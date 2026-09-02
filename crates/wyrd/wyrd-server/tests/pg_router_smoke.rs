@@ -571,7 +571,9 @@ async fn role_advertises_ready(pool: &sqlx::PgPool, node_id: uuid::Uuid) -> bool
 /// merely no longer authorized. And retirement must resolve who owns that
 /// loss before it releases anything: whether the lease supervisor selected it
 /// first or retirement did, the epoch ends with exactly one durable loss edge
-/// and one complete audit sequence.
+/// and one complete audit sequence. A renewal already stalled inside Postgres
+/// is the third case, because it is the one state in which the supervisor has
+/// no local reason to look at the clock at all.
 ///
 /// # Panics
 ///
@@ -581,6 +583,7 @@ async fn role_advertises_ready(pool: &sqlx::PgPool, node_id: uuid::Uuid) -> bool
 #[tokio::test]
 async fn oracle_epoch_cutoff_removes_readiness_and_retirement_joins_loss_owner() {
     supervisor_first_loss_closes_readiness_before_its_audit().await;
+    blocked_renewal_cannot_suppress_cutoff_or_bounded_settlement().await;
     retirement_first_loss_commits_its_own_edge().await;
 }
 
@@ -701,6 +704,205 @@ async fn supervisor_first_loss_closes_readiness_before_its_audit() {
             "oracle.reader_epoch.retired".to_owned(),
         ],
         "retirement joins the loss owner and adds no second loss edge"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM vala.oracle_reader_epochs WHERE node_id = $1"
+        )
+        .bind(node_id)
+        .fetch_one(&pool)
+        .await
+        .expect("epoch rows counted"),
+        0,
+        "a retired epoch leaves no row"
+    );
+
+    server.shutdown().await.expect("server shuts down");
+}
+
+/// Reports how many backends are queued behind an Oracle epoch row lock.
+///
+/// A writer that has to wait for a row first takes a `tuple` lock on the
+/// relation and only then blocks on the holder's transaction, so the presence
+/// of that lock is the evidence — visible without any elevated statistics
+/// privilege — that a statement reached Postgres and cannot return. Renewal is
+/// the only statement a live epoch issues against this table.
+///
+/// # Panics
+///
+/// Panics when `pg_locks` cannot be read.
+#[cfg(feature = "test-support")]
+async fn epoch_row_lock_waiters(pool: &sqlx::PgPool) -> i64 {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM pg_locks \
+          WHERE locktype = 'tuple' \
+            AND relation = 'vala.oracle_reader_epochs'::regclass",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("epoch row lock waiters counted")
+}
+
+/// Proves a renewal stuck in Postgres cannot hold admission open past cutoff.
+///
+/// The supervisor used to await its renewal without any competing deadline, so
+/// a renewal that reached SQL and never returned kept admission, readiness, and
+/// the durable role advertisement open for as long as Postgres stalled it —
+/// well past the instant the confirmed lease stopped authorizing source IO.
+/// Holding the epoch row reproduces exactly that stall, and the absolute
+/// cutoff derived from the last confirmed lease must still close this Oracle.
+///
+/// Nothing here holds a query guard: this server carries the production
+/// aborting terminator, so a descendant that outlived the cutoff would end the
+/// test process rather than fail it. Retained protection under an exhausted
+/// deadline is proved in `vala-bifrost-redux`'s Tier 2 authority target, which
+/// injects a recording terminator.
+///
+/// # Panics
+///
+/// Panics when the blocked renewal suppresses the cutoff, when readiness or
+/// the durable advertisement survives it, when the loss edge is audited while
+/// settlement is still blocked, or when the released epoch does not retire
+/// through its exact audit sequence.
+#[cfg(feature = "test-support")]
+async fn blocked_renewal_cannot_suppress_cutoff_or_bounded_settlement() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let authority = std::sync::Arc::clone(
+        server
+            .state()
+            .bifrost_query()
+            .expect("this server hosts an Oracle role")
+            .engine()
+            .reader_authority(),
+    );
+    let node_id = uuid::Uuid::from(server.node_id());
+    let fencing_token = authority.fencing_token();
+    let pool = server
+        .pg_fixture()
+        .superuser_pool()
+        .await
+        .expect("superuser pool");
+
+    await_oracle_ready(&server, true).await;
+    assert!(role_advertises_ready(&pool, node_id).await);
+
+    // Hold the epoch row itself. Renewal is the only statement the live epoch
+    // issues against it, so this stalls the renewal inside Postgres without
+    // touching the deadlines the supervisor already derived.
+    let mut gate = pool.begin().await.expect("epoch gate transaction begins");
+    sqlx::query(
+        "SELECT state_revision FROM vala.oracle_reader_epochs \
+          WHERE node_id = $1 AND fencing_token = $2 FOR UPDATE",
+    )
+    .bind(node_id)
+    .bind(fencing_token)
+    .fetch_one(&mut *gate)
+    .await
+    .expect("the epoch row is held");
+
+    // The renewal cadence is short relative to the lease, so the stall is
+    // observable long before the cutoff the test is waiting for.
+    let blocked_by = std::time::Instant::now() + std::time::Duration::from_mins(2);
+    while epoch_row_lock_waiters(&pool).await == 0 {
+        assert!(
+            std::time::Instant::now() < blocked_by,
+            "the cadence renewal never reached the held epoch row"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    // No collapse: the absolute cutoff of the last confirmed lease must arrive
+    // on its own while the renewal is still stuck.
+    let cutoff_by = std::time::Instant::now() + std::time::Duration::from_mins(2);
+    while authority.admits() {
+        assert!(
+            std::time::Instant::now() < cutoff_by,
+            "a blocked renewal held admission open past the epoch's cutoff"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    // Settlement is still blocked behind the same held row, and everything the
+    // process publishes about its authority must already be closed.
+    assert!(
+        !server
+            .state()
+            .bifrost_query()
+            .expect("the Oracle runtime is retained")
+            .engine()
+            .is_ready(),
+        "an epoch past its admission cutoff is not a ready Oracle"
+    );
+    assert_eq!(
+        epoch_audit_operations(&pool, node_id, fencing_token).await,
+        vec![
+            "oracle.reader_epoch.acquired".to_owned(),
+            "oracle.reader_epoch.activated".to_owned(),
+        ],
+        "the loss edge is not audited while its transaction is still blocked"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM vala.oracle_table_protections WHERE node_id = $1"
+        )
+        .bind(node_id)
+        .fetch_one(&pool)
+        .await
+        .expect("protection rows counted"),
+        0,
+        "nothing is released while settlement is blocked"
+    );
+
+    // Release before the bounded settlement window expires, so the audited
+    // loss edge is the one the supervisor already selected.
+    gate.rollback().await.expect("the epoch gate releases");
+
+    let liveness = server
+        .oneshot(
+            Request::builder()
+                .uri("/healthz")
+                .body(axum::body::Body::empty())
+                .expect("request builds"),
+        )
+        .await
+        .expect("router responds");
+    assert_eq!(
+        liveness.status(),
+        StatusCode::OK,
+        "a fenced epoch is unready, not unhealthy"
+    );
+
+    let advertising = std::time::Instant::now() + std::time::Duration::from_mins(2);
+    while role_advertises_ready(&pool, node_id).await {
+        assert!(
+            std::time::Instant::now() < advertising,
+            "the durable Oracle role kept advertising ready after a blocked renewal lost its lease"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    // Drive the production Oracle drain in place: `shutdown` consumes the
+    // harness, and with it the Postgres fixture whose rows this asserts on.
+    server
+        .state()
+        .bifrost_query()
+        .expect("the Oracle runtime is retained")
+        .engine()
+        .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(10))
+        .await;
+
+    assert_eq!(
+        epoch_audit_operations(&pool, node_id, fencing_token).await,
+        vec![
+            "oracle.reader_epoch.acquired".to_owned(),
+            "oracle.reader_epoch.activated".to_owned(),
+            "oracle.reader_epoch.draining".to_owned(),
+            "oracle.reader_epoch.invalidated".to_owned(),
+            "oracle.reader_epoch.retired".to_owned(),
+        ],
+        "the supervisor that lost the lease owns the one loss edge, and retirement joins it"
     );
     assert_eq!(
         sqlx::query_scalar::<_, i64>(

@@ -3430,10 +3430,13 @@ impl Oracle {
         // Retirement owns its own ordering end to end: it closes admission,
         // joins descendants, drains and joins its workers, releases every
         // table, and only then deletes the epoch row.
-        if let Err(error) = self.reader_authority.retire().await {
+        if let Err(error) = self
+            .reader_authority
+            .retire(tokio::time::Instant::from_std(deadline))
+            .await
+        {
             tracing::error!(error = %error, "Oracle retained reader protection after retirement failed");
         }
-        let _ = deadline;
         report
     }
 

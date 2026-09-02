@@ -565,7 +565,10 @@ async fn process_global_authority_aggregates_and_releases_conservatively() {
     race_narrowing_against_admission(&fixture, &authority, &orders).await;
     admit_opposite_table_orders(&authority, &events, &orders).await;
 
-    authority.retire().await.expect("epoch retires");
+    authority
+        .retire(retirement_deadline())
+        .await
+        .expect("epoch retires");
     assert!(fixture.header(&events).await.is_none());
     assert!(fixture.header(&orders).await.is_none());
     assert_eq!(
@@ -707,7 +710,7 @@ async fn epoch_lifecycle_self_fences_and_retires_in_order() {
     // released descendant, releases each table, invalidates, then deletes.
     drop(guard);
     authority
-        .retire()
+        .retire(retirement_deadline())
         .await
         .expect("a fenced epoch still retires");
     assert!(fixture.header(&events).await.is_none());
@@ -732,6 +735,209 @@ async fn epoch_lifecycle_self_fences_and_retires_in_order() {
             "oracle.reader_epoch.retired".to_owned(),
         ]
     );
+}
+
+/// The shutdown deadline every retirement expected to succeed is given.
+///
+/// Generous on purpose: those cases prove ordering and durable state, not
+/// timing, and this lane runs many fixtures against one Postgres. Retirement
+/// still reduces it against the epoch's own join deadline, so the bound under
+/// test is unchanged. The exhaustion cases pass their own tight deadline.
+fn retirement_deadline() -> tokio::time::Instant {
+    tokio::time::Instant::now() + Duration::from_secs(30)
+}
+
+/// Proves a caller's shutdown deadline bounds every stage of retirement, and
+/// that exhausting it retains everything the epoch durably protects.
+///
+/// Retirement used to take no deadline at all: it waited on the audited loss
+/// edge for as long as Postgres took, and gave descendants a fresh four-second
+/// window no matter how little of the caller's shutdown budget was left. Both
+/// stages are exercised here against the same absolute instant, because the
+/// dangerous outcome is not slowness — it is a retirement that keeps going
+/// after its deadline and releases protection the process can no longer prove
+/// it stopped reading under.
+///
+/// # Panics
+///
+/// Panics when retirement outlives the caller's deadline, when the terminator
+/// is not invoked exactly once, when retirement reports success, or when any
+/// durable protection, epoch state, or audit edge moves past the exhausted
+/// stage.
+#[tokio::test]
+async fn epoch_deadline_exhaustion_terminates_and_retains_protection() {
+    blocked_loss_settlement_terminates_at_the_caller_deadline().await;
+    unjoined_descendants_terminate_at_the_caller_deadline().await;
+}
+
+/// Drives exhaustion in the audited loss edge, with the epoch row held.
+///
+/// # Panics
+///
+/// Panics when settlement outlives the caller deadline or when retirement
+/// continues past it.
+async fn blocked_loss_settlement_terminates_at_the_caller_deadline() {
+    let fixture = AuthorityFixture::start().await;
+    let (authority, terminator) = fixture.authority(2).await;
+    let tenant = fixture.tenant().await;
+    let events = fixture.table(tenant, "events").await;
+
+    // One real durable protection, published exactly the way a query does.
+    let (guard, _permit) = authority
+        .acquire_guard_for_cuts(vec![(events.clone(), cut(30, 300, &[30, 20, 10]))])
+        .await
+        .expect("admission protects");
+    fixture
+        .settle(&events, "the admitted cut is durably protected", |record| {
+            record.is_some_and(|record| record.frontier.covers(30))
+        })
+        .await;
+
+    // Hold the epoch row so the audited loss edge cannot commit.
+    let pool = fixture
+        .database
+        .superuser_pool()
+        .await
+        .expect("superuser pool");
+    let mut gate = pool.begin().await.expect("epoch gate transaction begins");
+    sqlx::query(
+        "SELECT state_revision FROM vala.oracle_reader_epochs \
+          WHERE node_id = $1 AND fencing_token = $2 FOR UPDATE",
+    )
+    .bind(fixture.node_id)
+    .bind(i64::try_from(fixture.fence).expect("fence fits"))
+    .fetch_one(&mut *gate)
+    .await
+    .expect("the epoch row is held");
+
+    // A caller deadline strictly earlier than the epoch's own join deadline is
+    // the one retirement must honour.
+    let caller_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    assert!(
+        caller_deadline < authority.deadlines().await.join,
+        "the caller deadline has to be the binding one for this case to mean anything"
+    );
+    let error = authority
+        .retire(caller_deadline)
+        .await
+        .expect_err("an exhausted deadline is not a successful retirement");
+    let finished = tokio::time::Instant::now();
+    assert!(
+        finished >= caller_deadline && finished < caller_deadline + Duration::from_secs(3),
+        "retirement completed at {finished:?}, not at its caller deadline {caller_deadline:?}"
+    );
+    assert!(matches!(
+        error,
+        wyrd_spec::vala::BifrostError::Internal { .. }
+    ));
+    assert_eq!(
+        terminator.invocations(),
+        1,
+        "one exhausted retirement attempt terminates exactly once"
+    );
+    assert!(
+        authority.epoch_cancel().is_cancelled(),
+        "an epoch that could not record its loss still stops reading"
+    );
+
+    gate.rollback().await.expect("the epoch gate releases");
+
+    // Nothing past the exhausted stage happened.
+    assert!(
+        fixture
+            .header(&events)
+            .await
+            .is_some_and(|record| record.frontier.covers(30)),
+        "protection survives an exhausted retirement"
+    );
+    assert_eq!(
+        fixture
+            .epoch_row()
+            .await
+            .expect("the epoch row survives")
+            .state,
+        vala_sql::row_types::oracle_reader_authority::OracleEpochState::Active,
+        "a loss edge that never committed leaves the epoch exactly as it was"
+    );
+    assert_eq!(
+        fixture.epoch_audit_operations().await,
+        vec![
+            "oracle.reader_epoch.acquired".to_owned(),
+            "oracle.reader_epoch.activated".to_owned(),
+        ],
+        "no invalidation or retirement edge follows an exhausted settlement"
+    );
+    drop(guard);
+}
+
+/// Drives exhaustion in the descendant join, with one query guard held.
+///
+/// # Panics
+///
+/// Panics when the join uses its own budget instead of the caller's absolute
+/// deadline, or when retirement continues past it.
+async fn unjoined_descendants_terminate_at_the_caller_deadline() {
+    let fixture = AuthorityFixture::start().await;
+    let (authority, terminator) = fixture.authority(2).await;
+    let tenant = fixture.tenant().await;
+    let events = fixture.table(tenant, "events").await;
+
+    let (guard, permit) = authority
+        .acquire_guard_for_cuts(vec![(events.clone(), cut(30, 300, &[30, 20, 10]))])
+        .await
+        .expect("admission protects");
+    permit
+        .begin_io()
+        .expect("IO is permitted under a live epoch");
+
+    // Strictly inside the four-second join budget: a join that reached for its
+    // own window would outlive this by seconds.
+    let caller_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    let error = authority
+        .retire(caller_deadline)
+        .await
+        .expect_err("an unjoined descendant is not a successful retirement");
+    let finished = tokio::time::Instant::now();
+    assert!(
+        finished >= caller_deadline && finished < caller_deadline + Duration::from_secs(2),
+        "the descendant join used its own budget, not the caller deadline {caller_deadline:?}"
+    );
+    assert!(matches!(
+        error,
+        wyrd_spec::vala::BifrostError::Internal { .. }
+    ));
+    assert_eq!(terminator.invocations(), 1);
+    assert!(
+        permit.begin_io().is_err(),
+        "an epoch that gave up on its descendants starts no further IO"
+    );
+
+    // The loss edge itself committed; nothing after the exhausted join did.
+    assert!(
+        fixture
+            .header(&events)
+            .await
+            .is_some_and(|record| record.frontier.covers(30)),
+        "protection survives a retirement that could not join its readers"
+    );
+    assert_eq!(
+        fixture
+            .epoch_row()
+            .await
+            .expect("the epoch row survives")
+            .state,
+        vala_sql::row_types::oracle_reader_authority::OracleEpochState::Draining
+    );
+    assert_eq!(
+        fixture.epoch_audit_operations().await,
+        vec![
+            "oracle.reader_epoch.acquired".to_owned(),
+            "oracle.reader_epoch.activated".to_owned(),
+            "oracle.reader_epoch.draining".to_owned(),
+        ],
+        "an exhausted join reaches neither invalidation nor retirement"
+    );
+    drop(guard);
 }
 
 /// Registers one more Oracle node and starts its activated epoch.
@@ -926,7 +1132,10 @@ async fn leader_and_followers_protect_before_io_and_join_before_release() {
     assert_eq!(held, opened);
     drop(leader_guard);
     drop(leader_permit);
-    leader.retire().await.expect("the leader retires");
+    leader
+        .retire(retirement_deadline())
+        .await
+        .expect("the leader retires");
     assert!(
         node_protection(&fixture, &identity, leader_node, leader_fence)
             .await
@@ -1026,7 +1235,10 @@ async fn follower_protection_precedes_resolution(
     );
 
     drop(retry);
-    follower.retire().await.expect("the follower retires");
+    follower
+        .retire(retirement_deadline())
+        .await
+        .expect("the follower retires");
 }
 
 /// Proves an expired epoch this node cannot reclaim fails startup recovery
@@ -1110,7 +1322,7 @@ async fn startup_recovery_failure_prevents_epoch_activation_and_readiness() {
     );
 
     authority
-        .retire()
+        .retire(retirement_deadline())
         .await
         .expect("the acquired epoch retires");
 }
@@ -1201,7 +1413,10 @@ async fn narrowing_retries_once_and_covered_duplicates_need_no_sql() {
         "the retry commits exactly one release"
     );
 
-    authority.retire().await.expect("the epoch retires");
+    authority
+        .retire(retirement_deadline())
+        .await
+        .expect("the epoch retires");
 }
 
 /// Proves catalog promotion under a prepared reader identity is detected and
@@ -1326,5 +1541,8 @@ async fn catalog_promotion_between_prepare_and_materialize_restarts_all_tables()
         "a refused admission materializes nothing"
     );
 
-    authority.retire().await.expect("the epoch retires");
+    authority
+        .retire(retirement_deadline())
+        .await
+        .expect("the epoch retires");
 }

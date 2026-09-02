@@ -15,6 +15,7 @@
 
 use std::ops::Range;
 use std::sync::Arc;
+use std::task::Poll;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -443,6 +444,8 @@ mod tests {
     use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use futures_util::Stream as _;
+
     use tokio_util::sync::CancellationToken;
 
     use super::*;
@@ -477,17 +480,30 @@ mod tests {
 
     /// Proves a lazy listing gates every backend poll and every exposed item.
     ///
-    /// Two fences are exercised because they refuse at different boundaries: a
-    /// fence taken before the first poll must stop the backend from being
-    /// polled at all, and a fence taken while an item is already in hand must
-    /// stop that item from reaching the caller. Both must terminate the
-    /// wrapper after exactly one error rather than resuming on the next poll.
+    /// Three fences are exercised because they refuse at different boundaries:
+    /// a fence taken before the first poll must stop the backend from being
+    /// polled at all, a fence taken while an item is already in hand must stop
+    /// that item from reaching the caller, and a fence landing while the
+    /// backend is parked on `Pending` must stop the resumed poll that a
+    /// retained `next()` future would otherwise perform ungated. All three
+    /// must terminate the wrapper after exactly one error rather than resuming
+    /// on the next poll.
     #[tokio::test]
     async fn gated_list_stops_polling_and_yielding_after_fence() {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_mins(1);
+        live_permit_exposes_every_entry(deadline).await;
+        fence_before_the_first_poll_reaches_no_backend(deadline).await;
+        fence_with_an_item_in_hand_refuses_that_item(deadline).await;
+        fence_while_the_backend_is_parked_refuses_the_resumed_poll(deadline);
+    }
 
-        // A live permit exposes every entry and polls the backend once per
-        // item plus the final exhaustion poll.
+    /// A live permit exposes every entry and polls the backend once per item
+    /// plus the final exhaustion poll.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an entry is refused or the backend poll count differs.
+    async fn live_permit_exposes_every_entry(deadline: tokio::time::Instant) {
         let polls = Arc::new(AtomicUsize::new(0));
         let live = crate::oracle::reader_pins::ReaderIoPermit::new(
             CancellationToken::new(),
@@ -504,9 +520,16 @@ mod tests {
         }
         assert_eq!(exposed, vec!["a".to_owned(), "b".to_owned()]);
         assert_eq!(polls.load(Ordering::SeqCst), 3);
+    }
 
-        // A fence taken after the stream exists but before it is polled must
-        // reach the backend zero times.
+    /// A fence taken after the stream exists but before it is polled must
+    /// reach the backend zero times.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the listing is not refused, when the wrapper resumes, or
+    /// when the backend is polled at all.
+    async fn fence_before_the_first_poll_reaches_no_backend(deadline: tokio::time::Instant) {
         let polls = Arc::new(AtomicUsize::new(0));
         let epoch = CancellationToken::new();
         let mut stream = gate_list_stream(
@@ -535,9 +558,16 @@ mod tests {
             0,
             "no backend poll happens after the fence"
         );
+    }
 
-        // A fence that lands while a backend item is already in hand must stop
-        // that item from reaching the caller, and must not poll again after.
+    /// A fence that lands while a backend item is already in hand must stop
+    /// that item from reaching the caller, and must not poll again after.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the entry is exposed, when the wrapper resumes, or when the
+    /// backend is polled a second time.
+    async fn fence_with_an_item_in_hand_refuses_that_item(deadline: tokio::time::Instant) {
         let polls = Arc::new(AtomicUsize::new(0));
         let epoch = CancellationToken::new();
         let fencing = epoch.clone();
@@ -570,6 +600,59 @@ mod tests {
             1,
             "the fenced wrapper never polls the backend again"
         );
+    }
+
+    /// A backend parked on `Pending` must not be resumed after a fence.
+    ///
+    /// Polls are driven by hand because the property is about which poll
+    /// reaches the backend, and an executor would hide that ordering behind
+    /// wakeups. This is also why the case is synchronous.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the resumed poll reaches the backend, when the fence is not
+    /// reported as one permit error, or when the wrapper does not terminate.
+    fn fence_while_the_backend_is_parked_refuses_the_resumed_poll(deadline: tokio::time::Instant) {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let epoch = CancellationToken::new();
+        let counted = Arc::clone(&polls);
+        let backend = stream::poll_fn(move |_| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            std::task::Poll::<Option<IcebergResult<ListEntry>>>::Pending
+        })
+        .boxed();
+        let mut stream = gate_list_stream(
+            backend,
+            crate::oracle::reader_pins::ReaderIoPermit::new(
+                epoch.clone(),
+                CancellationToken::new(),
+                deadline,
+            ),
+        );
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(
+            std::pin::Pin::new(&mut stream)
+                .poll_next(&mut cx)
+                .is_pending(),
+            "a parked backend leaves the wrapper pending"
+        );
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+        epoch.cancel();
+        let refused = std::pin::Pin::new(&mut stream).poll_next(&mut cx);
+        assert!(
+            matches!(refused, std::task::Poll::Ready(Some(Err(_)))),
+            "a fence landing while the backend is parked refuses the resumed poll"
+        );
+        assert_eq!(
+            polls.load(Ordering::SeqCst),
+            1,
+            "the resumed poll never reaches the backend"
+        );
+        assert!(matches!(
+            std::pin::Pin::new(&mut stream).poll_next(&mut cx),
+            std::task::Poll::Ready(None)
+        ));
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
     }
 
     /// Builds an adapter over a real local backend rooted at `root`.
@@ -735,24 +818,44 @@ fn permit_error(error: &wyrd_spec::vala::BifrostError) -> IcebergError {
 /// immediately before each backend poll and again before each item — backend
 /// errors included — is handed on.
 ///
-/// A refusal yields exactly one error and then terminates: the wrapper drops
-/// the backend stream with it, so nothing polls the backend afterwards. The
+/// A refusal yields exactly one error and then terminates: `done` latches, so
+/// every later poll reports exhaustion without touching the backend. The
 /// wrapper adds no buffering and collects nothing, so laziness and the
 /// backend's own backpressure are unchanged.
+///
+/// The backend is polled directly rather than through a retained `next()`
+/// future, because such a future outlives a `Pending` return: a fence landing
+/// while the backend is parked would then be followed by a resumed backend
+/// poll that no `begin_io` ever authorized. Polling the inner stream here
+/// means every single backend poll is preceded by its own permit check.
 fn gate_list_stream(
     entries: BoxStream<'static, IcebergResult<ListEntry>>,
     permit: crate::oracle::reader_pins::ReaderIoPermit,
 ) -> BoxStream<'static, IcebergResult<ListEntry>> {
-    stream::unfold(Some((entries, permit)), |state| async move {
-        let (mut entries, permit) = state?;
+    let mut entries = entries;
+    let mut done = false;
+    stream::poll_fn(move |cx| {
+        if done {
+            return Poll::Ready(None);
+        }
         if let Err(error) = permit.begin_io() {
-            return Some((Err(permit_error(&error)), None));
+            done = true;
+            return Poll::Ready(Some(Err(permit_error(&error))));
         }
-        let item = entries.next().await?;
-        if let Err(error) = permit.expose_result() {
-            return Some((Err(permit_error(&error)), None));
+        match entries.as_mut().poll_next(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(None) => {
+                done = true;
+                Poll::Ready(None)
+            }
+            Poll::Ready(Some(item)) => {
+                if let Err(error) = permit.expose_result() {
+                    done = true;
+                    return Poll::Ready(Some(Err(permit_error(&error))));
+                }
+                Poll::Ready(Some(item))
+            }
         }
-        Some((item, Some((entries, permit))))
     })
     .boxed()
 }

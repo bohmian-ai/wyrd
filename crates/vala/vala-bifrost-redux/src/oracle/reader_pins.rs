@@ -936,7 +936,11 @@ impl OracleReaderAuthority {
             return EpochDeadlines {
                 no_io: now,
                 admission_cutoff: now,
-                join: now,
+                // The join budget is not collapsed with the rest: production
+                // still owns it after the cutoff, and removing it here would
+                // bound loss settlement to an instant no real lease shortfall
+                // ever produces.
+                join: now + EPOCH_JOIN_BUDGET,
             };
         }
         deadlines
@@ -1662,25 +1666,37 @@ impl OracleReaderAuthority {
     /// remains for this exact epoch. A failed table release retains the epoch
     /// and every remaining protection for retry.
     ///
+    /// `deadline` is the caller's absolute shutdown instant. It is reduced
+    /// once against this epoch's own join deadline, and that single instant
+    /// bounds loss settlement, the lease-worker join, and the descendant join.
+    /// No stage receives a fresh relative window: a stage that started late
+    /// must not be allowed to finish after the lease stopped authorizing
+    /// source IO. Exhausting it terminates and returns, so nothing downstream
+    /// of the exhausted stage runs and every durable protection stays.
+    ///
     /// # Errors
     ///
-    /// Returns [`BifrostError::Internal`] when a release, the invalidation
-    /// edge, or retirement fails. Protection is retained on every failure.
-    pub async fn retire(self: &Arc<Self>) -> Result<(), BifrostError> {
-        self.settle_lease_loss().await?;
+    /// Returns [`BifrostError::Internal`] when a bounded stage exhausts that
+    /// deadline, or when a release, the invalidation edge, or retirement
+    /// fails. Protection is retained on every failure.
+    pub async fn retire(
+        self: &Arc<Self>,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), BifrostError> {
+        let bound = self.deadlines().await.join.min(deadline);
+        let settled = self.settle_lease_loss(bound).await;
+        // Cancelled whichever way settlement went: a process that could not
+        // even record its loss must still stop reading under the lease it lost.
         self.epoch_cancel.cancel();
+        settled?;
         // Ordered, not incidental: descendants are joined before the narrowing
         // worker is stopped, and both happen before the first table release, so
         // no table is released while a reader of it can still be running and no
         // reserved narrowing is abandoned unapplied.
-        if !self.join_descendants().await {
-            tracing::error!(
-                node_id = %self.node_id,
-                fencing_token = self.fencing_token,
-                "Oracle retired its reader epoch without joining every descendant"
-            );
-            self.terminator
-                .terminate("Oracle reader epoch descendants outlived retirement's join budget");
+        if !self.join_descendants(bound).await {
+            return Err(self.terminate_exhausted(
+                "Oracle reader epoch descendants outlived retirement's join budget",
+            ));
         }
         self.stop_narrowing_worker().await;
 
@@ -1778,6 +1794,50 @@ impl OracleReaderAuthority {
         }
     }
 
+    /// Joins the lease supervisor, or ends this process at `deadline`.
+    ///
+    /// A timeout drops the supervisor's [`tokio::task::JoinHandle`] rather than
+    /// aborting it, because an aborted supervisor abandons whatever loss
+    /// transaction it is in the middle of. The process is terminated instead:
+    /// retirement cannot prove the supervisor stopped, so it must not go on to
+    /// release anything.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::Internal`] when the supervisor is still running
+    /// at `deadline`.
+    async fn join_lease_worker_by(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), BifrostError> {
+        if tokio::time::timeout_at(deadline, self.join_lease_worker())
+            .await
+            .is_err()
+        {
+            return Err(self.terminate_exhausted(
+                "Oracle reader epoch lease supervisor outlived retirement's shutdown deadline",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Ends this process's source IO and reports the stage that exhausted.
+    ///
+    /// Retirement calls this at most once per attempt and always returns the
+    /// error it produces, so an injected recording terminator cannot let a
+    /// retirement continue into protection release under a deadline that
+    /// production would have aborted on.
+    fn terminate_exhausted(&self, detail: &'static str) -> BifrostError {
+        tracing::error!(
+            node_id = %self.node_id,
+            fencing_token = self.fencing_token,
+            detail,
+            "Oracle reader epoch retirement exhausted its shutdown deadline"
+        );
+        self.terminator.terminate(detail);
+        internal(detail)
+    }
+
     /// Resolves which owner committed this epoch's loss edge before retirement
     /// releases anything.
     ///
@@ -1789,18 +1849,27 @@ impl OracleReaderAuthority {
     /// releasing protection under an epoch that never recorded its loss would
     /// leave nothing to reclaim it.
     ///
+    /// Every awaited stage is bounded by `deadline`, the single absolute
+    /// instant retirement sampled, so a database that stalls the loss edge
+    /// cannot keep this epoch alive past the lease it last confirmed.
+    ///
     /// # Errors
     ///
-    /// Returns [`BifrostError::Internal`] when the loss edge cannot be
-    /// committed, when the epoch row cannot be read, or when it is still in a
-    /// state that has not lost authority.
-    async fn settle_lease_loss(&self) -> Result<(), BifrostError> {
+    /// Returns [`BifrostError::Internal`] when a stage exhausts `deadline`,
+    /// when the loss edge cannot be committed, when the epoch row cannot be
+    /// read, or when it is still in a state that has not lost authority.
+    async fn settle_lease_loss(&self, deadline: tokio::time::Instant) -> Result<(), BifrostError> {
         if self.select_loss().await {
             self.renewal_cancel.cancel();
-            self.join_lease_worker().await;
-            return self.commit_loss_edge().await;
+            self.join_lease_worker_by(deadline).await?;
+            return match tokio::time::timeout_at(deadline, self.commit_loss_edge()).await {
+                Ok(result) => result,
+                Err(_) => Err(self.terminate_exhausted(
+                    "Oracle reader epoch loss edge outlived retirement's shutdown deadline",
+                )),
+            };
         }
-        self.join_lease_worker().await;
+        self.join_lease_worker_by(deadline).await?;
         let mut conn = system_conn(&self.vala).await?;
         let row = OracleReaderEpochs::new(&mut conn)
             .map_err(|error| internal(error.to_string()))?
@@ -1854,29 +1923,52 @@ impl OracleReaderAuthority {
                     () = self.renewal_cancel.cancelled() => return,
                     () = tokio::time::sleep_until(admission_cutoff) => {}
                     () = tokio::time::sleep(EPOCH_RENEWAL_INTERVAL) => {
-                        if let Err(error) = self.renew().await {
-                            tracing::error!(
-                                error = %error,
-                                node_id = %self.node_id,
-                                fencing_token = self.fencing_token,
-                                "Oracle self-fenced its reader epoch after a failed renewal"
-                            );
-                            self.self_fence().await;
-                            return;
+                        // The renewal is scoped so that a cutoff winning this
+                        // race drops the pending future — and with it the
+                        // lifecycle guard and the unfinished transaction —
+                        // before loss is selected. Awaiting it bare is what
+                        // let a renewal stalled inside Postgres hold admission
+                        // and readiness open past the instant the confirmed
+                        // lease stopped authorizing source IO.
+                        let outcome = {
+                            let renewal = self.renew();
+                            tokio::pin!(renewal);
+                            tokio::select! {
+                                () = shutdown.cancelled() => return,
+                                () = self.renewal_cancel.cancelled() => return,
+                                () = tokio::time::sleep_until(admission_cutoff) => {
+                                    RenewalOutcome::Cutoff
+                                }
+                                result = &mut renewal => match result {
+                                    Ok(()) => RenewalOutcome::Renewed,
+                                    Err(error) => RenewalOutcome::Refused(error),
+                                },
+                            }
+                        };
+                        match outcome {
+                            RenewalOutcome::Renewed => continue,
+                            RenewalOutcome::Refused(error) => {
+                                tracing::error!(
+                                    error = %error,
+                                    node_id = %self.node_id,
+                                    fencing_token = self.fencing_token,
+                                    "Oracle self-fenced its reader epoch after a failed renewal"
+                                );
+                                self.self_fence().await;
+                                return;
+                            }
+                            RenewalOutcome::Cutoff => {}
                         }
-                        continue;
                     }
                 }
             }
-            {
-                tracing::error!(
-                    node_id = %self.node_id,
-                    fencing_token = self.fencing_token,
-                    "Oracle self-fenced its reader epoch at its admission cutoff"
-                );
-                self.self_fence().await;
-                return;
-            }
+            tracing::error!(
+                node_id = %self.node_id,
+                fencing_token = self.fencing_token,
+                "Oracle self-fenced its reader epoch at its admission cutoff"
+            );
+            self.self_fence().await;
+            return;
         }
     }
 
@@ -1885,15 +1977,38 @@ impl OracleReaderAuthority {
     /// Nothing here is skipped on failure: an epoch that cannot commit its loss
     /// edge still cancels, because this process must stop reading under a lease
     /// it no longer holds regardless of what Postgres accepted.
+    ///
+    /// The audited edge and the descendant join share one absolute instant —
+    /// this epoch's own [`EpochDeadlines::join`], sampled once here — so a
+    /// database that never answers cannot extend the epoch past the lease it
+    /// last confirmed.
     pub async fn self_fence(self: &Arc<Self>) {
+        // The earliest applicable deadline: never past the lease's own join
+        // instant, and never more than the join budget from the moment loss was
+        // actually selected, which for an early fence is well before that instant.
+        let join = self
+            .deadlines()
+            .await
+            .join
+            .min(tokio::time::Instant::now() + EPOCH_JOIN_BUDGET);
         if !self.select_loss().await {
             return;
         }
-        if let Err(error) = self.commit_loss_edge().await {
-            tracing::error!(error = %error, "Oracle could not record its reader epoch loss");
+        match tokio::time::timeout_at(join, self.commit_loss_edge()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::error!(error = %error, "Oracle could not record its reader epoch loss");
+            }
+            Err(_) => {
+                tracing::error!(
+                    node_id = %self.node_id,
+                    fencing_token = self.fencing_token,
+                    "Oracle could not record its reader epoch loss before its join deadline"
+                );
+            }
         }
         self.epoch_cancel.cancel();
-        if !self.join_descendants().await {
+        if !self.join_descendants(join).await {
             tracing::error!(
                 node_id = %self.node_id,
                 fencing_token = self.fencing_token,
@@ -1910,15 +2025,30 @@ impl OracleReaderAuthority {
     /// exactly the descendant this epoch had to join. Reporting `false` means
     /// this process cannot prove its readers stopped, which is the one
     /// condition the terminator exists for.
-    async fn join_descendants(&self) -> bool {
+    ///
+    /// `deadline` is the caller's already-reduced absolute instant, never a
+    /// fresh window: a join that began late gets whatever is left, not another
+    /// [`EPOCH_JOIN_BUDGET`].
+    async fn join_descendants(&self, deadline: tokio::time::Instant) -> bool {
         let capacity = u32::try_from(self.release_capacity).unwrap_or(u32::MAX);
-        tokio::time::timeout(
-            EPOCH_JOIN_BUDGET,
-            self.release_permits.acquire_many(capacity),
-        )
-        .await
-        .is_ok_and(|permit| permit.is_ok())
+        tokio::time::timeout_at(deadline, self.release_permits.acquire_many(capacity))
+            .await
+            .is_ok_and(|permit| permit.is_ok())
     }
+}
+
+/// How one cadence renewal attempt ended.
+///
+/// Named rather than matched inline because the supervisor must drop its
+/// pending renewal future before acting on any of these, and carrying a value
+/// out of that scope is what guarantees the drop happens first.
+enum RenewalOutcome {
+    /// Postgres extended the lease and this epoch keeps serving.
+    Renewed,
+    /// Postgres refused the renewal, which is immediate lease loss.
+    Refused(BifrostError),
+    /// The confirmed lease reached its admission cutoff before SQL answered.
+    Cutoff,
 }
 
 /// Read-only enumeration and cleanup of epochs whose lease already expired.

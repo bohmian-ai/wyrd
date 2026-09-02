@@ -11,9 +11,12 @@
 //! module never filters by liveness and never substitutes an empty set for
 //! evidence it could not read.
 
+use vala_sql::TenantConn;
+use vala_sql::queries::oracle_reader_authority::{
+    BifrostTableMaintenanceAuthority, OracleTableProtections,
+};
 use vala_sql::row_types::forge_tasks::SnapshotWatermark;
 use vala_sql::row_types::oracle_reader_authority::{ProtectionRecord, TableAuthorityIdentity};
-use vala_sql::{TenantConn, queries::oracle_reader_authority::OracleTableProtections};
 use wyrd_spec::DataTenantId;
 
 use super::error::ForgeError;
@@ -126,6 +129,28 @@ impl<'conn, 'tx> ReaderProtection<'conn, 'tx> {
         watermarks.sort_by_key(|watermark| (watermark.timestamp_ms, watermark.snapshot_id));
         watermarks.dedup();
         Ok(watermarks)
+    }
+
+    /// Lists every snapshot an unresolved Forge expiration already claims.
+    ///
+    /// This reads the same admission index Oracle widening consults, through
+    /// the same owner, so a claim has exactly one reader on each side of the
+    /// boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Invariant`] when the table is unregistered and
+    /// [`ForgeError::Sql`] when the index read fails.
+    pub(super) async fn claimed_snapshot_ids(
+        &mut self,
+        tenant: DataTenantId,
+        table_ref: &TableRef,
+    ) -> Result<Vec<i64>, ForgeError> {
+        let identity = self.identity(tenant, table_ref).await?;
+        BifrostTableMaintenanceAuthority::new(self.conn)
+            .claimed_snapshots(&identity)
+            .await
+            .map_err(ForgeError::Sql)
     }
 
     /// Lists every snapshot id any epoch's proven ancestry still requires.

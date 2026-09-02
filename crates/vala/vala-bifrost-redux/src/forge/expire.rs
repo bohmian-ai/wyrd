@@ -466,6 +466,13 @@ impl Forge {
         let reader_watermarks = super::reader_protection::ReaderProtection::new(&mut conn)
             .watermarks(key.tenant, &key.table_ref)
             .await?;
+        // Snapshots another prepared expiration already claimed are removed
+        // from this pass in the same transaction the other roots are read in.
+        // Preparation re-checks the claim index under the table lock; this read
+        // only keeps a pass from planning work that is already owned.
+        let claimed_snapshot_ids = super::reader_protection::ReaderProtection::new(&mut conn)
+            .claimed_snapshot_ids(key.tenant, &key.table_ref)
+            .await?;
         conn.commit().await.map_err(ForgeError::Sql)?;
         if attempts_overflowed {
             return Err(ForgeError::SnapshotExpiry {
@@ -476,6 +483,7 @@ impl Forge {
             attempt_watermarks,
             reader_watermarks,
             lineage_snapshot_id: head_lineage_snapshot_id(table),
+            claimed_snapshot_ids,
             destructive_maintenance,
         })
     }

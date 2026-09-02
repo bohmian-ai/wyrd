@@ -34,6 +34,13 @@ pub(super) struct SnapshotProtectionRoots {
     /// decides that by reading this snapshot back. Expiring it would not lose
     /// data, but it would make every later rewrite of this table unprovable.
     pub(super) lineage_snapshot_id: Option<i64>,
+    /// Snapshots an unresolved snapshot-expiration claim already owns.
+    ///
+    /// A claim is not a reader protection: nothing needs the snapshot, another
+    /// prepared operation is already responsible for removing it. Selecting it
+    /// again would prepare two operations for the same deletion, so the claim
+    /// removes it from this pass rather than refusing the pass.
+    pub(super) claimed_snapshot_ids: Vec<i64>,
     /// Fail-closed permission derived from unreconciled durable operations.
     pub(super) destructive_maintenance: DestructiveMaintenance,
 }
@@ -134,6 +141,7 @@ impl SnapshotExpiryPolicy<'_> {
         if let Some(lineage) = self.roots.lineage_snapshot_id {
             snapshot_ids.retain(|id| *id != lineage);
         }
+        snapshot_ids.retain(|id| !self.roots.claimed_snapshot_ids.contains(id));
         Ok(if snapshot_ids.is_empty() {
             SnapshotExpiryDecision::NoOp(SnapshotExpiryNoOp::NothingEligible)
         } else {
@@ -148,6 +156,8 @@ impl SnapshotExpiryPolicy<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vala_sql::row_types::oracle_reader_authority::{ProtectionMember, TableAuthorityIdentity};
+    use wyrd_spec::DataTenantId;
 
     /// A linear four-snapshot history: 10 -> 20 -> 30 -> 40.
     fn history() -> Vec<SnapshotSummary> {
@@ -181,6 +191,7 @@ mod tests {
             attempt_watermarks: Vec::new(),
             reader_watermarks: Vec::new(),
             lineage_snapshot_id: None,
+            claimed_snapshot_ids: Vec::new(),
             destructive_maintenance: DestructiveMaintenance::Allowed,
         }
     }
@@ -191,9 +202,23 @@ mod tests {
         roots: &SnapshotProtectionRoots,
         retain_last: usize,
     ) -> Result<SnapshotExpiryDecision, crate::forge::error::ForgeError> {
+        decide_from(Some(40), ref_heads, roots, retain_last)
+    }
+
+    /// Builds the policy under test with an explicit current snapshot.
+    ///
+    /// Removing the current snapshot is its own root: a table with no current
+    /// snapshot protects nothing through it, which is only visible when the
+    /// geometry can be decided both ways.
+    fn decide_from(
+        current_snapshot_id: Option<i64>,
+        ref_heads: &[i64],
+        roots: &SnapshotProtectionRoots,
+        retain_last: usize,
+    ) -> Result<SnapshotExpiryDecision, crate::forge::error::ForgeError> {
         SnapshotExpiryPolicy {
             snapshots: &history(),
-            current_snapshot_id: Some(40),
+            current_snapshot_id,
             ref_heads,
             roots,
             retention_cutoff_ms: 3_500,
@@ -262,6 +287,35 @@ mod tests {
                 retain_last: 1,
             },
             RootCase {
+                what: "an unresolved expiration claim on the same table",
+                protected: vec![20],
+                ref_heads: Vec::new(),
+                roots: SnapshotProtectionRoots {
+                    claimed_snapshot_ids: vec![20],
+                    ..bare_roots()
+                },
+                retain_last: 1,
+            },
+            RootCase {
+                what: "two incomparable frontier members on a forked lineage",
+                protected: vec![10, 20, 30],
+                ref_heads: Vec::new(),
+                roots: SnapshotProtectionRoots {
+                    reader_watermarks: vec![
+                        SnapshotWatermark {
+                            snapshot_id: 10,
+                            timestamp_ms: 1_000,
+                        },
+                        SnapshotWatermark {
+                            snapshot_id: 20,
+                            timestamp_ms: 2_000,
+                        },
+                    ],
+                    ..bare_roots()
+                },
+                retain_last: 1,
+            },
+            RootCase {
                 what: "the rewrite lineage the branch head still references",
                 protected: vec![10],
                 ref_heads: Vec::new(),
@@ -290,7 +344,7 @@ mod tests {
     /// `changes/active/forge-live-tail-authority-conflict.md`. Until it is
     /// resolved, no case here may be widened to stand for both roots at once.
     #[test]
-    fn forge_snapshot_expiry_policy_matrix() {
+    fn snapshot_expiry_root_and_frontier_mutation_matrix() {
         // Baseline: with no protection beyond the current head and one retained
         // ancestor, everything strictly older than the cutoff is eligible.
         let baseline = decide(&[], &bare_roots(), 1).expect("bare policy decides");
@@ -327,6 +381,16 @@ mod tests {
                 );
             }
         }
+
+        // The current snapshot is a root in its own right: without one, the
+        // head stops being protected by anything but the age floor.
+        let headless = decide_from(None, &[], &bare_roots(), 1)
+            .expect("a table with no current snapshot decides");
+        assert_eq!(
+            expired(&headless),
+            [10, 20, 30],
+            "removing the current snapshot removes only what it alone protected"
+        );
 
         // The age floor is a floor, not a preference: nothing at or after the
         // cutoff is eligible however little else protects it.
@@ -390,5 +454,33 @@ mod tests {
                 "{case} must fail closed"
             );
         }
+
+        // A frontier member whose stored proof does not reproduce is
+        // contradictory evidence, not an absence of protection. It must refuse
+        // before any watermark derived from it can reach this policy.
+        let identity = TableAuthorityIdentity {
+            tenant: DataTenantId::new_v7(),
+            table_uid: [5_u8; 16],
+            catalog_name: "wyrd-redux".to_owned(),
+            namespace_name: "vala.bifrost".to_owned(),
+            table_name: "events".to_owned(),
+        };
+        let mut member = ProtectionMember::new(&identity, vec![30, 20], 3_000, 2_000)
+            .expect("a well-formed member builds");
+        assert!(
+            member.validate(&identity).is_ok(),
+            "the member it built validates"
+        );
+        member.ancestry_digest[0] ^= 0xff;
+        assert!(
+            member.validate(&identity).is_err(),
+            "a member whose ancestry digest does not reproduce must refuse"
+        );
+        member.ancestry_digest[0] ^= 0xff;
+        member.ancestry_path = vec![30, 25];
+        assert!(
+            member.validate(&identity).is_err(),
+            "a member whose ancestry no longer matches its endpoints must refuse"
+        );
     }
 }

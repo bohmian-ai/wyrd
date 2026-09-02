@@ -1029,30 +1029,39 @@ pub async fn compose_bifrost(
     }
     .build()
     .await?;
-    let forwarding_audit = Arc::new(
-        PostgresPeerSecurityAudit::try_new(&postgres)
-            .await
-            .map_err(|error| ServerBootError::OraclePeer(error.to_string()))?,
-    );
-    let forwarding_authority = Arc::new(
-        OraclePeerAuthority::from_pem(&signing_key, forwarding_audit)
-            .map_err(|error| ServerBootError::OraclePeer(error.to_string()))?,
-    );
-    let query_forwarder = Arc::new(crate::oracle::ReadyOracleForwarder::new(
-        crate::oracle::ReadyOracleForwarderInputs {
-            cluster: Arc::clone(&cluster_registry),
-            catalog: Arc::clone(&bifrost),
-            local_oracle: oracle.as_ref().map(|runtime| Arc::clone(runtime.engine())),
-            local_node_id: node_id,
-            local_fence: oracle
-                .as_ref()
-                .map(|runtime| runtime.registered_role().fencing_token),
-            credentials: peer_credentials,
-            tls: peer_tls,
-            authority: forwarding_authority,
-            config: OracleConfig::default(),
-        },
-    ));
+    // Forwarding classification pins the tables it is about to route, and a
+    // pin is snapshot-dependent source IO that must be covered by this node's
+    // own reader epoch. A replica with no Oracle role holds no epoch, so it
+    // gets no forwarder and no query dispatch at all: the Gate then refuses
+    // every query with `OracleRoleUnavailable`, which is exactly how an
+    // ingest-only replica is expressed.
+    let query_forwarder = match oracle.as_ref() {
+        Some(runtime) => {
+            let forwarding_audit = Arc::new(
+                PostgresPeerSecurityAudit::try_new(&postgres)
+                    .await
+                    .map_err(|error| ServerBootError::OraclePeer(error.to_string()))?,
+            );
+            let forwarding_authority = Arc::new(
+                OraclePeerAuthority::from_pem(&signing_key, forwarding_audit)
+                    .map_err(|error| ServerBootError::OraclePeer(error.to_string()))?,
+            );
+            Some(Arc::new(crate::oracle::ReadyOracleForwarder::new(
+                crate::oracle::ReadyOracleForwarderInputs {
+                    cluster: Arc::clone(&cluster_registry),
+                    catalog: Arc::clone(&bifrost),
+                    local_oracle: Some(Arc::clone(runtime.engine())),
+                    local_node_id: node_id,
+                    local_fence: Some(runtime.registered_role().fencing_token),
+                    credentials: peer_credentials,
+                    tls: peer_tls,
+                    authority: forwarding_authority,
+                    config: OracleConfig::default(),
+                },
+            )))
+        }
+        None => None,
+    };
     let interceptor =
         vala_bifrost_redux::gate::auth::ingest_auth_interceptor(Arc::clone(&token_verifier));
     let ingest_limits = scribe_config.ingest_limits();
@@ -1063,10 +1072,13 @@ pub async fn compose_bifrost(
             ingest_limits,
         ),
         None => vala_bifrost_redux::gate::Gate::without_scribe(interceptor, ingest_limits),
-    }
-    .with_query_dispatch(
-        Arc::clone(&query_forwarder) as Arc<dyn vala_bifrost_redux::contracts::OracleQueryDispatch>
-    );
+    };
+    let gate = match query_forwarder.as_ref() {
+        Some(forwarder) => gate
+            .with_query_dispatch(Arc::clone(forwarder)
+                as Arc<dyn vala_bifrost_redux::contracts::OracleQueryDispatch>),
+        None => gate,
+    };
     Ok(crate::state::ComposedBifrost {
         bifrost: crate::state::Bifrost::assembled(crate::state::BifrostComposition {
             gate,
@@ -1076,7 +1088,7 @@ pub async fn compose_bifrost(
             bifrost_storage,
             transport: bifrost_resources.transport_admission(),
             token_verifier,
-            query_forwarder: Some(query_forwarder),
+            query_forwarder,
             #[cfg(feature = "test-support")]
             resources: Some(bifrost_resources.clone()),
         }),

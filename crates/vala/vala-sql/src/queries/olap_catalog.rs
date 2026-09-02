@@ -7,16 +7,29 @@
 use wyrd_sql::TenantConn;
 
 use crate::SqlError;
+use crate::queries::oracle_reader_authority::{
+    BIFROST_CATALOG_NAME, BifrostTableMaintenanceAuthority,
+};
 use crate::row_types::olap_catalog::{
     BifrostTableRow, DeclaredIndexRow, EntityTimeBoundsRow, ProjectionCandidateRow,
 };
+use crate::row_types::oracle_reader_authority::TableAuthorityIdentity;
 
 // ── vala.bifrost_tables ──────────────────────────────────────────────────────
 
 /// Insert or update a Bifrost table registration for the current tenant.
 ///
+/// Registration also writes the table's
+/// `vala.bifrost_table_maintenance_authority` row in the same transaction, so
+/// the one serialization boundary reader protection and snapshot expiration
+/// both lock exists from the moment the table does. That is what lets every
+/// later consumer treat a missing authority row as an identity failure rather
+/// than falling back to an advisory lock.
+///
 /// # Errors
-/// Returns [`SqlError`] when the query fails or an RLS policy rejects the row.
+/// Returns [`SqlError`] when the query fails or an RLS policy rejects the row,
+/// and [`SqlError::InvariantViolation`] when `fqn` carries no namespace segment
+/// and therefore cannot name a table inside one.
 pub async fn upsert_table(
     conn: &mut TenantConn<'_>,
     table_uid: &[u8; 16],
@@ -44,6 +57,21 @@ pub async fn upsert_table(
     .execute(&mut **conn.transaction())
     .await
     .map_err(SqlError::from)?;
+    let Some((namespace_name, table_name)) = fqn.rsplit_once('.') else {
+        return Err(SqlError::InvariantViolation {
+            detail: "Bifrost table registration has no namespace segment".to_owned(),
+        });
+    };
+    let identity = TableAuthorityIdentity {
+        tenant: conn.data_tenant_id(),
+        table_uid: *table_uid,
+        catalog_name: BIFROST_CATALOG_NAME.to_owned(),
+        namespace_name: namespace_name.to_owned(),
+        table_name: table_name.to_owned(),
+    };
+    BifrostTableMaintenanceAuthority::new(conn)
+        .register(&identity)
+        .await?;
     Ok(())
 }
 

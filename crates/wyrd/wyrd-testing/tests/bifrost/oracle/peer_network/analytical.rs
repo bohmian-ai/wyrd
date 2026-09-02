@@ -277,3 +277,392 @@ const CLEAN_LEASE_POLLS: usize = 100;
 
 /// Interval between graph-lease observations while waiting for cleanup.
 const CLEAN_LEASE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Left-table rows, wider than the right so the join is not an identity.
+const LEFT_ROWS: i64 = 400_000;
+
+/// Right-table rows; the join key range that actually matches.
+const RIGHT_ROWS: i64 = 300_000;
+
+/// Rows per fixture ingest request.
+///
+/// One request per table would have to hold the whole table as a single Arrow
+/// batch in the Scribe's address space, which is a fixture artifact rather than
+/// anything a real writer does.
+const INGEST_CHUNK: i64 = 100_000;
+
+/// Distinct `filter_key` groups the fixture rows fall into.
+///
+/// Irrelevant to the query under test, which derives its own key from `id`;
+/// it only keeps the published files from being one trivial group.
+const INGEST_GROUPS: i64 = 1_000;
+
+/// Digits the query left-pads each id to.
+const KEY_DIGITS: usize = 6;
+
+/// Filler characters appended to each key, making every key exactly 1 KiB.
+const KEY_FILLER: usize = 1018;
+
+/// Smallest possible in-memory size of the output sort's input, in bytes.
+///
+/// 300,000 keys of 1,024 bytes, plus a 4-byte offset per key and one past the
+/// end, plus one 8-byte count per row. Arrow cannot represent this input in
+/// less, so exceeding the grant is arithmetic rather than an observation.
+const SORT_INPUT_LOWER_BOUND: u64 = 307_200_000 + 1_200_004 + 2_400_000;
+
+/// Memory ceiling the fixed pod envelope grants one Analytical query.
+///
+/// 512 MiB process memory less the 256 MiB unmanaged reserve leaves a 256 MiB
+/// Oracle budget, and one Analytical query holding both its slot units is
+/// granted all of it, clamped to the partition ceiling.
+const QUERY_GRANT_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Live gauges that must read exactly zero on either side of a settled query.
+const LIVE_GAUGES: [&str; 3] = [
+    "bifrost_oracle_analytical_attempts_active",
+    "bifrost_oracle_analytical_exchanges_active",
+    "oracle_fragments_active",
+];
+
+/// Counters proving followers exchanged real data rather than empty stages.
+const EXCHANGE_COUNTERS: [&str; 2] = [
+    "bifrost_oracle_analytical_exchange_batches_total",
+    "bifrost_oracle_analytical_exchange_bytes_total",
+];
+
+/// A join whose grouped, ordered result cannot fit its grant spills on whichever
+/// Oracle coordinates it, and returns the same rows either way.
+///
+/// # Panics
+///
+/// Panics when the baseline cannot be driven across the process topology.
+#[tokio::test]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn inactive_baseline_executes_join_group_spill_and_interchangeable_topology() {
+    prove_physical_analytical_baseline()
+        .await
+        .expect("physical analytical baseline journey");
+}
+
+/// Drives the baseline on two different coordinators of one live topology.
+///
+/// Three Oracles and one Scribe: the leader is not a participant in its own
+/// worker set, so two remote followers are the smallest shape that puts real
+/// stages on real peers, and running the identical statement on two of the
+/// three is what makes "interchangeable" an observation rather than a claim.
+///
+/// # Errors
+///
+/// Returns the first claim that broke.
+async fn prove_physical_analytical_baseline() -> Result<(), PeerJourneyError> {
+    let mut cluster = BifrostProcessCluster::start(
+        NODE_BINARY,
+        &[
+            ProcessNodeTarget::Oracle,
+            ProcessNodeTarget::Oracle,
+            ProcessNodeTarget::Oracle,
+            ProcessNodeTarget::Scribe,
+        ],
+    )
+    .await?;
+
+    let mut pids = std::collections::BTreeSet::new();
+    for node in cluster.nodes() {
+        if !pids.insert(node.pid()) {
+            return Err(format!("pod {} shares a PID with another pod", node.label()).into());
+        }
+    }
+
+    let suffix = uuid::Uuid::now_v7().simple();
+    let left = format!("physical_left_{suffix}");
+    let right = format!("physical_right_{suffix}");
+    seed(&mut cluster, &left, LEFT_ROWS)?;
+    seed(&mut cluster, &right, RIGHT_ROWS)?;
+    for index in [LEADER, FOLLOWERS[0], FOLLOWERS[1], SCRIBE] {
+        cluster.nodes_mut()[index].refresh_snapshot()?;
+    }
+
+    let sql = format!(
+        "SELECT LPAD(CAST(l.id AS VARCHAR), {KEY_DIGITS}, '0') || REPEAT('x', {KEY_FILLER}) \
+         AS filter_key, COUNT(*) AS matched \
+         FROM vala.bifrost.{left} AS l \
+         JOIN vala.bifrost.{right} AS r ON l.id = r.id \
+         GROUP BY l.id ORDER BY filter_key"
+    );
+    let expected_digest = expected_result_digest();
+
+    // Two different coordinators of the same cluster, same statement. Any
+    // configuration that made one Oracle special would diverge here.
+    let mut digests = Vec::new();
+    for coordinator in [0, 1] {
+        digests.push(coordinate_baseline(&mut cluster, coordinator, &sql, &expected_digest).await?);
+    }
+    if digests[0] != digests[1] {
+        return Err("two coordinators of one cluster produced different results".into());
+    }
+
+    peer_planes_are_reachable_from_both_coordinators(&mut cluster).await?;
+
+    cluster.shutdown();
+    Ok(())
+}
+
+/// Publishes one contiguous fixture table through the cluster's Scribe.
+///
+/// # Errors
+///
+/// Returns the control-protocol failure unchanged.
+fn seed(
+    cluster: &mut BifrostProcessCluster,
+    table: &str,
+    rows: i64,
+) -> Result<(), PeerJourneyError> {
+    cluster.nodes_mut()[SCRIBE].register_table(table)?;
+    let mut start_id = 0;
+    while start_id < rows {
+        let chunk = INGEST_CHUNK.min(rows - start_id);
+        cluster.nodes_mut()[SCRIBE].ingest_rows(table, start_id, chunk, INGEST_GROUPS)?;
+        start_id += chunk;
+    }
+    Ok(())
+}
+
+/// Runs the baseline on one coordinator and asserts everything it left behind.
+///
+/// Returns the coordinator's own result digest so the caller can compare two.
+///
+/// # Errors
+///
+/// Returns the first claim that broke, naming the coordinator.
+async fn coordinate_baseline(
+    cluster: &mut BifrostProcessCluster,
+    coordinator: usize,
+    sql: &str,
+    expected_digest: &str,
+) -> Result<String, PeerJourneyError> {
+    let oracles = [0, 1, 2];
+    let followers: Vec<usize> = oracles
+        .into_iter()
+        .filter(|it| *it != coordinator)
+        .collect();
+
+    let mut scratch_before = Vec::new();
+    let mut gauges_before = Vec::new();
+    let mut leases_before = Vec::new();
+    for index in oracles {
+        scratch_before.push(cluster.nodes_mut()[index].scratch_usage()?);
+        gauges_before.push(cluster.nodes_mut()[index].metric_totals(&LIVE_GAUGES)?);
+        leases_before.push(cluster.nodes_mut()[index].graph_leases()?.0);
+    }
+
+    let evidence = cluster.nodes_mut()[coordinator].execute_analytical_baseline(sql)?;
+
+    if evidence.granted_memory_bytes != QUERY_GRANT_BYTES {
+        return Err(format!(
+            "coordinator {coordinator} admits an Analytical query at {} bytes, not {QUERY_GRANT_BYTES}",
+            evidence.granted_memory_bytes
+        )
+        .into());
+    }
+    let expected_rows = usize::try_from(RIGHT_ROWS)?;
+    if evidence.rows != expected_rows {
+        return Err(format!(
+            "coordinator {coordinator} returned {} rows, not {expected_rows}",
+            evidence.rows
+        )
+        .into());
+    }
+    if !evidence.counts_all_one {
+        return Err(format!("coordinator {coordinator} matched a key more than once").into());
+    }
+    if !evidence.keys_strictly_increasing {
+        return Err(format!("coordinator {coordinator} returned unordered keys").into());
+    }
+    if evidence.result_digest != expected_digest {
+        return Err(format!(
+            "coordinator {coordinator} returned a result the fixture generator did not produce"
+        )
+        .into());
+    }
+    if evidence.batch_memory_bytes < SORT_INPUT_LOWER_BOUND {
+        return Err(format!(
+            "coordinator {coordinator} sorted {} bytes, below the arithmetic minimum \
+             {SORT_INPUT_LOWER_BOUND}",
+            evidence.batch_memory_bytes
+        )
+        .into());
+    }
+    if evidence.batch_memory_bytes <= QUERY_GRANT_BYTES {
+        return Err(format!(
+            "coordinator {coordinator} sorted {} bytes, which its {QUERY_GRANT_BYTES}-byte grant \
+             could have held without spilling",
+            evidence.batch_memory_bytes
+        )
+        .into());
+    }
+
+    let physical = evidence.physical.ok_or_else(|| {
+        PeerJourneyError::from(format!(
+            "coordinator {coordinator} executed no uniquely identifiable output sort"
+        ))
+    })?;
+    if physical.sort_schema != ["filter_key".to_owned(), "matched".to_owned()] {
+        return Err(format!(
+            "coordinator {coordinator} sorted {:?}, not the query's own output",
+            physical.sort_schema
+        )
+        .into());
+    }
+    if !physical.sort_ordering.contains("filter_key") || !physical.sort_ordering.contains("ASC") {
+        return Err(format!(
+            "coordinator {coordinator} ordered by {}, not ascending filter_key",
+            physical.sort_ordering
+        )
+        .into());
+    }
+    if physical.spill_count == 0 || physical.spilled_bytes == 0 || physical.spilled_rows == 0 {
+        return Err(format!(
+            "coordinator {coordinator} reported no spill: {} spills, {} bytes, {} rows",
+            physical.spill_count, physical.spilled_bytes, physical.spilled_rows
+        )
+        .into());
+    }
+    if physical.aggregate_group_types != ["Int64".to_owned()] {
+        return Err(format!(
+            "coordinator {coordinator} grouped on {:?}, not the narrow join key alone",
+            physical.aggregate_group_types
+        )
+        .into());
+    }
+    if physical.join_build_schemas.is_empty()
+        || physical
+            .join_build_schemas
+            .iter()
+            .any(|schema| schema != &["id".to_owned()])
+    {
+        return Err(format!(
+            "coordinator {coordinator} built its join from {:?}, not the projected id alone",
+            physical.join_build_schemas
+        )
+        .into());
+    }
+
+    let exchanged = cluster.nodes_mut()[coordinator].metric_totals(&EXCHANGE_COUNTERS)?;
+    for family in EXCHANGE_COUNTERS {
+        if exchanged.get(family).copied().unwrap_or_default() <= 0.0 {
+            return Err(format!("coordinator {coordinator} recorded no {family}").into());
+        }
+    }
+
+    // Every follower did work this attempt: a graph it leased, and the scan
+    // that lease admitted. A topology where one Oracle silently did nothing
+    // would return the same rows and none of this.
+    for index in &followers {
+        let activated = cluster.nodes_mut()[*index].graph_leases()?.0;
+        if activated <= leases_before[*index] {
+            return Err(format!(
+                "follower {index} activated no graph for coordinator {coordinator}"
+            )
+            .into());
+        }
+    }
+
+    for index in oracles {
+        let (activated, live) = await_released_lease(cluster, index).await?;
+        let _ = activated;
+        if live != 0 {
+            return Err(format!("Oracle {index} still holds {live} graph leases").into());
+        }
+        let scratch = cluster.nodes_mut()[index].scratch_usage()?;
+        if scratch != scratch_before[index] {
+            return Err(format!(
+                "Oracle {index} left scratch at {scratch:?}, not its {:?} baseline",
+                scratch_before[index]
+            )
+            .into());
+        }
+        let gauges = cluster.nodes_mut()[index].metric_totals(&LIVE_GAUGES)?;
+        if gauges != gauges_before[index] {
+            return Err(format!(
+                "Oracle {index} left live gauges at {gauges:?}, not its {:?} baseline",
+                gauges_before[index]
+            )
+            .into());
+        }
+    }
+
+    Ok(evidence.result_digest)
+}
+
+/// Both coordinators still answer on the public and private planes afterwards.
+///
+/// The peer services must remain absent from the public listener and mounted on
+/// the private one: a distributed execution that reached across processes and
+/// left either plane changed is a boundary failure, not a completed query.
+///
+/// # Errors
+///
+/// Returns the first plane whose behavior diverged.
+async fn peer_planes_are_reachable_from_both_coordinators(
+    cluster: &mut BifrostProcessCluster,
+) -> Result<(), PeerJourneyError> {
+    for coordinator in [0_usize, 1] {
+        let address = format!("http://{}", cluster.nodes()[coordinator].grpc_addr());
+        let channel = wyrd_tonic::transport::plaintext_endpoint(address)?
+            .connect()
+            .await?;
+        match super::support::probe_oracle_peer(channel).await {
+            Err(status) if status.code() == wyrd_tonic::tonic::Code::Unimplemented => {}
+            Err(status) => {
+                return Err(format!(
+                    "OraclePeerService answered {:?} on coordinator {coordinator}'s public listener",
+                    status.code()
+                )
+                .into());
+            }
+            Ok(()) => {
+                return Err(format!(
+                    "OraclePeerService served a request on coordinator {coordinator}'s \
+                     public listener"
+                )
+                .into());
+            }
+        }
+
+        let peer = cluster.nodes()[coordinator]
+            .ready_report()
+            .advertise_addr
+            .clone();
+        let before = super::support::polls_at(cluster, coordinator)?;
+        super::support::probe_from(
+            cluster,
+            SCRIBE,
+            &wyrd_testing::bifrost::process_cluster::PeerProbePlan::own(&peer),
+        )?;
+        if super::support::polls_at(cluster, coordinator)? == before {
+            return Err(format!(
+                "coordinator {coordinator} admitted no body on its private peer listener"
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+/// Recomputes the exact result the fixture tables must produce.
+///
+/// Generated from the fixture's own definition rather than from anything the
+/// cluster returned, so a query that silently dropped, duplicated, or reordered
+/// rows cannot agree with it.
+fn expected_result_digest() -> String {
+    use sha2::Digest as _;
+
+    let mut digest = sha2::Sha256::new();
+    for id in 0..RIGHT_ROWS {
+        let key = format!("{id:0KEY_DIGITS$}{filler}", filler = "x".repeat(KEY_FILLER));
+        digest.update((key.len() as u32).to_le_bytes().as_slice());
+        digest.update(key.as_bytes());
+        digest.update(1_i64.to_le_bytes().as_slice());
+    }
+    format!("{:x}", digest.finalize())
+}

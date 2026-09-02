@@ -2497,6 +2497,19 @@ impl Oracle {
         .await
     }
 
+    /// Borrows this node's own root-derived Oracle resource capability.
+    ///
+    /// A physical baseline has to state the grant its query will actually run
+    /// under before it runs, and the grant is derived from the live process
+    /// resource plan rather than from a constant. Acquiring one envelope from
+    /// this capability and reading its grant is the only way to observe the
+    /// same arithmetic admission will apply.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub const fn role_resources(&self) -> &crate::resources::OracleResources {
+        &self.memory.resources
+    }
+
     /// Returns this node's process-owned Oracle spill directory.
     ///
     /// Terminal-cleanup and qualified-spill evidence needs to assert that an
@@ -4424,7 +4437,7 @@ impl Oracle {
     ) -> Result<(SchemaRef, SendableRecordBatchStream, OracleQueryScanStats), OracleExecutionError>
     {
         let physical = Self::plan_physical(session, sql).await?;
-        Self::stream_physical(session, physical, logical_bytes_selected)
+        Self::stream_physical(session, &physical, logical_bytes_selected)
     }
 
     /// Executes one Analytical statement, reserving participants iff it distributes.
@@ -4496,13 +4509,13 @@ impl Oracle {
     /// plan's stream.
     fn stream_physical(
         session: &SessionContext,
-        physical: Arc<dyn ExecutionPlan>,
+        physical: &Arc<dyn ExecutionPlan>,
         logical_bytes_selected: u64,
     ) -> Result<(SchemaRef, SendableRecordBatchStream, OracleQueryScanStats), OracleExecutionError>
     {
         let scan_stats = OracleQueryScanStats::from_plan(physical.as_ref(), logical_bytes_selected);
         let schema = physical.schema();
-        let stream = execute_stream(Arc::clone(&physical), session.task_ctx())
+        let stream = execute_stream(Arc::clone(physical), session.task_ctx())
             .map_err(|error| map_datafusion_error(&error))?;
         Ok((schema, stream, scan_stats))
     }

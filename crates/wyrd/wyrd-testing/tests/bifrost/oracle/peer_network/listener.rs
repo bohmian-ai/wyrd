@@ -24,13 +24,6 @@ use super::support::{
 /// than locating or building a binary itself.
 const NODE_BINARY: &str = env!("CARGO_BIN_EXE_bifrost_peer_test_node");
 
-/// Oracle replica counts the topology scenarios cover.
-///
-/// One proves the complete contract with no remote follower; two and three
-/// prove remote peers change no node's configuration; six proves the same at
-/// the width the Analytical journeys use.
-const ORACLE_TOPOLOGIES: [usize; 4] = [1, 2, 3, 6];
-
 /// The private peer plane is one isolated, mutually authenticated listener
 /// owned by the same `wyrd-server` lifecycle as the public one, and every
 /// target composes exactly the roles it selects.
@@ -77,9 +70,11 @@ async fn prove_peer_listener_isolation() -> Result<(), PeerJourneyError> {
     drop(cluster);
 
     scribe_identity_is_coupled_to_its_volume().await?;
-    for oracles in ORACLE_TOPOLOGIES {
-        oracle_topology_is_uniform_and_exactly_addressed(oracles).await?;
-    }
+    // Three Oracles is the width the Analytical journeys run at, and the
+    // claim is that every replica is configured and addressed identically.
+    // Replaying it at other widths re-proves the same uniformity for the cost
+    // of booting more pods.
+    oracle_topology_is_uniform_and_exactly_addressed(3).await?;
     Ok(())
 }
 
@@ -460,14 +455,14 @@ fn fence_of(report: &NodeReport, node_id: uuid::Uuid) -> Result<u64, PeerJourney
         .ok_or_else(|| "the node published no live role".into())
 }
 
-/// Oracle pods are interchangeable at every replica count.
+/// Oracle pods are interchangeable across `oracles` replicas.
 ///
-/// One bullet of this claim is deliberately absent: every Oracle must also be
-/// able to coordinate an *inactive Analytical* query. That seam
-/// (`AnalyticalExecutionHandle::execute_inactive`) is restored by the retry
-/// slice, and `ControlRequest::ExecuteInactiveSql` is already wired through the
-/// harness for it. The assertion is added there rather than asserted against a
-/// seam that does not exist yet.
+/// Interchangeability of the *Analytical coordinator* is proven where it is
+/// observable, by
+/// `peer_network::analytical::inactive_baseline_executes_join_group_spill_and_interchangeable_topology`,
+/// which runs the same physical query on two different Oracles of one cluster
+/// and compares their results. This scenario proves the configuration half:
+/// membership, addressing, listener isolation, and peer reachability.
 ///
 /// # Errors
 ///

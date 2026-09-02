@@ -16,7 +16,7 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Array as _, Int64Array, StringArray};
+use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
@@ -35,20 +35,17 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::PrincipalId;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
-    AuthMethod, BifrostQueryRequest, FreshnessPolicy, QueryStreamFrame, QueryTerminalFrame,
-    VisibilityMode,
+    AuthMethod, BifrostQueryRequest, FreshnessPolicy, QueryStreamFrame, VisibilityMode,
 };
 use wyrd_testing::WyrdTestServer;
 use wyrd_testing::bifrost::{BifrostClusterSpec, WyrdTestCluster};
 
 use crate::support::*;
 
-/// One drained inactive Analytical result: its rows and its terminal frame.
+/// One drained inactive Analytical result.
 struct AnalyticalOutcome {
     /// Every decoded Arrow batch the distributed plan produced, in order.
     batches: Vec<RecordBatch>,
-    /// The one terminal frame the production stream owner emitted.
-    terminal: QueryTerminalFrame,
 }
 
 impl AnalyticalOutcome {
@@ -150,10 +147,10 @@ async fn execute_inactive_analytical(
             }
         }
     }
-    Ok(AnalyticalOutcome {
-        batches,
-        terminal: terminal.ok_or("inactive analytical stream emitted no terminal frame")?,
-    })
+    // Drained rather than dropped: a stream that ended without a terminal did
+    // not settle its graph, whatever its rows say.
+    terminal.ok_or("inactive analytical stream emitted no terminal frame")?;
+    Ok(AnalyticalOutcome { batches })
 }
 
 /// Sends one Arrow IPC batch carrying a single fixture row.
@@ -221,67 +218,6 @@ async fn seed_table(cluster: &WyrdTestCluster, prefix: &str) -> Result<String, J
     ingest.flush_bifrost().await?;
     cluster.refresh_oracle_snapshots().await?;
     Ok(table)
-}
-
-/// Raw SQL joining two published tables and aggregating the result executes on
-/// followers and returns the same rows a single node would have produced.
-#[tokio::test]
-#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
-async fn pg_inactive_analytical_raw_sql_executes_join_and_partial_final_aggregate_on_followers() {
-    prove_join_and_aggregate()
-        .await
-        .expect("inactive analytical join and aggregate journey");
-}
-
-/// Drives the join and aggregate proof against a six-node cluster.
-///
-/// # Errors
-///
-/// Returns a cluster, ingest, execution, or assertion error.
-async fn prove_join_and_aggregate() -> Result<(), JourneyError> {
-    let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::six_capacity()).await?;
-    let tenant = cluster.data_tenant_id();
-    let left = seed_table(&cluster, "analytical_left").await?;
-    let right = seed_table(&cluster, "analytical_right").await?;
-    let query_server = cluster.server(0).ok_or("missing query node")?;
-
-    let outcome = execute_inactive_analytical(
-        query_server,
-        tenant,
-        &format!(
-            "SELECT l.filter_key, COUNT(*) AS matched \
-             FROM vala.bifrost.{left} AS l \
-             JOIN vala.bifrost.{right} AS r ON l.id = r.id \
-             GROUP BY l.filter_key ORDER BY l.filter_key"
-        ),
-    )
-    .await?;
-
-    let groups = i64::try_from(outcome.rows())?;
-    if groups != FIXTURE_GROUPS {
-        return Err(format!("expected {FIXTURE_GROUPS} groups, saw {groups}").into());
-    }
-    let matched: i64 = outcome
-        .batches
-        .iter()
-        .map(|batch| {
-            batch
-                .column(1)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .map(|counts| (0..counts.len()).map(|row| counts.value(row)).sum::<i64>())
-                .unwrap_or_default()
-        })
-        .sum();
-    if matched != FIXTURE_ROWS {
-        return Err(format!("expected {FIXTURE_ROWS} matched rows, saw {matched}").into());
-    }
-    if outcome.terminal.row_count != u64::try_from(outcome.rows())? {
-        return Err("terminal row count differs from the decoded Arrow frames".into());
-    }
-
-    cluster.shutdown().await?;
-    Ok(())
 }
 
 /// Returns every node's live Analytical ownership, leader and follower halves.

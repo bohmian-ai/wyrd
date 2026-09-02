@@ -2856,7 +2856,7 @@ impl AnalyticalGraphLifecycle {
                 evidence.spilled_rows,
             );
             #[cfg(feature = "test-support")]
-            self.supervisor.record_output_sort(evidence);
+            self.supervisor.record_physical_evidence(evidence);
         }
         Ok(())
     }
@@ -7883,25 +7883,30 @@ impl AnalyticalAttemptOwnership {
     }
 }
 
-/// One completed query's own output-sort identity and spill evidence.
+/// One completed query's own physical-plan identity and retained spill evidence.
 ///
-/// Produced from exactly one `SortExec`'s retained metric set after the plan's
-/// result stream has been dropped, so a positive spill count here names the
-/// operator that spilled rather than an unattributed whole-plan total. The
-/// identity fields travel with the counters because "some sort spilled" and
-/// "this query's output sort spilled" are different claims.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AnalyticalOutputSortEvidence {
-    /// Field names of the sort's output schema, in order.
-    pub schema: Vec<String>,
-    /// Rendered lexicographic ordering the sort produced.
-    pub ordering: String,
-    /// Spill files the sort wrote.
+/// Folded once, from the executed plan, after its stream is dropped. Every
+/// field is read off the production plan rather than reconstructed, so a
+/// journey asserting on it is asserting on what actually ran.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AnalyticalPhysicalEvidence {
+    /// Output-sort field names, in output order.
+    pub sort_schema: Vec<String>,
+    /// Output-sort ordering, rendered exactly as the plan holds it.
+    pub sort_ordering: String,
+    /// Times the output sort spilled a run to scratch.
     pub spill_count: u64,
-    /// Bytes the sort spilled.
+    /// Bytes the output sort wrote to scratch.
     pub spilled_bytes: u64,
-    /// Rows the sort spilled.
+    /// Rows the output sort wrote to scratch.
     pub spilled_rows: u64,
+    /// Distinct grouping-column types every aggregate in the plan groups on.
+    ///
+    /// A plan that groups on the wide sort key rather than the narrow join key
+    /// would carry `Utf8` here, which is the shape the baseline refuses.
+    pub aggregate_group_types: Vec<String>,
+    /// Field names of each hash join's build-side child, in plan order.
+    pub join_build_schemas: Vec<Vec<String>>,
 }
 
 /// One graph's deferred physical-metric fold, awaited inside its own deadline.
@@ -7955,7 +7960,7 @@ impl AnalyticalGraphMetricFold {
     /// Awaits the follower fold, then reads the plan's own output-sort evidence.
     ///
     /// The caller bounds this; nothing here imposes a second timer.
-    pub(super) async fn settle(self) -> Option<AnalyticalOutputSortEvidence> {
+    pub(super) async fn settle(self) -> Option<AnalyticalPhysicalEvidence> {
         let Self { plan, fold } = self;
         fold.await;
         super::exec::output_sort_evidence(&plan)

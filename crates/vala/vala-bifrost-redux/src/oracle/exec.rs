@@ -34,9 +34,11 @@ use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReser
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_expr::expressions::Column;
+use datafusion::physical_plan::aggregates::AggregateExec;
 use datafusion::physical_plan::execution_plan::{
     Boundedness, EmissionType, PlanProperties, SchedulingType,
 };
+use datafusion::physical_plan::joins::HashJoinExec;
 use datafusion::physical_plan::metrics::{
     Count, ExecutionPlanMetricsSet, Metric, MetricValue, MetricsSet,
 };
@@ -1048,70 +1050,117 @@ fn fold_distributed_scan_metrics(
     }
 }
 
-/// Reads the completed output sort's own retained spill evidence, if it has one.
+/// Reads the completed plan's own physical shape and retained spill evidence.
 ///
-/// The "output sort" is the one `SortExec` in the whole plan — coordinator
-/// stage and every `Stage::Local` descendant included — whose output schema is
-/// the query's own. A query whose final ordering is produced by exactly one
-/// sort therefore has exactly one candidate, and the metric set read here is
-/// that operator's own rather than a whole-plan aggregate: a plan-wide spill
-/// total cannot distinguish the sort that spilled from any other consumer that
-/// did.
+/// The output sort is identified by carrying the root's own output schema,
+/// which is unique for this baseline's projection; zero or several matches
+/// return `None` rather than guessing, so a caller can never read a partial
+/// sort's metrics as the query's. The plan must already have been executed and
+/// its stream dropped: `MetricsSet` values are retained on the node, and an
+/// absent metric is distinguishable from a zero one only before execution.
 ///
-/// Zero or more than one candidate reports nothing rather than a fabricated
-/// zero, which is the same absent-versus-zero rule the scan fold follows. The
-/// plan must already have been executed and its stream dropped; `DataFusion`
-/// registers a `SortExec`'s metric set during execution, so reading earlier
-/// would report an operator that had not yet spilled.
+/// # Panics
+///
+/// Does not panic.
 pub(crate) fn output_sort_evidence(
     root: &Arc<dyn ExecutionPlan>,
-) -> Option<super::analytical::AnalyticalOutputSortEvidence> {
-    let mut found = Vec::new();
-    collect_output_sorts(root, root.schema().as_ref(), &mut found);
-    match found.as_slice() {
-        [evidence] => Some(evidence.clone()),
-        _ => None,
+) -> Option<super::analytical::AnalyticalPhysicalEvidence> {
+    let mut walk = PhysicalEvidenceWalk::default();
+    walk.visit(root, root.schema().as_ref());
+    let [sort] = walk.sorts.as_slice() else {
+        return None;
+    };
+    let mut aggregate_group_types: Vec<String> = walk.aggregate_group_types.into_iter().collect();
+    aggregate_group_types.sort();
+    Some(super::analytical::AnalyticalPhysicalEvidence {
+        sort_schema: sort.schema.clone(),
+        sort_ordering: sort.ordering.clone(),
+        spill_count: sort.spill_count,
+        spilled_bytes: sort.spilled_bytes,
+        spilled_rows: sort.spilled_rows,
+        aggregate_group_types,
+        join_build_schemas: walk.join_build_schemas,
+    })
+}
+
+/// One output sort's identity and retained spill counters.
+#[derive(Debug, Clone)]
+struct OutputSortNode {
+    /// Field names the sort emits, in output order.
+    schema: Vec<String>,
+    /// Ordering the sort holds, rendered exactly as the plan states it.
+    ordering: String,
+    /// Times this sort spilled a run to scratch.
+    spill_count: u64,
+    /// Bytes this sort wrote to scratch.
+    spilled_bytes: u64,
+    /// Rows this sort wrote to scratch.
+    spilled_rows: u64,
+}
+
+/// Accumulates one plan's physical shape across ordinary and distributed edges.
+///
+/// A distributed plan hides its remote stages behind network boundaries, so a
+/// walk over `children()` alone would see only the coordinator's fragment.
+/// Crossing `Stage::Local` reaches the stages this process itself owns, which
+/// is where the output sort and its retained metrics live.
+#[derive(Debug, Default)]
+struct PhysicalEvidenceWalk {
+    /// Every sort carrying the root's output schema.
+    sorts: Vec<OutputSortNode>,
+    /// Distinct grouping-column types across every aggregate in the plan.
+    aggregate_group_types: std::collections::BTreeSet<String>,
+    /// Field names of each hash join's build-side child, in visit order.
+    join_build_schemas: Vec<Vec<String>>,
+}
+
+impl PhysicalEvidenceWalk {
+    /// Records `node`'s own contribution, then descends into everything it owns.
+    fn visit(&mut self, node: &Arc<dyn ExecutionPlan>, schema: &Schema) {
+        if let Some(sort) = node.downcast_ref::<SortExec>()
+            && sort.schema().fields() == schema.fields()
+        {
+            let metrics = sort.metrics().unwrap_or_default();
+            let as_u64 =
+                |value: Option<usize>| u64::try_from(value.unwrap_or(0)).unwrap_or(u64::MAX);
+            self.sorts.push(OutputSortNode {
+                schema: field_names(sort.schema().as_ref()),
+                ordering: sort.expr().to_string(),
+                spill_count: as_u64(metrics.spill_count()),
+                spilled_bytes: as_u64(metrics.spilled_bytes()),
+                spilled_rows: as_u64(metrics.spilled_rows()),
+            });
+        }
+        if let Some(aggregate) = node.downcast_ref::<AggregateExec>() {
+            let input = aggregate.input().schema();
+            for (expr, _) in aggregate.group_expr().expr() {
+                if let Ok(data_type) = expr.data_type(input.as_ref()) {
+                    self.aggregate_group_types.insert(data_type.to_string());
+                }
+            }
+        }
+        if let Some(join) = node.downcast_ref::<HashJoinExec>() {
+            self.join_build_schemas
+                .push(field_names(join.left().schema().as_ref()));
+        }
+        if let Some(boundary) = node.as_network_boundary()
+            && let datafusion_distributed::Stage::Local(stage) = boundary.input_stage()
+        {
+            self.visit(&stage.plan, schema);
+        }
+        for child in node.children() {
+            self.visit(child, schema);
+        }
     }
 }
 
-/// Accumulates every `SortExec` carrying `schema`, crossing distributed edges.
-///
-/// Mirrors [`fold_distributed_scan_metrics`]: a distributed plan hangs each
-/// stage off its network boundary's input stage rather than off its children,
-/// so descending both edges is what reaches an operator that upstream placed
-/// below a boundary. Evidence is built at the match site because a stage's
-/// plan is reached through a temporary borrow that cannot outlive the walk.
-fn collect_output_sorts(
-    node: &Arc<dyn ExecutionPlan>,
-    schema: &Schema,
-    found: &mut Vec<super::analytical::AnalyticalOutputSortEvidence>,
-) {
-    if let Some(sort) = node.downcast_ref::<SortExec>()
-        && sort.schema().fields() == schema.fields()
-    {
-        let metrics = sort.metrics().unwrap_or_default();
-        let as_u64 = |value: Option<usize>| u64::try_from(value.unwrap_or(0)).unwrap_or(u64::MAX);
-        found.push(super::analytical::AnalyticalOutputSortEvidence {
-            schema: sort
-                .schema()
-                .fields()
-                .iter()
-                .map(|field| field.name().clone())
-                .collect(),
-            ordering: sort.expr().to_string(),
-            spill_count: as_u64(metrics.spill_count()),
-            spilled_bytes: as_u64(metrics.spilled_bytes()),
-            spilled_rows: as_u64(metrics.spilled_rows()),
-        });
-    }
-    if let Some(boundary) = node.as_network_boundary()
-        && let datafusion_distributed::Stage::Local(stage) = boundary.input_stage()
-    {
-        collect_output_sorts(&stage.plan, schema, found);
-    }
-    for child in node.children() {
-        collect_output_sorts(child, schema, found);
-    }
+/// Renders one schema's field names in output order.
+fn field_names(schema: &Schema) -> Vec<String> {
+    schema
+        .fields()
+        .iter()
+        .map(|field| field.name().clone())
+        .collect()
 }
 
 /// `DataFusion` Parquet metrics naming row groups a scan actually read.

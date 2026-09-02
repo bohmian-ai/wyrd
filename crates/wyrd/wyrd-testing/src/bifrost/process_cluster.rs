@@ -19,7 +19,7 @@
 //! wire contract: it is mounted on no listener, carries no tenant data, and
 //! never carries key material.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead, BufReader, Write as _};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
@@ -171,6 +171,23 @@ pub enum ControlRequest {
     ExecuteInactiveSql {
         /// Statement to execute.
         sql: String,
+    },
+    /// Execute one statement and report its complete physical evidence.
+    ///
+    /// Distinct from [`ControlRequest::ExecuteInactiveSql`] because the
+    /// evidence a physical baseline needs — the admitted grant, the scratch
+    /// occupancy on either side, the result digest, and the executed plan's own
+    /// spill counters — only exists inside the process that ran the query.
+    ExecuteAnalyticalBaseline {
+        /// Statement to execute.
+        sql: String,
+    },
+    /// Report this child's process-owned Oracle scratch occupancy.
+    ScratchUsage,
+    /// Report the current total of each named production metric family.
+    MetricTotals {
+        /// Prometheus family names to total.
+        families: Vec<String>,
     },
     /// Register one Bifrost table through this child's own catalog.
     RegisterTable {
@@ -392,6 +409,15 @@ pub enum ControlResponse {
         /// Rows the statement produced.
         rows: usize,
     },
+    /// Answer to [`ControlRequest::ExecuteAnalyticalBaseline`].
+    AnalyticalBaseline(Box<AnalyticalBaselineEvidence>),
+    /// Answer to [`ControlRequest::ScratchUsage`].
+    ScratchUsage(ScratchUsage),
+    /// Answer to [`ControlRequest::MetricTotals`].
+    MetricTotals {
+        /// Total of each requested family, absent families reported as zero.
+        totals: BTreeMap<String, f64>,
+    },
     /// Answer to [`ControlRequest::RegisterTable`].
     Registered,
     /// Answer to [`ControlRequest::IngestRows`].
@@ -442,6 +468,52 @@ pub enum ControlResponse {
     },
     /// Ordered shutdown has begun.
     ShuttingDown,
+}
+
+/// Everything one analytical statement leaves observable inside its own pod.
+///
+/// Assembled by the child around a single production execution: the grant is
+/// read from the live resource plan before the query runs, the scratch
+/// occupancy is measured on both sides of it, the result evidence is folded
+/// from the decoded Arrow frames, and the physical evidence is the executed
+/// plan's own retained metrics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnalyticalBaselineEvidence {
+    /// Rows the statement produced.
+    pub rows: usize,
+    /// Hex SHA-256 over every ordered `(filter_key, matched)` pair.
+    ///
+    /// Each row contributes its key length as four little-endian bytes, the
+    /// key's UTF-8 bytes, then the count as eight little-endian bytes, so no
+    /// two distinct results can collide by re-splitting the same byte run.
+    pub result_digest: String,
+    /// Summed `RecordBatch::get_array_memory_size` over every decoded batch.
+    pub batch_memory_bytes: u64,
+    /// Whether every row's count column held exactly one.
+    pub counts_all_one: bool,
+    /// Whether the key column increased strictly across the whole result.
+    pub keys_strictly_increasing: bool,
+    /// Memory ceiling the live resource plan grants one Analytical query.
+    pub granted_memory_bytes: u64,
+    /// Process-owned Oracle scratch occupancy before the statement ran.
+    pub scratch_before: ScratchUsage,
+    /// Process-owned Oracle scratch occupancy after its terminal.
+    pub scratch_after: ScratchUsage,
+    /// The executed plan's own shape and retained spill counters.
+    ///
+    /// Absent when the plan carried no uniquely identifiable output sort, which
+    /// a journey asserting on spill evidence must treat as a failure rather
+    /// than as an absent-but-acceptable measurement.
+    pub physical: Option<vala_bifrost_redux::oracle::analytical::AnalyticalPhysicalEvidence>,
+}
+
+/// One directory tree's entry and byte occupancy at a moment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScratchUsage {
+    /// Files under the root, at any depth.
+    pub entries: u64,
+    /// Summed length of those files.
+    pub bytes: u64,
 }
 
 /// What one child reports about itself.
@@ -935,6 +1007,67 @@ impl ProcessNode {
             ControlResponse::Failed { detail } => Err(ProcessClusterError::Child(detail)),
             other => Err(ProcessClusterError::Protocol(format!(
                 "expected an ingest, received {other:?}"
+            ))),
+        }
+    }
+
+    /// Runs one statement and collects its complete in-pod physical evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::request`], and
+    /// [`ProcessClusterError::Child`] when the statement failed.
+    pub fn execute_analytical_baseline(
+        &mut self,
+        sql: &str,
+    ) -> Result<AnalyticalBaselineEvidence, ProcessClusterError> {
+        match self.request(&ControlRequest::ExecuteAnalyticalBaseline {
+            sql: sql.to_owned(),
+        })? {
+            ControlResponse::AnalyticalBaseline(evidence) => Ok(*evidence),
+            ControlResponse::Failed { detail } => Err(ProcessClusterError::Child(detail)),
+            other => Err(ProcessClusterError::Protocol(format!(
+                "expected analytical evidence, received {other:?}"
+            ))),
+        }
+    }
+
+    /// Reads this child's process-owned Oracle scratch occupancy.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::request`], and
+    /// [`ProcessClusterError::Child`] when the scratch root cannot be measured.
+    pub fn scratch_usage(&mut self) -> Result<ScratchUsage, ProcessClusterError> {
+        match self.request(&ControlRequest::ScratchUsage)? {
+            ControlResponse::ScratchUsage(usage) => Ok(usage),
+            ControlResponse::Failed { detail } => Err(ProcessClusterError::Child(detail)),
+            other => Err(ProcessClusterError::Protocol(format!(
+                "expected scratch usage, received {other:?}"
+            ))),
+        }
+    }
+
+    /// Totals each named production metric family inside this child's process.
+    ///
+    /// A family this pod has never emitted totals zero, so a caller can take a
+    /// baseline before the series exists and still difference against it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::request`], and
+    /// [`ProcessClusterError::Child`] when the recorder could not be read.
+    pub fn metric_totals(
+        &mut self,
+        families: &[&str],
+    ) -> Result<BTreeMap<String, f64>, ProcessClusterError> {
+        match self.request(&ControlRequest::MetricTotals {
+            families: families.iter().map(|name| (*name).to_owned()).collect(),
+        })? {
+            ControlResponse::MetricTotals { totals } => Ok(totals),
+            ControlResponse::Failed { detail } => Err(ProcessClusterError::Child(detail)),
+            other => Err(ProcessClusterError::Protocol(format!(
+                "expected metric totals, received {other:?}"
             ))),
         }
     }

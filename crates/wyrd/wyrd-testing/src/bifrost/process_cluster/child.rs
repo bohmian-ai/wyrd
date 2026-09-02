@@ -32,6 +32,23 @@ use super::{
 use crate::bifrost::peer_keyring::TestPeerKeyringPaths;
 use crate::server::{TestBifrostPeerTls, WyrdTestServer};
 
+/// Fixed process-visible resources every simulated pod boots under.
+///
+/// A deployment gives every pod an identical, explicitly bounded envelope, and
+/// the whole point of a physical baseline is that the grant, the partition
+/// count, and the spill threshold are the same numbers on every run. Observing
+/// the host instead would make every physical assertion a property of whichever
+/// machine ran the test.
+const POD_SYSTEM_RESOURCES: vala_bifrost_redux::resources::SystemResourceSnapshot =
+    vala_bifrost_redux::resources::SystemResourceSnapshot {
+        memory_limit_bytes: 512 * 1024 * 1024,
+        effective_cpu: 4,
+        scratch_capacity_bytes: 4 * 1024 * 1024 * 1024,
+        scratch_available_bytes: 4 * 1024 * 1024 * 1024,
+        memory_source: vala_bifrost_redux::resources::ResourceSource::Injected,
+        cpu_source: vala_bifrost_redux::resources::ResourceSource::Injected,
+    };
+
 /// How long a child waits for its own readiness before reporting failure.
 const READY_DEADLINE: Duration = Duration::from_secs(60);
 
@@ -70,6 +87,13 @@ pub fn run_peer_test_node() -> ExitCode {
 /// readiness is not reached within [`READY_DEADLINE`].
 async fn serve() -> Result<(), ProcessClusterError> {
     let config = ChildConfig::from_env()?;
+    // Installed before composition so the Oracle's pre-registered analytical
+    // families exist in the recorder from boot; a recorder installed later
+    // would leave a family absent until its first increment, which is
+    // indistinguishable from a counter that never moved.
+    let telemetry = crate::bifrost::shared_process_telemetry_for_test()
+        .map_err(|error| ProcessClusterError::Child(error.to_string()))?
+        .1;
     let fingerprint = config.certificate_fingerprint()?;
     let (server, credentials, fixture) = config.start().await?;
     let report = await_ready(&server, &config, fingerprint).await?;
@@ -132,6 +156,32 @@ async fn serve() -> Result<(), ProcessClusterError> {
                     detail: error.to_string(),
                 })?,
             },
+            ControlRequest::ExecuteAnalyticalBaseline { sql } => {
+                match config.execute_analytical_baseline(&server, &sql).await {
+                    Ok(evidence) => {
+                        emit(&ControlResponse::AnalyticalBaseline(Box::new(evidence)))?;
+                    }
+                    Err(error) => emit(&ControlResponse::Failed {
+                        detail: error.to_string(),
+                    })?,
+                }
+            }
+            ControlRequest::ScratchUsage => match oracle(&server)
+                .and_then(|engine| scratch_usage(engine.analytical_spill_root()))
+            {
+                Ok(usage) => emit(&ControlResponse::ScratchUsage(usage))?,
+                Err(error) => emit(&ControlResponse::Failed {
+                    detail: error.to_string(),
+                })?,
+            },
+            ControlRequest::MetricTotals { families } => {
+                match metric_totals(&telemetry, &families) {
+                    Ok(totals) => emit(&ControlResponse::MetricTotals { totals })?,
+                    Err(error) => emit(&ControlResponse::Failed {
+                        detail: error.to_string(),
+                    })?,
+                }
+            }
             ControlRequest::RefreshSnapshot => match refresh_snapshot(&server).await {
                 Ok(()) => emit(&ControlResponse::Refreshed)?,
                 Err(error) => emit(&ControlResponse::Failed {
@@ -263,11 +313,12 @@ impl InactiveQuerySlot {
         let cancel = tokio_util::sync::CancellationToken::new();
         let token = cancel.clone();
         let task = tokio::spawn(async move {
+            let mut fold = ResultFold::default();
             tokio::select! {
                 () = token.cancelled() => Err(ProcessClusterError::Child(
                     "the inactive attempt was cancelled by its caller".to_owned(),
                 )),
-                outcome = drive_inactive_sql(engine, tenant_id, sql) => outcome,
+                outcome = drive_inactive_sql(engine, tenant_id, sql, &mut fold) => outcome,
             }
         });
         Self { task, cancel }
@@ -534,6 +585,7 @@ impl ChildConfig {
             .with_peer_bind(self.peer_bind)
             .with_bind_addrs_for_test(self.http_bind, self.grpc_bind)
             .with_durable_bifrost_roots(self.wal_root.clone(), self.spill_root.clone())
+            .with_system_resources_for_test(POD_SYSTEM_RESOURCES)
             .with_oracle_peer_credentials(Arc::clone(&credentials))
             .with_storage_handle(Arc::clone(&storage))
             .start_with_resources(Arc::clone(&fixture), Arc::clone(&storage), None)
@@ -679,8 +731,234 @@ impl ChildConfig {
         server: &WyrdTestServer,
         sql: &str,
     ) -> Result<usize, ProcessClusterError> {
-        drive_inactive_sql(oracle(server)?, self.tenant_id, sql.to_owned()).await
+        drive_inactive_sql(
+            oracle(server)?,
+            self.tenant_id,
+            sql.to_owned(),
+            &mut ResultFold::default(),
+        )
+        .await
     }
+
+    /// Runs one statement and collects everything its own pod can observe.
+    ///
+    /// The grant is read before the statement runs, from an envelope acquired
+    /// out of the live resource plan and immediately dropped, so it is the
+    /// arithmetic admission will apply rather than a restatement of a constant.
+    /// Scratch is measured on both sides of the same statement, and the
+    /// physical evidence is folded by the graph lifecycle before the terminal
+    /// this call awaits, so it is already retained by the time it is read.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProcessClusterError::Child`] when this target composes no
+    /// Oracle or no Analytical handle, the resource plan admits no Analytical
+    /// query, scratch cannot be measured, or the statement fails.
+    async fn execute_analytical_baseline(
+        &self,
+        server: &WyrdTestServer,
+        sql: &str,
+    ) -> Result<super::AnalyticalBaselineEvidence, ProcessClusterError> {
+        let child = ProcessClusterError::Child;
+        let engine = oracle(server)?;
+        let granted_memory_bytes = {
+            let envelope = engine
+                .role_resources()
+                .try_acquire_query(
+                    vala_bifrost_redux::resources::OracleResourceRequest::for_class(
+                        wyrd_spec::vala::api::QueryClass::Analytical,
+                        0.0,
+                    ),
+                )
+                .map_err(|error| child(error.to_string()))?;
+            let granted = envelope.granted_memory_bytes;
+            drop(envelope);
+            u64::try_from(granted).unwrap_or(u64::MAX)
+        };
+        let scratch_root = engine.analytical_spill_root().to_path_buf();
+        let scratch_before = scratch_usage(&scratch_root)?;
+
+        let mut fold = ResultFold::default();
+        let rows = drive_inactive_sql(
+            Arc::clone(&engine),
+            self.tenant_id,
+            sql.to_owned(),
+            &mut fold,
+        )
+        .await?;
+
+        let scratch_after = scratch_usage(&scratch_root)?;
+        let physical = engine
+            .analytical_execution()
+            .ok_or_else(|| child("this target composes no Analytical handle".to_owned()))?
+            .supervisor()
+            .settled_physical_evidence();
+        Ok(super::AnalyticalBaselineEvidence {
+            rows,
+            result_digest: fold.digest(),
+            batch_memory_bytes: fold.batch_memory_bytes,
+            counts_all_one: fold.counts_all_one,
+            keys_strictly_increasing: fold.keys_strictly_increasing,
+            granted_memory_bytes,
+            scratch_before,
+            scratch_after,
+            physical,
+        })
+    }
+}
+
+/// Folds one ordered `(Utf8, Int64)` result into assertable evidence.
+///
+/// Accumulated frame by frame rather than over a retained result set: the
+/// baseline's result is a third of a gigabyte of keys, and holding it to
+/// re-walk it later would change the very memory behavior under test.
+#[derive(Debug)]
+struct ResultFold {
+    /// Running digest over every ordered `(key, count)` pair.
+    digest: Sha256,
+    /// Summed `RecordBatch::get_array_memory_size` over every accepted batch.
+    batch_memory_bytes: u64,
+    /// Whether every count seen so far was exactly one.
+    counts_all_one: bool,
+    /// Whether keys have increased strictly across every batch boundary.
+    keys_strictly_increasing: bool,
+    /// Last key accepted, so ordering is checked across batches too.
+    previous_key: Option<String>,
+}
+
+impl Default for ResultFold {
+    /// Starts empty, which trivially satisfies both ordering claims.
+    fn default() -> Self {
+        Self {
+            digest: Sha256::new(),
+            batch_memory_bytes: 0,
+            counts_all_one: true,
+            keys_strictly_increasing: true,
+            previous_key: None,
+        }
+    }
+}
+
+impl ResultFold {
+    /// Accepts one decoded batch, ignoring a batch of any other shape.
+    ///
+    /// A statement whose result is not `(Utf8, Int64)` contributes only its
+    /// array memory size, so this fold stays usable by callers that want the
+    /// row count alone.
+    fn accept(&mut self, batch: &arrow::record_batch::RecordBatch) {
+        self.batch_memory_bytes = self
+            .batch_memory_bytes
+            .saturating_add(batch.get_array_memory_size() as u64);
+        let (Some(keys), Some(counts)) = (
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>(),
+            batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>(),
+        ) else {
+            return;
+        };
+        for row in 0..batch.num_rows() {
+            let key = keys.value(row);
+            let count = counts.value(row);
+            if count != 1 {
+                self.counts_all_one = false;
+            }
+            if self
+                .previous_key
+                .as_ref()
+                .is_some_and(|previous| previous.as_str() >= key)
+            {
+                self.keys_strictly_increasing = false;
+            }
+            self.previous_key = Some(key.to_owned());
+            self.digest
+                .update((key.len() as u32).to_le_bytes().as_slice());
+            self.digest.update(key.as_bytes());
+            self.digest.update(count.to_le_bytes().as_slice());
+        }
+    }
+
+    /// Finishes the running digest as lowercase hex.
+    fn digest(&self) -> String {
+        format!("{:x}", self.digest.clone().finalize())
+    }
+}
+
+/// Measures one directory tree's file count and byte occupancy.
+///
+/// An absent root reports zero rather than an error: a pod that has never
+/// spilled has no directory to walk, and that is the baseline a journey
+/// compares against.
+///
+/// # Errors
+///
+/// Returns [`ProcessClusterError::Child`] when an existing directory cannot be
+/// read, because an unreadable scratch root would otherwise be reported as an
+/// empty one.
+fn scratch_usage(root: &std::path::Path) -> Result<super::ScratchUsage, ProcessClusterError> {
+    let child = ProcessClusterError::Child;
+    let mut usage = super::ScratchUsage {
+        entries: 0,
+        bytes: 0,
+    };
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let listing = match std::fs::read_dir(&directory) {
+            Ok(listing) => listing,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(child(error.to_string())),
+        };
+        for entry in listing {
+            let entry = entry.map_err(|error| child(error.to_string()))?;
+            let metadata = match entry.metadata() {
+                Ok(metadata) => metadata,
+                // A spill file removed between the listing and the stat is a
+                // cleanup that already happened, not a measurement failure.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(child(error.to_string())),
+            };
+            if metadata.is_dir() {
+                pending.push(entry.path());
+            } else {
+                usage.entries = usage.entries.saturating_add(1);
+                usage.bytes = usage.bytes.saturating_add(metadata.len());
+            }
+        }
+    }
+    Ok(usage)
+}
+
+/// Totals each requested production metric family in this process.
+///
+/// Every sample of a family is summed regardless of its labels, and a family
+/// this pod has never emitted totals zero, so a caller can baseline a series
+/// before it exists.
+///
+/// # Errors
+///
+/// Returns [`ProcessClusterError::Child`] when the installed recorder renders
+/// an exposition this process cannot parse.
+fn metric_totals(
+    telemetry: &crate::bifrost::BifrostTelemetryCapture,
+    families: &[String],
+) -> Result<std::collections::BTreeMap<String, f64>, ProcessClusterError> {
+    let samples = telemetry
+        .snapshot()
+        .map_err(|error| ProcessClusterError::Child(error.to_string()))?;
+    let mut totals: std::collections::BTreeMap<String, f64> = families
+        .iter()
+        .map(|family| (family.clone(), 0.0))
+        .collect();
+    for sample in samples {
+        if let Some(total) = totals.get_mut(&sample.family) {
+            *total += sample.value;
+        }
+    }
+    Ok(totals)
 }
 
 /// Resolves this child's own Oracle engine.
@@ -711,6 +989,7 @@ async fn drive_inactive_sql(
     engine: Arc<vala_bifrost_redux::oracle::Oracle>,
     tenant_id: wyrd_spec::DataTenantId,
     sql: String,
+    fold: &mut ResultFold,
 ) -> Result<usize, ProcessClusterError> {
     {
         let child = |detail: String| ProcessClusterError::Child(detail);
@@ -770,10 +1049,11 @@ async fn drive_inactive_sql(
                         .map_err(|error| child(error.to_string()))?;
                 }
                 wyrd_spec::vala::api::QueryStreamFrame::Batch(batch) => {
-                    rows += decoder
+                    let decoded = decoder
                         .accept_batch(&batch.arrow_ipc_batch)
-                        .map_err(|error| child(error.to_string()))?
-                        .num_rows();
+                        .map_err(|error| child(error.to_string()))?;
+                    rows += decoded.num_rows();
+                    fold.accept(&decoded);
                 }
                 wyrd_spec::vala::api::QueryStreamFrame::Terminal(frame) => terminal = Some(frame),
             }

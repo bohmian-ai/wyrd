@@ -388,7 +388,7 @@ pub struct AnalyticalSupervisor {
     /// process-cluster journey needs the exact per-operator numbers its own
     /// query produced, which no counter family can attribute.
     #[cfg(feature = "test-support")]
-    output_sort: Mutex<Option<super::analytical::AnalyticalOutputSortEvidence>>,
+    physical_evidence: Mutex<Option<super::analytical::AnalyticalPhysicalEvidence>>,
 }
 
 impl fmt::Debug for AnalyticalSupervisor {
@@ -413,7 +413,7 @@ impl AnalyticalSupervisor {
             root_cancel: CancellationToken::new(),
             accepting: AtomicBool::new(true),
             #[cfg(feature = "test-support")]
-            output_sort: Mutex::new(None),
+            physical_evidence: Mutex::new(None),
         }
     }
 
@@ -746,16 +746,16 @@ impl AnalyticalSupervisor {
     /// Retains the most recently settled graph's output-sort evidence.
     ///
     /// Test-tier only: production publishes the same evidence as counters from
-    /// [`super::telemetry::record_output_sort`]. A journey needs the exact
+    /// [`super::telemetry::record_output_sort_spill`]. A journey needs the exact
     /// per-operator values its own query produced, and a counter family cannot
     /// answer "which sort" — so the settled evidence is kept verbatim for the
     /// process-cluster control protocol to project.
     #[cfg(feature = "test-support")]
-    pub(super) fn record_output_sort(
+    pub(super) fn record_physical_evidence(
         &self,
-        evidence: super::analytical::AnalyticalOutputSortEvidence,
+        evidence: super::analytical::AnalyticalPhysicalEvidence,
     ) {
-        if let Ok(mut retained) = self.output_sort.lock() {
+        if let Ok(mut retained) = self.physical_evidence.lock() {
             *retained = Some(evidence);
         }
     }
@@ -763,8 +763,13 @@ impl AnalyticalSupervisor {
     /// Reports the most recently settled graph's output-sort evidence.
     #[cfg(feature = "test-support")]
     #[must_use]
-    pub fn settled_output_sort(&self) -> Option<super::analytical::AnalyticalOutputSortEvidence> {
-        self.output_sort.lock().ok().and_then(|held| held.clone())
+    pub fn settled_physical_evidence(
+        &self,
+    ) -> Option<super::analytical::AnalyticalPhysicalEvidence> {
+        self.physical_evidence
+            .lock()
+            .ok()
+            .and_then(|held| held.clone())
     }
 
     /// Clears one graph's retained cleanup once every release has resolved.
@@ -1829,10 +1834,10 @@ mod tests {
             "a clean settlement publishes its attempt's release evidence"
         );
         let evidence = supervisor
-            .settled_output_sort()
+            .settled_physical_evidence()
             .expect("the settled graph folded its own output-sort evidence");
         assert_eq!(
-            evidence.schema,
+            evidence.sort_schema,
             vec!["filter_key".to_owned(), "matched".to_owned()],
             "the folded evidence names the query's own output schema"
         );

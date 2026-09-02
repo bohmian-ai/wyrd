@@ -1750,8 +1750,12 @@ mod tests {
         )
         .expect("forked cuts reduce");
         assert_eq!(forked.members.len(), 2);
-        assert!(forked.covers(10));
-        assert!(forked.covers(11));
+        assert!(forked.covers(41));
+        assert!(forked.covers(52));
+        // A cut protects the snapshot it reads, not its whole history: the
+        // ancestors are lineage evidence, and retaining them is Forge's
+        // decision, not something one reader silently pins.
+        assert!(!forked.covers(10));
         assert!(!forked.covers(12));
 
         // A singleton chain has the same head and protected endpoint.
@@ -1779,8 +1783,14 @@ mod tests {
 
         // Coverage is decided from proven ancestry, never snapshot-ID order: a
         // larger identifier on an unrelated lineage protects nothing.
-        assert!(covers_all(&comparable, &singleton) == comparable.covers(7));
+        assert!(covers_all(&comparable, &comparable));
         assert!(covers_all(&forked, &forked));
+        // 30's chain reaches 10, so it already covers a lone cut at 20.
+        let lone_twenty =
+            frontier_from_active_cuts(&id, &active(vec![cut(20, 200, &[20, 10])])).expect("lone");
+        assert!(covers_all(&comparable, &lone_twenty));
+        // Nothing on 30's chain reaches the unrelated snapshot 7.
+        assert!(!covers_all(&comparable, &singleton));
         assert!(!covers_all(&singleton, &comparable));
 
         // A record whose header digest does not reproduce is corruption.

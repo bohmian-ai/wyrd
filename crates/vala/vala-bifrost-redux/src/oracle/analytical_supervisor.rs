@@ -452,10 +452,11 @@ impl AnalyticalSupervisor {
     ///
     /// # Errors
     ///
-    /// Returns [`BifrostError::Internal`] when an attempt of the graph is still
-    /// live — releasing the envelope beneath a running attempt would poison the
-    /// resource root — or when a lock is poisoned. Returns
-    /// [`BifrostError::QueryExecutionFailed`] when the graph is not registered.
+    /// Returns [`BifrostError::Internal`] when an attempt of the graph or a
+    /// nested child of its envelope is still live — releasing the envelope
+    /// beneath either would poison the resource root — or when a lock is
+    /// poisoned. Returns [`BifrostError::QueryExecutionFailed`] when the graph
+    /// is not registered.
     pub fn release_graph(&self, graph: AnalyticalGraphKey) -> Result<(), BifrostError> {
         {
             let attempts = self.attempts.lock().map_err(|_| poisoned_supervisor())?;
@@ -464,6 +465,16 @@ impl AnalyticalSupervisor {
                     detail: "Oracle analytical graph still owns a live attempt".to_owned(),
                 });
             }
+        }
+        // The envelope's own nested children outlive the attempts that made
+        // them: upstream drops a follower's stage plan after the coordinator
+        // channel ends, so a cache entry, exchange buffer, or spill write can
+        // still hold this envelope for a moment. Returning it now would report
+        // a live reservation back to the process governor and poison it.
+        if !self.graph_children_idle(graph)? {
+            return Err(BifrostError::Internal {
+                detail: "Oracle analytical graph still owns a live envelope child".to_owned(),
+            });
         }
         let removed = {
             let mut graphs = self.graphs.lock().map_err(|_| poisoned_supervisor())?;

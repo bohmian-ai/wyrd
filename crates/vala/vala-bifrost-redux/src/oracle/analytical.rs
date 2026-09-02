@@ -2987,6 +2987,161 @@ mod tests {
         }
     }
 
+    /// A graph is released only after every child it owns has ended.
+    ///
+    /// Coordinator connections and attempts are separate holders of the same
+    /// graph, and a graph may be released only when both are gone and the
+    /// envelope's own nested children have drained. When that drain does not
+    /// complete, the graph is not quietly forgotten: the follower keeps the
+    /// supervisor guard, the reservation residue, and the reason, so the leak
+    /// stays attributable to this node instead of poisoning the governor later.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a graph is released beneath a live holder, when a settled
+    /// graph is retained, or when a failed cleanup is reported as clean.
+    #[tokio::test]
+    async fn follower_graph_release_waits_for_children_and_retains_cleanup_failure() {
+        let now = Utc::now();
+        let fixture = GraphFixture::new(now);
+        let plan = fixture.leader_message(StageOperationV1::SetPlan, 1);
+        let attempt = fixture
+            .send(&plan, now)
+            .await
+            .expect("the reserving leader activates the graph");
+        let first = fixture
+            .ingress
+            .retain_connection(fixture.graph)
+            .expect("a live graph retains a coordinator connection");
+        let second = fixture
+            .ingress
+            .retain_connection(fixture.graph)
+            .expect("nested calls for one graph share its ownership");
+
+        // The attempt ends, but two coordinator connections still address the
+        // graph, so nothing may be released yet.
+        fixture
+            .ingress
+            .finish_attempt(attempt, AnalyticalAttemptOutcome::Success)
+            .await
+            .expect("the graph's only attempt settles");
+        assert!(
+            fixture.ingress.published(fixture.graph).is_ok(),
+            "an open coordinator connection keeps the graph addressable"
+        );
+        drop(first);
+        assert!(
+            fixture.ingress.published(fixture.graph).is_ok(),
+            "the graph is retained while its last connection is still open"
+        );
+        assert_eq!(
+            fixture
+                .supervisor
+                .live_graphs()
+                .expect("graphs are readable"),
+            1,
+            "no supervisor guard was released beneath a live connection"
+        );
+
+        // The last connection closes. Its drop is synchronous and hands the
+        // graph to the ingress's own driver, which shutdown joins.
+        drop(second);
+        let settled = fixture
+            .ingress
+            .shutdown()
+            .await
+            .expect("the follower shuts down without a poisoned lock");
+        assert_eq!(
+            settled.graphs_retained, 0,
+            "a fully drained graph was released, not retained"
+        );
+        assert!(
+            fixture
+                .ingress
+                .live()
+                .expect("ownership is readable")
+                .is_clean(),
+            "the follower retains nothing after its last connection closed"
+        );
+        assert_eq!(
+            fixture.reservations.cleanup_expired(now),
+            0,
+            "settlement returned the graph's reservation entry"
+        );
+
+        // A graph whose envelope keeps a live nested child cannot drain. The
+        // follower must report that as a failure and keep everything it owns.
+        let now = Utc::now();
+        let fixture = GraphFixture::new(now);
+        let attempt = fixture
+            .send(&fixture.leader_message(StageOperationV1::SetPlan, 1), now)
+            .await
+            .expect("the reserving leader activates the graph");
+        let runtime = fixture
+            .supervisor
+            .graph_runtime(fixture.graph)
+            .expect("the activated graph installed a query-owned runtime");
+        let mut stuck = datafusion::execution::memory_pool::MemoryConsumer::new("stuck-child")
+            .register(&runtime.runtime().memory_pool);
+        stuck
+            .try_grow(1024)
+            .expect("the admitted envelope funds one nested child");
+        fixture
+            .ingress
+            .finish_attempt(attempt, AnalyticalAttemptOutcome::Success)
+            .await
+            .expect_err("a graph whose children never drain cannot be settled");
+        let retained = fixture.ingress.live().expect("ownership is readable");
+        assert_eq!(retained.graphs, 1, "the undrained graph is still owned");
+        assert_eq!(
+            retained.cleanup_failures, 1,
+            "the follower recorded exactly why the graph could not be released"
+        );
+        assert!(
+            !retained.is_clean(),
+            "a retained cleanup failure fails follower readiness"
+        );
+        assert_eq!(
+            fixture
+                .supervisor
+                .live_graphs()
+                .expect("graphs are readable"),
+            1,
+            "a failed settlement released no supervisor guard"
+        );
+
+        // Shutdown closes admission first, then reports what stayed retained.
+        let refused = fixture
+            .send(
+                &fixture.leader_message(StageOperationV1::ExecuteTask, 2),
+                now,
+            )
+            .await;
+        let inspection = fixture
+            .ingress
+            .shutdown()
+            .await
+            .expect("the follower shuts down without a poisoned lock");
+        assert!(
+            matches!(refused, Err(BifrostError::QueryExecutionFailed)),
+            "a draining graph admits nothing new"
+        );
+        assert_eq!(
+            inspection.graphs_retained, 1,
+            "shutdown reported the graph it could not release"
+        );
+        drop(stuck);
+        assert!(
+            matches!(
+                fixture
+                    .send(&fixture.leader_message(StageOperationV1::SetPlan, 3), now)
+                    .await,
+                Err(BifrostError::QueryAdmissionRejected)
+            ),
+            "a shut-down follower admits no further stage work"
+        );
+    }
+
     /// A failed activation publishes nothing and hands the reservation back.
     ///
     /// Activation is a transaction across three fallible steps — the graph

@@ -1441,6 +1441,44 @@ pub(super) fn admitted_guard_for_test()
 }
 
 #[cfg(test)]
+/// Builds one production admission owner over an explicit resource capability.
+///
+/// Shared with the Analytical lifecycle tests, which need a real admission
+/// owner rather than a fabricated guard: proving that a retained graph keeps a
+/// queued waiter blocked requires the queue, the class ceiling, and the
+/// active-query counter to be the production ones.
+pub(super) fn admission_owner_for_test(
+    config: OracleAdmissionConfig,
+    resources: crate::resources::OracleResources,
+) -> Arc<OracleAdmission> {
+    let role = RegisteredRole {
+        key: wyrd_spec::vala::api::ClusterNodeKey {
+            node_id: NodeId::new(uuid::Uuid::now_v7()),
+            role: wyrd_spec::vala::api::ClusterRole::Oracle,
+        },
+        fencing_token: 1,
+        capabilities: ClusterCapabilities::OracleV1(wyrd_spec::vala::api::OracleCapabilitiesV1 {
+            storage_protocol_version: 1,
+            cpu_cores: 1.0,
+            memory_budget_bytes: 1024,
+            cpu_cores_per_slot: 1.0,
+            memory_bytes_per_slot: 1024,
+            raw_slots: 1,
+            usable_slots: 1,
+            supported_classes: vec![QueryClass::Interactive, QueryClass::Analytical],
+            max_workers_per_query: 1,
+        }),
+    };
+    Arc::new(OracleAdmission::with_config(
+        Arc::new(OracleSlotManager::new(1, 1)),
+        role,
+        true,
+        config,
+        resources,
+    ))
+}
+
+#[cfg(test)]
 /// Reads active query ownership for a stream lifecycle assertion.
 pub(super) fn active_queries_for_test(shared: &Arc<AdmissionShared>) -> u64 {
     shared.state.lock().expect("state").active_queries
@@ -1450,7 +1488,7 @@ pub(super) fn active_queries_for_test(shared: &Arc<AdmissionShared>) -> u64 {
 type StartupResultReceiver = tokio::sync::oneshot::Receiver<Result<(), BifrostError>>;
 
 #[cfg(test)]
-mod tests {
+pub(in crate::oracle) mod tests {
     use super::*;
     use crate::cluster::ClusterSnapshot;
     use chrono::Utc;
@@ -1459,7 +1497,7 @@ mod tests {
     };
 
     /// Composes the deterministic Oracle capability shared by admission tests.
-    fn test_resources() -> crate::resources::OracleResources {
+    pub(in crate::oracle) fn test_resources() -> crate::resources::OracleResources {
         crate::resources::BifrostRuntimeResources::composed_for_test(
             1024 * 1024 * 1024,
             1024 * 1024 * 1024,
@@ -1548,31 +1586,7 @@ mod tests {
         config: OracleAdmissionConfig,
         resources: crate::resources::OracleResources,
     ) -> Arc<OracleAdmission> {
-        let role = RegisteredRole {
-            key: ClusterNodeKey {
-                node_id: NodeId::new(uuid::Uuid::now_v7()),
-                role: ClusterRole::Oracle,
-            },
-            fencing_token: 1,
-            capabilities: ClusterCapabilities::OracleV1(OracleCapabilitiesV1 {
-                storage_protocol_version: 1,
-                cpu_cores: 1.0,
-                memory_budget_bytes: 1024,
-                cpu_cores_per_slot: 1.0,
-                memory_bytes_per_slot: 1024,
-                raw_slots: 1,
-                usable_slots: 1,
-                supported_classes: vec![QueryClass::Interactive, QueryClass::Analytical],
-                max_workers_per_query: 1,
-            }),
-        };
-        Arc::new(OracleAdmission::with_config(
-            Arc::new(OracleSlotManager::new(1, 1)),
-            role,
-            true,
-            config,
-            resources,
-        ))
+        super::admission_owner_for_test(config, resources)
     }
 
     fn owner(config: OracleAdmissionConfig) -> Arc<OracleAdmission> {

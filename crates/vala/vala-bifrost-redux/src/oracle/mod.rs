@@ -2559,9 +2559,20 @@ impl Oracle {
                 cut.attempt_id(),
             )
             .await?;
-        let (session, mut ownership) =
-            handle.lease_session(attempt, &cut, &context, &mut admitted, work_units)?;
-        ownership.retain_admission(admitted);
+        let (session, ownership) = handle.lease_session(
+            attempt,
+            &cut,
+            &context,
+            &mut admitted,
+            work_units,
+            tokio::time::Instant::from_std(deadline),
+        )?;
+        if ownership.retain_admission(admitted).is_err() {
+            tracing::error!(
+                public_query_id = %attempt.public_query_id,
+                "Oracle analytical graph refused this query's admission owner"
+            );
+        }
         Ok((session, ownership))
     }
 
@@ -4319,7 +4330,14 @@ impl Oracle {
             );
         };
         let mut admitted = admitted;
-        match handle.lease_session(attempt, participant_cut, context, &mut admitted, work_units) {
+        match handle.lease_session(
+            attempt,
+            participant_cut,
+            context,
+            &mut admitted,
+            work_units,
+            tokio::time::Instant::from_std(deadline),
+        ) {
             Ok((session, ownership)) => {
                 admitted.analytical = Some(ownership);
                 Ok((session, admitted))

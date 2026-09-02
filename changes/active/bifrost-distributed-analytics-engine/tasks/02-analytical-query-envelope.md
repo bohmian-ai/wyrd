@@ -763,3 +763,116 @@ and at `26331b94c` onward fails, so the failure is this task's regression.
   `mise run test:bifrost:journey:oracle` → 15/15 passed;
   `mise run check:bifrost-resource-governance` passed;
   `mise run check:bifrost-oracle-deploy` → 2 passed; `git diff --check` clean.
+
+### Remediation — `$wyrd-task-review` findings 1–3 (Scenario 5)
+
+Three implementation defects against existing REQ-007 and Scenario 5 authority.
+No specification revision; no new dependency, protocol, RPC, scheduler, timer
+task, registry, or retry state machine.
+
+**FIND-BIFROST-R4-T02-QUERY-ENVELOPE-2 — admission follows retained graph ownership.**
+`AnalyticalGraphState` now owns `retained_admission: Option<AdmittedQueryGuard>`,
+declared immediately after `resources` so removing the graph drops the envelope
+first and the permit second. `AnalyticalSupervisor::retain_admission` stores one
+cycle-free guard on an `Active` or `Draining` entry and returns it unchanged on
+refusal. The admission `oneshot` is gone from `AnalyticalGraphSignals`,
+`AnalyticalGraphLifecycle`, `start`, and `settle`.
+`AnalyticalAttemptOwnership::retain_admission` now stores synchronously through
+the supervisor and is used by both the inactive seam and the production stream.
+`settle_analytical` takes the Analytical ownership out of the guard, stores the
+remainder in the graph, and only then signals and awaits settlement; it returns
+`AnalyticalStreamSettlement { clean, transferred }` and
+`release_and_finish_terminal` skips the stream-local release for a transferred
+guard while preserving the existing missing-owner diagnostic.
+
+- RED: `oracle::analytical::tests::a_failed_graph_cleanup_keeps_its_query_admission_charged`
+  fails against the pre-transfer shape (mutation: the stream keeps its guard) at
+  "the graph took this query's admission owner before settlement".
+- GREEN: passes; drives production-shaped `settle_analytical` over a real
+  `OracleAdmission` with one Analytical slot. Proves `active_queries` stays 1,
+  the queued Analytical caller stays blocked, the graph is `Draining`, readiness
+  is false, the retained permit is still held by the graph, and that removing
+  the graph returns the envelope before the permit so the waiter proceeds and
+  accounting returns to 0.
+- Command: `mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib --features test-support,bench-support -E 'test(=oracle::analytical::tests::a_failed_graph_cleanup_keeps_its_query_admission_charged)'` → 1 passed.
+
+**FIND-BIFROST-R4-T02-QUERY-ENVELOPE-1 — bounded peer operations.**
+The existing monotonic admission deadline is threaded from both
+`OracleQueryService` lease paths through `AnalyticalExecutionHandle::lease_session`
+into `AnalyticalGraphLifecycle::start` and stored on the lifecycle, which also
+holds the graph's existing cancellation child rather than creating a tree.
+`reserve` selects (biased) over that cancellation and
+`tokio::time::timeout_at(graph_deadline, …)`; either edge takes the existing
+reservation-failed path and returns every acceptance so far. One narrow helper,
+`release_within`, bounds every release attempt by
+`min(graph_deadline, now + RETAINED_RELEASE_RETRY)`, treats a timeout exactly
+like an unacknowledged release, and issues no RPC once the deadline has elapsed.
+`drain` reuses it, sleeps with `sleep_until` capped at the deadline, and now
+returns residue as an error so an unresolvable release settles as failure
+instead of releasing the graph. `dispatcher.rs` is unchanged.
+
+- RED: `oracle::analytical::tests::graph_peer_operations_are_bounded_by_the_graph_deadline`
+  fails under three separate mutations — cancellation arm removed
+  ("cancellation ends the reservation immediately, not at the far deadline"),
+  reserve bound moved off the graph deadline ("the reservation ended at the
+  graph's own deadline, not at some other bound"), and the release bound removed
+  ("cleanup retried the ambiguous release to the graph deadline and stopped
+  there").
+- GREEN: passes under `start_paused` time. Proves cancellation and the deadline
+  each interrupt a permanently pending reservation, a pending release cannot run
+  beyond its bound, no peer call begins after the deadline, settlement returns
+  failure rather than hanging, and shutdown reports retained residue instead of
+  awaiting an RPC. Ambiguous-release retention until acknowledgement or
+  conservative expiry stays covered by the existing reservation-lifecycle tests.
+- Command: `mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib --features test-support,bench-support -E 'test(=oracle::analytical::tests::graph_peer_operations_are_bounded_by_the_graph_deadline)'` → 1 passed.
+
+**FIND-BIFROST-R4-T02-QUERY-ENVELOPE-3 — no cleanup from `Drop`.**
+`impl Drop for AnalyticalParticipantReservations` is deleted with no
+replacement owner. The lifecycle-held `AnalyticalGraphGuard` is disarmed in
+`AnalyticalGraphLifecycle::start` the moment the task takes ownership, and the
+success path releases explicitly through `AnalyticalSupervisor::release_graph`
+after children and reservations settle, so no unwinding or aborted task can
+remove a graph the supervisor has not yet recorded a failure against. Shutdown
+now treats every lifecycle `JoinError`, cancellation included, as cleanup
+failure via the existing `retain_graph_cleanup`, and the final graph sweep skips
+any graph with a recorded failure — reusing the existing `Draining` failure
+state rather than a second collection.
+
+- RED: `oracle::analytical::tests::an_aborted_lifecycle_task_retains_its_graph_instead_of_releasing_it`
+  is unreachable before the change (`Drop` would have issued the releases the
+  test forbids) and the shutdown sweep would have removed the graph.
+- GREEN: passes. Proves no release RPC is ever issued outside the lifecycle
+  sequence, the supervisor records the cleanup failure, the graph stays
+  registered and `Draining`, the retained admission stays charged, readiness is
+  false, and the shutdown report carries the graph rather than sweeping it.
+- Command: `mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib --features test-support,bench-support -E 'test(=oracle::analytical::tests::an_aborted_lifecycle_task_retains_its_graph_instead_of_releasing_it)'` → 1 passed.
+
+Bounded corrections recorded:
+
+1. `assert_cleanup_failure_retains_draining_ownership` previously asserted
+   `graphs_released == 1`: the shutdown sweep removed the very residue it was
+   meant to report. It now asserts `(graphs_released, graphs_retained) == (0, 1)`,
+   which is what finding 3 requires.
+2. `drain` returning residue is new: it previously could not return unresolved,
+   so `settle` could reach `release_graph` and remove a graph whose reservations
+   were never returned. It now reports the residue as the cleanup failure.
+3. `AnalyticalSupervisor` gained two `#[cfg(test)]` accessors —
+   `abort_lifecycle_task_for_test` (aborts the handle in place, leaving shutdown
+   to take and join it, exactly as a panic would) and
+   `retains_admission_for_test` — because neither the task's exceptional end nor
+   a graph-held permit is otherwise observable.
+4. `admission::tests::owner_with_resources` now delegates to a new
+   `#[cfg(test)] pub(in crate::oracle) admission_owner_for_test`, so the
+   Analytical lifecycle test uses the production admission owner instead of a
+   duplicated one.
+5. The refusal `Err` variants carry `Box<AdmittedQueryGuard>`, matching the
+   existing `register_graph` precedent, to satisfy `clippy::result_large_err`.
+
+Remediation verification: existing Scenario 5 test retained and passing;
+`mise run fmt`; `mise run lints` clean; `mise run test:bifrost` → 972/972 passed;
+`mise run test:bifrost:journey:oracle` → 15/15 passed (the first, cold-build
+run flaked on `distributed::pg_bifrost_selective_predicate_and_projection_prune_distributed_reads`,
+a pruning journey with no Analytical lifecycle involvement; it passes standalone
+and in a clean full lane run);
+`mise run check:bifrost-resource-governance` passed;
+`mise run check:bifrost-oracle-deploy` → 2 passed; `git diff --check` clean.

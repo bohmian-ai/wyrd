@@ -194,6 +194,14 @@ pub struct AnalyticalAttemptGrant {
 struct AnalyticalGraphState {
     /// The admitted query envelope every attempt of this graph splits from.
     resources: OracleQueryResources,
+    /// The query's admission permit, held for exactly as long as the graph is.
+    ///
+    /// Declared after `resources` on purpose: removing the graph drops the
+    /// envelope first and the permit second, so admission counters never wake a
+    /// queued waiter while this query's envelope is still charged. A graph that
+    /// is retained as `Draining` therefore keeps both, which is what makes a
+    /// failed cleanup visible as charged capacity rather than as a free slot.
+    retained_admission: Option<super::admission::AdmittedQueryGuard>,
     /// The query-owned runtime every follower of this graph installs.
     runtime: AnalyticalGraphRuntime,
     /// Every outbound exchange stream this graph opened, owned by the graph.
@@ -479,6 +487,7 @@ impl AnalyticalSupervisor {
             graph,
             AnalyticalGraphEntry::Active(AnalyticalGraphState {
                 resources,
+                retained_admission: None,
                 runtime,
                 exchanges: Arc::default(),
                 cancel: self.root_cancel.child_token(),
@@ -637,6 +646,47 @@ impl AnalyticalSupervisor {
         }
     }
 
+    /// Stores one query's admission permit on the graph that owns its envelope.
+    ///
+    /// The permit outlives the stream that held it because the graph outlives
+    /// the stream: cleanup that cannot be confirmed retains the envelope, and
+    /// returning the admission counters while that envelope is still charged
+    /// would hand a queued waiter capacity this node does not have. Accepting
+    /// on `Draining` as well as `Active` is deliberate — a stream observes the
+    /// terminal after the lifecycle task has already begun settling.
+    ///
+    /// The guard must already be cycle-free: its Analytical ownership names
+    /// this supervisor, so storing a guard that still holds it would make the
+    /// graph own a handle to itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns `admitted` unchanged when the graph lock is poisoned, when the
+    /// graph is not registered, or when it already retains a permit, so a
+    /// refused transfer can never silently lose the query's admission.
+    pub(super) fn retain_admission(
+        &self,
+        graph: AnalyticalGraphKey,
+        admitted: super::admission::AdmittedQueryGuard,
+    ) -> Result<(), Box<super::admission::AdmittedQueryGuard>> {
+        let Ok(mut graphs) = self.graphs.lock() else {
+            tracing::error!(
+                public_query_id = %graph.public_query_id,
+                "Oracle analytical graph registry is poisoned"
+            );
+            return Err(Box::new(admitted));
+        };
+        let Some(entry) = graphs.get_mut(&graph) else {
+            return Err(Box::new(admitted));
+        };
+        let state = entry.state_mut();
+        if state.retained_admission.is_some() {
+            return Err(Box::new(admitted));
+        }
+        state.retained_admission = Some(admitted);
+        Ok(())
+    }
+
     /// Clears one graph's retained cleanup once every release has resolved.
     pub fn resolve_graph_cleanup(&self, graph: AnalyticalGraphKey) {
         let Ok(mut graphs) = self.graphs.lock() else {
@@ -789,6 +839,39 @@ impl AnalyticalSupervisor {
             .get_mut(&graph)
             .and_then(|entry| entry.state_mut().lifecycle.as_mut())
             .and_then(|lifecycle| lifecycle.handle.take()))
+    }
+
+    /// Reports whether one registered graph still holds a query's admission permit.
+    ///
+    /// The permit is otherwise unobservable, and "the graph kept it" is exactly
+    /// the property a retained cleanup has to prove.
+    #[cfg(test)]
+    pub(super) fn retains_admission_for_test(&self, graph: AnalyticalGraphKey) -> bool {
+        self.graphs.lock().is_ok_and(|graphs| {
+            graphs
+                .get(&graph)
+                .is_some_and(|entry| entry.state().retained_admission.is_some())
+        })
+    }
+
+    /// Aborts one graph's lifecycle task in place, leaving it joinable.
+    ///
+    /// The one caller is the test that proves an exceptional lifecycle end is
+    /// treated as cleanup failure. The handle stays in the entry so shutdown
+    /// still takes and joins it, which is exactly the path production takes
+    /// when a task panics.
+    #[cfg(test)]
+    pub(super) fn abort_lifecycle_task_for_test(&self, graph: AnalyticalGraphKey) {
+        let Ok(graphs) = self.graphs.lock() else {
+            return;
+        };
+        if let Some(handle) = graphs
+            .get(&graph)
+            .and_then(|entry| entry.state().lifecycle.as_ref())
+            .and_then(|lifecycle| lifecycle.handle.as_ref())
+        {
+            handle.abort();
+        }
     }
 
     /// Resolves the query-owned runtime one registered graph installs.
@@ -1052,14 +1135,21 @@ impl AnalyticalSupervisor {
         };
         for graph in signalled {
             self.signal_terminal(graph, AnalyticalAttemptOutcome::Cancelled)?;
+            // A task that panicked or was cancelled never ran its own cleanup
+            // sequence, so whatever it still owned is unreleased. Cancellation
+            // is not exempt: the sequence is the only thing that returns a
+            // reservation or an envelope, and it did not finish.
             if let Some(handle) = self.take_lifecycle_task(graph)?
                 && let Err(error) = handle.await
-                && !error.is_cancelled()
             {
                 tracing::error!(
                     %error,
                     public_query_id = %graph.public_query_id,
                     "Oracle analytical graph lifecycle task failed to join"
+                );
+                self.retain_graph_cleanup(
+                    graph,
+                    format!("Oracle analytical graph lifecycle task did not settle: {error}"),
                 );
             }
         }
@@ -1083,6 +1173,13 @@ impl AnalyticalSupervisor {
         };
         let mut graphs_released = 0;
         for graph in graphs {
+            // A graph with recorded cleanup failure is residue, not a sweepable
+            // entry: releasing it here would return an envelope whose owners
+            // were never confirmed released and hide the failure from the
+            // report this shutdown produces.
+            if self.graph_settlement_failure(graph)?.is_some() {
+                continue;
+            }
             if self.release_graph(graph).is_ok() {
                 graphs_released += 1;
             }

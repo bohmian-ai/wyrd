@@ -521,7 +521,8 @@ async fn settle_and_finish_stream(inputs: StreamSettlementInputs<'_>) -> QueryTe
     // A cleanup that could not be confirmed cannot become a success terminal:
     // the graph is retained as draining, so rows this query produced are not
     // provably complete and its owners are not provably returned.
-    let candidate = if settle_analytical(admitted, outcome).await {
+    let settlement = settle_analytical(admitted, outcome).await;
+    let candidate = if settlement.clean {
         candidate
     } else {
         failed_terminal_for_visibility(
@@ -537,7 +538,7 @@ async fn settle_and_finish_stream(inputs: StreamSettlementInputs<'_>) -> QueryTe
         gate_lifecycle,
         candidate,
         failed_outcome,
-        visibility,
+        settlement.transferred,
         row_count,
     );
     if let Some(owner) = running_query {
@@ -648,25 +649,66 @@ async fn settle_distributed(
 /// the graph's lifecycle task owns the cleanup order, and reproducing any of it
 /// here would be a second, racing sequence.
 ///
-/// Returns whether the graph settled cleanly. A retained cleanup is reported to
-/// the caller rather than logged and ignored, because it is what makes a
-/// success terminal untruthful.
-async fn settle_analytical(
+/// Reports what one stream's Analytical settlement did with its two owners.
+///
+/// Both answers come from the same act and are needed by different callers, so
+/// returning them together is what keeps the terminal truthful *and* stops the
+/// stream releasing admission the graph now owns.
+pub(super) struct AnalyticalStreamSettlement {
+    /// Whether cleanup completed, so a success terminal is truthful.
+    pub(super) clean: bool,
+    /// Whether the graph took this query's admission permit.
+    pub(super) transferred: bool,
+}
+
+/// Settles this stream's Analytical attempt after moving admission to its graph.
+///
+/// The transfer happens *before* settlement is signalled and awaited, not
+/// after: the lifecycle task may already have settled by the time this observes
+/// the outcome, and a permit handed over afterwards would arrive at a graph that
+/// no longer exists. Releasing it here instead would decrement class, tenant,
+/// and active-query accounting — waking a queued waiter — while a failed
+/// cleanup still holds this query's whole envelope.
+///
+/// Taking the Analytical ownership out of the guard first is what makes the
+/// transfer sound: the ownership names the supervisor that would then hold the
+/// guard, so a graph storing it whole would own a handle to itself.
+///
+/// A retained cleanup is reported to the caller rather than logged and ignored,
+/// because it is what makes a success terminal untruthful.
+pub(super) async fn settle_analytical(
     admitted: &mut Option<AdmittedQueryGuard>,
     outcome: QueryTerminalOutcome,
-) -> bool {
+) -> AnalyticalStreamSettlement {
     let Some(ownership) = admitted
         .as_mut()
         .and_then(AdmittedQueryGuard::take_analytical)
     else {
-        return true;
+        return AnalyticalStreamSettlement {
+            clean: true,
+            transferred: false,
+        };
+    };
+    let transferred = match admitted.take() {
+        Some(guard) => match ownership.retain_admission(guard) {
+            Ok(()) => true,
+            Err(returned) => {
+                tracing::error!(
+                    public_query_id = %ownership.key().public_query_id,
+                    "Oracle analytical graph refused this stream's admission owner"
+                );
+                *admitted = Some(*returned);
+                false
+            }
+        },
+        None => false,
     };
     let attempt_outcome = match outcome {
         QueryTerminalOutcome::Failed => AnalyticalAttemptOutcome::Failed,
         _ => AnalyticalAttemptOutcome::Success,
     };
     let key = ownership.key();
-    match ownership.settle(attempt_outcome).await {
+    let clean = match ownership.settle(attempt_outcome).await {
         Ok(_) => true,
         Err(error) => {
             tracing::error!(
@@ -677,7 +719,8 @@ async fn settle_analytical(
             );
             false
         }
-    }
+    };
+    AnalyticalStreamSettlement { clean, transferred }
 }
 
 /// Builds the terminal for a stream that exhausted its batches normally.
@@ -1219,10 +1262,15 @@ fn release_and_finish_terminal(
     gate_lifecycle: Option<&Arc<QueryStreamLifecycle>>,
     candidate: QueryTerminalFrame,
     failed_outcome: &'static str,
-    _visibility: VisibilityMode,
+    admission_transferred: bool,
     _row_count: u64,
 ) -> QueryTerminalFrame {
-    let _release = release_admitted(admitted);
+    // A transferred permit is not this stream's to release: the graph holds it
+    // until its cleanup is authoritative. Anything else is released here, and
+    // an absent owner that was never transferred is still the diagnostic it was.
+    if !admission_transferred {
+        let _release = release_admitted(admitted);
+    }
     let terminal = candidate;
     let outcome = if terminal.outcome == QueryTerminalOutcome::Failed {
         failed_outcome

@@ -468,6 +468,9 @@ pub(crate) fn register_analytical_series() {
     metrics::gauge!("bifrost_oracle_analytical_exchanges_active").set(0.0);
     metrics::counter!("bifrost_oracle_analytical_exchange_batches_total").increment(0);
     metrics::counter!("bifrost_oracle_analytical_exchange_bytes_total").increment(0);
+    metrics::counter!("bifrost_oracle_analytical_output_sort_spills_total").increment(0);
+    metrics::counter!("bifrost_oracle_analytical_output_sort_spilled_bytes_total").increment(0);
+    metrics::counter!("bifrost_oracle_analytical_output_sort_spilled_rows_total").increment(0);
 }
 
 /// Records one stage-operation authority decision with closed labels.
@@ -600,6 +603,20 @@ impl Drop for AnalyticalAttemptTelemetry {
         }
         metrics::gauge!("bifrost_oracle_analytical_attempts_active").decrement(1.0);
     }
+}
+
+/// Publishes one settled query's own output-sort spill evidence.
+///
+/// Emitted from the graph's settlement rather than from the result stream,
+/// because a `SortExec` registers its metric set during execution and only
+/// stops changing once that stream is dropped. The three families are
+/// unlabelled: the operator identity that makes the evidence attributable is a
+/// per-query fact and belongs on the attempt span, not in a metric label
+/// domain a query shape could expand.
+pub fn record_output_sort_spill(spills: u64, bytes: u64, rows: u64) {
+    metrics::counter!("bifrost_oracle_analytical_output_sort_spills_total").increment(spills);
+    metrics::counter!("bifrost_oracle_analytical_output_sort_spilled_bytes_total").increment(bytes);
+    metrics::counter!("bifrost_oracle_analytical_output_sort_spilled_rows_total").increment(rows);
 }
 
 /// Records one streamed exchange observation for the Analytical path.

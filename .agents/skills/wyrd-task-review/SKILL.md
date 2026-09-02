@@ -51,7 +51,16 @@ Report only source-validated defects with a reachable consequence. Every
 actionable finding includes a stable `FIND-<task>-<n>` ID and severity, exact
 source or authority location, mapped spec and task obligations, reachable
 scenario and consequence, required testable outcome, supporting and
-counterevidence, and focused closure verification.
+counterevidence, a concrete recommendation, and focused closure verification.
+
+Recommend the smallest repository-native correction supported by the evidence.
+Name the production owner, the control-flow, state, or API change, the existing
+mechanism to reuse, and the focused test change. Fix the shared root cause, not
+one reported symptom; do not add a dependency, abstraction, or configuration
+surface unless the existing repository cannot satisfy the required outcome. A
+recommendation is planning input, not new authority. When multiple materially
+different corrections remain valid, state the unresolved choice and its fixed
+constraints instead of inventing a preferred private design.
 
 Use `CRITICAL`, `MAJOR`, or `MODERATE` only for concrete in-scope defects.
 Preference, speculative cleanup, and unrelated baseline concerns do not block.
@@ -68,10 +77,51 @@ Return one verdict:
   material decision; or
 - `BLOCKED` — the immutable subject or essential authority cannot be inspected.
 
-Lead with the verdict, reviewed commit identity, and verification limits. List
-only validated findings; on `APPROVE`, add one compact obligation-coverage
-statement instead of repeating the task or spec. `REMEDIATE` routes validated
-findings to `$wyrd-plan`, not directly to ad hoc implementation. `APPROVE`
-approves only this task candidate; it does not merge, push, deploy, or replace
-final `$wyrd-change-review`. The review phase does not edit the active packet;
-the caller or execution harness may record the returned verdict there.
+Use this exact user-facing structure for every verdict. Keep every heading and
+field in this order; write `None` when a field has no entries.
+
+```markdown
+# <VERDICT>
+
+## Subject
+- Base: <commit>
+- Candidate: <commit>
+- Planning snapshot: <commit or None>
+- Evidence snapshot: <commit or None>
+
+## Verification
+- Reused: <current recorded evidence or None>
+- Rerun: <commands or None>
+- Not run: <commands and limits or None>
+
+## Findings
+
+### <FINDING-ID> — <SEVERITY>: <title>
+- Obligations: <spec and task IDs>
+- Locations: <source and authority locations>
+- Scenario: <reachable path>
+- Consequence: <observable failure>
+- Supporting evidence: <evidence>
+- Counterevidence: <evidence or None>
+- Recommendation: Reuse <existing mechanism> in <production owner>; change <control flow, state, or API>; update <focused test>.
+- Required outcome: <testable result>
+- Closure verification: <focused tests and commands>
+
+## Obligation Coverage
+- <compact coverage statement>
+
+## Prior Finding Closure
+- <finding ID and status, or None>
+
+## Routing
+- Next skill: <$wyrd-plan, $wyrd-spec, $wyrd-change-review, or None>
+- Finding IDs: <IDs or None>
+```
+
+When there are no findings, replace the complete example finding block under
+`Findings` with `- None`. Under `APPROVE`, keep obligation coverage compact
+instead of repeating the task or spec. List only validated findings.
+`REMEDIATE` routes them to `$wyrd-plan`, not directly to ad hoc implementation.
+`APPROVE` approves only this task candidate; it does not merge, push, deploy, or
+replace final `$wyrd-change-review`. The review phase does not edit the active
+packet; the caller or execution harness may record the returned verdict there.

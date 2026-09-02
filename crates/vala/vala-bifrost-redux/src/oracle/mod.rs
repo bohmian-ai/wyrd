@@ -20,7 +20,6 @@ use datafusion::dataframe::DataFrame;
 use datafusion::datasource::MemTable;
 use datafusion::datasource::TableProvider;
 use datafusion::execution::context::SessionContext;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream, execute_stream};
 use datafusion::sql::parser::{DFParser, Statement as DfStatement};
 use datafusion::sql::resolve::resolve_table_references;
@@ -4450,12 +4449,22 @@ impl Oracle {
     ) -> Result<(SchemaRef, SendableRecordBatchStream, OracleQueryScanStats), OracleExecutionError>
     {
         let physical = Self::plan_physical(session, input.sql).await?;
-        if exec::is_distributed_plan(physical.as_ref())
-            && let Some(ownership) = input.admitted.analytical.as_ref()
-        {
+        let distributed = exec::is_distributed_plan(physical.as_ref());
+        if distributed && let Some(ownership) = input.admitted.analytical.as_ref() {
             ownership.publish_participants().await?;
         }
-        Self::stream_physical(session, physical, input.logical_bytes_selected)
+        let mut scan_stats =
+            OracleQueryScanStats::from_plan(physical.as_ref(), input.logical_bytes_selected);
+        let schema = physical.schema();
+        let stream = execute_stream(Arc::clone(&physical), session.task_ctx())
+            .map_err(|error| map_datafusion_error(&error))?;
+        if distributed && let Some(ownership) = input.admitted.analytical.as_ref() {
+            ownership.retain_metric_fold(analytical::AnalyticalGraphMetricFold::new(
+                physical,
+                scan_stats.open_distributed_scan(),
+            ))?;
+        }
+        Ok((schema, stream, scan_stats))
     }
 
     /// Lowers one validated statement to its optimized physical plan.
@@ -4491,51 +4500,11 @@ impl Oracle {
         logical_bytes_selected: u64,
     ) -> Result<(SchemaRef, SendableRecordBatchStream, OracleQueryScanStats), OracleExecutionError>
     {
-        let mut scan_stats =
-            OracleQueryScanStats::from_plan(physical.as_ref(), logical_bytes_selected);
+        let scan_stats = OracleQueryScanStats::from_plan(physical.as_ref(), logical_bytes_selected);
         let schema = physical.schema();
         let stream = execute_stream(Arc::clone(&physical), session.task_ctx())
             .map_err(|error| map_datafusion_error(&error))?;
-        let stream = Self::with_distributed_scan_metrics(physical, stream, &mut scan_stats);
         Ok((schema, stream, scan_stats))
-    }
-
-    /// Appends follower scan evidence to a distributed plan's own result stream.
-    ///
-    /// A distributed plan's reads all happen on followers, and upstream reports
-    /// their metrics only after the coordinator channel reaches end of stream —
-    /// which is strictly after the leader's last batch. Collecting them in a
-    /// tail of the same stream is what puts them in hand before the query's
-    /// telemetry owner reaches its terminal, without making that terminal async.
-    ///
-    /// A plan that is not distributed is returned untouched, so the Interactive
-    /// path pays nothing for this.
-    fn with_distributed_scan_metrics(
-        physical: Arc<dyn ExecutionPlan>,
-        stream: SendableRecordBatchStream,
-        scan_stats: &mut OracleQueryScanStats,
-    ) -> SendableRecordBatchStream {
-        if !exec::is_distributed_plan(physical.as_ref()) {
-            return stream;
-        }
-        let sink = scan_stats.open_distributed_scan();
-        let schema = stream.schema();
-        // The inner stream is dropped before the metrics are awaited, not after.
-        // Upstream ends the coordinator channel — and therefore reports task
-        // metrics — when the distributed stream's own end-of-query guard drops,
-        // so holding that stream while waiting for its metrics would wait
-        // forever.
-        let collected =
-            futures_util::stream::unfold(Some((stream, physical, sink)), async move |state| {
-                let (mut stream, physical, sink) = state?;
-                if let Some(batch) = stream.next().await {
-                    return Some((batch, Some((stream, physical, sink))));
-                }
-                drop(stream);
-                exec::record_distributed_scan_metrics(physical, sink.as_ref()).await;
-                None
-            });
-        Box::pin(RecordBatchStreamAdapter::new(schema, collected))
     }
 }
 

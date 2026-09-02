@@ -218,6 +218,11 @@ struct AnalyticalGraphState {
     /// session that opens those exchanges and the lease that settles the graph
     /// bind to this one token.
     cancel: CancellationToken,
+    /// The physical-metric fold this graph settles inside its own deadline.
+    ///
+    /// Registered by the leader session once its plan has started, taken once
+    /// by the lifecycle task. A graph that never distributed has none.
+    metric_fold: Option<super::analytical::AnalyticalGraphMetricFold>,
     /// The leader lifecycle task supervising this graph, when it has one.
     ///
     /// A follower graph has none: it is settled by the coordinator call that
@@ -377,6 +382,13 @@ pub struct AnalyticalSupervisor {
     root_cancel: CancellationToken,
     /// Whether the supervisor still admits new attempts.
     accepting: AtomicBool,
+    /// Most recently settled graph's own output-sort evidence.
+    ///
+    /// Test-tier only. Production reports the same values as counters; a
+    /// process-cluster journey needs the exact per-operator numbers its own
+    /// query produced, which no counter family can attribute.
+    #[cfg(feature = "test-support")]
+    output_sort: Mutex<Option<super::analytical::AnalyticalOutputSortEvidence>>,
 }
 
 impl fmt::Debug for AnalyticalSupervisor {
@@ -400,6 +412,8 @@ impl AnalyticalSupervisor {
             attempts: Mutex::new(HashMap::new()),
             root_cancel: CancellationToken::new(),
             accepting: AtomicBool::new(true),
+            #[cfg(feature = "test-support")]
+            output_sort: Mutex::new(None),
         }
     }
 
@@ -491,6 +505,7 @@ impl AnalyticalSupervisor {
                 runtime,
                 exchanges: Arc::default(),
                 cancel: self.root_cancel.child_token(),
+                metric_fold: None,
                 lifecycle: None,
             }),
         );
@@ -685,6 +700,71 @@ impl AnalyticalSupervisor {
         }
         state.retained_admission = Some(admitted);
         Ok(())
+    }
+
+    /// Stores one started plan's physical-metric fold on the graph itself.
+    ///
+    /// The graph outlives the result stream, and the fold cannot run until that
+    /// stream is dropped, so the graph is the only owner that can both hold it
+    /// and bound it. Registering it here is what removes the unbounded await
+    /// that previously lived in the stream's own tail.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::Internal`] when the graph lock is poisoned and
+    /// [`BifrostError::QueryExecutionFailed`] when the graph is not registered
+    /// active or already retains a fold, so a second plan cannot replace the
+    /// evidence of the one that ran.
+    pub(super) fn retain_metric_fold(
+        &self,
+        graph: AnalyticalGraphKey,
+        fold: super::analytical::AnalyticalGraphMetricFold,
+    ) -> Result<(), BifrostError> {
+        let mut graphs = self.graphs.lock().map_err(|_| poisoned_supervisor())?;
+        let Some(AnalyticalGraphEntry::Active(state)) = graphs.get_mut(&graph) else {
+            return Err(BifrostError::QueryExecutionFailed);
+        };
+        if state.metric_fold.is_some() {
+            return Err(BifrostError::QueryExecutionFailed);
+        }
+        state.metric_fold = Some(fold);
+        Ok(())
+    }
+
+    /// Takes one graph's retained fold, leaving nothing behind to run twice.
+    ///
+    /// Taken on `Draining` as well as `Active` because settlement moves the
+    /// entry before it folds.
+    pub(super) fn take_metric_fold(
+        &self,
+        graph: AnalyticalGraphKey,
+    ) -> Option<super::analytical::AnalyticalGraphMetricFold> {
+        let mut graphs = self.graphs.lock().ok()?;
+        graphs.get_mut(&graph)?.state_mut().metric_fold.take()
+    }
+
+    /// Retains the most recently settled graph's output-sort evidence.
+    ///
+    /// Test-tier only: production publishes the same evidence as counters from
+    /// [`super::telemetry::record_output_sort`]. A journey needs the exact
+    /// per-operator values its own query produced, and a counter family cannot
+    /// answer "which sort" — so the settled evidence is kept verbatim for the
+    /// process-cluster control protocol to project.
+    #[cfg(feature = "test-support")]
+    pub(super) fn record_output_sort(
+        &self,
+        evidence: super::analytical::AnalyticalOutputSortEvidence,
+    ) {
+        if let Ok(mut retained) = self.output_sort.lock() {
+            *retained = Some(evidence);
+        }
+    }
+
+    /// Reports the most recently settled graph's output-sort evidence.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn settled_output_sort(&self) -> Option<super::analytical::AnalyticalOutputSortEvidence> {
+        self.output_sort.lock().ok().and_then(|held| held.clone())
     }
 
     /// Clears one graph's retained cleanup once every release has resolved.
@@ -1516,6 +1596,259 @@ mod tests {
         AnalyticalAttemptGrant {
             scratch_bytes: FIXTURE_SCRATCH_BYTES,
         }
+    }
+
+    /// Builds the two-column ordered plan whose one output sort carries evidence.
+    ///
+    /// Never executed: the claim under test is the settlement order and the
+    /// deadline that bounds it, and a `SortExec` that never ran still reports
+    /// its own identity and a zero spill set, which is exactly what the
+    /// lifecycle folds.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixed ordering cannot be built.
+    #[cfg(feature = "test-support")]
+    fn ordered_plan() -> Arc<dyn datafusion::physical_plan::ExecutionPlan> {
+        use arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::physical_expr::LexOrdering;
+        use datafusion::physical_expr::PhysicalSortExpr;
+        use datafusion::physical_expr::expressions::Column;
+        use datafusion::physical_plan::empty::EmptyExec;
+        use datafusion::physical_plan::sorts::sort::SortExec;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("filter_key", DataType::Utf8, false),
+            Field::new("matched", DataType::Int64, false),
+        ]));
+        let source = Arc::new(EmptyExec::new(Arc::clone(&schema)));
+        let ordering = LexOrdering::new(vec![PhysicalSortExpr::new(
+            Arc::new(Column::new("filter_key", 0)),
+            arrow::compute::SortOptions {
+                descending: false,
+                nulls_first: false,
+            },
+        )])
+        .expect("a one-column ordering is non-empty");
+        Arc::new(SortExec::new(ordering, source))
+    }
+
+    /// Registers one graph, its attempt, and its lifecycle over a held fold.
+    ///
+    /// Returns the signal half the caller drives, so the test states only the
+    /// terminal it signals and the moment it releases the fold.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture graph, attempt, or lifecycle cannot be composed.
+    #[cfg(feature = "test-support")]
+    fn lifecycle_over_fold(
+        supervisor: &Arc<AnalyticalSupervisor>,
+        graph: AnalyticalGraphKey,
+        resources: OracleQueryResources,
+        runtime: AnalyticalGraphRuntime,
+        deadline: tokio::time::Instant,
+        fold: futures_util::future::BoxFuture<'static, ()>,
+    ) -> super::super::analytical::AnalyticalGraphSignals {
+        use super::super::analytical::{
+            AnalyticalGraphLifecycle, AnalyticalGraphLifecycleOwners, AnalyticalGraphMetricFold,
+        };
+        use wyrd_spec::vala::api::{AnalyticalGraphRef, QueryId, ReserveNodeSlotsRequest};
+
+        let graph_guard = supervisor
+            .register_graph(graph, resources, runtime)
+            .map_err(|(_, error)| error)
+            .expect("an idle supervisor registers one graph");
+        let attempt = supervisor
+            .spawn_attempt(attempt_zero(graph, 0), fixture_grant())
+            .expect("a registered graph admits its own attempt");
+        let signals = AnalyticalGraphLifecycle::start(
+            graph,
+            Arc::clone(supervisor),
+            None,
+            Vec::new(),
+            ReserveNodeSlotsRequest {
+                query_id: QueryId::new(graph.public_query_id.as_uuid()),
+                leader_node_id: uuid::Uuid::now_v7().into(),
+                leader_fencing_token: 1,
+                query_class: QueryClass::Analytical,
+                slot_units: 2,
+                expires_at: chrono::Utc::now() + chrono::Duration::seconds(30),
+                graph: Some(AnalyticalGraphRef {
+                    public_query_id: graph.public_query_id.as_uuid(),
+                    datafusion_query_id: graph.datafusion_query_id.as_uuid(),
+                }),
+            },
+            deadline,
+            AnalyticalGraphLifecycleOwners {
+                attempt: Some(attempt),
+                graph_guard: Some(graph_guard),
+            },
+        )
+        .expect("a registered graph starts its lifecycle task");
+        supervisor
+            .retain_metric_fold(
+                graph,
+                AnalyticalGraphMetricFold::from_future(ordered_plan(), fold),
+            )
+            .expect("an active graph retains exactly one metric fold");
+        signals
+    }
+
+    /// Awaits one graph's published settlement.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the lifecycle task ends without publishing a settlement.
+    #[cfg(feature = "test-support")]
+    async fn published_settlement(
+        signals: &super::super::analytical::AnalyticalGraphSignals,
+    ) -> super::super::analytical::AnalyticalGraphResult {
+        use super::super::analytical::AnalyticalGraphResult;
+
+        let mut receiver = signals.settled_receiver();
+        loop {
+            let observed = *receiver.borrow_and_update();
+            if matches!(
+                observed,
+                AnalyticalGraphResult::SettledSuccess(_) | AnalyticalGraphResult::SettledFailure
+            ) {
+                return observed;
+            }
+            receiver
+                .changed()
+                .await
+                .expect("the lifecycle task publishes a settlement before it ends");
+        }
+    }
+
+    /// The graph deadline, not the metric fold, decides when settlement ends.
+    ///
+    /// Drives two graphs whose distributed metric fold the test holds. The
+    /// first fold is never released: the deadline expires, the graph takes the
+    /// failed-terminal `Draining` route, no successful release is published,
+    /// readiness stays false, and shutdown still observes and joins the graph.
+    /// The second releases its fold inside the deadline and settles
+    /// successfully, with the folded output-sort evidence already retained by
+    /// the time the release is published and the graph removed.
+    ///
+    /// Required mutation RED: await the fold without
+    /// [`tokio::time::timeout`] and the first case never settles at all;
+    /// fold after `attempt.finish` and the second case publishes its release
+    /// before the evidence exists.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a fixture owner cannot be composed or a settlement diverges.
+    #[cfg(feature = "test-support")]
+    #[tokio::test(start_paused = true)]
+    async fn distributed_metrics_settle_within_the_graph_deadline() {
+        use super::super::analytical::AnalyticalGraphResult;
+
+        let oracle = oracle_role();
+        let scratch_root = tempfile::tempdir().expect("fixture scratch root");
+        let spill = OracleSpillRuntime::new(scratch_root.path(), 2 * 1024 * 1024 * 1024)
+            .expect("a positive pod ceiling builds the process spill owner");
+        let supervisor = Arc::new(AnalyticalSupervisor::new());
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+
+        let held = Arc::new(tokio::sync::Notify::new());
+        let expired_graph = AnalyticalGraphKey {
+            public_query_id: PublicQueryId::from_uuid(uuid::Uuid::now_v7()),
+            datafusion_query_id: DataFusionQueryId::allocate(),
+        };
+        let expired_resources = oracle
+            .try_acquire_query(OracleResourceRequest::for_class(
+                QueryClass::Analytical,
+                0.0,
+            ))
+            .expect("an idle Oracle admits the held query");
+        let expired_runtime = query_runtime(&expired_resources, &spill);
+        let never = Arc::clone(&held);
+        let expired = lifecycle_over_fold(
+            &supervisor,
+            expired_graph,
+            expired_resources,
+            expired_runtime,
+            deadline,
+            Box::pin(async move {
+                // Released only by a companion this case never runs, so the
+                // deadline is the only thing that can end the wait.
+                never.notified().await;
+            }),
+        );
+        expired.terminal(AnalyticalAttemptOutcome::Success);
+
+        assert_eq!(
+            published_settlement(&expired).await,
+            AnalyticalGraphResult::SettledFailure,
+            "a fold that outlives the graph deadline cannot publish a success"
+        );
+        assert_eq!(
+            supervisor
+                .draining_graphs()
+                .expect("the supervisor reports its retained graphs"),
+            1,
+            "the expired graph is retained as draining with its owners"
+        );
+        assert!(
+            supervisor
+                .graph_settlement_failure(expired_graph)
+                .expect("the supervisor reports its recorded failure")
+                .is_some(),
+            "the retained graph names why its cleanup did not complete"
+        );
+
+        let settled_graph = AnalyticalGraphKey {
+            public_query_id: PublicQueryId::from_uuid(uuid::Uuid::now_v7()),
+            datafusion_query_id: DataFusionQueryId::allocate(),
+        };
+        let settled_resources = oracle
+            .try_acquire_query(OracleResourceRequest::for_class(
+                QueryClass::Analytical,
+                0.0,
+            ))
+            .expect("an idle Oracle admits the released query");
+        let settled_runtime = query_runtime(&settled_resources, &spill);
+        let settled = lifecycle_over_fold(
+            &supervisor,
+            settled_graph,
+            settled_resources,
+            settled_runtime,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+            Box::pin(async {}),
+        );
+        settled.terminal(AnalyticalAttemptOutcome::Success);
+
+        let release = match published_settlement(&settled).await {
+            AnalyticalGraphResult::SettledSuccess(release) => release,
+            other => panic!("a fold released inside the deadline settles cleanly: {other:?}"),
+        };
+        assert!(
+            release.is_some(),
+            "a clean settlement publishes its attempt's release evidence"
+        );
+        let evidence = supervisor
+            .settled_output_sort()
+            .expect("the settled graph folded its own output-sort evidence");
+        assert_eq!(
+            evidence.schema,
+            vec!["filter_key".to_owned(), "matched".to_owned()],
+            "the folded evidence names the query's own output schema"
+        );
+        assert!(
+            supervisor.live_graphs().expect("graphs are inspectable") == 1,
+            "only the retained draining graph survives its own settlement"
+        );
+
+        let inspection = supervisor
+            .shutdown()
+            .await
+            .expect("shutdown joins every remaining lifecycle task");
+        assert_eq!(
+            inspection.graphs_retained, 1,
+            "shutdown observes and reports the retained draining graph"
+        );
     }
 
     /// Two `DataFusion` graphs under one public query never reach each other.

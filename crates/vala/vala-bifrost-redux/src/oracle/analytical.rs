@@ -2534,13 +2534,23 @@ impl AnalyticalGraphSignals {
         self.supervisor.retain_admission(self.graph, admitted)
     }
 
+    /// Stores this graph's physical-metric fold on the graph entry itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns the supervisor's refusal unchanged when the graph is not
+    /// registered active or already retains a fold.
+    fn retain_metric_fold(&self, fold: AnalyticalGraphMetricFold) -> Result<(), BifrostError> {
+        self.supervisor.retain_metric_fold(self.graph, fold)
+    }
+
     /// Clones this graph's settlement receiver for one more observer.
     ///
     /// Every clone reads the same monotonic channel, which is how settlement
     /// evidence proves a raced success, cancellation, and failure all observe
     /// the one outcome the first terminal signal chose.
     #[cfg(test)]
-    fn settled_receiver(&self) -> tokio::sync::watch::Receiver<AnalyticalGraphResult> {
+    pub(super) fn settled_receiver(&self) -> tokio::sync::watch::Receiver<AnalyticalGraphResult> {
         self.result.clone()
     }
 
@@ -2628,7 +2638,7 @@ impl AnalyticalGraphSignals {
     ///
     /// Only the first signal chooses the outcome; a later one observes the
     /// graph already draining and awaits the same settlement.
-    fn terminal(&self, outcome: AnalyticalAttemptOutcome) {
+    pub(super) fn terminal(&self, outcome: AnalyticalAttemptOutcome) {
         if let Err(error) = self.supervisor.signal_terminal(self.graph, outcome) {
             tracing::error!(
                 %error,
@@ -2658,7 +2668,7 @@ impl Drop for AnalyticalGraphSignals {
 /// after the query has already failed. Keeping that follow-up on this one task
 /// is what avoids a detached timer, a second reservation registry, or a status
 /// RPC.
-struct AnalyticalGraphLifecycle {
+pub(super) struct AnalyticalGraphLifecycle {
     /// The graph every reservation and retained release belongs to.
     graph: AnalyticalGraphKey,
     /// Supervisor the retained-cleanup state is made visible through.
@@ -2701,6 +2711,14 @@ const RETAINED_RELEASE_RETRY: std::time::Duration = std::time::Duration::from_mi
 /// Shared by the drain that first observes it and by the settlement that fails
 /// the query on it, so the residue a node reports and the failure its caller
 /// receives name the same condition.
+/// Detail one graph records when its physical metric fold outlives the deadline.
+///
+/// Named alongside the reservation detail because both describe the same class
+/// of end: the deadline arrived before this node could confirm what a peer did,
+/// so the graph is retained rather than reported clean.
+const METRIC_FOLD_EXPIRED: &str =
+    "Oracle analytical distributed metrics did not settle before the graph deadline";
+
 const RETAINED_RELEASE_UNACKNOWLEDGED: &str =
     "Oracle analytical participant release was not acknowledged";
 
@@ -2710,7 +2728,7 @@ impl AnalyticalGraphLifecycle {
     /// Nothing is reserved here. The task exists from registration so the
     /// attempt has one owner to signal, and so the cell every channel resolves
     /// through is the graph's own from the moment the session is built.
-    fn start(
+    pub(super) fn start(
         graph: AnalyticalGraphKey,
         supervisor: Arc<AnalyticalSupervisor>,
         transports: Option<Arc<super::dispatcher::OraclePeerTransportDirectory>>,
@@ -2806,7 +2824,44 @@ impl AnalyticalGraphLifecycle {
         self.settle(outcome, reservations).await;
     }
 
-    /// Performs the one cleanup sequence and publishes its settlement.
+    /// Folds this graph's retained physical metrics inside its own deadline.
+    ///
+    /// The follower fold is unbounded on its own — upstream reports task
+    /// metrics only once every coordinator channel closes — so a peer that
+    /// never answers would otherwise hold settlement open forever. The graph's
+    /// absolute deadline already covers execution, cleanup, and settlement, so
+    /// it covers this too, and an expiry is a distributed execution failure
+    /// rather than a silently zeroed metric.
+    ///
+    /// A graph that never distributed retains no fold and settles unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns the detail recorded against the graph when the fold does not
+    /// complete before the deadline.
+    async fn fold_physical_metrics(&self) -> Result<(), String> {
+        let Some(fold) = self.supervisor.take_metric_fold(self.graph) else {
+            return Ok(());
+        };
+        let remaining = self
+            .deadline
+            .saturating_duration_since(tokio::time::Instant::now());
+        let Ok(evidence) = tokio::time::timeout(remaining, fold.settle()).await else {
+            return Err(METRIC_FOLD_EXPIRED.to_owned());
+        };
+        if let Some(evidence) = evidence {
+            super::telemetry::record_output_sort_spill(
+                evidence.spill_count,
+                evidence.spilled_bytes,
+                evidence.spilled_rows,
+            );
+            #[cfg(feature = "test-support")]
+            self.supervisor.record_output_sort(evidence);
+        }
+        Ok(())
+    }
+
+    /// Performs the one cleanup sequence and publishes its settlement.    /// Performs the one cleanup sequence and publishes its settlement.
     ///
     /// The order is the invariant, and this is the only place it exists: move
     /// the graph out of `Active` so nothing new is admitted, cancel unless the
@@ -2827,12 +2882,25 @@ impl AnalyticalGraphLifecycle {
         {
             cancel.cancel();
         }
-        let mut failure = None;
+        // Folded first, and only for a success terminal: the physical evidence
+        // this publishes describes rows a caller actually received, and an
+        // abandoned graph has no follower metrics coming. It runs before the
+        // attempt is joined so spill evidence is in hand before scratch is
+        // verified, success is published, and the graph is removed.
+        let mut failure = if outcome == AnalyticalAttemptOutcome::Success {
+            self.fold_physical_metrics().await.err()
+        } else {
+            None
+        };
         let mut release = None;
         if let Some(attempt) = self.attempt.take() {
             match attempt.finish(outcome).await {
                 Ok(settled) => release = Some(settled),
-                Err(error) => failure = Some(error.to_string()),
+                Err(error) => {
+                    if failure.is_none() {
+                        failure = Some(error.to_string());
+                    }
+                }
             }
         }
         // Cancellation alone cannot end an exchange whose consumer stopped
@@ -7759,6 +7827,25 @@ impl AnalyticalAttemptOwnership {
         self.signals.retain_admission(admitted)
     }
 
+    /// Hands this query's started plan and scan sink to its graph lifecycle.
+    ///
+    /// The fold has to outlive the result stream and be bounded by something,
+    /// and the graph is the only owner that is both: it is still registered
+    /// after the stream is dropped, and it already holds the query's absolute
+    /// deadline.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::QueryExecutionFailed`] when the graph is no
+    /// longer registered active or already retains a fold, and
+    /// [`BifrostError::Internal`] when the graph lock is poisoned.
+    pub(super) fn retain_metric_fold(
+        &self,
+        fold: AnalyticalGraphMetricFold,
+    ) -> Result<(), BifrostError> {
+        self.signals.retain_metric_fold(fold)
+    }
+
     /// Reserves and publishes this graph's participant cut, once, before dispatch.
     ///
     /// # Errors
@@ -7796,18 +7883,97 @@ impl AnalyticalAttemptOwnership {
     }
 }
 
+/// One completed query's own output-sort identity and spill evidence.
+///
+/// Produced from exactly one `SortExec`'s retained metric set after the plan's
+/// result stream has been dropped, so a positive spill count here names the
+/// operator that spilled rather than an unattributed whole-plan total. The
+/// identity fields travel with the counters because "some sort spilled" and
+/// "this query's output sort spilled" are different claims.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnalyticalOutputSortEvidence {
+    /// Field names of the sort's output schema, in order.
+    pub schema: Vec<String>,
+    /// Rendered lexicographic ordering the sort produced.
+    pub ordering: String,
+    /// Spill files the sort wrote.
+    pub spill_count: u64,
+    /// Bytes the sort spilled.
+    pub spilled_bytes: u64,
+    /// Rows the sort spilled.
+    pub spilled_rows: u64,
+}
+
+/// One graph's deferred physical-metric fold, awaited inside its own deadline.
+///
+/// Retained on the graph rather than awaited in the result stream's tail
+/// because the fold is unbounded on its own: upstream reports follower metrics
+/// only after the coordinator channel closes, and a follower that never answers
+/// would otherwise hold the query's terminal open forever. The graph's
+/// lifecycle already owns one absolute deadline covering execution, cleanup,
+/// and settlement, so the fold becomes one more descendant of it.
+pub(super) struct AnalyticalGraphMetricFold {
+    /// The executed physical plan whose own output sort is read after the fold.
+    plan: Arc<dyn ExecutionPlan>,
+    /// The follower-metric fold itself, deliberately opaque to the graph.
+    fold: futures_util::future::BoxFuture<'static, ()>,
+}
+
+impl fmt::Debug for AnalyticalGraphMetricFold {
+    /// Reports that a fold is retained without rendering the plan or future.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AnalyticalGraphMetricFold")
+            .finish_non_exhaustive()
+    }
+}
+
+impl AnalyticalGraphMetricFold {
+    /// Composes one graph's fold over an executed plan and its scan sink.
+    pub(super) fn new(
+        plan: Arc<dyn ExecutionPlan>,
+        sink: Arc<super::exec::RemoteScanMetrics>,
+    ) -> Self {
+        let folded = Arc::clone(&plan);
+        Self {
+            plan,
+            fold: Box::pin(async move {
+                super::exec::record_distributed_scan_metrics(folded, sink).await;
+            }),
+        }
+    }
+
+    /// Composes one fold over an arbitrary future, for lifecycle-order tests.
+    #[cfg(test)]
+    pub(super) fn from_future(
+        plan: Arc<dyn ExecutionPlan>,
+        fold: futures_util::future::BoxFuture<'static, ()>,
+    ) -> Self {
+        Self { plan, fold }
+    }
+
+    /// Awaits the follower fold, then reads the plan's own output-sort evidence.
+    ///
+    /// The caller bounds this; nothing here imposes a second timer.
+    pub(super) async fn settle(self) -> Option<AnalyticalOutputSortEvidence> {
+        let Self { plan, fold } = self;
+        fold.await;
+        super::exec::output_sort_evidence(&plan)
+    }
+}
+
 /// The two guards one leader graph hands to its lifecycle task at registration.
 ///
 /// Named rather than passed positionally because both are `Option`-shaped in
 /// the task and transposing them would move the release order — attempt before
 /// graph — that keeps the query envelope from being stranded.
-struct AnalyticalGraphLifecycleOwners {
+pub(super) struct AnalyticalGraphLifecycleOwners {
     /// The graph's own attempt, joined by the lifecycle task.
-    attempt: Option<AnalyticalAttemptGuard>,
+    pub(super) attempt: Option<AnalyticalAttemptGuard>,
     /// The graph's registration, disarmed once the lifecycle task owns it.
     ///
     /// Handing it over is what stops a caller's `Drop` from removing a graph
     /// the task is still settling; the task itself releases through the
     /// supervisor rather than through this guard.
-    graph_guard: Option<AnalyticalGraphGuard>,
+    pub(super) graph_guard: Option<AnalyticalGraphGuard>,
 }

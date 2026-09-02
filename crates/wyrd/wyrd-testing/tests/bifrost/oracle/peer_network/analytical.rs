@@ -51,8 +51,8 @@ async fn prove_graph_lease_owns_exact_resources() -> Result<(), PeerJourneyError
 
     let table = format!("graph_lease_{}", uuid::Uuid::now_v7().simple());
     cluster.nodes_mut()[SCRIBE].register_table(&table)?;
-    cluster.nodes_mut()[SCRIBE].ingest_rows(&table, 12, 3)?;
-    cluster.nodes_mut()[SCRIBE].ingest_rows(&table, 12, 3)?;
+    cluster.nodes_mut()[SCRIBE].ingest_rows(&table, 0, 12, 3)?;
+    cluster.nodes_mut()[SCRIBE].ingest_rows(&table, 0, 12, 3)?;
     for index in [LEADER, FOLLOWERS[0], FOLLOWERS[1], SCRIBE] {
         cluster.nodes_mut()[index].refresh_snapshot()?;
     }
@@ -176,8 +176,8 @@ async fn prove_terminal_ordering(cause: TerminalCause) -> Result<(), PeerJourney
 
     let table = format!("one_attempt_{}", uuid::Uuid::now_v7().simple());
     cluster.nodes_mut()[SCRIBE].register_table(&table)?;
-    cluster.nodes_mut()[SCRIBE].ingest_rows(&table, 12, 3)?;
-    cluster.nodes_mut()[SCRIBE].ingest_rows(&table, 12, 3)?;
+    cluster.nodes_mut()[SCRIBE].ingest_rows(&table, 0, 12, 3)?;
+    cluster.nodes_mut()[SCRIBE].ingest_rows(&table, 0, 12, 3)?;
     for index in [LEADER, FOLLOWERS[0], FOLLOWERS[1], SCRIBE] {
         cluster.nodes_mut()[index].refresh_snapshot()?;
     }

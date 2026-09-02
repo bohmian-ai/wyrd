@@ -41,6 +41,7 @@ use datafusion::physical_plan::metrics::{
     Count, ExecutionPlanMetricsSet, Metric, MetricValue, MetricsSet,
 };
 use datafusion::physical_plan::projection::ProjectionExec;
+use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{
@@ -986,7 +987,7 @@ pub(crate) fn is_distributed_plan(plan: &dyn ExecutionPlan) -> bool {
 /// nothing rather than a fabricated zero.
 pub(crate) async fn record_distributed_scan_metrics(
     plan: Arc<dyn ExecutionPlan>,
-    sink: &RemoteScanMetrics,
+    sink: Arc<RemoteScanMetrics>,
 ) {
     let Ok(with_metrics) = datafusion_distributed::rewrite_distributed_plan_with_metrics(
         plan,
@@ -1044,6 +1045,72 @@ fn fold_distributed_scan_metrics(
     }
     for child in node.children() {
         fold_distributed_scan_metrics(child, totals);
+    }
+}
+
+/// Reads the completed output sort's own retained spill evidence, if it has one.
+///
+/// The "output sort" is the one `SortExec` in the whole plan — coordinator
+/// stage and every `Stage::Local` descendant included — whose output schema is
+/// the query's own. A query whose final ordering is produced by exactly one
+/// sort therefore has exactly one candidate, and the metric set read here is
+/// that operator's own rather than a whole-plan aggregate: a plan-wide spill
+/// total cannot distinguish the sort that spilled from any other consumer that
+/// did.
+///
+/// Zero or more than one candidate reports nothing rather than a fabricated
+/// zero, which is the same absent-versus-zero rule the scan fold follows. The
+/// plan must already have been executed and its stream dropped; `DataFusion`
+/// registers a `SortExec`'s metric set during execution, so reading earlier
+/// would report an operator that had not yet spilled.
+pub(crate) fn output_sort_evidence(
+    root: &Arc<dyn ExecutionPlan>,
+) -> Option<super::analytical::AnalyticalOutputSortEvidence> {
+    let mut found = Vec::new();
+    collect_output_sorts(root, root.schema().as_ref(), &mut found);
+    match found.as_slice() {
+        [evidence] => Some(evidence.clone()),
+        _ => None,
+    }
+}
+
+/// Accumulates every `SortExec` carrying `schema`, crossing distributed edges.
+///
+/// Mirrors [`fold_distributed_scan_metrics`]: a distributed plan hangs each
+/// stage off its network boundary's input stage rather than off its children,
+/// so descending both edges is what reaches an operator that upstream placed
+/// below a boundary. Evidence is built at the match site because a stage's
+/// plan is reached through a temporary borrow that cannot outlive the walk.
+fn collect_output_sorts(
+    node: &Arc<dyn ExecutionPlan>,
+    schema: &Schema,
+    found: &mut Vec<super::analytical::AnalyticalOutputSortEvidence>,
+) {
+    if let Some(sort) = node.downcast_ref::<SortExec>()
+        && sort.schema().fields() == schema.fields()
+    {
+        let metrics = sort.metrics().unwrap_or_default();
+        let as_u64 = |value: Option<usize>| u64::try_from(value.unwrap_or(0)).unwrap_or(u64::MAX);
+        found.push(super::analytical::AnalyticalOutputSortEvidence {
+            schema: sort
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| field.name().clone())
+                .collect(),
+            ordering: sort.expr().to_string(),
+            spill_count: as_u64(metrics.spill_count()),
+            spilled_bytes: as_u64(metrics.spilled_bytes()),
+            spilled_rows: as_u64(metrics.spilled_rows()),
+        });
+    }
+    if let Some(boundary) = node.as_network_boundary()
+        && let datafusion_distributed::Stage::Local(stage) = boundary.input_stage()
+    {
+        collect_output_sorts(&stage.plan, schema, found);
+    }
+    for child in node.children() {
+        collect_output_sorts(child, schema, found);
     }
 }
 

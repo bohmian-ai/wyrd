@@ -181,6 +181,8 @@ pub enum ControlRequest {
     IngestRows {
         /// Table name inside the `vala.bifrost` namespace.
         table: String,
+        /// First `id` value this request writes.
+        start_id: i64,
         /// Number of rows to write.
         rows: i64,
         /// Distinct `filter_key` groups the rows fall into.
@@ -908,7 +910,9 @@ impl ProcessNode {
     ///
     /// The rows are written through this pod's own Scribe and published, so a
     /// later query observes durable state a real replica produced rather than
-    /// a fixture-authored file listing.
+    /// a fixture-authored file listing. Ids run `start_id..start_id + rows`,
+    /// so a caller builds one logical table out of several bounded requests
+    /// without any request having to hold the whole table in memory.
     ///
     /// # Errors
     ///
@@ -917,11 +921,13 @@ impl ProcessNode {
     pub fn ingest_rows(
         &mut self,
         table: &str,
+        start_id: i64,
         rows: i64,
         groups: i64,
     ) -> Result<(), ProcessClusterError> {
         match self.request(&ControlRequest::IngestRows {
             table: table.to_owned(),
+            start_id,
             rows,
             groups,
         })? {

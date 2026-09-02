@@ -120,9 +120,13 @@ async fn serve() -> Result<(), ProcessClusterError> {
             }
             ControlRequest::IngestRows {
                 table,
+                start_id,
                 rows,
                 groups,
-            } => match config.ingest_rows(&server, &table, rows, groups).await {
+            } => match config
+                .ingest_rows(&server, &table, start_id, rows, groups)
+                .await
+            {
                 Ok(()) => emit(&ControlResponse::Ingested)?,
                 Err(error) => emit(&ControlResponse::Failed {
                     detail: error.to_string(),
@@ -597,6 +601,7 @@ impl ChildConfig {
         &self,
         server: &WyrdTestServer,
         table: &str,
+        start_id: i64,
         rows: i64,
         groups: i64,
     ) -> Result<(), ProcessClusterError> {
@@ -645,7 +650,7 @@ impl ChildConfig {
                 request_id: wyrd_spec::request_id::RequestId::now_v7(),
                 batch_id: uuid::Uuid::now_v7(),
                 audit_event,
-                payload: fixture_rows_ipc(rows, groups)?,
+                payload: fixture_rows_ipc(start_id, rows, groups)?,
             })
             .await
             .map_err(|error| child(error.to_string()))?;
@@ -1077,30 +1082,36 @@ fn graph_lease_counts(server: &WyrdTestServer) -> (u64, usize) {
 
 /// Encodes `rows` deterministic `(id, filter_key)` rows as one Arrow IPC stream.
 ///
-/// The rows are spread over `groups` distinct keys so a grouped aggregate has
-/// more than one non-trivial group, which is what makes a distributed plan
-/// exchange partitions rather than collapse to a single stage.
+/// Ids run `start_id..start_id + rows`, so several bounded requests compose one
+/// contiguous logical table. The rows are spread over `groups` distinct keys so
+/// a grouped aggregate has more than one non-trivial group, which is what makes
+/// a distributed plan exchange partitions rather than collapse to a single
+/// stage.
 ///
 /// # Errors
 ///
 /// Returns [`ProcessClusterError::Child`] when the batch or its IPC encoding
 /// cannot be built.
-fn fixture_rows_ipc(rows: i64, groups: i64) -> Result<bytes::Bytes, ProcessClusterError> {
+fn fixture_rows_ipc(
+    start_id: i64,
+    rows: i64,
+    groups: i64,
+) -> Result<bytes::Bytes, ProcessClusterError> {
     let child = ProcessClusterError::Child;
     let groups = groups.max(1);
     let schema = Arc::new(arrow::datatypes::Schema::new(vec![
         arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
         arrow::datatypes::Field::new("filter_key", arrow::datatypes::DataType::Utf8, false),
     ]));
-    let keys: Vec<String> = (0..rows)
+    let ids: Vec<i64> = (start_id..start_id.saturating_add(rows)).collect();
+    let keys: Vec<String> = ids
+        .iter()
         .map(|id| format!("group_{}", id % groups))
         .collect();
     let batch = arrow::record_batch::RecordBatch::try_new(
         Arc::clone(&schema),
         vec![
-            Arc::new(arrow::array::Int64Array::from(
-                (0..rows).collect::<Vec<_>>(),
-            )),
+            Arc::new(arrow::array::Int64Array::from(ids)),
             Arc::new(arrow::array::StringArray::from(keys)),
         ],
     )

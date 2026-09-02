@@ -423,8 +423,17 @@ mod tests {
             "an open or uncertain attempt refuses the whole protocol"
         );
 
-        // A watermark that Iceberg cannot corroborate fails closed rather than
-        // being dropped from the protected set.
+        assert_uncorroborated_watermarks_fail_closed();
+        assert_frontier_member_proof_refuses();
+    }
+
+    /// Proves a watermark Iceberg cannot corroborate fails the pass instead of
+    /// being quietly dropped from the protected set.
+    ///
+    /// # Panics
+    ///
+    /// Panics when either uncorroborated watermark is tolerated.
+    fn assert_uncorroborated_watermarks_fail_closed() {
         for (case, watermark) in [
             (
                 "a watermark on a snapshot the table no longer retains",
@@ -454,10 +463,15 @@ mod tests {
                 "{case} must fail closed"
             );
         }
+    }
 
-        // A frontier member whose stored proof does not reproduce is
-        // contradictory evidence, not an absence of protection. It must refuse
-        // before any watermark derived from it can reach this policy.
+    /// Proves a frontier member whose stored proof no longer reproduces is
+    /// contradictory evidence rather than an absence of protection.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a corrupted digest or ancestry path still validates.
+    fn assert_frontier_member_proof_refuses() {
         let identity = TableAuthorityIdentity {
             tenant: DataTenantId::new_v7(),
             table_uid: [5_u8; 16],

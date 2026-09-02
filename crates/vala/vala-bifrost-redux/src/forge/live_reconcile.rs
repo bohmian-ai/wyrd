@@ -21,9 +21,10 @@ use crate::catalog::TenantTableBinding;
 use crate::catalog::layout::TimePartition;
 
 /// Whether later table stages may perform destructive maintenance.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum DestructiveMaintenance {
     /// All bounded prepared work has terminal proof.
+    #[default]
     Allowed,
     /// Uncertain or incomplete work requires destructive stages to stop.
     Blocked,

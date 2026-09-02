@@ -10,4 +10,5 @@ mod promotion;
 mod publication;
 mod reader_expiry_ordering;
 mod rewrite_support;
+mod snapshot_expiration;
 pub(crate) mod support;

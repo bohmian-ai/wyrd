@@ -384,6 +384,42 @@ impl<'resource> ForgeOperations<'resource> {
         })
     }
 
+    /// Reads one exact operation's validated state row by primary key.
+    ///
+    /// Snapshot-expiration reconciliation resolves its operation from the
+    /// task-bound claim index and then needs that one operation's immutable
+    /// prepared detail. This is the primary-key read for that step: no scan, no
+    /// cap, and no candidate-equality heuristic. Like every other state read it
+    /// touches only `vala.forge_operation_state`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqlError::InvariantViolation`] when the stored row fails
+    /// decoding or identity validation, and [`SqlError::Query`] when the read
+    /// fails.
+    ///
+    /// # Cancellation
+    ///
+    /// The read writes nothing; cancellation leaves no durable trace.
+    pub async fn operation(
+        &self,
+        conn: &mut TenantConn<'_>,
+        operation_id: Uuid,
+    ) -> Result<Option<ForgeOperationStateRow>, SqlError> {
+        let row: Option<ForgeOperationStateSqlRow> = sqlx::query_as(
+            r"SELECT * FROM vala.forge_operation_state
+               WHERE data_tenant_id = wyrd.current_tenant()
+                 AND resource = $1 AND family = $2 AND operation_id = $3",
+        )
+        .bind(self.resource)
+        .bind(self.family.as_str())
+        .bind(operation_id)
+        .fetch_optional(&mut **conn.transaction())
+        .await
+        .map_err(SqlError::from)?;
+        row.map(TryInto::try_into).transpose()
+    }
+
     /// Lists a bounded page of terminal Reset operations as never-published proof.
     ///
     /// # Errors
@@ -522,7 +558,14 @@ impl<'resource> ForgeOperations<'resource> {
         Ok(row)
     }
 
-    /// Inserts a new Prepared state row for the given operation.
+    /// Inserts a new Prepared state row for the given operation, reopening one
+    /// that a previous pass released.
+    ///
+    /// A `reset` operation is released, not terminal: the same table and the
+    /// same selection deterministically derive the same operation identity, so
+    /// a retry after a release must be able to prepare again. The upsert
+    /// reopens only a `reset` row; `committed` and `recovered` rows stay
+    /// terminal and are refused by the caller's replay gate before this runs.
     ///
     /// Caller must hold the advisory lock and have committed the audit append
     /// in the same transaction.
@@ -560,6 +603,14 @@ impl<'resource> ForgeOperations<'resource> {
                 $4::jsonb, $4::jsonb,
                 $5, NULL,
                 $6, $6)
+        ON CONFLICT (data_tenant_id, resource, family, operation_id) DO UPDATE
+            SET phase = 'prepared',
+                current_detail = EXCLUDED.prepared_detail,
+                prepared_audit_seq = EXCLUDED.prepared_audit_seq,
+                terminal_audit_seq = NULL,
+                prepared_at = EXCLUDED.prepared_at,
+                updated_at = EXCLUDED.updated_at
+            WHERE vala.forge_operation_state.phase = 'reset'
         "#,
         )
         .bind(self.resource)
@@ -844,7 +895,9 @@ impl ForgeOperations<'_> {
     /// task to Prepared with its evidence and audit.
     ///
     /// Replaying the identical preparation writes nothing and returns the
-    /// existing prepared sequence.
+    /// existing prepared sequence. An identical selection whose previous pass
+    /// was reset is prepared again, reopening that released operation; a
+    /// committed or recovered operation is refused.
     ///
     /// # Errors
     ///
@@ -896,16 +949,21 @@ impl ForgeOperations<'_> {
             let state_row: ForgeOperationStateRow = sql_row.try_into()?;
             if audit_detail_canonical_json(&detail)
                 != audit_detail_canonical_json(&state_row.prepared_detail)
-                || state_row.phase != ForgeOperationPhase::Prepared
+                || !matches!(
+                    state_row.phase,
+                    ForgeOperationPhase::Prepared | ForgeOperationPhase::Reset
+                )
             {
                 return Err(SqlError::Conflict {
                     detail: "snapshot expiration preparation does not replay the stored operation"
                         .to_owned(),
                 });
             }
-            return Ok(ForgeOperationTransition::AlreadyApplied {
-                audit_seq: state_row.prepared_audit_seq,
-            });
+            if state_row.phase == ForgeOperationPhase::Prepared {
+                return Ok(ForgeOperationTransition::AlreadyApplied {
+                    audit_seq: state_row.prepared_audit_seq,
+                });
+            }
         }
 
         let seq = OperatorAudit::new(tenant, &mut tx)

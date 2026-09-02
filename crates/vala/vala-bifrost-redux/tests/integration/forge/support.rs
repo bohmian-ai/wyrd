@@ -1117,6 +1117,12 @@ impl SupervisedPromotion {
         }
     }
 
+    /// Borrows the retained Forge graph so a scenario can drive one production
+    /// owner directly instead of through a claimed worker attempt.
+    pub(crate) fn forge(&self) -> Arc<Forge> {
+        Arc::clone(&self.forge)
+    }
+
     /// Runs the production reclaim transaction once, outside the worker loop.
     ///
     /// The supervised loop reclaims and then claims in one iteration, so a

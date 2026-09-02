@@ -6,16 +6,14 @@ use std::time::Instant;
 
 use iceberg::table::Table;
 use iceberg::transaction::{
-    ExpiredFileSet, ManifestRewriteLimits, ManifestRewriteOutcome, ManifestRewriteSelection,
-    rewrite_manifests,
+    ManifestRewriteLimits, ManifestRewriteOutcome, ManifestRewriteSelection, rewrite_manifests,
 };
 use tokio_util::sync::CancellationToken;
 
 use super::Forge;
 use super::compact::ForgeTableKey;
 use super::error::ForgeError;
-use super::expire::PendingExpiryTerminal;
-use super::expire::table_resource_for_key;
+use super::expire::{ExpiryTaskAuthority, table_resource_for_key};
 use super::lease::ForgeLease;
 use super::manifest_rewrite::{
     MANIFEST_REWRITE_COMMITTED, MANIFEST_REWRITE_PREPARED, MANIFEST_REWRITE_RESET,
@@ -24,6 +22,7 @@ use super::manifest_rewrite::{
 };
 use super::metrics::ForgeMetricStage;
 use crate::catalog::TenantTableBinding;
+use vala_sql::row_types::forge_tasks::ForgeTaskEvidence;
 use wyrd_spec::vala::StoragePath;
 use wyrd_spec::vala::api::ForgeManifestRewritePhase;
 
@@ -348,22 +347,26 @@ pub(super) struct ForgeMaintenance {
 pub(super) struct ForgeMaintenanceResult {
     /// Current table after metadata commits.
     pub(super) table: Table,
-    /// Metadata-derived candidates proven unreachable after expiry.
-    pub(super) expired_files: ExpiredFileSet,
-    /// Expiry operations closed only after task Prepared evidence commits.
-    pub(super) expiry_terminals: Vec<PendingExpiryTerminal>,
+    /// Final task evidence an atomic snapshot-expiration settlement stored.
+    ///
+    /// `Some` means the expiration already moved its task to `Succeeded` with
+    /// exact cleanup candidates and advanced planning demand, so the worker
+    /// owes the task no further terminal transition and performs no delete.
+    pub(super) expiry_evidence: Option<ForgeTaskEvidence>,
 }
 
 /// The exact table, plan inputs, and due-work flags for one maintenance pass.
 ///
-/// The dispatcher derives all six values from one validated claim, so they
-/// travel together rather than as six positional parameters in which the two
-/// adjacent booleans would be silently transposable.
+/// The dispatcher derives every value from one validated claim, so they travel
+/// together rather than as positional parameters in which the two adjacent
+/// booleans would be silently transposable.
 pub(super) struct ForgeMaintenanceRequest<'a> {
     /// Identity of the table being maintained.
     pub(super) key: &'a ForgeTableKey,
     /// Tenant and table binding authorizing this pass.
     pub(super) binding: &'a TenantTableBinding,
+    /// Claimed task identity that authorizes every expiration transition.
+    pub(super) authority: &'a ExpiryTaskAuthority,
     /// Loaded Iceberg table this pass commits against.
     pub(super) table: Table,
     /// Manifest paths selected by the claimed plan.
@@ -630,6 +633,7 @@ impl ForgeMaintenance {
         let ForgeMaintenanceRequest {
             key,
             binding,
+            authority,
             table,
             manifest_paths,
             manifest_rewrite_due,
@@ -665,29 +669,28 @@ impl ForgeMaintenance {
         }
         lease.require_fence(&self.forge.core.operator_pool).await?;
         require_running(stop)?;
-        let (expired_files, expiry_terminals) =
+        let expiry_evidence =
             if snapshot_expiry_due && self.forge.core.config.snapshot_expiry_enabled {
-                let expiry = self
-                    .forge
+                self.forge
                     .run_snapshot_expiry_for_table(
                         lease,
                         key,
                         binding,
+                        authority,
                         self.forge.core.clock.now()?,
                         stop,
                     )
-                    .await?;
-                (expiry.expired_files, expiry.terminals)
+                    .await?
+                    .settled_evidence
             } else {
-                (ExpiredFileSet::default(), Vec::new())
+                None
             };
         require_running(stop)?;
         lease.require_fence(&self.forge.core.operator_pool).await?;
         let table = self.forge.load_table(&binding.table_ident()).await?;
         Ok(ForgeMaintenanceResult {
             table,
-            expired_files,
-            expiry_terminals,
+            expiry_evidence,
         })
     }
 

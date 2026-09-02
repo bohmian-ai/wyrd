@@ -51,7 +51,7 @@ impl<'conn, 'tx> ReaderProtection<'conn, 'tx> {
     /// Returns [`ForgeError::Sql`] when the lookup fails and
     /// [`ForgeError::Invariant`] when the table has no registration row or its
     /// stored UID is not the 16 bytes the schema requires.
-    async fn identity(
+    pub(super) async fn identity(
         &mut self,
         tenant: DataTenantId,
         table_ref: &TableRef,

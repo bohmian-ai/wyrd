@@ -12,8 +12,15 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use vala_sql::queries::forge_operations::ForgeOperations;
 use vala_sql::queries::forge_tasks::ForgeTasks;
-use vala_sql::row_types::forge_operations::{ForgeOperationFamily, ForgeOperationTransition};
-use vala_sql::row_types::forge_tasks::{ForgeTaskTableIdentity, SnapshotWatermark};
+use vala_sql::row_types::forge_operations::{
+    ForgeClaimTable, ForgeExpirationAuthority, ForgeExpirationPreparation,
+    ForgeExpirationResetRequest, ForgeExpirationSettlement, ForgeExpirationSettlementRequest,
+    ForgeOperationFamily,
+};
+use vala_sql::row_types::forge_tasks::{
+    ForgeCleanupCandidate, ForgeCleanupCategory, ForgeCleanupPath, ForgeTaskEvidence,
+    ForgeTaskState, ForgeTaskTableIdentity, SnapshotWatermark,
+};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
 use wyrd_spec::request_id::RequestId;
@@ -22,7 +29,7 @@ use wyrd_spec::vala::api::{
     StoragePath,
 };
 
-use crate::catalog::{TableRef, TenantTableBinding};
+use crate::catalog::{BIFROST_CATALOG_NAME, TableRef, TenantTableBinding};
 #[cfg(test)]
 use crate::namespaces::BifrostNamespace;
 
@@ -49,7 +56,7 @@ pub struct SnapshotSummary {
 }
 
 /// Bounded snapshot-expiry reconciliation evidence for one table pass.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub(crate) struct ExpiryReconciliationOutcome {
     /// Prepared operations completed or proven externally complete.
     pub(crate) recovered: usize,
@@ -59,33 +66,29 @@ pub(crate) struct ExpiryReconciliationOutcome {
     pub(crate) unresolved: usize,
     /// Fail-closed destructive-maintenance disposition.
     pub(crate) destructive_maintenance: super::live_reconcile::DestructiveMaintenance,
-    /// Exact metadata-derived paths made unreachable by this pass.
-    pub(crate) expired_files: ExpiredFileSet,
-    /// Terminal expiry transitions delayed until task evidence is durable.
-    pub(crate) terminals: Vec<PendingExpiryTerminal>,
+    /// Final task evidence an atomic settlement in this pass already stored.
+    ///
+    /// `Some` means the task row is already `Succeeded` with its exact cleanup
+    /// candidates and its planning demand advanced, so the worker owes it no
+    /// further terminal transition. `None` means this pass settled nothing.
+    pub(crate) settled_evidence: Option<ForgeTaskEvidence>,
 }
 
-/// One committed expiry operation awaiting its terminal audit transition.
-#[derive(Debug)]
-pub(crate) struct PendingExpiryTerminal {
-    /// Canonical Prepared detail retained by the operation projection.
-    pub(crate) detail: AuditDetail,
-    /// Whether reconciliation, rather than the first caller, proved the commit.
-    pub(crate) recovered: bool,
-}
-
-impl Default for ExpiryReconciliationOutcome {
-    /// Starts one expiry reconciliation in the allowed, empty state.
-    fn default() -> Self {
-        Self {
-            recovered: 0,
-            pending: 0,
-            unresolved: 0,
-            destructive_maintenance: super::live_reconcile::DestructiveMaintenance::Allowed,
-            expired_files: ExpiredFileSet::default(),
-            terminals: Vec::new(),
-        }
-    }
+/// The claimed Forge task one snapshot-expiration pass acts under.
+///
+/// Preparation, reset, and settlement are all authorized by the exact task,
+/// attempt, and current owner rather than by the table lease alone, so the pass
+/// carries that identity from the worker's claim down to the three
+/// [`ForgeOperations`] transactions instead of re-deriving it from durable
+/// state it does not own.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ExpiryTaskAuthority {
+    /// Stable task identity carrying this expiration.
+    pub(crate) task_id: Uuid,
+    /// Attempt generation, preserved across reconciliation takeover.
+    pub(crate) attempt_id: Uuid,
+    /// Worker acting on the task right now.
+    pub(crate) worker_id: Uuid,
 }
 
 /// Selects only snapshots older than `cutoff_ms` that are not current, ref
@@ -152,14 +155,19 @@ impl Forge {
         lease: &mut ForgeLease,
         key: &ForgeTableKey,
         binding: &TenantTableBinding,
+        authority: &ExpiryTaskAuthority,
         now: DateTime<Utc>,
         stop: &CancellationToken,
     ) -> Result<ExpiryReconciliationOutcome, ForgeError> {
-        self.run_snapshot_expiry_for_table_inner(lease, key, binding, now, stop)
+        self.run_snapshot_expiry_for_table_inner(lease, key, binding, authority, now, stop)
             .await
     }
 
     /// Runs one table-scoped snapshot-expiry pass for integration fixtures.
+    ///
+    /// The fixture supplies the claimed task authority the production worker
+    /// would supply, so the same three [`ForgeOperations`] transactions bracket
+    /// the same pinned Iceberg call.
     ///
     /// # Errors
     ///
@@ -169,7 +177,10 @@ impl Forge {
     pub async fn run_snapshot_expiry_for_test(
         &self,
         binding: &TenantTableBinding,
-    ) -> Result<usize, ForgeError> {
+        task_id: Uuid,
+        attempt_id: Uuid,
+        worker_id: Uuid,
+    ) -> Result<Option<ForgeTaskEvidence>, ForgeError> {
         let key = ForgeTableKey {
             tenant: binding.tenant,
             table_ref: binding.table_ref.clone(),
@@ -182,61 +193,7 @@ impl Forge {
         let mut lease = ForgeLease::acquire(
             &self.core.operator_pool,
             lease_key,
-            Uuid::now_v7(),
-            self.core.config.lease_ttl,
-        )
-        .await?
-        .ok_or_else(|| ForgeError::FenceLost {
-            lease_key: format!("forge:table:{}:{}", binding.tenant, binding.table_ref),
-        })?;
-        let mut outcome = self
-            .run_snapshot_expiry_for_table(
-                &mut lease,
-                &key,
-                binding,
-                self.core.clock.now()?,
-                &CancellationToken::new(),
-            )
-            .await;
-        if let Ok(value) = &mut outcome {
-            self.finalize_expiry_terminals(
-                &mut lease,
-                binding.tenant,
-                std::mem::take(&mut value.terminals),
-            )
-            .await?;
-        }
-        lease.release(&self.core.operator_pool).await?;
-        outcome.map(|outcome| outcome.recovered)
-    }
-
-    /// Stops at the injected post-commit/pre-task-evidence boundary.
-    ///
-    /// The returned counts prove that exact metadata candidates and an open
-    /// expiry transition survive together before the worker may close either.
-    ///
-    /// # Errors
-    ///
-    /// Returns the production lease, catalog, watermark, expiry, and traversal
-    /// failures. The committed expiry deliberately remains Prepared for replay.
-    #[cfg(feature = "test-support")]
-    pub async fn run_snapshot_expiry_commit_boundary_for_test(
-        &self,
-        binding: &TenantTableBinding,
-    ) -> Result<(usize, usize), ForgeError> {
-        let key = ForgeTableKey {
-            tenant: binding.tenant,
-            table_ref: binding.table_ref.clone(),
-        };
-        let lease_key = forge_lease_key(
-            binding.tenant,
-            &binding.logical_namespace,
-            &binding.table_name,
-        );
-        let mut lease = ForgeLease::acquire(
-            &self.core.operator_pool,
-            lease_key,
-            Uuid::now_v7(),
+            worker_id,
             self.core.config.lease_ttl,
         )
         .await?
@@ -248,19 +205,17 @@ impl Forge {
                 &mut lease,
                 &key,
                 binding,
+                &ExpiryTaskAuthority {
+                    task_id,
+                    attempt_id,
+                    worker_id,
+                },
                 self.core.clock.now()?,
                 &CancellationToken::new(),
             )
-            .await?;
-        let candidates = outcome.expired_files.data_files.len()
-            + outcome.expired_files.delete_files.len()
-            + outcome.expired_files.manifests.len()
-            + outcome.expired_files.manifest_lists.len()
-            + outcome.expired_files.statistics.len()
-            + outcome.expired_files.metadata_logs.len();
-        let terminals = outcome.terminals.len();
+            .await;
         lease.release(&self.core.operator_pool).await?;
-        Ok((candidates, terminals))
+        outcome.map(|outcome| outcome.settled_evidence)
     }
 }
 
@@ -301,23 +256,28 @@ impl Forge {
         Ok((tables, failures))
     }
 
-    /// Reconcile prepared snapshot-expiry audits, then expire eligible snapshots.
+    /// Reconcile this task's prepared expiry, then expire eligible snapshots.
     ///
     /// Current and reference heads, plus their retained ancestry, are protected by
     /// [`select_expirable_snapshots`]. Recovery of an accepted Prepared operation
     /// ends the pass so a successor never submits a second expiry effect from the
     /// same metadata load. New selections reload metadata before commit.
+    ///
+    /// Postgres closes before Iceberg: the preparation transaction commits and
+    /// releases the table maintenance-authority row before the second catalog
+    /// read, so no SQL lock is held across catalog or object-store IO.
     async fn run_snapshot_expiry_for_table_inner(
         &self,
         lease: &mut ForgeLease,
         key: &ForgeTableKey,
         binding: &TenantTableBinding,
+        authority: &ExpiryTaskAuthority,
         now: DateTime<Utc>,
         stop: &CancellationToken,
     ) -> Result<ExpiryReconciliationOutcome, ForgeError> {
         require_running(stop)?;
         let mut outcome = self
-            .reconcile_expiry(lease, key, binding, now, stop)
+            .reconcile_expiry(lease, key, binding, authority, now, stop)
             .await?;
         if outcome.recovered > 0 {
             return Ok(outcome);
@@ -353,20 +313,64 @@ impl Forge {
         };
         let doomed: Vec<i64> = snapshot_ids.clone();
         let detail = expiry_detail(&table, key, cutoff_ms, snapshot_ids, ref_heads)?;
+        let claim_table = self.expiry_claim_table(key, &table).await?;
         require_running(stop)?;
         lease.require_fence(&self.core.operator_pool).await?;
-        self.append_expiry_audit(lease, key.tenant, &detail, "forge.snapshot_expire.prepared")
-            .await?;
-        require_running(stop)?;
         self.revalidate_reader_protection(key, &doomed, cutoff_ms)
             .await?;
-        outcome.expired_files = self
-            .complete_expiry(lease, key, binding, &detail, stop)
+        self.prepare_expiration(lease, key, authority, &claim_table, &detail)
             .await?;
-        outcome.terminals.push(PendingExpiryTerminal {
-            detail,
-            recovered: false,
-        });
+        require_running(stop)?;
+        // The one corroborating read. Every pinned field must still be exactly
+        // what preparation recorded; anything else is definite pre-call drift
+        // that releases the claims without making a single Iceberg mutation.
+        let reloaded = self.load_table(&binding.table_ident()).await?;
+        if let Err(drift) = corroborate_expiry(
+            &reloaded,
+            &claim_table,
+            &detail,
+            self.core.config.retain_last,
+        ) {
+            self.reset_expiration(lease, key, authority, &claim_table, &detail, &drift)
+                .await?;
+            outcome.unresolved = outcome.unresolved.saturating_add(1);
+            outcome.destructive_maintenance =
+                super::live_reconcile::DestructiveMaintenance::Blocked;
+            return Ok(outcome);
+        }
+        let expired_files = match self
+            .complete_expiry(lease, key, reloaded, &detail, stop)
+            .await
+        {
+            Ok(files) => files,
+            // A definite optimistic-commit rejection proves the mutation was
+            // never applied, so it releases the claims exactly like drift.
+            // Every other failure leaves acceptance unproven and therefore
+            // leaves task, operation, and claims Prepared for reconciliation.
+            Err(ForgeError::Catalog(error)) => {
+                let rejection = ForgeError::Catalog(error);
+                self.reset_expiration(lease, key, authority, &claim_table, &detail, &rejection)
+                    .await?;
+                outcome.unresolved = outcome.unresolved.saturating_add(1);
+                outcome.destructive_maintenance =
+                    super::live_reconcile::DestructiveMaintenance::Blocked;
+                return Ok(outcome);
+            }
+            Err(error) => return Err(error),
+        };
+        let evidence = self
+            .settle_expiration(
+                lease,
+                key,
+                binding,
+                authority,
+                &claim_table,
+                &detail,
+                &expired_files,
+                ForgeExpirationSettlement::Committed,
+            )
+            .await?;
+        outcome.settled_evidence = Some(evidence);
         outcome.recovered = outcome.recovered.saturating_add(1);
         Ok(outcome)
     }
@@ -765,7 +769,7 @@ impl Forge {
         &self,
         lease: &mut ForgeLease,
         key: &ForgeTableKey,
-        binding: &TenantTableBinding,
+        table: iceberg::table::Table,
         detail: &AuditDetail,
         stop: &CancellationToken,
     ) -> Result<ExpiredFileSet, ForgeError> {
@@ -778,18 +782,6 @@ impl Forge {
         if !lease.commit_window_fits(self.core.config.commit_window()) {
             return Err(ForgeError::FenceLost {
                 lease_key: lease.lease_key.clone(),
-            });
-        }
-        let table = self.load_table(&binding.table_ident()).await?;
-        if !selected_ids_are_eligible(
-            &table,
-            selected_snapshot_ids,
-            cutoff_ms,
-            self.core.config.retain_last,
-        )? {
-            return Err(ForgeError::SnapshotExpiry {
-                detail: "reloaded Iceberg metadata no longer matches the prepared selection"
-                    .to_owned(),
             });
         }
         let tx = Transaction::new(&table);
@@ -965,238 +957,461 @@ fn selected_ids_are_eligible(
     Ok(selected.iter().all(|id| expected.contains(id)))
 }
 
-/// Recover prepared expiry operations whose outcome is now knowable.
-///
-/// A selection already absent from Iceberg is recorded as recovered. A
-/// selection still present is retried only after the uncertainty bound has
-/// elapsed.
+/// Recover this task's prepared expiry operation when its outcome is knowable.
 impl Forge {
+    /// Settles or retains the one operation this task's claims still name.
+    ///
+    /// The claim index is the lookup: an attempt that crashed after preparation
+    /// left exactly one operation's rows behind under its own `task_id`, so
+    /// reconciliation reads that operation by primary key instead of scanning
+    /// open operations and matching derived candidates. A selection already
+    /// absent from Iceberg is settled `Recovered`. A selection still present is
+    /// retried only after the uncertainty bound has elapsed.
+    ///
+    /// # Errors
+    ///
+    /// Returns SQL, lease, catalog, traversal, or settlement failures. Anything
+    /// that cannot prove acceptance leaves the operation, task, and claims
+    /// Prepared and blocks destructive maintenance for this pass.
     async fn reconcile_expiry(
         &self,
         lease: &mut ForgeLease,
         key: &ForgeTableKey,
         binding: &TenantTableBinding,
+        authority: &ExpiryTaskAuthority,
         now: DateTime<Utc>,
         stop: &CancellationToken,
     ) -> Result<ExpiryReconciliationOutcome, ForgeError> {
         let resource = table_resource_for_key(key);
+        let operations = ForgeOperations::new(&resource, ForgeOperationFamily::SnapshotExpire)
+            .map_err(ForgeError::Sql)?;
+        let claims = operations
+            .claims_for_task(&self.core.operator_pool, key.tenant, authority.task_id)
+            .await
+            .map_err(ForgeError::Sql)?;
+        let mut outcome = ExpiryReconciliationOutcome::default();
+        let Some(first) = claims.first() else {
+            return Ok(outcome);
+        };
+        if claims
+            .iter()
+            .any(|claim| claim.operation_id != first.operation_id)
+        {
+            return Err(ForgeError::Reconciliation {
+                detail: "one Forge task owns claims for more than one expiry operation".to_owned(),
+            });
+        }
+        let claim_table = first.table.clone();
+        let operation_id = first.operation_id;
         let mut conn = self
             .core
             .vala
             .tenant_conn(key.tenant)
             .await
             .map_err(ForgeError::Sql)?;
-        let page = ForgeOperations::new(&resource, ForgeOperationFamily::SnapshotExpire)
-            .map_err(ForgeError::Sql)?
-            .list_open(&mut conn, self.core.config.max_open_operations_per_table)
+        let state = operations
+            .operation(&mut conn, operation_id)
             .await
             .map_err(ForgeError::Sql)?;
         conn.commit().await.map_err(ForgeError::Sql)?;
-        let mut outcome = ExpiryReconciliationOutcome::default();
-        if page.overflowed {
+        let state = state.ok_or_else(|| ForgeError::Reconciliation {
+            detail: format!("expiry claims reference missing operation {operation_id}"),
+        })?;
+        let detail = state.prepared_detail;
+        let AuditDetail::ForgeSnapshotExpire {
+            selected_snapshot_ids,
+            cutoff_ms,
+            ..
+        } = &detail
+        else {
+            return Err(ForgeError::Reconciliation {
+                detail: "claimed expiry operation carries non-expiry detail".to_owned(),
+            });
+        };
+        require_running(stop)?;
+        lease.require_fence(&self.core.operator_pool).await?;
+        let table = self.load_table(&binding.table_ident()).await?;
+        let all_absent = selected_snapshot_ids
+            .iter()
+            .all(|id| table.metadata().snapshot_by_id(*id).is_none());
+        let settlement = if all_absent {
+            ForgeExpirationSettlement::Recovered
+        } else if now
+            .signed_duration_since(state.prepared_at)
+            .to_std()
+            .unwrap_or_default()
+            < self.core.config.uncertainty_bound
+        {
+            outcome.pending = 1;
             outcome.destructive_maintenance =
                 super::live_reconcile::DestructiveMaintenance::Blocked;
             return Ok(outcome);
-        }
-        for row in page.operations {
-            let detail = row.prepared_detail;
-            let AuditDetail::ForgeSnapshotExpire {
-                selected_snapshot_ids,
-                cutoff_ms,
-                base_metadata_location,
-                ..
-            } = &detail
-            else {
-                record_malformed_expiry(&mut outcome);
-                continue;
-            };
-            require_running(stop)?;
-            lease.require_fence(&self.core.operator_pool).await?;
-            let table = self.load_table(&binding.table_ident()).await?;
-            let all_absent = selected_snapshot_ids
-                .iter()
-                .all(|id| table.metadata().snapshot_by_id(*id).is_none());
-            if all_absent {
-                let recovered_files = derive_recovered_files(
-                    &table,
-                    base_metadata_location.as_str(),
-                    &self.core.config,
-                )
-                .await?;
-                merge_expired_files(&mut outcome.expired_files, recovered_files);
-                outcome.terminals.push(PendingExpiryTerminal {
-                    detail,
-                    recovered: true,
-                });
-                outcome.recovered = outcome.recovered.saturating_add(1);
-                continue;
-            }
-            if now
-                .signed_duration_since(row.prepared_at)
-                .to_std()
-                .unwrap_or_default()
-                < self.core.config.uncertainty_bound
-            {
-                outcome.pending = outcome.pending.saturating_add(1);
-                continue;
-            }
-            if !selected_ids_are_eligible(
-                &table,
-                selected_snapshot_ids,
-                *cutoff_ms,
-                self.core.config.retain_last,
-            )? {
-                outcome.unresolved = outcome.unresolved.saturating_add(1);
-                continue;
-            }
-            let expired = self
-                .complete_expiry(lease, key, binding, &detail, stop)
-                .await?;
-            merge_expired_files(&mut outcome.expired_files, expired);
-            outcome.terminals.push(PendingExpiryTerminal {
-                detail,
-                recovered: true,
-            });
-            outcome.recovered = outcome.recovered.saturating_add(1);
-        }
-        if outcome.pending > 0 || outcome.unresolved > 0 {
+        } else if selected_ids_are_eligible(
+            &table,
+            selected_snapshot_ids,
+            *cutoff_ms,
+            self.core.config.retain_last,
+        )? {
+            ForgeExpirationSettlement::Committed
+        } else {
+            outcome.unresolved = 1;
             outcome.destructive_maintenance =
                 super::live_reconcile::DestructiveMaintenance::Blocked;
-        }
+            return Ok(outcome);
+        };
+        let expired_files = match settlement {
+            ForgeExpirationSettlement::Recovered => {
+                let AuditDetail::ForgeSnapshotExpire {
+                    base_metadata_location,
+                    ..
+                } = &detail
+                else {
+                    unreachable!("detail kind was matched above")
+                };
+                derive_recovered_files(&table, base_metadata_location.as_str(), &self.core.config)
+                    .await?
+            }
+            ForgeExpirationSettlement::Committed => {
+                self.complete_expiry(lease, key, table, &detail, stop)
+                    .await?
+            }
+        };
+        let evidence = self
+            .settle_expiration(
+                lease,
+                key,
+                binding,
+                authority,
+                &claim_table,
+                &detail,
+                &expired_files,
+                settlement,
+            )
+            .await?;
+        outcome.settled_evidence = Some(evidence);
+        outcome.recovered = 1;
         Ok(outcome)
     }
 }
 
 impl Forge {
-    /// Closes committed expiry operations only after exact task evidence is durable.
+    /// Resolves the durable claim-table identity one expiration binds to.
+    ///
+    /// The registered `table_uid` is the identity the maintenance-authority row
+    /// and the claim rows are keyed by, and the Iceberg table UUID is the
+    /// corroboration field that proves the second catalog read reached the same
+    /// physical table. Both are read once, at preparation, and never re-derived.
     ///
     /// # Errors
     ///
-    /// Returns lease, SQL, audit, or operation-state failures. A partial close
-    /// remains idempotently replayable from the still-Prepared operation rows.
-    pub(crate) async fn finalize_expiry_terminals(
+    /// Returns [`ForgeError::Sql`] or [`ForgeError::Invariant`] when the table
+    /// has no registration row or its stored UID is malformed.
+    async fn expiry_claim_table(
         &self,
-        lease: &mut ForgeLease,
-        tenant: DataTenantId,
-        terminals: Vec<PendingExpiryTerminal>,
-    ) -> Result<(), ForgeError> {
-        for pending in terminals {
-            let phase = if pending.recovered {
-                ForgeSnapshotExpirePhase::Recovered
-            } else {
-                ForgeSnapshotExpirePhase::Committed
-            };
-            let operation = if pending.recovered {
-                "forge.snapshot_expire.recovered"
-            } else {
-                "forge.snapshot_expire.committed"
-            };
-            self.append_expiry_audit(
-                lease,
-                tenant,
-                &terminal_expiry_detail(&pending.detail, phase),
-                operation,
-            )
-            .await?;
-        }
-        Ok(())
-    }
-}
-
-/// Merges typed expired-file sets while preserving category provenance.
-fn merge_expired_files(target: &mut ExpiredFileSet, source: ExpiredFileSet) {
-    target.data_files.extend(source.data_files);
-    target.delete_files.extend(source.delete_files);
-    target.manifests.extend(source.manifests);
-    target.manifest_lists.extend(source.manifest_lists);
-    target.statistics.extend(source.statistics);
-    target.metadata_logs.extend(source.metadata_logs);
-}
-
-/// Mark a wrong-family open expiry row as unresolved and fail closed later.
-fn record_malformed_expiry(outcome: &mut ExpiryReconciliationOutcome) {
-    outcome.unresolved = outcome.unresolved.saturating_add(1);
-}
-
-impl Forge {
-    /// Append a fenced snapshot-expiry audit and projection transition atomically.
-    ///
-    /// # Errors
-    ///
-    /// Returns a detail-validation, lease, SQL, operation-state, audit, fence,
-    /// or commit error. The caller-owned transaction rolls back both durable
-    /// rows.
-    async fn append_expiry_audit(
-        &self,
-        lease: &mut ForgeLease,
-        tenant: DataTenantId,
-        detail: &AuditDetail,
-        operation: &str,
-    ) -> Result<(), ForgeError> {
-        let resource = match detail {
-            AuditDetail::ForgeSnapshotExpire { group, .. } => group.clone(),
-            _ => {
-                return Err(ForgeError::SnapshotExpiry {
-                    detail: "snapshot-expiry audit detail has the wrong kind".to_owned(),
-                });
-            }
-        };
-        let event = AuditEvent {
-            request_id: RequestId::now_v7(),
-            trace_id: None,
-            operation: operation.to_owned(),
-            resource,
-            card_ref: None,
-            principal_id: SYSTEM_PRINCIPAL,
-            principal_kind: PrincipalKindTag::Service,
-            auth_method: AuthMethod::Internal,
-            permission: "bifrost:forge".to_owned(),
-            decision: AuditDecision::Allow,
-            result: AuditResult::Success,
-            payload_summary: operation.to_owned(),
-            detail: Some(detail.clone()),
-        };
-        lease.require_fence(&self.core.operator_pool).await?;
+        key: &ForgeTableKey,
+        table: &iceberg::table::Table,
+    ) -> Result<ForgeClaimTable, ForgeError> {
         let mut conn = self
             .core
             .vala
-            .tenant_conn(tenant)
+            .tenant_conn(key.tenant)
             .await
             .map_err(ForgeError::Sql)?;
-        let operations =
-            ForgeOperations::new(&event.resource, ForgeOperationFamily::SnapshotExpire)
-                .map_err(ForgeError::Sql)?;
-        let transition = if operation == "forge.snapshot_expire.prepared" {
-            operations.append_prepared(&mut conn, &event).await
-        } else {
-            operations.append_terminal(&mut conn, &event).await
-        }
-        .map_err(ForgeError::Sql)?;
-        match transition {
-            ForgeOperationTransition::Applied { .. }
-            | ForgeOperationTransition::AlreadyApplied { .. } => {}
-        }
-        lease.assert_transaction_fence(&mut conn).await?;
-        conn.commit().await.map_err(ForgeError::Sql)
+        let identity = super::reader_protection::ReaderProtection::new(&mut conn)
+            .identity(key.tenant, &key.table_ref)
+            .await?;
+        conn.commit().await.map_err(ForgeError::Sql)?;
+        Ok(ForgeClaimTable {
+            table_uid: identity.table_uid,
+            catalog_name: identity.catalog_name,
+            namespace_name: identity.namespace_name,
+            table_name: identity.table_name,
+            table_uuid: table.metadata().uuid(),
+        })
     }
 
-    /// Drive the production expiry transition writer from DB integration tests.
+    /// Opens the atomic preparation transaction that closes before Iceberg.
     ///
     /// # Errors
     ///
-    /// Returns the same validation, lease, SQL, transition, audit, fence, and
-    /// commit errors as the production expiry and reconciliation paths.
-    #[cfg(feature = "test-support")]
-    pub async fn append_expiry_transition_for_test(
+    /// Returns [`ForgeError::Sql`] when the fence, task identity, table
+    /// identity, surviving reader protection, or operation phase refuses the
+    /// preparation, and [`ForgeError::SnapshotExpiry`] when the detail is not
+    /// canonical expiry evidence.
+    async fn prepare_expiration(
         &self,
-        lease: &mut ForgeLease,
-        tenant: DataTenantId,
+        lease: &ForgeLease,
+        key: &ForgeTableKey,
+        authority: &ExpiryTaskAuthority,
+        table: &ForgeClaimTable,
         detail: &AuditDetail,
-        operation: &str,
     ) -> Result<(), ForgeError> {
-        self.append_expiry_audit(lease, tenant, detail, operation)
-            .await
+        let operation_event = expiry_operation_event(
+            detail,
+            "forge.snapshot_expire.prepared",
+            AuditResult::Success,
+        )?;
+        let task_event = super::worker::task_event(
+            authority.task_id,
+            ForgeTaskState::Prepared,
+            "snapshot expiration claims prepared before the Iceberg gate",
+        );
+        ForgeOperations::new(
+            &operation_event.resource,
+            ForgeOperationFamily::SnapshotExpire,
+        )
+        .map_err(ForgeError::Sql)?
+        .prepare_snapshot_expiration(
+            &self.core.operator_pool,
+            key.tenant,
+            &ForgeExpirationPreparation {
+                authority: &expiration_authority(authority, lease),
+                table,
+                evidence: &prepared_expiry_evidence(),
+                operation_event: &operation_event,
+                task_event: &task_event,
+            },
+        )
+        .await
+        .map_err(ForgeError::Sql)?;
+        Ok(())
     }
+
+    /// Releases an unproven selection so a successor can replan against fresh
+    /// reader protection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Sql`] when the reset preconditions do not match
+    /// and [`ForgeError::SnapshotExpiry`] for non-canonical detail.
+    async fn reset_expiration(
+        &self,
+        lease: &ForgeLease,
+        key: &ForgeTableKey,
+        authority: &ExpiryTaskAuthority,
+        table: &ForgeClaimTable,
+        detail: &AuditDetail,
+        cause: &ForgeError,
+    ) -> Result<(), ForgeError> {
+        let operation_event =
+            expiry_operation_event(detail, "forge.snapshot_expire.reset", AuditResult::Failure)?;
+        let task_event = super::worker::task_event(
+            authority.task_id,
+            ForgeTaskState::Cancelled,
+            &format!("snapshot expiration released without an Iceberg mutation: {cause}"),
+        );
+        ForgeOperations::new(
+            &operation_event.resource,
+            ForgeOperationFamily::SnapshotExpire,
+        )
+        .map_err(ForgeError::Sql)?
+        .reset_snapshot_expiration(
+            &self.core.operator_pool,
+            key.tenant,
+            &ForgeExpirationResetRequest {
+                authority: &expiration_authority(authority, lease),
+                table,
+                operation_event: &operation_event,
+                task_event: &task_event,
+            },
+        )
+        .await
+        .map_err(ForgeError::Sql)?;
+        tracing::warn!(
+            task_id = %authority.task_id,
+            cause = %cause,
+            "Forge released a prepared snapshot expiration without expiring anything"
+        );
+        Ok(())
+    }
+
+    /// Stores exact candidates and settles both owners in one transaction.
+    ///
+    /// Cleanup candidates are derived here and handed to separate cleanup
+    /// through task evidence; this owner performs no delete of its own.
+    ///
+    /// # Errors
+    ///
+    /// Returns path-binding, evidence, object-store, or [`ForgeError::Sql`]
+    /// failures. A failure before the settlement commit leaves operation, task,
+    /// and claims Prepared for exact replay.
+    #[allow(clippy::too_many_arguments)]
+    async fn settle_expiration(
+        &self,
+        lease: &ForgeLease,
+        key: &ForgeTableKey,
+        binding: &TenantTableBinding,
+        authority: &ExpiryTaskAuthority,
+        table: &ForgeClaimTable,
+        detail: &AuditDetail,
+        expired_files: &ExpiredFileSet,
+        settlement: ForgeExpirationSettlement,
+    ) -> Result<ForgeTaskEvidence, ForgeError> {
+        let committed = self.load_table(&binding.table_ident()).await?;
+        let identity = ForgeTaskTableIdentity::new(
+            BIFROST_CATALOG_NAME,
+            key.table_ref.namespace.as_str(),
+            key.table_ref.name.as_str(),
+        )
+        .map_err(ForgeError::Sql)?;
+        let mut evidence = self.committed_evidence(binding, &committed).await?;
+        evidence.cleanup_candidates = expiry_cleanup_candidates(
+            committed.metadata().location(),
+            expired_files,
+            binding,
+            &self.core.staging,
+            &identity,
+        )?;
+        evidence.validate(false).map_err(ForgeError::Sql)?;
+        let operation = match settlement {
+            ForgeExpirationSettlement::Committed => "forge.snapshot_expire.committed",
+            ForgeExpirationSettlement::Recovered => "forge.snapshot_expire.recovered",
+        };
+        let phase = match settlement {
+            ForgeExpirationSettlement::Committed => ForgeSnapshotExpirePhase::Committed,
+            ForgeExpirationSettlement::Recovered => ForgeSnapshotExpirePhase::Recovered,
+        };
+        let operation_event = expiry_operation_event(
+            &terminal_expiry_detail(detail, phase),
+            operation,
+            AuditResult::Success,
+        )?;
+        let task_event = super::worker::task_event(
+            authority.task_id,
+            ForgeTaskState::Succeeded,
+            "snapshot expiration settled with exact cleanup candidates",
+        );
+        ForgeOperations::new(
+            &operation_event.resource,
+            ForgeOperationFamily::SnapshotExpire,
+        )
+        .map_err(ForgeError::Sql)?
+        .settle_snapshot_expiration(
+            &self.core.operator_pool,
+            key.tenant,
+            &ForgeExpirationSettlementRequest {
+                authority: &expiration_authority(authority, lease),
+                table,
+                settlement,
+                evidence: &evidence,
+                operation_event: &operation_event,
+                task_event: &task_event,
+            },
+        )
+        .await
+        .map_err(ForgeError::Sql)?;
+        Ok(evidence)
+    }
+}
+
+/// Projects the pass's claimed task and live lease into mutation authority.
+fn expiration_authority(
+    authority: &ExpiryTaskAuthority,
+    lease: &ForgeLease,
+) -> ForgeExpirationAuthority {
+    ForgeExpirationAuthority {
+        task_id: authority.task_id,
+        attempt_id: authority.attempt_id,
+        worker_id: authority.worker_id,
+        lease_key: lease.lease_key.clone(),
+        lease_fencing_token: lease.fencing_token,
+    }
+}
+
+/// The empty pre-commit evidence a prepared expiration records on its task.
+fn prepared_expiry_evidence() -> ForgeTaskEvidence {
+    ForgeTaskEvidence {
+        version: 1,
+        committed_snapshot_id: None,
+        committed_metadata_location: None,
+        committed_metadata_digest: None,
+        cleanup_candidates: Vec::new(),
+        deleted_candidate_count: 0,
+    }
+}
+
+/// Builds one fenced snapshot-expiry operation audit event.
+///
+/// # Errors
+///
+/// Returns [`ForgeError::SnapshotExpiry`] when `detail` is not snapshot-expiry
+/// evidence and therefore names no operation resource.
+fn expiry_operation_event(
+    detail: &AuditDetail,
+    operation: &str,
+    result: AuditResult,
+) -> Result<AuditEvent, ForgeError> {
+    let AuditDetail::ForgeSnapshotExpire { group, .. } = detail else {
+        return Err(ForgeError::SnapshotExpiry {
+            detail: "snapshot-expiry audit detail has the wrong kind".to_owned(),
+        });
+    };
+    Ok(AuditEvent {
+        request_id: RequestId::now_v7(),
+        trace_id: None,
+        operation: operation.to_owned(),
+        resource: group.clone(),
+        card_ref: None,
+        principal_id: SYSTEM_PRINCIPAL,
+        principal_kind: PrincipalKindTag::Service,
+        auth_method: AuthMethod::Internal,
+        permission: "bifrost:forge".to_owned(),
+        decision: AuditDecision::Allow,
+        result,
+        payload_summary: operation.to_owned(),
+        detail: Some(detail.clone()),
+    })
+}
+
+/// Proves the corroborating catalog read matches every pinned field.
+///
+/// # Errors
+///
+/// Returns [`ForgeError::SnapshotExpiry`] naming the first field that drifted.
+/// Any error here is definite pre-call drift: no Iceberg mutation has run.
+fn corroborate_expiry(
+    table: &iceberg::table::Table,
+    claim_table: &ForgeClaimTable,
+    detail: &AuditDetail,
+    retain_last: usize,
+) -> Result<(), ForgeError> {
+    let AuditDetail::ForgeSnapshotExpire {
+        base_metadata_location,
+        current_snapshot_id,
+        retained_ref_heads,
+        cutoff_ms,
+        selected_snapshot_ids,
+        ..
+    } = detail
+    else {
+        return Err(ForgeError::SnapshotExpiry {
+            detail: "expiry audit detail has the wrong kind".to_owned(),
+        });
+    };
+    let drift = |field: &str| ForgeError::SnapshotExpiry {
+        detail: format!("prepared snapshot expiration no longer corroborates on {field}"),
+    };
+    if table.metadata().uuid() != claim_table.table_uuid {
+        return Err(drift("table uuid"));
+    }
+    let location = table
+        .metadata_location_result()
+        .map_err(ForgeError::Catalog)?;
+    if location != base_metadata_location.as_str() {
+        return Err(drift("metadata location"));
+    }
+    if table.metadata().current_snapshot_id() != *current_snapshot_id {
+        return Err(drift("current snapshot"));
+    }
+    let (_, mut ref_heads) = snapshot_summaries(table)?;
+    ref_heads.sort_unstable();
+    if &ref_heads != retained_ref_heads {
+        return Err(drift("retained ref heads"));
+    }
+    if !selected_ids_are_eligible(table, selected_snapshot_ids, *cutoff_ms, retain_last)? {
+        return Err(drift("selected snapshots"));
+    }
+    Ok(())
 }
 
 /// Copy an expiry detail while replacing its lifecycle phase.
@@ -1225,6 +1440,47 @@ fn terminal_expiry_detail(detail: &AuditDetail, phase: ForgeSnapshotExpirePhase)
     }
 }
 
+/// Converts expired fork categories into sorted, table-bound cleanup evidence.
+///
+/// This is the complete handoff to separate cleanup: settlement stores these
+/// exact names in task evidence and the expiration owner deletes nothing.
+///
+/// # Errors
+///
+/// Returns path-binding or SQL validation failures for any unsafe candidate.
+fn expiry_cleanup_candidates(
+    table_location: &str,
+    expired: &ExpiredFileSet,
+    binding: &TenantTableBinding,
+    staging: &opendal::Operator,
+    identity: &ForgeTaskTableIdentity,
+) -> Result<Vec<ForgeCleanupCandidate>, ForgeError> {
+    let categories = [
+        (ForgeCleanupCategory::Data, &expired.data_files),
+        (ForgeCleanupCategory::Data, &expired.delete_files),
+        (ForgeCleanupCategory::Data, &expired.statistics),
+        (ForgeCleanupCategory::Manifest, &expired.manifests),
+        (ForgeCleanupCategory::Manifest, &expired.manifest_lists),
+        (ForgeCleanupCategory::Metadata, &expired.metadata_logs),
+    ];
+    let mut candidates = categories
+        .into_iter()
+        .flat_map(|(category, paths)| paths.iter().map(move |path| (category, path)))
+        .map(|(category, path)| {
+            let key =
+                super::path::catalog_path_to_object_key(table_location, binding, staging, path)?;
+            Ok(ForgeCleanupCandidate {
+                category,
+                table: identity.clone(),
+                path: ForgeCleanupPath::new(key).map_err(ForgeError::Sql)?,
+            })
+        })
+        .collect::<Result<Vec<_>, ForgeError>>()?;
+    candidates.sort();
+    candidates.dedup();
+    Ok(candidates)
+}
+
 /// Return the stable audit resource URI for a Forge table.
 pub(crate) fn table_resource_for_key(key: &ForgeTableKey) -> String {
     format!(
@@ -1251,22 +1507,6 @@ fn expiry_operation_id(key: &ForgeTableKey, cutoff_ms: i64, selected: &[i64]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Wrong-family expiry state contributes unresolved evidence that blocks GC.
-    #[test]
-    fn malformed_expiry_blocks_gc() {
-        let mut outcome = ExpiryReconciliationOutcome::default();
-        record_malformed_expiry(&mut outcome);
-        if outcome.unresolved > 0 {
-            outcome.destructive_maintenance =
-                super::super::live_reconcile::DestructiveMaintenance::Blocked;
-        }
-        assert_eq!(outcome.unresolved, 1);
-        assert_eq!(
-            outcome.destructive_maintenance,
-            super::super::live_reconcile::DestructiveMaintenance::Blocked
-        );
-    }
 
     #[test]
     fn snapshot_selection_never_includes_current_or_retained_head() {

@@ -610,3 +610,44 @@ contract.
      `JoinHandle` and the `AnalyticalGraphEntry::{Active, Draining}` refactor.
      This scenario's terminal proof is that settlement returns the graph and the
      envelope to the process root exactly once.
+
+### Scenario 4 — One attempt and terminal failure
+
+- RED: `oracle::analytical::tests::peer_loss_is_one_terminal_attempt` failed at
+  `no successor attempt ordinal is representable` (`left: Some(AnalyticalAttemptNumber(1))`)
+  when `AnalyticalAttemptNumber::from_u8` still admitted ordinal one (temporary
+  one-line restoration, reverted).
+- GREEN:
+  - `AnalyticalAttemptNumber` keeps `ZERO` only. `ONE`, `retry()`, and the
+    ordinal-one parse branch are gone, so a successor is unrepresentable rather
+    than refused by policy; the wire ordinal survives only because the
+    distributed dependency encodes one.
+  - `AnalyticalAttemptOwnership::retry_pre_egress` and the
+    `AnalyticalAttemptOutcome::Retried` telemetry outcome are deleted
+    (`ALL` is now three).
+  - `pg_inactive_analytical_retry_drains_attempt_zero_before_attempt_one`,
+    `prove_bounded_retry`, and `successor_key` are deleted. The stale-identity
+    proof in `prove_stale_and_sibling_fencing` now names an unadmitted sibling
+    *stage* of the same graph, which is what "stale" means once a graph has one
+    attempt.
+  - Follower pause seam: `AnalyticalExecutePause` (test-support only) holds the
+    first authorized `ExecuteTask` after its `GraphLease` is active and before
+    any source is consumed, armed through
+    `AnalyticalStageIngress::bind_execute_pause_for_test`.
+  - Process-cluster control protocol extended with one bounded active
+    inactive-query slot (`StartInactiveSql`/`CancelInactiveSql`/`AwaitInactiveSql`)
+    and the pause operations (`ArmExecutePause`/`AwaitExecutePaused`/
+    `ReleaseExecutePause`), plus `ProcessNode::kill` for abrupt peer loss over
+    the existing reaper. Cancellation selects on a `CancellationToken` in the
+    slot; no second lifecycle implementation was added.
+- Command: `mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib --features test-support,bench-support -E 'test(=oracle::analytical::tests::peer_loss_is_one_terminal_attempt)'` → 1 passed.
+- Journey: `peer_network::analytical::one_attempt_peer_loss_and_cancellation_join_every_process`
+  drives three Oracle children and one Scribe child through both orderings on
+  clean clusters — kill the paused follower, and cancel from the leader —
+  asserting one activation per addressed follower, no successful result, and
+  released leases on every reachable child including the leader.
+  Command: `scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-testing --test oracle -P journey -E 'test(=peer_network::analytical::one_attempt_peer_loss_and_cancellation_join_every_process)' --run-ignored=all"`.
+- Bounded correction recorded: the unit test runs on a multi-threaded runtime.
+  The graph lifecycle task is otherwise polled on the test's own stack, and the
+  combined debug-build frame overflows it; the two orderings also share one
+  boxed future slot for the same reason.

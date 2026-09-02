@@ -75,6 +75,11 @@ async fn serve() -> Result<(), ProcessClusterError> {
     let report = await_ready(&server, &config, fingerprint).await?;
     emit(&ControlResponse::Ready(report.clone()))?;
 
+    // One armed pause and one active statement at a time: a journey that needs
+    // two is describing a different topology, not a deeper control protocol.
+    let mut pause: Option<Arc<vala_bifrost_redux::oracle::analytical::AnalyticalExecutePause>> =
+        None;
+    let mut active: Option<InactiveQuerySlot> = None;
     let stdin = std::io::stdin();
     let mut line = String::new();
     loop {
@@ -157,6 +162,68 @@ async fn serve() -> Result<(), ProcessClusterError> {
                     })?,
                 }
             }
+            ControlRequest::ArmExecutePause => match arm_execute_pause(&server) {
+                Ok(armed) => {
+                    pause = Some(armed);
+                    emit(&ControlResponse::PauseArmed)?;
+                }
+                Err(error) => emit(&ControlResponse::Failed {
+                    detail: error.to_string(),
+                })?,
+            },
+            ControlRequest::AwaitExecutePaused => match pause.as_ref() {
+                Some(armed) => {
+                    armed.wait_paused().await;
+                    emit(&ControlResponse::ExecutePaused)?;
+                }
+                None => emit(&ControlResponse::Failed {
+                    detail: "no execute pause is armed".to_owned(),
+                })?,
+            },
+            ControlRequest::ReleaseExecutePause => match pause.as_ref() {
+                Some(armed) => {
+                    armed.release();
+                    emit(&ControlResponse::PauseReleased)?;
+                }
+                None => emit(&ControlResponse::Failed {
+                    detail: "no execute pause is armed".to_owned(),
+                })?,
+            },
+            ControlRequest::StartInactiveSql { sql } => {
+                if active.is_some() {
+                    emit(&ControlResponse::Failed {
+                        detail: "the inactive-query slot is already occupied".to_owned(),
+                    })?;
+                } else {
+                    match oracle(&server) {
+                        Ok(engine) => {
+                            active = Some(InactiveQuerySlot::start(engine, config.tenant_id, sql));
+                            emit(&ControlResponse::Started)?;
+                        }
+                        Err(error) => emit(&ControlResponse::Failed {
+                            detail: error.to_string(),
+                        })?,
+                    }
+                }
+            }
+            ControlRequest::CancelInactiveSql => match active.as_ref() {
+                Some(slot) => {
+                    slot.cancel();
+                    emit(&ControlResponse::CancelRequested)?;
+                }
+                None => emit(&ControlResponse::Failed {
+                    detail: "the inactive-query slot is empty".to_owned(),
+                })?,
+            },
+            ControlRequest::AwaitInactiveSql => match active.take() {
+                Some(slot) => {
+                    let (rows, detail) = slot.join().await;
+                    emit(&ControlResponse::InactiveOutcome { rows, detail })?;
+                }
+                None => emit(&ControlResponse::Failed {
+                    detail: "the inactive-query slot is empty".to_owned(),
+                })?,
+            },
             ControlRequest::Shutdown => {
                 emit(&ControlResponse::ShuttingDown)?;
                 break;
@@ -167,6 +234,79 @@ async fn serve() -> Result<(), ProcessClusterError> {
         .shutdown()
         .await
         .map_err(|error| ProcessClusterError::Child(error.to_string()))
+}
+
+/// The one statement a child may have in flight outside its control loop.
+///
+/// The control protocol is strictly request/response, so a journey that needs
+/// to act on a query while it is running — pause a follower, kill it, cancel
+/// from the leader — cannot use the synchronous execute request. This owns that
+/// statement's task and its cancellation, and nothing else about it.
+struct InactiveQuerySlot {
+    /// The running statement.
+    task: tokio::task::JoinHandle<Result<usize, ProcessClusterError>>,
+    /// Cancellation the leader selects on, mirroring a caller drop.
+    cancel: tokio_util::sync::CancellationToken,
+}
+
+impl InactiveQuerySlot {
+    /// Starts one statement and returns immediately.
+    fn start(
+        engine: Arc<vala_bifrost_redux::oracle::Oracle>,
+        tenant_id: wyrd_spec::DataTenantId,
+        sql: String,
+    ) -> Self {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let token = cancel.clone();
+        let task = tokio::spawn(async move {
+            tokio::select! {
+                () = token.cancelled() => Err(ProcessClusterError::Child(
+                    "the inactive attempt was cancelled by its caller".to_owned(),
+                )),
+                outcome = drive_inactive_sql(engine, tenant_id, sql) => outcome,
+            }
+        });
+        Self { task, cancel }
+    }
+
+    /// Cancels the statement exactly as a dropped caller would.
+    fn cancel(&self) {
+        self.cancel.cancel();
+    }
+
+    /// Joins the statement and reports its terminal.
+    ///
+    /// A panicked task is reported as a terminal failure rather than
+    /// propagated, so a journey names the claim that broke instead of losing
+    /// the child.
+    async fn join(self) -> (Option<usize>, Option<String>) {
+        match self.task.await {
+            Ok(Ok(rows)) => (Some(rows), None),
+            Ok(Err(error)) => (None, Some(error.to_string())),
+            Err(error) => (None, Some(error.to_string())),
+        }
+    }
+}
+
+/// Arms this child's one-shot follower `ExecuteTask` pause.
+///
+/// # Errors
+///
+/// Returns [`ProcessClusterError::Child`] when this target composes no Oracle
+/// or no Analytical execution handle.
+fn arm_execute_pause(
+    server: &WyrdTestServer,
+) -> Result<Arc<vala_bifrost_redux::oracle::analytical::AnalyticalExecutePause>, ProcessClusterError>
+{
+    let engine = oracle(server)?;
+    let handle = engine.analytical_execution().ok_or_else(|| {
+        ProcessClusterError::Child("this Oracle composed no Analytical handle".to_owned())
+    })?;
+    let pause = Arc::new(vala_bifrost_redux::oracle::analytical::AnalyticalExecutePause::default());
+    handle
+        .worker()
+        .bind_execute_pause_for_test(Arc::clone(&pause));
+    Ok(pause)
 }
 
 /// Installs this child's log subscriber on stderr when `RUST_LOG` asks for one.
@@ -534,25 +674,53 @@ impl ChildConfig {
         server: &WyrdTestServer,
         sql: &str,
     ) -> Result<usize, ProcessClusterError> {
+        drive_inactive_sql(oracle(server)?, self.tenant_id, sql.to_owned()).await
+    }
+}
+
+/// Resolves this child's own Oracle engine.
+///
+/// # Errors
+///
+/// Returns [`ProcessClusterError::Child`] when this target composes no Oracle.
+fn oracle(
+    server: &WyrdTestServer,
+) -> Result<Arc<vala_bifrost_redux::oracle::Oracle>, ProcessClusterError> {
+    server
+        .state()
+        .bifrost_query()
+        .map(|query| Arc::clone(query.engine()))
+        .ok_or_else(|| ProcessClusterError::Child("this target composes no Oracle".to_owned()))
+}
+
+/// Drives one statement through the production inactive Analytical path.
+///
+/// Owns everything it needs, so the same body serves both the synchronous
+/// control request and the single active slot a peer-loss journey starts.
+///
+/// # Errors
+///
+/// Returns [`ProcessClusterError::Child`] when admission, planning, execution,
+/// or decoding fails, which is the attempt's own terminal failure.
+async fn drive_inactive_sql(
+    engine: Arc<vala_bifrost_redux::oracle::Oracle>,
+    tenant_id: wyrd_spec::DataTenantId,
+    sql: String,
+) -> Result<usize, ProcessClusterError> {
+    {
         let child = |detail: String| ProcessClusterError::Child(detail);
-        let engine = Arc::clone(
-            server
-                .state()
-                .bifrost_query()
-                .ok_or_else(|| child("this target composes no Oracle".to_owned()))?
-                .engine(),
-        );
+        let sql = sql.as_str();
         let permission = wyrd_runtime::Permission::bifrost_query_read();
         let principal = wyrd_runtime::Principal::new(
             wyrd_spec::auth::PrincipalId::new(uuid::Uuid::now_v7()),
             wyrd_runtime::PrincipalKind::User,
-            self.tenant_id,
+            tenant_id,
             Vec::new(),
             wyrd_runtime::permission::PermissionSet::from_iter([permission.clone()]),
         );
         let context = vala_bifrost_redux::oracle::AuthorizedQueryContext::try_new(
             principal,
-            self.tenant_id,
+            tenant_id,
             wyrd_spec::request_id::RequestId::now_v7(),
             None,
             wyrd_spec::vala::api::AuthMethod::Internal,
@@ -610,7 +778,9 @@ impl ChildConfig {
         let _ = terminal;
         Ok(rows)
     }
+}
 
+impl ChildConfig {
     /// Performs one shaped private-plane probe and returns its gRPC outcome.
     ///
     /// The probe is issued as a raw HTTP/2 request over this child's own

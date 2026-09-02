@@ -1362,6 +1362,67 @@ pub struct AnalyticalStageIngress {
     driver: Mutex<Option<JoinHandle<()>>>,
     /// Whether this ingress still admits new stage work.
     accepting: AtomicBool,
+    /// Test-tier one-shot pause of one `ExecuteTask` after graph activation.
+    #[cfg(feature = "test-support")]
+    execute_pause: Mutex<Option<Arc<AnalyticalExecutePause>>>,
+}
+
+/// Test seam that holds one follower `ExecuteTask` open at a real boundary.
+///
+/// Armed by a journey before it starts a distributed query. The first
+/// `ExecuteTask` this follower authorizes is held after its `GraphLease` is
+/// active and before it can consume any source, which is the only window in
+/// which peer loss or cancellation is observable as "the follower had the
+/// graph and had produced nothing". Every later `ExecuteTask` passes straight
+/// through, so arming one pause never stalls the rest of the graph.
+#[cfg(feature = "test-support")]
+#[derive(Debug, Default)]
+pub struct AnalyticalExecutePause {
+    /// Ensures exactly one `ExecuteTask` is held.
+    claimed: AtomicBool,
+    /// Wakes the journey once that task is holding.
+    paused: tokio::sync::Notify,
+    /// Records permission for the held task to continue.
+    released: AtomicBool,
+    /// Wakes the held task once the journey is done with it.
+    release: tokio::sync::Notify,
+}
+
+#[cfg(feature = "test-support")]
+impl AnalyticalExecutePause {
+    /// Waits until one `ExecuteTask` is held with its graph lease active.
+    pub async fn wait_paused(&self) {
+        while !self.claimed.load(Ordering::Acquire) {
+            self.paused.notified().await;
+        }
+    }
+
+    /// Reports whether an `ExecuteTask` has reached the seam.
+    #[must_use]
+    pub fn is_paused(&self) -> bool {
+        self.claimed.load(Ordering::Acquire)
+    }
+
+    /// Releases the held task so the graph may finish or fail normally.
+    pub fn release(&self) {
+        self.released.store(true, Ordering::Release);
+        self.release.notify_waiters();
+    }
+
+    /// Holds only the first `ExecuteTask` and lets every later one proceed.
+    async fn hold(&self) {
+        if self
+            .claimed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        self.paused.notify_waiters();
+        while !self.released.load(Ordering::Acquire) {
+            self.release.notified().await;
+        }
+    }
 }
 
 impl fmt::Debug for AnalyticalStageIngress {
@@ -1440,6 +1501,8 @@ impl AnalyticalStageIngress {
                 settlement: Mutex::new(Some(sender)),
                 driver: Mutex::new(driver),
                 accepting: AtomicBool::new(true),
+                #[cfg(feature = "test-support")]
+                execute_pause: Mutex::new(None),
             }
         })
     }
@@ -1575,10 +1638,29 @@ impl AnalyticalStageIngress {
                 // tolerance into a refusal race; the attempt guard still waits
                 // for `SetPlan`, which is the message that actually names one.
                 record_stage_operation(AnalyticalStageOperation::ExecuteTask);
+                // The lease is active and nothing has been read yet: exactly
+                // the window a peer-loss journey needs to observe.
+                #[cfg(feature = "test-support")]
+                if let Some(pause) = self
+                    .execute_pause
+                    .lock()
+                    .ok()
+                    .and_then(|pause| pause.as_ref().map(Arc::clone))
+                {
+                    pause.hold().await;
+                }
             }
         }
         tracing::Span::current().record("outcome", "authorized");
         Ok(key)
+    }
+
+    /// Arms the one-shot `ExecuteTask` pause used by peer-loss journeys.
+    #[cfg(feature = "test-support")]
+    pub fn bind_execute_pause_for_test(&self, pause: Arc<AnalyticalExecutePause>) {
+        if let Ok(mut current) = self.execute_pause.lock() {
+            *current = Some(pause);
+        }
     }
 
     /// Activates one graph exactly once, or reuses the lease already published.

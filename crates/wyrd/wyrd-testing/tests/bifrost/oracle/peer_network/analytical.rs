@@ -120,3 +120,160 @@ async fn prove_graph_lease_owns_exact_resources() -> Result<(), PeerJourneyError
     cluster.shutdown();
     Ok(())
 }
+
+/// Peer loss and cancellation each end one attempt on every reachable process.
+///
+/// # Panics
+///
+/// Panics when either ordering starts a successor or leaves ownership behind.
+#[tokio::test]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn one_attempt_peer_loss_and_cancellation_join_every_process() {
+    prove_one_attempt_peer_loss_and_cancellation()
+        .await
+        .expect("one-attempt peer loss journey");
+}
+
+/// Drives both terminal orderings over one live multi-process topology.
+///
+/// Each case gets a clean cluster on purpose: the claim is about what one
+/// query leaves behind, and a second query on the same processes cannot
+/// distinguish "released" from "never taken".
+///
+/// # Errors
+///
+/// Returns the first scenario failure, which names the claim that broke.
+async fn prove_one_attempt_peer_loss_and_cancellation() -> Result<(), PeerJourneyError> {
+    prove_terminal_ordering(TerminalCause::PeerLoss).await?;
+    prove_terminal_ordering(TerminalCause::Cancellation).await
+}
+
+/// How the one attempt is made to fail after its followers hold their graphs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalCause {
+    /// The paused follower's process disappears mid-graph.
+    PeerLoss,
+    /// The leader's caller cancels while the follower still holds its graph.
+    Cancellation,
+}
+
+/// Drives one clean cluster to one failed terminal and proves nothing survives.
+///
+/// # Errors
+///
+/// Returns the first claim that broke.
+async fn prove_terminal_ordering(cause: TerminalCause) -> Result<(), PeerJourneyError> {
+    let mut cluster = BifrostProcessCluster::start(
+        NODE_BINARY,
+        &[
+            ProcessNodeTarget::Oracle,
+            ProcessNodeTarget::Oracle,
+            ProcessNodeTarget::Oracle,
+            ProcessNodeTarget::Scribe,
+        ],
+    )
+    .await?;
+
+    let table = format!("one_attempt_{}", uuid::Uuid::now_v7().simple());
+    cluster.nodes_mut()[SCRIBE].register_table(&table)?;
+    cluster.nodes_mut()[SCRIBE].ingest_rows(&table, 12, 3)?;
+    cluster.nodes_mut()[SCRIBE].ingest_rows(&table, 12, 3)?;
+    for index in [LEADER, FOLLOWERS[0], FOLLOWERS[1], SCRIBE] {
+        cluster.nodes_mut()[index].refresh_snapshot()?;
+    }
+
+    // Armed before the query, so the follower is held at a real boundary: its
+    // graph lease is active and it has consumed no source.
+    let paused = FOLLOWERS[0];
+    cluster.nodes_mut()[paused].arm_execute_pause()?;
+
+    let sql = format!(
+        "SELECT filter_key, COUNT(*) AS matched FROM vala.bifrost.{table} \
+         GROUP BY filter_key ORDER BY filter_key"
+    );
+    cluster.nodes_mut()[LEADER].start_inactive_sql(&sql)?;
+    cluster.nodes_mut()[paused].await_execute_paused()?;
+
+    let (activated, live) = cluster.nodes_mut()[paused].graph_leases()?;
+    if (activated, live) != (1, 1) {
+        return Err(PeerJourneyError::from(format!(
+            "the paused follower must hold exactly one activated lease, held ({activated}, {live})"
+        )));
+    }
+
+    match cause {
+        TerminalCause::PeerLoss => cluster.nodes_mut()[paused].kill()?,
+        TerminalCause::Cancellation => cluster.nodes_mut()[LEADER].cancel_inactive_sql()?,
+    }
+
+    let outcome = cluster.nodes_mut()[LEADER].await_inactive_sql()?;
+    if let Ok(rows) = outcome {
+        return Err(PeerJourneyError::from(format!(
+            "a lost peer must not produce a successful result, returned {rows} rows"
+        )));
+    }
+
+    // The surviving follower was addressed exactly once and kept nothing. One
+    // activation is the whole claim: a successor attempt would have reserved
+    // and activated a second graph on this same process.
+    let survivor = FOLLOWERS[1];
+    let (activated, live) = await_released_lease(&mut cluster, survivor).await?;
+    if activated > 1 {
+        return Err(PeerJourneyError::from(format!(
+            "follower {survivor} must be addressed by one attempt, activated {activated}"
+        )));
+    }
+    if live != 0 {
+        return Err(PeerJourneyError::from(format!(
+            "follower {survivor} must release its graph lease, still holds {live}"
+        )));
+    }
+
+    // The leader, too: a terminal that leaves the leader's own graph registered
+    // would strand the query envelope on the node that owns it.
+    let (_, leader_live) = await_released_lease(&mut cluster, LEADER).await?;
+    if leader_live != 0 {
+        return Err(PeerJourneyError::from(format!(
+            "the leader must release its own graph, still holds {leader_live}"
+        )));
+    }
+
+    if cause == TerminalCause::Cancellation {
+        // Released only after the terminal, so the release cannot be what
+        // produced it. The killed process has nothing left to release.
+        cluster.nodes_mut()[paused].release_execute_pause()?;
+    }
+    cluster.shutdown();
+    Ok(())
+}
+
+/// Polls one node until it holds no graph lease, then reports its counts.
+///
+/// Cleanup is asynchronous with the leader's terminal by design, so a single
+/// observation would be a race rather than a claim.
+///
+/// # Errors
+///
+/// Returns the node's last observed counts when it never released.
+async fn await_released_lease(
+    cluster: &mut BifrostProcessCluster,
+    index: usize,
+) -> Result<(u64, usize), PeerJourneyError> {
+    let mut last = (0, 0);
+    for _ in 0..CLEAN_LEASE_POLLS {
+        last = cluster.nodes_mut()[index].graph_leases()?;
+        if last.1 == 0 {
+            return Ok(last);
+        }
+        tokio::time::sleep(CLEAN_LEASE_INTERVAL).await;
+    }
+    Err(PeerJourneyError::from(format!(
+        "node {index} never released its graph lease, last saw {last:?}"
+    )))
+}
+
+/// Bound on how long terminal cleanup may take before it is called a leak.
+const CLEAN_LEASE_POLLS: usize = 100;
+
+/// Interval between graph-lease observations while waiting for cleanup.
+const CLEAN_LEASE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);

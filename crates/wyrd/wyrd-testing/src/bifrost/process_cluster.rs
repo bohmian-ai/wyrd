@@ -200,6 +200,21 @@ pub enum ControlRequest {
     PeerProbe(PeerProbePlan),
     /// Report how many request bodies this child's peer plane has polled.
     PeerBodyPolls,
+    /// Arm the one-shot follower pause of the next authorized `ExecuteTask`.
+    ArmExecutePause,
+    /// Block until this child is holding an `ExecuteTask` at that pause.
+    AwaitExecutePaused,
+    /// Release the held `ExecuteTask` so its graph may finish or fail.
+    ReleaseExecutePause,
+    /// Start one statement in this child's single active inactive-query slot.
+    StartInactiveSql {
+        /// Statement to execute.
+        sql: String,
+    },
+    /// Cancel the statement occupying that slot.
+    CancelInactiveSql,
+    /// Block until that statement reaches its terminal and report it.
+    AwaitInactiveSql,
     /// Begin ordered shutdown and exit.
     Shutdown,
 }
@@ -392,6 +407,23 @@ pub enum ControlResponse {
     Probed {
         /// Non-secret gRPC status code name the destination returned.
         outcome: String,
+    },
+    /// Answer to [`ControlRequest::ArmExecutePause`].
+    PauseArmed,
+    /// Answer to [`ControlRequest::AwaitExecutePaused`].
+    ExecutePaused,
+    /// Answer to [`ControlRequest::ReleaseExecutePause`].
+    PauseReleased,
+    /// Answer to [`ControlRequest::StartInactiveSql`].
+    Started,
+    /// Answer to [`ControlRequest::CancelInactiveSql`].
+    CancelRequested,
+    /// Answer to [`ControlRequest::AwaitInactiveSql`].
+    InactiveOutcome {
+        /// Rows the statement produced, when it succeeded.
+        rows: Option<usize>,
+        /// The terminal failure, when it did not.
+        detail: Option<String>,
     },
     /// Answer to [`ControlRequest::PeerBodyPolls`].
     BodyPolls {
@@ -1057,6 +1089,134 @@ impl ProcessNode {
                 "child pid {} closed its control stream; stderr tail:\n{}",
                 self.ready.pid,
                 self.stderr_tail()
+            ))),
+        }
+    }
+
+    /// Arms this child's one-shot follower `ExecuteTask` pause.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::request`], and
+    /// [`ProcessClusterError::Child`] when this child composes no Oracle.
+    pub fn arm_execute_pause(&mut self) -> Result<(), ProcessClusterError> {
+        self.expect(&ControlRequest::ArmExecutePause, |response| {
+            matches!(response, ControlResponse::PauseArmed)
+        })
+    }
+
+    /// Blocks until this child is holding an `ExecuteTask` at that pause.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::request`].
+    pub fn await_execute_paused(&mut self) -> Result<(), ProcessClusterError> {
+        self.expect(&ControlRequest::AwaitExecutePaused, |response| {
+            matches!(response, ControlResponse::ExecutePaused)
+        })
+    }
+
+    /// Releases the held `ExecuteTask`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::request`].
+    pub fn release_execute_pause(&mut self) -> Result<(), ProcessClusterError> {
+        self.expect(&ControlRequest::ReleaseExecutePause, |response| {
+            matches!(response, ControlResponse::PauseReleased)
+        })
+    }
+
+    /// Starts one statement in this child's single active inactive-query slot.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::request`], and
+    /// [`ProcessClusterError::Child`] when the slot is already occupied.
+    pub fn start_inactive_sql(&mut self, sql: &str) -> Result<(), ProcessClusterError> {
+        self.expect(
+            &ControlRequest::StartInactiveSql {
+                sql: sql.to_owned(),
+            },
+            |response| matches!(response, ControlResponse::Started),
+        )
+    }
+
+    /// Cancels the statement occupying that slot.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::request`], and
+    /// [`ProcessClusterError::Child`] when the slot is empty.
+    pub fn cancel_inactive_sql(&mut self) -> Result<(), ProcessClusterError> {
+        self.expect(&ControlRequest::CancelInactiveSql, |response| {
+            matches!(response, ControlResponse::CancelRequested)
+        })
+    }
+
+    /// Blocks until that statement reaches its terminal and reports it.
+    ///
+    /// Returns the row count on success and the terminal failure detail
+    /// otherwise. A failed terminal is an outcome, not a harness error.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::request`], and
+    /// [`ProcessClusterError::Child`] when the slot is empty.
+    pub fn await_inactive_sql(&mut self) -> Result<Result<usize, String>, ProcessClusterError> {
+        match self.request(&ControlRequest::AwaitInactiveSql)? {
+            ControlResponse::InactiveOutcome {
+                rows: Some(rows), ..
+            } => Ok(Ok(rows)),
+            ControlResponse::InactiveOutcome {
+                detail: Some(detail),
+                ..
+            } => Ok(Err(detail)),
+            ControlResponse::Failed { detail } => Err(ProcessClusterError::Child(detail)),
+            other => Err(ProcessClusterError::Protocol(format!(
+                "expected an inactive-query outcome, received {other:?}"
+            ))),
+        }
+    }
+
+    /// Kills and reaps this child without asking it to shut down.
+    ///
+    /// This is real peer loss: the process disappears mid-graph, so its peers
+    /// observe a dead connection rather than a drained one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProcessClusterError::Child`] when a thread this node owns
+    /// could not be joined.
+    pub fn kill(&mut self) -> Result<(), ProcessClusterError> {
+        self.stdin = None;
+        if let Some(reaper) = &self.reaper {
+            let _ = reaper.send(ReaperCommand::Kill);
+        }
+        let _ = self.exited.recv_timeout(SHUTDOWN_TIMEOUT);
+        self.reaper = None;
+        self.join_threads()
+    }
+
+    /// Sends one request and requires the child to answer with an exact shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::request`], and
+    /// [`ProcessClusterError::Child`] when the child reported a failure.
+    fn expect(
+        &mut self,
+        request: &ControlRequest,
+        accept: impl Fn(&ControlResponse) -> bool,
+    ) -> Result<(), ProcessClusterError> {
+        let response = self.request(request)?;
+        if accept(&response) {
+            return Ok(());
+        }
+        match response {
+            ControlResponse::Failed { detail } => Err(ProcessClusterError::Child(detail)),
+            other => Err(ProcessClusterError::Protocol(format!(
+                "unexpected answer to {request:?}: {other:?}"
             ))),
         }
     }

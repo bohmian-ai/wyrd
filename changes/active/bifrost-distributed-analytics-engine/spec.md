@@ -1,6 +1,6 @@
 ---
 id: SPEC-bifrost-distributed-analytics-engine
-revision: 3
+revision: 4
 status: approved
 ---
 
@@ -40,9 +40,9 @@ later reconciles and retains them after explicit approval.
 - Support and prove the v1 distributed operator baseline: filtered and projected
   scans, fixed-width grouped aggregation, multi-input equi-join, streamed
   exchange, and one real spilling DataFusion operator.
-- Project the same query request, stream, selected path, terminal evidence,
-  cancellation, and structured errors through Rust, HTTP/gRPC, Python,
-  TypeScript, and MCP.
+- Ship the same query request, stream, selected path, terminal evidence,
+  cancellation, and structured errors through the shared Rust client,
+  HTTP/gRPC, and MCP.
 - Prove the real production user journeys for UI, data-scientist, internal
   scheduled, and agent-facing queries.
 
@@ -69,6 +69,10 @@ later reconciles and retains them after explicit approval.
   `datafusion-distributed`.
 - Cross-region distributed execution, autoscaling behavior, distributed writes,
   DML, or CTAS.
+- Python and TypeScript query projections in this change. They remain
+  first-class Wyrd languages and may project this shared Rust capability in a
+  later change, but they do not gate this v1 delivery or its Tier-1/Tier-2
+  evidence.
 
 ## Definitions
 
@@ -104,7 +108,7 @@ The existing authenticated raw-SQL query operation shall remain the only public
 execution entry point. The request shall not accept an execution path, query
 class, stage graph, worker set, physical plan, or tenant override.
 
-Rust, HTTP/gRPC, Python, TypeScript, and MCP shall project the same server-owned
+The shared Rust client, HTTP/gRPC, and MCP shall project the same server-owned
 query semantics, deadline, incremental Arrow results, selected execution path,
 terminal outcome, and structured errors.
 
@@ -228,20 +232,24 @@ Self-hosted, SaaS, and enterprise deployments shall expose the same query
 behavior. Deployment profiles may choose different finite capacities but shall
 not change query semantics.
 
-### REQ-010 — Thin first-class projections
+### REQ-010 — Shared Rust client and thin MCP projection
 
-Python and TypeScript shall expose idiomatic incremental query streams over the
-shared Rust client and server wire contract. Runtime cancellation, iterator
-close/drop, malformed terminal data, and transport error shall settle the server
-query and release native/runtime handles without moving routing or durable
-lifecycle logic into the client.
+The Rust client shall own all reusable client behavior for request construction,
+incremental Arrow decoding, terminal and structured-error validation, deadline
+handling, cancellation, and settlement. The production Rust journey shall use
+that shared implementation rather than a journey-specific client path.
 
-MCP shall expose the same raw-SQL query behavior with closed input schemas,
-caller ceilings for SQL, deadline, rows, and bytes beneath server hard limits,
-server-owned authentication and tenant binding, and no successful truncation.
+MCP shall thinly project the same Rust client behavior with closed input
+schemas, caller ceilings for SQL, deadline, rows, and bytes beneath server hard
+limits, server-owned authentication and tenant binding, and no successful
+truncation. MCP shall preserve structured errors and the terminal execution
+path without reproducing client lifecycle, internal operator, routing, or
+topology logic.
 
-Each projection shall preserve structured errors and the terminal execution
-path. It shall not reproduce the internal operator, routing, or topology matrix.
+Python and TypeScript are not required surfaces or acceptance dependencies for
+this change. A later language projection shall consume the shared Rust behavior
+and may add only language-runtime ergonomics; it shall not reimplement reusable
+client behavior.
 
 ### REQ-011 — Operational evidence
 
@@ -385,13 +393,17 @@ eventually report zero query graphs, attempts, leases, tasks, cache entries,
 exchange ownership, and spill files. A separate admission-pressure case proves
 that Analytical saturation does not consume the Interactive floor.
 
-### Journey E — First-class client and agent projections
+### Journey E — Rust client and agent projection
 
-Rust/HTTP or generated gRPC proves the complete production route and physical
-topology once. Python, TypeScript, and MCP each drive a real client-to-server-to-
-client query lifecycle and prove typed streaming, selected-path evidence,
-structured failure, cancellation/close behavior, and cleanup. They do not each
-repeat the physical operator matrix.
+The shared Rust client over HTTP or generated gRPC proves the complete
+client-to-server-to-client production route and physical topology once. MCP
+drives a real agent-to-server-to-agent query lifecycle and proves bounded input,
+selected-path evidence, structured failure, cancellation/ceiling behavior, and
+cleanup without repeating the physical operator matrix.
+
+All Tier-1 journeys and Tier-2 verification required by this change shall run
+without Python or Node.js and shall not depend on Python or TypeScript packages,
+bindings, test harnesses, or runtime lifetimes.
 
 ## Material constraints and required boundaries
 
@@ -406,7 +418,9 @@ repeat the physical operator matrix.
 - Query output remains streamed Arrow with one explicit terminal; no
   asynchronous query-job or result-polling protocol is added.
 - Public contracts remain language-neutral and generated from their owning
-  sources. Python and TypeScript remain projections rather than durable owners.
+  sources. `vala-sdk` owns shared reusable client behavior; future Python and
+  TypeScript support remains a thin projection rather than a durable or
+  reusable-behavior owner.
 - MCP remains agent-facing, bounded, permissioned, and tenant-safe.
 
 ## Acceptance obligations
@@ -454,13 +468,14 @@ existing peer trust boundary, represented by reachable deployment configuration,
 included in readiness, and joined during shutdown. The same Oracle process
 shape shall coordinate and follow work.
 
-### AC-006 — Public contract and projections
+### AC-006 — Shared Rust contract and MCP projection
 
-Source-generated contract evidence and real Rust/HTTP or gRPC, Python,
-TypeScript, and MCP journeys shall agree on request semantics, incremental Arrow
-results, deadline, selected path, terminal outcome, cancellation, and structured
-errors. MCP shall additionally prove closed bounded input and no successful
-truncation.
+Source-generated contract evidence and real shared-Rust-client HTTP or gRPC and
+MCP journeys shall agree on request semantics, incremental Arrow results,
+deadline, selected path, terminal outcome, cancellation, and structured errors.
+MCP shall additionally prove closed bounded input and no successful truncation.
+The required Tier-1 and Tier-2 lanes shall pass without building or executing
+Python or TypeScript integrations.
 
 ### AC-007 — Operational evidence
 
@@ -488,7 +503,9 @@ None in this draft. Approval would explicitly choose:
 - reuse of existing optimized-plan classification plus real-exchange validation
   instead of a specialized routing-facts subsystem; and
 - practical aggregate resource containment without a dependency fork or exact
-  dependency-internal message/queue proof.
+  dependency-internal message/queue proof; and
+- Rust plus MCP as the shipping client surfaces for this change, with Python
+  and TypeScript deferred to later changes.
 
 ## Planning-decision inventory
 
@@ -504,8 +521,9 @@ After approval, `$wyrd-plan` must decide only implementation-level details:
   three Oracle replicas;
 - the existing public contract sources that project selected-path terminal
   evidence consistently without adding a path selector or EXPLAIN;
-- the narrow runtime-native cancellation/close mechanics for Python,
-  TypeScript, and MCP projections;
+- the shared Rust client boundary for request construction, stream decoding,
+  terminal/error validation, deadline, cancellation, and settlement, plus the
+  thin MCP ceiling and agent-output projection over that boundary;
 - which existing Task 1 remediation code and evidence already satisfies this
   revision, which portions of the proposed Task 2 and Task 3 remain cohesive,
   and which current task artifacts shall be moved to scrap; and
@@ -546,6 +564,11 @@ security behavior changes.
   activation, and first-class client projections; narrowed routing, retry,
   EXPLAIN, operator, and topology scope; and defined the complete production
   user journeys.
+- Revision 4 (`approved`, 2026-09-01): the human explicitly approved Rust plus
+  MCP as this change's shipping client surfaces, made `vala-sdk` the reusable
+  client-behavior authority, deferred Python and TypeScript projections to later
+  changes, and removed Python and Node.js from required Tier-1 and Tier-2
+  evidence.
 
 ## Material authority
 

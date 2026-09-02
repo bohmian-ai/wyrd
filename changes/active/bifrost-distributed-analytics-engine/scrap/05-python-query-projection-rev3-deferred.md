@@ -3,18 +3,21 @@ id: BIFROST-R3-T05-PYTHON
 title: Project the terminal-safe query lifecycle through Python
 kind: implementation
 mode: RECONCILE
-status: proposed
+status: superseded
 spec: SPEC-bifrost-distributed-analytics-engine
 spec_revision: 3
 depends_on: [BIFROST-R3-T04-PRODUCTION-ACTIVATION]
-requirements: [REQ-001, REQ-008, REQ-010, REQ-011]
+requirements: [REQ-001, REQ-008, REQ-010]
 invariants: [INV-001, INV-003, INV-004, INV-005, INV-008]
-acceptance: [AC-006, AC-007, AC-008]
+acceptance: [AC-006, AC-008]
 parent_task: BIFROST-R3-T3-FIRST-CLASS-PROJECTIONS
 frozen_candidate: f1ac4cb01fe9ddda0a133cb58c955bab1e1cf7df
 ---
 
 # Python query projection
+
+> Deferred from this change by approved specification revision 4. Preserved as
+> non-authoritative planning input for a later Python integration change.
 
 ## Outcome and value
 
@@ -28,13 +31,16 @@ Required execution skills: `$wyrd-implement` and the repository PyO3 guidance.
 
 ## Current-state amendment and owners
 
-Retain `vala-sdk`'s Rust client, optional `python` feature,
+Retain Task 4's shared `vala-sdk` Rust stream settlement, optional `python` feature,
 `PyBifrostQueryStream`, and the public facade in
 `python/py-wyrd/python/wyrd/bifrost`. Replace the current `aclose` abandonment
-semantics and untyped terminal dictionary. `vala-sdk` owns native cancellation
-and terminal validation; `py-wyrd` remains a thin registration/facade/stub/test
-layer. Consume Task 4's test-tier multi-node `WyrdTestServer` option unchanged;
-testing support must not enter the production wheel.
+semantics and untyped terminal dictionary. `vala-sdk` owns native cancellation,
+deadline-bounded settlement, request/response conversion, incremental decoding,
+terminal validation, and canonical error extraction; `py-wyrd` remains a thin
+registration/facade/stub/test layer. Any reusable behavior found missing is
+implemented and Rust-tested in `vala-sdk` before Python exposes it. Consume Task
+4's test-tier multi-node `WyrdTestServer` option unchanged; testing support must
+not enter the production wheel.
 
 Do not add a Python path selector, EXPLAIN, client routing, Python-owned graph
 state, ad hoc runtime, or Rust tests that initialize CPython.
@@ -63,8 +69,8 @@ terminal value; let the facade retain it after validation. Convert derive-backed
 errors at the PyO3 edge with code/status/title/detail/remediation/details. Never
 hold `Bound<'py, T>` across blocking work or store `PyErr` in Rust owners.
 
-**REFACTOR.** One Rust terminal decoder serves Rust and Python; Python adds only
-idiomatic iteration/property shapes.
+**REFACTOR.** One Rust terminal decoder and error model serve every client;
+Python adds only idiomatic iteration, exception, and property shapes.
 
 ### Scenario 2 — Idempotent close and cancellation races
 
@@ -82,22 +88,26 @@ mise run py:setup
 mise exec -- bash -lc "cd python/py-wyrd && uv run pytest -q tests/bifrost/test_query.py::test_query_close_and_cancel_settle_exactly_once"
 ```
 
-**GREEN.** Make the Rust-native stream owner hold a closed state and idempotent
-`settle(abandon_reason)`: when no valid terminal exists, request server
-cancellation, drain/await settlement under the original deadline, then release
-the native stream. Python `aclose`, `CancelledError`, exceptions, and finalizer
-call this owner through `asyncio.to_thread`; finalization may signal/leak-report
-when it cannot await but must not claim successful cleanup.
+**GREEN.** Bridge Python `aclose`, `CancelledError`, decode/transport exceptions,
+and normal terminal to Task 4's one Rust-native async close/settlement API
+through the approved shared runtime boundary. Preserve the server request's
+original absolute deadline; do not start a Python-local timeout budget.
+Finalization may signal cancellation/leak-report when it cannot await but must
+not claim successful cleanup.
 
 **REFACTOR.** Python wrapper state mirrors native state but never becomes the
-authority; no `Bound` survives a thread/await boundary.
+authority. It may translate Python runtime events into Rust calls, but may not
+reimplement request validation, stream decoding, terminal/error semantics,
+deadlines, cancellation, or settlement. No `Bound` survives a thread/await
+boundary.
 
 ### Scenario 3 — Real Python client journey
 
 **Behavior.** Public Python imports drive Interactive success, Analytical
 success, structured post-selection failure, task cancellation/close, terminal
-paths, telemetry deltas, and zero server ownership. Maps REQ-001, REQ-008,
-REQ-010, REQ-011, AC-006, AC-007, AC-008.
+paths, deadline parity with the Rust request, and zero retained Python/native
+state and server query ownership. Maps REQ-001, REQ-008, REQ-010, AC-006,
+AC-008.
 
 **RED.** Add
 `tests/integration/test_bifrost_query.py::test_python_query_paths_failure_cancel_and_cleanup`.
@@ -136,7 +146,8 @@ git diff --check
 ## Completion evidence and stop conditions
 
 Provide generated-stub provenance, terminal/error parity, close-race traces,
-the real Python journey, and zero ownership/telemetry snapshots. Return
+the real Python journey, deadline parity, and zero Python/native/server query
+ownership snapshots. Return
 `SPEC_REVISION_REQUIRED` if Python needs a divergent wire contract, path
 selector, successful partial output, client-owned lifecycle, new dependency/
 feature, or weakened server auth/tenant/audit behavior.

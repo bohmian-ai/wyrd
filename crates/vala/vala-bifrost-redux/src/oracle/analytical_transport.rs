@@ -63,6 +63,7 @@ use datafusion_distributed::{
     GetWorkerInfoResponse, SetPlanRequest, TaskKey, WorkerChannel, WorkerToCoordinatorMsg,
 };
 use futures_util::StreamExt as _;
+use sha2::{Digest as _, Sha256};
 use futures_util::stream::BoxStream;
 use tower::Layer as _;
 use url::Url;
@@ -773,15 +774,7 @@ impl AnalyticalParticipantCut {
                     .to_owned(),
             });
         }
-        // Ordered so the encoded claims — and therefore the signature — depend
-        // only on the membership of the cut, never on iteration order.
-        wire.sort_by(|left, right| {
-            (&left.address, &left.node_id, left.fence).cmp(&(
-                &right.address,
-                &right.node_id,
-                right.fence,
-            ))
-        });
+        canonically_order(&mut wire);
         Ok(Self {
             wire,
             by_url: destinations,
@@ -855,6 +848,62 @@ impl AnalyticalParticipantCut {
     pub(crate) fn wire(&self) -> &[StageParticipantV1] {
         &self.wire
     }
+
+    /// Reports whether this exact node incarnation is a member of the cut.
+    ///
+    /// Identity is the node *and* its fence: a participant that restarted under
+    /// a new fence is a different incarnation and is simply not in this cut, so
+    /// a stage message it presents is refused rather than accepted as its
+    /// predecessor's.
+    #[must_use]
+    pub(crate) fn contains(&self, node_id: NodeId, fence: u64) -> bool {
+        self.by_url
+            .values()
+            .any(|destination| destination.node_id == node_id && destination.fence == fence)
+    }
+
+    /// Returns a membership-only digest of this cut.
+    ///
+    /// Computed over the same canonical ordering the leader signs, so two
+    /// tickets carrying the same membership fingerprint identically no matter
+    /// which order they listed it in, and any added, removed, or re-fenced
+    /// participant changes the digest. This is what lets a graph retain the
+    /// exact cut its first verified ticket carried and refuse a later message
+    /// that widens it, without storing a second copy of the cut per message.
+    #[must_use]
+    pub(crate) fn fingerprint(&self) -> String {
+        let mut ordered = self.wire.clone();
+        canonically_order(&mut ordered);
+        let mut digest = Sha256::new();
+        digest.update(b"wyrd-oracle-analytical-participant-cut-v1");
+        digest.update((ordered.len() as u64).to_be_bytes());
+        for participant in &ordered {
+            digest.update((participant.node_id.len() as u64).to_be_bytes());
+            digest.update(&participant.node_id);
+            digest.update(participant.fence.to_be_bytes());
+            digest.update((participant.address.len() as u64).to_be_bytes());
+            digest.update(participant.address.as_bytes());
+            digest.update((participant.reservation_id.len() as u64).to_be_bytes());
+            digest.update(participant.reservation_id.as_bytes());
+        }
+        hex::encode(digest.finalize())
+    }
+}
+
+/// Orders one cut so its encoding depends only on membership.
+///
+/// The signed claims — and therefore the signature — must not vary with the
+/// iteration order of the map a leader froze its cut from, and the same order is
+/// what makes [`AnalyticalParticipantCut::fingerprint`] comparable across two
+/// tickets. One ordering serves both; there is no second one.
+fn canonically_order(wire: &mut [StageParticipantV1]) {
+    wire.sort_by(|left, right| {
+        (&left.address, &left.node_id, left.fence).cmp(&(
+            &right.address,
+            &right.node_id,
+            right.fence,
+        ))
+    });
 }
 
 pub(crate) struct AnalyticalStageMinter {

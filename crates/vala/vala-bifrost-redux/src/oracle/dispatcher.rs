@@ -239,7 +239,8 @@ pub(crate) enum ReservedCapacity {
 /// the leader — a follower running a middle stage is itself a coordinator and
 /// legitimately signs under its own identity. The stage ticket independently
 /// binds the presenting principal, this follower's node identity, and its
-/// current role fence before this is ever reached.
+/// current role fence before this is ever reached. The activator retains that
+/// reserving identity separately, in its own immutable graph binding.
 #[derive(Debug, Clone, Copy)]
 pub struct GraphLeaseRequest {
     /// Reservation the leader took on this node for this graph.
@@ -250,94 +251,254 @@ pub struct GraphLeaseRequest {
     pub query_id: QueryId,
 }
 
-/// One follower's exact, graph-qualified ownership of a reserved query envelope.
+/// One follower's reservation held across a fallible graph activation.
 ///
-/// A graph lease is activated once, by whichever authorized stage method for
-/// the graph arrives first, and is then reused by every coordinator channel,
-/// task, stream, cache entry, and the optional retry. Reuse is what makes it a
-/// lease rather than a grant: the envelope is charged exactly once no matter
-/// how many stage messages address the graph.
-///
-/// The lease holds the running permit for the graph's whole life. The admitted
-/// [`crate::resources::OracleQueryResources`] envelope is taken out exactly
-/// once, by the follower that registers the graph with its supervisor, because
-/// the supervisor's graph guard is what releases the envelope when the graph
-/// ends.
-#[derive(Debug)]
-pub struct GraphLease {
-    /// Graph this lease is the sole follower-local owner of.
-    graph: AnalyticalGraphRef,
-    /// Reservation this lease was atomically transferred from.
+/// This is the transaction that replaced a destructive transfer. The pending
+/// entry — permit, envelope, reserving leader and fence, and above all its
+/// *original* expiry — is removed from the registry and retained here
+/// unchanged while the activator does the fallible work: building the query
+/// runtime and registering the graph with its supervisor. Exactly one of
+/// [`PendingGraphActivation::commit`] or [`PendingGraphActivation::rollback`]
+/// then decides whether the reservation became a graph or goes back on the
+/// shelf, so no failure path can leave the follower charged for a graph that
+/// does not exist, and no failure path can destroy a reservation that is still
+/// valid.
+pub struct PendingGraphActivation {
+    /// Registry this reservation is restored into when activation fails.
+    registry: Arc<ReservationRegistry>,
+    /// Identity of the reservation held open by this activation.
     reservation_id: ReservationId,
-    /// Query identity every reusing caller must still match.
-    query_id: QueryId,
-    /// Leader identity the reservation was accepted under.
-    leader_node_id: NodeId,
-    /// Leader fence the reservation was accepted under.
-    leader_fencing_token: FencingToken,
-    /// Admission class this graph was charged under.
-    query_class: QueryClass,
-    /// Reserved query envelope, moved out once by the registering follower.
-    resources: Mutex<Option<Box<crate::resources::OracleQueryResources>>>,
-    /// Running permit charged at reservation and held for the graph's life.
-    permit: Mutex<Option<OwnedSemaphorePermit>>,
+    /// Graph the reservation may only ever become.
+    graph: AnalyticalGraphRef,
+    /// The removed pending entry, retained verbatim until commit or rollback.
+    ///
+    /// Cleared by whichever of the two runs, so the drop guard can tell an
+    /// abandoned activation from a settled one.
+    entry: Option<PendingReservation>,
 }
 
-impl GraphLease {
-    /// Returns the graph this lease exclusively owns.
+impl fmt::Debug for PendingGraphActivation {
+    /// Reports the activation's identity without rendering retained ownership.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PendingGraphActivation")
+            .field("reservation_id", &self.reservation_id.as_uuid())
+            .field("settled", &self.entry.is_none())
+            .finish_non_exhaustive()
+    }
+}
+
+impl PendingGraphActivation {
+    /// Returns the exact graph this reservation was taken for.
     #[must_use]
-    pub fn graph(&self) -> AnalyticalGraphRef {
+    pub(crate) fn graph(&self) -> AnalyticalGraphRef {
         self.graph
     }
 
-    /// Returns the reservation this lease was transferred from.
+    /// Returns the reservation identity this activation holds open.
+    #[must_use]
+    pub(crate) fn reservation_id(&self) -> ReservationId {
+        self.reservation_id
+    }
+
+    /// Returns the leader node and fence the reservation was accepted under.
+    ///
+    /// This is reservation ownership, not per-message stage authority. The
+    /// activator retains it so a later coordinator can be authorized as either
+    /// this exact pair or an exact member of the immutable destination cut.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the activation has already committed or rolled back, which
+    /// is unreachable: both consume `self`.
+    #[must_use]
+    pub(crate) fn reserving_leader(&self) -> (NodeId, FencingToken) {
+        let entry = self.entry.as_ref().expect("a live activation owns its entry");
+        (entry.leader_node_id, entry.leader_fencing_token)
+    }
+
+    /// Returns the reservation's original expiry, which activation never extends.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the activation has already committed or rolled back.
+    #[must_use]
+    pub(crate) fn expires_at(&self) -> DateTime<Utc> {
+        self.entry
+            .as_ref()
+            .expect("a live activation owns its entry")
+            .expires_at
+    }
+
+    /// Returns the admission class the reservation was charged under.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the activation has already committed or rolled back.
+    #[must_use]
+    pub(crate) fn query_class(&self) -> QueryClass {
+        self.entry
+            .as_ref()
+            .expect("a live activation owns its entry")
+            .query_class
+    }
+
+    /// Borrows the reserved query envelope without taking ownership of it.
+    ///
+    /// Building the graph's bounded runtime needs only the envelope's pool and
+    /// scratch share, and it can fail. Lending rather than taking is what keeps
+    /// a failed runtime build recoverable: the envelope is still here, so the
+    /// rollback restores a reservation a later activator can still use.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the activation has already committed or rolled back, or when
+    /// the retained entry is not a graph reservation. `begin_graph_activation`
+    /// refuses every other shape before this is reachable.
+    #[must_use]
+    pub(crate) fn envelope(&self) -> &crate::resources::OracleQueryResources {
+        match self
+            .entry
+            .as_ref()
+            .and_then(|entry| entry.capacity.as_ref())
+        {
+            Some(ReservedCapacity::Graph(resources)) => resources,
+            _ => unreachable!("a graph activation always retains a graph envelope"),
+        }
+    }
+
+    /// Moves the reserved envelope into `register`, keeping it on failure.
+    ///
+    /// `register` is the single fallible act that changes the envelope's owner:
+    /// it takes the admitted resources and returns whatever owns them from then
+    /// on — in production, the supervisor's graph guard. A registration that
+    /// fails must hand the resources back, because the reservation this
+    /// activation restores is only usable again if it is restored complete.
+    ///
+    /// On success the residue — the running permit and the admission class — is
+    /// returned for the lease to own, and the activation's cumulative counter is
+    /// advanced exactly once.
+    ///
+    /// # Errors
+    ///
+    /// Returns the unchanged activation alongside `register`'s error, so the
+    /// caller can still roll back under the original expiry.
+    pub(crate) fn commit<T, F>(
+        mut self,
+        register: F,
+    ) -> Result<(CommittedGraphActivation, T), (Self, BifrostError)>
+    where
+        F: FnOnce(
+            crate::resources::OracleQueryResources,
+        )
+            -> Result<T, (crate::resources::OracleQueryResources, BifrostError)>,
+    {
+        let mut entry = self
+            .entry
+            .take()
+            .expect("a live activation owns its entry");
+        let Some(ReservedCapacity::Graph(resources)) = entry.capacity.take() else {
+            unreachable!("a graph activation always retains a graph envelope")
+        };
+        match register(*resources) {
+            Ok(owner) => {
+                let committed = CommittedGraphActivation {
+                    reservation_id: self.reservation_id,
+                    graph: self.graph,
+                    query_class: entry.query_class,
+                    permit: entry.permit.take(),
+                };
+                #[cfg(feature = "test-support")]
+                self.registry
+                    .graph_leases_activated_total
+                    .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                tracing::debug!(
+                    public_query_id = %self.graph.public_query_id,
+                    datafusion_query_id = %self.graph.datafusion_query_id,
+                    "Oracle graph lease activated from its reservation"
+                );
+                Ok((committed, owner))
+            }
+            Err((resources, error)) => {
+                entry.capacity = Some(ReservedCapacity::Graph(Box::new(resources)));
+                self.entry = Some(entry);
+                Err((self, error))
+            }
+        }
+    }
+
+    /// Returns the unchanged reservation to the registry, or drops it.
+    ///
+    /// Restoration is conditional on the reservation's *own* original expiry,
+    /// never on a fresh one: a failed activation may not buy the leader more
+    /// time than it was granted. An expired or displaced reservation releases
+    /// its exact permit and envelope instead, which returns this follower to
+    /// baseline rather than stranding capacity for a graph that never existed.
+    pub(crate) fn rollback(mut self, now: DateTime<Utc>) {
+        let Some(entry) = self.entry.take() else {
+            return;
+        };
+        self.registry.restore(self.reservation_id, entry, now);
+    }
+}
+
+impl Drop for PendingGraphActivation {
+    /// Rolls back an activation abandoned by cancellation, panic, or early return.
+    ///
+    /// The settled paths clear the entry and leave nothing to do here. This
+    /// covers the activator that simply went away, where the alternative is a
+    /// permit and envelope no owner can ever return.
+    fn drop(&mut self) {
+        let Some(entry) = self.entry.take() else {
+            return;
+        };
+        self.registry.restore(self.reservation_id, entry, Utc::now());
+    }
+}
+
+/// The reservation residue one activated graph lease owns for the graph's life.
+///
+/// Everything else the reservation held has changed owner: the envelope moved
+/// into the supervisor's graph state, and the pending entry is gone. What
+/// remains is the running permit this node charged when it accepted the
+/// reservation, which the graph must keep until it settles, and the class it was
+/// charged under. Dropping this is the release.
+#[derive(Debug)]
+pub struct CommittedGraphActivation {
+    /// Reservation this graph was activated from.
+    reservation_id: ReservationId,
+    /// Graph this residue belongs to.
+    graph: AnalyticalGraphRef,
+    /// Admission class the graph's envelope was charged under.
+    query_class: QueryClass,
+    /// Running permit charged at reservation and held for the graph's life.
+    permit: Option<OwnedSemaphorePermit>,
+}
+
+impl CommittedGraphActivation {
+    /// Returns the reservation this graph was activated from.
     #[must_use]
     pub fn reservation_id(&self) -> ReservationId {
         self.reservation_id
     }
 
-    /// Returns the admission class this graph's envelope was charged under.
+    /// Returns the graph this residue belongs to.
+    #[must_use]
+    pub fn graph(&self) -> AnalyticalGraphRef {
+        self.graph
+    }
+
+    /// Returns the admission class the graph's envelope was charged under.
     #[must_use]
     pub fn query_class(&self) -> QueryClass {
         self.query_class
     }
-
-    /// Takes the reserved query envelope, exactly once.
-    ///
-    /// Returns `None` on every later call. The first caller is the follower
-    /// that registers the graph with its supervisor, which then owns the
-    /// envelope's release; a second taker would mean two owners for one charge.
-    #[must_use]
-    pub fn take_resources(&self) -> Option<Box<crate::resources::OracleQueryResources>> {
-        self.resources.lock().ok().and_then(|mut held| held.take())
-    }
-
-    /// Returns the leader identity the reservation behind this lease was accepted under.
-    #[must_use]
-    pub fn leader_node_id(&self) -> NodeId {
-        self.leader_node_id
-    }
-
-    /// Returns the leader fence the reservation behind this lease was accepted under.
-    #[must_use]
-    pub fn leader_fencing_token(&self) -> FencingToken {
-        self.leader_fencing_token
-    }
-
-    /// Reports whether the ownership tuple of `request` matches this lease.
-    fn matches(&self, request: &GraphLeaseRequest) -> bool {
-        self.reservation_id == request.reservation_id
-            && self.graph == request.graph
-            && self.query_id == request.query_id
-    }
 }
 
-impl Drop for GraphLease {
-    /// Releases the graph's running permit when its last holder goes away.
+impl Drop for CommittedGraphActivation {
+    /// Returns the graph's running permit when its last owner goes away.
     fn drop(&mut self) {
-        if let Ok(mut permit) = self.permit.lock() {
-            drop(permit.take());
-        }
+        drop(self.permit.take());
     }
 }
 
@@ -376,15 +537,6 @@ pub struct ReservationRegistry {
     capacity: usize,
     /// Role-scoped pending and running slot owner.
     slots: Arc<OracleSlotManager>,
-    /// Live graph leases keyed by the exact graph each one owns.
-    ///
-    /// Separate from `entries` because the two have different lifetimes: a
-    /// pending reservation is short-lived and expires, while a graph lease
-    /// lives for as long as the distributed plan does and is released only by
-    /// its owner. Keying by graph rather than by reservation is what makes
-    /// reuse work — every later stage message for the same graph finds the same
-    /// lease without knowing which message activated it.
-    graph_leases: Mutex<HashMap<AnalyticalGraphRef, Arc<GraphLease>>>,
     /// Cumulative count of successful pending-to-running admissions on this peer.
     ///
     /// Incremented only in `take_for_execute`'s success arm — the remote-worker
@@ -416,7 +568,6 @@ impl ReservationRegistry {
             entries: Mutex::new(HashMap::new()),
             capacity,
             slots,
-            graph_leases: Mutex::new(HashMap::new()),
             #[cfg(feature = "test-support")]
             admitted_running_total: core::sync::atomic::AtomicU64::new(0),
             #[cfg(feature = "test-support")]
@@ -660,41 +811,31 @@ impl ReservationRegistry {
         })
     }
 
-    /// Atomically transfers one reservation into ownership of its named graph.
+    /// Opens one rollback-capable activation of a reservation into its graph.
     ///
-    /// This is the only path from a reservation to a graph envelope. The first
-    /// authorized stage method for a graph activates the lease; every later
-    /// one — another coordinator channel, another task, a cached stream, the
-    /// optional retry — receives the same lease without reacquiring anything.
-    /// Reuse still re-checks the complete ownership tuple, so a second graph
-    /// cannot ride in on a lease the first one activated.
+    /// This is the only path from a reservation to a graph envelope, and it is
+    /// deliberately not the transfer it replaced. The complete ownership tuple
+    /// is checked *before* the pending entry moves anywhere, and what the caller
+    /// receives is a transaction rather than a lease: until it commits, the
+    /// reservation is still whole and still restorable under its own original
+    /// expiry.
     ///
     /// Activation refuses before any worker, cache, or provider IO when the
-    /// reservation is missing, expired, or was taken for a different query,
-    /// leader, fence, or graph — or for no graph at all, which is a fragment
-    /// reservation whose worker quantum is far smaller than a graph envelope.
+    /// reservation is missing, expired, or was taken for a different query or
+    /// graph — or for no graph at all, which is a fragment reservation whose
+    /// worker quantum is far smaller than a graph envelope.
     ///
     /// # Errors
     ///
     /// Returns [`DispatchError::Terminal`] for a missing, expired, mismatched,
-    /// or non-graph reservation, and [`DispatchError::Unavailable`] when an
-    /// ownership lock is poisoned.
+    /// or non-graph reservation, and [`DispatchError::Unavailable`] when the
+    /// reservation lock is poisoned.
     #[tracing::instrument(name = "bifrost.oracle.graph_lease", skip_all)]
-    pub fn lease_graph(
-        &self,
+    pub(crate) fn begin_graph_activation(
+        self: &Arc<Self>,
         request: &GraphLeaseRequest,
         now: DateTime<Utc>,
-    ) -> Result<Arc<GraphLease>, DispatchError> {
-        let mut leases = self
-            .graph_leases
-            .lock()
-            .map_err(|_| DispatchError::Unavailable)?;
-        if let Some(live) = leases.get(&request.graph) {
-            if !live.matches(request) {
-                return Err(DispatchError::Terminal);
-            }
-            return Ok(Arc::clone(live));
-        }
+    ) -> Result<PendingGraphActivation, DispatchError> {
         let mut entries = self
             .entries
             .lock()
@@ -703,50 +844,63 @@ impl ReservationRegistry {
         let entry = entries
             .get(&request.reservation_id)
             .ok_or(DispatchError::Terminal)?;
-        if entry.query_id != request.query_id || entry.graph != Some(request.graph) {
-            return Err(DispatchError::Terminal);
-        }
-        let leader_node_id = entry.leader_node_id;
-        let leader_fencing_token = entry.leader_fencing_token;
-        let mut entry = entries
-            .remove(&request.reservation_id)
-            .ok_or(DispatchError::Terminal)?;
         // Only a graph reservation may become a graph. A fragment reservation
         // charged one worker quantum, which cannot pay for a whole plan.
-        let Some(ReservedCapacity::Graph(resources)) = entry.capacity.take() else {
+        if entry.query_id != request.query_id
+            || entry.graph != Some(request.graph)
+            || !matches!(entry.capacity, Some(ReservedCapacity::Graph(_)))
+        {
             return Err(DispatchError::Terminal);
-        };
-        let lease = Arc::new(GraphLease {
-            graph: request.graph,
+        }
+        let entry = entries
+            .remove(&request.reservation_id)
+            .ok_or(DispatchError::Terminal)?;
+        Ok(PendingGraphActivation {
+            registry: Arc::clone(self),
             reservation_id: request.reservation_id,
-            query_id: request.query_id,
-            leader_node_id,
-            leader_fencing_token,
-            query_class: entry.query_class,
-            resources: Mutex::new(Some(resources)),
-            permit: Mutex::new(entry.permit.take()),
-        });
-        leases.insert(request.graph, Arc::clone(&lease));
-        #[cfg(feature = "test-support")]
-        self.graph_leases_activated_total
-            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        tracing::debug!(
-            public_query_id = %request.graph.public_query_id,
-            datafusion_query_id = %request.graph.datafusion_query_id,
-            "Oracle graph lease activated from its reservation"
-        );
-        Ok(lease)
+            graph: request.graph,
+            entry: Some(entry),
+        })
     }
 
-    /// Drops this node's lease on one graph, exactly once.
+    /// Puts one unchanged reservation back, or releases it when it cannot be.
     ///
-    /// Returns whether a lease was actually held, so a caller releasing on a
-    /// terminal, cancellation, timeout, or shutdown path can tell a real
-    /// release from a repeat and never double-release the same charge.
-    pub fn release_graph(&self, graph: AnalyticalGraphRef) -> bool {
-        self.graph_leases
-            .lock()
-            .is_ok_and(|mut leases| leases.remove(&graph).is_some())
+    /// Centralized here rather than in the activator because collision and
+    /// expiry are the registry's own invariants: an entry may only return to a
+    /// slot that is still vacant, and only while its own original expiry has
+    /// not passed. Everything else drops the exact permit and envelope, which is
+    /// the honest outcome — the reservation the leader was promised is simply
+    /// over.
+    fn restore(&self, reservation_id: ReservationId, entry: PendingReservation, now: DateTime<Utc>) {
+        if entry.expires_at <= now {
+            return;
+        }
+        let Ok(mut entries) = self.entries.lock() else {
+            return;
+        };
+        retain_live(&mut entries, now);
+        if entries.contains_key(&reservation_id) || entries.len() >= self.capacity {
+            return;
+        }
+        entries.insert(reservation_id, entry);
+    }
+
+    /// Returns the greatest number of graphs this node may own at one time.
+    ///
+    /// Derived from the one capacity root that already governs graph
+    /// admission — the running semaphore, against the per-graph slot demand
+    /// clamped exactly as [`ReservationRegistry::reserve`] clamps it — so a
+    /// bounded queue sized from this cannot disagree with what the registry
+    /// will actually admit. Never zero: a node that can admit one graph must be
+    /// able to settle it.
+    #[must_use]
+    pub(crate) fn max_concurrent_graphs(&self) -> usize {
+        let running = self.slots.running_capacity().max(1);
+        let units = usize::try_from(super::analytical::ANALYTICAL_GRAPH_SLOT_UNITS)
+            .unwrap_or(1)
+            .max(1)
+            .min(running);
+        (running / units).max(1)
     }
 
     /// Returns the cumulative count of graph leases activated on this node.
@@ -758,17 +912,6 @@ impl ReservationRegistry {
     pub fn graph_leases_activated_total(&self) -> u64 {
         self.graph_leases_activated_total
             .load(core::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// Returns the number of graph leases this node still holds.
-    ///
-    /// Integration-only observable used to assert that success, mismatch,
-    /// expiry, cancellation, timeout, and shutdown all return the follower to
-    /// its baseline.
-    #[cfg(feature = "test-support")]
-    #[must_use]
-    pub fn live_graph_leases(&self) -> usize {
-        self.graph_leases.lock().map_or(0, |leases| leases.len())
     }
 
     /// Reclaims expired pending reservations and returns the number still held.

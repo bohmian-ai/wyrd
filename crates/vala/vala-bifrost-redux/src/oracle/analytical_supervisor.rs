@@ -346,29 +346,47 @@ impl AnalyticalSupervisor {
     /// query's memory, scratch, and slot units, and it refuses while any attempt
     /// of the graph is still live.
     ///
+    /// Every refusal hands `resources` back unchanged. Registration is one step
+    /// of a larger activation transaction, and the reservation that transaction
+    /// restores is only usable again if it is restored complete; dropping the
+    /// admitted envelope here would silently downgrade a recoverable failure
+    /// into a lost query envelope.
+    ///
     /// # Errors
     ///
     /// Returns [`BifrostError::Internal`] when the supervisor is shutting down,
     /// when the graph is already registered — a duplicate identity, which must
-    /// never silently replace a live plan — or when a lock is poisoned.
+    /// never silently replace a live plan — or when a lock is poisoned, each
+    /// paired with the returned envelope.
     pub fn register_graph(
         self: &Arc<Self>,
         graph: AnalyticalGraphKey,
         resources: OracleQueryResources,
         runtime: AnalyticalGraphRuntime,
-    ) -> Result<AnalyticalGraphGuard, BifrostError> {
+    ) -> Result<AnalyticalGraphGuard, (OracleQueryResources, BifrostError)> {
         if !self.is_healthy() {
-            return Err(BifrostError::Internal {
-                detail: "Oracle analytical supervisor is shutting down".to_owned(),
-            });
+            return Err((
+                resources,
+                BifrostError::Internal {
+                    detail: "Oracle analytical supervisor is shutting down".to_owned(),
+                },
+            ));
         }
-        let mut graphs = self.graphs.lock().map_err(|_| poisoned_supervisor())?;
+        let mut graphs = match self.graphs.lock() {
+            Ok(graphs) => graphs,
+            Err(_) => return Err((resources, poisoned_supervisor())),
+        };
         if graphs.contains_key(&graph) {
-            return Err(BifrostError::Internal {
-                detail: "Oracle analytical graph is already registered".to_owned(),
-            });
+            return Err((
+                resources,
+                BifrostError::Internal {
+                    detail: "Oracle analytical graph is already registered".to_owned(),
+                },
+            ));
         }
-        self.registry.register(graph, runtime.clone())?;
+        if let Err(error) = self.registry.register(graph, runtime.clone()) {
+            return Err((resources, error));
+        }
         graphs.insert(graph, AnalyticalGraphState { resources, runtime });
         drop(graphs);
         tracing::debug!(

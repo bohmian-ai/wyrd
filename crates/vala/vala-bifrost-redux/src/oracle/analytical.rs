@@ -792,6 +792,418 @@ impl AnalyticalStageEgress {
     }
 }
 
+/// The immutable authority one activated graph retains for its whole life.
+///
+/// A graph is addressed by many separate stage messages, and only the first one
+/// gets to say what the graph *is*. This is the exact union the follower keeps
+/// from that moment: the half it already proved when it accepted the
+/// reservation — identity, the reserving leader and fence, and the original
+/// expiry — and the half the first verified stage ticket carried, which the
+/// per-message binding check does not cover.
+///
+/// It is a projection of already-verified material, never a second signed
+/// inventory. [`super::peer::StageTicketClaims`] remains the only thing a peer
+/// signs; this is what the follower chose to remember from it.
+#[derive(Debug)]
+pub(crate) struct GraphLeaseBinding {
+    /// Reservation this graph was activated from.
+    reservation_id: ReservationId,
+    /// Exact graph the reservation was taken for.
+    graph: AnalyticalGraphRef,
+    /// Query identity the reservation was bound to.
+    query_id: QueryId,
+    /// Node identity of the leader that took the reservation.
+    ///
+    /// Reservation ownership, not stage authority. It authorizes a later
+    /// coordinator only as itself, and it is deliberately not inserted into the
+    /// participant cut: the leader is not a destination of this graph.
+    reserving_leader_node_id: NodeId,
+    /// Role fence the reserving leader held when it took the reservation.
+    reserving_leader_fence: FencingToken,
+    /// The reservation's own expiry, which activation never extends.
+    reservation_expires_at: DateTime<Utc>,
+    /// Authenticated data tenant of the graph.
+    tenant_id: DataTenantId,
+    /// Client-visible query identity of the graph.
+    public_query_id: Uuid,
+    /// Private distributed-graph identity.
+    datafusion_query_id: Uuid,
+    /// This follower's own node identity, as the first ticket addressed it.
+    destination_node_id: NodeId,
+    /// This follower's own role fence, as the first ticket addressed it.
+    destination_fence: u64,
+    /// Membership digest of the immutable destination participant cut.
+    participant_cut_fingerprint: String,
+    /// The frozen destination cut itself, for exact source membership.
+    participant_cut: AnalyticalParticipantCut,
+    /// Pinned snapshot digest of the graph's cut.
+    snapshot_digest: String,
+    /// Permission digest the graph's authority was resolved under.
+    permission_digest: String,
+    /// Absolute wall-clock deadline of the whole graph.
+    absolute_deadline_ms: i64,
+}
+
+impl GraphLeaseBinding {
+    /// Derives the retained binding from a reservation and its first ticket.
+    ///
+    /// Both halves come from material this node already verified: the
+    /// reservation it accepted, and the stage ticket the authority just
+    /// returned. Nothing is read from wire framing, and no new wire field is
+    /// required — the union already travels.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::QueryPeerSecurity`] when the verified claims
+    /// carry an unrepresentable identity, and [`BifrostError::Internal`] when
+    /// the carried participant cut cannot be adopted.
+    fn activate(
+        activation: &PendingGraphActivation,
+        request: &GraphLeaseRequest,
+        authorized: &AuthorizedStage,
+    ) -> Result<Self, BifrostError> {
+        let claims = &authorized.claims;
+        let (reserving_leader_node_id, reserving_leader_fence) = activation.reserving_leader();
+        let participant_cut = AnalyticalParticipantCut::adopt(&claims.participants)?;
+        Ok(Self {
+            reservation_id: request.reservation_id,
+            graph: request.graph,
+            query_id: request.query_id,
+            reserving_leader_node_id,
+            reserving_leader_fence,
+            reservation_expires_at: activation.expires_at(),
+            tenant_id: authorized.tenant_id,
+            public_query_id: request.graph.public_query_id,
+            datafusion_query_id: request.graph.datafusion_query_id,
+            destination_node_id: node_from_claim(&claims.destination_node_id)?,
+            destination_fence: claims.destination_fence,
+            participant_cut_fingerprint: participant_cut.fingerprint(),
+            participant_cut,
+            snapshot_digest: claims.snapshot_digest.clone(),
+            permission_digest: claims.permission_digest.clone(),
+            absolute_deadline_ms: claims.absolute_deadline_ms,
+        })
+    }
+
+    /// Returns the reservation this graph was activated from.
+    pub(crate) fn reservation_id(&self) -> ReservationId {
+        self.reservation_id
+    }
+
+    /// Returns the reservation's original expiry, retained unchanged.
+    pub(crate) fn reservation_expires_at(&self) -> DateTime<Utc> {
+        self.reservation_expires_at
+    }
+
+    /// Authorizes one later stage message against this graph's fixed authority.
+    ///
+    /// Two independent checks, in this order. First the presenting coordinator:
+    /// its exact node and fence pair is valid only when it is the pair that
+    /// reserved this graph, or an exact member of the immutable destination cut.
+    /// Neither branch widens the other — the leader is not in the cut, and cut
+    /// membership does not confer reservation ownership. Then the graph itself:
+    /// every immutable field the first ticket fixed must still be identical.
+    ///
+    /// This is pure comparison. It runs before plan decode, cache lookup,
+    /// runtime construction, provider resolution, and source IO, and a refusal
+    /// leaves the live lease exactly as it was.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::QueryPeerSecurity`] for an unauthorized source
+    /// pair, any changed immutable field, or an unrepresentable identity.
+    pub(crate) fn authorize(&self, authorized: &AuthorizedStage) -> Result<(), BifrostError> {
+        let claims = &authorized.claims;
+        let source_node_id = node_from_claim(&claims.source_node_id)?;
+        let reserving_leader = source_node_id == self.reserving_leader_node_id
+            && claims.source_fence == self.reserving_leader_fence;
+        if !reserving_leader && !self.participant_cut.contains(source_node_id, claims.source_fence)
+        {
+            tracing::warn!(
+                public_query_id = %self.public_query_id,
+                "Oracle analytical stage source is neither the reserving leader nor a cut participant"
+            );
+            return Err(BifrostError::QueryPeerSecurity);
+        }
+        let carried = AnalyticalParticipantCut::adopt(&claims.participants)?;
+        if authorized.tenant_id != self.tenant_id
+            || claims.public_query_id != self.public_query_id.as_bytes()
+            || claims.datafusion_query_id != self.datafusion_query_id.as_bytes()
+            || node_from_claim(&claims.destination_node_id)? != self.destination_node_id
+            || claims.destination_fence != self.destination_fence
+            || claims.snapshot_digest != self.snapshot_digest
+            || claims.permission_digest != self.permission_digest
+            || claims.absolute_deadline_ms != self.absolute_deadline_ms
+            || claims.reservation_id != self.reservation_id.as_uuid().to_string()
+            || carried.fingerprint() != self.participant_cut_fingerprint
+        {
+            tracing::warn!(
+                public_query_id = %self.public_query_id,
+                "Oracle analytical stage message would change a live graph's fixed authority"
+            );
+            return Err(BifrostError::QueryPeerSecurity);
+        }
+        Ok(())
+    }
+
+    /// Reports whether `request` names exactly this graph's reservation tuple.
+    pub(crate) fn matches(&self, request: &GraphLeaseRequest) -> bool {
+        self.reservation_id == request.reservation_id
+            && self.graph == request.graph
+            && self.query_id == request.query_id
+    }
+}
+
+/// Reads one node identity from verified claims.
+///
+/// # Errors
+///
+/// Returns [`BifrostError::QueryPeerSecurity`] when the claim does not carry a
+/// well-formed node UUID.
+fn node_from_claim(claim: &[u8]) -> Result<NodeId, BifrostError> {
+    Uuid::from_slice(claim)
+        .map(NodeId::new)
+        .map_err(|_| BifrostError::QueryPeerSecurity)
+}
+
+/// One follower's complete, exclusive ownership of one distributed graph.
+///
+/// Published only after every fallible activation step succeeded, and shared by
+/// every later stage message for the graph. It owns the whole set at once — the
+/// retained authority, the reservation residue, the supervisor's graph guard,
+/// the query-owned runtime, the graph's cancellation child, its absolute
+/// deadline, and its live attempts — so there is no window in which a graph is
+/// visible while part of what it needs is missing, and no take-once hole a
+/// second caller can find empty.
+pub struct GraphLease {
+    /// Fixed authority every later message for this graph is checked against.
+    binding: GraphLeaseBinding,
+    /// Reservation residue — the running permit — held for the graph's life.
+    activation: CommittedGraphActivation,
+    /// Graph this lease is the sole follower-local owner of.
+    graph: AnalyticalGraphKey,
+    /// Node supervisor holding this graph's admitted envelope.
+    supervisor: Arc<AnalyticalSupervisor>,
+    /// Outbound capability this graph's own middle stages sign through.
+    egress: Arc<AnalyticalStageEgress>,
+    /// Supervisor registration, released exactly once by settlement.
+    guard: Mutex<Option<AnalyticalGraphGuard>>,
+    /// Query-owned runtime every follower descendant of this graph installs.
+    runtime: AnalyticalGraphRuntime,
+    /// Cancellation child covering every descendant of this graph.
+    cancel: CancellationToken,
+    /// Attempts admitted under this graph, joined before it may be released.
+    attempts: Mutex<HashMap<AnalyticalAttemptKey, AnalyticalAttemptGuard>>,
+    /// Whether settlement has already run, so it can never run twice.
+    settled: AtomicBool,
+}
+
+impl fmt::Debug for GraphLease {
+    /// Reports the graph identity without rendering owned ownership.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GraphLease")
+            .field("graph", &self.graph)
+            .field("settled", &self.settled.load(Ordering::Acquire))
+            .finish_non_exhaustive()
+    }
+}
+
+impl GraphLease {
+    /// Returns the fixed authority this graph was activated with.
+    #[must_use]
+    pub(crate) fn binding(&self) -> &GraphLeaseBinding {
+        &self.binding
+    }
+
+    /// Returns the reservation residue this graph still holds.
+    #[must_use]
+    pub(crate) fn activation(&self) -> &CommittedGraphActivation {
+        &self.activation
+    }
+
+    /// Returns the query-owned runtime this graph's descendants install.
+    #[must_use]
+    pub(crate) fn runtime(&self) -> &AnalyticalGraphRuntime {
+        &self.runtime
+    }
+
+    /// Returns this graph's cancellation child.
+    #[must_use]
+    pub(crate) fn cancellation(&self) -> &CancellationToken {
+        &self.cancel
+    }
+
+    /// Returns how many attempts of this graph are still admitted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::Internal`] when the attempt lock is poisoned.
+    pub(crate) fn live_attempts(&self) -> Result<usize, BifrostError> {
+        Ok(self.attempts.lock().map_err(|_| poisoned_ingress())?.len())
+    }
+
+    /// Admits one attempt of this graph and retains its guard.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::Internal`] on a poisoned lock, and the
+    /// supervisor's refusal when the slot is occupied or the graph is unknown.
+    fn admit_attempt(
+        &self,
+        key: AnalyticalAttemptKey,
+        grant: AnalyticalAttemptGrant,
+    ) -> Result<(), BifrostError> {
+        let mut attempts = self.attempts.lock().map_err(|_| poisoned_ingress())?;
+        if attempts.contains_key(&key) {
+            return Ok(());
+        }
+        let guard = self.supervisor.spawn_attempt(key, grant)?;
+        attempts.insert(key, guard);
+        Ok(())
+    }
+
+    /// Settles one named attempt of this graph.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::Internal`] on a poisoned lock,
+    /// [`BifrostError::QueryExecutionFailed`] when `key` names no live attempt
+    /// of this graph, and the supervisor's refusal when settlement fails.
+    async fn finish_attempt(
+        &self,
+        key: AnalyticalAttemptKey,
+        outcome: AnalyticalAttemptOutcome,
+    ) -> Result<(), BifrostError> {
+        let guard = {
+            let mut attempts = self.attempts.lock().map_err(|_| poisoned_ingress())?;
+            attempts.remove(&key)
+        };
+        match guard {
+            Some(guard) => guard.finish(outcome).await.map(|_| ()),
+            None => Err(BifrostError::QueryExecutionFailed),
+        }
+    }
+
+    /// Returns everything this graph owns, in one order, exactly once.
+    ///
+    /// The order is the invariant: stop admitting, cancel unless the graph
+    /// succeeded, join every attempt and the descendants they own, wait for the
+    /// envelope's nested children to go idle — which is what proves no cache
+    /// entry, exchange, or spill write is still live — and only then release the
+    /// supervisor guard that returns the envelope, the egress record, and, when
+    /// the last holder of this lease goes away, the reservation's running
+    /// permit.
+    ///
+    /// A cleanup timeout or failure is reported as a failure. It is never a
+    /// successful release: the graph keeps every owner it still holds so the
+    /// leak stays attributable to this node rather than becoming a poisoned
+    /// governor later.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::Internal`] when a lock is poisoned or the
+    /// graph's descendants did not drain within the bounded wait, and the
+    /// supervisor's or egress owner's refusal when a release fails.
+    pub(crate) async fn settle(
+        &self,
+        outcome: AnalyticalAttemptOutcome,
+    ) -> Result<(), BifrostError> {
+        if self.settled.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        if outcome != AnalyticalAttemptOutcome::Succeeded {
+            self.cancel.cancel();
+        }
+        let live = {
+            let attempts = self.attempts.lock().map_err(|_| poisoned_ingress())?;
+            attempts.keys().copied().collect::<Vec<_>>()
+        };
+        for key in live {
+            self.finish_attempt(key, outcome).await?;
+        }
+        self.drain().await?;
+        let guard = self
+            .guard
+            .lock()
+            .map_err(|_| poisoned_ingress())?
+            .take();
+        if let Some(guard) = guard {
+            guard.release()?;
+        }
+        self.egress.release(self.graph)?;
+        Ok(())
+    }
+
+    /// Waits, bounded, for every nested child of the graph's envelope to end.
+    ///
+    /// Upstream drops a follower's stage plan from its own task cache after the
+    /// coordinator channel ends, so the query envelope can still carry live
+    /// `DataFusion` reservations for a short moment after every governed call
+    /// for the graph has closed. Releasing into that moment would poison the
+    /// process governor for a teardown that is merely in progress.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::Internal`] when the supervisor's ownership state
+    /// is poisoned or the graph did not drain within the bounded wait.
+    async fn drain(&self) -> Result<(), BifrostError> {
+        for _ in 0..GRAPH_DRAIN_POLLS {
+            if self.supervisor.graph_children_idle(self.graph)? {
+                return Ok(());
+            }
+            tokio::time::sleep(GRAPH_DRAIN_INTERVAL).await;
+        }
+        tracing::warn!(
+            public_query_id = %self.graph.public_query_id,
+            datafusion_query_id = %self.graph.datafusion_query_id,
+            "Oracle analytical graph did not drain before its follower release"
+        );
+        Err(BifrostError::Internal {
+            detail: "Oracle analytical graph cleanup did not complete".to_owned(),
+        })
+    }
+}
+
+/// One graph's exact state in this follower's ownership map.
+///
+/// There is one entry per graph, under one mutex, holding everything the
+/// follower needs to answer both questions it is ever asked about a graph: may
+/// this message address it, and may it be released yet. Splitting the graph
+/// guard from its open-connection count is what previously let a graph be
+/// released while a coordinator could still address it.
+#[derive(Debug)]
+enum AnalyticalGraphEntry {
+    /// The graph is live and may be addressed.
+    Active {
+        /// The graph's sole follower-local owner.
+        lease: Arc<GraphLease>,
+        /// Coordinator calls currently open for the graph.
+        open_connections: usize,
+    },
+    /// The graph is settling or has failed to settle, and admits nothing new.
+    Draining {
+        /// The graph's owner, retained until settlement actually succeeds.
+        lease: Arc<GraphLease>,
+        /// Why cleanup failed, when it did. `Some` fails readiness.
+        settlement_failure: Option<String>,
+    },
+}
+
+/// One graph handed to the ingress-owned settlement driver.
+///
+/// Deliberately self-contained: the driver settles through the lease it is
+/// given, not through a map it re-reads, so a settlement in flight cannot be
+/// confused by a later entry for the same identity.
+struct GraphSettlement {
+    /// Graph whose entry the driver updates after settlement.
+    graph: AnalyticalGraphKey,
+    /// The graph's owner, settled by the driver.
+    lease: Arc<GraphLease>,
+    /// Terminal outcome the settlement is performed under.
+    outcome: AnalyticalAttemptOutcome,
+}
+
 /// Complete construction inputs for one follower [`AnalyticalStageIngress`].
 ///
 /// Naming the dependencies keeps the two shared owners — the server authority
@@ -830,14 +1242,17 @@ pub struct AnalyticalStageIngressConfig {
 /// into supervised distributed work. The ordering it enforces is the whole
 /// point of the type: nothing decodes a plan, reads the task cache, constructs
 /// a provider, or touches storage until
-/// [`OracleStageAuthority::authorize_stage`] has returned, and the headers the
-/// upstream worker resolves its runtime from are derived from the *verified*
-/// claims rather than from anything the caller supplied.
+/// [`OracleStageAuthority::authorize_stage`] has returned *and* the graph's own
+/// retained authority has authorized the message, and the headers the upstream
+/// worker resolves its runtime from are derived from the *verified* claims
+/// rather than from anything the caller supplied.
 ///
-/// The ingress owns the follower's graph and attempt guards because a graph
-/// spans several separate stage calls: it is registered on the first `SetPlan`
-/// that names it and released when the graph is torn down, not when any one
-/// call returns.
+/// The ingress owns the follower's graphs because a graph spans several
+/// separate stage calls: it is activated by whichever authorized message for it
+/// arrives first and released when the graph is torn down, not when any one call
+/// returns. Activation, reuse, and the transition to draining are all serialized
+/// on one graph mutex, which is what makes exactly-once activation and
+/// exactly-once settlement signalling the same, single decision.
 pub struct AnalyticalStageIngress {
     /// This follower's own node identity, bound as every ticket's audience.
     node_id: NodeId,
@@ -855,19 +1270,20 @@ pub struct AnalyticalStageIngress {
     exchange_buffer_bytes: usize,
     /// Upstream worker whose sessions install this node's query-owned runtimes.
     worker: Worker,
-    /// Graph ownership tokens held for as long as the coordinator may address them.
-    graphs: Mutex<HashMap<AnalyticalGraphKey, AnalyticalGraphGuard>>,
-    /// Attempt ownership tokens held for as long as their stage work may run.
-    attempts: Mutex<HashMap<AnalyticalAttemptKey, AnalyticalAttemptGuard>>,
+    /// This follower's graphs, each in exactly one state, under one mutex.
+    graphs: Mutex<HashMap<AnalyticalGraphKey, AnalyticalGraphEntry>>,
     /// Outbound capability this node's own middle stages sign through.
     egress: Arc<AnalyticalStageEgress>,
-    /// Live coordinator connections per graph, used to release follower ownership.
+    /// Bounded queue the caller-drop path hands graphs to for settlement.
     ///
-    /// A follower owns a graph for exactly as long as its coordinator is still
-    /// connected for it. Counting the open governed calls is what turns "the
-    /// leader went away" — a cancellation, an expired deadline, a consumer that
-    /// walked off, or a dead leader — into one release path instead of four.
-    connections: Mutex<HashMap<AnalyticalGraphKey, usize>>,
+    /// Cleared by shutdown, which is how the driver learns to finish. A send
+    /// that cannot be made is recorded as a cleanup failure on the graph; it is
+    /// never quietly downgraded to a spawn or a successful terminal.
+    settlement: Mutex<Option<mpsc::Sender<GraphSettlement>>>,
+    /// The one settlement driver, owned and joined by this ingress.
+    driver: Mutex<Option<JoinHandle<()>>>,
+    /// Whether this ingress still admits new stage work.
+    accepting: AtomicBool,
 }
 
 impl fmt::Debug for AnalyticalStageIngress {
@@ -876,19 +1292,32 @@ impl fmt::Debug for AnalyticalStageIngress {
         formatter
             .debug_struct("AnalyticalStageIngress")
             .field("exchange_buffer_bytes", &self.exchange_buffer_bytes)
+            .field("accepting", &self.accepting.load(Ordering::Acquire))
             .finish_non_exhaustive()
     }
 }
 
 impl AnalyticalStageIngress {
-    /// Builds the follower ingress over the supervisor's own runtime registry.
+    /// Builds the follower ingress and starts its one settlement driver.
     ///
     /// The upstream worker is constructed from [`AnalyticalSessionBuilder`] over
-    /// that exact registry, so a stage whose graph is not registered — an
-    /// invalidated attempt, a sibling graph, a forged identity — fails to build
-    /// a session rather than silently falling back to a process runtime.
+    /// the supervisor's own runtime registry, so a stage whose graph is not
+    /// registered — an invalidated attempt, a sibling graph, a forged identity —
+    /// fails to build a session rather than silently falling back to a process
+    /// runtime.
+    ///
+    /// The driver is started here and joined by [`Self::shutdown`], so no
+    /// settlement task can outlive the ingress. It holds only a
+    /// [`Weak`] reference back, so the ingress's own join handle does not form a
+    /// reference cycle that would keep the node alive forever.
+    ///
+    /// # Panics
+    ///
+    /// Never panics. Constructed outside a Tokio runtime the driver is simply
+    /// absent, and every settlement signal is then recorded as a cleanup
+    /// failure rather than silently dropped.
     #[must_use]
-    pub fn new(config: AnalyticalStageIngressConfig) -> Self {
+    pub fn new(config: AnalyticalStageIngressConfig) -> Arc<Self> {
         let AnalyticalStageIngressConfig {
             node_id,
             oracle_fence,
@@ -905,20 +1334,40 @@ impl AnalyticalStageIngress {
             leaf,
             Arc::clone(&egress),
         ));
-        Self {
-            node_id,
-            oracle_fence,
-            authority,
-            supervisor,
-            reservations,
-            spill,
-            exchange_buffer_bytes,
-            worker,
-            graphs: Mutex::new(HashMap::new()),
-            attempts: Mutex::new(HashMap::new()),
-            egress,
-            connections: Mutex::new(HashMap::new()),
-        }
+        // Sized from the one capacity root that already bounds graph
+        // admission, so the queue can always hold every graph this node is
+        // permitted to own at once and there is no second capacity setting.
+        let (sender, receiver) = mpsc::channel(reservations.max_concurrent_graphs());
+        Arc::new_cyclic(|weak: &Weak<Self>| {
+            let driver = match tokio::runtime::Handle::try_current() {
+                Ok(handle) => {
+                    let ingress = Weak::clone(weak);
+                    Some(handle.spawn(drive_graph_settlements(receiver, ingress)))
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "Oracle analytical follower ingress was built outside a runtime; \
+                         caller-drop settlement is unavailable"
+                    );
+                    None
+                }
+            };
+            Self {
+                node_id,
+                oracle_fence,
+                authority,
+                supervisor,
+                reservations,
+                spill,
+                exchange_buffer_bytes,
+                worker,
+                graphs: Mutex::new(HashMap::new()),
+                egress,
+                settlement: Mutex::new(Some(sender)),
+                driver: Mutex::new(driver),
+                accepting: AtomicBool::new(true),
+            }
+        })
     }
 
     /// Returns the upstream worker for local-worker context composition.
@@ -936,10 +1385,12 @@ impl AnalyticalStageIngress {
     ///
     /// Everything downstream depends on this returning first. Nothing decodes a
     /// plan, consults the task cache, constructs a provider, admits a resource,
-    /// or issues storage I/O until it has. On the first authorized `SetPlan`
-    /// naming a graph this admits the follower's own analytical query envelope,
-    /// builds a runtime whose disk manager is bounded by that envelope's scratch
-    /// share, registers the graph, and admits the attempt.
+    /// or issues storage I/O until both the server authority and the graph's own
+    /// retained binding have accepted the message. The first authorized message
+    /// naming a graph — `SetPlan` or `ExecuteTask`, in either order — activates
+    /// it: the reservation's envelope becomes a bounded runtime, the graph
+    /// registers with the supervisor, and only then is one lease published.
+    /// Every equivalent later or concurrent message reuses that exact lease.
     ///
     /// # Errors
     ///
@@ -947,7 +1398,8 @@ impl AnalyticalStageIngress {
     /// identity, or binding failure, [`BifrostError::QueryAuditUnavailable`]
     /// when the required refusal audit could not commit,
     /// [`BifrostError::QueryAdmissionRejected`] when this follower cannot admit
-    /// the graph's envelope.
+    /// the graph's envelope, and [`BifrostError::QueryExecutionFailed`] when the
+    /// named graph is already draining.
     #[tracing::instrument(
         name = "bifrost.oracle.analytical.stage",
         skip_all,
@@ -964,6 +1416,9 @@ impl AnalyticalStageIngress {
         framed_message: &[u8],
         now: DateTime<Utc>,
     ) -> Result<AnalyticalAttemptKey, BifrostError> {
+        if !self.accepting.load(Ordering::Acquire) {
+            return Err(BifrostError::QueryAdmissionRejected);
+        }
         let identity =
             StageWireIdentity::read(headers).map_err(|_| BifrostError::QueryPeerSecurity)?;
         let ticket = read_ticket(headers).map_err(|_| BifrostError::QueryPeerSecurity)?;
@@ -984,30 +1439,41 @@ impl AnalyticalStageIngress {
                 }
             })?;
         let key = attempt_key(&authorized)?;
-        // Recorded from the verified claims, before any admission, so a stage
-        // that this node runs in the middle of a deeper graph can sign its own
-        // outbound pulls with exactly the authority it was granted.
+        let request = graph_lease_request(&authorized, key.graph())?;
+        // Before anything is decoded, cached, resolved, or read: either this
+        // message activates the graph under one serialized transaction, or the
+        // graph's already-fixed authority accepts it unchanged.
+        let lease = self.activate_or_reuse(key.graph(), &request, &authorized, now)?;
+        // Recorded from the verified claims, after the graph accepted them, so a
+        // stage that this node runs in the middle of a deeper graph can sign its
+        // own outbound pulls with exactly the authority it was granted.
         self.egress.record(key.graph(), &authorized)?;
-        let lease = graph_lease_request(&authorized, key.graph())?;
         match operation {
             StageOperationV1::SetPlan => {
-                self.admit_graph(key.graph(), &lease, now)?;
-                self.admit_attempt(key)?;
+                lease.admit_attempt(
+                    key,
+                    AnalyticalAttemptGrant {
+                        exchange_buffer_bytes: self.exchange_buffer_bytes,
+                        // Spill attribution belongs to the graph, not the
+                        // attempt. The graph runtime's disk manager was built
+                        // from the leased envelope's exact scratch share, and
+                        // every attempt of the graph spills through it;
+                        // splitting a second per-attempt share off the same
+                        // envelope would charge the same bytes twice.
+                        scratch_bytes: 0,
+                    },
+                )?;
                 record_stage_operation(AnalyticalStageOperation::SetPlan);
             }
             StageOperationV1::ExecuteTask => {
-                // Graph admission, not attempt admission. Upstream sends its
+                // Graph activation, not attempt admission. Upstream sends its
                 // plan on a spawned coordinator-channel task and lets
                 // `Worker::execute_task` wait for that plan to arrive, so an
                 // `ExecuteTask` legitimately reaches this follower before the
                 // `SetPlan` that names the same graph. Requiring the graph to
-                // already be registered would turn upstream's documented
-                // ordering tolerance into a refusal race. The ticket has
-                // already bound this graph, tenant, fence, and reservation, so
-                // admitting the envelope here is the same authorized act
-                // `SetPlan` performs; the attempt guard still waits for
-                // `SetPlan`, which is the message that actually names one.
-                self.admit_graph(key.graph(), &lease, now)?;
+                // already exist would turn upstream's documented ordering
+                // tolerance into a refusal race; the attempt guard still waits
+                // for `SetPlan`, which is the message that actually names one.
                 record_stage_operation(AnalyticalStageOperation::ExecuteTask);
             }
         }
@@ -1015,98 +1481,206 @@ impl AnalyticalStageIngress {
         Ok(key)
     }
 
-    /// Settles one attempt and releases the graph once its last attempt drains.
+    /// Activates one graph exactly once, or reuses the lease already published.
+    ///
+    /// The graph mutex is the single serialization point, and activation is
+    /// synchronous beneath it, which is what makes "first message wins" true
+    /// regardless of arrival order: a concurrent duplicate either finds the
+    /// published lease or waits for the mutex and then finds it. Nothing is
+    /// published until the runtime, the supervisor registration, and the lease
+    /// itself have all succeeded; any failure hands the reservation back under
+    /// its own unchanged expiry, so a serialized waiter may still activate it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::QueryAdmissionRejected`] when the reservation
+    /// cannot be activated or a runtime cannot be built,
+    /// [`BifrostError::QueryPeerSecurity`] when the message does not match the
+    /// live graph's fixed authority, [`BifrostError::QueryExecutionFailed`] when
+    /// the graph is draining, and [`BifrostError::Internal`] on a poisoned lock.
+    fn activate_or_reuse(
+        &self,
+        graph: AnalyticalGraphKey,
+        request: &GraphLeaseRequest,
+        authorized: &AuthorizedStage,
+        now: DateTime<Utc>,
+    ) -> Result<Arc<GraphLease>, BifrostError> {
+        let mut graphs = self.graphs.lock().map_err(|_| poisoned_ingress())?;
+        match graphs.get(&graph) {
+            Some(AnalyticalGraphEntry::Active { lease, .. }) => {
+                if !lease.binding().matches(request) {
+                    return Err(BifrostError::QueryPeerSecurity);
+                }
+                lease.binding().authorize(authorized)?;
+                return Ok(Arc::clone(lease));
+            }
+            Some(AnalyticalGraphEntry::Draining { .. }) => {
+                return Err(BifrostError::QueryExecutionFailed);
+            }
+            None => {}
+        }
+        let activation = self
+            .reservations
+            .begin_graph_activation(request, now)
+            .map_err(|_| BifrostError::QueryAdmissionRejected)?;
+        let lease = match self.publish(graph, activation, request, authorized) {
+            Ok(lease) => lease,
+            Err((activation, error)) => {
+                activation.rollback(now);
+                return Err(error);
+            }
+        };
+        graphs.insert(
+            graph,
+            AnalyticalGraphEntry::Active {
+                lease: Arc::clone(&lease),
+                open_connections: 0,
+            },
+        );
+        Ok(lease)
+    }
+
+    /// Performs every fallible activation step and builds the graph's lease.
+    ///
+    /// Split out so the failure type carries the reservation back to the caller:
+    /// the runtime build, the retained binding, and the supervisor registration
+    /// are each recoverable, and the activation is only spent when all three
+    /// have succeeded.
+    ///
+    /// # Errors
+    ///
+    /// Returns the untouched activation with the failure that stopped it.
+    #[allow(clippy::type_complexity)]
+    fn publish(
+        &self,
+        graph: AnalyticalGraphKey,
+        activation: PendingGraphActivation,
+        request: &GraphLeaseRequest,
+        authorized: &AuthorizedStage,
+    ) -> Result<Arc<GraphLease>, (PendingGraphActivation, BifrostError)> {
+        let binding = match GraphLeaseBinding::activate(&activation, request, authorized) {
+            Ok(binding) => binding,
+            Err(error) => return Err((activation, error)),
+        };
+        if let Err(error) = binding.authorize(authorized) {
+            return Err((activation, error));
+        }
+        let envelope = activation.envelope();
+        let runtime = match self
+            .spill
+            .build_query_runtime(envelope.memory_pool(), envelope.scratch_bytes)
+        {
+            Ok(runtime) => AnalyticalGraphRuntime::new(runtime, self.exchange_buffer_bytes),
+            Err(error) => return Err((activation, error)),
+        };
+        let supervisor = Arc::clone(&self.supervisor);
+        let registered = runtime.clone();
+        let (committed, guard) = activation.commit(move |resources| {
+            supervisor.register_graph(graph, resources, registered)
+        })?;
+        Ok(Arc::new(GraphLease {
+            binding,
+            activation: committed,
+            graph,
+            supervisor: Arc::clone(&self.supervisor),
+            egress: Arc::clone(&self.egress),
+            guard: Mutex::new(Some(guard)),
+            runtime,
+            cancel: self.supervisor.root_cancellation().child_token(),
+            attempts: Mutex::new(HashMap::new()),
+            settled: AtomicBool::new(false),
+        }))
+    }
+
+    /// Settles one attempt and settles its graph once nothing else holds it.
     ///
     /// # Errors
     ///
     /// Returns [`BifrostError::Internal`] when an ownership lock is poisoned,
-    /// and the supervisor's refusal when `key` names no live attempt.
+    /// [`BifrostError::QueryExecutionFailed`] when `key` names no live graph or
+    /// attempt, and the settlement failure when the graph could not be released.
     pub async fn finish_attempt(
         &self,
         key: AnalyticalAttemptKey,
         outcome: AnalyticalAttemptOutcome,
     ) -> Result<(), BifrostError> {
-        let guard = {
-            let mut attempts = self.attempts.lock().map_err(|_| poisoned_ingress())?;
-            attempts.remove(&key)
-        };
-        match guard {
-            Some(guard) => {
-                guard.finish(outcome).await?;
+        let lease = {
+            let graphs = self.graphs.lock().map_err(|_| poisoned_ingress())?;
+            match graphs.get(&key.graph()) {
+                Some(
+                    AnalyticalGraphEntry::Active { lease, .. }
+                    | AnalyticalGraphEntry::Draining { lease, .. },
+                ) => Arc::clone(lease),
+                None => return Err(BifrostError::QueryExecutionFailed),
             }
-            None => return Err(BifrostError::QueryExecutionFailed),
-        }
-        self.release_graph_if_idle(key.graph()).await
+        };
+        lease.finish_attempt(key, outcome).await?;
+        self.settle_if_idle(key.graph(), outcome).await
     }
 
-    /// Releases one graph once no attempt and no connection still holds it.
+    /// Settles one graph inline when no attempt and no connection holds it.
     ///
-    /// Both halves matter. An attempt still admitted means work may still run;
-    /// a connection still open means the coordinator may still address the
-    /// graph, including with the retry of an attempt that just drained.
+    /// This is the normal terminal path. It uses the same explicit settlement
+    /// the caller-drop driver and shutdown use, and it removes the graph only
+    /// when that settlement actually succeeded.
     ///
     /// # Errors
     ///
-    /// Returns [`BifrostError::Internal`] when an ownership lock is poisoned,
-    /// and the supervisor's or egress owner's refusal when the release itself
-    /// fails.
-    async fn release_graph_if_idle(&self, graph: AnalyticalGraphKey) -> Result<(), BifrostError> {
-        let release = {
+    /// Returns [`BifrostError::Internal`] on a poisoned lock and the settlement
+    /// failure when cleanup did not complete.
+    async fn settle_if_idle(
+        &self,
+        graph: AnalyticalGraphKey,
+        outcome: AnalyticalAttemptOutcome,
+    ) -> Result<(), BifrostError> {
+        let lease = {
             let mut graphs = self.graphs.lock().map_err(|_| poisoned_ingress())?;
-            let attempts = self.attempts.lock().map_err(|_| poisoned_ingress())?;
-            let connections = self.connections.lock().map_err(|_| poisoned_ingress())?;
-            if attempts.keys().any(|live| live.graph() == graph) || connections.contains_key(&graph)
-            {
-                None
-            } else {
-                graphs.remove(&graph)
-            }
-        };
-        let Some(release) = release else {
-            return Ok(());
-        };
-        self.drain_graph(graph).await?;
-        release.release()?;
-        self.egress.release(graph)?;
-        // Exactly once, on every terminal path. The supervisor guard returned
-        // the envelope; this returns the reservation's running permit and the
-        // node's record that it still owed this graph anything at all.
-        self.reservations.release_graph(AnalyticalGraphRef {
-            public_query_id: graph.public_query_id.as_uuid(),
-            datafusion_query_id: graph.datafusion_query_id.as_uuid(),
-        });
-        Ok(())
-    }
-
-    /// Waits out a teardown this node started but cannot observe finishing.
-    ///
-    /// Upstream drops a follower's stage plan from its own task cache after the
-    /// coordinator channel ends, so the query envelope can still carry live
-    /// `DataFusion` reservations for a short moment after every governed call
-    /// for the graph has closed. Releasing into that moment would poison the
-    /// process governor for a teardown that is merely in progress. Waiting
-    /// keeps the poison meaning what it says: a child that outlived its owner.
-    ///
-    /// The wait is bounded. A graph that never drains is released anyway, which
-    /// surfaces the real leak instead of hiding it behind an unbounded wait.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BifrostError::Internal`] when the supervisor's ownership state
-    /// is poisoned.
-    async fn drain_graph(&self, graph: AnalyticalGraphKey) -> Result<(), BifrostError> {
-        for _ in 0..GRAPH_DRAIN_POLLS {
-            if self.supervisor.graph_children_idle(graph)? {
+            let Some(AnalyticalGraphEntry::Active {
+                lease,
+                open_connections,
+            }) = graphs.get(&graph)
+            else {
+                return Ok(());
+            };
+            if *open_connections > 0 || lease.live_attempts()? > 0 {
                 return Ok(());
             }
-            tokio::time::sleep(GRAPH_DRAIN_INTERVAL).await;
+            let lease = Arc::clone(lease);
+            graphs.insert(
+                graph,
+                AnalyticalGraphEntry::Draining {
+                    lease: Arc::clone(&lease),
+                    settlement_failure: None,
+                },
+            );
+            lease
+        };
+        let settled = lease.settle(outcome).await;
+        self.record_settlement(graph, &settled);
+        settled
+    }
+
+    /// Records what settlement did to one graph's entry.
+    ///
+    /// Success is the only thing that removes a graph. A failure keeps every
+    /// owner and stores the reason, so readiness and shutdown can both see it.
+    fn record_settlement(&self, graph: AnalyticalGraphKey, settled: &Result<(), BifrostError>) {
+        let Ok(mut graphs) = self.graphs.lock() else {
+            return;
+        };
+        match settled {
+            Ok(()) => {
+                graphs.remove(&graph);
+            }
+            Err(error) => {
+                if let Some(AnalyticalGraphEntry::Draining {
+                    settlement_failure, ..
+                }) = graphs.get_mut(&graph)
+                {
+                    *settlement_failure = Some(error.to_string());
+                }
+            }
         }
-        tracing::warn!(
-            public_query_id = %graph.public_query_id,
-            datafusion_query_id = %graph.datafusion_query_id,
-            "Oracle analytical graph did not drain before its follower release"
-        );
-        Ok(())
     }
 
     /// Retains this graph for as long as one coordinator call stays open.
@@ -1117,59 +1691,107 @@ impl AnalyticalStageIngress {
     ///
     /// # Errors
     ///
-    /// Returns [`BifrostError::Internal`] when the connection lock is poisoned.
+    /// Returns [`BifrostError::Internal`] when the graph lock is poisoned and
+    /// [`BifrostError::QueryExecutionFailed`] when the graph is not live.
     pub fn retain_connection(
         self: &Arc<Self>,
         graph: AnalyticalGraphKey,
     ) -> Result<AnalyticalConnectionLease, BifrostError> {
-        *self
-            .connections
-            .lock()
-            .map_err(|_| poisoned_ingress())?
-            .entry(graph)
-            .or_insert(0) += 1;
+        let mut graphs = self.graphs.lock().map_err(|_| poisoned_ingress())?;
+        let Some(AnalyticalGraphEntry::Active {
+            open_connections, ..
+        }) = graphs.get_mut(&graph)
+        else {
+            return Err(BifrostError::QueryExecutionFailed);
+        };
+        *open_connections += 1;
         Ok(AnalyticalConnectionLease {
             ingress: Arc::clone(self),
             graph,
         })
     }
 
-    /// Releases every attempt and the graph itself once nothing holds it.
+    /// Closes one coordinator connection and signals settlement at zero.
     ///
-    /// Called only from a dropped [`AnalyticalConnectionLease`]. Attempts are
-    /// settled `Cancelled` because a coordinator that disconnected never
-    /// reported a terminal, and treating that as success would let a partial
-    /// stage look complete.
+    /// Deliberately synchronous and non-blocking: it is called from a `Drop`.
+    /// The transition from one open connection to zero happens under the same
+    /// graph mutex activation uses, so exactly one caller ever wins it, and the
+    /// asynchronous work it implies is handed to the ingress's own driver rather
+    /// than to a detached task nothing joins.
+    ///
+    /// A queue that is full or already closed is recorded as a cleanup failure
+    /// on the retained graph. It never falls back to a spawn, to synchronous
+    /// cleanup, to a release, or to a successful terminal.
     ///
     /// # Errors
     ///
-    /// Returns [`BifrostError::Internal`] when an ownership lock is poisoned,
-    /// or the supervisor's refusal when an attempt cannot settle.
-    async fn release_connection(&self, graph: AnalyticalGraphKey) -> Result<(), BifrostError> {
-        {
-            let mut connections = self.connections.lock().map_err(|_| poisoned_ingress())?;
-            let Some(open) = connections.get_mut(&graph) else {
-                return Ok(());
-            };
-            *open = open.saturating_sub(1);
-            if *open > 0 {
-                return Ok(());
-            }
-            connections.remove(&graph);
-        }
-        let stale = {
-            let attempts = self.attempts.lock().map_err(|_| poisoned_ingress())?;
-            attempts
-                .keys()
-                .filter(|key| key.graph() == graph)
-                .copied()
-                .collect::<Vec<_>>()
+    /// Returns [`BifrostError::Internal`] when the graph lock is poisoned.
+    fn close_connection(&self, graph: AnalyticalGraphKey) -> Result<(), BifrostError> {
+        let mut graphs = self.graphs.lock().map_err(|_| poisoned_ingress())?;
+        let Some(AnalyticalGraphEntry::Active {
+            open_connections, ..
+        }) = graphs.get_mut(&graph)
+        else {
+            return Ok(());
         };
-        for key in stale {
-            self.finish_attempt(key, AnalyticalAttemptOutcome::Cancelled)
-                .await?;
+        *open_connections = open_connections.saturating_sub(1);
+        if *open_connections > 0 {
+            return Ok(());
         }
-        self.release_graph_if_idle(graph).await
+        self.begin_draining(&mut graphs, graph, AnalyticalAttemptOutcome::Cancelled);
+        Ok(())
+    }
+
+    /// Moves one live graph to draining and hands it to the settlement driver.
+    ///
+    /// Called only while the graph mutex is held, which is what makes the
+    /// transition happen exactly once: a second path arriving later observes
+    /// `Draining` and neither settles nor enqueues the graph again.
+    fn begin_draining(
+        &self,
+        graphs: &mut HashMap<AnalyticalGraphKey, AnalyticalGraphEntry>,
+        graph: AnalyticalGraphKey,
+        outcome: AnalyticalAttemptOutcome,
+    ) {
+        let Some(AnalyticalGraphEntry::Active { lease, .. }) = graphs.remove(&graph) else {
+            return;
+        };
+        let failure = self.signal_settlement(GraphSettlement {
+            graph,
+            lease: Arc::clone(&lease),
+            outcome,
+        });
+        graphs.insert(
+            graph,
+            AnalyticalGraphEntry::Draining {
+                lease,
+                settlement_failure: failure,
+            },
+        );
+    }
+
+    /// Offers one graph to the bounded settlement queue without blocking.
+    ///
+    /// Returns the cleanup failure to record when the queue cannot take it.
+    fn signal_settlement(&self, message: GraphSettlement) -> Option<String> {
+        let sender = match self.settlement.lock() {
+            Ok(settlement) => settlement.clone(),
+            Err(_) => {
+                return Some("Oracle analytical settlement queue lock is poisoned".to_owned());
+            }
+        };
+        let Some(sender) = sender else {
+            return Some("Oracle analytical settlement queue is closed".to_owned());
+        };
+        match sender.try_send(message) {
+            Ok(()) => None,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                Some("Oracle analytical settlement queue is full".to_owned())
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                Some("Oracle analytical settlement queue is closed".to_owned())
+            }
+        }
     }
 
     /// Reports what this follower still owns without releasing any of it.
@@ -1178,105 +1800,106 @@ impl AnalyticalStageIngress {
     ///
     /// Returns [`BifrostError::Internal`] when an ownership lock is poisoned.
     pub fn live(&self) -> Result<AnalyticalLiveOwnership, BifrostError> {
+        let graphs = self.graphs.lock().map_err(|_| poisoned_ingress())?;
+        let mut attempts = 0;
+        let mut cleanup_failures = 0;
+        for entry in graphs.values() {
+            match entry {
+                AnalyticalGraphEntry::Active { lease, .. } => attempts += lease.live_attempts()?,
+                AnalyticalGraphEntry::Draining {
+                    lease,
+                    settlement_failure,
+                } => {
+                    attempts += lease.live_attempts()?;
+                    if settlement_failure.is_some() {
+                        cleanup_failures += 1;
+                    }
+                }
+            }
+        }
         Ok(AnalyticalLiveOwnership {
-            attempts: self.attempts.lock().map_err(|_| poisoned_ingress())?.len(),
-            graphs: self.graphs.lock().map_err(|_| poisoned_ingress())?.len(),
+            attempts,
+            graphs: graphs.len(),
+            cleanup_failures,
         })
     }
 
-    /// Releases every graph and attempt this follower still owns.
+    /// Closes admission, settles every remaining graph, and joins the driver.
+    ///
+    /// The order matters and is the whole contract: stop admitting, move every
+    /// live graph to draining and offer it to the queue, close the queue so the
+    /// driver finishes, join the driver so no settlement outlives this call, and
+    /// only then look at what is still retained. Anything left is a cleanup
+    /// failure that stayed owned rather than being forgotten.
     ///
     /// # Errors
     ///
     /// Returns [`BifrostError::Internal`] when an ownership lock is poisoned.
     pub async fn shutdown(&self) -> Result<AnalyticalSupervisorInspection, BifrostError> {
-        {
-            let mut attempts = self.attempts.lock().map_err(|_| poisoned_ingress())?;
-            attempts.clear();
-        }
+        self.accepting.store(false, Ordering::Release);
         {
             let mut graphs = self.graphs.lock().map_err(|_| poisoned_ingress())?;
-            // Released, not merely forgotten. Dropping the supervisor guard
-            // returns the envelope, but the reservation's running permit is
-            // owned by the registry's lease, and a shutdown that clears the map
-            // without releasing it leaves this node's peer capacity charged for
-            // a graph that no longer exists.
-            for graph in graphs.keys() {
-                self.reservations.release_graph(AnalyticalGraphRef {
-                    public_query_id: graph.public_query_id.as_uuid(),
-                    datafusion_query_id: graph.datafusion_query_id.as_uuid(),
-                });
+            let live = graphs
+                .iter()
+                .filter_map(|(graph, entry)| {
+                    matches!(entry, AnalyticalGraphEntry::Active { .. }).then_some(*graph)
+                })
+                .collect::<Vec<_>>();
+            for graph in live {
+                self.begin_draining(&mut graphs, graph, AnalyticalAttemptOutcome::Cancelled);
             }
-            graphs.clear();
+        }
+        drop(
+            self.settlement
+                .lock()
+                .map_err(|_| poisoned_ingress())?
+                .take(),
+        );
+        let driver = self.driver.lock().map_err(|_| poisoned_ingress())?.take();
+        if let Some(driver) = driver
+            && let Err(error) = driver.await
+        {
+            tracing::warn!(
+                error = %error,
+                "Oracle analytical settlement driver did not join cleanly"
+            );
+        }
+        let retained = self.live()?;
+        if !retained.is_clean() {
+            tracing::warn!(
+                graphs = retained.graphs,
+                attempts = retained.attempts,
+                cleanup_failures = retained.cleanup_failures,
+                "Oracle analytical follower shutdown retains unsettled graph ownership"
+            );
         }
         self.supervisor.shutdown().await
     }
+}
 
-    /// Admits this follower's own query envelope for a graph it has not seen.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BifrostError::QueryAdmissionRejected`] when the root capability
-    /// cannot admit an analytical query envelope, [`BifrostError::Internal`] on
-    /// a poisoned ownership lock or when the graph runtime cannot be built.
-    fn admit_graph(
-        &self,
-        graph: AnalyticalGraphKey,
-        lease: &GraphLeaseRequest,
-        now: DateTime<Utc>,
-    ) -> Result<(), BifrostError> {
-        let mut graphs = self.graphs.lock().map_err(|_| poisoned_ingress())?;
-        if graphs.contains_key(&graph) {
-            return Ok(());
+/// Settles every graph the caller-drop path hands to this node, one at a time.
+///
+/// The single asynchronous owner of caller-drop settlement. It holds only a
+/// [`Weak`] back-reference, so the ingress's own join handle cannot keep the
+/// ingress alive; a settlement that completes after the node is gone simply has
+/// no entry left to update. Returning ends the driver, which is what
+/// [`AnalyticalStageIngress::shutdown`] joins.
+async fn drive_graph_settlements(
+    mut settlements: mpsc::Receiver<GraphSettlement>,
+    ingress: Weak<AnalyticalStageIngress>,
+) {
+    while let Some(message) = settlements.recv().await {
+        let settled = message.lease.settle(message.outcome).await;
+        if let Err(error) = &settled {
+            tracing::warn!(
+                error = %error,
+                public_query_id = %message.graph.public_query_id,
+                "Oracle analytical follower could not settle a closed graph"
+            );
         }
-        // Activate, never self-grant. The envelope this graph executes under is
-        // the one the leader reserved on this node; taking a second one here
-        // would mean the leader's completed fan-out guaranteed capacity that
-        // nothing on this node was actually holding.
-        let lease = self
-            .reservations
-            .lease_graph(lease, now)
-            .map_err(|_| BifrostError::QueryAdmissionRejected)?;
-        let resources = *lease
-            .take_resources()
-            .ok_or(BifrostError::QueryAdmissionRejected)?;
-        let runtime = self
-            .spill
-            .build_query_runtime(resources.memory_pool(), resources.scratch_bytes)?;
-        let guard = self.supervisor.register_graph(
-            graph,
-            resources,
-            AnalyticalGraphRuntime::new(runtime, self.exchange_buffer_bytes),
-        )?;
-        graphs.insert(graph, guard);
-        Ok(())
-    }
-
-    /// Admits one attempt of an already registered graph and retains its guard.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BifrostError::Internal`] on a poisoned ownership lock, and the
-    /// supervisor's refusal when the slot is occupied or the graph is unknown.
-    fn admit_attempt(&self, key: AnalyticalAttemptKey) -> Result<(), BifrostError> {
-        let mut attempts = self.attempts.lock().map_err(|_| poisoned_ingress())?;
-        if attempts.contains_key(&key) {
-            return Ok(());
+        if let Some(ingress) = ingress.upgrade() {
+            ingress.record_settlement(message.graph, &settled);
         }
-        let guard = self.supervisor.spawn_attempt(
-            key,
-            AnalyticalAttemptGrant {
-                exchange_buffer_bytes: self.exchange_buffer_bytes,
-                // Spill attribution belongs to the graph, not the attempt. The
-                // graph runtime's disk manager was built from the leased
-                // envelope's exact scratch share, and every attempt of the
-                // graph spills through it; splitting a second per-attempt share
-                // off the same envelope would charge the same bytes twice.
-                scratch_bytes: 0,
-            },
-        )?;
-        attempts.insert(key, guard);
-        Ok(())
     }
 }
 
@@ -1535,6 +2158,7 @@ mod tests {
     use futures_util::StreamExt;
     use futures_util::stream;
     use url::Url;
+    use wyrd_spec::DataTenantId;
 
     use super::*;
 
@@ -1985,6 +2609,475 @@ mod tests {
         );
         assert_eq!(AnalyticalAttemptNumber::ONE.retry(), None);
         assert_eq!(AnalyticalAttemptNumber::from_u8(2), None);
+    }
+
+    /// Follower source resolver that counts every provider resolution attempt.
+    ///
+    /// Refusal is the point: a stage message that is refused before consumption
+    /// must never reach a provider at all, so a nonzero count is the failure.
+    #[derive(Debug, Default)]
+    struct CountingSource {
+        /// Provider resolutions attempted under this fixture.
+        resolutions: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl super::super::follower::FollowerSourceResolver for CountingSource {
+        /// Counts the attempt and refuses without touching storage.
+        ///
+        /// # Errors
+        /// Always returns the fixture refusal.
+        async fn resolve(
+            &self,
+            _target_role: wyrd_spec::vala::api::ClusterRole,
+            _assignment: &wyrd_spec::vala::api::FollowerScanAssignment,
+            _session: &SessionState,
+        ) -> Result<super::super::follower::ResolvedFollowerSource, String> {
+            self.resolutions.fetch_add(1, Ordering::SeqCst);
+            Err("counting fixture resolver refuses every assignment".to_owned())
+        }
+    }
+
+    /// A stage authority that enforces exactly the production binding rules.
+    ///
+    /// Only signature custody is fixture-owned: the presented claims are decoded
+    /// and run through [`StageTicketClaims::verify_binding`], so a mutated
+    /// identity is refused here for the same reason the server authority would
+    /// refuse it. Fields the binding does not cover — the participant cut and the
+    /// absolute deadline — pass through verbatim, which is exactly the authority
+    /// the graph lease must retain for itself.
+    #[derive(Debug)]
+    struct VerifyingStageAuthority;
+
+    #[async_trait]
+    impl OracleStageAuthority for VerifyingStageAuthority {
+        /// Encodes the claims verbatim under a fixture key and signature.
+        ///
+        /// # Errors
+        /// Never fails; the signature is fixture-owned.
+        fn mint_stage(
+            &self,
+            _operation: StageOperationV1,
+            claims: &super::super::peer::StageTicketClaims,
+        ) -> Result<wyrd_spec::vala::api::SignedPeerTicket, PeerSecurityError> {
+            Ok(wyrd_spec::vala::api::SignedPeerTicket {
+                key_id: "fixture".to_owned(),
+                claims_bytes: prost::Message::encode_to_vec(claims),
+                signature: vec![0; 64],
+            })
+        }
+
+        /// Verifies the presented claims bind the exact received bytes.
+        ///
+        /// # Errors
+        /// Returns the production refusal for any bound-field mismatch.
+        async fn authorize_stage(
+            &self,
+            ticket: &wyrd_spec::vala::api::SignedPeerTicket,
+            binding: &super::super::peer::StageBinding,
+            body: &[u8],
+            _now: DateTime<Utc>,
+        ) -> Result<AuthorizedStage, PeerSecurityError> {
+            let claims = <super::super::peer::StageTicketClaims as prost::Message>::decode(
+                ticket.claims_bytes.as_slice(),
+            )
+            .map_err(|_| PeerSecurityError::Claims)?;
+            let digest = super::super::peer::stage_body_digest(body)?;
+            claims.verify_binding(binding, &digest)?;
+            Ok(AuthorizedStage {
+                claims,
+                tenant_id: binding.tenant_id,
+            })
+        }
+    }
+
+    /// Builds one live Oracle role owner from an injected resource observation.
+    ///
+    /// This is the production composition stage, not a stub: the returned owner
+    /// issues real admitted query envelopes whose nested children the graph
+    /// lease must return.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the injected observation cannot compose an Oracle role.
+    fn fixture_oracle_role() -> OracleResources {
+        let snapshot = crate::resources::SystemResourceSnapshot {
+            memory_limit_bytes: 4 * 1024 * 1024 * 1024,
+            effective_cpu: 8,
+            scratch_capacity_bytes: 2 * 1024 * 1024 * 1024,
+            scratch_available_bytes: 2 * 1024 * 1024 * 1024,
+            memory_source: crate::resources::ResourceSource::Injected,
+            cpu_source: crate::resources::ResourceSource::Injected,
+        };
+        let policy = crate::resources::BifrostResourcePolicy {
+            roles: [crate::resources::BifrostRole::Oracle].into_iter().collect(),
+            memory_limit_bytes: None,
+            unmanaged_reserve_bytes: None,
+            scratch_limit_bytes: None,
+            effective_cpu: None,
+            oracle_query_slot_limit: None,
+            scratch_root: std::path::PathBuf::new(),
+            volume_roots: None,
+        };
+        crate::resources::BifrostRuntimeResources::from_snapshot(snapshot, policy)
+            .expect("an injected Oracle observation composes the production root")
+            .compose_roles()
+            .expect("role composition is issued from an unpoisoned root")
+            .oracle()
+            .expect("the Oracle role is active in this policy")
+    }
+
+    /// One stage message's complete signed identity, mutable field by field.
+    ///
+    /// Every field a graph lease must retain is settable here, so a test can
+    /// substitute exactly one and assert the refusal is attributable to it.
+    #[derive(Debug, Clone)]
+    struct StageMessage {
+        /// Governed operation this message carries.
+        operation: StageOperationV1,
+        /// Presenting coordinator's node identity.
+        source_node_id: NodeId,
+        /// Presenting coordinator's role fence.
+        source_fence: u64,
+        /// Authenticated data tenant of the graph.
+        tenant_id: DataTenantId,
+        /// Two-identity graph the operation belongs to.
+        graph: AnalyticalGraphKey,
+        /// Pinned snapshot digest of the graph's cut.
+        snapshot_digest: String,
+        /// Graph-local stage ordinal.
+        stage_id: u32,
+        /// Stage-local task ordinal.
+        task_id: Option<u32>,
+        /// Attempt ordinal within the graph.
+        attempt: u32,
+        /// Reservation the graph executes under.
+        reservation_id: String,
+        /// Permission digest resolved for the query.
+        permission_digest: String,
+        /// Absolute wall-clock deadline of the whole graph.
+        absolute_deadline_ms: i64,
+        /// Immutable destination participant cut carried by the ticket.
+        participants: Vec<super::super::peer::StageParticipantV1>,
+        /// Single-use nonce, varied so two messages are never replays.
+        nonce: Vec<u8>,
+    }
+
+    /// Everything one graph-lease owner test needs to send authorized stages.
+    struct GraphFixture {
+        /// The follower ingress under test.
+        ingress: Arc<AnalyticalStageIngress>,
+        /// Reservation owner the ingress activates graph leases from.
+        reservations: Arc<ReservationRegistry>,
+        /// Node supervisor owning registered graphs and attempts.
+        supervisor: Arc<AnalyticalSupervisor>,
+        /// Provider resolutions attempted by any refused message.
+        resolutions: Arc<AtomicUsize>,
+        /// This follower's own node identity.
+        node_id: NodeId,
+        /// This follower's own role fence.
+        fence: u64,
+        /// The graph every fixture message names.
+        graph: AnalyticalGraphKey,
+        /// Tenant every fixture message is authenticated for.
+        tenant_id: DataTenantId,
+        /// The reserving leader's node identity, absent from the cut.
+        leader_node_id: NodeId,
+        /// The reserving leader's role fence.
+        leader_fence: u64,
+        /// Reservation the leader took on this follower for the graph.
+        reservation_id: ReservationId,
+        /// Immutable destination cut, which never names the leader.
+        participants: Vec<super::super::peer::StageParticipantV1>,
+        /// Absolute deadline every fixture message carries.
+        deadline_ms: i64,
+        /// Spill owner kept alive for the ingress's runtime construction.
+        _spill: Arc<OracleSpillRuntime>,
+        /// Scratch root kept alive for the spill owner.
+        _root: tempfile::TempDir,
+    }
+
+    impl GraphFixture {
+        /// Composes a follower ingress holding one live graph reservation.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the Oracle role, spill owner, or reservation cannot be
+        /// composed, which would make every assertion below vacuous.
+        fn new(now: DateTime<Utc>) -> Self {
+            let root = tempfile::tempdir().expect("fixture scratch root must exist");
+            let spill = Arc::new(
+                OracleSpillRuntime::new(root.path(), 2 * 1024 * 1024 * 1024)
+                    .expect("bounded spill owner must be created"),
+            );
+            let resolutions = Arc::new(AtomicUsize::new(0));
+            let node_id = NodeId::new(Uuid::from_u128(2));
+            let fence = 7;
+            let supervisor = Arc::new(AnalyticalSupervisor::new());
+            let reservations = Arc::new(ReservationRegistry::new(
+                Arc::new(crate::oracle::OracleSlotManager::new(4, 4)),
+                16,
+            ));
+            let ingress = Arc::new(AnalyticalStageIngress::new(AnalyticalStageIngressConfig {
+                node_id,
+                oracle_fence: fence,
+                authority: Arc::new(VerifyingStageAuthority),
+                supervisor: Arc::clone(&supervisor),
+                reservations: Arc::clone(&reservations),
+                spill: Arc::clone(&spill),
+                exchange_buffer_bytes: 64 * 1024,
+                leaf: super::super::codec::AnalyticalLeafBinding::new(
+                    wyrd_spec::vala::api::ClusterRole::Oracle,
+                    Arc::new(CountingSource {
+                        resolutions: Arc::clone(&resolutions),
+                    }),
+                    Arc::new(crate::oracle::AcceptingOracleAudit),
+                ),
+                egress: fixture_egress(),
+            }));
+            let graph = AnalyticalGraphKey::new(
+                PublicQueryId::from_uuid(Uuid::from_u128(11)),
+                DataFusionQueryId::from_uuid(Uuid::from_u128(12)),
+            );
+            let leader_node_id = NodeId::new(Uuid::from_u128(1));
+            let leader_fence = 3;
+            let deadline = now + chrono::Duration::seconds(60);
+            let resources = fixture_oracle_role()
+                .try_acquire_query(OracleResourceRequest::for_class(QueryClass::Analytical, 0.0))
+                .expect("an idle Oracle admits one analytical query");
+            let reservation = reservations
+                .reserve(
+                    &ReserveNodeSlotsRequest {
+                        query_id: QueryId::new(graph.public_query_id.as_uuid()),
+                        leader_node_id,
+                        leader_fencing_token: leader_fence,
+                        query_class: QueryClass::Analytical,
+                        slot_units: ANALYTICAL_GRAPH_SLOT_UNITS,
+                        expires_at: deadline,
+                        graph: Some(AnalyticalGraphRef {
+                            public_query_id: graph.public_query_id.as_uuid(),
+                            datafusion_query_id: graph.datafusion_query_id.as_uuid(),
+                        }),
+                    },
+                    now,
+                    Some(super::super::dispatcher::ReservedCapacity::Graph(Box::new(
+                        resources,
+                    ))),
+                )
+                .expect("an idle follower accepts one graph reservation");
+            // The cut names the middle-stage participants only. The reserving
+            // leader is deliberately absent from it, which is what makes the two
+            // source-authorization branches independently observable.
+            let participants = vec![
+                super::super::peer::StageParticipantV1 {
+                    node_id: Uuid::from_u128(2).as_bytes().to_vec(),
+                    fence: 7,
+                    address: "https://follower-a.invalid/".to_owned(),
+                    reservation_id: reservation.reservation_id.as_uuid().to_string(),
+                },
+                super::super::peer::StageParticipantV1 {
+                    node_id: Uuid::from_u128(4).as_bytes().to_vec(),
+                    fence: 9,
+                    address: "https://follower-b.invalid/".to_owned(),
+                    reservation_id: Uuid::from_u128(44).to_string(),
+                },
+            ];
+            Self {
+                ingress,
+                reservations,
+                supervisor,
+                resolutions,
+                node_id,
+                fence,
+                graph,
+                tenant_id: DataTenantId::new_v7(),
+                leader_node_id,
+                leader_fence,
+                reservation_id: reservation.reservation_id,
+                participants,
+                deadline_ms: deadline.timestamp_millis(),
+                _spill: spill,
+                _root: root,
+            }
+        }
+
+        /// Builds the message the reserving leader presents to activate the graph.
+        fn leader_message(&self, operation: StageOperationV1, nonce: u8) -> StageMessage {
+            StageMessage {
+                operation,
+                source_node_id: self.leader_node_id,
+                source_fence: self.leader_fence,
+                tenant_id: self.tenant_id,
+                graph: self.graph,
+                snapshot_digest: "fixture-snapshot".to_owned(),
+                stage_id: 0,
+                task_id: match operation {
+                    StageOperationV1::SetPlan => None,
+                    StageOperationV1::ExecuteTask => Some(0),
+                },
+                attempt: 0,
+                reservation_id: self.reservation_id.as_uuid().to_string(),
+                permission_digest: "fixture-permissions".to_owned(),
+                absolute_deadline_ms: self.deadline_ms,
+                participants: self.participants.clone(),
+                nonce: vec![nonce],
+            }
+        }
+
+        /// Sends one signed stage message through the production ingress path.
+        ///
+        /// # Errors
+        ///
+        /// Returns whatever the ingress refuses the message with.
+        async fn send(
+            &self,
+            message: &StageMessage,
+            now: DateTime<Utc>,
+        ) -> Result<AnalyticalAttemptKey, BifrostError> {
+            let identity = StageWireIdentity {
+                source_node_id: message.source_node_id,
+                source_fence: message.source_fence,
+                tenant_id: message.tenant_id,
+                graph: message.graph,
+                snapshot_digest: message.snapshot_digest.clone(),
+                stage_id: message.stage_id,
+                task_id: message.task_id,
+                attempt: message.attempt,
+                reservation_id: message.reservation_id.clone(),
+                permission_digest: message.permission_digest.clone(),
+            };
+            let mut headers = HeaderMap::new();
+            identity
+                .write(&mut headers)
+                .expect("fixture identity must encode");
+            let body = b"fixture-stage-body";
+            let binding = identity.to_binding(message.operation, self.node_id, self.fence);
+            let claims = super::super::peer::StageTicketClaims::for_binding(
+                &binding,
+                super::super::peer::stage_body_digest(body).expect("fixture body must digest"),
+                message.nonce.clone(),
+                message.absolute_deadline_ms,
+                0,
+                message.participants.clone(),
+            );
+            let ticket = VerifyingStageAuthority
+                .mint_stage(message.operation, &claims)
+                .expect("fixture ticket must mint");
+            super::super::analytical_transport::write_ticket(&mut headers, &ticket)
+                .expect("fixture ticket must encode");
+            self.ingress
+                .authorize_stage_message(message.operation, &headers, body, now)
+                .await
+        }
+    }
+
+    /// A live graph lease retains its exact reservation and first-ticket authority.
+    ///
+    /// The retained binding is the union of the reservation half — identity,
+    /// reserving leader and fence, original expiry, and envelope — and the
+    /// immutable graph half of the first verified stage ticket. Every later
+    /// message is authorized against it before anything is decoded, resolved, or
+    /// read, and neither half may be widened or replaced by a later message.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a mutated message is admitted, when a legitimate coordinator
+    /// is refused, or when a refusal reaches a provider.
+    #[tokio::test]
+    async fn graph_lease_binding_mutation_is_refused_before_io() {
+        let now = Utc::now();
+        let fixture = GraphFixture::new(now);
+
+        // The reserving leader activates the graph even though the destination
+        // cut deliberately does not name it.
+        let activate = fixture.leader_message(StageOperationV1::SetPlan, 1);
+        fixture
+            .send(&activate, now)
+            .await
+            .expect("the reserving leader activates the graph it reserved");
+        assert_eq!(
+            fixture.reservations.graph_leases_activated_total(),
+            1,
+            "one reservation became exactly one graph"
+        );
+        assert_eq!(
+            fixture.supervisor.live_graphs().expect("graphs are readable"),
+            1,
+            "activation registered the graph with the node supervisor"
+        );
+
+        // A middle-stage participant named by the immutable cut is a valid
+        // later coordinator for the same graph.
+        let mut participant = fixture.leader_message(StageOperationV1::ExecuteTask, 2);
+        participant.source_node_id = NodeId::new(Uuid::from_u128(4));
+        participant.source_fence = 9;
+        fixture
+            .send(&participant, now)
+            .await
+            .expect("a coordinator named by the immutable cut addresses the live graph");
+
+        // A source in neither authorization branch is refused, and neither
+        // branch widens the other.
+        let mut stranger = fixture.leader_message(StageOperationV1::ExecuteTask, 3);
+        stranger.source_node_id = NodeId::new(Uuid::from_u128(99));
+        stranger.source_fence = 1;
+        assert!(
+            fixture.send(&stranger, now).await.is_err(),
+            "a coordinator that is neither the reserving leader nor an exact cut \
+             participant is refused"
+        );
+        let mut restarted = fixture.leader_message(StageOperationV1::ExecuteTask, 4);
+        restarted.source_node_id = NodeId::new(Uuid::from_u128(4));
+        restarted.source_fence = 10;
+        assert!(
+            fixture.send(&restarted, now).await.is_err(),
+            "a cut participant presenting a different fence is a different \
+             incarnation and is refused"
+        );
+        let mut restarted_leader = fixture.leader_message(StageOperationV1::ExecuteTask, 5);
+        restarted_leader.source_fence = 4;
+        assert!(
+            fixture.send(&restarted_leader, now).await.is_err(),
+            "the reserving leader's authority is its exact node and fence pair"
+        );
+
+        // Every immutable field of the first ticket is retained, and mutating
+        // any one of them refuses the message.
+        let mut widened_deadline = fixture.leader_message(StageOperationV1::ExecuteTask, 6);
+        widened_deadline.absolute_deadline_ms += 60_000;
+        assert!(
+            fixture.send(&widened_deadline, now).await.is_err(),
+            "a later message may not extend the graph's absolute deadline"
+        );
+        let mut widened_cut = fixture.leader_message(StageOperationV1::ExecuteTask, 7);
+        widened_cut
+            .participants
+            .push(super::super::peer::StageParticipantV1 {
+                node_id: Uuid::from_u128(5).as_bytes().to_vec(),
+                fence: 1,
+                address: "https://intruder.invalid/".to_owned(),
+                reservation_id: Uuid::from_u128(55).to_string(),
+            });
+        assert!(
+            fixture.send(&widened_cut, now).await.is_err(),
+            "a later message may not widen the immutable participant cut"
+        );
+
+        assert_eq!(
+            fixture.reservations.graph_leases_activated_total(),
+            1,
+            "no refused message activated a second envelope"
+        );
+        assert_eq!(
+            fixture.supervisor.live_graphs().expect("graphs are readable"),
+            1,
+            "the live graph survived every refusal unchanged"
+        );
+        assert_eq!(
+            fixture.resolutions.load(Ordering::SeqCst),
+            0,
+            "no refused message reached a provider, cache, or source"
+        );
     }
 }
 

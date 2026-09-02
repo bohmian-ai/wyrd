@@ -1,12 +1,12 @@
 ---
-id: BIFROST-R3-T02-QUERY-ENVELOPE
+id: BIFROST-R4-T02-QUERY-ENVELOPE
 title: Own one bounded one-attempt Analytical envelope through joined settlement
 kind: implementation
 mode: RECONCILE
 status: proposed
 spec: SPEC-bifrost-distributed-analytics-engine
-spec_revision: 3
-depends_on: [BIFROST-R3-T01-GRAPH-LEASE]
+spec_revision: 4
+depends_on: [BIFROST-R4-T01-GRAPH-LEASE]
 requirements: [REQ-004, REQ-005, REQ-006, REQ-007, REQ-009, REQ-011]
 invariants: [INV-001, INV-002, INV-003, INV-004, INV-005, INV-006, INV-007, INV-008]
 acceptance: [AC-001, AC-004, AC-005, AC-007, AC-008]
@@ -82,7 +82,7 @@ joins channel children, and explicitly releases each accepted reservation once.
 **REFACTOR.** The resolver delegates lifecycle to the reservation owner; it does
 not grow a second map or read live membership outside the immutable cut.
 
-### Scenario 2 — One pool and runtime per participant process
+### Scenario 2 — One pool, runtime, and finite result transport per participant
 
 **Behavior.** The leader reuses its existing `AdmittedQueryGuard`; each follower
 GraphLease owns exactly one local query envelope; operators and exchanges use
@@ -94,7 +94,9 @@ Maps REQ-005, REQ-006, INV-005, INV-006, INV-007, AC-004, AC-008.
 Assert leader admission count remains one, follower count is one per graph,
 operator and exchange allocations hit the same pool identity/current/peak
 counter, distinct queries have distinct pools, and floor capacity never enters
-an Analytical grant. Assert no exchange child/prediction field remains. Exact:
+an Analytical grant. Fill the finite result channel to prove the producer
+blocks/refuses without unbounded allocation, then cancel and assert it joins.
+Assert no exchange child/prediction field remains. Exact:
 
 ```bash
 mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib --features test-support,bench-support -E 'test(=oracle::analytical::tests::analytical_graph_reuses_one_query_pool_per_process)'
@@ -106,7 +108,9 @@ cancellation token, and deadline into `AnalyticalExecutionHandle`; do not call
 its graph runtime. Remove exchange child allocation and let the pinned exchange
 consumer allocate from the installed pool. Preserve finite worker, graph,
 task/partition, result, queue, scratch, and deadline limits with checked
-arithmetic before dispatch.
+arithmetic before dispatch. Keep the existing bounded result sender inside the
+same envelope and route full/closed outcomes through terminal cancellation and
+joined settlement; no detached producer may outlive the result receiver.
 
 **REFACTOR.** `OracleQueryResources` remains the sole participant-local pool
 owner and measurement point; no wrapper may introduce another ceiling.
@@ -191,7 +195,8 @@ git diff --check
 ## Completion evidence
 
 - Resolver event trace proving reserve timing, one concurrent RPC, and release.
-- Pool/runtime identity and Interactive-floor snapshots.
+- Pool/runtime identity, finite result-transport pressure, and Interactive-floor
+  snapshots.
 - Source and telemetry proof that no automatic retry or exchange child remains.
 - Per-outcome joined owner snapshots plus readiness/shutdown residue on failure.
 

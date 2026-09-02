@@ -1,15 +1,15 @@
 ---
-id: BIFROST-R3-T07-MCP
+id: BIFROST-R4-T05-MCP
 title: Project the bounded terminal-safe query lifecycle through MCP
 kind: implementation
 mode: RECONCILE
 status: proposed
 spec: SPEC-bifrost-distributed-analytics-engine
-spec_revision: 3
-depends_on: [BIFROST-R3-T04-PRODUCTION-ACTIVATION]
-requirements: [REQ-001, REQ-008, REQ-010, REQ-011]
+spec_revision: 4
+depends_on: [BIFROST-R4-T04-PRODUCTION-ACTIVATION]
+requirements: [REQ-001, REQ-008, REQ-010]
 invariants: [INV-001, INV-002, INV-003, INV-004, INV-005, INV-008]
-acceptance: [AC-006, AC-007, AC-008]
+acceptance: [AC-006, AC-008]
 parent_task: BIFROST-R3-T3-FIRST-CLASS-PROJECTIONS
 frozen_candidate: f1ac4cb01fe9ddda0a133cb58c955bab1e1cf7df
 ---
@@ -28,10 +28,14 @@ Required execution skill: `$wyrd-implement`.
 
 ## Current-state amendment and owners
 
-Retain `wyrd-mcp`'s existing query tool, `vala-sdk` client, RBAC journey target,
+Retain `wyrd-mcp`'s existing query tool, Task 4's shared `vala-sdk` settlement,
+RBAC journey target,
 and generated tool catalog owner. Extend the current schema/result with terminal
 path and exact lifecycle cleanup. `max_rows`/`max_bytes` remain caller ceilings
 beneath server hard limits. No path/class/topology/plan field is accepted.
+All client-neutral request conversion, stream decoding, terminal/error
+validation, deadlines, cancellation, and settlement remain in `vala-sdk`; MCP
+owns only tool schema, permission binding, caller ceilings, and JSON projection.
 
 Do not add EXPLAIN, a second MCP query tool, client routing, trusted tenant
 input, successful truncation, or a separate MCP cancellation/lifecycle owner.
@@ -61,21 +65,25 @@ caller ceilings locally and build the unchanged shared `BifrostQueryRequest`.
 Never copy tenant/principal into the request. Map authorization and validation
 through canonical Wyrd errors.
 
-**REFACTOR.** Shared request validation remains Rust-owned; MCP adds only its
-agent-output ceilings.
+**REFACTOR.** Shared client request validation remains `vala-sdk`-owned; MCP
+adds only tool-schema validation, permission binding, and agent-output ceilings.
 
 ### Scenario 2 — Complete terminal or structured ceiling failure
 
 **Behavior.** Success returns all emitted rows within ceilings plus the validated
 selected path/terminal. Crossing a row/byte ceiling requests cancellation,
 drains settlement, and returns failure with no partial success. Malformed,
-missing, duplicate, or inconsistent terminal is protocol failure. Maps REQ-008,
+missing, duplicate, or inconsistent terminal is protocol failure. Every failure
+uses the canonical MCP wire fields `code`, `status`, `title`, `detail`,
+`remediation`, and `details`; the existing scrubbed SDK accessor supplies
+`details` but `safe_details` is not a second public field. Maps REQ-008,
 REQ-010, INV-003, INV-004, INV-005, AC-006.
 
 **RED.** Add
 `rbac::bifrost_query_never_reports_successful_truncation`. Exercise exact-bound,
 one-row-over, one-byte-over, malformed terminal, and cancellation failure;
-assert no successful partial payload and zero server ownership before return.
+assert no successful partial payload, exact canonical error keys with no
+`safe_details` key, and zero server ownership before return.
 Exact:
 
 ```bash
@@ -84,20 +92,25 @@ scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner &&
 
 **GREEN.** Drain the shared terminal-safe stream incrementally while checking
 rows and encoded response bytes before adding each batch. On prospective
-overflow, call the shared stream cancellation/settlement owner and await it,
+overflow, call Task 4's shared stream cancellation/settlement owner and await it
+under the original query deadline,
 then return a structured ceiling error without rows. On success, require and
-project the validated terminal/path. Do not collect beyond the configured
-response ceiling.
+project the validated terminal/path. Serialize the scrubbed value returned by
+`ValaSdkError::safe_details()` under the canonical public `details` key and
+update the generated tool catalog/schema and RBAC assertions accordingly. Do
+not collect beyond the configured response ceiling.
 
-**REFACTOR.** One settlement helper covers ceiling, protocol, transport, and
-caller cancellation; it delegates server lifecycle to `vala-sdk`.
+**REFACTOR.** `vala-sdk`'s one settlement owner covers protocol, transport, and
+caller cancellation. MCP detects its response ceiling, invokes that owner, and
+does not duplicate server lifecycle or stream policy.
 
 ### Scenario 3 — Real agent-facing path journey
 
 **Behavior.** MCP drives real Interactive and Analytical queries, one
-post-selection failure, ceiling/cancellation cleanup, structured errors,
-selected paths, production telemetry deltas, and zero retained ownership. Maps
-REQ-001, REQ-008, REQ-010, REQ-011, AC-006, AC-007, AC-008.
+post-selection failure, ceiling/cancellation cleanup, canonical structured
+errors, selected paths, original-deadline parity, and zero retained MCP/client
+state and server query ownership. Maps REQ-001, REQ-008, REQ-010, AC-006,
+AC-008.
 
 **RED.** Add
 `rbac::bifrost_query_paths_bounds_failure_cancel_and_cleanup` to the existing
@@ -131,8 +144,9 @@ git diff --check
 ## Completion evidence and stop conditions
 
 Provide runtime catalog/schema proof, closed-input negative cases, exact ceiling
-and no-truncation evidence, real MCP journey terminals/errors, and zero
-ownership/telemetry snapshots. Return `SPEC_REVISION_REQUIRED` if MCP requires
+and no-truncation evidence, real MCP journey terminals/errors, deadline parity,
+and zero MCP/client/server-query ownership snapshots. Return
+`SPEC_REVISION_REQUIRED` if MCP requires
 a divergent wire contract, path/tenant selector, successful truncation,
 client-owned durable lifecycle, new dependency/feature, or weakened permission,
 tenant, audit, or terminal semantics.

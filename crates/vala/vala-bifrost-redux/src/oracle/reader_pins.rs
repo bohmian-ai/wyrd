@@ -1147,6 +1147,26 @@ impl OracleReaderAuthority {
         self.protect(requested).await
     }
 
+    /// Protects an already-derived cut set, for tests that need exact ancestry.
+    ///
+    /// Production callers reach [`OracleReaderAuthority::protect`] through a
+    /// prepared catalog identity or a signed follower cut, both of which can
+    /// only describe lineages a real table actually has. A test that must pin
+    /// forked or deeply nested histories needs to name the cuts directly, so
+    /// this is the one seam that accepts them — and it is compiled only under
+    /// the test-support feature.
+    ///
+    /// # Errors
+    ///
+    /// Returns every failure [`OracleReaderAuthority::acquire_guard`] returns.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn acquire_guard_for_cuts(
+        self: &Arc<Self>,
+        cuts: Vec<(TableAuthorityIdentity, LocalReaderCut)>,
+    ) -> Result<(ReaderQueryGuard, ReaderIoPermit), BifrostError> {
+        self.protect(cuts.into_iter().collect()).await
+    }
+
     /// Protects one follower fragment's assigned cuts under this node's epoch.
     ///
     /// A follower never resolves its own snapshot: the leader signed exactly

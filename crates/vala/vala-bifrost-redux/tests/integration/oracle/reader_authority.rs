@@ -212,6 +212,50 @@ impl AuthorityFixture {
         .expect("audit rows read")
     }
 
+    /// Reads this epoch's durable row exactly as Postgres holds it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the read fails, which means the stored state is corrupt.
+    async fn epoch_row(
+        &self,
+    ) -> Option<vala_sql::row_types::oracle_reader_authority::OracleEpochRow> {
+        let mut conn =
+            vala_sql::TenantConn::acquire(self.database.app_pool(), DataTenantId::SYSTEM_OWNER)
+                .await
+                .expect("system connection");
+        vala_sql::queries::oracle_reader_authority::OracleReaderEpochs::new(&mut conn)
+            .expect("epochs are system owned")
+            .read(self.node_id, i64::try_from(self.fence).expect("fence fits"))
+            .await
+            .expect("epoch read")
+    }
+
+    /// Lists the epoch lifecycle audit operations this node recorded.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the audit rows cannot be read.
+    async fn epoch_audit_operations(&self) -> Vec<String> {
+        let pool = self
+            .database
+            .superuser_pool()
+            .await
+            .expect("superuser pool");
+        sqlx::query_scalar(
+            "SELECT operation FROM vala.audit_outbox \
+              WHERE data_tenant_id = $1 AND resource = $2 ORDER BY seq",
+        )
+        .bind(uuid::Uuid::from(DataTenantId::SYSTEM_OWNER))
+        .bind(format!(
+            "oracle/reader_epoch/{}/{}",
+            self.node_id, self.fence
+        ))
+        .fetch_all(&pool)
+        .await
+        .expect("audit rows read")
+    }
+
     /// Polls until one table's durable header satisfies `predicate`.
     ///
     /// # Panics
@@ -469,5 +513,148 @@ async fn process_global_authority_aggregates_and_releases_conservatively() {
             .last()
             .map(String::as_str),
         Some("oracle.table_protection.released")
+    );
+}
+
+/// Proves lease loss self-fences and retirement releases in the fixed order.
+///
+/// The ordering is the safety property: admission closes, the loss edge is
+/// audited, IO is cancelled, descendants are joined, and only then may any
+/// table be released or the epoch row deleted.
+///
+/// # Panics
+///
+/// Panics when any revision, deadline relationship, permit refusal, terminator
+/// invocation, audit sequence, or release ordering differs from the contract.
+#[tokio::test]
+async fn epoch_lifecycle_self_fences_and_retires_in_order() {
+    let fixture = AuthorityFixture::start().await;
+    let (authority, terminator) = fixture.authority(2).await;
+    let tenant = fixture.tenant().await;
+    let events = fixture.table(tenant, "events").await;
+
+    // Acquisition is revision 1 and activation is revision 2, both audited.
+    let row = fixture.epoch_row().await.expect("the epoch row exists");
+    assert_eq!(
+        row.state,
+        vala_sql::row_types::oracle_reader_authority::OracleEpochState::Active
+    );
+    assert_eq!(row.state_revision, 2);
+    assert!(row.activated_at.is_some());
+
+    // Every deadline is derived from the lease the database reported, with the
+    // fixed conservative margins between them.
+    let deadlines = authority.deadlines().await;
+    assert_eq!(
+        deadlines.join.duration_since(deadlines.admission_cutoff),
+        Duration::from_secs(4)
+    );
+    assert_eq!(
+        deadlines.no_io.duration_since(deadlines.admission_cutoff),
+        Duration::from_secs(8)
+    );
+    assert!(
+        deadlines.no_io <= tokio::time::Instant::now() + Duration::from_secs(28),
+        "the no-IO deadline keeps the unconditional database-time allowance"
+    );
+
+    // Renewal advances the revision and deliberately records nothing.
+    authority.renew().await.expect("renewal applies");
+    assert_eq!(
+        fixture
+            .epoch_row()
+            .await
+            .expect("the epoch row survives renewal")
+            .state_revision,
+        3
+    );
+    assert_eq!(
+        fixture.epoch_audit_operations().await,
+        vec![
+            "oracle.reader_epoch.acquired".to_owned(),
+            "oracle.reader_epoch.activated".to_owned(),
+        ]
+    );
+
+    // A held query may read; the same permit must refuse once the epoch is
+    // fenced, including for a read that had already begun.
+    let (guard, permit) = authority
+        .acquire_guard_for_cuts(vec![(events.clone(), cut(30, 300, &[30, 20, 10]))])
+        .await
+        .expect("admission protects");
+    permit
+        .begin_io()
+        .expect("IO is permitted under a live epoch");
+    permit
+        .expose_result()
+        .expect("results are exposable under a live epoch");
+
+    // Self-fencing with an unjoined descendant is exactly the condition the
+    // terminator exists for: this process can no longer prove it stopped
+    // reading, so it says so rather than releasing anything.
+    authority.self_fence().await;
+    assert_eq!(terminator.invocations(), 1);
+    assert!(!authority.admits());
+    assert!(
+        permit.begin_io().is_err(),
+        "a fenced epoch starts no new IO"
+    );
+    assert!(
+        permit.expose_result().is_err(),
+        "a read begun before loss cannot expose bytes after it"
+    );
+    assert!(
+        authority
+            .acquire_guard_for_cuts(vec![(events.clone(), cut(40, 400, &[40]))])
+            .await
+            .is_err(),
+        "a fenced epoch admits nothing further"
+    );
+
+    // Protection survives the fence. Only the release sequence removes it.
+    let fenced = fixture.header(&events).await.expect("protection survives");
+    assert!(fenced.frontier.covers(30));
+    let draining = fixture.epoch_row().await.expect("the epoch row survives");
+    assert_eq!(
+        draining.state,
+        vala_sql::row_types::oracle_reader_authority::OracleEpochState::Draining
+    );
+    assert_eq!(
+        fixture
+            .epoch_audit_operations()
+            .await
+            .last()
+            .map(String::as_str),
+        Some("oracle.reader_epoch.draining")
+    );
+
+    // Retirement after a self-fence owes no second loss edge; it joins the now
+    // released descendant, releases each table, invalidates, then deletes.
+    drop(guard);
+    authority
+        .retire()
+        .await
+        .expect("a fenced epoch still retires");
+    assert!(fixture.header(&events).await.is_none());
+    assert!(
+        fixture.epoch_row().await.is_none(),
+        "a retired epoch leaves no row"
+    );
+    assert_eq!(
+        fixture.audit_operations(&events).await,
+        vec![
+            "oracle.table_protection.expanded".to_owned(),
+            "oracle.table_protection.released".to_owned(),
+        ]
+    );
+    assert_eq!(
+        fixture.epoch_audit_operations().await,
+        vec![
+            "oracle.reader_epoch.acquired".to_owned(),
+            "oracle.reader_epoch.activated".to_owned(),
+            "oracle.reader_epoch.draining".to_owned(),
+            "oracle.reader_epoch.invalidated".to_owned(),
+            "oracle.reader_epoch.retired".to_owned(),
+        ]
     );
 }

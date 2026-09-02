@@ -1530,8 +1530,13 @@ impl OracleReaderAuthority {
     /// Returns [`BifrostError::Internal`] when a release, the invalidation
     /// edge, or retirement fails. Protection is retained on every failure.
     pub async fn retire(self: &Arc<Self>) -> Result<(), BifrostError> {
-        self.select_loss().await;
-        self.commit_loss_edge().await?;
+        // Only the caller that actually selected loss owes the loss edge. A
+        // retirement that follows a self-fence would otherwise try to commit
+        // `draining` a second time, find no `active` row, and fail — leaving
+        // this epoch's protection for lease expiry to reclaim.
+        if self.select_loss().await {
+            self.commit_loss_edge().await?;
+        }
         self.epoch_cancel.cancel();
         // Ordered, not incidental: descendants are joined before the narrowing
         // worker is stopped, and both happen before the first table release, so

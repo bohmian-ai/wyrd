@@ -314,3 +314,110 @@ cleanup as release, alter retry behavior, or add/change a wire field. Return
 `PLAN_BLOCKED` if the existing single driver cannot observe a newly activated
 graph without another async owner; the bounded channel and graph map provide
 that wake and inventory today, so no block is known.
+
+## Execution evidence
+
+Status: implemented. Commits `8a12e2f08`, `726fb3e92`, `4f53b3e4a` on
+`oracle-distributed`.
+
+### Command corrections
+
+Both named tests are hosted in `oracle::analytical::tests` rather than
+`oracle::tests` / `oracle::analytical_transport::tests`. `GraphFixture` — the
+only fixture that reserves a real envelope and sends authorized `SetPlan` and
+`ExecuteTask` messages through the production ingress — lives there, and it is
+private to that module. Exact commands run:
+
+```bash
+mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib --features test-support,bench-support -E 'test(=oracle::analytical::tests::analytical_cleanup_failure_fails_production_readiness)'
+mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib --features test-support,bench-support -E 'test(=oracle::analytical::tests::execute_task_first_without_set_plan_settles_at_signed_deadline)'
+mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib --features test-support,bench-support -E 'test(=oracle::analytical_transport::tests::a_graph_closes_an_exchange_its_consumer_stopped_polling)'
+```
+
+### Scenario 1 — readiness
+
+RED: the new test failed on `!handle.is_healthy()` (analytical.rs:3358) with the
+supervisor still healthy and `cleanup_failures == 1`, i.e. readiness never read
+follower cleanup state. GREEN: `AnalyticalExecutionHandle::is_healthy` now also
+requires a successful `worker.live()` whose `cleanup_failures` is zero;
+`Oracle::is_ready` adds `analytical.is_none_or(is_healthy)` to its existing
+startup and admission predicates. Both tests pass.
+
+Limitation, recorded rather than worked around: the lib lane cannot compose a
+production `Oracle`. `OracleBuildConfig` requires a `BifrostCatalog`, whose
+`new` calls `iceberg_sql::build_catalog` against a live Postgres, so no
+credential-free `--lib` test can hold an `Oracle`. The executable proof
+therefore covers the whole new predicate —
+`AnalyticalExecutionHandle::is_healthy` over the real ingress, supervisor and a
+real retained cleanup failure — and the Oracle conjunct is one line over that
+same handle. The positive half at Oracle level is asserted in the journey lane:
+`crates/wyrd/wyrd-testing/tests/bifrost/oracle/analytical_inactive.rs` now
+requires `engine.is_ready()` while a live analytical graph is held, so an
+active graph making a real Oracle unready fails that journey.
+
+### Scenario 2 — deadline settlement
+
+RED: the new test failed first on settlement-queue capacity (`left: 2`,
+`right: 4`), then — with the capacity fixed but the deadline sweep neutralised
+as a check — on the bounded wait for the target graph to settle, proving the
+deadline branch is load-bearing rather than incidentally satisfied.
+
+GREEN, in the existing owners only:
+
+- `GraphLeaseBinding::absolute_deadline_ms()` — one private accessor; the
+  signed deadline stays in the binding.
+- One closed `GraphSettlementCommand { Wake, Settle(GraphSettlement) }` on the
+  same bounded channel, now sized `2 * max_concurrent_graphs()` (saturating,
+  floored at one). No second channel and no new setting.
+- `activate_or_reuse` sends `Wake` immediately after inserting an `Active`
+  entry. A full queue is ignored — the driver has unread commands and rescans —
+  and a closed queue moves the just-published graph to `Draining` with a
+  cleanup failure and refuses the stage.
+- `expire_due_graphs(now)` performs one locked pass: it moves every `Active`
+  entry past its signed deadline to `Draining` via the new
+  `begin_draining_locked` and returns those settlements plus the next deadline.
+  The scan is linear and carries the required `ponytail:` comment naming
+  `max_concurrent_graphs()` as its ceiling.
+- `drive_graph_settlements` remains the one joined driver and now selects over
+  three arms: its queue, the earliest deadline timer, and completion of the
+  settlements it already owns in one driver-local `FuturesUnordered`. Caller-
+  drop, shutdown, and deadline settlements all enter that same set, and each
+  completion goes through the existing `record_settlement`. No task per graph,
+  no detached cleanup, no dependency added (`futures-util` was already owned).
+  A narrow private `settle_graph` free function gives the set one stable future
+  type.
+- `begin_draining_locked` replaces rather than removes the map entry, so a graph
+  that is already draining keeps every owner and recorded failure it had.
+
+The test proves: an `ExecuteTask`-first graph survives its unary request's
+completion, settles past its 400 ms signed deadline while a sibling graph's
+gated settlement is still in flight, releases its worker and supervisor
+registration, and both graphs are released with the driver joined by shutdown.
+
+### Scenario 3 — allow audit
+
+`mise run check:clippy-allow-audit` no longer names
+`crates/vala/vala-bifrost-redux/src/oracle/analytical.rs`. The aggregate result
+remains non-zero for six pre-existing violations outside this write set:
+`crates/wyrd/wyrd-testing/src/bifrost/bench_families.rs` lines 442, 1022, 1269,
+2318, 2387, 2621 (all `clippy::too_many_arguments`).
+
+### Scenario 4 — reductions
+
+`OracleQueryResources::nested_idle` now delegates to `nested_debt`, deleting the
+duplicated lock and error block. `AnalyticalGraphExchanges::streams` is a plain
+`std::sync::Mutex<Vec<ExchangeSlot>>`; per-slot `Arc` sharing, close ordering,
+poison behaviour, and graph-level `Arc` ownership are unchanged. Both named
+retained-child and stopped-consumer proofs stay green.
+
+### Broader verification
+
+- `mise run fmt` — clean.
+- `mise run lints` — clean (workspace clippy, `--all-features --all-targets`).
+- `mise run check:bifrost-resource-governance` — passed.
+- `mise run check:clippy-allow-audit` — see Scenario 3.
+- `git diff --check` — clean.
+- `mise run test:bifrost` — 964 tests run, 964 passed.
+- `mise run test:bifrost:journey:oracle` — 15 journeys run, 15 passed,
+  including `analytical_inactive::pg_inactive_analytical_retry_drains_attempt_zero_before_attempt_one`
+  carrying the new live-graph `Oracle::is_ready` assertion.

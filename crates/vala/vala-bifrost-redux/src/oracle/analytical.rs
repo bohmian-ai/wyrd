@@ -302,6 +302,14 @@ pub struct AnalyticalGraphRuntime {
     /// already has one, and every byte an exchange holds is already charged to
     /// the pool installed here.
     runtime: Arc<RuntimeEnv>,
+    /// The grant-derived session shape every descendant stage must execute in.
+    ///
+    /// A follower receives the leader's *plan*, not the leader's session, so
+    /// without this it would run that plan under `DataFusion`'s own defaults:
+    /// far larger batches than the admitted grant was sized for, held by sort
+    /// merge reservations that cannot spill. The shape is the follower's own,
+    /// derived from the envelope it admitted for this graph.
+    shape: crate::resources::OracleSessionShape,
 }
 
 impl fmt::Debug for AnalyticalGraphRuntime {
@@ -316,14 +324,23 @@ impl fmt::Debug for AnalyticalGraphRuntime {
 impl AnalyticalGraphRuntime {
     /// Names the query-owned runtime one graph installs on its descendants.
     #[must_use]
-    pub const fn new(runtime: Arc<RuntimeEnv>) -> Self {
-        Self { runtime }
+    pub const fn new(
+        runtime: Arc<RuntimeEnv>,
+        shape: crate::resources::OracleSessionShape,
+    ) -> Self {
+        Self { runtime, shape }
     }
 
     /// Returns the query-owned runtime installed on follower descendants.
     #[must_use]
     pub const fn runtime(&self) -> &Arc<RuntimeEnv> {
         &self.runtime
+    }
+
+    /// Returns the session shape every descendant stage must execute in.
+    #[must_use]
+    pub const fn shape(&self) -> &crate::resources::OracleSessionShape {
+        &self.shape
     }
 }
 
@@ -531,8 +548,9 @@ impl WorkerSessionBuilder for AnalyticalSessionBuilder {
         // too, because a leaf's assignment travels inside the plan and only
         // this codec knows how to rebuild it.
         let mut builder = ctx.builder;
-        let mut config = builder.config().clone().unwrap_or_default();
-        crate::resources::OracleSessionShape::apply(&mut config);
+        let mut config = graph
+            .shape()
+            .apply(builder.config().clone().unwrap_or_default());
         config.set_distributed_user_codec(super::codec::OraclePhysicalExtensionCodec::analytical(
             self.leaf.clone(),
         ));
@@ -1774,7 +1792,14 @@ impl AnalyticalStageIngress {
             .spill
             .build_query_runtime(envelope.memory_pool(), envelope.scratch_bytes)
         {
-            Ok(runtime) => AnalyticalGraphRuntime::new(runtime),
+            Ok(runtime) => AnalyticalGraphRuntime::new(
+                runtime,
+                crate::resources::OracleSessionShape::for_grant(
+                    envelope.granted_memory_bytes,
+                    envelope.target_partitions,
+                    envelope.target_partitions,
+                ),
+            ),
             Err(error) => return Err((Box::new(activation), error)),
         };
         let supervisor = Arc::clone(&self.supervisor);
@@ -2861,7 +2886,7 @@ impl AnalyticalGraphLifecycle {
         Ok(())
     }
 
-    /// Performs the one cleanup sequence and publishes its settlement.    /// Performs the one cleanup sequence and publishes its settlement.
+    /// Performs the one cleanup sequence and publishes its settlement.
     ///
     /// The order is the invariant, and this is the only place it exists: move
     /// the graph out of `Active` so nothing new is admitted, cancel unless the
@@ -3339,6 +3364,15 @@ fn install_graph_runtime(
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    /// One full-grant session shape for fixtures that do not vary the grant.
+    fn fixture_shape() -> crate::resources::OracleSessionShape {
+        crate::resources::OracleSessionShape::for_grant(
+            crate::resources::ORACLE_PARTITION_MEMORY_BYTES,
+            4,
+            4,
+        )
+    }
+
     use crate::resources::{OracleResourceRequest, OracleResources};
 
     use arrow::array::Int64Array;
@@ -3645,7 +3679,7 @@ mod tests {
             DataFusionQueryId::allocate(),
         );
         let query_runtime = query_owned_runtime();
-        let graph = AnalyticalGraphRuntime::new(Arc::clone(&query_runtime));
+        let graph = AnalyticalGraphRuntime::new(Arc::clone(&query_runtime), fixture_shape());
         registry
             .register(key, graph.clone())
             .expect("the authorized graph registers its query-owned material");
@@ -3745,7 +3779,7 @@ mod tests {
     #[test]
     fn analytical_graph_runtime_installation_overrides_the_process_runtime() {
         let query_runtime = query_owned_runtime();
-        let graph = AnalyticalGraphRuntime::new(Arc::clone(&query_runtime));
+        let graph = AnalyticalGraphRuntime::new(Arc::clone(&query_runtime), fixture_shape());
         let state = install_graph_runtime(
             SessionStateBuilder::new()
                 .with_default_features()
@@ -5671,6 +5705,7 @@ mod tests {
                             0,
                         )
                         .expect("an unbounded fixture runtime builds"),
+                    fixture_shape(),
                 ),
             )
             .expect("the fixture supervisor accepts one direct registration");
@@ -6771,7 +6806,11 @@ mod tests {
                 .expect("the fixture spill owner builds one query runtime");
             let graph_guard = graph
                 .supervisor
-                .register_graph(graph.graph, resources, AnalyticalGraphRuntime::new(runtime))
+                .register_graph(
+                    graph.graph,
+                    resources,
+                    AnalyticalGraphRuntime::new(runtime, fixture_shape()),
+                )
                 .map_err(|(_, error)| error)
                 .expect("an empty supervisor registers one graph");
             let signals = AnalyticalGraphLifecycle::start(
@@ -7504,7 +7543,18 @@ impl AnalyticalExecutionHandle {
             .build_query_runtime(resources.memory_pool(), resources.scratch_bytes)?;
         let graph_guard = self
             .supervisor
-            .register_graph(graph, resources, AnalyticalGraphRuntime::new(runtime))
+            .register_graph(
+                graph,
+                resources,
+                AnalyticalGraphRuntime::new(
+                    runtime,
+                    crate::resources::OracleSessionShape::for_grant(
+                        granted_memory_bytes,
+                        target_partitions,
+                        target_partitions,
+                    ),
+                ),
+            )
             .map_err(|(_, error)| error)?;
         let attempt_guard = self.supervisor.spawn_attempt(
             AnalyticalAttemptKey::new(
@@ -7920,8 +7970,14 @@ pub struct AnalyticalPhysicalEvidence {
 pub(super) struct AnalyticalGraphMetricFold {
     /// The executed physical plan whose own output sort is read after the fold.
     plan: Arc<dyn ExecutionPlan>,
-    /// The follower-metric fold itself, deliberately opaque to the graph.
-    fold: futures_util::future::BoxFuture<'static, ()>,
+    /// The follower-metric fold, yielding the metric-carrying plan it built.
+    ///
+    /// Upstream returns the executed stages' metrics by *rewriting* the plan,
+    /// not by mutating the one this process planned: a local stage is
+    /// serialized to its worker and executed as a separate instance, so the
+    /// planned nodes never see a counter. The rewritten plan is therefore the
+    /// only place the executed sort's spill counters exist.
+    fold: futures_util::future::BoxFuture<'static, Option<Arc<dyn ExecutionPlan>>>,
 }
 
 impl fmt::Debug for AnalyticalGraphMetricFold {
@@ -7942,9 +7998,7 @@ impl AnalyticalGraphMetricFold {
         let folded = Arc::clone(&plan);
         Self {
             plan,
-            fold: Box::pin(async move {
-                super::exec::record_distributed_scan_metrics(folded, sink).await;
-            }),
+            fold: Box::pin(super::exec::record_distributed_scan_metrics(folded, sink)),
         }
     }
 
@@ -7952,7 +8006,7 @@ impl AnalyticalGraphMetricFold {
     #[cfg(test)]
     pub(super) fn from_future(
         plan: Arc<dyn ExecutionPlan>,
-        fold: futures_util::future::BoxFuture<'static, ()>,
+        fold: futures_util::future::BoxFuture<'static, Option<Arc<dyn ExecutionPlan>>>,
     ) -> Self {
         Self { plan, fold }
     }
@@ -7962,8 +8016,8 @@ impl AnalyticalGraphMetricFold {
     /// The caller bounds this; nothing here imposes a second timer.
     pub(super) async fn settle(self) -> Option<AnalyticalPhysicalEvidence> {
         let Self { plan, fold } = self;
-        fold.await;
-        super::exec::output_sort_evidence(&plan)
+        let executed = fold.await.unwrap_or(plan);
+        super::exec::output_sort_evidence(&executed)
     }
 }
 

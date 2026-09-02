@@ -1025,7 +1025,10 @@ impl ProcessNode {
             sql: sql.to_owned(),
         })? {
             ControlResponse::AnalyticalBaseline(evidence) => Ok(*evidence),
-            ControlResponse::Failed { detail } => Err(ProcessClusterError::Child(detail)),
+            ControlResponse::Failed { detail } => Err(ProcessClusterError::Child(format!(
+                "{detail}; stderr tail:\n{}",
+                self.stderr_tail()
+            ))),
             other => Err(ProcessClusterError::Protocol(format!(
                 "expected analytical evidence, received {other:?}"
             ))),
@@ -1870,10 +1873,19 @@ impl BifrostProcessCluster {
 
         let tail = Arc::new(Mutex::new(StderrTail::default()));
         let drain_tail = Arc::clone(&tail);
+        // A child's own view is otherwise reachable only through the retained
+        // tail, which a journey renders solely when a control call fails. An
+        // assertion failure — the common case while diagnosing — would show
+        // nothing at all, so a diagnosing run that already asked for logs
+        // through `RUST_LOG` gets every child line on the parent's stderr.
+        let echo = std::env::var_os("RUST_LOG").is_some();
         let stderr_thread = std::thread::spawn(move || {
             let reader = BufReader::new(stderr);
             for line in reader.lines() {
                 let Ok(line) = line else { return };
+                if echo {
+                    eprintln!("[child {pid}] {line}");
+                }
                 match drain_tail.lock() {
                     Ok(mut tail) => tail.push(line),
                     Err(poisoned) => poisoned.into_inner().push(line),

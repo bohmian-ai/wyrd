@@ -1582,7 +1582,14 @@ mod tests {
         let runtime = spill
             .build_query_runtime(resources.memory_pool(), resources.scratch_bytes)
             .expect("an admitted scratch share builds a bounded query runtime");
-        AnalyticalGraphRuntime::new(runtime)
+        AnalyticalGraphRuntime::new(
+            runtime,
+            crate::resources::OracleSessionShape::for_grant(
+                resources.granted_memory_bytes,
+                resources.target_partitions,
+                resources.target_partitions,
+            ),
+        )
     }
 
     /// Names one stage-scoped attempt zero for `graph`.
@@ -1653,7 +1660,10 @@ mod tests {
         resources: OracleQueryResources,
         runtime: AnalyticalGraphRuntime,
         deadline: tokio::time::Instant,
-        fold: futures_util::future::BoxFuture<'static, ()>,
+        fold: futures_util::future::BoxFuture<
+            'static,
+            Option<Arc<dyn datafusion::physical_plan::ExecutionPlan>>,
+        >,
     ) -> super::super::analytical::AnalyticalGraphSignals {
         use super::super::analytical::{
             AnalyticalGraphLifecycle, AnalyticalGraphLifecycleOwners, AnalyticalGraphMetricFold,
@@ -1780,6 +1790,7 @@ mod tests {
                 // Released only by a companion this case never runs, so the
                 // deadline is the only thing that can end the wait.
                 never.notified().await;
+                None
             }),
         );
         expired.terminal(AnalyticalAttemptOutcome::Success);
@@ -1821,7 +1832,7 @@ mod tests {
             settled_resources,
             settled_runtime,
             tokio::time::Instant::now() + std::time::Duration::from_secs(30),
-            Box::pin(async {}),
+            Box::pin(async { None }),
         );
         settled.terminal(AnalyticalAttemptOutcome::Success);
 

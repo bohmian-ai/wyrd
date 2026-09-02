@@ -4592,16 +4592,29 @@ pub fn oracle_target_partitions(
     Ok(locality.min(memory).max(ORACLE_MIN_TARGET_PARTITIONS))
 }
 
-/// Largest `DataFusion` batch size an Oracle query at the full grant receives.
+/// Ceiling on the `DataFusion` batch size an Oracle query may receive.
 ///
-/// This is `DataFusion`'s own default. A query holding the whole grant cap has
-/// room for the throughput that larger batches buy.
+/// This is `DataFusion`'s own default, and it is a ceiling rather than the
+/// full-grant value: batches are sized from the memory *one partition* may
+/// hold, so only a single-partition query near the grant cap approaches it.
 pub const ORACLE_MAX_BATCH_SIZE: usize = 8_192;
 /// Smallest `DataFusion` batch size an Oracle query at the floor grant receives.
 ///
 /// Below this, per-batch overhead dominates and the query loses more to task
 /// bookkeeping than it saves in memory.
 pub const ORACLE_MIN_BATCH_SIZE: usize = 1_024;
+
+/// Fraction of a partition's share of the grant held back for sort merging.
+///
+/// A `SortExec` that spills reads its runs back through `ExternalSorterMerge`,
+/// whose reservation cannot spill: if the sorting partitions have already
+/// consumed the pool, the merge fails the whole query with resource exhaustion
+/// instead of completing on disk. `DataFusion`'s own default reservation is a
+/// fixed 10 MiB, which is unrelated to the grant Bifrost actually admitted, so
+/// the reservation is derived from the grant here. Half of each partition's
+/// share leaves the sort real working memory while guaranteeing every partition
+/// can merge what it spilled.
+const SORT_MERGE_RESERVATION_DIVISOR: usize = 2;
 
 /// `DataFusion` session shape derived from one admitted memory grant.
 ///
@@ -4619,15 +4632,28 @@ pub struct OracleSessionShape {
     pub batch_size: usize,
     /// Whether the optimizer may prefer a hash join for this query.
     pub prefer_hash_join: bool,
+    /// Per-partition memory a spilling sort holds back for its merge phase.
+    pub sort_spill_reservation_bytes: usize,
 }
 
 impl OracleSessionShape {
     /// Derives every session knob from one grant and the pinned cut's work.
     ///
     /// Partitions narrow to the work actually available, batch size scales
-    /// linearly with the grant between [`ORACLE_MIN_BATCH_SIZE`] and
-    /// [`ORACLE_MAX_BATCH_SIZE`], and hash joins are disabled once the grant is
-    /// near the floor.
+    /// linearly with one partition's working share of the grant between
+    /// [`ORACLE_MIN_BATCH_SIZE`] and [`ORACLE_MAX_BATCH_SIZE`], and hash joins
+    /// are disabled once the grant is near the floor.
+    ///
+    /// Batch size is derived per partition, not from the whole grant, because
+    /// the memory a batch costs is paid `target_partitions` times over and the
+    /// operators that pay it cannot spill. A spilling `SortExec` converts its
+    /// in-memory run into an unspillable merge reservation and
+    /// `SortPreservingMergeExec` buffers one batch per partition on top of it;
+    /// sizing batches from the whole grant lets those unspillable buffers
+    /// exceed the pool, which fails the query outright instead of completing on
+    /// disk. The reservation this shape holds back is excluded from the batch
+    /// budget for the same reason: it is memory the query has already promised
+    /// to the merge.
     ///
     /// The join preference is the load-bearing one. `HashJoinExec` cannot spill:
     /// it grows a reservation and returns resource exhaustion when the grant is
@@ -4643,7 +4669,10 @@ impl OracleSessionShape {
         work_units: usize,
     ) -> Self {
         let target_partitions = oracle_partitions_for_work(admitted_partitions, work_units);
-        let scaled = ORACLE_MAX_BATCH_SIZE.saturating_mul(granted_memory_bytes)
+        let partition_share = granted_memory_bytes / target_partitions.max(1);
+        let sort_spill_reservation_bytes = partition_share / SORT_MERGE_RESERVATION_DIVISOR;
+        let scaled = ORACLE_MAX_BATCH_SIZE
+            .saturating_mul(partition_share.saturating_sub(sort_spill_reservation_bytes))
             / ORACLE_PARTITION_MEMORY_BYTES.max(1);
         let batch_size = scaled.clamp(ORACLE_MIN_BATCH_SIZE, ORACLE_MAX_BATCH_SIZE);
         let prefer_hash_join =
@@ -4652,6 +4681,7 @@ impl OracleSessionShape {
             target_partitions,
             batch_size,
             prefer_hash_join,
+            sort_spill_reservation_bytes,
         }
     }
 
@@ -4661,31 +4691,39 @@ impl OracleSessionShape {
     /// cannot apply two of them and silently drop the third.
     #[must_use]
     pub fn session_config(self) -> datafusion::execution::context::SessionConfig {
-        let mut config = datafusion::execution::context::SessionConfig::new()
-            .with_target_partitions(self.target_partitions)
-            .with_batch_size(self.batch_size);
-        config.options_mut().optimizer.prefer_hash_join = self.prefer_hash_join;
-        Self::apply(&mut config);
-        config
+        self.apply(datafusion::execution::context::SessionConfig::new())
     }
 
-    /// Applies the fixed Parquet reader pushdown and indexing options every
-    /// Oracle session (leader or follower) must set identically.
+    /// Applies every grant-derived knob to a session an Oracle will execute in.
     ///
     /// A closed leaf predicate recognized by `OracleTableProvider`'s classifier
     /// only prunes files, row groups, and pages if the `DataFusion` session that
     /// actually opens the Parquet files enables pushdown, reorders filters ahead
-    /// of decoding, and consults bloom filters/page indexes. Both the leader's
-    /// query-execution session ([`Self::session_config`]) and the follower's
-    /// per-request dispatch session (`FollowerSessionFactory::create`) route
-    /// through this one function rather than setting the four options inline,
-    /// so the two paths cannot silently drift apart.
-    pub fn apply(config: &mut datafusion::execution::context::SessionConfig) {
-        let parquet_options = &mut config.options_mut().execution.parquet;
+    /// of decoding, and consults bloom filters/page indexes. The memory knobs
+    /// travel with them because a stage that reads the leader's plan under
+    /// `DataFusion`'s own defaults holds far larger batches than the grant was
+    /// sized for, and the operators that hold them cannot spill. The leader's
+    /// query-execution session ([`Self::session_config`]), the follower's
+    /// per-request dispatch session (`FollowerSessionFactory::create`), and a
+    /// distributed stage session all route through this one function rather
+    /// than setting knobs inline, so no path can silently drift onto defaults.
+    #[must_use]
+    pub fn apply(
+        &self,
+        config: datafusion::execution::context::SessionConfig,
+    ) -> datafusion::execution::context::SessionConfig {
+        let mut config = config
+            .with_target_partitions(self.target_partitions)
+            .with_batch_size(self.batch_size);
+        let options = config.options_mut();
+        options.optimizer.prefer_hash_join = self.prefer_hash_join;
+        options.execution.sort_spill_reservation_bytes = self.sort_spill_reservation_bytes;
+        let parquet_options = &mut options.execution.parquet;
         parquet_options.pushdown_filters = true;
         parquet_options.reorder_filters = true;
         parquet_options.bloom_filter_on_read = true;
         parquet_options.enable_page_index = true;
+        config
     }
 }
 
@@ -5074,8 +5112,8 @@ mod tests {
     /// use it.
     #[test]
     fn oracle_reader_session_options_contract() {
-        let mut config = datafusion::execution::context::SessionConfig::new();
-        OracleSessionShape::apply(&mut config);
+        let config = OracleSessionShape::for_grant(ORACLE_PARTITION_MEMORY_BYTES, 4, 64)
+            .apply(datafusion::execution::context::SessionConfig::new());
         let parquet_options = &config.options().execution.parquet;
         assert!(parquet_options.pushdown_filters);
         assert!(parquet_options.reorder_filters);
@@ -6789,11 +6827,21 @@ mod tests {
             floor.target_partitions < full.target_partitions,
             "a floor grant must not fan out as widely as a full grant"
         );
+        // Batch size follows one partition's share, so the comparison is made
+        // at a fixed partition count: a wider fan-out of the same grant buys
+        // parallelism by giving each partition less memory, not more.
+        let full_serial = OracleSessionShape::for_grant(ORACLE_PARTITION_MEMORY_BYTES, 1, 1);
+        let floor_serial =
+            OracleSessionShape::for_grant(ORACLE_PARTITION_WORKING_MEMORY_BYTES, 1, 1);
         assert!(
-            floor.batch_size < full.batch_size,
+            floor_serial.batch_size < full_serial.batch_size,
             "a floor grant must hold less per batch than a full grant"
         );
-        assert_eq!(full.batch_size, ORACLE_MAX_BATCH_SIZE);
+        assert!(
+            full.batch_size < full_serial.batch_size,
+            "a wider fan-out of one grant must shrink each partition's batch"
+        );
+        assert!(full_serial.batch_size <= ORACLE_MAX_BATCH_SIZE);
         assert_eq!(floor.batch_size, ORACLE_MIN_BATCH_SIZE);
 
         assert!(
@@ -6829,11 +6877,34 @@ mod tests {
         );
         assert_eq!(full_config.target_partitions(), full.target_partitions);
         assert_eq!(full_config.batch_size(), full.batch_size);
+        // Held back per partition so a spilling sort can still merge its runs:
+        // the merge reservation cannot spill, so a pool consumed entirely by
+        // the sorting partitions fails the query instead of completing on disk.
+        assert_eq!(
+            full_config.options().execution.sort_spill_reservation_bytes,
+            ORACLE_PARTITION_MEMORY_BYTES / full.target_partitions / 2
+        );
+        assert!(
+            full_config
+                .options()
+                .execution
+                .sort_spill_reservation_bytes
+                .saturating_mul(full.target_partitions)
+                < ORACLE_PARTITION_MEMORY_BYTES,
+            "the merge reservations must not consume the whole grant"
+        );
 
         let floor_config = floor.session_config();
         assert!(
             !floor_config.options().optimizer.prefer_hash_join,
             "a floor-grant session disables the one operator that cannot spill"
+        );
+        assert_eq!(
+            floor_config
+                .options()
+                .execution
+                .sort_spill_reservation_bytes,
+            floor.sort_spill_reservation_bytes
         );
         assert_eq!(floor_config.target_partitions(), floor.target_partitions);
         assert_eq!(floor_config.batch_size(), floor.batch_size);

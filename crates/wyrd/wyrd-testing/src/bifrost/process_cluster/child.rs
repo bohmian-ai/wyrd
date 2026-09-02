@@ -34,20 +34,32 @@ use crate::server::{TestBifrostPeerTls, WyrdTestServer};
 
 /// Fixed process-visible resources every simulated pod boots under.
 ///
-/// A deployment gives every pod an identical, explicitly bounded envelope, and
-/// the whole point of a physical baseline is that the grant, the partition
-/// count, and the spill threshold are the same numbers on every run. Observing
-/// the host instead would make every physical assertion a property of whichever
-/// machine ran the test.
-const POD_SYSTEM_RESOURCES: vala_bifrost_redux::resources::SystemResourceSnapshot =
+/// A deployment gives every pod an explicitly bounded envelope, and the whole
+/// point of a physical baseline is that the grant, the partition count, and the
+/// spill threshold are the same numbers on every run. Observing the host
+/// instead would make every physical assertion a property of whichever machine
+/// ran the test.
+///
+/// An Oracle pod is deliberately the tightest of the two: 512 MiB less the
+/// 256 MiB unmanaged reserve is the budget the query grant is derived from. A
+/// Scribe or Forge pod is sized to complete one table lifecycle instead, which
+/// its own boot-time capacity check refuses to do inside the Oracle envelope.
+const fn pod_system_resources(
+    target: ProcessNodeTarget,
+) -> vala_bifrost_redux::resources::SystemResourceSnapshot {
+    let memory_limit_bytes = match target {
+        ProcessNodeTarget::Oracle => 512 * 1024 * 1024,
+        _ => 2 * 1024 * 1024 * 1024,
+    };
     vala_bifrost_redux::resources::SystemResourceSnapshot {
-        memory_limit_bytes: 512 * 1024 * 1024,
+        memory_limit_bytes,
         effective_cpu: 4,
         scratch_capacity_bytes: 4 * 1024 * 1024 * 1024,
         scratch_available_bytes: 4 * 1024 * 1024 * 1024,
         memory_source: vala_bifrost_redux::resources::ResourceSource::Injected,
         cpu_source: vala_bifrost_redux::resources::ResourceSource::Injected,
-    };
+    }
+}
 
 /// How long a child waits for its own readiness before reporting failure.
 const READY_DEADLINE: Duration = Duration::from_secs(60);
@@ -87,13 +99,17 @@ pub fn run_peer_test_node() -> ExitCode {
 /// readiness is not reached within [`READY_DEADLINE`].
 async fn serve() -> Result<(), ProcessClusterError> {
     let config = ChildConfig::from_env()?;
-    // Installed before composition so the Oracle's pre-registered analytical
-    // families exist in the recorder from boot; a recorder installed later
-    // would leave a family absent until its first increment, which is
-    // indistinguishable from a counter that never moved.
-    let telemetry = crate::bifrost::shared_process_telemetry_for_test()
-        .map_err(|error| ProcessClusterError::Child(error.to_string()))?
-        .1;
+    // The recorder alone, installed before composition: the Oracle's
+    // pre-registered analytical families must exist from boot, or an absent
+    // family would be indistinguishable from a counter that never moved. The
+    // trace half of the shared installation is deliberately not taken — its
+    // formatting layer writes to stdout, which in a child is the control
+    // protocol itself.
+    let telemetry = crate::bifrost::BifrostTelemetryCapture::new(
+        wyrd_server::app::metrics::install_recorder()
+            .map_err(|error| ProcessClusterError::Child(error.to_string()))?,
+        wyrd_telemetry::TestTraceCapture::default(),
+    );
     let fingerprint = config.certificate_fingerprint()?;
     let (server, credentials, fixture) = config.start().await?;
     let report = await_ready(&server, &config, fingerprint).await?;
@@ -585,7 +601,7 @@ impl ChildConfig {
             .with_peer_bind(self.peer_bind)
             .with_bind_addrs_for_test(self.http_bind, self.grpc_bind)
             .with_durable_bifrost_roots(self.wal_root.clone(), self.spill_root.clone())
-            .with_system_resources_for_test(POD_SYSTEM_RESOURCES)
+            .with_system_resources_for_test(pod_system_resources(self.target))
             .with_oracle_peer_credentials(Arc::clone(&credentials))
             .with_storage_handle(Arc::clone(&storage))
             .start_with_resources(Arc::clone(&fixture), Arc::clone(&storage), None)
@@ -785,14 +801,31 @@ impl ChildConfig {
             sql.to_owned(),
             &mut fold,
         )
-        .await?;
+        .await
+        .map_err(|error| child(format!("baseline statement failed: {error}")))?;
 
-        let scratch_after = scratch_usage(&scratch_root)?;
-        let physical = engine
+        let supervisor = engine
             .analytical_execution()
             .ok_or_else(|| child("this target composes no Analytical handle".to_owned()))?
             .supervisor()
-            .settled_physical_evidence();
+            .clone();
+        // The terminal frame reaches this caller before the graph's own
+        // lifecycle settles, and the physical evidence is folded inside that
+        // settlement, so the statement returning is not yet proof the evidence
+        // exists. Waiting for it here — rather than asserting on whatever the
+        // race left behind — is what makes the journey's physical claims
+        // deterministic.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        let physical = loop {
+            if let Some(evidence) = supervisor.settled_physical_evidence() {
+                break Some(evidence);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break None;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        };
+        let scratch_after = scratch_usage(&scratch_root)?;
         Ok(super::AnalyticalBaselineEvidence {
             rows,
             result_digest: fold.digest(),

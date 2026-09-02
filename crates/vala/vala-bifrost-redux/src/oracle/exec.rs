@@ -990,18 +990,17 @@ pub(crate) fn is_distributed_plan(plan: &dyn ExecutionPlan) -> bool {
 pub(crate) async fn record_distributed_scan_metrics(
     plan: Arc<dyn ExecutionPlan>,
     sink: Arc<RemoteScanMetrics>,
-) {
-    let Ok(with_metrics) = datafusion_distributed::rewrite_distributed_plan_with_metrics(
+) -> Option<Arc<dyn ExecutionPlan>> {
+    let with_metrics = datafusion_distributed::rewrite_distributed_plan_with_metrics(
         plan,
         datafusion_distributed::DistributedMetricsFormat::Aggregated,
     )
     .await
-    else {
-        return;
-    };
+    .ok()?;
     let mut totals = wyrd_spec::vala::api::WorkerScanStats::default();
     fold_distributed_scan_metrics(&with_metrics, &mut totals);
     sink.record_footer(totals);
+    Some(with_metrics)
 }
 
 /// Accumulates one rewritten plan node's scan metrics, then its whole subtree.
@@ -1112,23 +1111,49 @@ struct PhysicalEvidenceWalk {
     aggregate_group_types: std::collections::BTreeSet<String>,
     /// Field names of each hash join's build-side child, in visit order.
     join_build_schemas: Vec<Vec<String>>,
+    /// Nodes already recorded, identified by address.
+    ///
+    /// A `Stage::Local` boundary and its ordinary child are the same node in a
+    /// distributed plan, so a walk that follows both edges would count one sort
+    /// or join twice and then report the plan as ambiguous.
+    seen: std::collections::HashSet<*const ()>,
 }
 
 impl PhysicalEvidenceWalk {
     /// Records `node`'s own contribution, then descends into everything it owns.
     fn visit(&mut self, node: &Arc<dyn ExecutionPlan>, schema: &Schema) {
+        if !self.seen.insert(Arc::as_ptr(node).cast::<()>()) {
+            return;
+        }
         if let Some(sort) = node.downcast_ref::<SortExec>()
             && sort.schema().fields() == schema.fields()
         {
-            let metrics = sort.metrics().unwrap_or_default();
-            let as_u64 =
-                |value: Option<usize>| u64::try_from(value.unwrap_or(0)).unwrap_or(u64::MAX);
+            // Metrics come from the visited node, never from the downcast one.
+            // The distributed metrics rewrite replaces a follower-executed node
+            // with a transparent wrapper that delegates its downcast to the
+            // original operator: the downcast succeeds, but the operator it
+            // yields never executed here and carries an empty `MetricsSet`,
+            // while the wrapper holds the counters the follower reported.
+            let metrics = node.metrics().unwrap_or_default();
+            // Typed first, then by name: a stage that executed on a follower
+            // returns its counters through the distributed metrics rewrite,
+            // which rebuilds them as plain named counts rather than the typed
+            // spill metrics the local accessors recognize. Reading only one of
+            // the two forms reports a real spill as zero.
+            let named = metrics.aggregate_by_name();
+            let spilled = |typed: Option<usize>, name: &str| -> u64 {
+                let typed = typed.and_then(|value| u64::try_from(value).ok());
+                typed
+                    .filter(|value| *value > 0)
+                    .or_else(|| sum_named_count(&named, name))
+                    .unwrap_or(0)
+            };
             self.sorts.push(OutputSortNode {
                 schema: field_names(sort.schema().as_ref()),
                 ordering: sort.expr().to_string(),
-                spill_count: as_u64(metrics.spill_count()),
-                spilled_bytes: as_u64(metrics.spilled_bytes()),
-                spilled_rows: as_u64(metrics.spilled_rows()),
+                spill_count: spilled(metrics.spill_count(), "spill_count"),
+                spilled_bytes: spilled(metrics.spilled_bytes(), "spilled_bytes"),
+                spilled_rows: spilled(metrics.spilled_rows(), "spilled_rows"),
             });
         }
         if let Some(aggregate) = node.downcast_ref::<AggregateExec>() {

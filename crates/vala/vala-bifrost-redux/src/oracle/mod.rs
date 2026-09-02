@@ -135,7 +135,9 @@ pub use query_stream::QueryStreamLifecycle;
 pub use query_stream::{
     ORACLE_IPC_FRAMING_SCRATCH_BYTES, QueryIpcDecodeError, QueryIpcDecoder, QueryIpcEncoder,
 };
-use query_stream::{QueryStreamInput, RunningQueryTerminalOwner};
+use query_stream::{
+    QueryStreamInput, ReaderProtectedQueryTerminalOwner, RunningQueryTerminalOwner,
+};
 pub use running::{RunningQueryEntry, RunningQueryRegistry, RunningQuerySettlement};
 
 /// Builds one test stream through the production telemetry terminal owner.
@@ -2521,6 +2523,7 @@ impl Oracle {
         // and must not add a Postgres round trip to every read.
         self.ensure_query_telemetry(query_telemetry, request.visibility, planned.query_class);
         let mut phases = AttemptPhaseTimer::started();
+        let reader_io_permit = planned.reader_io_permit.clone();
         let (session, mut admitted, running_query) = self
             .admit_and_lease_attempt(context, &planned, participant_cut, deadline, &mut phases)
             .await?;
@@ -2543,6 +2546,10 @@ impl Oracle {
         phases.drained();
         admitted.live_reservations = std::mem::take(&mut drained.reservations);
         let degraded_tails = drained.degraded;
+        // Protection moves out of the plan here, before the cuts do, so the
+        // guard outlives every provider built from them.
+        let reader_protection =
+            ReaderProtectedQueryTerminalOwner::new(planned.reader_pin, reader_io_permit);
         let (schema, batches, scan_stats, degraded_sources) = match self
             .execute_sql_cut(SqlCutInput {
                 context,
@@ -2571,6 +2578,7 @@ impl Oracle {
         record_degraded_live_tail(&degraded_sources, degraded_tails);
         settle_attempt_output(
             AttemptOutput {
+                reader_protection,
                 schema,
                 batches,
                 scan_stats,
@@ -3114,6 +3122,10 @@ impl Oracle {
             scan_stats,
             gate_lifecycle: None,
             running_query: None,
+            reader_protection: Some(ReaderProtectedQueryTerminalOwner::new(
+                reader_pin,
+                reader_io_permit,
+            )),
         }))
     }
 
@@ -4497,6 +4509,8 @@ struct AttemptOutput {
     admitted: AdmittedQueryGuard,
     /// Running-query terminal owner transferred into the returned stream.
     running_query: RunningQueryTerminalOwner,
+    /// Reader-epoch protection transferred into the returned stream.
+    reader_protection: ReaderProtectedQueryTerminalOwner,
 }
 
 /// Request-scoped facts settlement needs that do not come from execution.
@@ -4544,6 +4558,7 @@ async fn settle_attempt_output(
         degraded_sources,
         admitted,
         running_query,
+        reader_protection,
     } = output;
     let AttemptSettlement {
         deadline,
@@ -4625,6 +4640,7 @@ async fn settle_attempt_output(
         scan_stats,
         gate_lifecycle,
         running_query: Some(running_query),
+        reader_protection: Some(reader_protection),
     })))
 }
 

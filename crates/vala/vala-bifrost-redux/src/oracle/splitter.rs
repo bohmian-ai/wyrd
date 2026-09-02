@@ -4,20 +4,25 @@ use datafusion::physical_plan::execution_plan::{ChildrenPropertiesMode, ReplaceC
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use arrow::datatypes::{DataType, Schema};
 #[cfg(test)]
 use arrow::record_batch::RecordBatch;
+use datafusion::common::JoinType;
 use datafusion::config::ConfigOptions;
 #[cfg(test)]
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::error::DataFusionError;
+use datafusion::functions_aggregate::count::Count;
+use datafusion::functions_aggregate::min_max::{Max, Min};
+use datafusion::functions_aggregate::sum::Sum;
+use datafusion::physical_expr::aggregate::AggregateFunctionExpr;
 use datafusion::physical_expr::{PhysicalExpr, expressions::Column as PhysicalColumn};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::ExecutionPlanProperties;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
-#[cfg(test)]
-use datafusion::physical_plan::limit::GlobalLimitExec;
+use datafusion::physical_plan::joins::HashJoinExec;
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
@@ -159,7 +164,7 @@ fn split_physical_plan_with_context(
     source_groups: &HashMap<String, String>,
     selected_participants: usize,
 ) -> Result<SplitPhysicalPlan, DataFusionError> {
-    validate_supported(plan.as_ref())?;
+    validate_supported(plan.as_ref(), source_groups)?;
     let mut followers = Vec::new();
     let source_count = collect_source_scan_ids(plan.as_ref()).len();
     if selected_participants == 1 && source_count <= 1 && source_count == 1 {
@@ -581,27 +586,246 @@ fn collect_closures(
     }
 }
 
-/// Rejects operators whose distributed semantics are not approved for this splitter.
-fn validate_supported(plan: &dyn ExecutionPlan) -> Result<(), DataFusionError> {
+/// Rejects any physical shape outside the closed v1 Analytical matrix.
+///
+/// This is the synchronous, pure predicate Oracle closes *before* any IO or
+/// participant reservation: an unsupported plan must cost nothing on a
+/// follower. The accepted matrix is written directly here as downcasts and
+/// matches rather than as a node registry or capability table, because the
+/// matrix is closed — every addition is a deliberate semantic decision, not a
+/// registration.
+///
+/// `source_groups` maps every authenticated source scan id to its canonical
+/// table, which is what proves a provider-local union reads exactly one table.
+///
+/// # Errors
+///
+/// Returns a plan error for any operator, aggregate mode or function, join
+/// form, union placement, leaf, or ordering outside the matrix.
+pub(super) fn validate_supported(
+    plan: &dyn ExecutionPlan,
+    source_groups: &HashMap<String, String>,
+) -> Result<(), DataFusionError> {
+    validate_node(plan, source_groups, None)
+}
+
+/// Judges one node against the matrix, then recurses carrying this node's kind.
+///
+/// Only the *immediate* parent kind travels down, which is exactly what the
+/// union rule needs: a [`UnionExec`] is a provider-local source union when its
+/// direct parent is the tenant tripwire, and a user set operation otherwise.
+///
+/// # Errors
+///
+/// Returns a plan error for any node outside the matrix.
+fn validate_node(
+    plan: &dyn ExecutionPlan,
+    source_groups: &HashMap<String, String>,
+    parent: Option<&str>,
+) -> Result<(), DataFusionError> {
     let name = plan.name();
-    if (name.contains("Join") && name != "HashJoinExec") || name.contains("Window") {
-        return Err(DataFusionError::Plan(format!(
-            "unsupported distributed Oracle operator: {name}"
-        )));
-    }
-    if name.ends_with("Exec")
-        && plan.children().is_empty()
-        && !matches!(
-            name,
-            "RemoteSourcePlaceholderExec" | "EmptyExec" | "DataSourceExec" | "MemorySourceConfig"
-        )
-    {
-        return Err(DataFusionError::Plan(format!(
-            "unsupported distributed Oracle leaf: {name}"
-        )));
+    match name {
+        // Scan chains and pass-through shaping.
+        "DataSourceExec"
+        | "RemoteSourcePlaceholderExec"
+        | "MemorySourceConfig"
+        | "EmptyExec"
+        | "FilterExec"
+        | "ProjectionExec"
+        | "TenantTripwireExec"
+        // Distributed fan-out and fan-in.
+        | "RepartitionExec"
+        | "CoalescePartitionsExec"
+        | "SortPreservingMergeExec" => {}
+        "AggregateExec" => validate_aggregate(plan)?,
+        "HashJoinExec" => validate_hash_join(plan)?,
+        "UnionExec" => validate_union(plan, source_groups, parent)?,
+        "SortExec" => {
+            let sort = plan
+                .downcast_ref::<SortExec>()
+                .ok_or_else(|| unsupported("SortExec is not the pinned implementation"))?;
+            // A fetch makes the sort a top-N, whose partial results are not
+            // combinable across participants without a leader-side merge this
+            // matrix does not accept.
+            if sort.fetch().is_some() {
+                return Err(unsupported("SortExec with a fetch"));
+            }
+        }
+        other => {
+            return Err(DataFusionError::Plan(format!(
+                "unsupported distributed Oracle operator: {other}"
+            )));
+        }
     }
     for child in plan.children() {
-        validate_supported(child.as_ref())?;
+        validate_node(child.as_ref(), source_groups, Some(name))?;
+    }
+    Ok(())
+}
+
+/// Names one closed-matrix refusal with a stable prefix.
+fn unsupported(detail: &str) -> DataFusionError {
+    DataFusionError::Plan(format!("unsupported distributed Oracle plan: {detail}"))
+}
+
+/// Accepts only the distributable aggregate modes and the pinned aggregates.
+///
+/// # Errors
+///
+/// Returns a plan error for a non-distributable mode, an aggregate `FILTER`, or
+/// any aggregate expression outside [`validate_aggregate_expr`].
+fn validate_aggregate(plan: &dyn ExecutionPlan) -> Result<(), DataFusionError> {
+    let aggregate = plan
+        .downcast_ref::<AggregateExec>()
+        .ok_or_else(|| unsupported("AggregateExec is not the pinned implementation"))?;
+    if !matches!(
+        aggregate.mode(),
+        AggregateMode::Partial | AggregateMode::PartialReduce | AggregateMode::FinalPartitioned
+    ) {
+        return Err(unsupported(
+            "aggregate mode outside Partial/PartialReduce/FinalPartitioned",
+        ));
+    }
+    if aggregate.filter_expr().iter().any(Option::is_some) {
+        return Err(unsupported("aggregate FILTER"));
+    }
+    // Argument types resolve against the real input schema only in `Partial`
+    // mode; the later modes consume accumulator state, so their inputs are
+    // state columns. Every distributed aggregate carries a `Partial` layer, so
+    // checking arguments there closes the argument matrix for the whole plan.
+    let argument_schema =
+        matches!(aggregate.mode(), AggregateMode::Partial).then(|| aggregate.input_schema());
+    for expression in aggregate.aggr_expr() {
+        validate_aggregate_expr(expression, argument_schema.as_deref())?;
+    }
+    Ok(())
+}
+
+/// Accepts one pinned, non-distinct, order-insensitive `Int64` aggregate.
+///
+/// The pinned implementation is proven by downcasting the function's inner
+/// implementation, never by its reported name: a user aggregate may call itself
+/// `sum` while producing a different accumulator state, and combining that
+/// state across participants would silently return a wrong answer.
+///
+/// # Errors
+///
+/// Returns a plan error for a distinct or ordered aggregate, an unpinned
+/// implementation, an argument count or type outside the matrix, or a state or
+/// result field whose type or nullability differs from the pinned tuple.
+fn validate_aggregate_expr(
+    expression: &AggregateFunctionExpr,
+    argument_schema: Option<&Schema>,
+) -> Result<(), DataFusionError> {
+    if expression.is_distinct() {
+        return Err(unsupported("distinct aggregate"));
+    }
+    if !expression.order_bys().is_empty() {
+        return Err(unsupported("order-sensitive aggregate"));
+    }
+    let implementation: &dyn std::any::Any = expression.fun().inner().as_ref();
+    // `COUNT` is the only pinned aggregate whose accumulator state and result
+    // are non-null: an empty input still counts zero rows, while an empty
+    // `SUM`, `MIN`, or `MAX` has no value.
+    let nullable = if implementation.is::<Count>() {
+        false
+    } else if implementation.is::<Sum>() || implementation.is::<Min>() || implementation.is::<Max>()
+    {
+        true
+    } else {
+        return Err(unsupported(
+            "aggregate outside the pinned COUNT/SUM/MIN/MAX set",
+        ));
+    };
+    let arguments = expression.expressions();
+    if arguments.len() != 1 {
+        return Err(unsupported("aggregate with more than one argument"));
+    }
+    if let Some(schema) = argument_schema
+        && arguments[0].data_type(schema)? != DataType::Int64
+    {
+        return Err(unsupported("aggregate argument is not Int64"));
+    }
+    let states = expression.state_fields()?;
+    if states.len() != 1
+        || states[0].data_type() != &DataType::Int64
+        || states[0].is_nullable() != nullable
+    {
+        return Err(unsupported(
+            "aggregate accumulator state is not the pinned Int64 tuple",
+        ));
+    }
+    let result = expression.field();
+    if result.data_type() != &DataType::Int64 || result.is_nullable() != nullable {
+        return Err(unsupported(
+            "aggregate result is not the pinned Int64 tuple",
+        ));
+    }
+    Ok(())
+}
+
+/// Accepts only an inner hash join over column-to-column equi-keys.
+///
+/// # Errors
+///
+/// Returns a plan error for any other join type, an empty or expression
+/// equi-key, or a join filter.
+fn validate_hash_join(plan: &dyn ExecutionPlan) -> Result<(), DataFusionError> {
+    let join = plan
+        .downcast_ref::<HashJoinExec>()
+        .ok_or_else(|| unsupported("HashJoinExec is not the pinned implementation"))?;
+    if !matches!(join.join_type(), JoinType::Inner) {
+        return Err(unsupported("join type outside Inner"));
+    }
+    if join.filter().is_some() {
+        return Err(unsupported("join filter"));
+    }
+    let keys = join.on();
+    if keys.is_empty() {
+        return Err(unsupported("join without an equi-key"));
+    }
+    if keys.iter().any(|(left, right)| {
+        left.downcast_ref::<PhysicalColumn>().is_none()
+            || right.downcast_ref::<PhysicalColumn>().is_none()
+    }) {
+        return Err(unsupported("join equi-key that is not column-to-column"));
+    }
+    Ok(())
+}
+
+/// Accepts a union only as the provider-local source union of one tripwire.
+///
+/// A SQL set operation and a provider's own hot/cold source union are the same
+/// physical node, so placement is the only thing that separates them: the
+/// provider builds its union directly beneath the tenant tripwire, and every
+/// leaf beneath it is an authenticated source of the same canonical table.
+///
+/// # Errors
+///
+/// Returns a plan error when the union's direct parent is not the tripwire,
+/// when it carries no authenticated source id, when a source id is not in
+/// `source_groups`, or when its sources span more than one canonical table.
+fn validate_union(
+    plan: &dyn ExecutionPlan,
+    source_groups: &HashMap<String, String>,
+    parent: Option<&str>,
+) -> Result<(), DataFusionError> {
+    if parent != Some("TenantTripwireExec") {
+        return Err(unsupported("union outside a provider-local source union"));
+    }
+    let sources = collect_source_scan_ids(plan);
+    if sources.is_empty() {
+        return Err(unsupported("union without an authenticated source"));
+    }
+    let mut tables = HashSet::new();
+    for scan_id in &sources {
+        let table = source_groups
+            .get(scan_id)
+            .ok_or_else(|| unsupported("union source is not an authenticated scan"))?;
+        tables.insert(table.as_str());
+    }
+    if tables.len() != 1 {
+        return Err(unsupported("union spanning more than one canonical table"));
     }
     Ok(())
 }
@@ -828,7 +1052,7 @@ mod tests {
         let plan = session
             .sql(
                 "SELECT value, COUNT(*) AS total FROM events \
-                 GROUP BY value ORDER BY total DESC LIMIT 1",
+                 GROUP BY value ORDER BY total DESC",
             )
             .await
             .expect("aggregate query plans")
@@ -846,10 +1070,6 @@ mod tests {
                 .indent(true)
                 .to_string();
         assert!(
-            leader_shape.contains("fetch=1"),
-            "leader plan:\n{leader_shape}"
-        );
-        assert!(
             leader_shape.contains("SortPreservingMergeExec"),
             "leader plan:\n{leader_shape}"
         );
@@ -863,10 +1083,6 @@ mod tests {
         // finished answer and the leader would concatenate rather than merge
         // them, so an aggregate would report one participant's value instead of
         // the total.
-        assert!(
-            !follower_shape.contains("GlobalLimitExec"),
-            "follower plan:\n{follower_shape}"
-        );
         assert!(
             !follower_shape.contains("SortPreservingMergeExec"),
             "follower plan:\n{follower_shape}"
@@ -918,6 +1134,8 @@ mod tests {
     /// A final operator without a lower exchange uses the pinned whole-plan fallback.
     #[test]
     fn distributed_split_wraps_final_plan_at_top() {
+        use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
+
         let schema = Arc::new(Schema::new(vec![Field::new(
             "value",
             DataType::Utf8,
@@ -928,11 +1146,15 @@ mod tests {
             assignment_schema_fingerprint(schema.as_ref()),
             schema,
         ));
-        let plan = Arc::new(GlobalLimitExec::new(remote, 0, Some(1)));
+        let ordering = LexOrdering::new(vec![PhysicalSortExpr::new_default(Arc::new(
+            PhysicalColumn::new("value", 0),
+        ))])
+        .expect("fixture ordering is non-empty");
+        let plan = Arc::new(SortExec::new(ordering, remote));
         let groups = HashMap::from([("scan".to_owned(), "events".to_owned())]);
         let split = split_physical_plan(plan, &groups).expect("whole-plan fallback");
         assert_eq!(split.followers.len(), 1);
-        assert!(split.followers[0].plan.is::<GlobalLimitExec>());
+        assert!(split.followers[0].plan.is::<SortExec>());
         assert!(split.leader.is::<RemoteSourcePlaceholderExec>());
     }
 }

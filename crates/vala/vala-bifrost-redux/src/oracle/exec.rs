@@ -6496,4 +6496,510 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(durations, vec![41_i64]);
     }
+
+    /// Fixture schema carrying one column per accepted and rejected aggregate
+    /// argument type, plus the hidden tenant column every tripwire consumes.
+    ///
+    /// Sharing one schema across the whole matrix keeps each negative case a
+    /// single semantic mutation of an otherwise accepted tree.
+    fn matrix_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("amount", DataType::Int64, true),
+            Field::new("label", DataType::Utf8, true),
+            Field::new("code", DataType::UInt64, true),
+            Field::new(
+                "stamp",
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+                true,
+            ),
+            Field::new("ratio", DataType::Float64, true),
+            Field::new(DATA_TENANT_ID, DataType::Utf8, false),
+        ]))
+    }
+
+    /// Builds one authenticated remote source placeholder over [`matrix_schema`].
+    fn matrix_source(scan_id: &str) -> Arc<dyn ExecutionPlan> {
+        let schema = matrix_schema();
+        Arc::new(
+            super::super::codec::RemoteSourcePlaceholderExec::new(
+                scan_id.to_owned(),
+                super::super::assignment_schema_fingerprint(schema.as_ref()),
+                schema,
+            )
+            .with_partitions(2),
+        )
+    }
+
+    /// Maps both fixture scan ids onto one canonical table.
+    fn matrix_groups() -> HashMap<String, String> {
+        HashMap::from([
+            ("cold-0".to_owned(), "vala.traces.spans".to_owned()),
+            ("hot-0".to_owned(), "vala.traces.spans".to_owned()),
+        ])
+    }
+
+    /// Borrows one fixture column as a physical expression.
+    fn matrix_column(name: &str, index: usize) -> Arc<dyn datafusion::physical_expr::PhysicalExpr> {
+        Arc::new(datafusion::physical_expr::expressions::Column::new(
+            name, index,
+        ))
+    }
+
+    /// Builds the one fixture predicate every filter and join filter reuses.
+    fn matrix_predicate() -> Arc<dyn datafusion::physical_expr::PhysicalExpr> {
+        datafusion::physical_expr::expressions::binary(
+            matrix_column("id", 0),
+            datafusion::logical_expr::Operator::Gt,
+            datafusion::physical_expr::expressions::lit(0_i64),
+            matrix_schema().as_ref(),
+        )
+        .expect("fixture predicate builds")
+    }
+
+    /// Builds one hash join between two fixture sources.
+    fn matrix_hash_join(
+        on: Vec<(
+            Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+            Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+        )>,
+        filter: Option<datafusion::physical_plan::joins::utils::JoinFilter>,
+        join_type: datafusion::common::JoinType,
+    ) -> Arc<dyn ExecutionPlan> {
+        Arc::new(
+            datafusion::physical_plan::joins::HashJoinExec::try_new(
+                matrix_source("cold-0"),
+                matrix_source("hot-0"),
+                on,
+                filter,
+                &join_type,
+                None,
+                datafusion::physical_plan::joins::PartitionMode::Partitioned,
+                datafusion::common::NullEquality::NullEqualsNothing,
+                false,
+            )
+            .expect("fixture hash join builds"),
+        )
+    }
+
+    /// Builds one physical aggregate expression over the fixture schema.
+    fn matrix_aggregate_expr(
+        udaf: Arc<datafusion::logical_expr::AggregateUDF>,
+        argument: Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+        alias: &str,
+        distinct: bool,
+    ) -> Arc<datafusion::physical_expr::aggregate::AggregateFunctionExpr> {
+        Arc::new(
+            datafusion::physical_expr::aggregate::AggregateExprBuilder::new(udaf, vec![argument])
+                .schema(matrix_schema())
+                .alias(alias.to_owned())
+                .with_distinct(distinct)
+                .build()
+                .expect("fixture aggregate builds"),
+        )
+    }
+
+    /// Wraps one aggregate expression in an `AggregateExec` of the given mode.
+    fn matrix_aggregate(
+        mode: datafusion::physical_plan::aggregates::AggregateMode,
+        aggregate: Arc<datafusion::physical_expr::aggregate::AggregateFunctionExpr>,
+        filter: Option<Arc<dyn datafusion::physical_expr::PhysicalExpr>>,
+    ) -> Arc<dyn ExecutionPlan> {
+        use datafusion::physical_plan::aggregates::{AggregateExec, PhysicalGroupBy};
+
+        Arc::new(
+            AggregateExec::try_new(
+                mode,
+                PhysicalGroupBy::new_single(Vec::new()),
+                vec![aggregate],
+                vec![filter],
+                matrix_source("cold-0"),
+                matrix_schema(),
+            )
+            .expect("fixture aggregate plan builds"),
+        )
+    }
+
+    /// Builds one authenticated context for a fixture tripwire.
+    fn matrix_context() -> AuthorizedQueryContext {
+        let tenant = wyrd_spec::DataTenantId::new_v7();
+        let principal = Principal {
+            id: PrincipalId::new(uuid::Uuid::now_v7()),
+            kind: wyrd_runtime::PrincipalKind::User,
+            tenant_id: tenant,
+            roles: Vec::new(),
+            effective_permissions: PermissionSet::default(),
+        };
+        AuthorizedQueryContext::try_new(
+            principal,
+            tenant,
+            RequestId::now_v7(),
+            None,
+            AuthMethod::Internal,
+            "bifrost_query:read",
+        )
+        .expect("fixture query context")
+    }
+
+    /// Wraps `input` in one tripwire bound to the canonical fixture table.
+    fn matrix_tripwire(input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+        Arc::new(
+            TenantTripwireExec::new(
+                input,
+                matrix_context(),
+                "vala.traces.spans".to_owned(),
+                Arc::new(NoopAudit),
+            )
+            .expect("fixture tripwire plan"),
+        )
+    }
+
+    /// Aggregate that impersonates `SUM` by name while its accumulator state and
+    /// result are `UInt64`.
+    ///
+    /// It exists to prove the predicate downcasts to the pinned built-in
+    /// implementation instead of trusting the reported function name.
+    #[derive(Debug, PartialEq, Eq, Hash)]
+    struct ImpostorSum {
+        /// Exact one-argument `Int64` signature matching the accepted `SUM`.
+        signature: datafusion::logical_expr::Signature,
+    }
+
+    impl ImpostorSum {
+        /// Creates the impostor over the same argument type as the accepted `SUM`.
+        fn new() -> Self {
+            Self {
+                signature: datafusion::logical_expr::Signature::exact(
+                    vec![DataType::Int64],
+                    datafusion::logical_expr::Volatility::Immutable,
+                ),
+            }
+        }
+    }
+
+    impl datafusion::logical_expr::AggregateUDFImpl for ImpostorSum {
+        /// Reports the pinned built-in's name without being that implementation.
+        fn name(&self) -> &'static str {
+            "sum"
+        }
+
+        /// Returns the exact `Int64` signature of the accepted aggregate.
+        fn signature(&self) -> &datafusion::logical_expr::Signature {
+            &self.signature
+        }
+
+        /// Returns the unaccepted `UInt64` result type.
+        fn return_type(&self, _args: &[DataType]) -> DataFusionResult<DataType> {
+            Ok(DataType::UInt64)
+        }
+
+        /// Never runs: the predicate rejects this aggregate before execution.
+        fn accumulator(
+            &self,
+            _args: datafusion::logical_expr::function::AccumulatorArgs,
+        ) -> DataFusionResult<Box<dyn datafusion::logical_expr::Accumulator>> {
+            Err(DataFusionError::Internal(
+                "impostor aggregate is never executed".to_owned(),
+            ))
+        }
+    }
+
+    /// Proves the accepted scan chain, fan-out, fan-in, and ordering rows.
+    fn assert_scan_and_exchange_matrix() {
+        use datafusion::physical_expr::expressions::Column as PhysicalColumn;
+        use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+        use datafusion::physical_plan::empty::EmptyExec;
+        use datafusion::physical_plan::filter::FilterExec;
+        use datafusion::physical_plan::repartition::RepartitionExec;
+        use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
+        use datafusion::physical_plan::{Partitioning, projection::ProjectionExec};
+
+        let groups = matrix_groups();
+        let schema = matrix_schema();
+        let validate = |plan: &Arc<dyn ExecutionPlan>| {
+            crate::oracle::splitter::validate_supported(plan.as_ref(), &groups)
+        };
+
+        // Scan chain: every accepted leaf and pass-through operator.
+        let source = matrix_source("cold-0");
+        validate(&source).expect("remote source placeholder is accepted");
+        let empty: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(Arc::clone(&schema)));
+        validate(&empty).expect("empty leaf is accepted");
+        let filtered: Arc<dyn ExecutionPlan> = Arc::new(
+            FilterExec::try_new(matrix_predicate(), Arc::clone(&source))
+                .expect("filter plan builds"),
+        );
+        validate(&filtered).expect("filter over an accepted scan is accepted");
+        let projected: Arc<dyn ExecutionPlan> = Arc::new(
+            ProjectionExec::try_new(
+                vec![(matrix_column("id", 0), "id".to_owned())],
+                Arc::clone(&filtered),
+            )
+            .expect("projection plan builds"),
+        );
+        validate(&projected).expect("projection over an accepted scan is accepted");
+
+        // Distributed fan-out and fan-in.
+        let repartitioned: Arc<dyn ExecutionPlan> = Arc::new(
+            RepartitionExec::try_new(Arc::clone(&source), Partitioning::RoundRobinBatch(2))
+                .expect("repartition plan builds"),
+        );
+        validate(&repartitioned).expect("repartition is accepted");
+        let coalesced: Arc<dyn ExecutionPlan> =
+            Arc::new(CoalescePartitionsExec::new(Arc::clone(&repartitioned)));
+        validate(&coalesced).expect("coalesce is accepted");
+        let ordering = datafusion::physical_expr::LexOrdering::new(vec![
+            datafusion::physical_expr::PhysicalSortExpr::new_default(Arc::new(
+                PhysicalColumn::new("id", 0),
+            )),
+        ])
+        .expect("fixture ordering is non-empty");
+        let merged: Arc<dyn ExecutionPlan> = Arc::new(SortPreservingMergeExec::new(
+            ordering.clone(),
+            Arc::clone(&repartitioned),
+        ));
+        validate(&merged).expect("sort preserving merge is accepted");
+
+        // Ordering and spill: `SortExec` without a fetch only.
+        let sorted: Arc<dyn ExecutionPlan> =
+            Arc::new(SortExec::new(ordering.clone(), Arc::clone(&source)));
+        validate(&sorted).expect("sort without fetch is accepted");
+        let fetched: Arc<dyn ExecutionPlan> =
+            Arc::new(SortExec::new(ordering, Arc::clone(&source)).with_fetch(Some(1)));
+        validate(&fetched).expect_err("sort with a fetch is rejected");
+    }
+
+    /// Proves the accepted aggregate modes, functions, and exact type tuples.
+    fn assert_accepted_aggregate_matrix() {
+        use datafusion::functions_aggregate::count::count_udaf;
+        use datafusion::functions_aggregate::min_max::{max_udaf, min_udaf};
+        use datafusion::functions_aggregate::sum::sum_udaf;
+        use datafusion::physical_expr::expressions::lit;
+        use datafusion::physical_plan::aggregates::AggregateMode;
+
+        let groups = matrix_groups();
+        let validate = |plan: &Arc<dyn ExecutionPlan>| {
+            crate::oracle::splitter::validate_supported(plan.as_ref(), &groups)
+        };
+
+        // `COUNT` is the one non-null tuple: an empty input still counts zero.
+        let count_star = matrix_aggregate_expr(count_udaf(), lit(1_i64), "count", false);
+        let count_state = count_star.state_fields().expect("count state fields");
+        assert_eq!(count_state.len(), 1);
+        assert_eq!(count_state[0].data_type(), &DataType::Int64);
+        assert!(!count_state[0].is_nullable());
+        assert_eq!(count_star.field().data_type(), &DataType::Int64);
+        assert!(!count_star.field().is_nullable());
+        for mode in [
+            AggregateMode::Partial,
+            AggregateMode::PartialReduce,
+            AggregateMode::FinalPartitioned,
+        ] {
+            validate(&matrix_aggregate(mode, Arc::clone(&count_star), None))
+                .expect("accepted aggregate mode");
+        }
+        for mode in [AggregateMode::Single, AggregateMode::Final] {
+            validate(&matrix_aggregate(mode, Arc::clone(&count_star), None))
+                .expect_err("unaccepted aggregate mode");
+        }
+        let count_column =
+            matrix_aggregate_expr(count_udaf(), matrix_column("id", 0), "count", false);
+        validate(&matrix_aggregate(
+            AggregateMode::Partial,
+            count_column,
+            None,
+        ))
+        .expect("COUNT(Int64) is accepted");
+
+        // `SUM`, `MIN`, and `MAX` each keep one nullable `Int64` state and result.
+        for (udaf, alias) in [
+            (sum_udaf(), "sum"),
+            (min_udaf(), "min"),
+            (max_udaf(), "max"),
+        ] {
+            let aggregate = matrix_aggregate_expr(udaf, matrix_column("amount", 1), alias, false);
+            let state = aggregate.state_fields().expect("state fields");
+            assert_eq!(state.len(), 1, "{alias} keeps one accumulator state");
+            assert_eq!(state[0].data_type(), &DataType::Int64);
+            assert!(state[0].is_nullable(), "{alias} state is nullable");
+            assert_eq!(aggregate.field().data_type(), &DataType::Int64);
+            assert!(
+                aggregate.field().is_nullable(),
+                "{alias} result is nullable"
+            );
+            validate(&matrix_aggregate(AggregateMode::Partial, aggregate, None))
+                .unwrap_or_else(|error| panic!("{alias}(Int64) is accepted: {error}"));
+        }
+    }
+
+    /// Proves the rejected aggregate arguments, distinctness, filters, and impostors.
+    fn assert_rejected_aggregate_matrix() {
+        use datafusion::functions_aggregate::count::count_udaf;
+        use datafusion::functions_aggregate::min_max::{max_udaf, min_udaf};
+        use datafusion::functions_aggregate::sum::sum_udaf;
+        use datafusion::physical_plan::aggregates::AggregateMode;
+
+        let groups = matrix_groups();
+        let validate = |plan: &Arc<dyn ExecutionPlan>| {
+            crate::oracle::splitter::validate_supported(plan.as_ref(), &groups)
+        };
+
+        // One argument-type mutation per pinned aggregate; nothing else changes.
+        for (udaf, argument, column, alias) in [
+            (count_udaf(), "label", 2_usize, "count"),
+            (sum_udaf(), "ratio", 5, "sum"),
+            (min_udaf(), "code", 3, "min"),
+            (max_udaf(), "stamp", 4, "max"),
+        ] {
+            let aggregate =
+                matrix_aggregate_expr(udaf, matrix_column(argument, column), alias, false);
+            assert!(
+                validate(&matrix_aggregate(AggregateMode::Partial, aggregate, None)).is_err(),
+                "{alias}({argument}) must be rejected"
+            );
+        }
+
+        let distinct = matrix_aggregate_expr(count_udaf(), matrix_column("id", 0), "count", true);
+        validate(&matrix_aggregate(AggregateMode::Partial, distinct, None))
+            .expect_err("a distinct aggregate is rejected");
+        let filtered = matrix_aggregate_expr(count_udaf(), matrix_column("id", 0), "count", false);
+        validate(&matrix_aggregate(
+            AggregateMode::Partial,
+            filtered,
+            Some(matrix_predicate()),
+        ))
+        .expect_err("a filtered aggregate is rejected");
+
+        let impostor = matrix_aggregate_expr(
+            Arc::new(datafusion::logical_expr::AggregateUDF::from(
+                ImpostorSum::new(),
+            )),
+            matrix_column("amount", 1),
+            "sum",
+            false,
+        );
+        assert_eq!(impostor.field().data_type(), &DataType::UInt64);
+        validate(&matrix_aggregate(AggregateMode::Partial, impostor, None))
+            .expect_err("a UInt64-state aggregate named sum is rejected");
+    }
+
+    /// Proves only an inner column equi-join with no join filter is accepted.
+    fn assert_join_matrix() {
+        use datafusion::common::JoinType;
+        use datafusion::physical_plan::joins::utils::{ColumnIndex, JoinFilter};
+
+        let groups = matrix_groups();
+        let validate = |plan: &Arc<dyn ExecutionPlan>| {
+            crate::oracle::splitter::validate_supported(plan.as_ref(), &groups)
+        };
+
+        let equi_key = vec![(matrix_column("id", 0), matrix_column("id", 0))];
+        validate(&matrix_hash_join(equi_key.clone(), None, JoinType::Inner))
+            .expect("inner column equi-join is accepted");
+        validate(&matrix_hash_join(equi_key.clone(), None, JoinType::Left))
+            .expect_err("a left join is rejected");
+        let expression_key = vec![(matrix_predicate(), matrix_column("id", 0))];
+        validate(&matrix_hash_join(expression_key, None, JoinType::Inner))
+            .expect_err("an expression equi-key join is rejected");
+        let join_filter = JoinFilter::new(
+            matrix_predicate(),
+            vec![ColumnIndex {
+                index: 0,
+                side: datafusion::common::JoinSide::Left,
+            }],
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+        );
+        validate(&matrix_hash_join(
+            equi_key,
+            Some(join_filter),
+            JoinType::Inner,
+        ))
+        .expect_err("a filtered join is rejected");
+    }
+
+    /// Proves union placement, table closure, and the unknown-operator refusal.
+    fn assert_union_and_unknown_matrix() {
+        use datafusion::functions_aggregate::count::count_udaf;
+        use datafusion::physical_expr::expressions::{Column as PhysicalColumn, lit};
+        use datafusion::physical_plan::aggregates::{
+            AggregateExec, AggregateMode, PhysicalGroupBy,
+        };
+        use datafusion::physical_plan::limit::GlobalLimitExec;
+
+        let groups = matrix_groups();
+        let validate = |plan: &Arc<dyn ExecutionPlan>| {
+            crate::oracle::splitter::validate_supported(plan.as_ref(), &groups)
+        };
+
+        // Unions: provider-local, same-table, directly beneath one tripwire.
+        let provider_union =
+            UnionExec::try_new(vec![matrix_source("cold-0"), matrix_source("hot-0")])
+                .expect("provider union builds");
+        validate(&matrix_tripwire(Arc::clone(&provider_union)))
+            .expect("a same-table provider union under a tripwire is accepted");
+        validate(&provider_union).expect_err("a SQL union without a tripwire parent is rejected");
+        let cross_table = HashMap::from([
+            ("cold-0".to_owned(), "vala.traces.spans".to_owned()),
+            ("hot-0".to_owned(), "vala.metrics.points".to_owned()),
+        ]);
+        crate::oracle::splitter::validate_supported(
+            matrix_tripwire(Arc::clone(&provider_union)).as_ref(),
+            &cross_table,
+        )
+        .expect_err("a cross-table union is rejected");
+        let unmapped = UnionExec::try_new(vec![matrix_source("cold-0"), matrix_source("ghost-0")])
+            .expect("unmapped union builds");
+        validate(&matrix_tripwire(unmapped))
+            .expect_err("a union with an unmapped source id is rejected");
+
+        // Unknown semantic operators stay outside the matrix.
+        let limited: Arc<dyn ExecutionPlan> =
+            Arc::new(GlobalLimitExec::new(matrix_source("cold-0"), 0, Some(1)));
+        validate(&limited).expect_err("an unknown semantic operator is rejected");
+
+        // The existing UTF-8 grouping journey remains a positive matrix row.
+        let journey_schema = Arc::new(Schema::new(vec![
+            Field::new("filter_key", DataType::Utf8, true),
+            Field::new("amount", DataType::Int64, true),
+        ]));
+        let journey_source: Arc<dyn ExecutionPlan> = Arc::new(
+            super::super::codec::RemoteSourcePlaceholderExec::new(
+                "cold-0".to_owned(),
+                super::super::assignment_schema_fingerprint(journey_schema.as_ref()),
+                Arc::clone(&journey_schema),
+            )
+            .with_partitions(2),
+        );
+        let grouped = matrix_aggregate_expr(count_udaf(), lit(1_i64), "count", false);
+        let journey: Arc<dyn ExecutionPlan> = Arc::new(
+            AggregateExec::try_new(
+                AggregateMode::Partial,
+                PhysicalGroupBy::new_single(vec![(
+                    Arc::new(PhysicalColumn::new("filter_key", 0))
+                        as Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+                    "filter_key".to_owned(),
+                )]),
+                vec![grouped],
+                vec![None],
+                Arc::clone(&journey_source),
+                journey_schema,
+            )
+            .expect("grouped journey aggregate builds"),
+        );
+        validate(&journey).expect("UTF-8 grouped COUNT(*) remains accepted");
+    }
+
+    /// The closed v1 Analytical physical matrix accepts exactly its baseline.
+    ///
+    /// Every negative case is one semantic mutation of an otherwise accepted
+    /// tree, so a failure names the exact capability that leaked into the
+    /// predicate rather than a shape difference.
+    #[tokio::test]
+    async fn supported_analytical_plan_accepts_only_the_v1_baseline() {
+        assert_scan_and_exchange_matrix();
+        assert_accepted_aggregate_matrix();
+        assert_rejected_aggregate_matrix();
+        assert_join_matrix();
+        assert_union_and_unknown_matrix();
+    }
 }

@@ -1725,7 +1725,13 @@ pub struct PlannedSqlCut {
     /// that the claim's lifetime is the cut's lifetime by construction: a plan
     /// that is abandoned before execution, or dropped on a retry, releases its
     /// snapshots without anyone remembering to.
-    pub(crate) reader_pin: Option<reader_pins::ReaderPinGuard>,
+    pub(crate) reader_pin: Option<reader_pins::ReaderQueryGuard>,
+    /// Epoch-gated permission this plan's source IO must present.
+    ///
+    /// Held beside the pin rather than derived at execution so that the permit
+    /// and the protection it depends on have exactly one lifetime: a plan that
+    /// carries a pin always carries the permit proving that pin is still live.
+    pub(crate) reader_io_permit: Option<reader_pins::ReaderIoPermit>,
 }
 
 impl PlannedSqlCut {
@@ -1787,6 +1793,13 @@ struct SqlAttemptInput<'a> {
 }
 
 /// Retained local query engine owner.
+/// Maximum expired reader epochs one startup sweep reclaims.
+///
+/// Bounded so a cluster that lost many nodes at once still starts promptly; the
+/// epochs a sweep does not reach stay expired and are reclaimed by the next
+/// Oracle to start.
+const EXPIRED_EPOCH_SWEEP_LIMIT: i64 = 64;
+
 pub struct Oracle {
     /// Planner and floor configuration.
     planner: OraclePlanner,
@@ -1802,8 +1815,8 @@ pub struct Oracle {
     cluster: Arc<ClusterRegistry>,
     /// One process-local lifecycle registry shared with private controls.
     running_queries: Arc<RunningQueryRegistry>,
-    /// Snapshots this node's in-flight cuts still need Forge to retain.
-    reader_watermarks: Arc<reader_pins::ReaderWatermarks>,
+    /// One process-global epoch owning every durable reader protection.
+    reader_authority: Arc<reader_pins::OracleReaderAuthority>,
     /// Tenant-qualified catalog and SQL owners retained for query execution.
     catalog: Arc<BifrostCatalog>,
     /// Tenant SQL handle retained for the Oracle lifecycle boundary.
@@ -1837,8 +1850,10 @@ pub struct Oracle {
     maintenance: Mutex<Option<JoinHandle<()>>>,
     /// Background-only `PostgreSQL` allocator and renewal task.
     delegated_maintenance: Mutex<Option<JoinHandle<()>>>,
-    /// Cancellation-bound task republishing this node's reader watermarks.
-    reader_watermark_refresh: Mutex<Option<JoinHandle<()>>>,
+    /// Bounded worker draining this epoch's batched protection narrowing.
+    reader_narrowing: Mutex<Option<JoinHandle<()>>>,
+    /// Cancellation-bound task renewing this epoch's lease or self-fencing.
+    reader_lease_supervisor: Mutex<Option<JoinHandle<()>>>,
     /// Test-tier one-shot pause after immutable worker selection.
     #[cfg(feature = "test-support")]
     topology_probe: Mutex<Option<Arc<OracleTopologyProbe>>>,
@@ -1994,8 +2009,9 @@ impl Oracle {
     ///
     /// # Errors
     /// Returns [`BifrostError::Internal`] when the configured SQL floor is zero.
-    pub fn new(config: OracleBuildConfig) -> Result<Self, BifrostError> {
+    pub async fn new(config: OracleBuildConfig) -> Result<Self, BifrostError> {
         validate_oracle_config(config.config)?;
+        let operator_pool = config.operator_pool;
         let planner = OraclePlanner::new(config.config);
         let telemetry = Arc::new(OracleTelemetry::new(Arc::clone(&config.local_slots)));
         let cluster = Arc::clone(&config.cluster);
@@ -2039,7 +2055,7 @@ impl Oracle {
             })?
             .spawn(
                 DelegatedOracleAdmissionWorker::new(
-                    config.operator_pool,
+                    operator_pool.clone(),
                     Arc::clone(&delegated_admission),
                     demand_rx,
                     shutdown.clone(),
@@ -2049,11 +2065,24 @@ impl Oracle {
         let ready = Arc::new(AtomicBool::new(false));
         let (maintenance, startup_result) =
             OracleAdmission::start_maintenance(shutdown.clone(), Arc::clone(&ready))?;
-        let (reader_watermarks, reader_watermark_refresh) = reader_pins::ReaderWatermarks::start(
-            config.vala.clone(),
-            admission.local_role.key.node_id.into(),
-            shutdown.clone(),
-        )?;
+        // Every plan takes a release reservation before admission, so the
+        // bound is every plan that can exist at once: the running classes plus
+        // the queue behind them, never just the admitted ones.
+        let reader_capacity = (config.config.interactive_slots
+            + config.config.analytical_slots
+            + config.config.queue_capacity) as usize;
+        let (reader_authority, reader_narrowing) =
+            reader_pins::OracleReaderAuthority::start(reader_pins::OracleReaderAuthorityConfig {
+                vala: config.vala.clone(),
+                operator_pool: operator_pool.clone(),
+                node_id: admission.local_role.key.node_id.as_uuid(),
+                fencing_token: admission.local_role.fencing_token,
+                max_concurrent_queries: reader_capacity.max(1),
+                terminator: Arc::new(reader_pins::AbortingEpochTerminator),
+            })
+            .await?;
+        let reader_lease_supervisor = tokio::runtime::Handle::current()
+            .spawn(Arc::clone(&reader_authority).supervise_lease(shutdown.clone()));
         let fragment_dispatcher = config.peer_transports.map(|transports| {
             Arc::new(dispatcher::FragmentDispatcher::new(
                 Arc::clone(&config.peer_ticket_minter),
@@ -2067,7 +2096,7 @@ impl Oracle {
             delegated_loss: Mutex::new(Some(loss_rx)),
             cluster,
             running_queries,
-            reader_watermarks,
+            reader_authority,
             catalog: config.catalog,
             vala: config.vala,
             memory: config.memory,
@@ -2085,7 +2114,8 @@ impl Oracle {
             startup_result: Mutex::new(Some(startup_result)),
             maintenance: Mutex::new(Some(maintenance)),
             delegated_maintenance: Mutex::new(Some(delegated_maintenance)),
-            reader_watermark_refresh: Mutex::new(Some(reader_watermark_refresh)),
+            reader_narrowing: Mutex::new(Some(reader_narrowing)),
+            reader_lease_supervisor: Mutex::new(Some(reader_lease_supervisor)),
             #[cfg(feature = "test-support")]
             topology_probe: Mutex::new(None),
         })
@@ -2464,7 +2494,11 @@ impl Oracle {
         // planned it. Background publication remains separate from query
         // execution; closing the acquisition-ordering gap is remediation work
         // and must not add a Postgres round trip to every read.
-        planned.reader_pin = Some(self.reader_watermarks.ledger().pin(&planned.cuts)?);
+        // Durable protection is established here, before any snapshot-dependent
+        // source IO, and the permit that proves it stays with the plan.
+        let (pin, permit) = self.reader_authority.acquire_guard(&planned.cuts).await?;
+        planned.reader_pin = Some(pin);
+        planned.reader_io_permit = Some(permit);
         self.ensure_query_telemetry(query_telemetry, request.visibility, planned.query_class);
         let mut phases = AttemptPhaseTimer::started();
         let (session, mut admitted, running_query) = self
@@ -2699,10 +2733,10 @@ impl Oracle {
         Ok(planned)
     }
 
-    /// Borrows this node's durable reader-watermark owner.
+    /// Borrows this node's process-global reader epoch authority.
     #[must_use]
-    pub fn reader_watermarks(&self) -> &Arc<reader_pins::ReaderWatermarks> {
-        &self.reader_watermarks
+    pub fn reader_authority(&self) -> &Arc<reader_pins::OracleReaderAuthority> {
+        &self.reader_authority
     }
 
     /// Acquires live fences, commits the read decision, and drains authorized tails.
@@ -3160,7 +3194,29 @@ impl Oracle {
             })?;
         receiver.await.map_err(|_| BifrostError::Internal {
             detail: "Oracle startup task ended without a result".to_owned(),
-        })?
+        })??;
+        // Reclaiming crashed epochs precedes activation so this node does not
+        // start serving while dead peers still hold protection. A sweep failure
+        // is logged rather than fatal: excess retention is safe, and refusing to
+        // start would turn one dead peer into an unavailable cluster.
+        let recovery = reader_pins::OracleEpochRecovery::new(
+            self.reader_authority.operator_pool().clone(),
+            self.vala.clone(),
+        );
+        match recovery.reclaim_expired(EXPIRED_EPOCH_SWEEP_LIMIT).await {
+            Ok(0) => {}
+            Ok(reclaimed) => tracing::info!(
+                reclaimed,
+                "Oracle reclaimed expired reader epochs before activation"
+            ),
+            Err(error) => tracing::warn!(
+                error = %error,
+                "Oracle could not sweep expired reader epochs before activation"
+            ),
+        }
+        // Activation is the last startup step, so readiness can never be
+        // published under an epoch Postgres has not yet marked active.
+        self.reader_authority.activate().await
     }
 
     /// Borrows the tenant SQL root retained by the Oracle composition boundary.
@@ -3253,8 +3309,22 @@ impl Oracle {
                 delegated.abort();
             }
         }
+        // Retirement closes admission, releases every table, and deletes the
+        // epoch row. Only then are its workers joined: a worker cancelled first
+        // could leave a reserved release undelivered.
+        if let Err(error) = self.reader_authority.retire().await {
+            tracing::error!(error = %error, "Oracle retained reader protection after retirement failed");
+        }
+        let supervisor = self
+            .reader_lease_supervisor
+            .lock()
+            .ok()
+            .and_then(|mut handle| handle.take());
+        if let Some(supervisor) = supervisor {
+            supervisor.abort();
+        }
         let watermarks = self
-            .reader_watermark_refresh
+            .reader_narrowing
             .lock()
             .ok()
             .and_then(|mut handle| handle.take());

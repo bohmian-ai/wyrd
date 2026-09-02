@@ -20,8 +20,8 @@ pub use crate::vala::audit_detail::{
     AuditDetail, AuditDetailValueError, BatchId, BifrostSecurityPhase,
     BifrostSecurityViolationKind, ForgeIcebergRewritePhase, ForgeManifestRewritePhase,
     ForgeOrphanGcPhase, ForgePromotedFile, ForgePromotedFileSetDigest, ForgeScribePromotionPhase,
-    ForgeSnapshotExpirePhase, QueryAuditDigest, QueryExecutionMode, ScopeHash, StoragePath,
-    audit_detail_canonical_json,
+    ForgeSnapshotExpirePhase, OracleReaderEpochPhase, OracleTableProtectionPhase, QueryAuditDigest,
+    QueryExecutionMode, ScopeHash, StoragePath, audit_detail_canonical_json,
 };
 
 /// Bifrost table-identifier newtype.

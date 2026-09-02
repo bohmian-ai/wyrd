@@ -32,6 +32,7 @@ mod planner;
 mod planning_scheduler;
 mod protection_roots;
 pub(crate) mod publication;
+mod reader_protection;
 pub(crate) mod rewrite;
 mod scheduler;
 pub(crate) mod scribe_promotion;

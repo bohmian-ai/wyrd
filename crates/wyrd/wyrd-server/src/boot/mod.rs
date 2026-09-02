@@ -1745,7 +1745,9 @@ impl<'a> OracleRoleBuilder<'a> {
             peer_transports: Some(peer_transports),
             delegated_admission_config,
             config: oracle_config,
-        }) {
+        })
+        .await
+        {
             Ok(oracle) => Arc::new(oracle),
             Err(error) => {
                 release_failed_oracle_role(&cluster, &role, "construction").await;

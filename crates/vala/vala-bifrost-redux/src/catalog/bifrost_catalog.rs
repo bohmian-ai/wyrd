@@ -89,6 +89,13 @@ pub struct CreateTableRequest {
 pub struct PinnedSealedTable {
     /// Authenticated tenant/table binding.
     pub binding: TenantTableBinding,
+    /// Durable registered table UID, which is this table's protection identity.
+    ///
+    /// Reader protection is keyed by the registered UID rather than by the
+    /// namespace and name it happens to be reachable under, so the cut carries
+    /// the UID it was resolved from instead of letting a later consumer
+    /// reconstruct one.
+    pub table_uid: TableUid,
     /// Iceberg table metadata loaded once for this cut.
     pub iceberg_table: iceberg::table::Table,
     /// Exact current snapshot identity selected from the immutable table metadata.
@@ -267,9 +274,10 @@ impl BifrostCatalog {
         #[cfg(any(test, feature = "test-support"))]
         TEST_SEALED_PIN_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let fqn = table.fqn();
-        let Some(_row) = self.lookup_table_row(&fqn, tenant).await? else {
+        let Some(row) = self.lookup_table_row(&fqn, tenant).await? else {
             return Err(BifrostCatalogError::TableNotFound(fqn));
         };
+        let table_uid = TableUid::from_row(&row.table_uid, &fqn)?;
         let binding = TenantTableBinding::resolve((tenant, table.clone()))
             .map_err(|error| BifrostCatalogError::InvalidBinding(error.to_string()))?;
         let (iceberg_table, pinned, cut) = self.acquire_stable_cut(&binding, tenant).await?;
@@ -332,6 +340,7 @@ impl BifrostCatalog {
         }));
         Ok(PinnedSealedTable {
             binding,
+            table_uid,
             iceberg_table,
             snapshot_id,
             snapshot_digest,

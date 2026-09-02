@@ -399,6 +399,7 @@ impl OraclePlanner {
             query_class: classification.query_class,
             local_ratio,
             reader_pin: None,
+            reader_io_permit: None,
         })
     }
 

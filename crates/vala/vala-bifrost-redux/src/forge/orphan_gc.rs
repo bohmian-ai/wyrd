@@ -949,24 +949,12 @@ impl Forge {
                 roots.open_outputs.push(normalize(path.as_str())?);
             }
         }
-        let (reader_watermarks, readers_overflowed) =
-            vala_sql::queries::reader_watermarks::BifrostReaderWatermarks::new(&mut conn)
-                .list_active(
-                    key.table_ref.namespace.as_str(),
-                    key.table_ref.name.as_str(),
-                    request.table.now,
-                    u32::try_from(cap).map_err(|_| ForgeError::Invariant {
-                        detail: "open-operation cap exceeds the reader-watermark query bound"
-                            .to_owned(),
-                    })?,
-                )
-                .await
-                .map_err(ForgeError::Sql)?;
-        roots.blocked |= readers_overflowed;
-        roots.pinned_snapshot_ids = reader_watermarks
-            .iter()
-            .map(|watermark| watermark.snapshot_id)
-            .collect();
+        // Every snapshot on every proven ancestry chain, not just the chain
+        // endpoints: this pass protects the objects those snapshots reach, so a
+        // partial chain would leave the middle of a reader's history collectable.
+        roots.pinned_snapshot_ids = super::reader_protection::ReaderProtection::new(&mut conn)
+            .protected_snapshot_ids(key.tenant, &key.table_ref)
+            .await?;
         conn.commit().await.map_err(ForgeError::Sql)?;
         Ok(roots)
     }

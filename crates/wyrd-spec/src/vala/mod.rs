@@ -43,8 +43,8 @@ pub mod trace;
 pub use audit_detail::{
     AuditDetail, AuditDetailValueError, BatchId, ForgeIcebergRewritePhase,
     ForgeManifestRewritePhase, ForgeOrphanGcPhase, ForgePromotedFile, ForgePromotedFileSetDigest,
-    ForgeScribePromotionPhase, ForgeSnapshotExpirePhase, ScopeHash, StoragePath,
-    audit_detail_canonical_json,
+    ForgeScribePromotionPhase, ForgeSnapshotExpirePhase, OracleReaderEpochPhase,
+    OracleTableProtectionPhase, ScopeHash, StoragePath, audit_detail_canonical_json,
 };
 pub use correlation::{CorrelationColumns, CorrelationContext};
 pub use error::{BifrostError, PhysicalLayoutField, PhysicalLayoutViolation};

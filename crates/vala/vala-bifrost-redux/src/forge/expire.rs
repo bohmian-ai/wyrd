@@ -394,35 +394,16 @@ impl Forge {
         doomed: &[i64],
         cutoff_ms: i64,
     ) -> Result<(), ForgeError> {
-        let cap = u32::try_from(self.core.config.max_open_operations_per_table).map_err(|_| {
-            ForgeError::InvalidConfig {
-                detail: "Forge active-watermark cap exceeds u32".to_owned(),
-            }
-        })?;
         let mut conn = self
             .core
             .vala
             .tenant_conn(key.tenant)
             .await
             .map_err(ForgeError::Sql)?;
-        let (readers, overflowed) =
-            vala_sql::queries::reader_watermarks::BifrostReaderWatermarks::new(&mut conn)
-                .list_active(
-                    key.table_ref.namespace.as_str(),
-                    key.table_ref.name.as_str(),
-                    self.core.clock.now()?,
-                    cap,
-                )
-                .await
-                .map_err(ForgeError::Sql)?;
+        let readers = super::reader_protection::ReaderProtection::new(&mut conn)
+            .watermarks(key.tenant, &key.table_ref)
+            .await?;
         conn.commit().await.map_err(ForgeError::Sql)?;
-        if overflowed {
-            return Err(ForgeError::SnapshotExpiry {
-                detail: "live reader protection exceeded its bounded query at the destructive \
-                         commit boundary"
-                    .to_owned(),
-            });
-        }
         for reader in &readers {
             if doomed.contains(&reader.snapshot_id) || reader.timestamp_ms <= cutoff_ms {
                 return Err(ForgeError::SnapshotExpiry {
@@ -478,18 +459,15 @@ impl Forge {
                 .watermarks(&mut conn, &identity, cap)
                 .await
                 .map_err(ForgeError::Sql)?;
-        let (reader_watermarks, readers_overflowed) =
-            vala_sql::queries::reader_watermarks::BifrostReaderWatermarks::new(&mut conn)
-                .list_active(
-                    key.table_ref.namespace.as_str(),
-                    key.table_ref.name.as_str(),
-                    self.core.clock.now()?,
-                    cap,
-                )
-                .await
-                .map_err(ForgeError::Sql)?;
+        // Reader protection is not bounded by the open-operation cap: a
+        // frontier is one member per incomparable lineage, and truncating it
+        // would silently stop protecting one of them. A frontier that cannot be
+        // read or validated fails the pass instead.
+        let reader_watermarks = super::reader_protection::ReaderProtection::new(&mut conn)
+            .watermarks(key.tenant, &key.table_ref)
+            .await?;
         conn.commit().await.map_err(ForgeError::Sql)?;
-        if attempts_overflowed || readers_overflowed {
+        if attempts_overflowed {
             return Err(ForgeError::SnapshotExpiry {
                 detail: "active Forge protection set exceeded its bounded query".to_owned(),
             });

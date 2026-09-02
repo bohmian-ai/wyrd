@@ -1,4 +1,4 @@
--- Snapshots that live Oracle cuts and Scribe live-tail leases still need.
+-- Snapshots that live Oracle cuts still need.
 --
 -- Forge maintenance runs in a different process from every reader, so a pinned
 -- cut has to leave a durable trace or destructive maintenance would be deciding

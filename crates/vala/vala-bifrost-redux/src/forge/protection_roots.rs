@@ -26,7 +26,7 @@ pub(super) struct OrphanProtectionRoots {
     /// Outputs a staged, prepared, open, commit-uncertain, or reconciling
     /// attempt produced or may still produce.
     pub(super) open_outputs: Vec<String>,
-    /// Snapshots an Oracle cut or live-tail lease still depends on.
+    /// Snapshots a pinned Oracle cut still depends on.
     pub(super) pinned_snapshot_ids: Vec<i64>,
     /// Whether any open or unreconciled operation forbids destructive work.
     pub(super) blocked: bool,
@@ -79,6 +79,11 @@ mod tests {
     /// Each case drops exactly one root class and requires the object that
     /// class alone protected to become eligible, so a class that quietly stops
     /// contributing cannot pass as a complete union.
+    ///
+    /// This inventory covers pinned Oracle cuts and carries no live-tail case. That
+    /// is a recorded open conflict, not an omission: see
+    /// `changes/active/forge-live-tail-authority-conflict.md`. Until it is
+    /// resolved, no case here may be widened to stand for both roots at once.
     #[test]
     fn forge_orphan_protection_includes_all_noncatalog_authority() {
         let catalog_path = "t/spans/data/forge/catalog-00000.parquet";
@@ -137,7 +142,7 @@ mod tests {
         unpinned.pinned_snapshot_ids = vec![30];
         assert!(
             unpinned.compose().is_err(),
-            "an Oracle cut or live-tail lease on a snapshot the traversal never saw must fail closed"
+            "an Oracle cut on a snapshot the traversal never saw must fail closed"
         );
 
         let mut blocked = roots();

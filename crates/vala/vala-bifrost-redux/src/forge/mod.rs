@@ -23,6 +23,7 @@ mod live_reconcile;
 mod live_replace;
 mod maintenance;
 pub(crate) mod managed;
+mod manifest_rewrite;
 mod metrics;
 pub(crate) mod orphan_gc;
 mod path;

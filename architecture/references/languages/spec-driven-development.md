@@ -23,6 +23,29 @@ invariant, public behavior, material constraint, or required system boundary,
 stop and route the conflict through a specification revision and renewed human
 approval.
 
+## Decision ownership by workflow stage
+
+The workflow separates product authority from implementation architecture and
+local coding freedom. "Implementation detail" is not one undifferentiated
+category.
+
+| Stage | Decisions it owns |
+|---|---|
+| `$wyrd-spec` | Product behavior, externally observable success and failure, invariants, acceptance, material constraints, and required ownership or system boundaries. |
+| `$wyrd-plan` | Concrete implementation architecture below the approved spec: owning structs/modules, durable identities and schema, state machines, synchronization and ordering, transaction/atomicity boundaries, failure/shutdown/crash recovery, dependency/API use, consumer wiring, test topology, and real task decomposition. |
+| `$wyrd-implement` | Local coding choices that cannot alter the planned architecture: helper names, private signatures, equivalent local containers or expressions, and bounded refactoring inside the task's locked owners, states, and seams. |
+| `$wyrd-task-readiness` | Independent proof that the proposed tasks contain every required plan-level decision and can be executed without inventing one. |
+
+Concurrency protocols, persistent schema, durable state, ownership, lifecycle
+transitions, cross-process ordering, atomicity, shutdown semantics, and crash or
+takeover recovery are always plan-level decisions unless the approved spec or
+architecture already fixes them. They are never ordinary implementer judgment.
+
+Use this test at the plan/readiness boundary: if two implementors could follow
+the same task and choose materially different durability, synchronization,
+ownership, recovery, schema, dependency, or test-topology designs, the task is
+not decision-complete.
+
 ## Change artifact lifecycle
 
 Use one tracked, repository-local change packet while work is active. Keep the
@@ -131,9 +154,11 @@ the spec to draft. An approved spec has no unresolved material decision.
 
 ## Task contract
 
-`wyrd-plan` derives implementation tasks only from an approved spec revision or
-from validated task-review findings under that same spec. Use as many tasks as
-cohesive ownership and real dependencies require; task count is not a target.
+`wyrd-plan` derives implementation tasks from an approved spec revision, from
+validated task-review findings under that same spec, or by reconciling an
+approved revision with a frozen partially implemented task candidate and its
+current-state amendment. Use as many tasks as cohesive ownership and real
+dependencies require; task count is not a target.
 
 Each task identifies:
 
@@ -156,17 +181,41 @@ remediates: []
 - mapped requirement, invariant, and acceptance IDs;
 - outcome, owners, scope, non-goals, and direct dependencies;
 - material implementation decisions and seams that belong below the spec;
-- an ordered behavioral test-scenario list;
+- ordered implementation scenarios that bind each observable behavior and
+  decisive RED proof to the concrete GREEN production owner, state, API,
+  control-flow, ordering, atomicity, lifecycle, recovery, dependency, migration,
+  and consumer decisions required to make it pass wherever those dimensions
+  are material;
 - the required Red-Green-Refactor execution discipline;
 - exact focused commands for every specifically named test;
 - broader crate, module, family, integration, codegen, and journey verification;
 - completion evidence and material stop conditions; and
 - for remediation, the parent task and validated finding IDs.
 
-Task planning may choose private implementation mechanics. It may not weaken or
-reinterpret the approved spec. A task is ready only when an implementer can
-execute it without making a new material product, contract, ownership,
-security, tenancy, migration, rollout, or acceptance decision.
+Task planning must choose the plan-level implementation architecture listed in
+the decision-ownership table. It may not weaken or reinterpret the approved
+spec. A task is ready only when an implementer can execute it without making a
+new product decision or a new plan-level ownership, durability, schema,
+ordering, atomicity, recovery, dependency, migration, security, tenancy,
+rollout, test-topology, or acceptance decision.
+
+Test and production design happen together, scenario by scenario. The RED proof
+must fail when a material selected production decision is implemented
+incorrectly; a task-wide test list and a separate implementation-design section
+do not establish that trace. Tasks need no mandatory design ledger, matrix,
+pseudocode, or rejected-alternative inventory. Record rationale only where it
+explains a material selected decision, then verify cross-scenario owner,
+consumer, lifecycle, generated-surface, and evidence-tier closure.
+An obligation that cannot meaningfully execute instead binds its equivalent
+static or generated proof to the production source change; do not manufacture a
+RED test merely to claim TDD.
+
+Readiness does not require pseudocode or eliminate normal implementation
+judgment. An implementer is expected to resolve helper names, private
+signatures, equivalent local containers or expressions, routine error
+propagation, stale symbol locations, and bounded refactoring from the nearest
+repository precedent. Task revision is required only when implementation would
+otherwise choose among materially different plan-level designs.
 
 Task status moves through `proposed`, `ready`, `in_progress`, `review`, and
 `approved`; use `superseded` when an approved spec revision or replacement task
@@ -233,7 +282,16 @@ Pre-implementation task readiness and post-implementation task correctness are
 different reviews.
 
 Task readiness reviews one or more proposed tasks and returns `READY`,
-`REVISE_TASKS`, `SPEC_REVISION_REQUIRED`, or `BLOCKED`.
+`REVISE_TASKS`, `SPEC_REVISION_REQUIRED`, or `BLOCKED`. The author of a task
+cannot issue its authoritative `READY` verdict. Use a fresh-context reviewer;
+when none is available, return `BLOCKED` with
+`INDEPENDENT_READINESS_REVIEW_REQUIRED`.
+
+During implementation, a task gap that leaves materially different plan-level
+designs open returns `TASK_REVISION_REQUIRED` to `$wyrd-plan`. A required change
+to approved behavior or material product authority returns
+`SPEC_REVISION_REQUIRED` to `$wyrd-spec`. Neither verdict applies to ordinary
+repository-local coding choices that preserve the task's concrete design.
 
 Task review inspects one immutable cumulative task candidate against the
 approved spec, original task, all remediation tasks, and available evidence. It

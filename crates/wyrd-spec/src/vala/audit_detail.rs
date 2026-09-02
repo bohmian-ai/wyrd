@@ -610,6 +610,28 @@ pub enum AuditDetail {
         /// Exact snapshot IDs selected for expiry, sorted ascending.
         selected_snapshot_ids: Vec<i64>,
     },
+    /// A Forge metadata-only manifest rewrite and its Iceberg boundary.
+    ///
+    /// The operation regroups manifest entries and nothing else: the data files
+    /// the table logically contains are identical before and after it. Both
+    /// path collections are exact and ordered, so a reader can prove which
+    /// manifests were replaced by which without consulting the catalog.
+    ForgeManifestRewrite {
+        /// Deterministic identifier shared by prepared and terminal rows.
+        operation_id: uuid::Uuid,
+        /// Durable phase represented by this audit row.
+        phase: ForgeManifestRewritePhase,
+        /// Canonical tenant/table resource identity.
+        group: String,
+        /// Metadata location observed before the rewrite commit.
+        base_metadata_location: StoragePath,
+        /// Metadata location returned by a proven commit, when known.
+        committed_metadata_location: Option<StoragePath>,
+        /// Exact ordered manifests replaced by the rewrite.
+        input_manifest_paths: Vec<StoragePath>,
+        /// Exact ordered manifests written by the rewrite.
+        output_manifest_paths: Vec<StoragePath>,
+    },
     /// A Forge orphan-GC operation and its bounded object batch.
     ForgeOrphanGc {
         /// Deterministic identifier shared by prepared and terminal rows.
@@ -830,6 +852,26 @@ pub enum ForgeSnapshotExpirePhase {
     Committed,
     /// Reconciliation proved the external commit completed.
     Recovered,
+}
+
+/// Durable phase recorded for a Forge metadata-only manifest rewrite.
+///
+/// The rewrite writes new manifests and then swaps them in with one catalog
+/// commit, so it has the same recoverable external boundary as data rewrite:
+/// a prepared operation whose commit outcome is unknown is settled by
+/// reconciliation into exactly one of `Recovered` or `Reset`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ForgeManifestRewritePhase {
+    /// The exact input and output manifests were fixed before the commit.
+    Prepared,
+    /// The catalog commit completed and returned a metadata location.
+    Committed,
+    /// Reconciliation proved a previously uncertain commit completed.
+    Recovered,
+    /// Reconciliation proved the prepared commit was not applied.
+    Reset,
 }
 
 /// Durable phase recorded for a Forge orphan-GC operation.

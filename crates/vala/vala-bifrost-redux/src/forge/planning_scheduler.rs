@@ -292,7 +292,7 @@ impl<'forge> ForgeScheduler<'forge> {
     pub async fn record_hint(&self, hint: StagingFileCommitted) -> Result<(), ForgeError> {
         let (binding, _) = hint.into_parts();
         let table = ForgeTaskTableIdentity::new(
-            "wyrd-redux",
+            crate::catalog::BIFROST_CATALOG_NAME,
             binding.logical_namespace.clone(),
             binding.table_ref.name.clone(),
         )
@@ -555,7 +555,7 @@ impl<'forge> ForgeScheduler<'forge> {
             }
             self.renew_fence(fence).await?;
             let identity = ForgeTaskTableIdentity::new(
-                "wyrd-redux",
+                crate::catalog::BIFROST_CATALOG_NAME,
                 key.table_ref.namespace.as_str(),
                 key.table_ref.name,
             )

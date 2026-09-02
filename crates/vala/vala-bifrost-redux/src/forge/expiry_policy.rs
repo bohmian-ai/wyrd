@@ -26,7 +26,7 @@ use super::live_reconcile::DestructiveMaintenance;
 pub(super) struct SnapshotProtectionRoots {
     /// Base snapshots held by open Forge attempts on this table.
     pub(super) attempt_watermarks: Vec<SnapshotWatermark>,
-    /// Snapshots held by pinned Oracle cuts and Scribe live-tail leases.
+    /// Snapshots held by pinned Oracle cuts.
     pub(super) reader_watermarks: Vec<SnapshotWatermark>,
     /// Base snapshot the branch head's rewrite lineage still references.
     ///
@@ -249,7 +249,7 @@ mod tests {
                 retain_last: 1,
             },
             RootCase {
-                what: "a watermark held by a pinned Oracle cut or live-tail lease",
+                what: "a watermark held by a pinned Oracle cut",
                 protected: vec![20, 30],
                 ref_heads: Vec::new(),
                 roots: SnapshotProtectionRoots {
@@ -284,6 +284,11 @@ mod tests {
     /// deliberately not composed: a policy that protects a snapshot because
     /// some *other* root happened to cover it is not proof that this root
     /// works, and it is exactly how a protection is silently lost.
+    ///
+    /// This inventory covers pinned Oracle cuts and carries no live-tail case. That
+    /// is a recorded open conflict, not an omission: see
+    /// `changes/active/forge-live-tail-authority-conflict.md`. Until it is
+    /// resolved, no case here may be widened to stand for both roots at once.
     #[test]
     fn forge_snapshot_expiry_policy_matrix() {
         // Baseline: with no protection beyond the current head and one retained

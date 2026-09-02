@@ -4,7 +4,7 @@ use vala_sql::row_types::forge_tasks::ForgeTaskTableIdentity;
 use wyrd_spec::DataTenantId;
 
 use super::error::ForgeError;
-use crate::catalog::{TableRef, TenantTableBinding};
+use crate::catalog::{BIFROST_CATALOG_NAME, TableRef, TenantTableBinding};
 
 /// Converts a durable identity before any catalog load and validates tenant binding.
 ///
@@ -21,7 +21,7 @@ pub(crate) fn task_table_binding(
             detail: "Forge task tenant differs from scheduler binding".to_owned(),
         });
     }
-    if identity.catalog != "wyrd-redux" {
+    if identity.catalog != BIFROST_CATALOG_NAME {
         return Err(ForgeError::Invariant {
             detail: "unsupported Forge task catalog".to_owned(),
         });

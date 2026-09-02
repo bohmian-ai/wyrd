@@ -18,9 +18,10 @@ use crate::reference::CardRef;
 use crate::request_id::RequestId;
 pub use crate::vala::audit_detail::{
     AuditDetail, AuditDetailValueError, BatchId, BifrostSecurityPhase,
-    BifrostSecurityViolationKind, ForgeIcebergRewritePhase, ForgeOrphanGcPhase, ForgePromotedFile,
-    ForgePromotedFileSetDigest, ForgeScribePromotionPhase, ForgeSnapshotExpirePhase,
-    QueryAuditDigest, QueryExecutionMode, ScopeHash, StoragePath, audit_detail_canonical_json,
+    BifrostSecurityViolationKind, ForgeIcebergRewritePhase, ForgeManifestRewritePhase,
+    ForgeOrphanGcPhase, ForgePromotedFile, ForgePromotedFileSetDigest, ForgeScribePromotionPhase,
+    ForgeSnapshotExpirePhase, QueryAuditDigest, QueryExecutionMode, ScopeHash, StoragePath,
+    audit_detail_canonical_json,
 };
 
 /// Bifrost table-identifier newtype.

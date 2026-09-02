@@ -351,12 +351,15 @@ impl Forge {
         else {
             return Ok(outcome);
         };
+        let doomed: Vec<i64> = snapshot_ids.clone();
         let detail = expiry_detail(&table, key, cutoff_ms, snapshot_ids, ref_heads)?;
         require_running(stop)?;
         lease.require_fence(&self.core.operator_pool).await?;
         self.append_expiry_audit(lease, key.tenant, &detail, "forge.snapshot_expire.prepared")
             .await?;
         require_running(stop)?;
+        self.revalidate_reader_protection(key, &doomed, cutoff_ms)
+            .await?;
         outcome.expired_files = self
             .complete_expiry(lease, key, binding, &detail, stop)
             .await?;
@@ -370,6 +373,70 @@ impl Forge {
 }
 
 impl Forge {
+    /// Re-reads reader protection immediately before the destructive commit.
+    ///
+    /// The selection was decided against a read of the reader watermarks taken
+    /// before planning, the prepared audit, and the fence refresh. A query
+    /// admitted in that window publishes its pin durably before it reads, so
+    /// re-reading here is what turns "nobody needed this when we looked" into
+    /// "nobody needs this now". The pass is abandoned rather than narrowed: the
+    /// prepared operation settles on its own reconciliation path, and a
+    /// successor re-decides against the newer reader set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Sql`] when the watermarks cannot be re-read and
+    /// [`ForgeError::SnapshotExpiry`] when the bounded query overflows or a
+    /// live reader now depends on a snapshot this pass intended to expire.
+    async fn revalidate_reader_protection(
+        &self,
+        key: &ForgeTableKey,
+        doomed: &[i64],
+        cutoff_ms: i64,
+    ) -> Result<(), ForgeError> {
+        let cap = u32::try_from(self.core.config.max_open_operations_per_table).map_err(|_| {
+            ForgeError::InvalidConfig {
+                detail: "Forge active-watermark cap exceeds u32".to_owned(),
+            }
+        })?;
+        let mut conn = self
+            .core
+            .vala
+            .tenant_conn(key.tenant)
+            .await
+            .map_err(ForgeError::Sql)?;
+        let (readers, overflowed) =
+            vala_sql::queries::reader_watermarks::BifrostReaderWatermarks::new(&mut conn)
+                .list_active(
+                    key.table_ref.namespace.as_str(),
+                    key.table_ref.name.as_str(),
+                    self.core.clock.now()?,
+                    cap,
+                )
+                .await
+                .map_err(ForgeError::Sql)?;
+        conn.commit().await.map_err(ForgeError::Sql)?;
+        if overflowed {
+            return Err(ForgeError::SnapshotExpiry {
+                detail: "live reader protection exceeded its bounded query at the destructive \
+                         commit boundary"
+                    .to_owned(),
+            });
+        }
+        for reader in &readers {
+            if doomed.contains(&reader.snapshot_id) || reader.timestamp_ms <= cutoff_ms {
+                return Err(ForgeError::SnapshotExpiry {
+                    detail: format!(
+                        "a live reader on snapshot {} at {}ms was admitted after this expiry was \
+                         decided against cutoff {cutoff_ms}ms",
+                        reader.snapshot_id, reader.timestamp_ms
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Gathers every non-catalog authority that protects a snapshot.
     ///
     /// The three roots are read together, under the fence this pass already
@@ -390,7 +457,7 @@ impl Forge {
         destructive_maintenance: super::live_reconcile::DestructiveMaintenance,
     ) -> Result<SnapshotProtectionRoots, ForgeError> {
         let identity = ForgeTaskTableIdentity::new(
-            "wyrd-redux",
+            crate::catalog::BIFROST_CATALOG_NAME,
             key.table_ref.namespace.as_str(),
             key.table_ref.name.as_str(),
         )

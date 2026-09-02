@@ -46,6 +46,12 @@ boundaries, data structures, algorithms, internal APIs, persistence mechanics,
 and concurrency mechanisms. Include one only when it is itself an approved
 constraint or an architecture authority already fixes it.
 
+Identify the categories of plan-level decisions the approved spec intentionally
+leaves open, without choosing them here. Examples include the required durable
+identity, state machine, cross-process ordering, atomicity, shutdown/crash
+recovery, dependency capability, and test topology. This planning-decision
+inventory is a handoff obligation for `$wyrd-plan`, not an implementation plan.
+
 Challenge ambiguous architecture language. “Persist separately” is an
 implementation choice unless independent persistence is required for a named
 durability, security, ownership, or externally observable invariant.
@@ -70,7 +76,8 @@ Use proportionate Markdown with stable local IDs:
 9. required system boundaries, public interfaces, and cross-boundary flow;
 10. `AC-*` acceptance obligations and credible evidence classes;
 11. open material decisions; and
-12. revision history and materially relevant authority links.
+12. planning-decision inventory; and
+13. revision history and materially relevant authority links.
 
 Use exact Wyrd vocabulary. Requirements and invariants must be atomic enough to
 map to tasks and evidence, but do not turn the spec into a test inventory or
@@ -100,6 +107,6 @@ downstream work until the human explicitly approves the new revision and
 ## Handoff
 
 Report the spec path, revision, status, locked behavioral obligations, retained
-implementation freedoms, selected authority links, and any exact approval or
-blocking decision needed. Never claim task or implementation readiness merely
-because the spec is approved.
+implementation freedoms, planning-decision inventory, selected authority links,
+and any exact approval or blocking decision needed. Never claim task or
+implementation readiness merely because the spec is approved.

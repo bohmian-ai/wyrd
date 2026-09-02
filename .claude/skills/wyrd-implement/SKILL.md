@@ -1,12 +1,14 @@
 ---
 name: wyrd-implement
-description: Implement and verify one ready Wyrd task through scenario-by-scenario Red-Green-Refactor cycles and focused repository verification. Use for one approved-spec implementation or remediation task; stop when implementation would require a spec revision.
+description: Implement and verify one ready Wyrd task through scenario-by-scenario Red-Green-Refactor cycles. Resolve ordinary local details; stop only for a genuinely missing plan-level decision or required spec revision.
 ---
 
 # Wyrd Implement
 
 Own one task's complete test-driven implementation, evidence, and fix loop.
-Implementation reasoning belongs here; approved behavioral authority does not.
+Apply a presumption of execution: resolve ordinary repository-local details and
+bounded code-shape choices instead of escalating uncertainty. Approved product
+authority and plan-level implementation architecture do not belong here.
 
 ## Establish the task contract
 
@@ -32,6 +34,13 @@ Follow CodeGraph instructions. Inspect the nearest owner, callers, consumers,
 tests, manifests, features, generated projections, and `mise.toml`. Preserve
 unrelated user changes. A write forecast is coordination guidance, not an
 allowlist; report necessary scope expansion.
+
+Before RED, confirm the task fixes its concrete owners, durable identities and
+state, ordering/atomicity, lifecycle failure and recovery, dependency/API use,
+consumer wiring, and test topology wherever those are material. Do not demand
+pseudocode or exhaustive private details. Adapt stale file or symbol locations
+to the current repository when the intended owner and design remain
+unambiguous.
 
 ## Execute TDD one scenario at a time
 
@@ -71,11 +80,28 @@ errors, cleanup, cancellation, audit, tenancy, generated surfaces,
 cross-language projections, documentation, and tests. Follow Wyrd's
 struct-centered Rust, rustdoc, async, PyO3, contract, and test-tier rules.
 
-Ordinary private mechanics remain the implementer's choice. Stop when
-correctness requires changing the approved behavior, invariant, acceptance,
-public or persisted contract, material architecture, ownership, security,
-tenancy, migration, or dependency/feature decision. Report
-`SPEC_REVISION_REQUIRED` with exact evidence; do not rewrite the spec or task.
+Ordinary local mechanics remain the implementer's choice: helper names,
+private signatures, equivalent local containers or expressions, exact code
+organization, and bounded refactoring that preserves the task's owners,
+durable state, transitions, ordering, recovery, dependencies, and evidence.
+Use the nearest repository precedent to resolve a minor omission when that
+precedent yields one clear design and does not alter a plan-level decision;
+record the bounded correction in task evidence.
+
+Return `TASK_REVISION_REQUIRED` only when implementation cannot proceed without
+choosing among materially different ownership, durable schema/state,
+synchronization/ordering, atomicity, shutdown/crash recovery, dependency/API,
+migration, consumer, or test-topology designs. The report must cite the exact
+task gap, repository evidence, and at least two materially different reachable
+choices or the exact missing dependency capability. Do not use
+`TASK_REVISION_REQUIRED` for stale paths or commands, helper placement, local
+types, routine error propagation, compiler-driven corrections, or a preference
+between behaviorally equivalent implementations.
+
+Stop with `SPEC_REVISION_REQUIRED` only when correctness requires changing the
+approved behavior, invariant, acceptance, public contract, material constraint,
+required ownership boundary, security, or tenancy rule. Do not rewrite the
+spec or task during implementation.
 
 ## Verify
 
@@ -99,9 +125,10 @@ objective, mapped spec obligations, or accepted behavior. Record each
 scenario's expected RED failure, GREEN result, any refactor, broader
 verification, command corrections, and material limitations.
 
-Return `COMPLETE`, `SPEC_REVISION_REQUIRED`, or `BLOCKED`, followed by the
-implemented outcome, changed owners, spec-obligation evidence trace, exact
-commands and results, bounded corrections, risks, and diff or commit reference.
+Return `COMPLETE`, `TASK_REVISION_REQUIRED`, `SPEC_REVISION_REQUIRED`, or
+`BLOCKED`, followed by the implemented outcome or exact blocker, changed
+owners, spec-obligation evidence trace, exact commands and results, bounded
+corrections, risks, and diff or commit reference.
 
 Create a commit only when requested. Implementation completion does not approve
 the task, merge it, or authorize deployment; route the immutable cumulative

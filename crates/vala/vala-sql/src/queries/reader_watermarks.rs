@@ -1,7 +1,7 @@
 //! Durable snapshots that live Bifrost readers still depend on.
 //!
 //! Forge maintenance and Bifrost readers never share a process, so a pinned
-//! Oracle cut or Scribe live-tail lease has to leave a durable trace before
+//! Oracle cut has to leave a durable trace before
 //! destructive maintenance can honour it. Each reader node republishes the
 //! oldest snapshot it still needs per table on its ordinary heartbeat, with an
 //! expiry derived from that same heartbeat, so a reader that stops answering

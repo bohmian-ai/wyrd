@@ -1803,7 +1803,7 @@ pub struct Oracle {
     /// One process-local lifecycle registry shared with private controls.
     running_queries: Arc<RunningQueryRegistry>,
     /// Snapshots this node's in-flight cuts still need Forge to retain.
-    reader_pins: Arc<reader_pins::ReaderPinLedger>,
+    reader_watermarks: Arc<reader_pins::ReaderWatermarks>,
     /// Tenant-qualified catalog and SQL owners retained for query execution.
     catalog: Arc<BifrostCatalog>,
     /// Tenant SQL handle retained for the Oracle lifecycle boundary.
@@ -1838,7 +1838,7 @@ pub struct Oracle {
     /// Background-only `PostgreSQL` allocator and renewal task.
     delegated_maintenance: Mutex<Option<JoinHandle<()>>>,
     /// Cancellation-bound task republishing this node's reader watermarks.
-    reader_watermarks: Mutex<Option<JoinHandle<()>>>,
+    reader_watermark_refresh: Mutex<Option<JoinHandle<()>>>,
     /// Test-tier one-shot pause after immutable worker selection.
     #[cfg(feature = "test-support")]
     topology_probe: Mutex<Option<Arc<OracleTopologyProbe>>>,
@@ -2049,9 +2049,7 @@ impl Oracle {
         let ready = Arc::new(AtomicBool::new(false));
         let (maintenance, startup_result) =
             OracleAdmission::start_maintenance(shutdown.clone(), Arc::clone(&ready))?;
-        let reader_pins = Arc::new(reader_pins::ReaderPinLedger::new());
-        let reader_watermarks = reader_pins::ReaderWatermarkPublisher::spawn(
-            Arc::clone(&reader_pins),
+        let (reader_watermarks, reader_watermark_refresh) = reader_pins::ReaderWatermarks::start(
             config.vala.clone(),
             admission.local_role.key.node_id.into(),
             shutdown.clone(),
@@ -2069,7 +2067,7 @@ impl Oracle {
             delegated_loss: Mutex::new(Some(loss_rx)),
             cluster,
             running_queries,
-            reader_pins,
+            reader_watermarks,
             catalog: config.catalog,
             vala: config.vala,
             memory: config.memory,
@@ -2087,7 +2085,7 @@ impl Oracle {
             startup_result: Mutex::new(Some(startup_result)),
             maintenance: Mutex::new(Some(maintenance)),
             delegated_maintenance: Mutex::new(Some(delegated_maintenance)),
-            reader_watermarks: Mutex::new(Some(reader_watermarks)),
+            reader_watermark_refresh: Mutex::new(Some(reader_watermark_refresh)),
             #[cfg(feature = "test-support")]
             topology_probe: Mutex::new(None),
         })
@@ -2449,22 +2447,24 @@ impl Oracle {
             prepared,
         } = input;
         let stale_replacement = StaleReplacementGate::before_output(retry_ordinal);
-        let planned = match prepared {
-            Some(planned) => planned,
-            None => {
-                self.plan_sql_attempt(
-                    context,
-                    &request.sql,
-                    tables,
-                    deadline,
-                    oracle_cut_cpu_cores(participant_cut),
-                )
-                .await?
-            }
-        };
+        let mut planned = self
+            .attempt_plan(
+                prepared,
+                context,
+                request,
+                tables,
+                deadline,
+                participant_cut,
+            )
+            .await?;
         if planned.query_class != expected_query_class {
             return Err(BifrostError::QueryPeerSecurity);
         }
+        // Every attempt enters the process-local ledger here, whichever path
+        // planned it. Background publication remains separate from query
+        // execution; closing the acquisition-ordering gap is remediation work
+        // and must not add a Postgres round trip to every read.
+        planned.reader_pin = Some(self.reader_watermarks.ledger().pin(&planned.cuts)?);
         self.ensure_query_telemetry(query_telemetry, request.visibility, planned.query_class);
         let mut phases = AttemptPhaseTimer::started();
         let (session, mut admitted, running_query) = self
@@ -2643,6 +2643,39 @@ impl Oracle {
             })
     }
 
+    /// Returns the plan this attempt executes, reusing a prepared one.
+    ///
+    /// A local leader already paid for classification when it prepared its
+    /// participant cut, so re-planning would pin the catalog twice for one
+    /// query. Every other path plans here.
+    ///
+    /// # Errors
+    ///
+    /// Returns the planner's stable error when classification fails.
+    async fn attempt_plan(
+        &self,
+        prepared: Option<PlannedSqlCut>,
+        context: &AuthorizedQueryContext,
+        request: &BifrostQueryRequest,
+        tables: &[TableRef],
+        deadline: Instant,
+        participant_cut: &OracleQueryAttemptCut,
+    ) -> Result<PlannedSqlCut, BifrostError> {
+        match prepared {
+            Some(planned) => Ok(planned),
+            None => {
+                self.plan_sql_attempt(
+                    context,
+                    &request.sql,
+                    tables,
+                    deadline,
+                    oracle_cut_cpu_cores(participant_cut),
+                )
+                .await
+            }
+        }
+    }
+
     /// Delegates one SQL metadata attempt to the planner owner.
     async fn plan_sql_attempt(
         &self,
@@ -2652,7 +2685,7 @@ impl Oracle {
         deadline: Instant,
         live_oracle_cpu: f64,
     ) -> Result<PlannedSqlCut, BifrostError> {
-        let mut planned = self
+        let planned = self
             .planner
             .pin_and_classify(
                 context,
@@ -2663,14 +2696,13 @@ impl Oracle {
                 live_oracle_cpu,
             )
             .await?;
-        planned.reader_pin = Some(self.reader_pins.pin(&planned.cuts));
         Ok(planned)
     }
 
-    /// Borrows this node's live reader-pin ledger for durable publication.
+    /// Borrows this node's durable reader-watermark owner.
     #[must_use]
-    pub fn reader_pins(&self) -> &Arc<reader_pins::ReaderPinLedger> {
-        &self.reader_pins
+    pub fn reader_watermarks(&self) -> &Arc<reader_pins::ReaderWatermarks> {
+        &self.reader_watermarks
     }
 
     /// Acquires live fences, commits the read decision, and drains authorized tails.
@@ -3222,7 +3254,7 @@ impl Oracle {
             }
         }
         let watermarks = self
-            .reader_watermarks
+            .reader_watermark_refresh
             .lock()
             .ok()
             .and_then(|mut handle| handle.take());

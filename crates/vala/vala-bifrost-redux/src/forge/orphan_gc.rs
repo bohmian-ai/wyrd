@@ -341,7 +341,7 @@ struct DurableProtectionRoots {
     hot_unpromoted: Vec<String>,
     /// Outputs produced or still producible by a nonterminal attempt.
     open_outputs: Vec<String>,
-    /// Snapshots an Oracle cut or live-tail lease still depends on.
+    /// Snapshots a pinned Oracle cut still depends on.
     pinned_snapshot_ids: Vec<i64>,
     /// Whether any open or unreconciled operation forbids destructive work.
     blocked: bool,

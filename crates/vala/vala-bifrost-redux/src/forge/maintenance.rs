@@ -15,9 +15,63 @@ use super::Forge;
 use super::compact::ForgeTableKey;
 use super::error::ForgeError;
 use super::expire::PendingExpiryTerminal;
+use super::expire::table_resource_for_key;
 use super::lease::ForgeLease;
+use super::manifest_rewrite::{
+    MANIFEST_REWRITE_COMMITTED, MANIFEST_REWRITE_PREPARED, MANIFEST_REWRITE_RESET,
+    ManifestGrouping, ManifestRewriteInputs, ManifestRewriteOperation,
+    manifest_rewrite_operation_id,
+};
 use super::metrics::ForgeMetricStage;
 use crate::catalog::TenantTableBinding;
+use wyrd_spec::vala::StoragePath;
+use wyrd_spec::vala::api::ForgeManifestRewritePhase;
+
+/// Lists the manifests the table's current snapshot names.
+///
+/// # Errors
+///
+/// Returns [`ForgeError::Catalog`] when the manifest list cannot be loaded.
+async fn current_manifest_paths(table: &Table) -> Result<Vec<String>, ForgeError> {
+    let Some(snapshot) = table.metadata().current_snapshot() else {
+        return Ok(Vec::new());
+    };
+    Ok(table
+        .manifest_list_reader(snapshot)
+        .load()
+        .await
+        .map_err(ForgeError::Catalog)?
+        .entries()
+        .iter()
+        .map(|entry| entry.manifest_path.clone())
+        .collect())
+}
+
+/// Borrows the table's current metadata location as audit-safe text.
+///
+/// # Errors
+///
+/// Returns [`ForgeError::Catalog`] when the table has no metadata location and
+/// [`ForgeError::Reconciliation`] when it is not representable in an audit row.
+fn metadata_location(table: &Table) -> Result<StoragePath, ForgeError> {
+    audit_path(
+        table
+            .metadata_location_result()
+            .map_err(ForgeError::Catalog)?,
+    )
+}
+
+/// Converts one catalog path into audit-safe storage text.
+///
+/// # Errors
+///
+/// Returns [`ForgeError::Reconciliation`] when the path is empty, over-long, or
+/// otherwise refused by the audit-detail value contract.
+fn audit_path(path: &str) -> Result<StoragePath, ForgeError> {
+    StoragePath::new(path.to_owned()).map_err(|error| ForgeError::Reconciliation {
+        detail: format!("manifest rewrite path {path} is not audit-safe: {error}"),
+    })
+}
 
 /// One already-filtered data manifest considered by the shared rewrite planner.
 ///
@@ -401,10 +455,27 @@ impl ForgeMaintenance {
     /// as a reconciliation error, never as a clean stop.
     async fn submit_manifest_rewrite(
         &self,
+        lease: &mut ForgeLease,
+        key: &ForgeTableKey,
         table: &Table,
         rewrite_paths: Vec<String>,
         stop: &CancellationToken,
     ) -> Result<(), ForgeError> {
+        let operation = ManifestRewriteOperation::prepare(ManifestRewriteInputs {
+            operation_id: manifest_rewrite_operation_id(key, &rewrite_paths),
+            group: table_resource_for_key(key),
+            base_metadata_location: metadata_location(table)?,
+            inputs: self.manifest_groupings(table, &rewrite_paths).await?,
+        });
+        self.forge
+            .append_manifest_rewrite_audit(
+                lease,
+                key.tenant,
+                &operation.prepared_detail(),
+                MANIFEST_REWRITE_PREPARED,
+            )
+            .await?;
+        let preimage = current_manifest_paths(table).await?;
         let rewrite = rewrite_manifests(
             self.forge.core.catalog.as_ref(),
             table,
@@ -448,10 +519,84 @@ impl ForgeMaintenance {
                     .to_owned(),
             }),
         };
-        if rewritten.outcome == ManifestRewriteOutcome::Stale {
-            tracing::debug!("manifest rewrite selection became stale; reconciling expiry state");
+        if rewritten.outcome != ManifestRewriteOutcome::Rewritten {
+            tracing::debug!(
+                outcome = ?rewritten.outcome,
+                "manifest rewrite committed nothing; settling the prepared operation as reset"
+            );
+            return self
+                .forge
+                .append_manifest_rewrite_audit(
+                    lease,
+                    key.tenant,
+                    &operation.reset_detail(),
+                    MANIFEST_REWRITE_RESET,
+                )
+                .await;
         }
-        Ok(())
+        let outputs = &self
+            .manifest_groupings(
+                &rewritten.table,
+                &current_manifest_paths(&rewritten.table)
+                    .await?
+                    .into_iter()
+                    .filter(|path| !preimage.contains(path))
+                    .collect::<Vec<_>>(),
+            )
+            .await?;
+        let detail = operation.commit(
+            outputs,
+            metadata_location(&rewritten.table)?,
+            ForgeManifestRewritePhase::Committed,
+        )?;
+        self.forge
+            .append_manifest_rewrite_audit(lease, key.tenant, &detail, MANIFEST_REWRITE_COMMITTED)
+            .await
+    }
+
+    /// Reads the live data-file membership of each named manifest.
+    ///
+    /// Membership is what the metadata-only proof compares, so it is read from
+    /// the manifests themselves rather than inferred from the selection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Catalog`] when a manifest list or manifest cannot
+    /// be loaded, and [`ForgeError::Reconciliation`] when a path is not
+    /// representable as audit-safe storage text.
+    async fn manifest_groupings(
+        &self,
+        table: &Table,
+        manifest_paths: &[String],
+    ) -> Result<Vec<ManifestGrouping>, ForgeError> {
+        let Some(snapshot) = table.metadata().current_snapshot() else {
+            return Ok(Vec::new());
+        };
+        let manifests = table
+            .manifest_list_reader(snapshot)
+            .load()
+            .await
+            .map_err(ForgeError::Catalog)?;
+        let mut groupings = Vec::new();
+        for entry in manifests
+            .entries()
+            .iter()
+            .filter(|entry| manifest_paths.contains(&entry.manifest_path))
+        {
+            let manifest = entry
+                .load_manifest(table.file_io())
+                .await
+                .map_err(ForgeError::Catalog)?;
+            let mut data_file_paths = Vec::new();
+            for live in manifest.entries().iter().filter(|entry| entry.is_alive()) {
+                data_file_paths.push(audit_path(live.data_file().file_path())?);
+            }
+            groupings.push(ManifestGrouping {
+                manifest_path: audit_path(&entry.manifest_path)?,
+                data_file_paths,
+            });
+        }
+        Ok(groupings)
     }
 
     /// Runs manifest rewrite, watermarked expiry, and never-published cleanup in order.
@@ -514,7 +659,7 @@ impl ForgeMaintenance {
         if manifest_rewrite_due && self.forge.core.config.manifest_rewrite_enabled {
             let rewrite_paths = self.select_rewrite_paths(&table, manifest_paths).await?;
             if !rewrite_paths.is_empty() {
-                self.submit_manifest_rewrite(&table, rewrite_paths, stop)
+                self.submit_manifest_rewrite(lease, key, &table, rewrite_paths, stop)
                     .await?;
             }
         }

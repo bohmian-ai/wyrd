@@ -22,8 +22,9 @@ use std::str::FromStr;
 use chrono::Utc;
 use sqlx::types::Uuid;
 use wyrd_spec::vala::api::{
-    AuditDetail, AuditEvent, ForgeIcebergRewritePhase, ForgeOrphanGcPhase,
-    ForgeScribePromotionPhase, ForgeSnapshotExpirePhase, audit_detail_canonical_json,
+    AuditDetail, AuditEvent, ForgeIcebergRewritePhase, ForgeManifestRewritePhase,
+    ForgeOrphanGcPhase, ForgeScribePromotionPhase, ForgeSnapshotExpirePhase,
+    audit_detail_canonical_json,
 };
 
 use crate::queries::audit_outbox::append_audit;
@@ -748,6 +749,11 @@ fn extract_detail_identity<'a>(
             group,
             ..
         } => ("forge_orphan_gc", operation_id, group),
+        AuditDetail::ForgeManifestRewrite {
+            operation_id,
+            group,
+            ..
+        } => ("forge_manifest_rewrite", operation_id, group),
         _ => {
             return Err(SqlError::Conflict {
                 detail: format!("expected forge detail kind {expected_kind}, got another variant"),
@@ -791,6 +797,12 @@ fn extract_detail_phase(detail: &AuditDetail) -> Result<ForgeOperationPhase, Sql
             ForgeOrphanGcPhase::Prepared => ForgeOperationPhase::Prepared,
             ForgeOrphanGcPhase::Committed => ForgeOperationPhase::Committed,
             ForgeOrphanGcPhase::Recovered => ForgeOperationPhase::Recovered,
+        },
+        AuditDetail::ForgeManifestRewrite { phase, .. } => match phase {
+            ForgeManifestRewritePhase::Prepared => ForgeOperationPhase::Prepared,
+            ForgeManifestRewritePhase::Committed => ForgeOperationPhase::Committed,
+            ForgeManifestRewritePhase::Recovered => ForgeOperationPhase::Recovered,
+            ForgeManifestRewritePhase::Reset => ForgeOperationPhase::Reset,
         },
         _ => {
             return Err(SqlError::Conflict {

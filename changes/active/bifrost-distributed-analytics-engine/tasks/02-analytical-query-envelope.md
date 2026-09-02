@@ -651,3 +651,115 @@ contract.
   The graph lifecycle task is otherwise polled on the test's own stack, and the
   combined debug-build frame overflows it; the two orderings also share one
   boxed future slot for the same reason.
+
+### Scenario 4 remediation — reserve and release one graph on the real query path
+
+Commit `e7fc79439`. The Scenario 4 unit proof leased through the inactive seam,
+which never reaches `Oracle::execute_distributed_session`, so the production SQL
+path was still reserving and releasing outside the graph the supervisor owns.
+
+- `execute_distributed_session` now reserves exactly once, through the graph's
+  own signals, after `plan_distributed_split` reports a supported plan that
+  produced a follower subtree — so failed planning, an unsupported shape, and
+  the exchange-free fallback each issue zero reserve RPCs.
+- The same path settles through that graph rather than through a locally held
+  owner, so the real query path and the inactive seam share one reservation and
+  one release.
+- Verified with `mise run test:bifrost` and
+  `mise run test:bifrost:journey:oracle`.
+
+### Scenario 1 remediation — the ungrouped `Final` aggregate is supported
+
+Commit `2a8f25c1c`. Re-verified rather than inherited: the open failure of
+`distributed::pg_bifrost_selective_predicate_and_projection_prune_distributed_reads`
+was recorded as pre-existing at baseline `1f020ead2`, but `1f020ead2` already
+contains Scenario 1 (`26331b94c`). Running the journey at `26331b94c~1` passes
+and at `26331b94c` onward fails, so the failure is this task's regression.
+
+- Cause: the closed predicate accepted only `Partial`, `PartialReduce`, and
+  `FinalPartitioned`. `DataFusion` plans every ungrouped aggregate as
+  `Partial` → `CoalescePartitionsExec` → `Final`, so `SELECT count(*)` was
+  refused as an unsupported distributed shape and reported
+  `QueryExecutionFailed`, hiding the tenant tripwire's `QueryTenantInvariant`.
+- Fix: `Final` joins the accepted set — it consumes the same accumulator state
+  `FinalPartitioned` does. `Single` and `SinglePartitioned` stay refused: they
+  carry no partial layer, so no state crosses a participant boundary.
+  `assert_accepted_aggregate_matrix` was corrected accordingly, not weakened.
+- Commands: `mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib --features test-support,bench-support -E 'test(=oracle::exec::tests::supported_analytical_plan_accepts_only_the_v1_baseline) or test(/oracle::splitter/)'` → 4 passed;
+  `scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-testing --test oracle -P journey -E 'test(=distributed::pg_bifrost_selective_predicate_and_projection_prune_distributed_reads)' --run-ignored=all"` → 1 passed.
+
+### Scenario 5 — One supervisor-owned lifecycle task and retained cleanup failure
+
+- RED: `oracle::analytical::tests::leader_lifecycle_task_joins_every_owner_and_retains_failure`
+  failed at `a cleanup failure prevents a success terminal` when the settlement
+  path published `SettledSuccess` and dropped the failure detail instead of
+  retaining the graph — the log-and-ignore settlement this task invalidates
+  (temporary inversion of the failure branch, reverted).
+- GREEN, commit `d6c0e2a5c`:
+  - The leader supervisor's map value is now
+    `AnalyticalGraphEntry::{Active, Draining}`, following the follower's
+    existing lifecycle shape. `AnalyticalGraphState` gained the entry's
+    `AnalyticalGraphLifecycleOwner`: the control sender, a clonable result
+    receiver, and the one `Option<JoinHandle<()>>`. The separate `draining`
+    `HashSet` is gone; `draining_graphs` counts `Draining` entries carrying a
+    recorded failure, which keeps readiness false for residue only and not for
+    a graph merely passing through settlement.
+  - New supervisor operations: `attach_lifecycle`, `signal_reserve`,
+    `signal_terminal`, `graph_settlement_failure`, and the private
+    `take_lifecycle_task`. `signal_terminal` moves `Active` to `Draining` under
+    the graph mutex and only the first signal sends the outcome; every later
+    signal observes `Draining`, leaves the outcome unchanged, and is handed the
+    same result receiver.
+  - `AnalyticalGraphSignals` no longer holds a control sender or a task. It
+    holds the supervisor, the graph key, its own clone of the result receiver,
+    the participant cell, and a `oneshot` the admission owner is handed through.
+    Its `Drop` signals cancellation and nothing else.
+  - `AnalyticalGraphControl::Terminal` carries the outcome;
+    `AnalyticalGraphResult` gained `SettledSuccess(Option<AnalyticalAttemptRelease>)`
+    and `SettledFailure`.
+  - The lifecycle task owns the whole order: move the entry out of `Active`,
+    cancel on a non-success outcome, join the attempt and every driver it
+    retained, close the graph's exchange registry, return every participant
+    reservation under Scenario 2's expiry rule, wait out the envelope's nested
+    children, release the graph, and release the admission owner last of all.
+    Successful cleanup removes the entry before publishing settled success; an
+    unconfirmed cleanup calls the new `AnalyticalGraphGuard::retain`, records
+    the detail on the `Draining` entry, and publishes settled failure.
+  - `AnalyticalAttemptOwnership` no longer holds either guard — the task does.
+    It keeps the attempt key, its cancellation child, the shared egress fence,
+    and the signals; `settle` signals and awaits, and never performs cleanup.
+  - `AnalyticalSupervisor::shutdown` signals every remaining graph, takes each
+    handle, and joins it before the attempt and graph sweep.
+  - `settle_analytical` now reports whether the graph settled cleanly, and
+    `settle_and_finish_stream` downgrades its terminal when it did not, so a
+    retained cleanup cannot become a success terminal.
+- Command: `scripts/postgres/with-test-postgres.sh -- mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib --features test-support,bench-support -E 'test(=oracle::analytical::tests::leader_lifecycle_task_joins_every_owner_and_retains_failure)'` → 1 passed.
+- Follow-on fix, commit `13170a9b9`: `pg_inactive_analytical_production_telemetry_covers_every_hot_path`
+  failed with a leader graph retained at 547 bytes of nested memory. An outbound
+  exchange keeps its reader task, and the buffers it charges to the query pool,
+  alive until every partition stream it handed out is dropped; cancellation
+  alone does not drop them. The leader lifecycle task now closes the graph's own
+  exchange registry before waiting for the envelope's children, exactly as the
+  follower lease already did.
+- Bounded corrections recorded:
+  1. `ReservationFixture` now registers a real graph and attaches its lifecycle,
+     because the supervisor's graph entry *is* the lifecycle registry: a task
+     with no entry could not move its graph to draining, retain a failed
+     cleanup, or be joined by shutdown.
+  2. The result channel keeps only its latest value, so a settlement can
+     overwrite the reservation verdict. `publish_participants` therefore reads
+     the durable record — the participant cell is set once, only after every
+     participant accepted, so its absence is the refusal.
+  3. The `AdmittedQueryGuard` the inactive seam retains is handed to the
+     lifecycle task through a `oneshot` rather than held by the ownership, so
+     the admission counters are returned only after the graph has returned the
+     envelope taken out of that guard, on the drop path as well as on `settle`.
+- Broader verification: `mise run fmt`; `mise run lints` clean;
+  `mise run test:bifrost` → 969/969 passed (the four
+  `catalog::bifrost_catalog::production_pin_tests::*` /
+  `scribe::persistence::tests::*` failures reported in earlier scenarios were an
+  artifact of running bare `cargo nextest` without
+  `scripts/postgres/with-test-postgres.sh`; they pass in the lane);
+  `mise run test:bifrost:journey:oracle` → 15/15 passed;
+  `mise run check:bifrost-resource-governance` passed;
+  `mise run check:bifrost-oracle-deploy` → 2 passed; `git diff --check` clean.

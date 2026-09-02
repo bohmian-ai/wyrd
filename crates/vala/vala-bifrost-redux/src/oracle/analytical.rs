@@ -959,6 +959,16 @@ impl GraphLeaseBinding {
         Ok(())
     }
 
+    /// Returns the signed absolute wall-clock deadline of the whole graph.
+    ///
+    /// This is the graph's only time bound and it is immutable: every later
+    /// stage message must carry the identical value or [`Self::authorize`]
+    /// refuses it. The ingress reads it to know when a graph that no coordinator
+    /// connection is holding must nevertheless be cancelled.
+    pub(crate) const fn absolute_deadline_ms(&self) -> i64 {
+        self.absolute_deadline_ms
+    }
+
     /// Reports whether `request` names exactly this graph's reservation tuple.
     pub(crate) fn matches(&self, request: &GraphLeaseRequest) -> bool {
         self.reservation_id == request.reservation_id
@@ -1262,6 +1272,42 @@ struct GraphSettlement {
     outcome: AnalyticalAttemptOutcome,
 }
 
+/// The closed set of commands the one settlement driver accepts.
+///
+/// Two, because the driver has exactly two reasons to run: a graph it must
+/// settle now, and a change to the set of graphs whose deadlines it is
+/// watching. Sharing one queue keeps the driver a single joined owner with a
+/// single capacity root rather than two independently sized channels.
+enum GraphSettlementCommand {
+    /// A newly activated graph exists; rescan the deadline inventory.
+    Wake,
+    /// Settle exactly this graph, which has already left the active state.
+    Settle(GraphSettlement),
+}
+
+/// Why the bounded settlement queue could not take a command.
+///
+/// Named rather than stringly because the two cases have different policies: a
+/// lost settlement is a cleanup failure the graph must retain, while a full
+/// queue is itself a wake and loses nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettlementQueueRefusal {
+    /// Every slot is taken; the driver has unread commands to process.
+    Full,
+    /// The queue is closed or unreadable, so nothing will observe this graph.
+    Closed,
+}
+
+impl SettlementQueueRefusal {
+    /// Renders the retained cleanup-failure reason for this refusal.
+    fn detail(self) -> String {
+        match self {
+            Self::Full => "Oracle analytical settlement queue is full".to_owned(),
+            Self::Closed => "Oracle analytical settlement queue is closed".to_owned(),
+        }
+    }
+}
+
 /// Complete construction inputs for one follower [`AnalyticalStageIngress`].
 ///
 /// Naming the dependencies keeps the two shared owners — the server authority
@@ -1341,7 +1387,7 @@ pub struct AnalyticalStageIngress {
     /// Cleared by shutdown, which is how the driver learns to finish. A send
     /// that cannot be made is recorded as a cleanup failure on the graph; it is
     /// never quietly downgraded to a spawn or a successful terminal.
-    settlement: Mutex<Option<mpsc::Sender<GraphSettlement>>>,
+    settlement: Mutex<Option<mpsc::Sender<GraphSettlementCommand>>>,
     /// The one settlement driver, owned and joined by this ingress.
     driver: Mutex<Option<JoinHandle<()>>>,
     /// Whether this ingress still admits new stage work.
@@ -1395,7 +1441,14 @@ impl AnalyticalStageIngress {
         // Sized from the one capacity root that already bounds graph
         // admission, so the queue can always hold every graph this node is
         // permitted to own at once and there is no second capacity setting.
-        let (sender, receiver) = mpsc::channel(reservations.max_concurrent_graphs());
+        // Two commands per graph: at most one activation wake and one terminal
+        // settlement can be outstanding for any admitted graph at a time.
+        let (sender, receiver) = mpsc::channel(
+            reservations
+                .max_concurrent_graphs()
+                .saturating_mul(2)
+                .max(1),
+        );
         Arc::new_cyclic(|weak: &Weak<Self>| {
             let driver = if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 Some(handle.spawn(drive_graph_settlements(receiver, Weak::clone(weak))))
@@ -1618,6 +1671,23 @@ impl AnalyticalStageIngress {
                 open_connections: 0,
             },
         );
+        // The driver watches deadlines from this map, so it has to learn that
+        // the map changed. A full queue already means the driver has unread
+        // commands and will rescan, so it is not a lost signal; a closed queue
+        // means nothing will ever observe this graph again, and publishing an
+        // active lease no owner can end is worse than refusing the stage.
+        if self.offer_settlement(GraphSettlementCommand::Wake)
+            == Err(SettlementQueueRefusal::Closed)
+        {
+            graphs.insert(
+                graph,
+                AnalyticalGraphEntry::Draining {
+                    lease,
+                    settlement_failure: Some(SettlementQueueRefusal::Closed.detail()),
+                },
+            );
+            return Err(BifrostError::QueryExecutionFailed);
+        }
         Ok(lease)
     }
 
@@ -1847,45 +1917,138 @@ impl AnalyticalStageIngress {
         graph: AnalyticalGraphKey,
         outcome: AnalyticalAttemptOutcome,
     ) {
-        let Some(AnalyticalGraphEntry::Active { lease, .. }) = graphs.remove(&graph) else {
+        let Some(settlement) = Self::begin_draining_locked(graphs, graph, outcome) else {
             return;
         };
-        let failure = self.signal_settlement(GraphSettlement {
-            graph,
-            lease: Arc::clone(&lease),
-            outcome,
-        });
+        let Err(refusal) = self.offer_settlement(GraphSettlementCommand::Settle(settlement)) else {
+            return;
+        };
+        if let Some(AnalyticalGraphEntry::Draining {
+            settlement_failure, ..
+        }) = graphs.get_mut(&graph)
+        {
+            *settlement_failure = Some(refusal.detail());
+        }
+    }
+
+    /// Moves one active graph to draining and names the settlement it needs.
+    ///
+    /// Returns `None` when `graph` is not active here, which is what makes a
+    /// second path arriving later a no-op rather than a second settlement. The
+    /// entry is replaced rather than removed, so a graph already draining keeps
+    /// every owner and every recorded failure it had.
+    fn begin_draining_locked(
+        graphs: &mut HashMap<AnalyticalGraphKey, AnalyticalGraphEntry>,
+        graph: AnalyticalGraphKey,
+        outcome: AnalyticalAttemptOutcome,
+    ) -> Option<GraphSettlement> {
+        let Some(AnalyticalGraphEntry::Active { lease, .. }) = graphs.get(&graph) else {
+            return None;
+        };
+        let lease = Arc::clone(lease);
         graphs.insert(
             graph,
             AnalyticalGraphEntry::Draining {
-                lease,
-                settlement_failure: failure,
+                lease: Arc::clone(&lease),
+                settlement_failure: None,
             },
         );
+        Some(GraphSettlement {
+            graph,
+            lease,
+            outcome,
+        })
     }
 
-    /// Offers one graph to the bounded settlement queue without blocking.
+    /// Offers one command to the bounded settlement queue without blocking.
     ///
-    /// Returns the cleanup failure to record when the queue cannot take it.
-    fn signal_settlement(&self, message: GraphSettlement) -> Option<String> {
-        let sender = match self.settlement.lock() {
-            Ok(settlement) => settlement.clone(),
-            Err(_) => {
-                return Some("Oracle analytical settlement queue lock is poisoned".to_owned());
-            }
-        };
-        let Some(sender) = sender else {
-            return Some("Oracle analytical settlement queue is closed".to_owned());
-        };
-        match sender.try_send(message) {
-            Ok(()) => None,
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                Some("Oracle analytical settlement queue is full".to_owned())
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                Some("Oracle analytical settlement queue is closed".to_owned())
-            }
-        }
+    /// Returns the refusal rather than a rendered reason so each caller applies
+    /// its own policy: a settlement the queue cannot take is a cleanup failure,
+    /// while a wake the queue cannot take is already implied by the commands
+    /// that filled it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SettlementQueueRefusal::Full`] when every slot is taken and
+    /// [`SettlementQueueRefusal::Closed`] when the queue is closed, taken by
+    /// shutdown, or unreadable.
+    fn offer_settlement(
+        &self,
+        command: GraphSettlementCommand,
+    ) -> Result<(), SettlementQueueRefusal> {
+        let sender = self
+            .settlement
+            .lock()
+            .map_err(|_| SettlementQueueRefusal::Closed)?
+            .clone()
+            .ok_or(SettlementQueueRefusal::Closed)?;
+        sender.try_send(command).map_err(|error| match error {
+            mpsc::error::TrySendError::Full(_) => SettlementQueueRefusal::Full,
+            mpsc::error::TrySendError::Closed(_) => SettlementQueueRefusal::Closed,
+        })
+    }
+
+    /// Moves every graph past its signed deadline to draining, and reports the
+    /// next deadline still to watch.
+    ///
+    /// One pass under one lock so the settlements the driver takes and the
+    /// timer it then waits on describe the same instant. The returned
+    /// settlements are handed straight to the driver's own concurrent set
+    /// rather than through the queue, because the driver is already the caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::Internal`] when the graph lock is poisoned.
+    fn expire_due_graphs(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<(Vec<GraphSettlement>, Option<i64>), BifrostError> {
+        let mut graphs = self.graphs.lock().map_err(|_| poisoned_ingress())?;
+        let now_ms = now.timestamp_millis();
+        // ponytail: linear scan of the whole graph map, which
+        // `ReservationRegistry::max_concurrent_graphs()` already bounds to this
+        // node's admitted graph count; a deadline-ordered priority queue is the
+        // upgrade only if profiling ever shows this scan mattering.
+        let due = graphs
+            .iter()
+            .filter_map(|(graph, entry)| match entry {
+                AnalyticalGraphEntry::Active { lease, .. } => {
+                    (lease.binding().absolute_deadline_ms() <= now_ms).then_some(*graph)
+                }
+                AnalyticalGraphEntry::Draining { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        let settlements = due
+            .into_iter()
+            .filter_map(|graph| {
+                Self::begin_draining_locked(&mut graphs, graph, AnalyticalAttemptOutcome::Cancelled)
+            })
+            .collect::<Vec<_>>();
+        let next = graphs
+            .values()
+            .filter_map(|entry| match entry {
+                AnalyticalGraphEntry::Active { lease, .. } => {
+                    Some(lease.binding().absolute_deadline_ms())
+                }
+                AnalyticalGraphEntry::Draining { .. } => None,
+            })
+            .min();
+        Ok((settlements, next))
+    }
+
+    /// Returns how many commands the bounded settlement queue can hold.
+    ///
+    /// Test-only. The queue's size is the property that keeps a valid
+    /// settlement from being retained as a queue-full cleanup failure, and it
+    /// is deliberately derived rather than configured, so the only way to
+    /// assert it is to read it back.
+    #[cfg(test)]
+    fn settlement_capacity(&self) -> usize {
+        self.settlement
+            .lock()
+            .ok()
+            .and_then(|settlement| settlement.as_ref().map(mpsc::Sender::max_capacity))
+            .unwrap_or_default()
     }
 
     /// Returns the published lease for one graph, for identity assertions.
@@ -1992,30 +2155,96 @@ impl AnalyticalStageIngress {
     }
 }
 
-/// Settles every graph the caller-drop path hands to this node, one at a time.
+/// Settles every graph this node must release, and cancels each at its deadline.
 ///
-/// The single asynchronous owner of caller-drop settlement. It holds only a
-/// [`Weak`] back-reference, so the ingress's own join handle cannot keep the
-/// ingress alive; a settlement that completes after the node is gone simply has
-/// no entry left to update. Returning ends the driver, which is what
-/// [`AnalyticalStageIngress::shutdown`] joins.
+/// The single asynchronous owner of follower settlement. It has three reasons
+/// to wake — a command on its bounded queue, the earliest signed graph deadline
+/// coming due, and the completion of a settlement it already owns — and it
+/// serves all three from one task. The settlements it owns run concurrently in
+/// one driver-local `FuturesUnordered`, so a graph whose cleanup drains slowly
+/// cannot stop the driver from cancelling a different graph on time; they are
+/// still this task's own futures, so nothing is detached and shutdown's join is
+/// still complete.
+///
+/// It holds only a [`Weak`] back-reference, so the ingress's own join handle
+/// cannot keep the ingress alive; a settlement that completes after the node is
+/// gone simply has no entry left to update. Returning ends the driver, which is
+/// what [`AnalyticalStageIngress::shutdown`] joins.
 async fn drive_graph_settlements(
-    mut settlements: mpsc::Receiver<GraphSettlement>,
+    mut commands: mpsc::Receiver<GraphSettlementCommand>,
     ingress: Weak<AnalyticalStageIngress>,
 ) {
-    while let Some(message) = settlements.recv().await {
-        let settled = message.lease.settle(message.outcome).await;
-        if let Err(error) = &settled {
-            tracing::warn!(
-                error = %error,
-                public_query_id = %message.graph.public_query_id,
-                "Oracle analytical follower could not settle a closed graph"
-            );
+    let mut settling = futures_util::stream::FuturesUnordered::new();
+    let mut queue_closed = false;
+    loop {
+        // Every deadline is rescanned from the graph map on every wake rather
+        // than tracked incrementally: the map is the one lifecycle inventory,
+        // and a second copy of it could disagree with the state that authorizes
+        // work against the same graph.
+        let next_deadline = match ingress.upgrade() {
+            Some(node) => match node.expire_due_graphs(Utc::now()) {
+                Ok((due, next)) => {
+                    for settlement in due {
+                        settling.push(settle_graph(settlement));
+                    }
+                    next
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "Oracle analytical settlement driver cannot read graph deadlines"
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
+        if queue_closed && settling.is_empty() {
+            return;
         }
-        if let Some(ingress) = ingress.upgrade() {
-            ingress.record_settlement(message.graph, &settled);
+        let timer = next_deadline.map(|deadline_ms| {
+            let remaining = deadline_ms.saturating_sub(Utc::now().timestamp_millis());
+            tokio::time::sleep(Duration::from_millis(u64::try_from(remaining).unwrap_or(0)))
+        });
+        tokio::select! {
+            command = commands.recv(), if !queue_closed => match command {
+                Some(GraphSettlementCommand::Wake) => {}
+                Some(GraphSettlementCommand::Settle(settlement)) => {
+                    settling.push(settle_graph(settlement));
+                }
+                None => queue_closed = true,
+            },
+            Some((graph, settled)) = futures_util::StreamExt::next(&mut settling) => {
+                if let Err(error) = &settled {
+                    tracing::warn!(
+                        error = %error,
+                        public_query_id = %graph.public_query_id,
+                        "Oracle analytical follower could not settle a closed graph"
+                    );
+                }
+                if let Some(node) = ingress.upgrade() {
+                    node.record_settlement(graph, &settled);
+                }
+            }
+            () = async {
+                timer
+                    .expect("the timer branch is enabled only when a deadline exists")
+                    .await;
+            }, if timer.is_some() => {}
         }
     }
+}
+
+/// Runs one graph's settlement and reports which graph it was.
+///
+/// A free function so every future in the driver's concurrent set has the same
+/// type, and so the graph identity survives to the completion arm without the
+/// driver keeping a parallel table of in-flight settlements.
+async fn settle_graph(
+    settlement: GraphSettlement,
+) -> (AnalyticalGraphKey, Result<(), BifrostError>) {
+    let settled = settlement.lease.settle(settlement.outcome).await;
+    (settlement.graph, settled)
 }
 
 /// Leader-side ownership of every participant reservation one attempt took.
@@ -2918,7 +3147,24 @@ mod tests {
         /// Panics when the Oracle role, spill owner, or reservation cannot be
         /// composed, which would make every assertion below vacuous.
         fn new(now: DateTime<Utc>) -> Self {
-            Self::with_pod_spill_limit(now, 2 * 1024 * 1024 * 1024)
+            Self::compose(
+                now,
+                2 * 1024 * 1024 * 1024,
+                now + chrono::Duration::seconds(60),
+            )
+        }
+
+        /// Composes the same fixture whose graph carries an exact deadline.
+        ///
+        /// The signed absolute deadline is the only bound an `ExecuteTask`-first
+        /// graph has, so a test that proves that bound has to choose it.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the Oracle role, spill owner, or reservation cannot be
+        /// composed, which would make every assertion below vacuous.
+        fn with_deadline(now: DateTime<Utc>, deadline: DateTime<Utc>) -> Self {
+            Self::compose(now, 2 * 1024 * 1024 * 1024, deadline)
         }
 
         /// Composes the same fixture over an exact process spill limit.
@@ -2932,6 +3178,24 @@ mod tests {
         /// Panics when the Oracle role, spill owner, or reservation cannot be
         /// composed, which would make every assertion below vacuous.
         fn with_pod_spill_limit(now: DateTime<Utc>, pod_spill_limit_bytes: u64) -> Self {
+            Self::compose(
+                now,
+                pod_spill_limit_bytes,
+                now + chrono::Duration::seconds(60),
+            )
+        }
+
+        /// Composes the fixture over an exact spill limit and graph deadline.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the Oracle role, spill owner, or reservation cannot be
+        /// composed, which would make every assertion below vacuous.
+        fn compose(
+            now: DateTime<Utc>,
+            pod_spill_limit_bytes: u64,
+            deadline: DateTime<Utc>,
+        ) -> Self {
             let root = tempfile::tempdir().expect("fixture scratch root must exist");
             let spill = Arc::new(
                 OracleSpillRuntime::new(root.path(), pod_spill_limit_bytes)
@@ -2968,7 +3232,6 @@ mod tests {
             );
             let leader_node_id = NodeId::new(Uuid::from_u128(1));
             let leader_fence = 3;
-            let deadline = now + chrono::Duration::seconds(60);
             let resources = fixture_oracle_role()
                 .try_acquire_query(OracleResourceRequest::for_class(
                     QueryClass::Analytical,
@@ -3029,6 +3292,58 @@ mod tests {
                 spill,
                 _root: root,
             }
+        }
+
+        /// Reserves one more graph on the same follower and names its message.
+        ///
+        /// The second graph shares this fixture's ingress, driver, and settlement
+        /// queue, which is the only way a test can observe how one graph's
+        /// settlement affects another's.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the follower cannot admit a second graph reservation.
+        fn sibling(
+            &self,
+            now: DateTime<Utc>,
+            deadline: DateTime<Utc>,
+        ) -> (AnalyticalGraphKey, StageMessage) {
+            let graph = AnalyticalGraphKey::new(
+                PublicQueryId::from_uuid(Uuid::from_u128(21)),
+                DataFusionQueryId::from_uuid(Uuid::from_u128(22)),
+            );
+            let resources = fixture_oracle_role()
+                .try_acquire_query(OracleResourceRequest::for_class(
+                    QueryClass::Analytical,
+                    0.0,
+                ))
+                .expect("an idle Oracle admits one analytical query");
+            let reservation = self
+                .reservations
+                .reserve(
+                    &ReserveNodeSlotsRequest {
+                        query_id: QueryId::new(graph.public_query_id.as_uuid()),
+                        leader_node_id: self.leader_node_id,
+                        leader_fencing_token: self.leader_fence,
+                        query_class: QueryClass::Analytical,
+                        slot_units: ANALYTICAL_GRAPH_SLOT_UNITS,
+                        expires_at: deadline,
+                        graph: Some(AnalyticalGraphRef {
+                            public_query_id: graph.public_query_id.as_uuid(),
+                            datafusion_query_id: graph.datafusion_query_id.as_uuid(),
+                        }),
+                    },
+                    now,
+                    Some(super::super::dispatcher::ReservedCapacity::Graph(Box::new(
+                        resources,
+                    ))),
+                )
+                .expect("an idle follower accepts a second graph reservation");
+            let mut message = self.leader_message(StageOperationV1::ExecuteTask, 9);
+            message.graph = graph;
+            message.reservation_id = reservation.reservation_id.as_uuid().to_string();
+            message.absolute_deadline_ms = deadline.timestamp_millis();
+            (graph, message)
         }
 
         /// Composes this node's production Analytical handle over the fixture.
@@ -3295,6 +3610,130 @@ mod tests {
             .finish_attempt(sibling_attempt, AnalyticalAttemptOutcome::Success)
             .await
             .expect("the sibling graph's only attempt settles");
+    }
+
+    /// An `ExecuteTask`-first graph settles no later than its signed deadline.
+    ///
+    /// Upstream sends its plan on a spawned coordinator-channel task, so a
+    /// valid `ExecuteTask` may activate a graph before any `SetPlan` arrives.
+    /// The end of that unary request is *not* a departure signal — upstream may
+    /// keep producing rows after consuming the request body — so the graph
+    /// stays owned. Its bound is therefore the one the leader already signed:
+    /// the absolute deadline in the retained binding. The single ingress-owned
+    /// driver observes it, moves the graph to draining, cancels it, and runs
+    /// the same joined settlement every other terminal path runs.
+    ///
+    /// A sibling graph whose envelope keeps a live nested child holds its own
+    /// settlement open across the target's whole deadline, which is what proves
+    /// the driver settles concurrently rather than serially: a slow cleanup may
+    /// not stop the driver from cancelling another graph on time.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a live `ExecuteTask`-first graph is released by the end of
+    /// its unary request, when it outlives its signed deadline, when a blocked
+    /// sibling settlement delays it, or when the bounded settlement queue
+    /// cannot hold one wake plus one settlement per admitted graph.
+    #[tokio::test]
+    async fn execute_task_first_without_set_plan_settles_at_signed_deadline() {
+        let now = Utc::now();
+        let target_deadline = now + chrono::Duration::milliseconds(400);
+        let fixture = GraphFixture::with_deadline(now, target_deadline);
+
+        // One wake and one terminal settlement per admitted graph must fit, or
+        // a valid settlement would be retained as a queue-full cleanup failure.
+        assert_eq!(
+            fixture.ingress.settlement_capacity(),
+            2 * fixture.reservations.max_concurrent_graphs(),
+            "the settlement queue must hold one wake plus one settlement per admitted graph"
+        );
+
+        // The sibling activates first and is handed to the driver immediately,
+        // with one real nested child that keeps its drain from completing.
+        let (sibling_graph, sibling_message) =
+            fixture.sibling(now, now + chrono::Duration::seconds(60));
+        fixture
+            .send(&sibling_message, now)
+            .await
+            .expect("the reserving leader activates the sibling graph");
+        let sibling_runtime = fixture
+            .supervisor
+            .graph_runtime(sibling_graph)
+            .expect("the sibling graph installed a query-owned runtime");
+        let gate = datafusion::execution::memory_pool::MemoryConsumer::new("sibling-gate")
+            .register(&sibling_runtime.runtime().memory_pool);
+        gate.try_grow(1024)
+            .expect("the admitted envelope funds one nested child");
+        drop(
+            fixture
+                .ingress
+                .retain_connection(sibling_graph)
+                .expect("a live graph retains a coordinator connection"),
+        );
+
+        // The target activates from `ExecuteTask` alone. No coordinator channel
+        // is ever opened for it, and its unary request has already returned.
+        fixture
+            .send(
+                &fixture.leader_message(StageOperationV1::ExecuteTask, 2),
+                now,
+            )
+            .await
+            .expect("the reserving leader activates the graph from ExecuteTask alone");
+        assert!(
+            fixture
+                .ingress
+                .graph_worker(&fixture.graph)
+                .expect("graph ownership is readable")
+                .is_some(),
+            "a completed unary ExecuteTask must not release valid work"
+        );
+
+        // Past the signed deadline the target settles and releases everything,
+        // while the sibling's blocked settlement is still in flight.
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while fixture.ingress.published(fixture.graph).is_ok() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the target graph settles at its signed deadline");
+        assert!(
+            fixture
+                .ingress
+                .graph_worker(&fixture.graph)
+                .expect("graph ownership is readable")
+                .is_none(),
+            "a settled graph released its upstream worker"
+        );
+        assert!(
+            fixture.supervisor.graph_runtime(fixture.graph).is_err(),
+            "a settled graph released its supervisor registration and query runtime"
+        );
+        assert!(
+            fixture.ingress.published(sibling_graph).is_ok(),
+            "the blocked sibling is still owned by the same driver"
+        );
+
+        // Releasing the gate lets the sibling's own settlement complete, and
+        // shutdown joins the one driver rather than a detached cleanup task.
+        drop(gate);
+        let inspection = tokio::time::timeout(Duration::from_secs(10), fixture.ingress.shutdown())
+            .await
+            .expect("the one settlement driver joins within the bound")
+            .expect("the follower shuts down without a poisoned lock");
+        assert_eq!(
+            inspection.graphs_retained, 0,
+            "both graphs were released, not retained"
+        );
+        assert!(
+            fixture
+                .ingress
+                .live()
+                .expect("ownership is readable")
+                .is_clean(),
+            "the follower retains nothing after both graphs settled"
+        );
     }
 
     /// A retained follower cleanup failure alone fails production readiness.

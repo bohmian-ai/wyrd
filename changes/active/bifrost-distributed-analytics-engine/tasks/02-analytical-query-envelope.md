@@ -86,14 +86,25 @@ the Interactive floor belong to Task 4.
 **Behavior.** The accepted physical matrix is closed and direct:
 
 - scan chains may contain `DataSourceExec`, `RemoteSourcePlaceholderExec`,
-  `MemorySourceConfig`, `EmptyExec`, `FilterExec`, and `ProjectionExec`;
+  `MemorySourceConfig`, `EmptyExec`, `FilterExec`, `ProjectionExec`, and the
+  existing `TenantTripwireExec`;
 - `AggregateExec` may use only `Partial`, `PartialReduce`, or
-  `FinalPartitioned`, and only fixed-width `COUNT`, `SUM`, `MIN`, or `MAX`;
+  `FinalPartitioned`. Every aggregate is a pinned built-in, non-distinct,
+  order-insensitive expression with no aggregate `FILTER`: `COUNT(*)` or
+  `COUNT(Int64)` has one non-null `Int64` accumulator state and a non-null
+  `Int64` result; `SUM(Int64)`, `MIN(Int64)`, and `MAX(Int64)` each have one
+  nullable `Int64` accumulator state and a nullable `Int64` result. Physical
+  coercion must already have produced those exact argument types;
 - distributed fan-out/fan-in may use only `RepartitionExec`,
-  `CoalescePartitionsExec`, `SortPreservingMergeExec`, and `UnionExec`;
-- joins may use only `HashJoinExec` with equi-keys and no non-equi join filter;
-  and
-- ordering/spill may use only the qualified `SortExec`.
+  `CoalescePartitionsExec`, and `SortPreservingMergeExec`;
+- `UnionExec` is accepted only as the direct source child of one
+  `TenantTripwireExec`, with at least one authenticated source id, every source
+  id present in `source_groups`, and all ids mapped to the same canonical table.
+  A SQL/user set operation is never an accepted structural union, even when its
+  inputs read the same table;
+- joins may use only `HashJoinExec` with `JoinType::Inner`, at least one
+  column-to-column equi-key, and `filter().is_none()`; and
+- ordering/spill may use only `SortExec` with `fetch() == None`.
 
 Every other aggregate mode, function, join form, semantic node, window, unknown
 leaf, or plan without a real network exchange fails synchronously before IO or
@@ -101,23 +112,37 @@ reservation. Maps REQ-003, REQ-004, INV-007, INV-008, AC-002, AC-008.
 
 **RED.** Add
 `oracle::exec::tests::supported_analytical_plan_accepts_only_the_v1_baseline`.
-Construct positive and one-semantic-mutation negative physical trees, including
-every accepted matrix row, missing exchange, `Single` and `Final` aggregate
-modes, non-equi join/filter, unsupported aggregate function/state, and an
-unknown semantic operator. Include the existing UTF-8 `filter_key` grouping
-journey as a positive case. Exact:
+Construct positive and one-semantic-mutation negative physical trees for every
+matrix boundary. Exercise each accepted aggregate and assert its exact argument,
+state-field, result-field, and nullability tuple. Reject `COUNT(Utf8)`,
+`SUM(Float64)`, `MIN(UInt64)`, `MAX(Timestamp(Microsecond, None))`, a distinct or
+filtered aggregate, and a test aggregate whose state or result is `UInt64` while
+the accepted expression is otherwise unchanged. Also reject `Single` and
+`Final` modes; a left, empty-key, expression-key, or filtered hash join; a
+same-table SQL `UNION ALL`, a cross-table union, and an internal union with an
+unmapped source id; and `SortExec` with `fetch() == Some(_)`. Retain missing
+exchange, unknown semantic operator, and every positive matrix row. Include the
+existing UTF-8 `filter_key` grouping journey as a positive case. Exact:
 
 ```bash
 mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib --features test-support,bench-support -E 'test(=oracle::exec::tests::supported_analytical_plan_accepts_only_the_v1_baseline)'
 ```
 
 **GREEN.** Tighten the existing synchronous
-`splitter::validate_supported` recursion to encode the matrix above with direct
-type checks and aggregate-mode/function matches in that function. Do not add a
-node registry, capability table, trait, or second abstraction. Reject anything
-outside the matrix before reservation and return one typed support result
-consumed by Scenario 2 and later Task 4 without duplicating logical optimization
-or estimating new routing facts.
+`splitter::validate_supported` recursion to accept `source_groups` and encode the
+matrix above with direct downcasts and matches in that function. For each
+`AggregateFunctionExpr`, downcast `fun().inner()` to the pinned `Count`, `Sum`,
+`Min`, or `Max` implementation and match `is_distinct()`, the physical argument
+fields, `state_fields()`, `field()`, nullability, aggregate filter, and ordering;
+do not infer support from the function name alone. Match
+`HashJoinExec::join_type()`, `on()`, and `filter()` directly. Carry only the
+immediate parent kind during recursion so a `UnionExec` is accepted exclusively
+beneath `TenantTripwireExec`, then use the existing `source_groups` map to prove
+one nonempty canonical table group. Match `SortExec::fetch()` directly. Do not
+add a node registry, capability table, provenance map, trait, or second
+abstraction. Reject anything outside the matrix before reservation and return
+one typed support result consumed by Scenario 2 and later Task 4 without
+duplicating logical optimization or estimating new routing facts.
 
 **REFACTOR.** Keep validation synchronous, pure, and closed over semantic
 capabilities while allowing pinned dependency structure to evolve within the
@@ -421,8 +446,9 @@ git diff --check
 - Plan/reserve/dispatch traces proving unsupported and no-exchange paths make
   zero reserve RPCs and selected execution reserves every follower once before
   any dispatch.
-- Supported/unsupported physical-tree mutation evidence proving the closed
-  predicate is complete before reservation.
+- Supported/unsupported physical-tree mutation evidence proving exact aggregate
+  argument/state/result types, inner column equi-joins, provider-local
+  same-table unions, and `SortExec` without `fetch` before reservation.
 - Partial-reservation and ambiguous-release evidence proving accepted leases
   retain their returned expiry, remain `Draining` before the later wall/monotonic
   threshold, and clear only on acknowledgement or conservative expiry.

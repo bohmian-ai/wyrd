@@ -321,22 +321,11 @@ def check_vala_query_modules(failures: list[str]) -> None:
             continue
 
         if relative in VALA_TENANT_CONN_OWNER_ALLOWLIST:
-            owns_tenant_conn = re.search(
-                r"struct\s+\w+[^{]*\{[^}]*conn:\s*&'\w+\s+mut\s+TenantConn",
-                code,
-                re.DOTALL,
-            ) is not None
-            for fn_name, params in public_async_fns(code):
-                if (
-                    "TenantConn<'_" not in params
-                    and "TenantConn < '_" not in params
-                    and "OperatorPool" not in params
-                    and not (owns_tenant_conn and "self" in params)
-                ):
-                    failures.append(
-                        f"{relative}: public async fn {fn_name} must take &mut TenantConn<'_>, "
-                        "take an OperatorPool, or be a method of a struct owning a TenantConn"
-                    )
+            for fn_name in tenant_conn_owner_violations(code):
+                failures.append(
+                    f"{relative}: public async fn {fn_name} must take &mut TenantConn<'_>, "
+                    "take an OperatorPool, or be a method of the struct owning a TenantConn"
+                )
             check_tenant_query_file(
                 relative,
                 body,
@@ -620,11 +609,148 @@ def has_public_async_fn(code: str) -> bool:
 
 
 def public_async_fns(code: str) -> list[tuple[str, str]]:
-    pattern = re.compile(
-        r"pub\s+async\s+fn\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(([^)]*)\)",
-        re.DOTALL,
-    )
-    return pattern.findall(code)
+    return [(name, params) for name, params, _ in _public_async_fn_sites(code)]
+
+
+PUBLIC_ASYNC_FN_RE = re.compile(
+    r"pub\s+async\s+fn\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(([^)]*)\)",
+    re.DOTALL,
+)
+
+TENANT_CONN_FIELD_RE = re.compile(r"&\s*'\w+\s+mut\s+TenantConn\b")
+
+STRUCT_RE = re.compile(r"\bstruct\s+([A-Za-z_][A-Za-z0-9_]*)")
+
+IMPL_RE = re.compile(r"\bimpl\b")
+
+
+def _public_async_fn_sites(code: str) -> list[tuple[str, str, int]]:
+    """Return every public async fn as `(name, parameter text, offset)`."""
+    return [
+        (match.group(1), match.group(2), match.start())
+        for match in PUBLIC_ASYNC_FN_RE.finditer(code)
+    ]
+
+
+def _matching_brace(code: str, opening: int) -> int | None:
+    """Return the index of the `}` closing the `{` at `opening`, if balanced.
+
+    Only brace depth is tracked. Callers pass comment-stripped Rust, and a
+    brace inside a string literal is rare enough in query modules that the
+    depth scan stays the simplest thing that answers "which block encloses
+    this offset" without adding a parser dependency.
+    """
+    depth = 0
+    for index in range(opening, len(code)):
+        char = code[index]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return index
+    return None
+
+
+def _impl_type_name(header: str) -> str | None:
+    """Reduce one `impl` header to the concrete type the block belongs to.
+
+    `impl<'a> Trait for Owner<'a>` and `impl<'a> Owner<'a>` both resolve to
+    `Owner`, because the receiver's authority comes from the type the methods
+    are attached to, never from the trait they satisfy.
+    """
+    header = re.split(r"\bwhere\b", header, maxsplit=1)[0]
+    if " for " in header:
+        header = header.rsplit(" for ", 1)[1]
+    else:
+        header = re.sub(r"^\s*<[^>]*>", "", header)
+    header = header.strip().lstrip("&").strip()
+    header = re.sub(r"<.*$", "", header).strip()
+    name = header.rsplit("::", 1)[-1].strip()
+    return name or None
+
+
+def _impl_blocks(code: str) -> list[tuple[str, int, int]]:
+    """Return `(type name, body start, body end)` for every `impl` block.
+
+    A `-> impl Trait` return position is skipped: its "header" would run past
+    a parenthesis or semicolon before any block brace, which no real `impl`
+    item does.
+    """
+    blocks: list[tuple[str, int, int]] = []
+    for match in IMPL_RE.finditer(code):
+        opening = code.find("{", match.end())
+        if opening == -1:
+            continue
+        header = code[match.end() : opening]
+        if any(token in header for token in "();="):
+            continue
+        closing = _matching_brace(code, opening)
+        if closing is None:
+            continue
+        name = _impl_type_name(header)
+        if name:
+            blocks.append((name, opening, closing))
+    return blocks
+
+
+def _enclosing_impl_type(blocks: list[tuple[str, int, int]], offset: int) -> str | None:
+    """Return the innermost `impl` type whose body contains `offset`."""
+    best: tuple[str, int] | None = None
+    for name, start, end in blocks:
+        if start < offset < end and (best is None or start > best[1]):
+            best = (name, start)
+    return best[0] if best else None
+
+
+def structs_owning_tenant_conn(code: str) -> set[str]:
+    """Return every concrete struct that owns a borrowed `TenantConn` field.
+
+    Ownership is what makes a `self` receiver proof of tenant scope: every
+    statement such a method issues runs on the caller's RLS-bound connection.
+    Both brace and tuple struct bodies are read, and the body is bounded by
+    the struct's own terminator so an unrelated later struct cannot lend it a
+    field it does not have.
+    """
+    owners: set[str] = set()
+    for match in STRUCT_RE.finditer(code):
+        opening = code.find("{", match.end())
+        semicolon = code.find(";", match.end())
+        if opening != -1 and (semicolon == -1 or opening < semicolon):
+            closing = _matching_brace(code, opening)
+            body = code[opening : closing if closing is not None else len(code)]
+        elif semicolon != -1:
+            body = code[match.end() : semicolon]
+        else:
+            continue
+        if TENANT_CONN_FIELD_RE.search(body):
+            owners.add(match.group(1))
+    return owners
+
+
+def tenant_conn_owner_violations(code: str) -> list[str]:
+    """Return public async fns in `code` that prove no tenant-scoped authority.
+
+    A function passes on one of three exact grounds: it takes a
+    `&mut TenantConn<'_>`, it takes an `OperatorPool` for bounded read-only
+    cross-tenant work, or it is a method of the very struct that owns the
+    connection. The last ground is receiver-exact on purpose — an unrelated
+    struct's `&self` in the same module is not evidence of anything.
+    """
+    owners = structs_owning_tenant_conn(code)
+    blocks = _impl_blocks(code)
+    violations: list[str] = []
+    for name, params, offset in _public_async_fn_sites(code):
+        if (
+            "TenantConn<'_" in params
+            or "TenantConn < '_" in params
+            or "OperatorPool" in params
+        ):
+            continue
+        if "self" in params and _enclosing_impl_type(blocks, offset) in owners:
+            continue
+        violations.append(name)
+    return violations
 
 
 def has_platform_executor(code: str) -> bool:

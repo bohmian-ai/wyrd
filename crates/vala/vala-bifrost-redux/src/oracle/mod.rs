@@ -1727,13 +1727,29 @@ pub struct PlannedSqlCut {
     /// that the claim's lifetime is the cut's lifetime by construction: a plan
     /// that is abandoned before execution, or dropped on a retry, releases its
     /// snapshots without anyone remembering to.
-    pub(crate) reader_pin: Option<reader_pins::ReaderQueryGuard>,
+    pub(crate) reader_pin: reader_pins::ReaderQueryGuard,
     /// Epoch-gated permission this plan's source IO must present.
     ///
     /// Held beside the pin rather than derived at execution so that the permit
     /// and the protection it depends on have exactly one lifetime: a plan that
     /// carries a pin always carries the permit proving that pin is still live.
-    pub(crate) reader_io_permit: Option<reader_pins::ReaderIoPermit>,
+    pub(crate) reader_io_permit: reader_pins::ReaderIoPermit,
+}
+
+/// One complete set of materialized table cuts and the reader-epoch evidence
+/// that made materializing them legal.
+///
+/// This is the single value produced by the leader's protect-then-materialize
+/// sequence. It exists so that a caller cannot hold cuts without also holding
+/// the guard that keeps their snapshots alive and the permit their source IO
+/// must present: the three are constructed together and move together.
+pub(crate) struct ProtectedPlannedSqlCut {
+    /// This node's durable claim on every snapshot named below.
+    pub(crate) guard: reader_pins::ReaderQueryGuard,
+    /// Epoch-gated permission every read of these cuts must present.
+    pub(crate) permit: reader_pins::ReaderIoPermit,
+    /// Immutable table cuts materialized under `permit`.
+    pub(crate) cuts: Vec<PinnedSealedTable>,
 }
 
 impl PlannedSqlCut {
@@ -2179,12 +2195,12 @@ impl Oracle {
         // Typed plans are schema-only authoring artifacts. The executable
         // Oracle provider is installed later by `query_plan` after it freezes
         // a tenant-bound visibility cut and commits its read decision.
-        let schema: Arc<Schema> = match self.catalog.pin_sealed_table(&table, tenant).await {
-            Ok(cut) => Arc::new(
-                iceberg::arrow::schema_to_arrow_schema(
-                    cut.iceberg_table.metadata().current_schema(),
-                )
-                .map_err(|_| BifrostError::QueryExecutionFailed)?,
+        // Metadata only: a schema-only artifact never touches a snapshot, so it
+        // resolves the reader identity without protecting or materializing one.
+        let schema: Arc<Schema> = match self.catalog.prepare_reader_identity(&table, tenant).await {
+            Ok(prepared) => Arc::new(
+                iceberg::arrow::schema_to_arrow_schema(prepared.metadata.current_schema())
+                    .map_err(|_| BifrostError::QueryExecutionFailed)?,
             ),
             Err(BifrostCatalogError::TableNotFound(_)) => {
                 let definition = crate::tables::builtin_table(namespace.as_str(), name)
@@ -2255,7 +2271,14 @@ impl Oracle {
         let snapshot = self.cluster.snapshot();
         let planned = self
             .planner
-            .classify_for_forwarding(context, request, deadline, &self.catalog, &snapshot)
+            .classify_for_forwarding(
+                context,
+                request,
+                deadline,
+                &self.catalog,
+                &self.reader_authority,
+                &snapshot,
+            )
             .await?;
         let query_class = planned.query_class;
         let now = chrono::Utc::now();
@@ -2479,7 +2502,7 @@ impl Oracle {
             prepared,
         } = input;
         let stale_replacement = StaleReplacementGate::before_output(retry_ordinal);
-        let mut planned = self
+        let planned = self
             .attempt_plan(
                 prepared,
                 context,
@@ -2496,11 +2519,6 @@ impl Oracle {
         // planned it. Background publication remains separate from query
         // execution; closing the acquisition-ordering gap is remediation work
         // and must not add a Postgres round trip to every read.
-        // Durable protection is established here, before any snapshot-dependent
-        // source IO, and the permit that proves it stays with the plan.
-        let (pin, permit) = self.reader_authority.acquire_guard(&planned.cuts).await?;
-        planned.reader_pin = Some(pin);
-        planned.reader_io_permit = Some(permit);
         self.ensure_query_telemetry(query_telemetry, request.visibility, planned.query_class);
         let mut phases = AttemptPhaseTimer::started();
         let (session, mut admitted, running_query) = self
@@ -2729,6 +2747,7 @@ impl Oracle {
                 tables,
                 deadline,
                 &self.catalog,
+                &self.reader_authority,
                 live_oracle_cpu,
             )
             .await?;
@@ -3016,13 +3035,18 @@ impl Oracle {
         query_telemetry: QueryTelemetryGuard,
         admitted: AdmittedQueryGuard,
     ) -> Result<OracleQueryStream, BifrostError> {
-        let cuts = self
+        let ProtectedPlannedSqlCut {
+            guard: reader_pin,
+            permit: reader_io_permit,
+            cuts,
+        } = self
             .planner
             .prepare_typed_cuts(
                 &plan,
                 context.data_tenant_id,
                 options.deadline,
                 &self.catalog,
+                &self.reader_authority,
             )
             .await?;
         let (session, mut admitted) = self.lease_session(

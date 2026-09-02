@@ -21,9 +21,10 @@ use super::*;
 use super::{
     AuthorizedQueryContext, BifrostCatalog, BifrostCatalogError, BifrostError, DrainedTails,
     HotFileSource, OracleAudit, OracleMemoryResources, OracleTableInputs, OracleTableProvider,
-    OracleTelemetry, PinnedSealedTable, PlannedSqlCut, QueryClass, TableRef, map_datafusion_error,
-    optimized_plan_is_complex, query_class_label,
+    OracleTelemetry, PinnedSealedTable, PlannedSqlCut, ProtectedPlannedSqlCut, QueryClass,
+    TableRef, map_datafusion_error, optimized_plan_is_complex, query_class_label,
 };
+use crate::oracle::reader_pins::OracleReaderAuthority;
 
 /// Query floor and logical-plan preparation owner.
 #[derive(Debug, Clone)]
@@ -109,6 +110,7 @@ impl OraclePlanner {
         request: &BifrostQueryRequest,
         deadline: Instant,
         catalog: &BifrostCatalog,
+        authority: &Arc<OracleReaderAuthority>,
         snapshot: &crate::cluster::ClusterSnapshot,
     ) -> Result<PlannedSqlCut, BifrostError> {
         self.validate_query(request)?;
@@ -127,6 +129,7 @@ impl OraclePlanner {
             &tables,
             deadline,
             catalog,
+            authority,
             live_oracle_cpu,
         )
         .await
@@ -165,36 +168,77 @@ impl OraclePlanner {
 }
 
 impl OraclePlanner {
-    /// Pins every table scan in a typed plan against one authenticated tenant.
+    /// Protects and materializes every table scan in a typed plan.
     ///
-    /// Tables are pinned sequentially under one absolute deadline. Cancellation
-    /// drops the active catalog future; cuts already returned are immutable local
-    /// values and are discarded with the incomplete result.
+    /// Tables are prepared sequentially under one absolute deadline, the whole
+    /// set is protected by one durable guard, and only then is any snapshot
+    /// materialized. Cancellation drops the active catalog future; a partially
+    /// materialized result is discarded together with its guard, which narrows
+    /// the protection it took.
     ///
     /// # Errors
-    /// Returns invalid SQL for non-canonical scans or timeout/catalog failures
-    /// while materializing the immutable table cuts.
+    /// Returns invalid SQL for non-canonical scans, reader-authority refusal,
+    /// or timeout/catalog failures while materializing the immutable cuts.
     pub(super) async fn prepare_typed_cuts(
         &self,
         plan: &datafusion::logical_expr::LogicalPlan,
         tenant: wyrd_spec::DataTenantId,
         deadline: Instant,
         catalog: &BifrostCatalog,
-    ) -> Result<Vec<PinnedSealedTable>, BifrostError> {
+        authority: &Arc<OracleReaderAuthority>,
+    ) -> Result<ProtectedPlannedSqlCut, BifrostError> {
         let tables = collect_plan_table_refs(plan)?;
-        let mut cuts = Vec::with_capacity(tables.len());
+        Self::protect_and_materialize(&tables, tenant, deadline, catalog, authority).await
+    }
+
+    /// Prepares identities, takes one complete reader guard, then materializes.
+    ///
+    /// This is the only place a leader turns table references into readable
+    /// cuts. The ordering is the protection contract: every identity is
+    /// resolved from metadata alone, one guard covers the whole set, and no
+    /// snapshot-dependent source IO happens before that guard exists.
+    ///
+    /// # Errors
+    /// Returns [`BifrostError::QueryTimeout`] when the deadline passes during
+    /// preparation or materialization, the reader authority's refusal when the
+    /// cut cannot be protected, and the catalog's public failure otherwise.
+    async fn protect_and_materialize(
+        tables: &[TableRef],
+        tenant: wyrd_spec::DataTenantId,
+        deadline: Instant,
+        catalog: &BifrostCatalog,
+        authority: &Arc<OracleReaderAuthority>,
+    ) -> Result<ProtectedPlannedSqlCut, BifrostError> {
+        let mut prepared = Vec::with_capacity(tables.len());
         for table in tables {
             let remaining = deadline
                 .checked_duration_since(Instant::now())
                 .ok_or(BifrostError::QueryTimeout)?;
-            cuts.push(
-                tokio::time::timeout(remaining, catalog.pin_sealed_table(&table, tenant))
+            prepared.push(
+                tokio::time::timeout(remaining, catalog.prepare_reader_identity(table, tenant))
                     .await
                     .map_err(|_| BifrostError::QueryTimeout)?
                     .map_err(BifrostCatalogError::into_public)?,
             );
         }
-        Ok(cuts)
+        let (guard, permit) = authority.acquire_guard(&prepared).await?;
+        let mut cuts = Vec::with_capacity(prepared.len());
+        for identity in prepared {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .ok_or(BifrostError::QueryTimeout)?;
+            cuts.push(
+                tokio::time::timeout(remaining, catalog.materialize_reader_cut(identity, &permit))
+                    .await
+                    .map_err(|_| BifrostError::QueryTimeout)?
+                    .map_err(BifrostCatalogError::into_public)?,
+            );
+        }
+        Ok(ProtectedPlannedSqlCut {
+            guard,
+            permit,
+            cuts,
+        })
     }
 
     /// Builds executable providers from authenticated cuts and drained tails.
@@ -313,6 +357,7 @@ impl OraclePlanner {
         tables: &[TableRef],
         deadline: Instant,
         catalog: &BifrostCatalog,
+        authority: &Arc<OracleReaderAuthority>,
         live_oracle_cpu: f64,
     ) -> Result<PlannedSqlCut, BifrostError> {
         let planning = self.try_planning()?;
@@ -321,24 +366,23 @@ impl OraclePlanner {
         // attribute pre-fragment query latency, which is otherwise invisible
         // between admission and the first fragment dispatch.
         let pin_started = std::time::Instant::now();
-        let mut cuts = Vec::with_capacity(tables.len());
-        let mut estimated_bytes = 0_u64;
-        for table in tables {
-            let remaining = deadline
-                .checked_duration_since(Instant::now())
-                .ok_or(BifrostError::QueryTimeout)?;
-            let cut = tokio::time::timeout(
-                remaining,
-                catalog.pin_sealed_table(table, context.data_tenant_id),
-            )
-            .await
-            .map_err(|_| BifrostError::QueryTimeout)?
-            .map_err(BifrostCatalogError::into_public)?;
-            estimated_bytes = estimated_bytes
+        let ProtectedPlannedSqlCut {
+            guard,
+            permit,
+            cuts,
+        } = Self::protect_and_materialize(
+            tables,
+            context.data_tenant_id,
+            deadline,
+            catalog,
+            authority,
+        )
+        .await?;
+        let estimated_bytes = cuts.iter().try_fold(0_u64, |total, cut| {
+            total
                 .checked_add(cut.estimated_bytes)
-                .ok_or(BifrostError::QueryAdmissionRejected)?;
-            cuts.push(cut);
-        }
+                .ok_or(BifrostError::QueryAdmissionRejected)
+        })?;
         let pinned_elapsed = pin_started.elapsed();
         let hot_files = cuts.iter().map(|cut| cut.hot_files.len()).sum::<usize>();
         let iceberg_files = cuts
@@ -398,8 +442,8 @@ impl OraclePlanner {
             cuts,
             query_class: classification.query_class,
             local_ratio,
-            reader_pin: None,
-            reader_io_permit: None,
+            reader_pin: guard,
+            reader_io_permit: permit,
         })
     }
 

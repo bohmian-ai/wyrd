@@ -173,61 +173,49 @@ pub fn frontier_from_active_cuts(
     ProtectionFrontier::new(identity, members).map_err(|error| internal(error.to_string()))
 }
 
-/// Derives one query's per-table cut from an already pinned sealed table.
+/// Derives one query's per-table cut from a prepared reader identity.
 ///
-/// A cut with no Iceberg snapshot contributes nothing, because there is no
-/// snapshot for maintenance to protect. A cut whose snapshot its own metadata
-/// cannot date fails closed: the query is about to read that snapshot, and
-/// protection without a corroborating timestamp is protection the maintenance
-/// owner rejects.
+/// Runs before any snapshot-dependent IO: the identity already carries the
+/// snapshot, its timestamp, and its ancestry from the immutable metadata
+/// document, so nothing here opens an object. A prepared identity with no
+/// snapshot contributes nothing, because there is no snapshot for maintenance
+/// to protect.
 ///
 /// # Errors
 ///
-/// Returns [`BifrostError::Internal`] when the pinned snapshot is absent from
-/// the table metadata the cut was taken from.
-pub fn local_cut_from_pinned(
-    pinned: &PinnedSealedTable,
+/// Returns [`BifrostError::Internal`] when the identity names a snapshot it
+/// could not date or whose ancestry does not begin at that snapshot. Both are
+/// unprovable coverage claims, and a query is about to read that snapshot.
+pub fn local_cut_from_prepared(
+    prepared: &crate::catalog::PreparedReaderIdentity,
 ) -> Result<Option<(TableAuthorityIdentity, LocalReaderCut)>, BifrostError> {
-    let Some(snapshot_id) = pinned.snapshot_id else {
+    let Some(snapshot_id) = prepared.snapshot_id else {
         return Ok(None);
     };
-    let metadata = pinned.iceberg_table.metadata();
-    let snapshot = metadata.snapshot_by_id(snapshot_id).ok_or_else(|| {
+    let timestamp_ms = prepared.snapshot_timestamp_ms.ok_or_else(|| {
         internal(format!(
-            "Oracle pinned snapshot {snapshot_id} that its own table metadata cannot date, so it \
-             cannot be protected from maintenance"
+            "Oracle prepared snapshot {snapshot_id} that its own table metadata cannot date, so \
+             it cannot be protected from maintenance"
         ))
     })?;
-    let mut ancestry_path = vec![snapshot_id];
-    let mut cursor = snapshot.parent_snapshot_id();
-    // Bounded by the retained snapshot count: an ancestry longer than the
-    // metadata's own snapshot list is a cycle, not a deep history.
-    let bound = metadata.snapshots().count().saturating_add(1);
-    while let Some(parent) = cursor {
-        if ancestry_path.len() > bound || ancestry_path.contains(&parent) {
-            return Err(internal(format!(
-                "Oracle pinned snapshot {snapshot_id} has a malformed ancestry that does not \
-                 terminate"
-            )));
-        }
-        ancestry_path.push(parent);
-        cursor = metadata
-            .snapshot_by_id(parent)
-            .and_then(|snapshot| snapshot.parent_snapshot_id());
+    if prepared.ancestry_path.first() != Some(&snapshot_id) {
+        return Err(internal(format!(
+            "Oracle prepared snapshot {snapshot_id} with an ancestry that does not begin at it"
+        )));
     }
     let identity = TableAuthorityIdentity {
-        tenant: pinned.binding.tenant,
-        table_uid: *pinned.table_uid.as_bytes(),
+        tenant: prepared.binding.tenant,
+        table_uid: *prepared.table_uid.as_bytes(),
         catalog_name: BIFROST_CATALOG_NAME.to_owned(),
-        namespace_name: pinned.binding.table_ref.namespace.as_str().to_owned(),
-        table_name: pinned.binding.table_ref.name.clone(),
+        namespace_name: prepared.binding.table_ref.namespace.as_str().to_owned(),
+        table_name: prepared.binding.table_ref.name.clone(),
     };
     Ok(Some((
         identity,
         LocalReaderCut {
             snapshot_id,
-            timestamp_ms: snapshot.timestamp_ms(),
-            ancestry_path,
+            timestamp_ms,
+            ancestry_path: prepared.ancestry_path.clone(),
         },
     )))
 }
@@ -500,6 +488,12 @@ pub struct ReaderQueryGuard {
     holdings: Vec<(TableAuthorityIdentity, u64)>,
     /// Reservation consumed when the pins are enqueued for removal.
     release: Option<OwnedSemaphorePermit>,
+    /// Query-scoped cancellation shared with every permit this guard issued.
+    ///
+    /// Cancelling it on release is what makes the permit strictly weaker than
+    /// the guard: once the cut is no longer protected, no permit derived from
+    /// it can authorize another read or expose a read already in flight.
+    query_cancel: CancellationToken,
 }
 
 impl std::fmt::Debug for ReaderQueryGuard {
@@ -517,6 +511,7 @@ impl Drop for ReaderQueryGuard {
     /// A closed queue means the authority is already shutting down and has
     /// taken ownership of draining; the pins it would remove are removed there.
     fn drop(&mut self) {
+        self.query_cancel.cancel();
         let Some(permit) = self.release.take() else {
             return;
         };
@@ -1031,7 +1026,7 @@ impl OracleReaderAuthority {
     /// Every failure leaves prior conservative protection in place.
     pub async fn acquire_guard(
         self: &Arc<Self>,
-        cuts: &[PinnedSealedTable],
+        prepared: &[crate::catalog::PreparedReaderIdentity],
     ) -> Result<(ReaderQueryGuard, ReaderIoPermit), BifrostError> {
         let (no_io_deadline, admission_cutoff) = {
             let lifecycle = self.lifecycle.lock().await;
@@ -1058,8 +1053,8 @@ impl OracleReaderAuthority {
             .map_err(|_| internal("Oracle reader authority release queue is closed"))?;
 
         let mut requested: BTreeMap<TableAuthorityIdentity, LocalReaderCut> = BTreeMap::new();
-        for cut in cuts {
-            let Some((identity, local)) = local_cut_from_pinned(cut)? else {
+        for cut in prepared {
+            let Some((identity, local)) = local_cut_from_prepared(cut)? else {
                 continue;
             };
             // One query cannot hold two different cuts of one table: the cut is
@@ -1095,10 +1090,12 @@ impl OracleReaderAuthority {
         // The guard is constructed even on failure so that dropping it enqueues
         // the exact narrowing for whichever tables did widen. A partially
         // admitted plan never leaves a pin nobody will remove.
+        let query_cancel = CancellationToken::new();
         let guard = ReaderQueryGuard {
             authority: Arc::clone(self),
             holdings,
             release: Some(release),
+            query_cancel: query_cancel.clone(),
         };
         if let Some(error) = failure {
             drop(guard);
@@ -1107,11 +1104,7 @@ impl OracleReaderAuthority {
 
         Ok((
             guard,
-            ReaderIoPermit::new(
-                self.epoch_cancel.clone(),
-                CancellationToken::new(),
-                no_io_deadline,
-            ),
+            ReaderIoPermit::new(self.epoch_cancel.clone(), query_cancel, no_io_deadline),
         ))
     }
 

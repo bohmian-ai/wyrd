@@ -580,3 +580,254 @@ mod tests {
         assert!(warehouse.starts_with("file://"));
     }
 }
+
+/// The one message every refused write on the read-only query adapter reports.
+///
+/// Query-scoped storage exists to read a pinned snapshot. A write reaching it
+/// is a construction mistake, not a permission failure, so it names the adapter
+/// rather than suggesting the caller retry with different authority.
+const READ_ONLY_QUERY_STORAGE: &str =
+    "epoch-gated query storage is read-only and cannot write, delete, or open an output";
+
+/// Maps a refused permit onto Iceberg's error type.
+///
+/// `FeatureUnsupported` is deliberate: the object is reachable and the request
+/// is well formed, but this process no longer holds the authority that made
+/// reading it safe, and Iceberg must not retry that at its own layer the way it
+/// retries `Unexpected`.
+fn permit_error(error: &wyrd_spec::vala::BifrostError) -> IcebergError {
+    IcebergError::new(IcebergErrorKind::FeatureUnsupported, error.to_string())
+}
+
+/// Read-only Iceberg storage that no operation escapes without a live permit.
+///
+/// Every reachable read checks the permit immediately before the backend call
+/// and again after it completes, before anything is returned. The second check
+/// is the one that matters for correctness: without it, a read that started
+/// legally could still hand bytes from a snapshot to a query whose epoch lost
+/// authority while the read was in flight, and Forge may already have deleted
+/// what those bytes describe.
+///
+/// Writes are not gated, they are refused. This adapter is built per query from
+/// a pinned immutable cut; there is no correct write through it, so admitting
+/// one under a valid permit would be worse than rejecting it.
+#[derive(Debug, Clone)]
+pub struct EpochGatedIcebergStorage {
+    /// Ungated adapter every authorized operation delegates to.
+    inner: BifrostIcebergStorage,
+    /// Proof that this query's epoch still authorizes snapshot-dependent IO.
+    permit: crate::oracle::reader_pins::ReaderIoPermit,
+}
+
+impl EpochGatedIcebergStorage {
+    /// Binds one query's permit to this node's storage adapter.
+    #[must_use]
+    pub fn new(
+        inner: BifrostIcebergStorage,
+        permit: crate::oracle::reader_pins::ReaderIoPermit,
+    ) -> Self {
+        Self { inner, permit }
+    }
+}
+
+impl Serialize for EpochGatedIcebergStorage {
+    /// Always refuses: the permit is authority local to this process and epoch.
+    ///
+    /// # Errors
+    /// Always returns a serializer error carrying [`NOT_PORTABLE`].
+    fn serialize<S: Serializer>(&self, _serializer: S) -> Result<S::Ok, S::Error> {
+        Err(S::Error::custom(NOT_PORTABLE))
+    }
+}
+
+impl<'de> Deserialize<'de> for EpochGatedIcebergStorage {
+    /// Always refuses: a reconstructed permit would authorize nothing real.
+    ///
+    /// # Errors
+    /// Always returns a deserializer error carrying [`NOT_PORTABLE`].
+    fn deserialize<D: Deserializer<'de>>(_deserializer: D) -> Result<Self, D::Error> {
+        Err(D::Error::custom(NOT_PORTABLE))
+    }
+}
+
+#[async_trait]
+#[typetag::serde]
+impl Storage for EpochGatedIcebergStorage {
+    async fn exists(&self, path: &str) -> IcebergResult<bool> {
+        self.permit.begin_io().map_err(|e| permit_error(&e))?;
+        let found = self.inner.exists(path).await?;
+        self.permit.expose_result().map_err(|e| permit_error(&e))?;
+        Ok(found)
+    }
+
+    async fn metadata(&self, path: &str) -> IcebergResult<FileMetadata> {
+        self.permit.begin_io().map_err(|e| permit_error(&e))?;
+        let metadata = self.inner.metadata(path).await?;
+        self.permit.expose_result().map_err(|e| permit_error(&e))?;
+        Ok(metadata)
+    }
+
+    async fn read(&self, path: &str) -> IcebergResult<Bytes> {
+        self.permit.begin_io().map_err(|e| permit_error(&e))?;
+        let bytes = self.inner.read(path).await?;
+        self.permit.expose_result().map_err(|e| permit_error(&e))?;
+        Ok(bytes)
+    }
+
+    async fn reader(&self, path: &str) -> IcebergResult<Box<dyn FileRead>> {
+        self.permit.begin_io().map_err(|e| permit_error(&e))?;
+        let inner = self.inner.reader(path).await?;
+        self.permit.expose_result().map_err(|e| permit_error(&e))?;
+        Ok(Box::new(EpochGatedFileRead {
+            inner,
+            permit: self.permit.clone(),
+        }))
+    }
+
+    async fn write(&self, _path: &str, _bs: Bytes) -> IcebergResult<()> {
+        Err(IcebergError::new(
+            IcebergErrorKind::FeatureUnsupported,
+            READ_ONLY_QUERY_STORAGE,
+        ))
+    }
+
+    async fn writer(&self, _path: &str) -> IcebergResult<Box<dyn FileWrite>> {
+        Err(IcebergError::new(
+            IcebergErrorKind::FeatureUnsupported,
+            READ_ONLY_QUERY_STORAGE,
+        ))
+    }
+
+    async fn delete(&self, _path: &str) -> IcebergResult<()> {
+        Err(IcebergError::new(
+            IcebergErrorKind::FeatureUnsupported,
+            READ_ONLY_QUERY_STORAGE,
+        ))
+    }
+
+    async fn delete_prefix(&self, _path: &str) -> IcebergResult<()> {
+        Err(IcebergError::new(
+            IcebergErrorKind::FeatureUnsupported,
+            READ_ONLY_QUERY_STORAGE,
+        ))
+    }
+
+    async fn delete_stream(&self, _paths: BoxStream<'static, String>) -> IcebergResult<()> {
+        Err(IcebergError::new(
+            IcebergErrorKind::FeatureUnsupported,
+            READ_ONLY_QUERY_STORAGE,
+        ))
+    }
+
+    async fn list(
+        &self,
+        path: &str,
+        recursive: bool,
+    ) -> IcebergResult<BoxStream<'static, IcebergResult<ListEntry>>> {
+        self.permit.begin_io().map_err(|e| permit_error(&e))?;
+        let entries = self.inner.list(path, recursive).await?;
+        self.permit.expose_result().map_err(|e| permit_error(&e))?;
+        Ok(entries)
+    }
+
+    fn new_input(&self, path: &str) -> IcebergResult<InputFile> {
+        self.permit.begin_io().map_err(|e| permit_error(&e))?;
+        self.inner.new_input(path)?;
+        Ok(InputFile::new(Arc::new(self.clone()), path.to_owned()))
+    }
+
+    fn new_output(&self, _path: &str) -> IcebergResult<OutputFile> {
+        Err(IcebergError::new(
+            IcebergErrorKind::FeatureUnsupported,
+            READ_ONLY_QUERY_STORAGE,
+        ))
+    }
+}
+
+/// A ranged reader that re-checks the permit around every range.
+///
+/// A Parquet scan opens one reader and then issues many ranged reads over the
+/// life of a query, so checking only at open would leave the longest-lived
+/// route to object bytes ungated for the rest of the query.
+pub struct EpochGatedFileRead {
+    /// Ungated reader every authorized range delegates to.
+    inner: Box<dyn FileRead>,
+    /// Proof that this query's epoch still authorizes snapshot-dependent IO.
+    permit: crate::oracle::reader_pins::ReaderIoPermit,
+}
+
+impl std::fmt::Debug for EpochGatedFileRead {
+    /// Prints the wrapper without the object identity the reader holds.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EpochGatedFileRead")
+            .field("permit", &self.permit)
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl FileRead for EpochGatedFileRead {
+    async fn read(&self, range: Range<u64>) -> IcebergResult<Bytes> {
+        self.permit.begin_io().map_err(|e| permit_error(&e))?;
+        let bytes = self.inner.read(range).await?;
+        self.permit.expose_result().map_err(|e| permit_error(&e))?;
+        Ok(bytes)
+    }
+}
+
+/// Builds epoch-gated storage for exactly one query.
+///
+/// Iceberg asks the factory per catalog configuration and ignores it here for
+/// the same reason [`BifrostIcebergStorageFactory`] does: the backend is
+/// already decided. What this factory adds is that every instance it hands out
+/// carries the same query's permit, so a table built through it cannot acquire
+/// an ungated route to storage partway down its own metadata tree.
+#[derive(Debug, Clone)]
+pub struct EpochGatedIcebergStorageFactory {
+    /// The gated storage every built instance shares.
+    storage: EpochGatedIcebergStorage,
+}
+
+impl EpochGatedIcebergStorageFactory {
+    /// Binds a factory to one owner, one warehouse root, and one permit.
+    #[must_use]
+    pub fn new(
+        storage: Arc<BifrostStorage>,
+        warehouse: &str,
+        permit: crate::oracle::reader_pins::ReaderIoPermit,
+    ) -> Self {
+        Self {
+            storage: EpochGatedIcebergStorage::new(
+                BifrostIcebergStorage::new(storage, warehouse),
+                permit,
+            ),
+        }
+    }
+}
+
+impl Serialize for EpochGatedIcebergStorageFactory {
+    /// Always refuses: the permit is authority local to this process and epoch.
+    ///
+    /// # Errors
+    /// Always returns a serializer error carrying [`NOT_PORTABLE`].
+    fn serialize<S: Serializer>(&self, _serializer: S) -> Result<S::Ok, S::Error> {
+        Err(S::Error::custom(NOT_PORTABLE))
+    }
+}
+
+impl<'de> Deserialize<'de> for EpochGatedIcebergStorageFactory {
+    /// Always refuses: a reconstructed permit would authorize nothing real.
+    ///
+    /// # Errors
+    /// Always returns a deserializer error carrying [`NOT_PORTABLE`].
+    fn deserialize<D: Deserializer<'de>>(_deserializer: D) -> Result<Self, D::Error> {
+        Err(D::Error::custom(NOT_PORTABLE))
+    }
+}
+
+#[typetag::serde]
+impl StorageFactory for EpochGatedIcebergStorageFactory {
+    fn build(&self, _config: &StorageConfig) -> IcebergResult<Arc<dyn Storage>> {
+        Ok(Arc::new(self.storage.clone()))
+    }
+}

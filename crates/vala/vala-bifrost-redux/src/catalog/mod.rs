@@ -22,7 +22,8 @@ pub mod tenant_table;
 mod wire;
 
 pub use bifrost_catalog::{
-    BifrostCatalog, CreateTableRequest, PinnedIcebergFile, PinnedSealedTable, TableUid,
+    BifrostCatalog, CreateTableRequest, PinnedIcebergFile, PinnedSealedTable,
+    PreparedReaderIdentity, TableUid,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use bifrost_catalog::{reset_sealed_pin_count_for_test, sealed_pin_count_for_test};

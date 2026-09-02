@@ -3516,9 +3516,21 @@ impl Oracle {
     }
 
     /// Returns whether startup readiness completed and queries may enter admission.
+    ///
+    /// A composed Analytical half is a third input, not a parallel readiness
+    /// state: a node retaining a graph it could not settle still holds that
+    /// graph's supervisor guard, reservation residue, and charged envelope, so
+    /// it must stop advertising itself even while startup is reconciled and
+    /// admission has capacity. An Oracle composed without Analytical remains
+    /// governed by the first two predicates alone.
     #[must_use]
     pub fn is_ready(&self) -> bool {
-        self.startup_reconciled() && self.admission.is_available()
+        self.startup_reconciled()
+            && self.admission.is_available()
+            && self
+                .analytical
+                .as_ref()
+                .is_none_or(|analytical| analytical.is_healthy())
     }
 
     /// Publishes a membership snapshot to future local admissions.

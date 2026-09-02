@@ -6,7 +6,7 @@ mode: RECONCILE
 status: proposed
 spec: SPEC-bifrost-distributed-analytics-engine
 spec_revision: 4
-depends_on: [BIFROST-R4-T01-GRAPH-LEASE]
+depends_on: [BIFROST-R4-T01-R01-GRAPH-LEASE-REMEDIATION]
 requirements: [REQ-002, REQ-004, REQ-005, REQ-006, REQ-007, REQ-009, REQ-011]
 invariants: [INV-001, INV-002, INV-003, INV-004, INV-005, INV-006, INV-007, INV-008]
 acceptance: [AC-001, AC-003, AC-004, AC-005, AC-007, AC-008]

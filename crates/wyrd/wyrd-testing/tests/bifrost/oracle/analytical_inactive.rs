@@ -390,6 +390,12 @@ async fn prove_bounded_retry() -> Result<(), JourneyError> {
         return Err("a retry was admitted while its predecessor was still live".into());
     }
 
+    // Readiness now also consults the Analytical half. A live, healthy graph is
+    // ordinary service, so the production Oracle must still advertise itself.
+    if !engine.is_ready() {
+        return Err("a live analytical graph must not make its Oracle unready".into());
+    }
+
     let retried = ownership.retry_pre_egress(grant).await?;
     if retried.key().attempt.as_u8() != 1 {
         return Err(format!(

@@ -3031,6 +3031,42 @@ mod tests {
             }
         }
 
+        /// Composes this node's production Analytical handle over the fixture.
+        ///
+        /// The same owners the follower ingress already uses, so the handle's
+        /// health is a projection of this fixture's real graph state rather
+        /// than of a second, parallel inventory.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the fixture's Oracle role cannot be composed.
+        fn execution_handle(&self) -> AnalyticalExecutionHandle {
+            AnalyticalExecutionHandle::new(
+                AnalyticalExecutionOwners {
+                    worker: Arc::clone(&self.ingress),
+                    authority: Arc::new(VerifyingStageAuthority),
+                    supervisor: Arc::clone(&self.supervisor),
+                    spill: Arc::clone(&self.spill),
+                    oracle_resources: fixture_oracle_role(),
+                    peer_transports: None,
+                },
+                AnalyticalExecutionConfig {
+                    node_id: self.node_id,
+                    oracle_fence: self.fence,
+                    ticket_ttl: chrono::Duration::seconds(30),
+                    exchange_buffer_bytes: 64 * 1024,
+                    scratch_bytes: 0,
+                    peer_tls: BifrostPeerTls::unreachable_for_test(),
+                    peer_credentials: Arc::new(
+                        super::super::dispatcher::StaticOraclePeerCredentials::new(
+                            secrecy::SecretString::from("fixture-bearer"),
+                        ),
+                    ),
+                },
+                fixture_leaf_binding(),
+            )
+        }
+
         /// Builds the message the reserving leader presents to activate the graph.
         fn leader_message(&self, operation: StageOperationV1, nonce: u8) -> StageMessage {
             StageMessage {
@@ -3259,6 +3295,71 @@ mod tests {
             .finish_attempt(sibling_attempt, AnalyticalAttemptOutcome::Success)
             .await
             .expect("the sibling graph's only attempt settles");
+    }
+
+    /// A retained follower cleanup failure alone fails production readiness.
+    ///
+    /// The node's Analytical handle is what production readiness consults, and
+    /// a live graph is not a reason to stop serving: a healthy active graph and
+    /// its live attempt leave the handle healthy. A graph the follower could
+    /// *not* settle is different — it is a leak this node still owns and can
+    /// name — so the same handle reports unhealthy, which is the exact
+    /// predicate `Oracle::is_ready` adds to its startup and admission checks.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an active graph fails readiness, when a retained cleanup
+    /// failure is not counted, or when it leaves the handle healthy.
+    #[tokio::test]
+    async fn analytical_cleanup_failure_fails_production_readiness() {
+        let now = Utc::now();
+        let fixture = GraphFixture::new(now);
+        let handle = fixture.execution_handle();
+        assert!(
+            handle.is_healthy(),
+            "a node owning no graph at all is healthy"
+        );
+
+        let attempt = fixture
+            .send(&fixture.leader_message(StageOperationV1::SetPlan, 1), now)
+            .await
+            .expect("the reserving leader activates the graph");
+        assert!(
+            handle.is_healthy(),
+            "a live, healthy graph does not make the node unready"
+        );
+
+        // One real nested child of the graph's own envelope, so the drain that
+        // settlement performs cannot complete for a reason the follower owns.
+        let runtime = fixture
+            .supervisor
+            .graph_runtime(fixture.graph)
+            .expect("the activated graph installed a query-owned runtime");
+        let stuck = datafusion::execution::memory_pool::MemoryConsumer::new("stuck-child")
+            .register(&runtime.runtime().memory_pool);
+        stuck
+            .try_grow(1024)
+            .expect("the admitted envelope funds one nested child");
+        fixture
+            .ingress
+            .finish_attempt(attempt, AnalyticalAttemptOutcome::Success)
+            .await
+            .expect_err("a graph whose children never drain cannot be settled");
+
+        let retained = fixture.ingress.live().expect("ownership is readable");
+        assert_eq!(
+            retained.cleanup_failures, 1,
+            "the follower named exactly one graph it could not release"
+        );
+        assert!(
+            fixture.supervisor.is_healthy(),
+            "the supervisor itself is still serviceable, so readiness must fail for the retained failure alone"
+        );
+        assert!(
+            !handle.is_healthy(),
+            "a retained follower cleanup failure fails production readiness"
+        );
+        drop(stuck);
     }
 
     /// Proves an undrainable graph is retained, named, and never released.
@@ -4038,9 +4139,22 @@ impl AnalyticalExecutionHandle {
     }
 
     /// Reports whether this node can still admit Analytical work.
+    ///
+    /// Two conditions, both read from owners that already exist. The supervisor
+    /// must still be serviceable, and the follower must not be retaining a graph
+    /// whose cleanup failed: that graph keeps a supervisor guard, a reservation
+    /// residue, and a charged envelope this node can name but cannot return, so
+    /// continuing to advertise readiness would send new work to a node that has
+    /// already stranded some. Live, healthy graphs and attempts are deliberately
+    /// not consulted — ordinary service would otherwise fail readiness — and an
+    /// unreadable ownership lock fails closed for the same reason.
     #[must_use]
     pub fn is_healthy(&self) -> bool {
         self.supervisor.is_healthy()
+            && self
+                .worker
+                .live()
+                .is_ok_and(|follower| follower.cleanup_failures == 0)
     }
 
     /// Returns the follower ingress this node serves stage operations through.

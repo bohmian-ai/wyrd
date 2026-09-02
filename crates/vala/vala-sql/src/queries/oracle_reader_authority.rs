@@ -152,6 +152,39 @@ impl<'conn, 'tx> BifrostTableMaintenanceAuthority<'conn, 'tx> {
         }
         Ok(())
     }
+
+    /// Returns every snapshot of this table an unresolved Forge expiration has
+    /// already claimed, in ascending order.
+    ///
+    /// This is the read side of the same serialization boundary [`Self::lock`]
+    /// owns: a caller that holds the table row and finds a requested snapshot
+    /// here lost the race to a prepared expiration and must re-resolve rather
+    /// than widen over a snapshot that is about to disappear. The owner never
+    /// mutates a claim; only the fenced Forge lifecycle does.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqlError::InvariantViolation`] when the identity is malformed
+    /// and [`SqlError`] when the admission-index read fails.
+    pub async fn claimed_snapshots(
+        &mut self,
+        identity: &TableAuthorityIdentity,
+    ) -> Result<Vec<i64>, SqlError> {
+        identity.validate(BIFROST_CATALOG_NAME)?;
+        sqlx::query_scalar(
+            r"
+            SELECT snapshot_id
+              FROM vala.forge_snapshot_expiration_claims
+             WHERE data_tenant_id = wyrd.current_tenant()
+               AND table_uid = $1
+             ORDER BY snapshot_id
+            ",
+        )
+        .bind(identity.table_uid.as_slice())
+        .fetch_all(&mut **self.conn.transaction())
+        .await
+        .map_err(SqlError::from)
+    }
 }
 
 /// Durable owner of one process's bounded, renewable Oracle reader lease.

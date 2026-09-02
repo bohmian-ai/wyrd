@@ -1468,10 +1468,28 @@ impl OracleReaderAuthority {
                 .tenant_conn(identity.tenant)
                 .await
                 .map_err(|error| internal(error.to_string()))?;
-            BifrostTableMaintenanceAuthority::new(&mut conn)
+            let mut authority = BifrostTableMaintenanceAuthority::new(&mut conn);
+            authority
                 .lock(identity)
                 .await
                 .map_err(|error| internal(error.to_string()))?;
+            // The same table row that serializes this widening also guards the
+            // Forge claim index. A requested cut that a prepared expiration has
+            // already claimed lost the race: drop the whole attempted admission
+            // so the caller re-resolves against a fresh catalog cut instead of
+            // pinning a snapshot that is about to be expired.
+            let claimed = authority
+                .claimed_snapshots(identity)
+                .await
+                .map_err(|error| internal(error.to_string()))?;
+            if let Some(snapshot) = claimed
+                .into_iter()
+                .find(|snapshot| required.covers(*snapshot))
+            {
+                return Err(internal(format!(
+                    "snapshot {snapshot} is claimed by a prepared Forge expiration"
+                )));
+            }
             let outcome = OracleTableProtections::new(&mut conn)
                 .commit(
                     identity,

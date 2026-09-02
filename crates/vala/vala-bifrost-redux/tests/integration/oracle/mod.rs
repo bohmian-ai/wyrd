@@ -4,4 +4,4 @@
 //! directory are archived bodies and stay unlisted until their tests are
 //! restored against a current production invariant.
 
-mod reader_authority;
+pub(crate) mod reader_authority;

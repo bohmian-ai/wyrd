@@ -8,5 +8,6 @@
 mod managed_rewrite;
 mod promotion;
 mod publication;
+mod reader_expiry_ordering;
 mod rewrite_support;
 pub(crate) mod support;

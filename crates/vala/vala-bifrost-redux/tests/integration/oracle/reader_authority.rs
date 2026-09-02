@@ -36,9 +36,9 @@ use wyrd_spec::vala::api::{
 const SETTLE_BUDGET: Duration = Duration::from_secs(10);
 
 /// One live database, one Oracle role fence, and helpers to inspect protection.
-struct AuthorityFixture {
+pub(crate) struct AuthorityFixture {
     /// Repository Postgres fixture owning the isolated database.
-    database: PgFixture,
+    pub(crate) database: PgFixture,
     /// Physical node every epoch in the test is acquired for.
     node_id: Uuid,
     /// Exact `cluster_nodes` Oracle fence the epoch is acquired under.
@@ -53,7 +53,7 @@ impl AuthorityFixture {
     /// # Panics
     ///
     /// Panics when the fixture or the membership registration fails.
-    async fn start() -> Self {
+    pub(crate) async fn start() -> Self {
         let database = PgFixture::start().await.expect("Postgres fixture");
         let node_id = Uuid::now_v7();
         let nodes = ClusterNodes::new(database.vala_postgres().clone());
@@ -101,7 +101,7 @@ impl AuthorityFixture {
     /// # Panics
     ///
     /// Panics when acquisition or activation fails.
-    async fn authority(
+    pub(crate) async fn authority(
         &self,
         concurrency: usize,
     ) -> (Arc<OracleReaderAuthority>, Arc<RecordingEpochTerminator>) {
@@ -126,7 +126,7 @@ impl AuthorityFixture {
     /// # Panics
     ///
     /// Panics when the tenant cannot be seeded.
-    async fn tenant(&self) -> DataTenantId {
+    pub(crate) async fn tenant(&self) -> DataTenantId {
         let tenant = DataTenantId::new_v7();
         self.database
             .seed_additional_tenant_with_uuid(
@@ -143,7 +143,7 @@ impl AuthorityFixture {
     /// # Panics
     ///
     /// Panics when the registration cannot commit.
-    async fn table(&self, tenant: DataTenantId, name: &str) -> TableAuthorityIdentity {
+    pub(crate) async fn table(&self, tenant: DataTenantId, name: &str) -> TableAuthorityIdentity {
         let table_uid = *Uuid::now_v7().as_bytes();
         let mut conn = vala_sql::TenantConn::acquire(self.database.app_pool(), tenant)
             .await
@@ -176,7 +176,10 @@ impl AuthorityFixture {
     /// # Panics
     ///
     /// Panics when the read fails, which means the stored evidence is corrupt.
-    async fn header(&self, identity: &TableAuthorityIdentity) -> Option<ProtectionRecord> {
+    pub(crate) async fn header(
+        &self,
+        identity: &TableAuthorityIdentity,
+    ) -> Option<ProtectionRecord> {
         let mut conn = vala_sql::TenantConn::acquire(self.database.app_pool(), identity.tenant)
             .await
             .expect("tenant connection");
@@ -284,7 +287,7 @@ impl AuthorityFixture {
 }
 
 /// Builds one local cut with an exact ancestry, newest first.
-fn cut(snapshot_id: i64, timestamp_ms: i64, ancestry: &[i64]) -> LocalReaderCut {
+pub(crate) fn cut(snapshot_id: i64, timestamp_ms: i64, ancestry: &[i64]) -> LocalReaderCut {
     LocalReaderCut {
         snapshot_id,
         timestamp_ms,

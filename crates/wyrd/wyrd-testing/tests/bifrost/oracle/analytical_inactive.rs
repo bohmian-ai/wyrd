@@ -517,7 +517,7 @@ async fn prove_stale_and_sibling_fencing() -> Result<(), JourneyError> {
     if supervisor.live_attempts()? != 1 {
         return Err("a refused fencing attempt disturbed live supervision".into());
     }
-    if ownership.attempt.cancellation().is_cancelled() {
+    if ownership.cancellation().is_cancelled() {
         return Err("a refused fencing attempt cancelled the live attempt".into());
     }
 

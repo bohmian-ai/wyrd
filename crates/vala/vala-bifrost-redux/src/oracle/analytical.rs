@@ -64,7 +64,8 @@ pub use super::analytical_supervisor::AnalyticalSupervisor;
 use super::AuthorizedQueryContext;
 use super::analytical_supervisor::{
     AnalyticalAttemptGrant, AnalyticalAttemptGuard, AnalyticalAttemptKey, AnalyticalAttemptRelease,
-    AnalyticalGraphGuard, AnalyticalSupervisorInspection, StageId, TaskId,
+    AnalyticalGraphGuard, AnalyticalGraphLifecycleOwner, AnalyticalSupervisorInspection, StageId,
+    TaskId,
 };
 use super::analytical_transport::AnalyticalDestination;
 use super::analytical_transport::{
@@ -2442,8 +2443,11 @@ pub enum AnalyticalGraphControl {
     Registered,
     /// Selection is final; reserve the participant cut before dispatch.
     ReserveRequested,
-    /// The attempt has reached its terminal; return everything reserved.
-    Terminal,
+    /// The graph reached its first terminal; settle everything it owns.
+    ///
+    /// Carries the outcome the first signal chose. A later signal observes the
+    /// graph already draining and never replaces it.
+    Terminal(AnalyticalAttemptOutcome),
 }
 
 /// What the graph's lifecycle task has published back to its attempt.
@@ -2455,21 +2459,35 @@ pub enum AnalyticalGraphResult {
     ReservationReady,
     /// A participant declined; every accepted reservation was released.
     ReservationFailed,
+    /// Cleanup completed; every owner was released before the graph was removed.
+    ///
+    /// Carries the attempt's release evidence when the graph supervised one.
+    SettledSuccess(Option<AnalyticalAttemptRelease>),
+    /// Cleanup did not complete; the graph is retained as `Draining`.
+    SettledFailure,
 }
 
 /// The attempt-side half of one graph's lifecycle task.
 ///
-/// Declared as the last field of [`AnalyticalAttemptOwnership`] so dropping the
-/// ownership closes the control channel after the local guards are gone, which
-/// is what tells the task to return reservations only once this node has
-/// stopped addressing their owners.
+/// Deliberately holds no task handle and no control sender: both live in the
+/// supervisor's graph entry, so a caller may ask for settlement and await its
+/// result but can never take, abort, or reproduce the cleanup sequence. Dropping
+/// this value signals cancellation and nothing else.
 pub struct AnalyticalGraphSignals {
-    /// Control channel the attempt drives its lifecycle task through.
-    control: tokio::sync::watch::Sender<AnalyticalGraphControl>,
-    /// Result channel the lifecycle task publishes progress on.
+    /// Supervisor every control signal is issued through.
+    supervisor: Arc<AnalyticalSupervisor>,
+    /// The graph these signals address.
+    graph: AnalyticalGraphKey,
+    /// Clonable result channel this caller awaits settlement on.
     result: tokio::sync::watch::Receiver<AnalyticalGraphResult>,
     /// The graph-owned cell the reserved cut is published into.
     participants: Arc<std::sync::OnceLock<Arc<AnalyticalParticipantCut>>>,
+    /// The admission owner handed to the lifecycle task, when a caller has one.
+    ///
+    /// The task releases it as the very last step of cleanup, after the graph
+    /// has returned the envelope taken out of it, so the query's admission
+    /// counters never wake a waiter while its envelope is still charged.
+    admission: Option<tokio::sync::oneshot::Sender<super::admission::AdmittedQueryGuard>>,
 }
 
 impl fmt::Debug for AnalyticalGraphSignals {
@@ -2489,6 +2507,66 @@ impl AnalyticalGraphSignals {
         Arc::clone(&self.participants)
     }
 
+    /// Hands the admission owner to the lifecycle task for last release.
+    fn retain_admission(&mut self, admitted: super::admission::AdmittedQueryGuard) {
+        if let Some(sender) = self.admission.take()
+            && sender.send(admitted).is_err()
+        {
+            tracing::error!(
+                public_query_id = %self.graph.public_query_id,
+                "Oracle analytical lifecycle task cannot take the admission owner"
+            );
+        }
+    }
+
+    /// Clones this graph's settlement receiver for one more observer.
+    ///
+    /// Every clone reads the same monotonic channel, which is how settlement
+    /// evidence proves a raced success, cancellation, and failure all observe
+    /// the one outcome the first terminal signal chose.
+    #[cfg(test)]
+    fn settled_receiver(&self) -> tokio::sync::watch::Receiver<AnalyticalGraphResult> {
+        self.result.clone()
+    }
+
+    /// Waits for this graph's lifecycle task to publish its settlement.
+    ///
+    /// Every caller holds its own clone of the same receiver, so a raced
+    /// success, cancellation, and peer failure all observe the one settlement
+    /// the first terminal signal chose.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::Internal`] carrying the recorded cleanup failure
+    /// when the graph is retained as draining, and
+    /// [`BifrostError::QueryExecutionFailed`] when the task ended without
+    /// publishing a settlement.
+    async fn settled(&self) -> Result<Option<AnalyticalAttemptRelease>, BifrostError> {
+        let mut result = self.result.clone();
+        loop {
+            match *result.borrow_and_update() {
+                AnalyticalGraphResult::SettledSuccess(release) => return Ok(release),
+                AnalyticalGraphResult::SettledFailure => {
+                    let detail = self
+                        .supervisor
+                        .graph_settlement_failure(self.graph)
+                        .ok()
+                        .flatten()
+                        .unwrap_or_else(|| {
+                            "Oracle analytical graph cleanup did not complete".to_owned()
+                        });
+                    return Err(BifrostError::Internal { detail });
+                }
+                AnalyticalGraphResult::Pending
+                | AnalyticalGraphResult::ReservationReady
+                | AnalyticalGraphResult::ReservationFailed => {}
+            }
+            if result.changed().await.is_err() {
+                return Err(BifrostError::QueryExecutionFailed);
+            }
+        }
+    }
+
     /// Reserves the participant cut once and parks until it is published.
     ///
     /// Called exactly where selection becomes irreversible: after the physical
@@ -2503,13 +2581,7 @@ impl AnalyticalGraphSignals {
     /// declined its reservation, and [`BifrostError::QueryExecutionFailed`]
     /// when the graph's lifecycle task is gone.
     pub async fn publish_participants(&self) -> Result<(), BifrostError> {
-        if self
-            .control
-            .send(AnalyticalGraphControl::ReserveRequested)
-            .is_err()
-        {
-            return Err(BifrostError::QueryExecutionFailed);
-        }
+        self.supervisor.signal_reserve(self.graph)?;
         let mut result = self.result.clone();
         loop {
             match *result.borrow_and_update() {
@@ -2518,6 +2590,18 @@ impl AnalyticalGraphSignals {
                 AnalyticalGraphResult::ReservationFailed => {
                     return Err(BifrostError::QueryAdmissionRejected);
                 }
+                // A settlement may overwrite the reservation verdict, because
+                // the result channel keeps only its latest value. The published
+                // cut is the durable record: it is set once, only after every
+                // participant accepted, so its absence *is* the refusal.
+                AnalyticalGraphResult::SettledSuccess(_)
+                | AnalyticalGraphResult::SettledFailure => {
+                    return Err(if self.participants.get().is_some() {
+                        BifrostError::QueryExecutionFailed
+                    } else {
+                        BifrostError::QueryAdmissionRejected
+                    });
+                }
             }
             if result.changed().await.is_err() {
                 return Err(BifrostError::QueryExecutionFailed);
@@ -2525,9 +2609,30 @@ impl AnalyticalGraphSignals {
         }
     }
 
-    /// Tells the lifecycle task the attempt has reached its terminal.
-    fn terminal(&self) {
-        let _ = self.control.send(AnalyticalGraphControl::Terminal);
+    /// Asks the supervisor to settle this graph under `outcome`.
+    ///
+    /// Only the first signal chooses the outcome; a later one observes the
+    /// graph already draining and awaits the same settlement.
+    fn terminal(&self, outcome: AnalyticalAttemptOutcome) {
+        if let Err(error) = self.supervisor.signal_terminal(self.graph, outcome) {
+            tracing::error!(
+                %error,
+                public_query_id = %self.graph.public_query_id,
+                "Oracle analytical terminal signal was refused"
+            );
+        }
+    }
+}
+
+impl Drop for AnalyticalGraphSignals {
+    /// Signals cancellation, and only that.
+    ///
+    /// A dropped caller — a client that walked away, a raw stream drop — must
+    /// not spawn, abort, release, or reproduce the cleanup sequence. The task
+    /// stays owned by the supervisor, so it runs the one sequence and shutdown
+    /// still joins it.
+    fn drop(&mut self) {
+        self.terminal(AnalyticalAttemptOutcome::Cancelled);
     }
 }
 
@@ -2555,6 +2660,12 @@ struct AnalyticalGraphLifecycle {
     control: tokio::sync::watch::Receiver<AnalyticalGraphControl>,
     /// Result channel this task publishes its progress on.
     result: tokio::sync::watch::Sender<AnalyticalGraphResult>,
+    /// The graph's own attempt, joined by this task and nothing else.
+    attempt: Option<AnalyticalAttemptGuard>,
+    /// The graph's registration, released only after cleanup succeeds.
+    graph_guard: Option<AnalyticalGraphGuard>,
+    /// The admission owner, released last of all when a caller handed one over.
+    admission: tokio::sync::oneshot::Receiver<super::admission::AdmittedQueryGuard>,
 }
 
 /// How often a retained release is retried while it is neither acknowledged nor expired.
@@ -2575,26 +2686,41 @@ impl AnalyticalGraphLifecycle {
         transports: Option<Arc<super::dispatcher::OraclePeerTransportDirectory>>,
         remote: Vec<(Url, super::dispatcher::DispatchCandidate)>,
         request: ReserveNodeSlotsRequest,
-    ) -> AnalyticalGraphSignals {
+        owners: AnalyticalGraphLifecycleOwners,
+    ) -> Result<AnalyticalGraphSignals, BifrostError> {
         let participants = Arc::new(std::sync::OnceLock::new());
         let (control, control_rx) = tokio::sync::watch::channel(AnalyticalGraphControl::Registered);
         let (result, result_rx) = tokio::sync::watch::channel(AnalyticalGraphResult::Pending);
+        let (admission_tx, admission_rx) = tokio::sync::oneshot::channel();
+        let AnalyticalGraphLifecycleOwners {
+            attempt,
+            graph_guard,
+        } = owners;
         let lifecycle = Self {
             graph,
-            supervisor,
+            supervisor: Arc::clone(&supervisor),
             transports,
             remote,
             request,
             participants: Arc::clone(&participants),
             control: control_rx,
             result,
+            attempt,
+            graph_guard,
+            admission: admission_rx,
         };
-        tokio::spawn(lifecycle.run());
-        AnalyticalGraphSignals {
-            control,
+        let handle = tokio::spawn(lifecycle.run());
+        supervisor.attach_lifecycle(
+            graph,
+            AnalyticalGraphLifecycleOwner::new(control, result_rx.clone(), handle),
+        )?;
+        Ok(AnalyticalGraphSignals {
+            supervisor,
+            graph,
             result: result_rx,
             participants,
-        }
+            admission: Some(admission_tx),
+        })
     }
 
     /// Runs the graph's whole reservation and cleanup lifecycle.
@@ -2605,7 +2731,12 @@ impl AnalyticalGraphLifecycle {
     async fn run(mut self) {
         let mut reservations = AnalyticalParticipantReservations::empty();
         let mut requested = false;
-        while self.control.changed().await.is_ok() {
+        let outcome = loop {
+            if self.control.changed().await.is_err() {
+                // Every signal half is gone and no terminal arrived: the caller
+                // walked away, which is a cancellation rather than a success.
+                break AnalyticalAttemptOutcome::Cancelled;
+            }
             let control = *self.control.borrow_and_update();
             match control {
                 AnalyticalGraphControl::Registered => {}
@@ -2619,19 +2750,114 @@ impl AnalyticalGraphLifecycle {
                             reservations = taken;
                             let _ = self.result.send(AnalyticalGraphResult::ReservationReady);
                         }
-                        Err(mut taken) => {
-                            let retained = taken.release().await;
+                        Err(taken) => {
+                            reservations = taken;
                             let _ = self.result.send(AnalyticalGraphResult::ReservationFailed);
-                            self.drain(retained).await;
-                            return;
+                            // A refused reservation is itself the terminal: no
+                            // dispatch can follow it, so nothing is gained by
+                            // waiting for a caller to say so.
+                            break AnalyticalAttemptOutcome::Failed;
                         }
                     }
                 }
-                AnalyticalGraphControl::Terminal => break,
+                AnalyticalGraphControl::Terminal(outcome) => break outcome,
+            }
+        };
+        self.settle(outcome, reservations).await;
+    }
+
+    /// Performs the one cleanup sequence and publishes its settlement.
+    ///
+    /// The order is the invariant, and this is the only place it exists: move
+    /// the graph out of `Active` so nothing new is admitted, cancel unless the
+    /// graph succeeded, join the attempt and every descendant it retained,
+    /// return every participant reservation, wait for the envelope's own nested
+    /// children to go idle, release the graph, and only then release the
+    /// admission owner. Cleanup that cannot be confirmed leaves every
+    /// unresolved owner in the `Draining` entry and publishes a failure, so a
+    /// success terminal is unreachable and readiness stays false.
+    async fn settle(
+        mut self,
+        outcome: AnalyticalAttemptOutcome,
+        mut reservations: AnalyticalParticipantReservations,
+    ) {
+        let _ = self.supervisor.signal_terminal(self.graph, outcome);
+        if outcome != AnalyticalAttemptOutcome::Success
+            && let Ok(Some(cancel)) = self.supervisor.graph_cancellation(self.graph)
+        {
+            cancel.cancel();
+        }
+        let mut failure = None;
+        let mut release = None;
+        if let Some(attempt) = self.attempt.take() {
+            match attempt.finish(outcome).await {
+                Ok(settled) => release = Some(settled),
+                Err(error) => failure = Some(error.to_string()),
             }
         }
         let retained = reservations.release().await;
         self.drain(retained).await;
+        if failure.is_none()
+            && let Err(error) = self.release_graph().await
+        {
+            failure = Some(error.to_string());
+        }
+        match failure {
+            None => {
+                let _ = self
+                    .result
+                    .send(AnalyticalGraphResult::SettledSuccess(release));
+            }
+            Some(detail) => {
+                tracing::error!(
+                    public_query_id = %self.graph.public_query_id,
+                    datafusion_query_id = %self.graph.datafusion_query_id,
+                    detail,
+                    "Oracle analytical graph cleanup did not complete"
+                );
+                // Retained, never released: the graph keeps every owner it
+                // still holds so the residue stays attributable to this node.
+                if let Some(guard) = self.graph_guard.take() {
+                    guard.retain();
+                }
+                self.supervisor.retain_graph_cleanup(self.graph, detail);
+                let _ = self.result.send(AnalyticalGraphResult::SettledFailure);
+            }
+        }
+        // Last of all, and only here: the envelope this guard lent the graph
+        // has been returned, so the admission counters may wake the next query.
+        drop(self.admission.try_recv());
+    }
+
+    /// Waits, bounded, for the envelope's children and then releases the graph.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::Internal`] when a nested child of the query
+    /// envelope is still live after the bounded wait, and the supervisor's
+    /// refusal when the graph itself cannot be released.
+    async fn release_graph(&mut self) -> Result<(), BifrostError> {
+        let Some(guard) = self.graph_guard.take() else {
+            return Ok(());
+        };
+        for _ in 0..GRAPH_DRAIN_POLLS {
+            if self.supervisor.graph_children_idle(self.graph)? {
+                return guard.release();
+            }
+            tokio::time::sleep(GRAPH_DRAIN_INTERVAL).await;
+        }
+        let (scratch_bytes, memory_bytes) = self.supervisor.graph_children_debt(self.graph)?;
+        tracing::warn!(
+            public_query_id = %self.graph.public_query_id,
+            datafusion_query_id = %self.graph.datafusion_query_id,
+            scratch_bytes,
+            memory_bytes,
+            "Oracle analytical leader graph did not drain before its release"
+        );
+        guard.retain();
+        Err(BifrostError::Internal {
+            detail: "Oracle analytical graph cleanup did not complete".to_owned(),
+        })
     }
 
     /// Reserves every remote participant and publishes the complete cut once.
@@ -2729,7 +2955,13 @@ impl AnalyticalGraphLifecycle {
         if retained.is_empty() {
             return;
         }
-        self.supervisor.retain_graph_cleanup(self.graph);
+        let _ = self
+            .supervisor
+            .signal_terminal(self.graph, AnalyticalAttemptOutcome::Failed);
+        self.supervisor.retain_graph_cleanup(
+            self.graph,
+            "Oracle analytical participant release was not acknowledged".to_owned(),
+        );
         while !retained.is_empty() {
             tokio::time::sleep(RETAINED_RELEASE_RETRY).await;
             let mut remaining = Vec::with_capacity(retained.len());
@@ -4054,7 +4286,7 @@ mod tests {
             );
         } else {
             published.expect("every addressed follower accepted its reservation");
-            ownership.attempt.record_egress();
+            ownership.record_egress();
             assert!(ownership.egressed(), "one result frame has left this query");
         }
         Box::pin(assert_terminal_returns_everything(
@@ -4109,6 +4341,318 @@ mod tests {
             0,
             "one terminal returns the query envelope to the process root"
         );
+    }
+
+    /// Awaits one cloned settlement receiver and returns what it observed.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the lifecycle task ends without publishing a settlement,
+    /// which would make every settlement assertion below vacuous.
+    async fn observe_settlement(
+        mut receiver: tokio::sync::watch::Receiver<AnalyticalGraphResult>,
+    ) -> AnalyticalGraphResult {
+        loop {
+            let observed = *receiver.borrow_and_update();
+            if matches!(
+                observed,
+                AnalyticalGraphResult::SettledSuccess(_) | AnalyticalGraphResult::SettledFailure
+            ) {
+                return observed;
+            }
+            receiver
+                .changed()
+                .await
+                .expect("the lifecycle task publishes a settlement before it ends");
+        }
+    }
+
+    /// Names one stage of the graph the settlement sequence never joins.
+    fn stray_attempt_key(graph: AnalyticalGraphKey) -> AnalyticalAttemptKey {
+        AnalyticalAttemptKey::new(
+            graph.public_query_id,
+            graph.datafusion_query_id,
+            StageId::new(1),
+            Some(TaskId::new(0)),
+            AnalyticalAttemptNumber::ZERO,
+        )
+    }
+
+    /// One supervisor-owned lifecycle task settles every leader graph.
+    ///
+    /// Four properties are proven together because they are one design: the
+    /// task is owned by the supervisor rather than by a caller, so a raw stream
+    /// drop signals cancellation and leaves a task shutdown still joins; the
+    /// first terminal signal alone chooses the outcome and every cloned result
+    /// receiver observes that same settlement; successful cleanup releases the
+    /// attempt, every participant reservation, and the graph exactly once
+    /// before the graph entry is removed and success is published; and a
+    /// cleanup that cannot be confirmed retains every owner in the `Draining`
+    /// entry, publishes a failure instead of a success, and removes readiness.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a caller can take the task, when a later terminal replaces
+    /// the first, when a settled graph strands an owner, or when a failed
+    /// cleanup reports success or leaves the node advertising readiness.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn leader_lifecycle_task_joins_every_owner_and_retains_failure() {
+        Box::pin(assert_success_releases_every_owner_once()).await;
+        Box::pin(assert_first_terminal_alone_chooses_the_settlement()).await;
+        Box::pin(assert_stream_drop_leaves_a_supervisor_owned_task()).await;
+        Box::pin(assert_cleanup_failure_retains_draining_ownership()).await;
+    }
+
+    /// Successful cleanup releases every owner once, then removes the graph.
+    ///
+    /// # Panics
+    ///
+    /// Panics when settlement strands an owner, releases a reservation twice,
+    /// or removes the graph before its owners were returned.
+    async fn assert_success_releases_every_owner_once() {
+        let fixture = GraphFixture::new(Utc::now());
+        let oracle = fixture_oracle_role();
+        let leased = lease_over_lossy_peers(&fixture, &oracle, 2);
+        let (admitted, ownership, transport) = *leased;
+        ownership
+            .publish_participants()
+            .await
+            .expect("every addressed follower accepted its reservation");
+        assert_eq!(
+            fixture
+                .supervisor
+                .live_graphs()
+                .expect("the supervisor reports live graphs"),
+            1,
+            "the graph is live while its attempt still owns it"
+        );
+        assert_eq!(
+            fixture
+                .supervisor
+                .live_attempts()
+                .expect("the supervisor reports live attempts"),
+            1,
+            "the leader attempt is owned by the lifecycle task, not by the caller"
+        );
+        let release = ownership
+            .settle(AnalyticalAttemptOutcome::Success)
+            .await
+            .expect("successful cleanup publishes a success settlement");
+        assert_eq!(
+            release.outcome,
+            AnalyticalAttemptOutcome::Success,
+            "the settlement carries the outcome the first terminal chose"
+        );
+        assert_eq!(
+            transport.releases().len(),
+            2,
+            "each accepted reservation is returned exactly once"
+        );
+        assert_eq!(
+            fixture
+                .supervisor
+                .live_attempts()
+                .expect("the supervisor reports live attempts"),
+            0,
+            "the attempt is joined before the graph is removed"
+        );
+        assert_eq!(
+            fixture
+                .supervisor
+                .live_graphs()
+                .expect("the supervisor reports live graphs"),
+            0,
+            "successful cleanup removes the graph entry"
+        );
+        assert_eq!(
+            fixture
+                .supervisor
+                .draining_graphs()
+                .expect("the supervisor reports retained cleanup"),
+            0,
+            "a settled graph retains no cleanup"
+        );
+        drop(admitted);
+        assert_eq!(
+            oracle
+                .snapshot()
+                .expect("the fixture root reports live ownership")
+                .oracle_analytical_queries,
+            0,
+            "the query envelope returns to the process root exactly once"
+        );
+    }
+
+    /// The first terminal signal wins, and every observer sees that settlement.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a later terminal replaces the first, or when two cloned
+    /// receivers observe different settlements.
+    async fn assert_first_terminal_alone_chooses_the_settlement() {
+        let fixture = GraphFixture::new(Utc::now());
+        let oracle = fixture_oracle_role();
+        let leased = lease_over_lossy_peers(&fixture, &oracle, 2);
+        let (admitted, ownership, _transport) = *leased;
+        ownership
+            .publish_participants()
+            .await
+            .expect("every addressed follower accepted its reservation");
+        let observers = [
+            ownership.signals.settled_receiver(),
+            ownership.signals.settled_receiver(),
+            ownership.signals.settled_receiver(),
+        ];
+        // Cancellation first, then a peer failure, then the success the caller
+        // is about to ask for: only the first may choose the outcome.
+        ownership
+            .signals
+            .terminal(AnalyticalAttemptOutcome::Cancelled);
+        ownership.signals.terminal(AnalyticalAttemptOutcome::Failed);
+        let release = ownership
+            .settle(AnalyticalAttemptOutcome::Success)
+            .await
+            .expect("a raced terminal still settles this graph exactly once");
+        assert_eq!(
+            release.outcome,
+            AnalyticalAttemptOutcome::Cancelled,
+            "the first terminal signal alone chooses the outcome"
+        );
+        let settlement = AnalyticalGraphResult::SettledSuccess(Some(release));
+        for observer in observers {
+            assert_eq!(
+                observe_settlement(observer).await,
+                settlement,
+                "every cloned receiver observes the same settlement"
+            );
+        }
+        drop(admitted);
+    }
+
+    /// A dropped caller signals cancellation and leaves the task joinable.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a raw drop strands the graph, or when shutdown cannot find
+    /// and join the task the dropped caller left behind.
+    async fn assert_stream_drop_leaves_a_supervisor_owned_task() {
+        let fixture = GraphFixture::new(Utc::now());
+        let oracle = fixture_oracle_role();
+        let leased = lease_over_lossy_peers(&fixture, &oracle, 2);
+        let (admitted, ownership, transport) = *leased;
+        ownership
+            .publish_participants()
+            .await
+            .expect("every addressed follower accepted its reservation");
+        let observer = ownership.signals.settled_receiver();
+        // The raw drop path: no settle, no await, nothing taken. The caller
+        // holds no task handle to abort and no guard to release.
+        drop(ownership);
+        let settled = observe_settlement(observer).await;
+        assert!(
+            matches!(settled, AnalyticalGraphResult::SettledSuccess(Some(release))
+                if release.outcome == AnalyticalAttemptOutcome::Cancelled),
+            "a dropped caller is a cancellation the supervisor-owned task settles: {settled:?}"
+        );
+        assert_eq!(
+            transport.releases().len(),
+            2,
+            "the dropped caller's reservations are still returned exactly once"
+        );
+        let inspection = fixture
+            .supervisor
+            .shutdown()
+            .await
+            .expect("shutdown joins every remaining lifecycle task");
+        assert_eq!(
+            (inspection.attempts_retained, inspection.graphs_retained),
+            (0, 0),
+            "shutdown joins the dropped caller's task and retains nothing"
+        );
+        drop(admitted);
+        assert_eq!(
+            oracle
+                .snapshot()
+                .expect("the fixture root reports live ownership")
+                .oracle_analytical_queries,
+            0,
+            "a dropped caller still returns the query envelope"
+        );
+    }
+
+    /// Cleanup that cannot be confirmed retains ownership and fails readiness.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a failed cleanup publishes success, releases the graph, or
+    /// leaves the node advertising readiness.
+    async fn assert_cleanup_failure_retains_draining_ownership() {
+        let fixture = GraphFixture::new(Utc::now());
+        let oracle = fixture_oracle_role();
+        let leased = lease_over_lossy_peers(&fixture, &oracle, 2);
+        let (admitted, ownership, _transport) = *leased;
+        ownership
+            .publish_participants()
+            .await
+            .expect("every addressed follower accepted its reservation");
+        // A stage the settlement sequence cannot reach: it is not this graph's
+        // own attempt, so joining that attempt leaves it live and the graph
+        // cannot be confirmed released.
+        let graph = ownership.key().graph();
+        let stray = fixture
+            .supervisor
+            .spawn_attempt(
+                stray_attempt_key(graph),
+                AnalyticalAttemptGrant { scratch_bytes: 0 },
+            )
+            .expect("an active graph admits one more stage");
+        let error = ownership
+            .settle(AnalyticalAttemptOutcome::Success)
+            .await
+            .expect_err("a cleanup failure prevents a success terminal");
+        assert!(
+            matches!(error, BifrostError::Internal { .. }),
+            "an unconfirmed cleanup is reported, not logged and ignored: {error:?}"
+        );
+        assert_eq!(
+            fixture
+                .supervisor
+                .live_graphs()
+                .expect("the supervisor reports live graphs"),
+            1,
+            "a failed cleanup retains the graph rather than releasing it"
+        );
+        assert_eq!(
+            fixture
+                .supervisor
+                .draining_graphs()
+                .expect("the supervisor reports retained cleanup"),
+            1,
+            "the retained graph is visible as draining"
+        );
+        assert!(
+            fixture
+                .supervisor
+                .graph_settlement_failure(graph)
+                .expect("the supervisor reports why cleanup failed")
+                .is_some(),
+            "the retained graph names why its cleanup could not be confirmed"
+        );
+        assert!(
+            !fixture.execution_handle().is_healthy(),
+            "a node retaining an unsettled graph does not advertise readiness"
+        );
+        drop(stray);
+        let inspection = fixture
+            .supervisor
+            .shutdown()
+            .await
+            .expect("shutdown reaches the retained residue");
+        assert_eq!(
+            inspection.graphs_released, 1,
+            "the retained graph was still there for shutdown to account for"
+        );
+        drop(admitted);
     }
 
     /// A leader query owns exactly one envelope, and its graph is that pool.
@@ -5162,6 +5706,11 @@ mod tests {
         remote: Vec<(Url, super::super::dispatcher::DispatchCandidate)>,
         /// The attempt-side half of the started lifecycle task.
         signals: AnalyticalGraphSignals,
+        /// Process root the registered graph's envelope was admitted from.
+        ///
+        /// Retained because releasing the graph returns the envelope to *this*
+        /// root; dropping it early would make every ownership assertion vacuous.
+        _oracle: OracleResources,
     }
 
     impl ReservationFixture {
@@ -5200,6 +5749,26 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
+            // Registered exactly as production registers, because the graph
+            // entry is the lifecycle registry: a task with no entry could not
+            // move its graph to draining, retain a failed cleanup, or be joined
+            // by shutdown.
+            let oracle = fixture_oracle_role();
+            let resources = oracle
+                .try_acquire_query(OracleResourceRequest::for_class(
+                    QueryClass::Analytical,
+                    0.0,
+                ))
+                .expect("an idle Oracle admits one analytical query");
+            let runtime = graph
+                .spill
+                .build_query_runtime(resources.memory_pool(), resources.scratch_bytes)
+                .expect("the fixture spill owner builds one query runtime");
+            let graph_guard = graph
+                .supervisor
+                .register_graph(graph.graph, resources, AnalyticalGraphRuntime::new(runtime))
+                .map_err(|(_, error)| error)
+                .expect("an empty supervisor registers one graph");
             let signals = AnalyticalGraphLifecycle::start(
                 graph.graph,
                 Arc::clone(&graph.supervisor),
@@ -5217,12 +5786,18 @@ mod tests {
                         datafusion_query_id: graph.graph.datafusion_query_id.as_uuid(),
                     }),
                 },
-            );
+                AnalyticalGraphLifecycleOwners {
+                    attempt: None,
+                    graph_guard: Some(graph_guard),
+                },
+            )
+            .expect("the registered graph accepts one lifecycle task");
             Self {
                 graph,
                 transport,
                 remote,
                 signals,
+                _oracle: oracle,
             }
         }
 
@@ -5936,6 +6511,9 @@ impl AnalyticalExecutionHandle {
                 scratch_bytes: self.config.scratch_bytes,
             },
         )?;
+        let key = attempt_guard.key();
+        let cancel = attempt_guard.cancellation().clone();
+        let egressed = attempt_guard.egress_flag();
         let signals = AnalyticalGraphLifecycle::start(
             graph,
             Arc::clone(&self.supervisor),
@@ -5953,7 +6531,11 @@ impl AnalyticalExecutionHandle {
                     datafusion_query_id: graph.datafusion_query_id.as_uuid(),
                 }),
             },
-        );
+            AnalyticalGraphLifecycleOwners {
+                attempt: Some(attempt_guard),
+                graph_guard: Some(graph_guard),
+            },
+        )?;
         let session = self.leader_session(
             AnalyticalSessionInputs {
                 context,
@@ -5971,10 +6553,10 @@ impl AnalyticalExecutionHandle {
         Ok((
             session,
             AnalyticalAttemptOwnership {
-                graph: graph_guard,
-                attempt: attempt_guard,
+                key,
+                cancel,
+                egressed,
                 signals,
-                admission: None,
             },
         ))
     }
@@ -6172,58 +6754,57 @@ pub struct AnalyticalAttemptContext {
 /// this value settles both, which is what makes a cancelled or abandoned
 /// attempt return capacity instead of stranding it.
 pub struct AnalyticalAttemptOwnership {
-    /// Attempt ownership retained for as long as stage work may run.
+    /// The attempt every descendant of this ownership binds to.
+    key: AnalyticalAttemptKey,
+    /// Cancellation child covering every descendant of the attempt.
+    cancel: CancellationToken,
+    /// Egress fence shared with the supervisor's attempt state.
     ///
-    /// Declared before the graph on purpose: Rust drops struct fields in
-    /// declaration order, and a graph asked to release while one of its
-    /// attempts is still live refuses. Reversing these two fields is not a
-    /// style choice; it strands the query envelope.
-    pub attempt: AnalyticalAttemptGuard,
-    /// Graph ownership retained for as long as stages may be addressed.
-    pub graph: AnalyticalGraphGuard,
-    /// The graph lifecycle task's attempt-side half.
+    /// Cloned from the attempt guard the lifecycle task now owns, because the
+    /// fence outlives this caller: settlement evidence still has to say whether
+    /// rows left the node.
+    egressed: Arc<std::sync::atomic::AtomicBool>,
+    /// The graph lifecycle task's caller-side half.
     ///
-    /// Declared after the local guards so it closes after them: the task is
-    /// told to return every participant reservation only once this node has
-    /// stopped addressing their owners.
+    /// The only handle a caller has on the graph. It carries no task and no
+    /// guard: the supervisor owns those, so this value can ask for settlement
+    /// and await it but can never perform it.
     pub signals: AnalyticalGraphSignals,
-    /// The admission owner this ownership retains when nothing else holds it.
-    ///
-    /// The production SQL path keeps its own guard and attaches this ownership
-    /// to it, so this is `None` there. The inactive-attempt seam has no query
-    /// stream to hold one, so it hands the guard here instead — which is what
-    /// keeps the query's admission counters charged for exactly as long as the
-    /// graph holds the envelope taken out of it. Declared last so those
-    /// counters are returned only after the envelope itself has been.
-    admission: Option<Box<super::admission::AdmittedQueryGuard>>,
 }
 
 impl AnalyticalAttemptOwnership {
     /// Returns the exact attempt every descendant of this ownership binds to.
     #[must_use]
-    pub fn key(&self) -> AnalyticalAttemptKey {
-        self.attempt.key()
+    pub const fn key(&self) -> AnalyticalAttemptKey {
+        self.key
+    }
+
+    /// Returns the cancellation child covering every descendant of the attempt.
+    #[must_use]
+    pub const fn cancellation(&self) -> &CancellationToken {
+        &self.cancel
     }
 
     /// Records that result data produced under this attempt left the node.
     pub fn record_egress(&self) {
-        self.attempt.record_egress();
+        self.egressed
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// Reports whether result data already left the node under this attempt.
     #[must_use]
     pub fn egressed(&self) -> bool {
-        self.attempt.egressed()
+        self.egressed.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Retains the admission owner for a caller that holds no query stream.
     ///
     /// The inactive-attempt seam leases a session without building a stream, so
     /// nothing else would keep the query's admission counters charged while the
-    /// graph holds its envelope. Handing the guard here makes this ownership the
-    /// single owner of both.
+    /// graph holds its envelope. The guard is handed to the graph's lifecycle
+    /// task, which releases it as the last step of cleanup.
     pub(super) fn retain_admission(&mut self, admitted: super::admission::AdmittedQueryGuard) {
-        self.admission = Some(Box::new(admitted));
+        self.signals.retain_admission(admitted);
     }
 
     /// Reserves and publishes this graph's participant cut, once, before dispatch.
@@ -6255,21 +6836,22 @@ impl AnalyticalAttemptOwnership {
         self,
         outcome: AnalyticalAttemptOutcome,
     ) -> Result<AnalyticalAttemptRelease, BifrostError> {
-        let Self {
-            attempt,
-            graph,
-            signals,
-            admission,
-        } = self;
-        let release = attempt.finish(outcome).await?;
-        graph.release()?;
-        // Signalled only after both local guards are gone, so a participant is
-        // told to drop its reservation once this node can no longer address it.
-        signals.terminal();
-        // Last, and only here: the envelope this guard lent the graph has been
-        // returned by the release above, so the admission counters may now wake
-        // the next query.
-        drop(admission);
-        Ok(release)
+        self.signals.terminal(outcome);
+        self.signals
+            .settled()
+            .await?
+            .ok_or(BifrostError::QueryExecutionFailed)
     }
+}
+
+/// The two guards one leader graph hands to its lifecycle task at registration.
+///
+/// Named rather than passed positionally because both are `Option`-shaped in
+/// the task and transposing them would move the release order — attempt before
+/// graph — that keeps the query envelope from being stranded.
+struct AnalyticalGraphLifecycleOwners {
+    /// The graph's own attempt, joined by the lifecycle task.
+    attempt: Option<AnalyticalAttemptGuard>,
+    /// The graph's registration, released only after cleanup succeeds.
+    graph_guard: Option<AnalyticalGraphGuard>,
 }

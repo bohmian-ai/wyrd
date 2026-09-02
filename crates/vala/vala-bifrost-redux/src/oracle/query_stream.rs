@@ -518,7 +518,18 @@ async fn settle_and_finish_stream(inputs: StreamSettlementInputs<'_>) -> QueryTe
         stream_cancellation,
     );
     settle_distributed(distributed_settlement, outcome, stream_cancellation).await;
-    settle_analytical(admitted, outcome).await;
+    // A cleanup that could not be confirmed cannot become a success terminal:
+    // the graph is retained as draining, so rows this query produced are not
+    // provably complete and its owners are not provably returned.
+    let candidate = if settle_analytical(admitted, outcome).await {
+        candidate
+    } else {
+        failed_terminal_for_visibility(
+            QueryTerminalErrorCode::QueryExecutionFailed,
+            row_count,
+            visibility,
+        )
+    };
     let candidate = close_ipc_stream(ipc, candidate, visibility, row_count);
     let terminal = release_and_finish_terminal(
         admitted,
@@ -633,30 +644,39 @@ async fn settle_distributed(
 /// however it ended, the point at which follower work stops rather than the
 /// point at which it is merely no longer awaited.
 ///
-/// A settlement failure is logged rather than propagated: the terminal frame is
-/// already chosen, and the guard's own drop still returns every reservation.
+/// Signalling and awaiting is the whole of this stream's part in settlement:
+/// the graph's lifecycle task owns the cleanup order, and reproducing any of it
+/// here would be a second, racing sequence.
+///
+/// Returns whether the graph settled cleanly. A retained cleanup is reported to
+/// the caller rather than logged and ignored, because it is what makes a
+/// success terminal untruthful.
 async fn settle_analytical(
     admitted: &mut Option<AdmittedQueryGuard>,
     outcome: QueryTerminalOutcome,
-) {
+) -> bool {
     let Some(ownership) = admitted
         .as_mut()
         .and_then(AdmittedQueryGuard::take_analytical)
     else {
-        return;
+        return true;
     };
     let attempt_outcome = match outcome {
         QueryTerminalOutcome::Failed => AnalyticalAttemptOutcome::Failed,
         _ => AnalyticalAttemptOutcome::Success,
     };
     let key = ownership.key();
-    if let Err(error) = ownership.settle(attempt_outcome).await {
-        tracing::error!(
-            %error,
-            public_query_id = %key.public_query_id,
-            datafusion_query_id = %key.datafusion_query_id,
-            "Oracle analytical attempt could not settle with its leader stream"
-        );
+    match ownership.settle(attempt_outcome).await {
+        Ok(_) => true,
+        Err(error) => {
+            tracing::error!(
+                %error,
+                public_query_id = %key.public_query_id,
+                datafusion_query_id = %key.datafusion_query_id,
+                "Oracle analytical attempt could not settle with its leader stream"
+            );
+            false
+        }
     }
 }
 

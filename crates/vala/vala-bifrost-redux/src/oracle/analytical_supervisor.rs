@@ -210,6 +210,88 @@ struct AnalyticalGraphState {
     /// session that opens those exchanges and the lease that settles the graph
     /// bind to this one token.
     cancel: CancellationToken,
+    /// The leader lifecycle task supervising this graph, when it has one.
+    ///
+    /// A follower graph has none: it is settled by the coordinator call that
+    /// activated it. A leader graph attaches one at registration, and the
+    /// supervisor — never a caller — owns its join handle, which is what keeps
+    /// the task joinable after the query stream that signalled it is gone.
+    lifecycle: Option<AnalyticalGraphLifecycleOwner>,
+}
+
+/// The supervisor-side half of one leader graph's lifecycle task.
+///
+/// Held in the graph entry rather than by the attempt, so a caller that drops
+/// its stream signals settlement without being able to take, abort, or await
+/// the task. Only shutdown takes the handle, and only after signalling.
+pub struct AnalyticalGraphLifecycleOwner {
+    /// Control channel the graph's terminal is signalled through.
+    control: tokio::sync::watch::Sender<super::analytical::AnalyticalGraphControl>,
+    /// Clonable result channel every caller awaits settlement on.
+    result: tokio::sync::watch::Receiver<super::analytical::AnalyticalGraphResult>,
+    /// The task itself, taken only by shutdown.
+    handle: Option<JoinHandle<()>>,
+}
+
+impl fmt::Debug for AnalyticalGraphLifecycleOwner {
+    /// Reports whether the task is still joinable without rendering channels.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AnalyticalGraphLifecycleOwner")
+            .field("joinable", &self.handle.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl AnalyticalGraphLifecycleOwner {
+    /// Composes the supervisor's half of one started lifecycle task.
+    #[must_use]
+    pub fn new(
+        control: tokio::sync::watch::Sender<super::analytical::AnalyticalGraphControl>,
+        result: tokio::sync::watch::Receiver<super::analytical::AnalyticalGraphResult>,
+        handle: JoinHandle<()>,
+    ) -> Self {
+        Self {
+            control,
+            result,
+            handle: Some(handle),
+        }
+    }
+}
+
+/// One registered graph's exact lifecycle state in the supervisor's map.
+///
+/// The follower ingress already distinguishes these two states; the leader now
+/// does too, because a graph whose cleanup has begun must keep every owner it
+/// still holds while refusing new work. Collapsing them into one map value is
+/// what previously let a settling graph look identical to a live one.
+enum AnalyticalGraphEntry {
+    /// The graph is live: it admits attempts and accepts a terminal signal.
+    Active(AnalyticalGraphState),
+    /// A terminal was signalled; the graph admits nothing and is settling.
+    Draining {
+        /// Everything the graph still owns until its cleanup succeeds.
+        state: AnalyticalGraphState,
+        /// Why cleanup could not be confirmed, when it could not. `Some`
+        /// fails readiness and keeps the residue attributable to this node.
+        settlement_failure: Option<String>,
+    },
+}
+
+impl AnalyticalGraphEntry {
+    /// Borrows the graph's owned state in either lifecycle state.
+    const fn state(&self) -> &AnalyticalGraphState {
+        match self {
+            Self::Active(state) | Self::Draining { state, .. } => state,
+        }
+    }
+
+    /// Mutably borrows the graph's owned state in either lifecycle state.
+    const fn state_mut(&mut self) -> &mut AnalyticalGraphState {
+        match self {
+            Self::Active(state) | Self::Draining { state, .. } => state,
+        }
+    }
 }
 
 /// Everything one live attempt owns and must return exactly once.
@@ -276,16 +358,13 @@ pub struct AnalyticalSupervisor {
     /// Query-owned runtimes resolvable by authenticated follower stage work.
     registry: Arc<AnalyticalRuntimeRegistry>,
     /// Admitted query envelopes keyed by graph, one per live distributed plan.
-    graphs: Mutex<HashMap<AnalyticalGraphKey, AnalyticalGraphState>>,
+    ///
+    /// The value carries the graph's lifecycle state, so `Active` and
+    /// `Draining` are one authoritative registry rather than a live map beside
+    /// a separate set of names.
+    graphs: Mutex<HashMap<AnalyticalGraphKey, AnalyticalGraphEntry>>,
     /// Live attempts keyed by complete two-identity attempt identity.
     attempts: Mutex<HashMap<AnalyticalAttemptKey, AnalyticalAttemptState>>,
-    /// Graphs whose participant reservations could not be confirmed released.
-    ///
-    /// Separate from `graphs` because a draining graph has already returned its
-    /// local envelope: what is retained is a remote follower's, which this node
-    /// can name but cannot free. Keeping it here is what makes the residue
-    /// attributable to this node instead of silently forgotten.
-    draining: Mutex<std::collections::HashSet<AnalyticalGraphKey>>,
     /// Node-scoped cancellation parent of every attempt's cancellation child.
     root_cancel: CancellationToken,
     /// Whether the supervisor still admits new attempts.
@@ -311,7 +390,6 @@ impl AnalyticalSupervisor {
             registry: Arc::new(AnalyticalRuntimeRegistry::new()),
             graphs: Mutex::new(HashMap::new()),
             attempts: Mutex::new(HashMap::new()),
-            draining: Mutex::new(std::collections::HashSet::new()),
             root_cancel: CancellationToken::new(),
             accepting: AtomicBool::new(true),
         }
@@ -399,12 +477,13 @@ impl AnalyticalSupervisor {
         }
         graphs.insert(
             graph,
-            AnalyticalGraphState {
+            AnalyticalGraphEntry::Active(AnalyticalGraphState {
                 resources,
                 runtime,
                 exchanges: Arc::default(),
                 cancel: self.root_cancel.child_token(),
-            },
+                lifecycle: None,
+            }),
         );
         drop(graphs);
         tracing::debug!(
@@ -433,7 +512,9 @@ impl AnalyticalSupervisor {
     ) -> Result<Option<Arc<super::analytical_transport::AnalyticalGraphExchanges>>, BifrostError>
     {
         let graphs = self.graphs.lock().map_err(|_| poisoned_supervisor())?;
-        Ok(graphs.get(&graph).map(|state| Arc::clone(&state.exchanges)))
+        Ok(graphs
+            .get(&graph)
+            .map(|entry| Arc::clone(&entry.state().exchanges)))
     }
 
     /// Returns one registered graph's own cancellation child.
@@ -449,7 +530,7 @@ impl AnalyticalSupervisor {
         graph: AnalyticalGraphKey,
     ) -> Result<Option<CancellationToken>, BifrostError> {
         let graphs = self.graphs.lock().map_err(|_| poisoned_supervisor())?;
-        Ok(graphs.get(&graph).map(|state| state.cancel.clone()))
+        Ok(graphs.get(&graph).map(|entry| entry.state().cancel.clone()))
     }
 
     /// Reports whether one registered graph's envelope has no nested child left.
@@ -464,10 +545,11 @@ impl AnalyticalSupervisor {
     /// own scratch attribution lock is poisoned.
     pub fn graph_children_idle(&self, graph: AnalyticalGraphKey) -> Result<bool, BifrostError> {
         let graphs = self.graphs.lock().map_err(|_| poisoned_supervisor())?;
-        let Some(state) = graphs.get(&graph) else {
+        let Some(entry) = graphs.get(&graph) else {
             return Ok(true);
         };
-        state
+        entry
+            .state()
             .resources
             .nested_idle()
             .map_err(|_| poisoned_supervisor())
@@ -488,10 +570,11 @@ impl AnalyticalSupervisor {
         graph: AnalyticalGraphKey,
     ) -> Result<(u64, usize), BifrostError> {
         let graphs = self.graphs.lock().map_err(|_| poisoned_supervisor())?;
-        let Some(state) = graphs.get(&graph) else {
+        let Some(entry) = graphs.get(&graph) else {
             return Ok((0, 0));
         };
-        state
+        entry
+            .state()
             .resources
             .nested_debt()
             .map_err(|_| poisoned_supervisor())
@@ -506,45 +589,206 @@ impl AnalyticalSupervisor {
         Ok(self.graphs.lock().map_err(|_| poisoned_supervisor())?.len())
     }
 
-    /// Counts graphs retained because a participant release was not acknowledged.
+    /// Counts graphs whose cleanup could not be confirmed complete.
+    ///
+    /// Only a `Draining` entry carrying a recorded failure is counted. A graph
+    /// merely passing through settlement is not residue, so a normal terminal
+    /// never removes this node's readiness; an unacknowledged participant
+    /// release or a failed cleanup does, and stays counted until it resolves.
     ///
     /// # Errors
     ///
-    /// Returns [`BifrostError::Internal`] when the draining lock is poisoned.
+    /// Returns [`BifrostError::Internal`] when the graph lock is poisoned.
     pub fn draining_graphs(&self) -> Result<usize, BifrostError> {
-        Ok(self
-            .draining
-            .lock()
-            .map_err(|_| poisoned_supervisor())?
-            .len())
+        let graphs = self.graphs.lock().map_err(|_| poisoned_supervisor())?;
+        Ok(graphs
+            .values()
+            .filter(|entry| {
+                matches!(
+                    entry,
+                    AnalyticalGraphEntry::Draining {
+                        settlement_failure: Some(_),
+                        ..
+                    }
+                )
+            })
+            .count())
     }
 
-    /// Records that one graph is holding an unacknowledged participant release.
+    /// Records why one draining graph's cleanup could not be confirmed.
     ///
     /// A poisoned lock is logged rather than propagated: this is called from a
     /// lifecycle task that has no caller to fail, and the alternative is losing
-    /// the record entirely.
-    pub fn retain_graph_cleanup(&self, graph: AnalyticalGraphKey) {
-        if let Ok(mut draining) = self.draining.lock() {
-            draining.insert(graph);
-        } else {
+    /// the record entirely. A graph that is no longer registered is likewise
+    /// only logged; nothing this node owns is left to attribute the residue to.
+    pub fn retain_graph_cleanup(&self, graph: AnalyticalGraphKey, detail: String) {
+        let Ok(mut graphs) = self.graphs.lock() else {
             tracing::error!(
                 public_query_id = %graph.public_query_id,
-                "Oracle analytical draining registry is poisoned"
+                "Oracle analytical graph registry is poisoned"
             );
+            return;
+        };
+        if let Some(AnalyticalGraphEntry::Draining {
+            settlement_failure, ..
+        }) = graphs.get_mut(&graph)
+        {
+            *settlement_failure = Some(detail);
         }
     }
 
     /// Clears one graph's retained cleanup once every release has resolved.
     pub fn resolve_graph_cleanup(&self, graph: AnalyticalGraphKey) {
-        if let Ok(mut draining) = self.draining.lock() {
-            draining.remove(&graph);
-        } else {
+        let Ok(mut graphs) = self.graphs.lock() else {
             tracing::error!(
                 public_query_id = %graph.public_query_id,
-                "Oracle analytical draining registry is poisoned"
+                "Oracle analytical graph registry is poisoned"
             );
+            return;
+        };
+        if let Some(AnalyticalGraphEntry::Draining {
+            settlement_failure, ..
+        }) = graphs.get_mut(&graph)
+        {
+            *settlement_failure = None;
         }
+    }
+
+    /// Reports why one graph's cleanup failed, when it did.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::Internal`] when the graph lock is poisoned.
+    pub fn graph_settlement_failure(
+        &self,
+        graph: AnalyticalGraphKey,
+    ) -> Result<Option<String>, BifrostError> {
+        let graphs = self.graphs.lock().map_err(|_| poisoned_supervisor())?;
+        Ok(match graphs.get(&graph) {
+            Some(AnalyticalGraphEntry::Draining {
+                settlement_failure, ..
+            }) => settlement_failure.clone(),
+            _ => None,
+        })
+    }
+
+    /// Attaches one leader graph's lifecycle task to its registered entry.
+    ///
+    /// The supervisor becomes the task's only owner here. A caller keeps the
+    /// attempt-side signal halves, so it can ask for settlement and await the
+    /// result, but it can never take, abort, or await the task itself — which
+    /// is what makes a dropped query stream leave a joinable task behind.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::QueryExecutionFailed`] when the graph is not
+    /// registered active, and [`BifrostError::Internal`] when the graph lock is
+    /// poisoned or a lifecycle is already attached.
+    pub fn attach_lifecycle(
+        &self,
+        graph: AnalyticalGraphKey,
+        lifecycle: AnalyticalGraphLifecycleOwner,
+    ) -> Result<(), BifrostError> {
+        let mut graphs = self.graphs.lock().map_err(|_| poisoned_supervisor())?;
+        let Some(AnalyticalGraphEntry::Active(state)) = graphs.get_mut(&graph) else {
+            return Err(BifrostError::QueryExecutionFailed);
+        };
+        if state.lifecycle.is_some() {
+            return Err(BifrostError::Internal {
+                detail: "Oracle analytical graph already owns a lifecycle task".to_owned(),
+            });
+        }
+        state.lifecycle = Some(lifecycle);
+        Ok(())
+    }
+
+    /// Signals one graph's terminal and returns the settlement to await.
+    ///
+    /// The first signal moves `Active` to `Draining` under the graph lock and
+    /// chooses the outcome; every later signal observes `Draining`, leaves the
+    /// outcome unchanged, and is handed the same result receiver. A graph that
+    /// is no longer registered has already settled, so `None` is the correct
+    /// answer rather than an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::Internal`] when the graph lock is poisoned.
+    pub fn signal_terminal(
+        &self,
+        graph: AnalyticalGraphKey,
+        outcome: AnalyticalAttemptOutcome,
+    ) -> Result<
+        Option<tokio::sync::watch::Receiver<super::analytical::AnalyticalGraphResult>>,
+        BifrostError,
+    > {
+        let mut graphs = self.graphs.lock().map_err(|_| poisoned_supervisor())?;
+        let Some(entry) = graphs.remove(&graph) else {
+            return Ok(None);
+        };
+        let (state, settlement_failure, first) = match entry {
+            AnalyticalGraphEntry::Active(state) => (state, None, true),
+            AnalyticalGraphEntry::Draining {
+                state,
+                settlement_failure,
+            } => (state, settlement_failure, false),
+        };
+        let result = state.lifecycle.as_ref().map(|lifecycle| {
+            if first {
+                let _ = lifecycle
+                    .control
+                    .send(super::analytical::AnalyticalGraphControl::Terminal(outcome));
+            }
+            lifecycle.result.clone()
+        });
+        graphs.insert(
+            graph,
+            AnalyticalGraphEntry::Draining {
+                state,
+                settlement_failure,
+            },
+        );
+        Ok(result)
+    }
+
+    /// Asks one graph's lifecycle task to reserve its participant cut.
+    ///
+    /// Idempotent by construction: the control channel is monotonic, so a
+    /// repeated request is the value the task already handled rather than a
+    /// second reservation round.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::QueryExecutionFailed`] when the graph is no
+    /// longer active or owns no lifecycle task, and [`BifrostError::Internal`]
+    /// when the graph lock is poisoned.
+    pub fn signal_reserve(&self, graph: AnalyticalGraphKey) -> Result<(), BifrostError> {
+        let graphs = self.graphs.lock().map_err(|_| poisoned_supervisor())?;
+        let Some(AnalyticalGraphEntry::Active(state)) = graphs.get(&graph) else {
+            return Err(BifrostError::QueryExecutionFailed);
+        };
+        let Some(lifecycle) = state.lifecycle.as_ref() else {
+            return Err(BifrostError::QueryExecutionFailed);
+        };
+        lifecycle
+            .control
+            .send(super::analytical::AnalyticalGraphControl::ReserveRequested)
+            .map_err(|_| BifrostError::QueryExecutionFailed)
+    }
+
+    /// Takes one draining graph's lifecycle task so shutdown can join it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::Internal`] when the graph lock is poisoned.
+    fn take_lifecycle_task(
+        &self,
+        graph: AnalyticalGraphKey,
+    ) -> Result<Option<JoinHandle<()>>, BifrostError> {
+        let mut graphs = self.graphs.lock().map_err(|_| poisoned_supervisor())?;
+        Ok(graphs
+            .get_mut(&graph)
+            .and_then(|entry| entry.state_mut().lifecycle.as_mut())
+            .and_then(|lifecycle| lifecycle.handle.take()))
     }
 
     /// Resolves the query-owned runtime one registered graph installs.
@@ -560,7 +804,7 @@ impl AnalyticalSupervisor {
         let graphs = self.graphs.lock().map_err(|_| poisoned_supervisor())?;
         graphs
             .get(&graph)
-            .map(|state| state.runtime.clone())
+            .map(|entry| entry.state().runtime.clone())
             .ok_or(BifrostError::QueryExecutionFailed)
     }
 
@@ -637,7 +881,11 @@ impl AnalyticalSupervisor {
             });
         }
         let graphs = self.graphs.lock().map_err(|_| poisoned_supervisor())?;
-        let Some(graph) = graphs.get(&key.graph()) else {
+        let Some(AnalyticalGraphEntry::Active(graph)) = graphs.get(&key.graph()) else {
+            // A draining graph is deliberately indistinguishable from an
+            // unregistered one here: its cleanup already began, so admitting
+            // another attempt beneath it would strand work the settlement
+            // sequence has stopped waiting for.
             return Err(BifrostError::QueryExecutionFailed);
         };
         let mut attempts = self.attempts.lock().map_err(|_| poisoned_supervisor())?;
@@ -785,6 +1033,12 @@ impl AnalyticalSupervisor {
     /// Stops admission, cancels the node root, settles every live attempt, and
     /// releases every registered graph's runtime and admitted envelope.
     ///
+    /// Every graph that still owns a lifecycle task is signalled first and its
+    /// task is joined, because shutdown is the only owner permitted to take
+    /// that handle. Joining before the attempt and graph sweep below is what
+    /// makes a task that is mid-cleanup finish its own sequence rather than
+    /// racing this one.
+    ///
     /// # Errors
     ///
     /// Returns [`BifrostError::Internal`] when the attempt or registry lock is
@@ -792,6 +1046,23 @@ impl AnalyticalSupervisor {
     pub async fn shutdown(&self) -> Result<AnalyticalSupervisorInspection, BifrostError> {
         self.accepting.store(false, Ordering::Release);
         self.root_cancel.cancel();
+        let signalled: Vec<AnalyticalGraphKey> = {
+            let graphs = self.graphs.lock().map_err(|_| poisoned_supervisor())?;
+            graphs.keys().copied().collect()
+        };
+        for graph in signalled {
+            self.signal_terminal(graph, AnalyticalAttemptOutcome::Cancelled)?;
+            if let Some(handle) = self.take_lifecycle_task(graph)?
+                && let Err(error) = handle.await
+                && !error.is_cancelled()
+            {
+                tracing::error!(
+                    %error,
+                    public_query_id = %graph.public_query_id,
+                    "Oracle analytical graph lifecycle task failed to join"
+                );
+            }
+        }
         let live: Vec<AnalyticalAttemptKey> = {
             let attempts = self.attempts.lock().map_err(|_| poisoned_supervisor())?;
             attempts.keys().copied().collect()
@@ -918,6 +1189,16 @@ impl AnalyticalGraphGuard {
         self.released = true;
         self.supervisor.release_graph(self.graph)
     }
+
+    /// Gives up the guard without releasing the graph it owns.
+    ///
+    /// The one caller is a cleanup sequence that failed: the supervisor keeps
+    /// the graph's entry, envelope, and runtime as `Draining` so the residue
+    /// stays named and attributable rather than being returned to the process
+    /// governor while a child may still hold it.
+    pub fn retain(mut self) {
+        self.released = true;
+    }
 }
 
 impl Drop for AnalyticalGraphGuard {
@@ -992,6 +1273,12 @@ impl AnalyticalAttemptGuard {
     /// later observation can un-fence it.
     pub fn record_egress(&self) {
         self.egressed.store(true, Ordering::Release);
+    }
+
+    /// Returns the shared egress fence, for an owner that outlives this guard.
+    #[must_use]
+    pub fn egress_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.egressed)
     }
 
     /// Reports whether result data already left the node under this attempt.

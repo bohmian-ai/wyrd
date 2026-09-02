@@ -1,6 +1,7 @@
 //! Bounded local and tonic sealed-fragment dispatch.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::pin::Pin;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -16,6 +17,7 @@ use tokio::sync::OwnedSemaphorePermit;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use wyrd_spec::DataTenantId;
+use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::api::{
     AnalyticalGraphRef, BifrostSecurityViolationKind, ExecuteFragmentRequest, FencingToken, NodeId,
     OracleRoleFence, PendingNodeReservation, QueryAuditDigest, QueryClass, QueryId,
@@ -289,18 +291,6 @@ impl fmt::Debug for PendingGraphActivation {
 }
 
 impl PendingGraphActivation {
-    /// Returns the exact graph this reservation was taken for.
-    #[must_use]
-    pub(crate) fn graph(&self) -> AnalyticalGraphRef {
-        self.graph
-    }
-
-    /// Returns the reservation identity this activation holds open.
-    #[must_use]
-    pub(crate) fn reservation_id(&self) -> ReservationId {
-        self.reservation_id
-    }
-
     /// Returns the leader node and fence the reservation was accepted under.
     ///
     /// This is reservation ownership, not per-message stage authority. The
@@ -313,7 +303,10 @@ impl PendingGraphActivation {
     /// is unreachable: both consume `self`.
     #[must_use]
     pub(crate) fn reserving_leader(&self) -> (NodeId, FencingToken) {
-        let entry = self.entry.as_ref().expect("a live activation owns its entry");
+        let entry = self
+            .entry
+            .as_ref()
+            .expect("a live activation owns its entry");
         (entry.leader_node_id, entry.leader_fencing_token)
     }
 
@@ -328,19 +321,6 @@ impl PendingGraphActivation {
             .as_ref()
             .expect("a live activation owns its entry")
             .expires_at
-    }
-
-    /// Returns the admission class the reservation was charged under.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the activation has already committed or rolled back.
-    #[must_use]
-    pub(crate) fn query_class(&self) -> QueryClass {
-        self.entry
-            .as_ref()
-            .expect("a live activation owns its entry")
-            .query_class
     }
 
     /// Borrows the reserved query envelope without taking ownership of it.
@@ -390,13 +370,9 @@ impl PendingGraphActivation {
     where
         F: FnOnce(
             crate::resources::OracleQueryResources,
-        )
-            -> Result<T, (crate::resources::OracleQueryResources, BifrostError)>,
+        ) -> Result<T, (crate::resources::OracleQueryResources, BifrostError)>,
     {
-        let mut entry = self
-            .entry
-            .take()
-            .expect("a live activation owns its entry");
+        let mut entry = self.entry.take().expect("a live activation owns its entry");
         let Some(ReservedCapacity::Graph(resources)) = entry.capacity.take() else {
             unreachable!("a graph activation always retains a graph envelope")
         };
@@ -452,7 +428,8 @@ impl Drop for PendingGraphActivation {
         let Some(entry) = self.entry.take() else {
             return;
         };
-        self.registry.restore(self.reservation_id, entry, Utc::now());
+        self.registry
+            .restore(self.reservation_id, entry, Utc::now());
     }
 }
 
@@ -871,7 +848,12 @@ impl ReservationRegistry {
     /// not passed. Everything else drops the exact permit and envelope, which is
     /// the honest outcome — the reservation the leader was promised is simply
     /// over.
-    fn restore(&self, reservation_id: ReservationId, entry: PendingReservation, now: DateTime<Utc>) {
+    fn restore(
+        &self,
+        reservation_id: ReservationId,
+        entry: PendingReservation,
+        now: DateTime<Utc>,
+    ) {
         if entry.expires_at <= now {
             return;
         }

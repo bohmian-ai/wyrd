@@ -36,7 +36,8 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -50,6 +51,9 @@ use datafusion_distributed::{DistributedExt as _, WorkerResolver};
 use datafusion_distributed::{Worker, WorkerQueryContext, WorkerSessionBuilder};
 use http::HeaderMap;
 use std::time::Duration;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use url::Url;
 use uuid::Uuid;
 use wyrd_spec::vala::BifrostError;
@@ -68,7 +72,8 @@ use super::analytical_transport::{
     AnalyticalStageSigning, StageWireIdentity, read_ticket,
 };
 use super::dispatcher::{
-    BifrostPeerTls, GraphLeaseRequest, OraclePeerCredentials, ReservationRegistry,
+    BifrostPeerTls, CommittedGraphActivation, GraphLeaseRequest, OraclePeerCredentials,
+    PendingGraphActivation, ReservationRegistry,
 };
 use super::participant_cut::OracleQueryAttemptCut;
 use super::peer::{AuthorizedStage, OracleStageAuthority, PeerSecurityError, StageOperationV1};
@@ -77,8 +82,9 @@ use super::telemetry::{
     AnalyticalAttemptOutcome, AnalyticalStageOperation, record_stage_operation,
 };
 use crate::resources::{OracleResourceRequest, OracleResources};
+use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::{
-    AnalyticalGraphRef, QueryClass, QueryId, ReservationId, ReserveNodeSlotsRequest,
+    AnalyticalGraphRef, FencingToken, QueryClass, QueryId, ReservationId, ReserveNodeSlotsRequest,
 };
 
 /// Header carrying the client-visible query identity on every stage operation.
@@ -885,16 +891,6 @@ impl GraphLeaseBinding {
         })
     }
 
-    /// Returns the reservation this graph was activated from.
-    pub(crate) fn reservation_id(&self) -> ReservationId {
-        self.reservation_id
-    }
-
-    /// Returns the reservation's original expiry, retained unchanged.
-    pub(crate) fn reservation_expires_at(&self) -> DateTime<Utc> {
-        self.reservation_expires_at
-    }
-
     /// Authorizes one later stage message against this graph's fixed authority.
     ///
     /// Two independent checks, in this order. First the presenting coordinator:
@@ -917,7 +913,10 @@ impl GraphLeaseBinding {
         let source_node_id = node_from_claim(&claims.source_node_id)?;
         let reserving_leader = source_node_id == self.reserving_leader_node_id
             && claims.source_fence == self.reserving_leader_fence;
-        if !reserving_leader && !self.participant_cut.contains(source_node_id, claims.source_fence)
+        if !reserving_leader
+            && !self
+                .participant_cut
+                .contains(source_node_id, claims.source_fence)
         {
             tracing::warn!(
                 public_query_id = %self.public_query_id,
@@ -988,8 +987,6 @@ pub struct GraphLease {
     egress: Arc<AnalyticalStageEgress>,
     /// Supervisor registration, released exactly once by settlement.
     guard: Mutex<Option<AnalyticalGraphGuard>>,
-    /// Query-owned runtime every follower descendant of this graph installs.
-    runtime: AnalyticalGraphRuntime,
     /// Cancellation child covering every descendant of this graph.
     cancel: CancellationToken,
     /// Attempts admitted under this graph, joined before it may be released.
@@ -1014,24 +1011,6 @@ impl GraphLease {
     #[must_use]
     pub(crate) fn binding(&self) -> &GraphLeaseBinding {
         &self.binding
-    }
-
-    /// Returns the reservation residue this graph still holds.
-    #[must_use]
-    pub(crate) fn activation(&self) -> &CommittedGraphActivation {
-        &self.activation
-    }
-
-    /// Returns the query-owned runtime this graph's descendants install.
-    #[must_use]
-    pub(crate) fn runtime(&self) -> &AnalyticalGraphRuntime {
-        &self.runtime
-    }
-
-    /// Returns this graph's cancellation child.
-    #[must_use]
-    pub(crate) fn cancellation(&self) -> &CancellationToken {
-        &self.cancel
     }
 
     /// Returns how many attempts of this graph are still admitted.
@@ -1112,7 +1091,14 @@ impl GraphLease {
         if self.settled.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
-        if outcome != AnalyticalAttemptOutcome::Succeeded {
+        tracing::debug!(
+            public_query_id = %self.graph.public_query_id,
+            reservation_id = %self.activation.reservation_id().as_uuid(),
+            reservation_expires_at = %self.binding.reservation_expires_at,
+            outcome = ?outcome,
+            "Oracle analytical follower is settling a graph"
+        );
+        if outcome != AnalyticalAttemptOutcome::Success {
             self.cancel.cancel();
         }
         let live = {
@@ -1123,11 +1109,7 @@ impl GraphLease {
             self.finish_attempt(key, outcome).await?;
         }
         self.drain().await?;
-        let guard = self
-            .guard
-            .lock()
-            .map_err(|_| poisoned_ingress())?
-            .take();
+        let guard = self.guard.lock().map_err(|_| poisoned_ingress())?.take();
         if let Some(guard) = guard {
             guard.release()?;
         }
@@ -1575,9 +1557,8 @@ impl AnalyticalStageIngress {
         };
         let supervisor = Arc::clone(&self.supervisor);
         let registered = runtime.clone();
-        let (committed, guard) = activation.commit(move |resources| {
-            supervisor.register_graph(graph, resources, registered)
-        })?;
+        let (committed, guard) = activation
+            .commit(move |resources| supervisor.register_graph(graph, resources, registered))?;
         Ok(Arc::new(GraphLease {
             binding,
             activation: committed,
@@ -1585,7 +1566,6 @@ impl AnalyticalStageIngress {
             supervisor: Arc::clone(&self.supervisor),
             egress: Arc::clone(&self.egress),
             guard: Mutex::new(Some(guard)),
-            runtime,
             cancel: self.supervisor.root_cancellation().child_token(),
             attempts: Mutex::new(HashMap::new()),
             settled: AtomicBool::new(false),
@@ -1994,7 +1974,7 @@ impl Drop for AnalyticalParticipantReservations {
 /// clamps this to its own running capacity before charging, so a smaller peer
 /// still admits the graph rather than refusing a structurally unschedulable
 /// demand.
-const ANALYTICAL_GRAPH_SLOT_UNITS: u32 = 2;
+pub(crate) const ANALYTICAL_GRAPH_SLOT_UNITS: u32 = 2;
 
 /// Follower ownership of one graph, held for one open coordinator call.
 ///
@@ -2019,24 +1999,20 @@ impl fmt::Debug for AnalyticalConnectionLease {
 }
 
 impl Drop for AnalyticalConnectionLease {
-    /// Releases this connection's share of the graph's follower ownership.
+    /// Closes this connection's share of the graph's follower ownership.
+    ///
+    /// Synchronous and non-blocking by construction: it decrements under the
+    /// ingress's graph mutex and, at zero, hands the graph to the ingress's own
+    /// settlement driver. It never spawns a detached task, never blocks on
+    /// cleanup, and never releases the graph itself, so a dropped connection
+    /// cannot outlive or race the owner that must join it.
     fn drop(&mut self) {
-        let ingress = Arc::clone(&self.ingress);
-        let graph = self.graph;
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        if let Err(error) = self.ingress.close_connection(self.graph) {
             tracing::warn!(
-                "Oracle analytical follower dropped a stage connection outside a runtime"
+                error = %error,
+                "Oracle analytical follower could not close a stage connection"
             );
-            return;
-        };
-        handle.spawn(async move {
-            if let Err(error) = ingress.release_connection(graph).await {
-                tracing::warn!(
-                    error = %error,
-                    "Oracle analytical follower could not release a closed stage connection"
-                );
-            }
-        });
+        }
     }
 }
 
@@ -2710,7 +2686,9 @@ mod tests {
             cpu_source: crate::resources::ResourceSource::Injected,
         };
         let policy = crate::resources::BifrostResourcePolicy {
-            roles: [crate::resources::BifrostRole::Oracle].into_iter().collect(),
+            roles: [crate::resources::BifrostRole::Oracle]
+                .into_iter()
+                .collect(),
             memory_limit_bytes: None,
             unmanaged_reserve_bytes: None,
             scratch_limit_bytes: None,
@@ -2818,7 +2796,7 @@ mod tests {
                 Arc::new(crate::oracle::OracleSlotManager::new(4, 4)),
                 16,
             ));
-            let ingress = Arc::new(AnalyticalStageIngress::new(AnalyticalStageIngressConfig {
+            let ingress = AnalyticalStageIngress::new(AnalyticalStageIngressConfig {
                 node_id,
                 oracle_fence: fence,
                 authority: Arc::new(VerifyingStageAuthority),
@@ -2834,7 +2812,7 @@ mod tests {
                     Arc::new(crate::oracle::AcceptingOracleAudit),
                 ),
                 egress: fixture_egress(),
-            }));
+            });
             let graph = AnalyticalGraphKey::new(
                 PublicQueryId::from_uuid(Uuid::from_u128(11)),
                 DataFusionQueryId::from_uuid(Uuid::from_u128(12)),
@@ -2843,7 +2821,10 @@ mod tests {
             let leader_fence = 3;
             let deadline = now + chrono::Duration::seconds(60);
             let resources = fixture_oracle_role()
-                .try_acquire_query(OracleResourceRequest::for_class(QueryClass::Analytical, 0.0))
+                .try_acquire_query(OracleResourceRequest::for_class(
+                    QueryClass::Analytical,
+                    0.0,
+                ))
                 .expect("an idle Oracle admits one analytical query");
             let reservation = reservations
                 .reserve(
@@ -3001,7 +2982,10 @@ mod tests {
             "one reservation became exactly one graph"
         );
         assert_eq!(
-            fixture.supervisor.live_graphs().expect("graphs are readable"),
+            fixture
+                .supervisor
+                .live_graphs()
+                .expect("graphs are readable"),
             1,
             "activation registered the graph with the node supervisor"
         );
@@ -3069,7 +3053,10 @@ mod tests {
             "no refused message activated a second envelope"
         );
         assert_eq!(
-            fixture.supervisor.live_graphs().expect("graphs are readable"),
+            fixture
+                .supervisor
+                .live_graphs()
+                .expect("graphs are readable"),
             1,
             "the live graph survived every refusal unchanged"
         );
@@ -3252,13 +3239,18 @@ pub struct AnalyticalLiveOwnership {
     pub attempts: usize,
     /// Graphs still holding a query-owned runtime and admitted envelope.
     pub graphs: usize,
+    /// Graphs retained because their cleanup did not complete.
+    ///
+    /// A non-zero count is a real leak this node still owns and can name, not a
+    /// transient teardown, so it fails readiness rather than being logged away.
+    pub cleanup_failures: usize,
 }
 
 impl AnalyticalLiveOwnership {
     /// Reports whether this half of the node retains nothing.
     #[must_use]
     pub const fn is_clean(&self) -> bool {
-        self.attempts == 0 && self.graphs == 0
+        self.attempts == 0 && self.graphs == 0 && self.cleanup_failures == 0
     }
 }
 
@@ -3398,6 +3390,9 @@ impl AnalyticalExecutionHandle {
             leader: AnalyticalLiveOwnership {
                 attempts: self.supervisor.live_attempts()?,
                 graphs: self.supervisor.live_graphs()?,
+                // Leader-side cleanup is joined inline by the attempt owner, so
+                // there is no retained-failure state on this half to report.
+                cleanup_failures: 0,
             },
             follower: self.worker.live()?,
         })
@@ -3451,11 +3446,14 @@ impl AnalyticalExecutionHandle {
         let runtime = self
             .spill
             .build_query_runtime(resources.memory_pool(), resources.scratch_bytes)?;
-        let graph_guard = self.supervisor.register_graph(
-            graph,
-            resources,
-            AnalyticalGraphRuntime::new(runtime, self.config.exchange_buffer_bytes),
-        )?;
+        let graph_guard = self
+            .supervisor
+            .register_graph(
+                graph,
+                resources,
+                AnalyticalGraphRuntime::new(runtime, self.config.exchange_buffer_bytes),
+            )
+            .map_err(|(_, error)| error)?;
         let attempt_guard = self.supervisor.spawn_attempt(
             AnalyticalAttemptKey::new(
                 attempt.public_query_id,

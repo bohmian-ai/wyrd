@@ -2156,8 +2156,8 @@ fn compose_analytical_handle(
         peer_tls.clone(),
         Arc::clone(&peer_credentials),
     ));
-    let worker = Arc::new(analytical::AnalyticalStageIngress::new(
-        analytical::AnalyticalStageIngressConfig {
+    let worker =
+        analytical::AnalyticalStageIngress::new(analytical::AnalyticalStageIngressConfig {
             node_id,
             oracle_fence: fence,
             authority: Arc::clone(&authority),
@@ -2167,10 +2167,9 @@ fn compose_analytical_handle(
             exchange_buffer_bytes,
             leaf: leaf.clone(),
             egress,
-        },
-    ));
+        });
     Arc::new(analytical::AnalyticalExecutionHandle::new(
-        worker,
+        Arc::clone(&worker),
         authority,
         supervisor,
         spill,
@@ -2571,7 +2570,10 @@ impl Oracle {
     pub fn graph_lease_counts(&self) -> (u64, usize) {
         (
             self.reservations.graph_leases_activated_total(),
-            self.reservations.live_graph_leases(),
+            self.analytical
+                .as_ref()
+                .and_then(|handle| handle.worker().live().ok())
+                .map_or(0, |live| live.graphs),
         )
     }
 

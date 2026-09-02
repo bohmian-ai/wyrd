@@ -63,8 +63,8 @@ use datafusion_distributed::{
     GetWorkerInfoResponse, SetPlanRequest, TaskKey, WorkerChannel, WorkerToCoordinatorMsg,
 };
 use futures_util::StreamExt as _;
-use sha2::{Digest as _, Sha256};
 use futures_util::stream::BoxStream;
+use sha2::{Digest as _, Sha256};
 use tower::Layer as _;
 use url::Url;
 use uuid::Uuid;
@@ -2113,6 +2113,43 @@ mod tests {
         }
     }
 
+    /// Composes one injected, idle Oracle role for fixture graph reservations.
+    ///
+    /// Injected rather than observed so the reservation this fixture takes is
+    /// the same on every machine.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the injected observation cannot compose an active Oracle role.
+    fn fixture_oracle_role() -> crate::resources::OracleResources {
+        let snapshot = crate::resources::SystemResourceSnapshot {
+            memory_limit_bytes: 4 * 1024 * 1024 * 1024,
+            effective_cpu: 8,
+            scratch_capacity_bytes: 2 * 1024 * 1024 * 1024,
+            scratch_available_bytes: 2 * 1024 * 1024 * 1024,
+            memory_source: crate::resources::ResourceSource::Injected,
+            cpu_source: crate::resources::ResourceSource::Injected,
+        };
+        let policy = crate::resources::BifrostResourcePolicy {
+            roles: [crate::resources::BifrostRole::Oracle]
+                .into_iter()
+                .collect(),
+            memory_limit_bytes: None,
+            unmanaged_reserve_bytes: None,
+            scratch_limit_bytes: None,
+            effective_cpu: None,
+            oracle_query_slot_limit: None,
+            scratch_root: std::path::PathBuf::new(),
+            volume_roots: None,
+        };
+        crate::resources::BifrostRuntimeResources::from_snapshot(snapshot, policy)
+            .expect("an injected Oracle observation composes the production root")
+            .compose_roles()
+            .expect("role composition is issued from an unpoisoned root")
+            .oracle()
+            .expect("the Oracle role is active in this policy")
+    }
+
     /// A stage authority that enforces exactly the real binding and digest rules.
     ///
     /// It is not a permissive stub: it recomputes the body digest and runs the
@@ -2192,7 +2229,46 @@ mod tests {
             );
             let authority_calls = Arc::new(AtomicUsize::new(0));
             let node_id = NodeId::new(Uuid::from_u128(2));
-            let ingress = Arc::new(AnalyticalStageIngress::new(AnalyticalStageIngressConfig {
+            let reservations = Arc::new(super::super::dispatcher::ReservationRegistry::new(
+                Arc::new(crate::oracle::OracleSlotManager::new(4, 4)),
+                16,
+            ));
+            let graph = AnalyticalGraphKey::new(
+                PublicQueryId::from_uuid(Uuid::from_u128(11)),
+                DataFusionQueryId::from_uuid(Uuid::from_u128(12)),
+            );
+            // The adapter forwards a message only once the follower has taken
+            // exact ownership of the graph, and ownership comes from an admitted
+            // reservation. Reserving one here keeps this a transport test rather
+            // than a test of an unreachable, ownerless graph.
+            let reservation = reservations
+                .reserve(
+                    &wyrd_spec::vala::api::ReserveNodeSlotsRequest {
+                        query_id: wyrd_spec::vala::api::QueryId::new(
+                            graph.public_query_id.as_uuid(),
+                        ),
+                        leader_node_id: NodeId::new(Uuid::from_u128(1)),
+                        leader_fencing_token: 3,
+                        query_class: wyrd_spec::vala::api::QueryClass::Analytical,
+                        slot_units: crate::oracle::analytical::ANALYTICAL_GRAPH_SLOT_UNITS,
+                        expires_at: Utc::now() + chrono::Duration::seconds(60),
+                        graph: Some(wyrd_spec::vala::api::AnalyticalGraphRef {
+                            public_query_id: graph.public_query_id.as_uuid(),
+                            datafusion_query_id: graph.datafusion_query_id.as_uuid(),
+                        }),
+                    },
+                    Utc::now(),
+                    Some(super::super::dispatcher::ReservedCapacity::Graph(Box::new(
+                        fixture_oracle_role()
+                            .try_acquire_query(crate::resources::OracleResourceRequest::for_class(
+                                wyrd_spec::vala::api::QueryClass::Analytical,
+                                0.0,
+                            ))
+                            .expect("an idle Oracle admits one analytical query"),
+                    ))),
+                )
+                .expect("an idle follower accepts one graph reservation");
+            let ingress = AnalyticalStageIngress::new(AnalyticalStageIngressConfig {
                 node_id,
                 oracle_fence: 7,
                 authority: Arc::new(FixtureAuthority {
@@ -2201,10 +2277,7 @@ mod tests {
                 supervisor: Arc::new(
                     super::super::analytical_supervisor::AnalyticalSupervisor::new(),
                 ),
-                reservations: Arc::new(super::super::dispatcher::ReservationRegistry::new(
-                    Arc::new(crate::oracle::OracleSlotManager::new(4, 4)),
-                    16,
-                )),
+                reservations: Arc::clone(&reservations),
                 spill: Arc::clone(&spill),
                 exchange_buffer_bytes: 64 * 1024,
                 leaf: crate::oracle::codec::AnalyticalLeafBinding::new(
@@ -2224,20 +2297,17 @@ mod tests {
                         secrecy::SecretString::from("fixture-bearer"),
                     )),
                 )),
-            }));
+            });
             let identity = StageWireIdentity {
                 source_node_id: NodeId::new(Uuid::from_u128(1)),
                 source_fence: 3,
                 tenant_id: DataTenantId::new_v7(),
-                graph: AnalyticalGraphKey::new(
-                    PublicQueryId::from_uuid(Uuid::from_u128(11)),
-                    DataFusionQueryId::from_uuid(Uuid::from_u128(12)),
-                ),
+                graph,
                 snapshot_digest: "fixture-snapshot".to_owned(),
                 stage_id: 0,
                 task_id: None,
                 attempt: 0,
-                reservation_id: "fixture-reservation".to_owned(),
+                reservation_id: reservation.reservation_id.as_uuid().to_string(),
                 permission_digest: "fixture-permissions".to_owned(),
             };
             Self {

@@ -26,7 +26,11 @@ pub use bifrost_catalog::{
     PreparedReaderIdentity, TableUid,
 };
 #[cfg(any(test, feature = "test-support"))]
-pub use bifrost_catalog::{reset_sealed_pin_count_for_test, sealed_pin_count_for_test};
+pub use bifrost_catalog::{
+    inject_revalidation_faults_for_test, pending_revalidation_faults_for_test,
+    prepared_identity_count_for_test, reset_prepared_identity_count_for_test,
+    reset_sealed_pin_count_for_test, sealed_pin_count_for_test,
+};
 pub use error::BifrostCatalogError;
 pub use layout::{
     LayoutSortKey, NullOrder, PhysicalLayout, SortDirection, TimeGranularity, TimePartition,

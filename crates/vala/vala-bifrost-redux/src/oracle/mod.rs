@@ -75,7 +75,7 @@ pub mod follower;
 mod ownership;
 mod participant_cut;
 pub mod peer;
-mod planner;
+pub mod planner;
 pub(crate) mod pruning;
 mod query_stream;
 pub mod reader_pins;

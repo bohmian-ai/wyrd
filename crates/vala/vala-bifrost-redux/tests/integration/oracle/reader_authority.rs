@@ -1203,3 +1203,128 @@ async fn narrowing_retries_once_and_covered_duplicates_need_no_sql() {
 
     authority.retire().await.expect("the epoch retires");
 }
+
+/// Proves catalog promotion under a prepared reader identity is detected and
+/// restarts the complete admission rather than materializing a stale cut.
+///
+/// Protection is taken against the metadata document preparation read, so a
+/// promotion in between leaves a guard that covers a snapshot the query is no
+/// longer going to read. The authoritative reload is what notices, and the
+/// answer is a complete restart: the guard is dropped and every table is
+/// prepared, protected, revalidated, and materialized again. A second drift is
+/// reported rather than chased.
+///
+/// # Panics
+///
+/// Panics when a real promotion is not detected, when the restart does not
+/// re-prepare and materialize the complete set, or when a second drift does not
+/// surface as a typed metadata mismatch.
+#[tokio::test]
+async fn catalog_promotion_between_prepare_and_materialize_restarts_all_tables() {
+    let fixture = forge_support::PromotionIntegrationFixture::start("reader_revalidate").await;
+    let (authority, _node, _fence) = oracle_epoch(&fixture, "http://oracle-revalidate:5002").await;
+
+    // A real promotion between preparation and revalidation is exactly the
+    // drift the authoritative reload exists to find.
+    let prepared = fixture
+        .catalog
+        .prepare_reader_identity(&fixture.binding.table_ref, fixture.tenant)
+        .await
+        .expect("the registered table resolves");
+    fixture
+        .catalog
+        .revalidate_reader_identity(&prepared)
+        .await
+        .expect("an unpromoted identity revalidates");
+    commit_one_snapshot(&fixture).await;
+    let drift = fixture
+        .catalog
+        .revalidate_reader_identity(&prepared)
+        .await
+        .expect_err("a promoted table no longer holds the prepared identity");
+    assert!(
+        matches!(
+            drift,
+            vala_bifrost_redux::catalog::BifrostCatalogError::MetadataMismatch(_)
+        ),
+        "promotion is reported as metadata drift, not as a load failure: {drift:?}"
+    );
+    let reprepared = fixture
+        .catalog
+        .prepare_reader_identity(&fixture.binding.table_ref, fixture.tenant)
+        .await
+        .expect("the promoted table resolves again");
+    fixture
+        .catalog
+        .revalidate_reader_identity(&reprepared)
+        .await
+        .expect("a freshly prepared identity revalidates");
+
+    // Driving the production sequence with one drift must restart it whole:
+    // every table prepared again, and none materialized under the guard that
+    // was dropped.
+    let tables = vec![fixture.binding.table_ref.clone()];
+    vala_bifrost_redux::catalog::reset_prepared_identity_count_for_test();
+    vala_bifrost_redux::catalog::reset_sealed_pin_count_for_test();
+    vala_bifrost_redux::catalog::inject_revalidation_faults_for_test(1);
+    let materialized =
+        vala_bifrost_redux::oracle::planner::OraclePlanner::protect_and_materialize_for_test(
+            &tables,
+            fixture.tenant,
+            std::time::Instant::now() + Duration::from_secs(30),
+            &fixture.catalog,
+            &authority,
+        )
+        .await
+        .expect("the restarted attempt materializes the complete set");
+    assert_eq!(materialized, tables.len());
+    assert_eq!(
+        vala_bifrost_redux::catalog::pending_revalidation_faults_for_test(),
+        0,
+        "the first attempt consumed the injected drift"
+    );
+    assert_eq!(
+        vala_bifrost_redux::catalog::prepared_identity_count_for_test(),
+        tables.len() * 2,
+        "the restart re-prepares every table, not only the one that drifted"
+    );
+    assert_eq!(
+        vala_bifrost_redux::catalog::sealed_pin_count_for_test(),
+        tables.len(),
+        "nothing is materialized under the guard the drift discarded"
+    );
+
+    // A second drift is a typed failure, not a third attempt.
+    vala_bifrost_redux::catalog::reset_prepared_identity_count_for_test();
+    vala_bifrost_redux::catalog::reset_sealed_pin_count_for_test();
+    vala_bifrost_redux::catalog::inject_revalidation_faults_for_test(2);
+    let error =
+        vala_bifrost_redux::oracle::planner::OraclePlanner::protect_and_materialize_for_test(
+            &tables,
+            fixture.tenant,
+            std::time::Instant::now() + Duration::from_secs(30),
+            &fixture.catalog,
+            &authority,
+        )
+        .await
+        .expect_err("a second drift under one query is refused");
+    assert!(
+        matches!(
+            error,
+            wyrd_spec::vala::error::BifrostError::MetadataMismatch { .. }
+        ),
+        "the second drift surfaces as a typed metadata mismatch: {error:?}"
+    );
+    assert_eq!(
+        vala_bifrost_redux::catalog::prepared_identity_count_for_test(),
+        tables.len() * 2,
+        "admission restarts exactly once"
+    );
+    assert_eq!(
+        vala_bifrost_redux::catalog::sealed_pin_count_for_test(),
+        0,
+        "a refused admission materializes nothing"
+    );
+
+    authority.retire().await.expect("the epoch retires");
+}

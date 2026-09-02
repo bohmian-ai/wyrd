@@ -167,6 +167,26 @@ impl OraclePlanner {
     }
 }
 
+/// Why one protect-and-materialize attempt failed.
+///
+/// Only authoritative catalog promotion is worth restarting for; every other
+/// failure would repeat identically, so it is reported as it stands.
+enum AttemptFailure {
+    /// Revalidation proved the catalog moved under this attempt.
+    CatalogPromoted(BifrostError),
+    /// A failure a restart cannot change.
+    Fatal(BifrostError),
+}
+
+impl AttemptFailure {
+    /// Unwraps the public error this attempt failed with.
+    fn into_public(self) -> BifrostError {
+        match self {
+            Self::CatalogPromoted(error) | Self::Fatal(error) => error,
+        }
+    }
+}
+
 impl OraclePlanner {
     /// Protects and materializes every table scan in a typed plan.
     ///
@@ -191,17 +211,29 @@ impl OraclePlanner {
         Self::protect_and_materialize(&tables, tenant, deadline, catalog, Some(authority)).await
     }
 
-    /// Prepares identities, takes one complete reader guard, then materializes.
+    /// Prepares identities, takes one complete reader guard, revalidates, then
+    /// materializes — restarting the whole thing once on catalog promotion.
     ///
     /// This is the only place a leader turns table references into readable
     /// cuts. The ordering is the protection contract: every identity is
-    /// resolved from metadata alone, one guard covers the whole set, and no
-    /// snapshot-dependent source IO happens before that guard exists.
+    /// resolved from metadata alone, one guard covers the whole set, every
+    /// prepared table is revalidated against the authoritative catalog before
+    /// any of them is materialized, and no snapshot-dependent source IO happens
+    /// before that guard exists.
+    ///
+    /// Promotion between preparation and materialization invalidates the whole
+    /// attempt, not one table: the guard covers a set of snapshots, and a set
+    /// with one stale member protects nothing coherent. The guard is therefore
+    /// dropped and every table is prepared, protected, revalidated, and
+    /// materialized again. One restart only — a second drift is reported rather
+    /// than chased.
     ///
     /// # Errors
     /// Returns [`BifrostError::QueryTimeout`] when the deadline passes during
     /// preparation or materialization, the reader authority's refusal when the
-    /// cut cannot be protected, and the catalog's public failure otherwise.
+    /// cut cannot be protected, a metadata-mismatch failure when the catalog
+    /// was promoted twice under this query, and the catalog's public failure
+    /// otherwise.
     async fn protect_and_materialize(
         tables: &[TableRef],
         tenant: wyrd_spec::DataTenantId,
@@ -214,29 +246,77 @@ impl OraclePlanner {
             // has nothing that could protect a snapshot it is about to read.
             return Err(BifrostError::OracleRoleUnavailable);
         };
+        match Self::attempt_protected_cut(tables, tenant, deadline, catalog, authority).await {
+            Err(AttemptFailure::CatalogPromoted(error)) => {
+                tracing::warn!(
+                    error = %error,
+                    tables = tables.len(),
+                    "Oracle restarted complete reader admission after catalog promotion"
+                );
+                Self::attempt_protected_cut(tables, tenant, deadline, catalog, authority)
+                    .await
+                    .map_err(AttemptFailure::into_public)
+            }
+            other => other.map_err(AttemptFailure::into_public),
+        }
+    }
+
+    /// Runs one complete prepare, protect, revalidate, and materialize attempt.
+    ///
+    /// # Errors
+    /// Returns [`AttemptFailure::CatalogPromoted`] when revalidation proved the
+    /// authoritative catalog moved under this attempt, which the caller may
+    /// restart once, and [`AttemptFailure::Fatal`] for every failure a restart
+    /// cannot change.
+    async fn attempt_protected_cut(
+        tables: &[TableRef],
+        tenant: wyrd_spec::DataTenantId,
+        deadline: Instant,
+        catalog: &BifrostCatalog,
+        authority: &Arc<OracleReaderAuthority>,
+    ) -> Result<ProtectedPlannedSqlCut, AttemptFailure> {
         let mut prepared = Vec::with_capacity(tables.len());
         for table in tables {
             let remaining = deadline
                 .checked_duration_since(Instant::now())
-                .ok_or(BifrostError::QueryTimeout)?;
+                .ok_or(AttemptFailure::Fatal(BifrostError::QueryTimeout))?;
             prepared.push(
                 tokio::time::timeout(remaining, catalog.prepare_reader_identity(table, tenant))
                     .await
-                    .map_err(|_| BifrostError::QueryTimeout)?
-                    .map_err(BifrostCatalogError::into_public)?,
+                    .map_err(|_| AttemptFailure::Fatal(BifrostError::QueryTimeout))?
+                    .map_err(|error| AttemptFailure::Fatal(error.into_public()))?,
             );
         }
-        let (guard, permit) = authority.acquire_guard(&prepared).await?;
+        let (guard, permit) = authority
+            .acquire_guard(&prepared)
+            .await
+            .map_err(AttemptFailure::Fatal)?;
+        // Every prepared table is revalidated before any of them materializes,
+        // so a promotion is found while the whole attempt is still discardable.
+        for identity in &prepared {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .ok_or(AttemptFailure::Fatal(BifrostError::QueryTimeout))?;
+            tokio::time::timeout(remaining, catalog.revalidate_reader_identity(identity))
+                .await
+                .map_err(|_| AttemptFailure::Fatal(BifrostError::QueryTimeout))?
+                .map_err(|error| match error {
+                    BifrostCatalogError::MetadataMismatch(_) => {
+                        AttemptFailure::CatalogPromoted(error.into_public())
+                    }
+                    other => AttemptFailure::Fatal(other.into_public()),
+                })?;
+        }
         let mut cuts = Vec::with_capacity(prepared.len());
         for identity in prepared {
             let remaining = deadline
                 .checked_duration_since(Instant::now())
-                .ok_or(BifrostError::QueryTimeout)?;
+                .ok_or(AttemptFailure::Fatal(BifrostError::QueryTimeout))?;
             cuts.push(
                 tokio::time::timeout(remaining, catalog.materialize_reader_cut(identity, &permit))
                     .await
-                    .map_err(|_| BifrostError::QueryTimeout)?
-                    .map_err(BifrostCatalogError::into_public)?,
+                    .map_err(|_| AttemptFailure::Fatal(BifrostError::QueryTimeout))?
+                    .map_err(|error| AttemptFailure::Fatal(error.into_public()))?,
             );
         }
         Ok(ProtectedPlannedSqlCut {
@@ -244,6 +324,30 @@ impl OraclePlanner {
             permit,
             cuts,
         })
+    }
+
+    /// Drives one complete protect-and-materialize attempt from a test.
+    ///
+    /// Preparation, protection, revalidation, and materialization are one
+    /// operation by construction, so a test that needs to observe the restart
+    /// has no other entry point into the exact production sequence.
+    ///
+    /// Returns how many cuts the successful attempt materialized, which is the
+    /// observable the caller needs; the protected cut itself stays private.
+    ///
+    /// # Errors
+    /// Returns whatever [`Self::protect_and_materialize`] returns.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn protect_and_materialize_for_test(
+        tables: &[TableRef],
+        tenant: wyrd_spec::DataTenantId,
+        deadline: Instant,
+        catalog: &BifrostCatalog,
+        authority: &Arc<OracleReaderAuthority>,
+    ) -> Result<usize, BifrostError> {
+        Self::protect_and_materialize(tables, tenant, deadline, catalog, Some(authority))
+            .await
+            .map(|protected| protected.cuts.len())
     }
 
     /// Builds executable providers from authenticated cuts and drained tails.

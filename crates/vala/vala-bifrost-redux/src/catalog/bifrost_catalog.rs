@@ -217,18 +217,6 @@ struct PinnedIcebergState {
     estimated_bytes: u64,
 }
 
-impl PinnedIcebergState {
-    /// Returns the canonical identity digest used to stabilize a cross-system cut.
-    fn digest(&self) -> String {
-        digest_strings(
-            self.snapshot_id
-                .map(|id| id.to_string())
-                .into_iter()
-                .chain(self.file_paths.iter().cloned()),
-        )
-    }
-}
-
 /// Everything one reader needs to protect a cut before it opens anything.
 ///
 /// Produced by [`BifrostCatalog::prepare_reader_identity`] and consumed by
@@ -323,6 +311,51 @@ pub fn sealed_pin_count_for_test() -> usize {
     TEST_SEALED_PIN_COUNT.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+/// Reader identities prepared by production code paths in serialized tests.
+///
+/// A restart after catalog promotion has to re-prepare every table, not only
+/// the one that drifted, so the count is what distinguishes a complete restart
+/// from a partial one.
+#[cfg(any(test, feature = "test-support"))]
+static TEST_PREPARED_IDENTITY_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Revalidations still to be failed before the next one is allowed to succeed.
+#[cfg(any(test, feature = "test-support"))]
+static TEST_REVALIDATION_FAULTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Resets and returns the observed prepared-identity count for one test.
+#[cfg(any(test, feature = "test-support"))]
+pub fn reset_prepared_identity_count_for_test() -> usize {
+    TEST_PREPARED_IDENTITY_COUNT.swap(0, std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Returns prepared reader identities observed since the last reset.
+#[must_use]
+#[cfg(any(test, feature = "test-support"))]
+pub fn prepared_identity_count_for_test() -> usize {
+    TEST_PREPARED_IDENTITY_COUNT.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Makes the next `count` revalidations report authoritative metadata drift.
+///
+/// A real promotion between preparation and materialization is what this
+/// stands in for. Committing one at that exact point from outside the call is
+/// not reachable, because preparation, protection, revalidation, and
+/// materialization are one operation by construction.
+#[cfg(any(test, feature = "test-support"))]
+pub fn inject_revalidation_faults_for_test(count: usize) {
+    TEST_REVALIDATION_FAULTS.store(count, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Returns how many injected revalidation faults remain unconsumed.
+#[must_use]
+#[cfg(any(test, feature = "test-support"))]
+pub fn pending_revalidation_faults_for_test() -> usize {
+    TEST_REVALIDATION_FAULTS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 impl BifrostCatalog {
     /// Resolves only the identity of the cut a reader is about to protect.
     ///
@@ -345,6 +378,8 @@ impl BifrostCatalog {
         table: &TableRef,
         tenant: DataTenantId,
     ) -> Result<PreparedReaderIdentity, BifrostCatalogError> {
+        #[cfg(any(test, feature = "test-support"))]
+        TEST_PREPARED_IDENTITY_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let fqn = table.fqn();
         let Some(row) = self.lookup_table_row(&fqn, tenant).await? else {
             return Err(BifrostCatalogError::TableNotFound(fqn));
@@ -372,6 +407,56 @@ impl BifrostCatalog {
         })
     }
 
+    /// Proves the authoritative catalog still holds the prepared identity.
+    ///
+    /// Protection is taken against the metadata document preparation read, and
+    /// that document is then reused for the whole cut, so nothing downstream
+    /// can notice that the table was promoted in between. This is the one place
+    /// that asks the catalog again: one authoritative `load_table` per prepared
+    /// identifier, compared on both the metadata location and the metadata
+    /// document itself, because a promotion that reuses a location still
+    /// changes the document.
+    ///
+    /// The reloaded table is discarded. It carries the catalog's own ungated
+    /// `FileIO`, and retaining it would put an unpermitted route to this cut's
+    /// objects back into a path that exists to keep them out.
+    ///
+    /// # Errors
+    /// Returns [`BifrostCatalogError::MetadataMismatch`] when the authoritative
+    /// metadata location or document differs from the prepared one, and a
+    /// catalog error when the table cannot be loaded at all.
+    pub async fn revalidate_reader_identity(
+        &self,
+        prepared: &PreparedReaderIdentity,
+    ) -> Result<(), BifrostCatalogError> {
+        #[cfg(any(test, feature = "test-support"))]
+        if TEST_REVALIDATION_FAULTS
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |remaining| remaining.checked_sub(1),
+            )
+            .is_ok()
+        {
+            return Err(BifrostCatalogError::MetadataMismatch(
+                "injected authoritative reader-identity drift".to_owned(),
+            ));
+        }
+        let loaded = self.catalog.load_table(&prepared.identifier).await?;
+        if loaded.metadata_location() != prepared.metadata_location.as_deref() {
+            return Err(BifrostCatalogError::MetadataMismatch(
+                "the authoritative table metadata location moved under the prepared identity"
+                    .to_owned(),
+            ));
+        }
+        if *loaded.metadata_ref() != *prepared.metadata {
+            return Err(BifrostCatalogError::MetadataMismatch(
+                "the authoritative table metadata changed under the prepared identity".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Materializes the pinned cut through storage gated by one reader permit.
     ///
     /// The table is rebuilt here rather than reused from
@@ -381,10 +466,11 @@ impl BifrostCatalog {
     /// instead. Reusing the loaded table would leave an ungated route to
     /// exactly the objects the protection was taken for.
     ///
-    /// The metadata identity is checked again at the end. Drift means the table
-    /// moved between preparation and materialization, and the caller must
-    /// restart complete admission rather than read a cut its protection does
-    /// not cover.
+    /// Drift between preparation and this call is not detectable here: this
+    /// method builds its table from the prepared metadata, so comparing the
+    /// result against that same document proves nothing. The authoritative
+    /// check is [`BifrostCatalog::revalidate_reader_identity`], which the
+    /// caller runs for every prepared table before materializing any.
     ///
     /// # Errors
     /// Returns [`BifrostCatalogError::MetadataMismatch`] when the table moved
@@ -410,13 +496,6 @@ impl BifrostCatalog {
         let (iceberg_table, pinned, cut) = self
             .acquire_stable_cut_from(gated, &binding, tenant)
             .await?;
-        if iceberg_table.metadata().current_snapshot_id() != prepared.metadata.current_snapshot_id()
-        {
-            return Err(BifrostCatalogError::MetadataMismatch(
-                "the table moved between reader-identity preparation and materialization"
-                    .to_owned(),
-            ));
-        }
         let snapshot_id = pinned.snapshot_id;
         let iceberg_file_paths = pinned.file_paths;
         let iceberg_files = pinned.files;
@@ -565,27 +644,18 @@ impl BifrostCatalog {
         ),
         BifrostCatalogError,
     > {
-        for _attempt in 1..=3_u8 {
-            let pinned_a = self.pin_iceberg_snapshot(&gated, binding).await?;
-            let hot_file_catalog =
-                HotFileCatalog::new(&binding.logical_namespace, &binding.table_name);
-            let mut conn = self.postgres.tenant_conn(tenant).await?;
-            let cut = hot_file_catalog
-                .unresolved_for_cut(
-                    &mut conn,
-                    &pinned_a.file_paths,
-                    pinned_a.forge_publication_operation_id,
-                )
-                .await?;
-            conn.commit().await?;
-            let pinned_b = self.pin_iceberg_snapshot(&gated, binding).await?;
-            if pinned_a.snapshot_id == pinned_b.snapshot_id
-                && pinned_a.digest() == pinned_b.digest()
-            {
-                return Ok((gated, pinned_b, cut));
-            }
-        }
-        Err(BifrostCatalogError::UnstableCut { attempts: 3 })
+        let pinned = self.pin_iceberg_snapshot(&gated, binding).await?;
+        let hot_file_catalog = HotFileCatalog::new(&binding.logical_namespace, &binding.table_name);
+        let mut conn = self.postgres.tenant_conn(tenant).await?;
+        let cut = hot_file_catalog
+            .unresolved_for_cut(
+                &mut conn,
+                &pinned.file_paths,
+                pinned.forge_publication_operation_id,
+            )
+            .await?;
+        conn.commit().await?;
+        Ok((gated, pinned, cut))
     }
 
     /// Collects and validates the immutable files of one current Iceberg snapshot.

@@ -596,7 +596,19 @@ shared workflow skill and `mise run check:skills-sync` to detect drift. Codex
   Wyrd crates; Wyrd never depends on that private repository. "Enterprise cloud"
   describes a deployment topology and tenant-isolation requirement, not an
   in-tree commercial edition.
-- KEEP IT SIMPLE STUPID: when reviewing and implementing, avoid over-engineering and adding unnecessary complexity, YAGNI, and follow a modular design that solves the problem at hand without adding extra layers, abstractions, or future-proofing that isn't justified by current needs. There should be one obvious way to do something, and it should be the way we do it.
+- For every design, plan, implementation, and review, first understand the
+  complete path, then stop at the first correct option: remove or decline
+  speculative work; simplify existing code; reuse the repository's current
+  owner or pattern; use the standard library; use a native platform feature;
+  use an already-installed dependency; otherwise add the minimum cohesive code.
+- Before adding a file, type, trait, helper, dependency, configuration option,
+  compatibility path, or test fixture, inspect the existing owners and callers
+  and prove that the repository does not already provide the needed behavior.
+  Fix a root cause once at the shared owner instead of patching each symptom.
+  Do not scaffold for hypothetical reuse or future requirements.
+- Simplicity never overrides explicit product behavior, architecture,
+  validation, security, tenancy, durability, accessibility, testing, or
+  verification requirements. The smallest incomplete solution is still wrong.
 - Follow industry and Rust community best practices. Provide recommendations when appropriate.
 
 ## 16. General Code Rules
@@ -644,9 +656,13 @@ Primary stack: Rust (tokio, axum, tonic, DataFusion, Iceberg, Arrow, PyO3), Pyth
 - Always consider: **Ergonomics** (does the API/UX/CLI feel natural?), **Value** (does this solve a real problem?), **Simplicity** (is there a simpler version that gets 90% of the value?), **Blindspots** (what will break, scale badly, or get misused?).
 - Be a pragmatic architect. Prefer long-term stability and performance over cleverness. Push back on over-engineering.
 
-**Communication:** Tone and response shape are owned by the active output
-style, not this file. The one repo-specific addition: don't ask multiple
-questions at once — if clarification is needed, ask the single most
-important one.
+**Communication:** Lead with the outcome. Default to at most five short bullets
+and 150 words; use less when possible. Do not restate the request, narrate tool
+use, provide a feature tour, or repeat details already recorded in a spec, task,
+review, or completion artifact. Put durable evidence in that artifact and link
+or name it. Expand only when the user explicitly requests a report or when an
+unresolved risk or decision cannot be communicated safely within the default.
+Do not ask multiple questions at once; if clarification is needed, ask the
+single most important one.
 
 **Target user persona:** ML engineers, data scientists, AI platform teams, and AI agents. These users run compute-heavy workloads, deploy to Kubernetes, and are sophisticated enough to read a stack trace, inspect a schema, and form an opinion on an API design. Design as if your primary consumer is a careful, literal interpreter that has no ability to ask for clarification.

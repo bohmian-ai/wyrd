@@ -68,9 +68,10 @@ Return one verdict:
   material decision; or
 - `BLOCKED` — the immutable subject or essential authority cannot be inspected.
 
-Lead with the verdict, then findings, spec-obligation trace, prior-finding
-closure, verification limits, and reviewed commit identity. `REMEDIATE` routes
-validated findings to `$wyrd-plan`, not directly to ad hoc implementation.
-`APPROVE` approves only this task candidate; it does not merge, push, deploy, or
-replace final `$wyrd-change-review`. The review phase does not edit the active
-packet; the caller or execution harness may record the returned verdict there.
+Lead with the verdict, reviewed commit identity, and verification limits. List
+only validated findings; on `APPROVE`, add one compact obligation-coverage
+statement instead of repeating the task or spec. `REMEDIATE` routes validated
+findings to `$wyrd-plan`, not directly to ad hoc implementation. `APPROVE`
+approves only this task candidate; it does not merge, push, deploy, or replace
+final `$wyrd-change-review`. The review phase does not edit the active packet;
+the caller or execution harness may record the returned verdict there.

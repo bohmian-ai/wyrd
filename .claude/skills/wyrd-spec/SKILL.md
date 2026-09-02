@@ -106,7 +106,8 @@ downstream work until the human explicitly approves the new revision and
 
 ## Handoff
 
-Report the spec path, revision, status, locked behavioral obligations, retained
-implementation freedoms, planning-decision inventory, selected authority links,
-and any exact approval or blocking decision needed. Never claim task or
-implementation readiness merely because the spec is approved.
+Report the spec path, revision, status, a one-sentence outcome, and any exact
+approval or blocking decision needed. Do not repeat obligations, implementation
+freedoms, decision inventories, or authority links already recorded in the
+spec. Never claim task or implementation readiness merely because the spec is
+approved.

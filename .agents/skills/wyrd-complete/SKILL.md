@@ -77,7 +77,7 @@ Run `git diff --check`, inspect the complete completion diff, verify that the
 completed record exists and the exact active packet does not, and confirm that
 all repository-relative links resolve. Create a commit only when requested.
 
-Return `COMPLETE` or `BLOCKED` with the completed-record path, removed active
-path, reviewed target identity, verification performed, and any delivery action
-still requiring human authorization. Completion never merges, pushes, deploys,
-or grants product authorization.
+Return `COMPLETE` or `BLOCKED` with the completed-record path, reviewed target
+identity, verification status, and any delivery action still requiring human
+authorization. Do not repeat the completed record in chat. Completion never
+merges, pushes, deploys, or grants product authorization.

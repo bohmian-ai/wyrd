@@ -126,6 +126,10 @@ to reject, and the signal that would change the recommendation.
 **One question (only if material).** Ask the smallest question that separates
 the remaining choices; otherwise state the assumption and stop.
 
+For a simple decision, collapse this structure into one short paragraph or a
+few bullets. Do not narrate research, list every considered alternative, or use
+headings that make the answer longer without making the decision clearer.
+
 Keep advice headless and language-agnostic. UI convenience cannot become the
 source of truth, client code cannot own durable server behavior, and external
 systems are read through `Source` rather than written by Wyrd.

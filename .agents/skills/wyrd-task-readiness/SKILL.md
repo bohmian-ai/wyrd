@@ -107,8 +107,12 @@ Return `REVISE_TASKS` when any of these are true:
 ## Findings and verdict
 
 A blocking finding includes the exact task location, governing authority or
-spec obligation, repository evidence, implementation consequence, and smallest
-required task correction.
+spec obligation, repository evidence, implementation consequence, and the
+simplest concrete task correction supported by that evidence. The correction
+must preserve the approved spec, follow the current architecture's ownership
+and dependency direction, and prefer the uniquely applicable existing
+repository shape. It must resolve the choice with an actual educated decision
+rather than delegate discovery to implementation. Follow KISS, YAGNI, and DRY principles.
 
 Return one verdict: `READY`, `REVISE_TASKS`, `SPEC_REVISION_REQUIRED`, or
 `BLOCKED`. Lead with the verdict, summarize the nine axes, and list only

@@ -3251,9 +3251,14 @@ impl Oracle {
     }
 
     /// Returns whether startup readiness completed and queries may enter admission.
+    ///
+    /// The reader epoch is part of that answer: an epoch past its admission
+    /// cutoff still has a reconciled startup and an available admission
+    /// controller, but it no longer holds the authority a read needs, so it
+    /// must stop advertising readiness the moment its loss is selected.
     #[must_use]
     pub fn is_ready(&self) -> bool {
-        self.startup_reconciled() && self.admission.is_available()
+        self.startup_reconciled() && self.admission.is_available() && self.reader_authority.admits()
     }
 
     /// Publishes a membership snapshot to future local admissions.

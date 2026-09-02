@@ -715,16 +715,22 @@ async fn run_delegated_continuity_monitor(
     advertise_ready: Arc<AtomicBool>,
     shutdown: CancellationToken,
 ) {
+    let own_loss = || wyrd_spec::vala::api::OracleAdmissionContinuityLost {
+        holder_node_id: registered_role.key.node_id,
+        holder_fencing_token: registered_role.fencing_token,
+    };
+    // The reader epoch's own loss is a continuity loss for this exact fence,
+    // and it is selected before its audited edge commits, so it must reach
+    // this monitor directly rather than waiting for a delegated report that
+    // an epoch fencing itself never produces.
     let loss = tokio::select! {
         () = shutdown.cancelled() => return,
+        () = engine.reader_authority().loss_selected_notify().cancelled() => Some(own_loss()),
         loss = losses.recv() => loss,
     };
     let loss = loss.unwrap_or_else(|| {
         tracing::error!("delegated Oracle continuity channel closed unexpectedly");
-        wyrd_spec::vala::api::OracleAdmissionContinuityLost {
-            holder_node_id: registered_role.key.node_id,
-            holder_fencing_token: registered_role.fencing_token,
-        }
+        own_loss()
     });
     let exact_signal = crate::oracle::close_local_delegated_continuity(
         registered_role.key.node_id,

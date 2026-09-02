@@ -484,7 +484,7 @@ mod tests {
     /// wrapper after exactly one error rather than resuming on the next poll.
     #[tokio::test]
     async fn gated_list_stops_polling_and_yielding_after_fence() {
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_mins(1);
 
         // A live permit exposes every entry and polls the backend once per
         // item plus the final exhaustion poll.

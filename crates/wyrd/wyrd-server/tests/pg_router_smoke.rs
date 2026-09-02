@@ -487,3 +487,291 @@ async fn valid_token_is_not_rejected_by_default_deny_layer() {
 
     server.shutdown().await.expect("server shuts down");
 }
+
+/// Polls the Oracle readiness input until it reports `expected`.
+///
+/// `/readyz` reads this value through its published snapshot; the snapshot is
+/// republished by a background loop that a composed-in-process server does not
+/// run, so the readiness contract is observed at the same input the probe
+/// reads rather than through a snapshot that never ticks.
+///
+/// # Panics
+///
+/// Panics when Oracle readiness does not reach `expected` within the budget.
+#[cfg(feature = "test-support")]
+async fn await_oracle_ready(server: &WyrdTestServer, expected: bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let ready = server
+            .state()
+            .bifrost_query()
+            .expect("this server hosts an Oracle role")
+            .engine()
+            .is_ready();
+        if ready == expected {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Oracle readiness never reached {expected}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+/// Lists this node's Oracle reader-epoch lifecycle audit operations, in order.
+///
+/// # Panics
+///
+/// Panics when the audit rows cannot be read.
+#[cfg(feature = "test-support")]
+async fn epoch_audit_operations(
+    pool: &sqlx::PgPool,
+    node_id: uuid::Uuid,
+    fencing_token: i64,
+) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT operation FROM vala.audit_outbox \
+          WHERE data_tenant_id = $1 AND resource = $2 ORDER BY seq",
+    )
+    .bind(uuid::Uuid::from(wyrd_spec::DataTenantId::SYSTEM_OWNER))
+    .bind(format!("oracle/reader_epoch/{node_id}/{fencing_token}"))
+    .fetch_all(pool)
+    .await
+    .expect("epoch audit rows read")
+}
+
+/// Reports whether this node's durable Oracle role row still advertises ready.
+///
+/// # Panics
+///
+/// Panics when the role row cannot be read.
+#[cfg(feature = "test-support")]
+async fn role_advertises_ready(pool: &sqlx::PgPool, node_id: uuid::Uuid) -> bool {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT ready FROM vala.cluster_nodes WHERE node_id = $1 AND role = 'oracle'",
+    )
+    .bind(node_id)
+    .fetch_one(pool)
+    .await
+    .expect("oracle role row read")
+}
+
+/// Proves epoch loss closes readiness before its audit, and that retirement
+/// joins whichever owner selected that loss.
+///
+/// Two properties are inseparable here and are therefore proved together.
+/// Reaching the admission cutoff must remove readiness — the authority's own
+/// admission, the engine, `/readyz`, and the durable role advertisement — at
+/// the instant loss is selected, which is strictly before the audited loss
+/// edge commits, while liveness stays true because the process is healthy and
+/// merely no longer authorized. And retirement must resolve who owns that
+/// loss before it releases anything: whether the lease supervisor selected it
+/// first or retirement did, the epoch ends with exactly one durable loss edge
+/// and one complete audit sequence.
+///
+/// # Panics
+///
+/// Panics when readiness, liveness, durable advertisement, the audit
+/// sequence, or the retired epoch row differs from that contract.
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn oracle_epoch_cutoff_removes_readiness_and_retirement_joins_loss_owner() {
+    supervisor_first_loss_closes_readiness_before_its_audit().await;
+    retirement_first_loss_commits_its_own_edge().await;
+}
+
+/// Drives the race in which the lease supervisor selects loss first.
+///
+/// # Panics
+///
+/// Panics when readiness, liveness, advertisement, or the audit sequence
+/// differs from the contract.
+#[cfg(feature = "test-support")]
+async fn supervisor_first_loss_closes_readiness_before_its_audit() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let authority = std::sync::Arc::clone(
+        server
+            .state()
+            .bifrost_query()
+            .expect("this server hosts an Oracle role")
+            .engine()
+            .reader_authority(),
+    );
+    let node_id = uuid::Uuid::from(server.node_id());
+    let fencing_token = authority.fencing_token();
+    let pool = server
+        .pg_fixture()
+        .superuser_pool()
+        .await
+        .expect("superuser pool");
+
+    await_oracle_ready(&server, true).await;
+    assert!(role_advertises_ready(&pool, node_id).await);
+
+    // Hold every audit append. Renewal deliberately writes no audit row, so
+    // this gates exactly the loss edge's transaction and nothing the epoch
+    // needs in order to reach its cutoff.
+    let mut gate = pool.begin().await.expect("audit gate transaction begins");
+    sqlx::query("LOCK TABLE vala.audit_outbox IN EXCLUSIVE MODE")
+        .execute(&mut *gate)
+        .await
+        .expect("the audit outbox is held");
+
+    // Reach the cutoff through the production supervisor. A renewal that lands
+    // first re-derives the deadlines from its fresh lease, so the collapse is
+    // reapplied until admission actually closes.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while authority.admits() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the epoch never reached its admission cutoff"
+        );
+        authority.collapse_lease_for_test();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    // Loss is selected and the audited edge is still blocked behind the gate.
+    // Readiness must already be gone everywhere it is published.
+    assert!(
+        !server
+            .state()
+            .bifrost_query()
+            .expect("the Oracle runtime is retained")
+            .engine()
+            .is_ready(),
+        "an epoch past its admission cutoff is not a ready Oracle"
+    );
+    let liveness = server
+        .oneshot(
+            Request::builder()
+                .uri("/healthz")
+                .body(axum::body::Body::empty())
+                .expect("request builds"),
+        )
+        .await
+        .expect("router responds");
+    assert_eq!(
+        liveness.status(),
+        StatusCode::OK,
+        "a fenced epoch is unready, not unhealthy"
+    );
+    assert_eq!(
+        epoch_audit_operations(&pool, node_id, fencing_token).await,
+        vec![
+            "oracle.reader_epoch.acquired".to_owned(),
+            "oracle.reader_epoch.activated".to_owned(),
+        ],
+        "readiness closes before the loss edge is audited, not after"
+    );
+
+    // Releasing the gate lets the supervisor finish its audited loss edge, and
+    // lets the continuity monitor's own audited deactivation land.
+    gate.rollback().await.expect("the audit gate releases");
+    let advertising = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while role_advertises_ready(&pool, node_id).await {
+        assert!(
+            std::time::Instant::now() < advertising,
+            "the durable Oracle role kept advertising ready after epoch loss"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    // Drive the production Oracle drain in place: `shutdown` consumes the
+    // harness, and with it the Postgres fixture whose rows this asserts on.
+    server
+        .state()
+        .bifrost_query()
+        .expect("the Oracle runtime is retained")
+        .engine()
+        .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(10))
+        .await;
+
+    assert_eq!(
+        epoch_audit_operations(&pool, node_id, fencing_token).await,
+        vec![
+            "oracle.reader_epoch.acquired".to_owned(),
+            "oracle.reader_epoch.activated".to_owned(),
+            "oracle.reader_epoch.draining".to_owned(),
+            "oracle.reader_epoch.invalidated".to_owned(),
+            "oracle.reader_epoch.retired".to_owned(),
+        ],
+        "retirement joins the loss owner and adds no second loss edge"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM vala.oracle_reader_epochs WHERE node_id = $1"
+        )
+        .bind(node_id)
+        .fetch_one(&pool)
+        .await
+        .expect("epoch rows counted"),
+        0,
+        "a retired epoch leaves no row"
+    );
+
+    server.shutdown().await.expect("server shuts down");
+}
+
+/// Drives the race in which retirement selects loss first.
+///
+/// # Panics
+///
+/// Panics when the audit sequence or the retired epoch row differs from the
+/// contract.
+#[cfg(feature = "test-support")]
+async fn retirement_first_loss_commits_its_own_edge() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let node_id = uuid::Uuid::from(server.node_id());
+    let fencing_token = server
+        .state()
+        .bifrost_query()
+        .expect("this server hosts an Oracle role")
+        .engine()
+        .reader_authority()
+        .fencing_token();
+    let pool = server
+        .pg_fixture()
+        .superuser_pool()
+        .await
+        .expect("superuser pool");
+
+    await_oracle_ready(&server, true).await;
+    // Drive the production Oracle drain in place: `shutdown` consumes the
+    // harness, and with it the Postgres fixture whose rows this asserts on.
+    server
+        .state()
+        .bifrost_query()
+        .expect("the Oracle runtime is retained")
+        .engine()
+        .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(10))
+        .await;
+
+    assert_eq!(
+        epoch_audit_operations(&pool, node_id, fencing_token).await,
+        vec![
+            "oracle.reader_epoch.acquired".to_owned(),
+            "oracle.reader_epoch.activated".to_owned(),
+            "oracle.reader_epoch.draining".to_owned(),
+            "oracle.reader_epoch.invalidated".to_owned(),
+            "oracle.reader_epoch.retired".to_owned(),
+        ],
+        "retirement that selects loss commits exactly one loss edge itself"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM vala.oracle_reader_epochs WHERE node_id = $1"
+        )
+        .bind(node_id)
+        .fetch_one(&pool)
+        .await
+        .expect("epoch rows counted"),
+        0,
+        "a retired epoch leaves no row"
+    );
+
+    server.shutdown().await.expect("server shuts down");
+}

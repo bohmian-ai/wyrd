@@ -633,6 +633,13 @@ pub struct OracleReaderAuthority {
     lifecycle: Mutex<EpochLifecycle>,
     /// Cancellation root every descendant of this epoch observes.
     epoch_cancel: CancellationToken,
+    /// Fires the instant loss is selected, before its audited edge commits.
+    ///
+    /// Separate from `epoch_cancel` because readiness must close at selection
+    /// while descendants keep running until the loss edge is durable.
+    loss_selected_notify: CancellationToken,
+    /// Stops the lease supervisor's renewal cadence without aborting it.
+    renewal_cancel: CancellationToken,
     /// One coordinator per durable table, keyed in canonical lock order.
     coordinators: Mutex<BTreeMap<TableAuthorityIdentity, Arc<Mutex<OracleTableCoordinator>>>>,
     /// Release reservations, one per concurrently admissible query.
@@ -647,21 +654,22 @@ pub struct OracleReaderAuthority {
     admission_open: AtomicBool,
     /// What this process does when it cannot join descendants in time.
     terminator: Arc<dyn OracleEpochTerminator>,
-    /// The epoch's own background tasks, joined during retirement.
+    /// Bounded worker draining reserved narrowing commands.
     ///
     /// Owned here rather than by the engine because retirement's ordering is
     /// this type's invariant: the narrowing worker must be drained and joined
     /// after descendants are joined and before any table is released, and no
     /// caller can be relied on to sequence that from outside.
-    workers: Mutex<Option<EpochWorkers>>,
-}
-
-/// The two background tasks one reader epoch owns for its whole life.
-struct EpochWorkers {
-    /// Bounded worker draining reserved narrowing commands.
-    narrowing: tokio::task::JoinHandle<()>,
+    narrowing_worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Renewal and self-fence supervisor for this epoch's lease.
-    lease: tokio::task::JoinHandle<()>,
+    ///
+    /// Held separately from the narrowing worker because retirement must join
+    /// it first, while resolving who owns this epoch's loss, and long before
+    /// any protection is released.
+    lease_worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Test-only latch making the confirmed lease stop extending.
+    #[cfg(any(test, feature = "test-support"))]
+    lease_collapsed: AtomicBool,
 }
 
 impl std::fmt::Debug for OracleReaderAuthority {
@@ -755,6 +763,8 @@ impl OracleReaderAuthority {
                 loss_selected: false,
             }),
             epoch_cancel: CancellationToken::new(),
+            loss_selected_notify: CancellationToken::new(),
+            renewal_cancel: CancellationToken::new(),
             coordinators: Mutex::new(BTreeMap::new()),
             release_permits: Arc::new(Semaphore::new(config.max_concurrent_queries)),
             release_capacity: config.max_concurrent_queries,
@@ -762,11 +772,15 @@ impl OracleReaderAuthority {
             narrowing_drain: CancellationToken::new(),
             admission_open: AtomicBool::new(false),
             terminator: config.terminator,
-            workers: Mutex::new(None),
+            narrowing_worker: Mutex::new(None),
+            lease_worker: Mutex::new(None),
+            #[cfg(any(test, feature = "test-support"))]
+            lease_collapsed: AtomicBool::new(false),
         });
         let narrowing = runtime.spawn(Arc::clone(&authority).run_narrowing(narrowing_rx));
         let lease = runtime.spawn(Arc::clone(&authority).supervise_lease(config.shutdown));
-        *authority.workers.lock().await = Some(EpochWorkers { narrowing, lease });
+        *authority.narrowing_worker.lock().await = Some(narrowing);
+        *authority.lease_worker.lock().await = Some(lease);
         Ok(authority)
     }
 
@@ -774,6 +788,16 @@ impl OracleReaderAuthority {
     #[must_use]
     pub fn epoch_cancel(&self) -> &CancellationToken {
         &self.epoch_cancel
+    }
+
+    /// Borrows the token fired the instant this epoch's loss is selected.
+    ///
+    /// Consumers that must stop advertising authority — the continuity monitor
+    /// above all — wait on this rather than on `epoch_cancel`, which is only
+    /// cancelled after the audited loss edge is attempted.
+    #[must_use]
+    pub fn loss_selected_notify(&self) -> &CancellationToken {
+        &self.loss_selected_notify
     }
 
     /// Reports the exact fence this epoch holds.
@@ -884,13 +908,42 @@ impl OracleReaderAuthority {
 
     /// Reports the deadlines derived from the last confirmed lease.
     pub async fn deadlines(&self) -> EpochDeadlines {
-        self.lifecycle.lock().await.deadlines
+        let deadlines = self.lifecycle.lock().await.deadlines;
+        #[cfg(any(test, feature = "test-support"))]
+        if self.lease_collapsed.load(Ordering::SeqCst) {
+            let now = tokio::time::Instant::now();
+            return EpochDeadlines {
+                no_io: now,
+                admission_cutoff: now,
+                join: now,
+            };
+        }
+        deadlines
     }
 
     /// Reports whether this epoch is currently admitting queries.
     #[must_use]
     pub fn admits(&self) -> bool {
         self.admission_open.load(Ordering::SeqCst)
+    }
+
+    /// Collapses this epoch's readiness and no-IO deadlines onto the current
+    /// instant, and reports whether the collapse was applied.
+    ///
+    /// Test-only. A lease runs out in production because Postgres stopped
+    /// extending it, which a test cannot reproduce without either a fake clock
+    /// — unusable against a live server and a live database, whose pending IO
+    /// makes the paused runtime auto-advance through unrelated timers — or a
+    /// wait as long as the lease itself. Collapsing the derived deadlines
+    /// leaves the supervisor observing exactly the state a real shortfall
+    /// produces, so everything after it is the production self-fence path.
+    ///
+    /// The collapse latches, because a renewal that lands first would
+    /// otherwise re-derive future deadlines from its fresh lease and hide the
+    /// shortfall the caller is provoking.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn collapse_lease_for_test(&self) {
+        self.lease_collapsed.store(true, Ordering::SeqCst);
     }
 
     /// Closes admission exactly once and reports whether this call did it.
@@ -908,6 +961,9 @@ impl OracleReaderAuthority {
         lifecycle.phase = EpochPhase::Closed;
         drop(lifecycle);
         self.admission_open.store(false, Ordering::SeqCst);
+        // Both before any awaited SQL: readiness must be gone at selection,
+        // not once the audited loss edge has been accepted.
+        self.loss_selected_notify.cancel();
         true
     }
 
@@ -1530,13 +1586,7 @@ impl OracleReaderAuthority {
     /// Returns [`BifrostError::Internal`] when a release, the invalidation
     /// edge, or retirement fails. Protection is retained on every failure.
     pub async fn retire(self: &Arc<Self>) -> Result<(), BifrostError> {
-        // Only the caller that actually selected loss owes the loss edge. A
-        // retirement that follows a self-fence would otherwise try to commit
-        // `draining` a second time, find no `active` row, and fail — leaving
-        // this epoch's protection for lease expiry to reclaim.
-        if self.select_loss().await {
-            self.commit_loss_edge().await?;
-        }
+        self.settle_lease_loss().await?;
         self.epoch_cancel.cancel();
         // Ordered, not incidental: descendants are joined before the narrowing
         // worker is stopped, and both happen before the first table release, so
@@ -1551,7 +1601,7 @@ impl OracleReaderAuthority {
             self.terminator
                 .terminate("Oracle reader epoch descendants outlived retirement's join budget");
         }
-        self.stop_workers().await;
+        self.stop_narrowing_worker().await;
 
         let identities: Vec<TableAuthorityIdentity> =
             self.coordinators.lock().await.keys().cloned().collect();
@@ -1608,18 +1658,16 @@ impl OracleReaderAuthority {
 
     /// Closes the narrowing queue, then joins both of this epoch's workers.
     ///
-    /// The lease supervisor is aborted rather than awaited: it is a renewal
-    /// loop with no unflushed state, and the epoch has already committed its
-    /// loss edge, so another renewal would be wrong rather than merely late.
-    /// The narrowing worker is drained instead, because its queue may still
-    /// hold reserved releases that must reach Postgres.
-    async fn stop_workers(&self) {
-        let Some(workers) = self.workers.lock().await.take() else {
+    /// The narrowing worker is drained rather than cancelled, because its
+    /// queue may still hold reserved releases that must reach Postgres. The
+    /// lease supervisor is not touched here: it was already joined while
+    /// retirement resolved who owns this epoch's loss.
+    async fn stop_narrowing_worker(&self) {
+        let Some(narrowing) = self.narrowing_worker.lock().await.take() else {
             return;
         };
-        workers.lease.abort();
         self.narrowing_drain.cancel();
-        if let Err(error) = workers.narrowing.await
+        if let Err(error) = narrowing.await
             && !error.is_cancelled()
         {
             tracing::error!(
@@ -1627,6 +1675,72 @@ impl OracleReaderAuthority {
                 "Oracle reader epoch narrowing worker did not terminate cleanly"
             );
         }
+    }
+
+    /// Waits for the lease supervisor to finish, without cancelling or
+    /// aborting it.
+    ///
+    /// A supervisor that selected this epoch's loss is in the middle of the
+    /// audited loss edge; aborting it would abandon that transaction and leave
+    /// the durable epoch behind for lease expiry to reclaim.
+    async fn join_lease_worker(&self) {
+        let Some(lease) = self.lease_worker.lock().await.take() else {
+            return;
+        };
+        if let Err(error) = lease.await
+            && !error.is_cancelled()
+        {
+            tracing::error!(
+                node_id = %self.node_id,
+                "Oracle reader epoch lease supervisor did not terminate cleanly"
+            );
+        }
+    }
+
+    /// Resolves which owner committed this epoch's loss edge before retirement
+    /// releases anything.
+    ///
+    /// Retirement and the lease supervisor can both reach loss; exactly one
+    /// selects it, and only that one owes the audited edge. When retirement
+    /// wins it stops the renewal cadence, joins the supervisor, and commits
+    /// the edge itself. When the supervisor won, retirement waits for it and
+    /// then verifies the durable epoch actually reached a loss state, because
+    /// releasing protection under an epoch that never recorded its loss would
+    /// leave nothing to reclaim it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::Internal`] when the loss edge cannot be
+    /// committed, when the epoch row cannot be read, or when it is still in a
+    /// state that has not lost authority.
+    async fn settle_lease_loss(&self) -> Result<(), BifrostError> {
+        if self.select_loss().await {
+            self.renewal_cancel.cancel();
+            self.join_lease_worker().await;
+            return self.commit_loss_edge().await;
+        }
+        self.join_lease_worker().await;
+        let mut conn = system_conn(&self.vala).await?;
+        let row = OracleReaderEpochs::new(&mut conn)
+            .map_err(|error| internal(error.to_string()))?
+            .read(self.node_id, self.fencing_token)
+            .await
+            .map_err(|error| internal(error.to_string()))?;
+        conn.commit()
+            .await
+            .map_err(|error| internal(error.to_string()))?;
+        let row = row.ok_or_else(|| internal("Oracle reader epoch row disappeared"))?;
+        if !matches!(
+            row.state,
+            OracleEpochState::Draining | OracleEpochState::Invalidated
+        ) {
+            return Err(internal(
+                "Oracle reader epoch loss was selected but never durably recorded",
+            ));
+        }
+        let mut lifecycle = self.lifecycle.lock().await;
+        lifecycle.confirmed_revision = row.state_revision;
+        Ok(())
     }
 
     /// Borrows the read-only pool reader recovery enumerates through.
@@ -1640,30 +1754,44 @@ impl OracleReaderAuthority {
     /// This is the only writer of the epoch's authority window while the Oracle
     /// serves reads. It self-fences on two independent grounds: a renewal that
     /// Postgres refused, and a local monotonic clock that has reached the
-    /// no-IO deadline derived from the last confirmed lease. The second matters
-    /// because a supervisor that is merely starved never learns the first.
+    /// admission cutoff derived from the last confirmed lease. The second
+    /// matters because a supervisor that is merely starved never learns the
+    /// first, and the cutoff rather than the no-IO deadline because admission
+    /// must close while there is still time to stop reads that already began.
+    ///
+    /// It returns without self-fencing when the process is shutting down or
+    /// when retirement cancelled renewal, because in both of those cases the
+    /// caller that cancelled owns this epoch's loss.
     async fn supervise_lease(self: Arc<Self>, shutdown: CancellationToken) {
         loop {
-            let no_io = self.deadlines().await.no_io;
-            tokio::select! {
-                () = shutdown.cancelled() => return,
-                () = tokio::time::sleep_until(no_io) => {
-                    tracing::error!(
-                        node_id = %self.node_id,
-                        fencing_token = self.fencing_token,
-                        "Oracle self-fenced its reader epoch at the no-IO deadline"
-                    );
-                    self.self_fence().await;
-                    return;
+            let admission_cutoff = self.deadlines().await.admission_cutoff;
+            // Re-checked before the select so a cutoff that has already passed
+            // self-fences immediately instead of racing the renewal cadence.
+            if tokio::time::Instant::now() < admission_cutoff {
+                tokio::select! {
+                    () = shutdown.cancelled() => return,
+                    () = self.renewal_cancel.cancelled() => return,
+                    () = tokio::time::sleep_until(admission_cutoff) => {}
+                    () = tokio::time::sleep(EPOCH_RENEWAL_INTERVAL) => {
+                        if let Err(error) = self.renew().await {
+                            tracing::error!(
+                                error = %error,
+                                node_id = %self.node_id,
+                                fencing_token = self.fencing_token,
+                                "Oracle self-fenced its reader epoch after a failed renewal"
+                            );
+                            self.self_fence().await;
+                            return;
+                        }
+                        continue;
+                    }
                 }
-                () = tokio::time::sleep(EPOCH_RENEWAL_INTERVAL) => {}
             }
-            if let Err(error) = self.renew().await {
+            {
                 tracing::error!(
-                    error = %error,
                     node_id = %self.node_id,
                     fencing_token = self.fencing_token,
-                    "Oracle self-fenced its reader epoch after a failed renewal"
+                    "Oracle self-fenced its reader epoch at its admission cutoff"
                 );
                 self.self_fence().await;
                 return;

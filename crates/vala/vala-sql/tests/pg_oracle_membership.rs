@@ -906,6 +906,35 @@ mod pg_tests {
             .is_empty()
         );
 
+        // Retirement's cross-tenant proof is execute-only and read-only, and
+        // it is owned by the one role that may see past forced RLS.
+        let (owner, volatility, security): (String, String, bool) = sqlx::query_as(
+            "SELECT r.rolname, p.provolatile::text, p.prosecdef \
+               FROM pg_proc p \
+               JOIN pg_roles r ON r.oid = p.proowner \
+              WHERE p.oid = 'vala.oracle_epoch_protection_count(uuid, bigint)'::regprocedure",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("retirement proof function exists");
+        assert_eq!(
+            (owner.as_str(), volatility.as_str(), security),
+            ("wyrd_migrator", "s", true)
+        );
+        let executors: Vec<String> = sqlx::query_scalar(
+            "SELECT grantee FROM information_schema.role_routine_grants \
+              WHERE specific_schema = 'vala' AND routine_name = 'oracle_epoch_protection_count' \
+                AND privilege_type = 'EXECUTE' AND grantee <> 'wyrd_migrator' \
+              ORDER BY grantee",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("routine grants read");
+        assert_eq!(
+            executors,
+            vec!["wyrd_app".to_owned(), "wyrd_platform_admin".to_owned()]
+        );
+
         // Registration writes exactly one authority row, split at the last dot.
         let rows: Vec<(String, String, String, Vec<u8>)> = sqlx::query_as(
             "SELECT catalog_name, namespace_name, table_name, table_uid \
@@ -1164,6 +1193,366 @@ mod pg_tests {
                 .await
                 .is_err(),
             "the recovery grant cannot mutate tenant protection"
+        );
+    }
+
+    /// Proves corrupt protection evidence and a lost CAS both fail closed.
+    ///
+    /// Every case here is one Forge would otherwise misread as "this table is
+    /// less protected than it is", so none of them may degrade into an absent
+    /// or smaller frontier.
+    ///
+    /// # Panics
+    ///
+    /// Panics when corrupt state reads as absent, when a lost compare-and-set
+    /// mutates anything, or when protection leaks across tenants.
+    #[tokio::test]
+    async fn oracle_reader_authority_corruption_and_failed_narrowing_fail_closed() {
+        let harness = ReaderAuthority::start().await;
+        let node = harness.node_id;
+        let fence = harness.register_oracle_role().await;
+        let frontier = harness.frontier(vec![30, 20, 10], 300, 100);
+        let ProtectionCas::Committed(record) = harness
+            .commit_protection(fence, None, &frontier, OracleTableProtectionPhase::Expanded)
+            .await
+        else {
+            panic!("a first protection commits");
+        };
+        assert_eq!(record.revision, 1);
+        let pool = harness.superuser().await;
+
+        // A header digest that no longer reproduces over its own members is
+        // corruption, not a smaller protected set.
+        sqlx::query(
+            "UPDATE vala.oracle_table_protections SET frontier_digest = $2 \
+              WHERE data_tenant_id = $1",
+        )
+        .bind(harness.tenant.as_uuid())
+        .bind(vec![0_u8; 32])
+        .execute(&pool)
+        .await
+        .expect("digest corruption applies");
+        let mut conn = harness.tenant_conn().await;
+        let poisoned = OracleTableProtections::new(&mut conn)
+            .read(&harness.identity, node, fence)
+            .await;
+        assert!(
+            matches!(poisoned, Err(SqlError::InvariantViolation { .. })),
+            "a corrupt header digest must fail closed: {poisoned:?}"
+        );
+        // The same poison stops a narrowing commit before it writes anything.
+        let refused = OracleTableProtections::new(&mut conn)
+            .commit(
+                &harness.identity,
+                node,
+                fence,
+                Some(1),
+                &ProtectionFrontier::default(),
+            )
+            .await;
+        assert!(
+            matches!(refused, Err(SqlError::InvariantViolation { .. })),
+            "a commit over corrupt evidence must fail closed: {refused:?}"
+        );
+        drop(conn);
+        sqlx::query(
+            "UPDATE vala.oracle_table_protections SET frontier_digest = $2 \
+              WHERE data_tenant_id = $1",
+        )
+        .bind(harness.tenant.as_uuid())
+        .bind(record.frontier_digest.to_vec())
+        .execute(&pool)
+        .await
+        .expect("digest restore applies");
+
+        // An unknown member digest version is unreadable evidence, not an
+        // older encoding to be tolerated.
+        sqlx::query(
+            "UPDATE vala.oracle_table_protection_members SET ancestry_digest = $2 \
+              WHERE data_tenant_id = $1",
+        )
+        .bind(harness.tenant.as_uuid())
+        .bind(vec![7_u8; 32])
+        .execute(&pool)
+        .await
+        .expect("member corruption applies");
+        let mut conn = harness.tenant_conn().await;
+        let poisoned = OracleTableProtections::new(&mut conn)
+            .list_table_protection(&harness.identity)
+            .await;
+        assert!(
+            matches!(poisoned, Err(SqlError::InvariantViolation { .. })),
+            "a corrupt member digest must fail closed for Forge too: {poisoned:?}"
+        );
+        drop(conn);
+        let restored = frontier.members[0].ancestry_digest.to_vec();
+        sqlx::query(
+            "UPDATE vala.oracle_table_protection_members SET ancestry_digest = $2 \
+              WHERE data_tenant_id = $1",
+        )
+        .bind(harness.tenant.as_uuid())
+        .bind(restored)
+        .execute(&pool)
+        .await
+        .expect("member restore applies");
+
+        // A stale expectation is a conflict carrying the winner, and it commits
+        // nothing: no revision advance, no member change, no partial write.
+        let widened = harness.frontier(vec![40, 30, 20, 10], 400, 100);
+        let conflict = harness
+            .commit_protection(
+                fence,
+                Some(7),
+                &widened,
+                OracleTableProtectionPhase::Expanded,
+            )
+            .await;
+        let ProtectionCas::Conflict(Some(winner)) = conflict else {
+            panic!("a lost compare-and-set reports the winning record");
+        };
+        assert_eq!(winner.revision, 1);
+        assert_eq!(winner.frontier, frontier);
+        let (revision, members): (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT revision FROM vala.oracle_table_protections \
+                      WHERE data_tenant_id = $1), \
+                    (SELECT count(*) FROM vala.oracle_table_protection_members \
+                      WHERE data_tenant_id = $1)",
+        )
+        .bind(harness.tenant.as_uuid())
+        .fetch_one(&pool)
+        .await
+        .expect("post-conflict state reads");
+        assert_eq!((revision, members), (1, 1), "a lost CAS writes nothing");
+        assert_eq!(
+            audit_operations(&pool, harness.tenant).await,
+            vec!["oracle.table_protection.expanded".to_owned()],
+            "a lost CAS leaves no evidence behind"
+        );
+
+        // Protection is tenant-private: another tenant sees nothing at all.
+        let other = DataTenantId::new_v7();
+        harness
+            .fixture
+            .seed_additional_tenant_with_uuid(other, &format!("other-{}", other.as_uuid().simple()))
+            .await
+            .expect("second tenant seeds");
+        let mut conn = TenantConn::acquire(harness.fixture.app_pool(), other)
+            .await
+            .expect("second tenant connection");
+        let foreign = TableAuthorityIdentity {
+            tenant: other,
+            ..harness.identity.clone()
+        };
+        assert!(
+            OracleTableProtections::new(&mut conn)
+                .read(&foreign, node, fence)
+                .await
+                .expect("cross-tenant read runs")
+                .is_none(),
+            "one tenant's protection is invisible to another"
+        );
+        drop(conn);
+    }
+
+    /// Proves neither a stale heartbeat nor a replacement removes protection.
+    ///
+    /// Liveness is not authority: only the database's own proof of lease expiry
+    /// authorizes invalidation, and only the audited release sequence removes a
+    /// header.
+    ///
+    /// # Panics
+    ///
+    /// Panics when protection is removed without database-proven expiry, when
+    /// the release ordering is violated, or when a retired epoch leaves
+    /// evidence behind.
+    #[tokio::test]
+    async fn stale_heartbeat_and_replacement_startup_cannot_remove_reader_protection() {
+        let harness = ReaderAuthority::start().await;
+        let node = harness.node_id;
+        let fence = harness.register_oracle_role().await;
+        let lease = std::time::Duration::from_secs(30);
+        let mut conn = harness.system_conn().await;
+        let acquired = OracleReaderEpochs::new(&mut conn)
+            .expect("epochs are system owned")
+            .acquire(node, fence, lease)
+            .await
+            .expect("epoch acquires");
+        let activated = OracleReaderEpochs::new(&mut conn)
+            .expect("epochs are system owned")
+            .activate(node, fence, acquired.state_revision)
+            .await
+            .expect("epoch activates");
+        conn.commit().await.expect("epoch startup commits");
+        harness
+            .commit_protection(
+                fence,
+                None,
+                &harness.frontier(vec![30, 20, 10], 300, 100),
+                OracleTableProtectionPhase::Expanded,
+            )
+            .await;
+        let pool = harness.superuser().await;
+        let before: (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT revision FROM vala.oracle_table_protections \
+                      WHERE data_tenant_id = $1), \
+                    (SELECT count(*) FROM vala.oracle_table_protection_members \
+                      WHERE data_tenant_id = $1)",
+        )
+        .bind(harness.tenant.as_uuid())
+        .fetch_one(&pool)
+        .await
+        .expect("protection state reads");
+
+        // Stale the discovery heartbeat only, then start a replacement.
+        sqlx::query(
+            "UPDATE vala.cluster_nodes SET heartbeat_at = now() - interval '2 minutes' \
+                      WHERE node_id = $1",
+        )
+        .bind(node)
+        .execute(&pool)
+        .await
+        .expect("heartbeat ages");
+        assert_eq!(harness.register_oracle_role().await, 2);
+
+        let mut conn = harness.system_conn().await;
+        assert!(
+            OracleReaderEpochs::new(&mut conn)
+                .expect("epochs are system owned")
+                .invalidate_expired(node, fence)
+                .await
+                .expect("expiry check runs")
+                .is_none(),
+            "a stale heartbeat and a replacement are not proof of lease expiry"
+        );
+        conn.commit().await.expect("expiry check commits");
+        let after: (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT revision FROM vala.oracle_table_protections \
+                      WHERE data_tenant_id = $1), \
+                    (SELECT count(*) FROM vala.oracle_table_protection_members \
+                      WHERE data_tenant_id = $1)",
+        )
+        .bind(harness.tenant.as_uuid())
+        .fetch_one(&pool)
+        .await
+        .expect("protection state re-reads");
+        assert_eq!(after, before, "protection survives liveness alone");
+        assert_eq!(
+            audit_operations(&pool, harness.tenant).await,
+            vec!["oracle.table_protection.expanded".to_owned()]
+        );
+
+        // Once Postgres itself proves the lease is past, invalidation and the
+        // per-tenant release may proceed, in that order.
+        sqlx::query(
+            "UPDATE vala.oracle_reader_epochs \
+                SET acquired_at = statement_timestamp() - interval '1 hour', \
+                    activated_at = statement_timestamp() - interval '1 hour', \
+                    renewed_at = statement_timestamp() - interval '1 hour', \
+                    lease_expires_at = statement_timestamp() - interval '1 second' \
+              WHERE node_id = $1 AND fencing_token = $2",
+        )
+        .bind(node)
+        .bind(fence)
+        .execute(&pool)
+        .await
+        .expect("lease expiry applies");
+        assert_eq!(
+            list_expired_epochs_for_operator(harness.fixture.operator_pool(), 64)
+                .await
+                .expect("expired scan runs")
+                .len(),
+            1
+        );
+        let mut conn = harness.system_conn().await;
+        let invalidated = OracleReaderEpochs::new(&mut conn)
+            .expect("epochs are system owned")
+            .invalidate_expired(node, fence)
+            .await
+            .expect("expiry check runs")
+            .expect("a provably expired lease invalidates");
+        assert_eq!(invalidated, activated.state_revision + 1);
+        append_audit(
+            &mut conn,
+            &epoch_event(
+                node,
+                fence,
+                OracleReaderEpochPhase::Invalidated,
+                invalidated,
+            ),
+        )
+        .await
+        .expect("invalidation audit appends");
+        // Retirement before release is refused: the header is still protection.
+        let premature = OracleReaderEpochs::new(&mut conn)
+            .expect("epochs are system owned")
+            .retire(node, fence, invalidated)
+            .await;
+        assert!(
+            matches!(premature, Err(SqlError::InvariantViolation { .. })),
+            "an epoch that still protects a table cannot retire: {premature:?}"
+        );
+        drop(conn);
+
+        let mut conn = harness.system_conn().await;
+        let invalidated = OracleReaderEpochs::new(&mut conn)
+            .expect("epochs are system owned")
+            .invalidate_expired(node, fence)
+            .await
+            .expect("expiry check runs")
+            .expect("a provably expired lease invalidates");
+        append_audit(
+            &mut conn,
+            &epoch_event(
+                node,
+                fence,
+                OracleReaderEpochPhase::Invalidated,
+                invalidated,
+            ),
+        )
+        .await
+        .expect("invalidation audit appends");
+        conn.commit().await.expect("invalidation commits");
+
+        let released = harness
+            .commit_protection(
+                fence,
+                Some(1),
+                &ProtectionFrontier::default(),
+                OracleTableProtectionPhase::Released,
+            )
+            .await;
+        assert!(matches!(released, ProtectionCas::Committed(_)));
+        let mut conn = harness.system_conn().await;
+        OracleReaderEpochs::new(&mut conn)
+            .expect("epochs are system owned")
+            .retire(node, fence, invalidated)
+            .await
+            .expect("a released epoch retires");
+        append_audit(
+            &mut conn,
+            &epoch_event(node, fence, OracleReaderEpochPhase::Retired, invalidated),
+        )
+        .await
+        .expect("retirement audit appends");
+        conn.commit().await.expect("retirement commits");
+
+        let remaining: (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM vala.oracle_reader_epochs WHERE node_id = $1), \
+                    (SELECT count(*) FROM vala.oracle_table_protection_members \
+                      WHERE data_tenant_id = $2)",
+        )
+        .bind(node)
+        .bind(harness.tenant.as_uuid())
+        .fetch_one(&pool)
+        .await
+        .expect("final state reads");
+        assert_eq!(remaining, (0, 0), "a safely retired epoch leaves nothing");
+        assert_eq!(
+            audit_operations(&pool, harness.tenant).await,
+            vec![
+                "oracle.table_protection.expanded".to_owned(),
+                "oracle.table_protection.released".to_owned(),
+            ]
         );
     }
 }

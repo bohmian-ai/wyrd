@@ -499,18 +499,16 @@ impl<'conn, 'tx> OracleReaderEpochs<'conn, 'tx> {
         fencing_token: i64,
         expected_revision: i64,
     ) -> Result<(), SqlError> {
-        let remaining: i64 = sqlx::query_scalar(
-            r"
-            SELECT count(*)
-              FROM vala.oracle_table_protections
-             WHERE node_id = $1 AND fencing_token = $2
-            ",
-        )
-        .bind(node_id)
-        .bind(fencing_token)
-        .fetch_one(&mut **self.conn.transaction())
-        .await
-        .map_err(SqlError::from)?;
+        // The count must span every tenant while this transaction is bound to
+        // the system owner, so it goes through the execute-only read-only
+        // function rather than a statement forced RLS would answer with zero.
+        let remaining: i64 =
+            sqlx::query_scalar(r"SELECT vala.oracle_epoch_protection_count($1, $2)")
+                .bind(node_id)
+                .bind(fencing_token)
+                .fetch_one(&mut **self.conn.transaction())
+                .await
+                .map_err(SqlError::from)?;
         if remaining != 0 {
             return Err(invariant(
                 "Oracle reader epoch still protects tables and cannot be retired",

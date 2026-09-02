@@ -184,3 +184,32 @@ GRANT SELECT, INSERT, UPDATE, DELETE
 -- may not mutate tenant state or append tenant audit through this grant.
 GRANT SELECT ON vala.oracle_table_protections TO wyrd_platform_admin;
 GRANT SELECT ON vala.oracle_reader_epochs TO wyrd_platform_admin;
+
+-- ---------------------------------------------------------------------------
+-- Retirement proof
+-- ---------------------------------------------------------------------------
+
+-- Retiring an epoch requires proof that no protection header remains for it,
+-- but that proof spans every tenant while the retiring transaction is bound to
+-- the system owner under forced RLS — so a plain count inside that transaction
+-- would always see zero and retire an epoch that is still protecting tables.
+-- This execute-only function is exactly that proof: read-only, cross-tenant,
+-- returning one number and no row payload, and taking no tenant input.
+CREATE FUNCTION vala.oracle_epoch_protection_count(
+    p_node_id uuid,
+    p_fencing_token bigint
+) RETURNS bigint
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+    SELECT pg_catalog.count(*)
+      FROM vala.oracle_table_protections
+     WHERE node_id = p_node_id AND fencing_token = p_fencing_token
+$$;
+
+ALTER FUNCTION vala.oracle_epoch_protection_count(uuid, bigint) OWNER TO wyrd_migrator;
+REVOKE ALL ON FUNCTION vala.oracle_epoch_protection_count(uuid, bigint) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION vala.oracle_epoch_protection_count(uuid, bigint) TO wyrd_app;
+GRANT EXECUTE ON FUNCTION vala.oracle_epoch_protection_count(uuid, bigint) TO wyrd_platform_admin;

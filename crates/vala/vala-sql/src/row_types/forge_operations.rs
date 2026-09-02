@@ -13,11 +13,12 @@ use std::str::FromStr;
 
 use sqlx::types::Uuid;
 use wyrd_spec::vala::api::{
-    AuditDetail, ForgeIcebergRewritePhase, ForgeOrphanGcPhase, ForgeScribePromotionPhase,
-    ForgeSnapshotExpirePhase,
+    AuditDetail, AuditEvent, ForgeIcebergRewritePhase, ForgeOrphanGcPhase,
+    ForgeScribePromotionPhase, ForgeSnapshotExpirePhase,
 };
 
 use crate::SqlError;
+use crate::row_types::forge_tasks::ForgeTaskEvidence;
 
 /// Closed Forge operation families tracked by the state projection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -272,12 +273,23 @@ impl TryFrom<ForgeOperationStateSqlRow> for ForgeOperationStateRow {
             row.operation_id,
             ForgeOperationPhase::Prepared,
         )?;
+        // A snapshot-expiry Reset is internal: the public
+        // `ForgeSnapshotExpirePhase` has no Reset variant, so the reset row
+        // keeps its immutable Prepared detail as `current_detail` and records
+        // the release only in the column phase and terminal sequence.
+        let current_phase = if family == ForgeOperationFamily::SnapshotExpire
+            && phase == ForgeOperationPhase::Reset
+        {
+            ForgeOperationPhase::Prepared
+        } else {
+            phase
+        };
         validate_detail_identity(
             &current_detail,
             &row.resource,
             family,
             row.operation_id,
-            phase,
+            current_phase,
         )?;
 
         // Enforce nullability invariant.
@@ -444,4 +456,219 @@ fn validate_detail_identity(
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot-expiration claims
+// ---------------------------------------------------------------------------
+
+/// The exact registered Bifrost table one expiration claim is bound to.
+///
+/// `table_uid` is the durable identity; the catalog/namespace/table payload and
+/// the Iceberg `table_uuid` are carried so drift between the registry, the
+/// maintenance authority, and the catalog is visible in the claim itself rather
+/// than silent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForgeClaimTable {
+    /// Durable 16-byte Bifrost table UID.
+    pub table_uid: [u8; 16],
+    /// Catalog the table is registered in; always the Bifrost catalog.
+    pub catalog_name: String,
+    /// Logical namespace segment of the table identity.
+    pub namespace_name: String,
+    /// Final segment of the table identity.
+    pub table_name: String,
+    /// Exact Iceberg table UUID observed when the selection was made.
+    pub table_uuid: Uuid,
+}
+
+/// One worker's fenced authority over a snapshot-expiration operation.
+///
+/// At preparation this is written into every claim row as immutable historical
+/// evidence of who prepared the selection and under which table fence. At reset
+/// and settlement the same shape describes the *current* mutation authority:
+/// the task's unchanged `task_id`/`attempt_id`, its current `claimed_by` owner
+/// with an unexpired claim, and that owner's own newly acquired live fence. A
+/// successor is therefore never required to be the preparing worker or to reuse
+/// the preparing fence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForgeExpirationAuthority {
+    /// Stable Forge task identity carrying the expiration.
+    pub task_id: Uuid,
+    /// Exact attempt generation, preserved across reconciliation takeover.
+    pub attempt_id: Uuid,
+    /// Worker acting on the task right now.
+    pub worker_id: Uuid,
+    /// Forge table lease namespace that worker holds.
+    pub lease_key: String,
+    /// Live fencing token of that lease.
+    pub lease_fencing_token: i64,
+}
+
+/// One immutable claim row: exactly one unresolved snapshot of one operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForgeSnapshotExpirationClaim {
+    /// Canonical tenant/table resource identity shared with the operation.
+    pub resource: String,
+    /// Deterministic operation identifier the claim belongs to.
+    pub operation_id: Uuid,
+    /// Exact snapshot this claim reserves against reader widening.
+    pub snapshot_id: i64,
+    /// Identity the selection was prepared under.
+    pub prepared_by: ForgeExpirationAuthority,
+    /// Table the claim is bound to.
+    pub table: ForgeClaimTable,
+}
+
+/// How one prepared snapshot-expiration operation settled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForgeExpirationSettlement {
+    /// The preparing worker proved the Iceberg commit itself.
+    Committed,
+    /// Reconciliation proved a predecessor's commit had been accepted.
+    Recovered,
+}
+
+impl ForgeExpirationSettlement {
+    /// Returns the operation phase this settlement writes.
+    #[must_use]
+    pub fn phase(self) -> ForgeOperationPhase {
+        match self {
+            Self::Committed => ForgeOperationPhase::Committed,
+            Self::Recovered => ForgeOperationPhase::Recovered,
+        }
+    }
+}
+
+/// Outcome of applying the internal `Prepared -> Reset` expiration transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForgeExpirationResetOutcome {
+    /// The reset applied: claims were deleted and planning demand advanced.
+    Applied {
+        /// Planning-demand generation the same transaction advanced to.
+        demand_generation: i64,
+    },
+    /// A matching reset was already durable; nothing was written again.
+    AlreadyApplied,
+}
+
+/// Everything one atomic snapshot-expiration preparation needs.
+///
+/// The request bundles the mutation authority, the table the claims bind to,
+/// the Prepared task evidence, and both audit events so the caller cannot
+/// present a partial preparation to the single transaction that applies it.
+pub struct ForgeExpirationPreparation<'request> {
+    /// Live task/attempt/worker/lease identity preparing the selection.
+    pub authority: &'request ForgeExpirationAuthority,
+    /// Registered table the claims and the maintenance authority row name.
+    pub table: &'request ForgeClaimTable,
+    /// Prepared attempt evidence recorded on the task in the same transaction.
+    pub evidence: &'request ForgeTaskEvidence,
+    /// Prepared `forge.snapshot_expire.prepared` operation audit event.
+    pub operation_event: &'request AuditEvent,
+    /// Matching `forge.task.prepared` task audit event.
+    pub task_event: &'request AuditEvent,
+}
+
+/// Everything one atomic snapshot-expiration settlement needs.
+pub struct ForgeExpirationSettlementRequest<'request> {
+    /// Current mutation authority, which need not be the preparing worker.
+    pub authority: &'request ForgeExpirationAuthority,
+    /// Registered table the resolved claims are bound to.
+    pub table: &'request ForgeClaimTable,
+    /// Whether this attempt proved the commit or recovered a predecessor's.
+    pub settlement: ForgeExpirationSettlement,
+    /// Final attempt evidence, including the exact cleanup candidate names.
+    pub evidence: &'request ForgeTaskEvidence,
+    /// Terminal `forge.snapshot_expire.{committed,recovered}` audit event.
+    pub operation_event: &'request AuditEvent,
+    /// Matching `forge.task.succeeded` task audit event.
+    pub task_event: &'request AuditEvent,
+}
+
+/// Everything one atomic snapshot-expiration reset needs.
+pub struct ForgeExpirationResetRequest<'request> {
+    /// Current mutation authority releasing the unproven selection.
+    pub authority: &'request ForgeExpirationAuthority,
+    /// Registered table whose claims are released.
+    pub table: &'request ForgeClaimTable,
+    /// Failed `forge.snapshot_expire.reset` operation audit event, which
+    /// carries the immutable Prepared detail because the public snapshot-expiry
+    /// phase enum has no Reset variant.
+    pub operation_event: &'request AuditEvent,
+    /// Matching `forge.task.cancelled` task audit event.
+    pub task_event: &'request AuditEvent,
+}
+
+/// Exact column mirror of one `vala.forge_snapshot_expiration_claims` row.
+///
+/// The mirror is private to conversion: [`ForgeSnapshotExpirationClaim`] is the
+/// public shape, and the conversion below is where the stored 16-byte table UID
+/// is proven to be exactly that.
+#[derive(sqlx::FromRow)]
+pub(crate) struct ForgeSnapshotExpirationClaimSqlRow {
+    /// Canonical tenant/table resource identity shared with the operation.
+    resource: String,
+    /// Deterministic operation identifier the claim belongs to.
+    operation_id: Uuid,
+    /// Exact reserved snapshot.
+    snapshot_id: i64,
+    /// Task the selection was prepared under.
+    task_id: Uuid,
+    /// Attempt the selection was prepared under.
+    attempt_id: Uuid,
+    /// Worker that prepared the selection.
+    worker_id: Uuid,
+    /// Table lease that worker held when preparing.
+    lease_key: String,
+    /// Fencing token of that lease.
+    lease_fencing_token: i64,
+    /// Durable table UID the claim is bound to.
+    table_uid: Vec<u8>,
+    /// Exact catalog wire name.
+    catalog_name: String,
+    /// Logical Bifrost namespace.
+    namespace_name: String,
+    /// Physical table name.
+    table_name: String,
+    /// Iceberg table UUID observed at preparation.
+    table_uuid: Uuid,
+}
+
+impl TryFrom<ForgeSnapshotExpirationClaimSqlRow> for ForgeSnapshotExpirationClaim {
+    /// Error returned when a stored claim violates its column invariants.
+    type Error = SqlError;
+
+    /// Converts one stored claim row, proving the table UID is 16 bytes.
+    ///
+    /// # Errors
+    /// Returns [`SqlError::InvariantViolation`] when `table_uid` is not exactly
+    /// 16 bytes, which the table's own CHECK also forbids.
+    fn try_from(row: ForgeSnapshotExpirationClaimSqlRow) -> Result<Self, Self::Error> {
+        let table_uid: [u8; 16] =
+            row.table_uid
+                .try_into()
+                .map_err(|_| SqlError::InvariantViolation {
+                    detail: "snapshot expiration claim table UID is not 16 bytes".to_owned(),
+                })?;
+        Ok(Self {
+            resource: row.resource,
+            operation_id: row.operation_id,
+            snapshot_id: row.snapshot_id,
+            prepared_by: ForgeExpirationAuthority {
+                task_id: row.task_id,
+                attempt_id: row.attempt_id,
+                worker_id: row.worker_id,
+                lease_key: row.lease_key,
+                lease_fencing_token: row.lease_fencing_token,
+            },
+            table: ForgeClaimTable {
+                table_uid,
+                catalog_name: row.catalog_name,
+                namespace_name: row.namespace_name,
+                table_name: row.table_name,
+                table_uuid: row.table_uuid,
+            },
+        })
+    }
 }

@@ -184,6 +184,13 @@ GRANT SELECT, INSERT, UPDATE, DELETE
 -- may not mutate tenant state or append tenant audit through this grant.
 GRANT SELECT ON vala.oracle_table_protections TO wyrd_platform_admin;
 GRANT SELECT ON vala.oracle_reader_epochs TO wyrd_platform_admin;
+GRANT SELECT ON vala.oracle_table_protection_members TO wyrd_platform_admin;
+-- The fenced Forge expiration lifecycle runs on the operator pool and takes the
+-- maintenance-authority row as its serialization lock against reader widening.
+-- PostgreSQL requires UPDATE privilege to take a `FOR UPDATE` row lock, so the
+-- grant is wider than the behavior: Forge only ever reads and locks this row,
+-- and registration remains the sole writer.
+GRANT SELECT, UPDATE ON vala.bifrost_table_maintenance_authority TO wyrd_platform_admin;
 
 -- ---------------------------------------------------------------------------
 -- Retirement proof
@@ -213,3 +220,72 @@ ALTER FUNCTION vala.oracle_epoch_protection_count(uuid, bigint) OWNER TO wyrd_mi
 REVOKE ALL ON FUNCTION vala.oracle_epoch_protection_count(uuid, bigint) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION vala.oracle_epoch_protection_count(uuid, bigint) TO wyrd_app;
 GRANT EXECUTE ON FUNCTION vala.oracle_epoch_protection_count(uuid, bigint) TO wyrd_platform_admin;
+
+-- ---------------------------------------------------------------------------
+-- Forge snapshot-expiration claims
+-- ---------------------------------------------------------------------------
+
+-- The mirror image of a reader protection header. A protection row says "a
+-- reader still needs this snapshot"; a claim row says "an expiration operation
+-- has already selected this snapshot and has not resolved". Both are read while
+-- the same bifrost_table_maintenance_authority row is held FOR UPDATE, which is
+-- what gives the widen-versus-destroy race exactly one durable winner per
+-- tenant-qualified table.
+--
+-- Only unresolved claims live here: settlement and reset delete the operation's
+-- rows in the same transaction that closes it, and the cascade from
+-- forge_operation_state means an operation can never outlive its claims in the
+-- other direction either.
+--
+-- Claim rows are immutable. They preserve the identity the selection was
+-- prepared under — task, attempt, preparing worker, and that worker's table
+-- lease key and fencing token — as historical evidence. Correcting a
+-- preparation means deleting these rows and preparing a new operation, never
+-- updating one, which is why wyrd_platform_admin holds INSERT and DELETE but
+-- no UPDATE. A successor that takes the task over settles under its own current
+-- ownership and its own newly acquired fence; it does not rewrite these rows.
+CREATE TABLE vala.forge_snapshot_expiration_claims (
+    data_tenant_id      uuid   NOT NULL REFERENCES platform.tenants(data_tenant_id),
+    resource            text   NOT NULL,
+    family              text   NOT NULL CHECK (family = 'snapshot_expire'),
+    operation_id        uuid   NOT NULL,
+    snapshot_id         bigint NOT NULL,
+    task_id             uuid   NOT NULL REFERENCES vala.forge_tasks(task_id),
+    attempt_id          uuid   NOT NULL,
+    worker_id           uuid   NOT NULL,
+    lease_key           text   NOT NULL CHECK (btrim(lease_key) <> ''),
+    lease_fencing_token bigint NOT NULL CHECK (lease_fencing_token > 0),
+    table_uid           bytea  NOT NULL CHECK (octet_length(table_uid) = 16),
+    catalog_name        text   NOT NULL CHECK (catalog_name = 'wyrd-redux'),
+    namespace_name      text   NOT NULL CHECK (btrim(namespace_name) <> ''),
+    table_name          text   NOT NULL CHECK (btrim(table_name) <> ''),
+    table_uuid          uuid   NOT NULL,
+    PRIMARY KEY (data_tenant_id, resource, family, operation_id, snapshot_id),
+    FOREIGN KEY (data_tenant_id, resource, family, operation_id)
+        REFERENCES vala.forge_operation_state
+                   (data_tenant_id, resource, family, operation_id)
+        ON DELETE CASCADE,
+    FOREIGN KEY (data_tenant_id, table_uid)
+        REFERENCES vala.bifrost_table_maintenance_authority(data_tenant_id, table_uid)
+);
+
+-- Admission asks one question: is this exact snapshot on this exact table
+-- already claimed? Reconciliation asks the other: which operation do this
+-- task's claims belong to? Neither may become a scan.
+CREATE INDEX forge_snapshot_expiration_claims_admission
+    ON vala.forge_snapshot_expiration_claims (data_tenant_id, table_uid, snapshot_id);
+CREATE INDEX forge_snapshot_expiration_claims_task
+    ON vala.forge_snapshot_expiration_claims (data_tenant_id, task_id);
+
+ALTER TABLE vala.forge_snapshot_expiration_claims ENABLE ROW LEVEL SECURITY;
+ALTER TABLE vala.forge_snapshot_expiration_claims FORCE  ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON vala.forge_snapshot_expiration_claims
+    USING      (data_tenant_id = wyrd.current_tenant())
+    WITH CHECK (data_tenant_id = wyrd.current_tenant());
+
+REVOKE ALL ON vala.forge_snapshot_expiration_claims FROM PUBLIC;
+-- Oracle admission reads the claim index from a tenant connection; only the
+-- fenced Forge lifecycle owner, which runs on the operator pool, may write one.
+GRANT SELECT ON vala.forge_snapshot_expiration_claims TO wyrd_app;
+GRANT SELECT, INSERT, DELETE
+    ON vala.forge_snapshot_expiration_claims TO wyrd_platform_admin;

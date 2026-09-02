@@ -21,18 +21,26 @@ use std::str::FromStr;
 
 use chrono::Utc;
 use sqlx::types::Uuid;
+use sqlx::{PgConnection, Postgres, Transaction};
+use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::{
-    AuditDetail, AuditEvent, ForgeIcebergRewritePhase, ForgeManifestRewritePhase,
+    AuditDetail, AuditEvent, AuditResult, ForgeIcebergRewritePhase, ForgeManifestRewritePhase,
     ForgeOrphanGcPhase, ForgeScribePromotionPhase, ForgeSnapshotExpirePhase,
     audit_detail_canonical_json,
 };
 
-use crate::queries::audit_outbox::append_audit;
+use crate::queries::audit_outbox::{OperatorAudit, append_audit};
+use crate::queries::oracle_reader_authority::{BIFROST_CATALOG_NAME, OracleTableProtections};
 use crate::row_types::forge_operations::{
+    ForgeClaimTable, ForgeExpirationAuthority, ForgeExpirationPreparation,
+    ForgeExpirationResetOutcome, ForgeExpirationResetRequest, ForgeExpirationSettlementRequest,
     ForgeOperationFamily, ForgeOperationPhase, ForgeOperationStateRow, ForgeOperationStateSqlRow,
-    ForgeOperationTransition, OpenForgeOperationPage,
+    ForgeOperationTransition, ForgeSnapshotExpirationClaim, ForgeSnapshotExpirationClaimSqlRow,
+    OpenForgeOperationPage,
 };
-use crate::{SqlError, TenantConn};
+use crate::row_types::forge_tasks::{ForgeTaskEvidence, evidence_to_value};
+use crate::row_types::oracle_reader_authority::TableAuthorityIdentity;
+use crate::{OperatorPool, SqlError, TenantConn};
 
 /// Scoped Forge operation state handle for one `(resource, family)`.
 ///
@@ -116,15 +124,18 @@ impl<'resource> ForgeOperations<'resource> {
             ForgeOperationPhase::Prepared,
         )?;
 
-        self.acquire_operation_lock(conn, operation_id).await?;
+        self.acquire_operation_lock(conn.transaction(), operation_id)
+            .await?;
 
-        let row = self.select_state_for_update(conn, operation_id).await?;
+        let row = self
+            .select_state_for_update(conn.transaction(), operation_id)
+            .await?;
 
         match row {
             None => {
                 // Absent row: first Prepared for this operation.
                 let seq = append_audit(conn, event).await?;
-                self.insert_prepared(conn, operation_id, &detail, seq)
+                self.insert_prepared(conn.transaction(), operation_id, &detail, seq)
                     .await?;
                 Ok(ForgeOperationTransition::Applied { audit_seq: seq })
             }
@@ -243,10 +254,11 @@ impl<'resource> ForgeOperations<'resource> {
         let (detail, _, operation_id) =
             validate_event(event, self.resource, self.family, terminal_phase)?;
 
-        self.acquire_operation_lock(conn, operation_id).await?;
+        self.acquire_operation_lock(conn.transaction(), operation_id)
+            .await?;
 
         let sql_row = self
-            .select_state_for_update(conn, operation_id)
+            .select_state_for_update(conn.transaction(), operation_id)
             .await?
             .ok_or_else(|| SqlError::Conflict {
                 detail: "cannot append terminal for absent operation state".to_owned(),
@@ -286,8 +298,14 @@ impl<'resource> ForgeOperations<'resource> {
         }
 
         let seq = append_audit(conn, event).await?;
-        self.apply_terminal(conn, operation_id, &detail, terminal_phase, seq)
-            .await?;
+        self.apply_terminal(
+            conn.transaction(),
+            operation_id,
+            &detail,
+            terminal_phase,
+            seq,
+        )
+        .await?;
 
         Ok(ForgeOperationTransition::Applied { audit_seq: seq })
     }
@@ -437,7 +455,7 @@ impl<'resource> ForgeOperations<'resource> {
     /// transaction commits, rolls back, or is dropped.
     async fn acquire_operation_lock(
         &self,
-        conn: &mut TenantConn<'_>,
+        conn: &mut PgConnection,
         operation_id: Uuid,
     ) -> Result<(), SqlError> {
         sqlx::query(
@@ -458,7 +476,7 @@ impl<'resource> ForgeOperations<'resource> {
         .bind(self.resource)
         .bind(self.family.as_str())
         .bind(operation_id)
-        .execute(&mut **conn.transaction())
+        .execute(&mut *conn)
         .await
         .map_err(SqlError::from)?;
         Ok(())
@@ -477,7 +495,7 @@ impl<'resource> ForgeOperations<'resource> {
     /// any advisory lock until its own commit, rollback, or drop boundary.
     async fn select_state_for_update(
         &self,
-        conn: &mut TenantConn<'_>,
+        conn: &mut PgConnection,
         operation_id: Uuid,
     ) -> Result<Option<ForgeOperationStateSqlRow>, SqlError> {
         // We still use FOR UPDATE inside the existing advisory lock to guard
@@ -497,7 +515,7 @@ impl<'resource> ForgeOperations<'resource> {
         .bind(self.resource)
         .bind(self.family.as_str())
         .bind(operation_id)
-        .fetch_optional(&mut **conn.transaction())
+        .fetch_optional(&mut *conn)
         .await
         .map_err(SqlError::from)?;
 
@@ -520,7 +538,7 @@ impl<'resource> ForgeOperations<'resource> {
     /// rolls back both, and an identical retry can safely start again.
     async fn insert_prepared(
         &self,
-        conn: &mut TenantConn<'_>,
+        conn: &mut PgConnection,
         operation_id: Uuid,
         detail: &AuditDetail,
         prepared_seq: i64,
@@ -550,7 +568,7 @@ impl<'resource> ForgeOperations<'resource> {
         .bind(detail_json.to_string())
         .bind(prepared_seq)
         .bind(now)
-        .execute(&mut **conn.transaction())
+        .execute(&mut *conn)
         .await
         .map_err(SqlError::from)?;
 
@@ -574,7 +592,7 @@ impl<'resource> ForgeOperations<'resource> {
     /// back audit and terminal projection state together.
     async fn apply_terminal(
         &self,
-        conn: &mut TenantConn<'_>,
+        conn: &mut PgConnection,
         operation_id: Uuid,
         detail: &AuditDetail,
         terminal_phase: ForgeOperationPhase,
@@ -606,7 +624,7 @@ impl<'resource> ForgeOperations<'resource> {
         .bind(detail_json.to_string())
         .bind(terminal_seq)
         .bind(now)
-        .execute(&mut **conn.transaction())
+        .execute(&mut *conn)
         .await
         .map_err(SqlError::from)?;
 
@@ -795,4 +813,806 @@ fn extract_detail_phase(detail: &AuditDetail) -> Result<ForgeOperationPhase, Sql
     };
 
     Ok(phase)
+}
+
+// ---------------------------------------------------------------------------
+// Serialized snapshot expiration: claim lifecycle on the operator pool
+// ---------------------------------------------------------------------------
+
+/// Lock order every snapshot-expiration transaction below takes, in order:
+///
+/// 1. the current live Forge table lease row (fence assertion),
+/// 2. the exact task/attempt/current-owner row,
+/// 3. the table maintenance-authority row that serializes reader widening
+///    against destructive maintenance for one tenant-qualified table,
+/// 4. the operation state row (advisory lock, then `FOR UPDATE`),
+/// 5. the claim rows for that operation, and
+/// 6. the tenant audit chain head.
+///
+/// Every method here runs on the operator pool because the claim table grants
+/// `INSERT`/`DELETE` to `wyrd_platform_admin` only; the transaction binds
+/// `wyrd.current_tenant()` first so RLS-shaped predicates and the tenant audit
+/// chain behave exactly as they do on a tenant connection.
+impl ForgeOperations<'_> {
+    /// Atomically prepares one snapshot-expiration selection.
+    ///
+    /// In one operator transaction this asserts the caller's live lease fence,
+    /// pins the exact running attempt, takes the table's maintenance-authority
+    /// row, refuses when any surviving reader protection frontier still covers
+    /// a selected snapshot, appends the Prepared operation audit, inserts the
+    /// Prepared operation state, claims every selected snapshot, and moves the
+    /// task to Prepared with its evidence and audit.
+    ///
+    /// Replaying the identical preparation writes nothing and returns the
+    /// existing prepared sequence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqlError::Conflict`] when the family is not
+    /// `snapshot_expire`, either audit event does not name this operation or
+    /// task, the lease fence is lost, the task/attempt/owner/table identity
+    /// does not match, a surviving protection frontier covers a selected
+    /// snapshot, or the operation is already resolved.
+    /// Returns [`SqlError::InvariantViolation`] when stored state is malformed.
+    /// Returns [`SqlError::Query`] for statement failures.
+    ///
+    /// # Cancellation
+    ///
+    /// Cancellation drops the uncommitted operator transaction, releasing every
+    /// lock and discarding audit, state, claims, and the task transition
+    /// together. An identical retry is safe.
+    pub async fn prepare_snapshot_expiration(
+        &self,
+        operator: &OperatorPool,
+        tenant: DataTenantId,
+        request: &ForgeExpirationPreparation<'_>,
+    ) -> Result<ForgeOperationTransition, SqlError> {
+        self.require_snapshot_expire()?;
+        let (detail, _, operation_id) = validate_event(
+            request.operation_event,
+            self.resource,
+            self.family,
+            ForgeOperationPhase::Prepared,
+        )?;
+        let selected = selected_snapshot_ids(&detail)?;
+        validate_task_event(request.task_event, request.authority.task_id, "prepared")?;
+        request.evidence.validate(false)?;
+
+        let mut tx = operator.pool().begin().await.map_err(SqlError::from)?;
+        bind_tenant(&mut tx, tenant).await?;
+        assert_lease_fence(&mut tx, request.authority).await?;
+        lock_expiration_task(
+            &mut tx,
+            request.authority,
+            request.table,
+            &["running", "prepared"],
+        )
+        .await?;
+        let identity = lock_table_authority(&mut tx, tenant, request.table).await?;
+        refuse_protected_snapshots(&mut tx, &identity, &selected).await?;
+
+        self.acquire_operation_lock(&mut tx, operation_id).await?;
+        if let Some(sql_row) = self.select_state_for_update(&mut tx, operation_id).await? {
+            let state_row: ForgeOperationStateRow = sql_row.try_into()?;
+            if audit_detail_canonical_json(&detail)
+                != audit_detail_canonical_json(&state_row.prepared_detail)
+                || state_row.phase != ForgeOperationPhase::Prepared
+            {
+                return Err(SqlError::Conflict {
+                    detail: "snapshot expiration preparation does not replay the stored operation"
+                        .to_owned(),
+                });
+            }
+            return Ok(ForgeOperationTransition::AlreadyApplied {
+                audit_seq: state_row.prepared_audit_seq,
+            });
+        }
+
+        let seq = OperatorAudit::new(tenant, &mut tx)
+            .append(request.operation_event)
+            .await?;
+        self.insert_prepared(&mut tx, operation_id, &detail, seq)
+            .await?;
+        self.insert_claims(&mut tx, operation_id, &selected, request)
+            .await?;
+        let changed = sqlx::query(
+            "UPDATE vala.forge_tasks SET state='prepared',evidence=$4::jsonb,updated_at=statement_timestamp() WHERE task_id=$1 AND data_tenant_id=wyrd.current_tenant() AND state='running' AND attempt_id=$2 AND claimed_by=$3",
+        )
+        .bind(request.authority.task_id)
+        .bind(request.authority.attempt_id)
+        .bind(request.authority.worker_id)
+        .bind(evidence_to_value(request.evidence).to_string())
+        .execute(&mut *tx)
+        .await
+        .map_err(SqlError::from)?
+        .rows_affected();
+        exact_one(changed, "snapshot expiration prepared task transition")?;
+        OperatorAudit::new(tenant, &mut tx)
+            .append(request.task_event)
+            .await?;
+
+        tx.commit().await.map_err(SqlError::from)?;
+        Ok(ForgeOperationTransition::Applied { audit_seq: seq })
+    }
+
+    /// Atomically settles one prepared snapshot expiration as Committed or
+    /// Recovered.
+    ///
+    /// The settling worker need not be the preparing one: the claim rows carry
+    /// the preparation identity as historical evidence, while the fence, task
+    /// attempt, and owner are revalidated against the caller's *current*
+    /// authority. Settlement appends the terminal operation audit, resolves the
+    /// operation state, deletes every claim, moves the task to Succeeded with
+    /// its final cleanup evidence, appends the task audit, and advances the
+    /// table's planning demand — all in one transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqlError::Conflict`] when the family, audit identity, lease
+    /// fence, task identity, table identity, operation phase, or the claim set
+    /// does not exactly match the prepared selection.
+    /// Returns [`SqlError::InvariantViolation`] when stored state is malformed.
+    /// Returns [`SqlError::Query`] for statement failures.
+    ///
+    /// # Cancellation
+    ///
+    /// Cancellation drops the uncommitted transaction; the operation stays
+    /// Prepared with its claims intact and the identical settlement can retry.
+    pub async fn settle_snapshot_expiration(
+        &self,
+        operator: &OperatorPool,
+        tenant: DataTenantId,
+        request: &ForgeExpirationSettlementRequest<'_>,
+    ) -> Result<ForgeOperationTransition, SqlError> {
+        self.require_snapshot_expire()?;
+        let terminal_phase = request.settlement.phase();
+        let (detail, _, operation_id) = validate_event(
+            request.operation_event,
+            self.resource,
+            self.family,
+            terminal_phase,
+        )?;
+        validate_task_event(request.task_event, request.authority.task_id, "succeeded")?;
+        request.evidence.validate(false)?;
+
+        let mut tx = operator.pool().begin().await.map_err(SqlError::from)?;
+        bind_tenant(&mut tx, tenant).await?;
+        assert_lease_fence(&mut tx, request.authority).await?;
+        let task_state = task_state(&mut tx, request.authority.task_id).await?;
+        lock_table_authority(&mut tx, tenant, request.table).await?;
+        self.acquire_operation_lock(&mut tx, operation_id).await?;
+        let state_row: ForgeOperationStateRow = self
+            .select_state_for_update(&mut tx, operation_id)
+            .await?
+            .ok_or_else(|| SqlError::Conflict {
+                detail: "cannot settle an absent snapshot expiration".to_owned(),
+            })?
+            .try_into()?;
+        let claimed = self.claimed_snapshots(&mut tx, operation_id).await?;
+
+        if state_row.phase == terminal_phase
+            && audit_detail_canonical_json(&detail)
+                == audit_detail_canonical_json(&state_row.current_detail)
+            && task_state == "succeeded"
+            && claimed.is_empty()
+        {
+            let terminal_seq =
+                state_row
+                    .terminal_audit_seq
+                    .ok_or_else(|| SqlError::InvariantViolation {
+                        detail: "settled snapshot expiration is missing its terminal audit seq"
+                            .to_owned(),
+                    })?;
+            return Ok(ForgeOperationTransition::AlreadyApplied {
+                audit_seq: terminal_seq,
+            });
+        }
+
+        self.require_resolvable_prepared(&state_row, &claimed, task_state.as_str())?;
+        lock_expiration_task(&mut tx, request.authority, request.table, &["prepared"]).await?;
+
+        let seq = OperatorAudit::new(tenant, &mut tx)
+            .append(request.operation_event)
+            .await?;
+        self.apply_terminal(&mut tx, operation_id, &detail, terminal_phase, seq)
+            .await?;
+        self.delete_claims(&mut tx, operation_id).await?;
+        self.resolve_task(
+            &mut tx,
+            tenant,
+            "succeeded",
+            request.authority,
+            request.task_event,
+            Some(request.evidence),
+        )
+        .await?;
+        advance_planning_demand(&mut tx, tenant, request.table).await?;
+
+        tx.commit().await.map_err(SqlError::from)?;
+        Ok(ForgeOperationTransition::Applied { audit_seq: seq })
+    }
+
+    /// Atomically releases one prepared snapshot expiration that never
+    /// committed.
+    ///
+    /// The reset is internal: `ForgeSnapshotExpirePhase` has no public Reset
+    /// variant, so the state row keeps its immutable Prepared detail as
+    /// `current_detail` and records the release only through the `reset` column
+    /// phase and its terminal audit sequence. The same transaction deletes every
+    /// claim, cancels the task, and advances the table's planning demand so the
+    /// selection can be recomputed against fresh reader protection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqlError::Conflict`] when the family, audit identity, lease
+    /// fence, task identity, table identity, operation phase, or claim set does
+    /// not exactly match the prepared selection.
+    /// Returns [`SqlError::InvariantViolation`] when stored state is malformed.
+    /// Returns [`SqlError::Query`] for statement failures.
+    ///
+    /// # Cancellation
+    ///
+    /// Cancellation drops the uncommitted transaction; the operation stays
+    /// Prepared with its claims intact and the identical reset can retry.
+    pub async fn reset_snapshot_expiration(
+        &self,
+        operator: &OperatorPool,
+        tenant: DataTenantId,
+        request: &ForgeExpirationResetRequest<'_>,
+    ) -> Result<ForgeExpirationResetOutcome, SqlError> {
+        self.require_snapshot_expire()?;
+        let operation_id = validate_reset_event(request.operation_event, self.resource)?;
+        validate_task_event(request.task_event, request.authority.task_id, "cancelled")?;
+
+        let mut tx = operator.pool().begin().await.map_err(SqlError::from)?;
+        bind_tenant(&mut tx, tenant).await?;
+        assert_lease_fence(&mut tx, request.authority).await?;
+        let task_state = task_state(&mut tx, request.authority.task_id).await?;
+        lock_table_authority(&mut tx, tenant, request.table).await?;
+        self.acquire_operation_lock(&mut tx, operation_id).await?;
+        let state_row: ForgeOperationStateRow = self
+            .select_state_for_update(&mut tx, operation_id)
+            .await?
+            .ok_or_else(|| SqlError::Conflict {
+                detail: "cannot reset an absent snapshot expiration".to_owned(),
+            })?
+            .try_into()?;
+        let claimed = self.claimed_snapshots(&mut tx, operation_id).await?;
+
+        if state_row.phase == ForgeOperationPhase::Reset
+            && state_row.terminal_audit_seq.is_some()
+            && task_state == "cancelled"
+            && claimed.is_empty()
+        {
+            return Ok(ForgeExpirationResetOutcome::AlreadyApplied);
+        }
+
+        self.require_resolvable_prepared(&state_row, &claimed, task_state.as_str())?;
+        if audit_detail_canonical_json(request.operation_event.detail.as_ref().ok_or_else(
+            || SqlError::Conflict {
+                detail: "reset event must carry the prepared detail".to_owned(),
+            },
+        )?) != audit_detail_canonical_json(&state_row.prepared_detail)
+        {
+            return Err(SqlError::Conflict {
+                detail: "snapshot expiration reset must carry the immutable prepared detail"
+                    .to_owned(),
+            });
+        }
+        lock_expiration_task(&mut tx, request.authority, request.table, &["prepared"]).await?;
+
+        let seq = OperatorAudit::new(tenant, &mut tx)
+            .append(request.operation_event)
+            .await?;
+        self.apply_terminal(
+            &mut tx,
+            operation_id,
+            &state_row.prepared_detail,
+            ForgeOperationPhase::Reset,
+            seq,
+        )
+        .await?;
+        self.delete_claims(&mut tx, operation_id).await?;
+        self.resolve_task(
+            &mut tx,
+            tenant,
+            "cancelled",
+            request.authority,
+            request.task_event,
+            None,
+        )
+        .await?;
+        let demand_generation = advance_planning_demand(&mut tx, tenant, request.table).await?;
+
+        tx.commit().await.map_err(SqlError::from)?;
+        Ok(ForgeExpirationResetOutcome::Applied { demand_generation })
+    }
+
+    /// Returns this task's unresolved claims, letting reconciliation find the
+    /// exact operation a crashed attempt prepared without re-deriving it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqlError::Query`] when the task-bound index read fails.
+    ///
+    /// # Cancellation
+    ///
+    /// The read writes nothing; cancellation leaves no durable trace.
+    pub async fn claims_for_task(
+        &self,
+        operator: &OperatorPool,
+        tenant: DataTenantId,
+        task_id: Uuid,
+    ) -> Result<Vec<ForgeSnapshotExpirationClaim>, SqlError> {
+        self.require_snapshot_expire()?;
+        let mut tx = operator.pool().begin().await.map_err(SqlError::from)?;
+        bind_tenant(&mut tx, tenant).await?;
+        let rows: Vec<ForgeSnapshotExpirationClaimSqlRow> = sqlx::query_as(
+            "SELECT resource,operation_id,snapshot_id,task_id,attempt_id,worker_id,lease_key,lease_fencing_token,table_uid,catalog_name,namespace_name,table_name,table_uuid FROM vala.forge_snapshot_expiration_claims WHERE data_tenant_id=wyrd.current_tenant() AND task_id=$1 ORDER BY operation_id,snapshot_id",
+        )
+        .bind(task_id)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(SqlError::from)?;
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Private snapshot-expiration helpers
+// ---------------------------------------------------------------------------
+
+impl ForgeOperations<'_> {
+    /// Rejects a snapshot-expiration workflow invoked on another family.
+    ///
+    /// # Errors
+    /// Returns [`SqlError::Conflict`] unless the handle owns `snapshot_expire`.
+    fn require_snapshot_expire(&self) -> Result<(), SqlError> {
+        if self.family == ForgeOperationFamily::SnapshotExpire {
+            Ok(())
+        } else {
+            Err(SqlError::Conflict {
+                detail: format!(
+                    "snapshot expiration claims are not valid for family {}",
+                    self.family.as_str()
+                ),
+            })
+        }
+    }
+
+    /// Requires an unresolved Prepared operation whose claims exactly reproduce
+    /// its prepared selection while the task is still Prepared.
+    ///
+    /// # Errors
+    /// Returns [`SqlError::Conflict`] when the operation is already resolved,
+    /// the task is not Prepared, or the claim set is not the exact selection.
+    fn require_resolvable_prepared(
+        &self,
+        state_row: &ForgeOperationStateRow,
+        claimed: &[i64],
+        task_state: &str,
+    ) -> Result<(), SqlError> {
+        if state_row.phase != ForgeOperationPhase::Prepared || task_state != "prepared" {
+            return Err(SqlError::Conflict {
+                detail: format!(
+                    "snapshot expiration is not resolvable: operation {:?}, task {task_state}",
+                    state_row.phase
+                ),
+            });
+        }
+        if claimed != selected_snapshot_ids(&state_row.prepared_detail)?.as_slice() {
+            return Err(SqlError::Conflict {
+                detail: "snapshot expiration claims do not reproduce the prepared selection"
+                    .to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Inserts one immutable claim row per selected snapshot.
+    ///
+    /// # Errors
+    /// Returns [`SqlError::Query`] when the insert violates a constraint,
+    /// including the primary key another table-local winner already holds.
+    async fn insert_claims(
+        &self,
+        conn: &mut PgConnection,
+        operation_id: Uuid,
+        selected: &[i64],
+        request: &ForgeExpirationPreparation<'_>,
+    ) -> Result<(), SqlError> {
+        sqlx::query(
+            "INSERT INTO vala.forge_snapshot_expiration_claims (data_tenant_id,resource,family,operation_id,snapshot_id,task_id,attempt_id,worker_id,lease_key,lease_fencing_token,table_uid,catalog_name,namespace_name,table_name,table_uuid) SELECT wyrd.current_tenant(),$1,$2,$3,s,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14 FROM unnest($4::bigint[]) AS s",
+        )
+        .bind(self.resource)
+        .bind(self.family.as_str())
+        .bind(operation_id)
+        .bind(selected)
+        .bind(request.authority.task_id)
+        .bind(request.authority.attempt_id)
+        .bind(request.authority.worker_id)
+        .bind(&request.authority.lease_key)
+        .bind(request.authority.lease_fencing_token)
+        .bind(request.table.table_uid.as_slice())
+        .bind(&request.table.catalog_name)
+        .bind(&request.table.namespace_name)
+        .bind(&request.table.table_name)
+        .bind(request.table.table_uuid)
+        .execute(&mut *conn)
+        .await
+        .map_err(SqlError::from)?;
+        Ok(())
+    }
+
+    /// Reads one operation's unresolved claim snapshots in ascending order.
+    ///
+    /// The read takes no row lock: claims are immutable, and the operation's
+    /// advisory lock plus its `FOR UPDATE` state row already serialize the only
+    /// transaction that may insert or delete them.
+    ///
+    /// # Errors
+    /// Returns [`SqlError::Query`] when the read fails.
+    async fn claimed_snapshots(
+        &self,
+        conn: &mut PgConnection,
+        operation_id: Uuid,
+    ) -> Result<Vec<i64>, SqlError> {
+        sqlx::query_scalar(
+            "SELECT snapshot_id FROM vala.forge_snapshot_expiration_claims WHERE data_tenant_id=wyrd.current_tenant() AND resource=$1 AND family=$2 AND operation_id=$3 ORDER BY snapshot_id",
+        )
+        .bind(self.resource)
+        .bind(self.family.as_str())
+        .bind(operation_id)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(SqlError::from)
+    }
+
+    /// Deletes every claim an operation still holds as part of resolving it.
+    ///
+    /// # Errors
+    /// Returns [`SqlError::Query`] when the delete fails.
+    async fn delete_claims(
+        &self,
+        conn: &mut PgConnection,
+        operation_id: Uuid,
+    ) -> Result<(), SqlError> {
+        sqlx::query(
+            "DELETE FROM vala.forge_snapshot_expiration_claims WHERE data_tenant_id=wyrd.current_tenant() AND resource=$1 AND family=$2 AND operation_id=$3",
+        )
+        .bind(self.resource)
+        .bind(self.family.as_str())
+        .bind(operation_id)
+        .execute(&mut *conn)
+        .await
+        .map_err(SqlError::from)?;
+        Ok(())
+    }
+
+    /// Applies the exact Prepared-to-terminal task transition and its audit.
+    ///
+    /// # Errors
+    /// Returns [`SqlError::Conflict`] unless exactly one row matched the exact
+    /// task, attempt, and current owner, and [`SqlError`] for audit failures.
+    async fn resolve_task(
+        &self,
+        conn: &mut Transaction<'_, Postgres>,
+        tenant: DataTenantId,
+        next: &str,
+        authority: &ForgeExpirationAuthority,
+        event: &AuditEvent,
+        evidence: Option<&ForgeTaskEvidence>,
+    ) -> Result<(), SqlError> {
+        let encoded = evidence.map(|value| evidence_to_value(value).to_string());
+        let changed = sqlx::query(
+            "UPDATE vala.forge_tasks SET state=$4,evidence=COALESCE($5::jsonb,evidence),attempt_id=NULL,claimed_by=NULL,claim_expires_at=NULL,watermark_snapshot_id=NULL,watermark_timestamp_ms=NULL,updated_at=statement_timestamp() WHERE task_id=$1 AND data_tenant_id=wyrd.current_tenant() AND state='prepared' AND attempt_id=$2 AND claimed_by=$3",
+        )
+        .bind(authority.task_id)
+        .bind(authority.attempt_id)
+        .bind(authority.worker_id)
+        .bind(next)
+        .bind(&encoded)
+        .execute(&mut **conn)
+        .await
+        .map_err(SqlError::from)?
+        .rows_affected();
+        exact_one(changed, "snapshot expiration task resolution")?;
+        OperatorAudit::new(tenant, conn).append(event).await?;
+        Ok(())
+    }
+}
+
+/// Binds `wyrd.current_tenant()` on an operator transaction so tenant-shaped
+/// predicates, the audit chain, and RLS `WITH CHECK` clauses behave exactly as
+/// they do on a [`TenantConn`].
+///
+/// # Errors
+/// Returns [`SqlError::Query`] when the binding statement fails.
+async fn bind_tenant(
+    tx: &mut Transaction<'_, Postgres>,
+    tenant: DataTenantId,
+) -> Result<(), SqlError> {
+    sqlx::query(wyrd_sql::tenant_conn::BIND_CURRENT_TENANT_SQL)
+        .bind(tenant.to_string())
+        .execute(&mut **tx)
+        .await
+        .map_err(SqlError::from)?;
+    Ok(())
+}
+
+/// Locks the caller's maintenance lease row and proves it still owns the fence.
+///
+/// `vala.maintenance_leases` is a cross-tenant control-plane table with no RLS,
+/// and the SECURITY DEFINER assertion function is granted to `wyrd_app` only,
+/// so the operator path takes the same `FOR UPDATE` lock directly.
+///
+/// # Errors
+/// Returns [`SqlError::InvariantViolation`] when the fence is lost and
+/// [`SqlError::Query`] when the statement fails.
+async fn assert_lease_fence(
+    tx: &mut Transaction<'_, Postgres>,
+    authority: &ForgeExpirationAuthority,
+) -> Result<(), SqlError> {
+    let owned: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM vala.maintenance_leases WHERE lease_key=$1 AND owner=$2 AND fencing_token=$3 AND expires_at>clock_timestamp() FOR UPDATE)",
+    )
+    .bind(&authority.lease_key)
+    .bind(authority.worker_id)
+    .bind(authority.lease_fencing_token)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(SqlError::from)?;
+    if owned {
+        Ok(())
+    } else {
+        Err(SqlError::InvariantViolation {
+            detail: format!("maintenance lease fence lost for `{}`", authority.lease_key),
+        })
+    }
+}
+
+/// Reads one Forge task's current state under a row lock.
+///
+/// # Errors
+/// Returns [`SqlError::Conflict`] when the task does not exist for this tenant
+/// and [`SqlError::Query`] when the statement fails.
+async fn task_state(tx: &mut Transaction<'_, Postgres>, task_id: Uuid) -> Result<String, SqlError> {
+    sqlx::query_scalar(
+        "SELECT state FROM vala.forge_tasks WHERE task_id=$1 AND data_tenant_id=wyrd.current_tenant() AND strategy='snapshot_expiry' FOR UPDATE",
+    )
+    .bind(task_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(SqlError::from)?
+    .ok_or_else(|| SqlError::Conflict {
+        detail: "snapshot expiration names no such Forge task for this tenant".to_owned(),
+    })
+}
+
+/// Pins the exact snapshot-expiry task, attempt, current owner, unexpired
+/// claim, and registered table under a row lock, in one of `expected_states`.
+///
+/// # Errors
+/// Returns [`SqlError::Conflict`] when no row matches that exact identity.
+async fn lock_expiration_task(
+    tx: &mut Transaction<'_, Postgres>,
+    authority: &ForgeExpirationAuthority,
+    table: &ForgeClaimTable,
+    expected_states: &[&str],
+) -> Result<(), SqlError> {
+    let states: Vec<String> = expected_states.iter().map(|s| (*s).to_owned()).collect();
+    let matched: Option<Uuid> = sqlx::query_scalar(
+        "SELECT task_id FROM vala.forge_tasks WHERE task_id=$1 AND data_tenant_id=wyrd.current_tenant() AND strategy='snapshot_expiry' AND state=ANY($2) AND attempt_id=$3 AND claimed_by=$4 AND claim_expires_at>statement_timestamp() AND catalog_name=$5 AND namespace_name=$6 AND table_name=$7 FOR UPDATE",
+    )
+    .bind(authority.task_id)
+    .bind(&states)
+    .bind(authority.attempt_id)
+    .bind(authority.worker_id)
+    .bind(&table.catalog_name)
+    .bind(&table.namespace_name)
+    .bind(&table.table_name)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(SqlError::from)?;
+    if matched.is_some() {
+        Ok(())
+    } else {
+        Err(SqlError::Conflict {
+            detail: format!(
+                "snapshot expiration did not match an exact {expected_states:?} task, attempt, owner, and table"
+            ),
+        })
+    }
+}
+
+/// Takes the table's maintenance-authority row, the one-row-per-table boundary
+/// that gives reader widening and destructive maintenance a single winner.
+///
+/// # Errors
+/// Returns [`SqlError::Conflict`] when the table has no authority row or its
+/// registered UID disagrees with the request, and [`SqlError`] on statement or
+/// identity-validation failure.
+async fn lock_table_authority(
+    tx: &mut Transaction<'_, Postgres>,
+    tenant: DataTenantId,
+    table: &ForgeClaimTable,
+) -> Result<TableAuthorityIdentity, SqlError> {
+    let registered: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT table_uid FROM vala.bifrost_table_maintenance_authority WHERE data_tenant_id=wyrd.current_tenant() AND catalog_name=$1 AND namespace_name=$2 AND table_name=$3 FOR UPDATE",
+    )
+    .bind(&table.catalog_name)
+    .bind(&table.namespace_name)
+    .bind(&table.table_name)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(SqlError::from)?;
+    let registered = registered.ok_or_else(|| SqlError::Conflict {
+        detail: "snapshot expiration names a table with no maintenance authority row".to_owned(),
+    })?;
+    if registered.as_slice() != table.table_uid.as_slice() {
+        return Err(SqlError::Conflict {
+            detail: "snapshot expiration table UID disagrees with the registered table".to_owned(),
+        });
+    }
+    let identity = TableAuthorityIdentity {
+        tenant,
+        table_uid: table.table_uid,
+        catalog_name: table.catalog_name.clone(),
+        namespace_name: table.namespace_name.clone(),
+        table_name: table.table_name.clone(),
+    };
+    identity.validate(BIFROST_CATALOG_NAME)?;
+    Ok(identity)
+}
+
+/// Refuses the whole preparation when any surviving reader protection frontier
+/// still covers a selected snapshot.
+///
+/// The refusal is deliberate: `operation_id` is derived from the exact
+/// selection and the Prepared audit detail is immutable, so silently narrowing
+/// the selection here would invalidate the identity the caller committed to.
+/// Coverage is proven ancestry-path membership — Iceberg remains the only
+/// ancestry authority, so this never re-derives lineage in SQL.
+///
+/// # Errors
+/// Returns [`SqlError::Conflict`] when a frontier covers a selected snapshot,
+/// and [`SqlError::InvariantViolation`] when a stored protection fails
+/// validation.
+async fn refuse_protected_snapshots(
+    tx: &mut Transaction<'_, Postgres>,
+    identity: &TableAuthorityIdentity,
+    selected: &[i64],
+) -> Result<(), SqlError> {
+    let records = OracleTableProtections::for_connection(tx)
+        .list_table_protection(identity)
+        .await?;
+    for record in &records {
+        if let Some(covered) = selected
+            .iter()
+            .copied()
+            .find(|snapshot| record.frontier.covers(*snapshot))
+        {
+            return Err(SqlError::Conflict {
+                detail: format!(
+                    "snapshot {covered} is still covered by a surviving reader protection frontier"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Advances the table's periodic planning demand so a resolved expiration is
+/// never durable without a request to replan against the new metadata.
+///
+/// # Errors
+/// Returns [`SqlError::Query`] when the upsert fails.
+async fn advance_planning_demand(
+    tx: &mut Transaction<'_, Postgres>,
+    tenant: DataTenantId,
+    table: &ForgeClaimTable,
+) -> Result<i64, SqlError> {
+    sqlx::query_scalar::<_, i64>(
+        "INSERT INTO vala.forge_planning_demands (data_tenant_id,catalog_name,namespace_name,table_name,last_source) VALUES ($1,$2,$3,$4,'periodic') ON CONFLICT (data_tenant_id,catalog_name,namespace_name,table_name) DO UPDATE SET last_requested_at=statement_timestamp(),last_source='periodic',generation=vala.forge_planning_demands.generation+1,acknowledged_snapshot_id=NULL,acknowledged_commit_count=NULL RETURNING generation",
+    )
+    .bind(tenant.as_uuid())
+    .bind(&table.catalog_name)
+    .bind(&table.namespace_name)
+    .bind(&table.table_name)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(SqlError::from)
+}
+
+/// Returns the exact ascending snapshot selection carried by a snapshot-expiry
+/// detail.
+///
+/// # Errors
+/// Returns [`SqlError::Conflict`] when the detail is another variant or the
+/// selection is empty, unsorted, or repeats a snapshot.
+fn selected_snapshot_ids(detail: &AuditDetail) -> Result<Vec<i64>, SqlError> {
+    let AuditDetail::ForgeSnapshotExpire {
+        selected_snapshot_ids,
+        ..
+    } = detail
+    else {
+        return Err(SqlError::Conflict {
+            detail: "expected a snapshot-expiry audit detail".to_owned(),
+        });
+    };
+    if selected_snapshot_ids.is_empty()
+        || selected_snapshot_ids
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+    {
+        return Err(SqlError::Conflict {
+            detail: "snapshot expiration selection must be non-empty and strictly ascending"
+                .to_owned(),
+        });
+    }
+    Ok(selected_snapshot_ids.clone())
+}
+
+/// Validates that a task lifecycle audit event names this exact task and next
+/// state, mirroring the tenant-connection task workflows.
+///
+/// # Errors
+/// Returns [`SqlError::Conflict`] for mismatched audit identity.
+fn validate_task_event(event: &AuditEvent, task_id: Uuid, next: &str) -> Result<(), SqlError> {
+    if event.resource != format!("forge-task:{task_id}")
+        || event.operation != format!("forge.task.{next}")
+    {
+        return Err(SqlError::Conflict {
+            detail: "Forge task audit event does not match task identity and transition".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Validates the internal snapshot-expiry reset event and returns its
+/// operation ID.
+///
+/// The event carries the immutable Prepared detail because the public
+/// `ForgeSnapshotExpirePhase` has no Reset variant; only the operation string
+/// and the failed result distinguish it.
+///
+/// # Errors
+/// Returns [`SqlError::Conflict`] when the operation string, result, or detail
+/// identity does not name this resource's reset.
+fn validate_reset_event(event: &AuditEvent, expected_resource: &str) -> Result<Uuid, SqlError> {
+    if event.operation != "forge.snapshot_expire.reset" || event.result != AuditResult::Failure {
+        return Err(SqlError::Conflict {
+            detail: "snapshot expiration reset requires a failed forge.snapshot_expire.reset event"
+                .to_owned(),
+        });
+    }
+    let detail = event.detail.as_ref().ok_or_else(|| SqlError::Conflict {
+        detail: "reset event must carry the prepared detail".to_owned(),
+    })?;
+    let (operation_id, group) = extract_detail_identity(detail, "forge_snapshot_expire")?;
+    if group != expected_resource {
+        return Err(SqlError::Conflict {
+            detail: format!("detail group {group} does not match resource {expected_resource}"),
+        });
+    }
+    if extract_detail_phase(detail)? != ForgeOperationPhase::Prepared {
+        return Err(SqlError::Conflict {
+            detail: "snapshot expiration reset must carry the immutable prepared detail".to_owned(),
+        });
+    }
+    Ok(operation_id)
+}
+
+/// Requires an exact single-row transition.
+///
+/// # Errors
+/// Returns [`SqlError::Conflict`] unless exactly one row changed.
+fn exact_one(changed: u64, operation: &str) -> Result<(), SqlError> {
+    if changed == 1 {
+        Ok(())
+    } else {
+        Err(SqlError::Conflict {
+            detail: format!("{operation} did not match exact state, attempt, and owner"),
+        })
+    }
 }

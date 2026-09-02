@@ -639,14 +639,29 @@ impl TryFrom<EpochDbRow> for OracleEpochRow {
 /// compare-and-set on the table-local revision. A conflict returns the complete
 /// winning record so the coordinator can adopt it when it already covers the
 /// local cut instead of recomputing blindly.
-pub struct OracleTableProtections<'conn, 'tx> {
-    /// Tenant-bound connection every statement runs inside.
-    conn: &'conn mut TenantConn<'tx>,
+pub struct OracleTableProtections<'conn> {
+    /// Already tenant-bound connection every statement runs inside.
+    conn: &'conn mut sqlx::PgConnection,
 }
 
-impl<'conn, 'tx> OracleTableProtections<'conn, 'tx> {
+impl<'conn> OracleTableProtections<'conn> {
     /// Binds the protection owner to one tenant transaction.
-    pub fn new(conn: &'conn mut TenantConn<'tx>) -> Self {
+    pub fn new(conn: &'conn mut TenantConn<'_>) -> Self {
+        Self {
+            conn: &mut **conn.transaction(),
+        }
+    }
+
+    /// Binds the protection owner to an already tenant-bound connection.
+    ///
+    /// Forge's snapshot-expiration preparation runs on the operator pool,
+    /// because claim mutation and the maintenance-lease fence are not reachable
+    /// from `wyrd_app`, yet it must read these same protection rows inside that
+    /// one transaction under the same table lock — a frontier published between
+    /// the caller's own read and the lock would otherwise be invisible to it.
+    /// The caller is responsible for having bound `wyrd.current_tenant()` on
+    /// this connection; every statement below still filters on it explicitly.
+    pub fn for_connection(conn: &'conn mut sqlx::PgConnection) -> Self {
         Self { conn }
     }
 
@@ -679,7 +694,7 @@ impl<'conn, 'tx> OracleTableProtections<'conn, 'tx> {
         .bind(identity.table_uid.as_slice())
         .bind(node_id)
         .bind(fencing_token)
-        .fetch_optional(&mut **self.conn.transaction())
+        .fetch_optional(&mut *self.conn)
         .await
         .map_err(SqlError::from)?;
         let Some(header) = header else {
@@ -735,7 +750,7 @@ impl<'conn, 'tx> OracleTableProtections<'conn, 'tx> {
         .bind(identity.table_uid.as_slice())
         .bind(node_id)
         .bind(fencing_token)
-        .fetch_all(&mut **self.conn.transaction())
+        .fetch_all(&mut *self.conn)
         .await
         .map_err(SqlError::from)?;
         let mut members = Vec::with_capacity(rows.len());
@@ -801,7 +816,7 @@ impl<'conn, 'tx> OracleTableProtections<'conn, 'tx> {
             .bind(identity.table_uid.as_slice())
             .bind(node_id)
             .bind(fencing_token)
-            .execute(&mut **self.conn.transaction())
+            .execute(&mut *self.conn)
             .await
             .map_err(SqlError::from)?;
             return Ok(ProtectionCas::Committed(Box::new(ProtectionRecord {
@@ -838,7 +853,7 @@ impl<'conn, 'tx> OracleTableProtections<'conn, 'tx> {
         .bind(next_revision)
         .bind(FRONTIER_ENCODING_VERSION)
         .bind(frontier.digest(identity).as_slice())
-        .fetch_one(&mut **self.conn.transaction())
+        .fetch_one(&mut *self.conn)
         .await
         .map_err(SqlError::from)?;
 
@@ -860,7 +875,7 @@ impl<'conn, 'tx> OracleTableProtections<'conn, 'tx> {
                 .map(|m| m.protected_snapshot_id)
                 .collect::<Vec<i64>>(),
         )
-        .execute(&mut **self.conn.transaction())
+        .execute(&mut *self.conn)
         .await
         .map_err(SqlError::from)?;
 
@@ -894,7 +909,7 @@ impl<'conn, 'tx> OracleTableProtections<'conn, 'tx> {
             .bind(&member.ancestry_path)
             .bind(ANCESTRY_DIGEST_VERSION)
             .bind(member.ancestry_digest.as_slice())
-            .execute(&mut **self.conn.transaction())
+            .execute(&mut *self.conn)
             .await
             .map_err(SqlError::from)?;
         }
@@ -937,7 +952,7 @@ impl<'conn, 'tx> OracleTableProtections<'conn, 'tx> {
         .bind(key.table_uid.as_slice())
         .bind(key.node_id)
         .bind(key.fencing_token)
-        .fetch_optional(&mut **self.conn.transaction())
+        .fetch_optional(&mut *self.conn)
         .await
         .map_err(SqlError::from)?;
         let Some((catalog_name, namespace_name, table_name, revision)) = row else {
@@ -979,7 +994,7 @@ impl<'conn, 'tx> OracleTableProtections<'conn, 'tx> {
             ",
         )
         .bind(identity.table_uid.as_slice())
-        .fetch_all(&mut **self.conn.transaction())
+        .fetch_all(&mut *self.conn)
         .await
         .map_err(SqlError::from)?;
         let mut records = Vec::with_capacity(epochs.len());

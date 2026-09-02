@@ -27,8 +27,11 @@ mod pg_tests {
 
         use vala_sql::queries::forge_operations::ForgeOperations;
         use vala_sql::row_types::forge_operations::{
-            ForgeOperationFamily, ForgeOperationTransition,
+            ForgeClaimTable, ForgeExpirationAuthority, ForgeExpirationPreparation,
+            ForgeExpirationResetOutcome, ForgeExpirationResetRequest, ForgeExpirationSettlement,
+            ForgeExpirationSettlementRequest, ForgeOperationFamily, ForgeOperationTransition,
         };
+        use vala_sql::row_types::forge_tasks::ForgeTaskEvidence;
         use vala_sql::{SqlError, TenantConn};
 
         // -----------------------------------------------------------------------
@@ -1348,6 +1351,499 @@ mod pg_tests {
                     Err(SqlError::InvariantViolation { .. })
                 ),
                 "state whose detail identity contradicts its row must fail closed"
+            );
+        }
+
+        // -------------------------------------------------------------------
+        // Serialized snapshot expiration claims
+        // -------------------------------------------------------------------
+
+        /// Fixed table identity every expiration test claims against.
+        fn claim_table(table_uuid: Uuid) -> ForgeClaimTable {
+            ForgeClaimTable {
+                table_uid: [7_u8; 16],
+                catalog_name: "wyrd-redux".to_owned(),
+                namespace_name: "vala.bifrost".to_owned(),
+                table_name: "tbl".to_owned(),
+                table_uuid,
+            }
+        }
+
+        /// Seeds the registered table, its maintenance-authority row, one live
+        /// lease, and one running snapshot-expiry task owned by `authority`.
+        ///
+        /// # Panics
+        ///
+        /// Panics when any seeding statement fails.
+        async fn seed_expiration_arrangement(
+            superuser: &PgPool,
+            tenant: DataTenantId,
+            authority: &ForgeExpirationAuthority,
+            table: &ForgeClaimTable,
+        ) {
+            sqlx::query("INSERT INTO vala.bifrost_tables (data_tenant_id,table_uid,fqn,fingerprint,physical_layout) VALUES ($1,$2,'vala.bifrost.tbl',decode(repeat('00',32),'hex'),'{}'::jsonb)")
+                .bind(tenant.as_uuid())
+                .bind(table.table_uid.as_slice())
+                .execute(superuser)
+                .await
+                .expect("seed bifrost table");
+            sqlx::query("INSERT INTO vala.bifrost_table_maintenance_authority (data_tenant_id,catalog_name,namespace_name,table_name,table_uid) VALUES ($1,$2,$3,$4,$5)")
+                .bind(tenant.as_uuid())
+                .bind(&table.catalog_name)
+                .bind(&table.namespace_name)
+                .bind(&table.table_name)
+                .bind(table.table_uid.as_slice())
+                .execute(superuser)
+                .await
+                .expect("seed maintenance authority");
+            sqlx::query("INSERT INTO vala.maintenance_leases (lease_key,owner,fencing_token,expires_at,heartbeat_at) VALUES ($1,$2,$3,now()+interval '10 minutes',now())")
+                .bind(&authority.lease_key)
+                .bind(authority.worker_id)
+                .bind(authority.lease_fencing_token)
+                .execute(superuser)
+                .await
+                .expect("seed lease");
+            sqlx::query("INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,namespace_name,table_name,strategy,lane,base_snapshot_id,plan,plan_hash,estimated_files,estimated_bytes,estimated_parallelism,estimated_memory_bytes,estimated_spill_bytes,large_task_ceiling_bytes,state,attempt_id,claimed_by,claim_expires_at,watermark_snapshot_id,watermark_timestamp_ms,ready_at) VALUES ($1,$2,$3,$4,$5,'snapshot_expiry','ordinary',77,'{}'::jsonb,decode(repeat('00',32),'hex'),1,1,1,1,1,1,'running',$6,$7,now()+interval '10 minutes',77,1,now())")
+                .bind(authority.task_id)
+                .bind(tenant.as_uuid())
+                .bind(&table.catalog_name)
+                .bind(&table.namespace_name)
+                .bind(&table.table_name)
+                .bind(authority.attempt_id)
+                .bind(authority.worker_id)
+                .execute(superuser)
+                .await
+                .expect("seed running task");
+        }
+
+        /// Builds Prepared-phase task evidence with no committed publication yet.
+        fn prepared_evidence() -> ForgeTaskEvidence {
+            ForgeTaskEvidence {
+                version: 1,
+                committed_snapshot_id: None,
+                committed_metadata_location: None,
+                committed_metadata_digest: None,
+                cleanup_candidates: Vec::new(),
+                deleted_candidate_count: 0,
+            }
+        }
+
+        /// Builds settled evidence naming the exact committed publication.
+        fn settled_evidence() -> ForgeTaskEvidence {
+            ForgeTaskEvidence {
+                version: 1,
+                committed_snapshot_id: Some(88),
+                committed_metadata_location: Some(
+                    "table/iceberg/metadata/00008-settled.json".to_owned(),
+                ),
+                committed_metadata_digest: Some("a".repeat(64)),
+                cleanup_candidates: Vec::new(),
+                deleted_candidate_count: 0,
+            }
+        }
+
+        /// Counts this operation's unresolved claim rows.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the count query fails.
+        async fn count_claims(superuser: &PgPool, operation_id: Uuid) -> i64 {
+            sqlx::query_scalar(
+                "SELECT count(*) FROM vala.forge_snapshot_expiration_claims WHERE operation_id=$1",
+            )
+            .bind(operation_id)
+            .fetch_one(superuser)
+            .await
+            .expect("claim count")
+        }
+
+        /// Reads one Forge task's current state string.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the state query fails.
+        async fn task_state_of(superuser: &PgPool, task_id: Uuid) -> String {
+            sqlx::query_scalar("SELECT state FROM vala.forge_tasks WHERE task_id=$1")
+                .bind(task_id)
+                .fetch_one(superuser)
+                .await
+                .expect("task state")
+        }
+
+        /// Proves the claim table matches its migration and that preparation,
+        /// reset, and settlement are each one atomic, replayable transaction.
+        ///
+        /// # Panics
+        ///
+        /// Panics on any schema, lifecycle, atomicity, or replay mismatch.
+        #[tokio::test]
+        async fn snapshot_expiration_claim_schema_and_atomic_lifecycle_match_migration() {
+            let TestFixtures { fixture, superuser } = setup().await;
+            let tenant = fixture.data_tenant_id();
+            let operator = fixture.operator_pool();
+
+            // --- schema is exactly what the migration declares -------------
+            let columns: Vec<(String, String, String)> = sqlx::query_as(
+                "SELECT column_name,data_type,is_nullable FROM information_schema.columns WHERE table_schema='vala' AND table_name='forge_snapshot_expiration_claims' ORDER BY ordinal_position",
+            )
+            .fetch_all(&superuser)
+            .await
+            .expect("claim columns");
+            let expected = [
+                ("data_tenant_id", "uuid", "NO"),
+                ("resource", "text", "NO"),
+                ("family", "text", "NO"),
+                ("operation_id", "uuid", "NO"),
+                ("snapshot_id", "bigint", "NO"),
+                ("task_id", "uuid", "NO"),
+                ("attempt_id", "uuid", "NO"),
+                ("worker_id", "uuid", "NO"),
+                ("lease_key", "text", "NO"),
+                ("lease_fencing_token", "bigint", "NO"),
+                ("table_uid", "bytea", "NO"),
+                ("catalog_name", "text", "NO"),
+                ("namespace_name", "text", "NO"),
+                ("table_name", "text", "NO"),
+                ("table_uuid", "uuid", "NO"),
+            ];
+            assert_eq!(columns.len(), expected.len(), "claim column count");
+            for ((name, kind, nullable), (want_name, want_kind, want_nullable)) in
+                columns.iter().zip(expected.iter())
+            {
+                assert_eq!(name, want_name, "claim column name");
+                assert_eq!(kind, want_kind, "claim column type for {name}");
+                assert_eq!(nullable, want_nullable, "claim nullability for {name}");
+            }
+
+            let indexes: Vec<(String,)> = sqlx::query_as(
+                "SELECT indexname FROM pg_indexes WHERE schemaname='vala' AND tablename='forge_snapshot_expiration_claims' ORDER BY indexname",
+            )
+            .fetch_all(&superuser)
+            .await
+            .expect("claim indexes");
+            let index_names: Vec<&str> = indexes.iter().map(|row| row.0.as_str()).collect();
+            assert!(
+                index_names.contains(&"forge_snapshot_expiration_claims_admission")
+                    && index_names.contains(&"forge_snapshot_expiration_claims_task"),
+                "admission and task-bound indexes exist: {index_names:?}"
+            );
+
+            let (rls_enabled, rls_forced): (bool, bool) = sqlx::query_as(
+                "SELECT relrowsecurity,relforcerowsecurity FROM pg_class WHERE oid='vala.forge_snapshot_expiration_claims'::regclass",
+            )
+            .fetch_one(&superuser)
+            .await
+            .expect("rls flags");
+            assert!(rls_enabled && rls_forced, "claims force row level security");
+
+            let grants: Vec<(String, String)> = sqlx::query_as(
+                "SELECT grantee,privilege_type FROM information_schema.role_table_grants WHERE table_schema='vala' AND table_name='forge_snapshot_expiration_claims' AND grantee IN ('wyrd_app','wyrd_platform_admin') ORDER BY grantee,privilege_type",
+            )
+            .fetch_all(&superuser)
+            .await
+            .expect("claim grants");
+            let granted: Vec<(&str, &str)> = grants
+                .iter()
+                .map(|row| (row.0.as_str(), row.1.as_str()))
+                .collect();
+            assert_eq!(
+                granted,
+                vec![
+                    ("wyrd_app", "SELECT"),
+                    ("wyrd_platform_admin", "DELETE"),
+                    ("wyrd_platform_admin", "INSERT"),
+                    ("wyrd_platform_admin", "SELECT"),
+                ],
+                "claims are immutable: no role holds UPDATE"
+            );
+
+            // --- preparation is one atomic transaction ---------------------
+            let authority = ForgeExpirationAuthority {
+                task_id: Uuid::now_v7(),
+                attempt_id: Uuid::now_v7(),
+                worker_id: Uuid::now_v7(),
+                lease_key: "forge:tenant_a:vala.bifrost:tbl".to_owned(),
+                lease_fencing_token: 9,
+            };
+            let table = claim_table(Uuid::now_v7());
+            seed_expiration_arrangement(&superuser, tenant, &authority, &table).await;
+
+            let operation_id = Uuid::now_v7();
+            let detail =
+                expire_detail(operation_id, ForgeSnapshotExpirePhase::Prepared, resource());
+            let prepared_event = event(
+                "forge.snapshot_expire.prepared",
+                resource(),
+                Some(detail.clone()),
+            );
+            let task_prepared = event(
+                "forge.task.prepared",
+                &format!("forge-task:{}", authority.task_id),
+                None,
+            );
+            let evidence = prepared_evidence();
+            let ops = ForgeOperations::new(resource(), ForgeOperationFamily::SnapshotExpire)
+                .expect("valid Forge resource");
+            let preparation = ForgeExpirationPreparation {
+                authority: &authority,
+                table: &table,
+                evidence: &evidence,
+                operation_event: &prepared_event,
+                task_event: &task_prepared,
+            };
+
+            let applied = ops
+                .prepare_snapshot_expiration(operator, tenant, &preparation)
+                .await
+                .expect("preparation applies");
+            assert!(
+                matches!(applied, ForgeOperationTransition::Applied { .. }),
+                "first preparation applies: {applied:?}"
+            );
+            assert_eq!(
+                count_claims(&superuser, operation_id).await,
+                2,
+                "one claim per selected snapshot"
+            );
+            assert_eq!(
+                task_state_of(&superuser, authority.task_id).await,
+                "prepared",
+                "task advanced with the claims"
+            );
+            assert_eq!(
+                count_audit(&superuser, tenant).await,
+                2,
+                "preparation audits the operation and the task exactly once each"
+            );
+
+            // Replaying the identical preparation writes nothing.
+            let replay = ops
+                .prepare_snapshot_expiration(operator, tenant, &preparation)
+                .await
+                .expect("preparation replay");
+            assert!(
+                matches!(replay, ForgeOperationTransition::AlreadyApplied { .. }),
+                "identical preparation replay is idempotent: {replay:?}"
+            );
+            assert_eq!(
+                count_audit(&superuser, tenant).await,
+                2,
+                "replay appends no audit"
+            );
+
+            // A second table-local operation cannot claim the same snapshot.
+            let rival_id = Uuid::now_v7();
+            let rival_detail =
+                expire_detail(rival_id, ForgeSnapshotExpirePhase::Prepared, resource());
+            let rival_event = event(
+                "forge.snapshot_expire.prepared",
+                resource(),
+                Some(rival_detail),
+            );
+            let rival = ForgeExpirationPreparation {
+                authority: &authority,
+                table: &table,
+                evidence: &evidence,
+                operation_event: &rival_event,
+                task_event: &task_prepared,
+            };
+            assert!(
+                ops.prepare_snapshot_expiration(operator, tenant, &rival)
+                    .await
+                    .is_err(),
+                "a rival operation cannot claim an already-claimed snapshot"
+            );
+            assert_eq!(
+                count_claims(&superuser, rival_id).await,
+                0,
+                "the refused rival left no claim behind"
+            );
+
+            // --- reset releases the selection without a public phase -------
+            let reset_event = event(
+                "forge.snapshot_expire.reset",
+                resource(),
+                Some(detail.clone()),
+            );
+            let reset_event = AuditEvent {
+                result: AuditResult::Failure,
+                ..reset_event
+            };
+            let task_cancelled = event(
+                "forge.task.cancelled",
+                &format!("forge-task:{}", authority.task_id),
+                None,
+            );
+            let reset_request = ForgeExpirationResetRequest {
+                authority: &authority,
+                table: &table,
+                operation_event: &reset_event,
+                task_event: &task_cancelled,
+            };
+            let reset = ops
+                .reset_snapshot_expiration(operator, tenant, &reset_request)
+                .await
+                .expect("reset applies");
+            let ForgeExpirationResetOutcome::Applied { demand_generation } = reset else {
+                panic!("first reset applies: {reset:?}");
+            };
+            assert!(demand_generation > 0, "reset advanced planning demand");
+            assert_eq!(
+                count_claims(&superuser, operation_id).await,
+                0,
+                "reset released every claim"
+            );
+            assert_eq!(
+                task_state_of(&superuser, authority.task_id).await,
+                "cancelled",
+                "reset cancelled the task in the same transaction"
+            );
+            let phase: String = sqlx::query_scalar(
+                "SELECT phase FROM vala.forge_operation_state WHERE operation_id=$1",
+            )
+            .bind(operation_id)
+            .fetch_one(&superuser)
+            .await
+            .expect("reset phase");
+            assert_eq!(
+                phase, "reset",
+                "reset is durable in the column, not the detail"
+            );
+
+            let reset_replay = ops
+                .reset_snapshot_expiration(operator, tenant, &reset_request)
+                .await
+                .expect("reset replay");
+            assert_eq!(
+                reset_replay,
+                ForgeExpirationResetOutcome::AlreadyApplied,
+                "identical reset replay writes nothing"
+            );
+            assert_eq!(
+                count_audit(&superuser, tenant).await,
+                4,
+                "reset audits the operation and the task exactly once each"
+            );
+
+            // --- settlement resolves a fresh preparation -------------------
+            let settle_authority = ForgeExpirationAuthority {
+                task_id: Uuid::now_v7(),
+                attempt_id: Uuid::now_v7(),
+                worker_id: Uuid::now_v7(),
+                lease_key: "forge:tenant_a:vala.bifrost:tbl:settle".to_owned(),
+                lease_fencing_token: 10,
+            };
+            sqlx::query("INSERT INTO vala.maintenance_leases (lease_key,owner,fencing_token,expires_at,heartbeat_at) VALUES ($1,$2,$3,now()+interval '10 minutes',now())")
+                .bind(&settle_authority.lease_key)
+                .bind(settle_authority.worker_id)
+                .bind(settle_authority.lease_fencing_token)
+                .execute(&superuser)
+                .await
+                .expect("seed settle lease");
+            sqlx::query("INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,namespace_name,table_name,strategy,lane,base_snapshot_id,plan,plan_hash,estimated_files,estimated_bytes,estimated_parallelism,estimated_memory_bytes,estimated_spill_bytes,large_task_ceiling_bytes,state,attempt_id,claimed_by,claim_expires_at,watermark_snapshot_id,watermark_timestamp_ms,ready_at) VALUES ($1,$2,$3,$4,$5,'snapshot_expiry','ordinary',78,'{}'::jsonb,decode(repeat('11',32),'hex'),1,1,1,1,1,1,'running',$6,$7,now()+interval '10 minutes',78,1,now())")
+                .bind(settle_authority.task_id)
+                .bind(tenant.as_uuid())
+                .bind(&table.catalog_name)
+                .bind(&table.namespace_name)
+                .bind(&table.table_name)
+                .bind(settle_authority.attempt_id)
+                .bind(settle_authority.worker_id)
+                .execute(&superuser)
+                .await
+                .expect("seed settle task");
+
+            let settle_operation = Uuid::now_v7();
+            let settle_detail = expire_detail(
+                settle_operation,
+                ForgeSnapshotExpirePhase::Prepared,
+                resource(),
+            );
+            let settle_prepared = event(
+                "forge.snapshot_expire.prepared",
+                resource(),
+                Some(settle_detail),
+            );
+            let settle_task_prepared = event(
+                "forge.task.prepared",
+                &format!("forge-task:{}", settle_authority.task_id),
+                None,
+            );
+            ops.prepare_snapshot_expiration(
+                operator,
+                tenant,
+                &ForgeExpirationPreparation {
+                    authority: &settle_authority,
+                    table: &table,
+                    evidence: &evidence,
+                    operation_event: &settle_prepared,
+                    task_event: &settle_task_prepared,
+                },
+            )
+            .await
+            .expect("settle preparation applies");
+
+            let committed_detail = expire_detail(
+                settle_operation,
+                ForgeSnapshotExpirePhase::Committed,
+                resource(),
+            );
+            let committed_event = event(
+                "forge.snapshot_expire.committed",
+                resource(),
+                Some(committed_detail),
+            );
+            let task_succeeded = event(
+                "forge.task.succeeded",
+                &format!("forge-task:{}", settle_authority.task_id),
+                None,
+            );
+            let final_evidence = settled_evidence();
+            let settlement = ForgeExpirationSettlementRequest {
+                authority: &settle_authority,
+                table: &table,
+                settlement: ForgeExpirationSettlement::Committed,
+                evidence: &final_evidence,
+                operation_event: &committed_event,
+                task_event: &task_succeeded,
+            };
+            let settled = ops
+                .settle_snapshot_expiration(operator, tenant, &settlement)
+                .await
+                .expect("settlement applies");
+            assert!(
+                matches!(settled, ForgeOperationTransition::Applied { .. }),
+                "first settlement applies: {settled:?}"
+            );
+            assert_eq!(
+                count_claims(&superuser, settle_operation).await,
+                0,
+                "settlement released every claim"
+            );
+            assert_eq!(
+                task_state_of(&superuser, settle_authority.task_id).await,
+                "succeeded",
+                "settlement succeeded the task in the same transaction"
+            );
+
+            let settle_replay = ops
+                .settle_snapshot_expiration(operator, tenant, &settlement)
+                .await
+                .expect("settlement replay");
+            assert!(
+                matches!(
+                    settle_replay,
+                    ForgeOperationTransition::AlreadyApplied { .. }
+                ),
+                "identical settlement replay writes nothing: {settle_replay:?}"
+            );
+
+            // Reconciliation locates the operation through task-bound claims.
+            assert!(
+                ops.claims_for_task(operator, tenant, settle_authority.task_id)
+                    .await
+                    .expect("task claim lookup")
+                    .is_empty(),
+                "a resolved task holds no unresolved claims"
             );
         }
     }

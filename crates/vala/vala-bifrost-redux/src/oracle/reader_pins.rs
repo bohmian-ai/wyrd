@@ -1855,3 +1855,61 @@ mod tests {
         );
     }
 }
+
+/// Builds the signed reader cut one follower must protect before it reads.
+///
+/// A follower protects exactly the snapshot it was assigned, so the cut's
+/// retained head and protected endpoint are the same snapshot and its ancestry
+/// path is that single entry. Signing the digest here binds the cut to the
+/// table's durable UID and tenant, so a peer cannot present the same snapshot
+/// identifier under a different table's identity.
+///
+/// Returns `None` when the pinned table has no Iceberg snapshot: there is
+/// nothing snapshot-dependent for the follower to protect.
+///
+/// # Errors
+///
+/// Returns [`BifrostError::Internal`] when the pinned snapshot is absent from
+/// its own metadata, which would leave the cut undatable.
+pub fn follower_reader_cut(
+    pinned: &PinnedSealedTable,
+    planned_under_fence: u64,
+) -> Result<Option<wyrd_spec::vala::api::FollowerReaderCut>, BifrostError> {
+    let Some(snapshot_id) = pinned.snapshot_id else {
+        return Ok(None);
+    };
+    let metadata = pinned.iceberg_table.metadata();
+    let snapshot = metadata.snapshot_by_id(snapshot_id).ok_or_else(|| {
+        internal(format!(
+            "Oracle pinned snapshot {snapshot_id} is absent from its own table metadata"
+        ))
+    })?;
+    let identity = TableAuthorityIdentity {
+        tenant: pinned.binding.tenant,
+        table_uid: *pinned.table_uid.as_bytes(),
+        catalog_name: BIFROST_CATALOG_NAME.to_owned(),
+        namespace_name: pinned.binding.table_ref.namespace.as_str().to_owned(),
+        table_name: pinned.binding.table_ref.name.clone(),
+    };
+    let timestamp_ms = snapshot.timestamp_ms();
+    let member = ProtectionMember::new(&identity, vec![snapshot_id], timestamp_ms, timestamp_ms)
+        .map_err(|error| internal(error.to_string()))?;
+    let mut ancestry_digest_hex = String::with_capacity(64);
+    for byte in member.ancestry_digest {
+        use std::fmt::Write as _;
+        let _ = write!(ancestry_digest_hex, "{byte:02x}");
+    }
+    Ok(Some(wyrd_spec::vala::api::FollowerReaderCut {
+        table_uid: uuid::Uuid::from_bytes(*pinned.table_uid.as_bytes()),
+        snapshot_id,
+        snapshot_timestamp_ms: timestamp_ms,
+        retained_head_snapshot_id: snapshot_id,
+        ancestry_path: vec![snapshot_id],
+        ancestry_digest_version: u32::try_from(
+            vala_sql::row_types::oracle_reader_authority::ANCESTRY_DIGEST_VERSION,
+        )
+        .unwrap_or(1),
+        ancestry_digest_hex,
+        target_epoch_fence: planned_under_fence,
+    }))
+}

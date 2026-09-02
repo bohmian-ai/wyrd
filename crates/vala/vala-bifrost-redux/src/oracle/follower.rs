@@ -1840,6 +1840,10 @@ pub(crate) mod tests {
                     schema_fingerprint: fingerprint,
                     required_columns: vec!["value".to_owned(), DATA_TENANT_ID.to_owned()],
                     predicates: Vec::new(),
+                    reader_cut: wyrd_spec::vala::api::FollowerReaderCut::no_snapshot(
+                        uuid::Uuid::nil(),
+                        1,
+                    ),
                 }],
                 plan_fingerprint: physical_plan_fingerprint(&bytes),
             },
@@ -1894,6 +1898,7 @@ pub(crate) mod tests {
             schema_fingerprint: fingerprint.clone(),
             required_columns: vec!["wyrd_event_time".to_owned(), DATA_TENANT_ID.to_owned()],
             predicates: Vec::new(),
+            reader_cut: wyrd_spec::vala::api::FollowerReaderCut::no_snapshot(uuid::Uuid::nil(), 1),
         };
         let session = SessionContext::new().state();
         resolver
@@ -2030,6 +2035,7 @@ pub(crate) mod tests {
             schema_fingerprint: "mixed".to_owned(),
             required_columns: vec![DATA_TENANT_ID.to_owned()],
             predicates: Vec::new(),
+            reader_cut: wyrd_spec::vala::api::FollowerReaderCut::no_snapshot(uuid::Uuid::nil(), 1),
         };
         let fence: wyrd_spec::vala::api::FencingToken = 1;
         assert!(
@@ -2093,6 +2099,7 @@ pub(crate) mod tests {
             schema_fingerprint: "shape".to_owned(),
             required_columns: vec!["data_tenant_id".to_owned()],
             predicates: Vec::new(),
+            reader_cut: wyrd_spec::vala::api::FollowerReaderCut::no_snapshot(uuid::Uuid::nil(), 1),
         };
 
         assert_eq!(
@@ -2395,6 +2402,10 @@ pub(crate) mod tests {
                     // schema actually carries.
                     required_columns: vec!["wyrd_event_time".to_owned()],
                     predicates: Vec::new(),
+                    reader_cut: wyrd_spec::vala::api::FollowerReaderCut::no_snapshot(
+                        uuid::Uuid::nil(),
+                        1,
+                    ),
                 },
                 &session,
             )
@@ -2527,6 +2538,7 @@ pub(crate) mod tests {
                     "STATUS_CODE_ERROR".to_owned(),
                 ),
             )],
+            reader_cut: wyrd_spec::vala::api::FollowerReaderCut::no_snapshot(uuid::Uuid::nil(), 1),
         }
     }
 

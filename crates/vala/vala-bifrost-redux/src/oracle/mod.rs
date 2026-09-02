@@ -1603,6 +1603,7 @@ impl CutAssignments {
         schema_fingerprint: &str,
         physical_schema: &Schema,
         files: Vec<PersistedFileDescriptor>,
+        reader_cut: &wyrd_spec::vala::api::FollowerReaderCut,
     ) {
         self.oracle_assignments.insert(
             scan_id.to_owned(),
@@ -1618,6 +1619,7 @@ impl CutAssignments {
                     .map(|field| field.name().clone())
                     .collect(),
                 predicates: Vec::new(),
+                reader_cut: reader_cut.clone(),
             },
         );
         self.source_groups
@@ -3520,6 +3522,17 @@ impl Oracle {
             namespace: cut.binding.logical_namespace.clone(),
             table: cut.binding.table_ref.name.clone(),
         };
+        // Signed once per cut: every scan id this table contributes names the
+        // same protected snapshot, so a follower cannot be handed two
+        // assignments that disagree about what it must protect.
+        let reader_cut =
+            reader_pins::follower_reader_cut(&cut, self.admission.local_role.fencing_token)?
+                .unwrap_or_else(|| {
+                    wyrd_spec::vala::api::FollowerReaderCut::no_snapshot(
+                        uuid::Uuid::from_bytes(*cut.table_uid.as_bytes()),
+                        self.admission.local_role.fencing_token,
+                    )
+                });
         let mut remote_sources = RemotePersistedSources::default();
         let mut common_scan_ids = Vec::new();
         if distributed {
@@ -3537,6 +3550,7 @@ impl Oracle {
                 &schema_fingerprint,
                 physical_schema.as_ref(),
                 files,
+                &reader_cut,
             );
             common_scan_ids.push(scan_id.clone());
             remote_sources.iceberg_scan_id = Some(scan_id);
@@ -3556,6 +3570,7 @@ impl Oracle {
                 &schema_fingerprint,
                 physical_schema.as_ref(),
                 files,
+                &reader_cut,
             );
             common_scan_ids.push(scan_id.clone());
             remote_sources.hot_scan_id = Some(scan_id);
@@ -3570,6 +3585,7 @@ impl Oracle {
                 &schema_fingerprint,
                 physical_schema.as_ref(),
                 Vec::new(),
+                &reader_cut,
             );
             common_scan_ids.push(live_scan_id.clone());
             remote_sources.scribe_scan_ids.push(live_scan_id);
@@ -4987,6 +5003,14 @@ fn build_scribe_follower_sources(
                         writer_epoch,
                     ),
                     binding: table.binding.clone(),
+                    // A live Scribe tail reads writer-owned memory, not a
+                    // snapshot, so this template carries the explicit
+                    // no-snapshot cut. `record_scan` replaces it with the
+                    // table's real cut for every Iceberg-backed scan id.
+                    reader_cut: wyrd_spec::vala::api::FollowerReaderCut::no_snapshot(
+                        uuid::Uuid::nil(),
+                        writer_epoch,
+                    ),
                     persisted: PersistedFileAssignment { files: Vec::new() },
                     scribe_provider_cut: Some(ScribeProviderCut {
                         writer_epoch,
@@ -5417,6 +5441,7 @@ mod tests {
             schema_fingerprint: format!("schema-{scan_id}"),
             required_columns: vec!["data_tenant_id".to_owned()],
             predicates: Vec::new(),
+            reader_cut: wyrd_spec::vala::api::FollowerReaderCut::no_snapshot(uuid::Uuid::nil(), 1),
         }
     }
 

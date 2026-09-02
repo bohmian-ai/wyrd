@@ -328,6 +328,7 @@ pub fn assignment_authority_digest_for(
                 scribe_cut: assignment.scribe_provider_cut.as_ref(),
                 required_columns: &assignment.required_columns,
                 predicates: &assignment.predicates,
+                reader_cut: &assignment.reader_cut,
             },
         )
         .collect::<Vec<_>>();

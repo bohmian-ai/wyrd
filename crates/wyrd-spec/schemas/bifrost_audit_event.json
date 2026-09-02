@@ -561,6 +561,167 @@
           }
         },
         {
+          "description": "A Forge metadata-only manifest rewrite and its Iceberg boundary.\n\nThe operation regroups manifest entries and nothing else: the data files the table logically contains are identical before and after it. Both path collections are exact and ordered, so a reader can prove which manifests were replaced by which without consulting the catalog.",
+          "type": "object",
+          "required": [
+            "base_metadata_location",
+            "group",
+            "input_manifest_paths",
+            "kind",
+            "operation_id",
+            "output_manifest_paths",
+            "phase"
+          ],
+          "properties": {
+            "base_metadata_location": {
+              "description": "Metadata location observed before the rewrite commit.",
+              "type": "string"
+            },
+            "committed_metadata_location": {
+              "description": "Metadata location returned by a proven commit, when known.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "group": {
+              "description": "Canonical tenant/table resource identity.",
+              "type": "string"
+            },
+            "input_manifest_paths": {
+              "description": "Exact ordered manifests replaced by the rewrite.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "forge_manifest_rewrite"
+              ]
+            },
+            "operation_id": {
+              "description": "Deterministic identifier shared by prepared and terminal rows.",
+              "type": "string",
+              "format": "uuid"
+            },
+            "output_manifest_paths": {
+              "description": "Exact ordered manifests written by the rewrite.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "phase": {
+              "description": "Durable phase represented by this audit row.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ForgeManifestRewritePhase"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "description": "One fenced Oracle reader epoch's durable lifecycle transition.\n\nThe epoch is a process fact rather than a tenant fact, so this event is appended under the system owner. Renewal is deliberately absent: it changes only the lease window and revision, and auditing every five seconds would bury the transitions that actually change what Forge may destroy.",
+          "type": "object",
+          "required": [
+            "fencing_token",
+            "kind",
+            "node_id",
+            "phase",
+            "state_revision"
+          ],
+          "properties": {
+            "fencing_token": {
+              "description": "Exact `cluster_nodes` Oracle fence the epoch was acquired under.",
+              "type": "integer",
+              "format": "int64"
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "oracle_reader_epoch"
+              ]
+            },
+            "node_id": {
+              "description": "Physical node holding the epoch.",
+              "type": "string",
+              "format": "uuid"
+            },
+            "phase": {
+              "description": "Durable transition this row records.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/OracleReaderEpochPhase"
+                }
+              ]
+            },
+            "state_revision": {
+              "description": "Revision the committing statement left behind.",
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        },
+        {
+          "description": "One epoch's durable reader protection change for one table.\n\nAppended in the same tenant transaction as the protection rows it describes, so a protection change and its evidence commit or roll back together. An admission already covered by the confirmed frontier emits nothing, because it changes no durable state.",
+          "type": "object",
+          "required": [
+            "fencing_token",
+            "group",
+            "kind",
+            "node_id",
+            "phase",
+            "protected_snapshot_ids",
+            "revision"
+          ],
+          "properties": {
+            "fencing_token": {
+              "description": "Exact Oracle fence of that epoch.",
+              "type": "integer",
+              "format": "int64"
+            },
+            "group": {
+              "description": "Canonical tenant/table resource identity.",
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "oracle_table_protection"
+              ]
+            },
+            "node_id": {
+              "description": "Physical node whose epoch published the protection.",
+              "type": "string",
+              "format": "uuid"
+            },
+            "phase": {
+              "description": "Durable transition this row records.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/OracleTableProtectionPhase"
+                }
+              ]
+            },
+            "protected_snapshot_ids": {
+              "description": "Oldest protected snapshot of every retained chain, sorted ascending.",
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "format": "int64"
+              }
+            },
+            "revision": {
+              "description": "Table-local revision this transition committed.",
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        },
+        {
           "description": "A Forge orphan-GC operation and its bounded object batch.",
           "type": "object",
           "required": [
@@ -1498,6 +1659,39 @@
         }
       ]
     },
+    "ForgeManifestRewritePhase": {
+      "description": "Durable phase recorded for a Forge metadata-only manifest rewrite.\n\nThe rewrite writes new manifests and then swaps them in with one catalog commit, so it has the same recoverable external boundary as data rewrite: a prepared operation whose commit outcome is unknown is settled by reconciliation into exactly one of `Recovered` or `Reset`.",
+      "oneOf": [
+        {
+          "description": "The exact input and output manifests were fixed before the commit.",
+          "type": "string",
+          "enum": [
+            "prepared"
+          ]
+        },
+        {
+          "description": "The catalog commit completed and returned a metadata location.",
+          "type": "string",
+          "enum": [
+            "committed"
+          ]
+        },
+        {
+          "description": "Reconciliation proved a previously uncertain commit completed.",
+          "type": "string",
+          "enum": [
+            "recovered"
+          ]
+        },
+        {
+          "description": "Reconciliation proved the prepared commit was not applied.",
+          "type": "string",
+          "enum": [
+            "reset"
+          ]
+        }
+      ]
+    },
     "ForgeOrphanGcPhase": {
       "description": "Durable phase recorded for a Forge orphan-GC operation.",
       "oneOf": [
@@ -1579,6 +1773,72 @@
           "type": "string",
           "enum": [
             "recovered"
+          ]
+        }
+      ]
+    },
+    "OracleReaderEpochPhase": {
+      "description": "Durable transition recorded for one Oracle reader epoch.\n\n`Retired` is the deletion of the epoch row after its last protection was released, which is what keeps a safely retired epoch from remaining a permanent maintenance root.",
+      "oneOf": [
+        {
+          "description": "The lease was inserted under the node's exact current Oracle fence.",
+          "type": "string",
+          "enum": [
+            "acquired"
+          ]
+        },
+        {
+          "description": "Every dependency was established and the epoch may admit reads.",
+          "type": "string",
+          "enum": [
+            "activated"
+          ]
+        },
+        {
+          "description": "Admission closed and descendants are being joined.",
+          "type": "string",
+          "enum": [
+            "draining"
+          ]
+        },
+        {
+          "description": "The epoch can never renew or admit again.",
+          "type": "string",
+          "enum": [
+            "invalidated"
+          ]
+        },
+        {
+          "description": "The invalidated epoch released every table and its row was deleted.",
+          "type": "string",
+          "enum": [
+            "retired"
+          ]
+        }
+      ]
+    },
+    "OracleTableProtectionPhase": {
+      "description": "Durable transition recorded for one epoch's per-table reader protection.",
+      "oneOf": [
+        {
+          "description": "First protection for the table, or a conservative widening of it.",
+          "type": "string",
+          "enum": [
+            "expanded"
+          ]
+        },
+        {
+          "description": "A narrowing that still protects every remaining active cut.",
+          "type": "string",
+          "enum": [
+            "narrowed"
+          ]
+        },
+        {
+          "description": "The last active cut ended and the protection header was removed.",
+          "type": "string",
+          "enum": [
+            "released"
           ]
         }
       ]

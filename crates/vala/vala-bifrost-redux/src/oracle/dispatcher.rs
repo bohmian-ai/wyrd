@@ -3343,6 +3343,7 @@ mod tests {
                 wyrd_spec::vala::managed_columns::DATA_TENANT_ID.to_owned(),
             ],
             predicates: Vec::new(),
+            reader_cut: wyrd_spec::vala::api::FollowerReaderCut::no_snapshot(uuid::Uuid::nil(), 1),
         }];
         let claims = PeerTicketClaims {
             protocol_version: PEER_PROTOCOL_VERSION,
@@ -3444,6 +3445,10 @@ mod tests {
                     wyrd_spec::vala::managed_columns::DATA_TENANT_ID.to_owned(),
                 ],
                 predicates: Vec::new(),
+                reader_cut: wyrd_spec::vala::api::FollowerReaderCut::no_snapshot(
+                    uuid::Uuid::nil(),
+                    1,
+                ),
             }],
             binding,
             target_role: ClusterRole::Oracle,
@@ -4260,6 +4265,7 @@ mod tests {
                 wyrd_spec::vala::managed_columns::DATA_TENANT_ID.to_owned(),
             ],
             predicates: Vec::new(),
+            reader_cut: wyrd_spec::vala::api::FollowerReaderCut::no_snapshot(uuid::Uuid::nil(), 1),
         };
         let digest_of = |cut: ScribeProviderCut| {
             crate::oracle::peer::assignment_authority_digest_for(&[cut_assignment(cut)])

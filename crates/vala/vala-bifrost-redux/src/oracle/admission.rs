@@ -235,8 +235,28 @@ struct LocalPermit {
     spill: u64,
     /// Complete resource envelope released before queued work is reconsidered.
     resources: Mutex<Option<crate::resources::OracleQueryResources>>,
+    /// Read-only projection of the envelope, retained after it moves away.
+    shape: Option<RetainedQuerySessionShape>,
     /// Exactly-once release latch.
     released: AtomicBool,
+}
+
+/// The parts of an admitted envelope a query still needs after it moves.
+///
+/// An Analytical lease transfers this query's [`OracleQueryResources`] into the
+/// graph that owns it, because exactly one owner may return the envelope to the
+/// governor. Dispatch, session construction, and tail drain still have to name
+/// the same memory pool and the same admitted shape afterwards, so the permit
+/// keeps this borrow-equivalent copy. Holding the pool handle charges nothing:
+/// it is the same tracked pool the envelope owns, not a second reservation.
+#[derive(Clone)]
+struct RetainedQuerySessionShape {
+    /// The tracked pool every operator of this query allocates from.
+    pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
+    /// The memory ceiling admission granted this query.
+    granted_memory_bytes: usize,
+    /// Adaptive partition count derived from that grant.
+    target_partitions: usize,
 }
 
 impl LocalPermit {
@@ -750,6 +770,14 @@ impl OracleAdmission {
             tenant: grant.tenant,
             memory: grant.memory,
             spill: grant.spill,
+            shape: grant
+                .resources
+                .as_ref()
+                .map(|resources| RetainedQuerySessionShape {
+                    pool: resources.memory_pool(),
+                    granted_memory_bytes: resources.granted_memory_bytes,
+                    target_partitions: resources.target_partitions,
+                }),
             resources: Mutex::new(grant.resources.take()),
             released: AtomicBool::new(false),
         };
@@ -1131,9 +1159,15 @@ impl AdmittedQueryGuard {
     /// Taking rather than borrowing is deliberate: settlement consumes the two
     /// guards, and removing them here means a later drop of this admission
     /// cannot settle or release the same attempt a second time.
+    ///
+    /// This query's physical projections are released first because they are
+    /// children of the very envelope the graph is about to return. Settling
+    /// with them still live makes the graph refuse to release, which strands
+    /// the graph on this node instead of returning its capacity.
     pub(super) fn take_analytical(
         &mut self,
     ) -> Option<super::analytical::AnalyticalAttemptOwnership> {
+        self.physical_projections.clear();
         self.analytical.take()
     }
 
@@ -1267,13 +1301,10 @@ impl AdmittedQueryGuard {
     pub(super) fn memory_pool(
         &self,
     ) -> Option<Arc<dyn datafusion::execution::memory_pool::MemoryPool>> {
-        self.local_permit.as_ref().and_then(|permit| {
-            permit.resources.lock().ok().and_then(|resources| {
-                resources
-                    .as_ref()
-                    .map(crate::resources::OracleQueryResources::memory_pool)
-            })
-        })
+        self.local_permit
+            .as_ref()
+            .and_then(|permit| permit.shape.as_ref())
+            .map(|shape| Arc::clone(&shape.pool))
     }
 
     /// Returns the memory ceiling admission granted this query.
@@ -1286,13 +1317,11 @@ impl AdmittedQueryGuard {
     pub(super) fn granted_memory_bytes(&self) -> usize {
         self.local_permit
             .as_ref()
-            .and_then(|permit| permit.resources.lock().ok())
-            .and_then(|resources| {
-                resources
-                    .as_ref()
-                    .map(|resources| resources.granted_memory_bytes)
-            })
-            .unwrap_or(crate::resources::ORACLE_PARTITION_WORKING_MEMORY_BYTES)
+            .and_then(|permit| permit.shape.as_ref())
+            .map_or(
+                crate::resources::ORACLE_PARTITION_WORKING_MEMORY_BYTES,
+                |shape| shape.granted_memory_bytes,
+            )
     }
 
     /// Returns adaptive target partitions calculated with the admitted grant.
@@ -1300,13 +1329,8 @@ impl AdmittedQueryGuard {
     pub(super) fn target_partitions(&self) -> usize {
         self.local_permit
             .as_ref()
-            .and_then(|permit| permit.resources.lock().ok())
-            .and_then(|resources| {
-                resources
-                    .as_ref()
-                    .map(|resources| resources.target_partitions)
-            })
-            .unwrap_or(1)
+            .and_then(|permit| permit.shape.as_ref())
+            .map_or(1, |shape| shape.target_partitions)
     }
 
     /// Attaches exact query-keyed ownership after live-tail drain completes.
@@ -1400,6 +1424,7 @@ pub(super) fn admitted_guard_for_test()
                 memory: 1024,
                 spill: 0,
                 resources: Mutex::new(None),
+                shape: None,
                 released: AtomicBool::new(false),
             }),
             delegated_grant: None,

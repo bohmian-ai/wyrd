@@ -2792,7 +2792,7 @@ impl Oracle {
         ),
         BifrostError,
     > {
-        let admitted = self
+        let mut admitted = self
             .admit_sql_query(
                 context,
                 planned.query_class,
@@ -2803,7 +2803,13 @@ impl Oracle {
             .await?;
         phases.admitted();
         let work_units = Self::scannable_work_units(&planned.cuts);
-        let (session, mut admitted) = match analytical {
+        // Projected before the lease, never after: an Analytical lease moves
+        // this query's envelope out of the guard and into the graph that owns
+        // it, and every physical projection is an exact child split of that
+        // same envelope. Deriving them afterwards would ask the guard for
+        // resources it no longer holds.
+        admitted.retain_physical_projections(&planned.cuts)?;
+        let (session, admitted) = match analytical {
             Some(attempt) => self.lease_analytical_session(
                 deadline,
                 admitted,
@@ -2814,7 +2820,6 @@ impl Oracle {
             )?,
             None => self.lease_session(deadline, admitted, work_units, "lease rejection")?,
         };
-        admitted.retain_physical_projections(&planned.cuts)?;
         let running_query =
             self.register_running_query(context, planned.query_class, &admitted, participant_cut)?;
         Ok((session, admitted, running_query))
@@ -3758,9 +3763,7 @@ impl Oracle {
             // so the leader plans and executes the statement whole. Every leaf
             // already carries its signed assignment, and the stage ticket's
             // digest over the serialized plan is what binds it.
-            let (schema, stream, stats) = self
-                .execute_session(&session, input.sql, input.logical_bytes_selected)
-                .await?;
+            let (schema, stream, stats) = self.execute_analytical_session(&session, &input).await?;
             return Ok((
                 schema,
                 stream,
@@ -4403,14 +4406,73 @@ impl Oracle {
         logical_bytes_selected: u64,
     ) -> Result<(SchemaRef, SendableRecordBatchStream, OracleQueryScanStats), OracleExecutionError>
     {
+        let physical = Self::plan_physical(session, sql).await?;
+        Self::stream_physical(session, physical, logical_bytes_selected)
+    }
+
+    /// Executes one Analytical statement, reserving participants iff it distributes.
+    ///
+    /// The Analytical path hands the whole statement to the upstream
+    /// distributed planner, so there is no split for this node to inspect: the
+    /// built physical plan is the first place a follower subtree becomes
+    /// visible, and executing it is what dials the first destination. Reserving
+    /// between those two steps is therefore both the earliest point a
+    /// participant may be charged and the last point before one is addressed. A
+    /// plan that upstream kept whole on the leader issues no reserve at all.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same planning and streaming failures as
+    /// [`Self::execute_session`], plus the stable admission failure when a
+    /// participant declines to hold this graph's envelope.
+    async fn execute_analytical_session(
+        &self,
+        session: &SessionContext,
+        input: &SqlCutInput<'_>,
+    ) -> Result<(SchemaRef, SendableRecordBatchStream, OracleQueryScanStats), OracleExecutionError>
+    {
+        let physical = Self::plan_physical(session, input.sql).await?;
+        if exec::is_distributed_plan(physical.as_ref())
+            && let Some(ownership) = input.admitted.analytical.as_ref()
+        {
+            ownership.publish_participants().await?;
+        }
+        Self::stream_physical(session, physical, input.logical_bytes_selected)
+    }
+
+    /// Lowers one validated statement to its optimized physical plan.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable execution failure when the statement cannot be planned
+    /// or optimized against the session's registered providers.
+    async fn plan_physical(
+        session: &SessionContext,
+        sql: &str,
+    ) -> Result<Arc<dyn ExecutionPlan>, OracleExecutionError> {
         let frame = session
             .sql(sql)
             .await
             .map_err(|error| map_datafusion_error(&error))?;
-        let physical = frame
+        frame
             .create_physical_plan()
             .await
-            .map_err(|error| map_datafusion_error(&error))?;
+            .map_err(|error| map_datafusion_error(&error))
+            .map_err(OracleExecutionError::from)
+    }
+
+    /// Opens one already-planned physical tree as a metered result stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable execution failure when `DataFusion` cannot start the
+    /// plan's stream.
+    fn stream_physical(
+        session: &SessionContext,
+        physical: Arc<dyn ExecutionPlan>,
+        logical_bytes_selected: u64,
+    ) -> Result<(SchemaRef, SendableRecordBatchStream, OracleQueryScanStats), OracleExecutionError>
+    {
         let mut scan_stats =
             OracleQueryScanStats::from_plan(physical.as_ref(), logical_bytes_selected);
         let schema = physical.schema();

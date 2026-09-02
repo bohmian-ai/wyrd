@@ -2671,11 +2671,20 @@ impl AnalyticalGraphLifecycle {
             releases: Vec::with_capacity(self.remote.len()),
         };
         for (url, candidate) in &self.remote {
-            let Ok(pending) = transports
+            let pending = match transports
                 .reserve_graph(candidate, self.request.clone())
                 .await
-            else {
-                return Err(reserved);
+            {
+                Ok(pending) => pending,
+                Err(error) => {
+                    tracing::warn!(
+                        node_id = ?candidate.node_id,
+                        url = %url,
+                        error = %error,
+                        "Oracle analytical participant refused a graph reservation"
+                    );
+                    return Err(reserved);
+                }
             };
             reserved.releases.push(AnalyticalRetainedRelease {
                 candidate: candidate.clone(),
@@ -2697,8 +2706,15 @@ impl AnalyticalGraphLifecycle {
                 },
             );
         }
-        let Ok(cut) = AnalyticalParticipantCut::freeze(destinations) else {
-            return Err(reserved);
+        let cut = match AnalyticalParticipantCut::freeze(destinations) {
+            Ok(cut) => cut,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "Oracle analytical leader could not freeze its participant cut"
+                );
+                return Err(reserved);
+            }
         };
         let _ = self.participants.set(Arc::new(cut));
         Ok(reserved)

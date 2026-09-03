@@ -1,6 +1,5 @@
 //! Authenticated public Bifrost query gRPC adapter.
 
-use std::collections::HashMap;
 use std::pin::Pin;
 
 use futures_util::Stream;
@@ -8,7 +7,6 @@ use vala_bifrost_redux::oracle::OracleQueryStream;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
 use wyrd_tonic::tonic::{Request, Response, Status};
-use wyrd_tonic::tonic_types::{ErrorDetails, StatusExt as _};
 use wyrd_tonic::wyrd::v1::bifrost_query_service_server::{
     BifrostQueryService, BifrostQueryServiceServer,
 };
@@ -251,21 +249,11 @@ pub(crate) fn query_stream_response(result: OracleQueryStream) -> Response<Query
 
 /// Converts a public Wyrd error to its closest tonic status class.
 pub(crate) fn query_status(error: WyrdError) -> Status {
-    let status_code = error.status();
-    let code = match status_code {
-        400 | 422 => wyrd_tonic::tonic::Code::InvalidArgument,
-        401 => wyrd_tonic::tonic::Code::Unauthenticated,
-        403 => wyrd_tonic::tonic::Code::PermissionDenied,
-        404 => wyrd_tonic::tonic::Code::NotFound,
-        409 => wyrd_tonic::tonic::Code::Aborted,
-        429 => wyrd_tonic::tonic::Code::ResourceExhausted,
-        503 => wyrd_tonic::tonic::Code::Unavailable,
-        504 => wyrd_tonic::tonic::Code::DeadlineExceeded,
-        _ => wyrd_tonic::tonic::Code::Internal,
-    };
-    let details = ErrorDetails::with_error_info(error.code(), "wyrd.dev", HashMap::new());
-    let mut status = Status::with_error_details(code, error.to_string(), details);
-    if matches!(status_code, 429 | 503) {
+    // Retryability is read before the error moves: only the transient capacity
+    // and readiness classes this surface already retried keep the hint.
+    let retryable = matches!(error.status(), 429 | 503);
+    let mut status = wyrd_tonic::error::wyrd_error_to_status(error, None);
+    if retryable {
         status.metadata_mut().insert(
             "retry-after-ms",
             "1000".parse().expect("static metadata is valid"),
@@ -276,6 +264,10 @@ pub(crate) fn query_status(error: WyrdError) -> Status {
 
 #[cfg(test)]
 mod tests {
+    use super::{
+        BifrostQueryGrpc, BifrostQueryService, insert_request_id, proto, query_status,
+        query_stream_response,
+    };
     use futures_util::StreamExt;
     use http_body_util::BodyExt;
     use vala_bifrost_redux::oracle::OracleQueryStream;
@@ -287,12 +279,6 @@ mod tests {
     };
     use wyrd_tonic::frame_codec::FrameDecoder;
     use wyrd_tonic::tonic::Code;
-    use wyrd_tonic::tonic_types::StatusExt as _;
-
-    use super::{
-        BifrostQueryGrpc, BifrostQueryService, insert_request_id, proto, query_status,
-        query_stream_response,
-    };
 
     /// Public gRPC lifecycle conversion preserves tenant opacity and idempotent cancellation.
     #[test]
@@ -467,18 +453,31 @@ mod tests {
         }
     }
 
-    /// ErrorInfo retains stable capacity and poison codes without message parsing.
+    /// The canonical Wyrd problem envelope carries every public query error.
+    ///
+    /// Stable capacity and poison codes are read from the same `wyrd-error-bin`
+    /// problem document every other Wyrd gRPC surface publishes, so a client
+    /// needs one decoder rather than a query-only ErrorInfo shape.
     #[test]
-    fn grpc_error_info_preserves_capacity_and_poison_codes() {
+    fn grpc_query_errors_carry_the_canonical_problem_envelope() {
         for error in [
             BifrostError::QueryAdmissionRejected,
             BifrostError::QueryMemoryRequestTooLarge,
             BifrostError::QueryExecutionFailed,
         ] {
-            let expected = error.code().to_owned();
-            let status = query_status(error.into());
-            let info = status.get_details_error_info().expect("query ErrorInfo");
-            assert_eq!(info.reason, expected);
+            let expected: wyrd_spec::error::WyrdError = error.into();
+            let status = query_status(expected.clone());
+            let bytes = status
+                .metadata()
+                .get_bin(wyrd_tonic::error::WYRD_ERROR_HEADER)
+                .expect("query problem envelope")
+                .to_bytes()
+                .expect("decodable problem envelope");
+            let body: serde_json::Value =
+                serde_json::from_slice(&bytes).expect("problem json document");
+            assert_eq!(body["code"], expected.code());
+            assert_eq!(body["status"], expected.status());
+            assert_eq!(body["title"], expected.title());
         }
     }
 

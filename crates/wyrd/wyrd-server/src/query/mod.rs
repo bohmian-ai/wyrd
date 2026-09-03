@@ -9,4 +9,5 @@
 
 pub mod floor;
 pub mod routes;
+pub mod scheduled;
 pub mod service;

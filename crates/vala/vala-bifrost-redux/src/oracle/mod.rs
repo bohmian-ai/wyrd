@@ -3175,25 +3175,21 @@ impl Oracle {
             }
         };
         record_degraded_live_tail(&execution.degraded_sources, drained.degraded);
-        // Read before the cut is consumed: the gate is fixed by the path this
+        // Built before the cut is consumed: the gate is fixed by the path this
         // attempt already selected, never by what settlement later reports.
-        let selected_path = execution.execution_path;
-        settle_attempt_output(
-            AttemptOutput::new(execution, admitted, running_query),
-            AttemptSettlement {
-                deadline,
-                deadline_ms: participant_cut.deadline().timestamp_millis().max(0),
+        let settlement = AttemptSettlement {
+            deadline,
+            deadline_ms: participant_cut.deadline().timestamp_millis().max(0),
+            retry_ordinal,
+            stale_replacement: StaleReplacementGate::before_output(
                 retry_ordinal,
-                stale_replacement: StaleReplacementGate::before_output(
-                    retry_ordinal,
-                    selected_path,
-                ),
-                visibility: request.visibility,
-                freshness: request.freshness,
-            },
-            query_telemetry,
-        )
-        .await
+                execution.execution_path,
+            ),
+            visibility: request.visibility,
+            freshness: request.freshness,
+        };
+        let output = AttemptOutput::new(execution, admitted, running_query);
+        settle_attempt_output(output, settlement, query_telemetry).await
     }
 
     /// Inserts one admitted query against the ingress-captured membership cut.

@@ -1053,15 +1053,12 @@ async fn prove_selected_failure_is_terminal() -> Result<(), JourneyError> {
     cluster.nodes_mut()[paused].await_execute_paused()?;
     cluster.nodes_mut()[paused].kill()?;
 
-    match query.await? {
-        Ok(settled) => {
-            return Err(format!(
-                "a lost peer must not produce a successful {:?} result of {} rows",
-                settled.path, settled.rows
-            )
-            .into());
-        }
-        Err(_) => {}
+    if let Ok(settled) = query.await? {
+        return Err(format!(
+            "a lost peer must not produce a successful {:?} result of {} rows",
+            settled.path, settled.rows
+        )
+        .into());
     }
 
     // One activation on the survivor is the whole no-rerun claim: a local

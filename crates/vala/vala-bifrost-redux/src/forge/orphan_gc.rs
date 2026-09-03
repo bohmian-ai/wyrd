@@ -8,6 +8,7 @@ use futures_util::StreamExt;
 use iceberg::spec::{DataContentType, ManifestContentType, TableMetadata};
 use opendal::raw::Timestamp;
 use opendal::{EntryMode, ErrorKind};
+use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 #[cfg(feature = "test-support")]
@@ -1833,7 +1834,6 @@ impl Forge {
     /// run and with the table resource otherwise, then absorbs every candidate
     /// path with the existing zero delimiter.
     fn gc_operation_id(task_id: Option<Uuid>, key: &ForgeTableKey, candidates: &[String]) -> Uuid {
-        use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         match task_id {
             Some(task_id) => hasher.update(task_id.as_bytes()),

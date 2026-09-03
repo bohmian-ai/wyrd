@@ -1748,6 +1748,8 @@ struct SqlCutInput<'a> {
     /// distribute, because the Interactive splitter has already pushed the
     /// entire query below a single remote scan.
     analytical: Option<&'a analytical::AnalyticalAttemptContext>,
+    /// The public running-query owner, moved onto the graph if Analytical wins.
+    running_query: &'a mut Option<RunningQueryTerminalOwner>,
 }
 
 /// One executed cut's output together with the path it was executed on.
@@ -3131,6 +3133,9 @@ impl Oracle {
         };
         phases.drained();
         admitted.live_reservations = std::mem::take(&mut drained.reservations);
+        // Retained here only until selection: an Analytical query moves this
+        // owner onto its graph, and what is left is what the stream still owes.
+        let mut running_query = Some(running_query);
         let execution = match self
             .execute_sql_cut(SqlCutInput {
                 context,
@@ -3147,6 +3152,7 @@ impl Oracle {
                 participant_cut,
                 work_units,
                 analytical: candidate.as_ref(),
+                running_query: &mut running_query,
             })
             .await
         {
@@ -4614,7 +4620,16 @@ impl Oracle {
             input.work_units,
             tokio::time::Instant::from_std(input.deadline),
         )?;
+        let graph = ownership.key().graph();
         input.admitted.analytical = Some(ownership);
+        // Selection moves the public entry onto the graph: from here the graph
+        // is what "running" describes, and only its joined cleanup may retire
+        // it. A refusal leaves the owner on the stream, which still fails it.
+        if let Some(owner) = input.running_query.take()
+            && let Err(returned) = handle.retain_running_query(graph, owner)
+        {
+            *input.running_query = Some(*returned);
+        }
         // Published only after activation and immediately before dispatch, so
         // no follower is charged for a graph that never opened.
         if let Some(ownership) = input.admitted.analytical.as_ref() {
@@ -5193,7 +5208,7 @@ struct AttemptOutput {
     /// Admitted query owner released on every failure path.
     admitted: AdmittedQueryGuard,
     /// Running-query terminal owner transferred into the returned stream.
-    running_query: RunningQueryTerminalOwner,
+    running_query: Option<RunningQueryTerminalOwner>,
     /// Execution path this attempt irreversibly selected before it opened.
     execution_path: QueryExecutionPath,
 }
@@ -5208,7 +5223,7 @@ impl AttemptOutput {
     fn new(
         execution: CutExecution,
         admitted: AdmittedQueryGuard,
-        running_query: RunningQueryTerminalOwner,
+        running_query: Option<RunningQueryTerminalOwner>,
     ) -> Self {
         let CutExecution {
             schema,
@@ -5359,7 +5374,7 @@ async fn settle_attempt_output(
         // Gate attaches its own lifecycle to the returned stream through
         // `with_gate_lifecycle`; nothing on the attempt path owns one.
         gate_lifecycle: None,
-        running_query: Some(running_query),
+        running_query,
     })))
 }
 

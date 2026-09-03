@@ -202,6 +202,14 @@ struct AnalyticalGraphState {
     /// is retained as `Draining` therefore keeps both, which is what makes a
     /// failed cleanup visible as charged capacity rather than as a free slot.
     retained_admission: Option<super::admission::AdmittedQueryGuard>,
+    /// The public running-query entry this graph retires after cleanup joins.
+    ///
+    /// Selection moves this owner off the query stream and onto the graph,
+    /// because from that point the graph — not the stream — is what the entry
+    /// describes. A cleanup that cannot be confirmed keeps it here with every
+    /// other retained owner, so the query stays visibly running for exactly as
+    /// long as this node still holds its residue.
+    running_query: Option<super::query_stream::RunningQueryTerminalOwner>,
     /// The query-owned runtime every follower of this graph installs.
     runtime: AnalyticalGraphRuntime,
     /// Every outbound exchange stream this graph opened, owned by the graph.
@@ -502,6 +510,7 @@ impl AnalyticalSupervisor {
             AnalyticalGraphEntry::Active(AnalyticalGraphState {
                 resources,
                 retained_admission: None,
+                running_query: None,
                 runtime,
                 exchanges: Arc::default(),
                 cancel: self.root_cancel.child_token(),
@@ -985,7 +994,10 @@ impl AnalyticalSupervisor {
     /// beneath either would poison the resource root — or when a lock is
     /// poisoned. Returns [`BifrostError::QueryExecutionFailed`] when the graph
     /// is not registered.
-    pub fn release_graph(&self, graph: AnalyticalGraphKey) -> Result<(), BifrostError> {
+    pub(super) fn release_graph(
+        &self,
+        graph: AnalyticalGraphKey,
+    ) -> Result<Option<super::query_stream::RunningQueryTerminalOwner>, BifrostError> {
         {
             let attempts = self.attempts.lock().map_err(|_| poisoned_supervisor())?;
             if attempts.keys().any(|live| live.graph() == graph) {
@@ -1008,15 +1020,48 @@ impl AnalyticalSupervisor {
             let mut graphs = self.graphs.lock().map_err(|_| poisoned_supervisor())?;
             graphs.remove(&graph)
         };
-        if removed.is_none() {
+        let Some(mut removed) = removed else {
             return Err(BifrostError::QueryExecutionFailed);
-        }
+        };
+        // Handed back rather than dropped here: dropping the owner would retire
+        // the entry as failed, and only the caller knows this graph's terminal.
+        let running_query = removed.state_mut().running_query.take();
         self.registry.invalidate(graph)?;
         tracing::debug!(
             public_query_id = %graph.public_query_id,
             datafusion_query_id = %graph.datafusion_query_id,
             "Oracle analytical graph released"
         );
+        Ok(running_query)
+    }
+
+    /// Moves one query's running-registry owner onto its graph.
+    ///
+    /// # Errors
+    ///
+    /// Returns `owner` unchanged when the graph lock is poisoned, when the
+    /// graph is not registered, or when it already retains an owner, so a
+    /// refused transfer can never silently retire the public entry.
+    pub(super) fn retain_running_query(
+        &self,
+        graph: AnalyticalGraphKey,
+        owner: super::query_stream::RunningQueryTerminalOwner,
+    ) -> Result<(), Box<super::query_stream::RunningQueryTerminalOwner>> {
+        let Ok(mut graphs) = self.graphs.lock() else {
+            tracing::error!(
+                public_query_id = %graph.public_query_id,
+                "Oracle analytical graph registry is poisoned"
+            );
+            return Err(Box::new(owner));
+        };
+        let Some(entry) = graphs.get_mut(&graph) else {
+            return Err(Box::new(owner));
+        };
+        let state = entry.state_mut();
+        if state.running_query.is_some() {
+            return Err(Box::new(owner));
+        }
+        state.running_query = Some(owner);
         Ok(())
     }
 
@@ -1369,7 +1414,10 @@ impl AnalyticalGraphGuard {
     /// notably a refusal while an attempt of the graph is still live.
     pub fn release(mut self) -> Result<(), BifrostError> {
         self.released = true;
-        self.supervisor.release_graph(self.graph)
+        // A guard release carries no terminal, so any owner still on the graph
+        // is dropped here and retires the entry failed, which is what an
+        // unsettled graph means.
+        self.supervisor.release_graph(self.graph).map(drop)
     }
 
     /// Gives up the guard without releasing the graph it owns.

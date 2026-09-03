@@ -2961,10 +2961,22 @@ impl AnalyticalGraphLifecycle {
         if failure.is_none() && !unresolved.is_empty() {
             failure = Some(RETAINED_RELEASE_UNACKNOWLEDGED.to_owned());
         }
-        if failure.is_none()
-            && let Err(error) = self.release_graph().await
-        {
-            failure = Some(error.to_string());
+        let mut running_query = None;
+        if failure.is_none() {
+            match self.release_graph().await {
+                Ok(owner) => running_query = owner,
+                Err(error) => failure = Some(error.to_string()),
+            }
+        }
+        // Retired only here, after every attempt, exchange, participant,
+        // runtime, scratch, and admission owner joined: the public entry
+        // describes the graph, so it outlives the stream that signalled it.
+        if let Some(mut owner) = running_query {
+            owner.finish(if outcome == AnalyticalAttemptOutcome::Success {
+                wyrd_spec::vala::api::QueryTerminalOutcome::Success
+            } else {
+                wyrd_spec::vala::api::QueryTerminalOutcome::Failed
+            });
         }
         match failure {
             None => {
@@ -3045,7 +3057,9 @@ impl AnalyticalGraphLifecycle {
     /// or a nested child of the query envelope is still live after the poll
     /// count, and the supervisor's refusal when the graph itself cannot be
     /// released.
-    async fn release_graph(&mut self) -> Result<(), BifrostError> {
+    async fn release_graph(
+        &mut self,
+    ) -> Result<Option<super::query_stream::RunningQueryTerminalOwner>, BifrostError> {
         for _ in 0..GRAPH_DRAIN_POLLS {
             let now = tokio::time::Instant::now();
             if now >= self.deadline {
@@ -7688,6 +7702,21 @@ impl AnalyticalExecutionHandle {
         .with_distributed_planner()
         .build();
         Ok(SessionContext::new_with_state(state))
+    }
+
+    /// Moves one query's running-registry owner onto its already-registered graph.
+    ///
+    /// # Errors
+    ///
+    /// Returns `owner` unchanged when the graph cannot accept it, so a refused
+    /// transfer leaves the caller holding the only thing that can retire the
+    /// public entry.
+    pub(super) fn retain_running_query(
+        &self,
+        graph: AnalyticalGraphKey,
+        owner: super::query_stream::RunningQueryTerminalOwner,
+    ) -> Result<(), Box<super::query_stream::RunningQueryTerminalOwner>> {
+        self.supervisor.retain_running_query(graph, owner)
     }
 
     /// Releases every leader and follower owner this handle still holds.

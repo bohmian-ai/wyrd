@@ -249,7 +249,7 @@ impl RunningQueryTerminalOwner {
     }
 
     /// Removes the active entry with the truthful terminal classification once.
-    fn finish(&mut self, outcome: QueryTerminalOutcome) {
+    pub(super) fn finish(&mut self, outcome: QueryTerminalOutcome) {
         if !self.settled {
             let _ = self
                 .registry

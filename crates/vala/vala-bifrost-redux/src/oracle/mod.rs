@@ -1861,6 +1861,16 @@ pub struct Oracle {
     /// Test-tier switch that routes fused reads through explicitly registered local transports.
     #[cfg(feature = "test-support")]
     prefer_local_tail_routes: std::sync::atomic::AtomicBool,
+    /// Test-tier one-shot refusal armed immediately before the distributed build.
+    ///
+    /// Selection has two distinct pre-selection refusals that both fall back to
+    /// Interactive — the closed support predicate and the pinned distributed
+    /// planner — and only an injected planner refusal can tell them apart from
+    /// outside the process. The flag is consumed by the attempt that observes
+    /// it, so a statement the predicate already refused leaves it armed, which
+    /// is itself the proof that validation ran first.
+    #[cfg(feature = "test-support")]
+    fail_next_analytical_plan: std::sync::atomic::AtomicBool,
     /// Mandatory immutable read/security audit collaborator.
     audit: Arc<dyn OracleAudit>,
     /// Optional distributed fragment owner assembled from server capabilities.
@@ -2218,6 +2228,59 @@ impl Oracle {
             .store(true, std::sync::atomic::Ordering::Release);
     }
 
+    /// Prepares the exact production participant cut and pinned plan for a journey.
+    ///
+    /// The forwarded leader entry takes a signed cut it did not build itself,
+    /// so proving that entry needs the same cut production builds. This is the
+    /// production preparation unchanged; nothing here is a substitute path.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same stable validation, readiness, catalog, classification,
+    /// and deadline errors as [`Self::query_sql`].
+    #[cfg(feature = "test-support")]
+    pub async fn prepare_query_attempt_for_test(
+        &self,
+        context: &AuthorizedQueryContext,
+        request: &BifrostQueryRequest,
+    ) -> Result<(OracleQueryAttemptCut, PlannedSqlCut), BifrostError> {
+        self.prepare_query_attempt(context, request).await
+    }
+
+    /// Arms one refusal of the pinned distributed physical build.
+    ///
+    /// The refusal is checked immediately before the second
+    /// `create_physical_plan` call and returns the same mapped planning error
+    /// that call would have returned. It neither replaces nor wraps the pinned
+    /// planner, so an armed flag that is still armed afterwards proves the
+    /// pinned planner was never reached.
+    #[cfg(feature = "test-support")]
+    pub fn fail_next_analytical_plan_for_test(&self) {
+        self.fail_next_analytical_plan
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Reports whether an armed distributed-planning refusal is still unconsumed.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn analytical_plan_failure_armed_for_test(&self) -> bool {
+        self.fail_next_analytical_plan
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Consumes an armed one-shot distributed-planning refusal, if any.
+    fn take_analytical_plan_failure(&self) -> bool {
+        #[cfg(feature = "test-support")]
+        {
+            self.fail_next_analytical_plan
+                .swap(false, std::sync::atomic::Ordering::AcqRel)
+        }
+        #[cfg(not(feature = "test-support"))]
+        {
+            false
+        }
+    }
+
     /// Returns the query-scoped discovery owner unless a test selected local routes.
     fn tail_discovery_for_query(&self) -> Option<Arc<dyn tail_fence::TailStreamDiscovery>> {
         #[cfg(feature = "test-support")]
@@ -2316,6 +2379,8 @@ impl Oracle {
             tail_discovery: config.tail_discovery,
             #[cfg(feature = "test-support")]
             prefer_local_tail_routes: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "test-support")]
+            fail_next_analytical_plan: std::sync::atomic::AtomicBool::new(false),
             audit: config.audit,
             fragment_dispatcher,
             analytical,

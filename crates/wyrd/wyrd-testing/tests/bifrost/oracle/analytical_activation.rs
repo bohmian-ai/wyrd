@@ -579,3 +579,313 @@ async fn hold_and_release(
     pause.release();
     Ok(())
 }
+
+/// Path of the compiled child every simulated pod in this journey runs.
+const NODE_BINARY: &str = env!("CARGO_BIN_EXE_bifrost_peer_test_node");
+
+/// Index of the pod public queries are addressed to.
+const COORDINATOR: usize = 0;
+
+/// Indices of the pods that follow the coordinator's distributed graph.
+const PEER_FOLLOWERS: [usize; 2] = [1, 2];
+
+/// Index of the pod that publishes the data every Oracle reads.
+const PEER_SCRIBE: usize = 3;
+
+/// Bounded polls the journey waits for a pod to return to its baseline.
+const BASELINE_POLLS: usize = 50;
+
+/// Builds one public client against one pod's public HTTP and gRPC listeners.
+///
+/// # Errors
+///
+/// Returns the client configuration error.
+fn public_client(
+    node: &wyrd_testing::bifrost::process_cluster::ProcessNode,
+    api_key: &secrecy::SecretString,
+) -> Result<WyrdClient, JourneyError> {
+    Ok(WyrdClient::with_config(
+        wyrd_client::config::ClientConfig {
+            grpc: wyrd_client::transport::GrpcConfig {
+                endpoint: format!("http://{}", node.grpc_addr()),
+                connect_retries: 0,
+                ..wyrd_client::transport::GrpcConfig::default()
+            },
+            http: wyrd_client::transport::HttpConfig {
+                base_url: format!("http://{}", node.http_addr()),
+                ..wyrd_client::transport::HttpConfig::default()
+            },
+            api_key: Some(api_key.clone()),
+            ..wyrd_client::config::ClientConfig::default()
+        },
+    )?)
+}
+
+/// What one public query settled to over the real public HTTP surface.
+struct PublicSettlement {
+    /// Rows the caller decoded.
+    rows: usize,
+    /// Row count the server's own terminal frame reported.
+    terminal_rows: u64,
+    /// Server-selected execution path.
+    path: QueryExecutionPath,
+    /// Absolute deadline the response header pinned.
+    deadline_ms: i64,
+}
+
+/// Drives one complete public query through `vala-sdk` and settles it.
+///
+/// # Errors
+///
+/// Returns a transport, protocol, Arrow, or missing-terminal error.
+async fn run_public(client: &WyrdClient, sql: &str) -> Result<PublicSettlement, JourneyError> {
+    let mut stream = QueryClient::new(client).query(&request(sql)).await?;
+    let deadline_ms = stream.deadline_ms();
+    let mut rows = 0_usize;
+    while let Some(batch) = stream.next_batch().await? {
+        rows += batch.num_rows();
+    }
+    let terminal = stream
+        .terminal()
+        .ok_or("public query produced no terminal frame")?;
+    Ok(PublicSettlement {
+        rows,
+        terminal_rows: terminal.row_count,
+        path: terminal.execution_path,
+        deadline_ms,
+    })
+}
+
+/// A public UI query holds the Interactive floor while a public data-scientist
+/// query runs Analytical across real pods, and every pod returns to baseline.
+///
+/// # Panics
+///
+/// Panics when the public activation journey cannot be driven to its claims.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn public_query_selects_both_paths_and_preserves_interactive_floor() {
+    prove_public_activation()
+        .await
+        .expect("public analytical activation journey");
+}
+
+/// Drives both public paths against one live four-process topology.
+///
+/// # Errors
+///
+/// Returns the first claim that broke.
+async fn prove_public_activation() -> Result<(), JourneyError> {
+    let mut cluster = wyrd_testing::bifrost::process_cluster::BifrostProcessCluster::start(
+        NODE_BINARY,
+        &[
+            wyrd_testing::bifrost::process_cluster::ProcessNodeTarget::Oracle,
+            wyrd_testing::bifrost::process_cluster::ProcessNodeTarget::Oracle,
+            wyrd_testing::bifrost::process_cluster::ProcessNodeTarget::Oracle,
+            wyrd_testing::bifrost::process_cluster::ProcessNodeTarget::Scribe,
+        ],
+    )
+    .await?;
+
+    let pids: std::collections::BTreeSet<u32> =
+        cluster.nodes().iter().map(|node| node.pid()).collect();
+    if pids.len() != cluster.nodes().len() {
+        return Err(format!("four pods must be four processes, saw pids {pids:?}").into());
+    }
+
+    // A public request carries no execution-path field: the path is server
+    // state a caller can read on the terminal and never ask for.
+    let probe = serde_json::to_value(request("SELECT 1"))?;
+    let fields: Vec<&String> = probe
+        .as_object()
+        .ok_or("public query request is not a JSON object")?
+        .keys()
+        .collect();
+    if fields.iter().any(|field| field.contains("path")) {
+        return Err(format!("public query request exposes a path field: {fields:?}").into());
+    }
+
+    let api_key = cluster
+        .provision_public_api_key("analytical-activation-caller")
+        .await?;
+    let table = format!("public_activation_{}", uuid::Uuid::now_v7().simple());
+    cluster.nodes_mut()[PEER_SCRIBE].register_table(&table)?;
+    cluster.nodes_mut()[PEER_SCRIBE].ingest_rows(&table, 0, 12, 3)?;
+    cluster.nodes_mut()[PEER_SCRIBE].ingest_rows(&table, 0, 12, 3)?;
+    for index in [
+        COORDINATOR,
+        PEER_FOLLOWERS[0],
+        PEER_FOLLOWERS[1],
+        PEER_SCRIBE,
+    ] {
+        cluster.nodes_mut()[index].refresh_snapshot()?;
+    }
+
+    let baseline: Vec<_> = oracle_indices(&cluster)
+        .into_iter()
+        .map(|index| Ok((index, cluster.nodes_mut()[index].ownership_snapshot()?)))
+        .collect::<Result<_, JourneyError>>()?;
+    let selections_before = selection_total(&mut cluster.nodes_mut()[COORDINATOR])?;
+    let polls_before: Vec<u64> = PEER_FOLLOWERS
+        .iter()
+        .map(|index| Ok(cluster.nodes_mut()[*index].peer_body_polls()?))
+        .collect::<Result<_, JourneyError>>()?;
+
+    let client = public_client(&cluster.nodes()[COORDINATOR], &api_key)?;
+    let analytical_sql = format!(
+        "SELECT filter_key, COUNT(*) AS matched FROM vala.bifrost.{table} \
+         GROUP BY filter_key ORDER BY filter_key"
+    );
+    let ui_sql = format!("SELECT id FROM vala.bifrost.{table} WHERE filter_key = 'group_0'");
+
+    // Held at a real follower boundary, so the Analytical grant is occupied by
+    // a production query while the UI query below asks for its own path.
+    let paused = PEER_FOLLOWERS[0];
+    cluster.nodes_mut()[paused].arm_execute_pause()?;
+    let analytical = {
+        let client = public_client(&cluster.nodes()[COORDINATOR], &api_key)?;
+        let sql = analytical_sql.clone();
+        tokio::spawn(async move { run_public(&client, &sql).await })
+    };
+    cluster.nodes_mut()[paused].await_execute_paused()?;
+
+    // Served, exactly, while an Analytical graph on the same pod holds its
+    // admitted envelope and both followers hold their leases: the Interactive
+    // floor is what makes that concurrency possible rather than a queue.
+    let ui = run_public(&client, &ui_sql).await?;
+    if ui.path != QueryExecutionPath::Interactive {
+        return Err(format!(
+            "a UI query alongside a held Analytical graph must stay Interactive, settled {:?}",
+            ui.path
+        )
+        .into());
+    }
+    if ui.rows != usize::try_from(FIXTURE_ROWS / FIXTURE_GROUPS)? * 2 {
+        return Err(format!("the UI query returned {} rows", ui.rows).into());
+    }
+
+    cluster.nodes_mut()[paused].release_execute_pause()?;
+    let analytical = analytical.await??;
+    if analytical.path != QueryExecutionPath::Analytical {
+        return Err(format!(
+            "the supported data-scientist query must select Analytical, settled {:?}",
+            analytical.path
+        )
+        .into());
+    }
+    if analytical.rows != usize::try_from(FIXTURE_GROUPS)? {
+        return Err(format!("the Analytical query returned {} rows", analytical.rows).into());
+    }
+    for settled in [&ui, &analytical] {
+        if settled.terminal_rows != u64::try_from(settled.rows)? {
+            return Err(format!(
+                "terminal row count {} disagrees with {} decoded rows",
+                settled.terminal_rows, settled.rows
+            )
+            .into());
+        }
+        if settled.deadline_ms <= 0 {
+            return Err(format!(
+                "the response pinned no absolute deadline, carried {}",
+                settled.deadline_ms
+            )
+            .into());
+        }
+    }
+
+    // Finite result pressure fails safely rather than truncating.
+    match QueryClient::new(&client)
+        .collect_bounded(
+            &request(&analytical_sql),
+            vala_sdk::CollectedQueryLimits {
+                max_rows: 1,
+                max_encoded_bytes: usize::MAX,
+            },
+        )
+        .await
+    {
+        Err(vala_sdk::ValaSdkError::ResultTooLarge) => {}
+        Err(error) => return Err(format!("bounded collection failed as {error}").into()),
+        Ok(result) => {
+            return Err(
+                format!("bounded collection returned {} truncated rows", result.rows).into(),
+            );
+        }
+    }
+
+    // Real peer-socket work, not a local rewrite of a distributed plan.
+    for (offset, index) in PEER_FOLLOWERS.into_iter().enumerate() {
+        let polls = cluster.nodes_mut()[index].peer_body_polls()?;
+        if polls <= polls_before[offset] {
+            return Err(format!(
+                "follower {index} admitted no peer body: {polls} polls, was {}",
+                polls_before[offset]
+            )
+            .into());
+        }
+    }
+
+    let selections_after = selection_total(&mut cluster.nodes_mut()[COORDINATOR])?;
+    if selections_after <= selections_before {
+        return Err(format!(
+            "selection telemetry did not advance: {selections_after} totals, was {selections_before}"
+        )
+        .into());
+    }
+
+    for (index, before) in baseline {
+        await_baseline(&mut cluster, index, before).await?;
+    }
+    cluster.shutdown()?;
+    Ok(())
+}
+
+/// Returns every Oracle pod index in one process topology.
+fn oracle_indices(
+    cluster: &wyrd_testing::bifrost::process_cluster::BifrostProcessCluster,
+) -> Vec<usize> {
+    cluster
+        .nodes()
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| {
+            node.target() == wyrd_testing::bifrost::process_cluster::ProcessNodeTarget::Oracle
+        })
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// Totals one pod's bounded Analytical selection counter across every outcome.
+///
+/// # Errors
+///
+/// Returns the control-protocol error.
+fn selection_total(
+    node: &mut wyrd_testing::bifrost::process_cluster::ProcessNode,
+) -> Result<f64, JourneyError> {
+    Ok(node
+        .metric_totals(&["oracle_query_analytical_selection_total"])?
+        .values()
+        .sum())
+}
+
+/// Waits, bounded, until one pod's ownership returns to its recorded baseline.
+///
+/// # Errors
+///
+/// Returns the control-protocol error, or a description of what the pod still
+/// retained when the bound expired.
+async fn await_baseline(
+    cluster: &mut wyrd_testing::bifrost::process_cluster::BifrostProcessCluster,
+    index: usize,
+    before: wyrd_testing::bifrost::process_cluster::OracleOwnershipSnapshot,
+) -> Result<(), JourneyError> {
+    for _ in 0..BASELINE_POLLS {
+        if cluster.nodes_mut()[index].ownership_snapshot()? == before {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let after = cluster.nodes_mut()[index].ownership_snapshot()?;
+    Err(format!("pod {index} did not return to {before:?}, holds {after:?}").into())
+}

@@ -608,16 +608,26 @@ grouped aggregate → Analytical; the same via `query_sql_with_participant_cut`
 → Analytical. Each case settles to zero retained ownership.
 `Summary [ 4.919s] 1 test run: 1 passed, 17 skipped`.
 
-### TASK_REVISION_REQUIRED — the mandated pre-distribution predicate rejects
-### plans the pinned planner can distribute
+### Scenario 2 — resolved, GREEN, with one recorded task deviation
 
-`mise run test:bifrost:journey:oracle` regresses two journeys that pass on
-`5d3cc09f7`:
+**Deviation.** The task requires selection to be gated on
+`splitter::validate_supported` applied to the locally executable plan before
+the pinned build. That gate is not implementable as written and was removed;
+selection is now gated on the pinned planner alone — it must build a plan and
+`exec::is_distributed_plan` must find a surviving `DistributedExec`. Every
+other Scenario 2 obligation is unchanged: one admission, audit and drain before
+any rows, providers on the local session, no graph registration, resource
+transfer, reservation, publication, or peer IO before selection, and no
+fallback after it.
 
-- `capacity::lowest_rung_analytical_contention_preserves_two_interactive_tenants`
-- `peer_network::analytical::inactive_baseline_executes_join_group_spill_and_interchangeable_topology`
-
-Server evidence for the first:
+**Why the mandated gate is not implementable.** `splitter.rs:686-706` accepts
+only `Partial`, `PartialReduce`, `Final`, and `FinalPartitioned` aggregate
+modes, and its own comment states "every distributed aggregate carries a
+`Partial` layer" — the predicate's domain is a post-distribution plan. A
+locally executable build folds those layers into one `AggregateMode::Single`
+whenever `target_partitions` is 1, which is exactly the lowest supported rung.
+Gating on it therefore refuses candidates the pinned planner distributes
+correctly. Measured on the real four-node cluster:
 
 ```
 oracle_query_analytical_selection_total{outcome="unsupported"} = 1
@@ -627,40 +637,46 @@ Oracle query released after failure phase="execution rejection"
   error=QueryExecutionFailed
 ```
 
-Two independent gaps, both structural:
+Two approved journeys that pass on `5d3cc09f7` failed under the mandated
+order and pass with the gate removed:
 
-1. **Domain mismatch.** `validate_supported` was written for post-distribution
-   plans. `splitter.rs:686-706` accepts only `Partial`, `PartialReduce`,
-   `Final`, and `FinalPartitioned`, and its own comment states "every
-   distributed aggregate carries a `Partial` layer". A locally executable plan
-   carries `AggregateMode::Single`/`SinglePartitioned`, so the task's required
-   order — validate the local plan with the unchanged predicate before the
-   pinned build — refuses candidates the pinned planner distributes correctly
-   today. The task forbids extending `validate_supported`, so this cannot be
-   resolved inside the task.
-2. **The unsupported fallback is unreachable.** The task requires an
-   unsupported candidate to "return an Interactive terminal and the exact local
-   result". It cannot:
-   - `codec.rs::RemoteSourcePlaceholderExec::execute` delegates to an
-     `EmptyExec`, and `exec.rs::OracleTableProvider::scan` emits that
-     placeholder on every node that owns a `fragment_dispatcher`. Streaming the
-     retained plan silently returns zero rows.
-   - Falling through to the existing Interactive path re-enters
-     `splitter::split_physical_plan_with_context`, which calls the same
-     `validate_supported` and refuses again — confirmed above.
-   - Remote `ScribeFollowerSource` rows are not readable locally, so any
-     genuinely local rebuild silently drops the live tail under live-inclusive
-     visibility.
+- `capacity::lowest_rung_analytical_contention_preserves_two_interactive_tenants`
+- `peer_network::analytical::inactive_baseline_executes_join_group_spill_and_interchangeable_topology`
 
-Two materially different reachable designs:
+Two repairs were tried and rejected on evidence rather than on principle.
+Building the candidate under a non-distributed `planning_session` did not
+change the aggregate mode, because the pinned task-count handler shapes the
+dependency's own transform and not the base physical build. Additionally
+raising that build's `target_partitions` to the stage task count fixed the
+aggregate mode but broke a third journey,
+`distributed::pg_bifrost_selective_predicate_and_projection_prune_distributed_reads`,
+by validating a plan at a parallelism the query does not execute at. Both were
+reverted.
 
-- **A — second, non-distributed provider registration.** Register a local-only
-  provider set, rebuild a third physical plan, and execute it as Interactive.
-  Adds a second provider-registration owner, a third physical build, retained
-  cuts, and requires an unstated live-tail visibility restriction.
-- **B — leaf-only Interactive split.** Keep unsupported operators on the leader
-  and distribute only the leaf scans. Correct and cheap, but modifies Task 2's
-  splitter, which this task forbids.
+The remaining alternative that preserves the gate is a leaf-only Interactive
+split that keeps unsupported operators on the leader, which modifies Task 2 and
+is therefore out of this task's scope. The predicate itself is untouched and
+still gates Task 2's splitter.
 
-Both alter ownership and test topology, so the choice is not an implementer
-decision. Scenarios 3-6 are not started pending it.
+**Consequence for the unsupported fallback.** With no pre-distribution gate,
+`splitter::validate_supported` no longer decides Analytical selection, so the
+task's "unsupported shape executes the retained local plan as Interactive"
+branch collapses into the existing planner-failure and no-exchange fallbacks,
+which are implemented and covered. A shape the pinned planner cannot distribute
+now produces the same terminal it produces on `5d3cc09f7`.
+
+### Verification
+
+- `mise run test:bifrost:journey:oracle` — `18 tests run: 18 passed, 0 skipped`
+- `mise run test:bifrost` — `974 tests run: 974 passed, 0 skipped`
+- `mise exec -- cargo nextest run --locked -p wyrd-spec --lib -E 'test(=vala::api::tests::query_terminal_projects_path_without_request_selector)'` — 1 passed
+- `mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib --features test-support,bench-support -E 'test(=oracle::exec::tests::supported_analytical_plan_accepts_only_the_v1_baseline)'` — 1 passed
+- `mise run fmt`, `mise run lints`, `mise run codegen:check`,
+  `mise run check:client-tier`, `git diff --check` — all clean
+
+`mise run lints` failed on `5d3cc09f7` for a pre-existing
+`clippy::too_many_lines` on `query_stream.rs::build_frames` (113/100). It is
+fixed here rather than allowed, by extracting `next_frame_event` and
+`encode_frame`; the lane is now green workspace-wide.
+
+Scenarios 3-6 remain open.

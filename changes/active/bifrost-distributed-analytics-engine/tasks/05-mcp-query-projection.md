@@ -68,11 +68,10 @@ Required execution skill: `$wyrd-implement`.
 - `crates/wyrd/wyrd-server/src/bifrost/service.rs`: existing authenticated
   `list_tables(&AppState, Caller)` and `describe_table(&AppState, Caller, ...)`
   remain the discovery owners; no behavior change is expected.
-- `crates/wyrd/wyrd-server/src/query/service.rs`: existing authenticated query
-  operation and Oracle stream remain lifecycle owners. Change this file only
-  if Task 04A leaves shared pre-execution validation or public terminal-error
-  mapping private to HTTP; move that existing seam once so HTTP and MCP share
-  it rather than duplicating it.
+- `crates/wyrd/wyrd-server/src/query/service.rs`: existing authenticated
+  `stream_query(AppState, Caller, BifrostQueryRequest)` and its returned
+  `OracleQueryStream` remain the authorization and lifecycle owners; no query
+  service behavior change is expected.
 - `crates/wyrd/wyrd-mcp/tests/bifrost/mcp/{main.rs,discovery.rs,query.rs}`:
   replace the obsolete `layout` and `rbac` module registrations with ordinary
   `discovery` and `query` modules for local client-to-`/mcp`-to-server
@@ -164,12 +163,12 @@ scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner &&
 
 **GREEN.** Parse the closed local request at the MCP boundary, map its four
 query-policy values into the existing `BifrostQueryRequest`, and call the
-existing authenticated query application operation directly with `AppState`
-and verified `Caller`. MCP invalid parameters use rmcp's protocol-correct
+existing `query::service::stream_query` operation directly with `AppState` and
+verified `Caller`. MCP invalid parameters use rmcp's protocol-correct
 invalid-params error. Authenticated Wyrd failures return `CallToolResult` with
-`is_error: true` and the canonical structured public problem. If Task 04A
-leaves policy-floor checks in the HTTP route, move them into the shared query
-service before calling Oracle; do not reproduce the parser or policy checks.
+`is_error: true` and the canonical structured public problem. Reuse the
+service's existing authorization, policy-floor validation, and public error
+mapping; do not reproduce them in the MCP adapter.
 
 **REFACTOR.** Keep pure parsing helpers local and synchronous. Do not add
 public preflight or `EXPLAIN`; the first actual query call owns validation.

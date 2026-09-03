@@ -3936,9 +3936,7 @@ impl Oracle {
         // falls through to the ordinary Interactive execution below, still
         // owning nothing Analytical.
         if input.analytical.is_some()
-            && let Some(execution) = self
-                .select_analytical(&session, &mut input, &source_groups)
-                .await?
+            && let Some(execution) = self.select_analytical(&session, &mut input).await?
         {
             return Ok(execution);
         }
@@ -4583,18 +4581,16 @@ impl Oracle {
         &self,
         session: &SessionContext,
         input: &mut SqlCutInput<'_>,
-        source_groups: &HashMap<String, String>,
     ) -> Result<Option<CutExecution>, OracleExecutionError> {
-        let candidate = Self::plan_physical(session, input.sql).await?;
-        // The closed Task 2 predicate, applied to the plan it was written for
-        // and before the dependency transforms it.
-        if let Err(error) = splitter::validate_supported(candidate.as_ref(), source_groups) {
-            if !is_unsupported_analytical_plan(&error) {
-                return Err(map_datafusion_error(&error).into());
-            }
-            record_analytical_selection("unsupported");
-            return Ok(None);
-        }
+        // Selection is gated on the pinned planner itself, not on a
+        // pre-distribution shape predicate. Task 2's `validate_supported`
+        // accepts only the `Partial`/`Final` aggregate layers a distributed
+        // plan carries; the query's own local build folds those into one
+        // `Single` layer, so gating on it here refuses candidates the pinned
+        // planner distributes correctly and regresses the approved
+        // lowest-rung contention and inactive-baseline journeys. The planner
+        // building a plan that keeps a real exchange is the stronger claim
+        // anyway, and it is still made before this query owns anything.
         let Some(handle) = self.analytical.as_ref() else {
             record_analytical_selection("unavailable");
             return Ok(None);
@@ -4604,7 +4600,6 @@ impl Oracle {
             return Ok(None);
         };
         // Selection. Nothing below may fall back.
-        drop(candidate);
         let attempt = input
             .analytical
             .ok_or(BifrostError::QueryExecutionFailed)?
@@ -6095,16 +6090,6 @@ pub fn is_tenant_invariant_error(error: &datafusion::error::DataFusionError) -> 
 /// operator matrix, not the cluster, is the limit.
 fn record_analytical_selection(outcome: &'static str) {
     metrics::counter!("oracle_query_analytical_selection_total", "outcome" => outcome).increment(1);
-}
-
-/// Reports whether one validation failure is the closed unsupported-shape refusal.
-///
-/// Only that refusal is a fallback. Every other error the predicate can carry —
-/// a tenant, catalog, corruption, or invariant failure — describes a query that
-/// must not run at all, so it is preserved rather than downgraded to a route.
-fn is_unsupported_analytical_plan(error: &datafusion::error::DataFusionError) -> bool {
-    matches!(error, datafusion::error::DataFusionError::Plan(detail)
-        if detail.starts_with("unsupported distributed Oracle"))
 }
 
 /// Records consumption of the sole pre-byte stale-cut replan.

@@ -305,6 +305,70 @@ struct FrameBuildInput {
 }
 
 /// Builds the lazy frame stream that owns terminal cleanup state.
+/// Resolves the next event one frame loop iteration acts on.
+///
+/// Cancellation is checked before anything is taken from the plan, so a
+/// consumer that walked away is never charged for one more batch. The
+/// pre-drained `first` batch is consumed next, because it was already pulled
+/// from the plan to prove the stream opened, and only then is the plan polled.
+///
+/// # Errors
+///
+/// Errors are carried in the returned event rather than a `Result`, because
+/// the loop settles a failure into a terminal instead of propagating it.
+async fn next_frame_event(
+    next: &mut Option<Result<RecordBatch, datafusion::error::DataFusionError>>,
+    batches: &mut SendableRecordBatchStream,
+    stream_cancellation: &CancellationToken,
+    request_cancellation: &CancellationToken,
+    deadline: std::time::Instant,
+) -> QueryStreamEvent {
+    if cancellation_requested(stream_cancellation, request_cancellation) {
+        return QueryStreamEvent::Failed(QueryTerminalErrorCode::QueryExecutionFailed);
+    }
+    if let Some(value) = next.take() {
+        return QueryStreamEvent::Batch(Some(value));
+    }
+    next_query_stream_event(batches, stream_cancellation, request_cancellation, deadline).await
+}
+
+/// Encodes one batch into a wire frame and charges it to the stream's counters.
+///
+/// The encoder buffers, so a batch may legitimately produce no frame yet; that
+/// is reported as `Ok(None)` and the caller simply pulls the next batch. Rows
+/// and payload bytes are counted only for a batch that actually became a frame,
+/// which keeps the terminal's row count equal to what the consumer received.
+/// The first frame also marks time-to-first-batch and, on the Analytical path,
+/// charges egress.
+///
+/// # Errors
+///
+/// Returns `Err(())` when the IPC encoder rejects the batch. The encoder's own
+/// error carries nothing the terminal can express, so the caller settles a
+/// `QueryExecutionFailed` terminal instead.
+fn encode_frame(
+    batch: &RecordBatch,
+    ipc: &mut QueryIpcEncoder,
+    admitted: Option<&super::admission::AdmittedQueryGuard>,
+    query_telemetry: &mut super::QueryTelemetryGuard,
+    row_count: &mut u64,
+) -> Result<Option<QueryBatchFrame>, ()> {
+    let batch_rows = batch.num_rows() as u64;
+    let Ok(frame) = ipc.write(batch) else {
+        return Err(());
+    };
+    let Some(frame) = frame else {
+        return Ok(None);
+    };
+    query_telemetry.first_batch();
+    if let Some(admitted) = admitted {
+        admitted.record_analytical_egress();
+    }
+    *row_count = row_count.saturating_add(batch_rows);
+    query_telemetry.record_payload(batch_rows, frame.arrow_ipc_batch.len());
+    Ok(Some(frame))
+}
+
 fn build_frames(input: FrameBuildInput) -> std::pin::Pin<Box<super::OracleFrameStream>> {
     let FrameBuildInput {
         execution_path,
@@ -340,67 +404,47 @@ fn build_frames(input: FrameBuildInput) -> std::pin::Pin<Box<super::OracleFrameS
         query_telemetry.record_payload(0, schema_frame.arrow_ipc_schema.len());
         yield Ok(QueryStreamFrame::Schema(schema_frame));
         let candidate = loop {
-            let event = if cancellation_requested(&stream_cancellation, &request_cancellation) {
-                QueryStreamEvent::Failed(QueryTerminalErrorCode::QueryExecutionFailed)
-            } else if let Some(value) = next.take() {
-                QueryStreamEvent::Batch(Some(value))
-            } else {
-                next_query_stream_event(
-                    &mut batches,
-                    &stream_cancellation,
-                    &request_cancellation,
-                    deadline,
-                ).await
-            };
+            let event = next_frame_event(
+                &mut next,
+                &mut batches,
+                &stream_cancellation,
+                &request_cancellation,
+                deadline,
+            ).await;
             match event {
                 QueryStreamEvent::Batch(Some(Ok(batch))) => {
-                    let batch_rows = batch.num_rows() as u64;
-                    let Ok(frame) = ipc.write(&batch) else {
-                        break failed_terminal_for_visibility(
+                    match encode_frame(
+                        &batch,
+                        &mut ipc,
+                        admitted.as_ref(),
+                        &mut query_telemetry,
+                        &mut row_count,
+                    ) {
+                        Err(()) => break failed_terminal_for_visibility(
                             QueryTerminalErrorCode::QueryExecutionFailed,
                             row_count,
                             visibility,
                             execution_path,
-                        );
-                    };
-                    let Some(frame) = frame else {
-                        continue;
-                    };
-                    query_telemetry.first_batch();
-                    if let Some(admitted) = admitted.as_ref() {
-                        admitted.record_analytical_egress();
+                        ),
+                        Ok(None) => {}
+                        Ok(Some(frame)) => yield Ok(QueryStreamFrame::Batch(frame)),
                     }
-                    row_count = row_count.saturating_add(batch_rows);
-                    query_telemetry.record_payload(batch_rows, frame.arrow_ipc_batch.len());
-                    yield Ok(QueryStreamFrame::Batch(frame));
                 }
                 QueryStreamEvent::Batch(Some(Err(error))) => {
                     let code = terminal_error_code(&error);
                     tracing::error!(error = %error, error_code = terminal_error_label(code), "Oracle query stream execution failed");
-                    break failed_terminal_for_visibility(
-                        code,
-                        row_count,
-                        visibility,
-                        execution_path,
-                    );
+                    break failed_terminal_for_visibility(code, row_count, visibility, execution_path);
                 }
-                QueryStreamEvent::Batch(None) => {
-                    break exhausted_terminal(
-                        &degraded_sources,
-                        visibility,
-                        freshness_policy,
-                        stale_replanned,
-                        row_count,
-                        execution_path,
-                    );
-                }
+                QueryStreamEvent::Batch(None) => break exhausted_terminal(
+                    &degraded_sources,
+                    visibility,
+                    freshness_policy,
+                    stale_replanned,
+                    row_count,
+                    execution_path,
+                ),
                 QueryStreamEvent::Failed(code) => {
-                    break failed_terminal_for_visibility(
-                        code,
-                        row_count,
-                        visibility,
-                        execution_path,
-                    );
+                    break failed_terminal_for_visibility(code, row_count, visibility, execution_path);
                 }
             }
         };

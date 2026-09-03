@@ -1,6 +1,6 @@
 ---
 id: SPEC-bifrost-distributed-analytics-engine
-revision: 4
+revision: 5
 status: approved
 ---
 
@@ -27,6 +27,35 @@ remediation and the proposed Task 2 and Task 3 with one KISS v1 outcome. Existin
 planning artifacts have no authority under this revision unless `$wyrd-plan`
 later reconciles and retains them after explicit approval.
 
+Revision 5 also corrects the MCP boundary discovered during Task 5 readiness.
+MCP is a public Wyrd protocol surface hosted by `wyrd-server`, not a Skald tool
+registry and not an external `vala-sdk` client calling back into the server.
+Task 4 remains the in-progress Rust HTTP/gRPC client owner and is unchanged by
+this revision. All MCP transport, client plumbing, and Bifrost tool work begins
+only after Task 4 completes.
+
+## Revision 5 request and affected work
+
+Revision 4 incorrectly required MCP to consume the external Rust query client.
+The checked-in `wyrd-mcp` binary instead registers in-process Skald
+`AgentTool`s and explicitly has no MCP transport. That shape cannot prove a
+real MCP initialize, discovery, invocation, authentication, cancellation, or
+result contract and reverses the intended relationship: Skald may consume an
+MCP server, but MCP is not a Skald runtime tool implementation.
+
+Approval of Revision 5 would:
+
+- retain Task 4's Rust client, terminal, cancellation, and settlement work;
+- remove Task 4 and Task 5 claims that server-hosted MCP calls
+  `vala_sdk::QueryClient`;
+- require one `task-5-pre-mcp-buildout` predecessor for reusable MCP
+  client/server transport, authentication, and protocol evidence after Task 4;
+- supersede the current proposed Task 5 with a read-only Bifrost MCP journey
+  task that depends on the MCP predecessor; and
+- leave Bifrost ingest/write tools to a separate approved change because this
+  specification governs analytical reads and explicitly excludes distributed
+  writes, DML, and CTAS.
+
 ## Scope
 
 - Close the remaining GraphLease, distributed-query cleanup, physical-execution,
@@ -43,6 +72,12 @@ later reconciles and retains them after explicit approval.
 - Ship the same query request, stream, selected path, terminal evidence,
   cancellation, and structured errors through the shared Rust client,
   HTTP/gRPC, and MCP.
+- Host a standard Streamable HTTP MCP endpoint on the existing `wyrd-server`
+  public surface and support conforming MCP clients that can attach Wyrd
+  authentication headers, including a minimal first-party Rust MCP connection.
+- Let an authenticated agent discover Bifrost tables and physical layout,
+  construct a bounded raw-SQL read, and receive a compact terminal-safe result
+  on behalf of the verified principal.
 - Prove the real production user journeys for UI, data-scientist, internal
   scheduled, and agent-facing queries.
 
@@ -73,6 +108,17 @@ later reconciles and retains them after explicit approval.
   first-class Wyrd languages and may project this shared Rust capability in a
   later change, but they do not gate this v1 delivery or its Tier-1/Tier-2
   evidence.
+- A second externally addressable MCP service, a Skald-owned MCP server, or an
+  MCP handler that calls the server's public HTTP API back into the same
+  process.
+- Stdio, legacy HTTP+SSE, WebSocket, custom JSON-RPC, or multiple MCP transports
+  in this change. Local and remote clients use the same Streamable HTTP
+  endpoint.
+- Public query `EXPLAIN`, a separate validate-query tool, join-hint registry,
+  partition-inventory tool, asynchronous query job, or MCP result-streaming
+  protocol.
+- Bifrost ingest/write tools. Agentic writes require their own approved scopes,
+  idempotency, payload bounds, audit behavior, and user journeys.
 
 ## Definitions
 
@@ -95,6 +141,15 @@ later reconciles and retains them after explicit approval.
 - **Terminal-safe stream:** an incremental Arrow result stream whose preceding
   rows constitute a successful complete query only after one explicit success
   terminal.
+- **MCP server:** the standard Streamable HTTP protocol adapter mounted on the
+  existing `wyrd-server` public listener at `/mcp`.
+- **MCP client:** any conforming MCP client capable of attaching Wyrd
+  authentication headers. The first-party Rust integration uses the official
+  Rust MCP SDK for protocol lifecycle and reuses Wyrd client authentication
+  only for credential refresh and Wyrd request headers.
+- **MCP tool result:** one bounded final `tools/call` result emitted only after
+  the underlying Oracle stream reaches a validated terminal and all required
+  query ownership settles. It is not an incremental row stream.
 - **Supported Analytical baseline:** filtered/projected scans, fixed-width
   `COUNT`, `SUM`, `MIN`, and `MAX` grouping, multi-input equi-join, streamed
   exchange, and a DataFusion operator capable of spilling through the admitted
@@ -109,8 +164,10 @@ execution entry point. The request shall not accept an execution path, query
 class, stage graph, worker set, physical plan, or tenant override.
 
 The shared Rust client, HTTP/gRPC, and MCP shall project the same server-owned
-query semantics, deadline, incremental Arrow results, selected execution path,
-terminal outcome, and structured errors.
+query semantics, deadline, selected execution path, terminal outcome, and
+structured errors. HTTP/gRPC and the Rust client shall preserve incremental
+Arrow results; MCP shall expose the same completed result as one bounded final
+tool result.
 
 ### REQ-002 — Simple server-owned routing
 
@@ -232,19 +289,21 @@ Self-hosted, SaaS, and enterprise deployments shall expose the same query
 behavior. Deployment profiles may choose different finite capacities but shall
 not change query semantics.
 
-### REQ-010 — Shared Rust client and thin MCP projection
+### REQ-010 — Independent Rust-client and MCP projections
 
 The Rust client shall own all reusable client behavior for request construction,
 incremental Arrow decoding, terminal and structured-error validation, deadline
 handling, cancellation, and settlement. The production Rust journey shall use
 that shared implementation rather than a journey-specific client path.
 
-MCP shall thinly project the same Rust client behavior with closed input
-schemas, caller ceilings for SQL, deadline, rows, and bytes beneath server hard
-limits, server-owned authentication and tenant binding, and no successful
-truncation. MCP shall preserve structured errors and the terminal execution
-path without reproducing client lifecycle, internal operator, routing, or
-topology logic.
+MCP shall project the same server-owned request, authorization, routing,
+terminal, error, deadline, cancellation, and cleanup semantics through a native
+server adapter. A server-hosted MCP handler shall call the existing authenticated
+server application operations with the verified caller; it shall not invoke
+`wyrd-client` or `vala-sdk` over HTTP back into its own server process. The MCP
+adapter may own only MCP-specific input ceilings, compact final-result
+projection, and protocol cancellation bridging. It shall not reproduce Oracle
+planning, routing, authorization, audit, or durable lifecycle behavior.
 
 Python and TypeScript are not required surfaces or acceptance dependencies for
 this change. A later language projection shall consume the shared Rust behavior
@@ -261,6 +320,58 @@ failure category, cleanup, and terminal outcome.
 Tenant, table, SQL, query, graph, snapshot, and task identities shall remain in
 scrubbed traces or durable evidence, never metric labels. Configuration values
 or plan text alone shall not count as evidence of physical distributed work.
+
+### REQ-012 — Standard MCP serving and agent discovery
+
+`wyrd-server` shall expose one Streamable HTTP MCP endpoint at `/mcp` on its
+existing public listener. Local clients use the same endpoint over localhost;
+remote clients use it through the deployment's existing gateway and TLS. This
+change shall not add another public listener, service identity, deployment
+surface, or stdio implementation.
+
+The MCP protocol implementation shall use the official Rust MCP SDK rather than
+custom JSON-RPC or Skald's runtime tool registry. The server shall support the
+standard lifecycle and the `tools/list` and `tools/call` operations needed by
+the required journeys. MCP protocol and session headers belong to the MCP SDK.
+
+Authenticated MCP HTTP requests shall use the existing
+`x-wyrd-access-token: Bearer <token>` identity contract and optional
+`wyrd-request-id`. The server shall reuse the existing token verifier,
+request-ID middleware, permission checks, tenant derivation, principal Card
+scope, and delegated `act` chain. Tenant, principal, delegation, roles, and
+execution path shall never be accepted as tool arguments.
+
+The first-party Rust MCP connection shall use the official MCP client for
+protocol lifecycle and a single Wyrd-specific HTTP request decorator for access
+token acquisition or refresh and Wyrd request IDs. It shall reuse the existing
+Wyrd authentication owner without wrapping, mirroring, or reimplementing the
+MCP client API or `ClientHandler`. Skald may adapt discovered MCP tools into its
+runtime registry on the consuming side; neither `wyrd-server` nor its MCP tools
+shall depend on Skald.
+
+The server shall expose exactly the Bifrost read capabilities required here:
+
+- `bifrost.list_tables` for compact tenant-authorized discovery;
+- `bifrost.describe_table` for one table's schema, field metadata, event-time
+  partition granularity, ordered sort keys, and Bloom columns; and
+- `bifrost.query` for one read-only SQL request with closed SQL, visibility,
+  freshness, deadline, row-ceiling, and serialized-byte-ceiling input.
+
+Schema and layout discovery shall not expose live topology, an exhaustive
+partition inventory, internal plans, or server-selected execution controls.
+Malformed SQL, multiple statements, non-SELECT operations, invalid fields,
+unknown tables, unsupported query shapes, and floor violations shall return
+safe structured feedback at the earliest owning validation or planning boundary
+before rows execute. No public `EXPLAIN` or separate preflight operation is
+required.
+
+`bifrost.query` shall return one compact structured result containing a column
+description once, positional row values, and the validated terminal including
+the server-selected `Interactive` or `Analytical` path. MCP row and serialized
+byte defaults and hard ceilings shall be lower than the server hard limits and
+chosen during planning for agent context safety. Exceeding a ceiling shall fail
+with the canonical structured result-too-large error and no successful partial
+or truncated payload. MCP progress notifications shall not carry result rows.
 
 ## Invariants and prohibited outcomes
 
@@ -311,6 +422,14 @@ copy, local patch, compatibility bridge, or duplicate native universe.
 This change shall introduce no second query API, optimizer, scheduler, shuffle
 service, analytical deployment role, resource registry, listener owner,
 telemetry owner, or client-side routing implementation.
+
+### INV-009 — MCP boundary direction
+
+The Wyrd MCP server shall not use Skald's runtime registry or error types and
+shall not call Wyrd's external Rust client back into the hosting server. MCP
+clients own protocol connectivity; `wyrd-server` owns authentication and
+server-side execution. A Skald agent may consume the public MCP endpoint but
+does not own or define it.
 
 ## Externally observable production behavior
 
@@ -396,10 +515,20 @@ that Analytical saturation does not consume the Interactive floor.
 ### Journey E — Rust client and agent projection
 
 The shared Rust client over HTTP or generated gRPC proves the complete
-client-to-server-to-client production route and physical topology once. MCP
-drives a real agent-to-server-to-agent query lifecycle and proves bounded input,
-selected-path evidence, structured failure, cancellation/ceiling behavior, and
-cleanup without repeating the physical operator matrix.
+client-to-server-to-client production route and physical topology once. A real
+MCP client independently performs protocol initialization, discovers Bifrost
+tools, and drives agent-to-server-to-agent query lifecycles through `/mcp`
+without calling or emulating the Rust HTTP client.
+
+For the operational debugging flow, an authenticated agent lists tables,
+describes the relevant OTEL table, submits a bounded error-trace query, receives
+an `Interactive` terminal and complete bounded result, and answers on behalf of
+the verified principal. For the analytical flow, the agent lists and describes
+three relevant tables, constructs a supported multi-table join and fixed-width
+aggregation without a path hint, receives an `Analytical` terminal and complete
+bounded result, and can repair malformed or unsupported SQL from canonical
+structured feedback. Both flows prove cancellation and ceiling behavior, no
+partial success, and cleanup without repeating the physical operator matrix.
 
 All Tier-1 journeys and Tier-2 verification required by this change shall run
 without Python or Node.js and shall not depend on Python or TypeScript packages,
@@ -408,6 +537,8 @@ bindings, test harnesses, or runtime lifetimes.
 ## Material constraints and required boundaries
 
 - `wyrd-server` remains the only network-serving and listener-lifecycle owner.
+- The public MCP endpoint is `/mcp` on that existing logical serving surface
+  and uses Streamable HTTP in every deployment profile.
 - Vala Oracle remains the cohesive query, route, admission, distributed
   execution, and cleanup owner.
 - Scribe and the immutable Iceberg/live-tail cut remain the source authority;
@@ -415,13 +546,19 @@ bindings, test harnesses, or runtime lifetimes.
 - The private peer security and fenced-destination behavior already proven by
   the Task 1 remediation remains required and is not redesigned here.
 - The existing two-second pending reservation TTL remains unchanged.
-- Query output remains streamed Arrow with one explicit terminal; no
-  asynchronous query-job or result-polling protocol is added.
+- Oracle, HTTP/gRPC, and Rust-client query output remains streamed Arrow with
+  one explicit terminal; MCP converts that internal stream into one bounded
+  final result. No asynchronous query-job or result-polling protocol is added.
 - Public contracts remain language-neutral and generated from their owning
-  sources. `vala-sdk` owns shared reusable client behavior; future Python and
-  TypeScript support remains a thin projection rather than a durable or
-  reusable-behavior owner.
+  sources. `vala-sdk` owns reusable external Rust query-client behavior; MCP
+  independently projects the same server operation without an SDK loopback.
+  Future Python and TypeScript support remains a thin projection rather than a
+  durable or reusable-behavior owner.
 - MCP remains agent-facing, bounded, permissioned, and tenant-safe.
+- MCP `tools/call` returns one final result rather than an incremental row
+  stream. Oracle may stream internally while the MCP boundary enforces finite
+  memory, rows, serialized bytes, cancellation, terminal validation, and no
+  successful truncation.
 
 ## Acceptance obligations
 
@@ -468,12 +605,14 @@ existing peer trust boundary, represented by reachable deployment configuration,
 included in readiness, and joined during shutdown. The same Oracle process
 shape shall coordinate and follow work.
 
-### AC-006 — Shared Rust contract and MCP projection
+### AC-006 — Rust and MCP query projections
 
-Source-generated contract evidence and real shared-Rust-client HTTP or gRPC and
-MCP journeys shall agree on request semantics, incremental Arrow results,
-deadline, selected path, terminal outcome, cancellation, and structured errors.
-MCP shall additionally prove closed bounded input and no successful truncation.
+Source-generated contract evidence and real Rust-client HTTP or gRPC and MCP
+journeys shall agree on server request semantics, deadline, selected path,
+terminal outcome, cancellation, cleanup, and structured errors. The Rust client
+shall prove incremental Arrow behavior. MCP shall independently prove standard
+protocol initialization, discovery, and invocation, closed bounded input,
+compact terminal-safe output, and no successful truncation.
 The required Tier-1 and Tier-2 lanes shall pass without building or executing
 Python or TypeScript integrations.
 
@@ -493,6 +632,23 @@ second DataFusion/Arrow universe, public path selector, EXPLAIN requirement,
 automatic retry, scheduler, shuffle service, analytical pod role, duplicate
 owner, or client-side durable behavior.
 
+### AC-009 — MCP serving, authentication, and client interoperability
+
+One real Rust MCP client shall connect to `/mcp` over Streamable HTTP, complete
+the negotiated MCP lifecycle, list the exact Bifrost tools, and invoke a tool
+through the production `wyrd-server` handler. Evidence shall prove the official
+MCP implementation owns protocol framing and session headers; the Wyrd request
+decorator owns only refreshed `x-wyrd-access-token` and `wyrd-request-id`
+headers; every request is authenticated into the exact tenant, principal Card
+scope, and delegated actor chain; and no Skald registry, custom MCP client
+handler, SDK loopback, second listener, or duplicate auth verifier participates.
+
+The required MCP Bifrost journeys shall prove table discovery, schema and
+physical-layout discovery, an Interactive OTEL debugging query, an Analytical
+three-table query, actionable structured SQL failure, caller cancellation,
+result-ceiling refusal without partial payload, selected-path terminal evidence,
+and zero retained Oracle ownership before the final MCP result or error returns.
+
 ## Open material decisions
 
 None in this draft. Approval would explicitly choose:
@@ -505,7 +661,17 @@ None in this draft. Approval would explicitly choose:
 - practical aggregate resource containment without a dependency fork or exact
   dependency-internal message/queue proof; and
 - Rust plus MCP as the shipping client surfaces for this change, with Python
-  and TypeScript deferred to later changes.
+  and TypeScript deferred to later changes;
+- one server-hosted Streamable HTTP `/mcp` endpoint rather than stdio or a
+  separate MCP service;
+- the official Rust MCP SDK rather than Skald or custom JSON-RPC for both the
+  server protocol and first-party Rust MCP connectivity;
+- reuse of Wyrd client authentication through one request decorator rather
+  than a duplicate MCP client handler or duplicated credential lifecycle;
+- direct authenticated server-operation invocation rather than an in-process
+  `wyrd-client` or `vala-sdk` HTTP loopback; and
+- three bounded Bifrost read tools, compact final results, no MCP row streaming,
+  no public `EXPLAIN`, and no Bifrost write tool in this change.
 
 ## Planning-decision inventory
 
@@ -522,8 +688,19 @@ After approval, `$wyrd-plan` must decide only implementation-level details:
 - the existing public contract sources that project selected-path terminal
   evidence consistently without adding a path selector or EXPLAIN;
 - the shared Rust client boundary for request construction, stream decoding,
-  terminal/error validation, deadline, cancellation, and settlement, plus the
-  thin MCP ceiling and agent-output projection over that boundary;
+  terminal/error validation, deadline, cancellation, and settlement;
+- the official MCP SDK feature set and the smallest server-owned handler that
+  mounts on the existing authenticated router without a second listener;
+- the narrow MCP HTTP client decorator that reuses the existing Wyrd
+  authentication owner for refreshed access tokens and request IDs without
+  mirroring the MCP client API;
+- the exact MCP row and serialized-byte defaults and hard ceilings that keep
+  agent context bounded beneath server hard limits;
+- the server-owned bounded collection and cancellation path that converts the
+  internal Oracle stream into one final MCP result without reusing the external
+  HTTP client or introducing a general query-job abstraction;
+- one `task-5-pre-mcp-buildout` task that begins after Task 4, followed by one
+  Bifrost MCP journey task that depends on that plumbing;
 - which existing Task 1 remediation code and evidence already satisfies this
   revision, which portions of the proposed Task 2 and Task 3 remain cohesive,
   and which current task artifacts shall be moved to scrap; and
@@ -569,6 +746,12 @@ security behavior changes.
   client-behavior authority, deferred Python and TypeScript projections to later
   changes, and removed Python and Node.js from required Tier-1 and Tier-2
   evidence.
+- Revision 5 (`approved`, 2026-09-03): the human explicitly approved replacing
+  the inverted Skald and external-client MCP projection with one server-hosted
+  Streamable HTTP `/mcp` surface, an official-SDK Rust MCP connection that
+  reuses Wyrd authentication, and bounded table-discovery plus Interactive and
+  Analytical agent read journeys. Task 4 remains unchanged and completes before
+  either MCP task.
 
 ## Material authority
 
@@ -578,6 +761,12 @@ security behavior changes.
 - [`architecture/wyrd-doctrine.mdx`](../../../architecture/wyrd-doctrine.mdx)
 - [`architecture/bifrost-design.md`](../../../architecture/bifrost-design.md)
 - [`architecture/references/languages/spec-driven-development.md`](../../../architecture/references/languages/spec-driven-development.md)
+- [`architecture/references/languages/agent-harness.md`](../../../architecture/references/languages/agent-harness.md)
+- [`architecture/references/languages/errors.md`](../../../architecture/references/languages/errors.md)
+- [`architecture/references/doctrine/architecture-constraints.md`](../../../architecture/references/doctrine/architecture-constraints.md)
+- [`architecture/references/architecture/patterns.md`](../../../architecture/references/architecture/patterns.md)
+- [`architecture/wyrd-security-posture.md`](../../../architecture/wyrd-security-posture.md)
+- [`architecture/operations/deployment-and-release.md`](../../../architecture/operations/deployment-and-release.md)
 - [`architecture/references/domain/olap-serving.md`](../../../architecture/references/domain/olap-serving.md)
 - [`architecture/references/domain/datafusion.md`](../../../architecture/references/domain/datafusion.md)
 - [`architecture/references/domain/analytical-operations-reliability.md`](../../../architecture/references/domain/analytical-operations-reliability.md)

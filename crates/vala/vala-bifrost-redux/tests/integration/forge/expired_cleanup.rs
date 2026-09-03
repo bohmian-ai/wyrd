@@ -9,15 +9,31 @@ use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-use vala_bifrost_redux::forge::{ForgeError, ForgeScheduler, ForgeWorker, ForgeWorkerConfig};
+use vala_bifrost_redux::catalog::TenantTableBinding;
+use vala_bifrost_redux::forge::{
+    Forge, ForgeError, ForgeScheduler, ForgeWorker, ForgeWorkerConfig,
+};
+use vala_bifrost_redux::oracle::reader_pins::{
+    OracleReaderAuthority, OracleReaderAuthorityConfig, RecordingEpochTerminator,
+};
+use vala_sql::queries::cluster_nodes::ClusterNodes;
 use vala_sql::queries::forge_tasks::{ForgeEnqueueBatch, ForgeTasks};
+use vala_sql::queries::oracle_reader_authority::BIFROST_CATALOG_NAME;
+use vala_sql::row_types::cluster_nodes::RoleRegistration;
 use vala_sql::row_types::forge_tasks::{
     ExpiredCleanupPayload, ForgeCleanupCandidate, ForgeCleanupCategory, ForgeCleanupPath,
     ForgeTaskClaim, ForgeTaskLane, ForgeTaskStrategy, ForgeTaskTableIdentity, NewForgeTask,
 };
+use vala_sql::row_types::oracle_reader_authority::TableAuthorityIdentity;
+use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
 use wyrd_spec::request_id::RequestId;
-use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
+use wyrd_spec::vala::api::{
+    AuditDecision, AuditEvent, AuditResult, AuthMethod, ClusterCapabilities, ClusterNodeKey,
+    ClusterRole, NodeId, OracleCapabilitiesV1, QueryClass,
+};
+
+use crate::oracle::reader_authority::cut;
 
 use super::snapshot_expiration::{
     ExpirableTable, expirable_table, object_exists, seed_ready_expiry_task,
@@ -251,6 +267,83 @@ async fn release_cleanup_claim(fixture: &PromotionIntegrationFixture, task_id: U
         .expect("the cleanup claim releases");
 }
 
+/// Starts one real Oracle reader authority over the fixture's own database.
+///
+/// Nothing about the authority is simulated: it registers a real Oracle role,
+/// acquires and activates a real epoch, and commits real protection frontiers
+/// through `vala.bifrost_table_maintenance_authority` — the same row an
+/// expired-cleanup preparation serializes against.
+///
+/// # Panics
+///
+/// Panics when the role, epoch, or activation cannot be established.
+async fn reader_authority(
+    fixture: &PromotionIntegrationFixture,
+    shutdown: &CancellationToken,
+) -> (Arc<OracleReaderAuthority>, TableAuthorityIdentity) {
+    let node_id = Uuid::now_v7();
+    let mut conn = fixture
+        .database
+        .vala_postgres()
+        .tenant_conn(DataTenantId::SYSTEM_OWNER)
+        .await
+        .expect("system connection");
+    let row = ClusterNodes::new(fixture.database.vala_postgres().clone())
+        .register(
+            &mut conn,
+            &RoleRegistration {
+                key: ClusterNodeKey {
+                    node_id: NodeId::new(node_id),
+                    role: ClusterRole::Oracle,
+                },
+                address: "http://oracle:5002".into(),
+                capabilities: ClusterCapabilities::OracleV1(OracleCapabilitiesV1 {
+                    storage_protocol_version: 1,
+                    cpu_cores: 4.0,
+                    memory_budget_bytes: 4096,
+                    cpu_cores_per_slot: 1.0,
+                    memory_bytes_per_slot: 1024,
+                    raw_slots: 4,
+                    usable_slots: 3,
+                    supported_classes: vec![QueryClass::Interactive],
+                    max_workers_per_query: 3,
+                }),
+                started_at: chrono::Utc::now(),
+            },
+        )
+        .await
+        .expect("oracle role registers");
+    conn.commit().await.expect("registration commits");
+
+    let authority = OracleReaderAuthority::start(OracleReaderAuthorityConfig {
+        vala: fixture.database.vala_postgres().clone(),
+        operator_pool: fixture.database.operator_pool().clone(),
+        node_id,
+        fencing_token: row.lease.fencing_token,
+        max_concurrent_queries: 4,
+        terminator: Arc::new(RecordingEpochTerminator::default()) as Arc<_>,
+        shutdown: shutdown.clone(),
+    })
+    .await
+    .expect("epoch acquires");
+    authority.activate().await.expect("epoch activates");
+
+    let table_uid: Vec<u8> =
+        sqlx::query_scalar("SELECT table_uid FROM vala.bifrost_tables WHERE data_tenant_id=$1")
+            .bind(fixture.tenant.as_uuid())
+            .fetch_one(fixture.operator_pool.pool())
+            .await
+            .expect("the fixture table is registered");
+    let identity = TableAuthorityIdentity {
+        tenant: fixture.tenant,
+        table_uid: table_uid.try_into().expect("table uid is 16 bytes"),
+        catalog_name: BIFROST_CATALOG_NAME.to_owned(),
+        namespace_name: fixture.binding.table_ref.namespace.as_str().to_owned(),
+        table_name: fixture.binding.table_ref.name.clone(),
+    };
+    (authority, identity)
+}
+
 /// Counts every live maintenance lease, which a refused claim must not change.
 ///
 /// # Panics
@@ -261,6 +354,209 @@ async fn live_leases(fixture: &PromotionIntegrationFixture) -> i64 {
         .fetch_one(fixture.operator_pool.pool())
         .await
         .expect("lease count")
+}
+
+/// Builds a path beside one candidate, sharing its table-bound directory.
+///
+/// Staying in the candidate's own directory keeps the derived path inside the
+/// table binding, so a refusal it produces is the safety rule under test rather
+/// than a path-shape rejection.
+///
+/// # Panics
+///
+/// Panics when the candidate path carries no directory.
+fn sibling_path(candidate: &ForgeCleanupCandidate, file_name: &str) -> String {
+    let (directory, _) = candidate
+        .path
+        .as_str()
+        .rsplit_once('/')
+        .expect("the candidate path has a directory");
+    format!("{directory}/{file_name}")
+}
+
+/// Asserts every durable gate that must hold at the paused object-store stat.
+///
+/// The drain is suspended between its committed preparation and its first
+/// external call, so each assertion here observes production state directly:
+/// the SQL transaction is closed, the prepared row is the reader-widening and
+/// competing-Forge boundary, and the self-exemption covers exactly one tuple.
+///
+/// # Panics
+///
+/// Panics when any gate, lock, refusal, or exemption boundary differs.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the gate proof observes the whole live drain context and owns no state of its own"
+)]
+async fn assert_paused_candidate_gates(
+    table: &ExpirableTable,
+    worker: &ForgeWorker,
+    forge: &Arc<Forge>,
+    binding: &TenantTableBinding,
+    oracle: &Arc<OracleReaderAuthority>,
+    identity: &TableAuthorityIdentity,
+    cleanup_id: Uuid,
+    attempt: Uuid,
+    payload: &ExpiredCleanupPayload,
+) {
+    let candidate = &payload.cleanup_candidates[0];
+
+    assert_eq!(
+        cursor(&table.fixture, cleanup_id).await,
+        ("prepared".to_owned(), 0, Some(0)),
+        "the preparation is durable before the first object call"
+    );
+    assert_eq!(
+        table.store.deletes(),
+        0,
+        "no deletion is submitted before the fresh proof completes"
+    );
+
+    // The preparation transaction and its table-authority lock are closed: a
+    // separate transaction takes the same row without waiting.
+    let mut lock = table
+        .fixture
+        .operator_pool
+        .pool()
+        .begin()
+        .await
+        .expect("independent transaction");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        sqlx::query("SELECT 1 FROM vala.bifrost_table_maintenance_authority WHERE data_tenant_id=$1 AND catalog_name=$2 AND namespace_name=$3 AND table_name=$4 FOR UPDATE NOWAIT")
+            .bind(identity.tenant.as_uuid())
+            .bind(&identity.catalog_name)
+            .bind(&identity.namespace_name)
+            .bind(&identity.table_name)
+            .fetch_one(&mut *lock),
+    )
+    .await
+    .expect("the independent lock is not blocked")
+    .expect("the preparation transaction released the table-authority row");
+    lock.rollback().await.expect("release the probe lock");
+
+    // Real Oracle frontier expansion is refused while the preparation is
+    // unresolved, and it is refused before any manifest or data object is read.
+    let reads_before = table.store.reads();
+    assert!(
+        oracle
+            .acquire_guard_for_cuts(vec![(
+                identity.clone(),
+                cut(
+                    payload.committed_snapshot_id,
+                    1,
+                    &[payload.committed_snapshot_id],
+                ),
+            )])
+            .await
+            .is_err(),
+        "an unresolved cleanup preparation blocks reader widening"
+    );
+    assert_eq!(
+        table.store.reads(),
+        reads_before,
+        "reader widening is refused before any manifest or data read"
+    );
+
+    // The active-task index still denies a second claim, and the live table
+    // lease still denies a competing destructive effect.
+    assert!(
+        worker
+            .claim_for_test()
+            .await
+            .expect("claim transaction runs")
+            .is_none(),
+        "the prepared cleanup task excludes every competing Forge claim"
+    );
+    assert!(
+        matches!(
+            forge.run_orphan_gc_report_for_test(binding).await,
+            Err(ForgeError::FenceLost { .. })
+        ),
+        "the live table lease denies a competing destructive effect"
+    );
+
+    // The self-exemption is exact in all four fields: only the drain's own
+    // tuple stops its own preparation from protecting the candidate.
+    // Every axis classifies the same real object; only the exemption tuple
+    // varies, so a refusal is attributable to that one mismatched field.
+    let eligibility = async |task_id, attempt_id, index, exempted: &ForgeCleanupCandidate| {
+        forge
+            .expired_cleanup_eligibility_for_test(
+                binding,
+                task_id,
+                attempt_id,
+                index,
+                exempted,
+                candidate.path.as_str(),
+            )
+            .await
+            .expect("the production protection proof loads")
+    };
+    assert_eq!(
+        eligibility(cleanup_id, attempt, 0, candidate).await,
+        "Eligible",
+        "the exact prepared tuple proceeds"
+    );
+    for (task_id, attempt_id, index, mismatch) in [
+        (Uuid::now_v7(), attempt, 0, "task id"),
+        (cleanup_id, Uuid::now_v7(), 0, "attempt id"),
+        (cleanup_id, attempt, 1, "cursor index"),
+    ] {
+        assert_eq!(
+            eligibility(task_id, attempt_id, index, candidate).await,
+            "Protected",
+            "a mismatched {mismatch} leaves the preparation protecting its object"
+        );
+    }
+    let sibling_candidate = ForgeCleanupCandidate {
+        path: ForgeCleanupPath::new(sibling_path(candidate, "wyrd-other-candidate.parquet"))
+            .expect("a sibling candidate path is valid"),
+        ..candidate.clone()
+    };
+    assert_eq!(
+        eligibility(cleanup_id, attempt, 0, &sibling_candidate).await,
+        "Protected",
+        "a mismatched candidate leaves the preparation protecting its object"
+    );
+
+    // One safety input mutated at a time still refuses, through the same proof:
+    // an object the live table still reaches, and a path outside the binding.
+    let live = forge
+        .load_maintenance_protection_for_test(binding)
+        .await
+        .expect("the production live set loads");
+    let reachable = live
+        .paths_for_test()
+        .iter()
+        .next()
+        .expect("the live table still reaches at least one object")
+        .clone();
+    assert_eq!(
+        forge
+            .expired_cleanup_eligibility_for_test(
+                binding, cleanup_id, attempt, 0, candidate, &reachable,
+            )
+            .await
+            .expect("the production protection proof loads"),
+        "Protected",
+        "an object the live catalog still reaches is never eligible"
+    );
+    assert_eq!(
+        forge
+            .expired_cleanup_eligibility_for_test(
+                binding,
+                cleanup_id,
+                attempt,
+                0,
+                candidate,
+                "../outside/escape.parquet",
+            )
+            .await
+            .expect("the production protection proof loads"),
+        "InvalidPath",
+        "a path outside the table binding is never eligible"
+    );
 }
 
 #[tokio::test]
@@ -351,10 +647,30 @@ async fn candidate_preparation_releases_sql_and_blocks_oracle_and_competing_forg
         "an active cleanup task excludes every competing Forge claim for the table"
     );
 
-    worker
-        .execute_expired_cleanup_claim_for_test(claim, &CancellationToken::new())
-        .await
-        .expect("the drained cleanup task succeeds");
+    // Suspend the first candidate's fresh reachability stat. That instant is
+    // after the preparation committed and before any deletion was submitted,
+    // which is the only place the durable gates can be observed at all.
+    let attempt = claim.attempt_id.expect("a claimed task has an attempt");
+    let epoch_shutdown = CancellationToken::new();
+    let (oracle, identity) = reader_authority(&table.fixture, &epoch_shutdown).await;
+    let binding = table.fixture.binding.clone();
+    let forge = table.supervised.forge();
+    table.store.pause_stat_at(1);
+    let drain_stop = CancellationToken::new();
+    let (drained, ()) = tokio::join!(
+        worker.execute_expired_cleanup_claim_for_test(claim, &drain_stop),
+        async {
+            table.store.stat_paused().await;
+            assert_paused_candidate_gates(
+                &table, &worker, &forge, &binding, &oracle, &identity, cleanup_id, attempt,
+                &payload,
+            )
+            .await;
+            table.store.release_stat();
+        }
+    );
+    drained.expect("the drained cleanup task succeeds");
+    epoch_shutdown.cancel();
 
     let (state, frontier, prepared) = cursor(&table.fixture, cleanup_id).await;
     assert_eq!(state, "succeeded");

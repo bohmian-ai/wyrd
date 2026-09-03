@@ -657,6 +657,64 @@ impl Forge {
         ))
     }
 
+    /// Classifies one prepared cleanup candidate under an exact self-exemption.
+    ///
+    /// This is the production loader and the production predicate: only the
+    /// four-field exemption tuple is supplied by the caller, so an integration
+    /// test can vary task, attempt, cursor index, and candidate independently
+    /// and observe that every mismatch leaves the durable preparation acting as
+    /// protection.
+    ///
+    /// # Errors
+    ///
+    /// Returns catalog, manifest, SQL, operation-state, path, clock, object
+    /// metadata, or cancellation failures from the production protection path.
+    #[cfg(feature = "test-support")]
+    pub async fn expired_cleanup_eligibility_for_test(
+        &self,
+        binding: &TenantTableBinding,
+        exemption_task_id: Uuid,
+        exemption_attempt_id: Uuid,
+        exemption_index: u32,
+        exemption_candidate: &ForgeCleanupCandidate,
+        path: &str,
+    ) -> Result<String, ForgeError> {
+        let key = ForgeTableKey {
+            tenant: binding.tenant,
+            table_ref: binding.table_ref.clone(),
+        };
+        let stop = CancellationToken::new();
+        let protection = self
+            .load_expired_cleanup_protection(
+                &key,
+                binding,
+                self.core.clock.now()?,
+                ExpiredCleanupExemption {
+                    task_id: exemption_task_id,
+                    attempt_id: exemption_attempt_id,
+                    index: exemption_index,
+                    candidate: exemption_candidate,
+                },
+                &stop,
+            )
+            .await?;
+        let evidence = match self.core.object_store.stat(path).await {
+            Ok(metadata) => Some(metadata),
+            Err(error) if error.kind() == opendal::ErrorKind::NotFound => None,
+            Err(error) => return Err(ForgeError::ObjectDelete(error)),
+        };
+        Ok(format!(
+            "{:?}",
+            protection.expired_cleanup_eligibility(
+                binding,
+                path,
+                evidence
+                    .as_ref()
+                    .map_or(ObjectEvidence::Missing, ObjectEvidence::Present),
+            )
+        ))
+    }
+
     /// Runs one table-scoped orphan collection pass for integration fixtures.
     ///
     /// # Errors

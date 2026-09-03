@@ -612,8 +612,10 @@ pub(crate) struct PromotionIntegrationFixture {
     /// and reused by [`PromotionIntegrationFixture::seal_more`] to publish
     /// further hot objects through the same writer.
     scribe: Arc<ScribeImpl>,
-    /// Database retained for the fixture lifetime.
-    _database: wyrd_dev_fixtures::pg::PgFixture,
+    /// Database retained for the fixture lifetime and reused by scenarios that
+    /// compose a second production owner — an Oracle reader authority, say —
+    /// over the exact same durable state.
+    pub(crate) database: wyrd_dev_fixtures::pg::PgFixture,
     /// Warehouse root retained for the fixture lifetime.
     _warehouse: tempfile::TempDir,
     /// WAL root retained for the fixture lifetime.
@@ -694,7 +696,7 @@ impl PromotionIntegrationFixture {
             config: ForgeConfig::default(),
             forge_resources,
             scribe,
-            _database: database,
+            database,
             _warehouse: warehouse,
             _wal_root: wal_root,
             scratch_root,

@@ -55,6 +55,10 @@ VALA_OPERATOR_ALLOWLIST = {
     # Oracle admission recovery is a bounded global counter reconciliation
     # performed through the operator pool before readiness.
     "crates/vala/vala-sql/src/queries/oracle_admission_operator.rs",
+    # Oracle admission blocks are a cross-tenant capacity ledger fenced by the
+    # Oracle role incarnation, allocated and renewed before any tenant request
+    # is admitted, so the owner runs on the operator pool.
+    "crates/vala/vala-sql/src/queries/oracle_admission.rs",
 }
 
 # Cohesive owners that intentionally expose both cross-tenant OperatorPool
@@ -106,6 +110,8 @@ VALA_NON_RLS_CONTROL_TABLES = {
     "vala.forge_scheduler_state",  # singleton cross-tenant scheduler fence
     "vala.forge_worker_claim_state",  # singleton cross-tenant worker fairness cursor
     "vala.forge_large_lane_lease",  # singleton cluster-wide large-task fence
+    # global worker roster keyed by worker identity, no tenant column
+    "vala.forge_worker_registry",
 }
 
 RAW_QUERY_ALLOWLIST_MARKERS = [

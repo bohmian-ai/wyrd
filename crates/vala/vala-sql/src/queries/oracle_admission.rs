@@ -1,4 +1,11 @@
 //! Background allocation and renewal of role-fenced Oracle admission blocks.
+//!
+//! The delegated capacity ledger is cross-tenant by construction: one fenced
+//! renewal reconciles the global, tenant, and principal accounting rows for the
+//! whole node before any tenant request is admitted, so every statement runs
+//! through [`OperatorPool`] inside a transaction this module opens and closes
+//! itself. No raw pool or transaction leaves the owner.
+// raw-query grep allowlist: the fixed statements target admission tables that post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote them to macros.
 
 use chrono::Duration;
 use sqlx::{Postgres, Transaction};

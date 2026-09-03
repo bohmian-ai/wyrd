@@ -10,6 +10,12 @@ CREATE TABLE vala.oracle_admission_policies (
     UNIQUE NULLS NOT DISTINCT (scope_kind, data_tenant_id, query_class)
 );
 
+ALTER TABLE vala.oracle_admission_policies ENABLE ROW LEVEL SECURITY;
+ALTER TABLE vala.oracle_admission_policies FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON vala.oracle_admission_policies
+    USING (data_tenant_id = wyrd.current_tenant())
+    WITH CHECK (data_tenant_id = wyrd.current_tenant());
+
 CREATE TABLE vala.oracle_admission_blocks (
     block_id uuid PRIMARY KEY,
     allocation_id uuid NOT NULL,
@@ -32,6 +38,12 @@ CREATE INDEX oracle_admission_blocks_accounting
     ON vala.oracle_admission_blocks (scope_kind, data_tenant_id, query_class, expires_at);
 CREATE INDEX oracle_admission_blocks_holder
     ON vala.oracle_admission_blocks (holder_node_id, holder_fencing_token, expires_at);
+
+ALTER TABLE vala.oracle_admission_blocks ENABLE ROW LEVEL SECURITY;
+ALTER TABLE vala.oracle_admission_blocks FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON vala.oracle_admission_blocks
+    USING (data_tenant_id = wyrd.current_tenant())
+    WITH CHECK (data_tenant_id = wyrd.current_tenant());
 
 REVOKE ALL ON vala.oracle_admission_policies FROM PUBLIC, wyrd_app;
 REVOKE ALL ON vala.oracle_admission_blocks FROM PUBLIC, wyrd_app;

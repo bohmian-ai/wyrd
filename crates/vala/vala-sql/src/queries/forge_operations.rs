@@ -30,7 +30,9 @@ use wyrd_spec::vala::api::{
 };
 
 use crate::queries::audit_outbox::{OperatorAudit, append_audit};
-use crate::queries::oracle_reader_authority::{BIFROST_CATALOG_NAME, OracleTableProtections};
+use crate::queries::oracle_reader_authority::{
+    BIFROST_CATALOG_NAME, HeaderDbRow, MemberDbRow, digest32, invariant, sorted_members,
+};
 use crate::row_types::forge_operations::{
     ForgeClaimTable, ForgeExpirationAuthority, ForgeExpirationPreparation,
     ForgeExpirationResetOutcome, ForgeExpirationResetRequest, ForgeExpirationSettlementRequest,
@@ -39,7 +41,9 @@ use crate::row_types::forge_operations::{
     OpenForgeOperationPage,
 };
 use crate::row_types::forge_tasks::{ForgeTaskEvidence, evidence_to_value};
-use crate::row_types::oracle_reader_authority::TableAuthorityIdentity;
+use crate::row_types::oracle_reader_authority::{
+    ProtectionFrontier, ProtectionMember, ProtectionRecord, TableAuthorityIdentity,
+};
 use crate::{OperatorPool, SqlError, TenantConn};
 
 /// Scoped Forge operation state handle for one `(resource, family)`.
@@ -1541,9 +1545,7 @@ async fn refuse_protected_snapshots(
     identity: &TableAuthorityIdentity,
     selected: &[i64],
 ) -> Result<(), SqlError> {
-    let records = OracleTableProtections::for_connection(tx)
-        .list_table_protection(identity)
-        .await?;
+    let records = list_table_protection_in_operator_tx(tx, identity).await?;
     for record in &records {
         if let Some(covered) = selected
             .iter()
@@ -1558,6 +1560,121 @@ async fn refuse_protected_snapshots(
         }
     }
     Ok(())
+}
+
+/// Reads and validates every epoch's complete protection record for one table
+/// inside the preparation's own operator transaction.
+///
+/// Preparation already holds the table's `bifrost_table_maintenance_authority`
+/// row lock on an operator transaction whose `wyrd.current_tenant()` binding is
+/// established, and the frontier must be read under that same lock: a
+/// protection published between an earlier read and the lock would otherwise be
+/// invisible. The statements, ordering, and row validation mirror the Oracle
+/// owner's tenant-connection reads exactly — same tenant predicate, same
+/// `node_id, fencing_token` epoch order, same `protected_snapshot_id` member
+/// order, same header-identity, digest, and domain validation.
+///
+/// # Errors
+/// Returns [`SqlError::InvariantViolation`] when a stored header names another
+/// table, when a header or member fails validation, or when a header disappears
+/// inside this transaction, and [`SqlError`] when a statement fails.
+async fn list_table_protection_in_operator_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    identity: &TableAuthorityIdentity,
+) -> Result<Vec<ProtectionRecord>, SqlError> {
+    identity.validate(BIFROST_CATALOG_NAME)?;
+    let epochs: Vec<(uuid::Uuid, i64)> = sqlx::query_as(
+        r"
+        SELECT node_id, fencing_token
+          FROM vala.oracle_table_protections
+         WHERE data_tenant_id = wyrd.current_tenant()
+           AND table_uid = $1
+         ORDER BY node_id, fencing_token
+        ",
+    )
+    .bind(identity.table_uid.as_slice())
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(SqlError::from)?;
+
+    let mut records = Vec::with_capacity(epochs.len());
+    for (node_id, fencing_token) in epochs {
+        let header: Option<HeaderDbRow> = sqlx::query_as(
+            r"
+            SELECT catalog_name, namespace_name, table_name, revision,
+                   frontier_encoding_version, frontier_digest, updated_at
+              FROM vala.oracle_table_protections
+             WHERE data_tenant_id = wyrd.current_tenant()
+               AND table_uid = $1
+               AND node_id = $2
+               AND fencing_token = $3
+            ",
+        )
+        .bind(identity.table_uid.as_slice())
+        .bind(node_id)
+        .bind(fencing_token)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(SqlError::from)?;
+        let header = header.ok_or_else(|| {
+            invariant("reader protection header disappeared inside one transaction")
+        })?;
+        if header.catalog_name != identity.catalog_name
+            || header.namespace_name != identity.namespace_name
+            || header.table_name != identity.table_name
+        {
+            return Err(invariant(
+                "stored reader protection names a different table than the caller",
+            ));
+        }
+
+        let member_rows: Vec<MemberDbRow> = sqlx::query_as(
+            r"
+            SELECT protected_snapshot_id, protected_snapshot_timestamp_ms,
+                   retained_head_snapshot_id, retained_head_timestamp_ms,
+                   ancestry_path, ancestry_digest_version, ancestry_digest
+              FROM vala.oracle_table_protection_members
+             WHERE data_tenant_id = wyrd.current_tenant()
+               AND table_uid = $1
+               AND node_id = $2
+               AND fencing_token = $3
+             ORDER BY protected_snapshot_id
+            ",
+        )
+        .bind(identity.table_uid.as_slice())
+        .bind(node_id)
+        .bind(fencing_token)
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(SqlError::from)?;
+        let mut members = Vec::with_capacity(member_rows.len());
+        for row in member_rows {
+            let member = ProtectionMember {
+                protected_snapshot_id: row.protected_snapshot_id,
+                protected_snapshot_timestamp_ms: row.protected_snapshot_timestamp_ms,
+                retained_head_snapshot_id: row.retained_head_snapshot_id,
+                retained_head_timestamp_ms: row.retained_head_timestamp_ms,
+                ancestry_path: row.ancestry_path,
+                ancestry_digest_version: row.ancestry_digest_version,
+                ancestry_digest: digest32(row.ancestry_digest)?,
+            };
+            member.validate(identity)?;
+            members.push(member);
+        }
+
+        let record = ProtectionRecord {
+            revision: header.revision,
+            frontier_encoding_version: header.frontier_encoding_version,
+            frontier_digest: digest32(header.frontier_digest)?,
+            updated_at: header.updated_at,
+            frontier: ProtectionFrontier {
+                members: sorted_members(members),
+            },
+        };
+        record.validate(identity)?;
+        records.push(record);
+    }
+    Ok(records)
 }
 
 /// Advances the table's periodic planning demand so a resolved expiration is

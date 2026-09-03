@@ -2,6 +2,7 @@
 //!
 //! The owner records the fsynced v4 WAL identity and appends the canonical
 //! ingest audit event in the same caller-owned [`TenantConn`] transaction.
+// raw-query grep allowlist: both statements are fixed and tenant-bound; `vala.scribe_batch_commits` post-dates the sqlx offline cache, so run `mise run sqlx:prepare` to promote them to macros.
 
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::AuditEvent;

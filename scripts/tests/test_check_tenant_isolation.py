@@ -19,8 +19,16 @@ SCRIPT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from check_tenant_isolation import (  # noqa: E402
+    VALA_NON_RLS_CONTROL_TABLES,
+    VALA_OPERATOR_ALLOWLIST,
+    ROOT,
+    has_platform_executor,
+    has_raw_query_marker,
+    normalize_sql,
+    strip_sql_line_comments,
     structs_owning_tenant_conn,
     tenant_conn_owner_violations,
+    tenant_table_windows,
 )
 
 
@@ -110,6 +118,93 @@ def test_explicit_tenant_conn_parameter_always_passes() -> None:
     }
     """
     assert tenant_conn_owner_violations(code) == []
+
+
+def _repo_text(relative: str) -> str:
+    """Reads one repository file the pinned classifications describe."""
+    return (ROOT / relative).read_text()
+
+
+ORACLE_ADMISSION_MIGRATION = (
+    "crates/vala/vala-sql/migrations/20260910000022_oracle_admission_blocks.sql"
+)
+ORACLE_ADMISSION_MODULE = "crates/vala/vala-sql/src/queries/oracle_admission.rs"
+ORACLE_READER_AUTHORITY_MODULE = (
+    "crates/vala/vala-sql/src/queries/oracle_reader_authority.rs"
+)
+SCRIBE_BATCH_COMMITS_MODULE = (
+    "crates/vala/vala-sql/src/queries/scribe_batch_commits.rs"
+)
+
+
+def test_forge_worker_registry_is_the_only_new_control_table_exception() -> None:
+    assert "vala.forge_worker_registry" in VALA_NON_RLS_CONTROL_TABLES
+    migration = strip_sql_line_comments(
+        _repo_text(
+            "crates/vala/vala-sql/migrations/"
+            "20260910000019_forge_task_failure_taxonomy.sql"
+        )
+    )
+    windows = dict(tenant_table_windows(migration, "vala"))
+    assert "forge_worker_registry" in windows
+    assert "data_tenant_id" not in windows["forge_worker_registry"], (
+        "the registry exception is only justified while the table has no tenant column"
+    )
+
+
+def test_both_oracle_admission_tables_carry_a_complete_rls_triple() -> None:
+    migration = strip_sql_line_comments(_repo_text(ORACLE_ADMISSION_MIGRATION))
+    windows = dict(tenant_table_windows(migration, "vala"))
+    for table in ("oracle_admission_policies", "oracle_admission_blocks"):
+        qualified = f"vala.{table}"
+        assert qualified not in VALA_NON_RLS_CONTROL_TABLES, (
+            "an admission table must never be classified as a non-RLS control table"
+        )
+        window = normalize_sql(windows[table])
+        for clause in (
+            f"alter table {qualified} enable row level security",
+            f"alter table {qualified} force row level security",
+            f"create policy tenant_isolation on {qualified}",
+            "using (data_tenant_id = wyrd.current_tenant())",
+            "with check (data_tenant_id = wyrd.current_tenant())",
+        ):
+            assert clause in window.lower(), f"{qualified} is missing `{clause}`"
+
+
+def test_oracle_admission_module_is_an_operator_pool_owner() -> None:
+    assert ORACLE_ADMISSION_MODULE in VALA_OPERATOR_ALLOWLIST
+    code = _repo_text(ORACLE_ADMISSION_MODULE)
+    assert has_platform_executor(code), (
+        "an operator-allowlisted module must still prove its platform executor"
+    )
+    assert "TenantConn" not in code, (
+        "the cross-tenant admission ledger must not take a tenant connection"
+    )
+
+
+def test_table_protections_owns_a_tenant_conn_and_rejects_a_raw_connection() -> None:
+    code = _repo_text(ORACLE_READER_AUTHORITY_MODULE)
+    assert "OracleTableProtections" in structs_owning_tenant_conn(code)
+    assert tenant_conn_owner_violations(code) == []
+    assert "for_connection" not in code, (
+        "a raw-connection constructor would reintroduce the unowned binding"
+    )
+    raw = code.replace(
+        "conn: &'conn mut TenantConn<'tx>,\n}",
+        "conn: &'conn mut sqlx::PgConnection,\n}",
+    )
+    assert "OracleTableProtections" not in structs_owning_tenant_conn(raw), (
+        "a raw PgConnection field must not count as tenant ownership"
+    )
+
+
+def test_the_two_sanctioned_raw_query_markers_are_accepted() -> None:
+    for relative in (ORACLE_ADMISSION_MODULE, SCRIBE_BATCH_COMMITS_MODULE):
+        code = _repo_text(relative)
+        assert has_raw_query_marker(code), f"{relative} lost its raw-query marker"
+        assert not has_raw_query_marker(
+            code.replace("raw-query grep allowlist", "raw-query grep")
+        ), f"{relative} must be justified by the exact sanctioned marker"
 
 
 def main() -> int:

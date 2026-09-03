@@ -32,7 +32,7 @@ use crate::{OperatorPool, SqlError, TenantConn};
 pub const BIFROST_CATALOG_NAME: &str = "wyrd-redux";
 
 /// Constructs a fail-closed invariant error without leaking row payloads.
-fn invariant(detail: &str) -> SqlError {
+pub(crate) fn invariant(detail: &str) -> SqlError {
     SqlError::InvariantViolation {
         detail: detail.to_owned(),
     }
@@ -56,7 +56,7 @@ fn table_uid(bytes: Vec<u8>) -> Result<[u8; 16], SqlError> {
 ///
 /// Returns [`SqlError::InvariantViolation`] when the stored value is not
 /// exactly 32 bytes.
-fn digest32(bytes: Vec<u8>) -> Result<[u8; 32], SqlError> {
+pub(crate) fn digest32(bytes: Vec<u8>) -> Result<[u8; 32], SqlError> {
     <[u8; 32]>::try_from(bytes.as_slice())
         .map_err(|_| invariant("stored reader protection digest is not 32 bytes"))
 }
@@ -672,29 +672,19 @@ impl TryFrom<EpochDbRow> for OracleEpochRow {
 /// compare-and-set on the table-local revision. A conflict returns the complete
 /// winning record so the coordinator can adopt it when it already covers the
 /// local cut instead of recomputing blindly.
-pub struct OracleTableProtections<'conn> {
-    /// Already tenant-bound connection every statement runs inside.
-    conn: &'conn mut sqlx::PgConnection,
+pub struct OracleTableProtections<'conn, 'tx> {
+    /// Tenant-bound transaction every statement runs inside.
+    ///
+    /// Owning the [`TenantConn`] itself, rather than a connection borrowed out
+    /// of one, is what makes every `&mut self` method below provably
+    /// tenant-scoped: there is no way to construct this owner from a connection
+    /// whose RLS binding was never established.
+    conn: &'conn mut TenantConn<'tx>,
 }
 
-impl<'conn> OracleTableProtections<'conn> {
+impl<'conn, 'tx> OracleTableProtections<'conn, 'tx> {
     /// Binds the protection owner to one tenant transaction.
-    pub fn new(conn: &'conn mut TenantConn<'_>) -> Self {
-        Self {
-            conn: &mut **conn.transaction(),
-        }
-    }
-
-    /// Binds the protection owner to an already tenant-bound connection.
-    ///
-    /// Forge's snapshot-expiration preparation runs on the operator pool,
-    /// because claim mutation and the maintenance-lease fence are not reachable
-    /// from `wyrd_app`, yet it must read these same protection rows inside that
-    /// one transaction under the same table lock — a frontier published between
-    /// the caller's own read and the lock would otherwise be invisible to it.
-    /// The caller is responsible for having bound `wyrd.current_tenant()` on
-    /// this connection; every statement below still filters on it explicitly.
-    pub fn for_connection(conn: &'conn mut sqlx::PgConnection) -> Self {
+    pub fn new(conn: &'conn mut TenantConn<'tx>) -> Self {
         Self { conn }
     }
 
@@ -727,7 +717,7 @@ impl<'conn> OracleTableProtections<'conn> {
         .bind(identity.table_uid.as_slice())
         .bind(node_id)
         .bind(fencing_token)
-        .fetch_optional(&mut *self.conn)
+        .fetch_optional(&mut **self.conn.transaction())
         .await
         .map_err(SqlError::from)?;
         let Some(header) = header else {
@@ -783,7 +773,7 @@ impl<'conn> OracleTableProtections<'conn> {
         .bind(identity.table_uid.as_slice())
         .bind(node_id)
         .bind(fencing_token)
-        .fetch_all(&mut *self.conn)
+        .fetch_all(&mut **self.conn.transaction())
         .await
         .map_err(SqlError::from)?;
         let mut members = Vec::with_capacity(rows.len());
@@ -849,7 +839,7 @@ impl<'conn> OracleTableProtections<'conn> {
             .bind(identity.table_uid.as_slice())
             .bind(node_id)
             .bind(fencing_token)
-            .execute(&mut *self.conn)
+            .execute(&mut **self.conn.transaction())
             .await
             .map_err(SqlError::from)?;
             return Ok(ProtectionCas::Committed(Box::new(ProtectionRecord {
@@ -886,7 +876,7 @@ impl<'conn> OracleTableProtections<'conn> {
         .bind(next_revision)
         .bind(FRONTIER_ENCODING_VERSION)
         .bind(frontier.digest(identity).as_slice())
-        .fetch_one(&mut *self.conn)
+        .fetch_one(&mut **self.conn.transaction())
         .await
         .map_err(SqlError::from)?;
 
@@ -908,7 +898,7 @@ impl<'conn> OracleTableProtections<'conn> {
                 .map(|m| m.protected_snapshot_id)
                 .collect::<Vec<i64>>(),
         )
-        .execute(&mut *self.conn)
+        .execute(&mut **self.conn.transaction())
         .await
         .map_err(SqlError::from)?;
 
@@ -942,7 +932,7 @@ impl<'conn> OracleTableProtections<'conn> {
             .bind(&member.ancestry_path)
             .bind(ANCESTRY_DIGEST_VERSION)
             .bind(member.ancestry_digest.as_slice())
-            .execute(&mut *self.conn)
+            .execute(&mut **self.conn.transaction())
             .await
             .map_err(SqlError::from)?;
         }
@@ -985,7 +975,7 @@ impl<'conn> OracleTableProtections<'conn> {
         .bind(key.table_uid.as_slice())
         .bind(key.node_id)
         .bind(key.fencing_token)
-        .fetch_optional(&mut *self.conn)
+        .fetch_optional(&mut **self.conn.transaction())
         .await
         .map_err(SqlError::from)?;
         let Some((catalog_name, namespace_name, table_name, revision)) = row else {
@@ -1027,7 +1017,7 @@ impl<'conn> OracleTableProtections<'conn> {
             ",
         )
         .bind(identity.table_uid.as_slice())
-        .fetch_all(&mut *self.conn)
+        .fetch_all(&mut **self.conn.transaction())
         .await
         .map_err(SqlError::from)?;
         let mut records = Vec::with_capacity(epochs.len());
@@ -1045,47 +1035,47 @@ impl<'conn> OracleTableProtections<'conn> {
 }
 
 /// Orders decoded members by digest so a read reproduces the written order.
-fn sorted_members(mut members: Vec<ProtectionMember>) -> Vec<ProtectionMember> {
+pub(crate) fn sorted_members(mut members: Vec<ProtectionMember>) -> Vec<ProtectionMember> {
     members.sort_by_key(|member| member.ancestry_digest);
     members
 }
 
 /// Raw protection header projection awaiting validation.
 #[derive(sqlx::FromRow)]
-struct HeaderDbRow {
+pub(crate) struct HeaderDbRow {
     /// Persisted catalog payload, checked against the caller's identity.
-    catalog_name: String,
+    pub(crate) catalog_name: String,
     /// Persisted namespace payload, checked against the caller's identity.
-    namespace_name: String,
+    pub(crate) namespace_name: String,
     /// Persisted table-name payload, checked against the caller's identity.
-    table_name: String,
+    pub(crate) table_name: String,
     /// Monotonic table-local revision.
-    revision: i64,
+    pub(crate) revision: i64,
     /// Stored frontier encoding version.
-    frontier_encoding_version: i32,
+    pub(crate) frontier_encoding_version: i32,
     /// Stored header digest bytes awaiting length validation.
-    frontier_digest: Vec<u8>,
+    pub(crate) frontier_digest: Vec<u8>,
     /// Database time of the commit that wrote this revision.
-    updated_at: DateTime<Utc>,
+    pub(crate) updated_at: DateTime<Utc>,
 }
 
 /// Raw protection member projection awaiting validation.
 #[derive(sqlx::FromRow)]
-struct MemberDbRow {
+pub(crate) struct MemberDbRow {
     /// Oldest active cut on this chain.
-    protected_snapshot_id: i64,
+    pub(crate) protected_snapshot_id: i64,
     /// Iceberg timestamp of the protected snapshot.
-    protected_snapshot_timestamp_ms: i64,
+    pub(crate) protected_snapshot_timestamp_ms: i64,
     /// Newest active cut on this chain.
-    retained_head_snapshot_id: i64,
+    pub(crate) retained_head_snapshot_id: i64,
     /// Iceberg timestamp of the retained head.
-    retained_head_timestamp_ms: i64,
+    pub(crate) retained_head_timestamp_ms: i64,
     /// Inclusive newest-to-oldest parent walk.
-    ancestry_path: Vec<i64>,
+    pub(crate) ancestry_path: Vec<i64>,
     /// Stored ancestry digest version.
-    ancestry_digest_version: i32,
+    pub(crate) ancestry_digest_version: i32,
     /// Stored ancestry digest bytes awaiting length validation.
-    ancestry_digest: Vec<u8>,
+    pub(crate) ancestry_digest: Vec<u8>,
 }
 
 /// Enumerates the exact protection keys one dead epoch still holds.

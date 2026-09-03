@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 
+use chrono::Duration as ChronoDuration;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use vala_bifrost_redux::catalog::TenantTableBinding;
@@ -754,15 +755,108 @@ async fn assert_foreign_takeover_is_refused(
     assert_eq!(owner, Some(claim.claimed_by.expect("claim owner")));
 }
 
+/// Seeds one more real expired object and returns its plan candidate.
+///
+/// Partial progress is only observable across more than one candidate, and the
+/// handoff a single fixture expiration leaves carries exactly one. The object is
+/// written beside the existing candidate so it stays inside the table binding,
+/// and the manual Forge clock — the only age authority in this fixture — is
+/// moved past it so the shared minimum-age proof admits it.
+///
+/// # Panics
+///
+/// Panics when the object cannot be written or the manual clock cannot advance.
+async fn seed_second_candidate(
+    table: &ExpirableTable,
+    payload: &ExpiredCleanupPayload,
+) -> ForgeCleanupCandidate {
+    let base = payload
+        .cleanup_candidates
+        .first()
+        .expect("the handoff carries at least one candidate");
+    let path = sibling_path(base, "wyrd-second-expired.parquet");
+    table
+        .fixture
+        .staging
+        .write(&path, b"second expired candidate".to_vec())
+        .await
+        .expect("the second candidate object seeds");
+    let advanced = table.control.now().expect("manual clock reads") + ChronoDuration::days(7);
+    table
+        .control
+        .set(advanced)
+        .expect("the manual clock advances past the seeded object");
+    ForgeCleanupCandidate {
+        category: base.category,
+        table: base.table.clone(),
+        path: ForgeCleanupPath::new(&path).expect("second candidate path"),
+    }
+}
+
+/// Lapses one task's claim lease so the prepared-recovery route can take it.
+///
+/// This is the durable trace a crashed owner leaves: the prepared row and its
+/// cursor survive untouched while the lease simply stops being renewed.
+///
+/// # Panics
+///
+/// Panics when the update fails.
+async fn expire_claim(pool: &sqlx::PgPool, task_id: Uuid) {
+    sqlx::query("UPDATE vala.forge_tasks SET claim_expires_at=statement_timestamp()-interval '1 hour' WHERE task_id=$1")
+        .bind(task_id)
+        .execute(pool)
+        .await
+        .expect("the claim lease lapses");
+}
+
+/// Counts how many audits for one task carry the given operation.
+///
+/// # Panics
+///
+/// Panics when the audit read fails.
+async fn audit_count(
+    fixture: &PromotionIntegrationFixture,
+    task_id: Uuid,
+    operation: &str,
+) -> usize {
+    audits(fixture, task_id)
+        .await
+        .iter()
+        .filter(|entry| entry.as_str() == operation)
+        .count()
+}
+
+/// Reads one task's current attempt generation.
+///
+/// # Panics
+///
+/// Panics when the task is unreadable.
+async fn attempt_of(pool: &sqlx::PgPool, task_id: Uuid) -> Option<Uuid> {
+    sqlx::query_scalar("SELECT attempt_id FROM vala.forge_tasks WHERE task_id = $1")
+        .bind(task_id)
+        .fetch_one(pool)
+        .await
+        .expect("cleanup task readable")
+}
+
 #[tokio::test]
 async fn cursor_replays_exact_prepared_candidate_after_refusal_uncertainty_and_takeover() {
     let DrainedExpiration {
         table,
         worker,
         cleanup_id,
-        payload,
+        mut payload,
     } = Box::pin(drained_expiration("cleanup_replay")).await;
     let pool = table.fixture.operator_pool.pool();
+    let deletes_before = table.store.deletes();
+
+    let second = seed_second_candidate(&table, &payload).await;
+    payload.cleanup_candidates.push(second);
+    payload.cleanup_candidates.sort();
+    assert_eq!(payload.cleanup_candidates.len(), 2);
+    persist_cleanup_plan(&table.fixture, cleanup_id, &payload).await;
+    let first = payload.cleanup_candidates[0].path.as_str().to_owned();
+    let last = payload.cleanup_candidates[1].path.as_str().to_owned();
 
     let claim = worker
         .claim_for_test()
@@ -771,8 +865,8 @@ async fn cursor_replays_exact_prepared_candidate_after_refusal_uncertainty_and_t
         .expect("the cleanup task is claimable");
     let attempt = claim.attempt_id.expect("a claimed task has an attempt");
 
-    // Cancelling before the first delete is submitted retains the candidate:
-    // nothing advances and the exact plan vector is unchanged.
+    // Cancelling before the first preparation is a cooperative stop: nothing
+    // durable was written, so nothing advances and no object is touched.
     let cancelled = CancellationToken::new();
     cancelled.cancel();
     let refused = worker
@@ -781,12 +875,12 @@ async fn cursor_replays_exact_prepared_candidate_after_refusal_uncertainty_and_t
         .expect_err("a cancelled drain does not succeed");
     assert!(
         matches!(refused, ForgeError::Shutdown | ForgeError::ShutdownRetained),
-        "pre-submission cancellation is a cooperative stop: {refused}"
+        "cancellation before preparation is a cooperative stop: {refused}"
     );
-    let (_, frontier, _) = cursor(&table.fixture, cleanup_id).await;
     assert_eq!(
-        frontier, 0,
-        "cancellation before submission advances nothing"
+        cursor(&table.fixture, cleanup_id).await,
+        ("running".to_owned(), 0, None),
+        "cancellation before preparation writes no cursor"
     );
     for candidate in &payload.cleanup_candidates {
         assert!(
@@ -798,49 +892,214 @@ async fn cursor_replays_exact_prepared_candidate_after_refusal_uncertainty_and_t
     assert_foreign_takeover_is_refused(&table, &claim, cleanup_id, pool).await;
 
     // A cooperatively cancelled pre-effect attempt released nothing durable, so
-    // the task returns to the claim pool and a successor drains the identical
-    // immutable candidate vector to success.
-    sqlx::query("UPDATE vala.forge_tasks SET state='ready',attempt_id=NULL,claimed_by=NULL,claim_expires_at=NULL,watermark_snapshot_id=NULL,watermark_timestamp_ms=NULL WHERE task_id=$1")
-        .bind(cleanup_id)
-        .execute(pool)
-        .await
-        .expect("the cancelled claim releases");
-    let successor = worker
+    // the task returns to the claim pool with the identical immutable plan.
+    release_cleanup_claim(&table.fixture, cleanup_id).await;
+    let claim = worker
         .claim_for_test()
         .await
         .expect("claim transaction runs")
         .expect("the released cleanup task is claimable again");
-    assert_eq!(successor.task_id, cleanup_id);
-    assert_ne!(
-        successor.attempt_id,
-        Some(attempt),
-        "a released pre-effect claim is re-attempted"
+    assert_eq!(claim.task_id, cleanup_id);
+    let attempt = {
+        let next = claim.attempt_id.expect("a claimed task has an attempt");
+        assert_ne!(next, attempt, "a released pre-effect claim is re-attempted");
+        next
+    };
+
+    // A stat failure lands after the preparation committed, so it is a
+    // definitive pre-submission failure: it settles as a refusal, appends one
+    // refusal audit, and retains candidate zero for exact replay.
+    let stats_before = table.store.stats();
+    table.store.fail_next_stats(1);
+    let retained = worker
+        .execute_expired_cleanup_claim_for_test(claim.clone(), &CancellationToken::new())
+        .await
+        .expect_err("a refused candidate does not complete the drain");
+    assert!(
+        matches!(retained, ForgeError::Reconciliation { .. }),
+        "a refusal retains the candidate for replay: {retained}"
+    );
+    assert!(
+        table.store.stats() > stats_before,
+        "the refusal happened at a real object stat"
     );
     assert_eq!(
-        successor.plan.parameters, claim.plan.parameters,
-        "the copied cleanup plan is immutable across attempts"
+        cursor(&table.fixture, cleanup_id).await,
+        ("prepared".to_owned(), 0, Some(0)),
+        "a refused candidate stays prepared at its own index"
     );
-    worker
-        .execute_expired_cleanup_claim_for_test(successor, &CancellationToken::new())
+    assert_eq!(
+        table.store.deletes(),
+        deletes_before,
+        "a pre-submission refusal submits no delete"
+    );
+    assert_eq!(
+        audit_count(
+            &table.fixture,
+            cleanup_id,
+            "forge.expired_cleanup.candidate_refused"
+        )
+        .await,
+        1,
+        "one authoritative refusal appends exactly one candidate audit"
+    );
+
+    // The owner stops renewing its lease. The prepared task is recovered by the
+    // production prepared-claim route under a new fence, retaining the same
+    // task and attempt identity, and every retry re-proves the candidate.
+    expire_claim(pool, cleanup_id).await;
+    let taker = ForgeWorker::new(
+        table.supervised.forge(),
+        ForgeWorkerConfig::default(),
+        Uuid::now_v7(),
+    )
+    .expect("takeover worker");
+
+    // Cancellation released from a paused stat is also strictly pre-submission.
+    let stats_before = table.store.stats();
+    table.store.pause_stat_at(1);
+    let stop = CancellationToken::new();
+    let (result, ()) = tokio::join!(taker.execute_one_for_test(&stop), async {
+        table.store.stat_paused().await;
+        stop.cancel();
+        table.store.release_stat();
+    });
+    let retained = result.expect_err("pre-submission cancellation retains the candidate");
+    assert!(
+        matches!(retained, ForgeError::Reconciliation { .. }),
+        "cancellation observed before submission settles as a refusal: {retained}"
+    );
+    assert!(
+        table.store.stats() > stats_before,
+        "takeover re-stats the candidate before any retry"
+    );
+    assert_eq!(
+        cursor(&table.fixture, cleanup_id).await,
+        ("prepared".to_owned(), 0, Some(0)),
+        "cancellation before submission advances nothing"
+    );
+    assert_eq!(
+        table.store.deletes(),
+        deletes_before,
+        "cancellation before submission submits no delete"
+    );
+    assert_eq!(
+        audit_count(
+            &table.fixture,
+            cleanup_id,
+            "forge.expired_cleanup.candidate_refused"
+        )
+        .await,
+        2,
+        "each observed authoritative refusal appends exactly one audit"
+    );
+    assert_eq!(
+        attempt_of(pool, cleanup_id).await,
+        Some(attempt),
+        "takeover resumes the same task and attempt"
+    );
+
+    // The displaced owner is stale: it can neither mutate the row nor audit.
+    let sequence_before = audits(&table.fixture, cleanup_id).await.len();
+    assert!(
+        worker
+            .execute_expired_cleanup_claim_for_test(claim, &CancellationToken::new())
+            .await
+            .is_err(),
+        "a displaced owner cannot drain the task it lost"
+    );
+    assert_eq!(
+        audits(&table.fixture, cleanup_id).await.len(),
+        sequence_before,
+        "a stale owner appends no audit"
+    );
+    assert_eq!(
+        cursor(&table.fixture, cleanup_id).await,
+        ("prepared".to_owned(), 0, Some(0)),
+        "a stale owner mutates no row"
+    );
+
+    // A delete that took effect but reported failure is uncertain: the object is
+    // gone, yet nothing advances, so the same candidate is replayed rather than
+    // skipped past an object whose fate was unknown.
+    expire_claim(pool, cleanup_id).await;
+    table.store.fail_next_deletes(1);
+    let retained = taker
+        .execute_one_for_test(&CancellationToken::new())
         .await
-        .expect("the retained candidates replay to success");
+        .expect_err("an uncertain acceptance does not complete the drain");
+    assert!(
+        matches!(retained, ForgeError::Reconciliation { .. }),
+        "an unknown acceptance retains the candidate: {retained}"
+    );
+    assert_eq!(
+        table.store.deletes(),
+        deletes_before + 1,
+        "exactly one delete was submitted"
+    );
+    assert!(
+        !object_exists(&table.fixture, &first).await,
+        "the submitted delete took effect even though its acknowledgement was lost"
+    );
+    assert_eq!(
+        cursor(&table.fixture, cleanup_id).await,
+        ("prepared".to_owned(), 0, Some(0)),
+        "an uncertain acceptance advances nothing"
+    );
+    assert_eq!(
+        audit_count(
+            &table.fixture,
+            cleanup_id,
+            "forge.expired_cleanup.candidate_uncertain"
+        )
+        .await,
+        1,
+        "one uncertain settlement appends exactly one candidate audit"
+    );
+
+    // The replay proves the absence with a fresh stat, advances once, and
+    // finishes the second candidate from the partial frontier.
+    expire_claim(pool, cleanup_id).await;
+    assert_eq!(
+        attempt_of(pool, cleanup_id).await,
+        Some(attempt),
+        "every takeover so far resumed the same task and attempt"
+    );
+    assert!(
+        taker
+            .execute_one_for_test(&CancellationToken::new())
+            .await
+            .expect("the retained candidates replay to success"),
+        "the prepared cleanup task is recovered"
+    );
     let (state, frontier, prepared) = cursor(&table.fixture, cleanup_id).await;
     assert_eq!(state, "succeeded");
     assert_eq!(frontier as usize, payload.cleanup_candidates.len());
     assert_eq!(prepared, None);
-    let sequence = audits(&table.fixture, cleanup_id).await;
     assert_eq!(
-        sequence
-            .iter()
-            .filter(|entry| *entry == "forge.expired_cleanup.candidate_prepared")
-            .count(),
-        payload.cleanup_candidates.len(),
-        "no candidate is prepared twice: {sequence:?}"
+        table.store.deletes(),
+        deletes_before + 2,
+        "the proven-absent candidate is never blindly deleted a second time"
     );
-    for candidate in &payload.cleanup_candidates {
-        assert!(
-            !object_exists(&table.fixture, candidate.path.as_str()).await,
-            "every candidate is finally removed"
+    assert!(!object_exists(&table.fixture, &first).await);
+    assert!(!object_exists(&table.fixture, &last).await);
+
+    let sequence = audits(&table.fixture, cleanup_id).await;
+    for (operation, expected) in [
+        ("forge.expired_cleanup.candidate_prepared", 2),
+        ("forge.expired_cleanup.candidate_refused", 2),
+        ("forge.expired_cleanup.candidate_uncertain", 1),
+        ("forge.expired_cleanup.candidate_missing", 1),
+        ("forge.expired_cleanup.candidate_deleted", 1),
+        ("forge.task.succeeded", 1),
+    ] {
+        assert_eq!(
+            sequence
+                .iter()
+                .filter(|entry| entry.as_str() == operation)
+                .count(),
+            expected,
+            "exact audit cardinality for {operation}: {sequence:?}"
         );
     }
 

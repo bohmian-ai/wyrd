@@ -76,6 +76,8 @@ pub(crate) struct CountingObjectStore {
     stat_pause: StatPause,
     /// Remaining delegated stats to fail with an injected transient error.
     stat_errors: AtomicUsize,
+    /// Remaining delegated deletes to submit and then report as unknown.
+    delete_errors: AtomicUsize,
 }
 
 /// Deterministic pause seam over exactly one delegated `stat`.
@@ -106,6 +108,7 @@ impl CountingObjectStore {
             stats: AtomicUsize::new(0),
             stat_pause: StatPause::default(),
             stat_errors: AtomicUsize::new(0),
+            delete_errors: AtomicUsize::new(0),
         })
     }
 
@@ -141,6 +144,15 @@ impl CountingObjectStore {
     /// it exercises the branch where the object's existence stays unknown.
     pub(crate) fn fail_next_stats(&self, count: usize) {
         self.stat_errors.store(count, Ordering::Release);
+    }
+
+    /// Let the next `count` delegated deletes take effect, then report failure.
+    ///
+    /// This is the acceptance-unknown shape a real object store produces when
+    /// the deletion happened but its acknowledgement was lost, so the caller
+    /// must treat the candidate as uncertain rather than deleted.
+    pub(crate) fn fail_next_deletes(&self, count: usize) {
+        self.delete_errors.store(count, Ordering::Release);
     }
 
     /// Borrow the shared read counter so a catalog seam can snapshot it.
@@ -214,7 +226,21 @@ impl ForgeObjectStore for CountingObjectStore {
 
     async fn delete(&self, path: &str) -> opendal::Result<()> {
         self.deletes.fetch_add(1, Ordering::AcqRel);
-        self.inner.delete(path).await
+        let submitted = self.inner.delete(path).await;
+        if self
+            .delete_errors
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            submitted?;
+            return Err(opendal::Error::new(
+                opendal::ErrorKind::Unexpected,
+                "injected expired-cleanup delete acknowledgement failure",
+            ));
+        }
+        submitted
     }
 }
 

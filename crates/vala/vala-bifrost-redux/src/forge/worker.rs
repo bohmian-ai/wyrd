@@ -4235,28 +4235,31 @@ impl ForgeWorker {
         })
     }
 
-    /// Takes one candidate's fresh proof and submits its deletion.
+    /// Proves one prepared candidate is still safe to delete right now.
     ///
     /// No Postgres transaction is alive here: the preparation committed and
     /// closed before this runs, so the object-store call cannot hold a database
     /// resource. The protection proof exempts exactly this task, attempt,
     /// cursor index, and candidate, so the drain's own prepared row stops
     /// protecting the object it is about to delete while every other
-    /// unresolved preparation still does.
+    /// unresolved preparation still does. `Ok(None)` reports an absence proven
+    /// by a fresh stat, the only non-deleting outcome permitted to advance the
+    /// cursor; `Ok(Some(path))` is the bound path the caller may delete.
     ///
     /// # Errors
     ///
-    /// Returns protection, object-metadata, or path-binding failures, all of
-    /// which happen before any deletion is submitted and therefore leave the
-    /// candidate exactly as it was.
-    async fn attempt_cleanup_delete(
+    /// Returns clock, protection, object-metadata, refreshed-eligibility,
+    /// path-binding, cancellation, and fencing failures. Every one of them
+    /// happens strictly before a deletion is constructed, so the caller settles
+    /// them all as [`ExpiredCleanupOutcome::Refused`] rather than propagating.
+    async fn prove_cleanup_candidate(
         &self,
         attempt: &CleanupAttempt<'_>,
         lease: &mut ForgeLease,
         index: u32,
         candidate: &ForgeCleanupCandidate,
         stop: &CancellationToken,
-    ) -> Result<ExpiredCleanupOutcome, ForgeError> {
+    ) -> Result<Option<String>, ForgeError> {
         let key = super::compact::ForgeTableKey {
             tenant: attempt.tenant,
             table_ref: attempt.binding.table_ref.clone(),
@@ -4287,16 +4290,13 @@ impl ForgeWorker {
             .map_or(ObjectEvidence::Missing, ObjectEvidence::Present);
         match protection.expired_cleanup_eligibility(attempt.binding, path, evidence) {
             GcEligibility::Eligible => {}
-            GcEligibility::Missing => return Ok(ExpiredCleanupOutcome::Missing),
+            GcEligibility::Missing => return Ok(None),
             refusal => {
-                tracing::warn!(
-                    refusal = ?refusal,
-                    task_id = %attempt.task_id,
-                    attempt_id = %attempt.attempt,
-                    index,
-                    "refreshed protection refused a prepared expired-cleanup candidate"
-                );
-                return Ok(ExpiredCleanupOutcome::Refused);
+                return Err(ForgeError::Reconciliation {
+                    detail: format!(
+                        "refreshed protection refused a prepared expired-cleanup candidate: {refusal:?}"
+                    ),
+                });
             }
         }
         let path = attempt.binding.validate_object_path(path).ok_or_else(|| {
@@ -4308,6 +4308,50 @@ impl ForgeWorker {
         // and still the fenced publication owner.
         require_running(stop)?;
         lease.require_fence(&self.forge.core.operator_pool).await?;
+        Ok(Some(path))
+    }
+
+    /// Takes one candidate's fresh proof and submits its deletion.
+    ///
+    /// No Postgres transaction is alive here: the preparation committed and
+    /// closed before this runs, so the object-store call cannot hold a database
+    /// resource. The protection proof exempts exactly this task, attempt,
+    /// cursor index, and candidate, so the drain's own prepared row stops
+    /// protecting the object it is about to delete while every other
+    /// unresolved preparation still does.
+    ///
+    /// # Errors
+    ///
+    /// Never fails for a pre-submission cause: every clock, protection,
+    /// object-metadata, eligibility, path-binding, cancellation, and fencing
+    /// failure observed before the deletion is constructed is normalized to
+    /// [`ExpiredCleanupOutcome::Refused`] so it reaches the settlement and
+    /// audit path with the candidate untouched and still prepared.
+    async fn attempt_cleanup_delete(
+        &self,
+        attempt: &CleanupAttempt<'_>,
+        lease: &mut ForgeLease,
+        index: u32,
+        candidate: &ForgeCleanupCandidate,
+        stop: &CancellationToken,
+    ) -> Result<ExpiredCleanupOutcome, ForgeError> {
+        let path = match self
+            .prove_cleanup_candidate(attempt, lease, index, candidate, stop)
+            .await
+        {
+            Ok(Some(path)) => path,
+            Ok(None) => return Ok(ExpiredCleanupOutcome::Missing),
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    task_id = %attempt.task_id,
+                    attempt_id = %attempt.attempt,
+                    index,
+                    "expired cleanup refused a prepared candidate before submitting its delete"
+                );
+                return Ok(ExpiredCleanupOutcome::Refused);
+            }
+        };
         let deletion = self.forge.core.object_store.delete(&path);
         tokio::pin!(deletion);
         let deletion = tokio::select! {

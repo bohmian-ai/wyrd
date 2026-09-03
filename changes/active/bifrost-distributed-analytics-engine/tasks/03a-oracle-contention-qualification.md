@@ -342,3 +342,32 @@ a second execution or resource owner.
 | `git diff --check` | clean |
 
 No command in the task was stale; every one ran verbatim.
+
+### Review remediation (FIND-03a-1, FIND-03a-2)
+
+Both findings were assertion gaps in the Scenario 2 journey. Neither required a
+production change, and no new hook, abstraction, or fixture was added.
+
+- **FIND-03a-1 — contention was proven once, not per window.** Analytical
+  ownership was sampled only before the Interactive loop, so a stream that
+  drained afterward would leave both windows uncontended while every assertion
+  still passed. `prove_interactive_window` now takes the Analytical query's
+  probe and re-reads `live_analytical_ownership` in the same window as the
+  Interactive gauge sample, so each tenant's admission is observed while the
+  Analytical query still holds admission, a live graph, its grant, and nonzero
+  pool memory.
+- **FIND-03a-2 — settled release was asserted for Analytical only.**
+  `prove_pool_within_grant` checked `current <= peak <= grant`, which a
+  nonzero settled current can satisfy. It now rejects any nonzero settled
+  `pool_current_bytes`, and the Analytical-only duplicate check was deleted.
+  All three probes are held to the same claim.
+
+| Command | Result |
+| --- | --- |
+| Scenario 2 exact command | `PASS [43.543s]` |
+| `mise run fmt` | pass |
+| `mise run lints` | pass |
+| `mise run test:bifrost` | 974 passed, 0 skipped |
+| `mise run test:bifrost:journey:oracle` | 17 passed, 0 skipped |
+| `mise run check:bifrost-resource-governance` | pass |
+| `git diff --check` | clean |

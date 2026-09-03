@@ -243,8 +243,17 @@ async fn prove_lowest_rung_contention() -> Result<(), JourneyError> {
         (tenant_a, "contention-a", &ui_a),
         (tenant_b, "contention-b", &ui_b),
     ] {
-        interactive
-            .push(prove_interactive_window(&cluster, coordinator, tenant, name, table).await?);
+        interactive.push(
+            prove_interactive_window(
+                &cluster,
+                coordinator,
+                &analytical_probe,
+                tenant,
+                name,
+                table,
+            )
+            .await?,
+        );
     }
 
     while let Some(frame) = analytical.frames.next().await {
@@ -275,13 +284,6 @@ async fn prove_lowest_rung_contention() -> Result<(), JourneyError> {
         ("interactive tenant B", interactive[1].0, interactive[1].1),
     ] {
         prove_pool_within_grant(label, live, final_snapshot)?;
-    }
-    if analytical_final.pool_current_bytes != 0 {
-        return Err(format!(
-            "the drained Analytical query still holds {} pool bytes",
-            analytical_final.pool_current_bytes
-        )
-        .into());
     }
 
     await_clean_nodes(&cluster).await?;
@@ -322,13 +324,19 @@ fn oracle_floor_observation() -> SystemResourceSnapshot {
 /// public client. Telemetry is sampled while the client still owns the stream,
 /// because an active-query gauge read after the drain proves nothing.
 ///
+/// `analytical_probe` is the still-executing Analytical query's probe. Its
+/// ownership is re-read in the same window as the Interactive gauge sample:
+/// the point of the window is contention, and an Analytical query that had
+/// already drained would leave the floor uncontended and the observation void.
+///
 /// # Errors
 ///
-/// Returns the first admission, telemetry, terminal, or readiness claim that
-/// broke, naming the tenant's client.
+/// Returns the first admission, contention, telemetry, terminal, or readiness
+/// claim that broke, naming the tenant's client.
 async fn prove_interactive_window(
     cluster: &WyrdTestCluster,
     coordinator: &WyrdTestServer,
+    analytical_probe: &Arc<QueryResourceProbe>,
     tenant: DataTenantId,
     name: &str,
     table: &str,
@@ -366,6 +374,11 @@ async fn prove_interactive_window(
         )
         .into());
     }
+    // Contemporaneous with the gauge sample above: admission active, the
+    // Analytical graph live, and its grant and pool still held.
+    live_analytical_ownership(coordinator, analytical_probe)?.ok_or_else(|| {
+        format!("{name} was admitted after the Analytical query had already released its envelope")
+    })?;
     let live = probe.snapshot();
     if live.granted_memory_bytes == 0 {
         return Err(format!("{name} was admitted without an issued memory grant").into());
@@ -419,12 +432,14 @@ async fn prove_interactive_window(
     Ok((live, probe.snapshot()))
 }
 
-/// Asserts one query's pool never exceeded the grant admission issued it.
+/// Asserts one query's pool never exceeded the grant admission issued it and
+/// that the settled query released all of it.
 ///
 /// # Errors
 ///
 /// Returns an error when the observed peak exceeds the grant, when current
-/// exceeds peak, or when a query that ran reported no peak at all.
+/// exceeds peak, when a query that ran reported no peak at all, or when the
+/// settled query still holds pool memory.
 fn prove_pool_within_grant(
     label: &str,
     live: QueryResourceSnapshot,
@@ -445,6 +460,15 @@ fn prove_pool_within_grant(
     }
     if settled.pool_peak_bytes == 0 {
         return Err(format!("{label} reported no pool reservation at all").into());
+    }
+    // A settled query holds nothing. Peak and grant bound a leak only in
+    // relative terms; the release itself is the absolute claim.
+    if settled.pool_current_bytes != 0 {
+        return Err(format!(
+            "{label} still holds {} pool bytes after settling",
+            settled.pool_current_bytes
+        )
+        .into());
     }
     Ok(())
 }

@@ -1662,7 +1662,7 @@ mod tests {
         deadline: tokio::time::Instant,
         fold: futures_util::future::BoxFuture<
             'static,
-            Option<Arc<dyn datafusion::physical_plan::ExecutionPlan>>,
+            datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>>,
         >,
     ) -> super::super::analytical::AnalyticalGraphSignals {
         use super::super::analytical::{
@@ -1702,10 +1702,7 @@ mod tests {
         )
         .expect("a registered graph starts its lifecycle task");
         supervisor
-            .retain_metric_fold(
-                graph,
-                AnalyticalGraphMetricFold::from_future(ordered_plan(), fold),
-            )
+            .retain_metric_fold(graph, AnalyticalGraphMetricFold::from_future(fold))
             .expect("an active graph retains exactly one metric fold");
         signals
     }
@@ -1747,10 +1744,16 @@ mod tests {
     /// successfully, with the folded output-sort evidence already retained by
     /// the time the release is published and the graph removed.
     ///
+    /// A third case, on its own supervisor and its own Oracle fixture so the
+    /// first case's residue cannot answer for it, fails the rewrite itself:
+    /// an immediate rewrite error is a settlement failure, not a licence to
+    /// publish the unexecuted original plan's evidence as the query's.
+    ///
     /// Required mutation RED: await the fold without
     /// [`tokio::time::timeout`] and the first case never settles at all;
     /// fold after `attempt.finish` and the second case publishes its release
-    /// before the evidence exists.
+    /// before the evidence exists; erase the rewrite error or fall back to the
+    /// original plan and the third case publishes a success.
     ///
     /// # Panics
     ///
@@ -1790,7 +1793,7 @@ mod tests {
                 // Released only by a companion this case never runs, so the
                 // deadline is the only thing that can end the wait.
                 never.notified().await;
-                None
+                Ok(ordered_plan())
             }),
         );
         expired.terminal(AnalyticalAttemptOutcome::Success);
@@ -1832,7 +1835,7 @@ mod tests {
             settled_resources,
             settled_runtime,
             tokio::time::Instant::now() + std::time::Duration::from_secs(30),
-            Box::pin(async { None }),
+            Box::pin(async { Ok(ordered_plan()) }),
         );
         settled.terminal(AnalyticalAttemptOutcome::Success);
 
@@ -1864,6 +1867,68 @@ mod tests {
         assert_eq!(
             inspection.graphs_retained, 1,
             "shutdown observes and reports the retained draining graph"
+        );
+
+        // Isolated on purpose: a fresh supervisor and a fresh Oracle root are
+        // the only way this case can claim the retained graph and the absent
+        // evidence are its own rather than the expired case's.
+        let failing_oracle = oracle_role();
+        let failing_supervisor = Arc::new(AnalyticalSupervisor::new());
+        let failing_graph = AnalyticalGraphKey {
+            public_query_id: PublicQueryId::from_uuid(uuid::Uuid::now_v7()),
+            datafusion_query_id: DataFusionQueryId::allocate(),
+        };
+        let failing_resources = failing_oracle
+            .try_acquire_query(OracleResourceRequest::for_class(
+                QueryClass::Analytical,
+                0.0,
+            ))
+            .expect("an idle Oracle admits the rewrite-failure query");
+        let failing_runtime = query_runtime(&failing_resources, &spill);
+        let failing = lifecycle_over_fold(
+            &failing_supervisor,
+            failing_graph,
+            failing_resources,
+            failing_runtime,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+            Box::pin(async {
+                Err(datafusion::error::DataFusionError::Execution(
+                    "follower metric rewrite refused".to_owned(),
+                ))
+            }),
+        );
+        failing.terminal(AnalyticalAttemptOutcome::Success);
+
+        assert_eq!(
+            published_settlement(&failing).await,
+            AnalyticalGraphResult::SettledFailure,
+            "a rewrite error cannot publish a success terminal"
+        );
+        assert_eq!(
+            failing_supervisor
+                .draining_graphs()
+                .expect("the isolated supervisor reports its retained graphs"),
+            1,
+            "the rewrite failure retains exactly one draining graph"
+        );
+        assert!(
+            failing_supervisor
+                .graph_settlement_failure(failing_graph)
+                .expect("the isolated supervisor reports its recorded failure")
+                .is_some(),
+            "the retained graph names the rewrite failure"
+        );
+        assert!(
+            failing_supervisor.settled_physical_evidence().is_none(),
+            "an unexecuted original plan is not this query's physical evidence"
+        );
+        let failing_inspection = failing_supervisor
+            .shutdown()
+            .await
+            .expect("shutdown joins the isolated lifecycle task");
+        assert_eq!(
+            failing_inspection.graphs_retained, 1,
+            "shutdown reports the graph the rewrite failure retained"
         );
     }
 

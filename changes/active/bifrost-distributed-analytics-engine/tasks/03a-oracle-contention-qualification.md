@@ -6,7 +6,7 @@ mode: RECONCILE
 status: proposed
 spec: SPEC-bifrost-distributed-analytics-engine
 spec_revision: 4
-depends_on: [BIFROST-R4-T03-PHYSICAL-BASELINE]
+depends_on: [BIFROST-R4-T03-R01-TERMINAL-LIFECYCLE-EVIDENCE]
 requirements: [REQ-005, REQ-006, REQ-007, REQ-011]
 invariants: [INV-003, INV-004, INV-005, INV-006, INV-008]
 acceptance: [AC-004, AC-007, AC-008]

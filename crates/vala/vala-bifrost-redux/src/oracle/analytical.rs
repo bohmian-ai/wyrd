@@ -2744,6 +2744,14 @@ const RETAINED_RELEASE_RETRY: std::time::Duration = std::time::Duration::from_mi
 const METRIC_FOLD_EXPIRED: &str =
     "Oracle analytical distributed metrics did not settle before the graph deadline";
 
+/// Detail one graph records when the follower-metric rewrite itself fails.
+///
+/// Distinct from the deadline detail because the two are distinguishable and
+/// operationally different: a timeout says a peer never answered, a refusal
+/// says the dependency could not build the metric-carrying plan at all. Both
+/// retain the graph; only this one names an error the dependency reported.
+const METRIC_FOLD_REFUSED: &str = "Oracle analytical distributed metric rewrite failed";
+
 const RETAINED_RELEASE_UNACKNOWLEDGED: &str =
     "Oracle analytical participant release was not acknowledged";
 
@@ -2860,10 +2868,16 @@ impl AnalyticalGraphLifecycle {
     ///
     /// A graph that never distributed retains no fold and settles unchanged.
     ///
+    /// A rewrite the dependency refuses is the same class of failure: the
+    /// coordinator never obtained the plan that carries the executed stages'
+    /// counters, so there is nothing to publish and no unexecuted plan may
+    /// stand in for it.
+    ///
     /// # Errors
     ///
     /// Returns the detail recorded against the graph when the fold does not
-    /// complete before the deadline.
+    /// complete before the deadline, or when the follower-metric rewrite
+    /// itself fails.
     async fn fold_physical_metrics(&self) -> Result<(), String> {
         let Some(fold) = self.supervisor.take_metric_fold(self.graph) else {
             return Ok(());
@@ -2871,9 +2885,10 @@ impl AnalyticalGraphLifecycle {
         let remaining = self
             .deadline
             .saturating_duration_since(tokio::time::Instant::now());
-        let Ok(evidence) = tokio::time::timeout(remaining, fold.settle()).await else {
+        let Ok(folded) = tokio::time::timeout(remaining, fold.settle()).await else {
             return Err(METRIC_FOLD_EXPIRED.to_owned());
         };
+        let evidence = folded.map_err(|error| format!("{METRIC_FOLD_REFUSED}: {error}"))?;
         if let Some(evidence) = evidence {
             super::telemetry::record_output_sort_spill(
                 evidence.spill_count,
@@ -7968,8 +7983,6 @@ pub struct AnalyticalPhysicalEvidence {
 /// lifecycle already owns one absolute deadline covering execution, cleanup,
 /// and settlement, so the fold becomes one more descendant of it.
 pub(super) struct AnalyticalGraphMetricFold {
-    /// The executed physical plan whose own output sort is read after the fold.
-    plan: Arc<dyn ExecutionPlan>,
     /// The follower-metric fold, yielding the metric-carrying plan it built.
     ///
     /// Upstream returns the executed stages' metrics by *rewriting* the plan,
@@ -7977,7 +7990,13 @@ pub(super) struct AnalyticalGraphMetricFold {
     /// serialized to its worker and executed as a separate instance, so the
     /// planned nodes never see a counter. The rewritten plan is therefore the
     /// only place the executed sort's spill counters exist.
-    fold: futures_util::future::BoxFuture<'static, Option<Arc<dyn ExecutionPlan>>>,
+    ///
+    /// The rewrite's own error is carried rather than erased: the plan this
+    /// struct also holds was never executed as the coordinator's metric
+    /// carrier, so substituting it for a failed rewrite would publish an
+    /// unexecuted plan's evidence as the query's.
+    fold:
+        futures_util::future::BoxFuture<'static, datafusion::error::Result<Arc<dyn ExecutionPlan>>>,
 }
 
 impl fmt::Debug for AnalyticalGraphMetricFold {
@@ -7995,29 +8014,36 @@ impl AnalyticalGraphMetricFold {
         plan: Arc<dyn ExecutionPlan>,
         sink: Arc<super::exec::RemoteScanMetrics>,
     ) -> Self {
-        let folded = Arc::clone(&plan);
         Self {
-            plan,
-            fold: Box::pin(super::exec::record_distributed_scan_metrics(folded, sink)),
+            fold: Box::pin(super::exec::record_distributed_scan_metrics(plan, sink)),
         }
     }
 
     /// Composes one fold over an arbitrary future, for lifecycle-order tests.
     #[cfg(test)]
     pub(super) fn from_future(
-        plan: Arc<dyn ExecutionPlan>,
-        fold: futures_util::future::BoxFuture<'static, Option<Arc<dyn ExecutionPlan>>>,
+        fold: futures_util::future::BoxFuture<
+            'static,
+            datafusion::error::Result<Arc<dyn ExecutionPlan>>,
+        >,
     ) -> Self {
-        Self { plan, fold }
+        Self { fold }
     }
 
     /// Awaits the follower fold, then reads the plan's own output-sort evidence.
     ///
     /// The caller bounds this; nothing here imposes a second timer.
-    pub(super) async fn settle(self) -> Option<AnalyticalPhysicalEvidence> {
-        let Self { plan, fold } = self;
-        let executed = fold.await.unwrap_or(plan);
-        super::exec::output_sort_evidence(&executed)
+    ///
+    /// # Errors
+    ///
+    /// Returns the rewrite's own error. A failed rewrite yields no evidence at
+    /// all: the plan this process built was never the coordinator's metric
+    /// carrier, so there is no second plan to read instead.
+    pub(super) async fn settle(
+        self,
+    ) -> datafusion::error::Result<Option<AnalyticalPhysicalEvidence>> {
+        let executed = self.fold.await?;
+        Ok(super::exec::output_sort_evidence(&executed))
     }
 }
 

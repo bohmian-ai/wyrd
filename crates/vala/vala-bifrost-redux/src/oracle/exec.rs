@@ -987,20 +987,27 @@ pub(crate) fn is_distributed_plan(plan: &dyn ExecutionPlan) -> bool {
 ///
 /// A plan that is not distributed, or whose metrics never arrive, contributes
 /// nothing rather than a fabricated zero.
+///
+/// # Errors
+///
+/// Returns the pinned dependency's rewrite error unchanged. The error is the
+/// caller's, not this function's, to interpret: the plan it would otherwise
+/// have to fall back on never carried the executed stages' counters, so
+/// reporting one as this query's physical evidence would be a fabrication.
+/// Nothing is recorded into `sink` on that path.
 pub(crate) async fn record_distributed_scan_metrics(
     plan: Arc<dyn ExecutionPlan>,
     sink: Arc<RemoteScanMetrics>,
-) -> Option<Arc<dyn ExecutionPlan>> {
+) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
     let with_metrics = datafusion_distributed::rewrite_distributed_plan_with_metrics(
         plan,
         datafusion_distributed::DistributedMetricsFormat::Aggregated,
     )
-    .await
-    .ok()?;
+    .await?;
     let mut totals = wyrd_spec::vala::api::WorkerScanStats::default();
     fold_distributed_scan_metrics(&with_metrics, &mut totals);
     sink.record_footer(totals);
-    Some(with_metrics)
+    Ok(with_metrics)
 }
 
 /// Accumulates one rewritten plan node's scan metrics, then its whole subtree.

@@ -452,6 +452,56 @@ struct ChildConfig {
     peer_keyring: TestPeerKeyringPaths,
 }
 
+/// Accepts one query's rows only behind a fully validated success terminal.
+///
+/// This is the point at which rows already decoded off the wire either become
+/// a result or become nothing. Every check is the production contract's own:
+/// the closed terminal matrix for the requested visibility, the emitted-row
+/// reconciliation, the outcome requirement, and the decoder's explicit
+/// end-of-stream. `Degraded` is refused here rather than in the contract
+/// because a partial cut is not a baseline result, and the contract has no
+/// opinion on which outcomes a given caller will accept.
+///
+/// Private to this module on purpose: it exists so the terminal decision the
+/// process journey depends on is directly testable rather than buried in one
+/// long stream loop.
+///
+/// # Errors
+///
+/// Returns [`ProcessClusterError::Child`] when the terminal is malformed for
+/// the requested visibility, disagrees with the rows emitted before it, is not
+/// [`wyrd_spec::vala::api::QueryTerminalOutcome::Success`], or does not close
+/// the decoder with its own explicit Arrow IPC end-of-stream.
+fn accept_query_terminal(
+    terminal: &wyrd_spec::vala::api::QueryTerminalFrame,
+    visibility: wyrd_spec::vala::api::VisibilityMode,
+    emitted_rows: usize,
+    decoder: &mut vala_bifrost_redux::oracle::QueryIpcDecoder,
+) -> Result<usize, ProcessClusterError> {
+    let child = |detail: String| ProcessClusterError::Child(detail);
+    terminal
+        .validate(visibility)
+        .map_err(|error| child(error.to_string()))?;
+    terminal
+        .validate_emitted_rows(u64::try_from(emitted_rows).unwrap_or(u64::MAX))
+        .map_err(|error| child(error.to_string()))?;
+    if terminal.outcome != wyrd_spec::vala::api::QueryTerminalOutcome::Success {
+        return Err(child(format!(
+            "the inactive attempt ended on a {:?} terminal",
+            terminal.outcome
+        )));
+    }
+    decoder
+        .accept_eos(&terminal.arrow_ipc_eos)
+        .map_err(|error| child(error.to_string()))?;
+    if !decoder.eos_accepted() {
+        return Err(child(
+            "the inactive attempt never closed its Arrow IPC stream".to_owned(),
+        ));
+    }
+    Ok(emitted_rows)
+}
+
 impl ChildConfig {
     /// Reads and validates the complete child environment.
     ///
@@ -1093,8 +1143,12 @@ async fn drive_inactive_sql(
         }
         let terminal = terminal
             .ok_or_else(|| child("the inactive attempt emitted no terminal frame".to_owned()))?;
-        let _ = terminal;
-        Ok(rows)
+        accept_query_terminal(
+            &terminal,
+            wyrd_spec::vala::api::VisibilityMode::PublishedOnly,
+            rows,
+            &mut decoder,
+        )
     }
 }
 
@@ -1439,4 +1493,102 @@ fn fixture_rows_ipc(
         writer.finish().map_err(|error| child(error.to_string()))?;
     }
     Ok(bytes::Bytes::from(ipc))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use wyrd_spec::vala::api::{
+        QueryFreshness, QuerySource, QueryTerminalError, QueryTerminalErrorCode,
+        QueryTerminalFrame, QueryTerminalOutcome, SourceCompletion, SourceCompletionOutcome,
+        VisibilityMode,
+    };
+
+    use super::{ProcessClusterError, accept_query_terminal};
+
+    /// Rows already on the wire are discarded when the terminal is not a
+    /// validated success.
+    ///
+    /// Encodes one real schema and one real batch through the production IPC
+    /// encoder, decodes them through the production decoder, then presents a
+    /// structurally valid *failed* terminal whose `row_count` matches the rows
+    /// that were emitted. Everything except the outcome agrees, so the only
+    /// thing that can reject it is the outcome requirement itself.
+    ///
+    /// Required mutation RED: discard the terminal, or accept any outcome the
+    /// contract validates, and the helper returns the row count for a query
+    /// that failed after framing began.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture stream cannot be encoded or decoded.
+    #[test]
+    fn inactive_sql_terminal_rejects_failed_output_after_rows() {
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+        ]));
+        let batch = arrow::record_batch::RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(arrow::array::Int64Array::from(vec![1_i64, 2, 3]))],
+        )
+        .expect("the fixture batch matches its own schema");
+
+        let (mut encoder, schema_frame) = vala_bifrost_redux::oracle::QueryIpcEncoder::new(&schema)
+            .expect("the fixture schema opens an IPC stream");
+        let batch_frame = encoder
+            .write(&batch)
+            .expect("the fixture batch encodes")
+            .expect("a nonempty batch produces a wire frame");
+
+        let mut decoder = vala_bifrost_redux::oracle::QueryIpcDecoder::new();
+        decoder
+            .accept_schema(&schema_frame.arrow_ipc_schema)
+            .expect("the decoder accepts the stream prefix");
+        let emitted = decoder
+            .accept_batch(&batch_frame.arrow_ipc_batch)
+            .expect("the decoder accepts the batch")
+            .num_rows();
+        assert_eq!(emitted, 3, "the fixture emits the rows it encoded");
+
+        let failed = QueryTerminalFrame {
+            outcome: QueryTerminalOutcome::Failed,
+            freshness: QueryFreshness::Complete,
+            row_count: u64::try_from(emitted).expect("a fixture row count fits a u64"),
+            warnings: Vec::new(),
+            source_completion: vec![
+                SourceCompletion {
+                    source: QuerySource::Iceberg,
+                    outcome: SourceCompletionOutcome::Complete,
+                },
+                SourceCompletion {
+                    source: QuerySource::HotSealed,
+                    outcome: SourceCompletionOutcome::Complete,
+                },
+            ],
+            error: Some(QueryTerminalError {
+                code: QueryTerminalErrorCode::QueryExecutionFailed,
+                detail: None,
+            }),
+            arrow_ipc_eos: Vec::new(),
+        };
+        failed
+            .validate(VisibilityMode::PublishedOnly)
+            .expect("the fixture terminal is structurally valid on its own");
+
+        let refused = accept_query_terminal(
+            &failed,
+            VisibilityMode::PublishedOnly,
+            emitted,
+            &mut decoder,
+        );
+        assert!(
+            matches!(refused, Err(ProcessClusterError::Child(_))),
+            "rows preceding a failed terminal are not a result: {refused:?}"
+        );
+        assert!(
+            !decoder.eos_accepted(),
+            "a failed terminal carries no end-of-stream to accept"
+        );
+    }
 }

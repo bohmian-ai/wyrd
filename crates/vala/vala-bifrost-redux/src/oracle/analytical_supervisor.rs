@@ -1734,6 +1734,80 @@ mod tests {
         }
     }
 
+    /// Proves an immediate rewrite error is a settlement failure of its own.
+    ///
+    /// Given its own supervisor and its own Oracle root so nothing it asserts
+    /// can be answered by another case's residue: the retained graph, the
+    /// recorded detail, and the absent physical evidence are all this graph's.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture owners cannot be composed or the settlement
+    /// diverges from the retained-cleanup route.
+    #[cfg(feature = "test-support")]
+    async fn rewrite_error_retains_its_own_graph(spill: &OracleSpillRuntime) {
+        use super::super::analytical::AnalyticalGraphResult;
+
+        let failing_oracle = oracle_role();
+        let failing_supervisor = Arc::new(AnalyticalSupervisor::new());
+        let failing_graph = AnalyticalGraphKey {
+            public_query_id: PublicQueryId::from_uuid(uuid::Uuid::now_v7()),
+            datafusion_query_id: DataFusionQueryId::allocate(),
+        };
+        let failing_resources = failing_oracle
+            .try_acquire_query(OracleResourceRequest::for_class(
+                QueryClass::Analytical,
+                0.0,
+            ))
+            .expect("an idle Oracle admits the rewrite-failure query");
+        let failing_runtime = query_runtime(&failing_resources, spill);
+        let failing = lifecycle_over_fold(
+            &failing_supervisor,
+            failing_graph,
+            failing_resources,
+            failing_runtime,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+            Box::pin(async {
+                Err(datafusion::error::DataFusionError::Execution(
+                    "follower metric rewrite refused".to_owned(),
+                ))
+            }),
+        );
+        failing.terminal(AnalyticalAttemptOutcome::Success);
+
+        assert_eq!(
+            published_settlement(&failing).await,
+            AnalyticalGraphResult::SettledFailure,
+            "a rewrite error cannot publish a success terminal"
+        );
+        assert_eq!(
+            failing_supervisor
+                .draining_graphs()
+                .expect("the isolated supervisor reports its retained graphs"),
+            1,
+            "the rewrite failure retains exactly one draining graph"
+        );
+        assert!(
+            failing_supervisor
+                .graph_settlement_failure(failing_graph)
+                .expect("the isolated supervisor reports its recorded failure")
+                .is_some(),
+            "the retained graph names the rewrite failure"
+        );
+        assert!(
+            failing_supervisor.settled_physical_evidence().is_none(),
+            "an unexecuted original plan is not this query's physical evidence"
+        );
+        let failing_inspection = failing_supervisor
+            .shutdown()
+            .await
+            .expect("shutdown joins the isolated lifecycle task");
+        assert_eq!(
+            failing_inspection.graphs_retained, 1,
+            "shutdown reports the graph the rewrite failure retained"
+        );
+    }
+
     /// The graph deadline, not the metric fold, decides when settlement ends.
     ///
     /// Drives two graphs whose distributed metric fold the test holds. The
@@ -1869,67 +1943,7 @@ mod tests {
             "shutdown observes and reports the retained draining graph"
         );
 
-        // Isolated on purpose: a fresh supervisor and a fresh Oracle root are
-        // the only way this case can claim the retained graph and the absent
-        // evidence are its own rather than the expired case's.
-        let failing_oracle = oracle_role();
-        let failing_supervisor = Arc::new(AnalyticalSupervisor::new());
-        let failing_graph = AnalyticalGraphKey {
-            public_query_id: PublicQueryId::from_uuid(uuid::Uuid::now_v7()),
-            datafusion_query_id: DataFusionQueryId::allocate(),
-        };
-        let failing_resources = failing_oracle
-            .try_acquire_query(OracleResourceRequest::for_class(
-                QueryClass::Analytical,
-                0.0,
-            ))
-            .expect("an idle Oracle admits the rewrite-failure query");
-        let failing_runtime = query_runtime(&failing_resources, &spill);
-        let failing = lifecycle_over_fold(
-            &failing_supervisor,
-            failing_graph,
-            failing_resources,
-            failing_runtime,
-            tokio::time::Instant::now() + std::time::Duration::from_secs(30),
-            Box::pin(async {
-                Err(datafusion::error::DataFusionError::Execution(
-                    "follower metric rewrite refused".to_owned(),
-                ))
-            }),
-        );
-        failing.terminal(AnalyticalAttemptOutcome::Success);
-
-        assert_eq!(
-            published_settlement(&failing).await,
-            AnalyticalGraphResult::SettledFailure,
-            "a rewrite error cannot publish a success terminal"
-        );
-        assert_eq!(
-            failing_supervisor
-                .draining_graphs()
-                .expect("the isolated supervisor reports its retained graphs"),
-            1,
-            "the rewrite failure retains exactly one draining graph"
-        );
-        assert!(
-            failing_supervisor
-                .graph_settlement_failure(failing_graph)
-                .expect("the isolated supervisor reports its recorded failure")
-                .is_some(),
-            "the retained graph names the rewrite failure"
-        );
-        assert!(
-            failing_supervisor.settled_physical_evidence().is_none(),
-            "an unexecuted original plan is not this query's physical evidence"
-        );
-        let failing_inspection = failing_supervisor
-            .shutdown()
-            .await
-            .expect("shutdown joins the isolated lifecycle task");
-        assert_eq!(
-            failing_inspection.graphs_retained, 1,
-            "shutdown reports the graph the rewrite failure retained"
-        );
+        rewrite_error_retains_its_own_graph(&spill).await;
     }
 
     /// Two `DataFusion` graphs under one public query never reach each other.

@@ -345,9 +345,13 @@ impl Forge {
             Ok(files) => files,
             // A definite optimistic-commit rejection proves the mutation was
             // never applied, so it releases the claims exactly like drift.
-            // Every other failure leaves acceptance unproven and therefore
-            // leaves task, operation, and claims Prepared for reconciliation.
-            Err(ForgeError::Catalog(error)) => {
+            // A retryable catalog error is not that proof: the pinned Iceberg
+            // transaction exhausted its own budget without ever learning
+            // whether the commit landed, so it falls through to the uncertain
+            // path below. Every other failure leaves acceptance unproven and
+            // therefore leaves task, operation, and claims Prepared for
+            // reconciliation.
+            Err(ForgeError::Catalog(error)) if !error.retryable() => {
                 let rejection = ForgeError::Catalog(error);
                 self.reset_expiration(lease, key, authority, &claim_table, &detail, &rejection)
                     .await?;

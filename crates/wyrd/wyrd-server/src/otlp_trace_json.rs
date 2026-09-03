@@ -111,7 +111,7 @@ fn decode_trace_request(
     let mut output = ExportTraceServiceRequest::default();
     let mut first = true;
     let mut seen = 0u128;
-    cursor.expect(b'{')?;
+    cursor.consume_expected(b'{')?;
     while let Some(field) = next_object_field(cursor, &mut first)? {
         if field != Field::ResourceSpans {
             cursor.skip_value(0)?;
@@ -138,7 +138,7 @@ fn decode_resource_spans(cursor: &mut JsonCursor<'_>) -> Result<ResourceSpans, J
     let mut output = ResourceSpans::default();
     let mut first = true;
     let mut seen = 0u128;
-    cursor.expect(b'{')?;
+    cursor.consume_expected(b'{')?;
     while let Some(field) = next_object_field(cursor, &mut first)? {
         if !matches!(
             field,
@@ -170,7 +170,7 @@ fn decode_scope_spans(cursor: &mut JsonCursor<'_>) -> Result<ScopeSpans, JsonDec
     let mut output = ScopeSpans::default();
     let mut first = true;
     let mut seen = 0u128;
-    cursor.expect(b'{')?;
+    cursor.consume_expected(b'{')?;
     while let Some(field) = next_object_field(cursor, &mut first)? {
         if !matches!(field, Field::Scope | Field::Spans | Field::SchemaUrl) {
             cursor.skip_value(0)?;
@@ -198,7 +198,7 @@ fn decode_span(cursor: &mut JsonCursor<'_>) -> Result<Span, JsonDecodeError> {
     let mut output = Span::default();
     let mut first = true;
     let mut seen = 0u128;
-    cursor.expect(b'{')?;
+    cursor.consume_expected(b'{')?;
     while let Some(field) = next_object_field(cursor, &mut first)? {
         if !matches!(
             field,
@@ -258,7 +258,7 @@ fn decode_event(cursor: &mut JsonCursor<'_>) -> Result<span::Event, JsonDecodeEr
     let mut output = span::Event::default();
     let mut first = true;
     let mut seen = 0u128;
-    cursor.expect(b'{')?;
+    cursor.consume_expected(b'{')?;
     while let Some(field) = next_object_field(cursor, &mut first)? {
         if !matches!(
             field,
@@ -292,7 +292,7 @@ fn decode_link(cursor: &mut JsonCursor<'_>) -> Result<span::Link, JsonDecodeErro
     let mut output = span::Link::default();
     let mut first = true;
     let mut seen = 0u128;
-    cursor.expect(b'{')?;
+    cursor.consume_expected(b'{')?;
     while let Some(field) = next_object_field(cursor, &mut first)? {
         if !matches!(
             field,
@@ -332,7 +332,7 @@ fn decode_status(cursor: &mut JsonCursor<'_>) -> Result<Status, JsonDecodeError>
     let mut output = Status::default();
     let mut first = true;
     let mut seen = 0u128;
-    cursor.expect(b'{')?;
+    cursor.consume_expected(b'{')?;
     while let Some(field) = next_object_field(cursor, &mut first)? {
         if !matches!(field, Field::Message | Field::Code) {
             cursor.skip_value(0)?;

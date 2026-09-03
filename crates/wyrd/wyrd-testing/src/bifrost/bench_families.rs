@@ -439,6 +439,7 @@ async fn run_ingest_stages(
 /// # Errors
 /// Returns [`FamilyRunError`] for a capture failure or unexpected write
 /// failures observed during the measured window.
+// justification: the qualification harness fixes this stage's inputs by contract; a single-use request wrapper would hide which of them the measured ingest window actually reads without removing one of them.
 #[allow(clippy::too_many_arguments)]
 async fn measure_ingest_stage(
     cluster: &WyrdTestCluster,
@@ -1019,6 +1020,7 @@ async fn materialize_smoke_dataset_into(
 /// # Errors
 /// Returns [`FamilyRunError`] for a capture failure or unexpected read failures
 /// observed during the measured window.
+// justification: the qualification harness fixes this stage's inputs by contract; a single-use request wrapper would hide which of them the measured query window actually reads without removing one of them.
 #[allow(clippy::too_many_arguments)]
 async fn measure_query_stage(
     cluster: &WyrdTestCluster,
@@ -1266,6 +1268,7 @@ async fn execute_one_query(query: QueryClient, sql: String) -> QueryOutcome {
 /// controlled-admission-only window is the sole saturation shape, and any other
 /// nonhealthy shape carries no saturation marker. Logical bytes are the
 /// completed reads times the per-query scanned-byte weight.
+// justification: the qualification harness fixes this stage's inputs by contract; a single-use request wrapper would hide which of them the constructed query stage actually reads without removing one of them.
 #[allow(clippy::too_many_arguments)]
 fn build_query_stage(
     workload_id: &str,
@@ -2315,6 +2318,7 @@ pub async fn run_fairness(
 /// # Errors
 /// Returns [`FamilyRunError`] for a provisioning, materialization, client,
 /// correctness, capture, or unexpected-failure condition.
+// justification: the qualification harness fixes this stage's inputs by contract; a single-use request wrapper would hide which of them the fairness stage sequence actually reads without removing one of them.
 #[allow(clippy::too_many_arguments)]
 async fn run_fairness_stages(
     cluster: &WyrdTestCluster,
@@ -2384,6 +2388,7 @@ async fn run_fairness_stages(
 /// # Errors
 /// Returns [`FamilyRunError`] for a capture failure or unexpected read failures
 /// observed during the measured window.
+// justification: the qualification harness fixes this stage's inputs by contract; a single-use request wrapper would hide which of them the measured fairness window actually reads without removing one of them.
 #[allow(clippy::too_many_arguments)]
 async fn measure_fairness_stage(
     cluster: &WyrdTestCluster,
@@ -2618,6 +2623,7 @@ pub async fn run_mixed(
 /// # Errors
 /// Returns [`FamilyRunError`] for a provisioning, dataset-acquisition, client,
 /// correctness, capture, or unexpected-failure condition, or an empty plan.
+// justification: the qualification harness fixes this stage's inputs by contract; a single-use request wrapper would hide which of them the mixed stage actually reads without removing one of them.
 #[allow(clippy::too_many_arguments)]
 async fn run_mixed_stage(
     cluster: &WyrdTestCluster,

@@ -214,6 +214,8 @@ pub(crate) struct PromotionCatalogSeam {
     parked_dropped: AtomicBool,
     /// Wakes tests waiting for that cancellation.
     parked_drop_ready: tokio::sync::Notify,
+    /// Whether every accepted commit's response is discarded before returning.
+    lose_response: AtomicBool,
     /// Storage adapter every loaded table is rebound to, once one is installed.
     ///
     /// The managed core reads inputs and writes rewrite outputs through the
@@ -240,6 +242,7 @@ impl PromotionCatalogSeam {
             parked_release: tokio::sync::Notify::new(),
             parked_dropped: AtomicBool::new(false),
             parked_drop_ready: tokio::sync::Notify::new(),
+            lose_response: AtomicBool::new(false),
             file_io: std::sync::OnceLock::new(),
         })
     }
@@ -316,6 +319,18 @@ impl PromotionCatalogSeam {
         self.park_next.store(true, Ordering::Release);
         self.reject_parked.store(true, Ordering::Release);
         self.parked_release.notify_waiters();
+    }
+
+    /// Arm or disarm losing every accepted commit's response.
+    ///
+    /// The fault fires strictly after `inner.update_table` returned success, so
+    /// the mutation is durably applied and only the caller's knowledge of it is
+    /// lost. That is the one shape a pre-delegation refusal cannot produce. It
+    /// stays armed rather than firing once because the pinned Iceberg
+    /// transaction retries a retryable error itself; only a fault that outlives
+    /// that budget delivers the uncertainty to the Forge expiry owner.
+    pub(crate) fn lose_commit_responses(&self, armed: bool) {
+        self.lose_response.store(armed, Ordering::Release);
     }
 
     /// Release the parked commit as a definite conflict.
@@ -448,7 +463,16 @@ impl Catalog for PromotionCatalogSeam {
                 .with_retryable(false));
             }
         }
-        self.inner.update_table(commit).await
+        let committed = self.inner.update_table(commit).await?;
+        if self.lose_response.load(Ordering::Acquire) {
+            drop(committed);
+            return Err(IcebergError::new(
+                IcebergErrorKind::Unexpected,
+                "injected lost Forge commit response after catalog acceptance",
+            )
+            .with_retryable(true));
+        }
+        Ok(committed)
     }
 }
 

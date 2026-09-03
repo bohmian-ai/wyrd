@@ -269,42 +269,14 @@ async fn prepare_and_abandon_at_the_catalog_gate(
 /// Panics on any durable-state, candidate, delete-count, or ordering mismatch.
 #[tokio::test]
 async fn prepared_claim_releases_sql_before_iceberg_and_hands_exact_names_to_cleanup() {
-    let fixture = PromotionIntegrationFixture::start("expiry_bracket").await;
-    let store = CountingObjectStore::new(Arc::clone(&fixture.staging));
-    let seam = PromotionCatalogSeam::new(fixture.catalog.iceberg_catalog(), store.read_counter());
-    let (clock, control) = manual_clock();
-    let mut supervised = SupervisedPromotion::start(
-        &fixture,
-        Arc::clone(&seam) as Arc<dyn iceberg::Catalog>,
-        Arc::clone(&store) as Arc<dyn vala_bifrost_redux::forge::ForgeObjectStore>,
-        clock,
-    );
-    // Two real promotion commits leave two snapshots, so the retained head
-    // still leaves an expirable ancestor under `retain_last = 1`.
-    supervised.run_one_success().await;
-    fixture.seal_more(2).await;
-    supervised.restart_worker();
-    supervised.run_one_success().await;
-    // Every existing snapshot is now older than the retention cutoff. Each
-    // later advance moves the cutoff, so every pass below derives its own
-    // deterministic operation identity instead of replaying the previous one.
-    control
-        .advance(ChronoDuration::hours(48))
-        .expect("manual clock advance");
+    let ExpirableTable {
+        fixture,
+        store,
+        seam,
+        supervised,
+        watermark,
+    } = expirable_table("expiry_bracket").await;
     let forge = supervised.forge();
-    // Every seeded task protects the live head, which is the watermark a real
-    // claimed attempt would carry.
-    let head = fixture
-        .catalog
-        .iceberg_catalog()
-        .load_table(&fixture.binding.table_ident())
-        .await
-        .expect("fixture table loads")
-        .metadata()
-        .current_snapshot()
-        .map(|snapshot| (snapshot.snapshot_id(), snapshot.timestamp_ms()))
-        .expect("two promotions left a current snapshot");
-    let watermark = head;
 
     reject_releases_every_claim(&fixture, &seam, &store, &forge, watermark).await;
 
@@ -359,6 +331,216 @@ async fn prepared_claim_releases_sql_before_iceberg_and_hands_exact_names_to_cle
         store.deletes(),
         deletes_before,
         "snapshot expiration never invokes physical cleanup"
+    );
+
+    supervised.shutdown().await;
+}
+
+/// Everything one snapshot-expiration scenario needs over a live fixture.
+///
+/// The supervisor is retained by value because dropping it would take the
+/// scheduler, worker, and shared `Forge` graph down with it.
+struct ExpirableTable {
+    /// Live Scribe/Forge fixture over one repository-managed database.
+    fixture: PromotionIntegrationFixture,
+    /// Delete- and read-counting object store every effect goes through.
+    store: Arc<CountingObjectStore>,
+    /// Catalog seam that can refuse, park, or lose one commit.
+    seam: Arc<PromotionCatalogSeam>,
+    /// Retained production scheduler and worker supervisor.
+    supervised: SupervisedPromotion,
+    /// Current head snapshot and its timestamp, used as the task watermark.
+    watermark: (i64, i64),
+}
+
+/// Promotes twice and ages the clock so the older snapshot is expirable.
+///
+/// # Panics
+///
+/// Panics when the fixture cannot promote twice or the table has no head.
+async fn expirable_table(name: &str) -> ExpirableTable {
+    let fixture = PromotionIntegrationFixture::start(name).await;
+    let store = CountingObjectStore::new(Arc::clone(&fixture.staging));
+    let seam = PromotionCatalogSeam::new(fixture.catalog.iceberg_catalog(), store.read_counter());
+    let (clock, control) = manual_clock();
+    let mut supervised = SupervisedPromotion::start(
+        &fixture,
+        Arc::clone(&seam) as Arc<dyn iceberg::Catalog>,
+        Arc::clone(&store) as Arc<dyn vala_bifrost_redux::forge::ForgeObjectStore>,
+        clock,
+    );
+    // Two real promotion commits leave two snapshots, so the retained head
+    // still leaves an expirable ancestor under `retain_last = 1`.
+    supervised.run_one_success().await;
+    fixture.seal_more(2).await;
+    supervised.restart_worker();
+    supervised.run_one_success().await;
+    // Every existing snapshot is now older than the retention cutoff. Each
+    // later advance moves the cutoff, so every pass derives its own
+    // deterministic operation identity instead of replaying the previous one.
+    control
+        .advance(ChronoDuration::hours(48))
+        .expect("manual clock advance");
+    // Every seeded task protects the live head, which is the watermark a real
+    // claimed attempt would carry.
+    let watermark = fixture
+        .catalog
+        .iceberg_catalog()
+        .load_table(&fixture.binding.table_ident())
+        .await
+        .expect("fixture table loads")
+        .metadata()
+        .current_snapshot()
+        .map(|snapshot| (snapshot.snapshot_id(), snapshot.timestamp_ms()))
+        .expect("two promotions left a current snapshot");
+    ExpirableTable {
+        fixture,
+        store,
+        seam,
+        supervised,
+        watermark,
+    }
+}
+
+/// Counts the snapshots the real catalog still retains for the fixture table.
+///
+/// Expiration removes ancestry rather than moving the head, so the retained
+/// snapshot count — not the current snapshot id — is what proves the catalog
+/// accepted the mutation.
+///
+/// # Panics
+///
+/// Panics when the fixture table cannot be loaded.
+async fn retained_snapshots(fixture: &PromotionIntegrationFixture) -> usize {
+    fixture
+        .catalog
+        .iceberg_catalog()
+        .load_table(&fixture.binding.table_ident())
+        .await
+        .expect("fixture table loads")
+        .metadata()
+        .snapshots()
+        .count()
+}
+
+/// Proves an accepted commit whose response was lost keeps prepared authority.
+///
+/// # Panics
+///
+/// Panics when the lost response resets the preparation, when Iceberg did not
+/// actually advance, or when takeover does not settle from the advanced
+/// metadata without a second catalog mutation.
+#[tokio::test]
+async fn retryable_catalog_failure_retains_prepared_authority() {
+    let ExpirableTable {
+        fixture,
+        store,
+        seam,
+        supervised,
+        watermark,
+    } = expirable_table("expiry_lost_response").await;
+    let forge = supervised.forge();
+
+    let attempt = Uuid::now_v7();
+    let preparing_worker = Uuid::now_v7();
+    let task = seed_running_task(
+        &fixture,
+        fixture.tenant,
+        attempt,
+        preparing_worker,
+        watermark,
+        "22",
+    )
+    .await;
+    let snapshots_before = retained_snapshots(&fixture).await;
+    let deletes_before = store.deletes();
+    seam.lose_commit_responses(true);
+    let uncertain = forge
+        .run_snapshot_expiry_for_test(&fixture.binding, task, attempt, preparing_worker)
+        .await;
+    seam.lose_commit_responses(false);
+    let error = uncertain.expect_err("a lost response is uncertainty, not a released expiration");
+    assert!(
+        matches!(error, vala_bifrost_redux::forge::ForgeError::Catalog(_)),
+        "the retryable catalog error surfaces unwrapped: {error:?}"
+    );
+    assert!(
+        retained_snapshots(&fixture).await < snapshots_before,
+        "the catalog accepted the expiration before the response was lost"
+    );
+    let retained = expiry_state(&fixture, task).await;
+    assert_eq!(retained.task_state, "prepared");
+    assert!(retained.claims > 0, "every claim survives uncertainty");
+    assert_eq!(retained.operation_phase.as_deref(), Some("prepared"));
+    assert!(
+        !retained
+            .audits
+            .contains(&"forge.snapshot_expire.reset".to_owned())
+            && !retained.audits.contains(&"forge.task.cancelled".to_owned()),
+        "an uncertain outcome releases nothing: {:?}",
+        retained.audits
+    );
+    let preparing_evidence: (Uuid, Uuid, Uuid) = sqlx::query_as(
+        "SELECT task_id, attempt_id, worker_id FROM vala.forge_snapshot_expiration_claims \
+         WHERE task_id = $1 LIMIT 1",
+    )
+    .bind(task)
+    .fetch_one(fixture.operator_pool.pool())
+    .await
+    .expect("immutable preparation evidence");
+    assert_eq!(preparing_evidence, (task, attempt, preparing_worker));
+    assert_eq!(
+        store.deletes(),
+        deletes_before,
+        "expiration deletes nothing"
+    );
+
+    let attempts_before = seam.attempts();
+    let settling_worker = Uuid::now_v7();
+    sqlx::query("UPDATE vala.maintenance_leases SET expires_at = now() - interval '1 hour'")
+        .execute(fixture.operator_pool.pool())
+        .await
+        .expect("the dead preparing worker's lease ages out");
+    sqlx::query("UPDATE vala.forge_tasks SET claimed_by = $2 WHERE task_id = $1")
+        .bind(task)
+        .bind(settling_worker)
+        .execute(fixture.operator_pool.pool())
+        .await
+        .expect("a new owner takes the prepared task over");
+    let evidence = forge
+        .run_snapshot_expiry_for_test(&fixture.binding, task, attempt, settling_worker)
+        .await
+        .expect("takeover recognizes the advanced metadata")
+        .expect("recovered settlement settles the prepared task");
+    assert!(
+        !evidence.cleanup_candidates.is_empty(),
+        "recovered settlement stores the exact cleanup candidates"
+    );
+    assert_eq!(
+        seam.attempts(),
+        attempts_before,
+        "takeover settles from the committed metadata without a second mutation"
+    );
+    let settled = expiry_state(&fixture, task).await;
+    assert_eq!(settled.task_state, "succeeded");
+    assert_eq!(settled.claims, 0);
+    assert_eq!(settled.operation_phase.as_deref(), Some("recovered"));
+    assert!(
+        settled
+            .audits
+            .contains(&"forge.snapshot_expire.recovered".to_owned())
+            && settled.audits.contains(&"forge.task.succeeded".to_owned()),
+        "recovery emits both terminal audits: {:?}",
+        settled.audits
+    );
+    assert!(
+        settled.demand_generation > retained.demand_generation,
+        "recovered settlement creates cleanup demand"
+    );
+    assert_eq!(
+        store.deletes(),
+        deletes_before,
+        "expiration deletes nothing"
     );
 
     supervised.shutdown().await;

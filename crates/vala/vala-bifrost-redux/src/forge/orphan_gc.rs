@@ -881,7 +881,14 @@ impl Forge {
         let detail = Self::gc_detail(table.key, scan.candidates)?;
         self.append_gc_audit(lease, table.key.tenant, &detail, "forge.orphan_gc.prepared")
             .await?;
-        let batch = self
+        // Past the prepared audit the operation row owns this batch. A caller
+        // driving a durable task must not settle its attempt on any exit from
+        // here: settling would return the task to the pool while the batch is
+        // still unresolved, and a successor would list and select against an
+        // open preparation. Reporting the exit as retained instead leaves the
+        // attempt standing until its lease lapses, which is the one route that
+        // replays this exact batch.
+        let batch = match self
             .delete_gc_batch(
                 lease,
                 GcBatchRequest {
@@ -891,7 +898,17 @@ impl Forge {
                     deadline: Some(deadline),
                 },
             )
-            .await?;
+            .await
+        {
+            Ok(batch) => batch,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "prepared orphan-GC batch left unresolved; retaining the attempt for reclaim"
+                );
+                return Err(ForgeError::ShutdownRetained);
+            }
+        };
         outcome.recovered = outcome.recovered.saturating_add(1);
         outcome.deleted = outcome.deleted.saturating_add(batch.deleted);
         outcome.skipped = outcome.skipped.saturating_add(batch.skipped);

@@ -1053,6 +1053,108 @@ mod pg_tests {
             conn.commit().await.expect("seeded projection commit");
         }
 
+        /// Seeds one outbox-less prepared `OrphanGc` row and settles it.
+        ///
+        /// Orphan collection is the one destructive family whose recovery
+        /// authority is reached only through this projection: an orphan batch
+        /// leaves no catalog trace, so a reader that needed the prepared audit
+        /// row to still exist would lose the batch whenever delivery was
+        /// relayed or pruned away. This proves the family lists, settles, and
+        /// snapshots on its own durable state, and that its terminal
+        /// settlement still appends exactly one audit event atomically.
+        ///
+        /// # Panics
+        ///
+        /// Panics when seeding, listing, settlement, or any phase, sequence, or
+        /// cardinality assertion fails.
+        async fn assert_orphan_gc_recovery_is_outbox_independent(
+            pool: &PgPool,
+            tenant: DataTenantId,
+            audits_before: i64,
+        ) {
+            let operation_id = Uuid::now_v7();
+            let prepared_seq = 6_360_i64;
+            let candidate_paths =
+                vec![StoragePath::new("table/orphans/outbox-free.parquet").expect("valid path")];
+            let prepared_detail = AuditDetail::ForgeOrphanGc {
+                operation_id,
+                phase: ForgeOrphanGcPhase::Prepared,
+                group: resource().to_owned(),
+                candidate_paths: candidate_paths.clone(),
+                deleted_paths: vec![],
+                skipped_paths: vec![],
+            };
+            seed_state_row(
+                pool,
+                tenant,
+                ForgeOperationFamily::OrphanGc,
+                operation_id,
+                "prepared",
+                &prepared_detail,
+                &prepared_detail,
+                prepared_seq,
+                None,
+            )
+            .await;
+
+            let open = list_open(pool, tenant, ForgeOperationFamily::OrphanGc)
+                .await
+                .expect("orphan-GC recovery must not require an audit delivery row");
+            assert!(!open.overflowed, "single seeded open orphan-GC operation");
+            assert_eq!(open.operations.len(), 1, "exactly one open orphan-GC batch");
+            assert_eq!(open.operations[0].operation_id, operation_id);
+            assert_eq!(open.operations[0].prepared_audit_seq, prepared_seq);
+            assert_eq!(open.operations[0].terminal_audit_seq, None);
+            assert_eq!(open.operations[0].prepared_detail, prepared_detail);
+
+            let recovered_event = event(
+                "forge.orphan_gc.recovered",
+                resource(),
+                Some(AuditDetail::ForgeOrphanGc {
+                    operation_id,
+                    phase: ForgeOrphanGcPhase::Recovered,
+                    group: resource().to_owned(),
+                    candidate_paths: candidate_paths.clone(),
+                    deleted_paths: candidate_paths,
+                    skipped_paths: vec![],
+                }),
+            );
+            let terminal_seq = match append_terminal(
+                pool,
+                tenant,
+                resource(),
+                ForgeOperationFamily::OrphanGc,
+                &recovered_event,
+            )
+            .await
+            .expect("orphan-GC settlement must not require an audit delivery row")
+            {
+                ForgeOperationTransition::Applied { audit_seq } => audit_seq,
+                other => panic!("expected terminal application, got {other:?}"),
+            };
+            assert_eq!(
+                count_audit(pool, tenant).await,
+                audits_before + 1,
+                "orphan-GC settlement appends exactly one audit event"
+            );
+            assert_eq!(
+                state_snapshot(pool, tenant, ForgeOperationFamily::OrphanGc, operation_id).await,
+                StateSnapshot {
+                    phase: "recovered".to_owned(),
+                    prepared_audit_seq: prepared_seq,
+                    terminal_audit_seq: Some(terminal_seq),
+                }
+            );
+            assert!(
+                list_open(pool, tenant, ForgeOperationFamily::OrphanGc)
+                    .await
+                    .expect("open listing")
+                    .operations
+                    .is_empty(),
+                "a settled batch is no longer open recovery work"
+            );
+        }
+
         /// Builds one snapshot-expiry detail for the fixed test resource.
         ///
         /// # Panics
@@ -1324,6 +1426,8 @@ mod pg_tests {
                 1,
                 "an idempotent terminal replay appends no audit"
             );
+
+            assert_orphan_gc_recovery_is_outbox_independent(pool, tenant, 1).await;
 
             // Contradictory stored state still fails closed before any caller
             // receives recovery authority.

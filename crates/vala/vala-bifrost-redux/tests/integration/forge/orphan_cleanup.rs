@@ -414,9 +414,9 @@ async fn traverse_until_ambiguous_delete(
             assert!(
                 matches!(
                     error,
-                    vala_bifrost_redux::forge::ForgeError::ObjectDelete(_)
+                    vala_bifrost_redux::forge::ForgeError::ShutdownRetained
                 ),
-                "only the armed delete may end a bounded pass: {error}"
+                "only an unresolved prepared batch may end a bounded pass: {error}"
             );
             // Settlement belongs to the production worker loop, which this
             // phase-bypassing entrypoint deliberately does not run, so the
@@ -660,6 +660,356 @@ async fn assert_recovered_pass_exhausts_the_prefix(
     );
     let (state, evidence) = orphan_task_row(fixture, task_id).await;
     assert_eq!(state, "succeeded", "an exhausted prefix ends the task");
+    assert!(
+        evidence.is_none(),
+        "a completed orphan task carries no resume position: {evidence:?}"
+    );
+}
+
+/// One promoted table carrying exactly one aged, eligible rowless orphan.
+struct OrphanBatch {
+    /// Live Scribe/Forge fixture over one repository-managed database.
+    promoted: PromotedRewriteFixture,
+    /// Delete-counting, pausable object store every effect goes through.
+    store: Arc<CountingObjectStore>,
+    /// Forge graph retained after the supervisor shut down.
+    forge: Arc<vala_bifrost_redux::forge::Forge>,
+    /// Durable identity of the ready orphan-cleanup task.
+    task_id: Uuid,
+    /// Object key of the single eligible orphan.
+    orphan: String,
+}
+
+/// Promotes one table, seeds one aged orphan, and enqueues its cleanup task.
+///
+/// # Panics
+///
+/// Panics when the fixture cannot start or the clock cannot advance.
+async fn one_eligible_orphan(name: &str) -> OrphanBatch {
+    let promoted = PromotedRewriteFixture::start_unpromoted(name).await;
+    let store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
+    let catalog = PromotionCatalogSeam::new(
+        promoted.fixture.catalog.iceberg_catalog(),
+        store.read_counter(),
+    );
+    let (clock, control) = manual_clock();
+    let mut supervisor = SupervisedPromotion::start(
+        &promoted.fixture,
+        Arc::clone(&catalog) as Arc<dyn Catalog>,
+        Arc::clone(&store) as Arc<dyn ForgeObjectStore>,
+        clock,
+    );
+    supervisor.run_one_success().await;
+    let orphan = seed_object(
+        &promoted.fixture,
+        format!(
+            "{}/{}-00000-{}.parquet",
+            forge_root(&promoted.fixture),
+            Uuid::now_v7(),
+            Uuid::now_v7()
+        ),
+    )
+    .await;
+    let forge = supervisor.forge();
+    supervisor.shutdown().await;
+    let cutoff = control
+        .advance(ChronoDuration::hours(25))
+        .expect("manual clock advance")
+        .timestamp_millis();
+    let task_id = seed_ready_orphan_task(&promoted.fixture, cutoff).await;
+    OrphanBatch {
+        promoted,
+        store,
+        forge,
+        task_id,
+        orphan,
+    }
+}
+
+/// Reads the durable identity and phase of every orphan-GC operation row.
+///
+/// # Panics
+///
+/// Panics when the diagnostic read fails.
+async fn orphan_operations(fixture: &PromotionIntegrationFixture) -> Vec<(Uuid, String)> {
+    sqlx::query_as(
+        "SELECT operation_id,phase FROM vala.forge_operation_state WHERE data_tenant_id=$1 AND family='orphan_gc' ORDER BY prepared_at,operation_id",
+    )
+    .bind(fixture.tenant.as_uuid())
+    .fetch_all(fixture.operator_pool.pool())
+    .await
+    .expect("orphan-GC operation state is readable")
+}
+
+/// Lists every orphan-GC audit operation this tenant appended, in sequence.
+///
+/// # Panics
+///
+/// Panics when the diagnostic read fails.
+async fn orphan_gc_audits(fixture: &PromotionIntegrationFixture) -> Vec<String> {
+    tenant_audits(fixture, "forge.orphan_gc.%", None).await
+}
+
+/// Lists this tenant's audit operations matching one `LIKE` pattern.
+///
+/// The audit outbox is readable only through a tenant connection, which is the
+/// same route the production appenders take.
+///
+/// # Panics
+///
+/// Panics when the tenant connection or the diagnostic read fails.
+async fn tenant_audits(
+    fixture: &PromotionIntegrationFixture,
+    pattern: &str,
+    resource: Option<&str>,
+) -> Vec<String> {
+    let mut conn = fixture
+        .vala
+        .tenant_conn(fixture.tenant)
+        .await
+        .expect("fixture tenant connection");
+    let operations: Vec<String> = sqlx::query_scalar(
+        "SELECT operation FROM vala.audit_outbox WHERE operation LIKE $1 AND ($2::text IS NULL OR resource=$2) ORDER BY seq",
+    )
+    .bind(pattern)
+    .bind(resource)
+    .fetch_all(&mut **conn.transaction())
+    .await
+    .expect("tenant audits are readable");
+    conn.commit().await.expect("audit read commit");
+    operations
+}
+
+/// Asserts the delete gate holds no Postgres transaction or advisory lock.
+///
+/// The preparation must commit and close before the first object call, because
+/// an object store call is unbounded and a transaction held across it would
+/// pin a connection and block every competing authority for its duration.
+///
+/// # Panics
+///
+/// Panics when an advisory lock is held or the prepared row is still locked by
+/// an open transaction.
+async fn assert_delete_gate_is_sql_free(batch: &OrphanBatch) -> Uuid {
+    let fixture = &batch.promoted.fixture;
+    let operations = orphan_operations(fixture).await;
+    let [(operation_id, phase)] = operations.as_slice() else {
+        panic!("exactly one prepared orphan-GC batch exists: {operations:?}");
+    };
+    assert_eq!(phase, "prepared", "the batch is durable before its delete");
+    let advisory: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM pg_locks WHERE locktype='advisory'")
+            .fetch_one(fixture.operator_pool.pool())
+            .await
+            .expect("advisory locks are readable");
+    assert_eq!(advisory, 0, "no advisory lock spans the object delete");
+    let mut probe = fixture
+        .operator_pool
+        .pool()
+        .begin()
+        .await
+        .expect("independent transaction");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        sqlx::query(
+            "SELECT 1 FROM vala.forge_operation_state WHERE operation_id=$1 FOR UPDATE NOWAIT",
+        )
+        .bind(operation_id)
+        .fetch_one(&mut *probe),
+    )
+    .await
+    .expect("the independent lock is not blocked")
+    .expect("the preparation transaction released the prepared row");
+    probe.rollback().await.expect("release the probe lock");
+    *operation_id
+}
+
+/// Asserts a post-preparation exit retained the attempt exactly as it stood.
+///
+/// # Panics
+///
+/// Panics when the task left `Running`, its attempt or cursor moved, its
+/// failure budget was consumed, or a terminal task audit was appended.
+async fn assert_attempt_is_retained(
+    fixture: &PromotionIntegrationFixture,
+    task_id: Uuid,
+    attempt: Uuid,
+) {
+    let (state, evidence, attempts, current): (
+        String,
+        Option<serde_json::Value>,
+        i32,
+        Option<Uuid>,
+    ) = sqlx::query_as(
+        "SELECT state,evidence,attempt_count,attempt_id FROM vala.forge_tasks WHERE task_id=$1",
+    )
+    .bind(task_id)
+    .fetch_one(fixture.operator_pool.pool())
+    .await
+    .expect("the orphan task is readable");
+    assert_eq!(state, "running", "the prepared attempt is left standing");
+    assert_eq!(
+        current,
+        Some(attempt),
+        "the attempt generation is untouched"
+    );
+    assert_eq!(attempts, 0, "a retained exit consumes no failure budget");
+    assert!(
+        evidence.is_none(),
+        "an unresolved batch writes no cursor: {evidence:?}"
+    );
+    assert_eq!(
+        tenant_audits(
+            fixture,
+            "forge.task.%",
+            Some(&format!("forge-task:{task_id}"))
+        )
+        .await,
+        Vec::<String>::new(),
+        "a retained attempt appends no terminal task audit"
+    );
+}
+
+/// A prepared batch owns its own recovery across takeover and replay.
+///
+/// The delete gate is the dangerous point of this protocol: the batch is
+/// durable, the object call is unbounded, and the attempt may die at any
+/// instant. This proves the three properties that make that survivable. No
+/// Postgres transaction or advisory lock spans the delete, so a stuck object
+/// store cannot pin a connection or block a competing authority. A
+/// post-preparation exit leaves the attempt exactly as it stood — same
+/// generation, same empty cursor, no consumed budget, no terminal audit — so
+/// nothing observes a settlement that did not happen. And the successor that
+/// reclaims the lapsed lease replays the same batch identity rather than
+/// listing a fresh one, so an object already deleted by the dead attempt is
+/// recovered as deleted instead of being re-selected or lost.
+///
+/// # Panics
+///
+/// Panics when the fixture cannot start or any state, audit, or identity
+/// assertion fails.
+#[tokio::test]
+async fn prepared_batch_takeover_is_replay_safe_and_sql_free_during_delete() {
+    let batch = one_eligible_orphan("orphan_takeover").await;
+    let fixture = &batch.promoted.fixture;
+    let owner = ForgeWorker::new(
+        Arc::clone(&batch.forge),
+        ForgeWorkerConfig::default(),
+        Uuid::now_v7(),
+    )
+    .expect("first fixture Forge worker");
+    let claim = owner
+        .claim_for_test()
+        .await
+        .expect("claim transaction runs")
+        .expect("the ready orphan task is claimable");
+    assert_eq!(claim.task_id, batch.task_id);
+    let attempt = claim.attempt_id.expect("a claim carries its attempt");
+
+    batch.store.pause_delete_at(1);
+    let stop = CancellationToken::new();
+    let mut prepared = Uuid::nil();
+    let (result, ()) = tokio::join!(
+        owner.execute_orphan_cleanup_claim_for_test(claim, &stop),
+        async {
+            batch.store.delete_paused().await;
+            prepared = assert_delete_gate_is_sql_free(&batch).await;
+            // The owner dies after its delete is submitted but before it can
+            // resolve the batch: the worst survivable moment in the protocol.
+            stop.cancel();
+            batch.store.release_delete();
+        }
+    );
+    let retained = result.expect_err("a post-preparation exit does not settle the attempt");
+    assert!(
+        matches!(
+            retained,
+            vala_bifrost_redux::forge::ForgeError::ShutdownRetained
+        ),
+        "a prepared batch retains its attempt for reclaim: {retained}"
+    );
+    assert_attempt_is_retained(fixture, batch.task_id, attempt).await;
+    assert_eq!(
+        orphan_gc_audits(fixture).await,
+        vec!["forge.orphan_gc.prepared".to_owned()],
+        "an unresolved batch has exactly one prepared audit and no terminal one"
+    );
+
+    assert_takeover_replays_the_same_batch(&batch, prepared, attempt).await;
+}
+
+/// Asserts the successor reclaims the task and replays the same batch.
+///
+/// # Panics
+///
+/// Panics when reclaim does not move the task, the replay creates a second
+/// batch identity, the recovery is not audited exactly once, or the task does
+/// not settle with its prefix exhausted.
+async fn assert_takeover_replays_the_same_batch(
+    batch: &OrphanBatch,
+    prepared: Uuid,
+    attempt: Uuid,
+) {
+    let fixture = &batch.promoted.fixture;
+    fixture.expire_claims().await;
+    let reclaimed = vala_sql::queries::forge_tasks::ForgeTasks::new(fixture.operator_pool.clone())
+        .reclaim_expired(8)
+        .await
+        .expect("expired claims reclaim");
+    assert_eq!(reclaimed, 1, "the lapsed lease returns exactly this task");
+    fixture.clear_task_backoff().await;
+
+    let taker = ForgeWorker::new(
+        Arc::clone(&batch.forge),
+        ForgeWorkerConfig::default(),
+        Uuid::now_v7(),
+    )
+    .expect("takeover fixture Forge worker");
+    let claim = taker
+        .claim_for_test()
+        .await
+        .expect("claim transaction runs")
+        .expect("the reclaimed orphan task is claimable");
+    assert_eq!(
+        claim.task_id, batch.task_id,
+        "takeover resumes the same task"
+    );
+    assert_ne!(
+        claim.attempt_id,
+        Some(attempt),
+        "takeover runs under its own attempt generation"
+    );
+    taker
+        .execute_orphan_cleanup_claim_for_test(claim, &CancellationToken::new())
+        .await
+        .expect("the takeover settles the prepared batch");
+
+    let operations = orphan_operations(fixture).await;
+    let [(identity, phase)] = operations.as_slice() else {
+        panic!("recovery replays one batch instead of listing another: {operations:?}");
+    };
+    assert_eq!(
+        *identity, prepared,
+        "the batch identity is stable across takeover"
+    );
+    assert_ne!(
+        phase, "prepared",
+        "the replayed batch reaches a terminal phase"
+    );
+    assert_eq!(
+        orphan_gc_audits(fixture).await,
+        vec![
+            "forge.orphan_gc.prepared".to_owned(),
+            "forge.orphan_gc.recovered".to_owned()
+        ],
+        "one prepared and one terminal audit describe the whole batch"
+    );
+    assert!(
+        !object_exists(fixture, &batch.orphan).await,
+        "the reclaimed orphan is gone once its batch resolves"
+    );
+    let (state, evidence) = orphan_task_row(fixture, batch.task_id).await;
+    assert_eq!(state, "succeeded", "the exhausted prefix ends the task");
     assert!(
         evidence.is_none(),
         "a completed orphan task carries no resume position: {evidence:?}"

@@ -213,6 +213,11 @@ impl CountingObjectStore {
         self.delete_pause.arrived.notified().await;
     }
 
+    /// Let the suspended delete proceed into the real operator.
+    pub(crate) fn release_delete(&self) {
+        self.delete_pause.release.notify_one();
+    }
+
     /// Borrow the shared read counter so a catalog seam can snapshot it.
     pub(crate) fn read_counter(&self) -> Arc<AtomicUsize> {
         Arc::clone(&self.reads)

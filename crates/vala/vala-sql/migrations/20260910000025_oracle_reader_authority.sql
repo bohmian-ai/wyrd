@@ -289,3 +289,18 @@ REVOKE ALL ON vala.forge_snapshot_expiration_claims FROM PUBLIC;
 GRANT SELECT ON vala.forge_snapshot_expiration_claims TO wyrd_app;
 GRANT SELECT, INSERT, DELETE
     ON vala.forge_snapshot_expiration_claims TO wyrd_platform_admin;
+
+-- ---------------------------------------------------------------------------
+-- Expired-cleanup handoff identity
+-- ---------------------------------------------------------------------------
+
+-- One cleanup task per succeeded snapshot-expiration source, as a database
+-- invariant rather than a scheduler convention. The source task id is the
+-- globally unique replay identity of the handoff, so a second enqueue for the
+-- same source cannot create a second physical deletion owner even if two
+-- schedulers race or a demand is replanned. Retention also reads this index:
+-- a succeeded expiration whose candidates no cleanup plan references yet is
+-- held back from terminal pruning by a NOT EXISTS against exactly this key.
+CREATE UNIQUE INDEX forge_tasks_expired_cleanup_source ON vala.forge_tasks
+ ((plan #>> '{parameters,source_task_id}'))
+ WHERE strategy = 'expired_cleanup';

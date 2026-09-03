@@ -1390,7 +1390,7 @@ impl ForgeOperations<'_> {
 ///
 /// # Errors
 /// Returns [`SqlError::Query`] when the binding statement fails.
-async fn bind_tenant(
+pub(crate) async fn bind_tenant(
     tx: &mut Transaction<'_, Postgres>,
     tenant: DataTenantId,
 ) -> Result<(), SqlError> {
@@ -1411,7 +1411,7 @@ async fn bind_tenant(
 /// # Errors
 /// Returns [`SqlError::InvariantViolation`] when the fence is lost and
 /// [`SqlError::Query`] when the statement fails.
-async fn assert_lease_fence(
+pub(crate) async fn assert_lease_fence(
     tx: &mut Transaction<'_, Postgres>,
     authority: &ForgeExpirationAuthority,
 ) -> Result<(), SqlError> {
@@ -1490,11 +1490,14 @@ async fn lock_expiration_task(
 /// Takes the table's maintenance-authority row, the one-row-per-table boundary
 /// that gives reader widening and destructive maintenance a single winner.
 ///
+/// Shared by every fenced Forge maintenance workflow that must exclude reader
+/// widening for the duration of its own transaction.
+///
 /// # Errors
 /// Returns [`SqlError::Conflict`] when the table has no authority row or its
 /// registered UID disagrees with the request, and [`SqlError`] on statement or
 /// identity-validation failure.
-async fn lock_table_authority(
+pub(crate) async fn lock_table_authority(
     tx: &mut Transaction<'_, Postgres>,
     tenant: DataTenantId,
     table: &ForgeClaimTable,
@@ -1509,11 +1512,11 @@ async fn lock_table_authority(
     .await
     .map_err(SqlError::from)?;
     let registered = registered.ok_or_else(|| SqlError::Conflict {
-        detail: "snapshot expiration names a table with no maintenance authority row".to_owned(),
+        detail: "Forge maintenance names a table with no maintenance authority row".to_owned(),
     })?;
     if registered.as_slice() != table.table_uid.as_slice() {
         return Err(SqlError::Conflict {
-            detail: "snapshot expiration table UID disagrees with the registered table".to_owned(),
+            detail: "Forge maintenance table UID disagrees with the registered table".to_owned(),
         });
     }
     let identity = TableAuthorityIdentity {
@@ -1578,7 +1581,7 @@ async fn refuse_protected_snapshots(
 /// Returns [`SqlError::InvariantViolation`] when a stored header names another
 /// table, when a header or member fails validation, or when a header disappears
 /// inside this transaction, and [`SqlError`] when a statement fails.
-async fn list_table_protection_in_operator_tx(
+pub(crate) async fn list_table_protection_in_operator_tx(
     tx: &mut Transaction<'_, Postgres>,
     identity: &TableAuthorityIdentity,
 ) -> Result<Vec<ProtectionRecord>, SqlError> {

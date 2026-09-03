@@ -5,8 +5,10 @@ use std::str::FromStr;
 use chrono::{DateTime, Utc};
 use sqlx::types::Uuid;
 use wyrd_spec::DataTenantId;
+use wyrd_spec::vala::api::AuditEvent;
 
 use crate::SqlError;
+use crate::row_types::forge_operations::{ForgeClaimTable, ForgeExpirationAuthority};
 
 /// Current version of persisted task plans and evidence.
 pub const FORGE_TASK_PAYLOAD_VERSION: u16 = 1;
@@ -410,6 +412,211 @@ impl ForgeTaskPlan {
     }
 }
 
+impl ForgeTaskPlan {
+    /// Validates the plan under the exact strategy that will execute it.
+    ///
+    /// Every strategy except [`ForgeTaskStrategy::ExpiredCleanup`] names its
+    /// work through `inputs`, so an empty input set is a malformed plan for it.
+    /// Expired cleanup is the one strategy whose work is the immutable copied
+    /// candidate vector inside `parameters`: `inputs` is deliberately empty so
+    /// the plan cannot grow a second candidate authority, and its typed handoff
+    /// is decoded here so a malformed payload fails before lease acquisition or
+    /// any external IO.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::validate`], plus
+    /// [`SqlError::Conflict`] (or [`SqlError::InvariantViolation`] when
+    /// `persisted`) for an empty non-cleanup input set, a nonempty cleanup
+    /// input set, or a cleanup payload that is missing, unknown-versioned,
+    /// unknown-fielded, empty, or malformed.
+    pub fn validate_for_strategy(
+        &self,
+        strategy: ForgeTaskStrategy,
+        persisted: bool,
+    ) -> Result<(), SqlError> {
+        self.validate(persisted)?;
+        let fail = |detail: String| {
+            if persisted {
+                SqlError::InvariantViolation { detail }
+            } else {
+                SqlError::Conflict { detail }
+            }
+        };
+        if strategy == ForgeTaskStrategy::ExpiredCleanup {
+            if !self.inputs.is_empty() {
+                return Err(fail(
+                    "expired cleanup plans carry their candidates in parameters, not inputs"
+                        .to_owned(),
+                ));
+            }
+            ExpiredCleanupPayload::from_value(&self.parameters, persisted)?;
+        } else if self.inputs.is_empty() {
+            return Err(fail("Forge task plan has no exact inputs".to_owned()));
+        }
+        Ok(())
+    }
+
+    /// Decodes the typed expired-cleanup handoff this plan carries.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqlError::Conflict`] when the strategy is not
+    /// [`ForgeTaskStrategy::ExpiredCleanup`], and the decoding errors of
+    /// [`ExpiredCleanupPayload::from_value`] for a malformed payload.
+    pub fn expired_cleanup_payload(
+        &self,
+        strategy: ForgeTaskStrategy,
+        persisted: bool,
+    ) -> Result<ExpiredCleanupPayload, SqlError> {
+        if strategy != ForgeTaskStrategy::ExpiredCleanup {
+            return Err(SqlError::Conflict {
+                detail: "only an expired-cleanup plan carries a cleanup handoff".to_owned(),
+            });
+        }
+        ExpiredCleanupPayload::from_value(&self.parameters, persisted)
+    }
+}
+
+/// Payload version of the closed expired-cleanup handoff.
+///
+/// This is the inner version of `plan.parameters` only. The outer
+/// [`FORGE_TASK_PAYLOAD_VERSION`] is unchanged: the handoff is a new
+/// strategy-specific parameter shape, not a new plan envelope.
+pub const EXPIRED_CLEANUP_PAYLOAD_VERSION: u16 = 1;
+
+/// Stable `kind` tag of the expired-cleanup parameter payload.
+pub const EXPIRED_CLEANUP_PAYLOAD_KIND: &str = "expired_cleanup";
+
+/// The closed, immutable handoff one expired-cleanup task executes.
+///
+/// The vector is copied byte-for-byte, in order, from one succeeded
+/// snapshot-expiration task's evidence at enqueue. After that commit the copy
+/// is authoritative: preparation, replay, takeover, and settlement never read
+/// the source row again, so the source may be pruned normally.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpiredCleanupPayload {
+    /// Inner payload version; unknown versions fail closed.
+    pub version: u16,
+    /// Globally unique replay identity: the succeeded expiration task copied.
+    pub source_task_id: Uuid,
+    /// Snapshot the source expiration committed.
+    pub committed_snapshot_id: i64,
+    /// Metadata location the source expiration committed.
+    pub committed_metadata_location: String,
+    /// Digest of that committed metadata.
+    pub committed_metadata_digest: String,
+    /// Exact ordered candidate copy; never derived, reordered, or listed.
+    pub cleanup_candidates: Vec<ForgeCleanupCandidate>,
+}
+
+impl ExpiredCleanupPayload {
+    /// Encodes the handoff into its stable closed JSON object.
+    #[must_use]
+    pub fn to_value(&self) -> serde_json::Value {
+        serde_json::json!({
+            "version": self.version,
+            "kind": EXPIRED_CLEANUP_PAYLOAD_KIND,
+            "source_task_id": self.source_task_id.to_string(),
+            "committed_snapshot_id": self.committed_snapshot_id,
+            "committed_metadata_location": self.committed_metadata_location,
+            "committed_metadata_digest": self.committed_metadata_digest,
+            "cleanup_candidates": candidates_to_value(&self.cleanup_candidates),
+        })
+    }
+
+    /// Decodes one handoff, refusing every shape the contract does not name.
+    ///
+    /// Unknown fields, an unknown or missing version, a wrong `kind`, an empty
+    /// or unordered candidate vector, and malformed identities all fail here,
+    /// which is before lease acquisition and before any external IO.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqlError::Conflict`], or [`SqlError::InvariantViolation`] when
+    /// `persisted`, for any departure from the closed shape.
+    pub fn from_value(value: &serde_json::Value, persisted: bool) -> Result<Self, SqlError> {
+        let fail = |detail: &str| {
+            let detail = detail.to_owned();
+            if persisted {
+                SqlError::InvariantViolation { detail }
+            } else {
+                SqlError::Conflict { detail }
+            }
+        };
+        let object = value
+            .as_object()
+            .ok_or_else(|| fail("expired cleanup payload is not an object"))?;
+        const FIELDS: [&str; 7] = [
+            "version",
+            "kind",
+            "source_task_id",
+            "committed_snapshot_id",
+            "committed_metadata_location",
+            "committed_metadata_digest",
+            "cleanup_candidates",
+        ];
+        if object.len() != FIELDS.len() || FIELDS.iter().any(|field| !object.contains_key(*field)) {
+            return Err(fail("expired cleanup payload has unknown or missing fields"));
+        }
+        let version = object
+            .get("version")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u16::try_from(value).ok())
+            .ok_or_else(|| fail("expired cleanup payload version is malformed"))?;
+        if version != EXPIRED_CLEANUP_PAYLOAD_VERSION {
+            return Err(fail("unknown expired cleanup payload version"));
+        }
+        if object.get("kind").and_then(serde_json::Value::as_str)
+            != Some(EXPIRED_CLEANUP_PAYLOAD_KIND)
+        {
+            return Err(fail("expired cleanup payload kind is malformed"));
+        }
+        let source_task_id = object
+            .get("source_task_id")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .ok_or_else(|| fail("expired cleanup source task identity is malformed"))?;
+        let committed_snapshot_id = object
+            .get("committed_snapshot_id")
+            .and_then(serde_json::Value::as_i64)
+            .ok_or_else(|| fail("expired cleanup committed snapshot is malformed"))?;
+        let string = |key: &str| {
+            object
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| fail("expired cleanup committed metadata is malformed"))
+        };
+        let committed_metadata_location = string("committed_metadata_location")?;
+        let committed_metadata_digest = string("committed_metadata_digest")?;
+        let cleanup_candidates = candidates_from_value(
+            object
+                .get("cleanup_candidates")
+                .ok_or_else(|| fail("expired cleanup candidates are missing"))?,
+            persisted,
+        )?;
+        if cleanup_candidates.is_empty()
+            || cleanup_candidates
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+        {
+            return Err(fail(
+                "expired cleanup candidates must be nonempty, ordered, and duplicate-free",
+            ));
+        }
+        Ok(Self {
+            version,
+            source_task_id,
+            committed_snapshot_id,
+            committed_metadata_location,
+            committed_metadata_digest,
+            cleanup_candidates,
+        })
+    }
+}
+
 /// Encodes a validated plan into its stable JSON object.
 pub(crate) fn plan_to_value(plan: &ForgeTaskPlan) -> serde_json::Value {
     serde_json::json!({"version":plan.version,"inputs":plan.inputs,"parameters":plan.parameters})
@@ -576,6 +783,17 @@ pub struct ForgeTaskEvidence {
     pub cleanup_candidates: Vec<ForgeCleanupCandidate>,
     /// Durable cursor into `cleanup_candidates`.
     pub deleted_candidate_count: u32,
+    /// Candidate index whose object-store deletion is currently unresolved.
+    ///
+    /// `None` is the resting state: no delete has been submitted for this task,
+    /// so the cursor alone describes it. `Some(i)` means preparation committed
+    /// for candidate `i` and its external result is not yet proven, which is
+    /// both the replay identity a successor resumes from and the protection
+    /// every other maintenance reader must honour. It is always exactly
+    /// `deleted_candidate_count`, and it can never exist once the cursor has
+    /// reached the terminal frontier. Evidence written before this field
+    /// existed decodes as `None`.
+    pub prepared_candidate_index: Option<u32>,
 }
 
 impl ForgeTaskEvidence {
@@ -606,6 +824,20 @@ impl ForgeTaskEvidence {
         {
             return Err(SqlError::Conflict {
                 detail: "invalid Forge evidence cleanup cursor or candidates".to_owned(),
+            });
+        }
+        if self
+            .prepared_candidate_index
+            .is_some_and(|index| {
+                index != self.deleted_candidate_count
+                    || usize::try_from(index).map_or(true, |index| {
+                        index >= self.cleanup_candidates.len()
+                    })
+            })
+        {
+            return Err(SqlError::Conflict {
+                detail: "Forge prepared candidate index must name the current cursor candidate"
+                    .to_owned(),
             });
         }
         if self.committed_metadata_location.is_some() != self.committed_metadata_digest.is_some()
@@ -640,10 +872,84 @@ impl ForgeTaskEvidence {
     }
 }
 
+/// Encodes one ordered candidate vector into its stable JSON array.
+///
+/// The same encoding backs both the immutable plan handoff and the mutable
+/// attempt evidence, so a byte-for-byte plan/evidence parity check is a plain
+/// value comparison rather than two encoders that can drift apart.
+pub(crate) fn candidates_to_value(candidates: &[ForgeCleanupCandidate]) -> serde_json::Value {
+    serde_json::Value::Array(candidates.iter().map(|candidate|serde_json::json!({"category":candidate.category.as_str(),"catalog":candidate.table.catalog,"namespace":candidate.table.namespace,"table":candidate.table.table,"path":candidate.path.as_str()})).collect())
+}
+
+/// Decodes one candidate vector, validating every identity and table binding.
+///
+/// # Errors
+///
+/// Returns [`SqlError::Conflict`], or [`SqlError::InvariantViolation`] when
+/// `persisted`, for a non-array value, a malformed candidate object, an unknown
+/// category, an unsafe path, or a candidate that is not bound to its own table.
+pub(crate) fn candidates_from_value(
+    value: &serde_json::Value,
+    persisted: bool,
+) -> Result<Vec<ForgeCleanupCandidate>, SqlError> {
+    let fail = |detail: &str| {
+        let detail = detail.to_owned();
+        if persisted {
+            SqlError::InvariantViolation { detail }
+        } else {
+            SqlError::Conflict { detail }
+        }
+    };
+    value
+        .as_array()
+        .ok_or_else(|| fail("cleanup candidates are malformed"))?
+        .iter()
+        .map(|value| {
+            let candidate = value
+                .as_object()
+                .ok_or_else(|| fail("cleanup candidate is not an object"))?;
+            let string = |key: &str| {
+                candidate
+                    .get(key)
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| fail("cleanup candidate field is malformed"))
+            };
+            let category = string("category")?
+                .parse()
+                .map_err(|_| fail("cleanup candidate category is malformed"))?;
+            let table = ForgeTaskTableIdentity::new(
+                string("catalog")?,
+                string("namespace")?,
+                string("table")?,
+            )
+            .map_err(|_| fail("cleanup candidate table identity is malformed"))?;
+            let path = ForgeCleanupPath::new(string("path")?)
+                .map_err(|_| fail("cleanup candidate path is malformed"))?;
+            let candidate = ForgeCleanupCandidate {
+                category,
+                table,
+                path,
+            };
+            candidate
+                .validate()
+                .map_err(|_| fail("cleanup candidate is not table-bound"))?;
+            Ok(candidate)
+        })
+        .collect()
+}
+
 /// Encodes validated attempt evidence into its stable JSON object.
 pub(crate) fn evidence_to_value(evidence: &ForgeTaskEvidence) -> serde_json::Value {
-    let candidates=evidence.cleanup_candidates.iter().map(|candidate|serde_json::json!({"category":candidate.category.as_str(),"catalog":candidate.table.catalog,"namespace":candidate.table.namespace,"table":candidate.table.table,"path":candidate.path.as_str()})).collect::<Vec<_>>();
-    serde_json::json!({"version":evidence.version,"committed_snapshot_id":evidence.committed_snapshot_id,"committed_metadata_location":evidence.committed_metadata_location,"committed_metadata_digest":evidence.committed_metadata_digest,"cleanup_candidates":candidates,"deleted_candidate_count":evidence.deleted_candidate_count})
+    serde_json::json!({"version":evidence.version,"committed_snapshot_id":evidence.committed_snapshot_id,"committed_metadata_location":evidence.committed_metadata_location,"committed_metadata_digest":evidence.committed_metadata_digest,"cleanup_candidates":candidates_to_value(&evidence.cleanup_candidates),"deleted_candidate_count":evidence.deleted_candidate_count,"prepared_candidate_index":evidence.prepared_candidate_index})
+}
+
+/// Decodes one persisted evidence column for callers outside this module.
+///
+/// # Errors
+///
+/// Returns [`SqlError::InvariantViolation`] for malformed stored JSON.
+pub(crate) fn evidence_from_json(value: serde_json::Value) -> Result<ForgeTaskEvidence, SqlError> {
+    evidence_from_value(value)
 }
 
 /// Decodes persisted attempt evidence and rejects malformed column shapes.
@@ -685,54 +991,14 @@ fn evidence_from_value(value: serde_json::Value) -> Result<ForgeTaskEvidence, Sq
             })
             .transpose()
     };
-    let cleanup_candidates = object
-        .get("cleanup_candidates")
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| SqlError::InvariantViolation {
-            detail: "cleanup candidates are malformed".to_owned(),
-        })?
-        .iter()
-        .map(|value| {
-            let candidate = value
-                .as_object()
-                .ok_or_else(|| SqlError::InvariantViolation {
-                    detail: "cleanup candidate is not an object".to_owned(),
-                })?;
-            let string = |key: &str| {
-                candidate
-                    .get(key)
-                    .and_then(serde_json::Value::as_str)
-                    .ok_or_else(|| SqlError::InvariantViolation {
-                        detail: format!("cleanup candidate {key} is malformed"),
-                    })
-            };
-            let category = string("category")?.parse()?;
-            let table = ForgeTaskTableIdentity::new(
-                string("catalog")?,
-                string("namespace")?,
-                string("table")?,
-            )
-            .map_err(|_| SqlError::InvariantViolation {
-                detail: "cleanup candidate table identity is malformed".to_owned(),
-            })?;
-            let path = ForgeCleanupPath::new(string("path")?).map_err(|_| {
-                SqlError::InvariantViolation {
-                    detail: "cleanup candidate path is malformed".to_owned(),
-                }
-            })?;
-            let candidate = ForgeCleanupCandidate {
-                category,
-                table,
-                path,
-            };
-            candidate
-                .validate()
-                .map_err(|_| SqlError::InvariantViolation {
-                    detail: "cleanup candidate is not table-bound".to_owned(),
-                })?;
-            Ok::<ForgeCleanupCandidate, SqlError>(candidate)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let cleanup_candidates = candidates_from_value(
+        object
+            .get("cleanup_candidates")
+            .ok_or_else(|| SqlError::InvariantViolation {
+                detail: "cleanup candidates are malformed".to_owned(),
+            })?,
+        true,
+    )?;
     let deleted_candidate_count = object
         .get("deleted_candidate_count")
         .and_then(serde_json::Value::as_u64)
@@ -740,6 +1006,18 @@ fn evidence_from_value(value: serde_json::Value) -> Result<ForgeTaskEvidence, Sq
         .ok_or_else(|| SqlError::InvariantViolation {
             detail: "deletion cursor is malformed".to_owned(),
         })?;
+    let prepared_candidate_index = object
+        .get("prepared_candidate_index")
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|value| u32::try_from(value).ok())
+                .ok_or_else(|| SqlError::InvariantViolation {
+                    detail: "prepared candidate index is malformed".to_owned(),
+                })
+        })
+        .transpose()?;
     Ok(ForgeTaskEvidence {
         version,
         committed_snapshot_id,
@@ -747,6 +1025,7 @@ fn evidence_from_value(value: serde_json::Value) -> Result<ForgeTaskEvidence, Sq
         committed_metadata_digest: string_option("committed_metadata_digest")?,
         cleanup_candidates,
         deleted_candidate_count,
+        prepared_candidate_index,
     })
 }
 
@@ -1206,6 +1485,65 @@ pub enum ForgeTaskTransitionOutcome {
     Applied,
     /// Identical state was already durable.
     AlreadyApplied,
+}
+
+/// Which physical outcome one prepared cleanup candidate reached.
+///
+/// Only [`Self::Deleted`] and [`Self::Missing`] are proofs: both mean the
+/// object cannot be read again, so the cursor may pass the candidate. The other
+/// two are observations that must be durable — a refusal proves nothing was
+/// submitted, an uncertainty proves nothing about what the object store did —
+/// so both retain the prepared candidate for same-identity replay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpiredCleanupOutcome {
+    /// The object store accepted the deletion.
+    Deleted,
+    /// The object was proven absent after the complete fresh safety proof.
+    Missing,
+    /// A safety proof, validation, fence, or cancellation failed before the
+    /// delete was submitted, so no external effect was attempted.
+    Refused,
+    /// A delete was submitted and its result cannot prove acceptance or
+    /// rejection, including cancellation after submission.
+    Uncertain,
+}
+
+impl ExpiredCleanupOutcome {
+    /// Returns the exact audit operation this outcome appends.
+    #[must_use]
+    pub const fn audit_operation(self) -> &'static str {
+        match self {
+            Self::Deleted => "forge.expired_cleanup.candidate_deleted",
+            Self::Missing => "forge.expired_cleanup.candidate_missing",
+            Self::Refused => "forge.expired_cleanup.candidate_refused",
+            Self::Uncertain => "forge.expired_cleanup.candidate_uncertain",
+        }
+    }
+
+    /// Reports whether this outcome authorizes the cursor to pass the candidate.
+    #[must_use]
+    pub const fn advances(self) -> bool {
+        matches!(self, Self::Deleted | Self::Missing)
+    }
+}
+
+/// The exact identity one per-candidate cleanup transition is applied under.
+///
+/// Every field is revalidated inside the workflow's own short operator
+/// transaction: a stale owner, a lost table fence, a different attempt, or a
+/// cursor that has already moved all refuse rather than mutate.
+#[derive(Debug, Clone, Copy)]
+pub struct ExpiredCleanupCandidateRequest<'request> {
+    /// Fenced task, attempt, current owner, and live table lease.
+    pub authority: &'request ForgeExpirationAuthority,
+    /// Registered table whose maintenance-authority row is taken FOR UPDATE.
+    pub table: &'request ForgeClaimTable,
+    /// Cursor index this transition names; must equal the durable cursor.
+    pub index: u32,
+    /// The exact candidate at `index`, compared against the immutable plan.
+    pub candidate: &'request ForgeCleanupCandidate,
+    /// Audit event appended in the same commit as the state change.
+    pub event: &'request AuditEvent,
 }
 
 /// Bounded task status page.

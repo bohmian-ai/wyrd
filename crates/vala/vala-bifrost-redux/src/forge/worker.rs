@@ -4223,6 +4223,7 @@ impl ForgeWorker {
                     now: self.forge.core.clock.now()?,
                     age_cutoff_ms: Some(payload.age_cutoff_ms),
                     start_after: start_after.as_deref(),
+                    task_id: Some(claim.task_id),
                 },
                 stop,
             )

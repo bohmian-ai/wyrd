@@ -324,6 +324,11 @@ struct GcTableContext<'context> {
     /// leading run of protected objects cannot starve the pages behind it.
     /// `None` starts the prefix from its beginning.
     start_after: Option<&'context str>,
+    /// Durable task that owns this run, when a task drives it. The batch
+    /// identity is seeded from this UUID so two periodic tasks selecting the
+    /// same paths stay distinct while one task's retry and takeover do not.
+    /// `None` keeps the table-seeded identity used by direct maintenance.
+    task_id: Option<Uuid>,
 }
 
 /// Inputs that distinguish a fresh protection load from a GC self-reload.
@@ -533,6 +538,9 @@ pub(super) struct OrphanGcScan<'scan> {
     pub(super) age_cutoff_ms: Option<i64>,
     /// Exclusive resume key taken from the task's durable cursor.
     pub(super) start_after: Option<&'scan str>,
+    /// Durable task owning this run, when a task drives it. Seeds the prepared
+    /// batch identity so retry and takeover of one task reuse it.
+    pub(super) task_id: Option<Uuid>,
 }
 
 impl Forge {
@@ -563,6 +571,7 @@ impl Forge {
             stop,
             age_cutoff_ms: scan.age_cutoff_ms,
             start_after: scan.start_after,
+            task_id: scan.task_id,
         };
         self.run_orphan_gc_for_table_inner(lease, &table).await
     }
@@ -605,6 +614,7 @@ impl Forge {
             stop,
             age_cutoff_ms: None,
             start_after: None,
+            task_id: None,
         };
         self.load_maintenance_protection(ProtectionRequest {
             table: &table,
@@ -637,6 +647,7 @@ impl Forge {
             stop: &stop,
             age_cutoff_ms: None,
             start_after: None,
+            task_id: None,
         };
         self.load_maintenance_protection(ProtectionRequest {
             table: &table,
@@ -671,6 +682,7 @@ impl Forge {
             stop: &stop,
             age_cutoff_ms: None,
             start_after: None,
+            task_id: None,
         };
         let protection = self
             .load_maintenance_protection(ProtectionRequest {
@@ -808,6 +820,7 @@ impl Forge {
                     now: self.core.clock.now()?,
                     age_cutoff_ms: None,
                     start_after: None,
+                    task_id: None,
                 },
                 &CancellationToken::new(),
             )
@@ -878,7 +891,7 @@ impl Forge {
         if scan.candidates.is_empty() {
             return Ok(outcome);
         }
-        let detail = Self::gc_detail(table.key, scan.candidates)?;
+        let detail = Self::gc_detail(table.task_id, table.key, scan.candidates)?;
         self.append_gc_audit(lease, table.key.tenant, &detail, "forge.orphan_gc.prepared")
             .await?;
         // Past the prepared audit the operation row owns this batch. A caller
@@ -1600,7 +1613,17 @@ impl Forge {
         Ok(outcome)
     }
 
+    /// Builds the canonical prepared audit detail for one orphan batch.
+    ///
+    /// `task_id` seeds the batch identity when a durable task owns the run;
+    /// `None` keeps the table-seeded identity used by direct maintenance.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::LiveSet`] when a candidate is not a valid
+    /// storage path.
     fn gc_detail(
+        task_id: Option<Uuid>,
         key: &ForgeTableKey,
         mut candidates: Vec<String>,
     ) -> Result<AuditDetail, ForgeError> {
@@ -1613,7 +1636,7 @@ impl Forge {
                 detail: error.to_string(),
             })?;
         Ok(AuditDetail::ForgeOrphanGc {
-            operation_id: Self::gc_operation_id(key, &candidates),
+            operation_id: Self::gc_operation_id(task_id, key, &candidates),
             phase: ForgeOrphanGcPhase::Prepared,
             group: table_resource_for_key(key),
             candidate_paths,
@@ -1804,10 +1827,18 @@ impl Forge {
         Ok(paths.into_iter().collect())
     }
 
-    fn gc_operation_id(key: &ForgeTableKey, candidates: &[String]) -> Uuid {
+    /// Derives the stable batch identity for one sorted candidate set.
+    ///
+    /// The digest is seeded with the owning task's UUID when a task drives the
+    /// run and with the table resource otherwise, then absorbs every candidate
+    /// path with the existing zero delimiter.
+    fn gc_operation_id(task_id: Option<Uuid>, key: &ForgeTableKey, candidates: &[String]) -> Uuid {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
-        hasher.update(table_resource_for_key(key));
+        match task_id {
+            Some(task_id) => hasher.update(task_id.as_bytes()),
+            None => hasher.update(table_resource_for_key(key)),
+        }
         for candidate in candidates {
             hasher.update(candidate.as_bytes());
             hasher.update([0]);
@@ -1823,6 +1854,58 @@ impl Forge {
 mod tests {
     use super::*;
     use crate::forge::protection_roots::OrphanProtectionRoots;
+
+    /// A task-driven batch keeps one identity across retry and takeover, stays
+    /// distinct from another task selecting the same paths, and leaves the
+    /// non-task maintenance identity table-seeded.
+    #[test]
+    fn task_scoped_gc_operation_identity_is_stable_across_takeover() {
+        let key = ForgeTableKey {
+            tenant: DataTenantId::new_v7(),
+            table_ref: crate::catalog::TableRef::new(
+                crate::namespaces::BifrostNamespace::Traces,
+                "spans",
+            ),
+        };
+        let first_task = Uuid::from_u128(0x1111_1111_1111_1111_1111_1111_1111_1111);
+        let second_task = Uuid::from_u128(0x2222_2222_2222_2222_2222_2222_2222_2222);
+        let forward = vec![
+            "tenants/t/traces/spans/data/a.parquet".to_owned(),
+            "tenants/t/traces/spans/data/b.parquet".to_owned(),
+        ];
+        let reversed = vec![
+            "tenants/t/traces/spans/data/b.parquet".to_owned(),
+            "tenants/t/traces/spans/data/a.parquet".to_owned(),
+        ];
+        let identity = |task_id: Option<Uuid>, candidates: Vec<String>| match Forge::gc_detail(
+            task_id, &key, candidates,
+        )
+        .expect("candidate paths are valid storage paths")
+        {
+            AuditDetail::ForgeOrphanGc { operation_id, .. } => operation_id,
+            other => panic!("orphan GC detail expected, got {other:?}"),
+        };
+
+        let claimed = identity(Some(first_task), forward.clone());
+        assert_eq!(
+            claimed,
+            identity(Some(first_task), reversed.clone()),
+            "retry and takeover of one task must reuse its batch identity"
+        );
+        assert_ne!(
+            claimed,
+            identity(Some(second_task), forward.clone()),
+            "another periodic task selecting the same paths must be distinct"
+        );
+        let table_seeded = identity(None, forward.clone());
+        assert_eq!(table_seeded, identity(None, reversed));
+        assert_ne!(table_seeded, claimed);
+        assert_eq!(
+            table_seeded,
+            Forge::gc_operation_id(None, &key, &forward),
+            "the non-task maintenance identity stays table-seeded"
+        );
+    }
 
     #[test]
     fn maintenance_protection_traverses_retained_history() {

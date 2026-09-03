@@ -732,6 +732,7 @@ impl ForgeMaintenance {
                     now,
                     age_cutoff_ms: None,
                     start_after: None,
+                    task_id: None,
                 },
                 stop,
             )

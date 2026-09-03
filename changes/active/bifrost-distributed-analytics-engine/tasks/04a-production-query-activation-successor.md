@@ -679,4 +679,121 @@ now produces the same terminal it produces on `5d3cc09f7`.
 fixed here rather than allowed, by extracting `next_frame_event` and
 `encode_frame`; the lane is now green workspace-wide.
 
-Scenarios 3-6 remain open.
+## Scenario 3 - cleanup-join ownership (commit `9b48bf459`)
+
+RED: `analytical_activation::transport_drop_retains_running_status_until_cleanup_joins`
+failed to compile, then failed on the missing pause: a selected Analytical
+query released its graph before the journey could observe the held state.
+
+GREEN: `AnalyticalCleanupPause` (a `test-support` one-shot on the leader
+lifecycle's `release_graph`) holds the release after
+`graph_children_idle` and before the supervisor entry drops, so the journey
+observes RUNNING status and retained graph ownership over both HTTP and gRPC,
+then a clean retirement on release. Interactive attempts - direct, planner
+refusal, and no-exchange - register no graph at all.
+
+Deviation: the pause is reached through the in-process `WyrdTestCluster`,
+which shares the process static, rather than through a new
+`BifrostProcessCluster` control message. A control-protocol extension buys no
+additional proof here; the pause is a leader-local lifecycle point.
+
+REFACTOR (commit `7517096dc`): the retirement wait polls
+`Oracle::running_queries()` in process instead of the public status route. The
+transport drop the scenario requires can leave the SDK client's connection pool
+holding an entry no later request can use, which failed the probe under
+concurrent journey load. The public status surface is still asserted while the
+graph is held, which is the contract the scenario owns.
+
+## Scenario 4 - both public paths across real pods (commit `98e45325e`)
+
+RED: `analytical_activation::public_query_selects_both_paths_and_preserves_interactive_floor`
+failed with no Analytical selection recorded: the public HTTP surface had no
+journey driving a distributed candidate across separate processes.
+
+GREEN: four `bifrost_peer_test_node` child processes (one coordinator, two
+followers, one Scribe) serve one public API key over `vala-sdk` HTTP with no
+path field in the request. Interactive and Analytical settle with exact
+terminal, row-count, and deadline agreement; `collect_bounded` refuses with
+`ValaSdkError::ResultTooLarge`; follower `peer_body_polls` advance;
+`oracle_query_analytical_selection_total` advances; every Oracle returns to its
+recorded idle baseline.
+
+Deviation: the Interactive floor is proved as *Interactive served concurrently
+while an Analytical graph on the same pod holds its admitted envelope*.
+Deterministic Analytical slot exhaustion is unreachable through the existing
+control protocol - `analytical_slots` is 4 and only two follower execute-pauses
+exist - and adding a capacity knob to that protocol is outside this task.
+
+## Scenario 5 - selection is irreversible (commit `f968c3178`)
+
+RED: `analytical_activation::fallback_is_preselection_only_and_failure_is_terminal`
+failed on the stale-replacement edge: `StaleReplacementGate` admitted a
+replacement for an attempt that had already selected Analytical.
+
+GREEN: the gate now carries the path the attempt irreversibly selected and
+settles a typed stale first batch only for attempt zero, no escaped output, and
+Interactive. No edge remains from selected Analytical back to `execute_session`,
+`stream_physical`, or `plan_distributed_split`. The journey covers both
+pre-selection fallbacks, a 403 under-privileged refusal that leaves zero
+ownership, and a killed follower producing exactly one terminal failure with
+the survivor reporting `activated == 1` and its lease released.
+
+Deviation: the typed stale first-batch replacement itself is proved by the
+crate-local unit test
+`oracle::tests::stale_replacement_gate_settles_once_and_rejects_second_or_post_output_attempts`.
+No deterministic stale-Iceberg-object injection exists at the journey boundary.
+
+## Scenario 6 - generated and scheduled surfaces agree (commit `90d4b3891`)
+
+RED: `server::query::generated_grpc_and_scheduled_queries_share_audit_terminal_and_cleanup`
+failed on the absent `ScheduledQueryCaller` and on a gRPC refusal that carried
+no canonical problem envelope.
+
+GREEN: `ScheduledQueryCaller` runs the identical statement through
+`AppState::query_sql`, yielding the same rows and the same selected path and
+relaying its own `bifrost.query.read_decision` audit row. `grpc::query::query_status`
+now delegates to `wyrd_tonic::error::wyrd_error_to_status`, so public gRPC
+emits the canonical `wyrd-error-bin` envelope and keeps the `retry-after-ms`
+hint only for the 429/503 classes this surface already retried. Peer services
+are absent from the public listener, `/readyz` is 200, and no Analytical
+ownership remains.
+
+Command correction: gRPC calls authenticate with the exchanged bearer
+(`client.auth().bearer()`), not the raw API key; an unauthenticated request is
+refused by the auth interceptor before `query_status` and therefore carries no
+envelope. The envelope is asserted on an authenticated query over an
+unregistered table.
+
+## Verification (scenarios 3-6)
+
+- `mise run test:bifrost:journey:oracle` - `21 tests run: 21 passed` (stable
+  across four consecutive lane runs after the scenario 3 refactor)
+- `mise run test:bifrost:journey:server` - `2 tests run: 2 passed`
+- `mise run test:bifrost` - `975 tests run: 975 passed, 0 skipped`
+- `mise exec -- cargo nextest run --locked -p vala-sdk --lib` - `35 passed`
+- `mise run fmt`, `mise run lints`, `mise run codegen:check`,
+  `mise run check:client-tier`, `mise run check:pyo3-scope`,
+  `git diff --check` - all clean
+
+### Baseline failures outside this task's write set
+
+Neither is caused by, nor reachable from, the files this task changed; both are
+recorded rather than suppressed.
+
+- `mise run check:unwrap-audit` fails on 72 hits in `otlp_json.rs`,
+  `otlp_trace_json.rs`, `otlp_logs_json.rs`, `otlp_metrics_json.rs`,
+  `process_cluster.rs`, and `forge_harness.rs` - all inherent methods named
+  `expect` that the audit's textual match cannot distinguish from
+  `Option::expect`. Zero overlap with this task's diff.
+- `wyrd-server state::tests::production_validate_rejects_stub_on_production`
+  fails under the Postgres wrapper: `production_validate` returns `Ok` because
+  `test_app_state` composes a Bifrost whose `serves_api()` is false, so the
+  stub-policy branch is unreachable. The other eight `state::tests` pass. This
+  task touches neither `state.rs` nor `test_support.rs`. Note that the whole
+  `wyrd-server --lib` target requires the wrapper: bare `cargo nextest` panics
+  with `test DB env unset (WYRD_DATABASE_URL + WYRD_DATABASE_MIGRATOR_PASSWORD)`.
+- `oracle::distributed::pg_bifrost_selective_predicate_and_projection_prune_distributed_reads`
+  fails intermittently in the journey lane on its byte-accounting assertion
+  (`narrow=22370 broad=4856`), independent of this task's changes. It is the
+  same journey already recorded above as broken by a rejected scenario 1 repair.
+

@@ -297,6 +297,14 @@ impl From<domain::QueryStreamFrame> for proto::QueryStreamFrame {
                         .collect(),
                     error: value.error.map(proto_terminal_error),
                     arrow_ipc_eos: value.arrow_ipc_eos,
+                    execution_path: match value.execution_path {
+                        domain::QueryExecutionPath::Interactive => {
+                            proto::QueryExecutionPath::Interactive as i32
+                        }
+                        domain::QueryExecutionPath::Analytical => {
+                            proto::QueryExecutionPath::Analytical as i32
+                        }
+                    },
                 })
             }
         };
@@ -501,6 +509,15 @@ fn terminal(
             .collect::<Result<_, _>>()?,
         error: value.error.map(terminal_error).transpose()?,
         arrow_ipc_eos: value.arrow_ipc_eos,
+        execution_path: match proto::QueryExecutionPath::try_from(value.execution_path)
+            .map_err(|_| QueryConversionError::RequiredEnum("execution_path"))?
+        {
+            proto::QueryExecutionPath::Interactive => domain::QueryExecutionPath::Interactive,
+            proto::QueryExecutionPath::Analytical => domain::QueryExecutionPath::Analytical,
+            proto::QueryExecutionPath::Unspecified => {
+                return Err(QueryConversionError::RequiredEnum("execution_path"))
+            }
+        },
     };
     terminal.validate(visibility)?;
     terminal.validate_emitted_rows(emitted_rows)?;
@@ -757,6 +774,7 @@ mod tests {
         let frame = proto::QueryStreamFrame {
             frame: Some(proto::query_stream_frame::Frame::Terminal(
                 proto::QueryTerminalFrame {
+                    execution_path: proto::QueryExecutionPath::Interactive as i32,
                     outcome: 0,
                     freshness: proto::QueryFreshness::Complete as i32,
                     row_count: 0,
@@ -819,6 +837,7 @@ mod tests {
         ];
         for terminal in [
             proto::QueryTerminalFrame {
+                execution_path: proto::QueryExecutionPath::Interactive as i32,
                 outcome: proto::QueryTerminalOutcome::Failed as i32,
                 freshness: proto::QueryFreshness::Complete as i32,
                 row_count: 0,
@@ -828,6 +847,7 @@ mod tests {
                 arrow_ipc_eos: Vec::new(),
             },
             proto::QueryTerminalFrame {
+                execution_path: proto::QueryExecutionPath::Interactive as i32,
                 outcome: proto::QueryTerminalOutcome::Success as i32,
                 freshness: proto::QueryFreshness::Degraded as i32,
                 row_count: 0,
@@ -837,6 +857,7 @@ mod tests {
                 arrow_ipc_eos: Vec::new(),
             },
             proto::QueryTerminalFrame {
+                execution_path: proto::QueryExecutionPath::Interactive as i32,
                 outcome: proto::QueryTerminalOutcome::Success as i32,
                 freshness: proto::QueryFreshness::Complete as i32,
                 row_count: 0,
@@ -922,6 +943,7 @@ mod tests {
         proto::QueryStreamFrame {
             frame: Some(proto::query_stream_frame::Frame::Terminal(
                 proto::QueryTerminalFrame {
+                    execution_path: proto::QueryExecutionPath::Interactive as i32,
                     outcome: proto::QueryTerminalOutcome::Success as i32,
                     freshness: proto::QueryFreshness::Complete as i32,
                     row_count,

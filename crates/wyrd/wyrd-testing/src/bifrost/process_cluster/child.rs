@@ -1629,6 +1629,7 @@ mod tests {
         let failed = QueryTerminalFrame {
             outcome: QueryTerminalOutcome::Failed,
             freshness: QueryFreshness::Complete,
+            execution_path: wyrd_spec::vala::api::QueryExecutionPath::Interactive,
             row_count: u64::try_from(emitted).expect("a fixture row count fits a u64"),
             warnings: Vec::new(),
             source_completion: vec![

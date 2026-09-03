@@ -1201,6 +1201,7 @@ mod tests {
         QueryTerminalFrame {
             outcome: QueryTerminalOutcome::Success,
             freshness: QueryFreshness::Complete,
+            execution_path: wyrd_spec::vala::api::QueryExecutionPath::Interactive,
             row_count: rows,
             warnings: Vec::new(),
             source_completion: sources(visibility),
@@ -1214,6 +1215,7 @@ mod tests {
         QueryTerminalFrame {
             outcome: QueryTerminalOutcome::Degraded,
             freshness: QueryFreshness::Degraded,
+            execution_path: wyrd_spec::vala::api::QueryExecutionPath::Interactive,
             row_count: rows,
             warnings: vec![QueryWarning::LiveTailUnavailable],
             source_completion: vec![
@@ -1240,6 +1242,7 @@ mod tests {
         QueryTerminalFrame {
             outcome: QueryTerminalOutcome::Failed,
             freshness: QueryFreshness::Complete,
+            execution_path: wyrd_spec::vala::api::QueryExecutionPath::Interactive,
             row_count: rows,
             warnings: Vec::new(),
             source_completion: sources(VisibilityMode::PublishedOnly),

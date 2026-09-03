@@ -41,10 +41,10 @@ use wyrd_spec::vala::api::{
     AuditDetail, AuthMethod, BifrostQueryRequest, BifrostSecurityPhase,
     BifrostSecurityViolationKind, ClusterCapabilities, FollowerScanAssignment, NodeId,
     PersistedFileAssignment, PersistedFileDescriptor, QueryAuditDigest, QueryBatchFrame,
-    QueryClass, QueryExecutionMode, QueryFreshness, QueryId, QuerySchemaFrame, QuerySource,
-    QueryStreamFrame, QueryTerminalErrorCode, QueryTerminalFrame, QueryTerminalOutcome,
-    ScribeProviderCut, SourceCompletion, SourceCompletionOutcome, TenantTableBinding,
-    VisibilityMode,
+    QueryClass, QueryExecutionMode, QueryExecutionPath, QueryFreshness, QueryId, QuerySchemaFrame,
+    QuerySource, QueryStreamFrame, QueryTerminalErrorCode, QueryTerminalFrame,
+    QueryTerminalOutcome, ScribeProviderCut, SourceCompletion, SourceCompletionOutcome,
+    TenantTableBinding, VisibilityMode,
 };
 use wyrd_spec::vala::managed_columns::DATA_TENANT_ID;
 
@@ -3005,6 +3005,7 @@ impl Oracle {
                 degraded_sources,
                 admitted,
                 running_query,
+                execution_path: QueryExecutionPath::Interactive,
             },
             AttemptSettlement {
                 deadline,
@@ -3472,6 +3473,8 @@ impl Oracle {
         }
         let (ipc, schema_frame) = QueryIpcEncoder::new(&schema)?;
         Ok(OracleQueryStream::new(QueryStreamInput {
+            // The typed plan path has no Analytical candidate to select.
+            execution_path: QueryExecutionPath::Interactive,
             schema_frame,
             ipc,
             batches,
@@ -4643,16 +4646,30 @@ fn register_session_table(
 pub type OracleFrameStream = dyn Stream<Item = Result<QueryStreamFrame, BifrostError>> + Send;
 
 /// Returns a terminal failed frame for a late execution error.
+///
+/// This entry is for failures that never reached Analytical selection, so the
+/// terminal names [`QueryExecutionPath::Interactive`]: REQ-002 makes selection
+/// irreversible, and a caller must never read a path the server did not run.
 #[must_use]
 pub fn failed_terminal(code: QueryTerminalErrorCode, row_count: u64) -> QueryTerminalFrame {
-    failed_terminal_for_visibility(code, row_count, VisibilityMode::PublishedOnly)
+    failed_terminal_for_visibility(
+        code,
+        row_count,
+        VisibilityMode::PublishedOnly,
+        QueryExecutionPath::Interactive,
+    )
 }
 
 /// Returns a contract-valid failed terminal for the query's visibility cut.
+///
+/// `execution_path` is the path the stream had already selected, so a failure
+/// after Analytical selection reports `Analytical` rather than silently
+/// presenting itself as an Interactive failure.
 fn failed_terminal_for_visibility(
     code: QueryTerminalErrorCode,
     row_count: u64,
     visibility: VisibilityMode,
+    execution_path: QueryExecutionPath,
 ) -> QueryTerminalFrame {
     let mut source_completion = vec![
         SourceCompletion {
@@ -4673,6 +4690,7 @@ fn failed_terminal_for_visibility(
     QueryTerminalFrame {
         outcome: QueryTerminalOutcome::Failed,
         freshness: wyrd_spec::vala::api::QueryFreshness::Complete,
+        execution_path,
         row_count,
         warnings: Vec::new(),
         source_completion,
@@ -4987,6 +5005,8 @@ struct AttemptOutput {
     admitted: AdmittedQueryGuard,
     /// Running-query terminal owner transferred into the returned stream.
     running_query: RunningQueryTerminalOwner,
+    /// Execution path this attempt irreversibly selected before it opened.
+    execution_path: QueryExecutionPath,
 }
 
 /// Request-scoped facts settlement needs that do not come from execution.
@@ -5032,6 +5052,7 @@ async fn settle_attempt_output(
         degraded_sources,
         admitted,
         running_query,
+        execution_path,
     } = output;
     let AttemptSettlement {
         deadline,
@@ -5098,6 +5119,7 @@ async fn settle_attempt_output(
         }
     };
     Ok(Some(OracleQueryStream::new(QueryStreamInput {
+        execution_path,
         schema_frame,
         ipc,
         batches,

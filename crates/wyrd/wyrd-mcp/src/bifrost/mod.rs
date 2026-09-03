@@ -969,6 +969,7 @@ mod bifrost_tools {
         let terminal = QueryTerminalFrame {
             outcome: QueryTerminalOutcome::Failed,
             freshness: QueryFreshness::Complete,
+            execution_path: wyrd_spec::vala::api::QueryExecutionPath::Interactive,
             row_count: 2,
             warnings: Vec::new(),
             source_completion: vec![
@@ -1006,6 +1007,7 @@ mod bifrost_tools {
         let terminal = QueryTerminalFrame {
             outcome: QueryTerminalOutcome::Degraded,
             freshness: QueryFreshness::Degraded,
+            execution_path: wyrd_spec::vala::api::QueryExecutionPath::Interactive,
             row_count: 2,
             warnings: vec![QueryWarning::LiveTailUnavailable],
             source_completion: vec![

@@ -724,6 +724,7 @@ mod tests {
             let terminal = |arrow_ipc_eos: Vec<u8>| QueryTerminalFrame {
                 outcome: QueryTerminalOutcome::Success,
                 freshness: QueryFreshness::Complete,
+                execution_path: wyrd_spec::vala::api::QueryExecutionPath::Interactive,
                 row_count: 5,
                 warnings: Vec::new(),
                 source_completion: vec![

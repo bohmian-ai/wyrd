@@ -53,10 +53,14 @@ qualified Analytical handle is integrated.
   this implementation through a thin boundary; none reimplements its logic.
 - `wyrd-server` owns audit-WAL-before-rows, public/private listener composition,
   lifecycle cancellation, readiness, shutdown, and internal scheduled calls.
-- `wyrd-testing` owns Rust/HTTP/gRPC and multi-process journeys.
-- The existing test-tier `WyrdTestServer` owner gains one internal
-  multi-node-Oracle composition option consumed unchanged by the Rust and MCP
-  journeys; no language-specific cluster handle is exported.
+- `wyrd-testing` owns Rust/HTTP/gRPC and multi-process journeys. Evidence mapped
+  to REQ-003 or AC-002 uses the existing `BifrostProcessCluster` with three
+  `ProcessNodeTarget::Oracle` children and one `ProcessNodeTarget::Scribe`
+  child, drives `ProcessNode::http_addr` or `grpc_addr`, and authenticates with
+  `BifrostProcessCluster::provision_public_api_key`. `WyrdTestCluster` remains
+  available for in-process supporting checks but cannot prove a process or
+  socket boundary. Do not add a cluster abstraction or modify `WyrdTestServer`
+  ownership.
 
 MCP belongs to Task 5 as a thin projection over this Rust client, not an
 independent client implementation. Python and TypeScript are outside revision
@@ -95,34 +99,87 @@ or persisted query-path row.
 ### Scenario 2 — Conservative request-local selection
 
 **Behavior.** Interactive is default. Existing classification nominates an
-Analytical candidate; Task 2's supported physical-plan result plus a real
-exchange, Task 3's physical qualification, and successful Analytical admission
-irreversibly select it. Unsupported shape, safe planning failure, or no exchange
-falls back before selection only. Maps REQ-002, REQ-003, INV-001, INV-008,
-AC-002, AC-003, AC-008.
+Analytical candidate and the participant-cut leader derives one exact
+provisional graph identity from the already-pinned request facts. The candidate
+is admitted and leases that graph once; Task 2's supported physical-plan result
+plus a real exchange then irreversibly selects Analytical. Unsupported shape,
+safe planning failure, or no exchange falls back before selection while the
+provisional graph remains owned and settles normally. Unsupported and
+no-exchange outcomes execute their already-built leader plan as Interactive;
+distributed-planning failure uses the existing Interactive planning/execution
+path. Maps REQ-002, REQ-003, INV-001, INV-002, INV-008, AC-002, AC-003, AC-008.
 
 **RED.** Add
 `oracle::tests::analytical_selection_requires_supported_physical_exchange`.
-Mutate candidate, planner result, supported predicate, exchange presence, and
-admission result; assert fallback only before admission/selection and no second
-optimizer/facts owner. Exact:
+Drive both `Oracle::query_sql` and the forwarded
+`Oracle::query_sql_with_participant_cut` leader path. Assert each Analytical
+candidate leases exactly one graph whose public ID equals the participant-cut
+attempt UUID, whose `DataFusionQueryId` is allocated once and differs from that
+public ID, and whose snapshot and permission digests equal the existing audit
+helpers' results over the exact `PlannedSqlCut` and authorized context. Mutate
+the supported predicate, exchange presence, and admission result. A supported
+exchange must publish participants and select Analytical; an unsupported or
+no-exchange plan must issue no reservation, execute the same already-built
+leader physical plan as Interactive, and settle the provisional graph. Inject a
+`plan_distributed_split` failure before participant publication and assert the
+same session, admission, pinned cut, and provisional graph continue through
+`Oracle::execute_session` without a reservation, returning Interactive on
+success and its stable error if Interactive planning also fails. Assert no
+re-admission, cut re-pin, or graph re-lease on any fallback; assert one physical-
+plan build and no optimizer rerun only for unsupported and no-exchange outcomes.
+It fails while both production entries pass no Analytical context and no
+production transition leases and then settles a provisional graph. Exact:
 
 ```bash
 mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib --features test-support,bench-support -E 'test(=oracle::tests::analytical_selection_requires_supported_physical_exchange)'
 ```
 
 **GREEN.** Keep the request-local selected path initialized to `Interactive`.
-Use `PlannedSqlCut`'s existing classification inputs and Task 2's pure validator
-to prepare a candidate. Replace the selected value with `Analytical` exactly
-once, only after the physical plan is supported, contains a real exchange, and
-Analytical admission succeeds. Planning/support/no-exchange errors may continue
-on Interactive only before that assignment and only when Interactive can
-execute safely. Admission refusal and every later error are Analytical
-failures.
+Both production entries already converge on `Oracle::run_sql_attempt`; derive
+the candidate's `AnalyticalAttemptContext` there, after
+`plan_or_reuse_attempt` returns the exact `PlannedSqlCut` and before
+`admit_and_lease_attempt`. Set `public_query_id` with
+`PublicQueryId::from_uuid(participant_cut.attempt_id().as_uuid())`, allocate one
+`DataFusionQueryId::allocate()`, set `snapshot_digest` from
+`aggregate_audit_digest(planned.cuts.iter().map(|cut|
+cut.snapshot_digest.as_str()))`, and set `permission_digest` from the existing
+`audit_digest(&context.permission)`; copy only each digest's string value into
+the context. The participant cut remains the deadline and participant/fence
+authority passed to `AnalyticalExecutionHandle::lease_session`. Keep the
+explicit context accepted by `query_sql_inactive_analytical` solely as the
+test-support override; production `None` now means derive this context, not use
+an Interactive session. Update the stale comments on `SqlAttemptInput` and
+`DataFusionQueryId` to describe provisional candidate allocation.
+
+Admit once and lease the existing Analytical session/graph once before physical
+planning. Change the existing Analytical execution result to return its selected
+`QueryExecutionPath` with the schema, stream, and statistics. Extend the
+existing physical-planning seam to return its one already-built leader
+`Arc<dyn ExecutionPlan>` together with Task 2's supported-plan verdict and
+exchange presence before any stream is opened. A supported plan with a real
+exchange publishes participants, opens the distributed stream, and returns
+`Analytical`. A rejected supported-plan verdict or absent exchange publishes no
+participants; when that returned leader plan is locally executable, open that
+same `Arc` through the existing `stream_physical` path and return `Interactive`
+while retaining the provisional `AnalyticalAttemptOwnership` in
+`AdmittedQueryGuard` for normal settlement. If `plan_distributed_split` fails
+before participant publication and therefore returns no reusable plan, call
+`Oracle::execute_session` with the original session, SQL, and logical selected
+bytes. Keep the same admission guard, `PlannedSqlCut`, participant cut, and
+provisional `AnalyticalAttemptOwnership`; a successful Interactive execution
+returns `Interactive`, while failure of that existing Interactive path returns
+its stable error. Do not re-admit, rebuild or re-pin `PlannedSqlCut` or its
+participant cut, or allocate another graph ID. The no-second-optimizer rule
+applies only when unsupported or no-exchange planning already returned a
+reusable leader plan; distributed-planning failure intentionally delegates its
+fresh local plan to `execute_session`. Admission refusal is pre-selection
+failure; reservation and every failure after participant publication are
+terminal Analytical failures.
 
 **REFACTOR.** Keep the selected value private and immutable after Analytical
-assignment. Do not introduce a routing state-machine type; query class does not
-become the execution-path authority.
+assignment. Candidate class, actual graph ownership, and selected terminal path
+remain separate facts. Do not introduce a routing state-machine type; query
+class does not become the execution-path authority.
 
 ### Scenario 3 — Shared Rust stream settlement
 
@@ -159,16 +216,42 @@ Exact:
 mise exec -- cargo nextest run --locked -p vala-sdk --lib -E 'test(=query::tests::query_result_stream_settles_every_incomplete_exit_once)'
 ```
 
-Add the focused server journey
-`query::response_body_drop_retains_running_status_until_cleanup_joins`. Stall
-the production response after its schema, drop the HTTP body, and hold the
-existing Oracle cleanup gate. Assert status remains present and cancelling
-while cleanup is held, then release the gate and assert the same status route
-returns `WYRD_VALA_404_RUNNING_QUERY_NOT_FOUND`; also assert the HTTP deadline
-header equals the active summary deadline. Exact:
+Add
+`oracle::query_stream::tests::running_query_terminal_owner_drop_retires_untransferred_failure`
+in `vala-bifrost-redux`. Insert one real running entry, drop its untransferred
+terminal owner, and assert one failed retirement and no remaining entry; then
+explicitly finish a second owner and assert its later drop is a no-op. This is a
+verification-only regression lock before the refactor and must remain green
+while the post-registration audit, execution, first-batch, telemetry, and schema
+error paths continue to rely on that destructor. Exact:
 
 ```bash
-scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-testing --test server -P journey -E 'test(=query::response_body_drop_retains_running_status_until_cleanup_joins)' --run-ignored=all"
+mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib --features test-support,bench-support -E 'test(=oracle::query_stream::tests::running_query_terminal_owner_drop_retires_untransferred_failure)'
+```
+
+Add the focused Oracle journey
+`analytical_public::transport_drop_retains_running_status_until_cleanup_joins`.
+For HTTP, arm the existing server schema stall, wait until the body reaches it,
+and drop the response body. For gRPC, read the schema frame and then drop the
+receiver; do not add a second transport stall. Start
+`BifrostProcessCluster::start` with
+`[ProcessNodeTarget::Oracle, ProcessNodeTarget::Oracle,
+ProcessNodeTarget::Oracle, ProcessNodeTarget::Scribe]`, provision one shared
+public API key, and drive the coordinator child's HTTP/gRPC addresses directly.
+Exercise graphless Interactive, no-exchange Interactive fallback with its
+provisional Analytical graph, and selected Analytical. For each graph-owning
+case, arm the new one-shot cleanup pause on the coordinator before the query;
+after transport drop, await that pause, assert the running status is still
+cancelling and graph ownership is retained, then release it and assert the same
+public status route returns `WYRD_VALA_404_RUNNING_QUERY_NOT_FOUND`. For
+graphless Interactive, assert drop synchronously destroys local batch,
+admission, and resource owners before its running entry disappears. In every
+case assert transport drop only signals the existing query cancellation token;
+also assert the no-exchange terminal selects Interactive and HTTP/gRPC deadline
+metadata equals the active summary deadline. Exact:
+
+```bash
+scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-testing --test oracle -P journey -E 'test(=analytical_public::transport_drop_retains_running_status_until_cleanup_joins)' --run-ignored=all"
 ```
 
 **GREEN.** Carry the participant cut's existing `DateTime<Utc>` deadline on
@@ -194,19 +277,109 @@ replace the original stream error; if proof is still unavailable at the
 deadline, return that original error and record scrubbed unconfirmed-settlement
 telemetry. Do not read or validate the broken body again.
 
-Move active-entry retirement behind Oracle's existing cleanup ownership.
-`RunningQueryTerminalOwner::Drop` must not remove the entry. Normal stream
-completion retires it only after `settle_and_finish_stream` has joined children
-and released the query envelope. On response-body drop, the server transport
-owner invokes the registry's existing idempotent cancelling transition, signals
-the query cancellation tree, and transfers the retirement capability to the
-existing Analytical supervisor-owned lifecycle before caller-owned stream state
-can disappear; that lifecycle calls `settle_terminal` only after its cleanup
-join succeeds. Interactive drop uses the same Oracle stream settlement owner
-after its local batch, admission, and resource owners have released. A cleanup
-timeout/failure leaves the entry visible as cancelling and lets the existing
-readiness/shutdown evidence surface the retained owner. HTTP and gRPC transport
-drop use this same Oracle path.
+Keep `RunningQueryTerminalOwner::Drop` as the fail-safe failed retirement for
+every post-registration error before ownership transfer; do not rewrite those
+early returns. Choose retirement ownership from actual graph ownership, never
+from the selected terminal path. Immediately after `register_running_query`
+inside `admit_and_lease_attempt`, inspect the returned
+`AdmittedQueryGuard::analytical`. When it contains
+`AnalyticalAttemptOwnership`, move the running owner into a new
+`running_query: Option<RunningQueryTerminalOwner>` field on that graph's
+existing `AnalyticalGraphState` before audit, drain, physical qualification, or
+first-batch polling. This includes a provisional graph whose supported-plan or
+no-exchange result later selects Interactive. Return
+`AttemptOutput::running_query` as `None` for every graph-owning attempt. Only a
+graphless Interactive attempt keeps `Some(owner)` through the pre-stream error
+paths and moves it into `OracleQueryStream` after first-batch validation and
+schema encoding succeed.
+
+Implement the graph transfer as
+`AnalyticalAttemptOwnership::retain_running_query`, delegating through its
+existing signals to `AnalyticalSupervisor::retain_running_query` and following
+the existing `retain_admission` returned-owner pattern. Reject a second owner
+without replacing or dropping the first. A refused transfer returns the new
+owner unchanged; keep it alive while signalling a failed terminal and awaiting
+the same graph lifecycle settlement, then release admission and let its
+fail-safe `Drop` retire the entry. Widen
+`RunningQueryTerminalOwner::finish` only to `pub(super)` for the sibling
+supervisor. The existing
+`AnalyticalGraphLifecycle` explicitly finishes the accepted graph-held owner
+after its cleanup join as part of clean graph release. After the distributed
+join, close the local IPC stream before signalling Analytical settlement, while
+admission remains held, so IPC-close failure is included in the exact public
+outcome. Change the existing internal signal only: make
+`AnalyticalGraphControl::Terminal` carry both its existing
+`AnalyticalAttemptOutcome` and the final `QueryTerminalOutcome`, thread both
+through `AnalyticalGraphSignals::terminal` and `AnalyticalGraphGuard::settle`,
+and store the latter once in
+`AnalyticalGraphState::running_query_outcome: Option<QueryTerminalOutcome>`.
+`Success` and `Degraded` remain distinct; execution failure, cancellation,
+deadline, or `AnalyticalGraphSignals::Drop` supplies `Failed`. The first
+terminal signal wins both values. If later cleanup fails, the retained graph is
+not retired and any eventual post-deadline release uses `Failed`. This adds no
+wire field or second signal channel. Add one supervisor method
+for that leader path,
+`AnalyticalSupervisor::release_graph_and_finish_running_query`: after the
+existing live-attempt and child-idle checks, it removes the graph entry,
+invalidates the runtime, drops the released graph resources, and then calls
+`RunningQueryTerminalOwner::finish` with the mapped terminal outcome. If
+invalidation fails, reinsert the unchanged graph entry so its terminal owner
+and cleanup remain observable. Follower releases continue through the existing
+ownerless `release_graph`. Post-deadline eventual release uses the leader method
+with a failed outcome. A timeout or cleanup failure before release keeps the
+owner on the observable draining graph, so the status remains cancelling and
+readiness/shutdown report the retained cleanup.
+
+Keep only graphless Interactive retirement on `OracleQueryStream`. Make the
+stream retain its frame generator and optional graphless terminal owner
+separately. Its normal terminal polling path finishes that owner only after
+`settle_and_finish_stream` has joined distributed work and released admission.
+An Interactive fallback whose guard still contains
+`AnalyticalAttemptOwnership` carries no stream-local terminal owner; its graph
+lifecycle receives the Interactive stream's final public outcome and retires
+the graph-held owner after cleanup. Make the frame generator private, expose one
+inherent `next_frame` operation, and update Gate, server query service, HTTP,
+gRPC, and current direct tests to consume that operation so no caller can bypass
+retirement. Its synchronous `Drop` first signals the existing cancellation
+token, then takes and drops the frame generator so local batch, admission, and
+resource owners are destroyed, and only then drops any graphless terminal
+owner; the existing fail-safe destructor retires it as failed. Normal
+completion explicitly finishes that owner first, making its later drop a
+no-op. HTTP and gRPC retain and poll the complete
+`OracleQueryStream` instead of destructuring out `frames`; transport drop adds
+no cleanup owner and starts no task—it only causes that existing cancellation
+signal and Oracle-owned retirement order. Explicit `cancel` uses the same
+stream polling/settlement path.
+
+Under `test-support`, add one one-shot `AnalyticalCleanupPause` in
+`oracle/analytical.rs`, owned through `oracle/analytical_supervisor.rs` by the
+existing `AnalyticalSupervisor` and taken by the next
+`AnalyticalGraphLifecycle`. Reuse the existing `AnalyticalExecutePause`
+`AtomicBool`/`Notify` handshake shape rather than adding a generic gate. The
+supervisor's test-only `Mutex<Option<Arc<AnalyticalCleanupPause>>>` accepts one
+arm only while empty, and lifecycle start takes and clears that slot. `Arm`
+installs that single pause; `Await` waits until the lifecycle has joined the
+attempt, released participants, and observed idle graph children; and `Release`
+lets the lifecycle call
+`AnalyticalSupervisor::release_graph_and_finish_running_query`. The pause sits
+immediately before that clean release, delays only the production lifecycle,
+and makes no cleanup or terminal decision.
+
+Project the pause through the existing `BifrostProcessCluster` control protocol
+in `wyrd-testing/src/bifrost/process_cluster.rs` and its `child.rs`
+with `ArmAnalyticalCleanupPause`, `AwaitAnalyticalCleanupPaused`, and
+`ReleaseAnalyticalCleanupPause` requests;
+`CleanupPauseArmed`, `AnalyticalCleanupPaused`, and `CleanupPauseReleased`
+responses; and matching `ProcessNode::arm_analytical_cleanup_pause`,
+`await_analytical_cleanup_paused`, and `release_analytical_cleanup_pause`
+methods. Add `ArmQuerySchemaStall` and `AwaitQuerySchemaStall` requests,
+`QuerySchemaStallArmed` and `QuerySchemaStalled { query_id }` responses, and
+matching `ProcessNode` methods that delegate to
+`WyrdTestServer::stall_next_query_after_schema` and
+`wait_query_schema_stall`; they create no second stall. The child retains only
+the armed test handles, and the parent uses the schema stall only for the HTTP
+case to position transport drop before awaiting the independent lifecycle
+pause.
 
 **REFACTOR.** `vala-sdk` is the sole shared client settlement owner. MCP only
 bridges its tool-return and ceiling events to this API. Client-neutral behavior
@@ -227,12 +400,15 @@ REQ-002, REQ-003, REQ-006, REQ-008, REQ-009, REQ-011, AC-002–AC-007.
 
 **RED.** Add
 `analytical_public::public_query_selects_both_paths_and_preserves_interactive_floor`
-to the Oracle journey target. Use one-Oracle/one-Scribe for the UI case and the
-qualified three-Oracle/one-Scribe fixture for Analytical; assert raw request
-has no path field, the HTTP deadline metadata retained by `vala-sdk` equals the
-server's active-query deadline, terminals differ, trusted result parity, UI
-service under pressure, finite result-transport refusal, and all production
-gauges/owners return to baseline. Exact:
+to the Oracle journey target. Start one `BifrostProcessCluster` with three
+Oracle targets and one Scribe target, provision one public API key, and drive a
+coordinator's public HTTP address through `vala-sdk` for both the UI and
+Analytical cases. Assert the child PIDs are distinct, remote work crosses a
+peer socket, the raw request has no path field, the retained HTTP deadline
+equals the server's active-query deadline, terminals differ, results match the
+trusted local result, UI service survives Analytical pressure, result transport
+refuses finitely, and every process-owned gauge/owner returns to baseline.
+Exact:
 
 ```bash
 scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-testing --test oracle -P journey -E 'test(=analytical_public::public_query_selects_both_paths_and_preserves_interactive_floor)' --run-ignored=all"
@@ -246,22 +422,28 @@ owner. Do not repeat Task 3A's admission or memory load matrix.
 
 **REFACTOR.** Do not copy the physical operator matrix; consume Task 3 evidence.
 
-### Scenario 5 — Pre-selection fallback versus post-selection failure
+### Scenario 5 — Interactive stale replacement versus Analytical failure
 
-**Behavior.** Unsupported/no-exchange candidates and a typed stale-Iceberg
-replan may run Interactive only before Analytical selection; injected peer/
-transport/resource/cancellation/deadline/cleanup failure after selection
-returns one failed Analytical terminal, no stale replacement, no rerun, and no
-successful partial rows. An under-privileged sensitive-column request is
-refused before selection and peer/source IO. Maps REQ-002, REQ-007, REQ-008,
-INV-001, INV-002, INV-003, INV-004, AC-003, AC-004.
+**Behavior.** Unsupported/no-exchange candidates fall back before Analytical
+selection. The existing typed stale-Iceberg first-batch detector may replace
+only the first selected Interactive attempt before output escapes. Typed stale
+or injected peer/transport/resource/cancellation/deadline/cleanup failure after
+Analytical selection returns one failed Analytical terminal, with no
+replacement, rerun, or successful partial rows. An under-privileged
+sensitive-column request is refused before selection and peer/source IO. Maps
+REQ-002, REQ-007, REQ-008, INV-001, INV-002, INV-003, INV-004, AC-003, AC-004.
 
 **RED.** Add
 `analytical_public::fallback_is_preselection_only_and_failure_is_terminal`.
-Drive a no-exchange candidate, the existing typed stale-Iceberg condition on
-both sides of the selection point, an under-privileged sensitive-column query,
-and an injected post-selection peer loss; assert path/attempt/terminal/audit/
-ownership and zero peer/source IO for the authorization denial. Exact:
+Drive a no-exchange execution that remains Interactive and encounters the
+existing typed stale-Iceberg first-batch condition on attempt zero; assert one
+replacement before output. Drive the same typed condition after Analytical
+selection, an under-privileged sensitive-column query, and an injected
+post-selection peer loss; assert path/attempt/terminal/audit/ownership, no
+Analytical replacement or Interactive rerun, and zero peer/source IO for the
+authorization denial. Use the existing `BifrostProcessCluster` with three
+Oracle child processes and one Scribe child process, its shared public API key,
+and a coordinator's public endpoint. Exact:
 
 ```bash
 scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-testing --test oracle -P journey -E 'test(=analytical_public::fallback_is_preselection_only_and_failure_is_terminal)' --run-ignored=all"
@@ -269,11 +451,17 @@ scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner &&
 
 **GREEN.** Carry the locked selection into `query_stream`; remove every error
 edge from selected Analytical to Interactive. Await joined cleanup before the
-failed terminal. Constrain `Oracle::run_sql_query_attempt_loop` and
-`StaleReplacementGate` so the one stale-Iceberg replacement is a preparation-
-time replan only: it must complete before Analytical admission/selection and is
-disabled after selection or output. Preserve authorization before physical
-dispatch and stable Wyrd error mapping at HTTP/gRPC/Rust boundaries.
+failed terminal. Keep the current first-batch typed-stale detector. Add the
+immutable selected path to `StaleReplacementGate` and allow its existing one
+replacement only when `retry_ordinal == 0`, the selected path is Interactive,
+and no output has escaped. A typed stale first batch on Analytical follows the
+ordinary terminal settlement path; it never returns `Ok(None)` to
+`Oracle::run_sql_query_attempt_loop`. When that eligible Interactive attempt
+owns a provisional Analytical graph, signal failure and await its joined graph
+settlement—including retirement of the graph-held running owner—before
+returning `Ok(None)` for the existing re-pin/re-admit retry. Preserve
+authorization before physical dispatch and stable Wyrd error mapping at
+HTTP/gRPC/Rust boundaries.
 
 **REFACTOR.** One terminal constructor serves both paths; only the selected path
 and typed outcome vary.
@@ -311,10 +499,11 @@ Replace `grpc::query::query_status`'s partial `ErrorInfo` mapping with the
 existing canonical `wyrd_tonic::wyrd_error_to_status` problem+json metadata
 mapper and retain retry metadata only for the existing retryable pre-stream
 capacity classes. Keep peer services private and included in readiness/ordered
-shutdown. In the test tier only, compose the existing multi-node Oracle fixture
-behind the current `WyrdTestServer` handle and one Rust-native configuration
-option; downstream runtimes consume this fixture without editing its lifecycle
-or exporting a cluster class.
+shutdown. The journey starts
+`BifrostProcessCluster::start` with three Oracle targets and one Scribe target,
+uses `provision_public_api_key`, and drives the selected child's existing public
+HTTP/gRPC addresses. The process cluster retains every child listener and
+shutdown owner; the journey adds no `WyrdTestServer` composition.
 
 **REFACTOR.** No scheduler, alternate internal analytical method, audit writer,
 or second gRPC error envelope.
@@ -332,6 +521,16 @@ base-10 Unix epoch millisecond integer. `RunningQueryNotFound` proves only that
 the active server owner retired after cleanup; it is not a recovered terminal.
 Healthy streams validate terminals, broken streams preserve their originating
 error and validate settlement only through active-entry disappearance.
+Transport adapters retain the complete Oracle stream and own no retirement
+logic. Only graphless Interactive retirement follows synchronous stream-local
+destruction. Whenever `AdmittedQueryGuard` contains
+`AnalyticalAttemptOwnership`, including an Interactive pre-selection fallback,
+retirement belongs to the existing supervisor before any transport can receive
+the stream and occurs only after joined graph cleanup. Selected path describes
+execution, not retirement ownership.
+Cross-process acceptance evidence comes only from `BifrostProcessCluster` with
+distinct child PIDs and real public/private sockets. `WyrdTestCluster` evidence
+is supporting in-process coverage and cannot satisfy REQ-003 or AC-002.
 
 Task 3A owns admission fairness, Interactive protection, and lowest-rung
 contention qualification. This task may observe those behaviors through public
@@ -364,9 +563,17 @@ git diff --check
 
 - Source-generated request/terminal diff proving no selector or EXPLAIN.
 - Selection mutation matrix and path admission/floor snapshots.
+- Exact public/graph/snapshot/permission/deadline identity and single-lease
+  evidence for both production leader entries, including same-plan unsupported/
+  no-exchange fallback, `execute_session` planning-failure fallback, and retained
+  provisional-graph cleanup.
 - UI, data-scientist, scheduled, failure, cancellation, and pressure journeys.
 - HTTP/gRPC deadline metadata equality, healthy terminal-drain, broken-stream
-  status settlement, and response-drop-before-cleanup ordering evidence.
+  status settlement, fail-safe pre-stream retirement, and deterministic
+  graphless/no-exchange/Analytical response-drop ordering evidence from the
+  lifecycle pause.
+- Distinct child-PID and public/private socket evidence from the existing
+  three-Oracle/one-Scribe `BifrostProcessCluster`.
 - Single audit acceptance/no stage audit evidence.
 - Production telemetry deltas and zero owner/readiness/shutdown snapshots.
 

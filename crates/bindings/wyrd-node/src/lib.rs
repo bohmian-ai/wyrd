@@ -773,8 +773,9 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use wyrd_spec::error::WyrdError;
     use wyrd_spec::vala::api::{
-        QueryErrorDetail, QueryFreshness, QuerySource, QueryTerminalError, QueryTerminalErrorCode,
-        QueryTerminalFrame, QueryTerminalOutcome, SourceCompletion, SourceCompletionOutcome,
+        QueryErrorDetail, QueryExecutionPath, QueryFreshness, QuerySource, QueryTerminalError,
+        QueryTerminalErrorCode, QueryTerminalFrame, QueryTerminalOutcome, SourceCompletion,
+        SourceCompletionOutcome,
     };
     use wyrd_spec::vala::error::BifrostError;
 
@@ -871,6 +872,7 @@ mod tests {
         let dropped = Arc::new(AtomicBool::new(false));
         let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let terminal = QueryTerminalFrame {
+            execution_path: QueryExecutionPath::Interactive,
             outcome: QueryTerminalOutcome::Failed,
             freshness: QueryFreshness::Complete,
             row_count: 0,
@@ -1024,6 +1026,7 @@ mod tests {
         let owner = NativeBifrostQueryStream::new_for_test(TestStreamOwner::new(
             std::collections::VecDeque::from([Ok(None)]),
             Some(QueryTerminalFrame {
+                execution_path: QueryExecutionPath::Interactive,
                 outcome: QueryTerminalOutcome::Success,
                 freshness: QueryFreshness::Complete,
                 row_count: 0,

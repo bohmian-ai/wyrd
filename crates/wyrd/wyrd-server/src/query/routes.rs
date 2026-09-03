@@ -535,6 +535,7 @@ mod tests {
             QueryStreamFrame::Terminal(QueryTerminalFrame {
                 outcome: QueryTerminalOutcome::Degraded,
                 freshness: QueryFreshness::Degraded,
+                execution_path: wyrd_spec::vala::api::QueryExecutionPath::Interactive,
                 row_count: 1,
                 warnings: Vec::new(),
                 source_completion: Vec::new(),
@@ -615,6 +616,7 @@ mod tests {
             QueryStreamFrame::Terminal(QueryTerminalFrame {
                 outcome: QueryTerminalOutcome::Success,
                 freshness: QueryFreshness::Complete,
+                execution_path: wyrd_spec::vala::api::QueryExecutionPath::Interactive,
                 row_count: 0,
                 warnings: Vec::new(),
                 source_completion: complete_sources(),
@@ -684,6 +686,7 @@ mod tests {
         let terminal = QueryStreamFrame::Terminal(QueryTerminalFrame {
             outcome: QueryTerminalOutcome::Failed,
             freshness: QueryFreshness::Complete,
+            execution_path: wyrd_spec::vala::api::QueryExecutionPath::Interactive,
             row_count: 1,
             warnings: Vec::new(),
             source_completion: Vec::new(),

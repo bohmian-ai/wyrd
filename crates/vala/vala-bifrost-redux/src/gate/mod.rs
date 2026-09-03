@@ -1396,6 +1396,7 @@ mod tests {
                 wyrd_spec::vala::api::QueryTerminalFrame {
                     outcome: wyrd_spec::vala::api::QueryTerminalOutcome::Success,
                     freshness: wyrd_spec::vala::api::QueryFreshness::Complete,
+                    execution_path: wyrd_spec::vala::api::QueryExecutionPath::Interactive,
                     row_count: 0,
                     warnings: Vec::new(),
                     source_completion: Vec::new(),

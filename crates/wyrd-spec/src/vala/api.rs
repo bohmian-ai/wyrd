@@ -1296,6 +1296,32 @@ pub enum QueryTerminalOutcome {
     Failed,
 }
 
+/// The execution path Oracle selected for one logical query.
+///
+/// This is a server-derived terminal fact, never a request field: REQ-001 keeps
+/// path selection entirely on the server, and REQ-008 requires the terminal to
+/// name the path that actually ran. It is deliberately distinct from
+/// [`QueryClass`], which is the admission class of a *candidate*; a query
+/// admitted as an Analytical candidate still terminates as
+/// [`QueryExecutionPath::Interactive`] when its distributed plan is unsupported
+/// or carries no real exchange.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum QueryExecutionPath {
+    /// Oracle executed the query locally on the coordinator.
+    Interactive,
+    /// Oracle executed the query as a distributed graph across Oracle peers.
+    Analytical,
+}
+
+impl Default for QueryExecutionPath {
+    /// Uses Interactive so an unset path can never claim distributed execution.
+    fn default() -> Self {
+        Self::Interactive
+    }
+}
+
 /// Freshness achieved by the admitted visibility cut.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
@@ -1448,6 +1474,13 @@ pub struct QueryTerminalFrame {
     pub outcome: QueryTerminalOutcome,
     /// Admitted-cut freshness.
     pub freshness: QueryFreshness,
+    /// Execution path Oracle selected for this query.
+    ///
+    /// Present on every terminal, successful or failed, so a caller always
+    /// learns which path ran. A failed terminal on
+    /// [`QueryExecutionPath::Analytical`] is the proof that selection was
+    /// irreversible: REQ-002 forbids rerunning that query through Interactive.
+    pub execution_path: QueryExecutionPath,
     /// Rows already emitted in batch frames.
     pub row_count: u64,
     /// Closed bounded warnings.
@@ -1615,6 +1648,7 @@ mod query_terminal_tests {
         let success = QueryTerminalFrame {
             outcome: QueryTerminalOutcome::Success,
             freshness: QueryFreshness::Complete,
+            execution_path: QueryExecutionPath::Interactive,
             row_count: 2,
             warnings: vec![],
             source_completion: complete_sources(VisibilityMode::PublishedOnly),
@@ -1633,6 +1667,7 @@ mod query_terminal_tests {
         let degraded = QueryTerminalFrame {
             outcome: QueryTerminalOutcome::Degraded,
             freshness: QueryFreshness::Degraded,
+            execution_path: QueryExecutionPath::Interactive,
             row_count: 1,
             warnings: vec![QueryWarning::LiveTailUnavailable],
             source_completion: degraded_sources.clone(),
@@ -1646,6 +1681,7 @@ mod query_terminal_tests {
         let failed = QueryTerminalFrame {
             outcome: QueryTerminalOutcome::Failed,
             freshness: QueryFreshness::Degraded,
+            execution_path: QueryExecutionPath::Interactive,
             row_count: 1,
             warnings: vec![QueryWarning::LiveTailUnavailable],
             source_completion: degraded_sources,
@@ -1669,6 +1705,7 @@ mod query_terminal_tests {
         let failed_without_error = QueryTerminalFrame {
             outcome: QueryTerminalOutcome::Failed,
             freshness: QueryFreshness::Complete,
+            execution_path: QueryExecutionPath::Interactive,
             row_count: 3,
             warnings: vec![],
             source_completion: complete_sources(VisibilityMode::PublishedOnly),
@@ -1770,6 +1807,7 @@ mod query_terminal_tests {
         let failed = |freshness, source_completion| QueryTerminalFrame {
             outcome: QueryTerminalOutcome::Failed,
             freshness,
+            execution_path: QueryExecutionPath::Interactive,
             row_count: 0,
             warnings: vec![],
             source_completion,
@@ -2871,6 +2909,7 @@ mod tests {
         let base = QueryTerminalFrame {
             outcome: QueryTerminalOutcome::Success,
             freshness: QueryFreshness::Complete,
+            execution_path: QueryExecutionPath::Interactive,
             row_count: 0,
             warnings: vec![],
             source_completion: sources,
@@ -2945,6 +2984,82 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<QueryTerminalFrame>(encoded).expect("terminal deserializes"),
             base
+        );
+    }
+
+    /// The public query contract carries the selected path out and never in.
+    ///
+    /// REQ-001 keeps the request free of any execution-path, class, worker, or
+    /// plan selector, and REQ-008 requires the terminal to name the path Oracle
+    /// actually selected. Both halves are pinned from the generated schema so a
+    /// later field addition on either side has to break this test first.
+    #[test]
+    fn query_terminal_projects_path_without_request_selector() {
+        let request = serde_json::to_value(schemars::schema_for!(BifrostQueryRequest).schema)
+            .expect("request schema serializes");
+        let mut request_properties = request["properties"]
+            .as_object()
+            .expect("request has properties")
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        request_properties.sort_unstable();
+        assert_eq!(
+            request_properties,
+            ["deadline_ms", "freshness", "sql", "visibility"],
+            "the request must not accept a path, class, worker, or plan selector"
+        );
+
+        let path = serde_json::to_value(schemars::schema_for!(QueryExecutionPath).schema)
+            .expect("path schema serializes");
+        let path_variants = path["oneOf"]
+            .as_array()
+            .expect("the selected path is a closed enum")
+            .iter()
+            .map(|variant| {
+                variant["enum"][0]
+                    .as_str()
+                    .expect("each variant is one string constant")
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            path_variants,
+            ["interactive", "analytical"],
+            "the selected path is closed over Interactive and Analytical"
+        );
+
+        let terminal = QueryTerminalFrame {
+            outcome: QueryTerminalOutcome::Success,
+            freshness: QueryFreshness::Complete,
+            execution_path: QueryExecutionPath::Analytical,
+            row_count: 0,
+            warnings: vec![],
+            source_completion: vec![
+                SourceCompletion {
+                    source: QuerySource::Iceberg,
+                    outcome: SourceCompletionOutcome::Complete,
+                },
+                SourceCompletion {
+                    source: QuerySource::HotSealed,
+                    outcome: SourceCompletionOutcome::Complete,
+                },
+            ],
+            error: None,
+            arrow_ipc_eos: vec![0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0],
+        };
+        terminal
+            .validate(VisibilityMode::PublishedOnly)
+            .expect("an Analytical terminal is valid");
+        let encoded = serde_json::to_value(&terminal).expect("terminal serializes");
+        assert_eq!(
+            encoded["execution_path"],
+            serde_json::Value::from("analytical"),
+            "the terminal names the server-selected path on the wire"
+        );
+        assert_eq!(
+            serde_json::from_value::<QueryTerminalFrame>(encoded).expect("terminal deserializes"),
+            terminal
         );
     }
 

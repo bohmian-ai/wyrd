@@ -270,3 +270,75 @@ behavior, or the supported minimum topology. Return `PLAN_BLOCKED` if Task 3's
 real spilling stream cannot remain open while existing production inspection
 observes its grant and root memory; report the missing seam rather than adding
 a second execution or resource owner.
+
+## Execution evidence
+
+### Scenario 1 — `analytical_saturation_preserves_interactive_floor_and_rotates_tenants`
+
+- **RED.** The named test did not exist; the module did not compile against it.
+  Once written, it passed on its first run against the retained admission
+  owner, so the task's conditional GREEN ("if the retained implementation does
+  not satisfy the test, correct grant order") required no production change.
+  This scenario is verified regression coverage of behavior already correct.
+- **GREEN.** `PASS [0.018s]` via the task's exact command.
+- **REFACTOR.** The queue-full half was extracted into
+  `prove_rejection_charges_nothing`, and the waiter bindings renamed
+  (`tenant_a_head` / `tenant_a_tail` / `peer_head`), to satisfy
+  `clippy::too_many_lines` and `clippy::similar_names` without weakening an
+  assertion. Both halves still run against one shared `OracleResources` root.
+- Production `enqueue_waiter` runs a grant pass per arrival, so the three
+  Interactive waiters are pushed through the module's existing `push_waiter`
+  fixture and settled by one `drain_grants` pass. That is the only way all
+  three contend in a single pass, which is what the stated assertions describe.
+
+### Scenario 2 — `capacity::lowest_rung_analytical_contention_preserves_two_interactive_tenants`
+
+- **RED.** `capacity.rs` held no journey, `three_oracles_one_scribe()` did not
+  exist, the stream resource probe exposed neither its issued grant nor its
+  query-pool current/peak, and the only probe binding on the public route was
+  the cancelling schema stall. Those four seams were built first (passive
+  `QueryStreamFault::CaptureProbe`, `QueryStreamProbeCapture`,
+  `QueryResourceSnapshot` grant/pool fields, `oracle_resource_snapshots`).
+- **GREEN.** `PASS [50.794s]` via the task's exact command, and again in the
+  full lane.
+- **Diagnosis, in order, each a fixture defect rather than a production one:**
+  1. The expected Analytical grant was sampled by acquiring and dropping an
+     envelope *while the Analytical query held one*, which the root correctly
+     refuses at 512 MiB. Moved to the pre-query baseline, where the envelope is
+     genuinely free.
+  2. `ORDER BY` with no fetch is a "complex" plan, so the planner classified
+     the bounded read Analytical; it then queued behind the live Analytical
+     query and rejected on `queue_deadline`. `ORDER BY ... LIMIT` then failed
+     as `unsupported distributed Oracle operator: SortExec(TopK)`. The
+     Interactive read is now a flat projection, which is what actually
+     exercises the Interactive floor.
+  3. A 64-row Interactive result fits in the transport's buffers, so the server
+     finished and released the query before the window sampled it
+     (`oracle_queries_active{class="interactive"}` read 0 → 0). The bounded
+     table is now 200k rows, so the undrained client is what holds the query
+     open. This is TCP/stream backpressure, not a sleep.
+  4. `support::live_ownership` demanded an Oracle from every node, which a
+     Scribe-only node correctly does not compose. It now skips nodes with no
+     Oracle; every existing caller's cluster is all-Oracle, so their behavior
+     is unchanged.
+  5. On the single-threaded `#[tokio::test]` default, four in-process pods plus
+     a distributed 700k-row join starved the pods' own heartbeats, their Oracle
+     role leases expired, and the graph failed with a partial result. The
+     journey now runs `flavor = "multi_thread", worker_threads = 8`, matching
+     the existing `scribe::horizontal_ingest` journeys.
+- **Limitation.** The 512 MiB / 2 CPU / 1 GiB scratch figures are an injected
+  observation, so this run bounds what admission *accounts for* on the lowest
+  rung. It makes no claim about aggregate physical process memory.
+
+### Broader verification
+
+| Command | Result |
+| --- | --- |
+| `mise run fmt` | pass |
+| `mise run lints` | pass |
+| `mise run test:bifrost` | 974 passed, 0 skipped |
+| `mise run test:bifrost:journey:oracle` | 17 passed, 0 skipped |
+| `mise run check:bifrost-resource-governance` | pass |
+| `git diff --check` | clean |
+
+No command in the task was stale; every one ran verbatim.

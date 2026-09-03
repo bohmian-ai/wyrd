@@ -12,8 +12,8 @@
 //! are plumbing around the real dependency, not a second implementation of it.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arrow::array::{Int64Array, RecordBatch, TimestampMicrosecondArray};
@@ -82,6 +82,10 @@ pub(crate) struct CountingObjectStore {
     delete_errors: AtomicUsize,
     /// Remaining delegated deletes to submit and then report as already absent.
     delete_absences: AtomicUsize,
+    /// Entries per orphan-listing page; `0` keeps the single-page default.
+    list_page_entries: AtomicUsize,
+    /// Every `start_after` cursor orphan listing has been given, in order.
+    list_cursors: Mutex<Vec<Option<String>>>,
 }
 
 /// Deterministic pause seam over exactly one delegated object-store call.
@@ -119,7 +123,26 @@ impl CountingObjectStore {
             delete_pause: CallPause::default(),
             delete_errors: AtomicUsize::new(0),
             delete_absences: AtomicUsize::new(0),
+            list_page_entries: AtomicUsize::new(0),
+            list_cursors: Mutex::new(Vec::new()),
         })
+    }
+
+    /// Splits orphan listing into pages of exactly `entries` keys.
+    ///
+    /// The production adapter owns page granularity, so a scan-bound proof
+    /// needs a seam that can make a page small enough for the per-run page cap
+    /// to bite deterministically.
+    pub(crate) fn page_listing_by(&self, entries: usize) {
+        self.list_page_entries.store(entries, Ordering::Release);
+    }
+
+    /// Returns every cursor orphan listing has been resumed from, in order.
+    pub(crate) fn list_cursors(&self) -> Vec<Option<String>> {
+        self.list_cursors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Return how many objects were stat'ed.
@@ -235,6 +258,39 @@ impl ForgeObjectStore for CountingObjectStore {
 
     async fn list(&self, prefix: &str) -> opendal::Result<Vec<Entry>> {
         self.inner.list_with(prefix).recursive(true).await
+    }
+
+    /// Page the real listing while preserving exclusive, lexicographic cursors.
+    ///
+    /// The production adapter delegates the cursor to the backend; the
+    /// filesystem operator behind this fixture cannot, so the same semantics
+    /// are applied here over a real recursive listing. Recording each cursor is
+    /// what lets a resume proof assert that earlier pages are never relisted.
+    async fn list_pages(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+    ) -> opendal::Result<vala_bifrost_redux::forge::ForgeObjectPages> {
+        self.list_cursors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(start_after.map(ToOwned::to_owned));
+        let mut entries = self.list(prefix).await?;
+        entries.retain(|entry| entry.metadata().is_file());
+        if let Some(cursor) = start_after {
+            entries.retain(|entry| entry.path() > cursor);
+        }
+        entries.sort_unstable_by(|left, right| left.path().cmp(right.path()));
+        let per_page = self.list_page_entries.load(Ordering::Acquire);
+        let pages: Vec<opendal::Result<Vec<Entry>>> = if per_page == 0 {
+            vec![Ok(entries)]
+        } else {
+            entries
+                .chunks(per_page)
+                .map(|chunk| Ok(chunk.to_vec()))
+                .collect()
+        };
+        Ok(Box::pin(futures_util::stream::iter(pages)))
     }
 
     async fn stat(&self, path: &str) -> opendal::Result<Metadata> {

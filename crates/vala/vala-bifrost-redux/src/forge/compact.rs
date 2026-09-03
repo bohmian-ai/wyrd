@@ -378,18 +378,32 @@ pub trait ForgeObjectStore: std::fmt::Debug + Send + Sync {
     ///
     /// This is the listing path orphan GC uses so it can consume the prefix
     /// incrementally and stop at a page boundary once its per-run page cap or
-    /// time budget is reached. The default body adapts [`Self::list`] into a
-    /// single page, which preserves behavior for every non-production
-    /// implementation. The production adapter overrides this with true
-    /// incremental pagination so a large prefix never materializes at once;
-    /// riding this default in production would defeat the scan bound.
+    /// time budget is reached. `start_after` resumes the walk strictly after
+    /// one already-processed key in lexicographic order, which is what keeps a
+    /// leading page of protected objects from starving the pages behind it.
+    ///
+    /// The default body adapts [`Self::list`] into a single page and applies
+    /// the same exclusive ordering itself, which preserves behavior for every
+    /// non-production implementation. The production adapter overrides this
+    /// with true incremental pagination and the backend's own cursor so a large
+    /// prefix never materializes at once; riding this default in production
+    /// would defeat the scan bound.
     ///
     /// # Errors
     ///
     /// Returns the backend error when recursive listing cannot begin. Errors
     /// encountered mid-walk surface as a failed item in the returned stream.
-    async fn list_pages(&self, prefix: &str) -> opendal::Result<ForgeObjectPages> {
-        let entries = self.list(prefix).await?;
+    async fn list_pages(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+    ) -> opendal::Result<ForgeObjectPages> {
+        let mut entries = self.list(prefix).await?;
+        entries.retain(|entry| entry.metadata().is_file());
+        if let Some(cursor) = start_after {
+            entries.retain(|entry| entry.path() > cursor);
+        }
+        entries.sort_unstable_by(|left, right| left.path().cmp(right.path()));
         Ok(Box::pin(stream::once(ready(Ok(entries)))))
     }
 
@@ -774,7 +788,7 @@ mod tests {
             .collect::<Vec<_>>();
         direct.sort();
 
-        let mut pages = store.list_pages("").await.expect("paged listing");
+        let mut pages = store.list_pages("", None).await.expect("paged listing");
         let first = pages
             .next()
             .await

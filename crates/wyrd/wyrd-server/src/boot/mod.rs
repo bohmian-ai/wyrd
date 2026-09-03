@@ -133,17 +133,46 @@ impl ForgeObjectStore for OpenDalForgeObjectStore {
     /// so a mid-walk backend error surfaces as a failed page rather than being
     /// silently truncated.
     ///
+    /// Listing is gated on the backend advertising `list_with_start_after`.
+    /// The bounded scan resumes by cursor, and emulating that cursor by
+    /// filtering would relist every earlier page on every attempt — exactly the
+    /// unbounded listing the page cap exists to prevent — so an incapable
+    /// backend is refused before any listing rather than served an
+    /// anti-starvation guarantee this adapter cannot keep.
+    ///
     /// # Errors
     ///
-    /// Returns the underlying OpenDAL error when the lister cannot be opened.
-    /// Errors encountered after the walk begins surface as a failed page in the
-    /// returned stream.
-    async fn list_pages(&self, prefix: &str) -> opendal::Result<ForgeObjectPages> {
-        let lister = self.operator.lister_with(prefix).recursive(true).await?;
+    /// Returns [`opendal::ErrorKind::Unsupported`] when the backend cannot
+    /// resume from a cursor, and the underlying OpenDAL error when the lister
+    /// cannot be opened. Errors encountered after the walk begins surface as a
+    /// failed page in the returned stream.
+    async fn list_pages(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+    ) -> opendal::Result<ForgeObjectPages> {
+        if !self.operator.info().full_capability().list_with_start_after {
+            return Err(opendal::Error::new(
+                opendal::ErrorKind::Unsupported,
+                "Forge orphan listing requires backend list_with_start_after support",
+            ));
+        }
+        let mut listing = self.operator.lister_with(prefix).recursive(true);
+        if let Some(cursor) = start_after {
+            listing = listing.start_after(cursor);
+        }
+        let lister = listing.await?;
         let pages = lister.chunks(FORGE_OBJECT_LIST_PAGE_ENTRIES).map(|chunk| {
-            chunk
+            // A resumable scan advances its cursor over objects only: a
+            // directory key ends in a separator and is not an addressable
+            // object, so a page made only of them would leave the cursor
+            // standing still and relist forever.
+            Ok(chunk
                 .into_iter()
-                .collect::<opendal::Result<Vec<opendal::Entry>>>()
+                .collect::<opendal::Result<Vec<opendal::Entry>>>()?
+                .into_iter()
+                .filter(|entry| entry.metadata().is_file())
+                .collect())
         });
         Ok(Box::pin(pages))
     }
@@ -2138,6 +2167,44 @@ pub fn spawn_maintenance_scheduler(
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    /// Orphan listing refuses a backend that cannot resume from a cursor.
+    ///
+    /// The bounded orphan scan's only anti-starvation mechanism is an exclusive
+    /// `start_after` cursor: without native support a leading page of protected
+    /// objects would be relisted forever and the later pages behind it would
+    /// never be reached. Emulating the cursor by filtering would reintroduce the
+    /// unbounded listing the cap exists to prevent, so the production adapter
+    /// fails closed instead. The filesystem service is the already-installed
+    /// backend that advertises the capability as absent, which makes it the
+    /// exact case this refusal exists for.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the filesystem operator cannot be built, when it starts
+    /// advertising cursor support, or when listing is permitted anyway.
+    #[tokio::test]
+    async fn open_dal_forge_listing_refuses_backend_without_start_after() {
+        let root = tempfile::tempdir().expect("listing root");
+        let operator = opendal::Operator::new(
+            opendal::services::Fs::default().root(&root.path().to_string_lossy()),
+        )
+        .expect("filesystem operator builds")
+        .finish();
+        assert!(
+            !operator.info().full_capability().list_with_start_after,
+            "the filesystem service is the backend this refusal exists for"
+        );
+        let store = OpenDalForgeObjectStore::new(Arc::new(operator));
+        for cursor in [None, Some("tenants/t/table/data/forge/v1/a.parquet")] {
+            let error = store
+                .list_pages("tenants/t/table/data/forge/v1/", cursor)
+                .await
+                .err()
+                .expect("a backend without cursor support cannot be listed");
+            assert_eq!(error.kind(), opendal::ErrorKind::Unsupported);
+        }
+    }
 
     /// Boot rejects an intrinsic replay envelope while accepting its exact boundary.
     ///

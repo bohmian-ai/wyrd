@@ -25,9 +25,9 @@ use vala_sql::row_types::forge_operations::ForgeOperationFamily;
 use vala_sql::row_types::forge_tasks::{
     ExpiredCleanupCandidateRequest, ExpiredCleanupOutcome, ExpiredCleanupPayload,
     FORGE_TASK_PAYLOAD_VERSION, ForgeClaimStrategy, ForgeCleanupCandidate, ForgePreparedTaskClaim,
-    ForgeTask, ForgeTaskClaim, ForgeTaskEvidence, ForgeTaskState, ForgeTaskStrategy,
-    ForgeTaskTableIdentity, ForgeTaskTransition, MAINTENANCE_STRATEGIES, SnapshotWatermark,
-    TaskProgressEffect,
+    ForgeTask, ForgeTaskClaim, ForgeTaskEvidence, ForgeTaskRowEvidence, ForgeTaskState,
+    ForgeTaskStrategy, ForgeTaskTableIdentity, ForgeTaskTransition, MAINTENANCE_STRATEGIES,
+    SnapshotWatermark, TaskProgressEffect,
 };
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
@@ -55,6 +55,7 @@ use super::scribe_promotion::{
 };
 use super::{Forge, ForgeCapacity};
 use crate::catalog::TenantTableBinding;
+use crate::catalog::layout::forge_data_location;
 
 /// Parameter discriminator every durable small-file rewrite task carries.
 ///
@@ -245,6 +246,11 @@ enum ForgeDispatchResult {
     Maintenance(Box<ForgeMaintenanceResult>),
     /// A fully drained expired-cleanup candidate set with its final evidence.
     Cleaned(Box<ForgeTaskEvidence>),
+    /// One bounded orphan-cleanup pass that already wrote its own durable task
+    /// transition: either a cursor checkpoint plus a non-consuming release, or
+    /// the audited terminal success that exhaustion earns. The worker owes it
+    /// no further transition.
+    OrphanSettled,
 }
 
 /// Durable task state accompanying exact committed evidence.
@@ -1578,6 +1584,23 @@ impl ForgeWorker {
             .await
     }
 
+    /// Executes one already-claimed orphan-cleanup task through the real
+    /// fenced path while phase activation is still owned by a later task.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same failures as
+    /// [`Self::execute_snapshot_expiry_claim_for_test`].
+    #[cfg(feature = "test-support")]
+    pub async fn execute_orphan_cleanup_claim_for_test(
+        &self,
+        claim: ForgeTaskClaim,
+        shutdown: &CancellationToken,
+    ) -> Result<(), ForgeError> {
+        self.execute_maintenance_claim_for_test(ForgeTaskStrategy::OrphanCleanup, claim, shutdown)
+            .await
+    }
+
     /// Shared body of the phase-bypassing maintenance test entrypoints.
     ///
     /// # Errors
@@ -2230,6 +2253,22 @@ impl ForgeWorker {
                 .map_err(ForgeError::Sql)?;
             return Ok(ForgeMetricStage::ExpiredCleanup);
         }
+        if matches!(
+            task.strategy,
+            ForgeClaimStrategy::Known(ForgeTaskStrategy::OrphanCleanup)
+        ) {
+            // Orphan cleanup's single input is a scan prefix, not a file set,
+            // and its parameters carry the immutable cutoff. Both shapes are
+            // re-validated here; the prefix is bound to this task's own table
+            // in the dispatch, where the catalog location is available.
+            task.plan
+                .orphan_cleanup_payload(ForgeTaskStrategy::OrphanCleanup, true)
+                .map_err(ForgeError::Sql)?;
+            task.plan
+                .orphan_cleanup_prefix(true)
+                .map_err(ForgeError::Sql)?;
+            return Ok(ForgeMetricStage::OrphanGc);
+        }
         let (expected_kind, stage) = match &task.strategy {
             ForgeClaimStrategy::Known(ForgeTaskStrategy::ScribePromotion) => (
                 super::scribe_promotion::SCRIBE_PROMOTION_PARAMETER_KIND,
@@ -2414,6 +2453,18 @@ impl ForgeWorker {
             ForgeDispatchResult::Cleaned(evidence) => {
                 Ok((*evidence, ForgeExecutionEvidenceState::Prepared))
             }
+            ForgeDispatchResult::OrphanSettled => Ok((
+                ForgeTaskEvidence {
+                    version: FORGE_TASK_PAYLOAD_VERSION,
+                    committed_snapshot_id: None,
+                    committed_metadata_location: None,
+                    committed_metadata_digest: None,
+                    cleanup_candidates: Vec::new(),
+                    deleted_candidate_count: 0,
+                    prepared_candidate_index: None,
+                },
+                ForgeExecutionEvidenceState::Settled,
+            )),
             ForgeDispatchResult::Maintenance(result) => {
                 self.complete_maintenance(claim, attempt, binding, lease, *result, stop)
                     .await
@@ -2735,6 +2786,7 @@ impl ForgeWorker {
                 ForgeTaskStrategy::ManifestRewrite
                     | ForgeTaskStrategy::SnapshotExpiry
                     | ForgeTaskStrategy::ExpiredCleanup
+                    | ForgeTaskStrategy::OrphanCleanup
             )
         )
     }
@@ -2906,6 +2958,10 @@ impl ForgeWorker {
             }
             ForgeClaimStrategy::Known(ForgeTaskStrategy::ExpiredCleanup) => {
                 self.dispatch_expired_cleanup(claim, attempt, binding, lease, &table, stop)
+                    .await
+            }
+            ForgeClaimStrategy::Known(ForgeTaskStrategy::OrphanCleanup) => {
+                self.dispatch_orphan_cleanup(claim, attempt, binding, lease, &table, stop)
                     .await
             }
             _ => Err(ForgeError::Invariant {
@@ -4088,6 +4144,133 @@ impl ForgeWorker {
     /// fencing, audit, SQL, or cancellation failures. Every failure leaves the
     /// durable cursor authoritative, so the exact candidate is replayed by this
     /// or a successor attempt.
+    /// Runs one bounded orphan-collection pass for an already-claimed task.
+    ///
+    /// The task row's tenant and table plus its immutable prefix and cutoff are
+    /// the complete scan identity, so the first thing this does is re-bind that
+    /// prefix to the table's *current* Forge recipe root. A plan naming another
+    /// table's prefix, or a stale root, is refused before the lease is used and
+    /// before a single object is listed.
+    ///
+    /// Everything destructive stays with the retained owner: listing,
+    /// protection, the sorted batch, its `OrphanGc` prepare/delete/reconcile
+    /// protocol, and crash recovery. What this adds is the durable scan
+    /// position. After the selected batch settles, a partial pass checkpoints
+    /// the last completely processed key and releases the task without
+    /// consuming failure budget, which is what keeps a leading run of protected
+    /// objects from starving the pages behind it. An exhausted prefix instead
+    /// clears the cursor and takes the audited terminal transition.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Sql`] when the plan is not the closed orphan
+    /// contract or a durable transition is refused, [`ForgeError::Invariant`]
+    /// when the plan prefix is not this table's current Forge recipe root, and
+    /// every lease, catalog, protection, object-store, audit, and cancellation
+    /// failure the retained collection owner raises.
+    ///
+    /// # Cancellation
+    ///
+    /// Cancellation observed by the retained owner leaves any prepared batch
+    /// open and does not advance the cursor; the task stays claimable by
+    /// lease-expiry reclaim with its durable position unchanged.
+    async fn dispatch_orphan_cleanup(
+        &self,
+        claim: &ForgeTaskClaim,
+        attempt: Uuid,
+        binding: &TenantTableBinding,
+        lease: &mut ForgeLease,
+        table: &Table,
+        stop: &CancellationToken,
+    ) -> Result<ForgeDispatchResult, ForgeError> {
+        let payload = claim
+            .plan
+            .orphan_cleanup_payload(ForgeTaskStrategy::OrphanCleanup, true)
+            .map_err(ForgeError::Sql)?;
+        let prefix = claim
+            .plan
+            .orphan_cleanup_prefix(true)
+            .map_err(ForgeError::Sql)?;
+        let expected = catalog_path_to_object_key(
+            table.metadata().location(),
+            binding,
+            &self.forge.core.staging,
+            &forge_data_location(table.metadata().location()),
+        )?;
+        if prefix != expected {
+            return Err(ForgeError::Invariant {
+                detail: format!(
+                    "orphan cleanup plan prefix {prefix} is not this table's Forge root {expected}"
+                ),
+            });
+        }
+        let start_after = claim
+            .evidence
+            .as_ref()
+            .and_then(ForgeTaskRowEvidence::orphan_scan)
+            .map(|cursor| cursor.start_after.clone());
+        let key = super::compact::ForgeTableKey {
+            tenant: claim.data_tenant_id,
+            table_ref: binding.table_ref.clone(),
+        };
+        let outcome = self
+            .forge
+            .run_orphan_gc_for_table(
+                lease,
+                &key,
+                binding,
+                super::orphan_gc::OrphanGcScan {
+                    now: self.forge.core.clock.now()?,
+                    age_cutoff_ms: Some(payload.age_cutoff_ms),
+                    start_after: start_after.as_deref(),
+                },
+                stop,
+            )
+            .await?;
+        let authority = ForgeExpirationAuthority {
+            task_id: claim.task_id,
+            attempt_id: attempt,
+            worker_id: self.owner,
+            lease_key: lease.lease_key.clone(),
+            lease_fencing_token: lease.fencing_token,
+        };
+        let claim_table = self.forge.expiry_claim_table(&key, table).await?;
+        if outcome.partial {
+            if let Some(frontier) = outcome.frontier.as_deref() {
+                self.tasks
+                    .checkpoint_orphan_cleanup_cursor(
+                        claim.data_tenant_id,
+                        &authority,
+                        &claim_table,
+                        frontier,
+                    )
+                    .await
+                    .map_err(ForgeError::Sql)?;
+            }
+            // A bounded pass is progress, not a failure: the same task returns
+            // to the pool with its position intact and its budget untouched.
+            self.tasks
+                .retry(claim.task_id, attempt, self.owner, chrono::Utc::now())
+                .await
+                .map_err(ForgeError::Sql)?;
+        } else {
+            self.tasks
+                .complete_orphan_cleanup(
+                    claim.data_tenant_id,
+                    &authority,
+                    &claim_table,
+                    &task_event(
+                        claim.task_id,
+                        ForgeTaskState::Succeeded,
+                        "orphan cleanup prefix exhausted",
+                    ),
+                )
+                .await
+                .map_err(ForgeError::Sql)?;
+        }
+        Ok(ForgeDispatchResult::OrphanSettled)
+    }
+
     async fn dispatch_expired_cleanup(
         &self,
         claim: &ForgeTaskClaim,

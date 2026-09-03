@@ -320,6 +320,10 @@ struct GcTableContext<'context> {
     /// orphan-GC TTL applied to `now`, which is what every non-task caller
     /// uses.
     age_cutoff_ms: Option<i64>,
+    /// Durable scan cursor. Listing resumes strictly after this key, so a
+    /// leading run of protected objects cannot starve the pages behind it.
+    /// `None` starts the prefix from its beginning.
+    start_after: Option<&'context str>,
 }
 
 /// Inputs that distinguish a fresh protection load from a GC self-reload.
@@ -517,6 +521,20 @@ pub fn current_gc_gate_for_test(
         .any(|row| row.operation_id != exemption.operation_id))
 }
 
+/// The immutable window one orphan-GC run scans.
+///
+/// A run driven by a durable task carries that task's own fixed cutoff and
+/// resume position; the periodic maintenance path carries neither and derives
+/// its cutoff from the run instant instead.
+pub(super) struct OrphanGcScan<'scan> {
+    /// Instant this run's protection proof is taken at.
+    pub(super) now: DateTime<Utc>,
+    /// Task-owned immutable object-age cutoff, when a task owns the run.
+    pub(super) age_cutoff_ms: Option<i64>,
+    /// Exclusive resume key taken from the task's durable cursor.
+    pub(super) start_after: Option<&'scan str>,
+}
+
 impl Forge {
     /// Run reconciled orphan deletion for one fenced physical table.
     ///
@@ -535,16 +553,16 @@ impl Forge {
         lease: &mut ForgeLease,
         key: &ForgeTableKey,
         binding: &TenantTableBinding,
-        now: DateTime<Utc>,
-        age_cutoff_ms: Option<i64>,
+        scan: OrphanGcScan<'_>,
         stop: &CancellationToken,
     ) -> Result<OrphanGcOutcome, ForgeError> {
         let table = GcTableContext {
             key,
             binding,
-            now,
+            now: scan.now,
             stop,
-            age_cutoff_ms,
+            age_cutoff_ms: scan.age_cutoff_ms,
+            start_after: scan.start_after,
         };
         self.run_orphan_gc_for_table_inner(lease, &table).await
     }
@@ -586,6 +604,7 @@ impl Forge {
             now,
             stop,
             age_cutoff_ms: None,
+            start_after: None,
         };
         self.load_maintenance_protection(ProtectionRequest {
             table: &table,
@@ -617,6 +636,7 @@ impl Forge {
             now: self.core.clock.now()?,
             stop: &stop,
             age_cutoff_ms: None,
+            start_after: None,
         };
         self.load_maintenance_protection(ProtectionRequest {
             table: &table,
@@ -650,6 +670,7 @@ impl Forge {
             now: self.core.clock.now()?,
             stop: &stop,
             age_cutoff_ms: None,
+            start_after: None,
         };
         let protection = self
             .load_maintenance_protection(ProtectionRequest {
@@ -783,8 +804,11 @@ impl Forge {
                 &mut lease,
                 &key,
                 binding,
-                self.core.clock.now()?,
-                None,
+                OrphanGcScan {
+                    now: self.core.clock.now()?,
+                    age_cutoff_ms: None,
+                    start_after: None,
+                },
                 &CancellationToken::new(),
             )
             .await?;
@@ -842,10 +866,15 @@ impl Forge {
             return Ok(outcome);
         }
         let scan = self
-            .list_gc_candidates(table.binding, &protection, page_cap, deadline)
+            .list_gc_candidates(table, &protection, page_cap, deadline)
             .await?;
         outcome.partial |= scan.partial;
         outcome.candidates = outcome.candidates.saturating_add(scan.candidates.len());
+        // The frontier is reported even when nothing was selected: a page of
+        // only protected or unaddressable entries is completely processed work,
+        // and advancing past it is exactly what stops it from being relisted on
+        // every successor attempt.
+        outcome.frontier = scan.frontier;
         if scan.candidates.is_empty() {
             return Ok(outcome);
         }
@@ -871,7 +900,7 @@ impl Forge {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub(crate) struct OrphanGcOutcome {
     /// Exact candidate paths considered across new and reconciled batches.
     pub(crate) candidates: usize,
@@ -883,6 +912,11 @@ pub(crate) struct OrphanGcOutcome {
     pub(crate) skipped: usize,
     /// Open prepared operations left pending after bounded reconciliation.
     pub(crate) pending: usize,
+    /// Last object key whose classification completed during this pass, if the
+    /// scan reached one. A caller owning a durable task checkpoints exactly
+    /// this key after its selected batch settles; every earlier key is proven
+    /// handled and every later key is untouched.
+    pub(crate) frontier: Option<String>,
     /// Whether a per-run bound (listing-page cap or wall-clock budget) ended the
     /// run before its candidate set was exhausted. A partial run committed only
     /// durable deletions and leaves the remainder for a successor run; it is not
@@ -900,6 +934,8 @@ struct GcCandidateScan {
     candidates: Vec<String>,
     /// Whether a per-run bound stopped the scan before the prefix was exhausted.
     partial: bool,
+    /// Last key whose classification completed, in listing order.
+    frontier: Option<String>,
 }
 
 /// Result of completing one prepared GC batch under an optional run budget.
@@ -1244,38 +1280,56 @@ impl Forge {
     /// Returns object-store listing failures. Cancellation leaves objects untouched.
     async fn list_gc_candidates(
         &self,
-        binding: &TenantTableBinding,
+        table: &GcTableContext<'_>,
         protection: &MaintenanceProtection,
         page_cap: usize,
         deadline: Instant,
     ) -> Result<GcCandidateScan, ForgeError> {
+        let binding = table.binding;
         tracing::debug!(
             captured_now = %protection.now,
-            prefix = %binding.object_prefix,
+            prefix = %forge_data_prefix(binding),
+            start_after = ?table.start_after,
             page_cap,
             "enumerating bounded orphan-GC candidates"
         );
-        let prefix = format!("{}/", binding.object_prefix.trim_end_matches('/'));
+        // The scan is bounded to the Forge recipe root rather than the whole
+        // table prefix. Nothing outside that root is addressable by orphan
+        // collection anyway, and a task-owned cursor must name a key strictly
+        // beneath the prefix its plan fixes — which is exactly this root.
+        let prefix = format!("{}/", forge_data_prefix(binding));
         let mut pages = self
             .core
             .object_store
-            .list_pages(&prefix)
+            .list_pages(&prefix, table.start_after)
             .await
             .map_err(ForgeError::ObjectList)?;
+        let batch_cap = self.core.config.max_gc_candidates_per_batch;
         let mut candidates = Vec::new();
+        let mut frontier: Option<String> = None;
         let mut scanned_pages = 0_usize;
         let mut partial = false;
-        loop {
-            if scanned_pages >= page_cap || Instant::now() >= deadline {
-                partial = true;
-                break;
-            }
+        'scan: loop {
+            // Bounds are checked *after* a page is consumed so an exhausted
+            // prefix is reported as complete rather than as a run that merely
+            // ran out of budget. A durable task cursor turns that difference
+            // into "succeeded" versus "resume forever".
             let Some(page) = pages.next().await else {
                 break;
             };
-            let entries = page.map_err(ForgeError::ObjectList)?;
+            let mut entries = page.map_err(ForgeError::ObjectList)?;
             scanned_pages = scanned_pages.saturating_add(1);
+            // Key order is what makes the frontier meaningful, and a backend is
+            // only required to page — not to order within a page.
+            entries.sort_unstable_by(|left, right| left.path().cmp(right.path()));
             for entry in entries {
+                if candidates.len() >= batch_cap {
+                    // Stopping *before* this entry is what keeps the frontier
+                    // honest: the cursor must never move past work no batch
+                    // considered.
+                    partial = true;
+                    break 'scan;
+                }
                 let path = entry.path().to_owned();
                 if protection.gc_eligibility(
                     binding,
@@ -1283,15 +1337,20 @@ impl Forge {
                     ObjectEvidence::Present(entry.metadata()),
                 ) == GcEligibility::Eligible
                 {
-                    candidates.push(path);
+                    candidates.push(path.clone());
                 }
+                frontier = Some(path);
+            }
+            if scanned_pages >= page_cap || Instant::now() >= deadline {
+                partial = true;
+                break;
             }
         }
         candidates.sort_unstable();
-        candidates.truncate(self.core.config.max_gc_candidates_per_batch);
         Ok(GcCandidateScan {
             candidates,
             partial,
+            frontier,
         })
     }
 

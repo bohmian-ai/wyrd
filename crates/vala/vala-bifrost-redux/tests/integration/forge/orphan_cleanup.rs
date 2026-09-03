@@ -935,7 +935,10 @@ async fn prepared_batch_takeover_is_replay_safe_and_sql_free_during_delete() {
         "an unresolved batch has exactly one prepared audit and no terminal one"
     );
 
-    assert_takeover_replays_the_same_batch(&batch, prepared, attempt).await;
+    Box::pin(assert_takeover_replays_the_same_batch(
+        &batch, prepared, attempt,
+    ))
+    .await;
 }
 
 /// Asserts the successor reclaims the task and replays the same batch.

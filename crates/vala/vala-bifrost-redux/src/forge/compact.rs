@@ -779,11 +779,15 @@ mod tests {
         }
         let store = FsListObjectStore { operator };
 
+        // A flat listing also names the directories it walked; a page carries
+        // addressable objects only, because a resumable scan advances its
+        // cursor over object keys.
         let mut direct = store
             .list("")
             .await
             .expect("direct listing")
             .into_iter()
+            .filter(|entry| entry.metadata().is_file())
             .map(|entry| entry.path().to_owned())
             .collect::<Vec<_>>();
         direct.sort();
@@ -806,7 +810,7 @@ mod tests {
 
         assert_eq!(
             page_paths, direct,
-            "the single page equals the flat listing"
+            "the single page equals every object of the flat listing"
         );
     }
 

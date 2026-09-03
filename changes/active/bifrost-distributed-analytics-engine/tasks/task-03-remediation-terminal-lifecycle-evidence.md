@@ -436,3 +436,27 @@ Six `wyrd-testing` lib tests (`bifrost::scribe_workload::tests::…` and five
 reviewed base `5b0f885c` and on this candidate under an ad-hoc
 `cargo nextest run -p wyrd-testing --lib`; they pass through their owning
 `mise` lanes. Pre-existing and unrelated to this task.
+
+## Review remediation — FIND-BIFROST-R4-T03-PHYSICAL-BASELINE-6
+
+A child that accepted `Shutdown` but whose `WyrdTestServer::shutdown` failed
+exits `ExitCode::FAILURE` within the deadline. `reap` matched `Ok(Some(_))` and
+discarded that status, so `ProcessNode::shutdown`, the cluster, and the journey
+all reported a clean ordered shutdown.
+
+- **RED.** `mise exec -- cargo nextest run --locked -p wyrd-testing --lib -E
+  'test(=bifrost::process_cluster::tests::a_natural_non_zero_child_exit_is_a_shutdown_failure)'`
+  failed on `a failed exit is reported`: the status-mapping owner returned
+  `None` for a non-success exit, which is what the reaper did.
+- **GREEN.** `natural_exit_failure` reports a non-success status from the
+  reaper's natural-exit branch only. The deliberate `ReaperCommand::Kill` branch
+  is untouched, so `ProcessNode::kill` still treats its own kill status as the
+  expected outcome rather than a shutdown failure. The focused test passes.
+- **Closure verification.** `mise run test:bifrost:journey:oracle` passes 16/16,
+  including `explicit_shutdown_reports_failure_after_reaping_every_child` and
+  `peer_listener_is_isolated_mtls_and_role_complete`. One earlier run of that
+  lane failed its six `pg_*` journeys on Postgres startup contention; the rerun
+  passed every one, and no process-cluster journey was involved.
+- **Broader verification.** `mise run fmt`, `mise run lints`,
+  `mise run test:bifrost` (973 passed), the three boundary checks, and
+  `git diff --check` all pass.

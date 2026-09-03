@@ -2134,6 +2134,18 @@ impl Drop for BifrostProcessCluster {
     }
 }
 
+/// Reports a natural child exit that ended in failure.
+///
+/// A child that exited on its own says whether its own shutdown was clean
+/// through its exit status, so a non-success status is the only evidence the
+/// parent has that ordered shutdown did not complete. A child the parent
+/// deliberately killed is never routed here: its non-success status is the
+/// expected result of the kill, not a shutdown failure.
+fn natural_exit_failure(pid: u32, status: &std::process::ExitStatus) -> Option<String> {
+    (!status.success())
+        .then(|| format!("child pid {pid} exited with {status} instead of shutting down cleanly"))
+}
+
 /// Owns one `Child`, waiting for normal exit while accepting a kill command.
 ///
 /// Separated onto its own thread because the parent must be able to both wait
@@ -2148,7 +2160,14 @@ fn reap(
     let mut first: Option<String> = None;
     loop {
         match child.try_wait() {
-            Ok(Some(_)) => break,
+            Ok(Some(status)) => {
+                // The child chose its own exit, so its status is the parent's
+                // only report of whether that exit was an ordered one.
+                if let Some(detail) = natural_exit_failure(pid, &status) {
+                    first.get_or_insert(detail);
+                }
+                break;
+            }
             Ok(None) => {}
             Err(error) => {
                 // The status is unreadable, so this loop can no longer decide
@@ -2341,6 +2360,20 @@ mod tests {
         let rendered = tail.render();
         assert!(!rendered.contains("line 0\n"));
         assert!(rendered.ends_with(&format!("line {}", STDERR_TAIL_LINES + 9)));
+    }
+
+    /// A child that exits non-zero on its own is a shutdown failure.
+    #[cfg(unix)]
+    #[test]
+    fn a_natural_non_zero_child_exit_is_a_shutdown_failure() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let failed = std::process::ExitStatus::from_raw(1 << 8);
+        let detail = natural_exit_failure(4242, &failed).expect("a failed exit is reported");
+        assert!(detail.contains("4242"), "{detail} names the child");
+        assert_eq!(
+            natural_exit_failure(4242, &std::process::ExitStatus::from_raw(0)),
+            None
+        );
     }
 
     /// Every target round-trips through its wire name.

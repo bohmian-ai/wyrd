@@ -163,7 +163,10 @@ async fn scribe_sources_live_for_lease_and_release_once() {
         "committed hot objects without promotion evidence are the Forge roots: {roots_before:?}"
     );
 
-    // Unsealed rows are the only state a live tail is allowed to serve here.
+    // Unsealed rows are the state this tier can put under a lease against the
+    // real Scribe; the frozen immutable and staged source states are read under
+    // their leases by the tier-3 proofs in `scribe::tail_rpc` and
+    // `scribe::hot_source`.
     fixture.append_without_seal(7).await;
     let reader = fixture
         .scribe()

@@ -2929,6 +2929,13 @@ mod tests {
         memtable
             .insert(&key, event(), meta(1, 3), batch(vec![1, 2, 3]))
             .expect("first fixture batch inserts");
+        // Freezing between the appends is what makes this fixture cover both
+        // source states a live tail must keep readable for its lease: the first
+        // generation becomes immutable frozen Arrow, and the rows appended
+        // after it stay in the active writable bucket.
+        memtable
+            .freeze(&key)
+            .expect("first fixture generation freezes");
         memtable
             .insert(&key, event(), meta(2, 2), batch(vec![4, 5]))
             .expect("second fixture batch inserts");
@@ -3519,9 +3526,17 @@ mod tests {
                 max_encoded_bytes: 1 << 20,
             })
             .expect("the retained live-tail source is readable for its lease");
-        assert!(
-            !page.batches.is_empty(),
-            "the lease still owns the Arrow it admitted"
+        // The fixture froze its first generation (three rows) and left the
+        // second active (two rows). Reading all five back is what proves both
+        // source states stayed readable for the lease; the frozen generation
+        // alone would return three.
+        assert_eq!(
+            page.batches
+                .iter()
+                .map(|batch| batch.num_rows())
+                .sum::<usize>(),
+            5,
+            "the lease reads the frozen immutable generation and the active one"
         );
         assert!(
             reader

@@ -7,3 +7,4 @@
 mod distributed_compat;
 mod forge;
 mod oracle;
+mod scribe;

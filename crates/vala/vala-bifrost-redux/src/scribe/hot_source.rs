@@ -1133,6 +1133,11 @@ mod tests {
     /// lease is what makes "no deletion under a pinned reader" true rather than
     /// merely likely.
     ///
+    /// Two concurrent readers prove the ownership rule the count depends on:
+    /// each lease releases exactly once on drop, so cleanup waits for the last
+    /// reader rather than the first, and a settled generation cannot be
+    /// released a second time by a later drain.
+    ///
     /// # Panics
     ///
     /// Panics when the lease is not counted, when cleanup does not wait for it,
@@ -1154,6 +1159,15 @@ mod tests {
             .expect("locked");
         assert_eq!(lease.sources().len(), 1);
         assert_eq!(registry.leases(&key, generation).expect("locked"), 1);
+        let second = registry
+            .staged_sources(key.tenant, &key.table, key.partition, key.partition)
+            .expect("locked");
+        assert_eq!(second.sources().len(), 1);
+        assert_eq!(
+            registry.leases(&key, generation).expect("locked"),
+            2,
+            "each pinned reader owns its own staged lease"
+        );
 
         let waiting = registry.drain_leases(&key, generation);
         tokio::pin!(waiting);
@@ -1163,10 +1177,30 @@ mod tests {
         );
 
         drop(lease);
+        assert_eq!(
+            registry.leases(&key, generation).expect("locked"),
+            1,
+            "one reader's drop releases exactly its own lease"
+        );
+        assert!(
+            futures_util::poll!(waiting.as_mut()).is_pending(),
+            "cleanup waits for the last pinned reader, not the first"
+        );
+
+        drop(second);
         assert_eq!(registry.leases(&key, generation).expect("locked"), 0);
         waiting
             .await
             .expect("cleanup proceeds once the reader is gone");
+        assert_eq!(
+            registry.leases(&key, generation).expect("locked"),
+            0,
+            "a settled staged lease is never released a second time"
+        );
+        registry
+            .drain_leases(&key, generation)
+            .await
+            .expect("a settled generation drains again without waiting");
     }
 
     /// Draining a member no reader holds returns without waiting.

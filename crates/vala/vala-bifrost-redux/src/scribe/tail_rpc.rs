@@ -2855,6 +2855,9 @@ mod tests {
     /// appended batches of `value` rows, so a selective fetch can be compared
     /// against the unfiltered one.
     ///
+    /// The caller supplies the Scribe root so a lifetime proof can compare the
+    /// same authoritative capability before and after every terminal path.
+    ///
     /// # Panics
     /// Panics when the fixture batches, seal key, or memtable inserts violate
     /// their construction invariants.
@@ -2862,20 +2865,32 @@ mod tests {
         tenant: DataTenantId,
         day: crate::catalog::layout::TimePartition,
         stream: StreamIdentity,
+        resources: crate::resources::ScribeResources,
     ) -> (FetchLiveTailService, super::TenantTableBinding) {
         use crate::catalog::TableRef;
         use crate::scribe::seal_key::SealKey;
         use crate::scribe::wal::ScribeAppendMeta;
 
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "value",
-            DataType::Int64,
-            false,
-        )]));
+        // The managed row ordinal is part of every persisted append, and a fence
+        // cursor is derived from it, so the fixture carries it exactly as
+        // ingress would. It is excluded from the projected source fingerprint.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Int64, false),
+            Field::new(
+                wyrd_spec::vala::managed_columns::WYRD_ROW_ORDINAL,
+                DataType::Int32,
+                false,
+            ),
+        ]));
         let batch = |values: Vec<i64>| {
+            let ordinals = (0..i32::try_from(values.len()).expect("fixture row count fits i32"))
+                .collect::<Vec<_>>();
             RecordBatch::try_new(
                 Arc::clone(&schema),
-                vec![Arc::new(Int64Array::from(values))],
+                vec![
+                    Arc::new(Int64Array::from(values)),
+                    Arc::new(arrow::array::Int32Array::from(ordinals)),
+                ],
             )
             .expect("valid fixture batch")
         };
@@ -2920,9 +2935,22 @@ mod tests {
         let binding =
             super::TenantTableBinding::resolve((tenant, table)).expect("fixture binding resolves");
         (
-            FetchLiveTailService::new(stream, memtable, tail_resources()),
+            FetchLiveTailService::new(stream, memtable, resources),
             binding,
         )
+    }
+
+    /// Returns the canonical projected fingerprint of the fixture row schema.
+    ///
+    /// A live-tail acquisition validates every retained batch against the
+    /// requested fingerprint, so a lifetime proof needs the exact accepted value
+    /// and one deliberately wrong value from the same derivation.
+    fn fixture_schema_fingerprint() -> SchemaFingerprint {
+        let schema = Schema::new(vec![Field::new("value", DataType::Int64, false)]);
+        SchemaFingerprint::new(hex::encode(
+            crate::contracts::projected_source_schema_fingerprint(&schema).0,
+        ))
+        .expect("fixture schema fingerprint")
     }
 
     /// A signed predicate is applied inside Scribe, so a selective live-tail
@@ -2938,7 +2966,7 @@ mod tests {
         let tenant = DataTenantId::new_v7();
         let day = crate::test_support::day_partition(2026, 7, 14);
         let stream = StreamIdentity::new(NodeId::generate(), WriterEpoch::new(1));
-        let (service, binding) = selective_tail_fixture(tenant, day, stream);
+        let (service, binding) = selective_tail_fixture(tenant, day, stream, tail_resources());
         let request = |predicates: Vec<ScanPredicate>| super::FetchLiveTailRequest {
             binding: binding.clone(),
             target_stream: stream,
@@ -3409,6 +3437,169 @@ mod tests {
                 .expect("settled root snapshot")
                 .scribe_memory_used_bytes,
             baseline.scribe_memory_used_bytes
+        );
+    }
+
+    /// Every terminal live-tail path releases its acquired owner exactly once.
+    ///
+    /// The reader retains real active and immutable Arrow arrays from the same
+    /// Scribe root a production reader owns, so success, error, cancellation,
+    /// deadline expiry, and reader drop are each proven against one authority:
+    /// the number of releases equals the number of acquired owners, no owner is
+    /// released twice, and the root returns to its exact pre-read baseline. The
+    /// fence names Scribe-local Arrow only; nothing here creates an object-store
+    /// key, so no live-tail placeholder can reach Forge protection.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a terminal path leaks an owner, releases one twice, or leaves
+    /// the shared Scribe root above its baseline.
+    #[tokio::test]
+    async fn live_tail_source_guards_release_once_on_every_terminal_path() {
+        let tenant = DataTenantId::new_v7();
+        let day = crate::test_support::day_partition(2026, 7, 14);
+        let stream = StreamIdentity::new(NodeId::generate(), WriterEpoch::new(1));
+        let resources = tail_resources();
+        let baseline_bytes = resources
+            .snapshot()
+            .expect("baseline root snapshot")
+            .scribe_memory_used_bytes;
+        let (service, _binding) = selective_tail_fixture(tenant, day, stream, resources.clone());
+        let reader = ScribeTailReader::new(Arc::new(service), TailFenceConfig::default());
+        let live_request = || {
+            let mut request = empty_fence_request(tenant);
+            request.schema_fingerprint = fixture_schema_fingerprint();
+            request
+        };
+        let live_bytes = || {
+            resources
+                .snapshot()
+                .expect("terminal path root snapshot")
+                .scribe_memory_used_bytes
+        };
+        let snapshot = || {
+            reader
+                .ownership_snapshot_for_test()
+                .expect("terminal path ownership snapshot")
+        };
+
+        // Deadline: refused before any owner is acquired, so nothing to release.
+        let mut expired = live_request();
+        expired.deadline = chrono::Utc::now() - chrono::Duration::seconds(1);
+        assert!(matches!(
+            reader.acquire_fence(expired).await,
+            Err(TailReadError::DeadlineElapsed)
+        ));
+        let after_deadline = snapshot();
+        assert_eq!(after_deadline.reservations, 0);
+        assert_eq!(after_deadline.releases, 0);
+        assert_eq!(live_bytes(), baseline_bytes);
+
+        // Error: the owner is acquired, then settled once by the failing path.
+        let mut mismatched = live_request();
+        mismatched.schema_fingerprint =
+            SchemaFingerprint::new("0".repeat(64)).expect("mismatched fingerprint");
+        assert!(matches!(
+            reader.acquire_fence(mismatched).await,
+            Err(TailReadError::SchemaMismatch)
+        ));
+        let after_error = snapshot();
+        assert_eq!(after_error.reservations, 1);
+        assert_eq!(after_error.releases, 1);
+        assert_eq!(after_error.active_reservations, 0);
+        assert_eq!(live_bytes(), baseline_bytes);
+
+        // Success: real Arrow stays readable for the lease and releases once.
+        let fence = reader
+            .acquire_fence(live_request())
+            .await
+            .expect("live-tail fence over the fixture rows");
+        let retained = snapshot();
+        assert_eq!(retained.active_reservations, 1);
+        assert!(retained.active_reserved_bytes > 0);
+        assert!(live_bytes() > baseline_bytes);
+        let page = reader
+            .read_page(&TailPageRequest {
+                query_id: uuid::Uuid::nil(),
+                fence_id: fence.fence_id,
+                after: None,
+                max_rows: 64,
+                max_encoded_bytes: 1 << 20,
+            })
+            .expect("the retained live-tail source is readable for its lease");
+        assert!(
+            !page.batches.is_empty(),
+            "the lease still owns the Arrow it admitted"
+        );
+        assert!(
+            reader
+                .release_fence(fence.fence_id)
+                .expect("explicit release")
+                .released
+        );
+        let after_success = snapshot();
+        assert_eq!(after_success.releases, retained.releases + 1);
+        assert_eq!(after_success.active_reservations, 0);
+        assert_eq!(live_bytes(), baseline_bytes);
+        reader
+            .release_fence(fence.fence_id)
+            .expect("duplicate release is idempotent");
+        assert_eq!(
+            snapshot().releases,
+            after_success.releases,
+            "a released owner is never settled a second time"
+        );
+
+        // Cancellation: a pre-material guard returns its owner exactly once.
+        let pending = reader
+            .reserve_pending_fence()
+            .expect("cancellation guard owns one reservation");
+        assert_eq!(snapshot().active_reservations, 1);
+        drop(pending);
+        let after_cancel = snapshot();
+        assert_eq!(after_cancel.releases, after_success.releases + 1);
+        assert_eq!(after_cancel.active_reservations, 0);
+        assert_eq!(live_bytes(), baseline_bytes);
+
+        // Expiry: the lease deadline settles the retained owner exactly once.
+        let expiring = reader
+            .acquire_fence(live_request())
+            .await
+            .expect("expiring live-tail fence");
+        let due = Instant::now() + TailFenceConfig::default().ttl + Duration::from_secs(1);
+        assert_eq!(reader.expire_due(due, 64).released, 1);
+        assert_eq!(reader.expire_due(due, 64).released, 0);
+        let after_expiry = snapshot();
+        assert_eq!(after_expiry.releases, after_cancel.releases + 1);
+        assert_eq!(after_expiry.active_reservations, 0);
+        assert_eq!(live_bytes(), baseline_bytes);
+        assert!(matches!(
+            reader.read_page(&TailPageRequest {
+                query_id: uuid::Uuid::nil(),
+                fence_id: expiring.fence_id,
+                after: None,
+                max_rows: 64,
+                max_encoded_bytes: 1 << 20,
+            }),
+            Err(TailReadError::CursorOutOfRange)
+        ));
+
+        // Drop: reader destruction drains the one owner still retained.
+        reader
+            .acquire_fence(live_request())
+            .await
+            .expect("fence retained across reader destruction");
+        assert!(live_bytes() > baseline_bytes);
+        assert_eq!(
+            snapshot().releases,
+            after_expiry.releases,
+            "the retained owner is still live when the reader is destroyed"
+        );
+        drop(reader);
+        assert_eq!(
+            live_bytes(),
+            baseline_bytes,
+            "reader drop returns the last retained owner to the Scribe root"
         );
     }
 

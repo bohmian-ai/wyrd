@@ -284,6 +284,7 @@ fn query_stream_response_with_fault(
     stall: Option<std::sync::Arc<crate::state::QueryStreamStall>>,
 ) -> Response {
     let schema_fingerprint = result.schema_fingerprint.clone();
+    let deadline_ms = result.deadline_ms;
     if let Some(stall) = &stall {
         stall.bind_resource_probe(result.resource_probe_for_test());
     }
@@ -327,6 +328,7 @@ fn query_stream_response_with_fault(
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, QUERY_STREAM_CONTENT_TYPE)
         .header("x-wyrd-schema-fingerprint", schema_fingerprint)
+        .header("x-wyrd-query-deadline-ms", deadline_ms)
         .body(body)
     {
         Ok(response) => response,
@@ -344,6 +346,7 @@ fn query_stream_response_with_fault(
     _stall: Option<()>,
 ) -> Response {
     let schema_fingerprint = result.schema_fingerprint;
+    let deadline_ms = result.deadline_ms;
     let mut frames = result.frames;
     let body = Body::from_stream(async_stream::stream! {
         while let Some(frame) = frames.next().await {
@@ -355,6 +358,7 @@ fn query_stream_response_with_fault(
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, QUERY_STREAM_CONTENT_TYPE)
         .header("x-wyrd-schema-fingerprint", schema_fingerprint)
+        .header("x-wyrd-query-deadline-ms", deadline_ms)
         .body(body)
     {
         Ok(response) => response,

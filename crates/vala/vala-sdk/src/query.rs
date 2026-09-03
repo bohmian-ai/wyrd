@@ -233,9 +233,22 @@ impl QueryClient {
             .client
             .request_json_stream_with_id(reqwest::Method::POST, "/v1/query", request, &request_id)
             .await?;
+        let deadline_ms = response
+            .headers()
+            .get("x-wyrd-query-deadline-ms")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<i64>().ok())
+            .filter(|deadline| *deadline >= 0)
+            .ok_or_else(|| {
+                ValaSdkError::Protocol(
+                    "query response omits a valid x-wyrd-query-deadline-ms".to_owned(),
+                )
+            })?;
         Ok(QueryResultStream::new(
             RawQueryStream::new(response.bytes_stream(), request.visibility),
             request_id,
+            self.clone(),
+            deadline_ms,
         ))
     }
 
@@ -539,10 +552,38 @@ fn query_body_transport_error(error: reqwest::Error) -> ValaSdkError {
     })
 }
 
+/// What one incomplete stream still owes the server before the caller walks away.
+///
+/// A stream that reached its terminal owes nothing. Anything else left a query
+/// running on a server that has no other way to learn the caller is gone, so
+/// exactly one settlement is owed — and which one depends entirely on whether
+/// the body can still be trusted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamSettlement {
+    /// The body is intact and can be drained to its real terminal.
+    Healthy,
+    /// The body failed to decode or transport and must never be read again.
+    Broken,
+    /// A terminal was observed, or settlement already ran exactly once.
+    Settled,
+}
+
+/// Stable code proving one query is no longer running and needs no settlement.
+const RUNNING_QUERY_RETIRED_CODE: &str = "WYRD_VALA_404_RUNNING_QUERY_NOT_FOUND";
+
+/// Interval between status polls while proving a broken stream was cleaned up.
+const SETTLEMENT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// Arrow-projecting query stream that preserves terminal metadata.
 pub struct QueryResultStream {
     /// Canonical server-visible request identity available before body polling.
     request_id: RequestId,
+    /// Client reused for the one cancellation and any status proof this stream owes.
+    client: QueryClient,
+    /// Server-pinned absolute deadline bounding every settlement wait.
+    deadline_ms: i64,
+    /// Settlement this stream still owes, or [`StreamSettlement::Settled`].
+    settlement: StreamSettlement,
     /// Validated logical-frame stream.
     raw: RawQueryStream,
     /// Schema established by the unique initial schema frame.
@@ -557,9 +598,17 @@ pub struct QueryResultStream {
 
 impl QueryResultStream {
     /// Constructs the Arrow projection over a raw protocol stream.
-    fn new(raw: RawQueryStream, request_id: RequestId) -> Self {
+    fn new(
+        raw: RawQueryStream,
+        request_id: RequestId,
+        client: QueryClient,
+        deadline_ms: i64,
+    ) -> Self {
         Self {
             request_id,
+            client,
+            deadline_ms,
+            settlement: StreamSettlement::Healthy,
             raw,
             schema: None,
             terminal: None,
@@ -615,6 +664,8 @@ impl QueryResultStream {
                         .validate_emitted_rows(self.emitted_rows)
                         .map_err(|error| ValaSdkError::Protocol(error.to_string()))?;
                     self.terminal = Some(terminal.clone());
+                    // A terminal is the server's own settlement. Nothing is owed.
+                    self.settlement = StreamSettlement::Settled;
                     if terminal.outcome == QueryTerminalOutcome::Failed {
                         return Err(ValaSdkError::FailedTerminal { terminal });
                     }
@@ -645,19 +696,20 @@ impl QueryResultStream {
         let mut batches = Vec::new();
         let mut rows = 0usize;
         loop {
-            let batch = self.next_batch().await?;
+            let batch = match self.next_batch().await {
+                Ok(batch) => batch,
+                Err(error) => return Err(self.settle_with(error).await),
+            };
             if self.encoded_bytes > limits.max_encoded_bytes {
-                return Err(ValaSdkError::ResultTooLarge);
+                return Err(self.settle_with(ValaSdkError::ResultTooLarge).await);
             }
             let Some(batch) = batch else {
                 break;
             };
-            let next_rows = rows
-                .checked_add(batch.num_rows())
-                .ok_or(ValaSdkError::ResultTooLarge)?;
-            if next_rows > limits.max_rows {
-                return Err(ValaSdkError::ResultTooLarge);
-            }
+            let next_rows = match rows.checked_add(batch.num_rows()) {
+                Some(next_rows) if next_rows <= limits.max_rows => next_rows,
+                _ => return Err(self.settle_with(ValaSdkError::ResultTooLarge).await),
+            };
             rows = next_rows;
             batches.push(batch);
         }
@@ -670,6 +722,129 @@ impl QueryResultStream {
             rows,
             encoded_bytes: self.encoded_bytes,
         })
+    }
+
+    /// Settles this stream because `error` ended it, and returns that error.
+    ///
+    /// The originating error is always what the caller sees: settlement is the
+    /// client's obligation to the server, not a second failure to report. A
+    /// decode or transport error also means the body can no longer be trusted,
+    /// so it downgrades settlement to the status-polling proof before running.
+    async fn settle_with(&mut self, error: ValaSdkError) -> ValaSdkError {
+        if matches!(
+            error,
+            ValaSdkError::Protocol(_)
+                | ValaSdkError::Arrow(_)
+                | ValaSdkError::Transport(_)
+                | ValaSdkError::IncompleteQueryStream
+        ) {
+            self.settlement = StreamSettlement::Broken;
+        }
+        self.settle().await;
+        error
+    }
+
+    /// Settles one incomplete stream exactly once.
+    ///
+    /// A stream that already reached its terminal returns immediately, and a
+    /// second call is a no-op, so cancellation is issued at most once per
+    /// query. A healthy body is drained to its real terminal, which is both the
+    /// cheapest proof of cleanup and the only one that keeps the connection
+    /// reusable. A broken body is never read again; the query's own status
+    /// route is polled instead until it reports the entry is gone.
+    ///
+    /// Every wait is bounded by the server-pinned deadline this stream was
+    /// opened with, so settlement can never outlive the query it settles. If
+    /// the deadline passes without proof, that is reported as scrubbed
+    /// telemetry rather than raised: the caller's own error is the one that
+    /// matters, and the server still owns its cleanup.
+    pub async fn settle(&mut self) {
+        let owed = std::mem::replace(&mut self.settlement, StreamSettlement::Settled);
+        match owed {
+            StreamSettlement::Settled => return,
+            StreamSettlement::Healthy | StreamSettlement::Broken => {}
+        }
+        let client = self.client.clone();
+        let request_id = self.request_id.clone();
+        let _ = client.cancel(&request_id).await;
+        if owed == StreamSettlement::Healthy && self.drain_to_terminal().await {
+            return;
+        }
+        Self::poll_until_retired(client, request_id, self.deadline_ms, self.remaining()).await;
+    }
+
+    /// Drains a healthy body to its terminal within the query deadline.
+    ///
+    /// Returns whether the terminal actually arrived. A drain that hits the
+    /// deadline or a late decode failure leaves the caller with no proof, so it
+    /// reports `false` and the status poll takes over.
+    async fn drain_to_terminal(&mut self) -> bool {
+        let drained = tokio::time::timeout(self.remaining(), async {
+            while let Ok(Some(_)) = self.next_batch().await {}
+            self.terminal.is_some()
+        })
+        .await;
+        drained.unwrap_or(false)
+    }
+
+    /// Polls one query's status until the server proves it is no longer running.
+    ///
+    /// It takes its owners by value rather than borrowing the stream, so the
+    /// returned future stays `Send` without requiring the stream itself to be
+    /// `Sync` — callers spawn settlement onto a multi-threaded runtime.
+    ///
+    /// Only the not-found projection is proof; every other outcome — still
+    /// running, unavailable, a transport failure — means the answer is not in
+    /// yet, so the poll simply waits out its fixed interval and asks again
+    /// until the deadline retires it.
+    async fn poll_until_retired(
+        client: QueryClient,
+        request_id: RequestId,
+        deadline_ms: i64,
+        remaining: std::time::Duration,
+    ) {
+        let proven = tokio::time::timeout(remaining, async {
+            loop {
+                if client
+                    .status(&request_id)
+                    .await
+                    .is_err_and(|error| error.code() == RUNNING_QUERY_RETIRED_CODE)
+                {
+                    return;
+                }
+                tokio::time::sleep(SETTLEMENT_POLL_INTERVAL).await;
+            }
+        })
+        .await;
+        if proven.is_err() {
+            tracing::warn!(
+                request_id = %request_id,
+                deadline_ms,
+                "Oracle query settlement remains unconfirmed at its deadline"
+            );
+        }
+    }
+
+    /// Returns the time left before this query's server-pinned deadline.
+    ///
+    /// A deadline that has already passed yields zero rather than a negative
+    /// duration, which makes every bounded settlement wait resolve immediately
+    /// instead of panicking on the conversion.
+    fn remaining(&self) -> std::time::Duration {
+        let now = std::time::SystemTime::UNIX_EPOCH
+            .elapsed()
+            .map_or(i64::MAX, |since| {
+                i64::try_from(since.as_millis()).unwrap_or(i64::MAX)
+            });
+        u64::try_from(self.deadline_ms - now).map_or(std::time::Duration::ZERO, |remaining| {
+            std::time::Duration::from_millis(remaining)
+        })
+    }
+
+    /// Returns this stream's server-pinned absolute deadline in epoch milliseconds.
+    #[must_use]
+    pub const fn deadline_ms(&self) -> i64 {
+        self.deadline_ms
     }
 
     /// Returns terminal metadata only after validated completion or failure.
@@ -930,7 +1105,7 @@ impl QueryIpcDecoder {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::task::{Context, Poll};
 
     use arrow::array::Int64Array;
@@ -950,6 +1125,240 @@ mod tests {
     use wyrd_tonic::wyrd::v1 as proto;
 
     use super::*;
+
+    /// Counts the lifecycle calls one settling stream makes against a server.
+    #[derive(Debug, Default)]
+    struct LifecycleCounts {
+        /// Cancellation requests received on the query's own route.
+        cancels: AtomicUsize,
+        /// Status polls received on the query's own route.
+        statuses: AtomicUsize,
+    }
+
+    /// Serves the two lifecycle routes settlement uses, counting every call.
+    ///
+    /// The status route always reports the query is gone, which is the proof a
+    /// broken stream polls for. Each connection is answered once and closed, so
+    /// the counters record exactly how many requests the client actually made.
+    fn lifecycle_server(counts: Arc<LifecycleCounts>) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("test listener binds");
+        let address = listener.local_addr().expect("listener has an address");
+        listener
+            .set_nonblocking(true)
+            .expect("listener converts to tokio");
+        let listener = TcpListener::from_std(listener).expect("listener adopts the runtime");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let counts = Arc::clone(&counts);
+                tokio::spawn(async move {
+                    let mut request = [0_u8; 2048];
+                    let Ok(read) = socket.read(&mut request).await else {
+                        return;
+                    };
+                    let request = String::from_utf8_lossy(&request[..read]).to_string();
+                    let response = if request.starts_with("POST /auth/token") {
+                        // The client exchanges its API key before any lifecycle
+                        // route; a far-future expiry keeps one exchange enough.
+                        let body = format!(
+                            "{{\"access_token\":\"test-token\",\"token_type\":\"Bearer\",\"expires_at\":\"{}\"}}",
+                            "2099-01-01T00:00:00Z"
+                        );
+                        format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                    } else if request.starts_with("DELETE ") {
+                        counts.cancels.fetch_add(1, Ordering::AcqRel);
+                        let body = "{\"cancellation_requested\":true}";
+                        format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                    } else {
+                        counts.statuses.fetch_add(1, Ordering::AcqRel);
+                        let body = "{\"code\":\"WYRD_VALA_404_RUNNING_QUERY_NOT_FOUND\",\"detail\":\"gone\"}";
+                        format!(
+                            "HTTP/1.1 404 Not Found\r\ncontent-type: application/problem+json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                    };
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        format!("http://{address}")
+    }
+
+    /// Builds a stream bound to a live lifecycle server with a live deadline.
+    fn settling_stream(
+        chunks: Vec<Vec<u8>>,
+        base_url: &str,
+        deadline_ms: i64,
+    ) -> QueryResultStream {
+        let body = stream::iter(chunks.into_iter().map(|chunk| Ok(Bytes::from(chunk))));
+        QueryResultStream::new(
+            RawQueryStream::new(body, VisibilityMode::PublishedOnly),
+            RequestId::now_v7(),
+            client_for(base_url),
+            deadline_ms,
+        )
+    }
+
+    /// Returns an absolute epoch-millisecond deadline `millis` from now.
+    fn deadline_in(millis: i64) -> i64 {
+        let now = i64::try_from(
+            std::time::SystemTime::UNIX_EPOCH
+                .elapsed()
+                .expect("the test clock is after the epoch")
+                .as_millis(),
+        )
+        .expect("the epoch millisecond fits an i64");
+        now + millis
+    }
+
+    /// Every incomplete exit settles the server exactly once, under the deadline.
+    ///
+    /// The five exits a caller can actually take are covered together because
+    /// the contract they share is a single one: whatever ends the stream, the
+    /// server learns about it once, the caller keeps its own error, and nothing
+    /// waits past the deadline the server pinned.
+    #[tokio::test]
+    async fn query_result_stream_settles_every_incomplete_exit_once() {
+        let schema = test_schema();
+        let (mut ipc, prefix) = TestQueryIpc::open(&schema);
+        let batch = ipc.batch(&schema, &[1, 2, 3]);
+        let eos = ipc.close();
+        let complete = vec![
+            encoded(QueryStreamFrame::Schema(QuerySchemaFrame {
+                schema_fingerprint: String::new(),
+                arrow_ipc_schema: prefix.clone(),
+            })),
+            encoded(QueryStreamFrame::Batch(QueryBatchFrame {
+                arrow_ipc_batch: batch.clone(),
+            })),
+            encoded(QueryStreamFrame::Terminal(success_terminal(
+                VisibilityMode::PublishedOnly,
+                3,
+                eos,
+            ))),
+        ];
+
+        // A stream that reached its terminal owes the server nothing.
+        let counts = Arc::new(LifecycleCounts::default());
+        let base_url = lifecycle_server(Arc::clone(&counts));
+        let mut settled = settling_stream(complete.clone(), &base_url, deadline_in(30_000));
+        while settled
+            .next_batch()
+            .await
+            .expect("complete stream decodes")
+            .is_some()
+        {}
+        settled.settle().await;
+        assert_eq!(
+            counts.cancels.load(Ordering::Acquire),
+            0,
+            "a terminal is the server's own settlement"
+        );
+
+        // A healthy stream abandoned early cancels once and drains its body.
+        let counts = Arc::new(LifecycleCounts::default());
+        let base_url = lifecycle_server(Arc::clone(&counts));
+        let mut healthy = settling_stream(complete, &base_url, deadline_in(30_000));
+        healthy.next_batch().await.expect("first batch decodes");
+        healthy.settle().await;
+        healthy.settle().await;
+        assert_eq!(
+            counts.cancels.load(Ordering::Acquire),
+            1,
+            "settlement cancels at most once across repeated calls"
+        );
+        assert!(
+            healthy.terminal().is_some(),
+            "a healthy body is drained to its real terminal"
+        );
+        assert_eq!(
+            counts.statuses.load(Ordering::Acquire),
+            0,
+            "a drained terminal needs no status proof"
+        );
+
+        // A bounded-result overflow settles before the caller sees the error.
+        let (mut ipc, prefix) = TestQueryIpc::open(&schema);
+        let wide = ipc.batch(&schema, &[1, 2, 3, 4, 5]);
+        let eos = ipc.close();
+        let counts = Arc::new(LifecycleCounts::default());
+        let base_url = lifecycle_server(Arc::clone(&counts));
+        let overflow = settling_stream(
+            vec![
+                encoded(QueryStreamFrame::Schema(QuerySchemaFrame {
+                    schema_fingerprint: String::new(),
+                    arrow_ipc_schema: prefix,
+                })),
+                encoded(QueryStreamFrame::Batch(QueryBatchFrame {
+                    arrow_ipc_batch: wide,
+                })),
+                encoded(QueryStreamFrame::Terminal(success_terminal(
+                    VisibilityMode::PublishedOnly,
+                    5,
+                    eos,
+                ))),
+            ],
+            &base_url,
+            deadline_in(30_000),
+        );
+        let error = overflow
+            .collect_bounded(CollectedQueryLimits {
+                max_rows: 1,
+                max_encoded_bytes: usize::MAX,
+            })
+            .await
+            .expect_err("the row ceiling refuses this result");
+        assert!(matches!(error, ValaSdkError::ResultTooLarge));
+        assert_eq!(
+            counts.cancels.load(Ordering::Acquire),
+            1,
+            "an overflow exit settles the server once"
+        );
+
+        // A protocol failure keeps its own error and proves cleanup by status.
+        let counts = Arc::new(LifecycleCounts::default());
+        let base_url = lifecycle_server(Arc::clone(&counts));
+        let broken = settling_stream(
+            vec![encoded(QueryStreamFrame::Batch(QueryBatchFrame {
+                arrow_ipc_batch: vec![0xff, 0xff, 0xff, 0xff],
+            }))],
+            &base_url,
+            deadline_in(30_000),
+        );
+        let error = broken
+            .collect_bounded(CollectedQueryLimits {
+                max_rows: usize::MAX,
+                max_encoded_bytes: usize::MAX,
+            })
+            .await
+            .expect_err("an undecodable batch fails");
+        assert!(
+            matches!(error, ValaSdkError::Protocol(_) | ValaSdkError::Arrow(_)),
+            "settlement never replaces the originating error: {error:?}"
+        );
+        assert_eq!(counts.cancels.load(Ordering::Acquire), 1);
+        assert!(
+            counts.statuses.load(Ordering::Acquire) >= 1,
+            "a broken body is proven retired by status, never by reading it again"
+        );
+
+        // A deadline already in the past bounds settlement to no waiting at all.
+        let counts = Arc::new(LifecycleCounts::default());
+        let base_url = lifecycle_server(Arc::clone(&counts));
+        let mut expired = settling_stream(Vec::new(), &base_url, deadline_in(-1));
+        expired.settlement = StreamSettlement::Broken;
+        tokio::time::timeout(std::time::Duration::from_secs(5), expired.settle())
+            .await
+            .expect("an expired deadline settles without waiting");
+    }
 
     /// Proves an HTTP body failure remains a structured transport error.
     #[tokio::test]
@@ -1263,7 +1672,35 @@ mod tests {
     /// Builds a result stream over arbitrary already-encoded response chunks.
     fn result_stream(chunks: Vec<Vec<u8>>, visibility: VisibilityMode) -> QueryResultStream {
         let body = stream::iter(chunks.into_iter().map(|chunk| Ok(Bytes::from(chunk))));
-        QueryResultStream::new(RawQueryStream::new(body, visibility), RequestId::now_v7())
+        QueryResultStream::new(
+            RawQueryStream::new(body, visibility),
+            RequestId::now_v7(),
+            offline_client(),
+            0,
+        )
+    }
+
+    /// Builds a query client whose lifecycle routes are guaranteed unreachable.
+    ///
+    /// Tests that only exercise decoding never settle against a server, so the
+    /// client they carry must be inert rather than absent: the stream's own
+    /// contract is that it always holds one.
+    fn offline_client() -> QueryClient {
+        client_for("http://127.0.0.1:1")
+    }
+
+    /// Builds a query client bound to one base URL with a static credential.
+    fn client_for(base_url: &str) -> QueryClient {
+        let config = wyrd_client::config::ClientConfig {
+            api_key: Some(secrecy::SecretString::from("test-key")),
+            http: wyrd_client::transport::config::HttpConfig {
+                base_url: base_url.to_owned(),
+                timeout_ms: 2_000,
+                ..wyrd_client::transport::config::HttpConfig::default()
+            },
+            ..wyrd_client::config::ClientConfig::default()
+        };
+        QueryClient::new(&WyrdClient::with_config(config).expect("static config builds a client"))
     }
 
     /// The converter rejects a second schema before any terminal can be accepted.
@@ -1764,6 +2201,8 @@ mod tests {
         let result = QueryResultStream::new(
             RawQueryStream::new(body, VisibilityMode::PublishedOnly),
             request_id.clone(),
+            offline_client(),
+            0,
         );
         assert_eq!(result.request_id(), &request_id);
 

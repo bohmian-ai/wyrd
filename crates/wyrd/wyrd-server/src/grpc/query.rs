@@ -231,6 +231,7 @@ fn insert_request_id<T>(response: &mut Response<T>, request_id: &RequestId) {
 /// Converts one Oracle logical stream to the canonical gRPC frame transport.
 pub(crate) fn query_stream_response(result: OracleQueryStream) -> Response<QueryGrpcStream> {
     let schema_fingerprint = result.schema_fingerprint.clone();
+    let deadline_ms = result.deadline_ms;
     let output = QueryGrpcStreamOwner {
         query: Some(result),
     };
@@ -239,6 +240,11 @@ pub(crate) fn query_stream_response(result: OracleQueryStream) -> Response<Query
         response
             .metadata_mut()
             .insert("x-wyrd-schema-fingerprint", value);
+    }
+    if let Ok(value) = deadline_ms.to_string().parse() {
+        response
+            .metadata_mut()
+            .insert("x-wyrd-query-deadline-ms", value);
     }
     response
 }

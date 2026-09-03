@@ -19,6 +19,12 @@ use super::*;
 pub struct OracleQueryStream {
     /// Stable fingerprint known before the first transport byte is emitted.
     pub schema_fingerprint: String,
+    /// This query's absolute deadline as a nonnegative Unix epoch millisecond.
+    ///
+    /// Every transport projects this unchanged so an external settlement owner
+    /// can bound its own drain and status polling by the same instant the
+    /// server enforces, instead of inventing a client-side timeout.
+    pub deadline_ms: i64,
     /// Underlying frame stream.
     pub frames: std::pin::Pin<Box<OracleFrameStream>>,
     /// Cancellation signal used by the stream owner to force awaited cleanup.
@@ -194,6 +200,8 @@ pub(super) struct QueryStreamInput {
     pub(super) admitted: AdmittedQueryGuard,
     /// Absolute execution deadline.
     pub(super) deadline: Instant,
+    /// The same deadline as a nonnegative Unix epoch millisecond, for transports.
+    pub(super) deadline_ms: i64,
     /// Requested visibility contract.
     pub(super) visibility: VisibilityMode,
     /// Public freshness policy applied only after aggregate disposition selection.
@@ -1367,11 +1375,13 @@ impl OracleQueryStream {
     #[must_use]
     pub fn from_forwarded(
         schema_fingerprint: String,
+        deadline_ms: i64,
         frames: std::pin::Pin<Box<super::OracleFrameStream>>,
         cancellation: CancellationToken,
     ) -> Self {
         Self::assemble(
             schema_fingerprint,
+            deadline_ms,
             frames,
             cancellation,
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1391,12 +1401,25 @@ impl OracleQueryStream {
     ) -> Self {
         Self {
             schema_fingerprint,
+            deadline_ms: 0,
             frames,
             cancellation,
             telemetry_cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(feature = "test-support")]
             resource_probe: None,
         }
+    }
+
+    /// Overrides a synthetic stream's projected deadline.
+    ///
+    /// Only [`Self::test_new`] streams need this: they have no participant cut
+    /// to read a real deadline from, and a transport test that asserts the
+    /// projected header still needs one exact value to assert against.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn with_deadline_ms(mut self, deadline_ms: i64) -> Self {
+        self.deadline_ms = deadline_ms;
+        self
     }
 
     /// Builds a test stream through the production telemetry and admission owners.
@@ -1418,6 +1441,7 @@ impl OracleQueryStream {
             first: None,
             admitted,
             deadline: Instant::now() + Duration::from_secs(1),
+            deadline_ms: 0,
             visibility: VisibilityMode::PublishedOnly,
             freshness_policy: wyrd_spec::vala::api::FreshnessPolicy::Strict,
             degraded_sources: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -1446,6 +1470,7 @@ impl OracleQueryStream {
             first,
             admitted,
             deadline,
+            deadline_ms,
             visibility,
             freshness_policy,
             degraded_sources,
@@ -1488,6 +1513,7 @@ impl OracleQueryStream {
         });
         let stream = Self::assemble(
             schema_fingerprint,
+            deadline_ms,
             frames,
             cancellation,
             telemetry_cancelled,
@@ -1500,12 +1526,14 @@ impl OracleQueryStream {
     /// Assemble the stream owner from its schema, frame source, and cancellation edge.
     fn assemble(
         schema_fingerprint: String,
+        deadline_ms: i64,
         frames: std::pin::Pin<Box<super::OracleFrameStream>>,
         cancellation: CancellationToken,
         telemetry_cancelled: Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         Self {
             schema_fingerprint,
+            deadline_ms,
             frames,
             cancellation,
             telemetry_cancelled,
@@ -2083,6 +2111,7 @@ mod tests {
             first: None,
             admitted,
             deadline: Instant::now() + Duration::from_secs(1),
+            deadline_ms: 0,
             visibility: VisibilityMode::PublishedOnly,
             freshness_policy: FreshnessPolicy::Strict,
             degraded_sources: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -2124,6 +2153,7 @@ mod tests {
             first: None,
             admitted,
             deadline: Instant::now() + Duration::from_secs(1),
+            deadline_ms: 0,
             visibility: VisibilityMode::PublishedOnly,
             freshness_policy: FreshnessPolicy::Strict,
             degraded_sources: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -2165,6 +2195,7 @@ mod tests {
             first: None,
             admitted,
             deadline: Instant::now() + Duration::from_secs(1),
+            deadline_ms: 0,
             visibility: VisibilityMode::PublishedOnly,
             freshness_policy: FreshnessPolicy::Strict,
             degraded_sources: Arc::new(std::sync::Mutex::new(Vec::new())),

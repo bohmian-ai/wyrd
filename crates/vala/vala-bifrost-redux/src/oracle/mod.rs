@@ -3163,6 +3163,7 @@ impl Oracle {
             AttemptOutput::new(execution, admitted, running_query),
             AttemptSettlement {
                 deadline,
+                deadline_ms: participant_cut.deadline().timestamp_millis().max(0),
                 retry_ordinal,
                 stale_replacement: StaleReplacementGate::before_output(retry_ordinal),
                 visibility: request.visibility,
@@ -3635,6 +3636,7 @@ impl Oracle {
             first,
             admitted,
             deadline: options.deadline,
+            deadline_ms: absolute_deadline_ms(options.deadline),
             visibility: options.visibility,
             freshness_policy: wyrd_spec::vala::api::FreshnessPolicy::Strict,
             degraded_sources: Arc::new(std::sync::Mutex::new(if drained.degraded {
@@ -5231,6 +5233,8 @@ impl AttemptOutput {
 struct AttemptSettlement {
     /// Absolute whole-query deadline shared across retry attempts.
     deadline: Instant,
+    /// The pinned cut's deadline as a nonnegative Unix epoch millisecond.
+    deadline_ms: i64,
     /// Zero-based stale-replan attempt ordinal.
     retry_ordinal: u8,
     /// Gate deciding whether a typed stale first batch may be replanned.
@@ -5274,6 +5278,7 @@ async fn settle_attempt_output(
     } = output;
     let AttemptSettlement {
         deadline,
+        deadline_ms,
         retry_ordinal,
         stale_replacement,
         visibility,
@@ -5344,6 +5349,7 @@ async fn settle_attempt_output(
         first,
         admitted,
         deadline,
+        deadline_ms,
         visibility,
         freshness_policy: freshness,
         degraded_sources,
@@ -5355,6 +5361,20 @@ async fn settle_attempt_output(
         gate_lifecycle: None,
         running_query: Some(running_query),
     })))
+}
+
+/// Projects a monotonic execution deadline as a nonnegative Unix epoch millisecond.
+///
+/// The typed-plan path carries no participant cut, so it has no pinned wall-clock
+/// deadline to read. Converting the monotonic instant names the same point in
+/// time the server already enforces rather than inventing a second budget. A
+/// deadline that has already passed yields the current time, never a negative
+/// millisecond, because the wire contract is nonnegative.
+fn absolute_deadline_ms(deadline: Instant) -> i64 {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let remaining =
+        chrono::Duration::from_std(remaining).unwrap_or_else(|_| chrono::Duration::zero());
+    (chrono::Utc::now() + remaining).timestamp_millis().max(0)
 }
 
 /// Records an unavailable live tail as a degraded partition on the shared list.

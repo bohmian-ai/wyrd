@@ -64,7 +64,9 @@ Required execution skill: `$wyrd-implement`.
 
 - `crates/wyrd/wyrd-server/src/mcp/{mod.rs,bifrost.rs}`: register exactly
   `bifrost.list_tables`, `bifrost.describe_table`, and `bifrost.query` on the
-  Task 05-pre handler. Keep MCP request/result types local to this adapter.
+  Task 05-pre handler's normal catalog. The predecessor's default-off
+  connectivity probe is never registered by ordinary server startup. Keep MCP
+  request/result types local to this adapter.
 - `crates/wyrd/wyrd-server/src/bifrost/service.rs`: existing authenticated
   `list_tables(&AppState, Caller)` and `describe_table(&AppState, Caller, ...)`
   remain the discovery owners; no behavior change is expected.
@@ -107,9 +109,11 @@ AC-008, AC-009. Revision 5 discovery contract and both journey discovery
 steps.
 
 **RED.** Add ignored journey
-`discovery::pg_tests::agent_discovers_only_authorized_tables_and_layout`. Connect a real
-authenticated rmcp client and assert `tools/list` exposes exactly the three
-`bifrost.*` names. Seed two tenants. Assert `bifrost.list_tables` returns only
+`discovery::pg_tests::agent_discovers_only_authorized_tables_and_layout`. Start
+an ordinary bound `WyrdTestServer` without the predecessor's probe opt-in,
+connect a real authenticated rmcp client, and assert `tools/list` exposes
+exactly the three `bifrost.*` names and no context probe. Seed two tenants.
+Assert `bifrost.list_tables` returns only
 the caller's authorized compact `namespace`, `name`, and `status` values.
 Assert `bifrost.describe_table` returns the selected table's schema, every
 field's metadata, event-time partition granularity, ordered sort keys, and
@@ -279,7 +283,9 @@ already exposes the required schema and physical layout.
 ## Cross-scenario decisions and authority
 
 - Tool names are exactly `bifrost.list_tables`, `bifrost.describe_table`, and
-  `bifrost.query`; all are read-only.
+  `bifrost.query`; all are read-only. Ordinary `WyrdTestServer` and production
+  startup expose that same three-tool catalog; only the predecessor's explicit
+  connectivity-fixture opt-in may add its test probe.
 - `bifrost.query` returns one final `{columns, rows, terminal}` value only.
   Columns occur once as ordered `{name, data_type, nullable}` entries and rows
   are positional arrays using Arrow's existing JSON value semantics.
@@ -312,6 +318,12 @@ Client model, MCP; `architecture/wyrd-doctrine.mdx`;
 and `AGENTS.md` §§2, 3, 9, 11.
 
 ## Broader verification
+
+Do not run any lane in this section during scenario implementation. Complete
+each Red–Green–Refactor cycle with only its exact named command, and proceed
+only after that focused test passes. After every required focused command in
+this task passes, run the broader lanes below once as final consolidation; do
+not restart the full set after each edit.
 
 ```bash
 mise run fmt

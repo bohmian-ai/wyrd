@@ -315,6 +315,17 @@ impl ReadyOracleForwarder {
             .filter(|value| !value.is_empty())
             .ok_or(BifrostError::QueryPeerSecurity)?
             .to_owned();
+        // A forwarded stream projects the executing Oracle's own deadline. A
+        // missing or unparsable value is a protocol failure rather than a
+        // locally invented budget, because the remote leader is the only owner
+        // that knows when this query stops.
+        let deadline_ms = response
+            .metadata()
+            .get("x-wyrd-query-deadline-ms")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<i64>().ok())
+            .filter(|deadline| *deadline >= 0)
+            .ok_or(BifrostError::QueryPeerSecurity)?;
         let mut wire = response.into_inner();
         let frames = async_stream::stream! {
             let mut converter = QueryStreamConverter::new(visibility);
@@ -359,6 +370,7 @@ impl ReadyOracleForwarder {
         };
         Ok(OracleQueryStream::from_forwarded(
             schema_fingerprint,
+            deadline_ms,
             Box::pin(frames),
             tokio_util::sync::CancellationToken::new(),
         ))

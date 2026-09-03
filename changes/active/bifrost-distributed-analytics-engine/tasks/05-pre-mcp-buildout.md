@@ -74,6 +74,10 @@ Required execution skill: `$wyrd-implement`.
   `tokio_util::task::TaskTracker` for MCP in-flight work on `AppState`, close it
   after transport admission stops, and await it within the existing server
   shutdown deadline. Do not add a custom counter or another deadline.
+- `crates/wyrd/wyrd-testing/src/server.rs`: add one default-false
+  `WyrdTestServerBuilder::with_mcp_context_probe_for_test()` control that opts
+  only connectivity journeys into the test-support context probe. Ordinary
+  `WyrdTestServer::{start_in_process,start_bound}` startup never registers it.
 - `crates/wyrd/wyrd-server/src/components/auth/{principal_extractor.rs,token_extract.rs}`:
   change `AuthenticatedPrincipal` to retain the existing
   `Arc<wyrd_auth_verify::VerifiedToken>`, expose narrow `principal()` and
@@ -121,8 +125,11 @@ and lifecycle obligations.
 an official `StreamableHttpClientTransport` to the production `/mcp` route,
 initialize, list tools, invoke one test-only capability, cancel its pending
 call, and close the client. The capability reports only trusted test evidence
-for tenant, principal, delegation, roles, request ID, and cancellation; it is
-compiled only under the server's existing test-support feature.
+for tenant, principal, delegation, roles, request ID, and cancellation. Start
+the server through
+`WyrdTestServer::builder().with_mcp_context_probe_for_test().start_bound()` and
+assert the probe is present only for that opted-in fixture; compiling
+`test-support` alone does not register it.
 
 ```bash
 scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-mcp --test mcp -P journey -E 'test(=connectivity::pg_tests::streamable_http_client_reaches_authenticated_server_context)' --run-ignored=all"
@@ -194,8 +201,10 @@ invent a Wyrd MCP client facade.
 AC-008, AC-009. Revision 5 rejection and cleanup obligations.
 
 **RED.** Add ignored journey
-`connectivity::pg_tests::mcp_rejects_credentials_and_joins_request_and_process_cancellation`. Through a real
-`reqwest` client, prove missing and malformed/invalid credentials are rejected
+`connectivity::pg_tests::mcp_rejects_credentials_and_joins_request_and_process_cancellation`.
+Start its bound server with the same explicit
+`with_mcp_context_probe_for_test()` opt-in. Through a real `reqwest` client,
+prove missing and malformed/invalid credentials are rejected
 by the production `/mcp` edge with the canonical HTTP status and Wyrd problem
 fields. Use the official rmcp client only after protocol admission: prove a
 valid under-scoped principal is rejected and an allowed principal can invoke
@@ -222,7 +231,8 @@ scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner &&
 **GREEN.** Reuse the existing verifier, request-ID handling, authorization,
 tenant derivation, principal Card scope, delegation, and audit context. One
 `#[cfg(feature = "test-support")]` context-probe tool owned by
-`wyrd-server::mcp` derives `Caller`, then calls
+`wyrd-server::mcp` is registered only when the test builder's explicit probe
+control is true. It derives `Caller`, then calls
 `query::service::authorize_audited` with
 `Permission::bifrost_query_read()`, operation `wyrd.mcp.test.context`, and
 resource `mcp.test.context` before returning any trusted context. Its pending
@@ -239,13 +249,17 @@ clean drain. At the adapter edge translate public derive-backed
 principal, delegation, roles, or execution path as tool input.
 
 **REFACTOR.** Delete any duplicated auth parsing or context construction. The
-test-only capability remains unavailable in production builds and is not a
-general extension point.
+test-only capability remains unavailable in production builds, absent from
+ordinary `WyrdTestServer` MCP startup, and is not a general extension point.
 
 ## Cross-scenario decisions and authority
 
 - There is exactly one `/mcp` endpoint and one public listener. The same route
 serves local and remote clients.
+- The normal handler catalog contains only production tools: none in this
+  predecessor and exactly the three Bifrost tools after Task 05. The context
+  probe is a default-off connectivity-fixture option and never joins the
+  ordinary catalog.
 - `rmcp` owns the protocol. Wyrd owns identity, authorization, tenancy, audit,
 and public Wyrd errors at the adapter boundary.
 - `StreamableHttpServerConfig::cancellation_token` is the existing
@@ -275,6 +289,12 @@ surfaces; `architecture/wyrd-doctrine.mdx`; `architecture/wyrd-security-posture.
 and `AGENTS.md` §§2, 3, 9, 11.
 
 ## Broader verification
+
+Do not run any lane in this section during scenario implementation. Complete
+each Red–Green–Refactor cycle with only its exact named command, and proceed
+only after that focused test passes. After every required focused command in
+this task passes, run the broader lanes below once as final consolidation; do
+not restart the full set after each edit.
 
 ```bash
 mise run fmt

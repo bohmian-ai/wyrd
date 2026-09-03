@@ -575,3 +575,92 @@ frozen resolver inputs without registering a graph or issuing peer IO. Do not
 respond by extending `validate_supported`, using `plan_distributed_split`,
 capturing an internal plan with a custom `QueryPlanner`, or falling back after
 resource transfer.
+
+## Execution evidence
+
+### Scenario 1 — retained, GREEN
+
+`b1634b93b` already ships one typed terminal path with no request selector.
+Re-verified: `mise exec -- cargo nextest run --locked -p wyrd-spec --lib -E
+'test(=vala::api::tests::query_terminal_projects_path_without_request_selector)'`.
+
+### Scenario 2 — mechanism GREEN, ordering BLOCKED
+
+Implemented on the local session in `oracle/mod.rs`:
+`select_analytical` builds one locally executable physical plan, applies
+Task 2's unchanged `splitter::validate_supported`, rebuilds only supported
+candidates through `analytical::planning_session` (pinned
+`with_distributed_planner()`, no channel resolver, no supervisor mutation, no
+peer IO), and selects Analytical only when `exec::is_distributed_plan` holds.
+Resource transfer, graph registration, participant reservation and publication
+all move after selection. `analytical::lease_session` now returns the envelope
+to its permit via the new `admission::restore_query_resources` when graph
+registration refuses. `execute_analytical_session` and
+`lease_analytical_session` are removed. Outcomes are counted on
+`oracle_query_analytical_selection_total{outcome}`.
+
+New journey
+`crates/wyrd/wyrd-testing/tests/bifrost/oracle/analytical_activation.rs::analytical_selection_requires_supported_physical_exchange`
+(four-node `three_oracles_one_scribe`) passes for: non-candidate → Interactive;
+supported candidate with an armed planner failure → Interactive with the flag
+consumed; no-exchange candidate → Interactive with the exact local result;
+grouped aggregate → Analytical; the same via `query_sql_with_participant_cut`
+→ Analytical. Each case settles to zero retained ownership.
+`Summary [ 4.919s] 1 test run: 1 passed, 17 skipped`.
+
+### TASK_REVISION_REQUIRED — the mandated pre-distribution predicate rejects
+### plans the pinned planner can distribute
+
+`mise run test:bifrost:journey:oracle` regresses two journeys that pass on
+`5d3cc09f7`:
+
+- `capacity::lowest_rung_analytical_contention_preserves_two_interactive_tenants`
+- `peer_network::analytical::inactive_baseline_executes_join_group_spill_and_interchangeable_topology`
+
+Server evidence for the first:
+
+```
+oracle_query_analytical_selection_total{outcome="unsupported"} = 1
+Error during planning: unsupported distributed Oracle plan:
+  aggregate mode outside Partial/PartialReduce/Final/FinalPartitioned
+Oracle query released after failure phase="execution rejection"
+  error=QueryExecutionFailed
+```
+
+Two independent gaps, both structural:
+
+1. **Domain mismatch.** `validate_supported` was written for post-distribution
+   plans. `splitter.rs:686-706` accepts only `Partial`, `PartialReduce`,
+   `Final`, and `FinalPartitioned`, and its own comment states "every
+   distributed aggregate carries a `Partial` layer". A locally executable plan
+   carries `AggregateMode::Single`/`SinglePartitioned`, so the task's required
+   order — validate the local plan with the unchanged predicate before the
+   pinned build — refuses candidates the pinned planner distributes correctly
+   today. The task forbids extending `validate_supported`, so this cannot be
+   resolved inside the task.
+2. **The unsupported fallback is unreachable.** The task requires an
+   unsupported candidate to "return an Interactive terminal and the exact local
+   result". It cannot:
+   - `codec.rs::RemoteSourcePlaceholderExec::execute` delegates to an
+     `EmptyExec`, and `exec.rs::OracleTableProvider::scan` emits that
+     placeholder on every node that owns a `fragment_dispatcher`. Streaming the
+     retained plan silently returns zero rows.
+   - Falling through to the existing Interactive path re-enters
+     `splitter::split_physical_plan_with_context`, which calls the same
+     `validate_supported` and refuses again — confirmed above.
+   - Remote `ScribeFollowerSource` rows are not readable locally, so any
+     genuinely local rebuild silently drops the live tail under live-inclusive
+     visibility.
+
+Two materially different reachable designs:
+
+- **A — second, non-distributed provider registration.** Register a local-only
+  provider set, rebuild a third physical plan, and execute it as Interactive.
+  Adds a second provider-registration owner, a third physical build, retained
+  cuts, and requires an unstated live-tail visibility restriction.
+- **B — leaf-only Interactive split.** Keep unsupported operators on the leader
+  and distribute only the leaf scans. Correct and cheap, but modifies Task 2's
+  splitter, which this task forbids.
+
+Both alter ownership and test topology, so the choice is not an implementer
+decision. Scenarios 3-6 are not started pending it.

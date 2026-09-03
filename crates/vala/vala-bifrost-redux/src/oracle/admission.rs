@@ -1253,6 +1253,26 @@ impl AdmittedQueryGuard {
             .and_then(|mut resources| resources.take())
     }
 
+    /// Returns a taken envelope to the same permit it was taken from.
+    ///
+    /// Only the graph-registration refusal uses this: registration hands the
+    /// envelope back instead of consuming it, and the guard is still the
+    /// query's owner at that point, so putting it back is what lets the
+    /// ordinary terminal release return the grant. A permit that is already
+    /// holding an envelope, or that is gone, drops the returned one rather
+    /// than overwriting a live owner.
+    pub(super) fn restore_query_resources(
+        &mut self,
+        resources: crate::resources::OracleQueryResources,
+    ) {
+        if let Some(permit) = self.local_permit.as_ref()
+            && let Ok(mut held) = permit.resources.lock()
+            && held.is_none()
+        {
+            *held = Some(resources);
+        }
+    }
+
     /// Records that result data left this query, fencing any later retry.
     ///
     /// A retry is only sound while nothing has been handed to the client. The

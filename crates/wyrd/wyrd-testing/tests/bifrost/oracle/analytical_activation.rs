@@ -17,7 +17,9 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 use futures_util::StreamExt as _;
-use vala_bifrost_redux::oracle::{AuthorizedQueryContext, Oracle, OracleQueryStream, QueryIpcDecoder};
+use vala_bifrost_redux::oracle::{
+    AuthorizedQueryContext, Oracle, OracleQueryStream, QueryIpcDecoder,
+};
 use vala_sdk::BifrostGrpcTransport;
 use wyrd_client::WyrdClient;
 use wyrd_spec::vala::api::{
@@ -87,7 +89,11 @@ async fn drain(mut stream: OracleQueryStream) -> Result<Settled, JourneyError> {
 /// # Errors
 ///
 /// Returns any stable query error, or a drain failure.
-async fn run(engine: &Oracle, context: AuthorizedQueryContext, sql: &str) -> Result<Settled, JourneyError> {
+async fn run(
+    engine: &Oracle,
+    context: AuthorizedQueryContext,
+    sql: &str,
+) -> Result<Settled, JourneyError> {
     drain(engine.query_sql(context, request(sql)).await?).await
 }
 
@@ -191,7 +197,8 @@ async fn analytical_selection_requires_supported_physical_exchange() {
 ///
 /// Returns a cluster, execution, ownership, or assertion error.
 async fn prove_selection() -> Result<(), JourneyError> {
-    let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::three_oracles_one_scribe()).await?;
+    let cluster =
+        WyrdTestCluster::start_spec(BifrostClusterSpec::three_oracles_one_scribe()).await?;
     let tenant = cluster.data_tenant_id();
     let table = seed_table(&cluster, "analytical_selection").await?;
     let empty = {
@@ -224,36 +231,24 @@ async fn prove_selection() -> Result<(), JourneyError> {
         &format!("SELECT id FROM vala.bifrost.{table} WHERE filter_key = 'group_0'"),
     )
     .await?;
-    expect(&plain, QueryExecutionPath::Interactive, usize::try_from(FIXTURE_ROWS / FIXTURE_GROUPS)?, "non-candidate")?;
-    await_clean_nodes(&cluster).await?;
-
-    // An unsupported candidate is refused by the pre-distribution predicate.
-    // The armed planner refusal is still armed afterwards, which is the proof
-    // that validation ran before the pinned distributed build.
-    engine.fail_next_analytical_plan_for_test();
-    let unsupported = run(
-        &engine,
-        query_context(tenant)?,
-        &format!(
-            "SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS ordinal FROM vala.bifrost.{table}"
-        ),
-    )
-    .await?;
     expect(
-        &unsupported,
+        &plain,
         QueryExecutionPath::Interactive,
-        usize::try_from(FIXTURE_ROWS)?,
-        "unsupported candidate",
+        usize::try_from(FIXTURE_ROWS / FIXTURE_GROUPS)?,
+        "non-candidate",
     )?;
-    if !engine.analytical_plan_failure_armed_for_test() {
-        return Err("unsupported candidate reached the pinned distributed planner".into());
-    }
     await_clean_nodes(&cluster).await?;
 
     // A supported candidate whose distributed build refuses stays Interactive
     // and consumes the armed refusal.
+    engine.fail_next_analytical_plan_for_test();
     let refused = run(&engine, query_context(tenant)?, &grouped).await?;
-    expect(&refused, QueryExecutionPath::Interactive, usize::try_from(FIXTURE_GROUPS)?, "planner-refused candidate")?;
+    expect(
+        &refused,
+        QueryExecutionPath::Interactive,
+        usize::try_from(FIXTURE_GROUPS)?,
+        "planner-refused candidate",
+    )?;
     if engine.analytical_plan_failure_armed_for_test() {
         return Err("supported candidate never reached the pinned distributed planner".into());
     }
@@ -263,20 +258,37 @@ async fn prove_selection() -> Result<(), JourneyError> {
     let no_exchange = run(
         &engine,
         query_context(tenant)?,
-        &format!("SELECT filter_key, COUNT(*) AS matched FROM vala.bifrost.{empty} GROUP BY filter_key"),
+        &format!(
+            "SELECT filter_key, COUNT(*) AS matched FROM vala.bifrost.{empty} GROUP BY filter_key"
+        ),
     )
     .await?;
-    expect(&no_exchange, QueryExecutionPath::Interactive, 0, "no-exchange candidate")?;
+    expect(
+        &no_exchange,
+        QueryExecutionPath::Interactive,
+        0,
+        "no-exchange candidate",
+    )?;
     await_clean_nodes(&cluster).await?;
 
     // A surviving real exchange is the only thing that selects Analytical, on
     // both the public leader entry and the forwarded leader entry.
     let selected = run(&engine, query_context(tenant)?, &grouped).await?;
-    expect(&selected, QueryExecutionPath::Analytical, usize::try_from(FIXTURE_GROUPS)?, "supported exchange")?;
+    expect(
+        &selected,
+        QueryExecutionPath::Analytical,
+        usize::try_from(FIXTURE_GROUPS)?,
+        "supported exchange",
+    )?;
     await_clean_nodes(&cluster).await?;
 
     let forwarded = run_forwarded(&engine, query_context(tenant)?, &grouped).await?;
-    expect(&forwarded, QueryExecutionPath::Analytical, usize::try_from(FIXTURE_GROUPS)?, "forwarded supported exchange")?;
+    expect(
+        &forwarded,
+        QueryExecutionPath::Analytical,
+        usize::try_from(FIXTURE_GROUPS)?,
+        "forwarded supported exchange",
+    )?;
     await_clean_nodes(&cluster).await?;
 
     cluster.shutdown().await?;

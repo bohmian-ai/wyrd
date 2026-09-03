@@ -7556,21 +7556,28 @@ impl AnalyticalExecutionHandle {
         let runtime = self
             .spill
             .build_query_runtime(resources.memory_pool(), resources.scratch_bytes)?;
-        let graph_guard = self
-            .supervisor
-            .register_graph(
-                graph,
-                resources,
-                AnalyticalGraphRuntime::new(
-                    runtime,
-                    crate::resources::OracleSessionShape::for_grant(
-                        granted_memory_bytes,
-                        target_partitions,
-                        target_partitions,
-                    ),
+        let graph_guard = match self.supervisor.register_graph(
+            graph,
+            resources,
+            AnalyticalGraphRuntime::new(
+                runtime,
+                crate::resources::OracleSessionShape::for_grant(
+                    granted_memory_bytes,
+                    target_partitions,
+                    target_partitions,
                 ),
-            )
-            .map_err(|(_, error)| error)?;
+            ),
+        ) {
+            Ok(guard) => guard,
+            // The refusal hands the envelope straight back rather than
+            // consuming it, so it is restored to the same permit it was taken
+            // from. Dropping it here would strand this query's whole grant on
+            // a node that never registered a graph to release it.
+            Err((returned, error)) => {
+                admitted.restore_query_resources(*returned);
+                return Err(error);
+            }
+        };
         let attempt_guard = self.supervisor.spawn_attempt(
             AnalyticalAttemptKey::new(
                 attempt.public_query_id,
@@ -7632,6 +7639,55 @@ impl AnalyticalExecutionHandle {
                 signals,
             },
         ))
+    }
+
+    /// Composes the planning-only session the pinned distributed build runs in.
+    ///
+    /// This session exists so a candidate plan can be *proposed* before this
+    /// query owns anything Analytical. It reuses the admitted query's own
+    /// state — catalog, registered providers, runtime, and grant-derived
+    /// config — and adds exactly what the pinned planner consults while it
+    /// transforms: the frozen worker set, the cut-derived task count, the leaf
+    /// split, and this node's codec. It deliberately installs no channel
+    /// resolver: channels are resolved from the execution `TaskContext`, which
+    /// only the authoritative leader session supplies, so nothing built here
+    /// can dial a peer.
+    ///
+    /// Composing it performs no supervisor mutation, no resource transfer, no
+    /// participant publication, and no IO.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::Internal`] when a participant endpoint in the
+    /// frozen cut is not a valid URL.
+    pub(super) fn planning_session(
+        &self,
+        local: &SessionContext,
+        cut: &OracleQueryAttemptCut,
+        work_units: usize,
+    ) -> Result<SessionContext, BifrostError> {
+        let urls = self
+            .remote_participants(cut)?
+            .into_iter()
+            .map(|(url, _)| url)
+            .collect::<Vec<_>>();
+        let mut config = local.copied_config();
+        config.set_distributed_desired_task_count_handler(AnalyticalCutTaskCount::new(
+            urls.len(),
+            work_units,
+        ));
+        config.set_distributed_scale_up_leaf_node_handler(AnalyticalLeafSplit);
+        config.set_distributed_worker_resolver(AnalyticalWorkerResolver { urls });
+        config.set_distributed_user_codec(super::codec::OraclePhysicalExtensionCodec::analytical(
+            self.leaf.clone(),
+        ));
+        let state = datafusion::execution::session_state::SessionStateBuilder::new_from_existing(
+            local.state(),
+        )
+        .with_config(config)
+        .with_distributed_planner()
+        .build();
+        Ok(SessionContext::new_with_state(state))
     }
 
     /// Releases every leader and follower owner this handle still holds.

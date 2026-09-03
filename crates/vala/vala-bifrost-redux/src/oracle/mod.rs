@@ -1718,7 +1718,12 @@ struct SqlCutInput<'a> {
     /// Caller-selected source-loss policy retained through follower dispatch.
     freshness: wyrd_spec::vala::api::FreshnessPolicy,
     /// Admitted durable/local query owner used by distributed dispatch.
-    admitted: &'a AdmittedQueryGuard,
+    ///
+    /// Mutable because selection may move this query's envelope out of it: a
+    /// candidate that survives validation and the pinned distributed build
+    /// transfers the envelope into the Analytical graph from here, and every
+    /// refusal before that point leaves the guard exactly as it was.
+    admitted: &'a mut AdmittedQueryGuard,
     /// Query-owned `DataFusion` runtime acquired before provider and data IO.
     session: SessionContext,
     /// Absolute execution deadline.
@@ -1727,7 +1732,14 @@ struct SqlCutInput<'a> {
     logical_bytes_selected: u64,
     /// One ingress-captured, role-fenced participant cut used by every dispatch.
     participant_cut: &'a OracleQueryAttemptCut,
-    /// Whether this attempt executes through the Analytical stage graph.
+    /// Scannable work the pinned cut offers, used to shape Analytical parallelism.
+    work_units: usize,
+    /// Immutable candidate identity, present only for an Analytical candidate.
+    ///
+    /// A candidate is not a selection. It names the identities the graph would
+    /// be registered under *if* the local plan proves supported and the pinned
+    /// distributed build keeps an exchange; until then this query is Interactive
+    /// and owns no Analytical state.
     ///
     /// The two distributed paths are mutually exclusive: Interactive splits the
     /// planned physical tree itself and signs one fragment per follower, while
@@ -1735,7 +1747,25 @@ struct SqlCutInput<'a> {
     /// and lets it form stages. Layering them would give the planner nothing to
     /// distribute, because the Interactive splitter has already pushed the
     /// entire query below a single remote scan.
-    analytical: bool,
+    analytical: Option<&'a analytical::AnalyticalAttemptContext>,
+}
+
+/// One executed cut's output together with the path it was executed on.
+///
+/// The path is produced by execution rather than chosen by the caller: only
+/// the code that saw a real `DistributedExec` survive can say the query became
+/// Analytical, so it travels out with the stream it describes.
+struct CutExecution {
+    /// Output schema of the executed root.
+    schema: SchemaRef,
+    /// Undrained result stream of the executed root.
+    batches: SendableRecordBatchStream,
+    /// Scan telemetry derived from the executed root.
+    scan_stats: OracleQueryScanStats,
+    /// Shared accumulator recording ordered degradation reasons.
+    degraded_sources: DegradedSourceAccumulator,
+    /// Path this cut irreversibly selected before its stream opened.
+    execution_path: QueryExecutionPath,
 }
 
 /// Table-local facts needed to derive every pinned Scribe follower assignment.
@@ -2833,6 +2863,75 @@ impl Oracle {
         Err(BifrostError::QueryExecutionFailed)
     }
 
+    /// Decides whether this attempt is an Analytical candidate, and under what
+    /// identity.
+    ///
+    /// A candidate is exactly a query the server classified Analytical on a
+    /// node that composed the Analytical owners. Being a candidate selects
+    /// nothing: it only means the plan is allowed to be *offered* to the pinned
+    /// distributed planner once it has proved supported.
+    ///
+    /// A caller-supplied attempt identity is honoured unchanged so a harness
+    /// can name the graph it will inspect; supplying one does not make the
+    /// query Analytical either.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::QueryAuditUnavailable`] when a digest input is
+    /// outside the bounded audit digest contract.
+    fn analytical_candidate(
+        &self,
+        context: &AuthorizedQueryContext,
+        participant_cut: &OracleQueryAttemptCut,
+        planned: &PlannedSqlCut,
+        supplied: Option<&analytical::AnalyticalAttemptContext>,
+    ) -> Result<Option<analytical::AnalyticalAttemptContext>, BifrostError> {
+        if let Some(attempt) = supplied {
+            return Ok(Some(attempt.clone()));
+        }
+        if planned.query_class != QueryClass::Analytical || self.analytical.is_none() {
+            return Ok(None);
+        }
+        Self::candidate_attempt_context(context, participant_cut, planned).map(Some)
+    }
+
+    /// Derives one candidate's immutable Analytical identity from the attempt.
+    ///
+    /// Every field is already fixed by the time a candidate exists: the public
+    /// identity is this request's own attempt id, and the two digests are the
+    /// same aggregate snapshot and permission digests the read decision was
+    /// audited under, so a graph registered later cannot describe a different
+    /// query than the one that was authorized. The private graph identity is
+    /// allocated separately on purpose — a leaked public identity into the
+    /// distributed graph, or the reverse, is what the stage authority's
+    /// identity isolation exists to refuse.
+    ///
+    /// Holding a candidate selects nothing. It is discarded unchanged by every
+    /// pre-selection refusal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::QueryAuditUnavailable`] when a digest input is
+    /// outside the bounded audit digest contract.
+    fn candidate_attempt_context(
+        context: &AuthorizedQueryContext,
+        participant_cut: &OracleQueryAttemptCut,
+        planned: &PlannedSqlCut,
+    ) -> Result<analytical::AnalyticalAttemptContext, BifrostError> {
+        Ok(analytical::AnalyticalAttemptContext {
+            public_query_id: analytical::PublicQueryId::from_uuid(
+                participant_cut.attempt_id().as_uuid(),
+            ),
+            datafusion_query_id: analytical::DataFusionQueryId::from_uuid(uuid::Uuid::now_v7()),
+            snapshot_digest: aggregate_audit_digest(
+                planned.cuts.iter().map(|cut| cut.snapshot_digest.as_str()),
+            )?
+            .as_str()
+            .to_owned(),
+            permission_digest: audit_digest(&context.permission)?.as_str().to_owned(),
+        })
+    }
+
     /// Starts one query telemetry owner once across a possible stale retry.
     fn ensure_query_telemetry(
         &self,
@@ -2871,7 +2970,7 @@ impl Oracle {
         participant_cut: &OracleQueryAttemptCut,
         deadline: Instant,
         phases: &mut AttemptPhaseTimer,
-        analytical: Option<&analytical::AnalyticalAttemptContext>,
+        work_units: usize,
     ) -> Result<
         (
             SessionContext,
@@ -2890,24 +2989,18 @@ impl Oracle {
             )
             .await?;
         phases.admitted();
-        let work_units = Self::scannable_work_units(&planned.cuts);
-        // Projected before the lease, never after: an Analytical lease moves
-        // this query's envelope out of the guard and into the graph that owns
-        // it, and every physical projection is an exact child split of that
-        // same envelope. Deriving them afterwards would ask the guard for
-        // resources it no longer holds.
+        // Projected before any later transfer, never after: a selected
+        // Analytical attempt moves this query's envelope out of the guard and
+        // into the graph that owns it, and every physical projection is an
+        // exact child split of that same envelope. Deriving them afterwards
+        // would ask the guard for resources it no longer holds.
         admitted.retain_physical_projections(&planned.cuts)?;
-        let (session, admitted) = match analytical {
-            Some(attempt) => self.lease_analytical_session(
-                deadline,
-                admitted,
-                attempt,
-                participant_cut,
-                context,
-                work_units,
-            )?,
-            None => self.lease_session(deadline, admitted, work_units, "lease rejection")?,
-        };
+        // Always the ordinary query-owned local session. Selection happens
+        // after this query has a locally executable plan, so leasing an
+        // Analytical session here would transfer the envelope before anything
+        // had proved the query could distribute at all.
+        let (session, admitted) =
+            self.lease_session(deadline, admitted, work_units, "lease rejection")?;
         let running_query =
             self.register_running_query(context, planned.query_class, &admitted, participant_cut)?;
         Ok((session, admitted, running_query))
@@ -3006,6 +3099,9 @@ impl Oracle {
             })
             .await?;
         self.ensure_query_telemetry(query_telemetry, request.visibility, planned.query_class);
+        let candidate =
+            self.analytical_candidate(context, participant_cut, &planned, analytical)?;
+        let work_units = Self::scannable_work_units(&planned.cuts);
         let mut phases = AttemptPhaseTimer::started();
         let (session, mut admitted, running_query) = self
             .admit_and_lease_attempt(
@@ -3014,7 +3110,7 @@ impl Oracle {
                 participant_cut,
                 deadline,
                 &mut phases,
-                analytical,
+                work_units,
             )
             .await?;
         let mut drained = match self
@@ -3035,7 +3131,7 @@ impl Oracle {
         };
         phases.drained();
         admitted.live_reservations = std::mem::take(&mut drained.reservations);
-        let (schema, batches, scan_stats, degraded_sources) = match self
+        let execution = match self
             .execute_sql_cut(SqlCutInput {
                 context,
                 sql: &request.sql,
@@ -3045,11 +3141,12 @@ impl Oracle {
                 scribe_sources: drained.follower_sources,
                 query_class: planned.query_class,
                 freshness: request.freshness,
-                admitted: &admitted,
+                admitted: &mut admitted,
                 session,
                 deadline,
                 participant_cut,
-                analytical: analytical.is_some(),
+                work_units,
+                analytical: candidate.as_ref(),
             })
             .await
         {
@@ -3061,17 +3158,9 @@ impl Oracle {
                 return release_error(deadline, admitted, error, "execution rejection");
             }
         };
-        record_degraded_live_tail(&degraded_sources, drained.degraded);
+        record_degraded_live_tail(&execution.degraded_sources, drained.degraded);
         settle_attempt_output(
-            AttemptOutput {
-                schema,
-                batches,
-                scan_stats,
-                degraded_sources,
-                admitted,
-                running_query,
-                execution_path: QueryExecutionPath::Interactive,
-            },
+            AttemptOutput::new(execution, admitted, running_query),
             AttemptSettlement {
                 deadline,
                 retry_ordinal,
@@ -3811,15 +3900,7 @@ impl Oracle {
     async fn execute_sql_cut(
         &self,
         mut input: SqlCutInput<'_>,
-    ) -> Result<
-        (
-            SchemaRef,
-            SendableRecordBatchStream,
-            OracleQueryScanStats,
-            DegradedSourceAccumulator,
-        ),
-        OracleExecutionError,
-    > {
+    ) -> Result<CutExecution, OracleExecutionError> {
         // `SessionContext` is an `Arc`-backed handle, so this clones the
         // handle rather than the session; the envelope stays whole for the
         // distributed call below.
@@ -3849,40 +3930,48 @@ impl Oracle {
             source_groups,
             scribe_assignments,
         } = assignments;
-        if input.analytical {
-            // The upstream distributed planner owns stage formation from here,
-            // so the leader plans and executes the statement whole. Every leaf
-            // already carries its signed assignment, and the stage ticket's
-            // digest over the serialized plan is what binds it.
-            let (schema, stream, stats) = self.execute_analytical_session(&session, &input).await?;
-            return Ok((
-                schema,
-                stream,
-                stats,
-                Arc::new(std::sync::Mutex::new(Vec::new())),
-            ));
+        // Selection is decided here and nowhere earlier: the plan is built,
+        // judged by the unchanged closed predicate, and only then offered to
+        // the pinned distributed planner. Every refusal returns `None` and
+        // falls through to the ordinary Interactive execution below, still
+        // owning nothing Analytical.
+        if input.analytical.is_some()
+            && let Some(execution) = self
+                .select_analytical(&session, &mut input, &source_groups)
+                .await?
+        {
+            return Ok(execution);
         }
         if oracle_assignments.is_empty() && scribe_assignments.is_empty() {
-            let (schema, stream, stats) = self
+            let (schema, batches, scan_stats) = self
                 .execute_session(&session, input.sql, input.logical_bytes_selected)
                 .await?;
-            Ok((
+            Ok(CutExecution {
                 schema,
-                stream,
-                stats,
-                Arc::new(std::sync::Mutex::new(Vec::new())),
-            ))
+                batches,
+                scan_stats,
+                degraded_sources: Arc::new(std::sync::Mutex::new(Vec::new())),
+                execution_path: QueryExecutionPath::Interactive,
+            })
         } else {
-            self.execute_distributed_session(
-                &session,
-                &input,
-                DistributedScanAssignments {
-                    oracle_assignments,
-                    source_groups,
-                    scribe_assignments,
-                },
-            )
-            .await
+            let (schema, batches, scan_stats, degraded_sources) = self
+                .execute_distributed_session(
+                    &session,
+                    &input,
+                    DistributedScanAssignments {
+                        oracle_assignments,
+                        source_groups,
+                        scribe_assignments,
+                    },
+                )
+                .await?;
+            Ok(CutExecution {
+                schema,
+                batches,
+                scan_stats,
+                degraded_sources,
+                execution_path: QueryExecutionPath::Interactive,
+            })
         }
     }
 
@@ -4046,7 +4135,11 @@ impl Oracle {
                 node_assignments.insert(scan_id.clone(), assignment);
             }
         }
-        if input.analytical {
+        // Attached for every candidate, because the assignment has to ride on
+        // the leaf while the physical tree is still being built and selection
+        // has not happened yet. It is inert on the Interactive path, which
+        // signs its assignments beside the plan rather than inside it.
+        if input.analytical.is_some() {
             remote_sources.analytical_assignments = common_scan_ids
                 .iter()
                 .filter_map(|scan_id| {
@@ -4109,7 +4202,7 @@ impl Oracle {
         let sql = input.sql;
         let query_class = input.query_class;
         let freshness = input.freshness;
-        let admitted = input.admitted;
+        let admitted = &*input.admitted;
         let deadline = input.deadline;
         let logical_bytes_selected = input.logical_bytes_selected;
         let participant_cut = input.participant_cut;
@@ -4381,51 +4474,6 @@ impl Oracle {
         }
     }
 
-    /// Leases the inactive Analytical session for one attempt, or releases it.
-    ///
-    /// The returned session plans and executes distributed. Its graph and
-    /// attempt ownership is attached to the admitted guard rather than returned
-    /// separately, so it settles when the query stream drains and cannot be
-    /// dropped early by a caller that only holds the session.
-    ///
-    /// # Errors
-    ///
-    /// Returns the stable admission, supervisor, or runtime error after
-    /// synchronously releasing the supplied admission owner.
-    fn lease_analytical_session(
-        &self,
-        deadline: Instant,
-        admitted: AdmittedQueryGuard,
-        attempt: &analytical::AnalyticalAttemptContext,
-        participant_cut: &OracleQueryAttemptCut,
-        context: &AuthorizedQueryContext,
-        work_units: usize,
-    ) -> Result<(SessionContext, AdmittedQueryGuard), BifrostError> {
-        let Some(handle) = self.analytical.as_ref() else {
-            return release_error(
-                deadline,
-                admitted,
-                BifrostError::OracleRoleUnavailable,
-                "analytical lease without a composed handle",
-            );
-        };
-        let mut admitted = admitted;
-        match handle.lease_session(
-            attempt,
-            participant_cut,
-            context,
-            &mut admitted,
-            work_units,
-            tokio::time::Instant::from_std(deadline),
-        ) {
-            Ok((session, ownership)) => {
-                admitted.analytical = Some(ownership);
-                Ok((session, admitted))
-            }
-            Err(error) => release_error(deadline, admitted, error, "analytical lease rejection"),
-        }
-    }
-
     /// Resolves leader-local hot file locations for one pinned cut.
     ///
     /// # Errors
@@ -4508,44 +4556,123 @@ impl Oracle {
         Self::stream_physical(session, &physical, logical_bytes_selected)
     }
 
-    /// Executes one Analytical statement, reserving participants iff it distributes.
+    /// Selects, and only then activates, the Analytical path for one candidate.
     ///
-    /// The Analytical path hands the whole statement to the upstream
-    /// distributed planner, so there is no split for this node to inspect: the
-    /// built physical plan is the first place a follower subtree becomes
-    /// visible, and executing it is what dials the first destination. Reserving
-    /// between those two steps is therefore both the earliest point a
-    /// participant may be charged and the last point before one is addressed. A
-    /// plan that upstream kept whole on the leader issues no reserve at all.
+    /// The order is the whole contract. One physical plan is built and retained
+    /// first; the unchanged pre-distribution support predicate judges *that*
+    /// plan, before the dependency has had a chance to introduce nodes the
+    /// predicate was never written for; the pinned distributed planner then
+    /// performs its own build over a planning-only session that owns nothing.
+    ///
+    /// Every refusal up to that point returns `Ok(None)`, having registered no
+    /// graph, moved no envelope, reserved no follower, published no
+    /// participant, and issued no peer IO — the caller then executes this query
+    /// on the unchanged Interactive path.
+    ///
+    /// A surviving `DistributedExec` makes selection irreversible: from there
+    /// the envelope moves into the graph, participants are published
+    /// immediately before dispatch, and every later failure is terminal. No
+    /// path after the transfer reopens the retained candidate plan.
     ///
     /// # Errors
     ///
-    /// Returns the same planning and streaming failures as
-    /// [`Self::execute_session`], plus the stable admission failure when a
-    /// participant declines to hold this graph's envelope.
-    async fn execute_analytical_session(
+    /// Returns the mapped planning failure, a non-support validation failure
+    /// such as a tenant or catalog invariant, and every stable admission,
+    /// supervisor, reservation, or runtime failure raised after selection.
+    async fn select_analytical(
         &self,
         session: &SessionContext,
-        input: &SqlCutInput<'_>,
-    ) -> Result<(SchemaRef, SendableRecordBatchStream, OracleQueryScanStats), OracleExecutionError>
-    {
-        let physical = Self::plan_physical(session, input.sql).await?;
-        let distributed = exec::is_distributed_plan(physical.as_ref());
-        if distributed && let Some(ownership) = input.admitted.analytical.as_ref() {
+        input: &mut SqlCutInput<'_>,
+        source_groups: &HashMap<String, String>,
+    ) -> Result<Option<CutExecution>, OracleExecutionError> {
+        let candidate = Self::plan_physical(session, input.sql).await?;
+        // The closed Task 2 predicate, applied to the plan it was written for
+        // and before the dependency transforms it.
+        if let Err(error) = splitter::validate_supported(candidate.as_ref(), source_groups) {
+            if !is_unsupported_analytical_plan(&error) {
+                return Err(map_datafusion_error(&error).into());
+            }
+            record_analytical_selection("unsupported");
+            return Ok(None);
+        }
+        let Some(handle) = self.analytical.as_ref() else {
+            record_analytical_selection("unavailable");
+            return Ok(None);
+        };
+        let Some(distributed) = self.plan_analytical_candidate(handle, session, input).await else {
+            record_analytical_selection("no_exchange");
+            return Ok(None);
+        };
+        // Selection. Nothing below may fall back.
+        drop(candidate);
+        let attempt = input
+            .analytical
+            .ok_or(BifrostError::QueryExecutionFailed)?
+            .clone();
+        let (leader, ownership) = handle.lease_session(
+            &attempt,
+            input.participant_cut,
+            input.context,
+            input.admitted,
+            input.work_units,
+            tokio::time::Instant::from_std(input.deadline),
+        )?;
+        input.admitted.analytical = Some(ownership);
+        // Published only after activation and immediately before dispatch, so
+        // no follower is charged for a graph that never opened.
+        if let Some(ownership) = input.admitted.analytical.as_ref() {
             ownership.publish_participants().await?;
         }
         let mut scan_stats =
-            OracleQueryScanStats::from_plan(physical.as_ref(), input.logical_bytes_selected);
-        let schema = physical.schema();
-        let stream = execute_stream(Arc::clone(&physical), session.task_ctx())
+            OracleQueryScanStats::from_plan(distributed.as_ref(), input.logical_bytes_selected);
+        let schema = distributed.schema();
+        let batches = execute_stream(Arc::clone(&distributed), leader.task_ctx())
             .map_err(|error| map_datafusion_error(&error))?;
-        if distributed && let Some(ownership) = input.admitted.analytical.as_ref() {
+        if let Some(ownership) = input.admitted.analytical.as_ref() {
             ownership.retain_metric_fold(analytical::AnalyticalGraphMetricFold::new(
-                physical,
+                distributed,
                 scan_stats.open_distributed_scan(),
             ))?;
         }
-        Ok((schema, stream, scan_stats))
+        record_analytical_selection("analytical");
+        Ok(Some(CutExecution {
+            schema,
+            batches,
+            scan_stats,
+            degraded_sources: Arc::new(std::sync::Mutex::new(Vec::new())),
+            execution_path: QueryExecutionPath::Analytical,
+        }))
+    }
+
+    /// Rebuilds one supported candidate through the pinned distributed planner.
+    ///
+    /// Returns `None` for every pre-selection refusal — a planning session that
+    /// cannot be composed, a planner that refuses, or a plan that kept no
+    /// exchange — because all three mean the same thing to the caller: this
+    /// query stays Interactive and still owns nothing.
+    async fn plan_analytical_candidate(
+        &self,
+        handle: &Arc<analytical::AnalyticalExecutionHandle>,
+        session: &SessionContext,
+        input: &SqlCutInput<'_>,
+    ) -> Option<Arc<dyn ExecutionPlan>> {
+        let planning = handle
+            .planning_session(session, input.participant_cut, input.work_units)
+            .inspect_err(|error| {
+                tracing::debug!(?error, "Oracle analytical candidate composed no planner");
+            })
+            .ok()?;
+        if self.take_analytical_plan_failure() {
+            tracing::debug!("Oracle analytical candidate refused by an injected planning failure");
+            return None;
+        }
+        let distributed = Self::plan_physical(&planning, input.sql)
+            .await
+            .inspect_err(|error| {
+                tracing::debug!(?error, "Oracle analytical candidate failed to distribute");
+            })
+            .ok()?;
+        exec::is_distributed_plan(distributed.as_ref()).then_some(distributed)
     }
 
     /// Lowers one validated statement to its optimized physical plan.
@@ -5072,6 +5199,37 @@ struct AttemptOutput {
     running_query: RunningQueryTerminalOwner,
     /// Execution path this attempt irreversibly selected before it opened.
     execution_path: QueryExecutionPath,
+}
+
+impl AttemptOutput {
+    /// Joins one executed cut with the two owners settlement must be able to release.
+    ///
+    /// The cut supplies the stream and the path it was executed on; the guard
+    /// and the terminal owner are what any failure below must hand back. They
+    /// are only ever produced together, so they are joined here rather than
+    /// threaded through the caller field by field.
+    fn new(
+        execution: CutExecution,
+        admitted: AdmittedQueryGuard,
+        running_query: RunningQueryTerminalOwner,
+    ) -> Self {
+        let CutExecution {
+            schema,
+            batches,
+            scan_stats,
+            degraded_sources,
+            execution_path,
+        } = execution;
+        Self {
+            schema,
+            batches,
+            scan_stats,
+            degraded_sources,
+            admitted,
+            running_query,
+            execution_path,
+        }
+    }
 }
 
 /// Request-scoped facts settlement needs that do not come from execution.
@@ -5927,6 +6085,26 @@ pub fn is_stale_iceberg_object_error(error: &datafusion::error::DataFusionError)
 #[must_use]
 pub fn is_tenant_invariant_error(error: &datafusion::error::DataFusionError) -> bool {
     exec::is_tenant_invariant_error(error)
+}
+
+/// Records which path one Analytical candidate's selection settled on.
+///
+/// The label is a closed outcome, never an identity or a statement: `analytical`
+/// for a surviving exchange, and the pre-selection refusal that kept the query
+/// Interactive otherwise. A rising refusal rate is what says the accepted
+/// operator matrix, not the cluster, is the limit.
+fn record_analytical_selection(outcome: &'static str) {
+    metrics::counter!("oracle_query_analytical_selection_total", "outcome" => outcome).increment(1);
+}
+
+/// Reports whether one validation failure is the closed unsupported-shape refusal.
+///
+/// Only that refusal is a fallback. Every other error the predicate can carry —
+/// a tenant, catalog, corruption, or invariant failure — describes a query that
+/// must not run at all, so it is preserved rather than downgraded to a route.
+fn is_unsupported_analytical_plan(error: &datafusion::error::DataFusionError) -> bool {
+    matches!(error, datafusion::error::DataFusionError::Plan(detail)
+        if detail.starts_with("unsupported distributed Oracle"))
 }
 
 /// Records consumption of the sole pre-byte stale-cut replan.

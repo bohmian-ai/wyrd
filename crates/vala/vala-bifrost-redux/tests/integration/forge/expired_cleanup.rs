@@ -12,7 +12,8 @@ use uuid::Uuid;
 use vala_bifrost_redux::forge::{ForgeError, ForgeScheduler, ForgeWorker, ForgeWorkerConfig};
 use vala_sql::queries::forge_tasks::{ForgeEnqueueBatch, ForgeTasks};
 use vala_sql::row_types::forge_tasks::{
-    ExpiredCleanupPayload, ForgeTaskClaim, ForgeTaskLane, ForgeTaskStrategy, NewForgeTask,
+    ExpiredCleanupPayload, ForgeCleanupCandidate, ForgeCleanupCategory, ForgeCleanupPath,
+    ForgeTaskClaim, ForgeTaskLane, ForgeTaskStrategy, ForgeTaskTableIdentity, NewForgeTask,
 };
 use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
 use wyrd_spec::request_id::RequestId;
@@ -212,6 +213,56 @@ async fn drained_expiration(name: &str) -> DrainedExpiration {
     }
 }
 
+/// Overwrites one cleanup task's persisted plan with an exact handoff.
+///
+/// Only a durably persisted plan can prove the consumer-side gate: the worker
+/// re-reads what the row carries, so planting the payload here is the direct
+/// way to present a plan the enqueue admission would have refused.
+///
+/// # Panics
+///
+/// Panics when the update fails.
+async fn persist_cleanup_plan(
+    fixture: &PromotionIntegrationFixture,
+    task_id: Uuid,
+    payload: &ExpiredCleanupPayload,
+) {
+    sqlx::query("UPDATE vala.forge_tasks SET plan=$2::jsonb WHERE task_id=$1")
+        .bind(task_id)
+        .bind(
+            serde_json::json!({"version":1,"inputs":[],"parameters":payload.to_value()})
+                .to_string(),
+        )
+        .execute(fixture.operator_pool.pool())
+        .await
+        .expect("the cleanup plan is replanted");
+}
+
+/// Returns one cleanup task to the claim pool without touching its evidence.
+///
+/// # Panics
+///
+/// Panics when the release fails.
+async fn release_cleanup_claim(fixture: &PromotionIntegrationFixture, task_id: Uuid) {
+    sqlx::query("UPDATE vala.forge_tasks SET state='ready',attempt_id=NULL,claimed_by=NULL,claim_expires_at=NULL,watermark_snapshot_id=NULL,watermark_timestamp_ms=NULL WHERE task_id=$1")
+        .bind(task_id)
+        .execute(fixture.operator_pool.pool())
+        .await
+        .expect("the cleanup claim releases");
+}
+
+/// Counts every live maintenance lease, which a refused claim must not change.
+///
+/// # Panics
+///
+/// Panics when the diagnostic read fails.
+async fn live_leases(fixture: &PromotionIntegrationFixture) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM vala.maintenance_leases")
+        .fetch_one(fixture.operator_pool.pool())
+        .await
+        .expect("lease count")
+}
+
 #[tokio::test]
 async fn candidate_preparation_releases_sql_and_blocks_oracle_and_competing_forge_claims() {
     let DrainedExpiration {
@@ -221,6 +272,61 @@ async fn candidate_preparation_releases_sql_and_blocks_oracle_and_competing_forg
         payload,
     } = Box::pin(drained_expiration("cleanup_gates")).await;
     let deletes_before = table.store.deletes();
+
+    // A persisted cleanup plan whose candidate is internally valid but belongs
+    // to a sibling table is refused before the lease, the catalog, and any
+    // object-store call.
+    let sibling = ExpiredCleanupPayload {
+        cleanup_candidates: vec![ForgeCleanupCandidate {
+            category: ForgeCleanupCategory::Data,
+            table: ForgeTaskTableIdentity::new(
+                "wyrd-redux",
+                table.fixture.binding.table_ref.namespace.as_str(),
+                "sibling",
+            )
+            .expect("sibling identity"),
+            path: ForgeCleanupPath::new("sibling/data/00000.parquet").expect("sibling path"),
+        }],
+        ..payload.clone()
+    };
+    persist_cleanup_plan(&table.fixture, cleanup_id, &sibling).await;
+    let leases_before = live_leases(&table.fixture).await;
+    let stats_before = table.store.stats();
+    let stray = worker
+        .claim_for_test()
+        .await
+        .expect("claim transaction runs")
+        .expect("the replanted cleanup task is claimable");
+    let refused = worker
+        .execute_expired_cleanup_claim_for_test(stray, &CancellationToken::new())
+        .await
+        .expect_err("a cross-table cleanup plan is refused");
+    assert!(
+        matches!(refused, ForgeError::Sql(_)),
+        "the cross-table plan is refused by the payload contract: {refused}"
+    );
+    assert_eq!(
+        table.store.stats(),
+        stats_before,
+        "a refused cross-table plan stats no object"
+    );
+    assert_eq!(
+        table.store.deletes(),
+        deletes_before,
+        "a refused cross-table plan deletes no object"
+    );
+    assert_eq!(
+        live_leases(&table.fixture).await,
+        leases_before,
+        "a refused cross-table plan acquires no table lease"
+    );
+    assert_eq!(
+        cursor(&table.fixture, cleanup_id).await,
+        ("claimed".to_owned(), 0, None),
+        "a refused cross-table plan writes no cleanup evidence"
+    );
+    persist_cleanup_plan(&table.fixture, cleanup_id, &payload).await;
+    release_cleanup_claim(&table.fixture, cleanup_id).await;
 
     let claim = worker
         .claim_for_test()

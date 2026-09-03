@@ -70,6 +70,29 @@ pub(crate) struct CountingObjectStore {
     deletes: AtomicUsize,
     /// Number of delegated object reads, shared so a seam can snapshot it.
     reads: Arc<AtomicUsize>,
+    /// Number of delegated object stats, which prove a pre-IO refusal.
+    stats: AtomicUsize,
+    /// Optional pause applied to one delegated stat.
+    stat_pause: StatPause,
+    /// Remaining delegated stats to fail with an injected transient error.
+    stat_errors: AtomicUsize,
+}
+
+/// Deterministic pause seam over exactly one delegated `stat`.
+///
+/// A cleanup candidate's fresh reachability proof begins with a stat, so
+/// suspending that one call is the only place a test can observe the durable
+/// state a preparation committed while no Postgres transaction is open and no
+/// deletion has been submitted. Both handshakes use `Notify::notify_one`, whose
+/// permit is stored, so neither side can miss the other and no sleep is needed.
+#[derive(Debug, Default)]
+struct StatPause {
+    /// One-based stat ordinal to suspend at; `0` disables the gate.
+    at: AtomicUsize,
+    /// Signalled once the selected stat is suspended.
+    arrived: tokio::sync::Notify,
+    /// Signalled by the test to let the suspended stat proceed.
+    release: tokio::sync::Notify,
 }
 
 impl CountingObjectStore {
@@ -80,7 +103,44 @@ impl CountingObjectStore {
             output_writers: AtomicUsize::new(0),
             deletes: AtomicUsize::new(0),
             reads: Arc::new(AtomicUsize::new(0)),
+            stats: AtomicUsize::new(0),
+            stat_pause: StatPause::default(),
+            stat_errors: AtomicUsize::new(0),
         })
+    }
+
+    /// Return how many objects were stat'ed.
+    pub(crate) fn stats(&self) -> usize {
+        self.stats.load(Ordering::Acquire)
+    }
+
+    /// Suspend the stat whose one-based ordinal is `at`, counting from now.
+    ///
+    /// The caller then awaits [`Self::stat_paused`] and finally calls
+    /// [`Self::release_stat`], which is the whole handshake: no other stat is
+    /// affected and nothing is timed.
+    pub(crate) fn pause_stat_at(&self, at: usize) {
+        self.stat_pause
+            .at
+            .store(self.stats() + at, Ordering::Release);
+    }
+
+    /// Wait until the armed stat is suspended inside the delegated call.
+    pub(crate) async fn stat_paused(&self) {
+        self.stat_pause.arrived.notified().await;
+    }
+
+    /// Let the suspended stat proceed to the real operator.
+    pub(crate) fn release_stat(&self) {
+        self.stat_pause.release.notify_one();
+    }
+
+    /// Fail the next `count` delegated stats with an injected transient error.
+    ///
+    /// The error is an `Unexpected` opendal failure rather than `NotFound`, so
+    /// it exercises the branch where the object's existence stays unknown.
+    pub(crate) fn fail_next_stats(&self, count: usize) {
+        self.stat_errors.store(count, Ordering::Release);
     }
 
     /// Borrow the shared read counter so a catalog seam can snapshot it.
@@ -131,6 +191,24 @@ impl ForgeObjectStore for CountingObjectStore {
     }
 
     async fn stat(&self, path: &str) -> opendal::Result<Metadata> {
+        let ordinal = self.stats.fetch_add(1, Ordering::AcqRel) + 1;
+        if self.stat_pause.at.load(Ordering::Acquire) == ordinal {
+            self.stat_pause.at.store(0, Ordering::Release);
+            self.stat_pause.arrived.notify_one();
+            self.stat_pause.release.notified().await;
+        }
+        if self
+            .stat_errors
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(opendal::Error::new(
+                opendal::ErrorKind::Unexpected,
+                "injected expired-cleanup stat failure",
+            ));
+        }
         self.inner.stat(path).await
     }
 

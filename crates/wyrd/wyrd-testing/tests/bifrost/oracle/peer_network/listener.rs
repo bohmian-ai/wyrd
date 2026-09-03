@@ -66,7 +66,7 @@ async fn prove_peer_listener_isolation() -> Result<(), PeerJourneyError> {
     only_a_member_certificate_completes_the_handshake(&cluster).await?;
     a_trusted_certificate_alone_authorizes_nothing(&cluster).await?;
     every_target_mounts_exactly_its_services(&cluster).await?;
-    cluster.shutdown();
+    cluster.shutdown()?;
     drop(cluster);
 
     scribe_identity_is_coupled_to_its_volume().await?;
@@ -437,7 +437,7 @@ async fn scribe_identity_is_coupled_to_its_volume() -> Result<(), PeerJourneyErr
         // pod to damage again.
         cluster = BifrostProcessCluster::start(NODE_BINARY, &[ProcessNodeTarget::Scribe]).await?;
     }
-    cluster.shutdown();
+    cluster.shutdown()?;
     Ok(())
 }
 
@@ -542,7 +542,7 @@ async fn oracle_topology_is_uniform_and_exactly_addressed(
             }
         }
     }
-    cluster.shutdown();
+    cluster.shutdown()?;
     Ok(())
 }
 
@@ -582,5 +582,67 @@ async fn coordinate_public_query(
     stream
         .terminal()
         .ok_or("the coordinated query produced no terminal frame")?;
+    Ok(())
+}
+
+/// Explicit cluster shutdown reports a child failure after reaping every child.
+///
+/// # Panics
+///
+/// Panics when the failed shutdown is not observable or a child survives it.
+#[tokio::test]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn explicit_shutdown_reports_failure_after_reaping_every_child() {
+    prove_explicit_shutdown_reports_failure()
+        .await
+        .expect("explicit shutdown failure journey");
+}
+
+/// Kills one child out from under the cluster, then shuts the cluster down.
+///
+/// A killed child has no stdin left, so it rejects the shutdown request the
+/// cluster sends it — the smallest real failure a caller can produce without
+/// reaching into the harness. The claim is that the caller learns about it,
+/// that learning about it did not stop the healthy Scribe from being asked and
+/// joined, and that nothing survives either way.
+///
+/// # Errors
+///
+/// Returns the first claim that broke.
+async fn prove_explicit_shutdown_reports_failure() -> Result<(), PeerJourneyError> {
+    let mut cluster = BifrostProcessCluster::start(
+        NODE_BINARY,
+        &[ProcessNodeTarget::Oracle, ProcessNodeTarget::Scribe],
+    )
+    .await?;
+
+    let oracle_label = cluster.nodes()[0].label().to_owned();
+    let scribe_label = cluster.nodes()[1].label().to_owned();
+    cluster.nodes_mut()[0].kill()?;
+
+    let Err(reported) = cluster.shutdown() else {
+        return Err("explicit shutdown reported success after a child was killed".into());
+    };
+    let detail = reported.to_string();
+    if !detail.contains(&oracle_label) {
+        return Err(format!("the shutdown failure does not name {oracle_label}: {detail}").into());
+    }
+    if detail.contains(&scribe_label) {
+        return Err(
+            format!("the healthy {scribe_label} was reported as a failure: {detail}").into(),
+        );
+    }
+    // A join failure is the harness failing to reap; the claim under test is
+    // that every child was still reaped while the first failure was preserved.
+    if detail.contains("threads panicked") || detail.contains("could not be reaped") {
+        return Err(format!("a child was not reaped before the failure returned: {detail}").into());
+    }
+    if !cluster.nodes().is_empty() {
+        return Err(format!(
+            "{} nodes survived an explicit shutdown",
+            cluster.nodes().len()
+        )
+        .into());
+    }
     Ok(())
 }

@@ -54,7 +54,7 @@ async fn prove_peer_transport_uses_immutable_fenced_destinations() -> Result<(),
     a_plaintext_dial_never_reaches_a_private_adapter(&mut cluster)?;
     a_replaced_participant_does_not_inherit_the_frozen_fence(&mut cluster)?;
 
-    cluster.shutdown();
+    cluster.shutdown()?;
     Ok(())
 }
 

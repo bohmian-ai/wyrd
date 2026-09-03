@@ -62,7 +62,7 @@ async fn prove_peer_authentication_precedes_body_admission() -> Result<(), PeerJ
     the_configured_principal_is_admitted_on_both_adapters(&mut cluster, &destination)?;
     first_frame_layout_does_not_change_admission(&mut cluster, &destination)?;
 
-    cluster.shutdown();
+    cluster.shutdown()?;
     Ok(())
 }
 
@@ -290,7 +290,7 @@ async fn prove_peer_tickets_are_independent_exact_and_replay_safe() -> Result<()
     a_state_changing_ticket_is_single_use(&mut cluster, &plane, &keyring)?;
     worker_discovery_is_always_refused(&mut cluster, &plane)?;
 
-    cluster.shutdown();
+    cluster.shutdown()?;
     Ok(())
 }
 

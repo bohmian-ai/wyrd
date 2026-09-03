@@ -209,6 +209,8 @@ pub enum ControlRequest {
     RefreshSnapshot,
     /// Report this child's graph-lease activations and the leases it still holds.
     GraphLeases,
+    /// Report every Oracle ownership total this child can still account for.
+    OracleOwnership,
     /// Dial another pod's private peer socket and report the wire outcome.
     ///
     /// The child always presents its configured peer TLS material, so a
@@ -431,6 +433,8 @@ pub enum ControlResponse {
         /// Graph leases this child still holds.
         live: usize,
     },
+    /// Answer to [`ControlRequest::OracleOwnership`].
+    OracleOwnership(Box<OracleOwnershipSnapshot>),
     /// Answer to [`ControlRequest::PeerProbe`].
     Probed {
         /// Non-secret gRPC status code name the destination returned.
@@ -505,6 +509,71 @@ pub struct AnalyticalBaselineEvidence {
     /// a journey asserting on spill evidence must treat as a failure rather
     /// than as an absent-but-acceptable measurement.
     pub physical: Option<vala_bifrost_redux::oracle::analytical::AnalyticalPhysicalEvidence>,
+}
+
+/// Everything one Oracle process still owns, projected from production owners.
+///
+/// A journey proving cleanup needs one before/after comparison that fails on
+/// *any* retained owner, not three chosen gauges. Every field here is read from
+/// an owner that already exists in production — the Analytical execution
+/// handle, Oracle's own admission inspection, the process resource root, the
+/// process scratch tree, and the live production gauges — so this type owns no
+/// state, grants no capability, and can never diverge from what it projects.
+///
+/// Graph and attempt counts are deliberately the whole ownership boundary for
+/// what hangs under them: a graph owns its worker, task cache, driver tasks,
+/// and connections, so a nonzero graph count is already the leak report and no
+/// test-only registry is added to restate it.
+///
+/// Fixed scalar fields only. Nothing here is unbounded or identity-bearing, so
+/// the control protocol carries a constant-size message however large the
+/// query was.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct OracleOwnershipSnapshot {
+    /// Leader-side attempts still supervised.
+    pub leader_attempts: usize,
+    /// Leader-side graphs still holding a runtime and admitted envelope.
+    pub leader_graphs: usize,
+    /// Leader-side graphs retained because their cleanup did not complete.
+    pub leader_cleanup_failures: usize,
+    /// Follower-side attempts still supervised.
+    pub follower_attempts: usize,
+    /// Follower-side graphs still holding a runtime and admitted envelope.
+    pub follower_graphs: usize,
+    /// Follower-side graphs retained because their cleanup did not complete.
+    pub follower_cleanup_failures: usize,
+    /// Queries currently holding local class and tenant grants.
+    pub active_queries: u64,
+    /// Waiters currently queued for a local grant.
+    pub queued_queries: u64,
+    /// Memory bytes reserved by active queries.
+    pub reserved_memory_bytes: u64,
+    /// Spill bytes reserved by active queries.
+    pub reserved_spill_bytes: u64,
+    /// Peer pending reservations held by this Oracle.
+    pub peer_pending: u64,
+    /// Peer running reservations held by this Oracle.
+    pub peer_running: u64,
+    /// Live Oracle query owners at the process resource root.
+    pub root_active_queries: u32,
+    /// Live analytical-class Oracle query owners at that root.
+    pub root_analytical_queries: u32,
+    /// Slot units retained by Oracle query owners.
+    pub root_query_slot_units: u32,
+    /// Memory retained specifically by Oracle query owners.
+    pub root_query_memory_used_bytes: u64,
+    /// Scratch retained specifically by Oracle query owners.
+    pub root_query_scratch_used_bytes: u64,
+    /// Whether at least one Oracle query owner is active.
+    pub root_query_active: bool,
+    /// Process-owned Oracle scratch occupancy.
+    pub scratch: ScratchUsage,
+    /// Live `bifrost_oracle_analytical_attempts_active` production gauge.
+    pub attempts_active: f64,
+    /// Live `bifrost_oracle_analytical_exchanges_active` production gauge.
+    pub exchanges_active: f64,
+    /// Live `oracle_fragments_active` production gauge.
+    pub fragments_active: f64,
 }
 
 /// One directory tree's entry and byte occupancy at a moment.
@@ -852,8 +921,12 @@ pub struct ProcessNode {
     stderr_thread: Option<JoinHandle<()>>,
     /// Bounded stderr tail shared with the drain thread.
     stderr: Arc<Mutex<StderrTail>>,
-    /// Signalled by the reaper once the child has been waited on.
-    exited: Receiver<()>,
+    /// Carries the reaper's own outcome once the child has been waited on.
+    ///
+    /// A bounded one-slot channel because the reaper reports exactly once: the
+    /// first `try_wait`, kill, or wait error it hit, after it finished every
+    /// cleanup step that was still possible.
+    exited: Receiver<Result<(), String>>,
 }
 
 impl std::fmt::Debug for ProcessNode {
@@ -1115,6 +1188,29 @@ impl ProcessNode {
         }
     }
 
+    /// Reports every Oracle ownership total this child can still account for.
+    ///
+    /// Taken before and after one execution, an equal pair is the strongest
+    /// cleanup claim this harness can make: not that three gauges returned to
+    /// zero, but that every production owner the process can name holds exactly
+    /// what it held before. Read-only — nothing here releases, resets, or
+    /// otherwise touches what it reports.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::request`], and
+    /// [`ProcessClusterError::Child`] when this target composes no Oracle or an
+    /// ownership lock is poisoned.
+    pub fn ownership_snapshot(&mut self) -> Result<OracleOwnershipSnapshot, ProcessClusterError> {
+        match self.request(&ControlRequest::OracleOwnership)? {
+            ControlResponse::OracleOwnership(snapshot) => Ok(*snapshot),
+            ControlResponse::Failed { detail } => Err(ProcessClusterError::Child(detail)),
+            other => Err(ProcessClusterError::Protocol(format!(
+                "expected an ownership snapshot, received {other:?}"
+            ))),
+        }
+    }
+
     /// Asks this child to run one statement through inactive Analytical.
     ///
     /// Returns the row count the attempt produced. Nothing in production
@@ -1328,16 +1424,36 @@ impl ProcessNode {
     ///
     /// # Errors
     ///
-    /// Returns [`ProcessClusterError::Child`] when a thread this node owns
-    /// could not be joined.
+    /// Returns [`ProcessClusterError::Child`] when the reaper could not
+    /// terminate or reap the child, or when a thread this node owns could not
+    /// be joined. Every step is still attempted before the first error
+    /// returns.
     pub fn kill(&mut self) -> Result<(), ProcessClusterError> {
         self.stdin = None;
         if let Some(reaper) = &self.reaper {
             let _ = reaper.send(ReaperCommand::Kill);
         }
-        let _ = self.exited.recv_timeout(SHUTDOWN_TIMEOUT);
+        let reaped = self.await_reaper();
         self.reaper = None;
-        self.join_threads()
+        let joined = self.join_threads();
+        match reaped {
+            Err(detail) => Err(ProcessClusterError::Child(detail)),
+            Ok(()) => joined,
+        }
+    }
+
+    /// Waits for the reaper's one report and renders a missing one as failure.
+    ///
+    /// A reaper that never answers is indistinguishable from one that could not
+    /// reap, so the deadline elapsing is itself the process-control error.
+    fn await_reaper(&self) -> Result<(), String> {
+        match self.exited.recv_timeout(SHUTDOWN_TIMEOUT) {
+            Ok(result) => result,
+            Err(error) => Err(format!(
+                "child pid {} was not reported reaped: {error}",
+                self.ready.pid
+            )),
+        }
     }
 
     /// Sends one request and requires the child to answer with an exact shape.
@@ -1369,23 +1485,51 @@ impl ProcessNode {
     /// to exit. A child that does not respond in time is killed and reaped, so
     /// the same call is also the correct path on test failure.
     ///
+    /// The first failure in operation order is preserved and returned: a
+    /// rejected shutdown request, then a missed graceful exit, then a
+    /// forced-kill or reaper failure, then a reader/reaper join failure. Every
+    /// later step still runs, so a caller that receives an error has already
+    /// had stdin closed, the child terminated, and every thread joined. A
+    /// forced kill is itself a failure even when it and the joins succeed:
+    /// this node was asked to shut down and did not.
+    ///
     /// # Errors
     ///
-    /// Returns [`ProcessClusterError::Child`] when a reader or reaper thread
-    /// could not be joined, which is a harness defect rather than detached
-    /// work left running.
+    /// Returns [`ProcessClusterError::Child`] carrying that first failure.
     pub fn shutdown(&mut self) -> Result<(), ProcessClusterError> {
-        let requested = self.send(&ControlRequest::Shutdown).is_ok();
+        let pid = self.ready.pid;
+        let mut first: Option<String> = None;
+        if let Err(error) = self.send(&ControlRequest::Shutdown) {
+            first = Some(format!(
+                "child pid {pid} rejected its shutdown request: {error}"
+            ));
+        }
         self.stdin = None;
-        let exited = requested && self.exited.recv_timeout(SHUTDOWN_TIMEOUT).is_ok();
-        if !exited {
+        let mut reaped = None;
+        if first.is_none() {
+            match self.exited.recv_timeout(SHUTDOWN_TIMEOUT) {
+                Ok(result) => reaped = Some(result),
+                Err(error) => {
+                    first = Some(format!(
+                        "child pid {pid} did not exit within its shutdown deadline: {error}"
+                    ));
+                }
+            }
+        }
+        if reaped.is_none() {
             if let Some(reaper) = &self.reaper {
                 let _ = reaper.send(ReaperCommand::Kill);
             }
-            let _ = self.exited.recv_timeout(SHUTDOWN_TIMEOUT);
+            reaped = Some(self.await_reaper());
         }
         self.reaper = None;
-        self.join_threads()
+        if let Some(Err(detail)) = reaped
+            && first.is_none()
+        {
+            first = Some(detail);
+        }
+        let joined = self.join_threads();
+        first.map_or(joined, |detail| Err(ProcessClusterError::Child(detail)))
     }
 
     /// Joins the reaper and both reader threads.
@@ -1573,8 +1717,16 @@ impl BifrostProcessCluster {
             match cluster.launch(&plan) {
                 Ok(node) => cluster.nodes.push(node),
                 Err(error) => {
-                    cluster.shutdown();
-                    return Err(error);
+                    // Clean cleanup leaves the launch failure untouched; a
+                    // caller diagnosing a launch should not have to read past
+                    // teardown noise. Cleanup that itself failed is the more
+                    // serious condition and is reported alongside it.
+                    return match cluster.shutdown() {
+                        Ok(()) => Err(error),
+                        Err(cleanup) => Err(ProcessClusterError::Child(format!(
+                            "child launch failed: {error}; cleanup after it also failed: {cleanup}"
+                        ))),
+                    };
                 }
             }
         }
@@ -1606,13 +1758,31 @@ impl BifrostProcessCluster {
 
     /// Shuts down and reaps every child, joining all owned threads.
     ///
-    /// Called explicitly at the end of a journey and again from `Drop`, so a
-    /// panicking test leaves no surviving child.
-    pub fn shutdown(&mut self) {
+    /// Every node is attempted in cluster order even after one fails, and the
+    /// node list is cleared either way, so a panicking test still leaves no
+    /// surviving child. The first child failure is returned with every later
+    /// child's label and detail appended, because a journey that only learned
+    /// about the first would not know whether the rest were even asked.
+    ///
+    /// [`Drop`] is the only caller allowed to discard this result.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProcessClusterError::Child`] naming each child that could not
+    /// be shut down, terminated, reaped, or joined.
+    pub fn shutdown(&mut self) -> Result<(), ProcessClusterError> {
+        let mut failures: Vec<String> = Vec::new();
         for node in &mut self.nodes {
-            let _ = node.shutdown();
+            if let Err(error) = node.shutdown() {
+                failures.push(format!("{}: {error}", node.label));
+            }
         }
         self.nodes.clear();
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(ProcessClusterError::Child(failures.join("; ")))
+        }
     }
 
     /// Returns the peer ticket keyring every child in this cluster loads.
@@ -1710,10 +1880,16 @@ impl BifrostProcessCluster {
         match self.launch(&plan) {
             Ok(mut node) => {
                 let report = node.ready_report().clone();
-                let _ = node.shutdown();
-                Err(ProcessClusterError::Child(format!(
-                    "child started with {defect:?} peer material and reported {report:?}"
-                )))
+                let cleanup = node.shutdown();
+                // The probe's own claim stays primary: the damaged child was
+                // supposed to refuse to start, and it did not. A cleanup
+                // failure is appended rather than substituted.
+                let mut detail =
+                    format!("child started with {defect:?} peer material and reported {report:?}");
+                if let Err(error) = cleanup {
+                    detail.push_str(&format!("; cleanup after it also failed: {error}"));
+                }
+                Err(ProcessClusterError::Child(detail))
             }
             Err(error) => Ok(error.to_string()),
         }
@@ -1749,8 +1925,13 @@ impl BifrostProcessCluster {
             defect: PeerTlsDefect::None,
             volume,
         };
-        let _ = previous.shutdown();
+        // The replacement reuses this pod's label, root, and sockets, so it
+        // cannot be launched until the previous process has actually released
+        // them. A failed shutdown leaves the slot empty rather than racing a
+        // survivor for its own address.
+        let stopped = previous.shutdown();
         drop(previous);
+        stopped?;
         let node = self.launch(&plan)?;
         self.nodes.insert(index, node);
         Ok(self.nodes[index].ready_report())
@@ -1894,7 +2075,7 @@ impl BifrostProcessCluster {
         });
 
         let (command_tx, command_rx) = channel::<ReaperCommand>();
-        let (exit_tx, exit_rx) = channel();
+        let (exit_tx, exit_rx) = std::sync::mpsc::sync_channel(1);
         let reaper_thread = std::thread::spawn(move || reap(child, &command_rx, &exit_tx));
 
         let mut node = ProcessNode {
@@ -1944,8 +2125,12 @@ impl BifrostProcessCluster {
 
 impl Drop for BifrostProcessCluster {
     /// Guarantees no child survives the cluster, even on panic.
+    ///
+    /// The only caller permitted to discard a shutdown result: `Drop` has no
+    /// way to return one, and the alternative — panicking during teardown —
+    /// would hide whatever the test was actually failing on.
     fn drop(&mut self) {
-        self.shutdown();
+        let _ = self.shutdown();
     }
 }
 
@@ -1954,25 +2139,44 @@ impl Drop for BifrostProcessCluster {
 /// Separated onto its own thread because the parent must be able to both wait
 /// for an orderly exit and force one, and `std::process::Child` offers no way
 /// to do that from a single blocking call.
-fn reap(mut child: Child, commands: &Receiver<ReaperCommand>, exited: &Sender<()>) {
+fn reap(
+    mut child: Child,
+    commands: &Receiver<ReaperCommand>,
+    exited: &std::sync::mpsc::SyncSender<Result<(), String>>,
+) {
+    let pid = child.id();
+    let mut first: Option<String> = None;
     loop {
         match child.try_wait() {
             Ok(Some(_)) => break,
             Ok(None) => {}
-            Err(_) => break,
+            Err(error) => {
+                // The status is unreadable, so this loop can no longer decide
+                // anything; the unconditional wait below is still attempted.
+                first.get_or_insert(format!("child pid {pid} status is unreadable: {error}"));
+                break;
+            }
         }
         match commands.recv_timeout(Duration::from_millis(50)) {
             Ok(ReaperCommand::Kill) | Err(RecvTimeoutError::Disconnected) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                if let Err(error) = child.kill() {
+                    first.get_or_insert(format!("child pid {pid} could not be killed: {error}"));
+                }
+                if let Err(error) = child.wait() {
+                    first.get_or_insert(format!("child pid {pid} could not be reaped: {error}"));
+                }
                 break;
             }
             Err(RecvTimeoutError::Timeout) => {}
         }
     }
     // Unconditional, so a child that exited on its own is still reaped.
-    let _ = child.wait();
-    let _ = exited.send(());
+    if let Err(error) = child.wait() {
+        first.get_or_insert(format!("child pid {pid} could not be reaped: {error}"));
+    }
+    // Reported only after every cleanup step that was still possible, so a
+    // caller that receives an error has already had the child reaped for it.
+    let _ = exited.send(first.map_or(Ok(()), Err));
 }
 
 /// Reads one newline-terminated line, refusing an oversized one.
@@ -2021,6 +2225,86 @@ mod child;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The ownership control shape survives the control protocol unchanged.
+    ///
+    /// The snapshot is the parent's only view of a child's retained ownership,
+    /// so a field that silently fails to encode would turn a leak into a
+    /// passing comparison. Encoding it as the real `ControlResponse` and back
+    /// pins both the round trip and the shape itself: fixed scalar fields, no
+    /// unbounded collection, and no tenant, query, graph, or node identity.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the response does not encode, decode, or compare equal.
+    #[test]
+    fn oracle_ownership_snapshot_round_trips() {
+        let snapshot = OracleOwnershipSnapshot {
+            leader_attempts: 1,
+            leader_graphs: 2,
+            leader_cleanup_failures: 3,
+            follower_attempts: 4,
+            follower_graphs: 5,
+            follower_cleanup_failures: 6,
+            active_queries: 7,
+            queued_queries: 8,
+            reserved_memory_bytes: 9,
+            reserved_spill_bytes: 10,
+            peer_pending: 11,
+            peer_running: 12,
+            root_active_queries: 13,
+            root_analytical_queries: 14,
+            root_query_slot_units: 15,
+            root_query_memory_used_bytes: 16,
+            root_query_scratch_used_bytes: 17,
+            root_query_active: true,
+            scratch: ScratchUsage {
+                entries: 18,
+                bytes: 19,
+            },
+            attempts_active: 20.0,
+            exchanges_active: 21.0,
+            fragments_active: 22.0,
+        };
+
+        let encoded = serde_json::to_string(&ControlResponse::OracleOwnership(Box::new(snapshot)))
+            .expect("the ownership response encodes");
+        let decoded: ControlResponse =
+            serde_json::from_str(&encoded).expect("the ownership response decodes");
+        match decoded {
+            ControlResponse::OracleOwnership(returned) => assert_eq!(
+                *returned, snapshot,
+                "every ownership field survives the control protocol"
+            ),
+            other => panic!("expected an ownership snapshot, received {other:?}"),
+        }
+
+        let fields: std::collections::BTreeSet<String> =
+            match serde_json::to_value(snapshot).expect("the snapshot encodes as an object") {
+                serde_json::Value::Object(map) => {
+                    for (name, value) in &map {
+                        assert!(
+                            value.is_number() || value.is_boolean() || name == "scratch",
+                            "{name} is neither a scalar nor the bounded scratch pair"
+                        );
+                    }
+                    map.keys().cloned().collect()
+                }
+                other => panic!("the snapshot is not an object: {other:?}"),
+            };
+        assert_eq!(
+            fields.len(),
+            22,
+            "the ownership shape gained or lost a field without this pin moving"
+        );
+        assert!(
+            !fields.iter().any(|name| name.contains("id")
+                || name.contains("tenant")
+                || name.contains("label")
+                || name.contains("sql")),
+            "an ownership snapshot carries no identity: {fields:?}"
+        );
+    }
 
     /// An oversized control line is refused rather than buffered.
     ///

@@ -117,7 +117,7 @@ async fn prove_graph_lease_owns_exact_resources() -> Result<(), PeerJourneyError
         }
     }
 
-    cluster.shutdown();
+    cluster.shutdown()?;
     Ok(())
 }
 
@@ -243,7 +243,7 @@ async fn prove_terminal_ordering(cause: TerminalCause) -> Result<(), PeerJourney
         // produced it. The killed process has nothing left to release.
         cluster.nodes_mut()[paused].release_execute_pause()?;
     }
-    cluster.shutdown();
+    cluster.shutdown()?;
     Ok(())
 }
 
@@ -316,13 +316,6 @@ const SORT_INPUT_LOWER_BOUND: u64 = 307_200_000 + 1_200_004 + 2_400_000;
 /// Oracle budget, and one Analytical query holding both its slot units is
 /// granted all of it, clamped to the partition ceiling.
 const QUERY_GRANT_BYTES: u64 = 256 * 1024 * 1024;
-
-/// Live gauges that must read exactly zero on either side of a settled query.
-const LIVE_GAUGES: [&str; 3] = [
-    "bifrost_oracle_analytical_attempts_active",
-    "bifrost_oracle_analytical_exchanges_active",
-    "oracle_fragments_active",
-];
 
 /// Counters proving followers exchanged real data rather than empty stages.
 const EXCHANGE_COUNTERS: [&str; 2] = [
@@ -403,7 +396,7 @@ async fn prove_physical_analytical_baseline() -> Result<(), PeerJourneyError> {
 
     peer_planes_are_reachable_from_both_coordinators(&mut cluster).await?;
 
-    cluster.shutdown();
+    cluster.shutdown()?;
     Ok(())
 }
 
@@ -446,14 +439,16 @@ async fn coordinate_baseline(
         .filter(|it| *it != coordinator)
         .collect();
 
-    let mut scratch_before = Vec::new();
-    let mut gauges_before = Vec::new();
+    let mut ownership_before = Vec::new();
     let mut leases_before = Vec::new();
     for index in oracles {
-        scratch_before.push(cluster.nodes_mut()[index].scratch_usage()?);
-        gauges_before.push(cluster.nodes_mut()[index].metric_totals(&LIVE_GAUGES)?);
+        ownership_before.push(cluster.nodes_mut()[index].ownership_snapshot()?);
         leases_before.push(cluster.nodes_mut()[index].graph_leases()?.0);
     }
+    // Sampled inside this iteration, not once for the whole journey: these are
+    // cumulative counters, so a second coordinator that exchanged nothing would
+    // still read above zero on its predecessor's totals.
+    let exchanged_before = cluster.nodes_mut()[coordinator].metric_totals(&EXCHANGE_COUNTERS)?;
 
     let evidence = cluster.nodes_mut()[coordinator].execute_analytical_baseline(sql)?;
 
@@ -549,8 +544,14 @@ async fn coordinate_baseline(
 
     let exchanged = cluster.nodes_mut()[coordinator].metric_totals(&EXCHANGE_COUNTERS)?;
     for family in EXCHANGE_COUNTERS {
-        if exchanged.get(family).copied().unwrap_or_default() <= 0.0 {
-            return Err(format!("coordinator {coordinator} recorded no {family}").into());
+        let before = exchanged_before.get(family).copied().unwrap_or_default();
+        let after = exchanged.get(family).copied().unwrap_or_default();
+        if after <= before {
+            return Err(format!(
+                "coordinator {coordinator} recorded no {family} for this execution: \
+                 {before} then {after}"
+            )
+            .into());
         }
     }
 
@@ -573,19 +574,15 @@ async fn coordinate_baseline(
         if live != 0 {
             return Err(format!("Oracle {index} still holds {live} graph leases").into());
         }
-        let scratch = cluster.nodes_mut()[index].scratch_usage()?;
-        if scratch != scratch_before[index] {
+        // Complete ownership, not a chosen subset: a graph, attempt, cleanup
+        // failure, admitted or queued query, peer reservation, slot unit,
+        // query memory or scratch owner, spill entry, or live gauge that this
+        // execution failed to return diverges here.
+        let ownership = cluster.nodes_mut()[index].ownership_snapshot()?;
+        if ownership != ownership_before[index] {
             return Err(format!(
-                "Oracle {index} left scratch at {scratch:?}, not its {:?} baseline",
-                scratch_before[index]
-            )
-            .into());
-        }
-        let gauges = cluster.nodes_mut()[index].metric_totals(&LIVE_GAUGES)?;
-        if gauges != gauges_before[index] {
-            return Err(format!(
-                "Oracle {index} left live gauges at {gauges:?}, not its {:?} baseline",
-                gauges_before[index]
+                "Oracle {index} left ownership at {ownership:?}, not its {:?} baseline",
+                ownership_before[index]
             )
             .into());
         }

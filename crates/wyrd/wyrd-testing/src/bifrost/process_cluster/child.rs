@@ -208,6 +208,14 @@ async fn serve() -> Result<(), ProcessClusterError> {
                 let (activated, live) = graph_lease_counts(&server);
                 emit(&ControlResponse::GraphLeases { activated, live })?;
             }
+            ControlRequest::OracleOwnership => match ownership_snapshot(&server, &telemetry) {
+                Ok(snapshot) => {
+                    emit(&ControlResponse::OracleOwnership(Box::new(snapshot)))?;
+                }
+                Err(error) => emit(&ControlResponse::Failed {
+                    detail: error.to_string(),
+                })?,
+            },
             ControlRequest::PeerProbe(plan) => {
                 match config
                     .peer_probe(&plan, credentials.as_ref(), &fixture)
@@ -1445,6 +1453,73 @@ fn graph_lease_counts(server: &WyrdTestServer) -> (u64, usize) {
         .state()
         .bifrost_query()
         .map_or((0, 0), |oracle| oracle.engine().graph_lease_counts())
+}
+
+/// Projects every Oracle ownership total this process can still account for.
+///
+/// Purely a read: each field is taken from the owner that already maintains it
+/// — the Analytical execution handle's own live inspection, Oracle's admission
+/// inspection, the process resource root's snapshot, the process scratch tree,
+/// and the installed production gauges. Nothing is recomputed here, so a
+/// journey comparing two of these is comparing production accounting rather
+/// than this harness's arithmetic.
+///
+/// # Errors
+///
+/// Returns [`ProcessClusterError::Child`] when this target composes no Oracle
+/// or Analytical handle, an ownership lock is poisoned, the resource root
+/// cannot be read, or scratch cannot be measured.
+fn ownership_snapshot(
+    server: &WyrdTestServer,
+    telemetry: &crate::bifrost::BifrostTelemetryCapture,
+) -> Result<super::OracleOwnershipSnapshot, ProcessClusterError> {
+    let child = ProcessClusterError::Child;
+    let engine = oracle(server)?;
+    let live = engine
+        .analytical_execution()
+        .ok_or_else(|| child("this target composes no Analytical handle".to_owned()))?
+        .live()
+        .map_err(|error| child(error.to_string()))?;
+    let runtime = engine.runtime_inspection();
+    let root = engine
+        .role_resources()
+        .snapshot()
+        .map_err(|error| child(error.to_string()))?;
+    let scratch = scratch_usage(engine.analytical_spill_root())?;
+    let gauges = metric_totals(
+        telemetry,
+        &[
+            "bifrost_oracle_analytical_attempts_active".to_owned(),
+            "bifrost_oracle_analytical_exchanges_active".to_owned(),
+            "oracle_fragments_active".to_owned(),
+        ],
+    )?;
+    let gauge = |family: &str| gauges.get(family).copied().unwrap_or_default();
+    Ok(super::OracleOwnershipSnapshot {
+        leader_attempts: live.leader.attempts,
+        leader_graphs: live.leader.graphs,
+        leader_cleanup_failures: live.leader.cleanup_failures,
+        follower_attempts: live.follower.attempts,
+        follower_graphs: live.follower.graphs,
+        follower_cleanup_failures: live.follower.cleanup_failures,
+        active_queries: runtime.active_queries,
+        queued_queries: runtime.queued_queries,
+        reserved_memory_bytes: runtime.reserved_memory_bytes,
+        reserved_spill_bytes: runtime.reserved_spill_bytes,
+        peer_pending: runtime.peer_pending,
+        peer_running: runtime.peer_running,
+        root_active_queries: root.oracle_active_queries,
+        root_analytical_queries: root.oracle_analytical_queries,
+        root_query_slot_units: root.oracle_query_slot_units,
+        root_query_memory_used_bytes: u64::try_from(root.oracle_query_memory_used_bytes)
+            .unwrap_or(u64::MAX),
+        root_query_scratch_used_bytes: root.oracle_query_scratch_used_bytes,
+        root_query_active: root.oracle_query_active,
+        scratch,
+        attempts_active: gauge("bifrost_oracle_analytical_attempts_active"),
+        exchanges_active: gauge("bifrost_oracle_analytical_exchanges_active"),
+        fragments_active: gauge("oracle_fragments_active"),
+    })
 }
 
 /// Encodes `rows` deterministic `(id, filter_key)` rows as one Arrow IPC stream.

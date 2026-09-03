@@ -19,6 +19,7 @@ use super::support::{
     CountingObjectStore, PromotionCatalogSeam, PromotionIntegrationFixture, SupervisedPromotion,
     manual_clock,
 };
+use vala_bifrost_redux::forge::ForgeClockControl;
 
 /// Durable snapshot of everything one expiration boundary must have written.
 #[derive(Debug, PartialEq, Eq)]
@@ -114,7 +115,7 @@ async fn seed_running_task(
     let (base_snapshot_id, watermark_timestamp_ms) = watermark;
     sqlx::query(
         "INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,namespace_name,table_name,strategy,lane,base_snapshot_id,plan,plan_hash,estimated_files,estimated_bytes,estimated_parallelism,estimated_memory_bytes,estimated_spill_bytes,large_task_ceiling_bytes,state,attempt_id,claimed_by,claim_expires_at,watermark_snapshot_id,watermark_timestamp_ms,ready_at) \
-         VALUES ($1,$2,'wyrd-redux',$3,$4,'snapshot_expiry','ordinary',$7,'{}'::jsonb,decode(repeat($9,32),'hex'),1,1,1,1,1,1,'running',$5,$6,now()+interval '10 minutes',$7,$8,now())",
+         VALUES ($1,$2,'wyrd-redux',$3,$4,'snapshot_expiry','ordinary',$7,'{\"version\":1,\"inputs\":[],\"parameters\":{\"kind\":\"maintenance\",\"trigger_commit_count\":1}}'::jsonb,decode(repeat($9,32),'hex'),1,1,1,1,1,1,'running',$5,$6,now()+interval '10 minutes',$7,$8,now())",
     )
     .bind(task_id)
     .bind(tenant.as_uuid())
@@ -276,6 +277,7 @@ async fn prepared_claim_releases_sql_before_iceberg_and_hands_exact_names_to_cle
         store,
         seam,
         supervised,
+        control: _control,
         watermark,
     } = expirable_table("expiry_bracket", false).await;
     let forge = supervised.forge();
@@ -351,8 +353,28 @@ struct ExpirableTable {
     seam: Arc<PromotionCatalogSeam>,
     /// Retained production scheduler and worker supervisor.
     supervised: SupervisedPromotion,
+    /// Manual clock control shared by the whole Forge graph.
+    control: ForgeClockControl,
     /// Current head snapshot and its timestamp, used as the task watermark.
     watermark: (i64, i64),
+}
+
+/// Reads the current head snapshot and its timestamp from the real catalog.
+///
+/// # Panics
+///
+/// Panics when the table cannot be loaded or carries no current snapshot.
+async fn head_watermark(fixture: &PromotionIntegrationFixture) -> (i64, i64) {
+    fixture
+        .catalog
+        .iceberg_catalog()
+        .load_table(&fixture.binding.table_ident())
+        .await
+        .expect("fixture table loads")
+        .metadata()
+        .current_snapshot()
+        .map(|snapshot| (snapshot.snapshot_id(), snapshot.timestamp_ms()))
+        .expect("a promotion left a current snapshot")
 }
 
 /// Promotes twice and ages the clock so the older snapshot is expirable.
@@ -390,21 +412,13 @@ async fn expirable_table(name: &str, worker_routed: bool) -> ExpirableTable {
         .expect("manual clock advance");
     // Every seeded task protects the live head, which is the watermark a real
     // claimed attempt would carry.
-    let watermark = fixture
-        .catalog
-        .iceberg_catalog()
-        .load_table(&fixture.binding.table_ident())
-        .await
-        .expect("fixture table loads")
-        .metadata()
-        .current_snapshot()
-        .map(|snapshot| (snapshot.snapshot_id(), snapshot.timestamp_ms()))
-        .expect("two promotions left a current snapshot");
+    let watermark = head_watermark(&fixture).await;
     ExpirableTable {
         fixture,
         store,
         seam,
         supervised,
+        control,
         watermark,
     }
 }
@@ -444,6 +458,7 @@ async fn retryable_catalog_failure_retains_prepared_authority() {
         store,
         seam,
         supervised,
+        control: _control,
         watermark,
     } = expirable_table("expiry_lost_response", false).await;
     let forge = supervised.forge();
@@ -602,6 +617,7 @@ async fn worker_settled_expiration_returns_success_without_a_second_transition()
         store,
         seam: _seam,
         supervised,
+        control: _control,
         watermark,
     } = expirable_table("expiry_worker_settles", true).await;
     let worker = ForgeWorker::new(
@@ -660,4 +676,161 @@ async fn worker_settled_expiration_returns_success_without_a_second_transition()
     );
 
     supervised.shutdown().await;
+}
+
+/// Writes one aged, otherwise eligible never-published Forge object.
+///
+/// The name is an immutable Forge attempt generation, which is the only path
+/// shape orphan collection may reach by listing alone.
+///
+/// # Panics
+///
+/// Panics when the staging operator rejects the write.
+async fn seed_never_published_object(fixture: &PromotionIntegrationFixture) -> String {
+    let path = format!(
+        "{}/data/forge/{}-00001.parquet",
+        fixture.binding.object_prefix,
+        Uuid::now_v7()
+    );
+    fixture
+        .staging
+        .write(&path, b"never published".to_vec())
+        .await
+        .expect("the orphan object seeds");
+    path
+}
+
+/// Reports whether the seeded orphan object still exists in staging.
+///
+/// # Panics
+///
+/// Panics when the staging operator fails for a reason other than absence.
+async fn object_exists(fixture: &PromotionIntegrationFixture, path: &str) -> bool {
+    match fixture.staging.stat(path).await {
+        Ok(_) => true,
+        Err(error) if error.kind() == opendal::ErrorKind::NotFound => false,
+        Err(error) => panic!("staging stat failed: {error}"),
+    }
+}
+
+/// Proves neither fresh nor recovered expiration deletes a never-published object.
+///
+/// Each half runs on its own table: one pass expires every eligible ancestor,
+/// so proving fresh and recovered expiration on one table would mean promoting
+/// on top of an already-expired ancestry, which is a different scenario.
+///
+/// # Panics
+///
+/// Panics when an expiration deletes anything, or when the retained orphan
+/// owner cannot delete the same object afterwards.
+#[tokio::test]
+async fn worker_expiration_never_runs_orphan_cleanup() {
+    let fresh = expirable_table("expiry_no_orphan_fresh", true).await;
+    let orphan = seed_never_published_object(&fresh.fixture).await;
+    let deletes_before = fresh.store.deletes();
+    let worker = ForgeWorker::new(
+        fresh.supervised.forge(),
+        ForgeWorkerConfig::default(),
+        Uuid::now_v7(),
+    )
+    .expect("fixture Forge worker");
+    let fresh_task = seed_ready_expiry_task(&fresh.fixture, fresh.watermark, "55").await;
+    let claim = worker
+        .claim_for_test()
+        .await
+        .expect("the production claim transaction runs")
+        .expect("the ready snapshot-expiry task is claimable");
+    assert_eq!(claim.task_id, fresh_task);
+    worker
+        .execute_snapshot_expiry_claim_for_test(claim, &CancellationToken::new())
+        .await
+        .expect("fresh expiration succeeds");
+    assert_eq!(
+        expiry_state(&fresh.fixture, fresh_task).await.task_state,
+        "succeeded"
+    );
+    assert!(
+        object_exists(&fresh.fixture, &orphan).await,
+        "fresh expiration deleted a never-published object"
+    );
+    assert_eq!(
+        fresh.store.deletes(),
+        deletes_before,
+        "fresh expiration invoked physical cleanup"
+    );
+    // The retained owner, and only it, may reclaim the same object.
+    let deleted = fresh
+        .supervised
+        .forge()
+        .run_orphan_gc_for_test(&fresh.fixture.binding)
+        .await
+        .expect("the independent orphan strategy runs");
+    assert_eq!(deleted, 1, "the orphan owner deletes exactly its candidate");
+    assert!(
+        !object_exists(&fresh.fixture, &orphan).await,
+        "the orphan owner did not delete the object it reported"
+    );
+    fresh.supervised.shutdown().await;
+
+    let recovered = expirable_table("expiry_no_orphan_takeover", true).await;
+    let orphan = seed_never_published_object(&recovered.fixture).await;
+    let deletes_before = recovered.store.deletes();
+    let forge = recovered.supervised.forge();
+    let (prepared_task, _attempt, _prepared) = prepare_and_abandon_at_the_catalog_gate(
+        &recovered.fixture,
+        &recovered.seam,
+        &forge,
+        recovered.watermark,
+    )
+    .await;
+    sqlx::query("UPDATE vala.maintenance_leases SET expires_at = now() - interval '1 hour'")
+        .execute(recovered.fixture.operator_pool.pool())
+        .await
+        .expect("the dead preparing worker's lease ages out");
+    sqlx::query(
+        "UPDATE vala.forge_tasks SET claim_expires_at = now() - interval '1 hour' WHERE task_id = $1",
+    )
+    .bind(prepared_task)
+    .execute(recovered.fixture.operator_pool.pool())
+    .await
+    .expect("the prepared claim ages out");
+    let successor = ForgeWorker::new(
+        Arc::clone(&forge),
+        ForgeWorkerConfig::default(),
+        Uuid::now_v7(),
+    )
+    .expect("fixture successor worker");
+    assert!(
+        successor
+            .execute_one_for_test(&CancellationToken::new())
+            .await
+            .expect("prepared reconciliation settles the taken-over expiration"),
+        "the successor found the prepared task"
+    );
+    assert_eq!(
+        expiry_state(&recovered.fixture, prepared_task)
+            .await
+            .task_state,
+        "succeeded"
+    );
+    assert!(
+        object_exists(&recovered.fixture, &orphan).await,
+        "recovered expiration deleted a never-published object"
+    );
+    assert_eq!(
+        recovered.store.deletes(),
+        deletes_before,
+        "recovered expiration invoked physical cleanup"
+    );
+    let deleted = forge
+        .run_orphan_gc_for_test(&recovered.fixture.binding)
+        .await
+        .expect("the independent orphan strategy runs");
+    assert_eq!(deleted, 1, "the orphan owner deletes exactly its candidate");
+    assert!(
+        !object_exists(&recovered.fixture, &orphan).await,
+        "the orphan owner did not delete the object it reported"
+    );
+
+    recovered.supervised.shutdown().await;
 }

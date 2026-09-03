@@ -364,10 +364,8 @@ impl Forge {
         };
         let evidence = self
             .settle_expiration(
-                lease,
-                key,
                 binding,
-                authority,
+                &expiration_authority(authority, lease),
                 &claim_table,
                 &detail,
                 &expired_files,
@@ -1104,10 +1102,8 @@ impl Forge {
         };
         let evidence = self
             .settle_expiration(
-                lease,
-                key,
                 binding,
-                authority,
+                &expiration_authority(authority, lease),
                 &claim_table,
                 &detail,
                 &expired_files,
@@ -1256,18 +1252,20 @@ impl Forge {
     /// Cleanup candidates are derived here and handed to separate cleanup
     /// through task evidence; this owner performs no delete of its own.
     ///
+    /// Tenant and table identity come from `binding`, and the caller projects
+    /// its claimed task and live lease into `authority` before calling, so
+    /// this operation carries exactly the terms the settlement transaction
+    /// verifies and nothing that would have to agree with them.
+    ///
     /// # Errors
     ///
     /// Returns path-binding, evidence, object-store, or [`ForgeError::Sql`]
     /// failures. A failure before the settlement commit leaves operation, task,
     /// and claims Prepared for exact replay.
-    #[allow(clippy::too_many_arguments)]
     async fn settle_expiration(
         &self,
-        lease: &ForgeLease,
-        key: &ForgeTableKey,
         binding: &TenantTableBinding,
-        authority: &ExpiryTaskAuthority,
+        authority: &ForgeExpirationAuthority,
         table: &ForgeClaimTable,
         detail: &AuditDetail,
         expired_files: &ExpiredFileSet,
@@ -1276,8 +1274,8 @@ impl Forge {
         let committed = self.load_table(&binding.table_ident()).await?;
         let identity = ForgeTaskTableIdentity::new(
             BIFROST_CATALOG_NAME,
-            key.table_ref.namespace.as_str(),
-            key.table_ref.name.as_str(),
+            binding.table_ref.namespace.as_str(),
+            binding.table_ref.name.as_str(),
         )
         .map_err(ForgeError::Sql)?;
         let mut evidence = self.committed_evidence(binding, &committed).await?;
@@ -1303,7 +1301,7 @@ impl Forge {
             AuditResult::Success,
         )?;
         let task_event = super::worker::task_event(
-            authority.task,
+            authority.task_id,
             ForgeTaskState::Succeeded,
             "snapshot expiration settled with exact cleanup candidates",
         );
@@ -1314,9 +1312,9 @@ impl Forge {
         .map_err(ForgeError::Sql)?
         .settle_snapshot_expiration(
             &self.core.operator_pool,
-            key.tenant,
+            binding.tenant,
             &ForgeExpirationSettlementRequest {
-                authority: &expiration_authority(authority, lease),
+                authority,
                 table,
                 settlement,
                 evidence: &evidence,

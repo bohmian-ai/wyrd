@@ -2099,9 +2099,6 @@ impl ForgeWorker {
                         .to_owned(),
                 });
             }
-            ForgeMaintenance::new(Arc::clone(&self.forge))
-                .collect_never_published(lease, &key, binding, stop)
-                .await?;
             if stop.is_cancelled() {
                 return Err(ForgeError::Shutdown);
             }
@@ -3888,13 +3885,6 @@ impl ForgeWorker {
         // and planning demand in one transaction and deliberately deleted
         // nothing: its exact candidates are the handoff to separate cleanup.
         if let Some(evidence) = result.expiry_evidence {
-            let key = super::compact::ForgeTableKey {
-                tenant: claim.data_tenant_id,
-                table_ref: binding.table_ref.clone(),
-            };
-            ForgeMaintenance::new(Arc::clone(&self.forge))
-                .collect_never_published(lease, &key, binding, stop)
-                .await?;
             return Ok((evidence, ForgeExecutionEvidenceState::Settled));
         }
         let mut evidence = self.committed_evidence(binding, &result.table).await?;

@@ -3066,6 +3066,8 @@ impl AnalyticalGraphLifecycle {
                 break;
             }
             if self.supervisor.graph_children_idle(self.graph)? {
+                #[cfg(feature = "test-support")]
+                analytical_cleanup_pause_for_test().hold().await;
                 // Removing the entry drops the envelope and only then the
                 // admission permit it retained, so the counters that wake the
                 // next query are returned last.
@@ -3373,12 +3375,81 @@ fn poisoned_ingress() -> BifrostError {
     }
 }
 
-/// Rebuilds a follower session over one graph's material without upstream.
+/// One-shot pause held immediately before a clean Analytical graph release.
 ///
-/// Used by the extension-surface proof so the *same* installation logic can be
-/// checked against a plain [`SessionStateBuilder`], which is what makes a
-/// regression in [`AnalyticalSessionBuilder`] attributable to Wyrd rather than
-/// to an upstream change.
+/// A journey needs a window in which every owner is still held but cleanup has
+/// already begun, which is otherwise unobservable: the release is a single
+/// synchronous step. Arming this pause stops exactly one graph on that step
+/// until the test releases it, so status, ownership, and readiness can be read
+/// while the query is genuinely mid-cleanup.
+#[cfg(feature = "test-support")]
+#[derive(Debug, Default)]
+pub struct AnalyticalCleanupPause {
+    /// Whether one graph should still be stopped before its release.
+    armed: std::sync::atomic::AtomicBool,
+    /// Whether a graph has reached the pause.
+    entered: std::sync::atomic::AtomicBool,
+    /// Wakes a waiter once a graph reaches the pause.
+    entered_notify: tokio::sync::Notify,
+    /// Wakes the paused graph once the test releases it.
+    release_notify: tokio::sync::Notify,
+}
+
+#[cfg(feature = "test-support")]
+impl AnalyticalCleanupPause {
+    /// Arms the pause for the next graph that reaches a clean release.
+    pub fn arm(&self) {
+        self.entered
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.armed.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Waits until a graph is stopped on its release step.
+    pub async fn wait_entered(&self) {
+        while !self.entered.load(std::sync::atomic::Ordering::Acquire) {
+            self.entered_notify.notified().await;
+        }
+    }
+
+    /// Releases the paused graph and disarms the pause.
+    pub fn release(&self) {
+        self.armed
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.release_notify.notify_waiters();
+    }
+
+    /// Stops one armed graph here, consuming the arming exactly once.
+    ///
+    /// Unarmed graphs pass straight through, so production release behavior is
+    /// unchanged when nothing is testing it.
+    async fn hold(&self) {
+        if !self.armed.swap(false, std::sync::atomic::Ordering::AcqRel) {
+            return;
+        }
+        let released = self.release_notify.notified();
+        tokio::pin!(released);
+        self.entered
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.entered_notify.notify_waiters();
+        released.await;
+    }
+}
+
+/// Process-wide cleanup pause shared by the test harness and the lifecycle.
+#[cfg(feature = "test-support")]
+static ANALYTICAL_CLEANUP_PAUSE: std::sync::OnceLock<std::sync::Arc<AnalyticalCleanupPause>> =
+    std::sync::OnceLock::new();
+
+/// Returns the process-wide Analytical cleanup pause.
+#[cfg(feature = "test-support")]
+#[must_use]
+pub fn analytical_cleanup_pause_for_test() -> std::sync::Arc<AnalyticalCleanupPause> {
+    std::sync::Arc::clone(
+        ANALYTICAL_CLEANUP_PAUSE
+            .get_or_init(|| std::sync::Arc::new(AnalyticalCleanupPause::default())),
+    )
+}
+
 #[cfg(test)]
 fn install_graph_runtime(
     builder: datafusion::execution::SessionStateBuilder,

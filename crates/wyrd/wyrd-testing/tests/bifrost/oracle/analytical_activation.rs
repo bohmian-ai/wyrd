@@ -17,11 +17,15 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 use futures_util::StreamExt as _;
+use vala_bifrost_redux::oracle::analytical::{
+    AnalyticalCleanupPause, AnalyticalLiveInspection, analytical_cleanup_pause_for_test,
+};
 use vala_bifrost_redux::oracle::{
     AuthorizedQueryContext, Oracle, OracleQueryStream, QueryIpcDecoder,
 };
-use vala_sdk::BifrostGrpcTransport;
+use vala_sdk::{BifrostGrpcTransport, QueryClient};
 use wyrd_client::WyrdClient;
+use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
     BifrostQueryRequest, FreshnessPolicy, QueryExecutionPath, QueryStreamFrame, VisibilityMode,
 };
@@ -316,5 +320,262 @@ fn expect(
     if settled.rows != rows {
         return Err(format!("{case}: expected {rows} rows, saw {}", settled.rows).into());
     }
+    Ok(())
+}
+
+/// Bounded polls the journey waits for a retired public running entry.
+const RETIREMENT_POLLS: usize = 50;
+
+/// Waits, bounded, until one request identity is no longer a running query.
+///
+/// Retirement is what proves the server released the owners the stream held.
+/// It is polled rather than read once because the transport drop that triggers
+/// it is observed by the server, not published by the client.
+///
+/// # Errors
+///
+/// Returns a transport error, or a description naming the case whose entry was
+/// still running when the bound expired.
+async fn await_retired(
+    query: &QueryClient,
+    request_id: &RequestId,
+    case: &str,
+) -> Result<(), JourneyError> {
+    for _ in 0..RETIREMENT_POLLS {
+        match query.status(request_id).await {
+            Err(error) if error.code() == "WYRD_VALA_404_RUNNING_QUERY_NOT_FOUND" => return Ok(()),
+            Err(error) => return Err(format!("{case}: status probe failed: {error}").into()),
+            Ok(_) => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+        }
+    }
+    Err(format!("{case}: running entry was never retired").into())
+}
+
+/// Reports whether every Oracle node currently retains no Analytical ownership.
+///
+/// # Errors
+///
+/// Returns the first node inspection error.
+fn nodes_clean(cluster: &WyrdTestCluster) -> Result<bool, JourneyError> {
+    Ok(live_ownership(cluster)?
+        .iter()
+        .all(AnalyticalLiveInspection::is_clean))
+}
+
+/// Interactive streams are graphless and settle on their own; only a selected
+/// Analytical query keeps its running entry and graph ownership until the
+/// leader lifecycle's cleanup join completes.
+#[tokio::test]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn transport_drop_retains_running_status_until_cleanup_joins() {
+    prove_cleanup_ownership()
+        .await
+        .expect("production analytical cleanup ownership journey");
+}
+
+/// Drives the graphless-Interactive and paused-Analytical cases on one cluster.
+///
+/// # Errors
+///
+/// Returns a cluster, execution, ownership, transport, or assertion error.
+async fn prove_cleanup_ownership() -> Result<(), JourneyError> {
+    let cluster =
+        WyrdTestCluster::start_spec(BifrostClusterSpec::three_oracles_one_scribe()).await?;
+    let tenant = cluster.data_tenant_id();
+    let table = seed_table(&cluster, "analytical_cleanup").await?;
+    let empty = {
+        let ingest = cluster
+            .servers()
+            .find(|server| server.bifrost_scribe().is_some())
+            .ok_or("missing ingest node")?;
+        let name = unique_table("analytical_cleanup_empty");
+        register_table(ingest, tenant, &name).await?;
+        cluster.refresh_oracle_snapshots().await?;
+        name
+    };
+    let query_server = cluster.server(0).ok_or("missing query node")?;
+    let engine = Arc::clone(
+        query_server
+            .state()
+            .bifrost_query()
+            .ok_or("query node composed no Oracle")?
+            .engine(),
+    );
+    let public = client(query_server, "analytical-cleanup-reader").await?;
+    let query = QueryClient::new(&public);
+
+    let plain = format!("SELECT id FROM vala.bifrost.{table} WHERE filter_key = 'group_0'");
+    let grouped = format!(
+        "SELECT filter_key, COUNT(*) AS matched FROM vala.bifrost.{table} GROUP BY filter_key"
+    );
+    let no_exchange = format!(
+        "SELECT filter_key, COUNT(*) AS matched FROM vala.bifrost.{empty} GROUP BY filter_key"
+    );
+
+    for (case, sql, refuse) in [
+        ("direct interactive", plain.as_str(), false),
+        ("unsupported fallback", grouped.as_str(), true),
+        ("no-exchange fallback", no_exchange.as_str(), false),
+    ] {
+        if refuse {
+            engine.fail_next_analytical_plan_for_test();
+        }
+        let mut stream = query.query(&request(sql)).await?;
+        let request_id = stream.request_id().clone();
+        stream.next_batch().await?;
+        if !nodes_clean(&cluster)? {
+            return Err(format!("{case}: Interactive attempt registered a graph").into());
+        }
+        drop(stream);
+        await_retired(&query, &request_id, case).await?;
+        if !nodes_clean(&cluster)? {
+            return Err(format!("{case}: Interactive retirement left graph ownership").into());
+        }
+    }
+
+    prove_paused_cleanup(&cluster, &query, &grouped).await?;
+    prove_paused_cleanup_over_grpc(&cluster, query_server, &public, &grouped).await?;
+
+    cluster.shutdown().await?;
+    Ok(())
+}
+
+/// Holds one selected Analytical graph on its clean release over HTTP.
+///
+/// # Errors
+///
+/// Returns a transport, pause, ownership, or assertion error.
+async fn prove_paused_cleanup(
+    cluster: &WyrdTestCluster,
+    query: &QueryClient,
+    sql: &str,
+) -> Result<(), JourneyError> {
+    let pause = analytical_cleanup_pause_for_test();
+    pause.arm();
+    let mut stream = query.query(&request(sql)).await?;
+    let request_id = stream.request_id().clone();
+    let drain = tokio::spawn(async move {
+        while stream.next_batch().await?.is_some() {}
+        Ok::<_, vala_sdk::ValaSdkError>(stream.terminal().map(|frame| frame.execution_path))
+    });
+    hold_and_release(
+        cluster,
+        query,
+        &request_id,
+        &pause,
+        "http selected analytical",
+    )
+    .await?;
+    let path = drain
+        .await??
+        .ok_or("http selected analytical: stream emitted no terminal frame")?;
+    if path != QueryExecutionPath::Analytical {
+        return Err(format!("http selected analytical: settled on {path:?}").into());
+    }
+    await_retired(query, &request_id, "http selected analytical").await?;
+    await_clean_nodes(cluster).await?;
+    Ok(())
+}
+
+/// Holds one selected Analytical graph on its clean release over gRPC.
+///
+/// # Errors
+///
+/// Returns a transport, pause, ownership, or assertion error.
+async fn prove_paused_cleanup_over_grpc(
+    cluster: &WyrdTestCluster,
+    server: &wyrd_testing::WyrdTestServer,
+    public: &WyrdClient,
+    sql: &str,
+) -> Result<(), JourneyError> {
+    use wyrd_tonic::wyrd::v1 as proto;
+    use wyrd_tonic::wyrd::v1::bifrost_query_service_client::BifrostQueryServiceClient;
+
+    let channel = wyrd_tonic::tonic::transport::Endpoint::from_shared(
+        server.grpc_url().ok_or("missing gRPC URL")?,
+    )?
+    .connect()
+    .await?;
+    let bearer = public.auth().bearer().await?;
+    let mut grpc = BifrostQueryServiceClient::new(channel);
+    let mut request =
+        wyrd_tonic::tonic::Request::new(proto::BifrostQueryRequest::from(request(sql)));
+    request.metadata_mut().insert(
+        "x-wyrd-access-token",
+        format!("Bearer {}", bearer.expose()).parse()?,
+    );
+
+    let pause = analytical_cleanup_pause_for_test();
+    pause.arm();
+    let response = grpc.query(request).await?;
+    let deadline_ms: i64 = response
+        .metadata()
+        .get("x-wyrd-query-deadline-ms")
+        .ok_or("gRPC query response omits x-wyrd-query-deadline-ms")?
+        .to_str()?
+        .parse()?;
+    if deadline_ms < 0 {
+        return Err(format!("gRPC query deadline {deadline_ms} is negative").into());
+    }
+    let request_id = RequestId::parse(
+        response
+            .metadata()
+            .get("x-wyrd-request-id")
+            .ok_or("gRPC query response omits x-wyrd-request-id")?
+            .to_str()?,
+    )?;
+    let mut frames = response.into_inner();
+    let drain = tokio::spawn(async move {
+        let mut path = None;
+        while let Some(frame) = frames.next().await {
+            if let Some(proto::query_stream_frame::Frame::Terminal(terminal)) = frame?.frame {
+                path = Some(terminal.execution_path);
+            }
+        }
+        Ok::<_, JourneyError>(path)
+    });
+    let query = QueryClient::new(public);
+    hold_and_release(
+        cluster,
+        &query,
+        &request_id,
+        &pause,
+        "grpc selected analytical",
+    )
+    .await?;
+    let path = drain
+        .await??
+        .ok_or("grpc selected analytical: stream emitted no terminal frame")?;
+    if path != proto::QueryExecutionPath::Analytical as i32 {
+        return Err(format!("grpc selected analytical: settled on path {path}").into());
+    }
+    await_retired(&query, &request_id, "grpc selected analytical").await?;
+    await_clean_nodes(cluster).await?;
+    Ok(())
+}
+
+/// Asserts running status and graph ownership survive the paused release.
+///
+/// # Errors
+///
+/// Returns a timeout, transport, ownership, or assertion error naming the case.
+async fn hold_and_release(
+    cluster: &WyrdTestCluster,
+    query: &QueryClient,
+    request_id: &RequestId,
+    pause: &AnalyticalCleanupPause,
+    case: &str,
+) -> Result<(), JourneyError> {
+    tokio::time::timeout(std::time::Duration::from_secs(120), pause.wait_entered())
+        .await
+        .map_err(|_| format!("{case}: cleanup never reached the graph release pause"))?;
+    query
+        .status(request_id)
+        .await
+        .map_err(|error| format!("{case}: running entry retired before cleanup joined: {error}"))?;
+    if nodes_clean(cluster)? {
+        return Err(format!("{case}: graph ownership was released before cleanup joined").into());
+    }
+    pause.release();
     Ok(())
 }

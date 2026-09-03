@@ -776,8 +776,9 @@ async fn worker_settled_expiration_returns_success_without_a_second_transition()
 /// Panics when the staging operator rejects the write.
 async fn seed_never_published_object(fixture: &PromotionIntegrationFixture) -> String {
     let path = format!(
-        "{}/data/forge/{}-00001.parquet",
+        "{}/data/forge/v1/{}-00001-{}.parquet",
         fixture.binding.object_prefix,
+        Uuid::now_v7(),
         Uuid::now_v7()
     );
     fixture

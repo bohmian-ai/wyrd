@@ -724,7 +724,7 @@ impl ForgeMaintenance {
         let started = Instant::now();
         let result = self
             .forge
-            .run_orphan_gc_for_table(lease, key, binding, now, stop)
+            .run_orphan_gc_for_table(lease, key, binding, now, None, stop)
             .await;
         let elapsed = started.elapsed();
         self.forge.core.telemetry.record_stage(

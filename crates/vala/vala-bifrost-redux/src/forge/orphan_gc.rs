@@ -28,6 +28,7 @@ use wyrd_spec::vala::api::{
 
 use vala_sql::row_types::forge_tasks::ForgeCleanupCandidate;
 
+use crate::catalog::layout::{FORGE_DATA_MARKER, FORGE_WRITER_RECIPE};
 use crate::catalog::{BIFROST_CATALOG_NAME, TenantTableBinding};
 
 use super::Forge;
@@ -38,6 +39,7 @@ use super::lease::ForgeLease;
 #[cfg(feature = "test-support")]
 use super::lease::forge_lease_key;
 use super::live_reconcile::DestructiveMaintenance;
+use super::managed::identity::ForgeOutputIdentity;
 use super::path::{catalog_path_to_object_key, validate_table_location};
 use super::protection_roots::OrphanProtectionRoots;
 
@@ -228,7 +230,7 @@ impl MaintenanceProtection {
         let Some(normalized) = binding.validate_object_path(path) else {
             return GcEligibility::InvalidPath;
         };
-        if !scope.admits(&normalized) {
+        if !scope.admits(binding, &normalized) {
             return GcEligibility::InvalidPath;
         }
         if self.destructive_maintenance == DestructiveMaintenance::Blocked
@@ -265,31 +267,32 @@ enum MaintenanceScope {
 
 impl MaintenanceScope {
     /// Reports whether this scope may consider the normalized object key.
-    fn admits(self, normalized: &str) -> bool {
+    ///
+    /// Attempt-generation scope defers entirely to the writer's own recipe
+    /// grammar, so cleanup can never recognize a shape the writer does not
+    /// emit. Scribe pod/ULID names and catalog-owned metadata deliberately fail
+    /// that parse and remain reclaimable only from committed expiry evidence.
+    fn admits(self, binding: &TenantTableBinding, normalized: &str) -> bool {
         match self {
-            Self::AttemptGeneration => is_forge_attempt_generation(normalized),
+            Self::AttemptGeneration => {
+                ForgeOutputIdentity::parse(normalized, &forge_data_prefix(binding)).is_ok()
+            }
             Self::ExpiredCandidate => true,
         }
     }
 }
 
-/// Recognize only immutable Forge attempt-generation data paths.
+/// Returns this binding's current Forge recipe root as a normalized object key.
 ///
-/// Scribe pod/ULID names and generic Iceberg metadata paths deliberately fail
-/// this predicate and can be reclaimed only from committed expiry evidence.
-fn is_forge_attempt_generation(path: &str) -> bool {
-    let Some((_, file_name)) = path.rsplit_once("/data/forge/") else {
-        return false;
-    };
-    let Some(stem) = file_name.strip_suffix(".parquet") else {
-        return false;
-    };
-    let Some((generation, ordinal)) = stem.rsplit_once('-') else {
-        return false;
-    };
-    ordinal.len() == 5
-        && ordinal.bytes().all(|byte| byte.is_ascii_digit())
-        && Uuid::parse_str(generation).is_ok_and(|uuid| uuid.get_version_num() == 7)
+/// The catalog's `forge_data_location` is derived from the table location; the
+/// binding's `object_prefix` is that same table's object-key form, so appending
+/// the fixed marker and recipe here yields the identical root without needing a
+/// loaded table.
+fn forge_data_prefix(binding: &TenantTableBinding) -> String {
+    format!(
+        "{}{FORGE_DATA_MARKER}{FORGE_WRITER_RECIPE}",
+        binding.object_prefix.trim_end_matches('/')
+    )
 }
 
 /// Validated identity of the one prepared GC batch allowed to finish itself.
@@ -312,6 +315,11 @@ struct GcTableContext<'context> {
     now: DateTime<Utc>,
     /// Cancellation boundary checked before every destructive transition.
     stop: &'context CancellationToken,
+    /// Immutable inclusive age cutoff captured when the periodic task was
+    /// planned, in epoch milliseconds. `None` falls back to the configured
+    /// orphan-GC TTL applied to `now`, which is what every non-task caller
+    /// uses.
+    age_cutoff_ms: Option<i64>,
 }
 
 /// Inputs that distinguish a fresh protection load from a GC self-reload.
@@ -528,6 +536,7 @@ impl Forge {
         key: &ForgeTableKey,
         binding: &TenantTableBinding,
         now: DateTime<Utc>,
+        age_cutoff_ms: Option<i64>,
         stop: &CancellationToken,
     ) -> Result<OrphanGcOutcome, ForgeError> {
         let table = GcTableContext {
@@ -535,6 +544,7 @@ impl Forge {
             binding,
             now,
             stop,
+            age_cutoff_ms,
         };
         self.run_orphan_gc_for_table_inner(lease, &table).await
     }
@@ -575,6 +585,7 @@ impl Forge {
             binding,
             now,
             stop,
+            age_cutoff_ms: None,
         };
         self.load_maintenance_protection(ProtectionRequest {
             table: &table,
@@ -605,6 +616,7 @@ impl Forge {
             binding,
             now: self.core.clock.now()?,
             stop: &stop,
+            age_cutoff_ms: None,
         };
         self.load_maintenance_protection(ProtectionRequest {
             table: &table,
@@ -637,6 +649,7 @@ impl Forge {
             binding,
             now: self.core.clock.now()?,
             stop: &stop,
+            age_cutoff_ms: None,
         };
         let protection = self
             .load_maintenance_protection(ProtectionRequest {
@@ -771,6 +784,7 @@ impl Forge {
                 &key,
                 binding,
                 self.core.clock.now()?,
+                None,
                 &CancellationToken::new(),
             )
             .await?;
@@ -945,7 +959,15 @@ impl Forge {
             blocked: durable.blocked,
         }
         .compose()?;
-        let object_age_cutoff = self.gc_object_age_cutoff(table_context.now)?;
+        let object_age_cutoff = match table_context.age_cutoff_ms {
+            Some(cutoff_ms) => {
+                Timestamp::from_millisecond(cutoff_ms).map_err(|_| ForgeError::InvalidConfig {
+                    detail: "orphan cleanup cutoff cannot be represented by object storage"
+                        .to_owned(),
+                })?
+            }
+            None => self.gc_object_age_cutoff(table_context.now)?,
+        };
         Ok(MaintenanceProtection::new(
             composed.live_set,
             composed.blocked,
@@ -1665,13 +1687,6 @@ impl Forge {
         validate_table_location(binding, metadata.location(), &self.core.staging)
     }
 
-    /// Apply generic Forge-generation eligibility to a test fixture path.
-    #[cfg(feature = "test-support")]
-    #[must_use]
-    pub fn known_iceberg_object_for_test(path: &str) -> bool {
-        is_forge_attempt_generation(path)
-    }
-
     /// Load the exact terminal Reset generation set used by production GC.
     ///
     /// # Errors
@@ -1790,10 +1805,11 @@ mod tests {
             TableRef::new(BifrostNamespace::Traces, "spans"),
         ))
         .expect("binding");
-        let forge_path = |generation: Uuid| {
+        let forge_path = |attempt: Uuid| {
             format!(
-                "{}/data/forge/{generation}-00000.parquet",
-                binding.object_prefix
+                "{}{FORGE_DATA_MARKER}{FORGE_WRITER_RECIPE}/{attempt}-00000-{}.parquet",
+                binding.object_prefix,
+                Uuid::now_v7()
             )
         };
         let old_path = forge_path(Uuid::now_v7());
@@ -1989,24 +2005,223 @@ mod tests {
         );
     }
 
-    /// A Forge attempt generation is recognized by the `/data/forge/` segment
-    /// alone, so no recipe or other path-smuggled value can strand a
-    /// generation outside the collector's reach. Scribe pod/ULID and
-    /// Iceberg-owned paths still fail the predicate.
+    /// Every orphan-protection root is load-bearing on its own.
+    ///
+    /// Never-published orphan collection deletes objects no catalog snapshot
+    /// names, so the only thing standing between a bounded listing and data
+    /// loss is the completeness of the protected union and the closed
+    /// eligibility truth applied over it. This removes one authority at a time
+    /// — catalog reachability, committed-but-unpromoted `file_list` objects,
+    /// the staged/prepared/open/possible/uncertain output root, snapshot
+    /// lineage, an Oracle reader pin, the tenant/table binding, the
+    /// destructive-maintenance gate that lease loss and fence loss raise, and
+    /// the object age floor — and requires each removal to either expose an
+    /// object as unsafely eligible or fail closed. A root that can be dropped
+    /// with no observable consequence is a root that is no longer protecting
+    /// anything.
     #[test]
-    fn forge_attempt_generation_recognition_contract() {
-        let generation = Uuid::now_v7();
-        assert!(is_forge_attempt_generation(&format!(
-            "tenant/table/data/forge/{generation}-00000.parquet"
-        )));
-        assert!(!is_forge_attempt_generation(&format!(
-            "tenant/table/data/forge/bifrost-writer-v2/{generation}-00000.parquet"
-        )));
-        assert!(!is_forge_attempt_generation(
-            "tenant/table/data/pod-a-01JABC.parquet"
-        ));
-        assert!(!is_forge_attempt_generation(
-            "tenant/table/metadata/v1.metadata.json"
-        ));
+    fn orphan_policy_root_mutation_matrix() {
+        use crate::catalog::TableRef;
+        use crate::forge::protection_roots::OrphanProtectionRoots;
+        use crate::namespaces::BifrostNamespace;
+
+        let binding = TenantTableBinding::resolve((
+            DataTenantId::new_v7(),
+            TableRef::new(BifrostNamespace::Traces, "spans"),
+        ))
+        .expect("binding");
+        let output = |attempt: Uuid| {
+            format!(
+                "{}{FORGE_DATA_MARKER}{FORGE_WRITER_RECIPE}/{attempt}-00000-{}.parquet",
+                binding.object_prefix,
+                Uuid::now_v7()
+            )
+        };
+        let catalog_output = output(Uuid::now_v7());
+        let open_output = output(Uuid::now_v7());
+        let orphan = output(Uuid::now_v7());
+        let hot_scribe = format!("{}/data/pod-a-01JHOT.parquet", binding.object_prefix);
+
+        let roots = || OrphanProtectionRoots {
+            catalog: {
+                let mut set = ProtectedLiveSet::default();
+                set.insert(catalog_output.clone());
+                set
+            },
+            traversed_snapshot_ids: vec![10, 20],
+            hot_unpromoted: vec![hot_scribe.clone()],
+            open_outputs: vec![open_output.clone()],
+            pinned_snapshot_ids: vec![20],
+            blocked: false,
+        };
+        let cutoff = Timestamp::from_millisecond(24 * 60 * 60 * 1_000).expect("timestamp");
+        let now = DateTime::<Utc>::from_timestamp_millis(48 * 60 * 60 * 1_000).expect("time");
+        let protection_from = |roots: OrphanProtectionRoots| {
+            let composed = roots.compose().expect("roots compose");
+            MaintenanceProtection::new(composed.live_set, composed.blocked, now, cutoff)
+        };
+        let aged = opendal::Metadata::new(EntryMode::FILE)
+            .with_last_modified(Timestamp::from_millisecond(0).expect("timestamp"));
+        let young = opendal::Metadata::new(EntryMode::FILE).with_last_modified(
+            Timestamp::from_millisecond(47 * 60 * 60 * 1_000).expect("timestamp"),
+        );
+
+        let complete = protection_from(roots());
+        assert_eq!(
+            complete.gc_eligibility(&binding, &orphan, ObjectEvidence::Present(&aged)),
+            GcEligibility::Eligible,
+            "an aged output no authority names is exactly what this protocol collects"
+        );
+        for (protected, why) in [
+            (
+                &catalog_output,
+                "a catalog-reachable output is never an orphan",
+            ),
+            (
+                &open_output,
+                "a staged, prepared, open, possible, or uncertain output is still owned",
+            ),
+        ] {
+            assert_eq!(
+                complete.gc_eligibility(&binding, protected, ObjectEvidence::Present(&aged)),
+                GcEligibility::Protected,
+                "{why}"
+            );
+        }
+        assert!(
+            complete.live_set.contains(&hot_scribe),
+            "a committed but unpromoted Scribe object is inside the protected union"
+        );
+
+        // Catalog reachability: without it, live table data is collectable.
+        let mut without_catalog = roots();
+        without_catalog.catalog = ProtectedLiveSet::default();
+        assert_eq!(
+            protection_from(without_catalog).gc_eligibility(
+                &binding,
+                &catalog_output,
+                ObjectEvidence::Present(&aged)
+            ),
+            GcEligibility::Eligible,
+            "dropping catalog reachability exposes live data, so that root is load-bearing"
+        );
+
+        // Staged/prepared/open/possible/uncertain outputs: their one root.
+        let mut without_open = roots();
+        without_open.open_outputs.clear();
+        assert_eq!(
+            protection_from(without_open).gc_eligibility(
+                &binding,
+                &open_output,
+                ObjectEvidence::Present(&aged)
+            ),
+            GcEligibility::Eligible,
+            "dropping the open-output root exposes an attempt's own working set"
+        );
+
+        // Committed-but-unpromoted `file_list` objects: their one root. Scribe
+        // pod names are outside the recipe grammar, so the observable loss is
+        // union membership rather than an eligibility flip.
+        let mut without_hot = roots();
+        without_hot.hot_unpromoted.clear();
+        assert!(
+            !protection_from(without_hot).live_set.contains(&hot_scribe),
+            "dropping the file_list root removes the only authority naming hot objects"
+        );
+
+        // Oracle reader pins and the snapshot lineage that must still carry
+        // them: an unreachable pin is refused rather than deleted around.
+        let mut unpinned = roots();
+        unpinned.pinned_snapshot_ids = vec![30];
+        assert!(
+            unpinned.compose().is_err(),
+            "an Oracle cut on a snapshot the traversal never saw must fail closed"
+        );
+        let mut lineage_lost = roots();
+        lineage_lost.traversed_snapshot_ids.clear();
+        assert!(
+            lineage_lost.compose().is_err(),
+            "a pinned snapshot missing from the traversed lineage must fail closed"
+        );
+
+        // Lease loss, fence loss, and any open or unreconciled operation raise
+        // the destructive gate, which protects the whole table at once.
+        let mut blocked = roots();
+        blocked.blocked = true;
+        assert_eq!(
+            protection_from(blocked).gc_eligibility(
+                &binding,
+                &orphan,
+                ObjectEvidence::Present(&aged)
+            ),
+            GcEligibility::Protected,
+            "a raised destructive gate protects every object, including a true orphan"
+        );
+
+        // The tenant/table binding, the object age floor, and object evidence
+        // itself each independently refuse.
+        let foreign = TenantTableBinding::resolve((
+            DataTenantId::new_v7(),
+            TableRef::new(BifrostNamespace::Traces, "spans"),
+        ))
+        .expect("foreign binding");
+        assert_eq!(
+            complete.gc_eligibility(&foreign, &orphan, ObjectEvidence::Present(&aged)),
+            GcEligibility::InvalidPath,
+            "another tenant's binding never addresses this table's objects"
+        );
+        assert_eq!(
+            complete.gc_eligibility(&binding, &orphan, ObjectEvidence::Present(&young)),
+            GcEligibility::TooYoung
+        );
+        assert_eq!(
+            complete.gc_eligibility(
+                &binding,
+                &orphan,
+                ObjectEvidence::Present(&opendal::Metadata::new(EntryMode::FILE))
+            ),
+            GcEligibility::TooYoung,
+            "an object with no last-modified evidence has not proven its age"
+        );
+        assert_eq!(
+            complete.gc_eligibility(&binding, &orphan, ObjectEvidence::Missing),
+            GcEligibility::Missing
+        );
+
+        // Listing, age, and path grammar are necessary but never sufficient:
+        // only the canonical recipe grammar is addressable at all.
+        for (lookalike, why) in [
+            (
+                format!(
+                    "{}{FORGE_DATA_MARKER}{FORGE_WRITER_RECIPE}/{}-00000.parquet",
+                    binding.object_prefix,
+                    Uuid::now_v7()
+                ),
+                "an output with no per-writer identity is not a recipe output",
+            ),
+            (
+                format!(
+                    "{}{FORGE_DATA_MARKER}v2/{}-00000-{}.parquet",
+                    binding.object_prefix,
+                    Uuid::now_v7(),
+                    Uuid::now_v7()
+                ),
+                "another recipe root is outside this collector's reach",
+            ),
+            (
+                format!("{}/data/pod-a-01JABC.parquet", binding.object_prefix),
+                "a Scribe pod object is reclaimable only from committed expiry evidence",
+            ),
+            (
+                format!("{}/metadata/v1.metadata.json", binding.object_prefix),
+                "catalog-owned metadata is never reached by orphan listing alone",
+            ),
+        ] {
+            assert_eq!(
+                complete.gc_eligibility(&binding, &lookalike, ObjectEvidence::Present(&aged)),
+                GcEligibility::InvalidPath,
+                "{why}"
+            );
+        }
     }
 }

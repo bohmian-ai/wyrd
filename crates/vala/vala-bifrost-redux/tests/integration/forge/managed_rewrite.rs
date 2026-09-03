@@ -1,23 +1,28 @@
 //! Tier-2 proof that the managed rewrite seam produces objects and no snapshot.
 //!
+//! One scenario at the end covers the surrounding production route instead: it
+//! runs the real scheduler and worker to prove that publishing a compaction is
+//! non-destructive, which is the contract the non-committing core exists for.
+//!
 //! Every scenario starts from real promoted state: a real Scribe sealed the
 //! objects and a real Forge promotion published them. What the scenarios then
 //! drive is the production non-committing owner over the real catalog, the real
 //! object store, and the real resource governor — never a scheduler, never a
 //! worker, and never a fabricated plan.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
 use iceberg::spec::DataContentType;
 use vala_bifrost_redux::forge::{
-    ForgeError, ForgeObjectStore, ForgeRewriteAttempt, ForgeRewriteEvidence, ForgeRewriteOutcome,
-    ForgeUnsettledOutput, RewriteHandoff,
+    ForgeClock, ForgeError, ForgeObjectStore, ForgeRewriteAttempt, ForgeRewriteEvidence,
+    ForgeRewriteOutcome, ForgeUnsettledOutput, RewriteHandoff,
 };
 use vala_bifrost_redux::resources::ForgeRewriteRequest;
 
 use super::rewrite_support::{PromotedRewriteFixture, RewriteOutputBreak};
-use super::support::{CountingObjectStore, PromotionCatalogSeam};
+use super::support::{CountingObjectStore, PromotionCatalogSeam, SupervisedPromotion};
 
 /// Runs one whole non-committing rewrite attempt under an exact plan budget.
 ///
@@ -879,5 +884,111 @@ async fn managed_rewrite_second_pass_is_zero_io_without_live_set_delta() {
         fixture.object_digests().await,
         digests,
         "the refused second pass wrote nothing"
+    );
+}
+
+/// Compaction publishes replacements and never deletes what it rewrote.
+///
+/// This is the whole production route, not the managed core alone: one real
+/// promotion, then one real rewrite through the production scheduler and
+/// worker over the real catalog and object store. What it requires is the
+/// non-destructive contract every later retention decision depends on. The
+/// rewrite adds exactly one snapshot; the new cut is made of replacement
+/// objects and none of the inputs it consumed; every input object is still
+/// present in the store, byte for byte; and the object store was never asked to
+/// delete anything at all. A pinned cut that still names an input can therefore
+/// keep reading it until retention and cleanup independently permit deletion.
+///
+/// # Panics
+///
+/// Panics when the rewrite publishes no snapshot or more than one, when an
+/// input survives in the live cut, when an input object was mutated or removed,
+/// or when compaction issued any delete.
+#[tokio::test]
+async fn compaction_publishes_replacements_without_deleting_inputs() {
+    let promoted = PromotedRewriteFixture::start_unpromoted("rewrite_nondestructive").await;
+    let object_store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
+    let mut supervisor = SupervisedPromotion::start(
+        &promoted.fixture,
+        promoted.fixture.catalog.iceberg_catalog(),
+        Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
+        ForgeClock::system(),
+    );
+    supervisor.run_one_success().await;
+
+    let inputs = promoted
+        .live_data_files()
+        .await
+        .iter()
+        .map(|file| file.file_path().to_owned())
+        .collect::<BTreeSet<_>>();
+    assert!(
+        !inputs.is_empty(),
+        "the rewrite starts from a promoted live set"
+    );
+    let before = promoted.load_table().await;
+    let snapshots_before = before.metadata().snapshots().count();
+    let base_snapshot = before
+        .metadata()
+        .current_snapshot_id()
+        .expect("the promoted table has a current snapshot");
+    let digests_before = promoted.fixture.object_digests().await;
+    let deletes_before = object_store.deletes();
+
+    supervisor.restart_worker();
+    supervisor.run_one_success().await;
+    supervisor.shutdown().await;
+
+    let after = promoted.load_table().await;
+    assert_eq!(
+        after.metadata().snapshots().count(),
+        snapshots_before + 1,
+        "compaction publishes exactly one new snapshot"
+    );
+    let published = after
+        .metadata()
+        .current_snapshot_id()
+        .expect("the rewritten table has a current snapshot");
+    assert_ne!(
+        published, base_snapshot,
+        "the published snapshot is the rewrite's own, not the base it planned against"
+    );
+    let live = promoted
+        .live_data_files()
+        .await
+        .iter()
+        .map(|file| file.file_path().to_owned())
+        .collect::<BTreeSet<_>>();
+    assert!(
+        !live.is_empty(),
+        "the new cut is made of the replacement objects"
+    );
+    assert!(
+        live.is_disjoint(&inputs),
+        "a new cut reads replacements, never the inputs they replaced: {live:?}"
+    );
+
+    let digests_after = promoted.fixture.object_digests().await;
+    for (path, digest) in &digests_before {
+        assert_eq!(
+            digests_after.get(path),
+            Some(digest),
+            "compaction left every input object untouched: {path}"
+        );
+    }
+    assert!(
+        inputs
+            .iter()
+            .all(|path| digests_after.contains_key(path.as_str())),
+        "every rewritten input is still readable by an existing pinned cut"
+    );
+    assert_eq!(
+        object_store.deletes(),
+        deletes_before,
+        "compaction issues no delete at all"
+    );
+    assert_eq!(
+        deletes_before, 0,
+        "nothing before the rewrite deleted either"
     );
 }

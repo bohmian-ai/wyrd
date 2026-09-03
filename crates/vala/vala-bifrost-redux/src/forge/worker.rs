@@ -2199,7 +2199,8 @@ impl ForgeWorker {
     /// # Errors
     ///
     /// Returns an invariant error for an unknown or reserved strategy,
-    /// malformed parameters, or an empty exact input set.
+    /// malformed parameters, or an empty exact input set, and the SQL refusal
+    /// of a cleanup plan whose candidates do not all belong to the task table.
     fn validate_payload_contract(task: &ForgeTaskClaim) -> Result<ForgeMetricStage, ForgeError> {
         // Expired cleanup is the one strategy whose exact work is its
         // parameters rather than its inputs: it deletes objects no snapshot
@@ -2219,8 +2220,12 @@ impl ForgeWorker {
             });
         }
         if cleanup {
+            // The copied plan is authoritative for what this task deletes, so
+            // the consumer re-binds it to the table the task row is filed under
+            // before any lease, catalog, stat, or delete can happen.
             task.plan
                 .expired_cleanup_payload(ForgeTaskStrategy::ExpiredCleanup, true)
+                .and_then(|payload| payload.validate_for_table(&task.table_ref))
                 .map_err(ForgeError::Sql)?;
             return Ok(ForgeMetricStage::ExpiredCleanup);
         }

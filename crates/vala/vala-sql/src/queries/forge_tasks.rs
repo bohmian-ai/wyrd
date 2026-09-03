@@ -1229,8 +1229,12 @@ impl ForgeTasks {
     /// # Errors
     ///
     /// Returns [`SqlError::InvariantViolation`] when the selected source's
-    /// stored evidence is malformed or does not satisfy the handoff contract,
-    /// and [`SqlError`] when the bounded read fails.
+    /// stored evidence is malformed or carries an unknown version,
+    /// [`SqlError::Conflict`] when that evidence has an invalid deletion or
+    /// prepared cursor, names a candidate bound to another table, or does not
+    /// satisfy the handoff contract, and [`SqlError`] when the bounded read
+    /// fails. Every one of those refusals is synchronous and precedes any
+    /// durable effect.
     ///
     /// # Cancellation
     ///
@@ -1252,6 +1256,8 @@ impl ForgeTasks {
             return Ok(None);
         };
         let evidence = crate::row_types::forge_tasks::evidence_from_json(evidence)?;
+        evidence.validate(true)?;
+        evidence.validate_for_table(table_ref)?;
         require_handoff_source(&evidence)?;
         Ok(Some(ExpiredCleanupPayload::from_handoff(
             task_id, &evidence,
@@ -1273,11 +1279,13 @@ impl ForgeTasks {
     ///
     /// Returns [`SqlError::Conflict`] when the source is missing, pruned, not a
     /// succeeded `snapshot_expiry` task for the same tenant and table, carries
-    /// consumed or absent candidates, disagrees with the proposed committed
-    /// metadata identity or candidate vector, or when a cleanup row for this
-    /// source already exists with a different plan.
+    /// consumed or absent candidates, carries an invalid deletion or prepared
+    /// cursor, names a candidate bound to another table, disagrees with the
+    /// proposed committed metadata identity or candidate vector, or when a
+    /// cleanup row for this source already exists with a different plan.
     /// Returns [`SqlError::InvariantViolation`] for malformed stored evidence
-    /// and [`SqlError`] for statement failures.
+    /// or an unknown evidence version, and [`SqlError`] for statement
+    /// failures.
     async fn admit_cleanup_handoff(
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         task: &NewForgeTask,
@@ -1317,6 +1325,8 @@ impl ForgeTasks {
             detail: "expired cleanup source carries no evidence".to_owned(),
         })?;
         let evidence = crate::row_types::forge_tasks::evidence_from_json(evidence)?;
+        evidence.validate(true)?;
+        evidence.validate_for_table(&task.table_ref)?;
         require_handoff_source(&evidence)?;
         let expected = format!(
             "{}/{}/{}/{}/{}/{}",

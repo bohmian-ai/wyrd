@@ -2932,23 +2932,53 @@ mod pg_tests {
         table: &ForgeClaimTable,
         candidates: &[ForgeCleanupCandidate],
     ) -> Uuid {
-        let task_id = Uuid::now_v7();
-        let evidence = ForgeTaskEvidence {
+        seed_expiration_evidence(
+            superuser,
+            tenant,
+            table,
+            &handoff_evidence(candidates.to_vec()),
+        )
+        .await
+    }
+
+    /// Builds the canonical well-formed handoff evidence one expiration leaves.
+    ///
+    /// Callers mutate the returned value to express exactly one malformed axis,
+    /// which keeps every refusal assertion attributable to that one field.
+    fn handoff_evidence(candidates: Vec<ForgeCleanupCandidate>) -> ForgeTaskEvidence {
+        ForgeTaskEvidence {
             prepared_candidate_index: None,
             version: FORGE_TASK_PAYLOAD_VERSION,
             committed_snapshot_id: Some(4242),
             committed_metadata_location: Some("cleanup/metadata/00042-committed.json".to_owned()),
             committed_metadata_digest: Some("b".repeat(64)),
-            cleanup_candidates: candidates.to_vec(),
+            cleanup_candidates: candidates,
             deleted_candidate_count: 0,
-        };
+        }
+    }
+
+    /// Inserts one succeeded snapshot-expiration source carrying exact evidence.
+    ///
+    /// The evidence is written as raw JSONB without passing a validator, which
+    /// is what makes a malformed durable row reachable at all: the refusal under
+    /// test belongs to the reader, not to the writer that never ran.
+    ///
+    /// # Panics
+    /// Panics when the insert fails.
+    async fn seed_expiration_evidence(
+        superuser: &PgPool,
+        tenant: DataTenantId,
+        table: &ForgeClaimTable,
+        evidence: &ForgeTaskEvidence,
+    ) -> Uuid {
+        let task_id = Uuid::now_v7();
         sqlx::query("INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,namespace_name,table_name,strategy,lane,base_snapshot_id,plan,plan_hash,estimated_files,estimated_bytes,estimated_parallelism,estimated_memory_bytes,estimated_spill_bytes,large_task_ceiling_bytes,state,evidence,ready_at,updated_at) VALUES ($1,$2,$3,$4,$5,'snapshot_expiry','ordinary',41,'{\"version\":1,\"inputs\":[\"m.avro\"],\"parameters\":{}}'::jsonb,decode(repeat('11',32),'hex'),1,1,1,1,1,1,'succeeded',$6::jsonb,now()-interval '2 days',now()-interval '2 days')")
             .bind(task_id)
             .bind(tenant.as_uuid())
             .bind(&table.catalog_name)
             .bind(&table.namespace_name)
             .bind(&table.table_name)
-            .bind(vala_sql::row_types::forge_tasks::evidence_to_value(&evidence).to_string())
+            .bind(vala_sql::row_types::forge_tasks::evidence_to_value(evidence).to_string())
             .execute(superuser)
             .await
             .expect("seed expiration source");
@@ -2999,6 +3029,141 @@ mod pg_tests {
             AuditResult::Success,
             "expired cleanup candidate transition".to_owned(),
         )
+    }
+
+    /// Asserts both cleanup admission paths refuse one malformed durable source.
+    ///
+    /// The bounded read and the locked enqueue are separate entry points into
+    /// the same handoff, so a source that only one of them rejects still reaches
+    /// durable cleanup state. Each call seeds exactly one malformed source,
+    /// drives both paths, and proves the enqueue transaction left no cleanup
+    /// row, no audit, and an untouched demand behind.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a diagnostic read fails or either path accepts the source.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the assertion needs the whole durable admission context and owns no state of its own"
+    )]
+    async fn assert_malformed_handoff_source_is_refused(
+        fixture: &PgFixture,
+        admin: &PgPool,
+        tasks: &ForgeTasks,
+        tenant: DataTenantId,
+        table: &ForgeClaimTable,
+        identity: &ForgeTaskTableIdentity,
+        owner: Uuid,
+        fence: i64,
+        evidence: &ForgeTaskEvidence,
+        axis: &str,
+    ) {
+        let source = seed_expiration_evidence(admin, tenant, table, evidence).await;
+        assert!(
+            tasks
+                .unconsumed_expiration_handoff(tenant, identity)
+                .await
+                .is_err(),
+            "the bounded handoff read accepted a source with {axis}"
+        );
+
+        let mut hint = TenantConn::acquire(fixture.app_pool(), tenant)
+            .await
+            .expect("hint conn");
+        tasks
+            .upsert_hint(&mut hint, tenant, identity)
+            .await
+            .expect("demand");
+        hint.commit().await.expect("commit hint");
+        let (demands, _) = tasks
+            .planning_demands(owner, fence, 4)
+            .await
+            .expect("demands");
+        let demand = demands
+            .into_iter()
+            .find(|value| value.table_ref == *identity)
+            .expect("malformed source still raises a cleanup demand");
+
+        let mut cleanup = task(tenant, "cleanup", ForgeTaskLane::Ordinary, 9);
+        cleanup.strategy = ForgeTaskStrategy::ExpiredCleanup;
+        cleanup.base_snapshot_id = evidence.committed_snapshot_id.expect("committed snapshot");
+        cleanup.plan = ForgeTaskPlan {
+            version: FORGE_TASK_PAYLOAD_VERSION,
+            inputs: Vec::new(),
+            parameters: ExpiredCleanupPayload::from_handoff(source, evidence)
+                .expect("the malformed axis is not the committed identity")
+                .to_value(),
+        };
+        cleanup.estimates.files = 2;
+
+        let cleanup_rows = || async {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM vala.forge_tasks WHERE strategy='expired_cleanup'",
+            )
+            .fetch_one(admin)
+            .await
+            .expect("cleanup row count")
+        };
+        let audit_rows = || async {
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM vala.audit_outbox")
+                .fetch_one(admin)
+                .await
+                .expect("audit row count")
+        };
+        let before_cleanup = cleanup_rows().await;
+        let before_audits = audit_rows().await;
+        assert!(
+            tasks
+                .enqueue_and_acknowledge(
+                    owner,
+                    fence,
+                    &demand,
+                    ForgeEnqueueBatch {
+                        executable: std::slice::from_ref(&cleanup),
+                        unschedulable: &[],
+                    },
+                    |id| event("forge.task.unschedulable", id),
+                )
+                .await
+                .is_err(),
+            "the locked enqueue admission accepted a source with {axis}"
+        );
+        assert_eq!(
+            cleanup_rows().await,
+            before_cleanup,
+            "a refused {axis} source inserts no cleanup task"
+        );
+        assert_eq!(
+            audit_rows().await,
+            before_audits,
+            "a refused {axis} source appends no enqueue audit"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT generation FROM vala.forge_planning_demands WHERE data_tenant_id=$1 AND catalog_name=$2 AND namespace_name=$3 AND table_name=$4")
+                .bind(tenant.as_uuid())
+                .bind(&identity.catalog)
+                .bind(&identity.namespace)
+                .bind(&identity.table)
+                .fetch_one(admin)
+                .await
+                .expect("demand survives"),
+            demand.generation,
+            "a refused {axis} source leaves the demand unacknowledged"
+        );
+
+        sqlx::query("DELETE FROM vala.forge_tasks WHERE task_id=$1")
+            .bind(source)
+            .execute(admin)
+            .await
+            .expect("drop the malformed source");
+        sqlx::query("DELETE FROM vala.forge_planning_demands WHERE data_tenant_id=$1 AND catalog_name=$2 AND namespace_name=$3 AND table_name=$4")
+            .bind(tenant.as_uuid())
+            .bind(&identity.catalog)
+            .bind(&identity.namespace)
+            .bind(&identity.table)
+            .execute(admin)
+            .await
+            .expect("drop the demand this subcase raised");
     }
 
     #[tokio::test]
@@ -3164,6 +3329,39 @@ mod pg_tests {
                 .expect("no handoff remains"),
             None
         );
+
+        // A malformed durable source is refused synchronously by both the
+        // bounded read and the locked enqueue, before any cleanup row exists.
+        let unknown_version = ForgeTaskEvidence {
+            version: FORGE_TASK_PAYLOAD_VERSION + 1,
+            ..handoff_evidence(candidates.clone())
+        };
+        let invalid_cursor = ForgeTaskEvidence {
+            deleted_candidate_count: 5,
+            ..handoff_evidence(candidates.clone())
+        };
+        let prepared_cursor = ForgeTaskEvidence {
+            prepared_candidate_index: Some(4),
+            ..handoff_evidence(candidates.clone())
+        };
+        let sibling = ForgeCleanupCandidate {
+            category: ForgeCleanupCategory::Data,
+            table: ForgeTaskTableIdentity::new("wyrd-redux", "vala.bifrost", "sibling")
+                .expect("sibling identity"),
+            path: ForgeCleanupPath::new("sibling/data/a.parquet").expect("sibling path"),
+        };
+        let foreign_table = handoff_evidence(vec![sibling]);
+        for (evidence, axis) in [
+            (&unknown_version, "an unknown evidence version"),
+            (&invalid_cursor, "an invalid deletion cursor"),
+            (&prepared_cursor, "an invalid prepared cursor"),
+            (&foreign_table, "a candidate bound to another table"),
+        ] {
+            assert_malformed_handoff_source_is_refused(
+                &fixture, &admin, &tasks, tenant, &table, &identity, owner, fence, evidence, axis,
+            )
+            .await;
+        }
 
         // Preparation and settlement are source-independent from here on.
         let authority = ForgeExpirationAuthority {

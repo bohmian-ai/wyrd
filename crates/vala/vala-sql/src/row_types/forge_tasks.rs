@@ -544,6 +544,31 @@ impl ExpiredCleanupPayload {
         })
     }
 
+    /// Validates that every copied candidate belongs to the cleanup task table.
+    ///
+    /// The plan copy is self-consistent — each candidate names its own table and
+    /// its path carries that table name — but self-consistency alone does not
+    /// bind the copy to the task that will execute it. A consumer holding a
+    /// persisted cleanup task therefore re-checks the copy against the table its
+    /// row is filed under, so a cross-table plan is refused before that task's
+    /// lease, catalog access, stat, or delete.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqlError::Conflict`] when a candidate names another table.
+    pub fn validate_for_table(&self, table: &ForgeTaskTableIdentity) -> Result<(), SqlError> {
+        if self
+            .cleanup_candidates
+            .iter()
+            .any(|candidate| &candidate.table != table)
+        {
+            return Err(SqlError::Conflict {
+                detail: "expired cleanup plan contains a candidate for another table".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
     /// Returns the serialized size of the candidate vector in bytes.
     ///
     /// This is the only meaningful byte estimate a cleanup task has: it reads

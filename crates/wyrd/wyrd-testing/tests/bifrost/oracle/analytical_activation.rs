@@ -889,3 +889,254 @@ async fn await_baseline(
     let after = cluster.nodes_mut()[index].ownership_snapshot()?;
     Err(format!("pod {index} did not return to {before:?}, holds {after:?}").into())
 }
+
+/// Fallback is a pre-selection decision only, and a selected Analytical query
+/// that loses a peer fails once without ever rerunning locally.
+///
+/// # Panics
+///
+/// Panics when either half of the journey cannot be driven to its claims.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn fallback_is_preselection_only_and_failure_is_terminal() {
+    prove_preselection_fallback()
+        .await
+        .expect("pre-selection fallback journey");
+    prove_selected_failure_is_terminal()
+        .await
+        .expect("selected Analytical terminal failure journey");
+}
+
+/// Both refusable candidates fall back Interactive, and an under-privileged
+/// caller is refused before any planning, peer, or source IO.
+///
+/// # Errors
+///
+/// Returns the first claim that broke.
+async fn prove_preselection_fallback() -> Result<(), JourneyError> {
+    let cluster =
+        WyrdTestCluster::start_spec(BifrostClusterSpec::three_oracles_one_scribe()).await?;
+    let tenant = cluster.data_tenant_id();
+    let table = seed_table(&cluster, "preselection_fallback").await?;
+    let empty = {
+        let ingest = cluster
+            .servers()
+            .find(|server| server.bifrost_scribe().is_some())
+            .ok_or("missing ingest node")?;
+        let name = unique_table("preselection_fallback_empty");
+        register_table(ingest, tenant, &name).await?;
+        cluster.refresh_oracle_snapshots().await?;
+        name
+    };
+    let query_server = cluster.server(0).ok_or("missing query node")?;
+    let engine = Arc::clone(
+        query_server
+            .state()
+            .bifrost_query()
+            .ok_or("query node composed no Oracle")?
+            .engine(),
+    );
+
+    let grouped = format!(
+        "SELECT filter_key, COUNT(*) AS matched FROM vala.bifrost.{table} GROUP BY filter_key"
+    );
+    engine.fail_next_analytical_plan_for_test();
+    let refused = run(&engine, query_context(tenant)?, &grouped).await?;
+    expect(
+        &refused,
+        QueryExecutionPath::Interactive,
+        usize::try_from(FIXTURE_GROUPS)?,
+        "planner-refused candidate",
+    )?;
+    if !nodes_clean(&cluster)? {
+        return Err("a refused candidate registered a graph".into());
+    }
+    await_clean_nodes(&cluster).await?;
+
+    let no_exchange = run(
+        &engine,
+        query_context(tenant)?,
+        &format!(
+            "SELECT filter_key, COUNT(*) AS matched FROM vala.bifrost.{empty} GROUP BY filter_key"
+        ),
+    )
+    .await?;
+    expect(
+        &no_exchange,
+        QueryExecutionPath::Interactive,
+        0,
+        "no-exchange candidate",
+    )?;
+    if !nodes_clean(&cluster)? {
+        return Err("a no-exchange candidate registered a graph".into());
+    }
+    await_clean_nodes(&cluster).await?;
+
+    // Denied before planning, peers, or sources: a caller holding no query
+    // permission must leave the node exactly as it found it.
+    let bootstrap = query_server
+        .bootstrap_service_in_tenant(tenant, "preselection-denied", &[])
+        .await?;
+    let denied = client_from_bootstrap(query_server, bootstrap).await?;
+    let error = QueryClient::new(&denied)
+        .query(&request(&grouped))
+        .await
+        .err()
+        .ok_or("an under-privileged caller ran a query")?;
+    if error.status() != 403 {
+        return Err(format!(
+            "the denied caller was refused as {} instead",
+            error.status()
+        )
+        .into());
+    }
+    if !QueryClient::new(&denied)
+        .running()
+        .await
+        .is_err_and(|error| error.status() == 403)
+    {
+        return Err("the denied caller could still list running queries".into());
+    }
+    if !nodes_clean(&cluster)? {
+        return Err("a denied query left Analytical ownership behind".into());
+    }
+
+    cluster.shutdown().await?;
+    Ok(())
+}
+
+/// A selected Analytical query that loses a follower fails once and terminally.
+///
+/// # Errors
+///
+/// Returns the first claim that broke.
+async fn prove_selected_failure_is_terminal() -> Result<(), JourneyError> {
+    let mut cluster = wyrd_testing::bifrost::process_cluster::BifrostProcessCluster::start(
+        NODE_BINARY,
+        &[
+            wyrd_testing::bifrost::process_cluster::ProcessNodeTarget::Oracle,
+            wyrd_testing::bifrost::process_cluster::ProcessNodeTarget::Oracle,
+            wyrd_testing::bifrost::process_cluster::ProcessNodeTarget::Oracle,
+            wyrd_testing::bifrost::process_cluster::ProcessNodeTarget::Scribe,
+        ],
+    )
+    .await?;
+    let api_key = cluster
+        .provision_public_api_key("selected-failure-caller")
+        .await?;
+    let table = format!("selected_failure_{}", uuid::Uuid::now_v7().simple());
+    cluster.nodes_mut()[PEER_SCRIBE].register_table(&table)?;
+    cluster.nodes_mut()[PEER_SCRIBE].ingest_rows(&table, 0, 12, 3)?;
+    cluster.nodes_mut()[PEER_SCRIBE].ingest_rows(&table, 0, 12, 3)?;
+    for index in [
+        COORDINATOR,
+        PEER_FOLLOWERS[0],
+        PEER_FOLLOWERS[1],
+        PEER_SCRIBE,
+    ] {
+        cluster.nodes_mut()[index].refresh_snapshot()?;
+    }
+
+    let sql = format!(
+        "SELECT filter_key, COUNT(*) AS matched FROM vala.bifrost.{table} \
+         GROUP BY filter_key ORDER BY filter_key"
+    );
+    let paused = PEER_FOLLOWERS[0];
+    let survivor = PEER_FOLLOWERS[1];
+    cluster.nodes_mut()[paused].arm_execute_pause()?;
+    let client = public_client(&cluster.nodes()[COORDINATOR], &api_key)?;
+    let query = {
+        let client = public_client(&cluster.nodes()[COORDINATOR], &api_key)?;
+        let sql = sql.clone();
+        tokio::spawn(async move { run_public(&client, &sql).await })
+    };
+    cluster.nodes_mut()[paused].await_execute_paused()?;
+    cluster.nodes_mut()[paused].kill()?;
+
+    match query.await? {
+        Ok(settled) => {
+            return Err(format!(
+                "a lost peer must not produce a successful {:?} result of {} rows",
+                settled.path, settled.rows
+            )
+            .into());
+        }
+        Err(_) => {}
+    }
+
+    // One activation on the survivor is the whole no-rerun claim: a local
+    // successor attempt would have reserved and activated a second graph.
+    let (activated, live) = await_released_lease(&mut cluster, survivor).await?;
+    if activated != 1 {
+        return Err(format!(
+            "the survivor must be addressed by exactly one attempt, activated {activated}"
+        )
+        .into());
+    }
+    if live != 0 {
+        return Err(format!("the survivor still holds {live} graph leases").into());
+    }
+    let idle = wyrd_testing::bifrost::process_cluster::OracleOwnershipSnapshot {
+        leader_attempts: 0,
+        leader_graphs: 0,
+        leader_cleanup_failures: 0,
+        follower_attempts: 0,
+        follower_graphs: 0,
+        follower_cleanup_failures: 0,
+        active_queries: 0,
+        queued_queries: 0,
+        reserved_memory_bytes: 0,
+        reserved_spill_bytes: 0,
+        peer_pending: 0,
+        peer_running: 0,
+        root_active_queries: 0,
+        root_analytical_queries: 0,
+        root_query_slot_units: 0,
+        root_query_memory_used_bytes: 0,
+        root_query_scratch_used_bytes: 0,
+        root_query_active: false,
+        scratch: wyrd_testing::bifrost::process_cluster::ScratchUsage {
+            entries: 0,
+            bytes: 0,
+        },
+        attempts_active: 0.0,
+        exchanges_active: 0.0,
+        fragments_active: 0.0,
+    };
+    await_baseline(&mut cluster, COORDINATOR, idle).await?;
+
+    // The pod this journey killed has no stdin left, so explicit shutdown
+    // reports it; asserting on that proves every other pod was still joined.
+    let killed = cluster.nodes()[paused].label().to_owned();
+    drop(client);
+    match cluster.shutdown() {
+        Err(reported) if reported.to_string().contains(&killed) => Ok(()),
+        Err(reported) => Err(format!("shutdown reported {reported}, not {killed}").into()),
+        Ok(()) => Err(format!("shutdown did not report the killed pod {killed}").into()),
+    }
+}
+
+/// Waits, bounded, until one pod has released every graph lease it activated.
+///
+/// A follower settles on its own stage-operation path rather than with the
+/// leader's stream, so the release is a bounded convergence rather than an
+/// instantaneous read.
+///
+/// # Errors
+///
+/// Returns the control-protocol error, or a description of the lease the pod
+/// still held when the bound expired.
+async fn await_released_lease(
+    cluster: &mut wyrd_testing::bifrost::process_cluster::BifrostProcessCluster,
+    index: usize,
+) -> Result<(u64, usize), JourneyError> {
+    for _ in 0..BASELINE_POLLS {
+        let leases = cluster.nodes_mut()[index].graph_leases()?;
+        if leases.1 == 0 {
+            return Ok(leases);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let (activated, live) = cluster.nodes_mut()[index].graph_leases()?;
+    Err(format!("pod {index} activated {activated} leases and still holds {live}").into())
+}

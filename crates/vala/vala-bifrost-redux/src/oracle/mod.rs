@@ -316,22 +316,28 @@ struct StaleReplacementGate {
     retry_ordinal: u8,
     /// Whether any public schema or record frame has been exposed.
     output_started: bool,
+    /// Path this attempt irreversibly selected before it opened.
+    selected_path: QueryExecutionPath,
 }
 
 impl StaleReplacementGate {
     /// Creates the pre-output gate used while building one attempt stream.
-    const fn before_output(retry_ordinal: u8) -> Self {
+    const fn before_output(retry_ordinal: u8, selected_path: QueryExecutionPath) -> Self {
         Self {
             retry_ordinal,
             output_started: false,
+            selected_path,
         }
     }
 
     /// Settles the real admitted owner before authorizing the sole typed replacement.
     ///
-    /// A retry is returned only for the first attempt, before public output, and
-    /// after synchronous release of the complete admitted owner. Every other
-    /// combination returns the unchanged owner for terminal settlement.
+    /// A retry is returned only for the first attempt, on an Interactive
+    /// selection, before public output, and after synchronous release of the
+    /// complete admitted owner. Every other combination returns the unchanged
+    /// owner for terminal settlement. Selection is irreversible, so a query
+    /// that already moved onto a graph has no local path to replan back onto:
+    /// its stale first batch settles the graph and fails.
     ///
     /// # Errors
     ///
@@ -345,7 +351,11 @@ impl StaleReplacementGate {
         admitted: AdmittedQueryGuard,
         typed_stale: bool,
     ) -> Result<(), Box<AdmittedQueryGuard>> {
-        if self.retry_ordinal == 0 && !self.output_started && typed_stale {
+        if self.retry_ordinal == 0
+            && !self.output_started
+            && typed_stale
+            && self.selected_path == QueryExecutionPath::Interactive
+        {
             admitted.release();
             record_stale_replan();
             Ok(())
@@ -3165,13 +3175,19 @@ impl Oracle {
             }
         };
         record_degraded_live_tail(&execution.degraded_sources, drained.degraded);
+        // Read before the cut is consumed: the gate is fixed by the path this
+        // attempt already selected, never by what settlement later reports.
+        let selected_path = execution.execution_path;
         settle_attempt_output(
             AttemptOutput::new(execution, admitted, running_query),
             AttemptSettlement {
                 deadline,
                 deadline_ms: participant_cut.deadline().timestamp_millis().max(0),
                 retry_ordinal,
-                stale_replacement: StaleReplacementGate::before_output(retry_ordinal),
+                stale_replacement: StaleReplacementGate::before_output(
+                    retry_ordinal,
+                    selected_path,
+                ),
                 visibility: request.visibility,
                 freshness: request.freshness,
             },
@@ -6800,7 +6816,7 @@ mod tests {
         let cancellation = admitted.cancellation.clone();
         assert_eq!(admission::active_queries_for_test(&shared), 1);
         assert!(
-            StaleReplacementGate::before_output(0)
+            StaleReplacementGate::before_output(0, QueryExecutionPath::Interactive)
                 .settle_for_typed_stale(admitted, true)
                 .is_ok()
         );
@@ -6808,11 +6824,12 @@ mod tests {
         assert_eq!(admission::active_queries_for_test(&shared), 0);
 
         let (second, second_shared, _request_cancellation) = admission::admitted_guard_for_test();
-        let second =
-            match StaleReplacementGate::before_output(1).settle_for_typed_stale(second, true) {
-                Ok(()) => panic!("second stale attempt must not replace"),
-                Err(admitted) => admitted,
-            };
+        let second = match StaleReplacementGate::before_output(1, QueryExecutionPath::Interactive)
+            .settle_for_typed_stale(second, true)
+        {
+            Ok(()) => panic!("second stale attempt must not replace"),
+            Err(admitted) => admitted,
+        };
         assert_eq!(admission::active_queries_for_test(&second_shared), 1);
         second.release();
         assert_eq!(admission::active_queries_for_test(&second_shared), 0);
@@ -6822,6 +6839,7 @@ mod tests {
         let post_output = match (StaleReplacementGate {
             retry_ordinal: 0,
             output_started: true,
+            selected_path: QueryExecutionPath::Interactive,
         })
         .settle_for_typed_stale(post_output, true)
         {
@@ -6833,14 +6851,30 @@ mod tests {
 
         let (string_only, string_shared, _request_cancellation) =
             admission::admitted_guard_for_test();
-        let string_only = match StaleReplacementGate::before_output(0)
-            .settle_for_typed_stale(string_only, false)
-        {
-            Ok(()) => panic!("string-only not-found must not replace"),
-            Err(admitted) => admitted,
-        };
+        let string_only =
+            match StaleReplacementGate::before_output(0, QueryExecutionPath::Interactive)
+                .settle_for_typed_stale(string_only, false)
+            {
+                Ok(()) => panic!("string-only not-found must not replace"),
+                Err(admitted) => admitted,
+            };
         string_only.release();
         assert_eq!(admission::active_queries_for_test(&string_shared), 0);
+
+        // Selection is irreversible: a query that already moved onto a graph
+        // has no local path to replan back onto, so its stale first batch is a
+        // terminal failure rather than the one permitted replacement.
+        let (analytical, analytical_shared, _request_cancellation) =
+            admission::admitted_guard_for_test();
+        let analytical =
+            match StaleReplacementGate::before_output(0, QueryExecutionPath::Analytical)
+                .settle_for_typed_stale(analytical, true)
+            {
+                Ok(()) => panic!("a selected Analytical stale first batch must not replace"),
+                Err(admitted) => admitted,
+            };
+        analytical.release();
+        assert_eq!(admission::active_queries_for_test(&analytical_shared), 0);
     }
 
     /// Synthetic first-batch owner exposing cleanup and final-drop observations.

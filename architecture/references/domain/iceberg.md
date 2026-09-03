@@ -114,8 +114,9 @@ separate selection, commit, retention, and audit evidence.
   objects idempotently only after safety validation.
 - Orphan cleanup protects every live snapshot, staged or prepared operation,
   publication attempt, committed Scribe `file_list` object without exact
-  promotion evidence, pinned Oracle cut, live-tail lease, and configured age
-  window. A storage listing alone can never prove an orphan.
+  promotion evidence, pinned Oracle cut, and configured age window.
+  A v1 live-tail lease retains Scribe-local Arrow batches and staged resources for its lifetime but names no Forge-collectable object, so it contributes no independent Forge GC root.
+  A storage listing alone can never prove an orphan.
 
 ## Rejected shapes
 

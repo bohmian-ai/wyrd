@@ -539,9 +539,10 @@ expiration preserves active refs, unresolved attempts, reconciliation evidence,
 and the lineage snapshot referenced by the branch head. Orphan GC deletes only
 objects proven unreferenced and outside every active or uncertain attempt.
 Committed Scribe hot objects in `file_list` that lack exact promotion evidence,
-and objects retained by any pinned Oracle cut or live-tail lease, are hard GC
-roots even when no Iceberg snapshot references them. No cleanup infers safety
-from age or path shape alone.
+and objects retained by a pinned Oracle cut, are hard GC roots even when no
+Iceberg snapshot references them.
+A v1 live-tail lease retains Scribe-local Arrow batches and staged resources for its lifetime but names no Forge-collectable object, so it contributes no independent Forge GC root.
+No cleanup infers safety from age or path shape alone.
 
 ## Resource and failure invariants
 

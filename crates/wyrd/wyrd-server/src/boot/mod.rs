@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use base64::Engine;
-use futures_util::StreamExt;
+use futures_util::{StreamExt, TryStreamExt};
 use secrecy::{ExposeSecret, SecretString};
 use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::catalog::BifrostCatalog;
@@ -162,18 +162,15 @@ impl ForgeObjectStore for OpenDalForgeObjectStore {
             listing = listing.start_after(cursor);
         }
         let lister = listing.await?;
-        let pages = lister.chunks(FORGE_OBJECT_LIST_PAGE_ENTRIES).map(|chunk| {
-            // A resumable scan advances its cursor over objects only: a
-            // directory key ends in a separator and is not an addressable
-            // object, so a page made only of them would leave the cursor
-            // standing still and relist forever.
-            Ok(chunk
-                .into_iter()
-                .collect::<opendal::Result<Vec<opendal::Entry>>>()?
-                .into_iter()
-                .filter(|entry| entry.metadata().is_file())
-                .collect())
-        });
+        // A resumable scan advances its cursor over objects only: a directory
+        // key ends in a separator and is not an addressable object, so it must
+        // not consume the page bound either — a chunk of only directories would
+        // yield an empty page and leave the frontier standing still, starving
+        // the objects behind it.
+        let objects = lister.try_filter(|entry| std::future::ready(entry.metadata().is_file()));
+        let pages = objects
+            .chunks(FORGE_OBJECT_LIST_PAGE_ENTRIES)
+            .map(|chunk| chunk.into_iter().collect::<opendal::Result<Vec<_>>>());
         Ok(Box::pin(pages))
     }
 
@@ -2204,6 +2201,72 @@ mod tests {
                 .expect("a backend without cursor support cannot be listed");
             assert_eq!(error.kind(), opendal::ErrorKind::Unsupported);
         }
+    }
+
+    /// A capable lister's directory entries never consume the page bound.
+    ///
+    /// The production page bound counts addressable objects, because the task
+    /// cursor advances over objects only. A chunk of leading directory markers
+    /// would otherwise yield an empty page and leave the frontier stationary,
+    /// starving the later object behind it. The filesystem service plus the
+    /// installed capability override is the smallest backend that both yields
+    /// directory entries and advertises cursor support.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the operator cannot be built, when the override does not
+    /// advertise cursor support, when the single page is not exactly the one
+    /// object, or when the stream yields another page.
+    #[tokio::test]
+    async fn open_dal_forge_listing_filters_directories_before_page_boundary() {
+        let root = tempfile::tempdir().expect("listing root");
+        let operator = opendal::Operator::new(
+            opendal::services::Fs::default().root(&root.path().to_string_lossy()),
+        )
+        .expect("filesystem operator builds")
+        .layer(opendal::layers::CapabilityOverrideLayer::new(
+            |mut capability| {
+                capability.list_with_start_after = true;
+                capability
+            },
+        ))
+        .finish();
+        assert!(
+            operator.info().full_capability().list_with_start_after,
+            "the overridden operator must advertise cursor support"
+        );
+        let prefix = "tenants/t/table/data/forge/v1/";
+        for index in 0..FORGE_OBJECT_LIST_PAGE_ENTRIES {
+            operator
+                .create_dir(&format!("{prefix}{index:06}/"))
+                .await
+                .expect("leading directory marker is created");
+        }
+        let object = format!("{prefix}zzzzzz.parquet");
+        operator
+            .write(&object, "orphan")
+            .await
+            .expect("trailing object is written");
+
+        let store = OpenDalForgeObjectStore::new(Arc::new(operator));
+        let mut pages = store
+            .list_pages(prefix, None)
+            .await
+            .expect("a cursor-capable backend is listable");
+        let page = pages
+            .next()
+            .await
+            .expect("one object-only page is yielded")
+            .expect("the page lists successfully");
+        let paths = page
+            .iter()
+            .map(|entry| entry.path().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(paths, vec![object], "the page holds only the object");
+        assert!(
+            pages.next().await.is_none(),
+            "the object-only page is the whole listing"
+        );
     }
 
     /// Boot rejects an intrinsic replay envelope while accepting its exact boundary.

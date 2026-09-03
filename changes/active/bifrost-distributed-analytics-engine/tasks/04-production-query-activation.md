@@ -582,3 +582,101 @@ git diff --check
 Return `SPEC_REVISION_REQUIRED` if activation requires a path hint, EXPLAIN,
 automatic retry, exact routing-facts subsystem, broader operator promise,
 durable query job, new listener, or changed tenant/audit semantics.
+
+## Execution evidence
+
+### Scenario 1 — One request and one typed terminal path — GREEN
+
+- RED: `vala::api::tests::query_terminal_projects_path_without_request_selector`
+  failed because `QueryTerminalFrame` carried no selected execution path.
+- GREEN: added `QueryExecutionPath::{Interactive, Analytical}` to
+  `wyrd-spec::vala::api`, `QueryTerminalFrame::execution_path`, the proto enum
+  and `QueryTerminalFrame.execution_path = 8` in `wyrd.v1.proto`, both
+  `wyrd-tonic` conversions (`RequiredEnum("execution_path")` for an unspecified
+  or unknown wire value), and threaded the server-selected value through
+  `oracle::query_stream` (`QueryStreamInput`, `FrameBuildInput`,
+  `StreamSettlementInputs`, `exhausted_terminal`, `successful_terminal`,
+  `close_ipc_stream`) and `oracle::mod` (`failed_terminal_for_visibility`,
+  `AttemptOutput`). `BifrostQueryRequest` is unchanged; `vala-sdk` projects the
+  new field through its existing `terminal()` conversion with no new code.
+- Command: `mise exec -- cargo nextest run --locked -p wyrd-spec --lib -E 'test(=vala::api::tests::query_terminal_projects_path_without_request_selector)'`
+  → 1 passed.
+- Correction: the task text says the schema assertion reads a top-level `enum`
+  array. schemars 0.8 emits `oneOf` for an enum whose variants carry doc
+  comments, so the test reads `oneOf[*].enum[0]`. Same proof, current emitter.
+- REFACTOR: `mise run codegen:regen` reported no drift; no generated artifact
+  was hand-edited.
+- Commit: `b1634b93b feat(bifrost): name the server-selected execution path on
+  every query terminal`.
+
+### Scenario 2 — Conservative request-local selection — TASK_REVISION_REQUIRED
+
+Two independent gaps block implementation. Both are ownership/topology
+decisions, not stale paths.
+
+**1. The named RED test cannot exist at its named location.**
+`vala-bifrost-redux` constructs no `Oracle` anywhere in its own tree —
+`rtk proxy grep -rn "Oracle::new" crates/` returns only
+`crates/wyrd/wyrd-server/src/boot/mod.rs` and the definition itself.
+`OracleBuildConfig` requires a `BifrostCatalog`, `ValaPostgres`, an
+`OperatorPool`, a `ClusterRegistry`, a fenced `RegisteredRole`, spill runtime,
+tail transports, audit, peer TLS/credentials, and a stage authority; the only
+composition of those is `wyrd-server`'s boot path, reached in tests through
+`WyrdTestServer`. `crates/vala/vala-bifrost-redux/tests/integration/oracle/*`
+are all empty placeholder files. Reachable choices:
+(a) add an in-crate `test-support` Oracle harness that duplicates
+`WyrdTestServer`'s composition — which the task's own owners section forbids
+("Do not add a cluster abstraction or modify `WyrdTestServer` ownership"); or
+(b) place the selection proof in `wyrd-testing/tests/bifrost/oracle/`, beside
+the existing `analytical_inactive` module that already drives
+`Oracle::query_sql_inactive_analytical` through
+`server.state().bifrost_query().engine()`, and keep only a pure selection
+predicate as a `vala-bifrost-redux` lib unit test.
+
+**2. The unsupported-with-exchange fallback is unreachable as specified.**
+Scenario 2 requires that a rejected supported-plan verdict "publishes no
+participants" and then "execute[s] that same already-built leader physical
+plan as Interactive" on the same session, admission, cut, and provisional
+graph. Against the pinned dependency this cannot hold:
+
+- The Analytical leader session is built by
+  `AnalyticalExecutionHandle::leader_session` with
+  `SessionStateBuilder::with_distributed_planner()`, so distribution happens
+  inside `DistributedQueryPlanner::create_physical_plan`, not in a
+  Wyrd-owned optimizer rule. `Oracle::execute_analytical_session`'s single
+  `plan_physical` call is therefore the only build, and its result is already
+  a `DistributedExec` whenever the statement distributes.
+- `datafusion-distributed`'s `create_distributed_plan` returns the original
+  non-distributed plan when no network boundary was injected, so the
+  *no-exchange* outcome does have a locally executable reusable plan. The
+  *unsupported* outcome does not: a `DistributedExec` (or its `base_plan`,
+  which carries `NetworkShuffleExec`/`NetworkCoalesceExec`) cannot be opened
+  through `stream_physical` without published participants, and
+  `lease_analytical_session` has already moved the query's resources out of
+  the `AdmittedQueryGuard`, so no Interactive session remains to re-plan on.
+- Task 2's `splitter::validate_supported` matrix is closed over Wyrd operator
+  names (`DataSourceExec`, `RemoteSourcePlaceholderExec`, `FilterExec`,
+  `AggregateExec`, `HashJoinExec`, `UnionExec`, `SortExec`, `RepartitionExec`,
+  `CoalescePartitionsExec`, `SortPreservingMergeExec`, `TenantTripwireExec`,
+  `MemorySourceConfig`, `EmptyExec`). It names none of the dependency's
+  operators, so applied to a built `DistributedExec` tree it rejects every
+  distributed plan.
+
+Reachable choices, materially different:
+(a) evaluate the verdict over the built distributed tree, which requires
+extending Task 2's closed matrix with the dependency's operator names — which
+this task forbids ("Do not repeat Task 3's physical operator qualification
+here") — and accepting that unsupported-with-exchange terminates rather than
+falls back;
+(b) evaluate the verdict over a pre-distribution physical plan, which requires
+a second physical build that Scenario 2 forbids ("assert one physical-plan
+build and no optimizer rerun");
+(c) move Analytical selection to the Wyrd-owned `plan_distributed_split` seam
+that Scenario 2's fallback text names — that seam does return a reusable
+leader plan and does apply `validate_supported` — but `plan_distributed_split`
+belongs to `execute_distributed_session`, the Interactive fragment-splitter
+path, and is never reached when `SqlCutInput::analytical` is set. Choosing it
+changes which execution owner the selected `Analytical` path denotes.
+
+Scenario 2 must name one of these before implementation can proceed. Scenarios
+3–6 depend on Scenario 2's selection seam and were not started.

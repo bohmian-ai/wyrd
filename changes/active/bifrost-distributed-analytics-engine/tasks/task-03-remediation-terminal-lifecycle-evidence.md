@@ -331,3 +331,108 @@ Return `PLAN_BLOCKED` if the pinned dependency cannot preserve metric rewrite
 errors or the existing Oracle/Analytical owners cannot expose their current
 test-tier inspection without a parallel production owner. Repository inspection
 found both capabilities, so no block is known.
+
+## Execution evidence
+
+Executed under `$wyrd-implement` on base
+`5b0f885c1423c7142aa01db7a51699cb2b373cee`. Every scenario command below was
+run verbatim as written in its scenario unless a correction is named.
+
+### Scenario 1 — metric rewrite errors retain the graph
+
+- **RED.** With the seam still shaped `Option<Arc<dyn ExecutionPlan>>`, the
+  rewrite-error case was driven with the `None` that `.ok()?` produces from a
+  refused rewrite. Observed failure:
+  `assertion left == right failed: a rewrite error cannot publish a success
+  terminal / left: SettledSuccess(Some(AnalyticalAttemptRelease { ... outcome:
+  Success ... })) / right: SettledFailure`.
+- **GREEN.** `oracle::exec::record_distributed_scan_metrics` now returns
+  `DataFusionResult<Arc<dyn ExecutionPlan>>`; `AnalyticalGraphMetricFold`
+  carries that result and `settle` propagates the error;
+  `fold_physical_metrics` renders it as the new `METRIC_FOLD_REFUSED` detail
+  and takes the existing `retain_graph_cleanup`/`SettledFailure` route.
+  Command passed.
+- **REFACTOR.** `AnalyticalGraphMetricFold::plan` was removed rather than
+  retained unread: it existed only as the `unwrap_or` fallback, and the fold is
+  constructed only for a distributed plan. `from_future` lost the same
+  parameter. The rewrite-error case was extracted to
+  `rewrite_error_retains_its_own_graph` to keep the test function inside the
+  workspace `too_many_lines` bound; it remains one test.
+
+### Scenario 2 — validated success terminal
+
+- **RED.** `accept_query_terminal` was first introduced holding today's
+  behavior verbatim (`let _ = terminal; Ok(emitted_rows)`), which is what
+  `drive_inactive_sql` did inline. Observed failure:
+  `rows preceding a failed terminal are not a result: Ok(3)`.
+- **GREEN.** The helper now calls `QueryTerminalFrame::validate`,
+  `validate_emitted_rows`, requires `QueryTerminalOutcome::Success`, calls
+  `QueryIpcDecoder::accept_eos` with `arrow_ipc_eos`, and requires
+  `eos_accepted()`, mapping every refusal through
+  `ProcessClusterError::Child`. `drive_inactive_sql` returns through it.
+  Command passed.
+
+### Scenario 3 — per-execution exchange and complete ownership
+
+- **GREEN.** `ControlRequest::OracleOwnership` /
+  `ControlResponse::OracleOwnership` and `ProcessNode::ownership_snapshot`
+  carry a 22-field `OracleOwnershipSnapshot` projected from
+  `AnalyticalExecutionHandle::live()`, `Oracle::runtime_inspection()`,
+  `OracleResources::snapshot()`, the process scratch inspection, and the three
+  live production gauges. `coordinate_baseline` captures and compares one
+  complete snapshot per Oracle inside each iteration and samples
+  `EXCHANGE_COUNTERS` in the same before/after boundary, requiring
+  `after > before` for both families. The `LIVE_GAUGES` constant was deleted:
+  the snapshot subsumes it, and leaving it would be a second, weaker copy of
+  the same claim.
+- Both commands passed:
+  `peer_network::analytical::inactive_baseline_executes_join_group_spill_and_interchangeable_topology`
+  and `bifrost::process_cluster::tests::oracle_ownership_snapshot_round_trips`.
+- **Limitation, recorded rather than papered over.** The round-trip test had a
+  real RED (an off-by-one field-count pin). The journey's strengthened
+  assertions were green on first run and no demonstrated RED exists for them:
+  producing one would require a coordinator that executes the baseline while
+  exchanging nothing, or an Oracle that genuinely leaks an owner, neither of
+  which is reachable without changing production behavior. The mutation
+  argument stands in its place — restoring the cumulative `> 0.0` check makes
+  coordinator 1's exchange claim satisfiable by coordinator 0's totals, and
+  narrowing the comparison back to scratch plus three gauges stops observing
+  attempts, graphs, cleanup failures, admitted and queued queries, peer
+  reservations, slot units, query memory, and query scratch.
+
+### Scenario 4 — explicit shutdown reports failure after reaping
+
+- **RED.** `explicit_shutdown_reports_failure_after_reaping_every_child` did
+  not compile against `BifrostProcessCluster::shutdown`, which returned `()`:
+  `expected (), found Result<_, _>` — there was no result for a caller to
+  observe.
+- **GREEN.** The reaper's completion channel became
+  `sync_channel(1)` carrying `Result<(), String>`; it records the first
+  `try_wait`, kill, or wait error and sends it only after every remaining
+  cleanup step. `ProcessNode::kill` and `ProcessNode::shutdown` consume and
+  propagate it, `shutdown` preserving the first error in operation order and a
+  forced kill after the graceful timeout counting as a failure on its own.
+  `BifrostProcessCluster::shutdown` returns `Result<(), ProcessClusterError>`,
+  attempts every node in cluster order, clears the list, and joins each
+  failing child's label and detail. `start`, `restart`, and
+  `probe_startup_failure` handle cleanup exactly as the task defines; `Drop` is
+  the only caller discarding the result. Both commands passed.
+- **In-scope consumer correction.** `prove_terminal_ordering(PeerLoss)` kills a
+  pod on purpose and then shuts the cluster down, so it is now a caller of a
+  reporting shutdown. Rather than discard the result, it asserts the report
+  names exactly the pod it killed and no other, which is the same evidence in
+  that journey's own terms.
+
+### Broader verification
+
+`mise run fmt`, `mise run lints`, `mise run test:bifrost` (973 passed),
+`mise run test:bifrost:journey:oracle` (16 passed),
+`mise run check:bifrost-oracle-deploy`,
+`mise run check:bifrost-resource-governance`,
+`mise run check:object-store-pin`, and `git diff --check` all pass.
+
+Six `wyrd-testing` lib tests (`bifrost::scribe_workload::tests::…` and five
+`bifrost::forge_harness::worker_lifecycle_tests::…`) fail identically on the
+reviewed base `5b0f885c` and on this candidate under an ad-hoc
+`cargo nextest run -p wyrd-testing --lib`; they pass through their owning
+`mise` lanes. Pre-existing and unrelated to this task.

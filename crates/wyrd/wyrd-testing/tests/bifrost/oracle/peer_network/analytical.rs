@@ -243,7 +243,27 @@ async fn prove_terminal_ordering(cause: TerminalCause) -> Result<(), PeerJourney
         // produced it. The killed process has nothing left to release.
         cluster.nodes_mut()[paused].release_execute_pause()?;
     }
-    cluster.shutdown()?;
+    // A pod this journey killed on purpose has no stdin left to accept a
+    // shutdown request, so explicit shutdown reports it. Asserting on that
+    // rather than discarding it is the point: the report must name exactly the
+    // pod this journey removed, which means every other pod was still asked,
+    // reaped, and joined.
+    let killed = cluster.nodes()[paused].label().to_owned();
+    match (cause, cluster.shutdown()) {
+        (TerminalCause::Cancellation, Ok(())) => {}
+        (TerminalCause::PeerLoss, Err(reported)) => {
+            let detail = reported.to_string();
+            if !detail.contains(&killed) || detail.matches("pod-").count() != 1 {
+                return Err(format!(
+                    "shutdown after killing {killed} reported {detail}, not that pod alone"
+                )
+                .into());
+            }
+        }
+        (cause, result) => {
+            return Err(format!("shutdown after {cause:?} reported {result:?}").into());
+        }
+    }
     Ok(())
 }
 

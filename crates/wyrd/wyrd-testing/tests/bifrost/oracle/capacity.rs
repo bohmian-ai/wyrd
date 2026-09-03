@@ -159,11 +159,28 @@ async fn prove_lowest_rung_contention() -> Result<(), JourneyError> {
         ANALYTICAL_INGEST_GROUPS,
     )
     .await?;
-    seed_fixture_table(ingest, tenant_a, &ui_a, INTERACTIVE_ROWS, INTERACTIVE_GROUPS).await?;
-    seed_fixture_table(ingest, tenant_b, &ui_b, INTERACTIVE_ROWS, INTERACTIVE_GROUPS).await?;
+    seed_fixture_table(
+        ingest,
+        tenant_a,
+        &ui_a,
+        INTERACTIVE_ROWS,
+        INTERACTIVE_GROUPS,
+    )
+    .await?;
+    seed_fixture_table(
+        ingest,
+        tenant_b,
+        &ui_b,
+        INTERACTIVE_ROWS,
+        INTERACTIVE_GROUPS,
+    )
+    .await?;
     cluster.refresh_oracle_snapshots().await?;
 
-    let journey_checkpoint = cluster.telemetry().checkpoint().map_err(|e| e.to_string())?;
+    let journey_checkpoint = cluster
+        .telemetry()
+        .checkpoint()
+        .map_err(|e| e.to_string())?;
     let baseline = ownership_baseline(&cluster).await?;
     // Sampled at baseline: the same acquisition against a saturated root would
     // be refused, so the grant is read while the envelope is genuinely free.
@@ -226,7 +243,8 @@ async fn prove_lowest_rung_contention() -> Result<(), JourneyError> {
         (tenant_a, "contention-a", &ui_a),
         (tenant_b, "contention-b", &ui_b),
     ] {
-        interactive.push(prove_interactive_window(&cluster, coordinator, tenant, name, table).await?);
+        interactive
+            .push(prove_interactive_window(&cluster, coordinator, tenant, name, table).await?);
     }
 
     while let Some(frame) = analytical.frames.next().await {
@@ -316,7 +334,10 @@ async fn prove_interactive_window(
     table: &str,
 ) -> Result<(QueryResourceSnapshot, QueryResourceSnapshot), JourneyError> {
     let client = client_for_tenant(coordinator, tenant, name).await?;
-    let checkpoint = cluster.telemetry().checkpoint().map_err(|e| e.to_string())?;
+    let checkpoint = cluster
+        .telemetry()
+        .checkpoint()
+        .map_err(|e| e.to_string())?;
     let active_before = class_gauge(cluster, "interactive")?;
     let capture = coordinator.capture_next_query_resource_probe();
 
@@ -434,10 +455,7 @@ fn prove_pool_within_grant(
 ///
 /// Returns an error when any node's Scribe, Oracle, and Forge ownership
 /// together exceed the memory the plan governs.
-fn prove_roots_within_budget(
-    cluster: &WyrdTestCluster,
-    label: &str,
-) -> Result<(), JourneyError> {
+fn prove_roots_within_budget(cluster: &WyrdTestCluster, label: &str) -> Result<(), JourneyError> {
     for snapshot in cluster.oracle_resource_snapshots()? {
         let held = snapshot.scribe_memory_used_bytes
             + snapshot.oracle_memory_used_bytes
@@ -811,7 +829,7 @@ async fn seed_fixture_table(
             .ingest_native_for_test(vala_bifrost_redux::scribe::NativeIngressTestFrame {
                 principal: fixture_principal(tenant),
                 table: table_ref.clone(),
-                expected_schema_fingerprint: fingerprint.clone(),
+                expected_schema_fingerprint: fingerprint,
                 request_id: wyrd_spec::request_id::RequestId::now_v7(),
                 batch_id: uuid::Uuid::now_v7(),
                 audit_event: fixture_audit_event(tenant, table),
@@ -836,10 +854,7 @@ fn fixture_principal(tenant: DataTenantId) -> wyrd_runtime::principal::Principal
 }
 
 /// Builds the server-shaped audit event committed with one fixture batch.
-fn fixture_audit_event(
-    tenant: DataTenantId,
-    table: &str,
-) -> wyrd_spec::vala::api::AuditEvent {
+fn fixture_audit_event(tenant: DataTenantId, table: &str) -> wyrd_spec::vala::api::AuditEvent {
     let _ = tenant;
     wyrd_spec::vala::api::AuditEvent::new(
         wyrd_spec::request_id::RequestId::now_v7(),
@@ -872,7 +887,10 @@ fn fixture_rows_ipc(start_id: i64, rows: i64, groups: i64) -> Result<bytes::Byte
         Field::new("filter_key", DataType::Utf8, false),
     ]));
     let ids: Vec<i64> = (start_id..start_id.saturating_add(rows)).collect();
-    let keys: Vec<String> = ids.iter().map(|id| format!("group_{}", id % groups)).collect();
+    let keys: Vec<String> = ids
+        .iter()
+        .map(|id| format!("group_{}", id % groups))
+        .collect();
     let batch = RecordBatch::try_new(
         Arc::clone(&schema),
         vec![

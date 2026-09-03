@@ -2463,20 +2463,23 @@ pub(in crate::oracle) mod tests {
 
         let mut analytical =
             push_waiter(&shared, AdmissionClass::Analytical, tenant_a, 1, deadline);
-        let mut first_a = push_waiter(&shared, AdmissionClass::Interactive, tenant_a, 2, deadline);
-        let mut second_a = push_waiter(&shared, AdmissionClass::Interactive, tenant_a, 3, deadline);
-        let mut first_b = push_waiter(&shared, AdmissionClass::Interactive, tenant_b, 4, deadline);
+        let mut tenant_a_head =
+            push_waiter(&shared, AdmissionClass::Interactive, tenant_a, 2, deadline);
+        let mut tenant_a_tail =
+            push_waiter(&shared, AdmissionClass::Interactive, tenant_a, 3, deadline);
+        let mut peer_head =
+            push_waiter(&shared, AdmissionClass::Interactive, tenant_b, 4, deadline);
         drain_grants(&shared);
 
         let analytical_grant = analytical.try_recv().expect("analytical class grant");
-        let first_a_grant = first_a
+        let head_grant = tenant_a_head
             .try_recv()
             .expect("interactive tenant A is grantable while the analytical class is full");
-        let first_b_grant = first_b
+        let peer_grant = peer_head
             .try_recv()
             .expect("the tenant cursor reaches peer tenant B before tenant A repeats");
         assert!(
-            second_a.try_recv().is_err(),
+            tenant_a_tail.try_recv().is_err(),
             "the multi-tenant ceiling holds tenant A's second interactive request"
         );
         {
@@ -2488,14 +2491,14 @@ pub(in crate::oracle) mod tests {
             assert_eq!(state.queued, 1);
         }
 
-        owner.rollback_grant(first_b_grant);
-        let second_a_grant = second_a
+        owner.rollback_grant(peer_grant);
+        let tail_grant = tenant_a_tail
             .try_recv()
             .expect("tenant A's queued request is granted once the peer tenant releases");
         assert_eq!(shared.state.lock().expect("state").queued, 0);
 
-        owner.rollback_grant(first_a_grant);
-        owner.rollback_grant(second_a_grant);
+        owner.rollback_grant(head_grant);
+        owner.rollback_grant(tail_grant);
         owner.rollback_grant(analytical_grant);
         {
             let state = shared.state.lock().expect("state");
@@ -2520,6 +2523,25 @@ pub(in crate::oracle) mod tests {
             "every granted envelope returns to the process root"
         );
 
+        prove_rejection_charges_nothing(config, &resources, tenant_a, deadline);
+        assert_eq!(
+            resources.snapshot().expect("final root"),
+            baseline,
+            "rejection and release leave the process root at its exact baseline"
+        );
+    }
+
+    /// Proves a queue-full refusal mutates nothing the process root owns.
+    ///
+    /// Deliberately run against the same root the granting owner used: a
+    /// refusal that quietly charged the root would be invisible to an owner
+    /// checked only against its own class counters.
+    fn prove_rejection_charges_nothing(
+        config: OracleAdmissionConfig,
+        resources: &crate::resources::OracleResources,
+        tenant: DataTenantId,
+        deadline: Instant,
+    ) {
         let rejecting = owner_with_resources(
             OracleAdmissionConfig {
                 interactive_slots: 1,
@@ -2530,7 +2552,7 @@ pub(in crate::oracle) mod tests {
         );
         let mut held = rejecting
             .enqueue_waiter(
-                tenant_a,
+                tenant,
                 AdmissionClass::Interactive,
                 0.0,
                 deadline,
@@ -2539,7 +2561,7 @@ pub(in crate::oracle) mod tests {
             .expect("first interactive request is admitted");
         let mut waiting = rejecting
             .enqueue_waiter(
-                tenant_a,
+                tenant,
                 AdmissionClass::Interactive,
                 0.0,
                 deadline,
@@ -2548,7 +2570,7 @@ pub(in crate::oracle) mod tests {
             .expect("second interactive request occupies the finite queue");
         let before_rejection = resources.snapshot().expect("pre-rejection root");
         let rejected = rejecting.enqueue_waiter(
-            tenant_a,
+            tenant,
             AdmissionClass::Interactive,
             0.0,
             deadline,
@@ -2577,11 +2599,6 @@ pub(in crate::oracle) mod tests {
             .try_recv()
             .expect("the queued request is granted by the release");
         rejecting.rollback_grant(waiting_grant);
-        assert_eq!(
-            resources.snapshot().expect("final root"),
-            baseline,
-            "rejection and release leave the process root at its exact baseline"
-        );
     }
 
     /// Local probe release remains idempotent through its watch state.

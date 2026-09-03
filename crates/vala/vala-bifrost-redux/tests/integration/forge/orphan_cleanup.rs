@@ -41,6 +41,94 @@ async fn seed_object(fixture: &PromotionIntegrationFixture, path: String) -> Str
     path
 }
 
+/// Asserts nothing durable names the objects the refused rewrite produced.
+///
+/// This is what makes the scenario a genuine rowless case: with no operation
+/// row, no Forge audit transition, and no Reset generation, the collector has
+/// no durable evidence to consult and must reach the object through the
+/// writer's own grammar and the age floor alone.
+///
+/// # Panics
+///
+/// Panics when any durable owner turns out to name the produced objects.
+async fn assert_no_durable_owner_names(
+    fixture: &PromotionIntegrationFixture,
+    forge: &Arc<vala_bifrost_redux::forge::Forge>,
+    audit_before: i64,
+) {
+    assert_eq!(
+        fixture.rewrite_phases().await,
+        Vec::<String>::new(),
+        "the refusal arrived before any Prepared operation row"
+    );
+    assert_eq!(
+        fixture.forge_audit_count().await,
+        audit_before,
+        "a refused publication appends no Forge audit transition"
+    );
+    assert_eq!(
+        forge
+            .reset_generation_paths_for_test(&fixture.binding)
+            .await
+            .expect("reset generations read"),
+        Vec::<String>::new(),
+        "a rowless output needs no Reset row to be reclaimable"
+    );
+}
+
+/// Seeds every object that merely resembles a rewrite output.
+///
+/// Listing discovers all of these under the same table prefix, so they are the
+/// direct evidence that path grammar decides reach and never safety.
+///
+/// # Panics
+///
+/// Panics when the staging operator rejects a write.
+async fn seed_lookalikes(fixture: &PromotionIntegrationFixture) -> Vec<String> {
+    let root = forge_root(fixture);
+    let prefix = &fixture.binding.object_prefix;
+    let mut lookalikes = Vec::new();
+    for path in [
+        format!("{prefix}/data/forge/{}-00001.parquet", Uuid::now_v7()),
+        format!(
+            "{prefix}/data/forge/v2/{}-00000-{}.parquet",
+            Uuid::now_v7(),
+            Uuid::now_v7()
+        ),
+        format!("{root}/{}-00000.parquet", Uuid::now_v7()),
+        format!("{root}/{}-0000x-{}.parquet", Uuid::now_v7(), Uuid::now_v7()),
+        format!("{prefix}/data/pod-a-01JABCDEF.parquet"),
+        format!("{prefix}/metadata/orphan-lookalike.json"),
+    ] {
+        lookalikes.push(seed_object(fixture, path).await);
+    }
+    lookalikes
+}
+
+/// Asserts one classification for every path in `paths`.
+///
+/// # Panics
+///
+/// Panics when the production classifier fails or returns another verdict.
+async fn assert_eligibility(
+    forge: &Arc<vala_bifrost_redux::forge::Forge>,
+    fixture: &PromotionIntegrationFixture,
+    paths: &[String],
+    expected: &str,
+    why: &str,
+) {
+    for path in paths {
+        assert_eq!(
+            forge
+                .gc_eligibility_for_test(&fixture.binding, path)
+                .await
+                .expect("eligibility classification"),
+            expected,
+            "{why}: {path}"
+        );
+    }
+}
+
 /// A rowless Forge output is reclaimed only through canonical identity and a
 /// complete protection proof.
 ///
@@ -122,84 +210,55 @@ async fn rowless_output_uses_canonical_identity_and_full_protection() {
         );
     }
 
-    // Nothing durable names those objects: no operation row, no Forge audit
-    // transition, and no Reset generation the collector could have consulted.
-    assert_eq!(
-        promoted.fixture.rewrite_phases().await,
-        Vec::<String>::new(),
-        "the refusal arrived before any Prepared operation row"
-    );
-    assert_eq!(
-        promoted.fixture.forge_audit_count().await,
-        audit_before,
-        "a refused publication appends no Forge audit transition"
-    );
-    assert_eq!(
-        forge
-            .reset_generation_paths_for_test(&promoted.fixture.binding)
-            .await
-            .expect("reset generations read"),
-        Vec::<String>::new(),
-        "a rowless output needs no Reset row to be reclaimable"
-    );
-
-    // Objects that only resemble a rewrite output are discovered by the same
-    // listing and must stay unreachable to this protocol.
-    let root = forge_root(&promoted.fixture);
-    let prefix = &promoted.fixture.binding.object_prefix;
-    let mut lookalikes = Vec::new();
-    for path in [
-        format!("{prefix}/data/forge/{}-00001.parquet", Uuid::now_v7()),
-        format!(
-            "{prefix}/data/forge/v2/{}-00000-{}.parquet",
-            Uuid::now_v7(),
-            Uuid::now_v7()
-        ),
-        format!("{root}/{}-00000.parquet", Uuid::now_v7()),
-        format!("{root}/{}-0000x-{}.parquet", Uuid::now_v7(), Uuid::now_v7()),
-        format!("{prefix}/data/pod-a-01JABCDEF.parquet"),
-        format!("{prefix}/metadata/orphan-lookalike.json"),
-    ] {
-        lookalikes.push(seed_object(&promoted.fixture, path).await);
-    }
+    assert_no_durable_owner_names(&promoted.fixture, &forge, audit_before).await;
+    let lookalikes = seed_lookalikes(&promoted.fixture).await;
 
     // Before the age floor elapses, even a genuinely rowless output is retained.
-    for path in &rowless {
-        assert_eq!(
-            forge
-                .gc_eligibility_for_test(&promoted.fixture.binding, path)
-                .await
-                .expect("eligibility classification"),
-            "TooYoung",
-            "an output younger than the configured floor is never collectable"
-        );
-    }
+    assert_eligibility(
+        &forge,
+        &promoted.fixture,
+        &rowless,
+        "TooYoung",
+        "an output younger than the configured floor is never collectable",
+    )
+    .await;
     control
         .advance(ChronoDuration::hours(25))
         .expect("manual clock advance");
-    for path in &rowless {
-        assert_eq!(
-            forge
-                .gc_eligibility_for_test(&promoted.fixture.binding, path)
-                .await
-                .expect("eligibility classification"),
-            "Eligible",
-            "an aged rowless output is exactly what this protocol collects"
-        );
-    }
-    for path in &lookalikes {
-        assert_eq!(
-            forge
-                .gc_eligibility_for_test(&promoted.fixture.binding, path)
-                .await
-                .expect("eligibility classification"),
-            "InvalidPath",
-            "only the canonical recipe grammar is addressable by orphan collection"
-        );
-    }
+    assert_eligibility(
+        &forge,
+        &promoted.fixture,
+        &rowless,
+        "Eligible",
+        "an aged rowless output is exactly what this protocol collects",
+    )
+    .await;
+    assert_eligibility(
+        &forge,
+        &promoted.fixture,
+        &lookalikes,
+        "InvalidPath",
+        "only the canonical recipe grammar is addressable by orphan collection",
+    )
+    .await;
 
+    assert_collection_deletes_only_rowless(&forge, &promoted.fixture, &rowless, &lookalikes).await;
+}
+
+/// Runs one real collection pass and asserts what it did and did not delete.
+///
+/// # Panics
+///
+/// Panics when the pass fails, deletes the wrong count, or touches a lookalike
+/// or the promoted live set.
+async fn assert_collection_deletes_only_rowless(
+    forge: &Arc<vala_bifrost_redux::forge::Forge>,
+    fixture: &PromotionIntegrationFixture,
+    rowless: &[String],
+    lookalikes: &[String],
+) {
     let deleted = forge
-        .run_orphan_gc_for_test(&promoted.fixture.binding)
+        .run_orphan_gc_for_test(&fixture.binding)
         .await
         .expect("the retained orphan owner runs");
     assert_eq!(
@@ -207,20 +266,20 @@ async fn rowless_output_uses_canonical_identity_and_full_protection() {
         rowless.len(),
         "the collector deletes exactly the rowless outputs it classified"
     );
-    for path in &rowless {
+    for path in rowless {
         assert!(
-            !object_exists(&promoted.fixture, path).await,
+            !object_exists(fixture, path).await,
             "the collector did not delete the object it reported"
         );
     }
-    for path in &lookalikes {
+    for path in lookalikes {
         assert!(
-            object_exists(&promoted.fixture, path).await,
+            object_exists(fixture, path).await,
             "a lookalike path survives a real collection pass: {path}"
         );
     }
     assert!(
-        !promoted.fixture.live_data_paths().await.is_empty(),
+        !fixture.live_data_paths().await.is_empty(),
         "the promoted live set is untouched by orphan collection"
     );
 }

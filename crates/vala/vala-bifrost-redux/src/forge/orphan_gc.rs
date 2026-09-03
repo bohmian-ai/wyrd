@@ -1746,6 +1746,7 @@ impl Forge {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::forge::protection_roots::OrphanProtectionRoots;
 
     #[test]
     fn maintenance_protection_traverses_retained_history() {
@@ -2005,6 +2006,242 @@ mod tests {
         );
     }
 
+    /// Object identities shared by every case of the root-mutation matrix.
+    ///
+    /// Held together because each root class is only meaningful next to the
+    /// object it alone protects: the assertions below all read as "drop this
+    /// root, watch that object become reachable".
+    struct OrphanMatrixPaths {
+        /// Validated physical binding every case classifies against.
+        binding: TenantTableBinding,
+        /// Output only catalog reachability protects.
+        catalog_output: String,
+        /// Output only the open-attempt root protects.
+        open_output: String,
+        /// Committed Scribe object only the `file_list` root protects.
+        hot_scribe: String,
+        /// Aged output no authority names, which is what this protocol deletes.
+        orphan: String,
+    }
+
+    impl OrphanMatrixPaths {
+        /// Builds one binding and the four canonical objects the matrix uses.
+        fn new() -> Self {
+            use crate::catalog::TableRef;
+            use crate::namespaces::BifrostNamespace;
+
+            let binding = TenantTableBinding::resolve((
+                DataTenantId::new_v7(),
+                TableRef::new(BifrostNamespace::Traces, "spans"),
+            ))
+            .expect("binding");
+            let output = |prefix: &str| {
+                format!(
+                    "{prefix}{FORGE_DATA_MARKER}{FORGE_WRITER_RECIPE}/{}-00000-{}.parquet",
+                    Uuid::now_v7(),
+                    Uuid::now_v7()
+                )
+            };
+            Self {
+                catalog_output: output(&binding.object_prefix),
+                open_output: output(&binding.object_prefix),
+                orphan: output(&binding.object_prefix),
+                hot_scribe: format!("{}/data/pod-a-01JHOT.parquet", binding.object_prefix),
+                binding,
+            }
+        }
+
+        /// Rebuilds the complete root set every case starts from.
+        fn roots(&self) -> OrphanProtectionRoots {
+            OrphanProtectionRoots {
+                catalog: {
+                    let mut set = ProtectedLiveSet::default();
+                    set.insert(self.catalog_output.clone());
+                    set
+                },
+                traversed_snapshot_ids: vec![10, 20],
+                hot_unpromoted: vec![self.hot_scribe.clone()],
+                open_outputs: vec![self.open_output.clone()],
+                pinned_snapshot_ids: vec![20],
+                blocked: false,
+            }
+        }
+    }
+
+    /// The fixed age cutoff and evaluation time every matrix case shares.
+    fn orphan_matrix_protection(roots: OrphanProtectionRoots) -> MaintenanceProtection {
+        let composed = roots.compose().expect("roots compose");
+        MaintenanceProtection::new(
+            composed.live_set,
+            composed.blocked,
+            DateTime::<Utc>::from_timestamp_millis(48 * 60 * 60 * 1_000).expect("time"),
+            Timestamp::from_millisecond(24 * 60 * 60 * 1_000).expect("timestamp"),
+        )
+    }
+
+    /// Object metadata older than the matrix cutoff.
+    fn orphan_matrix_aged() -> opendal::Metadata {
+        opendal::Metadata::new(EntryMode::FILE)
+            .with_last_modified(Timestamp::from_millisecond(0).expect("timestamp"))
+    }
+
+    /// Requires each protection root to be the only thing protecting its object.
+    ///
+    /// A root that can be dropped with no observable consequence is a root that
+    /// is no longer protecting anything, so each case here must either expose an
+    /// object as unsafely eligible or fail closed.
+    fn assert_each_orphan_root_is_load_bearing(paths: &OrphanMatrixPaths) {
+        let aged = orphan_matrix_aged();
+
+        let mut without_catalog = paths.roots();
+        without_catalog.catalog = ProtectedLiveSet::default();
+        assert_eq!(
+            orphan_matrix_protection(without_catalog).gc_eligibility(
+                &paths.binding,
+                &paths.catalog_output,
+                ObjectEvidence::Present(&aged)
+            ),
+            GcEligibility::Eligible,
+            "dropping catalog reachability exposes live data, so that root is load-bearing"
+        );
+
+        let mut without_open = paths.roots();
+        without_open.open_outputs.clear();
+        assert_eq!(
+            orphan_matrix_protection(without_open).gc_eligibility(
+                &paths.binding,
+                &paths.open_output,
+                ObjectEvidence::Present(&aged)
+            ),
+            GcEligibility::Eligible,
+            "dropping the open-output root exposes an attempt's own working set"
+        );
+
+        // Scribe pod names are outside the recipe grammar, so the observable
+        // loss for the `file_list` root is union membership, not an
+        // eligibility flip.
+        let mut without_hot = paths.roots();
+        without_hot.hot_unpromoted.clear();
+        assert!(
+            !orphan_matrix_protection(without_hot)
+                .live_set
+                .contains(&paths.hot_scribe),
+            "dropping the file_list root removes the only authority naming hot objects"
+        );
+
+        let mut unpinned = paths.roots();
+        unpinned.pinned_snapshot_ids = vec![30];
+        assert!(
+            unpinned.compose().is_err(),
+            "an Oracle cut on a snapshot the traversal never saw must fail closed"
+        );
+
+        let mut lineage_lost = paths.roots();
+        lineage_lost.traversed_snapshot_ids.clear();
+        assert!(
+            lineage_lost.compose().is_err(),
+            "a pinned snapshot missing from the traversed lineage must fail closed"
+        );
+
+        let mut blocked = paths.roots();
+        blocked.blocked = true;
+        assert_eq!(
+            orphan_matrix_protection(blocked).gc_eligibility(
+                &paths.binding,
+                &paths.orphan,
+                ObjectEvidence::Present(&aged)
+            ),
+            GcEligibility::Protected,
+            "lease loss, fence loss, and open operations all raise one gate over the table"
+        );
+    }
+
+    /// Requires the tenant binding, age floor, and object evidence to refuse
+    /// independently of every protection root.
+    fn assert_orphan_binding_age_and_evidence_refuse(paths: &OrphanMatrixPaths) {
+        use crate::catalog::TableRef;
+        use crate::namespaces::BifrostNamespace;
+
+        let protection = orphan_matrix_protection(paths.roots());
+        let aged = orphan_matrix_aged();
+        let foreign = TenantTableBinding::resolve((
+            DataTenantId::new_v7(),
+            TableRef::new(BifrostNamespace::Traces, "spans"),
+        ))
+        .expect("foreign binding");
+        assert_eq!(
+            protection.gc_eligibility(&foreign, &paths.orphan, ObjectEvidence::Present(&aged)),
+            GcEligibility::InvalidPath,
+            "another tenant's binding never addresses this table's objects"
+        );
+        let young = opendal::Metadata::new(EntryMode::FILE).with_last_modified(
+            Timestamp::from_millisecond(47 * 60 * 60 * 1_000).expect("timestamp"),
+        );
+        assert_eq!(
+            protection.gc_eligibility(
+                &paths.binding,
+                &paths.orphan,
+                ObjectEvidence::Present(&young)
+            ),
+            GcEligibility::TooYoung
+        );
+        assert_eq!(
+            protection.gc_eligibility(
+                &paths.binding,
+                &paths.orphan,
+                ObjectEvidence::Present(&opendal::Metadata::new(EntryMode::FILE))
+            ),
+            GcEligibility::TooYoung,
+            "an object with no last-modified evidence has not proven its age"
+        );
+        assert_eq!(
+            protection.gc_eligibility(&paths.binding, &paths.orphan, ObjectEvidence::Missing),
+            GcEligibility::Missing
+        );
+    }
+
+    /// Requires only the writer's own recipe grammar to be addressable at all.
+    fn assert_only_canonical_recipe_paths_are_addressable(paths: &OrphanMatrixPaths) {
+        let protection = orphan_matrix_protection(paths.roots());
+        let aged = orphan_matrix_aged();
+        let prefix = &paths.binding.object_prefix;
+        for (lookalike, why) in [
+            (
+                format!(
+                    "{prefix}{FORGE_DATA_MARKER}{FORGE_WRITER_RECIPE}/{}-00000.parquet",
+                    Uuid::now_v7()
+                ),
+                "an output with no per-writer identity is not a recipe output",
+            ),
+            (
+                format!(
+                    "{prefix}{FORGE_DATA_MARKER}v2/{}-00000-{}.parquet",
+                    Uuid::now_v7(),
+                    Uuid::now_v7()
+                ),
+                "another recipe root is outside this collector's reach",
+            ),
+            (
+                format!("{prefix}/data/pod-a-01JABC.parquet"),
+                "a Scribe pod object is reclaimable only from committed expiry evidence",
+            ),
+            (
+                format!("{prefix}/metadata/v1.metadata.json"),
+                "catalog-owned metadata is never reached by orphan listing alone",
+            ),
+        ] {
+            assert_eq!(
+                protection.gc_eligibility(
+                    &paths.binding,
+                    &lookalike,
+                    ObjectEvidence::Present(&aged)
+                ),
+                GcEligibility::InvalidPath,
+                "{why}"
+            );
+        }
+    }
+
     /// Every orphan-protection root is load-bearing on its own.
     ///
     /// Never-published orphan collection deletes objects no catalog snapshot
@@ -2016,212 +2253,45 @@ mod tests {
     /// lineage, an Oracle reader pin, the tenant/table binding, the
     /// destructive-maintenance gate that lease loss and fence loss raise, and
     /// the object age floor — and requires each removal to either expose an
-    /// object as unsafely eligible or fail closed. A root that can be dropped
-    /// with no observable consequence is a root that is no longer protecting
-    /// anything.
+    /// object as unsafely eligible or fail closed.
     #[test]
     fn orphan_policy_root_mutation_matrix() {
-        use crate::catalog::TableRef;
-        use crate::forge::protection_roots::OrphanProtectionRoots;
-        use crate::namespaces::BifrostNamespace;
+        let paths = OrphanMatrixPaths::new();
+        let complete = orphan_matrix_protection(paths.roots());
+        let aged = orphan_matrix_aged();
 
-        let binding = TenantTableBinding::resolve((
-            DataTenantId::new_v7(),
-            TableRef::new(BifrostNamespace::Traces, "spans"),
-        ))
-        .expect("binding");
-        let output = |attempt: Uuid| {
-            format!(
-                "{}{FORGE_DATA_MARKER}{FORGE_WRITER_RECIPE}/{attempt}-00000-{}.parquet",
-                binding.object_prefix,
-                Uuid::now_v7()
-            )
-        };
-        let catalog_output = output(Uuid::now_v7());
-        let open_output = output(Uuid::now_v7());
-        let orphan = output(Uuid::now_v7());
-        let hot_scribe = format!("{}/data/pod-a-01JHOT.parquet", binding.object_prefix);
-
-        let roots = || OrphanProtectionRoots {
-            catalog: {
-                let mut set = ProtectedLiveSet::default();
-                set.insert(catalog_output.clone());
-                set
-            },
-            traversed_snapshot_ids: vec![10, 20],
-            hot_unpromoted: vec![hot_scribe.clone()],
-            open_outputs: vec![open_output.clone()],
-            pinned_snapshot_ids: vec![20],
-            blocked: false,
-        };
-        let cutoff = Timestamp::from_millisecond(24 * 60 * 60 * 1_000).expect("timestamp");
-        let now = DateTime::<Utc>::from_timestamp_millis(48 * 60 * 60 * 1_000).expect("time");
-        let protection_from = |roots: OrphanProtectionRoots| {
-            let composed = roots.compose().expect("roots compose");
-            MaintenanceProtection::new(composed.live_set, composed.blocked, now, cutoff)
-        };
-        let aged = opendal::Metadata::new(EntryMode::FILE)
-            .with_last_modified(Timestamp::from_millisecond(0).expect("timestamp"));
-        let young = opendal::Metadata::new(EntryMode::FILE).with_last_modified(
-            Timestamp::from_millisecond(47 * 60 * 60 * 1_000).expect("timestamp"),
-        );
-
-        let complete = protection_from(roots());
         assert_eq!(
-            complete.gc_eligibility(&binding, &orphan, ObjectEvidence::Present(&aged)),
+            complete.gc_eligibility(
+                &paths.binding,
+                &paths.orphan,
+                ObjectEvidence::Present(&aged)
+            ),
             GcEligibility::Eligible,
             "an aged output no authority names is exactly what this protocol collects"
         );
         for (protected, why) in [
             (
-                &catalog_output,
+                &paths.catalog_output,
                 "a catalog-reachable output is never an orphan",
             ),
             (
-                &open_output,
+                &paths.open_output,
                 "a staged, prepared, open, possible, or uncertain output is still owned",
             ),
         ] {
             assert_eq!(
-                complete.gc_eligibility(&binding, protected, ObjectEvidence::Present(&aged)),
+                complete.gc_eligibility(&paths.binding, protected, ObjectEvidence::Present(&aged)),
                 GcEligibility::Protected,
                 "{why}"
             );
         }
         assert!(
-            complete.live_set.contains(&hot_scribe),
+            complete.live_set.contains(&paths.hot_scribe),
             "a committed but unpromoted Scribe object is inside the protected union"
         );
 
-        // Catalog reachability: without it, live table data is collectable.
-        let mut without_catalog = roots();
-        without_catalog.catalog = ProtectedLiveSet::default();
-        assert_eq!(
-            protection_from(without_catalog).gc_eligibility(
-                &binding,
-                &catalog_output,
-                ObjectEvidence::Present(&aged)
-            ),
-            GcEligibility::Eligible,
-            "dropping catalog reachability exposes live data, so that root is load-bearing"
-        );
-
-        // Staged/prepared/open/possible/uncertain outputs: their one root.
-        let mut without_open = roots();
-        without_open.open_outputs.clear();
-        assert_eq!(
-            protection_from(without_open).gc_eligibility(
-                &binding,
-                &open_output,
-                ObjectEvidence::Present(&aged)
-            ),
-            GcEligibility::Eligible,
-            "dropping the open-output root exposes an attempt's own working set"
-        );
-
-        // Committed-but-unpromoted `file_list` objects: their one root. Scribe
-        // pod names are outside the recipe grammar, so the observable loss is
-        // union membership rather than an eligibility flip.
-        let mut without_hot = roots();
-        without_hot.hot_unpromoted.clear();
-        assert!(
-            !protection_from(without_hot).live_set.contains(&hot_scribe),
-            "dropping the file_list root removes the only authority naming hot objects"
-        );
-
-        // Oracle reader pins and the snapshot lineage that must still carry
-        // them: an unreachable pin is refused rather than deleted around.
-        let mut unpinned = roots();
-        unpinned.pinned_snapshot_ids = vec![30];
-        assert!(
-            unpinned.compose().is_err(),
-            "an Oracle cut on a snapshot the traversal never saw must fail closed"
-        );
-        let mut lineage_lost = roots();
-        lineage_lost.traversed_snapshot_ids.clear();
-        assert!(
-            lineage_lost.compose().is_err(),
-            "a pinned snapshot missing from the traversed lineage must fail closed"
-        );
-
-        // Lease loss, fence loss, and any open or unreconciled operation raise
-        // the destructive gate, which protects the whole table at once.
-        let mut blocked = roots();
-        blocked.blocked = true;
-        assert_eq!(
-            protection_from(blocked).gc_eligibility(
-                &binding,
-                &orphan,
-                ObjectEvidence::Present(&aged)
-            ),
-            GcEligibility::Protected,
-            "a raised destructive gate protects every object, including a true orphan"
-        );
-
-        // The tenant/table binding, the object age floor, and object evidence
-        // itself each independently refuse.
-        let foreign = TenantTableBinding::resolve((
-            DataTenantId::new_v7(),
-            TableRef::new(BifrostNamespace::Traces, "spans"),
-        ))
-        .expect("foreign binding");
-        assert_eq!(
-            complete.gc_eligibility(&foreign, &orphan, ObjectEvidence::Present(&aged)),
-            GcEligibility::InvalidPath,
-            "another tenant's binding never addresses this table's objects"
-        );
-        assert_eq!(
-            complete.gc_eligibility(&binding, &orphan, ObjectEvidence::Present(&young)),
-            GcEligibility::TooYoung
-        );
-        assert_eq!(
-            complete.gc_eligibility(
-                &binding,
-                &orphan,
-                ObjectEvidence::Present(&opendal::Metadata::new(EntryMode::FILE))
-            ),
-            GcEligibility::TooYoung,
-            "an object with no last-modified evidence has not proven its age"
-        );
-        assert_eq!(
-            complete.gc_eligibility(&binding, &orphan, ObjectEvidence::Missing),
-            GcEligibility::Missing
-        );
-
-        // Listing, age, and path grammar are necessary but never sufficient:
-        // only the canonical recipe grammar is addressable at all.
-        for (lookalike, why) in [
-            (
-                format!(
-                    "{}{FORGE_DATA_MARKER}{FORGE_WRITER_RECIPE}/{}-00000.parquet",
-                    binding.object_prefix,
-                    Uuid::now_v7()
-                ),
-                "an output with no per-writer identity is not a recipe output",
-            ),
-            (
-                format!(
-                    "{}{FORGE_DATA_MARKER}v2/{}-00000-{}.parquet",
-                    binding.object_prefix,
-                    Uuid::now_v7(),
-                    Uuid::now_v7()
-                ),
-                "another recipe root is outside this collector's reach",
-            ),
-            (
-                format!("{}/data/pod-a-01JABC.parquet", binding.object_prefix),
-                "a Scribe pod object is reclaimable only from committed expiry evidence",
-            ),
-            (
-                format!("{}/metadata/v1.metadata.json", binding.object_prefix),
-                "catalog-owned metadata is never reached by orphan listing alone",
-            ),
-        ] {
-            assert_eq!(
-                complete.gc_eligibility(&binding, &lookalike, ObjectEvidence::Present(&aged)),
-                GcEligibility::InvalidPath,
-                "{why}"
-            );
-        }
+        assert_each_orphan_root_is_load_bearing(&paths);
+        assert_orphan_binding_age_and_evidence_refuse(&paths);
+        assert_only_canonical_recipe_paths_are_addressable(&paths);
     }
 }

@@ -5,10 +5,11 @@
 //! and stay unlisted until their tests are restored against a current
 //! production invariant.
 
+mod expired_cleanup;
 mod managed_rewrite;
 mod promotion;
 mod publication;
 mod reader_expiry_ordering;
 mod rewrite_support;
-mod snapshot_expiration;
+pub(crate) mod snapshot_expiration;
 pub(crate) mod support;

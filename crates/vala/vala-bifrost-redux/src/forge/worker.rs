@@ -2368,6 +2368,50 @@ impl ForgeWorker {
         )
     }
 
+    /// Dispatches one fresh claim and reduces its result to durable evidence.
+    ///
+    /// Splits the strategy-specific dispatch and evidence reduction out of the
+    /// fenced attempt so the fence, heartbeat, and cancellation seams stay one
+    /// readable sequence.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever the dispatched strategy returns, including shutdown,
+    /// reconciliation, catalog, and SQL errors.
+    async fn dispatch_evidence(
+        &self,
+        claim: &ForgeTaskClaim,
+        attempt: Uuid,
+        binding: &TenantTableBinding,
+        lease: &mut ForgeLease,
+        table: Table,
+        stop: &CancellationToken,
+    ) -> Result<(ForgeTaskEvidence, ForgeExecutionEvidenceState), ForgeError> {
+        match self
+            .dispatch_claim(ForgeDispatchRequest {
+                claim,
+                attempt,
+                binding,
+                lease,
+                table,
+                stop,
+            })
+            .await?
+        {
+            ForgeDispatchResult::Committed(committed) => self
+                .committed_evidence(binding, &committed)
+                .await
+                .map(|evidence| (evidence, ForgeExecutionEvidenceState::Fresh)),
+            ForgeDispatchResult::Cleaned(evidence) => {
+                Ok((*evidence, ForgeExecutionEvidenceState::Prepared))
+            }
+            ForgeDispatchResult::Maintenance(result) => {
+                self.complete_maintenance(claim, attempt, binding, lease, *result, stop)
+                    .await
+            }
+        }
+    }
+
     async fn execute_fenced(
         &self,
         claim: &ForgeTaskClaim,
@@ -2443,37 +2487,8 @@ impl ForgeWorker {
         let execution = match committed_recovery {
             Some(evidence) => Ok((evidence, ForgeExecutionEvidenceState::RecoveredCommit)),
             None => {
-                match self
-                    .dispatch_claim(ForgeDispatchRequest {
-                        claim,
-                        attempt,
-                        binding,
-                        lease,
-                        table,
-                        stop: dispatch_stop,
-                    })
+                self.dispatch_evidence(claim, attempt, binding, lease, table, dispatch_stop)
                     .await
-                {
-                    Ok(ForgeDispatchResult::Committed(committed)) => self
-                        .committed_evidence(binding, &committed)
-                        .await
-                        .map(|evidence| (evidence, ForgeExecutionEvidenceState::Fresh)),
-                    Ok(ForgeDispatchResult::Cleaned(evidence)) => {
-                        Ok((*evidence, ForgeExecutionEvidenceState::Prepared))
-                    }
-                    Ok(ForgeDispatchResult::Maintenance(result)) => {
-                        self.complete_maintenance(
-                            claim,
-                            attempt,
-                            binding,
-                            lease,
-                            *result,
-                            dispatch_stop,
-                        )
-                        .await
-                    }
-                    Err(error) => Err(error),
-                }
             }
         };
         // A pre-effect cancellation surfaces as `execution == Err(Shutdown)`

@@ -1301,12 +1301,14 @@ impl ForgeTasks {
                         .to_owned(),
             });
         }
-        let source: Option<(Uuid, String, String, String, String, String, Option<serde_json::Value>)> = sqlx::query_as("SELECT data_tenant_id,catalog_name,namespace_name,table_name,strategy,state,evidence FROM vala.forge_tasks WHERE task_id=$1 FOR UPDATE")
+        let source: Option<(String, Option<serde_json::Value>)> = sqlx::query_as(
+            "SELECT data_tenant_id::text||'/'||catalog_name||'/'||namespace_name||'/'||table_name||'/'||strategy||'/'||state,evidence FROM vala.forge_tasks WHERE task_id=$1 FOR UPDATE",
+        )
             .bind(payload.source_task_id)
             .fetch_optional(&mut **tx)
             .await
             .map_err(SqlError::from)?;
-        let Some((tenant, catalog, namespace, table, strategy, state, evidence)) = source else {
+        let Some((identity, evidence)) = source else {
             return Err(SqlError::Conflict {
                 detail: "expired cleanup names no surviving snapshot-expiration source".to_owned(),
             });
@@ -1316,13 +1318,16 @@ impl ForgeTasks {
         })?;
         let evidence = crate::row_types::forge_tasks::evidence_from_json(evidence)?;
         require_handoff_source(&evidence)?;
-        if tenant != task.data_tenant_id.as_uuid()
-            || catalog != task.table_ref.catalog
-            || namespace != task.table_ref.namespace
-            || table != task.table_ref.table
-            || strategy != ForgeTaskStrategy::SnapshotExpiry.as_str()
-            || state != ForgeTaskState::Succeeded.as_str()
-        {
+        let expected = format!(
+            "{}/{}/{}/{}/{}/{}",
+            task.data_tenant_id.as_uuid(),
+            task.table_ref.catalog,
+            task.table_ref.namespace,
+            task.table_ref.table,
+            ForgeTaskStrategy::SnapshotExpiry.as_str(),
+            ForgeTaskState::Succeeded.as_str(),
+        );
+        if identity != expected {
             return Err(SqlError::Conflict {
                 detail: "expired cleanup source is not a succeeded expiration for this table"
                     .to_owned(),

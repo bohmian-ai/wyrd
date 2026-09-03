@@ -16,8 +16,8 @@ use vala_sql::queries::forge_operations::ForgeOperations;
 use vala_sql::queries::forge_tasks::{ForgeClaimLimits, ForgeEnqueueBatch, ForgeTasks};
 use vala_sql::row_types::forge_operations::ForgeOperationFamily;
 use vala_sql::row_types::forge_tasks::{
-    FORGE_TASK_PAYLOAD_VERSION, ForgePlanningDemand, ForgeTaskEstimates, ForgeTaskLane,
-    ForgeTaskPlan, ForgeTaskStrategy, ForgeTaskTableIdentity, NewForgeTask,
+    ExpiredCleanupPayload, FORGE_TASK_PAYLOAD_VERSION, ForgePlanningDemand, ForgeTaskEstimates,
+    ForgeTaskLane, ForgeTaskPlan, ForgeTaskStrategy, ForgeTaskTableIdentity, NewForgeTask,
 };
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
@@ -570,6 +570,32 @@ impl<'forge> ForgeScheduler<'forge> {
         Ok(failures > 0)
     }
 
+    /// Records one discovery telemetry sample per planned candidate.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invariant error when a candidate strategy has no metric
+    /// mapping, which would otherwise silently drop the sample.
+    fn record_discovered_candidates(
+        &self,
+        snapshot: &ForgeTableSnapshot,
+    ) -> Result<(), ForgeError> {
+        for candidate in &snapshot.candidates {
+            self.forge.core.telemetry.record_discovered_candidate(
+                ForgeTaskMetricStrategy::try_from(candidate.strategy).map_err(|strategy| {
+                    ForgeError::Invariant {
+                        detail: format!(
+                            "Forge candidate strategy lacks a metric mapping: {strategy:?}"
+                        ),
+                    }
+                })?,
+                candidate.inputs.len(),
+                candidate.bytes,
+            );
+        }
+        Ok(())
+    }
+
     /// Plans and atomically acknowledges one exact demand generation.
     ///
     /// # Errors
@@ -589,19 +615,7 @@ impl<'forge> ForgeScheduler<'forge> {
                 compaction_debt_bytes,
             ));
         }
-        for candidate in &snapshot.candidates {
-            self.forge.core.telemetry.record_discovered_candidate(
-                ForgeTaskMetricStrategy::try_from(candidate.strategy).map_err(|strategy| {
-                    ForgeError::Invariant {
-                        detail: format!(
-                            "Forge candidate strategy lacks a metric mapping: {strategy:?}"
-                        ),
-                    }
-                })?,
-                candidate.inputs.len(),
-                candidate.bytes,
-            );
-        }
+        self.record_discovered_candidates(&snapshot)?;
         let mut executable = Vec::new();
         let mut unschedulable = Vec::new();
         // Expired cleanup outranks fresh planning for this table: it consumes a
@@ -1309,6 +1323,21 @@ impl<'forge> ForgeScheduler<'forge> {
         if !super::phase::admits_new_effect(ForgeTaskStrategy::ExpiredCleanup) {
             return Ok(None);
         }
+        self.unconsumed_cleanup_projection(demand).await
+    }
+
+    /// Builds the cleanup task for an unconsumed handoff without the phase gate.
+    ///
+    /// The gate is the caller's, so the projection itself stays provable while
+    /// production routing is still owned by a later task.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same failures as [`Self::expired_cleanup_task`].
+    pub(super) async fn unconsumed_cleanup_projection(
+        &self,
+        demand: &ForgePlanningDemand,
+    ) -> Result<Option<NewForgeTask>, ForgeError> {
         let Some(payload) = self
             .tasks
             .unconsumed_expiration_handoff(demand.data_tenant_id, &demand.table_ref)
@@ -1317,45 +1346,23 @@ impl<'forge> ForgeScheduler<'forge> {
         else {
             return Ok(None);
         };
-        let count = payload.cleanup_candidates.len();
-        let files = u32::try_from(count).map_err(|_| ForgeError::Invariant {
-            detail: "expired cleanup candidate count exceeds u32".to_owned(),
-        })?;
-        let bytes = payload.serialized_candidate_bytes().max(1);
-        let envelope = ForgeEnvelopeSizer::size(bytes, count, 1, self.capacity)?;
-        let plan = ForgeTaskPlan {
-            version: FORGE_TASK_PAYLOAD_VERSION,
-            inputs: Vec::new(),
-            parameters: payload.to_value(),
-        };
-        let plan_hash = plan_hash(&plan)?;
-        Ok(Some(NewForgeTask {
-            data_tenant_id: demand.data_tenant_id,
-            table_ref: demand.table_ref.clone(),
-            strategy: ForgeTaskStrategy::ExpiredCleanup,
-            lane: ForgeTaskLane::Ordinary,
-            base_snapshot_id: payload.committed_snapshot_id,
-            plan,
-            plan_hash,
-            estimates: ForgeTaskEstimates {
-                files,
-                bytes,
-                parallelism: 1,
-                memory_bytes: envelope
-                    .memory_bytes()
-                    .map_err(|error| ForgeError::Invariant {
-                        detail: error.to_string(),
-                    })?,
-                spill_bytes: envelope
-                    .scratch_bytes()
-                    .map_err(|error| ForgeError::Invariant {
-                        detail: error.to_string(),
-                    })?,
-                large_ceiling_bytes: self.capacity.max_large_task_bytes,
-                envelope: Some(envelope),
-            },
-            ready_at: Utc::now(),
-        }))
+        cleanup_projection(demand, &payload, self.capacity).map(Some)
+    }
+
+    /// Builds the production cleanup projection for one integration fixture.
+    ///
+    /// Only phase activation is bypassed; the handoff read, validation, and
+    /// bounded projection are the production owners.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same failures as [`Self::expired_cleanup_task`].
+    #[cfg(feature = "test-support")]
+    pub async fn expired_cleanup_task_for_test(
+        &self,
+        demand: &ForgePlanningDemand,
+    ) -> Result<Option<NewForgeTask>, ForgeError> {
+        self.unconsumed_cleanup_projection(demand).await
     }
 
     /// Publishes complete-only planning backlog gauges.
@@ -1549,6 +1556,64 @@ fn unschedulable_event(task_id: Uuid) -> AuditEvent {
         AuditResult::Success,
         "Forge plan exceeds configured capacity".to_owned(),
     )
+}
+
+/// Builds the fixed bounded durable task one cleanup handoff projects to.
+///
+/// The projection is deterministic in the payload alone: candidate count is the
+/// file estimate, the canonical serialization length is the byte estimate, one
+/// reader permit reflects the strictly serial per-candidate protocol, and the
+/// base snapshot is the identity the expiration committed.
+///
+/// # Errors
+///
+/// Returns [`ForgeError::Invariant`] when the candidate count exceeds the
+/// durable estimate bound or an envelope term cannot be represented, and
+/// [`ForgeError::Capacity`] when the topology supplies no complete envelope.
+pub(super) fn cleanup_projection(
+    demand: &ForgePlanningDemand,
+    payload: &ExpiredCleanupPayload,
+    capacity: ForgeCapacity,
+) -> Result<NewForgeTask, ForgeError> {
+    let count = payload.cleanup_candidates.len();
+    let files = u32::try_from(count).map_err(|_| ForgeError::Invariant {
+        detail: "expired cleanup candidate count exceeds u32".to_owned(),
+    })?;
+    let bytes = payload.serialized_candidate_bytes().max(1);
+    let envelope = ForgeEnvelopeSizer::size(bytes, count, 1, capacity)?;
+    let plan = ForgeTaskPlan {
+        version: FORGE_TASK_PAYLOAD_VERSION,
+        inputs: Vec::new(),
+        parameters: payload.to_value(),
+    };
+    let plan_hash = plan_hash(&plan)?;
+    Ok(NewForgeTask {
+        data_tenant_id: demand.data_tenant_id,
+        table_ref: demand.table_ref.clone(),
+        strategy: ForgeTaskStrategy::ExpiredCleanup,
+        lane: ForgeTaskLane::Ordinary,
+        base_snapshot_id: payload.committed_snapshot_id,
+        plan,
+        plan_hash,
+        estimates: ForgeTaskEstimates {
+            files,
+            bytes,
+            parallelism: 1,
+            memory_bytes: envelope
+                .memory_bytes()
+                .map_err(|error| ForgeError::Invariant {
+                    detail: error.to_string(),
+                })?,
+            spill_bytes: envelope
+                .scratch_bytes()
+                .map_err(|error| ForgeError::Invariant {
+                    detail: error.to_string(),
+                })?,
+            large_ceiling_bytes: capacity.max_large_task_bytes,
+            envelope: Some(envelope),
+        },
+        ready_at: Utc::now(),
+    })
 }
 
 #[cfg(test)]

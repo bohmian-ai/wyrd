@@ -344,19 +344,19 @@ async fn prepared_claim_releases_sql_before_iceberg_and_hands_exact_names_to_cle
 ///
 /// The supervisor is retained by value because dropping it would take the
 /// scheduler, worker, and shared `Forge` graph down with it.
-struct ExpirableTable {
+pub(super) struct ExpirableTable {
     /// Live Scribe/Forge fixture over one repository-managed database.
-    fixture: PromotionIntegrationFixture,
+    pub(super) fixture: PromotionIntegrationFixture,
     /// Delete- and read-counting object store every effect goes through.
-    store: Arc<CountingObjectStore>,
+    pub(super) store: Arc<CountingObjectStore>,
     /// Catalog seam that can refuse, park, or lose one commit.
-    seam: Arc<PromotionCatalogSeam>,
+    pub(super) seam: Arc<PromotionCatalogSeam>,
     /// Retained production scheduler and worker supervisor.
-    supervised: SupervisedPromotion,
+    pub(super) supervised: SupervisedPromotion,
     /// Manual clock control shared by the whole Forge graph.
-    control: ForgeClockControl,
+    pub(super) control: ForgeClockControl,
     /// Current head snapshot and its timestamp, used as the task watermark.
-    watermark: (i64, i64),
+    pub(super) watermark: (i64, i64),
 }
 
 /// Reads the current head snapshot and its timestamp from the real catalog.
@@ -364,7 +364,7 @@ struct ExpirableTable {
 /// # Panics
 ///
 /// Panics when the table cannot be loaded or carries no current snapshot.
-async fn head_watermark(fixture: &PromotionIntegrationFixture) -> (i64, i64) {
+pub(super) async fn head_watermark(fixture: &PromotionIntegrationFixture) -> (i64, i64) {
     fixture
         .catalog
         .iceberg_catalog()
@@ -386,7 +386,7 @@ async fn head_watermark(fixture: &PromotionIntegrationFixture) -> (i64, i64) {
 /// # Panics
 ///
 /// Panics when the fixture cannot promote twice or the table has no head.
-async fn expirable_table(name: &str, worker_routed: bool) -> ExpirableTable {
+pub(super) async fn expirable_table(name: &str, worker_routed: bool) -> ExpirableTable {
     let mut fixture = PromotionIntegrationFixture::start(name).await;
     fixture.config.snapshot_expiry_enabled = worker_routed;
     let store = CountingObjectStore::new(Arc::clone(&fixture.staging));
@@ -639,7 +639,7 @@ async fn retryable_catalog_failure_retains_prepared_authority() {
 /// # Panics
 ///
 /// Panics when the fixture has no head manifest or the seeding statement fails.
-async fn seed_ready_expiry_task(
+pub(super) async fn seed_ready_expiry_task(
     fixture: &PromotionIntegrationFixture,
     watermark: (i64, i64),
     plan_hash_byte: &str,
@@ -793,7 +793,7 @@ async fn seed_never_published_object(fixture: &PromotionIntegrationFixture) -> S
 /// # Panics
 ///
 /// Panics when the staging operator fails for a reason other than absence.
-async fn object_exists(fixture: &PromotionIntegrationFixture, path: &str) -> bool {
+pub(super) async fn object_exists(fixture: &PromotionIntegrationFixture, path: &str) -> bool {
     match fixture.staging.stat(path).await {
         Ok(_) => true,
         Err(error) if error.kind() == opendal::ErrorKind::NotFound => false,

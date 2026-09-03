@@ -73,27 +73,35 @@ pub(crate) struct CountingObjectStore {
     /// Number of delegated object stats, which prove a pre-IO refusal.
     stats: AtomicUsize,
     /// Optional pause applied to one delegated stat.
-    stat_pause: StatPause,
+    stat_pause: CallPause,
     /// Remaining delegated stats to fail with an injected transient error.
     stat_errors: AtomicUsize,
+    /// Optional pause applied to one delegated delete, before it is submitted.
+    delete_pause: CallPause,
     /// Remaining delegated deletes to submit and then report as unknown.
     delete_errors: AtomicUsize,
+    /// Remaining delegated deletes to submit and then report as already absent.
+    delete_absences: AtomicUsize,
 }
 
-/// Deterministic pause seam over exactly one delegated `stat`.
+/// Deterministic pause seam over exactly one delegated object-store call.
 ///
 /// A cleanup candidate's fresh reachability proof begins with a stat, so
 /// suspending that one call is the only place a test can observe the durable
 /// state a preparation committed while no Postgres transaction is open and no
-/// deletion has been submitted. Both handshakes use `Notify::notify_one`, whose
-/// permit is stored, so neither side can miss the other and no sleep is needed.
+/// deletion has been submitted. Suspending the delete instead holds the caller
+/// inside the polled deletion future, which is the only place the boundary
+/// between a pre- and a post-submission outcome can be driven. Both handshakes
+/// use `Notify::notify_one`, whose permit is stored, so neither side can miss
+/// the other and no sleep is needed. A caller that cancels rather than releases
+/// simply drops the suspended future, leaving the real operator untouched.
 #[derive(Debug, Default)]
-struct StatPause {
-    /// One-based stat ordinal to suspend at; `0` disables the gate.
+struct CallPause {
+    /// One-based call ordinal to suspend at; `0` disables the gate.
     at: AtomicUsize,
-    /// Signalled once the selected stat is suspended.
+    /// Signalled once the selected call is suspended.
     arrived: tokio::sync::Notify,
-    /// Signalled by the test to let the suspended stat proceed.
+    /// Signalled by the test to let the suspended call proceed.
     release: tokio::sync::Notify,
 }
 
@@ -106,9 +114,11 @@ impl CountingObjectStore {
             deletes: AtomicUsize::new(0),
             reads: Arc::new(AtomicUsize::new(0)),
             stats: AtomicUsize::new(0),
-            stat_pause: StatPause::default(),
+            stat_pause: CallPause::default(),
             stat_errors: AtomicUsize::new(0),
+            delete_pause: CallPause::default(),
             delete_errors: AtomicUsize::new(0),
+            delete_absences: AtomicUsize::new(0),
         })
     }
 
@@ -153,6 +163,31 @@ impl CountingObjectStore {
     /// must treat the candidate as uncertain rather than deleted.
     pub(crate) fn fail_next_deletes(&self, count: usize) {
         self.delete_errors.store(count, Ordering::Release);
+    }
+
+    /// Let the next `count` delegated deletes take effect, then report absence.
+    ///
+    /// This is what a store reports when the object is already gone by the time
+    /// the deletion is applied, which the caller must treat as a proven absence
+    /// rather than as an unknown acceptance.
+    pub(crate) fn not_found_next_deletes(&self, count: usize) {
+        self.delete_absences.store(count, Ordering::Release);
+    }
+
+    /// Suspend the delete whose one-based ordinal is `at`, counting from now.
+    ///
+    /// The suspension happens before the real operator is called, so a caller
+    /// that cancels instead of releasing leaves the object intact while its
+    /// deletion counts as submitted.
+    pub(crate) fn pause_delete_at(&self, at: usize) {
+        self.delete_pause
+            .at
+            .store(self.deletes() + at, Ordering::Release);
+    }
+
+    /// Wait until the armed delete is suspended inside the delegated call.
+    pub(crate) async fn delete_paused(&self) {
+        self.delete_pause.arrived.notified().await;
     }
 
     /// Borrow the shared read counter so a catalog seam can snapshot it.
@@ -225,7 +260,12 @@ impl ForgeObjectStore for CountingObjectStore {
     }
 
     async fn delete(&self, path: &str) -> opendal::Result<()> {
-        self.deletes.fetch_add(1, Ordering::AcqRel);
+        let ordinal = self.deletes.fetch_add(1, Ordering::AcqRel) + 1;
+        if self.delete_pause.at.load(Ordering::Acquire) == ordinal {
+            self.delete_pause.at.store(0, Ordering::Release);
+            self.delete_pause.arrived.notify_one();
+            self.delete_pause.release.notified().await;
+        }
         let submitted = self.inner.delete(path).await;
         if self
             .delete_errors
@@ -238,6 +278,19 @@ impl ForgeObjectStore for CountingObjectStore {
             return Err(opendal::Error::new(
                 opendal::ErrorKind::Unexpected,
                 "injected expired-cleanup delete acknowledgement failure",
+            ));
+        }
+        if self
+            .delete_absences
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            submitted?;
+            return Err(opendal::Error::new(
+                opendal::ErrorKind::NotFound,
+                "injected expired-cleanup delete absence",
             ));
         }
         submitted

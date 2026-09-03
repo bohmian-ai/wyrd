@@ -813,42 +813,48 @@ async fn assert_foreign_takeover_is_refused(
     assert_eq!(owner, Some(claim.claimed_by.expect("claim owner")));
 }
 
-/// Seeds one more real expired object and returns its plan candidate.
+/// Seeds more real expired objects and returns their plan candidates.
 ///
-/// Partial progress is only observable across more than one candidate, and the
-/// handoff a single fixture expiration leaves carries exactly one. The object is
-/// written beside the existing candidate so it stays inside the table binding,
-/// and the manual Forge clock — the only age authority in this fixture — is
-/// moved past it so the shared minimum-age proof admits it.
+/// Partial progress and a nonzero resume frontier are only observable across
+/// several candidates, and the handoff a single fixture expiration leaves
+/// carries exactly one. Each object is written beside the existing candidate so
+/// it stays inside the table binding, and the manual Forge clock — the only age
+/// authority in this fixture — is moved past them so the shared minimum-age
+/// proof admits them.
 ///
 /// # Panics
 ///
-/// Panics when the object cannot be written or the manual clock cannot advance.
-async fn seed_second_candidate(
+/// Panics when an object cannot be written or the manual clock cannot advance.
+async fn seed_extra_candidates(
     table: &ExpirableTable,
     payload: &ExpiredCleanupPayload,
-) -> ForgeCleanupCandidate {
+    file_names: &[&str],
+) -> Vec<ForgeCleanupCandidate> {
     let base = payload
         .cleanup_candidates
         .first()
         .expect("the handoff carries at least one candidate");
-    let path = sibling_path(base, "wyrd-second-expired.parquet");
-    table
-        .fixture
-        .staging
-        .write(&path, b"second expired candidate".to_vec())
-        .await
-        .expect("the second candidate object seeds");
+    let mut seeded = Vec::with_capacity(file_names.len());
+    for file_name in file_names {
+        let path = sibling_path(base, file_name);
+        table
+            .fixture
+            .staging
+            .write(&path, b"seeded expired candidate".to_vec())
+            .await
+            .expect("the extra candidate object seeds");
+        seeded.push(ForgeCleanupCandidate {
+            category: base.category,
+            table: base.table.clone(),
+            path: ForgeCleanupPath::new(&path).expect("extra candidate path"),
+        });
+    }
     let advanced = table.control.now().expect("manual clock reads") + ChronoDuration::days(7);
     table
         .control
         .set(advanced)
-        .expect("the manual clock advances past the seeded object");
-    ForgeCleanupCandidate {
-        category: base.category,
-        table: base.table.clone(),
-        path: ForgeCleanupPath::new(&path).expect("second candidate path"),
-    }
+        .expect("the manual clock advances past the seeded objects");
+    seeded
 }
 
 /// Lapses one task's claim lease so the prepared-recovery route can take it.
@@ -1110,8 +1116,8 @@ async fn assert_lost_acknowledgement_is_uncertain(
     );
     assert_eq!(
         table.store.deletes(),
-        deletes_before + 1,
-        "exactly one delete was submitted"
+        deletes_before + 2,
+        "exactly one further delete was submitted"
     );
     assert!(
         !object_exists(&table.fixture, first).await,
@@ -1129,8 +1135,124 @@ async fn assert_lost_acknowledgement_is_uncertain(
             "forge.expired_cleanup.candidate_uncertain"
         )
         .await,
+        2,
+        "each observed uncertain settlement appends exactly one candidate audit"
+    );
+}
+
+/// Asserts cancellation after the delete future is polled records uncertainty.
+///
+/// The delete is suspended inside the polled deletion future, which is the only
+/// point where the pinned submission boundary can be crossed: the object store
+/// was reached, so its acceptance is unknown and the candidate must be retained
+/// rather than refused or advanced past.
+///
+/// # Panics
+///
+/// Panics when the cancellation is settled as anything but uncertainty, the
+/// cursor advances, or the object was actually removed.
+async fn assert_polled_delete_cancellation_is_uncertain(
+    table: &ExpirableTable,
+    taker: &ForgeWorker,
+    cleanup_id: Uuid,
+    first: &str,
+    deletes_before: usize,
+) {
+    let pool = table.fixture.operator_pool.pool();
+    expire_claim(pool, cleanup_id).await;
+    table.store.pause_delete_at(1);
+    let stop = CancellationToken::new();
+    let (result, ()) = tokio::join!(taker.execute_one_for_test(&stop), async {
+        table.store.delete_paused().await;
+        stop.cancel();
+    });
+    let retained = result.expect_err("cancellation racing a submitted delete does not complete");
+    assert!(
+        matches!(retained, ForgeError::Reconciliation { .. }),
+        "cancellation after submission retains the candidate: {retained}"
+    );
+    assert_eq!(
+        table.store.deletes(),
+        deletes_before + 1,
+        "the deletion was submitted before the stop was observed"
+    );
+    assert!(
+        object_exists(&table.fixture, first).await,
+        "the cancelled deletion never reached the real object store"
+    );
+    assert_eq!(
+        cursor(&table.fixture, cleanup_id).await,
+        ("prepared".to_owned(), 0, Some(0)),
+        "an unknown acceptance advances nothing"
+    );
+    assert_eq!(
+        audit_count(
+            &table.fixture,
+            cleanup_id,
+            "forge.expired_cleanup.candidate_uncertain"
+        )
+        .await,
         1,
         "one uncertain settlement appends exactly one candidate audit"
+    );
+}
+
+/// Asserts the drain advances one candidate and then stops at the next.
+///
+/// The first candidate's absence is proven by a fresh stat, so the cursor
+/// advances exactly once; the second candidate is then prepared and its delete
+/// is cancelled inside the polled future, which leaves the task at a nonzero
+/// partial frontier for the successor to resume from.
+///
+/// # Panics
+///
+/// Panics when the frontier is not exactly one, the prepared index is not the
+/// second candidate, or the second object was removed.
+async fn assert_partial_frontier_is_left_for_the_successor(
+    table: &ExpirableTable,
+    taker: &ForgeWorker,
+    cleanup_id: Uuid,
+    second: &str,
+    deletes_before: usize,
+) {
+    let pool = table.fixture.operator_pool.pool();
+    expire_claim(pool, cleanup_id).await;
+    table.store.pause_delete_at(1);
+    let stop = CancellationToken::new();
+    let (result, ()) = tokio::join!(taker.execute_one_for_test(&stop), async {
+        table.store.delete_paused().await;
+        stop.cancel();
+    });
+    assert!(
+        matches!(
+            result.expect_err("the interrupted drain does not complete"),
+            ForgeError::Reconciliation { .. }
+        ),
+        "the second candidate is retained at the partial frontier"
+    );
+    assert_eq!(
+        cursor(&table.fixture, cleanup_id).await,
+        ("prepared".to_owned(), 1, Some(1)),
+        "the proven-absent first candidate advanced once and the second is prepared"
+    );
+    assert_eq!(
+        table.store.deletes(),
+        deletes_before + 3,
+        "a proven absence submits no delete and the second candidate submits one"
+    );
+    assert!(
+        object_exists(&table.fixture, second).await,
+        "the cancelled deletion never reached the real object store"
+    );
+    assert_eq!(
+        audit_count(
+            &table.fixture,
+            cleanup_id,
+            "forge.expired_cleanup.candidate_missing"
+        )
+        .await,
+        1,
+        "the stat-proven absence appends exactly one advancing audit"
     );
 }
 
@@ -1145,8 +1267,6 @@ async fn assert_cleanup_finished_exactly(
     table: &ExpirableTable,
     cleanup_id: Uuid,
     payload: &ExpiredCleanupPayload,
-    first: &str,
-    last: &str,
     deletes_before: usize,
 ) {
     let pool = table.fixture.operator_pool.pool();
@@ -1156,18 +1276,22 @@ async fn assert_cleanup_finished_exactly(
     assert_eq!(prepared, None);
     assert_eq!(
         table.store.deletes(),
-        deletes_before + 2,
-        "the proven-absent candidate is never blindly deleted a second time"
+        deletes_before + 5,
+        "no settled candidate is ever blindly deleted again"
     );
-    assert!(!object_exists(&table.fixture, first).await);
-    assert!(!object_exists(&table.fixture, last).await);
+    for candidate in &payload.cleanup_candidates {
+        assert!(
+            !object_exists(&table.fixture, candidate.path.as_str()).await,
+            "every candidate is finally removed"
+        );
+    }
 
     let sequence = audits(&table.fixture, cleanup_id).await;
     for (operation, expected) in [
-        ("forge.expired_cleanup.candidate_prepared", 2),
+        ("forge.expired_cleanup.candidate_prepared", 3),
         ("forge.expired_cleanup.candidate_refused", 2),
-        ("forge.expired_cleanup.candidate_uncertain", 1),
-        ("forge.expired_cleanup.candidate_missing", 1),
+        ("forge.expired_cleanup.candidate_uncertain", 3),
+        ("forge.expired_cleanup.candidate_missing", 2),
         ("forge.expired_cleanup.candidate_deleted", 1),
         ("forge.task.succeeded", 1),
     ] {
@@ -1208,13 +1332,19 @@ async fn cursor_replays_exact_prepared_candidate_after_refusal_uncertainty_and_t
     let pool = table.fixture.operator_pool.pool();
     let deletes_before = table.store.deletes();
 
-    let second = seed_second_candidate(&table, &payload).await;
-    payload.cleanup_candidates.push(second);
+    payload.cleanup_candidates.extend(
+        seed_extra_candidates(
+            &table,
+            &payload,
+            &["wyrd-second-expired.parquet", "wyrd-third-expired.parquet"],
+        )
+        .await,
+    );
     payload.cleanup_candidates.sort();
-    assert_eq!(payload.cleanup_candidates.len(), 2);
+    assert_eq!(payload.cleanup_candidates.len(), 3);
     persist_cleanup_plan(&table.fixture, cleanup_id, &payload).await;
     let first = payload.cleanup_candidates[0].path.as_str().to_owned();
-    let last = payload.cleanup_candidates[1].path.as_str().to_owned();
+    let second = payload.cleanup_candidates[1].path.as_str().to_owned();
 
     let claim = worker
         .claim_for_test()
@@ -1260,11 +1390,28 @@ async fn cursor_replays_exact_prepared_candidate_after_refusal_uncertainty_and_t
     assert_cancelled_stat_settles_as_refusal(&table, &taker, cleanup_id, attempt, deletes_before)
         .await;
     assert_stale_owner_is_inert(&table, &worker, claim, cleanup_id).await;
+    assert_polled_delete_cancellation_is_uncertain(
+        &table,
+        &taker,
+        cleanup_id,
+        &first,
+        deletes_before,
+    )
+    .await;
     assert_lost_acknowledgement_is_uncertain(&table, &taker, cleanup_id, &first, deletes_before)
         .await;
+    assert_partial_frontier_is_left_for_the_successor(
+        &table,
+        &taker,
+        cleanup_id,
+        &second,
+        deletes_before,
+    )
+    .await;
 
-    // The replay proves the absence with a fresh stat, advances once, and
-    // finishes the second candidate from the partial frontier.
+    // The successor resumes at the nonzero partial frontier: the settled first
+    // candidate is never revisited, the retained second candidate is retried and
+    // proven absent by the deletion itself, and the last candidate is deleted.
     expire_claim(pool, cleanup_id).await;
     assert_eq!(
         attempt_of(pool, cleanup_id).await,
@@ -1272,14 +1419,18 @@ async fn cursor_replays_exact_prepared_candidate_after_refusal_uncertainty_and_t
         "every takeover so far resumed the same task and attempt"
     );
     assert!(
+        !object_exists(&table.fixture, &first).await,
+        "the first candidate was already settled before this takeover"
+    );
+    table.store.not_found_next_deletes(1);
+    assert!(
         taker
             .execute_one_for_test(&CancellationToken::new())
             .await
             .expect("the retained candidates replay to success"),
         "the prepared cleanup task is recovered"
     );
-    assert_cleanup_finished_exactly(&table, cleanup_id, &payload, &first, &last, deletes_before)
-        .await;
+    assert_cleanup_finished_exactly(&table, cleanup_id, &payload, deletes_before).await;
 
     let _ = Arc::strong_count(&table.store);
     table.supervised.shutdown().await;

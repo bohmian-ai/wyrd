@@ -1577,6 +1577,46 @@ mod tests {
     };
     use crate::test_support::{SpanCaptureSubscriber, has_span_outcome};
 
+    /// An abandoned pre-transfer owner retires its entry failed from raw `Drop`.
+    ///
+    /// Selection moves this owner into the graph, so anything that still holds
+    /// it never reached Analytical. Dropping it is therefore the last chance to
+    /// remove the running entry, and it must do so without blocking or spawning
+    /// — `Drop` runs on whatever thread abandoned the stream, including a
+    /// runtime worker being torn down.
+    #[test]
+    fn running_query_terminal_owner_drop_retires_untransferred_failure() {
+        let registry = Arc::new(crate::oracle::RunningQueryRegistry::new());
+        let tenant_id = wyrd_spec::DataTenantId::new_v7();
+        let request_id = wyrd_spec::request_id::RequestId::now_v7();
+        assert!(registry.insert(crate::oracle::running::tests::entry(
+            tenant_id,
+            request_id.clone()
+        )));
+
+        let owner = super::RunningQueryTerminalOwner::new(
+            Arc::clone(&registry),
+            tenant_id,
+            request_id.clone(),
+        );
+        assert!(
+            registry.get(tenant_id, &request_id).is_some(),
+            "the entry stays active while the owner lives"
+        );
+        drop(owner);
+
+        assert!(
+            registry.get(tenant_id, &request_id).is_none(),
+            "dropping an untransferred owner retires its entry"
+        );
+        assert!(
+            registry
+                .settle_terminal(tenant_id, &request_id, QueryTerminalOutcome::Success)
+                .is_none(),
+            "the drop settlement is exactly once and cannot be reclassified"
+        );
+    }
+
     /// Closes a pre-terminal candidate the way the production stream does.
     ///
     /// [`successful_terminal`] builds the candidate before the stream's IPC

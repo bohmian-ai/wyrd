@@ -66,9 +66,14 @@ Required execution skill: `$wyrd-implement`.
   `transport-streamable-http-server`; `wyrd-mcp` enables only `client` and
   `transport-streamable-http-client-reqwest`.
 - `crates/wyrd/wyrd-server/Cargo.toml` and
-  `crates/wyrd/wyrd-server/src/{http.rs,mcp/mod.rs}`: mount one
+  `crates/wyrd/wyrd-server/src/{lib.rs,http/router.rs,mcp/mod.rs}`: declare the
+  MCP module and mount one
   `StreamableHttpService` at `/mcp` inside the existing request-ID,
   authentication, bounds, and shutdown layers.
+- `crates/wyrd/wyrd-server/src/{state.rs,app/server.rs}`: store one
+  `tokio_util::task::TaskTracker` for MCP in-flight work on `AppState`, close it
+  after transport admission stops, and await it within the existing server
+  shutdown deadline. Do not add a custom counter or another deadline.
 - `crates/wyrd/wyrd-server/src/components/auth/{principal_extractor.rs,token_extract.rs}`:
   change `AuthenticatedPrincipal` to retain the existing
   `Arc<wyrd_auth_verify::VerifiedToken>`, expose narrow `principal()` and
@@ -98,9 +103,9 @@ Required execution skill: `$wyrd-implement`.
   server helper needed to expose a test-only capability and observe
   cancellation.
 
-No other production file is in scope beyond the mechanical consumers listed
-above. In particular, this task does not change Bifrost catalog/query behavior,
-`vala-sdk`, or Skald.
+No other production file is in scope beyond the owners and mechanical consumers
+listed above. In particular, this task does not change Bifrost catalog/query
+behavior, `vala-sdk`, or Skald.
 
 ## Ordered implementation scenarios
 
@@ -139,11 +144,13 @@ protocol, disable legacy session mode, require stateless protocol metadata,
 and let `rmcp` own framing, MCP headers, sessions, and request cancellation.
 Build `StreamableHttpServerConfig` with
 `state.shutdown_token.clone()` as its `cancellation_token`, so Wyrd process
-shutdown stops admission and cancels every active MCP request before the
-existing HTTP/server drain completes.
-Disable only `rmcp`'s standalone loopback Host allowlist because Wyrd's public
-listener/gateway owns remote host routing; retain its Origin validation and
-Wyrd's mandatory JWT edge. Read `AuthenticatedPrincipal` and the separate
+shutdown stops admission and cancels every active MCP request. Call
+`disable_allowed_hosts()` because Wyrd's public listener and gateway own remote
+host routing, and call `disable_allowed_origins()` explicitly: Wyrd has no
+authoritative browser-Origin allowlist, so Origin enforcement remains disabled
+behind the existing gateway/TLS and mandatory JWT boundary. A browser-Origin
+policy requires a separately approved configuration source and tests. Read
+`AuthenticatedPrincipal` and the separate
 `RequestId` from request extensions. The handler derives the existing `Caller`
 for server operations and consults `delegation_chain()` only for
 delegation-aware attribution and audit.
@@ -158,24 +165,24 @@ listener, or generic tool-injection system.
 header requirements.
 
 **RED.** Add
-`client::tests::decorator_adds_only_wyrd_headers_and_retries_one_unauthorized`.
-Use a bounded local HTTP recorder that serves both token exchange and MCP: the
-first issued JWT receives 401, forced refresh returns a second JWT, and the
-single retry succeeds. Assert the decorator adds
+`client::tests::decorator_adds_current_wyrd_headers_once_per_request`.
+Use a bounded local HTTP recorder and issue two MCP requests. Assert the
+decorator obtains the current bearer for each request, adds
 `x-wyrd-access-token: Bearer <JWT>`, preserves a supplied `wyrd-request-id` or
 generates one when absent, leaves all MCP headers untouched, never writes the
-standard `Authorization` header, refreshes exactly once, and retries exactly
-once.
+standard `Authorization` header, and delegates each request exactly once.
 
 ```bash
-mise exec -- cargo nextest run --locked -p wyrd-mcp --lib -E 'test(=client::tests::decorator_adds_only_wyrd_headers_and_retries_one_unauthorized)'
+mise exec -- cargo nextest run --locked -p wyrd-mcp --lib -E 'test(=client::tests::decorator_adds_current_wyrd_headers_once_per_request)'
 ```
 
 **GREEN.** Implement `rmcp`'s existing HTTP transport trait for one small
 decorator around its reqwest client. On each request call
 `AuthMiddleware::bearer()`, preserve a caller-supplied request ID from rmcp
 custom headers or use `AuthMiddleware::request_id(None)`, and delegate all MCP
-behavior. On 401 only, call `force_refresh()` and retry once.
+behavior once. Do not add reactive 401 parsing or retry: `bearer()` already
+owns proactive refresh, while rmcp's reqwest transport erases the typed status
+and Wyrd problem body for a pre-protocol 401.
 
 **REFACTOR.** Keep the decorator in `wyrd-mcp`, where the `rmcp` dependency is
 already required. Do not add `rmcp` to `wyrd-client`, copy token exchange, or
@@ -188,22 +195,25 @@ AC-008, AC-009. Revision 5 rejection and cleanup obligations.
 
 **RED.** Add ignored journey
 `connectivity::pg_tests::mcp_rejects_credentials_and_joins_request_and_process_cancellation`. Through a real
-rmcp client, prove missing credentials, malformed/invalid JWTs, and a valid
-under-scoped principal are rejected by the existing edge with canonical Wyrd
-errors. The under-scoped case lacks `Permission::bifrost_query_read()`; assert
+`reqwest` client, prove missing and malformed/invalid credentials are rejected
+by the production `/mcp` edge with the canonical HTTP status and Wyrd problem
+fields. Use the official rmcp client only after protocol admission: prove a
+valid under-scoped principal is rejected and an allowed principal can invoke
+the tool. The under-scoped case lacks `Permission::bifrost_query_read()`; assert
 the test capability returns the existing permission denial and that the
 existing audited-denial path records the required permission, verified caller,
 request ID, denial, and failure before the tool returns. Prove an allowed call
 binds the verified tenant/principal rather than client arguments.
 
-Drive two cancellation cases with the capability held behind a deterministic
-test latch. First retain the returned rmcp `RequestHandle`, invoke
+Drive two cancellation cases with deterministic entry and cleanup latches.
+First retain the returned rmcp `RequestHandle`, invoke
 `RequestHandle::cancel(None).await`, and assert the capability observes
 `RequestContext<RoleServer>::ct.cancelled()` and joins its work before client
 close. Then start another pending call, cancel the owning `WyrdTestServer`
 without cancelling its request handle, and assert `AppState::shutdown_token`
-cancels the request context and the capability joins before server drain
-returns.
+cancels the request context. Hold cleanup after the HTTP cancellation response,
+assert the server drain remains pending while the MCP tracker is non-empty,
+release cleanup, and assert the tracker reaches zero before drain returns.
 
 ```bash
 scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-mcp --test mcp -P journey -E 'test(=connectivity::pg_tests::mcp_rejects_credentials_and_joins_request_and_process_cancellation)' --run-ignored=all"
@@ -216,10 +226,15 @@ tenant derivation, principal Card scope, delegation, and audit context. One
 `query::service::authorize_audited` with
 `Permission::bifrost_query_read()`, operation `wyrd.mcp.test.context`, and
 resource `mcp.test.context` before returning any trusted context. Its pending
-operation receives `RequestContext<RoleServer>` and races only its owned work
-against `context.ct.cancelled()`; either rmcp request cancellation or the
-server-configured `AppState::shutdown_token` reaches that same branch, which
-joins before returning. At the adapter edge translate public derive-backed
+operation receives `RequestContext<RoleServer>`, obtains an RAII token from
+`AppState`'s MCP `TaskTracker`, and holds it through cancellation cleanup and
+result creation. Race only its owned work against `context.ct.cancelled()`;
+either rmcp request cancellation or the server-configured
+`AppState::shutdown_token` reaches that same branch. After the supervised
+transport drain stops admission, `BoundServer::run` closes the tracker and
+awaits `TaskTracker::wait()` with `timeout_at` using the unchanged process
+deadline; a non-empty tracker at the deadline is a lifecycle failure, never a
+clean drain. At the adapter edge translate public derive-backed
 `WyrdError` values into protocol-correct MCP errors. Never accept tenant,
 principal, delegation, roles, or execution path as tool input.
 
@@ -235,8 +250,15 @@ serves local and remote clients.
 and public Wyrd errors at the adapter boundary.
 - `StreamableHttpServerConfig::cancellation_token` is the existing
   `AppState::shutdown_token`; per-request work additionally observes
-  `RequestContext<RoleServer>::ct`, and both paths join owned work before Wyrd
-  reports server drain complete.
+  `RequestContext<RoleServer>::ct`. Every tool request holds an `AppState` MCP
+  `TaskTracker` token through cleanup; after transport admission stops,
+  `BoundServer::run` closes and awaits that tracker under its existing shutdown
+  deadline before it may report a clean drain.
+- rmcp Host and Origin validation are explicitly disabled. The deployed gateway,
+  TLS, and Wyrd JWT edge are the current trust boundary; browser-Origin
+  enforcement is out of scope until an authoritative allowlist is specified.
+- The client decorator obtains `AuthMiddleware::bearer()` for every request and
+  never implements reactive 401 retry or parses rmcp transport error strings.
 - `wyrd-server::mcp` and its Bifrost MCP adapters do not invoke or depend on
   `wyrd-client`, `vala-sdk`, or Skald. Retain the existing server-level
   `wyrd-client` dependency used by `ServerBifrostPeerCredentials`; it is
@@ -268,10 +290,11 @@ git diff --check
 ## Completion evidence and stop conditions
 
 Provide the dependency/feature diff, production `/mcp` router proof, verified
-request-context and direct-consumer propagation, decorator retry/header
-evidence, real rmcp initialize/list/call/cancel/close transcripts, the exact
-permission and audited-denial evidence, request-cancellation joining, and
-process-shutdown joining before server drain. Return `SPEC_REVISION_REQUIRED` if implementation
+request-context and direct-consumer propagation, per-request decorator/header
+evidence, direct-HTTP canonical credential failures, real rmcp
+initialize/list/call/cancel/close transcripts, the exact permission and
+audited-denial evidence, request-cancellation joining, and tracker-zero
+process-shutdown evidence before server drain. Return `SPEC_REVISION_REQUIRED` if implementation
 needs another transport/listener/service, server-side Skald or SDK self-calls,
 identity tool arguments, a custom MCP protocol layer, or weaker Wyrd edge
 security. Stop for an approved-plan revision if Task 04A changes the existing

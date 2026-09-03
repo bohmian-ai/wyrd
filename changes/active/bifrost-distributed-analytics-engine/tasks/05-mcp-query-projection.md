@@ -73,10 +73,14 @@ Required execution skill: `$wyrd-implement`.
   `OracleQueryStream` remain the authorization and lifecycle owners; no query
   service behavior change is expected.
 - `crates/wyrd/wyrd-mcp/tests/bifrost/mcp/{main.rs,discovery.rs,query.rs}`:
-  replace the obsolete `layout` and `rbac` module registrations with ordinary
-  `discovery` and `query` modules for local client-to-`/mcp`-to-server
-  journeys. Reuse the narrowest existing `wyrd-testing` catalog, OTEL,
-  cancellation, and inspection fixtures; add no generic harness framework.
+  retain the predecessor's ordinary `connectivity` registration and add
+  ordinary `discovery` and `query` modules for local
+  client-to-`/mcp`-to-server journeys. Never remove `connectivity`. Reuse the
+  narrowest existing `wyrd-testing` catalog, OTEL, cancellation, and inspection
+  fixtures; add no generic harness framework.
+- `crates/wyrd/wyrd-mcp/tests/bifrost/mcp/{layout.rs,rbac.rs}`: delete only if
+  either obsolete file still exists after integrating the predecessor;
+  otherwise make no change.
 - `crates/wyrd/wyrd-testing/{Cargo.toml,tests/bifrost/oracle/main.rs,tests/bifrost/oracle/mcp.rs}`:
   add `rmcp` only as test plumbing, register `mod mcp`, and own the one
   cross-process MCP analytical journey that requires the existing
@@ -293,7 +297,9 @@ already exposes the required schema and physical layout.
   remains unchanged.
 - Every cancellable MCP query method receives `RequestContext<RoleServer>`,
   races work against `context.ct.cancelled()`, and awaits
-  `OracleQueryStream::cancel()` before returning cancellation.
+  `OracleQueryStream::cancel()` before returning cancellation. Every one of the
+  three tool methods also holds the predecessor's `AppState` MCP tracker token
+  through its complete cleanup and result path.
 - Oracle remains the sole query lifecycle owner. MCP owns only request
   adaptation, its lower response budget, final serialization, and protocol
   error translation.

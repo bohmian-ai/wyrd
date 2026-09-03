@@ -350,7 +350,7 @@ impl RunningQueryRegistry {
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::oracle) mod tests {
     use std::sync::{Arc, Barrier};
     use std::thread;
 
@@ -398,7 +398,10 @@ mod tests {
     }
 
     /// Creates one entry with an Oracle and Scribe participant.
-    fn entry(tenant_id: DataTenantId, request_id: RequestId) -> RunningQueryEntry {
+    pub(in crate::oracle) fn entry(
+        tenant_id: DataTenantId,
+        request_id: RequestId,
+    ) -> RunningQueryEntry {
         let now = Utc::now();
         let oracle = lease(1, ClusterRole::Oracle);
         let cut = OracleQueryAttemptCut::try_from_snapshot(

@@ -4305,6 +4305,7 @@ impl Forge {
             committed_metadata_digest: Some(digest),
             cleanup_candidates: Vec::new(),
             deleted_candidate_count: 0,
+            prepared_candidate_index: None,
         };
         evidence.validate(false).map_err(ForgeError::Sql)?;
         Ok(evidence)
@@ -4412,6 +4413,7 @@ impl ForgeWorker {
                 )),
                 cleanup_candidates: Vec::new(),
                 deleted_candidate_count: 0,
+                prepared_candidate_index: None,
             };
             evidence.validate(false).map_err(ForgeError::Sql)?;
             return Ok(Some(evidence));

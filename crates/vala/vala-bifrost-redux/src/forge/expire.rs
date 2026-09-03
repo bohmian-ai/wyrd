@@ -1351,6 +1351,7 @@ fn prepared_expiry_evidence() -> ForgeTaskEvidence {
         committed_metadata_digest: None,
         cleanup_candidates: Vec::new(),
         deleted_candidate_count: 0,
+        prepared_candidate_index: None,
     }
 }
 

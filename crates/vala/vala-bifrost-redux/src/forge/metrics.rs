@@ -84,13 +84,15 @@ pub(super) enum ForgeMetricStage {
     ManifestRewrite,
     /// Reconcile and expire old snapshots.
     SnapshotExpiry,
+    /// Delete the exact objects one committed expiration made unreachable.
+    ExpiredCleanup,
     /// Reconcile and remove proven orphan objects.
     OrphanGc,
 }
 
 impl ForgeMetricStage {
     /// Every stage label registered for Forge duration and failure series.
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 9] = [
         Self::ScribePromotion,
         Self::ReconcileStaging,
         Self::ReconcileIceberg,
@@ -98,6 +100,7 @@ impl ForgeMetricStage {
         Self::IcebergRewrite,
         Self::ManifestRewrite,
         Self::SnapshotExpiry,
+        Self::ExpiredCleanup,
         Self::OrphanGc,
     ];
 
@@ -111,6 +114,7 @@ impl ForgeMetricStage {
             Self::IcebergRewrite => "iceberg_rewrite",
             Self::ManifestRewrite => "manifest_rewrite",
             Self::SnapshotExpiry => "snapshot_expiry",
+            Self::ExpiredCleanup => "expired_cleanup",
             Self::OrphanGc => "orphan_gc",
         }
     }

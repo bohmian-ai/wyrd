@@ -139,6 +139,7 @@ async fn prepare_expiration(
         table_uuid: Uuid::now_v7(),
     };
     let evidence = ForgeTaskEvidence {
+        prepared_candidate_index: None,
         version: 1,
         committed_snapshot_id: None,
         committed_metadata_location: None,

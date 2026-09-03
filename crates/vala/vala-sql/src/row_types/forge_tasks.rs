@@ -511,6 +511,54 @@ pub struct ExpiredCleanupPayload {
 }
 
 impl ExpiredCleanupPayload {
+    /// Builds the immutable payload one succeeded expiration hands off.
+    ///
+    /// The copy is taken once, at planning, and is identity-bound to the source
+    /// task: the cleanup task never re-reads the expiration's row, so a later
+    /// change to that row cannot widen or shift what this task deletes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqlError::Conflict`] when the evidence carries no committed
+    /// identity and therefore is not a usable handoff.
+    pub fn from_handoff(
+        source_task_id: Uuid,
+        evidence: &ForgeTaskEvidence,
+    ) -> Result<Self, SqlError> {
+        let missing = || SqlError::Conflict {
+            detail: "snapshot expiration evidence is not a cleanup handoff".to_owned(),
+        };
+        Ok(Self {
+            version: EXPIRED_CLEANUP_PAYLOAD_VERSION,
+            source_task_id,
+            committed_snapshot_id: evidence.committed_snapshot_id.ok_or_else(missing)?,
+            committed_metadata_location: evidence
+                .committed_metadata_location
+                .clone()
+                .ok_or_else(missing)?,
+            committed_metadata_digest: evidence
+                .committed_metadata_digest
+                .clone()
+                .ok_or_else(missing)?,
+            cleanup_candidates: evidence.cleanup_candidates.clone(),
+        })
+    }
+
+    /// Returns the serialized size of the candidate vector in bytes.
+    ///
+    /// This is the only meaningful byte estimate a cleanup task has: it reads
+    /// no data files, so its admission envelope is sized by the projection it
+    /// carries rather than by anything it processes.
+    #[must_use]
+    pub fn serialized_candidate_bytes(&self) -> u64 {
+        u64::try_from(
+            candidates_to_value(&self.cleanup_candidates)
+                .to_string()
+                .len(),
+        )
+        .unwrap_or(u64::MAX)
+    }
+
     /// Encodes the handoff into its stable closed JSON object.
     #[must_use]
     pub fn to_value(&self) -> serde_json::Value {
@@ -1946,6 +1994,7 @@ mod tests {
     #[test]
     fn evidence_cursor_fails_closed() {
         let evidence = ForgeTaskEvidence {
+            prepared_candidate_index: None,
             version: 1,
             committed_snapshot_id: Some(7),
             committed_metadata_location: Some("metadata/v7.json".to_owned()),
@@ -1961,6 +2010,7 @@ mod tests {
         };
         assert!(evidence.validate(false).is_err());
         let mismatched = ForgeTaskEvidence {
+            prepared_candidate_index: None,
             version: 1,
             committed_snapshot_id: Some(7),
             committed_metadata_location: Some("metadata/v7.json".to_owned()),

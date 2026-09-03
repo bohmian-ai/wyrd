@@ -16,7 +16,8 @@ use vala_sql::queries::forge_operations::ForgeOperations;
 use vala_sql::queries::forge_tasks::{ForgeClaimLimits, ForgeEnqueueBatch, ForgeTasks};
 use vala_sql::row_types::forge_operations::ForgeOperationFamily;
 use vala_sql::row_types::forge_tasks::{
-    ForgePlanningDemand, ForgeTaskLane, ForgeTaskStrategy, ForgeTaskTableIdentity, NewForgeTask,
+    FORGE_TASK_PAYLOAD_VERSION, ForgePlanningDemand, ForgeTaskEstimates, ForgeTaskLane,
+    ForgeTaskPlan, ForgeTaskStrategy, ForgeTaskTableIdentity, NewForgeTask,
 };
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
@@ -32,7 +33,8 @@ use super::maintenance::{
 };
 use super::metrics::{ForgeDemandTransitionResult, ForgeTaskMetricStrategy};
 use super::planner::{
-    ForgeCapacity, ForgePlanCandidate, ForgePlanCapacity, ForgePlanner, ForgeTableSnapshot,
+    ForgeCapacity, ForgeEnvelopeSizer, ForgePlanCandidate, ForgePlanCapacity, ForgePlanner,
+    ForgeTableSnapshot, plan_hash,
 };
 use super::worker::{ForgeLifecycleEvent, forge_claim_memory_limit};
 use crate::maintenance::StagingFileCommitted;
@@ -600,9 +602,20 @@ impl<'forge> ForgeScheduler<'forge> {
                 candidate.bytes,
             );
         }
-        let planned = self.planner.plan_table(&snapshot)?;
         let mut executable = Vec::new();
         let mut unschedulable = Vec::new();
+        // Expired cleanup outranks fresh planning for this table: it consumes a
+        // handoff an expiration already committed, and the one-active-task
+        // index would refuse a second task anyway. Draining the handoff first
+        // is what keeps unreachable objects from accumulating behind new work.
+        if let Some(cleanup) = self.expired_cleanup_task(demand).await? {
+            executable.push(cleanup);
+        }
+        let planned = if executable.is_empty() {
+            self.planner.plan_table(&snapshot)?
+        } else {
+            Vec::new()
+        };
         for task in planned.into_iter().take(1) {
             let terminal = task.capacity == ForgePlanCapacity::Unschedulable;
             let durable = NewForgeTask {
@@ -1273,6 +1286,75 @@ impl<'forge> ForgeScheduler<'forge> {
                 "snapshot_expiry_due": snapshot_expiry_due,
                 "reconciliation_due": reconciliation_due,
             }),
+        }))
+    }
+
+    /// Builds the one cleanup task an unconsumed expiration handoff demands.
+    ///
+    /// The projection is fixed and bounded: the candidates are already known,
+    /// so nothing is discovered, sized against data, or re-derived from the
+    /// catalog. The estimates exist only to satisfy admission, and the single
+    /// reader permit reflects that the task performs one deletion at a time.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Sql`] when the handoff read or its payload
+    /// validation fails, [`ForgeError::Capacity`] when the topology cannot
+    /// supply an envelope, and [`ForgeError::Invariant`] when the candidate
+    /// count exceeds the durable estimate bounds.
+    async fn expired_cleanup_task(
+        &self,
+        demand: &ForgePlanningDemand,
+    ) -> Result<Option<NewForgeTask>, ForgeError> {
+        if !super::phase::admits_new_effect(ForgeTaskStrategy::ExpiredCleanup) {
+            return Ok(None);
+        }
+        let Some(payload) = self
+            .tasks
+            .unconsumed_expiration_handoff(demand.data_tenant_id, &demand.table_ref)
+            .await
+            .map_err(ForgeError::Sql)?
+        else {
+            return Ok(None);
+        };
+        let count = payload.cleanup_candidates.len();
+        let files = u32::try_from(count).map_err(|_| ForgeError::Invariant {
+            detail: "expired cleanup candidate count exceeds u32".to_owned(),
+        })?;
+        let bytes = payload.serialized_candidate_bytes().max(1);
+        let envelope = ForgeEnvelopeSizer::size(bytes, count, 1, self.capacity)?;
+        let plan = ForgeTaskPlan {
+            version: FORGE_TASK_PAYLOAD_VERSION,
+            inputs: Vec::new(),
+            parameters: payload.to_value(),
+        };
+        let plan_hash = plan_hash(&plan)?;
+        Ok(Some(NewForgeTask {
+            data_tenant_id: demand.data_tenant_id,
+            table_ref: demand.table_ref.clone(),
+            strategy: ForgeTaskStrategy::ExpiredCleanup,
+            lane: ForgeTaskLane::Ordinary,
+            base_snapshot_id: payload.committed_snapshot_id,
+            plan,
+            plan_hash,
+            estimates: ForgeTaskEstimates {
+                files,
+                bytes,
+                parallelism: 1,
+                memory_bytes: envelope
+                    .memory_bytes()
+                    .map_err(|error| ForgeError::Invariant {
+                        detail: error.to_string(),
+                    })?,
+                spill_bytes: envelope
+                    .scratch_bytes()
+                    .map_err(|error| ForgeError::Invariant {
+                        detail: error.to_string(),
+                    })?,
+                large_ceiling_bytes: self.capacity.max_large_task_bytes,
+                envelope: Some(envelope),
+            },
+            ready_at: Utc::now(),
         }))
     }
 

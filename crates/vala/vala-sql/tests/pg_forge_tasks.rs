@@ -1144,6 +1144,7 @@ mod pg_tests {
         )
         .await;
         let evidence = ForgeTaskEvidence {
+            prepared_candidate_index: None,
             version: 1,
             committed_snapshot_id: Some(51),
             committed_metadata_location: Some("metadata/v51.json".to_owned()),
@@ -1243,46 +1244,6 @@ mod pg_tests {
             ForgeTaskTransitionOutcome::AlreadyApplied
         );
         prepared_conn.commit().await.expect("commit prepared");
-        {
-            let mut cursor_rollback = TenantConn::acquire(fixture.app_pool(), tenant)
-                .await
-                .expect("cursor rollback");
-            tasks
-                .advance_cleanup_cursor(&mut cursor_rollback, id, attempt, owner, 0, 1)
-                .await
-                .expect("advance rollback cursor");
-        }
-        let mut cursor_commit = TenantConn::acquire(fixture.app_pool(), tenant)
-            .await
-            .expect("cursor commit");
-        assert!(
-            tasks
-                .advance_cleanup_cursor(&mut cursor_commit, id, attempt, owner, 1, 2)
-                .await
-                .is_err(),
-            "a stale expected cursor fails closed"
-        );
-        tasks
-            .advance_cleanup_cursor(&mut cursor_commit, id, attempt, owner, 0, 1)
-            .await
-            .expect("advance committed cursor");
-        cursor_commit.commit().await.expect("commit cursor");
-        let mut cursor_verify = TenantConn::acquire(fixture.app_pool(), tenant)
-            .await
-            .expect("cursor verify");
-        let cursor_page = tasks
-            .status(&mut cursor_verify, 10)
-            .await
-            .expect("cursor status");
-        assert_eq!(
-            cursor_page.tasks[0]
-                .evidence
-                .as_ref()
-                .expect("Prepared evidence")
-                .deleted_candidate_count,
-            1
-        );
-        cursor_verify.commit().await.expect("commit cursor verify");
         let terminal = ForgeTaskTransition {
             task_id: id,
             attempt_id: attempt,
@@ -1395,6 +1356,7 @@ mod pg_tests {
             .await
             .expect("start");
         let evidence = ForgeTaskEvidence {
+            prepared_candidate_index: None,
             version: FORGE_TASK_PAYLOAD_VERSION,
             committed_snapshot_id: Some(730),
             committed_metadata_location: Some("metadata/v730.json".to_owned()),
@@ -1493,6 +1455,7 @@ mod pg_tests {
             .await
             .expect("start");
         let evidence = ForgeTaskEvidence {
+            prepared_candidate_index: None,
             version: FORGE_TASK_PAYLOAD_VERSION,
             committed_snapshot_id: Some(740),
             committed_metadata_location: Some("metadata/v740.json".to_owned()),
@@ -1576,6 +1539,7 @@ mod pg_tests {
             .await
             .expect("start");
         let evidence = ForgeTaskEvidence {
+            prepared_candidate_index: None,
             version: FORGE_TASK_PAYLOAD_VERSION,
             committed_snapshot_id: Some(92),
             committed_metadata_location: Some("metadata/v92.json".to_owned()),
@@ -1716,6 +1680,7 @@ mod pg_tests {
                 noop_attempt,
                 owner,
                 &ForgeTaskEvidence {
+                    prepared_candidate_index: None,
                     version: FORGE_TASK_PAYLOAD_VERSION,
                     committed_snapshot_id: Some(93),
                     committed_metadata_location: Some("metadata/v93.json".to_owned()),

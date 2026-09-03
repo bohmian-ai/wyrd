@@ -399,9 +399,19 @@ impl ForgeTasks {
                     .await?;
             }
         }
-        let acknowledged = if batch.executable.is_empty()
-            && batch.unschedulable.is_empty()
-            && demand.acknowledged_snapshot_id.is_some()
+        // One cleanup task consumes exactly one handoff. When the table still
+        // has another unconsumed one, the demand has to survive this
+        // acknowledgement, or that handoff waits for an unrelated future
+        // demand while its objects stay unreachable and undeleted.
+        let cleanup_pending = batch
+            .executable
+            .iter()
+            .any(|task| task.strategy == ForgeTaskStrategy::ExpiredCleanup)
+            && Self::has_unconsumed_handoff(&mut tx, demand).await?;
+        let acknowledged = if cleanup_pending
+            || (batch.executable.is_empty()
+                && batch.unschedulable.is_empty()
+                && demand.acknowledged_snapshot_id.is_some())
         {
             sqlx::query("UPDATE vala.forge_planning_demands SET last_requested_at=statement_timestamp() WHERE data_tenant_id=$1 AND catalog_name=$2 AND namespace_name=$3 AND table_name=$4 AND generation=$5")
                 .bind(demand.data_tenant_id.as_uuid()).bind(&demand.table_ref.catalog).bind(&demand.table_ref.namespace).bind(&demand.table_ref.table).bind(demand.generation).execute(&mut *tx).await.map_err(SqlError::from)?.rows_affected()
@@ -868,42 +878,6 @@ impl ForgeTasks {
         .await
     }
 
-    /// Advances one Prepared cleanup cursor after a completed bounded delete batch.
-    ///
-    /// # Errors
-    /// Returns conflict unless the exact Prepared attempt owns evidence whose
-    /// current cursor equals `expected`, or SQL errors while updating it.
-    ///
-    /// # Cancellation
-    /// The caller-owned transaction rolls back the cursor update.
-    pub async fn advance_cleanup_cursor(
-        &self,
-        conn: &mut TenantConn<'_>,
-        task_id: Uuid,
-        attempt: Uuid,
-        owner: Uuid,
-        expected: u32,
-        next: u32,
-    ) -> Result<(), SqlError> {
-        if next <= expected {
-            return Err(SqlError::Conflict {
-                detail: "Forge cleanup cursor must advance".to_owned(),
-            });
-        }
-        let changed = sqlx::query("UPDATE vala.forge_tasks SET evidence=jsonb_set(evidence,'{deleted_candidate_count}',to_jsonb($5::bigint),false),updated_at=statement_timestamp() WHERE task_id=$1 AND state='prepared' AND attempt_id=$2 AND claimed_by=$3 AND (evidence->>'deleted_candidate_count')::bigint=$4 AND jsonb_array_length(evidence->'cleanup_candidates') >= $5")
-            .bind(task_id)
-            .bind(attempt)
-            .bind(owner)
-            .bind(i64::from(expected))
-            .bind(i64::from(next))
-            .execute(&mut **conn.transaction())
-            .await
-            .map_err(SqlError::from)?
-            .rows_affected();
-        exact_one(changed, "advance cleanup cursor")?;
-        Ok(())
-    }
-
     /// Atomically applies a lifecycle-significant terminal state and audit row.
     ///
     /// # Errors
@@ -1217,6 +1191,29 @@ impl ForgeTasks {
         Ok(changed)
     }
 
+    /// Reports whether the demanded table still has an unconsumed handoff.
+    ///
+    /// This runs inside the acknowledgement transaction, so a cleanup task
+    /// inserted moments earlier already counts as having consumed its own
+    /// source and only a genuinely remaining handoff is reported.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqlError`] when the operator-transaction read fails.
+    async fn has_unconsumed_handoff(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        demand: &ForgePlanningDemand,
+    ) -> Result<bool, SqlError> {
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM vala.forge_tasks source WHERE source.data_tenant_id=$1 AND source.catalog_name=$2 AND source.namespace_name=$3 AND source.table_name=$4 AND source.strategy='snapshot_expiry' AND source.state='succeeded' AND jsonb_array_length(COALESCE(source.evidence->'cleanup_candidates', '[]'::jsonb)) > 0 AND NOT EXISTS (SELECT 1 FROM vala.forge_tasks cleanup WHERE cleanup.strategy = 'expired_cleanup' AND cleanup.plan #>> '{parameters,source_task_id}' = source.task_id::text))")
+            .bind(demand.data_tenant_id.as_uuid())
+            .bind(&demand.table_ref.catalog)
+            .bind(&demand.table_ref.namespace)
+            .bind(&demand.table_ref.table)
+            .fetch_one(&mut **tx)
+            .await
+            .map_err(SqlError::from)
+    }
+
     /// Reads the oldest bounded succeeded expiration handoff this table still owes.
     ///
     /// "Owes" is exactly one condition: a succeeded `snapshot_expiry` task for
@@ -1242,7 +1239,7 @@ impl ForgeTasks {
         &self,
         tenant: DataTenantId,
         table_ref: &ForgeTaskTableIdentity,
-    ) -> Result<Option<(Uuid, ForgeTaskEvidence)>, SqlError> {
+    ) -> Result<Option<ExpiredCleanupPayload>, SqlError> {
         let row: Option<(Uuid, serde_json::Value)> = sqlx::query_as("SELECT source.task_id,source.evidence FROM vala.forge_tasks source WHERE source.data_tenant_id=$1 AND source.catalog_name=$2 AND source.namespace_name=$3 AND source.table_name=$4 AND source.strategy='snapshot_expiry' AND source.state='succeeded' AND jsonb_array_length(COALESCE(source.evidence->'cleanup_candidates', '[]'::jsonb)) > 0 AND NOT EXISTS (SELECT 1 FROM vala.forge_tasks cleanup WHERE cleanup.strategy = 'expired_cleanup' AND cleanup.plan #>> '{parameters,source_task_id}' = source.task_id::text) ORDER BY source.updated_at,source.task_id LIMIT 1")
             .bind(tenant.as_uuid())
             .bind(&table_ref.catalog)
@@ -1256,7 +1253,9 @@ impl ForgeTasks {
         };
         let evidence = crate::row_types::forge_tasks::evidence_from_json(evidence)?;
         require_handoff_source(&evidence)?;
-        Ok(Some((task_id, evidence)))
+        Ok(Some(ExpiredCleanupPayload::from_handoff(
+            task_id, &evidence,
+        )?))
     }
 
     /// Validates one proposed cleanup task against its locked source row.

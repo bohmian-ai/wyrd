@@ -1419,6 +1419,7 @@ mod pg_tests {
         /// Builds Prepared-phase task evidence with no committed publication yet.
         fn prepared_evidence() -> ForgeTaskEvidence {
             ForgeTaskEvidence {
+                prepared_candidate_index: None,
                 version: 1,
                 committed_snapshot_id: None,
                 committed_metadata_location: None,
@@ -1431,6 +1432,7 @@ mod pg_tests {
         /// Builds settled evidence naming the exact committed publication.
         fn settled_evidence() -> ForgeTaskEvidence {
             ForgeTaskEvidence {
+                prepared_candidate_index: None,
                 version: 1,
                 committed_snapshot_id: Some(88),
                 committed_metadata_location: Some(

@@ -7,7 +7,9 @@ mod pg_tests {
     use sqlx::{PgPool, types::Uuid};
     use vala_sql::TenantConn;
     use vala_sql::queries::forge_tasks::{ForgeClaimLimits, ForgeEnqueueBatch, ForgeTasks};
+    use vala_sql::row_types::forge_operations::{ForgeClaimTable, ForgeExpirationAuthority};
     use vala_sql::row_types::forge_tasks::{
+        ExpiredCleanupCandidateRequest, ExpiredCleanupOutcome, ExpiredCleanupPayload,
         FORGE_TASK_PAYLOAD_VERSION, ForgeClaimStrategy, ForgeCleanupCandidate,
         ForgeCleanupCategory, ForgeCleanupPath, ForgeTaskEstimates, ForgeTaskEvidence,
         ForgeTaskLane, ForgeTaskPlan, ForgeTaskState, ForgeTaskStrategy, ForgeTaskTableIdentity,
@@ -2858,6 +2860,517 @@ mod pg_tests {
             unknown.strategy,
             ForgeClaimStrategy::Known(ForgeTaskStrategy::ScribePromotion),
             "an unrecognized tag must never fall back to promotion"
+        );
+    }
+
+    /// Fixed table identity every expired-cleanup proof binds to.
+    fn cleanup_table() -> ForgeClaimTable {
+        ForgeClaimTable {
+            table_uid: [9_u8; 16],
+            catalog_name: "wyrd-redux".to_owned(),
+            namespace_name: "vala.bifrost".to_owned(),
+            table_name: "cleanup".to_owned(),
+            table_uuid: Uuid::now_v7(),
+        }
+    }
+
+    /// Builds one table-bound cleanup candidate for the cleanup fixture table.
+    ///
+    /// # Panics
+    /// Panics when the fixed identity or path is invalid.
+    fn cleanup_candidate(name: &str) -> ForgeCleanupCandidate {
+        ForgeCleanupCandidate {
+            category: ForgeCleanupCategory::Data,
+            table: ForgeTaskTableIdentity::new("wyrd-redux", "vala.bifrost", "cleanup")
+                .expect("identity"),
+            path: ForgeCleanupPath::new(format!("cleanup/data/{name}.parquet")).expect("path"),
+        }
+    }
+
+    /// Seeds the registered table, its maintenance-authority row, and one live
+    /// lease so fenced cleanup transitions have every durable root they check.
+    ///
+    /// # Panics
+    /// Panics when any seeding statement fails.
+    async fn seed_cleanup_roots(
+        superuser: &PgPool,
+        tenant: DataTenantId,
+        authority: &ForgeExpirationAuthority,
+        table: &ForgeClaimTable,
+    ) {
+        sqlx::query("INSERT INTO vala.bifrost_tables (data_tenant_id,table_uid,fqn,fingerprint,physical_layout) VALUES ($1,$2,'vala.bifrost.cleanup',decode(repeat('00',32),'hex'),'{}'::jsonb)")
+            .bind(tenant.as_uuid())
+            .bind(table.table_uid.as_slice())
+            .execute(superuser)
+            .await
+            .expect("seed bifrost table");
+        sqlx::query("INSERT INTO vala.bifrost_table_maintenance_authority (data_tenant_id,catalog_name,namespace_name,table_name,table_uid) VALUES ($1,$2,$3,$4,$5)")
+            .bind(tenant.as_uuid())
+            .bind(&table.catalog_name)
+            .bind(&table.namespace_name)
+            .bind(&table.table_name)
+            .bind(table.table_uid.as_slice())
+            .execute(superuser)
+            .await
+            .expect("seed maintenance authority");
+        sqlx::query("INSERT INTO vala.maintenance_leases (lease_key,owner,fencing_token,expires_at,heartbeat_at) VALUES ($1,$2,$3,now()+interval '10 minutes',now())")
+            .bind(&authority.lease_key)
+            .bind(authority.worker_id)
+            .bind(authority.lease_fencing_token)
+            .execute(superuser)
+            .await
+            .expect("seed lease");
+    }
+
+    /// Inserts one old succeeded snapshot-expiration source carrying candidates.
+    ///
+    /// # Panics
+    /// Panics when the insert fails.
+    async fn seed_expiration_source(
+        superuser: &PgPool,
+        tenant: DataTenantId,
+        table: &ForgeClaimTable,
+        candidates: &[ForgeCleanupCandidate],
+    ) -> Uuid {
+        let task_id = Uuid::now_v7();
+        let evidence = ForgeTaskEvidence {
+            prepared_candidate_index: None,
+            version: FORGE_TASK_PAYLOAD_VERSION,
+            committed_snapshot_id: Some(4242),
+            committed_metadata_location: Some("cleanup/metadata/00042-committed.json".to_owned()),
+            committed_metadata_digest: Some("b".repeat(64)),
+            cleanup_candidates: candidates.to_vec(),
+            deleted_candidate_count: 0,
+        };
+        sqlx::query("INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,namespace_name,table_name,strategy,lane,base_snapshot_id,plan,plan_hash,estimated_files,estimated_bytes,estimated_parallelism,estimated_memory_bytes,estimated_spill_bytes,large_task_ceiling_bytes,state,evidence,ready_at,updated_at) VALUES ($1,$2,$3,$4,$5,'snapshot_expiry','ordinary',41,'{\"version\":1,\"inputs\":[\"m.avro\"],\"parameters\":{}}'::jsonb,decode(repeat('11',32),'hex'),1,1,1,1,1,1,'succeeded',$6::jsonb,now()-interval '2 days',now()-interval '2 days')")
+            .bind(task_id)
+            .bind(tenant.as_uuid())
+            .bind(&table.catalog_name)
+            .bind(&table.namespace_name)
+            .bind(&table.table_name)
+            .bind(vala_sql::row_types::forge_tasks::evidence_to_value(&evidence).to_string())
+            .execute(superuser)
+            .await
+            .expect("seed expiration source");
+        task_id
+    }
+
+    /// Counts audit-outbox rows carrying one exact operation.
+    ///
+    /// # Panics
+    /// Panics when the count query fails.
+    async fn count_operation(superuser: &PgPool, operation: &str) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM vala.audit_outbox WHERE operation=$1")
+            .bind(operation)
+            .fetch_one(superuser)
+            .await
+            .expect("operation count")
+    }
+
+    /// Reads one Forge task's persisted evidence, if any.
+    ///
+    /// # Panics
+    /// Panics when the read or decode fails.
+    async fn evidence_of(superuser: &PgPool, task_id: Uuid) -> Option<ForgeTaskEvidence> {
+        let raw: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT evidence FROM vala.forge_tasks WHERE task_id=$1")
+                .bind(task_id)
+                .fetch_one(superuser)
+                .await
+                .expect("evidence read");
+        raw.map(|value| {
+            vala_sql::row_types::forge_tasks::evidence_from_json(value).expect("decode")
+        })
+    }
+
+    /// Builds one candidate-transition audit event for the cleanup task.
+    fn cleanup_event(operation: &str, task_id: Uuid) -> AuditEvent {
+        AuditEvent::new(
+            RequestId::now_v7(),
+            None,
+            operation.to_owned(),
+            format!("forge-task:{task_id}"),
+            None,
+            PrincipalId::new(Uuid::nil()),
+            PrincipalKindTag::Service,
+            AuthMethod::Internal,
+            "bifrost:forge".to_owned(),
+            AuditDecision::Allow,
+            AuditResult::Success,
+            "expired cleanup candidate transition".to_owned(),
+        )
+    }
+
+    #[tokio::test]
+    async fn expired_cleanup_handoff_and_candidate_lifecycle_are_exact_atomic_and_audited() {
+        let (fixture, admin) = setup().await;
+        let tasks = ForgeTasks::new(fixture.operator_pool().clone());
+        let tenant = fixture.data_tenant_id();
+        let table = cleanup_table();
+        let identity =
+            ForgeTaskTableIdentity::new("wyrd-redux", "vala.bifrost", "cleanup").expect("identity");
+        let candidates = vec![cleanup_candidate("a"), cleanup_candidate("b")];
+        let source = seed_expiration_source(&admin, tenant, &table, &candidates).await;
+
+        // The generic enqueue path can never create a cleanup task.
+        let mut generic = task(tenant, "cleanup", ForgeTaskLane::Ordinary, 3);
+        generic.strategy = ForgeTaskStrategy::ExpiredCleanup;
+        assert!(
+            tasks.enqueue(&generic).await.is_err(),
+            "generic enqueue refuses expired cleanup"
+        );
+
+        // The source is retained by pruning until a cleanup plan references it.
+        let mut prune = TenantConn::acquire(fixture.app_pool(), tenant)
+            .await
+            .expect("prune conn");
+        assert_eq!(
+            tasks
+                .prune_terminal(&mut prune, Utc::now(), 10)
+                .await
+                .expect("prune before enqueue"),
+            0
+        );
+        prune.commit().await.expect("commit prune");
+
+        // The bounded handoff read names exactly that source and its candidates.
+        let payload = tasks
+            .unconsumed_expiration_handoff(tenant, &identity)
+            .await
+            .expect("handoff read")
+            .expect("one unconsumed handoff");
+        assert_eq!(payload.source_task_id, source);
+        assert_eq!(payload.committed_snapshot_id, 4242);
+        assert_eq!(payload.cleanup_candidates, candidates);
+        let encoded = payload.to_value();
+        let object = encoded.as_object().expect("closed object");
+        assert_eq!(
+            object.len(),
+            7,
+            "the payload is a closed seven-field object"
+        );
+        assert_eq!(object["kind"], "expired_cleanup");
+        assert_eq!(object["version"], 1);
+
+        // Unknown fields and versions fail closed.
+        let mut unknown = object.clone();
+        unknown.insert("extra".to_owned(), serde_json::json!(1));
+        assert!(
+            ExpiredCleanupPayload::from_value(&serde_json::Value::Object(unknown), false).is_err()
+        );
+        let mut bad_version = object.clone();
+        bad_version.insert("version".to_owned(), serde_json::json!(2));
+        assert!(
+            ExpiredCleanupPayload::from_value(&serde_json::Value::Object(bad_version), false)
+                .is_err()
+        );
+
+        // The cleanup task is inserted and the demand acknowledged in one pass.
+        let mut hint = TenantConn::acquire(fixture.app_pool(), tenant)
+            .await
+            .expect("hint conn");
+        tasks
+            .upsert_hint(&mut hint, tenant, &identity)
+            .await
+            .expect("demand");
+        hint.commit().await.expect("commit hint");
+        let owner = Uuid::now_v7();
+        let fence = tasks
+            .acquire_scheduler(owner, 30)
+            .await
+            .expect("scheduler lease")
+            .expect("fence");
+        let (demands, _) = tasks
+            .planning_demands(owner, fence, 4)
+            .await
+            .expect("demands");
+        let demand = demands
+            .into_iter()
+            .find(|value| value.table_ref == identity)
+            .expect("cleanup demand");
+        let mut cleanup = task(tenant, "cleanup", ForgeTaskLane::Ordinary, 5);
+        cleanup.strategy = ForgeTaskStrategy::ExpiredCleanup;
+        cleanup.base_snapshot_id = payload.committed_snapshot_id;
+        cleanup.plan = ForgeTaskPlan {
+            version: FORGE_TASK_PAYLOAD_VERSION,
+            inputs: Vec::new(),
+            parameters: payload.to_value(),
+        };
+        cleanup.estimates.files = 2;
+
+        // A copy that changed a candidate is refused against the locked source.
+        let mut divergent = cleanup.clone();
+        let mut shifted = payload.cleanup_candidates.clone();
+        shifted.reverse();
+        let mut divergent_payload = payload.clone();
+        divergent_payload.cleanup_candidates = shifted;
+        divergent.plan.parameters = divergent_payload.to_value();
+        assert!(
+            tasks
+                .enqueue_and_acknowledge(
+                    owner,
+                    fence,
+                    &demand,
+                    ForgeEnqueueBatch {
+                        executable: std::slice::from_ref(&divergent),
+                        unschedulable: &[],
+                    },
+                    |id| event("forge.task.unschedulable", id),
+                )
+                .await
+                .is_err(),
+            "a candidate vector that disagrees with its source is refused"
+        );
+
+        assert_eq!(
+            tasks
+                .enqueue_and_acknowledge(
+                    owner,
+                    fence,
+                    &demand,
+                    ForgeEnqueueBatch {
+                        executable: std::slice::from_ref(&cleanup),
+                        unschedulable: &[],
+                    },
+                    |id| event("forge.task.unschedulable", id),
+                )
+                .await
+                .expect("enqueue cleanup"),
+            1
+        );
+        let cleanup_id: Uuid = sqlx::query_scalar(
+            "SELECT task_id FROM vala.forge_tasks WHERE strategy='expired_cleanup'",
+        )
+        .fetch_one(&admin)
+        .await
+        .expect("cleanup task id");
+
+        // Once a cleanup plan references it, the source prunes normally.
+        let mut prune_after = TenantConn::acquire(fixture.app_pool(), tenant)
+            .await
+            .expect("prune after");
+        assert_eq!(
+            tasks
+                .prune_terminal(&mut prune_after, Utc::now(), 10)
+                .await
+                .expect("prune after enqueue"),
+            1
+        );
+        prune_after.commit().await.expect("commit prune after");
+        assert_eq!(
+            tasks
+                .unconsumed_expiration_handoff(tenant, &identity)
+                .await
+                .expect("no handoff remains"),
+            None
+        );
+
+        // Preparation and settlement are source-independent from here on.
+        let authority = ForgeExpirationAuthority {
+            task_id: cleanup_id,
+            attempt_id: Uuid::now_v7(),
+            worker_id: Uuid::now_v7(),
+            lease_key: "forge:table:cleanup".to_owned(),
+            lease_fencing_token: 7,
+        };
+        seed_cleanup_roots(&admin, tenant, &authority, &table).await;
+        sqlx::query("UPDATE vala.forge_tasks SET state='running',attempt_id=$2,claimed_by=$3,claim_expires_at=now()+interval '10 minutes',watermark_snapshot_id=4242,watermark_timestamp_ms=1 WHERE task_id=$1")
+            .bind(cleanup_id)
+            .bind(authority.attempt_id)
+            .bind(authority.worker_id)
+            .execute(&admin)
+            .await
+            .expect("claim cleanup task");
+
+        let request =
+            |index: u32, operation: &'static str| (index, cleanup_event(operation, cleanup_id));
+        let (index, prepared_event) = request(0, "forge.expired_cleanup.candidate_prepared");
+        assert_eq!(
+            tasks
+                .prepare_expired_cleanup_candidate(
+                    tenant,
+                    ExpiredCleanupCandidateRequest {
+                        authority: &authority,
+                        table: &table,
+                        index,
+                        candidate: &candidates[0],
+                        event: &prepared_event,
+                    },
+                )
+                .await
+                .expect("prepare candidate zero"),
+            ForgeTaskTransitionOutcome::Applied
+        );
+        let prepared = evidence_of(&admin, cleanup_id).await.expect("evidence");
+        assert_eq!(prepared.prepared_candidate_index, Some(0));
+        assert_eq!(prepared.deleted_candidate_count, 0);
+        assert_eq!(prepared.cleanup_candidates, candidates);
+        assert_eq!(
+            count_operation(&admin, "forge.expired_cleanup.candidate_prepared").await,
+            1
+        );
+
+        // The exact already-prepared tuple replays read-only.
+        let replay = cleanup_event("forge.expired_cleanup.candidate_prepared", cleanup_id);
+        assert_eq!(
+            tasks
+                .prepare_expired_cleanup_candidate(
+                    tenant,
+                    ExpiredCleanupCandidateRequest {
+                        authority: &authority,
+                        table: &table,
+                        index: 0,
+                        candidate: &candidates[0],
+                        event: &replay,
+                    },
+                )
+                .await
+                .expect("replay preparation"),
+            ForgeTaskTransitionOutcome::AlreadyApplied
+        );
+        assert_eq!(
+            count_operation(&admin, "forge.expired_cleanup.candidate_prepared").await,
+            1,
+            "an identical replay emits no second audit"
+        );
+
+        // A stale owner can neither prepare nor settle.
+        let stale = ForgeExpirationAuthority {
+            worker_id: Uuid::now_v7(),
+            ..authority.clone()
+        };
+        let stale_event = cleanup_event("forge.expired_cleanup.candidate_deleted", cleanup_id);
+        assert!(
+            tasks
+                .settle_expired_cleanup_candidate(
+                    tenant,
+                    ExpiredCleanupCandidateRequest {
+                        authority: &stale,
+                        table: &table,
+                        index: 0,
+                        candidate: &candidates[0],
+                        event: &stale_event,
+                    },
+                    ExpiredCleanupOutcome::Deleted,
+                )
+                .await
+                .is_err(),
+            "a stale owner cannot settle"
+        );
+
+        // Confirmed deletion is the only thing that advances candidate zero.
+        let deleted_event = cleanup_event("forge.expired_cleanup.candidate_deleted", cleanup_id);
+        tasks
+            .settle_expired_cleanup_candidate(
+                tenant,
+                ExpiredCleanupCandidateRequest {
+                    authority: &authority,
+                    table: &table,
+                    index: 0,
+                    candidate: &candidates[0],
+                    event: &deleted_event,
+                },
+                ExpiredCleanupOutcome::Deleted,
+            )
+            .await
+            .expect("settle candidate zero");
+        let advanced = evidence_of(&admin, cleanup_id).await.expect("evidence");
+        assert_eq!(advanced.deleted_candidate_count, 1);
+        assert_eq!(advanced.prepared_candidate_index, None);
+
+        // Refusal and uncertainty audit without moving the frontier.
+        let one_prepared = cleanup_event("forge.expired_cleanup.candidate_prepared", cleanup_id);
+        tasks
+            .prepare_expired_cleanup_candidate(
+                tenant,
+                ExpiredCleanupCandidateRequest {
+                    authority: &authority,
+                    table: &table,
+                    index: 1,
+                    candidate: &candidates[1],
+                    event: &one_prepared,
+                },
+            )
+            .await
+            .expect("prepare candidate one");
+        for (outcome, operation) in [
+            (
+                ExpiredCleanupOutcome::Refused,
+                "forge.expired_cleanup.candidate_refused",
+            ),
+            (
+                ExpiredCleanupOutcome::Uncertain,
+                "forge.expired_cleanup.candidate_uncertain",
+            ),
+        ] {
+            let retained = cleanup_event(operation, cleanup_id);
+            tasks
+                .settle_expired_cleanup_candidate(
+                    tenant,
+                    ExpiredCleanupCandidateRequest {
+                        authority: &authority,
+                        table: &table,
+                        index: 1,
+                        candidate: &candidates[1],
+                        event: &retained,
+                    },
+                    outcome,
+                )
+                .await
+                .expect("record a non-advancing outcome");
+            let held = evidence_of(&admin, cleanup_id).await.expect("evidence");
+            assert_eq!(held.deleted_candidate_count, 1);
+            assert_eq!(held.prepared_candidate_index, Some(1));
+            assert_eq!(held.cleanup_candidates, candidates);
+            assert_eq!(count_operation(&admin, operation).await, 1);
+        }
+
+        // Proven absence advances to the terminal frontier.
+        let missing_event = cleanup_event("forge.expired_cleanup.candidate_missing", cleanup_id);
+        tasks
+            .settle_expired_cleanup_candidate(
+                tenant,
+                ExpiredCleanupCandidateRequest {
+                    authority: &authority,
+                    table: &table,
+                    index: 1,
+                    candidate: &candidates[1],
+                    event: &missing_event,
+                },
+                ExpiredCleanupOutcome::Missing,
+            )
+            .await
+            .expect("settle candidate one as missing");
+        let drained = evidence_of(&admin, cleanup_id).await.expect("evidence");
+        assert_eq!(drained.deleted_candidate_count, 2);
+        assert_eq!(drained.prepared_candidate_index, None);
+
+        // Success is available only at that empty prepared frontier.
+        let mut terminal_conn = TenantConn::acquire(fixture.app_pool(), tenant)
+            .await
+            .expect("terminal conn");
+        tasks
+            .terminal(
+                &mut terminal_conn,
+                ForgeTaskTransition {
+                    task_id: cleanup_id,
+                    attempt_id: authority.attempt_id,
+                    owner: authority.worker_id,
+                    expected: ForgeTaskState::Prepared,
+                    next: ForgeTaskState::Succeeded,
+                },
+                &event("forge.task.succeeded", cleanup_id),
+            )
+            .await
+            .expect("terminal success");
+        terminal_conn.commit().await.expect("commit terminal");
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT state FROM vala.forge_tasks WHERE task_id=$1")
+                .bind(cleanup_id)
+                .fetch_one(&admin)
+                .await
+                .expect("final state"),
+            "succeeded"
         );
     }
 }

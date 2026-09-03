@@ -983,7 +983,7 @@ pub(crate) fn candidates_from_value(
 }
 
 /// Encodes validated attempt evidence into its stable JSON object.
-pub(crate) fn evidence_to_value(evidence: &ForgeTaskEvidence) -> serde_json::Value {
+pub fn evidence_to_value(evidence: &ForgeTaskEvidence) -> serde_json::Value {
     serde_json::json!({"version":evidence.version,"committed_snapshot_id":evidence.committed_snapshot_id,"committed_metadata_location":evidence.committed_metadata_location,"committed_metadata_digest":evidence.committed_metadata_digest,"cleanup_candidates":candidates_to_value(&evidence.cleanup_candidates),"deleted_candidate_count":evidence.deleted_candidate_count,"prepared_candidate_index":evidence.prepared_candidate_index})
 }
 
@@ -992,7 +992,7 @@ pub(crate) fn evidence_to_value(evidence: &ForgeTaskEvidence) -> serde_json::Val
 /// # Errors
 ///
 /// Returns [`SqlError::InvariantViolation`] for malformed stored JSON.
-pub(crate) fn evidence_from_json(value: serde_json::Value) -> Result<ForgeTaskEvidence, SqlError> {
+pub fn evidence_from_json(value: serde_json::Value) -> Result<ForgeTaskEvidence, SqlError> {
     evidence_from_value(value)
 }
 

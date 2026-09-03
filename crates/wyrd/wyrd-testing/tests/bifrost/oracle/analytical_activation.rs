@@ -25,6 +25,7 @@ use vala_bifrost_redux::oracle::{
 };
 use vala_sdk::{BifrostGrpcTransport, QueryClient};
 use wyrd_client::WyrdClient;
+use wyrd_spec::DataTenantId;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
     BifrostQueryRequest, FreshnessPolicy, QueryExecutionPath, QueryStreamFrame, VisibilityMode,
@@ -330,25 +331,46 @@ const RETIREMENT_POLLS: usize = 50;
 ///
 /// Retirement is what proves the server released the owners the stream held.
 /// It is polled rather than read once because the transport drop that triggers
-/// it is observed by the server, not published by the client.
+/// it is observed by the server, not published by the client. The registry is
+/// read in process: the public status surface is proved while the graph is
+/// still held, and an abandoned stream can leave this client's connection pool
+/// holding an entry no later probe can use.
 ///
 /// # Errors
 ///
-/// Returns a transport error, or a description naming the case whose entry was
-/// still running when the bound expired.
+/// Returns a description naming the case whose entry was still running when
+/// the bound expired, with the lifecycle state that names why.
 async fn await_retired(
-    query: &QueryClient,
+    engine: &Arc<Oracle>,
+    tenant: DataTenantId,
     request_id: &RequestId,
     case: &str,
 ) -> Result<(), JourneyError> {
     for _ in 0..RETIREMENT_POLLS {
-        match query.status(request_id).await {
-            Err(error) if error.code() == "WYRD_VALA_404_RUNNING_QUERY_NOT_FOUND" => return Ok(()),
-            Err(error) => return Err(format!("{case}: status probe failed: {error}").into()),
-            Ok(_) => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+        if engine.running_queries().get(tenant, request_id).is_none() {
+            return Ok(());
         }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    Err(format!("{case}: running entry was never retired").into())
+    let state = engine
+        .running_queries()
+        .list(tenant)
+        .into_iter()
+        .find(|summary| &summary.request_id == request_id)
+        .map(|summary| format!("{:?}", summary.state));
+    Err(format!(
+        "{case}: running entry was never retired; state={}",
+        state.unwrap_or_else(|| "<absent>".to_owned())
+    )
+    .into())
+}
+
+/// Reports whether one SDK error is a client-side transport send failure.
+///
+/// Only that class is retried by this journey: a dropped stream can leave the
+/// client's connection pool holding an entry the next request cannot use.
+fn is_transport(error: &vala_sdk::ValaSdkError) -> bool {
+    error.code() == "WYRD_SPEC_500_INTERNAL" && error.to_string().contains("transport error")
 }
 
 /// Reports whether every Oracle node currently retains no Analytical ownership.
@@ -420,21 +442,34 @@ async fn prove_cleanup_ownership() -> Result<(), JourneyError> {
         if refuse {
             engine.fail_next_analytical_plan_for_test();
         }
-        let mut stream = query.query(&request(sql)).await?;
+        let mut stream = match query.query(&request(sql)).await {
+            Ok(stream) => stream,
+            // Same abandoned-connection hazard as the retirement probe: the
+            // first dispatch after a dropped stream may fail to send.
+            Err(error) if is_transport(&error) => query
+                .query(&request(sql))
+                .await
+                .map_err(|retry| format!("{case}: query dispatch failed: {error}; {retry}"))?,
+            Err(error) => return Err(format!("{case}: query dispatch failed: {error}").into()),
+        };
         let request_id = stream.request_id().clone();
-        stream.next_batch().await?;
+        stream
+            .next_batch()
+            .await
+            .map_err(|error| format!("{case}: first batch failed: {error}"))?;
         if !nodes_clean(&cluster)? {
             return Err(format!("{case}: Interactive attempt registered a graph").into());
         }
         drop(stream);
-        await_retired(&query, &request_id, case).await?;
+        await_retired(&engine, tenant, &request_id, case).await?;
         if !nodes_clean(&cluster)? {
             return Err(format!("{case}: Interactive retirement left graph ownership").into());
         }
     }
 
-    prove_paused_cleanup(&cluster, &query, &grouped).await?;
-    prove_paused_cleanup_over_grpc(&cluster, query_server, &public, &grouped).await?;
+    prove_paused_cleanup(&cluster, &engine, tenant, &query, &grouped).await?;
+    prove_paused_cleanup_over_grpc(&cluster, &engine, tenant, query_server, &public, &grouped)
+        .await?;
 
     cluster.shutdown().await?;
     Ok(())
@@ -447,12 +482,17 @@ async fn prove_cleanup_ownership() -> Result<(), JourneyError> {
 /// Returns a transport, pause, ownership, or assertion error.
 async fn prove_paused_cleanup(
     cluster: &WyrdTestCluster,
+    engine: &Arc<Oracle>,
+    tenant: DataTenantId,
     query: &QueryClient,
     sql: &str,
 ) -> Result<(), JourneyError> {
     let pause = analytical_cleanup_pause_for_test();
     pause.arm();
-    let mut stream = query.query(&request(sql)).await?;
+    let mut stream = query
+        .query(&request(sql))
+        .await
+        .map_err(|error| format!("http selected analytical: query dispatch failed: {error}"))?;
     let request_id = stream.request_id().clone();
     let drain = tokio::spawn(async move {
         while stream.next_batch().await?.is_some() {}
@@ -472,7 +512,7 @@ async fn prove_paused_cleanup(
     if path != QueryExecutionPath::Analytical {
         return Err(format!("http selected analytical: settled on {path:?}").into());
     }
-    await_retired(query, &request_id, "http selected analytical").await?;
+    await_retired(engine, tenant, &request_id, "http selected analytical").await?;
     await_clean_nodes(cluster).await?;
     Ok(())
 }
@@ -484,6 +524,8 @@ async fn prove_paused_cleanup(
 /// Returns a transport, pause, ownership, or assertion error.
 async fn prove_paused_cleanup_over_grpc(
     cluster: &WyrdTestCluster,
+    engine: &Arc<Oracle>,
+    tenant: DataTenantId,
     server: &wyrd_testing::WyrdTestServer,
     public: &WyrdClient,
     sql: &str,
@@ -549,7 +591,7 @@ async fn prove_paused_cleanup_over_grpc(
     if path != proto::QueryExecutionPath::Analytical as i32 {
         return Err(format!("grpc selected analytical: settled on path {path}").into());
     }
-    await_retired(&query, &request_id, "grpc selected analytical").await?;
+    await_retired(engine, tenant, &request_id, "grpc selected analytical").await?;
     await_clean_nodes(cluster).await?;
     Ok(())
 }

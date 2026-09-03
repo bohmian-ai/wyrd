@@ -2019,6 +2019,7 @@ impl ForgeWorker {
         let evidence = task
             .evidence
             .as_ref()
+            .and_then(vala_sql::row_types::forge_tasks::ForgeTaskRowEvidence::publication)
             .ok_or_else(|| ForgeError::Reconciliation {
                 detail: "Prepared Forge task has no committed evidence".to_owned(),
             })?;

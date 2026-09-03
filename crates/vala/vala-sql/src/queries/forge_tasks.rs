@@ -22,9 +22,10 @@ use crate::row_types::forge_tasks::{
     ExpiredCleanupCandidateRequest, ExpiredCleanupOutcome, ExpiredCleanupPayload,
     FORGE_TASK_PAYLOAD_VERSION, ForgeCleanupCandidate, ForgePlanningDemand,
     ForgePlanningDemandSqlRow, ForgePreparedTaskClaim, ForgePreparedTaskClaimSqlRow, ForgeTask,
-    ForgeTaskClaim, ForgeTaskClaimSqlRow, ForgeTaskEvidence, ForgeTaskPage, ForgeTaskSqlRow,
-    ForgeTaskState, ForgeTaskStrategy, ForgeTaskTableIdentity, ForgeTaskTransition,
-    ForgeTaskTransitionOutcome, NewForgeTask, SnapshotWatermark, TaskProgressEffect,
+    ForgeTaskClaim, ForgeTaskClaimSqlRow, ForgeTaskEvidence, ForgeTaskPage, ForgeTaskPlan,
+    ForgeTaskRowEvidence, ForgeTaskSqlRow, ForgeTaskState, ForgeTaskStrategy,
+    ForgeTaskTableIdentity, ForgeTaskTransition, ForgeTaskTransitionOutcome, NewForgeTask,
+    OrphanCleanupCursor, SnapshotWatermark, TaskProgressEffect,
 };
 use crate::{OperatorPool, SqlError, TenantConn};
 
@@ -1552,6 +1553,113 @@ impl ForgeTasks {
         Ok(ForgeTaskTransitionOutcome::Applied)
     }
 
+    /// Atomically advances one orphan-cleanup task's durable scan cursor.
+    ///
+    /// The checkpoint is taken only after the attempt's selected deletion batch
+    /// has settled, so the cursor can never skip an object whose classification
+    /// or deletion is still unresolved. It names the last completely processed
+    /// object key and nothing else: no candidate, no owner, and no deletion
+    /// decision enters task evidence, so no later reader can mistake the cursor
+    /// for deletion authority. The row is pinned to the exact live `Running`
+    /// task, attempt, owner, unexpired claim, and table, and the key is rebound
+    /// to the task's own immutable plan prefix before it is written.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqlError::Conflict`] when the lease fence is lost, when no
+    /// row matches that exact identity, or when the key is not strictly beneath
+    /// the plan prefix. Returns [`SqlError::InvariantViolation`] for a
+    /// malformed persisted plan, and [`SqlError`] for statement failures.
+    ///
+    /// # Cancellation
+    ///
+    /// Cancellation drops the uncommitted transaction, leaving the previous
+    /// cursor authoritative and the identical retry safe.
+    pub async fn checkpoint_orphan_cleanup_cursor(
+        &self,
+        tenant: DataTenantId,
+        authority: &ForgeExpirationAuthority,
+        table: &ForgeClaimTable,
+        start_after: &str,
+    ) -> Result<ForgeTaskTransitionOutcome, SqlError> {
+        let mut tx = self
+            .operator_pool
+            .pool()
+            .begin()
+            .await
+            .map_err(SqlError::from)?;
+        bind_tenant(&mut tx, tenant).await?;
+        assert_lease_fence(&mut tx, authority).await?;
+        let locked = lock_orphan_task(&mut tx, authority, table).await?;
+        let cursor = OrphanCleanupCursor::new(start_after.to_owned());
+        OrphanCleanupCursor::from_value(&cursor.to_value(), &locked.prefix, false)?;
+        let changed = sqlx::query("UPDATE vala.forge_tasks SET evidence=$5::jsonb,updated_at=statement_timestamp() WHERE task_id=$1 AND data_tenant_id=wyrd.current_tenant() AND strategy='orphan_cleanup' AND state='running' AND attempt_id=$2 AND claimed_by=$3 AND claim_expires_at>statement_timestamp() AND table_name=$4")
+            .bind(authority.task_id)
+            .bind(authority.attempt_id)
+            .bind(authority.worker_id)
+            .bind(&table.table_name)
+            .bind(cursor.to_value().to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(SqlError::from)?
+            .rows_affected();
+        exact_one(changed, "orphan cleanup cursor checkpoint")?;
+        tx.commit().await.map_err(SqlError::from)?;
+        Ok(ForgeTaskTransitionOutcome::Applied)
+    }
+
+    /// Atomically completes one orphan-cleanup task whose prefix is exhausted.
+    ///
+    /// Clearing the cursor, the exact `Running -> Succeeded` transition, and
+    /// the task-success audit commit or roll back together, so a crash can
+    /// never expose a succeeded task whose traversal evidence still claims
+    /// unfinished work. Completion requests no planning demand: orphan cleanup
+    /// changes no snapshot and its successor is the next periodic task, which
+    /// carries its own fresh cutoff and reconsiders every object again.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqlError::Conflict`] when the lease fence is lost, when the
+    /// audit event does not name this task and transition, or when no row
+    /// matches the exact live `Running` task, attempt, owner, and table.
+    /// Returns [`SqlError`] for statement or audit failures.
+    ///
+    /// # Cancellation
+    ///
+    /// Cancellation drops the uncommitted transaction, leaving the task
+    /// `Running` with its cursor intact for an identical replay.
+    pub async fn complete_orphan_cleanup(
+        &self,
+        tenant: DataTenantId,
+        authority: &ForgeExpirationAuthority,
+        table: &ForgeClaimTable,
+        event: &AuditEvent,
+    ) -> Result<ForgeTaskTransitionOutcome, SqlError> {
+        validate_audit_event(event, authority.task_id, ForgeTaskState::Succeeded)?;
+        let mut tx = self
+            .operator_pool
+            .pool()
+            .begin()
+            .await
+            .map_err(SqlError::from)?;
+        bind_tenant(&mut tx, tenant).await?;
+        assert_lease_fence(&mut tx, authority).await?;
+        lock_orphan_task(&mut tx, authority, table).await?;
+        let changed = sqlx::query("UPDATE vala.forge_tasks SET state='succeeded',evidence=NULL,attempt_id=NULL,claimed_by=NULL,claim_expires_at=NULL,watermark_snapshot_id=NULL,watermark_timestamp_ms=NULL,failure_class=NULL,failed_volume_identity=NULL,next_eligible_at=statement_timestamp(),updated_at=statement_timestamp() WHERE task_id=$1 AND data_tenant_id=wyrd.current_tenant() AND strategy='orphan_cleanup' AND state='running' AND attempt_id=$2 AND claimed_by=$3 AND table_name=$4")
+            .bind(authority.task_id)
+            .bind(authority.attempt_id)
+            .bind(authority.worker_id)
+            .bind(&table.table_name)
+            .execute(&mut *tx)
+            .await
+            .map_err(SqlError::from)?
+            .rows_affected();
+        exact_one(changed, "orphan cleanup completion")?;
+        OperatorAudit::new(tenant, &mut tx).append(event).await?;
+        tx.commit().await.map_err(SqlError::from)?;
+        Ok(ForgeTaskTransitionOutcome::Applied)
+    }
+
     /// Applies an exact tenant mutation and audit append inside the caller transaction.
     ///
     /// Reaching a terminal state frees the task's per-owner large slot simply by
@@ -1650,6 +1758,92 @@ async fn lock_cleanup_task(
             .map(crate::row_types::forge_tasks::evidence_from_json)
             .transpose()?,
     })
+}
+
+/// One locked orphan-cleanup task row: its immutable scan prefix and cursor.
+struct LockedOrphanTask {
+    /// Immutable normalized scan prefix the plan names.
+    prefix: String,
+    /// Current traversal cursor, absent before the first checkpoint.
+    #[expect(
+        dead_code,
+        reason = "decoding the stored cursor under the row lock is the fail-closed check; callers read the frontier from the claim"
+    )]
+    cursor: Option<OrphanCleanupCursor>,
+}
+
+/// Pins the exact live `Running` orphan-cleanup task, attempt, owner, unexpired
+/// claim, and table under a row lock and decodes its closed durable shapes.
+///
+/// Decoding happens here rather than in each caller so a malformed persisted
+/// plan or cursor fails closed under the same lock that authorizes the write.
+///
+/// # Errors
+///
+/// Returns [`SqlError::Conflict`] when no row matches that exact identity, and
+/// [`SqlError::InvariantViolation`] for a malformed persisted plan or cursor.
+async fn lock_orphan_task(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    authority: &ForgeExpirationAuthority,
+    table: &ForgeClaimTable,
+) -> Result<LockedOrphanTask, SqlError> {
+    let row: Option<(serde_json::Value, Option<serde_json::Value>)> = sqlx::query_as("SELECT plan,evidence FROM vala.forge_tasks WHERE task_id=$1 AND data_tenant_id=wyrd.current_tenant() AND strategy='orphan_cleanup' AND state='running' AND attempt_id=$2 AND claimed_by=$3 AND claim_expires_at>statement_timestamp() AND catalog_name=$4 AND namespace_name=$5 AND table_name=$6 FOR UPDATE")
+        .bind(authority.task_id)
+        .bind(authority.attempt_id)
+        .bind(authority.worker_id)
+        .bind(&table.catalog_name)
+        .bind(&table.namespace_name)
+        .bind(&table.table_name)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(SqlError::from)?;
+    let Some((plan, evidence)) = row else {
+        return Err(SqlError::Conflict {
+            detail: "orphan cleanup did not match an exact live task, attempt, owner, and table"
+                .to_owned(),
+        });
+    };
+    let inputs = plan
+        .get("inputs")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| SqlError::InvariantViolation {
+            detail: "orphan cleanup plan inputs are malformed".to_owned(),
+        })?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| SqlError::InvariantViolation {
+                    detail: "orphan cleanup plan input is not a string".to_owned(),
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let parameters =
+        plan.get("parameters")
+            .cloned()
+            .ok_or_else(|| SqlError::InvariantViolation {
+                detail: "orphan cleanup plan parameters are missing".to_owned(),
+            })?;
+    let plan = ForgeTaskPlan {
+        version: FORGE_TASK_PAYLOAD_VERSION,
+        inputs,
+        parameters,
+    };
+    let prefix = plan.orphan_cleanup_prefix(true)?.to_owned();
+    let cursor = evidence
+        .map(|value| {
+            ForgeTaskRowEvidence::decode(ForgeTaskStrategy::OrphanCleanup, &value, &prefix)
+        })
+        .transpose()?
+        .map(|evidence| match evidence {
+            ForgeTaskRowEvidence::OrphanScan(cursor) => Ok(cursor),
+            ForgeTaskRowEvidence::Publication(_) => Err(SqlError::InvariantViolation {
+                detail: "orphan cleanup evidence decoded as publication evidence".to_owned(),
+            }),
+        })
+        .transpose()?;
+    Ok(LockedOrphanTask { prefix, cursor })
 }
 
 /// Requires that `index` names exactly `candidate` in the immutable plan.

@@ -451,6 +451,9 @@ impl ForgeTaskPlan {
                 ));
             }
             ExpiredCleanupPayload::from_value(&self.parameters, persisted)?;
+        } else if strategy == ForgeTaskStrategy::OrphanCleanup {
+            self.orphan_cleanup_prefix(persisted)?;
+            OrphanCleanupPayload::from_value(&self.parameters, persisted)?;
         } else if self.inputs.is_empty() {
             return Err(fail("Forge task plan has no exact inputs".to_owned()));
         }
@@ -475,6 +478,301 @@ impl ForgeTaskPlan {
             });
         }
         ExpiredCleanupPayload::from_value(&self.parameters, persisted)
+    }
+
+    /// Returns the single scan prefix an orphan-cleanup plan names.
+    ///
+    /// Orphan cleanup scans exactly one immutable storage prefix, so the plan's
+    /// `inputs` vector carries exactly one safe, relative object key and never
+    /// a set. A widened, empty, absolute, or traversal-bearing input is refused
+    /// here, which is before lease acquisition and before any object IO.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqlError::Conflict`], or [`SqlError::InvariantViolation`] when
+    /// `persisted`, unless `inputs` holds exactly one normalized relative key.
+    pub fn orphan_cleanup_prefix(&self, persisted: bool) -> Result<&str, SqlError> {
+        let fail = || {
+            let detail = "orphan cleanup plans name exactly one normalized scan prefix".to_owned();
+            if persisted {
+                SqlError::InvariantViolation { detail }
+            } else {
+                SqlError::Conflict { detail }
+            }
+        };
+        let [prefix] = self.inputs.as_slice() else {
+            return Err(fail());
+        };
+        if !is_normalized_object_key(prefix) {
+            return Err(fail());
+        }
+        Ok(prefix)
+    }
+
+    /// Decodes the typed orphan-cleanup parameters this plan carries.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqlError::Conflict`] when the strategy is not
+    /// [`ForgeTaskStrategy::OrphanCleanup`], and the decoding errors of
+    /// [`OrphanCleanupPayload::from_value`] for a malformed payload.
+    pub fn orphan_cleanup_payload(
+        &self,
+        strategy: ForgeTaskStrategy,
+        persisted: bool,
+    ) -> Result<OrphanCleanupPayload, SqlError> {
+        if strategy != ForgeTaskStrategy::OrphanCleanup {
+            return Err(SqlError::Conflict {
+                detail: "only an orphan-cleanup plan carries a scan payload".to_owned(),
+            });
+        }
+        OrphanCleanupPayload::from_value(&self.parameters, persisted)
+    }
+}
+
+/// Payload version of the closed orphan-cleanup scan parameters.
+///
+/// This is the inner version of `plan.parameters` only; the outer
+/// [`FORGE_TASK_PAYLOAD_VERSION`] envelope is unchanged.
+pub const ORPHAN_CLEANUP_PAYLOAD_VERSION: u16 = 1;
+
+/// Stable `kind` tag of the orphan-cleanup parameter payload.
+pub const ORPHAN_CLEANUP_PAYLOAD_KIND: &str = "orphan_cleanup";
+
+/// Version of the closed orphan-cleanup scan cursor stored as task evidence.
+pub const ORPHAN_CLEANUP_CURSOR_VERSION: u16 = 1;
+
+/// Rejects any string that is not a safe relative object key.
+///
+/// Shared by the scan prefix and the scan cursor so the two halves of one
+/// orphan-cleanup task cannot disagree about what a normalized key is.
+fn is_normalized_object_key(value: &str) -> bool {
+    !value.is_empty()
+        && !value.starts_with('/')
+        && !value.ends_with('/')
+        && !value.contains("://")
+        && !value.contains('\\')
+        && !value
+            .split('/')
+            .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+}
+
+/// The closed, immutable parameters one periodic orphan-cleanup task executes.
+///
+/// The age cutoff is captured once, when the periodic task is planned, and is
+/// never re-derived from a later clock. That is what keeps a long-lived retry
+/// or takeover from silently widening what the task may delete: the task's
+/// scan identity is its tenant, table, prefix, and this cutoff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OrphanCleanupPayload {
+    /// Inner payload version; unknown versions fail closed.
+    pub version: u16,
+    /// Immutable inclusive last-modified cutoff in milliseconds since the epoch.
+    pub age_cutoff_ms: i64,
+}
+
+impl OrphanCleanupPayload {
+    /// Encodes the parameters into their stable closed JSON object.
+    #[must_use]
+    pub fn to_value(&self) -> serde_json::Value {
+        serde_json::json!({
+            "version": self.version,
+            "kind": ORPHAN_CLEANUP_PAYLOAD_KIND,
+            "age_cutoff_ms": self.age_cutoff_ms,
+        })
+    }
+
+    /// Decodes one payload, refusing every shape the contract does not name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqlError::Conflict`], or [`SqlError::InvariantViolation`] when
+    /// `persisted`, for a non-object value, unknown or missing fields, an
+    /// unknown version, a wrong `kind`, or a negative cutoff.
+    pub fn from_value(value: &serde_json::Value, persisted: bool) -> Result<Self, SqlError> {
+        let fail = |detail: &str| {
+            let detail = detail.to_owned();
+            if persisted {
+                SqlError::InvariantViolation { detail }
+            } else {
+                SqlError::Conflict { detail }
+            }
+        };
+        let object = value
+            .as_object()
+            .ok_or_else(|| fail("orphan cleanup payload is not an object"))?;
+        const FIELDS: [&str; 3] = ["version", "kind", "age_cutoff_ms"];
+        if object.len() != FIELDS.len() || FIELDS.iter().any(|field| !object.contains_key(*field)) {
+            return Err(fail("orphan cleanup payload has unknown or missing fields"));
+        }
+        let version = object
+            .get("version")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u16::try_from(value).ok())
+            .ok_or_else(|| fail("orphan cleanup payload version is malformed"))?;
+        if version != ORPHAN_CLEANUP_PAYLOAD_VERSION {
+            return Err(fail("unknown orphan cleanup payload version"));
+        }
+        if object.get("kind").and_then(serde_json::Value::as_str)
+            != Some(ORPHAN_CLEANUP_PAYLOAD_KIND)
+        {
+            return Err(fail("orphan cleanup payload kind is malformed"));
+        }
+        let age_cutoff_ms = object
+            .get("age_cutoff_ms")
+            .and_then(serde_json::Value::as_i64)
+            .filter(|value| *value >= 0)
+            .ok_or_else(|| fail("orphan cleanup age cutoff is malformed"))?;
+        Ok(Self {
+            version,
+            age_cutoff_ms,
+        })
+    }
+}
+
+/// The closed durable traversal cursor one orphan-cleanup task carries.
+///
+/// The cursor records traversal only: it names the last object key whose
+/// classification completed, so a successor attempt resumes listing after it
+/// instead of restarting on a leading page of protected objects. It never
+/// names a candidate, an owner, or a deletion decision, so nothing about
+/// deletion safety can be derived from it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrphanCleanupCursor {
+    /// Cursor schema version; unknown versions fail closed.
+    pub version: u16,
+    /// Last completely processed object key, strictly beneath the task prefix.
+    pub start_after: String,
+}
+
+impl OrphanCleanupCursor {
+    /// Builds one cursor at the current traversal frontier.
+    #[must_use]
+    pub fn new(start_after: String) -> Self {
+        Self {
+            version: ORPHAN_CLEANUP_CURSOR_VERSION,
+            start_after,
+        }
+    }
+
+    /// Encodes the cursor into its stable closed JSON object.
+    #[must_use]
+    pub fn to_value(&self) -> serde_json::Value {
+        serde_json::json!({"version": self.version, "start_after": self.start_after})
+    }
+
+    /// Decodes one cursor and rebinds it to the task's immutable scan prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqlError::Conflict`], or [`SqlError::InvariantViolation`] when
+    /// `persisted`, for a non-object value, unknown or missing fields, an
+    /// unknown version, a non-normalized key, or a key that is not strictly
+    /// beneath `prefix`.
+    pub fn from_value(
+        value: &serde_json::Value,
+        prefix: &str,
+        persisted: bool,
+    ) -> Result<Self, SqlError> {
+        let fail = |detail: &str| {
+            let detail = detail.to_owned();
+            if persisted {
+                SqlError::InvariantViolation { detail }
+            } else {
+                SqlError::Conflict { detail }
+            }
+        };
+        let object = value
+            .as_object()
+            .ok_or_else(|| fail("orphan cleanup cursor is not an object"))?;
+        const FIELDS: [&str; 2] = ["version", "start_after"];
+        if object.len() != FIELDS.len() || FIELDS.iter().any(|field| !object.contains_key(*field)) {
+            return Err(fail("orphan cleanup cursor has unknown or missing fields"));
+        }
+        let version = object
+            .get("version")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u16::try_from(value).ok())
+            .ok_or_else(|| fail("orphan cleanup cursor version is malformed"))?;
+        if version != ORPHAN_CLEANUP_CURSOR_VERSION {
+            return Err(fail("unknown orphan cleanup cursor version"));
+        }
+        let start_after = object
+            .get("start_after")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| fail("orphan cleanup cursor key is malformed"))?;
+        if !is_normalized_object_key(start_after)
+            || !start_after.starts_with(&format!("{}/", prefix.trim_end_matches('/')))
+        {
+            return Err(fail("orphan cleanup cursor key escaped its task prefix"));
+        }
+        Ok(Self {
+            version,
+            start_after: start_after.to_owned(),
+        })
+    }
+}
+
+/// The closed strategy-dispatched evidence one Forge task row may carry.
+///
+/// Evidence is not one shape across strategies: publication and expired
+/// cleanup carry [`ForgeTaskEvidence`], while orphan cleanup carries only a
+/// traversal cursor. Dispatching on the row's own strategy is what keeps the
+/// cursor shape unreachable for every other strategy and keeps every existing
+/// strategy's evidence contract exactly as it was.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForgeTaskRowEvidence {
+    /// Publication, expiration, and expired-cleanup evidence.
+    Publication(ForgeTaskEvidence),
+    /// Orphan-cleanup traversal cursor.
+    OrphanScan(OrphanCleanupCursor),
+}
+
+impl ForgeTaskRowEvidence {
+    /// Decodes one persisted evidence column under its row's own strategy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqlError::InvariantViolation`] when the stored JSON is not the
+    /// closed shape that strategy accepts, including an orphan cursor whose key
+    /// escaped `prefix`.
+    pub fn decode(
+        strategy: ForgeTaskStrategy,
+        value: &serde_json::Value,
+        prefix: &str,
+    ) -> Result<Self, SqlError> {
+        if strategy == ForgeTaskStrategy::OrphanCleanup {
+            OrphanCleanupCursor::from_value(value, prefix, true).map(Self::OrphanScan)
+        } else {
+            evidence_from_json(value.clone()).map(Self::Publication)
+        }
+    }
+
+    /// Encodes this evidence back into its stable JSON object.
+    #[must_use]
+    pub fn to_value(&self) -> serde_json::Value {
+        match self {
+            Self::Publication(evidence) => evidence_to_value(evidence),
+            Self::OrphanScan(cursor) => cursor.to_value(),
+        }
+    }
+
+    /// Returns the publication evidence, or `None` for an orphan cursor.
+    #[must_use]
+    pub fn publication(&self) -> Option<&ForgeTaskEvidence> {
+        match self {
+            Self::Publication(evidence) => Some(evidence),
+            Self::OrphanScan(_) => None,
+        }
+    }
+
+    /// Returns the orphan traversal cursor, or `None` for publication evidence.
+    #[must_use]
+    pub fn orphan_scan(&self) -> Option<&OrphanCleanupCursor> {
+        match self {
+            Self::OrphanScan(cursor) => Some(cursor),
+            Self::Publication(_) => None,
+        }
     }
 }
 
@@ -1443,8 +1741,8 @@ pub struct ForgeTask {
     pub claim_expires_at: Option<DateTime<Utc>>,
     /// Active GC watermark.
     pub watermark: Option<SnapshotWatermark>,
-    /// Publication or cleanup evidence.
-    pub evidence: Option<ForgeTaskEvidence>,
+    /// Strategy-dispatched task-row evidence.
+    pub evidence: Option<ForgeTaskRowEvidence>,
     /// Attempt-consuming failures observed for this task.
     pub attempt_count: u32,
     /// Closed persisted failure classification, when the prior attempt failed.
@@ -1496,8 +1794,8 @@ pub struct ForgeTaskClaim {
     pub claim_expires_at: Option<DateTime<Utc>>,
     /// Active GC watermark.
     pub watermark: Option<SnapshotWatermark>,
-    /// Publication or cleanup evidence.
-    pub evidence: Option<ForgeTaskEvidence>,
+    /// Strategy-dispatched task-row evidence.
+    pub evidence: Option<ForgeTaskRowEvidence>,
     /// Attempt-consuming failures observed for this task.
     pub attempt_count: u32,
     /// Closed persisted failure classification, when the prior attempt failed.
@@ -1728,6 +2026,39 @@ pub(crate) struct ForgePreparedTaskClaimSqlRow {
     task: ForgeTaskSqlRow,
 }
 
+/// Decodes one persisted evidence column under its row's own strategy.
+///
+/// Publication, expiration, and expired cleanup keep their existing closed
+/// evidence contract, including the table binding re-check that stops a
+/// persisted candidate vector from naming another table. Orphan cleanup is the
+/// one strategy whose evidence is a traversal cursor, and it is rebound to the
+/// row's own immutable scan prefix here so an out-of-prefix cursor fails closed
+/// at the same boundary.
+///
+/// # Errors
+///
+/// Returns [`SqlError::InvariantViolation`] for any stored shape the row's
+/// strategy does not accept.
+fn decode_row_evidence(
+    strategy: ForgeTaskStrategy,
+    value: &serde_json::Value,
+    plan: &ForgeTaskPlan,
+    table_ref: &ForgeTaskTableIdentity,
+) -> Result<ForgeTaskRowEvidence, SqlError> {
+    if strategy == ForgeTaskStrategy::OrphanCleanup {
+        let prefix = plan.orphan_cleanup_prefix(true)?;
+        return ForgeTaskRowEvidence::decode(strategy, value, prefix);
+    }
+    let evidence = evidence_from_value(value.clone())?;
+    evidence.validate(true)?;
+    evidence
+        .validate_for_table(table_ref)
+        .map_err(|_| SqlError::InvariantViolation {
+            detail: "persisted Forge cleanup evidence is bound to another table".to_owned(),
+        })?;
+    Ok(ForgeTaskRowEvidence::Publication(evidence))
+}
+
 impl TryFrom<ForgeTaskClaimSqlRow> for ForgeTaskClaim {
     type Error = SqlError;
 
@@ -1817,17 +2148,13 @@ impl TryFrom<ForgeTaskSqlRow> for ForgeTask {
                 .map_err(|_| SqlError::InvariantViolation {
                     detail: "Forge task contains malformed table identity".to_owned(),
                 })?;
+        let strategy: ForgeTaskStrategy = row.strategy.parse()?;
         let plan = plan_from_value(row.plan)?;
         plan.validate(true)?;
-        let evidence = row.evidence.map(evidence_from_value).transpose()?;
-        if let Some(value) = &evidence {
-            value.validate(true)?;
-            value
-                .validate_for_table(&table_ref)
-                .map_err(|_| SqlError::InvariantViolation {
-                    detail: "persisted Forge cleanup evidence is bound to another table".to_owned(),
-                })?;
-        }
+        let evidence = row
+            .evidence
+            .map(|value| decode_row_evidence(strategy, &value, &plan, &table_ref))
+            .transpose()?;
         let watermark = match (row.watermark_snapshot_id, row.watermark_timestamp_ms) {
             (Some(snapshot_id), Some(timestamp_ms)) => {
                 let value = SnapshotWatermark {
@@ -1927,7 +2254,7 @@ impl TryFrom<ForgeTaskSqlRow> for ForgeTask {
             task_id: row.task_id,
             data_tenant_id,
             table_ref,
-            strategy: row.strategy.parse()?,
+            strategy,
             lane: row.lane.parse()?,
             base_snapshot_id: row.base_snapshot_id,
             plan,

@@ -12,8 +12,9 @@ mod pg_tests {
         ExpiredCleanupCandidateRequest, ExpiredCleanupOutcome, ExpiredCleanupPayload,
         FORGE_TASK_PAYLOAD_VERSION, ForgeClaimStrategy, ForgeCleanupCandidate,
         ForgeCleanupCategory, ForgeCleanupPath, ForgeTaskEstimates, ForgeTaskEvidence,
-        ForgeTaskLane, ForgeTaskPlan, ForgeTaskState, ForgeTaskStrategy, ForgeTaskTableIdentity,
-        ForgeTaskTransition, ForgeTaskTransitionOutcome, MAINTENANCE_STRATEGIES, NewForgeTask,
+        ForgeTaskLane, ForgeTaskPlan, ForgeTaskRowEvidence, ForgeTaskState, ForgeTaskStrategy,
+        ForgeTaskTableIdentity, ForgeTaskTransition, ForgeTaskTransitionOutcome,
+        MAINTENANCE_STRATEGIES, NewForgeTask, ORPHAN_CLEANUP_PAYLOAD_VERSION, OrphanCleanupPayload,
         SnapshotWatermark,
     };
     use wyrd_dev_fixtures::pg::PgFixture;
@@ -1406,7 +1407,10 @@ mod pg_tests {
         assert_eq!(taken[0].task_id, task_id);
         assert_eq!(taken[0].attempt_id, Some(attempt));
         assert_eq!(taken[0].state, ForgeTaskState::Prepared);
-        assert_eq!(taken[0].evidence, Some(evidence));
+        assert_eq!(
+            taken[0].evidence,
+            Some(ForgeTaskRowEvidence::Publication(evidence))
+        );
         assert!(matches!(
             taken[0].claimed_by,
             Some(owner) if owner == successor_a || owner == successor_b
@@ -1497,7 +1501,10 @@ mod pg_tests {
         assert_eq!(taken.task_id, task_id);
         assert_eq!(taken.attempt_id, Some(attempt));
         assert_eq!(taken.state, ForgeTaskState::Prepared);
-        assert_eq!(taken.evidence, Some(evidence));
+        assert_eq!(
+            taken.evidence,
+            Some(ForgeTaskRowEvidence::Publication(evidence))
+        );
         assert_eq!(taken.claimed_by, Some(successor));
     }
 
@@ -3569,6 +3576,488 @@ mod pg_tests {
                 .await
                 .expect("final state"),
             "succeeded"
+        );
+    }
+
+    /// Builds the canonical closed orphan-cleanup plan for one scan prefix.
+    fn orphan_plan(prefix: &str, age_cutoff_ms: i64) -> ForgeTaskPlan {
+        ForgeTaskPlan {
+            version: FORGE_TASK_PAYLOAD_VERSION,
+            inputs: vec![prefix.to_owned()],
+            parameters: OrphanCleanupPayload {
+                version: ORPHAN_CLEANUP_PAYLOAD_VERSION,
+                age_cutoff_ms,
+            }
+            .to_value(),
+        }
+    }
+
+    /// Builds one enqueueable periodic orphan-cleanup task for `table`.
+    ///
+    /// # Panics
+    /// Panics when the fixed identity is invalid.
+    fn orphan_task(
+        tenant: DataTenantId,
+        table: &str,
+        prefix: &str,
+        age_cutoff_ms: i64,
+    ) -> NewForgeTask {
+        NewForgeTask {
+            strategy: ForgeTaskStrategy::OrphanCleanup,
+            plan: orphan_plan(prefix, age_cutoff_ms),
+            ..task(tenant, table, ForgeTaskLane::Ordinary, 7)
+        }
+    }
+
+    /// Reads one task's raw persisted evidence column.
+    ///
+    /// # Panics
+    /// Panics when the read fails.
+    async fn raw_evidence(superuser: &PgPool, task_id: Uuid) -> Option<serde_json::Value> {
+        sqlx::query_scalar("SELECT evidence FROM vala.forge_tasks WHERE task_id=$1")
+            .bind(task_id)
+            .fetch_one(superuser)
+            .await
+            .expect("evidence read")
+    }
+
+    /// Reads one task's durable state and attempt budget together.
+    ///
+    /// # Panics
+    /// Panics when the read fails.
+    async fn state_and_attempts(superuser: &PgPool, task_id: Uuid) -> (String, i32) {
+        sqlx::query_as("SELECT state,attempt_count FROM vala.forge_tasks WHERE task_id=$1")
+            .bind(task_id)
+            .fetch_one(superuser)
+            .await
+            .expect("state read")
+    }
+
+    /// The orphan-cleanup plan, cursor, retry, and completion contracts are closed.
+    ///
+    /// One periodic orphan-cleanup task is fully described by its tenant, its
+    /// table, one immutable scan prefix, and one immutable age cutoff. This
+    /// pins that whole contract against real PostgreSQL: the exact plan and
+    /// cursor shapes round-trip, no Reset row and no source-operation identity
+    /// is required or accepted anywhere in it, and every widened, malformed, or
+    /// out-of-prefix value is refused before it can become durable state.
+    ///
+    /// The lifecycle half is what makes a bounded scan resumable. A cursor
+    /// checkpoint survives the `Running -> Retryable` release and the later
+    /// claim with the same task identity and an unchanged failure budget, so a
+    /// partial scan is ordinary progress rather than a failed attempt. Work
+    /// whose ownership is ambiguous cannot advance the cursor at all. Exhaustion
+    /// clears the cursor and marks the task succeeded in the same transaction as
+    /// its one success audit, proven by forcing that audit append to fail and
+    /// observing the transition roll back with it.
+    ///
+    /// # Panics
+    /// Panics when PostgreSQL setup or any closure assertion fails.
+    #[tokio::test]
+    async fn orphan_cleanup_plan_cursor_retry_and_completion_are_closed() {
+        let (fixture, admin) = setup().await;
+        let op = fixture.operator_pool();
+        let tasks = ForgeTasks::new(op.clone());
+        let tenant = fixture.data_tenant_id();
+        let prefix = format!("tenants/{tenant}/bifrost/orphan/data/forge/v1");
+        let cutoff_ms = 1_700_000_000_000_i64;
+
+        // The closed plan shape: exactly one normalized prefix, and parameters
+        // that name only the payload kind, its version, and the immutable
+        // cutoff. Every other spelling is refused before enqueue can persist it.
+        for (broken, why) in [
+            (
+                ForgeTaskPlan {
+                    inputs: Vec::new(),
+                    ..orphan_plan(&prefix, cutoff_ms)
+                },
+                "a scan with no prefix names no work",
+            ),
+            (
+                ForgeTaskPlan {
+                    inputs: vec![prefix.clone(), format!("{prefix}/extra")],
+                    ..orphan_plan(&prefix, cutoff_ms)
+                },
+                "a widened input set would give the task two scan identities",
+            ),
+            (
+                ForgeTaskPlan {
+                    inputs: vec![format!("/{prefix}")],
+                    ..orphan_plan(&prefix, cutoff_ms)
+                },
+                "an absolute key is not a normalized object key",
+            ),
+            (
+                ForgeTaskPlan {
+                    inputs: vec![format!("{prefix}/../sibling")],
+                    ..orphan_plan(&prefix, cutoff_ms)
+                },
+                "a traversal segment escapes the scan prefix",
+            ),
+            (
+                ForgeTaskPlan {
+                    parameters: serde_json::json!({
+                        "version": 1,
+                        "kind": "orphan_cleanup",
+                        "age_cutoff_ms": cutoff_ms,
+                        "source_operation_id": Uuid::now_v7().to_string(),
+                    }),
+                    ..orphan_plan(&prefix, cutoff_ms)
+                },
+                "a source-operation identity is not part of this contract",
+            ),
+            (
+                ForgeTaskPlan {
+                    parameters: serde_json::json!({"version": 2, "kind": "orphan_cleanup", "age_cutoff_ms": cutoff_ms}),
+                    ..orphan_plan(&prefix, cutoff_ms)
+                },
+                "an unknown payload version fails closed",
+            ),
+            (
+                ForgeTaskPlan {
+                    parameters: serde_json::json!({"version": 1, "kind": "expired_cleanup", "age_cutoff_ms": cutoff_ms}),
+                    ..orphan_plan(&prefix, cutoff_ms)
+                },
+                "another strategy's payload kind is not this strategy's payload",
+            ),
+            (
+                ForgeTaskPlan {
+                    parameters: serde_json::json!({"version": 1, "kind": "orphan_cleanup", "age_cutoff_ms": -1}),
+                    ..orphan_plan(&prefix, cutoff_ms)
+                },
+                "a negative cutoff is not a wall-clock instant",
+            ),
+        ] {
+            assert!(
+                tasks
+                    .enqueue(&NewForgeTask {
+                        plan: broken,
+                        ..orphan_task(tenant, "orphan", &prefix, cutoff_ms)
+                    })
+                    .await
+                    .is_err(),
+                "{why}"
+            );
+        }
+
+        let id = tasks
+            .enqueue(&orphan_task(tenant, "orphan", &prefix, cutoff_ms))
+            .await
+            .expect("orphan cleanup enqueue");
+        let owner = Uuid::now_v7();
+        let fence = tasks
+            .acquire_scheduler(owner, 30)
+            .await
+            .expect("scheduler")
+            .expect("fence");
+        let table = ForgeClaimTable {
+            table_uid: [7_u8; 16],
+            catalog_name: "wyrd-redux".to_owned(),
+            namespace_name: "vala.bifrost".to_owned(),
+            table_name: "orphan".to_owned(),
+            table_uuid: Uuid::now_v7(),
+        };
+        let claim = tasks
+            .claim_fair(owner, limits(4), Some(MAINTENANCE_STRATEGIES))
+            .await
+            .expect("claim")
+            .expect("claimed orphan task");
+        assert_eq!(claim.task_id, id);
+        assert_eq!(
+            claim.strategy,
+            ForgeClaimStrategy::Known(ForgeTaskStrategy::OrphanCleanup)
+        );
+        assert_eq!(
+            claim
+                .plan
+                .orphan_cleanup_payload(ForgeTaskStrategy::OrphanCleanup, true)
+                .expect("payload round-trips"),
+            OrphanCleanupPayload {
+                version: ORPHAN_CLEANUP_PAYLOAD_VERSION,
+                age_cutoff_ms: cutoff_ms,
+            },
+            "the immutable cutoff survives enqueue and claim unchanged"
+        );
+        assert_eq!(
+            claim
+                .plan
+                .orphan_cleanup_prefix(true)
+                .expect("prefix round-trips"),
+            prefix
+        );
+        assert!(
+            claim.evidence.is_none(),
+            "a fresh orphan task starts with no cursor at all"
+        );
+        let attempt = claim.attempt_id.expect("attempt");
+        tasks
+            .start(
+                id,
+                attempt,
+                owner,
+                SnapshotWatermark {
+                    snapshot_id: 7,
+                    timestamp_ms: 700,
+                },
+            )
+            .await
+            .expect("start");
+        let authority = ForgeExpirationAuthority {
+            task_id: id,
+            attempt_id: attempt,
+            worker_id: owner,
+            lease_key: format!("forge:table:{tenant}:vala.bifrost.orphan"),
+            lease_fencing_token: fence,
+        };
+        sqlx::query("INSERT INTO vala.maintenance_leases (lease_key,owner,fencing_token,expires_at,heartbeat_at) VALUES ($1,$2,$3,now()+interval '10 minutes',now())")
+            .bind(&authority.lease_key)
+            .bind(authority.worker_id)
+            .bind(authority.lease_fencing_token)
+            .execute(&admin)
+            .await
+            .expect("seed lease");
+
+        // The cursor records traversal only, and only inside this task's own
+        // prefix. A sibling table's key, a traversal segment, and the prefix
+        // itself are all refused, so a cursor can never widen what the task
+        // scans or name work outside its table.
+        for (bad, why) in [
+            (
+                format!("tenants/{tenant}/bifrost/other/data/forge/v1/object.parquet"),
+                "a sibling table's key is not beneath this task's prefix",
+            ),
+            (
+                format!("{prefix}/../object.parquet"),
+                "a traversal segment escapes the prefix",
+            ),
+            (
+                prefix.clone(),
+                "the prefix itself is not strictly beneath the prefix",
+            ),
+            (String::new(), "an empty key names no object"),
+        ] {
+            assert!(
+                tasks
+                    .checkpoint_orphan_cleanup_cursor(tenant, &authority, &table, &bad)
+                    .await
+                    .is_err(),
+                "{why}"
+            );
+        }
+        assert!(
+            raw_evidence(&admin, id).await.is_none(),
+            "a refused checkpoint writes no evidence"
+        );
+
+        let first_key = format!("{prefix}/aaa/00000000-0000-7000-8000-000000000001.parquet");
+        assert_eq!(
+            tasks
+                .checkpoint_orphan_cleanup_cursor(tenant, &authority, &table, &first_key)
+                .await
+                .expect("first checkpoint"),
+            ForgeTaskTransitionOutcome::Applied
+        );
+        assert_eq!(
+            raw_evidence(&admin, id).await.expect("cursor evidence"),
+            serde_json::json!({"version": 1, "start_after": first_key}),
+            "the persisted cursor is exactly the closed two-field object"
+        );
+
+        // Ambiguous ownership cannot move the frontier: a stale attempt, a
+        // foreign owner, and a foreign table each fail before any write.
+        for (ambiguous, why) in [
+            (
+                ForgeExpirationAuthority {
+                    attempt_id: Uuid::now_v7(),
+                    ..authority.clone()
+                },
+                "a stale attempt no longer owns this task",
+            ),
+            (
+                ForgeExpirationAuthority {
+                    worker_id: Uuid::now_v7(),
+                    ..authority.clone()
+                },
+                "a foreign owner never held this claim",
+            ),
+            (
+                ForgeExpirationAuthority {
+                    lease_fencing_token: fence + 1,
+                    ..authority.clone()
+                },
+                "a stale fence has lost table authority",
+            ),
+        ] {
+            assert!(
+                tasks
+                    .checkpoint_orphan_cleanup_cursor(
+                        tenant,
+                        &ambiguous,
+                        &table,
+                        &format!("{prefix}/zzz/object.parquet")
+                    )
+                    .await
+                    .is_err(),
+                "{why}"
+            );
+        }
+        assert!(
+            tasks
+                .checkpoint_orphan_cleanup_cursor(
+                    tenant,
+                    &authority,
+                    &ForgeClaimTable {
+                        table_name: "other".to_owned(),
+                        ..table.clone()
+                    },
+                    &format!("{prefix}/zzz/object.parquet")
+                )
+                .await
+                .is_err(),
+            "a cross-table checkpoint cannot reach this task"
+        );
+        assert_eq!(
+            raw_evidence(&admin, id).await.expect("cursor evidence"),
+            serde_json::json!({"version": 1, "start_after": first_key}),
+            "no ambiguous caller moved the frontier"
+        );
+
+        // A partial scan releases the task without consuming failure budget,
+        // and the cursor survives both the release and the successor claim.
+        let (_, attempts_before) = state_and_attempts(&admin, id).await;
+        tasks
+            .retry(id, attempt, owner, Utc::now() - Duration::seconds(1))
+            .await
+            .expect("partial scan release");
+        let (state, attempts_after) = state_and_attempts(&admin, id).await;
+        assert_eq!(state, "retryable");
+        assert_eq!(
+            attempts_after, attempts_before,
+            "a partial scan is progress, not an attempt-consuming failure"
+        );
+        let resumed = tasks
+            .claim_fair(owner, limits(4), Some(MAINTENANCE_STRATEGIES))
+            .await
+            .expect("resume claim")
+            .expect("resumed orphan task");
+        assert_eq!(resumed.task_id, id, "the successor is the same task");
+        assert_eq!(
+            resumed
+                .evidence
+                .as_ref()
+                .and_then(ForgeTaskRowEvidence::orphan_scan)
+                .map(|cursor| cursor.start_after.clone()),
+            Some(first_key.clone()),
+            "the successor resumes from the exact persisted frontier"
+        );
+        let resumed_attempt = resumed.attempt_id.expect("resumed attempt");
+        assert_ne!(resumed_attempt, attempt, "the successor is a new attempt");
+        tasks
+            .start(
+                id,
+                resumed_attempt,
+                owner,
+                SnapshotWatermark {
+                    snapshot_id: 7,
+                    timestamp_ms: 700,
+                },
+            )
+            .await
+            .expect("resume start");
+        let resumed_authority = ForgeExpirationAuthority {
+            attempt_id: resumed_attempt,
+            ..authority.clone()
+        };
+        let last_key = format!("{prefix}/zzz/00000000-0000-7000-8000-000000000002.parquet");
+        tasks
+            .checkpoint_orphan_cleanup_cursor(tenant, &resumed_authority, &table, &last_key)
+            .await
+            .expect("resumed checkpoint");
+
+        // Completion is atomic with its audit. Occupying the next audit
+        // sequence forces the append to fail after the state update, and the
+        // whole transaction rolls back: the task stays Running with its cursor.
+        let head_seq: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(seq),0) FROM vala.audit_outbox WHERE data_tenant_id=$1",
+        )
+        .bind(tenant.as_uuid())
+        .fetch_one(&admin)
+        .await
+        .expect("chain head");
+        sqlx::query("INSERT INTO vala.audit_outbox (data_tenant_id,seq,prev_hash,entry_hash,request_id,operation,resource,principal_id,principal_kind,auth_method,permission,decision,result,payload_summary) VALUES ($1,$2,decode(repeat('00',32),'hex'),decode(repeat('00',32),'hex'),'poison','test.poison','forge-task:poison',$3,'service','internal','bifrost:forge','allow','success','poison')")
+            .bind(tenant.as_uuid())
+            .bind(head_seq + 1)
+            .bind(Uuid::nil())
+            .execute(&admin)
+            .await
+            .expect("occupy the next audit sequence");
+        assert!(
+            tasks
+                .complete_orphan_cleanup(
+                    tenant,
+                    &resumed_authority,
+                    &table,
+                    &event("forge.task.succeeded", id)
+                )
+                .await
+                .is_err(),
+            "a failed audit append must take the terminal transition with it"
+        );
+        assert_eq!(state_and_attempts(&admin, id).await.0, "running");
+        assert_eq!(
+            raw_evidence(&admin, id).await.expect("cursor evidence"),
+            serde_json::json!({"version": 1, "start_after": last_key}),
+            "the rolled-back completion left the cursor authoritative"
+        );
+        // The outbox is append-only, so the occupied sequence is released by
+        // advancing the chain head past it rather than by deleting the row.
+        sqlx::query("INSERT INTO vala.audit_chain_head (data_tenant_id,last_seq,head_hash) VALUES ($1,$2,decode(repeat('00',32),'hex')) ON CONFLICT (data_tenant_id) DO UPDATE SET last_seq=EXCLUDED.last_seq")
+            .bind(tenant.as_uuid())
+            .bind(head_seq + 1)
+            .execute(&admin)
+            .await
+            .expect("advance past the occupied sequence");
+
+        assert_eq!(
+            tasks
+                .complete_orphan_cleanup(
+                    tenant,
+                    &resumed_authority,
+                    &table,
+                    &event("forge.task.succeeded", id)
+                )
+                .await
+                .expect("exhaustion completes the task"),
+            ForgeTaskTransitionOutcome::Applied
+        );
+        assert_eq!(state_and_attempts(&admin, id).await.0, "succeeded");
+        assert!(
+            raw_evidence(&admin, id).await.is_none(),
+            "exhaustion clears the traversal cursor"
+        );
+        assert_eq!(
+            count_operation(&admin, "forge.task.succeeded").await,
+            1,
+            "exactly one task-success audit is appended"
+        );
+        assert!(
+            tasks
+                .complete_orphan_cleanup(
+                    tenant,
+                    &resumed_authority,
+                    &table,
+                    &event("forge.task.succeeded", id)
+                )
+                .await
+                .is_err(),
+            "a completed orphan task cannot complete twice"
+        );
+        assert!(
+            tasks
+                .checkpoint_orphan_cleanup_cursor(tenant, &resumed_authority, &table, &last_key)
+                .await
+                .is_err(),
+            "a completed orphan task cannot resume its scan"
         );
     }
 }

@@ -2211,8 +2211,11 @@ impl ForgeWorker {
         );
         if task.plan.inputs.is_empty() != cleanup {
             return Err(ForgeError::Invariant {
-                detail: "Forge task payload does not match its strategy's input contract"
-                    .to_owned(),
+                detail: if cleanup {
+                    "Forge expired cleanup carries inputs its payload contract forbids".to_owned()
+                } else {
+                    "Forge task payload carries no exact inputs".to_owned()
+                },
             });
         }
         if cleanup {

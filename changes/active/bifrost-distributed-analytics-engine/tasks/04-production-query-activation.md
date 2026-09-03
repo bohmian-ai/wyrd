@@ -126,40 +126,95 @@ become the execution-path authority.
 
 ### Scenario 3 — Shared Rust stream settlement
 
-**Behavior.** Normal terminal, explicit close, caller drop, bounded-collection
-overflow, decode/transport failure, and cancellation converge on one idempotent
-Rust-owned settlement: cancel if incomplete, await/drain server settlement under
-the original deadline, validate the terminal, then release the response body.
-Language and MCP projections consume this owner instead of implementing server
-lifecycle policy. Maps REQ-007, REQ-008, REQ-010, INV-003, INV-004, INV-008,
-AC-004, AC-006.
+**Behavior.** HTTP and gRPC initial response metadata return the server's exact
+absolute wall-clock deadline as Unix epoch milliseconds in
+`x-wyrd-query-deadline-ms`; `vala-sdk` retains that value with the request ID
+and response body. A healthy stream, including explicit cancellation or a
+bounded-collection overflow before transport failure, requests cancellation at
+most once, drains the existing body under that deadline, and validates its
+terminal before reporting settlement. If decode or transport has already
+broken the body, the client preserves the original error, issues the same
+existing cancellation request, and polls the existing status route until the
+stable `RunningQueryNotFound` 404 proves server cleanup completed; this path
+does not claim terminal validation. Raw Rust `Drop` only drops the body and
+signals cancellation; it never blocks, spawns client work, or claims awaited
+settlement. Language and MCP projections consume this owner instead of
+implementing server lifecycle policy. Maps REQ-007, REQ-008, REQ-010, INV-003,
+INV-004, INV-008, AC-004, AC-006.
 
 **RED.** Add
 `query::tests::query_result_stream_settles_every_incomplete_exit_once` in
-`vala-sdk`. Use deterministic HTTP lifecycle gates for terminal/close/cancel,
-result-limit overflow, protocol failure, and transport failure; assert one
-server cancel at most, settlement remains within the original request deadline,
-the terminal is validated before success, and the body releases after server
-settlement. Exact:
+`vala-sdk`. Use deterministic HTTP lifecycle gates for a normal terminal,
+healthy explicit close, result-limit overflow, protocol/decode failure, and
+transport failure. Assert the client retains the response deadline, rejects a
+missing, malformed, negative, or non-representable deadline header before
+returning a stream, sends at most one cancellation, and never exceeds that
+deadline. The healthy cases must drain the same body and validate its terminal;
+the broken cases must return the original `ValaSdkError` with unchanged stable
+code, status, and detail after cancellation and status polling reaches the stable
+`WYRD_VALA_404_RUNNING_QUERY_NOT_FOUND`, with no terminal-validation claim.
+Exact:
 
 ```bash
 mise exec -- cargo nextest run --locked -p vala-sdk --lib -E 'test(=query::tests::query_result_stream_settles_every_incomplete_exit_once)'
 ```
 
-**GREEN.** Make `vala_sdk::QueryResultStream` retain the client cancellation
-capability, original absolute deadline, and one native settlement state. Its
-explicit async close and every owned error/overflow path request cancellation
-only when no validated terminal exists, continue polling the same stream or
-status/cancellation contract until a terminal settlement is observed within
-that deadline, validate it, and release exactly once. `Drop` may signal
-cancellation and leak telemetry but cannot spawn, block, or claim settlement.
-Keep `BifrostClient::cancel` as the one HTTP cancellation operation.
+Add the focused server journey
+`query::response_body_drop_retains_running_status_until_cleanup_joins`. Stall
+the production response after its schema, drop the HTTP body, and hold the
+existing Oracle cleanup gate. Assert status remains present and cancelling
+while cleanup is held, then release the gate and assert the same status route
+returns `WYRD_VALA_404_RUNNING_QUERY_NOT_FOUND`; also assert the HTTP deadline
+header equals the active summary deadline. Exact:
+
+```bash
+scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-testing --test server -P journey -E 'test(=query::response_body_drop_retains_running_status_until_cleanup_joins)' --run-ignored=all"
+```
+
+**GREEN.** Carry the participant cut's existing `DateTime<Utc>` deadline on
+`OracleQueryStream` and project its checked nonnegative `timestamp_millis()`
+through HTTP response headers, gRPC initial metadata, and the existing private
+Oracle forwarding adapter without recomputing it at any transport hop. Document
+the HTTP header in the generated OpenAPI source. A missing or malformed deadline
+on either server-to-server forwarding or the public Rust client is a protocol
+failure; no proto field, query request field, polling endpoint, or completed
+result is added.
+
+Make `vala_sdk::QueryResultStream` retain `QueryClient`, request ID, the raw
+deadline milliseconds, body, and one settlement state. Explicit close and
+owned overflow/error paths move the stream through that state exactly once.
+While the body remains decodable, cancellation drains only that body and
+accepts settlement only after a structurally valid terminal; it returns the
+caller's original overflow error after that proof. Once decode or transport
+fails, save the original error, issue `QueryClient::cancel` once, and call
+`QueryClient::status` at a fixed 100 ms interval clipped to the remaining
+absolute deadline until its stable not-found code proves removal. Transient
+cancel/status failures do not
+replace the original stream error; if proof is still unavailable at the
+deadline, return that original error and record scrubbed unconfirmed-settlement
+telemetry. Do not read or validate the broken body again.
+
+Move active-entry retirement behind Oracle's existing cleanup ownership.
+`RunningQueryTerminalOwner::Drop` must not remove the entry. Normal stream
+completion retires it only after `settle_and_finish_stream` has joined children
+and released the query envelope. On response-body drop, the server transport
+owner invokes the registry's existing idempotent cancelling transition, signals
+the query cancellation tree, and transfers the retirement capability to the
+existing Analytical supervisor-owned lifecycle before caller-owned stream state
+can disappear; that lifecycle calls `settle_terminal` only after its cleanup
+join succeeds. Interactive drop uses the same Oracle stream settlement owner
+after its local batch, admission, and resource owners have released. A cleanup
+timeout/failure leaves the entry visible as cancelling and lets the existing
+readiness/shutdown evidence surface the retained owner. HTTP and gRPC transport
+drop use this same Oracle path.
 
 **REFACTOR.** `vala-sdk` is the sole shared client settlement owner. MCP only
 bridges its tool-return and ceiling events to this API. Client-neutral behavior
 discovered while implementing a projection must move into `vala-sdk` first and
 receive Rust coverage there; the projection then exposes it without
-duplication.
+duplication. Keep the existing running-query route and Analytical supervisor;
+do not add a client background task, completed-query storage, polling API, or
+lifecycle framework.
 
 ### Scenario 4 — Public UI and distributed Rust journeys
 
@@ -174,9 +229,10 @@ REQ-002, REQ-003, REQ-006, REQ-008, REQ-009, REQ-011, AC-002–AC-007.
 `analytical_public::public_query_selects_both_paths_and_preserves_interactive_floor`
 to the Oracle journey target. Use one-Oracle/one-Scribe for the UI case and the
 qualified three-Oracle/one-Scribe fixture for Analytical; assert raw request
-has no path field, terminals differ, trusted result parity, UI service under
-pressure, finite result-transport refusal, and all production gauges/owners
-return to baseline. Exact:
+has no path field, the HTTP deadline metadata retained by `vala-sdk` equals the
+server's active-query deadline, terminals differ, trusted result parity, UI
+service under pressure, finite result-transport refusal, and all production
+gauges/owners return to baseline. Exact:
 
 ```bash
 scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-testing --test oracle -P journey -E 'test(=analytical_public::public_query_selects_both_paths_and_preserves_interactive_floor)' --run-ignored=all"
@@ -233,7 +289,7 @@ AC-007.
 **RED.** Add
 `query::generated_grpc_and_scheduled_queries_share_audit_terminal_and_cleanup`
 to the server journey. Assert one accepted/relayed logical read, no stage audit,
-generated gRPC terminal path and canonical problem fields (`code`, HTTP
+generated gRPC initial deadline metadata, terminal path, and canonical problem fields (`code`, HTTP
 `status`, `title`, `detail`, `remediation`, `details`, and request instance),
 the production scheduled adapter's same `AppState::query_sql` route,
 cancellation, private peer isolation, readiness, and zero ownership. Exact:
@@ -271,6 +327,12 @@ path/reason/outcome values only; IDs and SQL stay scrubbed traces. Rust is the
 client implementation authority: wire parsing, validation, errors, deadlines,
 cancellation, and settlement must not diverge by language.
 
+The deadline header is the existing participant-cut deadline represented as a
+base-10 Unix epoch millisecond integer. `RunningQueryNotFound` proves only that
+the active server owner retired after cleanup; it is not a recovered terminal.
+Healthy streams validate terminals, broken streams preserve their originating
+error and validate settlement only through active-entry disappearance.
+
 Task 3A owns admission fairness, Interactive protection, and lowest-rung
 contention qualification. This task may observe those behaviors through public
 routing but must not redesign or duplicate their owners or evidence matrix.
@@ -303,6 +365,8 @@ git diff --check
 - Source-generated request/terminal diff proving no selector or EXPLAIN.
 - Selection mutation matrix and path admission/floor snapshots.
 - UI, data-scientist, scheduled, failure, cancellation, and pressure journeys.
+- HTTP/gRPC deadline metadata equality, healthy terminal-drain, broken-stream
+  status settlement, and response-drop-before-cleanup ordering evidence.
 - Single audit acceptance/no stage audit evidence.
 - Production telemetry deltas and zero owner/readiness/shutdown snapshots.
 

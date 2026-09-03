@@ -282,23 +282,25 @@ pub(crate) fn attempt_context() -> AnalyticalAttemptContext {
     }
 }
 
-/// Returns every node's live Analytical ownership, leader and follower halves.
+/// Returns every Oracle node's live Analytical ownership, leader and follower
+/// halves.
+///
+/// A node that composed no Oracle is skipped rather than refused: a Scribe-only
+/// node has no Analytical ownership to inspect, so demanding one from it would
+/// report a correct topology as a failure.
 ///
 /// # Errors
 ///
-/// Returns an error when a node composed no Oracle or its ownership lock is
-/// poisoned.
+/// Returns an error when an Oracle node composed no Analytical handle or its
+/// ownership lock is poisoned.
 pub(crate) fn live_ownership(
     cluster: &WyrdTestCluster,
 ) -> Result<Vec<AnalyticalLiveInspection>, JourneyError> {
     cluster
         .servers()
-        .map(|server| {
-            let engine = server
-                .state()
-                .bifrost_query()
-                .ok_or("query node composed no Oracle")?
-                .engine();
+        .filter_map(|server| server.state().bifrost_query())
+        .map(|query| {
+            let engine = query.engine();
             let handle = engine
                 .analytical_execution()
                 .ok_or("Oracle composed no Analytical handle")?;

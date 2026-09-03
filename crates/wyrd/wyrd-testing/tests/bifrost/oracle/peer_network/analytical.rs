@@ -299,10 +299,10 @@ const CLEAN_LEASE_POLLS: usize = 100;
 const CLEAN_LEASE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Left-table rows, wider than the right so the join is not an identity.
-const LEFT_ROWS: i64 = 400_000;
+const LEFT_ROWS: i64 = crate::support::ANALYTICAL_LEFT_ROWS;
 
 /// Right-table rows; the join key range that actually matches.
-const RIGHT_ROWS: i64 = 300_000;
+const RIGHT_ROWS: i64 = crate::support::ANALYTICAL_RIGHT_ROWS;
 
 /// Rows per fixture ingest request.
 ///
@@ -316,12 +316,6 @@ const INGEST_CHUNK: i64 = 100_000;
 /// Irrelevant to the query under test, which derives its own key from `id`;
 /// it only keeps the published files from being one trivial group.
 const INGEST_GROUPS: i64 = 1_000;
-
-/// Digits the query left-pads each id to.
-const KEY_DIGITS: usize = 6;
-
-/// Filler characters appended to each key, making every key exactly 1 KiB.
-const KEY_FILLER: usize = 1018;
 
 /// Smallest possible in-memory size of the output sort's input, in bytes.
 ///
@@ -395,14 +389,8 @@ async fn prove_physical_analytical_baseline() -> Result<(), PeerJourneyError> {
         cluster.nodes_mut()[index].refresh_snapshot()?;
     }
 
-    let sql = format!(
-        "SELECT LPAD(CAST(l.id AS VARCHAR), {KEY_DIGITS}, '0') || REPEAT('x', {KEY_FILLER}) \
-         AS filter_key, COUNT(*) AS matched \
-         FROM vala.bifrost.{left} AS l \
-         JOIN vala.bifrost.{right} AS r ON l.id = r.id \
-         GROUP BY l.id ORDER BY filter_key"
-    );
-    let expected_digest = expected_result_digest();
+    let sql = crate::support::analytical_baseline_sql(&left, &right);
+    let expected_digest = crate::support::expected_analytical_digest();
 
     // Two different coordinators of the same cluster, same statement. Any
     // configuration that made one Oracle special would diverge here.
@@ -664,22 +652,4 @@ async fn peer_planes_are_reachable_from_both_coordinators(
         }
     }
     Ok(())
-}
-
-/// Recomputes the exact result the fixture tables must produce.
-///
-/// Generated from the fixture's own definition rather than from anything the
-/// cluster returned, so a query that silently dropped, duplicated, or reordered
-/// rows cannot agree with it.
-fn expected_result_digest() -> String {
-    use sha2::Digest as _;
-
-    let mut digest = sha2::Sha256::new();
-    for id in 0..RIGHT_ROWS {
-        let key = format!("{id:0KEY_DIGITS$}{filler}", filler = "x".repeat(KEY_FILLER));
-        digest.update((key.len() as u32).to_le_bytes().as_slice());
-        digest.update(key.as_bytes());
-        digest.update(1_i64.to_le_bytes().as_slice());
-    }
-    format!("{:x}", digest.finalize())
 }

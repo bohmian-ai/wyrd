@@ -18,12 +18,17 @@ use sha2::{Digest as _, Sha256};
 use std::sync::Arc;
 use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef, TenantTableBinding};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
+use vala_bifrost_redux::oracle::analytical::{
+    AnalyticalAttemptContext, AnalyticalLiveInspection, DataFusionQueryId, PublicQueryId,
+};
 use vala_bifrost_redux::parquet::writer_properties::bifrost_writer_properties;
 use vala_bifrost_redux::schema::with_managed_columns;
 use vala_sdk::QueryClient;
 use wyrd_client::WyrdClient;
 use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::{GrpcConfig, HttpConfig};
+use wyrd_runtime::permission::PermissionSet;
+use wyrd_runtime::{Permission, Principal, PrincipalKind};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
 use wyrd_spec::request_id::RequestId;
@@ -236,6 +241,149 @@ pub(crate) async fn query_rows(
     }
     Ok(rows)
 }
+/// Builds one authenticated in-process query context for the fixture tenant.
+///
+/// The public SDK cannot reach the inactive path, so the journey authenticates
+/// the same way the public query service does — a tenant-bound principal
+/// holding exactly `bifrost:query:read` — and hands Oracle the identical
+/// context its own gRPC surface would have built.
+pub(crate) fn query_context(
+    tenant: DataTenantId,
+) -> Result<vala_bifrost_redux::oracle::AuthorizedQueryContext, JourneyError> {
+    let permission = Permission::bifrost_query_read();
+    let principal = Principal::new(
+        PrincipalId::new(uuid::Uuid::now_v7()),
+        PrincipalKind::User,
+        tenant,
+        Vec::new(),
+        PermissionSet::from_iter([permission.clone()]),
+    );
+    Ok(vala_bifrost_redux::oracle::AuthorizedQueryContext::try_new(
+        principal,
+        tenant,
+        RequestId::now_v7(),
+        None,
+        AuthMethod::Internal,
+        permission.to_string(),
+    )?)
+}
+
+/// Allocates the per-query identities one inactive attempt is leased under.
+///
+/// The two query identities are allocated independently on purpose: a leaked
+/// public identity into the distributed graph, or the reverse, is exactly what
+/// the stage authority's identity isolation exists to refuse.
+pub(crate) fn attempt_context() -> AnalyticalAttemptContext {
+    AnalyticalAttemptContext {
+        public_query_id: PublicQueryId::from_uuid(uuid::Uuid::now_v7()),
+        datafusion_query_id: DataFusionQueryId::from_uuid(uuid::Uuid::now_v7()),
+        snapshot_digest: format!("snapshot-{}", uuid::Uuid::now_v7().simple()),
+        permission_digest: format!("permission-{}", uuid::Uuid::now_v7().simple()),
+    }
+}
+
+/// Returns every node's live Analytical ownership, leader and follower halves.
+///
+/// # Errors
+///
+/// Returns an error when a node composed no Oracle or its ownership lock is
+/// poisoned.
+pub(crate) fn live_ownership(
+    cluster: &WyrdTestCluster,
+) -> Result<Vec<AnalyticalLiveInspection>, JourneyError> {
+    cluster
+        .servers()
+        .map(|server| {
+            let engine = server
+                .state()
+                .bifrost_query()
+                .ok_or("query node composed no Oracle")?
+                .engine();
+            let handle = engine
+                .analytical_execution()
+                .ok_or("Oracle composed no Analytical handle")?;
+            Ok(handle.live()?)
+        })
+        .collect()
+}
+
+/// Waits, under a bound, for every node to retain no Analytical ownership.
+///
+/// A follower settles on its own stage-operation path rather than with the
+/// leader's stream, so the assertion is a bounded convergence rather than an
+/// instantaneous read. It is bounded because a node that never converges is a
+/// leak, and reporting it as a timeout is the point.
+///
+/// # Errors
+///
+/// Returns the first inspection error, or a description of what a node still
+/// retained when the bound expired.
+pub(crate) async fn await_clean_nodes(cluster: &WyrdTestCluster) -> Result<(), JourneyError> {
+    for _ in 0..CLEAN_NODE_POLLS {
+        let live = live_ownership(cluster)?;
+        if live.iter().all(AnalyticalLiveInspection::is_clean) {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    Err(format!(
+        "nodes still retain Analytical ownership: {:?}",
+        live_ownership(cluster)?
+    )
+    .into())
+}
+
+/// Bound on how long terminal cleanup may take before it is called a leak.
+pub(crate) const CLEAN_NODE_POLLS: usize = 50;
+
+/// Left-table rows in the qualified Analytical baseline workload.
+///
+/// Wider than the right table so the join is not an identity.
+pub(crate) const ANALYTICAL_LEFT_ROWS: i64 = 400_000;
+
+/// Right-table rows in the qualified Analytical baseline workload.
+///
+/// The join key range that actually matches, and therefore the result's row
+/// count. Sized so the output sort's input exceeds one Analytical grant.
+pub(crate) const ANALYTICAL_RIGHT_ROWS: i64 = 300_000;
+
+/// Digits the baseline query left-pads each id to.
+pub(crate) const ANALYTICAL_KEY_DIGITS: usize = 6;
+
+/// Filler characters appended to each key, making every key exactly 1 KiB.
+pub(crate) const ANALYTICAL_KEY_FILLER: usize = 1018;
+
+/// Builds the qualified Analytical baseline statement over two fixture tables.
+///
+/// One equi-join, one fixed-width grouped aggregate, and one output sort over a
+/// key wide enough that the sort's input cannot fit an Analytical grant. Shared
+/// by the physical baseline and by the contention qualification that reuses the
+/// same admitted workload, so both are provably running one statement.
+pub(crate) fn analytical_baseline_sql(left: &str, right: &str) -> String {
+    format!(
+        "SELECT LPAD(CAST(l.id AS VARCHAR), {ANALYTICAL_KEY_DIGITS}, '0') ||          REPEAT('x', {ANALYTICAL_KEY_FILLER}) AS filter_key, COUNT(*) AS matched          FROM vala.bifrost.{left} AS l          JOIN vala.bifrost.{right} AS r ON l.id = r.id          GROUP BY l.id ORDER BY filter_key"
+    )
+}
+
+/// Recomputes the exact result [`analytical_baseline_sql`] must produce.
+///
+/// Generated from the fixture's own definition rather than from anything the
+/// cluster returned, so a query that silently dropped, duplicated, or reordered
+/// rows cannot agree with it.
+pub(crate) fn expected_analytical_digest() -> String {
+    let mut digest = Sha256::new();
+    for id in 0..ANALYTICAL_RIGHT_ROWS {
+        let key = format!(
+            "{id:0ANALYTICAL_KEY_DIGITS$}{filler}",
+            filler = "x".repeat(ANALYTICAL_KEY_FILLER)
+        );
+        digest.update(u32::try_from(key.len()).unwrap_or(u32::MAX).to_le_bytes());
+        digest.update(key.as_bytes());
+        digest.update(1_i64.to_le_bytes());
+    }
+    format!("{:x}", digest.finalize())
+}
+
 /// Return a collision-free SQL identifier for one serialized journey.
 pub(crate) fn unique_table(prefix: &str) -> String {
     format!("{prefix}_{}", uuid::Uuid::now_v7().simple())

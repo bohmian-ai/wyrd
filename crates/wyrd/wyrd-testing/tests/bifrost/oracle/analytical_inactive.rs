@@ -22,20 +22,14 @@ use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 use futures_util::StreamExt as _;
 use vala_bifrost_redux::oracle::QueryIpcDecoder;
-use vala_bifrost_redux::oracle::analytical::{
-    AnalyticalAttemptContext, AnalyticalLiveInspection, DataFusionQueryId, PublicQueryId,
-};
+use vala_bifrost_redux::oracle::analytical::DataFusionQueryId;
 use vala_bifrost_redux::oracle::analytical_supervisor::AnalyticalAttemptKey;
 use vala_bifrost_redux::oracle::telemetry::AnalyticalAttemptOutcome;
 use vala_sdk::BifrostGrpcTransport;
 use wyrd_client::WyrdClient;
-use wyrd_runtime::permission::PermissionSet;
-use wyrd_runtime::{Permission, Principal, PrincipalKind};
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::PrincipalId;
-use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
-    AuthMethod, BifrostQueryRequest, FreshnessPolicy, QueryStreamFrame, VisibilityMode,
+    BifrostQueryRequest, FreshnessPolicy, QueryStreamFrame, VisibilityMode,
 };
 use wyrd_testing::WyrdTestServer;
 use wyrd_testing::bifrost::{BifrostClusterSpec, WyrdTestCluster};
@@ -52,47 +46,6 @@ impl AnalyticalOutcome {
     /// Total rows across every decoded batch.
     fn rows(&self) -> usize {
         self.batches.iter().map(RecordBatch::num_rows).sum()
-    }
-}
-
-/// Builds one authenticated in-process query context for the fixture tenant.
-///
-/// The public SDK cannot reach the inactive path, so the journey authenticates
-/// the same way the public query service does — a tenant-bound principal
-/// holding exactly `bifrost:query:read` — and hands Oracle the identical
-/// context its own gRPC surface would have built.
-fn query_context(
-    tenant: DataTenantId,
-) -> Result<vala_bifrost_redux::oracle::AuthorizedQueryContext, JourneyError> {
-    let permission = Permission::bifrost_query_read();
-    let principal = Principal::new(
-        PrincipalId::new(uuid::Uuid::now_v7()),
-        PrincipalKind::User,
-        tenant,
-        Vec::new(),
-        PermissionSet::from_iter([permission.clone()]),
-    );
-    Ok(vala_bifrost_redux::oracle::AuthorizedQueryContext::try_new(
-        principal,
-        tenant,
-        RequestId::now_v7(),
-        None,
-        AuthMethod::Internal,
-        permission.to_string(),
-    )?)
-}
-
-/// Allocates the per-query identities one inactive attempt is leased under.
-///
-/// The two query identities are allocated independently on purpose: a leaked
-/// public identity into the distributed graph, or the reverse, is exactly what
-/// the stage authority's identity isolation exists to refuse.
-fn attempt_context() -> AnalyticalAttemptContext {
-    AnalyticalAttemptContext {
-        public_query_id: PublicQueryId::from_uuid(uuid::Uuid::now_v7()),
-        datafusion_query_id: DataFusionQueryId::from_uuid(uuid::Uuid::now_v7()),
-        snapshot_digest: format!("snapshot-{}", uuid::Uuid::now_v7().simple()),
-        permission_digest: format!("permission-{}", uuid::Uuid::now_v7().simple()),
     }
 }
 
@@ -219,60 +172,6 @@ async fn seed_table(cluster: &WyrdTestCluster, prefix: &str) -> Result<String, J
     cluster.refresh_oracle_snapshots().await?;
     Ok(table)
 }
-
-/// Returns every node's live Analytical ownership, leader and follower halves.
-///
-/// # Errors
-///
-/// Returns an error when a node composed no Oracle or its ownership lock is
-/// poisoned.
-fn live_ownership(
-    cluster: &WyrdTestCluster,
-) -> Result<Vec<AnalyticalLiveInspection>, JourneyError> {
-    cluster
-        .servers()
-        .map(|server| {
-            let engine = server
-                .state()
-                .bifrost_query()
-                .ok_or("query node composed no Oracle")?
-                .engine();
-            let handle = engine
-                .analytical_execution()
-                .ok_or("Oracle composed no Analytical handle")?;
-            Ok(handle.live()?)
-        })
-        .collect()
-}
-
-/// Waits, under a bound, for every node to retain no Analytical ownership.
-///
-/// A follower settles on its own stage-operation path rather than with the
-/// leader's stream, so the assertion is a bounded convergence rather than an
-/// instantaneous read. It is bounded because a node that never converges is a
-/// leak, and reporting it as a timeout is the point.
-///
-/// # Errors
-///
-/// Returns the first inspection error, or a description of what a node still
-/// retained when the bound expired.
-async fn await_clean_nodes(cluster: &WyrdTestCluster) -> Result<(), JourneyError> {
-    for _ in 0..CLEAN_NODE_POLLS {
-        let live = live_ownership(cluster)?;
-        if live.iter().all(AnalyticalLiveInspection::is_clean) {
-            return Ok(());
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-    Err(format!(
-        "nodes still retain Analytical ownership: {:?}",
-        live_ownership(cluster)?
-    )
-    .into())
-}
-
-/// Bound on how long terminal cleanup may take before it is called a leak.
-const CLEAN_NODE_POLLS: usize = 50;
 
 /// Builds one published-only strict request with the journey's deadline.
 fn request(sql: &str) -> BifrostQueryRequest {

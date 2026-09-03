@@ -1516,8 +1516,9 @@ impl ForgeWorker {
     /// Executes one already-claimed snapshot-expiry task through the real
     /// fenced path while phase activation is still owned by a later task.
     ///
-    /// Everything a production attempt does is reused: the same table binding,
-    /// the same table lease, [`Self::execute_fenced`], and the real
+    /// Everything a production attempt does is reused: the same
+    /// [`Self::validate_payload_contract`] gate, the same table binding, the
+    /// same table lease, [`Self::execute_fenced`], and the real
     /// [`Self::finish_claim_execution`] result. Only
     /// [`super::phase::admits_new_effect`] is bypassed, because snapshot
     /// expiration is not activated for production routing yet and refusing the
@@ -1526,7 +1527,8 @@ impl ForgeWorker {
     /// # Errors
     ///
     /// Returns [`ForgeError::Invariant`] when the claim is not an
-    /// exact snapshot-expiry task owned by this worker's attempt,
+    /// exact snapshot-expiry task owned by this worker's attempt, when it fails
+    /// the production payload contract,
     /// [`ForgeError::FenceLost`] when the table lease is held elsewhere, and
     /// every catalog, SQL, object-store, fencing, or audit failure the fenced
     /// execution itself raises.
@@ -1552,6 +1554,7 @@ impl ForgeWorker {
                 detail: "Forge worker received a claim owned by another attempt".to_owned(),
             });
         }
+        Self::validate_payload_contract(&claim)?;
         let binding = task_table_binding(
             claim.data_tenant_id,
             claim.execution_tenant_id,
@@ -2125,22 +2128,23 @@ impl ForgeWorker {
         Ok(false)
     }
 
-    /// Validates the closed strategy, payload contract, and phase without IO.
+    /// Validates the closed strategy and payload contract without IO.
     ///
-    /// This is the worker's pre-effect gate. It runs before the publication
-    /// lease, the table load, and every dispatch arm, so a claim it refuses has
-    /// touched no catalog, no object store, and no durable transition. Each
-    /// retained strategy keeps its own parameter contract here even while the
+    /// This is the phase-independent half of the worker's pre-effect gate: the
+    /// exact input set, the closed strategy, and that strategy's own parameter
+    /// contract. Each retained strategy keeps its contract here even while the
     /// activation boundary refuses it, because a strategy whose contract stops
     /// being checked is a strategy whose contract has quietly rotted by the
-    /// time its own activation task arrives.
+    /// time its own activation task arrives. It is separate from
+    /// [`Self::validate_payload`] so the snapshot-expiry test entrypoint, which
+    /// exists only because that one strategy is not phase-activated yet, still
+    /// enforces every contract production enforces.
     ///
     /// # Errors
     ///
     /// Returns an invariant error for an unknown or reserved strategy,
-    /// malformed parameters, an empty exact input set, or a strategy this
-    /// implementation phase has not activated.
-    fn validate_payload(task: &ForgeTaskClaim) -> Result<ForgeMetricStage, ForgeError> {
+    /// malformed parameters, or an empty exact input set.
+    fn validate_payload_contract(task: &ForgeTaskClaim) -> Result<ForgeMetricStage, ForgeError> {
         if task.plan.inputs.is_empty() {
             return Err(ForgeError::Invariant {
                 detail: "Forge task payload has no exact inputs".to_owned(),
@@ -2196,13 +2200,29 @@ impl ForgeWorker {
                 detail: "Forge task parameters do not match the strategy contract".to_owned(),
             });
         }
-        // The phase boundary is the last check rather than the first: a claim
-        // is refused for being malformed before it is refused for being early,
-        // so widening the phase later cannot turn a contract violation into a
-        // silently accepted task. This runs before the lease, the table load,
-        // and every dispatch arm, so a claim that reached durable state without
-        // passing the scheduler's admission gate still cannot produce a catalog
-        // or object-store effect.
+        Ok(stage)
+    }
+
+    /// Validates the payload contract and then this phase's activation.
+    ///
+    /// This is the worker's pre-effect gate. It runs before the publication
+    /// lease, the table load, and every dispatch arm, so a claim it refuses has
+    /// touched no catalog, no object store, and no durable transition.
+    ///
+    /// The phase boundary is the last check rather than the first: a claim is
+    /// refused for being malformed before it is refused for being early, so
+    /// widening the phase later cannot turn a contract violation into a
+    /// silently accepted task. A claim that reached durable state without
+    /// passing the scheduler's admission gate therefore still cannot produce a
+    /// catalog or object-store effect.
+    ///
+    /// # Errors
+    ///
+    /// Returns every [`Self::validate_payload_contract`] invariant, and an
+    /// invariant error for a strategy this implementation phase has not
+    /// activated.
+    fn validate_payload(task: &ForgeTaskClaim) -> Result<ForgeMetricStage, ForgeError> {
+        let stage = Self::validate_payload_contract(task)?;
         if !matches!(
             task.strategy,
             ForgeClaimStrategy::Known(strategy) if super::phase::admits_new_effect(strategy)

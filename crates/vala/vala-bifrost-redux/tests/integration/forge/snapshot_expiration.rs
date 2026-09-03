@@ -12,7 +12,7 @@ use std::sync::Arc;
 use chrono::Duration as ChronoDuration;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-use vala_bifrost_redux::forge::{ForgeWorker, ForgeWorkerConfig};
+use vala_bifrost_redux::forge::{ForgeError, ForgeWorker, ForgeWorkerConfig};
 use wyrd_spec::DataTenantId;
 
 use super::support::{
@@ -423,6 +423,84 @@ async fn expirable_table(name: &str, worker_routed: bool) -> ExpirableTable {
     }
 }
 
+/// Names one real manifest of the fixture table's current snapshot.
+///
+/// Maintenance planning takes the head snapshot's manifest entries as a task's
+/// exact inputs, so a seeded task that carries one of them has the same payload
+/// shape the production scheduler would have written.
+///
+/// # Panics
+///
+/// Panics when the table cannot be loaded, has no current snapshot, or its
+/// manifest list is empty.
+async fn head_manifest_path(fixture: &PromotionIntegrationFixture) -> String {
+    let table = fixture
+        .catalog
+        .iceberg_catalog()
+        .load_table(&fixture.binding.table_ident())
+        .await
+        .expect("fixture table loads");
+    let snapshot = table
+        .metadata()
+        .current_snapshot()
+        .expect("a promotion left a current snapshot");
+    let manifests = table
+        .manifest_list_reader(snapshot)
+        .load()
+        .await
+        .expect("the head manifest list loads");
+    manifests
+        .entries()
+        .iter()
+        .map(|manifest| manifest.manifest_path.clone())
+        .min()
+        .expect("the head snapshot has at least one manifest")
+}
+
+/// Asserts an unproven expiration retained the preparing worker's authority.
+///
+/// An uncertain outcome must leave the task `prepared`, every claim row in
+/// place, the operation `prepared`, no release audit of either kind, and the
+/// original attempt's immutable evidence unchanged — which together are what
+/// let a successor reconcile instead of re-expiring.
+///
+/// Returns the retained state so the caller can compare a later settlement
+/// against it.
+///
+/// # Panics
+///
+/// Panics when any of those owners moved, or when the claim evidence is
+/// missing or names another attempt.
+async fn assert_uncertain_preparation_retained(
+    fixture: &PromotionIntegrationFixture,
+    task: Uuid,
+    attempt: Uuid,
+    preparing_worker: Uuid,
+) -> ExpiryState {
+    let retained = expiry_state(fixture, task).await;
+    assert_eq!(retained.task_state, "prepared");
+    assert!(retained.claims > 0, "every claim survives uncertainty");
+    assert_eq!(retained.operation_phase.as_deref(), Some("prepared"));
+    assert!(
+        !retained
+            .audits
+            .contains(&"forge.snapshot_expire.reset".to_owned())
+            && !retained.audits.contains(&"forge.task.cancelled".to_owned()),
+        "an uncertain outcome releases nothing: {:?}",
+        retained.audits
+    );
+    let preparing_evidence: (Uuid, Uuid, Uuid) = sqlx::query_as(
+        "SELECT task_id, attempt_id, worker_id FROM vala.forge_snapshot_expiration_claims \
+         WHERE task_id = $1 LIMIT 1",
+    )
+    .bind(task)
+    .fetch_one(fixture.operator_pool.pool())
+    .await
+    .expect("immutable preparation evidence");
+    assert_eq!(preparing_evidence, (task, attempt, preparing_worker));
+    retained
+}
+
 /// Counts the snapshots the real catalog still retains for the fixture table.
 ///
 /// Expiration removes ancestry rather than moving the head, so the retained
@@ -490,27 +568,8 @@ async fn retryable_catalog_failure_retains_prepared_authority() {
         retained_snapshots(&fixture).await < snapshots_before,
         "the catalog accepted the expiration before the response was lost"
     );
-    let retained = expiry_state(&fixture, task).await;
-    assert_eq!(retained.task_state, "prepared");
-    assert!(retained.claims > 0, "every claim survives uncertainty");
-    assert_eq!(retained.operation_phase.as_deref(), Some("prepared"));
-    assert!(
-        !retained
-            .audits
-            .contains(&"forge.snapshot_expire.reset".to_owned())
-            && !retained.audits.contains(&"forge.task.cancelled".to_owned()),
-        "an uncertain outcome releases nothing: {:?}",
-        retained.audits
-    );
-    let preparing_evidence: (Uuid, Uuid, Uuid) = sqlx::query_as(
-        "SELECT task_id, attempt_id, worker_id FROM vala.forge_snapshot_expiration_claims \
-         WHERE task_id = $1 LIMIT 1",
-    )
-    .bind(task)
-    .fetch_one(fixture.operator_pool.pool())
-    .await
-    .expect("immutable preparation evidence");
-    assert_eq!(preparing_evidence, (task, attempt, preparing_worker));
+    let retained =
+        assert_uncertain_preparation_retained(&fixture, task, attempt, preparing_worker).await;
     assert_eq!(
         store.deletes(),
         deletes_before,
@@ -571,11 +630,15 @@ async fn retryable_catalog_failure_retains_prepared_authority() {
 /// Seeds one ready `snapshot_expiry` task with a valid executable envelope.
 ///
 /// A ready row is what the production claim transaction consumes, so the test
-/// drives the same admission path a supervised worker would.
+/// drives the same admission path a supervised worker would. The plan carries
+/// one real head manifest as its exact input, because the production worker
+/// refuses a maintenance payload with no inputs before it reaches any other
+/// gate — a seeded empty plan would prove settlement against a task shape
+/// production never executes.
 ///
 /// # Panics
 ///
-/// Panics when the seeding statement fails.
+/// Panics when the fixture has no head manifest or the seeding statement fails.
 async fn seed_ready_expiry_task(
     fixture: &PromotionIntegrationFixture,
     watermark: (i64, i64),
@@ -583,9 +646,14 @@ async fn seed_ready_expiry_task(
 ) -> Uuid {
     let task_id = Uuid::now_v7();
     let (base_snapshot_id, _) = watermark;
+    let plan = serde_json::json!({
+        "version": 1,
+        "inputs": [head_manifest_path(fixture).await],
+        "parameters": {"kind": "maintenance", "trigger_commit_count": 1},
+    });
     sqlx::query(
         "INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,namespace_name,table_name,strategy,lane,base_snapshot_id,plan,plan_hash,estimated_files,estimated_bytes,estimated_parallelism,estimated_memory_bytes,estimated_spill_bytes,large_task_ceiling_bytes,state,ready_at,envelope_version,decoded_batch_bytes,decoded_input_bytes,sort_working_bytes,sort_merge_reservation_bytes,encoder_buffer_bytes,upload_chunk_bytes,footer_encoded_bytes,footer_decode_workspace_bytes,sort_spill_bytes) \
-         VALUES ($1,$2,'wyrd-redux',$3,$4,'snapshot_expiry','ordinary',$5,'{\"version\":1,\"inputs\":[],\"parameters\":{\"kind\":\"maintenance\",\"trigger_commit_count\":1}}'::jsonb,decode(repeat($6,32),'hex'),1,1,1,41943040,1024,1,'ready',now(),2,1024,1024,3072,1024,1024,1024,8388608,33554432,1024)",
+         VALUES ($1,$2,'wyrd-redux',$3,$4,'snapshot_expiry','ordinary',$5,$7,decode(repeat($6,32),'hex'),1,1,1,41943040,1024,1,'ready',now(),2,1024,1024,3072,1024,1024,1024,8388608,33554432,1024)",
     )
     .bind(task_id)
     .bind(fixture.tenant.as_uuid())
@@ -593,6 +661,7 @@ async fn seed_ready_expiry_task(
     .bind(&fixture.binding.table_ref.name)
     .bind(base_snapshot_id)
     .bind(plan_hash_byte)
+    .bind(plan)
     .execute(fixture.operator_pool.pool())
     .await
     .expect("ready snapshot-expiry task seeds");
@@ -635,6 +704,25 @@ async fn worker_settled_expiration_returns_success_without_a_second_transition()
     assert_eq!(claim.task_id, task, "the seeded task is the claimed task");
     let before = expiry_state(&fixture, task).await;
     let deletes_before = store.deletes();
+
+    // The entrypoint bypasses phase activation and nothing else: the same
+    // payload contract production applies before its lease must still refuse a
+    // claim whose exact inputs were cleared, without touching durable state.
+    let mut without_inputs = claim.clone();
+    without_inputs.plan.inputs.clear();
+    let refused = worker
+        .execute_snapshot_expiry_claim_for_test(without_inputs, &CancellationToken::new())
+        .await
+        .expect_err("a maintenance claim with no exact inputs is refused");
+    assert!(
+        matches!(&refused, ForgeError::Invariant { detail } if detail.contains("no exact inputs")),
+        "the refusal is the production payload-contract invariant: {refused}"
+    );
+    assert_eq!(
+        expiry_state(&fixture, task).await,
+        before,
+        "a refused payload leaves the claimed task, its claims, and its audits untouched"
+    );
 
     worker
         .execute_snapshot_expiry_claim_for_test(claim, &CancellationToken::new())
@@ -713,6 +801,44 @@ async fn object_exists(fixture: &PromotionIntegrationFixture, path: &str) -> boo
     }
 }
 
+/// Asserts an expiration left one never-published object to the orphan owner.
+///
+/// Expiration must neither delete the object nor invoke physical cleanup at
+/// all, and the independent orphan strategy must still reclaim exactly that
+/// candidate afterwards — which is what proves the object was a genuine orphan
+/// the expiration merely declined to touch.
+///
+/// # Panics
+///
+/// Panics when the expiration deleted anything, or when the orphan owner does
+/// not delete exactly its one candidate.
+async fn assert_orphan_survives_expiration(
+    table: &ExpirableTable,
+    orphan: &str,
+    deletes_before: usize,
+) {
+    assert!(
+        object_exists(&table.fixture, orphan).await,
+        "expiration deleted a never-published object"
+    );
+    assert_eq!(
+        table.store.deletes(),
+        deletes_before,
+        "expiration invoked physical cleanup"
+    );
+    let deleted = table
+        .supervised
+        .forge()
+        .run_orphan_gc_for_test(&table.fixture.binding)
+        .await
+        .expect("the independent orphan strategy runs");
+    assert_eq!(deleted, 1, "the orphan owner deletes exactly its candidate");
+    assert!(
+        !object_exists(&table.fixture, orphan).await,
+        "the orphan owner did not delete the object it reported"
+    );
+}
+
 /// Proves neither fresh nor recovered expiration deletes a never-published object.
 ///
 /// Each half runs on its own table: one pass expires every eligible ancestor,
@@ -749,27 +875,7 @@ async fn worker_expiration_never_runs_orphan_cleanup() {
         expiry_state(&fresh.fixture, fresh_task).await.task_state,
         "succeeded"
     );
-    assert!(
-        object_exists(&fresh.fixture, &orphan).await,
-        "fresh expiration deleted a never-published object"
-    );
-    assert_eq!(
-        fresh.store.deletes(),
-        deletes_before,
-        "fresh expiration invoked physical cleanup"
-    );
-    // The retained owner, and only it, may reclaim the same object.
-    let deleted = fresh
-        .supervised
-        .forge()
-        .run_orphan_gc_for_test(&fresh.fixture.binding)
-        .await
-        .expect("the independent orphan strategy runs");
-    assert_eq!(deleted, 1, "the orphan owner deletes exactly its candidate");
-    assert!(
-        !object_exists(&fresh.fixture, &orphan).await,
-        "the orphan owner did not delete the object it reported"
-    );
+    assert_orphan_survives_expiration(&fresh, &orphan, deletes_before).await;
     fresh.supervised.shutdown().await;
 
     let recovered = expirable_table("expiry_no_orphan_takeover", true).await;
@@ -813,24 +919,7 @@ async fn worker_expiration_never_runs_orphan_cleanup() {
             .task_state,
         "succeeded"
     );
-    assert!(
-        object_exists(&recovered.fixture, &orphan).await,
-        "recovered expiration deleted a never-published object"
-    );
-    assert_eq!(
-        recovered.store.deletes(),
-        deletes_before,
-        "recovered expiration invoked physical cleanup"
-    );
-    let deleted = forge
-        .run_orphan_gc_for_test(&recovered.fixture.binding)
-        .await
-        .expect("the independent orphan strategy runs");
-    assert_eq!(deleted, 1, "the orphan owner deletes exactly its candidate");
-    assert!(
-        !object_exists(&recovered.fixture, &orphan).await,
-        "the orphan owner did not delete the object it reported"
-    );
+    assert_orphan_survives_expiration(&recovered, &orphan, deletes_before).await;
 
     recovered.supervised.shutdown().await;
 }

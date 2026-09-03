@@ -2348,6 +2348,192 @@ pub(in crate::oracle) mod tests {
         assert_eq!(clean.queued_queries, 0);
     }
 
+    /// Queues one waiter directly so several requests contend in a single pass.
+    ///
+    /// Production enqueues run a grant pass on every arrival. Tenant rotation and
+    /// the multi-tenant ceiling are only observable once the queue already holds
+    /// the competing requests, so this seeds the queue and the caller runs one
+    /// pass by hand.
+    fn push_waiter(
+        shared: &Arc<AdmissionShared>,
+        class_kind: AdmissionClass,
+        tenant: DataTenantId,
+        id: u64,
+        deadline: Instant,
+    ) -> tokio::sync::oneshot::Receiver<Grant> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut state = shared.state.lock().expect("state");
+        let class = match class_kind {
+            AdmissionClass::Interactive => &mut state.interactive,
+            AdmissionClass::Analytical => &mut state.analytical,
+        };
+        let index = class.tenant_index(tenant);
+        class.tenants[index].1.waiters.push_back(Waiter {
+            id,
+            deadline,
+            local_ratio: 0.0,
+            tx,
+        });
+        state.queued += 1;
+        rx
+    }
+
+    /// Runs one complete grant pass exactly as a release or arrival would.
+    fn drain_grants(shared: &Arc<AdmissionShared>) {
+        let notifications = {
+            let mut state = shared.state.lock().expect("state");
+            grant_waiters(shared, &mut state)
+        };
+        notify_grants(shared, notifications);
+    }
+
+    /// A saturated Analytical class never consumes Interactive capacity, per-tenant
+    /// FIFO holds, and the tenant cursor grants a waiting peer tenant before it
+    /// returns to the first tenant.
+    ///
+    /// Rejection is checked against the same process root so a refused request is
+    /// proven to leave class, tenant, memory, scratch, and slot ownership exactly
+    /// where it found it.
+    #[test]
+    fn analytical_saturation_preserves_interactive_floor_and_rotates_tenants() {
+        let resources = test_resources();
+        let config = OracleAdmissionConfig {
+            interactive_slots: 2,
+            analytical_slots: 1,
+            single_tenant_ceiling: 2,
+            multi_tenant_ceiling: 1,
+            ..Default::default()
+        };
+        let owner = owner_with_resources(config, resources.clone());
+        let shared = Arc::clone(&owner.shared);
+        let baseline = resources.snapshot().expect("root baseline");
+        let tenant_a = DataTenantId::new_v7();
+        let tenant_b = DataTenantId::new_v7();
+        let deadline = Instant::now() + Duration::from_secs(30);
+
+        let mut analytical =
+            push_waiter(&shared, AdmissionClass::Analytical, tenant_a, 1, deadline);
+        let mut first_a = push_waiter(&shared, AdmissionClass::Interactive, tenant_a, 2, deadline);
+        let mut second_a = push_waiter(&shared, AdmissionClass::Interactive, tenant_a, 3, deadline);
+        let mut first_b = push_waiter(&shared, AdmissionClass::Interactive, tenant_b, 4, deadline);
+        drain_grants(&shared);
+
+        let analytical_grant = analytical.try_recv().expect("analytical class grant");
+        let first_a_grant = first_a
+            .try_recv()
+            .expect("interactive tenant A is grantable while the analytical class is full");
+        let first_b_grant = first_b
+            .try_recv()
+            .expect("the tenant cursor reaches peer tenant B before tenant A repeats");
+        assert!(
+            second_a.try_recv().is_err(),
+            "the multi-tenant ceiling holds tenant A's second interactive request"
+        );
+        {
+            let state = shared.state.lock().expect("state");
+            assert_eq!(state.analytical.used, 1);
+            assert_eq!(state.interactive.used, 2);
+            assert_eq!(state.interactive.tenants[0].1.active, 1);
+            assert_eq!(state.interactive.tenants[1].1.active, 1);
+            assert_eq!(state.queued, 1);
+        }
+
+        owner.rollback_grant(first_b_grant);
+        let second_a_grant = second_a
+            .try_recv()
+            .expect("tenant A's queued request is granted once the peer tenant releases");
+        assert_eq!(shared.state.lock().expect("state").queued, 0);
+
+        owner.rollback_grant(first_a_grant);
+        owner.rollback_grant(second_a_grant);
+        owner.rollback_grant(analytical_grant);
+        {
+            let state = shared.state.lock().expect("state");
+            assert_eq!(state.interactive.used, 0);
+            assert_eq!(state.analytical.used, 0);
+            assert_eq!(state.interactive.memory_used, 0);
+            assert_eq!(state.analytical.memory_used, 0);
+            assert_eq!(state.spill_used, 0);
+            assert_eq!(state.active_queries, 0);
+            assert!(
+                state
+                    .interactive
+                    .tenants
+                    .iter()
+                    .chain(state.analytical.tenants.iter())
+                    .all(|(_, queue)| queue.active == 0 && queue.waiters.is_empty())
+            );
+        }
+        assert_eq!(
+            resources.snapshot().expect("released root"),
+            baseline,
+            "every granted envelope returns to the process root"
+        );
+
+        let rejecting = owner_with_resources(
+            OracleAdmissionConfig {
+                interactive_slots: 1,
+                queue_capacity: 1,
+                ..config
+            },
+            resources.clone(),
+        );
+        let mut held = rejecting
+            .enqueue_waiter(
+                tenant_a,
+                AdmissionClass::Interactive,
+                0.0,
+                deadline,
+                QueryClass::Interactive,
+            )
+            .expect("first interactive request is admitted");
+        let mut waiting = rejecting
+            .enqueue_waiter(
+                tenant_a,
+                AdmissionClass::Interactive,
+                0.0,
+                deadline,
+                QueryClass::Interactive,
+            )
+            .expect("second interactive request occupies the finite queue");
+        let before_rejection = resources.snapshot().expect("pre-rejection root");
+        let rejected = rejecting.enqueue_waiter(
+            tenant_a,
+            AdmissionClass::Interactive,
+            0.0,
+            deadline,
+            QueryClass::Interactive,
+        );
+        assert!(matches!(
+            rejected,
+            Err(BifrostError::QueryAdmissionRejected)
+        ));
+        {
+            let state = rejecting.shared.state.lock().expect("state");
+            assert_eq!(state.interactive.used, 1);
+            assert_eq!(state.queued, 1);
+            assert_eq!(state.active_queries, 1);
+        }
+        assert_eq!(
+            resources.snapshot().expect("post-rejection root"),
+            before_rejection,
+            "a refused request charges no class, tenant, memory, scratch, or slot ownership"
+        );
+
+        let held_grant = held.receiver.try_recv().expect("held interactive grant");
+        rejecting.rollback_grant(held_grant);
+        let waiting_grant = waiting
+            .receiver
+            .try_recv()
+            .expect("the queued request is granted by the release");
+        rejecting.rollback_grant(waiting_grant);
+        assert_eq!(
+            resources.snapshot().expect("final root"),
+            baseline,
+            "rejection and release leave the process root at its exact baseline"
+        );
+    }
+
     /// Local probe release remains idempotent through its watch state.
     #[test]
     fn admission_module_compiles() {}

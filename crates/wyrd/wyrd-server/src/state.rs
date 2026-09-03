@@ -1123,6 +1123,53 @@ pub enum QueryStreamFault {
     EofAfterBatch = 2,
     /// Stall the next query after its schema until the HTTP body is cancelled.
     StallAfterSchema = 3,
+    /// Bind the next query's resource probe to a waiting observer and change nothing else.
+    CaptureProbe = 4,
+}
+
+/// Notification-backed one-shot binding of one query's resource probe.
+///
+/// This is deliberately not a fault. `StallAfterSchema` exists to hold a body
+/// open so a cancellation can be observed, and it therefore owns and eventually
+/// cancels the stream. A journey that needs the *successful* path's resource
+/// evidence cannot use it, so this observes the same probe and leaves the
+/// stream entirely to its real caller.
+#[cfg(feature = "test-support")]
+#[derive(Debug, Default)]
+pub struct QueryStreamProbeCapture {
+    /// The probe of the query that claimed this capture.
+    probe: std::sync::Mutex<Option<Arc<vala_bifrost_redux::oracle::QueryResourceProbe>>>,
+    /// Wakes a waiter once the route has bound the probe.
+    bound: tokio::sync::Notify,
+}
+
+#[cfg(feature = "test-support")]
+impl QueryStreamProbeCapture {
+    /// Binds the claiming query's probe and wakes any waiter.
+    pub fn bind(&self, probe: Arc<vala_bifrost_redux::oracle::QueryResourceProbe>) {
+        if let Ok(mut current) = self.probe.lock() {
+            *current = Some(probe);
+        }
+        self.bound.notify_waiters();
+    }
+
+    /// Returns the bound probe, waiting without polling until one arrives.
+    ///
+    /// The waiter is registered before the current binding is observed, because
+    /// [`tokio::sync::Notify::notify_waiters`] wakes only already-registered
+    /// waiters; observing first would lose a binding that lands in between and
+    /// park this caller forever.
+    pub async fn wait_resource_probe(&self) -> Arc<vala_bifrost_redux::oracle::QueryResourceProbe> {
+        loop {
+            let notified = self.bound.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(probe) = self.probe.lock().ok().and_then(|probe| probe.clone()) {
+                return probe;
+            }
+            notified.await;
+        }
+    }
 }
 
 /// Notification-backed lifecycle state for one stalled test-tier query body.
@@ -1199,6 +1246,8 @@ pub struct QueryStreamFaultController {
     next: Arc<AtomicU8>,
     /// Lifecycle state retained for the one scheduled stall probe.
     stall: Arc<std::sync::Mutex<Option<Arc<QueryStreamStall>>>>,
+    /// Observer retained for the one armed passive probe capture.
+    capture: Arc<std::sync::Mutex<Option<Arc<QueryStreamProbeCapture>>>>,
 }
 
 /// Atomic control-audit fault owned by a test server instance.
@@ -1245,6 +1294,21 @@ impl QueryStreamFaultController {
         stall
     }
 
+    /// Arms one passive capture of the next query's resource probe.
+    ///
+    /// Stored beside the existing atomic next-query fault, so arming a capture
+    /// and scheduling a truncation remain the same one-shot slot: a journey
+    /// cannot accidentally observe a query it also truncated.
+    #[must_use]
+    pub fn capture_next_probe(&self) -> Arc<QueryStreamProbeCapture> {
+        let capture = Arc::new(QueryStreamProbeCapture::default());
+        if let Ok(mut current) = self.capture.lock() {
+            *current = Some(Arc::clone(&capture));
+        }
+        self.set_next(QueryStreamFault::CaptureProbe);
+        capture
+    }
+
     /// Claim and clear the one-shot fault atomically.
     #[must_use]
     pub fn claim(&self) -> Option<QueryStreamFault> {
@@ -1252,8 +1316,18 @@ impl QueryStreamFaultController {
             1 => Some(QueryStreamFault::EofAfterSchema),
             2 => Some(QueryStreamFault::EofAfterBatch),
             3 => Some(QueryStreamFault::StallAfterSchema),
+            4 => Some(QueryStreamFault::CaptureProbe),
             _ => None,
         }
+    }
+
+    /// Takes the observer paired with a claimed probe capture.
+    #[must_use]
+    pub fn claim_capture(&self) -> Option<Arc<QueryStreamProbeCapture>> {
+        self.capture
+            .lock()
+            .ok()
+            .and_then(|mut capture| capture.take())
     }
 
     /// Takes the lifecycle state paired with a claimed schema stall.

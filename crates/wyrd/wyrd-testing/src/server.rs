@@ -1170,6 +1170,20 @@ impl WyrdTestServer {
         }
     }
 
+    /// Arms one passive capture of the next query's resource probe.
+    ///
+    /// The returned observer is the caller's to hold and await; unlike the
+    /// schema stall, nothing here owns, truncates, stalls, or cancels the
+    /// stream, so the query still drains entirely through its real public
+    /// client. Only the arm operation is delegated, so no harness slot retains
+    /// the capture.
+    #[must_use]
+    pub fn capture_next_query_resource_probe(
+        &self,
+    ) -> Arc<wyrd_server::state::QueryStreamProbeCapture> {
+        self.inner.query_stream_fault.capture_next_probe()
+    }
+
     /// Wait until the scheduled query reaches its schema stall.
     ///
     /// # Errors

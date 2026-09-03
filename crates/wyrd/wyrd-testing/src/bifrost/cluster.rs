@@ -229,6 +229,27 @@ impl BifrostClusterSpec {
         }
     }
 
+    /// Construct three Oracle-only nodes and one Scribe-only node.
+    ///
+    /// The smallest topology that puts real distributed stages on real peers:
+    /// a coordinator is not a participant in its own worker set, so two remote
+    /// Oracles are required, and separating the publisher keeps the query nodes
+    /// carrying nothing but the read path whose capacity is under test.
+    #[must_use]
+    pub fn three_oracles_one_scribe() -> Self {
+        Self {
+            nodes: vec![
+                Self::node(1, [BifrostRuntimeRole::Oracle]),
+                Self::node(2, [BifrostRuntimeRole::Oracle]),
+                Self::node(3, [BifrostRuntimeRole::Oracle]),
+                Self::node(4, [BifrostRuntimeRole::Scribe]),
+            ],
+            scribe_geometry_for_test: None,
+            scribe_persistence_faults_for_test: None,
+            storage_io: wyrd_server::config::BifrostStorageIoConfig::default(),
+        }
+    }
+
     /// Construct six mixed capacity nodes.
     #[must_use]
     pub fn six_capacity() -> Self {
@@ -1964,6 +1985,33 @@ impl WyrdTestCluster {
             metric_families: self.telemetry.families(),
             span_names: self.telemetry.span_names(),
         })
+    }
+
+    /// Projects every Oracle node's live root resource ownership.
+    ///
+    /// One entry per node that composed an Oracle, in cluster order. The
+    /// snapshot is the production root's own, so a journey asserting that
+    /// Scribe, Oracle, and Forge together stay inside the managed budget is
+    /// reading the same accounting admission refuses against.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClusterError::Resource`] when a node's root accounting is
+    /// poisoned and cannot produce a trustworthy snapshot.
+    pub fn oracle_resource_snapshots(
+        &self,
+    ) -> Result<Vec<vala_bifrost_redux::resources::ResourceSnapshot>, ClusterError> {
+        self.servers
+            .values()
+            .flatten()
+            .filter_map(|server| server.state().bifrost_resources())
+            .filter(|resources| resources.oracle().is_some())
+            .map(|resources| {
+                resources
+                    .snapshot()
+                    .map_err(|error| ClusterError::Resource(error.to_string()))
+            })
+            .collect()
     }
 
     /// Observe that every running Scribe exposes the requested live stream.

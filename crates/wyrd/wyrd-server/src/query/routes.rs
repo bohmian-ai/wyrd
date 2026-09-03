@@ -221,6 +221,17 @@ pub(crate) async fn sync_query(
             .and_then(|controller| controller.claim_stall()),
         _ => None,
     };
+    // Passive: the capture reads this query's probe and returns the stream
+    // untouched to its real caller, so the body below sees no fault at all.
+    #[cfg(feature = "test-support")]
+    if matches!(fault, Some(crate::state::QueryStreamFault::CaptureProbe))
+        && let Some(capture) = state
+            .query_stream_fault
+            .as_ref()
+            .and_then(|controller| controller.claim_capture())
+    {
+        capture.bind(result.resource_probe_for_test());
+    }
     #[cfg(not(feature = "test-support"))]
     let fault = None;
     #[cfg(not(feature = "test-support"))]

@@ -3209,7 +3209,8 @@ impl BifrostResourceGovernor {
         state.oracle_query_memory_used_bytes = next_query_memory;
         state.oracle_query_scratch_used_bytes = next_query_scratch;
         record_memory_transition("oracle", "acquired", next_memory);
-        let memory_pool = bounded_memory_pool(granted_memory_bytes);
+        let memory_peak_bytes = Arc::new(AtomicUsize::new(0));
+        let memory_pool = observed_query_memory_pool(granted_memory_bytes, &memory_peak_bytes);
         Ok(OracleQueryResources {
             query_class: request.query_class,
             memory_bytes: request.memory_bytes,
@@ -3218,6 +3219,7 @@ impl BifrostResourceGovernor {
             slot_units: request.slot_units,
             target_partitions,
             memory_pool,
+            memory_peak_bytes,
             nested_scratch_used_bytes: Arc::new(Mutex::new(0)),
             governor: self.clone(),
             released: false,
@@ -4142,6 +4144,13 @@ pub struct OracleQueryResources {
     pub target_partitions: usize,
     /// One shared pool used by `DataFusion` and every query-owned Wyrd consumer.
     memory_pool: Arc<dyn MemoryPool>,
+    /// Largest reservation this query's own pool has held, in bytes.
+    ///
+    /// Query-local rather than process-global: a journey that runs several
+    /// queries concurrently needs each one's peak attributable to the grant it
+    /// was admitted under. Only the observing pool wrapper writes it, so it
+    /// stays zero on a build without `test-support`.
+    memory_peak_bytes: Arc<AtomicUsize>,
     /// Query-local scratch children split from the already admitted envelope.
     nested_scratch_used_bytes: Arc<Mutex<u64>>,
     governor: BifrostResourceGovernor,
@@ -4155,6 +4164,15 @@ impl OracleQueryResources {
     #[must_use]
     pub fn memory_pool(&self) -> Arc<dyn MemoryPool> {
         Arc::clone(&self.memory_pool)
+    }
+
+    /// Returns the query-local counter the observing pool records peaks into.
+    ///
+    /// The counter is shared, not copied: an owner that transfers this envelope
+    /// away still names the same peak the pool keeps updating.
+    #[must_use]
+    pub fn memory_peak_bytes(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.memory_peak_bytes)
     }
 
     /// Reports whether every nested child of this query envelope is gone.
@@ -4758,16 +4776,45 @@ pub fn oracle_partitions_for_work(admitted_ceiling: usize, work_units: usize) ->
 /// a zero-byte envelope.
 #[must_use]
 pub(crate) fn bounded_memory_pool(limit_bytes: usize) -> Arc<dyn MemoryPool> {
-    let pool: Arc<dyn MemoryPool> = Arc::new(TrackConsumersPool::new(
-        FairSpillPool::new(limit_bytes.max(1)),
-        NonZeroUsize::new(16).unwrap_or(NonZeroUsize::MIN),
-    ));
+    let pool = finite_pool(limit_bytes);
     #[cfg(any(test, feature = "test-support"))]
     {
-        Arc::new(PeakTrackingMemoryPool::new(pool))
+        Arc::new(PeakTrackingMemoryPool::new(pool, None))
     }
     #[cfg(not(any(test, feature = "test-support")))]
     pool
+}
+
+/// Builds the production finite pool every Bifrost owner allocates from.
+fn finite_pool(limit_bytes: usize) -> Arc<dyn MemoryPool> {
+    Arc::new(TrackConsumersPool::new(
+        FairSpillPool::new(limit_bytes.max(1)),
+        NonZeroUsize::new(16).unwrap_or(NonZeroUsize::MIN),
+    ))
+}
+
+/// Builds one admitted query's pool, recording its peak into `peak`.
+///
+/// The pool itself is [`bounded_memory_pool`]'s: admission, fairness, and
+/// spilling behavior are identical. Only a `test-support` build attaches the
+/// observing wrapper, so on a production build `peak` is never written and the
+/// allocation path gains nothing.
+pub(crate) fn observed_query_memory_pool(
+    limit_bytes: usize,
+    peak: &Arc<AtomicUsize>,
+) -> Arc<dyn MemoryPool> {
+    #[cfg(any(test, feature = "test-support"))]
+    {
+        Arc::new(PeakTrackingMemoryPool::new(
+            finite_pool(limit_bytes),
+            Some(Arc::clone(peak)),
+        ))
+    }
+    #[cfg(not(any(test, feature = "test-support")))]
+    {
+        let _ = peak;
+        bounded_memory_pool(limit_bytes)
+    }
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -4822,18 +4869,28 @@ pub fn memory_consumer_peak_for_test(fragment: &str) -> usize {
 struct PeakTrackingMemoryPool {
     /// Production finite pool receiving every accounting operation unchanged.
     inner: Arc<dyn MemoryPool>,
+    /// Optional pool-local peak, present when one query owns this pool.
+    ///
+    /// The process-global ledger below cannot answer "did *this* query stay
+    /// within *its* grant" once two queries run at once, which is exactly the
+    /// question a contention journey asks.
+    query_peak: Option<Arc<AtomicUsize>>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
 impl PeakTrackingMemoryPool {
     /// Wraps one production pool for observation only.
-    fn new(inner: Arc<dyn MemoryPool>) -> Self {
-        Self { inner }
+    fn new(inner: Arc<dyn MemoryPool>, query_peak: Option<Arc<AtomicUsize>>) -> Self {
+        Self { inner, query_peak }
     }
 
     /// Records the current reservation after a successful growth operation.
     fn observe(&self, reservation: &MemoryReservation) {
-        TEST_MEMORY_PEAK_BYTES.fetch_max(self.inner.reserved(), Ordering::AcqRel);
+        let reserved = self.inner.reserved();
+        if let Some(peak) = &self.query_peak {
+            peak.fetch_max(reserved, Ordering::AcqRel);
+        }
+        TEST_MEMORY_PEAK_BYTES.fetch_max(reserved, Ordering::AcqRel);
         TEST_MEMORY_CONSUMER_PEAKS
             .lock()
             .expect("test memory peak ledger lock remains available")

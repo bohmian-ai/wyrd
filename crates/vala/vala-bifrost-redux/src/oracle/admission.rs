@@ -5,7 +5,7 @@
 //! decision; asynchronous callers wait only on their own one-shot channel.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -253,6 +253,8 @@ struct LocalPermit {
 struct RetainedQuerySessionShape {
     /// The tracked pool every operator of this query allocates from.
     pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
+    /// The peak counter that pool records into, shared with the envelope.
+    memory_peak_bytes: Arc<AtomicUsize>,
     /// The memory ceiling admission granted this query.
     granted_memory_bytes: usize,
     /// Adaptive partition count derived from that grant.
@@ -357,6 +359,15 @@ pub struct QueryResourceSnapshot {
     pub peer_slots: u64,
     /// Live-tail fences retained by this query.
     pub tail_fences: u64,
+    /// Memory ceiling admission issued this exact query.
+    ///
+    /// Fixed at admission and never renegotiated, so it is the bound every
+    /// other reservation figure here is meaningful against.
+    pub granted_memory_bytes: u64,
+    /// Bytes this query's own `DataFusion` pool currently holds.
+    pub pool_current_bytes: u64,
+    /// Largest reservation this query's own pool has ever held.
+    pub pool_peak_bytes: u64,
 }
 
 #[cfg(feature = "test-support")]
@@ -366,20 +377,43 @@ pub struct QueryResourceProbe {
     query_id: QueryId,
     /// Latest exact resource ownership and notification channel.
     snapshot: tokio::sync::watch::Sender<QueryResourceSnapshot>,
+    /// This query's own admitted pool, read live rather than sampled on release.
+    pool: Option<Arc<dyn datafusion::execution::memory_pool::MemoryPool>>,
+    /// Peak counter the admitted pool writes after each successful growth.
+    memory_peak_bytes: Option<Arc<AtomicUsize>>,
 }
 
 #[cfg(feature = "test-support")]
 impl QueryResourceProbe {
     /// Creates the probe after local admission and before stream construction.
+    ///
+    /// `shape` is the query's retained envelope projection; it is absent only
+    /// for a synthetic guard that never held an admitted envelope, and the
+    /// grant, current, and peak observations are then all zero.
     #[must_use]
-    fn new(query_id: QueryId, memory_bytes: u64, slot_units: u64) -> Self {
+    fn new(
+        query_id: QueryId,
+        memory_bytes: u64,
+        slot_units: u64,
+        shape: Option<&RetainedQuerySessionShape>,
+    ) -> Self {
         let (snapshot, _) = tokio::sync::watch::channel(QueryResourceSnapshot {
             admission_slots: slot_units,
             memory_bytes,
             peer_slots: slot_units,
             tail_fences: 0,
+            granted_memory_bytes: shape.map_or(0, |shape| {
+                u64::try_from(shape.granted_memory_bytes).unwrap_or(u64::MAX)
+            }),
+            pool_current_bytes: 0,
+            pool_peak_bytes: 0,
         });
-        Self { query_id, snapshot }
+        Self {
+            query_id,
+            snapshot,
+            pool: shape.map(|shape| Arc::clone(&shape.pool)),
+            memory_peak_bytes: shape.map(|shape| Arc::clone(&shape.memory_peak_bytes)),
+        }
     }
     /// Returns the existing Oracle query identity.
     #[must_use]
@@ -387,9 +421,21 @@ impl QueryResourceProbe {
         self.query_id
     }
     /// Returns current exact ownership for this query only.
+    ///
+    /// Pool current and peak are read from the live owners rather than from the
+    /// watch channel, so an observation taken while the query is still running
+    /// reports what it holds now rather than what it held at admission.
     #[must_use]
     pub fn snapshot(&self) -> QueryResourceSnapshot {
-        *self.snapshot.borrow()
+        let mut snapshot = *self.snapshot.borrow();
+        snapshot.pool_current_bytes = self
+            .pool
+            .as_ref()
+            .map_or(0, |pool| u64::try_from(pool.reserved()).unwrap_or(u64::MAX));
+        snapshot.pool_peak_bytes = self.memory_peak_bytes.as_ref().map_or(0, |peak| {
+            u64::try_from(peak.load(Ordering::Acquire)).unwrap_or(u64::MAX)
+        });
+        snapshot
     }
     /// Subscribes to ownership transitions.
     #[must_use]
@@ -775,6 +821,7 @@ impl OracleAdmission {
                 .as_ref()
                 .map(|resources| RetainedQuerySessionShape {
                     pool: resources.memory_pool(),
+                    memory_peak_bytes: resources.memory_peak_bytes(),
                     granted_memory_bytes: resources.granted_memory_bytes,
                     target_partitions: resources.target_partitions,
                 }),
@@ -1346,6 +1393,9 @@ impl AdmittedQueryGuard {
             self.query_id,
             memory_bytes,
             slot_units,
+            self.local_permit
+                .as_ref()
+                .and_then(|permit| permit.shape.as_ref()),
         ));
         self.resource_probe = Some(Arc::clone(&probe));
         probe

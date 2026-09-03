@@ -1128,7 +1128,7 @@ impl Forge {
     ///
     /// Returns [`ForgeError::Sql`] or [`ForgeError::Invariant`] when the table
     /// has no registration row or its stored UID is malformed.
-    async fn expiry_claim_table(
+    pub(super) async fn expiry_claim_table(
         &self,
         key: &ForgeTableKey,
         table: &iceberg::table::Table,

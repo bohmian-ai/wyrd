@@ -557,7 +557,9 @@ impl ExpiredCleanupPayload {
             "cleanup_candidates",
         ];
         if object.len() != FIELDS.len() || FIELDS.iter().any(|field| !object.contains_key(*field)) {
-            return Err(fail("expired cleanup payload has unknown or missing fields"));
+            return Err(fail(
+                "expired cleanup payload has unknown or missing fields",
+            ));
         }
         let version = object
             .get("version")
@@ -598,9 +600,7 @@ impl ExpiredCleanupPayload {
             persisted,
         )?;
         if cleanup_candidates.is_empty()
-            || cleanup_candidates
-                .windows(2)
-                .any(|pair| pair[0] >= pair[1])
+            || cleanup_candidates.windows(2).any(|pair| pair[0] >= pair[1])
         {
             return Err(fail(
                 "expired cleanup candidates must be nonempty, ordered, and duplicate-free",
@@ -826,15 +826,11 @@ impl ForgeTaskEvidence {
                 detail: "invalid Forge evidence cleanup cursor or candidates".to_owned(),
             });
         }
-        if self
-            .prepared_candidate_index
-            .is_some_and(|index| {
-                index != self.deleted_candidate_count
-                    || usize::try_from(index).map_or(true, |index| {
-                        index >= self.cleanup_candidates.len()
-                    })
-            })
-        {
+        if self.prepared_candidate_index.is_some_and(|index| {
+            index != self.deleted_candidate_count
+                || usize::try_from(index)
+                    .map_or(true, |index| index >= self.cleanup_candidates.len())
+        }) {
             return Err(SqlError::Conflict {
                 detail: "Forge prepared candidate index must name the current cursor candidate"
                     .to_owned(),

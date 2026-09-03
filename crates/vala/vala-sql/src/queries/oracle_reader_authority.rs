@@ -185,6 +185,44 @@ impl<'conn, 'tx> BifrostTableMaintenanceAuthority<'conn, 'tx> {
         .await
         .map_err(SqlError::from)
     }
+
+    /// Counts this table's unresolved expired-cleanup preparations.
+    ///
+    /// A prepared cleanup candidate may already have been handed to the object
+    /// store, so its object's existence is unknown until the owning attempt
+    /// settles it. This read shares [`Self::lock`]'s serialization boundary, so
+    /// a widening that observes zero here cannot be overtaken by a preparation
+    /// that commits afterwards.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqlError::InvariantViolation`] when the identity is malformed
+    /// and [`SqlError`] when the task read fails.
+    pub async fn prepared_cleanup_candidates(
+        &mut self,
+        identity: &TableAuthorityIdentity,
+    ) -> Result<i64, SqlError> {
+        identity.validate(BIFROST_CATALOG_NAME)?;
+        sqlx::query_scalar(
+            r"
+            SELECT COUNT(*)
+              FROM vala.forge_tasks
+             WHERE data_tenant_id = wyrd.current_tenant()
+               AND catalog_name = $1
+               AND namespace_name = $2
+               AND table_name = $3
+               AND strategy = 'expired_cleanup'
+               AND state = 'prepared'
+               AND jsonb_typeof(evidence->'prepared_candidate_index') = 'number'
+            ",
+        )
+        .bind(&identity.catalog_name)
+        .bind(&identity.namespace_name)
+        .bind(&identity.table_name)
+        .fetch_one(&mut **self.conn.transaction())
+        .await
+        .map_err(SqlError::from)
+    }
 }
 
 /// Durable owner of one process's bounded, renewable Oracle reader lease.

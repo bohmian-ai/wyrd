@@ -20,11 +20,14 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use vala_sql::queries::forge_tasks::{ForgeClaimLimits, ForgeTasks};
+use vala_sql::row_types::forge_operations::ForgeExpirationAuthority;
 use vala_sql::row_types::forge_operations::ForgeOperationFamily;
 use vala_sql::row_types::forge_tasks::{
-    ForgeClaimStrategy, ForgeCleanupCandidate, ForgePreparedTaskClaim, ForgeTask, ForgeTaskClaim,
-    ForgeTaskEvidence, ForgeTaskState, ForgeTaskStrategy, ForgeTaskTableIdentity,
-    ForgeTaskTransition, MAINTENANCE_STRATEGIES, SnapshotWatermark, TaskProgressEffect,
+    ExpiredCleanupCandidateRequest, ExpiredCleanupOutcome, ExpiredCleanupPayload,
+    FORGE_TASK_PAYLOAD_VERSION, ForgeClaimStrategy, ForgeCleanupCandidate, ForgePreparedTaskClaim,
+    ForgeTask, ForgeTaskClaim, ForgeTaskEvidence, ForgeTaskState, ForgeTaskStrategy,
+    ForgeTaskTableIdentity, ForgeTaskTransition, MAINTENANCE_STRATEGIES, SnapshotWatermark,
+    TaskProgressEffect,
 };
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
@@ -34,7 +37,6 @@ use wyrd_spec::vala::api::{
     ForgeScribePromotionPhase, StoragePath,
 };
 
-use super::cleanup_cursor::{CleanupDeletion, CleanupStep, CursorCommit, ExpiredCleanupCursor};
 use super::compact::ForgeGroupKey;
 use super::error::{ForgeCapacityFailurePhase, ForgeError, ForgeFailureClass};
 use super::expire::ExpiryTaskAuthority;
@@ -46,7 +48,7 @@ use super::metrics::{
     ForgeDemandTransitionResult, ForgeLeaseResult, ForgeMetricStage, ForgeProgressEffect,
     ForgeTaskMetricStrategy, ForgeTaskTerminalResult,
 };
-use super::orphan_gc::{GcEligibility, MaintenanceProtection, ObjectEvidence};
+use super::orphan_gc::{ExpiredCleanupExemption, GcEligibility, ObjectEvidence};
 use super::path::catalog_path_to_object_key;
 use super::scribe_promotion::{
     ForgePromotionCommit, ForgePromotionSettlement, ScribePromotionPlan,
@@ -241,6 +243,8 @@ enum ForgeDispatchResult {
     Committed(Table),
     /// Ordered maintenance with exact post-expiry candidates.
     Maintenance(Box<ForgeMaintenanceResult>),
+    /// A fully drained expired-cleanup candidate set with its final evidence.
+    Cleaned(Box<ForgeTaskEvidence>),
 }
 
 /// Durable task state accompanying exact committed evidence.
@@ -258,6 +262,21 @@ enum ForgeExecutionEvidenceState {
 }
 
 /// Exact durable ownership required to advance a Prepared cleanup cursor.
+/// Durable position an expired-cleanup drain restarts from.
+///
+/// A fresh dispatch starts at zero with nothing prepared. A takeover starts at
+/// the durable frontier, and `prepared` records whether that frontier's
+/// candidate already committed a preparation whose external result is unproven
+/// — in which case the drain must settle that candidate rather than prepare it
+/// a second time.
+#[derive(Debug, Clone, Copy, Default)]
+struct CleanupResume {
+    /// Candidates already durably settled as advanced.
+    frontier: u32,
+    /// Whether the candidate at `frontier` is already prepared.
+    prepared: bool,
+}
+
 struct CleanupAttempt<'a> {
     /// Durable task identity.
     task_id: Uuid,
@@ -1538,12 +1557,45 @@ impl ForgeWorker {
         claim: ForgeTaskClaim,
         shutdown: &CancellationToken,
     ) -> Result<(), ForgeError> {
-        if !matches!(
-            claim.strategy,
-            ForgeClaimStrategy::Known(ForgeTaskStrategy::SnapshotExpiry)
-        ) {
+        self.execute_maintenance_claim_for_test(ForgeTaskStrategy::SnapshotExpiry, claim, shutdown)
+            .await
+    }
+
+    /// Executes one already-claimed expired-cleanup task through the real
+    /// fenced path while phase activation is still owned by a later task.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same failures as
+    /// [`Self::execute_snapshot_expiry_claim_for_test`].
+    #[cfg(feature = "test-support")]
+    pub async fn execute_expired_cleanup_claim_for_test(
+        &self,
+        claim: ForgeTaskClaim,
+        shutdown: &CancellationToken,
+    ) -> Result<(), ForgeError> {
+        self.execute_maintenance_claim_for_test(ForgeTaskStrategy::ExpiredCleanup, claim, shutdown)
+            .await
+    }
+
+    /// Shared body of the phase-bypassing maintenance test entrypoints.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Invariant`] when the claim is not an exact task of
+    /// `expected` owned by this worker's attempt or fails the production
+    /// payload contract, [`ForgeError::FenceLost`] when the table lease is held
+    /// elsewhere, and every failure the fenced execution itself raises.
+    #[cfg(feature = "test-support")]
+    async fn execute_maintenance_claim_for_test(
+        &self,
+        expected: ForgeTaskStrategy,
+        claim: ForgeTaskClaim,
+        shutdown: &CancellationToken,
+    ) -> Result<(), ForgeError> {
+        if claim.strategy != ForgeClaimStrategy::Known(expected) {
             return Err(ForgeError::Invariant {
-                detail: "the snapshot-expiry test entrypoint accepts only that strategy".to_owned(),
+                detail: "the maintenance test entrypoint accepts only its own strategy".to_owned(),
             });
         }
         let attempt = claim.attempt_id.ok_or_else(|| ForgeError::Invariant {
@@ -2110,18 +2162,22 @@ impl ForgeWorker {
         let table = self.forge.load_table(&binding.table_ident()).await?;
         self.verify_committed_evidence(binding, &table, evidence)
             .await?;
-        self.resume_expired_cleanup(
-            CleanupAttempt {
-                task_id: task.task_id,
-                tenant: task.data_tenant_id,
-                attempt,
-                binding,
-            },
-            lease,
-            evidence,
-            stop,
-        )
-        .await?;
+        if task.strategy == ForgeTaskStrategy::ExpiredCleanup {
+            self.resume_expired_cleanup(
+                CleanupAttempt {
+                    task_id: task.task_id,
+                    tenant: task.data_tenant_id,
+                    attempt,
+                    binding,
+                },
+                lease,
+                &task.plan,
+                &table,
+                evidence,
+                stop,
+            )
+            .await?;
+        }
         if stop.is_cancelled() {
             return Err(ForgeError::Shutdown);
         }
@@ -2145,10 +2201,25 @@ impl ForgeWorker {
     /// Returns an invariant error for an unknown or reserved strategy,
     /// malformed parameters, or an empty exact input set.
     fn validate_payload_contract(task: &ForgeTaskClaim) -> Result<ForgeMetricStage, ForgeError> {
-        if task.plan.inputs.is_empty() {
+        // Expired cleanup is the one strategy whose exact work is its
+        // parameters rather than its inputs: it deletes objects no snapshot
+        // reaches, so an input file set would be meaningless and an empty one
+        // is the contract.
+        let cleanup = matches!(
+            task.strategy,
+            ForgeClaimStrategy::Known(ForgeTaskStrategy::ExpiredCleanup)
+        );
+        if task.plan.inputs.is_empty() != cleanup {
             return Err(ForgeError::Invariant {
-                detail: "Forge task payload has no exact inputs".to_owned(),
+                detail: "Forge task payload does not match its strategy's input contract"
+                    .to_owned(),
             });
+        }
+        if cleanup {
+            task.plan
+                .expired_cleanup_payload(ForgeTaskStrategy::ExpiredCleanup, true)
+                .map_err(ForgeError::Sql)?;
+            return Ok(ForgeMetricStage::ExpiredCleanup);
         }
         let (expected_kind, stage) = match &task.strategy {
             ForgeClaimStrategy::Known(ForgeTaskStrategy::ScribePromotion) => (
@@ -2330,7 +2401,10 @@ impl ForgeWorker {
                 ForgeTaskStrategy::ManifestRewrite | ForgeTaskStrategy::SnapshotExpiry
             )
         );
-        if !base_matches && committed_recovery.is_none() && !maintenance_recovery {
+        if !base_matches
+            && committed_recovery.is_none()
+            && !Self::tolerates_base_drift(&claim.strategy)
+        {
             self.forge
                 .core
                 .telemetry
@@ -2384,6 +2458,9 @@ impl ForgeWorker {
                         .committed_evidence(binding, &committed)
                         .await
                         .map(|evidence| (evidence, ForgeExecutionEvidenceState::Fresh)),
+                    Ok(ForgeDispatchResult::Cleaned(evidence)) => {
+                        Ok((*evidence, ForgeExecutionEvidenceState::Prepared))
+                    }
                     Ok(ForgeDispatchResult::Maintenance(result)) => {
                         self.complete_maintenance(
                             claim,
@@ -2620,6 +2697,24 @@ impl ForgeWorker {
         }
     }
 
+    /// Reports whether a strategy stays valid when the table has moved past
+    /// its planning base.
+    ///
+    /// Maintenance and expired cleanup are defined against the table's own
+    /// history rather than against one exact input set, so an intervening
+    /// writer does not supersede them: refusing them on base drift would make
+    /// them unrunnable on any table that is still being written to.
+    fn tolerates_base_drift(strategy: &ForgeClaimStrategy) -> bool {
+        matches!(
+            strategy,
+            ForgeClaimStrategy::Known(
+                ForgeTaskStrategy::ManifestRewrite
+                    | ForgeTaskStrategy::SnapshotExpiry
+                    | ForgeTaskStrategy::ExpiredCleanup
+            )
+        )
+    }
+
     /// Selects the retained snapshot protected while one claimed task runs.
     ///
     /// Normal execution protects the exact planning base. Recovery protects
@@ -2646,12 +2741,8 @@ impl ForgeWorker {
                 timestamp_ms: 0,
             });
         }
-        if matches!(
-            claim.strategy,
-            ForgeClaimStrategy::Known(
-                ForgeTaskStrategy::ManifestRewrite | ForgeTaskStrategy::SnapshotExpiry
-            )
-        ) && let Some(current) = table.metadata().current_snapshot()
+        if Self::tolerates_base_drift(&claim.strategy)
+            && let Some(current) = table.metadata().current_snapshot()
         {
             return Ok(SnapshotWatermark {
                 snapshot_id: current.snapshot_id(),
@@ -2768,12 +2859,7 @@ impl ForgeWorker {
             return Ok(ForgeDispatchResult::Committed(table));
         }
         if !Self::base_snapshot_matches(&table, claim.base_snapshot_id)
-            && !matches!(
-                claim.strategy,
-                ForgeClaimStrategy::Known(
-                    ForgeTaskStrategy::ManifestRewrite | ForgeTaskStrategy::SnapshotExpiry
-                )
-            )
+            && !Self::tolerates_base_drift(&claim.strategy)
         {
             return Err(ForgeError::Reconciliation {
                 detail: "Forge task base snapshot changed before execution".to_owned(),
@@ -2792,6 +2878,10 @@ impl ForgeWorker {
             }
             ForgeClaimStrategy::Known(ForgeTaskStrategy::SmallFiles) => {
                 self.dispatch_iceberg_rewrite(claim, attempt, binding, lease, &table, stop)
+                    .await
+            }
+            ForgeClaimStrategy::Known(ForgeTaskStrategy::ExpiredCleanup) => {
+                self.dispatch_expired_cleanup(claim, attempt, binding, lease, &table, stop)
                     .await
             }
             _ => Err(ForgeError::Invariant {
@@ -3907,7 +3997,7 @@ impl ForgeWorker {
         if let Some(evidence) = result.expiry_evidence {
             return Ok((evidence, ForgeExecutionEvidenceState::Settled));
         }
-        let mut evidence = self.committed_evidence(binding, &result.table).await?;
+        let evidence = self.committed_evidence(binding, &result.table).await?;
         evidence.validate(false).map_err(ForgeError::Sql)?;
 
         require_running(stop)?;
@@ -3949,23 +4039,6 @@ impl ForgeWorker {
         }
         require_running(stop)?;
         lease.require_fence(&self.forge.core.operator_pool).await?;
-        let cleanup_attempt = CleanupAttempt {
-            task_id: claim.task_id,
-            tenant: claim.data_tenant_id,
-            attempt,
-            binding,
-        };
-        let cursor = ExpiredCleanupCursor::resume(evidence.cleanup_candidates.len(), 0)?;
-        let deleted = self
-            .drain_expired_cleanup(
-                &cleanup_attempt,
-                lease,
-                &evidence.cleanup_candidates,
-                cursor,
-                stop,
-            )
-            .await?;
-        evidence.deleted_candidate_count = deleted;
         let key = super::compact::ForgeTableKey {
             tenant: claim.data_tenant_id,
             table_ref: binding.table_ref.clone(),
@@ -3976,33 +4049,191 @@ impl ForgeWorker {
         Ok((evidence, ForgeExecutionEvidenceState::Prepared))
     }
 
-    /// Deletes every candidate at or past `cursor`, committing each advance.
+    /// Runs one claimed expired-cleanup task to its drained frontier.
     ///
-    /// This is the only expired-cleanup deletion loop. A fresh run enters it
-    /// with a zeroed cursor and a takeover enters it with the durable frontier,
-    /// so first execution and resume cannot drift apart in their ordering,
-    /// fencing, or idempotency rules.
+    /// The immutable payload is the whole work: it names the succeeded
+    /// expiration this task consumes, the committed identity that expiration
+    /// left behind, and the exact ordered candidates that commit made
+    /// unreachable. Nothing here is re-derived from the catalog, so a task that
+    /// runs much later deletes exactly the objects its handoff named or nothing
+    /// at all.
     ///
     /// # Errors
     ///
-    /// Returns cancellation, path-binding, object-store, cursor, fencing, or
-    /// durable SQL failures. A failure leaves the last committed frontier
-    /// authoritative, so the current or a successor owner replays from the
-    /// first uncommitted candidate.
+    /// Returns payload-decoding, protection, path-binding, object-store,
+    /// fencing, audit, SQL, or cancellation failures. Every failure leaves the
+    /// durable cursor authoritative, so the exact candidate is replayed by this
+    /// or a successor attempt.
+    async fn dispatch_expired_cleanup(
+        &self,
+        claim: &ForgeTaskClaim,
+        attempt: Uuid,
+        binding: &TenantTableBinding,
+        lease: &mut ForgeLease,
+        table: &Table,
+        stop: &CancellationToken,
+    ) -> Result<ForgeDispatchResult, ForgeError> {
+        let payload = claim
+            .plan
+            .expired_cleanup_payload(ForgeTaskStrategy::ExpiredCleanup, true)
+            .map_err(ForgeError::Sql)?;
+        let cleanup = CleanupAttempt {
+            task_id: claim.task_id,
+            tenant: claim.data_tenant_id,
+            attempt,
+            binding,
+        };
+        let evidence = self
+            .drain_expired_cleanup(
+                &cleanup,
+                lease,
+                &payload,
+                table,
+                CleanupResume::default(),
+                stop,
+            )
+            .await?;
+        Ok(ForgeDispatchResult::Cleaned(Box::new(evidence)))
+    }
+
+    /// Deletes every remaining candidate through the two-phase protocol.
+    ///
+    /// Each candidate is handled alone and in order: prepare durably, close
+    /// Postgres, take a fresh reachability proof, submit the delete, then
+    /// settle. Postgres is never open across the object-store call, and the
+    /// frontier advances only for a confirmed deletion or a proven absence, so
+    /// a refusal or an uncertain acceptance retains the exact candidate for
+    /// replay instead of skipping it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Reconciliation`] when a candidate is refused or
+    /// its acceptance is unknown, plus protection, path-binding, object-store,
+    /// fencing, audit, SQL, or cancellation failures.
     ///
     /// # Cancellation
     ///
-    /// Cancellation stops before the next delete or cursor transition. A
-    /// delete racing cancellation may already be accepted; its candidate is
-    /// idempotent and stays behind the frontier for replay.
+    /// Cancellation observed before a delete is submitted stops the drain with
+    /// the frontier intact. Cancellation racing a submitted delete is recorded
+    /// as uncertainty, which retains the candidate rather than advancing past
+    /// an object whose fate is unknown.
     async fn drain_expired_cleanup(
         &self,
         attempt: &CleanupAttempt<'_>,
         lease: &mut ForgeLease,
-        candidates: &[ForgeCleanupCandidate],
-        mut cursor: ExpiredCleanupCursor,
+        payload: &ExpiredCleanupPayload,
+        table: &Table,
+        resume: CleanupResume,
         stop: &CancellationToken,
-    ) -> Result<u32, ForgeError> {
+    ) -> Result<ForgeTaskEvidence, ForgeError> {
+        let started = Instant::now();
+        let total =
+            u32::try_from(payload.cleanup_candidates.len()).map_err(|_| ForgeError::Invariant {
+                detail: "expired cleanup candidate set exceeds u32".to_owned(),
+            })?;
+        let authority = ForgeExpirationAuthority {
+            task_id: attempt.task_id,
+            attempt_id: attempt.attempt,
+            worker_id: self.owner,
+            lease_key: lease.lease_key.clone(),
+            lease_fencing_token: lease.fencing_token,
+        };
+        let key = super::compact::ForgeTableKey {
+            tenant: attempt.tenant,
+            table_ref: attempt.binding.table_ref.clone(),
+        };
+        let table = self.forge.expiry_claim_table(&key, table).await?;
+        let mut prepared = resume.prepared;
+        let mut index = resume.frontier;
+        while index < total {
+            let candidate = payload
+                .cleanup_candidates
+                .get(usize::try_from(index).unwrap_or(usize::MAX))
+                .ok_or_else(|| ForgeError::Invariant {
+                    detail: "expired cleanup cursor named an absent candidate".to_owned(),
+                })?;
+            if !prepared {
+                require_running(stop)?;
+                lease.require_fence(&self.forge.core.operator_pool).await?;
+                let event =
+                    cleanup_event(attempt.task_id, "forge.expired_cleanup.candidate_prepared");
+                self.tasks
+                    .prepare_expired_cleanup_candidate(
+                        attempt.tenant,
+                        ExpiredCleanupCandidateRequest {
+                            authority: &authority,
+                            table: &table,
+                            index,
+                            candidate,
+                            event: &event,
+                        },
+                    )
+                    .await
+                    .map_err(ForgeError::Sql)?;
+            }
+            prepared = false;
+            let outcome = self
+                .attempt_cleanup_delete(attempt, lease, index, candidate, stop)
+                .await?;
+            let event = cleanup_event(attempt.task_id, outcome.audit_operation());
+            self.tasks
+                .settle_expired_cleanup_candidate(
+                    attempt.tenant,
+                    ExpiredCleanupCandidateRequest {
+                        authority: &authority,
+                        table: &table,
+                        index,
+                        candidate,
+                        event: &event,
+                    },
+                    outcome,
+                )
+                .await
+                .map_err(ForgeError::Sql)?;
+            if !outcome.advances() {
+                return Err(ForgeError::Reconciliation {
+                    detail: format!(
+                        "expired cleanup retained candidate {index} for replay after {}",
+                        outcome.audit_operation()
+                    ),
+                });
+            }
+            index = index.saturating_add(1);
+        }
+        self.record_expired_cleanup_completion(started);
+        Ok(ForgeTaskEvidence {
+            version: FORGE_TASK_PAYLOAD_VERSION,
+            committed_snapshot_id: Some(payload.committed_snapshot_id),
+            committed_metadata_location: Some(payload.committed_metadata_location.clone()),
+            committed_metadata_digest: Some(payload.committed_metadata_digest.clone()),
+            cleanup_candidates: payload.cleanup_candidates.clone(),
+            deleted_candidate_count: total,
+            prepared_candidate_index: None,
+        })
+    }
+
+    /// Takes one candidate's fresh proof and submits its deletion.
+    ///
+    /// No Postgres transaction is alive here: the preparation committed and
+    /// closed before this runs, so the object-store call cannot hold a database
+    /// resource. The protection proof exempts exactly this task, attempt,
+    /// cursor index, and candidate, so the drain's own prepared row stops
+    /// protecting the object it is about to delete while every other
+    /// unresolved preparation still does.
+    ///
+    /// # Errors
+    ///
+    /// Returns protection, object-metadata, or path-binding failures, all of
+    /// which happen before any deletion is submitted and therefore leave the
+    /// candidate exactly as it was.
+    async fn attempt_cleanup_delete(
+        &self,
+        attempt: &CleanupAttempt<'_>,
+        lease: &mut ForgeLease,
+        index: u32,
+        candidate: &ForgeCleanupCandidate,
+        stop: &CancellationToken,
+    ) -> Result<ExpiredCleanupOutcome, ForgeError> {
         let key = super::compact::ForgeTableKey {
             tenant: attempt.tenant,
             table_ref: attempt.binding.table_ref.clone(),
@@ -4013,48 +4244,15 @@ impl ForgeWorker {
                 &key,
                 attempt.binding,
                 self.forge.core.clock.now()?,
+                ExpiredCleanupExemption {
+                    task_id: attempt.task_id,
+                    attempt_id: attempt.attempt,
+                    index,
+                    candidate,
+                },
                 stop,
             )
             .await?;
-        while let CleanupStep::Delete(index) = cursor.step() {
-            let candidate = candidates.get(index).ok_or_else(|| ForgeError::Invariant {
-                detail: "expired cleanup cursor named an absent candidate".to_owned(),
-            })?;
-            let deletion = self
-                .delete_cleanup_object(attempt, lease, candidate, &protection, stop)
-                .await?;
-            let commit = cursor.confirm(deletion)?;
-            self.commit_cleanup_cursor(attempt, lease, commit, stop)
-                .await?;
-        }
-        Ok(cursor.committed())
-    }
-
-    /// Deletes one cleanup candidate after re-taking every safety proof.
-    ///
-    /// The prepared candidate set records what was unreachable when expiry
-    /// committed. A successor owner may drain it much later, so the candidate
-    /// is re-checked against refreshed protection here rather than trusted:
-    /// a candidate a retained head reaches again, one that no longer clears the
-    /// age floor, or one a reopened operation now protects is left in place.
-    ///
-    /// An object already absent is an idempotent success: the safety proof that
-    /// admitted it has already been made, so a replayed deletion is exactly as
-    /// final as the original.
-    ///
-    /// # Errors
-    ///
-    /// Returns cancellation, fencing, or object-store failures.
-    async fn delete_cleanup_object(
-        &self,
-        attempt: &CleanupAttempt<'_>,
-        lease: &mut ForgeLease,
-        candidate: &ForgeCleanupCandidate,
-        protection: &MaintenanceProtection,
-        stop: &CancellationToken,
-    ) -> Result<CleanupDeletion, ForgeError> {
-        require_running(stop)?;
-        lease.require_fence(&self.forge.core.operator_pool).await?;
         let path = candidate.path.as_str();
         let metadata = match self.forge.core.object_store.stat(path).await {
             Ok(metadata) => Some(metadata),
@@ -4066,15 +4264,16 @@ impl ForgeWorker {
             .map_or(ObjectEvidence::Missing, ObjectEvidence::Present);
         match protection.expired_cleanup_eligibility(attempt.binding, path, evidence) {
             GcEligibility::Eligible => {}
-            GcEligibility::Missing => return Ok(CleanupDeletion::AlreadyMissing),
+            GcEligibility::Missing => return Ok(ExpiredCleanupOutcome::Missing),
             refusal => {
                 tracing::warn!(
                     refusal = ?refusal,
                     task_id = %attempt.task_id,
                     attempt_id = %attempt.attempt,
-                    "refreshed protection retained a prepared expired-cleanup candidate"
+                    index,
+                    "refreshed protection refused a prepared expired-cleanup candidate"
                 );
-                return Ok(CleanupDeletion::Retained);
+                return Ok(ExpiredCleanupOutcome::Refused);
             }
         }
         let path = attempt.binding.validate_object_path(path).ok_or_else(|| {
@@ -4082,61 +4281,31 @@ impl ForgeWorker {
                 detail: "expired cleanup candidate escaped table binding".to_owned(),
             }
         })?;
+        // The last two proofs before the irreversible effect: still running,
+        // and still the fenced publication owner.
+        require_running(stop)?;
+        lease.require_fence(&self.forge.core.operator_pool).await?;
         let deletion = self.forge.core.object_store.delete(&path);
         tokio::pin!(deletion);
         let deletion = tokio::select! {
             result = &mut deletion => result,
-            () = stop.cancelled() => return Err(ForgeError::Shutdown),
+            () = stop.cancelled() => return Ok(ExpiredCleanupOutcome::Uncertain),
         };
         match deletion {
-            Ok(()) => Ok(CleanupDeletion::Confirmed),
+            Ok(()) => Ok(ExpiredCleanupOutcome::Deleted),
             Err(error) if error.kind() == opendal::ErrorKind::NotFound => {
-                Ok(CleanupDeletion::AlreadyMissing)
+                Ok(ExpiredCleanupOutcome::Missing)
             }
-            Err(error) => Err(ForgeError::ObjectDelete(error)),
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    task_id = %attempt.task_id,
+                    index,
+                    "expired cleanup deletion acceptance is unknown"
+                );
+                Ok(ExpiredCleanupOutcome::Uncertain)
+            }
         }
-    }
-
-    /// Commits one cursor advance under the same fence that authorized it.
-    ///
-    /// The advance is a compare-and-set against the frontier the cursor
-    /// expected, so a successor owner replaying the same candidate cannot push
-    /// the frontier a second time.
-    ///
-    /// # Errors
-    ///
-    /// Returns cancellation, fencing, or durable SQL failures. A failed commit
-    /// leaves the candidate replayable by the current or successor owner.
-    async fn commit_cleanup_cursor(
-        &self,
-        attempt: &CleanupAttempt<'_>,
-        lease: &mut ForgeLease,
-        commit: CursorCommit,
-        stop: &CancellationToken,
-    ) -> Result<(), ForgeError> {
-        require_running(stop)?;
-        lease.require_fence(&self.forge.core.operator_pool).await?;
-        let mut cursor = self
-            .forge
-            .core
-            .vala
-            .tenant_conn(attempt.tenant)
-            .await
-            .map_err(ForgeError::Sql)?;
-        self.tasks
-            .advance_cleanup_cursor(
-                &mut cursor,
-                attempt.task_id,
-                attempt.attempt,
-                self.owner,
-                commit.expected,
-                commit.next,
-            )
-            .await
-            .map_err(ForgeError::Sql)?;
-        lease.assert_transaction_fence(&mut cursor).await?;
-        cursor.commit().await.map_err(ForgeError::Sql)?;
-        Ok(())
     }
 
     /// Record the completed durable expired-cleanup obligation at its owner boundary.
@@ -4147,30 +4316,35 @@ impl ForgeWorker {
             .record_cleanup(ForgeCleanupKind::Expired, started.elapsed());
     }
 
-    /// Resumes the undeleted suffix of exact Prepared cleanup evidence.
+    /// Resumes one taken-over expired-cleanup task from its durable frontier.
+    ///
+    /// Takeover retains the attempt generation, so the candidate a previous
+    /// owner prepared is still this attempt's to settle: it is not re-prepared,
+    /// its fresh proof and delete are simply retried, and the same acceptance
+    /// rules decide whether the frontier moves.
     ///
     /// # Errors
     ///
-    /// Returns malformed cursor, binding, fencing, object-store, SQL, or
-    /// cancellation failures from the shared drain owner.
-    ///
-    /// # Cancellation
-    ///
-    /// Cancellation stops before the next delete or cursor transition.
+    /// Returns payload-decoding, cursor, protection, object-store, fencing,
+    /// audit, SQL, or cancellation failures from the shared drain owner.
     async fn resume_expired_cleanup(
         &self,
         cleanup: CleanupAttempt<'_>,
         lease: &mut ForgeLease,
+        plan: &vala_sql::row_types::forge_tasks::ForgeTaskPlan,
+        table: &Table,
         evidence: &ForgeTaskEvidence,
         stop: &CancellationToken,
-    ) -> Result<(), ForgeError> {
-        let cursor = ExpiredCleanupCursor::resume(
-            evidence.cleanup_candidates.len(),
-            evidence.deleted_candidate_count,
-        )?;
-        self.drain_expired_cleanup(&cleanup, lease, &evidence.cleanup_candidates, cursor, stop)
-            .await?;
-        Ok(())
+    ) -> Result<ForgeTaskEvidence, ForgeError> {
+        let payload = plan
+            .expired_cleanup_payload(ForgeTaskStrategy::ExpiredCleanup, true)
+            .map_err(ForgeError::Sql)?;
+        let resume = CleanupResume {
+            frontier: evidence.deleted_candidate_count,
+            prepared: evidence.prepared_candidate_index.is_some(),
+        };
+        self.drain_expired_cleanup(&cleanup, lease, &payload, table, resume, stop)
+            .await
     }
 
     /// Starts coordinated task-claim and table-lease renewal for one operation.
@@ -5058,6 +5232,28 @@ fn require_running(stop: &CancellationToken) -> Result<(), ForgeError> {
 }
 
 /// Builds one internal task lifecycle audit envelope.
+/// Builds the tenant-outbox event for one expired-cleanup candidate transition.
+///
+/// The operation string is the only thing that varies, and the durable owner
+/// re-validates it against the transition it is about to perform, so a
+/// mislabelled event is refused rather than recorded.
+pub(super) fn cleanup_event(task_id: Uuid, operation: &str) -> AuditEvent {
+    AuditEvent::new(
+        RequestId::now_v7(),
+        None,
+        operation.to_owned(),
+        format!("forge-task:{task_id}"),
+        None,
+        PrincipalId::new(Uuid::nil()),
+        PrincipalKindTag::Service,
+        AuthMethod::Internal,
+        "bifrost:forge".to_owned(),
+        AuditDecision::Allow,
+        AuditResult::Success,
+        "expired cleanup candidate transition".to_owned(),
+    )
+}
+
 pub(super) fn task_event(task_id: Uuid, state: ForgeTaskState, reason: &str) -> AuditEvent {
     AuditEvent::new(
         RequestId::now_v7(),

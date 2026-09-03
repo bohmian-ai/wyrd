@@ -20,12 +20,11 @@ use crate::queries::forge_operations::{
 use crate::row_types::forge_operations::{ForgeClaimTable, ForgeExpirationAuthority};
 use crate::row_types::forge_tasks::{
     ExpiredCleanupCandidateRequest, ExpiredCleanupOutcome, ExpiredCleanupPayload,
-    FORGE_TASK_PAYLOAD_VERSION,
-    ForgeCleanupCandidate, ForgePlanningDemand, ForgePlanningDemandSqlRow, ForgePreparedTaskClaim,
-    ForgePreparedTaskClaimSqlRow, ForgeTask, ForgeTaskClaim, ForgeTaskClaimSqlRow,
-    ForgeTaskEvidence, ForgeTaskPage, ForgeTaskSqlRow, ForgeTaskState, ForgeTaskStrategy,
-    ForgeTaskTableIdentity, ForgeTaskTransition, ForgeTaskTransitionOutcome, NewForgeTask,
-    SnapshotWatermark, TaskProgressEffect,
+    FORGE_TASK_PAYLOAD_VERSION, ForgeCleanupCandidate, ForgePlanningDemand,
+    ForgePlanningDemandSqlRow, ForgePreparedTaskClaim, ForgePreparedTaskClaimSqlRow, ForgeTask,
+    ForgeTaskClaim, ForgeTaskClaimSqlRow, ForgeTaskEvidence, ForgeTaskPage, ForgeTaskSqlRow,
+    ForgeTaskState, ForgeTaskStrategy, ForgeTaskTableIdentity, ForgeTaskTransition,
+    ForgeTaskTransitionOutcome, NewForgeTask, SnapshotWatermark, TaskProgressEffect,
 };
 use crate::{OperatorPool, SqlError, TenantConn};
 
@@ -1298,8 +1297,9 @@ impl ForgeTasks {
                 return Ok(false);
             }
             return Err(SqlError::Conflict {
-                detail: "an expired cleanup task already exists for this source with a different plan"
-                    .to_owned(),
+                detail:
+                    "an expired cleanup task already exists for this source with a different plan"
+                        .to_owned(),
             });
         }
         let source: Option<(Uuid, String, String, String, String, String, Option<serde_json::Value>)> = sqlx::query_as("SELECT data_tenant_id,catalog_name,namespace_name,table_name,strategy,state,evidence FROM vala.forge_tasks WHERE task_id=$1 FOR UPDATE")
@@ -1413,8 +1413,7 @@ impl ForgeTasks {
             }
         } else if request.index != 0 || locked.state != ForgeTaskState::Running {
             return Err(SqlError::Conflict {
-                detail: "the first expired cleanup preparation must name candidate zero"
-                    .to_owned(),
+                detail: "the first expired cleanup preparation must name candidate zero".to_owned(),
             });
         }
 
@@ -1593,12 +1592,12 @@ impl LockedCleanupTask {
     /// Returns [`SqlError::InvariantViolation`] when the persisted plan is not
     /// the closed expired-cleanup payload.
     fn payload(&self) -> Result<ExpiredCleanupPayload, SqlError> {
-        let parameters = self
-            .plan
-            .get("parameters")
-            .ok_or_else(|| SqlError::InvariantViolation {
-                detail: "expired cleanup plan parameters are missing".to_owned(),
-            })?;
+        let parameters =
+            self.plan
+                .get("parameters")
+                .ok_or_else(|| SqlError::InvariantViolation {
+                    detail: "expired cleanup plan parameters are missing".to_owned(),
+                })?;
         ExpiredCleanupPayload::from_value(parameters, true)
     }
 }
@@ -1756,4 +1755,81 @@ fn validate_audit_event(
         });
     }
     Ok(())
+}
+
+/// One expired-cleanup candidate whose deletion has been prepared but not
+/// settled.
+///
+/// A prepared candidate is the only object an expired-cleanup task may be about
+/// to delete, so unrelated destructive work must treat it as protected until
+/// the owning attempt settles it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForgePreparedCleanupCandidate {
+    /// Cleanup task that committed the preparation.
+    pub task_id: Uuid,
+    /// Attempt generation the preparation is fenced to.
+    pub attempt_id: Uuid,
+    /// Cursor index the preparation named.
+    pub index: u32,
+    /// Exact candidate that index resolves to.
+    pub candidate: ForgeCleanupCandidate,
+}
+
+/// Lists every unresolved expired-cleanup preparation for one physical table.
+///
+/// The read is deliberately narrow: only a `prepared` cleanup task whose
+/// evidence still carries a `prepared_candidate_index` has an object whose fate
+/// is unknown. Every other cleanup state has either not submitted a deletion or
+/// already settled one, so it contributes no protection root.
+///
+/// # Errors
+///
+/// Returns [`SqlError::Query`] when PostgreSQL cannot execute the tenant-scoped
+/// read, and [`SqlError::InvariantViolation`] when a persisted row's evidence
+/// cannot be decoded or its prepared index names no candidate.
+pub async fn list_prepared_cleanup_candidates(
+    conn: &mut TenantConn<'_>,
+    catalog: &str,
+    namespace: &str,
+    table: &str,
+) -> Result<Vec<ForgePreparedCleanupCandidate>, SqlError> {
+    let rows: Vec<(Uuid, Option<Uuid>, serde_json::Value)> = sqlx::query_as(
+        "SELECT task_id,attempt_id,evidence FROM vala.forge_tasks \
+         WHERE data_tenant_id = wyrd.current_tenant() AND catalog_name=$1 AND namespace_name=$2 \
+           AND table_name=$3 AND strategy='expired_cleanup' AND state='prepared' \
+           AND jsonb_typeof(evidence->'prepared_candidate_index') = 'number' ORDER BY task_id",
+    )
+    .bind(catalog)
+    .bind(namespace)
+    .bind(table)
+    .fetch_all(&mut **conn.transaction())
+    .await
+    .map_err(SqlError::from)?;
+    rows.into_iter()
+        .map(|(task_id, attempt_id, evidence)| {
+            let evidence = crate::row_types::forge_tasks::evidence_from_json(evidence)?;
+            let index =
+                evidence
+                    .prepared_candidate_index
+                    .ok_or_else(|| SqlError::InvariantViolation {
+                        detail: "prepared expired-cleanup row lost its candidate index".to_owned(),
+                    })?;
+            let candidate = usize::try_from(index)
+                .ok()
+                .and_then(|index| evidence.cleanup_candidates.get(index))
+                .ok_or_else(|| SqlError::InvariantViolation {
+                    detail: "prepared expired-cleanup index names no candidate".to_owned(),
+                })?
+                .clone();
+            let attempt_id = attempt_id.ok_or_else(|| SqlError::InvariantViolation {
+                detail: "prepared expired-cleanup row lost its attempt generation".to_owned(),
+            })?;
+            Ok(ForgePreparedCleanupCandidate {
+                task_id,
+                attempt_id,
+                index,
+                candidate,
+            })
+        })
+        .collect()
 }

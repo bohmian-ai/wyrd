@@ -14,6 +14,7 @@ use uuid::Uuid;
 use vala_sql::TenantConn;
 use vala_sql::queries::file_list::list_nonterminal_file_paths;
 use vala_sql::queries::forge_operations::ForgeOperations;
+use vala_sql::queries::forge_tasks::list_prepared_cleanup_candidates;
 use vala_sql::row_types::forge_operations::{
     ForgeOperationFamily, ForgeOperationPhase, ForgeOperationStateRow, ForgeOperationTransition,
 };
@@ -25,7 +26,9 @@ use wyrd_spec::vala::api::{
     StoragePath, audit_detail_canonical_json,
 };
 
-use crate::catalog::TenantTableBinding;
+use vala_sql::row_types::forge_tasks::ForgeCleanupCandidate;
+
+use crate::catalog::{BIFROST_CATALOG_NAME, TenantTableBinding};
 
 use super::Forge;
 use super::compact::ForgeTableKey;
@@ -317,6 +320,27 @@ struct ProtectionRequest<'context> {
     table: &'context GcTableContext<'context>,
     /// Prepared GC detail allowed to exempt only its exact operation.
     current_gc_detail: Option<&'context AuditDetail>,
+    /// Prepared expired-cleanup candidate allowed to exempt only itself.
+    cleanup_exemption: Option<ExpiredCleanupExemption<'context>>,
+}
+
+/// Identity of the single prepared cleanup candidate one drain owns.
+///
+/// Every unresolved cleanup preparation protects its object, including this
+/// one — a drain that trusted a stale preparation would delete an object whose
+/// proof another attempt owns. The exemption is therefore exact in all four
+/// fields: a mismatch in task, attempt, cursor index, or candidate leaves the
+/// preparation as protection and the drain refuses its own candidate.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ExpiredCleanupExemption<'candidate> {
+    /// Cleanup task the drain is executing.
+    pub(super) task_id: Uuid,
+    /// Attempt generation fencing that execution.
+    pub(super) attempt_id: Uuid,
+    /// Durable cursor index the drain prepared.
+    pub(super) index: u32,
+    /// Exact candidate that index resolves to.
+    pub(super) candidate: &'candidate ForgeCleanupCandidate,
 }
 
 /// Inputs for completing one prepared GC batch.
@@ -527,12 +551,12 @@ impl Forge {
         self.load_maintenance_protection_inner(request).await
     }
 
-    /// Loads refreshed protection for one prepared expired-cleanup drain.
+    /// Loads refreshed protection for one prepared expired-cleanup candidate.
     ///
-    /// Expired cleanup takes this proof once per drain rather than once per
-    /// candidate: the table lease it runs under already excludes a concurrent
-    /// producer, so one refreshed catalog, SQL, and operation load covers every
-    /// candidate the drain will consider.
+    /// The proof is taken per candidate rather than once per drain because each
+    /// candidate now owns its own durable preparation: the exemption below is
+    /// what makes the drain's own prepared row stop protecting the object it is
+    /// about to delete, and it names exactly one candidate.
     ///
     /// # Errors
     ///
@@ -543,6 +567,7 @@ impl Forge {
         key: &ForgeTableKey,
         binding: &TenantTableBinding,
         now: DateTime<Utc>,
+        exemption: ExpiredCleanupExemption<'_>,
         stop: &CancellationToken,
     ) -> Result<MaintenanceProtection, ForgeError> {
         let table = GcTableContext {
@@ -554,6 +579,7 @@ impl Forge {
         self.load_maintenance_protection(ProtectionRequest {
             table: &table,
             current_gc_detail: None,
+            cleanup_exemption: Some(exemption),
         })
         .await
     }
@@ -583,6 +609,7 @@ impl Forge {
         self.load_maintenance_protection(ProtectionRequest {
             table: &table,
             current_gc_detail: None,
+            cleanup_exemption: None,
         })
         .await
         .map(|protection| protection.live_set)
@@ -615,6 +642,7 @@ impl Forge {
             .load_maintenance_protection(ProtectionRequest {
                 table: &table,
                 current_gc_detail: None,
+                cleanup_exemption: None,
             })
             .await?;
         let metadata = self
@@ -734,6 +762,7 @@ impl Forge {
             .load_maintenance_protection(ProtectionRequest {
                 table,
                 current_gc_detail: None,
+                cleanup_exemption: None,
             })
             .await?;
         if protection.destructive_maintenance == DestructiveMaintenance::Blocked {
@@ -948,6 +977,32 @@ impl Forge {
             for path in operation_output_paths(&row.prepared_detail) {
                 roots.open_outputs.push(normalize(path.as_str())?);
             }
+        }
+        // An unresolved cleanup preparation names an object whose existence is
+        // unknown: the delete may already have been submitted. Protecting it
+        // keeps orphan collection and every other cleanup off it until the
+        // owning attempt settles. Only the exact caller-named preparation is
+        // exempt, so a stale or mismatched one still protects its object.
+        for prepared in list_prepared_cleanup_candidates(
+            &mut conn,
+            BIFROST_CATALOG_NAME,
+            key.table_ref.namespace.as_str(),
+            &key.table_ref.name,
+        )
+        .await
+        .map_err(ForgeError::Sql)?
+        {
+            if request.cleanup_exemption.is_some_and(|exemption| {
+                exemption.task_id == prepared.task_id
+                    && exemption.attempt_id == prepared.attempt_id
+                    && exemption.index == prepared.index
+                    && *exemption.candidate == prepared.candidate
+            }) {
+                continue;
+            }
+            roots
+                .open_outputs
+                .push(normalize(prepared.candidate.path.as_str())?);
         }
         // Every snapshot on every proven ancestry chain, not just the chain
         // endpoints: this pass protects the objects those snapshots reach, so a
@@ -1285,6 +1340,7 @@ impl Forge {
             .load_maintenance_protection(ProtectionRequest {
                 table,
                 current_gc_detail: Some(detail),
+                cleanup_exemption: None,
             })
             .await?;
         let GcDeletionTally {

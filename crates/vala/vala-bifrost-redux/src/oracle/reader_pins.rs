@@ -1490,6 +1490,22 @@ impl OracleReaderAuthority {
                     "snapshot {snapshot} is claimed by a prepared Forge expiration"
                 )));
             }
+            // The same row also serializes expired-object cleanup. A prepared
+            // cleanup candidate may already be in the object store's hands, so
+            // its object's existence is unknown; widening a reader frontier
+            // over that window could pin a chain that reaches it. Narrowing is
+            // always safe and is deliberately not refused here.
+            if phase == OracleTableProtectionPhase::Expanded
+                && authority
+                    .prepared_cleanup_candidates(identity)
+                    .await
+                    .map_err(|error| internal(error.to_string()))?
+                    > 0
+            {
+                return Err(internal(
+                    "an unresolved Forge expired-cleanup preparation blocks reader widening",
+                ));
+            }
             let outcome = OracleTableProtections::new(&mut conn)
                 .commit(
                     identity,

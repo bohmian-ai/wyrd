@@ -3440,6 +3440,109 @@ mod tests {
         );
     }
 
+    /// Asserts the two refusals that never reach a lease settle their owners once.
+    ///
+    /// A deadline that has already elapsed is refused before any owner exists,
+    /// so nothing is acquired and nothing can be released. A schema mismatch is
+    /// refused after the pre-material guard already owns root capacity, so the
+    /// guard is the one that must settle it — exactly once.
+    ///
+    /// # Panics
+    ///
+    /// Panics when either refusal acquires an owner it does not settle.
+    async fn assert_refused_acquisitions_settle_once(
+        reader: &ScribeTailReader,
+        template: &AcquireTailFenceRequest,
+    ) -> super::TailOwnershipSnapshot {
+        let snapshot = || {
+            reader
+                .ownership_snapshot_for_test()
+                .expect("refusal ownership snapshot")
+        };
+        let mut expired = template.clone();
+        expired.deadline = chrono::Utc::now() - chrono::Duration::seconds(1);
+        assert!(matches!(
+            reader.acquire_fence(expired).await,
+            Err(TailReadError::DeadlineElapsed)
+        ));
+        let after_deadline = snapshot();
+        assert_eq!(after_deadline.reservations, 0);
+        assert_eq!(after_deadline.releases, 0);
+
+        let mut mismatched = template.clone();
+        mismatched.schema_fingerprint =
+            SchemaFingerprint::new("0".repeat(64)).expect("mismatched fingerprint");
+        assert!(matches!(
+            reader.acquire_fence(mismatched).await,
+            Err(TailReadError::SchemaMismatch)
+        ));
+        let after_error = snapshot();
+        assert_eq!(after_error.reservations, 1);
+        assert_eq!(after_error.releases, 1);
+        assert_eq!(after_error.active_reservations, 0);
+        after_error
+    }
+
+    /// Asserts one successful lease stays readable and releases exactly once.
+    ///
+    /// The page read is the point: the Arrow the fence admitted is still owned
+    /// while the lease is held. The explicit release then settles that owner,
+    /// and a duplicate release must not settle it again.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the leased source is unreadable, when release does not
+    /// settle the owner, or when a duplicate release settles it twice.
+    async fn assert_lease_is_readable_and_releases_once(
+        reader: &ScribeTailReader,
+        request: AcquireTailFenceRequest,
+    ) -> super::TailOwnershipSnapshot {
+        let snapshot = || {
+            reader
+                .ownership_snapshot_for_test()
+                .expect("lease ownership snapshot")
+        };
+        let before = snapshot();
+        let fence = reader
+            .acquire_fence(request)
+            .await
+            .expect("live-tail fence over the fixture rows");
+        let retained = snapshot();
+        assert_eq!(retained.active_reservations, 1);
+        assert!(retained.active_reserved_bytes > 0);
+        let page = reader
+            .read_page(&TailPageRequest {
+                query_id: uuid::Uuid::nil(),
+                fence_id: fence.fence_id,
+                after: None,
+                max_rows: 64,
+                max_encoded_bytes: 1 << 20,
+            })
+            .expect("the retained live-tail source is readable for its lease");
+        assert!(
+            !page.batches.is_empty(),
+            "the lease still owns the Arrow it admitted"
+        );
+        assert!(
+            reader
+                .release_fence(fence.fence_id)
+                .expect("explicit release")
+                .released
+        );
+        let after = snapshot();
+        assert_eq!(after.releases, before.releases + 1);
+        assert_eq!(after.active_reservations, 0);
+        reader
+            .release_fence(fence.fence_id)
+            .expect("duplicate release is idempotent");
+        assert_eq!(
+            snapshot().releases,
+            after.releases,
+            "a released owner is never settled a second time"
+        );
+        after
+    }
+
     /// Every terminal live-tail path releases its acquired owner exactly once.
     ///
     /// The reader retains real active and immutable Arrow arrays from the same
@@ -3466,11 +3569,8 @@ mod tests {
             .scribe_memory_used_bytes;
         let (service, _binding) = selective_tail_fixture(tenant, day, stream, resources.clone());
         let reader = ScribeTailReader::new(Arc::new(service), TailFenceConfig::default());
-        let live_request = || {
-            let mut request = empty_fence_request(tenant);
-            request.schema_fingerprint = fixture_schema_fingerprint();
-            request
-        };
+        let mut template = empty_fence_request(tenant);
+        template.schema_fingerprint = fixture_schema_fingerprint();
         let live_bytes = || {
             resources
                 .snapshot()
@@ -3483,72 +3583,12 @@ mod tests {
                 .expect("terminal path ownership snapshot")
         };
 
-        // Deadline: refused before any owner is acquired, so nothing to release.
-        let mut expired = live_request();
-        expired.deadline = chrono::Utc::now() - chrono::Duration::seconds(1);
-        assert!(matches!(
-            reader.acquire_fence(expired).await,
-            Err(TailReadError::DeadlineElapsed)
-        ));
-        let after_deadline = snapshot();
-        assert_eq!(after_deadline.reservations, 0);
-        assert_eq!(after_deadline.releases, 0);
+        assert_refused_acquisitions_settle_once(&reader, &template).await;
         assert_eq!(live_bytes(), baseline_bytes);
 
-        // Error: the owner is acquired, then settled once by the failing path.
-        let mut mismatched = live_request();
-        mismatched.schema_fingerprint =
-            SchemaFingerprint::new("0".repeat(64)).expect("mismatched fingerprint");
-        assert!(matches!(
-            reader.acquire_fence(mismatched).await,
-            Err(TailReadError::SchemaMismatch)
-        ));
-        let after_error = snapshot();
-        assert_eq!(after_error.reservations, 1);
-        assert_eq!(after_error.releases, 1);
-        assert_eq!(after_error.active_reservations, 0);
+        let after_success =
+            assert_lease_is_readable_and_releases_once(&reader, template.clone()).await;
         assert_eq!(live_bytes(), baseline_bytes);
-
-        // Success: real Arrow stays readable for the lease and releases once.
-        let fence = reader
-            .acquire_fence(live_request())
-            .await
-            .expect("live-tail fence over the fixture rows");
-        let retained = snapshot();
-        assert_eq!(retained.active_reservations, 1);
-        assert!(retained.active_reserved_bytes > 0);
-        assert!(live_bytes() > baseline_bytes);
-        let page = reader
-            .read_page(&TailPageRequest {
-                query_id: uuid::Uuid::nil(),
-                fence_id: fence.fence_id,
-                after: None,
-                max_rows: 64,
-                max_encoded_bytes: 1 << 20,
-            })
-            .expect("the retained live-tail source is readable for its lease");
-        assert!(
-            !page.batches.is_empty(),
-            "the lease still owns the Arrow it admitted"
-        );
-        assert!(
-            reader
-                .release_fence(fence.fence_id)
-                .expect("explicit release")
-                .released
-        );
-        let after_success = snapshot();
-        assert_eq!(after_success.releases, retained.releases + 1);
-        assert_eq!(after_success.active_reservations, 0);
-        assert_eq!(live_bytes(), baseline_bytes);
-        reader
-            .release_fence(fence.fence_id)
-            .expect("duplicate release is idempotent");
-        assert_eq!(
-            snapshot().releases,
-            after_success.releases,
-            "a released owner is never settled a second time"
-        );
 
         // Cancellation: a pre-material guard returns its owner exactly once.
         let pending = reader
@@ -3563,7 +3603,7 @@ mod tests {
 
         // Expiry: the lease deadline settles the retained owner exactly once.
         let expiring = reader
-            .acquire_fence(live_request())
+            .acquire_fence(template.clone())
             .await
             .expect("expiring live-tail fence");
         let due = Instant::now() + TailFenceConfig::default().ttl + Duration::from_secs(1);
@@ -3586,7 +3626,7 @@ mod tests {
 
         // Drop: reader destruction drains the one owner still retained.
         reader
-            .acquire_fence(live_request())
+            .acquire_fence(template)
             .await
             .expect("fence retained across reader destruction");
         assert!(live_bytes() > baseline_bytes);

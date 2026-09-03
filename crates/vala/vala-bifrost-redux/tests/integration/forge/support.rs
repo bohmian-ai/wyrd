@@ -871,11 +871,6 @@ impl PromotionIntegrationFixture {
             .expect("a registered fingerprint is a canonical wire fingerprint")
     }
 
-    /// The event day every fixture batch lands in.
-    pub(crate) fn day(&self) -> chrono::NaiveDate {
-        fixture_day()
-    }
-
     /// Reads the promotion settlement columns of the fixture table, in durable order.
     ///
     /// # Panics
@@ -1893,7 +1888,7 @@ async fn register_scribe_fence(
 /// # Panics
 ///
 /// Panics when midnight is not representable, which cannot happen for a UTC day.
-fn fixture_day() -> chrono::NaiveDate {
+pub(crate) fn fixture_day() -> chrono::NaiveDate {
     chrono::Utc::now().date_naive() - chrono::Duration::days(1)
 }
 

@@ -1513,6 +1513,74 @@ impl ForgeWorker {
             .map_err(ForgeError::Sql)
     }
 
+    /// Executes one already-claimed snapshot-expiry task through the real
+    /// fenced path while phase activation is still owned by a later task.
+    ///
+    /// Everything a production attempt does is reused: the same table binding,
+    /// the same table lease, [`Self::execute_fenced`], and the real
+    /// [`Self::finish_claim_execution`] result. Only
+    /// [`super::phase::admits_new_effect`] is bypassed, because snapshot
+    /// expiration is not activated for production routing yet and refusing the
+    /// claim here would prove nothing about its settlement.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Invariant`] when the claim is not an
+    /// exact snapshot-expiry task owned by this worker's attempt,
+    /// [`ForgeError::FenceLost`] when the table lease is held elsewhere, and
+    /// every catalog, SQL, object-store, fencing, or audit failure the fenced
+    /// execution itself raises.
+    #[cfg(feature = "test-support")]
+    pub async fn execute_snapshot_expiry_claim_for_test(
+        &self,
+        claim: ForgeTaskClaim,
+        shutdown: &CancellationToken,
+    ) -> Result<(), ForgeError> {
+        if !matches!(
+            claim.strategy,
+            ForgeClaimStrategy::Known(ForgeTaskStrategy::SnapshotExpiry)
+        ) {
+            return Err(ForgeError::Invariant {
+                detail: "the snapshot-expiry test entrypoint accepts only that strategy".to_owned(),
+            });
+        }
+        let attempt = claim.attempt_id.ok_or_else(|| ForgeError::Invariant {
+            detail: "claimed Forge task has no attempt generation".to_owned(),
+        })?;
+        if claim.claimed_by != Some(self.owner) || claim.state != ForgeTaskState::Claimed {
+            return Err(ForgeError::Invariant {
+                detail: "Forge worker received a claim owned by another attempt".to_owned(),
+            });
+        }
+        let binding = task_table_binding(
+            claim.data_tenant_id,
+            claim.execution_tenant_id,
+            &claim.table_ref,
+        )?;
+        let lease_key = forge_lease_key(
+            claim.data_tenant_id,
+            &binding.logical_namespace,
+            &binding.table_name,
+        );
+        let mut lease = ForgeLease::acquire(
+            &self.forge.core.operator_pool,
+            lease_key,
+            self.owner,
+            self.forge.core.config.lease_ttl,
+        )
+        .await?
+        .ok_or_else(|| ForgeError::FenceLost {
+            lease_key: format!("forge:table:{}:{}", claim.data_tenant_id, binding.table_ref),
+        })?;
+        let result = self
+            .execute_fenced(&claim, attempt, &binding, &mut lease, shutdown)
+            .await;
+        if let Err(error) = lease.release(&self.forge.core.operator_pool).await {
+            tracing::warn!(task_id = %claim.task_id, error = %error, "Forge expiry test lease release failed");
+        }
+        result
+    }
+
     /// Invokes the pre-effect shutdown release directly for one planted claim.
     ///
     /// This narrow seam lets an integration test assert the retain-on-advance
@@ -2491,6 +2559,15 @@ impl ForgeWorker {
         evidence: &ForgeTaskEvidence,
         state: ForgeExecutionEvidenceState,
     ) -> Result<(), ForgeError> {
+        // Atomic expiration settlement already wrote the terminal task
+        // transition, cleared ownership, removed the claims, advanced planning
+        // demand, and appended both terminal audits in one transaction. The row
+        // no longer names this attempt, so heartbeating it would report a
+        // conflict after durable success. The worker performs no second
+        // transition and no further authority refresh at all.
+        if matches!(state, ForgeExecutionEvidenceState::Settled) {
+            return Ok(());
+        }
         self.tasks
             .heartbeat(
                 claim.task_id,
@@ -2505,8 +2582,6 @@ impl ForgeWorker {
             ForgeExecutionEvidenceState::Fresh | ForgeExecutionEvidenceState::RecoveredCommit => {
                 self.persist_success(claim, attempt, lease, evidence).await
             }
-            // Settlement already wrote the terminal task transition and its
-            // planning demand inside the same transaction as the operation.
             ForgeExecutionEvidenceState::Settled => Ok(()),
             ForgeExecutionEvidenceState::Prepared => {
                 self.persist_terminal_success(

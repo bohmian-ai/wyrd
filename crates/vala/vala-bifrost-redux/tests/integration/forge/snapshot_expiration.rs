@@ -10,7 +10,9 @@
 use std::sync::Arc;
 
 use chrono::Duration as ChronoDuration;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+use vala_bifrost_redux::forge::{ForgeWorker, ForgeWorkerConfig};
 use wyrd_spec::DataTenantId;
 
 use super::support::{
@@ -275,7 +277,7 @@ async fn prepared_claim_releases_sql_before_iceberg_and_hands_exact_names_to_cle
         seam,
         supervised,
         watermark,
-    } = expirable_table("expiry_bracket").await;
+    } = expirable_table("expiry_bracket", false).await;
     let forge = supervised.forge();
 
     reject_releases_every_claim(&fixture, &seam, &store, &forge, watermark).await;
@@ -355,11 +357,16 @@ struct ExpirableTable {
 
 /// Promotes twice and ages the clock so the older snapshot is expirable.
 ///
+/// `worker_routed` enables the fixture's `snapshot_expiry_enabled` config so a
+/// maintenance dispatch reaches the expiry owner. It is a fixture capability
+/// flag, not production phase activation, which TASK-055 still owns.
+///
 /// # Panics
 ///
 /// Panics when the fixture cannot promote twice or the table has no head.
-async fn expirable_table(name: &str) -> ExpirableTable {
-    let fixture = PromotionIntegrationFixture::start(name).await;
+async fn expirable_table(name: &str, worker_routed: bool) -> ExpirableTable {
+    let mut fixture = PromotionIntegrationFixture::start(name).await;
+    fixture.config.snapshot_expiry_enabled = worker_routed;
     let store = CountingObjectStore::new(Arc::clone(&fixture.staging));
     let seam = PromotionCatalogSeam::new(fixture.catalog.iceberg_catalog(), store.read_counter());
     let (clock, control) = manual_clock();
@@ -438,7 +445,7 @@ async fn retryable_catalog_failure_retains_prepared_authority() {
         seam,
         supervised,
         watermark,
-    } = expirable_table("expiry_lost_response").await;
+    } = expirable_table("expiry_lost_response", false).await;
     let forge = supervised.forge();
 
     let attempt = Uuid::now_v7();
@@ -541,6 +548,115 @@ async fn retryable_catalog_failure_retains_prepared_authority() {
         store.deletes(),
         deletes_before,
         "expiration deletes nothing"
+    );
+
+    supervised.shutdown().await;
+}
+
+/// Seeds one ready `snapshot_expiry` task with a valid executable envelope.
+///
+/// A ready row is what the production claim transaction consumes, so the test
+/// drives the same admission path a supervised worker would.
+///
+/// # Panics
+///
+/// Panics when the seeding statement fails.
+async fn seed_ready_expiry_task(
+    fixture: &PromotionIntegrationFixture,
+    watermark: (i64, i64),
+    plan_hash_byte: &str,
+) -> Uuid {
+    let task_id = Uuid::now_v7();
+    let (base_snapshot_id, _) = watermark;
+    sqlx::query(
+        "INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,namespace_name,table_name,strategy,lane,base_snapshot_id,plan,plan_hash,estimated_files,estimated_bytes,estimated_parallelism,estimated_memory_bytes,estimated_spill_bytes,large_task_ceiling_bytes,state,ready_at,envelope_version,decoded_batch_bytes,decoded_input_bytes,sort_working_bytes,sort_merge_reservation_bytes,encoder_buffer_bytes,upload_chunk_bytes,footer_encoded_bytes,footer_decode_workspace_bytes,sort_spill_bytes) \
+         VALUES ($1,$2,'wyrd-redux',$3,$4,'snapshot_expiry','ordinary',$5,'{\"version\":1,\"inputs\":[],\"parameters\":{\"kind\":\"maintenance\",\"trigger_commit_count\":1}}'::jsonb,decode(repeat($6,32),'hex'),1,1,1,41943040,1024,1,'ready',now(),2,1024,1024,3072,1024,1024,1024,8388608,33554432,1024)",
+    )
+    .bind(task_id)
+    .bind(fixture.tenant.as_uuid())
+    .bind(fixture.binding.table_ref.namespace.as_str())
+    .bind(&fixture.binding.table_ref.name)
+    .bind(base_snapshot_id)
+    .bind(plan_hash_byte)
+    .execute(fixture.operator_pool.pool())
+    .await
+    .expect("ready snapshot-expiry task seeds");
+    task_id
+}
+
+/// Counts how many times one audit operation appears in a settled sequence.
+fn audit_count(audits: &[String], operation: &str) -> usize {
+    audits.iter().filter(|entry| *entry == operation).count()
+}
+
+/// Proves a worker accepts atomic expiration settlement without transitioning.
+///
+/// # Panics
+///
+/// Panics when the claim is not produced, execution does not return success,
+/// or any terminal owner is written twice.
+#[tokio::test]
+async fn worker_settled_expiration_returns_success_without_a_second_transition() {
+    let ExpirableTable {
+        fixture,
+        store,
+        seam: _seam,
+        supervised,
+        watermark,
+    } = expirable_table("expiry_worker_settles", true).await;
+    let worker = ForgeWorker::new(
+        supervised.forge(),
+        ForgeWorkerConfig::default(),
+        Uuid::now_v7(),
+    )
+    .expect("fixture Forge worker");
+    let task = seed_ready_expiry_task(&fixture, watermark, "44").await;
+    let claim = worker
+        .claim_for_test()
+        .await
+        .expect("the production claim transaction runs")
+        .expect("the ready snapshot-expiry task is claimable");
+    assert_eq!(claim.task_id, task, "the seeded task is the claimed task");
+    let before = expiry_state(&fixture, task).await;
+    let deletes_before = store.deletes();
+
+    worker
+        .execute_snapshot_expiry_claim_for_test(claim, &CancellationToken::new())
+        .await
+        .expect("a settled expiration is a successful worker attempt");
+
+    let settled = expiry_state(&fixture, task).await;
+    assert_eq!(settled.task_state, "succeeded");
+    assert_eq!(settled.claims, 0);
+    assert_eq!(settled.operation_phase.as_deref(), Some("committed"));
+    assert_eq!(
+        audit_count(&settled.audits, "forge.task.succeeded"),
+        1,
+        "the task has exactly one terminal audit: {:?}",
+        settled.audits
+    );
+    assert_eq!(
+        audit_count(&settled.audits, "forge.snapshot_expire.committed"),
+        1,
+        "the operation has exactly one terminal audit: {:?}",
+        settled.audits
+    );
+    assert_eq!(
+        settled.demand_generation,
+        Some(before.demand_generation.unwrap_or(0) + 1),
+        "settlement advances planning demand exactly once"
+    );
+    let owner: Option<Uuid> =
+        sqlx::query_scalar("SELECT claimed_by FROM vala.forge_tasks WHERE task_id = $1")
+            .bind(task)
+            .fetch_one(fixture.operator_pool.pool())
+            .await
+            .expect("settled task remains readable");
+    assert_eq!(owner, None, "settlement cleared task ownership");
+    assert_eq!(
+        store.deletes(),
+        deletes_before,
+        "snapshot expiration never invokes physical cleanup"
     );
 
     supervised.shutdown().await;

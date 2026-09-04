@@ -1212,10 +1212,16 @@ pub(crate) struct HotFileSource {
 /// any stage whose leaves do not all name it.
 #[derive(Debug, Clone)]
 pub(crate) struct OracleRemoteSource {
-    /// Stable request-local scan identity the bound assignment is keyed by.
-    pub(crate) scan_id: String,
+    /// Canonical table name both sides mint this cut's scan identities from.
+    pub(crate) table: String,
     /// The one frozen participant every task of this leaf's stage routes to.
     pub(crate) destination: super::dispatcher::DispatchCandidate,
+    /// Whether the pinned snapshot names any compacted data file.
+    ///
+    /// Only the cut knows this; the provider knows its own hot files. A tier
+    /// the cut does not hold is not delegated at all, so no stage is dispatched
+    /// to read nothing.
+    pub(crate) iceberg: bool,
 }
 
 /// Complete immutable inputs for constructing one authenticated table provider.
@@ -1418,6 +1424,7 @@ impl OracleTableProvider {
     ) -> DataFusionResult<Vec<Arc<dyn ExecutionPlan>>> {
         let required_schema = Arc::clone(&scan_projection.required_schema);
         let mut inputs: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
+        let published_index = inputs.len();
         {
             // `limit` is forwarded only as a per-leaf upper bound; DataFusion's
             // own global limit above this provider remains authoritative. The
@@ -1457,35 +1464,49 @@ impl OracleTableProvider {
         let Some(remote) = self.remote.as_ref() else {
             return Ok(inputs);
         };
-        // A cut with nothing persisted has no leaf to substitute, and a
-        // placeholder over an empty local plan would claim a source the
+        // One placeholder per tier the cut actually holds. A follower resolves
+        // an assignment's whole descriptor list through a single reader, so a
+        // cut holding both compacted and staged output delegates them as two
+        // remote sources; both name the same frozen destination, so the stage
+        // still routes to exactly one participant.
+        let hot_index = published_index + 1;
+        let mut remotes: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
+        for (index, tier) in [
+            (published_index, super::RemotePersistedTier::Iceberg),
+            (hot_index, super::RemotePersistedTier::Hot),
+        ] {
+            let Some(local) = inputs.get(index).filter(|_| match tier {
+                super::RemotePersistedTier::Iceberg => remote.iceberg,
+                super::RemotePersistedTier::Hot => !self.hot_files.is_empty(),
+            }) else {
+                continue;
+            };
+            remotes.push(Arc::new(
+                super::codec::RemoteSourcePlaceholderExec::new(
+                    super::persisted_follower_scan_id(&remote.table, tier),
+                    // The fingerprint is of the table's complete physical
+                    // schema, not of this scan's closure: the follower resolves
+                    // the same catalog provider and compares against
+                    // `provider.schema()` before it reads anything. The closure
+                    // travels separately, as `required_columns`.
+                    super::assignment_schema_fingerprint(&self.physical_schema),
+                    Arc::clone(&required_schema),
+                )
+                .with_closure(
+                    scan_projection.required_columns.clone(),
+                    supported_predicates.to_vec(),
+                )
+                .with_destination(remote.destination.clone())
+                .with_local(Arc::clone(local)),
+            ) as Arc<dyn ExecutionPlan>);
+        }
+        // A cut whose only persisted tier is empty has no leaf to substitute,
+        // and a placeholder over an empty local plan would claim a source the
         // follower could not read either.
-        if inputs.is_empty() {
+        if remotes.is_empty() {
             return Ok(inputs);
         }
-        let local: Arc<dyn ExecutionPlan> = if let [single] = inputs.as_slice() {
-            Arc::clone(single)
-        } else {
-            UnionExec::try_new(inputs)?
-        };
-        Ok(vec![Arc::new(
-            super::codec::RemoteSourcePlaceholderExec::new(
-                remote.scan_id.clone(),
-                // The fingerprint is of the table's complete physical schema,
-                // not of this scan's closure: the follower resolves the same
-                // catalog provider and compares against `provider.schema()`
-                // before it reads anything. The closure travels separately, as
-                // `required_columns`.
-                super::assignment_schema_fingerprint(&self.physical_schema),
-                required_schema,
-            )
-            .with_closure(
-                scan_projection.required_columns.clone(),
-                supported_predicates.to_vec(),
-            )
-            .with_destination(remote.destination.clone())
-            .with_local(local),
-        ) as Arc<dyn ExecutionPlan>])
+        Ok(remotes)
     }
 
     /// Returns the staged hot files this query can still read a row from.

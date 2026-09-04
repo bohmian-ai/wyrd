@@ -3056,10 +3056,13 @@ impl Oracle {
             .collect::<Vec<_>>();
         let mut follower_assignments = std::collections::HashMap::new();
         for placeholder in root.map(remote_placeholders).unwrap_or_default() {
-            let cut = cuts
+            let (cut, tier) = cuts
                 .iter()
-                .find(|cut| {
-                    persisted_follower_scan_id(&cut.binding.table_ref.fqn())
+                .flat_map(|cut| {
+                    [RemotePersistedTier::Iceberg, RemotePersistedTier::Hot].map(|tier| (cut, tier))
+                })
+                .find(|(cut, tier)| {
+                    persisted_follower_scan_id(&cut.binding.table_ref.fqn(), *tier)
                         == placeholder.scan_id()
                 })
                 .ok_or(BifrostError::QueryExecutionFailed)?;
@@ -3068,7 +3071,7 @@ impl Oracle {
             };
             follower_assignments.insert(
                 placeholder.scan_id().to_owned(),
-                follower_scan_assignment(cut, &placeholder)?,
+                follower_scan_assignment(cut, tier, &placeholder)?,
             );
             planned.push(key);
         }
@@ -3799,8 +3802,9 @@ impl Oracle {
                 .get(index % destinations.len().max(1))
                 .filter(|_| scannable)
                 .map(|destination| exec::OracleRemoteSource {
-                    scan_id: persisted_follower_scan_id(&table_name),
+                    table: table_name.clone(),
                     destination: destination.clone(),
+                    iceberg: !cut.iceberg_files.is_empty(),
                 });
             // The leader keeps its own hot sources even when a remote owner is
             // frozen. The placeholder that substitutes them still carries them
@@ -4145,11 +4149,12 @@ pub(super) fn remote_placeholders(
 
 /// Builds the one assignment a cut's frozen remote owner is signed to read.
 ///
-/// Every published Iceberg object and every unpublished hot object the cut
-/// pinned becomes a descriptor here, in cut order, because the leader registered
-/// no local reader for them. The closure and predicates come from the planned
-/// placeholder rather than being recomputed, so what the follower is authorized
-/// to read is exactly what the retained plan projected.
+/// Every object the cut pinned in `tier` becomes a descriptor here, in cut
+/// order, because the leader registered no local reader for them. One
+/// assignment names one tier: the follower resolves its whole descriptor list
+/// through a single reader and refuses a mixed list. The closure and predicates
+/// come from the planned placeholder rather than being recomputed, so what the
+/// follower is authorized to read is exactly what the retained plan projected.
 ///
 /// # Errors
 ///
@@ -4158,16 +4163,21 @@ pub(super) fn remote_placeholders(
 /// colliding object key.
 fn follower_scan_assignment(
     cut: &PinnedSealedTable,
+    tier: RemotePersistedTier,
     placeholder: &codec::RemoteSourcePlaceholderExec,
 ) -> Result<wyrd_spec::vala::api::FollowerScanAssignment, BifrostError> {
-    let mut files = cut
-        .iceberg_files
-        .iter()
-        .map(|file| iceberg_file_descriptor(file, cut.snapshot_id))
-        .collect::<Vec<_>>();
-    for row in &cut.hot_files {
-        files.push(hot_file_descriptor(row)?);
-    }
+    let files = match tier {
+        RemotePersistedTier::Iceberg => cut
+            .iceberg_files
+            .iter()
+            .map(|file| iceberg_file_descriptor(file, cut.snapshot_id))
+            .collect::<Vec<_>>(),
+        RemotePersistedTier::Hot => cut
+            .hot_files
+            .iter()
+            .map(hot_file_descriptor)
+            .collect::<Result<Vec<_>, _>>()?,
+    };
     Ok(wyrd_spec::vala::api::FollowerScanAssignment {
         scan_id: placeholder.scan_id().to_owned(),
         binding: tail_fence::TailFenceDrainer::wire_binding(cut)?,
@@ -4182,13 +4192,38 @@ fn follower_scan_assignment(
     })
 }
 
-/// Derives the stable scan identity one cut's remote persisted sources bind by.
+/// The persisted tier one remote source names.
 ///
-/// Leader and binder both compute it from the canonical table name alone, so
-/// the planned placeholder and the assignment published after admission name
-/// the same source without either side carrying the other's state.
-fn persisted_follower_scan_id(table: &str) -> String {
-    format!("oracle:{table}:persisted")
+/// A follower assignment resolves its whole descriptor list through a single
+/// reader — the catalog provider's scan for compacted output, `HotParquetExec`
+/// for staged output — so a cut holding both tiers delegates them as two remote
+/// sources rather than one list no reader can serve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemotePersistedTier {
+    /// Data files in the cut's pinned Iceberg snapshot.
+    Iceberg,
+    /// Staged hot Parquet the pinned snapshot's manifest does not name.
+    Hot,
+}
+
+impl RemotePersistedTier {
+    /// Returns the stable suffix this tier contributes to a scan identity.
+    const fn tag(self) -> &'static str {
+        match self {
+            Self::Iceberg => "iceberg",
+            Self::Hot => "hot",
+        }
+    }
+}
+
+/// Derives the stable scan identity one cut's remote persisted source binds by.
+///
+/// Leader and binder both compute it from the canonical table name and the tier
+/// alone, so the planned placeholder and the assignment published after
+/// admission name the same source without either side carrying the other's
+/// state.
+fn persisted_follower_scan_id(table: &str, tier: RemotePersistedTier) -> String {
+    format!("oracle:{table}:{}", tier.tag())
 }
 
 /// Computes the fingerprint a follower scan assignment must carry for a schema,

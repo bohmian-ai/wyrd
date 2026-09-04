@@ -796,4 +796,3 @@ recorded rather than suppressed.
   fails intermittently in the journey lane on its byte-accounting assertion
   (`narrow=22370 broad=4856`), independent of this task's changes. It is the
   same journey already recorded above as broken by a rejected scenario 1 repair.
-

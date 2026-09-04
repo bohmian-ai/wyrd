@@ -1717,4 +1717,205 @@ mod tests {
             Err(PeerSecurityError::Fence),
         );
     }
+
+    /// Builds one fully bound final v1 forwarding envelope for authority tests.
+    ///
+    /// Every field the envelope signs is set to a distinguishable value so a
+    /// per-field mutation test can prove the signature covers it: the audience
+    /// and fence the verifier checks directly, the replay identity and expiry,
+    /// the authenticated caller context including its request id, the complete
+    /// unchanged request body, and the absolute query deadline.
+    fn forward_claims(
+        worker: NodeId,
+        worker_fence: u64,
+        tenant_id: DataTenantId,
+        now: DateTime<Utc>,
+    ) -> ForwardQueryClaims {
+        use wyrd_runtime::permission::PermissionSet;
+        use wyrd_runtime::{Permission, Principal, PrincipalKind};
+        use wyrd_spec::auth::PrincipalId;
+        use wyrd_spec::request_id::RequestId;
+        use wyrd_spec::vala::api::{FreshnessPolicy, VisibilityMode};
+
+        let permission = Permission::bifrost_query_read();
+        let principal = Principal::new(
+            PrincipalId::new(uuid::Uuid::now_v7()),
+            PrincipalKind::User,
+            tenant_id,
+            Vec::new(),
+            PermissionSet::from_iter([permission.clone()]),
+        );
+        let context = vala_bifrost_redux::oracle::AuthorizedQueryContext::try_new(
+            principal,
+            tenant_id,
+            RequestId::now_v7(),
+            None,
+            wyrd_spec::vala::api::AuthMethod::Internal,
+            permission.to_string(),
+        )
+        .expect("tenant-bound query context");
+        ForwardQueryClaims {
+            protocol_version: 1,
+            audience: worker,
+            worker_fence,
+            nonce: uuid::Uuid::now_v7().as_bytes().to_vec(),
+            expires_at_ms: (now + chrono::Duration::seconds(5)).timestamp_millis(),
+            context,
+            request: BifrostQueryRequest {
+                sql: "SELECT value FROM vala.bifrost.events".to_owned(),
+                visibility: VisibilityMode::PublishedOnly,
+                freshness: FreshnessPolicy::Strict,
+                deadline_ms: Some(5_000),
+            },
+            absolute_deadline_ms: (now + chrono::Duration::seconds(30)).timestamp_millis(),
+        }
+    }
+
+    /// Re-signs nothing: swaps only the claims bytes under an existing signature.
+    ///
+    /// A forwarding binding is authenticated by the detached signature over the
+    /// serialized claims, so substituting any single field produces bytes the
+    /// original signature no longer covers. This is how the test proves a field
+    /// the verifier never reads — the request body, the caller context, the
+    /// absolute deadline — is still bound.
+    fn substitute_claims(
+        ticket: &SignedPeerTicket,
+        claims: &ForwardQueryClaims,
+    ) -> SignedPeerTicket {
+        SignedPeerTicket {
+            key_id: ticket.key_id.clone(),
+            claims_bytes: serde_json::to_vec(claims).expect("claims encode"),
+            signature: ticket.signature.clone(),
+        }
+    }
+
+    /// The final v1 forwarding envelope round-trips and binds every signed field.
+    #[tokio::test]
+    async fn forward_query_claims_round_trip_and_bind_every_field() {
+        let (authority, _audit) = authority();
+        let worker = NodeId::new(uuid::Uuid::from_u128(71));
+        let tenant = DataTenantId::new(uuid::Uuid::now_v7()).expect("tenant");
+        let now = Utc::now();
+        let claims = forward_claims(worker, 11, tenant, now);
+
+        let ticket = authority.mint_forward_query(&claims).expect("ticket");
+        let verified = authority
+            .verify_forward_query(&ticket, worker, 11, now)
+            .await
+            .expect("a correct forwarding envelope is authorized");
+        assert_eq!(verified.protocol_version, 1);
+        assert_eq!(verified.audience, claims.audience);
+        assert_eq!(verified.worker_fence, claims.worker_fence);
+        assert_eq!(verified.nonce, claims.nonce);
+        assert_eq!(verified.expires_at_ms, claims.expires_at_ms);
+        assert_eq!(verified.context.data_tenant_id, tenant);
+        assert_eq!(verified.context.request_id, claims.context.request_id);
+        assert_eq!(verified.context.permission, claims.context.permission);
+        assert_eq!(verified.request, claims.request);
+        assert_eq!(verified.absolute_deadline_ms, claims.absolute_deadline_ms);
+
+        assert_eq!(
+            authority
+                .verify_forward_query(&ticket, worker, 11, now)
+                .await
+                .expect_err("a replayed forwarding envelope is refused"),
+            PeerSecurityError::Replay
+        );
+
+        let wrong_audience = authority
+            .mint_forward_query(&forward_claims(
+                NodeId::new(uuid::Uuid::from_u128(72)),
+                11,
+                tenant,
+                now,
+            ))
+            .expect("ticket");
+        assert_eq!(
+            authority
+                .verify_forward_query(&wrong_audience, worker, 11, now)
+                .await
+                .expect_err("another Oracle's envelope is refused"),
+            PeerSecurityError::Audience
+        );
+
+        let wrong_version = authority
+            .mint_forward_query(&ForwardQueryClaims {
+                protocol_version: 2,
+                ..forward_claims(worker, 11, tenant, now)
+            })
+            .expect("ticket");
+        assert_eq!(
+            authority
+                .verify_forward_query(&wrong_version, worker, 11, now)
+                .await
+                .expect_err("only protocol version 1 is accepted"),
+            PeerSecurityError::Audience
+        );
+
+        let stale_fence = authority
+            .mint_forward_query(&forward_claims(worker, 10, tenant, now))
+            .expect("ticket");
+        assert_eq!(
+            authority
+                .verify_forward_query(&stale_fence, worker, 11, now)
+                .await
+                .expect_err("a pre-restart fence is refused"),
+            PeerSecurityError::Fence
+        );
+
+        let expired = authority
+            .mint_forward_query(&ForwardQueryClaims {
+                expires_at_ms: (now - chrono::Duration::milliseconds(1)).timestamp_millis(),
+                ..forward_claims(worker, 11, tenant, now)
+            })
+            .expect("ticket");
+        assert_eq!(
+            authority
+                .verify_forward_query(&expired, worker, 11, now)
+                .await
+                .expect_err("an expired envelope is refused"),
+            PeerSecurityError::Expired
+        );
+
+        let signed = authority
+            .mint_forward_query(&forward_claims(worker, 11, tenant, now))
+            .expect("ticket");
+        let base = forward_claims(worker, 11, tenant, now);
+        let mut substitutions = vec![
+            ForwardQueryClaims {
+                context: forward_claims(worker, 11, tenant, now).context,
+                ..base.clone()
+            },
+            ForwardQueryClaims {
+                request: BifrostQueryRequest {
+                    sql: "SELECT 1".to_owned(),
+                    ..base.request.clone()
+                },
+                ..base.clone()
+            },
+            ForwardQueryClaims {
+                absolute_deadline_ms: base.absolute_deadline_ms + 1,
+                ..base.clone()
+            },
+            ForwardQueryClaims {
+                nonce: uuid::Uuid::now_v7().as_bytes().to_vec(),
+                ..base.clone()
+            },
+        ];
+        substitutions.push(base);
+        for substituted in substitutions {
+            assert_eq!(
+                authority
+                    .verify_forward_query(
+                        &substitute_claims(&signed, &substituted),
+                        worker,
+                        11,
+                        now
+                    )
+                    .await
+                    .expect_err("a substituted signed binding is refused"),
+                PeerSecurityError::InvalidSignature
+            );
+        }
+    }
 }

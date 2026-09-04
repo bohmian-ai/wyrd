@@ -1457,6 +1457,9 @@ the strength of a hand-off note rather than to this task file, which is the
 authority. The task is the unit of completion; a scenario finishing does not
 finish the task.
 
+**Use tracing, metrics and logging to diagnose failures.** Leverage the available observability tools to understand why each journey lane is failing and to guide the remediation efforts. eprint is not
+acceptable as a substitute for proper observability; rely on structured tracing, metrics, and logging to gather actionable insights.
+
 **The failing journey lanes are in scope and are a blocker.** Six Oracle journey
 tests are red at this commit:
 

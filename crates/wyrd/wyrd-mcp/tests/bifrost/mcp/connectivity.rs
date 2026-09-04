@@ -20,6 +20,41 @@ use wyrd_testing::WyrdTestServer;
 /// Boxed error carried by every helper in this journey.
 pub(crate) type McpJourneyError = Box<dyn std::error::Error + Send + Sync>;
 
+/// Read one tool call's structured content, failing on a tool-level error.
+///
+/// # Errors
+///
+/// Returns the structured Wyrd problem when the call reported `is_error`, and
+/// a description when it carried no structured content at all.
+pub(crate) fn structured(
+    result: rmcp::model::CallToolResult,
+) -> Result<serde_json::Value, McpJourneyError> {
+    let content = result
+        .structured_content
+        .ok_or("a Wyrd MCP tool returns structured content")?;
+    if result.is_error == Some(true) {
+        return Err(format!("tool call failed: {content}").into());
+    }
+    Ok(content)
+}
+
+/// Read the canonical Wyrd problem from a call that must have failed.
+///
+/// # Errors
+///
+/// Returns a description when the call succeeded or carried no problem.
+pub(crate) fn problem(
+    result: rmcp::model::CallToolResult,
+) -> Result<serde_json::Value, McpJourneyError> {
+    let content = result
+        .structured_content
+        .ok_or("a failed Wyrd MCP tool returns its structured problem")?;
+    if result.is_error != Some(true) {
+        return Err(format!("tool call unexpectedly succeeded: {content}").into());
+    }
+    Ok(content)
+}
+
 /// Build the first-party MCP client transport for `server` using `credential`.
 ///
 /// The credential path is the production one: for an API key the middleware

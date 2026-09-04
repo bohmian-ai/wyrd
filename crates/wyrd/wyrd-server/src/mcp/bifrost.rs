@@ -13,8 +13,10 @@ use arrow::json::writer::{EncoderOptions, make_encoder};
 use arrow::record_batch::RecordBatch;
 use futures_util::StreamExt as _;
 use rmcp::model::{CallToolResult, Tool, ToolAnnotations};
+use rmcp::service::{RequestContext, RoleServer};
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
+use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::oracle::{OracleQueryStream, QueryIpcDecoder};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::BifrostError as ValaError;
@@ -57,6 +59,14 @@ const DEFAULT_MAX_BYTES: usize = 4 * 1024 * 1024;
 
 /// Largest `max_bytes` an MCP caller may ask for, well under the server's 256 MiB.
 const MAX_BYTES_CEILING: usize = 16 * 1024 * 1024;
+
+/// Compact-JSON bytes the result object costs before any content is charged.
+///
+/// `{"columns":`, `,"rows":`, the row array's `[` and `]`, `,"terminal":`, and
+/// the closing `}` are structural and always present, so they are charged once
+/// up front and the columns, each row plus its separating comma, and the
+/// terminal are charged as they are produced.
+const STRUCTURED_OVERHEAD_BYTES: usize = 11 + 8 + 2 + 12 + 1;
 
 /// The exact catalog every ordinary Wyrd server advertises.
 ///
@@ -391,15 +401,49 @@ pub(crate) async fn query(
     state: &AppState,
     caller: Caller,
     arguments: Option<serde_json::Map<String, JsonValue>>,
+    context: &RequestContext<RoleServer>,
 ) -> Result<CallToolResult, WyrdError> {
     let arguments: QueryArguments = parse_arguments(QUERY, arguments)?;
     arguments.validate()?;
     let stream =
         crate::query::service::stream_query(state.clone(), caller, arguments.to_request()).await?;
+    #[cfg(feature = "test-support")]
+    let stall = claim_schema_stall(state, &stream);
     let collector = ResultCollector {
         max_rows: usize::try_from(arguments.max_rows).unwrap_or(usize::MAX),
+        max_bytes: arguments.max_bytes,
+        bytes: STRUCTURED_OVERHEAD_BYTES,
+        #[cfg(feature = "test-support")]
+        stall,
     };
-    Ok(CallToolResult::structured(collector.collect(stream).await?))
+    Ok(CallToolResult::structured(
+        collector.collect(stream, &context.ct).await?,
+    ))
+}
+
+/// Claim the deterministic post-schema hold a cancellation journey armed.
+///
+/// The hold is the only way a journey can cancel a query that is genuinely
+/// mid-flight: a fixture table answers faster than a cancellation notification
+/// can cross the wire, so without it the race the collector must win would
+/// never actually be run. It exists exclusively in `test-support` builds and
+/// binds Oracle's own resource probe so the journey can assert release against
+/// the same query identity.
+#[cfg(feature = "test-support")]
+fn claim_schema_stall(
+    state: &AppState,
+    stream: &OracleQueryStream,
+) -> Option<Arc<crate::state::QueryStreamStall>> {
+    let controller = state.query_stream_fault.as_ref()?;
+    if !matches!(
+        controller.claim(),
+        Some(crate::state::QueryStreamFault::StallAfterSchema)
+    ) {
+        return None;
+    }
+    let stall = controller.claim_stall()?;
+    stall.bind_resource_probe(stream.resource_probe_for_test());
+    Some(stall)
 }
 
 /// Collects one Oracle stream into the single value `bifrost.query` returns.
@@ -411,6 +455,13 @@ pub(crate) async fn query(
 struct ResultCollector {
     /// Row ceiling this caller asked for. Exceeding it fails; nothing truncates.
     max_rows: usize,
+    /// Exact compact-JSON byte ceiling for `{columns, rows, terminal}`.
+    max_bytes: usize,
+    /// Exact bytes charged so far, starting at the fixed structural overhead.
+    bytes: usize,
+    /// Deterministic post-schema hold used only by cancellation journeys.
+    #[cfg(feature = "test-support")]
+    stall: Option<Arc<crate::state::QueryStreamStall>>,
 }
 
 impl ResultCollector {
@@ -422,13 +473,26 @@ impl ResultCollector {
     /// error. Every pre-terminal failure awaits [`OracleQueryStream::cancel`]
     /// first, so Oracle has released admission, memory, peer work, scratch, and
     /// graph leases before this returns.
-    async fn collect(self, mut stream: OracleQueryStream) -> Result<JsonValue, WyrdError> {
+    async fn collect(
+        mut self,
+        mut stream: OracleQueryStream,
+        cancel: &CancellationToken,
+    ) -> Result<JsonValue, WyrdError> {
         let mut ipc = QueryIpcDecoder::new();
         let mut columns: Option<Vec<JsonValue>> = None;
         let mut schema: Option<arrow::datatypes::SchemaRef> = None;
         let mut rows: Vec<JsonValue> = Vec::new();
         let mut terminal: Option<JsonValue> = None;
-        while let Some(frame) = stream.frames.next().await {
+        loop {
+            let next = tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    stream.cancel().await;
+                    return Err(ValaError::QueryStreamIncomplete.into());
+                }
+                frame = stream.frames.next() => frame,
+            };
+            let Some(frame) = next else { break };
             let frame = match frame {
                 Ok(frame) => frame,
                 Err(error) => {
@@ -440,8 +504,18 @@ impl ResultCollector {
                 QueryStreamFrame::Schema(accepted) if schema.is_none() => {
                     match ipc.accept_schema(&accepted.arrow_ipc_schema) {
                         Ok(accepted) => {
-                            columns = Some(project_columns(&accepted));
+                            let projected = project_columns(&accepted);
+                            if let Err(error) = self.charge(&projected) {
+                                stream.cancel().await;
+                                return Err(error);
+                            }
+                            columns = Some(projected);
                             schema = Some(accepted);
+                            #[cfg(feature = "test-support")]
+                            if let Some(stall) = self.stall.take() {
+                                stall.mark_entered();
+                                cancel.cancelled().await;
+                            }
                         }
                         Err(error) => {
                             stream.cancel().await;
@@ -489,6 +563,10 @@ impl ResultCollector {
             stream.cancel().await;
             return Err(ValaError::QueryStreamIncomplete.into());
         };
+        if let Err(error) = self.charge(&terminal) {
+            stream.cancel().await;
+            return Err(error);
+        }
         Ok(serde_json::json!({
             "columns": columns,
             "rows": rows,
@@ -503,7 +581,7 @@ impl ResultCollector {
     /// Returns [`ValaError::QueryResultTooLarge`] when the batch would carry the
     /// result past the caller's row ceiling, and [`WyrdError::Internal`] when a
     /// column has no Arrow JSON encoder.
-    fn retain(&self, rows: &mut Vec<JsonValue>, batch: &RecordBatch) -> Result<(), WyrdError> {
+    fn retain(&mut self, rows: &mut Vec<JsonValue>, batch: &RecordBatch) -> Result<(), WyrdError> {
         if rows.len().saturating_add(batch.num_rows()) > self.max_rows {
             return Err(ValaError::QueryResultTooLarge.into());
         }
@@ -539,8 +617,49 @@ impl ResultCollector {
                     })?,
                 );
             }
-            rows.push(JsonValue::Array(row));
+            let row = JsonValue::Array(row);
+            if !rows.is_empty() {
+                self.charge_bytes(1)?;
+            }
+            self.charge(&row)?;
+            rows.push(row);
         }
+        Ok(())
+    }
+
+    /// Charge one value's exact compact-JSON length against the budget.
+    ///
+    /// The value is serialized into a temporary buffer purely to measure it, so
+    /// the caller can refuse it before retaining it: an overflow must never
+    /// leave a partially built result that could be mistaken for a short one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WyrdError::Internal`] when the value cannot be serialized, and
+    /// [`ValaError::QueryResultTooLarge`] when charging it exceeds the ceiling.
+    fn charge<T: serde::Serialize + ?Sized>(&mut self, value: &T) -> Result<(), WyrdError> {
+        let measured = serde_json::to_vec(value).map_err(|error| WyrdError::Internal {
+            message: format!("{QUERY} could not measure its own result: {error}"),
+            details: serde_json::json!({ "tool": QUERY }),
+        })?;
+        self.charge_bytes(measured.len())
+    }
+
+    /// Charge an exact byte count, refusing overflow of the count or ceiling.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValaError::QueryResultTooLarge`] when the running count would
+    /// overflow or would exceed the caller's byte ceiling.
+    fn charge_bytes(&mut self, amount: usize) -> Result<(), WyrdError> {
+        let charged = self
+            .bytes
+            .checked_add(amount)
+            .ok_or(ValaError::QueryResultTooLarge)?;
+        if charged > self.max_bytes {
+            return Err(ValaError::QueryResultTooLarge.into());
+        }
+        self.bytes = charged;
         Ok(())
     }
 }
@@ -584,9 +703,189 @@ fn project_terminal(frame: &QueryTerminalFrame) -> JsonValue {
 mod tests {
     use super::{
         DEFAULT_MAX_BYTES, DEFAULT_MAX_ROWS, MAX_BYTES_CEILING, MAX_ROWS_CEILING, MAX_SQL_BYTES,
-        QUERY, QueryArguments, descriptors, parse_arguments,
+        QUERY, QueryArguments, ResultCollector, STRUCTURED_OVERHEAD_BYTES, descriptors,
+        parse_arguments,
     };
-    use wyrd_spec::vala::api::{FreshnessPolicy, VisibilityMode};
+    use std::sync::Arc;
+
+    use arrow::array::{ArrayRef, BinaryArray, Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Fields, Schema};
+    use arrow::record_batch::RecordBatch;
+    use tokio_util::sync::CancellationToken;
+    use vala_bifrost_redux::oracle::OracleQueryStream;
+    use wyrd_spec::error::WyrdError;
+    use wyrd_spec::vala::api::{
+        FreshnessPolicy, QueryBatchFrame, QueryExecutionPath, QueryFreshness, QuerySchemaFrame,
+        QueryStreamFrame, QueryTerminalFrame, QueryTerminalOutcome, VisibilityMode,
+    };
+
+    /// One synthetic batch carrying every shape the projection must survive.
+    ///
+    /// Two columns share the name `value` so an object row model would lose
+    /// one of them, the first column has a null slot, `payload` is binary, and
+    /// `nested` is a struct: between them they cover the null, duplicate-name,
+    /// opaque-bytes, and non-scalar cases the encoder handles differently.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture arrays do not match the fixture schema, which is
+    /// a defect in this test rather than a runtime condition.
+    fn projection_batch() -> RecordBatch {
+        let nested_fields = Fields::from(vec![Field::new("depth", DataType::Int64, false)]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Int64, true),
+            Field::new("value", DataType::Utf8, false),
+            Field::new("payload", DataType::Binary, false),
+            Field::new("nested", DataType::Struct(nested_fields.clone()), false),
+        ]));
+        let nested: ArrayRef = Arc::new(arrow::array::StructArray::new(
+            nested_fields,
+            vec![Arc::new(Int64Array::from(vec![7, 8]))],
+            None,
+        ));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![None, Some(2)])),
+                Arc::new(StringArray::from(vec!["first", "second"])),
+                Arc::new(BinaryArray::from(vec![
+                    b"\x00\xff".as_ref(),
+                    b"ok".as_ref(),
+                ])),
+                nested,
+            ],
+        )
+        .expect("the fixture arrays match the fixture schema")
+    }
+
+    /// Build one settled synthetic Oracle stream carrying `batch`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the Arrow IPC writer rejects the fixture batch.
+    fn synthetic_stream(batch: &RecordBatch) -> (OracleQueryStream, CancellationToken) {
+        let mut writer =
+            arrow::ipc::writer::StreamWriter::try_new(Vec::new(), batch.schema().as_ref())
+                .expect("the fixture schema writes");
+        let prefix = std::mem::take(writer.get_mut());
+        writer.write(batch).expect("the fixture batch writes");
+        let fragment = std::mem::take(writer.get_mut());
+        writer.finish().expect("the fixture writer finishes");
+        let eos = std::mem::take(writer.get_mut());
+        let frames = vec![
+            Ok(QueryStreamFrame::Schema(QuerySchemaFrame {
+                schema_fingerprint: "mcp-projection".to_owned(),
+                arrow_ipc_schema: prefix,
+            })),
+            Ok(QueryStreamFrame::Batch(QueryBatchFrame {
+                arrow_ipc_batch: fragment,
+            })),
+            Ok(QueryStreamFrame::Terminal(QueryTerminalFrame {
+                outcome: QueryTerminalOutcome::Success,
+                freshness: QueryFreshness::Complete,
+                execution_path: QueryExecutionPath::Interactive,
+                row_count: 2,
+                warnings: Vec::new(),
+                source_completion: Vec::new(),
+                error: None,
+                arrow_ipc_eos: eos,
+            })),
+        ];
+        let cancellation = CancellationToken::new();
+        let stream = OracleQueryStream::test_new(
+            "mcp-projection".to_owned(),
+            Box::pin(async_stream::stream! {
+                for frame in frames {
+                    yield frame;
+                }
+            }),
+            cancellation.clone(),
+        );
+        (stream, cancellation)
+    }
+
+    /// The result is positional, Arrow-encoded, and charged to the exact byte.
+    ///
+    /// The byte ceiling is the only budget an agent cannot estimate for itself,
+    /// so it has to mean exactly one thing: the compact JSON the tool actually
+    /// returns. The test recomputes that length from the returned value, proves
+    /// the exact length is accepted, and proves one byte less is refused as a
+    /// canonical too-large error rather than a truncated success.
+    #[test]
+    fn query_result_is_positional_and_counts_exact_structured_json_bytes() {
+        wyrd_runtime::runtime().block_on(async {
+            let batch = projection_batch();
+            let collector = |max_bytes: usize| ResultCollector {
+                max_rows: 10,
+                max_bytes,
+                bytes: STRUCTURED_OVERHEAD_BYTES,
+                #[cfg(feature = "test-support")]
+                stall: None,
+            };
+
+            let (stream, _token) = synthetic_stream(&batch);
+            let value = collector(MAX_BYTES_CEILING)
+                .collect(stream, &CancellationToken::new())
+                .await
+                .expect("an unconstrained projection succeeds");
+
+            assert_eq!(
+                value["columns"],
+                serde_json::json!([
+                    {"name": "value", "data_type": "Int64", "nullable": true},
+                    {"name": "value", "data_type": "Utf8", "nullable": false},
+                    {"name": "payload", "data_type": "Binary", "nullable": false},
+                    {
+                        "name": "nested",
+                        "data_type": "Struct(\"depth\": non-null Int64)",
+                        "nullable": false,
+                    },
+                ]),
+                "columns are ordered triples that keep both `value` columns"
+            );
+            assert_eq!(
+                value["rows"],
+                serde_json::json!([
+                    [null, "first", "00ff", {"depth": 7}],
+                    [2, "second", "6f6b", {"depth": 8}],
+                ]),
+                "rows are positional arrays using Arrow's own JSON encoding"
+            );
+
+            let exact = serde_json::to_vec(&value)
+                .expect("the projected value serializes")
+                .len();
+
+            let (stream, _token) = synthetic_stream(&batch);
+            assert_eq!(
+                collector(exact)
+                    .collect(stream, &CancellationToken::new())
+                    .await
+                    .expect("the exact serialized length is within budget"),
+                value,
+                "the ceiling counts exactly the bytes the tool returns"
+            );
+
+            let (stream, token) = synthetic_stream(&batch);
+            let refused = collector(exact - 1)
+                .collect(stream, &CancellationToken::new())
+                .await
+                .expect_err("one byte less than the result is refused");
+            assert_eq!(
+                refused.code(),
+                "WYRD_VALA_413_QUERY_RESULT_TOO_LARGE",
+                "overflow is the canonical too-large error, never a truncation"
+            );
+            assert!(
+                matches!(refused, WyrdError::Vala { .. }),
+                "overflow keeps its Bifrost error identity: {refused:?}"
+            );
+            assert!(
+                token.is_cancelled(),
+                "an overflowing stream is settled before the tool returns"
+            );
+        });
+    }
 
     /// The query tool accepts exactly six bounded fields and no path selector.
     ///

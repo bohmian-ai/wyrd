@@ -39,7 +39,7 @@ wyrd-testing = { workspace = true }
 # Journey plumbing only: the discovery journey registers a second tenant's
 # table through the production catalog so the list projection's tenancy claim
 # is about two real tables, not one.
-vala-bifrost-redux = { workspace = true }
+vala-bifrost-redux = { workspace = true, features = ["test-support"] }
 arrow = { workspace = true }
 wyrd-server = { workspace = true, features = ["test-support"] }
 wyrd-spec = { workspace = true }

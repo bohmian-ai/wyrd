@@ -6,10 +6,10 @@
 //! without a second lookup. The journey drives all three through a real `rmcp`
 //! client so what it observes is what an agent observes.
 
-use crate::connectivity::{McpJourneyError, discover, transport};
+use crate::connectivity::{McpJourneyError, discover, problem, structured, transport};
 
 mod pg_tests {
-    use super::{McpJourneyError, discover, transport};
+    use super::{McpJourneyError, discover, problem, structured, transport};
 
     use rmcp::ClientServiceExt as _;
     use rmcp::model::CallToolRequestParams;
@@ -25,39 +25,6 @@ mod pg_tests {
         "bifrost.describe_table",
         "bifrost.query",
     ];
-
-    /// Read one tool call's structured content, failing on a tool-level error.
-    ///
-    /// # Errors
-    ///
-    /// Returns the structured Wyrd problem when the call reported `is_error`,
-    /// and a description when it carried no structured content at all.
-    fn structured(
-        result: rmcp::model::CallToolResult,
-    ) -> Result<serde_json::Value, McpJourneyError> {
-        let content = result
-            .structured_content
-            .ok_or("a Bifrost tool returns structured content")?;
-        if result.is_error == Some(true) {
-            return Err(format!("tool call failed: {content}").into());
-        }
-        Ok(content)
-    }
-
-    /// Read the canonical Wyrd problem from a call that must have failed.
-    ///
-    /// # Errors
-    ///
-    /// Returns a description when the call succeeded or carried no problem.
-    fn problem(result: rmcp::model::CallToolResult) -> Result<serde_json::Value, McpJourneyError> {
-        let content = result
-            .structured_content
-            .ok_or("a failed Bifrost tool returns its structured problem")?;
-        if result.is_error != Some(true) {
-            return Err(format!("tool call unexpectedly succeeded: {content}").into());
-        }
-        Ok(content)
-    }
 
     /// An agent sees exactly three tools, only its own tenant's tables, and the
     /// complete physical layout of the one it selects.

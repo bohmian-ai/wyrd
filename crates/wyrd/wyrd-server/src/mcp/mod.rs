@@ -195,7 +195,7 @@ impl ServerHandler for WyrdMcpHandler {
             }
             bifrost::QUERY => {
                 let caller = Self::caller(&context).map_err(wyrd_error_to_mcp)?;
-                bifrost::query(&self.state, caller, request.arguments).await
+                bifrost::query(&self.state, caller, request.arguments, &context).await
             }
             unknown => {
                 return Err(ErrorData::new(

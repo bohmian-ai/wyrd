@@ -130,7 +130,8 @@ pub use ownership::{
     DelegatedOracleAdmissionGrant, DelegatedOracleAdmissionWorker,
 };
 pub use participant_cut::{
-    OracleQueryAttemptCut, OracleQueryAttemptCutError, OracleQueryParticipant,
+    OracleQueryAttemptCut, OracleQueryAttemptCutError, OracleQueryAttemptRoster,
+    OracleQueryParticipant,
 };
 use planner::OracleClassification;
 pub use planner::OraclePlanner;

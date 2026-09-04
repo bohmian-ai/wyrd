@@ -66,19 +66,51 @@ pub enum OracleQueryAttemptCutError {
     DeadlineElapsed,
 }
 
-impl OracleQueryAttemptCut {
-    /// Freezes one fresh snapshot into the exact participants for a query attempt.
+/// One class-neutral frozen membership and source cut for a query attempt.
+///
+/// A leader must freeze membership before it knows the query's class, because
+/// the class is derived from a physical root that can only be built against the
+/// frozen cut. This value is that intermediate: the exact same participants,
+/// leader, and deadline the signed cut will carry, validated for readiness,
+/// fences, and role capability, but not yet bound to a class.
+///
+/// [`Self::finalize`] consumes it with the root-derived class. No topology or
+/// source refresh happens between the two calls, so the signed cut names the
+/// membership the root was planned against.
+#[derive(Debug, Clone)]
+pub struct OracleQueryAttemptRoster {
+    /// Source snapshot observation time.
+    observed_at: DateTime<Utc>,
+    /// Stable attempt identity.
+    attempt_id: QueryId,
+    /// Ready Oracle participants sorted by node identity.
+    oracles: Vec<OracleQueryParticipant>,
+    /// Ready Scribe participants sorted by node identity.
+    scribes: Vec<OracleQueryParticipant>,
+    /// Request-local leader retained from the Oracle set.
+    leader: OracleQueryParticipant,
+    /// Absolute wall-clock query deadline.
+    deadline: DateTime<Utc>,
+}
+
+impl OracleQueryAttemptRoster {
+    /// Freezes one fresh snapshot into class-neutral attempt membership.
+    ///
+    /// The leader is chosen before any class exists, so class compatibility is
+    /// not checked here at all. Participants are validated for readiness,
+    /// fences, and role capability now, and for the derived class in
+    /// [`Self::finalize`]. Selecting a leader that can serve every derivable
+    /// class is the caller's concern, upstream of this freeze.
     ///
     /// # Errors
     ///
     /// Returns [`OracleQueryAttemptCutError`] for stale or duplicate membership,
     /// incomplete role fences, incompatible capabilities, an unavailable leader,
     /// or an elapsed deadline.
-    pub fn try_from_snapshot(
+    pub fn freeze(
         snapshot: &ClusterSnapshot,
         attempt_id: QueryId,
         leader_node_id: NodeId,
-        query_class: QueryClass,
         deadline: DateTime<Utc>,
         now: DateTime<Utc>,
         freshness: Duration,
@@ -100,8 +132,8 @@ impl OracleQueryAttemptCut {
         if snapshot.has_conflicting_roles() {
             return Err(OracleQueryAttemptCutError::DuplicateRole);
         }
-        let mut oracles = Self::participants(snapshot.live_oracles(), query_class)?;
-        let mut scribes = Self::participants(snapshot.live_scribes(), query_class)?;
+        let mut oracles = Self::participants(snapshot.live_oracles())?;
+        let mut scribes = Self::participants(snapshot.live_scribes())?;
         Self::sort_and_deduplicate(&mut oracles)?;
         Self::sort_and_deduplicate(&mut scribes)?;
         let leader = oracles
@@ -119,15 +151,51 @@ impl OracleQueryAttemptCut {
         })
     }
 
+    /// Signs the frozen roster into the immutable cut for one derived class.
+    ///
+    /// Consumes the roster so no caller can finalize the same membership twice
+    /// under two classes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OracleQueryAttemptCutError::IncompatibleCapability`] when a
+    /// frozen participant does not advertise `query_class`.
+    pub fn finalize(
+        self,
+        query_class: QueryClass,
+    ) -> Result<OracleQueryAttemptCut, OracleQueryAttemptCutError> {
+        let Self {
+            observed_at,
+            attempt_id,
+            oracles,
+            scribes,
+            leader,
+            deadline,
+        } = self;
+        for participant in oracles.iter().chain(scribes.iter()) {
+            if !supports_class(participant, query_class) {
+                return Err(OracleQueryAttemptCutError::IncompatibleCapability);
+            }
+        }
+        Ok(OracleQueryAttemptCut {
+            observed_at,
+            attempt_id,
+            oracles,
+            scribes,
+            leader,
+            deadline,
+        })
+    }
+
     /// Validates and projects one role-filtered participant slice.
     ///
     /// # Errors
     ///
-    /// Returns [`OracleQueryAttemptCutError`] when readiness, fencing, role
-    /// capability, or query-class compatibility is invalid.
+    /// Returns [`OracleQueryAttemptCutError`] when readiness, fencing, or role
+    /// capability is invalid. Class compatibility is checked in
+    /// [`Self::finalize`], once the root has decided the class.
     fn participants(
         leases: Vec<&ClusterRoleLease>,
-        query_class: QueryClass,
     ) -> Result<Vec<OracleQueryParticipant>, OracleQueryAttemptCutError> {
         leases
             .into_iter()
@@ -139,11 +207,6 @@ impl OracleQueryAttemptCut {
                     .capabilities
                     .validate_for_role(lease.key.role)
                     .map_err(|_| OracleQueryAttemptCutError::IncompatibleCapability)?;
-                if let ClusterCapabilities::OracleV1(capabilities) = &lease.capabilities
-                    && !capabilities.supported_classes.contains(&query_class)
-                {
-                    return Err(OracleQueryAttemptCutError::IncompatibleCapability);
-                }
                 Ok(OracleQueryParticipant {
                     node_id: lease.key.node_id,
                     endpoint: lease.address.clone(),
@@ -185,6 +248,48 @@ impl OracleQueryAttemptCut {
         }
         *participants = deduplicated;
         Ok(())
+    }
+}
+
+/// Reports whether one frozen participant advertises `query_class`.
+///
+/// Only an Oracle capability document constrains class; a Scribe participant
+/// serves the live tail for either class and is always compatible.
+fn supports_class(participant: &OracleQueryParticipant, query_class: QueryClass) -> bool {
+    match &participant.capabilities {
+        ClusterCapabilities::OracleV1(capabilities) => {
+            capabilities.supported_classes.contains(&query_class)
+        }
+        _ => true,
+    }
+}
+
+impl OracleQueryAttemptCut {
+    /// Freezes one fresh snapshot into the exact participants for a query attempt.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OracleQueryAttemptCutError`] for stale or duplicate membership,
+    /// incomplete role fences, incompatible capabilities, an unavailable leader,
+    /// or an elapsed deadline.
+    pub fn try_from_snapshot(
+        snapshot: &ClusterSnapshot,
+        attempt_id: QueryId,
+        leader_node_id: NodeId,
+        query_class: QueryClass,
+        deadline: DateTime<Utc>,
+        now: DateTime<Utc>,
+        freshness: Duration,
+    ) -> Result<Self, OracleQueryAttemptCutError> {
+        OracleQueryAttemptRoster::freeze(
+            snapshot,
+            attempt_id,
+            leader_node_id,
+            deadline,
+            now,
+            freshness,
+        )?
+        .finalize(query_class)
     }
 
     /// Returns the source snapshot observation time.

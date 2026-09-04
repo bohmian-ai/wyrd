@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Int64Array, StringArray};
+use arrow::array::{Int32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
@@ -38,13 +38,27 @@ const FIXTURE_ROWS: i64 = 12;
 /// Distinct `filter_key` groups the fixture rows fall into.
 const FIXTURE_GROUPS: i64 = 3;
 
-/// Rows the journey's same-table self-join must return.
+/// Exact ordered `(left_id, right_id, right_ordinal)` rows the journey's
+/// same-table self-join must return.
 ///
 /// The left alias keeps `filter_key = 'group_0'`, which is ids `0, 3, 6, 9`.
 /// The join condition carries that group onto the right alias, whose own
 /// `id > 5` predicate leaves ids `6, 9`. Four left rows against two right rows
-/// is eight, and it is eight only while each alias binds its own closure.
-const SELF_JOIN_ROWS: usize = 8;
+/// is eight, and those eight pairs are these pairs only while each alias binds
+/// its own closure. This journey's process fixture writes all `FIXTURE_ROWS`
+/// in one ingest batch, and `wyrd_row_ordinal` is zero-based within a batch, so
+/// each right ordinal equals that row's own `id`; the right `id` is what
+/// distinguishes the two right-side rows.
+const SELF_JOIN_RESULT: [(i64, i64, i32); 8] = [
+    (0, 6, 6),
+    (0, 9, 9),
+    (3, 6, 6),
+    (3, 9, 9),
+    (6, 6, 6),
+    (6, 9, 9),
+    (9, 6, 6),
+    (9, 9, 9),
+];
 
 /// Builds one published-only strict request with the journey's deadline.
 fn request(sql: &str) -> BifrostQueryRequest {
@@ -534,6 +548,64 @@ async fn run_public(client: &WyrdClient, sql: &str) -> Result<PublicSettlement, 
     })
 }
 
+/// Drives the journey's same-table self-join and decodes its exact rows.
+///
+/// Returns the ordinary public settlement alongside every decoded
+/// `(left_id, right_id, right_ordinal)` tuple in the order the server streamed
+/// them, which the query's `ORDER BY` makes deterministic.
+///
+/// # Errors
+///
+/// Returns a transport, protocol, Arrow, or missing-terminal error, or a
+/// description when a batch does not carry the three expected column types.
+async fn run_self_join(
+    client: &WyrdClient,
+    sql: &str,
+) -> Result<(PublicSettlement, Vec<(i64, i64, i32)>), JourneyError> {
+    let mut stream = QueryClient::new(client).query(&request(sql)).await?;
+    let deadline_ms = stream.deadline_ms();
+    let mut rows = 0_usize;
+    let mut decoded = Vec::new();
+    while let Some(batch) = stream.next_batch().await? {
+        rows += batch.num_rows();
+        let left = column::<Int64Array>(&batch, 0, "left_id")?;
+        let right = column::<Int64Array>(&batch, 1, "right_id")?;
+        let ordinal = column::<Int32Array>(&batch, 2, "right_ordinal")?;
+        for index in 0..batch.num_rows() {
+            decoded.push((left.value(index), right.value(index), ordinal.value(index)));
+        }
+    }
+    let terminal = stream
+        .terminal()
+        .ok_or("public query produced no terminal frame")?;
+    Ok((
+        PublicSettlement {
+            rows,
+            terminal_rows: terminal.row_count,
+            path: terminal.execution_path,
+            deadline_ms,
+        },
+        decoded,
+    ))
+}
+
+/// Borrows one batch column as its expected concrete Arrow array.
+///
+/// # Errors
+///
+/// Returns a description when the column is absent or holds another type.
+fn column<'batch, A: 'static>(
+    batch: &'batch RecordBatch,
+    index: usize,
+    name: &str,
+) -> Result<&'batch A, JourneyError> {
+    batch
+        .columns()
+        .get(index)
+        .and_then(|column| column.as_any().downcast_ref::<A>())
+        .ok_or_else(|| format!("self-join column {index} ({name}) is missing or mistyped").into())
+}
+
 /// Drives one failure phase and proves it entered the physical builder once.
 ///
 /// Returns that phase's own membership digest, so a caller can prove the next
@@ -696,19 +768,28 @@ async fn prove_single_planner_routing() -> Result<(), JourneyError> {
         .map(|index| Ok(cluster.nodes_mut()[*index].peer_body_polls()?))
         .collect::<Result<_, JourneyError>>()?;
     let self_join_sql = format!(
-        "SELECT l.id AS left_id, r.wyrd_row_ordinal AS right_ordinal \
+        "SELECT l.id AS left_id, r.id AS right_id, r.wyrd_row_ordinal AS right_ordinal \
          FROM vala.bifrost.{table} l \
          JOIN vala.bifrost.{table} r ON l.filter_key = r.filter_key \
          WHERE l.filter_key = 'group_0' AND r.id > 5 \
-         ORDER BY left_id, right_ordinal"
+         ORDER BY left_id, right_id, right_ordinal"
     );
-    let self_join = run_public(&client, &self_join_sql).await?;
+    // Driven here rather than through `run_public` because the claim is about
+    // the values: a count alone cannot tell an independently bound pair of
+    // occurrences from two that collided onto one closure.
+    let (self_join, self_join_result) = run_self_join(&client, &self_join_sql).await?;
     expect_public(
         &self_join,
         QueryExecutionPath::Analytical,
-        SELF_JOIN_ROWS,
+        SELF_JOIN_RESULT.len(),
         "same-table self-join",
     )?;
+    if self_join_result != SELF_JOIN_RESULT {
+        return Err(format!(
+            "same-table self-join returned {self_join_result:?}, expected {SELF_JOIN_RESULT:?}"
+        )
+        .into());
+    }
     for (offset, index) in PEER_FOLLOWERS.into_iter().enumerate() {
         let polls = cluster.nodes_mut()[index].peer_body_polls()?;
         if polls <= polls_before_join[offset] {

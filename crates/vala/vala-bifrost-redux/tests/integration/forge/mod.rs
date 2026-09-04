@@ -8,6 +8,7 @@
 mod expired_cleanup;
 mod managed_rewrite;
 mod orphan_cleanup;
+mod production_routes;
 mod promotion;
 mod publication;
 mod reader_expiry_ordering;

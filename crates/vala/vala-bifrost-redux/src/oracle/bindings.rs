@@ -23,30 +23,77 @@ use wyrd_spec::vala::error::BifrostError;
 
 use super::{AccountedMemoryReservation, OracleMemoryResources, OracleTelemetry};
 
+/// Complete planned authority of one physical remote-scan occurrence.
+///
+/// Every fact here is fixed while the plan is built, before the query is
+/// admitted, and every one of them is compared against the assignment bound
+/// after admission. Carrying them together is what makes a repeated occurrence
+/// of the same table and tier — a self-join, a repeated CTE — bind to its own
+/// projection closure instead of silently inheriting a sibling's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct FollowerSourceKey {
+    /// Request-local scan identity, unique per physical scan occurrence.
+    pub(super) scan_id: String,
+    /// Frozen peer endpoint, node identity, role, and role fence.
+    pub(super) destination: super::dispatcher::DispatchCandidate,
+    /// Authenticated data tenant this occurrence was planned for.
+    pub(super) tenant: wyrd_spec::DataTenantId,
+    /// Canonical fully-qualified table name of the pinned cut it reads.
+    pub(super) table: String,
+    /// The one persisted tier of that cut this occurrence delegates.
+    pub(super) tier: super::RemotePersistedTier,
+    /// Fingerprint of the table's complete physical schema.
+    pub(super) schema_fingerprint: String,
+    /// Closed projection closure, in signed order.
+    pub(super) required_columns: Vec<String>,
+    /// Closed leaf predicates, in filter order.
+    pub(super) predicates: Vec<wyrd_spec::vala::assignment_authority::ScanPredicate>,
+}
+
+impl FollowerSourceKey {
+    /// Reports whether `assignment` carries exactly this occurrence's authority.
+    ///
+    /// The binder mints the assignment from this key's own cut and tier, so this
+    /// is the check that the value published under a key never describes a
+    /// different read from the one the plan retained. The tier is covered by the
+    /// scan identity, which is minted from the table, the tier, and the
+    /// occurrence at one site.
+    pub(super) fn matches(
+        &self,
+        assignment: &wyrd_spec::vala::api::FollowerScanAssignment,
+    ) -> bool {
+        assignment.scan_id == self.scan_id
+            && assignment.binding.tenant_id == self.tenant
+            && format!(
+                "vala.{}.{}",
+                assignment.binding.namespace, assignment.binding.table
+            ) == self.table
+            && assignment.schema_fingerprint == self.schema_fingerprint
+            && assignment.required_columns == self.required_columns
+            && assignment.predicates == self.predicates
+    }
+}
+
 /// Closed identity of the one source a planning leaf reads.
 ///
 /// This is everything a leaf may retain about its data before admission: which
-/// per-table drained batch set it reads, or which remote scan it reads from
-/// which frozen destination. It deliberately carries no batches, assignment,
-/// pool, runtime, or class.
-#[derive(Debug, Clone, PartialEq)]
+/// per-table drained batch set it reads, or which remote scan occurrence it
+/// reads from which frozen destination. It deliberately carries no batches,
+/// assignment, pool, runtime, or class.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum OracleSourceKey {
     /// The single Fused batch set drained for one canonical table.
     LocalDrained {
         /// Canonical fully-qualified table name whose batches this leaf reads.
         table: String,
     },
-    /// One remote scan answered by exactly one frozen participant.
+    /// One remote scan occurrence answered by exactly one frozen participant.
     ///
     /// The destination is fixed when the roster is frozen, before the class
     /// exists, so a stage carrying this leaf can never be routed to a peer the
     /// cut did not authorize. The assignment itself is bound after admission.
-    Follower {
-        /// Stable request-local scan identity shared with the assignment.
-        scan_id: String,
-        /// Frozen peer URL, node identity, role, and role fence.
-        destination: Box<super::dispatcher::DispatchCandidate>,
-    },
+    /// Boxed because this variant dwarfs its sibling.
+    Follower(Box<FollowerSourceKey>),
 }
 
 impl OracleSourceKey {
@@ -54,7 +101,36 @@ impl OracleSourceKey {
     pub(super) fn local_table(&self) -> Option<&str> {
         match self {
             Self::LocalDrained { table } => Some(table.as_str()),
-            Self::Follower { .. } => None,
+            Self::Follower(_) => None,
+        }
+    }
+
+    /// Returns the full planned remote authority, if this key is remote.
+    pub(super) fn follower(&self) -> Option<&FollowerSourceKey> {
+        match self {
+            Self::LocalDrained { .. } => None,
+            Self::Follower(source) => Some(source),
+        }
+    }
+}
+
+impl std::hash::Hash for OracleSourceKey {
+    /// Hashes only the identity every equal key necessarily shares.
+    ///
+    /// A canonical table name and a request-local scan identity each already
+    /// separate every distinct key in one query, so hashing the remaining
+    /// authority would cost a full closure walk per lookup without removing a
+    /// collision. Equal keys still hash equally, which is the contract.
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        match self {
+            Self::LocalDrained { table } => {
+                state.write_u8(0);
+                table.hash(state);
+            }
+            Self::Follower(source) => {
+                state.write_u8(1);
+                source.scan_id.hash(state);
+            }
         }
     }
 }
@@ -128,8 +204,8 @@ pub(super) struct OracleExecutionBindings {
     grant: OracleExecutionGrant,
     /// Drained Fused batches keyed by canonical table name.
     local_batches: HashMap<String, Vec<RecordBatch>>,
-    /// Completed follower assignments keyed by their planned scan identity.
-    follower_assignments: HashMap<String, wyrd_spec::vala::api::FollowerScanAssignment>,
+    /// Completed follower assignments keyed by their full planned occurrence.
+    follower_assignments: HashMap<OracleSourceKey, wyrd_spec::vala::api::FollowerScanAssignment>,
     /// Reservations retaining those batches until the query settles.
     _reservations: Vec<AccountedMemoryReservation>,
     /// Whether one requested live source was unavailable at drain time.
@@ -153,8 +229,9 @@ pub(super) struct OracleExecutionBindingInputs {
     pub(super) grant: OracleExecutionGrant,
     /// Drained Fused batches keyed by canonical table name.
     pub(super) local_batches: HashMap<String, Vec<RecordBatch>>,
-    /// Completed follower assignments keyed by their planned scan identity.
-    pub(super) follower_assignments: HashMap<String, wyrd_spec::vala::api::FollowerScanAssignment>,
+    /// Completed follower assignments keyed by their full planned occurrence.
+    pub(super) follower_assignments:
+        HashMap<OracleSourceKey, wyrd_spec::vala::api::FollowerScanAssignment>,
     /// Reservations retaining those batches until the query settles.
     pub(super) reservations: Vec<AccountedMemoryReservation>,
     /// Whether one requested live source was unavailable at drain time.
@@ -164,15 +241,19 @@ pub(super) struct OracleExecutionBindingInputs {
 impl OracleExecutionBindings {
     /// Validates and builds the one binding set for a retained plan.
     ///
-    /// `planned` is the exact key set the retained leaves carry. Every planned
-    /// key must have exactly one binding and no binding may exist for a key no
-    /// leaf planned, because either direction means the plan and the admitted
-    /// sources describe different reads.
+    /// `planned` is the exact canonical key set the retained leaves carry, one
+    /// entry per physical scan occurrence. Every planned key must have exactly
+    /// one binding whose whole authority matches that key, and no binding may
+    /// exist for a key no leaf planned, because either direction means the plan
+    /// and the admitted sources describe different reads.
     ///
     /// # Errors
     ///
     /// Returns [`BifrostError::QueryExecutionFailed`] when a planned key is
-    /// unbound or when a binding names a key no leaf planned.
+    /// unbound, when `planned` repeats one canonical remote occurrence, when a
+    /// binding names a key no leaf planned, or when a bound assignment's scan
+    /// identity, tenant/table binding, schema fingerprint, projection closure,
+    /// or predicates differ from the occurrence that planned it.
     pub(super) fn try_new(
         inputs: OracleExecutionBindingInputs,
         planned: &[OracleSourceKey],
@@ -184,28 +265,31 @@ impl OracleExecutionBindings {
             reservations,
             degraded,
         } = inputs;
+        let mut planned_followers = 0_usize;
         for key in planned {
             let bound = match key {
                 OracleSourceKey::LocalDrained { table } => local_batches.contains_key(table),
-                OracleSourceKey::Follower { scan_id, .. } => follower_assignments
-                    .get(scan_id)
-                    .is_some_and(|assignment| assignment.scan_id == *scan_id),
+                OracleSourceKey::Follower(source) => {
+                    planned_followers += 1;
+                    follower_assignments
+                        .get(key)
+                        .is_some_and(|assignment| source.matches(assignment))
+                }
             };
             if !bound {
                 return Err(BifrostError::QueryExecutionFailed);
             }
         }
+        // Exact cardinality both ways. Every planned occurrence resolved above,
+        // so equal counts leave no unplanned binding and no repeated canonical
+        // occurrence — a duplicate would be counted twice against one entry.
+        if planned_followers != follower_assignments.len() {
+            return Err(BifrostError::QueryExecutionFailed);
+        }
         if local_batches.keys().any(|table| {
             !planned
                 .iter()
                 .any(|key| key.local_table() == Some(table.as_str()))
-        }) {
-            return Err(BifrostError::QueryExecutionFailed);
-        }
-        if follower_assignments.keys().any(|scan_id| {
-            !planned.iter().any(|key| {
-                matches!(key, OracleSourceKey::Follower { scan_id: planned, .. } if planned == scan_id)
-            })
         }) {
             return Err(BifrostError::QueryExecutionFailed);
         }
@@ -250,9 +334,10 @@ impl OracleExecutionBindings {
 
     /// Resolves the one completed assignment a remote leaf reads.
     ///
-    /// The lookup is by the planned scan identity alone, so a leaf can only
-    /// ever reach the assignment the binder validated against its own frozen
-    /// destination.
+    /// The lookup is by the leaf's whole planned occurrence — scan identity,
+    /// destination, tenant/table binding, tier, schema, and closure — so a leaf
+    /// can only ever reach the assignment the binder validated against exactly
+    /// that occurrence, never a same-table sibling's.
     ///
     /// # Errors
     ///
@@ -262,12 +347,12 @@ impl OracleExecutionBindings {
         &self,
         key: &OracleSourceKey,
     ) -> datafusion::error::Result<&wyrd_spec::vala::api::FollowerScanAssignment> {
-        let OracleSourceKey::Follower { scan_id, .. } = key else {
+        if key.follower().is_none() {
             return Err(datafusion::error::DataFusionError::Execution(
                 "Oracle plan leaf is not a remote source".to_owned(),
             ));
-        };
-        self.follower_assignments.get(scan_id).ok_or_else(|| {
+        }
+        self.follower_assignments.get(key).ok_or_else(|| {
             datafusion::error::DataFusionError::Execution(
                 "Oracle plan leaf has no bound follower assignment".to_owned(),
             )

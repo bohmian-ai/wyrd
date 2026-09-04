@@ -3066,26 +3066,46 @@ impl Oracle {
                 bindings::OracleSourceKey::LocalDrained { table }
             })
             .collect::<Vec<_>>();
-        let mut follower_assignments = std::collections::HashMap::new();
+        let mut follower_assignments: std::collections::HashMap<
+            bindings::OracleSourceKey,
+            wyrd_spec::vala::api::FollowerScanAssignment,
+        > = std::collections::HashMap::new();
         for placeholder in root.map(remote_placeholders).unwrap_or_default() {
-            let (cut, tier) = cuts
-                .iter()
-                .flat_map(|cut| {
-                    [RemotePersistedTier::Iceberg, RemotePersistedTier::Hot].map(|tier| (cut, tier))
-                })
-                .find(|(cut, tier)| {
-                    persisted_follower_scan_id(&cut.binding.table_ref.fqn(), *tier)
-                        == placeholder.scan_id()
-                })
-                .ok_or(BifrostError::QueryExecutionFailed)?;
             let Some(key) = placeholder.source_key() else {
                 continue;
             };
-            follower_assignments.insert(
-                placeholder.scan_id().to_owned(),
-                follower_scan_assignment(cut, tier, &placeholder)?,
-            );
-            planned.push(key);
+            let source = key
+                .follower()
+                .ok_or(BifrostError::QueryExecutionFailed)?
+                .clone();
+            // The pinned cut is selected by the occurrence's own frozen table
+            // binding, not by searching for a recomputed scan identity, so two
+            // occurrences of one table can never resolve to each other's cut.
+            let cut = cuts
+                .iter()
+                .find(|cut| {
+                    cut.binding.tenant == source.tenant
+                        && cut.binding.table_ref.fqn() == source.table
+                })
+                .ok_or(BifrostError::QueryExecutionFailed)?;
+            let assignment = follower_scan_assignment(cut, source.tier, &placeholder)?;
+            match follower_assignments.entry(key.clone()) {
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(assignment);
+                    planned.push(key);
+                }
+                // A `DistributedLeafExec` contributes its original leaf plus one
+                // variant per stage task. Every immutable fact of the key already
+                // agreed to reach this arm, and a share is applied at encode
+                // time, so the variants legitimately canonicalize onto the one
+                // occurrence. Anything that would replace the first value is a
+                // distinct read arriving under one identity.
+                std::collections::hash_map::Entry::Occupied(slot) => {
+                    if *slot.get() != assignment {
+                        return Err(BifrostError::QueryExecutionFailed);
+                    }
+                }
+            }
         }
         let value = bindings::OracleExecutionBindings::try_new(
             bindings::OracleExecutionBindingInputs {
@@ -4242,14 +4262,14 @@ impl RemotePersistedTier {
     }
 }
 
-/// Derives the stable scan identity one cut's remote persisted source binds by.
+/// Derives the scan identity one physical remote-scan occurrence binds by.
 ///
-/// Leader and binder both compute it from the canonical table name and the tier
-/// alone, so the planned placeholder and the assignment published after
-/// admission name the same source without either side carrying the other's
-/// state.
-fn persisted_follower_scan_id(table: &str, tier: RemotePersistedTier) -> String {
-    format!("oracle:{table}:{}", tier.tag())
+/// `occurrence` is the provider's request-local scan ordinal, so a same-table
+/// self-join or a repeated CTE mints one identity per physical occurrence
+/// instead of two leaves sharing — and overwriting — a single assignment. It is
+/// minted at this one site and copied onto the assignment, never recomputed.
+fn persisted_follower_scan_id(table: &str, tier: RemotePersistedTier, occurrence: u64) -> String {
+    format!("oracle:{table}:{}:{occurrence}", tier.tag())
 }
 
 /// Computes the fingerprint a follower scan assignment must carry for a schema,

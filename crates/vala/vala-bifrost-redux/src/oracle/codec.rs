@@ -138,6 +138,24 @@ pub(crate) enum PreflightExtension {
     },
 }
 
+/// The one pinned source occurrence a placeholder was planned against.
+///
+/// The provider knows all four facts while it builds the leaf; keeping them
+/// together is what lets the post-admission binder select the exact cut and
+/// tier this occurrence delegates without parsing or recomputing its scan
+/// identity.
+#[derive(Debug, Clone)]
+pub(super) struct PlannedRemoteSource {
+    /// The one frozen participant every task of this leaf's stage routes to.
+    pub(super) destination: super::dispatcher::DispatchCandidate,
+    /// Authenticated data tenant the cut was pinned for.
+    pub(super) tenant: wyrd_spec::DataTenantId,
+    /// Canonical fully-qualified table name of that cut.
+    pub(super) table: String,
+    /// The one persisted tier of the cut this occurrence delegates.
+    pub(super) tier: super::RemotePersistedTier,
+}
+
 /// Leaf placeholder substituted for one Wyrd-owned source before serialization.
 #[derive(Debug, Clone)]
 pub struct RemoteSourcePlaceholderExec {
@@ -164,13 +182,15 @@ pub struct RemoteSourcePlaceholderExec {
     /// placeholder is the only thing that crosses the wire and the stage
     /// ticket's digest over the plan is what binds the assignment.
     assignment: Option<Box<wyrd_spec::vala::api::FollowerScanAssignment>>,
-    /// The one participant frozen for this source when the roster was frozen.
+    /// The pinned cut, tier, and frozen participant of this scan occurrence.
     ///
-    /// `None` before a destination is attached. Once attached it is private
-    /// stage authority: the route handler refuses any stage whose remote leaves
-    /// do not all name this exact peer, so a leaf can never be executed by a
-    /// participant the cut did not authorize.
-    destination: Option<Box<super::dispatcher::DispatchCandidate>>,
+    /// `None` before a source is attached, which is the Interactive
+    /// dispatcher's own leaf. Once attached it is private stage authority: the
+    /// route handler refuses any stage whose remote leaves do not all name this
+    /// exact peer, so a leaf can never be executed by a participant the cut did
+    /// not authorize, and the binder resolves the cut it belongs to from this
+    /// binding rather than by recomputing a scan identity.
+    source: Option<Box<PlannedRemoteSource>>,
     /// The real leader-readable leaf this placeholder substituted, if any.
     ///
     /// Present whenever the provider had a plan the leader can execute itself.
@@ -202,7 +222,7 @@ impl RemoteSourcePlaceholderExec {
             required_columns: Vec::new(),
             predicates: Vec::new(),
             assignment: None,
-            destination: None,
+            source: None,
             local: None,
             task_index: 0,
             task_count: 1,
@@ -229,34 +249,43 @@ impl RemoteSourcePlaceholderExec {
         self
     }
 
-    /// Freezes the one participant every task of this leaf's stage routes to.
+    /// Freezes the pinned cut, tier, and participant this occurrence reads.
     #[must_use]
-    pub(super) fn with_destination(
-        mut self,
-        destination: super::dispatcher::DispatchCandidate,
-    ) -> Self {
-        self.destination = Some(Box::new(destination));
+    pub(super) fn with_source(mut self, source: PlannedRemoteSource) -> Self {
+        self.source = Some(Box::new(source));
         self
     }
 
     /// Returns the frozen destination, if one was attached.
     #[must_use]
     pub(super) fn destination(&self) -> Option<&super::dispatcher::DispatchCandidate> {
-        self.destination.as_deref()
+        self.source.as_ref().map(|source| &source.destination)
     }
 
     /// Returns the planned source key this leaf binds through, if it is remote.
     ///
-    /// A placeholder without a destination is not a planned Oracle source — it
-    /// is the Interactive dispatcher's own leaf — so it names no key.
+    /// A placeholder without a frozen source is not a planned Oracle source —
+    /// it is the Interactive dispatcher's own leaf — so it names no key. The
+    /// key is derived from the leaf's own retained facts rather than stored, so
+    /// a closure attached after the source can never leave the two disagreeing.
+    /// Task variants of one occurrence derive an identical key, because a share
+    /// divides work rather than authority.
     #[must_use]
     pub(super) fn source_key(&self) -> Option<super::bindings::OracleSourceKey> {
-        self.destination
-            .as_ref()
-            .map(|destination| super::bindings::OracleSourceKey::Follower {
-                scan_id: self.scan_id.clone(),
-                destination: destination.clone(),
-            })
+        self.source.as_ref().map(|source| {
+            super::bindings::OracleSourceKey::Follower(Box::new(
+                super::bindings::FollowerSourceKey {
+                    scan_id: self.scan_id.clone(),
+                    destination: source.destination.clone(),
+                    tenant: source.tenant,
+                    table: source.table.clone(),
+                    tier: source.tier,
+                    schema_fingerprint: self.schema_fingerprint.clone(),
+                    required_columns: self.required_columns.clone(),
+                    predicates: self.predicates.clone(),
+                },
+            ))
+        })
     }
 
     /// Narrows this leaf to one task's share of its stage.

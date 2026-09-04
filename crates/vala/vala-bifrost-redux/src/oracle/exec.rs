@@ -1235,7 +1235,7 @@ pub(crate) struct OracleRemoteSource {
     /// Canonical table name both sides mint this cut's scan identities from.
     pub(crate) table: String,
     /// The one frozen participant every task of this leaf's stage routes to.
-    pub(crate) destination: super::dispatcher::DispatchCandidate,
+    pub(crate) destination: crate::oracle::dispatcher::DispatchCandidate,
     /// Whether the pinned snapshot names any compacted data file.
     ///
     /// Only the cut knows this; the provider knows its own hot files. A tier
@@ -1297,6 +1297,15 @@ pub(crate) struct OracleTableProvider {
     /// Frozen remote owner of this cut's persisted sources, when the cut chose
     /// one. `None` keeps every persisted leaf leader-local.
     remote: Option<OracleRemoteSource>,
+    /// Request-local ordinal handed to the next physical scan of this table.
+    ///
+    /// `DataFusion` calls [`TableProvider::scan`] once per physical occurrence,
+    /// so a self-join or a repeated CTE over one registered table reaches this
+    /// provider more than once. Each occurrence takes its own value, which is
+    /// what keeps its remote scan identity — and therefore its assignment —
+    /// distinct from its siblings'. `Relaxed` is sufficient: uniqueness is the
+    /// invariant, and nothing else is published through this counter.
+    scan_occurrences: std::sync::atomic::AtomicU64,
 }
 
 impl fmt::Debug for OracleTableProvider {
@@ -1412,6 +1421,7 @@ impl OracleTableProvider {
             table: table_name,
             audit,
             remote,
+            scan_occurrences: std::sync::atomic::AtomicU64::new(0),
         })
     }
 }
@@ -1454,6 +1464,7 @@ impl OracleTableProvider {
         supported_filters: &[Expr],
         supported_predicates: &[wyrd_spec::vala::assignment_authority::ScanPredicate],
         limit: Option<usize>,
+        occurrence: u64,
     ) -> DataFusionResult<Vec<Arc<dyn ExecutionPlan>>> {
         let required_schema = Arc::clone(&scan_projection.required_schema);
         let mut inputs: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
@@ -1517,7 +1528,7 @@ impl OracleTableProvider {
             };
             remotes.push(Arc::new(
                 super::codec::RemoteSourcePlaceholderExec::new(
-                    super::persisted_follower_scan_id(&remote.table, tier),
+                    super::persisted_follower_scan_id(&remote.table, tier, occurrence),
                     // The fingerprint is of the table's complete physical
                     // schema, not of this scan's closure: the follower resolves
                     // the same catalog provider and compares against
@@ -1530,7 +1541,12 @@ impl OracleTableProvider {
                     scan_projection.required_columns.clone(),
                     supported_predicates.to_vec(),
                 )
-                .with_destination(remote.destination.clone())
+                .with_source(super::codec::PlannedRemoteSource {
+                    destination: remote.destination.clone(),
+                    tenant: self.context.data_tenant_id,
+                    table: remote.table.clone(),
+                    tier,
+                })
                 .with_local(Arc::clone(local)),
             ) as Arc<dyn ExecutionPlan>);
         }
@@ -1672,7 +1688,8 @@ impl TableProvider for OracleTableProvider {
     /// # Errors
     ///
     /// Returns a `DataFusion` planning error when a source or projection cannot
-    /// be represented with the pinned physical schema.
+    /// be represented with the pinned physical schema, or when this request has
+    /// exhausted its scan occurrences.
     async fn scan(
         &self,
         state: &dyn Session,
@@ -1680,6 +1697,22 @@ impl TableProvider for OracleTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        // Exactly one ordinal per physical occurrence, taken before anything
+        // below can mint an identity from it. Exhaustion fails planning rather
+        // than wrapping, because a wrapped ordinal would reissue a live scan
+        // identity to a different read.
+        let occurrence = self
+            .scan_occurrences
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |current| current.checked_add(1),
+            )
+            .map_err(|_| {
+                DataFusionError::Plan(
+                    "Oracle table provider exhausted its request-local scan occurrences".to_owned(),
+                )
+            })?;
         let (supported_predicates, supported_filters) = self.closed_pushdown(filters);
         // One closure, derived once, governs every leaf below and every
         // operator above. Nothing downstream recomputes a column set or order.
@@ -1697,6 +1730,7 @@ impl TableProvider for OracleTableProvider {
                 &supported_filters,
                 &supported_predicates,
                 limit,
+                occurrence,
             )
             .await?;
         // Planned unconditionally: the Fused drain runs after admission, so
@@ -5569,6 +5603,366 @@ mod tests {
             .expect("the exact planned key set binds")
     }
 
+    /// Builds the one frozen participant a delegated fixture cut names.
+    fn fixture_destination() -> crate::oracle::dispatcher::DispatchCandidate {
+        crate::oracle::dispatcher::DispatchCandidate {
+            node_id: wyrd_spec::vala::api::NodeId::new(uuid::Uuid::now_v7()),
+            role: wyrd_spec::vala::api::ClusterRole::Oracle,
+            worker_fence: 7,
+            endpoint: Some("https://oracle-a.internal".to_owned()),
+        }
+    }
+
+    /// Mints the assignment the binder publishes for one planned occurrence.
+    ///
+    /// Built from the key rather than from a pinned cut, because what this
+    /// owner proves is the key-to-value agreement the binder validates, not the
+    /// file projection a cut contributes.
+    fn assignment_for(
+        key: &crate::oracle::bindings::FollowerSourceKey,
+    ) -> wyrd_spec::vala::api::FollowerScanAssignment {
+        wyrd_spec::vala::api::FollowerScanAssignment {
+            scan_id: key.scan_id.clone(),
+            binding: wyrd_spec::vala::api::TenantTableBinding {
+                tenant_id: key.tenant,
+                namespace: "traces".to_owned(),
+                table: "spans".to_owned(),
+            },
+            persisted: wyrd_spec::vala::api::PersistedFileAssignment {
+                files: ["a", "b", "c", "d"]
+                    .into_iter()
+                    .map(|path| {
+                        wyrd_spec::vala::api::PersistedFileDescriptor::Iceberg(
+                            wyrd_spec::vala::api::IcebergFileDescriptor {
+                                path: format!("s3://fixture/{path}.parquet"),
+                                size_bytes: 1,
+                                row_count: 1,
+                                snapshot_id: 1,
+                                min_event_time_micros: None,
+                                max_event_time_micros: None,
+                            },
+                        )
+                    })
+                    .collect(),
+            },
+            scribe_provider_cut: None,
+            schema_fingerprint: key.schema_fingerprint.clone(),
+            required_columns: key.required_columns.clone(),
+            predicates: key.predicates.clone(),
+        }
+    }
+
+    /// Returns the sole remote occurrence key of one planned root.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the root planned anything other than exactly one remote
+    /// placeholder, which would mean the fixture stopped delegating its cut.
+    fn sole_remote_placeholder(
+        root: &Arc<dyn ExecutionPlan>,
+    ) -> crate::oracle::codec::RemoteSourcePlaceholderExec {
+        let mut found = crate::oracle::remote_placeholders(root.as_ref());
+        assert_eq!(found.len(), 1, "one delegated tier plans one placeholder");
+        found.remove(0)
+    }
+
+    /// Two occurrences of one delegated table bind independently and exactly.
+    ///
+    /// A same-table self-join reaches the one registered provider twice, so both
+    /// occurrences share a canonical table and persisted tier and differ only in
+    /// their projection closure. Split out of
+    /// [`retained_plan_uses_admitted_task_context_only`] to keep each half
+    /// readable; it owns the occurrence identity, the task-variant
+    /// canonicalization, and the six binding refusals.
+    ///
+    /// # Panics
+    ///
+    /// Panics when two occurrences collide, when a task variant fails to share
+    /// its occurrence's key or narrows a non-disjoint share, or when any
+    /// mismatched binding is accepted.
+    async fn assert_repeated_scans_bind_exactly() {
+        use crate::oracle::bindings::{
+            OracleExecutionBindingInputs, OracleExecutionBindings, OracleSourceKey,
+        };
+
+        let (left_leaf, right_leaf) = plan_two_delegated_occurrences().await;
+        assert_ne!(
+            left_leaf.scan_id(),
+            right_leaf.scan_id(),
+            "each physical occurrence mints its own scan identity"
+        );
+        let left_key = left_leaf
+            .source_key()
+            .expect("a delegated leaf names a key");
+        let right_key = right_leaf
+            .source_key()
+            .expect("a delegated leaf names a key");
+        assert_ne!(left_key, right_key, "two occurrences are two keys");
+        let (Some(left_source), Some(right_source)) = (left_key.follower(), right_key.follower())
+        else {
+            panic!("both occurrences are remote");
+        };
+        assert_ne!(
+            left_source.required_columns, right_source.required_columns,
+            "each occurrence keeps its own projection closure"
+        );
+        assert_eq!(left_source.tier, right_source.tier);
+        assert_eq!(left_source.table, right_source.table);
+
+        let left_assignment = assignment_for(left_source);
+        assert_task_variants_share_one_occurrence(&left_leaf, &left_key, &left_assignment);
+
+        let planned = [left_key.clone(), right_key.clone()];
+        let assignments = || {
+            HashMap::from([
+                (left_key.clone(), left_assignment.clone()),
+                (right_key.clone(), assignment_for(right_source)),
+            ])
+        };
+        let governor = oracle_test_roles(4 * 1024 * 1024 * 1024);
+        let telemetry = Arc::new(OracleTelemetry::new(Arc::new(OracleSlotManager::new(1, 1))));
+        let pool = crate::resources::bounded_memory_pool(1024 * 1024 * 1024);
+        let inputs = |assignments: HashMap<
+            OracleSourceKey,
+            wyrd_spec::vala::api::FollowerScanAssignment,
+        >| OracleExecutionBindingInputs {
+            grant: crate::oracle::bindings::OracleExecutionGrant::for_test(
+                QueryClass::Interactive,
+                oracle_memory_resources(&governor, 1024 * 1024),
+                Arc::clone(&telemetry),
+            ),
+            local_batches: HashMap::new(),
+            follower_assignments: assignments,
+            reservations: Vec::new(),
+            degraded: false,
+        };
+
+        let bound = OracleExecutionBindings::try_new(inputs(assignments()), &planned)
+            .expect("the exact planned occurrence set binds");
+        assert_eq!(
+            bound
+                .follower_assignment(&left_key)
+                .expect("the first occurrence resolves its own assignment")
+                .scan_id,
+            left_source.scan_id,
+        );
+        assert_eq!(
+            bound
+                .follower_assignment(&right_key)
+                .expect("the second occurrence resolves its own assignment")
+                .scan_id,
+            right_source.scan_id,
+        );
+
+        assert_exact_binding_refusals(&BindingRefusalCase {
+            inputs: &inputs,
+            assignments: &assignments,
+            left: left_source,
+            right: right_source,
+            left_key: &left_key,
+            right_key: &right_key,
+        });
+        assert_eq!(
+            pool.reserved(),
+            0,
+            "every binding refusal happens before any leaf opens row IO"
+        );
+    }
+
+    /// Plans two physical occurrences of one delegated table and tier.
+    ///
+    /// This is the shape a same-table self-join reaches the single registered
+    /// provider with: two `scan` calls that differ only in the alias-level
+    /// projection and predicate each side contributes.
+    ///
+    /// # Panics
+    ///
+    /// Panics when either occurrence fails to plan its delegated placeholder.
+    async fn plan_two_delegated_occurrences() -> (
+        crate::oracle::codec::RemoteSourcePlaceholderExec,
+        crate::oracle::codec::RemoteSourcePlaceholderExec,
+    ) {
+        use datafusion::logical_expr::{col, lit};
+
+        let (provider, _live) = projection_closure_provider(
+            wyrd_spec::DataTenantId::new_v7(),
+            Some(OracleRemoteSource {
+                table: "vala.traces.spans".to_owned(),
+                destination: fixture_destination(),
+                iceberg: true,
+            }),
+        )
+        .await;
+        let session = datafusion::execution::context::SessionContext::new();
+        let left = provider
+            .scan(
+                &session.state(),
+                Some(&vec![1_usize]),
+                &[col("status_code").eq(lit("STATUS_CODE_ERROR"))],
+                None,
+            )
+            .await
+            .expect("the first occurrence plans");
+        let right = provider
+            .scan(&session.state(), Some(&vec![0_usize]), &[], None)
+            .await
+            .expect("the second occurrence plans");
+        (
+            sole_remote_placeholder(&left),
+            sole_remote_placeholder(&right),
+        )
+    }
+
+    /// One occurrence's task variants share its key and narrow disjoint shares.
+    ///
+    /// The split handler produces one variant per stage task. A share divides
+    /// work, not authority, so every variant must derive the same occurrence
+    /// key and reach the one assignment bound under it, while the files each
+    /// one actually reads stay disjoint.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a variant derives a different key or two variants overlap.
+    fn assert_task_variants_share_one_occurrence(
+        leaf: &crate::oracle::codec::RemoteSourcePlaceholderExec,
+        key: &crate::oracle::bindings::OracleSourceKey,
+        assignment: &wyrd_spec::vala::api::FollowerScanAssignment,
+    ) {
+        let first_task = leaf.clone().with_task_share(0, 2);
+        let second_task = leaf.clone().with_task_share(1, 2);
+        assert_eq!(first_task.source_key().as_ref(), Some(key));
+        assert_eq!(second_task.source_key().as_ref(), Some(key));
+        let first_share = first_task.narrow(assignment.clone()).persisted.files;
+        let second_share = second_task.narrow(assignment.clone()).persisted.files;
+        assert_eq!(first_share.len(), 2);
+        assert_eq!(second_share.len(), 2);
+        assert!(
+            first_share.iter().all(|file| !second_share.contains(file)),
+            "task variants narrow onto disjoint file shares"
+        );
+    }
+
+    /// Everything one mismatch-refusal sweep needs to rebuild its inputs.
+    ///
+    /// The two closures rebuild a fresh grant and a fresh assignment map per
+    /// attempt, because [`OracleExecutionBindings::try_new`] consumes both.
+    struct BindingRefusalCase<'a, I, A> {
+        /// Rebuilds one complete binding input set around a given map.
+        inputs: &'a I,
+        /// Rebuilds the exact assignment map both planned occurrences bound.
+        assignments: &'a A,
+        /// The first occurrence's complete planned authority.
+        left: &'a crate::oracle::bindings::FollowerSourceKey,
+        /// The second occurrence's complete planned authority.
+        right: &'a crate::oracle::bindings::FollowerSourceKey,
+        /// The first occurrence's key, as the retained plan carries it.
+        left_key: &'a crate::oracle::bindings::OracleSourceKey,
+        /// The second occurrence's key, as the retained plan carries it.
+        right_key: &'a crate::oracle::bindings::OracleSourceKey,
+    }
+
+    /// Refuses every single-fact disagreement between a plan and its bindings.
+    ///
+    /// One mutated fact at a time; each one is a plan that no longer describes
+    /// the admitted read, and each must be refused while the binding set is
+    /// still a value — before any leaf exists to open row IO with.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any mutated occurrence, repeated occurrence, or swapped
+    /// assignment value is accepted.
+    fn assert_exact_binding_refusals<I, A>(case: &BindingRefusalCase<'_, I, A>)
+    where
+        I: Fn(
+            HashMap<
+                crate::oracle::bindings::OracleSourceKey,
+                wyrd_spec::vala::api::FollowerScanAssignment,
+            >,
+        ) -> crate::oracle::bindings::OracleExecutionBindingInputs,
+        A: Fn() -> HashMap<
+            crate::oracle::bindings::OracleSourceKey,
+            wyrd_spec::vala::api::FollowerScanAssignment,
+        >,
+    {
+        use crate::oracle::bindings::{OracleExecutionBindings, OracleSourceKey};
+
+        let BindingRefusalCase {
+            inputs,
+            assignments,
+            left: left_source,
+            right: right_source,
+            left_key,
+            right_key,
+        } = *case;
+        let mut destination_role = left_source.clone();
+        destination_role.destination.role = wyrd_spec::vala::api::ClusterRole::Scribe;
+        let mut destination_fence = left_source.clone();
+        destination_fence.destination.worker_fence += 1;
+        let mut destination_endpoint = left_source.clone();
+        destination_endpoint.destination.endpoint = Some("https://oracle-b.internal".to_owned());
+        let mut destination_node = left_source.clone();
+        destination_node.destination.node_id =
+            wyrd_spec::vala::api::NodeId::new(uuid::Uuid::now_v7());
+        let mut other_tenant = left_source.clone();
+        other_tenant.tenant = wyrd_spec::DataTenantId::new_v7();
+        let mut other_table = left_source.clone();
+        other_table.table = "vala.traces.links".to_owned();
+        let mut other_tier = left_source.clone();
+        other_tier.tier = crate::oracle::RemotePersistedTier::Hot;
+        let mut other_schema = left_source.clone();
+        other_schema.schema_fingerprint = "not-the-planned-schema".to_owned();
+        let mut other_columns = left_source.clone();
+        other_columns
+            .required_columns
+            .push("unused_payload".to_owned());
+        let mut other_predicates = left_source.clone();
+        other_predicates.predicates.clear();
+        for mutated in [
+            destination_role,
+            destination_fence,
+            destination_endpoint,
+            destination_node,
+            other_tenant,
+            other_table,
+            other_tier,
+            other_schema,
+            other_columns,
+            other_predicates,
+        ] {
+            let mutated = OracleSourceKey::Follower(Box::new(mutated));
+            assert!(
+                OracleExecutionBindings::try_new(
+                    inputs(assignments()),
+                    &[mutated, right_key.clone()],
+                )
+                .is_err(),
+                "a planned occurrence that differs by one fact resolves nothing"
+            );
+        }
+        // A duplicate canonical occurrence, distinct from the task variants of
+        // one occurrence, breaks the exact one-to-one cardinality.
+        assert!(
+            OracleExecutionBindings::try_new(
+                inputs(assignments()),
+                &[left_key.clone(), left_key.clone(), right_key.clone()],
+            )
+            .is_err(),
+            "one canonical occurrence may be planned exactly once"
+        );
+        // A value whose own authority disagrees with the key it was published
+        // under is refused even though the key itself resolves.
+        let mut replaced = assignments();
+        replaced.insert(left_key.clone(), assignment_for(right_source));
+        assert!(
+            OracleExecutionBindings::try_new(
+                inputs(replaced),
+                &[left_key.clone(), right_key.clone()],
+            )
+            .is_err(),
+            "one occurrence's assignment cannot answer another's key"
+        );
+    }
+
     /// Asserts admission changed no optimizer or memory knob of the retained shape.
     ///
     /// Admission supplies a runtime and a memory pool only, so a grant larger
@@ -5614,7 +6008,7 @@ mod tests {
         // source, and the bound Fused rows must arrive through the admitted
         // pool alone.
         let tenant = wyrd_spec::DataTenantId::new_v7();
-        let (provider, live) = projection_closure_provider(tenant).await;
+        let (provider, live) = projection_closure_provider(tenant, None).await;
         let table = "vala.traces.spans".to_owned();
         let planned_keys = [crate::oracle::bindings::OracleSourceKey::LocalDrained {
             table: table.clone(),
@@ -5818,6 +6212,7 @@ mod tests {
         assert_eq!(whole_pool.reserved(), 0);
 
         assert_retained_root_binds_once(&governor, &telemetry).await;
+        assert_repeated_scans_bind_exactly().await;
     }
 
     /// Follower governance returns every retained byte to its request-local
@@ -6275,6 +6670,7 @@ mod tests {
     /// be constructed, since none of those are the behavior under test.
     async fn projection_closure_provider(
         tenant: wyrd_spec::DataTenantId,
+        remote: Option<OracleRemoteSource>,
     ) -> (OracleTableProvider, RecordBatch) {
         let principal = Principal {
             id: PrincipalId::new(uuid::Uuid::now_v7()),
@@ -6322,7 +6718,7 @@ mod tests {
             context,
             table_name: "vala.traces.spans".to_owned(),
             audit: Arc::new(NoopAudit),
-            remote: None,
+            remote,
         })
         .await
         .expect("pinned fixture provider");
@@ -6351,7 +6747,7 @@ mod tests {
         use datafusion::physical_plan::filter::FilterExec;
 
         let tenant = wyrd_spec::DataTenantId::new_v7();
-        let (provider, live) = projection_closure_provider(tenant).await;
+        let (provider, live) = projection_closure_provider(tenant, None).await;
 
         let public = provider.schema();
         let projection = vec![public.index_of("duration_ms").expect("public duration_ms")];

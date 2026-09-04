@@ -7260,7 +7260,12 @@ mod tests {
             false,
         )]));
         super::super::codec::RemoteSourcePlaceholderExec::new(scan_id, "fingerprint", schema)
-            .with_destination(destination.clone())
+            .with_source(super::super::codec::PlannedRemoteSource {
+                destination: destination.clone(),
+                tenant: wyrd_spec::DataTenantId::new_v7(),
+                table: "vala.traces.spans".to_owned(),
+                tier: super::super::RemotePersistedTier::Iceberg,
+            })
     }
 
     /// Builds the signed assignment a bound placeholder resolves through, with

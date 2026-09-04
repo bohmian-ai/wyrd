@@ -4696,7 +4696,11 @@ impl Oracle {
                 tracing::debug!(?error, "Oracle analytical candidate failed to distribute");
             })
             .ok()?;
-        exec::is_distributed_plan(distributed.as_ref()).then_some(distributed)
+        matches!(
+            exec::query_class_for_root(distributed.as_ref()),
+            QueryClass::Analytical
+        )
+        .then_some(distributed)
     }
 
     /// Lowers one validated statement to its optimized physical plan.

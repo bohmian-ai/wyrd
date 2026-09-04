@@ -967,13 +967,24 @@ pub(crate) fn analytical_leaf_scan_metrics(plan: &dyn ExecutionPlan) -> MetricsS
     published
 }
 
-/// Reports whether one physical plan root is an upstream distributed plan.
+/// Derives the admitted query class from one already-built physical root.
 ///
-/// Only a distributed root has follower-side metrics to wait for; every other
-/// plan's scans are already visible in the leader's own metric sets.
-pub(crate) fn is_distributed_plan(plan: &dyn ExecutionPlan) -> bool {
-    plan.downcast_ref::<datafusion_distributed::DistributedExec>()
+/// The pinned distributed planner is the only classifier: it returns a
+/// `DistributedExec` root exactly when it decided the plan needs cross-node
+/// stages, and returns the original non-distributed root otherwise. Reading
+/// the exact root type is therefore the whole decision — there is no candidate
+/// heuristic, operator allowlist, or second build behind it. A `DistributedExec`
+/// nested below some other root is not the planner's verdict for this query and
+/// stays `Interactive`.
+pub(crate) fn query_class_for_root(plan: &dyn ExecutionPlan) -> QueryClass {
+    if plan
+        .downcast_ref::<datafusion_distributed::DistributedExec>()
         .is_some()
+    {
+        QueryClass::Analytical
+    } else {
+        QueryClass::Interactive
+    }
 }
 
 /// Folds a completed distributed plan's follower scan metrics into `sink`.
@@ -7150,5 +7161,174 @@ mod tests {
         assert_rejected_aggregate_matrix();
         assert_join_matrix();
         assert_union_and_unknown_matrix();
+    }
+
+    /// The physical root type alone decides the admitted query class.
+    ///
+    /// Revision 6 removed every pre-planning classifier: a normal `DataFusion`
+    /// root is Interactive, and only the exact `DistributedExec` root the
+    /// pinned distributed planner returns is Analytical. Both roots asserted
+    /// here come from real planning — the ordinary one from `DataFusion`'s own
+    /// planner and the distributed one from the pinned planner — so the
+    /// assertion covers exactly the value production derives its class from.
+    /// Cut, attempt, build-count, terminal, and ownership behavior belong to
+    /// the public routing journey and are deliberately absent here.
+    ///
+    /// # Panics
+    ///
+    /// Panics when either statement cannot be lowered, or when the pinned
+    /// planner returns no `DistributedExec` root for the grouped fixture.
+    #[tokio::test]
+    async fn physical_root_alone_selects_query_class() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let batch = |offset: i64| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(vec![offset, offset + 1])) as ArrayRef,
+                    Arc::new(Int64Array::from(vec![offset * 10, offset * 20])) as ArrayRef,
+                ],
+            )
+            .expect("root-class fixture batch")
+        };
+        let partitions = vec![vec![batch(0)], vec![batch(2)]];
+
+        let ordinary = datafusion::prelude::SessionContext::new();
+        ordinary
+            .register_table(
+                "rows",
+                Arc::new(
+                    datafusion::datasource::MemTable::try_new(
+                        Arc::clone(&schema),
+                        partitions.clone(),
+                    )
+                    .expect("ordinary fixture provider"),
+                ),
+            )
+            .expect("register ordinary fixture");
+        let ordinary_root = ordinary
+            .sql("SELECT key, sum(value) FROM rows GROUP BY key")
+            .await
+            .expect("lower ordinary statement")
+            .create_physical_plan()
+            .await
+            .expect("build ordinary physical root");
+        assert!(
+            ordinary_root
+                .downcast_ref::<datafusion_distributed::DistributedExec>()
+                .is_none(),
+            "the ordinary planner must not return a distributed root"
+        );
+        assert_eq!(
+            query_class_for_root(ordinary_root.as_ref()),
+            QueryClass::Interactive
+        );
+
+        let mut config = datafusion::prelude::SessionConfig::new();
+        datafusion_distributed::DistributedExt::set_distributed_worker_resolver(
+            &mut config,
+            RootClassWorkers,
+        );
+        datafusion_distributed::DistributedExt::set_distributed_desired_task_count_handler(
+            &mut config,
+            RootClassTaskCount,
+        );
+        use datafusion_distributed::SessionStateBuilderExt as _;
+        let state = datafusion::execution::session_state::SessionStateBuilder::new()
+            .with_default_features()
+            .with_config(config)
+            .with_distributed_planner()
+            .build();
+        let distributed = datafusion::prelude::SessionContext::new_with_state(state);
+        distributed
+            .register_table(
+                "rows",
+                Arc::new(
+                    datafusion::datasource::MemTable::try_new(Arc::clone(&schema), partitions)
+                        .expect("distributed fixture provider"),
+                ),
+            )
+            .expect("register distributed fixture");
+        let distributed_root = distributed
+            .sql("SELECT key, sum(value) FROM rows GROUP BY key")
+            .await
+            .expect("lower distributed statement")
+            .create_physical_plan()
+            .await
+            .expect("build distributed physical root");
+        assert!(
+            distributed_root
+                .downcast_ref::<datafusion_distributed::DistributedExec>()
+                .is_some(),
+            "the pinned planner must return a distributed root for the grouped fixture"
+        );
+        assert_eq!(
+            query_class_for_root(distributed_root.as_ref()),
+            QueryClass::Analytical
+        );
+
+        // A distributed subtree that is not the exact root stays Interactive:
+        // the class is read from the root alone, never from the tree beneath it.
+        let wrapped: Arc<dyn ExecutionPlan> = Arc::new(
+            datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec::new(
+                Arc::clone(&distributed_root),
+            ),
+        );
+        assert_eq!(
+            query_class_for_root(wrapped.as_ref()),
+            QueryClass::Interactive
+        );
+    }
+
+    /// Forces every leaf stage of the root-class fixture onto two tasks.
+///
+/// The pinned planner elides a boundary it judges unnecessary, and a two-row
+/// in-memory table is always judged unnecessary. Oracle's production planner
+/// answers this same handler from the frozen cut rather than from scanned
+/// bytes, so answering it here plans the shape production plans instead of
+/// forcing an outcome the planner would otherwise refuse.
+#[derive(Debug)]
+struct RootClassTaskCount;
+
+#[async_trait::async_trait]
+impl datafusion_distributed::DesiredTaskCountHandler for RootClassTaskCount {
+    /// Requests two tasks for every leaf node and defers on inner nodes.
+    ///
+    /// # Errors
+    ///
+    /// Never fails: the count is a constant.
+    async fn handle(
+        &self,
+        ev: datafusion_distributed::DesiredTaskCountEvent<'_>,
+    ) -> Option<DataFusionResult<datafusion_distributed::DesiredTaskCountEventResponse>> {
+        if ev.plan.children().is_empty() {
+            Some(Ok(
+                datafusion_distributed::DesiredTaskCountEventResponse::desired(2),
+            ))
+        } else {
+            None
+        }
+    }
+}
+
+/// Frozen worker set the root-class fixture plans its distributed root over.
+    #[derive(Debug)]
+    struct RootClassWorkers;
+
+    impl datafusion_distributed::WorkerResolver for RootClassWorkers {
+        /// Returns two fixed peers so the pinned planner may form a real stage.
+        ///
+        /// # Errors
+        ///
+        /// Never fails: both URLs are constant and already valid.
+        fn get_urls(&self) -> DataFusionResult<Vec<url::Url>> {
+            Ok(vec![
+                url::Url::parse("http://worker-0.invalid:50051").expect("fixture worker URL"),
+                url::Url::parse("http://worker-1.invalid:50051").expect("fixture worker URL"),
+            ])
+        }
     }
 }

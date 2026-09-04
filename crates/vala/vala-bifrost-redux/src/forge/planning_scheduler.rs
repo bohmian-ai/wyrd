@@ -18,6 +18,7 @@ use vala_sql::row_types::forge_operations::ForgeOperationFamily;
 use vala_sql::row_types::forge_tasks::{
     ExpiredCleanupPayload, FORGE_TASK_PAYLOAD_VERSION, ForgePlanningDemand, ForgeTaskEstimates,
     ForgeTaskLane, ForgeTaskPlan, ForgeTaskStrategy, ForgeTaskTableIdentity, NewForgeTask,
+    ORPHAN_CLEANUP_PAYLOAD_VERSION, OrphanCleanupPayload,
 };
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
@@ -29,11 +30,13 @@ use super::compact::ForgeGroupKey;
 use super::error::ForgeError;
 use super::identity::task_table_binding;
 use super::metrics::{ForgeDemandTransitionResult, ForgeTaskMetricStrategy};
+use super::path::catalog_path_to_object_key;
 use super::planner::{
     ForgeCapacity, ForgeEnvelopeSizer, ForgePlanCandidate, ForgePlanCapacity, ForgePlanner,
     ForgeTableSnapshot, plan_hash,
 };
 use super::worker::{ForgeLifecycleEvent, forge_claim_memory_limit};
+use crate::catalog::layout::forge_data_location;
 use crate::maintenance::StagingFileCommitted;
 use crate::resources::ResourcePlan;
 
@@ -591,46 +594,15 @@ impl<'forge> ForgeScheduler<'forge> {
         demand: &ForgePlanningDemand,
         fence: i64,
     ) -> Result<DemandPlanningResult, ForgeError> {
-        let (snapshot, compaction_debt_files, compaction_debt_bytes) =
+        let (snapshot, compaction_debt_files, compaction_debt_bytes, orphan_scan_prefix) =
             self.discover_snapshot(demand).await?;
         self.record_discovered_candidates(&snapshot)?;
-        let mut executable = Vec::new();
-        let mut unschedulable = Vec::new();
-        // Expired cleanup outranks fresh planning for this table: it consumes a
-        // handoff an expiration already committed, and the one-active-task
-        // index would refuse a second task anyway. Draining the handoff first
-        // is what keeps unreachable objects from accumulating behind new work.
-        if let Some(cleanup) = self.expired_cleanup_task(demand).await? {
-            executable.push(cleanup);
-        }
-        let planned = if executable.is_empty() {
-            self.planner.plan_table(&snapshot)?
-        } else {
-            Vec::new()
-        };
-        for task in planned.into_iter().take(1) {
-            let terminal = task.capacity == ForgePlanCapacity::Unschedulable;
-            let durable = NewForgeTask {
-                data_tenant_id: demand.data_tenant_id,
-                table_ref: demand.table_ref.clone(),
-                strategy: task.strategy,
-                lane: if terminal {
-                    ForgeTaskLane::Ordinary
-                } else {
-                    task.lane()?
-                },
-                base_snapshot_id: task.base_snapshot_id,
-                plan: task.plan,
-                plan_hash: task.plan_hash,
-                estimates: task.estimates,
-                ready_at: Utc::now(),
-            };
-            if terminal {
-                unschedulable.push(durable);
-            } else {
-                executable.push(durable);
-            }
-        }
+        let ForgeDemandArbitration {
+            executable,
+            unschedulable,
+        } = self
+            .arbitrate_demand(demand, &snapshot, orphan_scan_prefix)
+            .await?;
         let inserted = {
             #[cfg(feature = "test-support")]
             self.pause_before_demand_acknowledgement_if_armed().await;
@@ -721,13 +693,24 @@ impl<'forge> ForgeScheduler<'forge> {
     async fn discover_snapshot(
         &self,
         demand: &ForgePlanningDemand,
-    ) -> Result<(ForgeTableSnapshot, u64, u64), ForgeError> {
+    ) -> Result<(ForgeTableSnapshot, u64, u64, String), ForgeError> {
         let binding = task_table_binding(
             demand.data_tenant_id,
             demand.data_tenant_id,
             &demand.table_ref,
         )?;
         let table = self.forge.load_table(&binding.table_ident()).await?;
+        // The orphan scan prefix is this table's current Forge recipe root,
+        // normalized to an object key. It is derived here, from the same table
+        // load the rest of discovery uses, so a fallback orphan task and the
+        // worker that later executes it agree on the prefix by construction.
+        let table_location = table.metadata().location().to_owned();
+        let orphan_scan_prefix = catalog_path_to_object_key(
+            &table_location,
+            &binding,
+            &self.forge.core.staging,
+            &forge_data_location(&table_location),
+        )?;
         // Snapshot expiration is the one plan-encoded metadata effect. Open
         // live-rewrite reconciliation shares its candidate because both are
         // resolved by the same fenced expiry pass against current metadata.
@@ -777,6 +760,7 @@ impl<'forge> ForgeScheduler<'forge> {
             },
             promotion_debt_files,
             promotion_debt_bytes,
+            orphan_scan_prefix,
         ))
     }
 
@@ -1162,6 +1146,97 @@ impl<'forge> ForgeScheduler<'forge> {
         }))
     }
 
+    /// Fills this table's single active-task slot in the fixed strategy order.
+    ///
+    /// Expired cleanup outranks fresh planning because it consumes a handoff an
+    /// expiration already committed. The existing planner's own candidate order
+    /// is preserved next. Orphan cleanup is always due, so it comes last and
+    /// only when nothing a reader can still observe claimed the slot.
+    ///
+    /// # Errors
+    ///
+    /// Returns the handoff, planner, lane, and orphan-projection errors of the
+    /// branch that ran. A failure leaves the demand unacknowledged.
+    async fn arbitrate_demand(
+        &self,
+        demand: &ForgePlanningDemand,
+        snapshot: &ForgeTableSnapshot,
+        orphan_scan_prefix: String,
+    ) -> Result<ForgeDemandArbitration, ForgeError> {
+        let mut executable = Vec::new();
+        let mut unschedulable = Vec::new();
+        // Expired cleanup outranks fresh planning for this table: it consumes a
+        // handoff an expiration already committed, and the one-active-task
+        // index would refuse a second task anyway. Draining the handoff first
+        // is what keeps unreachable objects from accumulating behind new work.
+        if let Some(cleanup) = self.expired_cleanup_task(demand).await? {
+            executable.push(cleanup);
+        }
+        let planned = if executable.is_empty() {
+            self.planner.plan_table(snapshot)?
+        } else {
+            Vec::new()
+        };
+        for task in planned.into_iter().take(1) {
+            let terminal = task.capacity == ForgePlanCapacity::Unschedulable;
+            let durable = NewForgeTask {
+                data_tenant_id: demand.data_tenant_id,
+                table_ref: demand.table_ref.clone(),
+                strategy: task.strategy,
+                lane: if terminal {
+                    ForgeTaskLane::Ordinary
+                } else {
+                    task.lane()?
+                },
+                base_snapshot_id: task.base_snapshot_id,
+                plan: task.plan,
+                plan_hash: task.plan_hash,
+                estimates: task.estimates,
+                ready_at: Utc::now(),
+            };
+            if terminal {
+                unschedulable.push(durable);
+            } else {
+                executable.push(durable);
+            }
+        }
+        // Orphan cleanup is deliberately last. It reclaims objects no metadata
+        // references, so it must never displace a compaction, expiration, or
+        // cleanup effect that a reader can still observe. It fills the table's
+        // single active-task slot only when nothing else claimed it.
+        if executable.is_empty() && unschedulable.is_empty() {
+            executable.push(self.orphan_cleanup_task(
+                demand,
+                snapshot.snapshot_id,
+                orphan_scan_prefix,
+            )?);
+        }
+        Ok(ForgeDemandArbitration {
+            executable,
+            unschedulable,
+        })
+    }
+
+    /// Runs one production arbitration for an integration fixture.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Self::discover_snapshot`] and
+    /// [`Self::arbitrate_demand`].
+    #[cfg(feature = "test-support")]
+    pub async fn arbitrate_demand_for_test(
+        &self,
+        demand: &ForgePlanningDemand,
+    ) -> Result<Vec<NewForgeTask>, ForgeError> {
+        let (snapshot, _, _, prefix) = self.discover_snapshot(demand).await?;
+        let arbitration = self.arbitrate_demand(demand, &snapshot, prefix).await?;
+        Ok(arbitration
+            .executable
+            .into_iter()
+            .chain(arbitration.unschedulable)
+            .collect())
+    }
+
     /// Builds the one cleanup task an unconsumed expiration handoff demands.
     ///
     /// The projection is fixed and bounded: the candidates are already known,
@@ -1183,6 +1258,79 @@ impl<'forge> ForgeScheduler<'forge> {
             return Ok(None);
         }
         self.unconsumed_cleanup_projection(demand).await
+    }
+
+    /// Builds the one orphan-cleanup task a table's idle planning pass projects.
+    ///
+    /// The cutoff is computed exactly once here, from the demand generation's
+    /// own `last_requested_at`, so the task carries an immutable planning cut
+    /// that no later worker re-derives from a moving clock. The scan prefix and
+    /// base snapshot are the ones this same planning pass already observed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Invariant`] when the configured TTL cannot be
+    /// converted or the cutoff underflows the representable timestamp range,
+    /// and [`ForgeError::Capacity`] when the topology supplies no envelope.
+    fn orphan_cleanup_task(
+        &self,
+        demand: &ForgePlanningDemand,
+        base_snapshot_id: i64,
+        scan_prefix: String,
+    ) -> Result<NewForgeTask, ForgeError> {
+        let ttl =
+            chrono::Duration::from_std(self.forge.core.config.orphan_gc_ttl).map_err(|_| {
+                ForgeError::Invariant {
+                    detail: "Forge orphan GC TTL exceeds the representable range".to_owned(),
+                }
+            })?;
+        let age_cutoff_ms = demand
+            .last_requested_at
+            .checked_sub_signed(ttl)
+            .ok_or_else(|| ForgeError::Invariant {
+                detail: "Forge orphan cleanup cutoff underflows the representable range".to_owned(),
+            })?
+            .timestamp_millis();
+        let payload = OrphanCleanupPayload {
+            version: ORPHAN_CLEANUP_PAYLOAD_VERSION,
+            age_cutoff_ms,
+        };
+        // The scan is a bounded listing walk with no data read, so the estimate
+        // is the minimum admissible envelope rather than a sized workload.
+        let envelope = ForgeEnvelopeSizer::size(1, 1, 1, self.capacity)?;
+        let plan = ForgeTaskPlan {
+            version: FORGE_TASK_PAYLOAD_VERSION,
+            inputs: vec![scan_prefix],
+            parameters: payload.to_value(),
+        };
+        let plan_hash = plan_hash(&plan)?;
+        Ok(NewForgeTask {
+            data_tenant_id: demand.data_tenant_id,
+            table_ref: demand.table_ref.clone(),
+            strategy: ForgeTaskStrategy::OrphanCleanup,
+            lane: ForgeTaskLane::Ordinary,
+            base_snapshot_id,
+            plan,
+            plan_hash,
+            estimates: ForgeTaskEstimates {
+                files: 1,
+                bytes: 1,
+                parallelism: 1,
+                memory_bytes: envelope
+                    .memory_bytes()
+                    .map_err(|error| ForgeError::Invariant {
+                        detail: error.to_string(),
+                    })?,
+                spill_bytes: envelope
+                    .scratch_bytes()
+                    .map_err(|error| ForgeError::Invariant {
+                        detail: error.to_string(),
+                    })?,
+                large_ceiling_bytes: self.capacity.max_large_task_bytes,
+                envelope: Some(envelope),
+            },
+            ready_at: Utc::now(),
+        })
     }
 
     /// Builds the cleanup task for an unconsumed handoff without the phase gate.
@@ -1405,6 +1553,14 @@ fn unschedulable_event(task_id: Uuid) -> AuditEvent {
         AuditResult::Success,
         "Forge plan exceeds configured capacity".to_owned(),
     )
+}
+
+/// The one active-task slot this table's planning pass filled.
+struct ForgeDemandArbitration {
+    /// At most one enqueueable task, in arbitration order.
+    executable: Vec<NewForgeTask>,
+    /// At most one terminal task recorded as unschedulable.
+    unschedulable: Vec<NewForgeTask>,
 }
 
 /// Builds the fixed bounded durable task one cleanup handoff projects to.

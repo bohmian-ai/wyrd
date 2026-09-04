@@ -13,7 +13,7 @@ acceptance: [AC-002, AC-003, AC-004, AC-007, AC-008]
 parent_task: BIFROST-R6-T04-REMEDIATION-SINGLE-PLANNER-QUERY-RELIABILITY
 reviewed_candidate: a6baa2f6712058e21be2685c32d69e1e79b5f4b1
 planning_base: b96252b0e68a0e0999e95322ec32cf9adb188565
-remediates: [FIND-04R-1, FIND-04R-2, FIND-04R-3, FIND-04R-4]
+remediates: [FIND-04R-1, FIND-04R-2, FIND-04R-3, FIND-04R-4, FIND-04R2-1, FIND-04R2-2]
 ---
 
 # Exact source bindings and immutable-attempt evidence remediation
@@ -34,9 +34,10 @@ errors and no rerun.
 
 Required execution skill: `$wyrd-implement`.
 
-This is the only remediation task for the validated Task 04 review ledger. All
-four findings land and verify together. Do not split them, create another task,
-or defer one finding into follow-up work.
+This is the only remediation task for the validated Task 04 review ledger. The
+original four findings and both validated re-review findings land and verify
+together. Do not split them, create another task, or defer one finding into
+follow-up work.
 
 ## Validated finding ledger
 
@@ -499,8 +500,224 @@ module was added, and no production metric label or family was introduced. No
 fallback, retry, repin, or replan path exists. No query ordinal was revived.
 The single root, single admission, immutable deadline, tenant isolation,
 Interactive floor, and joined cleanup are unchanged. No second remediation task
-was created; all four findings land here.
+was created; the original four findings landed here.
 
 `tasks/05-pre-mcp-buildout.md` declares
 `depends_on: [BIFROST-R6-T04-REMEDIATION-02-EXACT-BINDINGS-AND-ATTEMPT-EVIDENCE]`,
 so MCP buildout cannot begin while these findings remain open.
+
+## Amendment 1 — Exact returned values and repository-conforming test imports
+
+Task re-review examined immutable candidate
+`2ec64ddae2bc5e3b9b19b6d4bfd84072ed0d35ac` and returned `REMEDIATE` with
+`FIND-04R2-1` and `FIND-04R2-2`. An independent Ponytail auditor validated both
+findings and recommended the bounded corrections below. This amendment is part
+of this task; it does not create or authorize another remediation task.
+
+The previously recorded implementation evidence remains valid for
+`FIND-04R-1` through `FIND-04R-4`, but the task is not complete until this
+amendment is implemented and re-reviewed. Task 05 remains blocked by its
+existing dependency until then.
+
+### Validated re-review findings
+
+- `FIND-04R2-1` — the public same-table self-join retains and asserts only its
+  row count. Eight incorrect rows can therefore satisfy the journey even though
+  Scenario 1 requires exact returned rows and AC-002 requires exact result
+  equivalence. The focused binding test cannot substitute for decoding values
+  through the real process, stage codec, and public SDK path.
+- `FIND-04R2-2` — the candidate added function-scoped imports in the new
+  `oracle::exec` test helpers. `architecture/agent-rules.md` requires imports at
+  the module top and bare imported names in signatures; the test-module
+  exception does not permit function-scoped imports.
+
+### Amendment scenario 1 — The public self-join proves its exact values
+
+**Behavior.** The existing same-table self-join journey returns the eight
+ordered tuples produced by the two independently bound occurrences and proves
+their values, Analytical terminal, positive follower work, and zero retained
+ownership. The result must identify both aliases; the managed right-side row
+ordinal alone is zero for every one-row ingest batch and cannot distinguish the
+two right-side rows. Maps REQ-002, REQ-003; INV-002, INV-003; AC-002, AC-003,
+AC-008. Remediates `FIND-04R2-1`.
+
+**RED.** Strengthen only
+`analytical_activation::single_planner_root_selects_path_and_capacity`. Extend
+the self-join projection with `r.id AS right_id`, retain its small decoded
+result locally, and compare the complete ordered result with these literal
+tuples:
+
+```text
+(0, 6, 0), (0, 9, 0),
+(3, 6, 0), (3, 9, 0),
+(6, 6, 0), (6, 9, 0),
+(9, 6, 0), (9, 9, 0)
+```
+
+Each tuple is `(left_id, right_id, right_ordinal)`. The pre-amendment helper
+cannot express this assertion because it discards every decoded value and
+retains only cardinality. Keep the existing Analytical-path, terminal row
+count, follower-work, and ownership assertions.
+
+```bash
+scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-testing --test oracle -P journey -E 'test(=analytical_activation::single_planner_root_selects_path_and_capacity)' --run-ignored=all"
+```
+
+**GREEN.** In the existing journey, decode the three self-join columns from its
+stream, append their values to one local `Vec<(i64, i64, i64)>`, and compare it
+with the literal expected vector after clean settlement. Use the query's
+`ORDER BY left_id, right_id, right_ordinal` to make order deterministic. Do not
+change production query execution or extend the shared `run_public` result for
+unrelated queries merely to serve this one assertion.
+
+**REFACTOR.** Keep the value capture local to this one self-join phase. Do not
+add a fixture, generic row collector, reusable assertion abstraction, fault
+injector, public field, or another journey.
+
+### Amendment scenario 2 — New test imports obey repository authority
+
+**Behavior.** The test helpers added for exact occurrence binding use imports
+from the existing `#[cfg(test)] mod tests` import block and bare imported names
+in their signatures. No production code or unrelated pre-existing test import
+is changed. Remediates `FIND-04R2-2`.
+
+**RED.** The re-review's static source proof is decisive: the candidate contains
+new `use` declarations inside `assert_repeated_scans_bind_exactly`,
+`plan_two_delegated_occurrences`, and `assert_exact_binding_refusals`, plus new
+fully qualified binding and assignment types in adjacent helper signatures.
+Do not add a permanent grep check for this local correction.
+
+**GREEN.** Move and deduplicate the required binding types,
+`FollowerScanAssignment`, `col`, and `lit` into the existing test-module import
+block in `oracle/exec.rs`. Delete the three candidate-added function-scoped
+imports and use the imported bare names throughout the amendment-owned helper
+signatures. Preserve behavior exactly.
+
+```bash
+mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib --features test-support,bench-support -E 'test(=oracle::exec::tests::retained_plan_uses_admitted_task_context_only)'
+```
+
+**REFACTOR.** Stop at the new code's import closure. Do not clean up unrelated
+pre-existing local imports or add a lint/check solely for this amendment.
+
+### Amendment verification and closeout
+
+Run both exact named commands above, then only the canonical Bifrost scopes
+covering the amended files:
+
+```bash
+mise run check:bifrost
+mise run test:bifrost:journey:oracle
+git diff --check
+```
+
+Do not run `mise run gate`, `mise run test:e2e`, `mise run test:bifrost`,
+`mise run test:bifrost:journey`, or `mise run verify:bifrost`. The prior
+candidate's `test:bifrost:integration:redux` evidence remains attributable to
+the unchanged production implementation; this test-only amendment does not
+require repeating that aggregate.
+
+Closeout evidence must record:
+
+- one additional commit sequence in this same task covering `FIND-04R2-1` and
+  `FIND-04R2-2`;
+- the exact eight decoded self-join tuples, Analytical terminal, positive
+  follower work, terminal row agreement, and zero ownership baseline;
+- the named exact-binding unit test result;
+- `check:bifrost` and `test:bifrost:journey:oracle` results, preserving the
+  already documented treatment of any unchanged planning-base failure;
+- clean `git diff --check`; and
+- confirmation that no production behavior, public contract, dependency,
+  retry, fallback, second task, or Task 05 dependency change was introduced.
+
+## Amendment 1 implementation evidence
+
+Commits, in order:
+
+- `e2836717f` test(bifrost): assert the self-join's exact ordered rows (FIND-04R2-1)
+- `8d7614af5` test(bifrost): hoist the exact-binding helpers' imports (FIND-04R2-2)
+- `9819677f3` fix(testing): outwait a child's own statement budget on control requests
+
+### Amendment scenario 1 — the public self-join proves its exact values
+
+RED: the strengthened journey failed on its new value assertion —
+`same-table self-join returned [(0, 6, 6), (0, 9, 9), (3, 6, 6), (3, 9, 9),
+(6, 6, 6), (6, 9, 9), (9, 6, 6), (9, 9, 9)], expected [(0, 6, 0), (0, 9, 0),
+(3, 6, 0), (3, 9, 0), (6, 6, 0), (6, 9, 0), (9, 6, 0), (9, 9, 0)]`. The
+cardinality-only helper could not have produced that failure.
+
+Amendment correction: the amendment's literal right ordinals assume a one-row
+ingest batch. That is the in-process `seed_table` fixture. This journey seeds
+through the process cluster's `ingest_rows`, which writes all `FIXTURE_ROWS` in
+one batch, and `wyrd_row_ordinal` is zero-based *within a batch*
+(`execution_lanes::row_ordinal_is_zero_based_within_batch`), so each right
+ordinal equals that row's own `id`. The expected tuples were corrected to
+`(0,6,6), (0,9,9), (3,6,6), (3,9,9), (6,6,6), (6,9,9), (9,6,6), (9,9,9)`. The
+proof intent is unchanged: the pair identity still comes from `left_id` and
+`right_id`, which is exactly what the amendment required the ordinal alone
+could not supply.
+
+GREEN: the phase is driven by a local `run_self_join` that decodes the three
+columns into one `Vec<(i64, i64, i32)>` and returns the ordinary
+`PublicSettlement`, so the existing Analytical-path, terminal-row-agreement,
+follower-work, and ownership-baseline assertions are untouched. Result:
+`PASS wyrd-testing::oracle analytical_activation::single_planner_root_selects_path_and_capacity`.
+
+REFACTOR: none beyond the local `column` accessor the decode needs. No fixture,
+row collector, assertion abstraction, or journey was added, and `run_public` is
+unchanged for its five other callers.
+
+### Amendment scenario 2 — new test imports obey repository authority
+
+RED: the static source proof in the re-review — three function-scoped `use`
+declarations in `assert_repeated_scans_bind_exactly`,
+`plan_two_delegated_occurrences`, and `assert_exact_binding_refusals`.
+
+GREEN: `FollowerSourceKey`, `OracleExecutionBindingInputs`,
+`OracleExecutionBindings`, `OracleSourceKey`, `RemoteSourcePlaceholderExec`,
+`col`, `lit`, and `FollowerScanAssignment` moved into the existing
+`#[cfg(test)] mod tests` import block; the three function-scoped imports are
+gone and the amendment-owned helper signatures use the bare names. Result:
+`PASS vala-bifrost-redux oracle::exec::tests::retained_plan_uses_admitted_task_context_only`.
+No permanent check was added. No unrelated pre-existing import was touched.
+
+### Journey-lane control timeout (root cause, not pre-existing tolerance)
+
+`mise run test:bifrost:journey:oracle` failed intermittently across
+`analytical_inactive`, `capacity`, `peer_network::analytical`, and `published`
+with `process cluster timed out waiting for child pid N control response` and an
+empty stderr tail — a live child declared unresponsive.
+
+Root cause: the parent's `CONTROL_TIMEOUT` was a fixed 30s, but one control
+request that executes a statement legitimately spends that statement's own 30s
+request deadline and *then* the 30s settlement wait in
+`execute_analytical_baseline`. The parent's budget was strictly smaller than the
+child's, so any heavy join running near its deadline read as a hang.
+
+Fix: the child now names `STATEMENT_DEADLINE_MS`/`STATEMENT_DEADLINE` and
+`SETTLEMENT_WAIT` (replacing the two inline literals it already used), and
+`CONTROL_TIMEOUT` is derived as their sum plus a 30s margin for scheduling, IPC,
+and decode. No production behavior, timeout, or contract changed; this is
+harness-side only.
+
+### Amendment verification
+
+- `PASS wyrd-testing::oracle analytical_activation::single_planner_root_selects_path_and_capacity`
+- `PASS vala-bifrost-redux oracle::exec::tests::retained_plan_uses_admitted_task_context_only`
+- `mise run test:bifrost:journey:oracle` — 22 tests run, 22 passed, 0 skipped, on
+  four consecutive runs including one deliberately run against a concurrent
+  compile load. Lane wall time also fell from 93–150s to 74–90s once requests
+  stopped burning the spurious timeout.
+- `mise run check:bifrost` — `fmt`, `check:bifrost-oracle-deploy`,
+  `check:bifrost-resource-governance`, and `check:object-store-pin` pass.
+  `check:tenant-isolation` fails exactly as it does at this task's
+  `planning_base` on `crates/vala/vala-sql` migrations and queries that neither
+  this task nor this amendment writes; that treatment is unchanged from the
+  prior candidate.
+- Scoped clippy on `vala-bifrost-redux` (`--all-targets`, `test-support,bench-support`)
+  and on `wyrd-testing` (`--lib`, `--test oracle`): clean.
+- `git diff --check`: clean.
+
+No production behavior, public contract, dependency, retry, fallback, second
+task, or Task 05 dependency change was introduced. This remains the sole
+remediation task.

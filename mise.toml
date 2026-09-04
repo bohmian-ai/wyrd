@@ -8,7 +8,7 @@
 #
 #   mise run test:rust   Broad Rust aggregate.
 #   mise run verify:bifrost   Complete scoped Bifrost gate.
-#   mise run test:wyrd/skald/vala/shared   Family lanes (skip pg_tests, no docker needed).
+#   mise run test:wyrd/skald/vala/shared   Complete default-feature family lanes.
 #   mise run py:test:unit   Python suite (builds the extension, then pytest).
 #
 #   mise exec -- cargo nextest run --locked -p <crate> --lib \
@@ -65,7 +65,7 @@ run = "cargo build --workspace --all-features --all-targets"
 [tasks."test:wyrd"]
 hide = true
 description = "Run wyrd family tests inside an isolated Postgres lifecycle; package list in scripts/test-families.sh"
-run = "scripts/postgres/with-test-postgres.sh -- mise run test:wyrd:inner"
+run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run test:wyrd:inner'"
 
 [tasks."test:wyrd:inner"]
 hide = true
@@ -89,7 +89,12 @@ run = "bash scripts/run-family-tests.sh vala"
 
 [tasks."test:shared"]
 hide = true
-description = "Run shared family tests (unit tests only — pg_tests skipped without docker); package list in scripts/test-families.sh"
+description = "Run complete shared family tests inside an isolated Postgres lifecycle; package list in scripts/test-families.sh"
+run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run test:shared:inner'"
+
+[tasks."test:shared:inner"]
+hide = true
+description = "Run shared family tests with the lifecycle already provisioned; package list in scripts/test-families.sh"
 run = "bash scripts/run-family-tests.sh shared"
 
 [tasks."test:bifrost"]
@@ -154,7 +159,7 @@ run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:a
 
 [tasks."test:bifrost:journey"]
 description = """Run the current Bifrost/Scribe Rust user-journey tests (marked #[ignore]
-so they stay out of the fast lane) against live Postgres."""
+so they stay out of default family lanes) against live Postgres."""
 
 run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run test:bifrost:journey:inner'"
 [tasks."test:bifrost:journey:inner"]
@@ -188,7 +193,7 @@ run = "bash scripts/run-bifrost-journeys.sh"
 # max_connections (docker-compose.yml). Raise those together, never one alone.
 #
 # `--run-ignored=all` replaces libtest's `--include-ignored`: tier-1 journeys are
-# `#[ignore]` so they stay out of the fast lane. Nextest does not fail fast by
+# `#[ignore]` so they stay out of default family lanes. Nextest does not fail fast by
 # default and `fail-fast = false` is set in the profile, so one broken test
 # never hides the rest of a binary. Nextest also never runs doctests, which this
 # repository does not use.
@@ -308,14 +313,14 @@ description = "Complete Bifrost change gate: scoped checks plus every Bifrost te
 depends = ["check:bifrost", "test:bifrost"]
 
 [tasks."test:rust"]
-description = """Aggregate Rust test gate: family lanes (wyrd, skald, vala, shared) + storage emulator matrix + sql + targeted server integration.
+description = """Aggregate Rust test gate: complete default-feature family lanes + storage emulator matrix + feature-specific SQL and tonic lanes.
 Bifrost (DataFusion-heavy) runs as a separate CI job via test:bifrost to avoid artifact-lock
 contention; add test:bifrost to gate or run it directly to include it locally.
 Only real-credential cloud storage tests (test:storage:{s3,gcs,azure}:cloud) are gated to
 storage-integration-cloud.yml; emulator-backed storage tests run here because they are just
 docker containers, same difficulty as Postgres.
 """
-depends = ["test:wyrd", "test:skald", "test:vala", "test:shared", "test:storage:matrix", "test:sql", "test:tonic", "test:e2e"]
+depends = ["test:wyrd", "test:skald", "test:vala", "test:shared", "test:storage:matrix", "test:sql", "test:tonic"]
 
 [tasks."test:tonic"]
 description = """Run every wyrd-tonic test at the feature union its private-conversion
@@ -323,20 +328,6 @@ contracts require. The family lanes invoke Cargo with default features, and
 wyrd-tonic's `default = []` leaves the `server`/`client` code uncompiled there,
 so this general crate lane is the only place those conversions execute."""
 run = "cargo nextest run --locked -p wyrd-tonic --features server,client"
-
-[tasks."test:e2e"]
-hide = true
-description = "Run targeted non-Bifrost server integration fixtures requiring Postgres."
-
-run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run test:e2e:inner'"
-[tasks."test:e2e:inner"]
-hide = true
-description = "Run targeted non-Bifrost server integration fixtures requiring Postgres."
-run = """
-cargo nextest run --locked -p wyrd-auth --test-threads=1 -E 'test(pg_tests)'
-cargo nextest run --locked -p wyrd-server --test auth_e2e --test authz_check_e2e --test pg_authz_check_route --test pg_bootstrap_key --test-threads=1
-cargo nextest run --locked -p wyrd-client --test pg_auth_e2e_against_fixture --test pg_discovery_against_fixture --test-threads=1
-"""
 
 [tasks."identity:e2e"]
 hide = true

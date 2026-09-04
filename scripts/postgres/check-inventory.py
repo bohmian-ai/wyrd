@@ -21,14 +21,14 @@ if "docker ps" in (root / "mise.toml").read_text() or "docker rm" in (root / "mi
     raise SystemExit("global Docker enumeration/deletion remains")
 empty = {
     "db:migrate", "db:migrate:all", "test:sql", "test:sql:forge-scale",
-    "test:bifrost:integration:redux", "test:bifrost:integration:sql", "test:wyrd",
+    "test:bifrost:integration:redux", "test:bifrost:integration:sql",
 }
-migrated = {"test:bifrost", "test:vala"}
+migrated = {"test:bifrost", "test:vala", "test:wyrd", "test:shared"}
 pre = {
     "test:bifrost:integration:server",
     "test:bifrost:journey",
     "test:bifrost:journey:python", "test:bifrost:journey:typescript",
-    "test:e2e", "py:test:integration", "ts:test:integration", "identity:e2e",
+    "py:test:integration", "ts:test:integration", "identity:e2e",
     "test:storage:e2e", "test:storage:s3:cloud", "test:storage:gcs:cloud", "test:storage:azure:cloud",
 }
 aggregates = {"test:rust", "gate", "test:storage:matrix", "test:storage:cloud:matrix"}
@@ -158,10 +158,21 @@ if len(sys.argv) == 2 and sys.argv[1] == "--negative-test":
     print("postgres inventory Vala lane negative tests: PASS")
 
 wyrd = tasks["test:wyrd"]
-if wyrd.get("run") != "scripts/postgres/with-test-postgres.sh -- mise run test:wyrd:inner":
-    raise SystemExit("test:wyrd must delegate exactly once through with-test-postgres.sh")
+if wyrd.get("run") != (
+    "scripts/postgres/with-test-postgres.sh -- bash -lc "
+    "'mise run db:migrate:all:inner && mise run test:wyrd:inner'"
+):
+    raise SystemExit("test:wyrd must run the exact complete migrated family lane")
 if tasks["test:wyrd:inner"].get("run") != "bash scripts/run-family-tests.sh wyrd":
     raise SystemExit("test:wyrd:inner must preserve the canonical family test command")
+shared = tasks["test:shared"]
+if shared.get("run") != (
+    "scripts/postgres/with-test-postgres.sh -- bash -lc "
+    "'mise run db:migrate:all:inner && mise run test:shared:inner'"
+):
+    raise SystemExit("test:shared must run the exact complete migrated family lane")
+if tasks["test:shared:inner"].get("run") != "bash scripts/run-family-tests.sh shared":
+    raise SystemExit("test:shared:inner must preserve the canonical family test command")
 for name in aggregates:
     if "with-test-postgres.sh" in str(tasks.get(name, {}).get("run", "")):
         raise SystemExit(f"aggregate {name} owns a nested lifecycle")

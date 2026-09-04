@@ -64,17 +64,16 @@ fixtures. Every specifically named Rust test uses an exact task-recorded
 `mise exec -- cargo nextest run` command.
 
 ```bash
-mise run test:wyrd            # wyrd/* family (no DB)
+mise run test:wyrd            # complete wyrd/* default-feature family
 mise run test:skald           # skald/* family (no DB)
-mise run test:vala            # vala/* family (no DB)
-mise run test:shared          # shared/* family (no DB)
+mise run test:vala            # complete vala/* default-feature family
+mise run test:shared          # complete shared/* default-feature family
 mise run test:sql             # live Postgres SQL integration tests
 mise run verify:bifrost       # complete Bifrost checks and all test tiers
 mise run test:bifrost         # all Bifrost tests and language surfaces
 mise run test:bifrost:journey # Rust bifrost user-journey tests/multi-pod distributed tests
                               # (capability binaries + registration rule:
                               #  crates/wyrd/wyrd-testing/tests/README.md)
-mise run test:e2e             # targeted non-Bifrost server integration fixtures
 mise run test:storage:matrix  # storage emulator matrix (S3/GCS/Azure)
 
 # Narrow named lib test:

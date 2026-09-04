@@ -57,17 +57,17 @@ with reading a shared fixture file.
 **A journey is registered by membership in a capability binary that a lane runs
 whole.** It is *not* registered by `#[ignore]`.
 
-`#[ignore]` and `mod pg_tests` do something different: they exclude a test from
-the family **fast** lane, which skips `pg_tests`. The `otlp` binary shows the two
-axes are independent — none of its tests are `#[ignore]`d, all are inside
-`mod pg_tests`, and the whole binary runs in the journey lane.
+`#[ignore]` excludes a test from the default family lane. `mod pg_tests` is
+source organization only; mise does not inspect module names. The `otlp` binary
+shows the two axes are independent — none of its tests are `#[ignore]`d, all are
+inside `mod pg_tests`, and the whole binary runs in both its family and journey
+lanes.
 
 So:
 
 - Put the test in the binary that owns its capability. It now runs in that
   binary's lane. **No `mise.toml` edit.**
-- Add `#[ignore]` (or put it in `mod pg_tests`) when it needs the serialized
-  Postgres-backed lane and must stay out of the fast lane.
+- Add `#[ignore]` when it must stay out of the default family lane.
 
 ## Adding a journey
 

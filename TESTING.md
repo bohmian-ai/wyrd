@@ -96,23 +96,22 @@ mise run codegen:check                   # contracts, schemas, stubs
 mise run check:client-tier | check:pyo3-scope | check:unwrap-audit
 ```
 
-## Fast lane vs. gated lane
+## Family lanes vs. gated journeys
 
 Two independent axes decide where a test runs. They are often confused.
 
 - **Which binary or capability-owned module** it is in decides **which lane**
   runs it. This is the only thing that registers a test.
-- **`#[ignore]` / `mod pg_tests`** decides whether the **fast** lane skips it.
-  Family fast lanes run `--skip pg_tests` and omit ignored tests so they stay
-  credential- and database-free. Targeted integration lanes run those tests.
+- **`#[ignore]`** keeps a test out of its default family lane. `mod pg_tests`
+  is source organization only; mise does not interpret module names.
 
-The `otlp` binary shows the axes are independent: no test in it is `#[ignore]`d,
-all are inside `mod pg_tests`, and the whole binary still runs in the journey
-lane.
+Family lanes run every non-ignored default-feature test in their crates and
+provision Postgres where any owned crate needs it. Feature-specific and external
+service journeys keep explicit lanes.
 
 Bifrost's own lanes pass `--include-ignored`, so an ignored test still runs
-there. Marking a test `#[ignore]` excludes it from the fast lane, not from
-Bifrost.
+there. Marking a test `#[ignore]` excludes it from the default family lane, not
+from Bifrost.
 
 ## When a test fails
 

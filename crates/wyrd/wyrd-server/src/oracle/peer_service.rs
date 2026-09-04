@@ -223,7 +223,8 @@ impl OraclePeerGrpc {
             .await
             .map_err(|error| match error {
                 PhysicalPlanFollowerError::Preflight(_)
-                | PhysicalPlanFollowerError::PostResolutionDecode(_) => DispatchError::Terminal,
+                | PhysicalPlanFollowerError::PostResolutionDecode(_)
+                | PhysicalPlanFollowerError::AuthorityAlreadyInstalled => DispatchError::Terminal,
                 PhysicalPlanFollowerError::Resolution(_) => DispatchError::EligibleSourceLoss {
                     cause: vala_bifrost_redux::oracle::dispatcher::EligibleSourceLossCause::ProviderResolution,
                 },

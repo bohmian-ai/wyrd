@@ -679,6 +679,25 @@ impl OraclePeerWorker {
         }
     }
 
+    /// Installs the one process reader authority on this worker's follower.
+    ///
+    /// The worker is constructed before the Oracle engine that owns the
+    /// authority, so boot fills it here after `OracleEngine::new` and before
+    /// startup, cluster activation, snapshot publication, or readiness. A
+    /// snapshot-bearing assignment fails closed until this succeeds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PhysicalPlanFollowerError::AuthorityAlreadyInstalled`] when an
+    /// authority was already installed, so a repeated or late installation
+    /// fails boot instead of permitting source IO under an unexpected epoch.
+    pub fn install_reader_authority(
+        &self,
+        authority: Arc<crate::oracle::reader_pins::OracleReaderAuthority>,
+    ) -> Result<(), PhysicalPlanFollowerError> {
+        self.physical_follower.install_reader_authority(authority)
+    }
+
     /// Captures exact production follower and footer activity for journeys.
     #[cfg(feature = "test-support")]
     #[must_use]
@@ -971,7 +990,11 @@ impl OraclePeerWorker {
                             .await?;
                         DispatchError::Terminal
                     }
-                    PhysicalPlanFollowerError::PostResolutionDecode(_) => {
+                    // Boot installs the reader authority before this worker
+                    // can serve, so reaching this arm at execution time means
+                    // the process is misconfigured rather than the peer.
+                    PhysicalPlanFollowerError::PostResolutionDecode(_)
+                    | PhysicalPlanFollowerError::AuthorityAlreadyInstalled => {
                         tracing::error!(?error, "Oracle physical follower rejected the request");
                         DispatchError::Terminal
                     }

@@ -920,30 +920,14 @@ pub async fn compose_bifrost(
                     ForgeClock::system()
                 }
             },
-            completion_observer: {
-                #[cfg(feature = "test-support")]
-                {
-                    test_controls
-                        .as_ref()
-                        .and_then(|controls| controls.forge_completion_observer.clone())
-                }
-                #[cfg(not(feature = "test-support"))]
-                {
-                    None
-                }
-            },
-            scheduler_trigger: {
-                #[cfg(feature = "test-support")]
-                {
-                    test_controls
-                        .as_ref()
-                        .map(|controls| controls.forge_scheduler_trigger.clone())
-                }
-                #[cfg(not(feature = "test-support"))]
-                {
-                    None
-                }
-            },
+            #[cfg(feature = "test-support")]
+            completion_observer: test_controls
+                .as_ref()
+                .and_then(|controls| controls.forge_completion_observer.clone()),
+            #[cfg(feature = "test-support")]
+            scheduler_trigger: test_controls
+                .as_ref()
+                .map(|controls| controls.forge_scheduler_trigger.clone()),
             telemetry: Arc::new(ForgeTelemetry::new()),
         })?);
         let worker = roles
@@ -1750,7 +1734,7 @@ impl<'a> OracleRoleBuilder<'a> {
             Arc::clone(&security_audit),
             lifecycle_transport,
         ));
-        let local_transport = Arc::new(LocalOraclePeerTransport::new(worker));
+        let local_transport = Arc::new(LocalOraclePeerTransport::new(Arc::clone(&worker)));
         let peer_transports =
             OraclePeerTransportDirectory::new(node_id, local_transport, remote_transport);
         let oracle_spill_root = prepare_oracle_spill_root(spill_root)?;
@@ -1792,6 +1776,16 @@ impl<'a> OracleRoleBuilder<'a> {
                 return Err(ServerBootError::OraclePeer(error.to_string()));
             }
         };
+        // The engine owns the one process reader authority and is built after
+        // this worker, so the follower's single-assignment cell is filled here
+        // — before startup reconciliation, activation, snapshot publication, or
+        // readiness. Until it succeeds a snapshot-bearing assignment fails
+        // closed, and a repeated or late installation fails boot outright.
+        if let Err(error) = worker.install_reader_authority(Arc::clone(oracle.reader_authority())) {
+            oracle.shutdown(std::time::Instant::now()).await;
+            release_failed_oracle_role(&cluster, &role, "reader authority installation").await;
+            return Err(ServerBootError::OraclePeer(error.to_string()));
+        }
         Ok(BuiltOracleRole {
             catalog,
             oracle,

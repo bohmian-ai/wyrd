@@ -58,6 +58,9 @@ pub enum PhysicalPlanFollowerError {
     /// The decoded plan could not create its output stream.
     #[error("physical-plan execution failed after decode: {0}")]
     Execution(String),
+    /// A second reader epoch was offered to a follower that already holds one.
+    #[error("follower reader authority is already installed")]
+    AuthorityAlreadyInstalled,
 }
 
 /// One resolved role-local source and the authenticated schema it came from.
@@ -1103,11 +1106,15 @@ pub struct PhysicalPlanFollower<R> {
     maximum_plan_bytes: usize,
     /// This node's own reader epoch, present on every Oracle follower.
     ///
-    /// Optional because a Scribe pod runs the same follower over a live-tail
+    /// Empty on a Scribe pod, which runs the same follower over a live-tail
     /// resolver that reads no snapshot. An Oracle assignment that names a
-    /// snapshot is refused when it is absent, so the option is a role
-    /// distinction rather than a way to skip protection.
-    reader_authority: Option<Arc<OracleReaderAuthority>>,
+    /// snapshot is refused while the cell is empty, so an unfilled cell is a
+    /// role distinction rather than a way to skip protection.
+    ///
+    /// The cell is single-assignment because the engine that owns the process
+    /// reader authority is constructed *after* this worker. Boot fills it once,
+    /// before startup or activation, and a second fill is a wiring defect.
+    reader_authority: std::sync::OnceLock<Arc<OracleReaderAuthority>>,
     /// Observable lifecycle-boundary effects used to prove fail-closed ordering.
     effects: FollowerEffects,
 }
@@ -1123,7 +1130,7 @@ where
             .field("resolver", &self.resolver)
             .field("audit", &self.audit.is_some())
             .field("maximum_plan_bytes", &self.maximum_plan_bytes)
-            .field("reader_authority", &self.reader_authority.is_some())
+            .field("reader_authority", &self.reader_authority.get().is_some())
             .field("effects", &self.effects)
             .finish()
     }
@@ -1155,7 +1162,7 @@ where
             resolver,
             audit: None,
             maximum_plan_bytes: DEFAULT_MAX_PHYSICAL_PLAN_BYTES,
-            reader_authority: None,
+            reader_authority: std::sync::OnceLock::new(),
             effects: FollowerEffects {
                 preflight: AtomicUsize::new(0),
                 resolver: AtomicUsize::new(0),
@@ -1174,10 +1181,34 @@ where
     }
 
     /// Installs this node's reader epoch, without which no snapshot is readable.
+    ///
+    /// Retained for callers that already own the authority at construction.
+    /// Boot cannot, so it uses [`Self::install_reader_authority`] instead.
     #[must_use]
     pub fn with_reader_authority(mut self, authority: Arc<OracleReaderAuthority>) -> Self {
-        self.reader_authority = Some(authority);
+        self.reader_authority = std::sync::OnceLock::from(authority);
         self
+    }
+
+    /// Installs this node's reader epoch exactly once, after construction.
+    ///
+    /// The one process reader authority is owned by the Oracle engine, which is
+    /// built after this follower, so boot fills the cell here before startup,
+    /// activation, or snapshot publication. Taking `&self` keeps the follower
+    /// shareable behind an `Arc` while remaining single-assignment.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PhysicalPlanFollowerError::AuthorityAlreadyInstalled`] when the
+    /// cell is already filled, so a repeated or late installation fails boot
+    /// rather than silently leaving a second authority unused.
+    pub fn install_reader_authority(
+        &self,
+        authority: Arc<OracleReaderAuthority>,
+    ) -> Result<(), PhysicalPlanFollowerError> {
+        self.reader_authority
+            .set(authority)
+            .map_err(|_| PhysicalPlanFollowerError::AuthorityAlreadyInstalled)
     }
 
     /// Protects every snapshot this fragment's assignments name, before decode.
@@ -1201,7 +1232,7 @@ where
             if !assignment.reader_cut.protects_a_snapshot() {
                 continue;
             }
-            let Some(authority) = self.reader_authority.as_ref() else {
+            let Some(authority) = self.reader_authority.get() else {
                 return Err(PhysicalPlanFollowerError::Preflight(
                     "follower has no reader epoch for a snapshot-bearing assignment".to_owned(),
                 ));
@@ -1238,7 +1269,7 @@ where
             local_cut_from_follower(identity, cut)
                 .map_err(|error| PhysicalPlanFollowerError::Preflight(error.to_string()))?;
         }
-        let Some(authority) = self.reader_authority.as_ref() else {
+        let Some(authority) = self.reader_authority.get() else {
             return Err(PhysicalPlanFollowerError::Preflight(
                 "follower has no reader epoch for a snapshot-bearing assignment".to_owned(),
             ));

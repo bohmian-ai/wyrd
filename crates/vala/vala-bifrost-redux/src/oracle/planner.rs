@@ -19,10 +19,10 @@ use wyrd_spec::vala::api::ClusterCapabilities;
 
 use super::*;
 use super::{
-    AuthorizedQueryContext, BifrostCatalog, BifrostCatalogError, BifrostError, DrainedTails,
-    HotFileSource, OracleAudit, OracleMemoryResources, OracleTableInputs, OracleTableProvider,
-    OracleTelemetry, PinnedSealedTable, PlannedSqlCut, QueryClass, TableRef, map_datafusion_error,
-    optimized_plan_is_complex, query_class_label,
+    AuthorizedQueryContext, BifrostCatalog, BifrostCatalogError, BifrostError, HotFileSource,
+    OracleAudit, OracleTableInputs, OracleTableProvider, OracleTelemetry, PinnedSealedTable,
+    PlannedSqlCut, QueryClass, TableRef, map_datafusion_error, optimized_plan_is_complex,
+    query_class_label,
 };
 
 /// Query floor and logical-plan preparation owner.
@@ -211,14 +211,9 @@ impl OraclePlanner {
     ) -> Result<std::collections::HashMap<String, Arc<dyn TableProvider>>, BifrostError> {
         let TypedProviderInputs {
             context,
-            class,
             cuts,
-            drained,
             catalog,
             audit,
-            memory,
-            query_pool,
-            telemetry,
         } = inputs;
         let mut providers = std::collections::HashMap::with_capacity(cuts.len());
         for cut in cuts {
@@ -227,17 +222,10 @@ impl OraclePlanner {
             let provider = OracleTableProvider::try_new(OracleTableInputs {
                 table: cut.iceberg_table,
                 storage: Arc::clone(catalog.storage()),
-                distributed_iceberg_batches: None,
                 hot_files,
-                distributed_hot_batches: Vec::new(),
-                live_batches: drained.batches.remove(&table_name).unwrap_or_default(),
                 context: context.clone(),
                 table_name: table_name.clone(),
                 audit: Arc::clone(&audit),
-                memory: memory.clone(),
-                query_pool: Arc::clone(&query_pool),
-                telemetry: Arc::clone(&telemetry),
-                query_class: class,
             })
             .await
             .map_err(|error| map_datafusion_error(&error))?;
@@ -450,22 +438,12 @@ impl OraclePlanner {
 pub(super) struct TypedProviderInputs<'a> {
     /// Authenticated tenant context copied into each provider.
     pub(super) context: &'a AuthorizedQueryContext,
-    /// Admission class charged by each provider.
-    pub(super) class: QueryClass,
     /// Pinned table metadata selected for this query.
     pub(super) cuts: Vec<PinnedSealedTable>,
-    /// Drained live batches and reservations for the same cuts.
-    pub(super) drained: &'a mut DrainedTails,
     /// Catalog used to resolve hot object locations.
     pub(super) catalog: &'a BifrostCatalog,
     /// Durable audit collaborator retained by each source operator.
     pub(super) audit: Arc<dyn OracleAudit>,
-    /// Parent memory governor and reconciliation ceiling.
-    pub(super) memory: OracleMemoryResources,
-    /// Query-local pool shared by `DataFusion` and Wyrd source owners.
-    pub(super) query_pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
-    /// Production source/reconciliation telemetry owner.
-    pub(super) telemetry: Arc<OracleTelemetry>,
 }
 
 /// Collects distinct canonical table identities from a typed plan.

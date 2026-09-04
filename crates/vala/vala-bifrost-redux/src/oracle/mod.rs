@@ -61,6 +61,7 @@ pub mod analytical_scan;
 pub mod analytical_supervisor;
 pub mod analytical_transport;
 pub mod attempt;
+mod bindings;
 pub mod codec;
 pub mod dispatcher;
 pub(crate) mod exec;
@@ -1663,8 +1664,6 @@ struct SqlCutInput<'a> {
     sql: &'a str,
     /// Exact pinned table cuts.
     cuts: Vec<PinnedSealedTable>,
-    /// Drained live batches keyed by canonical table name.
-    live_batches: HashMap<String, Vec<RecordBatch>>,
     /// Remote Scribe sources selected by the audited visibility cut.
     scribe_sources: Vec<ScribeFollowerSource>,
     /// Immutable admission class.
@@ -3068,7 +3067,17 @@ impl Oracle {
             Err(error) => return release_error(deadline, admitted, error, "audit rejection"),
         };
         phases.drained();
-        admitted.live_reservations = std::mem::take(&mut drained.reservations);
+        let bound = match self.bind_execution_sources(
+            &session,
+            &admitted,
+            planned.query_class,
+            participant_cut.deadline(),
+            &planned.cuts,
+            &mut drained,
+        ) {
+            Ok(bound) => bound,
+            Err(error) => return release_error(deadline, admitted, error, "binding rejection"),
+        };
         // Retained here only until selection: an Analytical query moves this
         // owner onto its graph, and what is left is what the stream still owes.
         let mut running_query = Some(running_query);
@@ -3078,8 +3087,7 @@ impl Oracle {
                 sql: &request.sql,
                 logical_bytes_selected: Self::logical_selected_bytes(&planned.cuts),
                 cuts: planned.cuts,
-                live_batches: drained.batches,
-                scribe_sources: drained.follower_sources,
+                scribe_sources: std::mem::take(&mut drained.follower_sources),
                 query_class: planned.query_class,
                 freshness: request.freshness,
                 admitted: &mut admitted,
@@ -3100,7 +3108,12 @@ impl Oracle {
                 return release_error(deadline, admitted, error, "execution rejection");
             }
         };
-        record_degraded_live_tail(&execution.degraded_sources, drained.degraded);
+        record_degraded_live_tail(
+            &execution.degraded_sources,
+            bound
+                .get()
+                .is_some_and(bindings::OracleExecutionBindings::degraded),
+        );
         let settlement = AttemptSettlement {
             deadline,
             deadline_ms: participant_cut.deadline().timestamp_millis().max(0),
@@ -3109,6 +3122,65 @@ impl Oracle {
         };
         let output = AttemptOutput::new(execution, admitted, running_query);
         settle_attempt_output(output, settlement, query_telemetry).await
+    }
+
+    /// Publishes the one binding set every planned leaf resolves through.
+    ///
+    /// Called after admission and the audited drain, and before any physical
+    /// leaf can execute. It validates that every source the plan planned has
+    /// exactly one binding, then sets the session's `OnceLock` once. A failed
+    /// set drops the rejected bindings — releasing their drained reservations —
+    /// and terminates the query rather than replacing live bindings.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::QueryExecutionFailed`] when the session carries
+    /// no bindings extension, when validation refuses the binding set, or when
+    /// the lock was already bound.
+    ///
+    /// On success the bound lock is returned so the terminal path reads the
+    /// degraded fact from the same post-admission source registry the leaves
+    /// resolve against.
+    fn bind_execution_sources(
+        &self,
+        session: &SessionContext,
+        admitted: &AdmittedQueryGuard,
+        query_class: QueryClass,
+        deadline: chrono::DateTime<chrono::Utc>,
+        cuts: &[PinnedSealedTable],
+        drained: &mut DrainedTails,
+    ) -> Result<Arc<bindings::OracleExecutionLock>, BifrostError> {
+        let lock = session
+            .copied_config()
+            .get_extension::<bindings::OracleExecutionLock>()
+            .ok_or(BifrostError::QueryExecutionFailed)?;
+        let mut local_batches = std::mem::take(&mut drained.batches);
+        let planned = cuts
+            .iter()
+            .map(|cut| {
+                let table = cut.binding.table_ref.fqn();
+                local_batches.entry(table.clone()).or_default();
+                bindings::OracleSourceKey::LocalDrained { table }
+            })
+            .collect::<Vec<_>>();
+        let value = bindings::OracleExecutionBindings::try_new(
+            bindings::OracleExecutionBindingInputs {
+                grant: bindings::OracleExecutionGrant {
+                    query_class,
+                    cancellation: admitted.cancellation.clone(),
+                    deadline,
+                    memory: self.memory.clone(),
+                    telemetry: Arc::clone(&self.telemetry),
+                },
+                local_batches,
+                reservations: std::mem::take(&mut drained.reservations),
+                degraded: drained.degraded,
+            },
+            &planned,
+        )?;
+        lock.set(value)
+            .map_err(|_| BifrostError::QueryExecutionFailed)?;
+        Ok(lock)
     }
 
     /// Inserts one admitted query against the ingress-captured membership cut.
@@ -3532,19 +3604,29 @@ impl Oracle {
         let mut drained = self
             .acquire_audit_and_drain_typed_tails(context, &plan, options, class, &cuts, &admitted)
             .await?;
-        admitted.live_reservations = std::mem::take(&mut drained.reservations);
+        let bound = match self.bind_execution_sources(
+            &session,
+            &admitted,
+            class,
+            absolute_deadline(options.deadline),
+            &cuts,
+            &mut drained,
+        ) {
+            Ok(bound) => bound,
+            Err(error) => {
+                return release_error(options.deadline, admitted, error, "typed binding rejection");
+            }
+        };
+        let degraded = bound
+            .get()
+            .is_some_and(bindings::OracleExecutionBindings::degraded);
         let providers = self
             .planner
             .build_typed_providers(planner::TypedProviderInputs {
                 context,
-                class,
                 cuts,
-                drained: &mut drained,
                 catalog: &self.catalog,
                 audit: Arc::clone(&self.audit),
-                memory: self.memory.clone(),
-                query_pool: Arc::clone(&session.runtime_env().memory_pool),
-                telemetry: Arc::clone(&self.telemetry),
             })
             .await?;
         let rewritten = OraclePlanner::replace_typed_sources(plan, &providers)?;
@@ -3575,7 +3657,7 @@ impl Oracle {
             deadline_ms: absolute_deadline_ms(options.deadline),
             visibility: options.visibility,
             freshness_policy: wyrd_spec::vala::api::FreshnessPolicy::Strict,
-            degraded_sources: Arc::new(std::sync::Mutex::new(if drained.degraded {
+            degraded_sources: Arc::new(std::sync::Mutex::new(if degraded {
                 vec![DegradedPartition {
                     ordinal: u32::MAX,
                     reason: "live_tail_unavailable",
@@ -3850,13 +3932,11 @@ impl Oracle {
                 .or_default()
                 .push(source);
         }
-        let mut live_batches = std::mem::take(&mut input.live_batches);
         for cut in std::mem::take(&mut input.cuts) {
             self.register_cut_provider(
                 cut,
                 &session,
                 &input,
-                &mut live_batches,
                 &mut scribe_sources,
                 &mut assignments,
             )
@@ -3945,7 +4025,6 @@ impl Oracle {
         cut: PinnedSealedTable,
         session: &SessionContext,
         input: &SqlCutInput<'_>,
-        live_batches: &mut HashMap<String, Vec<RecordBatch>>,
         remote_sources: RemotePersistedSources,
     ) -> Result<(), OracleExecutionError> {
         let distributed = self.fragment_dispatcher.is_some();
@@ -3958,17 +4037,10 @@ impl Oracle {
         let provider_inputs = OracleTableInputs {
             table: cut.iceberg_table,
             storage: Arc::clone(self.catalog.storage()),
-            distributed_iceberg_batches: None,
             hot_files: local_hot_files,
-            distributed_hot_batches: Vec::new(),
-            live_batches: live_batches.remove(&table_name).unwrap_or_default(),
             context: input.context.clone(),
             table_name: table_name.clone(),
             audit: Arc::clone(&self.audit),
-            memory: self.memory.clone(),
-            query_pool: Arc::clone(&session.runtime_env().memory_pool),
-            telemetry: Arc::clone(&self.telemetry),
-            query_class: input.query_class,
         };
         let provider = if distributed {
             OracleTableProvider::try_new_distributed(provider_inputs, remote_sources).await
@@ -3989,7 +4061,6 @@ impl Oracle {
         cut: PinnedSealedTable,
         session: &SessionContext,
         input: &SqlCutInput<'_>,
-        live_batches: &mut HashMap<String, Vec<RecordBatch>>,
         scribe_sources: &mut HashMap<String, Vec<ScribeFollowerSource>>,
         assignments: &mut CutAssignments,
     ) -> Result<(), OracleExecutionError> {
@@ -4085,7 +4156,7 @@ impl Oracle {
                 })
                 .collect();
         }
-        self.register_table_provider(cut, session, input, live_batches, remote_sources)
+        self.register_table_provider(cut, session, input, remote_sources)
             .await?;
         Ok(())
     }
@@ -4378,7 +4449,12 @@ impl Oracle {
             admitted.target_partitions(),
             work_units,
         );
-        let config = shape.session_config();
+        // Installed empty before any planning happens. The lock owns no runtime
+        // and no memory; it is the one place a planned leaf's concrete source,
+        // grant, and drained batches arrive once, after admission.
+        let config = shape
+            .session_config()
+            .with_extension(Arc::new(bindings::OracleExecutionLock::new()));
         let state = datafusion::execution::session_state::SessionStateBuilder::new()
             .with_default_features()
             .with_config(config)
@@ -5310,10 +5386,19 @@ async fn settle_attempt_output(
 /// deadline that has already passed yields the current time, never a negative
 /// millisecond, because the wire contract is nonnegative.
 fn absolute_deadline_ms(deadline: Instant) -> i64 {
+    absolute_deadline(deadline).timestamp_millis().max(0)
+}
+
+/// Projects one monotonic deadline onto the absolute wall clock.
+///
+/// Execution governance is observed by leaves that only see a wall clock, so a
+/// monotonic budget has to be projected once at the boundary rather than
+/// re-derived per leaf.
+fn absolute_deadline(deadline: Instant) -> chrono::DateTime<chrono::Utc> {
     let remaining = deadline.saturating_duration_since(Instant::now());
     let remaining =
         chrono::Duration::from_std(remaining).unwrap_or_else(|_| chrono::Duration::zero());
-    (chrono::Utc::now() + remaining).timestamp_millis().max(0)
+    chrono::Utc::now() + remaining
 }
 
 /// Records an unavailable live tail as a degraded partition on the shared list.

@@ -28,21 +28,52 @@ use futures_util::TryStreamExt as _;
 use wyrd_spec::vala::api::ClusterRole;
 use wyrd_spec::vala::api::FollowerScanAssignment;
 
+use super::bindings::OracleSourceKey;
 use super::follower::{FollowerSourceResolver, signed_closure_schema};
 
-/// Leaf that resolves one signed Analytical assignment on first execution.
+/// The one source a lazily resolved Oracle leaf reads.
+///
+/// Both variants defer every byte of IO to `execute`, which is the only point
+/// at which the admitted task — and therefore the query's runtime, pool,
+/// deadline, cancellation, and bound sources — exists.
+#[derive(Clone)]
+enum AnalyticalScanSource {
+    /// Leader-side leaf projecting the one Fused batch set bound for its table.
+    LocalDrained {
+        /// Exact planned key this leaf resolves its batches through.
+        key: OracleSourceKey,
+    },
+    /// Worker-side leaf resolving the assignment authenticated on the wire.
+    Assigned {
+        /// Signed assignment naming this task's tenant binding, files, and closure.
+        assignment: Arc<FollowerScanAssignment>,
+        /// Role this node executes as, selecting the resolver's source family.
+        role: ClusterRole,
+        /// Process resolver that turns an assignment into a role-local provider.
+        resolver: Arc<dyn FollowerSourceResolver>,
+    },
+}
+
+impl AnalyticalScanSource {
+    /// Returns the stable non-secret identity rendered in plan diagnostics.
+    fn label(&self) -> &str {
+        match self {
+            Self::LocalDrained { key } => key.local_table(),
+            Self::Assigned { assignment, .. } => assignment.scan_id.as_str(),
+        }
+    }
+}
+
+/// Leaf that resolves one authenticated source on first execution.
 ///
 /// The leaf advertises the leader's closure schema and partition count so the
 /// follower's decoded plan has exactly the shape the leader planned. Resolution
 /// is memoized: every partition of one leaf shares a single provider, so a
 /// multi-partition stage performs the catalog and storage work once.
+#[derive(Clone)]
 pub struct AnalyticalScanExec {
-    /// Signed assignment naming this task's tenant binding, files, and closure.
-    assignment: Arc<FollowerScanAssignment>,
-    /// Role this node executes as, used to select the resolver's source family.
-    role: ClusterRole,
-    /// Process resolver that turns an assignment into a role-local provider.
-    resolver: Arc<dyn FollowerSourceResolver>,
+    /// Closed source identity this leaf resolves at execution time.
+    source: AnalyticalScanSource,
     /// Advertised physical properties derived from the leader's closure.
     properties: Arc<PlanProperties>,
     /// Provider resolved on first execution and shared by every partition.
@@ -62,6 +93,30 @@ impl AnalyticalScanExec {
         schema: SchemaRef,
         partitions: usize,
     ) -> Self {
+        Self::with_source(
+            AnalyticalScanSource::Assigned {
+                assignment: Arc::new(assignment),
+                role,
+                resolver,
+            },
+            schema,
+            partitions,
+        )
+    }
+
+    /// Creates the leader-side leaf that reads one table's bound Fused batches.
+    ///
+    /// The batch set is bound after admission and the audited drain, so this
+    /// leaf retains only its key and the closure schema the plan was built
+    /// against. A single partition is advertised because one drained batch set
+    /// is projected as one memory source.
+    #[must_use]
+    pub(super) fn local_drained(key: OracleSourceKey, schema: SchemaRef) -> Self {
+        Self::with_source(AnalyticalScanSource::LocalDrained { key }, schema, 1)
+    }
+
+    /// Builds one leaf around an already-chosen source and advertised shape.
+    fn with_source(source: AnalyticalScanSource, schema: SchemaRef, partitions: usize) -> Self {
         let properties = Arc::new(PlanProperties::new(
             datafusion::physical_expr::EquivalenceProperties::new(schema),
             Partitioning::UnknownPartitioning(partitions.max(1)),
@@ -69,9 +124,7 @@ impl AnalyticalScanExec {
             datafusion::physical_plan::execution_plan::Boundedness::Bounded,
         ));
         Self {
-            assignment: Arc::new(assignment),
-            role,
-            resolver,
+            source,
             properties,
             resolved: Arc::new(tokio::sync::OnceCell::new()),
         }
@@ -79,55 +132,93 @@ impl AnalyticalScanExec {
 
     /// Resolves, validates, and reshapes the provider backing this leaf.
     ///
-    /// The two schema checks mirror `PhysicalPlanFollower::decode` exactly: the
-    /// fingerprint identifies the table's complete canonical schema, and the
-    /// leaf must then expose precisely the closure derived from that schema and
-    /// the signed column names. Deriving the closure from the provider's own
-    /// schema would make the check circular, so it is derived from the
-    /// authenticated full schema. The provider is finally reshaped to the
-    /// advertised partition count, because the leader planned against that
-    /// count and an operator above this leaf depends on it.
+    /// Both variants resolve against the executing task rather than a fresh
+    /// process default, so the resolved subtree inherits the admitted runtime,
+    /// memory pool, session configuration, and registered functions.
+    ///
+    /// The assigned variant's two schema checks mirror
+    /// `PhysicalPlanFollower::decode` exactly: the fingerprint identifies the
+    /// table's complete canonical schema, and the leaf must then expose
+    /// precisely the closure derived from that schema and the signed column
+    /// names. Deriving the closure from the provider's own schema would make
+    /// the check circular, so it is derived from the authenticated full schema.
+    /// The provider is finally reshaped to the advertised partition count,
+    /// because the leader planned against that count and an operator above this
+    /// leaf depends on it.
     ///
     /// # Errors
     ///
     /// Returns [`DataFusionError::Plan`] when resolution fails, when either
-    /// schema check fails, or when the provider cannot be repartitioned.
-    async fn resolve(&self) -> Result<Arc<dyn ExecutionPlan>> {
-        let session = SessionStateBuilder::new().with_default_features().build();
-        let resolved = self
-            .resolver
-            .resolve(self.role, self.assignment.as_ref(), &session)
-            .await
-            .map_err(|error| {
-                DataFusionError::Plan(format!("analytical source resolution failed: {error}"))
-            })?;
-        let actual = super::assignment_schema_fingerprint(resolved.full_schema.as_ref());
-        if actual != self.assignment.schema_fingerprint {
-            return Err(DataFusionError::Plan(
-                "resolved provider schema fingerprint differs from assignment".to_owned(),
-            ));
-        }
-        let expected = signed_closure_schema(
-            resolved.full_schema.as_ref(),
-            &self.assignment.required_columns,
-        )
-        .map_err(DataFusionError::Plan)?;
-        if resolved.plan.schema() != expected {
-            return Err(DataFusionError::Plan(
-                "resolved provider schema differs from the signed projection closure".to_owned(),
-            ));
-        }
-        if resolved.plan.schema() != self.schema() {
+    /// schema check fails, or when the provider cannot be repartitioned, and a
+    /// [`DataFusionError::Execution`] when a local-drained leaf has no bound
+    /// source in the executing task.
+    async fn resolve(&self, task: &Arc<TaskContext>) -> Result<Arc<dyn ExecutionPlan>> {
+        let resolved = match &self.source {
+            AnalyticalScanSource::LocalDrained { key } => {
+                let lock = super::bindings::bindings_for_task(task.as_ref())?;
+                let bindings = lock.get().ok_or_else(|| {
+                    DataFusionError::Execution("Oracle execution bindings are not bound".to_owned())
+                })?;
+                bindings.grant().ensure_live()?;
+                let batches = bindings.local_batches(key)?;
+                return super::exec::OracleTableProvider::projected_memory_source(
+                    batches,
+                    &self.schema(),
+                );
+            }
+            AnalyticalScanSource::Assigned {
+                assignment,
+                role,
+                resolver,
+            } => {
+                let session = SessionStateBuilder::new()
+                    .with_config(task.session_config().clone())
+                    .with_runtime_env(task.runtime_env())
+                    .with_scalar_functions(task.scalar_functions().values().cloned().collect())
+                    .with_aggregate_functions(
+                        task.aggregate_functions().values().cloned().collect(),
+                    )
+                    .with_window_functions(task.window_functions().values().cloned().collect())
+                    .build();
+                let resolved = resolver
+                    .resolve(*role, assignment.as_ref(), &session)
+                    .await
+                    .map_err(|error| {
+                        DataFusionError::Plan(format!(
+                            "analytical source resolution failed: {error}"
+                        ))
+                    })?;
+                let actual = super::assignment_schema_fingerprint(resolved.full_schema.as_ref());
+                if actual != assignment.schema_fingerprint {
+                    return Err(DataFusionError::Plan(
+                        "resolved provider schema fingerprint differs from assignment".to_owned(),
+                    ));
+                }
+                let expected = signed_closure_schema(
+                    resolved.full_schema.as_ref(),
+                    &assignment.required_columns,
+                )
+                .map_err(DataFusionError::Plan)?;
+                if resolved.plan.schema() != expected {
+                    return Err(DataFusionError::Plan(
+                        "resolved provider schema differs from the signed projection closure"
+                            .to_owned(),
+                    ));
+                }
+                resolved.plan
+            }
+        };
+        if resolved.schema() != self.schema() {
             return Err(DataFusionError::Plan(
                 "resolved provider schema differs from the advertised leaf schema".to_owned(),
             ));
         }
         let advertised = self.properties.partitioning.partition_count();
-        if resolved.plan.output_partitioning().partition_count() == advertised {
-            return Ok(resolved.plan);
+        if resolved.output_partitioning().partition_count() == advertised {
+            return Ok(resolved);
         }
         datafusion::physical_plan::repartition::RepartitionExec::try_new(
-            resolved.plan,
+            resolved,
             Partitioning::RoundRobinBatch(advertised),
         )
         .map(|plan| Arc::new(plan) as Arc<dyn ExecutionPlan>)
@@ -143,8 +234,7 @@ impl std::fmt::Debug for AnalyticalScanExec {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("AnalyticalScanExec")
-            .field("scan_id", &self.assignment.scan_id)
-            .field("role", &self.role)
+            .field("source", &self.source.label())
             .field(
                 "partitions",
                 &self.properties.partitioning.partition_count(),
@@ -163,7 +253,7 @@ impl DisplayAs for AnalyticalScanExec {
         _display: DisplayFormatType,
         formatter: &mut std::fmt::Formatter<'_>,
     ) -> std::fmt::Result {
-        write!(formatter, "AnalyticalScanExec: {}", self.assignment.scan_id)
+        write!(formatter, "AnalyticalScanExec: {}", self.source.label())
     }
 }
 
@@ -270,17 +360,11 @@ impl ExecutionPlan for AnalyticalScanExec {
             )));
         }
         let schema = self.schema();
-        let this = AnalyticalScanExec {
-            assignment: Arc::clone(&self.assignment),
-            role: self.role,
-            resolver: Arc::clone(&self.resolver),
-            properties: Arc::clone(&self.properties),
-            resolved: Arc::clone(&self.resolved),
-        };
+        let this = self.clone();
         let stream = futures_util::stream::once(async move {
             let plan = this
                 .resolved
-                .get_or_try_init(|| this.resolve())
+                .get_or_try_init(|| this.resolve(&context))
                 .await?
                 .clone();
             plan.execute(partition, context)

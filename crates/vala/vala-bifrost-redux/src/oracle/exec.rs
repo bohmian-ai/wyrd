@@ -1728,42 +1728,22 @@ pub(crate) struct OracleTableInputs {
     pub(crate) table: iceberg::table::Table,
     /// The node's one storage owner, which decodes every hot object's metadata.
     pub(crate) storage: Arc<crate::storage::BifrostStorage>,
-    /// Footer-validated distributed Iceberg batches, when peer dispatch was selected.
-    pub(crate) distributed_iceberg_batches: Option<Vec<RecordBatch>>,
     /// Leader-local hot files absent from the pinned Iceberg snapshot.
     pub(crate) hot_files: Vec<HotFileSource>,
-    /// Footer-validated distributed hot batches.
-    pub(crate) distributed_hot_batches: Vec<RecordBatch>,
-    /// Drained live batches for the same table cut.
-    pub(crate) live_batches: Vec<RecordBatch>,
     /// Authenticated request context retained by the tenant tripwire.
     pub(crate) context: AuthorizedQueryContext,
     /// Canonical table name used in security diagnostics.
     pub(crate) table_name: String,
     /// Mandatory audit collaborator.
     pub(crate) audit: Arc<dyn OracleAudit>,
-    /// Parent-governed source and reconciliation memory.
-    pub(crate) memory: OracleMemoryResources,
-    /// Query-local pool shared by `DataFusion` and Wyrd-owned source buffers.
-    pub(crate) query_pool: Arc<dyn MemoryPool>,
-    /// Production memory telemetry owner.
-    pub(super) telemetry: Arc<OracleTelemetry>,
-    /// Admission class charged by this provider.
-    pub(crate) query_class: QueryClass,
 }
 
 /// Complete physical provider for one authenticated table visibility cut.
 pub(crate) struct OracleTableProvider {
     /// Pinned Iceberg provider built from immutable table metadata.
     iceberg: IcebergStaticTableProvider,
-    /// Footer-validated distributed Iceberg batches, or `None` for leader-local scanning.
-    distributed_iceberg_batches: Option<Vec<RecordBatch>>,
     /// Pinned hot files absent from the selected Iceberg manifest.
     hot_files: Vec<HotFileSource>,
-    /// Fully validated local/peer hot batches admitted only after a matching footer.
-    distributed_hot_batches: Vec<RecordBatch>,
-    /// Already-audited and drained live batches.
-    live_batches: Vec<RecordBatch>,
     /// File reader inherited from the pinned Iceberg table.
     file_io: FileIO,
     /// The node's one storage owner, handed to every hot leaf this builds.
@@ -1778,14 +1758,6 @@ pub(crate) struct OracleTableProvider {
     table: String,
     /// Standard read/security audit collaborator.
     audit: Arc<dyn OracleAudit>,
-    /// Parent-governed reconciliation and source memory.
-    memory: OracleMemoryResources,
-    /// Query-local pool shared by every physical operator and source owner.
-    query_pool: Arc<dyn MemoryPool>,
-    /// Production memory accounting shared with the retained Oracle.
-    telemetry: Arc<OracleTelemetry>,
-    /// Immutable admission class charged by this table execution.
-    query_class: QueryClass,
     /// Optional persisted-source placeholders used by native follower planning.
     remote_sources: RemotePersistedSources,
 }
@@ -1816,19 +1788,7 @@ impl fmt::Debug for OracleTableProvider {
         formatter
             .debug_struct("OracleTableProvider")
             .field("table", &self.table)
-            .field(
-                "distributed_iceberg_batch_count",
-                &self
-                    .distributed_iceberg_batches
-                    .as_ref()
-                    .map_or(0, Vec::len),
-            )
             .field("hot_file_count", &self.hot_files.len())
-            .field(
-                "distributed_hot_batch_count",
-                &self.distributed_hot_batches.len(),
-            )
-            .field("live_batch_count", &self.live_batches.len())
             .finish_non_exhaustive()
     }
 }
@@ -1959,17 +1919,10 @@ impl OracleTableProvider {
         let OracleTableInputs {
             table,
             storage,
-            distributed_iceberg_batches,
             hot_files,
-            distributed_hot_batches,
-            live_batches,
             context,
             table_name,
             audit,
-            memory,
-            query_pool,
-            telemetry,
-            query_class,
         } = inputs;
         let file_io = table.file_io().clone();
         let iceberg = IcebergStaticTableProvider::try_new_from_table(table)
@@ -1977,28 +1930,9 @@ impl OracleTableProvider {
             .map_err(|error| DataFusionError::External(Box::new(error)))?;
         let physical_schema = iceberg.schema();
         let public_schema = schema_without(&physical_schema, DATA_TENANT_ID)?;
-        let distributed_iceberg_batches = distributed_iceberg_batches
-            .map(|batches| {
-                batches
-                    .into_iter()
-                    .map(|batch| project_batch(&batch, Arc::clone(&physical_schema)))
-                    .collect::<DataFusionResult<Vec<_>>>()
-            })
-            .transpose()?;
-        let distributed_hot_batches = distributed_hot_batches
-            .into_iter()
-            .map(|batch| project_batch(&batch, Arc::clone(&physical_schema)))
-            .collect::<DataFusionResult<Vec<_>>>()?;
-        let live_batches = live_batches
-            .into_iter()
-            .map(|batch| project_batch(&batch, Arc::clone(&physical_schema)))
-            .collect::<DataFusionResult<Vec<_>>>()?;
         Ok(Self {
             iceberg,
-            distributed_iceberg_batches,
             hot_files,
-            distributed_hot_batches,
-            live_batches,
             file_io,
             storage,
             physical_schema,
@@ -2006,10 +1940,6 @@ impl OracleTableProvider {
             context,
             table: table_name,
             audit,
-            memory,
-            query_pool,
-            telemetry,
-            query_class,
             remote_sources: RemotePersistedSources::default(),
         })
     }
@@ -2170,9 +2100,6 @@ impl TableProvider for OracleTableProvider {
                 &scan_projection,
                 &supported_predicates,
             ));
-        } else if let Some(batches) = &self.distributed_iceberg_batches {
-            let published = Self::projected_memory_source(batches, &required_schema)?;
-            inputs.push(published);
         } else {
             // `limit` is forwarded only as a per-leaf upper bound; DataFusion's
             // own global limit above this provider remains authoritative. The
@@ -2211,20 +2138,10 @@ impl TableProvider for OracleTableProvider {
                 self.file_io.clone(),
                 Arc::clone(&self.storage),
                 Arc::clone(&required_schema),
-                HotParquetGovernance::Leader {
-                    memory: self.memory.clone(),
-                    memory_pool: Arc::clone(&self.query_pool),
-                    telemetry: Arc::clone(&self.telemetry),
-                    query_class: self.query_class,
-                },
+                HotParquetPlan::Leader,
                 Arc::new(OracleScanMetricsHandle::default()),
                 supported_predicates.clone(),
             ));
-            inputs.push(hot);
-        }
-        if !self.distributed_hot_batches.is_empty() {
-            let hot =
-                Self::projected_memory_source(&self.distributed_hot_batches, &required_schema)?;
             inputs.push(hot);
         }
         for scan_id in &self.remote_sources.scribe_scan_ids {
@@ -2235,10 +2152,18 @@ impl TableProvider for OracleTableProvider {
                 &supported_predicates,
             ));
         }
-        if !self.live_batches.is_empty() {
-            let live = Self::projected_memory_source(&self.live_batches, &required_schema)?;
-            inputs.push(live);
-        }
+        // Planned unconditionally: the Fused drain runs after admission, so
+        // planning cannot know whether this table has live rows. The leaf
+        // resolves its one bound batch set — possibly empty — from the
+        // execution `TaskContext` instead of capturing rows here.
+        inputs.push(Arc::new(
+            super::analytical_scan::AnalyticalScanExec::local_drained(
+                super::bindings::OracleSourceKey::LocalDrained {
+                    table: self.table.clone(),
+                },
+                Arc::clone(&required_schema),
+            ),
+        ));
         let union = UnionExec::try_new(inputs)?;
         let tripwire = Arc::new(TenantTripwireExec::new(
             union,
@@ -2503,6 +2428,59 @@ impl Drop for AccountedRangeOwner {
         {
             self.reservation.poison();
             tracing::error!("Oracle hot-range wrapper cleanup poisoned accounting");
+        }
+    }
+}
+
+/// Planning-time governance retained by one hot-Parquet leaf.
+///
+/// A leaf is built before the query is admitted, so it may not capture a memory
+/// pool or an admission class. It retains only the process-owned accounting
+/// handles its role needs and resolves the admitted pool, class, cancellation,
+/// and deadline from the executing `TaskContext`.
+#[derive(Clone)]
+pub(super) enum HotParquetPlan {
+    /// Leader-local leaf resolving every governance fact from the admitted task.
+    Leader,
+    /// Follower leaf charged against the request-local pool its lease retains.
+    Follower {
+        /// Request-local pool backed by the retained Oracle worker lease.
+        memory_pool: Arc<dyn MemoryPool>,
+    },
+}
+
+impl HotParquetPlan {
+    /// Resolves the executable governance mode for one admitted task.
+    ///
+    /// The leader mode reads the once-bound execution bindings installed in the
+    /// session configuration before planning, refuses a cancelled or expired
+    /// query before any storage IO, and charges every reserved byte to the
+    /// admitted runtime's own pool. The follower mode already holds the pool
+    /// its stage lease was admitted with and resolves to itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `DataFusion` execution error when the leader's bindings are
+    /// absent or unbound, the query was cancelled, or its deadline elapsed.
+    fn resolve(&self, task: &TaskContext) -> DataFusionResult<HotParquetGovernance> {
+        match self {
+            Self::Leader => {
+                let lock = super::bindings::bindings_for_task(task)?;
+                let bindings = lock.get().ok_or_else(|| {
+                    DataFusionError::Execution("Oracle execution bindings are not bound".to_owned())
+                })?;
+                let grant = bindings.grant();
+                grant.ensure_live()?;
+                Ok(HotParquetGovernance::Leader {
+                    memory: grant.memory.clone(),
+                    memory_pool: Arc::clone(task.memory_pool()),
+                    telemetry: Arc::clone(&grant.telemetry),
+                    query_class: grant.query_class,
+                })
+            }
+            Self::Follower { memory_pool } => Ok(HotParquetGovernance::Follower {
+                memory_pool: Arc::clone(memory_pool),
+            }),
         }
     }
 }
@@ -2879,8 +2857,8 @@ pub(super) struct HotParquetExec {
     file_io: FileIO,
     /// Complete physical table schema.
     schema: SchemaRef,
-    /// Closed governance mode owning every reservation this leaf takes.
-    governance: HotParquetGovernance,
+    /// Planning-time governance resolved against the admitted task at execute.
+    governance: HotParquetPlan,
     /// Shared terminal metric owner retained by query telemetry.
     metrics: Arc<OracleScanMetricsHandle>,
     /// Closed predicate conjunction used to skip a file whose footer
@@ -2914,7 +2892,7 @@ impl HotParquetExec {
         file_io: FileIO,
         storage: Arc<crate::storage::BifrostStorage>,
         schema: SchemaRef,
-        governance: HotParquetGovernance,
+        governance: HotParquetPlan,
         metrics: Arc<OracleScanMetricsHandle>,
         predicates: Vec<wyrd_spec::vala::assignment_authority::ScanPredicate>,
     ) -> Self {
@@ -3023,10 +3001,13 @@ impl ExecutionPlan for HotParquetExec {
             )));
         }
         let schema = Arc::clone(&self.schema);
+        // Resolved here, never captured at planning time: the admitted pool,
+        // class, cancellation, and deadline all arrive with this task.
+        let governance = self.governance.resolve(task.as_ref())?;
         // The hot leaf decodes at the admitted session's batch size, so this
         // path is shaped by the same grant as every other operator in the plan
         // rather than by a fixed constant of its own.
-        let stream = hot_stream(self, task.session_config().batch_size());
+        let stream = hot_stream(self, task.session_config().batch_size(), governance);
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
 }
@@ -3042,12 +3023,12 @@ impl ExecutionPlan for HotParquetExec {
 fn hot_stream(
     exec: &HotParquetExec,
     batch_size: usize,
+    governance: HotParquetGovernance,
 ) -> impl Stream<Item = DataFusionResult<RecordBatch>> + Send + 'static {
     let files = exec.files.clone();
     let file_io = exec.file_io.clone();
     let storage = Arc::clone(&exec.storage);
     let schema = Arc::clone(&exec.schema);
-    let governance = exec.governance.clone();
     let metrics = Arc::clone(&exec.metrics);
     let predicates = exec.predicates.clone();
     #[cfg(test)]
@@ -5025,18 +5006,17 @@ mod tests {
                 FileIO::new_with_fs(),
                 fixture_storage(),
                 Arc::clone(&schema),
-                HotParquetGovernance::Leader {
-                    memory: memory.clone(),
-                    memory_pool: crate::resources::bounded_memory_pool(1024 * 1024 * 1024),
-                    telemetry: Arc::clone(&telemetry),
-                    query_class: QueryClass::Interactive,
-                },
+                HotParquetPlan::Leader,
                 Arc::clone(&metrics),
                 Vec::new(),
             );
             (exec, metrics)
         };
-        let context = datafusion::execution::context::SessionContext::new().task_ctx();
+        let context = bound_leader_task(
+            memory.clone(),
+            &telemetry,
+            crate::resources::bounded_memory_pool(1024 * 1024 * 1024),
+        );
         let (success, success_metrics) = make_exec(size);
         let mut stream = success
             .execute(0, Arc::clone(&context))
@@ -5249,12 +5229,7 @@ mod tests {
             FileIO::new_with_fs(),
             fixture_storage(),
             Arc::clone(&projected),
-            HotParquetGovernance::Leader {
-                memory: oracle_memory_resources(&governor, 1024),
-                memory_pool: Arc::clone(&query_pool),
-                telemetry: Arc::clone(&telemetry),
-                query_class: QueryClass::Interactive,
-            },
+            HotParquetPlan::Leader,
             Arc::clone(&metrics),
             Vec::new(),
         )
@@ -5279,7 +5254,11 @@ mod tests {
         let mut batches = exec
             .execute(
                 0,
-                datafusion::execution::context::SessionContext::new().task_ctx(),
+                bound_leader_task(
+                    oracle_memory_resources(&governor, 1024),
+                    &telemetry,
+                    Arc::clone(&query_pool),
+                ),
             )
             .expect("production hot stream");
         let rows = drain_projected_int64_batches(
@@ -5442,12 +5421,7 @@ mod tests {
             FileIO::new_with_fs(),
             fixture_storage(),
             Arc::clone(&fixture.schema),
-            HotParquetGovernance::Leader {
-                memory: oracle_memory_resources(&governor, 1024),
-                memory_pool: Arc::clone(&query_pool),
-                telemetry: Arc::clone(&telemetry),
-                query_class: QueryClass::Interactive,
-            },
+            HotParquetPlan::Leader,
             Arc::new(OracleScanMetricsHandle::default()),
             Vec::new(),
         )
@@ -5464,7 +5438,11 @@ mod tests {
         let mut stream = exec
             .execute(
                 0,
-                datafusion::execution::context::SessionContext::new().task_ctx(),
+                bound_leader_task(
+                    oracle_memory_resources(&governor, 1024),
+                    &telemetry,
+                    Arc::clone(&query_pool),
+                ),
             )
             .expect("production cancellation stream");
         let batch = stream
@@ -5504,7 +5482,14 @@ mod tests {
         let batches = exec
             .execute(
                 0,
-                datafusion::execution::context::SessionContext::new().task_ctx(),
+                bound_leader_task(
+                    oracle_memory_resources(
+                        &oracle_test_roles(4 * 1024 * 1024 * 1024),
+                        1024 * 1024,
+                    ),
+                    telemetry,
+                    crate::resources::bounded_memory_pool(1024 * 1024 * 1024),
+                ),
             )
             .expect("hot terminal stream");
         let mut stream =
@@ -5541,12 +5526,7 @@ mod tests {
                 FileIO::new_with_fs(),
                 fixture_storage(),
                 Arc::clone(&fixture.schema),
-                HotParquetGovernance::Leader {
-                    memory: memory.clone(),
-                    memory_pool: crate::resources::bounded_memory_pool(1024 * 1024 * 1024),
-                    telemetry: Arc::clone(&telemetry),
-                    query_class: QueryClass::Interactive,
-                },
+                HotParquetPlan::Leader,
                 Arc::clone(&metrics),
                 Vec::new(),
             )
@@ -5583,7 +5563,11 @@ mod tests {
         let batches = pending
             .execute(
                 0,
-                datafusion::execution::context::SessionContext::new().task_ctx(),
+                bound_leader_task(
+                    memory.clone(),
+                    &telemetry,
+                    crate::resources::bounded_memory_pool(1024 * 1024 * 1024),
+                ),
             )
             .expect("pending hot stream");
         let mut pending_stream = crate::oracle::test_query_stream_from_physical(
@@ -5906,7 +5890,7 @@ mod tests {
     /// deliberately mis-state it to drive the storage-failure branch.
     fn hot_exec_for(
         fixture: &HotCausalFixture,
-        governance: HotParquetGovernance,
+        governance: HotParquetPlan,
         metrics: &Arc<OracleScanMetricsHandle>,
         size_bytes: usize,
     ) -> HotParquetExec {
@@ -5923,6 +5907,28 @@ mod tests {
             governance,
             Arc::clone(metrics),
             Vec::new(),
+        )
+    }
+
+    /// Builds one bound task context for a leader leaf under test.
+    ///
+    /// Every leader leaf resolves its governance from the task it executes
+    /// with, so a leaf-level test has to publish one grant the same way
+    /// admission does.
+    fn bound_leader_task(
+        memory: OracleMemoryResources,
+        telemetry: &Arc<OracleTelemetry>,
+        memory_pool: Arc<dyn MemoryPool>,
+    ) -> Arc<TaskContext> {
+        crate::oracle::bindings::bind_test_session(
+            datafusion::prelude::SessionConfig::new(),
+            memory_pool,
+            crate::oracle::bindings::OracleExecutionGrant::for_test(
+                QueryClass::Interactive,
+                memory,
+                Arc::clone(telemetry),
+            ),
+            std::collections::HashMap::new(),
         )
     }
 
@@ -5945,15 +5951,38 @@ mod tests {
         counts
     }
 
-    /// Both governance modes decode at the admitted session batch size and
-    /// produce identical rows and scan evidence.
+    /// Builds one admitted leader task context at an explicit batch size.
     ///
-    /// A floor-shaped grant must split the same file into many small batches
-    /// and a maximum-shaped grant must return it as one, through the leader's
-    /// governor-backed mode and a follower's request-local pool alike. This is
-    /// the proof that the hot leaf no longer carries a batch size of its own.
+    /// This is the shape admission publishes: the session carries the admitted
+    /// batch size and pool, and the lock carries the grant, so a leaf that
+    /// retained nothing still resolves everything it needs.
+    fn admitted_hot_task(
+        batch_size: usize,
+        memory_pool: &Arc<dyn MemoryPool>,
+        memory: OracleMemoryResources,
+        telemetry: &Arc<OracleTelemetry>,
+    ) -> Arc<TaskContext> {
+        crate::oracle::bindings::bind_test_session(
+            datafusion::prelude::SessionConfig::new().with_batch_size(batch_size),
+            Arc::clone(memory_pool),
+            crate::oracle::bindings::OracleExecutionGrant::for_test(
+                QueryClass::Interactive,
+                memory,
+                Arc::clone(telemetry),
+            ),
+            std::collections::HashMap::new(),
+        )
+    }
+
+    /// One retained plan reads its batch size and pool only from the task it is
+    /// executed with, in both governance modes.
+    ///
+    /// A physical root is built before admission, so the same leaf instance is
+    /// executed twice under two different admitted task contexts and must split
+    /// at each task's own batch size and charge each task's own pool. Leader and
+    /// follower modes must agree on rows and scan evidence at every size.
     #[tokio::test]
-    async fn hot_parquet_decodes_at_the_admitted_batch_size_in_both_modes() {
+    async fn retained_plan_uses_admitted_task_context_only() {
         let fixture = build_hot_batch_fixture();
         let size = fixture.bytes.len();
         let rows = usize::try_from(HOT_BATCH_FIXTURE_ROWS).expect("fixture rows fit usize");
@@ -5963,20 +5992,18 @@ mod tests {
         for (batch_size, expected_batches) in [(8_usize, 8_usize), (8_192, 1)] {
             let leader_pool = crate::resources::bounded_memory_pool(1024 * 1024 * 1024);
             let leader_metrics = Arc::new(OracleScanMetricsHandle::default());
-            let leader = hot_exec_for(
-                &fixture,
-                HotParquetGovernance::Leader {
-                    memory: oracle_memory_resources(&governor, 1024 * 1024),
-                    memory_pool: Arc::clone(&leader_pool),
-                    telemetry: Arc::clone(&telemetry),
-                    query_class: QueryClass::Interactive,
-                },
-                &leader_metrics,
-                size,
-            );
+            let leader = hot_exec_for(&fixture, HotParquetPlan::Leader, &leader_metrics, size);
             let leader_counts = drain_hot_row_counts(
                 leader
-                    .execute(0, task_context_with_batch_size(batch_size))
+                    .execute(
+                        0,
+                        admitted_hot_task(
+                            batch_size,
+                            &leader_pool,
+                            oracle_memory_resources(&governor, 1024 * 1024),
+                            &telemetry,
+                        ),
+                    )
                     .expect("leader hot stream"),
             )
             .await;
@@ -5985,7 +6012,7 @@ mod tests {
             let follower_metrics = Arc::new(OracleScanMetricsHandle::default());
             let follower = hot_exec_for(
                 &fixture,
-                HotParquetGovernance::Follower {
+                HotParquetPlan::Follower {
                     memory_pool: Arc::clone(&follower_pool),
                 },
                 &follower_metrics,
@@ -6009,6 +6036,45 @@ mod tests {
             assert_hot_scan_baselines(&governor, &leader_pool, &telemetry);
             assert_eq!(follower_pool.reserved(), 0);
         }
+
+        let retained_metrics = Arc::new(OracleScanMetricsHandle::default());
+        let retained = hot_exec_for(&fixture, HotParquetPlan::Leader, &retained_metrics, size);
+        let split_pool = crate::resources::bounded_memory_pool(1024 * 1024 * 1024);
+        let split = drain_hot_row_counts(
+            retained
+                .execute(
+                    0,
+                    admitted_hot_task(
+                        8,
+                        &split_pool,
+                        oracle_memory_resources(&governor, 1024 * 1024),
+                        &telemetry,
+                    ),
+                )
+                .expect("first admitted hot stream"),
+        )
+        .await;
+        let whole_pool = crate::resources::bounded_memory_pool(1024 * 1024 * 1024);
+        let whole = drain_hot_row_counts(
+            retained
+                .execute(
+                    0,
+                    admitted_hot_task(
+                        8_192,
+                        &whole_pool,
+                        oracle_memory_resources(&governor, 1024 * 1024),
+                        &telemetry,
+                    ),
+                )
+                .expect("second admitted hot stream"),
+        )
+        .await;
+        assert_eq!(split.len(), 8);
+        assert_eq!(whole.len(), 1);
+        assert_eq!(split.iter().sum::<usize>(), rows);
+        assert_eq!(whole.iter().sum::<usize>(), rows);
+        assert_eq!(split_pool.reserved(), 0);
+        assert_eq!(whole_pool.reserved(), 0);
     }
 
     /// Follower governance returns every retained byte to its request-local
@@ -6029,7 +6095,7 @@ mod tests {
         let success_metrics = Arc::new(OracleScanMetricsHandle::default());
         let success = hot_exec_for(
             &fixture,
-            HotParquetGovernance::Follower {
+            HotParquetPlan::Follower {
                 memory_pool: Arc::clone(&pool),
             },
             &success_metrics,
@@ -6049,7 +6115,7 @@ mod tests {
         let failed_metrics = Arc::new(OracleScanMetricsHandle::default());
         let failed = hot_exec_for(
             &fixture,
-            HotParquetGovernance::Follower {
+            HotParquetPlan::Follower {
                 memory_pool: Arc::clone(&pool),
             },
             &failed_metrics,
@@ -6073,7 +6139,7 @@ mod tests {
         let cancelled_metrics = Arc::new(OracleScanMetricsHandle::default());
         let cancelled = hot_exec_for(
             &fixture,
-            HotParquetGovernance::Follower {
+            HotParquetPlan::Follower {
                 memory_pool: Arc::clone(&pool),
             },
             &cancelled_metrics,
@@ -6095,7 +6161,7 @@ mod tests {
         let retry_metrics = Arc::new(OracleScanMetricsHandle::default());
         let retry = hot_exec_for(
             &fixture,
-            HotParquetGovernance::Follower {
+            HotParquetPlan::Follower {
                 memory_pool: Arc::clone(&pool),
             },
             &retry_metrics,
@@ -6207,23 +6273,13 @@ mod tests {
             "bifrost_query:read",
         )
         .expect("query context");
-        let roles = oracle_test_roles(2 * 1024 * 1024 * 1024);
         OracleTableProvider::try_new(OracleTableInputs {
             table: pruning_fixture_table(),
             storage: fixture_storage(),
-            distributed_iceberg_batches: None,
             hot_files,
-            distributed_hot_batches: Vec::new(),
-            live_batches: Vec::new(),
             context,
             table_name: "vala.traces.spans".to_owned(),
             audit: Arc::new(NoopAudit),
-            memory: oracle_memory_resources(&roles, 64 * 1024 * 1024),
-            query_pool: Arc::new(datafusion::execution::memory_pool::GreedyMemoryPool::new(
-                256 * 1024 * 1024,
-            )),
-            telemetry: Arc::new(OracleTelemetry::new(Arc::new(OracleSlotManager::new(1, 1)))),
-            query_class: QueryClass::Interactive,
         })
         .await
         .expect("pruning fixture provider")
@@ -6472,7 +6528,9 @@ mod tests {
     /// # Panics
     /// Panics if the authorization context, fixture batch, or provider cannot
     /// be constructed, since none of those are the behavior under test.
-    async fn projection_closure_provider(tenant: wyrd_spec::DataTenantId) -> OracleTableProvider {
+    async fn projection_closure_provider(
+        tenant: wyrd_spec::DataTenantId,
+    ) -> (OracleTableProvider, RecordBatch) {
         let principal = Principal {
             id: PrincipalId::new(uuid::Uuid::now_v7()),
             kind: wyrd_runtime::PrincipalKind::User,
@@ -6489,7 +6547,6 @@ mod tests {
             "bifrost_query:read",
         )
         .expect("query context");
-        let roles = oracle_test_roles(2 * 1024 * 1024 * 1024);
         let live_schema = Arc::new(Schema::new(vec![
             Field::new("unused_payload", DataType::Utf8, true),
             Field::new("duration_ms", DataType::Int64, true),
@@ -6512,23 +6569,14 @@ mod tests {
             ],
         )
         .expect("live fixture batch");
-        OracleTableProvider::try_new_distributed(
+        let provider = OracleTableProvider::try_new_distributed(
             OracleTableInputs {
                 table: projection_fixture_table(),
                 storage: fixture_storage(),
-                distributed_iceberg_batches: None,
                 hot_files: Vec::new(),
-                distributed_hot_batches: Vec::new(),
-                live_batches: vec![live],
                 context,
                 table_name: "vala.traces.spans".to_owned(),
                 audit: Arc::new(NoopAudit),
-                memory: oracle_memory_resources(&roles, 64 * 1024 * 1024),
-                query_pool: Arc::new(datafusion::execution::memory_pool::GreedyMemoryPool::new(
-                    256 * 1024 * 1024,
-                )),
-                telemetry: Arc::new(OracleTelemetry::new(Arc::new(OracleSlotManager::new(1, 1)))),
-                query_class: QueryClass::Interactive,
             },
             RemotePersistedSources {
                 iceberg_scan_id: Some("vala.traces.spans:iceberg".to_owned()),
@@ -6538,7 +6586,8 @@ mod tests {
             },
         )
         .await
-        .expect("pinned fixture provider")
+        .expect("pinned fixture provider");
+        (provider, live)
     }
 
     /// One leader-owned closure governs every leaf, the placeholder, the
@@ -6565,7 +6614,7 @@ mod tests {
         use datafusion::physical_plan::filter::FilterExec;
 
         let tenant = wyrd_spec::DataTenantId::new_v7();
-        let provider = projection_closure_provider(tenant).await;
+        let (provider, live) = projection_closure_provider(tenant).await;
 
         let complete_fingerprint =
             super::super::assignment_schema_fingerprint(provider.physical_schema.as_ref());
@@ -6638,9 +6687,21 @@ mod tests {
         assert_eq!(predicate_columns, vec![("status_code".to_string(), 1)]);
 
         // One ERROR row and one OK row in; only the ERROR duration out.
-        let rows = collect(plan, Arc::new(TaskContext::default()))
-            .await
-            .expect("closure plan executes");
+        let rows = collect(
+            plan,
+            crate::oracle::bindings::bind_test_session(
+                datafusion::prelude::SessionConfig::new(),
+                crate::resources::bounded_memory_pool(64 * 1024 * 1024),
+                crate::oracle::bindings::OracleExecutionGrant::for_test(
+                    QueryClass::Interactive,
+                    oracle_memory_resources(&oracle_test_roles(1024 * 1024 * 1024), 1024 * 1024),
+                    Arc::new(OracleTelemetry::new(Arc::new(OracleSlotManager::new(1, 1)))),
+                ),
+                std::collections::HashMap::from([("vala.traces.spans".to_owned(), vec![live])]),
+            ),
+        )
+        .await
+        .expect("closure plan executes");
         let durations = rows
             .iter()
             .flat_map(|batch| {
@@ -7284,37 +7345,38 @@ mod tests {
     }
 
     /// Forces every leaf stage of the root-class fixture onto two tasks.
-///
-/// The pinned planner elides a boundary it judges unnecessary, and a two-row
-/// in-memory table is always judged unnecessary. Oracle's production planner
-/// answers this same handler from the frozen cut rather than from scanned
-/// bytes, so answering it here plans the shape production plans instead of
-/// forcing an outcome the planner would otherwise refuse.
-#[derive(Debug)]
-struct RootClassTaskCount;
+    ///
+    /// The pinned planner elides a boundary it judges unnecessary, and a two-row
+    /// in-memory table is always judged unnecessary. Oracle's production planner
+    /// answers this same handler from the frozen cut rather than from scanned
+    /// bytes, so answering it here plans the shape production plans instead of
+    /// forcing an outcome the planner would otherwise refuse.
+    #[derive(Debug)]
+    struct RootClassTaskCount;
 
-#[async_trait::async_trait]
-impl datafusion_distributed::DesiredTaskCountHandler for RootClassTaskCount {
-    /// Requests two tasks for every leaf node and defers on inner nodes.
-    ///
-    /// # Errors
-    ///
-    /// Never fails: the count is a constant.
-    async fn handle(
-        &self,
-        ev: datafusion_distributed::DesiredTaskCountEvent<'_>,
-    ) -> Option<DataFusionResult<datafusion_distributed::DesiredTaskCountEventResponse>> {
-        if ev.plan.children().is_empty() {
-            Some(Ok(
-                datafusion_distributed::DesiredTaskCountEventResponse::desired(2),
-            ))
-        } else {
-            None
+    #[async_trait::async_trait]
+    impl datafusion_distributed::DesiredTaskCountHandler for RootClassTaskCount {
+        /// Requests two tasks for every leaf node and defers on inner nodes.
+        ///
+        /// # Errors
+        ///
+        /// Never fails: the count is a constant.
+        async fn handle(
+            &self,
+            ev: datafusion_distributed::DesiredTaskCountEvent<'_>,
+        ) -> Option<DataFusionResult<datafusion_distributed::DesiredTaskCountEventResponse>>
+        {
+            if ev.plan.children().is_empty() {
+                Some(Ok(
+                    datafusion_distributed::DesiredTaskCountEventResponse::desired(2),
+                ))
+            } else {
+                None
+            }
         }
     }
-}
 
-/// Frozen worker set the root-class fixture plans its distributed root over.
+    /// Frozen worker set the root-class fixture plans its distributed root over.
     #[derive(Debug)]
     struct RootClassWorkers;
 

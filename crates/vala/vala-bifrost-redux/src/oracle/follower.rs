@@ -497,7 +497,7 @@ impl FollowerSourceResolver for OracleCatalogResolver {
                     self.catalog.file_io().clone(),
                     Arc::clone(self.catalog.storage()),
                     required_schema,
-                    super::exec::HotParquetGovernance::Follower {
+                    super::exec::HotParquetPlan::Follower {
                         memory_pool: session.runtime_env().memory_pool.clone(),
                     },
                     Arc::new(super::exec::OracleScanMetricsHandle::default()),

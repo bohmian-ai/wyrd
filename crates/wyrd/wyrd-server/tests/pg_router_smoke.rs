@@ -982,3 +982,215 @@ async fn retirement_first_loss_commits_its_own_edge() {
 
     server.shutdown().await.expect("server shuts down");
 }
+
+/// Polls one Forge role bit until it reaches `expected`.
+///
+/// The composed in-process server does not run the background readiness loop,
+/// so the contract is observed at the same shared bit `/readyz` reads.
+///
+/// # Panics
+///
+/// Panics when the bit never reaches `expected` within the budget.
+#[cfg(feature = "test-support")]
+async fn await_forge_role(
+    server: &WyrdTestServer,
+    expected: bool,
+    select: fn(&wyrd_server::state::Forge) -> vala_bifrost_redux::forge::ForgeRoleReadiness,
+    label: &str,
+) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+    loop {
+        let forge = server
+            .state()
+            .forge()
+            .expect("this target selected a Forge role");
+        if select(forge).is_ready() == expected {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{label} readiness never reached {expected}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// Publishes one readiness snapshot for a composed server and returns it.
+///
+/// The production `readiness_loop` is driven for exactly as long as it takes to
+/// store its first computed snapshot, so the assertion reads the same probe
+/// output `/readyz` serialises rather than a hand-built fixture.
+///
+/// # Panics
+///
+/// Panics when no snapshot is published within the budget.
+#[cfg(feature = "test-support")]
+async fn published_snapshot(server: &WyrdTestServer) -> Arc<ReadinessSnapshot> {
+    let stop = tokio_util::sync::CancellationToken::new();
+    let loop_handle = tokio::spawn(wyrd_server::components::health::readiness_loop(
+        server.state().clone(),
+        std::time::Duration::from_millis(50),
+        std::time::Duration::from_secs(5),
+        stop.clone(),
+    ));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+    let snapshot = loop {
+        let snapshot = server.state().readiness.load_full();
+        if snapshot.postgres.reason != ProbeReason::Warmup {
+            break snapshot;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the readiness loop never published a computed snapshot"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    };
+    stop.cancel();
+    let _ = loop_handle.await;
+    snapshot
+}
+
+/// Forge readiness is target-conditional, recovery-gated, and removed before a
+/// role stops owning work.
+///
+/// Covers the three properties a Kubernetes operator depends on. A target that
+/// did not select a Forge role publishes no Forge check at all, so its
+/// `/readyz` conjunction cannot be held down by a role it never runs. A
+/// selected worker publishes ready only after its durable recovery drain
+/// completes, and a selected coordinator only after a full fenced planning
+/// pass. Both bits clear on shutdown before the role stops claiming, while
+/// `/healthz` keeps answering 200 so the process is drained rather than killed.
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn forge_role_readiness_is_target_conditional_and_removed_before_loss() {
+    forge_checks_follow_target_selection().await;
+    forge_worker_readiness_gates_on_recovery().await;
+    forge_coordinator_readiness_follows_a_completed_pass().await;
+}
+
+/// Every production target projection publishes exactly the Forge checks it runs.
+#[cfg(feature = "test-support")]
+async fn forge_checks_follow_target_selection() {
+    for (target, coordinator, worker) in [
+        (wyrd_server::config::BifrostTarget::All, true, true),
+        (wyrd_server::config::BifrostTarget::Server, true, false),
+        (wyrd_server::config::BifrostTarget::Oracle, false, false),
+        (wyrd_server::config::BifrostTarget::Scribe, false, false),
+        (wyrd_server::config::BifrostTarget::ForgeWorker, false, true),
+    ] {
+        let server = WyrdTestServer::builder()
+            .with_bifrost_target_for_test(target)
+            .start_in_process()
+            .await
+            .expect("targeted server starts");
+        let snapshot = published_snapshot(&server).await;
+        assert_eq!(
+            snapshot.forge_coordinator.is_some(),
+            coordinator,
+            "{target:?} published the wrong Forge coordinator check"
+        );
+        assert_eq!(
+            snapshot.forge_worker.is_some(),
+            worker,
+            "{target:?} published the wrong Forge worker check"
+        );
+        server.shutdown().await.expect("targeted server shuts down");
+    }
+}
+
+/// A selected worker publishes ready only after its recovery drain, and clears
+/// the bit on shutdown while liveness keeps answering.
+#[cfg(feature = "test-support")]
+async fn forge_worker_readiness_gates_on_recovery() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let readiness = server
+        .state()
+        .forge()
+        .expect("the default target selects Forge")
+        .worker_readiness();
+    assert!(
+        !readiness.is_ready(),
+        "a worker that has not drained recoverable work is not ready"
+    );
+
+    let stop = tokio_util::sync::CancellationToken::new();
+    let worker = wyrd_server::boot::spawn_forge_worker(server.state(), stop.clone(), 1, 1)
+        .expect("the worker composes");
+    let handle = tokio::spawn(worker);
+
+    await_forge_role(
+        &server,
+        true,
+        wyrd_server::state::Forge::worker_readiness,
+        "worker",
+    )
+    .await;
+
+    stop.cancel();
+    handle.await.expect("worker joins").expect("worker loop ok");
+    assert!(
+        !readiness.is_ready(),
+        "a stopped worker does not advertise ready"
+    );
+
+    let liveness = server
+        .oneshot(
+            Request::builder()
+                .uri("/healthz")
+                .body(axum::body::Body::empty())
+                .expect("request builds"),
+        )
+        .await
+        .expect("liveness answers");
+    assert_eq!(
+        liveness.status(),
+        StatusCode::OK,
+        "a draining Forge worker is still live"
+    );
+    server.shutdown().await.expect("test server shuts down");
+}
+
+/// The coordinator publishes ready only once a full fenced pass completes, and
+/// its guard removes the bit when the supervised loop stops.
+#[cfg(feature = "test-support")]
+async fn forge_coordinator_readiness_follows_a_completed_pass() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let forge = server
+        .state()
+        .forge()
+        .expect("the default target selects Forge")
+        .coordinator_readiness();
+    assert!(
+        !forge.is_ready(),
+        "a coordinator that has not run a pass is not ready"
+    );
+
+    let stop = tokio_util::sync::CancellationToken::new();
+    let scheduler = wyrd_server::boot::spawn_maintenance_scheduler(server.state(), stop.clone())
+        .expect("the scheduler composes")
+        .expect("the default target selects a coordinator");
+    let handle = tokio::spawn(scheduler);
+
+    await_forge_role(
+        &server,
+        true,
+        wyrd_server::state::Forge::coordinator_readiness,
+        "coordinator",
+    )
+    .await;
+
+    stop.cancel();
+    handle
+        .await
+        .expect("scheduler joins")
+        .expect("pass loop ok");
+    assert!(
+        !forge.is_ready(),
+        "a stopped coordinator does not advertise ready"
+    );
+    server.shutdown().await.expect("test server shuts down");
+}

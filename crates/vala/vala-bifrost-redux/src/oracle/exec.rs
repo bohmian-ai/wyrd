@@ -3668,9 +3668,14 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::oracle::bindings::{
+        FollowerSourceKey, OracleExecutionBindingInputs, OracleExecutionBindings, OracleSourceKey,
+    };
+    use crate::oracle::codec::RemoteSourcePlaceholderExec;
     use crate::oracle::{BifrostQueryReadDecision, OracleSlotManager};
     use arrow::array::{ArrayRef, Int32Array, Int64Array, StringArray};
     use async_trait::async_trait;
+    use datafusion::logical_expr::{col, lit};
     use datafusion::physical_plan::sorts::sort::SortExec;
     use datafusion::physical_plan::union::UnionExec;
     use wyrd_runtime::Principal;
@@ -3678,6 +3683,7 @@ mod tests {
     use wyrd_spec::auth::PrincipalId;
     use wyrd_spec::request_id::RequestId;
     use wyrd_spec::vala::api::AuthMethod;
+    use wyrd_spec::vala::api::FollowerScanAssignment;
     use wyrd_spec::vala::api::QueryStreamFrame;
 
     /// In-memory audit sink used only to inspect physical plan structure.
@@ -5658,9 +5664,7 @@ mod tests {
     ///
     /// Panics when the root planned anything other than exactly one remote
     /// placeholder, which would mean the fixture stopped delegating its cut.
-    fn sole_remote_placeholder(
-        root: &Arc<dyn ExecutionPlan>,
-    ) -> crate::oracle::codec::RemoteSourcePlaceholderExec {
+    fn sole_remote_placeholder(root: &Arc<dyn ExecutionPlan>) -> RemoteSourcePlaceholderExec {
         let mut found = crate::oracle::remote_placeholders(root.as_ref());
         assert_eq!(found.len(), 1, "one delegated tier plans one placeholder");
         found.remove(0)
@@ -5681,10 +5685,6 @@ mod tests {
     /// its occurrence's key or narrows a non-disjoint share, or when any
     /// mismatched binding is accepted.
     async fn assert_repeated_scans_bind_exactly() {
-        use crate::oracle::bindings::{
-            OracleExecutionBindingInputs, OracleExecutionBindings, OracleSourceKey,
-        };
-
         let (left_leaf, right_leaf) = plan_two_delegated_occurrences().await;
         assert_ne!(
             left_leaf.scan_id(),
@@ -5722,19 +5722,18 @@ mod tests {
         let governor = oracle_test_roles(4 * 1024 * 1024 * 1024);
         let telemetry = Arc::new(OracleTelemetry::new(Arc::new(OracleSlotManager::new(1, 1))));
         let pool = crate::resources::bounded_memory_pool(1024 * 1024 * 1024);
-        let inputs = |assignments: HashMap<
-            OracleSourceKey,
-            wyrd_spec::vala::api::FollowerScanAssignment,
-        >| OracleExecutionBindingInputs {
-            grant: crate::oracle::bindings::OracleExecutionGrant::for_test(
-                QueryClass::Interactive,
-                oracle_memory_resources(&governor, 1024 * 1024),
-                Arc::clone(&telemetry),
-            ),
-            local_batches: HashMap::new(),
-            follower_assignments: assignments,
-            reservations: Vec::new(),
-            degraded: false,
+        let inputs = |assignments: HashMap<OracleSourceKey, FollowerScanAssignment>| {
+            OracleExecutionBindingInputs {
+                grant: crate::oracle::bindings::OracleExecutionGrant::for_test(
+                    QueryClass::Interactive,
+                    oracle_memory_resources(&governor, 1024 * 1024),
+                    Arc::clone(&telemetry),
+                ),
+                local_batches: HashMap::new(),
+                follower_assignments: assignments,
+                reservations: Vec::new(),
+                degraded: false,
+            }
         };
 
         let bound = OracleExecutionBindings::try_new(inputs(assignments()), &planned)
@@ -5778,12 +5777,8 @@ mod tests {
     /// # Panics
     ///
     /// Panics when either occurrence fails to plan its delegated placeholder.
-    async fn plan_two_delegated_occurrences() -> (
-        crate::oracle::codec::RemoteSourcePlaceholderExec,
-        crate::oracle::codec::RemoteSourcePlaceholderExec,
-    ) {
-        use datafusion::logical_expr::{col, lit};
-
+    async fn plan_two_delegated_occurrences()
+    -> (RemoteSourcePlaceholderExec, RemoteSourcePlaceholderExec) {
         let (provider, _live) = projection_closure_provider(
             wyrd_spec::DataTenantId::new_v7(),
             Some(OracleRemoteSource {
@@ -5824,9 +5819,9 @@ mod tests {
     ///
     /// Panics when a variant derives a different key or two variants overlap.
     fn assert_task_variants_share_one_occurrence(
-        leaf: &crate::oracle::codec::RemoteSourcePlaceholderExec,
-        key: &crate::oracle::bindings::OracleSourceKey,
-        assignment: &wyrd_spec::vala::api::FollowerScanAssignment,
+        leaf: &RemoteSourcePlaceholderExec,
+        key: &OracleSourceKey,
+        assignment: &FollowerScanAssignment,
     ) {
         let first_task = leaf.clone().with_task_share(0, 2);
         let second_task = leaf.clone().with_task_share(1, 2);
@@ -5852,13 +5847,13 @@ mod tests {
         /// Rebuilds the exact assignment map both planned occurrences bound.
         assignments: &'a A,
         /// The first occurrence's complete planned authority.
-        left: &'a crate::oracle::bindings::FollowerSourceKey,
+        left: &'a FollowerSourceKey,
         /// The second occurrence's complete planned authority.
-        right: &'a crate::oracle::bindings::FollowerSourceKey,
+        right: &'a FollowerSourceKey,
         /// The first occurrence's key, as the retained plan carries it.
-        left_key: &'a crate::oracle::bindings::OracleSourceKey,
+        left_key: &'a OracleSourceKey,
         /// The second occurrence's key, as the retained plan carries it.
-        right_key: &'a crate::oracle::bindings::OracleSourceKey,
+        right_key: &'a OracleSourceKey,
     }
 
     /// Refuses every single-fact disagreement between a plan and its bindings.
@@ -5873,19 +5868,9 @@ mod tests {
     /// assignment value is accepted.
     fn assert_exact_binding_refusals<I, A>(case: &BindingRefusalCase<'_, I, A>)
     where
-        I: Fn(
-            HashMap<
-                crate::oracle::bindings::OracleSourceKey,
-                wyrd_spec::vala::api::FollowerScanAssignment,
-            >,
-        ) -> crate::oracle::bindings::OracleExecutionBindingInputs,
-        A: Fn() -> HashMap<
-            crate::oracle::bindings::OracleSourceKey,
-            wyrd_spec::vala::api::FollowerScanAssignment,
-        >,
+        I: Fn(HashMap<OracleSourceKey, FollowerScanAssignment>) -> OracleExecutionBindingInputs,
+        A: Fn() -> HashMap<OracleSourceKey, FollowerScanAssignment>,
     {
-        use crate::oracle::bindings::{OracleExecutionBindings, OracleSourceKey};
-
         let BindingRefusalCase {
             inputs,
             assignments,

@@ -18,7 +18,9 @@ use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
 
 use std::sync::Arc;
 
-use super::snapshot_expiration::{ExpirableTable, head_watermark, seed_ready_expiry_task};
+use super::snapshot_expiration::{
+    ExpirableTable, expirable_table, head_watermark, seed_ready_expiry_task,
+};
 use super::support::{
     CountingObjectStore, PromotionCatalogSeam, PromotionIntegrationFixture, SupervisedPromotion,
     manual_clock,
@@ -254,4 +256,122 @@ async fn enqueue(
         )
         .await
         .expect("the arbitrated task enqueues");
+}
+
+/// Reads every Forge task this fixture's tenant owns, in creation order.
+///
+/// # Panics
+///
+/// Panics when the diagnostic read fails.
+async fn settled_tasks(fixture: &PromotionIntegrationFixture) -> Vec<(Uuid, String, String)> {
+    sqlx::query_as(
+        "SELECT task_id, strategy, state FROM vala.forge_tasks WHERE data_tenant_id = $1 \
+         ORDER BY created_at, task_id",
+    )
+    .bind(fixture.tenant.as_uuid())
+    .fetch_all(fixture.operator_pool.pool())
+    .await
+    .expect("Forge tasks are readable")
+}
+
+/// Four strategies plan, dispatch, and settle as four independent tasks.
+///
+/// One supervised coordinator plans against real Postgres, Iceberg, and object
+/// storage while a separately-owned worker consumes what it enqueued. Repeated
+/// pass-and-settle cycles are driven until every retained production route has
+/// produced its own durable task, which is only reachable when each strategy is
+/// admitted, dispatched to its own owner, and settled without borrowing another
+/// strategy's effect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Postgres, Iceberg, and object storage"]
+async fn four_strategies_schedule_dispatch_and_settle_independently() {
+    let mut table = expirable_table("four_routes", true).await;
+    // Promotion already settled twice while the fixture started, so the routes
+    // still owed are compaction, expiration, expired cleanup, and orphan work.
+    let mut deletes_before_expiry = None;
+    for _ in 0..8 {
+        let settled = settled_tasks(&table.fixture).await;
+        let seen = settled
+            .iter()
+            .map(|(_, strategy, _)| strategy.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        if [
+            "small_files",
+            "snapshot_expiry",
+            "expired_cleanup",
+            "orphan_cleanup",
+        ]
+        .iter()
+        .all(|strategy| seen.contains(strategy))
+        {
+            break;
+        }
+        if deletes_before_expiry.is_none() && seen.contains("small_files") {
+            deletes_before_expiry = Some(table.store.deletes());
+        }
+        table.supervised.restart_worker();
+        table.supervised.run_one_success().await;
+    }
+
+    let settled = settled_tasks(&table.fixture).await;
+    for strategy in [
+        "small_files",
+        "snapshot_expiry",
+        "expired_cleanup",
+        "orphan_cleanup",
+    ] {
+        let rows = settled
+            .iter()
+            .filter(|(_, value, _)| value == strategy)
+            .collect::<Vec<_>>();
+        assert!(
+            !rows.is_empty(),
+            "{strategy} owns its own durable task: {settled:?}"
+        );
+        assert!(
+            rows.iter().all(|(_, _, state)| state == "succeeded"),
+            "{strategy} settled on its own: {settled:?}"
+        );
+    }
+    let identities = settled
+        .iter()
+        .map(|(task_id, _, _)| *task_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        identities.len(),
+        settled.len(),
+        "every route owns a distinct task identity"
+    );
+
+    // Snapshot expiration leaves durable cleanup demand rather than performing
+    // the deletion itself, so the exact objects it retired are only removed
+    // once the separate cleanup task claims them.
+    let expiry = settled
+        .iter()
+        .find(|(_, strategy, _)| strategy == "snapshot_expiry")
+        .expect("the expiration route settled");
+    assert_eq!(
+        settled
+            .iter()
+            .filter(|(_, strategy, _)| strategy == "snapshot_expiry")
+            .count(),
+        1,
+        "one expiration settled the retention debt: {settled:?}"
+    );
+    let evidence: Option<serde_json::Value> =
+        sqlx::query_scalar("SELECT evidence FROM vala.forge_tasks WHERE task_id = $1")
+            .bind(expiry.0)
+            .fetch_one(table.fixture.operator_pool.pool())
+            .await
+            .expect("expiry evidence is readable");
+    let candidates = evidence
+        .as_ref()
+        .and_then(|value| value.get("cleanup_candidates"))
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::len)
+        .unwrap_or_default();
+    assert!(
+        candidates > 0,
+        "the expiration handed off its candidates instead of deleting them"
+    );
 }

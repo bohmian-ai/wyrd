@@ -52,10 +52,11 @@ pub use planner::{
 };
 pub use planning_scheduler::{ForgeScheduleOutcome, ForgeScheduler};
 pub use rewrite::ForgeRewriteRuntime;
+#[cfg(feature = "test-support")]
 pub use scheduler::ForgeSchedulerTrigger;
-pub use worker::{
-    ForgeLifecycleEvent, ForgeWorker, ForgeWorkerCompletionObserver, ForgeWorkerConfig,
-};
+#[cfg(feature = "test-support")]
+pub use worker::{ForgeLifecycleEvent, ForgeWorkerCompletionObserver};
+pub use worker::{ForgeWorker, ForgeWorkerConfig};
 
 #[cfg(feature = "test-support")]
 pub use expiry_gates::ExpiryTestControls;
@@ -93,8 +94,10 @@ pub struct ForgeBuildConfig {
     /// Concrete wall clock captured once by each Forge work batch.
     pub clock: ForgeClock,
     /// Optional test-only observer of successful supervised task completion.
+    #[cfg(feature = "test-support")]
     pub completion_observer: Option<ForgeWorkerCompletionObserver>,
     /// Optional test-only trigger that wakes this owner’s supervised scheduler loop.
+    #[cfg(feature = "test-support")]
     pub scheduler_trigger: Option<ForgeSchedulerTrigger>,
     /// Fixed-cardinality production telemetry injected by process composition.
     pub telemetry: Arc<ForgeTelemetry>,
@@ -133,8 +136,10 @@ pub(crate) struct ForgeCore {
     /// Wall clock shared by periodic and hinted maintenance batches.
     clock: ForgeClock,
     /// Optional observer notified only after a supervised worker returns success.
+    #[cfg(feature = "test-support")]
     completion_observer: Option<ForgeWorkerCompletionObserver>,
     /// Optional trigger/observer retained only by test-built supervised schedulers.
+    #[cfg(feature = "test-support")]
     scheduler_trigger: Option<ForgeSchedulerTrigger>,
     /// Fixed-cardinality operational metric handles registered at construction.
     telemetry: Arc<ForgeTelemetry>,
@@ -172,7 +177,9 @@ impl Forge {
             config: build.config,
             maintenance_interval: build.maintenance_interval,
             clock: build.clock,
+            #[cfg(feature = "test-support")]
             completion_observer: build.completion_observer,
+            #[cfg(feature = "test-support")]
             scheduler_trigger: build.scheduler_trigger,
             telemetry: build.telemetry,
             #[cfg(feature = "test-support")]

@@ -35,7 +35,9 @@ use super::planner::{
     ForgeCapacity, ForgeEnvelopeSizer, ForgePlanCandidate, ForgePlanCapacity, ForgePlanner,
     ForgeTableSnapshot, plan_hash,
 };
-use super::worker::{ForgeLifecycleEvent, forge_claim_memory_limit};
+#[cfg(feature = "test-support")]
+use super::worker::ForgeLifecycleEvent;
+use super::worker::forge_claim_memory_limit;
 use crate::catalog::layout::forge_data_location;
 use crate::maintenance::StagingFileCommitted;
 use crate::resources::ResourcePlan;
@@ -637,6 +639,7 @@ impl<'forge> ForgeScheduler<'forge> {
                 .telemetry
                 .record_demand_transition(ForgeDemandTransitionResult::Drained);
         }
+        #[cfg(feature = "test-support")]
         if result.acknowledged
             && let Some(observer) = &self.forge.core.completion_observer
         {

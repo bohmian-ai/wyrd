@@ -6,10 +6,13 @@
 
 use std::path::Path;
 use std::str::FromStr;
+use std::sync::Arc;
+#[cfg(feature = "test-support")]
+use std::sync::Mutex;
 #[cfg(feature = "test-support")]
 use std::sync::atomic::AtomicBool;
+#[cfg(feature = "test-support")]
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use iceberg::spec::TableMetadata;
@@ -346,6 +349,7 @@ pub struct ForgeRewriteEvidenceRecord {
 /// production worker's claim execution returns success, so it cannot affect
 /// scheduling, claim ownership, publication, or terminal transitions.
 #[derive(Clone, Default)]
+#[cfg(feature = "test-support")]
 pub struct ForgeWorkerCompletionObserver {
     /// Ordered typed lifecycle events recorded by production scheduler and worker owners.
     lifecycle_events: Arc<Mutex<Vec<ForgeLifecycleEvent>>>,
@@ -433,6 +437,7 @@ pub struct ForgeWorkerCompletionObserver {
 
 /// Typed causal evidence from the production Forge scheduler and worker owners.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(feature = "test-support")]
 pub enum ForgeLifecycleEvent {
     /// A fenced scheduler atomically enqueued the eligible inputs.
     Planned {
@@ -498,6 +503,7 @@ struct CompletionObserverClaimGate {
     release: tokio::sync::Notify,
 }
 
+#[cfg(feature = "test-support")]
 impl ForgeWorkerCompletionObserver {
     /// Create an empty completion observer for one shared Forge worker topology.
     #[must_use]
@@ -1118,6 +1124,7 @@ pub struct ForgeWorker {
     /// Fixed process-local concurrency.
     config: ForgeWorkerConfig,
     /// Optional observer that receives only completed supervised executions.
+    #[cfg(feature = "test-support")]
     completion_observer: Option<ForgeWorkerCompletionObserver>,
     /// Complete capacity declaration passed to atomic `PostgreSQL` admission.
     capacity: ForgeCapacity,
@@ -1139,6 +1146,7 @@ impl ForgeWorker {
         let limits = &forge.core.config;
         let capacity = ForgeCapacity::try_from(limits)?;
         Ok(Self {
+            #[cfg(feature = "test-support")]
             completion_observer: forge.core.completion_observer.clone(),
             tasks: ForgeTasks::new(forge.core.operator_pool.clone()),
             forge,
@@ -1324,6 +1332,7 @@ impl ForgeWorker {
             {
                 let task_id = prepared.task.task_id;
                 let strategy = ForgeClaimStrategy::Known(prepared.task.strategy);
+                #[cfg(feature = "test-support")]
                 if let Some(observer) = &self.completion_observer {
                     observer.record_lifecycle(ForgeLifecycleEvent::Claimed {
                         task_id,
@@ -1354,6 +1363,7 @@ impl ForgeWorker {
                 continue;
             };
             let task_id = claim.task_id;
+            #[cfg(feature = "test-support")]
             if let Some(observer) = &self.completion_observer {
                 observer.record_lifecycle(ForgeLifecycleEvent::Claimed {
                     task_id,
@@ -1408,6 +1418,11 @@ impl ForgeWorker {
     ///
     /// This is deliberately called after the full durable execution path
     /// returns, so test observation cannot acknowledge or alter a task.
+    #[cfg(not(feature = "test-support"))]
+    fn record_completion(&self, _task_id: Uuid, _strategy: ForgeClaimStrategy) {}
+
+    /// Publish one observer event after a successful worker execution.
+    #[cfg(feature = "test-support")]
     fn record_completion(&self, task_id: Uuid, strategy: ForgeClaimStrategy) {
         if let Some(observer) = &self.completion_observer {
             observer.record_lifecycle(ForgeLifecycleEvent::Terminal {
@@ -1419,6 +1434,11 @@ impl ForgeWorker {
     }
 
     /// Publish one passive observer event after any supervised attempt returns.
+    #[cfg(not(feature = "test-support"))]
+    fn record_attempt(&self, _error: Option<&ForgeError>) {}
+
+    /// Publish one passive observer event after any supervised attempt returns.
+    #[cfg(feature = "test-support")]
     fn record_attempt(&self, error: Option<&ForgeError>) {
         if let Some(observer) = &self.completion_observer {
             observer.record_attempt(error);
@@ -2482,13 +2502,20 @@ impl ForgeWorker {
     ) -> Result<(), ForgeError> {
         lease.require_fence(&self.forge.core.operator_pool).await?;
         // Held for the whole fenced attempt: dropping the lease is what returns
-        // the granted memory and scratch counters to the root governor. A live
-        // rewrite is the exception: the managed core leases the identical
-        // envelope for itself around the only phase that actually holds bytes,
-        // so acquiring here as well would charge the root governor twice for
-        // one attempt and refuse rewrites the cluster has room for.
+        // the granted memory and scratch counters to the root governor.
         let _resources = match claim.strategy {
-            ForgeClaimStrategy::Known(ForgeTaskStrategy::SmallFiles) => None,
+            // A live rewrite leases the identical envelope for itself around the
+            // only phase that actually holds bytes, so acquiring here as well
+            // would charge the root governor twice for one attempt.
+            // Metadata and cleanup work opens no data file. Charging it a
+            // rewrite envelope would reserve memory and scratch nothing uses and
+            // let one table's retention debt refuse another table's rewrite.
+            ForgeClaimStrategy::Known(
+                ForgeTaskStrategy::SmallFiles
+                | ForgeTaskStrategy::SnapshotExpiry
+                | ForgeTaskStrategy::ExpiredCleanup
+                | ForgeTaskStrategy::OrphanCleanup,
+            ) => None,
             _ => Some(self.acquire_rewrite_resources(claim, attempt, binding)?),
         };
         let table = self.forge.load_table(&binding.table_ident()).await?;
@@ -2697,6 +2724,11 @@ impl ForgeWorker {
     /// test observation cannot acknowledge or alter a task before its effect is
     /// committed. The catalog-committed event is emitted only when the evidence
     /// carries a committed snapshot.
+    #[cfg(not(feature = "test-support"))]
+    fn record_rewrite_evidence(&self, _claim: &ForgeTaskClaim, _evidence: &ForgeTaskEvidence) {}
+
+    /// Publishes the rewrite and catalog-commit observer events.
+    #[cfg(feature = "test-support")]
     fn record_rewrite_evidence(&self, claim: &ForgeTaskClaim, evidence: &ForgeTaskEvidence) {
         let Some(observer) = &self.completion_observer else {
             return;

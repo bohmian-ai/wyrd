@@ -1,7 +1,10 @@
 //! Supervision for the single durable Forge planning scheduler.
 
+#[cfg(feature = "test-support")]
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+#[cfg(feature = "test-support")]
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use tokio_util::sync::CancellationToken;
@@ -18,6 +21,7 @@ use crate::maintenance::StagingFileCommitted;
 /// The trigger only wakes the already-running [`Forge::run`] loop. It never
 /// constructs a scheduler, claims work, or executes a planning pass itself.
 #[derive(Clone, Default)]
+#[cfg(feature = "test-support")]
 pub struct ForgeSchedulerTrigger {
     /// Wakeup consumed by the production supervisor select loop.
     requested: Arc<tokio::sync::Notify>,
@@ -30,6 +34,7 @@ pub struct ForgeSchedulerTrigger {
     owner: Arc<std::sync::Mutex<Option<Uuid>>>,
 }
 
+#[cfg(feature = "test-support")]
 impl ForgeSchedulerTrigger {
     /// Construct an idle control for one supervised Forge owner.
     #[must_use]
@@ -153,13 +158,7 @@ impl Forge {
                         return Ok(());
                     }
                 },
-                () = async {
-                    if let Some(trigger) = &self.core.scheduler_trigger {
-                        trigger.wait_for_request().await;
-                    } else {
-                        std::future::pending::<()>().await;
-                    }
-                } => {
+                () = self.await_triggered_pass() => {
                     if !self.run_planning_pass(&scheduler, &shutdown, true).await {
                         return Ok(());
                     }
@@ -246,9 +245,7 @@ impl Forge {
                         .telemetry
                         .record_lease(ForgeLeaseResult::Contention);
                     tracing::debug!(triggered, "Forge scheduler remains on standby");
-                    if let Some(trigger) = &self.core.scheduler_trigger {
-                        trigger.record_completed_pass();
-                    }
+                    self.record_completed_pass();
                     return true;
                 }
                 tracing::debug!(
@@ -264,10 +261,29 @@ impl Forge {
                 tracing::error!(error = %error, triggered, "Forge scheduling pass failed");
             }
         }
+        self.record_completed_pass();
+        true
+    }
+
+    /// Waits for the deterministic test trigger that requests one extra pass.
+    ///
+    /// Production has no such trigger, so the future never resolves there and
+    /// the surrounding `select!` is driven only by ticks, hints, and shutdown.
+    async fn await_triggered_pass(&self) {
+        #[cfg(feature = "test-support")]
+        if let Some(trigger) = &self.core.scheduler_trigger {
+            trigger.wait_for_request().await;
+            return;
+        }
+        std::future::pending::<()>().await;
+    }
+
+    /// Reports one completed pass to the deterministic test trigger, if any.
+    fn record_completed_pass(&self) {
+        #[cfg(feature = "test-support")]
         if let Some(trigger) = &self.core.scheduler_trigger {
             trigger.record_completed_pass();
         }
-        true
     }
 
     /// Receives one lossy wake-up while holding only the inbox mutex.

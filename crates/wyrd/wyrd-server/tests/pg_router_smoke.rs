@@ -696,17 +696,27 @@ async fn supervisor_first_loss_closes_readiness_before_its_audit() {
         .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(10))
         .await;
 
-    assert_eq!(
-        epoch_audit_operations(&pool, node_id, fencing_token).await,
-        vec![
-            "oracle.reader_epoch.acquired".to_owned(),
-            "oracle.reader_epoch.activated".to_owned(),
-            "oracle.reader_epoch.draining".to_owned(),
-            "oracle.reader_epoch.invalidated".to_owned(),
-            "oracle.reader_epoch.retired".to_owned(),
-        ],
-        "retirement joins the loss owner and adds no second loss edge"
-    );
+    // `shutdown` returns once the drain is complete, but the retirement edge is
+    // appended by the owning supervisor task, so the last row lands just after.
+    let expected = vec![
+        "oracle.reader_epoch.acquired".to_owned(),
+        "oracle.reader_epoch.activated".to_owned(),
+        "oracle.reader_epoch.draining".to_owned(),
+        "oracle.reader_epoch.invalidated".to_owned(),
+        "oracle.reader_epoch.retired".to_owned(),
+    ];
+    let retiring = std::time::Instant::now() + FORGE_READINESS_CEILING;
+    loop {
+        let observed = epoch_audit_operations(&pool, node_id, fencing_token).await;
+        if observed == expected {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < retiring,
+            "retirement joins the loss owner and adds no second loss edge; observed {observed:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
             "SELECT count(*) FROM vala.oracle_reader_epochs WHERE node_id = $1"

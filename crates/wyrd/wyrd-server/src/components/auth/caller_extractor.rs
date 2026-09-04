@@ -27,9 +27,8 @@ impl FromRequestParts<AppState> for Caller {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        let principal = AuthenticatedPrincipal::from_request_parts(parts, state)
-            .await?
-            .principal;
+        let principal =
+            Principal::from(AuthenticatedPrincipal::from_request_parts(parts, state).await?);
         let request_id = parts
             .extensions
             .get::<RequestId>()

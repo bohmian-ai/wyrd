@@ -120,7 +120,7 @@ mod pg_tests {
     }
 
     async fn protected(Extension(principal): Extension<AuthenticatedPrincipal>) -> StatusCode {
-        let _ = principal.principal.tenant_id;
+        let _ = principal.principal().tenant_id;
         StatusCode::OK
     }
 

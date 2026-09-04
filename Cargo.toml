@@ -80,6 +80,10 @@ rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", 
 # dependency: Wyrd does not issue certificates.
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 axum = "0.8"
+# Official Rust MCP SDK. Wyrd pins one version workspace-wide and each owner
+# opts into the narrowest transport surface it serves: `wyrd-server` mounts the
+# Streamable HTTP server, `wyrd-mcp` connects the Streamable HTTP client.
+rmcp = { version = "3.2.0", default-features = false }
 http = "1"
 http-body = "1"
 serde = { version = "1", features = ["derive"] }

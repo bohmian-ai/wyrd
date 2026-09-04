@@ -264,7 +264,7 @@ async fn issue_key(
     Json(request): Json<IssueKeyRequest>,
 ) -> Result<Json<wyrd_spec::auth::IssueKeyResponse>, WyrdErrorResponse> {
     wyrd_auth::service_accounts::require_service_accounts_write(
-        &caller.principal,
+        caller.principal(),
         "issue API keys",
     )
     .map_err(WyrdErrorResponse::from)?;
@@ -278,7 +278,7 @@ async fn issue_key(
         }
     };
 
-    let tenant = caller.principal.tenant_id;
+    let tenant = caller.principal().tenant_id;
     let mut conn = state
         .postgres
         .tenant_conn(tenant)
@@ -286,11 +286,11 @@ async fn issue_key(
         .map_err(sql_error)?;
     let service = IssueApiKey::default();
     let issued = service
-        .execute(&mut conn, request, &caller.principal)
+        .execute(&mut conn, request, caller.principal())
         .await
         .map_err(|error| WyrdErrorResponse::from(WyrdError::from(error)))?;
     service
-        .audit(&mut conn, &issued, &caller.principal, req_id)
+        .audit(&mut conn, &issued, caller.principal(), req_id)
         .await
         .map_err(|error| sql_error(wyrd_sql::SqlError::from(error)))?;
     conn.commit().await.map_err(sql_error)?;
@@ -449,7 +449,7 @@ mod pg_tests {
         tenant: DataTenantId,
         permissions: PermissionSet,
     ) -> AuthenticatedPrincipal {
-        AuthenticatedPrincipal {
+        AuthenticatedPrincipal::from_verified(Arc::new(wyrd_auth_verify::VerifiedToken {
             principal: Principal {
                 id: PrincipalId::new(id),
                 kind: PrincipalKind::User,
@@ -457,7 +457,10 @@ mod pg_tests {
                 roles: Vec::new(),
                 effective_permissions: permissions,
             },
-        }
+            delegation_chain: Vec::new(),
+            exp: chrono::Utc::now() + chrono::Duration::minutes(5),
+            iat: chrono::Utc::now(),
+        }))
     }
 
     async fn lazy_state() -> AppState {

@@ -820,12 +820,7 @@ impl Forge {
             }),
         };
         #[cfg(feature = "test-support")]
-        if self
-            .core
-            .maintenance_controls
-            .pause_expiry_accepted(stop)
-            .await
-        {
+        if self.core.expiry_controls.pause_expiry_accepted(stop).await {
             return Err(ForgeError::Reconciliation {
                 detail: "Iceberg snapshot expiry commit was accepted before cancellation"
                     .to_owned(),

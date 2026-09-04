@@ -1701,16 +1701,16 @@ impl WyrdTestServer {
         self.inner.forge_object_store.as_ref().map(Arc::clone)
     }
 
-    /// Return deterministic maintenance gates from the supervised Forge owner.
+    /// Return deterministic expiration gates from the supervised Forge owner.
     #[must_use]
-    pub fn forge_maintenance_controls_for_test(
+    pub fn forge_expiry_controls_for_test(
         &self,
-    ) -> Option<vala_bifrost_redux::forge::MaintenanceTestControls> {
+    ) -> Option<vala_bifrost_redux::forge::ExpiryTestControls> {
         self.inner
             .state
             .forge()
             .and_then(|forge| forge.coordinator())
-            .map(|forge| forge.maintenance_controls_for_test())
+            .map(|forge| forge.expiry_controls_for_test())
     }
 
     /// Hold the live process root's available Forge capacity through one RAII lease.

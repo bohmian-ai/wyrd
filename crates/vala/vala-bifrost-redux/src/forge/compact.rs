@@ -35,10 +35,6 @@ const DEFAULT_MAX_OPEN_OPERATIONS_PER_TABLE: usize = 256;
 const DEFAULT_MAX_RETAINED_SNAPSHOTS_PER_TABLE: usize = 256;
 /// Small-file candidacy threshold.
 pub(crate) const DEFAULT_SMALL_FILE_THRESHOLD_BYTES: u64 = 64 * 1024 * 1024;
-/// Target size for one manifest rewrite bin.
-pub(crate) const DEFAULT_MANIFEST_REWRITE_TARGET_SIZE_BYTES: u64 = 8 * 1024 * 1024;
-/// Minimum count for an under-filled manifest bin.
-pub(crate) const DEFAULT_MANIFEST_REWRITE_MIN_COUNT: usize = 100;
 /// Default commit count past `retain_last` that makes snapshot expiry due on
 /// its own. Chosen well above ordinary per-tick compaction commit counts so a
 /// table under steady ingest still accrues history before maintenance fires,
@@ -102,13 +98,10 @@ pub struct ForgeConfig {
     /// Whether periodic snapshot expiry is enabled for this Forge owner.
     pub snapshot_expiry_enabled: bool,
     /// Whether periodic fragmented-manifest rewrite is enabled.
-    pub manifest_rewrite_enabled: bool,
     /// Independent small-file candidacy threshold used by live planning.
     pub small_file_threshold_bytes: u64,
     /// Maximum bytes packed into one selected manifest rewrite bin.
-    pub manifest_rewrite_target_size_bytes: u64,
     /// Minimum count required for the newest under-filled manifest bin.
-    pub manifest_rewrite_min_count: usize,
     /// Age after which an unreferenced object may be deleted.
     pub orphan_gc_ttl: Duration,
     /// Maximum orphan candidates considered in one GC batch.
@@ -181,10 +174,7 @@ impl Default for ForgeConfig {
             snapshot_retention: Duration::from_hours(24),
             retain_last: 1,
             snapshot_expiry_enabled: false,
-            manifest_rewrite_enabled: false,
             small_file_threshold_bytes: DEFAULT_SMALL_FILE_THRESHOLD_BYTES,
-            manifest_rewrite_target_size_bytes: DEFAULT_MANIFEST_REWRITE_TARGET_SIZE_BYTES,
-            manifest_rewrite_min_count: DEFAULT_MANIFEST_REWRITE_MIN_COUNT,
             orphan_gc_ttl: Duration::from_hours(24),
             max_gc_candidates_per_batch: 256,
             max_maintenance_items_per_tick: DEFAULT_MAX_MAINTENANCE_ITEMS_PER_TICK,
@@ -225,8 +215,6 @@ impl ForgeConfig {
             || self.snapshot_retention.is_zero()
             || self.retain_last == 0
             || self.small_file_threshold_bytes == 0
-            || self.manifest_rewrite_target_size_bytes == 0
-            || self.manifest_rewrite_min_count == 0
             || self.orphan_gc_ttl.is_zero()
             || self.max_gc_candidates_per_batch == 0
             || self.max_maintenance_items_per_tick == 0
@@ -468,156 +456,6 @@ pub(crate) struct ForgeTableKey {
     pub(crate) tenant: DataTenantId,
     /// Logical table identity resolved at the storage boundary.
     pub(crate) table_ref: crate::catalog::TableRef,
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-/// Counters collected from one Forge maintenance tick.
-pub struct ForgeTickOutcome {
-    /// Candidate groups discovered for compaction.
-    pub groups_seen: usize,
-    /// Rewrite bins committed to Iceberg.
-    pub bins_committed: usize,
-    /// Bins skipped because a budget or lease window was exhausted.
-    pub bins_skipped: usize,
-    /// Durable operations recovered from audit state.
-    pub reconciled: usize,
-    /// Registrations discovered by the periodic catalog roster.
-    pub tables_discovered: usize,
-    /// Registrations that reached a terminal local classification.
-    pub tables_examined: usize,
-    /// Tables whose stages completed successfully.
-    pub tables_succeeded: usize,
-    /// Tables skipped due to lease contention or cancellation.
-    pub tables_skipped: usize,
-    /// Tables that encountered a failure.
-    pub tables_failed: usize,
-    /// Compaction operations recovered during reconciliation.
-    pub reconciliation_recovered: usize,
-    /// Snapshot-expiry operations recovered or completed.
-    pub expiry_reconciled: usize,
-    /// Orphan-GC operations recovered.
-    pub gc_reconciled: usize,
-    /// Objects considered by orphan GC.
-    pub gc_candidates: usize,
-    /// Objects deleted by orphan GC.
-    pub gc_deleted: usize,
-    /// Objects skipped after a live-set or fence recheck.
-    pub gc_skipped: usize,
-    /// Work skipped because a per-tick budget was reached.
-    pub budget_skips: usize,
-    /// Tables skipped because another Forge owner held the lease.
-    pub lease_contention: usize,
-    /// Leases obtained by replacing expired owners.
-    pub lease_takeovers: usize,
-    /// Operations stopped after losing the table fence.
-    pub fence_losses: usize,
-    /// Stage-level failures that did not abort discovery of other tables.
-    pub stage_failures: usize,
-    /// Peak spill bytes observed across successful rewrites in this tick.
-    pub spill_bytes: u64,
-    /// Rows accepted from staged inputs.
-    pub input_rows: u64,
-    /// Rows encoded into committed outputs.
-    pub output_rows: u64,
-    /// Number of rotated output files committed to Iceberg.
-    pub outputs_committed: usize,
-    /// Prepared live replacements proven committed by fresh manifest evidence.
-    pub live_recovered: usize,
-    /// Prepared live replacements proven abandoned and safely reset.
-    pub live_reset: usize,
-    /// Prepared live replacements still inside the uncertainty window.
-    pub live_pending: usize,
-    /// Prepared live replacements lacking terminal proof.
-    pub live_unresolved: usize,
-    /// Open-operation pages that exceeded their configured cap.
-    pub open_operation_overflows: usize,
-    /// Staging files that remain for a later fold.
-    pub staging_pending_files: usize,
-    /// Current-snapshot live files seen by right-size planning.
-    pub live_candidates: usize,
-    /// Live rewrite groups planned by the tick.
-    pub live_groups_planned: usize,
-    /// Live rewrite groups committed by the tick.
-    pub live_groups_committed: usize,
-    /// Live plans invalidated by snapshot change.
-    pub live_snapshot_changes: usize,
-    /// Staging inputs committed by fold work.
-    pub staging_input_files: usize,
-    /// Staging input bytes committed by fold work.
-    pub staging_input_bytes: u64,
-    /// Staging outputs committed by fold work.
-    pub staging_output_files: usize,
-    /// Staging output bytes committed by fold work.
-    pub staging_output_bytes: u64,
-    /// Live replacement input files committed by the tick.
-    pub live_input_files: usize,
-    /// Live replacement input bytes committed by the tick.
-    pub live_input_bytes: u64,
-    /// Live replacement output files committed by the tick.
-    pub live_output_files: usize,
-    /// Live replacement output bytes committed by the tick.
-    pub live_output_bytes: u64,
-    /// Whether the periodic owner examined its complete roster.
-    pub tick_complete: bool,
-    /// Whether conservative work remains after this outcome.
-    pub pending_work: bool,
-}
-
-impl ForgeTickOutcome {
-    /// Returns true only for a complete, observed no-work periodic pass.
-    #[must_use]
-    pub fn is_converged(&self) -> bool {
-        self.tick_complete
-            && self.tables_examined == self.tables_discovered
-            && !self.pending_work
-            && [
-                self.groups_seen,
-                self.bins_committed,
-                self.bins_skipped,
-                self.reconciled,
-                self.tables_skipped,
-                self.tables_failed,
-                self.reconciliation_recovered,
-                self.expiry_reconciled,
-                self.gc_reconciled,
-                self.gc_candidates,
-                self.gc_deleted,
-                self.gc_skipped,
-                self.budget_skips,
-                self.lease_contention,
-                self.lease_takeovers,
-                self.fence_losses,
-                self.stage_failures,
-                self.staging_pending_files,
-                self.live_candidates,
-                self.live_groups_planned,
-                self.live_groups_committed,
-                self.live_snapshot_changes,
-                self.live_recovered,
-                self.live_reset,
-                self.live_pending,
-                self.live_unresolved,
-                self.open_operation_overflows,
-                self.staging_input_files,
-                self.staging_output_files,
-                self.live_input_files,
-                self.live_output_files,
-                self.outputs_committed,
-            ]
-            .into_iter()
-            .all(|value| value == 0)
-            && [
-                self.staging_input_bytes,
-                self.staging_output_bytes,
-                self.live_input_bytes,
-                self.live_output_bytes,
-                self.spill_bytes,
-                self.input_rows,
-                self.output_rows,
-            ]
-            .into_iter()
-            .all(|value| value == 0)
-    }
 }
 
 impl Forge {

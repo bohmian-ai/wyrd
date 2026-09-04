@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use super::error::ForgeError;
 use super::metrics::{ForgeHintPersistenceResult, ForgeLeaseResult};
-use super::{Forge, ForgeScheduler, ForgeTickOutcome};
+use super::{Forge, ForgeScheduler};
 use crate::maintenance::StagingFileCommitted;
 
 /// Test-tier control and observation for a supervised production scheduler loop.
@@ -268,25 +268,6 @@ impl Forge {
             trigger.record_completed_pass();
         }
         true
-    }
-
-    /// Runs one durable planning pass without executing claimed work.
-    ///
-    /// # Errors
-    /// Returns scheduler construction, discovery, catalog-read, or SQL errors.
-    pub async fn run_once(&self) -> Result<ForgeTickOutcome, ForgeError> {
-        let scheduled = ForgeScheduler::new(self)?
-            .schedule_once(&CancellationToken::new())
-            .await?;
-        Ok(ForgeTickOutcome {
-            groups_seen: scheduled.tasks_enqueued,
-            tables_discovered: scheduled.demands_seen,
-            tables_examined: scheduled.demands_seen,
-            tables_succeeded: scheduled.demands_acknowledged,
-            tables_failed: usize::from(scheduled.incomplete),
-            pending_work: scheduled.incomplete,
-            ..ForgeTickOutcome::default()
-        })
     }
 
     /// Receives one lossy wake-up while holding only the inbox mutex.

@@ -15,14 +15,13 @@ mod clock;
 pub(crate) mod compact;
 pub(crate) mod error;
 pub(crate) mod expire;
+mod expiry_gates;
 mod expiry_policy;
 mod identity;
 pub(crate) mod lease;
 mod live_reconcile;
 mod live_replace;
-mod maintenance;
 pub(crate) mod managed;
-mod manifest_rewrite;
 mod metrics;
 pub(crate) mod orphan_gc;
 mod path;
@@ -40,7 +39,7 @@ mod worker;
 pub use clock::ForgeClock;
 #[cfg(feature = "test-support")]
 pub use clock::ForgeClockControl;
-pub use compact::{ForgeConfig, ForgeObjectPages, ForgeObjectStore, ForgeTickOutcome};
+pub use compact::{ForgeConfig, ForgeObjectPages, ForgeObjectStore};
 pub use error::ForgeError;
 pub use managed::{
     ForgeRewriteAttempt, ForgeRewriteEvidence, ForgeRewriteOutcome, ForgeUnsettledOutput,
@@ -59,11 +58,11 @@ pub use worker::{
 };
 
 #[cfg(feature = "test-support")]
+pub use expiry_gates::ExpiryTestControls;
+#[cfg(feature = "test-support")]
 pub use lease::{ForgeLease, forge_lease_key};
 #[cfg(feature = "test-support")]
 pub use live_reconcile::LiveReconciliationTestOutcome;
-#[cfg(feature = "test-support")]
-pub use maintenance::MaintenanceTestControls;
 #[cfg(feature = "test-support")]
 pub use orphan_gc::{OrphanGcReport, current_gc_gate_for_test};
 #[cfg(feature = "test-support")]
@@ -139,9 +138,9 @@ pub(crate) struct ForgeCore {
     scheduler_trigger: Option<ForgeSchedulerTrigger>,
     /// Fixed-cardinality operational metric handles registered at construction.
     telemetry: Arc<ForgeTelemetry>,
-    /// Deterministic maintenance boundaries used only by integration tests.
+    /// Deterministic expiration boundaries used only by integration tests.
     #[cfg(feature = "test-support")]
-    maintenance_controls: maintenance::MaintenanceTestControls,
+    expiry_controls: expiry_gates::ExpiryTestControls,
     /// Owner-bound one-shot failure after maintenance evidence becomes Prepared.
     #[cfg(feature = "test-support")]
     fail_after_maintenance_prepared: AtomicBool,
@@ -177,7 +176,7 @@ impl Forge {
             scheduler_trigger: build.scheduler_trigger,
             telemetry: build.telemetry,
             #[cfg(feature = "test-support")]
-            maintenance_controls: maintenance::MaintenanceTestControls::default(),
+            expiry_controls: expiry_gates::ExpiryTestControls::default(),
             #[cfg(feature = "test-support")]
             fail_after_maintenance_prepared: AtomicBool::new(false),
         };
@@ -206,11 +205,11 @@ impl Forge {
         self.core.resources.clone()
     }
 
-    /// Returns deterministic controls for manifest and expiry commit boundaries.
+    /// Returns deterministic controls for the expiry commit boundaries.
     #[cfg(feature = "test-support")]
     #[must_use]
-    pub fn maintenance_controls_for_test(&self) -> MaintenanceTestControls {
-        self.core.maintenance_controls.clone()
+    pub fn expiry_controls_for_test(&self) -> ExpiryTestControls {
+        self.core.expiry_controls.clone()
     }
 }
 

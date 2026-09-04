@@ -42,7 +42,6 @@ use super::error::{ForgeCapacityFailurePhase, ForgeError, ForgeFailureClass};
 use super::expire::ExpiryTaskAuthority;
 use super::identity::task_table_binding;
 use super::lease::{ForgeLease, forge_lease_key};
-use super::maintenance::{ForgeMaintenance, ForgeMaintenanceResult};
 use super::metrics::{
     ForgeAttemptResource, ForgeCapacityRefusalPhase, ForgeCleanupKind, ForgeConflictKind,
     ForgeDemandTransitionResult, ForgeLeaseResult, ForgeMetricStage, ForgeProgressEffect,
@@ -181,23 +180,30 @@ struct ForgeDispatchRequest<'a> {
     stop: &'a CancellationToken,
 }
 
-/// Validated maintenance effects encoded by one durable task plan.
+/// Validated snapshot-expiration intent encoded by one durable task plan.
+///
+/// Snapshot expiration is the only remaining plan-encoded maintenance effect,
+/// so the intent carries one flag: whether this exact task owns a retention
+/// pass, or was planned solely to reconcile an open live rewrite.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ForgeMaintenanceIntent {
-    /// Whether the task owns one bounded manifest rewrite pass.
-    manifest_rewrite_due: bool,
+struct ForgeSnapshotExpiryIntent {
     /// Whether the task owns one snapshot-retention pass.
     snapshot_expiry_due: bool,
 }
 
-impl ForgeMaintenanceIntent {
-    /// Decodes the canonical maintenance plan or a pre-upgrade snapshot-expiry row.
+impl ForgeSnapshotExpiryIntent {
+    /// Decodes the canonical snapshot-expiry plan or a pre-upgrade row.
     ///
-    /// Canonical rows carry all three due flags. A two-field `SnapshotExpiry`
+    /// Canonical rows carry the due flags the scheduler writes. A two-field
     /// row predates those flags and can only mean snapshot expiry; accepting it
-    /// preserves ready/retryable work across a rolling upgrade without allowing
-    /// a legacy row to acquire manifest-rewrite authority.
+    /// preserves ready/retryable work across a rolling upgrade.
     fn parse(strategy: &ForgeClaimStrategy, parameters: &Map<String, Value>) -> Option<Self> {
+        if !matches!(
+            strategy,
+            ForgeClaimStrategy::Known(ForgeTaskStrategy::SnapshotExpiry)
+        ) {
+            return None;
+        }
         if parameters.get("kind").and_then(Value::as_str) != Some("maintenance")
             || parameters
                 .get("trigger_commit_count")
@@ -206,44 +212,43 @@ impl ForgeMaintenanceIntent {
         {
             return None;
         }
-        if parameters.len() == 2
-            && matches!(
-                strategy,
-                ForgeClaimStrategy::Known(ForgeTaskStrategy::SnapshotExpiry)
-            )
-        {
+        if parameters.len() == 2 {
             return Some(Self {
-                manifest_rewrite_due: false,
                 snapshot_expiry_due: true,
             });
         }
-        if parameters.len() != 5 {
+        if parameters.len() != 4 {
             return None;
         }
-        let manifest_rewrite_due = parameters.get("manifest_rewrite_due")?.as_bool()?;
         let snapshot_expiry_due = parameters.get("snapshot_expiry_due")?.as_bool()?;
         let reconciliation_due = parameters.get("reconciliation_due")?.as_bool()?;
-        let strategy_matches = match strategy {
-            ForgeClaimStrategy::Known(ForgeTaskStrategy::ManifestRewrite) => {
-                manifest_rewrite_due && !snapshot_expiry_due && !reconciliation_due
-            }
-            ForgeClaimStrategy::Known(ForgeTaskStrategy::SnapshotExpiry) => {
-                snapshot_expiry_due || reconciliation_due
-            }
-            ForgeClaimStrategy::Known(_) | ForgeClaimStrategy::Unknown(_) => false,
-        };
-        strategy_matches.then_some(Self {
-            manifest_rewrite_due,
+        (snapshot_expiry_due || reconciliation_due).then_some(Self {
             snapshot_expiry_due,
         })
     }
 }
 
+/// Exact result one dispatched snapshot-expiration pass returns.
+///
+/// The pass reloads the table after its own commits so the completion path
+/// derives evidence from current metadata, and reports whether the expiration
+/// already settled its own task atomically.
+struct ForgeSnapshotExpiryResult {
+    /// Current table after the expiration's metadata commits.
+    table: Table,
+    /// Final task evidence an atomic snapshot-expiration settlement stored.
+    ///
+    /// `Some` means the expiration already moved its task to `Succeeded` with
+    /// exact cleanup candidates and advanced planning demand, so the worker
+    /// owes the task no further terminal transition and performs no delete.
+    expiry_evidence: Option<ForgeTaskEvidence>,
+}
+
 enum ForgeDispatchResult {
     /// Ordinary publication whose evidence is not yet Prepared.
     Committed(Table),
-    /// Ordered maintenance with exact post-expiry candidates.
-    Maintenance(Box<ForgeMaintenanceResult>),
+    /// One snapshot-expiration pass with its exact post-expiry candidates.
+    SnapshotExpiry(Box<ForgeSnapshotExpiryResult>),
     /// A fully drained expired-cleanup candidate set with its final evidence.
     Cleaned(Box<ForgeTaskEvidence>),
     /// One bounded orphan-cleanup pass that already wrote its own durable task
@@ -2278,16 +2283,11 @@ impl ForgeWorker {
                 LIVE_REWRITE_PARAMETER_KIND,
                 ForgeMetricStage::IcebergRewrite,
             ),
-            ForgeClaimStrategy::Known(ForgeTaskStrategy::ManifestRewrite) => {
-                ("maintenance", ForgeMetricStage::ManifestRewrite)
-            }
             ForgeClaimStrategy::Known(ForgeTaskStrategy::SnapshotExpiry) => {
                 ("maintenance", ForgeMetricStage::SnapshotExpiry)
             }
             ForgeClaimStrategy::Known(
-                ForgeTaskStrategy::FullIdentity
-                | ForgeTaskStrategy::ExpiredCleanup
-                | ForgeTaskStrategy::OrphanCleanup,
+                ForgeTaskStrategy::ExpiredCleanup | ForgeTaskStrategy::OrphanCleanup,
             )
             | ForgeClaimStrategy::Unknown(_) => {
                 return Err(ForgeError::Invariant {
@@ -2306,9 +2306,9 @@ impl ForgeWorker {
             ForgeClaimStrategy::Known(ForgeTaskStrategy::ScribePromotion) => {
                 super::scribe_promotion::ScribePromotionPlan::from_parameters(parameters).is_ok()
             }
-            ForgeClaimStrategy::Known(
-                ForgeTaskStrategy::ManifestRewrite | ForgeTaskStrategy::SnapshotExpiry,
-            ) => ForgeMaintenanceIntent::parse(&task.strategy, parameters).is_some(),
+            ForgeClaimStrategy::Known(ForgeTaskStrategy::SnapshotExpiry) => {
+                ForgeSnapshotExpiryIntent::parse(&task.strategy, parameters).is_some()
+            }
             _ => {
                 parameters.get("kind").and_then(Value::as_str) == Some(expected_kind)
                     && parameters.len() == 1
@@ -2465,8 +2465,8 @@ impl ForgeWorker {
                 },
                 ForgeExecutionEvidenceState::Settled,
             )),
-            ForgeDispatchResult::Maintenance(result) => {
-                self.complete_maintenance(claim, attempt, binding, lease, *result, stop)
+            ForgeDispatchResult::SnapshotExpiry(result) => {
+                self.complete_snapshot_expiry(claim, attempt, binding, lease, *result, stop)
                     .await
             }
         }
@@ -2501,9 +2501,7 @@ impl ForgeWorker {
         };
         let maintenance_recovery = matches!(
             claim.strategy,
-            ForgeClaimStrategy::Known(
-                ForgeTaskStrategy::ManifestRewrite | ForgeTaskStrategy::SnapshotExpiry
-            )
+            ForgeClaimStrategy::Known(ForgeTaskStrategy::SnapshotExpiry)
         );
         if !base_matches
             && committed_recovery.is_none()
@@ -2783,8 +2781,7 @@ impl ForgeWorker {
         matches!(
             strategy,
             ForgeClaimStrategy::Known(
-                ForgeTaskStrategy::ManifestRewrite
-                    | ForgeTaskStrategy::SnapshotExpiry
+                ForgeTaskStrategy::SnapshotExpiry
                     | ForgeTaskStrategy::ExpiredCleanup
                     | ForgeTaskStrategy::OrphanCleanup
             )
@@ -2846,42 +2843,52 @@ impl ForgeWorker {
         })
     }
 
-    /// Runs one claimed manifest-rewrite or snapshot-expiry task.
+    /// Runs one claimed snapshot-expiry task through its retained owner.
     ///
-    /// The plan's own validated parameters decide which maintenance reasons are
-    /// due, so a claim cannot widen its scope at execution time. Live
-    /// replacements are reconciled first: expiry that ran against unreconciled
-    /// replacements could retire a snapshot still referenced by an in-flight
-    /// rewrite. The reconciliation clock reading is taken inside this call so
-    /// the reconciliation window is measured from execution, not from claim.
+    /// The plan's own validated parameters decide whether retention is due, so
+    /// a claim cannot widen its scope at execution time. Live replacements are
+    /// reconciled first: expiry that ran against unreconciled replacements
+    /// could retire a snapshot still referenced by an in-flight rewrite. The
+    /// reconciliation clock reading is taken inside this call so the
+    /// reconciliation window is measured from execution, not from claim. The
+    /// pass performs no deletion of its own: the exact candidates a successful
+    /// expiration commits are the durable handoff an independently claimed
+    /// expired-cleanup task consumes.
     ///
     /// # Errors
     ///
     /// Returns [`ForgeError::Invariant`] when the validated plan parameters are
-    /// not an object or the maintenance intent cannot be decoded, and propagates
-    /// reconciliation, catalog, and clock errors from the maintenance pass.
-    async fn dispatch_maintenance(
+    /// not an object or the expiry intent cannot be decoded,
+    /// [`ForgeError::FenceLost`] when the table lease no longer covers the
+    /// commit window, [`ForgeError::Shutdown`] when authority is lost before an
+    /// effect, and propagates reconciliation, catalog, SQL, audit, and clock
+    /// errors from the retained expiration owner.
+    ///
+    /// # Cancellation
+    ///
+    /// Cancellation stops before the next stage. Cancellation racing the expiry
+    /// commit leaves the Prepared operation open for evidence-based recovery.
+    async fn dispatch_snapshot_expiry(
         &self,
         claim: &ForgeTaskClaim,
         attempt: Uuid,
         binding: &TenantTableBinding,
         lease: &mut ForgeLease,
-        table: Table,
         stop: &CancellationToken,
     ) -> Result<ForgeDispatchResult, ForgeError> {
-        let intent = ForgeMaintenanceIntent::parse(
+        let intent = ForgeSnapshotExpiryIntent::parse(
             &claim.strategy,
             claim
                 .plan
                 .parameters
                 .as_object()
                 .ok_or_else(|| ForgeError::Invariant {
-                    detail: "validated Forge maintenance parameters lost their object shape"
+                    detail: "validated Forge snapshot-expiry parameters lost their object shape"
                         .to_owned(),
                 })?,
         )
         .ok_or_else(|| ForgeError::Invariant {
-            detail: "validated Forge maintenance intent could not be decoded".to_owned(),
+            detail: "validated Forge snapshot-expiry intent could not be decoded".to_owned(),
         })?;
         let key = super::compact::ForgeTableKey {
             tenant: claim.data_tenant_id,
@@ -2890,27 +2897,60 @@ impl ForgeWorker {
         self.forge
             .reconcile_live_replacements(lease, &key, binding, stop, self.forge.core.clock.now()?)
             .await?;
-        ForgeMaintenance::new(Arc::clone(&self.forge))
-            .execute(
-                lease,
-                crate::forge::maintenance::ForgeMaintenanceRequest {
-                    key: &key,
-                    binding,
-                    authority: &ExpiryTaskAuthority {
-                        task: claim.task_id,
-                        attempt,
-                        worker: self.owner,
-                    },
-                    table,
-                    manifest_paths: &claim.plan.inputs,
-                    manifest_rewrite_due: intent.manifest_rewrite_due,
-                    snapshot_expiry_due: intent.snapshot_expiry_due,
-                },
-                stop,
-            )
+        if stop.is_cancelled() {
+            return Err(ForgeError::Shutdown);
+        }
+        lease.require_fence(&self.forge.core.operator_pool).await?;
+        if !lease.commit_window_fits(self.forge.core.config.commit_window()) {
+            return Err(ForgeError::FenceLost {
+                lease_key: lease.lease_key.clone(),
+            });
+        }
+        #[cfg(feature = "test-support")]
+        if self
+            .forge
+            .core
+            .expiry_controls
+            .pause_expiry_submission(stop)
             .await
-            .map(Box::new)
-            .map(ForgeDispatchResult::Maintenance)
+        {
+            return Err(ForgeError::Reconciliation {
+                detail:
+                    "Iceberg expiry lifecycle was cancelled before its first catalog submission"
+                        .to_owned(),
+            });
+        }
+        let expiry_evidence =
+            if intent.snapshot_expiry_due && self.forge.core.config.snapshot_expiry_enabled {
+                self.forge
+                    .run_snapshot_expiry_for_table(
+                        lease,
+                        &key,
+                        binding,
+                        &ExpiryTaskAuthority {
+                            task: claim.task_id,
+                            attempt,
+                            worker: self.owner,
+                        },
+                        self.forge.core.clock.now()?,
+                        stop,
+                    )
+                    .await?
+                    .settled_evidence
+            } else {
+                None
+            };
+        if stop.is_cancelled() {
+            return Err(ForgeError::Shutdown);
+        }
+        lease.require_fence(&self.forge.core.operator_pool).await?;
+        let table = self.forge.load_table(&binding.table_ident()).await?;
+        Ok(ForgeDispatchResult::SnapshotExpiry(Box::new(
+            ForgeSnapshotExpiryResult {
+                table,
+                expiry_evidence,
+            },
+        )))
     }
 
     /// Dispatches one validated task to its exact existing rewrite owner.
@@ -2946,10 +2986,8 @@ impl ForgeWorker {
                 self.dispatch_scribe_promotion(claim, attempt, binding, lease, &table, stop)
                     .await
             }
-            ForgeClaimStrategy::Known(
-                ForgeTaskStrategy::ManifestRewrite | ForgeTaskStrategy::SnapshotExpiry,
-            ) => {
-                self.dispatch_maintenance(claim, attempt, binding, lease, table, stop)
+            ForgeClaimStrategy::Known(ForgeTaskStrategy::SnapshotExpiry) => {
+                self.dispatch_snapshot_expiry(claim, attempt, binding, lease, stop)
                     .await
             }
             ForgeClaimStrategy::Known(ForgeTaskStrategy::SmallFiles) => {
@@ -4001,22 +4039,22 @@ impl ForgeWorker {
     /// and the scrubbed durable task and attempt UUIDs.
     ///
     /// Candidate derivation has already completed from before/after Iceberg
-    /// metadata. This method records the complete ordered set before the first
-    /// delete, advances the cursor after every idempotent object result, and
-    /// only then enters the disjoint never-published generation collector.
+    /// metadata. This method records the complete ordered set as durable
+    /// Prepared evidence and deletes nothing: the exact candidates are the
+    /// handoff an independently claimed expired-cleanup task consumes.
     ///
     /// # Errors
     ///
     /// Returns path binding, evidence, SQL, audit, fencing, object-store, or
     /// cancellation failures. A failure retains Prepared evidence and its last
     /// committed cursor for deterministic takeover.
-    async fn complete_maintenance(
+    async fn complete_snapshot_expiry(
         &self,
         claim: &ForgeTaskClaim,
         attempt: Uuid,
         binding: &TenantTableBinding,
         lease: &mut ForgeLease,
-        result: ForgeMaintenanceResult,
+        result: ForgeSnapshotExpiryResult,
         stop: &CancellationToken,
     ) -> Result<(ForgeTaskEvidence, ForgeExecutionEvidenceState), ForgeError> {
         let started = Instant::now();
@@ -4030,7 +4068,7 @@ impl ForgeWorker {
             attempt_id = %attempt,
         );
         let result = tracing::Instrument::instrument(
-            self.complete_maintenance_inner(claim, attempt, binding, lease, result, stop),
+            self.complete_snapshot_expiry_inner(claim, attempt, binding, lease, result, stop),
             span.clone(),
         )
         .await;
@@ -4060,13 +4098,13 @@ impl ForgeWorker {
     /// Cancellation stops before the next durable or object-store effect.
     /// A delete racing cancellation may already be accepted; its idempotent
     /// candidate remains behind the durable cursor for successor replay.
-    async fn complete_maintenance_inner(
+    async fn complete_snapshot_expiry_inner(
         &self,
         claim: &ForgeTaskClaim,
         attempt: Uuid,
         binding: &TenantTableBinding,
         lease: &mut ForgeLease,
-        result: ForgeMaintenanceResult,
+        result: ForgeSnapshotExpiryResult,
         stop: &CancellationToken,
     ) -> Result<(ForgeTaskEvidence, ForgeExecutionEvidenceState), ForgeError> {
         require_running(stop)?;
@@ -4119,13 +4157,6 @@ impl ForgeWorker {
         }
         require_running(stop)?;
         lease.require_fence(&self.forge.core.operator_pool).await?;
-        let key = super::compact::ForgeTableKey {
-            tenant: claim.data_tenant_id,
-            table_ref: binding.table_ref.clone(),
-        };
-        ForgeMaintenance::new(Arc::clone(&self.forge))
-            .collect_never_published(lease, &key, binding, stop)
-            .await?;
         Ok((evidence, ForgeExecutionEvidenceState::Prepared))
     }
 
@@ -4213,7 +4244,12 @@ impl ForgeWorker {
             tenant: claim.data_tenant_id,
             table_ref: binding.table_ref.clone(),
         };
-        let outcome = self
+        // The retained collector owns the scan; this route owns its
+        // observation. Both the stage duration and the deleted/retained/partial
+        // accounting are recorded on the failure path too, so a failed bounded
+        // pass still moves its stage-failure series before the error propagates.
+        let started = Instant::now();
+        let result = self
             .forge
             .run_orphan_gc_for_table(
                 lease,
@@ -4227,7 +4263,18 @@ impl ForgeWorker {
                 },
                 stop,
             )
-            .await?;
+            .await;
+        let elapsed = started.elapsed();
+        self.forge.core.telemetry.record_stage(
+            ForgeMetricStage::OrphanGc,
+            elapsed,
+            result.is_err(),
+        );
+        let outcome = result?;
+        self.forge
+            .core
+            .telemetry
+            .record_orphan_gc(&outcome, elapsed);
         let authority = ForgeExpirationAuthority {
             task_id: claim.task_id,
             attempt_id: attempt,
@@ -5669,23 +5716,44 @@ mod tests {
         assert_eq!(defaults.per_tenant_active_cap, 1);
     }
 
-    /// Maintenance intent preserves exact strategy routing and legacy expiry meaning.
+    /// Snapshot-expiry intent preserves exact routing and legacy row meaning.
+    ///
+    /// The canonical row carries the scheduler's due flags; the two-field row
+    /// predates them and can only mean snapshot expiry. Both must decode, and a
+    /// row filed under any other strategy must not, because the intent is what
+    /// authorizes the retention pass.
     #[test]
-    fn maintenance_intent_routes_manifest_and_legacy_expiry_exactly() {
-        let manifest = serde_json::json!({
+    fn snapshot_expiry_intent_routes_canonical_and_legacy_rows_exactly() {
+        let canonical = serde_json::json!({
             "kind": "maintenance",
             "trigger_commit_count": 0,
-            "manifest_rewrite_due": true,
-            "snapshot_expiry_due": false,
+            "snapshot_expiry_due": true,
             "reconciliation_due": false,
         });
         assert_eq!(
-            ForgeMaintenanceIntent::parse(
-                &ForgeClaimStrategy::Known(ForgeTaskStrategy::ManifestRewrite),
-                manifest.as_object().expect("manifest parameters"),
+            ForgeSnapshotExpiryIntent::parse(
+                &ForgeClaimStrategy::Known(ForgeTaskStrategy::SnapshotExpiry),
+                canonical.as_object().expect("canonical parameters"),
             ),
-            Some(ForgeMaintenanceIntent {
-                manifest_rewrite_due: true,
+            Some(ForgeSnapshotExpiryIntent {
+                snapshot_expiry_due: true,
+            })
+        );
+
+        let reconciliation_only = serde_json::json!({
+            "kind": "maintenance",
+            "trigger_commit_count": 0,
+            "snapshot_expiry_due": false,
+            "reconciliation_due": true,
+        });
+        assert_eq!(
+            ForgeSnapshotExpiryIntent::parse(
+                &ForgeClaimStrategy::Known(ForgeTaskStrategy::SnapshotExpiry),
+                reconciliation_only
+                    .as_object()
+                    .expect("reconciliation parameters"),
+            ),
+            Some(ForgeSnapshotExpiryIntent {
                 snapshot_expiry_due: false,
             })
         );
@@ -5695,22 +5763,21 @@ mod tests {
             "trigger_commit_count": 7,
         });
         assert_eq!(
-            ForgeMaintenanceIntent::parse(
+            ForgeSnapshotExpiryIntent::parse(
                 &ForgeClaimStrategy::Known(ForgeTaskStrategy::SnapshotExpiry),
                 legacy.as_object().expect("legacy expiry parameters"),
             ),
-            Some(ForgeMaintenanceIntent {
-                manifest_rewrite_due: false,
+            Some(ForgeSnapshotExpiryIntent {
                 snapshot_expiry_due: true,
             })
         );
         assert!(
-            ForgeMaintenanceIntent::parse(
-                &ForgeClaimStrategy::Known(ForgeTaskStrategy::ManifestRewrite),
-                legacy.as_object().expect("legacy manifest parameters"),
+            ForgeSnapshotExpiryIntent::parse(
+                &ForgeClaimStrategy::Known(ForgeTaskStrategy::SmallFiles),
+                canonical.as_object().expect("canonical parameters"),
             )
             .is_none(),
-            "legacy expiry rows cannot acquire manifest-rewrite authority"
+            "only a snapshot-expiry row may carry retention authority"
         );
     }
 
@@ -5763,50 +5830,31 @@ mod tests {
         }
     }
 
-    /// Only promotion and live rewrite cross this phase's activation boundary.
+    /// The activation boundary admits every production route's exact payload.
     ///
-    /// Each maintenance claim below carries the payload its own strategy
-    /// contract accepts, so it passes every earlier check and is refused only
-    /// by the phase. That ordering is the point: the refusal is what the
-    /// worker answers with, and it answers before the publication lease, the
-    /// table load, and every dispatch arm — so an injected claim that never
-    /// passed the scheduler's admission gate still reaches no catalog, no
-    /// object store, and no durable effect.
-    ///
-    /// The retained dispatch, execution, reconciliation, and cleanup owners for
-    /// these strategies stay compiled and statically reachable; this test pins
-    /// that they cannot be *entered*, not that they are gone. Live rewrite is
-    /// the counterpart: it is inside the boundary in this phase, so the same
-    /// gate must let its exact payload through.
+    /// Each closed strategy now has a reachable production owner, so the gate's
+    /// job is no longer refusal but payload fidelity: a row whose parameters do
+    /// not match its strategy contract is still refused before any catalog,
+    /// object store, or durable effect, and that refusal must come from the
+    /// payload contract rather than from activation.
     #[test]
-    fn forge_activation_boundary_admits_live_rewrite_and_refuses_maintenance() {
-        let maintenance = |manifest_rewrite_due: bool| {
+    fn forge_activation_boundary_admits_every_production_payload() {
+        ForgeWorker::validate_payload(&claimed_task(
+            ForgeTaskStrategy::SnapshotExpiry,
             serde_json::json!({
                 "kind": "maintenance",
                 "trigger_commit_count": 0,
-                "manifest_rewrite_due": manifest_rewrite_due,
-                "snapshot_expiry_due": !manifest_rewrite_due,
+                "snapshot_expiry_due": true,
                 "reconciliation_due": false,
-            })
-        };
-        for (strategy, manifest_rewrite_due) in [
-            (ForgeTaskStrategy::ManifestRewrite, true),
-            (ForgeTaskStrategy::SnapshotExpiry, false),
-        ] {
-            let task = claimed_task(strategy, maintenance(manifest_rewrite_due));
-            let error = ForgeWorker::validate_payload(&task)
-                .expect_err("a disabled strategy is refused before any effect");
-            assert!(
-                error.to_string().contains("not activated in this phase"),
-                "{strategy:?} must be refused by the activation boundary, saw {error}"
-            );
-        }
+            }),
+        ))
+        .expect("snapshot expiration is an activated production route");
 
         ForgeWorker::validate_payload(&claimed_task(
             ForgeTaskStrategy::SmallFiles,
             serde_json::json!({ "kind": LIVE_REWRITE_PARAMETER_KIND }),
         ))
-        .expect("live rewrite is activated in this phase");
+        .expect("live rewrite is an activated production route");
         let mislabelled = ForgeWorker::validate_payload(&claimed_task(
             ForgeTaskStrategy::SmallFiles,
             serde_json::json!({ "kind": "maintenance" }),

@@ -2484,6 +2484,34 @@ fn merge_gauge_maxima(
     Ok(())
 }
 
+/// Closed `strategy` label values every production Forge metric may carry.
+///
+/// The list mirrors `ForgeTaskMetricStrategy` in the production telemetry
+/// owner. Keeping one constant here is what makes a production label the
+/// projection cannot name fail as an unexpected label rather than silently
+/// disappearing from the report.
+const FORGE_STRATEGY_LABELS: &[&str] = &[
+    "scribe_promotion",
+    "small_files",
+    "snapshot_expiry",
+    "expired_cleanup",
+    "orphan_cleanup",
+];
+
+/// Closed `stage` label values every production Forge stage metric may carry.
+///
+/// Mirrors `ForgeMetricStage` in the production telemetry owner.
+const FORGE_STAGE_LABELS: &[&str] = &[
+    "scribe_promotion",
+    "reconcile_staging",
+    "reconcile_iceberg",
+    "manifest_discovery",
+    "iceberg_rewrite",
+    "snapshot_expiry",
+    "expired_cleanup",
+    "orphan_gc",
+];
+
 /// Forge-only report mapped solely from production capture observations.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct ForgeMaintenanceTelemetryReport {
@@ -2544,12 +2572,16 @@ pub enum ForgeCausalDiagnosis {
 /// Closed task strategy projected from production Forge metric labels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
 pub enum ForgeTelemetryStrategy {
+    /// Promote already-published Scribe hot objects unchanged.
+    ScribePromotion,
     /// Rewrite current-snapshot small files.
     SmallFiles,
-    /// Rewrite fragmented Iceberg manifests.
-    ManifestRewrite,
     /// Expire old Iceberg snapshots.
     SnapshotExpiry,
+    /// Delete the exact objects one committed expiration made unreachable.
+    ExpiredCleanup,
+    /// Delete proven never-published outputs beneath one table prefix.
+    OrphanCleanup,
 }
 
 /// Closed terminal task result projected from production Forge metrics.
@@ -2570,6 +2602,8 @@ pub enum ForgeTelemetryTaskResult {
 /// Closed Forge maintenance stage projected from production metrics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
 pub enum ForgeTelemetryStage {
+    /// Promote already-published Scribe hot objects unchanged.
+    ScribePromotion,
     /// Reconcile staged audit operations.
     ReconcileStaging,
     /// Reconcile Iceberg replacement operations.
@@ -2578,10 +2612,10 @@ pub enum ForgeTelemetryStage {
     ManifestDiscovery,
     /// Rewrite an Iceberg data-file group.
     IcebergRewrite,
-    /// Rewrite a bounded same-spec manifest group.
-    ManifestRewrite,
     /// Expire retained snapshots.
     SnapshotExpiry,
+    /// Delete the exact objects one committed expiration made unreachable.
+    ExpiredCleanup,
     /// Remove proven orphan objects.
     OrphanGc,
 }
@@ -3364,23 +3398,16 @@ fn validate_causal_metric_contract(
             ),
             "bifrost_forge_worker_quarantined" => (&[], &[]),
             "bifrost_forge_discovered_candidate_files"
-            | "bifrost_forge_discovered_candidate_bytes" => (
-                &["strategy", "le"],
-                &[(
-                    "strategy",
-                    &["small_files", "manifest_rewrite", "snapshot_expiry"],
-                )],
-            ),
+            | "bifrost_forge_discovered_candidate_bytes" => {
+                (&["strategy", "le"], &[("strategy", FORGE_STRATEGY_LABELS)])
+            }
             "bifrost_forge_planning_demand_total" => {
                 (&["source"], &[("source", &["hint", "roster_repair"])])
             }
             "bifrost_forge_task_duration_seconds" => (
                 &["strategy", "result", "le"],
                 &[
-                    (
-                        "strategy",
-                        &["small_files", "manifest_rewrite", "snapshot_expiry"],
-                    ),
+                    ("strategy", FORGE_STRATEGY_LABELS),
                     (
                         "result",
                         &[
@@ -3393,21 +3420,9 @@ fn validate_causal_metric_contract(
                     ),
                 ],
             ),
-            "bifrost_forge_stage_failures_total" | "bifrost_forge_stage_seconds" => (
-                &["stage", "le"],
-                &[(
-                    "stage",
-                    &[
-                        "reconcile_staging",
-                        "reconcile_iceberg",
-                        "manifest_discovery",
-                        "iceberg_rewrite",
-                        "manifest_rewrite",
-                        "snapshot_expiry",
-                        "orphan_gc",
-                    ],
-                )],
-            ),
+            "bifrost_forge_stage_failures_total" | "bifrost_forge_stage_seconds" => {
+                (&["stage", "le"], &[("stage", FORGE_STAGE_LABELS)])
+            }
             "bifrost_forge_rewrite_input_files_total"
             | "bifrost_forge_rewrite_input_bytes_total"
             | "bifrost_forge_rewrite_output_files_total"
@@ -3688,9 +3703,11 @@ fn causal_terminal_tasks(
     delta: &BifrostTelemetryDelta,
 ) -> Result<Vec<ForgeTerminalTaskTelemetry>, BifrostTelemetryReportError> {
     let strategies = [
+        ("scribe_promotion", ForgeTelemetryStrategy::ScribePromotion),
         ("small_files", ForgeTelemetryStrategy::SmallFiles),
-        ("manifest_rewrite", ForgeTelemetryStrategy::ManifestRewrite),
         ("snapshot_expiry", ForgeTelemetryStrategy::SnapshotExpiry),
+        ("expired_cleanup", ForgeTelemetryStrategy::ExpiredCleanup),
+        ("orphan_cleanup", ForgeTelemetryStrategy::OrphanCleanup),
     ];
     let results = [
         ("succeeded", ForgeTelemetryTaskResult::Succeeded),
@@ -3730,9 +3747,11 @@ fn causal_discovered_candidates(
     delta: &BifrostTelemetryDelta,
 ) -> Result<Vec<ForgeDiscoveredCandidateTelemetry>, BifrostTelemetryReportError> {
     let strategies = [
+        ("scribe_promotion", ForgeTelemetryStrategy::ScribePromotion),
         ("small_files", ForgeTelemetryStrategy::SmallFiles),
-        ("manifest_rewrite", ForgeTelemetryStrategy::ManifestRewrite),
         ("snapshot_expiry", ForgeTelemetryStrategy::SnapshotExpiry),
+        ("expired_cleanup", ForgeTelemetryStrategy::ExpiredCleanup),
+        ("orphan_cleanup", ForgeTelemetryStrategy::OrphanCleanup),
     ];
     let mut rows = Vec::new();
     for (label, strategy) in strategies {
@@ -3773,12 +3792,13 @@ fn causal_stage_failures(
     delta: &BifrostTelemetryDelta,
 ) -> Result<Vec<ForgeStageFailureTelemetry>, BifrostTelemetryReportError> {
     let stages = [
+        ("scribe_promotion", ForgeTelemetryStage::ScribePromotion),
         ("reconcile_staging", ForgeTelemetryStage::ReconcileStaging),
         ("reconcile_iceberg", ForgeTelemetryStage::ReconcileIceberg),
         ("manifest_discovery", ForgeTelemetryStage::ManifestDiscovery),
         ("iceberg_rewrite", ForgeTelemetryStage::IcebergRewrite),
-        ("manifest_rewrite", ForgeTelemetryStage::ManifestRewrite),
         ("snapshot_expiry", ForgeTelemetryStage::SnapshotExpiry),
+        ("expired_cleanup", ForgeTelemetryStage::ExpiredCleanup),
         ("orphan_gc", ForgeTelemetryStage::OrphanGc),
     ];
     let mut rows = Vec::new();
@@ -3907,9 +3927,9 @@ fn causal_spans(
                 span,
                 "strategy",
                 if name == ForgeCausalSpanName::CatalogCommit {
-                    &["small_files", "manifest_rewrite"]
+                    &["small_files", "scribe_promotion"]
                 } else {
-                    &["small_files", "manifest_rewrite", "snapshot_expiry"]
+                    FORGE_STRATEGY_LABELS
                 },
             )?;
         } else if name == ForgeCausalSpanName::Cleanup {
@@ -4073,11 +4093,7 @@ fn validate_forge_span_contract(
                     span,
                     &["attempt_id", "result", "role", "strategy", "task_id"],
                 )?;
-                validate_closed_span_attribute(
-                    span,
-                    "strategy",
-                    &["small_files", "manifest_rewrite", "snapshot_expiry"],
-                )?;
+                validate_closed_span_attribute(span, "strategy", FORGE_STRATEGY_LABELS)?;
                 validate_closed_span_attribute(
                     span,
                     "result",
@@ -4101,7 +4117,7 @@ fn validate_forge_span_contract(
                 validate_closed_span_attribute(
                     span,
                     "strategy",
-                    &["small_files", "manifest_rewrite"],
+                    &["small_files", "scribe_promotion"],
                 )?;
                 validate_closed_span_attribute(
                     span,
@@ -4295,10 +4311,7 @@ fn validate_forge_label_contract(
             "bifrost_forge_task_duration_seconds" => (
                 &["strategy", "result", "le"],
                 &[
-                    (
-                        "strategy",
-                        &["small_files", "manifest_rewrite", "snapshot_expiry"],
-                    ),
+                    ("strategy", FORGE_STRATEGY_LABELS),
                     (
                         "result",
                         &[
@@ -4379,13 +4392,9 @@ fn validate_forge_label_contract(
                 &["consumer", "outcome"],
                 &[("outcome", &["accepted", "rejected"])],
             ),
-            "bifrost_forge_task_spill_bytes" => (
-                &["strategy", "le"],
-                &[(
-                    "strategy",
-                    &["small_files", "manifest_rewrite", "snapshot_expiry"],
-                )],
-            ),
+            "bifrost_forge_task_spill_bytes" => {
+                (&["strategy", "le"], &[("strategy", FORGE_STRATEGY_LABELS)])
+            }
             "bifrost_forge_conflicts_total" => (
                 &["kind"],
                 &[(

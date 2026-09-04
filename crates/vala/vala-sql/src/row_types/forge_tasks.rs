@@ -1407,10 +1407,6 @@ pub enum ForgeTaskStrategy {
     ScribePromotion,
     /// Compact small files.
     SmallFiles,
-    /// Repair full table identity.
-    FullIdentity,
-    /// Rewrite manifests.
-    ManifestRewrite,
     /// Expire snapshots.
     SnapshotExpiry,
     /// Delete metadata-derived expired files.
@@ -1455,8 +1451,6 @@ impl ForgeTaskStrategy {
         match self {
             Self::ScribePromotion => "scribe_promotion",
             Self::SmallFiles => "small_files",
-            Self::FullIdentity => "full_identity",
-            Self::ManifestRewrite => "manifest_rewrite",
             Self::SnapshotExpiry => "snapshot_expiry",
             Self::ExpiredCleanup => "expired_cleanup",
             Self::OrphanCleanup => "orphan_cleanup",
@@ -1472,8 +1466,6 @@ impl FromStr for ForgeTaskStrategy {
         match value {
             "scribe_promotion" => Ok(Self::ScribePromotion),
             "small_files" => Ok(Self::SmallFiles),
-            "full_identity" => Ok(Self::FullIdentity),
-            "manifest_rewrite" => Ok(Self::ManifestRewrite),
             "snapshot_expiry" => Ok(Self::SnapshotExpiry),
             "expired_cleanup" => Ok(Self::ExpiredCleanup),
             "orphan_cleanup" => Ok(Self::OrphanCleanup),

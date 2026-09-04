@@ -31,8 +31,6 @@ pub enum ForgeOperationFamily {
     SnapshotExpire,
     /// Orphan-GC operations (`forge.orphan_gc.*`).
     OrphanGc,
-    /// Metadata-only manifest-rewrite operations (`forge.manifest_rewrite.*`).
-    ManifestRewrite,
 }
 
 impl ForgeOperationFamily {
@@ -44,7 +42,6 @@ impl ForgeOperationFamily {
             Self::IcebergRewrite => "iceberg_rewrite",
             Self::SnapshotExpire => "snapshot_expire",
             Self::OrphanGc => "orphan_gc",
-            Self::ManifestRewrite => "manifest_rewrite",
         }
     }
 
@@ -56,7 +53,6 @@ impl ForgeOperationFamily {
             Self::IcebergRewrite => "forge_iceberg_rewrite",
             Self::SnapshotExpire => "forge_snapshot_expire",
             Self::OrphanGc => "forge_orphan_gc",
-            Self::ManifestRewrite => "forge_manifest_rewrite",
         }
     }
 
@@ -68,7 +64,6 @@ impl ForgeOperationFamily {
             Self::IcebergRewrite => "forge.iceberg_rewrite",
             Self::SnapshotExpire => "forge.snapshot_expire",
             Self::OrphanGc => "forge.orphan_gc",
-            Self::ManifestRewrite => "forge.manifest_rewrite",
         }
     }
 }
@@ -86,7 +81,6 @@ impl std::str::FromStr for ForgeOperationFamily {
             "iceberg_rewrite" => Ok(Self::IcebergRewrite),
             "snapshot_expire" => Ok(Self::SnapshotExpire),
             "orphan_gc" => Ok(Self::OrphanGc),
-            "manifest_rewrite" => Ok(Self::ManifestRewrite),
             other => Err(SqlError::InvariantViolation {
                 detail: format!("unknown forge operation family: {other}"),
             }),
@@ -381,11 +375,6 @@ fn validate_detail_identity(
             group,
             ..
         } => (*operation_id, group.as_str(), "forge_orphan_gc"),
-        AuditDetail::ForgeManifestRewrite {
-            operation_id,
-            group,
-            ..
-        } => (*operation_id, group.as_str(), "forge_manifest_rewrite"),
         _ => {
             return Err(SqlError::InvariantViolation {
                 detail: "unexpected audit detail kind for forge operation".to_owned(),

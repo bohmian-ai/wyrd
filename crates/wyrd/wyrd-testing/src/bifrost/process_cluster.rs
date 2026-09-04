@@ -230,6 +230,8 @@ pub enum ControlRequest {
     PeerProbe(PeerProbePlan),
     /// Report how many request bodies this child's peer plane has polled.
     PeerBodyPolls,
+    /// Report this child's physical-build total, latest cut, and active cuts.
+    PhysicalBuildEvidence,
     /// Arm the one-shot refusal of this child's next distributed physical build.
     ArmAnalyticalPlanFailure,
     /// Arm the one-shot follower pause of the next authorized `ExecuteTask`.
@@ -249,6 +251,20 @@ pub enum ControlRequest {
     AwaitInactiveSql,
     /// Begin ordered shutdown and exit.
     Shutdown,
+}
+
+/// One child's narrow view of its own physical builds and active query cuts.
+///
+/// Test-support evidence only: it carries counts and canonical digests, never
+/// statement text, tenant or table identity, or an unbounded event list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PhysicalBuildEvidence {
+    /// Physical roots this child has begun building since start.
+    pub total: u64,
+    /// Canonical membership digest the most recent build entered with.
+    pub latest_cut_fingerprint: String,
+    /// Participant-cut digests of this tenant's active queries, in request-ID order.
+    pub active_cut_fingerprints: Vec<String>,
 }
 
 /// Trust a probe establishes its connection under.
@@ -475,6 +491,8 @@ pub enum ControlResponse {
         /// Request bodies this child's peer plane has polled since start.
         count: u64,
     },
+    /// Answer to [`ControlRequest::PhysicalBuildEvidence`].
+    PhysicalBuilds(PhysicalBuildEvidence),
     /// The request could not be served.
     ///
     /// Carries a non-secret detail only: the child never renders key material,
@@ -1311,6 +1329,29 @@ impl ProcessNode {
             ControlResponse::Failed { detail } => Err(ProcessClusterError::Child(detail)),
             other => Err(ProcessClusterError::Protocol(format!(
                 "expected a body-poll count, received {other:?}"
+            ))),
+        }
+    }
+
+    /// Reads this child's physical-build total, latest cut, and active cuts.
+    ///
+    /// One request serves both evidence needs: a journey differences `total`
+    /// across a serialized phase to prove exactly one build happened, and
+    /// compares `latest_cut_fingerprint` with the fingerprint the still-active
+    /// query retained to prove that build ran against the cut the terminal
+    /// attempt reports.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::request`].
+    pub fn physical_build_evidence(
+        &mut self,
+    ) -> Result<PhysicalBuildEvidence, ProcessClusterError> {
+        match self.request(&ControlRequest::PhysicalBuildEvidence)? {
+            ControlResponse::PhysicalBuilds(evidence) => Ok(evidence),
+            ControlResponse::Failed { detail } => Err(ProcessClusterError::Child(detail)),
+            other => Err(ProcessClusterError::Protocol(format!(
+                "expected physical-build evidence, received {other:?}"
             ))),
         }
     }

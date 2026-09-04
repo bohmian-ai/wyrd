@@ -534,6 +534,59 @@ async fn run_public(client: &WyrdClient, sql: &str) -> Result<PublicSettlement, 
     })
 }
 
+/// Drives one failure phase and proves it entered the physical builder once.
+///
+/// Returns that phase's own membership digest, so a caller can prove the next
+/// phase observed a different cut and is therefore not reading a stale
+/// predecessor observation. The structured code and the transport check
+/// together state that the caller saw the server's terminal query-execution
+/// failure rather than a dropped connection that happens to look like one.
+///
+/// # Errors
+///
+/// Returns a description when the statement settles, when the SDK error is a
+/// transport failure or carries another code, when the build total moves by
+/// anything other than one, or when the phase records no cut.
+async fn expect_single_build_failure(
+    cluster: &mut wyrd_testing::bifrost::process_cluster::BifrostProcessCluster,
+    client: &WyrdClient,
+    sql: &str,
+    case: &str,
+) -> Result<String, JourneyError> {
+    let before = cluster.nodes_mut()[COORDINATOR].physical_build_evidence()?;
+    let failure = match run_public(client, sql).await {
+        Ok(settled) => {
+            return Err(format!(
+                "{case}: still settled {:?} with {} rows",
+                settled.path, settled.rows
+            )
+            .into());
+        }
+        Err(error) => error,
+    };
+    let sdk = failure
+        .downcast_ref::<vala_sdk::ValaSdkError>()
+        .ok_or_else(|| format!("{case}: failed outside the SDK as {failure}"))?;
+    if is_transport(sdk) {
+        return Err(format!("{case}: failed as a client transport error: {sdk}").into());
+    }
+    if sdk.code() != "WYRD_VALA_500_QUERY_EXECUTION_FAILED" {
+        return Err(format!("{case}: settled code {}: {sdk}", sdk.code()).into());
+    }
+    let after = cluster.nodes_mut()[COORDINATOR].physical_build_evidence()?;
+    if after.total != before.total + 1 {
+        return Err(format!(
+            "{case}: entered the physical builder {} times, expected exactly one",
+            after.total - before.total
+        )
+        .into());
+    }
+    if after.latest_cut_fingerprint.is_empty() {
+        return Err(format!("{case}: recorded no membership cut for its build").into());
+    }
+    Ok(after.latest_cut_fingerprint)
+}
+
 /// One immutable cut and one physical root decide the path, the remote capacity
 /// it uses, and every terminal failure — with no second build and no fallback.
 ///
@@ -673,13 +726,9 @@ async fn prove_single_planner_routing() -> Result<(), JourneyError> {
     // One armed planning refusal settles the sole attempt: there is no second
     // build to fall back to, so the caller sees a failure rather than rows.
     cluster.nodes_mut()[COORDINATOR].arm_analytical_plan_failure()?;
-    if let Ok(settled) = run_public(&client, &grouped_sql).await {
-        return Err(format!(
-            "an armed planning refusal still settled {:?} with {} rows",
-            settled.path, settled.rows
-        )
-        .into());
-    }
+    let refusal_cut =
+        expect_single_build_failure(&mut cluster, &client, &grouped_sql, "planning refusal")
+            .await?;
     for (index, before) in baseline.clone() {
         await_baseline(&mut cluster, index, before).await?;
     }
@@ -689,12 +738,13 @@ async fn prove_single_planner_routing() -> Result<(), JourneyError> {
     // fail its one attempt rather than repin, replan, or rebuild.
     let object = pinned_parquet(&cluster, &table)?;
     cluster.remove_storage_object(&object)?;
-    if let Ok(settled) = run_public(&client, &scan_sql).await {
-        return Err(format!(
-            "a missing pinned object still settled {} rows",
-            settled.rows
-        )
-        .into());
+    let stale_cut =
+        expect_single_build_failure(&mut cluster, &client, &scan_sql, "missing pinned object")
+            .await?;
+    // Each phase froze its own membership, so an observation carried over from
+    // the refusal above could not be mistaken for this phase's evidence.
+    if stale_cut == refusal_cut {
+        return Err(format!("both failure phases report one request-local cut {stale_cut}").into());
     }
     for (index, before) in baseline {
         await_baseline(&mut cluster, index, before).await?;

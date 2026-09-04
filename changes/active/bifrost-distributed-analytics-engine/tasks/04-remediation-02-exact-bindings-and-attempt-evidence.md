@@ -81,14 +81,16 @@ Primary owners:
 - `wyrd-testing`'s existing `oracle` journey target owns the public regression
   proofs.
 
-Expected production write set is limited to:
+Expected write set is limited to:
 
 - `crates/vala/vala-bifrost-redux/src/oracle/{mod.rs,exec.rs,codec.rs,bindings.rs,participant_cut.rs,running.rs}` as required by the concrete implementation;
 - `crates/wyrd/wyrd-testing/src/bifrost/process_cluster.rs` and
   `crates/wyrd/wyrd-testing/src/bifrost/process_cluster/child.rs` for private
   process evidence and the stale-evidence guard; and
 - the existing Oracle unit/integration tests and
-  `crates/wyrd/wyrd-testing/tests/bifrost/oracle/analytical_activation.rs`.
+  `crates/wyrd/wyrd-testing/tests/bifrost/oracle/analytical_activation.rs`; and
+- `tasks/05-pre-mcp-buildout.md`, whose prerequisite advances from the first
+  Task 04 remediation to this final Task 04 remediation.
 
 Use fewer files when the existing owners allow it. Do not introduce a trait,
 registry, generic observer, new crate/module, dependency, configuration knob,
@@ -359,4 +361,6 @@ The implementation closeout must provide:
   missing pinned data, and selected peer loss;
 - zero retained ownership after every public phase; and
 - `git diff --check` output plus confirmation that no public contract,
-  dependency, fallback, retry, or second remediation task was added.
+  dependency, fallback, retry, or second remediation task was added; and
+- confirmation that `05-pre-mcp-buildout.md` depends on this remediation task,
+  so MCP work cannot begin while these Task 04 findings remain open.

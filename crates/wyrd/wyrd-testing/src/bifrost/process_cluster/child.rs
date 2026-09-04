@@ -227,6 +227,32 @@ async fn serve() -> Result<(), ProcessClusterError> {
                     })?,
                 }
             }
+            ControlRequest::PhysicalBuildEvidence => {
+                let (total, latest_cut_fingerprint) =
+                    vala_bifrost_redux::oracle::physical_build_observation_for_test();
+                let active_cut_fingerprints = match oracle(&server) {
+                    Ok(engine) => {
+                        let registry = engine.running_queries();
+                        registry
+                            .list(config.tenant_id)
+                            .iter()
+                            .filter_map(|summary| {
+                                registry
+                                    .get(config.tenant_id, &summary.request_id)
+                                    .map(|entry| entry.participant_cut().fingerprint())
+                            })
+                            .collect()
+                    }
+                    Err(_) => Vec::new(),
+                };
+                emit(&ControlResponse::PhysicalBuilds(
+                    super::PhysicalBuildEvidence {
+                        total,
+                        latest_cut_fingerprint,
+                        active_cut_fingerprints,
+                    },
+                ))?;
+            }
             ControlRequest::PeerBodyPolls => {
                 emit(&ControlResponse::BodyPolls {
                     count: wyrd_server::grpc::peer_body_polls(),

@@ -217,6 +217,28 @@ impl OracleQueryAttemptRoster {
         self.deadline
     }
 
+    /// Returns this frozen membership's canonical digest, before any class.
+    ///
+    /// Identical to the digest [`OracleQueryAttemptCut::fingerprint`] renders
+    /// for the cut this roster finalizes into, so an observation taken at the
+    /// physical build can be compared with the terminal attempt's own cut.
+    ///
+    /// # Panics
+    ///
+    /// Panics only when a participant collection exceeds the fixed-width
+    /// canonical length encoding.
+    #[must_use]
+    pub fn fingerprint(&self) -> String {
+        canonical_fingerprint(
+            self.attempt_id,
+            self.observed_at,
+            self.deadline,
+            &self.leader,
+            &self.oracles,
+            &self.scribes,
+        )
+    }
+
     /// Validates and projects one role-filtered participant slice.
     ///
     /// # Errors
@@ -294,6 +316,45 @@ fn supports_class(participant: &OracleQueryParticipant, query_class: QueryClass)
     }
 }
 
+/// Renders one frozen membership into its canonical execution-cut digest.
+///
+/// Shared by the pre-class roster and the finalized cut so both sides of one
+/// attempt encode the same facts the same way. Query class is deliberately
+/// absent: the digest identifies the membership a build ran against, which is
+/// decided before the root exists.
+///
+/// # Panics
+///
+/// Panics only when a participant collection exceeds the fixed-width canonical
+/// length encoding.
+fn canonical_fingerprint(
+    attempt_id: QueryId,
+    observed_at: DateTime<Utc>,
+    deadline: DateTime<Utc>,
+    leader: &OracleQueryParticipant,
+    oracles: &[OracleQueryParticipant],
+    scribes: &[OracleQueryParticipant],
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"wyrd.oracle.participant-cut.v1\0");
+    digest.update(attempt_id.as_uuid().as_bytes());
+    OracleQueryAttemptCut::hash_timestamp(&mut digest, observed_at);
+    OracleQueryAttemptCut::hash_timestamp(&mut digest, deadline);
+    digest.update(b"leader\0");
+    OracleQueryAttemptCut::hash_participant(&mut digest, leader);
+    digest.update(b"oracles\0");
+    OracleQueryAttemptCut::hash_len(&mut digest, oracles.len());
+    for participant in oracles {
+        OracleQueryAttemptCut::hash_participant(&mut digest, participant);
+    }
+    digest.update(b"scribes\0");
+    OracleQueryAttemptCut::hash_len(&mut digest, scribes.len());
+    for participant in scribes {
+        OracleQueryAttemptCut::hash_participant(&mut digest, participant);
+    }
+    format!("sha256:{:x}", digest.finalize())
+}
+
 impl OracleQueryAttemptCut {
     /// Freezes one fresh snapshot into the exact participants for a query attempt.
     ///
@@ -366,24 +427,14 @@ impl OracleQueryAttemptCut {
     /// exceeds the fixed-width canonical digest encoding.
     #[must_use]
     pub fn fingerprint(&self) -> String {
-        let mut digest = Sha256::new();
-        digest.update(b"wyrd.oracle.participant-cut.v1\0");
-        digest.update(self.attempt_id.as_uuid().as_bytes());
-        Self::hash_timestamp(&mut digest, self.observed_at);
-        Self::hash_timestamp(&mut digest, self.deadline);
-        digest.update(b"leader\0");
-        Self::hash_participant(&mut digest, &self.leader);
-        digest.update(b"oracles\0");
-        Self::hash_len(&mut digest, self.oracles.len());
-        for participant in &self.oracles {
-            Self::hash_participant(&mut digest, participant);
-        }
-        digest.update(b"scribes\0");
-        Self::hash_len(&mut digest, self.scribes.len());
-        for participant in &self.scribes {
-            Self::hash_participant(&mut digest, participant);
-        }
-        format!("sha256:{:x}", digest.finalize())
+        canonical_fingerprint(
+            self.attempt_id,
+            self.observed_at,
+            self.deadline,
+            &self.leader,
+            &self.oracles,
+            &self.scribes,
+        )
     }
 
     /// Adds one full-resolution UTC timestamp to the cut digest.

@@ -2372,13 +2372,7 @@ impl Oracle {
         // The same single build production performs, so this attempt leases the
         // exact config its retained root was planned with.
         let retained = self
-            .build_physical_root(
-                &context,
-                &request.sql,
-                &planned.cuts,
-                roster.oracles(),
-                work_units,
-            )
+            .build_physical_root(&context, &request.sql, &planned.cuts, &roster, work_units)
             .await?;
         let cut = roster
             .finalize(QueryClass::Analytical)
@@ -2744,13 +2738,7 @@ impl Oracle {
         };
         let work_units = Self::scannable_work_units(&planned.cuts);
         let retained = self
-            .build_physical_root(
-                context,
-                &request.sql,
-                &planned.cuts,
-                roster.oracles(),
-                work_units,
-            )
+            .build_physical_root(context, &request.sql, &planned.cuts, &roster, work_units)
             .await?;
         let query_class = exec::query_class_for_root(retained.root.as_ref());
         tracing::Span::current().record("query_class", query_class_label(query_class));
@@ -3965,9 +3953,12 @@ impl Oracle {
         context: &AuthorizedQueryContext,
         sql: &str,
         cuts: &[PinnedSealedTable],
-        oracles: &[participant_cut::OracleQueryParticipant],
+        roster: &participant_cut::OracleQueryAttemptRoster,
         work_units: usize,
     ) -> Result<RetainedPhysicalPlan, BifrostError> {
+        let oracles = roster.oracles();
+        #[cfg(feature = "test-support")]
+        record_physical_build(&roster.fingerprint());
         let shape = crate::resources::OracleSessionShape::for_grant(
             crate::resources::ORACLE_PARTITION_WORKING_MEMORY_BYTES,
             crate::resources::ORACLE_MIN_TARGET_PARTITIONS,
@@ -4033,6 +4024,57 @@ impl Oracle {
             .map_err(|error| map_datafusion_error(&error))
             .map_err(OracleExecutionError::from)
     }
+}
+
+/// Test-support observation of the one shared physical-build convergence point.
+///
+/// Process-local because every entry point that can build a root — production
+/// classification and the inactive attempt lease alike — runs inside the pod
+/// under observation. A journey differences the total across one serialized
+/// request, so it needs no per-query key and retains no event list.
+#[cfg(feature = "test-support")]
+static PHYSICAL_BUILDS: PhysicalBuildObservation = PhysicalBuildObservation {
+    total: AtomicU64::new(0),
+    latest_cut_fingerprint: std::sync::Mutex::new(String::new()),
+};
+
+/// Counted builds and the membership digest the most recent one ran against.
+#[cfg(feature = "test-support")]
+struct PhysicalBuildObservation {
+    /// Physical roots this process has begun building since start.
+    total: AtomicU64,
+    /// Canonical roster digest the most recent build entered with.
+    latest_cut_fingerprint: std::sync::Mutex<String>,
+}
+
+/// Records one entry into the shared physical builder.
+///
+/// Called from [`Oracle::build_physical_root`] alone, before anything in that
+/// build can fail, so an attempt that never reaches a root is still counted:
+/// the observable fact is that a build was entered, which is what makes a
+/// second ordinal, repin, or replan visible without one existing.
+#[cfg(feature = "test-support")]
+fn record_physical_build(cut_fingerprint: &str) {
+    PHYSICAL_BUILDS.total.fetch_add(1, Ordering::Relaxed);
+    let mut latest = PHYSICAL_BUILDS
+        .latest_cut_fingerprint
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    latest.clear();
+    latest.push_str(cut_fingerprint);
+}
+
+/// Returns this process's physical-build total and latest membership digest.
+#[cfg(feature = "test-support")]
+#[must_use]
+pub fn physical_build_observation_for_test() -> (u64, String) {
+    let total = PHYSICAL_BUILDS.total.load(Ordering::Relaxed);
+    let latest = PHYSICAL_BUILDS
+        .latest_cut_fingerprint
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    (total, latest)
 }
 
 /// Projects omitted and zero request budgets to the configured immutable default.

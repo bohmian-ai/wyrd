@@ -6,7 +6,7 @@ mode: RECONCILE
 status: proposed
 spec: SPEC-bifrost-distributed-analytics-engine
 spec_revision: 6
-depends_on: [BIFROST-R6-T04-REMEDIATION-SINGLE-PLANNER-QUERY-RELIABILITY]
+depends_on: [BIFROST-R6-T04-REMEDIATION-02-EXACT-BINDINGS-AND-ATTEMPT-EVIDENCE]
 requirements: [REQ-007, REQ-010, REQ-012]
 invariants: [INV-002, INV-004, INV-005, INV-008, INV-009]
 acceptance: [AC-006, AC-008, AC-009]
@@ -33,10 +33,10 @@ Required execution skill: `$wyrd-implement`.
 
 ### Retained
 
-- Task 04 and Task 04A remain the reviewed implementation history. MCP work
-  starts only after
-  `BIFROST-R6-T04-REMEDIATION-SINGLE-PLANNER-QUERY-RELIABILITY` replaces their
-  superseded two-gate query architecture and closes terminal reliability.
+- Task 04, Task 04A, and the first Task 04 remediation remain the reviewed
+  implementation history. MCP work starts only after
+  `BIFROST-R6-T04-REMEDIATION-02-EXACT-BINDINGS-AND-ATTEMPT-EVIDENCE` closes the
+  final validated Task 04 reliability findings.
 - The existing public listener, JWT verifier, `x-wyrd-access-token` contract,
   optional `wyrd-request-id`, authorization, tenant derivation, principal Card
   scope, delegated `act` chain, `Caller`, and audit context remain authoritative.

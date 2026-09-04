@@ -260,7 +260,7 @@ description = "wyrd-testing `server` binary, whole"
 run = "cargo nextest run --locked -p wyrd-testing --test server -P journey --run-ignored=all"
 
 [tasks."test:bifrost:journey:mcp"]
-description = "Tier-1 journeys: Bifrost MCP surface and its RBAC"
+description = "Tier-1 journeys: MCP client-to-server connectivity, credentials, RBAC, cancellation"
 run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run test:bifrost:journey:mcp:inner'"
 [tasks."test:bifrost:journey:mcp:inner"]
 hide = true

@@ -11071,6 +11071,7 @@ dependencies = [
  "rmcp",
  "secrecy",
  "serde_json",
+ "sqlx 0.9.0",
  "sse-stream",
  "tokio",
  "uuid",

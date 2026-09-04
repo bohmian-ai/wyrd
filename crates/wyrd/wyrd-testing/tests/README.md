@@ -74,8 +74,8 @@ So:
 1. Pick the binary whose capability it proves.
 2. Add it to the module that owns its theme, or add a new file plus one `mod`
    line in that binary's `main.rs`.
-3. If it needs Postgres or a server, `#[ignore]` it (or place it in
-   `mod pg_tests`).
+3. Add `#[ignore]` only when it belongs exclusively to the gated Bifrost
+   journey lane; Postgres use alone does not exclude it from family coverage.
 
 Do **not** add a `[[test]]` entry for the new file. Add a new `[[test]]` target
 only for a genuinely new capability, and give it a `//!` doc naming the
@@ -98,7 +98,7 @@ Keep a module under roughly 40 KB. Splitting costs one file and one `mod` line.
 | `mise run test:bifrost:journey:mcp` | `wyrd-mcp` `mcp`, whole |
 | `mise run test:bifrost:journey:python` | Python Bifrost client and query journeys |
 | `mise run test:bifrost:journey:typescript` | TypeScript Oracle query journey |
-| `mise run test:wyrd` | everything not `#[ignore]`d and not in `mod pg_tests` |
+| `mise run test:wyrd` | every non-ignored default-feature test in the Wyrd family |
 
 Every lane selects a Cargo **target**, never a test name. Cargo resolves a
 target against the manifest and fails loudly when it is missing; a positional

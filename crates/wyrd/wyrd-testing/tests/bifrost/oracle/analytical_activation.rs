@@ -38,6 +38,14 @@ const FIXTURE_ROWS: i64 = 12;
 /// Distinct `filter_key` groups the fixture rows fall into.
 const FIXTURE_GROUPS: i64 = 3;
 
+/// Rows the journey's same-table self-join must return.
+///
+/// The left alias keeps `filter_key = 'group_0'`, which is ids `0, 3, 6, 9`.
+/// The join condition carries that group onto the right alias, whose own
+/// `id > 5` predicate leaves ids `6, 9`. Four left rows against two right rows
+/// is eight, and it is eight only while each alias binds its own closure.
+const SELF_JOIN_ROWS: usize = 8;
+
 /// Builds one published-only strict request with the journey's deadline.
 fn request(sql: &str) -> BifrostQueryRequest {
     BifrostQueryRequest {
@@ -618,6 +626,42 @@ async fn prove_single_planner_routing() -> Result<(), JourneyError> {
             return Err(format!(
                 "follower {index} admitted no peer body: {polls} polls, was {}",
                 polls_before[offset]
+            )
+            .into());
+        }
+    }
+    for (index, before) in baseline.clone() {
+        await_baseline(&mut cluster, index, before).await?;
+    }
+
+    // A same-table self-join reaches the one registered provider twice. Each
+    // alias carries its own projection and predicate closure, so the two
+    // physical occurrences must bind independently: a collision would let one
+    // side read the other's closure and change the result.
+    let polls_before_join: Vec<u64> = PEER_FOLLOWERS
+        .iter()
+        .map(|index| Ok(cluster.nodes_mut()[*index].peer_body_polls()?))
+        .collect::<Result<_, JourneyError>>()?;
+    let self_join_sql = format!(
+        "SELECT l.id AS left_id, r.wyrd_row_ordinal AS right_ordinal \
+         FROM vala.bifrost.{table} l \
+         JOIN vala.bifrost.{table} r ON l.filter_key = r.filter_key \
+         WHERE l.filter_key = 'group_0' AND r.id > 5 \
+         ORDER BY left_id, right_ordinal"
+    );
+    let self_join = run_public(&client, &self_join_sql).await?;
+    expect_public(
+        &self_join,
+        QueryExecutionPath::Analytical,
+        SELF_JOIN_ROWS,
+        "same-table self-join",
+    )?;
+    for (offset, index) in PEER_FOLLOWERS.into_iter().enumerate() {
+        let polls = cluster.nodes_mut()[index].peer_body_polls()?;
+        if polls <= polls_before_join[offset] {
+            return Err(format!(
+                "follower {index} admitted no self-join peer body: {polls} polls, was {}",
+                polls_before_join[offset]
             )
             .into());
         }

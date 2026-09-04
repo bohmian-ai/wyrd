@@ -429,6 +429,18 @@ pub struct ForgeWorkerCompletionObserver {
     /// Release for the one completed handoff held by the passive barrier.
     #[cfg(feature = "test-support")]
     handoff_pause_release: Arc<tokio::sync::Notify>,
+    /// One-shot injected failure of the next healthy-worker registration.
+    #[cfg(feature = "test-support")]
+    fail_next_registration: Arc<AtomicBool>,
+    /// One-shot injected failure of the next recovery-predicate query.
+    #[cfg(feature = "test-support")]
+    fail_next_recovery_predicate: Arc<AtomicBool>,
+    /// One-shot injected failure of the next worker-owned table-lease release.
+    #[cfg(feature = "test-support")]
+    fail_next_lease_release: Arc<AtomicBool>,
+    /// One-shot injected failure of the next cancelled-claim release.
+    #[cfg(feature = "test-support")]
+    fail_next_cancelled_claim_release: Arc<AtomicBool>,
 }
 
 /// Typed causal evidence from the production Forge scheduler and worker owners.
@@ -505,6 +517,70 @@ impl ForgeWorkerCompletionObserver {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Arm a one-shot failure of the next healthy-worker registration.
+    ///
+    /// A worker that cannot record itself healthy has no durable identity to
+    /// claim under, so the startup boundary must be reachable in a test without
+    /// a production configuration field. Consumed by the first registration
+    /// that observes it, which is what lets the same worker respawn and recover.
+    pub fn fail_next_registration(&self) {
+        self.fail_next_registration.store(true, Ordering::Release);
+    }
+
+    /// Consume the armed one-shot registration failure, if any.
+    #[must_use]
+    fn take_registration_failure(&self) -> bool {
+        self.fail_next_registration.swap(false, Ordering::AcqRel)
+    }
+
+    /// Arm a one-shot failure of the next recovery-predicate query.
+    ///
+    /// The predicate is the last thing standing between recovery and published
+    /// readiness, so a failure there must leave the worker unready rather than
+    /// optimistically ready.
+    pub fn fail_next_recovery_predicate(&self) {
+        self.fail_next_recovery_predicate
+            .store(true, Ordering::Release);
+    }
+
+    /// Consume the armed one-shot recovery-predicate failure, if any.
+    #[must_use]
+    fn take_recovery_predicate_failure(&self) -> bool {
+        self.fail_next_recovery_predicate
+            .swap(false, Ordering::AcqRel)
+    }
+
+    /// Arm a one-shot failure of the next worker-owned table-lease release.
+    ///
+    /// A retained table fence lets this owner's next claim run against a table
+    /// it can no longer prove it owns, so the release boundary is fatal and
+    /// must be injectable at both worker-owned release sites.
+    pub fn fail_next_lease_release(&self) {
+        self.fail_next_lease_release.store(true, Ordering::Release);
+    }
+
+    /// Consume the armed one-shot lease-release failure, if any.
+    #[must_use]
+    fn take_lease_release_failure(&self) -> bool {
+        self.fail_next_lease_release.swap(false, Ordering::AcqRel)
+    }
+
+    /// Arm a one-shot failure of the next cancelled-claim release.
+    ///
+    /// A shutdown that cannot drain its own claim leaves durable state this
+    /// owner still holds, so it must report the failure rather than exit clean.
+    pub fn fail_next_cancelled_claim_release(&self) {
+        self.fail_next_cancelled_claim_release
+            .store(true, Ordering::Release);
+    }
+
+    /// Consume the armed one-shot cancelled-claim-release failure, if any.
+    #[must_use]
+    fn take_cancelled_claim_release_failure(&self) -> bool {
+        self.fail_next_cancelled_claim_release
+            .swap(false, Ordering::AcqRel)
     }
 
     /// Return the number of successful worker executions observed so far.
@@ -1202,6 +1278,14 @@ impl ForgeWorker {
             tracing::error!(worker=%self.owner, error=%error, "Forge worker quarantined by startup scratch probe");
             return Ok(());
         }
+        #[cfg(feature = "test-support")]
+        if let Some(observer) = &self.completion_observer
+            && observer.take_registration_failure()
+        {
+            return Err(ForgeError::Sql(vala_sql::SqlError::Conflict {
+                detail: "injected Forge worker registration failure".to_owned(),
+            }));
+        }
         self.tasks
             .register_healthy_worker(self.owner, volume.as_str())
             .await
@@ -1232,36 +1316,83 @@ impl ForgeWorker {
         for index in 0..self.config.worker_concurrency {
             let worker = self.clone();
             let stop = slot_stop.clone();
+            let slot_readiness = readiness.clone();
+            let sibling_stop = slot_stop.clone();
             // Slot zero is the reserved maintenance slot: it always attempts a
             // maintenance-strategy claim before falling back to any strategy, so
             // a ready maintenance task can never be starved by a compaction
             // backlog occupying every other slot. With a single-slot worker that
             // one slot carries the reservation.
             let reserved_maintenance = index == 0;
-            slots.spawn(async move { Box::pin(worker.run_slot(stop, reserved_maintenance)).await });
+            slots.spawn(async move {
+                let outcome = Box::pin(worker.run_slot(stop, reserved_maintenance)).await;
+                if outcome.is_err() {
+                    // Readiness is cleared by the owner that first observes the
+                    // loss, before it reaches the parent. Waiting for the join
+                    // would leave a window in which a sibling still holding a
+                    // slot could take one more claim under an owner that can no
+                    // longer prove what it did.
+                    slot_readiness.publish(false);
+                    sibling_stop.cancel();
+                }
+                outcome
+            });
         }
         // The first error is the one that describes why this worker stopped;
         // later errors are usually its siblings observing the same cancellation.
         let mut first_error = None;
         // Draining the whole set is deliberate: a sibling still holds a lease
         // and a claim, and joining it is what proves it released them.
-        while let Some(joined) = slots.join_next().await {
-            let outcome = joined.unwrap_or_else(|error| {
-                Err(ForgeError::Invariant {
+        loop {
+            let joined = tokio::select! {
+                () = shutdown.cancelled(), if first_error.is_none() => {
+                    // An ordinary drain closes routing before the slots are
+                    // asked to stop, for the same reason a failure does.
+                    readiness.publish(false);
+                    slot_stop.cancel();
+                    break;
+                }
+                joined = slots.join_next() => joined,
+            };
+            let Some(joined) = joined else { break };
+            let outcome = match joined {
+                Ok(outcome) => outcome,
+                // Expected once this supervisor aborts the remaining slots; it
+                // says nothing about why the worker stopped.
+                Err(error) if error.is_cancelled() => continue,
+                Err(error) => Err(ForgeError::Invariant {
                     detail: format!("Forge worker slot panicked: {error}"),
-                })
-            });
+                }),
+            };
             if let Err(error) = outcome
                 && first_error.is_none()
             {
+                readiness.publish(false);
                 slot_stop.cancel();
+                // Nothing else may claim under this owner, so the siblings are
+                // aborted rather than allowed to finish their current attempt.
+                slots.abort_all();
                 first_error = Some(error);
             }
         }
+        while let Some(joined) = slots.join_next().await {
+            match joined {
+                Ok(Err(error)) if first_error.is_none() => {
+                    readiness.publish(false);
+                    first_error = Some(error);
+                }
+                Ok(_) => {}
+                Err(error) if error.is_cancelled() => {}
+                Err(error) if first_error.is_none() => {
+                    readiness.publish(false);
+                    first_error = Some(ForgeError::Invariant {
+                        detail: format!("Forge worker slot panicked: {error}"),
+                    });
+                }
+                Err(_) => {}
+            }
+        }
         if let Some(error) = first_error {
-            // Cleared before the error propagates, so routing closes ahead of
-            // the supervisor observing the failure.
-            readiness.publish(false);
             tracing::error!(worker = %self.owner, error = %error, "Forge worker stopped after a slot could not settle its work");
             return Err(error);
         }
@@ -1315,6 +1446,14 @@ impl ForgeWorker {
             let cleaned = self
                 .execute_one_recoverable_cleanup(claim_limits, shutdown)
                 .await?;
+            #[cfg(feature = "test-support")]
+            if let Some(observer) = &self.completion_observer
+                && observer.take_recovery_predicate_failure()
+            {
+                return Err(ForgeError::Sql(vala_sql::SqlError::Conflict {
+                    detail: "injected Forge worker registration failure".to_owned(),
+                }));
+            }
             if !self
                 .tasks
                 .has_recoverable_work(self.owner)
@@ -1424,6 +1563,29 @@ impl ForgeWorker {
     /// Returns typed scratch IO when directory inspection or deletion fails.
     fn cleanup_attempt_scratch(&self, task_id: Uuid, attempt_id: Uuid) -> Result<(), ForgeError> {
         cleanup_attempt_scratch_root(&self.forge.core.rewrite_spill_root, task_id, attempt_id)
+    }
+
+    /// Releases one worker-owned table fence through the single fault seam.
+    ///
+    /// Both worker-owned release sites route here so an injected release
+    /// failure exercises exactly the boundary production uses. The injection
+    /// precedes the real release, so the fence stays held and the durable state
+    /// matches what a genuine release failure would leave behind.
+    ///
+    /// # Errors
+    ///
+    /// Returns the lease layer's release failure, or the injected typed SQL
+    /// conflict when a test armed the one-shot seam.
+    async fn release_table_lease(&self, lease: &mut ForgeLease) -> Result<bool, ForgeError> {
+        #[cfg(feature = "test-support")]
+        if let Some(observer) = &self.completion_observer
+            && observer.take_lease_release_failure()
+        {
+            return Err(ForgeError::Sql(vala_sql::SqlError::Conflict {
+                detail: "injected Forge table lease release failure".to_owned(),
+            }));
+        }
+        lease.release(&self.forge.core.operator_pool).await
     }
 
     /// Reclaims expired durable attempts and removes only their exact scratch prefixes.
@@ -2007,6 +2169,14 @@ impl ForgeWorker {
         task_id: Uuid,
         attempt: Uuid,
     ) -> Result<(), ForgeError> {
+        #[cfg(feature = "test-support")]
+        if let Some(observer) = &self.completion_observer
+            && observer.take_cancelled_claim_release_failure()
+        {
+            return Err(ForgeError::Sql(vala_sql::SqlError::Conflict {
+                detail: "injected Forge cancelled claim release failure".to_owned(),
+            }));
+        }
         let ready_at = self.forge.core.clock.now()?;
         match self
             .tasks
@@ -2217,7 +2387,7 @@ impl ForgeWorker {
             task,
             attempt,
             stage,
-            lease,
+            mut lease,
             task_span,
             elapsed,
             result,
@@ -2258,7 +2428,7 @@ impl ForgeWorker {
                 .telemetry
                 .record_conflict(ForgeConflictKind::FenceLost);
         }
-        if let Err(error) = lease.release(&self.forge.core.operator_pool).await {
+        if let Err(error) = self.release_table_lease(&mut lease).await {
             tracing::warn!(task_id = %task.task_id, error = %error, "Forge table lease release failed");
             // A retained table fence would let this owner's next claim run
             // against a table it can no longer prove it owns.
@@ -2475,10 +2645,24 @@ impl ForgeWorker {
             .await
         }
         .await;
-        if let Err(error) = lease.release(&self.forge.core.operator_pool).await {
-            tracing::warn!(task_id = %task.task_id, error = %error, "Forge reconciliation lease release failed");
+        // Matches the precedence `settle_claim_execution` already implements: a
+        // retained table fence would let this owner's next claim run against a
+        // table it can no longer prove it owns, so a release-only failure is
+        // fatal too. When reconciliation already failed, that error stays
+        // primary and the release failure is only a secondary diagnostic.
+        let release = self.release_table_lease(&mut lease).await;
+        match (result, release) {
+            (Err(reconciliation), Err(release)) => {
+                tracing::warn!(task_id = %task.task_id, error = %release, "Forge reconciliation lease release also failed");
+                Err(reconciliation)
+            }
+            (Err(reconciliation), Ok(_)) => Err(reconciliation),
+            (Ok(()), Err(release)) => {
+                tracing::error!(task_id = %task.task_id, error = %release, "Forge reconciliation committed but its table lease could not be released");
+                Err(release)
+            }
+            (Ok(()), Ok(_)) => Ok(()),
         }
-        result
     }
 
     /// Verifies and resumes every external effect owned by one Prepared task.

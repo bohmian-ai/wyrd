@@ -1986,6 +1986,80 @@ mod tests {
             .collect()
     }
 
+    /// Asserts the lifecycle family emitted exactly its closed label product.
+    ///
+    /// The caller has just driven every strategy, stage, and outcome once, so
+    /// a missing series means a listed pair emits nothing and an extra series
+    /// means a label escaped the closed set.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the series count differs from the product or when any
+    /// listed pair is absent or was not incremented exactly once.
+    #[cfg(test)]
+    fn assert_closed_lifecycle_product(snapshot: &BenchmarkMetricSnapshot) {
+        let lifecycle = family_series(snapshot, "bifrost_forge_lifecycle_events_total");
+        assert_eq!(
+            lifecycle.len(),
+            ForgeTaskMetricStrategy::ALL.len()
+                * ForgeLifecycleStage::ALL.len()
+                * ForgeLifecycleOutcome::ALL.len()
+        );
+        for strategy in ForgeTaskMetricStrategy::ALL {
+            for stage in ForgeLifecycleStage::ALL {
+                for outcome in ForgeLifecycleOutcome::ALL {
+                    let series = lifecycle
+                        .iter()
+                        .find(|name| {
+                            name.contains(&format!("strategy=\"{}\"", strategy.as_str()))
+                                && name.contains(&format!("event=\"{}\"", stage.as_str()))
+                                && name.contains(&format!("outcome=\"{}\"", outcome.as_str()))
+                        })
+                        .expect("closed lifecycle series");
+                    assert_eq!(snapshot.counters.get(series), Some(&1));
+                }
+            }
+        }
+    }
+
+    /// Asserts the active-task guard balances across every attempt exit.
+    ///
+    /// The gauge is opened for a task's lifetime, so an ordinary drop and a
+    /// panic unwind must both return it to zero. Anything else means a task
+    /// exit path skipped its decrement and the gauge would drift upward.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the gauge does not read one while a guard is held, or does
+    /// not return to zero after the guard drops or unwinds.
+    #[cfg(test)]
+    fn assert_active_task_balance(recorder: &BenchmarkRecorder, telemetry: &Arc<ForgeTelemetry>) {
+        let active = |strategy: ForgeTaskMetricStrategy| {
+            recorder
+                .snapshot()
+                .gauges
+                .iter()
+                .find(|(name, _)| {
+                    name.starts_with("bifrost_forge_active_tasks{")
+                        && name.contains(&format!("strategy=\"{}\"", strategy.as_str()))
+                })
+                .map_or(0.0, |(_, value)| *value)
+        };
+        for strategy in ForgeTaskMetricStrategy::ALL {
+            let guard = telemetry.active_task(strategy);
+            assert!((active(strategy) - 1.0).abs() < f64::EPSILON);
+            drop(guard);
+            assert!(active(strategy).abs() < f64::EPSILON);
+        }
+        let unwound = ForgeTaskMetricStrategy::OrphanCleanup;
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = telemetry.active_task(unwound);
+            panic!("forge attempt unwound");
+        }));
+        assert!(panicked.is_err());
+        assert!(active(unwound).abs() < f64::EPSILON);
+    }
+
     /// Proves Forge telemetry is closed, bounded, and balanced across task exits.
     ///
     /// The planning handles the scheduler once emitted inline keep their names,
@@ -2048,28 +2122,7 @@ mod tests {
                 );
             }
 
-            let lifecycle = family_series(&snapshot, "bifrost_forge_lifecycle_events_total");
-            assert_eq!(
-                lifecycle.len(),
-                ForgeTaskMetricStrategy::ALL.len()
-                    * ForgeLifecycleStage::ALL.len()
-                    * ForgeLifecycleOutcome::ALL.len()
-            );
-            for strategy in ForgeTaskMetricStrategy::ALL {
-                for stage in ForgeLifecycleStage::ALL {
-                    for outcome in ForgeLifecycleOutcome::ALL {
-                        let series = lifecycle
-                            .iter()
-                            .find(|name| {
-                                name.contains(&format!("strategy=\"{}\"", strategy.as_str()))
-                                    && name.contains(&format!("event=\"{}\"", stage.as_str()))
-                                    && name.contains(&format!("outcome=\"{}\"", outcome.as_str()))
-                            })
-                            .expect("closed lifecycle series");
-                        assert_eq!(snapshot.counters.get(series), Some(&1));
-                    }
-                }
-            }
+            assert_closed_lifecycle_product(&snapshot);
 
             // Unbounded identities are what turn a maintenance family into a
             // cardinality incident, so no Forge series may carry one.
@@ -2085,30 +2138,7 @@ mod tests {
                 }
             }
 
-            let active = |strategy: ForgeTaskMetricStrategy| {
-                recorder
-                    .snapshot()
-                    .gauges
-                    .iter()
-                    .find(|(name, _)| {
-                        name.starts_with("bifrost_forge_active_tasks{")
-                            && name.contains(&format!("strategy=\"{}\"", strategy.as_str()))
-                    })
-                    .map_or(0.0, |(_, value)| *value)
-            };
-            for strategy in ForgeTaskMetricStrategy::ALL {
-                let guard = telemetry.active_task(strategy);
-                assert!((active(strategy) - 1.0).abs() < f64::EPSILON);
-                drop(guard);
-                assert!(active(strategy).abs() < f64::EPSILON);
-            }
-            let unwound = ForgeTaskMetricStrategy::OrphanCleanup;
-            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let _guard = telemetry.active_task(unwound);
-                panic!("forge attempt unwound");
-            }));
-            assert!(panicked.is_err());
-            assert!(active(unwound).abs() < f64::EPSILON);
+            assert_active_task_balance(&recorder, &telemetry);
         });
 
         // The scheduler now owns no metric handle of its own; every planning

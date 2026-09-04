@@ -22,8 +22,8 @@ use super::snapshot_expiration::{
     ExpirableTable, expirable_table, head_watermark, seed_ready_expiry_task,
 };
 use super::support::{
-    CountingObjectStore, PromotionCatalogSeam, PromotionIntegrationFixture, SupervisedPromotion,
-    manual_clock,
+    CountingObjectStore, ForgeTelemetryCheckpoint, PromotionCatalogSeam,
+    PromotionIntegrationFixture, SupervisedPromotion, manual_clock,
 };
 
 /// Starts one expirable table whose only planner candidate is expiration.
@@ -374,4 +374,102 @@ async fn four_strategies_schedule_dispatch_and_settle_independently() {
         candidates > 0,
         "the expiration handed off its candidates instead of deleting them"
     );
+}
+
+/// Sums every recorded counter series of one family carrying all given labels.
+fn counter_total(
+    snapshot: &wyrd_bench::BenchmarkMetricSnapshot,
+    family: &str,
+    labels: &[(&str, &str)],
+) -> u64 {
+    snapshot
+        .counters
+        .iter()
+        .filter(|(name, _)| name.starts_with(&format!("{family}{{")))
+        .filter(|(name, _)| {
+            labels
+                .iter()
+                .all(|(key, value)| name.contains(&format!("{key}=\"{value}\"")))
+        })
+        .map(|(_, value)| *value)
+        .sum()
+}
+
+/// Every production task exit returns its strategy's active ownership to zero.
+///
+/// The four retained routes are driven through the real scheduler and worker
+/// until each has planned, claimed, and settled a durable task of its own,
+/// including the worker restarts that cancel an in-flight attempt. The active
+/// gauge is opened by a task-lifetime guard, so any exit that skipped its
+/// decrement — commit, refusal, cancellation, or unwind — leaves a non-zero
+/// residue here. The lifecycle family is checked in the same pass so an
+/// unbounded label or an unlisted pair cannot reach production unnoticed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Postgres, Iceberg, and object storage"]
+async fn telemetry_balances_every_task_exit() {
+    let telemetry = ForgeTelemetryCheckpoint::install();
+    let mut table = expirable_table("telemetry_exits", true).await;
+    let routes = [
+        "small_files",
+        "snapshot_expiry",
+        "expired_cleanup",
+        "orphan_cleanup",
+    ];
+    for _ in 0..8 {
+        let seen = settled_tasks(&table.fixture)
+            .await
+            .into_iter()
+            .map(|(_, strategy, _)| strategy)
+            .collect::<std::collections::BTreeSet<_>>();
+        if routes.iter().all(|strategy| seen.contains(*strategy)) {
+            break;
+        }
+        table.supervised.restart_worker();
+        table.supervised.run_one_success().await;
+    }
+
+    let snapshot = telemetry.snapshot();
+    for strategy in routes {
+        for stage in ["planned", "claimed", "settled"] {
+            assert!(
+                counter_total(
+                    &snapshot,
+                    "bifrost_forge_lifecycle_events_total",
+                    &[("strategy", strategy), ("event", stage), ("outcome", "ok"),],
+                ) > 0,
+                "{strategy} reported its own {stage} boundary"
+            );
+        }
+    }
+
+    // The guard decrements on every exit, so a settled route that still owns
+    // active work is a leaked attempt rather than a slow one.
+    for (name, value) in &snapshot.gauges {
+        if name.starts_with("bifrost_forge_active_tasks{") {
+            assert!(
+                value.abs() < f64::EPSILON,
+                "{name} retained {value} active attempts"
+            );
+        }
+    }
+
+    // Production emission must stay inside the closed schema the owner
+    // registers; an unbounded identity here is a cardinality incident.
+    for name in snapshot
+        .counters
+        .keys()
+        .chain(snapshot.gauges.keys())
+        .chain(snapshot.histograms.keys())
+        .filter(|name| name.starts_with("bifrost_forge_"))
+    {
+        for label in ["table=", "tenant=", "task=", "owner=", "prefix="] {
+            assert!(!name.contains(label), "{name} carries {label}");
+        }
+    }
+    telemetry.require_metrics(&[
+        "bifrost_forge_lifecycle_events_total",
+        "bifrost_forge_active_tasks",
+        "bifrost_forge_scheduling_total",
+        "bifrost_forge_planning_demand_total",
+    ]);
 }

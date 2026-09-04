@@ -2243,6 +2243,15 @@ impl ForgeTelemetryCheckpoint {
             .collect()
     }
 
+    /// Returns every production metric series recorded since installation.
+    ///
+    /// A family-presence assertion cannot distinguish a balanced gauge from a
+    /// leaked one, so a scenario that must prove exact label sets or a return
+    /// to zero reads the raw series instead.
+    pub(crate) fn snapshot(&self) -> wyrd_bench::BenchmarkMetricSnapshot {
+        self.recorder.snapshot()
+    }
+
     /// Asserts every named production metric family was registered and used.
     ///
     /// # Panics

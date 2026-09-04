@@ -1445,3 +1445,47 @@ paths. `oracle/splitter.rs` remains, as this task allows: its deletion gate is
 the representative process journey
 (`peer_network::analytical::stage_graph_executes_representative_query_styles`),
 which Scenario 4 has not yet written. Scenarios 4–7 are untouched.
+
+---
+
+## Amendment — status: task incomplete, journey lanes red
+
+**Status.** This task is **not complete**. Scenarios 1, 2, and 3 are landed.
+Scenarios 4, 5, 6, and 7 are **not implemented** — no RED written, no GREEN
+taken. The implementing agent scoped its session to Scenario 3's open defect on
+the strength of a hand-off note rather than to this task file, which is the
+authority. The task is the unit of completion; a scenario finishing does not
+finish the task.
+
+**The failing journey lanes are in scope and are a blocker.** Six Oracle journey
+tests are red at this commit:
+
+- `analytical_activation::transport_drop_retains_running_status_until_cleanup_joins`
+- `analytical_activation::public_query_selects_both_paths_and_preserves_interactive_floor`
+- `analytical_inactive::pg_inactive_analytical_production_telemetry_covers_every_hot_path`
+- `analytical_inactive::pg_inactive_analytical_raw_sql_proves_pushdown_exchange_and_qualified_spill`
+- `peer_network::analytical::inactive_baseline_executes_join_group_spill_and_interchangeable_topology`
+- `published::published_cache_pruning_and_shutdown_are_production_governed`
+
+The evidence section above classifies these as "pre-existing and outside
+Scenario 3." That classification is withdrawn as a disposition. Every one of
+these lanes passed before work on this task began; they fail now, on this
+branch, after this work. Whether the proximate cause predates a given slice is a
+diagnostic detail, not a licence to leave the lane red. A red lane that was
+green at the branch point is this task's obligation to fix, full stop. No
+scenario in this task may be marked done, and this task may not go to
+`$wyrd-task-review`, while any of them is failing.
+
+**Required to close this task.**
+
+1. Restore all six journey lanes to green. Diagnose each against the branch
+   point (`git log` the lane's subject files back to the pre-task commit) rather
+   than assuming a prior slice owns it.
+2. Implement Scenarios 4, 5, 6, and 7 in full, each through its own
+   RED → GREEN → REFACTOR cycle with the exact verification commands this task
+   names.
+3. Delete `oracle/splitter.rs` once Scenario 4's
+   `peer_network::analytical::stage_graph_executes_representative_query_styles`
+   passes, as Scenario 4 requires.
+4. Re-run the full Oracle journey lane and `mise run test:bifrost` and record
+   both totals, with zero failures, before requesting review.

@@ -200,14 +200,91 @@ This is the failure rule to keep in mind when changing Forge: losing the lease
 must stop the operation. A stale worker must never complete a durable state
 transition after a replacement worker has taken over.
 
+## Telemetry
+
+`forge/metrics.rs` is the only Forge metric owner. Every family below is
+registered once when `ForgeTelemetry` is constructed, so the label sets are
+closed at startup and no Forge series carries a tenant, table, task, owner, or
+object-prefix label. There is no combined maintenance route: each strategy is
+scheduled, dispatched, and settled independently and reports under its own
+`strategy` label.
+
+### Planning and scheduling
+
+| Family | Labels | Meaning |
+| --- | --- | --- |
+| `bifrost_forge_planning_demand_total` | `source` | Accepted planning demands, by `hint` or `periodic`. |
+| `bifrost_forge_scheduling_total` | `result` | Scheduling passes, by `complete` or `incomplete`. |
+| `bifrost_forge_unschedulable_total` | — | Tasks a pass recorded as unschedulable. |
+| `bifrost_forge_scheduling_duration_seconds` | — | Wall time of one scheduling pass. |
+| `bifrost_forge_scheduler_duration_seconds` | — | Wall time of one supervised scheduler iteration. |
+| `bifrost_forge_planning_backlog` | — | Tables with outstanding demand after a complete pass. |
+| `bifrost_forge_oldest_planning_demand_seconds` | — | Age of the oldest outstanding demand. |
+| `bifrost_forge_oldest_backlog_seconds` | — | Age of the oldest unsettled task. |
+| `bifrost_forge_fairness_lag_tasks` | — | Tasks the fairest tenant is behind by. |
+| `bifrost_forge_demand_transitions_total` | `transition` | Durable demand-row transitions. |
+| `bifrost_forge_hints_total` | `result` | Advisory Scribe hints, by inbox outcome. |
+| `bifrost_forge_hint_persistence_total` | `result` | Durable hint persistence attempts. |
+| `bifrost_forge_hint_persistence_seconds` | `result` | Durable hint persistence latency. |
+| `bifrost_forge_discovered_candidate_files` | — | Files the last discovery pass considered. |
+| `bifrost_forge_discovered_candidate_bytes` | — | Bytes the last discovery pass considered. |
+| `bifrost_forge_compaction_debt` | `dimension` | Outstanding small-file debt in files and bytes. |
+| `bifrost_forge_complete_gauge_publications_total` | — | Complete-pass gauge publications. |
+
+### Task lifecycle
+
+| Family | Labels | Meaning |
+| --- | --- | --- |
+| `bifrost_forge_lifecycle_events_total` | `strategy`, `event`, `outcome` | Durable transitions at their authoritative boundary: `planned`, `claimed`, or `settled`, each `ok` or `error`. |
+| `bifrost_forge_active_tasks` | `strategy` | Attempts currently held by this process. The guard decrements on every exit, including cancellation and unwind, so a non-zero steady-state value is a leak. |
+| `bifrost_forge_task_duration_seconds` | `strategy`, `result` | Settled task latency. |
+| `bifrost_forge_task_failures_total` | `class` | Settled failures by failure class. |
+| `bifrost_forge_task_spill_bytes` | `strategy` | Scratch bytes an attempt spilled. |
+| `bifrost_forge_operations` | `source`, `result` | Durable operation outcomes by data source. |
+| `bifrost_forge_stage_seconds` | `stage` | Per-stage latency inside one attempt. |
+| `bifrost_forge_stage_failures_total` | `stage` | Per-stage failures inside one attempt. |
+| `bifrost_forge_progress_effects_total` | `effect` | Whether a settled attempt changed durable state. |
+| `bifrost_forge_retries_total` | `class` | Retry decisions by failure class. |
+| `bifrost_forge_terminal_poisons_total` | `class` | Terminal poison decisions by failure class. |
+| `bifrost_forge_conflicts_total` | `kind` | Catalog and fencing conflicts. |
+| `bifrost_forge_lease_events_total` | `result` | Table-lease acquisition, renewal, and release outcomes. |
+| `bifrost_forge_worker_quarantined` | — | Whether this worker has quarantined itself. |
+| `bifrost_forge_role_processes` | `role` | Forge role processes this deployment is running. |
+| `bifrost_forge_role_process_started_total` | `role` | Forge role process starts. |
+
+### Rewrite and capacity
+
+| Family | Labels | Meaning |
+| --- | --- | --- |
+| `bifrost_forge_rewrite_input_files_total` | `source` | Files a rewrite consumed. |
+| `bifrost_forge_rewrite_input_bytes_total` | `source` | Bytes a rewrite consumed. |
+| `bifrost_forge_rewrite_output_files_total` | `source` | Files a rewrite produced. |
+| `bifrost_forge_rewrite_output_bytes_total` | `source` | Bytes a rewrite produced. |
+| `bifrost_forge_rewrite_events_total` | `kind` | Rewrite lifecycle events. |
+| `bifrost_forge_capacity_refusals_total` | `phase` | Capacity refusals at admission or execution. |
+| `bifrost_forge_execution_envelope_failures_total` | `resource` | Envelope acquisition failures by resource. |
+| `bifrost_forge_attempt_resource_bytes` | `resource`, `measure` | Planned, acquired, and peak attempt resources. |
+| `bifrost_forge_attempt_resource_releases_total` | `result` | Attempt resource releases, including poisoned releases. |
+| `bifrost_forge_legacy_envelopes_superseded_total` | `result` | Superseded legacy envelopes. |
+
+### Cleanup
+
+| Family | Labels | Meaning |
+| --- | --- | --- |
+| `bifrost_forge_cleanup_duration_seconds` | `kind` | Expired-file and orphan cleanup latency. |
+| `bifrost_forge_orphan_backlog_objects` | — | Objects a complete orphan scan left unreclaimed; a partial scan publishes the work it could not finish. |
+
 ## Code map
 
 The implementation follows the lifecycle described above:
 
 | File | Responsibility |
 | --- | --- |
-| `forge/scheduler.rs` | Tick scheduling, table ordering, stage order, cancellation, and lease release. |
-| `forge/binpack.rs` | Tenant/table/day keys and deterministic rewrite-bin construction. |
+| `forge/scheduler.rs` | Supervised scheduler loop, tick cadence, hint intake, and shutdown. |
+| `forge/planning_scheduler.rs` | Discovery, demand arbitration, and durable task enqueue. |
+| `forge/worker.rs` | Claim, fenced dispatch, settlement, and recovery reconciliation. |
+| `forge/planner.rs` | Candidate selection and rewrite envelope sizing. |
+| `forge/metrics.rs` | The sole Forge metric owner and its closed label schema. |
 | `forge/compact.rs` | Candidate selection, staged-file validation, Iceberg compaction, audit transitions, and reconciliation. |
 | `forge/expire.rs` | Snapshot selection, expiry commit, and expiry recovery. |
 | `forge/orphan_gc.rs` | Live-set construction, candidate selection, final reference checks, deletion, and GC recovery. |

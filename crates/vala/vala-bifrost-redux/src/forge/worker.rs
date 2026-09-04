@@ -5997,6 +5997,7 @@ mod tests {
     }
 
     /// Completion observation retains an event recorded before the waiter starts.
+    #[cfg(feature = "test-support")]
     #[tokio::test]
     async fn completion_observer_preserves_early_completion() {
         let observer = ForgeWorkerCompletionObserver::new();
@@ -6010,6 +6011,7 @@ mod tests {
     }
 
     /// A completion between waiter registration and its counter read wakes the waiter.
+    #[cfg(feature = "test-support")]
     #[tokio::test]
     async fn completion_observer_preserves_registration_race() {
         let observer = ForgeWorkerCompletionObserver::new();

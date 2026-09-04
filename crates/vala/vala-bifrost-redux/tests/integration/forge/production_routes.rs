@@ -409,7 +409,10 @@ fn counter_total(
 async fn forge_metrics_describe_real_data_flow() {
     let telemetry = ForgeTelemetryCheckpoint::install();
     let mut table = expirable_table("telemetry_exits", true).await;
+    // Promotion settles while the fixture starts, and the checkpoint is already
+    // installed, so all five production routes are observable from one capture.
     let routes = [
+        "scribe_promotion",
         "small_files",
         "snapshot_expiry",
         "expired_cleanup",
@@ -468,6 +471,95 @@ async fn forge_metrics_describe_real_data_flow() {
             .any(|result| name.contains(&format!("result=\"{result}\""))),
             "{name} carries an unlisted result"
         );
+    }
+
+    // Every settled route measured the episode it owned, so a missing duration
+    // observation is an attempt counted without the latency it actually took.
+    for task_type in routes {
+        let observed: u64 = snapshot
+            .histograms
+            .iter()
+            .filter(|(name, _)| {
+                name.starts_with("bifrost_forge_task_duration_seconds{")
+                    && name.contains(&format!("task_type=\"{task_type}\""))
+            })
+            .map(|(_, value)| value.count)
+            .sum();
+        assert!(observed > 0, "{task_type} observed no attempt duration");
+    }
+
+    // Physical data flow is reported only by the routes that move files, and
+    // only under the durable strategy that committed the effect.
+    for family in [
+        "bifrost_forge_input_files_total",
+        "bifrost_forge_input_bytes_total",
+        "bifrost_forge_output_files_total",
+        "bifrost_forge_output_bytes_total",
+    ] {
+        for task_type in ["scribe_promotion", "small_files"] {
+            assert!(
+                counter_total(&snapshot, family, &[("task_type", task_type)]) > 0,
+                "{family} reported nothing for {task_type}"
+            );
+        }
+        for name in snapshot
+            .counters
+            .keys()
+            .filter(|name| name.starts_with(&format!("{family}{{")))
+        {
+            assert!(
+                name.contains("task_type=\"scribe_promotion\"")
+                    || name.contains("task_type=\"small_files\""),
+                "{name} claims data flow for a route that rewrites nothing"
+            );
+        }
+    }
+
+    // Expiration counts the individual snapshots it removed, unlabelled because
+    // only one route can remove one.
+    assert!(
+        snapshot
+            .counters
+            .get("bifrost_forge_snapshots_expired_total")
+            .copied()
+            .unwrap_or_default()
+            > 0,
+        "the settled expiration reported no removed snapshot"
+    );
+
+    // Deletions are emitted at the delete boundary itself, so the counter can
+    // never exceed the deletes the real object store was actually asked for,
+    // and only the two cleanup routes delete anything.
+    let deleted = counter_total(&snapshot, "bifrost_forge_deleted_objects_total", &[]);
+    assert!(
+        deleted <= table.store.deletes() as u64,
+        "{deleted} deletions were counted for {} real object-store deletes",
+        table.store.deletes()
+    );
+    for name in snapshot
+        .counters
+        .keys()
+        .filter(|name| name.starts_with("bifrost_forge_deleted_objects_total{"))
+    {
+        assert!(
+            name.contains("task_type=\"expired_cleanup\"")
+                || name.contains("task_type=\"orphan_cleanup\""),
+            "{name} claims a deletion for a route that deletes nothing"
+        );
+    }
+
+    // The active gauge rose while each route owned its claim; the balance
+    // assertion below then proves it came back down.
+    for task_type in routes {
+        let peak = snapshot
+            .gauge_peaks
+            .iter()
+            .filter(|(name, _)| {
+                name.starts_with("bifrost_forge_active_tasks{")
+                    && name.contains(&format!("task_type=\"{task_type}\""))
+            })
+            .fold(0.0_f64, |peak, (_, value)| peak.max(*value));
+        assert!(peak > 0.0, "{task_type} never held an active attempt");
     }
 
     // The guard decrements on every exit, so a settled route that still owns

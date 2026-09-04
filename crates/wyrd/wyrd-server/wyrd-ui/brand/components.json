@@ -502,11 +502,13 @@
         "--danger-text",
         "--border",
         "--surface",
-        "--muted"
+        "--muted",
+        "--text"
       ],
       "props": {
         "series": "Array<{ label: string, points: number[] }>",
         "labels": "string[]?",
+        "unit": "string?",
         "threshold": "{ value: number, label: string }?"
       },
       "variants": [],
@@ -515,13 +517,15 @@
         "axis",
         "threshold",
         "series",
-        "legend"
+        "legend",
+        "readout"
       ],
       "rules": [
         "inline SVG 300x148, multi-series, dashed gridlines",
         "series take no colour prop: stroke, stroke-dasharray and marker shape are chosen by series position from a fixed four-style table, so a serialized view can never name a token",
         "each series MUST carry a distinct dash and marker (solid square, '6 3' circle, '2 3' triangle, '8 2 2 2' diamond) and the legend MUST mirror both as a line sample, not a block swatch. --control-bar and --brand-strong collapse to 1.22:1 under deuteranopia, so hue alone cannot separate two percentiles.",
-        "a threshold is drawn as a labeled dashed rule plus a positional tick on the axis — never an unlabeled red line"
+        "a threshold is drawn as a labeled dashed rule plus a positional tick on the axis — never an unlabeled red line",
+        "the readout is always populated and never hover-gated: it defaults to the most recent point, the plot is focusable and arrow/Home/End step it, and pointer hover only moves which point it reports. A value a reader can only reach with a pointer is not a value the chart shows."
       ]
     },
     "Bars": {

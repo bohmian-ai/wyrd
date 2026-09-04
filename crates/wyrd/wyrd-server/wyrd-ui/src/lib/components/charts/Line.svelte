@@ -9,8 +9,9 @@
   let {
     series,
     labels = [],
+    unit,
     threshold
-  }: { series: Series[]; labels?: string[]; threshold?: Threshold } = $props();
+  }: { series: Series[]; labels?: string[]; unit?: string; threshold?: Threshold } = $props();
 
   const W = 300;
   const H = 148;
@@ -28,6 +29,38 @@
   ] as const;
 
   const grid = [0, 1, 2, 3].map((g) => yTop + ((yBot - yTop) * g) / 3);
+
+  const count = $derived(series[0]?.points.length ?? 0);
+
+  // The point the readout is reporting. Hovering or arrowing moves it; letting go returns
+  // it to the most recent point. It is never null, so the values are on the page for a
+  // keyboard or touch reader too — hover chooses which point, it does not gate the data.
+  let hovered = $state<number | null>(null);
+  const active = $derived(hovered ?? count - 1);
+
+  /** Snap the pointer's x to the nearest plotted index. */
+  function track(event: PointerEvent): void {
+    const box = (event.currentTarget as SVGSVGElement).getBoundingClientRect();
+    if (!box.width || count < 2) return;
+    const ratio = ((event.clientX - box.left) / box.width) * W;
+    const step = (x1 - x0) / (count - 1);
+    hovered = Math.min(count - 1, Math.max(0, Math.round((ratio - x0) / step)));
+  }
+
+  /** Left/right step the readout; home/end jump to the ends of the range. */
+  function step(event: KeyboardEvent): void {
+    const moves: Record<string, number> = { ArrowLeft: -1, ArrowRight: 1 };
+    if (event.key in moves) {
+      hovered = Math.min(count - 1, Math.max(0, active + moves[event.key]));
+    } else if (event.key === 'Home') {
+      hovered = 0;
+    } else if (event.key === 'End') {
+      hovered = count - 1;
+    } else {
+      return;
+    }
+    event.preventDefault();
+  }
 
   const scale = $derived.by(() => {
     const values = series.flatMap((s) => s.points);
@@ -51,6 +84,11 @@
   });
 
   const thresholdY = $derived(threshold ? scale(threshold.value) : 0);
+
+  const activeX = $derived(x0 + ((x1 - x0) / (count - 1 || 1)) * active);
+
+  /** What the readout says: the point's own label, or its position in the range. */
+  const activeLabel = $derived(labels[active] || `point ${active + 1} of ${count}`);
 
   const xlabels = $derived.by(() => {
     const n = series[0]?.points.length ?? 0;
@@ -76,7 +114,23 @@
 </script>
 
 <div class="wy-line">
-  <svg viewBox={`0 0 ${W} ${H}`} role="img" aria-label={`${series.map((s) => s.label).join(', ')} over the selected range`}>
+  <!-- A focusable data region, the same case as Table's scroller: the plot is a picture,
+       but the point the readout reports is a position a reader must be able to move. The
+       lint models only widgets and static images, so it sees no legitimate third case.
+       Values are never hover-gated — the readout is always populated and aria-live, so a
+       reader who never moves the cursor still gets the most recent point. -->
+  <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+  <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+  <svg
+    viewBox={`0 0 ${W} ${H}`}
+    role="group"
+    aria-label={`${series.map((s) => s.label).join(', ')} over the selected range. Use the arrow keys to read each point.`}
+    tabindex="0"
+    onpointermove={track}
+    onpointerleave={() => (hovered = null)}
+    onkeydown={step}
+    onblur={() => (hovered = null)}
+  >
     {#each grid as gy (gy)}
       <line class="grid" x1={x0} y1={gy.toFixed(1)} x2={x1} y2={gy.toFixed(1)} stroke-width="1" stroke-dasharray="3 3" />
     {/each}
@@ -86,6 +140,7 @@
       <line class="tick" x1={x0 - 4} y1={thresholdY.toFixed(1)} x2={x0 + 4} y2={thresholdY.toFixed(1)} stroke-width="3" />
       <text class="thrl" x={x1} y={(thresholdY - 4).toFixed(1)} text-anchor="end">{threshold.label}</text>
     {/if}
+    <line class="cursor" x1={activeX.toFixed(1)} y1={yTop} x2={activeX.toFixed(1)} y2={yBot} stroke-width="2" stroke-dasharray="2 3" />
     {#each plotted as s (s.label)}
       <polyline
         points={s.line}
@@ -97,24 +152,34 @@
         stroke-linecap="round"
       />
       {#each s.pts as p, i (i)}
-        <path class="node" d={marker(s.marker, p.x, p.y)} style={`stroke:${s.color}`} stroke-width="2" />
+        <path
+          class="node"
+          class:read={i === active}
+          d={marker(s.marker, p.x, p.y)}
+          style={`stroke:${s.color}`}
+          stroke-width="2"
+        />
       {/each}
     {/each}
     {#each xlabels as l (l.label)}
       <text class="xl" x={l.x.toFixed(1)} y={yBot + 13} text-anchor={l.anchor}>{l.label}</text>
     {/each}
   </svg>
-  <ul class="legend">
-    {#each plotted as s (s.label)}
-      <li>
-        <svg class="sample" viewBox="0 0 26 10" aria-hidden="true">
-          <line x1="1" y1="5" x2="25" y2="5" style={`stroke:${s.color}`} stroke-dasharray={s.dash || undefined} stroke-width="2.5" />
-          <path class="node" d={marker(s.marker, 13, 5)} style={`stroke:${s.color}`} stroke-width="2" />
-        </svg>
-        <span>{s.label}</span>
-      </li>
-    {/each}
-  </ul>
+  <div class="readout" aria-live="polite">
+    <span class="at">{activeLabel}</span>
+    <ul class="legend">
+      {#each plotted as s (s.label)}
+        <li>
+          <svg class="sample" viewBox="0 0 26 10" aria-hidden="true">
+            <line x1="1" y1="5" x2="25" y2="5" style={`stroke:${s.color}`} stroke-dasharray={s.dash || undefined} stroke-width="2.5" />
+            <path class="node" d={marker(s.marker, 13, 5)} style={`stroke:${s.color}`} stroke-width="2" />
+          </svg>
+          <span class="sl">{s.label}</span>
+          <span class="sv">{s.pts[active] ? series[plotted.indexOf(s)].points[active] : '–'}{#if unit}<span class="su">{unit}</span>{/if}</span>
+        </li>
+      {/each}
+    </ul>
+  </div>
 </div>
 
 <style>
@@ -144,16 +209,52 @@
   .node {
     fill: var(--surface);
   }
+  /* the point the readout is reporting */
+  .node.read {
+    fill: var(--text);
+  }
+  .cursor {
+    stroke: var(--muted);
+    stroke-opacity: 0.55;
+  }
+  .wy-line > svg:focus-visible {
+    outline: 2px solid var(--text);
+    outline-offset: 2px;
+  }
   .xl {
     font-family: var(--fm);
     font-size: 8.5px;
     fill: var(--muted);
   }
+  .readout {
+    margin-top: 8px;
+    font-family: var(--fm);
+  }
+  .at {
+    display: block;
+    font-size: 8.5px;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+  .sl {
+    color: var(--muted);
+  }
+  .sv {
+    font-weight: 700;
+    color: var(--text);
+  }
+  .su {
+    font-weight: 400;
+    color: var(--muted);
+    margin-left: 2px;
+  }
   .legend {
     display: flex;
     flex-wrap: wrap;
     gap: 4px 12px;
-    margin: 8px 0 0;
+    margin: 3px 0 0;
     padding: 0;
     list-style: none;
     font-family: var(--fm);

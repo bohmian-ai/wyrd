@@ -1,4 +1,4 @@
-import { render } from '@testing-library/svelte';
+import { fireEvent, render } from '@testing-library/svelte';
 import { expect, test } from 'vitest';
 import Line from './Line.svelte';
 import ModeProvider from '../ModeProvider.svelte';
@@ -67,4 +67,25 @@ test('light and dark render the same structure and the same non-colour separatio
   expect(draw(light.container.querySelector('.wy-root') as HTMLElement)).toBe(
     draw(dark.container.querySelector('.wy-root') as HTMLElement)
   );
+});
+
+test('the readout is populated without a pointer and reports the most recent point', () => {
+  const { container } = render(Line, { props: { series, labels: ['a', 'b', 'c'], unit: 'ms' } });
+  // Never hover-gated: a keyboard or touch reader gets the latest values on first paint.
+  expect(container.querySelector('.readout .at')?.textContent).toBe('c');
+  expect([...container.querySelectorAll('.readout .sv')].map((v) => v.textContent)).toEqual([
+    '131ms',
+    '388ms',
+    '588ms'
+  ]);
+});
+
+test('arrow keys step the readout and Home jumps to the start of the range', async () => {
+  const { container } = render(Line, { props: { series, labels: ['a', 'b', 'c'] } });
+  const plot = container.querySelector('.wy-line > svg') as SVGSVGElement;
+  await fireEvent.keyDown(plot, { key: 'ArrowLeft' });
+  expect(container.querySelector('.readout .at')?.textContent).toBe('b');
+  await fireEvent.keyDown(plot, { key: 'Home' });
+  expect(container.querySelector('.readout .at')?.textContent).toBe('a');
+  expect(container.querySelector('.readout .sv')?.textContent).toBe('120');
 });

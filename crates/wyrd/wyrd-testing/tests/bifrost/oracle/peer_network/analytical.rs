@@ -653,3 +653,244 @@ async fn peer_planes_are_reachable_from_both_coordinators(
     }
     Ok(())
 }
+
+/// One representative query style per operator family, all on real peers.
+///
+/// # Panics
+///
+/// Panics when a style cannot be driven across the process topology.
+#[tokio::test]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn stage_graph_executes_representative_query_styles() {
+    prove_representative_query_styles()
+        .await
+        .expect("representative query style journey");
+}
+
+/// Drives the four query styles a stage graph must support end to end.
+///
+/// The baseline journey proves one qualified statement in depth. This one
+/// proves breadth: a partitioned scan with a filter and projection, a grouped
+/// aggregation, a left equi-join whose unmatched rows survive, and a sorted
+/// statement bounded by a limit. Each runs on the same live three-Oracle
+/// topology, returns a row count the fixture's own definition fixes, and must
+/// leave every pod exactly as it found it.
+///
+/// # Errors
+///
+/// Returns the first claim that broke, naming the style.
+async fn prove_representative_query_styles() -> Result<(), PeerJourneyError> {
+    let mut cluster = BifrostProcessCluster::start(
+        NODE_BINARY,
+        &[
+            ProcessNodeTarget::Oracle,
+            ProcessNodeTarget::Oracle,
+            ProcessNodeTarget::Oracle,
+            ProcessNodeTarget::Scribe,
+        ],
+    )
+    .await?;
+
+    let suffix = uuid::Uuid::now_v7().simple();
+    let left = format!("styles_left_{suffix}");
+    let right = format!("styles_right_{suffix}");
+    seed(&mut cluster, &left, LEFT_ROWS)?;
+    seed(&mut cluster, &right, RIGHT_ROWS)?;
+    for index in [LEADER, FOLLOWERS[0], FOLLOWERS[1], SCRIBE] {
+        cluster.nodes_mut()[index].refresh_snapshot()?;
+    }
+
+    for style in query_styles(&left, &right) {
+        execute_style(&mut cluster, &style).await?;
+    }
+
+    cluster.shutdown()?;
+    Ok(())
+}
+
+/// One representative statement and everything its result must satisfy.
+struct QueryStyle {
+    /// Operator family this statement stands for.
+    name: &'static str,
+    /// The statement itself, qualified against this journey's fixture tables.
+    sql: String,
+    /// Rows the fixture's definition fixes for this statement.
+    rows: usize,
+    /// Whether the result must be strictly ascending in its first column.
+    ordered: bool,
+    /// Whether every grouped count in the result must be exactly one.
+    unique_counts: bool,
+    /// Whether the statement's sort input must exceed its grant and spill.
+    spills: bool,
+}
+
+/// Builds the four representative statements over one seeded fixture pair.
+///
+/// Every row count here is derived from the fixture generator rather than from
+/// an observation: ids are contiguous and `filter_key` is `id % INGEST_GROUPS`,
+/// so each claim below fails if the engine drops, duplicates, or silently
+/// converts a join.
+fn query_styles(left: &str, right: &str) -> Vec<QueryStyle> {
+    let wide_key = format!(
+        "LPAD(CAST(l.id AS VARCHAR), {digits}, '0') || REPEAT('x', {filler})",
+        digits = crate::support::ANALYTICAL_KEY_DIGITS,
+        filler = crate::support::ANALYTICAL_KEY_FILLER
+    );
+    vec![
+        QueryStyle {
+            name: "partitioned scan, filter, and projection",
+            sql: format!(
+                "SELECT id FROM vala.bifrost.{left} WHERE filter_key = 'group_7' \
+                 AND id < {LEFT_ROWS}"
+            ),
+            // One id per full pass of the group cycle across the whole table.
+            rows: usize::try_from(LEFT_ROWS / INGEST_GROUPS).unwrap_or(usize::MAX),
+            ordered: false,
+            unique_counts: false,
+            spills: false,
+        },
+        QueryStyle {
+            name: "grouped aggregation",
+            sql: format!(
+                "SELECT filter_key, COUNT(*) AS matched FROM vala.bifrost.{left} \
+                 GROUP BY filter_key"
+            ),
+            rows: usize::try_from(INGEST_GROUPS).unwrap_or(usize::MAX),
+            ordered: false,
+            unique_counts: false,
+            spills: false,
+        },
+        QueryStyle {
+            name: "left equi-join",
+            // The left table is wider than the right, so an inner join would
+            // return RIGHT_ROWS here. Only a left join keeps the unmatched ids,
+            // and only a correct one keeps each of them exactly once.
+            sql: format!(
+                "SELECT {wide_key} AS filter_key, COUNT(*) AS matched \
+                 FROM vala.bifrost.{left} AS l \
+                 LEFT JOIN vala.bifrost.{right} AS r ON l.id = r.id \
+                 GROUP BY l.id ORDER BY filter_key"
+            ),
+            rows: usize::try_from(LEFT_ROWS).unwrap_or(usize::MAX),
+            ordered: true,
+            unique_counts: true,
+            spills: true,
+        },
+        QueryStyle {
+            name: "sort with limit",
+            sql: format!(
+                "SELECT {wide_key} AS filter_key, COUNT(*) AS matched \
+                 FROM vala.bifrost.{left} AS l \
+                 GROUP BY l.id ORDER BY filter_key LIMIT {SORT_LIMIT_ROWS}"
+            ),
+            rows: SORT_LIMIT_ROWS,
+            ordered: true,
+            unique_counts: true,
+            spills: false,
+        },
+    ]
+}
+
+/// Rows the bounded sort style keeps out of the whole left table.
+const SORT_LIMIT_ROWS: usize = 5;
+
+/// Runs one style on the leader and asserts its result, exchange, and cleanup.
+///
+/// # Errors
+///
+/// Returns the first claim that broke, naming the style.
+async fn execute_style(
+    cluster: &mut BifrostProcessCluster,
+    style: &QueryStyle,
+) -> Result<(), PeerJourneyError> {
+    let oracles = [0, 1, 2];
+    let mut ownership_before = Vec::new();
+    let mut leases_before = Vec::new();
+    for index in oracles {
+        ownership_before.push(cluster.nodes_mut()[index].ownership_snapshot()?);
+        leases_before.push(cluster.nodes_mut()[index].graph_leases()?.0);
+    }
+    let exchanged_before = cluster.nodes_mut()[LEADER].metric_totals(&EXCHANGE_COUNTERS)?;
+
+    let name = style.name;
+    let evidence = cluster.nodes_mut()[LEADER]
+        .execute_analytical_baseline(&style.sql)
+        .map_err(|error| PeerJourneyError::from(format!("{name} failed: {error}")))?;
+
+    if evidence.rows != style.rows {
+        return Err(format!(
+            "{name} returned {} rows, not the {} its fixture fixes",
+            evidence.rows, style.rows
+        )
+        .into());
+    }
+    if style.unique_counts && !evidence.counts_all_one {
+        return Err(format!("{name} matched a grouped key more than once").into());
+    }
+    if style.ordered && !evidence.keys_strictly_increasing {
+        return Err(format!("{name} returned unordered keys").into());
+    }
+
+    // Only a statement with an output sort carries physical evidence, and only
+    // one whose sort input exceeds its grant may spill. A style that claims
+    // either and produced neither is the failure.
+    match (&evidence.physical, style.ordered) {
+        (Some(physical), true) => {
+            if style.spills && (physical.spill_count == 0 || physical.spilled_rows == 0) {
+                return Err(format!(
+                    "{name} reported no spill: {} spills, {} rows",
+                    physical.spill_count, physical.spilled_rows
+                )
+                .into());
+            }
+        }
+        (None, true) => {
+            return Err(format!("{name} recorded no output-sort evidence").into());
+        }
+        (evidence, false) => {
+            if let Some(evidence) = evidence {
+                return Err(format!("{name} sorts nothing yet recorded {evidence:?}").into());
+            }
+        }
+    }
+
+    // Every style is a distributed graph, not a leader-local rewrite: a stage
+    // that never crossed a peer socket would return the same rows and move no
+    // exchange counter at all.
+    let exchanged = cluster.nodes_mut()[LEADER].metric_totals(&EXCHANGE_COUNTERS)?;
+    for family in EXCHANGE_COUNTERS {
+        let before = exchanged_before.get(family).copied().unwrap_or_default();
+        let after = exchanged.get(family).copied().unwrap_or_default();
+        if after <= before {
+            return Err(format!("{name} recorded no {family}: {before} then {after}").into());
+        }
+    }
+    // How many followers a style reaches is the planner's decision — a single
+    // scan stage may fit one task — so the claim is that real remote work
+    // happened, not that every peer received some.
+    let mut activated_followers = 0;
+    for index in FOLLOWERS {
+        if cluster.nodes_mut()[index].graph_leases()?.0 > leases_before[index] {
+            activated_followers += 1;
+        }
+    }
+    if activated_followers == 0 {
+        return Err(format!("{name} activated no graph on any follower").into());
+    }
+
+    for index in oracles {
+        let (_, live) = await_released_lease(cluster, index).await?;
+        if live != 0 {
+            return Err(format!("{name} left {live} graph leases on Oracle {index}").into());
+        }
+        let ownership = cluster.nodes_mut()[index].ownership_snapshot()?;
+        if ownership != ownership_before[index] {
+            return Err(format!(
+                "{name} left Oracle {index} at {ownership:?}, not its {:?} baseline",
+                ownership_before[index]
+            )
+            .into());
+        }
+    }
+    Ok(())
+}

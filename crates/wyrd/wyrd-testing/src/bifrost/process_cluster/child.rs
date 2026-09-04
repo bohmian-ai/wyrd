@@ -882,6 +882,13 @@ impl ChildConfig {
         let scratch_root = engine.analytical_spill_root().to_path_buf();
         let scratch_before = scratch_usage(&scratch_root)?;
 
+        let supervisor = engine
+            .analytical_execution()
+            .ok_or_else(|| child("this target composes no Analytical handle".to_owned()))?
+            .supervisor()
+            .clone();
+        let settled_before = supervisor.settled_graph_count();
+
         let mut fold = ResultFold::default();
         let rows = drive_inactive_sql(
             Arc::clone(&engine),
@@ -892,27 +899,20 @@ impl ChildConfig {
         .await
         .map_err(|error| child(format!("baseline statement failed: {error}")))?;
 
-        let supervisor = engine
-            .analytical_execution()
-            .ok_or_else(|| child("this target composes no Analytical handle".to_owned()))?
-            .supervisor()
-            .clone();
         // The terminal frame reaches this caller before the graph's own
         // lifecycle settles, and the physical evidence is folded inside that
         // settlement, so the statement returning is not yet proof the evidence
-        // exists. Waiting for it here — rather than asserting on whatever the
-        // race left behind — is what makes the journey's physical claims
-        // deterministic.
+        // exists. The wait is on the settlement counter rather than on the
+        // evidence itself, because a plan with no output sort settles carrying
+        // none — waiting for evidence would stall every such statement for the
+        // whole bound and then report its predecessor's numbers.
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-        let physical = loop {
-            if let Some(evidence) = supervisor.settled_physical_evidence() {
-                break Some(evidence);
-            }
-            if tokio::time::Instant::now() >= deadline {
-                break None;
-            }
+        while supervisor.settled_graph_count() == settled_before
+            && tokio::time::Instant::now() < deadline
+        {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        };
+        }
+        let physical = supervisor.settled_physical_evidence();
         let scratch_after = scratch_usage(&scratch_root)?;
         Ok(super::AnalyticalBaselineEvidence {
             rows,
@@ -970,6 +970,12 @@ impl ResultFold {
         self.batch_memory_bytes = self
             .batch_memory_bytes
             .saturating_add(batch.get_array_memory_size() as u64);
+        // Column access is by position, so the arity check has to come first:
+        // a projection with a single column is a shape this fold accepts and
+        // ignores, not one it may index past.
+        if batch.num_columns() < 2 {
+            return;
+        }
         let (Some(keys), Some(counts)) = (
             batch
                 .column(0)

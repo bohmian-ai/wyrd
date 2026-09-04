@@ -397,6 +397,14 @@ pub struct AnalyticalSupervisor {
     /// query produced, which no counter family can attribute.
     #[cfg(feature = "test-support")]
     physical_evidence: Mutex<Option<super::analytical::AnalyticalPhysicalEvidence>>,
+    /// Graphs whose metric fold has settled on this node.
+    ///
+    /// Test-tier only, and the reason [`Self::physical_evidence`] is readable
+    /// at all: evidence is absent for a plan with no output sort, so its
+    /// presence cannot tell a caller whether the graph it just ran has
+    /// settled. This counter can, and it advances for every settled graph.
+    #[cfg(feature = "test-support")]
+    settled_graphs: std::sync::atomic::AtomicU64,
 }
 
 impl fmt::Debug for AnalyticalSupervisor {
@@ -422,6 +430,8 @@ impl AnalyticalSupervisor {
             accepting: AtomicBool::new(true),
             #[cfg(feature = "test-support")]
             physical_evidence: Mutex::new(None),
+            #[cfg(feature = "test-support")]
+            settled_graphs: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -752,21 +762,37 @@ impl AnalyticalSupervisor {
         graphs.get_mut(&graph)?.state_mut().metric_fold.take()
     }
 
-    /// Retains the most recently settled graph's output-sort evidence.
+    /// Records one settled graph and whatever output-sort evidence it carried.
     ///
     /// Test-tier only: production publishes the same evidence as counters from
     /// [`super::telemetry::record_output_sort_spill`]. A journey needs the exact
     /// per-operator values its own query produced, and a counter family cannot
     /// answer "which sort" — so the settled evidence is kept verbatim for the
     /// process-cluster control protocol to project.
+    ///
+    /// `evidence` is `None` for a plan with no uniquely identifiable output
+    /// sort. That case still advances [`Self::settled_graph_count`] and clears
+    /// the retained evidence, so a caller polling for its own statement's
+    /// settlement neither waits forever nor reads the previous statement's
+    /// numbers.
     #[cfg(feature = "test-support")]
-    pub(super) fn record_physical_evidence(
+    pub(super) fn record_settlement(
         &self,
-        evidence: super::analytical::AnalyticalPhysicalEvidence,
+        evidence: Option<super::analytical::AnalyticalPhysicalEvidence>,
     ) {
         if let Ok(mut retained) = self.physical_evidence.lock() {
-            *retained = Some(evidence);
+            *retained = evidence;
         }
+        self.settled_graphs
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// Reports how many graphs have settled their metric fold on this node.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn settled_graph_count(&self) -> u64 {
+        self.settled_graphs
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Reports the most recently settled graph's output-sort evidence.

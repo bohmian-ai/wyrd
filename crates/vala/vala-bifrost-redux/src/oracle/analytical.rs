@@ -2889,15 +2889,18 @@ impl AnalyticalGraphLifecycle {
             return Err(METRIC_FOLD_EXPIRED.to_owned());
         };
         let evidence = folded.map_err(|error| format!("{METRIC_FOLD_REFUSED}: {error}"))?;
-        if let Some(evidence) = evidence {
+        if let Some(evidence) = &evidence {
             super::telemetry::record_output_sort_spill(
                 evidence.spill_count,
                 evidence.spilled_bytes,
                 evidence.spilled_rows,
             );
-            #[cfg(feature = "test-support")]
-            self.supervisor.record_physical_evidence(evidence);
         }
+        // Recorded whether or not the plan carried an output sort: a settled
+        // graph is the fact a test-tier caller waits on, and a plan without a
+        // sort settles just as completely as one with it.
+        #[cfg(feature = "test-support")]
+        self.supervisor.record_settlement(evidence);
         Ok(())
     }
 

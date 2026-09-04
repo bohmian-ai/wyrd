@@ -62,7 +62,15 @@ const STDERR_TAIL_LINES: usize = 512;
 const READY_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// How long the parent waits for a child to answer one control request.
-const CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
+///
+/// Derived from the child's own budget instead of picked: a request that runs a
+/// statement may legitimately spend that statement's whole deadline and then the
+/// settlement wait that follows it, so a fixed thirty seconds declared a live
+/// child unresponsive whenever a heavy join ran near its deadline. The margin
+/// covers process scheduling, IPC, and result decoding on a loaded machine.
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(
+    child::STATEMENT_DEADLINE.as_secs() + child::SETTLEMENT_WAIT.as_secs() + 30,
+);
 
 /// How long the parent waits for a child to exit after `Shutdown`.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);

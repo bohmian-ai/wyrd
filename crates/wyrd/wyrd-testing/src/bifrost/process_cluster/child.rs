@@ -64,6 +64,22 @@ const fn pod_system_resources(
 /// How long a child waits for its own readiness before reporting failure.
 const READY_DEADLINE: Duration = Duration::from_secs(60);
 
+/// Request deadline every statement a control request executes carries.
+///
+/// Named rather than inlined because the parent's `CONTROL_TIMEOUT` is derived
+/// from it: the parent must outwait the whole budget one request may legitimately
+/// spend, or a slow-but-live statement reads as an unresponsive child.
+pub(super) const STATEMENT_DEADLINE_MS: u64 = 30_000;
+
+/// [`STATEMENT_DEADLINE_MS`] as the duration the parent's budget is built from.
+pub(super) const STATEMENT_DEADLINE: Duration = Duration::from_millis(STATEMENT_DEADLINE_MS);
+
+/// How long a child waits for an executed statement's graph to settle.
+///
+/// Spent after the statement's own deadline, so one control request can take
+/// this long on top of [`STATEMENT_DEADLINE`].
+pub(super) const SETTLEMENT_WAIT: Duration = Duration::from_secs(30);
+
 /// Interval between readiness observations.
 const READY_POLL: Duration = Duration::from_millis(100);
 
@@ -933,7 +949,7 @@ impl ChildConfig {
         // evidence itself, because a plan with no output sort settles carrying
         // none — waiting for evidence would stall every such statement for the
         // whole bound and then report its predecessor's numbers.
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        let deadline = tokio::time::Instant::now() + SETTLEMENT_WAIT;
         while supervisor.settled_graph_count() == settled_before
             && tokio::time::Instant::now() < deadline
         {
@@ -1197,7 +1213,7 @@ async fn drive_inactive_sql(
                     sql: sql.to_owned(),
                     visibility: wyrd_spec::vala::api::VisibilityMode::PublishedOnly,
                     freshness: wyrd_spec::vala::api::FreshnessPolicy::Strict,
-                    deadline_ms: Some(30_000),
+                    deadline_ms: Some(STATEMENT_DEADLINE_MS),
                 },
                 attempt,
             )

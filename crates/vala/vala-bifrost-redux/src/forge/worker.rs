@@ -595,6 +595,16 @@ impl ForgeWorkerCompletionObserver {
         self.fail_next_lease_release.store(true, Ordering::Release);
     }
 
+    /// Reports whether the one-shot lease-release failure is still armed.
+    ///
+    /// A test that injects this failure into a path that already failed for
+    /// another reason cannot tell from the returned error whether the release
+    /// site was reached at all. Reading the disarmed flag proves it was.
+    #[must_use]
+    pub fn lease_release_failure_armed(&self) -> bool {
+        self.fail_next_lease_release.load(Ordering::Acquire)
+    }
+
     /// Consume the armed one-shot lease-release failure, if any.
     #[must_use]
     fn take_lease_release_failure(&self) -> bool {

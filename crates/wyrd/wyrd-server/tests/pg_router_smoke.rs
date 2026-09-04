@@ -1873,6 +1873,165 @@ async fn coordinator_audit_append_failure_clears_readiness() {
     server.shutdown().await.expect("test server shuts down");
 }
 
+/// Publication evidence naming a snapshot the table never retained.
+///
+/// Reconciliation validates prepared evidence against the live table before it
+/// resumes any effect, so an unretained snapshot id is the smallest fixture
+/// that reaches that refusal with otherwise well-formed evidence.
+#[cfg(feature = "test-support")]
+const UNRETAINED_EVIDENCE: &str = r#"{"version":1,"committed_snapshot_id":999999,"committed_metadata_location":"metadata/v9.json","committed_metadata_digest":"digest","cleanup_candidates":[],"deleted_candidate_count":0}"#;
+
+/// Moves one seeded task into a lapsed Prepared attempt awaiting reconciliation.
+///
+/// A Prepared row with an expired claim is exactly the residue a crashed owner
+/// leaves behind, and it is what `claim_prepared_for_reconciliation` takes over.
+/// `evidence` is the durable publication evidence the successor must validate.
+///
+/// # Panics
+///
+/// Panics when the update does not reach the seeded row.
+#[cfg(feature = "test-support")]
+async fn prepare_lapsed_attempt(pool: &sqlx::PgPool, task_id: uuid::Uuid, evidence: &str) {
+    sqlx::query(
+        "UPDATE vala.forge_tasks SET state='prepared',attempt_id=gen_random_uuid(),\
+         claimed_by=gen_random_uuid(),claim_expires_at=statement_timestamp()-interval '1 hour',\
+         watermark_snapshot_id=4242,watermark_timestamp_ms=0,\
+         evidence=$2::jsonb,updated_at=statement_timestamp() WHERE task_id=$1",
+    )
+    .bind(task_id)
+    .bind(evidence)
+    .execute(pool)
+    .await
+    .expect("the seeded task becomes a lapsed Prepared attempt");
+}
+
+/// Boots a worker over one lapsed Prepared attempt whose evidence cannot validate.
+///
+/// Returns the worker's error and its readiness handle so each caller asserts
+/// the precedence it owns.
+///
+/// # Panics
+///
+/// Panics when the worker does not return within the readiness ceiling, or
+/// exits clean over unreconciled durable evidence.
+#[cfg(feature = "test-support")]
+async fn run_worker_over_invalid_prepared_evidence(
+    server: &WyrdTestServer,
+    observer: &vala_bifrost_redux::forge::ForgeWorkerCompletionObserver,
+    table: &str,
+    arm_release_failure: bool,
+) -> (String, uuid::Uuid, sqlx::PgPool) {
+    register_forge_table(server, table).await;
+    let pool = server
+        .pg_fixture()
+        .superuser_pool()
+        .await
+        .expect("superuser pool");
+    let task_id = seed_ready_forge_task(
+        &pool,
+        uuid::Uuid::from(server.data_tenant_id()),
+        table,
+        "small_files",
+        true,
+        LIVE_REWRITE_PLAN,
+    )
+    .await;
+    prepare_lapsed_attempt(&pool, task_id, UNRETAINED_EVIDENCE).await;
+    if arm_release_failure {
+        observer.fail_next_lease_release();
+    }
+    let stop = tokio_util::sync::CancellationToken::new();
+    let worker = wyrd_server::boot::spawn_forge_worker(server.state(), stop.clone(), 1, 1)
+        .expect("the worker composes");
+    let error = tokio::time::timeout(FORGE_READINESS_CEILING, worker)
+        .await
+        .expect("recovery refuses the invalid evidence within the readiness ceiling")
+        .expect_err("a worker does not exit clean over unreconciled prepared evidence");
+    stop.cancel();
+    (format!("{error}"), task_id, pool)
+}
+
+/// Recovery refuses a Prepared attempt whose evidence no longer validates, and
+/// never advertises readiness over it.
+///
+/// # Panics
+///
+/// Panics when the refusal is not the validation refusal, readiness is
+/// published, or the attempt is settled instead of retained.
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prepared_evidence_validation_failure_never_publishes_ready() {
+    let (server, observer) = server_with_forge_observer().await;
+    let readiness = server
+        .state()
+        .forge()
+        .expect("the default target selects Forge")
+        .worker_readiness();
+    let (error, task_id, pool) =
+        run_worker_over_invalid_prepared_evidence(&server, &observer, "prepared_validation", false)
+            .await;
+    assert!(
+        error.contains("Prepared evidence snapshot is no longer retained"),
+        "recovery returned an unrelated error: {error}"
+    );
+    assert!(
+        !readiness.is_ready(),
+        "a worker advertised ready over unreconciled prepared evidence"
+    );
+    let state: String = sqlx::query_scalar("SELECT state FROM vala.forge_tasks WHERE task_id=$1")
+        .bind(task_id)
+        .fetch_one(&pool)
+        .await
+        .expect("the retained attempt is readable");
+    assert_eq!(
+        state, "prepared",
+        "invalid evidence was settled instead of retained for a later owner"
+    );
+    server.shutdown().await.expect("test server shuts down");
+}
+
+/// A reconciliation failure stays the reported error when its table-lease
+/// release fails too.
+///
+/// Both failures are fatal, but they are not equally diagnostic: the release
+/// failure is downstream of a reconciliation that already refused to proceed,
+/// so surfacing the release error would name the wrong cause.
+///
+/// # Panics
+///
+/// Panics when the release failure displaces the reconciliation error or
+/// readiness survives the pair.
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reconciliation_failure_outranks_its_release_failure() {
+    let (server, observer) = server_with_forge_observer().await;
+    let readiness = server
+        .state()
+        .forge()
+        .expect("the default target selects Forge")
+        .worker_readiness();
+    let (error, _, _) =
+        run_worker_over_invalid_prepared_evidence(&server, &observer, "prepared_release", true)
+            .await;
+    assert!(
+        error.contains("Prepared evidence snapshot is no longer retained"),
+        "the release failure displaced the reconciliation error: {error}"
+    );
+    assert!(
+        !error.contains("injected Forge lease release failure"),
+        "the secondary release failure was reported as the cause: {error}"
+    );
+    assert!(
+        !observer.lease_release_failure_armed(),
+        "the release site was never reached, so nothing outranked anything"
+    );
+    assert!(
+        !readiness.is_ready(),
+        "a worker advertised ready after a fatal reconciliation and release pair"
+    );
+    server.shutdown().await.expect("test server shuts down");
+}
+
 /// A worker whose cancelled-claim release fails reports that failure, clears
 /// readiness, and retains the claim for durable recovery.
 ///

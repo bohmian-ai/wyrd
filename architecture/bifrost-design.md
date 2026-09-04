@@ -565,11 +565,22 @@ No cleanup infers safety from age or path shape alone.
 
 ## Telemetry
 
-Scribe, Oracle, and Forge each own a closed lifecycle telemetry registry used by
-production behavior, verification, and operator documentation. Required
-observations cover admission, queue age, active ownership, WAL fsync, staging,
-merge, object IO, catalog calls, spill, retries, lease and fence decisions,
-reconciliation, cleanup, cancellation, and terminal settlement.
+Scribe, Oracle, and Forge each own one closed telemetry registry used by
+production behavior, verification, and operator documentation. Four surfaces
+carry Bifrost's observability, and each fact belongs to exactly one of them.
+
+The public Prometheus catalog answers what an operator must be able to graph
+and alert on without reading code: demand, queue depth and age, active
+ownership, durable results, latency, failure class, physical data flow, and
+outstanding maintenance debt. It is deliberately small and closed; a subsystem
+does not add a family because a value exists.
+
+Protocol mechanics — lease and fence decisions, catalog calls, reconciliation,
+cursor movement, scheduler passes, and resource envelopes — belong to
+structured traces, where the identities that make them useful are legal.
+Durable audit and task rows remain the authority for what actually happened,
+and no metric is evidence of a durable fact. Unresolved authority or
+in-progress recovery is a readiness signal, not a metric.
 
 Every active gauge decrements on success, refusal, retry, uncertainty,
 cancellation, and failure. Metric labels use only closed, bounded dimensions

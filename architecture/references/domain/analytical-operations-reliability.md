@@ -100,9 +100,14 @@ Measure at minimum:
   `file_list` publication, reconciliation, and live-tail source counts;
 - Oracle route, slot wait, planning, pruning, exchange bytes, worker fan-out,
   peer retry, cancellation, TTFF, terminal latency, and incomplete streams;
-- Forge promotion debt, rewrite debt, task/lease age, writer estimates and close
-  reasons, commit conflicts, uncertain operations, no-progress refusals,
-  snapshot age, cleanup cursor, and orphan backlog;
+- Forge promotion debt, rewrite debt, task queue age, attempts, failure class,
+  accepted-delete rate, writer estimates and close reasons, commit conflicts,
+  uncertain operations, no-progress refusals, snapshot age, role readiness, and
+  the durable cleanup cursor. Orphan cleanup is measured this way — by its own
+  queue age, attempts, failures, and physically deleted objects — and not by an
+  orphan-backlog gauge: that number is only knowable by a full storage scan
+  that is stale on completion, is not comparable between partial scans, and is
+  not safely aggregatable across replicas;
 - catalog refresh age and object-store latency/error/throughput.
 
 Metrics use stable bounded labels. Tenant, table, batch, task, attempt, path,

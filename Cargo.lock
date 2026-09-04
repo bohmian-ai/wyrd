@@ -11064,6 +11064,7 @@ dependencies = [
 name = "wyrd-mcp"
 version = "0.0.1"
 dependencies = [
+ "chrono",
  "futures-util",
  "http 1.5.0",
  "reqwest 0.13.4",
@@ -11072,6 +11073,7 @@ dependencies = [
  "serde_json",
  "sse-stream",
  "tokio",
+ "uuid",
  "wyrd-client",
  "wyrd-runtime",
  "wyrd-server",

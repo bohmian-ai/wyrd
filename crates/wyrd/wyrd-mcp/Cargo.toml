@@ -42,3 +42,5 @@ wyrd-runtime = { workspace = true }
 tokio = { workspace = true }
 serde_json = { workspace = true }
 secrecy = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }

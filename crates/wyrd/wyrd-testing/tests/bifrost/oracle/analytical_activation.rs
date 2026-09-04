@@ -1183,6 +1183,9 @@ async fn prove_selected_failure_is_terminal() -> Result<(), JourneyError> {
     let paused = PEER_FOLLOWERS[0];
     let survivor = PEER_FOLLOWERS[1];
     let attempts_before = attempt_totals(&mut cluster)?;
+    let builds_before = cluster.nodes_mut()[COORDINATOR]
+        .physical_build_evidence()?
+        .total;
     cluster.nodes_mut()[paused].arm_execute_pause()?;
     let client = public_client(&cluster.nodes()[COORDINATOR], &api_key)?;
     let query = {
@@ -1201,6 +1204,27 @@ async fn prove_selected_failure_is_terminal() -> Result<(), JourneyError> {
         })
     };
     cluster.nodes_mut()[paused].await_execute_paused()?;
+
+    // Read while the query is still held at the follower: the cut the leader's
+    // active entry retains is the one its single build ran against, so the
+    // terminal failure below cannot be reporting a rebuilt or repinned
+    // membership.
+    let held = cluster.nodes_mut()[COORDINATOR].physical_build_evidence()?;
+    let [active_cut] = held.active_cut_fingerprints.as_slice() else {
+        return Err(format!(
+            "the paused query must be the coordinator's sole active query, saw {:?}",
+            held.active_cut_fingerprints
+        )
+        .into());
+    };
+    if *active_cut != held.latest_cut_fingerprint {
+        return Err(format!(
+            "the active query retains cut {active_cut}, built against {}",
+            held.latest_cut_fingerprint
+        )
+        .into());
+    }
+
     cluster.nodes_mut()[paused].kill()?;
 
     let failure = match query.await? {
@@ -1213,6 +1237,19 @@ async fn prove_selected_failure_is_terminal() -> Result<(), JourneyError> {
     };
     if is_transport(&failure) || !failure.code().starts_with("WYRD_") {
         return Err(format!("the lost peer surfaced {failure} as {}", failure.code()).into());
+    }
+
+    // One build for the whole attempt: the lost peer produced no successor
+    // ordinal, so the coordinator never re-entered the shared physical builder.
+    let builds = cluster.nodes_mut()[COORDINATOR]
+        .physical_build_evidence()?
+        .total;
+    if builds != builds_before + 1 {
+        return Err(format!(
+            "the lost peer entered the physical builder {} times, expected exactly one",
+            builds - builds_before
+        )
+        .into());
     }
 
     // One attempt, terminally failed. A repin, a replan, or any local

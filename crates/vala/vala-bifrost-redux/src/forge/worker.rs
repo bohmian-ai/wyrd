@@ -1103,8 +1103,8 @@ struct ClaimExecutionOutcome<'task> {
     task_span: tracing::Span,
     /// Complete execution duration.
     elapsed: Duration,
-    /// Fenced execution result.
-    result: Result<(), ForgeError>,
+    /// Fenced execution result: whether the requested effect settled.
+    result: Result<bool, ForgeError>,
 }
 
 /// Classifies whether prepared evidence represents progress beyond its base.
@@ -1211,9 +1211,16 @@ impl ForgeWorker {
             "Forge worker started"
         );
         let mut slots = JoinSet::new();
+        // One child token shared by every slot. A slot that can no longer prove
+        // what it did to durable state must not let its siblings take another
+        // claim under the same owner, so the first failing slot cancels this
+        // token and the rest stop at their next pre-SQL checkpoint. It is a
+        // child of the process token so an ordinary shutdown still reaches all
+        // of them.
+        let slot_stop = shutdown.child_token();
         for index in 0..self.config.worker_concurrency {
             let worker = self.clone();
-            let stop = shutdown.clone();
+            let stop = slot_stop.clone();
             // Slot zero is the reserved maintenance slot: it always attempts a
             // maintenance-strategy claim before falling back to any strategy, so
             // a ready maintenance task can never be starved by a compaction
@@ -1222,10 +1229,27 @@ impl ForgeWorker {
             let reserved_maintenance = index == 0;
             slots.spawn(async move { Box::pin(worker.run_slot(stop, reserved_maintenance)).await });
         }
-        while let Some(result) = slots.join_next().await {
-            result.map_err(|error| ForgeError::Invariant {
-                detail: format!("Forge worker slot panicked: {error}"),
-            })??;
+        // The first error is the one that describes why this worker stopped;
+        // later errors are usually its siblings observing the same cancellation.
+        let mut first_error = None;
+        // Draining the whole set is deliberate: a sibling still holds a lease
+        // and a claim, and joining it is what proves it released them.
+        while let Some(joined) = slots.join_next().await {
+            let outcome = joined.unwrap_or_else(|error| {
+                Err(ForgeError::Invariant {
+                    detail: format!("Forge worker slot panicked: {error}"),
+                })
+            });
+            if let Err(error) = outcome
+                && first_error.is_none()
+            {
+                slot_stop.cancel();
+                first_error = Some(error);
+            }
+        }
+        if let Some(error) = first_error {
+            tracing::error!(worker = %self.owner, error = %error, "Forge worker stopped after a slot could not settle its work");
+            return Err(error);
         }
         // Pairs with the start event so an operator can tell a worker that
         // drained cleanly from one that vanished.
@@ -1304,10 +1328,12 @@ impl ForgeWorker {
     ///
     /// # Errors
     ///
-    /// Returns only configuration errors that make further claims unsafe.
-    /// Individual task failures remain durable and are logged for takeover; a
-    /// shutdown-release database failure is likewise logged and the claim is
-    /// retained for lease-expiry recovery rather than failing the slot.
+    /// Returns only failures that make a further claim by this owner unsafe:
+    /// configuration, durable settlement, audit, SQL, reconciliation, claim, and
+    /// cancellation-release failures. Each leaves durable state that no longer
+    /// describes what this owner did, so the slot stops rather than claiming
+    /// again. An execution failure this attempt durably settled is not one of
+    /// them: it stays a healthy exit that permits the next claim.
     ///
     /// When `reserved_maintenance` is set this slot attempts a maintenance-only
     /// claim before any unfiltered claim on every iteration, reserving its
@@ -1324,8 +1350,16 @@ impl ForgeWorker {
             }
             self.reclaim_expired_attempts(claim_limits.max_active_per_tenant)
                 .await?;
+            // Checked immediately before each durable claim so a sibling slot's
+            // failure stops this one before it takes new work.
+            if shutdown.is_cancelled() {
+                return Ok(());
+            }
             if self.reconcile_one_prepared(claim_limits, &shutdown).await? {
                 continue;
+            }
+            if shutdown.is_cancelled() {
+                return Ok(());
             }
             let claim = self
                 .claim_next(claim_limits, reserved_maintenance)
@@ -1357,7 +1391,10 @@ impl ForgeWorker {
                 if let Some(attempt) = claim.attempt_id
                     && let Err(error) = self.release_cancelled_claim(task_id, attempt).await
                 {
-                    tracing::warn!(worker = %self.owner, task_id = %task_id, error = %error, "Forge claim shutdown release failed; durable state retained for lease recovery");
+                    tracing::error!(worker = %self.owner, task_id = %task_id, error = %error, "Forge claim shutdown release failed; durable state retained for lease recovery");
+                    // The claim is still held by this owner in durable state, so
+                    // this worker cannot honestly report that it drained.
+                    return Err(error);
                 }
                 return Ok(());
             }
@@ -1392,11 +1429,15 @@ impl ForgeWorker {
                 elapsed_ms = started.elapsed().as_millis(),
                 "Forge task settled"
             );
-            self.record_attempt(result.as_ref().err());
             #[cfg(feature = "test-support")]
             self.pause_after_attempt_for_test().await;
-            if result.is_ok() {
-                self.record_completion(task_id, strategy);
+            match result {
+                // Only a settled effect is a completion; a superseded envelope,
+                // a terminalized payload, and a settled execution failure are
+                // all healthy exits that permit the next claim.
+                Ok(true) => self.record_completion(task_id, strategy),
+                Ok(false) => {}
+                Err(error) => return Err(error),
             }
         }
     }
@@ -1446,7 +1487,11 @@ impl ForgeWorker {
         match result {
             Ok(()) => self.record_completion(task_id, strategy),
             Err(error) => {
-                tracing::warn!(worker = %self.owner, error = %error, "Prepared Forge task reconciliation stopped; exact evidence retained");
+                tracing::error!(worker = %self.owner, error = %error, "Prepared Forge task reconciliation stopped; exact evidence retained");
+                // A Prepared attempt already produced durable evidence a reader
+                // can observe. Continuing past an unresolved one would let this
+                // owner start another effect over unreconciled state.
+                return Err(error);
             }
         }
         Ok(true)
@@ -1750,7 +1795,7 @@ impl ForgeWorker {
         if let Err(error) = lease.release(&self.forge.core.operator_pool).await {
             tracing::warn!(task_id = %claim.task_id, error = %error, "Forge expiry test lease release failed");
         }
-        result
+        result.map(|_| ())
     }
 
     /// Invokes the pre-effect shutdown release directly for one planted claim.
@@ -1850,7 +1895,7 @@ impl ForgeWorker {
         claim: ForgeTaskClaim,
         shutdown: &CancellationToken,
     ) -> Result<(), ForgeError> {
-        self.execute_claim(claim, shutdown).await
+        self.execute_claim(claim, shutdown).await.map(|_| ())
     }
 
     /// Executes one exact claimed task through validation, table fencing,
@@ -1860,16 +1905,52 @@ impl ForgeWorker {
     /// load, lease acquisition, or object IO. Supported tasks acquire the table
     /// lease before any catalog or object-store effect.
     ///
+    /// Returns whether the requested strategy effect settled successfully. A
+    /// superseded legacy envelope, a terminalized malformed payload, a
+    /// superseded base snapshot, and an execution failure this attempt durably
+    /// settled all return `Ok(false)`: nothing a reader can observe was
+    /// produced, but this owner may take another claim. The durable task row
+    /// remains the authority for what happened; the boolean is private control
+    /// flow, not a second state taxonomy.
+    ///
     /// # Errors
     ///
-    /// Returns validation, SQL, catalog, object-store, rewrite, fencing,
-    /// cancellation, evidence, or audit errors. Uncertain external outcomes
-    /// remain nonterminal for lease-based recovery.
+    /// Returns only failures that make a further claim by this owner unsafe:
+    /// durable settlement, audit, SQL, claim, reconciliation, and table-lease
+    /// release failures. An execution failure whose settlement and lease
+    /// release both commit is reported as `Ok(false)` instead, and its error is
+    /// still observed once by the attempt seam.
     pub async fn execute_claim(
         &self,
         claim: ForgeTaskClaim,
         shutdown: &CancellationToken,
-    ) -> Result<(), ForgeError> {
+    ) -> Result<bool, ForgeError> {
+        // Exactly one passive observation per attempt. An execution failure the
+        // attempt durably settled is reported here even though the attempt
+        // itself returns a healthy boolean, so the failure stays observable
+        // without turning a settled outcome into a slot-fatal error.
+        let mut settled_failure = None;
+        let outcome = self
+            .execute_claim_attempt(claim, shutdown, &mut settled_failure)
+            .await;
+        self.record_attempt(settled_failure.as_ref().or(outcome.as_ref().err()));
+        outcome
+    }
+
+    /// Runs one claimed attempt, reporting a durably settled execution failure.
+    ///
+    /// `settled_failure` receives the execution error whenever this attempt
+    /// settled it durably and therefore returns a healthy boolean.
+    ///
+    /// # Errors
+    ///
+    /// Returns every failure [`Self::execute_claim`] documents.
+    async fn execute_claim_attempt(
+        &self,
+        claim: ForgeTaskClaim,
+        shutdown: &CancellationToken,
+        settled_failure: &mut Option<ForgeError>,
+    ) -> Result<bool, ForgeError> {
         let task = &claim;
         if claim.execution_tenant_id != task.data_tenant_id {
             return Err(ForgeError::Invariant {
@@ -1890,7 +1971,9 @@ impl ForgeWorker {
                 .core
                 .telemetry
                 .record_legacy_supersession(result.is_ok());
-            return result;
+            // Superseding a legacy envelope settles the row without running the
+            // requested effect, so it never counts as a successful completion.
+            return result.map(|()| false);
         }
         let binding = task_table_binding(
             task.data_tenant_id,
@@ -1902,7 +1985,9 @@ impl ForgeWorker {
             Err(error) => {
                 self.fail_before_effect(task, attempt, error.to_string())
                     .await?;
-                return Ok(());
+                // Terminalizing a malformed payload is a healthy worker outcome
+                // that produced no effect.
+                return Ok(false);
             }
         };
         let lease_key = forge_lease_key(
@@ -1951,28 +2036,38 @@ impl ForgeWorker {
         )
         .await;
         let elapsed = started.elapsed();
-        self.settle_claim_execution(ClaimExecutionOutcome {
-            task,
-            attempt,
-            stage,
-            lease,
-            task_span,
-            elapsed,
-            result,
-        })
+        self.settle_claim_execution(
+            ClaimExecutionOutcome {
+                task,
+                attempt,
+                stage,
+                lease,
+                task_span,
+                elapsed,
+                result,
+            },
+            settled_failure,
+        )
         .await
     }
 
     /// Settles failure, records telemetry, and releases one task's table lease.
     ///
+    /// Returns whether the requested effect settled. An execution failure whose
+    /// durable settlement and lease release both commit is a healthy outcome
+    /// reported through `settled_failure` rather than through the return value.
+    ///
     /// # Errors
     ///
-    /// Returns the original execution failure after best-effort settlement and
-    /// lease release; successful execution returns after the same bookkeeping.
+    /// Returns the settlement failure when the durable row could not be made to
+    /// describe this attempt, or the lease-release failure when the table fence
+    /// could not be given up. Either leaves this owner unable to prove what it
+    /// did, so it must stop claiming.
     async fn settle_claim_execution(
         &self,
         outcome: ClaimExecutionOutcome<'_>,
-    ) -> Result<(), ForgeError> {
+        settled_failure: &mut Option<ForgeError>,
+    ) -> Result<bool, ForgeError> {
         let ClaimExecutionOutcome {
             task,
             attempt,
@@ -1991,10 +2086,16 @@ impl ForgeWorker {
                 "Forge task execution failed"
             );
         }
+        // An execution failure is only a healthy worker outcome once its
+        // durable settlement commits. A settlement failure means the durable
+        // row no longer describes what this owner did, so it is preserved and
+        // propagated after the remaining bookkeeping rather than logged away.
+        let mut fatal = None;
         if let Err(error) = &result
             && let Err(settlement) = self.settle_execution_failure(task, attempt, error).await
         {
             tracing::error!(task_id=%task.task_id, error=%settlement, "Forge failure settlement failed; claim retained for expiry recovery");
+            fatal = Some(settlement);
         }
         self.record_task_execution_telemetry(task, &task_span, elapsed)
             .await;
@@ -2014,8 +2115,22 @@ impl ForgeWorker {
         }
         if let Err(error) = lease.release(&self.forge.core.operator_pool).await {
             tracing::warn!(task_id = %task.task_id, error = %error, "Forge table lease release failed");
+            // A retained table fence would let this owner's next claim run
+            // against a table it can no longer prove it owns.
+            fatal.get_or_insert(error);
         }
-        result
+        if let Some(error) = fatal {
+            return Err(error);
+        }
+        // The failure committed to durable state, so the caller reports it as
+        // an observed attempt failure rather than as a reason to stop claiming.
+        if let Err(error) = result {
+            *settled_failure = Some(error);
+            return Ok(false);
+        }
+        // The durable row is the authority for what happened; the boolean only
+        // reports whether the requested effect settled successfully.
+        Ok(result.unwrap_or(false))
     }
 
     /// Records the task-duration observation from the durable task lifecycle state.
@@ -2474,6 +2589,10 @@ impl ForgeWorker {
     /// returns [`ForgeError::ShutdownRetained`] so `run_slot` retains it for
     /// evidence-based recovery rather than releasing it.
     ///
+    /// Returns whether the requested effect settled. A base snapshot that moved
+    /// past this plan cancels the task as superseded and returns `false`: the
+    /// row is settled, but no effect a reader can observe was produced.
+    ///
     /// # Errors
     ///
     /// Returns catalog, stale-snapshot, lifecycle, heartbeat, rewrite, evidence,
@@ -2568,7 +2687,7 @@ impl ForgeWorker {
         binding: &TenantTableBinding,
         lease: &mut ForgeLease,
         shutdown: &CancellationToken,
-    ) -> Result<(), ForgeError> {
+    ) -> Result<bool, ForgeError> {
         lease.require_fence(&self.forge.core.operator_pool).await?;
         // Held for the whole fenced attempt: dropping the lease is what returns
         // the granted memory and scratch counters to the root governor.
@@ -2608,7 +2727,9 @@ impl ForgeWorker {
                 .telemetry
                 .record_conflict(ForgeConflictKind::SnapshotChanged);
             self.cancel_superseded(claim).await?;
-            return Ok(());
+            // The requested effect never ran, so this is a healthy exit that
+            // recorded no successful completion.
+            return Ok(false);
         }
         let watermark = Self::execution_watermark(&table, claim, committed_recovery.as_ref())?;
         self.begin_attempt(claim, attempt, watermark).await?;
@@ -2675,7 +2796,8 @@ impl ForgeWorker {
             .await?;
         self.record_rewrite_evidence(claim, &evidence);
         self.finish_claim_execution(claim, attempt, lease, &evidence, state)
-            .await
+            .await?;
+        Ok(true)
     }
 
     /// Settles a rewrite whose commit was discovered rather than observed.

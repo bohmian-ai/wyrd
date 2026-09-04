@@ -5343,13 +5343,206 @@ mod tests {
         )
     }
 
-    /// One retained plan reads its batch size and pool only from the task it is
-    /// executed with, in both governance modes.
+    /// Builds the one valid binding set, proving the two refusals on the way.
     ///
-    /// A physical root is built before admission, so the same leaf instance is
-    /// executed twice under two different admitted task contexts and must split
-    /// at each task's own batch size and charge each task's own pool. Leader and
-    /// follower modes must agree on rows and scan evidence at every size.
+    /// A planned key with no binding and a binding no leaf planned are both
+    /// mismatches between the retained plan and the admitted sources, and both
+    /// must be refused before any task exists to read rows with.
+    ///
+    /// # Panics
+    ///
+    /// Panics when either mismatch is accepted, or when the exact planned key
+    /// set is refused.
+    fn validated_bindings(
+        governor: &crate::resources::BifrostRoleResources,
+        telemetry: &Arc<OracleTelemetry>,
+        table: &str,
+        live: &RecordBatch,
+        planned_keys: &[crate::oracle::bindings::OracleSourceKey],
+    ) -> crate::oracle::bindings::OracleExecutionBindings {
+        let inputs = |batches: std::collections::HashMap<String, Vec<RecordBatch>>| {
+            crate::oracle::bindings::OracleExecutionBindingInputs {
+                grant: crate::oracle::bindings::OracleExecutionGrant::for_test(
+                    QueryClass::Interactive,
+                    oracle_memory_resources(governor, 1024 * 1024),
+                    Arc::clone(telemetry),
+                ),
+                local_batches: batches,
+                reservations: Vec::new(),
+                degraded: false,
+            }
+        };
+        let bound = || std::collections::HashMap::from([(table.to_owned(), vec![live.clone()])]);
+        assert!(
+            crate::oracle::bindings::OracleExecutionBindings::try_new(
+                inputs(std::collections::HashMap::new()),
+                planned_keys,
+            )
+            .is_err(),
+            "a planned key with no binding is refused"
+        );
+        assert!(
+            crate::oracle::bindings::OracleExecutionBindings::try_new(inputs(bound()), &[])
+                .is_err(),
+            "a binding no leaf planned is refused"
+        );
+        crate::oracle::bindings::OracleExecutionBindings::try_new(inputs(bound()), planned_keys)
+            .expect("the exact planned key set binds")
+    }
+
+    /// Asserts admission changed no optimizer or memory knob of the retained shape.
+    ///
+    /// Admission supplies a runtime and a memory pool only, so a grant larger
+    /// than the minimum-grant planning shape must leave target partitions,
+    /// batch size, hash-join preference, and sort-spill reservation untouched.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any of those four knobs differs between the two configs.
+    fn assert_same_session_shape(
+        planned: &datafusion::prelude::SessionConfig,
+        executed: &datafusion::prelude::SessionConfig,
+    ) {
+        assert_eq!(executed.target_partitions(), planned.target_partitions());
+        assert_eq!(executed.batch_size(), planned.batch_size());
+        assert_eq!(
+            executed.options().optimizer.prefer_hash_join,
+            planned.options().optimizer.prefer_hash_join
+        );
+        assert_eq!(
+            executed.options().execution.sort_spill_reservation_bytes,
+            planned.options().execution.sort_spill_reservation_bytes
+        );
+    }
+
+    /// A whole retained root binds once and reads only its admitted task.
+    ///
+    /// Split out of [`retained_plan_uses_admitted_task_context_only`] to keep
+    /// each half readable; it owns the sentinel planning runtime, the binding
+    /// validation refusals, and the planning-versus-execution config equality.
+    ///
+    /// # Panics
+    ///
+    /// Panics when planning reserves memory, when a mismatched binding is
+    /// accepted, when the admitted config drifts from the retained shape, or
+    /// when either pool fails to return to zero.
+    async fn assert_retained_root_binds_once(
+        governor: &crate::resources::BifrostRoleResources,
+        telemetry: &Arc<OracleTelemetry>,
+    ) {
+        // A whole retained root is planned on a sentinel planning runtime and
+        // executed on a distinct admitted one. Planning must reach no row
+        // source, and the bound Fused rows must arrive through the admitted
+        // pool alone.
+        let tenant = wyrd_spec::DataTenantId::new_v7();
+        let (provider, live) = projection_closure_provider(tenant).await;
+        let table = "vala.traces.spans".to_owned();
+        let planned_keys = [crate::oracle::bindings::OracleSourceKey::LocalDrained {
+            table: table.clone(),
+        }];
+
+        let shape = crate::resources::OracleSessionShape::for_grant(
+            crate::resources::ORACLE_PARTITION_WORKING_MEMORY_BYTES,
+            crate::resources::ORACLE_MIN_TARGET_PARTITIONS,
+            1,
+        );
+        let lock = Arc::new(crate::oracle::bindings::OracleExecutionLock::new());
+        let retained_config = shape.session_config().with_extension(Arc::clone(&lock));
+        let planning_pool = crate::resources::bounded_memory_pool(1024 * 1024 * 1024);
+        let planning_runtime = Arc::new(
+            datafusion::execution::runtime_env::RuntimeEnvBuilder::new()
+                .with_memory_pool(Arc::clone(&planning_pool))
+                .build()
+                .expect("sentinel planning runtime"),
+        );
+        let planning = datafusion::execution::context::SessionContext::new_with_state(
+            datafusion::execution::session_state::SessionStateBuilder::new()
+                .with_default_features()
+                .with_config(retained_config.clone())
+                .with_runtime_env(Arc::clone(&planning_runtime))
+                .build(),
+        );
+        let root = provider
+            .scan(&planning.state(), None, &[], None)
+            .await
+            .expect("retained root plans on the planning session");
+        drop(planning);
+        assert_eq!(
+            planning_pool.reserved(),
+            0,
+            "planning opens no row source and reserves nothing"
+        );
+
+        let bindings = validated_bindings(governor, telemetry, &table, &live, &planned_keys);
+        assert!(lock.set(bindings).is_ok(), "a fresh lock binds once");
+
+        let admitted_pool = crate::resources::bounded_memory_pool(1024 * 1024 * 1024);
+        let admitted = datafusion::execution::context::SessionContext::new_with_state(
+            datafusion::execution::session_state::SessionStateBuilder::new()
+                .with_default_features()
+                .with_config(retained_config.clone())
+                .with_runtime_env(Arc::new(
+                    datafusion::execution::runtime_env::RuntimeEnvBuilder::new()
+                        .with_memory_pool(Arc::clone(&admitted_pool))
+                        .build()
+                        .expect("admitted query runtime"),
+                ))
+                .build(),
+        );
+        let task = admitted.task_ctx();
+
+        assert_same_session_shape(&retained_config, task.session_config());
+
+        let executed = datafusion::physical_plan::collect(Arc::clone(&root), Arc::clone(&task))
+            .await
+            .expect("the retained root executes on the admitted task");
+        assert_eq!(
+            executed
+                .iter()
+                .map(arrow::array::RecordBatch::num_rows)
+                .sum::<usize>(),
+            2,
+            "the bound Fused rows are the retained root's only rows"
+        );
+        assert_eq!(planning_pool.reserved(), 0, "row IO never touches planning");
+        assert_eq!(admitted_pool.reserved(), 0, "settlement returns every byte");
+
+        // A freshly planned root executed on a session carrying no lock refuses
+        // at the leaf rather than reading rows from anywhere else.
+        let unbound_session =
+            datafusion::execution::context::SessionContext::new_with_config(shape.session_config());
+        let unbound_root = provider
+            .scan(&unbound_session.state(), None, &[], None)
+            .await
+            .expect("a second root plans");
+        assert!(
+            datafusion::physical_plan::collect(unbound_root, unbound_session.task_ctx())
+                .await
+                .is_err(),
+            "an unbound session cannot execute a retained root"
+        );
+        drop(root);
+    }
+
+    /// One retained plan reads its runtime, pool, batch size, and bound sources
+    /// only from the task it is executed with.
+    ///
+    /// A physical root is built before admission, so the same hot leaf instance
+    /// is executed twice under two different admitted task contexts and must
+    /// split at each task's own batch size and charge each task's own pool;
+    /// leader and follower modes must agree on rows and scan evidence at every
+    /// size. A whole retained root is then planned on a sentinel planning
+    /// runtime whose pool must never be reserved against, bound once through the
+    /// session `OnceLock`, and executed on a distinct admitted runtime. The
+    /// planning and executing `SessionConfig` must still carry the same
+    /// minimum-grant target partitions, batch size, hash-join preference, and
+    /// sort-spill reservation, because admission supplies capacity rather than
+    /// optimizer choices.
+    ///
+    /// # Panics
+    ///
+    /// Panics when planning, binding validation, or execution violates any of
+    /// those contracts.
     #[tokio::test]
     async fn retained_plan_uses_admitted_task_context_only() {
         let fixture = build_hot_batch_fixture();
@@ -5444,6 +5637,8 @@ mod tests {
         assert_eq!(whole.iter().sum::<usize>(), rows);
         assert_eq!(split_pool.reserved(), 0);
         assert_eq!(whole_pool.reserved(), 0);
+
+        assert_retained_root_binds_once(&governor, &telemetry).await;
     }
 
     /// Follower governance returns every retained byte to its request-local
@@ -5960,9 +6155,7 @@ mod tests {
     /// requested output, the predicate-only column that must survive to the
     /// provider-local filter, and the hidden tenant column that must survive to
     /// the tripwire. `unused_payload` is requested by nobody and must not
-    /// appear in any leaf. The remote placeholder still advertises the
-    /// *complete* four-column fingerprint, because that value identifies the
-    /// table's canonical schema rather than this query's projection.
+    /// appear in any leaf.
     ///
     /// # Panics
     /// Panics if provider construction, scan planning, or execution violates
@@ -6132,12 +6325,12 @@ mod tests {
             &mut config,
             RootClassTaskCount,
         );
-        use datafusion_distributed::SessionStateBuilderExt as _;
-        let state = datafusion::execution::session_state::SessionStateBuilder::new()
-            .with_default_features()
-            .with_config(config)
-            .with_distributed_planner()
-            .build();
+        let state = <datafusion::execution::session_state::SessionStateBuilder as datafusion_distributed::SessionStateBuilderExt>::with_distributed_planner(
+            datafusion::execution::session_state::SessionStateBuilder::new()
+                .with_default_features()
+                .with_config(config),
+        )
+        .build();
         let distributed = datafusion::prelude::SessionContext::new_with_state(state);
         distributed
             .register_table(

@@ -1586,6 +1586,42 @@ struct SqlAttemptInput<'a> {
     analytical: Option<&'a analytical::AnalyticalAttemptContext>,
 }
 
+/// Inputs for the pre-admission half of one attempt.
+struct ClassifyInput<'a> {
+    /// Authenticated request context.
+    context: &'a AuthorizedQueryContext,
+    /// Original validated query request.
+    request: &'a BifrostQueryRequest,
+    /// Tables parsed from the validated SQL statement.
+    tables: &'a [TableRef],
+    /// Absolute whole-query deadline.
+    deadline: Instant,
+    /// Class-neutral membership frozen before any class existed.
+    roster: participant_cut::OracleQueryAttemptRoster,
+    /// Catalog snapshot already pinned in this process for this attempt.
+    prepared: Option<PlannedSqlCut>,
+    /// Inactive Analytical attempt identity, present only on the harness entry.
+    analytical: Option<&'a analytical::AnalyticalAttemptContext>,
+    /// Telemetry slot opened once the class is known.
+    query_telemetry: &'a mut Option<QueryTelemetryGuard>,
+}
+
+/// The one cut, root, and class every later step of an attempt reads.
+struct ClassifiedAttempt {
+    /// The single immutable source cut this attempt pinned.
+    planned: PlannedSqlCut,
+    /// The one physical root and the exact config it was built with.
+    retained: RetainedPhysicalPlan,
+    /// Class derived from that root alone.
+    query_class: QueryClass,
+    /// The participant cut signed with that class and the frozen roster.
+    participant_cut: participant_cut::OracleQueryAttemptCut,
+    /// Analytical attempt identity, present only for an Analytical root.
+    attempt: Option<analytical::AnalyticalAttemptContext>,
+    /// Scannable work units the frozen cut selected.
+    work_units: usize,
+}
+
 /// Retained local query engine owner.
 pub struct Oracle {
     /// Planner and floor configuration.
@@ -2352,15 +2388,15 @@ impl Oracle {
                 cut.attempt_id(),
             )
             .await?;
-        let (session, ownership) = handle.lease_session(
+        let (session, ownership) = handle.lease_session(analytical::AnalyticalLeaseInputs {
             attempt,
-            &cut,
-            &context,
-            &mut admitted,
+            cut: &cut,
+            context: &context,
+            admitted: &mut admitted,
             work_units,
-            retained.config,
-            tokio::time::Instant::from_std(deadline),
-        )?;
+            config: retained.config,
+            deadline: tokio::time::Instant::from_std(deadline),
+        })?;
         if ownership.retain_admission(admitted).is_err() {
             tracing::error!(
                 public_query_id = %attempt.public_query_id,
@@ -2664,6 +2700,101 @@ impl Oracle {
         self.execution_session(admitted, config)
     }
 
+    /// Pins one cut, builds one physical root, and derives this attempt's class.
+    ///
+    /// This is the whole pre-admission half of an attempt, kept together because
+    /// no step between them may observe a class that does not yet exist: the
+    /// cut is frozen class-neutral, the root is built on the minimum-grant
+    /// planning shape, the class is derived from that exact root, and only then
+    /// is the participant cut signed with it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the stable catalog, planning, or roster error. Every one of them
+    /// is terminal; nothing here repins or rebuilds.
+    async fn classify_one_build(
+        &self,
+        input: ClassifyInput<'_>,
+    ) -> Result<ClassifiedAttempt, BifrostError> {
+        let ClassifyInput {
+            context,
+            request,
+            tables,
+            deadline,
+            roster,
+            prepared,
+            analytical,
+            query_telemetry,
+        } = input;
+        let planned = match prepared {
+            Some(planned) => planned,
+            None => self.plan_sql_attempt(context, tables, deadline).await?,
+        };
+        let work_units = Self::scannable_work_units(&planned.cuts);
+        let retained = self
+            .build_physical_root(
+                context,
+                &request.sql,
+                &planned.cuts,
+                roster.oracles(),
+                work_units,
+            )
+            .await?;
+        let query_class = exec::query_class_for_root(retained.root.as_ref());
+        tracing::Span::current().record("query_class", query_class_label(query_class));
+        let participant_cut = roster
+            .finalize(query_class)
+            .map_err(|_| BifrostError::OracleRoleUnavailable)?;
+        self.ensure_query_telemetry(query_telemetry, request.visibility, query_class);
+        let attempt = match analytical {
+            Some(attempt) => Some(attempt.clone()),
+            None if query_class == QueryClass::Analytical && self.analytical.is_some() => Some(
+                Self::candidate_attempt_context(context, participant_cut.attempt_id(), &planned)?,
+            ),
+            None => None,
+        };
+        Ok(ClassifiedAttempt {
+            planned,
+            retained,
+            query_class,
+            participant_cut,
+            attempt,
+            work_units,
+        })
+    }
+
+    /// Audits and drains the pinned sources, then binds them to the retained plan.
+    ///
+    /// These are one step because a drain that is not bound owns reservations
+    /// nobody will release: a binding failure must drop the drained tails here
+    /// rather than leaving them for a caller to remember.
+    ///
+    /// # Errors
+    ///
+    /// Returns the stable audit, activation, drain, or binding-validation
+    /// error. Every one of them settles the sole attempt.
+    async fn drain_and_bind(
+        &self,
+        audit: CutAuditInput<'_>,
+        config: &datafusion::prelude::SessionConfig,
+        cut_deadline: chrono::DateTime<chrono::Utc>,
+        phases: &mut AttemptPhaseTimer,
+    ) -> Result<Arc<bindings::OracleExecutionLock>, BifrostError> {
+        let admitted = audit.admitted;
+        let query_class = audit.query_class;
+        let cuts = audit.cuts;
+        let mut drained = self.audit_and_drain_cut(audit).await?;
+        phases.drained();
+        self.bind_execution_sources(
+            config,
+            admitted,
+            query_class,
+            cut_deadline,
+            cuts,
+            &mut drained,
+        )
+    }
+
     /// Runs one complete SQL attempt from one build to a settled query stream.
     ///
     /// The order here is the whole contract: the immutable cut is pinned or
@@ -2693,33 +2824,25 @@ impl Oracle {
             prepared,
             analytical,
         } = input;
-        let planned = match prepared {
-            Some(planned) => planned,
-            None => self.plan_sql_attempt(context, tables, deadline).await?,
-        };
-        let work_units = Self::scannable_work_units(&planned.cuts);
-        let retained = self
-            .build_physical_root(
+        let ClassifiedAttempt {
+            planned,
+            retained,
+            query_class,
+            participant_cut,
+            attempt,
+            work_units,
+        } = self
+            .classify_one_build(ClassifyInput {
                 context,
-                &request.sql,
-                &planned.cuts,
-                roster.oracles(),
-                work_units,
-            )
+                request,
+                tables,
+                deadline,
+                roster,
+                prepared,
+                analytical,
+                query_telemetry,
+            })
             .await?;
-        let query_class = exec::query_class_for_root(retained.root.as_ref());
-        tracing::Span::current().record("query_class", query_class_label(query_class));
-        let participant_cut = roster
-            .finalize(query_class)
-            .map_err(|_| BifrostError::OracleRoleUnavailable)?;
-        self.ensure_query_telemetry(query_telemetry, request.visibility, query_class);
-        let attempt = match analytical {
-            Some(attempt) => Some(attempt.clone()),
-            None if query_class == QueryClass::Analytical && self.analytical.is_some() => Some(
-                Self::candidate_attempt_context(context, participant_cut.attempt_id(), &planned)?,
-            ),
-            None => None,
-        };
         let mut phases = AttemptPhaseTimer::started();
         let (mut admitted, running_query) = self
             .admit_built_attempt(
@@ -2731,31 +2854,24 @@ impl Oracle {
                 &mut phases,
             )
             .await?;
-        let mut drained = match self
-            .audit_and_drain_cut(CutAuditInput {
-                context,
-                request,
-                cuts: &planned.cuts,
-                query_class,
-                deadline,
-                admitted: &admitted,
-            })
+        let bound = match self
+            .drain_and_bind(
+                CutAuditInput {
+                    context,
+                    request,
+                    cuts: &planned.cuts,
+                    query_class,
+                    deadline,
+                    admitted: &admitted,
+                },
+                &retained.config,
+                participant_cut.deadline(),
+                &mut phases,
+            )
             .await
         {
-            Ok(drained) => drained,
-            Err(error) => return release_error(deadline, admitted, error, "audit rejection"),
-        };
-        phases.drained();
-        let bound = match self.bind_execution_sources(
-            &retained.config,
-            &admitted,
-            query_class,
-            participant_cut.deadline(),
-            &planned.cuts,
-            &mut drained,
-        ) {
             Ok(bound) => bound,
-            Err(error) => return release_error(deadline, admitted, error, "binding rejection"),
+            Err(error) => return release_error(deadline, admitted, error, "source rejection"),
         };
         // Retained here only until execution: an Analytical query moves this
         // owner onto its graph, and what is left is what the stream still owes.
@@ -2848,15 +2964,15 @@ impl Oracle {
                 });
             }
         };
-        let (leader, ownership) = handle.lease_session(
+        let (leader, ownership) = handle.lease_session(analytical::AnalyticalLeaseInputs {
             attempt,
-            participant_cut,
+            cut: participant_cut,
             context,
             admitted,
             work_units,
             config,
-            tokio::time::Instant::from_std(deadline),
-        )?;
+            deadline: tokio::time::Instant::from_std(deadline),
+        })?;
         let graph = ownership.key().graph();
         admitted.analytical = Some(ownership);
         // Execution moves the public entry onto the graph: from here the graph

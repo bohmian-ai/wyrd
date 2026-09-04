@@ -1756,6 +1756,41 @@ impl BifrostProcessCluster {
         &self.shared.fixture
     }
 
+    /// Deletes one object from the shared local object store.
+    ///
+    /// A journey needs this to make a published Iceberg snapshot reference a
+    /// data file that no longer exists, which is the only way to reach the
+    /// leader's stale-source branch through the real public entry without a
+    /// fault injector. `relative_object_key` is resolved under the cluster's
+    /// own `storage_root`; an absolute key or one containing a parent-directory
+    /// component is refused so a journey cannot reach outside the fixture.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProcessClusterError::Resource`] when the key escapes the
+    /// storage root or when the object cannot be removed.
+    pub fn remove_storage_object(
+        &self,
+        relative_object_key: &str,
+    ) -> Result<(), ProcessClusterError> {
+        let key = Path::new(relative_object_key);
+        if key.is_absolute()
+            || key
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            return Err(ProcessClusterError::Resource(format!(
+                "storage object key escapes the storage root: {relative_object_key}"
+            )));
+        }
+        let target = self.shared.storage_root.path().join(key);
+        std::fs::remove_file(&target).map_err(|error| {
+            ProcessClusterError::Resource(format!(
+                "removing storage object {relative_object_key} failed: {error}"
+            ))
+        })
+    }
+
     /// Shuts down and reaps every child, joining all owned threads.
     ///
     /// Every node is attempted in cluster order even after one fails, and the

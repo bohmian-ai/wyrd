@@ -4463,6 +4463,33 @@ mod tests {
         }
     }
 
+    /// Builds one attempt identity with the fixture's shared digests.
+    ///
+    /// The two identities are what a graph is keyed by, so a lease test varies
+    /// them per case while the digests stay fixed.
+    fn fixture_attempt(public: u128, datafusion: u128) -> AnalyticalAttemptContext {
+        AnalyticalAttemptContext {
+            public_query_id: PublicQueryId::from_uuid(Uuid::from_u128(public)),
+            datafusion_query_id: DataFusionQueryId::from_uuid(Uuid::from_u128(datafusion)),
+            snapshot_digest: "fixture-snapshot".to_owned(),
+            permission_digest: "fixture-permissions".to_owned(),
+        }
+    }
+
+    /// Builds the minimum-grant session configuration a leader plans with.
+    ///
+    /// Production retains the config its physical root was built with, so a
+    /// lease test hands `lease_session` the same shape rather than letting the
+    /// handle invent one.
+    fn min_grant_lease_config() -> datafusion::prelude::SessionConfig {
+        crate::resources::OracleSessionShape::for_grant(
+            crate::resources::ORACLE_PARTITION_WORKING_MEMORY_BYTES,
+            crate::resources::ORACLE_MIN_TARGET_PARTITIONS,
+            4,
+        )
+        .session_config()
+    }
+
     /// Builds one authenticated Analytical context for a leasing fixture.
     fn context_for_leasing() -> AuthorizedQueryContext {
         let tenant = DataTenantId::new_v7();
@@ -4579,32 +4606,22 @@ mod tests {
             .expect("an idle Oracle admits one analytical query");
         let (mut admitted, _shared, _cancel) = super::super::admission::admitted_guard_for_test();
         admitted.install_query_resources_for_test(resources);
-        let attempt = AnalyticalAttemptContext {
-            public_query_id: PublicQueryId::from_uuid(Uuid::from_u128(201)),
-            datafusion_query_id: DataFusionQueryId::from_uuid(Uuid::from_u128(202)),
-            snapshot_digest: "fixture-snapshot".to_owned(),
-            permission_digest: "fixture-permissions".to_owned(),
-        };
+        let attempt = fixture_attempt(201, 202);
         let cut = super::super::participant_cut::tests::analytical_cut(
             now,
             fixture.node_id.as_uuid().as_u128(),
             expires_at,
         );
         let (session, ownership) = handle
-            .lease_session(
-                &attempt,
-                &cut,
-                &context_for_leasing(),
-                &mut admitted,
-                4,
-                crate::resources::OracleSessionShape::for_grant(
-                    crate::resources::ORACLE_PARTITION_WORKING_MEMORY_BYTES,
-                    crate::resources::ORACLE_MIN_TARGET_PARTITIONS,
-                    4,
-                )
-                .session_config(),
+            .lease_session(super::AnalyticalLeaseInputs {
+                attempt: &attempt,
+                cut: &cut,
+                context: &context_for_leasing(),
+                admitted: &mut admitted,
+                work_units: 4,
+                config: min_grant_lease_config(),
                 deadline,
-            )
+            })
             .expect("the leader leases one session from its admitted envelope");
         drop(session);
         Box::new((admitted, ownership, transport))
@@ -5203,12 +5220,7 @@ mod tests {
 
         let (mut admitted, _shared, _cancel) = super::super::admission::admitted_guard_for_test();
         admitted.install_query_resources_for_test(resources);
-        let attempt = AnalyticalAttemptContext {
-            public_query_id: PublicQueryId::from_uuid(Uuid::from_u128(101)),
-            datafusion_query_id: DataFusionQueryId::from_uuid(Uuid::from_u128(102)),
-            snapshot_digest: "fixture-snapshot".to_owned(),
-            permission_digest: "fixture-permissions".to_owned(),
-        };
+        let attempt = fixture_attempt(101, 102);
         let cut = super::super::participant_cut::tests::analytical_cut(
             now,
             fixture.node_id.as_uuid().as_u128(),
@@ -5216,20 +5228,15 @@ mod tests {
         );
         let context = context_for_leasing();
         let (session, ownership) = handle
-            .lease_session(
-                &attempt,
-                &cut,
-                &context,
-                &mut admitted,
-                4,
-                crate::resources::OracleSessionShape::for_grant(
-                    crate::resources::ORACLE_PARTITION_WORKING_MEMORY_BYTES,
-                    crate::resources::ORACLE_MIN_TARGET_PARTITIONS,
-                    4,
-                )
-                .session_config(),
-                tokio::time::Instant::now() + Duration::from_mins(1),
-            )
+            .lease_session(super::AnalyticalLeaseInputs {
+                attempt: &attempt,
+                cut: &cut,
+                context: &context,
+                admitted: &mut admitted,
+                work_units: 4,
+                config: min_grant_lease_config(),
+                deadline: tokio::time::Instant::now() + Duration::from_mins(1),
+            })
             .expect("the leader leases one session from its admitted envelope");
 
         // Leasing is a transfer, not an acquisition: the root still sees one.
@@ -6156,32 +6163,22 @@ mod tests {
             })
             .await
             .expect("an idle Oracle admits one analytical query");
-        let attempt = AnalyticalAttemptContext {
-            public_query_id: PublicQueryId::from_uuid(Uuid::from_u128(301)),
-            datafusion_query_id: DataFusionQueryId::from_uuid(Uuid::from_u128(302)),
-            snapshot_digest: "fixture-snapshot".to_owned(),
-            permission_digest: "fixture-permissions".to_owned(),
-        };
+        let attempt = fixture_attempt(301, 302);
         let cut = super::super::participant_cut::tests::analytical_cut(
             now,
             fixture.node_id.as_uuid().as_u128(),
             expires_at,
         );
         let (session, ownership) = handle
-            .lease_session(
-                &attempt,
-                &cut,
-                &context_for_leasing(),
-                &mut admitted,
-                4,
-                crate::resources::OracleSessionShape::for_grant(
-                    crate::resources::ORACLE_PARTITION_WORKING_MEMORY_BYTES,
-                    crate::resources::ORACLE_MIN_TARGET_PARTITIONS,
-                    4,
-                )
-                .session_config(),
-                tokio::time::Instant::now() + Duration::from_mins(1),
-            )
+            .lease_session(super::AnalyticalLeaseInputs {
+                attempt: &attempt,
+                cut: &cut,
+                context: &context_for_leasing(),
+                admitted: &mut admitted,
+                work_units: 4,
+                config: min_grant_lease_config(),
+                deadline: tokio::time::Instant::now() + Duration::from_mins(1),
+            })
             .expect("the leader leases one session from its admitted envelope");
         drop(session);
         let graph = ownership.key().graph();
@@ -7635,14 +7632,17 @@ impl AnalyticalExecutionHandle {
     /// build the bounded query runtime.
     pub(super) fn lease_session(
         &self,
-        attempt: &AnalyticalAttemptContext,
-        cut: &OracleQueryAttemptCut,
-        context: &AuthorizedQueryContext,
-        admitted: &mut super::admission::AdmittedQueryGuard,
-        work_units: usize,
-        config: datafusion::prelude::SessionConfig,
-        deadline: tokio::time::Instant,
+        inputs: AnalyticalLeaseInputs<'_>,
     ) -> Result<(SessionContext, AnalyticalAttemptOwnership), BifrostError> {
+        let AnalyticalLeaseInputs {
+            attempt,
+            cut,
+            context,
+            admitted,
+            work_units,
+            config,
+            deadline,
+        } = inputs;
         let graph = AnalyticalGraphKey::new(attempt.public_query_id, attempt.datafusion_query_id);
         // Read from the immutable cut, not from a reservation: node identity,
         // endpoint, and fence are all frozen before anything is reserved, so
@@ -7940,6 +7940,28 @@ impl AnalyticalExecutionHandle {
             })
             .collect()
     }
+}
+
+/// Everything one admitted attempt needs to lease its distributed session.
+///
+/// The values are fixed before the leader's envelope moves onto the graph
+/// supervisor, so they travel as one group rather than as seven parameters that
+/// a caller could reorder.
+pub(super) struct AnalyticalLeaseInputs<'a> {
+    /// Public and `DataFusion` query identities for this attempt.
+    pub(super) attempt: &'a AnalyticalAttemptContext,
+    /// The immutable signed participant cut every stage reads.
+    pub(super) cut: &'a OracleQueryAttemptCut,
+    /// Authenticated principal, tenant, and audit correlation.
+    pub(super) context: &'a AuthorizedQueryContext,
+    /// Admission guard whose query envelope is transferred onto the graph.
+    pub(super) admitted: &'a mut super::admission::AdmittedQueryGuard,
+    /// Scannable work units the frozen cut selected.
+    pub(super) work_units: usize,
+    /// The exact `SessionConfig` the retained physical root was built with.
+    pub(super) config: datafusion::prelude::SessionConfig,
+    /// One absolute execution deadline shared by every stage.
+    pub(super) deadline: tokio::time::Instant,
 }
 
 /// The leader-session inputs one attempt composes its distributed session from.

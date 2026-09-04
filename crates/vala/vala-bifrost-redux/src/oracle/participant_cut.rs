@@ -290,7 +290,7 @@ fn supports_class(participant: &OracleQueryParticipant, query_class: QueryClass)
         ClusterCapabilities::OracleV1(capabilities) => {
             capabilities.supported_classes.contains(&query_class)
         }
-        _ => true,
+        ClusterCapabilities::ScribeV1(_) => true,
     }
 }
 

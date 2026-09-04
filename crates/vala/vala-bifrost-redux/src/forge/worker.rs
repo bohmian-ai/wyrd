@@ -1393,7 +1393,10 @@ impl ForgeWorker {
         );
         // Either healthy boolean is progress: a settled refusal or retry is a
         // durable result, and the predicate decides whether more remains.
-        if self.execute_claim(claim, shutdown).await? {
+        // Boxed for the same reason `run_slot` is: execution nests deeply, and
+        // holding that whole state machine inline inside the startup drain
+        // pushes the composed server future past rustc's layout-query budget.
+        if Box::pin(self.execute_claim(claim, shutdown)).await? {
             self.record_completion(task_id, strategy);
         }
         Ok(true)

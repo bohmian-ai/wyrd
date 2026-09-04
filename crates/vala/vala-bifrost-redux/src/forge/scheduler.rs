@@ -260,14 +260,17 @@ impl Forge {
                 self.core
                     .telemetry
                     .record_scheduler_pass(&outcome, started.elapsed());
+                // Readiness is authority, not liveness: only a pass that held
+                // the fence and acknowledged everything it was asked to plan
+                // proves this replica is the coordinator work should route to.
+                // A standby replica lost the fence to a live peer, and a pass
+                // that stopped at its per-wake budget left demand unplanned.
+                readiness.publish(!outcome.standby && !outcome.incomplete);
                 if outcome.standby {
                     self.core
                         .telemetry
                         .record_lease(ForgeLeaseResult::Contention);
                     tracing::debug!(triggered, "Forge scheduler remains on standby");
-                    // A standby pass still proved durable and lease access, so
-                    // this replica is a usable coordinator even without the fence.
-                    readiness.publish(true);
                     self.record_completed_pass();
                     return true;
                 }
@@ -278,7 +281,6 @@ impl Forge {
                     triggered,
                     "Forge scheduling pass completed"
                 );
-                readiness.publish(true);
             }
             Err(error) => {
                 pass_span.record("result", "failed");

@@ -1193,4 +1193,170 @@ async fn forge_coordinator_readiness_follows_a_completed_pass() {
         "a stopped coordinator does not advertise ready"
     );
     server.shutdown().await.expect("test server shuts down");
+
+    coordinator_standby_and_partial_passes_are_not_ready().await;
+}
+
+/// A standby pass and an overflowed partial pass both leave the coordinator
+/// unready, and the next complete fenced pass restores it.
+///
+/// Readiness answers whether this replica currently holds the authority the
+/// role promises. A standby replica lost the fence to a live peer, so it plans
+/// nothing; a partial pass ran out of its per-wake hint budget and left demand
+/// unacknowledged. Routing maintenance to either one is routing it to a
+/// coordinator that will not do the work.
+///
+/// # Panics
+///
+/// Panics when a standby, partial, or completed pass publishes the wrong bit.
+#[cfg(feature = "test-support")]
+async fn coordinator_standby_and_partial_passes_are_not_ready() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let readiness = server
+        .state()
+        .forge()
+        .expect("the default target selects Forge")
+        .coordinator_readiness();
+    let pool = server
+        .pg_fixture()
+        .superuser_pool()
+        .await
+        .expect("superuser pool");
+
+    // A live peer holds the fence, so every pass this replica runs is standby.
+    sqlx::query(
+        "UPDATE vala.forge_scheduler_state SET owner=$1,fencing_token=fencing_token+1,\
+         expires_at=statement_timestamp()+interval '10 minutes',\
+         updated_at=statement_timestamp() WHERE singleton",
+    )
+    .bind(uuid::Uuid::now_v7())
+    .execute(&pool)
+    .await
+    .expect("a peer takes the scheduler fence");
+
+    let stop = tokio_util::sync::CancellationToken::new();
+    let scheduler = wyrd_server::boot::spawn_maintenance_scheduler(server.state(), stop.clone())
+        .expect("the scheduler composes")
+        .expect("the default target selects a coordinator");
+    let handle = tokio::spawn(scheduler);
+
+    let before = server.completed_forge_scheduler_passes_for_test();
+    server.request_forge_scheduler_pass_for_test();
+    server
+        .wait_for_forge_scheduler_passes_for_test(before + 1)
+        .await;
+    assert!(
+        !readiness.is_ready(),
+        "a standby replica holds no fence and is not a ready coordinator"
+    );
+
+    // Releasing the fence lets the very next pass complete under this replica.
+    sqlx::query(
+        "UPDATE vala.forge_scheduler_state SET expires_at=statement_timestamp()-interval '1 second' \
+         WHERE singleton",
+    )
+    .execute(&pool)
+    .await
+    .expect("expire the peer fence");
+    await_forge_role(
+        &server,
+        true,
+        wyrd_server::state::Forge::coordinator_readiness,
+        "coordinator after the fence is released",
+    )
+    .await;
+
+    stop.cancel();
+    handle
+        .await
+        .expect("scheduler joins")
+        .expect("pass loop ok");
+    server.shutdown().await.expect("test server shuts down");
+
+    coordinator_partial_pass_is_not_ready().await;
+}
+
+/// An overflowed partial planning pass leaves the coordinator unready until the
+/// next pass drains the remaining demand.
+///
+/// The per-wake hint budget bounds one pass, not the queue. A replica that
+/// stopped at its budget has left demand unacknowledged, so it has not yet
+/// proved it can plan what it was asked to plan.
+///
+/// # Panics
+///
+/// Panics when a partial or completed pass publishes the wrong bit.
+#[cfg(feature = "test-support")]
+async fn coordinator_partial_pass_is_not_ready() {
+    let server = WyrdTestServer::builder()
+        .with_forge_config_for_test(vala_bifrost_redux::forge::ForgeConfig {
+            max_hints_per_wake: 1,
+            ..vala_bifrost_redux::forge::ForgeConfig::default()
+        })
+        .start_in_process()
+        .await
+        .expect("test server starts");
+    let readiness = server
+        .state()
+        .forge()
+        .expect("the default target selects Forge")
+        .coordinator_readiness();
+    let pool = server
+        .pg_fixture()
+        .superuser_pool()
+        .await
+        .expect("superuser pool");
+
+    // Two outstanding demands are one more than this coordinator's per-wake
+    // budget can page, so every pass it runs overflows and stays incomplete.
+    for table in ["partial_one", "partial_two"] {
+        sqlx::query(
+            "INSERT INTO vala.forge_planning_demands \
+             (data_tenant_id,catalog_name,namespace_name,table_name,last_source) \
+             VALUES ($1,'wyrd-redux','vala.bifrost',$2,'periodic')",
+        )
+        .bind(uuid::Uuid::from(server.data_tenant_id()))
+        .bind(table)
+        .execute(&pool)
+        .await
+        .expect("seed planning demand");
+    }
+
+    let stop = tokio_util::sync::CancellationToken::new();
+    let scheduler = wyrd_server::boot::spawn_maintenance_scheduler(server.state(), stop.clone())
+        .expect("the scheduler composes")
+        .expect("the default target selects a coordinator");
+    let handle = tokio::spawn(scheduler);
+
+    let before = server.completed_forge_scheduler_passes_for_test();
+    server.request_forge_scheduler_pass_for_test();
+    server
+        .wait_for_forge_scheduler_passes_for_test(before + 1)
+        .await;
+    assert!(
+        !readiness.is_ready(),
+        "a pass that stopped at its hint budget left demand unplanned"
+    );
+
+    sqlx::query("DELETE FROM vala.forge_planning_demands WHERE data_tenant_id=$1")
+        .bind(uuid::Uuid::from(server.data_tenant_id()))
+        .execute(&pool)
+        .await
+        .expect("drain the remaining demand");
+    await_forge_role(
+        &server,
+        true,
+        wyrd_server::state::Forge::coordinator_readiness,
+        "coordinator after the remaining demand drains",
+    )
+    .await;
+
+    stop.cancel();
+    handle
+        .await
+        .expect("scheduler joins")
+        .expect("pass loop ok");
+    server.shutdown().await.expect("test server shuts down");
 }

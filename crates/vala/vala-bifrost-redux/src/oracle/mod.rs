@@ -3812,6 +3812,15 @@ impl Oracle {
             // with nothing to read whenever the planner declines to distribute
             // this cut. The follower reads the same files from its assignment.
             let hot_files = self.local_hot_sources(cut)?;
+            tracing::debug!(
+                target: "wyrd::oracle::planning",
+                table = %cut.binding.table_ref.fqn(),
+                destinations = destinations.len(),
+                iceberg_files = cut.iceberg_files.len(),
+                hot_files = cut.hot_files.len(),
+                delegated = remote.is_some(),
+                "oracle cut provider registration"
+            );
             let provider = OracleTableProvider::try_new(OracleTableInputs {
                 table: cut.iceberg_table.clone(),
                 storage: Arc::clone(self.catalog.storage()),

@@ -414,14 +414,6 @@ async fn prove_pushdown_exchange_and_spill() -> Result<(), JourneyError> {
         .delta_since(&broad_checkpoint)
         .map_err(|e| e.to_string())?;
     let broad_bytes = sum_metric(&broad_delta, "oracle_query_bytes_scanned_total");
-    let exchange_batches = sum_metric(
-        &broad_delta,
-        "bifrost_oracle_analytical_exchange_batches_total",
-    );
-    let exchange_bytes = sum_metric(
-        &broad_delta,
-        "bifrost_oracle_analytical_exchange_bytes_total",
-    );
 
     let narrow_checkpoint = cluster
         .telemetry()
@@ -461,6 +453,37 @@ async fn prove_pushdown_exchange_and_spill() -> Result<(), JourneyError> {
         )
         .into());
     }
+    // The exchange is read from a grouped statement of its own rather than from
+    // either scan above. A projection scan of one cut is entirely
+    // leader-executable, so the single planner returns a normal root for it and
+    // the query settles Interactive; only a statement carrying a shuffle
+    // produces the follower stages whose result data this claim is about. The
+    // same seeded cut is read either way, so this is the same physical source.
+    let exchange_checkpoint = cluster
+        .telemetry()
+        .checkpoint()
+        .map_err(|e| e.to_string())?;
+    execute_inactive_analytical(
+        query_server,
+        tenant,
+        &format!(
+            "SELECT filter_key, count(*) AS matched FROM vala.bifrost.{table} \
+             GROUP BY filter_key"
+        ),
+    )
+    .await?;
+    let exchange_delta = cluster
+        .telemetry()
+        .delta_since(&exchange_checkpoint)
+        .map_err(|e| e.to_string())?;
+    let exchange_batches = sum_metric(
+        &exchange_delta,
+        "bifrost_oracle_analytical_exchange_batches_total",
+    );
+    let exchange_bytes = sum_metric(
+        &exchange_delta,
+        "bifrost_oracle_analytical_exchange_bytes_total",
+    );
     if exchange_batches <= 0.0 || exchange_bytes <= 0.0 {
         return Err(format!(
             "distributed exchange carried no follower result data: \

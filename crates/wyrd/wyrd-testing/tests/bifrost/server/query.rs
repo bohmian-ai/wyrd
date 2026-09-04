@@ -89,6 +89,9 @@ async fn generated_grpc_and_scheduled_queries_share_audit_terminal_and_cleanup()
     prove_shared_query_surfaces()
         .await
         .expect("shared gRPC and scheduled query journey");
+    prove_scheduled_analytical_peer_loss()
+        .await
+        .expect("scheduled Analytical peer-loss journey");
 }
 
 /// Drives both server-side query entries against one real bound server.
@@ -348,4 +351,184 @@ fn ipc_value(value: i64) -> Vec<u8> {
     writer.write(&batch).expect("in-memory IPC write");
     writer.finish().expect("in-memory IPC finish");
     bytes
+}
+
+/// Bounded polls the peer-loss phase waits on an Analytical lifecycle change.
+const ANALYTICAL_POLLS: usize = 100;
+
+/// A scheduled Analytical query whose peer dies produces no outcome and no leak.
+///
+/// The scheduled caller is the server's own entry, so a peer loss under it must
+/// settle exactly like one under the public entry: a mapped stable failure, no
+/// `ScheduledQueryOutcome`, the same single audited read decision the successful
+/// phase above proves, and no retained Analytical ownership once cleanup joins.
+///
+/// # Errors
+///
+/// Returns the first claim that broke.
+async fn prove_scheduled_analytical_peer_loss() -> Result<(), ServerJourneyError> {
+    let mut cluster = wyrd_testing::bifrost::WyrdTestCluster::start_spec(
+        wyrd_testing::bifrost::BifrostClusterSpec::three_oracles_one_scribe(),
+    )
+    .await?;
+    let tenant = cluster.data_tenant_id();
+    let table = format!("scheduled_peer_loss_{}", uuid::Uuid::now_v7().simple());
+    let ingest = cluster
+        .servers()
+        .find(|server| server.bifrost_scribe().is_some())
+        .ok_or("the cluster composed no Scribe")?;
+    ingest
+        .state()
+        .bifrost_catalog()
+        .ok_or("the Scribe composed no Bifrost catalog")?
+        .create_table(CreateTableRequest {
+            table: TableRef::new(BifrostNamespace::Bifrost, &table),
+            user_fields: vec![Field::new("value", DataType::Int64, false)],
+            tenant,
+            physical_layout: None,
+            audit: None,
+        })
+        .await?;
+
+    let bootstrap = ingest
+        .bootstrap_service_in_tenant(tenant, "scheduled-peer-loss-writer", &["admin"])
+        .await?;
+    let api_key = bootstrap
+        .api_key()
+        .ok_or("machine bootstrap returned no key")?
+        .clone();
+    let writer = wyrd_client::WyrdClient::with_config(wyrd_client::config::ClientConfig {
+        grpc: wyrd_client::transport::GrpcConfig {
+            endpoint: ingest.grpc_url().ok_or("missing gRPC URL")?,
+            connect_retries: 0,
+            ..wyrd_client::transport::GrpcConfig::default()
+        },
+        http: wyrd_client::transport::HttpConfig {
+            base_url: ingest.base_url().ok_or("missing HTTP URL")?.to_owned(),
+            ..wyrd_client::transport::HttpConfig::default()
+        },
+        api_key: Some(api_key),
+        ..wyrd_client::config::ClientConfig::default()
+    })?;
+    let transport = vala_sdk::BifrostGrpcTransport::connect(&writer).await?;
+    // Two published objects rather than one: a single-partition leaf is
+    // leader-executable, and this phase needs a root the planner distributes.
+    for _ in 0..2 {
+        for value in FIXTURE_VALUES {
+            transport
+                .insert_batch(
+                    &format!("vala.bifrost.{table}"),
+                    uuid::Uuid::now_v7().into_bytes(),
+                    ipc_value(value),
+                )
+                .await?;
+        }
+        ingest.flush_bifrost().await?;
+    }
+    cluster.refresh_oracle_snapshots().await?;
+
+    // The pause is armed on one follower before the statement runs, so the
+    // peer this phase kills is provably holding an activated stage rather than
+    // racing the query's own completion.
+    let victim_server = cluster.server(1).ok_or("missing follower node")?;
+    let victim = victim_server.node_id();
+    let pause = std::sync::Arc::new(
+        vala_bifrost_redux::oracle::analytical::AnalyticalExecutePause::default(),
+    );
+    victim_server
+        .state()
+        .bifrost_query()
+        .ok_or("the follower composed no Bifrost query surface")?
+        .engine()
+        .analytical_execution()
+        .ok_or("the follower composed no Analytical handle")?
+        .worker()
+        .bind_execute_pause_for_test(std::sync::Arc::clone(&pause));
+
+    let leader = cluster.server(0).ok_or("missing leader node")?;
+    let leader_state = leader.state().clone();
+    let reads_before = audit_rows(leader, tenant, "bifrost.query.read_decision").await?;
+    let sql = format!(
+        "SELECT value, COUNT(*) AS matched FROM vala.bifrost.{table} GROUP BY value ORDER BY value"
+    );
+    let scheduled = {
+        let context = scheduled_context(tenant)?;
+        tokio::spawn(async move {
+            ScheduledQueryCaller::new(
+                leader_state,
+                context,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .run(request(&sql))
+            .await
+        })
+    };
+
+    // The peer is killed only once it actually holds an activated stage, so the
+    // loss is a real mid-execution failure rather than a race with selection.
+    tokio::time::timeout(std::time::Duration::from_secs(30), pause.wait_paused())
+        .await
+        .map_err(|_| "no follower ever held an activated Analytical stage")?;
+    cluster.terminate_node_abruptly_for_test(victim).await?;
+
+    match scheduled.await? {
+        Ok(outcome) => {
+            return Err(format!(
+                "a lost peer still produced a scheduled outcome of {} rows",
+                outcome.rows
+            )
+            .into());
+        }
+        Err(error) if error.code().starts_with("WYRD_") => {}
+        Err(error) => {
+            return Err(format!("the lost peer surfaced {error} as {}", error.code()).into());
+        }
+    }
+
+    // One accepted logical read, exactly as the successful phase proves: a
+    // failed execution neither skips its audited decision nor writes a second.
+    let leader = cluster.server(0).ok_or("missing leader node")?;
+    if audit_rows(leader, tenant, "bifrost.query.read_decision").await? != reads_before + 1 {
+        return Err("the failed scheduled query did not relay exactly one logical read".into());
+    }
+    if audit_rows(leader, tenant, "bifrost.query.stage%").await? != 0 {
+        return Err("a failed query stage appended its own audit row".into());
+    }
+
+    await_clean_analytical(&cluster).await?;
+    cluster.shutdown().await?;
+    Ok(())
+}
+
+/// Waits until every running node retains no Analytical ownership.
+///
+/// # Errors
+///
+/// Returns an inspection error, or a description of what a node still held.
+async fn await_clean_analytical(
+    cluster: &wyrd_testing::bifrost::WyrdTestCluster,
+) -> Result<(), ServerJourneyError> {
+    let mut last = String::new();
+    for _ in 0..ANALYTICAL_POLLS {
+        let mut clean = true;
+        last.clear();
+        for server in cluster.servers() {
+            let Some(query) = server.state().bifrost_query() else {
+                continue;
+            };
+            let Some(handle) = query.engine().analytical_execution() else {
+                continue;
+            };
+            let live = handle.live()?;
+            if !AnalyticalLiveInspection::is_clean(&live) {
+                clean = false;
+                last = format!("{live:?}");
+            }
+        }
+        if clean {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    Err(format!("a node still retained Analytical ownership: {last}").into())
 }

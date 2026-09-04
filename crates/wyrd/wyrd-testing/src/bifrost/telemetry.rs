@@ -6,14 +6,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-#[cfg(test)]
-use metrics_exporter_prometheus::PrometheusBuilder;
 use metrics_exporter_prometheus::PrometheusHandle;
 use wyrd_telemetry::{CapturedSpan, CapturedSpanStatus, TestTraceCapture};
 
 use crate::bifrost::BifrostTopology;
-#[cfg(test)]
-use crate::server::ForgeDataFileInspection;
 
 /// Exact Prometheus sample kind retained across family normalization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,6 +116,44 @@ pub(crate) struct TelemetryBinding {
     /// Closed categorical label domains.
     allowed_label_values: &'static [TelemetryLabelValues],
 }
+
+/// Closed `task_type` label values every public Forge family carries.
+///
+/// Mirrors the five durable Forge task strategies owned by the production
+/// telemetry catalog, so a production label this projection cannot name fails
+/// as an unexpected value instead of silently vanishing from the report.
+const FORGE_TASK_TYPES: &[&str] = &[
+    "scribe_promotion",
+    "small_files",
+    "snapshot_expiry",
+    "expired_cleanup",
+    "orphan_cleanup",
+];
+
+/// Closed label domain for the Forge families keyed only by task type.
+const FORGE_TASK_TYPE_LABELS: &[TelemetryLabelValues] = &[TelemetryLabelValues {
+    key: "task_type",
+    values: FORGE_TASK_TYPES,
+}];
+
+/// Closed label domain for the Forge task-attempt counter.
+const FORGE_TASK_ATTEMPT_LABELS: &[TelemetryLabelValues] = &[
+    TelemetryLabelValues {
+        key: "task_type",
+        values: FORGE_TASK_TYPES,
+    },
+    TelemetryLabelValues {
+        key: "result",
+        values: &[
+            "succeeded",
+            "retry",
+            "failed",
+            "cancelled",
+            "refused",
+            "uncertain",
+        ],
+    },
+];
 
 /// Closed production labels emitted by the Oracle admission owner.
 const ORACLE_ADMISSION_LABELS: &[TelemetryLabelValues] = &[
@@ -521,12 +555,12 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
     TelemetryBinding {
         id: TelemetryBindingId("forge.backlog_peak"),
         selected_label_values: &[],
-        family: "bifrost_forge_oldest_backlog_seconds",
+        family: "bifrost_forge_pending_tasks",
         kind: BifrostMetricKind::Gauge,
-        unit: TelemetryUnit::Seconds,
+        unit: TelemetryUnit::Count,
         aggregation: TelemetryAggregation::Peak,
         requirement: TelemetryRequirement::Role("forge"),
-        allowed_label_values: &[],
+        allowed_label_values: FORGE_TASK_TYPE_LABELS,
     },
     TelemetryBinding {
         id: TelemetryBindingId("oracle.admission"),
@@ -597,65 +631,56 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
     },
     TelemetryBinding {
         id: TelemetryBindingId("forge.publications"),
-        selected_label_values: &[],
-        family: "bifrost_forge_complete_gauge_publications_total",
+        selected_label_values: &[TelemetrySelectedLabel {
+            key: "result",
+            value: "succeeded",
+        }],
+        family: "bifrost_forge_task_attempts_total",
         kind: BifrostMetricKind::Counter,
         unit: TelemetryUnit::Count,
         aggregation: TelemetryAggregation::Delta,
         requirement: TelemetryRequirement::Role("forge"),
-        allowed_label_values: &[],
+        allowed_label_values: FORGE_TASK_ATTEMPT_LABELS,
     },
     TelemetryBinding {
         id: TelemetryBindingId("forge.rewrite_input_files"),
         selected_label_values: &[],
-        family: "bifrost_forge_rewrite_input_files_total",
+        family: "bifrost_forge_input_files_total",
         kind: BifrostMetricKind::Counter,
         unit: TelemetryUnit::Count,
         aggregation: TelemetryAggregation::Delta,
         requirement: TelemetryRequirement::Role("forge"),
-        allowed_label_values: &[TelemetryLabelValues {
-            key: "source",
-            values: &["staging", "iceberg"],
-        }],
+        allowed_label_values: FORGE_TASK_TYPE_LABELS,
     },
     TelemetryBinding {
         id: TelemetryBindingId("forge.rewrite_input_bytes"),
         selected_label_values: &[],
-        family: "bifrost_forge_rewrite_input_bytes_total",
+        family: "bifrost_forge_input_bytes_total",
         kind: BifrostMetricKind::Counter,
         unit: TelemetryUnit::Bytes,
         aggregation: TelemetryAggregation::Delta,
         requirement: TelemetryRequirement::Role("forge"),
-        allowed_label_values: &[TelemetryLabelValues {
-            key: "source",
-            values: &["staging", "iceberg"],
-        }],
+        allowed_label_values: FORGE_TASK_TYPE_LABELS,
     },
     TelemetryBinding {
         id: TelemetryBindingId("forge.rewrite_output_files"),
         selected_label_values: &[],
-        family: "bifrost_forge_rewrite_output_files_total",
+        family: "bifrost_forge_output_files_total",
         kind: BifrostMetricKind::Counter,
         unit: TelemetryUnit::Count,
         aggregation: TelemetryAggregation::Delta,
         requirement: TelemetryRequirement::Role("forge"),
-        allowed_label_values: &[TelemetryLabelValues {
-            key: "source",
-            values: &["staging", "iceberg"],
-        }],
+        allowed_label_values: FORGE_TASK_TYPE_LABELS,
     },
     TelemetryBinding {
         id: TelemetryBindingId("forge.rewrite_output_bytes"),
         selected_label_values: &[],
-        family: "bifrost_forge_rewrite_output_bytes_total",
+        family: "bifrost_forge_output_bytes_total",
         kind: BifrostMetricKind::Counter,
         unit: TelemetryUnit::Bytes,
         aggregation: TelemetryAggregation::Delta,
         requirement: TelemetryRequirement::Role("forge"),
-        allowed_label_values: &[TelemetryLabelValues {
-            key: "source",
-            values: &["staging", "iceberg"],
-        }],
+        allowed_label_values: FORGE_TASK_TYPE_LABELS,
     },
     TelemetryBinding {
         id: TelemetryBindingId("oracle.rows"),
@@ -2915,48 +2940,18 @@ fn histogram_quantile_state_for_label(
 }
 
 #[cfg(test)]
+/// Estimate a histogram quantile from changed Prometheus cumulative buckets.
+pub(crate) fn histogram_quantile(
+    delta: &BifrostTelemetryDelta,
+    family: &str,
+    quantile: f64,
+) -> Result<f64, BifrostTelemetryReportError> {
+    histogram_quantile_for_label(delta, family, "", "", quantile)
+}
+
+#[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use super::*;
-    use vala_bifrost_redux::resources::{
-        BifrostResourcePolicy, BifrostRole, BifrostRuntimeResources, ForgeRewriteRequest,
-        MIN_SCRATCH_FREE_BYTES, ResourceSource, SystemResourceSnapshot,
-    };
-    use vala_sql::row_types::forge_tasks::{FORGE_ENVELOPE_VERSION, ForgeTaskEnvelope};
-
-    /// Construct one normalized production sample for mapper contract tests.
-    fn sample(family: &str, labels: &[(&str, &str)], value: f64) -> BifrostMetricSample {
-        BifrostMetricSample {
-            family: family.to_owned(),
-            labels: labels
-                .iter()
-                .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
-                .collect(),
-            value,
-            kind: if labels.iter().any(|(key, _)| *key == "le") {
-                BifrostMetricKind::HistogramBucket
-            } else if family.ends_with("_total") && family != "oracle_queries_active" {
-                BifrostMetricKind::Counter
-            } else {
-                BifrostMetricKind::Gauge
-            },
-        }
-    }
-
-    /// Construct one normalized histogram count sample for mapper tests.
-    fn histogram_count(family: &str, labels: &[(&str, &str)], value: f64) -> BifrostMetricSample {
-        let mut sample = sample(family, labels, value);
-        sample.kind = BifrostMetricKind::HistogramCount;
-        sample
-    }
-
-    /// Construct one normalized histogram sum sample for mapper tests.
-    fn histogram_sum(family: &str, labels: &[(&str, &str)], value: f64) -> BifrostMetricSample {
-        let mut sample = sample(family, labels, value);
-        sample.kind = BifrostMetricKind::HistogramSum;
-        sample
-    }
 
     /// Construct one normalized captured production span for mapper tests.
     fn captured_span(name: &str, attributes: &[(&str, &str)]) -> CapturedSpan {
@@ -3924,11 +3919,20 @@ mod tests {
             EmitterContractFixture {
                 id: "forge.backlog_peak",
                 selectors: &[],
-                family: "bifrost_forge_oldest_backlog_seconds",
+                family: "bifrost_forge_pending_tasks",
                 kind: Gauge,
-                keys: &[],
-                domains: &[],
-                unit: Seconds,
+                keys: &["task_type"],
+                domains: &[(
+                    "task_type",
+                    &[
+                        "scribe_promotion",
+                        "small_files",
+                        "snapshot_expiry",
+                        "expired_cleanup",
+                        "orphan_cleanup",
+                    ],
+                )],
+                unit: Count,
                 aggregation: Peak,
                 requirement: Role("forge"),
                 destination: "binding validation",
@@ -4020,11 +4024,33 @@ mod tests {
             },
             EmitterContractFixture {
                 id: "forge.publications",
-                selectors: &[],
-                family: "bifrost_forge_complete_gauge_publications_total",
+                selectors: &[("result", "succeeded")],
+                family: "bifrost_forge_task_attempts_total",
                 kind: Counter,
-                keys: &[],
-                domains: &[],
+                keys: &["task_type", "result"],
+                domains: &[
+                    (
+                        "task_type",
+                        &[
+                            "scribe_promotion",
+                            "small_files",
+                            "snapshot_expiry",
+                            "expired_cleanup",
+                            "orphan_cleanup",
+                        ],
+                    ),
+                    (
+                        "result",
+                        &[
+                            "succeeded",
+                            "retry",
+                            "failed",
+                            "cancelled",
+                            "refused",
+                            "uncertain",
+                        ],
+                    ),
+                ],
                 unit: Count,
                 aggregation: Delta,
                 requirement: Role("forge"),
@@ -4033,10 +4059,19 @@ mod tests {
             EmitterContractFixture {
                 id: "forge.rewrite_input_files",
                 selectors: &[],
-                family: "bifrost_forge_rewrite_input_files_total",
+                family: "bifrost_forge_input_files_total",
                 kind: Counter,
-                keys: &["source"],
-                domains: &[("source", &["staging", "iceberg"])],
+                keys: &["task_type"],
+                domains: &[(
+                    "task_type",
+                    &[
+                        "scribe_promotion",
+                        "small_files",
+                        "snapshot_expiry",
+                        "expired_cleanup",
+                        "orphan_cleanup",
+                    ],
+                )],
                 unit: Count,
                 aggregation: Delta,
                 requirement: Role("forge"),
@@ -4045,10 +4080,19 @@ mod tests {
             EmitterContractFixture {
                 id: "forge.rewrite_input_bytes",
                 selectors: &[],
-                family: "bifrost_forge_rewrite_input_bytes_total",
+                family: "bifrost_forge_input_bytes_total",
                 kind: Counter,
-                keys: &["source"],
-                domains: &[("source", &["staging", "iceberg"])],
+                keys: &["task_type"],
+                domains: &[(
+                    "task_type",
+                    &[
+                        "scribe_promotion",
+                        "small_files",
+                        "snapshot_expiry",
+                        "expired_cleanup",
+                        "orphan_cleanup",
+                    ],
+                )],
                 unit: Bytes,
                 aggregation: Delta,
                 requirement: Role("forge"),
@@ -4057,10 +4101,19 @@ mod tests {
             EmitterContractFixture {
                 id: "forge.rewrite_output_files",
                 selectors: &[],
-                family: "bifrost_forge_rewrite_output_files_total",
+                family: "bifrost_forge_output_files_total",
                 kind: Counter,
-                keys: &["source"],
-                domains: &[("source", &["staging", "iceberg"])],
+                keys: &["task_type"],
+                domains: &[(
+                    "task_type",
+                    &[
+                        "scribe_promotion",
+                        "small_files",
+                        "snapshot_expiry",
+                        "expired_cleanup",
+                        "orphan_cleanup",
+                    ],
+                )],
                 unit: Count,
                 aggregation: Delta,
                 requirement: Role("forge"),
@@ -4069,10 +4122,19 @@ mod tests {
             EmitterContractFixture {
                 id: "forge.rewrite_output_bytes",
                 selectors: &[],
-                family: "bifrost_forge_rewrite_output_bytes_total",
+                family: "bifrost_forge_output_bytes_total",
                 kind: Counter,
-                keys: &["source"],
-                domains: &[("source", &["staging", "iceberg"])],
+                keys: &["task_type"],
+                domains: &[(
+                    "task_type",
+                    &[
+                        "scribe_promotion",
+                        "small_files",
+                        "snapshot_expiry",
+                        "expired_cleanup",
+                        "orphan_cleanup",
+                    ],
+                )],
                 unit: Bytes,
                 aggregation: Delta,
                 requirement: Role("forge"),

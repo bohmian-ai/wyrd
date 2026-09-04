@@ -475,94 +475,7 @@ async fn forge_metrics_describe_real_data_flow() {
         );
     }
 
-    // Every settled route measured the episode it owned, so a missing duration
-    // observation is an attempt counted without the latency it actually took.
-    for task_type in routes {
-        let observed: u64 = snapshot
-            .histograms
-            .iter()
-            .filter(|(name, _)| {
-                name.starts_with("bifrost_forge_task_duration_seconds{")
-                    && name.contains(&format!("task_type=\"{task_type}\""))
-            })
-            .map(|(_, value)| value.count)
-            .sum();
-        assert!(observed > 0, "{task_type} observed no attempt duration");
-    }
-
-    // Physical data flow is reported only by the routes that move files, and
-    // only under the durable strategy that committed the effect.
-    for family in [
-        "bifrost_forge_input_files_total",
-        "bifrost_forge_input_bytes_total",
-        "bifrost_forge_output_files_total",
-        "bifrost_forge_output_bytes_total",
-    ] {
-        for task_type in ["scribe_promotion", "small_files"] {
-            assert!(
-                counter_total(&snapshot, family, &[("task_type", task_type)]) > 0,
-                "{family} reported nothing for {task_type}"
-            );
-        }
-        for name in snapshot
-            .counters
-            .keys()
-            .filter(|name| name.starts_with(&format!("{family}{{")))
-        {
-            assert!(
-                name.contains("task_type=\"scribe_promotion\"")
-                    || name.contains("task_type=\"small_files\""),
-                "{name} claims data flow for a route that rewrites nothing"
-            );
-        }
-    }
-
-    // Expiration counts the individual snapshots it removed, unlabelled because
-    // only one route can remove one.
-    assert!(
-        snapshot
-            .counters
-            .get("bifrost_forge_snapshots_expired_total")
-            .copied()
-            .unwrap_or_default()
-            > 0,
-        "the settled expiration reported no removed snapshot"
-    );
-
-    // Deletions are emitted at the delete boundary itself, so the counter can
-    // never exceed the deletes the real object store was actually asked for,
-    // and only the two cleanup routes delete anything.
-    let deleted = counter_total(&snapshot, "bifrost_forge_deleted_objects_total", &[]);
-    assert!(
-        deleted <= table.store.deletes() as u64,
-        "{deleted} deletions were counted for {} real object-store deletes",
-        table.store.deletes()
-    );
-    for name in snapshot
-        .counters
-        .keys()
-        .filter(|name| name.starts_with("bifrost_forge_deleted_objects_total{"))
-    {
-        assert!(
-            name.contains("task_type=\"expired_cleanup\"")
-                || name.contains("task_type=\"orphan_cleanup\""),
-            "{name} claims a deletion for a route that deletes nothing"
-        );
-    }
-
-    // The active gauge rose while each route owned its claim; the balance
-    // assertion below then proves it came back down.
-    for task_type in routes {
-        let peak = snapshot
-            .gauge_peaks
-            .iter()
-            .filter(|(name, _)| {
-                name.starts_with("bifrost_forge_active_tasks{")
-                    && name.contains(&format!("task_type=\"{task_type}\""))
-            })
-            .fold(0.0_f64, |peak, (_, value)| peak.max(*value));
-        assert!(peak > 0.0, "{task_type} never held an active attempt");
-    }
+    assert_route_data_flow(&snapshot, routes, table.store.deletes());
 
     // The guard decrements on every exit, so a settled route that still owns
     // active work is a leaked attempt rather than a slow one.
@@ -671,65 +584,16 @@ async fn coordinator_and_worker_delete_only_exact_never_published_generation() {
     // Drive the real coordinator and worker until an orphan-cleanup task has
     // settled. Earlier passes still owe compaction, so the loop also proves the
     // orphan route is reached without pre-empting the strategies ahead of it.
-    let mut settled_orphan = None;
-    let mut cursors: Vec<String> = Vec::new();
-    for _ in 0..64 {
-        supervisor.schedule_only().await;
-        let tasks = settled_tasks(&promoted.fixture).await;
-        if let Some((task_id, _, _)) = tasks
-            .iter()
-            .find(|(_, strategy, state)| strategy == "orphan_cleanup" && state == "succeeded")
-        {
-            settled_orphan = Some(*task_id);
-            break;
-        }
-        // Retry backoff is wall-clock and unrelated to what this scenario
-        // proves, so the existing fixture aging retires it instead of sleeping.
-        promoted.fixture.clear_task_backoff().await;
-        let claimable: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM vala.forge_tasks WHERE data_tenant_id=$1 \
-             AND state IN ('ready','retryable') AND ready_at <= now()",
-        )
-        .bind(promoted.fixture.tenant.as_uuid())
-        .fetch_one(promoted.fixture.operator_pool.pool())
-        .await
-        .expect("claimable Forge tasks are readable");
-        if claimable > 0 {
-            supervisor.restart_worker();
-            supervisor.settle_some_success().await;
-        }
-        if let Some((orphan_id, _, _)) = tasks
-            .iter()
-            .find(|(_, strategy, _)| strategy == "orphan_cleanup")
-        {
-            let (_, evidence) =
-                super::orphan_cleanup::orphan_task_row(&promoted.fixture, *orphan_id).await;
-            if evidence.is_some() {
-                let cursor = super::orphan_cleanup::cursor_of(evidence.as_ref());
-                if cursors.last() != Some(&cursor) {
-                    cursors.push(cursor);
-                }
-            }
-        }
-    }
-    let observed = settled_tasks(&promoted.fixture).await;
-    let task_id = settled_orphan.unwrap_or_else(|| {
-        panic!("the production route settles one orphan-cleanup task; saw {observed:?}")
-    });
+    let (task_id, cursors) = drive_until_orphan_settles(&mut supervisor, &promoted.fixture).await;
 
-    // Only the exact rowless generation is gone.
-    for path in &rowless {
-        assert!(
-            !object_exists(&promoted.fixture, path).await,
-            "the never-published output {path} survived its own collection route"
-        );
-    }
-    for path in lookalikes.iter().chain(protected.iter()).chain(live.iter()) {
-        assert!(
-            object_exists(&promoted.fixture, path).await,
-            "a protected, live, or invalid object was collected: {path}"
-        );
-    }
+    assert_only_the_rowless_generation_is_gone(
+        &promoted.fixture,
+        &rowless,
+        &lookalikes,
+        &protected,
+        &live,
+    )
+    .await;
 
     // The durable cursor survives the worker restarts the loop already made.
     let (state, evidence) =
@@ -759,6 +623,7 @@ async fn coordinator_and_worker_delete_only_exact_never_published_generation() {
 
     // No destructive sibling route ran: the table never owed an expiration or a
     // cleanup handoff, so nothing but collection could have removed an object.
+    let observed = settled_tasks(&promoted.fixture).await;
     assert!(
         observed
             .iter()
@@ -782,4 +647,196 @@ async fn coordinator_and_worker_delete_only_exact_never_published_generation() {
     );
 
     supervisor.shutdown().await;
+}
+
+/// Asserts each production route reported the data flow it actually performed.
+///
+/// Split out of the driving test so each boundary — duration, file and byte
+/// throughput, expiration, deletion, and the active gauge's rise — reads as one
+/// statement about one family rather than as one long block.
+///
+/// # Panics
+///
+/// Panics when a route reported no duration, no throughput, a deletion it did
+/// not perform, or never held an active attempt.
+fn assert_route_data_flow(
+    snapshot: &wyrd_bench::BenchmarkMetricSnapshot,
+    routes: [&str; 5],
+    real_deletes: usize,
+) {
+    // Every settled route measured the episode it owned, so a missing duration
+    // observation is an attempt counted without the latency it actually took.
+    for task_type in routes {
+        let observed: u64 = snapshot
+            .histograms
+            .iter()
+            .filter(|(name, _)| {
+                name.starts_with("bifrost_forge_task_duration_seconds{")
+                    && name.contains(&format!("task_type=\"{task_type}\""))
+            })
+            .map(|(_, value)| value.count)
+            .sum();
+        assert!(observed > 0, "{task_type} observed no attempt duration");
+    }
+
+    // Physical data flow is reported only by the routes that move files, and
+    // only under the durable strategy that committed the effect.
+    for family in [
+        "bifrost_forge_input_files_total",
+        "bifrost_forge_input_bytes_total",
+        "bifrost_forge_output_files_total",
+        "bifrost_forge_output_bytes_total",
+    ] {
+        for task_type in ["scribe_promotion", "small_files"] {
+            assert!(
+                counter_total(snapshot, family, &[("task_type", task_type)]) > 0,
+                "{family} reported nothing for {task_type}"
+            );
+        }
+        for name in snapshot
+            .counters
+            .keys()
+            .filter(|name| name.starts_with(&format!("{family}{{")))
+        {
+            assert!(
+                name.contains("task_type=\"scribe_promotion\"")
+                    || name.contains("task_type=\"small_files\""),
+                "{name} claims data flow for a route that rewrites nothing"
+            );
+        }
+    }
+
+    // Expiration counts the individual snapshots it removed, unlabelled because
+    // only one route can remove one.
+    assert!(
+        snapshot
+            .counters
+            .get("bifrost_forge_snapshots_expired_total")
+            .copied()
+            .unwrap_or_default()
+            > 0,
+        "the settled expiration reported no removed snapshot"
+    );
+
+    // Deletions are emitted at the delete boundary itself, so the counter can
+    // never exceed the deletes the real object store was actually asked for,
+    // and only the two cleanup routes delete anything.
+    let deleted = counter_total(snapshot, "bifrost_forge_deleted_objects_total", &[]);
+    assert!(
+        deleted <= real_deletes as u64,
+        "{deleted} deletions were counted for {real_deletes} real object-store deletes"
+    );
+    for name in snapshot
+        .counters
+        .keys()
+        .filter(|name| name.starts_with("bifrost_forge_deleted_objects_total{"))
+    {
+        assert!(
+            name.contains("task_type=\"expired_cleanup\"")
+                || name.contains("task_type=\"orphan_cleanup\""),
+            "{name} claims a deletion for a route that deletes nothing"
+        );
+    }
+
+    // The active gauge rose while each route owned its claim; the balance
+    // assertion below then proves it came back down.
+    for task_type in routes {
+        let peak = snapshot
+            .gauge_peaks
+            .iter()
+            .filter(|(name, _)| {
+                name.starts_with("bifrost_forge_active_tasks{")
+                    && name.contains(&format!("task_type=\"{task_type}\""))
+            })
+            .fold(0.0_f64, |peak, (_, value)| peak.max(*value));
+        assert!(peak > 0.0, "{task_type} never held an active attempt");
+    }
+}
+
+/// Drives the real coordinator and worker until an orphan-cleanup task settles.
+///
+/// Earlier passes still owe compaction, so this also proves the orphan route is
+/// reached without pre-empting the strategies ahead of it. Returns the settled
+/// task id and every distinct durable cursor observed along the way.
+///
+/// # Panics
+///
+/// Panics when no orphan-cleanup task settles within the bounded pass budget.
+async fn drive_until_orphan_settles(
+    supervisor: &mut SupervisedPromotion,
+    fixture: &PromotionIntegrationFixture,
+) -> (uuid::Uuid, Vec<String>) {
+    let mut settled_orphan = None;
+    let mut cursors: Vec<String> = Vec::new();
+    for _ in 0..64 {
+        supervisor.schedule_only().await;
+        let tasks = settled_tasks(fixture).await;
+        if let Some((task_id, _, _)) = tasks
+            .iter()
+            .find(|(_, strategy, state)| strategy == "orphan_cleanup" && state == "succeeded")
+        {
+            settled_orphan = Some(*task_id);
+            break;
+        }
+        // Retry backoff is wall-clock and unrelated to what this scenario
+        // proves, so the existing fixture aging retires it instead of sleeping.
+        fixture.clear_task_backoff().await;
+        let claimable: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM vala.forge_tasks WHERE data_tenant_id=$1 \
+             AND state IN ('ready','retryable') AND ready_at <= now()",
+        )
+        .bind(fixture.tenant.as_uuid())
+        .fetch_one(fixture.operator_pool.pool())
+        .await
+        .expect("claimable Forge tasks are readable");
+        if claimable > 0 {
+            supervisor.restart_worker();
+            supervisor.settle_some_success().await;
+        }
+        if let Some((orphan_id, _, _)) = tasks
+            .iter()
+            .find(|(_, strategy, _)| strategy == "orphan_cleanup")
+        {
+            let (_, evidence) = super::orphan_cleanup::orphan_task_row(fixture, *orphan_id).await;
+            if evidence.is_some() {
+                let cursor = super::orphan_cleanup::cursor_of(evidence.as_ref());
+                if cursors.last() != Some(&cursor) {
+                    cursors.push(cursor);
+                }
+            }
+        }
+    }
+    let observed = settled_tasks(fixture).await;
+    let task_id = settled_orphan.unwrap_or_else(|| {
+        panic!("the production route settles one orphan-cleanup task; saw {observed:?}")
+    });
+    (task_id, cursors)
+}
+
+/// Asserts collection removed the rowless generation and nothing else.
+///
+/// # Panics
+///
+/// Panics when a never-published output survived or any protected, live, young,
+/// invalid, or foreign object was collected.
+async fn assert_only_the_rowless_generation_is_gone(
+    fixture: &PromotionIntegrationFixture,
+    rowless: &[String],
+    lookalikes: &[String],
+    protected: &[String],
+    live: &std::collections::BTreeSet<String>,
+) {
+    // Only the exact rowless generation is gone.
+    for path in rowless {
+        assert!(
+            !object_exists(fixture, path).await,
+            "the never-published output {path} survived its own collection route"
+        );
+    }
+    for path in lookalikes.iter().chain(protected.iter()).chain(live.iter()) {
+        assert!(
+            object_exists(fixture, path).await,
+            "a protected, live, or invalid object was collected: {path}"
+        );
+    }
 }

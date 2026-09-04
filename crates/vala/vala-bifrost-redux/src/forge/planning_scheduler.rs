@@ -28,7 +28,7 @@ use super::Forge;
 use super::compact::ForgeGroupKey;
 use super::error::ForgeError;
 use super::identity::task_table_binding;
-use super::metrics::ForgePendingTasks;
+use super::metrics::{ForgePendingTasks, ForgeTelemetry};
 use super::path::catalog_path_to_object_key;
 use super::planner::{
     ForgeCapacity, ForgeEnvelopeSizer, ForgePlanCandidate, ForgePlanCapacity, ForgePlanner,
@@ -592,7 +592,7 @@ impl<'forge> ForgeScheduler<'forge> {
             compaction_debt_bytes,
         };
         for task_type in &inserted {
-            self.forge.core.telemetry.record_task_created(*task_type);
+            ForgeTelemetry::record_task_created(*task_type);
         }
         #[cfg(feature = "test-support")]
         if result.acknowledged

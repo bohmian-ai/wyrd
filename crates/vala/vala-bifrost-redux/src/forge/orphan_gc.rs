@@ -41,6 +41,7 @@ use super::lease::ForgeLease;
 use super::lease::forge_lease_key;
 use super::live_reconcile::DestructiveMaintenance;
 use super::managed::identity::ForgeOutputIdentity;
+use super::metrics::ForgeTelemetry;
 use super::path::{catalog_path_to_object_key, validate_table_location};
 use super::protection_roots::OrphanProtectionRoots;
 
@@ -1451,9 +1452,7 @@ impl Forge {
                     // an object proven missing before the delete and an
                     // idempotent `NotFound`, neither of which is a deletion
                     // this fence performed.
-                    self.core
-                        .telemetry
-                        .record_deleted_objects(ForgeTaskStrategy::OrphanCleanup, 1);
+                    ForgeTelemetry::record_deleted_objects(ForgeTaskStrategy::OrphanCleanup, 1);
                     tally.deleted.push(path.as_str().to_owned());
                 }
                 Err(error) if error.kind() == ErrorKind::NotFound => {

@@ -4111,6 +4111,26 @@ mod pg_tests {
             .expect("clear tasks");
     }
 
+    /// Exact shape of one seeded unowned cleanup row.
+    ///
+    /// The recovery predicate is decided by the combination of strategy, state,
+    /// retained cursor, and time gate, so those travel together as one value
+    /// rather than as a long positional argument list.
+    struct UnownedCleanupRow<'a> {
+        /// Table this cleanup row belongs to.
+        table_name: &'a str,
+        /// Cleanup strategy the row is claimed under.
+        strategy: ForgeTaskStrategy,
+        /// Durable plan persisted with the row.
+        plan: &'a ForgeTaskPlan,
+        /// Exact durable state the row is parked in.
+        state: &'a str,
+        /// Retained cursor evidence the recovery claim must resume.
+        evidence: &'a serde_json::Value,
+        /// Whether the row's fair-claim time gate is still in the future.
+        deferred: bool,
+    }
+
     /// Inserts one unowned cleanup row carrying an exact durable cursor.
     ///
     /// Expired cleanup is only reachable through a validated expiration
@@ -4125,13 +4145,16 @@ mod pg_tests {
     async fn seed_unowned_cleanup_row(
         superuser: &PgPool,
         tenant: DataTenantId,
-        table_name: &str,
-        strategy: ForgeTaskStrategy,
-        plan: &ForgeTaskPlan,
-        state: &str,
-        evidence: &serde_json::Value,
-        deferred: bool,
+        row: UnownedCleanupRow<'_>,
     ) -> Uuid {
+        let UnownedCleanupRow {
+            table_name,
+            strategy,
+            plan,
+            state,
+            evidence,
+            deferred,
+        } = row;
         let task_id = Uuid::now_v7();
         sqlx::query(
             "INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,namespace_name,\
@@ -4277,7 +4300,16 @@ mod pg_tests {
                 ),
             ] {
                 let id = seed_unowned_cleanup_row(
-                    &admin, tenant, table_name, strategy, &plan, state, &evidence, false,
+                    &admin,
+                    tenant,
+                    UnownedCleanupRow {
+                        table_name,
+                        strategy,
+                        plan: &plan,
+                        state,
+                        evidence: &evidence,
+                        deferred: false,
+                    },
                 )
                 .await;
                 assert!(
@@ -4306,12 +4338,14 @@ mod pg_tests {
         let deferred = seed_unowned_cleanup_row(
             &admin,
             tenant,
-            "deferred",
-            ForgeTaskStrategy::OrphanCleanup,
-            &orphan_plan(&prefix, 1_700_000_000_000),
-            "retryable",
-            &cursor,
-            true,
+            UnownedCleanupRow {
+                table_name: "deferred",
+                strategy: ForgeTaskStrategy::OrphanCleanup,
+                plan: &orphan_plan(&prefix, 1_700_000_000_000),
+                state: "retryable",
+                evidence: &cursor,
+                deferred: true,
+            },
         )
         .await;
         assert!(

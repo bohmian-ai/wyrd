@@ -16,6 +16,7 @@ use super::compact::ForgeGroupKey;
 use super::compact::ForgeTableKey;
 use super::error::ForgeError;
 use super::lease::ForgeLease;
+use super::metrics::ForgeTelemetry;
 use super::path::catalog_path_to_object_key;
 use crate::catalog::TenantTableBinding;
 use crate::catalog::layout::TimePartition;
@@ -364,22 +365,8 @@ impl Forge {
                 .map(String::as_str);
             let (forge_operation_id, forge_group) =
                 parse_snapshot_forge_identity(workflow, operation, group)?;
-            let rewrite_volume = forge_operation_id.and_then(|_| {
-                let properties: BTreeMap<_, _> = snapshot
-                    .summary()
-                    .additional_properties
-                    .iter()
-                    .map(|(key, value)| (key.clone(), value.clone()))
-                    .collect();
-                super::publication::RewriteSnapshotProperties::validate(&properties)
-                    .ok()
-                    .map(|properties| RecoveredRewriteVolume {
-                        removed_data_files: properties.removed_data_files,
-                        removed_bytes: properties.removed_bytes,
-                        added_data_files: properties.added_data_files,
-                        added_bytes: properties.added_bytes,
-                    })
-            });
+            let rewrite_volume =
+                forge_operation_id.and_then(|_| recovered_rewrite_volume(snapshot));
             let list = table
                 .manifest_list_reader(snapshot)
                 .load()
@@ -530,12 +517,12 @@ impl Forge {
                 )
                 .await?;
                 if let Some(volume) = volume {
-                    self.core.telemetry.record_input(
+                    ForgeTelemetry::record_input(
                         ForgeTaskStrategy::SmallFiles,
                         volume.removed_data_files,
                         volume.removed_bytes,
                     );
-                    self.core.telemetry.record_output(
+                    ForgeTelemetry::record_output(
                         ForgeTaskStrategy::SmallFiles,
                         volume.added_data_files,
                         volume.added_bytes,
@@ -890,6 +877,31 @@ fn iceberg_terminal_detail(
         input_paths: input_paths.clone(),
         output_paths: output_paths.clone(),
     })
+}
+
+/// Reads the canonical rewrite volume a published snapshot recorded, if any.
+///
+/// Recovery must report the same file and byte counts the original commit did,
+/// so the numbers come from the snapshot's own validated rewrite properties
+/// rather than from a fresh scan. A snapshot that carries no valid rewrite
+/// property set reports nothing.
+fn recovered_rewrite_volume(
+    snapshot: &iceberg::spec::SnapshotRef,
+) -> Option<RecoveredRewriteVolume> {
+    let properties: BTreeMap<_, _> = snapshot
+        .summary()
+        .additional_properties
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    super::publication::RewriteSnapshotProperties::validate(&properties)
+        .ok()
+        .map(|properties| RecoveredRewriteVolume {
+            removed_data_files: properties.removed_data_files,
+            removed_bytes: properties.removed_bytes,
+            added_data_files: properties.added_data_files,
+            added_bytes: properties.added_bytes,
+        })
 }
 
 #[cfg(test)]

@@ -1295,6 +1295,31 @@ impl Forge {
     }
 }
 
+/// Constructs the shared closed-schema span for one catalog commit future.
+///
+/// Catalog commit detail is protocol evidence rather than a public metric, so
+/// it lives here as a structured trace. Only the strategy, result, role, and
+/// scrubbed durable task UUIDs are owner-authored: tenant, table, SQL,
+/// object-path, and error details must never be added by callers.
+pub(super) fn catalog_commit_span(
+    strategy: &'static str,
+    task_identity: Option<(Uuid, Uuid)>,
+) -> tracing::Span {
+    let span = tracing::info_span!(
+        "bifrost.forge.catalog.commit",
+        strategy,
+        result = tracing::field::Empty,
+        role = "forge_worker",
+        task_id = tracing::field::Empty,
+        attempt_id = tracing::field::Empty,
+    );
+    if let Some((task_id, attempt_id)) = task_identity {
+        span.record("task_id", tracing::field::display(task_id));
+        span.record("attempt_id", tracing::field::display(attempt_id));
+    }
+    span
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -2147,29 +2172,4 @@ mod tests {
             "an unrepresentable budget refuses instead of producing an unbounded call"
         );
     }
-}
-
-/// Constructs the shared closed-schema span for one catalog commit future.
-///
-/// Catalog commit detail is protocol evidence rather than a public metric, so
-/// it lives here as a structured trace. Only the strategy, result, role, and
-/// scrubbed durable task UUIDs are owner-authored: tenant, table, SQL,
-/// object-path, and error details must never be added by callers.
-pub(super) fn catalog_commit_span(
-    strategy: &'static str,
-    task_identity: Option<(Uuid, Uuid)>,
-) -> tracing::Span {
-    let span = tracing::info_span!(
-        "bifrost.forge.catalog.commit",
-        strategy,
-        result = tracing::field::Empty,
-        role = "forge_worker",
-        task_id = tracing::field::Empty,
-        attempt_id = tracing::field::Empty,
-    );
-    if let Some((task_id, attempt_id)) = task_identity {
-        span.record("task_id", tracing::field::display(task_id));
-        span.record("attempt_id", tracing::field::display(attempt_id));
-    }
-    span
 }

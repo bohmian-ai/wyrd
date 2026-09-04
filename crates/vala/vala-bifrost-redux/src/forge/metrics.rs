@@ -144,7 +144,7 @@ impl ForgeTelemetry {
     }
 
     /// Counts one new durable task row after its transaction commits.
-    pub(super) fn record_task_created(&self, task_type: ForgeTaskStrategy) {
+    pub(super) fn record_task_created(task_type: ForgeTaskStrategy) {
         metrics::counter!(
             "bifrost_forge_tasks_created_total",
             "task_type" => task_type.as_str()
@@ -157,7 +157,6 @@ impl ForgeTelemetry {
     /// Duration measures successful claim through durable result and excludes
     /// queue time, so it is recorded only once the durable state is known.
     pub(super) fn record_task_attempt(
-        &self,
         task_type: ForgeTaskStrategy,
         result: ForgeTaskResult,
         elapsed: Duration,
@@ -180,11 +179,7 @@ impl ForgeTelemetry {
     ///
     /// Recorded after the corresponding settlement transaction commits so the
     /// counter never claims a failure the durable record does not hold.
-    pub(super) fn record_task_failure(
-        &self,
-        task_type: ForgeTaskStrategy,
-        reason: ForgeFailureClass,
-    ) {
+    pub(super) fn record_task_failure(task_type: ForgeTaskStrategy, reason: ForgeFailureClass) {
         metrics::counter!(
             "bifrost_forge_task_failures_total",
             "task_type" => task_type.as_str(),
@@ -194,7 +189,7 @@ impl ForgeTelemetry {
     }
 
     /// Counts logical input files and bytes a committed effect consumed.
-    pub(super) fn record_input(&self, task_type: ForgeTaskStrategy, files: u64, bytes: u64) {
+    pub(super) fn record_input(task_type: ForgeTaskStrategy, files: u64, bytes: u64) {
         metrics::counter!(
             "bifrost_forge_input_files_total",
             "task_type" => task_type.as_str()
@@ -208,7 +203,7 @@ impl ForgeTelemetry {
     }
 
     /// Counts published output files and bytes a committed effect produced.
-    pub(super) fn record_output(&self, task_type: ForgeTaskStrategy, files: u64, bytes: u64) {
+    pub(super) fn record_output(task_type: ForgeTaskStrategy, files: u64, bytes: u64) {
         metrics::counter!(
             "bifrost_forge_output_files_total",
             "task_type" => task_type.as_str()
@@ -226,7 +221,7 @@ impl ForgeTelemetry {
     /// Emitted at the delete boundary itself: pre-delete missing, refused,
     /// uncertain, and recovery-already-absent objects contribute nothing, so
     /// the storage API's idempotent success is never read as a deletion.
-    pub(super) fn record_deleted_objects(&self, task_type: ForgeTaskStrategy, deleted: u64) {
+    pub(super) fn record_deleted_objects(task_type: ForgeTaskStrategy, deleted: u64) {
         metrics::counter!(
             "bifrost_forge_deleted_objects_total",
             "task_type" => task_type.as_str()
@@ -235,7 +230,7 @@ impl ForgeTelemetry {
     }
 
     /// Counts individual snapshots a committed or recovered expiration removed.
-    pub(super) fn record_snapshots_expired(&self, snapshots: u64) {
+    pub(super) fn record_snapshots_expired(snapshots: u64) {
         metrics::counter!("bifrost_forge_snapshots_expired_total").increment(snapshots);
     }
 
@@ -379,6 +374,58 @@ mod tests {
             .collect();
         (family.to_owned(), labels)
     }
+    /// Asserts every observed series carries only approved labels and values.
+    ///
+    /// Label cardinality is the operational risk in this catalog, so the check
+    /// is exhaustive in both directions: an unknown label key or an unlisted
+    /// value fails, and so does any ownership identity that would make a series
+    /// unbounded.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a series carries an unapproved label key, an unapproved
+    /// value, or an ownership identity.
+    fn assert_label_vocabulary_is_closed(snapshot: &wyrd_bench::BenchmarkMetricSnapshot) {
+        let task_types = TASK_TYPES
+            .iter()
+            .map(|task_type| task_type.as_str())
+            .collect::<BTreeSet<_>>();
+        let results = TASK_RESULTS
+            .iter()
+            .map(|result| result.as_str())
+            .collect::<BTreeSet<_>>();
+        let reasons = FAILURE_CLASSES
+            .iter()
+            .map(|reason| reason.as_str())
+            .collect::<BTreeSet<_>>();
+        for series in snapshot
+            .counters
+            .keys()
+            .chain(snapshot.gauges.keys())
+            .chain(snapshot.histograms.keys())
+        {
+            for (key, value) in parse_series(series).1 {
+                let allowed = match key.as_str() {
+                    "task_type" => &task_types,
+                    "result" => &results,
+                    "reason" => &reasons,
+                    other => panic!("{series} carries the unapproved label key {other}"),
+                };
+                assert!(
+                    allowed.contains(value.as_str()),
+                    "{series} carries the unapproved {key} value {value}"
+                );
+            }
+            for forbidden in [
+                "tenant", "table", "task_id", "attempt", "snapshot", "path", "request",
+            ] {
+                assert!(
+                    !series.contains(&format!("{forbidden}=")),
+                    "{series} carries the ownership label {forbidden}"
+                );
+            }
+        }
+    }
 
     /// Forge publishes exactly its approved, bounded, balanced catalog.
     ///
@@ -401,22 +448,22 @@ mod tests {
             let registered = recorder.snapshot();
 
             for task_type in TASK_TYPES {
-                telemetry.record_task_created(task_type);
-                telemetry.record_input(task_type, 2, 2048);
-                telemetry.record_output(task_type, 1, 1024);
-                telemetry.record_deleted_objects(task_type, 1);
+                ForgeTelemetry::record_task_created(task_type);
+                ForgeTelemetry::record_input(task_type, 2, 2048);
+                ForgeTelemetry::record_output(task_type, 1, 1024);
+                ForgeTelemetry::record_deleted_objects(task_type, 1);
             }
             for result in TASK_RESULTS {
-                telemetry.record_task_attempt(
+                ForgeTelemetry::record_task_attempt(
                     ForgeTaskStrategy::SmallFiles,
                     result,
                     Duration::from_millis(5),
                 );
             }
             for reason in FAILURE_CLASSES {
-                telemetry.record_task_failure(ForgeTaskStrategy::SmallFiles, reason);
+                ForgeTelemetry::record_task_failure(ForgeTaskStrategy::SmallFiles, reason);
             }
-            telemetry.record_snapshots_expired(3);
+            ForgeTelemetry::record_snapshots_expired(3);
             telemetry.publish_planning_status(4, 1_767_312_000);
             telemetry.publish_pending_tasks(&[ForgePendingTasks {
                 task_type: ForgeTaskStrategy::SmallFiles,
@@ -470,45 +517,7 @@ mod tests {
             "Forge published a family outside the approved catalog"
         );
 
-        let task_types = TASK_TYPES
-            .iter()
-            .map(|task_type| task_type.as_str())
-            .collect::<BTreeSet<_>>();
-        let results = TASK_RESULTS
-            .iter()
-            .map(|result| result.as_str())
-            .collect::<BTreeSet<_>>();
-        let reasons = FAILURE_CLASSES
-            .iter()
-            .map(|reason| reason.as_str())
-            .collect::<BTreeSet<_>>();
-        for series in snapshot
-            .counters
-            .keys()
-            .chain(snapshot.gauges.keys())
-            .chain(snapshot.histograms.keys())
-        {
-            for (key, value) in parse_series(series).1 {
-                let allowed = match key.as_str() {
-                    "task_type" => &task_types,
-                    "result" => &results,
-                    "reason" => &reasons,
-                    other => panic!("{series} carries the unapproved label key {other}"),
-                };
-                assert!(
-                    allowed.contains(value.as_str()),
-                    "{series} carries the unapproved {key} value {value}"
-                );
-            }
-            for forbidden in [
-                "tenant", "table", "task_id", "attempt", "snapshot", "path", "request",
-            ] {
-                assert!(
-                    !series.contains(&format!("{forbidden}=")),
-                    "{series} carries the ownership label {forbidden}"
-                );
-            }
-        }
+        assert_label_vocabulary_is_closed(&snapshot);
 
         // The guard's decrement lives in Drop, so both the ordinary exit and
         // the unwind must have returned their increment.

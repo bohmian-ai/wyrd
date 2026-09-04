@@ -45,7 +45,7 @@ use super::error::{ForgeError, ForgeFailureClass};
 use super::expire::ExpiryTaskAuthority;
 use super::identity::task_table_binding;
 use super::lease::{ForgeLease, forge_lease_key};
-use super::metrics::ForgeTaskResult;
+use super::metrics::{ForgeTaskResult, ForgeTelemetry};
 use super::orphan_gc::{ExpiredCleanupExemption, GcEligibility, ObjectEvidence};
 use super::path::catalog_path_to_object_key;
 use super::scribe_promotion::{
@@ -255,12 +255,24 @@ struct ForgeCommittedVolume {
     output_bytes: u64,
 }
 
+/// One committed publication and the exact volume its commit measured.
+///
+/// Boxed into its dispatch variant because the loaded table dominates every
+/// other outcome's size, and an inline copy would make each dispatch result as
+/// large as its largest arm.
+struct ForgeCommittedPublication {
+    /// Table as it stands after the publication's own commit.
+    table: Table,
+    /// Exact file and byte volume, when the committing owner measured it.
+    volume: Option<ForgeCommittedVolume>,
+}
+
 enum ForgeDispatchResult {
     /// Ordinary publication whose evidence is not yet Prepared.
     ///
     /// The volume is present only when the committing owner measured exact
     /// file and byte counts for this effect.
-    Committed(Table, Option<ForgeCommittedVolume>),
+    Committed(Box<ForgeCommittedPublication>),
     /// One snapshot-expiration pass with its exact post-expiry candidates.
     SnapshotExpiry(Box<ForgeSnapshotExpiryResult>),
     /// A fully drained expired-cleanup candidate set with its final evidence.
@@ -1265,24 +1277,25 @@ impl ForgeWorker {
     pub fn owner_for_test(&self) -> Uuid {
         self.owner
     }
-
-    /// Runs the fixed worker set until shutdown stops claims and drains slots.
+    /// Probes scratch, registers this worker, and drains its recoverable work.
     ///
-    /// Each slot claims at most one task at a time. Cancellation stops new
-    /// claims immediately; active operations observe the same token at their
-    /// established safe boundaries before the pool joins every slot.
+    /// This is everything that must succeed before a worker may advertise
+    /// itself: a writable spill volume, a durable healthy-worker registration,
+    /// and a complete recovery drain of every `Prepared` attempt and lapsed
+    /// claim it already owns. Readiness is published by the caller only when
+    /// this returns `true`.
     ///
     /// # Errors
     ///
-    /// Returns a slot panic or an unexpected slot-level configuration failure.
-    pub async fn run(
-        self,
-        shutdown: CancellationToken,
-        readiness: super::ForgeRoleReadiness,
-    ) -> Result<(), ForgeError> {
-        // Cleared on every exit, so a worker that stopped — cleanly, by
-        // quarantine, or by a slot failure — never keeps advertising itself.
-        let _readiness = ForgeWorkerReadinessGuard(readiness.clone());
+    /// Returns typed scratch IO when the spill volume cannot be identified,
+    /// SQL errors from quarantine or registration, and any settlement,
+    /// reconciliation, audit, catalog, object-store, or SQL failure the
+    /// recovery drain returns.
+    ///
+    /// Returns `Ok(false)` when the worker quarantined itself on its scratch
+    /// probe or shutdown was requested during recovery, so the caller returns
+    /// without ever publishing readiness.
+    async fn start_and_drain(&self, shutdown: &CancellationToken) -> Result<bool, ForgeError> {
         let volume = self.scratch_volume_identity()?;
         if let Err(error) = self.probe_scratch() {
             self.tasks
@@ -1290,7 +1303,7 @@ impl ForgeWorker {
                 .await
                 .map_err(ForgeError::Sql)?;
             tracing::error!(worker=%self.owner, error=%error, "Forge worker quarantined by startup scratch probe");
-            return Ok(());
+            return Ok(false);
         }
         #[cfg(feature = "test-support")]
         if let Some(observer) = &self.completion_observer
@@ -1313,8 +1326,28 @@ impl ForgeWorker {
         // Readiness is recovery-gated. A Prepared attempt or a lapsed claim is
         // durable evidence a reader can already observe, so this worker
         // resolves all of it before advertising itself and taking new work.
-        self.drain_recoverable_work(&shutdown).await?;
-        if shutdown.is_cancelled() {
+        self.drain_recoverable_work(shutdown).await?;
+        Ok(!shutdown.is_cancelled())
+    }
+
+    /// Runs the fixed worker set until shutdown stops claims and drains slots.
+    ///
+    /// Each slot claims at most one task at a time. Cancellation stops new
+    /// claims immediately; active operations observe the same token at their
+    /// established safe boundaries before the pool joins every slot.
+    ///
+    /// # Errors
+    ///
+    /// Returns a slot panic or an unexpected slot-level configuration failure.
+    pub async fn run(
+        self,
+        shutdown: CancellationToken,
+        readiness: super::ForgeRoleReadiness,
+    ) -> Result<(), ForgeError> {
+        // Cleared on every exit, so a worker that stopped — cleanly, by
+        // quarantine, or by a slot failure — never keeps advertising itself.
+        let _readiness = ForgeWorkerReadinessGuard(readiness.clone());
+        if !self.start_and_drain(&shutdown).await? {
             return Ok(());
         }
         readiness.publish(true);
@@ -1395,14 +1428,15 @@ impl ForgeWorker {
                     first_error = Some(error);
                 }
                 Ok(_) => {}
-                Err(error) if error.is_cancelled() => {}
-                Err(error) if first_error.is_none() => {
+                Err(error) if error.is_cancelled() || first_error.is_some() => {
+                    let _ = error;
+                }
+                Err(error) => {
                     readiness.publish(false);
                     first_error = Some(ForgeError::Invariant {
                         detail: format!("Forge worker slot panicked: {error}"),
                     });
                 }
-                Err(_) => {}
             }
         }
         if let Some(error) = first_error {
@@ -2435,10 +2469,7 @@ impl ForgeWorker {
         let Some(task_type) = Self::metric_strategy(&task.strategy) else {
             return;
         };
-        self.forge
-            .core
-            .telemetry
-            .record_task_attempt(task_type, result, elapsed);
+        ForgeTelemetry::record_task_attempt(task_type, result, elapsed);
     }
 
     /// Reads the authoritative post-attempt state and durable failure class.
@@ -2957,10 +2988,16 @@ impl ForgeWorker {
             })
             .await?
         {
-            ForgeDispatchResult::Committed(committed, volume) => self
-                .committed_evidence(binding, &committed)
+            ForgeDispatchResult::Committed(publication) => self
+                .committed_evidence(binding, &publication.table)
                 .await
-                .map(|evidence| (evidence, ForgeExecutionEvidenceState::Fresh, volume)),
+                .map(|evidence| {
+                    (
+                        evidence,
+                        ForgeExecutionEvidenceState::Fresh,
+                        publication.volume,
+                    )
+                }),
             ForgeDispatchResult::Cleaned(evidence) => {
                 Ok((*evidence, ForgeExecutionEvidenceState::Prepared, None))
             }
@@ -3099,7 +3136,7 @@ impl ForgeWorker {
         self.finish_claim_execution(claim, attempt, lease, &evidence, state)
             .await?;
         if !settled {
-            self.record_committed_volume(claim, volume);
+            Self::record_committed_volume(claim, volume);
         }
         Ok(true)
     }
@@ -3261,24 +3298,13 @@ impl ForgeWorker {
     /// Called only once the settlement transition for this attempt commits, and
     /// never for a state another owner already settled. A strategy this build
     /// does not know carries no `task_type`.
-    fn record_committed_volume(
-        &self,
-        claim: &ForgeTaskClaim,
-        volume: Option<ForgeCommittedVolume>,
-    ) {
+    fn record_committed_volume(claim: &ForgeTaskClaim, volume: Option<ForgeCommittedVolume>) {
         let (Some(volume), Some(task_type)) = (volume, Self::metric_strategy(&claim.strategy))
         else {
             return;
         };
-        self.forge
-            .core
-            .telemetry
-            .record_input(task_type, volume.input_files, volume.input_bytes);
-        self.forge.core.telemetry.record_output(
-            task_type,
-            volume.output_files,
-            volume.output_bytes,
-        );
+        ForgeTelemetry::record_input(task_type, volume.input_files, volume.input_bytes);
+        ForgeTelemetry::record_output(task_type, volume.output_files, volume.output_bytes);
     }
 
     /// Refreshes final authority and commits the appropriate success transition.
@@ -3540,7 +3566,12 @@ impl ForgeWorker {
             stop,
         } = request;
         if Self::current_snapshot_matches_task(&table, claim.task_id) {
-            return Ok(ForgeDispatchResult::Committed(table, None));
+            return Ok(ForgeDispatchResult::Committed(Box::new(
+                ForgeCommittedPublication {
+                    table,
+                    volume: None,
+                },
+            )));
         }
         if !Self::base_snapshot_matches(&table, claim.base_snapshot_id)
             && !Self::tolerates_base_drift(&claim.strategy)
@@ -4243,10 +4274,12 @@ impl ForgeWorker {
                 )?,
             )
             .await?;
-        Ok(ForgeDispatchResult::Committed(
-            committed,
-            Some(rewrite_volume(request)),
-        ))
+        Ok(ForgeDispatchResult::Committed(Box::new(
+            ForgeCommittedPublication {
+                table: committed,
+                volume: Some(rewrite_volume(request)),
+            },
+        )))
     }
 
     /// Decides what one non-success catalog outcome permits next.
@@ -4486,10 +4519,12 @@ impl ForgeWorker {
                 .await
             {
                 Ok(committed) => {
-                    return Ok(ForgeDispatchResult::Committed(
-                        committed,
-                        Some(Self::promotion_volume(claim)),
-                    ));
+                    return Ok(ForgeDispatchResult::Committed(Box::new(
+                        ForgeCommittedPublication {
+                            table: committed,
+                            volume: Some(Self::promotion_volume(claim)),
+                        },
+                    )));
                 }
                 Err(ForgeError::Catalog(error)) if !error.retryable() => error,
                 Err(error) => return Err(error),
@@ -4657,7 +4692,7 @@ impl ForgeWorker {
             },
         );
         if result.is_ok() {
-            self.record_expired_cleanup_completion(started);
+            Self::record_expired_cleanup_completion(started);
         }
         result
     }
@@ -5027,7 +5062,7 @@ impl ForgeWorker {
             }
             index = index.saturating_add(1);
         }
-        self.record_expired_cleanup_completion(started);
+        Self::record_expired_cleanup_completion(started);
         Ok(ForgeTaskEvidence {
             version: FORGE_TASK_PAYLOAD_VERSION,
             committed_snapshot_id: Some(payload.committed_snapshot_id),
@@ -5169,10 +5204,7 @@ impl ForgeWorker {
                 // `prove_cleanup_candidate` performed. Candidate settlement can
                 // still fail; recovery then observes the object already absent
                 // and adds nothing, so this object is counted exactly once.
-                self.forge
-                    .core
-                    .telemetry
-                    .record_deleted_objects(ForgeTaskStrategy::ExpiredCleanup, 1);
+                ForgeTelemetry::record_deleted_objects(ForgeTaskStrategy::ExpiredCleanup, 1);
                 Ok(ExpiredCleanupOutcome::Deleted)
             }
             Err(error) if error.kind() == opendal::ErrorKind::NotFound => {
@@ -5191,7 +5223,7 @@ impl ForgeWorker {
     }
 
     /// Reports the completed durable expired-cleanup obligation at its owner boundary.
-    fn record_expired_cleanup_completion(&self, started: Instant) {
+    fn record_expired_cleanup_completion(started: Instant) {
         tracing::debug!(
             elapsed_seconds = started.elapsed().as_secs_f64(),
             "Forge expired cleanup obligation completed"
@@ -5715,7 +5747,7 @@ impl ForgeWorker {
             ForgeError::Shutdown => self.release_cancelled_claim(claim.task_id, attempt).await,
             ForgeError::Capacity { .. } => {
                 self.record_capacity_refusal(claim.task_id, attempt).await?;
-                self.record_settled_failure(claim, ForgeFailureClass::CapacityRefused);
+                Self::record_settled_failure(claim, ForgeFailureClass::CapacityRefused);
                 Ok(())
             }
             ForgeError::ShutdownRetained => Ok(()),
@@ -5761,7 +5793,7 @@ impl ForgeWorker {
                 // Emitted after the retry or terminal transaction commits, so
                 // the counter never claims a failure the durable row does not
                 // hold, and exactly once per settled attempt.
-                self.record_settled_failure(claim, class);
+                Self::record_settled_failure(claim, class);
                 Ok(())
             }
         }
@@ -5772,12 +5804,9 @@ impl ForgeWorker {
     /// Called only after the corresponding retry, refusal, or terminal-failure
     /// transaction commits. A claim whose strategy this build does not know
     /// carries no `task_type`, so it is observed by the durable row instead.
-    fn record_settled_failure(&self, claim: &ForgeTaskClaim, class: ForgeFailureClass) {
+    fn record_settled_failure(claim: &ForgeTaskClaim, class: ForgeFailureClass) {
         if let Some(task_type) = Self::metric_strategy(&claim.strategy) {
-            self.forge
-                .core
-                .telemetry
-                .record_task_failure(task_type, class);
+            ForgeTelemetry::record_task_failure(task_type, class);
         }
     }
 
@@ -6566,13 +6595,13 @@ fn rewrite_volume(request: &super::publication::RewriteCommitRequest) -> ForgeCo
         input_bytes: request
             .removed_data_files
             .iter()
-            .map(|file| u64::try_from(file.file_size_in_bytes()).unwrap_or(0))
+            .map(iceberg::spec::DataFile::file_size_in_bytes)
             .sum(),
         output_files: request.added_data_files.len() as u64,
         output_bytes: request
             .added_data_files
             .iter()
-            .map(|file| u64::try_from(file.file_size_in_bytes()).unwrap_or(0))
+            .map(iceberg::spec::DataFile::file_size_in_bytes)
             .sum(),
     }
 }

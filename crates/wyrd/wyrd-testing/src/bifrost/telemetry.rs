@@ -1319,7 +1319,6 @@ pub(crate) struct ProcessWindow {
 /// Captured production telemetry emitted during one observation window.
 #[derive(Debug, Clone)]
 pub struct BifrostTelemetryDelta {
-    /// Production family inventory declared by the closing Prometheus scrape.
     /// Counter and histogram deltas from the one production render handle.
     pub metrics: Vec<BifrostMetricSample>,
     /// Gauge maxima observed by the production capture while the window ran.

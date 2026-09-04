@@ -40,6 +40,7 @@ use super::expiry_policy::{SnapshotExpiryDecision, SnapshotExpiryPolicy, Snapsho
 use super::lease::ForgeLease;
 #[cfg(feature = "test-support")]
 use super::lease::forge_lease_key;
+use super::metrics::ForgeTelemetry;
 
 const SYSTEM_PRINCIPAL: PrincipalId = PrincipalId::new(uuid::Uuid::nil());
 
@@ -372,7 +373,7 @@ impl Forge {
                 ForgeExpirationSettlement::Committed,
             )
             .await?;
-        self.record_expired_snapshots(&detail);
+        Self::record_expired_snapshots(&detail);
         outcome.settled_evidence = Some(evidence);
         outcome.recovered = outcome.recovered.saturating_add(1);
         Ok(outcome)
@@ -1106,7 +1107,7 @@ impl Forge {
                 settlement,
             )
             .await?;
-        self.record_expired_snapshots(&detail);
+        Self::record_expired_snapshots(&detail);
         outcome.settled_evidence = Some(evidence);
         outcome.recovered = 1;
         Ok(outcome)
@@ -1117,15 +1118,13 @@ impl Forge {
     /// Called only after committed or recovered settlement commits, and driven
     /// by the audited selection rather than a catalog re-read, so the count is
     /// exactly what the durable record says was expired.
-    fn record_expired_snapshots(&self, detail: &AuditDetail) {
+    fn record_expired_snapshots(detail: &AuditDetail) {
         if let AuditDetail::ForgeSnapshotExpire {
             selected_snapshot_ids,
             ..
         } = detail
         {
-            self.core
-                .telemetry
-                .record_snapshots_expired(selected_snapshot_ids.len() as u64);
+            ForgeTelemetry::record_snapshots_expired(selected_snapshot_ids.len() as u64);
         }
     }
 }

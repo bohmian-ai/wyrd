@@ -561,6 +561,69 @@
           }
         },
         {
+          "description": "A Forge metadata-only manifest rewrite and its Iceberg boundary.\n\nThe operation regroups manifest entries and nothing else: the data files the table logically contains are identical before and after it. Both path collections are exact and ordered, so a reader can prove which manifests were replaced by which without consulting the catalog.",
+          "type": "object",
+          "required": [
+            "base_metadata_location",
+            "group",
+            "input_manifest_paths",
+            "kind",
+            "operation_id",
+            "output_manifest_paths",
+            "phase"
+          ],
+          "properties": {
+            "base_metadata_location": {
+              "description": "Metadata location observed before the rewrite commit.",
+              "type": "string"
+            },
+            "committed_metadata_location": {
+              "description": "Metadata location returned by a proven commit, when known.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "group": {
+              "description": "Canonical tenant/table resource identity.",
+              "type": "string"
+            },
+            "input_manifest_paths": {
+              "description": "Exact ordered manifests replaced by the rewrite.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "forge_manifest_rewrite"
+              ]
+            },
+            "operation_id": {
+              "description": "Deterministic identifier shared by prepared and terminal rows.",
+              "type": "string",
+              "format": "uuid"
+            },
+            "output_manifest_paths": {
+              "description": "Exact ordered manifests written by the rewrite.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "phase": {
+              "description": "Durable phase represented by this audit row.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ForgeManifestRewritePhase"
+                }
+              ]
+            }
+          }
+        },
+        {
           "description": "One fenced Oracle reader epoch's durable lifecycle transition.\n\nThe epoch is a process fact rather than a tenant fact, so this event is appended under the system owner. Renewal is deliberately absent: it changes only the lease window and revision, and auditing every five seconds would bury the transitions that actually change what Forge may destroy.",
           "type": "object",
           "required": [
@@ -1589,6 +1652,39 @@
         },
         {
           "description": "Reconciliation proved the prepared operation was not committed.",
+          "type": "string",
+          "enum": [
+            "reset"
+          ]
+        }
+      ]
+    },
+    "ForgeManifestRewritePhase": {
+      "description": "Durable phase recorded for a Forge metadata-only manifest rewrite.\n\nThe rewrite writes new manifests and then swaps them in with one catalog commit, so it has the same recoverable external boundary as data rewrite: a prepared operation whose commit outcome is unknown is settled by reconciliation into exactly one of `Recovered` or `Reset`.",
+      "oneOf": [
+        {
+          "description": "The exact input and output manifests were fixed before the commit.",
+          "type": "string",
+          "enum": [
+            "prepared"
+          ]
+        },
+        {
+          "description": "The catalog commit completed and returned a metadata location.",
+          "type": "string",
+          "enum": [
+            "committed"
+          ]
+        },
+        {
+          "description": "Reconciliation proved a previously uncertain commit completed.",
+          "type": "string",
+          "enum": [
+            "recovered"
+          ]
+        },
+        {
+          "description": "Reconciliation proved the prepared commit was not applied.",
           "type": "string",
           "enum": [
             "reset"

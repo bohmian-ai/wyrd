@@ -195,11 +195,12 @@ struct ForgeSnapshotExpiryIntent {
 }
 
 impl ForgeSnapshotExpiryIntent {
-    /// Decodes the canonical snapshot-expiry plan or a pre-upgrade row.
+    /// Decodes the canonical snapshot-expiry plan.
     ///
-    /// Canonical rows carry the due flags the scheduler writes. A two-field
-    /// row predates those flags and can only mean snapshot expiry; accepting it
-    /// preserves ready/retryable work across a rolling upgrade.
+    /// Canonical rows carry exactly the four fields the scheduler writes: the
+    /// maintenance kind, its trigger commit count, and the two due flags. Any
+    /// other shape is refused, because no other shape was ever produced and a
+    /// fallback decoder would be an invented compatibility route.
     fn parse(strategy: &ForgeClaimStrategy, parameters: &Map<String, Value>) -> Option<Self> {
         if !matches!(
             strategy,
@@ -214,11 +215,6 @@ impl ForgeSnapshotExpiryIntent {
                 .is_none()
         {
             return None;
-        }
-        if parameters.len() == 2 {
-            return Some(Self {
-                snapshot_expiry_due: true,
-            });
         }
         if parameters.len() != 4 {
             return None;
@@ -6005,14 +6001,14 @@ mod tests {
         assert_eq!(defaults.per_tenant_active_cap, 1);
     }
 
-    /// Snapshot-expiry intent preserves exact routing and legacy row meaning.
+    /// Snapshot-expiry intent decodes only the canonical four-field plan.
     ///
-    /// The canonical row carries the scheduler's due flags; the two-field row
-    /// predates them and can only mean snapshot expiry. Both must decode, and a
-    /// row filed under any other strategy must not, because the intent is what
-    /// authorizes the retention pass.
+    /// The canonical row carries the scheduler's due flags. No two-field row
+    /// was ever shipped, so accepting one would be an invented compatibility
+    /// route, and a row filed under any other strategy must not decode because
+    /// the intent is what authorizes the retention pass.
     #[test]
-    fn snapshot_expiry_intent_routes_canonical_and_legacy_rows_exactly() {
+    fn snapshot_expiry_intent_routes_canonical_rows_exactly() {
         let canonical = serde_json::json!({
             "kind": "maintenance",
             "trigger_commit_count": 0,
@@ -6047,18 +6043,17 @@ mod tests {
             })
         );
 
-        let legacy = serde_json::json!({
+        let two_field = serde_json::json!({
             "kind": "maintenance",
             "trigger_commit_count": 7,
         });
         assert_eq!(
             ForgeSnapshotExpiryIntent::parse(
                 &ForgeClaimStrategy::Known(ForgeTaskStrategy::SnapshotExpiry),
-                legacy.as_object().expect("legacy expiry parameters"),
+                two_field.as_object().expect("two-field expiry parameters"),
             ),
-            Some(ForgeSnapshotExpiryIntent {
-                snapshot_expiry_due: true,
-            })
+            None,
+            "an unshipped two-field payload carries no retention authority"
         );
         assert!(
             ForgeSnapshotExpiryIntent::parse(

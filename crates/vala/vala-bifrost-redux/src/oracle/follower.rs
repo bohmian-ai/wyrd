@@ -949,15 +949,18 @@ where
 
 /// Parses one exact domain table binding into the catalog's closed namespace type.
 ///
-/// A wire binding carries the namespace with the `vala.` root already stripped
-/// (`TailFenceDrainer::wire_binding`), so the root is restored here rather than
-/// parsing a name the catalog's closed namespace set can never contain.
+/// A wire binding may carry its namespace with or without the `vala.` root, so
+/// the name is normalized through the shared canonicalizer rather than parsed
+/// as-is — one spelling of it names nothing the closed namespace set contains.
 ///
 /// # Errors
 /// Returns an error when the namespace/table pair is not a canonical Wyrd FQN.
 fn assignment_table(binding: &TenantTableBinding) -> Result<TableRef, String> {
-    TableRef::parse_fqn(&format!("vala.{}.{}", binding.namespace, binding.table))
-        .ok_or_else(|| "assignment table binding is not canonical".to_owned())
+    TableRef::parse_fqn(&crate::namespaces::canonical_table_name(
+        &binding.namespace,
+        &binding.table,
+    ))
+    .ok_or_else(|| "assignment table binding is not canonical".to_owned())
 }
 
 /// Restricts every file-backed leaf to the exact authenticated assignment.

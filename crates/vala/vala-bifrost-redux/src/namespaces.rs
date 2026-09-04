@@ -105,6 +105,21 @@ impl std::fmt::Display for BifrostNamespace {
     }
 }
 
+/// Joins a table binding's namespace and table into the canonical Wyrd FQN.
+///
+/// A wire `TenantTableBinding` carries its namespace either with the `vala.`
+/// root (`vala.bifrost`) or with that root already stripped
+/// (`TailFenceDrainer::wire_binding`), so every consumer that has to name the
+/// catalog's closed namespace set normalizes through this one function rather
+/// than guessing which producer built the binding it holds.
+pub(crate) fn canonical_table_name(namespace: &str, table: &str) -> String {
+    if namespace.starts_with("vala.") {
+        format!("{namespace}.{table}")
+    } else {
+        format!("vala.{namespace}.{table}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

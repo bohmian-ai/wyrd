@@ -524,7 +524,8 @@ impl TailReadTransport for LocalTailReadTransport {
                 .verify_tail_ticket_unbound(&ticket, TailTicketAudience::List)
                 .await?;
             let stream = self.reader.stream_identity();
-            let canonical = canonical_table_name(&binding.namespace, &binding.table);
+            let canonical =
+                crate::namespaces::canonical_table_name(&binding.namespace, &binding.table);
             authority
                 .verify_tail_ticket_binding(
                     &claims,
@@ -601,8 +602,10 @@ impl TailReadTransport for LocalTailReadTransport {
                 .verify_tail_ticket_unbound(&ticket, TailTicketAudience::Acquire)
                 .await?;
             let stream = self.reader.stream_identity();
-            let canonical =
-                canonical_table_name(&request.binding.namespace, &request.binding.table);
+            let canonical = crate::namespaces::canonical_table_name(
+                &request.binding.namespace,
+                &request.binding.table,
+            );
             authority
                 .verify_tail_ticket_binding(
                     &claims,
@@ -631,8 +634,10 @@ impl TailReadTransport for LocalTailReadTransport {
                 .verify_tail_ticket_unbound(&ticket, TailTicketAudience::Acquire)
                 .await?;
             let stream = self.reader.stream_identity();
-            let canonical =
-                canonical_table_name(&request.binding.namespace, &request.binding.table);
+            let canonical = crate::namespaces::canonical_table_name(
+                &request.binding.namespace,
+                &request.binding.table,
+            );
             authority
                 .verify_tail_ticket_binding(
                     &claims,
@@ -1141,15 +1146,6 @@ fn binding_from_wire(
         crate::catalog::TableRef::new(namespace, &binding.table),
     ))
     .map_err(|_| TailReadError::Binding)
-}
-
-/// Builds the domain-qualified table identity used by signed private tickets.
-fn canonical_table_name(namespace: &str, table: &str) -> String {
-    if namespace.starts_with("vala.") {
-        format!("{namespace}.{table}")
-    } else {
-        format!("vala.{namespace}.{table}")
-    }
 }
 
 /// Converts the validated wire partition into the local memtable partition key.

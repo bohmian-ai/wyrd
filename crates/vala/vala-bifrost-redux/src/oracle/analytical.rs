@@ -7348,13 +7348,33 @@ mod tests {
         .expect("an in-roster destination routes");
         assert_eq!(assigned.urls, vec![url.clone(), url.clone()]);
 
-        // A stage with no remote leaf is left to the ordinary bounded pool.
+        // A stage with no remote leaf reads only through exchanges. It is
+        // spread over the frozen roster in the roster's own order rather than
+        // deferred: upstream answers an unanswered event with a random
+        // assignment, which can route one task's plan push and its execution to
+        // different peers and leave the executing worker waiting for a plan
+        // that was written elsewhere.
         let local: Arc<dyn ExecutionPlan> = Arc::new(
             datafusion::physical_plan::empty::EmptyExec::new(leaf.schema()),
         );
+        let consumer = datafusion_distributed::RouteTasksHandler::handle(
+            &router,
+            datafusion_distributed::RouteTasksEvent {
+                task_ctx: Arc::clone(&task_ctx),
+                plan: &local,
+                task_count: 2,
+            },
+        )
+        .expect("a consumer stage is placed on the frozen roster")
+        .expect("the frozen roster places every task");
+        assert_eq!(consumer.urls, vec![url.clone(), url.clone()]);
+
+        // Only an empty roster leaves a stage to the ordinary bounded pool.
         assert!(
             datafusion_distributed::RouteTasksHandler::handle(
-                &router,
+                &OracleRouteTasks {
+                    destinations: Vec::new(),
+                },
                 datafusion_distributed::RouteTasksEvent {
                     task_ctx: Arc::clone(&task_ctx),
                     plan: &local,
@@ -7362,7 +7382,7 @@ mod tests {
                 },
             )
             .is_none(),
-            "a stage with no remote leaf defers to the bounded worker pool"
+            "a stage with no frozen roster defers to the bounded worker pool"
         );
 
         // Two distinct destinations in one stage fail before dispatch.

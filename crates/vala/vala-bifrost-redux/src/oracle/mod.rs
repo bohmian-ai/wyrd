@@ -3825,6 +3825,11 @@ impl Oracle {
                 table: cut.iceberg_table.clone(),
                 storage: Arc::clone(self.catalog.storage()),
                 hot_files,
+                iceberg_event_times: cut
+                    .iceberg_files
+                    .iter()
+                    .map(|file| file.event_time)
+                    .collect(),
                 context: context.clone(),
                 table_name,
                 audit: Arc::clone(&self.audit),

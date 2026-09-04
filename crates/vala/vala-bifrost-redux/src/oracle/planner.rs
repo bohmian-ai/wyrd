@@ -127,10 +127,16 @@ impl OraclePlanner {
         for cut in cuts {
             let table_name = cut.binding.table_ref.fqn();
             let hot_files = local_hot_sources(catalog, &cut)?;
+            let iceberg_event_times = cut
+                .iceberg_files
+                .iter()
+                .map(|file| file.event_time)
+                .collect();
             let provider = OracleTableProvider::try_new(OracleTableInputs {
                 table: cut.iceberg_table,
                 storage: Arc::clone(catalog.storage()),
                 hot_files,
+                iceberg_event_times,
                 context: context.clone(),
                 table_name: table_name.clone(),
                 audit: Arc::clone(&audit),

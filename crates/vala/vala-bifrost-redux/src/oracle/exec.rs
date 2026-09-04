@@ -1252,6 +1252,14 @@ pub(crate) struct OracleTableInputs {
     pub(crate) storage: Arc<crate::storage::BifrostStorage>,
     /// Leader-local hot files absent from the pinned Iceberg snapshot.
     pub(crate) hot_files: Vec<HotFileSource>,
+    /// Normalized `wyrd_event_time` bounds of every file the pinned Iceberg
+    /// snapshot holds, in manifest order.
+    ///
+    /// Carried so the leader can decide the published tier on the same axis and
+    /// the same bounds it decides the hot tier on. Iceberg's manifest planning
+    /// applies the identical bounds when it plans the scan, so this is the
+    /// leader's own statement of a decision the reader then enforces.
+    pub(crate) iceberg_event_times: Vec<crate::catalog::event_time::EventTimeStatistics>,
     /// Authenticated request context retained by the tenant tripwire.
     pub(crate) context: AuthorizedQueryContext,
     /// Canonical table name used in security diagnostics.
@@ -1269,6 +1277,9 @@ pub(crate) struct OracleTableProvider {
     iceberg: IcebergStaticTableProvider,
     /// Pinned hot files absent from the selected Iceberg manifest.
     hot_files: Vec<HotFileSource>,
+    /// Normalized event-time bounds of every pinned Iceberg file, in manifest
+    /// order.
+    iceberg_event_times: Vec<crate::catalog::event_time::EventTimeStatistics>,
     /// File reader inherited from the pinned Iceberg table.
     file_io: FileIO,
     /// The node's one storage owner, handed to every hot leaf this builds.
@@ -1377,6 +1388,7 @@ impl OracleTableProvider {
             table,
             storage,
             hot_files,
+            iceberg_event_times,
             context,
             table_name,
             audit,
@@ -1391,6 +1403,7 @@ impl OracleTableProvider {
         Ok(Self {
             iceberg,
             hot_files,
+            iceberg_event_times,
             file_io,
             storage,
             physical_schema,
@@ -1450,6 +1463,7 @@ impl OracleTableProvider {
             // own global limit above this provider remains authoritative. The
             // closure's physical indices are what keep unrequested columns out
             // of the Iceberg reader itself rather than merely out of the result.
+            self.record_iceberg_pruning(supported_predicates);
             let published = self
                 .iceberg
                 .scan(
@@ -1527,6 +1541,36 @@ impl OracleTableProvider {
             return Ok(inputs);
         }
         Ok(remotes)
+    }
+
+    /// Records this query's pre-footer event-time decision for every pinned
+    /// Iceberg file.
+    ///
+    /// The published tier is read through Iceberg's own manifest planning,
+    /// which applies these same normalized bounds and never opens an excluded
+    /// file's footer. Deciding here as well is what makes that exclusion
+    /// observable: without it the emitted
+    /// `bifrost_oracle_file_pruning_total` counts reconcile against the cut's
+    /// hot files alone and report a pruned snapshot as unpruned. The decision
+    /// reads the bounds the pin already minted from the manifest entry, so it
+    /// cannot disagree with what the reader then does.
+    ///
+    /// An unconstrained query interval records nothing at all, matching the hot
+    /// tier: nothing was considered, so nothing is reported.
+    fn record_iceberg_pruning(
+        &self,
+        predicates: &[wyrd_spec::vala::assignment_authority::ScanPredicate],
+    ) {
+        let interval = crate::oracle::pruning::EventTimeQueryInterval::from_predicates(predicates);
+        if interval.is_unbounded() {
+            return;
+        }
+        for statistics in &self.iceberg_event_times {
+            let _ = interval.retains(
+                crate::oracle::pruning::FilePruningSource::Iceberg,
+                *statistics,
+            );
+        }
     }
 
     /// Returns the staged hot files this query can still read a row from.
@@ -5976,6 +6020,7 @@ mod tests {
             table: pruning_fixture_table(),
             storage: fixture_storage(),
             hot_files,
+            iceberg_event_times: Vec::new(),
             context,
             table_name: "vala.traces.spans".to_owned(),
             audit: Arc::new(NoopAudit),
@@ -6273,6 +6318,7 @@ mod tests {
             table: projection_fixture_table(),
             storage: fixture_storage(),
             hot_files: Vec::new(),
+            iceberg_event_times: Vec::new(),
             context,
             table_name: "vala.traces.spans".to_owned(),
             audit: Arc::new(NoopAudit),

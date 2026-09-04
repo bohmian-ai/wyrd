@@ -983,6 +983,47 @@ async fn retirement_first_loss_commits_its_own_edge() {
     server.shutdown().await.expect("server shuts down");
 }
 
+/// Diagnostic ceiling for one Forge role transition.
+///
+/// Every transition this matrix drives is caused by an explicit scheduler pass,
+/// worker run, or durable seed, so the wait is a deadlock detector rather than a
+/// schedule. It is deliberately far shorter than the production scheduler
+/// interval: a wait that could absorb one natural wake would let a missing
+/// trigger pass as a slow success.
+#[cfg(feature = "test-support")]
+const FORGE_READINESS_CEILING: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Diagnostic ceiling for the readiness loop's first computed snapshot.
+#[cfg(feature = "test-support")]
+const SNAPSHOT_PUBLICATION_CEILING: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Drives exactly one production Forge scheduler pass and returns when it ends.
+///
+/// The scheduler is passive between wakes, so every coordinator transition in
+/// this matrix is caused here rather than waited for. Completion is read from
+/// the production pass counter, which advances whether the pass planned,
+/// stood by, overflowed, or rolled back, so the caller may assert the resulting
+/// readiness bit immediately instead of polling it.
+///
+/// # Panics
+///
+/// Panics when the requested pass does not complete within
+/// [`FORGE_READINESS_CEILING`], which means the scheduler loop is not running or
+/// is wedged rather than merely unready.
+#[cfg(feature = "test-support")]
+async fn drive_scheduler_pass(server: &WyrdTestServer, label: &str) {
+    let before = server.completed_forge_scheduler_passes_for_test();
+    server.request_forge_scheduler_pass_for_test();
+    tokio::time::timeout(
+        FORGE_READINESS_CEILING,
+        server.wait_for_forge_scheduler_passes_for_test(before + 1),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        panic!("{label}: no scheduler pass completed within {FORGE_READINESS_CEILING:?}")
+    });
+}
+
 /// Polls one Forge role bit until it reaches `expected`.
 ///
 /// The composed in-process server does not run the background readiness loop,
@@ -998,7 +1039,7 @@ async fn await_forge_role(
     select: fn(&wyrd_server::state::Forge) -> vala_bifrost_redux::forge::ForgeRoleReadiness,
     label: &str,
 ) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+    let deadline = std::time::Instant::now() + FORGE_READINESS_CEILING;
     loop {
         let forge = server
             .state()
@@ -1009,7 +1050,9 @@ async fn await_forge_role(
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "{label} readiness never reached {expected}"
+            "{label} readiness never reached {expected} within {FORGE_READINESS_CEILING:?} \
+             (completed passes: {})",
+            server.completed_forge_scheduler_passes_for_test()
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
@@ -1033,7 +1076,7 @@ async fn published_snapshot(server: &WyrdTestServer) -> Arc<ReadinessSnapshot> {
         std::time::Duration::from_secs(5),
         stop.clone(),
     ));
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+    let deadline = std::time::Instant::now() + SNAPSHOT_PUBLICATION_CEILING;
     let snapshot = loop {
         let snapshot = server.state().readiness.load_full();
         if snapshot.postgres.reason != ProbeReason::Warmup {
@@ -1050,29 +1093,9 @@ async fn published_snapshot(server: &WyrdTestServer) -> Arc<ReadinessSnapshot> {
     snapshot
 }
 
-/// Forge readiness is target-conditional, recovery-gated, and removed before a
-/// role stops owning work.
-///
-/// Covers the three properties a Kubernetes operator depends on. A target that
-/// did not select a Forge role publishes no Forge check at all, so its
-/// `/readyz` conjunction cannot be held down by a role it never runs. A
-/// selected worker publishes ready only after its durable recovery drain
-/// completes, and a selected coordinator only after a full fenced planning
-/// pass. Both bits clear on shutdown before the role stops claiming, while
-/// `/healthz` keeps answering 200 so the process is drained rather than killed.
-#[cfg(feature = "test-support")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn forge_role_readiness_is_target_conditional_and_removed_before_loss() {
-    forge_checks_follow_target_selection().await;
-    forge_worker_readiness_gates_on_recovery().await;
-    worker_scratch_failure_quarantines_without_readiness().await;
-    worker_registration_failure_never_publishes_ready().await;
-    worker_recovery_failure_never_publishes_ready().await;
-    forge_coordinator_readiness_follows_a_completed_pass().await;
-}
-
 /// Every production target projection publishes exactly the Forge checks it runs.
 #[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn forge_checks_follow_target_selection() {
     for (target, coordinator, worker) in [
         (wyrd_server::config::BifrostTarget::All, true, true),
@@ -1104,6 +1127,7 @@ async fn forge_checks_follow_target_selection() {
 /// A selected worker publishes ready only after its recovery drain, and clears
 /// the bit on shutdown while liveness keeps answering.
 #[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn forge_worker_readiness_gates_on_recovery() {
     let server = WyrdTestServer::start_in_process()
         .await
@@ -1158,6 +1182,7 @@ async fn forge_worker_readiness_gates_on_recovery() {
 /// The coordinator publishes ready only once a full fenced pass completes, and
 /// its guard removes the bit when the supervised loop stops.
 #[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn forge_coordinator_readiness_follows_a_completed_pass() {
     let server = WyrdTestServer::start_in_process()
         .await
@@ -1178,13 +1203,11 @@ async fn forge_coordinator_readiness_follows_a_completed_pass() {
         .expect("the default target selects a coordinator");
     let handle = tokio::spawn(scheduler);
 
-    await_forge_role(
-        &server,
-        true,
-        wyrd_server::state::Forge::coordinator_readiness,
-        "coordinator",
-    )
-    .await;
+    drive_scheduler_pass(&server, "first coordinator pass").await;
+    assert!(
+        forge.is_ready(),
+        "a coordinator that completed one fenced pass is ready"
+    );
 
     stop.cancel();
     handle
@@ -1196,24 +1219,22 @@ async fn forge_coordinator_readiness_follows_a_completed_pass() {
         "a stopped coordinator does not advertise ready"
     );
     server.shutdown().await.expect("test server shuts down");
-
-    coordinator_standby_and_partial_passes_are_not_ready().await;
 }
 
-/// A standby pass and an overflowed partial pass both leave the coordinator
-/// unready, and the next complete fenced pass restores it.
+/// A standby pass leaves the coordinator unready, and the next complete fenced
+/// pass under a reclaimed fence restores it.
 ///
 /// Readiness answers whether this replica currently holds the authority the
 /// role promises. A standby replica lost the fence to a live peer, so it plans
-/// nothing; a partial pass ran out of its per-wake hint budget and left demand
-/// unacknowledged. Routing maintenance to either one is routing it to a
-/// coordinator that will not do the work.
+/// nothing. Routing maintenance to it is routing it to a coordinator that will
+/// not do the work.
 ///
 /// # Panics
 ///
-/// Panics when a standby, partial, or completed pass publishes the wrong bit.
+/// Panics when a standby or completed pass publishes the wrong bit.
 #[cfg(feature = "test-support")]
-async fn coordinator_standby_and_partial_passes_are_not_ready() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn coordinator_standby_pass_is_not_ready() {
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
@@ -1245,11 +1266,7 @@ async fn coordinator_standby_and_partial_passes_are_not_ready() {
         .expect("the default target selects a coordinator");
     let handle = tokio::spawn(scheduler);
 
-    let before = server.completed_forge_scheduler_passes_for_test();
-    server.request_forge_scheduler_pass_for_test();
-    server
-        .wait_for_forge_scheduler_passes_for_test(before + 1)
-        .await;
+    drive_scheduler_pass(&server, "standby pass").await;
     assert!(
         !readiness.is_ready(),
         "a standby replica holds no fence and is not a ready coordinator"
@@ -1263,13 +1280,11 @@ async fn coordinator_standby_and_partial_passes_are_not_ready() {
     .execute(&pool)
     .await
     .expect("expire the peer fence");
-    await_forge_role(
-        &server,
-        true,
-        wyrd_server::state::Forge::coordinator_readiness,
-        "coordinator after the fence is released",
-    )
-    .await;
+    drive_scheduler_pass(&server, "pass after the fence is released").await;
+    assert!(
+        readiness.is_ready(),
+        "the first pass to reclaim the fence completed and is ready"
+    );
 
     stop.cancel();
     handle
@@ -1277,8 +1292,6 @@ async fn coordinator_standby_and_partial_passes_are_not_ready() {
         .expect("scheduler joins")
         .expect("pass loop ok");
     server.shutdown().await.expect("test server shuts down");
-
-    coordinator_partial_pass_is_not_ready().await;
 }
 
 /// An overflowed partial planning pass leaves the coordinator unready until the
@@ -1292,6 +1305,7 @@ async fn coordinator_standby_and_partial_passes_are_not_ready() {
 ///
 /// Panics when a partial or completed pass publishes the wrong bit.
 #[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn coordinator_partial_pass_is_not_ready() {
     let server = WyrdTestServer::builder()
         .with_forge_config_for_test(vala_bifrost_redux::forge::ForgeConfig {
@@ -1333,11 +1347,7 @@ async fn coordinator_partial_pass_is_not_ready() {
         .expect("the default target selects a coordinator");
     let handle = tokio::spawn(scheduler);
 
-    let before = server.completed_forge_scheduler_passes_for_test();
-    server.request_forge_scheduler_pass_for_test();
-    server
-        .wait_for_forge_scheduler_passes_for_test(before + 1)
-        .await;
+    drive_scheduler_pass(&server, "overflowed partial pass").await;
     assert!(
         !readiness.is_ready(),
         "a pass that stopped at its hint budget left demand unplanned"
@@ -1348,13 +1358,11 @@ async fn coordinator_partial_pass_is_not_ready() {
         .execute(&pool)
         .await
         .expect("drain the remaining demand");
-    await_forge_role(
-        &server,
-        true,
-        wyrd_server::state::Forge::coordinator_readiness,
-        "coordinator after the remaining demand drains",
-    )
-    .await;
+    drive_scheduler_pass(&server, "pass after the remaining demand drains").await;
+    assert!(
+        readiness.is_ready(),
+        "a pass with no demand left to page completed and is ready"
+    );
 
     stop.cancel();
     handle
@@ -1396,8 +1404,10 @@ async fn run_forge_worker_once(
     let stop = tokio_util::sync::CancellationToken::new();
     let worker = wyrd_server::boot::spawn_forge_worker(server.state(), stop.clone(), 1, 1)
         .expect("the worker composes");
-    let handle = tokio::spawn(worker);
-    let outcome = handle.await.expect("worker joins");
+    let outcome = tokio::time::timeout(FORGE_READINESS_CEILING, tokio::spawn(worker))
+        .await
+        .expect("the worker returns rather than looping for more work")
+        .expect("worker joins");
     stop.cancel();
     outcome
 }
@@ -1415,6 +1425,7 @@ async fn run_forge_worker_once(
 /// Panics when the quarantined worker publishes ready or the restored worker
 /// does not.
 #[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn worker_scratch_failure_quarantines_without_readiness() {
     let (server, _observer) = server_with_forge_observer().await;
     let scratch = server
@@ -1450,6 +1461,7 @@ async fn worker_scratch_failure_quarantines_without_readiness() {
 ///
 /// Panics when the failed worker publishes ready or the respawned one does not.
 #[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn worker_registration_failure_never_publishes_ready() {
     let (server, observer) = server_with_forge_observer().await;
     let readiness = server
@@ -1480,6 +1492,7 @@ async fn worker_registration_failure_never_publishes_ready() {
 ///
 /// Panics when the failed worker publishes ready or the respawned one does not.
 #[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn worker_recovery_failure_never_publishes_ready() {
     let (server, observer) = server_with_forge_observer().await;
     let readiness = server
@@ -1519,4 +1532,685 @@ async fn await_forge_role_while_running(server: &WyrdTestServer, label: &str) {
     .await;
     stop.cancel();
     handle.await.expect("worker joins").expect("worker loop ok");
+}
+
+/// Installs the shared planning-failure function and one trigger that raises on
+/// the named durable step.
+///
+/// The function is the same one the SQL-tier planning tests use, so a router
+/// test fails exactly the step a real coordinator commits rather than a stub.
+///
+/// # Panics
+///
+/// Panics when the fault DDL cannot be installed.
+#[cfg(feature = "test-support")]
+async fn install_planning_failure(pool: &sqlx::PgPool, create_trigger: &'static str) {
+    sqlx::query(
+        "CREATE FUNCTION vala.fail_forge_planning_step() RETURNS trigger LANGUAGE plpgsql \
+         AS $$ BEGIN RAISE EXCEPTION 'injected Forge planning failure'; END $$",
+    )
+    .execute(pool)
+    .await
+    .expect("the planning failure function installs");
+    sqlx::query(create_trigger)
+        .execute(pool)
+        .await
+        .expect("the planning failure trigger installs");
+}
+
+/// Removes the planning-failure trigger from `table` and its shared function.
+///
+/// # Panics
+///
+/// Panics when the fault DDL cannot be removed, which would leak into the next
+/// boundary this test drives.
+#[cfg(feature = "test-support")]
+async fn remove_planning_failure(pool: &sqlx::PgPool, table: &str) {
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP TRIGGER forge_fail_step ON vala.{table}"
+    )))
+    .execute(pool)
+    .await
+    .expect("the planning failure trigger is removable");
+    sqlx::query("DROP FUNCTION vala.fail_forge_planning_step()")
+        .execute(pool)
+        .await
+        .expect("the planning failure function is removable");
+}
+
+/// Counts one registered table's outstanding planning demand.
+///
+/// The count is table-scoped because roster repair re-upserts periodic demand
+/// for every registered table on every pass, so a tenant-wide count cannot tell
+/// a retained rollback apart from an unrelated table's fresh demand.
+///
+/// # Panics
+///
+/// Panics when the demand table cannot be read.
+#[cfg(feature = "test-support")]
+async fn outstanding_demands(pool: &sqlx::PgPool, tenant: uuid::Uuid, table: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM vala.forge_planning_demands \
+         WHERE data_tenant_id=$1 AND table_name=$2",
+    )
+    .bind(tenant)
+    .bind(table)
+    .fetch_one(pool)
+    .await
+    .expect("outstanding planning demand is readable")
+}
+
+/// Counts the Forge tasks one registered table currently owns.
+///
+/// # Panics
+///
+/// Panics when the task table cannot be read.
+#[cfg(feature = "test-support")]
+async fn table_task_count(pool: &sqlx::PgPool, tenant: uuid::Uuid, table: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM vala.forge_tasks WHERE data_tenant_id=$1 AND table_name=$2",
+    )
+    .bind(tenant)
+    .bind(table)
+    .fetch_one(pool)
+    .await
+    .expect("the Forge task table is readable")
+}
+
+/// Registers one real Bifrost table through the retained production catalog.
+///
+/// Planning discovers a table's snapshot before it reaches any durable write,
+/// so a demand naming a table the catalog does not hold fails in discovery and
+/// never exercises the enqueue transaction. Every coordinator fault this matrix
+/// injects therefore has to be raised against a table that really exists.
+///
+/// # Panics
+///
+/// Panics when the catalog refuses the registration.
+#[cfg(feature = "test-support")]
+async fn register_forge_table(server: &WyrdTestServer, table: &str) {
+    server
+        .create_bifrost_table_for_test(vala_bifrost_redux::catalog::CreateTableRequest {
+            table: vala_bifrost_redux::catalog::TableRef::new(
+                vala_bifrost_redux::namespaces::BifrostNamespace::Bifrost,
+                table,
+            ),
+            user_fields: vec![arrow::datatypes::Field::new(
+                "value",
+                arrow::datatypes::DataType::Int64,
+                false,
+            )],
+            tenant: server.data_tenant_id(),
+            physical_layout: None,
+            audit: None,
+        })
+        .await
+        .expect("the production catalog registers the table");
+}
+
+/// Spawns the production maintenance scheduler for one composed server.
+///
+/// # Panics
+///
+/// Panics when the scheduler cannot be composed for this target.
+#[cfg(feature = "test-support")]
+fn spawn_coordinator(
+    server: &WyrdTestServer,
+    stop: &tokio_util::sync::CancellationToken,
+) -> tokio::task::JoinHandle<Result<(), vala_bifrost_redux::forge::ForgeError>> {
+    let scheduler = wyrd_server::boot::spawn_maintenance_scheduler(server.state(), stop.clone())
+        .expect("the scheduler composes")
+        .expect("the default target selects a coordinator");
+    tokio::spawn(scheduler)
+}
+
+/// A coordinator whose durable task insert fails advances its pass counter,
+/// clears readiness, keeps the demand, and recovers on the next complete pass.
+///
+/// The insert commits inside the planning transaction, so a failure must roll
+/// the whole pass back rather than acknowledge demand it never planned.
+/// Readiness is the externally visible consequence: a replica whose planning
+/// writes are failing must not be routed maintenance.
+///
+/// The faulted table is registered only after the unfaulted pass, so the failing
+/// pass is the first one to plan it. A table already carrying its planned task
+/// would insert nothing on a replan and never reach the fault.
+///
+/// # Panics
+///
+/// Panics when a failed pass publishes ready, silently drops demand, or the
+/// healthy pass that follows does not restore readiness.
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn coordinator_task_insert_failure_clears_readiness() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let readiness = server
+        .state()
+        .forge()
+        .expect("the default target selects Forge")
+        .coordinator_readiness();
+    let pool = server
+        .pg_fixture()
+        .superuser_pool()
+        .await
+        .expect("superuser pool");
+    let tenant = uuid::Uuid::from(server.data_tenant_id());
+
+    let stop = tokio_util::sync::CancellationToken::new();
+    let handle = spawn_coordinator(&server, &stop);
+    drive_scheduler_pass(&server, "healthy pass before fault injection").await;
+    assert!(
+        readiness.is_ready(),
+        "the unfaulted pass this case builds on did not complete"
+    );
+
+    // An idle registered table still projects one orphan-cleanup task, so a
+    // real table is all the demand needed to reach the durable insert.
+    register_forge_table(&server, "coordinator_sql").await;
+    install_planning_failure(
+        &pool,
+        "CREATE TRIGGER forge_fail_step BEFORE INSERT ON vala.forge_tasks \
+         FOR EACH ROW EXECUTE FUNCTION vala.fail_forge_planning_step()",
+    )
+    .await;
+
+    drive_scheduler_pass(&server, "faulted planning pass").await;
+    assert!(
+        !readiness.is_ready(),
+        "a coordinator whose forge_tasks write failed advertised ready"
+    );
+    assert_eq!(
+        table_task_count(&pool, tenant, "coordinator_sql").await,
+        0,
+        "a rolled-back pass left a task behind"
+    );
+    assert_eq!(
+        outstanding_demands(&pool, tenant, "coordinator_sql").await,
+        1,
+        "a rolled-back pass acknowledged demand it never planned"
+    );
+
+    remove_planning_failure(&pool, "forge_tasks").await;
+    drive_scheduler_pass(&server, "restoration pass").await;
+    assert!(
+        readiness.is_ready(),
+        "the pass after the forge_tasks fault was removed stayed unready"
+    );
+    assert_eq!(
+        table_task_count(&pool, tenant, "coordinator_sql").await,
+        1,
+        "the recovered pass did not enqueue the task the failed pass rolled back"
+    );
+    assert_eq!(
+        outstanding_demands(&pool, tenant, "coordinator_sql").await,
+        0,
+        "the recovered pass left demand unacknowledged"
+    );
+
+    stop.cancel();
+    handle
+        .await
+        .expect("scheduler joins")
+        .expect("pass loop ok");
+    server.shutdown().await.expect("test server shuts down");
+}
+
+/// A coordinator whose unschedulable-task audit append fails rolls the task,
+/// the audit, and the demand acknowledgement back together, and recovers on the
+/// next complete pass.
+///
+/// The audit append only happens for a task planning classified unschedulable,
+/// so the fixture drives a real promotion candidate against a byte ceiling it
+/// cannot fit. The unfaulted table proves the append is genuinely reached before
+/// a second, freshly registered table is failed at it.
+///
+/// # Panics
+///
+/// Panics when the unfaulted pass never appends, a failed pass publishes ready
+/// or leaks a task, or the restored pass does not recover.
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn coordinator_audit_append_failure_clears_readiness() {
+    // One byte is below every executable working set, so any real promotion
+    // candidate this server plans is classified unschedulable and carries the
+    // audit append the fault targets.
+    let server = WyrdTestServer::builder()
+        .with_forge_config_for_test(vala_bifrost_redux::forge::ForgeConfig {
+            max_large_task_bytes: 1,
+            ..vala_bifrost_redux::forge::ForgeConfig::default()
+        })
+        .start_bound()
+        .await
+        .expect("test server starts");
+    let readiness = server
+        .state()
+        .forge()
+        .expect("the default target selects Forge")
+        .coordinator_readiness();
+    let pool = server
+        .pg_fixture()
+        .superuser_pool()
+        .await
+        .expect("superuser pool");
+    let tenant = uuid::Uuid::from(server.data_tenant_id());
+
+    // A bound server already runs the production maintenance scheduler, so this
+    // case drives that loop rather than composing a second one.
+
+    // The unfaulted table proves the audit append is on the path at all.
+    publish_unschedulable_demand(&server, "coordinator_audit_reached").await;
+    drive_scheduler_pass(&server, "unfaulted unschedulable pass").await;
+    assert!(
+        readiness.is_ready(),
+        "the unfaulted unschedulable pass did not complete"
+    );
+    assert_eq!(
+        unschedulable_audits(&pool, tenant).await,
+        1,
+        "an unschedulable planning result did not append its audit"
+    );
+
+    publish_unschedulable_demand(&server, "coordinator_audit_faulted").await;
+    install_planning_failure(
+        &pool,
+        "CREATE TRIGGER forge_fail_step BEFORE INSERT ON vala.audit_outbox \
+         FOR EACH ROW EXECUTE FUNCTION vala.fail_forge_planning_step()",
+    )
+    .await;
+
+    drive_scheduler_pass(&server, "faulted audit pass").await;
+    assert!(
+        !readiness.is_ready(),
+        "a coordinator whose audit_outbox write failed advertised ready"
+    );
+    assert_eq!(
+        table_task_count(&pool, tenant, "coordinator_audit_faulted").await,
+        0,
+        "the task rolled back with its audit was left behind"
+    );
+    assert_eq!(
+        outstanding_demands(&pool, tenant, "coordinator_audit_faulted").await,
+        1,
+        "a rolled-back pass acknowledged demand whose audit never committed"
+    );
+
+    remove_planning_failure(&pool, "audit_outbox").await;
+    drive_scheduler_pass(&server, "restoration pass").await;
+    assert!(
+        readiness.is_ready(),
+        "the pass after the audit_outbox fault was removed stayed unready"
+    );
+    assert_eq!(
+        table_task_count(&pool, tenant, "coordinator_audit_faulted").await,
+        1,
+        "the recovered pass did not enqueue the task the failed pass rolled back"
+    );
+    assert_eq!(
+        outstanding_demands(&pool, tenant, "coordinator_audit_faulted").await,
+        0,
+        "the recovered pass left demand unacknowledged"
+    );
+
+    server.shutdown().await.expect("test server shuts down");
+}
+
+/// Registers one table and publishes rows through it so the next planning pass
+/// derives a real Scribe-promotion candidate for it.
+///
+/// # Panics
+///
+/// Panics when registration, ingest, or the durable flush fails.
+#[cfg(feature = "test-support")]
+async fn publish_unschedulable_demand(server: &WyrdTestServer, table: &str) {
+    register_forge_table(server, table).await;
+    server
+        .seed_bifrost_rows(&format!("vala.bifrost.{table}"), &[1, 2, 3])
+        .await
+        .expect("publish rows the coordinator can plan against");
+}
+
+/// Counts the tenant's committed unschedulable-task audit records.
+///
+/// This is the exact durable row the coordinator's planning transaction appends
+/// beside an unschedulable task, so it distinguishes a pass that reached the
+/// audit step from one that never planned a terminal task at all.
+///
+/// # Panics
+///
+/// Panics when the audit outbox cannot be read.
+#[cfg(feature = "test-support")]
+async fn unschedulable_audits(pool: &sqlx::PgPool, tenant: uuid::Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM vala.audit_outbox \
+         WHERE data_tenant_id=$1 AND operation='forge.task.unschedulable'",
+    )
+    .bind(tenant)
+    .fetch_one(pool)
+    .await
+    .expect("the audit outbox is readable")
+}
+
+/// Seeds one claimable Forge task row directly.
+///
+/// Both durable non-success outcomes under test are reachable only from a row
+/// the planner would not produce today — a pre-envelope legacy row and a row
+/// whose plan parameters do not match its strategy — so the row is written
+/// directly rather than through an enqueue that would reject it. `envelope`
+/// controls whether the version-two resource columns are present, and
+/// `parameters` is the exact plan parameter object: the worker's pre-effect gate
+/// refuses a claim whose parameters do not match its strategy contract before it
+/// acquires any table fence, so a case that needs the fenced path must supply the
+/// contract-valid object rather than an empty one.
+///
+/// # Panics
+///
+/// Panics when the insert fails.
+#[cfg(feature = "test-support")]
+async fn seed_ready_forge_task(
+    pool: &sqlx::PgPool,
+    tenant: uuid::Uuid,
+    table_name: &str,
+    strategy: &str,
+    envelope: bool,
+    parameters: &str,
+) -> uuid::Uuid {
+    let task_id = uuid::Uuid::now_v7();
+    let statement = if envelope {
+        "INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,namespace_name,\
+         table_name,strategy,lane,base_snapshot_id,plan,plan_hash,estimated_files,\
+         estimated_bytes,estimated_parallelism,estimated_memory_bytes,estimated_spill_bytes,\
+         large_task_ceiling_bytes,envelope_version,decoded_batch_bytes,decoded_input_bytes,\
+         sort_working_bytes,sort_merge_reservation_bytes,encoder_buffer_bytes,\
+         upload_chunk_bytes,footer_encoded_bytes,footer_decode_workspace_bytes,\
+         sort_spill_bytes,state,ready_at,next_eligible_at,updated_at) \
+         VALUES ($1,$2,'wyrd-redux','vala.bifrost',$3,$4,'ordinary',4242,\
+         $5::jsonb,\
+         decode(repeat('33',32),'hex'),1,100,1,41943040,50,67108864,2,10,10,30,10,40,20,\
+         8388608,33554432,50,'ready',statement_timestamp()-interval '1 hour',\
+         statement_timestamp()-interval '1 hour',statement_timestamp())"
+    } else {
+        "INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,namespace_name,\
+         table_name,strategy,lane,base_snapshot_id,plan,plan_hash,estimated_files,\
+         estimated_bytes,estimated_parallelism,estimated_memory_bytes,estimated_spill_bytes,\
+         large_task_ceiling_bytes,state,ready_at,next_eligible_at,updated_at) \
+         VALUES ($1,$2,'wyrd-redux','vala.bifrost',$3,$4,'ordinary',4242,\
+         $5::jsonb,\
+         decode(repeat('33',32),'hex'),1,100,1,41943040,50,67108864,\
+         'ready',statement_timestamp()-interval '1 hour',\
+         statement_timestamp()-interval '1 hour',statement_timestamp())"
+    };
+    sqlx::query(statement)
+        .bind(task_id)
+        .bind(tenant)
+        .bind(table_name)
+        .bind(strategy)
+        .bind(parameters)
+        .execute(pool)
+        .await
+        .expect("seed a claimable Forge task");
+    task_id
+}
+
+/// Waits until the seeded task leaves its claimable states and reports the
+/// durable state it settled in.
+///
+/// # Panics
+///
+/// Panics when the row never settles inside the bounded wait.
+#[cfg(feature = "test-support")]
+async fn await_settled_task_state(pool: &sqlx::PgPool, task_id: uuid::Uuid) -> String {
+    for _ in 0..600 {
+        let state: String =
+            sqlx::query_scalar("SELECT state FROM vala.forge_tasks WHERE task_id=$1")
+                .bind(task_id)
+                .fetch_one(pool)
+                .await
+                .expect("the seeded task row is readable");
+        if !matches!(
+            state.as_str(),
+            "ready" | "retryable" | "claimed" | "running"
+        ) {
+            return state;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("the seeded Forge task never settled");
+}
+
+/// A claim that settles durably without producing an effect keeps the worker
+/// ready and reports no completion.
+///
+/// Both a pre-envelope legacy row and a row whose payload does not match its
+/// strategy are healthy worker outcomes: the worker terminalized durable state
+/// and produced nothing. Readiness answers whether this replica can take the
+/// next claim, so neither outcome may clear it.
+///
+/// # Panics
+///
+/// Panics when either row is reported as a completion or clears readiness.
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn durably_settled_claims_keep_readiness() {
+    for (table_name, strategy, envelope, expected) in [
+        ("legacy_supersession", "small_files", false, "cancelled"),
+        // Expired cleanup's exact work is its parameters, so a copied input set
+        // is exactly what its payload contract forbids.
+        ("malformed_payload", "expired_cleanup", true, "failed"),
+    ] {
+        let (server, observer) = server_with_forge_observer().await;
+        let readiness = server
+            .state()
+            .forge()
+            .expect("the default target selects Forge")
+            .worker_readiness();
+        let pool = server
+            .pg_fixture()
+            .superuser_pool()
+            .await
+            .expect("superuser pool");
+        let task_id = seed_ready_forge_task(
+            &pool,
+            uuid::Uuid::from(server.data_tenant_id()),
+            table_name,
+            strategy,
+            envelope,
+            "{\"version\":1,\"inputs\":[\"a.parquet\"],\"parameters\":{}}",
+        )
+        .await;
+
+        let stop = tokio_util::sync::CancellationToken::new();
+        let worker = wyrd_server::boot::spawn_forge_worker(server.state(), stop.clone(), 1, 1)
+            .expect("the worker composes");
+        let handle = tokio::spawn(worker);
+        await_forge_role(
+            &server,
+            true,
+            wyrd_server::state::Forge::worker_readiness,
+            table_name,
+        )
+        .await;
+
+        let settled = await_settled_task_state(&pool, task_id).await;
+        assert_eq!(
+            settled, expected,
+            "{table_name} settled in an unexpected durable state"
+        );
+        assert_eq!(
+            observer.completed(),
+            0,
+            "{table_name} produced no effect but was reported as a completion"
+        );
+        assert!(
+            readiness.is_ready(),
+            "{table_name} is a healthy outcome and must not clear worker readiness"
+        );
+
+        stop.cancel();
+        handle.await.expect("worker joins").expect("worker loop ok");
+        server.shutdown().await.expect("test server shuts down");
+    }
+}
+
+/// A live claim owned by another worker is not this worker's recovery residue
+/// and does not delay its readiness.
+///
+/// Recovery drains what this owner must resolve. A peer's unexpired claim is
+/// owned by that peer's own recovery, so treating it as residue would stall
+/// every replica behind the slowest one.
+///
+/// # Panics
+///
+/// Panics when the foreign claim blocks readiness or is disturbed.
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_foreign_claim_does_not_block_readiness() {
+    let (server, _observer) = server_with_forge_observer().await;
+    let pool = server
+        .pg_fixture()
+        .superuser_pool()
+        .await
+        .expect("superuser pool");
+    let task_id = seed_ready_forge_task(
+        &pool,
+        uuid::Uuid::from(server.data_tenant_id()),
+        "foreign_claim",
+        "small_files",
+        true,
+        "{\"version\":1,\"inputs\":[\"a.parquet\"],\"parameters\":{}}",
+    )
+    .await;
+    let peer = uuid::Uuid::now_v7();
+    sqlx::query(
+        "UPDATE vala.forge_tasks SET state='claimed',claimed_by=$2,attempt_id=$3,\
+         claim_expires_at=statement_timestamp()+interval '10 minutes' WHERE task_id=$1",
+    )
+    .bind(task_id)
+    .bind(peer)
+    .bind(uuid::Uuid::now_v7())
+    .execute(&pool)
+    .await
+    .expect("a live peer holds the claim");
+
+    await_forge_role_while_running(&server, "worker beside a live foreign claim").await;
+
+    let (state, owner): (String, Option<uuid::Uuid>) =
+        sqlx::query_as("SELECT state,claimed_by FROM vala.forge_tasks WHERE task_id=$1")
+            .bind(task_id)
+            .fetch_one(&pool)
+            .await
+            .expect("the foreign claim is readable");
+    assert_eq!(state, "claimed", "the foreign claim was disturbed");
+    assert_eq!(owner, Some(peer), "the foreign claim changed owner");
+    server.shutdown().await.expect("test server shuts down");
+}
+
+/// A worker whose table-fence release fails after a durable settlement returns
+/// that release error, clears readiness, and recovers on respawn.
+///
+/// The settlement itself already committed, so the release failure is the only
+/// unsafe part: the fence is still held by an owner that is no longer running
+/// it. Readiness must clear before any sibling can claim behind that fence.
+///
+/// # Panics
+///
+/// Panics when the release failure is swallowed, readiness survives it, or the
+/// respawned worker does not recover.
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn release_failure_clears_readiness() {
+    let (server, observer) = server_with_forge_observer().await;
+    let readiness = server
+        .state()
+        .forge()
+        .expect("the default target selects Forge")
+        .worker_readiness();
+    let pool = server
+        .pg_fixture()
+        .superuser_pool()
+        .await
+        .expect("superuser pool");
+
+    let stop = tokio_util::sync::CancellationToken::new();
+    let worker = wyrd_server::boot::spawn_forge_worker(server.state(), stop.clone(), 1, 1)
+        .expect("the worker composes");
+    let handle = tokio::spawn(worker);
+    // The fault is a one-shot, so it is armed only after the recovery drain has
+    // published ready. Arming it before startup would spend it on a recovery
+    // release and leave the claim under test running unfaulted.
+    await_forge_role(
+        &server,
+        true,
+        wyrd_server::state::Forge::worker_readiness,
+        "worker before its release fault is armed",
+    )
+    .await;
+    observer.fail_next_lease_release();
+
+    // A well-formed payload on a table this catalog does not carry reaches the
+    // table fence, settles its attempt durably, and then releases: exactly the
+    // ordering this fault needs.
+    let task_id = seed_ready_forge_task(
+        &pool,
+        uuid::Uuid::from(server.data_tenant_id()),
+        "release_only",
+        "small_files",
+        true,
+        // The live-rewrite parameter object is the exact contract the worker's
+        // pre-effect gate requires, so this claim reaches the table fence
+        // instead of being terminalized as malformed before one is acquired.
+        "{\"version\":1,\"inputs\":[\"a.parquet\"],\"parameters\":{\"kind\":\"live_rewrite\"}}",
+    )
+    .await;
+
+    let joined = tokio::time::timeout(FORGE_READINESS_CEILING, handle).await;
+    stop.cancel();
+    let error = match joined {
+        Ok(outcome) => outcome
+            .expect("worker joins")
+            .expect_err("the injected release failure is returned"),
+        Err(_) => {
+            let state: String =
+                sqlx::query_scalar("SELECT state FROM vala.forge_tasks WHERE task_id=$1")
+                    .bind(task_id)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("the seeded task row is readable");
+            panic!(
+                "the faulted worker kept claiming instead of returning its release failure \
+                 (task state: {state}, ready: {})",
+                readiness.is_ready()
+            )
+        }
+    };
+    assert!(
+        format!("{error}").contains("injected Forge table lease release failure"),
+        "the worker returned an unrelated error: {error}"
+    );
+    assert!(
+        !readiness.is_ready(),
+        "a worker still holding an unreleased table fence advertised ready"
+    );
+    let state: String = sqlx::query_scalar("SELECT state FROM vala.forge_tasks WHERE task_id=$1")
+        .bind(task_id)
+        .fetch_one(&pool)
+        .await
+        .expect("the settled task row is readable");
+    assert_ne!(
+        state, "ready",
+        "the attempt settled before its release failed"
+    );
+    // No sibling may claim behind a fence this owner never released.
+    let claimed: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM vala.forge_tasks WHERE task_id=$1 AND state IN ('claimed','running')",
+    )
+    .bind(task_id)
+    .fetch_one(&pool)
+    .await
+    .expect("the claim inventory is readable");
+    assert_eq!(claimed, 0, "a sibling claimed behind the unreleased fence");
+
+    await_forge_role_while_running(&server, "worker after its release recovers").await;
+    server.shutdown().await.expect("test server shuts down");
 }

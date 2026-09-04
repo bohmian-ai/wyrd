@@ -2320,6 +2320,94 @@ async fn durably_settled_claims_keep_readiness() {
     }
 }
 
+/// A transient execution failure settles the task retryable and keeps the
+/// worker ready.
+///
+/// A contract-valid rewrite whose table the catalog cannot load is an
+/// environment failure, not a defect in the task or in this replica. The
+/// durable row must return to `retryable` for a later attempt, the worker must
+/// report no completion, and readiness must survive: a replica that unreadied
+/// itself over another table's absence would drain the whole pod for one bad
+/// row.
+///
+/// # Panics
+///
+/// Panics when the task terminalizes instead of retrying, is reported as a
+/// completion, or clears readiness.
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transient_execution_failure_retries_and_keeps_readiness() {
+    let (server, observer) = server_with_forge_observer().await;
+    let readiness = server
+        .state()
+        .forge()
+        .expect("the default target selects Forge")
+        .worker_readiness();
+    let pool = server
+        .pg_fixture()
+        .superuser_pool()
+        .await
+        .expect("superuser pool");
+    let task_id = seed_ready_forge_task(
+        &pool,
+        uuid::Uuid::from(server.data_tenant_id()),
+        "absent_table",
+        "small_files",
+        true,
+        LIVE_REWRITE_PLAN,
+    )
+    .await;
+
+    let stop = tokio_util::sync::CancellationToken::new();
+    let worker = wyrd_server::boot::spawn_forge_worker(server.state(), stop.clone(), 1, 1)
+        .expect("the worker composes");
+    let handle = tokio::spawn(worker);
+    await_forge_role(
+        &server,
+        true,
+        wyrd_server::state::Forge::worker_readiness,
+        "worker",
+    )
+    .await;
+
+    // Poll for the retryable transition rather than a terminal state: this row
+    // deliberately never terminalizes, so a settle-wait would time out on it.
+    let deadline = std::time::Instant::now() + FORGE_READINESS_CEILING;
+    let mut observed = String::new();
+    while std::time::Instant::now() < deadline {
+        observed = sqlx::query_scalar("SELECT state FROM vala.forge_tasks WHERE task_id=$1")
+            .bind(task_id)
+            .fetch_one(&pool)
+            .await
+            .expect("the seeded task row is readable");
+        if observed == "retryable" {
+            break;
+        }
+        assert!(
+            !matches!(observed.as_str(), "succeeded" | "failed" | "cancelled"),
+            "a transient catalog failure terminalized as {observed}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        observed, "retryable",
+        "a transient catalog failure did not return the task for a later attempt"
+    );
+    assert_eq!(
+        observer.completed(),
+        0,
+        "a failed attempt was reported as a completion"
+    );
+    assert!(
+        readiness.is_ready(),
+        "a replica unreadied itself over another table's absence"
+    );
+
+    stop.cancel();
+    handle.await.expect("worker joins").expect("worker loop ok");
+    server.shutdown().await.expect("test server shuts down");
+}
+
 /// A live claim owned by another worker is not this worker's recovery residue
 /// and does not delay its readiness.
 ///

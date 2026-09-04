@@ -214,8 +214,6 @@ struct WyrdTestServerInner {
     forge_process_role: BifrostTarget,
     /// Stable identity assigned to this server process.
     node_id: NodeId,
-    /// Optional lifecycle telemetry owner retained until shutdown.
-    _forge_role_telemetry: Option<wyrd_server::app::metrics::TestForgeRoleTelemetryGuard>,
     /// Atomic one-shot query truncation controls for language journeys.
     query_stream_fault: QueryStreamFaultController,
     /// Atomic lifecycle-audit fault controls for causal query tests.
@@ -3515,10 +3513,6 @@ impl WyrdTestServerBuilder {
         let (forge_publisher, _forge_inbox) = staging_file_channel(16)
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
         let router = build_router(state.clone());
-        let forge_role_telemetry = Some(wyrd_server::start_capture_forge_role(
-            self.forge_process_role,
-            node_id.as_uuid(),
-        ));
 
         Ok(WyrdTestServer {
             inner: WyrdTestServerInner {
@@ -3539,7 +3533,6 @@ impl WyrdTestServerBuilder {
                 forge_object_store,
                 forge_process_role: self.forge_process_role,
                 node_id,
-                _forge_role_telemetry: forge_role_telemetry,
                 query_stream_fault,
                 query_control_audit_fault,
                 query_stream_stall: std::sync::Mutex::new(None),

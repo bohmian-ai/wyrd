@@ -54,7 +54,5 @@ pub use scribe_workload::{
 };
 pub use telemetry::{
     BifrostQueryTelemetryReport, BifrostTelemetryCapture, BifrostTelemetryCheckpoint,
-    BifrostTelemetryReportError, ForgeCausalDiagnosis, ForgeCausalTelemetryReport,
-    ForgeDiscoveredCandidateTelemetry, ForgeMaintenanceTelemetryReport, ForgeTelemetryFailureClass,
-    ForgeTelemetryResource,
+    BifrostTelemetryReportError,
 };

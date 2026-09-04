@@ -75,11 +75,9 @@ pub async fn run(mode: Option<ServeMode>) -> Result<(), BootExit> {
     let result = if !config.role.serves_api() {
         run_forge_worker_process(&config, state, metrics_handle).await
     } else {
-        let node_id = state.bifrost.node_id().ok_or_else(|| {
+        state.bifrost.node_id().ok_or_else(|| {
             BootExit::Other("configured Bifrost node identity is unavailable".into())
         })?;
-        let _role_telemetry =
-            metrics::ForgeRoleTelemetryGuard::started(config.role, node_id.as_uuid());
         WyrdServer::new_with_metrics_handle(config, state, metrics_handle)
             .map_err(|e| BootExit::Other(Box::new(e)))?
             .serve(mode)
@@ -107,11 +105,10 @@ async fn run_forge_worker_process(
     state: AppState,
     metrics_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
 ) -> Result<(), BootExit> {
-    let node_id = state
+    state
         .bifrost
         .node_id()
         .ok_or_else(|| BootExit::Other("configured Bifrost node identity is unavailable".into()))?;
-    let _role_telemetry = metrics::ForgeRoleTelemetryGuard::started(config.role, node_id.as_uuid());
     let shutdown = state.shutdown_token.clone();
     let mut set: JoinSet<TaskExit> = JoinSet::new();
     let worker = spawn_forge_worker(

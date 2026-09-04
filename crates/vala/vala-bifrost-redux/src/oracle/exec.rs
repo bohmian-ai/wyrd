@@ -38,7 +38,7 @@ use datafusion::physical_plan::aggregates::AggregateExec;
 use datafusion::physical_plan::execution_plan::{
     Boundedness, EmissionType, PlanProperties, SchedulingType,
 };
-use datafusion::physical_plan::joins::HashJoinExec;
+use datafusion::physical_plan::joins::{HashJoinExec, SortMergeJoinExec};
 use datafusion::physical_plan::metrics::{
     Count, ExecutionPlanMetricsSet, Metric, MetricValue, MetricsSet,
 };
@@ -378,6 +378,16 @@ impl OracleQueryScanStats {
         if let Some(source) = plan.downcast_ref::<HotParquetExec>() {
             stats.scan_handles.push(Arc::clone(source.metrics()));
         }
+        // A remote placeholder hides the leaf it substituted from `children`
+        // so the distributed planner keeps scaling it as one. The leader still
+        // executes that leaf whenever the stage stays in the head, so scan
+        // evidence has to descend into it explicitly or every locally served
+        // distributed-shaped query would report no source at all.
+        if let Some(source) = plan.downcast_ref::<super::codec::RemoteSourcePlaceholderExec>()
+            && let Some(local) = source.local_plan()
+        {
+            Self::visit(local.as_ref(), stats);
+        }
         for child in plan.children() {
             Self::visit(child.as_ref(), stats);
         }
@@ -608,7 +618,7 @@ struct PhysicalEvidenceWalk {
     sorts: Vec<OutputSortNode>,
     /// Distinct grouping-column types across every aggregate in the plan.
     aggregate_group_types: std::collections::BTreeSet<String>,
-    /// Field names of each hash join's build-side child, in visit order.
+    /// Field names of each equi-join's left-input child, in visit order.
     join_build_schemas: Vec<Vec<String>>,
     /// Nodes already recorded, identified by address.
     ///
@@ -663,7 +673,17 @@ impl PhysicalEvidenceWalk {
                 }
             }
         }
+        // Both equi-join operators are recorded. Which one a query gets is not
+        // a property of the statement: the retained planning shape disables
+        // hash joins at the memory floor precisely because `HashJoinExec`
+        // cannot spill, so a plan built at the floor carries a sort-merge join
+        // instead. Reading only one operator would report a real join as
+        // absent on every query the floor shape planned.
         if let Some(join) = node.downcast_ref::<HashJoinExec>() {
+            self.join_build_schemas
+                .push(field_names(join.left().schema().as_ref()));
+        }
+        if let Some(join) = node.downcast_ref::<SortMergeJoinExec>() {
             self.join_build_schemas
                 .push(field_names(join.left().schema().as_ref()));
         }

@@ -400,6 +400,19 @@ impl RemoteSourcePlaceholderExec {
     pub fn predicates(&self) -> &[wyrd_spec::vala::assignment_authority::ScanPredicate] {
         &self.predicates
     }
+
+    /// Returns the leader-readable leaf this placeholder substituted, if any.
+    ///
+    /// The local plan is deliberately hidden from [`ExecutionPlan::children`]
+    /// so the distributed planner keeps treating this node as a leaf and gives
+    /// it one variant per stage task. Any walk over the retained root would
+    /// therefore stop here and see no source at all, which is wrong for
+    /// anything accounting for what the leader actually executed. Scan
+    /// evidence reads the substituted leaf back through this accessor.
+    #[must_use]
+    pub fn local_plan(&self) -> Option<&Arc<dyn ExecutionPlan>> {
+        self.local.as_ref()
+    }
 }
 
 impl DisplayAs for RemoteSourcePlaceholderExec {

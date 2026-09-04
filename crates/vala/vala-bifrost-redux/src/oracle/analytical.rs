@@ -8621,7 +8621,11 @@ pub struct AnalyticalPhysicalEvidence {
     /// A plan that groups on the wide sort key rather than the narrow join key
     /// would carry `Utf8` here, which is the shape the baseline refuses.
     pub aggregate_group_types: Vec<String>,
-    /// Field names of each hash join's build-side child, in plan order.
+    /// Field names of each equi-join's left-input child, in plan order.
+    ///
+    /// Hash and sort-merge joins both count: the retained planning shape
+    /// disables hash joins at the memory floor, so which operator a query
+    /// carries is decided by the grant rather than by the statement.
     pub join_build_schemas: Vec<Vec<String>>,
 }
 
@@ -8694,6 +8698,15 @@ impl AnalyticalGraphMetricFold {
         self,
     ) -> datafusion::error::Result<Option<AnalyticalPhysicalEvidence>> {
         let executed = self.fold.await?;
+        // The rewritten plan is the only place the executed stages exist as one
+        // tree, and the evidence read below is a projection of it. Rendering it
+        // here is what makes a missing sort, aggregate, or join diagnosable
+        // without re-running the query under a different build.
+        tracing::debug!(
+            target: "wyrd::oracle::analytical",
+            plan = %datafusion::physical_plan::displayable(executed.as_ref()).indent(true),
+            "analytical metric-carrier plan"
+        );
         Ok(super::exec::output_sort_evidence(&executed))
     }
 }

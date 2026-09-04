@@ -321,3 +321,123 @@ needs another transport/listener/service, server-side Skald or SDK self-calls,
 identity tool arguments, a custom MCP protocol layer, or weaker Wyrd edge
 security. Stop for an approved-plan revision if the Oracle remediation changes
 the existing auth, listener, or shutdown seams assumed here.
+
+## Execution evidence
+
+### Scenario 1 — one authenticated endpoint and real protocol lifecycle
+
+RED. `connectivity::pg_tests::streamable_http_client_reaches_authenticated_server_context`
+failed with `Error: ConnectionClosed("initialize response")`. A direct-`reqwest`
+probe of the same POST showed the cause: `HTTP 200` carrying
+`{"code":-32022,"message":"Unsupported protocol version","data":{"requested":"2026-07-28","supported":["2026-07-28"]}}`.
+`components::auth::principal_extractor::pg_tests::authenticated_principal_preserves_verified_delegation_chain`
+failed to compile with E0599 (`no method named principal`/`delegation_chain` on
+`AuthenticatedPrincipal`) before the extractor retained its verified token.
+
+GREEN. `AuthenticatedPrincipal` retains `Arc<VerifiedToken>` behind
+`principal()`/`delegation_chain()` and a crate-private `from_verified`; the
+`/mcp` route mounts one `StreamableHttpService` inside the existing
+`require_authenticated` and request-id layers; the handler recovers both
+extensions from the transport's `axum::http::request::Parts`. The apparent
+version contradiction is `rmcp`'s lifecycle split, not a mismatch: `initialize`
+negotiates only down to a pre-2026-07-28 revision, and `ServiceExt::serve` takes
+that path by default. Advertising exactly the current revision — as this task
+requires — therefore admits only `server/discover` plus self-contained
+per-request metadata, so the journey opts into
+`ClientLifecycleMode::Discover`. Both tests pass.
+
+Consequence, recorded on `WYRD_MCP_PROTOCOL_VERSION`: a client that cannot speak
+2026-07-28 cannot reach `/mcp` at all. Confirmed as intended, not pending.
+This is an interoperability ceiling for the successor task's Bifrost tools and
+for any agent outside Wyrd's own SDKs; widening the advertised set is a product
+decision, not a local change in the adapter.
+
+A second journey, `connectivity::pg_tests::default_server_advertises_no_mcp_tools`,
+pins the other half of the catalog contract: compiling `test-support` is not
+enough to expose the probe, so a fixture that did not call
+`with_mcp_context_probe_for_test` advertises nothing.
+
+### Scenario 2 — per-request Wyrd headers on the client decorator
+
+RED. With header injection removed from `post_message`,
+`client::tests::decorator_adds_current_wyrd_headers_once_per_request` failed on
+`assertion left == right failed: the current bearer is obtained for every
+request / left: 0 / right: 2` — no `/auth/token` exchange occurred, so no Wyrd
+header could have been written.
+
+GREEN. `WyrdMcpHttpClient` implements `rmcp`'s `StreamableHttpClient` by
+delegating once to `reqwest::Client` after inserting `x-wyrd-access-token` and,
+when the caller supplied none, a minted `wyrd-request-id`. The recorder mints a
+rotating token that always expires inside the middleware's proactive-refresh
+skew, so two MCP requests observe `Bearer access-1` and `Bearer access-2` — a
+pinned first bearer fails the test. `Authorization` is never written, `accept`
+and `content-type` pass through untouched, and each message produces exactly one
+recorded HTTP request. Passes.
+
+`StreamableHttpError<E>` is `#[non_exhaustive]`, so the decorator cannot
+re-map exhaustively into a custom error type; it uses `type Error =
+reqwest::Error` and surfaces credential failures as
+`StreamableHttpError::Io(io::Error::other(..))`.
+
+REFACTOR. `contains_key`-then-`insert` became `Entry::Vacant` under
+`clippy::map_entry`.
+
+### Scenario 3 — credentials, RBAC, and both cancellation paths
+
+RED. The implementation preceded this test, so RED was established by mutation:
+replacing `let _token = state.mcp_tasks.token()` in the probe with a unit
+binding failed
+`connectivity::pg_tests::mcp_rejects_credentials_and_joins_request_and_process_cancellation`
+at `connectivity.rs:310` — "the drain cannot report settled while a tracker
+token is still held". The token was restored and the test passes.
+
+GREEN. One journey covers the single lifecycle: direct-`reqwest` posts prove the
+public edge refuses a missing credential with `401` /
+`WYRD_AUTH_401_UNAUTHENTICATED` and a malformed one with `400` /
+`WYRD_AUTH_400_BAD_TOKEN_FORMAT` before MCP framing exists; an under-scoped
+principal is refused through `authorize_audited` with
+`WYRD_PERMISSION_403_DENIED_RBAC` and exactly one new `deny` row in
+`vala.audit_outbox`; an allowed call carrying spoofed `tenant_id` and
+`principal_id` arguments still reports the verified tenant and principal;
+`RequestHandle::cancel(None)` reaches the handler's own `context.ct`; and
+process shutdown cancels in-flight work, then blocks its drain on the tracker
+until the parked invocation releases, after which
+`cancel_and_join_for_test` returns cleanly. Rendezvous is deterministic through
+zero-permit semaphores keyed by a caller-supplied `hold_id` — no sleeps.
+
+### Broader verification
+
+`mise run fmt`, `mise run lints`, `mise run check:client-tier`,
+`mise run test:bifrost:journey:mcp` (3/3), and `git diff --check` all pass, as do
+every task-named focused command.
+
+Command correction: the task lists `mise run test:e2e`, which is not a task in
+`mise.toml`. Substituted the e2e targets that cover the touched auth seam:
+
+```bash
+scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p wyrd-server --test auth_e2e --test authz_check_e2e --test identity_e2e --test-threads=2"
+```
+
+30 passed, 0 failed.
+
+`mise.toml`'s `test:bifrost:journey:mcp` description was updated from "Bifrost
+MCP surface and its RBAC" to name what the binary now proves. The lane itself
+selects the target whole and needed no change.
+
+### Limitations
+
+`mise run check:unwrap-audit` fails, and fails identically at this change's base
+commit `f6148fbbb`: `comm -13` over the sorted findings at base and at HEAD
+reports zero new entries. The findings are a method named `expect` on a byte
+cursor in `otlp_json.rs`/`otlp_trace_json.rs` and on test harness types, none of
+them in this task's write set.
+
+`mise run test:wyrd` does not pass cleanly on this machine. The failures are
+Postgres connection exhaustion — `expected to read 5 bytes, got 0 bytes at EOF`
+— and the failing set changes with `--test-threads`, which is the signature of a
+resource ceiling rather than a defect. Re-running the reported failures at
+`--test-threads=2` passes them (`pg_authz_check_route`, `pg_bootstrap_key`,
+`pg_eval_v1_protocol`: 17/17). One genuine failure survives and is also
+pre-existing: `wyrd-sql tests::transaction_discipline_is_documented` asserts on
+a sentence absent from `architecture/v1/00-foundations/sql-foundation.md` at
+base commit `f6148fbbb`; nothing under `architecture/` is in this write set.

@@ -54,4 +54,4 @@ jobs:
           docker-images: "false"
 
       - name: Run identity e2e suite
-        run: mise run identity:e2e
+        run: mise run test:identity:journey

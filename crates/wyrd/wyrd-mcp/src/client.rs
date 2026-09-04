@@ -7,6 +7,7 @@
 //! MCP client facade, handler, or lifecycle wrapper.
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::io;
 use std::sync::Arc;
 
@@ -76,10 +77,10 @@ impl WyrdMcpHttpClient {
             .map_err(|error| StreamableHttpError::Io(io::Error::other(error)))?;
         custom_headers.insert(HEADER_WYRD_ACCESS_TOKEN, token);
 
-        if !custom_headers.contains_key(&HEADER_WYRD_REQUEST_ID) {
+        if let Entry::Vacant(slot) = custom_headers.entry(HEADER_WYRD_REQUEST_ID) {
             let request_id = HeaderValue::from_str(&self.auth.request_id(None))
                 .map_err(|error| StreamableHttpError::Io(io::Error::other(error)))?;
-            custom_headers.insert(HEADER_WYRD_REQUEST_ID, request_id);
+            slot.insert(request_id);
         }
         Ok(custom_headers)
     }

@@ -329,7 +329,7 @@ wyrd-tonic's `default = []` leaves the `server`/`client` code uncompiled there,
 so this general crate lane is the only place those conversions execute."""
 run = "cargo nextest run --locked -p wyrd-tonic --features server,client"
 
-[tasks."identity:e2e"]
+[tasks."test:identity:journey"]
 hide = true
 description = """Stand up real OIDC providers (Keycloak + Dex), seed test users via the Keycloak
 admin REST API, export env gates, run the identity e2e suite against both issuers, then tear down.
@@ -337,8 +337,8 @@ Gated by WYRD_IDENTITY_E2E=1; skipped when the env var is unset so default local
 """
 env = { WYRD_IDENTITY_E2E = "1", WYRD_KEYCLOAK_ISSUER = "http://localhost:8080/realms/wyrd-test", WYRD_DEX_ISSUER = "http://localhost:5556" }
 
-run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run identity:e2e:inner'"
-[tasks."identity:e2e:inner"]
+run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run test:identity:journey:inner'"
+[tasks."test:identity:journey:inner"]
 hide = true
 description = """Stand up real OIDC providers (Keycloak + Dex), seed test users via the Keycloak
 admin REST API, export env gates, run the identity e2e suite against both issuers, then tear down.

@@ -41,11 +41,21 @@ pub mod probe;
 /// attach it, so accepting older revisions would mean accepting requests the
 /// stateless validator then rejects.
 ///
-/// Serving exactly one revision also fixes the lifecycle: `initialize` is the
-/// legacy handshake and negotiates only down to a pre-2026-07-28 revision, so
-/// a client reaches `/mcp` through `server/discover` plus self-contained
-/// per-request protocol metadata. That is the same session-free shape the
-/// stateless transport below is configured for.
+/// Serving exactly one revision also fixes the lifecycle: `initialize`
+/// negotiates only down to a pre-2026-07-28 revision, so a client reaches
+/// `/mcp` through `server/discover` plus self-contained per-request protocol
+/// metadata. That is the same session-free shape the stateless transport below
+/// is configured for.
+///
+/// Wyrd does not serve the older lifecycle, and that is deliberate rather than
+/// pending: a client that cannot speak 2026-07-28 cannot reach `/mcp` at all.
+/// The cost is interoperability with MCP clients pinned to an earlier
+/// revision; the return is one protocol shape with no session affinity, no
+/// per-revision branch in the adapter, and per-request metadata the stateless
+/// validator can require. Widening this set is a product decision about which
+/// agents Wyrd serves, not a local change here — every value added has to
+/// carry its own lifecycle through the same authorization, audit, tenancy, and
+/// cancellation path.
 const WYRD_MCP_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V_2026_07_28;
 
 /// The concrete Wyrd MCP request handler.

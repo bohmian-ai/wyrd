@@ -28,7 +28,7 @@ pre = {
     "test:bifrost:integration:server",
     "test:bifrost:journey",
     "test:bifrost:journey:python", "test:bifrost:journey:typescript",
-    "py:test:integration", "ts:test:integration", "identity:e2e",
+    "py:test:integration", "ts:test:integration", "test:identity:journey",
     "test:storage:e2e", "test:storage:s3:cloud", "test:storage:gcs:cloud", "test:storage:azure:cloud",
 }
 aggregates = {"test:rust", "gate", "test:storage:matrix", "test:storage:cloud:matrix"}

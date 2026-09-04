@@ -187,6 +187,12 @@ pub struct WyrdTestServer {
     requested_bind: Option<(std::net::SocketAddr, std::net::SocketAddr)>,
     /// Peer identity this server presents and verifies on the private plane.
     peer_tls: Option<TestBifrostPeerTls>,
+    /// Peer workload credential this server's private plane admits.
+    ///
+    /// Retained so a test can dial the peer plane as the one Service principal
+    /// the composed listener authorizes, instead of minting a second identity
+    /// the server was never told about.
+    peer_credentials: Arc<dyn OraclePeerCredentials>,
     /// Retains generated peer PEM files for as long as this server exists.
     _peer_tls_root: Option<Arc<tempfile::TempDir>>,
     /// Peer ticket keyring paths this server loads its peer authority from.
@@ -1748,6 +1754,23 @@ impl WyrdTestServer {
     #[must_use]
     pub fn peer_tls(&self) -> Option<&TestBifrostPeerTls> {
         self.peer_tls.as_ref()
+    }
+
+    /// Returns a bearer for the one workload principal the peer plane admits.
+    ///
+    /// The private listener authenticates exactly the Service principal bound
+    /// to this server's peer API key, so a test that dials the peer plane needs
+    /// this bearer rather than a user or data-tenant service token.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WyrdTestServerError::Auth`] when the credential exchange
+    /// cannot produce a bearer.
+    pub async fn peer_bearer(&self) -> Result<String, WyrdTestServerError> {
+        self.peer_credentials
+            .bearer(false)
+            .await
+            .map_err(|error| WyrdTestServerError::Auth(error.to_string()))
     }
 
     /// Return the placeholder API key (full bootstrap is complex).
@@ -3868,6 +3891,7 @@ impl WyrdTestServerBuilder {
             Some(credentials) => credentials,
             None => provision_oracle_peer_credentials(Arc::clone(&fixture)).await?,
         };
+        let retained_peer_credentials = Arc::clone(&peer_credentials);
         // Every Scribe- or Oracle-bearing target requires a complete peer
         // identity, so the harness provisions one unconditionally rather than
         // letting a test boot a server that production configuration would
@@ -4063,6 +4087,7 @@ impl WyrdTestServerBuilder {
             serve_handle: None,
             requested_bind: self.bind_addrs,
             peer_tls: self.peer_tls,
+            peer_credentials: retained_peer_credentials,
             _peer_tls_root: self.peer_tls_root,
             peer_keyring_paths: self.peer_keyring_paths,
             peer_bind: self.peer_bind,
@@ -4098,6 +4123,49 @@ impl WyrdTestServerBuilder {
         let srv = self.start_in_process().await?;
         srv.bind().await
     }
+}
+
+/// Mints one complete `bifrost.peer` identity under `directory`.
+///
+/// A Scribe- or Oracle-bearing target refuses to compose without a complete
+/// peer identity, so a test that hand-builds a [`WyrdServerConfig`] rather than
+/// taking one from [`WyrdTestServerBuilder`] still needs real CA, leaf, and
+/// ticket-keyring material on disk. This mints exactly that through the same
+/// authorities the harness uses, so no test grows a second notion of what a
+/// peer identity is.
+///
+/// The caller owns `directory` and must keep it alive for as long as the
+/// composed server may read the material.
+///
+/// # Errors
+///
+/// Returns [`WyrdTestServerError::Start`] when certificate or keyring material
+/// cannot be minted or written under `directory`.
+pub fn materialize_test_peer_config(
+    directory: &std::path::Path,
+    label: &str,
+) -> Result<wyrd_server::config::BifrostPeerConfig, WyrdTestServerError> {
+    let start = |error: String| WyrdTestServerError::Start(error);
+    let authority = crate::bifrost::peer_ca::BifrostPeerCa::generate("localhost")
+        .map_err(|error| start(error.to_string()))?;
+    let tls = authority
+        .materialize(directory, label)
+        .map_err(|error| start(error.to_string()))?;
+    let keyring = crate::bifrost::peer_keyring::TestPeerKeyring::generate()
+        .materialize(directory, label)
+        .map_err(|error| start(error.to_string()))?;
+    let bind = reserve_loopback_addr()?;
+    Ok(wyrd_server::config::BifrostPeerConfig {
+        bind,
+        advertise_addr: Some(format!("https://{bind}")),
+        ca_certificate_path: Some(tls.ca_path),
+        certificate_chain_path: Some(tls.certificate_path),
+        private_key_path: Some(tls.private_key_path),
+        server_name: Some(tls.server_name),
+        api_key: Some("harness-peer-api-key".to_owned()),
+        ticket: peer_keyring_config(&keyring),
+        ..wyrd_server::config::BifrostPeerConfig::default()
+    })
 }
 
 /// Projects materialized keyring paths onto the production configuration shape.

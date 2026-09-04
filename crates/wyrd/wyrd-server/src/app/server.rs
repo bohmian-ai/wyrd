@@ -949,6 +949,13 @@ mod pg_tests {
             config.http.bind = "127.0.0.1:0".parse().expect("static bind is valid");
             config.metrics.enabled = false;
             config.shutdown.drain_ms = 1_000;
+            config.bifrost.peer = crate::test_support::test_peer_config();
+            // The unit shell composes no Forge, and the default `All` target
+            // refuses to run without a retained Forge worker before shutdown
+            // is ever reached. `Server` is the serving target that schedules
+            // maintenance without executing it; it reaches the identical
+            // readiness, transport, Oracle, and Scribe shutdown phases.
+            config.role = BifrostTarget::Server;
             let probe = ShutdownTestProbe::new(stall);
             let server = WyrdServer::new(config, test_state_with_auth().await)
                 .expect("test server builds")
@@ -985,6 +992,7 @@ mod pg_tests {
     async fn metrics_disabled_construction_has_no_global_recorder() {
         let mut config = WyrdServerConfig::default();
         config.metrics.enabled = false;
+        config.bifrost.peer = crate::test_support::test_peer_config();
 
         let state1 = test_state_with_auth().await;
         let server1 = WyrdServer::new(config.clone(), state1)

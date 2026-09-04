@@ -218,13 +218,14 @@ mod tests {
             "dedicated worker composition must create one shared worker graph"
         );
         let boot = include_str!("../boot/mod.rs");
-        assert!(
-            boot.contains(".bifrost_node_id()"),
-            "normal worker composition must obtain configured physical identity from AppState"
+        assert_eq!(
+            boot.matches("ForgeWorker::new(").count(),
+            1,
+            "boot must construct the Forge worker exactly once"
         );
         assert!(
             boot.contains("node_id.as_uuid()"),
-            "normal ForgeWorker construction must use configured physical identity"
+            "normal ForgeWorker construction must use the boot-resolved physical identity"
         );
 
         let server = include_str!("server.rs");

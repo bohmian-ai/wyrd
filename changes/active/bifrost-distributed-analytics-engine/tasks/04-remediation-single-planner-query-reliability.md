@@ -1578,3 +1578,96 @@ Run and record: `mise run test:vala`, `mise run test:bifrost:journey:server`,
 `mise run check:pyo3-scope`, `mise run check:bifrost-resource-governance`, and
 `mise run check:unwrap-audit` (result recorded, not widened). Any failure among
 these is this task's obligation on the same terms Amendment 1 set.
+
+## Amendment 3 — closeout verification (scoped)
+
+**Lane scope revision.** Amendment 2 required `mise run test:e2e`. That lane
+runs the entire `wyrd-auth`, `wyrd-server`, `wyrd-testing`, and `wyrd-client`
+suites, most of which this task does not touch. The required lane is narrowed
+to the Bifrost-touching surface: the `wyrd-server` lib tests and the three
+integration targets in this task's write set, plus the already-listed Bifrost
+journey lanes. `wyrd-auth`, `wyrd-client`, and the non-Bifrost `wyrd-server`
+integration targets are out of scope.
+
+**Results.**
+
+| Lane | Result |
+| --- | --- |
+| `mise run test:vala` | 1276/1276 pass |
+| `mise run test:bifrost:journey:server` | 2/2 pass |
+| `mise run test:bifrost:journey:sdk` | 9/9 pass |
+| `mise run codegen:check` | pass |
+| `mise run check:client-tier` | pass |
+| `mise run check:pyo3-scope` | pass |
+| `mise run check:bifrost-resource-governance` | pass |
+| `mise run fmt`, `mise run lints` | pass |
+| scoped `wyrd-server --lib` | 365/365 pass |
+| scoped `wyrd-server` integration targets | 26/26 pass |
+| `mise run check:unwrap-audit` | fails on pre-existing `expect(` matches in `otlp_trace_json.rs` and `wyrd-testing/src/bifrost/*`; recorded, not widened |
+
+Scoped commands:
+
+```
+scripts/postgres/with-test-postgres.sh -- bash -lc \
+  "mise run db:migrate:inner && mise exec -- cargo nextest run --locked \
+   -p wyrd-server --features test-support --test-threads=1 --lib"
+
+scripts/postgres/with-test-postgres.sh -- bash -lc \
+  "mise run db:migrate:inner && mise exec -- cargo nextest run --locked \
+   -p wyrd-server --features test-support --test-threads=1 \
+   --test pg_grpc_ingest_smoke --test pg_router_smoke --test pg_merge_http_protected"
+```
+
+The two halves must run as separate nextest invocations. Combined in one
+invocation each `WyrdTestServer::start_in_process()` adds another embedded
+Postgres, and the fixtures start failing migrations with
+`expected to read 5 bytes, got 0 bytes at EOF`. That is fixture resource
+pressure, not a product defect: every affected test passes when the binaries
+run separately.
+
+**Root causes repaired.** All were branch regressions where a test asserted a
+contract the branch had already replaced; no production logic changed.
+
+1. **Peer identity became mandatory.** `WyrdServer::new` refuses to compose a
+   Scribe- or Oracle-bearing target without a complete `bifrost.peer` identity.
+   `wyrd-testing` gained `materialize_test_peer_config` for integration
+   fixtures; `wyrd-server`'s in-crate tests mint their own with `rcgen` in
+   `test_support.rs`, because `wyrd-testing` is a dev-dependency of this crate
+   and linking it from the lib test target pulls in a second `wyrd-server`
+   whose `BifrostPeerConfig` is a different type.
+2. **`AppState::bifrost_node_id()` was removed.** `boot` now passes
+   `node_id.as_uuid()` straight into `ForgeWorker::new`. The source-text
+   assertion in `app/mod.rs` was repointed at that live construction site.
+3. **Transport admission precedes authentication.** A 31 MiB OTLP body is
+   refused as `ResourceExhausted` at the 16 MiB ingest frame limit before the
+   codec or the authenticator runs. The fixture body is now 15 MiB, which keeps
+   authentication as the operative refusal and still proves the codec never ran.
+4. **`ScribeTailService` moved to the private peer plane.** The three tail
+   tests were ported to `build_peer_grpc` with mTLS and the peer bearer. The
+   cross-tenant vector was re-expressed as a real page-audience capability the
+   foreign tenant legitimately holds for its own fence: an acquire ticket fails
+   decode before any tenant is known, so it produces no auditable violation.
+   The violation is audited under the tenant the capability names, so the four
+   denials commit two rows per tenant, not four under the owner.
+5. **Tail fixtures used `vala.bifrost.events`.** `vala.bifrost` is a control
+   namespace with no registrable table and no builtin definition, so the Scribe
+   catalog owner refused the frame with `TableNotFound`. The fixtures now
+   register and read `vala.datasets.tail_events`, matching the existing
+   `register_dataset` precedent in the same file. Fixture tail tickets also
+   derive their nonce from the query id; the fixed `vec![7; 16]` nonce tripped
+   the authority's replay guard on the second mint.
+6. **Graceful shutdown seals the WAL.** `embedded_ingest_...` replayed the WAL
+   after `Scribe::shutdown`, which flushes, publishes, and seals every accepted
+   generation; replay correctly suppresses sealed records, so the assertion saw
+   an empty directory. The replay now runs before the drain, where the
+   fsync-backed ACK is the thing being proved.
+7. **`production_validate` gained a non-serving carve-out.** The unit-shell
+   test now asserts the reachable carve-out, and `pg_router_smoke.rs` gained
+   `production_profile_refuses_a_serving_target_with_stub_defaults` so the
+   security guard keeps real coverage against a composed, API-serving state.
+8. **`BifrostTarget::All` requires a retained Forge worker.** The shutdown-phase
+   unit test runs against a shell `Bifrost` that composes none, so `run()`
+   returned `ForgeSchedulerRequired` before any shutdown phase executed. The
+   test now uses `BifrostTarget::Server`, the serving target that schedules
+   maintenance without executing it and reaches the identical readiness,
+   transport, Oracle, and Scribe phases.

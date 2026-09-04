@@ -80,6 +80,7 @@ utoipa = { workspace = true }
 
 [dev-dependencies]
 insta = { workspace = true }
+rcgen = { workspace = true }
 reqwest = { workspace = true }
 wyrd-storage = { workspace = true }
 temp-env = { workspace = true }

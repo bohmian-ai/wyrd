@@ -15,7 +15,7 @@ pub use oidc_fixture::{KeycloakAdmin, LoginResult, OidcIssuerFixture};
 pub use principal::{Bootstrap, CheckResult};
 pub use server::{
     OracleRuntimeInspection, WyrdTestServer, WyrdTestServerBuilder, WyrdTestServerError,
-    server_postgres_from_fixture,
+    materialize_test_peer_config, server_postgres_from_fixture,
 };
 pub use time::ClockHandle;
 

@@ -2317,7 +2317,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    use super::{AppState, LimitsConfig, ProductionValidationError};
+    use super::{AppState, LimitsConfig};
 
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
     use wyrd_auth_check::AuthzCheckContext;
@@ -2439,13 +2439,20 @@ mod tests {
         assert!(state.production_validate().is_ok());
     }
 
+    /// A production target that serves no public API keeps its stub defaults.
+    ///
+    /// The dedicated Forge worker composes no Gate, authentication, or Oracle
+    /// peer, so the serving-surface guards below `serves_api` do not describe
+    /// it. The stub policy hook this shell carries is therefore accepted, and
+    /// the refusal it would otherwise produce is proved against a composed,
+    /// API-serving state in `tests/pg_router_smoke.rs`.
     #[tokio::test]
-    async fn production_validate_rejects_stub_on_production() {
+    async fn production_validate_accepts_a_non_serving_production_target() {
         let state = test_state()
             .await
             .with_deployment_profile(crate::config::DeploymentProfile::Production);
-        let err = state.production_validate().unwrap_err();
-        assert!(matches!(err, ProductionValidationError::StubPolicyHook));
+        assert!(!state.bifrost.serves_api());
+        assert!(state.production_validate().is_ok());
     }
 
     #[tokio::test]

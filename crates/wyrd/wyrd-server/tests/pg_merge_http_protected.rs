@@ -14,10 +14,14 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use axum::routing::{get, post};
 use chrono::Duration;
+use std::sync::OnceLock;
 use tower::ServiceExt;
 use wyrd_auth_verify::TokenPrincipalRef;
 use wyrd_runtime::PrincipalId;
-use wyrd_server::config::{BifrostTarget, ScribeRuntimeConfig, WyrdServerConfig};
+
+use wyrd_server::config::{
+    BifrostPeerConfig, BifrostTarget, ScribeRuntimeConfig, WyrdServerConfig,
+};
 use wyrd_server::state::LimitsConfig;
 use wyrd_server::{AppState, WyrdServer};
 use wyrd_spec::DataTenantId;
@@ -64,13 +68,38 @@ fn probe_router() -> Router {
         .route("/probe/echo", post(|body: String| async move { body }))
 }
 
+/// One process-lifetime peer identity shared by every case in this binary.
+///
+/// A default target is Scribe- and Oracle-bearing, so `WyrdServer::new` refuses
+/// to compose without a complete `bifrost.peer` identity. These cases never
+/// dial the peer plane — they exercise the HTTP edge stack — so one minted
+/// identity, kept alive for the binary, satisfies composition without giving
+/// each case its own certificate authority.
+static PEER_IDENTITY: OnceLock<(tempfile::TempDir, BifrostPeerConfig)> = OnceLock::new();
+
+/// Returns the shared peer identity, minting it on first use.
+///
+/// # Panics
+/// Panics when peer certificate or ticket material cannot be minted.
+fn peer_identity() -> &'static BifrostPeerConfig {
+    &PEER_IDENTITY
+        .get_or_init(|| {
+            let root = tempfile::tempdir().expect("peer material tempdir");
+            let config = wyrd_testing::materialize_test_peer_config(root.path(), "merge-http")
+                .expect("peer identity mints");
+            (root, config)
+        })
+        .1
+}
+
 /// Build the production `WyrdServer` around the supplied composed state.
 ///
 /// # Panics
 /// Panics when the state cannot satisfy `WyrdServer::new`.
 fn protected_server(state: AppState) -> WyrdServer {
-    WyrdServer::new(WyrdServerConfig::default(), state)
-        .expect("WyrdServer builds with full auth state")
+    let mut config = WyrdServerConfig::default();
+    config.bifrost.peer = peer_identity().clone();
+    WyrdServer::new(config, state).expect("WyrdServer builds with full auth state")
 }
 
 /// `attach_request_id` runs before `require_authenticated`, so even a refused

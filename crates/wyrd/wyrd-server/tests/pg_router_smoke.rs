@@ -488,3 +488,35 @@ async fn valid_token_is_not_rejected_by_default_deny_layer() {
 
     server.shutdown().await.expect("server shuts down");
 }
+
+/// A composed, API-serving target refuses the production profile while it still
+/// carries the stub policy hook.
+///
+/// `AppState::production_validate` short-circuits for a target that serves no
+/// public API, so the guard can only be observed against a state composed
+/// through `wyrd_server::boot::compose_bifrost` — which is exactly what the
+/// harness builds.
+#[tokio::test]
+async fn production_profile_refuses_a_serving_target_with_stub_defaults() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let state = server
+        .state()
+        .clone()
+        .with_deployment_profile(wyrd_server::config::DeploymentProfile::Production);
+
+    let refusal = state
+        .production_validate()
+        .expect_err("a serving production target must refuse its stub defaults");
+
+    assert!(
+        matches!(
+            refusal,
+            wyrd_server::state::ProductionValidationError::StubPolicyHook
+        ),
+        "the stub policy hook is the first production guard to refuse; got {refusal:?}"
+    );
+
+    server.shutdown().await.expect("server shuts down");
+}

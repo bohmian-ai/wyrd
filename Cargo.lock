@@ -11080,6 +11080,7 @@ dependencies = [
  "moka",
  "opendal",
  "rand 0.9.5",
+ "rcgen",
  "reqwest 0.13.4",
  "rustix",
  "secrecy",

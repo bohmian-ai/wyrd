@@ -60,8 +60,7 @@ with reading a shared fixture file.
 whole.** It is *not* registered by `#[ignore]`.
 
 `#[ignore]` and `mod pg_tests` do something different: they exclude a test from
-the **fast** lane (`test:wyrd` and `test:e2e`, which run
-`cargo test -p wyrd-testing … --skip pg_tests`). The `otlp` binary shows the two
+the family **fast** lane, which skips `pg_tests`. The `otlp` binary shows the two
 axes are independent — none of its tests are `#[ignore]`d, all are inside
 `mod pg_tests`, and the whole binary runs in the journey lane.
 
@@ -90,6 +89,7 @@ Keep a module under roughly 40 KB. Splitting costs one file and one `mod` line.
 
 | Lane | Runs |
 |---|---|
+| `mise run test:bifrost` | every Bifrost unit, integration, cluster, and Rust/Python/TypeScript journey lane |
 | `mise run test:bifrost:journey` | every capability below, in sequence, under one database lifecycle |
 | `mise run test:bifrost:journey:sdk` | `vala-sdk` `pg_bifrost_e2e`, whole |
 | `mise run test:bifrost:journey:forge` | `forge`, whole |
@@ -99,8 +99,10 @@ Keep a module under roughly 40 KB. Splitting costs one file and one `mod` line.
 | `mise run test:bifrost:journey:server` | `server`, whole |
 | `mise run test:bifrost:journey:interleavings` | `interleavings`, whole (no database) |
 | `mise run test:bifrost:journey:mcp` | `wyrd-mcp` `mcp`, whole |
+| `mise run test:bifrost:journey:python` | Python Bifrost client and query journeys |
+| `mise run test:bifrost:journey:typescript` | TypeScript Oracle query journey |
 | `mise run test:bifrost:cluster` | `cluster`, whole |
-| `mise run test:wyrd` / `test:e2e` | everything not `#[ignore]`d and not in `mod pg_tests` |
+| `mise run test:wyrd` | everything not `#[ignore]`d and not in `mod pg_tests` |
 
 Every lane selects a Cargo **target**, never a test name. Cargo resolves a
 target against the manifest and fails loudly when it is missing; a positional

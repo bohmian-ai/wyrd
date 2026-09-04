@@ -59,16 +59,18 @@ Keep a module under roughly 40 KB. Splitting costs one file and one `mod` line.
 
 ## Which lane do I run?
 
-Run the narrowest lane covering what you changed. `mise run gate` is the CI
-aggregate — let CI run it.
+Run the narrowest complete capability lane covering what you changed. `mise run
+gate` is the nightly, release, and conservative fallback aggregate.
 
 ### Bifrost
 
 ```bash
-mise run test:bifrost                    # tier 2: the whole redux crate
+mise run verify:bifrost                  # complete Bifrost checks + all test tiers
+mise run test:bifrost                    # all Bifrost tests and language surfaces
+mise run test:bifrost:integration:redux  # tier 2: the whole redux crate
 mise run test:bifrost:journey            # tier 1: every capability, one DB lifecycle
 mise run test:bifrost:journey:oracle     # tier 1: one capability
-#                     :sdk :forge :scribe :otlp :server :interleavings :mcp
+#                     :sdk :forge :scribe :otlp :server :interleavings :mcp :python :typescript
 mise run test:bifrost:cluster            # multi-pod topology matrix
 ```
 
@@ -81,12 +83,11 @@ mise run test:tonic                      # wyrd-tonic at its required feature un
 mise run test:storage:matrix             # object-store emulators
 mise run py:test:unit                    # Python
 mise run ts:test:unit                    # TypeScript
-mise run test:unit                       # aggregate of the Rust lanes above
+mise run test:rust                       # full Rust aggregate
 ```
 
-`test:unit` is an aggregate, not a tier — it depends on the family lanes plus
-storage, SQL, tonic, and e2e. Bifrost is deliberately outside it and runs as its
-own CI job, because its DataFusion cone would contend for artifact locks.
+`test:rust` is the broad Rust aggregate. Capability work uses its capability
+lane instead; Bifrost-only pull requests run `verify:bifrost`.
 
 ### Checks and codegen
 
@@ -100,11 +101,11 @@ mise run check:client-tier | check:pyo3-scope | check:unwrap-audit
 
 Two independent axes decide where a test runs. They are often confused.
 
-- **Which binary** it is in decides **which lane** runs it. This is the only
-  thing that registers a test.
+- **Which binary or capability-owned module** it is in decides **which lane**
+  runs it. This is the only thing that registers a test.
 - **`#[ignore]` / `mod pg_tests`** decides whether the **fast** lane skips it.
-  The fast lane (`test:wyrd`, `test:e2e`) runs `--skip pg_tests` and omits
-  ignored tests so it stays credential- and database-free.
+  Family fast lanes run `--skip pg_tests` and omit ignored tests so they stay
+  credential- and database-free. Targeted integration lanes run those tests.
 
 The `otlp` binary shows the axes are independent: no test in it is `#[ignore]`d,
 all are inside `mod pg_tests`, and the whole binary still runs in the journey

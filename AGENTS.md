@@ -375,10 +375,10 @@ behavior has no cross-boundary state (record the reason).
 
 ### Verification Scope
 
-Run verification for the code you changed. `mise run gate` is the CI aggregate;
-CI runs it on every push. It is intentionally broad and slow, and it is not the
-local bar — do not make it the default requirement for a plan, PR, or
-implementation slice.
+Run verification for the code you changed. Capability-scoped `verify:<scope>`
+tasks are the default local and pull-request gates when one exists. `mise run
+gate` is the broad repository aggregate reserved for nightly, release, mixed,
+global, and unclassified changes.
 
 ```bash
 # Always run the relevant format and lint checks.
@@ -410,7 +410,9 @@ not use a positional filter that can pass after selecting no test.
 
 - Rust crate change: prefer the nearest crate-specific `mise run ...` task
   (`test:wyrd`, `test:skald`, `test:vala`, `test:shared`, `test:sql`,
-  `test:bifrost`, `test:storage:matrix`, etc.). Whole-crate tests should use `mise` when a task exists because some
+  `test:bifrost`, `test:storage:matrix`, etc.). `test:bifrost` covers every
+  Bifrost tier and first-class language surface; its `:journey:<capability>`
+  leaves remain the iteration lanes. Whole-crate tests should use `mise` when a task exists because some
   crates need external dependencies, migrations, generated artifacts, or
   environment variables that the mise task sets up. Specifically named Rust
   tests use the exact `mise exec -- cargo nextest run` form above; include the
@@ -428,9 +430,10 @@ not use a positional filter that can pass after selecting no test.
   when the change affects shared example behavior.
 
 Run `mise run gate` locally only when the change is intentionally broad, crosses
-several ownership boundaries, changes shared CI/build/test infrastructure,
-prepares a release, or when the user explicitly asks for it. Otherwise let CI
-run it.
+several ownership boundaries without a complete capability gate, changes shared
+CI/build/test infrastructure, prepares a release, or when the user explicitly
+asks for it. Unknown CI paths fail over to this broad gate rather than silently
+skipping proof.
 
 Real cloud storage integration tests (`test:storage:*:cloud`) run against live
 infrastructure separately.
@@ -447,7 +450,7 @@ While working on a specific area:
 mise exec -- cargo nextest run --locked -p <crate> --lib \
   -E 'test(=module::tests::test_name)'
 mise run test:sql      # runs all SQL-backed integration tests across wyrd-sql, wyrd-dev-fixtures, and vala-sql
-mise run test:unit     # all Rust tests including SQL and storage emulators
+mise run test:rust     # broad Rust aggregate including SQL and storage emulators
 
 # Python only
 mise run py:test:unit  # all Python tests

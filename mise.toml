@@ -4,12 +4,10 @@
 # check that runs as a `gate` dependency (still runnable by name, just hidden).
 #
 #   mise run check       Fast pre-commit loop: fmt --check + clippy + cargo check.
-#   mise run gate        The CI aggregate. Slow and broad; CI runs it. Locally,
-#                        answer to "make sure everything passes" (Rust + Python +
-#                        codegen + docs + every boundary invariant).
+#   mise run gate        Full nightly/release/fallback aggregate.
 #
-#   mise run test:unit   All Rust tests except Bifrost, Forge SQL scale, and real-cloud storage.
-#   mise run test:bifrost   DataFusion/Postgres Rust tests (separate CI job).
+#   mise run test:rust   Broad Rust aggregate.
+#   mise run verify:bifrost   Complete scoped Bifrost gate.
 #   mise run test:wyrd/skald/vala/shared   Family lanes (skip pg_tests, no docker needed).
 #   mise run py:test:unit   Python suite (builds the extension, then pytest).
 #
@@ -95,15 +93,64 @@ description = "Run shared family tests (unit tests only — pg_tests skipped wit
 run = "bash scripts/run-family-tests.sh shared"
 
 [tasks."test:bifrost"]
-description = """Tier-2 lane: every vala-bifrost-redux test — lib, the `integration`
-binary, and doc tests — at the canonical test feature union against an isolated
-Postgres lifecycle. `integration` is the crate's only test target and every
-source under its `tests/` directory is a module of it, so this one command is
-complete; no narrower selector covers the `test-support` lib surface.
-`--include-ignored` is required: redux marks a journey-flavored test `#[ignore]`
-to keep it out of the family lanes, and this is the lane that must still run it.
-Tier-1 user journeys live in wyrd-testing and run under test:bifrost:journey."""
-run = "scripts/postgres/with-test-postgres.sh -- cargo nextest run --locked -p vala-bifrost-redux --features \"$WYRD_REDUX_TEST_FEATURES\" -P journey --run-ignored=all"
+description = "Run every Bifrost unit, integration, cluster, and Rust/Python/TypeScript journey test under one Postgres lifecycle."
+run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run test:bifrost:inner'"
+
+[tasks."test:bifrost:inner"]
+hide = true
+description = "Run the complete Bifrost test scope against an already-provisioned Postgres lifecycle."
+run = "bash scripts/run-bifrost-tests.sh"
+
+[tasks."test:bifrost:unit:rust:inner"]
+hide = true
+description = "Run Bifrost-facing unit tests in shared server, harness, SDK, and MCP owners."
+run = """
+cargo nextest run --locked -p wyrd-testing --lib -E 'test(/^bifrost::/) | test(/^interleaving::/) | test(/^load::/) | test(/^server::production_composition_tests::/)'
+cargo nextest run --locked -p wyrd-server --lib --features test-support -E 'test(/^bifrost::/) | test(/^oracle::/) | test(/^query::/) | test(/^grpc::(query|scribe_tail)::/) | test(/bifrost|oracle|scribe|forge/)'
+cargo nextest run --locked -p vala-sdk --lib -E 'test(/^query::/) | test(/^sdk::bifrost/)'
+cargo nextest run --locked -p wyrd-mcp --lib -E 'test(/^bifrost::/)'
+"""
+
+[tasks."test:bifrost:unit:python:inner"]
+hide = true
+description = "Run Python Bifrost unit tests."
+dir = "python/py-wyrd"
+depends = ["py:setup"]
+run = "uv run pytest -q tests/test_bifrost.py tests/bifrost"
+
+[tasks."test:bifrost:unit:typescript:inner"]
+hide = true
+description = "Run TypeScript Bifrost unit tests."
+dir = "typescript/wyrd"
+depends = ["ts:build"]
+run = "pnpm exec vitest run tests/unit/bifrost-query.test.ts"
+
+[tasks."test:bifrost:integration:redux:inner"]
+hide = true
+description = "Run the complete vala-bifrost-redux tier-2 suite at its canonical feature union."
+run = "cargo nextest run --locked -p vala-bifrost-redux --features \"$WYRD_REDUX_TEST_FEATURES\" -P journey --run-ignored=all"
+
+[tasks."test:bifrost:integration:redux"]
+description = "Run the complete vala-bifrost-redux tier-2 suite."
+run = "scripts/postgres/with-test-postgres.sh -- mise run test:bifrost:integration:redux:inner"
+
+[tasks."test:bifrost:integration:sql:inner"]
+hide = true
+description = "Run Vala's Bifrost control-plane SQL tests, excluding the separately bounded Forge scale case."
+run = "cargo nextest run --locked -p vala-sql --test-threads=1 -E 'not test(open_set_scan_remains_bounded_after_terminal_growth)'"
+
+[tasks."test:bifrost:integration:sql"]
+description = "Run Vala's Bifrost control-plane SQL tests."
+run = "scripts/postgres/with-test-postgres.sh -- mise run test:bifrost:integration:sql:inner"
+
+[tasks."test:bifrost:integration:server:inner"]
+hide = true
+description = "Run explicit wyrd-server integration targets that exercise Bifrost serving seams."
+run = "cargo nextest run --locked -p wyrd-server --features test-support --test pg_eval_v1_protocol --test pg_grpc_ingest_smoke --test pg_grpc_smoke --test pg_merge_http_protected --test pg_router_smoke --test-threads=1"
+
+[tasks."test:bifrost:integration:server"]
+description = "Run wyrd-server integration targets that exercise Bifrost serving seams."
+run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run test:bifrost:integration:server:inner'"
 
 [tasks."test:bifrost:journey"]
 description = """Run the current Bifrost/Scribe Rust user-journey tests (marked #[ignore]
@@ -223,6 +270,28 @@ hide = true
 description = "wyrd-mcp `mcp` binary, whole"
 run = "cargo nextest run --locked -p wyrd-mcp --test mcp -P journey --run-ignored=all"
 
+[tasks."test:bifrost:journey:python"]
+description = "Tier-1 journeys: Python Bifrost client and query surfaces"
+run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run test:bifrost:journey:python:inner'"
+
+[tasks."test:bifrost:journey:python:inner"]
+hide = true
+description = "Run Python Bifrost journeys against an already-provisioned Postgres lifecycle."
+dir = "python/py-wyrd"
+depends = ["py:setup:testing"]
+run = "uv run pytest -q -m integration tests/integration/test_bifrost_e2e.py tests/integration/test_bifrost_query.py"
+
+[tasks."test:bifrost:journey:typescript"]
+description = "Tier-1 journey: TypeScript Bifrost query surface"
+run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run test:bifrost:journey:typescript:inner'"
+
+[tasks."test:bifrost:journey:typescript:inner"]
+hide = true
+description = "Run the TypeScript Bifrost journey against an already-provisioned Postgres lifecycle."
+dir = "typescript/wyrd"
+depends = ["ts:build", "ts:build:testing"]
+run = "pnpm exec vitest run tests/integration/oracle-query.test.ts"
+
 [tasks."test:bifrost:cluster"]
 description = "Run the deterministic public-Gate Bifrost cluster matrix"
 run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run test:bifrost:cluster:inner'"
@@ -236,14 +305,29 @@ run = "cargo nextest run --locked -p wyrd-testing --test cluster -P journey --ru
 
 [tasks."check:bifrost-oracle-deploy"]
 description = "Validate Bifrost Oracle Kubernetes role selectors and rollback"
-run = "cargo nextest run --locked -p wyrd-testing bifrost_deployment_contract"
+run = "cargo nextest run --locked -p wyrd-testing --lib -E 'test(/^bifrost::deployment_contract::bifrost_deployment_contract_/)'"
 
 [tasks."check:bifrost-resource-governance"]
 description = "Reject obsolete Bifrost resource ownership and verify checker fixtures"
 run = "BIFROST_RESOURCE_GOVERNANCE_SELF_TEST=1 bash scripts/checks/bifrost-resource-governance.sh && bash scripts/checks/bifrost-resource-governance.sh"
 
-[tasks."test:unit"]
-description = """Aggregate Rust test gate: family lanes (wyrd, skald, vala, shared) + storage emulator matrix + sql + server e2e.
+[tasks."check:bifrost"]
+description = "Run formatting, scoped Clippy, and static Bifrost boundary checks."
+run = """
+cargo fmt --all -- --check
+cargo clippy --locked -p vala-bifrost-redux -p vala-sdk -p vala-sql -p wyrd-mcp -p wyrd-server -p wyrd-testing --all-targets --features wyrd-server/test-support -- -D warnings
+mise run check:bifrost-oracle-deploy
+mise run check:bifrost-resource-governance
+mise run check:object-store-pin
+mise run check:tenant-isolation
+"""
+
+[tasks."verify:bifrost"]
+description = "Complete Bifrost change gate: scoped checks plus every Bifrost test tier and language surface."
+depends = ["check:bifrost", "test:bifrost"]
+
+[tasks."test:rust"]
+description = """Aggregate Rust test gate: family lanes (wyrd, skald, vala, shared) + storage emulator matrix + sql + targeted server integration.
 Bifrost (DataFusion-heavy) runs as a separate CI job via test:bifrost to avoid artifact-lock
 contention; add test:bifrost to gate or run it directly to include it locally.
 Only real-credential cloud storage tests (test:storage:{s3,gcs,azure}:cloud) are gated to
@@ -261,18 +345,16 @@ run = "cargo nextest run --locked -p wyrd-tonic --features server,client"
 
 [tasks."test:e2e"]
 hide = true
-description = "Run server-level e2e tests requiring Postgres: wyrd-auth, wyrd-server, wyrd-testing, wyrd-client, and vala-sdk e2e fixtures"
+description = "Run targeted non-Bifrost server integration fixtures requiring Postgres."
 
 run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run test:e2e:inner'"
 [tasks."test:e2e:inner"]
 hide = true
-description = "Run server-level e2e tests requiring Postgres: wyrd-auth, wyrd-server, wyrd-testing, wyrd-client, and vala-sdk e2e fixtures"
+description = "Run targeted non-Bifrost server integration fixtures requiring Postgres."
 run = """
-cargo nextest run --locked -p wyrd-auth --test-threads=1
-cargo nextest run --locked -p wyrd-server --test-threads=1
-cargo nextest run --locked -p wyrd-testing --test-threads=1
+cargo nextest run --locked -p wyrd-auth --test-threads=1 -E 'test(pg_tests)'
+cargo nextest run --locked -p wyrd-server --test auth_e2e --test authz_check_e2e --test pg_authz_check_route --test pg_bootstrap_key --test-threads=1
 cargo nextest run --locked -p wyrd-client --test pg_auth_e2e_against_fixture --test pg_discovery_against_fixture --test-threads=1
-cargo nextest run --locked -p vala-sdk --test pg_bifrost_e2e -P journey --run-ignored=all
 """
 
 [tasks."identity:e2e"]
@@ -1113,11 +1195,11 @@ description = "Fail if wyrd-dev-fixtures imports wyrd-server or ServerPostgres::
 run = "bash scripts/checks/fixtures-no-server.sh"
 
 [tasks."gate"]
-description = "CI aggregate. Broad and slow — CI runs this. The local bar is `mise run check` plus the narrow tasks for what you touched (AGENTS.md §11)."
+description = "Full repository aggregate for nightly, release, mixed, global, and unclassified changes."
 depends = [
   "check",
   "check:skills-sync",
-  "test:unit",
+  "test:rust",
   "test:bifrost",
   "codegen:check",
   "cardkind:check",
@@ -1157,6 +1239,7 @@ depends = [
   "check:fixtures-no-server",
   "check:no-testing-in-prod-deps",
   "check:bifrost-oracle-deploy",
+  "check:bifrost-resource-governance",
   "check:test-coverage"]
 
 [tasks."db:migrate"]

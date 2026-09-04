@@ -21,15 +21,17 @@ if "docker ps" in (root / "mise.toml").read_text() or "docker rm" in (root / "mi
     raise SystemExit("global Docker enumeration/deletion remains")
 empty = {
     "db:migrate", "db:migrate:all", "test:sql", "test:sql:forge-scale",
-    "test:bifrost", "test:wyrd",
+    "test:bifrost:integration:redux", "test:bifrost:integration:sql", "test:wyrd",
 }
-migrated = {"test:vala"}
+migrated = {"test:bifrost", "test:vala"}
 pre = {
+    "test:bifrost:integration:server",
     "test:bifrost:journey",
+    "test:bifrost:journey:python", "test:bifrost:journey:typescript",
     "test:e2e", "py:test:integration", "ts:test:integration", "identity:e2e",
     "test:storage:e2e", "test:storage:s3:cloud", "test:storage:gcs:cloud", "test:storage:azure:cloud",
 }
-aggregates = {"test:unit", "gate", "test:storage:matrix", "test:storage:cloud:matrix"}
+aggregates = {"test:rust", "gate", "test:storage:matrix", "test:storage:cloud:matrix"}
 for name in empty | migrated | pre:
     task = tasks.get(name)
     if task is None or "with-test-postgres.sh" not in str(task.get("run", "")):
@@ -82,8 +84,24 @@ def check_vala_migrated_lane(task_map):
         raise SystemExit("test:vala:inner must preserve the canonical family test command")
 
 
+def check_bifrost_migrated_lane(task_map):
+    """Require one migrated lifecycle around the complete Bifrost runner."""
+    outer = task_map["test:bifrost"].get("run")
+    expected_outer = (
+        "scripts/postgres/with-test-postgres.sh -- bash -lc "
+        "'mise run db:migrate:all:inner && mise run test:bifrost:inner'"
+    )
+    if outer != expected_outer:
+        raise SystemExit("test:bifrost must run the exact complete migrated lane")
+
+    inner = task_map["test:bifrost:inner"].get("run")
+    if inner != "bash scripts/run-bifrost-tests.sh":
+        raise SystemExit("test:bifrost:inner must preserve the complete Bifrost runner")
+
+
 check_inner_lifecycle_dependencies(tasks)
 check_vala_migrated_lane(tasks)
+check_bifrost_migrated_lane(tasks)
 
 if len(sys.argv) == 2 and sys.argv[1] == "--negative-test":
     fixture = {name: dict(task) for name, task in tasks.items()}

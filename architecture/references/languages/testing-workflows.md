@@ -2,8 +2,9 @@
 
 Use this reference with
 `architecture/references/languages/implementation-execution.md`. Run the
-narrowest complete verification set for the changed surface. `mise run gate`
-is the broad CI aggregate; it is not the default local bar.
+narrowest complete verification set for the changed surface. Capability-scoped
+`verify:<scope>` tasks are the local and pull-request default; `mise run gate`
+is the nightly, release, and conservative fallback aggregate.
 
 ## Three Tiers (Priority Order)
 
@@ -68,11 +69,12 @@ mise run test:skald           # skald/* family (no DB)
 mise run test:vala            # vala/* family (no DB)
 mise run test:shared          # shared/* family (no DB)
 mise run test:sql             # live Postgres SQL integration tests
-mise run test:bifrost         # vala-bifrost integration tests
+mise run verify:bifrost       # complete Bifrost checks and all test tiers
+mise run test:bifrost         # all Bifrost tests and language surfaces
 mise run test:bifrost:journey # Rust bifrost user-journey tests/multi-pod distributed tests
                               # (capability binaries + registration rule:
                               #  crates/wyrd/wyrd-testing/tests/README.md)
-mise run test:e2e             # server-level e2e (wyrd-auth, wyrd-server, wyrd-testing, wyrd-client, vala-sdk)
+mise run test:e2e             # targeted non-Bifrost server integration fixtures
 mise run test:storage:matrix  # storage emulator matrix (S3/GCS/Azure)
 
 # Narrow named lib test:
@@ -157,10 +159,10 @@ a specific change will trip:
 
 `mise run gate` runs the broad repository battery: workspace checks, unit and
 Bifrost tests, code generation, boundary invariants, Python and TypeScript
-checks, examples, and documentation checks. Run it locally for intentionally
-broad cross-boundary changes, shared CI/build/test infrastructure, release
-qualification, or an explicit request. Otherwise run focused proof and let CI
-own the aggregate.
+checks, examples, and documentation checks. Nightly, release, mixed, global,
+and unclassified changes own that cost. Capability-scoped changes run their
+complete `verify:<scope>` task; unknown paths conservatively fall back to
+`gate`.
 
 Run all Cargo-backed commands sequentially across agents sharing a checkout or
 target directory. Parallel source work must not create overlapping Cargo

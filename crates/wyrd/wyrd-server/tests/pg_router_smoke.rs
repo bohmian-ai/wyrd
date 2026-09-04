@@ -1065,6 +1065,9 @@ async fn published_snapshot(server: &WyrdTestServer) -> Arc<ReadinessSnapshot> {
 async fn forge_role_readiness_is_target_conditional_and_removed_before_loss() {
     forge_checks_follow_target_selection().await;
     forge_worker_readiness_gates_on_recovery().await;
+    worker_scratch_failure_quarantines_without_readiness().await;
+    worker_registration_failure_never_publishes_ready().await;
+    worker_recovery_failure_never_publishes_ready().await;
     forge_coordinator_readiness_follows_a_completed_pass().await;
 }
 
@@ -1359,4 +1362,159 @@ async fn coordinator_partial_pass_is_not_ready() {
         .expect("scheduler joins")
         .expect("pass loop ok");
     server.shutdown().await.expect("test server shuts down");
+}
+
+/// Composes one server whose Forge worker observes an injectable production
+/// observer, so a startup or recovery boundary can be failed exactly once.
+///
+/// # Panics
+///
+/// Panics when the server cannot start.
+#[cfg(feature = "test-support")]
+async fn server_with_forge_observer()
+-> (WyrdTestServer, vala_bifrost_redux::forge::ForgeWorkerCompletionObserver) {
+    let observer = vala_bifrost_redux::forge::ForgeWorkerCompletionObserver::new();
+    let server = WyrdTestServer::builder()
+        .with_forge_completion_observer_for_test(observer.clone())
+        .start_in_process()
+        .await
+        .expect("test server starts");
+    (server, observer)
+}
+
+/// Runs one production Forge worker to completion and reports its result.
+///
+/// # Panics
+///
+/// Panics when the worker cannot be composed or its task panics.
+#[cfg(feature = "test-support")]
+async fn run_forge_worker_once(
+    server: &WyrdTestServer,
+) -> Result<(), vala_bifrost_redux::forge::ForgeError> {
+    let stop = tokio_util::sync::CancellationToken::new();
+    let worker = wyrd_server::boot::spawn_forge_worker(server.state(), stop.clone(), 1, 1)
+        .expect("the worker composes");
+    let handle = tokio::spawn(worker);
+    let outcome = handle.await.expect("worker joins");
+    stop.cancel();
+    outcome
+}
+
+/// A worker whose scratch volume is not a writable directory quarantines
+/// itself, never publishes ready, and recovers once the volume is restored.
+///
+/// The scratch probe is the first thing a worker does, before it registers or
+/// drains anything, so a pod whose spill volume failed to mount must not be
+/// routed work. Quarantine is durable, so an operator can see which pod refused
+/// itself rather than inferring it from an unready replica.
+///
+/// # Panics
+///
+/// Panics when the quarantined worker publishes ready or the restored worker
+/// does not.
+#[cfg(feature = "test-support")]
+async fn worker_scratch_failure_quarantines_without_readiness() {
+    let (server, _observer) = server_with_forge_observer().await;
+    let scratch = server
+        .scribe_wal_root_for_test()
+        .expect("the in-process server owns a WAL root")
+        .join("forge-spill");
+    std::fs::remove_dir_all(&scratch).expect("the composed scratch root is removable");
+    std::fs::write(&scratch, b"not a directory").expect("a regular file replaces the scratch root");
+
+    let readiness = server
+        .state()
+        .forge()
+        .expect("the default target selects Forge")
+        .worker_readiness();
+    run_forge_worker_once(&server)
+        .await
+        .expect("a quarantined worker returns rather than crashing the pod");
+    assert!(
+        !readiness.is_ready(),
+        "a worker quarantined by its scratch probe advertised ready"
+    );
+
+    std::fs::remove_file(&scratch).expect("the placeholder file is removable");
+    std::fs::create_dir_all(&scratch).expect("the scratch root is restorable");
+    await_forge_role_while_running(&server, "worker after its scratch volume is restored").await;
+    server.shutdown().await.expect("test server shuts down");
+}
+
+/// A worker whose durable registration fails returns that error and never
+/// publishes ready; the one-shot is consumed, so a respawn recovers.
+///
+/// # Panics
+///
+/// Panics when the failed worker publishes ready or the respawned one does not.
+#[cfg(feature = "test-support")]
+async fn worker_registration_failure_never_publishes_ready() {
+    let (server, observer) = server_with_forge_observer().await;
+    let readiness = server
+        .state()
+        .forge()
+        .expect("the default target selects Forge")
+        .worker_readiness();
+    observer.fail_next_registration();
+    let error = run_forge_worker_once(&server)
+        .await
+        .expect_err("the injected registration failure is returned");
+    assert!(
+        format!("{error}").contains("injected Forge worker registration failure"),
+        "the worker returned an unrelated error: {error}"
+    );
+    assert!(
+        !readiness.is_ready(),
+        "a worker that never registered advertised ready"
+    );
+    await_forge_role_while_running(&server, "worker after registration recovers").await;
+    server.shutdown().await.expect("test server shuts down");
+}
+
+/// A worker whose recovery predicate fails returns that error before the
+/// deterministic next-claim barrier and never publishes ready.
+///
+/// # Panics
+///
+/// Panics when the failed worker publishes ready or the respawned one does not.
+#[cfg(feature = "test-support")]
+async fn worker_recovery_failure_never_publishes_ready() {
+    let (server, observer) = server_with_forge_observer().await;
+    let readiness = server
+        .state()
+        .forge()
+        .expect("the default target selects Forge")
+        .worker_readiness();
+    observer.fail_next_recovery_predicate();
+    run_forge_worker_once(&server)
+        .await
+        .expect_err("the injected recovery failure is returned");
+    assert!(
+        !readiness.is_ready(),
+        "a worker that has not drained recoverable work advertised ready"
+    );
+    await_forge_role_while_running(&server, "worker after recovery drains").await;
+    server.shutdown().await.expect("test server shuts down");
+}
+
+/// Spawns one production worker and waits for it to publish ready, then stops it.
+///
+/// # Panics
+///
+/// Panics when readiness is never published or the worker loop returns an error.
+#[cfg(feature = "test-support")]
+async fn await_forge_role_while_running(server: &WyrdTestServer, label: &str) {
+    let stop = tokio_util::sync::CancellationToken::new();
+    let worker = wyrd_server::boot::spawn_forge_worker(server.state(), stop.clone(), 1, 1)
+        .expect("the worker composes");
+    let handle = tokio::spawn(worker);
+    await_forge_role(
+        server,
+        true,
+        wyrd_server::state::Forge::worker_readiness,
+        label,
+    )
+    .await;
+    stop.cancel();
+    handle.await.expect("worker joins").expect("worker loop ok");
 }

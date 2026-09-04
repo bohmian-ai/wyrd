@@ -1471,7 +1471,12 @@ impl OracleTableProvider {
         Ok(vec![Arc::new(
             super::codec::RemoteSourcePlaceholderExec::new(
                 remote.scan_id.clone(),
-                super::assignment_schema_fingerprint(&required_schema),
+                // The fingerprint is of the table's complete physical schema,
+                // not of this scan's closure: the follower resolves the same
+                // catalog provider and compares against `provider.schema()`
+                // before it reads anything. The closure travels separately, as
+                // `required_columns`.
+                super::assignment_schema_fingerprint(&self.physical_schema),
                 required_schema,
             )
             .with_closure(

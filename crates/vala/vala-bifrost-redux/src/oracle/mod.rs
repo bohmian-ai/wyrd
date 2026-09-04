@@ -4173,7 +4173,10 @@ fn follower_scan_assignment(
         binding: tail_fence::TailFenceDrainer::wire_binding(cut)?,
         persisted: wyrd_spec::vala::api::PersistedFileAssignment { files },
         scribe_provider_cut: None,
-        schema_fingerprint: assignment_schema_fingerprint(&placeholder.schema()),
+        // The planned placeholder already carries the full-schema fingerprint
+        // the follower validates against; recomputing it here from the
+        // placeholder's own projected schema would name the closure instead.
+        schema_fingerprint: placeholder.schema_fingerprint().to_owned(),
         required_columns: placeholder.required_columns().to_vec(),
         predicates: placeholder.predicates().to_vec(),
     })

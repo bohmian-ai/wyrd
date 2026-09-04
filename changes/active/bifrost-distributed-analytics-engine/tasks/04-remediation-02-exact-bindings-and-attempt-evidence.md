@@ -364,3 +364,143 @@ The implementation closeout must provide:
   dependency, fallback, retry, or second remediation task was added; and
 - confirmation that `05-pre-mcp-buildout.md` depends on this remediation task,
   so MCP work cannot begin while these Task 04 findings remain open.
+
+## Implementation evidence
+
+Commit sequence (all four finding IDs, in scenario order):
+
+- `1a4dd587d` fix(bifrost): bind each remote scan occurrence exactly (FIND-04R-1)
+- `ea47f2367` test(bifrost): prove a same-table self-join binds each occurrence (FIND-04R-1)
+- `51194baf8` fix(bifrost): require new settlement before reading analytical evidence (FIND-04R-2)
+- `e107ae87c` test(bifrost): prove each failure phase enters one build against one cut (FIND-04R-3)
+- `9981f30de` test(bifrost): prove selected peer loss retains its one built cut (FIND-04R-4)
+
+### Scenario 1 — exact per-occurrence bindings
+
+RED: the extended `retained_plan_uses_admitted_task_context_only` failed because
+both occurrences of one table/tier minted the same scan ID, so the second
+assignment replaced the first in `follower_assignments`.
+
+GREEN: `OracleTableProvider` allocates one request-local occurrence per `scan`
+with a checked `AtomicU64` increment (exhaustion is a planning failure);
+`persisted_follower_scan_id(table, tier, occurrence)` mints the ID;
+`OracleSourceKey::Follower(Box<FollowerSourceKey>)` carries scan ID,
+destination, tenant, canonical table, tier, schema fingerprint, required
+columns, and predicates; `RemoteSourcePlaceholderExec` retains a
+`PlannedRemoteSource` and derives its key at call time, so `DistributedLeafExec`
+task variants derive the identical key; `bind_execution_sources` selects the
+pinned cut by the placeholder's exact tenant/table and inserts through
+`HashMap::entry` (an occupied slot with a differing assignment is
+`QueryExecutionFailed`); `try_new` requires exact planned/bound follower
+cardinality and validates each assignment against its full key.
+`OracleSourceKey` implements `Hash` manually (discriminant plus table/scan ID)
+because `DispatchCandidate` and `ScanPredicate` are not `Hash`; equal keys hash
+equally, and the scan ID already separates every distinct key in one plan.
+
+Refusal sweep, one mutated fact at a time, each asserted to fail before the
+fixture's row-IO counter moves and with `pool.reserved() == 0`: duplicate
+canonical occurrence, swapped assignment, destination node/role/fence/endpoint,
+tenant, table, tier, schema fingerprint, required columns, predicates.
+
+```
+PASS vala-bifrost-redux oracle::exec::tests::retained_plan_uses_admitted_task_context_only
+PASS wyrd-testing::oracle analytical_activation::single_planner_root_selects_path_and_capacity
+```
+
+Journey self-join: `SELECT l.id, r.wyrd_row_ordinal FROM <t> l JOIN <t> r ON
+l.filter_key = r.filter_key WHERE l.filter_key = 'group_0' AND r.id > 5`
+settles `QueryExecutionPath::Analytical` with exactly 8 rows, both followers'
+peer body polls increase, and every Oracle pod returns to its ownership
+baseline.
+
+Command correction: the process fixture writes only `id` and `filter_key`, so
+the self-join projects the managed `wyrd_row_ordinal` rather than the
+in-process fixture's `unused_payload`.
+
+### Scenario 2 — a baseline reports only its own settled evidence
+
+RED: `analytical_baseline_rejects_predecessor_evidence_without_new_settlement`
+did not compile against `super::settled_analytical_evidence`, because the
+timeout path read retained evidence without distinguishing the two states.
+
+GREEN: one private synchronous helper `settled_analytical_evidence(before,
+after, evidence)` returns `ProcessClusterError::Child` naming the analytical
+baseline settlement wait when the counter did not advance;
+`execute_analytical_baseline` reads `settled_physical_evidence()` only through
+it. No clock abstraction, fault injector, retry, or timeout setting was added.
+
+```
+PASS wyrd-testing bifrost::process_cluster::child::tests::analytical_baseline_rejects_predecessor_evidence_without_new_settlement
+```
+
+### Scenario 3 — failure phases prove one immutable build
+
+RED: the journey accepted any `Err` and the private protocol exposed neither a
+build count nor cut identity.
+
+GREEN: `canonical_fingerprint` was extracted from
+`OracleQueryAttemptCut::fingerprint` and is now shared with the new
+`OracleQueryAttemptRoster::fingerprint`, so the pre-build roster and finalized
+cut agree. `build_physical_root` takes the roster and, before anything in the
+build can fail, calls the `test-support` `record_physical_build`, which
+increments one process-local `AtomicU64` and stores the latest digest;
+`physical_build_observation_for_test()` reads the pair. Both entry points
+(production classification and the inactive attempt lease) pass through that
+one call. `ControlRequest::PhysicalBuildEvidence` /
+`ControlResponse::PhysicalBuilds(PhysicalBuildEvidence)` expose `{ total,
+latest_cut_fingerprint, active_cut_fingerprints }` through the existing private
+JSON protocol; the parent helper is `ProcessNode::physical_build_evidence`.
+
+The journey's `expect_single_build_failure` helper drives both failure phases
+and requires: no settlement, `ValaSdkError::code() ==
+"WYRD_VALA_500_QUERY_EXECUTION_FAILED"`, `is_transport(&error) == false`, a
+build-total delta of exactly one, and a nonempty cut fingerprint. The two
+phases' fingerprints are then required to differ, so neither can be a stale
+predecessor observation. The existing production telemetry and zero-ownership
+comparisons are retained unchanged.
+
+### Scenario 4 — selected peer loss retains the original cut
+
+RED: the process protocol could not project the active registry's cut
+fingerprint.
+
+GREEN: the same control response carries
+`RunningQueryRegistry::list(tenant)` → `get` → `participant_cut().fingerprint()`
+in the registry's own request-ID order; no second cut copy and no new registry
+traversal API. After `await_execute_paused` and before `kill`, the journey
+requires exactly one active fingerprint and requires it to equal the builder's
+latest cut. After the terminal failure it requires the build-total delta to be
+exactly one, and retains the existing structured non-transport error, attempt
+totals (one started, zero succeeded), single survivor activation, zero live
+leases, and idle-ownership assertions.
+
+```
+PASS wyrd-testing::oracle analytical_activation::selected_peer_failure_is_terminal
+```
+
+### Focused verification
+
+- `mise run check:bifrost` — `cargo fmt --all -- --check`, the scoped Clippy
+  lane, `check:bifrost-oracle-deploy`, `check:bifrost-resource-governance`, and
+  `check:object-store-pin` all pass. `check:tenant-isolation` fails, and fails
+  identically at the task's `planning_base` (`b96252b0e`) on
+  `crates/vala/vala-sql/{migrations/20260910000019,migrations/20260910000022,src/queries/oracle_admission.rs,src/queries/scribe_batch_commits.rs}`
+  — none of which this task writes. Pre-existing, out of scope, not worked
+  around.
+- `mise run test:bifrost:integration:redux` — 960 tests run, 960 passed.
+- `mise run test:bifrost:journey:oracle` — 22 tests run, 22 passed.
+- `git diff --check` — clean; working tree clean.
+
+### Scope confirmation
+
+No public contract, endpoint, SDK field, protobuf field, descriptor,
+dependency, configuration knob, trait, registry, generic observer, crate, or
+module was added, and no production metric label or family was introduced. No
+fallback, retry, repin, or replan path exists. No query ordinal was revived.
+The single root, single admission, immutable deadline, tenant isolation,
+Interactive floor, and joined cleanup are unchanged. No second remediation task
+was created; all four findings land here.
+
+`tasks/05-pre-mcp-buildout.md` declares
+`depends_on: [BIFROST-R6-T04-REMEDIATION-02-EXACT-BINDINGS-AND-ATTEMPT-EVIDENCE]`,
+so MCP buildout cannot begin while these findings remain open.

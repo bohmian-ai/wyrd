@@ -11,7 +11,7 @@ const series = [
 
 test('draws one polyline per series', () => {
   const { container } = render(Line, { props: { series, labels: ['a', '', 'c'] } });
-  expect(container.querySelectorAll('.wy-line svg > polyline')).toHaveLength(3);
+  expect(container.querySelectorAll('.plot > svg > polyline')).toHaveLength(3);
 });
 
 test('renders only non-empty x labels', () => {
@@ -21,12 +21,12 @@ test('renders only non-empty x labels', () => {
 
 test('every series carries a distinct dash and marker, not just a distinct hue', () => {
   const { container } = render(Line, { props: { series } });
-  const lines = [...container.querySelectorAll('.wy-line svg > polyline')];
+  const lines = [...container.querySelectorAll('.plot > svg > polyline')];
   const dashes = lines.map((l) => l.getAttribute('stroke-dasharray') ?? 'solid');
   expect(new Set(dashes).size).toBe(3);
 
   // Markers: one path per point per series, and the shapes differ between series.
-  const shapes = [...container.querySelectorAll('.wy-line svg > path.node')].map((p) =>
+  const shapes = [...container.querySelectorAll('.plot > svg > path.node')].map((p) =>
     (p.getAttribute('d') ?? '').replace(/[\d.-]+/g, '')
   );
   expect(new Set(shapes).size).toBe(3);
@@ -69,23 +69,35 @@ test('light and dark render the same structure and the same non-colour separatio
   );
 });
 
-test('the readout is populated without a pointer and reports the most recent point', () => {
+test('the tooltip is reachable by focus, not by pointer alone, and opens on the latest point', async () => {
   const { container } = render(Line, { props: { series, labels: ['a', 'b', 'c'], unit: 'ms' } });
-  // Never hover-gated: a keyboard or touch reader gets the latest values on first paint.
-  expect(container.querySelector('.readout .at')?.textContent).toBe('c');
-  expect([...container.querySelectorAll('.readout .sv')].map((v) => v.textContent)).toEqual([
+  expect(container.querySelector('.tip'), 'at rest the plot carries no tooltip').toBeNull();
+
+  await fireEvent.focus(container.querySelector('.plot > svg') as SVGSVGElement);
+  expect(container.querySelector('.tip .at')?.textContent).toBe('c');
+  expect([...container.querySelectorAll('.tip .sv')].map((v) => v.textContent)).toEqual([
     '131ms',
     '388ms',
     '588ms'
   ]);
 });
 
-test('arrow keys step the readout and Home jumps to the start of the range', async () => {
+test('arrow keys move the tooltip and Home jumps to the start of the range', async () => {
   const { container } = render(Line, { props: { series, labels: ['a', 'b', 'c'] } });
-  const plot = container.querySelector('.wy-line > svg') as SVGSVGElement;
+  const plot = container.querySelector('.plot > svg') as SVGSVGElement;
+  await fireEvent.focus(plot);
   await fireEvent.keyDown(plot, { key: 'ArrowLeft' });
-  expect(container.querySelector('.readout .at')?.textContent).toBe('b');
+  expect(container.querySelector('.tip .at')?.textContent).toBe('b');
   await fireEvent.keyDown(plot, { key: 'Home' });
-  expect(container.querySelector('.readout .at')?.textContent).toBe('a');
-  expect(container.querySelector('.readout .sv')?.textContent).toBe('120');
+  expect(container.querySelector('.tip .at')?.textContent).toBe('a');
+  expect(container.querySelector('.tip .sv')?.textContent).toBe('120');
+});
+
+test('the tooltip anchors inward at the ends of the range so it is not clipped', async () => {
+  const { container } = render(Line, { props: { series, labels: ['a', 'b', 'c'] } });
+  const plot = container.querySelector('.plot > svg') as SVGSVGElement;
+  await fireEvent.focus(plot);
+  expect(container.querySelector('.tip')?.getAttribute('style')).toContain('translate(calc(-100% + 6px)');
+  await fireEvent.keyDown(plot, { key: 'Home' });
+  expect(container.querySelector('.tip')?.getAttribute('style')).toContain('translate(-6px');
 });

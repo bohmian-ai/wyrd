@@ -32,11 +32,13 @@
 
   const count = $derived(series[0]?.points.length ?? 0);
 
-  // The point the readout is reporting. Hovering or arrowing moves it; letting go returns
-  // it to the most recent point. It is never null, so the values are on the page for a
-  // keyboard or touch reader too — hover chooses which point, it does not gate the data.
+  // The point the tooltip is reporting. Hovering or arrowing moves it; letting go returns
+  // it to the most recent point. The tooltip shows while the plot is hovered or focused,
+  // so it is reachable by keyboard and by tap, not by pointer alone.
   let hovered = $state<number | null>(null);
+  let focused = $state(false);
   const active = $derived(hovered ?? count - 1);
+  const showing = $derived(hovered !== null || focused);
 
   /** Snap the pointer's x to the nearest plotted index. */
   function track(event: PointerEvent): void {
@@ -47,7 +49,7 @@
     hovered = Math.min(count - 1, Math.max(0, Math.round((ratio - x0) / step)));
   }
 
-  /** Left/right step the readout; home/end jump to the ends of the range. */
+  /** Left/right step the reported point; home/end jump to the ends of the range. */
   function step(event: KeyboardEvent): void {
     const moves: Record<string, number> = { ArrowLeft: -1, ArrowRight: 1 };
     if (event.key in moves) {
@@ -87,8 +89,17 @@
 
   const activeX = $derived(x0 + ((x1 - x0) / (count - 1 || 1)) * active);
 
-  /** What the readout says: the point's own label, or its position in the range. */
+  /** What the tooltip is titled: the point's own label, or its position in the range. */
   const activeLabel = $derived(labels[active] || `point ${active + 1} of ${count}`);
+
+  // The tooltip is positioned in percentages of the viewBox, so it tracks the plot at any
+  // rendered width. It sits above the highest series at the active point and anchors
+  // inward at the ends of the range so it is never clipped by the panel.
+  const tipLeft = $derived((activeX / W) * 100);
+  const tipTop = $derived((Math.min(...plotted.map((s) => s.pts[active]?.y ?? yBot)) / H) * 100);
+  const tipShift = $derived(
+    tipLeft < 22 ? '-6px' : tipLeft > 78 ? 'calc(-100% + 6px)' : '-50%'
+  );
 
   const xlabels = $derived.by(() => {
     const n = series[0]?.points.length ?? 0;
@@ -114,11 +125,12 @@
 </script>
 
 <div class="wy-line">
+  <div class="plot">
   <!-- A focusable data region, the same case as Table's scroller: the plot is a picture,
-       but the point the readout reports is a position a reader must be able to move. The
+       but the point the tooltip reports is a position a reader must be able to move. The
        lint models only widgets and static images, so it sees no legitimate third case.
-       Values are never hover-gated — the readout is always populated and aria-live, so a
-       reader who never moves the cursor still gets the most recent point. -->
+       Focusing the plot opens the tooltip on the most recent point and the arrow keys walk
+       it, so nothing here is reachable by pointer alone. -->
   <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
   <svg
@@ -129,7 +141,11 @@
     onpointermove={track}
     onpointerleave={() => (hovered = null)}
     onkeydown={step}
-    onblur={() => (hovered = null)}
+    onfocus={() => (focused = true)}
+    onblur={() => {
+      focused = false;
+      hovered = null;
+    }}
   >
     {#each grid as gy (gy)}
       <line class="grid" x1={x0} y1={gy.toFixed(1)} x2={x1} y2={gy.toFixed(1)} stroke-width="1" stroke-dasharray="3 3" />
@@ -140,7 +156,9 @@
       <line class="tick" x1={x0 - 4} y1={thresholdY.toFixed(1)} x2={x0 + 4} y2={thresholdY.toFixed(1)} stroke-width="3" />
       <text class="thrl" x={x1} y={(thresholdY - 4).toFixed(1)} text-anchor="end">{threshold.label}</text>
     {/if}
-    <line class="cursor" x1={activeX.toFixed(1)} y1={yTop} x2={activeX.toFixed(1)} y2={yBot} stroke-width="2" stroke-dasharray="2 3" />
+    {#if showing}
+      <line class="cursor" x1={activeX.toFixed(1)} y1={yTop} x2={activeX.toFixed(1)} y2={yBot} stroke-width="2" stroke-dasharray="2 3" />
+    {/if}
     {#each plotted as s (s.label)}
       <polyline
         points={s.line}
@@ -154,7 +172,7 @@
       {#each s.pts as p, i (i)}
         <path
           class="node"
-          class:read={i === active}
+          class:read={showing && i === active}
           d={marker(s.marker, p.x, p.y)}
           style={`stroke:${s.color}`}
           stroke-width="2"
@@ -165,26 +183,47 @@
       <text class="xl" x={l.x.toFixed(1)} y={yBot + 13} text-anchor={l.anchor}>{l.label}</text>
     {/each}
   </svg>
-  <div class="readout" aria-live="polite">
-    <span class="at">{activeLabel}</span>
-    <ul class="legend">
-      {#each plotted as s (s.label)}
-        <li>
-          <svg class="sample" viewBox="0 0 26 10" aria-hidden="true">
-            <line x1="1" y1="5" x2="25" y2="5" style={`stroke:${s.color}`} stroke-dasharray={s.dash || undefined} stroke-width="2.5" />
-            <path class="node" d={marker(s.marker, 13, 5)} style={`stroke:${s.color}`} stroke-width="2" />
-          </svg>
-          <span class="sl">{s.label}</span>
-          <span class="sv">{s.pts[active] ? series[plotted.indexOf(s)].points[active] : '–'}{#if unit}<span class="su">{unit}</span>{/if}</span>
-        </li>
-      {/each}
-    </ul>
+  {#if showing}
+    <div
+      class="tip"
+      style={`left:${tipLeft.toFixed(2)}%;top:${tipTop.toFixed(2)}%;transform:translate(${tipShift},-100%)`}
+      aria-live="polite"
+    >
+      <span class="at">{activeLabel}</span>
+      <ul>
+        {#each plotted as s, i (s.label)}
+          <li>
+            <svg class="sample" viewBox="0 0 26 10" aria-hidden="true">
+              <line x1="1" y1="5" x2="25" y2="5" style={`stroke:${s.color}`} stroke-dasharray={s.dash || undefined} stroke-width="2.5" />
+              <path class="node" d={marker(s.marker, 13, 5)} style={`stroke:${s.color}`} stroke-width="2" />
+            </svg>
+            <span class="sl">{s.label}</span>
+            <span class="sv">{series[i].points[active] ?? '–'}{#if unit}<span class="su">{unit}</span>{/if}</span>
+          </li>
+        {/each}
+      </ul>
+    </div>
+  {/if}
   </div>
+  <ul class="legend">
+    {#each plotted as s (s.label)}
+      <li>
+        <svg class="sample" viewBox="0 0 26 10" aria-hidden="true">
+          <line x1="1" y1="5" x2="25" y2="5" style={`stroke:${s.color}`} stroke-dasharray={s.dash || undefined} stroke-width="2.5" />
+          <path class="node" d={marker(s.marker, 13, 5)} style={`stroke:${s.color}`} stroke-width="2" />
+        </svg>
+        {s.label}
+      </li>
+    {/each}
+  </ul>
 </div>
 
 <style>
-  /* the plot only — the legend samples keep their own fixed 26x10 box */
-  .wy-line > svg {
+  .plot {
+    position: relative;
+  }
+  /* the plot only — the legend and tooltip samples keep their own fixed 26x10 box */
+  .plot > svg {
     display: block;
     width: 100%;
     height: auto;
@@ -209,7 +248,7 @@
   .node {
     fill: var(--surface);
   }
-  /* the point the readout is reporting */
+  /* the point the tooltip is reporting */
   .node.read {
     fill: var(--text);
   }
@@ -217,7 +256,7 @@
     stroke: var(--muted);
     stroke-opacity: 0.55;
   }
-  .wy-line > svg:focus-visible {
+  .plot > svg:focus-visible {
     outline: 2px solid var(--text);
     outline-offset: 2px;
   }
@@ -226,9 +265,34 @@
     font-size: 8.5px;
     fill: var(--muted);
   }
-  .readout {
-    margin-top: 8px;
+  /* Workbench geometry, quiet altitude: 2px border, 5px radius, 3px hard shadow. It is
+     never a hit target — pointer-events stay off so it cannot interrupt its own tracking. */
+  .tip {
+    position: absolute;
+    z-index: 1;
+    pointer-events: none;
+    margin-top: -10px;
+    padding: 6px 8px;
+    border: 2px solid var(--border);
+    border-radius: var(--r);
+    box-shadow: 3px 3px 0 0 var(--shadow);
+    background: var(--surface);
     font-family: var(--fm);
+    font-size: 9.5px;
+    white-space: nowrap;
+  }
+  .tip ul {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    margin: 3px 0 0;
+    padding: 0;
+    list-style: none;
+  }
+  .tip li {
+    display: flex;
+    align-items: center;
+    gap: 5px;
   }
   .at {
     display: block;
@@ -240,6 +304,7 @@
   }
   .sl {
     color: var(--muted);
+    margin-right: auto;
   }
   .sv {
     font-weight: 700;

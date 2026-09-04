@@ -87,6 +87,9 @@ with a coloured dot alone, which INV-008 forbids; it now reads through `Badge`.
 - **URL-backed state, not callbacks** — chip removal is an href and `Select`
   submits its enclosing form, so filter state stays in the URL and the catalog
   contract stays non-executable.
+- **Chart values** — `Line` reports the point under the cursor in a tooltip pinned to it;
+  focusing the plot opens it on the most recent point and arrow/Home/End walk it, so no
+  value is reachable by pointer alone. The legend stays identity-only (dash + marker).
 - **Light/dark equivalence (REQ-081)** — `Line.test.ts` renders the same chart
   under both `ModeProvider` modes and asserts the trees are identical once the
   token-bearing `style` attributes are stripped: only tokens differ.

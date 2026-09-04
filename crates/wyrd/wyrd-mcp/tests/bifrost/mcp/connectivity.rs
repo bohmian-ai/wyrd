@@ -7,26 +7,39 @@
 //! yet; the server's test-support context probe stands in for one so the
 //! journey observes exactly what the edge bound.
 
+use http::{HeaderName, HeaderValue};
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
-use secrecy::SecretString;
 use wyrd_client::auth::AuthMiddleware;
 use wyrd_client::config::{ClientConfig, TokenCacheMode};
 use wyrd_client::transport::credential::ResolvedCredential;
 use wyrd_mcp::client::WyrdMcpHttpClient;
+use wyrd_spec::request_id::RequestId;
 use wyrd_testing::WyrdTestServer;
 
 /// Boxed error carried by every helper in this journey.
 type McpJourneyError = Box<dyn std::error::Error + Send + Sync>;
 
-/// Build the first-party MCP client transport for `server` using `api_key`.
+/// Build the first-party MCP client transport for `server` using `credential`.
 ///
-/// The credential path is the production one: the middleware exchanges the key
-/// at the server's real `/auth/token` route and the decorator attaches the
-/// resulting bearer to every MCP request.
+/// The credential path is the production one: for an API key the middleware
+/// exchanges it at the server's real `/auth/token` route, for a bearer it
+/// carries the token as issued, and the decorator attaches the resulting bearer
+/// to every MCP request.
+///
+/// When `request_id` is supplied it is seeded into the transport's custom
+/// headers as `wyrd-request-id`, which the decorator preserves rather than
+/// minting its own — the only way a test can join a durable audit row to the
+/// exact request that produced it.
+///
+/// # Errors
+///
+/// Returns an error when the server is not bound to a listener or when the
+/// middleware cannot be constructed for `credential`.
 fn transport(
     server: &WyrdTestServer,
-    api_key: &SecretString,
+    credential: ResolvedCredential,
+    request_id: Option<&RequestId>,
 ) -> Result<StreamableHttpClientTransport<WyrdMcpHttpClient>, McpJourneyError> {
     let base_url = server
         .base_url()
@@ -35,21 +48,30 @@ fn transport(
     let mut config = ClientConfig::default();
     config.http.base_url = base_url.clone();
     config.token_cache = TokenCacheMode::InMemory;
-    let auth = AuthMiddleware::new(&config, ResolvedCredential::ApiKey(api_key.clone()))?;
+    let auth = AuthMiddleware::new(&config, credential)?;
+    let mut transport_config =
+        StreamableHttpClientTransportConfig::with_uri(format!("{base_url}/mcp"));
+    if let Some(request_id) = request_id {
+        transport_config.custom_headers.insert(
+            HeaderName::from_static("wyrd-request-id"),
+            HeaderValue::from_str(request_id.as_str())?,
+        );
+    }
     Ok(StreamableHttpClientTransport::with_client(
         WyrdMcpHttpClient::new(reqwest::Client::new(), auth),
-        StreamableHttpClientTransportConfig::with_uri(format!("{base_url}/mcp")),
+        transport_config,
     ))
 }
 
 mod pg_tests {
-    use super::{McpJourneyError, transport};
+    use super::{McpJourneyError, RequestId, ResolvedCredential, transport};
 
     use std::time::Duration;
 
     use rmcp::model::{CallToolRequest, CallToolRequestParams, ClientRequest, ProtocolVersion};
     use rmcp::service::PeerRequestOptions;
     use rmcp::{ClientLifecycleMode, ClientServiceExt as _};
+    use wyrd_runtime::Permission;
     use wyrd_server::mcp::probe;
     use wyrd_spec::DataTenantId;
     use wyrd_testing::WyrdTestServer;
@@ -83,11 +105,35 @@ mod pg_tests {
             .with_mcp_context_probe_for_test()
             .start_bound()
             .await?;
+        let initiator = server
+            .bootstrap_service("mcp-initiator", &["runtime_admin"])
+            .await?;
         let caller = server
             .bootstrap_service("mcp-connectivity", &["admin"])
             .await?;
-        let api_key = caller.api_key().ok_or("service bootstrap carries a key")?;
-        let client = ().serve_with_lifecycle(transport(&server, api_key)?, discover()).await?;
+        let initiator_jwt = server
+            .exchange_api_key(
+                initiator
+                    .api_key()
+                    .ok_or("service bootstrap carries a key")?,
+            )
+            .await?;
+        let delegated_jwt = server
+            .delegate(
+                &initiator_jwt,
+                caller.card_ref().ok_or("a service carries a card ref")?,
+            )
+            .await?;
+        let client = ()
+            .serve_with_lifecycle(
+                transport(
+                    &server,
+                    ResolvedCredential::BearerToken(delegated_jwt.into()),
+                    None,
+                )?,
+                discover(),
+            )
+            .await?;
 
         let tools = client.list_all_tools().await?;
         let names: Vec<&str> = tools.iter().map(|tool| tool.name.as_ref()).collect();
@@ -114,6 +160,16 @@ mod pg_tests {
             serde_json::Value::String(caller.id().to_string()),
             "the server binds the verified caller"
         );
+        assert_eq!(
+            context["roles"],
+            serde_json::json!(["admin"]),
+            "the delegated bearer carries exactly the target's own roles"
+        );
+        assert_eq!(
+            context["delegation_chain"],
+            serde_json::json!([initiator.id().to_string()]),
+            "the chain is initiator-first and stops at the single hop taken"
+        );
         assert_eq!(context["cancelled"], serde_json::Value::Bool(false));
         assert!(
             context["request_id"]
@@ -134,7 +190,12 @@ mod pg_tests {
         let server = WyrdTestServer::start_bound().await?;
         let caller = server.bootstrap_service("mcp-default", &["admin"]).await?;
         let api_key = caller.api_key().ok_or("service bootstrap carries a key")?;
-        let client = ().serve_with_lifecycle(transport(&server, api_key)?, discover()).await?;
+        let client = ()
+            .serve_with_lifecycle(
+                transport(&server, ResolvedCredential::ApiKey(api_key.clone()), None)?,
+                discover(),
+            )
+            .await?;
 
         assert!(
             client.list_all_tools().await?.is_empty(),
@@ -166,22 +227,6 @@ mod pg_tests {
         let response = request.send().await?;
         let status = response.status();
         Ok((status, response.json().await?))
-    }
-
-    /// Count durable denial rows the probe's audited authorization wrote.
-    async fn probe_denials(
-        server: &WyrdTestServer,
-        tenant: DataTenantId,
-    ) -> Result<i64, McpJourneyError> {
-        let mut conn = server.tenant_conn_for(tenant).await?;
-        let count: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM vala.audit_outbox WHERE operation = $1 AND decision = 'deny'",
-        )
-        .bind(probe::TOOL_NAME)
-        .fetch_one(&mut **conn.transaction())
-        .await?;
-        conn.commit().await?;
-        Ok(count)
     }
 
     /// Build one cancellable `tools/call` for the probe, parked on `hold_id`.
@@ -235,10 +280,17 @@ mod pg_tests {
         //    audited RBAC path every Bifrost read uses, and the denial is durable.
         let denied = server.bootstrap_service("mcp-denied", &["reader"]).await?;
         let denied_key = denied.api_key().ok_or("service bootstrap carries a key")?;
-        let denied_client =
-            ().serve_with_lifecycle(transport(&server, denied_key)?, discover())
-                .await?;
-        let before = probe_denials(&server, tenant).await?;
+        let denied_request_id = RequestId::now_v7();
+        let denied_client = ()
+            .serve_with_lifecycle(
+                transport(
+                    &server,
+                    ResolvedCredential::ApiKey(denied_key.clone()),
+                    Some(&denied_request_id),
+                )?,
+                discover(),
+            )
+            .await?;
         let refusal = denied_client
             .call_tool(CallToolRequestParams::new(probe::TOOL_NAME))
             .await
@@ -249,10 +301,29 @@ mod pg_tests {
                 .contains("WYRD_PERMISSION_403_DENIED_RBAC"),
             "the RBAC denial reaches the client verbatim: {refusal}"
         );
+        let mut conn = server.tenant_conn_for(tenant).await?;
+        let denial_rows: Vec<(String, uuid::Uuid, String, String, String)> = sqlx::query_as(
+            "SELECT permission, principal_id, request_id, decision, result \
+             FROM vala.audit_outbox \
+             WHERE operation = $1 \
+               AND request_id = $2",
+        )
+        .bind(probe::TOOL_NAME)
+        .bind(denied_request_id.as_str())
+        .fetch_all(&mut **conn.transaction())
+        .await?;
+        conn.commit().await?;
         assert_eq!(
-            probe_denials(&server, tenant).await?,
-            before + 1,
-            "the denial is durably audited before anything is disclosed"
+            denial_rows,
+            vec![(
+                Permission::bifrost_query_read().to_string(),
+                denied.id().as_uuid(),
+                denied_request_id.to_string(),
+                "deny".to_owned(),
+                "failure".to_owned(),
+            )],
+            "the denial is durably audited exactly once, under the caller's own \
+             request id, before anything is disclosed"
         );
         denied_client.cancel().await?;
 
@@ -260,7 +331,16 @@ mod pg_tests {
         //    identity the client asked for.
         let allowed = server.bootstrap_service("mcp-allowed", &["admin"]).await?;
         let allowed_key = allowed.api_key().ok_or("service bootstrap carries a key")?;
-        let client = ().serve_with_lifecycle(transport(&server, allowed_key)?, discover()).await?;
+        let client = ()
+            .serve_with_lifecycle(
+                transport(
+                    &server,
+                    ResolvedCredential::ApiKey(allowed_key.clone()),
+                    None,
+                )?,
+                discover(),
+            )
+            .await?;
         let mut spoofed = serde_json::Map::new();
         spoofed.insert(
             "tenant_id".to_owned(),

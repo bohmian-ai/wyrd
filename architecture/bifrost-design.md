@@ -264,30 +264,23 @@ streams one terminal-safe result. DataFusion providers receive only the pinned
 files and leased live-tail sources. Tenant authority is installed before plan
 decode or source IO.
 
-Oracle has two execution paths:
+Oracle plans every query once through the pinned `datafusion-distributed`
+planner and derives its admission and terminal path from the returned physical
+root:
 
-- **Interactive** is the default single-stage path for scans, filters, limits,
-  global operations already supported locally, low-cardinality aggregation,
-  and any query for which an analytical route cannot be established safely.
-- **Analytical** is the streamed distributed path for the supported v1
-  baseline: filtered and projected scans, fixed-width grouped `COUNT`, `SUM`,
-  `MIN`, and `MAX` aggregation, multi-input equi-join, streamed network
-  exchange, and one real spilling DataFusion operator. Query shapes outside
-  that baseline remain Interactive when Interactive supports them and
-  otherwise return a stable structured failure. Bifrost promises no exhaustive
-  operator matrix for windows, correlated subqueries, deduplicating sets,
-  UDAFs, every join type, or every aggregation state.
+- **Interactive** is selected for a normal DataFusion physical root and keeps
+  protected capacity for low-overhead, high-throughput reads.
+- **Analytical** is selected for a
+  `datafusion_distributed::DistributedExec` root and executes its streamed
+  stage graph across authenticated Oracle peers.
 
-Routing reuses Oracle's existing optimized-plan classification over the
-immutable pinned query facts to nominate an Analytical candidate; Bifrost adds
-no second optimizer and no separate routing-facts subsystem. Missing,
-incompatible, overflowed, or mutable estimates select Interactive. SQL text,
-row sampling, live execution statistics, client hints, and unpinned catalog
-state never select the path. A candidate becomes Analytical only when
-distributed physical planning succeeds, the plan stays inside the supported v1
-baseline, and the plan contains a real network exchange. Any of those checks
-failing before selection executes the Interactive plan and records a bounded
-fallback reason.
+Oracle maintains no operator allowlist, candidate heuristic, second physical
+build, or pre-selection fallback. The pinned planner decides whether useful
+network boundaries survive; its registered codecs and workers decide what the
+integrated system can execute. Planning, codec, and worker incompatibilities
+return a stable structured failure. Representative end-to-end queries prove
+scan/filter/projection, grouped aggregation, join, sort/limit, exchange, and
+spill behavior without claiming exhaustive operator coverage.
 
 ### Distributed analytical execution
 
@@ -352,7 +345,8 @@ One atomic aggregate check prevents their combined occupancy from exceeding
 Oracle capacity. A configured Interactive slot floor cannot be borrowed by
 Analytical work; Interactive work may use idle unreserved capacity. Both paths
 share one elastic memory and scratch root plus one leader/peer capacity counter.
-`QueryClass` is telemetry classification, not an admission key.
+`QueryClass` is derived from the one returned physical root and is never a
+caller-controlled hint.
 
 When Analytical execution is enabled, configuration requires
 `1 <= interactive_floor_slots < total_oracle_slots`; otherwise startup fails.
@@ -363,7 +357,8 @@ then assigns unreserved capacity to the oldest eligible path head while
 preserving tenant rotation. A continuously ready path cannot be skipped
 indefinitely, and Analytical work never consumes the Interactive floor.
 
-Slots admit and grants size. A slot unit charges 32 MiB of working memory.
+Slots admit; the actual grant sizes only the execution memory ceiling. A slot
+unit charges 32 MiB of working memory.
 Interactive work normally charges one unit and Analytical work two, with the
 selected physical plan owning the checked final cost. A query-local memory
 ceiling is derived once at admission:
@@ -379,14 +374,21 @@ the query lifetime and never recomputed under running operators. Each query's
 DataFusion pool enforces that ceiling while actual allocations draw from the
 shared root, whose hard limit remains authoritative.
 
-Operators and exchange consumers share the issued query ceiling without
+The guaranteed minimum successful grant fixes one `OracleSessionShape` before
+physical planning: the 32 MiB memory floor, the minimum two execution
+partitions narrowed by available cut work, and the resulting target partitions,
+batch size, spill reservation, and join preference. Oracle retains that exact
+`SessionConfig` with the single physical root. The actual grant chosen after
+root-derived admission supplies only the query-owned `RuntimeEnv` and
+`MemoryPool` ceiling; it does not reshape or rebuild the physical plan, and
+capacity above the retained shape may remain unused.
+
+Operators and exchange consumers share that issued query ceiling without
 separate sublimits. Admission refuses before dispatch when checked graph counts
 or scratch demand exceed their finite configured limits. Allocation or
 transport refusal after admission is a typed query-resource failure and
-cancels the full query; it never borrows from another query's ceiling. The
-fixed grant sizes one `OracleSessionShape`: target partitions, batch size, and
-join preference. Scratch space is separately reserved because spill consumes
-real disk.
+cancels the full query; it never borrows from another query's ceiling. Scratch
+space is separately reserved because spill consumes real disk.
 
 Tenant fairness is owned separately by per-tenant FIFO and weighted
 round-robin admission. Grants are tenant-blind. Memory governance protects

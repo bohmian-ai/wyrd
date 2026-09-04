@@ -41,8 +41,9 @@ storage exhausts. Shutdown closes admission, rotates active work, stages
 immutable members, closes residue claims, and drains admitted publication up
 to one absolute deadline; unsettled work retains exact replay evidence.
 
-Oracle admits interactive and analytical slots separately under one atomic
-total bound. Each query owns its runtime, one aggregate memory pool shared by
+Oracle derives Interactive or Analytical from the one physical root returned by
+the pinned planner, then admits their slots separately under one atomic total
+bound. Each query owns its runtime, one aggregate memory pool shared by
 operators and exchanges, spill allocation, bounded Wyrd-owned admission queues
 and graph controls, cancellation tree, and deadline. Dependency-owned exchange
 queues retain their pinned byte backpressure without a Wyrd item-count

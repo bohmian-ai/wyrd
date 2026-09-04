@@ -5,10 +5,16 @@ distributed execution, managed compaction, memory, spill, or diagnostics.
 
 ## DataFusion is execution, not authority
 
-DataFusion receives an already authenticated, tenant-qualified, admitted
-operation. Wyrd owns authorization, query-class routing, resource grants,
-deadlines, failure policy, audit, and terminal semantics. A `SessionContext`,
-SQL parser, optimizer, or `TableProvider` is never an authorization boundary.
+DataFusion planning receives an authenticated, tenant-qualified immutable cut
+before path-specific admission. It uses the exact `OracleSessionShape` derived
+from Oracle's guaranteed minimum successful grant and performs no row IO or
+query-memory retention. After the returned root selects its class, execution
+receives the admitted query-owned runtime and memory pool through `TaskContext`
+while retaining the planning `SessionConfig` unchanged; extra granted capacity
+may remain unused. Wyrd owns authorization, query-class routing, resource
+grants, deadlines, failure policy, audit, and terminal semantics. A
+`SessionContext`, SQL parser, optimizer, or `TableProvider` is never an
+authorization boundary.
 
 A provider owns schema, exact snapshot-bound file facts, statistics, scan
 construction, and truthful pushdown claims. Advertise `Exact` filtering only
@@ -19,14 +25,14 @@ map fields by name or stable field identity.
 
 ## Oracle execution paths
 
-The interactive engine is the default. Keep work interactive when it needs no
-network exchange or when cardinality/working-state estimates are missing or
-invalid. Use the streamed distributed path for the supported baseline of
-filtered/projected scans, fixed-width grouped `COUNT`/`SUM`/`MIN`/`MAX`,
-multi-input equi-join, streamed exchange, and a spilling operator. The
-analytical candidate must contain a real network exchange, and its physical
-plan must validate inside that baseline before selection. Do not promise
-broader operator coverage than the delivery proves.
+Run every query through the pinned `datafusion-distributed` planner once. A
+normal DataFusion physical root selects Interactive; a
+`datafusion_distributed::DistributedExec` root selects Analytical. Retain and
+execute that exact returned root after path-specific admission. Do not add a
+candidate classifier, operator allowlist, second physical build, or fallback
+planner. Representative end-to-end stage-graph queries prove the integrated
+planner, codec, worker, and result path without promising exhaustive operator
+coverage.
 
 Distributed stages use one partitioned streamed exchange and no materialized
 shuffle service. Bind tenant, pinned-snapshot digest, fragment digest, and fence

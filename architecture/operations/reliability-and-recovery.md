@@ -160,10 +160,10 @@ fabricate task completion to make health checks pass.
   exhaustion, protocol mismatch, deadline, or cancellation terminates the
   complete result. Terminal framing prevents a partial stream from being
   interpreted as success.
-- Multi-stage planning failure before analytical selection may select the
-  authorized interactive path; it cannot bypass admission, audit, tenant
-  binding, deadline, or payload policy. After selection there is no interactive
-  rerun.
+- Physical planning failure is terminal; Oracle does not build or run a second
+  interactive plan. Planning and path selection cannot bypass admission,
+  audit, tenant binding, deadline, or payload policy. After Analytical
+  selection there is no interactive rerun.
 - Cleanup timeout or failure is never reported as a successful release. The
   remaining graph stays observable to the owning supervisor, the node does not
   claim a clean terminal state, and readiness or shutdown evidence surfaces the

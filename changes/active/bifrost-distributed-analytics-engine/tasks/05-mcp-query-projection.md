@@ -5,7 +5,7 @@ kind: implementation
 mode: RECONCILE
 status: proposed
 spec: SPEC-bifrost-distributed-analytics-engine
-spec_revision: 5
+spec_revision: 6
 depends_on: [BIFROST-R5-T05-PRE-MCP-BUILDOUT]
 requirements: [REQ-001, REQ-008, REQ-010, REQ-012]
 invariants: [INV-001, INV-002, INV-003, INV-004, INV-005, INV-008, INV-009]
@@ -37,8 +37,8 @@ Required execution skill: `$wyrd-implement`.
   `max_rows`, and `max_bytes`, including the frozen MCP limits.
 - Canonical structured Wyrd errors, no successful truncation or partial
   result, server-selected path evidence, and zero retained Oracle ownership.
-- Task 04's production query behavior, now completed through Task 04A, remains
-  unchanged and is satisfied transitively through Task 05-pre.
+- Task 04 and Task 04A remain reviewed history. The revision 6 single-plan
+  Oracle behavior is satisfied transitively through Task 05-pre's dependency.
 
 ### Deleted
 
@@ -273,8 +273,8 @@ scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner &&
 ```
 
 **GREEN.** Reuse the Scenario 1 descriptions and Scenario 3 query adapter
-unchanged. There is no Analytical MCP branch: Oracle's existing support
-predicate, admission, physical-plan proof, and execution own path selection.
+unchanged. There is no Analytical MCP branch: Oracle's one pinned physical
+root, root-derived admission class, and execution own path selection.
 
 **REFACTOR.** Delete any plan hint, partition inventory, topology, or
 join-registry code introduced while making the journey pass. `describe_table`
@@ -352,5 +352,6 @@ partial assertions, and zero retained Oracle ownership before every return.
 Return `SPEC_REVISION_REQUIRED` if implementation requires another tool or
 transport, caller-selected routing, a server self-call, a successful partial
 result, Bifrost writes, or weaker auth, tenant, audit, floor, cancellation, or
-terminal semantics. Stop for an approved-plan revision if Task 04A changes the
-application/query seam or the exact terminal/cleanup evidence assumed here.
+terminal semantics. Stop for an approved-plan revision if the Oracle
+remediation changes the application/query seam or the exact terminal/cleanup
+evidence assumed here.

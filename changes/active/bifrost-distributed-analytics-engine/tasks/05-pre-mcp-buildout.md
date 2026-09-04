@@ -5,8 +5,8 @@ kind: implementation
 mode: RECONCILE
 status: proposed
 spec: SPEC-bifrost-distributed-analytics-engine
-spec_revision: 5
-depends_on: [BIFROST-R5-T04A-PRODUCTION-ACTIVATION]
+spec_revision: 6
+depends_on: [BIFROST-R6-T04-REMEDIATION-SINGLE-PLANNER-QUERY-RELIABILITY]
 requirements: [REQ-007, REQ-010, REQ-012]
 invariants: [INV-002, INV-004, INV-005, INV-008, INV-009]
 acceptance: [AC-006, AC-008, AC-009]
@@ -33,8 +33,10 @@ Required execution skill: `$wyrd-implement`.
 
 ### Retained
 
-- Task 04 and its Task 04A completion successor remain unchanged. MCP work
-  starts only after `BIFROST-R5-T04A-PRODUCTION-ACTIVATION` completes.
+- Task 04 and Task 04A remain the reviewed implementation history. MCP work
+  starts only after
+  `BIFROST-R6-T04-REMEDIATION-SINGLE-PLANNER-QUERY-RELIABILITY` replaces their
+  superseded two-gate query architecture and closes terminal reliability.
 - The existing public listener, JWT verifier, `x-wyrd-access-token` contract,
   optional `wyrd-request-id`, authorization, tenant derivation, principal Card
   scope, delegated `act` chain, `Caller`, and audit context remain authoritative.
@@ -317,5 +319,5 @@ audited-denial evidence, request-cancellation joining, and tracker-zero
 process-shutdown evidence before server drain. Return `SPEC_REVISION_REQUIRED` if implementation
 needs another transport/listener/service, server-side Skald or SDK self-calls,
 identity tool arguments, a custom MCP protocol layer, or weaker Wyrd edge
-security. Stop for an approved-plan revision if Task 04A changes the existing
-auth, listener, or shutdown seams assumed here.
+security. Stop for an approved-plan revision if the Oracle remediation changes
+the existing auth, listener, or shutdown seams assumed here.

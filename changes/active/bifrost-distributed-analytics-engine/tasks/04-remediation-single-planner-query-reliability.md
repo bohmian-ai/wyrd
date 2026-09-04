@@ -1360,3 +1360,88 @@ per scannable unit, and it is what makes
    `--features vala-bifrost-redux/test-support`; under default features
    `src/resources.rs` fails to compile with `E0433/E0425 cannot find type
    AtomicUsize`. That file is untouched by this task and the defect predates it.
+
+### Scenario 3 — complete: five further defects, journey green
+
+The hand-off's next step named the egress mint. Instrumenting it refuted that
+hypothesis in one run: `AnalyticalStageMint::call` was entered for stage 2 and
+never for stage 1, so the failure was upstream of the mint. A probe on
+`AnalyticalWorkerChannel::coordinator_channel` — the last Wyrd-owned frame
+before upstream's spawned push — showed both stage-1 pushes entering and
+failing to encode. Upstream joins that `JoinSet` only after the query has
+already failed, which is why the cause never appeared; the probe is now a
+permanent `tracing::warn!` on that path so a refused plan installation names
+itself instead of surfacing as the consumer's ten-second plan-wait timeout.
+
+Five defects, each proven by the journey advancing to a new, distinct failure:
+
+8. **The binder's walk could not see a split leaf.** `remote_placeholders`
+   descended only `children()`, and `DistributedLeafExec`'s per-task variants
+   are deliberately not its children. An analytical root therefore bound *no*
+   follower assignment at all, and every stage plan carrying that leaf failed
+   to encode with "Oracle plan leaf has no bound follower assignment". The
+   router's `stage_destinations` had already patched the same blind spot in its
+   own copy of the walk; both now share one walk, so this shape cannot diverge
+   between the side that binds a source and the side that places it.
+9. **A wire namespace was parsed without its root.**
+   `TailFenceDrainer::wire_binding` strips `vala.` before a binding goes on the
+   wire; `assignment_table` parsed the pair as-is and refused every production
+   binding as non-canonical. `canonical_table_name` in the Scribe tail RPC
+   already tolerated both spellings, so it moved to `namespaces` — where the
+   closed namespace set lives — and both sides read it.
+10. **The assignment fingerprinted the closure, not the table.** A follower
+    validates a persisted assignment against `provider.schema()` — the full
+    catalog schema — before it reads anything. The leader was fingerprinting the
+    scan's projected closure, which already travels separately as
+    `required_columns`, so every distributed persisted read was refused.
+11. **One assignment named two persisted tiers.** A follower resolves a
+    descriptor list through a single reader and refuses a mixed list, but
+    `follower_scan_assignment` concatenated the cut's Iceberg and hot files. The
+    scan identity now carries its tier (`oracle:{table}:iceberg` /
+    `oracle:{table}:hot`), a cut delegates only the tiers it holds, and both
+    placeholders name the same frozen destination so the stage still routes to
+    one participant. This is what
+    `distributed::pg_bifrost_selective_predicate_spans_hot_and_compacted_reads`
+    was failing on.
+12. **The journey deleted an object the fixture never writes.** It looked for an
+    Iceberg `data/` object, but the process fixture seals rows to staged hot
+    Parquet and runs no Forge compaction, so nothing under `data/` ever existed.
+    The pinned cut names a hot object exactly as it names a compacted one and
+    this task's own GREEN treats a stale Iceberg, hot, or live-tail source as
+    the same terminal, so the step deletes the object the fixture writes. The
+    walk reports what it saw when it finds none.
+
+One stale assertion was also corrected: the Scenario 3 unit test still required
+a stage with no remote leaf to defer, which defect 7 deliberately changed. Only
+an empty roster defers now; a consumer stage is spread over the frozen roster so
+a task's plan push and its execution stay on one peer. That test was the single
+failure in the `test:bifrost` lane at hand-off (959/960), not a new break.
+
+**Evidence.**
+
+```bash
+mise run test:bifrost                                   # 960/960
+mise exec -- cargo clippy -p vala-bifrost-redux --all-features --all-targets
+scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && \
+  mise exec -- cargo nextest run --locked -p wyrd-testing --test oracle -P journey \
+  -E 'test(=analytical_activation::single_planner_root_selects_path_and_capacity)' --run-ignored=all"
+```
+
+The Scenario 1 journey passes. The whole Oracle journey lane moved from
+`10 passed, 11 failed` at Scenario 3's landing to `15 passed, 6 failed`. Every
+remaining failure is pre-existing and outside Scenario 3:
+`analytical_activation::transport_drop_retains_running_status_until_cleanup_joins`,
+`analytical_activation::public_query_selects_both_paths_and_preserves_interactive_floor`,
+`analytical_inactive::pg_inactive_analytical_production_telemetry_covers_every_hot_path`,
+`analytical_inactive::pg_inactive_analytical_raw_sql_proves_pushdown_exchange_and_qualified_spill`,
+`peer_network::analytical::inactive_baseline_executes_join_group_spill_and_interchangeable_topology`,
+and `published::published_cache_pruning_and_shutdown_are_production_governed`.
+They are Scenario 4–7 subjects and fail with the same messages they failed with
+before this slice.
+
+`telemetry::record_stage_authority` is no longer uncalled: `wyrd-server`'s
+`oracle::peer_authority` records it on the authorized path and on both rejection
+paths. `oracle/splitter.rs` remains, as this task allows: its deletion gate is
+the representative process journey
+(`peer_network::analytical::stage_graph_executes_representative_query_styles`),
+which Scenario 4 has not yet written. Scenarios 4–7 are untouched.

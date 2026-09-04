@@ -1,6 +1,6 @@
 ---
 id: SPEC-bifrost-distributed-analytics-engine
-revision: 5
+revision: 6
 status: approved
 ---
 
@@ -17,10 +17,12 @@ One authenticated raw-SQL query surface serves three primary workloads:
 - larger exploratory joins and aggregations run by data scientists; and
 - server-initiated drift, evaluation, and scheduled analytical queries.
 
-Oracle selects either the `Interactive` or `Analytical` execution path. Callers
-submit SQL and consume the same terminal-safe stream regardless of the selected
-path. The server owns routing, admission, distributed execution, tenant safety,
-audit, cancellation, and cleanup.
+Oracle plans every query once through the pinned `datafusion-distributed`
+planner. A normal DataFusion physical root selects the `Interactive` path; a
+`DistributedExec` root selects the `Analytical` path. Callers submit SQL and
+consume the same terminal-safe stream regardless of the selected path. The
+server owns admission, distributed execution, tenant safety, audit,
+cancellation, and cleanup.
 
 This revision replaces the remaining behavior in the original Task 1
 remediation and the proposed Task 2 and Task 3 with one KISS v1 outcome. Existing
@@ -56,19 +58,39 @@ Approval of Revision 5 would:
   specification governs analytical reads and explicitly excludes distributed
   writes, DML, and CTAS.
 
+## Revision 6 request and affected work
+
+Task 4 implementation and review proved that the approved pre-distribution
+operator predicate did not describe the physical plans produced by the pinned
+planner. The human approved replacing that two-gate design with one planning
+decision: a normal DataFusion root is Interactive and a `DistributedExec` root
+is Analytical.
+
+Revision 6:
+
+- keeps Interactive and Analytical as separate admission and terminal paths so
+  stage graphs cannot consume the protected Interactive capacity;
+- makes the pinned `datafusion-distributed` planner the only physical planner
+  and the returned root the only path-selection fact;
+- removes the Analytical candidate heuristic, Wyrd operator allowlist, second
+  physical build, and pre-selection fallback;
+- retires the custom peer-distributed Interactive planner and execution
+  protocol while preserving authenticated pinned-source reads; and
+- requires a small end-to-end operator-style matrix through the real stage
+  graph rather than an exhaustive compatibility matrix.
+
 ## Scope
 
 - Close the remaining GraphLease, distributed-query cleanup, physical-execution,
   and private-deployment gaps in the inactive Analytical engine.
 - Activate the Analytical path behind the existing production raw-SQL query
   surface.
-- Preserve Interactive as the default and protect it from Analytical resource
-  pressure.
-- Route supported exchange-requiring queries to Analytical without introducing
-  a second optimizer or a new exact-routing-facts subsystem.
-- Support and prove the v1 distributed operator baseline: filtered and projected
-  scans, fixed-width grouped aggregation, multi-input equi-join, streamed
-  exchange, and one real spilling DataFusion operator.
+- Preserve Interactive capacity for normal physical plans while protecting it
+  from Analytical stage-graph pressure.
+- Plan every query once through the pinned `datafusion-distributed` planner and
+  derive its path solely from the returned physical root.
+- Prove representative stage-graph query styles without creating a Wyrd
+  operator allowlist or promising exhaustive operator coverage.
 - Ship the same query request, stream, selected path, terminal evidence,
   cancellation, and structured errors through the shared Rust client,
   HTTP/gRPC, and MCP.
@@ -94,9 +116,9 @@ Approval of Revision 5 would:
 - Repeating the complete public journey at one, two, three, and six Oracle
   replicas. Evidence must use only the smallest topologies that prove local and
   real cross-process distributed behavior.
-- A new routing-facts engine, optimizer, scheduler, shuffle service, query-job
-  service, polling API, resource framework, registry, listener owner, or
-  analytical-only pod role.
+- A Wyrd operator allowlist, routing heuristic, routing-facts engine, second
+  optimizer, scheduler, shuffle service, query-job service, polling API,
+  resource framework, registry, listener owner, or analytical-only pod role.
 - Exact prediction of every dependency allocation or transient encoded-message
   byte.
 - Separate operator-memory and exchange-memory pools.
@@ -122,17 +144,12 @@ Approval of Revision 5 would:
 
 ## Definitions
 
-- **Interactive:** Oracle's default execution path for low-latency work and any
-  query for which a safe supported distributed plan is not selected.
-- **Analytical:** Oracle's streamed distributed execution path using the pinned
-  `datafusion-distributed` dependency and one or more authenticated Oracle
-  peers.
-- **Analytical candidate:** a query that Oracle's existing optimized-plan
-  classification identifies as potentially benefiting from distributed
-  execution. Candidate status is not final path selection.
-- **Analytical selection:** the irreversible point after Oracle has built and
-  validated a supported distributed physical plan containing a real network
-  exchange and has admitted the query for distributed execution.
+- **Interactive:** the admission and terminal path selected when the pinned
+  planner returns a normal DataFusion physical root.
+- **Analytical:** the admission and terminal path selected when the pinned
+  planner returns a `datafusion_distributed::DistributedExec` root.
+- **Analytical selection:** the irreversible interpretation of a returned
+  `DistributedExec` root before its graph resources are activated.
 - **GraphLease:** one follower-local ownership boundary connecting an admitted
   reservation to one exact distributed query graph for its complete lifetime.
 - **Query envelope:** the query-owned runtime, aggregate DataFusion memory
@@ -150,10 +167,6 @@ Approval of Revision 5 would:
 - **MCP tool result:** one bounded final `tools/call` result emitted only after
   the underlying Oracle stream reaches a validated terminal and all required
   query ownership settles. It is not an incremental row stream.
-- **Supported Analytical baseline:** filtered/projected scans, fixed-width
-  `COUNT`, `SUM`, `MIN`, and `MAX` grouping, multi-input equi-join, streamed
-  exchange, and a DataFusion operator capable of spilling through the admitted
-  query scratch allocation.
 
 ## Required behavior
 
@@ -171,16 +184,12 @@ tool result.
 
 ### REQ-002 — Simple server-owned routing
 
-Interactive shall remain the default. Oracle shall use its existing optimized
-plan classification and immutable pinned-query facts to identify an Analytical
-candidate; this change shall not add a second optimizer or require a new
-exact-routing-facts subsystem.
-
-An Analytical candidate shall become Analytical only when distributed physical
-planning succeeds, the plan is within the supported v1 baseline, and the plan
-contains a real network exchange. Before Analytical selection, unsupported
-shape, unavailable safe facts, distributed-planning failure, or absence of an
-exchange shall execute through Interactive when Interactive supports the query.
+Oracle shall authorize and pin the query, build one physical plan through the
+pinned `datafusion-distributed` planner, and derive both admission and terminal
+path from that returned root. A normal root is Interactive. A
+`DistributedExec` root is Analytical. Oracle shall not first classify a
+candidate, validate a Wyrd operator matrix, build a second physical plan, or
+reinterpret planning failure as an Interactive fallback.
 
 After Analytical selection, resource, peer, transport, protocol, deadline,
 cancellation, or execution failure shall fail the logical query terminally. It
@@ -188,14 +197,14 @@ shall not rerun through Interactive.
 
 ### REQ-003 — Useful v1 Analytical execution
 
-The production Analytical path shall correctly execute raw-SQL queries that
-exercise the supported Analytical baseline across distinct Oracle processes.
-The coordinator shall stream results without materializing a complete shuffle
-or collecting the complete user result in memory.
-
-Queries outside the proven baseline may remain Interactive. If neither path can
-execute a query safely, Oracle shall return a stable structured failure rather
-than claim broader Analytical compatibility.
+The production Analytical path shall execute whatever physical operators the
+pinned planner, registered codecs, and workers support end to end. Wyrd shall
+prove representative scan/filter/projection, grouped aggregation, join, and
+sort/limit stage graphs across distinct Oracle processes without maintaining an
+independent operator allowlist. The coordinator shall stream results without
+materializing a complete shuffle or collecting the complete user result in
+memory. Planning, codec, or worker incompatibility shall return a stable
+structured failure rather than silently rerun another plan.
 
 ### REQ-004 — Exact graph ownership
 
@@ -238,7 +247,7 @@ aggregate Oracle capacity root. Analytical work shall never consume the
 configured Interactive slot floor. Resource refusal shall not mutate another
 query's grant or silently weaken a query's limits.
 
-UI queries that qualify for Interactive shall remain serviceable while
+UI queries whose returned physical root selects Interactive shall remain serviceable while
 Analytical work occupies all capacity available to the Analytical path.
 
 ### REQ-007 — Cancellation, failure, and joined cleanup
@@ -377,9 +386,9 @@ or truncated payload. MCP progress notifications shall not carry result rows.
 
 ### INV-001 — Server authority
 
-Only Oracle selects the execution path and owns query admission, the immutable
-cut, audit, cancellation, and terminal settlement. DataFusion and clients are
-execution consumers, not policy authorities.
+Oracle derives the execution path only from the physical root returned by the
+pinned planner and owns query admission, the immutable cut, audit,
+cancellation, and terminal settlement. Clients provide no routing policy.
 
 ### INV-002 — Tenant and snapshot integrity
 
@@ -436,8 +445,8 @@ does not own or define it.
 ### Successful Interactive query
 
 1. A caller submits authenticated read-only SQL through a public query client.
-2. Oracle authorizes the tenant and columns, pins one immutable cut, and selects
-   Interactive.
+2. Oracle authorizes the tenant and columns, pins one immutable cut, and the
+   pinned planner returns a normal DataFusion physical root.
 3. Oracle admits the query without surrendering the protected Interactive floor
    to Analytical work.
 4. The caller receives incremental Arrow batches followed by one success
@@ -449,9 +458,8 @@ does not own or define it.
 
 1. A caller submits the same authenticated raw-SQL request; no path hint is
    supplied.
-2. Oracle authorizes the query, pins one immutable cut, classifies it as an
-   Analytical candidate, and builds a supported distributed physical plan with
-   a real network exchange.
+2. Oracle authorizes the query, pins one immutable cut, and the pinned planner
+   returns one `DistributedExec` physical root.
 3. Oracle admits one query envelope, freezes the participant cut, and reserves
    selected followers immediately before dispatch.
 4. Authenticated follower processes activate one exact GraphLease each and run
@@ -462,12 +470,11 @@ does not own or define it.
    graph/cache state, releases every participant lease and query resource, and
    emits one success terminal identifying `Analytical`.
 
-### Pre-selection fallback
+### Planning failure
 
-If Oracle cannot construct a supported distributed plan or the candidate has no
-real exchange, it may execute the query through Interactive before Analytical
-selection. The successful terminal identifies `Interactive`. The server shall
-not claim that an Analytical attempt ran.
+If the pinned planner cannot produce one executable physical root, Oracle shall
+return one structured failure. It shall not rebuild the query through a second
+planner or reinterpret the failure as Interactive.
 
 ### Post-selection failure
 
@@ -487,10 +494,10 @@ query ownership at baseline while Analytical capacity is occupied.
 
 ### Journey B — Data-scientist distributed query
 
-A real client submits raw SQL containing a supported multi-input join and
-fixed-width grouped aggregation over enough published data to require a network
-exchange. A coordinator Oracle sends physical work to at least one different
-Oracle process. The result equals a trusted Interactive/local result; physical
+A real client submits representative raw SQL containing a multi-input join and
+grouped aggregation over enough published data for the pinned planner to return
+`DistributedExec`. A coordinator Oracle sends physical work to at least one
+different Oracle process. The result equals a trusted expected result; physical
 evidence proves remote scan/pushdown, exchange, join/aggregation, one real
 operator spill write/read/cleanup, and zero retained ownership after the
 terminal.
@@ -498,7 +505,7 @@ terminal.
 ### Journey C — Internal scheduled analytical query
 
 A server-owned drift, evaluation, or scheduled-query caller uses the same query
-contract and server routing, receives an Analytical terminal for a supported
+contract and server routing, receives an Analytical terminal for a staged
 large/global operation, and gains no private path selector or lifecycle owner.
 Its cancellation or deadline stops the complete distributed graph and returns
 all ownership to baseline.
@@ -524,7 +531,7 @@ For the operational debugging flow, an authenticated agent lists tables,
 describes the relevant OTEL table, submits a bounded error-trace query, receives
 an `Interactive` terminal and complete bounded result, and answers on behalf of
 the verified principal. For the analytical flow, the agent lists and describes
-three relevant tables, constructs a supported multi-table join and fixed-width
+three relevant tables, constructs a multi-table join and fixed-width
 aggregation without a path hint, receives an `Analytical` terminal and complete
 bounded result, and can repair malformed or unsupported SQL from canonical
 structured feedback. Both flows prove cancellation and ceiling behavior, no
@@ -584,9 +591,9 @@ may substitute for physical runtime evidence.
 
 Real public-client journeys shall prove a representative UI query selects
 Interactive and a representative data-scientist and internal scheduled query
-select Analytical without caller hints. Unsupported/no-exchange distributed
-candidates shall fall back only before selection; an injected post-selection
-failure shall be terminal.
+select Analytical without caller hints. The evidence shall prove that normal
+and `DistributedExec` roots select their matching path from one physical build;
+planning and post-selection failures shall be terminal.
 
 ### AC-004 — Bounded resources and failure cleanup
 
@@ -651,13 +658,13 @@ and zero retained Oracle ownership before the final MCP result or error returns.
 
 ## Open material decisions
 
-None in this draft. Approval would explicitly choose:
+None. The approved revisions explicitly choose:
 
 - no public distributed `EXPLAIN` requirement for this v1 change;
 - no automatic distributed-query retry;
 - representative rather than exhaustive operator and replica-count coverage;
-- reuse of existing optimized-plan classification plus real-exchange validation
-  instead of a specialized routing-facts subsystem; and
+- one pinned physical planner and root-derived path selection instead of a
+  routing heuristic, operator allowlist, or second physical build; and
 - practical aggregate resource containment without a dependency fork or exact
   dependency-internal message/queue proof; and
 - Rust plus MCP as the shipping client surfaces for this change, with Python
@@ -679,9 +686,11 @@ After approval, `$wyrd-plan` must decide only implementation-level details:
 
 - the smallest existing owner and atomic boundary for GraphLease activation,
   duplicate waiting/reuse, rollback, joined cleanup, and shutdown inspection;
-- the exact existing classification inputs and conservative thresholds reused
-  for Analytical candidacy without creating a new routing subsystem;
-- the exact supported physical-plan checks for the required operator baseline;
+- the exact pre-admission planning owner that retains one returned physical root
+  for path-specific admission and execution without rebuilding it;
+- the exact existing custom Interactive splitter, dispatcher, remote operator,
+  and test seams retired after their pinned-source behavior is preserved by the
+  single planner path;
 - the smallest topology proving one-Oracle Interactive behavior and real
   cross-process Analytical behavior, including whether the latter needs two or
   three Oracle replicas;
@@ -707,21 +716,21 @@ After approval, `$wyrd-plan` must decide only implementation-level details:
 - the focused `mise` commands and journey topology that prove AC-001 through
   AC-008 without repeating the full physical matrix in every client runtime.
 
-## Authority reconciliation required on approval
+## Authority reconciliation
 
-This draft intentionally narrows behavior currently stated more broadly in
-`architecture/bifrost-design.md` and the focused Bifrost references. Approval
-requires the owning architecture to be reconciled before implementation tasks
-are declared ready:
+The owning architecture was reconciled with approved revision 6 before its
+remediation task was proposed:
 
 - make public distributed `EXPLAIN` deferred rather than required for this v1
   delivery;
 - remove the mandatory transparent pre-egress retry and define peer loss as a
   terminal query failure;
-- describe the representative supported Analytical baseline without promising
-  the full window/subquery/deduplicating-set operator family;
-- permit reuse of the existing conservative classification and real-exchange
-  validation without requiring a new exact routing-facts subsystem; and
+- replace the Wyrd Analytical operator baseline with representative integrated
+  evidence for whatever the pinned planner and codecs execute;
+- define normal-root Interactive and `DistributedExec`-root Analytical
+  selection from one physical build, with no candidate heuristic or fallback;
+- retire the custom peer-distributed Interactive planner while preserving
+  authenticated pinned-source reads and protected Interactive capacity; and
 - preserve the already reconciled single aggregate query pool, practical Wyrd-
   owned bounds, dependency byte-backpressure boundary, and no-fork decision.
 
@@ -752,6 +761,12 @@ security behavior changes.
   reuses Wyrd authentication, and bounded table-discovery plus Interactive and
   Analytical agent read journeys. Task 4 remains unchanged and completes before
   either MCP task.
+- Revision 6 (`approved`, 2026-09-03): the human explicitly approved one pinned
+  physical-planning pipeline: normal roots are Interactive and
+  `DistributedExec` roots are Analytical. Removed the candidate heuristic,
+  Analytical operator allowlist, second physical build, and pre-selection
+  fallback while preserving separate admission capacity and representative
+  end-to-end stage-graph evidence.
 
 ## Material authority
 

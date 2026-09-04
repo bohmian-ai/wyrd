@@ -191,6 +191,12 @@ pub enum ControlRequest {
     MetricTotals {
         /// Prometheus family names to total.
         families: Vec<String>,
+        /// Labels every counted sample must carry, empty to total the family.
+        ///
+        /// A family whose outcome is a label — an attempt total, an admission
+        /// total — cannot answer "how many failed" from its sum alone, so the
+        /// filter is part of the read rather than a second control request.
+        labels: BTreeMap<String, String>,
     },
     /// Register one Bifrost table through this child's own catalog.
     RegisterTable {
@@ -1144,8 +1150,22 @@ impl ProcessNode {
         &mut self,
         families: &[&str],
     ) -> Result<BTreeMap<String, f64>, ProcessClusterError> {
+        self.metric_totals_labeled(families, &BTreeMap::new())
+    }
+
+    /// Totals each named family over the samples carrying every given label.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::metric_totals`].
+    pub fn metric_totals_labeled(
+        &mut self,
+        families: &[&str],
+        labels: &BTreeMap<String, String>,
+    ) -> Result<BTreeMap<String, f64>, ProcessClusterError> {
         match self.request(&ControlRequest::MetricTotals {
             families: families.iter().map(|name| (*name).to_owned()).collect(),
+            labels: labels.clone(),
         })? {
             ControlResponse::MetricTotals { totals } => Ok(totals),
             ControlResponse::Failed { detail } => Err(ProcessClusterError::Child(detail)),

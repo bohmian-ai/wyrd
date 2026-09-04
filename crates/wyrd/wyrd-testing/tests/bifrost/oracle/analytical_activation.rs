@@ -1088,20 +1088,49 @@ async fn prove_selected_failure_is_terminal() -> Result<(), JourneyError> {
     );
     let paused = PEER_FOLLOWERS[0];
     let survivor = PEER_FOLLOWERS[1];
+    let attempts_before = attempt_totals(&mut cluster)?;
     cluster.nodes_mut()[paused].arm_execute_pause()?;
     let client = public_client(&cluster.nodes()[COORDINATOR], &api_key)?;
     let query = {
         let client = public_client(&cluster.nodes()[COORDINATOR], &api_key)?;
         let sql = sql.clone();
-        tokio::spawn(async move { run_public(&client, &sql).await })
+        // Driven here rather than through `run_public` because the claim is
+        // about the failure itself: the caller must receive one structured
+        // Wyrd error, not an anonymous transport break or a truncated success.
+        tokio::spawn(async move {
+            let mut stream = QueryClient::new(&client).query(&request(&sql)).await?;
+            let mut rows = 0_usize;
+            while let Some(batch) = stream.next_batch().await? {
+                rows += batch.num_rows();
+            }
+            Ok::<usize, vala_sdk::ValaSdkError>(rows)
+        })
     };
     cluster.nodes_mut()[paused].await_execute_paused()?;
     cluster.nodes_mut()[paused].kill()?;
 
-    if let Ok(settled) = query.await? {
+    let failure = match query.await? {
+        Ok(rows) => {
+            return Err(
+                format!("a lost peer must not produce a successful result of {rows} rows").into(),
+            );
+        }
+        Err(failure) => failure,
+    };
+    if is_transport(&failure) || !failure.code().starts_with("WYRD_") {
+        return Err(format!("the lost peer surfaced {failure} as {}", failure.code()).into());
+    }
+
+    // One attempt, terminally failed. A repin, a replan, or any local
+    // successor would raise the total past one, and a cancellation or a
+    // success would land the one attempt on another outcome entirely.
+    let attempts = attempt_totals(&mut cluster)?;
+    let started = attempts.total - attempts_before.total;
+    let succeeded = attempts.succeeded - attempts_before.succeeded;
+    if started != 1.0 || succeeded != 0.0 {
         return Err(format!(
-            "a lost peer must not produce a successful {:?} result of {} rows",
-            settled.path, settled.rows
+            "the lost peer settled {started} attempts of which {succeeded} succeeded, \
+             not exactly one unsuccessful attempt"
         )
         .into());
     }
@@ -1156,6 +1185,41 @@ async fn prove_selected_failure_is_terminal() -> Result<(), JourneyError> {
         Err(reported) => Err(format!("shutdown reported {reported}, not {killed}").into()),
         Ok(()) => Err(format!("shutdown did not report the killed pod {killed}").into()),
     }
+}
+
+/// Analytical attempt totals one coordinator has recorded.
+struct AttemptTotals {
+    /// Attempts settled on every outcome.
+    total: f64,
+    /// Attempts settled on the successful outcome alone.
+    succeeded: f64,
+}
+
+/// Reads the coordinator's own Analytical attempt counters.
+///
+/// The counter is the production family a build increments once per attempt,
+/// so a differenced pair of these reads is what makes "one build, and it did
+/// not succeed" an observation rather than an inference from the absence of
+/// rows. A lost peer settles its one attempt as cancelled rather than failed —
+/// the leader cancels the graph — so the successful outcome is the one the
+/// claim excludes.
+///
+/// # Errors
+///
+/// Returns the control-protocol error unchanged.
+fn attempt_totals(
+    cluster: &mut wyrd_testing::bifrost::process_cluster::BifrostProcessCluster,
+) -> Result<AttemptTotals, JourneyError> {
+    let family = "bifrost_oracle_analytical_attempts_total";
+    let total = cluster.nodes_mut()[COORDINATOR].metric_totals(&[family])?;
+    let succeeded = cluster.nodes_mut()[COORDINATOR].metric_totals_labeled(
+        &[family],
+        &std::collections::BTreeMap::from([("outcome".to_owned(), "success".to_owned())]),
+    )?;
+    Ok(AttemptTotals {
+        total: total.get(family).copied().unwrap_or_default(),
+        succeeded: succeeded.get(family).copied().unwrap_or_default(),
+    })
 }
 
 /// Waits, bounded, until one pod has released every graph lease it activated.

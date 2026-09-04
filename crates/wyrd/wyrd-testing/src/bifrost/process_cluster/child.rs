@@ -190,8 +190,8 @@ async fn serve() -> Result<(), ProcessClusterError> {
                     detail: error.to_string(),
                 })?,
             },
-            ControlRequest::MetricTotals { families } => {
-                match metric_totals(&telemetry, &families) {
+            ControlRequest::MetricTotals { families, labels } => {
+                match metric_totals(&telemetry, &families, &labels) {
                     Ok(totals) => emit(&ControlResponse::MetricTotals { totals })?,
                     Err(error) => emit(&ControlResponse::Failed {
                         detail: error.to_string(),
@@ -1072,6 +1072,7 @@ fn scratch_usage(root: &std::path::Path) -> Result<super::ScratchUsage, ProcessC
 fn metric_totals(
     telemetry: &crate::bifrost::BifrostTelemetryCapture,
     families: &[String],
+    labels: &std::collections::BTreeMap<String, String>,
 ) -> Result<std::collections::BTreeMap<String, f64>, ProcessClusterError> {
     let samples = telemetry
         .snapshot()
@@ -1081,6 +1082,12 @@ fn metric_totals(
         .map(|family| (family.clone(), 0.0))
         .collect();
     for sample in samples {
+        let matches_labels = labels
+            .iter()
+            .all(|(name, value)| sample.labels.get(name) == Some(value));
+        if !matches_labels {
+            continue;
+        }
         if let Some(total) = totals.get_mut(&sample.family) {
             *total += sample.value;
         }
@@ -1529,6 +1536,7 @@ fn ownership_snapshot(
             "bifrost_oracle_analytical_exchanges_active".to_owned(),
             "oracle_fragments_active".to_owned(),
         ],
+        &std::collections::BTreeMap::new(),
     )?;
     let gauge = |family: &str| gauges.get(family).copied().unwrap_or_default();
     Ok(super::OracleOwnershipSnapshot {

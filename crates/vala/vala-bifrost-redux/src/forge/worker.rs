@@ -41,15 +41,11 @@ use wyrd_spec::vala::api::{
 };
 
 use super::compact::ForgeGroupKey;
-use super::error::{ForgeCapacityFailurePhase, ForgeError, ForgeFailureClass};
+use super::error::{ForgeError, ForgeFailureClass};
 use super::expire::ExpiryTaskAuthority;
 use super::identity::task_table_binding;
 use super::lease::{ForgeLease, forge_lease_key};
-use super::metrics::{
-    ForgeAttemptResource, ForgeCapacityRefusalPhase, ForgeCleanupKind, ForgeConflictKind,
-    ForgeDemandTransitionResult, ForgeLeaseResult, ForgeLifecycleOutcome, ForgeLifecycleStage,
-    ForgeMetricStage, ForgeProgressEffect, ForgeTaskMetricStrategy, ForgeTaskTerminalResult,
-};
+use super::metrics::ForgeTaskResult;
 use super::orphan_gc::{ExpiredCleanupExemption, GcEligibility, ObjectEvidence};
 use super::path::catalog_path_to_object_key;
 use super::scribe_promotion::{
@@ -1168,7 +1164,7 @@ struct ClaimExecutionOutcome<'task> {
     /// Exact claim attempt identity.
     attempt: Uuid,
     /// Closed metric stage derived from the validated payload.
-    stage: ForgeMetricStage,
+    stage: ForgeExecutionStage,
     /// Table fence held through settlement.
     lease: ForgeLease,
     /// Task span receiving the terminal result.
@@ -1274,7 +1270,6 @@ impl ForgeWorker {
                 .quarantine_worker(self.owner, volume.as_str())
                 .await
                 .map_err(ForgeError::Sql)?;
-            self.forge.core.telemetry.record_quarantine_state(true);
             tracing::error!(worker=%self.owner, error=%error, "Forge worker quarantined by startup scratch probe");
             return Ok(());
         }
@@ -1290,7 +1285,6 @@ impl ForgeWorker {
             .register_healthy_worker(self.owner, volume.as_str())
             .await
             .map_err(ForgeError::Sql)?;
-        self.forge.core.telemetry.record_quarantine_state(false);
         tracing::info!(
             worker = %self.owner,
             volume = volume.as_str(),
@@ -1721,13 +1715,7 @@ impl ForgeWorker {
             // cancellation, or unwind — balances the increment exactly once.
             let _active =
                 metric_strategy.map(|metric| self.forge.core.telemetry.active_task(metric));
-            self.record_lifecycle(metric_strategy, ForgeLifecycleStage::Claimed, true);
             let result = self.execute_claim(claim, &shutdown).await;
-            self.record_lifecycle(
-                metric_strategy,
-                ForgeLifecycleStage::Settled,
-                result.is_ok(),
-            );
             tracing::info!(
                 worker = %self.owner,
                 task_id = %task_id,
@@ -1804,34 +1792,14 @@ impl ForgeWorker {
         Ok(true)
     }
 
-    /// Maps one claimed strategy onto its closed metric label, if it has one.
+    /// Maps one claimed strategy onto its durable work type, if this build knows it.
     ///
-    /// A strategy this build does not know has no label, so it is observed by
-    /// the durable task row and the refusal path rather than by a metric.
-    fn metric_strategy(strategy: &ForgeClaimStrategy) -> Option<ForgeTaskMetricStrategy> {
+    /// A strategy this build does not know has no `task_type`, so it is
+    /// observed by the durable task row and the refusal path, not by a metric.
+    fn metric_strategy(strategy: &ForgeClaimStrategy) -> Option<ForgeTaskStrategy> {
         match strategy {
-            ForgeClaimStrategy::Known(known) => ForgeTaskMetricStrategy::try_from(*known).ok(),
+            ForgeClaimStrategy::Known(known) => Some(*known),
             ForgeClaimStrategy::Unknown(_) => None,
-        }
-    }
-
-    /// Records one durable lifecycle transition for a labelled strategy.
-    fn record_lifecycle(
-        &self,
-        strategy: Option<ForgeTaskMetricStrategy>,
-        stage: ForgeLifecycleStage,
-        succeeded: bool,
-    ) {
-        if let Some(strategy) = strategy {
-            self.forge.core.telemetry.record_lifecycle_event(
-                strategy,
-                stage,
-                if succeeded {
-                    ForgeLifecycleOutcome::Ok
-                } else {
-                    ForgeLifecycleOutcome::Error
-                },
-            );
         }
     }
 
@@ -2282,10 +2250,6 @@ impl ForgeWorker {
         }
         if task.estimates.envelope.is_none() {
             let result = self.cancel_superseded(task).await;
-            self.forge
-                .core
-                .telemetry
-                .record_legacy_supersession(result.is_ok());
             // Superseding a legacy envelope settles the row without running the
             // requested effect, so it never counts as a successful completion.
             return result.map(|()| false);
@@ -2318,23 +2282,12 @@ impl ForgeWorker {
         )
         .await?
         else {
-            self.forge
-                .core
-                .telemetry
-                .record_lease(ForgeLeaseResult::Contention);
-            self.forge
-                .core
-                .telemetry
-                .record_conflict(ForgeConflictKind::LeaseContention);
             return Err(ForgeError::FenceLost {
                 lease_key: format!("forge:table:{}:{}", task.data_tenant_id, binding.table_ref),
             });
         };
         if lease.takeover() {
-            self.forge
-                .core
-                .telemetry
-                .record_lease(ForgeLeaseResult::Takeover);
+            tracing::info!(task_id = %task.task_id, "Forge worker took over an expired table fence");
         }
         let started = Instant::now();
         let task_span = tracing::info_span!(
@@ -2414,20 +2367,13 @@ impl ForgeWorker {
         }
         self.record_task_execution_telemetry(task, &task_span, elapsed)
             .await;
-        self.forge
-            .core
-            .telemetry
-            .record_stage(stage, elapsed, result.is_err());
-        if matches!(result, Err(ForgeError::FenceLost { .. })) {
-            self.forge
-                .core
-                .telemetry
-                .record_lease(ForgeLeaseResult::FenceLost);
-            self.forge
-                .core
-                .telemetry
-                .record_conflict(ForgeConflictKind::FenceLost);
-        }
+        tracing::debug!(
+            task_id = %task.task_id,
+            stage = ?stage,
+            elapsed_seconds = elapsed.as_secs_f64(),
+            failed = result.is_err(),
+            "Forge task execution stage returned"
+        );
         if let Err(error) = self.release_table_lease(&mut lease).await {
             tracing::warn!(task_id = %task.task_id, error = %error, "Forge table lease release failed");
             // A retained table fence would let this owner's next claim run
@@ -2448,46 +2394,45 @@ impl ForgeWorker {
         Ok(result.unwrap_or(false))
     }
 
-    /// Records the task-duration observation from the durable task lifecycle state.
+    /// Records one completed ownership episode from the durable task row.
     ///
-    /// The worker never infers a terminal metric result from the Rust return
-    /// value: successful execution can durably cancel a superseded task, and
-    /// an error can leave the task retryable. Nonterminal states intentionally
-    /// produce no terminal duration observation.
+    /// The worker never infers the result from the Rust return value:
+    /// successful execution can durably cancel a superseded task, and an error
+    /// can leave the task retryable. The durable `(state, failure_class)` pair
+    /// is the authority, and a nonterminal or unread state emits nothing.
     async fn record_task_execution_telemetry(
         &self,
         task: &ForgeTaskClaim,
         span: &tracing::Span,
         elapsed: Duration,
     ) {
-        let Ok(Some(task_result)) = self.durable_task_metric_result(task).await else {
+        let Ok(Some(observation)) = self.durable_task_observation(task).await else {
             return;
         };
-        span.record("result", task_result.as_str());
-        let strategy = match task.strategy {
-            ForgeClaimStrategy::Known(strategy) => ForgeTaskMetricStrategy::try_from(strategy)
-                .expect("invariant: validated Forge execution strategy has a task metric label"),
-            ForgeClaimStrategy::Unknown(_) => {
-                unreachable!("invariant: unknown Forge strategy is rejected before execution")
-            }
+        let Some(result) = durable_task_result(observation) else {
+            return;
+        };
+        span.record("result", result.as_str());
+        let Some(task_type) = Self::metric_strategy(&task.strategy) else {
+            return;
         };
         self.forge
             .core
             .telemetry
-            .record_task_terminal(strategy, task_result, elapsed);
+            .record_task_attempt(task_type, result, elapsed);
     }
 
-    /// Reads the authoritative post-attempt state and maps it into telemetry.
+    /// Reads the authoritative post-attempt state and durable failure class.
     ///
     /// # Errors
     ///
     /// Returns tenant-connection, SQL, or durable-state parsing errors. The
     /// caller treats an observation failure as diagnostic-only because the
     /// underlying task transition has already committed independently.
-    async fn durable_task_metric_result(
+    async fn durable_task_observation(
         &self,
         task: &ForgeTaskClaim,
-    ) -> Result<Option<ForgeTaskTerminalResult>, ForgeError> {
+    ) -> Result<Option<(ForgeTaskState, Option<ForgeFailureClass>)>, ForgeError> {
         let mut conn = self
             .forge
             .core
@@ -2495,8 +2440,8 @@ impl ForgeWorker {
             .tenant_conn(task.data_tenant_id)
             .await
             .map_err(ForgeError::Sql)?;
-        let state: Option<String> = sqlx::query_scalar(
-            "SELECT state FROM vala.forge_tasks WHERE task_id = $1 AND data_tenant_id = $2",
+        let row: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT state, failure_class FROM vala.forge_tasks WHERE task_id = $1 AND data_tenant_id = $2",
         )
         .bind(task.task_id)
         .bind(task.data_tenant_id.as_uuid())
@@ -2504,11 +2449,15 @@ impl ForgeWorker {
         .await
         .map_err(vala_sql::SqlError::from)
         .map_err(ForgeError::Sql)?;
-        let Some(state) = state else {
+        let Some((state, failure_class)) = row else {
             return Ok(None);
         };
         let state = ForgeTaskState::from_str(&state).map_err(ForgeError::Sql)?;
-        Ok(ForgeTaskTerminalResult::try_from(state).ok())
+        let failure_class = failure_class
+            .map(|class| ForgeFailureClass::from_sql(&class))
+            .transpose()
+            .map_err(ForgeError::Sql)?;
+        Ok(Some((state, failure_class)))
     }
 
     /// Reconciles one taken-over Prepared attempt from its exact stored evidence.
@@ -2763,7 +2712,7 @@ impl ForgeWorker {
     /// Returns an invariant error for an unknown or reserved strategy,
     /// malformed parameters, or an empty exact input set, and the SQL refusal
     /// of a cleanup plan whose candidates do not all belong to the task table.
-    fn validate_payload_contract(task: &ForgeTaskClaim) -> Result<ForgeMetricStage, ForgeError> {
+    fn validate_payload_contract(task: &ForgeTaskClaim) -> Result<ForgeExecutionStage, ForgeError> {
         // Expired cleanup is the one strategy whose exact work is its
         // parameters rather than its inputs: it deletes objects no snapshot
         // reaches, so an input file set would be meaningless and an empty one
@@ -2789,7 +2738,7 @@ impl ForgeWorker {
                 .expired_cleanup_payload(ForgeTaskStrategy::ExpiredCleanup, true)
                 .and_then(|payload| payload.validate_for_table(&task.table_ref))
                 .map_err(ForgeError::Sql)?;
-            return Ok(ForgeMetricStage::ExpiredCleanup);
+            return Ok(ForgeExecutionStage::ExpiredCleanup);
         }
         if matches!(
             task.strategy,
@@ -2805,19 +2754,19 @@ impl ForgeWorker {
             task.plan
                 .orphan_cleanup_prefix(true)
                 .map_err(ForgeError::Sql)?;
-            return Ok(ForgeMetricStage::OrphanGc);
+            return Ok(ForgeExecutionStage::OrphanGc);
         }
         let (expected_kind, stage) = match &task.strategy {
             ForgeClaimStrategy::Known(ForgeTaskStrategy::ScribePromotion) => (
                 super::scribe_promotion::SCRIBE_PROMOTION_PARAMETER_KIND,
-                ForgeMetricStage::ScribePromotion,
+                ForgeExecutionStage::ScribePromotion,
             ),
             ForgeClaimStrategy::Known(ForgeTaskStrategy::SmallFiles) => (
                 LIVE_REWRITE_PARAMETER_KIND,
-                ForgeMetricStage::IcebergRewrite,
+                ForgeExecutionStage::IcebergRewrite,
             ),
             ForgeClaimStrategy::Known(ForgeTaskStrategy::SnapshotExpiry) => {
-                ("maintenance", ForgeMetricStage::SnapshotExpiry)
+                ("maintenance", ForgeExecutionStage::SnapshotExpiry)
             }
             ForgeClaimStrategy::Known(
                 ForgeTaskStrategy::ExpiredCleanup | ForgeTaskStrategy::OrphanCleanup,
@@ -2873,7 +2822,7 @@ impl ForgeWorker {
     /// Returns every [`Self::validate_payload_contract`] invariant, and an
     /// invariant error for a strategy this implementation phase has not
     /// activated.
-    fn validate_payload(task: &ForgeTaskClaim) -> Result<ForgeMetricStage, ForgeError> {
+    fn validate_payload(task: &ForgeTaskClaim) -> Result<ForgeExecutionStage, ForgeError> {
         let stage = Self::validate_payload_contract(task)?;
         if !matches!(
             task.strategy,
@@ -2949,7 +2898,6 @@ impl ForgeWorker {
             &self.forge.core.rewrite_spill_root,
             claim.task_id,
             attempt,
-            Arc::clone(&self.forge.core.telemetry),
         )
     }
 
@@ -3051,10 +2999,6 @@ impl ForgeWorker {
             && committed_recovery.is_none()
             && !Self::tolerates_base_drift(&claim.strategy)
         {
-            self.forge
-                .core
-                .telemetry
-                .record_conflict(ForgeConflictKind::SnapshotChanged);
             self.cancel_superseded(claim).await?;
             // The requested effect never ran, so this is a healthy exit that
             // recorded no successful completion.
@@ -4817,16 +4761,12 @@ impl ForgeWorker {
             )
             .await;
         let elapsed = started.elapsed();
-        self.forge.core.telemetry.record_stage(
-            ForgeMetricStage::OrphanGc,
-            elapsed,
-            result.is_err(),
-        );
         let outcome = result?;
-        self.forge
-            .core
-            .telemetry
-            .record_orphan_gc(&outcome, elapsed);
+        tracing::debug!(
+            task_id = %claim.task_id,
+            elapsed_seconds = elapsed.as_secs_f64(),
+            "Forge orphan collection scan returned"
+        );
         let authority = ForgeExpirationAuthority {
             task_id: claim.task_id,
             attempt_id: attempt,
@@ -5143,7 +5083,18 @@ impl ForgeWorker {
             () = stop.cancelled() => return Ok(ExpiredCleanupOutcome::Uncertain),
         };
         match deletion {
-            Ok(()) => Ok(ExpiredCleanupOutcome::Deleted),
+            Ok(()) => {
+                // Counted at the delete boundary, after the fresh `Present`
+                // proof, `Eligible` classification, and fence renewal that
+                // `prove_cleanup_candidate` performed. Candidate settlement can
+                // still fail; recovery then observes the object already absent
+                // and adds nothing, so this object is counted exactly once.
+                self.forge
+                    .core
+                    .telemetry
+                    .record_deleted_objects(ForgeTaskStrategy::ExpiredCleanup, 1);
+                Ok(ExpiredCleanupOutcome::Deleted)
+            }
             Err(error) if error.kind() == opendal::ErrorKind::NotFound => {
                 Ok(ExpiredCleanupOutcome::Missing)
             }
@@ -5159,12 +5110,12 @@ impl ForgeWorker {
         }
     }
 
-    /// Record the completed durable expired-cleanup obligation at its owner boundary.
+    /// Reports the completed durable expired-cleanup obligation at its owner boundary.
     fn record_expired_cleanup_completion(&self, started: Instant) {
-        self.forge
-            .core
-            .telemetry
-            .record_cleanup(ForgeCleanupKind::Expired, started.elapsed());
+        tracing::debug!(
+            elapsed_seconds = started.elapsed().as_secs_f64(),
+            "Forge expired cleanup obligation completed"
+        );
     }
 
     /// Resumes one taken-over expired-cleanup task from its durable frontier.
@@ -5576,16 +5527,9 @@ impl ForgeWorker {
             .map_err(ForgeError::Sql)?;
         lease.assert_transaction_fence(&mut terminal).await?;
         terminal.commit().await.map_err(ForgeError::Sql)?;
-        self.forge
-            .core
-            .telemetry
-            .record_demand_transition(ForgeDemandTransitionResult::Continued);
-        self.forge.core.telemetry.record_progress_effect(
-            if matches!(progress_effect, TaskProgressEffect::Progressed) {
-                ForgeProgressEffect::Changed
-            } else {
-                ForgeProgressEffect::AcknowledgedNoop
-            },
+        tracing::debug!(
+            progressed = matches!(progress_effect, TaskProgressEffect::Progressed),
+            "Forge task settled its durable progress effect"
         );
         Ok(())
     }
@@ -5633,16 +5577,9 @@ impl ForgeWorker {
             .map_err(ForgeError::Sql)?;
         lease.assert_transaction_fence(&mut terminal).await?;
         terminal.commit().await.map_err(ForgeError::Sql)?;
-        self.forge
-            .core
-            .telemetry
-            .record_demand_transition(ForgeDemandTransitionResult::Continued);
-        self.forge.core.telemetry.record_progress_effect(
-            if matches!(progress_effect, TaskProgressEffect::Progressed) {
-                ForgeProgressEffect::Changed
-            } else {
-                ForgeProgressEffect::AcknowledgedNoop
-            },
+        tracing::debug!(
+            progressed = matches!(progress_effect, TaskProgressEffect::Progressed),
+            "Forge task settled its durable progress effect"
         );
         Ok(())
     }
@@ -5698,36 +5635,18 @@ impl ForgeWorker {
             ForgeError::Shutdown => self.release_cancelled_claim(claim.task_id, attempt).await,
             ForgeError::Capacity { .. } => {
                 self.record_capacity_refusal(claim.task_id, attempt).await?;
-                self.forge
-                    .core
-                    .telemetry
-                    .record_capacity_refusal(ForgeCapacityRefusalPhase::Admission);
+                self.record_settled_failure(claim, ForgeFailureClass::CapacityRefused);
                 Ok(())
             }
             ForgeError::ShutdownRetained => Ok(()),
             _ => {
                 let class = error.failure_class();
-                self.forge.core.telemetry.record_failure_class(class);
-                let execution_envelope_resource = if error.capacity_failure_phase()
-                    == Some(ForgeCapacityFailurePhase::Execution)
-                {
-                    Some(match error {
-                        ForgeError::ExecutionEnvelopeExceeded {
-                            resource: "scratch",
-                            ..
-                        } => ForgeAttemptResource::Scratch,
-                        _ => ForgeAttemptResource::Memory,
-                    })
-                } else {
-                    None
-                };
                 let volume = if class == ForgeFailureClass::StorageHealth {
                     let volume = self.scratch_volume_identity()?;
                     self.tasks
                         .quarantine_worker(self.owner, volume.as_str())
                         .await
                         .map_err(ForgeError::Sql)?;
-                    self.forge.core.telemetry.record_quarantine_state(true);
                     Some(volume)
                 } else {
                     None
@@ -5746,7 +5665,6 @@ impl ForgeWorker {
                         error.to_string(),
                     )
                     .await?;
-                    self.forge.core.telemetry.record_terminal_poison(class);
                 } else {
                     self.tasks
                         .retry_failure(
@@ -5759,20 +5677,27 @@ impl ForgeWorker {
                         .await
                         .map(|_| ())
                         .map_err(ForgeError::Sql)?;
-                    self.forge.core.telemetry.record_retry(class);
                 }
-                if let Some(resource) = execution_envelope_resource {
-                    self.forge
-                        .core
-                        .telemetry
-                        .record_capacity_refusal(ForgeCapacityRefusalPhase::Execution);
-                    self.forge
-                        .core
-                        .telemetry
-                        .record_execution_envelope_failure(resource);
-                }
+                // Emitted after the retry or terminal transaction commits, so
+                // the counter never claims a failure the durable row does not
+                // hold, and exactly once per settled attempt.
+                self.record_settled_failure(claim, class);
                 Ok(())
             }
+        }
+    }
+
+    /// Counts one settled durable failure under its exact class.
+    ///
+    /// Called only after the corresponding retry, refusal, or terminal-failure
+    /// transaction commits. A claim whose strategy this build does not know
+    /// carries no `task_type`, so it is observed by the durable row instead.
+    fn record_settled_failure(&self, claim: &ForgeTaskClaim, class: ForgeFailureClass) {
+        if let Some(task_type) = Self::metric_strategy(&claim.strategy) {
+            self.forge
+                .core
+                .telemetry
+                .record_task_failure(task_type, class);
         }
     }
 
@@ -6497,4 +6422,61 @@ mod tests {
             .expect("completion waiter task joins");
         assert_eq!(observer.completed(), 1);
     }
+}
+
+/// Maps one durable `(state, failure_class)` pair onto its public result.
+///
+/// `Prepared` is the uncertainty handoff: work was externally accepted and its
+/// evidence is retained for recovery. A refusal is separated from an ordinary
+/// retry or terminal failure by the durable class, because an operator paging
+/// on failures needs capacity and data refusals to read differently. States a
+/// worker never settles into produce no observation at all.
+fn durable_task_result(
+    observation: (ForgeTaskState, Option<ForgeFailureClass>),
+) -> Option<ForgeTaskResult> {
+    let (state, class) = observation;
+    match state {
+        ForgeTaskState::Succeeded => Some(ForgeTaskResult::Succeeded),
+        ForgeTaskState::Cancelled => Some(ForgeTaskResult::Cancelled),
+        ForgeTaskState::Prepared => Some(ForgeTaskResult::Uncertain),
+        ForgeTaskState::Retryable => Some(match class {
+            Some(ForgeFailureClass::CapacityRefused) => ForgeTaskResult::Refused,
+            _ => ForgeTaskResult::Retry,
+        }),
+        ForgeTaskState::Failed => Some(match class {
+            Some(ForgeFailureClass::DataRefusal | ForgeFailureClass::CapacityRefused) => {
+                ForgeTaskResult::Refused
+            }
+            _ => ForgeTaskResult::Failed,
+        }),
+        ForgeTaskState::Ready
+        | ForgeTaskState::Claimed
+        | ForgeTaskState::Running
+        | ForgeTaskState::Unschedulable => None,
+    }
+}
+
+/// Closed execution-stage inventory one validated Forge payload routes to.
+///
+/// The stage names which owner runs the claim and appears in that attempt's
+/// structured trace. It is protocol detail, not a public metric label: the
+/// public catalog partitions work by durable `task_type` instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ForgeExecutionStage {
+    /// Promote already-published Scribe hot objects into the table unchanged.
+    ScribePromotion,
+    /// Reconcile staging audit operations.
+    ReconcileStaging,
+    /// Reconcile current-snapshot replacement operations.
+    ReconcileIceberg,
+    /// Discover current-snapshot rewrite groups.
+    ManifestDiscovery,
+    /// Replace one current-snapshot group.
+    IcebergRewrite,
+    /// Reconcile and expire old snapshots.
+    SnapshotExpiry,
+    /// Delete the exact objects one committed expiration made unreachable.
+    ExpiredCleanup,
+    /// Reconcile and remove proven orphan objects.
+    OrphanGc,
 }

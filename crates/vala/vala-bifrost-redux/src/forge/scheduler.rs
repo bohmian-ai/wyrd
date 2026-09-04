@@ -12,7 +12,6 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::error::ForgeError;
-use super::metrics::{ForgeHintPersistenceResult, ForgeLeaseResult};
 use super::{Forge, ForgeScheduler};
 use crate::maintenance::StagingFileCommitted;
 
@@ -208,15 +207,11 @@ impl Forge {
         );
         let result =
             tracing::Instrument::instrument(scheduler.record_hint(hint), span.clone()).await;
-        let outcome = if result.is_ok() {
-            ForgeHintPersistenceResult::Succeeded
-        } else {
-            ForgeHintPersistenceResult::Failed
-        };
-        span.record("result", outcome.as_str());
-        self.core
-            .telemetry
-            .record_hint_persistence(outcome, started.elapsed());
+        span.record("result", if result.is_ok() { "succeeded" } else { "failed" });
+        tracing::debug!(
+            elapsed_seconds = started.elapsed().as_secs_f64(),
+            "Forge maintenance hint persistence completed"
+        );
         result
     }
 
@@ -257,9 +252,6 @@ impl Forge {
                         "succeeded"
                     },
                 );
-                self.core
-                    .telemetry
-                    .record_scheduler_pass(&outcome, started.elapsed());
                 // Readiness is authority, not liveness: only a pass that held
                 // the fence and acknowledged everything it was asked to plan
                 // proves this replica is the coordinator work should route to.
@@ -267,9 +259,6 @@ impl Forge {
                 // that stopped at its per-wake budget left demand unplanned.
                 readiness.publish(!outcome.standby && !outcome.incomplete);
                 if outcome.standby {
-                    self.core
-                        .telemetry
-                        .record_lease(ForgeLeaseResult::Contention);
                     tracing::debug!(triggered, "Forge scheduler remains on standby");
                     self.record_completed_pass();
                     return true;
@@ -278,6 +267,7 @@ impl Forge {
                     demands_seen = outcome.demands_seen,
                     tasks_enqueued = outcome.tasks_enqueued,
                     incomplete = outcome.incomplete,
+                    elapsed_seconds = started.elapsed().as_secs_f64(),
                     triggered,
                     "Forge scheduling pass completed"
                 );

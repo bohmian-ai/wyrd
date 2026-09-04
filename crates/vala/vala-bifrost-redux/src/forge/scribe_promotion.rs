@@ -674,8 +674,8 @@ impl Forge {
             attempt_id,
             operation_id,
         } = commit;
-        let span = super::metrics::ForgeTelemetry::catalog_commit_span(
-            super::metrics::ForgeCatalogCommitStrategy::ScribePromotion,
+        let span = super::publication::catalog_commit_span(
+            "scribe_promotion",
             Some((task_id, attempt_id)),
         );
         if !lease.renew(&self.core.operator_pool).await?

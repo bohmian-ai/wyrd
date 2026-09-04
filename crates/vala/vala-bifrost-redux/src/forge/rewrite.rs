@@ -111,10 +111,30 @@ pub(crate) struct ForgeAttemptResources {
     release_result: Option<crate::resources::ForgeResourceReleaseResult>,
     /// Attempt-local resident peak shared with the leased pool wrapper.
     peak_memory_bytes: Arc<AtomicU64>,
-    /// Persisted and acquired totals recorded once at finalization.
-    observation: super::metrics::ForgeResourceObservation,
-    /// Fixed-cardinality metric owner receiving the final lifecycle event.
-    telemetry: Arc<super::metrics::ForgeTelemetry>,
+    /// Persisted and acquired totals reported once at finalization.
+    observation: ForgeAttemptResourceObservation,
+}
+
+/// Planned, acquired, and observed resource totals for one rewrite attempt.
+///
+/// Retained as a structured trace field rather than a metric: the useful
+/// question is what a specific stuck or refused attempt was granted and used,
+/// which needs the tenant, table, task, and attempt identity a bounded metric
+/// label set cannot carry.
+#[derive(Debug, Clone, Copy)]
+struct ForgeAttemptResourceObservation {
+    /// Resident bytes the durable envelope planned for this attempt.
+    planned_memory: u64,
+    /// Resident bytes the root governor actually issued.
+    acquired_memory: u64,
+    /// Highest resident bytes either pool wrapper observed.
+    peak_memory: u64,
+    /// Scratch bytes the durable envelope planned for this attempt.
+    planned_scratch: u64,
+    /// Scratch bytes the root governor actually issued.
+    acquired_scratch: u64,
+    /// Highest scratch bytes the compaction core reported beneath the lease.
+    peak_scratch: u64,
 }
 
 /// Splits and materializes one binding beneath an admitted Forge attempt.
@@ -172,7 +192,6 @@ impl ForgeAttemptResources {
         pod_spill_root: &Path,
         task_id: Uuid,
         attempt_id: Uuid,
-        telemetry: Arc<super::metrics::ForgeTelemetry>,
     ) -> Result<Self, ForgeError> {
         let lease =
             resources
@@ -206,7 +225,7 @@ impl ForgeAttemptResources {
             lease: Some(lease),
             release_result: None,
             peak_memory_bytes,
-            observation: super::metrics::ForgeResourceObservation {
+            observation: ForgeAttemptResourceObservation {
                 planned_memory: u64::try_from(request.memory_bytes).unwrap_or(u64::MAX),
                 acquired_memory: u64::try_from(request.memory_bytes).unwrap_or(u64::MAX),
                 peak_memory: 0,
@@ -214,7 +233,6 @@ impl ForgeAttemptResources {
                 acquired_scratch: request.scratch_bytes,
                 peak_scratch: 0,
             },
-            telemetry,
         })
     }
 
@@ -307,8 +325,16 @@ impl ForgeAttemptResources {
         } else {
             crate::resources::ForgeResourceReleaseResult::Released
         };
-        self.telemetry.record_attempt_resources(self.observation);
-        self.telemetry.record_attempt_release(result);
+        tracing::debug!(
+            planned_memory = self.observation.planned_memory,
+            acquired_memory = self.observation.acquired_memory,
+            peak_memory = self.observation.peak_memory,
+            planned_scratch = self.observation.planned_scratch,
+            acquired_scratch = self.observation.acquired_scratch,
+            peak_scratch = self.observation.peak_scratch,
+            release = ?result,
+            "Forge rewrite attempt resources finalized"
+        );
         self.release_result = Some(result);
         result
     }

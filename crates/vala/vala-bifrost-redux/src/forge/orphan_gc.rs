@@ -27,7 +27,7 @@ use wyrd_spec::vala::api::{
     StoragePath, audit_detail_canonical_json,
 };
 
-use vala_sql::row_types::forge_tasks::ForgeCleanupCandidate;
+use vala_sql::row_types::forge_tasks::{ForgeCleanupCandidate, ForgeTaskStrategy};
 
 use crate::catalog::layout::{FORGE_DATA_MARKER, FORGE_WRITER_RECIPE};
 use crate::catalog::{BIFROST_CATALOG_NAME, TenantTableBinding};
@@ -1446,7 +1446,16 @@ impl Forge {
             require_running(table.stop)?;
             lease.require_fence(&self.core.operator_pool).await?;
             match self.core.object_store.delete(&normalized).await {
-                Ok(()) => tally.deleted.push(path.as_str().to_owned()),
+                Ok(()) => {
+                    // Counted here, not from the tally: the tally also records
+                    // an object proven missing before the delete and an
+                    // idempotent `NotFound`, neither of which is a deletion
+                    // this fence performed.
+                    self.core
+                        .telemetry
+                        .record_deleted_objects(ForgeTaskStrategy::OrphanCleanup, 1);
+                    tally.deleted.push(path.as_str().to_owned());
+                }
                 Err(error) if error.kind() == ErrorKind::NotFound => {
                     tally.deleted.push(path.as_str().to_owned());
                 }

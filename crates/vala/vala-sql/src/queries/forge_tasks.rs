@@ -6,6 +6,7 @@
 
 // raw-query grep allowlist: Forge task tables post-date the sqlx offline cache and remain confined to OperatorPool/TenantConn.
 
+use std::str::FromStr;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -23,7 +24,8 @@ use crate::row_types::forge_tasks::{
     FORGE_TASK_PAYLOAD_VERSION, ForgeCleanupCandidate, ForgePlanningDemand,
     ForgePlanningDemandSqlRow, ForgePreparedTaskClaim, ForgePreparedTaskClaimSqlRow, ForgeTask,
     ForgeTaskClaim, ForgeTaskClaimSqlRow, ForgeTaskEvidence, ForgeTaskPage, ForgeTaskPlan,
-    ForgeTaskRowEvidence, ForgeTaskSqlRow, ForgeTaskState, ForgeTaskStrategy,
+    ForgeDemandStatus, ForgePendingTaskStatus, ForgeTaskRowEvidence, ForgeTaskSqlRow,
+    ForgeTaskState, ForgeTaskStrategy,
     ForgeTaskTableIdentity, ForgeTaskTransition, ForgeTaskTransitionOutcome, NewForgeTask,
     OrphanCleanupCursor, SnapshotWatermark, TaskProgressEffect,
 };
@@ -326,7 +328,7 @@ impl ForgeTasks {
         demand: &ForgePlanningDemand,
         batch: ForgeEnqueueBatch<'_>,
         unschedulable_event: F,
-    ) -> Result<u64, SqlError>
+    ) -> Result<Vec<ForgeTaskStrategy>, SqlError>
     where
         F: Fn(Uuid) -> AuditEvent,
     {
@@ -355,7 +357,7 @@ impl ForgeTasks {
                 detail: "Forge scheduler fence is stale".to_owned(),
             });
         }
-        let mut inserted_count = 0_u64;
+        let mut inserted = Vec::new();
         for task in batch.executable {
             task.plan.validate_for_strategy(task.strategy, false)?;
             if task.strategy == ForgeTaskStrategy::ExpiredCleanup
@@ -369,9 +371,11 @@ impl ForgeTasks {
             })?;
             let plan = crate::row_types::forge_tasks::plan_to_value(&task.plan);
             let envelope_json = serde_json::json!({"version":envelope.version,"decoded_batch":envelope.decoded_batch_bytes,"decoded_input":envelope.decoded_input_bytes,"sort_working":envelope.sort_working_bytes,"sort_merge":envelope.sort_merge_reservation_bytes,"encoder":envelope.encoder_buffer_bytes,"upload":envelope.upload_chunk_bytes,"footer_encoded":envelope.footer_encoded_bytes,"footer_decode":envelope.footer_decode_workspace_bytes,"sort_spill":envelope.sort_spill_bytes});
-            let inserted = sqlx::query("INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,namespace_name,table_name,strategy,lane,base_snapshot_id,plan,plan_hash,estimated_files,estimated_bytes,estimated_parallelism,estimated_memory_bytes,estimated_spill_bytes,large_task_ceiling_bytes,envelope_version,decoded_batch_bytes,decoded_input_bytes,sort_working_bytes,sort_merge_reservation_bytes,encoder_buffer_bytes,upload_chunk_bytes,footer_encoded_bytes,footer_decode_workspace_bytes,sort_spill_bytes,state,ready_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,(($17::jsonb)->>'version')::smallint,(($17::jsonb)->>'decoded_batch')::bigint,(($17::jsonb)->>'decoded_input')::bigint,(($17::jsonb)->>'sort_working')::bigint,(($17::jsonb)->>'sort_merge')::bigint,(($17::jsonb)->>'encoder')::bigint,(($17::jsonb)->>'upload')::bigint,(($17::jsonb)->>'footer_encoded')::bigint,(($17::jsonb)->>'footer_decode')::bigint,(($17::jsonb)->>'sort_spill')::bigint,'ready',$18) ON CONFLICT (data_tenant_id,catalog_name,namespace_name,table_name,strategy,base_snapshot_id,plan_hash) DO NOTHING")
+            let committed = sqlx::query("INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,namespace_name,table_name,strategy,lane,base_snapshot_id,plan,plan_hash,estimated_files,estimated_bytes,estimated_parallelism,estimated_memory_bytes,estimated_spill_bytes,large_task_ceiling_bytes,envelope_version,decoded_batch_bytes,decoded_input_bytes,sort_working_bytes,sort_merge_reservation_bytes,encoder_buffer_bytes,upload_chunk_bytes,footer_encoded_bytes,footer_decode_workspace_bytes,sort_spill_bytes,state,ready_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,(($17::jsonb)->>'version')::smallint,(($17::jsonb)->>'decoded_batch')::bigint,(($17::jsonb)->>'decoded_input')::bigint,(($17::jsonb)->>'sort_working')::bigint,(($17::jsonb)->>'sort_merge')::bigint,(($17::jsonb)->>'encoder')::bigint,(($17::jsonb)->>'upload')::bigint,(($17::jsonb)->>'footer_encoded')::bigint,(($17::jsonb)->>'footer_decode')::bigint,(($17::jsonb)->>'sort_spill')::bigint,'ready',$18) ON CONFLICT (data_tenant_id,catalog_name,namespace_name,table_name,strategy,base_snapshot_id,plan_hash) DO NOTHING")
                 .bind(Uuid::now_v7()).bind(task.data_tenant_id.as_uuid()).bind(&task.table_ref.catalog).bind(&task.table_ref.namespace).bind(&task.table_ref.table).bind(task.strategy.as_str()).bind(task.lane.as_str()).bind(task.base_snapshot_id).bind(plan).bind(task.plan_hash.as_slice()).bind(i64::from(task.estimates.files)).bind(i64::try_from(task.estimates.bytes).map_err(|_|SqlError::Conflict{detail:"estimated bytes overflow".to_owned()})?).bind(i32::from(task.estimates.parallelism)).bind(i64::try_from(task.estimates.memory_bytes).map_err(|_|SqlError::Conflict{detail:"memory estimate overflow".to_owned()})?).bind(i64::try_from(task.estimates.spill_bytes).map_err(|_|SqlError::Conflict{detail:"spill estimate overflow".to_owned()})?).bind(i64::try_from(task.estimates.large_ceiling_bytes).map_err(|_|SqlError::Conflict{detail:"large ceiling overflow".to_owned()})?).bind(envelope_json).bind(task.ready_at).execute(&mut *tx).await.map_err(SqlError::from)?;
-            inserted_count = inserted_count.saturating_add(inserted.rows_affected());
+            if committed.rows_affected() == 1 {
+                inserted.push(task.strategy);
+            }
         }
         for task in batch.unschedulable {
             if task.strategy == ForgeTaskStrategy::ExpiredCleanup {
@@ -388,11 +392,11 @@ impl ForgeTasks {
             let plan = crate::row_types::forge_tasks::plan_to_value(&task.plan);
             let envelope_json = serde_json::json!({"version":envelope.version,"decoded_batch":envelope.decoded_batch_bytes,"decoded_input":envelope.decoded_input_bytes,"sort_working":envelope.sort_working_bytes,"sort_merge":envelope.sort_merge_reservation_bytes,"encoder":envelope.encoder_buffer_bytes,"upload":envelope.upload_chunk_bytes,"footer_encoded":envelope.footer_encoded_bytes,"footer_decode":envelope.footer_decode_workspace_bytes,"sort_spill":envelope.sort_spill_bytes});
             let task_id = Uuid::now_v7();
-            let inserted: Option<Uuid> = sqlx::query_scalar("INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,namespace_name,table_name,strategy,lane,base_snapshot_id,plan,plan_hash,estimated_files,estimated_bytes,estimated_parallelism,estimated_memory_bytes,estimated_spill_bytes,large_task_ceiling_bytes,envelope_version,decoded_batch_bytes,decoded_input_bytes,sort_working_bytes,sort_merge_reservation_bytes,encoder_buffer_bytes,upload_chunk_bytes,footer_encoded_bytes,footer_decode_workspace_bytes,sort_spill_bytes,state,ready_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,(($17::jsonb)->>'version')::smallint,(($17::jsonb)->>'decoded_batch')::bigint,(($17::jsonb)->>'decoded_input')::bigint,(($17::jsonb)->>'sort_working')::bigint,(($17::jsonb)->>'sort_merge')::bigint,(($17::jsonb)->>'encoder')::bigint,(($17::jsonb)->>'upload')::bigint,(($17::jsonb)->>'footer_encoded')::bigint,(($17::jsonb)->>'footer_decode')::bigint,(($17::jsonb)->>'sort_spill')::bigint,'unschedulable',$18) ON CONFLICT (data_tenant_id,catalog_name,namespace_name,table_name,strategy,base_snapshot_id,plan_hash) DO NOTHING RETURNING task_id")
+            let committed: Option<Uuid> = sqlx::query_scalar("INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,namespace_name,table_name,strategy,lane,base_snapshot_id,plan,plan_hash,estimated_files,estimated_bytes,estimated_parallelism,estimated_memory_bytes,estimated_spill_bytes,large_task_ceiling_bytes,envelope_version,decoded_batch_bytes,decoded_input_bytes,sort_working_bytes,sort_merge_reservation_bytes,encoder_buffer_bytes,upload_chunk_bytes,footer_encoded_bytes,footer_decode_workspace_bytes,sort_spill_bytes,state,ready_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,(($17::jsonb)->>'version')::smallint,(($17::jsonb)->>'decoded_batch')::bigint,(($17::jsonb)->>'decoded_input')::bigint,(($17::jsonb)->>'sort_working')::bigint,(($17::jsonb)->>'sort_merge')::bigint,(($17::jsonb)->>'encoder')::bigint,(($17::jsonb)->>'upload')::bigint,(($17::jsonb)->>'footer_encoded')::bigint,(($17::jsonb)->>'footer_decode')::bigint,(($17::jsonb)->>'sort_spill')::bigint,'unschedulable',$18) ON CONFLICT (data_tenant_id,catalog_name,namespace_name,table_name,strategy,base_snapshot_id,plan_hash) DO NOTHING RETURNING task_id")
                 .bind(task_id).bind(task.data_tenant_id.as_uuid()).bind(&task.table_ref.catalog).bind(&task.table_ref.namespace).bind(&task.table_ref.table).bind(task.strategy.as_str()).bind(task.lane.as_str()).bind(task.base_snapshot_id).bind(plan).bind(task.plan_hash.as_slice()).bind(i64::from(task.estimates.files)).bind(i64::try_from(task.estimates.bytes).map_err(|_|SqlError::Conflict{detail:"estimated bytes overflow".to_owned()})?).bind(i32::from(task.estimates.parallelism)).bind(i64::try_from(task.estimates.memory_bytes).map_err(|_|SqlError::Conflict{detail:"memory estimate overflow".to_owned()})?).bind(i64::try_from(task.estimates.spill_bytes).map_err(|_|SqlError::Conflict{detail:"spill estimate overflow".to_owned()})?).bind(i64::try_from(task.estimates.large_ceiling_bytes).map_err(|_|SqlError::Conflict{detail:"large ceiling overflow".to_owned()})?).bind(envelope_json).bind(task.ready_at)
                 .fetch_optional(&mut *tx).await.map_err(SqlError::from)?;
-            if let Some(inserted_id) = inserted {
-                inserted_count = inserted_count.saturating_add(1);
+            if let Some(inserted_id) = committed {
+                inserted.push(task.strategy);
                 let event = unschedulable_event(inserted_id);
                 validate_audit_event(&event, inserted_id, ForgeTaskState::Unschedulable)?;
                 OperatorAudit::new(demand.data_tenant_id, &mut tx)
@@ -433,37 +437,66 @@ impl ForgeTasks {
             }
         }
         tx.commit().await.map_err(SqlError::from)?;
-        Ok(inserted_count)
+        Ok(inserted)
     }
 
-    /// Reads bounded authoritative pending demand and nonterminal task status.
+    /// Reads the exact unacknowledged planning-demand count and oldest request.
+    ///
+    /// One ordinary aggregate read over the demand table. It opens no
+    /// transaction and takes no cap, so the caller publishes an authoritative
+    /// count rather than a page-bounded one; a failed read publishes nothing.
     ///
     /// # Errors
-    /// Returns conflict for zero capacity and SQL errors from the bounded union.
-    pub async fn planning_status(
-        &self,
-        cap: u32,
-    ) -> Result<(u64, Option<DateTime<Utc>>, bool), SqlError> {
-        if cap == 0 {
-            return Err(SqlError::Conflict {
-                detail: "planning status cap must be positive".to_owned(),
-            });
-        }
-        let rows: Vec<(DateTime<Utc>,)> = sqlx::query_as("SELECT requested_at FROM (SELECT first_requested_at AS requested_at FROM vala.forge_planning_demands UNION ALL SELECT ready_at AS requested_at FROM vala.forge_tasks WHERE state IN ('ready','retryable','claimed','running','prepared')) pending ORDER BY requested_at LIMIT $1")
-            .bind(i64::from(cap) + 1).fetch_all(self.operator_pool.pool()).await.map_err(SqlError::from)?;
-        let overflowed = rows.len() > cap as usize;
-        let visible = rows
-            .into_iter()
-            .take(cap as usize)
-            .map(|row| row.0)
-            .collect::<Vec<_>>();
-        Ok((
-            u64::try_from(visible.len()).map_err(|_| SqlError::InvariantViolation {
-                detail: "Forge backlog count overflow".to_owned(),
+    /// Returns SQL errors from the aggregate read.
+    ///
+    /// # Cancellation
+    /// This read has no durable effect.
+    pub async fn planning_demand_status(&self) -> Result<ForgeDemandStatus, SqlError> {
+        let (demands, oldest_requested_at): (i64, Option<DateTime<Utc>>) = sqlx::query_as(
+            "SELECT count(*), min(first_requested_at) FROM vala.forge_planning_demands",
+        )
+        .fetch_one(self.operator_pool.pool())
+        .await
+        .map_err(SqlError::from)?;
+        Ok(ForgeDemandStatus {
+            demands: u64::try_from(demands).map_err(|_| SqlError::InvariantViolation {
+                detail: "Forge planning demand count overflow".to_owned(),
             })?,
-            visible.first().copied(),
-            overflowed,
-        ))
+            oldest_requested_at,
+        })
+    }
+
+    /// Reads exact pending task counts and oldest `ready_at` by strategy.
+    ///
+    /// Only `ready` and `retryable` rows are pending: a claimed, running, or
+    /// prepared row is owned by a worker and is reported by the active-task
+    /// signal instead. Strategies with no pending row are absent from the
+    /// result, and the caller publishes their explicit zeroes.
+    ///
+    /// # Errors
+    /// Returns SQL errors from the grouped read and an invariant violation for
+    /// a malformed persisted strategy or a count that does not fit `u64`.
+    ///
+    /// # Cancellation
+    /// This read has no durable effect.
+    pub async fn pending_task_status(&self) -> Result<Vec<ForgePendingTaskStatus>, SqlError> {
+        let rows: Vec<(String, i64, Option<DateTime<Utc>>)> = sqlx::query_as(
+            "SELECT strategy, count(*), min(ready_at) FROM vala.forge_tasks WHERE state IN ('ready','retryable') GROUP BY strategy",
+        )
+        .fetch_all(self.operator_pool.pool())
+        .await
+        .map_err(SqlError::from)?;
+        rows.into_iter()
+            .map(|(strategy, pending, oldest_ready_at)| {
+                Ok(ForgePendingTaskStatus {
+                    strategy: ForgeTaskStrategy::from_str(&strategy)?,
+                    pending: u64::try_from(pending).map_err(|_| SqlError::InvariantViolation {
+                        detail: "Forge pending task count overflow".to_owned(),
+                    })?,
+                    oldest_ready_at,
+                })
+            })
+            .collect()
     }
 
     /// Acquires or renews the singleton scheduler fence and returns its generation.

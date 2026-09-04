@@ -1,24 +1,20 @@
-//! Projection of the managed core's physical events onto Forge telemetry.
+//! Accumulation of the managed core's physical events for Forge.
 //!
 //! The core reports what it physically did — an object opened, a roll decided,
 //! a close settled, memory peaked, scratch measured, and exactly one terminal
-//! event. Forge needs two things from that stream and nothing else: a bounded,
-//! fixed-cardinality operational signal, and the set of objects the attempt may
-//! have produced so a failed or cancelled attempt is reclaimable.
+//! event. Forge needs one thing from that stream: the set of objects the
+//! attempt may have produced, plus the two peaks, so a failed or cancelled
+//! attempt is reclaimable and its resource lease is auditable.
 //!
-//! Everything else is deliberately *not* projected. The observer never records
-//! a path, an attempt id, or a tenant as a metric label, because each of those
-//! is unbounded and would turn one counter family into one series per table.
-//! And it never influences the rewrite: [`RewriteObserver::on_event`] returns
-//! nothing, and this implementation holds no channel, no error slot, and no
-//! cancellation authority through which it could.
+//! Everything else is deliberately dropped. The observer never influences the
+//! rewrite: [`RewriteObserver::on_event`] returns nothing, and this
+//! implementation holds no channel, no error slot, and no cancellation
+//! authority through which it could.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use iceberg_compaction_core::managed::{OutputIdentity, RewriteEvent, RewriteObserver};
-
-use crate::forge::metrics::{ForgeRewriteEventKind, ForgeTelemetry};
 
 /// Forge's one observer of a managed rewrite attempt.
 ///
@@ -28,8 +24,6 @@ use crate::forge::metrics::{ForgeRewriteEventKind, ForgeTelemetry};
 /// used. All three are shared with the executor rather than returned, because
 /// the observer is handed to the core and only the core calls it.
 pub(crate) struct ForgeRewriteObserver {
-    /// Fixed-cardinality metric owner receiving every projected event.
-    telemetry: Arc<ForgeTelemetry>,
     /// Objects the attempt opened, settled or not, in open order.
     outputs: std::sync::Mutex<Vec<OutputIdentity>>,
     /// Highest reservation the core observed against the leased pool.
@@ -40,9 +34,9 @@ pub(crate) struct ForgeRewriteObserver {
 
 /// Reports only the observer's accumulators.
 ///
-/// Written by hand because [`ForgeTelemetry`] owns registered metric handles
-/// that carry no useful debug shape; printing the accumulators is what a
-/// maintainer inspecting a stuck attempt actually wants.
+/// Written by hand because the interior mutex has no useful derived shape;
+/// printing the accumulators is what a maintainer inspecting a stuck attempt
+/// actually wants.
 impl std::fmt::Debug for ForgeRewriteObserver {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -58,32 +52,12 @@ impl std::fmt::Debug for ForgeRewriteObserver {
 }
 
 impl ForgeRewriteObserver {
-    /// Creates one observer bound to this attempt's telemetry owner.
-    pub(crate) fn new(telemetry: Arc<ForgeTelemetry>) -> Self {
+    /// Creates one observer for a single rewrite attempt.
+    pub(crate) fn new() -> Self {
         Self {
-            telemetry,
             outputs: std::sync::Mutex::new(Vec::new()),
             peak_memory_bytes: Arc::new(AtomicU64::new(0)),
             peak_scratch_bytes: Arc::new(AtomicU64::new(0)),
-        }
-    }
-
-    /// Maps one core event onto its closed Forge label.
-    ///
-    /// Exhaustive by construction: the core's event set is closed, so a core
-    /// that added an event would fail to compile here instead of silently
-    /// emitting nothing.
-    pub(crate) fn project(event: &RewriteEvent) -> ForgeRewriteEventKind {
-        match event {
-            RewriteEvent::OutputOpened { .. } => ForgeRewriteEventKind::OutputOpened,
-            RewriteEvent::RollDecided { .. } => ForgeRewriteEventKind::RollDecided,
-            RewriteEvent::OutputClosed { .. } => ForgeRewriteEventKind::OutputClosed,
-            RewriteEvent::PeakMemory { .. } => ForgeRewriteEventKind::PeakMemory,
-            RewriteEvent::OperatorSpill { .. } => ForgeRewriteEventKind::OperatorSpill,
-            RewriteEvent::ScratchSpill { .. } => ForgeRewriteEventKind::ScratchSpill,
-            RewriteEvent::Succeeded { .. } => ForgeRewriteEventKind::Succeeded,
-            RewriteEvent::Failed { .. } => ForgeRewriteEventKind::Failed,
-            RewriteEvent::Cancelled { .. } => ForgeRewriteEventKind::Cancelled,
         }
     }
 
@@ -148,12 +122,11 @@ impl ForgeRewriteObserver {
 }
 
 impl RewriteObserver for ForgeRewriteObserver {
-    /// Counts one physical event and folds any measurement it carries.
+    /// Folds any measurement one physical event carries.
     ///
     /// Every branch is O(1) and lock-free apart from the terminal output merge,
     /// which happens once per plan the attempt executes.
     fn on_event(&self, event: RewriteEvent) {
-        self.telemetry.record_rewrite_event(Self::project(&event));
         match event {
             RewriteEvent::OutputOpened {
                 logical_ordinal,
@@ -304,7 +277,7 @@ mod tests {
             );
         }
 
-        let observer = ForgeRewriteObserver::new(Arc::new(ForgeTelemetry::new()));
+        let observer = ForgeRewriteObserver::new();
         for event in events {
             observer.on_event(event);
         }

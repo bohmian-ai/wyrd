@@ -19,7 +19,6 @@ use uuid::Uuid;
 
 use crate::catalog::TenantTableBinding;
 use crate::forge::error::ForgeError;
-use crate::forge::metrics::ForgeCapacityRefusalPhase;
 use crate::forge::rewrite::ForgeAttemptResources;
 use crate::forge::{Forge, ForgeCore};
 
@@ -137,7 +136,6 @@ impl<'attempt> ForgeManagedRewrite<'attempt> {
         binding: &'attempt TenantTableBinding,
         attempt: ForgeRewriteAttempt<'attempt>,
     ) -> Result<Self, ForgeError> {
-        let telemetry = Arc::clone(&core.telemetry);
         let resources = ForgeAttemptResources::acquire(
             &core.resources,
             attempt.request,
@@ -145,14 +143,8 @@ impl<'attempt> ForgeManagedRewrite<'attempt> {
             &core.rewrite_spill_root,
             attempt.task_id,
             attempt.attempt_id,
-            Arc::clone(&telemetry),
-        )
-        .inspect_err(|error| {
-            if matches!(error, ForgeError::Capacity { .. }) {
-                telemetry.record_capacity_refusal(ForgeCapacityRefusalPhase::Admission);
-            }
-        })?;
-        let observer = Arc::new(ForgeRewriteObserver::new(Arc::clone(&telemetry)));
+        )?;
+        let observer = Arc::new(ForgeRewriteObserver::new());
         let spill =
             SpillLease::new(resources.spill_root()).map_err(|error| ForgeError::Invariant {
                 detail: format!("Forge attempt scratch root is not leasable: {error}"),

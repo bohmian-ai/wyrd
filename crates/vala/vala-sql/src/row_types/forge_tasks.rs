@@ -147,7 +147,7 @@ impl ForgeFailureClass {
     ///
     /// # Errors
     /// Returns an invariant violation for malformed persisted state.
-    pub(crate) fn from_sql(value: &str) -> Result<Self, SqlError> {
+    pub fn from_sql(value: &str) -> Result<Self, SqlError> {
         match value {
             "data_refusal" => Ok(Self::DataRefusal),
             "transient_object_store" => Ok(Self::TransientObjectStore),
@@ -1396,12 +1396,41 @@ fn evidence_from_value(value: serde_json::Value) -> Result<ForgeTaskEvidence, Sq
     })
 }
 
+/// Authoritative unacknowledged planning-demand status for one complete scan.
+///
+/// Published by the fenced coordinator after a complete pass. `demands` is the
+/// exact row count rather than a page, and `oldest_requested_at` is the stored
+/// request time so a consumer can derive age itself and keep seeing it grow if
+/// the producer later stalls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForgeDemandStatus {
+    /// Exact count of unacknowledged planning demands.
+    pub demands: u64,
+    /// Earliest `first_requested_at` across those demands, if any exist.
+    pub oldest_requested_at: Option<DateTime<Utc>>,
+}
+
+/// Authoritative pending-task status for one strategy after a complete scan.
+///
+/// Pending means exactly `ready` or `retryable`: an owned row belongs to the
+/// worker that claimed it. A strategy with no pending row produces no value,
+/// so the publisher supplies its explicit zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForgePendingTaskStatus {
+    /// Work type this status describes.
+    pub strategy: ForgeTaskStrategy,
+    /// Exact count of `ready` or `retryable` rows for this strategy.
+    pub pending: u64,
+    /// Earliest `ready_at` across those rows.
+    pub oldest_ready_at: Option<DateTime<Utc>>,
+}
+
 /// Closed Forge task strategies.
 ///
 /// The set spans publication work (`scribe_promotion`), rewrite work, and
 /// maintenance-family cleanup; [`ForgeTaskStrategy::is_maintenance`] is the
 /// only classification that distinguishes them for scheduling.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ForgeTaskStrategy {
     /// Promote already-published Scribe hot objects into the table unchanged.
     ScribePromotion,

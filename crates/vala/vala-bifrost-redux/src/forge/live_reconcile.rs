@@ -8,6 +8,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use vala_sql::queries::forge_operations::ForgeOperations;
 use vala_sql::row_types::forge_operations::{ForgeOperationFamily, ForgeOperationStateRow};
+use vala_sql::row_types::forge_tasks::ForgeTaskStrategy;
 use wyrd_spec::vala::api::{AuditDetail, ForgeIcebergRewritePhase, StoragePath};
 
 use super::Forge;
@@ -15,7 +16,6 @@ use super::compact::ForgeGroupKey;
 use super::compact::ForgeTableKey;
 use super::error::ForgeError;
 use super::lease::ForgeLease;
-use super::metrics::RewritePathContract;
 use super::path::catalog_path_to_object_key;
 use crate::catalog::TenantTableBinding;
 use crate::catalog::layout::TimePartition;
@@ -100,6 +100,26 @@ struct RetainedSnapshotObservation {
     forge_operation_id: Option<Uuid>,
     /// Canonical Forge group recorded with the operation identity.
     forge_group: Option<String>,
+    /// Exact rewrite volume this snapshot's validated properties declare.
+    ///
+    /// Present only for a snapshot that carries a complete, well-typed Forge
+    /// rewrite property set. Recovery reports throughput from these canonical
+    /// counts rather than restating object storage, so no metric path stats
+    /// objects.
+    rewrite_volume: Option<RecoveredRewriteVolume>,
+}
+
+/// Exact file and byte counts one committed rewrite snapshot declares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RecoveredRewriteVolume {
+    /// Live data files the commit removed.
+    removed_data_files: u64,
+    /// Total bytes of the removed data files.
+    removed_bytes: u64,
+    /// Data files the commit added.
+    added_data_files: u64,
+    /// Total bytes of the added data files.
+    added_bytes: u64,
 }
 
 /// Parsed and normalized fields from one prepared live-rewrite detail.
@@ -344,6 +364,22 @@ impl Forge {
                 .map(String::as_str);
             let (forge_operation_id, forge_group) =
                 parse_snapshot_forge_identity(workflow, operation, group)?;
+            let rewrite_volume = forge_operation_id.and_then(|_| {
+                let properties: BTreeMap<_, _> = snapshot
+                    .summary()
+                    .additional_properties
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect();
+                super::publication::RewriteSnapshotProperties::validate(&properties)
+                    .ok()
+                    .map(|properties| RecoveredRewriteVolume {
+                        removed_data_files: properties.removed_data_files,
+                        removed_bytes: properties.removed_bytes,
+                        added_data_files: properties.added_data_files,
+                        added_bytes: properties.added_bytes,
+                    })
+            });
             let list = table
                 .manifest_list_reader(snapshot)
                 .load()
@@ -379,6 +415,7 @@ impl Forge {
                         live_data_paths,
                         forge_operation_id,
                         forge_group,
+                        rewrite_volume,
                     },
                 )
                 .is_some()
@@ -463,16 +500,11 @@ impl Forge {
         let young = context.now.signed_duration_since(row.prepared_at) < uncertainty;
         match classify_evidence(&evidence, young) {
             LiveDisposition::Recovered(snapshot_id) => {
-                let volume = self
-                    .measure_rewrite_volume(
-                        RewritePathContract::Catalog {
-                            binding: context.binding,
-                            table_location: &context.observation_b.table_location,
-                        },
-                        &prepared.input_paths,
-                        &prepared.output_paths,
-                    )
-                    .await?;
+                let volume = context
+                    .observation_b
+                    .snapshots
+                    .get(&snapshot_id)
+                    .and_then(|snapshot| snapshot.rewrite_volume);
                 Self::require_running(context.stop)?;
                 context
                     .lease
@@ -497,18 +529,18 @@ impl Forge {
                     )?,
                 )
                 .await?;
-                self.core.telemetry.record_operation(
-                    super::metrics::ForgeMetricSource::Iceberg,
-                    super::metrics::ForgeOperationResult::Recovered,
-                    1,
-                );
-                self.core.telemetry.record_rewrite_volume(
-                    super::metrics::ForgeMetricSource::Iceberg,
-                    volume.input_files,
-                    volume.input_bytes,
-                    volume.output_files,
-                    volume.output_bytes,
-                );
+                if let Some(volume) = volume {
+                    self.core.telemetry.record_input(
+                        ForgeTaskStrategy::SmallFiles,
+                        volume.removed_data_files,
+                        volume.removed_bytes,
+                    );
+                    self.core.telemetry.record_output(
+                        ForgeTaskStrategy::SmallFiles,
+                        volume.added_data_files,
+                        volume.added_bytes,
+                    );
+                }
                 outcome.recovered = outcome.recovered.saturating_add(1);
             }
             LiveDisposition::Pending => {
@@ -566,11 +598,6 @@ impl Forge {
             iceberg_terminal_detail(&row.prepared_detail, ForgeIcebergRewritePhase::Reset, None)?,
         )
         .await?;
-        self.core.telemetry.record_operation(
-            super::metrics::ForgeMetricSource::Iceberg,
-            super::metrics::ForgeOperationResult::Reset,
-            1,
-        );
         outcome.reset = outcome.reset.saturating_add(1);
         Ok(())
     }

@@ -8,7 +8,6 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use chrono::Utc;
-use num_traits::ToPrimitive;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use vala_sql::SqlError;
@@ -17,7 +16,7 @@ use vala_sql::queries::forge_tasks::{ForgeClaimLimits, ForgeEnqueueBatch, ForgeT
 use vala_sql::row_types::forge_operations::ForgeOperationFamily;
 use vala_sql::row_types::forge_tasks::{
     ExpiredCleanupPayload, FORGE_TASK_PAYLOAD_VERSION, ForgePlanningDemand,
-    ForgePlanningDemandSource, ForgeTaskEstimates, ForgeTaskLane, ForgeTaskPlan, ForgeTaskStrategy,
+    ForgeTaskEstimates, ForgeTaskLane, ForgeTaskPlan, ForgeTaskStrategy,
     ForgeTaskTableIdentity, NewForgeTask, ORPHAN_CLEANUP_PAYLOAD_VERSION, OrphanCleanupPayload,
 };
 use wyrd_spec::DataTenantId;
@@ -29,10 +28,7 @@ use super::Forge;
 use super::compact::ForgeGroupKey;
 use super::error::ForgeError;
 use super::identity::task_table_binding;
-use super::metrics::{
-    ForgeDemandTransitionResult, ForgeLifecycleOutcome, ForgeLifecycleStage,
-    ForgeTaskMetricStrategy,
-};
+use super::metrics::ForgePendingTasks;
 use super::path::catalog_path_to_object_key;
 use super::planner::{
     ForgeCapacity, ForgeEnvelopeSizer, ForgePlanCandidate, ForgePlanCapacity, ForgePlanner,
@@ -303,10 +299,6 @@ impl<'forge> ForgeScheduler<'forge> {
             .await
             .map_err(ForgeError::Sql)?;
         conn.commit().await.map_err(ForgeError::Sql)?;
-        self.forge
-            .core
-            .telemetry
-            .record_planning_demand(ForgePlanningDemandSource::Hint);
         Ok(())
     }
 
@@ -331,7 +323,6 @@ impl<'forge> ForgeScheduler<'forge> {
         &self,
         stop: &CancellationToken,
     ) -> Result<ForgeScheduleOutcome, ForgeError> {
-        let started = std::time::Instant::now();
         let Some(fence) = self.acquire_fence().await? else {
             return Ok(ForgeScheduleOutcome {
                 standby: true,
@@ -367,11 +358,6 @@ impl<'forge> ForgeScheduler<'forge> {
         }
         self.renew_fence(fence).await?;
         self.publish_status(&mut outcome, fence).await?;
-        self.forge.core.telemetry.record_scheduling_pass(
-            outcome.incomplete,
-            outcome.unschedulable,
-            started.elapsed(),
-        );
         #[cfg(feature = "test-support")]
         if !outcome.incomplete {
             self.complete_publications.fetch_add(1, Ordering::AcqRel);
@@ -442,9 +428,6 @@ impl<'forge> ForgeScheduler<'forge> {
                     Err(ForgeError::Sql(SqlError::ForgeDemandGenerationChanged))
                         if generation_retries == 0 && !stop.is_cancelled() =>
                     {
-                        self.forge.core.telemetry.record_demand_transition(
-                            ForgeDemandTransitionResult::GenerationChanged,
-                        );
                         generation_retries = generation_retries.saturating_add(1);
                         outcome.incomplete = true;
                         let Some(refreshed) = self
@@ -464,10 +447,6 @@ impl<'forge> ForgeScheduler<'forge> {
                         demand = refreshed;
                     }
                     Err(error) => {
-                        self.forge
-                            .core
-                            .telemetry
-                            .record_demand_transition(ForgeDemandTransitionResult::Failed);
                         outcome.incomplete = true;
                         tracing::warn!(data_tenant_id = %demand.data_tenant_id, table = %demand.table_ref.table, error = %error, "Forge demand planning failed; retaining demand and continuing tenant page");
                         break;
@@ -565,32 +544,6 @@ impl<'forge> ForgeScheduler<'forge> {
         Ok(failures > 0)
     }
 
-    /// Records one discovery telemetry sample per planned candidate.
-    ///
-    /// # Errors
-    ///
-    /// Returns an invariant error when a candidate strategy has no metric
-    /// mapping, which would otherwise silently drop the sample.
-    fn record_discovered_candidates(
-        &self,
-        snapshot: &ForgeTableSnapshot,
-    ) -> Result<(), ForgeError> {
-        for candidate in &snapshot.candidates {
-            self.forge.core.telemetry.record_discovered_candidate(
-                ForgeTaskMetricStrategy::try_from(candidate.strategy).map_err(|strategy| {
-                    ForgeError::Invariant {
-                        detail: format!(
-                            "Forge candidate strategy lacks a metric mapping: {strategy:?}"
-                        ),
-                    }
-                })?,
-                candidate.inputs.len(),
-                candidate.bytes,
-            );
-        }
-        Ok(())
-    }
-
     /// Plans and atomically acknowledges one exact demand generation.
     ///
     /// # Errors
@@ -604,7 +557,6 @@ impl<'forge> ForgeScheduler<'forge> {
     ) -> Result<DemandPlanningResult, ForgeError> {
         let (snapshot, compaction_debt_files, compaction_debt_bytes, orphan_scan_prefix) =
             self.discover_snapshot(demand).await?;
-        self.record_discovered_candidates(&snapshot)?;
         let ForgeDemandArbitration {
             executable,
             unschedulable,
@@ -629,32 +581,18 @@ impl<'forge> ForgeScheduler<'forge> {
                 .map_err(ForgeError::Sql)?
         };
         let result = DemandPlanningResult {
-            tasks_enqueued: usize::try_from(inserted).unwrap_or(usize::MAX),
+            tasks_enqueued: inserted.len(),
             tasks_not_inserted: executable
                 .len()
                 .saturating_add(unschedulable.len())
-                .saturating_sub(usize::try_from(inserted).unwrap_or(usize::MAX)),
+                .saturating_sub(inserted.len()),
             unschedulable: unschedulable.len(),
             acknowledged: true,
             compaction_debt_files,
             compaction_debt_bytes,
         };
-        if result.acknowledged && result.tasks_enqueued == 0 {
-            self.forge
-                .core
-                .telemetry
-                .record_demand_transition(ForgeDemandTransitionResult::Drained);
-        }
-        if result.acknowledged {
-            for task in executable.iter().chain(&unschedulable) {
-                if let Ok(metric) = ForgeTaskMetricStrategy::try_from(task.strategy) {
-                    self.forge.core.telemetry.record_lifecycle_event(
-                        metric,
-                        ForgeLifecycleStage::Planned,
-                        ForgeLifecycleOutcome::Ok,
-                    );
-                }
-            }
+        for task_type in &inserted {
+            self.forge.core.telemetry.record_task_created(*task_type);
         }
         #[cfg(feature = "test-support")]
         if result.acknowledged
@@ -1411,11 +1349,6 @@ impl<'forge> ForgeScheduler<'forge> {
         if outcome.incomplete || outcome.demands_acknowledged != outcome.demands_seen {
             return Ok(());
         }
-        let (backlog, oldest, overflowed) = self
-            .tasks
-            .planning_status(self.demand_cap)
-            .await
-            .map_err(ForgeError::Sql)?;
         let governor =
             self.forge
                 .core
@@ -1442,28 +1375,40 @@ impl<'forge> ForgeScheduler<'forge> {
             );
         }
         self.renew_fence(fence).await?;
-        if should_publish_gauges(outcome, overflowed) {
-            let age = oldest.map_or(Duration::ZERO, |time| {
-                Utc::now()
-                    .signed_duration_since(time)
-                    .to_std()
-                    .unwrap_or_default()
-            });
-            self.forge
-                .core
-                .telemetry
-                .record_planning_backlog(exact_gauge(backlog), age);
-            self.forge
-                .core
-                .telemetry
-                .record_planning_status(age, outcome.fairness_lag_tasks);
-            self.forge.core.telemetry.record_compaction_debt(
-                outcome.compaction_debt_files,
-                outcome.compaction_debt_bytes,
-            );
-        } else {
-            outcome.incomplete = true;
-        }
+        let demands = self
+            .tasks
+            .planning_demand_status()
+            .await
+            .map_err(ForgeError::Sql)?;
+        let pending = self
+            .tasks
+            .pending_task_status()
+            .await
+            .map_err(ForgeError::Sql)?;
+        self.forge.core.telemetry.publish_planning_status(
+            demands.demands,
+            demands
+                .oldest_requested_at
+                .map_or(0, |time| time.timestamp()),
+        );
+        let observations: Vec<_> = pending
+            .into_iter()
+            .map(|status| ForgePendingTasks {
+                task_type: status.strategy,
+                count: status.pending,
+                oldest_ready_at_unix: status
+                    .oldest_ready_at
+                    .map_or(0, |time| time.timestamp()),
+            })
+            .collect();
+        self.forge
+            .core
+            .telemetry
+            .publish_pending_tasks(&observations);
+        self.forge.core.telemetry.record_compaction_debt(
+            outcome.compaction_debt_files,
+            outcome.compaction_debt_bytes,
+        );
         Ok(())
     }
 }
@@ -1538,24 +1483,6 @@ pub(super) fn maintenance_trigger_due(
         return true;
     }
     oldest_age.is_some_and(|age| age >= interval)
-}
-
-/// Converts a durable backlog count into an exact, monotonic gauge value.
-#[must_use]
-fn exact_gauge(value: u64) -> f64 {
-    const MAX_EXACT_GAUGE_INTEGER: u64 = 1_u64 << 53;
-    value
-        .min(MAX_EXACT_GAUGE_INTEGER)
-        .to_f64()
-        .unwrap_or(9_007_199_254_740_992.0)
-}
-
-/// Returns whether one status observation may replace authoritative gauges.
-#[must_use]
-fn should_publish_gauges(outcome: &ForgeScheduleOutcome, status_overflowed: bool) -> bool {
-    !outcome.incomplete
-        && outcome.demands_acknowledged == outcome.demands_seen
-        && !status_overflowed
 }
 
 /// Builds the exact audited terminal envelope after SQL chooses the task UUID.

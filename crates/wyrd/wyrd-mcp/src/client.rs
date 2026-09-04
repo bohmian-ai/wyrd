@@ -283,7 +283,9 @@ mod tests {
     /// Accepted`, which is what `rmcp`'s reqwest transport expects for a
     /// notification.
     async fn spawn_recorder() -> Recorder {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("recorder binds");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("recorder binds");
         let addr = listener.local_addr().expect("recorder address");
         let mcp_requests: Arc<Mutex<Vec<HashMap<String, String>>>> =
             Arc::new(Mutex::new(Vec::new()));

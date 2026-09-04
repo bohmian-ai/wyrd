@@ -40,6 +40,12 @@ pub mod probe;
 /// protocol metadata: an rmcp client negotiated below this revision does not
 /// attach it, so accepting older revisions would mean accepting requests the
 /// stateless validator then rejects.
+///
+/// Serving exactly one revision also fixes the lifecycle: `initialize` is the
+/// legacy handshake and negotiates only down to a pre-2026-07-28 revision, so
+/// a client reaches `/mcp` through `server/discover` plus self-contained
+/// per-request protocol metadata. That is the same session-free shape the
+/// stateless transport below is configured for.
 const WYRD_MCP_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V_2026_07_28;
 
 /// The concrete Wyrd MCP request handler.

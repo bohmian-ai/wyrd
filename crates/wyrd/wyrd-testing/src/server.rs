@@ -3194,6 +3194,11 @@ impl WyrdTestServerBuilder {
     /// `AppState::with_limits` the server uses, so the router under test is the
     /// composed production router with one configuration value changed.
     #[must_use]
+    pub fn with_limits_for_test(mut self, limits: wyrd_server::state::LimitsConfig) -> Self {
+        self.limits = Some(limits);
+        self
+    }
+
     /// Register the test-support MCP context probe in this server's `/mcp`
     /// tool catalog.
     ///
@@ -3204,11 +3209,6 @@ impl WyrdTestServerBuilder {
     #[must_use]
     pub fn with_mcp_context_probe_for_test(mut self) -> Self {
         self.mcp_context_probe = true;
-        self
-    }
-
-    pub fn with_limits_for_test(mut self, limits: wyrd_server::state::LimitsConfig) -> Self {
-        self.limits = Some(limits);
         self
     }
 

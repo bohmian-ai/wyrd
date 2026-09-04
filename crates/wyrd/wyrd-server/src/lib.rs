@@ -9,6 +9,7 @@ pub mod components;
 pub mod config;
 pub mod grpc;
 pub mod http;
+pub mod mcp;
 pub mod openapi;
 pub mod oracle;
 mod otlp_decode;

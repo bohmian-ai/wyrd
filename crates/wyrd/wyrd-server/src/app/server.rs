@@ -742,6 +742,25 @@ impl BoundServer {
             forge.mark_supervision_drained(supervised_drained);
         }
 
+        // Transport admission has stopped, so no further MCP request can start.
+        // Close the tracker and wait for the work already in flight inside the
+        // unchanged process deadline. `timeout_at` polls the tracker before the
+        // deadline, so an already-empty tracker returns immediately even when
+        // the supervised drain consumed the whole budget. A tracker still
+        // holding tokens at the deadline is a lifecycle failure: reporting a
+        // clean drain there would claim a settlement that never happened.
+        self.state.mcp_tasks.close();
+        let mcp_drained = tokio::time::timeout_at(deadline, self.state.mcp_tasks.wait())
+            .await
+            .is_ok();
+        let terminal = match terminal {
+            Some(message) => Some(message),
+            None if mcp_drained => None,
+            None => {
+                Some("MCP in-flight work did not drain before the shutdown deadline".to_owned())
+            }
+        };
+
         let deadline = deadline.into_std();
         #[cfg(feature = "test-support")]
         if shutdown_deadline_active(deadline)

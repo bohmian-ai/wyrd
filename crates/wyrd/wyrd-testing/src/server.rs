@@ -568,6 +568,8 @@ pub struct WyrdTestServerBuilder {
     bifrost_storage_io: wyrd_server::config::BifrostStorageIoConfig,
     /// Test-only request to panic the bound serve task after its drain returns.
     serve_task_panic_for_test: bool,
+    /// Register the test-support MCP context probe in the `/mcp` tool catalog.
+    mcp_context_probe: bool,
 }
 
 /// Test-only file paths for one replica's Bifrost peer identity and trust root.
@@ -642,6 +644,7 @@ impl Default for WyrdTestServerBuilder {
             shutdown_drain_for_test: None,
             bifrost_storage_io: wyrd_server::config::BifrostStorageIoConfig::default(),
             serve_task_panic_for_test: false,
+            mcp_context_probe: false,
         }
     }
 }
@@ -3191,6 +3194,19 @@ impl WyrdTestServerBuilder {
     /// `AppState::with_limits` the server uses, so the router under test is the
     /// composed production router with one configuration value changed.
     #[must_use]
+    /// Register the test-support MCP context probe in this server's `/mcp`
+    /// tool catalog.
+    ///
+    /// Default off. Only MCP connectivity journeys opt in: the probe is not a
+    /// production capability and must not appear in the catalog an ordinary
+    /// test server serves, so this is the single explicit switch that exposes
+    /// it. Compiling `test-support` alone never registers it.
+    #[must_use]
+    pub fn with_mcp_context_probe_for_test(mut self) -> Self {
+        self.mcp_context_probe = true;
+        self
+    }
+
     pub fn with_limits_for_test(mut self, limits: wyrd_server::state::LimitsConfig) -> Self {
         self.limits = Some(limits);
         self
@@ -4042,6 +4058,7 @@ impl WyrdTestServerBuilder {
         if let Some(limits) = self.limits {
             state = state.with_limits(limits);
         }
+        state = state.with_mcp_context_probe(self.mcp_context_probe);
         state.authz.permission_check = Arc::new(RbacCheck);
         state.authz.audit_writer = self
             .audit_writer

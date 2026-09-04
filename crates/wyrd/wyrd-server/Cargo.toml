@@ -35,6 +35,13 @@ tokio = { workspace = true, features = ["signal", "net"] }
 tokio-util = { workspace = true }
 url = { workspace = true }
 axum = { workspace = true }
+# Streamable HTTP MCP server only: `wyrd-server` serves the protocol, it never
+# connects as an MCP client.
+rmcp = { workspace = true, features = [
+    "server",
+    "macros",
+    "transport-streamable-http-server",
+] }
 vala-eval = { workspace = true }
 wyrd-telemetry = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }

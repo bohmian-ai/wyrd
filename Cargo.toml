@@ -84,6 +84,9 @@ axum = "0.8"
 # opts into the narrowest transport surface it serves: `wyrd-server` mounts the
 # Streamable HTTP server, `wyrd-mcp` connects the Streamable HTTP client.
 rmcp = { version = "3.2.0", default-features = false }
+# Server-sent-event types named in `rmcp`'s Streamable HTTP client trait
+# signatures. Wyrd never parses SSE itself; it only has to name the type.
+sse-stream = "0.2.4"
 http = "1"
 http-body = "1"
 serde = { version = "1", features = ["derive"] }

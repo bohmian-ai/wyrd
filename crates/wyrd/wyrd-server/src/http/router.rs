@@ -57,8 +57,24 @@ pub fn build_router(state: AppState) -> Router {
             require_authenticated,
         ));
 
+    // One MCP endpoint on the one public listener. It sits inside the same
+    // protected edge as `/v1` — request-id, panic capture, load-shed,
+    // concurrency, timeout, body limit — and carries the same default-deny
+    // authentication, so `rmcp` never sees an unverified caller. The route is
+    // not nested under `/v1`: the MCP protocol version, not the Wyrd API
+    // version, governs this surface's compatibility.
+    let mcp_route = Router::new()
+        .route_service("/mcp", crate::mcp::mcp_service(&state))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_authenticated,
+        ));
+
     let protected = apply_protected_edge(
-        Router::new().merge(auth_routes).nest("/v1", v1_group),
+        Router::new()
+            .merge(auth_routes)
+            .merge(mcp_route)
+            .nest("/v1", v1_group),
         &state,
     );
 

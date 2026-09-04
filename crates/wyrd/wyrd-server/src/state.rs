@@ -1964,6 +1964,21 @@ pub struct AppState {
     pub deployment_profile: DeploymentProfile,
     /// Shared cancellation token for cooperative shutdown.
     pub shutdown_token: CancellationToken,
+    /// In-flight MCP tool work for this process.
+    ///
+    /// Every `/mcp` tool invocation holds an RAII token for the life of its
+    /// work, including cancellation cleanup. After the supervised transport
+    /// drain stops admission, `BoundServer::run` closes this tracker and waits
+    /// for it inside the existing shutdown deadline, so a pod cannot report a
+    /// clean drain while an MCP handler is still settling.
+    pub mcp_tasks: tokio_util::task::TaskTracker,
+    /// Register the test-support MCP context probe in the `/mcp` tool catalog.
+    ///
+    /// Default `false`: only a test server that explicitly opted in through
+    /// `WyrdTestServerBuilder::with_mcp_context_probe_for_test` exposes it, so
+    /// merely compiling `test-support` never adds a capability to the catalog.
+    #[cfg(feature = "test-support")]
+    pub mcp_context_probe: bool,
     /// Telemetry guard (holds the tracer provider).
     pub telemetry: Arc<TelemetryGuard>,
     /// Request-shaping limits for the router middleware stack.
@@ -2004,6 +2019,9 @@ impl AppState {
             authz: ServerAuthz::default(),
             deployment_profile: DeploymentProfile::Development,
             shutdown_token,
+            mcp_tasks: tokio_util::task::TaskTracker::new(),
+            #[cfg(feature = "test-support")]
+            mcp_context_probe: false,
             telemetry: Arc::new(wyrd_telemetry::init_test_only_no_global(
                 wyrd_telemetry::TelemetryConfig::default(),
             )),
@@ -2024,6 +2042,18 @@ impl AppState {
     #[must_use]
     pub fn with_eval_audit(mut self, eval_audit: Arc<dyn EvalAuditWriter>) -> Self {
         self.eval_audit = eval_audit;
+        self
+    }
+
+    /// Register the test-support MCP context probe on this state.
+    ///
+    /// Connectivity journeys call this through
+    /// `WyrdTestServerBuilder::with_mcp_context_probe_for_test`; ordinary test
+    /// servers leave the catalog empty.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn with_mcp_context_probe(mut self, enabled: bool) -> Self {
+        self.mcp_context_probe = enabled;
         self
     }
 

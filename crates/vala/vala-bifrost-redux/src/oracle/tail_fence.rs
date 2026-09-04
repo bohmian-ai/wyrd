@@ -233,7 +233,7 @@ impl TailFenceDrainer<'_> {
     ///
     /// # Errors
     /// Returns visibility unavailable when the catalog namespace is malformed.
-    fn wire_binding(
+    pub(super) fn wire_binding(
         cut: &PinnedSealedTable,
     ) -> Result<wyrd_spec::vala::api::TenantTableBinding, BifrostError> {
         Ok(wyrd_spec::vala::api::TenantTableBinding {

@@ -58,7 +58,7 @@ impl AnalyticalScanSource {
     /// Returns the stable non-secret identity rendered in plan diagnostics.
     fn label(&self) -> &str {
         match self {
-            Self::LocalDrained { key } => key.local_table(),
+            Self::LocalDrained { key } => key.local_table().unwrap_or("local"),
             Self::Assigned { assignment, .. } => assignment.scan_id.as_str(),
         }
     }
@@ -113,6 +113,19 @@ impl AnalyticalScanExec {
     #[must_use]
     pub(super) fn local_drained(key: OracleSourceKey, schema: SchemaRef) -> Self {
         Self::with_source(AnalyticalScanSource::LocalDrained { key }, schema, 1)
+    }
+
+    /// Returns the planned key when this leaf is the leader's drained tail.
+    ///
+    /// Encoding consults this to decide whether the leaf can cross the wire at
+    /// all: a drained tail exists only on the node that drained it, so a stage
+    /// carrying one may be dispatched only when the tail bound no rows.
+    #[must_use]
+    pub(super) fn local_drained_key(&self) -> Option<&OracleSourceKey> {
+        match &self.source {
+            AnalyticalScanSource::LocalDrained { key } => Some(key),
+            AnalyticalScanSource::Assigned { .. } => None,
+        }
     }
 
     /// Builds one leaf around an already-chosen source and advertised shape.

@@ -7235,6 +7235,257 @@ mod tests {
         assert_ambiguous_release_retains_until_acknowledged(expires_at).await;
         assert_expiry_needs_both_clocks().await;
     }
+
+    /// Builds one frozen destination distinguishable by node identity.
+    fn frozen_destination(endpoint: &str) -> super::super::dispatcher::DispatchCandidate {
+        super::super::dispatcher::DispatchCandidate {
+            node_id: NodeId::new(uuid::Uuid::now_v7()),
+            role: wyrd_spec::vala::api::ClusterRole::Oracle,
+            worker_fence: 7,
+            endpoint: Some(endpoint.to_owned()),
+        }
+    }
+
+    /// Builds one destination-bound remote placeholder over a one-column schema.
+    fn bound_placeholder(
+        scan_id: &str,
+        destination: &super::super::dispatcher::DispatchCandidate,
+    ) -> super::super::codec::RemoteSourcePlaceholderExec {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        super::super::codec::RemoteSourcePlaceholderExec::new(scan_id, "fingerprint", schema)
+            .with_destination(destination.clone())
+    }
+
+    /// Builds the signed assignment a bound placeholder resolves through, with
+    /// distinguishable files so a task's share is identifiable by path.
+    fn split_fixture_assignment(
+        scan_id: &str,
+        files: usize,
+    ) -> wyrd_spec::vala::api::FollowerScanAssignment {
+        wyrd_spec::vala::api::FollowerScanAssignment {
+            scan_id: scan_id.to_owned(),
+            binding: wyrd_spec::vala::api::TenantTableBinding {
+                tenant_id: wyrd_spec::DataTenantId::new_v7(),
+                namespace: "traces".to_owned(),
+                table: "spans".to_owned(),
+            },
+            persisted: wyrd_spec::vala::api::PersistedFileAssignment {
+                files: (0..files)
+                    .map(|index| {
+                        super::super::test_persisted_descriptor(&format!("memory:///f{index}"))
+                    })
+                    .collect(),
+            },
+            scribe_provider_cut: None,
+            schema_fingerprint: "fingerprint".to_owned(),
+            required_columns: vec!["value".to_owned()],
+            predicates: Vec::new(),
+        }
+    }
+
+    /// A substituted leaf receives the cut's budget and is never forced past it.
+    ///
+    /// The placeholder can read its own local plan, so a stage the planner
+    /// leaves on the leader is correct rather than unreadable. Forcing a
+    /// minimum here would inject a boundary above every scannable cut and
+    /// distribute queries the leader could answer alone.
+    async fn assert_leaf_holds_exactly_the_cut_budget(
+        leaf: &Arc<dyn ExecutionPlan>,
+        budget: usize,
+        expected: usize,
+    ) {
+        // `budget` stands for both participants and scannable units; the count
+        // is their minimum, so passing it twice names the cut's real ceiling.
+        let response = datafusion_distributed::DesiredTaskCountHandler::handle(
+            &AnalyticalCutTaskCount::new(budget, budget),
+            datafusion_distributed::DesiredTaskCountEvent {
+                plan: leaf,
+                session_config: &datafusion::prelude::SessionConfig::new(),
+            },
+        )
+        .await
+        .expect("a leaf node is always answered")
+        .expect("the cut count never fails");
+        assert!(
+            matches!(
+                response.task_count,
+                datafusion_distributed::TaskCountAnnotation::Desired(tasks) if tasks == expected
+            ),
+            "a leaf must hold exactly {expected} tasks, saw {:?}",
+            response.task_count
+        );
+    }
+
+    /// Only the frozen participant receives a remote-bearing stage, and a
+    /// contradictory or unauthorized stage fails before any task is submitted.
+    fn assert_stage_routes_only_to_frozen_destination(
+        leaf: &Arc<dyn ExecutionPlan>,
+        destination: &super::super::dispatcher::DispatchCandidate,
+        url: &Url,
+    ) {
+        let stage: Arc<dyn ExecutionPlan> = Arc::new(
+            datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec::new(
+                Arc::clone(leaf),
+            ),
+        );
+        let router = OracleRouteTasks {
+            destinations: vec![(url.clone(), destination.clone())],
+        };
+        let task_ctx = Arc::new(datafusion::execution::TaskContext::default());
+        let assigned = datafusion_distributed::RouteTasksHandler::handle(
+            &router,
+            datafusion_distributed::RouteTasksEvent {
+                task_ctx: Arc::clone(&task_ctx),
+                plan: &stage,
+                task_count: 2,
+            },
+        )
+        .expect("a remote-bearing stage is routed")
+        .expect("an in-roster destination routes");
+        assert_eq!(assigned.urls, vec![url.clone(), url.clone()]);
+
+        // A stage with no remote leaf is left to the ordinary bounded pool.
+        let local: Arc<dyn ExecutionPlan> = Arc::new(
+            datafusion::physical_plan::empty::EmptyExec::new(leaf.schema()),
+        );
+        assert!(
+            datafusion_distributed::RouteTasksHandler::handle(
+                &router,
+                datafusion_distributed::RouteTasksEvent {
+                    task_ctx: Arc::clone(&task_ctx),
+                    plan: &local,
+                    task_count: 1,
+                },
+            )
+            .is_none(),
+            "a stage with no remote leaf defers to the bounded worker pool"
+        );
+
+        // Two distinct destinations in one stage fail before dispatch.
+        let other = frozen_destination("http://peer-b:9000/");
+        let conflicted = datafusion::physical_plan::union::UnionExec::try_new(vec![
+            Arc::clone(leaf),
+            Arc::new(bound_placeholder("oracle:spans:persisted", &other)) as Arc<dyn ExecutionPlan>,
+        ])
+        .expect("two identical schemas union");
+        assert!(
+            datafusion_distributed::RouteTasksHandler::handle(
+                &router,
+                datafusion_distributed::RouteTasksEvent {
+                    task_ctx: Arc::clone(&task_ctx),
+                    plan: &conflicted,
+                    task_count: 2,
+                },
+            )
+            .expect("a remote-bearing stage is answered")
+            .is_err(),
+            "a stage naming two frozen destinations must fail before dispatch"
+        );
+
+        // A destination outside the frozen roster is refused the same way.
+        let stranger: Arc<dyn ExecutionPlan> =
+            Arc::new(bound_placeholder("oracle:spans:persisted", &other));
+        assert!(
+            datafusion_distributed::RouteTasksHandler::handle(
+                &router,
+                datafusion_distributed::RouteTasksEvent {
+                    task_ctx: Arc::clone(&task_ctx),
+                    plan: &stranger,
+                    task_count: 1,
+                },
+            )
+            .expect("a remote-bearing stage is answered")
+            .is_err(),
+            "a destination outside the frozen roster must fail before dispatch"
+        );
+    }
+
+    /// The stage's tasks divide the one bound source instead of each reading
+    /// all of it, and a live Scribe source resolves exactly once.
+    fn assert_task_variants_divide_the_bound_source(
+        placeholder: &super::super::codec::RemoteSourcePlaceholderExec,
+        destination: &super::super::dispatcher::DispatchCandidate,
+    ) {
+        let assignment = split_fixture_assignment("oracle:spans:persisted", 5);
+        let mut seen = Vec::new();
+        for task in 0..2_usize {
+            let variant = placeholder.clone().with_task_share(task, 2);
+            seen.extend(
+                variant
+                    .narrow(assignment.clone())
+                    .persisted
+                    .files
+                    .iter()
+                    .map(|file| file.path().to_owned()),
+            );
+        }
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec![
+                "memory:///f0".to_owned(),
+                "memory:///f1".to_owned(),
+                "memory:///f2".to_owned(),
+                "memory:///f3".to_owned(),
+                "memory:///f4".to_owned(),
+            ],
+            "every signed file belongs to exactly one task variant"
+        );
+
+        let scribe = bound_placeholder("oracle:spans:scribe:node:1:live", destination);
+        let variants = AnalyticalLeafSplit::variants(&scribe, 2);
+        assert_eq!(variants.len(), 2, "one variant per stage task");
+        assert!(
+            variants[0]
+                .downcast_ref::<super::super::codec::RemoteSourcePlaceholderExec>()
+                .is_some(),
+            "task index zero retains the live Scribe source"
+        );
+        assert!(
+            variants[1]
+                .downcast_ref::<datafusion::physical_plan::empty::EmptyExec>()
+                .is_some(),
+            "only task index zero resolves a live Scribe source"
+        );
+        assert!(
+            AnalyticalLeafSplit::variants(placeholder, 2)
+                .iter()
+                .all(|variant| variant
+                    .downcast_ref::<super::super::codec::RemoteSourcePlaceholderExec>()
+                    .is_some()),
+            "a file-backed leaf keeps one share-carrying placeholder per task"
+        );
+    }
+
+    /// A single-partition remote leaf keeps a forced, destination-bound stage.
+    ///
+    /// These properties are proved together because they are one contract: a
+    /// leaf the leader cannot read must not collapse back onto the leader, its
+    /// stage must route only to the participant the roster froze for it, a
+    /// contradictory or unauthorized stage must fail before any task is
+    /// submitted, and the stage's tasks must divide the one bound source
+    /// rather than each reading all of it.
+    #[tokio::test]
+    async fn single_partition_remote_leaf_keeps_destination_bound_stage() {
+        let destination = frozen_destination("http://peer-a:9000/");
+        let url = Url::parse("http://peer-a:9000/").expect("frozen endpoint parses");
+        let placeholder = bound_placeholder("oracle:spans:persisted", &destination);
+        let leaf: Arc<dyn ExecutionPlan> = Arc::new(placeholder.clone());
+
+        assert_leaf_holds_exactly_the_cut_budget(&leaf, 3, 3).await;
+        // A leader-owned leaf beside it stays single-task, so its stage can
+        // never be dispatched to a peer whose codec could not decode it.
+        let leader_owned: Arc<dyn ExecutionPlan> = Arc::new(
+            datafusion::physical_plan::empty::EmptyExec::new(placeholder.schema()),
+        );
+        assert_leaf_holds_exactly_the_cut_budget(&leader_owned, 3, 1).await;
+        assert_stage_routes_only_to_frozen_destination(&leaf, &destination, &url);
+        assert_task_variants_divide_the_bound_source(&placeholder, &destination);
+    }
 }
 
 /// The exact worker set one Analytical attempt may place tasks on.
@@ -7261,13 +7512,17 @@ pub struct AnalyticalWorkerResolver {
 /// than a property of the cut, so a correctly-planned distributed query over a
 /// small table would silently collapse onto the leader.
 ///
-/// The handler answers only for leaf nodes, matching the contract of upstream's
-/// built-in estimator: answering for an inner node would override the task
-/// count its children reconciled. Registered as a *custom* handler, it is
-/// consulted before the built-in byte estimator and therefore replaces it.
+/// The handler answers for leaf nodes and for the hash repartition that opens a
+/// shuffle. Those are the two places a task count is genuinely decided: a scan
+/// cannot usefully exceed its file count, and an aggregate cannot usefully
+/// exceed the participants frozen for the attempt. Every other node reconciles
+/// from its children. Registered as a *custom* handler, it is consulted before
+/// the built-in byte estimator and therefore replaces it.
 struct AnalyticalCutTaskCount {
     /// Tasks one scan stage of this attempt may occupy, at least one.
     tasks: usize,
+    /// Participants frozen for this attempt, the ceiling for a shuffled stage.
+    participants: usize,
 }
 
 impl AnalyticalCutTaskCount {
@@ -7281,7 +7536,113 @@ impl AnalyticalCutTaskCount {
     fn new(participants: usize, work_units: usize) -> Self {
         Self {
             tasks: participants.min(work_units).max(1),
+            participants: participants.max(1),
         }
+    }
+}
+
+/// Routes every task of one isolated stage to the participant frozen for its
+/// remote leaves.
+///
+/// This is the sole destination validator and router for Oracle sources. It
+/// runs at the actual routing boundary, while the coordinator prepares worker
+/// placement and before any task is submitted or any source IO happens, so a
+/// stage that names an unauthorized or contradictory destination fails before
+/// a follower is ever contacted. Stages the planner created for its own
+/// join, aggregate, or shuffle boundaries carry no remote leaf and are deferred
+/// to the ordinary bounded worker pool.
+struct OracleRouteTasks {
+    /// The complete frozen roster, in the same order the planner sees it.
+    ///
+    /// Membership here is authorization: a leaf naming a peer absent from this
+    /// set was not admitted by the pinned participant cut.
+    destinations: Vec<(Url, super::dispatcher::DispatchCandidate)>,
+}
+
+impl OracleRouteTasks {
+    /// Collects every remote leaf destination reachable from one stage head.
+    ///
+    /// Called only from [`RouteTasksHandler::handle`]; the same traversal must
+    /// not run at any other call site, because a check that happens before the
+    /// routing boundary can be invalidated by the coordinator's own placement.
+    fn stage_destinations(
+        plan: &Arc<dyn ExecutionPlan>,
+    ) -> Vec<super::dispatcher::DispatchCandidate> {
+        let mut found = Vec::new();
+        let mut pending = vec![Arc::clone(plan)];
+        while let Some(node) = pending.pop() {
+            if let Some(placeholder) =
+                node.downcast_ref::<super::codec::RemoteSourcePlaceholderExec>()
+                && let Some(destination) = placeholder.destination()
+            {
+                found.push(destination.clone());
+            }
+            // A leaf that was scaled up is wrapped in `DistributedLeafExec`,
+            // whose per-task variants are deliberately not its `children`. The
+            // walk must descend into them explicitly, or a stage whose only
+            // remote source was split across tasks looks destination-free and
+            // falls through to upstream's random assignment — which routes the
+            // plan push and the task execution to different workers.
+            if let Some(split) = node.downcast_ref::<datafusion_distributed::DistributedLeafExec>()
+            {
+                pending.push(Arc::clone(split.original()));
+                pending.extend(split.variants().iter().map(Arc::clone));
+            }
+            pending.extend(node.children().into_iter().cloned());
+        }
+        found
+    }
+}
+
+impl datafusion_distributed::RouteTasksHandler for OracleRouteTasks {
+    /// Assigns every task slot of a remote-bearing stage to its frozen peer.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `DataFusion` execution error, before task submission, when a
+    /// stage names more than one distinct destination or names a peer that is
+    /// not in the frozen roster. Both mean the plan would read a source through
+    /// a participant the cut never authorized.
+    fn handle(
+        &self,
+        ev: datafusion_distributed::RouteTasksEvent<'_>,
+    ) -> Option<Result<datafusion_distributed::RouteTasksEventResponse, DataFusionError>> {
+        let destinations = Self::stage_destinations(ev.plan);
+        // A stage that names no frozen source is a consumer stage: it reads
+        // only through exchanges. Upstream's fallback for an unanswered event
+        // is a random assignment across the worker set, which routes a stage's
+        // plan push and its task execution to different peers and leaves the
+        // executing worker waiting for a plan that was written elsewhere.
+        // Spreading the tasks over the frozen roster in its own canonical order
+        // keeps every task on an authorized participant and keeps the two
+        // halves of one task on the same one.
+        let Some(first) = destinations.first().cloned() else {
+            if self.destinations.is_empty() {
+                return None;
+            }
+            return Some(Ok(datafusion_distributed::RouteTasksEventResponse::new(
+                (0..ev.task_count)
+                    .map(|task| self.destinations[task % self.destinations.len()].0.clone())
+                    .collect(),
+            )));
+        };
+        if destinations.iter().any(|candidate| *candidate != first) {
+            return Some(Err(DataFusionError::Execution(
+                "Oracle stage names more than one frozen destination".to_owned(),
+            )));
+        }
+        let Some((url, _)) = self
+            .destinations
+            .iter()
+            .find(|(_, candidate)| *candidate == first)
+        else {
+            return Some(Err(DataFusionError::Execution(
+                "Oracle stage names a destination outside the frozen roster".to_owned(),
+            )));
+        };
+        Some(Ok(datafusion_distributed::RouteTasksEventResponse::new(
+            vec![url.clone(); ev.task_count],
+        )))
     }
 }
 
@@ -7293,14 +7654,47 @@ impl AnalyticalCutTaskCount {
 /// count is final, which is the only point at which the split is knowable.
 struct AnalyticalLeafSplit;
 
+impl AnalyticalLeafSplit {
+    /// Builds one leaf variant per final stage task.
+    ///
+    /// A file-backed leaf yields one share-carrying placeholder per task. A
+    /// Scribe leaf yields its placeholder at task index zero and a native
+    /// schema-compatible `EmptyExec` everywhere else, because one live memtable
+    /// cut resolves exactly once and cannot be divided.
+    fn variants(
+        placeholder: &super::codec::RemoteSourcePlaceholderExec,
+        tasks: usize,
+    ) -> Vec<Arc<dyn ExecutionPlan>> {
+        let scribe = placeholder.is_scribe();
+        (0..tasks)
+            .map(|task| {
+                if scribe && task > 0 {
+                    return Arc::new(datafusion::physical_plan::empty::EmptyExec::new(
+                        placeholder.schema(),
+                    )) as Arc<dyn ExecutionPlan>;
+                }
+                Arc::new(placeholder.clone().with_task_share(task, tasks)) as Arc<dyn ExecutionPlan>
+            })
+            .collect()
+    }
+}
+
 impl datafusion_distributed::ScaleUpLeafNodeHandler for AnalyticalLeafSplit {
-    /// Replaces an assignment-bearing placeholder with one variant per task.
+    /// Replaces a remote source placeholder with one variant per stage task.
     ///
     /// The variants share schema and partition count — upstream requires both —
-    /// and differ only in the slice of signed file descriptors each carries. A
-    /// placeholder with no assignment is not ours to split, and a leaf whose
-    /// files do not divide is left with empty slices on the trailing tasks
-    /// rather than a wider share on any of them.
+    /// and differ only in the share of the bound source each names. The share
+    /// is recorded here as an index and a count rather than applied to files,
+    /// because the files do not exist yet: a planning placeholder carries no
+    /// assignment, and the codec narrows the bound assignment by this same
+    /// share when the variant is encoded. A leaf whose files do not divide
+    /// leaves empty slices on the trailing tasks rather than a wider share on
+    /// any of them.
+    ///
+    /// A Scribe leaf resolves one live memtable cut and cannot be divided at
+    /// all, so task index zero alone retains the placeholder and every other
+    /// task becomes a schema-compatible native `EmptyExec`. That is what keeps
+    /// a live tail from being read once per task.
     fn handle(
         &self,
         ev: datafusion_distributed::ScaleUpLeafNodeEvent<'_>,
@@ -7308,22 +7702,7 @@ impl datafusion_distributed::ScaleUpLeafNodeHandler for AnalyticalLeafSplit {
         let placeholder = ev
             .plan
             .downcast_ref::<super::codec::RemoteSourcePlaceholderExec>()?;
-        let assignment = placeholder.assignment()?;
-        let tasks = ev.task_count.max(1);
-        let variants = (0..tasks)
-            .map(|task| {
-                let mut narrowed = assignment.clone();
-                narrowed.persisted.files = assignment
-                    .persisted
-                    .files
-                    .iter()
-                    .skip(task)
-                    .step_by(tasks)
-                    .cloned()
-                    .collect();
-                Arc::new(placeholder.clone().with_assignment(narrowed)) as Arc<dyn ExecutionPlan>
-            })
-            .collect::<Vec<_>>();
+        let variants = Self::variants(placeholder, ev.task_count.max(1));
         Some(
             datafusion_distributed::DistributedLeafExec::try_new(Arc::clone(ev.plan), variants)
                 .map(|exec| {
@@ -7348,24 +7727,47 @@ impl datafusion_distributed::DesiredTaskCountHandler for AnalyticalCutTaskCount 
     ) -> Option<Result<datafusion_distributed::DesiredTaskCountEventResponse, DataFusionError>>
     {
         if !ev.plan.children().is_empty() {
-            return None;
+            // A hash repartition is the head of a shuffle, and the stage it
+            // opens is bounded by participants rather than by files. Scan
+            // parallelism cannot exceed the number of objects to open, but a
+            // grouped aggregate spreads by hash of its key, so a cut holding
+            // one file can still occupy every frozen peer above the shuffle.
+            // Without this the whole plan inherits the leaf's single task and
+            // the pinned revision elides the boundary, collapsing a genuinely
+            // distributable aggregate back onto the leader.
+            return ev
+                .plan
+                .downcast_ref::<datafusion::physical_plan::repartition::RepartitionExec>()
+                .filter(|repartition| {
+                    matches!(
+                        repartition.partitioning(),
+                        datafusion::physical_plan::Partitioning::Hash(_, _)
+                    )
+                })
+                .map(|_| {
+                    Ok(
+                        datafusion_distributed::DesiredTaskCountEventResponse::desired(
+                            self.participants,
+                        ),
+                    )
+                });
         }
-        // Only a source the leader cannot read itself may occupy more than one
-        // task. Every other leaf — the published Iceberg scan, the leader's hot
-        // files, the drained local live tail — is leader-owned and carries no
-        // wire encoding, so distributing its stage would ask the codec to
-        // serialize a plan that only exists on this node. One task keeps such a
-        // stage on the leader, and the pinned revision then elides the boundary
-        // above it, which is what leaves a leader-executable query's root
-        // normal.
-        let tasks = if ev
+        // Only a substituted source may occupy more than one task. Every other
+        // leaf — the drained local live tail above all — is leader-owned and
+        // carries no wire encoding, so distributing its stage would ask the
+        // codec to serialize a plan that exists only on this node.
+        //
+        // A substituted leaf gets the cut's own budget and nothing more. It is
+        // deliberately not forced past one task: the placeholder can read its
+        // local plan here, so a stage the pinned revision chooses to leave on
+        // the leader is correct rather than unreadable, and forcing a minimum
+        // would distribute a query the leader could have answered alone.
+        let tasks = match ev
             .plan
             .downcast_ref::<super::codec::RemoteSourcePlaceholderExec>()
-            .is_some()
         {
-            self.tasks
-        } else {
-            1
+            Some(_) => self.tasks,
+            None => 1,
         };
         Some(Ok(
             datafusion_distributed::DesiredTaskCountEventResponse::desired(tasks),
@@ -7786,10 +8188,10 @@ impl AnalyticalExecutionHandle {
         oracles: &[super::participant_cut::OracleQueryParticipant],
         work_units: usize,
     ) -> Result<SessionContext, BifrostError> {
-        let urls = self
-            .remote_participants(oracles)?
-            .into_iter()
-            .map(|(url, _)| url)
+        let destinations = self.remote_participants(oracles)?;
+        let urls = destinations
+            .iter()
+            .map(|(url, _)| url.clone())
             .collect::<Vec<_>>();
         let mut config = local.copied_config();
         config.set_distributed_desired_task_count_handler(AnalyticalCutTaskCount::new(
@@ -7798,18 +8200,21 @@ impl AnalyticalExecutionHandle {
         ));
         config.set_distributed_scale_up_leaf_node_handler(AnalyticalLeafSplit);
         config.set_distributed_worker_resolver(AnalyticalWorkerResolver { urls });
-        // Bifrost's scan is one union of this table's three leader-owned source
-        // kinds — published Iceberg, leader hot files, and the drained local
-        // live tail. Upstream's isolator would give that union one task per
-        // child and therefore distribute a plan the leader alone can read, so a
-        // purely leader-executable query would come back `DistributedExec` and
-        // ask the codec to serialize leaves that exist only on this node.
+        config.set_distributed_route_tasks_handler(OracleRouteTasks { destinations });
+        // Bifrost's scan is one union of this table's leader-owned source kinds
+        // — published Iceberg, leader hot files, and the drained local live
+        // tail. Upstream's isolator would give that union one task per child
+        // and therefore place a plan the leader alone can read below a network
+        // boundary, where the codec is asked to serialize leaves that exist
+        // only on this node.
         config
             .set_distributed_children_isolator_unions(false)
             .map_err(|_| BifrostError::QueryExecutionFailed)?;
-        config.set_distributed_user_codec(super::codec::OraclePhysicalExtensionCodec::analytical(
-            self.leaf.clone(),
-        ));
+        let mut codec = super::codec::OraclePhysicalExtensionCodec::analytical(self.leaf.clone());
+        if let Some(bindings) = config.get_extension::<super::bindings::OracleExecutionLock>() {
+            codec = codec.with_bindings(bindings);
+        }
+        config.set_distributed_user_codec(codec);
         let state = datafusion::execution::session_state::SessionStateBuilder::new_from_existing(
             local.state(),
         )
@@ -7909,9 +8314,13 @@ impl AnalyticalExecutionHandle {
         config.set_distributed_scale_up_leaf_node_handler(AnalyticalLeafSplit);
         config.set_distributed_worker_resolver(AnalyticalWorkerResolver { urls });
         config.set_distributed_channel_resolver(resolver);
-        config.set_distributed_user_codec(super::codec::OraclePhysicalExtensionCodec::analytical(
-            self.leaf.clone(),
-        ));
+        // No codec is installed here. `config` is the planning session's own
+        // copied configuration, which already carries this node's Oracle codec
+        // — bound to the execution lock, which this one would not be. Upstream
+        // stores user codecs as an ordered list and encodes the position of the
+        // codec that matched, so a second entry shifts every position past the
+        // one a follower builds from its own single install, and the follower
+        // then refuses the plan with "Can't find required codec in codec list".
         let state = datafusion::execution::session_state::SessionStateBuilder::new()
             .with_default_features()
             .with_config(config)
@@ -7919,6 +8328,28 @@ impl AnalyticalExecutionHandle {
             .with_distributed_planner()
             .build();
         Ok(SessionContext::new_with_state(state))
+    }
+
+    /// Returns the frozen non-leader participants a cut may delegate a source to.
+    ///
+    /// This is the roster the planner freezes destinations from, in cut order.
+    /// It is deliberately distinct from [`AnalyticalWorkerResolver`]'s
+    /// undifferentiated pool: a source placeholder names exactly one of these,
+    /// and the route handler refuses a stage that names anything else.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::Internal`] when a frozen participant endpoint is
+    /// not a valid URL.
+    pub(super) fn frozen_destinations(
+        &self,
+        oracles: &[super::participant_cut::OracleQueryParticipant],
+    ) -> Result<Vec<super::dispatcher::DispatchCandidate>, BifrostError> {
+        Ok(self
+            .remote_participants(oracles)?
+            .into_iter()
+            .map(|(_, candidate)| candidate)
+            .collect())
     }
 
     /// Projects the remote participants this attempt may address, without IO.

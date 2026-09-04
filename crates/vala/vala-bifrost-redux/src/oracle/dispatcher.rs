@@ -3107,7 +3107,7 @@ fn stream_status_error(status: &Status) -> DispatchError {
 }
 
 /// Immutable worker candidate with its role fence.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DispatchCandidate {
     /// Worker node identity.
     pub node_id: NodeId,

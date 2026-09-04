@@ -134,6 +134,7 @@ impl OraclePlanner {
                 context: context.clone(),
                 table_name: table_name.clone(),
                 audit: Arc::clone(&audit),
+                remote: None,
             })
             .await
             .map_err(|error| map_datafusion_error(&error))?;

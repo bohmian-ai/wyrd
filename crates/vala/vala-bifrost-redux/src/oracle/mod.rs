@@ -2777,6 +2777,7 @@ impl Oracle {
         &self,
         audit: CutAuditInput<'_>,
         config: &datafusion::prelude::SessionConfig,
+        root: Option<&dyn ExecutionPlan>,
         cut_deadline: chrono::DateTime<chrono::Utc>,
         phases: &mut AttemptPhaseTimer,
     ) -> Result<Arc<bindings::OracleExecutionLock>, BifrostError> {
@@ -2788,10 +2789,13 @@ impl Oracle {
         self.bind_execution_sources(
             config,
             admitted,
-            query_class,
             cut_deadline,
-            cuts,
-            &mut drained,
+            PlannedSources {
+                query_class,
+                cuts,
+                root,
+                drained: &mut drained,
+            },
         )
     }
 
@@ -2865,6 +2869,7 @@ impl Oracle {
                     admitted: &admitted,
                 },
                 &retained.config,
+                Some(retained.root.as_ref()),
                 participant_cut.deadline(),
                 &mut phases,
             )
@@ -3028,16 +3033,20 @@ impl Oracle {
         &self,
         config: &datafusion::prelude::SessionConfig,
         admitted: &AdmittedQueryGuard,
-        query_class: QueryClass,
         deadline: chrono::DateTime<chrono::Utc>,
-        cuts: &[PinnedSealedTable],
-        drained: &mut DrainedTails,
+        sources: PlannedSources<'_>,
     ) -> Result<Arc<bindings::OracleExecutionLock>, BifrostError> {
+        let PlannedSources {
+            query_class,
+            cuts,
+            root,
+            drained,
+        } = sources;
         let lock = config
             .get_extension::<bindings::OracleExecutionLock>()
             .ok_or(BifrostError::QueryExecutionFailed)?;
         let mut local_batches = std::mem::take(&mut drained.batches);
-        let planned = cuts
+        let mut planned = cuts
             .iter()
             .map(|cut| {
                 let table = cut.binding.table_ref.fqn();
@@ -3045,6 +3054,24 @@ impl Oracle {
                 bindings::OracleSourceKey::LocalDrained { table }
             })
             .collect::<Vec<_>>();
+        let mut follower_assignments = std::collections::HashMap::new();
+        for placeholder in root.map(remote_placeholders).unwrap_or_default() {
+            let cut = cuts
+                .iter()
+                .find(|cut| {
+                    persisted_follower_scan_id(&cut.binding.table_ref.fqn())
+                        == placeholder.scan_id()
+                })
+                .ok_or(BifrostError::QueryExecutionFailed)?;
+            let Some(key) = placeholder.source_key() else {
+                continue;
+            };
+            follower_assignments.insert(
+                placeholder.scan_id().to_owned(),
+                follower_scan_assignment(cut, &placeholder)?,
+            );
+            planned.push(key);
+        }
         let value = bindings::OracleExecutionBindings::try_new(
             bindings::OracleExecutionBindingInputs {
                 grant: bindings::OracleExecutionGrant {
@@ -3055,6 +3082,7 @@ impl Oracle {
                     telemetry: Arc::clone(&self.telemetry),
                 },
                 local_batches,
+                follower_assignments,
                 reservations: std::mem::take(&mut drained.reservations),
                 degraded: drained.degraded,
             },
@@ -3438,10 +3466,13 @@ impl Oracle {
         let bound = match self.bind_execution_sources(
             &session.copied_config(),
             &admitted,
-            class,
             absolute_deadline(options.deadline),
-            &cuts,
-            &mut drained,
+            PlannedSources {
+                query_class: class,
+                cuts: &cuts,
+                root: None,
+                drained: &mut drained,
+            },
         ) {
             Ok(bound) => bound,
             Err(error) => {
@@ -3755,16 +3786,36 @@ impl Oracle {
         session: &SessionContext,
         context: &AuthorizedQueryContext,
         cuts: &[PinnedSealedTable],
+        destinations: &[dispatcher::DispatchCandidate],
     ) -> Result<(), BifrostError> {
-        for cut in cuts {
+        for (index, cut) in cuts.iter().enumerate() {
             let table_name = cut.binding.table_ref.fqn();
+            // A cut delegates its persisted sources only when the frozen roster
+            // actually holds another Oracle and this cut has a published or hot
+            // object for it to read. Every other cut stays leader-local, which
+            // is what leaves a leader-executable query's root normal.
+            let scannable = !cut.iceberg_files.is_empty() || !cut.hot_files.is_empty();
+            let remote = destinations
+                .get(index % destinations.len().max(1))
+                .filter(|_| scannable)
+                .map(|destination| exec::OracleRemoteSource {
+                    scan_id: persisted_follower_scan_id(&table_name),
+                    destination: destination.clone(),
+                });
+            // The leader keeps its own hot sources even when a remote owner is
+            // frozen. The placeholder that substitutes them still carries them
+            // as its local plan, so dropping them here would leave the leader
+            // with nothing to read whenever the planner declines to distribute
+            // this cut. The follower reads the same files from its assignment.
+            let hot_files = self.local_hot_sources(cut)?;
             let provider = OracleTableProvider::try_new(OracleTableInputs {
                 table: cut.iceberg_table.clone(),
                 storage: Arc::clone(self.catalog.storage()),
-                hot_files: self.local_hot_sources(cut)?,
+                hot_files,
                 context: context.clone(),
                 table_name,
                 audit: Arc::clone(&self.audit),
+                remote,
             })
             .await
             .map_err(|error| map_datafusion_error(&error))?;
@@ -3884,7 +3935,17 @@ impl Oracle {
             .with_runtime_env(Arc::clone(&self.planning_runtime))
             .build();
         let planning = SessionContext::new_with_state(state);
-        self.register_cut_providers(&planning, context, cuts)
+        // Substitution is unconditional once a roster exists: the placeholder
+        // carries the real leaf as its local plan, so a cut the planner leaves
+        // on the leader is still read here. Gating on work units instead would
+        // make remoteness a property of how many files a cut happens to hold,
+        // which cannot express a query whose scan stays local while its
+        // aggregate distributes.
+        let destinations = match self.analytical.as_ref() {
+            Some(handle) => handle.frozen_destinations(oracles)?,
+            None => Vec::new(),
+        };
+        self.register_cut_providers(&planning, context, cuts, &destinations)
             .await?;
         let planning = match self.analytical.as_ref() {
             Some(handle) => handle.planning_session(&planning, oracles, work_units)?,
@@ -3963,6 +4024,156 @@ async fn await_first_batch(
     tokio::time::timeout(remaining, batches.next())
         .await
         .map_err(|_| BifrostError::QueryTimeout)
+}
+
+/// Projects one pinned Iceberg manifest entry into the descriptor a follower is
+/// signed to read.
+///
+/// The pinned snapshot is the object's publication authority, so a cut with no
+/// snapshot yields zero — a value descriptor validation refuses — rather than
+/// inventing one. Unusable event-time statistics reach the wire as the absent
+/// pair, which is the descriptor's only representation of "retain this file".
+fn iceberg_file_descriptor(
+    file: &crate::catalog::PinnedIcebergFile,
+    snapshot_id: Option<i64>,
+) -> PersistedFileDescriptor {
+    let (min_event_time_micros, max_event_time_micros) = file.event_time.descriptor_pair();
+    PersistedFileDescriptor::Iceberg(wyrd_spec::vala::api::IcebergFileDescriptor {
+        path: file.file_path.clone(),
+        size_bytes: file.file_size,
+        row_count: file.row_count,
+        snapshot_id: snapshot_id.unwrap_or_default(),
+        min_event_time_micros,
+        max_event_time_micros,
+    })
+}
+
+/// Projects one unresolved `vala.file_list` row into the descriptor a follower
+/// is signed to read.
+///
+/// The row's identity and decoded checksum are what let a follower resolve the
+/// object without querying the catalog by path, and are what make the hot
+/// metadata cache key safe: two distinct objects that shared a key would return
+/// one object's footer for the other's rows.
+///
+/// # Errors
+/// Returns [`BifrostError::QueryExecutionFailed`] when the row's checksum is
+/// absent, not valid hex, not exactly 32 decoded bytes, or all zero, and when
+/// its durable size or row count cannot be represented. Defaulting any of these
+/// would mint a valid-looking identity — every unchecksummed object in a tenant
+/// would share the all-zero key — so the query fails here, before the
+/// descriptor is signed and before any provider, cache, or object I/O sees it.
+fn hot_file_descriptor(
+    row: &vala_sql::row_types::file_list::HotFileRow,
+) -> Result<PersistedFileDescriptor, BifrostError> {
+    let event_time = crate::catalog::event_time::EventTimeStatistics::from_catalog_timestamps(
+        row.min_event_time,
+        row.max_event_time,
+    );
+    let (min_event_time_micros, max_event_time_micros) = event_time.descriptor_pair();
+    let sha256 = row
+        .file_checksum
+        .as_deref()
+        .and_then(|hex| hex::decode(hex).ok())
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes.as_slice()).ok())
+        .filter(|sha256| sha256 != &[0_u8; 32])
+        .ok_or(BifrostError::QueryExecutionFailed)?;
+    Ok(PersistedFileDescriptor::Hot(
+        wyrd_spec::vala::api::HotFileDescriptor {
+            path: row.file_path.clone(),
+            size_bytes: u64::try_from(row.file_size)
+                .map_err(|_| BifrostError::QueryExecutionFailed)?,
+            row_count: u64::try_from(row.row_count)
+                .map_err(|_| BifrostError::QueryExecutionFailed)?,
+            file_list_id: row.id,
+            sha256,
+            min_event_time_micros,
+            max_event_time_micros,
+        },
+    ))
+}
+
+/// Everything one attempt's binding step needs to publish its planned sources.
+///
+/// Grouping these keeps the class, the pinned cuts, the retained root, and the
+/// drained tails travelling together: each is only meaningful for the same
+/// single attempt, and the retained root is what decides which of the cuts'
+/// sources were actually planned as remote.
+struct PlannedSources<'a> {
+    /// Class derived from the retained physical root and admitted under.
+    query_class: QueryClass,
+    /// The attempt's immutable pinned table cuts, in plan order.
+    cuts: &'a [PinnedSealedTable],
+    /// Retained physical root, absent on the typed path, which plans its own
+    /// providers and never produces a remote leaf.
+    root: Option<&'a dyn ExecutionPlan>,
+    /// Audited drain output, moved into the published bindings.
+    drained: &'a mut DrainedTails,
+}
+
+/// Collects every remote source placeholder reachable from one retained root.
+///
+/// The retained root is the only authority on which sources the single planner
+/// actually kept: a cut may pin a remote owner and still be planned away by
+/// projection or pruning, and binding an assignment for a leaf that no longer
+/// exists would make the binding set disagree with the plan it governs.
+fn remote_placeholders(root: &dyn ExecutionPlan) -> Vec<codec::RemoteSourcePlaceholderExec> {
+    let mut found = Vec::new();
+    let mut pending: Vec<&dyn ExecutionPlan> = vec![root];
+    while let Some(node) = pending.pop() {
+        if let Some(placeholder) = node.downcast_ref::<codec::RemoteSourcePlaceholderExec>() {
+            found.push(placeholder.clone());
+        }
+        for child in node.children() {
+            pending.push(child.as_ref());
+        }
+    }
+    found
+}
+
+/// Builds the one assignment a cut's frozen remote owner is signed to read.
+///
+/// Every published Iceberg object and every unpublished hot object the cut
+/// pinned becomes a descriptor here, in cut order, because the leader registered
+/// no local reader for them. The closure and predicates come from the planned
+/// placeholder rather than being recomputed, so what the follower is authorized
+/// to read is exactly what the retained plan projected.
+///
+/// # Errors
+///
+/// Returns [`BifrostError::QueryExecutionFailed`] when a pinned hot row carries
+/// no usable durable identity, which would otherwise mint a valid-looking but
+/// colliding object key.
+fn follower_scan_assignment(
+    cut: &PinnedSealedTable,
+    placeholder: &codec::RemoteSourcePlaceholderExec,
+) -> Result<wyrd_spec::vala::api::FollowerScanAssignment, BifrostError> {
+    let mut files = cut
+        .iceberg_files
+        .iter()
+        .map(|file| iceberg_file_descriptor(file, cut.snapshot_id))
+        .collect::<Vec<_>>();
+    for row in &cut.hot_files {
+        files.push(hot_file_descriptor(row)?);
+    }
+    Ok(wyrd_spec::vala::api::FollowerScanAssignment {
+        scan_id: placeholder.scan_id().to_owned(),
+        binding: tail_fence::TailFenceDrainer::wire_binding(cut)?,
+        persisted: wyrd_spec::vala::api::PersistedFileAssignment { files },
+        scribe_provider_cut: None,
+        schema_fingerprint: assignment_schema_fingerprint(&placeholder.schema()),
+        required_columns: placeholder.required_columns().to_vec(),
+        predicates: placeholder.predicates().to_vec(),
+    })
+}
+
+/// Derives the stable scan identity one cut's remote persisted sources bind by.
+///
+/// Leader and binder both compute it from the canonical table name alone, so
+/// the planned placeholder and the assignment published after admission name
+/// the same source without either side carrying the other's state.
+fn persisted_follower_scan_id(table: &str) -> String {
+    format!("oracle:{table}:persisted")
 }
 
 /// Computes the fingerprint a follower scan assignment must carry for a schema,

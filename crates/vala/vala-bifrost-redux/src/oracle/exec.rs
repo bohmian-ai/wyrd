@@ -1203,6 +1203,21 @@ pub(crate) struct HotFileSource {
     pub(crate) metadata_key: crate::storage::HotMetadataKey,
 }
 
+/// One table cut's persisted sources delegated to a frozen remote participant.
+///
+/// Present only when the pinned cut decided this table's published Iceberg
+/// objects and leader hot files are read by another Oracle rather than by this
+/// leader. It is private stage authority: the destination is the exact
+/// participant the roster froze for this source, and the route handler refuses
+/// any stage whose leaves do not all name it.
+#[derive(Debug, Clone)]
+pub(crate) struct OracleRemoteSource {
+    /// Stable request-local scan identity the bound assignment is keyed by.
+    pub(crate) scan_id: String,
+    /// The one frozen participant every task of this leaf's stage routes to.
+    pub(crate) destination: super::dispatcher::DispatchCandidate,
+}
+
 /// Complete immutable inputs for constructing one authenticated table provider.
 pub(crate) struct OracleTableInputs {
     /// Pinned Iceberg table for the sealed cut.
@@ -1217,6 +1232,9 @@ pub(crate) struct OracleTableInputs {
     pub(crate) table_name: String,
     /// Mandatory audit collaborator.
     pub(crate) audit: Arc<dyn OracleAudit>,
+    /// Frozen remote owner of this cut's persisted sources, when the cut chose
+    /// one. `None` keeps every persisted leaf leader-local.
+    pub(crate) remote: Option<OracleRemoteSource>,
 }
 
 /// Complete physical provider for one authenticated table visibility cut.
@@ -1239,6 +1257,9 @@ pub(crate) struct OracleTableProvider {
     table: String,
     /// Standard read/security audit collaborator.
     audit: Arc<dyn OracleAudit>,
+    /// Frozen remote owner of this cut's persisted sources, when the cut chose
+    /// one. `None` keeps every persisted leaf leader-local.
+    remote: Option<OracleRemoteSource>,
 }
 
 impl fmt::Debug for OracleTableProvider {
@@ -1333,6 +1354,7 @@ impl OracleTableProvider {
             context,
             table_name,
             audit,
+            remote,
         } = inputs;
         let file_io = table.file_io().clone();
         let iceberg = IcebergStaticTableProvider::try_new_from_table(table)
@@ -1350,6 +1372,7 @@ impl OracleTableProvider {
             context,
             table: table_name,
             audit,
+            remote,
         })
     }
 }
@@ -1364,6 +1387,100 @@ impl OracleTableProvider {
     /// can never be pruned against this source.
     fn classify_filter_for_table(&self, filter: &Expr) -> FilterClassification {
         classify_filter_for_schema(&self.physical_schema, filter)
+    }
+
+    /// Builds this cut's persisted leaves — published Iceberg objects and the
+    /// leader's unpublished hot files — under the closure the caller derived.
+    ///
+    /// When the cut froze a remote owner for those sources the built leaves are
+    /// substituted by one destination-bound placeholder that still carries them
+    /// as its local plan. Substituting unconditionally is what keeps the
+    /// *planner* — not this provider — the thing that decides whether the cut
+    /// is read here or by a follower: the leaf reads its own local plan when it
+    /// stays in the head stage, and encodes the follower assignment when the
+    /// planner puts a boundary above it. Forcing a boundary here instead would
+    /// distribute every query over a scannable cut, including one the leader
+    /// could answer alone. The placeholder carries no assignment: the files it
+    /// may read are bound after admission and the audited drain, never at
+    /// planning time.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `DataFusion` planning error when the Iceberg provider refuses
+    /// the projection or a leaf cannot be normalized to the closure order.
+    async fn persisted_inputs(
+        &self,
+        state: &dyn Session,
+        scan_projection: &OracleScanProjection,
+        supported_filters: &[Expr],
+        supported_predicates: &[wyrd_spec::vala::assignment_authority::ScanPredicate],
+        limit: Option<usize>,
+    ) -> DataFusionResult<Vec<Arc<dyn ExecutionPlan>>> {
+        let required_schema = Arc::clone(&scan_projection.required_schema);
+        let mut inputs: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
+        {
+            // `limit` is forwarded only as a per-leaf upper bound; DataFusion's
+            // own global limit above this provider remains authoritative. The
+            // closure's physical indices are what keep unrequested columns out
+            // of the Iceberg reader itself rather than merely out of the result.
+            let published = self
+                .iceberg
+                .scan(
+                    state,
+                    Some(&scan_projection.physical_indices),
+                    supported_filters,
+                    limit,
+                )
+                .await?;
+            let published: Arc<dyn ExecutionPlan> =
+                Arc::new(OracleIcebergScanExec::from_plan(published.as_ref())?);
+            // The dependency may return the projected columns in its own
+            // physical order. The signed closure is authoritative, so the plan
+            // is normalized to it here rather than the closure being reordered
+            // to match a source.
+            inputs.push(project_plan_by_name(
+                published,
+                &scan_projection.required_columns,
+            )?);
+        }
+        if !self.hot_files.is_empty() {
+            inputs.push(Arc::new(HotParquetExec::new(
+                self.retained_hot_files(supported_predicates),
+                self.file_io.clone(),
+                Arc::clone(&self.storage),
+                Arc::clone(&required_schema),
+                HotParquetPlan::Leader,
+                Arc::new(OracleScanMetricsHandle::default()),
+                supported_predicates.to_vec(),
+            )));
+        }
+        let Some(remote) = self.remote.as_ref() else {
+            return Ok(inputs);
+        };
+        // A cut with nothing persisted has no leaf to substitute, and a
+        // placeholder over an empty local plan would claim a source the
+        // follower could not read either.
+        if inputs.is_empty() {
+            return Ok(inputs);
+        }
+        let local: Arc<dyn ExecutionPlan> = if let [single] = inputs.as_slice() {
+            Arc::clone(single)
+        } else {
+            UnionExec::try_new(inputs)?
+        };
+        Ok(vec![Arc::new(
+            super::codec::RemoteSourcePlaceholderExec::new(
+                remote.scan_id.clone(),
+                super::assignment_schema_fingerprint(&required_schema),
+                required_schema,
+            )
+            .with_closure(
+                scan_projection.required_columns.clone(),
+                supported_predicates.to_vec(),
+            )
+            .with_destination(remote.destination.clone())
+            .with_local(local),
+        ) as Arc<dyn ExecutionPlan>])
     }
 
     /// Returns the staged hot files this query can still read a row from.
@@ -1483,44 +1600,15 @@ impl TableProvider for OracleTableProvider {
             &supported_predicates,
         )?;
         let required_schema = Arc::clone(&scan_projection.required_schema);
-        let mut inputs: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
-        {
-            // `limit` is forwarded only as a per-leaf upper bound; DataFusion's
-            // own global limit above this provider remains authoritative. The
-            // closure's physical indices are what keep unrequested columns out
-            // of the Iceberg reader itself rather than merely out of the result.
-            let published = self
-                .iceberg
-                .scan(
-                    state,
-                    Some(&scan_projection.physical_indices),
-                    &supported_filters,
-                    limit,
-                )
-                .await?;
-            let published: Arc<dyn ExecutionPlan> =
-                Arc::new(OracleIcebergScanExec::from_plan(published.as_ref())?);
-            // The dependency may return the projected columns in its own
-            // physical order. The signed closure is authoritative, so the plan
-            // is normalized to it here rather than the closure being reordered
-            // to match a source.
-            inputs.push(project_plan_by_name(
-                published,
-                &scan_projection.required_columns,
-            )?);
-        }
-        if !self.hot_files.is_empty() {
-            let hot = Arc::new(HotParquetExec::new(
-                self.retained_hot_files(&supported_predicates),
-                self.file_io.clone(),
-                Arc::clone(&self.storage),
-                Arc::clone(&required_schema),
-                HotParquetPlan::Leader,
-                Arc::new(OracleScanMetricsHandle::default()),
-                supported_predicates.clone(),
-            ));
-            inputs.push(hot);
-        }
+        let mut inputs = self
+            .persisted_inputs(
+                state,
+                &scan_projection,
+                &supported_filters,
+                &supported_predicates,
+                limit,
+            )
+            .await?;
         // Planned unconditionally: the Fused drain runs after admission, so
         // planning cannot know whether this table has live rows. The leaf
         // resolves its one bound batch set — possibly empty — from the
@@ -5368,6 +5456,7 @@ mod tests {
                     Arc::clone(telemetry),
                 ),
                 local_batches: batches,
+                follower_assignments: std::collections::HashMap::new(),
                 reservations: Vec::new(),
                 degraded: false,
             }
@@ -5844,6 +5933,7 @@ mod tests {
             context,
             table_name: "vala.traces.spans".to_owned(),
             audit: Arc::new(NoopAudit),
+            remote: None,
         })
         .await
         .expect("pruning fixture provider")
@@ -6140,6 +6230,7 @@ mod tests {
             context,
             table_name: "vala.traces.spans".to_owned(),
             audit: Arc::new(NoopAudit),
+            remote: None,
         })
         .await
         .expect("pinned fixture provider");

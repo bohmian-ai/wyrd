@@ -26,8 +26,9 @@ use super::{AccountedMemoryReservation, OracleMemoryResources, OracleTelemetry};
 /// Closed identity of the one source a planning leaf reads.
 ///
 /// This is everything a leaf may retain about its data before admission: which
-/// per-table drained batch set it reads. It deliberately carries no batches,
-/// assignment, pool, runtime, or class.
+/// per-table drained batch set it reads, or which remote scan it reads from
+/// which frozen destination. It deliberately carries no batches, assignment,
+/// pool, runtime, or class.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum OracleSourceKey {
     /// The single Fused batch set drained for one canonical table.
@@ -35,13 +36,25 @@ pub(super) enum OracleSourceKey {
         /// Canonical fully-qualified table name whose batches this leaf reads.
         table: String,
     },
+    /// One remote scan answered by exactly one frozen participant.
+    ///
+    /// The destination is fixed when the roster is frozen, before the class
+    /// exists, so a stage carrying this leaf can never be routed to a peer the
+    /// cut did not authorize. The assignment itself is bound after admission.
+    Follower {
+        /// Stable request-local scan identity shared with the assignment.
+        scan_id: String,
+        /// Frozen peer URL, node identity, role, and role fence.
+        destination: Box<super::dispatcher::DispatchCandidate>,
+    },
 }
 
 impl OracleSourceKey {
-    /// Returns the canonical table name of a local-drained key.
-    pub(super) fn local_table(&self) -> &str {
+    /// Returns the canonical table name of a local-drained key, if it is one.
+    pub(super) fn local_table(&self) -> Option<&str> {
         match self {
-            Self::LocalDrained { table } => table.as_str(),
+            Self::LocalDrained { table } => Some(table.as_str()),
+            Self::Follower { .. } => None,
         }
     }
 }
@@ -115,6 +128,8 @@ pub(super) struct OracleExecutionBindings {
     grant: OracleExecutionGrant,
     /// Drained Fused batches keyed by canonical table name.
     local_batches: HashMap<String, Vec<RecordBatch>>,
+    /// Completed follower assignments keyed by their planned scan identity.
+    follower_assignments: HashMap<String, wyrd_spec::vala::api::FollowerScanAssignment>,
     /// Reservations retaining those batches until the query settles.
     _reservations: Vec<AccountedMemoryReservation>,
     /// Whether one requested live source was unavailable at drain time.
@@ -138,6 +153,8 @@ pub(super) struct OracleExecutionBindingInputs {
     pub(super) grant: OracleExecutionGrant,
     /// Drained Fused batches keyed by canonical table name.
     pub(super) local_batches: HashMap<String, Vec<RecordBatch>>,
+    /// Completed follower assignments keyed by their planned scan identity.
+    pub(super) follower_assignments: HashMap<String, wyrd_spec::vala::api::FollowerScanAssignment>,
     /// Reservations retaining those batches until the query settles.
     pub(super) reservations: Vec<AccountedMemoryReservation>,
     /// Whether one requested live source was unavailable at drain time.
@@ -163,23 +180,39 @@ impl OracleExecutionBindings {
         let OracleExecutionBindingInputs {
             grant,
             local_batches,
+            follower_assignments,
             reservations,
             degraded,
         } = inputs;
         for key in planned {
-            if !local_batches.contains_key(key.local_table()) {
+            let bound = match key {
+                OracleSourceKey::LocalDrained { table } => local_batches.contains_key(table),
+                OracleSourceKey::Follower { scan_id, .. } => follower_assignments
+                    .get(scan_id)
+                    .is_some_and(|assignment| assignment.scan_id == *scan_id),
+            };
+            if !bound {
                 return Err(BifrostError::QueryExecutionFailed);
             }
         }
-        if local_batches
-            .keys()
-            .any(|table| !planned.iter().any(|key| key.local_table() == table))
-        {
+        if local_batches.keys().any(|table| {
+            !planned
+                .iter()
+                .any(|key| key.local_table() == Some(table.as_str()))
+        }) {
+            return Err(BifrostError::QueryExecutionFailed);
+        }
+        if follower_assignments.keys().any(|scan_id| {
+            !planned.iter().any(|key| {
+                matches!(key, OracleSourceKey::Follower { scan_id: planned, .. } if planned == scan_id)
+            })
+        }) {
             return Err(BifrostError::QueryExecutionFailed);
         }
         Ok(Self {
             grant,
             local_batches,
+            follower_assignments,
             _reservations: reservations,
             degraded,
         })
@@ -205,14 +238,40 @@ impl OracleExecutionBindings {
         &self,
         key: &OracleSourceKey,
     ) -> datafusion::error::Result<&[RecordBatch]> {
-        self.local_batches
-            .get(key.local_table())
+        key.local_table()
+            .and_then(|table| self.local_batches.get(table))
             .map(Vec::as_slice)
             .ok_or_else(|| {
                 datafusion::error::DataFusionError::Execution(
                     "Oracle plan leaf has no bound local source".to_owned(),
                 )
             })
+    }
+
+    /// Resolves the one completed assignment a remote leaf reads.
+    ///
+    /// The lookup is by the planned scan identity alone, so a leaf can only
+    /// ever reach the assignment the binder validated against its own frozen
+    /// destination.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `DataFusion` execution error when the key names no follower
+    /// scan or when nothing was bound under it.
+    pub(super) fn follower_assignment(
+        &self,
+        key: &OracleSourceKey,
+    ) -> datafusion::error::Result<&wyrd_spec::vala::api::FollowerScanAssignment> {
+        let OracleSourceKey::Follower { scan_id, .. } = key else {
+            return Err(datafusion::error::DataFusionError::Execution(
+                "Oracle plan leaf is not a remote source".to_owned(),
+            ));
+        };
+        self.follower_assignments.get(scan_id).ok_or_else(|| {
+            datafusion::error::DataFusionError::Execution(
+                "Oracle plan leaf has no bound follower assignment".to_owned(),
+            )
+        })
     }
 }
 
@@ -267,6 +326,7 @@ pub(super) fn bind_test_session(
         lock.set(OracleExecutionBindings {
             grant,
             local_batches,
+            follower_assignments: HashMap::new(),
             _reservations: Vec::new(),
             degraded: false,
         })

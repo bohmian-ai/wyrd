@@ -84,6 +84,10 @@ with a coloured dot alone, which INV-008 forbids; it now reads through `Badge`.
   a visible `<label>`; `Disclosure` is a native `<details>`; `Table` scrolls in
   a `role="region"` with an `aria-label` and `tabindex="0"`; a `Chip`'s remove
   affordance is a link named "Remove filter <key>: <value>".
+- **Select popup** — the option list is styled through customizable select
+  (`appearance: base-select` + `::picker(select)`) inside an `@supports` guard, verified
+  in Chrome 152. Where it is unsupported the browser draws its own popup and nothing else
+  changes; the element is always a real `<select>`.
 - **URL-backed state, not callbacks** — chip removal is an href and `Select`
   submits its enclosing form, so filter state stays in the URL and the catalog
   contract stays non-executable.

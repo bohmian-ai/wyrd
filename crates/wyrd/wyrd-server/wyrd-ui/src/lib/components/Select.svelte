@@ -103,4 +103,60 @@
     outline: 2px solid var(--text);
     outline-offset: 2px;
   }
+
+  /* The option list is drawn by the OS, so appearance:none never reached inside it.
+     Customizable select does: it hands the popup to CSS while the element underneath stays
+     a real <select>, keeping every behaviour that made it the right choice. Chrome 135+
+     today; everywhere else this block is skipped and the native popup is used unchanged,
+     which is a correct dropdown, just not a Wyrd-shaped one. */
+  @supports (appearance: base-select) {
+    select,
+    select::picker(select) {
+      appearance: base-select;
+    }
+    /* the picker draws its own caret, so ours would be a second one */
+    .field::after {
+      content: none;
+    }
+    select::picker-icon {
+      color: var(--muted);
+      font-size: 9px;
+      transition: rotate 0.1s;
+    }
+    select:open::picker-icon {
+      rotate: 180deg;
+    }
+    /* raised altitude: the popup sits above the panel it was opened from */
+    select::picker(select) {
+      margin-top: 4px;
+      padding: 0;
+      border: 2px solid var(--border);
+      border-radius: var(--r);
+      box-shadow: 6px 6px 0 0 var(--shadow);
+      background: var(--surface);
+    }
+    option {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 7px 10px;
+      font-family: var(--fm);
+      font-size: 11px;
+      color: var(--text);
+      background: var(--surface);
+      border-bottom: 2px dashed var(--border);
+    }
+    option:last-of-type {
+      border-bottom: 0;
+    }
+    option:hover,
+    option:focus {
+      background: var(--brand-soft);
+    }
+    option::checkmark {
+      content: '✓';
+      color: var(--brand-strong);
+      font-weight: 700;
+    }
+  }
 </style>

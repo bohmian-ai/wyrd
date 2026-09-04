@@ -207,7 +207,9 @@
         "--shadow",
         "--text",
         "--muted",
-        "--r"
+        "--r",
+        "--brand-soft",
+        "--brand-strong"
       ],
       "props": {
         "label": "string",
@@ -226,7 +228,8 @@
         "the visible <label> is bound by id — a filter control is never labeled by placement alone",
         "auto submits the enclosing form on change; the component takes no callback, so the destination stays a server-owned action or GET route",
         "time-range control is this component with range options, not a separate component",
-        "appearance:none plus a wrapper caret gives the control the workbench geometry — 2px border, 5px radius, 3px hard shadow, the same hover lift and active sink as Button — while the element underneath stays a real <select>. The option list is still drawn by the OS; that is the trade for free keyboard operation, a real mobile picker and correct screen-reader semantics."
+        "appearance:none plus a wrapper caret gives the control the workbench geometry — 2px border, 5px radius, 3px hard shadow, the same hover lift and active sink as Button — while the element underneath stays a real <select>. The option list is still drawn by the OS; that is the trade for free keyboard operation, a real mobile picker and correct screen-reader semantics.",
+        "the option list is styled through customizable select (appearance: base-select + ::picker(select)) inside an @supports guard. Where that is unsupported the browser draws its own popup and nothing else changes — the element is always a real <select>, so keyboard operation, the mobile picker and screen-reader semantics never depend on the enhancement."
       ]
     },
     "Table": {

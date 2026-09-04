@@ -15,6 +15,13 @@ WITH cursor AS MATERIALIZED (
       AND t.next_eligible_at <= statement_timestamp()
       AND ($11::text[] IS NULL OR t.strategy = ANY($11::text[]))
       AND (
+          NOT $13::bool
+          OR (
+              t.strategy IN ('expired_cleanup', 'orphan_cleanup')
+              AND t.evidence IS NOT NULL
+          )
+      )
+      AND (
           $12::text IS NULL
           OR t.failed_volume_identity IS NULL
           OR t.failed_volume_identity <> $12

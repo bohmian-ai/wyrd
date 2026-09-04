@@ -4060,4 +4060,325 @@ mod pg_tests {
             "a completed orphan task cannot resume its scan"
         );
     }
+    /// Forces one enqueued task into an exact durable ownership shape.
+    ///
+    /// Recovery is defined over durable columns rather than over the path that
+    /// produced them, so the states under test are written directly. `owner`
+    /// names the holder of the claim and `expired` decides whether that claim
+    /// still authorizes work, which is exactly the pair the predicate reads.
+    ///
+    /// # Panics
+    /// Panics when the update fails.
+    async fn force_claim_state(
+        superuser: &PgPool,
+        task_id: Uuid,
+        state: &str,
+        owner: Uuid,
+        expired: bool,
+    ) {
+        sqlx::query(
+            "UPDATE vala.forge_tasks SET state=$2,claimed_by=$3,attempt_id=$4,\
+             claim_expires_at=statement_timestamp()+($5*interval '1 minute'),\
+             watermark_snapshot_id=CASE WHEN $2 IN ('running','prepared') THEN 41 END,\
+             watermark_timestamp_ms=CASE WHEN $2 IN ('running','prepared') THEN 700 END,\
+             evidence=CASE WHEN $2='prepared' \
+                 THEN '{\"version\":1,\"cleanup_candidates\":[],\"deleted_candidate_count\":0}'::jsonb END,\
+             updated_at=statement_timestamp() WHERE task_id=$1",
+        )
+        .bind(task_id)
+        .bind(state)
+        .bind(owner)
+        .bind(Uuid::now_v7())
+        .bind(if expired { -10_i64 } else { 10_i64 })
+        .execute(superuser)
+        .await
+        .expect("force claim state");
+    }
+
+    /// Deletes every seeded task so the next case asserts in isolation.
+    ///
+    /// # Panics
+    /// Panics when the delete fails.
+    async fn clear_tasks(superuser: &PgPool) {
+        sqlx::query("DELETE FROM vala.forge_tasks")
+            .execute(superuser)
+            .await
+            .expect("clear tasks");
+    }
+
+    /// Inserts one unowned cleanup row carrying an exact durable cursor.
+    ///
+    /// Expired cleanup is only reachable through a validated expiration
+    /// handoff, and both cleanup strategies reach the recovery states under
+    /// test through a release rather than an enqueue, so the row is written
+    /// directly. The envelope columns reproduce the version-two shape the
+    /// enqueue path persists, which is what keeps the row claimable under the
+    /// same resource predicate ordinary work is claimed by.
+    ///
+    /// # Panics
+    /// Panics when the insert fails.
+    async fn seed_unowned_cleanup_row(
+        superuser: &PgPool,
+        tenant: DataTenantId,
+        table_name: &str,
+        strategy: ForgeTaskStrategy,
+        plan: &ForgeTaskPlan,
+        state: &str,
+        evidence: &serde_json::Value,
+        deferred: bool,
+    ) -> Uuid {
+        let task_id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,namespace_name,\
+             table_name,strategy,lane,base_snapshot_id,plan,plan_hash,estimated_files,\
+             estimated_bytes,estimated_parallelism,estimated_memory_bytes,estimated_spill_bytes,\
+             large_task_ceiling_bytes,envelope_version,decoded_batch_bytes,decoded_input_bytes,\
+             sort_working_bytes,sort_merge_reservation_bytes,encoder_buffer_bytes,\
+             upload_chunk_bytes,footer_encoded_bytes,footer_decode_workspace_bytes,\
+             sort_spill_bytes,state,evidence,ready_at,next_eligible_at,updated_at) \
+             VALUES ($1,$2,'wyrd-redux','vala.bifrost',$3,$4,'ordinary',4242,$5::jsonb,\
+             decode(repeat('22',32),'hex'),1,100,1,41943040,50,67108864,2,10,10,30,10,40,20,\
+             8388608,33554432,50,$6,$7::jsonb,\
+             statement_timestamp()+($8*interval '1 hour'),\
+             statement_timestamp()+($8*interval '1 hour'),statement_timestamp())",
+        )
+        .bind(task_id)
+        .bind(tenant.as_uuid())
+        .bind(table_name)
+        .bind(strategy.as_str())
+        .bind(serde_json::to_string(&plan_to_value(plan)).expect("plan json"))
+        .bind(state)
+        .bind(evidence.to_string())
+        .bind(if deferred { 1_i64 } else { -1_i64 })
+        .execute(superuser)
+        .await
+        .expect("seed unowned cleanup row");
+        task_id
+    }
+
+    /// Renders one task plan as the JSON shape the durable column stores.
+    fn plan_to_value(plan: &ForgeTaskPlan) -> serde_json::Value {
+        serde_json::json!({
+            "version": plan.version,
+            "inputs": plan.inputs,
+            "parameters": plan.parameters,
+        })
+    }
+
+    /// Recovery covers exactly the durable residue a new owner must resolve.
+    ///
+    /// Worker readiness is gated on this predicate, so both halves of it must
+    /// be exact. Too narrow and a worker advertises itself while a reader can
+    /// still observe a half-settled effect nobody is reconciling; too wide and
+    /// ordinary demand — or another worker's live claim — would keep the worker
+    /// unready forever, because neither ever resolves without new slots.
+    ///
+    /// The recovery claim is the second half: it selects only unowned cleanup
+    /// cursors and keeps the fair claim's existing timing gates, so a deferred
+    /// cursor stays unready without becoming claimable early.
+    ///
+    /// # Panics
+    /// Panics when PostgreSQL setup or any state assertion fails.
+    #[tokio::test]
+    async fn recoverable_cleanup_claim_and_predicate_cover_exact_states() {
+        let (fixture, admin) = setup().await;
+        let tasks = ForgeTasks::new(fixture.operator_pool().clone());
+        let tenant = fixture.data_tenant_id();
+        let owner = Uuid::now_v7();
+        let foreign = Uuid::now_v7();
+
+        assert!(
+            !tasks
+                .has_recoverable_work(owner)
+                .await
+                .expect("empty predicate"),
+            "an empty queue leaves nothing to recover"
+        );
+
+        // A pre-terminal attempt this owner still holds is unresolved work: it
+        // is this worker's own residue from a previous process lifetime.
+        for state in ["claimed", "running", "prepared"] {
+            let id = tasks
+                .enqueue(&task(tenant, "owned", ForgeTaskLane::Ordinary, 11))
+                .await
+                .expect("enqueue owned task");
+            force_claim_state(&admin, id, state, owner, false).await;
+            assert!(
+                tasks
+                    .has_recoverable_work(owner)
+                    .await
+                    .expect("owned predicate"),
+                "a current-owner {state} attempt is unresolved recovery work"
+            );
+            clear_tasks(&admin).await;
+        }
+
+        // A lapsed claim is unresolved regardless of who held it: the previous
+        // owner can no longer prove what it did to durable state.
+        for state in ["claimed", "running", "prepared"] {
+            let id = tasks
+                .enqueue(&task(tenant, "expired", ForgeTaskLane::Ordinary, 12))
+                .await
+                .expect("enqueue expired task");
+            force_claim_state(&admin, id, state, foreign, true).await;
+            assert!(
+                tasks
+                    .has_recoverable_work(owner)
+                    .await
+                    .expect("expired predicate"),
+                "an expired foreign {state} attempt is unresolved recovery work"
+            );
+            clear_tasks(&admin).await;
+        }
+
+        // An unowned cleanup row carrying cursor evidence is residue too: some
+        // earlier attempt already deleted objects and checkpointed its scan,
+        // and that scan is not finished. Both cleanup strategies and both
+        // unowned states count, and the recovery claim selects them.
+        let prefix = format!("tenants/{tenant}/bifrost/orphan/data/forge/v1");
+        let cursor = serde_json::json!({
+            "version": 1,
+            "start_after": format!("{prefix}/aaa/object.parquet"),
+        });
+        let expired_plan = ForgeTaskPlan {
+            version: FORGE_TASK_PAYLOAD_VERSION,
+            inputs: Vec::new(),
+            parameters: ExpiredCleanupPayload::from_handoff(
+                Uuid::now_v7(),
+                &handoff_evidence(vec![cleanup_candidate("one")]),
+            )
+            .expect("committed handoff identity")
+            .to_value(),
+        };
+        let expired_evidence =
+            vala_sql::row_types::forge_tasks::evidence_to_value(&handoff_evidence(vec![
+                cleanup_candidate("one"),
+            ]));
+        for state in ["ready", "retryable"] {
+            for (label, table_name, strategy, plan, evidence) in [
+                (
+                    "orphan",
+                    "orphan",
+                    ForgeTaskStrategy::OrphanCleanup,
+                    orphan_plan(&prefix, 1_700_000_000_000),
+                    cursor.clone(),
+                ),
+                (
+                    "expired",
+                    "cleanup",
+                    ForgeTaskStrategy::ExpiredCleanup,
+                    expired_plan.clone(),
+                    expired_evidence.clone(),
+                ),
+            ] {
+                let id = seed_unowned_cleanup_row(
+                    &admin, tenant, table_name, strategy, &plan, state, &evidence, false,
+                )
+                .await;
+                assert!(
+                    tasks
+                        .has_recoverable_work(owner)
+                        .await
+                        .expect("cleanup predicate"),
+                    "an unowned {state} {label} cleanup cursor is recovery work"
+                );
+                let claimed = tasks
+                    .claim_recoverable_cleanup(owner, limits(4))
+                    .await
+                    .expect("recovery claim")
+                    .expect("the cleanup cursor is claimable");
+                assert_eq!(
+                    claimed.task_id, id,
+                    "recovery claims the exact {state} {label} cursor"
+                );
+                clear_tasks(&admin).await;
+            }
+        }
+
+        // A deferred cursor keeps the worker unready without becoming claimable
+        // early: the predicate ignores the time gates, the recovery claim keeps
+        // the fair claim's existing ones.
+        let deferred = seed_unowned_cleanup_row(
+            &admin,
+            tenant,
+            "deferred",
+            ForgeTaskStrategy::OrphanCleanup,
+            &orphan_plan(&prefix, 1_700_000_000_000),
+            "retryable",
+            &cursor,
+            true,
+        )
+        .await;
+        assert!(
+            tasks
+                .has_recoverable_work(owner)
+                .await
+                .expect("deferred predicate"),
+            "a deferred cursor is still unresolved recovery work"
+        );
+        assert!(
+            tasks
+                .claim_recoverable_cleanup(owner, limits(4))
+                .await
+                .expect("deferred recovery claim")
+                .is_none(),
+            "a deferred cursor is not claimable before its own timing gates"
+        );
+        sqlx::query(
+            "UPDATE vala.forge_tasks SET ready_at=statement_timestamp(),\
+             next_eligible_at=statement_timestamp() WHERE task_id=$1",
+        )
+        .bind(deferred)
+        .execute(&admin)
+        .await
+        .expect("release the cursor gates");
+        assert_eq!(
+            tasks
+                .claim_recoverable_cleanup(owner, limits(4))
+                .await
+                .expect("released recovery claim")
+                .expect("the released cursor is claimable")
+                .task_id,
+            deferred,
+            "the exact released cursor is the one recovery claims"
+        );
+        clear_tasks(&admin).await;
+
+        // Ordinary demand, an evidence-free cleanup row, and another worker's
+        // live claim are all outside recovery: none of them is residue this
+        // owner must resolve before it may advertise itself.
+        let ordinary = tasks
+            .enqueue(&task(tenant, "ordinary", ForgeTaskLane::Ordinary, 14))
+            .await
+            .expect("enqueue ordinary task");
+        let bare = tasks
+            .enqueue(&orphan_task(tenant, "bare", &prefix, 1_700_000_000_000))
+            .await
+            .expect("enqueue evidence-free cleanup");
+        assert!(
+            raw_evidence(&admin, bare).await.is_none(),
+            "a freshly enqueued cleanup task carries no cursor"
+        );
+        let live = tasks
+            .enqueue(&task(tenant, "live", ForgeTaskLane::Ordinary, 15))
+            .await
+            .expect("enqueue live foreign claim");
+        force_claim_state(&admin, live, "running", foreign, false).await;
+        assert!(
+            !tasks
+                .has_recoverable_work(owner)
+                .await
+                .expect("excluded predicate"),
+            "ready demand, a bare cleanup row, and a live foreign claim are not recovery"
+        );
+        assert!(
+            tasks
+                .claim_recoverable_cleanup(owner, limits(4))
+                .await
+                .expect("excluded recovery claim")
+                .is_none(),
+            "recovery claims no ordinary task and no evidence-free cleanup row"
+        );
+        let _ = (ordinary, bare);
+    }
 }

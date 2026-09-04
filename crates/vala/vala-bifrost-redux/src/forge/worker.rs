@@ -1290,11 +1290,31 @@ impl ForgeWorker {
     async fn drain_recoverable_work(&self, shutdown: &CancellationToken) -> Result<(), ForgeError> {
         let claim_limits = self.claim_limits()?;
         while !shutdown.is_cancelled() {
-            self.reclaim_expired_attempts(claim_limits.max_active_per_tenant)
-                .await?;
-            if self.reconcile_one_prepared(claim_limits, shutdown).await? {
-                continue;
+            // Reclaim is paged, so a single call can leave lapsed attempts
+            // behind. Draining until one page comes back short is what makes
+            // the predicate below an answer about the whole queue rather than
+            // about one page of it.
+            loop {
+                if shutdown.is_cancelled() {
+                    return Ok(());
+                }
+                let reclaimed = self
+                    .reclaim_expired_attempts(claim_limits.max_active_per_tenant)
+                    .await?;
+                if reclaimed.len() < claim_limits.max_active_per_tenant as usize {
+                    break;
+                }
             }
+            if shutdown.is_cancelled() {
+                return Ok(());
+            }
+            let reconciled = self.reconcile_one_prepared(claim_limits, shutdown).await?;
+            if shutdown.is_cancelled() {
+                return Ok(());
+            }
+            let cleaned = self
+                .execute_one_recoverable_cleanup(claim_limits, shutdown)
+                .await?;
             if !self
                 .tasks
                 .has_recoverable_work(self.owner)
@@ -1303,8 +1323,80 @@ impl ForgeWorker {
             {
                 return Ok(());
             }
+            if !reconciled && !cleaned {
+                // Something is unresolved that this pass could not claim: a
+                // deferred cursor waiting on its own timing gates, or an
+                // attempt this owner holds whose lease has not lapsed yet. The
+                // wait is cancellation-aware so shutdown never has to outlast
+                // a lease, and it replaces what would otherwise be a hot spin
+                // against Postgres before any slot exists.
+                tokio::select! {
+                    () = shutdown.cancelled() => return Ok(()),
+                    () = tokio::time::sleep(Duration::from_millis(250)) => {}
+                }
+            }
         }
         Ok(())
+    }
+
+    /// Claims and settles one currently eligible recoverable cleanup cursor.
+    ///
+    /// An unowned cleanup row carrying evidence is residue: an earlier attempt
+    /// deleted objects and checkpointed a scan it never finished. Recovery runs
+    /// it through the ordinary execution and settlement path, so a durably
+    /// settled non-success is progress rather than a recovery failure and the
+    /// caller simply asks the predicate again.
+    ///
+    /// Returns whether a cursor was claimed at all, which is what tells the
+    /// drain loop apart from a pass that made no progress and must wait.
+    ///
+    /// # Errors
+    ///
+    /// Returns the SQL, execution, settlement, or audit failure the attempt
+    /// raised. Each leaves durable state this owner cannot account for, so the
+    /// worker must not become ready.
+    ///
+    /// # Cancellation
+    ///
+    /// Cancellation is observed at [`Self::execute_claim`]'s existing safe
+    /// boundaries and leaves the cursor durable for a later owner.
+    async fn execute_one_recoverable_cleanup(
+        &self,
+        claim_limits: ForgeClaimLimits,
+        shutdown: &CancellationToken,
+    ) -> Result<bool, ForgeError> {
+        let Some(claim) = self
+            .tasks
+            .claim_recoverable_cleanup(self.owner, claim_limits)
+            .await
+            .map_err(ForgeError::Sql)?
+        else {
+            return Ok(false);
+        };
+        let task_id = claim.task_id;
+        let strategy = claim.strategy.clone();
+        #[cfg(feature = "test-support")]
+        if let Some(observer) = &self.completion_observer {
+            observer.record_lifecycle(ForgeLifecycleEvent::Claimed {
+                task_id,
+                worker_id: self.owner,
+            });
+        }
+        let metric_strategy = Self::metric_strategy(&strategy);
+        // Held for the whole attempt so every exit balances the increment.
+        let _active = metric_strategy.map(|metric| self.forge.core.telemetry.active_task(metric));
+        tracing::info!(
+            worker = %self.owner,
+            task_id = %task_id,
+            strategy = ?strategy,
+            "Forge recovery claimed an unfinished cleanup cursor"
+        );
+        // Either healthy boolean is progress: a settled refusal or retry is a
+        // durable result, and the predicate decides whether more remains.
+        if self.execute_claim(claim, shutdown).await? {
+            self.record_completion(task_id, strategy);
+        }
+        Ok(true)
     }
 
     /// Returns the stable identity of this worker's configured scratch volume.

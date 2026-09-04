@@ -596,6 +596,82 @@ impl ForgeTasks {
         strategy_filter: Option<&[ForgeTaskStrategy]>,
         scratch_volume_identity: Option<&str>,
     ) -> Result<Option<ForgeTaskClaim>, SqlError> {
+        self.claim(
+            owner,
+            limits,
+            strategy_filter,
+            scratch_volume_identity,
+            false,
+        )
+        .await
+    }
+
+    /// Claims one unowned cleanup cursor left behind by an earlier owner.
+    ///
+    /// A worker drains recovery before it advertises itself, and an unowned
+    /// `expired_cleanup` or `orphan_cleanup` row carrying evidence is residue:
+    /// an earlier attempt already deleted objects and checkpointed its scan
+    /// without finishing it. This runs the same fair transaction under one
+    /// private predicate so the recovering worker inherits the identical
+    /// timing, capacity, tenancy, envelope, and cursor rules; only the
+    /// candidate set narrows. It deliberately keeps the `ready_at` and
+    /// `next_eligible_at` gates, so a deferred cursor stays unclaimable while
+    /// [`Self::has_recoverable_work`] keeps the worker unready for it.
+    ///
+    /// Scratch-volume deferral does not apply: recovery is not choosing among
+    /// competing ready work, it is resolving the exact residue that exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same validation, decoding, and SQL errors as
+    /// [`Self::claim_fair`].
+    ///
+    /// # Cancellation
+    ///
+    /// Cancellation rolls back both the claim and the cursor advance.
+    pub async fn claim_recoverable_cleanup(
+        &self,
+        owner: Uuid,
+        limits: ForgeClaimLimits,
+    ) -> Result<Option<ForgeTaskClaim>, SqlError> {
+        self.claim(
+            owner,
+            limits,
+            Some(&[
+                ForgeTaskStrategy::ExpiredCleanup,
+                ForgeTaskStrategy::OrphanCleanup,
+            ]),
+            None,
+            true,
+        )
+        .await
+    }
+
+    /// Runs the one fair claim transaction under an exact candidate predicate.
+    ///
+    /// `recovery_only` is the single private axis separating ordinary claiming
+    /// from recovery: when false the transaction behaves exactly as the fair
+    /// claim always has, and when true it additionally requires an
+    /// evidence-bearing cleanup row. Both callers share this body so fairness,
+    /// tenancy, lane, envelope, and cursor semantics cannot drift apart.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqlError::Conflict`] for zero or overflowing limits,
+    /// invariant errors for malformed persisted rows, and query errors for
+    /// transaction failures.
+    ///
+    /// # Cancellation
+    ///
+    /// Cancellation rolls back both the claim and the cursor advance.
+    async fn claim(
+        &self,
+        owner: Uuid,
+        limits: ForgeClaimLimits,
+        strategy_filter: Option<&[ForgeTaskStrategy]>,
+        scratch_volume_identity: Option<&str>,
+        recovery_only: bool,
+    ) -> Result<Option<ForgeTaskClaim>, SqlError> {
         if limits.max_active_per_tenant == 0
             || limits.lease_seconds == 0
             || limits.max_files == 0
@@ -656,6 +732,7 @@ impl ForgeTasks {
             )
             .bind(strategy_filter)
             .bind(scratch_volume_identity)
+            .bind(recovery_only)
             .fetch_optional(&mut *tx)
             .await
             .map_err(SqlError::from)?;
@@ -717,14 +794,20 @@ impl ForgeTasks {
     /// Forge worker readiness is recovery-gated: a worker must not advertise
     /// itself while durable state from an earlier owner is still unresolved,
     /// because a reader could observe a half-settled effect that nobody is
-    /// currently reconciling. Three kinds of residue count as unresolved: an
-    /// attempt whose claim lease lapsed in any pre-terminal state — an expired
-    /// cleanup cursor among them — and a Prepared attempt this owner already
-    /// holds and has not reconciled. A live claim held by another owner is
-    /// deliberately not recovery work: that worker is making progress and must
-    /// not block this one's readiness. Ready or retryable work is likewise not
-    /// recovery: it is ordinary demand this worker's slots will claim once they
-    /// start, so waiting on it here would never terminate.
+    /// currently reconciling. Three kinds of residue count as unresolved: any
+    /// pre-terminal attempt this owner already holds, any pre-terminal attempt
+    /// whose claim lease lapsed, and any unowned cleanup row still carrying
+    /// cursor evidence — an earlier attempt already deleted objects and
+    /// checkpointed a scan it did not finish. The cleanup arm deliberately
+    /// ignores `ready_at` and `next_eligible_at`: a deferred cursor is still
+    /// unresolved, so the worker stays unready and polls until the unchanged
+    /// fair-claim gates admit it.
+    ///
+    /// A live claim held by another owner is deliberately not recovery work:
+    /// that worker is making progress and must not block this one's readiness.
+    /// Ordinary ready or retryable demand is likewise not recovery: this
+    /// worker's slots will claim it once they start, so waiting on it here
+    /// would never terminate.
     ///
     /// # Errors
     ///
@@ -738,8 +821,11 @@ impl ForgeTasks {
     pub async fn has_recoverable_work(&self, owner: Uuid) -> Result<bool, SqlError> {
         sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS (SELECT 1 FROM vala.forge_tasks t WHERE \
-             (t.state IN ('claimed','running','prepared') AND t.claim_expires_at<statement_timestamp()) \
-             OR (t.state='prepared' AND t.claimed_by=$1))",
+             (t.state IN ('claimed','running','prepared') AND t.claimed_by=$1) \
+             OR (t.state IN ('claimed','running','prepared') AND t.claim_expires_at<statement_timestamp()) \
+             OR (t.state IN ('ready','retryable') \
+                 AND t.strategy IN ('expired_cleanup','orphan_cleanup') \
+                 AND t.evidence IS NOT NULL))",
         )
         .bind(owner)
         .fetch_one(self.operator_pool.pool())

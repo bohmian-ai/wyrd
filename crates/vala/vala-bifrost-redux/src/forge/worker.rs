@@ -239,9 +239,28 @@ struct ForgeSnapshotExpiryResult {
     expiry_evidence: Option<ForgeTaskEvidence>,
 }
 
+/// Exact file and byte volume one committed Forge effect moved.
+///
+/// Reported only once the durable settlement for that effect commits, so no
+/// counter claims throughput the durable record does not hold.
+#[derive(Debug, Clone, Copy)]
+struct ForgeCommittedVolume {
+    /// Logical input files the effect consumed.
+    input_files: u64,
+    /// Logical input bytes the effect consumed.
+    input_bytes: u64,
+    /// Published output files the effect produced.
+    output_files: u64,
+    /// Published output bytes the effect produced.
+    output_bytes: u64,
+}
+
 enum ForgeDispatchResult {
     /// Ordinary publication whose evidence is not yet Prepared.
-    Committed(Table),
+    ///
+    /// The volume is present only when the committing owner measured exact
+    /// file and byte counts for this effect.
+    Committed(Table, Option<ForgeCommittedVolume>),
     /// One snapshot-expiration pass with its exact post-expiry candidates.
     SnapshotExpiry(Box<ForgeSnapshotExpiryResult>),
     /// A fully drained expired-cleanup candidate set with its final evidence.
@@ -2919,7 +2938,14 @@ impl ForgeWorker {
         lease: &mut ForgeLease,
         table: Table,
         stop: &CancellationToken,
-    ) -> Result<(ForgeTaskEvidence, ForgeExecutionEvidenceState), ForgeError> {
+    ) -> Result<
+        (
+            ForgeTaskEvidence,
+            ForgeExecutionEvidenceState,
+            Option<ForgeCommittedVolume>,
+        ),
+        ForgeError,
+    > {
         match self
             .dispatch_claim(ForgeDispatchRequest {
                 claim,
@@ -2931,12 +2957,12 @@ impl ForgeWorker {
             })
             .await?
         {
-            ForgeDispatchResult::Committed(committed) => self
+            ForgeDispatchResult::Committed(committed, volume) => self
                 .committed_evidence(binding, &committed)
                 .await
-                .map(|evidence| (evidence, ForgeExecutionEvidenceState::Fresh)),
+                .map(|evidence| (evidence, ForgeExecutionEvidenceState::Fresh, volume)),
             ForgeDispatchResult::Cleaned(evidence) => {
-                Ok((*evidence, ForgeExecutionEvidenceState::Prepared))
+                Ok((*evidence, ForgeExecutionEvidenceState::Prepared, None))
             }
             ForgeDispatchResult::OrphanSettled => Ok((
                 ForgeTaskEvidence {
@@ -2949,11 +2975,12 @@ impl ForgeWorker {
                     prepared_candidate_index: None,
                 },
                 ForgeExecutionEvidenceState::Settled,
+                None,
             )),
-            ForgeDispatchResult::SnapshotExpiry(result) => {
-                self.complete_snapshot_expiry(claim, attempt, binding, lease, *result, stop)
-                    .await
-            }
+            ForgeDispatchResult::SnapshotExpiry(result) => self
+                .complete_snapshot_expiry(claim, attempt, binding, lease, *result, stop)
+                .await
+                .map(|(evidence, state)| (evidence, state, None)),
         }
     }
 
@@ -3033,7 +3060,7 @@ impl ForgeWorker {
             &operation_stop
         };
         let execution = match committed_recovery {
-            Some(evidence) => Ok((evidence, ForgeExecutionEvidenceState::RecoveredCommit)),
+            Some(evidence) => Ok((evidence, ForgeExecutionEvidenceState::RecoveredCommit, None)),
             None => {
                 self.dispatch_evidence(claim, attempt, binding, lease, table, dispatch_stop)
                     .await
@@ -3062,14 +3089,18 @@ impl ForgeWorker {
             detail: format!("Forge claim heartbeat panicked: {error}"),
         })?;
         heartbeat_result?;
-        let (evidence, state) = completion?;
+        let (evidence, state, volume) = completion?;
         self.settle_promotion_evidence(claim, binding, lease, &evidence, &state)
             .await?;
         self.settle_rewrite_recovery(claim, binding, lease, &state, shutdown)
             .await?;
         self.record_rewrite_evidence(claim, &evidence);
+        let settled = matches!(state, ForgeExecutionEvidenceState::Settled);
         self.finish_claim_execution(claim, attempt, lease, &evidence, state)
             .await?;
+        if !settled {
+            self.record_committed_volume(claim, volume);
+        }
         Ok(true)
     }
 
@@ -3207,6 +3238,47 @@ impl ForgeWorker {
                 snapshot_id,
             });
         }
+    }
+
+    /// Reports the logical volume one Scribe promotion published.
+    ///
+    /// The claimed task's persisted estimates are the exact promotion demand:
+    /// the promotion moves those already-written objects into the table
+    /// unchanged. They are reported as both logical input and published output
+    /// because the same objects entered and left the effect; nothing here
+    /// claims Forge rewrote the bytes, and no storage metadata is reread.
+    fn promotion_volume(claim: &ForgeTaskClaim) -> ForgeCommittedVolume {
+        ForgeCommittedVolume {
+            input_files: u64::from(claim.estimates.files),
+            input_bytes: claim.estimates.bytes,
+            output_files: u64::from(claim.estimates.files),
+            output_bytes: claim.estimates.bytes,
+        }
+    }
+
+    /// Counts committed file and byte throughput after durable settlement.
+    ///
+    /// Called only once the settlement transition for this attempt commits, and
+    /// never for a state another owner already settled. A strategy this build
+    /// does not know carries no `task_type`.
+    fn record_committed_volume(
+        &self,
+        claim: &ForgeTaskClaim,
+        volume: Option<ForgeCommittedVolume>,
+    ) {
+        let (Some(volume), Some(task_type)) = (volume, Self::metric_strategy(&claim.strategy))
+        else {
+            return;
+        };
+        self.forge
+            .core
+            .telemetry
+            .record_input(task_type, volume.input_files, volume.input_bytes);
+        self.forge.core.telemetry.record_output(
+            task_type,
+            volume.output_files,
+            volume.output_bytes,
+        );
     }
 
     /// Refreshes final authority and commits the appropriate success transition.
@@ -3468,7 +3540,7 @@ impl ForgeWorker {
             stop,
         } = request;
         if Self::current_snapshot_matches_task(&table, claim.task_id) {
-            return Ok(ForgeDispatchResult::Committed(table));
+            return Ok(ForgeDispatchResult::Committed(table, None));
         }
         if !Self::base_snapshot_matches(&table, claim.base_snapshot_id)
             && !Self::tolerates_base_drift(&claim.strategy)
@@ -4171,7 +4243,10 @@ impl ForgeWorker {
                 )?,
             )
             .await?;
-        Ok(ForgeDispatchResult::Committed(committed))
+        Ok(ForgeDispatchResult::Committed(
+            committed,
+            Some(rewrite_volume(request)),
+        ))
     }
 
     /// Decides what one non-success catalog outcome permits next.
@@ -4410,7 +4485,12 @@ impl ForgeWorker {
                 )
                 .await
             {
-                Ok(committed) => return Ok(ForgeDispatchResult::Committed(committed)),
+                Ok(committed) => {
+                    return Ok(ForgeDispatchResult::Committed(
+                        committed,
+                        Some(Self::promotion_volume(claim)),
+                    ));
+                }
                 Err(ForgeError::Catalog(error)) if !error.retryable() => error,
                 Err(error) => return Err(error),
             };
@@ -6465,12 +6545,6 @@ fn durable_task_result(
 pub(super) enum ForgeExecutionStage {
     /// Promote already-published Scribe hot objects into the table unchanged.
     ScribePromotion,
-    /// Reconcile staging audit operations.
-    ReconcileStaging,
-    /// Reconcile current-snapshot replacement operations.
-    ReconcileIceberg,
-    /// Discover current-snapshot rewrite groups.
-    ManifestDiscovery,
     /// Replace one current-snapshot group.
     IcebergRewrite,
     /// Reconcile and expire old snapshots.
@@ -6479,4 +6553,26 @@ pub(super) enum ForgeExecutionStage {
     ExpiredCleanup,
     /// Reconcile and remove proven orphan objects.
     OrphanGc,
+}
+
+/// Reports the exact volume one accepted small-file rewrite moved.
+///
+/// The counts come from the same cross-checked descriptor lists the commit
+/// submitted and the snapshot properties record, so a later recovery reading
+/// those properties reports the identical numbers.
+fn rewrite_volume(request: &super::publication::RewriteCommitRequest) -> ForgeCommittedVolume {
+    ForgeCommittedVolume {
+        input_files: request.removed_data_files.len() as u64,
+        input_bytes: request
+            .removed_data_files
+            .iter()
+            .map(|file| u64::try_from(file.file_size_in_bytes()).unwrap_or(0))
+            .sum(),
+        output_files: request.added_data_files.len() as u64,
+        output_bytes: request
+            .added_data_files
+            .iter()
+            .map(|file| u64::try_from(file.file_size_in_bytes()).unwrap_or(0))
+            .sum(),
+    }
 }

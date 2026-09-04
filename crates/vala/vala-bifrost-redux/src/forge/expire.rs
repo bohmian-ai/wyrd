@@ -372,6 +372,7 @@ impl Forge {
                 ForgeExpirationSettlement::Committed,
             )
             .await?;
+        self.record_expired_snapshots(&detail);
         outcome.settled_evidence = Some(evidence);
         outcome.recovered = outcome.recovered.saturating_add(1);
         Ok(outcome)
@@ -1105,9 +1106,27 @@ impl Forge {
                 settlement,
             )
             .await?;
+        self.record_expired_snapshots(&detail);
         outcome.settled_evidence = Some(evidence);
         outcome.recovered = 1;
         Ok(outcome)
+    }
+
+    /// Counts the exact snapshots one settled expiration durably removed.
+    ///
+    /// Called only after committed or recovered settlement commits, and driven
+    /// by the audited selection rather than a catalog re-read, so the count is
+    /// exactly what the durable record says was expired.
+    fn record_expired_snapshots(&self, detail: &AuditDetail) {
+        if let AuditDetail::ForgeSnapshotExpire {
+            selected_snapshot_ids,
+            ..
+        } = detail
+        {
+            self.core
+                .telemetry
+                .record_snapshots_expired(selected_snapshot_ids.len() as u64);
+        }
     }
 }
 

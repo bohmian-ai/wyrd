@@ -207,7 +207,14 @@ impl Forge {
         );
         let result =
             tracing::Instrument::instrument(scheduler.record_hint(hint), span.clone()).await;
-        span.record("result", if result.is_ok() { "succeeded" } else { "failed" });
+        span.record(
+            "result",
+            if result.is_ok() {
+                "succeeded"
+            } else {
+                "failed"
+            },
+        );
         tracing::debug!(
             elapsed_seconds = started.elapsed().as_secs_f64(),
             "Forge maintenance hint persistence completed"

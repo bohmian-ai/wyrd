@@ -15,9 +15,9 @@ use vala_sql::queries::forge_operations::ForgeOperations;
 use vala_sql::queries::forge_tasks::{ForgeClaimLimits, ForgeEnqueueBatch, ForgeTasks};
 use vala_sql::row_types::forge_operations::ForgeOperationFamily;
 use vala_sql::row_types::forge_tasks::{
-    ExpiredCleanupPayload, FORGE_TASK_PAYLOAD_VERSION, ForgePlanningDemand,
-    ForgeTaskEstimates, ForgeTaskLane, ForgeTaskPlan, ForgeTaskStrategy,
-    ForgeTaskTableIdentity, NewForgeTask, ORPHAN_CLEANUP_PAYLOAD_VERSION, OrphanCleanupPayload,
+    ExpiredCleanupPayload, FORGE_TASK_PAYLOAD_VERSION, ForgePlanningDemand, ForgeTaskEstimates,
+    ForgeTaskLane, ForgeTaskPlan, ForgeTaskStrategy, ForgeTaskTableIdentity, NewForgeTask,
+    ORPHAN_CLEANUP_PAYLOAD_VERSION, OrphanCleanupPayload,
 };
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
@@ -1396,19 +1396,17 @@ impl<'forge> ForgeScheduler<'forge> {
             .map(|status| ForgePendingTasks {
                 task_type: status.strategy,
                 count: status.pending,
-                oldest_ready_at_unix: status
-                    .oldest_ready_at
-                    .map_or(0, |time| time.timestamp()),
+                oldest_ready_at_unix: status.oldest_ready_at.map_or(0, |time| time.timestamp()),
             })
             .collect();
         self.forge
             .core
             .telemetry
             .publish_pending_tasks(&observations);
-        self.forge.core.telemetry.record_compaction_debt(
-            outcome.compaction_debt_files,
-            outcome.compaction_debt_bytes,
-        );
+        self.forge
+            .core
+            .telemetry
+            .record_compaction_debt(outcome.compaction_debt_files, outcome.compaction_debt_bytes);
         Ok(())
     }
 }

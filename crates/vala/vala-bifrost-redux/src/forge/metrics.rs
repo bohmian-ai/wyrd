@@ -259,9 +259,8 @@ impl ForgeTelemetry {
                 .iter()
                 .find(|observation| observation.task_type == task_type);
             self.pending_tasks[&task_type].set(observed.map_or(0.0, |o| exact(o.count)));
-            self.oldest_pending_task[&task_type].set(
-                observed.map_or(0.0, |o| o.oldest_ready_at_unix.to_f64().unwrap_or(0.0)),
-            );
+            self.oldest_pending_task[&task_type]
+                .set(observed.map_or(0.0, |o| o.oldest_ready_at_unix.to_f64().unwrap_or(0.0)));
         }
     }
 
@@ -277,10 +276,7 @@ impl ForgeTelemetry {
     /// returned guard drops, so every task exit — success, refusal, failure,
     /// uncertainty handoff, cancellation, lease loss, takeover, shutdown, and
     /// panic unwind — balances the increment.
-    pub(super) fn active_task(
-        self: &Arc<Self>,
-        task_type: ForgeTaskStrategy,
-    ) -> ForgeActiveTask {
+    pub(super) fn active_task(self: &Arc<Self>, task_type: ForgeTaskStrategy) -> ForgeActiveTask {
         self.active_tasks[&task_type].increment(1.0);
         ForgeActiveTask {
             telemetry: Arc::clone(self),

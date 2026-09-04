@@ -7350,8 +7350,25 @@ impl datafusion_distributed::DesiredTaskCountHandler for AnalyticalCutTaskCount 
         if !ev.plan.children().is_empty() {
             return None;
         }
+        // Only a source the leader cannot read itself may occupy more than one
+        // task. Every other leaf — the published Iceberg scan, the leader's hot
+        // files, the drained local live tail — is leader-owned and carries no
+        // wire encoding, so distributing its stage would ask the codec to
+        // serialize a plan that only exists on this node. One task keeps such a
+        // stage on the leader, and the pinned revision then elides the boundary
+        // above it, which is what leaves a leader-executable query's root
+        // normal.
+        let tasks = if ev
+            .plan
+            .downcast_ref::<super::codec::RemoteSourcePlaceholderExec>()
+            .is_some()
+        {
+            self.tasks
+        } else {
+            1
+        };
         Some(Ok(
-            datafusion_distributed::DesiredTaskCountEventResponse::desired(self.tasks),
+            datafusion_distributed::DesiredTaskCountEventResponse::desired(tasks),
         ))
     }
 }
@@ -7781,6 +7798,15 @@ impl AnalyticalExecutionHandle {
         ));
         config.set_distributed_scale_up_leaf_node_handler(AnalyticalLeafSplit);
         config.set_distributed_worker_resolver(AnalyticalWorkerResolver { urls });
+        // Bifrost's scan is one union of this table's three leader-owned source
+        // kinds — published Iceberg, leader hot files, and the drained local
+        // live tail. Upstream's isolator would give that union one task per
+        // child and therefore distribute a plan the leader alone can read, so a
+        // purely leader-executable query would come back `DistributedExec` and
+        // ask the codec to serialize leaves that exist only on this node.
+        config
+            .set_distributed_children_isolator_unions(false)
+            .map_err(|_| BifrostError::QueryExecutionFailed)?;
         config.set_distributed_user_codec(super::codec::OraclePhysicalExtensionCodec::analytical(
             self.leaf.clone(),
         ));

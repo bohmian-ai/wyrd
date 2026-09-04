@@ -149,6 +149,37 @@ async fn await_retired(
     .into())
 }
 
+/// Waits until one pod has granted at least `units` query slot units.
+///
+/// A follower pause proves a graph arrived at a peer, which is not the same
+/// claim as the leader having charged that graph its full admitted envelope.
+/// The envelope is the condition a capacity refusal is a statement about, so
+/// the journey reads the leader's own granted units rather than inferring them
+/// from the pause.
+///
+/// # Errors
+///
+/// Returns the control-protocol error, or a description of what the pod held
+/// when the bound expired.
+async fn await_admitted(
+    cluster: &mut wyrd_testing::bifrost::process_cluster::BifrostProcessCluster,
+    index: usize,
+    units: u32,
+) -> Result<(), JourneyError> {
+    for _ in 0..BASELINE_POLLS {
+        if cluster.nodes_mut()[index]
+            .ownership_snapshot()?
+            .root_query_slot_units
+            >= units
+        {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let snapshot = cluster.nodes_mut()[index].ownership_snapshot()?;
+    Err(format!("pod {index} never granted {units} slot units, holds {snapshot:?}").into())
+}
+
 /// Reports whether one SDK error is a client-side transport send failure.
 ///
 /// Only that class is retried by this journey: a dropped stream can leave the
@@ -426,6 +457,13 @@ const PEER_SCRIBE: usize = 3;
 
 /// Bounded polls the journey waits for a pod to return to its baseline.
 const BASELINE_POLLS: usize = 50;
+
+/// Slot units one admitted Analytical graph charges at the resource root.
+///
+/// The activation topology starts each pod with one unit more than this, so a
+/// single held graph owns everything Analytical work can be granted while the
+/// remaining unit stays available to the Interactive floor.
+const ANALYTICAL_GRAPH_UNITS: u32 = 2;
 
 /// Builds one public client against one pod's public HTTP and gRPC listeners.
 ///
@@ -713,16 +751,25 @@ async fn public_query_selects_both_paths_and_preserves_interactive_floor() {
 ///
 /// Returns the first claim that broke.
 async fn prove_public_activation() -> Result<(), JourneyError> {
-    let mut cluster = wyrd_testing::bifrost::process_cluster::BifrostProcessCluster::start(
-        NODE_BINARY,
-        &[
-            wyrd_testing::bifrost::process_cluster::ProcessNodeTarget::Oracle,
-            wyrd_testing::bifrost::process_cluster::ProcessNodeTarget::Oracle,
-            wyrd_testing::bifrost::process_cluster::ProcessNodeTarget::Oracle,
-            wyrd_testing::bifrost::process_cluster::ProcessNodeTarget::Scribe,
-        ],
-    )
-    .await?;
+    // Three slot units per pod is what makes the two claims below independent:
+    // an Analytical graph charges two units at the resource root, so one held
+    // graph owns every unit Analytical work can be granted, while the third
+    // unit remains for the Interactive floor. Stating the number rather than
+    // deriving it from the injected memory envelope is what makes the refusal
+    // a statement about admitted capacity instead of about whatever the
+    // envelope happened to divide into.
+    let mut cluster =
+        wyrd_testing::bifrost::process_cluster::BifrostProcessCluster::start_with_oracle_query_slot_limit(
+            NODE_BINARY,
+            &[
+                wyrd_testing::bifrost::process_cluster::ProcessNodeTarget::Oracle,
+                wyrd_testing::bifrost::process_cluster::ProcessNodeTarget::Oracle,
+                wyrd_testing::bifrost::process_cluster::ProcessNodeTarget::Oracle,
+                wyrd_testing::bifrost::process_cluster::ProcessNodeTarget::Scribe,
+            ],
+            Some(3),
+        )
+        .await?;
 
     let pids: std::collections::BTreeSet<u32> =
         cluster.nodes().iter().map(|node| node.pid()).collect();
@@ -745,10 +792,18 @@ async fn prove_public_activation() -> Result<(), JourneyError> {
     let api_key = cluster
         .provision_public_api_key("analytical-activation-caller")
         .await?;
-    let table = format!("public_activation_{}", uuid::Uuid::now_v7().simple());
+    let suffix = uuid::Uuid::now_v7().simple();
+    let table = format!("public_activation_{suffix}");
     cluster.nodes_mut()[PEER_SCRIBE].register_table(&table)?;
     cluster.nodes_mut()[PEER_SCRIBE].ingest_rows(&table, 0, 12, 3)?;
     cluster.nodes_mut()[PEER_SCRIBE].ingest_rows(&table, 0, 12, 3)?;
+    // The UI table publishes one object, so its scan is a single-partition
+    // leader-executable leaf and its root is normal. The Analytical table above
+    // publishes two, which is what gives its grouped statement real remote work
+    // to distribute.
+    let ui_table = format!("public_activation_ui_{suffix}");
+    cluster.nodes_mut()[PEER_SCRIBE].register_table(&ui_table)?;
+    cluster.nodes_mut()[PEER_SCRIBE].ingest_rows(&ui_table, 0, 12, 3)?;
     for index in [
         COORDINATOR,
         PEER_FOLLOWERS[0],
@@ -772,18 +827,23 @@ async fn prove_public_activation() -> Result<(), JourneyError> {
         "SELECT filter_key, COUNT(*) AS matched FROM vala.bifrost.{table} \
          GROUP BY filter_key ORDER BY filter_key"
     );
-    let ui_sql = format!("SELECT id FROM vala.bifrost.{table} WHERE filter_key = 'group_0'");
+    let ui_sql = format!("SELECT id FROM vala.bifrost.{ui_table} WHERE filter_key = 'group_0'");
 
-    // Held at a real follower boundary, so the Analytical grant is occupied by
-    // a production query while the UI query below asks for its own path.
+    // Held at a real follower boundary, so the Analytical class is occupied by
+    // production queries while the UI query below asks for its own path. Two
+    // graphs are exactly the class capacity configured above.
     let paused = PEER_FOLLOWERS[0];
     cluster.nodes_mut()[paused].arm_execute_pause()?;
-    let analytical = {
+    let held = {
         let client = public_client(&cluster.nodes()[COORDINATOR], &api_key)?;
         let sql = analytical_sql.clone();
         tokio::spawn(async move { run_public(&client, &sql).await })
     };
     cluster.nodes_mut()[paused].await_execute_paused()?;
+    // The pause proves the graph reached a follower; the leader's own granted
+    // unit count is what proves it holds the whole Analytical envelope, which
+    // is the condition the refusal below is a statement about.
+    await_admitted(&mut cluster, COORDINATOR, ANALYTICAL_GRAPH_UNITS).await?;
 
     // Served, exactly, while an Analytical graph on the same pod holds its
     // admitted envelope and both followers hold their leases: the Interactive
@@ -796,12 +856,33 @@ async fn prove_public_activation() -> Result<(), JourneyError> {
         )
         .into());
     }
-    if ui.rows != usize::try_from(FIXTURE_ROWS / FIXTURE_GROUPS)? * 2 {
+    if ui.rows != usize::try_from(FIXTURE_ROWS / FIXTURE_GROUPS)? {
         return Err(format!("the UI query returned {} rows", ui.rows).into());
     }
 
+    // The pod's whole Analytical class is held, so one more Analytical
+    // statement has no capacity of its own. It may wait for a held graph to
+    // release or be refused outright; what it may never do is settle Analytical
+    // while the class is fully owned.
+    match run_public(&client, &analytical_sql).await {
+        Err(error) if error.to_string().contains("query admission rejected") => {}
+        Err(error) => {
+            return Err(
+                format!("an Analytical query beyond the class capacity failed as {error}").into(),
+            );
+        }
+        Ok(settled) => {
+            let snapshot = cluster.nodes_mut()[COORDINATOR].ownership_snapshot()?;
+            return Err(format!(
+                "an Analytical query settled {:?} while the class was fully held; leader holds {snapshot:?}",
+                settled.path
+            )
+            .into());
+        }
+    }
+
     cluster.nodes_mut()[paused].release_execute_pause()?;
-    let analytical = analytical.await??;
+    let analytical = held.await??;
     if analytical.path != QueryExecutionPath::Analytical {
         return Err(format!(
             "the supported data-scientist query must select Analytical, settled {:?}",

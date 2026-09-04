@@ -545,6 +545,18 @@ impl OracleTelemetry {
             "reason" => reason.as_str()
         )
         .increment(1);
+        // A refusal is the one admission outcome an operator has to explain,
+        // and the counter alone cannot say which of a node's queries lost. The
+        // event is emitted here, at the single place every reason converges,
+        // so no refusal branch can be added later without becoming visible.
+        if matches!(outcome, OracleAdmissionOutcome::Rejected) {
+            tracing::debug!(
+                target: "wyrd::oracle::admission",
+                class = query_class_label(query_class),
+                reason = reason.as_str(),
+                "oracle admission refused"
+            );
+        }
     }
 
     /// Records one query cancellation without identity-bearing labels.

@@ -467,6 +467,10 @@ struct ChildConfig {
     peer_api_key_path: PathBuf,
     /// Paths of the shared peer ticket keyring published to this child.
     peer_keyring: TestPeerKeyringPaths,
+    /// Oracle query slot units this child admits with, when the topology states
+    /// one. `None` keeps the memory-derived count every pod ran on before a
+    /// journey needed to saturate an admission class deterministically.
+    oracle_query_slot_limit: Option<usize>,
 }
 
 /// Accepts one query's rows only behind a fully validated success terminal.
@@ -564,6 +568,18 @@ impl ChildConfig {
                 active_key_id: read(env::PEER_TICKET_KEY_ID)?,
                 signing_key_path: PathBuf::from(read(env::PEER_TICKET_KEY_PATH)?),
                 verifying_keyring_path: PathBuf::from(read(env::PEER_TICKET_KEYRING_PATH)?),
+            },
+            // Optional: a topology that does not state a slot count keeps the
+            // memory-derived one, which is what every pod ran on before any
+            // journey needed a saturating class.
+            oracle_query_slot_limit: match std::env::var(env::ORACLE_QUERY_SLOT_LIMIT) {
+                Ok(value) => Some(value.parse().map_err(|error| {
+                    ProcessClusterError::Resource(format!(
+                        "{} is not a slot count: {error}",
+                        env::ORACLE_QUERY_SLOT_LIMIT
+                    ))
+                })?),
+                Err(_) => None,
             },
         })
     }
@@ -668,7 +684,12 @@ impl ChildConfig {
             .with_peer_bind(self.peer_bind)
             .with_bind_addrs_for_test(self.http_bind, self.grpc_bind)
             .with_durable_bifrost_roots(self.wal_root.clone(), self.spill_root.clone())
-            .with_system_resources_for_test(pod_system_resources(self.target))
+            .with_system_resources_for_test(pod_system_resources(self.target));
+        let server = match self.oracle_query_slot_limit {
+            Some(slots) => server.with_oracle_query_slot_limit_for_test(slots),
+            None => server,
+        };
+        let server = server
             .with_oracle_peer_credentials(Arc::clone(&credentials))
             .with_storage_handle(Arc::clone(&storage))
             .start_with_resources(Arc::clone(&fixture), Arc::clone(&storage), None)

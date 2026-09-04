@@ -108,6 +108,9 @@ mod env {
     pub const PEER_TICKET_KEY_PATH: &str = "WYRD_PEER_TEST_PEER_TICKET_KEY_PATH";
     /// Path to the shared published peer ticket verifying manifest.
     pub const PEER_TICKET_KEYRING_PATH: &str = "WYRD_PEER_TEST_PEER_TICKET_KEYRING_PATH";
+    /// Oracle query slot units each child admits with, when the topology states
+    /// one. Absent unless the caller asked for a stated admission capacity.
+    pub const ORACLE_QUERY_SLOT_LIMIT: &str = "WYRD_PEER_TEST_ORACLE_QUERY_SLOT_LIMIT";
 }
 
 /// Bifrost target one simulated pod serves.
@@ -1640,6 +1643,13 @@ pub struct BifrostProcessCluster {
     address_plan: AddressPlan,
     /// Compiled support binary each simulated pod runs.
     binary: PathBuf,
+    /// Oracle query slot units every child in this topology admits with.
+    ///
+    /// `None` leaves each pod on its memory-derived count. A journey that has
+    /// to observe one class saturate states the number instead, so admission
+    /// capacity is a property of the topology rather than of whatever the
+    /// injected memory envelope happens to divide into.
+    oracle_query_slot_limit: Option<usize>,
 }
 
 impl std::fmt::Debug for BifrostProcessCluster {
@@ -1696,6 +1706,24 @@ impl BifrostProcessCluster {
         binary: impl Into<PathBuf>,
         targets: &[ProcessNodeTarget],
     ) -> Result<Self, ProcessClusterError> {
+        Self::start_with_oracle_query_slot_limit(binary, targets, None).await
+    }
+
+    /// Launches the same topology with a stated Oracle admission capacity.
+    ///
+    /// `oracle_query_slot_limit` replaces each child's memory-derived slot
+    /// count, which is what lets a journey hold one class to saturation and
+    /// prove the other class still admits from its protected floor. `None` is
+    /// exactly [`Self::start`].
+    ///
+    /// # Errors
+    ///
+    /// Same conditions as [`Self::start`].
+    pub async fn start_with_oracle_query_slot_limit(
+        binary: impl Into<PathBuf>,
+        targets: &[ProcessNodeTarget],
+        oracle_query_slot_limit: Option<usize>,
+    ) -> Result<Self, ProcessClusterError> {
         let fixture = Arc::new(
             PgFixture::start()
                 .await
@@ -1729,6 +1757,7 @@ impl BifrostProcessCluster {
             nodes: Vec::new(),
             address_plan,
             binary: binary.into(),
+            oracle_query_slot_limit,
         };
         for (index, target) in targets.iter().copied().enumerate() {
             let plan = LaunchPlan {
@@ -2080,6 +2109,9 @@ impl BifrostProcessCluster {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if let Some(slots) = self.oracle_query_slot_limit {
+            command.env(env::ORACLE_QUERY_SLOT_LIMIT, slots.to_string());
+        }
         let mut child = command
             .spawn()
             .map_err(|error| ProcessClusterError::Child(error.to_string()))?;

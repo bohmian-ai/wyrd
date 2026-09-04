@@ -511,6 +511,12 @@ pub struct WyrdTestServerBuilder {
     oracle_spill_path: Option<std::path::PathBuf>,
     /// Complete process observations injected into the production resource policy.
     system_resources: Option<SystemResourceSnapshot>,
+    /// Configured Oracle query slot units, replacing the memory-derived count.
+    ///
+    /// A journey that has to observe class saturation needs the admission
+    /// capacity to be a stated number rather than whatever the injected memory
+    /// envelope happens to divide into.
+    oracle_query_slot_limit: Option<usize>,
     /// Cluster-retained Oracle audit WAL root reused across restarts.
     oracle_audit_wal_root: Option<Arc<tempfile::TempDir>>,
     /// Process-installed production telemetry guard shared by every node.
@@ -608,6 +614,7 @@ impl Default for WyrdTestServerBuilder {
             oracle_spill_root: None,
             oracle_spill_path: None,
             system_resources: None,
+            oracle_query_slot_limit: None,
             oracle_audit_wal_root: None,
             telemetry: None,
             bind_addrs: None,
@@ -3461,6 +3468,19 @@ impl WyrdTestServerBuilder {
         self
     }
 
+    /// Configure this node's Oracle query slot units explicitly.
+    ///
+    /// This is the same deployment knob production reads from
+    /// `WYRD_BIFROST_ORACLE_QUERY_SLOT_LIMIT`: it replaces the memory-derived
+    /// slot count, and server boot then splits it into the interactive and
+    /// analytical class allocations. A journey proving that a class saturates
+    /// sets it so the capacity under test is a stated number.
+    #[must_use]
+    pub fn with_oracle_query_slot_limit_for_test(mut self, slots: usize) -> Self {
+        self.oracle_query_slot_limit = Some(slots);
+        self
+    }
+
     /// Attach the process-installed production telemetry pipeline.
     #[must_use]
     pub(crate) fn with_telemetry(mut self, telemetry: Arc<TelemetryGuard>) -> Self {
@@ -3768,7 +3788,7 @@ impl WyrdTestServerBuilder {
                     unmanaged_reserve_bytes: None,
                     scratch_limit_bytes: None,
                     effective_cpu: None,
-                    oracle_query_slot_limit: None,
+                    oracle_query_slot_limit: self.oracle_query_slot_limit,
                     scratch_root,
                     volume_roots,
                 },

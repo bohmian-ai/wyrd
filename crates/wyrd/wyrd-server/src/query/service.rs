@@ -467,7 +467,7 @@ async fn collect_bounded(
 /// Decoding failures are server-side stream defects, not caller errors, so they
 /// keep the existing internal projection while retaining the closed reason for
 /// operators.
-pub(super) fn arrow_decode_error(error: &QueryIpcDecodeError) -> WyrdError {
+pub(crate) fn arrow_decode_error(error: &QueryIpcDecodeError) -> WyrdError {
     WyrdError::Internal {
         message: "failed to decode Oracle Arrow batch".to_owned(),
         details: serde_json::json!({ "detail": error.to_string() }),
@@ -475,7 +475,7 @@ pub(super) fn arrow_decode_error(error: &QueryIpcDecodeError) -> WyrdError {
 }
 
 /// Preserves the stable terminal error catalog across typed query adapters.
-pub(super) fn terminal_error_to_bifrost(
+pub(crate) fn terminal_error_to_bifrost(
     code: wyrd_spec::vala::api::QueryTerminalErrorCode,
 ) -> wyrd_spec::vala::error::BifrostError {
     use wyrd_spec::vala::api::QueryTerminalErrorCode;

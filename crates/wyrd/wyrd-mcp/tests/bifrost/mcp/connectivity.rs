@@ -80,9 +80,9 @@ mod pg_tests {
 
     use std::time::Duration;
 
+    use rmcp::ClientServiceExt as _;
     use rmcp::model::{CallToolRequest, CallToolRequestParams, ClientRequest};
     use rmcp::service::PeerRequestOptions;
-    use rmcp::ClientServiceExt as _;
     use wyrd_runtime::Permission;
     use wyrd_server::mcp::probe;
     use wyrd_spec::DataTenantId;
@@ -139,8 +139,13 @@ mod pg_tests {
         let names: Vec<&str> = tools.iter().map(|tool| tool.name.as_ref()).collect();
         assert_eq!(
             names,
-            vec![probe::TOOL_NAME],
-            "an opted-in fixture advertises exactly the context probe"
+            vec![
+                "bifrost.list_tables",
+                "bifrost.describe_table",
+                "bifrost.query",
+                probe::TOOL_NAME,
+            ],
+            "an opted-in fixture advertises the context probe after the ordinary catalog"
         );
 
         let result = client

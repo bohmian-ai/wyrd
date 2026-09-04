@@ -192,9 +192,9 @@ mod pg_tests {
             "the event-time partition granularity is described: {layout}"
         );
         assert!(
-            layout["sort_keys"].as_array().is_some_and(|keys| !keys
-                .is_empty()
-                && keys.iter().all(|key| key["column"].is_string())),
+            layout["sort_keys"].as_array().is_some_and(
+                |keys| !keys.is_empty() && keys.iter().all(|key| key["column"].is_string())
+            ),
             "the ordered sort keys are described: {layout}"
         );
         assert!(
@@ -255,8 +255,7 @@ mod pg_tests {
         .clone();
         let refusals = [
             CallToolRequestParams::new("bifrost.list_tables"),
-            CallToolRequestParams::new("bifrost.describe_table")
-                .with_arguments(describe_arguments),
+            CallToolRequestParams::new("bifrost.describe_table").with_arguments(describe_arguments),
         ];
         for parameters in refusals {
             let tool = parameters.name.clone();

@@ -193,6 +193,10 @@ impl ServerHandler for WyrdMcpHandler {
                 let caller = Self::caller(&context).map_err(wyrd_error_to_mcp)?;
                 bifrost::describe_table(&self.state, caller, request.arguments).await
             }
+            bifrost::QUERY => {
+                let caller = Self::caller(&context).map_err(wyrd_error_to_mcp)?;
+                bifrost::query(&self.state, caller, request.arguments).await
+            }
             unknown => {
                 return Err(ErrorData::new(
                     ErrorCode::INVALID_PARAMS,
@@ -201,11 +205,9 @@ impl ServerHandler for WyrdMcpHandler {
                 ));
             }
         };
-        Ok(CallToolResponse::Complete(
-            outcome.unwrap_or_else(|error| {
-                CallToolResult::structured_error(error.as_problem_json())
-            }),
-        ))
+        Ok(CallToolResponse::Complete(outcome.unwrap_or_else(
+            |error| CallToolResult::structured_error(error.as_problem_json()),
+        )))
     }
 }
 

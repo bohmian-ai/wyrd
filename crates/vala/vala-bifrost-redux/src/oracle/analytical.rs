@@ -7565,32 +7565,16 @@ impl OracleRouteTasks {
     /// Called only from [`RouteTasksHandler::handle`]; the same traversal must
     /// not run at any other call site, because a check that happens before the
     /// routing boundary can be invalidated by the coordinator's own placement.
+    /// The walk itself is [`super::remote_placeholders`], the one the binder
+    /// also uses, so a plan shape either side cannot see is a single defect
+    /// rather than two divergent ones.
     fn stage_destinations(
         plan: &Arc<dyn ExecutionPlan>,
     ) -> Vec<super::dispatcher::DispatchCandidate> {
-        let mut found = Vec::new();
-        let mut pending = vec![Arc::clone(plan)];
-        while let Some(node) = pending.pop() {
-            if let Some(placeholder) =
-                node.downcast_ref::<super::codec::RemoteSourcePlaceholderExec>()
-                && let Some(destination) = placeholder.destination()
-            {
-                found.push(destination.clone());
-            }
-            // A leaf that was scaled up is wrapped in `DistributedLeafExec`,
-            // whose per-task variants are deliberately not its `children`. The
-            // walk must descend into them explicitly, or a stage whose only
-            // remote source was split across tasks looks destination-free and
-            // falls through to upstream's random assignment — which routes the
-            // plan push and the task execution to different workers.
-            if let Some(split) = node.downcast_ref::<datafusion_distributed::DistributedLeafExec>()
-            {
-                pending.push(Arc::clone(split.original()));
-                pending.extend(split.variants().iter().map(Arc::clone));
-            }
-            pending.extend(node.children().into_iter().cloned());
-        }
-        found
+        super::remote_placeholders(plan.as_ref())
+            .iter()
+            .filter_map(|placeholder| placeholder.destination().cloned())
+            .collect()
     }
 }
 

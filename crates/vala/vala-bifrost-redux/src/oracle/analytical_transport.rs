@@ -1581,10 +1581,25 @@ impl WorkerChannel for AnalyticalWorkerChannel {
         task_ctx: &Arc<TaskContext>,
     ) -> Result<BoxStream<'static, Result<WorkerToCoordinatorMsg, DataFusionError>>, DataFusionError>
     {
-        self.stamp(&mut headers, set_plan_request.task_key)?;
-        self.inner
+        let key = set_plan_request.task_key;
+        self.stamp(&mut headers, key)?;
+        let out = self
+            .inner
             .coordinator_channel(headers, set_plan_request, c2w_stream, metrics, task_ctx)
-            .await
+            .await;
+        if let Err(error) = &out {
+            // Upstream spawns this push into a `JoinSet` it only joins after
+            // the query has already failed, so a refused plan installation is
+            // otherwise observable only as the consumer's plan-wait timeout ten
+            // seconds later. Naming it here keeps the cause in the log.
+            tracing::warn!(
+                stage = key.stage_id,
+                task = key.task_number,
+                error = %error,
+                "Oracle analytical stage plan installation failed"
+            );
+        }
+        out
     }
 
     /// Stamps and delegates one task execution.

@@ -4117,12 +4117,24 @@ struct PlannedSources<'a> {
 /// actually kept: a cut may pin a remote owner and still be planned away by
 /// projection or pruning, and binding an assignment for a leaf that no longer
 /// exists would make the binding set disagree with the plan it governs.
-fn remote_placeholders(root: &dyn ExecutionPlan) -> Vec<codec::RemoteSourcePlaceholderExec> {
+pub(super) fn remote_placeholders(
+    root: &dyn ExecutionPlan,
+) -> Vec<codec::RemoteSourcePlaceholderExec> {
     let mut found = Vec::new();
     let mut pending: Vec<&dyn ExecutionPlan> = vec![root];
     while let Some(node) = pending.pop() {
         if let Some(placeholder) = node.downcast_ref::<codec::RemoteSourcePlaceholderExec>() {
             found.push(placeholder.clone());
+        }
+        // A leaf that was scaled up is wrapped in `DistributedLeafExec`, whose
+        // per-task variants are deliberately not its `children`. Both callers —
+        // the binder that must bind every planned remote source and the router
+        // that must place its stage on that source's frozen peer — would
+        // otherwise read a split leaf as if the plan had no remote source at
+        // all, so the descent belongs in this one walk.
+        if let Some(split) = node.downcast_ref::<datafusion_distributed::DistributedLeafExec>() {
+            pending.push(split.original().as_ref());
+            pending.extend(split.variants().iter().map(Arc::as_ref));
         }
         for child in node.children() {
             pending.push(child.as_ref());

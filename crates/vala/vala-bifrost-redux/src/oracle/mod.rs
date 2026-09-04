@@ -309,62 +309,6 @@ fn follower_assignment_sources(
     sources
 }
 
-/// One attempt's fixed stale-object replacement boundary.
-#[derive(Clone, Copy)]
-struct StaleReplacementGate {
-    /// Zero-based full-attempt ordinal.
-    retry_ordinal: u8,
-    /// Whether any public schema or record frame has been exposed.
-    output_started: bool,
-    /// Path this attempt irreversibly selected before it opened.
-    selected_path: QueryExecutionPath,
-}
-
-impl StaleReplacementGate {
-    /// Creates the pre-output gate used while building one attempt stream.
-    const fn before_output(retry_ordinal: u8, selected_path: QueryExecutionPath) -> Self {
-        Self {
-            retry_ordinal,
-            output_started: false,
-            selected_path,
-        }
-    }
-
-    /// Settles the real admitted owner before authorizing the sole typed replacement.
-    ///
-    /// A retry is returned only for the first attempt, on an Interactive
-    /// selection, before public output, and after synchronous release of the
-    /// complete admitted owner. Every other combination returns the unchanged
-    /// owner for terminal settlement. Selection is irreversible, so a query
-    /// that already moved onto a graph has no local path to replan back onto:
-    /// its stale first batch settles the graph and fails.
-    ///
-    /// # Errors
-    ///
-    /// Returns the unchanged admitted owner when replacement is ineligible.
-    ///
-    /// The owner is boxed on the error path: it is far larger than the unit
-    /// success value, and returning it inline would make every caller's
-    /// `Result` pay that size on the common eligible path.
-    fn settle_for_typed_stale(
-        self,
-        admitted: AdmittedQueryGuard,
-        typed_stale: bool,
-    ) -> Result<(), Box<AdmittedQueryGuard>> {
-        if self.retry_ordinal == 0
-            && !self.output_started
-            && typed_stale
-            && self.selected_path == QueryExecutionPath::Interactive
-        {
-            admitted.release();
-            record_stale_replan();
-            Ok(())
-        } else {
-            Err(Box::new(admitted))
-        }
-    }
-}
-
 /// Decodes footer-validated attempt payloads into Arrow batches.
 ///
 /// # Errors
@@ -1824,8 +1768,6 @@ struct CutAuditInput<'a> {
     cuts: &'a [PinnedSealedTable],
     /// Server-derived query class.
     query_class: QueryClass,
-    /// Whole-query retry ordinal.
-    retry_ordinal: u8,
     /// Absolute query deadline.
     deadline: Instant,
     /// Admitted query owner supplying cancellation and durable query identity.
@@ -1842,11 +1784,9 @@ struct SqlAttemptInput<'a> {
     request: &'a BifrostQueryRequest,
     /// Tables parsed from the validated SQL statement.
     tables: &'a [TableRef],
-    /// Absolute whole-query deadline shared across retry attempts.
+    /// Absolute whole-query deadline.
     deadline: Instant,
-    /// Zero-based stale-replan attempt ordinal.
-    retry_ordinal: u8,
-    /// One signed ingress-captured participant cut reused by every retry phase.
+    /// One signed ingress-captured participant cut reused by every attempt phase.
     participant_cut: &'a OracleQueryAttemptCut,
     /// Server-derived class signed into the forwarding envelope.
     query_class: QueryClass,
@@ -2562,7 +2502,7 @@ impl Oracle {
     ) -> Result<OracleQueryStream, BifrostError> {
         let (cut, planned) = self.prepare_query_attempt(&context, &request).await?;
         let query_class = planned.query_class;
-        self.run_sql_query_attempt_loop(context, request, cut, query_class, Some(planned), None)
+        self.run_sql_query(context, request, cut, query_class, Some(planned), None)
             .await
     }
 
@@ -2593,7 +2533,7 @@ impl Oracle {
     ) -> Result<OracleQueryStream, BifrostError> {
         let (cut, planned) = self.prepare_query_attempt(&context, &request).await?;
         let query_class = planned.query_class;
-        self.run_sql_query_attempt_loop(
+        self.run_sql_query(
             context,
             request,
             cut,
@@ -2776,7 +2716,7 @@ impl Oracle {
         query_class: QueryClass,
         prepared: Option<PlannedSqlCut>,
     ) -> Result<OracleQueryStream, BifrostError> {
-        self.run_sql_query_attempt_loop(
+        self.run_sql_query(
             context,
             request,
             participant_cut,
@@ -2787,13 +2727,14 @@ impl Oracle {
         .await
     }
 
-    /// Runs one SQL query's bounded stale-replan attempt loop.
+    /// Runs one SQL query's single terminal attempt.
     ///
     /// Every public raw-SQL entry point converges here: the participant cut and
-    /// class are already fixed, and this owner is what decides whether an
-    /// attempt may be replaced by exactly one stale-Iceberg replan before any
-    /// result data leaves the node. Gate attaches its own request lifecycle to
-    /// the returned stream afterwards rather than through this path.
+    /// class are already fixed, and this owner runs the sole attempt the query
+    /// is allowed. A stale source, a planning failure, or an execution failure
+    /// is terminal; nothing repins, rebuilds, or falls back, and the caller may
+    /// only submit a new logical query. Gate attaches its own request lifecycle
+    /// to the returned stream afterwards rather than through this path.
     ///
     /// # Errors
     /// Returns the same stable query, catalog, admission, visibility, audit,
@@ -2809,13 +2750,13 @@ impl Oracle {
             search_role = "oracle"
         )
     )]
-    async fn run_sql_query_attempt_loop(
+    async fn run_sql_query(
         &self,
         context: AuthorizedQueryContext,
         request: BifrostQueryRequest,
         participant_cut: OracleQueryAttemptCut,
         query_class: QueryClass,
-        mut prepared: Option<PlannedSqlCut>,
+        prepared: Option<PlannedSqlCut>,
         analytical: Option<analytical::AnalyticalAttemptContext>,
     ) -> Result<OracleQueryStream, BifrostError> {
         self.validate_query(&request)?;
@@ -2843,36 +2784,26 @@ impl Oracle {
         // where pre-fragment latency is attributable.
         let attempt_started = std::time::Instant::now();
         let mut query_telemetry = None;
-        for retry_ordinal in 0_u8..=1 {
-            if let Some(stream) = self
-                .run_sql_attempt(
-                    SqlAttemptInput {
-                        context: &context,
-                        request: &request,
-                        tables: &tables,
-                        deadline,
-                        retry_ordinal,
-                        participant_cut: &participant_cut,
-                        query_class,
-                        // Only the first attempt may reuse the classification
-                        // snapshot. A stale-Iceberg retry exists precisely to
-                        // observe a newer catalog, so it must pin again.
-                        prepared: prepared.take(),
-                        analytical: analytical.as_ref(),
-                    },
-                    &mut query_telemetry,
-                )
-                .await?
-            {
-                tracing::debug!(
-                    attempt_ms = attempt_started.elapsed().as_millis(),
-                    retry_ordinal,
-                    "Oracle leader opened one query stream"
-                );
-                return Ok(stream);
-            }
-        }
-        Err(BifrostError::QueryExecutionFailed)
+        let stream = self
+            .run_sql_attempt(
+                SqlAttemptInput {
+                    context: &context,
+                    request: &request,
+                    tables: &tables,
+                    deadline,
+                    participant_cut: &participant_cut,
+                    query_class,
+                    prepared,
+                    analytical: analytical.as_ref(),
+                },
+                &mut query_telemetry,
+            )
+            .await?;
+        tracing::debug!(
+            attempt_ms = attempt_started.elapsed().as_millis(),
+            "Oracle leader opened one query stream"
+        );
+        Ok(stream)
     }
 
     /// Decides whether this attempt is an Analytical candidate, and under what
@@ -3071,11 +3002,8 @@ impl Oracle {
     /// its class checked against the signed cut, the envelope is admitted and
     /// leased, the cut is audited and its live tails drained, the physical plan
     /// executes, and only then is the first batch awaited and the stream
-    /// settled. An attempt that fails before output may be replaced once by its
-    /// caller's stale-replan loop; one that has produced output may not.
-    ///
-    /// Returns `Ok(None)` when this attempt was refused for a reason its caller
-    /// may retry, which is the signal the attempt loop replans on.
+    /// settled. This is the sole attempt the query is allowed: any failure it
+    /// reaches is terminal, and every owner it took is released before return.
     ///
     /// # Errors
     ///
@@ -3087,13 +3015,12 @@ impl Oracle {
         &self,
         input: SqlAttemptInput<'_>,
         query_telemetry: &mut Option<QueryTelemetryGuard>,
-    ) -> Result<Option<OracleQueryStream>, BifrostError> {
+    ) -> Result<OracleQueryStream, BifrostError> {
         let SqlAttemptInput {
             context,
             request,
             tables,
             deadline,
-            retry_ordinal,
             participant_cut,
             query_class: expected_query_class,
             prepared,
@@ -3131,7 +3058,6 @@ impl Oracle {
                 request,
                 cuts: &planned.cuts,
                 query_class: planned.query_class,
-                retry_ordinal,
                 deadline,
                 admitted: &admitted,
                 participant_cut,
@@ -3175,16 +3101,9 @@ impl Oracle {
             }
         };
         record_degraded_live_tail(&execution.degraded_sources, drained.degraded);
-        // Built before the cut is consumed: the gate is fixed by the path this
-        // attempt already selected, never by what settlement later reports.
         let settlement = AttemptSettlement {
             deadline,
             deadline_ms: participant_cut.deadline().timestamp_millis().max(0),
-            retry_ordinal,
-            stale_replacement: StaleReplacementGate::before_output(
-                retry_ordinal,
-                execution.execution_path,
-            ),
             visibility: request.visibility,
             freshness: request.freshness,
         };
@@ -3386,7 +3305,6 @@ impl Oracle {
                 input.cuts,
                 input.request.visibility,
                 input.query_class,
-                input.retry_ordinal,
                 input.deadline,
             )?;
             tokio::time::timeout(
@@ -3666,7 +3584,6 @@ impl Oracle {
             } else {
                 Vec::new()
             })),
-            stale_replanned: false,
             query_telemetry,
             scan_stats,
             gate_lifecycle: None,
@@ -5039,7 +4956,6 @@ fn read_decision(
     cuts: &[PinnedSealedTable],
     visibility: VisibilityMode,
     query_class: QueryClass,
-    retry_ordinal: u8,
     deadline: Instant,
 ) -> Result<BifrostQueryReadDecision, BifrostError> {
     let mut binding_digests = cuts
@@ -5074,7 +4990,9 @@ fn read_decision(
         selected_node_count: 1,
         worker_count: 0,
         slot_units,
-        retry_ordinal,
+        // One attempt per logical query: the audit contract still carries the
+        // ordinal, and Oracle now only ever writes its first value.
+        retry_ordinal: 0,
         deadline_ms,
     })
 }
@@ -5262,14 +5180,10 @@ impl AttemptOutput {
 
 /// Request-scoped facts settlement needs that do not come from execution.
 struct AttemptSettlement {
-    /// Absolute whole-query deadline shared across retry attempts.
+    /// Absolute whole-query deadline.
     deadline: Instant,
     /// The pinned cut's deadline as a nonnegative Unix epoch millisecond.
     deadline_ms: i64,
-    /// Zero-based stale-replan attempt ordinal.
-    retry_ordinal: u8,
-    /// Gate deciding whether a typed stale first batch may be replanned.
-    stale_replacement: StaleReplacementGate,
     /// Caller-selected visibility retained on the returned stream.
     visibility: VisibilityMode,
     /// Caller-selected source-loss policy retained on the returned stream.
@@ -5279,25 +5193,25 @@ struct AttemptSettlement {
 /// Awaits the first batch and converts one executed attempt into a query stream.
 ///
 /// The first batch is the decision point for the whole attempt. A typed stale
-/// object error observed before any output means the pinned cut moved under the
-/// query, so the attempt is cancelled, its distributed children are joined, and
-/// the caller is told to replan — but only while replacement is still eligible.
-/// Any other first-batch failure, a missing telemetry guard, or a schema-frame
-/// failure settles the distributed children and releases the admitted owner
-/// before returning, so no child outlives its parent on a failure path.
+/// object error means a data file the pinned cut referenced was already deleted
+/// when the scan reached it; there is no second attempt to move to, so the
+/// attempt is cancelled, its distributed children are joined, and the query
+/// fails. Any other first-batch failure, a missing telemetry guard, or a
+/// schema-frame failure settles the distributed children and releases the
+/// admitted owner before returning, so no child outlives its parent on a
+/// failure path.
 ///
 /// # Errors
 ///
 /// Returns [`BifrostError::QueryTimeout`] when the first batch does not arrive
 /// before the deadline, [`BifrostError::QueryExecutionFailed`] for a stale first
-/// batch that can no longer be replanned or a missing telemetry guard, and the
-/// mapped first-batch failure otherwise. `Ok(None)` means the caller must
-/// replan rather than that the query returned no rows.
+/// batch or a missing telemetry guard, and the mapped first-batch failure
+/// otherwise.
 async fn settle_attempt_output(
     output: AttemptOutput,
     settle: AttemptSettlement,
     query_telemetry: &mut Option<QueryTelemetryGuard>,
-) -> Result<Option<OracleQueryStream>, BifrostError> {
+) -> Result<OracleQueryStream, BifrostError> {
     let AttemptOutput {
         schema,
         mut batches,
@@ -5310,8 +5224,6 @@ async fn settle_attempt_output(
     let AttemptSettlement {
         deadline,
         deadline_ms,
-        retry_ordinal,
-        stale_replacement,
         visibility,
         freshness,
     } = settle;
@@ -5334,15 +5246,12 @@ async fn settle_attempt_output(
         admitted.cancellation.cancel();
         drop(batches);
         admitted.distributed_settlement.join().await;
-        return match stale_replacement.settle_for_typed_stale(admitted, true) {
-            Ok(()) => Ok(None),
-            Err(admitted) => release_error(
-                deadline,
-                *admitted,
-                BifrostError::QueryExecutionFailed,
-                "final stale first batch",
-            ),
-        };
+        return release_error(
+            deadline,
+            admitted,
+            BifrostError::QueryExecutionFailed,
+            "stale first batch",
+        );
     }
     if let Some(error) = map_first_batch_failure(first.as_ref()) {
         return settle_distributed_failure(
@@ -5372,7 +5281,7 @@ async fn settle_attempt_output(
             .await;
         }
     };
-    Ok(Some(OracleQueryStream::new(QueryStreamInput {
+    Ok(OracleQueryStream::new(QueryStreamInput {
         execution_path,
         schema_frame,
         ipc,
@@ -5384,14 +5293,13 @@ async fn settle_attempt_output(
         visibility,
         freshness_policy: freshness,
         degraded_sources,
-        stale_replanned: retry_ordinal == 1,
         query_telemetry,
         scan_stats,
         // Gate attaches its own lifecycle to the returned stream through
         // `with_gate_lifecycle`; nothing on the attempt path owns one.
         gate_lifecycle: None,
         running_query,
-    })))
+    }))
 }
 
 /// Projects a monotonic execution deadline as a nonnegative Unix epoch millisecond.
@@ -6143,19 +6051,6 @@ fn record_analytical_selection(outcome: &'static str) {
     metrics::counter!("oracle_query_analytical_selection_total", "outcome" => outcome).increment(1);
 }
 
-/// Records consumption of the sole pre-byte stale-cut replan.
-///
-/// A stale replan means a data file this query's pinned snapshot referenced was
-/// already deleted when the scan reached it — a live reader raced a Forge
-/// compaction that reclaimed its input. The query recovers by replanning, but it
-/// pays a second pin, a second admission, and a second audit, so a sustained
-/// rate here is a retention problem rather than normal operation. It is WARN,
-/// not DEBUG: correctness holds, but the cost is real and its cause is upstream.
-fn record_stale_replan() {
-    metrics::counter!("oracle_query_stale_replans_total").increment(1);
-    tracing::warn!("Oracle replanned one query after its pinned data file was already deleted");
-}
-
 /// Release an admitted query after an attempt-local terminal error.
 ///
 /// # Errors
@@ -6807,74 +6702,6 @@ mod tests {
             "404 parquet object not found".to_owned(),
         );
         assert!(!is_stale_iceberg_object_error(&text_only));
-    }
-
-    /// The sole typed pre-output replacement settles its real admission owner first.
-    #[test]
-    fn stale_replacement_gate_settles_once_and_rejects_second_or_post_output_attempts() {
-        let (admitted, shared, _request_cancellation) = admission::admitted_guard_for_test();
-        let cancellation = admitted.cancellation.clone();
-        assert_eq!(admission::active_queries_for_test(&shared), 1);
-        assert!(
-            StaleReplacementGate::before_output(0, QueryExecutionPath::Interactive)
-                .settle_for_typed_stale(admitted, true)
-                .is_ok()
-        );
-        assert!(cancellation.is_cancelled());
-        assert_eq!(admission::active_queries_for_test(&shared), 0);
-
-        let (second, second_shared, _request_cancellation) = admission::admitted_guard_for_test();
-        let second = match StaleReplacementGate::before_output(1, QueryExecutionPath::Interactive)
-            .settle_for_typed_stale(second, true)
-        {
-            Ok(()) => panic!("second stale attempt must not replace"),
-            Err(admitted) => admitted,
-        };
-        assert_eq!(admission::active_queries_for_test(&second_shared), 1);
-        second.release();
-        assert_eq!(admission::active_queries_for_test(&second_shared), 0);
-
-        let (post_output, post_output_shared, _request_cancellation) =
-            admission::admitted_guard_for_test();
-        let post_output = match (StaleReplacementGate {
-            retry_ordinal: 0,
-            output_started: true,
-            selected_path: QueryExecutionPath::Interactive,
-        })
-        .settle_for_typed_stale(post_output, true)
-        {
-            Ok(()) => panic!("post-output stale failure must not replace"),
-            Err(admitted) => admitted,
-        };
-        post_output.release();
-        assert_eq!(admission::active_queries_for_test(&post_output_shared), 0);
-
-        let (string_only, string_shared, _request_cancellation) =
-            admission::admitted_guard_for_test();
-        let string_only =
-            match StaleReplacementGate::before_output(0, QueryExecutionPath::Interactive)
-                .settle_for_typed_stale(string_only, false)
-            {
-                Ok(()) => panic!("string-only not-found must not replace"),
-                Err(admitted) => admitted,
-            };
-        string_only.release();
-        assert_eq!(admission::active_queries_for_test(&string_shared), 0);
-
-        // Selection is irreversible: a query that already moved onto a graph
-        // has no local path to replan back onto, so its stale first batch is a
-        // terminal failure rather than the one permitted replacement.
-        let (analytical, analytical_shared, _request_cancellation) =
-            admission::admitted_guard_for_test();
-        let analytical =
-            match StaleReplacementGate::before_output(0, QueryExecutionPath::Analytical)
-                .settle_for_typed_stale(analytical, true)
-            {
-                Ok(()) => panic!("a selected Analytical stale first batch must not replace"),
-                Err(admitted) => admitted,
-            };
-        analytical.release();
-        assert_eq!(admission::active_queries_for_test(&analytical_shared), 0);
     }
 
     /// Synthetic first-batch owner exposing cleanup and final-drop observations.

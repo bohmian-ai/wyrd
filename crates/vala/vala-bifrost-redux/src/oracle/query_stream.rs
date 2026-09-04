@@ -208,8 +208,6 @@ pub(super) struct QueryStreamInput {
     pub(super) freshness_policy: wyrd_spec::vala::api::FreshnessPolicy,
     /// Exact source tiers completed as eligible degraded losses.
     pub(super) degraded_sources: super::DegradedSourceAccumulator,
-    /// Whether the one stale-cut replan was consumed.
-    pub(super) stale_replanned: bool,
     /// Production query telemetry retained through terminal emission.
     pub(super) query_telemetry: QueryTelemetryGuard,
     /// Final physical scan evidence retained through terminal emission.
@@ -296,8 +294,6 @@ struct FrameBuildInput {
     freshness_policy: wyrd_spec::vala::api::FreshnessPolicy,
     /// Exact source tiers completed as eligible degraded losses.
     degraded_sources: super::DegradedSourceAccumulator,
-    /// Whether stale replanning was consumed.
-    stale_replanned: bool,
     /// Query telemetry guard.
     query_telemetry: super::QueryTelemetryGuard,
     /// Optional gate lifecycle guard.
@@ -389,7 +385,6 @@ fn build_frames(input: FrameBuildInput) -> std::pin::Pin<Box<super::OracleFrameS
         visibility,
         freshness_policy,
         degraded_sources,
-        stale_replanned,
         mut query_telemetry,
         gate_lifecycle,
         stream_cancellation,
@@ -447,8 +442,7 @@ fn build_frames(input: FrameBuildInput) -> std::pin::Pin<Box<super::OracleFrameS
                     &degraded_sources,
                     visibility,
                     freshness_policy,
-                    stale_replanned,
-                    row_count,
+                                row_count,
                     execution_path,
                 ),
                 QueryStreamEvent::Failed(code) => {
@@ -811,7 +805,6 @@ fn exhausted_terminal(
     degraded_sources: &super::DegradedSourceAccumulator,
     visibility: VisibilityMode,
     freshness_policy: wyrd_spec::vala::api::FreshnessPolicy,
-    stale_replanned: bool,
     row_count: u64,
     execution_path: QueryExecutionPath,
 ) -> QueryTerminalFrame {
@@ -827,7 +820,6 @@ fn exhausted_terminal(
         visibility,
         freshness_policy,
         &degraded.sources,
-        stale_replanned,
         row_count,
         execution_path,
     )
@@ -856,7 +848,6 @@ fn successful_terminal(
     visibility: VisibilityMode,
     freshness_policy: wyrd_spec::vala::api::FreshnessPolicy,
     degraded_sources: &[QuerySource],
-    stale_replanned: bool,
     row_count: u64,
     execution_path: QueryExecutionPath,
 ) -> QueryTerminalFrame {
@@ -888,9 +879,6 @@ fn successful_terminal(
     let mut warnings = Vec::new();
     if live_tail_lost {
         warnings.push(wyrd_spec::vala::api::QueryWarning::LiveTailUnavailable);
-    }
-    if stale_replanned {
-        warnings.push(wyrd_spec::vala::api::QueryWarning::StaleCutReplanned);
     }
     let mut source_completion = vec![
         SourceCompletion {
@@ -1445,7 +1433,6 @@ impl OracleQueryStream {
             visibility: VisibilityMode::PublishedOnly,
             freshness_policy: wyrd_spec::vala::api::FreshnessPolicy::Strict,
             degraded_sources: Arc::new(std::sync::Mutex::new(Vec::new())),
-            stale_replanned: false,
             query_telemetry: telemetry
                 .start_query(VisibilityMode::PublishedOnly, QueryClass::Interactive),
             scan_stats,
@@ -1474,8 +1461,7 @@ impl OracleQueryStream {
             visibility,
             freshness_policy,
             degraded_sources,
-            stale_replanned,
-            mut query_telemetry,
+                mut query_telemetry,
             scan_stats,
             gate_lifecycle,
             running_query,
@@ -1503,8 +1489,7 @@ impl OracleQueryStream {
             visibility,
             freshness_policy,
             degraded_sources,
-            stale_replanned,
-            query_telemetry,
+                query_telemetry,
             gate_lifecycle,
             stream_cancellation,
             request_cancellation,
@@ -1679,7 +1664,6 @@ mod tests {
             VisibilityMode::Fused,
             FreshnessPolicy::Strict,
             &[],
-            false,
             3,
             QueryExecutionPath::Interactive,
         );
@@ -1694,7 +1678,6 @@ mod tests {
             VisibilityMode::Fused,
             FreshnessPolicy::Strict,
             &[QuerySource::LiveTail],
-            false,
             2,
             QueryExecutionPath::Interactive,
         );
@@ -1711,7 +1694,6 @@ mod tests {
             VisibilityMode::Fused,
             FreshnessPolicy::AllowDegraded,
             &[QuerySource::LiveTail],
-            false,
             2,
             QueryExecutionPath::Interactive,
         );
@@ -1734,7 +1716,6 @@ mod tests {
                     VisibilityMode::Fused,
                     policy,
                     &[source],
-                    false,
                     0,
                     QueryExecutionPath::Interactive,
                 );
@@ -1760,7 +1741,6 @@ mod tests {
                 VisibilityMode::PublishedOnly,
                 policy,
                 &[QuerySource::LiveTail],
-                false,
                 4,
                 QueryExecutionPath::Interactive,
             );
@@ -1858,7 +1838,6 @@ mod tests {
                 VisibilityMode::PublishedOnly,
                 FreshnessPolicy::Strict,
                 &[],
-                false,
                 0,
                 QueryExecutionPath::Interactive,
             ),
@@ -1879,7 +1858,6 @@ mod tests {
                 VisibilityMode::PublishedOnly,
                 FreshnessPolicy::Strict,
                 &[],
-                false,
                 5,
                 QueryExecutionPath::Interactive,
             ),
@@ -2115,7 +2093,6 @@ mod tests {
             visibility: VisibilityMode::PublishedOnly,
             freshness_policy: FreshnessPolicy::Strict,
             degraded_sources: Arc::new(std::sync::Mutex::new(Vec::new())),
-            stale_replanned: false,
             query_telemetry: telemetry,
             scan_stats: OracleQueryScanStats::default(),
             gate_lifecycle: None,
@@ -2157,7 +2134,6 @@ mod tests {
             visibility: VisibilityMode::PublishedOnly,
             freshness_policy: FreshnessPolicy::Strict,
             degraded_sources: Arc::new(std::sync::Mutex::new(Vec::new())),
-            stale_replanned: false,
             query_telemetry: telemetry_owner
                 .start_query(VisibilityMode::PublishedOnly, QueryClass::Interactive),
             scan_stats: OracleQueryScanStats::default(),
@@ -2199,7 +2175,6 @@ mod tests {
             visibility: VisibilityMode::PublishedOnly,
             freshness_policy: FreshnessPolicy::Strict,
             degraded_sources: Arc::new(std::sync::Mutex::new(Vec::new())),
-            stale_replanned: false,
             query_telemetry: telemetry_owner
                 .start_query(VisibilityMode::PublishedOnly, QueryClass::Interactive),
             scan_stats: OracleQueryScanStats::default(),

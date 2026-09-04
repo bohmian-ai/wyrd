@@ -596,14 +596,14 @@ async fn prove_single_planner_routing() -> Result<(), JourneyError> {
         await_baseline(&mut cluster, index, before).await?;
     }
 
-    // A published object that no longer exists is terminal on the ordinary
-    // normal-root scan: the pinned snapshot still names it, so the leader must
+    // A pinned object that no longer exists is terminal on the ordinary
+    // normal-root scan: the pinned cut still names it, so the leader must
     // fail its one attempt rather than repin, replan, or rebuild.
-    let object = published_parquet(&cluster, &table)?;
+    let object = pinned_parquet(&cluster, &table)?;
     cluster.remove_storage_object(&object)?;
     if let Ok(settled) = run_public(&client, &scan_sql).await {
         return Err(format!(
-            "a missing published object still settled {} rows",
+            "a missing pinned object still settled {} rows",
             settled.rows
         )
         .into());
@@ -618,19 +618,23 @@ async fn prove_single_planner_routing() -> Result<(), JourneyError> {
 
 /// Returns one published Parquet data object of `table`, relative to the store.
 ///
-/// Only files under a `data` directory are eligible, so the caller deletes a
-/// row-bearing object while every Iceberg metadata and manifest file the
-/// snapshot depends on stays intact.
+/// Only row-bearing Parquet objects are eligible, so the caller deletes data
+/// while every Iceberg metadata and manifest file the snapshot depends on
+/// stays intact. The process fixture seals its rows to staged hot Parquet and
+/// runs no Forge compaction, so this is that hot object; the pinned cut names
+/// it exactly as it names a compacted one, and the stale-source branch under
+/// test does not distinguish the two.
 ///
 /// # Errors
 ///
-/// Returns a description when the store cannot be walked or holds no published
+/// Returns a description when the store cannot be walked or holds no pinned
 /// data object for `table`.
-fn published_parquet(
+fn pinned_parquet(
     cluster: &wyrd_testing::bifrost::process_cluster::BifrostProcessCluster,
     table: &str,
 ) -> Result<String, JourneyError> {
     let root = cluster.storage_root().to_path_buf();
+    let mut seen: Vec<String> = Vec::new();
     let mut pending = vec![root.clone()];
     while let Some(directory) = pending.pop() {
         for entry in std::fs::read_dir(&directory)? {
@@ -640,15 +644,16 @@ fn published_parquet(
                 continue;
             }
             let relative = path.strip_prefix(&root)?.to_string_lossy().into_owned();
-            let is_data = std::path::Path::new(&relative)
+            let is_metadata = std::path::Path::new(&relative)
                 .components()
-                .any(|component| component.as_os_str() == "data");
-            if is_data && relative.contains(table) && relative.ends_with(".parquet") {
+                .any(|component| component.as_os_str() == "metadata");
+            seen.push(relative.clone());
+            if !is_metadata && relative.contains(table) && relative.ends_with(".parquet") {
                 return Ok(relative);
             }
         }
     }
-    Err(format!("the object store published no data object for {table}").into())
+    Err(format!("the object store holds no pinned data object for {table}; saw {seen:?}").into())
 }
 
 /// Asserts one public settlement's selected path and exact row count.

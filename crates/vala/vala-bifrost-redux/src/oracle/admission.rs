@@ -1118,21 +1118,6 @@ pub(super) struct DistributedQuerySettlement {
 }
 
 impl DistributedQuerySettlement {
-    /// Starts one partition only while query cancellation remains open.
-    pub(super) fn start(
-        self: &Arc<Self>,
-        cancellation: &CancellationToken,
-    ) -> Option<DistributedPartitionGuard> {
-        let mut active = self.active.lock().ok()?;
-        if cancellation.is_cancelled() {
-            return None;
-        }
-        *active = active.checked_add(1)?;
-        Some(DistributedPartitionGuard {
-            settlement: Arc::clone(self),
-        })
-    }
-
     /// Cancels admission for new work and waits until every started partition settles.
     pub(super) async fn cancel_and_join(&self, cancellation: &CancellationToken) {
         {
@@ -1160,21 +1145,6 @@ impl DistributedQuerySettlement {
             }
             notified.await;
         }
-    }
-}
-
-/// RAII terminal for one started distributed partition future.
-pub(super) struct DistributedPartitionGuard {
-    /// Shared query settlement updated on every future terminal or drop.
-    settlement: Arc<DistributedQuerySettlement>,
-}
-
-impl Drop for DistributedPartitionGuard {
-    fn drop(&mut self) {
-        if let Ok(mut active) = self.settlement.active.lock() {
-            *active = active.saturating_sub(1);
-        }
-        self.settlement.settled.notify_waiters();
     }
 }
 
@@ -1527,17 +1497,19 @@ pub(super) fn admission_owner_for_test(
             role: wyrd_spec::vala::api::ClusterRole::Oracle,
         },
         fencing_token: 1,
-        capabilities: ClusterCapabilities::OracleV1(wyrd_spec::vala::api::OracleCapabilitiesV1 {
-            storage_protocol_version: 1,
-            cpu_cores: 1.0,
-            memory_budget_bytes: 1024,
-            cpu_cores_per_slot: 1.0,
-            memory_bytes_per_slot: 1024,
-            raw_slots: 1,
-            usable_slots: 1,
-            supported_classes: vec![QueryClass::Interactive, QueryClass::Analytical],
-            max_workers_per_query: 1,
-        }),
+        capabilities: wyrd_spec::vala::api::ClusterCapabilities::OracleV1(
+            wyrd_spec::vala::api::OracleCapabilitiesV1 {
+                storage_protocol_version: 1,
+                cpu_cores: 1.0,
+                memory_budget_bytes: 1024,
+                cpu_cores_per_slot: 1.0,
+                memory_bytes_per_slot: 1024,
+                raw_slots: 1,
+                usable_slots: 1,
+                supported_classes: vec![QueryClass::Interactive, QueryClass::Analytical],
+                max_workers_per_query: 1,
+            },
+        ),
     };
     Arc::new(OracleAdmission::with_config(
         Arc::new(OracleSlotManager::new(1, 1)),
@@ -1562,6 +1534,7 @@ pub(in crate::oracle) mod tests {
     use super::*;
     use crate::cluster::ClusterSnapshot;
     use chrono::Utc;
+    use wyrd_spec::vala::api::ClusterCapabilities;
     use wyrd_spec::vala::api::{
         ClusterNodeKey, ClusterRole, ClusterRoleLease, OracleCapabilitiesV1,
     };

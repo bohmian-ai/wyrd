@@ -6,15 +6,13 @@ use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use rand::RngCore as _;
-use vala_bifrost_redux::catalog::BifrostCatalog;
 use vala_bifrost_redux::cluster::{ClusterRegistry, ClusterSnapshot};
 use vala_bifrost_redux::oracle::dispatcher::{BifrostPeerTls, OraclePeerCredentials};
 use vala_bifrost_redux::oracle::{
-    AuthorizedQueryContext, Oracle, OracleConfig, OraclePlanner, OracleQueryAttemptCut,
-    OracleQueryStream, QueryIpcDecoder,
+    AuthorizedQueryContext, Oracle, OracleConfig, OraclePlanner, OracleQueryStream, QueryIpcDecoder,
 };
 use wyrd_runtime::Permission;
-use wyrd_spec::vala::api::{BifrostQueryRequest, NodeId, QueryClass, QueryId, SignedPeerTicket};
+use wyrd_spec::vala::api::{BifrostQueryRequest, NodeId, QueryClass, SignedPeerTicket};
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_tonic::query_conversion::QueryStreamConverter;
 use wyrd_tonic::tonic::Request;
@@ -40,8 +38,6 @@ struct ConnectedOracle {
 pub struct ReadyOracleForwarder {
     /// Current-ready membership authority captured once per query.
     cluster: Arc<ClusterRegistry>,
-    /// Shared tenant-qualified catalog used for pre-attempt classification.
-    catalog: Arc<BifrostCatalog>,
     /// Local Oracle leader operation, when this replica owns Oracle.
     local_oracle: Option<Arc<Oracle>>,
     /// Stable physical node identity.
@@ -84,8 +80,6 @@ impl vala_bifrost_redux::contracts::OracleQueryDispatch for ReadyOracleForwarder
 pub struct ReadyOracleForwarderInputs {
     /// Current-ready membership authority.
     pub cluster: Arc<ClusterRegistry>,
-    /// Shared tenant-qualified catalog.
-    pub catalog: Arc<BifrostCatalog>,
     /// Local Oracle leader operation, when selected on this replica.
     pub local_oracle: Option<Arc<Oracle>>,
     /// Stable physical node identity.
@@ -108,7 +102,6 @@ impl ReadyOracleForwarder {
     pub fn new(inputs: ReadyOracleForwarderInputs) -> Self {
         let ReadyOracleForwarderInputs {
             cluster,
-            catalog,
             local_oracle,
             local_node_id,
             local_fence,
@@ -119,7 +112,6 @@ impl ReadyOracleForwarder {
         } = inputs;
         Self {
             cluster,
-            catalog,
             local_oracle,
             local_node_id,
             local_fence,
@@ -156,18 +148,7 @@ impl ReadyOracleForwarder {
         let wall_deadline =
             now + chrono::Duration::from_std(duration).map_err(|_| BifrostError::QueryTimeout)?;
         let snapshot = self.cluster.snapshot();
-        let planned = self
-            .planner
-            .classify_for_forwarding(
-                &context,
-                &request,
-                monotonic_deadline,
-                &self.catalog,
-                &snapshot,
-            )
-            .await?;
-        let query_class = planned.query_class();
-        let mut candidates = eligible_oracle_candidates(&snapshot, query_class);
+        let mut candidates = eligible_oracle_candidates(&snapshot);
         if let Some(local) = candidates.iter().find(|lease| {
             lease.key.node_id == self.local_node_id
                 && self
@@ -179,19 +160,15 @@ impl ReadyOracleForwarder {
             let claims = ForwardingAttempt {
                 context,
                 request,
-                query_class,
                 now,
                 wall_deadline,
             }
-            .into_claims(&snapshot, (local.key.node_id, local.fencing_token))?;
+            .into_claims((local.key.node_id, local.fencing_token))?;
             let ticket = self
                 .authority
                 .mint_forward_query(&claims)
                 .map_err(|_| BifrostError::QueryPeerSecurity)?;
-            // The plan travels beside the ticket, never inside it: the ticket
-            // still carries every authorization claim, and the pinned snapshot
-            // never leaves this process.
-            return self.accept(ticket, Some(planned)).await;
+            return self.accept(ticket).await;
         }
         let remote_candidates = candidates
             .drain(..)
@@ -204,13 +181,11 @@ impl ReadyOracleForwarder {
                 )
             });
         route_remote_once(
-            &snapshot,
             remote_candidates,
             monotonic_deadline,
             ForwardingAttempt {
                 context,
                 request,
-                query_class,
                 now,
                 wall_deadline,
             },
@@ -229,18 +204,14 @@ impl ReadyOracleForwarder {
 
     /// Verifies and executes one signed envelope on this replica's local Oracle.
     ///
-    /// `prepared` carries a catalog snapshot this process already pinned while
-    /// classifying the same request, letting a local leader skip a redundant
-    /// second pin. It is an in-process optimization only: the ticket remains the
-    /// sole source of authorization, and a ticket arriving from a peer always
-    /// passes `None` because the pinned file list never crosses the wire.
+    /// The ticket is the sole source of authorization. The elected leader pins
+    /// and plans the query itself, so no catalog snapshot travels beside it.
     ///
     /// # Errors
-    /// Returns a closed authentication, policy, cut, role-fence, deadline, or query failure.
+    /// Returns a closed authentication, policy, role-fence, deadline, or query failure.
     pub async fn accept(
         &self,
         ticket: SignedPeerTicket,
-        prepared: Option<vala_bifrost_redux::oracle::PlannedSqlCut>,
     ) -> Result<OracleQueryStream, BifrostError> {
         let fence = self
             .local_fence
@@ -254,13 +225,7 @@ impl ReadyOracleForwarder {
         self.local_oracle
             .as_ref()
             .ok_or(BifrostError::OracleRoleUnavailable)?
-            .query_sql_with_participant_cut(
-                claims.context,
-                claims.request,
-                claims.participant_cut,
-                claims.query_class,
-                prepared,
-            )
+            .query_sql(claims.context, claims.request)
             .await
     }
 
@@ -403,13 +368,8 @@ impl ReadyOracleForwarder {
             .map_err(|_| BifrostError::QueryPeerSecurity)?;
         if claims.audience != local_node_id
             || claims.worker_fence != local_fence
-            || claims.participant_cut.leader().node_id != local_node_id
-            || claims.participant_cut.leader().fencing_token != local_fence
-            || claims.participant_cut.fingerprint() != claims.participant_cut_fingerprint
-            || claims.participant_cut.deadline().timestamp_millis() != claims.absolute_deadline_ms
-            || claims.participant_cut.deadline() <= chrono::Utc::now()
-            || claims.participant_cut.attempt_id().as_uuid().to_string()
-                != claims.context.request_id.as_str()
+            || claims.absolute_deadline_ms <= chrono::Utc::now().timestamp_millis()
+            || uuid::Uuid::parse_str(claims.context.request_id.as_str()).is_err()
         {
             return Err(BifrostError::QueryPeerSecurity);
         }
@@ -417,10 +377,12 @@ impl ReadyOracleForwarder {
     }
 }
 
-/// Returns ready Oracle leases for one class in stable snapshot order.
+/// Returns ready Oracle leases in stable snapshot order.
+///
+/// The class is derived from the physical root the elected leader builds, which
+/// is after selection, so a candidate must advertise both classes to be routable.
 fn eligible_oracle_candidates(
     snapshot: &ClusterSnapshot,
-    class: QueryClass,
 ) -> Vec<wyrd_spec::vala::api::ClusterRoleLease> {
     let mut candidates = snapshot
         .live_oracles()
@@ -429,7 +391,12 @@ fn eligible_oracle_candidates(
             lease.ready
                 && match &lease.capabilities {
                     wyrd_spec::vala::api::ClusterCapabilities::OracleV1(capabilities) => {
-                        capabilities.supported_classes.contains(&class)
+                        capabilities
+                            .supported_classes
+                            .contains(&QueryClass::Interactive)
+                            && capabilities
+                                .supported_classes
+                                .contains(&QueryClass::Analytical)
                     }
                     wyrd_spec::vala::api::ClusterCapabilities::ScribeV1(_) => false,
                 }
@@ -466,7 +433,6 @@ where
 
 /// Owns remote selection, same-snapshot envelope construction, and one terminal delivery.
 async fn route_remote_once<C, E, O, I, CF, CFut, EF, DF, DFut>(
-    snapshot: &ClusterSnapshot,
     candidates: I,
     connect_deadline: Instant,
     attempt: ForwardingAttempt,
@@ -484,7 +450,7 @@ where
 {
     let (leader, connected) =
         connect_before_delivery(candidates, connect_deadline, connect).await?;
-    let claims = attempt.into_claims(snapshot, leader)?;
+    let claims = attempt.into_claims(leader)?;
     let visibility = claims.request.visibility;
     let envelope = make_envelope(&claims)?;
     deliver(leader, connected, envelope, visibility).await
@@ -501,8 +467,6 @@ pub(crate) struct ForwardingAttempt {
     pub context: AuthorizedQueryContext,
     /// The query being forwarded, unchanged from ingress.
     pub request: BifrostQueryRequest,
-    /// Admission class governing the participant cut.
-    pub query_class: QueryClass,
     /// Ingress wall clock, used for envelope TTL and snapshot-age accounting.
     pub now: chrono::DateTime<chrono::Utc>,
     /// One absolute deadline captured at ingress and propagated unchanged.
@@ -510,47 +474,25 @@ pub(crate) struct ForwardingAttempt {
 }
 
 impl ForwardingAttempt {
-    /// Builds the one signed-envelope payload from the captured membership
-    /// snapshot and the elected leader.
+    /// Builds the one signed-envelope payload for the elected leader.
     ///
-    /// Derives the participant cut from `snapshot` rather than re-reading
-    /// membership, so the fingerprint the follower verifies describes exactly
-    /// the cut the leader routed against.
+    /// The envelope binds authorization only: audience, leader fence, replay
+    /// identity, expiry, the authenticated context, the unchanged request body,
+    /// and the absolute deadline. The leader pins its own participant cut.
     ///
     /// # Errors
     /// Returns [`BifrostError::QueryPeerSecurity`] when the request id is not a
-    /// UUID, and [`BifrostError::OracleRoleUnavailable`] when the snapshot
-    /// cannot yield a valid participant cut.
-    fn into_claims(
-        self,
-        snapshot: &ClusterSnapshot,
-        leader: (NodeId, u64),
-    ) -> Result<ForwardQueryClaims, BifrostError> {
+    /// UUID.
+    fn into_claims(self, leader: (NodeId, u64)) -> Result<ForwardQueryClaims, BifrostError> {
         let Self {
             context,
             request,
-            query_class,
             now,
             wall_deadline,
         } = self;
-        let observed_age = now
-            .signed_duration_since(snapshot.observed_at())
-            .to_std()
-            .unwrap_or_default();
-        let attempt_id = QueryId::new(
-            uuid::Uuid::parse_str(context.request_id.as_str())
-                .map_err(|_| BifrostError::QueryPeerSecurity)?,
-        );
-        let participant_cut = OracleQueryAttemptCut::try_from_snapshot(
-            snapshot,
-            attempt_id,
-            leader.0,
-            query_class,
-            wall_deadline,
-            now,
-            observed_age.saturating_add(Duration::from_secs(1)),
-        )
-        .map_err(|_| BifrostError::OracleRoleUnavailable)?;
+        if uuid::Uuid::parse_str(context.request_id.as_str()).is_err() {
+            return Err(BifrostError::QueryPeerSecurity);
+        }
         let mut nonce = vec![0_u8; 16];
         rand::rng().fill_bytes(&mut nonce);
         Ok(ForwardQueryClaims {
@@ -563,10 +505,7 @@ impl ForwardingAttempt {
                 .timestamp_millis(),
             context,
             request,
-            query_class,
-            participant_cut_fingerprint: participant_cut.fingerprint(),
-            absolute_deadline_ms: participant_cut.deadline().timestamp_millis(),
-            participant_cut,
+            absolute_deadline_ms: wall_deadline.timestamp_millis(),
         })
     }
 }
@@ -765,7 +704,7 @@ mod tests {
                 memory_bytes_per_slot: 512,
                 raw_slots: 2,
                 usable_slots: 2,
-                supported_classes: vec![QueryClass::Interactive],
+                supported_classes: vec![QueryClass::Interactive, QueryClass::Analytical],
                 max_workers_per_query: 2,
             }),
             ready: true,
@@ -814,28 +753,22 @@ mod tests {
         ];
         let snapshot = ClusterSnapshot::observed(leases.clone(), observed_at);
         let candidates = || {
-            eligible_oracle_candidates(&snapshot, QueryClass::Interactive)
+            eligible_oracle_candidates(&snapshot)
                 .into_iter()
                 .map(|lease| (lease.key.node_id, lease.fencing_token, lease.address))
         };
         let first = leases[0].key.node_id;
         let second = leases[1].key.node_id;
-        let expected_participants = leases
-            .iter()
-            .map(|lease| (lease.key.node_id, lease.fencing_token))
-            .collect::<Vec<_>>();
         let wall_deadline = observed_at + chrono::Duration::seconds(5);
         let connect_order = Arc::new(Mutex::new(Vec::new()));
         let delivered = Arc::new(Mutex::new(Vec::new()));
         let (context, request) = query_input();
         route_remote_once(
-            &snapshot,
             candidates(),
             Instant::now() + Duration::from_secs(1),
             ForwardingAttempt {
                 context,
                 request,
-                query_class: QueryClass::Interactive,
                 now: observed_at,
                 wall_deadline,
             },
@@ -861,15 +794,8 @@ mod tests {
                 move |leader, (), envelope: ForwardQueryClaims, _visibility| {
                     delivered.lock().expect("delivery lock").push((
                         leader,
-                        envelope.participant_cut.leader().node_id,
-                        envelope.participant_cut.leader().fencing_token,
-                        envelope.participant_cut_fingerprint.clone(),
-                        envelope
-                            .participant_cut
-                            .oracles()
-                            .iter()
-                            .map(|participant| (participant.node_id, participant.fencing_token))
-                            .collect::<Vec<_>>(),
+                        envelope.audience,
+                        envelope.worker_fence,
                     ));
                     async { Ok(()) }
                 }
@@ -887,21 +813,17 @@ mod tests {
             assert_eq!(delivered.len(), 1);
             assert_eq!(delivered[0].0, (second, 22));
             assert_eq!((delivered[0].1, delivered[0].2), (second, 22));
-            assert!(!delivered[0].3.is_empty());
-            assert_eq!(delivered[0].4, expected_participants);
         }
 
         let ambiguous_connect_order = Arc::new(Mutex::new(Vec::new()));
         let ambiguous_deliveries = Arc::new(Mutex::new(Vec::new()));
         let (context, request) = query_input();
         let error = route_remote_once(
-            &snapshot,
             candidates(),
             Instant::now() + Duration::from_secs(1),
             ForwardingAttempt {
                 context,
                 request,
-                query_class: QueryClass::Interactive,
                 now: observed_at,
                 wall_deadline,
             },
@@ -922,7 +844,7 @@ mod tests {
                     ambiguous_deliveries
                         .lock()
                         .expect("ambiguous delivery lock")
-                        .push((leader, envelope.participant_cut_fingerprint.clone()));
+                        .push((leader, envelope.audience));
                     async { Err::<(), _>(BifrostError::QueryExecutionFailed) }
                 }
             },

@@ -1062,7 +1062,6 @@ pub async fn compose_bifrost(
     let query_forwarder = Arc::new(crate::oracle::ReadyOracleForwarder::new(
         crate::oracle::ReadyOracleForwarderInputs {
             cluster: Arc::clone(&cluster_registry),
-            catalog: Arc::clone(&bifrost),
             local_oracle: oracle.as_ref().map(|runtime| Arc::clone(runtime.engine())),
             local_node_id: node_id,
             local_fence: oracle

@@ -16,7 +16,7 @@ use vala_bifrost_redux::oracle::telemetry::{
 };
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::{
-    BifrostQueryRequest, BifrostSecurityViolationKind, NodeId, QueryClass, SignedPeerTicket,
+    BifrostQueryRequest, BifrostSecurityViolationKind, NodeId, SignedPeerTicket,
 };
 use wyrd_tonic::prost::Message;
 
@@ -36,7 +36,7 @@ const MAX_RESERVATION_CLAIMS_BYTES: usize = 8 * 1024;
 /// than fragment claims because they bind two query identities, a stage, a
 /// task, an attempt, and a reservation on top of the peer fields.
 const MAX_STAGE_CLAIMS_BYTES: usize = 32 * 1024;
-/// Query envelopes include the bounded public SQL request and immutable participant cut.
+/// Query envelopes include the bounded public SQL request and its authenticated context.
 const MAX_FORWARD_QUERY_BYTES: usize = 128 * 1024;
 /// Default bound on unexpired single-use ticket identities.
 const DEFAULT_REPLAY_CAPACITY: usize = 1_024;
@@ -60,12 +60,6 @@ pub struct ForwardQueryClaims {
     pub context: vala_bifrost_redux::oracle::AuthorizedQueryContext,
     /// Original validated public query request.
     pub request: BifrostQueryRequest,
-    /// Server-derived class covered by the participant capability validation.
-    pub query_class: QueryClass,
-    /// Complete immutable participant cut used by every execution stage.
-    pub participant_cut: vala_bifrost_redux::oracle::OracleQueryAttemptCut,
-    /// Stable fingerprint redundantly bound for explicit receiver validation.
-    pub participant_cut_fingerprint: String,
     /// Exact absolute query deadline, repeated for fail-closed envelope validation.
     pub absolute_deadline_ms: i64,
 }

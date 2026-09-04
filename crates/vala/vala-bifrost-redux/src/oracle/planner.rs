@@ -1,28 +1,25 @@
 //! SQL planning owner for Oracle's immutable visibility cut.
 //!
 //! Planning validates read-only requests, pins tenant-qualified metadata under
-//! one deadline, classifies the cut, and builds session-local providers without
-//! performing admission, audit, or row execution side effects.
+//! one deadline, and builds session-local providers without performing
+//! admission, audit, or row execution side effects. The query class is derived
+//! later from the physical root alone, so nothing here classifies.
 
 use std::sync::Arc;
 use std::time::Instant;
 
-use arrow::datatypes::Schema;
-use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider};
 use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::datasource::TableProvider;
 use datafusion::datasource::default_table_source::DefaultTableSource;
-use datafusion::datasource::{MemTable, TableProvider};
 use datafusion::execution::context::SessionContext;
 use datafusion::physical_plan::ExecutionPlan;
 use num_traits::ToPrimitive;
-use wyrd_spec::vala::api::ClusterCapabilities;
 
 use super::*;
 use super::{
     AuthorizedQueryContext, BifrostCatalog, BifrostCatalogError, BifrostError, HotFileSource,
-    OracleAudit, OracleTableInputs, OracleTableProvider, OracleTelemetry, PinnedSealedTable,
-    PlannedSqlCut, QueryClass, TableRef, map_datafusion_error, optimized_plan_is_complex,
-    query_class_label,
+    OracleAudit, OracleTableInputs, OracleTableProvider, PinnedSealedTable, PlannedSqlCut,
+    TableRef, map_datafusion_error,
 };
 
 /// Query floor and logical-plan preparation owner.
@@ -32,17 +29,6 @@ pub struct OraclePlanner {
     pub(super) config: OracleConfig,
     /// Bounded permits covering sealed metadata planning.
     pub(super) planning: Arc<Semaphore>,
-}
-
-/// One closed classification result with its production accounting inputs.
-#[derive(Debug, Clone, Copy)]
-pub(super) struct OracleClassification {
-    /// Locked query class selected for admission.
-    pub(super) query_class: QueryClass,
-    /// Closed reason explaining the class selection.
-    pub(super) reason: &'static str,
-    /// Predicted sealed scan duration from the normative formula.
-    pub(super) predicted_scan_seconds: f64,
 }
 
 impl OraclePlanner {
@@ -83,84 +69,6 @@ impl OraclePlanner {
         Arc::clone(&self.planning)
             .try_acquire_owned()
             .map_err(|_| BifrostError::QueryAdmissionRejected)
-    }
-
-    /// Applies the normative estimated-byte classification formula.
-    #[must_use]
-    pub fn classify(estimated_bytes: u64, live_oracle_cpu: f64, complex: bool) -> QueryClass {
-        Self::classification(estimated_bytes, live_oracle_cpu, complex).query_class
-    }
-
-    /// Pins the authenticated request against one membership snapshot and returns its plan.
-    ///
-    /// This preparation has no admission, audit, registry, or execution side effects. It lets
-    /// an ingress owner choose and sign one compatible ready-Oracle participant cut before the
-    /// local or remote leader begins the shared execution operation.
-    ///
-    /// The pinned cut is returned rather than discarded so a local leader can execute the
-    /// snapshot it already paid for. A forwarded query cannot use it — the participant cut
-    /// carries cluster membership, not the file list — so a remote leader pins for itself.
-    ///
-    /// # Errors
-    /// Returns the same validation, catalog, timeout, and planning failures as Oracle planning.
-    pub async fn classify_for_forwarding(
-        &self,
-        context: &AuthorizedQueryContext,
-        request: &BifrostQueryRequest,
-        deadline: Instant,
-        catalog: &BifrostCatalog,
-        snapshot: &crate::cluster::ClusterSnapshot,
-    ) -> Result<PlannedSqlCut, BifrostError> {
-        self.validate_query(request)?;
-        let tables = parse_select_tables(&request.sql)?;
-        let live_oracle_cpu = snapshot
-            .live_oracles()
-            .into_iter()
-            .filter_map(|role| match &role.capabilities {
-                ClusterCapabilities::OracleV1(capabilities) => Some(capabilities.cpu_cores),
-                ClusterCapabilities::ScribeV1(_) => None,
-            })
-            .sum::<f64>();
-        self.pin_and_classify(
-            context,
-            &request.sql,
-            &tables,
-            deadline,
-            catalog,
-            live_oracle_cpu,
-        )
-        .await
-    }
-
-    /// Produces the class, closed reason, and predicted duration from one cut.
-    #[must_use]
-    pub(super) fn classification(
-        estimated_bytes: u64,
-        live_oracle_cpu: f64,
-        complex: bool,
-    ) -> OracleClassification {
-        let cpu = (live_oracle_cpu * 0.8).floor().max(1.0);
-        let seconds =
-            estimated_bytes.to_f64().unwrap_or(f64::MAX) / ESTIMATED_SCAN_BYTES_PER_SECOND / cpu;
-        if complex {
-            OracleClassification {
-                query_class: QueryClass::Analytical,
-                reason: "global_operator",
-                predicted_scan_seconds: seconds,
-            }
-        } else if seconds > INTERACTIVE_SCAN_LIMIT_SECONDS {
-            OracleClassification {
-                query_class: QueryClass::Analytical,
-                reason: "predicted_scan",
-                predicted_scan_seconds: seconds,
-            }
-        } else {
-            OracleClassification {
-                query_class: QueryClass::Interactive,
-                reason: "estimated_scan",
-                predicted_scan_seconds: seconds,
-            }
-        }
     }
 }
 
@@ -285,24 +193,23 @@ impl OraclePlanner {
         Ok((session, physical))
     }
 
-    /// Pins metadata and derives the immutable class for one SQL retry attempt.
+    /// Pins the immutable source cut for one SQL attempt.
     ///
     /// The planner owns parsing-adjacent metadata work and never executes rows;
     /// provider installation remains an Oracle composition concern after audit.
-    /// The planning permit spans all catalog pins, schema-only optimization, and
-    /// classification. Cancellation drops that permit and any local partial cuts;
-    /// no admission or audit side effect has occurred at this stage.
+    /// The planning permit spans every catalog pin. Cancellation drops that
+    /// permit and any local partial cuts; no admission or audit side effect has
+    /// occurred at this stage. Nothing here derives a class — the class comes
+    /// from the physical root built on top of this cut.
     ///
     /// # Errors
-    /// Returns timeout, catalog, planning, or byte-accounting failures.
-    pub(super) async fn pin_and_classify(
+    /// Returns timeout, catalog, or byte-accounting failures.
+    pub(super) async fn pin_cut(
         &self,
         context: &AuthorizedQueryContext,
-        sql: &str,
         tables: &[TableRef],
         deadline: Instant,
         catalog: &BifrostCatalog,
-        live_oracle_cpu: f64,
     ) -> Result<PlannedSqlCut, BifrostError> {
         let planning = self.try_planning()?;
         // DEBUG, not INFO: one event per catalog pin per query is per-request
@@ -311,7 +218,6 @@ impl OraclePlanner {
         // between admission and the first fragment dispatch.
         let pin_started = std::time::Instant::now();
         let mut cuts = Vec::with_capacity(tables.len());
-        let mut estimated_bytes = 0_u64;
         for table in tables {
             let remaining = deadline
                 .checked_duration_since(Instant::now())
@@ -323,33 +229,19 @@ impl OraclePlanner {
             .await
             .map_err(|_| BifrostError::QueryTimeout)?
             .map_err(BifrostCatalogError::into_public)?;
-            estimated_bytes = estimated_bytes
-                .checked_add(cut.estimated_bytes)
-                .ok_or(BifrostError::QueryAdmissionRejected)?;
             cuts.push(cut);
         }
-        let pinned_elapsed = pin_started.elapsed();
         let hot_files = cuts.iter().map(|cut| cut.hot_files.len()).sum::<usize>();
         let iceberg_files = cuts
             .iter()
             .map(|cut| cut.iceberg_files.len())
             .sum::<usize>();
-        let optimized_plan = self.prepare_optimized_sql_plan(sql, &cuts).await?;
         tracing::debug!(
             tables = tables.len(),
             hot_files,
             iceberg_files,
-            pin_ms = pinned_elapsed.as_millis(),
-            optimize_ms = pin_started
-                .elapsed()
-                .saturating_sub(pinned_elapsed)
-                .as_millis(),
+            pin_ms = pin_started.elapsed().as_millis(),
             "Oracle pinned one sealed cut"
-        );
-        let classification = Self::classification(
-            estimated_bytes,
-            live_oracle_cpu,
-            optimized_plan_is_complex(&optimized_plan),
         );
         let local_bytes = cuts.iter().try_fold(0_u64, |total, cut| {
             cut.hot_files.iter().try_fold(total, |total, file| {
@@ -379,58 +271,8 @@ impl OraclePlanner {
                 .map(|(local, total)| local / total)
                 .ok_or(BifrostError::QueryAdmissionRejected)?
         };
-        tracing::Span::current()
-            .record("query_class", query_class_label(classification.query_class));
-        OracleTelemetry::record_classification(classification);
         drop(planning);
-        Ok(PlannedSqlCut {
-            cuts,
-            query_class: classification.query_class,
-            local_ratio,
-        })
-    }
-
-    /// Lowers and optimizes SQL against schema-only providers from one cut.
-    ///
-    /// All registered providers are empty and session-local. Cancellation during
-    /// SQL lowering or optimization drops the session and exposes no partial plan.
-    ///
-    /// # Errors
-    /// Returns a stable planning failure when schema projection, registration,
-    /// SQL lowering, or logical optimization fails.
-    #[tracing::instrument(
-        name = "bifrost.oracle.plan",
-        skip_all,
-        fields(table_count = cuts.len())
-    )]
-    async fn prepare_optimized_sql_plan(
-        &self,
-        sql: &str,
-        cuts: &[PinnedSealedTable],
-    ) -> Result<datafusion::logical_expr::LogicalPlan, BifrostError> {
-        let session = SessionContext::new();
-        for cut in cuts {
-            let physical = iceberg::arrow::schema_to_arrow_schema(
-                cut.iceberg_table.metadata().current_schema(),
-            )
-            .map_err(|_| BifrostError::QueryExecutionFailed)?;
-            let fields = physical
-                .fields()
-                .iter()
-                .filter(|field| field.name() != "data_tenant_id")
-                .cloned()
-                .collect::<Vec<_>>();
-            let public = Arc::new(Schema::new(fields));
-            let provider = MemTable::try_new(public, vec![Vec::new()])
-                .map_err(|error| map_datafusion_error(&error))?;
-            register_session_table(&session, &cut.binding, Arc::new(provider))?;
-        }
-        session
-            .sql(sql)
-            .await
-            .map_err(|error| map_datafusion_error(&error))?
-            .into_optimized_plan()
-            .map_err(|error| map_datafusion_error(&error))
+        Ok(PlannedSqlCut { cuts, local_ratio })
     }
 }
 
@@ -523,55 +365,6 @@ fn local_hot_sources(
         .collect()
 }
 
-/// Registers one schema-only table beneath the Oracle catalog hierarchy.
-///
-/// The helper mirrors the logical namespace used by SQL lowering while keeping
-/// the registered provider empty; physical source access is installed only
-/// after the immutable cut and audit decision are complete.
-///
-/// # Errors
-/// Returns query execution failure when the binding namespace is invalid or
-/// `DataFusion` rejects catalog/schema/table registration.
-fn register_session_table(
-    session: &SessionContext,
-    binding: &crate::catalog::TenantTableBinding,
-    provider: Arc<dyn TableProvider>,
-) -> Result<(), BifrostError> {
-    let schema_name = binding
-        .logical_namespace
-        .strip_prefix("vala.")
-        .filter(|name| !name.is_empty())
-        .ok_or(BifrostError::QueryExecutionFailed)?;
-    let catalog = session.catalog("vala").unwrap_or_else(|| {
-        let catalog: Arc<dyn CatalogProvider> = Arc::new(MemoryCatalogProvider::new());
-        session.register_catalog("vala", Arc::clone(&catalog));
-        catalog
-    });
-    let schema = if let Some(schema) = catalog.schema(schema_name) {
-        schema
-    } else {
-        let schema: Arc<dyn datafusion::catalog::SchemaProvider> =
-            Arc::new(MemorySchemaProvider::new());
-        catalog
-            .register_schema(schema_name, Arc::clone(&schema))
-            .map_err(|error| map_datafusion_error(&error))?;
-        schema
-    };
-    let alias = Arc::clone(&provider);
-    schema
-        .register_table(binding.table_name.clone(), provider)
-        .map_err(|error| map_datafusion_error(&error))?;
-    // Keep the canonical three-part hierarchy while also accepting the
-    // public quoted-FQN form (`"vala.traces.spans"`). DataFusion resolves a
-    // quoted dotted identifier as one table under its default
-    // `datafusion.public` catalog; this alias preserves that SQL spelling
-    // without changing the canonical 1/2/3-part identifier resolution.
-    session
-        .register_table(TableReference::bare(binding.table_ref.fqn()), alias)
-        .map_err(|error| map_datafusion_error(&error))?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -637,23 +430,5 @@ mod tests {
             OraclePlanner::replace_typed_sources(plan, &HashMap::new()),
             Err(BifrostError::QueryExecutionFailed)
         ));
-    }
-
-    /// Physical source count does not force analytical scheduling for simple SQL.
-    #[test]
-    fn disjoint_multi_source_union_preserves_sql_classification() {
-        assert_eq!(
-            OraclePlanner::classify(0, 1.0, false),
-            crate::oracle::QueryClass::Interactive
-        );
-    }
-
-    /// One small sealed source remains eligible for interactive scheduling.
-    #[test]
-    fn simple_single_source_cut_classifies_interactive() {
-        assert_eq!(
-            OraclePlanner::classify(0, 1.0, false),
-            crate::oracle::QueryClass::Interactive
-        );
     }
 }

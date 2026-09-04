@@ -58,30 +58,27 @@ impl FilePruningDecision {
 
 /// Closed persisted-source label for one file-pruning decision.
 ///
-/// The two members are the only sources whose immutable statistics Oracle
-/// holds before opening an object: staged hot Parquet described by
-/// `vala.file_list`, and pinned Iceberg data files described by their manifest
-/// entry. Keeping the label an enum is what bounds the
+/// Staged hot Parquet described by `vala.file_list` is the only source Oracle
+/// prunes itself: a pinned Iceberg leaf hands its predicate to Iceberg's own
+/// manifest planning, which prunes without reporting through this counter.
+/// Keeping the label an enum is what bounds the
 /// `bifrost_oracle_file_pruning_total` series cardinality.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FilePruningSource {
     /// Staged hot Parquet not yet published into the pinned snapshot.
     Hot,
-    /// A data file reachable from the pinned Iceberg snapshot's manifests.
-    Iceberg,
 }
 
 impl FilePruningSource {
     /// Complete closed label domain, used by the emitted-inventory contract.
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 2] = [Self::Hot, Self::Iceberg];
+    pub(crate) const ALL: [Self; 1] = [Self::Hot];
 
     /// Returns the emitted `source` label for this persisted source.
     #[must_use]
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Hot => "hot",
-            Self::Iceberg => "iceberg",
         }
     }
 }
@@ -323,7 +320,7 @@ mod tests {
         assert_eq!(FilePruningDecision::Exclude.outcome_label(), "excluded");
         assert_eq!(
             FilePruningSource::ALL.map(FilePruningSource::as_str),
-            ["hot", "iceberg"]
+            ["hot"]
         );
     }
 }

@@ -187,6 +187,36 @@ impl OracleQueryAttemptRoster {
         })
     }
 
+    /// Returns the frozen ready Oracle participants, leader included.
+    #[must_use]
+    pub fn oracles(&self) -> &[OracleQueryParticipant] {
+        &self.oracles
+    }
+
+    /// Returns the frozen ready Scribe participants.
+    #[must_use]
+    pub fn scribes(&self) -> &[OracleQueryParticipant] {
+        &self.scribes
+    }
+
+    /// Returns the request-local leader frozen before any class existed.
+    #[must_use]
+    pub const fn leader(&self) -> &OracleQueryParticipant {
+        &self.leader
+    }
+
+    /// Returns the stable attempt identity this roster was frozen for.
+    #[must_use]
+    pub const fn attempt_id(&self) -> QueryId {
+        self.attempt_id
+    }
+
+    /// Returns the absolute wall-clock deadline frozen with this roster.
+    #[must_use]
+    pub const fn deadline(&self) -> DateTime<Utc> {
+        self.deadline
+    }
+
     /// Validates and projects one role-filtered participant slice.
     ///
     /// # Errors

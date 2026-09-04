@@ -486,7 +486,7 @@ impl OraclePeerService for OraclePeerGrpc {
             .query_forwarder()
             .ok_or(wyrd_spec::vala::error::BifrostError::OracleRoleUnavailable)
             .map_err(|error| crate::grpc::query::query_status(error.into()))?
-            .accept(ticket, None)
+            .accept(ticket)
             .await
             .map_err(|error| crate::grpc::query::query_status(error.into()))?;
         Ok(crate::grpc::query::query_stream_response(stream))

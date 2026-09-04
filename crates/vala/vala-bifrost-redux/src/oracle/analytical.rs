@@ -4597,6 +4597,12 @@ mod tests {
                 &context_for_leasing(),
                 &mut admitted,
                 4,
+                crate::resources::OracleSessionShape::for_grant(
+                    crate::resources::ORACLE_PARTITION_WORKING_MEMORY_BYTES,
+                    crate::resources::ORACLE_MIN_TARGET_PARTITIONS,
+                    4,
+                )
+                .session_config(),
                 deadline,
             )
             .expect("the leader leases one session from its admitted envelope");
@@ -5216,6 +5222,12 @@ mod tests {
                 &context,
                 &mut admitted,
                 4,
+                crate::resources::OracleSessionShape::for_grant(
+                    crate::resources::ORACLE_PARTITION_WORKING_MEMORY_BYTES,
+                    crate::resources::ORACLE_MIN_TARGET_PARTITIONS,
+                    4,
+                )
+                .session_config(),
                 tokio::time::Instant::now() + Duration::from_mins(1),
             )
             .expect("the leader leases one session from its admitted envelope");
@@ -6162,6 +6174,12 @@ mod tests {
                 &context_for_leasing(),
                 &mut admitted,
                 4,
+                crate::resources::OracleSessionShape::for_grant(
+                    crate::resources::ORACLE_PARTITION_WORKING_MEMORY_BYTES,
+                    crate::resources::ORACLE_MIN_TARGET_PARTITIONS,
+                    4,
+                )
+                .session_config(),
                 tokio::time::Instant::now() + Duration::from_mins(1),
             )
             .expect("the leader leases one session from its admitted envelope");
@@ -7622,6 +7640,7 @@ impl AnalyticalExecutionHandle {
         context: &AuthorizedQueryContext,
         admitted: &mut super::admission::AdmittedQueryGuard,
         work_units: usize,
+        config: datafusion::prelude::SessionConfig,
         deadline: tokio::time::Instant,
     ) -> Result<(SessionContext, AnalyticalAttemptOwnership), BifrostError> {
         let graph = AnalyticalGraphKey::new(attempt.public_query_id, attempt.datafusion_query_id);
@@ -7629,7 +7648,7 @@ impl AnalyticalExecutionHandle {
         // endpoint, and fence are all frozen before anything is reserved, so
         // planning has everything it needs while the followers are still
         // uncharged. Nothing here issues an RPC.
-        let remote = self.remote_participants(cut)?;
+        let remote = self.remote_participants(cut.oracles())?;
         // Transferred, never re-acquired: this query's envelope moves from the
         // admission guard into the graph, so nothing downstream can charge the
         // process governor a second time for the same query.
@@ -7708,8 +7727,7 @@ impl AnalyticalExecutionHandle {
                 urls: remote.into_iter().map(|(url, _)| url).collect(),
                 participants: signals.participants(),
                 permission_digest: &attempt.permission_digest,
-                granted_memory_bytes,
-                target_partitions,
+                config,
                 work_units,
             },
             graph,
@@ -7748,11 +7766,11 @@ impl AnalyticalExecutionHandle {
     pub(super) fn planning_session(
         &self,
         local: &SessionContext,
-        cut: &OracleQueryAttemptCut,
+        oracles: &[super::participant_cut::OracleQueryParticipant],
         work_units: usize,
     ) -> Result<SessionContext, BifrostError> {
         let urls = self
-            .remote_participants(cut)?
+            .remote_participants(oracles)?
             .into_iter()
             .map(|(url, _)| url)
             .collect::<Vec<_>>();
@@ -7823,8 +7841,7 @@ impl AnalyticalExecutionHandle {
             urls,
             participants,
             permission_digest,
-            granted_memory_bytes,
-            target_partitions,
+            mut config,
             work_units,
         } = inputs;
         let runtime = self.supervisor.graph_runtime(graph)?;
@@ -7859,12 +7876,6 @@ impl AnalyticalExecutionHandle {
                 ticket_ttl: self.config.ticket_ttl,
             },
         );
-        let shape = crate::resources::OracleSessionShape::for_grant(
-            granted_memory_bytes,
-            target_partitions,
-            work_units,
-        );
-        let mut config = shape.session_config();
         config.set_distributed_desired_task_count_handler(AnalyticalCutTaskCount::new(
             urls.len(),
             work_units,
@@ -7905,9 +7916,9 @@ impl AnalyticalExecutionHandle {
     /// valid URL, which would otherwise leave a worker unreachable and unsigned.
     fn remote_participants(
         &self,
-        cut: &OracleQueryAttemptCut,
+        oracles: &[super::participant_cut::OracleQueryParticipant],
     ) -> Result<Vec<(Url, super::dispatcher::DispatchCandidate)>, BifrostError> {
-        cut.oracles()
+        oracles
             .iter()
             .filter(|participant| participant.node_id != self.config.node_id)
             .map(|participant| {
@@ -7950,10 +7961,11 @@ struct AnalyticalSessionInputs<'a> {
     participants: Arc<std::sync::OnceLock<Arc<AnalyticalParticipantCut>>>,
     /// Digest of the leader-authorized permissions for this query.
     permission_digest: &'a str,
-    /// Ceiling this query's pool may grow to.
-    granted_memory_bytes: usize,
-    /// Query-local target partition count.
-    target_partitions: usize,
+    /// The exact `SessionConfig` the retained root was planned with.
+    ///
+    /// Reused verbatim so admission supplies the runtime and pool only; the
+    /// channel resolver is the one thing this session adds to it.
+    config: datafusion::prelude::SessionConfig,
     /// Scannable work the pinned cut offers, used to shape parallelism.
     work_units: usize,
 }

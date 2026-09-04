@@ -102,29 +102,6 @@ async fn run(
     drain(engine.query_sql(context, request(sql)).await?).await
 }
 
-/// Runs one statement through the forwarded leader entry with a production cut.
-///
-/// # Errors
-///
-/// Returns any stable query error, or a drain failure.
-async fn run_forwarded(
-    engine: &Oracle,
-    context: AuthorizedQueryContext,
-    sql: &str,
-) -> Result<Settled, JourneyError> {
-    let request = request(sql);
-    let (cut, planned) = engine
-        .prepare_query_attempt_for_test(&context, &request)
-        .await?;
-    let query_class = planned.query_class();
-    drain(
-        engine
-            .query_sql_with_participant_cut(context, request, cut, query_class, Some(planned))
-            .await?,
-    )
-    .await
-}
-
 /// Sends one Arrow IPC batch carrying a single fixture row.
 async fn ingest_row(
     client: &WyrdClient,
@@ -276,23 +253,13 @@ async fn prove_selection() -> Result<(), JourneyError> {
     )?;
     await_clean_nodes(&cluster).await?;
 
-    // A surviving real exchange is the only thing that selects Analytical, on
-    // both the public leader entry and the forwarded leader entry.
+    // A surviving real exchange is the only thing that selects Analytical.
     let selected = run(&engine, query_context(tenant)?, &grouped).await?;
     expect(
         &selected,
         QueryExecutionPath::Analytical,
         usize::try_from(FIXTURE_GROUPS)?,
         "supported exchange",
-    )?;
-    await_clean_nodes(&cluster).await?;
-
-    let forwarded = run_forwarded(&engine, query_context(tenant)?, &grouped).await?;
-    expect(
-        &forwarded,
-        QueryExecutionPath::Analytical,
-        usize::try_from(FIXTURE_GROUPS)?,
-        "forwarded supported exchange",
     )?;
     await_clean_nodes(&cluster).await?;
 

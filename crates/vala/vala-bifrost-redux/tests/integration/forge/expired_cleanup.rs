@@ -214,7 +214,8 @@ async fn drained_expiration(name: &str) -> DrainedExpiration {
                 |id| task_event("forge.task.unschedulable", id),
             )
             .await
-            .expect("cleanup enqueue"),
+            .expect("cleanup enqueue")
+            .len(),
         1
     );
     let cleanup_id: Uuid =

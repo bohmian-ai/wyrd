@@ -649,7 +649,12 @@ pub(super) async fn seed_ready_expiry_task(
     let plan = serde_json::json!({
         "version": 1,
         "inputs": [head_manifest_path(fixture).await],
-        "parameters": {"kind": "maintenance", "trigger_commit_count": 1},
+        "parameters": {
+            "kind": "maintenance",
+            "trigger_commit_count": 1,
+            "snapshot_expiry_due": true,
+            "reconciliation_due": false,
+        },
     });
     sqlx::query(
         "INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,namespace_name,table_name,strategy,lane,base_snapshot_id,plan,plan_hash,estimated_files,estimated_bytes,estimated_parallelism,estimated_memory_bytes,estimated_spill_bytes,large_task_ceiling_bytes,state,ready_at,envelope_version,decoded_batch_bytes,decoded_input_bytes,sort_working_bytes,sort_merge_reservation_bytes,encoder_buffer_bytes,upload_chunk_bytes,footer_encoded_bytes,footer_decode_workspace_bytes,sort_spill_bytes) \

@@ -29,6 +29,7 @@ pub(super) const TASK_TYPES: [ForgeTaskStrategy; 5] = [
 ];
 
 /// The exact public Forge family inventory, used by documentation coverage.
+#[cfg(test)]
 pub(super) const FORGE_METRIC_FAMILIES: [&str; 17] = [
     "bifrost_forge_planning_demands",
     "bifrost_forge_oldest_planning_demand_timestamp_seconds",

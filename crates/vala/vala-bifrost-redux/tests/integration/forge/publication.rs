@@ -687,7 +687,6 @@ async fn assert_drained_attempt_is_unsettled(
 /// transition and no second replacement of the same inputs.
 #[tokio::test]
 async fn rewrite_publication_ambiguity_restart_settles_once() {
-    let telemetry = ForgeTelemetryCheckpoint::install();
     let promoted = PromotedRewriteFixture::start_unpromoted("rewrite_ambiguity").await;
     let object_store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
     let catalog = PromotionCatalogSeam::new(

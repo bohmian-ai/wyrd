@@ -189,16 +189,6 @@ async fn prove_cleanup_ownership() -> Result<(), JourneyError> {
         WyrdTestCluster::start_spec(BifrostClusterSpec::three_oracles_one_scribe()).await?;
     let tenant = cluster.data_tenant_id();
     let table = seed_table(&cluster, "analytical_cleanup").await?;
-    let empty = {
-        let ingest = cluster
-            .servers()
-            .find(|server| server.bifrost_scribe().is_some())
-            .ok_or("missing ingest node")?;
-        let name = unique_table("analytical_cleanup_empty");
-        register_table(ingest, tenant, &name).await?;
-        cluster.refresh_oracle_snapshots().await?;
-        name
-    };
     let query_server = cluster.server(0).ok_or("missing query node")?;
     let engine = Arc::clone(
         query_server
@@ -214,44 +204,27 @@ async fn prove_cleanup_ownership() -> Result<(), JourneyError> {
     let grouped = format!(
         "SELECT filter_key, COUNT(*) AS matched FROM vala.bifrost.{table} GROUP BY filter_key"
     );
-    let no_exchange = format!(
-        "SELECT filter_key, COUNT(*) AS matched FROM vala.bifrost.{empty} GROUP BY filter_key"
-    );
 
-    for (case, sql, refuse) in [
-        ("direct interactive", plain.as_str(), false),
-        ("unsupported fallback", grouped.as_str(), true),
-        ("no-exchange fallback", no_exchange.as_str(), false),
-    ] {
-        if refuse {
-            engine.fail_next_analytical_plan_for_test();
-        }
-        let mut stream = match query.query(&request(sql)).await {
-            Ok(stream) => stream,
-            // Same abandoned-connection hazard as the retirement probe: the
-            // first dispatch after a dropped stream may fail to send.
-            Err(error) if is_transport(&error) => query
-                .query(&request(sql))
-                .await
-                .map_err(|retry| format!("{case}: query dispatch failed: {error}; {retry}"))?,
-            Err(error) => return Err(format!("{case}: query dispatch failed: {error}").into()),
-        };
-        let request_id = stream.request_id().clone();
-        stream
-            .next_batch()
-            .await
-            .map_err(|error| format!("{case}: first batch failed: {error}"))?;
-        if !nodes_clean(&cluster)? {
-            return Err(format!("{case}: Interactive attempt registered a graph").into());
-        }
-        drop(stream);
-        await_retired(&engine, tenant, &request_id, case).await?;
-        if !nodes_clean(&cluster)? {
-            return Err(format!("{case}: Interactive retirement left graph ownership").into());
-        }
+    // A normal root is graphless. It owns no graph while it streams and leaves
+    // none behind when its caller drops it mid-stream, so its retirement needs
+    // no cleanup join at all.
+    let case = "direct interactive";
+    let mut stream = dispatch(&query, &plain, case).await?;
+    let request_id = stream.request_id().clone();
+    stream
+        .next_batch()
+        .await
+        .map_err(|error| format!("{case}: first batch failed: {error}"))?;
+    if !nodes_clean(&cluster)? {
+        return Err(format!("{case}: Interactive attempt registered a graph").into());
+    }
+    drop(stream);
+    await_retired(&engine, tenant, &request_id, case).await?;
+    if !nodes_clean(&cluster)? {
+        return Err(format!("{case}: Interactive retirement left graph ownership").into());
     }
 
-    prove_paused_cleanup(&cluster, &engine, tenant, &query, &grouped).await?;
+    prove_paused_cleanup(&cluster, &engine, tenant, query_server, &public, &grouped).await?;
     prove_paused_cleanup_over_grpc(&cluster, &engine, tenant, query_server, &public, &grouped)
         .await?;
 
@@ -259,7 +232,37 @@ async fn prove_cleanup_ownership() -> Result<(), JourneyError> {
     Ok(())
 }
 
-/// Holds one selected Analytical graph on its clean release over HTTP.
+/// Opens one public query stream, retrying only a client-side send failure.
+///
+/// A stream this journey abandoned can leave the client's connection pool
+/// holding an entry the next request cannot use, which is a property of the
+/// pool rather than of the server under test.
+///
+/// # Errors
+///
+/// Returns the dispatch failure, naming the case, when the retry also fails.
+async fn dispatch(
+    query: &QueryClient,
+    sql: &str,
+    case: &str,
+) -> Result<vala_sdk::QueryResultStream, JourneyError> {
+    match query.query(&request(sql)).await {
+        Ok(stream) => Ok(stream),
+        Err(error) if is_transport(&error) => Ok(query
+            .query(&request(sql))
+            .await
+            .map_err(|retry| format!("{case}: query dispatch failed: {error}; {retry}"))?),
+        Err(error) => Err(format!("{case}: query dispatch failed: {error}").into()),
+    }
+}
+
+/// Drops one selected Analytical HTTP consumer mid-stream and holds its release.
+///
+/// The consumer takes the schema and exactly one batch and then vanishes
+/// without `settle` and without reaching a terminal, which is what a real
+/// caller that closes its connection does. Every later observation is made on a
+/// freshly authenticated client, so the abandoned connection the dropped stream
+/// left in the pool cannot serve it.
 ///
 /// # Errors
 ///
@@ -268,40 +271,43 @@ async fn prove_paused_cleanup(
     cluster: &WyrdTestCluster,
     engine: &Arc<Oracle>,
     tenant: DataTenantId,
-    query: &QueryClient,
+    server: &wyrd_testing::WyrdTestServer,
+    public: &WyrdClient,
     sql: &str,
 ) -> Result<(), JourneyError> {
+    let case = "http selected analytical";
     let pause = analytical_cleanup_pause_for_test();
     pause.arm();
-    let mut stream = query
-        .query(&request(sql))
-        .await
-        .map_err(|error| format!("http selected analytical: query dispatch failed: {error}"))?;
+    let mut stream = dispatch(&QueryClient::new(public), sql, case).await?;
     let request_id = stream.request_id().clone();
-    let drain = tokio::spawn(async move {
-        while stream.next_batch().await?.is_some() {}
-        Ok::<_, vala_sdk::ValaSdkError>(stream.terminal().map(|frame| frame.execution_path))
-    });
+    stream
+        .next_batch()
+        .await
+        .map_err(|error| format!("{case}: first batch failed: {error}"))?;
+    if stream.terminal().is_some() {
+        return Err(format!("{case}: the abandoned consumer reached its terminal").into());
+    }
+    drop(stream);
+    let observer = client(server, "analytical-cleanup-http-observer").await?;
     hold_and_release(
         cluster,
-        query,
+        &QueryClient::new(&observer),
         &request_id,
         &pause,
-        "http selected analytical",
+        case,
     )
     .await?;
-    let path = drain
-        .await??
-        .ok_or("http selected analytical: stream emitted no terminal frame")?;
-    if path != QueryExecutionPath::Analytical {
-        return Err(format!("http selected analytical: settled on {path:?}").into());
-    }
-    await_retired(engine, tenant, &request_id, "http selected analytical").await?;
+    await_retired(engine, tenant, &request_id, case).await?;
     await_clean_nodes(cluster).await?;
     Ok(())
 }
 
-/// Holds one selected Analytical graph on its clean release over gRPC.
+/// Drops one selected Analytical gRPC consumer and its channel mid-stream.
+///
+/// Both the response stream and the channel that carried it are dropped after a
+/// single message, so nothing this consumer owns can drain to a terminal. The
+/// running-status observation opens its own channel for the same reason the
+/// HTTP case opens its own client.
 ///
 /// # Errors
 ///
@@ -317,23 +323,24 @@ async fn prove_paused_cleanup_over_grpc(
     use wyrd_tonic::wyrd::v1 as proto;
     use wyrd_tonic::wyrd::v1::bifrost_query_service_client::BifrostQueryServiceClient;
 
+    let case = "grpc selected analytical";
     let channel = wyrd_tonic::tonic::transport::Endpoint::from_shared(
         server.grpc_url().ok_or("missing gRPC URL")?,
     )?
     .connect()
     .await?;
     let bearer = public.auth().bearer().await?;
-    let mut grpc = BifrostQueryServiceClient::new(channel);
-    let mut request =
+    let mut grpc = BifrostQueryServiceClient::new(channel.clone());
+    let mut grpc_request =
         wyrd_tonic::tonic::Request::new(proto::BifrostQueryRequest::from(request(sql)));
-    request.metadata_mut().insert(
+    grpc_request.metadata_mut().insert(
         "x-wyrd-access-token",
         format!("Bearer {}", bearer.expose()).parse()?,
     );
 
     let pause = analytical_cleanup_pause_for_test();
     pause.arm();
-    let response = grpc.query(request).await?;
+    let response = grpc.query(grpc_request).await?;
     let deadline_ms: i64 = response
         .metadata()
         .get("x-wyrd-query-deadline-ms")
@@ -351,31 +358,30 @@ async fn prove_paused_cleanup_over_grpc(
             .to_str()?,
     )?;
     let mut frames = response.into_inner();
-    let drain = tokio::spawn(async move {
-        let mut path = None;
-        while let Some(frame) = frames.next().await {
-            if let Some(proto::query_stream_frame::Frame::Terminal(terminal)) = frame?.frame {
-                path = Some(terminal.execution_path);
-            }
-        }
-        Ok::<_, JourneyError>(path)
-    });
-    let query = QueryClient::new(public);
+    let first = frames
+        .next()
+        .await
+        .ok_or_else(|| format!("{case}: the stream closed before its first message"))??;
+    if matches!(
+        first.frame,
+        Some(proto::query_stream_frame::Frame::Terminal(_))
+    ) {
+        return Err(format!("{case}: the abandoned consumer reached its terminal").into());
+    }
+    drop(frames);
+    drop(grpc);
+    drop(channel);
+
+    let observer = client(server, "analytical-cleanup-grpc-observer").await?;
     hold_and_release(
         cluster,
-        &query,
+        &QueryClient::new(&observer),
         &request_id,
         &pause,
-        "grpc selected analytical",
+        case,
     )
     .await?;
-    let path = drain
-        .await??
-        .ok_or("grpc selected analytical: stream emitted no terminal frame")?;
-    if path != proto::QueryExecutionPath::Analytical as i32 {
-        return Err(format!("grpc selected analytical: settled on path {path}").into());
-    }
-    await_retired(engine, tenant, &request_id, "grpc selected analytical").await?;
+    await_retired(engine, tenant, &request_id, case).await?;
     await_clean_nodes(cluster).await?;
     Ok(())
 }

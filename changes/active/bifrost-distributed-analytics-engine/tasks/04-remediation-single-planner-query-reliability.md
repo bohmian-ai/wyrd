@@ -1492,3 +1492,89 @@ scenario in this task may be marked done, and this task may not go to
    passes, as Scenario 4 requires.
 4. Re-run the full Oracle journey lane and `mise run test:bifrost` and record
    both totals, with zero failures, before requesting review.
+
+---
+
+## Amendment 2 — status: scenarios landed, broader verification incomplete
+
+**Status.** Every requirement of Amendment 1 items 1–3 is met. Item 4 is
+partially met: `mise run test:bifrost` and the Oracle journey lane were both
+re-run green, but the task's broader-verification list was interrupted before
+completion. This task is **not yet ready for `$wyrd-task-review`**.
+
+**Amendment 1 items.**
+
+1. **Journey lanes green.** All six named lanes pass. The full Oracle journey
+   lane ran `21 tests run: 21 passed, 0 skipped`.
+2. **Scenarios 4–7 implemented.**
+   - Scenario 4 — `9088c42e0`, `9e44f5203`, `9d03bc886`. Adds
+     `peer_network::analytical::stage_graph_executes_representative_query_styles`
+     over four real query styles (filtered scan, grouped aggregation, wide-key
+     join grouped and ordered, the same expression under `LIMIT 5`) on a real
+     process cluster, plus the protected-Interactive-capacity proof and the
+     lost-peer terminal proof.
+   - Scenario 5 — `3cc79d366`. Extends, rather than duplicates,
+     `query::generated_grpc_and_scheduled_queries_share_audit_terminal_and_cleanup`.
+   - Scenario 6 — no change required. The clean-EOF settlement contract and
+     every RED bullet were already implemented and asserted by
+     `query::tests::query_result_stream_settles_every_incomplete_exit_once`
+     (landed in `37cf30c86`); the named command was re-run and passes. This is a
+     verified no-op, not an untested scenario.
+   - Scenario 7 — `57400d31b`. The final v1 forwarding proof existed but lived
+     in a sibling test the task's named command never selected, so it could
+     regress unobserved. It is now a phase of
+     `oracle::peer_authority::tests::oracle_peer_authority_rejects_tamper_replay_and_restart_fence`.
+     `git diff --check` against the named base is clean and
+     `tasks/04a-production-query-activation-successor.md` has no trailing blank
+     line.
+3. **`oracle/splitter.rs` deleted.** The file is absent from the tree; its
+   deletion gate (the representative-query-styles journey) passes.
+
+**Material findings recorded during implementation.**
+
+- Analytical admission capacity is charged at the **resource root**
+  (`root_query_slot_units` = 2 per Analytical query, 1 per Interactive), not by
+  `ClassState.used`, which counts queries. The protected-floor journey therefore
+  states a three-unit budget through the new
+  `with_oracle_query_slot_limit_for_test` / `WYRD_PEER_TEST_ORACLE_QUERY_SLOT_LIMIT`
+  seam: two units for the held Analytical graph and one for the Interactive
+  floor. Four units admit a second Analytical query; two starve the floor
+  (`reason="queue_deadline"`).
+- A lost peer settles its single attempt as
+  `bifrost_oracle_analytical_attempts_total{outcome="cancelled"}`, not
+  `failed` — the leader cancels the graph. The journey asserts one attempt
+  started and zero succeeded.
+- Admission refusals had no diagnostic surface. A permanent
+  `tracing::debug!(target: "wyrd::oracle::admission", class, reason)` now fires
+  at the single `OracleTelemetry::record_admission` convergence point.
+- Settled physical evidence was not per-statement observable, so a plan without
+  an output sort blocked its waiter for 30s and then reported the *previous*
+  statement's numbers. The supervisor now carries a `settled_graphs` counter and
+  `record_settlement`, which records unconditionally.
+- Scenario 4 item 4 asks to assert the original cut fingerprint. No control
+  protocol or metric surface exposes the participant-cut fingerprint, so the
+  journey asserts it indirectly (exactly one attempt, exactly one survivor
+  activation). Production checks it at
+  `crates/vala/vala-bifrost-redux/src/oracle/analytical.rs:944`.
+- Checked-row overflow in the scheduled helper is unreachable through the
+  production path on 64-bit targets; the `checked_add` change stands, but no
+  test can force it end to end.
+
+**Verification run so far.**
+
+- `mise run fmt` — clean.
+- `mise run lints` — clean (workspace, `--all-features`, `--all-targets`).
+- `mise run test:bifrost` — `960 tests run: 960 passed, 0 skipped`.
+- Full Oracle journey lane — `21 tests run: 21 passed, 0 skipped`.
+- Scenario 6 named command — 1 passed.
+- Scenario 7 named command — 1 passed.
+- `git diff --check` — clean.
+
+**Remaining to close this task.**
+
+Run and record: `mise run test:vala`, `mise run test:bifrost:journey:server`,
+`mise run test:bifrost:journey:sdk`, `mise run test:e2e`,
+`mise run codegen:check`, `mise run check:client-tier`,
+`mise run check:pyo3-scope`, `mise run check:bifrost-resource-governance`, and
+`mise run check:unwrap-audit` (result recorded, not widened). Any failure among
+these is this task's obligation on the same terms Amendment 1 set.

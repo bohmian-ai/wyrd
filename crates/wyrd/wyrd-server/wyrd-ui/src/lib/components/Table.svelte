@@ -54,8 +54,25 @@
     border-bottom: 2px solid var(--border);
     color: var(--text);
   }
+  /* a linked cell reads as the row's destination, not as decorated prose */
+  .wy-table :global(td a) {
+    color: var(--text);
+    text-decoration: none;
+  }
+  .wy-table :global(tbody tr:hover td a) {
+    text-decoration: underline;
+  }
   .wy-table :global(tbody tr:last-child td) {
     border-bottom: 0;
+  }
+  /* A row is only interactive when it actually carries a link — a version readout is a
+     static table, and a blanket row hover would promise a click that is not there. */
+  .wy-table :global(tbody tr:has(a):hover td) {
+    background: var(--surface-2);
+  }
+  .wy-table :global(tbody tr:has(a:focus-visible) td) {
+    background: var(--surface-2);
+    box-shadow: inset 4px 0 0 0 var(--brand-strong);
   }
   .wy-table :global(tr.sel td) {
     background: var(--brand-soft);

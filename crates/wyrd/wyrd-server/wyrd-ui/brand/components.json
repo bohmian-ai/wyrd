@@ -108,7 +108,8 @@
         "ghost = surface fill, no accent",
         "href renders an <a> with identical treatment, so a catalog-safe view offers navigation without a callback crossing the contract",
         "fill is --brand-btn, never --brand: --brand is a dim navy panel colour in dark and pairs with --brand-btn-ink at 1.23:1",
-        "press interaction: hover lifts to 5px, active sinks to 1px"
+        "press interaction: hover lifts to 5px, active sinks to 1px",
+        "focus-visible draws an explicit 2px --text outline: the browser default ring is low contrast on the brand and lime fills"
       ]
     },
     "Badge": {
@@ -224,7 +225,8 @@
         "a native <select>: keyboard operation, screen-reader labeling and the mobile picker come from the platform, not from local menu code",
         "the visible <label> is bound by id — a filter control is never labeled by placement alone",
         "auto submits the enclosing form on change; the component takes no callback, so the destination stays a server-owned action or GET route",
-        "time-range control is this component with range options, not a separate component"
+        "time-range control is this component with range options, not a separate component",
+        "appearance:none plus a wrapper caret gives the control the workbench geometry — 2px border, 5px radius, 3px hard shadow, the same hover lift and active sink as Button — while the element underneath stays a real <select>. The option list is still drawn by the OS; that is the trade for free keyboard operation, a real mobile picker and correct screen-reader semantics."
       ]
     },
     "Table": {
@@ -262,7 +264,8 @@
         "header is plain surface (not gray) relying on the 2px bottom border",
         "selection wash uses --brand-soft plus a 4px --brand-strong inset left marker, never lime — selection is positional as well as tinted",
         "2px row dividers, last row borderless",
-        "an irreducibly wide table scrolls rather than dropping columns; the scroller is role=region with an aria-label and tabindex=0 so a keyboard-only reader can focus and pan it"
+        "an irreducibly wide table scrolls rather than dropping columns; the scroller is role=region with an aria-label and tabindex=0 so a keyboard-only reader can focus and pan it",
+        "a row is interactive only when it carries a link: tbody tr:has(a) takes a surface-2 hover wash and an inset brand-strong marker on focus-visible, and the linked cell underlines. A static readout row gets no hover, so the treatment never promises a click that is not there."
       ]
     },
     "KpiTile": {

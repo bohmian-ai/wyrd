@@ -121,7 +121,7 @@
               {#each evidence as e, i (e.kind)}
                 <tr class={i === 0 ? 'sel' : ''}>
                   <td>{e.kind}</td>
-                  <td>{e.subject}</td>
+                  <td><a href="#chrome">{e.subject}</a></td>
                   <td><Badge tone={e.verdict}>{e.label}</Badge></td>
                 </tr>
               {/each}

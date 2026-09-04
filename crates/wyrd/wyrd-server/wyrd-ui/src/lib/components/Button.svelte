@@ -52,6 +52,11 @@
     transform: translate(2px, 2px);
     box-shadow: 1px 1px 0 0 var(--shadow);
   }
+  /* the default ring is low contrast on the brand and lime fills */
+  .wy-btn:focus-visible {
+    outline: 2px solid var(--text);
+    outline-offset: 2px;
+  }
   .wy-btn:disabled {
     cursor: not-allowed;
     opacity: 0.55;

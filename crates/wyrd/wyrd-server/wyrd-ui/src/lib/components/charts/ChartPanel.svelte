@@ -54,7 +54,7 @@
 
 <Panel {title} variant="quiet">
   {#snippet head()}
-    <span class="meas">{measure}{#if unit}<span class="unit"> · {unit}</span>{/if}</span>
+    <span class="meas">{measure}{#if unit}<span class="unit">&nbsp;· {unit}</span>{/if}</span>
     {#if link}<a class="lnk" href={link.href}>{link.label}</a>{/if}
   {/snippet}
 

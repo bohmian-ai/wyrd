@@ -55,7 +55,14 @@
   const xlabels = $derived.by(() => {
     const n = series[0]?.points.length ?? 0;
     const step = (x1 - x0) / (n - 1 || 1);
-    return labels.map((label, i) => ({ label, x: x0 + step * i })).filter((l) => l.label);
+    // The first and last labels anchor inward so an edge label is never clipped.
+    return labels
+      .map((label, i) => ({
+        label,
+        x: x0 + step * i,
+        anchor: i === 0 ? 'start' : i === labels.length - 1 ? 'end' : 'middle'
+      }))
+      .filter((l) => l.label);
   });
 
   /** Marker path for one plotted point, so shape reads where colour cannot. */
@@ -94,7 +101,7 @@
       {/each}
     {/each}
     {#each xlabels as l (l.label)}
-      <text class="xl" x={l.x.toFixed(1)} y={yBot + 13} text-anchor="middle">{l.label}</text>
+      <text class="xl" x={l.x.toFixed(1)} y={yBot + 13} text-anchor={l.anchor}>{l.label}</text>
     {/each}
   </svg>
   <ul class="legend">
@@ -111,7 +118,8 @@
 </div>
 
 <style>
-  .wy-line svg {
+  /* the plot only — the legend samples keep their own fixed 26x10 box */
+  .wy-line > svg {
     display: block;
     width: 100%;
     height: auto;

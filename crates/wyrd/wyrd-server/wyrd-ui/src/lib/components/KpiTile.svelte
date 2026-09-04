@@ -39,6 +39,8 @@
     color: var(--muted);
   }
   .n {
+    /* wrap rather than clip: a truncated metric silently misreports the value */
+    overflow-wrap: anywhere;
     font-family: var(--fm);
     font-size: 22px;
     font-weight: 700;

@@ -1,314 +1,218 @@
 <script lang="ts">
   import ModeProvider from '$lib/components/ModeProvider.svelte';
-  import Card from '$lib/components/Card.svelte';
-  import Button from '$lib/components/Button.svelte';
   import Badge from '$lib/components/Badge.svelte';
-  import Table from '$lib/components/Table.svelte';
-  import KpiTile from '$lib/components/KpiTile.svelte';
-  import Spark from '$lib/components/Spark.svelte';
-  import Bars from '$lib/components/Bars.svelte';
-  import Lines from '$lib/components/Lines.svelte';
-  import Histo from '$lib/components/Histo.svelte';
-  import Trend from '$lib/components/Trend.svelte';
-  import Heatmap from '$lib/components/Heatmap.svelte';
-  import Dist from '$lib/components/Dist.svelte';
-  import Tree from '$lib/components/Tree.svelte';
-  import Dropdown from '$lib/components/Dropdown.svelte';
+  import Button from '$lib/components/Button.svelte';
+  import Chip from '$lib/components/Chip.svelte';
   import CodeBlock from '$lib/components/CodeBlock.svelte';
-  import TraceTable from '$lib/components/TraceTable.svelte';
-  import Waterfall from '$lib/components/Waterfall.svelte';
-  import SpanPanel from '$lib/components/SpanPanel.svelte';
-  import EvalPanel from '$lib/components/EvalPanel.svelte';
-  import DriftPanel from '$lib/components/DriftPanel.svelte';
+  import Disclosure from '$lib/components/Disclosure.svelte';
+  import KpiTile from '$lib/components/KpiTile.svelte';
+  import Panel from '$lib/components/Panel.svelte';
+  import Select from '$lib/components/Select.svelte';
+  import StateBlock from '$lib/components/StateBlock.svelte';
+  import Table from '$lib/components/Table.svelte';
+  import Bars from '$lib/components/charts/Bars.svelte';
+  import ChartPanel from '$lib/components/charts/ChartPanel.svelte';
+  import Line from '$lib/components/charts/Line.svelte';
+  import Spark from '$lib/components/charts/Spark.svelte';
   import Shell from '$lib/components/Shell.svelte';
   import Sidebar from '$lib/components/Sidebar.svelte';
   import Topbar from '$lib/components/Topbar.svelte';
-  import Hero from '$lib/components/Hero.svelte';
   import { registry } from '$lib/registry';
 
+  // The style guide is the component foundation's rendered evidence: every catalog entry
+  // in both modes, side by side, with the states and the narrow container that the
+  // accepted mocks require. It is a harness, not a product route.
   const registered = Object.keys(registry);
 
-  const traceRows = [
-    { id: 'tr_9f21', op: 'agent.run', kind: 'agent' as const, spans: 14, durationMs: 4210, tokens: 12400, cost: 0.18, score: 0.92, scoreTone: 'hi' as const, status: 'ok' as const },
-    { id: 'tr_8c04', op: 'llm.synthesize', kind: 'llm' as const, spans: 6, durationMs: 1840, tokens: 4100, cost: 0.06, score: 0.71, scoreTone: 'mid' as const, status: 'warn' as const },
-    { id: 'tr_71be', op: 'tool.search', kind: 'tool' as const, spans: 3, durationMs: 320, status: 'err' as const }
+  const latency = [
+    { label: 'p50', points: [120, 118, 131, 126, 140, 133, 129] },
+    { label: 'p95', points: [310, 402, 388, 361, 470, 441, 402] },
+    { label: 'p99', points: [520, 610, 588, 640, 812, 733, 690] }
   ];
-
-  const spans = [
-    { depth: 0, name: 'agent.run', kind: 'agent' as const, start: 0, duration: 4210, status: 'ok' as const },
-    { depth: 1, name: 'retrieval.fetch', kind: 'retrieval' as const, start: 120, duration: 880, status: 'ok' as const },
-    { depth: 1, name: 'llm.synthesize', kind: 'llm' as const, start: 1080, duration: 1840, status: 'warn' as const },
-    { depth: 2, name: 'tool.search', kind: 'tool' as const, start: 1200, duration: 320, status: 'err' as const }
+  const rangeOptions = [
+    { value: '1h', label: 'Last 1 hour' },
+    { value: '24h', label: 'Last 24 hours' },
+    { value: '7d', label: 'Last 7 days' }
   ];
-
+  const kindOptions = [
+    { value: 'Service', label: 'Service' },
+    { value: 'Model', label: 'Model' },
+    { value: 'Prompt', label: 'Prompt' }
+  ];
+  const evidence = [
+    { kind: 'unit-tests', subject: 'acme/ranking', verdict: 'ok' as const, label: 'passed' },
+    { kind: 'pii-review', subject: 'acme/checkout', verdict: 'danger' as const, label: 'failed' },
+    { kind: 'load-test', subject: 'acme/ledger', verdict: 'running' as const, label: 'running' }
+  ];
   const navGroups = [
     {
-      label: 'registry',
+      label: 'workbench',
       items: [
-        { label: 'cards', href: '#', active: true, kind: 'client' as const },
-        { label: 'evals', href: '#', kind: 'server' as const },
-        { label: 'policies', href: '#', kind: 'control' as const }
+        { label: 'cards', href: '#', active: true },
+        { label: 'observe', href: '#' },
+        { label: 'changes', href: '#' }
       ]
-    },
-    { label: 'observe', items: [{ label: 'traces', href: '#' }, { label: 'drift', href: '#' }] }
+    }
   ];
 </script>
 
-{#snippet spark()}
-  <svg viewBox="0 0 90 24" width="90" height="24" fill="none">
-    <polyline
-      points="0,18 15,14 30,16 45,9 60,11 75,5 90,7"
-      stroke="var(--ok)"
-      stroke-width="2"
-      stroke-linejoin="round"
-      stroke-linecap="round"
-    />
-  </svg>
+{#snippet trend()}
+  <Spark points={[18, 14, 16, 9, 11, 5, 7]} sentiment="neutral" />
 {/snippet}
 
 {#snippet catalog()}
   <div class="pad">
     <div class="sgh">
-      <span class="wm">WYRD</span> design system · registered: {registered.join(', ')}
+      <span class="wm">WYRD</span> component foundation · catalog: {registered.join(', ')}
     </div>
 
     <div class="grid">
-      <Card>
-        {#snippet head()}<span>Buttons</span><span>quiet</span>{/snippet}
+      <Panel title="Badge" variant="quiet">
         <div class="row">
-          <Button variant="primary">Primary</Button>
-          <Button variant="rune">Rune</Button>
-          <Button variant="ghost">Ghost</Button>
-        </div>
-      </Card>
-
-      <Card>
-        {#snippet head()}<span>Badges</span><span>status</span>{/snippet}
-        <div class="row">
-          <Badge>neutral</Badge>
-          <Badge tone="ok">healthy</Badge>
-          <Badge tone="warn">drift</Badge>
+          <Badge>draft</Badge>
+          <Badge tone="ok">passed</Badge>
+          <Badge tone="warn">stale</Badge>
           <Badge tone="danger">failed</Badge>
+          <Badge tone="running">running</Badge>
+          <Badge tone="fathom">fathom</Badge>
         </div>
-      </Card>
+      </Panel>
 
-      <Card variant="raised">
-        {#snippet head()}<span>Card · raised</span><span>6px</span>{/snippet}
-        <p style="margin:0;font-size:13px;line-height:1.5">
-          Raised altitude — used for drilldown panels. Same geometry, deeper shadow.
-        </p>
-      </Card>
+      <Panel title="Button">
+        <div class="row">
+          <Button variant="primary">Run now</Button>
+          <Button variant="secondary">Open fix PR</Button>
+          <Button variant="ghost">Cancel</Button>
+          <Button href="#chrome">View Card →</Button>
+        </div>
+      </Panel>
 
-      <Card variant="wide">
-        {#snippet head()}<span>KPI tiles</span><span>analytics</span>{/snippet}
+      <Panel title="Chip · applied filters">
+        <div class="row">
+          <Chip label="kind" value="Service" removeHref="?space=prod" />
+          <Chip label="space" value="prod" removeHref="?kind=Service" />
+          <Chip label="owner" value="m.linden" />
+        </div>
+      </Panel>
+
+      <Panel title="Select · filter and time controls">
+        <form class="row" method="GET">
+          <Select label="Kind" name="kind" options={kindOptions} value="Service" />
+          <Select label="Range" name="range" options={rangeOptions} value="24h" />
+        </form>
+      </Panel>
+
+      <Panel title="Metric values" variant="quiet">
         <div class="kpis">
-          <KpiTile label="runs" value="1,284" delta="+8%" trend="up" {spark} />
-          <KpiTile label="p95 latency" value="842ms" delta="-3%" trend="down" {spark} />
-          <KpiTile label="error rate" value="1.2%" delta="+0.4%" trend="up" {spark} />
-          <KpiTile label="spend" value="$42.10" delta="+12%" trend="up" {spark} />
+          <KpiTile label="Cards" value="42" delta="+3 this week" trend="up" />
+          <KpiTile label="Open changes" value="7" delta="-2 vs last week" trend="down" />
+          <KpiTile label="p95 latency" value="402" delta="ms" trend="flat" spark={trend} />
+          <KpiTile label="Spend" value="$42.10" delta="+$4.02 vs last week" trend="up" />
         </div>
-      </Card>
+      </Panel>
 
-      <Card variant="wide">
-        {#snippet head()}<span>Table</span><span>quiet</span>{/snippet}
-        <Table>
+      <Panel title="Table · evidence">
+        <Table label="Evidence for change_01">
           <table>
             <thead>
-              <tr><th>trace</th><th>root op</th><th>spans</th><th>status</th></tr>
+              <tr><th>kind</th><th>subject</th><th>verdict</th></tr>
             </thead>
             <tbody>
-              <tr><td>tr_9f21</td><td>agent.run</td><td>14</td><td><Badge tone="ok">ok</Badge></td></tr>
-              <tr class="sel"><td>tr_8c04</td><td>llm.synthesize</td><td>6</td><td><Badge tone="warn">slow</Badge></td></tr>
-              <tr><td>tr_71be</td><td>tool.search</td><td>3</td><td><Badge tone="danger">err</Badge></td></tr>
+              {#each evidence as e, i (e.kind)}
+                <tr class={i === 0 ? 'sel' : ''}>
+                  <td>{e.kind}</td>
+                  <td>{e.subject}</td>
+                  <td><Badge tone={e.verdict}>{e.label}</Badge></td>
+                </tr>
+              {/each}
             </tbody>
           </table>
         </Table>
-      </Card>
+      </Panel>
 
-      <Card>
-        {#snippet head()}<span>Bars</span><span>analytics</span>{/snippet}
-        <Bars
-          data={[
-            { label: 'agent', value: 42 },
-            { label: 'llm', value: 31, color: 'var(--rune-strong)' },
-            { label: 'tool', value: 18, color: 'var(--server-bar)' },
-            { label: 'rag', value: 9, color: 'var(--control-bar)' }
-          ]}
-        />
-      </Card>
+      <Panel title="Disclosure">
+        <Disclosure summary="Raw definition" meta="wyrd/v1">
+          <CodeBlock code={'{\n  "apiVersion": "wyrd/v1",\n  "kind": "Prompt"\n}'} />
+        </Disclosure>
+      </Panel>
 
-      <Card>
-        {#snippet head()}<span>Lines</span><span>percentiles</span>{/snippet}
-        <Lines
-          labels={['00', '06', '12', '18', '24']}
-          series={[
-            { points: [12, 18, 14, 22, 19], color: 'var(--control-bar)' },
-            { points: [28, 33, 30, 41, 36], color: 'var(--rune-strong)' },
-            { points: [52, 60, 48, 71, 64], color: 'var(--danger)' }
-          ]}
-        />
-      </Card>
-
-      <Card>
-        {#snippet head()}<span>Spark · Heatmap</span><span>micro</span>{/snippet}
-        <div class="row">
-          <Spark points={[18, 14, 16, 9, 11, 5, 7]} sentiment="ok" />
-          <Spark points={[5, 8, 7, 12, 10, 16, 19]} sentiment="danger" />
+      <Panel title="Async and authorization states">
+        <div class="stack">
+          <StateBlock state="loading" title="Loading Cards" />
+          <StateBlock state="empty" title="No Cards match these filters" detail="Remove a filter to widen the search." actionLabel="Clear filters" actionHref="?" />
+          <StateBlock state="partial" title="Partial results" detail="200 of 412 records loaded." />
+          <StateBlock state="unauthorized" title="Not authorized to read this Card" detail="Ask an owner for the cards:read scope." code="WYRD-AUTHZ-FORBIDDEN" />
+          <StateBlock state="error" title="Cards could not be loaded" code="WYRD-CHANGE-502" />
+          <StateBlock state="absent" title="No figures attached" detail="This Data Card version declares no figures." />
         </div>
-        <div style="margin-top:12px">
-          <Heatmap values={[2, 5, 8, 3, 9, 12, 6, 14, 4, 10, 7, 13, 1, 8, 11, 5, 9, 3, 12, 6, 14, 2, 7, 10]} />
-        </div>
-      </Card>
+      </Panel>
 
-      <Card>
-        {#snippet head()}<span>Histo · Trend</span><span>drift</span>{/snippet}
-        <Histo reference={[4, 10, 22, 30, 20, 10, 4]} current={[2, 5, 12, 20, 28, 22, 12]} />
-        <div style="margin-top:12px">
-          <Trend points={[0.08, 0.1, 0.12, 0.15, 0.14, 0.19, 0.22, 0.24]} threshold={0.2} />
-        </div>
-      </Card>
+      <div class="wide">
+        <ChartPanel
+          title="Request latency"
+          measure="Latency percentiles"
+          unit="ms"
+          latestValue={402}
+          source="vala · checkout-api"
+          freshness={{ label: '2m ago', at: '2026-09-04T17:18:00Z' }}
+          from={{ label: 'Sep 3 17:20', at: '2026-09-03T17:20:00Z' }}
+          to={{ label: 'Sep 4 17:20', at: '2026-09-04T17:20:00Z' }}
+          link={{ label: 'Open in Observe', href: '#chrome' }}
+        >
+          <Line series={latency} labels={['-24h', '', '-12h', '', '-6h', '', 'now']} threshold={{ value: 750, label: 'SLO 750ms' }} />
+        </ChartPanel>
+      </div>
 
-      <Card>
-        {#snippet head()}<span>Dist</span><span>planes</span>{/snippet}
-        <Dist
-          segments={[
-            { label: 'client', value: 48, color: 'var(--client-bar)' },
-            { label: 'server', value: 34, color: 'var(--server-bar)' },
-            { label: 'control', value: 18, color: 'var(--control-bar)' }
-          ]}
-        />
-      </Card>
+      <ChartPanel
+        title="Evidence by kind"
+        measure="Evidence records"
+        unit="records"
+        latestValue={31}
+        source="wyrd · change_01"
+        from={{ label: 'Sep 3', at: '2026-09-03' }}
+        to={{ label: 'Sep 4', at: '2026-09-04' }}
+      >
+        <Bars data={[{ label: 'unit', value: 14 }, { label: 'pii', value: 6 }, { label: 'load', value: 11 }]} unit="records" />
+      </ChartPanel>
 
-      <Card>
-        {#snippet head()}<span>Tree</span><span>card hierarchy</span>{/snippet}
-        <Tree
-          nodes={[
-            {
-              label: 'payments-svc',
-              meta: 'service',
-              open: true,
-              children: [
-                { label: 'churn-v3', meta: 'model', kind: 'server' },
-                { label: 'fathom-wf', meta: 'agent', kind: 'client' },
-                { label: 'pii-gate', meta: 'policy', kind: 'control' }
-              ]
-            }
-          ]}
-        />
-      </Card>
-
-      <Card>
-        {#snippet head()}<span>Dropdown</span><span>control</span>{/snippet}
-        <Dropdown
-          label="tenant: acme"
-          value="acme"
-          options={[
-            { label: 'acme', kind: 'client' },
-            { label: 'globex', kind: 'server' },
-            { label: 'initech', kind: 'control' }
-          ]}
-        />
-      </Card>
-
-      <Card>
-        {#snippet head()}<span>CodeBlock</span><span>copy</span>{/snippet}
-        <CodeBlock code={'wyrd apply --card payments-svc \\\n  --scope bifrost_record:write'} />
-      </Card>
-
-      <Card variant="wide">
-        {#snippet head()}<span>TraceTable</span><span>observe</span>{/snippet}
-        <TraceTable rows={traceRows} selectedId="tr_8c04" />
-      </Card>
-
-      <Card variant="wide">
-        {#snippet head()}<span>Waterfall</span><span>spans</span>{/snippet}
-        <Waterfall {spans} />
-      </Card>
-
-      <Card variant="wide">
-        {#snippet head()}<span>Drilldown panels</span><span>raised</span>{/snippet}
-        <div class="panels">
-          <SpanPanel
-            name="llm.synthesize"
-            kind="llm"
-            summary="Synthesis over 4 retrieved policy docs."
-            attributes={[
-              { label: 'span_id', value: 'span_7c2a4f' },
-              { label: 'trace_id', value: 'tr_9f21', link: true }
-            ]}
-            tokens={{ input: 1400, output: 1000, cache: 200 }}
-            events={[
-              { label: 'first token', at: '+0.4s' },
-              { label: 'complete', at: '+1.8s' }
-            ]}
-            outputPreview="Based on the retrieved policy docs, the request is within limits…"
-          />
-          <EvalPanel
-            recordId="rec_4a91c7"
-            agent="fathom-wf"
-            score={0.92}
-            pass={true}
-            judge="llm-judge · gpt-class"
-            metrics={[
-              { label: 'relevance', value: 0.95 },
-              { label: 'groundedness', value: 0.79 }
-            ]}
-            threshold={0.8}
-            rationale="Answer is well grounded; minor unsupported claim on pricing."
-            linked={[{ label: 'trace', value: 'tr_9f21', link: true }]}
-          />
-          <DriftPanel
-            feature="request_amount"
-            dataType="NUMERIC"
-            drifted={true}
-            psi={0.27}
-            threshold={0.2}
-            reference={[4, 10, 22, 30, 20, 10, 4]}
-            current={[2, 5, 12, 20, 28, 22, 12]}
-            driftSeries={[0.08, 0.1, 0.12, 0.15, 0.14, 0.19, 0.22, 0.24]}
-            stats={[
-              { label: 'ref mean', value: '142.3' },
-              { label: 'cur mean', value: '188.7', alert: true }
-            ]}
-          />
-        </div>
-      </Card>
-
-      <Card variant="wide">
-        {#snippet head()}<span>Shell · Sidebar · Topbar</span><span>app frame</span>{/snippet}
-        <Shell>
-          {#snippet sidebar()}<Sidebar brand="wyrd" groups={navGroups} />{/snippet}
-          {#snippet topbar()}
-            <Topbar
-              crumbs={['registry', 'cards', 'payments-svc']}
-              search="⌘K  search cards…"
-              env={{ label: 'prod', status: 'ok' }}
-            />
-          {/snippet}
-          <p style="margin:0;font-family:var(--fm);font-size:12px;color:var(--muted)">
-            main content region — the workbench renders here.
-          </p>
-        </Shell>
-      </Card>
-
-      <Card variant="wide">
-        {#snippet head()}<span>Hero</span><span>loud</span>{/snippet}
-        <Hero
-          title="The Wyrd Registry"
-          ornament="✳ wyrd"
-          tagline="Card-bound identity for the agentic stack. One credential. Two planes."
-          stats={[
-            { value: '18', label: 'Card kinds' },
-            { value: '2', label: 'Planes' },
-            { value: '1', label: 'Credential' }
-          ]}
-          ctas={[
-            { label: 'wyrd apply →' },
-            { label: 'view docs', variant: 'rune' }
-          ]}
-        />
-      </Card>
+      <ChartPanel
+        title="Drift score"
+        measure="PSI"
+        source="vala · feature"
+        state="unauthorized"
+        detail="This principal cannot read drift results for txns-2026q3."
+        code="WYRD-AUTHZ-FORBIDDEN"
+      />
     </div>
+
+    <div class="sgh narrow-h">Narrow container — the same components at 340px</div>
+    <div class="narrow">
+      <Panel title="Latency">
+        <div class="row">
+          <Chip label="kind" value="Service" removeHref="?" />
+          <Badge tone="warn">stale</Badge>
+        </div>
+        <div class="stack">
+          <Table label="Evidence, narrow">
+            <table>
+              <thead><tr><th>kind</th><th>subject</th><th>verdict</th></tr></thead>
+              <tbody>
+                {#each evidence as e (e.kind)}
+                  <tr><td>{e.kind}</td><td>{e.subject}</td><td><Badge tone={e.verdict}>{e.label}</Badge></td></tr>
+                {/each}
+              </tbody>
+            </table>
+          </Table>
+        </div>
+      </Panel>
+    </div>
+
+    <div class="sgh narrow-h" id="chrome">Trusted application chrome — implemented, deliberately not in the catalog</div>
+    <Shell>
+      {#snippet sidebar()}<Sidebar brand="bohmian" groups={navGroups} />{/snippet}
+      {#snippet topbar()}<Topbar crumbs={['acme', 'cards']} search="Search Cards" env={{ label: 'prod', status: 'ok' }} />{/snippet}
+      <div class="row"><Badge tone="ok">chrome resolves tenant identity, not an authored view</Badge></div>
+    </Shell>
   </div>
 {/snippet}
 
@@ -332,6 +236,7 @@
   }
   .col {
     background: #444;
+    min-width: 0;
   }
   .tag {
     font-family: var(--font-mono);
@@ -350,6 +255,9 @@
     color: var(--muted);
     margin-bottom: 16px;
   }
+  .narrow-h {
+    margin-top: 22px;
+  }
   .sgh .wm {
     font-family: var(--font-display);
     font-size: 14px;
@@ -360,12 +268,25 @@
     display: grid;
     grid-template-columns: 1fr 1fr;
     gap: 14px;
+    align-items: start;
+  }
+  .wide {
+    grid-column: 1 / -1;
   }
   .row {
     display: flex;
     gap: 10px;
     align-items: center;
     flex-wrap: wrap;
+  }
+  .stack {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    margin-top: 10px;
+  }
+  .narrow {
+    max-width: 340px;
   }
   .kpis {
     display: grid;
@@ -379,16 +300,6 @@
   }
   .kpis :global(.wy-kpi:last-child) {
     border-right: 0;
-  }
-  .panels {
-    display: flex;
-    gap: 14px;
-    flex-wrap: wrap;
-    align-items: flex-start;
-  }
-  .panels > :global(.wy-drawer) {
-    flex: 0 1 340px;
-    min-width: 0;
   }
 
   /* Harness is laptop/monitor-first; below these widths it stacks rather than crushes. */

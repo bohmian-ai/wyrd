@@ -1,59 +1,41 @@
 import type { Component } from 'svelte';
-import Card from './components/Card.svelte';
-import Button from './components/Button.svelte';
 import Badge from './components/Badge.svelte';
-import Table from './components/Table.svelte';
-import KpiTile from './components/KpiTile.svelte';
-import Spark from './components/Spark.svelte';
-import Bars from './components/Bars.svelte';
-import Lines from './components/Lines.svelte';
-import Histo from './components/Histo.svelte';
-import Trend from './components/Trend.svelte';
-import Heatmap from './components/Heatmap.svelte';
-import Dist from './components/Dist.svelte';
-import Tree from './components/Tree.svelte';
-import Dropdown from './components/Dropdown.svelte';
+import Button from './components/Button.svelte';
+import Chip from './components/Chip.svelte';
 import CodeBlock from './components/CodeBlock.svelte';
-import TraceTable from './components/TraceTable.svelte';
-import Waterfall from './components/Waterfall.svelte';
-import SpanPanel from './components/SpanPanel.svelte';
-import EvalPanel from './components/EvalPanel.svelte';
-import DriftPanel from './components/DriftPanel.svelte';
-import Shell from './components/Shell.svelte';
-import Sidebar from './components/Sidebar.svelte';
-import Topbar from './components/Topbar.svelte';
-import Hero from './components/Hero.svelte';
+import Disclosure from './components/Disclosure.svelte';
+import KpiTile from './components/KpiTile.svelte';
+import Panel from './components/Panel.svelte';
+import Select from './components/Select.svelte';
+import StateBlock from './components/StateBlock.svelte';
+import Table from './components/Table.svelte';
+import Bars from './components/charts/Bars.svelte';
+import ChartPanel from './components/charts/ChartPanel.svelte';
+import Line from './components/charts/Line.svelte';
+import Spark from './components/charts/Spark.svelte';
 
-// The shared bridge: maps a standardized component name to its implementation.
-// The workbench imports components directly; a dynamic-layout/A2UI renderer resolves
-// them by name from here. Every entry must have a matching `status: "built"` contract
-// in brand/components.json (enforced by registry.test.ts). Infrastructure (ModeProvider,
-// Drawer) is composed by other components rather than placed by name, so it is excluded.
+// The view component catalog: the components a future composed view is allowed to place
+// by name. Membership is deliberate, not incidental — every entry takes typed, JSON-safe,
+// semantic props and owns no credential, tenant, route or data access.
+//
+// Application chrome (Shell, Sidebar, Topbar, ModeProvider) is intentionally absent. It
+// is trusted application code: it resolves tenant identity, session state and navigation,
+// and an authored view must never be able to replace or impersonate it.
 export const registry = {
-  Card,
-  Button,
   Badge,
-  Table,
-  KpiTile,
-  Spark,
-  Bars,
-  Lines,
-  Histo,
-  Trend,
-  Heatmap,
-  Dist,
-  Tree,
-  Dropdown,
+  Button,
+  Chip,
   CodeBlock,
-  TraceTable,
-  Waterfall,
-  SpanPanel,
-  EvalPanel,
-  DriftPanel,
-  Shell,
-  Sidebar,
-  Topbar,
-  Hero
+  Disclosure,
+  KpiTile,
+  Panel,
+  Select,
+  StateBlock,
+  Table,
+  Bars,
+  ChartPanel,
+  Line,
+  Spark
 } satisfies Record<string, Component<any>>;
 
 export type ComponentName = keyof typeof registry;

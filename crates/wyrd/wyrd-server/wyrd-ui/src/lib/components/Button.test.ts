@@ -7,9 +7,14 @@ test('renders a button with the default primary variant', () => {
   expect(screen.getByRole('button')).toHaveAttribute('data-variant', 'primary');
 });
 
-test('applies the rune variant', () => {
-  render(Button, { props: { variant: 'rune' } });
-  expect(screen.getByRole('button')).toHaveAttribute('data-variant', 'rune');
+test('applies the secondary variant', () => {
+  render(Button, { props: { variant: 'secondary' } });
+  expect(screen.getByRole('button')).toHaveAttribute('data-variant', 'secondary');
+});
+
+test('renders a link when href is given', () => {
+  render(Button, { props: { href: '/t/acme/cards' } });
+  expect(screen.getByRole('link')).toHaveAttribute('href', '/t/acme/cards');
 });
 
 test('forwards native button attributes', () => {

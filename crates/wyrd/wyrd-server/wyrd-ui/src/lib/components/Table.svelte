@@ -1,12 +1,20 @@
 <script lang="ts">
   import type { Snippet } from 'svelte';
 
-  // A styled wrapper. Pass a normal <table> (thead/tbody) as children; the wrapper
-  // styles its descendants. Add class="sel" to a <tr> for the selection wash.
-  let { children }: { children?: Snippet } = $props();
+  // A styled wrapper. Pass a normal <table> (thead/tbody) as children; the wrapper styles
+  // its descendants. Add class="sel" to a <tr> for the selection wash.
+  //
+  // Irreducibly wide tables scroll rather than drop columns, so the scroller is a labeled
+  // region with tabindex="0": a keyboard-only reader can focus it and pan with the arrow
+  // keys, which a plain overflow container does not allow.
+  let { label, children }: { label: string; children?: Snippet } = $props();
 </script>
 
-<div class="wy-table">{@render children?.()}</div>
+<!-- A scrollable region is the one WCAG-sanctioned nonnegative tabindex on a non-widget:
+     without it the horizontal scroller is unreachable by keyboard. role=region +
+     aria-label make it a named landmark, which is exactly what the rule presumes absent. -->
+<!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+<div class="wy-table" role="region" aria-label={label} tabindex="0">{@render children?.()}</div>
 
 <style>
   .wy-table {
@@ -15,6 +23,10 @@
     background: var(--surface);
     box-shadow: 3px 3px 0 0 var(--shadow);
     overflow-x: auto;
+  }
+  .wy-table:focus-visible {
+    outline: 2px solid var(--brand-strong);
+    outline-offset: 2px;
   }
   .wy-table :global(th),
   .wy-table :global(td) {
@@ -46,6 +58,7 @@
     border-bottom: 0;
   }
   .wy-table :global(tr.sel td) {
-    background: var(--rune-soft);
+    background: var(--brand-soft);
+    box-shadow: inset 4px 0 0 0 var(--brand-strong);
   }
 </style>

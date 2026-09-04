@@ -1,95 +1,727 @@
 {
-  "$comment": "Machine-readable component contracts for the Wyrd design system. `status: built` entries are implemented in src/lib/components and registered in src/lib/registry.ts (parity enforced by registry.test.ts); the rendered reference is ./wyrd-ui-source-of-truth-v2.html. A dynamic-layout/A2UI renderer consumes this file to compose UIs from standardized pieces. Infrastructure (ModeProvider, Drawer) is intentionally absent: it is composed by other components, not placed by name.",
+  "$comment": "Machine-readable component contracts for the Wyrd design system under the bohmian brand. Every entry is implemented in src/lib/components and, when `catalog` is true, registered in src/lib/registry.ts (parity enforced by src/lib/registry.test.ts). `catalog: true` marks a component a future composed view may place by name: its props are typed, JSON-safe and semantic. `catalog: false` marks trusted application code — chrome that resolves tenant identity, session state and navigation — which an authored view must never be able to place, replace or impersonate. `consumers` lists the accepted product mock pages that require the component; a shared component earns its place only with at least two. The rendered reference is ./renders/styleguide.html.",
   "altitudes": {
     "quiet": "workbench default — 3px hard-offset shadow, restrained accent",
     "raised": "drilldown panels — 6px shadow + 4px kind/status top-bar",
-    "loud": "hero / landing only — 10px shadow, tricolor rail, display type"
+    "flat": "subordinate block — 2px border, no shadow",
+    "loud": "hero / landing only — 10px shadow, tricolor rail, serif display type"
+  },
+  "ownership": {
+    "$comment": "Blue is primary, lime is secondary. Fathom identity is carried by the ProductPill, the tinted panel head, and the label — NOT by owning a colour. See DESIGN.md 'Never colour alone': --ok and --danger collapse to 1.11:1 under deuteranopia, so no meaning in this system may rest on hue alone.",
+    "primary": [
+      "--brand",
+      "--brand-strong",
+      "--brand-soft",
+      "--brand-btn"
+    ],
+    "secondary": [
+      "--lime",
+      "--lime-text",
+      "--lime-ink"
+    ],
+    "rule": "Bright --lime is a FILL only (1.30:1 on white). Anything that needs lime as a mark — text, a thin bar, the client plane — uses --lime-text.",
+    "redundancy": "Status carries a glyph, thresholds carry a tick, chart series carry a dash and a marker. Colour is never the sole carrier of a meaning."
   },
   "components": {
-    "Card": {
+    "Panel": {
       "status": "built",
+      "catalog": true,
       "altitude": "quiet",
-      "tokens": ["--surface", "--border", "--shadow", "--muted", "--r"],
-      "props": { "variant": "quiet | raised | wide" },
-      "variants": ["quiet", "raised", "wide"],
-      "anatomy": ["head", "body"],
+      "consumers": [
+        "H-02",
+        "C-02",
+        "O-01",
+        "CR-03",
+        "S-01"
+      ],
+      "tokens": [
+        "--surface",
+        "--border",
+        "--shadow",
+        "--muted",
+        "--text",
+        "--lime",
+        "--r"
+      ],
+      "props": {
+        "variant": "quiet | raised | flat | wide",
+        "owner": "wyrd | fathom",
+        "title": "string?",
+        "children": "content"
+      },
+      "variants": [
+        "quiet",
+        "raised",
+        "flat",
+        "wide"
+      ],
+      "anatomy": [
+        "head",
+        "body"
+      ],
       "rules": [
-        "2px border always",
-        "3px shadow quiet / 6px shadow raised",
-        "5px radius",
-        "wide spans grid-column 1 / -1"
+        "named Panel, never Card: a Wyrd Card is a registered domain record, a panel is only a surface it may be drawn on",
+        "2px border always, 5px radius",
+        "quiet = 3px shadow, raised = 6px shadow and marks the page's single attention surface, flat = no shadow for a subordinate block",
+        "wide spans grid-column 1 / -1",
+        "container-type: inline-size so contained components respond to the panel, not the viewport",
+        "owner=fathom tints the head color-mix(--lime 26%, --surface), marking the content as Fathom-authored rather than Wyrd's. Its label is --text, NOT --ink-on-fill: the band lands on a dark olive in dark mode where near-black ink falls to 2.12:1."
       ]
     },
     "Button": {
       "status": "built",
+      "catalog": true,
       "altitude": "quiet",
-      "tokens": ["--border", "--shadow", "--surface", "--text", "--lime", "--lime-ink", "--rune-btn", "--rune-btn-ink", "--r"],
-      "props": { "variant": "primary | rune | ghost" },
-      "variants": ["primary", "rune", "ghost"],
-      "anatomy": ["label"],
+      "consumers": [
+        "CR-02",
+        "CR-04",
+        "Q-01",
+        "H-01"
+      ],
+      "tokens": [
+        "--border",
+        "--shadow",
+        "--surface",
+        "--text",
+        "--brand-btn",
+        "--brand-btn-ink",
+        "--lime",
+        "--lime-ink",
+        "--r"
+      ],
+      "props": {
+        "variant": "primary | secondary | ghost",
+        "href": "string?",
+        "children": "content"
+      },
+      "variants": [
+        "primary",
+        "secondary",
+        "ghost"
+      ],
+      "anatomy": [
+        "label"
+      ],
       "rules": [
-        "primary = lime fill (the one strong action)",
-        "rune = brand violet fill",
+        "primary = brand blue fill (--brand-btn) — the one strong action on a surface",
+        "secondary = lime fill — the second voice. Fathom-authored actions (open fix PR, re-run verification) use it, but it is NOT reserved to them; any genuine secondary action may take it.",
         "ghost = surface fill, no accent",
+        "href renders an <a> with identical treatment, so a catalog-safe view offers navigation without a callback crossing the contract",
+        "fill is --brand-btn, never --brand: --brand is a dim navy panel colour in dark and pairs with --brand-btn-ink at 1.23:1",
         "press interaction: hover lifts to 5px, active sinks to 1px"
       ]
     },
     "Badge": {
       "status": "built",
+      "catalog": true,
       "altitude": "quiet",
-      "tokens": ["--ok", "--warn", "--danger", "--muted", "--surface"],
-      "props": { "tone": "neutral | ok | warn | danger" },
-      "variants": ["neutral", "ok", "warn", "danger"],
-      "anatomy": ["label"],
+      "consumers": [
+        "C-01",
+        "CR-03",
+        "O-09",
+        "S-01",
+        "E-04"
+      ],
+      "tokens": [
+        "--ok-text",
+        "--warn-text",
+        "--danger-text",
+        "--brand-strong",
+        "--lime-text",
+        "--muted",
+        "--surface"
+      ],
+      "props": {
+        "tone": "neutral | ok | warn | danger | running | fathom",
+        "children": "content"
+      },
+      "variants": [
+        "neutral",
+        "ok",
+        "warn",
+        "danger",
+        "running",
+        "fathom"
+      ],
+      "anatomy": [
+        "glyph",
+        "label"
+      ],
       "rules": [
         "tone is a status signal, not decoration",
-        "2px border in tone color, 12% tinted fill, 4px radius"
+        "tone drives border, label, and tint from one --bc custom property, and --bc is always a *-text token: raw --ok/--warn/--danger are fill colours and land at 3.01 / 2.28 / 3.94:1 as an 8.5px label on light",
+        "2px border in tone colour, 12% tinted fill, 4px radius",
+        "MUST render an aria-hidden glyph before the label — ok=✓ warn=! danger=✕ running=● fathom=◈. --ok and --danger collapse to 1.11:1 under deuteranopia, so a colour-only badge makes pass and fail identical for ~6% of men.",
+        "neutral takes no glyph and no tint: 'neutral' means no status, and a 12% --muted wash lands at 4.46:1 in dark, which the contrast contract rejects"
+      ]
+    },
+    "Chip": {
+      "status": "built",
+      "catalog": true,
+      "altitude": "quiet",
+      "consumers": [
+        "C-01",
+        "O-01",
+        "O-10",
+        "M-01"
+      ],
+      "tokens": [
+        "--border",
+        "--surface",
+        "--surface-2",
+        "--text",
+        "--muted"
+      ],
+      "props": {
+        "label": "string",
+        "value": "string",
+        "removeHref": "string?"
+      },
+      "variants": [],
+      "anatomy": [
+        "key",
+        "value",
+        "remove"
+      ],
+      "rules": [
+        "states one applied filter as key + value, never an unlabeled value",
+        "removal is a link to the same route minus that param — never a callback, so filter state stays in the URL and stays restorable",
+        "the ✕ carries an aria-label naming the filter it removes",
+        "the value ellipsizes; the chip never grows past its container"
+      ]
+    },
+    "Select": {
+      "status": "built",
+      "catalog": true,
+      "altitude": "quiet",
+      "consumers": [
+        "C-01",
+        "O-03",
+        "O-04",
+        "S-01"
+      ],
+      "tokens": [
+        "--surface",
+        "--border",
+        "--shadow",
+        "--text",
+        "--muted",
+        "--r"
+      ],
+      "props": {
+        "label": "string",
+        "name": "string",
+        "options": "Array<{ value: string, label: string }>",
+        "value": "string?",
+        "auto": "boolean?"
+      },
+      "variants": [],
+      "anatomy": [
+        "label",
+        "select"
+      ],
+      "rules": [
+        "a native <select>: keyboard operation, screen-reader labeling and the mobile picker come from the platform, not from local menu code",
+        "the visible <label> is bound by id — a filter control is never labeled by placement alone",
+        "auto submits the enclosing form on change; the component takes no callback, so the destination stays a server-owned action or GET route",
+        "time-range control is this component with range options, not a separate component"
       ]
     },
     "Table": {
       "status": "built",
+      "catalog": true,
       "altitude": "quiet",
-      "tokens": ["--surface", "--border", "--shadow", "--muted", "--text", "--rune-soft", "--r"],
-      "props": {},
+      "consumers": [
+        "C-01",
+        "C-02",
+        "O-04",
+        "E-04",
+        "CR-01"
+      ],
+      "tokens": [
+        "--surface",
+        "--border",
+        "--shadow",
+        "--muted",
+        "--text",
+        "--brand-soft",
+        "--brand-strong",
+        "--r"
+      ],
+      "props": {
+        "label": "string",
+        "children": "content"
+      },
       "variants": [],
-      "anatomy": ["thead", "tbody"],
+      "anatomy": [
+        "scroller",
+        "thead",
+        "tbody"
+      ],
       "rules": [
-        "header is white surface (not gray) relying on the 2px bottom border",
-        "selection wash uses --rune-soft (tr.sel), never lime",
-        "2px row dividers, last row borderless"
+        "header is plain surface (not gray) relying on the 2px bottom border",
+        "selection wash uses --brand-soft plus a 4px --brand-strong inset left marker, never lime — selection is positional as well as tinted",
+        "2px row dividers, last row borderless",
+        "an irreducibly wide table scrolls rather than dropping columns; the scroller is role=region with an aria-label and tabindex=0 so a keyboard-only reader can focus and pan it"
       ]
     },
     "KpiTile": {
       "status": "built",
+      "catalog": true,
       "altitude": "quiet",
-      "tokens": ["--muted", "--text", "--ok", "--danger"],
-      "props": { "label": "string", "value": "string | number", "delta": "string?", "trend": "up | down | flat" },
-      "variants": ["up", "down", "flat"],
-      "anatomy": ["label", "value", "delta", "spark"],
+      "consumers": [
+        "H-02",
+        "C-09",
+        "O-01",
+        "E-01"
+      ],
+      "tokens": [
+        "--muted",
+        "--text",
+        "--ok",
+        "--danger"
+      ],
+      "props": {
+        "label": "string",
+        "value": "string | number",
+        "delta": "string?",
+        "trend": "up | down | flat",
+        "spark": "content"
+      },
+      "variants": [
+        "up",
+        "down",
+        "flat"
+      ],
+      "anatomy": [
+        "label",
+        "value",
+        "delta",
+        "spark"
+      ],
       "rules": [
-        "delta trend up = --ok, down = --danger",
+        "value is set in --font-display (Space Grotesk 700), not the body face",
+        "delta trend up = --ok, down = --danger, and the delta text states the direction so the tone is never the only signal",
         "min-width:0 + overflow:hidden so wide values never blow out a grid track"
       ]
     },
-
-    "Bars": { "status": "built", "altitude": "quiet", "tokens": ["--border", "--text", "--muted"], "rules": ["inline SVG, bar fill from a kind/line token, value + category labels"] },
-    "Lines": { "status": "built", "altitude": "quiet", "tokens": ["--border", "--surface", "--muted"], "rules": ["multi-series, dashed gridlines, series stroke from kind tokens (e.g. p50 blue / p95 violet / p99 red)"] },
-    "Spark": { "status": "built", "altitude": "quiet", "tokens": ["--ok", "--danger"], "rules": ["90x24 polyline, no fill, color = trend sentiment"] },
-    "Histo": { "status": "built", "altitude": "raised", "tokens": ["--control-bar", "--rune-strong", "--surface"], "rules": ["grouped reference (control) vs current (violet) distribution bars"] },
-    "Trend": { "status": "built", "altitude": "raised", "tokens": ["--rune-strong", "--danger"], "rules": ["line with dashed danger threshold; points above threshold turn danger"] },
-    "Heatmap": { "status": "built", "altitude": "quiet", "tokens": ["--rune-strong", "--surface-2"], "rules": ["intensity ramp uses violet (--rune-strong), NEVER lime — lime can't darken on white"] },
-    "Dist": { "status": "built", "altitude": "quiet", "tokens": ["--client", "--server", "--control"], "rules": ["stacked plane distribution using the Line colors + legend"] },
-    "Tree": { "status": "built", "altitude": "quiet", "tokens": ["--client-bar", "--server-bar", "--control-bar", "--border"], "rules": ["native details/summary, 3px kind left-bar on leaves, dashed nested guide"] },
-    "Dropdown": { "status": "built", "altitude": "quiet", "tokens": ["--surface", "--border", "--shadow", "--rune-soft", "--rune-strong"], "rules": ["2px border menu, 3px shadow, selected option rune-soft wash + rune-strong tick"] },
-    "CodeBlock": { "status": "built", "altitude": "quiet", "tokens": ["--surface-2", "--border", "--text", "--muted", "--r"], "props": { "code": "string", "copy": "boolean?" }, "anatomy": ["pre", "copy"], "rules": ["mono surface-2 block, 2px border, 5px radius", "optional copy button via navigator.clipboard"] },
-    "TraceTable": { "status": "built", "altitude": "quiet", "tokens": ["--client-bar", "--rune-strong", "--server-bar", "--control-bar", "--ok", "--warn", "--danger"], "rules": ["op left-bar by span kind (agent=client, llm=violet, tool=server, retrieval=control); status column ok/warn/err", "raw values in (durationMs/tokens/cost numbers, score 0-1, scoreTone verdict); formatted internally via lib/format.ts"] },
-    "Waterfall": { "status": "built", "altitude": "quiet", "tokens": ["--client-bar", "--rune-strong", "--server-bar", "--control-bar", "--surface", "--text"], "rules": ["ruler + positioned span bars; bar = kind border + color-mix kind tint; error overrides to danger"] },
-    "SpanPanel": { "status": "built", "altitude": "raised", "tokens": ["--rune-strong", "--surface", "--border", "--muted"], "rules": ["raised drawer, top-bar = span kind color, kv attributes + event timeline + code preview", "token counts are raw numbers, humanized via lib/format.ts"] },
-    "EvalPanel": { "status": "built", "altitude": "raised", "tokens": ["--rune-strong", "--ok", "--warn", "--danger"], "rules": ["raised drawer, big score, metric bars vs threshold (ok/danger), judge rationale"] },
-    "DriftPanel": { "status": "built", "altitude": "raised", "tokens": ["--danger", "--control-bar", "--rune-strong"], "rules": ["raised drawer, top-bar turns --danger when drifted (status overrides kind), histogram + trend"] },
-    "Shell": { "status": "built", "altitude": "quiet", "tokens": ["--surface", "--border", "--bg"], "rules": ["212px sidebar + topbar + main grid; 3px outer border"] },
-    "Sidebar": { "status": "built", "altitude": "quiet", "tokens": ["--surface", "--border", "--rune-soft", "--rune-strong", "--lime"], "rules": ["nav groups; active item rune-soft wash + border + 2px shadow; lime brand dot"] },
-    "Topbar": { "status": "built", "altitude": "quiet", "tokens": ["--surface", "--border", "--surface-2", "--ok"], "rules": ["breadcrumb + search + env pill with status dot"] },
-    "Hero": { "status": "built", "altitude": "loud", "tokens": ["--hero-bg", "--hero-ink", "--shadow", "--lime", "--client-bar", "--server-bar", "--control-bar"], "rules": ["display type, 3px border, 10px shadow, tricolor rail; landing only, never beside the workbench"] }
+    "Disclosure": {
+      "status": "built",
+      "catalog": true,
+      "altitude": "quiet",
+      "consumers": [
+        "C-05",
+        "C-14",
+        "E-08",
+        "M-01"
+      ],
+      "tokens": [
+        "--surface",
+        "--surface-2",
+        "--border",
+        "--text",
+        "--muted",
+        "--r"
+      ],
+      "props": {
+        "summary": "string",
+        "meta": "string?",
+        "open": "boolean?",
+        "children": "content"
+      },
+      "variants": [],
+      "anatomy": [
+        "summary",
+        "body"
+      ],
+      "rules": [
+        "native <details>/<summary>: open state, keyboard operation and the expanded/collapsed announcement come from the platform",
+        "open is the initial state only — the element owns it afterwards",
+        "2px dashed divider between summary and body, matching the internal-divider rule"
+      ]
+    },
+    "StateBlock": {
+      "status": "built",
+      "catalog": true,
+      "altitude": "flat",
+      "consumers": [
+        "C-01",
+        "C-03",
+        "O-03",
+        "CR-01",
+        "Q-01"
+      ],
+      "tokens": [
+        "--surface",
+        "--muted",
+        "--text",
+        "--danger-text",
+        "--warn-text",
+        "--brand-strong",
+        "--r"
+      ],
+      "props": {
+        "state": "loading | empty | partial | error | unauthorized | absent",
+        "title": "string",
+        "detail": "string?",
+        "code": "string?",
+        "actionLabel": "string?",
+        "actionHref": "string?"
+      },
+      "variants": [
+        "loading",
+        "empty",
+        "partial",
+        "error",
+        "unauthorized",
+        "absent"
+      ],
+      "anatomy": [
+        "glyph",
+        "state",
+        "title",
+        "detail",
+        "code",
+        "action"
+      ],
+      "rules": [
+        "the one place the workbench says there is nothing to draw and why — no surface silently renders an empty region",
+        "the state word is always written out beside the glyph; the dashed border and tone are secondary",
+        "loading takes role=status and aria-busy so the wait is announced; every other state takes role=note",
+        "code carries the server's stable Wyrd error code verbatim and never a stack, connection detail or invented UI vocabulary",
+        "absent is the earned-absent inset: an optional section the server has nothing for, stated rather than hidden"
+      ]
+    },
+    "CodeBlock": {
+      "status": "built",
+      "catalog": true,
+      "altitude": "quiet",
+      "consumers": [
+        "C-05",
+        "C-14",
+        "Q-01"
+      ],
+      "tokens": [
+        "--surface-2",
+        "--border",
+        "--text",
+        "--muted",
+        "--r"
+      ],
+      "props": {
+        "code": "string",
+        "copy": "boolean?"
+      },
+      "variants": [],
+      "anatomy": [
+        "pre",
+        "copy"
+      ],
+      "rules": [
+        "mono surface-2 block, 2px border, 5px radius",
+        "optional copy button via navigator.clipboard",
+        "renders text, never markup: the code prop is escaped content, not HTML"
+      ]
+    },
+    "ChartPanel": {
+      "status": "built",
+      "catalog": true,
+      "altitude": "quiet",
+      "consumers": [
+        "C-09",
+        "C-11",
+        "O-03",
+        "O-07",
+        "S-01"
+      ],
+      "tokens": [
+        "--surface",
+        "--border",
+        "--muted",
+        "--text",
+        "--brand-strong",
+        "--font-display"
+      ],
+      "props": {
+        "title": "string",
+        "measure": "string",
+        "unit": "string?",
+        "latestValue": "string | number",
+        "source": "string?",
+        "freshness": "{ label: string, at: string }?",
+        "from": "{ label: string, at: string }?",
+        "to": "{ label: string, at: string }?",
+        "link": "{ label: string, href: string }?",
+        "state": "ok | loading | empty | partial | unauthorized | error",
+        "detail": "string?",
+        "code": "string?",
+        "children": "content"
+      },
+      "variants": [
+        "ok",
+        "loading",
+        "empty",
+        "partial",
+        "unauthorized",
+        "error"
+      ],
+      "anatomy": [
+        "head",
+        "latest",
+        "state",
+        "plot",
+        "foot"
+      ],
+      "rules": [
+        "the one frame every Wyrd chart is drawn in: measure, unit, latest value, freshness, visible range, source, canonical link and the unavailable states",
+        "a non-ok state renders a StateBlock in place of the plot and NEVER a latest value — a stale, absent or unauthorized reading shown as a number is a health claim the server never made",
+        "partial draws the plot and the partial notice together; it never silently presents an incomplete series as complete",
+        "freshness and range use <time datetime> so the instant is machine-readable, not just formatted prose",
+        "composes Panel and StateBlock; it is a frame, never one component per metric and never a universal chart"
+      ]
+    },
+    "Line": {
+      "status": "built",
+      "catalog": true,
+      "altitude": "quiet",
+      "consumers": [
+        "O-03",
+        "C-09",
+        "C-11",
+        "S-01"
+      ],
+      "tokens": [
+        "--brand-strong",
+        "--control-bar",
+        "--server-bar",
+        "--lime-text",
+        "--danger",
+        "--danger-text",
+        "--border",
+        "--surface",
+        "--muted"
+      ],
+      "props": {
+        "series": "Array<{ label: string, points: number[] }>",
+        "labels": "string[]?",
+        "threshold": "{ value: number, label: string }?"
+      },
+      "variants": [],
+      "anatomy": [
+        "grid",
+        "axis",
+        "threshold",
+        "series",
+        "legend"
+      ],
+      "rules": [
+        "inline SVG 300x148, multi-series, dashed gridlines",
+        "series take no colour prop: stroke, stroke-dasharray and marker shape are chosen by series position from a fixed four-style table, so a serialized view can never name a token",
+        "each series MUST carry a distinct dash and marker (solid square, '6 3' circle, '2 3' triangle, '8 2 2 2' diamond) and the legend MUST mirror both as a line sample, not a block swatch. --control-bar and --brand-strong collapse to 1.22:1 under deuteranopia, so hue alone cannot separate two percentiles.",
+        "a threshold is drawn as a labeled dashed rule plus a positional tick on the axis — never an unlabeled red line"
+      ]
+    },
+    "Bars": {
+      "status": "built",
+      "catalog": true,
+      "altitude": "quiet",
+      "consumers": [
+        "O-07",
+        "C-03"
+      ],
+      "tokens": [
+        "--brand-strong",
+        "--border",
+        "--text",
+        "--muted"
+      ],
+      "props": {
+        "data": "Array<{ label: string, value: number }>",
+        "unit": "string?"
+      },
+      "variants": [],
+      "anatomy": [
+        "axis",
+        "bar",
+        "value",
+        "category"
+      ],
+      "rules": [
+        "inline SVG 300x148, --brand-strong fill, value above and category under every bar",
+        "bars take no colour prop; the reading is positional and textual, and the SVG carries an aria-label naming every category and value"
+      ]
+    },
+    "Spark": {
+      "status": "built",
+      "catalog": true,
+      "altitude": "quiet",
+      "consumers": [
+        "C-09",
+        "H-02"
+      ],
+      "tokens": [
+        "--ok",
+        "--warn",
+        "--danger",
+        "--muted"
+      ],
+      "props": {
+        "points": "number[]",
+        "sentiment": "ok | warn | danger | neutral",
+        "width": "number?",
+        "height": "number?"
+      },
+      "variants": [
+        "ok",
+        "warn",
+        "danger",
+        "neutral"
+      ],
+      "anatomy": [
+        "polyline"
+      ],
+      "rules": [
+        "90x24 polyline, no fill; shape carries the trend",
+        "sentiment defaults to neutral — a sparkline never asserts health the server did not state, and it always sits beside a labeled value"
+      ]
+    },
+    "Shell": {
+      "status": "built",
+      "catalog": false,
+      "altitude": "quiet",
+      "consumers": [
+        "every authenticated route"
+      ],
+      "tokens": [
+        "--surface",
+        "--border",
+        "--bg"
+      ],
+      "props": {},
+      "variants": [],
+      "anatomy": [
+        "sidebar",
+        "topbar",
+        "main"
+      ],
+      "rules": [
+        "212px sidebar + topbar + main grid; 3px outer border",
+        "trusted application chrome — not catalog: it frames every authored view and must never be placeable by one"
+      ]
+    },
+    "Sidebar": {
+      "status": "built",
+      "catalog": false,
+      "altitude": "quiet",
+      "consumers": [
+        "every authenticated route"
+      ],
+      "tokens": [
+        "--surface",
+        "--border",
+        "--brand-soft",
+        "--brand-strong"
+      ],
+      "props": {},
+      "variants": [],
+      "anatomy": [
+        "brand",
+        "nav"
+      ],
+      "rules": [
+        "nav groups; active item brand-soft wash + border + 2px shadow",
+        "brand slot is the bohmian mark (logo.svg) followed by the lowercase 'bohmian' wordmark in --font-serif",
+        "trusted application chrome — not catalog: it owns navigation, which an authored view must never redirect"
+      ]
+    },
+    "Topbar": {
+      "status": "built",
+      "catalog": false,
+      "altitude": "quiet",
+      "consumers": [
+        "every authenticated route"
+      ],
+      "tokens": [
+        "--surface",
+        "--border",
+        "--surface-2",
+        "--ok"
+      ],
+      "props": {},
+      "variants": [],
+      "anatomy": [
+        "breadcrumb",
+        "search",
+        "tenant",
+        "principal"
+      ],
+      "rules": [
+        "breadcrumb + search + env pill with status dot",
+        "hosts the ProductPill immediately after the wordmark",
+        "trusted application chrome — not catalog: it carries tenant identity and the principal menu"
+      ]
+    },
+    "ModeProvider": {
+      "status": "built",
+      "catalog": false,
+      "altitude": "quiet",
+      "consumers": [
+        "root layout",
+        "styleguide"
+      ],
+      "tokens": [
+        "--bg",
+        "--text"
+      ],
+      "props": {
+        "mode": "light | dark",
+        "children": "content"
+      },
+      "variants": [
+        "light",
+        "dark"
+      ],
+      "anatomy": [
+        "root"
+      ],
+      "rules": [
+        "applies data-mode and the shared font shorthands; every token in this file resolves beneath it",
+        "trusted application chrome — not catalog: it is composed by the layout, never placed by name"
+      ]
+    },
+    "ProductPill": {
+      "status": "spec",
+      "catalog": false,
+      "altitude": "quiet",
+      "consumers": [
+        "every authenticated route"
+      ],
+      "tokens": [
+        "--brand-btn",
+        "--brand-btn-ink",
+        "--lime",
+        "--lime-ink",
+        "--border",
+        "--r"
+      ],
+      "props": {
+        "product": "wyrd | fathom"
+      },
+      "variants": [
+        "wyrd",
+        "fathom"
+      ],
+      "anatomy": [
+        "label"
+      ],
+      "rules": [
+        "uppercase --font-mono, 10px, 700, .08em tracking",
+        "wyrd = --brand-btn fill + --brand-btn-ink; fathom = --lime fill + --lime-ink",
+        "the fill is --brand-btn, NOT --brand: --brand is a dim navy panel colour in dark mode and pairs with --brand-btn-ink at 1.23:1. --brand-btn holds ≥6.5:1 in both modes.",
+        "2px border, 3px radius — sits immediately after the bohmian wordmark in the Topbar",
+        "names the product layer the current surface belongs to; it is identity, never a control",
+        "trusted application chrome — not catalog: an authored view must never label itself as a product layer"
+      ]
+    }
   }
 }

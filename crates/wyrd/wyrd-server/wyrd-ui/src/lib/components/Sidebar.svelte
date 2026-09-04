@@ -67,7 +67,7 @@
   }
   .item.active {
     color: var(--text);
-    background: var(--rune-soft);
+    background: var(--brand-soft);
     border-color: var(--border);
     box-shadow: 2px 2px 0 0 var(--shadow);
   }

@@ -8,7 +8,7 @@
   <p class="mt-2" style="color:var(--muted)">The AI layer. Phase 0 skeleton.</p>
 
   <div class="mt-6 flex gap-3">
-    <a href="/styleguide"><Button variant="rune">Design system →</Button></a>
+    <Button href="/styleguide" variant="primary">Design system →</Button>
     <Button variant="ghost" onclick={toggleMode}>Toggle mode</Button>
   </div>
 </main>

@@ -16,9 +16,9 @@ use vala_sql::queries::forge_operations::ForgeOperations;
 use vala_sql::queries::forge_tasks::{ForgeClaimLimits, ForgeEnqueueBatch, ForgeTasks};
 use vala_sql::row_types::forge_operations::ForgeOperationFamily;
 use vala_sql::row_types::forge_tasks::{
-    ExpiredCleanupPayload, FORGE_TASK_PAYLOAD_VERSION, ForgePlanningDemand, ForgeTaskEstimates,
-    ForgeTaskLane, ForgeTaskPlan, ForgeTaskStrategy, ForgeTaskTableIdentity, NewForgeTask,
-    ORPHAN_CLEANUP_PAYLOAD_VERSION, OrphanCleanupPayload,
+    ExpiredCleanupPayload, FORGE_TASK_PAYLOAD_VERSION, ForgePlanningDemand,
+    ForgePlanningDemandSource, ForgeTaskEstimates, ForgeTaskLane, ForgeTaskPlan, ForgeTaskStrategy,
+    ForgeTaskTableIdentity, NewForgeTask, ORPHAN_CLEANUP_PAYLOAD_VERSION, OrphanCleanupPayload,
 };
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
@@ -29,7 +29,10 @@ use super::Forge;
 use super::compact::ForgeGroupKey;
 use super::error::ForgeError;
 use super::identity::task_table_binding;
-use super::metrics::{ForgeDemandTransitionResult, ForgeTaskMetricStrategy};
+use super::metrics::{
+    ForgeDemandTransitionResult, ForgeLifecycleOutcome, ForgeLifecycleStage,
+    ForgeTaskMetricStrategy,
+};
 use super::path::catalog_path_to_object_key;
 use super::planner::{
     ForgeCapacity, ForgeEnvelopeSizer, ForgePlanCandidate, ForgePlanCapacity, ForgePlanner,
@@ -300,7 +303,10 @@ impl<'forge> ForgeScheduler<'forge> {
             .await
             .map_err(ForgeError::Sql)?;
         conn.commit().await.map_err(ForgeError::Sql)?;
-        metrics::counter!("bifrost_forge_planning_demand_total", "source" => "hint").increment(1);
+        self.forge
+            .core
+            .telemetry
+            .record_planning_demand(ForgePlanningDemandSource::Hint);
         Ok(())
     }
 
@@ -361,11 +367,11 @@ impl<'forge> ForgeScheduler<'forge> {
         }
         self.renew_fence(fence).await?;
         self.publish_status(&mut outcome, fence).await?;
-        metrics::counter!("bifrost_forge_scheduling_total", "result" => if outcome.incomplete { "incomplete" } else { "complete" }).increment(1);
-        metrics::counter!("bifrost_forge_unschedulable_total")
-            .increment(outcome.unschedulable as u64);
-        metrics::histogram!("bifrost_forge_scheduling_duration_seconds")
-            .record(started.elapsed().as_secs_f64());
+        self.forge.core.telemetry.record_scheduling_pass(
+            outcome.incomplete,
+            outcome.unschedulable,
+            started.elapsed(),
+        );
         #[cfg(feature = "test-support")]
         if !outcome.incomplete {
             self.complete_publications.fetch_add(1, Ordering::AcqRel);
@@ -638,6 +644,17 @@ impl<'forge> ForgeScheduler<'forge> {
                 .core
                 .telemetry
                 .record_demand_transition(ForgeDemandTransitionResult::Drained);
+        }
+        if result.acknowledged {
+            for task in executable.iter().chain(&unschedulable) {
+                if let Ok(metric) = ForgeTaskMetricStrategy::try_from(task.strategy) {
+                    self.forge.core.telemetry.record_lifecycle_event(
+                        metric,
+                        ForgeLifecycleStage::Planned,
+                        ForgeLifecycleOutcome::Ok,
+                    );
+                }
+            }
         }
         #[cfg(feature = "test-support")]
         if result.acknowledged
@@ -1426,19 +1443,20 @@ impl<'forge> ForgeScheduler<'forge> {
         }
         self.renew_fence(fence).await?;
         if should_publish_gauges(outcome, overflowed) {
-            metrics::gauge!("bifrost_forge_planning_backlog").set(exact_gauge(backlog));
-            let age = oldest.map_or(0.0, |time| {
+            let age = oldest.map_or(Duration::ZERO, |time| {
                 Utc::now()
                     .signed_duration_since(time)
                     .to_std()
                     .unwrap_or_default()
-                    .as_secs_f64()
             });
-            metrics::gauge!("bifrost_forge_oldest_planning_demand_seconds").set(age);
             self.forge
                 .core
                 .telemetry
-                .record_planning_status(Duration::from_secs_f64(age), outcome.fairness_lag_tasks);
+                .record_planning_backlog(exact_gauge(backlog), age);
+            self.forge
+                .core
+                .telemetry
+                .record_planning_status(age, outcome.fairness_lag_tasks);
             self.forge.core.telemetry.record_compaction_debt(
                 outcome.compaction_debt_files,
                 outcome.compaction_debt_bytes,

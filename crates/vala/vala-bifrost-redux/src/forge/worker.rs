@@ -47,8 +47,8 @@ use super::identity::task_table_binding;
 use super::lease::{ForgeLease, forge_lease_key};
 use super::metrics::{
     ForgeAttemptResource, ForgeCapacityRefusalPhase, ForgeCleanupKind, ForgeConflictKind,
-    ForgeDemandTransitionResult, ForgeLeaseResult, ForgeMetricStage, ForgeProgressEffect,
-    ForgeTaskMetricStrategy, ForgeTaskTerminalResult,
+    ForgeDemandTransitionResult, ForgeLeaseResult, ForgeLifecycleOutcome, ForgeLifecycleStage,
+    ForgeMetricStage, ForgeProgressEffect, ForgeTaskMetricStrategy, ForgeTaskTerminalResult,
 };
 use super::orphan_gc::{ExpiredCleanupExemption, GcEligibility, ObjectEvidence};
 use super::path::catalog_path_to_object_key;
@@ -1324,31 +1324,7 @@ impl ForgeWorker {
             }
             self.reclaim_expired_attempts(claim_limits.max_active_per_tenant)
                 .await?;
-            if let Some(prepared) = self
-                .tasks
-                .claim_prepared_for_reconciliation(self.owner, claim_limits.lease_seconds)
-                .await
-                .map_err(ForgeError::Sql)?
-            {
-                let task_id = prepared.task.task_id;
-                let strategy = ForgeClaimStrategy::Known(prepared.task.strategy);
-                #[cfg(feature = "test-support")]
-                if let Some(observer) = &self.completion_observer {
-                    observer.record_lifecycle(ForgeLifecycleEvent::Claimed {
-                        task_id,
-                        worker_id: self.owner,
-                    });
-                }
-                let result = self.reconcile_prepared(prepared, &shutdown).await;
-                self.record_attempt(result.as_ref().err());
-                #[cfg(feature = "test-support")]
-                self.pause_after_attempt_for_test().await;
-                match result {
-                    Ok(()) => self.record_completion(task_id, strategy),
-                    Err(error) => {
-                        tracing::warn!(worker = %self.owner, error = %error, "Prepared Forge task reconciliation stopped; exact evidence retained");
-                    }
-                }
+            if self.reconcile_one_prepared(claim_limits, &shutdown).await? {
                 continue;
             }
             let claim = self
@@ -1396,7 +1372,18 @@ impl ForgeWorker {
                 "Forge task claimed"
             );
             let started = std::time::Instant::now();
+            let metric_strategy = Self::metric_strategy(&strategy);
+            // Held for the whole attempt so every exit — commit, refusal,
+            // cancellation, or unwind — balances the increment exactly once.
+            let _active =
+                metric_strategy.map(|metric| self.forge.core.telemetry.active_task(metric));
+            self.record_lifecycle(metric_strategy, ForgeLifecycleStage::Claimed, true);
             let result = self.execute_claim(claim, &shutdown).await;
+            self.record_lifecycle(
+                metric_strategy,
+                ForgeLifecycleStage::Settled,
+                result.is_ok(),
+            );
             tracing::info!(
                 worker = %self.owner,
                 task_id = %task_id,
@@ -1411,6 +1398,88 @@ impl ForgeWorker {
             if result.is_ok() {
                 self.record_completion(task_id, strategy);
             }
+        }
+    }
+
+    /// Reconciles one Prepared attempt this owner may claim, if any exists.
+    ///
+    /// Returns whether an attempt was reconciled, so the caller's slot loop can
+    /// retry recovery before taking any ordinary claim. Recovery outranks new
+    /// work: a Prepared attempt already produced durable evidence a reader can
+    /// observe, so it must be resolved before this owner starts another effect.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Sql`] when the bounded recovery claim fails. A
+    /// reconciliation failure is logged and retains its exact evidence rather
+    /// than failing the slot.
+    ///
+    /// # Cancellation
+    ///
+    /// A cancelled reconciliation leaves the attempt durable for a later owner.
+    async fn reconcile_one_prepared(
+        &self,
+        claim_limits: ForgeClaimLimits,
+        shutdown: &CancellationToken,
+    ) -> Result<bool, ForgeError> {
+        let Some(prepared) = self
+            .tasks
+            .claim_prepared_for_reconciliation(self.owner, claim_limits.lease_seconds)
+            .await
+            .map_err(ForgeError::Sql)?
+        else {
+            return Ok(false);
+        };
+        let task_id = prepared.task.task_id;
+        let strategy = ForgeClaimStrategy::Known(prepared.task.strategy);
+        #[cfg(feature = "test-support")]
+        if let Some(observer) = &self.completion_observer {
+            observer.record_lifecycle(ForgeLifecycleEvent::Claimed {
+                task_id,
+                worker_id: self.owner,
+            });
+        }
+        let result = self.reconcile_prepared(prepared, shutdown).await;
+        self.record_attempt(result.as_ref().err());
+        #[cfg(feature = "test-support")]
+        self.pause_after_attempt_for_test().await;
+        match result {
+            Ok(()) => self.record_completion(task_id, strategy),
+            Err(error) => {
+                tracing::warn!(worker = %self.owner, error = %error, "Prepared Forge task reconciliation stopped; exact evidence retained");
+            }
+        }
+        Ok(true)
+    }
+
+    /// Maps one claimed strategy onto its closed metric label, if it has one.
+    ///
+    /// A strategy this build does not know has no label, so it is observed by
+    /// the durable task row and the refusal path rather than by a metric.
+    fn metric_strategy(strategy: &ForgeClaimStrategy) -> Option<ForgeTaskMetricStrategy> {
+        match strategy {
+            ForgeClaimStrategy::Known(known) => ForgeTaskMetricStrategy::try_from(*known).ok(),
+            ForgeClaimStrategy::Unknown(_) => None,
+        }
+    }
+
+    /// Records one durable lifecycle transition for a labelled strategy.
+    fn record_lifecycle(
+        &self,
+        strategy: Option<ForgeTaskMetricStrategy>,
+        stage: ForgeLifecycleStage,
+        succeeded: bool,
+    ) {
+        if let Some(strategy) = strategy {
+            self.forge.core.telemetry.record_lifecycle_event(
+                strategy,
+                stage,
+                if succeeded {
+                    ForgeLifecycleOutcome::Ok
+                } else {
+                    ForgeLifecycleOutcome::Error
+                },
+            );
         }
     }
 

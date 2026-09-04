@@ -1,12 +1,15 @@
 //! Fixed-cardinality operational telemetry for Forge maintenance.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use metrics::{Counter, Gauge, Histogram};
 use num_traits::ToPrimitive;
 use uuid::Uuid;
-use vala_sql::row_types::forge_tasks::{ForgeTaskState, ForgeTaskStrategy};
+use vala_sql::row_types::forge_tasks::{
+    ForgePlanningDemandSource, ForgeTaskState, ForgeTaskStrategy,
+};
 use wyrd_spec::vala::api::StoragePath;
 
 use crate::catalog::TenantTableBinding;
@@ -218,6 +221,61 @@ pub(super) enum ForgeTaskMetricStrategy {
     ExpiredCleanup,
     /// Delete proven never-published outputs beneath one table prefix.
     OrphanCleanup,
+}
+
+/// Closed set of durable Forge task lifecycle transitions.
+///
+/// One event is emitted by the concrete owner that made the transition durable:
+/// the scheduler for `Planned`, the worker for `Claimed`, and the settlement
+/// path for `Settled`. Adding a member is a deliberate cardinality decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum ForgeLifecycleStage {
+    /// The scheduler committed one durable task row.
+    Planned,
+    /// A worker took durable ownership of one task.
+    Claimed,
+    /// One task reached a terminal durable state.
+    Settled,
+}
+
+impl ForgeLifecycleStage {
+    /// Every lifecycle stage eagerly registered for the counter family.
+    pub(super) const ALL: [Self; 3] = [Self::Planned, Self::Claimed, Self::Settled];
+
+    /// Returns the stable metric label for this stage.
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Planned => "planned",
+            Self::Claimed => "claimed",
+            Self::Settled => "settled",
+        }
+    }
+}
+
+/// Closed set of lifecycle-event outcomes.
+///
+/// A transition that a durable owner completed is `Ok`; one it refused or that
+/// failed at its own commit boundary is `Error`. There is no third value, so
+/// the family's cardinality is strategy count times stage count times two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum ForgeLifecycleOutcome {
+    /// The owner completed the transition.
+    Ok,
+    /// The owner refused the transition or it failed durably.
+    Error,
+}
+
+impl ForgeLifecycleOutcome {
+    /// Every outcome eagerly registered for the counter family.
+    pub(super) const ALL: [Self; 2] = [Self::Ok, Self::Error];
+
+    /// Returns the stable metric label for this outcome.
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Error => "error",
+        }
+    }
 }
 
 impl ForgeTaskMetricStrategy {
@@ -680,6 +738,31 @@ pub struct ForgeTelemetry {
     cleanup_duration: BTreeMap<ForgeCleanupKind, Histogram>,
     /// Scheduler pass duration retained by the injected production handle.
     scheduler_duration: Histogram,
+    /// Durable planning demands accepted, by the closed request source.
+    planning_demands: BTreeMap<&'static str, Counter>,
+    /// Completed scheduling passes by whether the pass was complete.
+    scheduling_passes: BTreeMap<&'static str, Counter>,
+    /// Durable tasks recorded terminal-unschedulable by the scheduler.
+    unschedulable_tasks: Counter,
+    /// Scheduling pass duration published by the scheduler itself.
+    scheduling_duration: Histogram,
+    /// Current durable planning backlog published on a complete pass.
+    planning_backlog: Gauge,
+    /// Age of the oldest durable planning demand on a complete pass.
+    oldest_planning_demand: Gauge,
+    /// Tasks this process currently holds an unsettled attempt for, by strategy.
+    active_tasks: BTreeMap<ForgeTaskMetricStrategy, Gauge>,
+    /// Objects the last complete orphan scan left unreclaimed.
+    orphan_backlog_objects: Gauge,
+    /// Durable lifecycle transitions by strategy, stage, and outcome.
+    lifecycle_events: BTreeMap<
+        (
+            ForgeTaskMetricStrategy,
+            ForgeLifecycleStage,
+            ForgeLifecycleOutcome,
+        ),
+        Counter,
+    >,
 }
 
 impl ForgeTelemetry {
@@ -759,6 +842,82 @@ impl ForgeTelemetry {
             conflicts: conflict_counters(),
             cleanup_duration: cleanup_histograms(),
             scheduler_duration: metrics::histogram!("bifrost_forge_scheduler_duration_seconds"),
+            planning_demands: labelled_counters(
+                "bifrost_forge_planning_demand_total",
+                "source",
+                &["hint", "periodic"],
+            ),
+            scheduling_passes: labelled_counters(
+                "bifrost_forge_scheduling_total",
+                "result",
+                &["complete", "incomplete"],
+            ),
+            unschedulable_tasks: metrics::counter!("bifrost_forge_unschedulable_total"),
+            scheduling_duration: metrics::histogram!("bifrost_forge_scheduling_duration_seconds"),
+            planning_backlog: metrics::gauge!("bifrost_forge_planning_backlog"),
+            oldest_planning_demand: metrics::gauge!("bifrost_forge_oldest_planning_demand_seconds"),
+            active_tasks: strategy_gauges("bifrost_forge_active_tasks"),
+            orphan_backlog_objects: metrics::gauge!("bifrost_forge_orphan_backlog_objects"),
+            lifecycle_events: lifecycle_event_counters(),
+        }
+    }
+
+    /// Records one accepted durable planning demand by its request source.
+    pub(super) fn record_planning_demand(&self, source: ForgePlanningDemandSource) {
+        self.planning_demands[&source.as_str()].increment(1);
+    }
+
+    /// Records one finished scheduling pass, its terminal count, and duration.
+    pub(super) fn record_scheduling_pass(
+        &self,
+        incomplete: bool,
+        unschedulable: usize,
+        elapsed: Duration,
+    ) {
+        self.scheduling_passes[&if incomplete { "incomplete" } else { "complete" }].increment(1);
+        self.unschedulable_tasks
+            .increment(unschedulable.to_u64().unwrap_or(u64::MAX));
+        self.scheduling_duration.record(elapsed.as_secs_f64());
+    }
+
+    /// Publishes the two complete-pass planning gauges.
+    ///
+    /// Both are published together and only on a complete pass, so a partial
+    /// pass never leaves one gauge fresh beside a stale sibling.
+    pub(super) fn record_planning_backlog(&self, backlog: f64, oldest_age: Duration) {
+        self.planning_backlog.set(backlog);
+        self.oldest_planning_demand.set(oldest_age.as_secs_f64());
+    }
+
+    /// Publishes the objects one complete orphan scan left unreclaimed.
+    pub(super) fn record_orphan_backlog(&self, objects: usize) {
+        self.orphan_backlog_objects
+            .set(objects.to_f64().unwrap_or(f64::MAX));
+    }
+
+    /// Records one durable lifecycle transition at its authoritative boundary.
+    pub(super) fn record_lifecycle_event(
+        &self,
+        strategy: ForgeTaskMetricStrategy,
+        stage: ForgeLifecycleStage,
+        outcome: ForgeLifecycleOutcome,
+    ) {
+        self.lifecycle_events[&(strategy, stage, outcome)].increment(1);
+    }
+
+    /// Opens one balanced active-task guard for the duration of an attempt.
+    ///
+    /// The gauge is incremented here and decremented exactly once when the
+    /// returned guard drops, so every task exit — success, failure, refusal,
+    /// cancellation, or panic unwind — balances the increment.
+    pub(super) fn active_task(
+        self: &Arc<Self>,
+        strategy: ForgeTaskMetricStrategy,
+    ) -> ForgeActiveTask {
+        self.active_tasks[&strategy].increment(1.0);
+        ForgeActiveTask {
+            telemetry: Arc::clone(self),
+            strategy,
         }
     }
 
@@ -858,6 +1017,14 @@ impl ForgeTelemetry {
         if outcome.partial {
             self.record_operation(ForgeMetricSource::Staging, ForgeOperationResult::Budget, 1);
         }
+        // A complete pass exhausted the prefix, so what it left behind is the
+        // real remaining backlog. A partial pass proves nothing about the
+        // remainder, so it publishes the work it could not finish instead.
+        self.record_orphan_backlog(if outcome.partial {
+            outcome.candidates.saturating_sub(outcome.deleted)
+        } else {
+            outcome.pending
+        });
     }
 
     /// Publish the complete scheduler-owned backlog and fairness state.
@@ -1158,6 +1325,77 @@ fn task_duration_histograms()
 }
 
 /// Register one histogram for every strategy accepted by the v1 worker.
+/// Balanced lifetime handle for one in-flight Forge task.
+///
+/// Held for exactly as long as this process owns an unsettled attempt. The
+/// decrement lives in `Drop` rather than on each exit path so no new terminal
+/// branch can leak the gauge.
+pub(super) struct ForgeActiveTask {
+    /// Registry the balanced decrement is applied to.
+    telemetry: Arc<ForgeTelemetry>,
+    /// Strategy label this guard incremented.
+    strategy: ForgeTaskMetricStrategy,
+}
+
+impl Drop for ForgeActiveTask {
+    fn drop(&mut self) {
+        self.telemetry.active_tasks[&self.strategy].decrement(1.0);
+    }
+}
+
+/// Registers one counter per closed value of a single-label family.
+fn labelled_counters(
+    name: &'static str,
+    label: &'static str,
+    values: &[&'static str],
+) -> BTreeMap<&'static str, Counter> {
+    values
+        .iter()
+        .map(|value| (*value, metrics::counter!(name, label => *value)))
+        .collect()
+}
+
+/// Registers one gauge per closed Forge strategy.
+fn strategy_gauges(name: &'static str) -> BTreeMap<ForgeTaskMetricStrategy, Gauge> {
+    ForgeTaskMetricStrategy::ALL
+        .into_iter()
+        .map(|strategy| {
+            (
+                strategy,
+                metrics::gauge!(name, "strategy" => strategy.as_str()),
+            )
+        })
+        .collect()
+}
+
+/// Registers every strategy, stage, and outcome of the lifecycle family.
+fn lifecycle_event_counters() -> BTreeMap<
+    (
+        ForgeTaskMetricStrategy,
+        ForgeLifecycleStage,
+        ForgeLifecycleOutcome,
+    ),
+    Counter,
+> {
+    let mut counters = BTreeMap::new();
+    for strategy in ForgeTaskMetricStrategy::ALL {
+        for stage in ForgeLifecycleStage::ALL {
+            for outcome in ForgeLifecycleOutcome::ALL {
+                counters.insert(
+                    (strategy, stage, outcome),
+                    metrics::counter!(
+                        "bifrost_forge_lifecycle_events_total",
+                        "strategy" => strategy.as_str(),
+                        "event" => stage.as_str(),
+                        "outcome" => outcome.as_str()
+                    ),
+                );
+            }
+        }
+    }
+    counters
+}
+
 fn strategy_histograms(name: &'static str) -> BTreeMap<ForgeTaskMetricStrategy, Histogram> {
     ForgeTaskMetricStrategy::ALL
         .into_iter()

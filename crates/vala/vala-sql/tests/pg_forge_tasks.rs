@@ -2143,7 +2143,8 @@ mod pg_tests {
                     |id| event("forge.task.unschedulable", id)
                 )
                 .await
-                .expect("successor ack"),
+                .expect("successor ack")
+                .len(),
             1
         );
         assert!(
@@ -2201,7 +2202,8 @@ mod pg_tests {
                     |id| event("forge.task.unschedulable", id)
                 )
                 .await
-                .expect("terminal ack"),
+                .expect("terminal ack")
+                .len(),
             1
         );
         let terminal_count: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.forge_tasks WHERE data_tenant_id=$1 AND table_name='demand' AND state='unschedulable'").bind(tenant.as_uuid()).fetch_one(&admin).await.expect("terminal count");
@@ -2523,14 +2525,15 @@ mod pg_tests {
             retained.data_tenant_id, first.data_tenant_id,
             "planning failure or cancellation without acknowledgement retains demand"
         );
-        let (backlog, oldest, overflowed) =
-            tasks.planning_status(1).await.expect("incomplete status");
-        assert_eq!(backlog, 1);
-        assert!(oldest.is_some());
-        assert!(
-            overflowed,
-            "two pending demands make a cap-one gauge pass incomplete"
+        let status = tasks
+            .planning_demand_status()
+            .await
+            .expect("authoritative demand status");
+        assert_eq!(
+            status.demands, 2,
+            "the demand snapshot counts every outstanding row, not one bounded page"
         );
+        assert!(status.oldest_requested_at.is_some());
         tasks
             .upsert_periodic(first.data_tenant_id, &first.table_ref)
             .await
@@ -2574,7 +2577,8 @@ mod pg_tests {
                     |id| event("forge.task.unschedulable", id),
                 )
                 .await
-                .expect("acknowledge current generation"),
+                .expect("acknowledge current generation")
+                .len(),
             0
         );
         let second = tasks
@@ -3307,7 +3311,8 @@ mod pg_tests {
                     |id| event("forge.task.unschedulable", id),
                 )
                 .await
-                .expect("enqueue cleanup"),
+                .expect("enqueue cleanup")
+                .len(),
             1
         );
         let cleanup_id: Uuid = sqlx::query_scalar(
@@ -4380,5 +4385,164 @@ mod pg_tests {
             "recovery claims no ordinary task and no evidence-free cleanup row"
         );
         let _ = (ordinary, bare);
+    }
+
+    /// The telemetry snapshot reports exact demand and exact pending work.
+    ///
+    /// Demand and pending tasks are two different populations: the demand
+    /// count is every unacknowledged row with its earliest request time, while
+    /// pending work counts only `ready` and `retryable` task rows per strategy
+    /// with their earliest `ready_at`. A claimed, running, prepared, or
+    /// terminal row is owned or finished and must not appear as queued work,
+    /// and a strategy with nothing pending must produce no row at all rather
+    /// than a stale one.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture, seeding, or either aggregate read fails, or
+    /// when a snapshot disagrees with the durable rows.
+    #[tokio::test]
+    async fn forge_telemetry_snapshot_reports_exact_demand_and_pending_work() {
+        let (fixture, admin) = setup().await;
+        let tasks = ForgeTasks::new(fixture.operator_pool().clone());
+        let tenant = fixture.data_tenant_id();
+
+        for table in ["demand-old", "demand-new", "demand-third"] {
+            let identity = ForgeTaskTableIdentity::new("wyrd-redux", "vala.bifrost", table)
+                .expect("demand identity");
+            tasks
+                .upsert_periodic(tenant, &identity)
+                .await
+                .expect("planning demand");
+        }
+        let oldest_demand = Utc::now() - Duration::hours(3);
+        sqlx::query(
+            "UPDATE vala.forge_planning_demands SET first_requested_at=$1 WHERE table_name='demand-old'",
+        )
+        .bind(oldest_demand)
+        .execute(&admin)
+        .await
+        .expect("age the oldest demand");
+
+        // Two pending rows per strategy for the three strategies that stay
+        // queued, plus one row each parked in every non-pending state.
+        let pending_strategies = [
+            ForgeTaskStrategy::SmallFiles,
+            ForgeTaskStrategy::SnapshotExpiry,
+            ForgeTaskStrategy::ScribePromotion,
+        ];
+        let oldest_ready = Utc::now() - Duration::hours(2);
+        let mut hash = 1_u8;
+        for (index, strategy) in pending_strategies.into_iter().enumerate() {
+            for suffix in ["ready", "retryable"] {
+                let table = format!("pending-{index}-{suffix}");
+                let seed = NewForgeTask {
+                    strategy,
+                    ..task(tenant, &table, ForgeTaskLane::Ordinary, hash)
+                };
+                hash += 1;
+                let task_id = tasks.enqueue(&seed).await.expect("pending seed");
+                sqlx::query("UPDATE vala.forge_tasks SET state=$1, ready_at=$2 WHERE task_id=$3")
+                    .bind(if suffix == "ready" {
+                        "ready"
+                    } else {
+                        "retryable"
+                    })
+                    .bind(if index == 0 && suffix == "ready" {
+                        oldest_ready
+                    } else {
+                        Utc::now()
+                    })
+                    .bind(task_id)
+                    .execute(&admin)
+                    .await
+                    .expect("park the pending row");
+            }
+        }
+        for (index, state) in [
+            "claimed",
+            "running",
+            "prepared",
+            "succeeded",
+            "failed",
+            "cancelled",
+            "unschedulable",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            // Parked under a strategy that is also pending, so an owned or
+            // finished row inflating its queue count fails here.
+            let seed = task(
+                tenant,
+                &format!("owned-{index}"),
+                ForgeTaskLane::Ordinary,
+                hash,
+            );
+            hash += 1;
+            let task_id = tasks.enqueue(&seed).await.expect("non-pending seed");
+            sqlx::query(
+                "UPDATE vala.forge_tasks SET state=$2,\
+                 claimed_by=CASE WHEN $2 IN ('claimed','running','prepared') THEN $3 END,\
+                 attempt_id=CASE WHEN $2 IN ('claimed','running','prepared') THEN $4 END,\
+                 claim_expires_at=CASE WHEN $2 IN ('claimed','running','prepared') \
+                     THEN statement_timestamp()+interval '10 minutes' END,\
+                 watermark_snapshot_id=CASE WHEN $2 IN ('running','prepared') THEN 41 END,\
+                 watermark_timestamp_ms=CASE WHEN $2 IN ('running','prepared') THEN 700 END,\
+                 evidence=CASE WHEN $2='prepared' \
+                     THEN '{\"version\":1,\"cleanup_candidates\":[],\"deleted_candidate_count\":0}'::jsonb END,\
+                 updated_at=statement_timestamp() WHERE task_id=$1",
+            )
+            .bind(task_id)
+            .bind(state)
+            .bind(Uuid::now_v7())
+            .bind(Uuid::now_v7())
+            .execute(&admin)
+            .await
+            .expect("park the non-pending row");
+        }
+
+        let demand = tasks
+            .planning_demand_status()
+            .await
+            .expect("demand snapshot");
+        assert_eq!(demand.demands, 3, "every unacknowledged demand row counts");
+        assert_eq!(
+            demand
+                .oldest_requested_at
+                .expect("an outstanding demand has a request time")
+                .timestamp(),
+            oldest_demand.timestamp(),
+            "the demand snapshot reports the stored earliest request, not an age"
+        );
+
+        let pending = tasks.pending_task_status().await.expect("pending snapshot");
+        assert_eq!(
+            pending
+                .iter()
+                .map(|status| status.strategy)
+                .collect::<std::collections::BTreeSet<_>>(),
+            pending_strategies.into_iter().collect(),
+            "only strategies with ready or retryable rows appear at all"
+        );
+        for status in &pending {
+            assert_eq!(
+                status.pending, 2,
+                "{:?} counts exactly its ready and retryable rows",
+                status.strategy
+            );
+        }
+        let small_files = pending
+            .iter()
+            .find(|status| status.strategy == ForgeTaskStrategy::SmallFiles)
+            .expect("the aged strategy is pending");
+        assert_eq!(
+            small_files
+                .oldest_ready_at
+                .expect("a pending row has a ready time")
+                .timestamp(),
+            oldest_ready.timestamp(),
+            "the pending snapshot reports the stored earliest ready_at, not an age"
+        );
     }
 }

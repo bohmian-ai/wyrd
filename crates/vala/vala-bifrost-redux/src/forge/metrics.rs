@@ -337,3 +337,220 @@ fn zeroed_task_type_gauges(name: &'static str) -> BTreeMap<ForgeTaskStrategy, Ga
 fn exact(value: u64) -> f64 {
     value.to_f64().unwrap_or(f64::MAX)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::*;
+
+    /// Every `reason` value Forge may publish, in durable class order.
+    const FAILURE_CLASSES: [ForgeFailureClass; 6] = [
+        ForgeFailureClass::DataRefusal,
+        ForgeFailureClass::TransientObjectStore,
+        ForgeFailureClass::TransientCoordination,
+        ForgeFailureClass::StorageHealth,
+        ForgeFailureClass::CapacityRefused,
+        ForgeFailureClass::InternalInvariant,
+    ];
+
+    /// Every `result` value Forge may publish, in outcome order.
+    const TASK_RESULTS: [ForgeTaskResult; 6] = [
+        ForgeTaskResult::Succeeded,
+        ForgeTaskResult::Retry,
+        ForgeTaskResult::Failed,
+        ForgeTaskResult::Cancelled,
+        ForgeTaskResult::Refused,
+        ForgeTaskResult::Uncertain,
+    ];
+
+    /// Split one recorded series key into its family and its label pairs.
+    fn parse_series(series: &str) -> (String, Vec<(String, String)>) {
+        let Some((family, tail)) = series.split_once('{') else {
+            return (series.to_owned(), Vec::new());
+        };
+        let labels = tail
+            .trim_end_matches('}')
+            .split(',')
+            .filter(|pair| !pair.is_empty())
+            .filter_map(|pair| pair.split_once('='))
+            .map(|(key, value)| (key.to_owned(), value.trim_matches('"').to_owned()))
+            .collect();
+        (family.to_owned(), labels)
+    }
+
+    /// Forge publishes exactly its approved, bounded, balanced catalog.
+    ///
+    /// The whole public surface is exercised through the real handle against a
+    /// local recorder, so this fails if a family is added, renamed, or dropped;
+    /// if a label key or value leaves its closed vocabulary; if an ownership
+    /// identity reaches a label; if construction pre-registers series no
+    /// production event can produce; or if an active-task guard leaks its
+    /// increment on an ordinary drop or a panic unwind.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the recorded catalog, labels, gauge zeroes, or active-task
+    /// balance differ from the approved contract.
+    #[test]
+    fn forge_telemetry_is_closed_bounded_and_balanced() {
+        let recorder = wyrd_bench::BenchmarkRecorder::default();
+        let registered = metrics::with_local_recorder(&recorder, || {
+            let telemetry = Arc::new(ForgeTelemetry::new());
+            let registered = recorder.snapshot();
+
+            for task_type in TASK_TYPES {
+                telemetry.record_task_created(task_type);
+                telemetry.record_input(task_type, 2, 2048);
+                telemetry.record_output(task_type, 1, 1024);
+                telemetry.record_deleted_objects(task_type, 1);
+            }
+            for result in TASK_RESULTS {
+                telemetry.record_task_attempt(
+                    ForgeTaskStrategy::SmallFiles,
+                    result,
+                    Duration::from_millis(5),
+                );
+            }
+            for reason in FAILURE_CLASSES {
+                telemetry.record_task_failure(ForgeTaskStrategy::SmallFiles, reason);
+            }
+            telemetry.record_snapshots_expired(3);
+            telemetry.publish_planning_status(4, 1_767_312_000);
+            telemetry.publish_pending_tasks(&[ForgePendingTasks {
+                task_type: ForgeTaskStrategy::SmallFiles,
+                count: 2,
+                oldest_ready_at_unix: 1_767_311_000,
+            }]);
+            telemetry.record_compaction_debt(9, 900);
+
+            drop(telemetry.active_task(ForgeTaskStrategy::SmallFiles));
+            let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _guard = telemetry.active_task(ForgeTaskStrategy::OrphanCleanup);
+                panic!("the attempt unwinds while it owns the gauge");
+            }));
+            assert!(unwound.is_err(), "the unwinding attempt really panicked");
+            registered
+        });
+
+        // Construction registers only the gauges, because a gauge must export
+        // zero before its first observation. A counter or histogram series here
+        // would be a label combination no production event ever produced.
+        assert!(
+            registered.counters.is_empty() && registered.histograms.is_empty(),
+            "construction pre-registered counter or histogram series: {registered:?}"
+        );
+        assert_eq!(
+            registered.gauges.len(),
+            4 + 3 * TASK_TYPES.len(),
+            "construction registers exactly the scalar and per-task-type gauges"
+        );
+        for (series, value) in &registered.gauges {
+            assert!(
+                value.abs() < f64::EPSILON,
+                "{series} did not export an explicit zero before first use"
+            );
+        }
+
+        let snapshot = recorder.snapshot();
+        let observed = snapshot
+            .counters
+            .keys()
+            .chain(snapshot.gauges.keys())
+            .chain(snapshot.histograms.keys())
+            .map(|series| parse_series(series).0)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            observed,
+            FORGE_METRIC_FAMILIES
+                .iter()
+                .map(|family| (*family).to_owned())
+                .collect::<BTreeSet<_>>(),
+            "Forge published a family outside the approved catalog"
+        );
+
+        let task_types = TASK_TYPES
+            .iter()
+            .map(|task_type| task_type.as_str())
+            .collect::<BTreeSet<_>>();
+        let results = TASK_RESULTS
+            .iter()
+            .map(|result| result.as_str())
+            .collect::<BTreeSet<_>>();
+        let reasons = FAILURE_CLASSES
+            .iter()
+            .map(|reason| reason.as_str())
+            .collect::<BTreeSet<_>>();
+        for series in snapshot
+            .counters
+            .keys()
+            .chain(snapshot.gauges.keys())
+            .chain(snapshot.histograms.keys())
+        {
+            for (key, value) in parse_series(series).1 {
+                let allowed = match key.as_str() {
+                    "task_type" => &task_types,
+                    "result" => &results,
+                    "reason" => &reasons,
+                    other => panic!("{series} carries the unapproved label key {other}"),
+                };
+                assert!(
+                    allowed.contains(value.as_str()),
+                    "{series} carries the unapproved {key} value {value}"
+                );
+            }
+            for forbidden in [
+                "tenant", "table", "task_id", "attempt", "snapshot", "path", "request",
+            ] {
+                assert!(
+                    !series.contains(&format!("{forbidden}=")),
+                    "{series} carries the ownership label {forbidden}"
+                );
+            }
+        }
+
+        // The guard's decrement lives in Drop, so both the ordinary exit and
+        // the unwind must have returned their increment.
+        for (series, value) in &snapshot.gauges {
+            if series.starts_with("bifrost_forge_active_tasks{") {
+                assert!(
+                    value.abs() < f64::EPSILON,
+                    "{series} retained {value} active attempts"
+                );
+            }
+        }
+    }
+
+    /// Operator documentation names exactly the families Forge publishes.
+    ///
+    /// A family added, renamed, or removed without its documented row would
+    /// otherwise reach operators as an undocumented series or a documented one
+    /// that never appears on a dashboard.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the documented family-name set differs from the catalog.
+    #[test]
+    fn forge_operator_documentation_matches_telemetry() {
+        const DOCUMENTATION: &str =
+            include_str!("../../../../../docs/src/content/docs/bifrost/forge.svx");
+
+        let documented = DOCUMENTATION
+            .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+            .filter(|word| word.starts_with("bifrost_forge_"))
+            .map(|word| {
+                // A PromQL example names the rendered histogram series, which
+                // Prometheus derives from the same family.
+                word.strip_suffix("_bucket").unwrap_or(word).to_owned()
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            documented,
+            FORGE_METRIC_FAMILIES
+                .iter()
+                .map(|family| (*family).to_owned())
+                .collect::<BTreeSet<_>>(),
+            "operator documentation and the published catalog disagree"
+        );
+    }
+}

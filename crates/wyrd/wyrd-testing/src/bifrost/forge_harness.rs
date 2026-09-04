@@ -182,6 +182,10 @@ pub struct CommitUncertaintyCatalog {
 pub(crate) struct CommitUncertaintyControls {
     /// Counts all delegated commit attempts across process-local wrappers.
     update_attempts: AtomicUsize,
+    /// Arms one injected failure before the next delegated table load.
+    fail_next_load_table: AtomicBool,
+    /// Counts delegated table loads reached while the load fault was armed.
+    load_table_calls: AtomicUsize,
     /// One-shot panic mode at the real catalog commit boundary.
     panic_mode: AtomicU8,
     /// Records that an armed catalog panic reached its production boundary.
@@ -301,6 +305,8 @@ impl CommitUncertaintyControls {
     pub(crate) fn new() -> Self {
         Self {
             update_attempts: AtomicUsize::new(0),
+            fail_next_load_table: AtomicBool::new(false),
+            load_table_calls: AtomicUsize::new(0),
             panic_mode: AtomicU8::new(0),
             panic_reached: AtomicBool::new(false),
             panic_ready: tokio::sync::Notify::new(),
@@ -327,6 +333,26 @@ impl CommitUncertaintyControls {
 }
 
 impl CommitUncertaintyCatalog {
+    /// Fail the next delegated table load exactly once.
+    ///
+    /// Recovery reloads the table a retained `Prepared` attempt named before it
+    /// can reconcile that evidence, so failing exactly one load is how a
+    /// scenario proves recovery stops at its catalog dependency instead of
+    /// settling on stale metadata. The arm is consumed by the call it fails, so
+    /// the next worker respawn recovers without further intervention.
+    pub fn fail_next_load_table(&self) {
+        self.controls.load_table_calls.store(0, Ordering::Release);
+        self.controls
+            .fail_next_load_table
+            .store(true, Ordering::Release);
+    }
+
+    /// Reports how many delegated table loads were reached since arming.
+    #[must_use]
+    pub fn load_table_calls(&self) -> usize {
+        self.controls.load_table_calls.load(Ordering::Acquire)
+    }
+
     /// Panic once immediately before the next delegated catalog commit.
     pub fn panic_before_next_commit(&self) {
         self.controls.panic_reached.store(false, Ordering::Release);
@@ -548,6 +574,19 @@ impl Catalog for CommitUncertaintyCatalog {
     }
 
     async fn load_table(&self, table: &TableIdent) -> iceberg::Result<Table> {
+        self.controls
+            .load_table_calls
+            .fetch_add(1, Ordering::AcqRel);
+        if self
+            .controls
+            .fail_next_load_table
+            .swap(false, Ordering::AcqRel)
+        {
+            return Err(iceberg::Error::new(
+                iceberg::ErrorKind::Unexpected,
+                "injected Forge catalog load failure",
+            ));
+        }
         self.inner.load_table(table).await
     }
 
@@ -821,6 +860,10 @@ pub struct ForgeObjectStoreControl {
     fail_output_put_armed: AtomicBool,
     /// Counts every wrapped object-store call made after fixture construction.
     object_io_calls: AtomicUsize,
+    /// Arms one injected failure before the next delegated read.
+    fail_next_read: AtomicBool,
+    /// Counts delegated reads reached since the read fault was armed.
+    read_calls: AtomicUsize,
     /// Retains the exact path observed by the most recent armed notification.
     last_output_path: Mutex<Option<String>>,
     /// One-shot arm flag for the next delegated object listing.
@@ -858,6 +901,39 @@ pub struct ForgeObjectStoreControl {
 }
 
 impl ForgeObjectStoreControl {
+    /// Fail the next delegated object read exactly once.
+    ///
+    /// A retained `Prepared` attempt reconciles from metadata it must reread,
+    /// so failing exactly one read is how a scenario proves recovery stops at
+    /// its object-store dependency rather than reconciling from nothing. The
+    /// arm is consumed by the call it fails, so the next respawn recovers.
+    pub fn fail_next_read(&self) {
+        self.read_calls.store(0, Ordering::Release);
+        self.fail_next_read.store(true, Ordering::Release);
+    }
+
+    /// Reports how many delegated reads were reached since arming.
+    #[must_use]
+    pub fn read_calls(&self) -> usize {
+        self.read_calls.load(Ordering::Acquire)
+    }
+
+    /// Consume one armed read failure, if the fixture armed it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an OpenDAL `Unexpected` error exactly once per arming.
+    fn take_read_failure(&self) -> opendal::Result<()> {
+        self.read_calls.fetch_add(1, Ordering::AcqRel);
+        if self.fail_next_read.swap(false, Ordering::AcqRel) {
+            return Err(opendal::Error::new(
+                opendal::ErrorKind::Unexpected,
+                "injected Forge object-store read failure",
+            ));
+        }
+        Ok(())
+    }
+
     /// Wrap the real staging operator used by a Forge context.
     #[must_use]
     pub fn new(inner: Arc<Operator>) -> Arc<Self> {
@@ -872,6 +948,8 @@ impl ForgeObjectStoreControl {
             fail_output_put_ordinal: AtomicUsize::new(0),
             fail_output_put_armed: AtomicBool::new(false),
             object_io_calls: AtomicUsize::new(0),
+            fail_next_read: AtomicBool::new(false),
+            read_calls: AtomicUsize::new(0),
             last_output_path: Mutex::new(None),
             pause_next_list: AtomicBool::new(false),
             list_returned: AtomicBool::new(false),
@@ -1092,11 +1170,13 @@ impl ForgeObjectStore for ForgeObjectStoreControl {
     /// requested range.
     async fn read_range(&self, path: &str, range: std::ops::Range<u64>) -> opendal::Result<Buffer> {
         self.object_io_calls.fetch_add(1, Ordering::AcqRel);
+        self.take_read_failure()?;
         self.inner.reader(path).await?.read(range).await
     }
 
     async fn read(&self, path: &str) -> opendal::Result<Buffer> {
         self.object_io_calls.fetch_add(1, Ordering::AcqRel);
+        self.take_read_failure()?;
         self.inner.read(path).await
     }
 

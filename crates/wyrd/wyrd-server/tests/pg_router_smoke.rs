@@ -1371,8 +1371,10 @@ async fn coordinator_partial_pass_is_not_ready() {
 ///
 /// Panics when the server cannot start.
 #[cfg(feature = "test-support")]
-async fn server_with_forge_observer()
--> (WyrdTestServer, vala_bifrost_redux::forge::ForgeWorkerCompletionObserver) {
+async fn server_with_forge_observer() -> (
+    WyrdTestServer,
+    vala_bifrost_redux::forge::ForgeWorkerCompletionObserver,
+) {
     let observer = vala_bifrost_redux::forge::ForgeWorkerCompletionObserver::new();
     let server = WyrdTestServer::builder()
         .with_forge_completion_observer_for_test(observer.clone())

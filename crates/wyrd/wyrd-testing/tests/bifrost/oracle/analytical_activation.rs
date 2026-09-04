@@ -17,18 +17,16 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 use futures_util::StreamExt as _;
+use vala_bifrost_redux::oracle::Oracle;
 use vala_bifrost_redux::oracle::analytical::{
     AnalyticalCleanupPause, AnalyticalLiveInspection, analytical_cleanup_pause_for_test,
-};
-use vala_bifrost_redux::oracle::{
-    AuthorizedQueryContext, Oracle, OracleQueryStream, QueryIpcDecoder,
 };
 use vala_sdk::{BifrostGrpcTransport, QueryClient};
 use wyrd_client::WyrdClient;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
-    BifrostQueryRequest, FreshnessPolicy, QueryExecutionPath, QueryStreamFrame, VisibilityMode,
+    BifrostQueryRequest, FreshnessPolicy, QueryExecutionPath, VisibilityMode,
 };
 use wyrd_testing::bifrost::{BifrostClusterSpec, WyrdTestCluster};
 
@@ -40,14 +38,6 @@ const FIXTURE_ROWS: i64 = 12;
 /// Distinct `filter_key` groups the fixture rows fall into.
 const FIXTURE_GROUPS: i64 = 3;
 
-/// What one drained production query settled to.
-struct Settled {
-    /// Total rows across every decoded Arrow batch.
-    rows: usize,
-    /// Execution path the server itself selected for this query.
-    path: QueryExecutionPath,
-}
-
 /// Builds one published-only strict request with the journey's deadline.
 fn request(sql: &str) -> BifrostQueryRequest {
     BifrostQueryRequest {
@@ -56,50 +46,6 @@ fn request(sql: &str) -> BifrostQueryRequest {
         freshness: FreshnessPolicy::Strict,
         deadline_ms: Some(30_000),
     }
-}
-
-/// Drains one already-opened Oracle stream to its terminal frame.
-///
-/// The terminal is required rather than optional: a stream that ended without
-/// one never settled whatever ownership it held, so its selected path would be
-/// a claim about an attempt that is still running.
-///
-/// # Errors
-///
-/// Returns a frame, decode, or missing-terminal error.
-async fn drain(mut stream: OracleQueryStream) -> Result<Settled, JourneyError> {
-    let mut decoder = QueryIpcDecoder::new();
-    let mut rows = 0_usize;
-    let mut terminal = None;
-    while let Some(frame) = stream.frames.next().await {
-        match frame? {
-            QueryStreamFrame::Schema(schema) => {
-                decoder.accept_schema(&schema.arrow_ipc_schema)?;
-            }
-            QueryStreamFrame::Batch(batch) => {
-                rows += decoder.accept_batch(&batch.arrow_ipc_batch)?.num_rows();
-            }
-            QueryStreamFrame::Terminal(frame) => terminal = Some(frame),
-        }
-    }
-    let terminal = terminal.ok_or("production query stream emitted no terminal frame")?;
-    Ok(Settled {
-        rows,
-        path: terminal.execution_path,
-    })
-}
-
-/// Runs one statement through the ordinary public leader entry.
-///
-/// # Errors
-///
-/// Returns any stable query error, or a drain failure.
-async fn run(
-    engine: &Oracle,
-    context: AuthorizedQueryContext,
-    sql: &str,
-) -> Result<Settled, JourneyError> {
-    drain(engine.query_sql(context, request(sql)).await?).await
 }
 
 /// Sends one Arrow IPC batch carrying a single fixture row.
@@ -160,135 +106,6 @@ async fn seed_table(cluster: &WyrdTestCluster, prefix: &str) -> Result<String, J
     ingest.flush_bifrost().await?;
     cluster.refresh_oracle_snapshots().await?;
     Ok(table)
-}
-
-/// Analytical selection happens only after a locally executable plan passes the
-/// unchanged support predicate and the pinned distributed build keeps an
-/// exchange; every earlier refusal stays Interactive and graphless.
-#[tokio::test]
-#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
-async fn analytical_selection_requires_supported_physical_exchange() {
-    prove_selection()
-        .await
-        .expect("production analytical selection journey");
-}
-
-/// Drives the complete selection matrix against one real cluster.
-///
-/// # Errors
-///
-/// Returns a cluster, execution, ownership, or assertion error.
-async fn prove_selection() -> Result<(), JourneyError> {
-    let cluster =
-        WyrdTestCluster::start_spec(BifrostClusterSpec::three_oracles_one_scribe()).await?;
-    let tenant = cluster.data_tenant_id();
-    let table = seed_table(&cluster, "analytical_selection").await?;
-    let empty = {
-        let ingest = cluster
-            .servers()
-            .find(|server| server.bifrost_scribe().is_some())
-            .ok_or("missing ingest node")?;
-        let name = unique_table("analytical_selection_empty");
-        register_table(ingest, tenant, &name).await?;
-        cluster.refresh_oracle_snapshots().await?;
-        name
-    };
-    let query_server = cluster.server(0).ok_or("missing query node")?;
-    let engine = Arc::clone(
-        query_server
-            .state()
-            .bifrost_query()
-            .ok_or("query node composed no Oracle")?
-            .engine(),
-    );
-
-    let grouped = format!(
-        "SELECT filter_key, COUNT(*) AS matched FROM vala.bifrost.{table} GROUP BY filter_key"
-    );
-
-    // A non-candidate never reaches selection at all.
-    let plain = run(
-        &engine,
-        query_context(tenant)?,
-        &format!("SELECT id FROM vala.bifrost.{table} WHERE filter_key = 'group_0'"),
-    )
-    .await?;
-    expect(
-        &plain,
-        QueryExecutionPath::Interactive,
-        usize::try_from(FIXTURE_ROWS / FIXTURE_GROUPS)?,
-        "non-candidate",
-    )?;
-    await_clean_nodes(&cluster).await?;
-
-    // A supported candidate whose distributed build refuses stays Interactive
-    // and consumes the armed refusal.
-    engine.fail_next_analytical_plan_for_test();
-    let refused = run(&engine, query_context(tenant)?, &grouped).await?;
-    expect(
-        &refused,
-        QueryExecutionPath::Interactive,
-        usize::try_from(FIXTURE_GROUPS)?,
-        "planner-refused candidate",
-    )?;
-    if engine.analytical_plan_failure_armed_for_test() {
-        return Err("supported candidate never reached the pinned distributed planner".into());
-    }
-    await_clean_nodes(&cluster).await?;
-
-    // A supported candidate with nothing scannable produces no exchange.
-    let no_exchange = run(
-        &engine,
-        query_context(tenant)?,
-        &format!(
-            "SELECT filter_key, COUNT(*) AS matched FROM vala.bifrost.{empty} GROUP BY filter_key"
-        ),
-    )
-    .await?;
-    expect(
-        &no_exchange,
-        QueryExecutionPath::Interactive,
-        0,
-        "no-exchange candidate",
-    )?;
-    await_clean_nodes(&cluster).await?;
-
-    // A surviving real exchange is the only thing that selects Analytical.
-    let selected = run(&engine, query_context(tenant)?, &grouped).await?;
-    expect(
-        &selected,
-        QueryExecutionPath::Analytical,
-        usize::try_from(FIXTURE_GROUPS)?,
-        "supported exchange",
-    )?;
-    await_clean_nodes(&cluster).await?;
-
-    cluster.shutdown().await?;
-    Ok(())
-}
-
-/// Asserts one settled query's selected path and exact row count.
-///
-/// # Errors
-///
-/// Returns a description naming the case, the expectation, and what was seen.
-fn expect(
-    settled: &Settled,
-    path: QueryExecutionPath,
-    rows: usize,
-    case: &str,
-) -> Result<(), JourneyError> {
-    if settled.path != path {
-        return Err(format!(
-            "{case}: expected {path:?} execution path, saw {:?}",
-            settled.path
-        )
-        .into());
-    }
-    if settled.rows != rows {
-        return Err(format!("{case}: expected {rows} rows, saw {}", settled.rows).into());
-    }
-    Ok(())
 }
 
 /// Bounded polls the journey waits for a retired public running entry.
@@ -665,6 +482,206 @@ async fn run_public(client: &WyrdClient, sql: &str) -> Result<PublicSettlement, 
     })
 }
 
+/// One immutable cut and one physical root decide the path, the remote capacity
+/// it uses, and every terminal failure — with no second build and no fallback.
+///
+/// # Panics
+///
+/// Panics when the single-planner routing journey cannot be driven to its
+/// claims.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn single_planner_root_selects_path_and_capacity() {
+    prove_single_planner_routing()
+        .await
+        .expect("single-planner routing journey");
+}
+
+/// Drives both root shapes and both terminal failures against one live topology.
+///
+/// The two failures are driven through the real public entry rather than an
+/// injector: a planning refusal is armed on the coordinator's own engine, and a
+/// stale source is produced by deleting one published Parquet object while its
+/// Iceberg metadata and manifests still reference it.
+///
+/// # Errors
+///
+/// Returns the first claim that broke.
+async fn prove_single_planner_routing() -> Result<(), JourneyError> {
+    let mut cluster = wyrd_testing::bifrost::process_cluster::BifrostProcessCluster::start(
+        NODE_BINARY,
+        &[
+            wyrd_testing::bifrost::process_cluster::ProcessNodeTarget::Oracle,
+            wyrd_testing::bifrost::process_cluster::ProcessNodeTarget::Oracle,
+            wyrd_testing::bifrost::process_cluster::ProcessNodeTarget::Oracle,
+            wyrd_testing::bifrost::process_cluster::ProcessNodeTarget::Scribe,
+        ],
+    )
+    .await?;
+    let api_key = cluster
+        .provision_public_api_key("single-planner-caller")
+        .await?;
+    let table = format!("single_planner_{}", uuid::Uuid::now_v7().simple());
+    cluster.nodes_mut()[PEER_SCRIBE].register_table(&table)?;
+    cluster.nodes_mut()[PEER_SCRIBE].ingest_rows(&table, 0, FIXTURE_ROWS, FIXTURE_GROUPS)?;
+    for index in [
+        COORDINATOR,
+        PEER_FOLLOWERS[0],
+        PEER_FOLLOWERS[1],
+        PEER_SCRIBE,
+    ] {
+        cluster.nodes_mut()[index].refresh_snapshot()?;
+    }
+
+    let baseline: Vec<_> = oracle_indices(&cluster)
+        .into_iter()
+        .map(|index| Ok((index, cluster.nodes_mut()[index].ownership_snapshot()?)))
+        .collect::<Result<_, JourneyError>>()?;
+    let polls_before: Vec<u64> = PEER_FOLLOWERS
+        .iter()
+        .map(|index| Ok(cluster.nodes_mut()[*index].peer_body_polls()?))
+        .collect::<Result<_, JourneyError>>()?;
+
+    let client = public_client(&cluster.nodes()[COORDINATOR], &api_key)?;
+    let scan_sql = format!("SELECT id FROM vala.bifrost.{table} WHERE filter_key = 'group_0'");
+    let grouped_sql = format!(
+        "SELECT filter_key, COUNT(*) AS matched FROM vala.bifrost.{table} \
+         GROUP BY filter_key ORDER BY filter_key"
+    );
+
+    // A normal root is entirely leader-executable and therefore Interactive.
+    let scan = run_public(&client, &scan_sql).await?;
+    expect_public(
+        &scan,
+        QueryExecutionPath::Interactive,
+        usize::try_from(FIXTURE_ROWS / FIXTURE_GROUPS)?,
+        "normal root",
+    )?;
+
+    // The grouped statement is the only one whose root is `DistributedExec`.
+    let grouped = run_public(&client, &grouped_sql).await?;
+    expect_public(
+        &grouped,
+        QueryExecutionPath::Analytical,
+        usize::try_from(FIXTURE_GROUPS)?,
+        "distributed root",
+    )?;
+
+    // Real remote stages, not a leader-local rewrite of a distributed plan.
+    for (offset, index) in PEER_FOLLOWERS.into_iter().enumerate() {
+        let polls = cluster.nodes_mut()[index].peer_body_polls()?;
+        if polls <= polls_before[offset] {
+            return Err(format!(
+                "follower {index} admitted no peer body: {polls} polls, was {}",
+                polls_before[offset]
+            )
+            .into());
+        }
+    }
+    for (index, before) in baseline.clone() {
+        await_baseline(&mut cluster, index, before).await?;
+    }
+
+    // One armed planning refusal settles the sole attempt: there is no second
+    // build to fall back to, so the caller sees a failure rather than rows.
+    cluster.nodes_mut()[COORDINATOR].arm_analytical_plan_failure()?;
+    if let Ok(settled) = run_public(&client, &grouped_sql).await {
+        return Err(format!(
+            "an armed planning refusal still settled {:?} with {} rows",
+            settled.path, settled.rows
+        )
+        .into());
+    }
+    for (index, before) in baseline.clone() {
+        await_baseline(&mut cluster, index, before).await?;
+    }
+
+    // A published object that no longer exists is terminal on the ordinary
+    // normal-root scan: the pinned snapshot still names it, so the leader must
+    // fail its one attempt rather than repin, replan, or rebuild.
+    let object = published_parquet(&cluster, &table)?;
+    cluster.remove_storage_object(&object)?;
+    if let Ok(settled) = run_public(&client, &scan_sql).await {
+        return Err(format!(
+            "a missing published object still settled {} rows",
+            settled.rows
+        )
+        .into());
+    }
+    for (index, before) in baseline {
+        await_baseline(&mut cluster, index, before).await?;
+    }
+
+    cluster.shutdown()?;
+    Ok(())
+}
+
+/// Returns one published Parquet data object of `table`, relative to the store.
+///
+/// Only files under a `data` directory are eligible, so the caller deletes a
+/// row-bearing object while every Iceberg metadata and manifest file the
+/// snapshot depends on stays intact.
+///
+/// # Errors
+///
+/// Returns a description when the store cannot be walked or holds no published
+/// data object for `table`.
+fn published_parquet(
+    cluster: &wyrd_testing::bifrost::process_cluster::BifrostProcessCluster,
+    table: &str,
+) -> Result<String, JourneyError> {
+    let root = cluster.storage_root().to_path_buf();
+    let mut pending = vec![root.clone()];
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(&directory)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            let relative = path.strip_prefix(&root)?.to_string_lossy().into_owned();
+            let is_data = std::path::Path::new(&relative)
+                .components()
+                .any(|component| component.as_os_str() == "data");
+            if is_data && relative.contains(table) && relative.ends_with(".parquet") {
+                return Ok(relative);
+            }
+        }
+    }
+    Err(format!("the object store published no data object for {table}").into())
+}
+
+/// Asserts one public settlement's selected path and exact row count.
+///
+/// # Errors
+///
+/// Returns a description naming the case, the expectation, and what was seen.
+fn expect_public(
+    settled: &PublicSettlement,
+    path: QueryExecutionPath,
+    rows: usize,
+    case: &str,
+) -> Result<(), JourneyError> {
+    if settled.path != path {
+        return Err(format!(
+            "{case}: expected {path:?} execution path, saw {:?}",
+            settled.path
+        )
+        .into());
+    }
+    if settled.rows != rows {
+        return Err(format!("{case}: expected {rows} rows, saw {}", settled.rows).into());
+    }
+    if settled.terminal_rows != u64::try_from(settled.rows)? {
+        return Err(format!(
+            "{case}: terminal row count {} disagrees with {} decoded rows",
+            settled.terminal_rows, settled.rows
+        )
+        .into());
+    }
+    Ok(())
+}
+
 /// A public UI query holds the Interactive floor while a public data-scientist
 /// query runs Analytical across real pods, and every pod returns to baseline.
 ///
@@ -734,7 +751,6 @@ async fn prove_public_activation() -> Result<(), JourneyError> {
         .into_iter()
         .map(|index| Ok((index, cluster.nodes_mut()[index].ownership_snapshot()?)))
         .collect::<Result<_, JourneyError>>()?;
-    let selections_before = selection_total(&mut cluster.nodes_mut()[COORDINATOR])?;
     let polls_before: Vec<u64> = PEER_FOLLOWERS
         .iter()
         .map(|index| Ok(cluster.nodes_mut()[*index].peer_body_polls()?))
@@ -834,14 +850,6 @@ async fn prove_public_activation() -> Result<(), JourneyError> {
         }
     }
 
-    let selections_after = selection_total(&mut cluster.nodes_mut()[COORDINATOR])?;
-    if selections_after <= selections_before {
-        return Err(format!(
-            "selection telemetry did not advance: {selections_after} totals, was {selections_before}"
-        )
-        .into());
-    }
-
     for (index, before) in baseline {
         await_baseline(&mut cluster, index, before).await?;
     }
@@ -862,20 +870,6 @@ fn oracle_indices(
         })
         .map(|(index, _)| index)
         .collect()
-}
-
-/// Totals one pod's bounded Analytical selection counter across every outcome.
-///
-/// # Errors
-///
-/// Returns the control-protocol error.
-fn selection_total(
-    node: &mut wyrd_testing::bifrost::process_cluster::ProcessNode,
-) -> Result<f64, JourneyError> {
-    Ok(node
-        .metric_totals(&["oracle_query_analytical_selection_total"])?
-        .values()
-        .sum())
 }
 
 /// Waits, bounded, until one pod's ownership returns to its recorded baseline.
@@ -907,84 +901,34 @@ async fn await_baseline(
 /// Panics when either half of the journey cannot be driven to its claims.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
-async fn fallback_is_preselection_only_and_failure_is_terminal() {
-    prove_preselection_fallback()
+async fn selected_peer_failure_is_terminal() {
+    prove_under_privileged_refusal()
         .await
-        .expect("pre-selection fallback journey");
+        .expect("under-privileged refusal journey");
     prove_selected_failure_is_terminal()
         .await
         .expect("selected Analytical terminal failure journey");
 }
 
-/// Both refusable candidates fall back Interactive, and an under-privileged
-/// caller is refused before any planning, peer, or source IO.
+/// An under-privileged caller is refused before any planning, peer, or source IO.
 ///
 /// # Errors
 ///
 /// Returns the first claim that broke.
-async fn prove_preselection_fallback() -> Result<(), JourneyError> {
+async fn prove_under_privileged_refusal() -> Result<(), JourneyError> {
     let cluster =
         WyrdTestCluster::start_spec(BifrostClusterSpec::three_oracles_one_scribe()).await?;
     let tenant = cluster.data_tenant_id();
-    let table = seed_table(&cluster, "preselection_fallback").await?;
-    let empty = {
-        let ingest = cluster
-            .servers()
-            .find(|server| server.bifrost_scribe().is_some())
-            .ok_or("missing ingest node")?;
-        let name = unique_table("preselection_fallback_empty");
-        register_table(ingest, tenant, &name).await?;
-        cluster.refresh_oracle_snapshots().await?;
-        name
-    };
+    let table = seed_table(&cluster, "under_privileged").await?;
     let query_server = cluster.server(0).ok_or("missing query node")?;
-    let engine = Arc::clone(
-        query_server
-            .state()
-            .bifrost_query()
-            .ok_or("query node composed no Oracle")?
-            .engine(),
-    );
-
     let grouped = format!(
         "SELECT filter_key, COUNT(*) AS matched FROM vala.bifrost.{table} GROUP BY filter_key"
     );
-    engine.fail_next_analytical_plan_for_test();
-    let refused = run(&engine, query_context(tenant)?, &grouped).await?;
-    expect(
-        &refused,
-        QueryExecutionPath::Interactive,
-        usize::try_from(FIXTURE_GROUPS)?,
-        "planner-refused candidate",
-    )?;
-    if !nodes_clean(&cluster)? {
-        return Err("a refused candidate registered a graph".into());
-    }
-    await_clean_nodes(&cluster).await?;
-
-    let no_exchange = run(
-        &engine,
-        query_context(tenant)?,
-        &format!(
-            "SELECT filter_key, COUNT(*) AS matched FROM vala.bifrost.{empty} GROUP BY filter_key"
-        ),
-    )
-    .await?;
-    expect(
-        &no_exchange,
-        QueryExecutionPath::Interactive,
-        0,
-        "no-exchange candidate",
-    )?;
-    if !nodes_clean(&cluster)? {
-        return Err("a no-exchange candidate registered a graph".into());
-    }
-    await_clean_nodes(&cluster).await?;
 
     // Denied before planning, peers, or sources: a caller holding no query
     // permission must leave the node exactly as it found it.
     let bootstrap = query_server
-        .bootstrap_service_in_tenant(tenant, "preselection-denied", &[])
+        .bootstrap_service_in_tenant(tenant, "under-privileged-denied", &[])
         .await?;
     let denied = client_from_bootstrap(query_server, bootstrap).await?;
     let error = QueryClient::new(&denied)

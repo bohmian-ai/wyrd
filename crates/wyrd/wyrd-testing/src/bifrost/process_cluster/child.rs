@@ -240,6 +240,15 @@ async fn serve() -> Result<(), ProcessClusterError> {
                     })?,
                 }
             }
+            ControlRequest::ArmAnalyticalPlanFailure => match oracle(&server) {
+                Ok(engine) => {
+                    engine.fail_next_analytical_plan_for_test();
+                    emit(&ControlResponse::PlanFailureArmed)?;
+                }
+                Err(error) => emit(&ControlResponse::Failed {
+                    detail: error.to_string(),
+                })?,
+            },
             ControlRequest::ArmExecutePause => match arm_execute_pause(&server) {
                 Ok(armed) => {
                     pause = Some(armed);

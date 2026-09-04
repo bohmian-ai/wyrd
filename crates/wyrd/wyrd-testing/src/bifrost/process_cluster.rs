@@ -221,6 +221,8 @@ pub enum ControlRequest {
     PeerProbe(PeerProbePlan),
     /// Report how many request bodies this child's peer plane has polled.
     PeerBodyPolls,
+    /// Arm the one-shot refusal of this child's next distributed physical build.
+    ArmAnalyticalPlanFailure,
     /// Arm the one-shot follower pause of the next authorized `ExecuteTask`.
     ArmExecutePause,
     /// Block until this child is holding an `ExecuteTask` at that pause.
@@ -440,6 +442,8 @@ pub enum ControlResponse {
         /// Non-secret gRPC status code name the destination returned.
         outcome: String,
     },
+    /// Answer to [`ControlRequest::ArmAnalyticalPlanFailure`].
+    PlanFailureArmed,
     /// Answer to [`ControlRequest::ArmExecutePause`].
     PauseArmed,
     /// Answer to [`ControlRequest::AwaitExecutePaused`].
@@ -1331,6 +1335,26 @@ impl ProcessNode {
         }
     }
 
+    /// Arms this child's one-shot refusal of its next distributed physical build.
+    ///
+    /// The refusal is consumed by the build itself, which is what lets a journey
+    /// prove that a planning failure settles the sole attempt rather than
+    /// falling back to a second build.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::request`], and
+    /// [`ProcessClusterError::Child`] when this child composes no Oracle.
+    pub fn arm_analytical_plan_failure(&mut self) -> Result<(), ProcessClusterError> {
+        match self.request(&ControlRequest::ArmAnalyticalPlanFailure)? {
+            ControlResponse::PlanFailureArmed => Ok(()),
+            ControlResponse::Failed { detail } => Err(ProcessClusterError::Child(detail)),
+            other => Err(ProcessClusterError::Protocol(format!(
+                "expected an armed plan failure, received {other:?}"
+            ))),
+        }
+    }
+
     /// Arms this child's one-shot follower `ExecuteTask` pause.
     ///
     /// # Errors
@@ -1754,6 +1778,16 @@ impl BifrostProcessCluster {
     #[must_use]
     pub fn fixture(&self) -> &PgFixture {
         &self.shared.fixture
+    }
+
+    /// Returns the shared local object-store root every child writes under.
+    ///
+    /// A journey needs it to find a published object by walking the store the
+    /// way an operator would, rather than reconstructing a layout the writer
+    /// owns.
+    #[must_use]
+    pub fn storage_root(&self) -> &Path {
+        self.shared.storage_root.path()
     }
 
     /// Deletes one object from the shared local object store.

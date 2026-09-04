@@ -693,7 +693,7 @@ impl ForgeTasks {
             });
         }
         let sql = format!(
-            "WITH candidate AS MATERIALIZED (SELECT task_id,data_tenant_id,lane,attempt_id FROM vala.forge_tasks c WHERE c.state='prepared' AND c.claim_expires_at<statement_timestamp() AND c.attempt_id IS NOT NULL AND (c.lane='ordinary' OR NOT EXISTS (SELECT 1 FROM vala.forge_tasks held WHERE held.claimed_by=$1 AND held.lane='large_singleton' AND held.state IN ('claimed','running','prepared') AND held.task_id<>c.task_id)) ORDER BY c.claim_expires_at,c.task_id FOR UPDATE SKIP LOCKED LIMIT 1), claimed AS (UPDATE vala.forge_tasks t SET claimed_by=$1,claim_expires_at=statement_timestamp()+($2*interval '1 second'),updated_at=statement_timestamp() FROM candidate c WHERE t.task_id=c.task_id RETURNING t.*) SELECT c.data_tenant_id AS execution_tenant_id,{CLAIM_TASK_PROJECTION} FROM claimed t JOIN candidate c USING(task_id)"
+            "WITH candidate AS MATERIALIZED (SELECT task_id,data_tenant_id,lane,attempt_id FROM vala.forge_tasks c WHERE c.state='prepared' AND (c.claim_expires_at<statement_timestamp() OR c.claimed_by=$1) AND c.attempt_id IS NOT NULL AND (c.lane='ordinary' OR NOT EXISTS (SELECT 1 FROM vala.forge_tasks held WHERE held.claimed_by=$1 AND held.lane='large_singleton' AND held.state IN ('claimed','running','prepared') AND held.task_id<>c.task_id)) ORDER BY c.claim_expires_at,c.task_id FOR UPDATE SKIP LOCKED LIMIT 1), claimed AS (UPDATE vala.forge_tasks t SET claimed_by=$1,claim_expires_at=statement_timestamp()+($2*interval '1 second'),updated_at=statement_timestamp() FROM candidate c WHERE t.task_id=c.task_id RETURNING t.*) SELECT c.data_tenant_id AS execution_tenant_id,{CLAIM_TASK_PROJECTION} FROM claimed t JOIN candidate c USING(task_id)"
         );
         let mut tx = self
             .operator_pool
@@ -710,6 +710,41 @@ impl ForgeTasks {
         let task = row.map(TryInto::try_into).transpose()?;
         tx.commit().await.map_err(SqlError::from)?;
         Ok(task)
+    }
+
+    /// Reports whether any durable recovery work remains before new claims.
+    ///
+    /// Forge worker readiness is recovery-gated: a worker must not advertise
+    /// itself while durable state from an earlier owner is still unresolved,
+    /// because a reader could observe a half-settled effect that nobody is
+    /// currently reconciling. Three kinds of residue count as unresolved: an
+    /// attempt whose claim lease lapsed in any pre-terminal state — an expired
+    /// cleanup cursor among them — and a Prepared attempt this owner already
+    /// holds and has not reconciled. A live claim held by another owner is
+    /// deliberately not recovery work: that worker is making progress and must
+    /// not block this one's readiness. Ready or retryable work is likewise not
+    /// recovery: it is ordinary demand this worker's slots will claim once they
+    /// start, so waiting on it here would never terminate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqlError`] when the cross-tenant operator pool or the
+    /// predicate query fails.
+    ///
+    /// # Cancellation
+    ///
+    /// The single read has no side effects, so cancellation loses only the
+    /// answer and the caller simply stays unready for one more iteration.
+    pub async fn has_recoverable_work(&self, owner: Uuid) -> Result<bool, SqlError> {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM vala.forge_tasks t WHERE \
+             (t.state IN ('claimed','running','prepared') AND t.claim_expires_at<statement_timestamp()) \
+             OR (t.state='prepared' AND t.claimed_by=$1))",
+        )
+        .bind(owner)
+        .fetch_one(self.operator_pool.pool())
+        .await
+        .map_err(SqlError::from)
     }
 
     /// Moves an exact owned claim to Running and installs its paired watermark.

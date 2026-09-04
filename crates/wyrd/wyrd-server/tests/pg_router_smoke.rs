@@ -325,6 +325,8 @@ async fn readyz_returns_ok_when_all_probes_pass() {
         storage: ok_probe.clone(),
         scribe: ok_probe.clone(),
         oracle: ok_probe,
+        forge_coordinator: None,
+        forge_worker: None,
     }));
 
     let response = server

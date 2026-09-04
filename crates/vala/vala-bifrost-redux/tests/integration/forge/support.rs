@@ -33,7 +33,7 @@ use vala_bifrost_redux::catalog::{
 };
 use vala_bifrost_redux::forge::{
     Forge, ForgeBuildConfig, ForgeClock, ForgeClockControl, ForgeConfig, ForgeError,
-    ForgeObjectStore, ForgeSchedulerTrigger, ForgeTelemetry, ForgeWorker,
+    ForgeObjectStore, ForgeRoleReadiness, ForgeSchedulerTrigger, ForgeTelemetry, ForgeWorker,
     ForgeWorkerCompletionObserver, ForgeWorkerConfig,
 };
 use vala_bifrost_redux::maintenance::staging_file_channel;
@@ -1389,11 +1389,11 @@ impl SupervisedPromotion {
         let scheduler_task = tokio::spawn({
             let forge = Arc::clone(&forge);
             let stop = scheduler_stop.clone();
-            async move { forge.run(stop).await }
+            async move { forge.run(stop, ForgeRoleReadiness::detached()).await }
         });
         let worker_task = tokio::spawn({
             let stop = worker_stop.clone();
-            async move { worker.run(stop).await }
+            async move { worker.run(stop, ForgeRoleReadiness::detached()).await }
         });
         Self {
             scheduler_trigger,
@@ -1479,7 +1479,9 @@ impl SupervisedPromotion {
         )
         .expect("fixture Forge worker");
         let stop = self.worker_stop.clone();
-        self.worker_task = Some(tokio::spawn(async move { worker.run(stop).await }));
+        self.worker_task = Some(tokio::spawn(async move {
+            worker.run(stop, ForgeRoleReadiness::detached()).await
+        }));
         self.worker_armed = false;
     }
 

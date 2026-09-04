@@ -103,6 +103,18 @@ impl ForgeSchedulerTrigger {
     }
 }
 
+/// Clears one Forge role's readiness when its supervised loop stops.
+///
+/// Every exit — clean shutdown, construction failure, or an unwind — runs the
+/// same clear, so no path can leave a stopped role advertising itself.
+struct ForgeReadinessGuard(super::ForgeRoleReadiness);
+
+impl Drop for ForgeReadinessGuard {
+    fn drop(&mut self) {
+        self.0.publish(false);
+    }
+}
+
 impl Forge {
     /// Runs durable hint ingestion and periodic planning until cancellation.
     ///
@@ -120,8 +132,15 @@ impl Forge {
     /// scheduling passes. A cancelled hint write remains absent or committed
     /// according to the database transaction boundary and is safe to recreate
     /// from the durable staging-file roster on a later pass.
-    pub async fn run(&self, shutdown: CancellationToken) -> Result<(), ForgeError> {
+    pub async fn run(
+        &self,
+        shutdown: CancellationToken,
+        readiness: super::ForgeRoleReadiness,
+    ) -> Result<(), ForgeError> {
         let _guard = self.acquire_run_guard()?;
+        // Cleared whenever this loop stops for any reason, so routing closes
+        // before the process finishes draining rather than after.
+        let _readiness = ForgeReadinessGuard(readiness.clone());
         #[cfg(feature = "test-support")]
         let scheduler = match self
             .core
@@ -154,12 +173,12 @@ impl Forge {
                     None => hints_open = false,
                 },
                 _ = ticker.tick() => {
-                    if !self.run_planning_pass(&scheduler, &shutdown, false).await {
+                    if !self.run_planning_pass(&scheduler, &shutdown, false, &readiness).await {
                         return Ok(());
                     }
                 },
                 () = self.await_triggered_pass() => {
-                    if !self.run_planning_pass(&scheduler, &shutdown, true).await {
+                    if !self.run_planning_pass(&scheduler, &shutdown, true, &readiness).await {
                         return Ok(());
                     }
                 },
@@ -214,6 +233,7 @@ impl Forge {
         scheduler: &ForgeScheduler<'_>,
         shutdown: &CancellationToken,
         triggered: bool,
+        readiness: &super::ForgeRoleReadiness,
     ) -> bool {
         let started = Instant::now();
         let pass_span = tracing::info_span!(
@@ -245,6 +265,9 @@ impl Forge {
                         .telemetry
                         .record_lease(ForgeLeaseResult::Contention);
                     tracing::debug!(triggered, "Forge scheduler remains on standby");
+                    // A standby pass still proved durable and lease access, so
+                    // this replica is a usable coordinator even without the fence.
+                    readiness.publish(true);
                     self.record_completed_pass();
                     return true;
                 }
@@ -255,10 +278,14 @@ impl Forge {
                     triggered,
                     "Forge scheduling pass completed"
                 );
+                readiness.publish(true);
             }
             Err(error) => {
                 pass_span.record("result", "failed");
                 tracing::error!(error = %error, triggered, "Forge scheduling pass failed");
+                // Cleared before the next claim or pass, so a coordinator whose
+                // dependency failed stops being routed to immediately.
+                readiness.publish(false);
             }
         }
         self.record_completed_pass();

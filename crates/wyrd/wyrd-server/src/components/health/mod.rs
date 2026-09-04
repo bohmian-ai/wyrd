@@ -51,6 +51,10 @@ pub enum ProbeReason {
     ScribeRecovery,
     /// Oracle role registration, coordination, or worker startup has not completed.
     OracleStartup,
+    /// The selected Forge coordinator has not completed a scheduling pass.
+    ForgeCoordinatorUnavailable,
+    /// The selected Forge worker has not finished durable recovery.
+    ForgeWorkerUnavailable,
 }
 
 /// Snapshot published by the background readiness_loop task.
@@ -64,6 +68,10 @@ pub struct ReadinessSnapshot {
     pub scribe: ProbeOutcome,
     /// Oracle registration and query-path readiness result.
     pub oracle: ProbeOutcome,
+    /// Forge coordinator readiness, present only when that role is selected.
+    pub forge_coordinator: Option<ProbeOutcome>,
+    /// Forge worker readiness, present only when that role is selected.
+    pub forge_worker: Option<ProbeOutcome>,
 }
 
 /// Per-dependency probe result.
@@ -100,13 +108,23 @@ impl ReadinessSnapshot {
                 reason: ProbeReason::Warmup,
                 elapsed_ms: 0,
             },
+            // Absent until a tick observes which Forge roles this target
+            // selected, so a non-Forge target's report never grows a check it
+            // can never satisfy.
+            forge_coordinator: None,
+            forge_worker: None,
         }
     }
 
     /// True when all probes passed in the most recent tick.
     #[must_use]
     pub fn all_ok(&self) -> bool {
-        self.postgres.ok && self.storage.ok && self.scribe.ok && self.oracle.ok
+        self.postgres.ok
+            && self.storage.ok
+            && self.scribe.ok
+            && self.oracle.ok
+            && self.forge_coordinator.as_ref().is_none_or(|probe| probe.ok)
+            && self.forge_worker.as_ref().is_none_or(|probe| probe.ok)
     }
 }
 
@@ -138,6 +156,51 @@ async fn compute_snapshot(state: &AppState, probe_timeout: Duration) -> Readines
         storage,
         scribe: probe_scribe(state),
         oracle: probe_oracle(state),
+        forge_coordinator: probe_forge_coordinator(state),
+        forge_worker: probe_forge_worker(state),
+    }
+}
+
+/// Reads the Forge coordinator bit the supervised planning loop publishes.
+///
+/// Returns `None` when this target did not select the role, so an unselected
+/// role contributes no check rather than a vacuously passing one.
+fn probe_forge_coordinator(state: &AppState) -> Option<ProbeOutcome> {
+    let forge = state.bifrost.forge()?;
+    forge.coordinator()?;
+    let ready = forge.coordinator_readiness().is_ready();
+    metrics::gauge!("bifrost_role_ready", "role" => "forge_coordinator").set(if ready {
+        1.0
+    } else {
+        0.0
+    });
+    Some(role_outcome(
+        ready,
+        ProbeReason::ForgeCoordinatorUnavailable,
+    ))
+}
+
+/// Reads the Forge worker bit its recovery-gated loop publishes.
+///
+/// Returns `None` when this target did not select the role.
+fn probe_forge_worker(state: &AppState) -> Option<ProbeOutcome> {
+    let forge = state.bifrost.forge()?;
+    forge.worker()?;
+    let ready = forge.worker_readiness().is_ready();
+    metrics::gauge!("bifrost_role_ready", "role" => "forge_worker").set(if ready {
+        1.0
+    } else {
+        0.0
+    });
+    Some(role_outcome(ready, ProbeReason::ForgeWorkerUnavailable))
+}
+
+/// Builds one probe outcome from a published role bit and its unready reason.
+fn role_outcome(ready: bool, unavailable: ProbeReason) -> ProbeOutcome {
+    ProbeOutcome {
+        ok: ready,
+        reason: if ready { ProbeReason::Ok } else { unavailable },
+        elapsed_ms: 0,
     }
 }
 
@@ -330,6 +393,10 @@ struct PublicChecks {
     storage: PublicProbeOutcome,
     scribe: PublicProbeOutcome,
     oracle: PublicProbeOutcome,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    forge_coordinator: Option<PublicProbeOutcome>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    forge_worker: Option<PublicProbeOutcome>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -354,6 +421,17 @@ impl PublicReadinessReport {
                 oracle: PublicProbeOutcome {
                     reason: snapshot.oracle.reason,
                 },
+                forge_coordinator: snapshot.forge_coordinator.as_ref().map(|probe| {
+                    PublicProbeOutcome {
+                        reason: probe.reason,
+                    }
+                }),
+                forge_worker: snapshot
+                    .forge_worker
+                    .as_ref()
+                    .map(|probe| PublicProbeOutcome {
+                        reason: probe.reason,
+                    }),
             },
         }
     }
@@ -377,7 +455,7 @@ pub async fn readyz(State(state): State<AppState>) -> Response {
 
 impl wyrd_tonic::health::HealthSnapshot for ReadinessSnapshot {
     fn all_ok(&self) -> bool {
-        self.postgres.ok && self.storage.ok && self.scribe.ok && self.oracle.ok
+        Self::all_ok(self)
     }
 }
 
@@ -407,6 +485,8 @@ mod tests {
                 reason: ProbeReason::Ok,
                 elapsed_ms: 1,
             },
+            forge_coordinator: None,
+            forge_worker: None,
         }
     }
 
@@ -432,6 +512,8 @@ mod tests {
                 reason: ProbeReason::Ok,
                 elapsed_ms: 1,
             },
+            forge_coordinator: None,
+            forge_worker: None,
         }
     }
 

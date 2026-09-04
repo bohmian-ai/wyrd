@@ -11,8 +11,8 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::catalog::TenantTableBinding;
 use vala_bifrost_redux::forge::{
-    ForgeError, ForgeSchedulerTrigger, ForgeWorker, ForgeWorkerCompletionObserver,
-    ForgeWorkerConfig,
+    ForgeError, ForgeRoleReadiness, ForgeSchedulerTrigger, ForgeWorker,
+    ForgeWorkerCompletionObserver, ForgeWorkerConfig,
 };
 use wyrd_server::BifrostTarget;
 use wyrd_testing::WyrdTestServer;
@@ -115,11 +115,11 @@ impl SupervisedForge {
         let scheduler_task = tokio::spawn({
             let forge = Arc::clone(&forge);
             let stop = scheduler_stop.clone();
-            async move { forge.run(stop).await }
+            async move { forge.run(stop, ForgeRoleReadiness::detached()).await }
         });
         let worker_task = tokio::spawn({
             let stop = worker_stop.clone();
-            async move { worker.run(stop).await }
+            async move { worker.run(stop, ForgeRoleReadiness::detached()).await }
         });
         Self {
             operator_pool: fixture.operator_pool.clone(),

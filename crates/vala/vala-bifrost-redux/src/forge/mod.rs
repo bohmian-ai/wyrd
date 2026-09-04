@@ -69,6 +69,39 @@ pub use orphan_gc::{OrphanGcReport, current_gc_gate_for_test};
 #[cfg(feature = "test-support")]
 pub use worker::ForgeRewriteEvidenceRecord;
 
+/// One process-owned readiness bit for a selected Forge role.
+///
+/// The server owns the bit and publishes it on `/readyz`; the Vala owner that
+/// actually performs the role's work sets it. Keeping it a shared handle rather
+/// than a return value means readiness reflects the loop's current state, not
+/// the last value the server happened to poll. Cleared before, never after, the
+/// failure that makes the role unusable, so routing closes ahead of authority
+/// loss.
+#[derive(Debug, Clone, Default)]
+pub struct ForgeRoleReadiness(Arc<AtomicBool>);
+
+impl ForgeRoleReadiness {
+    /// Creates a readiness bit no health surface observes.
+    ///
+    /// Used by fixtures and by any caller driving a Forge loop outside the
+    /// server, so the loops need no optional readiness parameter.
+    #[must_use]
+    pub fn detached() -> Self {
+        Self::default()
+    }
+
+    /// Publishes this role's current readiness.
+    pub fn publish(&self, ready: bool) {
+        self.0.store(ready, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Reads the currently published readiness.
+    #[must_use]
+    pub fn is_ready(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
 /// Construction-time dependency graph for one Forge maintenance handle.
 pub struct ForgeBuildConfig {
     /// Narrow Forge capability issued by the one production composition.

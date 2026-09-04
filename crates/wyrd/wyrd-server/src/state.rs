@@ -1290,6 +1290,10 @@ pub struct Forge {
     node_id: wyrd_spec::vala::api::NodeId,
     /// Set only after every supervised Forge task joins before the process deadline.
     supervision_drained: Arc<AtomicBool>,
+    /// Coordinator readiness published by the supervised planning loop.
+    coordinator_ready: vala_bifrost_redux::forge::ForgeRoleReadiness,
+    /// Worker readiness published only after durable recovery completes.
+    worker_ready: vala_bifrost_redux::forge::ForgeRoleReadiness,
 }
 
 impl Forge {
@@ -1309,7 +1313,21 @@ impl Forge {
             shutdown,
             node_id,
             supervision_drained: Arc::new(AtomicBool::new(false)),
+            coordinator_ready: vala_bifrost_redux::forge::ForgeRoleReadiness::detached(),
+            worker_ready: vala_bifrost_redux::forge::ForgeRoleReadiness::detached(),
         }
+    }
+
+    /// Returns the handle the supervised coordinator loop publishes into.
+    #[must_use]
+    pub fn coordinator_readiness(&self) -> vala_bifrost_redux::forge::ForgeRoleReadiness {
+        self.coordinator_ready.clone()
+    }
+
+    /// Returns the handle the supervised worker loop publishes into.
+    #[must_use]
+    pub fn worker_readiness(&self) -> vala_bifrost_redux::forge::ForgeRoleReadiness {
+        self.worker_ready.clone()
     }
 
     /// Borrows the selected coordinator.

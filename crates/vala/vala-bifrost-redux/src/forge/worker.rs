@@ -1188,7 +1188,14 @@ impl ForgeWorker {
     /// # Errors
     ///
     /// Returns a slot panic or an unexpected slot-level configuration failure.
-    pub async fn run(self, shutdown: CancellationToken) -> Result<(), ForgeError> {
+    pub async fn run(
+        self,
+        shutdown: CancellationToken,
+        readiness: super::ForgeRoleReadiness,
+    ) -> Result<(), ForgeError> {
+        // Cleared on every exit, so a worker that stopped — cleanly, by
+        // quarantine, or by a slot failure — never keeps advertising itself.
+        let _readiness = ForgeWorkerReadinessGuard(readiness.clone());
         let volume = self.scratch_volume_identity()?;
         if let Err(error) = self.probe_scratch() {
             self.tasks
@@ -1210,6 +1217,14 @@ impl ForgeWorker {
             slots = self.config.worker_concurrency,
             "Forge worker started"
         );
+        // Readiness is recovery-gated. A Prepared attempt or a lapsed claim is
+        // durable evidence a reader can already observe, so this worker
+        // resolves all of it before advertising itself and taking new work.
+        self.drain_recoverable_work(&shutdown).await?;
+        if shutdown.is_cancelled() {
+            return Ok(());
+        }
+        readiness.publish(true);
         let mut slots = JoinSet::new();
         // One child token shared by every slot. A slot that can no longer prove
         // what it did to durable state must not let its siblings take another
@@ -1248,12 +1263,51 @@ impl ForgeWorker {
             }
         }
         if let Some(error) = first_error {
+            // Cleared before the error propagates, so routing closes ahead of
+            // the supervisor observing the failure.
+            readiness.publish(false);
             tracing::error!(worker = %self.owner, error = %error, "Forge worker stopped after a slot could not settle its work");
             return Err(error);
         }
         // Pairs with the start event so an operator can tell a worker that
         // drained cleanly from one that vanished.
         tracing::info!(worker = %self.owner, "Forge worker stopped");
+        Ok(())
+    }
+
+    /// Resolves every durable attempt left unsettled before this worker starts.
+    ///
+    /// Reclaims lapsed claims and reconciles Prepared attempts until the durable
+    /// predicate reports nothing recoverable. Ready and retryable demand is not
+    /// recovery — the slots claim it once they start — so this terminates.
+    ///
+    /// # Errors
+    ///
+    /// Returns the SQL, reconciliation, settlement, audit, or scratch failures
+    /// recovery itself raises. Each leaves durable state this owner cannot
+    /// account for, so the worker must not become ready.
+    ///
+    /// # Cancellation
+    ///
+    /// Cancellation returns early with recovery incomplete and readiness
+    /// unpublished, leaving the remaining attempts for a later owner.
+    async fn drain_recoverable_work(&self, shutdown: &CancellationToken) -> Result<(), ForgeError> {
+        let claim_limits = self.claim_limits()?;
+        while !shutdown.is_cancelled() {
+            self.reclaim_expired_attempts(claim_limits.max_active_per_tenant)
+                .await?;
+            if self.reconcile_one_prepared(claim_limits, shutdown).await? {
+                continue;
+            }
+            if !self
+                .tasks
+                .has_recoverable_work(self.owner)
+                .await
+                .map_err(ForgeError::Sql)?
+            {
+                return Ok(());
+            }
+        }
         Ok(())
     }
 
@@ -5810,6 +5864,18 @@ fn task_progress_effect(
             .get("trigger_commit_count")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0),
+    }
+}
+
+/// Clears the Forge worker readiness bit when its supervised loop stops.
+///
+/// Held for the whole `run` body so quarantine, registration failure, a slot
+/// failure, and an unwind all clear readiness on the same path.
+struct ForgeWorkerReadinessGuard(super::ForgeRoleReadiness);
+
+impl Drop for ForgeWorkerReadinessGuard {
+    fn drop(&mut self) {
+        self.0.publish(false);
     }
 }
 

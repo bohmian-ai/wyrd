@@ -1128,15 +1128,23 @@ pub fn spawn_forge_worker(
     + 'static,
     ServerBootError,
 > {
-    let worker = state
+    let forge = state
         .bifrost
         .forge()
-        .and_then(Forge::worker)
-        .cloned()
         .ok_or_else(|| ServerBootError::ForgeSchedulerRequired {
             detail: "Bifrost target has no retained Forge worker".to_owned(),
         })?;
-    Ok(async move { worker.as_ref().clone().run(shutdown).await })
+    let worker =
+        forge
+            .worker()
+            .cloned()
+            .ok_or_else(|| ServerBootError::ForgeSchedulerRequired {
+                detail: "Bifrost target has no retained Forge worker".to_owned(),
+            })?;
+    // The readiness handle is the state's, so `/readyz` observes the loop's
+    // current bit rather than a value copied at boot.
+    let readiness = forge.worker_readiness();
+    Ok(async move { worker.as_ref().clone().run(shutdown, readiness).await })
 }
 
 /// One booted server state paired with the coordination-runtime owner it needs.
@@ -2151,7 +2159,12 @@ pub fn spawn_maintenance_scheduler(
     let Some(forge) = state.forge_handle().cloned() else {
         return Ok(None);
     };
-    Ok(Some(async move { forge.run(shutdown).await }))
+    let readiness = state
+        .bifrost
+        .forge()
+        .map(Forge::coordinator_readiness)
+        .unwrap_or_default();
+    Ok(Some(async move { forge.run(shutdown, readiness).await }))
 }
 
 #[cfg(test)]

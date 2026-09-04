@@ -11064,6 +11064,7 @@ dependencies = [
 name = "wyrd-mcp"
 version = "0.0.1"
 dependencies = [
+ "arrow",
  "chrono",
  "futures-util",
  "http 1.5.0",
@@ -11075,6 +11076,7 @@ dependencies = [
  "sse-stream",
  "tokio",
  "uuid",
+ "vala-bifrost-redux",
  "wyrd-client",
  "wyrd-runtime",
  "wyrd-server",

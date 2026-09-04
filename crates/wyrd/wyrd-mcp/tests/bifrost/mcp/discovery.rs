@@ -1,0 +1,275 @@
+//! Tier-1 journey: an agent discovers Bifrost through the real `/mcp` endpoint.
+//!
+//! Discovery is the half of the contract that decides what an agent can even
+//! attempt: the advertised catalog, the compact table list its own tenant
+//! authorizes, and the physical description it needs to write bounded SQL
+//! without a second lookup. The journey drives all three through a real `rmcp`
+//! client so what it observes is what an agent observes.
+
+use crate::connectivity::{McpJourneyError, discover, transport};
+
+mod pg_tests {
+    use super::{McpJourneyError, discover, transport};
+
+    use rmcp::ClientServiceExt as _;
+    use rmcp::model::CallToolRequestParams;
+    use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef};
+    use vala_bifrost_redux::namespaces::BifrostNamespace;
+    use wyrd_client::transport::credential::ResolvedCredential;
+    use wyrd_testing::WyrdTestServer;
+    use wyrd_testing::bifrost::seed_query_fixture;
+
+    /// The exact catalog an ordinary Wyrd server advertises over `/mcp`.
+    const BIFROST_TOOLS: [&str; 3] = [
+        "bifrost.list_tables",
+        "bifrost.describe_table",
+        "bifrost.query",
+    ];
+
+    /// Read one tool call's structured content, failing on a tool-level error.
+    ///
+    /// # Errors
+    ///
+    /// Returns the structured Wyrd problem when the call reported `is_error`,
+    /// and a description when it carried no structured content at all.
+    fn structured(
+        result: rmcp::model::CallToolResult,
+    ) -> Result<serde_json::Value, McpJourneyError> {
+        let content = result
+            .structured_content
+            .ok_or("a Bifrost tool returns structured content")?;
+        if result.is_error == Some(true) {
+            return Err(format!("tool call failed: {content}").into());
+        }
+        Ok(content)
+    }
+
+    /// Read the canonical Wyrd problem from a call that must have failed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a description when the call succeeded or carried no problem.
+    fn problem(result: rmcp::model::CallToolResult) -> Result<serde_json::Value, McpJourneyError> {
+        let content = result
+            .structured_content
+            .ok_or("a failed Bifrost tool returns its structured problem")?;
+        if result.is_error != Some(true) {
+            return Err(format!("tool call unexpectedly succeeded: {content}").into());
+        }
+        Ok(content)
+    }
+
+    /// An agent sees exactly three tools, only its own tenant's tables, and the
+    /// complete physical layout of the one it selects.
+    ///
+    /// The two tenants are what make the list assertion a tenancy claim rather
+    /// than a formatting one: both tables exist in the same catalog, and only
+    /// the caller's own is nameable — by listing, by describing, and by the
+    /// error a foreign name produces, which is the same not-found the absent
+    /// name produces so nothing leaks across the boundary.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the Postgres-backed Bifrost journey lane"]
+    async fn agent_discovers_only_authorized_tables_and_layout() -> Result<(), McpJourneyError> {
+        let server = WyrdTestServer::start_bound().await?;
+        let fixture = seed_query_fixture(&server, "mcp-discovery").await?;
+        let authorized = fixture
+            .table
+            .strip_prefix("vala.bifrost.")
+            .ok_or("the fixture table is Bifrost-qualified")?
+            .to_owned();
+
+        let foreign_tenant = server.seed_tenant("mcp-discovery-foreign").await?;
+        let foreign_table = format!("foreign_{}", uuid::Uuid::now_v7().simple());
+        server
+            .state()
+            .bifrost_catalog()
+            .ok_or("the test server composes a Bifrost catalog")?
+            .create_table(CreateTableRequest {
+                table: TableRef::new(BifrostNamespace::Bifrost, &foreign_table),
+                user_fields: vec![arrow::datatypes::Field::new(
+                    "id",
+                    arrow::datatypes::DataType::Int64,
+                    false,
+                )],
+                tenant: foreign_tenant,
+                physical_layout: None,
+                audit: None,
+            })
+            .await?;
+
+        let client = ()
+            .serve_with_lifecycle(
+                transport(
+                    &server,
+                    ResolvedCredential::BearerToken(fixture.token.clone().into()),
+                    None,
+                )?,
+                discover(),
+            )
+            .await?;
+
+        let names: Vec<String> = client
+            .list_all_tools()
+            .await?
+            .iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+        assert_eq!(
+            names, BIFROST_TOOLS,
+            "an ordinary server advertises exactly the three read tools and no test probe"
+        );
+
+        let listed = structured(
+            client
+                .call_tool(CallToolRequestParams::new("bifrost.list_tables"))
+                .await?,
+        )?;
+        let tables = listed["tables"]
+            .as_array()
+            .ok_or("list_tables returns a tables array")?;
+        for table in tables {
+            let keys: Vec<&String> = table
+                .as_object()
+                .ok_or("each listed table is an object")?
+                .keys()
+                .collect();
+            assert_eq!(
+                keys,
+                vec!["namespace", "name", "status"],
+                "the list projection stays compact"
+            );
+            assert_eq!(table["namespace"], serde_json::json!("vala.bifrost"));
+        }
+        let listed_names: Vec<&str> = tables
+            .iter()
+            .filter_map(|table| table["name"].as_str())
+            .collect();
+        assert!(
+            listed_names.contains(&authorized.as_str()),
+            "the caller's own table is listed: {listed_names:?}"
+        );
+        assert!(
+            !listed_names.contains(&foreign_table.as_str()),
+            "another tenant's table is never listed: {listed_names:?}"
+        );
+
+        let described = structured(
+            client
+                .call_tool(
+                    CallToolRequestParams::new("bifrost.describe_table").with_arguments(
+                        serde_json::json!({
+                            "namespace": "vala.bifrost",
+                            "name": authorized,
+                        })
+                        .as_object()
+                        .ok_or("describe arguments are an object")?
+                        .clone(),
+                    ),
+                )
+                .await?,
+        )?;
+        assert_eq!(described["entry"]["name"], serde_json::json!(authorized));
+        let fields = described["fields"]
+            .as_array()
+            .ok_or("describe returns the stored field list")?;
+        let field_names: Vec<&str> = fields
+            .iter()
+            .filter_map(|field| field["name"].as_str())
+            .collect();
+        assert!(
+            field_names.contains(&"id") && field_names.contains(&"value"),
+            "every user field is described: {field_names:?}"
+        );
+        assert!(
+            fields
+                .iter()
+                .any(|field| field["metadata"]["wyrd:column_class"] == "correlation"),
+            "field metadata reaches the agent: {fields:?}"
+        );
+        let layout = &described["physical_layout"];
+        assert!(
+            layout["partition_granularity"].is_string(),
+            "the event-time partition granularity is described: {layout}"
+        );
+        assert!(
+            layout["sort_keys"].as_array().is_some_and(|keys| !keys
+                .is_empty()
+                && keys.iter().all(|key| key["column"].is_string())),
+            "the ordered sort keys are described: {layout}"
+        );
+        assert!(
+            layout["bloom_columns"].is_array(),
+            "the Bloom columns are described: {layout}"
+        );
+
+        for absent in [
+            format!("absent_{}", uuid::Uuid::now_v7().simple()),
+            foreign_table.clone(),
+        ] {
+            let refusal = problem(
+                client
+                    .call_tool(
+                        CallToolRequestParams::new("bifrost.describe_table").with_arguments(
+                            serde_json::json!({"namespace": "vala.bifrost", "name": absent})
+                                .as_object()
+                                .ok_or("describe arguments are an object")?
+                                .clone(),
+                        ),
+                    )
+                    .await?,
+            )?;
+            assert_eq!(
+                refusal["code"],
+                serde_json::json!("WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND"),
+                "an absent or foreign table is the same canonical refusal: {refusal}"
+            );
+            assert_eq!(refusal["status"], serde_json::json!(404));
+        }
+
+        client.cancel().await?;
+
+        let denied = server
+            .bootstrap_service("mcp-discovery-denied", &["reader"])
+            .await?;
+        let denied_client = ()
+            .serve_with_lifecycle(
+                transport(
+                    &server,
+                    ResolvedCredential::ApiKey(
+                        denied
+                            .api_key()
+                            .ok_or("service bootstrap carries a key")?
+                            .clone(),
+                    ),
+                    None,
+                )?,
+                discover(),
+            )
+            .await?;
+        let describe_arguments = serde_json::json!({
+            "namespace": "vala.bifrost",
+            "name": authorized,
+        })
+        .as_object()
+        .ok_or("describe arguments are an object")?
+        .clone();
+        let refusals = [
+            CallToolRequestParams::new("bifrost.list_tables"),
+            CallToolRequestParams::new("bifrost.describe_table")
+                .with_arguments(describe_arguments),
+        ];
+        for parameters in refusals {
+            let tool = parameters.name.clone();
+            let refusal = problem(denied_client.call_tool(parameters).await?)?;
+            assert_eq!(
+                refusal["code"],
+                serde_json::json!("WYRD_PERMISSION_403_DENIED_RBAC"),
+                "{tool} denies an under-scoped principal"
+            );
+        }
+        denied_client.cancel().await?;
+
+        server.shutdown().await?;
+        Ok(())
+    }
+}

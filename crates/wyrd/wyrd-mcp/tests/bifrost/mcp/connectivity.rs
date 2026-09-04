@@ -18,7 +18,7 @@ use wyrd_spec::request_id::RequestId;
 use wyrd_testing::WyrdTestServer;
 
 /// Boxed error carried by every helper in this journey.
-type McpJourneyError = Box<dyn std::error::Error + Send + Sync>;
+pub(crate) type McpJourneyError = Box<dyn std::error::Error + Send + Sync>;
 
 /// Build the first-party MCP client transport for `server` using `credential`.
 ///
@@ -36,7 +36,7 @@ type McpJourneyError = Box<dyn std::error::Error + Send + Sync>;
 ///
 /// Returns an error when the server is not bound to a listener or when the
 /// middleware cannot be constructed for `credential`.
-fn transport(
+pub(crate) fn transport(
     server: &WyrdTestServer,
     credential: ResolvedCredential,
     request_id: Option<&RequestId>,
@@ -63,30 +63,30 @@ fn transport(
     ))
 }
 
+/// The modern, session-free MCP lifecycle: `server/discover` plus
+/// self-contained per-request protocol metadata.
+///
+/// Wyrd serves exactly one protocol revision and mounts no session manager, so
+/// the legacy `initialize` handshake has nothing to negotiate down to; this is
+/// the only lifecycle a client can use against `/mcp`.
+pub(crate) fn discover() -> rmcp::ClientLifecycleMode {
+    rmcp::ClientLifecycleMode::Discover {
+        preferred_versions: vec![rmcp::model::ProtocolVersion::V_2026_07_28],
+    }
+}
+
 mod pg_tests {
-    use super::{McpJourneyError, RequestId, ResolvedCredential, transport};
+    use super::{McpJourneyError, RequestId, ResolvedCredential, discover, transport};
 
     use std::time::Duration;
 
-    use rmcp::model::{CallToolRequest, CallToolRequestParams, ClientRequest, ProtocolVersion};
+    use rmcp::model::{CallToolRequest, CallToolRequestParams, ClientRequest};
     use rmcp::service::PeerRequestOptions;
-    use rmcp::{ClientLifecycleMode, ClientServiceExt as _};
+    use rmcp::ClientServiceExt as _;
     use wyrd_runtime::Permission;
     use wyrd_server::mcp::probe;
     use wyrd_spec::DataTenantId;
     use wyrd_testing::WyrdTestServer;
-
-    /// The modern, session-free MCP lifecycle: `server/discover` plus
-    /// self-contained per-request protocol metadata.
-    ///
-    /// Wyrd serves exactly one protocol revision and mounts no session
-    /// manager, so the legacy `initialize` handshake has nothing to negotiate
-    /// down to; this is the only lifecycle a client can use against `/mcp`.
-    fn discover() -> ClientLifecycleMode {
-        ClientLifecycleMode::Discover {
-            preferred_versions: vec![ProtocolVersion::V_2026_07_28],
-        }
-    }
 
     /// A real `rmcp` client reaches the `/mcp` endpoint and sees the exact
     /// tenant and principal Wyrd's authentication edge verified for it.
@@ -183,10 +183,15 @@ mod pg_tests {
         Ok(())
     }
 
-    /// A fixture that did not opt in advertises no MCP tool at all.
+    /// A fixture that did not opt in never advertises the test probe.
+    ///
+    /// What the ordinary catalog *does* contain is
+    /// `discovery::pg_tests::agent_discovers_only_authorized_tables_and_layout`'s
+    /// claim; this one owns only the opt-in gate, which is the half that has to
+    /// hold no matter what the Bifrost catalog grows to.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires the Postgres-backed Bifrost journey lane"]
-    async fn default_server_advertises_no_mcp_tools() -> Result<(), McpJourneyError> {
+    async fn default_server_advertises_no_test_probe() -> Result<(), McpJourneyError> {
         let server = WyrdTestServer::start_bound().await?;
         let caller = server.bootstrap_service("mcp-default", &["admin"]).await?;
         let api_key = caller.api_key().ok_or("service bootstrap carries a key")?;
@@ -198,8 +203,12 @@ mod pg_tests {
             .await?;
 
         assert!(
-            client.list_all_tools().await?.is_empty(),
-            "the production catalog is empty until the Bifrost tools land"
+            client
+                .list_all_tools()
+                .await?
+                .iter()
+                .all(|tool| tool.name != probe::TOOL_NAME),
+            "the probe is reachable only through an explicit fixture opt-in"
         );
 
         client.cancel().await?;

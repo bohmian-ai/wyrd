@@ -18,8 +18,9 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, ErrorCode, ErrorData, InitializeResult,
-    ListToolsResult, PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerInfo, Tool,
+    CallToolRequestParams, CallToolResponse, CallToolResult, ErrorCode, ErrorData,
+    InitializeResult, ListToolsResult, PaginatedRequestParams, ProtocolVersion, ServerCapabilities,
+    ServerInfo, Tool,
 };
 use rmcp::service::RequestContext;
 use rmcp::transport::streamable_http_server::session::never::NeverSessionManager;
@@ -31,6 +32,7 @@ use wyrd_spec::request_id::RequestId;
 use crate::components::auth::{AuthenticatedPrincipal, Caller};
 use crate::state::AppState;
 
+pub mod bifrost;
 #[cfg(feature = "test-support")]
 pub mod probe;
 
@@ -127,15 +129,17 @@ impl WyrdMcpHandler {
 
     /// The tools this handler advertises and accepts.
     ///
-    /// Empty in production today. The test-support context probe joins the
-    /// catalog only when a test server explicitly opted into it, so compiling
-    /// `test-support` is not enough to expose it.
+    /// Ordinary startup — production and an ordinary `WyrdTestServer` alike —
+    /// advertises exactly the three read-only Bifrost tools. The test-support
+    /// context probe joins that catalog only when a test server explicitly
+    /// opted into it, so compiling `test-support` is not enough to expose it.
     fn catalog(&self) -> Vec<Tool> {
+        let mut catalog = bifrost::descriptors();
         #[cfg(feature = "test-support")]
         if self.state.mcp_context_probe {
-            return vec![probe::descriptor()];
+            catalog.push(probe::descriptor());
         }
-        Vec::new()
+        catalog
     }
 }
 
@@ -176,10 +180,31 @@ impl ServerHandler for WyrdMcpHandler {
                 .map(CallToolResponse::Complete)
                 .map_err(wyrd_error_to_mcp);
         }
-        Err(ErrorData::new(
-            ErrorCode::INVALID_PARAMS,
-            format!("unknown Wyrd MCP tool: {}", request.name),
-            None,
+        // Every Bifrost tool holds an MCP tracker token for its whole path, so
+        // process shutdown waits for the work it cancelled rather than racing
+        // the result back out.
+        let _token = self.state.mcp_tasks.token();
+        let outcome = match request.name.as_ref() {
+            bifrost::LIST_TABLES => {
+                let caller = Self::caller(&context).map_err(wyrd_error_to_mcp)?;
+                bifrost::list_tables(&self.state, caller).await
+            }
+            bifrost::DESCRIBE_TABLE => {
+                let caller = Self::caller(&context).map_err(wyrd_error_to_mcp)?;
+                bifrost::describe_table(&self.state, caller, request.arguments).await
+            }
+            unknown => {
+                return Err(ErrorData::new(
+                    ErrorCode::INVALID_PARAMS,
+                    format!("unknown Wyrd MCP tool: {unknown}"),
+                    None,
+                ));
+            }
+        };
+        Ok(CallToolResponse::Complete(
+            outcome.unwrap_or_else(|error| {
+                CallToolResult::structured_error(error.as_problem_json())
+            }),
         ))
     }
 }

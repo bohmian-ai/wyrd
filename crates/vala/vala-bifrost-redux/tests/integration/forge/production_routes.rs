@@ -395,18 +395,18 @@ fn counter_total(
         .sum()
 }
 
-/// Every production task exit returns its strategy's active ownership to zero.
+/// Public Forge metrics describe the data flow each route actually performed.
 ///
 /// The four retained routes are driven through the real scheduler and worker
 /// until each has planned, claimed, and settled a durable task of its own,
-/// including the worker restarts that cancel an in-flight attempt. The active
-/// gauge is opened by a task-lifetime guard, so any exit that skipped its
-/// decrement — commit, refusal, cancellation, or unwind — leaves a non-zero
-/// residue here. The lifecycle family is checked in the same pass so an
-/// unbounded label or an unlisted pair cannot reach production unnoticed.
+/// including the worker restarts that cancel an in-flight attempt. Every route
+/// must appear in the created and attempted counters under its own
+/// `task_type`, and the RAII active-task gauge must return to zero on every
+/// exit — commit, refusal, cancellation, or unwind. The same pass rejects any
+/// ownership label, so an unbounded identity cannot reach production unnoticed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires Postgres, Iceberg, and object storage"]
-async fn telemetry_balances_every_task_exit() {
+async fn forge_metrics_describe_real_data_flow() {
     let telemetry = ForgeTelemetryCheckpoint::install();
     let mut table = expirable_table("telemetry_exits", true).await;
     let routes = [
@@ -429,17 +429,45 @@ async fn telemetry_balances_every_task_exit() {
     }
 
     let snapshot = telemetry.snapshot();
-    for strategy in routes {
-        for stage in ["planned", "claimed", "settled"] {
-            assert!(
-                counter_total(
-                    &snapshot,
-                    "bifrost_forge_lifecycle_events_total",
-                    &[("strategy", strategy), ("event", stage), ("outcome", "ok"),],
-                ) > 0,
-                "{strategy} reported its own {stage} boundary"
-            );
-        }
+    for task_type in routes {
+        assert!(
+            counter_total(
+                &snapshot,
+                "bifrost_forge_tasks_created_total",
+                &[("task_type", task_type)],
+            ) > 0,
+            "{task_type} reported the work the coordinator created"
+        );
+        assert!(
+            counter_total(
+                &snapshot,
+                "bifrost_forge_task_attempts_total",
+                &[("task_type", task_type)],
+            ) > 0,
+            "{task_type} reported the attempt it settled"
+        );
+    }
+
+    // Attempts carry only the six durable results, so an unlisted result is a
+    // vocabulary drift rather than a new outcome.
+    for name in snapshot
+        .counters
+        .keys()
+        .filter(|name| name.starts_with("bifrost_forge_task_attempts_total{"))
+    {
+        assert!(
+            [
+                "succeeded",
+                "retry",
+                "failed",
+                "cancelled",
+                "refused",
+                "uncertain",
+            ]
+            .iter()
+            .any(|result| name.contains(&format!("result=\"{result}\""))),
+            "{name} carries an unlisted result"
+        );
     }
 
     // The guard decrements on every exit, so a settled route that still owns
@@ -467,9 +495,11 @@ async fn telemetry_balances_every_task_exit() {
         }
     }
     telemetry.require_metrics(&[
-        "bifrost_forge_lifecycle_events_total",
+        "bifrost_forge_tasks_created_total",
+        "bifrost_forge_task_attempts_total",
+        "bifrost_forge_task_duration_seconds",
         "bifrost_forge_active_tasks",
-        "bifrost_forge_scheduling_total",
-        "bifrost_forge_planning_demand_total",
+        "bifrost_forge_pending_tasks",
+        "bifrost_forge_planning_demands",
     ]);
 }

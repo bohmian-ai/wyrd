@@ -1571,10 +1571,7 @@ pub(super) fn cleanup_projection(
 mod source_tests {
     use std::time::Duration;
 
-    use super::{
-        ForgeScheduleOutcome, governed_capacity, maintenance_trigger_due, should_publish_gauges,
-        status_claim_limits,
-    };
+    use super::{governed_capacity, maintenance_trigger_due, status_claim_limits};
     use vala_sql::row_types::forge_tasks::ForgeTaskStrategy;
 
     use crate::forge::planner::ForgeCapacity;
@@ -1709,28 +1706,5 @@ mod source_tests {
         assert!(!source.contains(concat!("run_targeted_", "compaction_for_table(")));
         assert!(!source.contains(concat!("commit_", "rewrite(")));
         assert!(!source.contains(concat!(".", "rewrite(")));
-    }
-
-    /// An incomplete pass cannot replace previously published authoritative gauges.
-    #[test]
-    fn incomplete_pass_preserves_previous_gauges() {
-        let mut published = (7_u64, 11_u64);
-        let incomplete = ForgeScheduleOutcome {
-            demands_seen: 2,
-            demands_acknowledged: 1,
-            incomplete: true,
-            ..ForgeScheduleOutcome::default()
-        };
-        if should_publish_gauges(&incomplete, false) {
-            published = (0, 0);
-        }
-        assert_eq!(published, (7, 11));
-        let complete = ForgeScheduleOutcome {
-            demands_seen: 2,
-            demands_acknowledged: 2,
-            ..ForgeScheduleOutcome::default()
-        };
-        assert!(should_publish_gauges(&complete, false));
-        assert!(!should_publish_gauges(&complete, true));
     }
 }

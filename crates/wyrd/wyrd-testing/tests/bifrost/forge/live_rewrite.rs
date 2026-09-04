@@ -976,28 +976,22 @@ fn assert_recovery_telemetry(
     // 4. The terminal reconciliation counted itself as a recovery.
     let recovered = counter_delta(
         recovery,
-        "bifrost_forge_operations",
-        &[("source", "iceberg"), ("result", "recovered")],
+        "bifrost_forge_task_attempts_total",
+        &[("task_type", "small_files"), ("result", "succeeded")],
     );
     assert!(
         recovered >= 1.0,
-        "the reconciliation recorded a recovered Iceberg operation: {recovered}"
+        "the reconciliation settled the recovered small-files attempt: {recovered}"
     );
 
     // 5. The counted recovery volume is the manifest-derived volume.
     for (family, expected) in [
-        ("bifrost_forge_rewrite_input_files_total", facts.input_files),
-        ("bifrost_forge_rewrite_input_bytes_total", facts.input_bytes),
-        (
-            "bifrost_forge_rewrite_output_files_total",
-            facts.output_files,
-        ),
-        (
-            "bifrost_forge_rewrite_output_bytes_total",
-            facts.output_bytes,
-        ),
+        ("bifrost_forge_input_files_total", facts.input_files),
+        ("bifrost_forge_input_bytes_total", facts.input_bytes),
+        ("bifrost_forge_output_files_total", facts.output_files),
+        ("bifrost_forge_output_bytes_total", facts.output_bytes),
     ] {
-        let observed = counter_delta(recovery, family, &[("source", "iceberg")]);
+        let observed = counter_delta(recovery, family, &[("task_type", "small_files")]);
         assert!(
             (observed - expected as f64).abs() < f64::EPSILON,
             "{family} counted the recovered operation's own volume: {observed} vs {expected}"
@@ -1065,8 +1059,38 @@ fn assert_recovery_telemetry(
                 sample.family
             );
         }
+        assert!(
+            APPROVED_FORGE_FAMILIES.contains(&sample.family.as_str()),
+            "Forge emitted {} outside the approved public catalog",
+            sample.family
+        );
     }
 }
+
+/// The exact public Forge metric catalog this journey is allowed to observe.
+///
+/// Membership is asserted against every captured `bifrost_forge_` sample so a
+/// family reintroduced outside the catalog fails here rather than reaching an
+/// operator dashboard.
+const APPROVED_FORGE_FAMILIES: &[&str] = &[
+    "bifrost_forge_planning_demands",
+    "bifrost_forge_oldest_planning_demand_timestamp_seconds",
+    "bifrost_forge_tasks_created_total",
+    "bifrost_forge_pending_tasks",
+    "bifrost_forge_oldest_pending_task_timestamp_seconds",
+    "bifrost_forge_active_tasks",
+    "bifrost_forge_task_attempts_total",
+    "bifrost_forge_task_duration_seconds",
+    "bifrost_forge_task_failures_total",
+    "bifrost_forge_input_files_total",
+    "bifrost_forge_input_bytes_total",
+    "bifrost_forge_output_files_total",
+    "bifrost_forge_output_bytes_total",
+    "bifrost_forge_deleted_objects_total",
+    "bifrost_forge_snapshots_expired_total",
+    "bifrost_forge_compaction_debt_files",
+    "bifrost_forge_compaction_debt_bytes",
+];
 
 /// Promoted rows survive a rewrite whose acceptance the committer never learned.
 ///

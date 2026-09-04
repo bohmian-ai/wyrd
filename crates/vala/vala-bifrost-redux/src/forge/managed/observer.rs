@@ -232,51 +232,23 @@ mod tests {
         ]
     }
 
-    /// The projection is total, bounded, reachable, and cannot alter a rewrite.
+    /// Observation folds every core measurement and cannot alter a rewrite.
     ///
     /// *Cumulative*: the terminal events of one attempt describe different
     /// plans, so their possibly-produced sets are merged by attempt-global
     /// logical ordinal rather than replaced — the observer projects one
     /// attempt, not one plan.
     ///
-    /// *Total and reachable*: every one of the core's nine events maps to a
-    /// distinct Forge label, and the nine labels are exactly the registered
-    /// inventory — so no event is dropped and no label exists that nothing can
-    /// emit. *Bounded*: the labels are compile-time constants with no path,
-    /// attempt, or tenant in them, which is what keeps one counter family from
-    /// becoming one series per table. *Non-semantic*: the observer's only
-    /// method returns nothing and the module names no mutation of a rewrite
-    /// result, so observation cannot change what a rewrite produces — the
-    /// source assertion is what keeps that true as the module grows.
+    /// *Non-semantic*: the observer's only method returns nothing and the
+    /// module names no mutation of a rewrite result, so observation cannot
+    /// change what a rewrite produces — the source assertion is what keeps
+    /// that true as the module grows.
     #[test]
-    fn forge_managed_observer_projection_is_bounded_reachable_and_non_semantic() {
+    fn forge_managed_observer_folds_peaks_and_outputs_without_semantics() {
         const SOURCE: &str = include_str!("observer.rs");
 
         let attempt_id = AttemptId::new();
         let events = every_event(attempt_id);
-        let projected: Vec<ForgeRewriteEventKind> =
-            events.iter().map(ForgeRewriteObserver::project).collect();
-        assert_eq!(
-            projected,
-            ForgeRewriteEventKind::ALL.to_vec(),
-            "every core event maps to exactly one registered label, in order"
-        );
-        let mut distinct = projected.clone();
-        distinct.sort_unstable();
-        distinct.dedup();
-        assert_eq!(
-            distinct.len(),
-            ForgeRewriteEventKind::ALL.len(),
-            "no two core events collapse onto one label"
-        );
-        for kind in ForgeRewriteEventKind::ALL {
-            let label = kind.as_str();
-            assert!(
-                !label.contains('/') && !label.contains('-') && !label.is_empty(),
-                "{label} must be a stable identifier, never a path fragment"
-            );
-        }
-
         let observer = ForgeRewriteObserver::new();
         for event in events {
             observer.on_event(event);

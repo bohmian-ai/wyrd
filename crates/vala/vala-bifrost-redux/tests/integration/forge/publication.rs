@@ -180,10 +180,6 @@ async fn rewrite_scheduler_dispatches_only_after_promotion_and_authority() {
         0,
         "planning a rewrite writes no object"
     );
-    telemetry.require_metrics(&[
-        "bifrost_forge_scheduler_duration_seconds",
-        "bifrost_forge_demand_transitions_total",
-    ]);
     assert!(
         !telemetry
             .spans_named("bifrost.forge.scheduler.pass")
@@ -366,10 +362,7 @@ async fn rewrite_publication_commits_exact_handoff_and_delete_disposition() {
         "the publication released its table lease"
     );
 
-    telemetry.require_metrics(&[
-        "bifrost_forge_operations",
-        "bifrost_forge_rewrite_output_files_total",
-    ]);
+    telemetry.require_metrics(&["bifrost_forge_output_files_total"]);
     let commits = telemetry.spans_named("bifrost.forge.catalog.commit");
     assert!(
         commits.iter().any(|span| span
@@ -789,8 +782,6 @@ async fn rewrite_publication_ambiguity_restart_settles_once() {
         published,
         "the rewritten cut is not rewritten again"
     );
-
-    telemetry.require_metrics(&["bifrost_forge_operations"]);
 }
 
 /// One real owner of publication authority, mutated while a rewrite is held.

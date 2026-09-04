@@ -1716,6 +1716,8 @@ mod tests {
                 .await,
             Err(PeerSecurityError::Fence),
         );
+
+        prove_forward_query_claims_bind_every_field().await;
     }
 
     /// Builds one fully bound final v1 forwarding envelope for authority tests.
@@ -1789,9 +1791,14 @@ mod tests {
         }
     }
 
-    /// The final v1 forwarding envelope round-trips and binds every signed field.
-    #[tokio::test]
-    async fn forward_query_claims_round_trip_and_bind_every_field() {
+    /// Proves the final v1 forwarding envelope round-trips and binds every
+    /// signed field it carries.
+    ///
+    /// This is a phase of the authority's tamper, replay, and fence test rather
+    /// than a test of its own: forwarding envelopes are authorized by the same
+    /// authority and the same closed rejections, so the two proofs share one
+    /// entry point instead of drifting apart under separate names.
+    async fn prove_forward_query_claims_bind_every_field() {
         let (authority, _audit) = authority();
         let worker = NodeId::new(uuid::Uuid::from_u128(71));
         let tenant = DataTenantId::new(uuid::Uuid::now_v7()).expect("tenant");

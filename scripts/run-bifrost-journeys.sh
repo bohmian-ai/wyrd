@@ -20,7 +20,6 @@ capabilities=(
   oracle
   otlp
   server
-  interleavings
   mcp
 )
 

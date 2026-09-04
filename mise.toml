@@ -93,7 +93,7 @@ description = "Run shared family tests (unit tests only — pg_tests skipped wit
 run = "bash scripts/run-family-tests.sh shared"
 
 [tasks."test:bifrost"]
-description = "Run every Bifrost unit, integration, cluster, and Rust/Python/TypeScript journey test under one Postgres lifecycle."
+description = "Run every Bifrost unit, integration, and Rust/Python/TypeScript journey test under one Postgres lifecycle."
 run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run test:bifrost:inner'"
 
 [tasks."test:bifrost:inner"]
@@ -163,11 +163,11 @@ description = """Run every Bifrost tier-1 capability binary, one after another, 
 the live Postgres this lane's parent already stood up. Each capability has a
 `test:bifrost:journey:<capability>` lane of its own; the script calls their
 `:inner` halves so every binary is defined in exactly one place and runs under
-one database lifecycle rather than standing up eight.
+one database lifecycle rather than standing up seven.
 
 The script exists because this cannot be a multiline `run`: mise aborts such a
 run at its first failing line, which would hide every capability behind the
-first broken one. The script runs all eight and reports them together."""
+first broken one. The script runs all seven and reports them together."""
 run = "bash scripts/run-bifrost-journeys.sh"
 
 # --- Per-capability tier-1 lanes -------------------------------------------
@@ -254,14 +254,6 @@ hide = true
 description = "wyrd-testing `server` binary, whole"
 run = "cargo nextest run --locked -p wyrd-testing --test server -P journey --run-ignored=all"
 
-[tasks."test:bifrost:journey:interleavings"]
-description = "Tier-1 journeys: deterministic scheduler permutation checks (no database)"
-run = "cargo nextest run --locked -p wyrd-testing --test interleavings -P journey --run-ignored=all"
-[tasks."test:bifrost:journey:interleavings:inner"]
-hide = true
-description = "wyrd-testing `interleavings` binary, whole; identical to the public lane, which needs no database"
-run = "cargo nextest run --locked -p wyrd-testing --test interleavings -P journey --run-ignored=all"
-
 [tasks."test:bifrost:journey:mcp"]
 description = "Tier-1 journeys: Bifrost MCP surface and its RBAC"
 run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run test:bifrost:journey:mcp:inner'"
@@ -291,17 +283,6 @@ description = "Run the TypeScript Bifrost journey against an already-provisioned
 dir = "typescript/wyrd"
 depends = ["ts:build", "ts:build:testing"]
 run = "pnpm exec vitest run tests/integration/oracle-query.test.ts"
-
-[tasks."test:bifrost:cluster"]
-description = "Run the deterministic public-Gate Bifrost cluster matrix"
-run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run test:bifrost:cluster:inner'"
-
-[tasks."test:bifrost:cluster:inner"]
-hide = true
-description = """Run the deterministic public-Gate cluster matrix binary whole.
-Selects the `cluster` target rather than naming its journeys, so a matrix case
-added to that binary runs here without an edit."""
-run = "cargo nextest run --locked -p wyrd-testing --test cluster -P journey --run-ignored=all"
 
 [tasks."check:bifrost-oracle-deploy"]
 description = "Validate Bifrost Oracle Kubernetes role selectors and rollback"

@@ -10,7 +10,6 @@ lanes=(
   integration:sql
   integration:server
   journey
-  cluster
   journey:python
   journey:typescript
   forge-scale

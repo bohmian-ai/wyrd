@@ -43,9 +43,7 @@ mistake unrepresentable.
 | `scribe` | `write_read`, `telemetry`, `lifecycle`, `event_time_window`, `source_boundary`, `source_boundary_recovery` | write, ack, seal, WAL replay, exactly-once restart, admission window, OTLP source-boundary durability | Postgres + server |
 | `oracle` | `published`, `distributed`, `convergence`, `spill`, `capacity`, `grpc_surface`, `observability`, `recovery`, `layout`, `peer` | query execution, distributed follower dispatch, peer security, tail fencing, cancellation, telemetry | Postgres + server |
 | `otlp` | `logs_export`, `metrics_export`, `trace_export`, `trace_export_http`, `mixed_batch`, `negative` | OTLP logs, metrics, traces, mixed batch, negative protocol surface | Postgres + server |
-| `cluster` | `load`, `materializer` | multi-pod topology, tenant fairness, cluster shutdown | Postgres + server |
 | `server` | `grpc_mount`, `smoke`, `owner_inspection` | gRPC mount, boot, owner lifecycle and inspection | Postgres + server |
-| `interleavings` | `permutations`, `smoke` | deterministic scheduler permutation checks | none |
 
 MCP journeys live in a sibling crate under the same rule:
 `wyrd-mcp/tests/bifrost/mcp/` aggregates `layout` and `rbac`.
@@ -89,7 +87,7 @@ Keep a module under roughly 40 KB. Splitting costs one file and one `mod` line.
 
 | Lane | Runs |
 |---|---|
-| `mise run test:bifrost` | every Bifrost unit, integration, cluster, and Rust/Python/TypeScript journey lane |
+| `mise run test:bifrost` | every Bifrost unit, integration, and Rust/Python/TypeScript journey lane |
 | `mise run test:bifrost:journey` | every capability below, in sequence, under one database lifecycle |
 | `mise run test:bifrost:journey:sdk` | `vala-sdk` `pg_bifrost_e2e`, whole |
 | `mise run test:bifrost:journey:forge` | `forge`, whole |
@@ -97,11 +95,9 @@ Keep a module under roughly 40 KB. Splitting costs one file and one `mod` line.
 | `mise run test:bifrost:journey:oracle` | `oracle`, whole |
 | `mise run test:bifrost:journey:otlp` | `otlp`, whole |
 | `mise run test:bifrost:journey:server` | `server`, whole |
-| `mise run test:bifrost:journey:interleavings` | `interleavings`, whole (no database) |
 | `mise run test:bifrost:journey:mcp` | `wyrd-mcp` `mcp`, whole |
 | `mise run test:bifrost:journey:python` | Python Bifrost client and query journeys |
 | `mise run test:bifrost:journey:typescript` | TypeScript Oracle query journey |
-| `mise run test:bifrost:cluster` | `cluster`, whole |
 | `mise run test:wyrd` | everything not `#[ignore]`d and not in `mod pg_tests` |
 
 Every lane selects a Cargo **target**, never a test name. Cargo resolves a

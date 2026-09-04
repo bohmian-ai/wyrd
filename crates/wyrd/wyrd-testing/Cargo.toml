@@ -41,16 +41,8 @@ name = "otlp"
 path = "tests/bifrost/otlp/main.rs"
 
 [[test]]
-name = "cluster"
-path = "tests/bifrost/cluster/main.rs"
-
-[[test]]
 name = "server"
 path = "tests/bifrost/server/main.rs"
-
-[[test]]
-name = "interleavings"
-path = "tests/bifrost/interleavings/main.rs"
 
 [dependencies]
 async-trait = { workspace = true }

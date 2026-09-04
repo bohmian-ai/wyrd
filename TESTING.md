@@ -70,8 +70,7 @@ mise run test:bifrost                    # all Bifrost tests and language surfac
 mise run test:bifrost:integration:redux  # tier 2: the whole redux crate
 mise run test:bifrost:journey            # tier 1: every capability, one DB lifecycle
 mise run test:bifrost:journey:oracle     # tier 1: one capability
-#                     :sdk :forge :scribe :otlp :server :interleavings :mcp :python :typescript
-mise run test:bifrost:cluster            # multi-pod topology matrix
+#                     :sdk :forge :scribe :otlp :server :mcp :python :typescript
 ```
 
 ### Everything else
@@ -118,7 +117,7 @@ Bifrost.
 ## When a test fails
 
 Every lane runs with `RUST_BACKTRACE=1` and `--no-fail-fast`, and the journey
-lanes run all eight capabilities before reporting. You should get the complete
+lanes run all seven capabilities before reporting. You should get the complete
 set of failures from one invocation — if you find yourself rerunning a lane to
 discover the next failure, something has regressed in the harness.
 

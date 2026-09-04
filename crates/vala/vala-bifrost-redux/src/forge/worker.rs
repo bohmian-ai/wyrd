@@ -536,6 +536,13 @@ struct CompletionObserverClaimGate {
     ready: tokio::sync::Notify,
     /// Releases all paused workers to execute their own claimed tasks.
     release: tokio::sync::Notify,
+    /// Whether the test has released the barrier.
+    ///
+    /// The paused workers wait on this rather than on the claim count. A
+    /// rendezvous of `expected` workers reports itself through `ready`, but the
+    /// pause itself ends only when the test says so, so a single supervised
+    /// worker can be held after its durable claim exactly like a pair can.
+    released: AtomicBool,
 }
 
 #[cfg(feature = "test-support")]
@@ -901,6 +908,7 @@ impl ForgeWorkerCompletionObserver {
                 claimed: AtomicUsize::new(0),
                 ready: tokio::sync::Notify::new(),
                 release: tokio::sync::Notify::new(),
+                released: AtomicBool::new(false),
             }));
     }
 
@@ -941,6 +949,7 @@ impl ForgeWorkerCompletionObserver {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
             .expect("claim gate must be configured before release");
+        gate.released.store(true, Ordering::Release);
         gate.release.notify_waiters();
     }
 
@@ -1048,7 +1057,11 @@ impl ForgeWorkerCompletionObserver {
         self.handoff_paused.store(false, Ordering::Release);
     }
 
-    /// Observe one persisted claim and pause execution until all configured roles participate.
+    /// Observe one persisted claim and pause until the test releases the barrier.
+    ///
+    /// The claim itself is already durable when this runs, so the pause changes
+    /// only the fixture's execution timing, never claim fairness, ownership,
+    /// task state, or publication behavior.
     #[cfg(feature = "test-support")]
     async fn pause_after_claim_for_test(&self) {
         let gate = self
@@ -1065,7 +1078,7 @@ impl ForgeWorkerCompletionObserver {
         }
         loop {
             let notified = gate.release.notified();
-            if gate.claimed.load(Ordering::Acquire) >= gate.expected {
+            if gate.released.load(Ordering::Acquire) {
                 return;
             }
             notified.await;

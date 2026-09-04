@@ -983,6 +983,23 @@ async fn retirement_first_loss_commits_its_own_edge() {
     server.shutdown().await.expect("server shuts down");
 }
 
+/// Plan payload whose parameters no strategy contract accepts.
+///
+/// The worker's pre-effect gate terminalizes a claim carrying it before any
+/// table fence, catalog load, or object IO, which is exactly what the durable
+/// non-success rows assert.
+#[cfg(feature = "test-support")]
+const MALFORMED_PLAN: &str = r#"{"version":1,"inputs":["a.parquet"],"parameters":{}}"#;
+
+/// Plan payload matching the small-files strategy contract exactly.
+///
+/// `validate_payload` requires the parameter object to be exactly the
+/// live-rewrite kind, so this is the payload a case must seed when it needs the
+/// claim to reach the fenced execution path rather than the pre-effect refusal.
+#[cfg(feature = "test-support")]
+const LIVE_REWRITE_PLAN: &str =
+    r#"{"version":1,"inputs":["a.parquet"],"parameters":{"kind":"live_rewrite"}}"#;
+
 /// Diagnostic ceiling for one Forge role transition.
 ///
 /// Every transition this matrix drives is caused by an explicit scheduler pass,
@@ -1856,6 +1873,87 @@ async fn coordinator_audit_append_failure_clears_readiness() {
     server.shutdown().await.expect("test server shuts down");
 }
 
+/// A worker whose cancelled-claim release fails reports that failure, clears
+/// readiness, and retains the claim for durable recovery.
+///
+/// A clean shutdown drains a just-claimed task back to a claimable state so the
+/// pod's active claims reach zero. When that drain fails the claim is still held
+/// in durable state by an owner that is no longer running it, so the worker must
+/// not report that it drained: it returns the error, clears readiness, and
+/// leaves the row for lease-expiry recovery rather than releasing it optimistically.
+///
+/// # Panics
+///
+/// Panics when the release failure is swallowed, readiness survives it, or the
+/// claim is released despite the failure.
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancellation_release_failure_closes_readiness() {
+    let (server, observer) = server_with_forge_observer().await;
+    let readiness = server
+        .state()
+        .forge()
+        .expect("the default target selects Forge")
+        .worker_readiness();
+    let pool = server
+        .pg_fixture()
+        .superuser_pool()
+        .await
+        .expect("superuser pool");
+    let task_id = seed_ready_forge_task(
+        &pool,
+        uuid::Uuid::from(server.data_tenant_id()),
+        "cancelled_release",
+        "small_files",
+        true,
+        LIVE_REWRITE_PLAN,
+    )
+    .await;
+    // The barrier holds the worker after its durable claim, so cancellation
+    // lands in the pre-execution window this release owns rather than racing it.
+    observer.hold_after_claims_for_test(1);
+    observer.fail_next_cancelled_claim_release();
+
+    let stop = tokio_util::sync::CancellationToken::new();
+    let worker = wyrd_server::boot::spawn_forge_worker(server.state(), stop.clone(), 1, 1)
+        .expect("the worker composes");
+    let handle = tokio::spawn(worker);
+    tokio::time::timeout(FORGE_READINESS_CEILING, observer.wait_for_claims_for_test())
+        .await
+        .expect("the worker takes its durable claim");
+    stop.cancel();
+    observer.release_claims_for_test();
+
+    let error = tokio::time::timeout(FORGE_READINESS_CEILING, handle)
+        .await
+        .expect("the worker returns its cancelled-claim release failure")
+        .expect("worker joins")
+        .expect_err("a worker that cannot drain its own claim does not exit clean");
+    assert!(
+        format!("{error}").contains("injected Forge cancelled claim release failure"),
+        "the worker returned an unrelated error: {error}"
+    );
+    assert!(
+        !readiness.is_ready(),
+        "a worker still holding an undrained claim advertised ready"
+    );
+    let state: String = sqlx::query_scalar("SELECT state FROM vala.forge_tasks WHERE task_id=$1")
+        .bind(task_id)
+        .fetch_one(&pool)
+        .await
+        .expect("the retained claim row is readable");
+    assert_eq!(
+        state, "claimed",
+        "the claim was released despite its release failing"
+    );
+    assert_eq!(
+        observer.completed(),
+        0,
+        "a drained claim was reported as a completion"
+    );
+    server.shutdown().await.expect("test server shuts down");
+}
+
 /// Registers one table and publishes rows through it so the next planning pass
 /// derives a real Scribe-promotion candidate for it.
 ///
@@ -2016,7 +2114,7 @@ async fn durably_settled_claims_keep_readiness() {
             table_name,
             strategy,
             envelope,
-            "{\"version\":1,\"inputs\":[\"a.parquet\"],\"parameters\":{}}",
+            MALFORMED_PLAN,
         )
         .await;
 
@@ -2078,7 +2176,7 @@ async fn live_foreign_claim_does_not_block_readiness() {
         "foreign_claim",
         "small_files",
         true,
-        "{\"version\":1,\"inputs\":[\"a.parquet\"],\"parameters\":{}}",
+        MALFORMED_PLAN,
     )
     .await;
     let peer = uuid::Uuid::now_v7();
@@ -2157,10 +2255,7 @@ async fn release_failure_clears_readiness() {
         "release_only",
         "small_files",
         true,
-        // The live-rewrite parameter object is the exact contract the worker's
-        // pre-effect gate requires, so this claim reaches the table fence
-        // instead of being terminalized as malformed before one is acquired.
-        "{\"version\":1,\"inputs\":[\"a.parquet\"],\"parameters\":{\"kind\":\"live_rewrite\"}}",
+        LIVE_REWRITE_PLAN,
     )
     .await;
 

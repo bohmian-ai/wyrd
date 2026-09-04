@@ -949,10 +949,14 @@ where
 
 /// Parses one exact domain table binding into the catalog's closed namespace type.
 ///
+/// A wire binding carries the namespace with the `vala.` root already stripped
+/// (`TailFenceDrainer::wire_binding`), so the root is restored here rather than
+/// parsing a name the catalog's closed namespace set can never contain.
+///
 /// # Errors
 /// Returns an error when the namespace/table pair is not a canonical Wyrd FQN.
 fn assignment_table(binding: &TenantTableBinding) -> Result<TableRef, String> {
-    TableRef::parse_fqn(&format!("{}.{}", binding.namespace, binding.table))
+    TableRef::parse_fqn(&format!("vala.{}.{}", binding.namespace, binding.table))
         .ok_or_else(|| "assignment table binding is not canonical".to_owned())
 }
 

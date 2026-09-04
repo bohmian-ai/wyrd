@@ -597,7 +597,11 @@
         "--border",
         "--bg"
       ],
-      "props": {},
+      "props": {
+        "sidebar": "content",
+        "topbar": "content",
+        "children": "content"
+      },
       "variants": [],
       "anatomy": [
         "sidebar",
@@ -620,9 +624,15 @@
         "--surface",
         "--border",
         "--brand-soft",
-        "--brand-strong"
+        "--shadow",
+        "--text",
+        "--muted",
+        "--r"
       ],
-      "props": {},
+      "props": {
+        "brand": "string?",
+        "groups": "Array<{ label: string, items: object[] }>"
+      },
       "variants": [],
       "anatomy": [
         "brand",
@@ -631,6 +641,7 @@
       "rules": [
         "nav groups; active item brand-soft wash + border + 2px shadow",
         "brand slot is the bohmian mark (logo.svg) followed by the lowercase 'bohmian' wordmark in --font-serif",
+        "carries the five product entries and no per-item kind bar: navigation is not a typed plane",
         "trusted application chrome — not catalog: it owns navigation, which an authored view must never redirect"
       ]
     },
@@ -643,20 +654,26 @@
       ],
       "tokens": [
         "--surface",
-        "--border",
         "--surface-2",
-        "--ok"
+        "--border",
+        "--text",
+        "--muted",
+        "--r"
       ],
-      "props": {},
+      "props": {
+        "crumbs": "string[]",
+        "search": "string?",
+        "env": "{ label: string, status: string }?"
+      },
       "variants": [],
       "anatomy": [
         "breadcrumb",
         "search",
-        "tenant",
-        "principal"
+        "env"
       ],
       "rules": [
-        "breadcrumb + search + env pill with status dot",
+        "breadcrumb + search + environment badge",
+        "the environment reads through Badge so its state carries a glyph and text; a bare coloured dot would make the state hue-only",
         "hosts the ProductPill immediately after the wordmark",
         "trusted application chrome — not catalog: it carries tenant identity and the principal menu"
       ]
@@ -677,10 +694,7 @@
         "mode": "light | dark",
         "children": "content"
       },
-      "variants": [
-        "light",
-        "dark"
-      ],
+      "variants": [],
       "anatomy": [
         "root"
       ],

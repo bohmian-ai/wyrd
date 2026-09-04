@@ -10,8 +10,8 @@ test('renders grouped nav items and marks the active one', () => {
         {
           label: 'registry',
           items: [
-            { label: 'cards', href: '/cards', active: true, kind: 'client' },
-            { label: 'evals', href: '/evals', kind: 'server' }
+            { label: 'cards', href: '/cards', active: true },
+            { label: 'evals', href: '/evals' }
           ]
         }
       ]
@@ -22,5 +22,4 @@ test('renders grouped nav items and marks the active one', () => {
   expect(items).toHaveLength(2);
   expect(items[0].classList.contains('active')).toBe(true);
   expect(items[1].classList.contains('active')).toBe(false);
-  expect(items[0]).toHaveAttribute('data-k', 'client');
 });

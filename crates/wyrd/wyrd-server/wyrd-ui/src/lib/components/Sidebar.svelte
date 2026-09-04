@@ -1,6 +1,5 @@
 <script lang="ts">
-  type Kind = 'client' | 'server' | 'control';
-  type NavItem = { label: string; href?: string; active?: boolean; kind?: Kind };
+  type NavItem = { label: string; href?: string; active?: boolean };
   type NavGroup = { label?: string; items: NavItem[] };
 
   let { brand, groups }: { brand?: string; groups: NavGroup[] } = $props();
@@ -11,7 +10,7 @@
   {#each groups as g (g.label ?? g.items[0]?.label)}
     {#if g.label}<div class="grp">{g.label}</div>{/if}
     {#each g.items as it (it.label)}
-      <a class="item" class:active={it.active} data-k={it.kind} href={it.href ?? '#'}>{it.label}</a>
+      <a class="item" class:active={it.active} href={it.href ?? '#'}>{it.label}</a>
     {/each}
   {/each}
 </nav>
@@ -70,14 +69,5 @@
     background: var(--brand-soft);
     border-color: var(--border);
     box-shadow: 2px 2px 0 0 var(--shadow);
-  }
-  .item[data-k='client'] {
-    border-left: 4px solid var(--client-bar);
-  }
-  .item[data-k='server'] {
-    border-left: 4px solid var(--server-bar);
-  }
-  .item[data-k='control'] {
-    border-left: 4px solid var(--control-bar);
   }
 </style>

@@ -1,4 +1,6 @@
 <script lang="ts">
+  import Badge from './Badge.svelte';
+
   type Env = { label: string; status: 'ok' | 'warn' | 'danger' };
 
   let {
@@ -17,7 +19,9 @@
   </nav>
   <div class="right">
     {#if search}<input class="search" type="search" placeholder={search} />{/if}
-    {#if env}<span class="env"><i data-st={env.status}></i>{env.label}</span>{/if}
+    <!-- the environment reads through Badge so its state carries a glyph and the tone is
+         never the only signal; a bare coloured dot fails INV-008 -->
+    {#if env}<Badge tone={env.status}>{env.label}</Badge>{/if}
   </div>
 </div>
 
@@ -73,35 +77,5 @@
   }
   .search::placeholder {
     color: var(--muted);
-  }
-  .env {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    font-size: 10px;
-    font-weight: 700;
-    letter-spacing: 0.4px;
-    text-transform: uppercase;
-    color: var(--text);
-    border: 2px solid var(--border);
-    border-radius: var(--r);
-    padding: 4px 9px;
-    background: var(--surface);
-    white-space: nowrap;
-  }
-  .env i {
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    flex: 0 0 auto;
-  }
-  .env i[data-st='ok'] {
-    background: var(--ok);
-  }
-  .env i[data-st='warn'] {
-    background: var(--warn);
-  }
-  .env i[data-st='danger'] {
-    background: var(--danger);
   }
 </style>

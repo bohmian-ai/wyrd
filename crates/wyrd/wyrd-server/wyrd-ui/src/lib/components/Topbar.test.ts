@@ -13,10 +13,12 @@ test('renders breadcrumbs with the last one marked current', () => {
   expect(container.querySelectorAll('.sep')).toHaveLength(2);
 });
 
-test('renders a search input and an env pill with a status dot', () => {
+test('renders a search input and an env badge that states its status', () => {
   const { container } = render(Topbar, {
-    props: { crumbs: ['home'], search: 'search cards…', env: { label: 'prod', status: 'ok' } }
+    props: { crumbs: ['home'], search: 'search cards…', env: { label: 'prod', status: 'warn' } }
   });
   expect(container.querySelector('input.search')).toHaveAttribute('placeholder', 'search cards…');
-  expect(container.querySelector('.env i')).toHaveAttribute('data-st', 'ok');
+  const badge = container.querySelector('.wy-badge');
+  expect(badge).toHaveAttribute('data-tone', 'warn');
+  expect(badge?.textContent).toContain('prod');
 });

@@ -1574,6 +1574,42 @@ impl SupervisedPromotion {
         assert_eq!(self.worker_observer.completed(), expected);
     }
 
+    /// Settle at least one successful attempt without planning anything.
+    ///
+    /// A route whose passes are deliberately bounded — orphan collection with
+    /// one listing page per pass — settles many short attempts in the time the
+    /// held-attempt barrier takes to stop the worker. Requiring exactly one
+    /// completion would make the scenario depend on that timing, so this
+    /// requires progress and success rather than a single episode.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a deterministic bound is missed, an attempt returned an
+    /// error, or the worker made no progress at all.
+    pub(crate) async fn settle_some_success(&mut self) {
+        let before = self.worker_observer.completed();
+        let expected_errors = self.worker_observer.returned_errors().len();
+        self.worker_observer.hold_after_next_attempt_for_test();
+        self.start_armed_worker();
+        tokio::time::timeout(
+            FIXTURE_BOUND,
+            self.worker_observer.wait_for_held_attempt_for_test(),
+        )
+        .await
+        .expect("production Forge worker attempt bound");
+        assert_eq!(
+            self.worker_observer.returned_errors().len(),
+            expected_errors,
+            "the attempt was expected to succeed: {:?}",
+            self.worker_observer.returned_errors()
+        );
+        self.stop_worker().await;
+        assert!(
+            self.worker_observer.completed() > before,
+            "the worker settled no attempt"
+        );
+    }
+
     /// Schedule one pass and await exactly one returned worker error while
     /// `during` drives the seam the attempt is parked on.
     ///

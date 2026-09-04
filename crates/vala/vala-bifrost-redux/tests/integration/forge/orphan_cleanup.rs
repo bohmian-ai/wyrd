@@ -87,7 +87,7 @@ async fn assert_no_durable_owner_names(
 /// # Panics
 ///
 /// Panics when the staging operator rejects a write.
-async fn seed_lookalikes(fixture: &PromotionIntegrationFixture) -> Vec<String> {
+pub(super) async fn seed_lookalikes(fixture: &PromotionIntegrationFixture) -> Vec<String> {
     let root = forge_root(fixture);
     let prefix = &fixture.binding.object_prefix;
     let mut lookalikes = Vec::new();
@@ -325,7 +325,7 @@ async fn seed_ready_orphan_task(fixture: &PromotionIntegrationFixture, cutoff_ms
 /// # Panics
 ///
 /// Panics when the diagnostic read fails.
-async fn orphan_task_row(
+pub(super) async fn orphan_task_row(
     fixture: &PromotionIntegrationFixture,
     task_id: Uuid,
 ) -> (String, Option<serde_json::Value>) {
@@ -341,7 +341,7 @@ async fn orphan_task_row(
 /// # Panics
 ///
 /// Panics when the evidence is absent or carries no cursor.
-fn cursor_of(evidence: Option<&serde_json::Value>) -> String {
+pub(super) fn cursor_of(evidence: Option<&serde_json::Value>) -> String {
     let evidence = evidence.expect("a bounded pass leaves a durable cursor");
     let mut keys: Vec<&str> = evidence
         .as_object()
@@ -370,7 +370,7 @@ fn cursor_of(evidence: Option<&serde_json::Value>) -> String {
 /// # Panics
 ///
 /// Panics when the live set cannot be read.
-async fn protected_forge_outputs(fixture: &PromotionIntegrationFixture) -> Vec<String> {
+pub(super) async fn protected_forge_outputs(fixture: &PromotionIntegrationFixture) -> Vec<String> {
     let root = format!("{}/", forge_root(fixture));
     fixture
         .live_data_paths()
@@ -731,7 +731,9 @@ async fn one_eligible_orphan(name: &str) -> OrphanBatch {
 /// # Panics
 ///
 /// Panics when the diagnostic read fails.
-async fn orphan_operations(fixture: &PromotionIntegrationFixture) -> Vec<(Uuid, String)> {
+pub(super) async fn orphan_operations(
+    fixture: &PromotionIntegrationFixture,
+) -> Vec<(Uuid, String)> {
     sqlx::query_as(
         "SELECT operation_id,phase FROM vala.forge_operation_state WHERE data_tenant_id=$1 AND family='orphan_gc' ORDER BY prepared_at,operation_id",
     )
@@ -746,7 +748,7 @@ async fn orphan_operations(fixture: &PromotionIntegrationFixture) -> Vec<(Uuid, 
 /// # Panics
 ///
 /// Panics when the diagnostic read fails.
-async fn orphan_gc_audits(fixture: &PromotionIntegrationFixture) -> Vec<String> {
+pub(super) async fn orphan_gc_audits(fixture: &PromotionIntegrationFixture) -> Vec<String> {
     tenant_audits(fixture, "forge.orphan_gc.%", None).await
 }
 

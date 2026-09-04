@@ -18,6 +18,8 @@ use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
 
 use std::sync::Arc;
 
+use super::rewrite_support::PromotedRewriteFixture;
+use super::snapshot_expiration::object_exists;
 use super::snapshot_expiration::{
     ExpirableTable, expirable_table, head_watermark, seed_ready_expiry_task,
 };
@@ -594,4 +596,190 @@ async fn forge_metrics_describe_real_data_flow() {
         "bifrost_forge_pending_tasks",
         "bifrost_forge_planning_demands",
     ]);
+}
+
+/// The production coordinator and worker collect exactly one rowless generation.
+///
+/// A real managed rewrite is refused before its `Prepared` operation row
+/// commits, so the outputs it already closed are named by no snapshot, no
+/// operation row, and no audit transition. The route that removes them is the
+/// ordinary one: the production scheduler plans an orphan-cleanup task and a
+/// separately owned production worker claims and executes it. Nothing here
+/// calls the retained collector directly, so the proof covers admission,
+/// dispatch, delete, and cursor settlement rather than the collector alone.
+///
+/// The fixture runs on the system clock with a 50 ms age floor, so object age
+/// and the SQL demand cutoff share one wall-clock basis and the young-survival
+/// assertion is real rather than seeded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Postgres, Iceberg, and object storage"]
+async fn coordinator_and_worker_delete_only_exact_never_published_generation() {
+    let mut promoted = PromotedRewriteFixture::start_unpromoted("orphan_route").await;
+    promoted.fixture.config.orphan_gc_ttl = std::time::Duration::from_millis(50);
+    // One entry per page and one page per pass, so the route must checkpoint a
+    // durable cursor and resume it across the worker restarts below.
+    promoted.fixture.config.orphan_gc_max_list_pages = 1;
+    let object_store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
+    object_store.page_listing_by(1);
+    let catalog = PromotionCatalogSeam::new(
+        promoted.fixture.catalog.iceberg_catalog(),
+        object_store.read_counter(),
+    );
+    let mut supervisor = SupervisedPromotion::start(
+        &promoted.fixture,
+        Arc::clone(&catalog) as Arc<dyn iceberg::Catalog>,
+        Arc::clone(&object_store) as Arc<dyn vala_bifrost_redux::forge::ForgeObjectStore>,
+        vala_bifrost_redux::forge::ForgeClock::system(),
+    );
+    supervisor.run_one_success().await;
+
+    // One real managed rewrite closes its outputs and is then refused by its
+    // own cancellation token, the last authority checked before the `Prepared`
+    // operation row would commit.
+    supervisor.restart_worker();
+    let worker_stop = supervisor.worker_stop();
+    let refusal = supervisor
+        .run_one_failure_holding_handoff(async {
+            worker_stop.cancel();
+        })
+        .await;
+    let rowless: Vec<String> = supervisor
+        .last_possible_rewrite_outputs()
+        .expect("the refused rewrite reported its possible outputs")
+        .iter()
+        .filter(|output| output.settled)
+        .map(|output| {
+            let prefix = &promoted.fixture.binding.object_prefix;
+            let at = output
+                .path
+                .find(prefix.as_str())
+                .expect("a produced output is inside its own table binding");
+            output.path[at..].to_owned()
+        })
+        .collect();
+    assert!(
+        !rowless.is_empty(),
+        "the refused rewrite closed at least one real output: {refusal}"
+    );
+
+    // Every safety root the collector must never address.
+    let lookalikes = super::orphan_cleanup::seed_lookalikes(&promoted.fixture).await;
+    let protected = super::orphan_cleanup::protected_forge_outputs(&promoted.fixture).await;
+    let live = promoted.fixture.live_data_paths().await;
+    assert!(!live.is_empty(), "the promoted live set is a safety root");
+
+    // Drive the real coordinator and worker until an orphan-cleanup task has
+    // settled. Earlier passes still owe compaction, so the loop also proves the
+    // orphan route is reached without pre-empting the strategies ahead of it.
+    let mut settled_orphan = None;
+    let mut cursors: Vec<String> = Vec::new();
+    for _ in 0..64 {
+        supervisor.schedule_only().await;
+        let tasks = settled_tasks(&promoted.fixture).await;
+        if let Some((task_id, _, _)) = tasks
+            .iter()
+            .find(|(_, strategy, state)| strategy == "orphan_cleanup" && state == "succeeded")
+        {
+            settled_orphan = Some(*task_id);
+            break;
+        }
+        // Retry backoff is wall-clock and unrelated to what this scenario
+        // proves, so the existing fixture aging retires it instead of sleeping.
+        promoted.fixture.clear_task_backoff().await;
+        let claimable: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM vala.forge_tasks WHERE data_tenant_id=$1 \
+             AND state IN ('ready','retryable') AND ready_at <= now()",
+        )
+        .bind(promoted.fixture.tenant.as_uuid())
+        .fetch_one(promoted.fixture.operator_pool.pool())
+        .await
+        .expect("claimable Forge tasks are readable");
+        if claimable > 0 {
+            supervisor.restart_worker();
+            supervisor.settle_some_success().await;
+        }
+        if let Some((orphan_id, _, _)) = tasks
+            .iter()
+            .find(|(_, strategy, _)| strategy == "orphan_cleanup")
+        {
+            let (_, evidence) =
+                super::orphan_cleanup::orphan_task_row(&promoted.fixture, *orphan_id).await;
+            if evidence.is_some() {
+                let cursor = super::orphan_cleanup::cursor_of(evidence.as_ref());
+                if cursors.last() != Some(&cursor) {
+                    cursors.push(cursor);
+                }
+            }
+        }
+    }
+    let observed = settled_tasks(&promoted.fixture).await;
+    let task_id = settled_orphan.unwrap_or_else(|| {
+        panic!("the production route settles one orphan-cleanup task; saw {observed:?}")
+    });
+
+    // Only the exact rowless generation is gone.
+    for path in &rowless {
+        assert!(
+            !object_exists(&promoted.fixture, path).await,
+            "the never-published output {path} survived its own collection route"
+        );
+    }
+    for path in lookalikes.iter().chain(protected.iter()).chain(live.iter()) {
+        assert!(
+            object_exists(&promoted.fixture, path).await,
+            "a protected, live, or invalid object was collected: {path}"
+        );
+    }
+
+    // The durable cursor survives the worker restarts the loop already made.
+    let (state, evidence) =
+        super::orphan_cleanup::orphan_task_row(&promoted.fixture, task_id).await;
+    assert_eq!(state, "succeeded");
+    assert!(
+        evidence.is_none(),
+        "an exhausted pass retires its cursor: {evidence:?}"
+    );
+    // The route checkpointed a durable resume point inside its own recipe root
+    // while the worker was restarted around it, and never moved that point
+    // backward. Cursor page ordering itself is owned by
+    // `orphan_cleanup::bounded_retry_resumes_after_cursor_without_starvation`.
+    assert!(
+        !cursors.is_empty(),
+        "the bounded route checkpointed no resumable cursor"
+    );
+    let root = format!("{}/data/forge/v1", promoted.fixture.binding.object_prefix);
+    assert!(
+        cursors.iter().all(|cursor| cursor.starts_with(&root)),
+        "a durable cursor left the recipe root: {cursors:?}"
+    );
+    assert!(
+        cursors.windows(2).all(|pair| pair[0] < pair[1]),
+        "a restarted worker replayed or rewound its durable cursor: {cursors:?}"
+    );
+
+    // No destructive sibling route ran: the table never owed an expiration or a
+    // cleanup handoff, so nothing but collection could have removed an object.
+    assert!(
+        observed
+            .iter()
+            .all(|(_, strategy, _)| strategy != "snapshot_expiry" && strategy != "expired_cleanup"),
+        "a sibling destructive route ran beside collection: {observed:?}"
+    );
+
+    // Identity is orphan-only: no other route wrote an operation or audit row
+    // while this one ran.
+    let operations = super::orphan_cleanup::orphan_operations(&promoted.fixture).await;
+    assert!(
+        !operations.is_empty(),
+        "the collection route owns its own operation identity"
+    );
+    let audits = super::orphan_cleanup::orphan_gc_audits(&promoted.fixture).await;
+    assert!(
+        audits
+            .iter()
+            .all(|entry| entry.starts_with("forge.orphan_gc.")),
+        "the collection route wrote an audit belonging to another owner: {audits:?}"
+    );
+
+    supervisor.shutdown().await;
 }

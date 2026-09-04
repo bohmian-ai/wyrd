@@ -857,7 +857,8 @@ impl ChildConfig {
     ///
     /// Returns [`ProcessClusterError::Child`] when this target composes no
     /// Oracle or no Analytical handle, the resource plan admits no Analytical
-    /// query, scratch cannot be measured, or the statement fails.
+    /// query, scratch cannot be measured, the statement fails, or the
+    /// statement's graph does not settle inside the bounded wait.
     async fn execute_analytical_baseline(
         &self,
         server: &WyrdTestServer,
@@ -912,7 +913,11 @@ impl ChildConfig {
         {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        let physical = supervisor.settled_physical_evidence();
+        let physical = settled_analytical_evidence(
+            settled_before,
+            supervisor.settled_graph_count(),
+            supervisor.settled_physical_evidence(),
+        )?;
         let scratch_after = scratch_usage(&scratch_root)?;
         Ok(super::AnalyticalBaselineEvidence {
             rows,
@@ -1614,6 +1619,35 @@ fn fixture_rows_ipc(
     Ok(bytes::Bytes::from(ipc))
 }
 
+/// Admits settled physical evidence only when the settlement counter advanced.
+///
+/// The supervisor retains the last settled graph's evidence, so a value being
+/// present says nothing about which statement folded it. Reading it after the
+/// bounded wait expired would attribute a predecessor's spill numbers to this
+/// query. The counter is the only fact that separates the two, so it decides.
+///
+/// # Errors
+///
+/// Returns [`ProcessClusterError::Child`] when `settled_after` did not advance
+/// past `settled_before`, meaning this statement's graph never settled inside
+/// the baseline's bounded wait.
+fn settled_analytical_evidence(
+    settled_before: u64,
+    settled_after: u64,
+    evidence: Option<vala_bifrost_redux::oracle::analytical::AnalyticalPhysicalEvidence>,
+) -> Result<
+    Option<vala_bifrost_redux::oracle::analytical::AnalyticalPhysicalEvidence>,
+    ProcessClusterError,
+> {
+    if settled_after <= settled_before {
+        return Err(ProcessClusterError::Child(
+            "the analytical baseline statement's graph did not settle inside its bounded wait"
+                .to_owned(),
+        ));
+    }
+    Ok(evidence)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -1624,7 +1658,7 @@ mod tests {
         VisibilityMode,
     };
 
-    use super::{ProcessClusterError, accept_query_terminal};
+    use super::{ProcessClusterError, accept_query_terminal, settled_analytical_evidence};
 
     /// Rows already on the wire are discarded when the terminal is not a
     /// validated success.
@@ -1709,6 +1743,45 @@ mod tests {
         assert!(
             !decoder.eos_accepted(),
             "a failed terminal carries no end-of-stream to accept"
+        );
+    }
+
+    /// A settlement counter that never advanced cannot license physical
+    /// evidence, even when a nonempty value is already retained.
+    ///
+    /// The retained value in this case belongs to whatever settled before this
+    /// statement, so accepting it would report a predecessor's spill numbers as
+    /// this query's. The advancing case proves the guard is about the counter
+    /// rather than about the evidence being present.
+    ///
+    /// Required mutation RED: read the evidence without comparing the counters,
+    /// and the stale value is returned as this statement's own.
+    #[test]
+    fn analytical_baseline_rejects_predecessor_evidence_without_new_settlement() {
+        let predecessor = vala_bifrost_redux::oracle::analytical::AnalyticalPhysicalEvidence {
+            sort_schema: vec!["key".to_owned()],
+            sort_ordering: "key@0 ASC".to_owned(),
+            spill_count: 7,
+            spilled_bytes: 4_096,
+            spilled_rows: 128,
+            aggregate_group_types: vec!["Int64".to_owned()],
+            join_build_schemas: vec![vec!["key".to_owned()]],
+        };
+
+        let stale = settled_analytical_evidence(4, 4, Some(predecessor.clone()))
+            .expect_err("an unadvanced settlement counter licenses no evidence");
+        assert!(
+            matches!(stale, ProcessClusterError::Child(ref detail)
+                if detail.contains("analytical baseline")),
+            "the refusal is the child error naming the analytical baseline settlement, got {stale:?}"
+        );
+
+        let settled = settled_analytical_evidence(4, 5, Some(predecessor.clone()))
+            .expect("an advanced settlement counter admits the current evidence");
+        assert_eq!(
+            settled,
+            Some(predecessor),
+            "the admitted evidence is the value the settled graph folded"
         );
     }
 }

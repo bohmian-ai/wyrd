@@ -625,7 +625,7 @@ async fn compaction_geometry_exact_rows_and_non_destructive_second_pass() {
     );
     let (neighbour_snapshot, neighbour_files) = journey.live_files(&neighbour_table.binding).await;
     // The managed core first normalizes promoted-file identity, then packs
-    // current-recipe files. Each pass must publish progress until geometry holds.
+    // current-recipe files. Continue packing residues until a pass is unchanged.
     let mut replacement = journey.live_files(&table.binding).await;
     for pass in 0..8 {
         journey.scheduler_pass().await;
@@ -638,16 +638,16 @@ async fn compaction_geometry_exact_rows_and_non_destructive_second_pass() {
                 .map(DataFile::file_size_in_bytes)
                 .collect::<Vec<_>>()
         );
-        assert_ne!(
-            next.0, replacement.0,
-            "geometry backlog makes snapshot progress"
-        );
+        let unchanged = next.0 == replacement.0;
         replacement = next;
-        if replacement
-            .1
-            .values()
-            .any(|file| file.file_size_in_bytes() >= 900 * 1024 * 1024)
-        {
+        if unchanged {
+            assert!(
+                replacement
+                    .1
+                    .values()
+                    .any(|file| file.file_size_in_bytes() >= 900 * 1024 * 1024),
+                "geometry backlog must make progress before reaching an unchanged cut"
+            );
             break;
         }
     }

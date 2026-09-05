@@ -815,7 +815,7 @@ impl ScribeIngressPlanner {
         }
         let material =
             projection.measure_traces(request, configured_otlp_material_bytes(self.limits)?)?;
-        counts.finish(request_bytes, name_bytes, material)
+        counts.finish(request_bytes, name_bytes, material.as_ref())
     }
 
     /// Counts a typed metrics request without projecting records.
@@ -886,7 +886,7 @@ impl ScribeIngressPlanner {
         }
         let material =
             projection.measure_metrics(request, configured_otlp_material_bytes(self.limits)?)?;
-        counts.finish(request_bytes, name_bytes, material)
+        counts.finish(request_bytes, name_bytes, material.as_ref())
     }
 
     /// Counts a typed logs request without projecting records.
@@ -934,7 +934,7 @@ impl ScribeIngressPlanner {
         }
         let material =
             projection.measure_logs(request, configured_otlp_material_bytes(self.limits)?)?;
-        counts.finish(request_bytes, name_bytes, material)
+        counts.finish(request_bytes, name_bytes, material.as_ref())
     }
 }
 
@@ -1436,13 +1436,12 @@ impl OtlpCounts {
         self,
         request_bytes: usize,
         name_bytes: usize,
-        material: Option<OtlpManagedMaterialPlan>,
+        material: Option<&OtlpManagedMaterialPlan>,
     ) -> Result<IngestMaterialPlan, ScribeError> {
-        let rows = material.as_ref().map_or(0, |value| value.rows);
-        let current_material_bytes = material
-            .as_ref()
-            .map_or(Ok(0), |value| value.admitted_bytes(usize::MAX))?;
-        let persistence_candidate_bytes = material.as_ref().map_or(0, |value| value.arrow_bytes);
+        let rows = material.map_or(0, |value| value.rows);
+        let current_material_bytes =
+            material.map_or(Ok(0), |value| value.admitted_bytes(usize::MAX))?;
+        let persistence_candidate_bytes = material.map_or(0, |value| value.arrow_bytes);
         let source_count = usize::from(material.is_some());
         let mut sources = [SourceMaterialPlan::default(); MAX_SOURCE_PLANS];
         if source_count != 0 {

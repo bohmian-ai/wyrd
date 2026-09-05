@@ -418,6 +418,16 @@ fn active_tasks(snapshot: &BenchmarkMetricSnapshot) -> f64 {
         .sum()
 }
 
+/// Counts completed ownership durations across all durable outcome labels.
+fn duration_count(snapshot: &BenchmarkMetricSnapshot) -> u64 {
+    snapshot
+        .histograms
+        .iter()
+        .filter(|(name, _)| name.starts_with("bifrost_forge_task_duration_seconds{"))
+        .map(|(_, value)| value.count)
+        .sum()
+}
+
 /// Checks exact integer debt values representable by these small real fixtures.
 ///
 /// # Panics
@@ -1627,4 +1637,218 @@ async fn scheduler_open_cycle_tracks_roster_changes() {
         (5, u64::try_from(bytes).expect("nonnegative file bytes"))
     );
     eprintln!("roster debt pages: 2, 2 (removed old member), 5/{bytes} bytes complete");
+}
+
+/// A cancelled sibling may return first, but cannot replace or abort the causal
+/// slot while that slot still owns its required durable telemetry observation.
+///
+/// # Panics
+/// Panics on delayed closure, primary-error loss, or incomplete ownership metrics.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Postgres, Iceberg, and object storage"]
+async fn worker_preserves_primary_fatal_during_sibling_shutdown() {
+    let telemetry = ForgeTelemetryCheckpoint::install();
+    let fixture = PromotionIntegrationFixture::start("primary_fatal").await;
+    fixture
+        .register_and_seal_table("cancelled_sibling", 2)
+        .await;
+    let observer = ForgeWorkerCompletionObserver::default();
+    observer.hold_before_next_lease_release_for_test();
+    observer.hold_before_fatal_observation_for_test();
+    observer.fail_next_lease_release();
+    let forge = fixture.build_forge_for_test(
+        fixture.catalog.iceberg_catalog(),
+        CountingObjectStore::new(Arc::clone(&fixture.staging)),
+        ForgeClock::system(),
+        observer.clone(),
+        ForgeSchedulerTrigger::default(),
+    );
+    let stop = CancellationToken::new();
+    ForgeScheduler::new(&forge)
+        .expect("scheduler")
+        .schedule_once(&stop)
+        .await
+        .expect("two plans");
+    sqlx::query("UPDATE vala.forge_tasks SET ready_at=now()+interval '1 hour',next_eligible_at=now()+interval '1 hour' WHERE table_name='cancelled_sibling'")
+        .execute(fixture.operator_pool.pool()).await.expect("defer sibling");
+    let worker = ForgeWorker::new(
+        forge,
+        ForgeWorkerConfig {
+            worker_concurrency: 2,
+            per_tenant_active_cap: 2,
+        },
+        Uuid::now_v7(),
+    )
+    .expect("two-slot worker");
+    let readiness = ForgeRoleReadiness::default();
+    let mut work =
+        AbortOnDropHandle::new(tokio::spawn(worker.run(stop.clone(), readiness.clone())));
+    let progress = timeout(OWNERSHIP_BOUND, async {
+        observer.wait_for_held_lease_release_for_test().await;
+        assert!(readiness.is_ready(), "successful settlement is still healthy before release fails");
+        observer.hold_after_claims_for_test(1);
+        sqlx::query("UPDATE vala.forge_tasks SET ready_at=now(),next_eligible_at=now() WHERE table_name='cancelled_sibling'")
+            .execute(fixture.operator_pool.pool()).await.expect("eligible sibling");
+        observer.wait_for_claims_for_test().await;
+        observer.fail_next_cancelled_claim_release();
+        observer.release_held_lease_release_for_test();
+        observer.wait_for_fatal_observation_for_test().await;
+        assert!(!readiness.is_ready(), "fatal release closes before observation");
+        observer.release_claims_for_test();
+        observer.wait_for_joined_slots_for_test(1).await;
+        assert!(!work.is_finished(), "secondary error cannot finish the parent");
+        assert!((active_tasks(&telemetry.snapshot()) - 1.0).abs() < f64::EPSILON,
+            "the primary still owns its guard after the secondary joined");
+        assert_eq!(counter_total(&telemetry.snapshot(), "bifrost_forge_task_attempts_total", &[]), 0);
+        // Process shutdown races with the registered fatal reporter as well.
+        stop.cancel();
+        observer.release_fatal_observation_for_test();
+    }).await;
+    if progress.is_err() {
+        stop.cancel();
+        work.abort();
+        panic!(
+            "fatal/sibling gate timeout: ready={}, attempts={}, active={}",
+            readiness.is_ready(),
+            observer.attempts(),
+            active_tasks(&telemetry.snapshot())
+        );
+    }
+    let error = if let Ok(result) = timeout(OWNERSHIP_BOUND, &mut work).await {
+        result.expect("join").expect_err("primary remains fatal")
+    } else {
+        stop.cancel();
+        work.abort();
+        panic!(
+            "primary did not finish observation: ready={}, attempts={}",
+            readiness.is_ready(),
+            observer.attempts()
+        );
+    };
+    assert!(
+        error.to_string().contains("table lease release failure"),
+        "{error}"
+    );
+    assert!(
+        !error.to_string().contains("cancelled claim"),
+        "secondary displaced primary: {error}"
+    );
+    assert_completed_episode(&telemetry.snapshot(), 0, "succeeded", Duration::ZERO);
+    let sibling: (String, i32) = sqlx::query_as(
+        "SELECT state,attempt_count FROM vala.forge_tasks WHERE table_name='cancelled_sibling'",
+    )
+    .fetch_one(fixture.operator_pool.pool())
+    .await
+    .expect("retained sibling");
+    assert_eq!(sibling, ("claimed".to_owned(), 0));
+    eprintln!(
+        "fatal parent: ready=false before telemetry; secondary joined first; original release error; attempts=1 succeeded; active=0; sibling={sibling:?}"
+    );
+}
+
+/// A running slot discovering invalid Prepared evidence closes readiness before
+/// held lease cleanup, preserves reconciliation over release, and observes uncertainty.
+///
+/// # Panics
+/// Panics on late readiness loss, error replacement, or missing ownership observation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Postgres, Iceberg, and object storage"]
+async fn worker_prepared_fatal_closes_before_release_and_observation() {
+    let telemetry = ForgeTelemetryCheckpoint::install();
+    let fixture = PromotionIntegrationFixture::start("prepared_fatal").await;
+    let observer = ForgeWorkerCompletionObserver::default();
+    let forge = fixture.build_forge_for_test(
+        fixture.catalog.iceberg_catalog(),
+        CountingObjectStore::new(Arc::clone(&fixture.staging)),
+        ForgeClock::system(),
+        observer.clone(),
+        ForgeSchedulerTrigger::default(),
+    );
+    let stop = CancellationToken::new();
+    ForgeScheduler::new(&forge)
+        .expect("scheduler")
+        .schedule_once(&stop)
+        .await
+        .expect("plan");
+    fixture.prepare_recovery_episode(&forge, &stop).await;
+    sqlx::query("UPDATE vala.forge_tasks SET claim_expires_at=now()+interval '1 hour', evidence=jsonb_set(evidence,'{committed_snapshot_id}','999999')")
+        .execute(fixture.operator_pool.pool()).await.expect("live foreign Prepared claim");
+    let before = telemetry.snapshot();
+    observer.hold_before_next_lease_release_for_test();
+    observer.hold_before_fatal_observation_for_test();
+    observer.fail_next_lease_release();
+    let worker =
+        ForgeWorker::new(forge, ForgeWorkerConfig::default(), Uuid::now_v7()).expect("worker");
+    let readiness = ForgeRoleReadiness::default();
+    let mut work =
+        AbortOnDropHandle::new(tokio::spawn(worker.run(stop.clone(), readiness.clone())));
+    let progress = timeout(OWNERSHIP_BOUND, async {
+        while !readiness.is_ready() {
+            tokio::task::yield_now().await;
+        }
+        sqlx::query("UPDATE vala.forge_tasks SET claim_expires_at=now()-interval '1 hour'")
+            .execute(fixture.operator_pool.pool())
+            .await
+            .expect("recovery becomes eligible after startup");
+        observer.wait_for_held_lease_release_for_test().await;
+        assert!(
+            !readiness.is_ready(),
+            "known reconciliation failure closes before release"
+        );
+        assert!((active_tasks(&telemetry.snapshot()) - 1.0).abs() < f64::EPSILON);
+        observer.release_held_lease_release_for_test();
+        observer.wait_for_fatal_observation_for_test().await;
+        assert!(!readiness.is_ready());
+        assert!(!work.is_finished());
+        observer.release_fatal_observation_for_test();
+    })
+    .await;
+    if progress.is_err() {
+        stop.cancel();
+        work.abort();
+        panic!(
+            "Prepared fatal boundary timeout: ready={}, attempts={}, errors={:?}",
+            readiness.is_ready(),
+            observer.attempts(),
+            observer.returned_errors()
+        );
+    }
+    let error = if let Ok(result) = timeout(OWNERSHIP_BOUND, &mut work).await {
+        result
+            .expect("join")
+            .expect_err("reconciliation remains fatal")
+    } else {
+        stop.cancel();
+        work.abort();
+        panic!(
+            "Prepared observation did not drain: ready={}, attempts={}",
+            readiness.is_ready(),
+            observer.attempts()
+        );
+    };
+    stop.cancel();
+    assert!(
+        error
+            .to_string()
+            .contains("Prepared evidence snapshot is no longer retained"),
+        "{error}"
+    );
+    let after = telemetry.snapshot();
+    assert!(active_tasks(&after).abs() < f64::EPSILON);
+    assert_eq!(
+        counter_total(
+            &after,
+            "bifrost_forge_task_attempts_total",
+            &[("result", "uncertain")]
+        ) - counter_total(
+            &before,
+            "bifrost_forge_task_attempts_total",
+            &[("result", "uncertain")]
+        ),
+        1
+    );
+    assert_eq!(duration_count(&after) - duration_count(&before), 1);
+    eprintln!(
+        "Prepared fatal: ready=false while release held; reconciliation error preserved; uncertain attempt/duration delta=1; active=0"
+    );
 }

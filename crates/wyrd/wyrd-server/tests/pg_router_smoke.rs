@@ -2847,6 +2847,9 @@ async fn live_foreign_claim_does_not_block_readiness() {
 #[cfg(feature = "test-support")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn release_failure_clears_readiness() {
+    let metrics = metrics_exporter_prometheus::PrometheusBuilder::new()
+        .install_recorder()
+        .expect("process-local Prometheus recorder");
     let observer = vala_bifrost_redux::forge::ForgeWorkerCompletionObserver::new();
     let server = WyrdTestServer::builder()
         .with_forge_completion_observer_for_test(observer.clone())
@@ -2879,7 +2882,8 @@ async fn release_failure_clears_readiness() {
         "worker before its release fault is armed",
     )
     .await;
-    observer.hold_after_next_attempt_for_test();
+    observer.hold_before_next_lease_release_for_test();
+    observer.hold_before_fatal_observation_for_test();
     observer.fail_next_lease_release();
 
     // A well-formed payload on a table this catalog does not carry reaches the
@@ -2895,9 +2899,37 @@ async fn release_failure_clears_readiness() {
     )
     .await;
 
+    let setup = tokio::time::timeout(FORGE_READINESS_CEILING, async {
+        observer.wait_for_held_lease_release_for_test().await;
+        observer.hold_after_claims_for_test(1);
+        let parked = seed_ready_forge_task(
+            &pool,
+            uuid::Uuid::from(server.data_tenant_id()),
+            "parked_release_sibling",
+            "small_files",
+            true,
+            LIVE_REWRITE_PLAN,
+        )
+        .await;
+        observer.wait_for_claims_for_test().await;
+        observer.release_held_lease_release_for_test();
+        parked
+    })
+    .await;
+    let parked = if let Ok(parked) = setup {
+        parked
+    } else {
+        stop.cancel();
+        handle.abort();
+        panic!(
+            "release/sibling setup timeout: ready={}, attempts={}",
+            readiness.is_ready(),
+            observer.attempts()
+        );
+    };
     if tokio::time::timeout(
         FORGE_READINESS_CEILING,
-        observer.wait_for_held_attempt_for_test(),
+        observer.wait_for_fatal_observation_for_test(),
     )
     .await
     .is_err()
@@ -2914,7 +2946,10 @@ async fn release_failure_clears_readiness() {
         !observer.lease_release_failure_armed(),
         "the first task consumed the release fault"
     );
-    observer.hold_after_claims_for_test(1);
+    assert!(
+        !readiness.is_ready(),
+        "known fatal release must close readiness before telemetry"
+    );
     let sibling = seed_ready_forge_task(
         &pool,
         uuid::Uuid::from(server.data_tenant_id()),
@@ -2924,18 +2959,6 @@ async fn release_failure_clears_readiness() {
         LIVE_REWRITE_PLAN,
     )
     .await;
-    if tokio::time::timeout(FORGE_READINESS_CEILING, observer.wait_for_claims_for_test())
-        .await
-        .is_err()
-    {
-        stop.cancel();
-        handle.abort();
-        panic!(
-            "sibling did not reach its claim barrier: ready={}, attempts={}",
-            readiness.is_ready(),
-            observer.attempts()
-        );
-    }
     let before: (String, i32, Option<uuid::Uuid>) = sqlx::query_as(
         "SELECT state,attempt_count,attempt_id FROM vala.forge_tasks WHERE task_id=$1",
     )
@@ -2943,22 +2966,29 @@ async fn release_failure_clears_readiness() {
     .fetch_one(&pool)
     .await
     .expect("parked sibling row");
-    assert_eq!(before.0, "claimed");
+    assert_eq!(before.0, "ready");
     assert_eq!(before.1, 0, "parked claim has not executed an attempt");
-    assert!(before.2.is_some());
-    observer.release_held_attempt_for_test();
-    await_forge_role(
-        &server,
-        false,
-        wyrd_server::state::Forge::worker_readiness,
-        "fatal release before sibling resumes",
-    )
-    .await;
-    eprintln!(
-        "before sibling release: ready={}, sibling={before:?}",
-        readiness.is_ready()
-    );
+    assert!(before.2.is_none());
     observer.release_claims_for_test();
+    if tokio::time::timeout(
+        FORGE_READINESS_CEILING,
+        observer.wait_for_joined_slots_for_test(1),
+    )
+    .await
+    .is_err()
+    {
+        stop.cancel();
+        handle.abort();
+        panic!(
+            "cancelled sibling did not join: ready={}, new demand={before:?}",
+            readiness.is_ready()
+        );
+    }
+    assert!(
+        !handle.is_finished(),
+        "primary observation must not be aborted"
+    );
+    observer.release_fatal_observation_for_test();
     let joined = tokio::time::timeout(FORGE_READINESS_CEILING, &mut handle).await;
     stop.cancel();
     let error = match joined {
@@ -2981,6 +3011,37 @@ async fn release_failure_clears_readiness() {
     assert!(
         !readiness.is_ready(),
         "a worker still holding an unreleased table fence advertised ready"
+    );
+    let rendered = metrics.render();
+    for family in [
+        "bifrost_forge_task_attempts_total",
+        "bifrost_forge_task_duration_seconds_count",
+    ] {
+        let sample = rendered
+            .lines()
+            .find(|line| {
+                line.starts_with(family)
+                    && line.contains("task_type=\"small_files\"")
+                    && line.contains("result=\"retry\"")
+            })
+            .expect("both durable Retryable ownership episodes are observed");
+        assert_eq!(
+            sample.rsplit_once(' ').expect("Prometheus sample").1,
+            "2",
+            "{sample}"
+        );
+    }
+    let active = rendered
+        .lines()
+        .find(|line| {
+            line.starts_with("bifrost_forge_active_tasks{")
+                && line.contains("task_type=\"small_files\"")
+        })
+        .expect("active ownership series");
+    assert_eq!(
+        active.rsplit_once(' ').expect("active sample").1,
+        "0",
+        "{active}"
     );
     let state: String = sqlx::query_scalar("SELECT state FROM vala.forge_tasks WHERE task_id=$1")
         .bind(task_id)
@@ -3006,14 +3067,12 @@ async fn release_failure_clears_readiness() {
         vala_bifrost_redux::forge::ForgeLifecycleEvent::Claimed { task_id, .. } if *task_id == sibling
     )).count();
     assert_eq!(
-        sibling_claims, 1,
-        "the sibling made exactly its original parked claim"
+        sibling_claims, 0,
+        "newly eligible work must receive no sibling claim"
     );
     eprintln!("after worker join: sibling={after:?}; no later claim or attempt");
-    // Make the retained sibling claim recoverable through the ordinary expiry path.
-    sqlx::query("UPDATE vala.forge_tasks SET claim_expires_at=statement_timestamp()-interval '1 second' WHERE task_id=$1")
-        .bind(sibling).execute(&pool).await.expect("expire retained sibling claim");
-
+    sqlx::query("UPDATE vala.forge_tasks SET claim_expires_at=statement_timestamp()-interval '1 second' WHERE task_id=$1 AND state='claimed'")
+        .bind(parked).execute(&pool).await.expect("recover any supervisor-aborted parked claim");
     await_forge_role_while_running(&server, "worker after its release recovers").await;
     server.shutdown().await.expect("test server shuts down");
 }

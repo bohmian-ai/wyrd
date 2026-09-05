@@ -6,20 +6,20 @@
 
 use std::path::Path;
 use std::str::FromStr;
-use std::sync::Arc;
 #[cfg(feature = "test-support")]
 use std::sync::Mutex;
 #[cfg(feature = "test-support")]
 use std::sync::atomic::AtomicBool;
 #[cfg(feature = "test-support")]
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use iceberg::spec::TableMetadata;
 use iceberg::table::Table;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
-use tokio::task::JoinSet;
+use tokio::task::{Id, JoinSet};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use vala_sql::queries::forge_tasks::{ForgeClaimLimits, ForgeTasks};
@@ -51,7 +51,7 @@ use super::path::catalog_path_to_object_key;
 use super::scribe_promotion::{
     ForgePromotionCommit, ForgePromotionSettlement, ScribePromotionPlan,
 };
-use super::{Forge, ForgeCapacity};
+use super::{Forge, ForgeCapacity, ForgeRoleReadiness};
 use crate::catalog::TenantTableBinding;
 use crate::catalog::layout::forge_data_location;
 
@@ -477,6 +477,24 @@ pub struct ForgeWorkerCompletionObserver {
     /// Lets the parked release continue through its real production boundary.
     #[cfg(feature = "test-support")]
     release_pause_resume: Arc<tokio::sync::Notify>,
+    /// Count of slot joins fully processed by the production parent.
+    #[cfg(feature = "test-support")]
+    joined_slots: Arc<AtomicUsize>,
+    /// Notifies tests that a secondary result has reached parent error selection.
+    #[cfg(feature = "test-support")]
+    joined_slot_ready: Arc<tokio::sync::Notify>,
+    /// One-shot pause before post-fatal durable telemetry observation.
+    #[cfg(feature = "test-support")]
+    hold_next_fatal_observation: Arc<AtomicBool>,
+    /// Whether the fatal slot is waiting to observe its durable result.
+    #[cfg(feature = "test-support")]
+    fatal_observation_paused: Arc<AtomicBool>,
+    /// Notifies tests that fatal observation has reached its gate.
+    #[cfg(feature = "test-support")]
+    fatal_observation_ready: Arc<tokio::sync::Notify>,
+    /// Releases the original fatal slot to finish required observation.
+    #[cfg(feature = "test-support")]
+    fatal_observation_resume: Arc<tokio::sync::Notify>,
     /// One-shot injected failure of the next cancelled-claim release.
     #[cfg(feature = "test-support")]
     fail_next_cancelled_claim_release: Arc<AtomicBool>,
@@ -913,6 +931,54 @@ impl ForgeWorkerCompletionObserver {
         }
     }
 
+    /// Waits until the parent has processed the requested number of slot joins.
+    /// Callers bound this diagnostic wait and cancel spawned work on timeout.
+    pub async fn wait_for_joined_slots_for_test(&self, expected: usize) {
+        loop {
+            let notified = self.joined_slot_ready.notified();
+            if self.joined_slots.load(Ordering::Acquire) >= expected {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Holds the next fatal result immediately before durable telemetry observation.
+    pub fn hold_before_fatal_observation_for_test(&self) {
+        self.fatal_observation_paused
+            .store(false, Ordering::Release);
+        self.hold_next_fatal_observation
+            .store(true, Ordering::Release);
+    }
+
+    /// Waits for the fatal observation gate; callers bound and cancel their work.
+    pub async fn wait_for_fatal_observation_for_test(&self) {
+        loop {
+            let notified = self.fatal_observation_ready.notified();
+            if self.fatal_observation_paused.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Releases fatal observation without changing its durable result or error.
+    pub fn release_fatal_observation_for_test(&self) {
+        self.fatal_observation_resume.notify_one();
+    }
+
+    /// Parks one fatal slot until the test permits its telemetry read to proceed.
+    async fn pause_fatal_observation_for_test(&self) {
+        if self
+            .hold_next_fatal_observation
+            .swap(false, Ordering::AcqRel)
+        {
+            self.fatal_observation_paused.store(true, Ordering::Release);
+            self.fatal_observation_ready.notify_waiters();
+            self.fatal_observation_resume.notified().await;
+        }
+    }
+
     /// Parks the next table-lease release after execution and durable settlement.
     pub fn hold_before_next_lease_release_for_test(&self) {
         self.release_paused.store(false, Ordering::Release);
@@ -1266,6 +1332,17 @@ fn prepared_effect_progressed(evidence: &ForgeTaskEvidence, base_snapshot_id: i6
     evidence.committed_snapshot_id != Some(base_snapshot_id) || evidence.deleted_candidate_count > 0
 }
 
+/// Shared bookkeeping for one running worker's existing slots and readiness.
+#[derive(Clone)]
+struct ForgeWorkerRunControls {
+    /// Existing role handle; no slot owns an independent readiness decision.
+    readiness: ForgeRoleReadiness,
+    /// Existing shared child token used to stop sibling claims.
+    stop: CancellationToken,
+    /// Causal slot whose actual error must survive cleanup and observation.
+    first_failure: Arc<OnceLock<Id>>,
+}
+
 /// Claim-driven Forge executor shared by embedded and dedicated topologies.
 #[derive(Clone)]
 pub struct ForgeWorker {
@@ -1282,6 +1359,8 @@ pub struct ForgeWorker {
     completion_observer: Option<ForgeWorkerCompletionObserver>,
     /// Complete capacity declaration passed to atomic `PostgreSQL` admission.
     capacity: ForgeCapacity,
+    /// Present only on spawned slots, never on direct fixtures or startup recovery.
+    run_controls: Option<ForgeWorkerRunControls>,
 }
 
 impl ForgeWorker {
@@ -1307,7 +1386,19 @@ impl ForgeWorker {
             owner,
             config,
             capacity,
+            run_controls: None,
         })
+    }
+
+    /// Registers the causal slot, closes readiness, and cancels siblings without yielding.
+    /// Direct execution and startup recovery have no shared slot controls to close.
+    fn close_after_fatal(&self) {
+        let Some(controls) = &self.run_controls else {
+            return;
+        };
+        let _ = controls.first_failure.set(tokio::task::id());
+        controls.readiness.publish(false);
+        controls.stop.cancel();
     }
 
     /// Arms one failure after maintenance task Prepared commits but before expiry terminal audit.
@@ -1397,7 +1488,7 @@ impl ForgeWorker {
     pub async fn run(
         self,
         shutdown: CancellationToken,
-        readiness: super::ForgeRoleReadiness,
+        readiness: ForgeRoleReadiness,
     ) -> Result<(), ForgeError> {
         // Cleared on every exit, so a worker that stopped — cleanly, by
         // quarantine, or by a slot failure — never keeps advertising itself.
@@ -1407,93 +1498,25 @@ impl ForgeWorker {
         }
         readiness.publish(true);
         let mut slots = JoinSet::new();
-        // One child token shared by every slot. A slot that can no longer prove
-        // what it did to durable state must not let its siblings take another
-        // claim under the same owner, so the first failing slot cancels this
-        // token and the rest stop at their next pre-SQL checkpoint. It is a
-        // child of the process token so an ordinary shutdown still reaches all
-        // of them.
-        let slot_stop = shutdown.child_token();
+        let controls = ForgeWorkerRunControls {
+            readiness: readiness.clone(),
+            stop: shutdown.child_token(),
+            first_failure: Arc::new(OnceLock::new()),
+        };
         for index in 0..self.config.worker_concurrency {
-            let worker = self.clone();
-            let stop = slot_stop.clone();
-            let slot_readiness = readiness.clone();
-            let sibling_stop = slot_stop.clone();
-            // Slot zero is the reserved maintenance slot: it always attempts a
-            // maintenance-strategy claim before falling back to any strategy, so
-            // a ready maintenance task can never be starved by a compaction
-            // backlog occupying every other slot. With a single-slot worker that
-            // one slot carries the reservation.
-            let reserved_maintenance = index == 0;
+            let mut worker = self.clone();
+            worker.run_controls = Some(controls.clone());
+            let stop = controls.stop.clone();
+            // Slot zero retains the existing maintenance reservation.
             slots.spawn(async move {
-                let outcome = Box::pin(worker.run_slot(stop, reserved_maintenance)).await;
+                let outcome = Box::pin(worker.run_slot(stop, index == 0)).await;
                 if outcome.is_err() {
-                    // Readiness is cleared by the owner that first observes the
-                    // loss, before it reaches the parent. Waiting for the join
-                    // would leave a window in which a sibling still holding a
-                    // slot could take one more claim under an owner that can no
-                    // longer prove what it did.
-                    slot_readiness.publish(false);
-                    sibling_stop.cancel();
+                    worker.close_after_fatal();
                 }
                 outcome
             });
         }
-        // The first error is the one that describes why this worker stopped;
-        // later errors are usually its siblings observing the same cancellation.
-        let mut first_error = None;
-        // Draining the whole set is deliberate: a sibling still holds a lease
-        // and a claim, and joining it is what proves it released them.
-        loop {
-            let joined = tokio::select! {
-                () = shutdown.cancelled(), if first_error.is_none() => {
-                    // An ordinary drain closes routing before the slots are
-                    // asked to stop, for the same reason a failure does.
-                    readiness.publish(false);
-                    slot_stop.cancel();
-                    break;
-                }
-                joined = slots.join_next() => joined,
-            };
-            let Some(joined) = joined else { break };
-            let outcome = match joined {
-                Ok(outcome) => outcome,
-                // Expected once this supervisor aborts the remaining slots; it
-                // says nothing about why the worker stopped.
-                Err(error) if error.is_cancelled() => continue,
-                Err(error) => Err(ForgeError::Invariant {
-                    detail: format!("Forge worker slot panicked: {error}"),
-                }),
-            };
-            if let Err(error) = outcome
-                && first_error.is_none()
-            {
-                readiness.publish(false);
-                slot_stop.cancel();
-                // Nothing else may claim under this owner, so the siblings are
-                // aborted rather than allowed to finish their current attempt.
-                slots.abort_all();
-                first_error = Some(error);
-            }
-        }
-        while let Some(joined) = slots.join_next().await {
-            match joined {
-                Ok(Err(error)) if first_error.is_none() => {
-                    readiness.publish(false);
-                    first_error = Some(error);
-                }
-                Ok(_) => {}
-                Err(error) if error.is_cancelled() || first_error.is_some() => {
-                    let _ = error;
-                }
-                Err(error) => {
-                    readiness.publish(false);
-                    first_error = Some(ForgeError::Invariant {
-                        detail: format!("Forge worker slot panicked: {error}"),
-                    });
-                }
-            }
-        }
+        let first_error = self.join_slots(&mut slots, &shutdown, &controls).await;
         if let Some(error) = first_error {
             tracing::error!(worker = %self.owner, error = %error, "Forge worker stopped after a slot could not settle its work");
             return Err(error);
@@ -1502,6 +1525,61 @@ impl ForgeWorker {
         // drained cleanly from one that vanished.
         tracing::info!(worker = %self.owner, "Forge worker stopped");
         Ok(())
+    }
+
+    /// Drains slots without aborting the causal reporter's cleanup or telemetry.
+    /// Concurrent process shutdown closes routing but uses the same error selection.
+    /// Unexpected task failures select their task ID; only our own aborts are ignored.
+    async fn join_slots(
+        &self,
+        slots: &mut JoinSet<Result<(), ForgeError>>,
+        shutdown: &CancellationToken,
+        controls: &ForgeWorkerRunControls,
+    ) -> Option<ForgeError> {
+        let mut first_error = None;
+        let mut shutting_down = false;
+        let mut aborted = false;
+        loop {
+            let joined = tokio::select! {
+                () = shutdown.cancelled(), if !shutting_down => {
+                    controls.readiness.publish(false);
+                    controls.stop.cancel();
+                    shutting_down = true;
+                    continue;
+                }
+                joined = slots.join_next_with_id() => joined,
+            };
+            let Some(joined) = joined else {
+                break;
+            };
+            let (id, outcome) = match joined {
+                Ok(joined) => joined,
+                Err(error) if aborted && error.is_cancelled() => continue,
+                Err(error) => (
+                    error.id(),
+                    Err(ForgeError::Invariant {
+                        detail: format!("Forge worker slot panicked: {error}"),
+                    }),
+                ),
+            };
+            if let Err(error) = outcome {
+                let reporter = *controls.first_failure.get_or_init(|| id);
+                controls.readiness.publish(false);
+                controls.stop.cancel();
+                if id == reporter {
+                    first_error = Some(error);
+                    slots.abort_all();
+                    aborted = true;
+                }
+                // A secondary error never displaces or aborts the registered slot.
+            }
+            #[cfg(feature = "test-support")]
+            if let Some(observer) = &self.completion_observer {
+                observer.joined_slots.fetch_add(1, Ordering::AcqRel);
+                observer.joined_slot_ready.notify_waiters();
+            }
+        }
+        first_error
     }
 
     /// Resolves every durable attempt left unsettled before this worker starts.
@@ -1817,6 +1895,7 @@ impl ForgeWorker {
                     Ok(())
                 };
                 if let Err(error) = &released {
+                    self.close_after_fatal();
                     tracing::error!(worker = %self.owner, task_id = %task_id, error = %error,
                         "Forge claim shutdown release failed; durable state retained for lease recovery");
                 }
@@ -2399,6 +2478,15 @@ impl ForgeWorker {
             span.clone(),
         )
         .await;
+        if outcome.is_err() {
+            self.close_after_fatal();
+        }
+        #[cfg(feature = "test-support")]
+        if outcome.is_err()
+            && let Some(observer) = &self.completion_observer
+        {
+            observer.pause_fatal_observation_for_test().await;
+        }
         self.record_task_execution_telemetry(
             claim.data_tenant_id,
             claim.task_id,
@@ -2539,6 +2627,7 @@ impl ForgeWorker {
             && let Err(settlement) = self.settle_execution_failure(task, attempt, error).await
         {
             tracing::error!(task_id=%task.task_id, error=%settlement, "Forge failure settlement failed; claim retained for expiry recovery");
+            self.close_after_fatal();
             fatal = Some(settlement);
         }
         tracing::debug!(
@@ -2548,6 +2637,7 @@ impl ForgeWorker {
             "Forge task execution stage returned"
         );
         if let Err(error) = self.release_table_lease(&mut lease).await {
+            self.close_after_fatal();
             tracing::warn!(task_id = %task.task_id, error = %error, "Forge table lease release failed");
             // A retained table fence would let this owner's next claim run
             // against a table it can no longer prove it owns.
@@ -2714,6 +2804,15 @@ impl ForgeWorker {
             span.clone(),
         )
         .await;
+        if result.is_err() {
+            self.close_after_fatal();
+        }
+        #[cfg(feature = "test-support")]
+        if result.is_err()
+            && let Some(observer) = &self.completion_observer
+        {
+            observer.pause_fatal_observation_for_test().await;
+        }
         self.record_task_execution_telemetry(
             claim.task.data_tenant_id,
             claim.task.task_id,
@@ -2789,10 +2888,19 @@ impl ForgeWorker {
                 &operation_stop,
             )
             .await;
+        if reconciliation.is_err() {
+            self.close_after_fatal();
+        }
         operation_stop.cancel();
-        let heartbeat_result = heartbeat.await.map_err(|error| ForgeError::Invariant {
-            detail: format!("Forge reconciliation heartbeat panicked: {error}"),
-        })?;
+        let heartbeat_result = heartbeat
+            .await
+            .map_err(|error| ForgeError::Invariant {
+                detail: format!("Forge reconciliation heartbeat panicked: {error}"),
+            })
+            .and_then(std::convert::identity);
+        if heartbeat_result.is_err() {
+            self.close_after_fatal();
+        }
         let result = async {
             heartbeat_result?;
             if reconciliation? {
@@ -2829,15 +2937,40 @@ impl ForgeWorker {
         // table it can no longer prove it owns, so a release-only failure is
         // fatal too. When reconciliation already failed, that error stays
         // primary and the release failure is only a secondary diagnostic.
-        let release = self.release_table_lease(&mut lease).await;
+        if result.is_err() {
+            self.close_after_fatal();
+        }
+        self.release_prepared_lease(task.task_id, &mut lease, result)
+            .await
+    }
+
+    /// Releases Prepared ownership while preserving an earlier reconciliation error.
+    /// The caller closes known failures before entering cleanup; a release-only
+    /// failure closes the same run controls immediately after release returns.
+    ///
+    /// # Errors
+    /// Returns reconciliation failure ahead of release failure when both occur.
+    ///
+    /// # Cancellation
+    /// The caller retains its ownership guard until release and observation finish.
+    async fn release_prepared_lease(
+        &self,
+        task_id: Uuid,
+        lease: &mut ForgeLease,
+        result: Result<(), ForgeError>,
+    ) -> Result<(), ForgeError> {
+        let release = self.release_table_lease(lease).await;
+        if release.is_err() {
+            self.close_after_fatal();
+        }
         match (result, release) {
             (Err(reconciliation), Err(release)) => {
-                tracing::warn!(task_id = %task.task_id, error = %release, "Forge reconciliation lease release also failed");
+                tracing::warn!(task_id = %task_id, error = %release, "Forge reconciliation lease release also failed");
                 Err(reconciliation)
             }
             (Err(reconciliation), Ok(_)) => Err(reconciliation),
             (Ok(()), Err(release)) => {
-                tracing::error!(task_id = %task.task_id, error = %release, "Forge reconciliation committed but its table lease could not be released");
+                tracing::error!(task_id = %task_id, error = %release, "Forge reconciliation committed but its table lease could not be released");
                 Err(release)
             }
             (Ok(()), Ok(_)) => Ok(()),
@@ -6168,6 +6301,13 @@ impl ForgeWorker {
                 .await?
         {
             return Ok(Some(claim));
+        }
+        if self
+            .run_controls
+            .as_ref()
+            .is_some_and(|controls| controls.stop.is_cancelled())
+        {
+            return Ok(None);
         }
         self.tasks
             .claim_fair_for_volume(self.owner, limits, None, Some(volume.as_str()))

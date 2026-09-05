@@ -3,7 +3,7 @@ id: BIFROST-R5-T05-MCP
 title: Project bounded Bifrost discovery and query journeys through MCP
 kind: implementation
 mode: RECONCILE
-status: review
+status: approved
 spec: SPEC-bifrost-distributed-analytics-engine
 spec_revision: 6
 depends_on: [BIFROST-R5-T05-PRE-MCP-BUILDOUT]
@@ -458,3 +458,11 @@ evidence assumed here.
 `mise run fmt`, `lints`, `check:client-tier`, `check:error-coverage`,
 `test:bifrost:journey:mcp` (6/6), and `test:bifrost:journey:oracle` (23/23)
 pass. `git diff --check` is clean.
+
+## Task closeout
+
+APPROVED by the cumulative immutable review in `../reviews/05-final-review.md`
+(candidate `b714141335eadd52032ea92b9f123562d7863cf5`). All Task 05 findings
+are closed and the implementation is integrated on the change branch. The full
+active change packet remains for its later all-task change review; this task
+approval does not claim the unrelated failed aggregates are green.

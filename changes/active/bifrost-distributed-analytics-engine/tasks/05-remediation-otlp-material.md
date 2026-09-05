@@ -2,7 +2,7 @@
 id: BIFROST-R6-T05-R03-OTLP-MATERIAL
 title: Admit OTLP from actual projected material facts
 kind: remediation
-status: review
+status: approved
 spec: SPEC-bifrost-distributed-analytics-engine
 spec_revision: 6
 parent_task: BIFROST-R5-T05-MCP
@@ -193,3 +193,11 @@ form one final root/replay plan. No intermediate estimated root is retained.
 - `git diff --check`: PASS. Public wire/schema/generated contracts unchanged.
 - Final client-tier/error-coverage checks PASS. Tenant-isolation/unwrap checks
   retain only the previously recorded unrelated failures; no check was changed.
+
+## Task closeout
+
+APPROVED by the cumulative immutable review in `../reviews/05-final-review.md`
+(candidate `b714141335eadd52032ea92b9f123562d7863cf5`). All Task 05 findings
+are closed and the implementation is integrated on the change branch. The full
+active change packet remains for its later all-task change review; this task
+approval does not claim the unrelated failed aggregates are green.

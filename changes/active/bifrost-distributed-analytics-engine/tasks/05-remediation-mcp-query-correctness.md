@@ -3,7 +3,7 @@ id: BIFROST-R6-T05-R01-MCP-QUERY-CORRECTNESS
 title: Make MCP query errors, terminals, and cancellation trustworthy
 kind: remediation
 mode: REMEDIATE
-status: review
+status: approved
 spec: SPEC-bifrost-distributed-analytics-engine
 spec_revision: 6
 depends_on: [BIFROST-R5-T05-MCP]
@@ -447,3 +447,11 @@ Scribe's new projection owner does no IO or mutation for native ingress, and
 configured boot-envelope arithmetic is unchanged. No failing test was ignored,
 removed, relaxed, or represented as green. These are retained broader-change
 concerns, not closure findings against this bounded MCP remediation.
+
+## Task closeout
+
+APPROVED by the cumulative immutable review in `../reviews/05-final-review.md`
+(candidate `b714141335eadd52032ea92b9f123562d7863cf5`). All Task 05 findings
+are closed and the implementation is integrated on the change branch. The full
+active change packet remains for its later all-task change review; this task
+approval does not claim the unrelated failed aggregates are green.

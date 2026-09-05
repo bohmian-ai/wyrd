@@ -2,7 +2,7 @@
 id: BIFROST-R6-T05-R02-OTEL-JOURNEY
 title: Prove actual OTEL trace debugging over MCP
 kind: remediation
-status: review
+status: approved
 spec: SPEC-bifrost-distributed-analytics-engine
 spec_revision: 6
 parent_task: BIFROST-R5-T05-MCP
@@ -122,3 +122,11 @@ Final closure proof: exact real OTLP MCP journey PASS (2.628s), full MCP lane
 PASS (6/6), full Oracle lane PASS (23/23), Bifrost integration PASS (965/965),
 format and workspace lints PASS. Both trace coverage finding 6 and its Scribe
 admission dependency finding 7 are ready for cumulative review.
+
+## Task closeout
+
+APPROVED by the cumulative immutable review in `../reviews/05-final-review.md`
+(candidate `b714141335eadd52032ea92b9f123562d7863cf5`). All Task 05 findings
+are closed and the implementation is integrated on the change branch. The full
+active change packet remains for its later all-task change review; this task
+approval does not claim the unrelated failed aggregates are green.

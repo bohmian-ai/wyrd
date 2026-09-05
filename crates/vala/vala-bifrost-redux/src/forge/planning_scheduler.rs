@@ -302,7 +302,7 @@ impl<'forge> ForgeScheduler<'forge> {
         Ok(())
     }
 
-    /// Repairs lost hints from the authoritative roster and plans one bounded demand page.
+    /// Drains durable demand before repairing the roster for the next planning cycle.
     ///
     /// This method performs metadata reads and `PostgreSQL` writes only. It never
     /// invokes `DataFusion`, rewrites objects, or commits an Iceberg transaction.
@@ -310,6 +310,8 @@ impl<'forge> ForgeScheduler<'forge> {
     /// # Errors
     /// Returns scheduler lease, roster, catalog, planning, or durable SQL errors.
     /// Planning and cancellation failures retain the observed demand generation.
+    /// An unfinished page is resumed without re-requesting tables already planned,
+    /// so a roster larger than the page budget can converge across bounded wakes.
     /// A generation replaced during its atomic acknowledgement is refreshed and
     /// retried once, while keeping the pass incomplete so complete-only status
     /// is never published from a raced view.
@@ -330,18 +332,23 @@ impl<'forge> ForgeScheduler<'forge> {
             });
         };
         self.renew_fence(fence).await?;
-        let mut outcome = ForgeScheduleOutcome {
-            incomplete: self.repair_roster(stop, fence).await?,
-            ..ForgeScheduleOutcome::default()
-        };
-        #[cfg(feature = "test-support")]
-        self.pause_before_demand_renewal_if_armed().await;
-        self.renew_fence(fence).await?;
-        let (demands, overflowed) = self
+        let (mut demands, mut overflowed) = self
             .tasks
             .planning_demands(self.owner, fence, self.demand_cap)
             .await
             .map_err(ForgeError::Sql)?;
+        let mut outcome = ForgeScheduleOutcome::default();
+        if demands.is_empty() {
+            outcome.incomplete = self.repair_roster(stop, fence).await?;
+            (demands, overflowed) = self
+                .tasks
+                .planning_demands(self.owner, fence, self.demand_cap)
+                .await
+                .map_err(ForgeError::Sql)?;
+        }
+        #[cfg(feature = "test-support")]
+        self.pause_before_demand_renewal_if_armed().await;
+        self.renew_fence(fence).await?;
         outcome.incomplete |= overflowed;
         outcome.demands_seen = demands.len();
         let mut admitted_by_tenant = BTreeMap::<_, usize>::new();

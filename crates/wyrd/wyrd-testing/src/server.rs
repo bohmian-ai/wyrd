@@ -409,6 +409,8 @@ pub struct WyrdTestServerBuilder {
     trusted_issuer_configs: Vec<IssuerEntry>,
     workload_binding_configs: Vec<WorkloadBindingEntry>,
     forge_interval: Duration,
+    /// Executor slots composed into the production Forge worker.
+    forge_worker_concurrency: usize,
     wal_sync_delay: Duration,
     scribe_admission: Option<AdmissionConfig>,
     /// One immutable lowerable limits snapshot shared by the test server's ingest owners.
@@ -486,6 +488,7 @@ impl Default for WyrdTestServerBuilder {
             trusted_issuer_configs: Vec::new(),
             workload_binding_configs: Vec::new(),
             forge_interval: Duration::from_secs(60),
+            forge_worker_concurrency: 1,
             wal_sync_delay: Duration::ZERO,
             scribe_admission: None,
             scribe_ingest_limits: IngestLimits::default(),
@@ -2825,6 +2828,13 @@ impl WyrdTestServerBuilder {
         self
     }
 
+    /// Sets the production worker's slot count and default per-tenant active cap.
+    #[must_use]
+    pub fn with_forge_worker_concurrency_for_test(mut self, concurrency: usize) -> Self {
+        self.forge_worker_concurrency = concurrency;
+        self
+    }
+
     /// Install an eval-run audit sink on the composed `AppState`.
     ///
     /// The default sink discards events, so a test that must prove a run
@@ -3444,6 +3454,7 @@ impl WyrdTestServerBuilder {
         let mut bifrost_config = BifrostRuntimeConfig::default();
         bifrost_config.scribe.ingest_request_bytes = self.scribe_ingest_limits.max_frame_bytes;
         let forge_runtime = ForgeRuntimeConfig {
+            worker_concurrency: self.forge_worker_concurrency,
             maintenance_interval_secs: Some(self.forge_interval.as_secs()),
             ..ForgeRuntimeConfig::default()
         };

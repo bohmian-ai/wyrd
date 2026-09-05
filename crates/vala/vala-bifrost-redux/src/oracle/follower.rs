@@ -1211,12 +1211,36 @@ where
             .map_err(|_| PhysicalPlanFollowerError::AuthorityAlreadyInstalled)
     }
 
+    /// Inspects the installed epoch and source-boundary counters without driving IO.
+    #[cfg(feature = "test-support")]
+    pub(super) fn authority_inspection_for_test(
+        &self,
+    ) -> (Option<Arc<OracleReaderAuthority>>, usize, usize) {
+        (
+            self.reader_authority.get().map(Arc::clone),
+            self.effects.preflight.load(Ordering::SeqCst),
+            self.effects.resolver.load(Ordering::SeqCst),
+        )
+    }
+
+    /// Reconstructs the pre-installation follower with the same resolver and audit.
+    #[cfg(feature = "test-support")]
+    pub(super) fn without_reader_authority_for_test(&self) -> Self
+    where
+        R: Clone,
+    {
+        let mut follower = Self::new(self.resolver.clone());
+        follower.audit = self.audit.as_ref().map(Arc::clone);
+        follower
+    }
+
     /// Protects every snapshot this fragment's assignments name, before decode.
     ///
     /// The leader signed exactly which snapshot each scan reads, and preflight
     /// has already verified those signatures, so this re-derives the same cuts
-    /// and commits them under *this* node's epoch. A fragment that names no
-    /// snapshot needs no protection and gets none.
+    /// and commits them under *this* node's epoch. An installed Oracle epoch
+    /// also supplies the IO permit for hot-only or empty assignments, without
+    /// adding snapshot protection. Scribe followers have no Oracle epoch.
     ///
     /// # Errors
     /// Returns [`PhysicalPlanFollowerError::Preflight`] when an assignment names
@@ -1260,7 +1284,7 @@ where
                 assignment.reader_cut.clone(),
             ));
         }
-        if cuts.is_empty() {
+        if cuts.is_empty() && self.reader_authority.get().is_none() {
             return Ok(None);
         }
         // Verified before any widening so a tampered ancestry is refused here

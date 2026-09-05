@@ -37,6 +37,8 @@ use super::follower::{
 use super::peer::{
     PeerSecurityAudit, PeerSecurityError, PeerTicketClaims, PeerTicketMinter, PeerTicketVerifier,
 };
+#[cfg(feature = "test-support")]
+use super::reader_pins::OracleReaderAuthority;
 use super::telemetry::{
     FragmentLocality, FragmentOutcome, FragmentTelemetry, PeerErrorClass, SecurityEventClass,
     SlotOutcome, record_peer_attempt, record_security, record_slot,
@@ -696,6 +698,34 @@ impl OraclePeerWorker {
         authority: Arc<crate::oracle::reader_pins::OracleReaderAuthority>,
     ) -> Result<(), PhysicalPlanFollowerError> {
         self.physical_follower.install_reader_authority(authority)
+    }
+
+    /// Returns the exact installed epoch plus preflight and resolver-entry counts.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn authority_inspection_for_test(
+        &self,
+    ) -> (Option<Arc<OracleReaderAuthority>>, usize, usize) {
+        self.physical_follower.authority_inspection_for_test()
+    }
+
+    /// Reconstructs boot's uninstalled worker while retaining its real dependencies.
+    ///
+    /// The new follower has an empty authority cell and fresh effect counters;
+    /// reservations, security, resources, and the catalog resolver remain shared.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn without_reader_authority_for_test(&self) -> Self {
+        Self {
+            worker_node_id: self.worker_node_id,
+            oracle_fence: self.oracle_fence,
+            verifier: Arc::clone(&self.verifier),
+            security_audit: Arc::clone(&self.security_audit),
+            reservations: Arc::clone(&self.reservations),
+            oracle_resources: self.oracle_resources.clone(),
+            physical_follower: Arc::new(self.physical_follower.without_reader_authority_for_test()),
+            physical_observer: Arc::new(PhysicalWorkerObserver::default()),
+        }
     }
 
     /// Captures exact production follower and footer activity for journeys.

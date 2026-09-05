@@ -203,7 +203,9 @@ async fn drain_forge_backlog(
     tenants: &[DataTenantId],
 ) {
     for _ in 0..DRAIN_PASS_BUDGET {
-        let mut owed = pending_tasks(cluster).await;
+        let target = observer.attempts().saturating_add(1);
+        let pending = pending_tasks(cluster).await;
+        let mut owed = pending;
         for tenant in tenants {
             owed += hot_rows(cluster, *tenant).await;
         }
@@ -213,8 +215,11 @@ async fn drain_forge_backlog(
         for tenant in tenants {
             release_retries(cluster, *tenant).await;
         }
-        let target = observer.attempts().saturating_add(1);
-        cluster.request_forge_scheduler_pass_for_test();
+        // Drain the admitted tasks before asking for another planning cycle;
+        // each fresh cycle may legitimately enqueue another orphan scan.
+        if pending == 0 {
+            cluster.request_forge_scheduler_pass_for_test();
+        }
         let _ =
             tokio::time::timeout(ATTEMPT_BOUND, observer.wait_for_attempts_at_least(target)).await;
     }
@@ -1172,10 +1177,28 @@ async fn forge_promoted_files_rewrite_and_remain_exact_across_recovery() {
     // anything, so the expected rows are the caller's own facts rather than
     // something read back out of the system under test.
     let mut owner_expected: Vec<ManagedRow> = Vec::new();
-    let mut neighbour_shared_expected: Vec<ManagedRow> = Vec::new();
-    let mut neighbour_only_expected: Vec<ManagedRow> = Vec::new();
     let owner_values: Vec<i64> = (0..24).collect();
     let neighbour_values: Vec<i64> = (1_000..1_024).collect();
+    // Each neighbour table has one file, so it owes no independent small-file
+    // rewrite while we assert its exact cut survives the owner's recovery.
+    let neighbour_shared_expected = canonical_order(
+        append_values(
+            &neighbour_client,
+            &shared.qualified,
+            Uuid::now_v7(),
+            &neighbour_values,
+        )
+        .await,
+    );
+    let neighbour_only_expected = canonical_order(
+        append_values(
+            &neighbour_client,
+            &neighbour_only.qualified,
+            Uuid::now_v7(),
+            &neighbour_values,
+        )
+        .await,
+    );
     for half in 0..2 {
         let span = 12 * half..12 * (half + 1);
         owner_expected.extend(
@@ -1183,25 +1206,7 @@ async fn forge_promoted_files_rewrite_and_remain_exact_across_recovery() {
                 &owner_client,
                 &shared.qualified,
                 Uuid::now_v7(),
-                &owner_values[span.clone()],
-            )
-            .await,
-        );
-        neighbour_shared_expected.extend(
-            append_values(
-                &neighbour_client,
-                &shared.qualified,
-                Uuid::now_v7(),
-                &neighbour_values[span.clone()],
-            )
-            .await,
-        );
-        neighbour_only_expected.extend(
-            append_values(
-                &neighbour_client,
-                &neighbour_only.qualified,
-                Uuid::now_v7(),
-                &neighbour_values[span],
+                &owner_values[span],
             )
             .await,
         );
@@ -1211,8 +1216,6 @@ async fn forge_promoted_files_rewrite_and_remain_exact_across_recovery() {
             .expect("the pod publishes its staged rows");
     }
     owner_expected = canonical_order(owner_expected);
-    neighbour_shared_expected = canonical_order(neighbour_shared_expected);
-    neighbour_only_expected = canonical_order(neighbour_only_expected);
 
     // Cut 1 — before promotion.
     let owner_digest =
@@ -1564,17 +1567,16 @@ async fn forge_promoted_files_rewrite_and_remain_exact_across_recovery() {
         .expect("production telemetry recovery checkpoint");
     let mut settled = false;
     for _ in 0..DRAIN_PASS_BUDGET {
+        let target = observer.attempts().saturating_add(1);
         if rewrite_phase(&cluster, uncertain).await != "prepared" {
             settled = true;
             break;
         }
-        release_retries(&cluster, owner).await;
         server
             .reclaim_expired_forge_attempts_for_test(16)
             .await
             .expect("the production reclaim pass runs");
-        let target = observer.attempts().saturating_add(1);
-        cluster.request_forge_scheduler_pass_for_test();
+        release_retries(&cluster, owner).await;
         let _ =
             tokio::time::timeout(ATTEMPT_BOUND, observer.wait_for_attempts_at_least(target)).await;
     }
@@ -1583,6 +1585,10 @@ async fn forge_promoted_files_rewrite_and_remain_exact_across_recovery() {
         "the pod never settled its one uncertain operation in {DRAIN_PASS_BUDGET} passes: {:?}",
         observer.returned_errors()
     );
+
+    // The durable recovery transition precedes the retry's release and span
+    // export. Observe that task's completion before checking terminal telemetry.
+    drain_forge_backlog(&cluster, &observer, &[owner, neighbour]).await;
 
     // Cut 4 — after recovery. Customer answer first, again.
     assert_eq!(

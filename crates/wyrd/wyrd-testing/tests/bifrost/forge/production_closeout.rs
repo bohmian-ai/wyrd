@@ -102,7 +102,13 @@ impl CloseoutJourney {
             "closeout role/node identities: {:?}",
             cluster.configured_node_ids()
         );
-        Self { cluster, observer, coordinator_node, scribe_node, oracle_node }
+        Self {
+            cluster,
+            observer,
+            coordinator_node,
+            scribe_node,
+            oracle_node,
+        }
     }
 
     /// Registers the payload schema through the retained server catalog harness.
@@ -172,7 +178,9 @@ impl CloseoutJourney {
     /// # Panics
     /// Panics if the retained node is absent.
     fn coordinator(&self) -> &WyrdTestServer {
-        self.cluster.server_by_node(self.coordinator_node).expect("coordinator node")
+        self.cluster
+            .server_by_node(self.coordinator_node)
+            .expect("coordinator node")
     }
 
     /// Borrows the dedicated Scribe serving node.
@@ -180,7 +188,9 @@ impl CloseoutJourney {
     /// # Panics
     /// Panics if the ingest node is absent.
     fn scribe(&self) -> &WyrdTestServer {
-        self.cluster.server_by_node(self.scribe_node).expect("Scribe node")
+        self.cluster
+            .server_by_node(self.scribe_node)
+            .expect("Scribe node")
     }
 
     /// Borrows the separate Oracle serving node.
@@ -188,7 +198,9 @@ impl CloseoutJourney {
     /// # Panics
     /// Panics if the retained node is absent.
     fn oracle(&self) -> &WyrdTestServer {
-        self.cluster.server_by_node(self.oracle_node).expect("Oracle node")
+        self.cluster
+            .server_by_node(self.oracle_node)
+            .expect("Oracle node")
     }
 
     /// Requests and observes one real scheduler pass before inspecting SQL.
@@ -220,7 +232,11 @@ impl CloseoutJourney {
     async fn drain_tasks(&self) {
         tokio::time::timeout(REWRITE_BOUND, async {
             loop {
-                assert!(self.observer.returned_errors().is_empty(), "worker failed: {:?}", self.observer.returned_errors());
+                assert!(
+                    self.observer.returned_errors().is_empty(),
+                    "worker failed: {:?}",
+                    self.observer.returned_errors()
+                );
                 let next = self.observer.attempts() + 1;
                 let (pending, attempts): (i64, i64) = sqlx::query_as(
                     "SELECT count(*) FILTER (WHERE state NOT IN \
@@ -588,7 +604,11 @@ async fn compaction_geometry_exact_rows_and_non_destructive_second_pass() {
         read_managed_rows(&neighbour_reader, &table.qualified).await,
         neighbour_expected
     );
-    journey.cluster.restart_node(journey.coordinator_node).await.expect("coordinator starts after complete ingestion");
+    journey
+        .cluster
+        .restart_node(journey.coordinator_node)
+        .await
+        .expect("coordinator starts after complete ingestion");
     for server in journey.cluster.servers().iter() {
         server
             .forge_clock()
@@ -611,10 +631,23 @@ async fn compaction_geometry_exact_rows_and_non_destructive_second_pass() {
         journey.scheduler_pass().await;
         journey.drain_tasks().await;
         let next = journey.live_files(&table.binding).await;
-        eprintln!("rewrite pass {pass}: {:?}", next.1.values().map(DataFile::file_size_in_bytes).collect::<Vec<_>>());
-        assert_ne!(next.0, replacement.0, "geometry backlog makes snapshot progress");
+        eprintln!(
+            "rewrite pass {pass}: {:?}",
+            next.1
+                .values()
+                .map(DataFile::file_size_in_bytes)
+                .collect::<Vec<_>>()
+        );
+        assert_ne!(
+            next.0, replacement.0,
+            "geometry backlog makes snapshot progress"
+        );
         replacement = next;
-        if replacement.1.values().any(|file| file.file_size_in_bytes() >= 900 * 1024 * 1024) {
+        if replacement
+            .1
+            .values()
+            .any(|file| file.file_size_in_bytes() >= 900 * 1024 * 1024)
+        {
             break;
         }
     }

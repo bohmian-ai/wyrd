@@ -638,6 +638,7 @@ mod tests {
             tenant_id: tenant_id.as_uuid().as_bytes().to_vec(),
             nonce: uuid::Uuid::from_u128(6).as_bytes().to_vec(),
             expires_at_ms: (now + chrono::Duration::seconds(10)).timestamp_millis(),
+            execution_deadline_unix_ms: (now + chrono::Duration::seconds(30)).timestamp_millis(),
             binding: "binding".to_owned(),
             fragment_digest: "fragment".to_owned(),
             manifest_digest: "manifest".to_owned(),
@@ -811,6 +812,21 @@ mod tests {
                 .verify_before_decode(&claim_tamper, worker, 9, now)
                 .await,
             Err(PeerSecurityError::InvalidSignature),
+        );
+
+        let mut deadline_tamper = primary
+            .mint(&claims(worker, 9, tenant, now))
+            .expect("ticket");
+        let mut changed =
+            PeerTicketClaims::decode(deadline_tamper.claims_bytes.as_slice()).expect("claims");
+        changed.execution_deadline_unix_ms += 1;
+        deadline_tamper.claims_bytes = changed.encode_to_vec();
+        assert_eq!(
+            primary
+                .verify_before_decode(&deadline_tamper, worker, 9, now)
+                .await,
+            Err(PeerSecurityError::InvalidSignature),
+            "execution deadline is signed independently of acceptance expiry",
         );
 
         let mut signature_tamper = primary

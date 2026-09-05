@@ -65,7 +65,9 @@ impl DeadlineJourney {
     /// Returns cluster, catalog, public transport, or snapshot refresh failures.
     async fn start(spec: BifrostClusterSpec, query_index: usize) -> Result<Self, JourneyError> {
         let cluster = WyrdTestCluster::start_spec(spec).await?;
-        let ingest = cluster.servers().find(|server| server.bifrost_scribe().is_some())
+        let ingest = cluster
+            .servers()
+            .find(|server| server.bifrost_scribe().is_some())
             .ok_or("missing ingest node")?;
         let table = unique_table("oracle_deadline");
         let neighbour_tenant = cluster.add_tenant("deadline-neighbour").await?;
@@ -81,8 +83,15 @@ impl DeadlineJourney {
         cluster.refresh_oracle_snapshots().await?;
         let ingress = cluster.server(query_index).ok_or("missing query ingress")?;
         let reader = client(ingress, "deadline-reader").await?;
-        let neighbour = client_for_tenant(ingress, neighbour_tenant, "deadline-neighbour-reader").await?;
-        Ok(Self { cluster, reader, neighbour, table: format!("vala.bifrost.{table}"), query_index })
+        let neighbour =
+            client_for_tenant(ingress, neighbour_tenant, "deadline-neighbour-reader").await?;
+        Ok(Self {
+            cluster,
+            reader,
+            neighbour,
+            table: format!("vala.bifrost.{table}"),
+            query_index,
+        })
     }
 
     /// Holds the accepted batch beyond its actual ticket expiry, then checks exact rows.
@@ -97,48 +106,86 @@ impl DeadlineJourney {
     ///
     /// Panics if execution locality, exact tenant rows, or released resources disagree.
     async fn run(self) -> Result<(), JourneyError> {
-        let mut pauses = FollowerPauses { workers: Vec::new(), releases: Vec::new() };
-        let mut ready = Vec::new();
-        for server in self.cluster.servers() {
-            if let Some(peer) = server.state().oracle_peer() {
-                let worker = peer.worker();
-                let (accepted, release) = worker.pause_next_batch_for_test()?;
-                pauses.workers.push(worker);
-                pauses.releases.push(release);
-                ready.push(accepted);
-            }
-        }
-        assert!(!ready.is_empty(), "at least one Oracle worker must be armed");
+        let (mut pauses, ready) = FollowerPauses::arm(&self.cluster)?;
+        assert!(
+            !ready.is_empty(),
+            "at least one Oracle worker must be armed"
+        );
         let request = BifrostQueryRequest {
             sql: format!("SELECT id FROM {} ORDER BY id", self.table),
             visibility: VisibilityMode::PublishedOnly,
             freshness: FreshnessPolicy::Strict,
             deadline_ms: Some(30_000),
         };
-        let query = self.query_ids(&request);
+        let query = self.query_terminal(&request);
         let release = async {
             let (accepted, _, _) = futures_util::future::select_all(ready).await;
             let accepted = accepted?;
-            let ingress = self.cluster.server(self.query_index).ok_or("missing ingress")?;
+            let ingress = self
+                .cluster
+                .server(self.query_index)
+                .ok_or("missing ingress")?;
             if self.query_index == 0 {
                 assert_eq!(accepted.worker_node_id, ingress.node_id());
             } else {
-                assert_ne!(accepted.worker_node_id, ingress.node_id(), "remote leg must execute remotely");
+                assert_ne!(
+                    accepted.worker_node_id,
+                    ingress.node_id(),
+                    "remote leg must execute remotely"
+                );
             }
             eprintln!("accepted follower: {accepted:?}");
-            let wait_ms = accepted.ticket_expires_at_ms + 50 - chrono::Utc::now().timestamp_millis();
+            let wait_ms =
+                accepted.ticket_expires_at_ms + 50 - chrono::Utc::now().timestamp_millis();
             if let Ok(wait_ms) = u64::try_from(wait_ms) {
                 tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
             }
+            assert!(
+                accepted.execution_deadline_unix_ms > chrono::Utc::now().timestamp_millis(),
+                "admitted execution budget must outlive ticket acceptance"
+            );
             pauses.release()?;
             Ok::<_, JourneyError>(())
         };
         let (rows, released) = tokio::time::timeout(std::time::Duration::from_secs(35), async {
             tokio::join!(query, release)
-        }).await?;
+        })
+        .await?;
         released?;
-        assert_eq!(rows?, vec![7], "accepted query must return its exact tenant row");
-        assert_eq!(query_ids(&self.neighbour, format!("SELECT id FROM {} ORDER BY id", self.table)).await?, vec![91]);
+        let (rows, outcome, error) = rows?;
+        assert_eq!(outcome, QueryTerminalOutcome::Success);
+        assert!(error.is_none());
+        assert_eq!(
+            rows,
+            vec![7],
+            "accepted query must return its exact tenant row"
+        );
+        self.assert_released().await?;
+        self.fail_held(false).await?;
+        self.fail_held(true).await?;
+        assert_eq!(
+            query_ids(
+                &self.neighbour,
+                format!("SELECT id FROM {} ORDER BY id", self.table)
+            )
+            .await?,
+            vec![91]
+        );
+        self.assert_released().await?;
+        self.cluster.shutdown().await?;
+        Ok(())
+    }
+
+    /// Requires every query and worker resource to be returned at terminal completion.
+    ///
+    /// # Errors
+    ///
+    /// Returns a production runtime inspection failure.
+    ///
+    /// # Panics
+    ///
+    /// Panics if admission, memory, spill, or peer capacity remains owned.
+    async fn assert_released(&self) -> Result<(), JourneyError> {
         let inspection = self.cluster.oracle_inspection().await?;
         assert_eq!(inspection.active_queries, 0, "{inspection:?}");
         assert_eq!(inspection.queued_queries, 0, "{inspection:?}");
@@ -146,11 +193,69 @@ impl DeadlineJourney {
         assert_eq!(inspection.reserved_spill_bytes, 0, "{inspection:?}");
         assert_eq!(inspection.peer_pending, 0, "{inspection:?}");
         assert_eq!(inspection.peer_running, 0, "{inspection:?}");
-        self.cluster.shutdown().await?;
         Ok(())
     }
 
-    /// Drains a public query, requiring a successful terminal and exact integer rows.
+    /// A held accepted query fails at its budget or after public cancellation.
+    ///
+    /// The pause remains owned until the public query terminates; no test timeout
+    /// produces the expected terminal or releases the first batch early.
+    ///
+    /// # Errors
+    ///
+    /// Returns gate, public query/control, or diagnostic timeout failures.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the query returns rows, succeeds, or reports the wrong terminal cause.
+    async fn fail_held(&self, cancel: bool) -> Result<(), JourneyError> {
+        let (mut pauses, ready) = FollowerPauses::arm(&self.cluster)?;
+        let request = BifrostQueryRequest {
+            sql: format!("SELECT id FROM {} ORDER BY id", self.table),
+            visibility: VisibilityMode::PublishedOnly,
+            freshness: FreshnessPolicy::Strict,
+            deadline_ms: Some(if cancel { 30_000 } else { 3_000 }),
+        };
+        let control = async {
+            let (accepted, _, _) = futures_util::future::select_all(ready).await;
+            let accepted = accepted?;
+            if cancel {
+                let request_id =
+                    wyrd_spec::request_id::RequestId::parse(&accepted.query_id.as_uuid().to_string())?;
+                let cancelled = QueryClient::new(&self.reader).cancel(&request_id).await?;
+                assert!(cancelled.cancellation_started);
+            }
+            Ok::<_, JourneyError>(accepted)
+        };
+        let (terminal, accepted) = tokio::time::timeout(std::time::Duration::from_secs(8), async {
+            tokio::join!(self.query_terminal(&request), control)
+        })
+        .await?;
+        let accepted = accepted?;
+        let (rows, outcome, error) = terminal?;
+        assert!(rows.is_empty());
+        assert_eq!(outcome, QueryTerminalOutcome::Failed);
+        if cancel {
+            assert_eq!(error, Some(QueryTerminalErrorCode::QueryExecutionFailed));
+        } else {
+            assert!(
+                chrono::Utc::now().timestamp_millis() >= accepted.execution_deadline_unix_ms,
+                "accepted follower must not fail at the earlier ticket expiry"
+            );
+            assert!(matches!(
+                error,
+                Some(
+                    QueryTerminalErrorCode::QueryTimeout
+                        | QueryTerminalErrorCode::QueryVisibilityUnavailable
+                )
+            ));
+        }
+        self.assert_released().await?;
+        pauses.release()?;
+        Ok(())
+    }
+
+    /// Drains exact integer rows and preserves either public failure surface.
     ///
     /// # Errors
     ///
@@ -158,20 +263,49 @@ impl DeadlineJourney {
     ///
     /// # Panics
     ///
-    /// Panics if a row is null or the query terminal is not successful.
-    async fn query_ids(&self, request: &BifrostQueryRequest) -> Result<Vec<i64>, JourneyError> {
-        let mut stream = QueryClient::new(&self.reader).query(request).await?;
+    /// Panics if a row is null.
+    async fn query_terminal(
+        &self,
+        request: &BifrostQueryRequest,
+    ) -> Result<
+        (
+            Vec<i64>,
+            QueryTerminalOutcome,
+            Option<QueryTerminalErrorCode>,
+        ),
+        JourneyError,
+    > {
+        let mut stream = match QueryClient::new(&self.reader).query(request).await {
+            Ok(stream) => stream,
+            Err(ValaSdkError::Transport(WyrdError::Vala { error })) => {
+                let code = bifrost_terminal_code(&error)
+                    .ok_or_else(|| format!("unexpected refusal: {error:?}"))?;
+                return Ok((Vec::new(), QueryTerminalOutcome::Failed, Some(code)));
+            }
+            Err(error) => return Err(error.into()),
+        };
         let mut ids = Vec::new();
-        while let Some(batch) = stream.next_batch().await? {
-            let column = batch.column(0).as_any().downcast_ref::<Int64Array>()
+        loop {
+            let batch = match stream.next_batch().await {
+                Ok(Some(batch)) => batch,
+                Ok(None) => break,
+                Err(_) if stream.terminal().is_some() => break,
+                Err(error) => return Err(error.into()),
+            };
+            let column = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
                 .ok_or("query id is not Int64")?;
             assert_eq!(column.null_count(), 0);
             ids.extend(column.values().iter().copied());
         }
         let terminal = stream.terminal().ok_or("query terminal missing")?;
-        assert_eq!(terminal.outcome, QueryTerminalOutcome::Success);
-        assert!(terminal.error.is_none());
-        Ok(ids)
+        Ok((
+            ids,
+            terminal.outcome,
+            terminal.error.as_ref().map(|error| error.code),
+        ))
     }
 }
 
@@ -184,6 +318,41 @@ struct FollowerPauses {
 }
 
 impl FollowerPauses {
+    /// Arms each real worker once and returns the first-batch notifications.
+    ///
+    /// # Errors
+    ///
+    /// Returns a worker gate error, disarming any earlier successful arms.
+    fn arm(
+        cluster: &WyrdTestCluster,
+    ) -> Result<
+        (
+            Self,
+            Vec<
+                tokio::sync::oneshot::Receiver<
+                    vala_bifrost_redux::oracle::dispatcher::AcceptedFollower,
+                >,
+            >,
+        ),
+        JourneyError,
+    > {
+        let mut pauses = Self {
+            workers: Vec::new(),
+            releases: Vec::new(),
+        };
+        let mut ready = Vec::new();
+        for server in cluster.servers() {
+            if let Some(peer) = server.state().oracle_peer() {
+                let worker = peer.worker();
+                let (accepted, release) = worker.pause_next_batch_for_test()?;
+                pauses.workers.push(worker);
+                pauses.releases.push(release);
+                ready.push(accepted);
+            }
+        }
+        Ok((pauses, ready))
+    }
+
     /// Disarms unused gates and releases every accepted stream.
     ///
     /// # Errors

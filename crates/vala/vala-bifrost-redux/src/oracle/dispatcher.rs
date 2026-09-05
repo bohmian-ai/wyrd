@@ -53,13 +53,10 @@ use crate::cluster::{ClusterRegistry, ClusterSnapshot, ROLE_LIVENESS_CUTOFF};
 /// claim encoding. Both sides read this one constant, so the check cannot
 /// desynchronize within a build.
 ///
-/// Protocol v3 binds the exact-partition assignment-authority digest
-/// ([`crate::oracle::peer::assignment_authority_digest_for`]) into those
-/// claims. It differs from v2 only in the Scribe-cut encoding, whose two day
-/// strings became two typed `(granularity, start)` partitions, and it is a
-/// homogeneous cutover: v2 tickets are rejected outright by
-/// [`validated_claim_identifiers`] rather than accepted through a dual decoder.
-pub const PEER_PROTOCOL_VERSION: u32 = 3;
+/// Protocol v4 signs a separate execution deadline so accepted followers can
+/// outlive ticket acceptance expiry. This homogeneous cutover rejects older
+/// claims through [`validated_claim_identifiers`] without a deadline fallback.
+pub const PEER_PROTOCOL_VERSION: u32 = 4;
 /// Pending reservation time to live.
 const PENDING_TTL: ChronoDuration = ChronoDuration::seconds(2);
 /// Stable peer rejection hint.
@@ -614,6 +611,8 @@ pub struct AcceptedFollower {
     pub oracle_fence: FencingToken,
     /// Last wall-clock instant at which the ticket could be accepted.
     pub ticket_expires_at_ms: i64,
+    /// Signed admitted query deadline enforced by the production frame encoder.
+    pub execution_deadline_unix_ms: i64,
 }
 
 /// One first-batch notification and its release receiver.
@@ -772,13 +771,19 @@ impl OraclePeerWorker {
         ),
         DispatchError,
     > {
-        let mut gate = self.batch_gate.lock().map_err(|_| DispatchError::Terminal)?;
+        let mut gate = self
+            .batch_gate
+            .lock()
+            .map_err(|_| DispatchError::Terminal)?;
         if gate.is_some() {
             return Err(DispatchError::Terminal);
         }
         let (ready, accepted) = tokio::sync::oneshot::channel();
         let (release, released) = tokio::sync::oneshot::channel();
-        *gate = Some(FollowerBatchGate { ready, release: released });
+        *gate = Some(FollowerBatchGate {
+            ready,
+            release: released,
+        });
         Ok((accepted, release))
     }
 
@@ -789,7 +794,10 @@ impl OraclePeerWorker {
     /// Returns an error if the gate lock is poisoned.
     #[cfg(any(test, feature = "test-support"))]
     pub fn clear_batch_pause_for_test(&self) -> Result<(), DispatchError> {
-        self.batch_gate.lock().map_err(|_| DispatchError::Terminal)?.take();
+        self.batch_gate
+            .lock()
+            .map_err(|_| DispatchError::Terminal)?
+            .take();
         Ok(())
     }
 
@@ -804,13 +812,20 @@ impl OraclePeerWorker {
         mut stream: datafusion::physical_plan::SendableRecordBatchStream,
         claims: &PeerTicketClaims,
     ) -> Result<datafusion::physical_plan::SendableRecordBatchStream, DispatchError> {
-        let gate = self.batch_gate.lock().map_err(|_| DispatchError::Terminal)?.take();
-        let Some(gate) = gate else { return Ok(stream); };
+        let gate = self
+            .batch_gate
+            .lock()
+            .map_err(|_| DispatchError::Terminal)?
+            .take();
+        let Some(gate) = gate else {
+            return Ok(stream);
+        };
         let accepted = AcceptedFollower {
             query_id: QueryId::new(uuid_from(&claims.query_id)?),
             worker_node_id: self.worker_node_id,
             oracle_fence: self.oracle_fence,
             ticket_expires_at_ms: claims.expires_at_ms,
+            execution_deadline_unix_ms: claims.execution_deadline_unix_ms,
         };
         let schema = stream.schema();
         let batches = async_stream::stream! {
@@ -820,7 +835,9 @@ impl OraclePeerWorker {
                 yield batch;
             }
         };
-        Ok(Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, batches)))
+        Ok(Box::pin(
+            datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, batches),
+        ))
     }
 
     /// Captures exact production follower and footer activity for journeys.
@@ -1053,6 +1070,13 @@ impl OraclePeerWorker {
         })
     }
 
+    /// Accepts signed authority and transfers reservation ownership into the timed stream.
+    ///
+    /// Dropping the future or returned stream releases its capacity and reader protection.
+    ///
+    /// # Errors
+    ///
+    /// Refuses invalid or elapsed authority, unavailable capacity, and follower failures.
     async fn execute_with_capacity(
         &self,
         request: ExecuteFragmentRequest,
@@ -1060,15 +1084,19 @@ impl OraclePeerWorker {
         admitted_grant: Option<LeaderAdmittedGrant>,
     ) -> Result<WorkerExecution, DispatchError> {
         let (claims, tenant_id) = self.verify_fragment_authority(&request).await?;
-        let follower_deadline = tokio::time::Instant::now()
-            + std::time::Duration::from_millis(
-                u64::try_from(
-                    claims
-                        .expires_at_ms
-                        .saturating_sub(Utc::now().timestamp_millis()),
-                )
-                .unwrap_or(0),
-            );
+        let monotonic_now = Instant::now();
+        let execution_deadline = claims
+            .execution_deadline()
+            .map_err(|_| DispatchError::Terminal)?;
+        let remaining = (execution_deadline - Utc::now())
+            .to_std()
+            .map_err(|_| DispatchError::Terminal)?;
+        if remaining.is_zero() {
+            return Err(DispatchError::Terminal);
+        }
+        let follower_deadline = monotonic_now
+            .checked_add(remaining)
+            .ok_or(DispatchError::Terminal)?;
         let mut running = self
             .claim_running_reservation(&request, capacity, &claims, tenant_id)
             .await?;
@@ -1379,6 +1407,7 @@ fn peer_ticket_claims(
             .expires_at
             .timestamp_millis()
             .min(fragment.deadline_unix_ms),
+        execution_deadline_unix_ms: fragment.deadline_unix_ms,
         binding: format!("{}.{}", fragment.binding.namespace, fragment.binding.table),
         fragment_digest: fragment.plan_fingerprint.clone(),
         manifest_digest: fragment.plan_fingerprint.clone(),
@@ -1752,6 +1781,7 @@ fn validated_claim_identifiers(
         || claims.query_id.len() != 16
         || claims.leader_node_id.len() != 16
         || claims.permission_digest.is_empty()
+        || claims.execution_deadline().is_err()
     {
         return Err(BifrostSecurityViolationKind::PeerFragment);
     }
@@ -3512,6 +3542,7 @@ mod tests {
             tenant_id: tenant.as_uuid().as_bytes().to_vec(),
             nonce: uuid::Uuid::now_v7().as_bytes().to_vec(),
             expires_at_ms: fragment.deadline_unix_ms,
+            execution_deadline_unix_ms: fragment.deadline_unix_ms,
             binding: "vala.bifrost.events".to_owned(),
             fragment_digest: plan_fingerprint.clone(),
             manifest_digest: plan_fingerprint.clone(),
@@ -4620,6 +4651,168 @@ mod tests {
                 .oracle_memory_used_bytes,
             0
         );
+    }
+
+    /// Signed execution time remains distinct from the pending acceptance window.
+    ///
+    /// # Panics
+    ///
+    /// Panics if minting clips the execution budget or malformed claims are accepted.
+    #[test]
+    fn peer_deadlines_keep_acceptance_and_execution_distinct() {
+        let now = Utc::now();
+        let node = NodeId::new(uuid::Uuid::now_v7());
+        let context = DispatchContext {
+            query_id: QueryId::new(uuid::Uuid::now_v7()),
+            leader_node_id: node,
+            leader_fence: 1,
+            tenant_id: uuid::Uuid::now_v7(),
+            query_class: QueryClass::Interactive,
+            slot_units: 1,
+            permission_digest: "permission".to_owned(),
+            attempt_bytes: 1_024,
+            attempt_memory_bytes: 1_024,
+            query_memory_pool: Arc::new(GreedyMemoryPool::new(1_024)),
+            granted_memory_bytes: 1_024,
+            admitted_target_partitions: 1,
+            cancellation: CancellationToken::new(),
+            deadline: Instant::now() + std::time::Duration::from_secs(30),
+        };
+        let candidate = DispatchCandidate {
+            node_id: node,
+            role: ClusterRole::Oracle,
+            worker_fence: 1,
+            endpoint: None,
+        };
+        let pending = PendingNodeReservation {
+            reservation_id: ReservationId::new(uuid::Uuid::now_v7()),
+            expires_at: now + PENDING_TTL,
+        };
+        let mut fragment = physical_dispatch_fragment("deadline");
+        fragment.deadline_unix_ms = (now + ChronoDuration::seconds(30)).timestamp_millis();
+        let claims =
+            peer_ticket_claims(&candidate, &context, &fragment, &pending).expect("signed claims");
+        assert_eq!(claims.expires_at_ms, pending.expires_at.timestamp_millis());
+        assert_eq!(claims.execution_deadline_unix_ms, fragment.deadline_unix_ms);
+        assert!(validated_claim_identifiers(&claims).is_ok());
+        let mut old = claims.clone();
+        old.protocol_version = 3;
+        assert_eq!(
+            validated_claim_identifiers(&old),
+            Err(BifrostSecurityViolationKind::PeerFragment)
+        );
+        for deadline in [0, -1, i64::MAX, claims.expires_at_ms - 1] {
+            let mut invalid = claims.clone();
+            invalid.execution_deadline_unix_ms = deadline;
+            assert_eq!(
+                validated_claim_identifiers(&invalid),
+                Err(BifrostSecurityViolationKind::PeerFragment)
+            );
+        }
+        let mut invalid_expiry = claims.clone();
+        invalid_expiry.expires_at_ms = i64::MIN;
+        assert_eq!(
+            validated_claim_identifiers(&invalid_expiry),
+            Err(BifrostSecurityViolationKind::PeerFragment)
+        );
+        fragment.deadline_unix_ms = (now + ChronoDuration::milliseconds(500)).timestamp_millis();
+        let short = peer_ticket_claims(&candidate, &context, &fragment, &pending)
+            .expect("short query claims");
+        assert_eq!(short.expires_at_ms, fragment.deadline_unix_ms);
+        assert_eq!(short.execution_deadline_unix_ms, fragment.deadline_unix_ms);
+        assert!(validated_claim_identifiers(&short).is_ok());
+    }
+
+    /// The follower's own encoder times out without any leader deadline wrapper.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the held follower emits rows, omits its timeout, or retains resources.
+    #[tokio::test]
+    async fn accepted_worker_enforces_signed_execution_deadline() {
+        let roles = crate::resources::BifrostRuntimeResources::composed_for_test(
+            1024 * 1024 * 1024,
+            1024 * 1024 * 1024,
+            [crate::resources::BifrostRole::Oracle],
+        );
+        let oracle = roles.oracle().expect("Oracle capability");
+        let baseline = oracle
+            .snapshot()
+            .expect("baseline")
+            .oracle_memory_used_bytes;
+        let node = NodeId::new(uuid::Uuid::now_v7());
+        let query_id = QueryId::new(uuid::Uuid::now_v7());
+        let slots = Arc::new(OracleSlotManager::new(1, 1));
+        let reservations = Arc::new(ReservationRegistry::new(Arc::clone(&slots), 1));
+        let worker = OraclePeerWorker::new_physical_with_resources(OraclePeerWorkerConfig {
+            worker_node_id: node,
+            oracle_fence: 37,
+            verifier: Arc::new(ClaimsPassthroughVerifier),
+            security_audit: Arc::new(NoopPeerSecurityAudit),
+            reservations: Arc::clone(&reservations),
+            oracle_resources: oracle.clone(),
+            resolver: Arc::new(TestFollowerResolver),
+            audit: Arc::new(TestOracleAudit),
+        });
+        let ReserveNodeSlotsResponse::Pending(pending) = worker
+            .reserve(&reserve_request(
+                query_id,
+                node,
+                37,
+                Utc::now() + PENDING_TTL,
+            ))
+            .await
+        else {
+            panic!("pending reservation");
+        };
+        let mut fixture = dispatcher_fixture();
+        fixture.deadline_unix_ms = (Utc::now() + ChronoDuration::seconds(3)).timestamp_millis();
+        let mut request = worker_request(
+            &fixture,
+            pending.reservation_id,
+            node,
+            37,
+            query_id,
+            DataTenantId::new_v7(),
+        );
+        let mut claims =
+            PeerTicketClaims::decode(request.ticket.claims_bytes.as_slice()).expect("claims");
+        claims.expires_at_ms = pending.expires_at.timestamp_millis();
+        request.ticket.claims_bytes = claims.encode_to_vec();
+        let (accepted, _release) = worker.pause_next_batch_for_test().expect("batch gate");
+        let mut execution = worker.execute(request).await.expect("accepted execution");
+        execution
+            .stream
+            .next()
+            .await
+            .expect("schema frame")
+            .expect("valid schema");
+        let (accepted, terminal) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(accepted, execution.stream.next())
+        })
+        .await
+        .expect("follower must enforce its own signed deadline");
+        let accepted = accepted.expect("gate polled");
+        assert!(accepted.execution_deadline_unix_ms > accepted.ticket_expires_at_ms);
+        assert!(chrono::Utc::now().timestamp_millis() >= accepted.execution_deadline_unix_ms);
+        assert!(matches!(
+            terminal,
+            Some(Err(DispatchError::Partial {
+                reason: DispatchPartialReason::Timeout,
+                ..
+            }))
+        ));
+        assert!(execution.stream.next().await.is_none());
+        drop(execution);
+        assert_eq!(
+            oracle
+                .snapshot()
+                .expect("released memory")
+                .oracle_memory_used_bytes,
+            baseline
+        );
+        assert_eq!(reservations.cleanup_expired(Utc::now()), 0);
+        assert_eq!(slots.running_in_use(), 0, "running capacity returned");
     }
 
     /// Remote worker execution retains exactly one root quantum until stream drop.

@@ -39,7 +39,7 @@ pub struct PeerTicketClaims {
     /// Single-use random nonce.
     #[prost(bytes, tag = "8")]
     pub nonce: Vec<u8>,
-    /// Expiry as Unix milliseconds.
+    /// Ticket acceptance and replay-cache expiry as Unix milliseconds.
     #[prost(int64, tag = "9")]
     pub expires_at_ms: i64,
     /// Tenant-qualified binding.
@@ -66,6 +66,27 @@ pub struct PeerTicketClaims {
     /// issuing object I/O.
     #[prost(string, tag = "15")]
     pub assignment_authority_digest: String,
+    /// Admitted query execution deadline, independent of ticket acceptance expiry.
+    #[prost(int64, tag = "16")]
+    pub execution_deadline_unix_ms: i64,
+}
+
+impl PeerTicketClaims {
+    /// Validates the signed execution deadline without extending ticket acceptance.
+    ///
+    /// # Errors
+    ///
+    /// Rejects absent, unrepresentable, or contradictory deadline timestamps.
+    pub fn execution_deadline(&self) -> Result<DateTime<Utc>, PeerSecurityError> {
+        if self.execution_deadline_unix_ms <= 0
+            || self.execution_deadline_unix_ms < self.expires_at_ms
+            || DateTime::from_timestamp_millis(self.expires_at_ms).is_none()
+        {
+            return Err(PeerSecurityError::Claims);
+        }
+        DateTime::from_timestamp_millis(self.execution_deadline_unix_ms)
+            .ok_or(PeerSecurityError::Claims)
+    }
 }
 
 /// Claims bytes accepted after signature and fence checks.

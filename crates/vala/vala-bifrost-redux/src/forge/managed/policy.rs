@@ -327,6 +327,58 @@ fn declared_bytes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iceberg::scan::FileScanTask;
+    use iceberg::spec::DataFileFormat;
+    use iceberg_compaction_core::file_selection::FileGroup;
+
+    /// Native rolling receives each selected group without premature stream residue.
+    ///
+    /// # Panics
+    /// Panics if valid policy projection or native planning fails, or selected
+    /// rows are split between writers before the encoded file target can roll.
+    #[test]
+    fn forge_table_policy_keeps_rolling_stream_whole() {
+        let metadata = metadata_with(vec![(FILE_TARGET_PROPERTY, "1073741824")]);
+        let policy = ForgeTablePolicy::extract(
+            &metadata,
+            &ForgeConfig {
+                small_file_threshold_bytes: 768 * 1024 * 1024,
+                ..limits()
+            },
+            1024 * 1024 * 1024,
+        ).expect("valid production geometry");
+        let config = policy.to_core_config(
+            "attempt".to_owned(), &[], 2, 1024 * 1024 * 1024,
+            std::path::PathBuf::from("/tmp"),
+        ).expect("native configuration");
+        for sizes_mib in [&[700_u64, 700][..], &[256, 256], &[2048]] {
+            let files = sizes_mib.iter().enumerate().map(|(index, size)| FileScanTask {
+                start: 0,
+                length: size * 1024 * 1024,
+                record_count: Some(100),
+                first_row_id: None,
+                data_sequence_number: None,
+                data_file_path: format!("file:///warehouse/input-{index}.parquet"),
+                data_file_format: DataFileFormat::Parquet,
+                schema: Arc::clone(metadata.current_schema()),
+                project_field_ids: vec![1],
+                predicate: None,
+                deletes: vec![],
+                sequence_number: 1,
+                file_size_in_bytes: size * 1024 * 1024,
+                partition: None,
+                partition_spec: None,
+                name_mapping: None,
+                unified_partition_type: None,
+                case_sensitive: true,
+                key_metadata: None,
+            }).collect();
+            let group = FileGroup::with_parallelism(files, &config.planning)
+                .expect("native group parallelism");
+            assert_eq!(group.output_parallelism, 1,
+                "{sizes_mib:?} MiB must reach one rolling stream, allowing target files and a remainder");
+        }
+    }
 
     /// Builds table metadata carrying an explicit Forge geometry.
     ///

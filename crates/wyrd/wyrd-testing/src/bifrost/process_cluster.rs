@@ -31,6 +31,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use wyrd_dev_fixtures::pg::PgFixture;
+use wyrd_spec::request_id::RequestId;
 
 use crate::bifrost::peer_ca::BifrostPeerCa;
 use crate::bifrost::peer_keyring::TestPeerKeyring;
@@ -248,6 +249,21 @@ pub enum ControlRequest {
     AwaitExecutePaused,
     /// Release the held `ExecuteTask` so its graph may finish or fail.
     ReleaseExecutePause,
+    /// Arm one exact public request at the Oracle post-pin preparation seam.
+    ArmPreparationPause {
+        /// Public request whose verified deadline is observed by the child.
+        request_id: RequestId,
+    },
+    /// Observe whether this Oracle has reached the request's post-pin hold.
+    ObservePreparationPause,
+    /// Release and clear this child's preparation hold, including unused arms.
+    ReleasePreparationPause,
+    /// Arm the existing process-wide graph-release hold.
+    ArmCleanupPause,
+    /// Wait until the graph's ownership is held at cleanup.
+    AwaitCleanupPaused,
+    /// Release and clear the graph-release hold.
+    ReleaseCleanupPause,
     /// Start one statement in this child's single active inactive-query slot.
     StartInactiveSql {
         /// Statement to execute.
@@ -483,6 +499,11 @@ pub enum ControlResponse {
     ExecutePaused,
     /// Answer to [`ControlRequest::ReleaseExecutePause`].
     PauseReleased,
+    /// Accepted signed deadline when the selected Oracle entered its hold.
+    PreparationPauseState {
+        /// None while this candidate has not pinned the matching request.
+        deadline_ms: Option<i64>,
+    },
     /// Answer to [`ControlRequest::StartInactiveSql`].
     Started,
     /// Answer to [`ControlRequest::CancelInactiveSql`].
@@ -1439,6 +1460,77 @@ impl ProcessNode {
         })
     }
 
+    /// Arm an exact request on this Oracle candidate without changing authority.
+    ///
+    /// # Errors
+    /// Returns control transport failures or refusal from a non-Oracle child.
+    pub fn arm_preparation_pause(
+        &mut self,
+        request_id: &RequestId,
+    ) -> Result<(), ProcessClusterError> {
+        self.expect(
+            &ControlRequest::ArmPreparationPause {
+                request_id: request_id.clone(),
+            },
+            |response| matches!(response, ControlResponse::PauseArmed),
+        )
+    }
+
+    /// Observe the selected child's original signed deadline without blocking
+    /// on a candidate that did not receive the query.
+    ///
+    /// # Errors
+    /// Returns transport, child, or unexpected-response protocol failures.
+    pub fn preparation_pause_deadline(&mut self) -> Result<Option<i64>, ProcessClusterError> {
+        match self.request(&ControlRequest::ObservePreparationPause)? {
+            ControlResponse::PreparationPauseState { deadline_ms } => Ok(deadline_ms),
+            ControlResponse::Failed { detail } => Err(ProcessClusterError::Child(detail)),
+            other => Err(ProcessClusterError::Protocol(format!(
+                "unexpected preparation observation: {other:?}"
+            ))),
+        }
+    }
+
+    /// Release and clear the selected or unused request-keyed preparation hold.
+    ///
+    /// # Errors
+    /// Returns control transport, child, or unexpected-response failures.
+    pub fn release_preparation_pause(&mut self) -> Result<(), ProcessClusterError> {
+        self.expect(&ControlRequest::ReleasePreparationPause, |response| {
+            matches!(response, ControlResponse::PauseReleased)
+        })
+    }
+
+    /// Arms the child's existing one-shot Analytical cleanup pause.
+    ///
+    /// # Errors
+    /// Returns control transport, child or protocol failures.
+    pub fn arm_cleanup_pause(&mut self) -> Result<(), ProcessClusterError> {
+        self.expect(&ControlRequest::ArmCleanupPause, |response| {
+            matches!(response, ControlResponse::PauseArmed)
+        })
+    }
+
+    /// Waits for retained graph ownership immediately before release.
+    ///
+    /// # Errors
+    /// Returns control failures or a bounded wait timeout.
+    pub fn await_cleanup_paused(&mut self) -> Result<(), ProcessClusterError> {
+        self.expect(&ControlRequest::AwaitCleanupPaused, |response| {
+            matches!(response, ControlResponse::ExecutePaused)
+        })
+    }
+
+    /// Releases the retained cleanup owner and clears any unused arm.
+    ///
+    /// # Errors
+    /// Returns control transport, child or protocol failures.
+    pub fn release_cleanup_pause(&mut self) -> Result<(), ProcessClusterError> {
+        self.expect(&ControlRequest::ReleaseCleanupPause, |response| {
+            matches!(response, ControlResponse::PauseReleased)
+        })
+    }
+
     /// Blocks until this child is holding an `ExecuteTask` at that pause.
     ///
     /// # Errors
@@ -1542,6 +1634,10 @@ impl ProcessNode {
     ///
     /// A reaper that never answers is indistinguishable from one that could not
     /// reap, so the deadline elapsing is itself the process-control error.
+    ///
+    /// # Errors
+    /// Returns the reaper's child-exit or cleanup failure, or a missing-report
+    /// error when the channel disconnects or the shutdown deadline elapses.
     fn await_reaper(&self) -> Result<(), String> {
         match self.exited.recv_timeout(SHUTDOWN_TIMEOUT) {
             Ok(result) => result,

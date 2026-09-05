@@ -261,6 +261,9 @@ mod pg_tests {
     /// A credential is rejected at the public edge, before any MCP framing, so
     /// the typed status and the Wyrd problem body are only observable outside
     /// the protocol client — `rmcp`'s reqwest transport erases both.
+    ///
+    /// # Errors
+    /// Returns request/header transport failures or a non-JSON response-body error.
     async fn raw_mcp_post(
         base_url: &str,
         credential: Option<&str>,

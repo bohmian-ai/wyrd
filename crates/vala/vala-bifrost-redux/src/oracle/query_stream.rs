@@ -1552,14 +1552,22 @@ impl OracleQueryStream {
         )
     }
 
+    /// Signals cancellation immediately while retaining the response for settlement.
+    ///
+    /// Marks cancellation telemetry and wakes the local owner. Forwarded callers
+    /// must also route cancellation through their authenticated lifecycle controls.
+    pub fn request_cancel(&self) {
+        self.telemetry_cancelled
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.cancellation.cancel();
+    }
+
     /// Signals cancellation and drains to a terminal frame under a short bound.
     ///
     /// This method is intentionally infallible: a timeout leaves local Drop
     /// cleanup in place while local ownership remains authoritative.
     pub async fn cancel(mut self) {
-        self.telemetry_cancelled
-            .store(true, std::sync::atomic::Ordering::Release);
-        self.cancellation.cancel();
+        self.request_cancel();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             while self.frames.next().await.is_some() {}
         })

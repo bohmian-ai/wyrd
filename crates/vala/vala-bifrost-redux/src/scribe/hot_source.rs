@@ -628,6 +628,28 @@ impl ScribeHotSourceRegistry {
         }))
     }
 
+    /// Returns tenant keys whose staged runs still own readable rows.
+    ///
+    /// # Errors
+    /// Returns [`HotSourceError::Poisoned`] on a poisoned lock.
+    pub(crate) fn staged_seal_keys_for_tenant(
+        &self,
+        tenant: wyrd_spec::ids::DataTenantId,
+    ) -> Result<Vec<SealKey>, HotSourceError> {
+        Ok(self
+            .lock()?
+            .iter()
+            .filter(|(key, authorities)| {
+                key.tenant == tenant
+                    && authorities
+                        .by_generation
+                        .values()
+                        .any(|authority| matches!(authority, HotAuthority::StagedRun { .. }))
+            })
+            .map(|(key, _)| key.clone())
+            .collect())
+    }
+
     /// Returns every staged member readable for one table in a partition range.
     ///
     /// This is the read side of the staged boundary: a generation whose Arrow

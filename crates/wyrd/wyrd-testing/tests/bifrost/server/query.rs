@@ -77,6 +77,162 @@ async fn audit_rows(
     Ok(count)
 }
 
+/// Real lifecycle controls require terminal proof even when the queried owner is absent.
+///
+/// Synthetic frame gates force transport timing without replacing the server's
+/// authenticated controls. The process MCP journey supplies real owner cleanup.
+///
+/// # Errors
+/// Returns server setup, control, channel or bounded-wait failures.
+///
+/// # Panics
+/// Panics if cancellation is delayed, absence becomes proof, or terminal proof is lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn consumer_cancellation_requires_owner_terminal() -> Result<(), ServerJourneyError> {
+    use vala_bifrost_redux::oracle::{OracleQueryStream, failed_terminal};
+    use wyrd_spec::vala::BifrostError;
+    use wyrd_spec::vala::api::{QueryStreamFrame, QueryTerminalErrorCode};
+
+    let server = WyrdTestServer::start_bound().await?;
+    let tenant = server.data_tenant_id();
+    let controls = server
+        .state()
+        .bifrost
+        .query_controls()
+        .ok_or("missing query controls")?;
+    for case in [
+        "delayed",
+        "EOF",
+        "transport",
+        "deadline",
+        "not found",
+        "consumed failed",
+    ] {
+        let request_id = RequestId::now_v7();
+        assert_eq!(
+            controls
+                .get(tenant, request_id.clone())
+                .await
+                .expect_err("synthetic query has no owner")
+                .code(),
+            wyrd_spec::error::WyrdError::from(BifrostError::RunningQueryNotFound).code()
+        );
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let token = tokio_util::sync::CancellationToken::new();
+        let frames = Box::pin(futures_util::stream::poll_fn(move |context| {
+            receiver.poll_recv(context)
+        }));
+        let mut stream =
+            OracleQueryStream::test_new("settlement-fixture".to_owned(), frames, token.clone());
+        stream.deadline_ms =
+            chrono::Utc::now().timestamp_millis() + if case == "deadline" { 200 } else { 5_000 };
+        let terminal = failed_terminal(QueryTerminalErrorCode::QueryExecutionFailed, 0);
+        let observed = (case == "consumed failed").then(|| terminal.clone());
+        let controls = controls.clone();
+        let settlement = tokio::spawn(async move {
+            controls
+                .cancel_and_settle(
+                    tenant,
+                    request_id,
+                    stream,
+                    VisibilityMode::PublishedOnly,
+                    observed,
+                )
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), token.cancelled()).await?;
+        assert!(
+            token.is_cancelled(),
+            "{case}: signal precedes terminal waiting"
+        );
+        match case {
+            "delayed" => {
+                tokio::time::sleep(std::time::Duration::from_millis(2_200)).await;
+                assert!(
+                    !settlement.is_finished(),
+                    "two-second best effort is not settlement"
+                );
+                sender.send(Ok(QueryStreamFrame::Terminal(terminal)))?;
+            }
+            "not found" => {
+                sender.send(Ok(QueryStreamFrame::Terminal(terminal)))?;
+            }
+            "transport" => {
+                sender.send(Err(BifrostError::QueryExecutionFailed))?;
+            }
+            "EOF" => drop(sender),
+            "deadline" | "consumed failed" => {}
+            _ => unreachable!("closed fixture cases"),
+        }
+        let result = tokio::time::timeout(std::time::Duration::from_secs(4), settlement).await??;
+        match case {
+            "EOF" | "transport" => assert_eq!(
+                result.expect_err("unconfirmed owner").code(),
+                wyrd_spec::error::WyrdError::from(BifrostError::RunningQueryControlUnavailable)
+                    .code()
+            ),
+            "deadline" => assert_eq!(
+                result.expect_err("original deadline expires").code(),
+                wyrd_spec::error::WyrdError::from(BifrostError::QueryStreamIncomplete).code()
+            ),
+            _ => result?,
+        }
+    }
+    server.shutdown().await?;
+    Ok(())
+}
+
+/// A verified forwarding envelope retains a shorter deadline than its request budget.
+///
+/// # Errors
+/// Returns setup, catalog, acceptance or stream errors from the real server.
+///
+/// # Panics
+/// Panics if acceptance replaces the signed instant or the empty-table query fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn signed_forwarding_preserves_shorter_absolute_deadline() -> Result<(), ServerJourneyError> {
+    let server = WyrdTestServer::start_bound().await?;
+    let tenant = server.data_tenant_id();
+    let table = format!("signed_deadline_{}", uuid::Uuid::now_v7().simple());
+    server
+        .state()
+        .bifrost_catalog()
+        .ok_or("missing catalog")?
+        .create_table(CreateTableRequest {
+            table: TableRef::new(BifrostNamespace::Bifrost, &table),
+            user_fields: vec![Field::new("value", DataType::Int64, false)],
+            tenant,
+            physical_layout: None,
+            audit: None,
+        })
+        .await?;
+    let query = request(&format!("SELECT value FROM vala.bifrost.{table}"));
+    assert_eq!(query.deadline_ms, Some(30_000));
+    let deadline = chrono::Utc::now().timestamp_millis() + 5_000;
+    let mut stream = server
+        .state()
+        .bifrost
+        .query_with_signed_deadline_for_test(scheduled_context(tenant)?, query, deadline)
+        .await?;
+    assert_eq!(stream.deadline_ms, deadline);
+    let mut terminal = None;
+    while let Some(frame) = stream.frames.next().await {
+        if let wyrd_spec::vala::api::QueryStreamFrame::Terminal(frame) = frame? {
+            terminal = Some(frame);
+        }
+    }
+    let terminal = terminal.expect("empty-table query still settles");
+    assert_eq!(
+        terminal.outcome,
+        wyrd_spec::vala::api::QueryTerminalOutcome::Success
+    );
+    assert_eq!(terminal.row_count, 0);
+    server.shutdown().await?;
+    Ok(())
+}
+
 /// The public gRPC surface and the server's own scheduled caller share one
 /// audit acceptance, one terminal contract, and one cleanup.
 ///
@@ -426,6 +582,10 @@ async fn prove_scheduled_analytical_peer_loss() -> Result<(), ServerJourneyError
         ingest.flush_bifrost().await?;
     }
     cluster.refresh_oracle_snapshots().await?;
+    let sql = format!(
+        "SELECT value, COUNT(*) AS matched FROM vala.bifrost.{table} GROUP BY value ORDER BY value"
+    );
+    prove_scheduled_analytical_completion(&cluster, &sql).await?;
 
     // The pause is armed on one follower before the statement runs, so the
     // peer this phase kills is provably holding an activated stage rather than
@@ -448,9 +608,7 @@ async fn prove_scheduled_analytical_peer_loss() -> Result<(), ServerJourneyError
     let leader = cluster.server(0).ok_or("missing leader node")?;
     let leader_state = leader.state().clone();
     let reads_before = audit_rows(leader, tenant, "bifrost.query.read_decision").await?;
-    let sql = format!(
-        "SELECT value, COUNT(*) AS matched FROM vala.bifrost.{table} GROUP BY value ORDER BY value"
-    );
+
     let scheduled = {
         let context = scheduled_context(tenant)?;
         tokio::spawn(async move {
@@ -497,6 +655,134 @@ async fn prove_scheduled_analytical_peer_loss() -> Result<(), ServerJourneyError
 
     await_clean_analytical(&cluster).await?;
     cluster.shutdown().await?;
+    Ok(())
+}
+
+/// Runs successful and actively cancelled scheduled Analytical queries through Scribe ingress.
+///
+/// # Errors
+/// Returns dispatch, audit, activation or cleanup failures from the real cluster.
+///
+/// # Panics
+/// Panics if either phase skips Analytical execution, duplicates audit, or retains ownership.
+async fn prove_scheduled_analytical_completion(
+    cluster: &wyrd_testing::bifrost::WyrdTestCluster,
+    sql: &str,
+) -> Result<(), ServerJourneyError> {
+    let tenant = cluster.data_tenant_id();
+    let ingress = cluster
+        .servers()
+        .find(|server| server.bifrost_scribe().is_some())
+        .ok_or("missing Scribe ingress")?;
+    assert!(
+        ingress.state().bifrost.oracle().is_none(),
+        "the scheduled ingress must forward"
+    );
+    assert!(
+        ingress.state().bifrost.query_controls().is_some(),
+        "forwarded ingress retains lifecycle routing"
+    );
+    let before = audit_rows(ingress, tenant, "bifrost.query.read_decision").await?;
+    let outcome = ScheduledQueryCaller::new(
+        ingress.state().clone(),
+        scheduled_context(tenant)?,
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .run(request(sql))
+    .await?;
+    assert_eq!(
+        outcome.terminal.outcome,
+        wyrd_spec::vala::api::QueryTerminalOutcome::Success
+    );
+    assert_eq!(
+        outcome.terminal.execution_path,
+        QueryExecutionPath::Analytical
+    );
+    assert_eq!(outcome.rows, u64::try_from(FIXTURE_VALUES.len())?);
+    assert_eq!(outcome.terminal.row_count, outcome.rows);
+    assert_scheduled_owners_released(cluster)?;
+    assert_eq!(
+        audit_rows(ingress, tenant, "bifrost.query.read_decision").await?,
+        before + 1
+    );
+
+    let leader_id = cluster
+        .servers()
+        .filter(|server| server.state().bifrost.oracle().is_some())
+        .map(WyrdTestServer::node_id)
+        .min()
+        .ok_or("missing ready Oracle")?;
+    let follower = cluster
+        .servers()
+        .find(|server| server.node_id() != leader_id && server.state().bifrost.oracle().is_some())
+        .ok_or("missing remote follower")?;
+    let pause = std::sync::Arc::new(
+        vala_bifrost_redux::oracle::analytical::AnalyticalExecutePause::default(),
+    );
+    follower
+        .state()
+        .bifrost_query()
+        .ok_or("missing follower Oracle")?
+        .engine()
+        .analytical_execution()
+        .ok_or("missing follower execution")?
+        .worker()
+        .bind_execute_pause_for_test(std::sync::Arc::clone(&pause));
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let caller = ScheduledQueryCaller::new(
+        ingress.state().clone(),
+        scheduled_context(tenant)?,
+        cancellation.clone(),
+    );
+    let query = request(sql);
+    let scheduled = tokio::spawn(async move { caller.run(query).await });
+    let entered =
+        tokio::time::timeout(std::time::Duration::from_secs(10), pause.wait_paused()).await;
+    cancellation.cancel();
+    pause.release();
+    entered?;
+    let error = scheduled
+        .await?
+        .expect_err("an actively cancelled schedule has no outcome");
+    assert_eq!(error.code(), "WYRD_VALA_502_QUERY_STREAM_INCOMPLETE");
+    assert_scheduled_owners_released(cluster)?;
+    assert_eq!(
+        audit_rows(ingress, tenant, "bifrost.query.read_decision").await?,
+        before + 2
+    );
+    Ok(())
+}
+
+/// Checks ownership at the scheduled return boundary, without a later polling grace period.
+///
+/// # Errors
+/// Returns inspection failure or retained query/graph/admission/resource evidence.
+fn assert_scheduled_owners_released(
+    cluster: &wyrd_testing::bifrost::WyrdTestCluster,
+) -> Result<(), ServerJourneyError> {
+    for server in cluster.servers() {
+        let Some(query) = server.state().bifrost_query() else {
+            continue;
+        };
+        let engine = query.engine();
+        let live = engine
+            .analytical_execution()
+            .ok_or("missing analytical owner")?
+            .live()?;
+        let root = engine.role_resources().snapshot()?;
+        if !live.is_clean()
+            || !engine
+                .running_queries()
+                .list(cluster.data_tenant_id())
+                .is_empty()
+            || root.oracle_query_active
+            || root.oracle_query_slot_units != 0
+            || root.oracle_query_memory_used_bytes != 0
+            || root.oracle_query_scratch_used_bytes != 0
+        {
+            return Err(format!("scheduled return retained ownership: {live:?}, {root:?}").into());
+        }
+    }
     Ok(())
 }
 

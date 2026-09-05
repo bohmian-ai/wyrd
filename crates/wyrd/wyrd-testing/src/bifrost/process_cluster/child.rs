@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 
 use secrecy::SecretString;
 use sha2::{Digest as _, Sha256};
+use vala_bifrost_redux::oracle::OraclePreparationPause;
 use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_server::config::BifrostTarget;
 
@@ -136,6 +137,8 @@ async fn serve() -> Result<(), ProcessClusterError> {
     let mut pause: Option<Arc<vala_bifrost_redux::oracle::analytical::AnalyticalExecutePause>> =
         None;
     let mut active: Option<InactiveQuerySlot> = None;
+    let mut preparation_pause: Option<Arc<OraclePreparationPause>> = None;
+    let mut cleanup_pause = None;
     let stdin = std::io::stdin();
     let mut line = String::new();
     loop {
@@ -291,6 +294,59 @@ async fn serve() -> Result<(), ProcessClusterError> {
                     detail: error.to_string(),
                 })?,
             },
+            ControlRequest::ArmPreparationPause { request_id } => match oracle(&server) {
+                Ok(engine) => {
+                    let armed = Arc::new(OraclePreparationPause::new(request_id));
+                    engine
+                        .bind_preparation_pause_for_test(Some(Arc::clone(&armed)))
+                        .map_err(|error| ProcessClusterError::Child(error.to_string()))?;
+                    preparation_pause = Some(armed);
+                    emit(&ControlResponse::PauseArmed)?;
+                }
+                Err(error) => emit(&ControlResponse::Failed {
+                    detail: error.to_string(),
+                })?,
+            },
+            ControlRequest::ObservePreparationPause => {
+                emit(&ControlResponse::PreparationPauseState {
+                    deadline_ms: preparation_pause
+                        .as_ref()
+                        .and_then(|pause| pause.observed_deadline_ms()),
+                })?;
+            }
+            ControlRequest::ReleasePreparationPause => {
+                if let Some(armed) = preparation_pause.take() {
+                    armed.release();
+                }
+                oracle(&server)?
+                    .bind_preparation_pause_for_test(None)
+                    .map_err(|error| ProcessClusterError::Child(error.to_string()))?;
+                emit(&ControlResponse::PauseReleased)?;
+            }
+            ControlRequest::ArmCleanupPause => {
+                let armed =
+                    vala_bifrost_redux::oracle::analytical::analytical_cleanup_pause_for_test();
+                armed.arm();
+                cleanup_pause = Some(armed);
+                emit(&ControlResponse::PauseArmed)?;
+            }
+            ControlRequest::AwaitCleanupPaused => match cleanup_pause.as_ref() {
+                Some(armed) => {
+                    tokio::time::timeout(STATEMENT_DEADLINE, armed.wait_entered())
+                        .await
+                        .map_err(|error| ProcessClusterError::Child(error.to_string()))?;
+                    emit(&ControlResponse::ExecutePaused)?;
+                }
+                None => emit(&ControlResponse::Failed {
+                    detail: "no cleanup pause armed".to_owned(),
+                })?,
+            },
+            ControlRequest::ReleaseCleanupPause => {
+                if let Some(armed) = cleanup_pause.take() {
+                    armed.release();
+                }
+                emit(&ControlResponse::PauseReleased)?;
+            }
             ControlRequest::ArmExecutePause => match arm_execute_pause(&server) {
                 Ok(armed) => {
                     pause = Some(armed);
@@ -358,6 +414,12 @@ async fn serve() -> Result<(), ProcessClusterError> {
                 break;
             }
         }
+    }
+    if let Some(armed) = preparation_pause.take() {
+        armed.release();
+    }
+    if let Some(armed) = cleanup_pause.take() {
+        armed.release();
     }
     server
         .shutdown()

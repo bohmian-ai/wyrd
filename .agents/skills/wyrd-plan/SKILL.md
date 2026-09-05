@@ -13,9 +13,13 @@ ownership and real dependencies require.
 
 ## Require the right authority
 
-For `DECOMPOSE`, require an explicitly approved spec revision. For `REMEDIATE`,
-require that spec, the original task, the cumulative reviewed candidate, and
-validated finding IDs from `$wyrd-task-review` or `$wyrd-change-review`.
+For `DECOMPOSE`, require an explicitly approved spec revision. For `REMEDIATE`
+from `$wyrd-task-review`, require that spec, the original task, the cumulative
+reviewed task candidate, and validated implementation finding IDs. For
+`REMEDIATE` from `$wyrd-change-review`, require that spec, the integrated base
+and target, the complete affected task set, and validated implementation
+finding IDs. Missing or incomplete review evidence is not an implementation
+finding and returns directly to `$wyrd-task-review`.
 For `RECONCILE`, require the approved revision, original task, frozen committed
 and uncommitted candidate, and a current-state amendment that classifies what is
 retained, deleted, invalidated, and unfinished. Partial code is evidence, not
@@ -167,9 +171,12 @@ Use proportionate Markdown containing:
 8. completion evidence; and
 9. material stop conditions.
 
-For remediation also record `parent_task` and `remediates` validated finding
-IDs. For reconciliation, record the parent task, frozen candidate identity,
-current-state amendment, and exact retained/deleted/invalidated obligations.
+For remediation record `remediates` validated finding IDs. Record `parent_task`
+when one existing task owns the finding. When an integrated finding spans tasks,
+leave `parent_task` empty and name the affected tasks in scope and consumer
+closure rather than inventing a parent. For reconciliation, record the parent
+task, frozen candidate identity, current-state amendment, and exact
+retained/deleted/invalidated obligations.
 Create the minimum cohesive task set. Do not overwrite the original task or
 hide its failed review or partial-implementation history. A successor may cite
 the original task as authority, but may not delegate work through an opaque

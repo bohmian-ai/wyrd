@@ -710,6 +710,9 @@ async fn scribe_tail_unauthenticated_is_rejected_before_lookup() {
 }
 
 /// Produces identical bounded non-empty pages through local and generated-tonic readers.
+///
+/// # Panics
+/// Panics if contiguous batching, byte limits, or continuation differ across transports.
 #[tokio::test]
 async fn scribe_tail_local_and_tonic_pages_match() {
     let server = WyrdTestServer::start_in_process()
@@ -742,6 +745,39 @@ async fn scribe_tail_local_and_tonic_pages_match() {
         .expect("remote metadata fence and capability acquire");
     let remote_fence = remote_lease.fence.clone();
     assert_eq!(local_fence.inclusive_live, remote_fence.inclusive_live);
+
+    let complete = local
+        .read_page(DomainTailPageRequest {
+            query_id,
+            fence_id: local_fence.fence_id,
+            after: None,
+            max_rows: 16,
+            max_encoded_bytes: 1024 * 1024,
+        })
+        .await
+        .expect("contiguous rows share one page batch");
+    assert!(complete.complete);
+    assert_eq!(complete.batches.len(), 1);
+    assert_eq!(complete.batches[0].num_rows(), 2);
+    let bytes = vala_bifrost_redux::scribe::tail_rpc::encode_tail_batch_exact(&complete.batches[0])
+        .expect("complete page encodes")
+        .len();
+    let bounded = remote
+        .read_page_with_capability(
+            DomainTailPageRequest {
+                query_id,
+                fence_id: remote_fence.fence_id,
+                after: None,
+                max_rows: 16,
+                max_encoded_bytes: u32::try_from(bytes - 1).expect("page fits wire limit"),
+            },
+            remote_lease.capability.clone(),
+        )
+        .await
+        .expect("byte ceiling splits the contiguous batch");
+    assert!(!bounded.complete);
+    assert_eq!(bounded.batches.len(), 1);
+    assert_eq!(bounded.batches[0].num_rows(), 1);
 
     let local_first = local
         .read_page(DomainTailPageRequest {

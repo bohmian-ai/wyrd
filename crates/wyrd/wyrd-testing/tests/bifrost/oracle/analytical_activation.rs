@@ -1,11 +1,10 @@
 //! Oracle journeys — production selection of the Analytical execution path.
 //!
 //! Every journey here starts at the ordinary authenticated raw-SQL operation
-//! with no caller hint. What it proves is the selection sequence: one locally
-//! executable physical plan, the unchanged closed support predicate, and only
-//! then the pinned distributed build. Interactive is the default and is also
-//! the outcome of every pre-selection refusal, and only a surviving real
-//! exchange transfers this query's envelope into an Analytical graph.
+//! with no caller hint. One pinned physical planner builds the query once:
+//! a normal returned root selects Interactive, while a `DistributedExec` root
+//! selects Analytical. Planning and selected execution failures are terminal;
+//! neither triggers a rebuild or an Interactive fallback.
 //!
 //! Module of the `oracle` binary; see `main.rs` for the capability it proves
 //! and `support.rs` for the fixtures it shares.
@@ -18,6 +17,7 @@ use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 use futures_util::StreamExt as _;
 use vala_bifrost_redux::oracle::Oracle;
+use vala_bifrost_redux::oracle::QueryIpcDecoder;
 use vala_bifrost_redux::oracle::analytical::{
     AnalyticalCleanupPause, AnalyticalLiveInspection, analytical_cleanup_pause_for_test,
 };
@@ -28,7 +28,11 @@ use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
     BifrostQueryRequest, FreshnessPolicy, QueryExecutionPath, VisibilityMode,
 };
+use wyrd_testing::bifrost::process_cluster::BifrostProcessCluster;
 use wyrd_testing::bifrost::{BifrostClusterSpec, WyrdTestCluster};
+use wyrd_tonic::query_conversion::QueryStreamConverter;
+use wyrd_tonic::wyrd::v1 as proto;
+use wyrd_tonic::wyrd::v1::bifrost_query_service_client::BifrostQueryServiceClient;
 
 use crate::support::*;
 
@@ -71,6 +75,9 @@ fn request(sql: &str) -> BifrostQueryRequest {
 }
 
 /// Sends one Arrow IPC batch carrying a single fixture row.
+///
+/// # Errors
+/// Returns transport/authentication failures or a server refusal of the append.
 async fn ingest_row(
     client: &WyrdClient,
     table: &str,
@@ -112,6 +119,10 @@ fn ipc_row(id: i64, filter_key: &str) -> Vec<u8> {
 }
 
 /// Writes and publishes one fixture table on the cluster's ingest node.
+///
+/// # Errors
+/// Returns missing-ingest-node, registration, credential, append, flush, or
+/// Oracle membership-refresh failures while preparing the published fixture.
 async fn seed_table(cluster: &WyrdTestCluster, prefix: &str) -> Result<String, JourneyError> {
     let ingest = cluster
         .servers()
@@ -677,10 +688,15 @@ async fn single_planner_root_selects_path_and_capacity() {
 /// injector: a planning refusal is armed on the coordinator's own engine, and a
 /// stale source is produced by deleting one published Parquet object while its
 /// Iceberg metadata and manifests still reference it.
+/// Local and forwarded post-pin holds also prove the original signed deadline.
 ///
 /// # Errors
 ///
 /// Returns the first claim that broke.
+///
+/// # Panics
+/// Panics if the deadline helper observes extended authority, late execution,
+/// incorrect rows, or physical-build/ownership evidence inconsistent with the query.
 async fn prove_single_planner_routing() -> Result<(), JourneyError> {
     let mut cluster = wyrd_testing::bifrost::process_cluster::BifrostProcessCluster::start(
         NODE_BINARY,
@@ -722,6 +738,13 @@ async fn prove_single_planner_routing() -> Result<(), JourneyError> {
         "SELECT filter_key, COUNT(*) AS matched FROM vala.bifrost.{table} \
          GROUP BY filter_key ORDER BY filter_key"
     );
+
+    for endpoint in [COORDINATOR, PEER_SCRIBE] {
+        for expire in [false, true] {
+            prove_preparation_deadline(&mut cluster, &api_key, &grouped_sql, endpoint, expire)
+                .await?;
+        }
+    }
 
     // A normal root is entirely leader-executable and therefore Interactive.
     let scan = run_public(&client, &scan_sql).await?;
@@ -829,6 +852,153 @@ async fn prove_single_planner_routing() -> Result<(), JourneyError> {
     }
 
     cluster.shutdown()?;
+    Ok(())
+}
+
+/// A request-keyed child pause compares verified ingress authority with the
+/// real gRPC response after pinning has consumed part of the original budget.
+///
+/// # Errors
+/// Returns fixture, transport, decoding, deadline, or ownership proof failures.
+///
+/// # Panics
+/// Panics if the response widens ingress time, preparation executes after expiry,
+/// or physical-build, terminal, or returned-row evidence violates the query.
+async fn prove_preparation_deadline(
+    cluster: &mut BifrostProcessCluster,
+    api_key: &secrecy::SecretString,
+    sql: &str,
+    endpoint: usize,
+    expire: bool,
+) -> Result<(), JourneyError> {
+    let client = public_client(&cluster.nodes()[endpoint], api_key)?;
+    let bearer = client.auth().bearer().await?;
+    let channel = wyrd_tonic::tonic::transport::Endpoint::from_shared(format!(
+        "http://{}",
+        cluster.nodes()[endpoint].grpc_addr()
+    ))?
+    .connect()
+    .await?;
+    let mut grpc = BifrostQueryServiceClient::new(channel);
+    let request_id = RequestId::now_v7();
+    let mut query = request(sql);
+    query.deadline_ms = Some(if expire { 1_000 } else { 5_000 });
+    let mut query = wyrd_tonic::tonic::Request::new(proto::BifrostQueryRequest::from(query));
+    query.metadata_mut().insert(
+        "x-wyrd-access-token",
+        format!("Bearer {}", bearer.expose()).parse()?,
+    );
+    query
+        .metadata_mut()
+        .insert("wyrd-request-id", request_id.as_str().parse()?);
+    let candidates = oracle_indices(cluster);
+    let baseline = candidates
+        .iter()
+        .map(|index| {
+            Ok((
+                *index,
+                cluster.nodes_mut()[*index].ownership_snapshot()?,
+                cluster.nodes_mut()[*index].physical_build_evidence()?.total,
+            ))
+        })
+        .collect::<Result<Vec<_>, JourneyError>>()?;
+    for index in &candidates {
+        cluster.nodes_mut()[*index].arm_preparation_pause(&request_id)?;
+    }
+    let response = tokio::spawn(async move { grpc.query(query).await });
+    let accepted = tokio::time::timeout(std::time::Duration::from_secs(4), async {
+        loop {
+            for index in &candidates {
+                if let Some(deadline) = cluster.nodes_mut()[*index].preparation_pause_deadline()? {
+                    return Ok::<_, JourneyError>(deadline);
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await??;
+    if expire {
+        let remaining =
+            u64::try_from(accepted.saturating_sub(chrono::Utc::now().timestamp_millis()))?;
+        tokio::time::sleep(std::time::Duration::from_millis(remaining + 20)).await;
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), response).await??;
+        for index in &candidates {
+            cluster.nodes_mut()[*index].release_preparation_pause()?;
+        }
+        let error = outcome.expect_err("expired preparation cannot publish a response stream");
+        let problem: serde_json::Value = serde_json::from_slice(
+            &error
+                .metadata()
+                .get_bin(wyrd_tonic::error::WYRD_ERROR_HEADER)
+                .ok_or("timeout omits canonical problem")?
+                .to_bytes()?,
+        )?;
+        assert_eq!(problem["code"], "WYRD_VALA_504_QUERY_TIMEOUT");
+        for (index, ownership, before) in baseline {
+            await_baseline(cluster, index, ownership).await?;
+            assert_eq!(
+                cluster.nodes_mut()[index].physical_build_evidence()?.total,
+                before,
+                "expired pinning cannot build or publish a roster to execution"
+            );
+        }
+        return Ok(());
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(
+        !response.is_finished(),
+        "post-pin pause must retain preparation"
+    );
+    for index in &candidates {
+        cluster.nodes_mut()[*index].release_preparation_pause()?;
+    }
+    let response = response.await??;
+    let advertised: i64 = response
+        .metadata()
+        .get("x-wyrd-query-deadline-ms")
+        .ok_or("response omits deadline")?
+        .to_str()?
+        .parse()?;
+    let mut frames = response.into_inner();
+    let mut ipc = QueryIpcDecoder::new();
+    let mut converter = QueryStreamConverter::new(VisibilityMode::PublishedOnly);
+    let mut terminal = None;
+    while let Some(frame) = frames.next().await {
+        let frame = frame?;
+        let rows = match frame.frame.as_ref() {
+            Some(proto::query_stream_frame::Frame::Schema(schema)) => {
+                ipc.accept_schema(&schema.arrow_ipc_schema)?;
+                None
+            }
+            Some(proto::query_stream_frame::Frame::Batch(batch)) => Some(u64::try_from(
+                ipc.accept_batch(&batch.arrow_ipc_batch)?.num_rows(),
+            )?),
+            _ => None,
+        };
+        if let wyrd_spec::vala::api::QueryStreamFrame::Terminal(frame) =
+            converter.convert(frame, rows)?
+        {
+            ipc.accept_eos(&frame.arrow_ipc_eos)?;
+            terminal = Some(frame);
+        }
+    }
+    let terminal = terminal.ok_or("query omitted terminal")?;
+    assert_eq!(
+        terminal.outcome,
+        wyrd_spec::vala::api::QueryTerminalOutcome::Success
+    );
+    assert_eq!(terminal.execution_path, QueryExecutionPath::Analytical);
+    assert_eq!(terminal.row_count, u64::try_from(FIXTURE_GROUPS)?);
+    let mut builds = 0;
+    for (index, ownership, before) in baseline {
+        await_baseline(cluster, index, ownership).await?;
+        builds += cluster.nodes_mut()[index].physical_build_evidence()?.total - before;
+    }
+    assert_eq!(builds, 1, "preparation must retain one physical build");
+    assert_eq!(
+        advertised, accepted,
+        "pinning cannot replace the verified ingress deadline"
+    );
     Ok(())
 }
 

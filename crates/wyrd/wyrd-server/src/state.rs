@@ -494,7 +494,7 @@ impl Oracle {
             "production Oracle composition requires its distributed dispatcher"
         );
         let query_controls = crate::oracle::RunningQueryControls::new(
-            Arc::clone(&running_queries),
+            Some(Arc::clone(&running_queries)),
             Arc::clone(&lifecycle_transport),
             Arc::clone(&cluster),
         );
@@ -1448,6 +1448,8 @@ pub struct Bifrost {
     peer_identity: Option<crate::grpc::PeerWorkloadIdentity>,
     /// Retained forwarder, reachable by the private peer inbound handler.
     query_forwarder: Option<Arc<crate::oracle::ReadyOracleForwarder>>,
+    /// Lifecycle routing retained by every query ingress, regardless of local role.
+    query_controls: Option<crate::oracle::RunningQueryControls>,
     /// Read-only proof handle for test-tier inspection of the production graph.
     #[cfg(feature = "test-support")]
     test_resources: Option<BifrostRoleResources>,
@@ -1487,6 +1489,8 @@ pub(crate) struct BifrostComposition {
     pub(crate) peer_identity: Option<crate::grpc::PeerWorkloadIdentity>,
     /// Canonical ready-Oracle selector and authenticated private forwarder.
     pub(crate) query_forwarder: Option<Arc<crate::oracle::ReadyOracleForwarder>>,
+    /// Shared local controls or remote-only routing for a forwarding ingress.
+    pub(crate) query_controls: Option<crate::oracle::RunningQueryControls>,
     /// Already-composed production resources exposed only to the test tier.
     #[cfg(feature = "test-support")]
     pub(crate) resources: Option<BifrostRoleResources>,
@@ -1505,6 +1509,7 @@ impl Bifrost {
             token_verifier,
             peer_identity,
             query_forwarder,
+            query_controls,
             #[cfg(feature = "test-support")]
             resources,
         } = composition;
@@ -1518,6 +1523,7 @@ impl Bifrost {
             token_verifier,
             peer_identity,
             query_forwarder,
+            query_controls,
             #[cfg(feature = "test-support")]
             test_resources: resources,
             #[cfg(feature = "test-support")]
@@ -1544,6 +1550,7 @@ impl Bifrost {
             token_verifier,
             peer_identity: None,
             query_forwarder: None,
+            query_controls: None,
             test_resources: None,
             test_catalog: None,
         })
@@ -1577,6 +1584,7 @@ impl Bifrost {
             token_verifier,
             peer_identity: None,
             query_forwarder: None,
+            query_controls: None,
             test_resources: None,
             test_catalog: Some(catalog),
         })
@@ -1629,16 +1637,37 @@ impl Bifrost {
         self.query_forwarder.as_ref()
     }
 
+    /// Exercises signed local forwarding with an ingress budget shorter than the request.
+    ///
+    /// The test seam changes only the signed input instant; the retained forwarder
+    /// performs normal signature, context, replay and fence checks before execution.
+    ///
+    /// # Errors
+    /// Returns role-unavailable for ownerless shells, or the normal acceptance error.
+    #[cfg(feature = "test-support")]
+    pub async fn query_with_signed_deadline_for_test(
+        &self,
+        context: vala_bifrost_redux::oracle::AuthorizedQueryContext,
+        request: wyrd_spec::vala::api::BifrostQueryRequest,
+        deadline_ms: i64,
+    ) -> Result<vala_bifrost_redux::oracle::OracleQueryStream, wyrd_spec::vala::BifrostError> {
+        self.query_forwarder
+            .as_ref()
+            .ok_or(wyrd_spec::vala::BifrostError::OracleRoleUnavailable)?
+            .accept_with_deadline_for_test(context, request, deadline_ms)
+            .await
+    }
+
     /// Borrows the selected Oracle runtime.
     #[must_use]
     pub const fn oracle(&self) -> Option<&Arc<Oracle>> {
         self.oracle.as_ref()
     }
 
-    /// Borrows the tenant-authorized lifecycle facade from the selected Oracle runtime.
+    /// Borrows tenant-authorized lifecycle routing on local or forwarding-only ingress.
     #[must_use]
     pub fn query_controls(&self) -> Option<&crate::oracle::RunningQueryControls> {
-        self.oracle.as_ref().map(|runtime| runtime.query_controls())
+        self.query_controls.as_ref()
     }
 
     /// Returns Scribe's exact tail service when this process owns Scribe.

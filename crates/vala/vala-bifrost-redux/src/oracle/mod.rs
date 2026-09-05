@@ -1711,6 +1711,60 @@ pub struct Oracle {
     /// Test-tier one-shot pause after immutable worker selection.
     #[cfg(feature = "test-support")]
     topology_probe: Mutex<Option<Arc<OracleTopologyProbe>>>,
+    /// Request-keyed test pause between catalog pinning and roster publication.
+    #[cfg(feature = "test-support")]
+    preparation_pause: Mutex<Option<Arc<OraclePreparationPause>>>,
+}
+
+/// One-shot observation of accepted ingress authority before roster publication.
+/// The pause owns synchronization only; it cannot select or change a deadline.
+#[cfg(feature = "test-support")]
+pub struct OraclePreparationPause {
+    /// Exact request eligible to consume this pause.
+    request_id: RequestId,
+    /// Accepted deadline once the selected Oracle reaches the post-pin seam.
+    deadline_ms: std::sync::atomic::AtomicI64,
+    /// Sticky release signal, including teardown before a query reaches the seam.
+    release: CancellationToken,
+}
+
+#[cfg(feature = "test-support")]
+impl OraclePreparationPause {
+    /// Arm one request identity without supplying query authority.
+    #[must_use]
+    pub fn new(request_id: RequestId) -> Self {
+        Self {
+            request_id,
+            deadline_ms: std::sync::atomic::AtomicI64::new(0),
+            release: CancellationToken::new(),
+        }
+    }
+
+    /// Return the accepted deadline only after this request has reached pinning.
+    #[must_use]
+    pub fn observed_deadline_ms(&self) -> Option<i64> {
+        let deadline = self.deadline_ms.load(Ordering::Acquire);
+        (deadline != 0).then_some(deadline)
+    }
+
+    /// Release the selected query or disarm an unused pause during teardown.
+    pub fn release(&self) {
+        self.release.cancel();
+    }
+
+    /// Hold only the matching request's first post-pin boundary until release.
+    /// Cancelling the wait retains its single-use observation until teardown.
+    async fn hold(&self, request_id: &RequestId, deadline_ms: i64) {
+        if self.request_id == *request_id
+            && !self.release.is_cancelled()
+            && self
+                .deadline_ms
+                .compare_exchange(0, deadline_ms, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            self.release.cancelled().await;
+        }
+    }
 }
 
 /// Notification-backed test seam for a topology change after worker selection.
@@ -1970,6 +2024,28 @@ fn compose_analytical_handle(
 const ANALYTICAL_STAGE_TICKET_TTL: chrono::Duration = chrono::Duration::seconds(30);
 
 impl Oracle {
+    /// Install or clear the request-keyed post-pin pause, releasing any old hold.
+    ///
+    /// # Errors
+    /// Returns an internal error when the test synchronization lock is poisoned.
+    #[cfg(feature = "test-support")]
+    pub fn bind_preparation_pause_for_test(
+        &self,
+        pause: Option<Arc<OraclePreparationPause>>,
+    ) -> Result<(), BifrostError> {
+        let mut current = self
+            .preparation_pause
+            .lock()
+            .map_err(|_| BifrostError::Internal {
+                detail: "Oracle preparation pause lock is poisoned".to_owned(),
+            })?;
+        if let Some(previous) = current.take() {
+            previous.release();
+        }
+        *current = pause;
+        Ok(())
+    }
+
     /// Reports whether the injected process shutdown token reached the engine.
     #[cfg(feature = "test-support")]
     #[must_use]
@@ -2152,6 +2228,8 @@ impl Oracle {
             delegated_maintenance: Mutex::new(Some(delegated_maintenance)),
             #[cfg(feature = "test-support")]
             topology_probe: Mutex::new(None),
+            #[cfg(feature = "test-support")]
+            preparation_pause: Mutex::new(None),
         })
     }
 
@@ -2278,9 +2356,42 @@ impl Oracle {
         context: AuthorizedQueryContext,
         request: BifrostQueryRequest,
     ) -> Result<OracleQueryStream, BifrostError> {
-        let (roster, planned) = self.prepare_query_attempt(&context, &request).await?;
+        let deadline_ms = self.capture_query_deadline(&request)?;
+        self.query_sql_with_deadline(context, request, deadline_ms)
+            .await
+    }
+
+    /// Execute a trusted server-internal query carrying verified ingress time.
+    /// Authentication and request/fence validation belong to the calling server.
+    ///
+    /// # Errors
+    /// Returns the same preparation and execution failures as [`Self::query_sql`].
+    pub async fn query_sql_with_deadline(
+        &self,
+        context: AuthorizedQueryContext,
+        request: BifrostQueryRequest,
+        absolute_deadline_ms: i64,
+    ) -> Result<OracleQueryStream, BifrostError> {
+        let (roster, planned) = self
+            .prepare_query_attempt(&context, &request, absolute_deadline_ms)
+            .await?;
         self.run_sql_query(context, request, roster, Some(planned), None)
             .await
+    }
+
+    /// Capture a direct-entry query budget once before any preparation IO.
+    ///
+    /// # Errors
+    /// Returns query timeout if the configured duration cannot form an instant.
+    fn capture_query_deadline(&self, request: &BifrostQueryRequest) -> Result<i64, BifrostError> {
+        let duration =
+            projected_request_deadline(request.deadline_ms, self.planner.config.default_deadline);
+        let duration =
+            chrono::Duration::from_std(duration).map_err(|_| BifrostError::QueryTimeout)?;
+        chrono::Utc::now()
+            .checked_add_signed(duration)
+            .map(|deadline| deadline.timestamp_millis())
+            .ok_or(BifrostError::QueryTimeout)
     }
 
     /// Starts one raw-SQL query on the production-unreachable Analytical path.
@@ -2308,7 +2419,10 @@ impl Oracle {
         request: BifrostQueryRequest,
         attempt: analytical::AnalyticalAttemptContext,
     ) -> Result<OracleQueryStream, BifrostError> {
-        let (roster, planned) = self.prepare_query_attempt(&context, &request).await?;
+        let deadline_ms = self.capture_query_deadline(&request)?;
+        let (roster, planned) = self
+            .prepare_query_attempt(&context, &request, deadline_ms)
+            .await?;
         self.run_sql_query(context, request, roster, Some(planned), Some(attempt))
             .await
     }
@@ -2364,7 +2478,10 @@ impl Oracle {
         ),
         BifrostError,
     > {
-        let (roster, planned) = self.prepare_query_attempt(&context, &request).await?;
+        let deadline_ms = self.capture_query_deadline(&request)?;
+        let (roster, planned) = self
+            .prepare_query_attempt(&context, &request, deadline_ms)
+            .await?;
         let handle = self
             .analytical
             .as_ref()
@@ -2380,11 +2497,13 @@ impl Oracle {
             .map_err(|_| BifrostError::OracleRoleUnavailable)?;
         // Admitted exactly as production admits: the leader envelope this graph
         // owns is the one this guard holds, and there is no second acquisition.
+        let remaining = cut
+            .deadline()
+            .signed_duration_since(chrono::Utc::now())
+            .to_std()
+            .map_err(|_| BifrostError::QueryTimeout)?;
         let deadline = Instant::now()
-            .checked_add(projected_request_deadline(
-                request.deadline_ms,
-                self.planner.config.default_deadline,
-            ))
+            .checked_add(remaining)
             .ok_or(BifrostError::QueryTimeout)?;
         let mut admitted = self
             .admit_sql_query(
@@ -2446,25 +2565,58 @@ impl Oracle {
         &self,
         context: &AuthorizedQueryContext,
         request: &BifrostQueryRequest,
+        absolute_deadline_ms: i64,
     ) -> Result<(participant_cut::OracleQueryAttemptRoster, PlannedSqlCut), BifrostError> {
         self.validate_query(request)?;
         if !self.is_ready() {
             return Err(BifrostError::OracleRoleUnavailable);
         }
-        let duration =
-            projected_request_deadline(request.deadline_ms, self.planner.config.default_deadline);
+        let wall_deadline = chrono::DateTime::from_timestamp_millis(absolute_deadline_ms)
+            .ok_or(BifrostError::QueryTimeout)?;
+        let duration = wall_deadline
+            .signed_duration_since(chrono::Utc::now())
+            .to_std()
+            .map_err(|_| BifrostError::QueryTimeout)?;
+        if duration.is_zero() {
+            return Err(BifrostError::QueryTimeout);
+        }
         let deadline = Instant::now()
             .checked_add(duration)
             .ok_or(BifrostError::QueryTimeout)?;
         let snapshot = self.cluster.snapshot();
         let tables = parse_select_tables(&request.sql)?;
-        let planned = self
-            .planner
-            .pin_cut(context, &tables, deadline, &self.catalog)
-            .await?;
+        let planned = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            self.planner
+                .pin_cut(context, &tables, deadline, &self.catalog),
+        )
+        .await
+        .map_err(|_| BifrostError::QueryTimeout)??;
+        if Instant::now() >= deadline || chrono::Utc::now() >= wall_deadline {
+            return Err(BifrostError::QueryTimeout);
+        }
+        #[cfg(feature = "test-support")]
+        {
+            let pause = self
+                .preparation_pause
+                .lock()
+                .map_err(|_| BifrostError::Internal {
+                    detail: "Oracle preparation pause lock is poisoned".to_owned(),
+                })?
+                .clone();
+            if let Some(pause) = pause {
+                tokio::time::timeout_at(
+                    tokio::time::Instant::from_std(deadline),
+                    pause.hold(&context.request_id, absolute_deadline_ms),
+                )
+                .await
+                .map_err(|_| BifrostError::QueryTimeout)?;
+            }
+        }
         let now = chrono::Utc::now();
-        let wall_deadline =
-            now + chrono::Duration::from_std(duration).map_err(|_| BifrostError::QueryTimeout)?;
+        if Instant::now() >= deadline || now >= wall_deadline {
+            return Err(BifrostError::QueryTimeout);
+        }
         let observed_age = now
             .signed_duration_since(snapshot.observed_at())
             .to_std()

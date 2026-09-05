@@ -1126,6 +1126,8 @@ pub struct ScribeTailReader {
     source: Arc<FetchLiveTailService>,
     /// Retention and page ceilings enforced before caller-provided values.
     config: TailFenceConfig,
+    /// Serializes pre-material ceilings until each snapshot shrinks to its live bytes.
+    materialization: tokio::sync::Mutex<()>,
     /// Mutable retained fences and aggregate shallow-memory accounting.
     fences: Mutex<FenceRegistry>,
 }
@@ -1307,7 +1309,7 @@ fn cursor_cmp(
     )))
 }
 
-/// Counts one shallow row's exact canonical IPC stream before page admission.
+/// Counts one shallow batch's exact canonical IPC stream before page admission.
 ///
 /// # Errors
 ///
@@ -1491,6 +1493,98 @@ struct RetainedFence {
     retained_bytes: usize,
     /// Sole owner of the retained Arrow payload and descriptor backing.
     owner: crate::resources::ScribeMemoryLease,
+}
+
+impl RetainedFence {
+    /// Builds a shallow page and its exact IPC charge from this immutable cut.
+    ///
+    /// # Errors
+    /// Returns [`TailReadError`] for invalid row identities, encoding failure,
+    /// or a single row that cannot fit the byte limit.
+    fn page(
+        &self,
+        after: &tail::TailCursor,
+        row_limit: usize,
+        byte_limit: usize,
+    ) -> Result<(LocalTailPage, usize), TailReadError> {
+        let mut batches = Vec::new();
+        let mut row_count = 0;
+        let mut encoded_bytes = 0_usize;
+        let mut next = None;
+        let mut complete = true;
+        'batches: for batch in &self.batches {
+            let ordinals = crate::schema::managed_columns::row_ordinals(batch.rows.as_ref())
+                .map_err(|error| TailReadError::State {
+                    detail: format!("retained row identity invariant failed: {error}"),
+                })?;
+            let cursor_at = |row_index| -> Result<tail::TailCursor, TailReadError> {
+                Ok(tail::TailCursor {
+                    writer_epoch: self.fence.stream.writer_epoch,
+                    wal_lsn: batch.lsn.as_u64(),
+                    batch_id: batch.batch_id,
+                    row_ordinal: u32::try_from(ordinals.value(row_index)).map_err(|_| {
+                        TailReadError::State {
+                            detail: "retained row ordinal is negative".to_owned(),
+                        }
+                    })?,
+                })
+            };
+            let included = |row_index| -> Result<bool, TailReadError> {
+                let cursor = cursor_at(row_index)?;
+                Ok(cursor_cmp(&cursor, after)? == std::cmp::Ordering::Greater
+                    && cursor_cmp(&cursor, &self.fence.inclusive_live)?
+                        != std::cmp::Ordering::Greater)
+            };
+            let mut start = 0;
+            while start < batch.rows.num_rows() {
+                if !included(start)? {
+                    start += 1;
+                    continue;
+                }
+                if row_count == row_limit {
+                    complete = false;
+                    break 'batches;
+                }
+                let mut length = 1;
+                while length < row_limit - row_count
+                    && start + length < batch.rows.num_rows()
+                    && included(start + length)?
+                {
+                    length += 1;
+                }
+                // Keep contiguous rows together: one-row slices otherwise retain
+                // and charge the same backing buffers once for every result row.
+                let (rows, bytes) = loop {
+                    let rows = batch.rows.slice(start, length);
+                    let bytes = encoded_record_batch_bytes(&rows)?;
+                    if bytes <= byte_limit - encoded_bytes {
+                        break (rows, bytes);
+                    }
+                    if length == 1 {
+                        if batches.is_empty() {
+                            return Err(TailReadError::OversizeRow);
+                        }
+                        complete = false;
+                        break 'batches;
+                    }
+                    length = length.div_ceil(2);
+                };
+                encoded_bytes += bytes;
+                row_count += length;
+                next = Some(cursor_at(start + length - 1)?);
+                batches.push(Arc::new(rows));
+                start += length;
+            }
+        }
+        Ok((
+            LocalTailPage {
+                batches,
+                next,
+                complete,
+            },
+            encoded_bytes,
+        ))
+    }
 }
 
 /// Cancellation-safe pre-material fence slot and root-backed capacity owner.
@@ -1691,6 +1785,7 @@ impl ScribeTailReader {
         let tombstone_capacity = max_fences.saturating_mul(4);
         Self {
             source,
+            materialization: tokio::sync::Mutex::new(()),
             config: TailFenceConfig {
                 ttl: config.ttl.min(Duration::from_secs(30)),
                 max_fences,
@@ -1870,6 +1965,16 @@ impl ScribeTailReader {
                 version: request.tail_protocol_version,
             });
         }
+        // ponytail: one snapshot materializes at a time; use per-scope size
+        // reservations if concurrent snapshot throughput becomes necessary.
+        let remaining = request
+            .deadline
+            .signed_duration_since(Utc::now())
+            .to_std()
+            .map_err(|_| TailReadError::DeadlineElapsed)?;
+        let _materialization = tokio::time::timeout(remaining, self.materialization.lock())
+            .await
+            .map_err(|_| TailReadError::DeadlineElapsed)?;
         let now = Utc::now();
         let remaining = request.deadline.signed_duration_since(now);
         let ttl = remaining
@@ -2119,71 +2224,16 @@ impl ScribeTailReader {
             .min(self.config.max_page_encoded_bytes)
             .max(1) as usize;
         let after = after.as_ref().unwrap_or(&retained.fence.exclusive_sealed);
-        let mut rows = Vec::with_capacity(row_limit);
-        let mut encoded_bytes = 0_usize;
-        let mut next = None;
-        for batch in &retained.batches {
-            let ordinals = crate::schema::managed_columns::row_ordinals(batch.rows.as_ref())
-                .map_err(|error| TailReadError::State {
-                    detail: format!("retained row identity invariant failed: {error}"),
-                })?;
-            for row_index in 0..batch.rows.num_rows() {
-                let cursor = tail::TailCursor {
-                    writer_epoch: retained.fence.stream.writer_epoch,
-                    wal_lsn: batch.lsn.as_u64(),
-                    batch_id: batch.batch_id,
-                    row_ordinal: u32::try_from(ordinals.value(row_index)).map_err(|_| {
-                        TailReadError::State {
-                            detail: "retained row ordinal is negative".to_owned(),
-                        }
-                    })?,
-                };
-                if cursor_cmp(&cursor, after)? != std::cmp::Ordering::Greater {
-                    continue;
-                }
-                if cursor_cmp(&cursor, &retained.fence.inclusive_live)? != std::cmp::Ordering::Less
-                    && cursor != retained.fence.inclusive_live
-                {
-                    continue;
-                }
-                let row = Arc::new(batch.rows.slice(row_index, 1));
-                let row_bytes = encoded_record_batch_bytes(row.as_ref())?;
-                if rows.is_empty() && row_bytes > byte_limit {
-                    return Err(TailReadError::OversizeRow);
-                }
-                if rows.len() == row_limit || encoded_bytes.saturating_add(row_bytes) > byte_limit {
-                    registry.lifecycle.transfers = registry
-                        .lifecycle
-                        .transfers
-                        .saturating_add(u64::try_from(rows.len()).unwrap_or(u64::MAX));
-                    registry.lifecycle.transferred_bytes = registry
-                        .lifecycle
-                        .transferred_bytes
-                        .saturating_add(encoded_bytes);
-                    return Ok(LocalTailPage {
-                        batches: rows,
-                        next,
-                        complete: false,
-                    });
-                }
-                encoded_bytes = encoded_bytes.saturating_add(row_bytes);
-                next = Some(cursor);
-                rows.push(row);
-            }
-        }
+        let (page, encoded_bytes) = retained.page(after, row_limit, byte_limit)?;
         registry.lifecycle.transfers = registry
             .lifecycle
             .transfers
-            .saturating_add(u64::try_from(rows.len()).unwrap_or(u64::MAX));
+            .saturating_add(u64::try_from(page.batches.len()).unwrap_or(u64::MAX));
         registry.lifecycle.transferred_bytes = registry
             .lifecycle
             .transferred_bytes
             .saturating_add(encoded_bytes);
-        Ok(LocalTailPage {
-            batches: rows,
-            next,
-            complete: true,
-        })
+        Ok(page)
     }
 
     /// Settles one retained owner exactly once; repeat calls are successful no-ops.
@@ -2565,15 +2615,28 @@ impl FetchLiveTailService {
         &self,
         tenant: DataTenantId,
     ) -> Result<Vec<crate::scribe::seal_key::SealKey>, ScribeError> {
-        if let Some(memtable) = &self.memtable {
-            return memtable.seal_keys_for_tenant(tenant);
+        let mut keys = if let Some(memtable) = &self.memtable {
+            memtable.seal_keys_for_tenant(tenant)?
+        } else {
+            self.shards
+                .as_ref()
+                .ok_or_else(|| ScribeError::Internal {
+                    detail: "tail source has no shard runtime".to_owned(),
+                })?
+                .active_seal_keys_for_tenant(tenant)?
+        };
+        if let Some(hot_sources) = &self.hot_sources {
+            keys.extend(
+                hot_sources
+                    .staged_seal_keys_for_tenant(tenant)
+                    .map_err(|error| ScribeError::Internal {
+                        detail: format!("discover staged live-tail keys: {error}"),
+                    })?,
+            );
         }
-        self.shards
-            .as_ref()
-            .ok_or_else(|| ScribeError::Internal {
-                detail: "tail source has no shard runtime".to_owned(),
-            })?
-            .active_seal_keys_for_tenant(tenant)
+        keys.sort_by_key(ToString::to_string);
+        keys.dedup();
+        Ok(keys)
     }
 
     /// Return the canonical pod-local shard for a live-tail scope.

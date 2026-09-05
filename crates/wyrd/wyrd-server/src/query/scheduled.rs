@@ -4,7 +4,7 @@ use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::oracle::{AuthorizedQueryContext, QueryIpcDecoder};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{
-    BifrostQueryRequest, QueryStreamFrame, QueryTerminalFrame, QueryTerminalOutcome,
+    BifrostQueryRequest, QueryStreamFrame, QueryTerminalFrame, QueryTerminalOutcome, VisibilityMode,
 };
 use wyrd_spec::vala::error::BifrostError;
 
@@ -55,12 +55,14 @@ impl ScheduledQueryCaller {
     ///
     /// The stream enforces its own pinned deadline, so this only adds the
     /// caller's cancellation: a cancelled run cancels the stream rather than
-    /// dropping it, which is what returns the admitted owner promptly.
+    /// dropping it. Local and remote cancellation are driven together while
+    /// the original response is retained until its owner reports settlement.
     ///
     /// # Errors
     ///
     /// Returns the stable pre-stream query error, a frame or Arrow decode
-    /// error, [`WyrdError`] for a failed terminal, and a protocol error when
+    /// error, [`WyrdError`] for a failed terminal, unconfirmed lifecycle routing,
+    /// and a protocol error when
     /// the stream ended without a terminal frame.
     ///
     /// # Cancellation
@@ -72,6 +74,7 @@ impl ScheduledQueryCaller {
         &self,
         request: BifrostQueryRequest,
     ) -> Result<ScheduledQueryOutcome, WyrdError> {
+        let visibility = request.visibility;
         let mut stream = self
             .state
             .bifrost
@@ -82,12 +85,30 @@ impl ScheduledQueryCaller {
         // frame is taken, so no leg of consumption — least of all the wait for
         // clean EOF after a terminal — can start a fresh budget.
         let deadline = deadline_instant(stream.deadline_ms);
-        match Self::consume_to_terminal(&mut stream.frames, deadline, &self.cancellation).await {
+        let mut terminal = None;
+        match Self::consume_to_terminal(
+            &mut stream.frames,
+            deadline,
+            &self.cancellation,
+            visibility,
+            &mut terminal,
+        )
+        .await
+        {
             Ok(outcome) => Ok(outcome),
             Err(error) => {
-                // An abandoned stream is still an admitted Oracle query, so the
-                // caller settles it rather than dropping it.
-                stream.cancel().await;
+                self.state
+                    .bifrost
+                    .query_controls()
+                    .ok_or(BifrostError::RunningQueryControlUnavailable)?
+                    .cancel_and_settle(
+                        self.context.data_tenant_id,
+                        self.context.request_id.clone(),
+                        stream,
+                        visibility,
+                        terminal,
+                    )
+                    .await?;
                 Err(error)
             }
         }
@@ -120,6 +141,8 @@ impl ScheduledQueryCaller {
         frames: &mut S,
         deadline: tokio::time::Instant,
         cancellation: &CancellationToken,
+        visibility: VisibilityMode,
+        observed: &mut Option<QueryTerminalFrame>,
     ) -> Result<ScheduledQueryOutcome, WyrdError>
     where
         S: futures_util::Stream<Item = Result<QueryStreamFrame, BifrostError>> + Unpin,
@@ -141,8 +164,12 @@ impl ScheduledQueryCaller {
                 // Clean EOF. Only a validated terminal makes this a result.
                 return settled.ok_or_else(|| BifrostError::QueryStreamIncomplete.into());
             };
-            let frame = frame.map_err(WyrdError::from)?;
+            let frame = frame.map_err(|error| {
+                *observed = None;
+                WyrdError::from(error)
+            })?;
             if settled.is_some() {
+                *observed = None;
                 return Err(BifrostError::QueryStreamProtocol.into());
             }
             match frame {
@@ -162,7 +189,12 @@ impl ScheduledQueryCaller {
                         .ok_or_else(|| WyrdError::from(BifrostError::QueryStreamProtocol))?;
                 }
                 QueryStreamFrame::Terminal(terminal) => {
+                    terminal
+                        .validate(visibility)
+                        .and_then(|()| terminal.validate_emitted_rows(rows))
+                        .map_err(|_| WyrdError::from(BifrostError::QueryStreamProtocol))?;
                     if terminal.outcome == QueryTerminalOutcome::Failed {
+                        *observed = Some(terminal.clone());
                         return Err(terminal
                             .error
                             .as_ref()
@@ -171,12 +203,10 @@ impl ScheduledQueryCaller {
                             })
                             .into());
                     }
-                    terminal
-                        .validate_emitted_rows(rows)
-                        .map_err(|_| WyrdError::from(BifrostError::QueryStreamProtocol))?;
                     decoder
                         .accept_eos(&terminal.arrow_ipc_eos)
                         .map_err(|error| super::service::arrow_decode_error(&error))?;
+                    *observed = Some(terminal.clone());
                     settled = Some(ScheduledQueryOutcome { rows, terminal });
                 }
             }
@@ -242,7 +272,8 @@ mod tests {
         (prefix, fragments, std::mem::take(writer.get_mut()))
     }
 
-    /// Builds one successful terminal claiming `row_count` rows.
+    /// Builds a valid published-only terminal claiming `row_count` rows.
+    /// Both persisted source classes are complete, matching the Oracle contract.
     fn success_terminal(row_count: u64, arrow_ipc_eos: Vec<u8>) -> QueryTerminalFrame {
         QueryTerminalFrame {
             outcome: QueryTerminalOutcome::Success,
@@ -250,10 +281,16 @@ mod tests {
             execution_path: wyrd_spec::vala::api::QueryExecutionPath::Interactive,
             row_count,
             warnings: Vec::new(),
-            source_completion: vec![SourceCompletion {
-                source: QuerySource::Iceberg,
-                outcome: SourceCompletionOutcome::Complete,
-            }],
+            source_completion: vec![
+                SourceCompletion {
+                    source: QuerySource::Iceberg,
+                    outcome: SourceCompletionOutcome::Complete,
+                },
+                SourceCompletion {
+                    source: QuerySource::HotSealed,
+                    outcome: SourceCompletionOutcome::Complete,
+                },
+            ],
             error: None,
             arrow_ipc_eos,
         }
@@ -267,6 +304,10 @@ mod tests {
     /// terminal, a row-count mismatch, a malformed end-of-stream, a second
     /// terminal, and any frame after the terminal each return a stable query
     /// error and no outcome.
+    ///
+    /// # Panics
+    /// Panics if malformed completion is accepted, valid completion is lost,
+    /// or the canonical refusal differs from the forced failure.
     #[tokio::test]
     async fn scheduled_terminal_requires_clean_eof() {
         let (prefix, fragments, eos) = split_ipc_stream(&[&[1, 2, 3]]);
@@ -349,6 +390,8 @@ mod tests {
                 &mut stream,
                 deadline_instant(deadline_in(30_000)),
                 &CancellationToken::new(),
+                VisibilityMode::PublishedOnly,
+                &mut None,
             )
             .await
             .expect_err(label);
@@ -374,6 +417,8 @@ mod tests {
             &mut stream,
             deadline_instant(deadline_in(30_000)),
             &CancellationToken::new(),
+            VisibilityMode::PublishedOnly,
+            &mut None,
         )
         .await
         .expect_err("a malformed end-of-stream is refused");
@@ -393,6 +438,8 @@ mod tests {
             &mut stream,
             deadline_instant(deadline_in(30_000)),
             &CancellationToken::new(),
+            VisibilityMode::PublishedOnly,
+            &mut None,
         )
         .await
         .expect("a valid terminal followed by clean EOF settles");
@@ -405,6 +452,8 @@ mod tests {
             &mut stream,
             deadline_instant(deadline_in(-1)),
             &CancellationToken::new(),
+            VisibilityMode::PublishedOnly,
+            &mut None,
         )
         .await
         .expect_err("an elapsed deadline is incomplete");

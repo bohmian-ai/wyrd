@@ -637,6 +637,16 @@ impl QueryResultStream {
     /// Cancelling preserves the stream for a later call. Dropping the stream
     /// cancels response-body consumption.
     pub async fn next_batch(&mut self) -> Result<Option<RecordBatch>, ValaSdkError> {
+        if self.terminal.is_none()
+            && self.settlement != StreamSettlement::Broken
+            && let Some(terminal) = self.raw.terminal().cloned()
+            && terminal.outcome != QueryTerminalOutcome::Failed
+        {
+            if let Err(error) = terminal.validate_emitted_rows(self.emitted_rows) {
+                return Err(self.mark_broken(ValaSdkError::Protocol(error.to_string())));
+            }
+            return self.finish_at_clean_eof(terminal).await;
+        }
         loop {
             let frame = self.raw.next_decoded_frame().await;
             self.encoded_bytes = self.raw.received_bytes();
@@ -714,9 +724,9 @@ impl QueryResultStream {
     /// A terminal is a claim about a stream that has not ended yet. Retaining it
     /// before the body closes would let a duplicate terminal, a late schema, or
     /// a trailing batch arrive behind a result the caller already believes is
-    /// complete. So the terminal is held locally, one further frame is polled
-    /// within whatever remains of the server-pinned deadline, and only clean EOF
-    /// promotes it to this stream's result.
+    /// complete. The raw stream retains the provisional terminal across cancelled
+    /// reads. One further frame is polled within the remaining server-pinned
+    /// deadline; only clean EOF promotes it to this stream's public result.
     ///
     /// # Errors
     /// Returns [`ValaSdkError::Protocol`] when any frame follows the terminal,
@@ -2096,6 +2106,113 @@ mod tests {
             stream.next_frame().await,
             Err(ValaSdkError::IncompleteQueryStream)
         ));
+    }
+
+    /// Cancelling provisional-success EOF validation preserves stream-owned
+    /// metadata for both incremental reads and subsequent bounded collection.
+    ///
+    /// # Panics
+    /// Panics if cancellation loses terminal metadata or exposes success before EOF.
+    #[tokio::test]
+    async fn cancelled_terminal_eof_wait_resumes_safely() {
+        for case in ["incremental", "collect", "expired", "late frame"] {
+            let schema = test_schema();
+            let (mut ipc, prefix) = TestQueryIpc::open(&schema);
+            let batch = ipc.batch(&schema, &[1, 2]);
+            let terminal = success_terminal(VisibilityMode::PublishedOnly, 2, ipc.close());
+            let (sender, mut receiver) = tokio::sync::mpsc::channel(3);
+            for frame in [
+                QueryStreamFrame::Schema(QuerySchemaFrame {
+                    schema_fingerprint: String::new(),
+                    arrow_ipc_schema: prefix,
+                }),
+                QueryStreamFrame::Batch(QueryBatchFrame {
+                    arrow_ipc_batch: batch,
+                }),
+                QueryStreamFrame::Terminal(terminal.clone()),
+            ] {
+                sender
+                    .try_send(Ok(Bytes::from(encoded(frame))))
+                    .expect("frame fits");
+            }
+            let eof_polled = Arc::new(tokio::sync::Notify::new());
+            let notify = Arc::clone(&eof_polled);
+            let body = stream::poll_fn(move |cx| {
+                let polled = receiver.poll_recv(cx);
+                if polled.is_pending() {
+                    notify.notify_one();
+                }
+                polled
+            });
+            let mut result = QueryResultStream::new(
+                RawQueryStream::new(body, VisibilityMode::PublishedOnly),
+                RequestId::now_v7(),
+                offline_client(),
+                deadline_in(if case == "expired" { 200 } else { 30_000 }),
+            );
+            assert_eq!(
+                result
+                    .next_batch()
+                    .await
+                    .expect("batch decodes")
+                    .expect("batch exists")
+                    .num_rows(),
+                2
+            );
+            {
+                let read = result.next_batch();
+                tokio::pin!(read);
+                tokio::select! {
+                    biased;
+                    value = &mut read => panic!("EOF must remain gated: {value:?}"),
+                    () = eof_polled.notified() => {},
+                }
+            }
+            assert!(result.terminal().is_none());
+            assert_eq!(result.settlement, StreamSettlement::Healthy);
+            if case == "expired" {
+                let deadline = result.deadline_ms();
+                tokio::time::sleep(result.remaining()).await;
+                let resumed =
+                    tokio::time::timeout(std::time::Duration::from_secs(1), result.next_batch())
+                        .await
+                        .expect("resumption remains bounded by the original deadline");
+                assert!(matches!(resumed, Err(ValaSdkError::IncompleteQueryStream)));
+                assert_eq!(result.deadline_ms(), deadline);
+                assert_eq!(result.settlement, StreamSettlement::Broken);
+                assert!(result.terminal().is_none());
+                continue;
+            }
+            if case == "late frame" {
+                sender
+                    .try_send(Ok(Bytes::from(encoded(QueryStreamFrame::Terminal(
+                        terminal.clone(),
+                    )))))
+                    .expect("late frame fits");
+                assert!(matches!(
+                    result.next_batch().await,
+                    Err(ValaSdkError::Protocol(_))
+                ));
+                assert_eq!(result.settlement, StreamSettlement::Broken);
+                assert!(result.terminal().is_none());
+                continue;
+            }
+            drop(sender);
+            if case == "collect" {
+                let collected = result
+                    .collect_bounded(CollectedQueryLimits {
+                        max_rows: 10,
+                        max_encoded_bytes: 1024 * 1024,
+                    })
+                    .await
+                    .expect("resumed collection retains completion");
+                assert_eq!(collected.terminal, terminal);
+            } else {
+                assert!(result.next_batch().await.expect("EOF validates").is_none());
+                assert_eq!(result.terminal(), Some(&terminal));
+                assert_eq!(result.settlement, StreamSettlement::Settled);
+            }
+        }
     }
 
     /// Schema, one batch, and terminal decode incrementally and retain metadata.

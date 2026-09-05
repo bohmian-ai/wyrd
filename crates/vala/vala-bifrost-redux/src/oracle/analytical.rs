@@ -1265,6 +1265,19 @@ struct GraphSettlement {
     outcome: AnalyticalAttemptOutcome,
 }
 
+impl GraphSettlement {
+    /// Drain this graph's lease and retain its identity with the outcome so the
+    /// ingress driver can update the matching entry without a second inventory.
+    ///
+    /// # Errors
+    /// The returned outcome contains the lease's task-drain or cleanup failure;
+    /// failed cleanup remains owned and observable by the lease supervisor.
+    async fn settle(self) -> (AnalyticalGraphKey, Result<(), BifrostError>) {
+        let settled = self.lease.settle(self.outcome).await;
+        (self.graph, settled)
+    }
+}
+
 /// The closed set of commands the one settlement driver accepts.
 ///
 /// Two, because the driver has exactly two reasons to run: a graph it must
@@ -1455,6 +1468,86 @@ impl fmt::Debug for AnalyticalStageIngress {
 }
 
 impl AnalyticalStageIngress {
+    /// Settles every graph this node must release, and cancels each at its deadline.
+    ///
+    /// The single asynchronous owner of follower settlement. It has three reasons
+    /// to wake — a command on its bounded queue, the earliest signed graph deadline
+    /// coming due, and the completion of a settlement it already owns — and it
+    /// serves all three from one task. The settlements it owns run concurrently in
+    /// one driver-local `FuturesUnordered`, so a graph whose cleanup drains slowly
+    /// cannot stop the driver from cancelling a different graph on time; they are
+    /// still this task's own futures, so nothing is detached and shutdown's join is
+    /// still complete.
+    ///
+    /// It holds only a [`Weak`] back-reference, so the ingress's own join handle
+    /// cannot keep the ingress alive; a settlement that completes after the node is
+    /// gone simply has no entry left to update. Returning ends the driver, which is
+    /// what [`AnalyticalStageIngress::shutdown`] joins.
+    async fn drive_graph_settlements(
+        mut commands: mpsc::Receiver<GraphSettlementCommand>,
+        ingress: Weak<Self>,
+    ) {
+        let mut settling = futures_util::stream::FuturesUnordered::new();
+        let mut queue_closed = false;
+        loop {
+            // Every deadline is rescanned from the graph map on every wake rather
+            // than tracked incrementally: the map is the one lifecycle inventory,
+            // and a second copy of it could disagree with the state that authorizes
+            // work against the same graph.
+            let next_deadline = match ingress.upgrade() {
+                Some(node) => match node.expire_due_graphs(Utc::now()) {
+                    Ok((due, next)) => {
+                        for settlement in due {
+                            settling.push(settlement.settle());
+                        }
+                        next
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error,
+                            "Oracle analytical settlement driver cannot read graph deadlines"
+                        );
+                        None
+                    }
+                },
+                None => None,
+            };
+            if queue_closed && settling.is_empty() {
+                return;
+            }
+            let timer = next_deadline.map(|deadline_ms| {
+                let remaining = deadline_ms.saturating_sub(Utc::now().timestamp_millis());
+                tokio::time::sleep(Duration::from_millis(u64::try_from(remaining).unwrap_or(0)))
+            });
+            tokio::select! {
+                command = commands.recv(), if !queue_closed => match command {
+                    Some(GraphSettlementCommand::Wake) => {}
+                    Some(GraphSettlementCommand::Settle(settlement)) => {
+                        settling.push(settlement.settle());
+                    }
+                    None => queue_closed = true,
+                },
+                Some((graph, settled)) = futures_util::StreamExt::next(&mut settling) => {
+                    if let Err(error) = &settled {
+                        tracing::warn!(
+                            error = %error,
+                            public_query_id = %graph.public_query_id,
+                            "Oracle analytical follower could not settle a closed graph"
+                        );
+                    }
+                    if let Some(node) = ingress.upgrade() {
+                        node.record_settlement(graph, &settled);
+                    }
+                }
+                () = async {
+                    timer
+                        .expect("the timer branch is enabled only when a deadline exists")
+                        .await;
+                }, if timer.is_some() => {}
+            }
+        }
+    }
+
     /// Builds the follower ingress and starts its one settlement driver.
     ///
     /// No upstream worker is built here. Each graph builds its own from
@@ -1499,7 +1592,7 @@ impl AnalyticalStageIngress {
         );
         Arc::new_cyclic(|weak: &Weak<Self>| {
             let driver = if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                Some(handle.spawn(drive_graph_settlements(receiver, Weak::clone(weak))))
+                Some(handle.spawn(Self::drive_graph_settlements(receiver, Weak::clone(weak))))
             } else {
                 tracing::warn!(
                     "Oracle analytical follower ingress was built outside a runtime; \
@@ -2231,98 +2324,6 @@ impl AnalyticalStageIngress {
         }
         self.supervisor.shutdown().await
     }
-}
-
-/// Settles every graph this node must release, and cancels each at its deadline.
-///
-/// The single asynchronous owner of follower settlement. It has three reasons
-/// to wake — a command on its bounded queue, the earliest signed graph deadline
-/// coming due, and the completion of a settlement it already owns — and it
-/// serves all three from one task. The settlements it owns run concurrently in
-/// one driver-local `FuturesUnordered`, so a graph whose cleanup drains slowly
-/// cannot stop the driver from cancelling a different graph on time; they are
-/// still this task's own futures, so nothing is detached and shutdown's join is
-/// still complete.
-///
-/// It holds only a [`Weak`] back-reference, so the ingress's own join handle
-/// cannot keep the ingress alive; a settlement that completes after the node is
-/// gone simply has no entry left to update. Returning ends the driver, which is
-/// what [`AnalyticalStageIngress::shutdown`] joins.
-async fn drive_graph_settlements(
-    mut commands: mpsc::Receiver<GraphSettlementCommand>,
-    ingress: Weak<AnalyticalStageIngress>,
-) {
-    let mut settling = futures_util::stream::FuturesUnordered::new();
-    let mut queue_closed = false;
-    loop {
-        // Every deadline is rescanned from the graph map on every wake rather
-        // than tracked incrementally: the map is the one lifecycle inventory,
-        // and a second copy of it could disagree with the state that authorizes
-        // work against the same graph.
-        let next_deadline = match ingress.upgrade() {
-            Some(node) => match node.expire_due_graphs(Utc::now()) {
-                Ok((due, next)) => {
-                    for settlement in due {
-                        settling.push(settle_graph(settlement));
-                    }
-                    next
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        error = %error,
-                        "Oracle analytical settlement driver cannot read graph deadlines"
-                    );
-                    None
-                }
-            },
-            None => None,
-        };
-        if queue_closed && settling.is_empty() {
-            return;
-        }
-        let timer = next_deadline.map(|deadline_ms| {
-            let remaining = deadline_ms.saturating_sub(Utc::now().timestamp_millis());
-            tokio::time::sleep(Duration::from_millis(u64::try_from(remaining).unwrap_or(0)))
-        });
-        tokio::select! {
-            command = commands.recv(), if !queue_closed => match command {
-                Some(GraphSettlementCommand::Wake) => {}
-                Some(GraphSettlementCommand::Settle(settlement)) => {
-                    settling.push(settle_graph(settlement));
-                }
-                None => queue_closed = true,
-            },
-            Some((graph, settled)) = futures_util::StreamExt::next(&mut settling) => {
-                if let Err(error) = &settled {
-                    tracing::warn!(
-                        error = %error,
-                        public_query_id = %graph.public_query_id,
-                        "Oracle analytical follower could not settle a closed graph"
-                    );
-                }
-                if let Some(node) = ingress.upgrade() {
-                    node.record_settlement(graph, &settled);
-                }
-            }
-            () = async {
-                timer
-                    .expect("the timer branch is enabled only when a deadline exists")
-                    .await;
-            }, if timer.is_some() => {}
-        }
-    }
-}
-
-/// Runs one graph's settlement and reports which graph it was.
-///
-/// A free function so every future in the driver's concurrent set has the same
-/// type, and so the graph identity survives to the completion arm without the
-/// driver keeping a parallel table of in-flight settlements.
-async fn settle_graph(
-    settlement: GraphSettlement,
-) -> (AnalyticalGraphKey, Result<(), BifrostError>) {
-    let settled = settlement.lease.settle(settlement.outcome).await;
-    (settlement.graph, settled)
 }
 
 /// Leader-side ownership of every participant reservation one attempt took.

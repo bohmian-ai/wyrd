@@ -32,10 +32,37 @@ struct TicketWire {
     node_id: uuid::Uuid,
     /// Writer epoch selected for the operation.
     writer_epoch: u64,
-    /// Absolute ticket deadline in epoch milliseconds.
+    /// Unchanged query execution deadline bound to the exact request.
     deadline_ms: i64,
+    /// Ticket acceptance expiry, no later than the query deadline or mint + 30s.
+    expires_ms: i64,
     /// Single-use replay nonce.
     nonce: Vec<u8>,
+}
+
+impl TicketWire {
+    /// Validate the signed acceptance window independently of the query budget.
+    ///
+    /// # Errors
+    /// Returns authorization failure for invalid timestamps, expired acceptance,
+    /// or an acceptance window exceeding the query deadline or maximum TTL.
+    fn validate_deadlines(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<(DateTime<Utc>, DateTime<Utc>), TailReadError> {
+        let deadline = DateTime::from_timestamp_millis(self.deadline_ms);
+        let expiry = DateTime::from_timestamp_millis(self.expires_ms);
+        match (deadline, expiry) {
+            (Some(deadline), Some(expiry))
+                if expiry > now && expiry <= deadline && expiry - now <= MAX_TICKET_TTL =>
+            {
+                Ok((deadline, expiry))
+            }
+            _ => Err(TailReadError::Authorization {
+                detail: "tail ticket deadline or acceptance expiry is invalid".to_owned(),
+            }),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -221,7 +248,7 @@ impl ScribeTailAuthority {
     }
 
     /// Projects transport-neutral claims into their signed wire representation.
-    fn wire(claims: &TailTicketClaims) -> TicketWire {
+    fn wire(claims: &TailTicketClaims, now: DateTime<Utc>) -> TicketWire {
         TicketWire {
             audience: Self::audience(claims.audience),
             query_id: claims.query_id,
@@ -230,6 +257,7 @@ impl ScribeTailAuthority {
             node_id: claims.node_id,
             writer_epoch: claims.writer_epoch,
             deadline_ms: claims.deadline.timestamp_millis(),
+            expires_ms: claims.deadline.min(now + MAX_TICKET_TTL).timestamp_millis(),
             nonce: claims.nonce.clone(),
         }
     }
@@ -237,17 +265,21 @@ impl ScribeTailAuthority {
 
 impl TailTicketMinter for ScribeTailAuthority {
     /// Signs one short-lived list or acquire claim set.
+    ///
+    /// The signed acceptance expiry is bounded independently; the query's exact
+    /// deadline remains unchanged for request binding and retained-fence execution.
+    ///
+    /// # Errors
+    /// Returns authorization failure for expired queries, short nonces, or
+    /// envelope encoding/signing failures.
     fn mint_tail_ticket(&self, claims: &TailTicketClaims) -> Result<Vec<u8>, TailReadError> {
         let now = Utc::now();
-        if claims.deadline <= now
-            || claims.deadline - now > MAX_TICKET_TTL
-            || claims.nonce.len() < 16
-        {
+        if claims.deadline <= now || claims.nonce.len() < 16 {
             return Err(TailReadError::Authorization {
                 detail: "tail ticket lifetime or nonce is invalid".to_owned(),
             });
         }
-        serde_json::to_vec(&Self::wire(claims))
+        serde_json::to_vec(&Self::wire(claims, now))
             .map_err(|_| TailReadError::Authorization {
                 detail: "tail ticket encoding failed".to_owned(),
             })
@@ -415,9 +447,9 @@ impl TailTicketVerifier for ScribeTailAuthority {
                 detail: "tail ticket audience is invalid".to_owned(),
             });
         }
-        let expiry = match DateTime::from_timestamp_millis(wire.deadline_ms) {
-            Some(expiry) => expiry,
-            None => {
+        let (deadline, expiry) = match wire.validate_deadlines(Utc::now()) {
+            Ok(deadlines) => deadlines,
+            Err(error) => {
                 if let Ok(tenant) = DataTenantId::new(wire.tenant_id) {
                     self.audit
                         .append_verified_tail_violation(tenant, "expiry")
@@ -427,21 +459,9 @@ impl TailTicketVerifier for ScribeTailAuthority {
                         .append_unverified_tail_rejection("expiry")
                         .await?;
                 }
-                return Err(TailReadError::Authorization {
-                    detail: "tail ticket deadline is invalid".to_owned(),
-                });
+                return Err(error);
             }
         };
-        if expiry <= Utc::now() {
-            if let Ok(tenant) = DataTenantId::new(wire.tenant_id) {
-                self.audit
-                    .append_verified_tail_violation(tenant, "expiry")
-                    .await?;
-            }
-            return Err(TailReadError::Authorization {
-                detail: "tail ticket expired".to_owned(),
-            });
-        }
         let replay_rejected = {
             let mut replay = self
                 .replay
@@ -478,7 +498,7 @@ impl TailTicketVerifier for ScribeTailAuthority {
             canonical_table: wire.canonical_table,
             node_id: wire.node_id,
             writer_epoch: wire.writer_epoch,
-            deadline: expiry,
+            deadline,
             audience: expected_audience,
             nonce: wire.nonce,
         })
@@ -504,7 +524,7 @@ impl TailTicketVerifier for ScribeTailAuthority {
             }
         };
         let audience = Self::parse_audience(wire.audience)?;
-        let expected_wire = Self::wire(expected);
+        let expected_wire = Self::wire(expected, Utc::now());
         if wire.query_id != expected_wire.query_id
             || wire.tenant_id != expected_wire.tenant_id
             || wire.canonical_table != expected_wire.canonical_table
@@ -522,19 +542,15 @@ impl TailTicketVerifier for ScribeTailAuthority {
             });
         }
         let now = Utc::now();
-        let expiry = DateTime::from_timestamp_millis(wire.deadline_ms).ok_or_else(|| {
-            TailReadError::Authorization {
-                detail: "tail ticket deadline is invalid".to_owned(),
+        let (_, expiry) = match wire.validate_deadlines(now) {
+            Ok(deadlines) => deadlines,
+            Err(error) => {
+                self.audit
+                    .append_verified_tail_violation(expected.tenant_id, "expiry")
+                    .await?;
+                return Err(error);
             }
-        })?;
-        if expiry <= now {
-            self.audit
-                .append_verified_tail_violation(expected.tenant_id, "expiry")
-                .await?;
-            return Err(TailReadError::Authorization {
-                detail: "tail ticket expired".to_owned(),
-            });
-        }
+        };
         let replay_rejected = {
             let mut replay = self
                 .replay
@@ -605,7 +621,7 @@ impl TailTicketVerifier for ScribeTailAuthority {
 
 #[cfg(test)]
 mod tests {
-    use super::ScribeTailAuthority;
+    use super::{MAX_TICKET_TTL, ScribeTailAuthority, TicketWire};
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
@@ -720,7 +736,12 @@ mod tests {
         }
     }
 
-    /// Replayed list and acquire tickets are both rejected before Scribe state.
+    /// Long query deadlines retain short-lived, single-use List and Acquire
+    /// authorization without shortening the bound request's execution budget.
+    ///
+    /// # Panics
+    /// Panics if a healthy long query cannot mint or use its ticket, or replay
+    /// is accepted without an audit denial.
     #[tokio::test]
     async fn replayed_list_and_acquire_tickets_are_audited() {
         let audit = Arc::new(RecordingAudit::default());
@@ -729,12 +750,26 @@ mod tests {
             (TailTicketAudience::List, 1),
             (TailTicketAudience::Acquire, 2),
         ] {
-            let claims = claims(audience, nonce);
+            let mut claims = claims(audience, nonce);
+            claims.deadline = chrono::Utc::now() + chrono::Duration::seconds(60);
             let ticket = authority.mint_tail_ticket(&claims).expect("ticket signs");
-            authority
+            let wire: TicketWire = authority.decode(&ticket).expect("signed claims decode");
+            let now = chrono::Utc::now();
+            let (deadline, expiry) = wire.validate_deadlines(now).expect("ticket is usable");
+            assert_eq!(
+                deadline.timestamp_millis(),
+                claims.deadline.timestamp_millis()
+            );
+            assert!(expiry - now <= MAX_TICKET_TTL);
+            assert!(expiry < deadline);
+            let decoded = authority
                 .verify_tail_ticket_unbound(&ticket, audience)
                 .await
                 .expect("first use succeeds");
+            assert_eq!(
+                decoded.deadline.timestamp_millis(),
+                claims.deadline.timestamp_millis()
+            );
             assert!(matches!(
                 authority
                     .verify_tail_ticket_unbound(&ticket, audience)
@@ -752,6 +787,65 @@ mod tests {
             reasons.iter().filter(|reason| *reason == "replay").count(),
             2
         );
+    }
+
+    /// Both verification entry points reject expired acceptance independently
+    /// of the still-live query deadline; exact authority and replay stay fenced.
+    ///
+    /// # Panics
+    /// Panics if an expired, rebound, or replayed ticket authorizes Scribe IO.
+    #[tokio::test]
+    async fn long_query_tickets_keep_expiry_and_exact_binding() {
+        let authority = authority(Arc::new(RecordingAudit::default()));
+        for (audience, nonce) in [
+            (TailTicketAudience::List, 11),
+            (TailTicketAudience::Acquire, 12),
+        ] {
+            let mut claims = claims(audience, nonce);
+            claims.deadline = chrono::Utc::now() + chrono::Duration::seconds(60);
+            let ticket = authority
+                .mint_tail_ticket(&claims)
+                .expect("long query signs");
+            let mut changed = claims.clone();
+            changed.query_id = uuid::Uuid::new_v4();
+            assert!(
+                authority
+                    .verify_tail_ticket(&ticket, &changed)
+                    .await
+                    .is_err()
+            );
+            authority
+                .verify_tail_ticket(&ticket, &claims)
+                .await
+                .expect("exact request verifies");
+            assert!(
+                authority
+                    .verify_tail_ticket(&ticket, &claims)
+                    .await
+                    .is_err()
+            );
+
+            let mut wire: TicketWire = authority.decode(&ticket).expect("signed ticket decodes");
+            let expiry = chrono::DateTime::from_timestamp_millis(wire.expires_ms)
+                .expect("signed expiry is valid");
+            assert!(wire.validate_deadlines(expiry).is_err());
+            wire.expires_ms =
+                (chrono::Utc::now() - chrono::Duration::milliseconds(1)).timestamp_millis();
+            let expired = authority
+                .sign(serde_json::to_vec(&wire).expect("claims encode"))
+                .expect("expired fixture signs");
+            authority.clear_replay_state();
+            assert!(matches!(
+                authority
+                    .verify_tail_ticket_unbound(&expired, audience)
+                    .await,
+                Err(TailReadError::Authorization { .. })
+            ));
+            assert!(matches!(
+                authority.verify_tail_ticket(&expired, &claims).await,
+                Err(TailReadError::Authorization { .. })
+            ));
+        }
     }
 
     /// A verified binding denial fails closed when its audit append is unavailable.

@@ -225,8 +225,41 @@ impl ReadyOracleForwarder {
         self.local_oracle
             .as_ref()
             .ok_or(BifrostError::OracleRoleUnavailable)?
-            .query_sql(claims.context, claims.request)
+            .query_sql_with_deadline(claims.context, claims.request, claims.absolute_deadline_ms)
             .await
+    }
+
+    /// Signs a shortened ingress budget and exercises ordinary ticket acceptance.
+    ///
+    /// Test-only callers supply an already authorized context; verification,
+    /// replay protection, fencing and Oracle preparation remain production code.
+    ///
+    /// # Errors
+    /// Returns role, signing, validation or query errors from normal acceptance.
+    #[cfg(feature = "test-support")]
+    pub(crate) async fn accept_with_deadline_for_test(
+        &self,
+        context: AuthorizedQueryContext,
+        request: BifrostQueryRequest,
+        deadline_ms: i64,
+    ) -> Result<OracleQueryStream, BifrostError> {
+        let claims = ForwardingAttempt {
+            context,
+            request,
+            now: chrono::Utc::now(),
+            wall_deadline: chrono::DateTime::from_timestamp_millis(deadline_ms)
+                .ok_or(BifrostError::QueryTimeout)?,
+        }
+        .into_claims((
+            self.local_node_id,
+            self.local_fence
+                .ok_or(BifrostError::OracleRoleUnavailable)?,
+        ))?;
+        let ticket = self
+            .authority
+            .mint_forward_query(&claims)
+            .map_err(|_| BifrostError::QueryPeerSecurity)?;
+        self.accept(ticket).await
     }
 
     /// Connects one endpoint without sending any query envelope bytes.
@@ -248,6 +281,11 @@ impl ReadyOracleForwarder {
     }
 
     /// Delivers one envelope exactly once over an already-connected authenticated channel.
+    ///
+    /// # Errors
+    /// Returns peer-security failures for invalid credentials or response metadata,
+    /// the leader's preparation timeout, or an execution failure for other
+    /// delivery/stream failures. No delivery failure is retried.
     async fn forward_remote(
         &self,
         mut connected: ConnectedOracle,
@@ -268,11 +306,15 @@ impl ReadyOracleForwarder {
         request
             .metadata_mut()
             .insert("x-wyrd-access-token", metadata);
-        let response = connected
-            .client
-            .forward_query(request)
-            .await
-            .map_err(|_| BifrostError::QueryExecutionFailed)?;
+        let response =
+            connected
+                .client
+                .forward_query(request)
+                .await
+                .map_err(|status| match status.code() {
+                    wyrd_tonic::tonic::Code::DeadlineExceeded => BifrostError::QueryTimeout,
+                    _ => BifrostError::QueryExecutionFailed,
+                })?;
         let schema_fingerprint = response
             .metadata()
             .get("x-wyrd-schema-fingerprint")

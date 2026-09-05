@@ -175,6 +175,10 @@ mod pg_tests {
     /// # Errors
     ///
     /// Returns the first claim that broke.
+    ///
+    /// # Panics
+    /// Panics if a ceiling result precedes retained cleanup, ownership is not
+    /// charged during the hold, or a refusal includes partial rows.
     async fn prove_analytical_mcp_journey() -> Result<(), JourneyError> {
         let mut cluster = BifrostProcessCluster::start(
             NODE_BINARY,
@@ -315,6 +319,53 @@ mod pg_tests {
                 )
                 .into());
             }
+        }
+
+        // A ceiling error remains pending through real cleanup, including a
+        // Scribe ingress whose cancellation must reach its remote Oracle.
+        for endpoint in [COORDINATOR, PEER_SCRIBE] {
+            for (index, before) in &baseline {
+                await_baseline(&mut cluster, *index, *before).await?;
+            }
+            let leader = if endpoint == COORDINATOR {
+                COORDINATOR
+            } else {
+                baseline
+                    .iter()
+                    .map(|(index, _)| *index)
+                    .min_by_key(|index| cluster.nodes()[*index].ready_report().node_id)
+                    .ok_or("no Oracle candidate")?
+            };
+            let token = bearer(&cluster.nodes()[endpoint], &api_key).await?;
+            let ingress =
+                ().serve_with_lifecycle(transport(&cluster.nodes()[endpoint], &token)?, discover())
+                    .await?;
+            cluster.nodes_mut()[leader].arm_cleanup_pause()?;
+            let peer = ingress.peer().clone();
+            let arguments =
+                query(serde_json::json!({"sql": join_sql, "max_rows": 1, "deadline_ms": 15_000}));
+            let result = tokio::spawn(async move { peer.call_tool(arguments).await });
+            cluster.nodes_mut()[leader].await_cleanup_paused()?;
+            tokio::time::sleep(std::time::Duration::from_millis(2_200)).await;
+            let premature = result.is_finished();
+            let held = cluster.nodes_mut()[leader].ownership_snapshot()?;
+            cluster.nodes_mut()[leader].release_cleanup_pause()?;
+            let refusal =
+                problem(tokio::time::timeout(std::time::Duration::from_secs(10), result).await???)?;
+            for (index, before) in &baseline {
+                await_baseline(&mut cluster, *index, *before).await?;
+            }
+            ingress.cancel().await?;
+            assert!(
+                !premature,
+                "MCP final result preceded owner settlement at endpoint {endpoint}"
+            );
+            assert!(
+                held.leader_graphs > 0 && held.root_query_active,
+                "cleanup still owns its graph and grant"
+            );
+            assert_eq!(refusal["code"], "WYRD_VALA_413_QUERY_RESULT_TOO_LARGE");
+            assert!(refusal.get("rows").is_none() && refusal.get("columns").is_none());
         }
 
         // Repairs and both ceilings refuse before or instead of a partial result.

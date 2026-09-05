@@ -420,6 +420,13 @@ impl WyrdMcpHandler {
         let arguments: QueryArguments = parse_arguments(QUERY, arguments)?;
         arguments.validate()?;
         let result = async {
+            let controls = self
+                .state
+                .bifrost
+                .query_controls()
+                .ok_or(ValaError::RunningQueryControlUnavailable)?
+                .clone();
+            let settlement = Some((controls, caller.data_tenant_id, caller.request_id.clone()));
             let stream = crate::query::service::stream_query(
                 self.state.clone(),
                 caller,
@@ -427,6 +434,7 @@ impl WyrdMcpHandler {
             )
             .await?;
             let collector = ResultCollector {
+                settlement,
                 visibility: arguments.visibility,
                 max_rows: usize::try_from(arguments.max_rows).unwrap_or(usize::MAX),
                 max_bytes: arguments.max_bytes,
@@ -475,6 +483,12 @@ impl WyrdMcpHandler {
 /// active cancellation on every pre-terminal failure. What differs is only the
 /// budget it charges and the shape it produces.
 struct ResultCollector {
+    /// Trusted cancellation routing and identity; absent only in pure decoder fixtures.
+    settlement: Option<(
+        crate::oracle::RunningQueryControls,
+        wyrd_spec::DataTenantId,
+        wyrd_spec::request_id::RequestId,
+    )>,
     /// Visibility requested by the caller, used to validate source completion.
     visibility: VisibilityMode,
     /// Row ceiling this caller asked for. Exceeding it fails; nothing truncates.
@@ -489,19 +503,44 @@ struct ResultCollector {
 }
 
 impl ResultCollector {
-    /// Validate one terminal, drain to clean EOF, and build `{columns, rows, terminal}`.
+    /// Collects the compact result, confirming owner settlement before any error return.
     ///
     /// # Errors
-    ///
-    /// Returns a stream-protocol, Arrow-decoding, execution, or result-size
-    /// error. Malformed or incomplete streams and cancellation await
-    /// [`OracleQueryStream::cancel`] before returning. A valid failed terminal
-    /// is already settled and returns its canonical error immediately; success
-    /// requires a valid Arrow EOS and clean frame-stream EOF.
+    /// Returns the consumer error after valid terminal proof; otherwise returns
+    /// the shared control owner's incomplete, protocol or unavailable error.
+    /// Cancellation signals immediately and retains the response under its original deadline.
     async fn collect(
         mut self,
         mut stream: OracleQueryStream,
         cancel: &CancellationToken,
+    ) -> Result<JsonValue, WyrdError> {
+        let mut terminal = None;
+        match self.consume(&mut stream, cancel, &mut terminal).await {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                let (controls, tenant, request_id) = self
+                    .settlement
+                    .take()
+                    .ok_or(ValaError::RunningQueryControlUnavailable)?;
+                controls
+                    .cancel_and_settle(tenant, request_id, stream, self.visibility, terminal)
+                    .await?;
+                Err(error)
+            }
+        }
+    }
+
+    /// Decodes and charges one result, retaining validated terminal evidence separately.
+    ///
+    /// # Errors
+    /// Returns protocol, Arrow, execution or result-ceiling errors. Early errors
+    /// signal cancellation synchronously; `collect` owns authoritative settlement.
+    /// Success remains provisional until Arrow EOS and clean response EOF.
+    async fn consume(
+        &mut self,
+        stream: &mut OracleQueryStream,
+        cancel: &CancellationToken,
+        observed: &mut Option<QueryTerminalFrame>,
     ) -> Result<JsonValue, WyrdError> {
         let mut ipc = QueryIpcDecoder::new();
         let mut columns: Option<Vec<JsonValue>> = None;
@@ -513,7 +552,7 @@ impl ResultCollector {
             let next = tokio::select! {
                 biased;
                 () = cancel.cancelled() => {
-                    stream.cancel().await;
+                    stream.request_cancel();
                     return Err(ValaError::QueryStreamIncomplete.into());
                 }
                 frame = stream.frames.next() => frame,
@@ -522,7 +561,8 @@ impl ResultCollector {
             let frame = match frame {
                 Ok(frame) => frame,
                 Err(error) => {
-                    stream.cancel().await;
+                    *observed = None;
+                    stream.request_cancel();
                     return Err(WyrdError::from(error));
                 }
             };
@@ -532,7 +572,7 @@ impl ResultCollector {
                         Ok(accepted) => {
                             let projected = project_columns(&accepted);
                             if let Err(error) = self.charge(&projected) {
-                                stream.cancel().await;
+                                stream.request_cancel();
                                 return Err(error);
                             }
                             columns = Some(projected);
@@ -544,7 +584,7 @@ impl ResultCollector {
                             }
                         }
                         Err(error) => {
-                            stream.cancel().await;
+                            stream.request_cancel();
                             return Err(crate::query::service::arrow_decode_error(&error));
                         }
                     }
@@ -553,7 +593,7 @@ impl ResultCollector {
                     let decoded = match ipc.accept_batch(&batch.arrow_ipc_batch) {
                         Ok(decoded) => decoded,
                         Err(error) => {
-                            stream.cancel().await;
+                            stream.request_cancel();
                             return Err(crate::query::service::arrow_decode_error(&error));
                         }
                     };
@@ -561,12 +601,12 @@ impl ResultCollector {
                         .ok()
                         .and_then(|count| decoded_rows.checked_add(count));
                     let Some(count) = count else {
-                        stream.cancel().await;
+                        stream.request_cancel();
                         return Err(ValaError::QueryStreamProtocol.into());
                     };
                     decoded_rows = count;
                     if let Err(error) = self.retain(&mut rows, &decoded) {
-                        stream.cancel().await;
+                        stream.request_cancel();
                         return Err(error);
                     }
                 }
@@ -576,10 +616,11 @@ impl ResultCollector {
                         .and_then(|()| frame.validate_emitted_rows(decoded_rows))
                         .is_err()
                     {
-                        stream.cancel().await;
+                        stream.request_cancel();
                         return Err(ValaError::QueryStreamProtocol.into());
                     }
                     if frame.outcome == QueryTerminalOutcome::Failed {
+                        *observed = Some(frame.clone());
                         return Err(frame.error.as_ref().map_or(
                             WyrdError::from(ValaError::QueryExecutionFailed),
                             |error| {
@@ -590,23 +631,25 @@ impl ResultCollector {
                         ));
                     }
                     if let Err(error) = ipc.accept_eos(&frame.arrow_ipc_eos) {
-                        stream.cancel().await;
+                        stream.request_cancel();
                         return Err(crate::query::service::arrow_decode_error(&error));
                     }
                     terminal = Some(project_terminal(&frame));
+                    *observed = Some(frame);
                 }
                 _ => {
-                    stream.cancel().await;
+                    *observed = None;
+                    stream.request_cancel();
                     return Err(ValaError::QueryStreamProtocol.into());
                 }
             }
         }
         let (Some(columns), Some(terminal)) = (columns, terminal) else {
-            stream.cancel().await;
+            stream.request_cancel();
             return Err(ValaError::QueryStreamIncomplete.into());
         };
         if let Err(error) = self.charge(&terminal) {
-            stream.cancel().await;
+            stream.request_cancel();
             return Err(error);
         }
         Ok(serde_json::json!({
@@ -856,10 +899,15 @@ mod tests {
         (stream, cancellation)
     }
 
-    /// Reject malformed terminals and trailing frames only after cancelling ownership.
+    /// Reject malformed terminals and trailing frames while signaling cancellation.
     ///
     /// A valid failed terminal is already settled, so its error survives empty
     /// EOS and does not trigger a second cancellation.
+    /// This pure decoder seam checks the original errors and signal; the real
+    /// MCP and server journeys check authoritative settlement before return.
+    ///
+    /// # Panics
+    /// Panics if a malformed stream is accepted, its error changes, or signaling is lost.
     #[test]
     fn query_rejects_untrustworthy_terminal_and_settles_stream() {
         wyrd_runtime::runtime().block_on(async {
@@ -920,7 +968,8 @@ mod tests {
                         }
                     }),
                 ));
-                let collector = ResultCollector {
+                let mut collector = ResultCollector {
+                    settlement: None,
                     visibility: VisibilityMode::PublishedOnly,
                     max_rows: 10,
                     max_bytes: MAX_BYTES_CEILING,
@@ -928,12 +977,15 @@ mod tests {
                     #[cfg(feature = "test-support")]
                     stall: None,
                 };
-                let error = collector.collect(stream, &cancel).await.expect_err(case);
+                let error = collector
+                    .consume(&mut stream, &cancel, &mut None)
+                    .await
+                    .expect_err(case);
                 assert_eq!(error.code(), code, "{case}: {error}");
                 assert_eq!(
                     token.is_cancelled(),
                     cancelled,
-                    "{case}: settlement before return"
+                    "{case}: cancellation signaled before return"
                 );
             }
         });
@@ -946,11 +998,15 @@ mod tests {
     /// returns. The test recomputes that length from the returned value, proves
     /// the exact length is accepted, and proves one byte less is refused as a
     /// canonical too-large error rather than a truncated success.
+    ///
+    /// # Panics
+    /// Panics if projection changes ordering or values, or byte accounting misses the ceiling.
     #[test]
     fn query_result_is_positional_and_counts_exact_structured_json_bytes() {
         wyrd_runtime::runtime().block_on(async {
             let batch = projection_batch();
             let collector = |max_bytes: usize| ResultCollector {
+                settlement: None,
                 visibility: VisibilityMode::PublishedOnly,
                 max_rows: 10,
                 max_bytes,
@@ -959,9 +1015,9 @@ mod tests {
                 stall: None,
             };
 
-            let (stream, _token) = synthetic_stream(&batch);
+            let (mut stream, _token) = synthetic_stream(&batch);
             let value = collector(MAX_BYTES_CEILING)
-                .collect(stream, &CancellationToken::new())
+                .consume(&mut stream, &CancellationToken::new(), &mut None)
                 .await
                 .expect("an unconstrained projection succeeds");
 
@@ -992,19 +1048,19 @@ mod tests {
                 .expect("the projected value serializes")
                 .len();
 
-            let (stream, _token) = synthetic_stream(&batch);
+            let (mut stream, _token) = synthetic_stream(&batch);
             assert_eq!(
                 collector(exact)
-                    .collect(stream, &CancellationToken::new())
+                    .consume(&mut stream, &CancellationToken::new(), &mut None)
                     .await
                     .expect("the exact serialized length is within budget"),
                 value,
                 "the ceiling counts exactly the bytes the tool returns"
             );
 
-            let (stream, token) = synthetic_stream(&batch);
+            let (mut stream, token) = synthetic_stream(&batch);
             let refused = collector(exact - 1)
-                .collect(stream, &CancellationToken::new())
+                .consume(&mut stream, &CancellationToken::new(), &mut None)
                 .await
                 .expect_err("one byte less than the result is refused");
             assert_eq!(

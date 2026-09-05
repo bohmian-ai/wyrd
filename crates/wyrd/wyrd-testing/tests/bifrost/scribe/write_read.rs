@@ -5,6 +5,7 @@ use std::sync::Arc;
 use arrow::array::Int64Array;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use url::Url;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_sdk::query::ValaSdkError;
 use wyrd_client::config::ClientConfig;
@@ -344,8 +345,9 @@ async fn assert_empty_table_reads_cleanly(server: &wyrd_testing::WyrdTestServer)
 ///
 /// # Panics
 ///
-/// Panics when setup fails, membership advertises `:0`, the private endpoint is
-/// not initially reachable, or the public SDK flattens the terminal failure.
+/// Panics when setup fails, the HTTPS endpoint is invalid or unreachable,
+/// fault injection changes its host/scheme, or the public SDK loses the typed
+/// visibility refusal before or after the response stream opens.
 #[tokio::test]
 #[ignore = "requires Postgres and object storage"]
 async fn scribe_undialable_private_peer_returns_typed_visibility_failure() {
@@ -376,11 +378,16 @@ async fn scribe_undialable_private_peer_returns_typed_visibility_failure() {
         .next()
         .expect("one ready Scribe membership");
     assert!(!scribe.address.ends_with(":0"));
-    let reachable = scribe
-        .address
-        .strip_prefix("http://")
-        .expect("test peer uses plaintext loopback");
-    tokio::net::TcpStream::connect(reachable)
+    let mut endpoint = Url::parse(&scribe.address).expect("private peer advertises a URL");
+    assert_eq!(endpoint.scheme(), "https");
+    let host = endpoint
+        .host_str()
+        .expect("private peer URL has a host")
+        .to_owned();
+    let port = endpoint
+        .port()
+        .expect("private peer URL has an explicit port");
+    tokio::net::TcpStream::connect((host.as_str(), port))
         .await
         .expect("advertised private Scribe endpoint is reachable before readiness");
 
@@ -388,6 +395,16 @@ async fn scribe_undialable_private_peer_returns_typed_visibility_failure() {
         .expect("reserve closed endpoint")
         .local_addr()
         .expect("closed endpoint address");
+    endpoint
+        .set_port(Some(closed.port()))
+        .expect("private peer URL accepts a port");
+    assert_eq!(endpoint.scheme(), "https");
+    assert_eq!(endpoint.host_str(), Some(host.as_str()));
+    assert!(
+        tokio::net::TcpStream::connect((host.as_str(), closed.port()))
+            .await
+            .is_err()
+    );
     let pool = server
         .pg_fixture()
         .superuser_pool()
@@ -397,7 +414,7 @@ async fn scribe_undialable_private_peer_returns_typed_visibility_failure() {
         "UPDATE vala.cluster_nodes SET advertise_addr=$1, heartbeat_at=now(), ready=true \
          WHERE data_tenant_id=$2 AND role='scribe'",
     )
-    .bind(format!("http://{closed}"))
+    .bind(endpoint.as_str())
     .bind(uuid::Uuid::from(wyrd_spec::DataTenantId::SYSTEM_OWNER))
     .execute(&pool)
     .await
@@ -423,6 +440,8 @@ async fn scribe_undialable_private_peer_returns_typed_visibility_failure() {
             Ok(None) => panic!("undialable strict read emitted a successful terminal"),
         },
     };
+    assert_eq!(error.code(), "WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE");
+    assert_eq!(error.status(), 503);
     match &error {
         ValaSdkError::FailedTerminal { terminal } => {
             assert_eq!(
@@ -434,7 +453,10 @@ async fn scribe_undialable_private_peer_returns_typed_visibility_failure() {
                 QueryTerminalErrorCode::QueryVisibilityUnavailable
             );
         }
-        other => panic!("expected typed failed terminal, got {other:?}"),
+        ValaSdkError::Transport(wyrd_spec::error::WyrdError::Vala {
+            error: wyrd_spec::vala::error::BifrostError::QueryVisibilityUnavailable,
+        }) => {}
+        other => panic!("expected typed visibility refusal, got {other:?}"),
     }
     assert_eq!(
         error_code(&error),

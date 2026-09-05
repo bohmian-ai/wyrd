@@ -1059,6 +1059,30 @@ pub async fn compose_bifrost(
         OraclePeerAuthority::from_keyring(Arc::clone(&peer_keyring), forwarding_audit)
             .map_err(|error| ServerBootError::OraclePeer(error.to_string()))?,
     );
+    let query_controls = oracle.as_ref().map_or_else(
+        || {
+            let transport = if let Some(tls) = peer_tls.clone() {
+                crate::oracle::OracleLifecycleTransport::with_tls(
+                    Arc::clone(&cluster_registry),
+                    Arc::clone(&peer_credentials),
+                    node_id,
+                    tls,
+                )
+            } else {
+                crate::oracle::OracleLifecycleTransport::new(
+                    Arc::clone(&cluster_registry),
+                    Arc::clone(&peer_credentials),
+                    node_id,
+                )
+            };
+            crate::oracle::RunningQueryControls::new(
+                None,
+                Arc::new(transport),
+                Arc::clone(&cluster_registry),
+            )
+        },
+        |runtime| runtime.query_controls().clone(),
+    );
     let query_forwarder = Arc::new(crate::oracle::ReadyOracleForwarder::new(
         crate::oracle::ReadyOracleForwarderInputs {
             cluster: Arc::clone(&cluster_registry),
@@ -1113,6 +1137,7 @@ pub async fn compose_bifrost(
             token_verifier,
             peer_identity,
             query_forwarder: Some(query_forwarder),
+            query_controls: Some(query_controls),
             #[cfg(feature = "test-support")]
             resources: Some(bifrost_resources.clone()),
         }),

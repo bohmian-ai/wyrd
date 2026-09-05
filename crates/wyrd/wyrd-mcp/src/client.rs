@@ -87,8 +87,14 @@ impl WyrdMcpHttpClient {
 }
 
 impl StreamableHttpClient for WyrdMcpHttpClient {
+    /// Underlying HTTP transport failure; credential/header failures use the
+    /// enclosing `StreamableHttpError::Io` variant.
     type Error = reqwest::Error;
 
+    /// Refresh Wyrd headers before delegating MCP message framing to `rmcp`.
+    ///
+    /// # Errors
+    /// Returns credential, invalid-header, or delegated HTTP/protocol errors.
     async fn post_message(
         &self,
         uri: Arc<str>,
@@ -103,6 +109,10 @@ impl StreamableHttpClient for WyrdMcpHttpClient {
             .await
     }
 
+    /// Send a decorated message while preserving the transport's SSE size bound.
+    ///
+    /// # Errors
+    /// Returns credential, invalid-header, HTTP/protocol, or SSE-limit errors.
     async fn post_message_with_max_sse_event_size(
         &self,
         uri: Arc<str>,
@@ -125,6 +135,10 @@ impl StreamableHttpClient for WyrdMcpHttpClient {
             .await
     }
 
+    /// Authenticate transport-requested session deletion with current credentials.
+    ///
+    /// # Errors
+    /// Returns credential, invalid-header, or delegated session-delete errors.
     async fn delete_session(
         &self,
         uri: Arc<str>,
@@ -138,6 +152,11 @@ impl StreamableHttpClient for WyrdMcpHttpClient {
             .await
     }
 
+    /// Open the transport's resumable SSE stream with refreshed Wyrd headers.
+    ///
+    /// # Errors
+    /// Returns credential, invalid-header, or stream-opening errors; later SSE
+    /// errors remain items of the returned stream.
     async fn get_stream(
         &self,
         uri: Arc<str>,
@@ -152,6 +171,11 @@ impl StreamableHttpClient for WyrdMcpHttpClient {
             .await
     }
 
+    /// Open a decorated SSE stream under the caller's event-size ceiling.
+    ///
+    /// # Errors
+    /// Returns credential, invalid-header, or stream-opening errors. SSE decode
+    /// and size-limit failures are yielded by the returned stream.
     async fn get_stream_with_max_sse_event_size(
         &self,
         uri: Arc<str>,

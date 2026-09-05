@@ -148,10 +148,31 @@ alternatives when their semantics are wanted.
 
 ### MCP
 
+Connect an MCP Streamable HTTP client to `$WYRD_SERVER_URL/mcp`. Wyrd serves
+protocol revision `2026-07-28` using `server/discover` and self-contained
+per-request protocol metadata, without sessions. Use a client that supports
+this discovery lifecycle; the older `initialize` lifecycle is not supported.
+Let the MCP client manage protocol framing and metadata.
+
+Every request must carry `x-wyrd-access-token: Bearer <access-token>`, including
+discovery and tool calls. Obtain the access token by exchanging a Wyrd API key
+at `POST /auth/token`, and refresh it before expiry. The first-party Rust
+`WyrdMcpHttpClient` decorator reuses `AuthMiddleware` to supply a current bearer
+and a `wyrd-request-id` on every request. It preserves a supplied request ID
+and leaves the application's `Authorization` header untouched.
+
+After discovery, use `tools/list` to find `bifrost.list_tables`,
+`bifrost.describe_table`, and `bifrost.query`, then invoke them with `tools/call`.
 The `bifrost.query` read tool accepts the same SQL and policy fields and returns
-`{schema, rows, terminal}`. Its output schema is closed, including terminal
-outcome, freshness, warning, source-completion, row-count, and stable-error
-fields, so agents can branch on fields instead of parsing prose.
+one bounded structured result: `{columns, rows, terminal}`. `columns` is an
+ordered array of descriptors with `name`, `data_type`, and `nullable`; each row
+is a positional array in that same order, preserving duplicate column names.
+The terminal contains `outcome`, `freshness`, `execution_path`, `row_count`,
+`warnings`, and `source_completion`.
+
+A query failure or result-ceiling refusal returns a structured Wyrd error with
+no partial successful result. Inspect the tool result's `isError` before using
+its structured content. The tool descriptor does not advertise an output schema.
 
 ## Permissions and stable failures
 

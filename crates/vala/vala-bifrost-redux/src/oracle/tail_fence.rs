@@ -814,7 +814,7 @@ impl TailFenceDrainer<'_> {
                 let Ok(reservation) = self.memory.resources.try_split_query_memory(
                     &self.query_pool,
                     "oracle-live-tail",
-                    batch.get_array_memory_size(),
+                    crate::scribe::memory::retained_arrow_bytes(&batch),
                 ) else {
                     self.release_one(&mut acquired).await;
                     return Err((table, BifrostError::QueryVisibilityUnavailable));

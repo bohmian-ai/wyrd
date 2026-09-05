@@ -141,20 +141,27 @@ impl WyrdMcpHandler {
 }
 
 impl ServerHandler for WyrdMcpHandler {
+    /// Advertise Wyrd's tools capability and sole supported protocol revision.
     fn get_info(&self) -> ServerInfo {
         let mut info = InitializeResult::new(ServerCapabilities::builder().enable_tools().build());
         info.protocol_version = WYRD_MCP_PROTOCOL_VERSION;
         info
     }
 
+    /// Restrict negotiation to the revision requiring stateless request metadata.
     fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
         Cow::Owned(vec![WYRD_MCP_PROTOCOL_VERSION])
     }
 
+    /// Resolve only tools in this process's configured Wyrd catalog.
     fn get_tool(&self, name: &str) -> Option<Tool> {
         self.catalog().into_iter().find(|tool| tool.name == name)
     }
 
+    /// Return the complete bounded catalog after public-edge authentication.
+    ///
+    /// # Errors
+    /// This hook is infallible; authentication failures are handled by the edge.
     async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
@@ -163,6 +170,13 @@ impl ServerHandler for WyrdMcpHandler {
         Ok(ListToolsResult::with_all_items(self.catalog()))
     }
 
+    /// Dispatch tools with verified request context and retain the shutdown
+    /// tracker token through execution and cancellation settlement.
+    ///
+    /// # Errors
+    /// Returns invalid parameters for unknown tools, mapped context errors when
+    /// trusted extensions are missing, or the owning tool's protocol error.
+    /// Domain failures remain structured tool results.
     async fn call_tool(
         &self,
         request: CallToolRequestParams,

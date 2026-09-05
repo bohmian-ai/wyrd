@@ -1,4 +1,4 @@
-@import url('https://fonts.googleapis.com/css2?family=Archivo+Black&family=Archivo:wght@400;500;600;700&family=JetBrains+Mono:wght@400;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,600&family=Space+Grotesk:wght@700&family=Archivo:wght@400;500;600;700&family=JetBrains+Mono:wght@400;700&display=swap');
 @import 'tailwindcss';
 @import '../brand/theme.css';
 
@@ -6,7 +6,33 @@ html,
 body {
   margin: 0;
   min-height: 100%;
-  /* dark-bg fallback to avoid a flash before ModeProvider paints the themed surface */
-  background: #0e0e0e;
   font-family: var(--font-sans);
+}
+
+/* Trusted application forms; the semantic component catalog has no executable props. */
+.app-control,
+.app-input {
+  border: 2px solid var(--border);
+  border-radius: var(--r);
+  padding: 8px 12px;
+  background: var(--surface);
+  color: var(--text);
+  font: 700 12px var(--font-mono);
+  min-width: 0;
+  max-width: 100%;
+}
+.app-control {
+  cursor: pointer;
+  box-shadow: 3px 3px 0 var(--shadow);
+}
+.app-control:hover {
+  background: var(--surface-2);
+}
+.app-control.primary {
+  background: var(--brand-btn);
+  color: var(--brand-btn-ink);
+}
+:focus-visible {
+  outline: 2px solid var(--brand-strong);
+  outline-offset: 3px;
 }

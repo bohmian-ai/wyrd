@@ -846,9 +846,9 @@ run = [
 ]
 
 [tasks."dev:frontend"]
-description = "SvelteKit dev server on :3000"
+description = "Run the local UI on localhost:3000 with a global mock-data toggle"
 dir = "crates/wyrd/wyrd-server/wyrd-ui"
-run = "pnpm run dev --host 0.0.0.0 --port ${WYRD_UI_PORT:-3000}"
+run = "WYRD_UI_LOCAL_AUTH=${WYRD_UI_LOCAL_AUTH:-true} WYRD_UI_MOCK_DATA=${WYRD_UI_MOCK_DATA:-true} pnpm run dev --host 127.0.0.1 --port ${WYRD_UI_PORT:-3000}"
 
 [tasks."docs:install"]
 hide = true

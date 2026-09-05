@@ -427,6 +427,7 @@ impl WyrdMcpHandler {
             )
             .await?;
             let collector = ResultCollector {
+                visibility: arguments.visibility,
                 max_rows: usize::try_from(arguments.max_rows).unwrap_or(usize::MAX),
                 max_bytes: arguments.max_bytes,
                 bytes: STRUCTURED_OVERHEAD_BYTES,
@@ -474,6 +475,8 @@ impl WyrdMcpHandler {
 /// active cancellation on every pre-terminal failure. What differs is only the
 /// budget it charges and the shape it produces.
 struct ResultCollector {
+    /// Visibility requested by the caller, used to validate source completion.
+    visibility: VisibilityMode,
     /// Row ceiling this caller asked for. Exceeding it fails; nothing truncates.
     max_rows: usize,
     /// Exact compact-JSON byte ceiling for `{columns, rows, terminal}`.
@@ -486,14 +489,15 @@ struct ResultCollector {
 }
 
 impl ResultCollector {
-    /// Drain `stream` to its terminal and build `{columns, rows, terminal}`.
+    /// Validate one terminal, drain to clean EOF, and build `{columns, rows, terminal}`.
     ///
     /// # Errors
     ///
     /// Returns a stream-protocol, Arrow-decoding, execution, or result-size
-    /// error. Every pre-terminal failure awaits [`OracleQueryStream::cancel`]
-    /// first, so Oracle has released admission, memory, peer work, scratch, and
-    /// graph leases before this returns.
+    /// error. Malformed or incomplete streams and cancellation await
+    /// [`OracleQueryStream::cancel`] before returning. A valid failed terminal
+    /// is already settled and returns its canonical error immediately; success
+    /// requires a valid Arrow EOS and clean frame-stream EOF.
     async fn collect(
         mut self,
         mut stream: OracleQueryStream,
@@ -503,6 +507,7 @@ impl ResultCollector {
         let mut columns: Option<Vec<JsonValue>> = None;
         let mut schema: Option<arrow::datatypes::SchemaRef> = None;
         let mut rows: Vec<JsonValue> = Vec::new();
+        let mut decoded_rows = 0_u64;
         let mut terminal: Option<JsonValue> = None;
         loop {
             let next = tokio::select! {
@@ -522,7 +527,7 @@ impl ResultCollector {
                 }
             };
             match frame {
-                QueryStreamFrame::Schema(accepted) if schema.is_none() => {
+                QueryStreamFrame::Schema(accepted) if schema.is_none() && terminal.is_none() => {
                     match ipc.accept_schema(&accepted.arrow_ipc_schema) {
                         Ok(accepted) => {
                             let projected = project_columns(&accepted);
@@ -552,12 +557,28 @@ impl ResultCollector {
                             return Err(crate::query::service::arrow_decode_error(&error));
                         }
                     };
+                    let count = u64::try_from(decoded.num_rows())
+                        .ok()
+                        .and_then(|count| decoded_rows.checked_add(count));
+                    let Some(count) = count else {
+                        stream.cancel().await;
+                        return Err(ValaError::QueryStreamProtocol.into());
+                    };
+                    decoded_rows = count;
                     if let Err(error) = self.retain(&mut rows, &decoded) {
                         stream.cancel().await;
                         return Err(error);
                     }
                 }
                 QueryStreamFrame::Terminal(frame) if schema.is_some() && terminal.is_none() => {
+                    if frame
+                        .validate(self.visibility)
+                        .and_then(|()| frame.validate_emitted_rows(decoded_rows))
+                        .is_err()
+                    {
+                        stream.cancel().await;
+                        return Err(ValaError::QueryStreamProtocol.into());
+                    }
                     if frame.outcome == QueryTerminalOutcome::Failed {
                         return Err(frame.error.as_ref().map_or(
                             WyrdError::from(ValaError::QueryExecutionFailed),
@@ -569,10 +590,10 @@ impl ResultCollector {
                         ));
                     }
                     if let Err(error) = ipc.accept_eos(&frame.arrow_ipc_eos) {
+                        stream.cancel().await;
                         return Err(crate::query::service::arrow_decode_error(&error));
                     }
                     terminal = Some(project_terminal(&frame));
-                    break;
                 }
                 _ => {
                     stream.cancel().await;
@@ -732,12 +753,16 @@ mod tests {
     use arrow::array::{ArrayRef, BinaryArray, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Fields, Schema};
     use arrow::record_batch::RecordBatch;
+    use futures_util::StreamExt as _;
     use tokio_util::sync::CancellationToken;
     use vala_bifrost_redux::oracle::OracleQueryStream;
     use wyrd_spec::error::WyrdError;
+    use wyrd_spec::vala::BifrostError;
     use wyrd_spec::vala::api::{
         FreshnessPolicy, QueryBatchFrame, QueryExecutionPath, QueryFreshness, QuerySchemaFrame,
-        QueryStreamFrame, QueryTerminalFrame, QueryTerminalOutcome, VisibilityMode,
+        QuerySource, QueryStreamFrame, QueryTerminalError, QueryTerminalErrorCode,
+        QueryTerminalFrame, QueryTerminalOutcome, SourceCompletion, SourceCompletionOutcome,
+        VisibilityMode,
     };
 
     /// One synthetic batch carrying every shape the projection must survive.
@@ -807,7 +832,13 @@ mod tests {
                 execution_path: QueryExecutionPath::Interactive,
                 row_count: 2,
                 warnings: Vec::new(),
-                source_completion: Vec::new(),
+                source_completion: [QuerySource::Iceberg, QuerySource::HotSealed]
+                    .into_iter()
+                    .map(|source| SourceCompletion {
+                        source,
+                        outcome: SourceCompletionOutcome::Complete,
+                    })
+                    .collect(),
                 error: None,
                 arrow_ipc_eos: eos,
             })),
@@ -825,6 +856,89 @@ mod tests {
         (stream, cancellation)
     }
 
+    /// Reject malformed terminals and trailing frames only after cancelling ownership.
+    ///
+    /// A valid failed terminal is already settled, so its error survives empty
+    /// EOS and does not trigger a second cancellation.
+    #[test]
+    fn query_rejects_untrustworthy_terminal_and_settles_stream() {
+        wyrd_runtime::runtime().block_on(async {
+            for (case, code, cancelled) in [
+                ("missing EOF", "WYRD_VALA_502_QUERY_STREAM_INCOMPLETE", true),
+                ("matrix", "WYRD_VALA_502_QUERY_STREAM_PROTOCOL", true),
+                ("row count", "WYRD_VALA_502_QUERY_STREAM_PROTOCOL", true),
+                ("EOS", "WYRD_SPEC_500_INTERNAL", true),
+                ("failed", "WYRD_VALA_504_QUERY_TIMEOUT", false),
+                ("duplicate", "WYRD_VALA_502_QUERY_STREAM_PROTOCOL", true),
+                (
+                    "trailing batch",
+                    "WYRD_VALA_502_QUERY_STREAM_PROTOCOL",
+                    true,
+                ),
+                ("trailing error", "WYRD_VALA_504_QUERY_TIMEOUT", true),
+                (
+                    "missing terminal",
+                    "WYRD_VALA_502_QUERY_STREAM_INCOMPLETE",
+                    true,
+                ),
+            ] {
+                let (mut stream, token) = synthetic_stream(&projection_batch());
+                let mut frames: Vec<_> = stream.frames.by_ref().collect().await;
+                let Ok(QueryStreamFrame::Terminal(terminal)) = &mut frames[2] else {
+                    panic!("fixture ends with a terminal");
+                };
+                match case {
+                    "missing EOF" => {}
+                    "matrix" => terminal.source_completion.clear(),
+                    "row count" => terminal.row_count += 1,
+                    "EOS" => terminal.arrow_ipc_eos = vec![1],
+                    "failed" => {
+                        terminal.outcome = QueryTerminalOutcome::Failed;
+                        terminal.error = Some(QueryTerminalError {
+                            code: QueryTerminalErrorCode::QueryTimeout,
+                            detail: None,
+                        });
+                        terminal.arrow_ipc_eos.clear();
+                    }
+                    "duplicate" => frames.push(frames[2].clone()),
+                    "trailing batch" => frames.push(frames[1].clone()),
+                    "trailing error" => frames.push(Err(BifrostError::QueryTimeout)),
+                    "missing terminal" => {
+                        frames.pop();
+                    }
+                    _ => unreachable!("closed test cases"),
+                }
+                let cancel = CancellationToken::new();
+                let cancel_at_eof = cancel.clone();
+                stream.frames = Box::pin(futures_util::stream::iter(frames).chain(
+                    futures_util::stream::poll_fn(move |_| {
+                        if case == "missing EOF" {
+                            cancel_at_eof.cancel();
+                            std::task::Poll::Pending
+                        } else {
+                            std::task::Poll::Ready(None)
+                        }
+                    }),
+                ));
+                let collector = ResultCollector {
+                    visibility: VisibilityMode::PublishedOnly,
+                    max_rows: 10,
+                    max_bytes: MAX_BYTES_CEILING,
+                    bytes: STRUCTURED_OVERHEAD_BYTES,
+                    #[cfg(feature = "test-support")]
+                    stall: None,
+                };
+                let error = collector.collect(stream, &cancel).await.expect_err(case);
+                assert_eq!(error.code(), code, "{case}: {error}");
+                assert_eq!(
+                    token.is_cancelled(),
+                    cancelled,
+                    "{case}: settlement before return"
+                );
+            }
+        });
+    }
+
     /// The result is positional, Arrow-encoded, and charged to the exact byte.
     ///
     /// The byte ceiling is the only budget an agent cannot estimate for itself,
@@ -837,6 +951,7 @@ mod tests {
         wyrd_runtime::runtime().block_on(async {
             let batch = projection_batch();
             let collector = |max_bytes: usize| ResultCollector {
+                visibility: VisibilityMode::PublishedOnly,
                 max_rows: 10,
                 max_bytes,
                 bytes: STRUCTURED_OVERHEAD_BYTES,

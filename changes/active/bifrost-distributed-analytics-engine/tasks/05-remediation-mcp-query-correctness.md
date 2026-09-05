@@ -350,3 +350,10 @@ contract rather than consuming its existing validators.
 - GREEN: the same exact Postgres-wrapped command passes all local invalid-input cases, including nonempty list arguments and missing describe name, and preserves application-level SQL/catalog errors and Scenario 1 repair hints.
 - List, describe, query, and the test-only schema-stall claim are inherent methods on `WyrdMcpHandler`; `mcp::bifrost` is private. The existing tracker remains held across each complete await.
 - `mise run fmt` passed. No public contract or dependency changed.
+
+### Scenario 3 — validated terminal and clean EOF
+
+- RED: the named terminal regression returned successful rows for an empty source-completion matrix.
+- GREEN: the exact named terminal test passes nine cases: matrix, row count, malformed EOS, valid failed terminal, duplicate terminal, trailing batch/error, missing terminal, and cancellation while awaiting missing EOF. All untrusted streams cancel before return; a valid failed terminal preserves `QueryTimeout` and does not cancel again.
+- The exact named positional/exact-byte test passes with a valid PublishedOnly source-completion fixture. Existing decoder and contract validators are reused; no Oracle terminal production changed.
+- `mise run fmt` and `git diff --check` passed.

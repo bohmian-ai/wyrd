@@ -107,3 +107,8 @@ The source already has exact trace/log/metric projection sizing, which should
 be examined for reuse before choosing a conservative bound or shared exact
 planning. Existing ownership, pre-reservation, bounded materialization, WAL,
 and replay guarantees must remain intact. No production workaround was made.
+
+Final test-only candidate verification: `mise run fmt` and `mise run lints`
+PASS (workspace linting 37.16s). `mise run test:bifrost:journey:mcp` FAIL:
+5 passed, 1 failed (the real OTLP journey, same HTTP 413 sizing mismatch).
+The original discovery/authentication/malformed-input MCP journeys remain green.

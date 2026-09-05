@@ -381,3 +381,23 @@ contract rather than consuming its existing validators.
   reviewed candidate `4d3a2839281ff259dda7f58089f4c63f0f2fa7ce`.
   These are existing failures, not passing gates; no checker was weakened.
 - `mise run fmt`: PASS after the real OTEL follow-up journey edit.
+
+- `NEXTEST_TEST_THREADS=2 mise run test:wyrd`: FAIL, 1877 passed / 8 failed /
+  52 skipped (131.146s test execution). Failures: existing query display/parse
+  roundtrip (`expected field`, found `or`); SQL transaction documentation
+  assertion; five Forge worker lifecycle tests panicking because their
+  synthetic fixture has no Scribe; Scribe workload repeated-read boundary.
+  These files are unchanged by this remediation. This is not full family proof.
+
+- `mise run lints`: PASS at the final test-only candidate (37.16s).
+- `mise run test:bifrost:journey:mcp`: 5 passed / 1 failed; only the newly real
+  OTLP journey fails before MCP at Scribe material admission, as documented in
+  `reviews/05-otel-dependency-review.md`.
+- `mise run test:bifrost:journey:oracle`: PASS, all 23 journeys (69.850s), including
+  the strengthened active distributed MCP cancellation journey.
+
+- `mise run test:bifrost:integration:redux`: PASS, all 961 tests (36.091s).
+- Final `git diff --check`: PASS. No production source changed after the five
+  focused correctness checks; the later candidate adds only real OTLP journey
+  coverage and evidence. Task 05 closeout remains REMEDIATE for finding 7;
+  family/boundary failures above remain explicitly unapproved.

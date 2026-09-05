@@ -368,10 +368,10 @@ impl<'attempt> ForgeManagedRewrite<'attempt> {
     /// # Errors
     ///
     /// Returns [`ForgeError::ExecutionEnvelopeExceeded`] when the leased
-    /// scratch was exhausted, and [`ForgeError::Catalog`] for every other core
-    /// failure, whose cause is a manifest, scan, or writer operation. Either is
-    /// wrapped in [`ForgeError::RewriteUnsettled`] when the attempt may already
-    /// have produced an object.
+    /// scratch or memory was exhausted, and [`ForgeError::Catalog`] for every
+    /// other core failure, whose cause is a manifest, scan, or writer
+    /// operation. Either is wrapped in [`ForgeError::RewriteUnsettled`] when
+    /// the attempt may already have produced an object.
     fn drain_or_fail(
         &self,
         base_snapshot_id: i64,
@@ -383,10 +383,15 @@ impl<'attempt> ForgeManagedRewrite<'attempt> {
                 possible_outputs: self.possible_outputs(),
             });
         }
-        let failure = if self.observer.peak_scratch_bytes() >= self.resources.scratch_bytes() {
+        let failure = if let Some(resource) = exhausted_lease(
+            self.observer.peak_scratch_bytes(),
+            self.resources.scratch_bytes(),
+            self.observer.peak_memory_bytes(),
+            self.resources.memory_bytes(),
+        ) {
             ForgeError::ExecutionEnvelopeExceeded {
-                resource: "scratch",
-                detail: format!("Forge managed rewrite exhausted its scratch lease: {error}"),
+                resource,
+                detail: format!("Forge managed rewrite exhausted its {resource} lease: {error}"),
             }
         } else {
             ForgeError::Catalog(iceberg::Error::new(
@@ -429,6 +434,31 @@ impl<'attempt> ForgeManagedRewrite<'attempt> {
             possible_outputs,
         }
     }
+}
+
+/// Names the leased execution term an attempt exhausted, if it exhausted one.
+///
+/// Both terms are admission promises the attempt was granted before any IO, so
+/// reaching either one is a capacity outcome and not an object-store or catalog
+/// fault. Memory is checked as well as scratch because an attempt whose pool
+/// refused a reservation fails inside the core exactly like a scan failure
+/// does, and classifying that as transient would ask the scheduler to retry an
+/// attempt that cannot fit. Scratch is checked first because an attempt that
+/// spilled to its limit reached memory pressure first by construction, so the
+/// spill is the more specific term to report.
+fn exhausted_lease(
+    peak_scratch: u64,
+    scratch_lease: u64,
+    peak_memory: u64,
+    memory_lease: u64,
+) -> Option<&'static str> {
+    if peak_scratch >= scratch_lease {
+        return Some("scratch");
+    }
+    if peak_memory >= memory_lease {
+        return Some("memory");
+    }
+    None
 }
 
 /// Appends one plan's consumed live paths to the handoff's accumulators.
@@ -482,4 +512,18 @@ fn total_equality_deletes(plans: &[CompactionPlan]) -> usize {
         .iter()
         .map(|plan| plan.file_group.equality_delete_files.len())
         .sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::exhausted_lease;
+
+    /// An attempt that reached its memory grant is a capacity outcome, not a
+    /// transient object-store one, even when its scratch was never touched.
+    #[test]
+    fn exhausted_memory_lease_is_named_when_scratch_is_untouched() {
+        assert_eq!(exhausted_lease(0, 4096, 8192, 8192), Some("memory"));
+        assert_eq!(exhausted_lease(4096, 4096, 0, 8192), Some("scratch"));
+        assert_eq!(exhausted_lease(1, 4096, 1, 8192), None);
+    }
 }

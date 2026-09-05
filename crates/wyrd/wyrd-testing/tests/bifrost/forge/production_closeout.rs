@@ -1,6 +1,6 @@
 //! Public, cross-pod qualification of production Forge geometry and cleanup.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -25,7 +25,8 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::NodeId;
 use wyrd_testing::WyrdTestServer;
 use wyrd_testing::bifrost::{
-    BifrostClusterSpec, OracleFollowerPauses, TestOracleResources, WyrdTestCluster,
+    BifrostClusterSpec, CommitUncertaintyCatalog, OracleFollowerPauses, TestOracleResources,
+    WyrdTestCluster,
 };
 
 use crate::public_support::{
@@ -102,7 +103,7 @@ impl CloseoutJourney {
             }),
         });
         let cluster = WyrdTestCluster::start_spec_with_forge_config_and_completion_observer(
-            spec, config, true,
+            spec, config, true, true,
         )
         .await
         .expect("separate production roles start");
@@ -264,6 +265,121 @@ impl CloseoutJourney {
         );
     }
 
+    /// Lists every physical object under this table's Forge output root.
+    ///
+    /// The listing is the same real prefix the collection route walks, so the
+    /// difference between two listings is exactly what a rewrite closed, with
+    /// no fixture ever naming an object on the writer's behalf.
+    ///
+    /// # Panics
+    /// Panics when the storage listing fails.
+    async fn forge_objects(&self, binding: &TenantTableBinding) -> BTreeSet<String> {
+        let prefix = format!("{}/data/forge/", binding.object_prefix.as_str());
+        self.cluster
+            .storage_operator()
+            .list_with(&prefix)
+            .recursive(true)
+            .await
+            .expect("Forge output listing")
+            .into_iter()
+            .filter(|entry| entry.metadata().is_file())
+            .map(|entry| entry.path().to_owned())
+            .collect()
+    }
+
+    /// Asserts the coordinator's production orphan predicate for each object.
+    ///
+    /// The verdict comes from the retained protection loader on a node that is
+    /// not the one executing the work, which is what makes it observable while
+    /// a worker holds a catalog commit open.
+    ///
+    /// # Panics
+    /// Panics when the production classifier fails or returns another verdict.
+    async fn assert_eligibility(
+        &self,
+        binding: &TenantTableBinding,
+        paths: &BTreeSet<String>,
+        expected: &str,
+        why: &str,
+    ) {
+        for path in paths {
+            assert_eq!(
+                self.coordinator()
+                    .forge_gc_eligibility_for_test(binding, path)
+                    .await
+                    .expect("production eligibility classification"),
+                expected,
+                "{why}: {path}"
+            );
+        }
+    }
+
+    /// Corroborates collection with its own audited operation identity.
+    ///
+    /// # Panics
+    /// Panics when the route wrote no operation, its audits belong to another
+    /// owner, or a destructive sibling route ran beside it.
+    async fn assert_orphan_evidence(&self, tenant: DataTenantId) {
+        let mut conn = self
+            .coordinator()
+            .tenant_conn_for(tenant)
+            .await
+            .expect("tenant-scoped audit inspection");
+        let rows: Vec<(Uuid, String, String)> = sqlx::query_as(
+            "SELECT o.operation_id, p.operation, t.operation \
+             FROM vala.forge_operation_state o \
+             JOIN vala.audit_outbox p ON p.data_tenant_id=o.data_tenant_id AND p.seq=o.prepared_audit_seq \
+             JOIN vala.audit_outbox t ON t.data_tenant_id=o.data_tenant_id AND t.seq=o.terminal_audit_seq \
+             WHERE o.family='orphan_gc'",
+        )
+        .fetch_all(&mut **conn.transaction())
+        .await
+        .expect("orphan collection audit evidence");
+        let strategies: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT strategy FROM vala.forge_tasks WHERE data_tenant_id=wyrd.current_tenant()",
+        )
+        .fetch_all(&mut **conn.transaction())
+        .await
+        .expect("durable strategy inventory");
+        conn.commit()
+            .await
+            .expect("read-only audit inspection completes");
+        assert!(
+            !rows.is_empty(),
+            "the collection route owns its own audited operation identity"
+        );
+        for (operation, prepared, terminal) in &rows {
+            assert_eq!(prepared, "forge.orphan_gc.prepared");
+            assert!(
+                terminal == "forge.orphan_gc.committed" || terminal == "forge.orphan_gc.recovered",
+                "collection settled through another owner: {terminal}"
+            );
+            eprintln!("orphan collection operation {operation}: {prepared} -> {terminal}");
+        }
+        assert!(
+            strategies
+                .iter()
+                .all(|strategy| strategy != "snapshot_expiry" && strategy != "expired_cleanup"),
+            "a sibling destructive route ran beside collection: {strategies:?}"
+        );
+        let metrics = self
+            .cluster
+            .telemetry()
+            .snapshot()
+            .expect("production metrics");
+        assert!(
+            metrics.iter().any(
+                |sample| sample.family == "bifrost_forge_deleted_objects_total"
+                    && sample.value > 0.0
+            ),
+            "collection reported no physical deletion"
+        );
+        eprintln!(
+            "collection worker identities={:?}",
+            self.observer.completed_workers()
+        );
+    }
+
     /// Registers the payload schema through the retained server catalog harness.
     ///
     /// # Panics
@@ -354,6 +470,48 @@ impl CloseoutJourney {
         self.cluster
             .server_by_node(self.oracle_node)
             .expect("Oracle node")
+    }
+
+    /// Drains tasks while one deliberately abandoned rewrite is expected.
+    ///
+    /// The ordinary drain treats any returned worker error as a defect. One
+    /// scenario needs a real attempt to be refused after it closed its outputs
+    /// and before it prepared, so this variant accepts exactly the refusal that
+    /// scenario injects at the publication reacquisition it drives, and still
+    /// refuses every other worker error. The observer keeps every error it ever
+    /// saw, so every drain after that injection has to use this variant.
+    ///
+    /// # Panics
+    /// Panics on SQL failure, a stalled attempt, or any other worker error.
+    async fn drain_tasks_allowing_injected_refusal(&self) {
+        tokio::time::timeout(REWRITE_BOUND, async {
+            loop {
+                for error in self.observer.returned_errors() {
+                    assert!(
+                        error.contains("injected Forge catalog load failure"),
+                        "worker failed for an unexpected reason: {error}"
+                    );
+                }
+                let next = self.observer.attempts() + 1;
+                let (pending, attempts): (i64, i64) = sqlx::query_as(
+                    "SELECT count(*) FILTER (WHERE state NOT IN \
+                     ('succeeded', 'failed', 'cancelled', 'unschedulable')), \
+                     coalesce(sum(attempt_count), 0)::bigint FROM vala.forge_tasks",
+                )
+                .fetch_one(self.cluster.pg_fixture().operator_pool().pool())
+                .await
+                .expect("durable task and ownership inspection");
+                if pending == 0
+                    && self.observer.attempts()
+                        >= usize::try_from(attempts).expect("nonnegative attempts")
+                {
+                    break;
+                }
+                self.observer.wait_for_attempts_at_least(next).await;
+            }
+        })
+        .await
+        .expect("the abandoned rewrite and its retry both settle");
     }
 
     /// Requests and observes one real scheduler pass before inspecting SQL.
@@ -1150,5 +1308,356 @@ impl ReaderCleanupJourney {
 async fn lazy_old_reader_survives_cross_pod_expiration_and_physical_cleanup() {
     let mut journey = ReaderCleanupJourney::start().await;
     journey.protect_during_cleanup().await;
+    journey.finish().await;
+}
+
+/// Owns two tenants and the real output one refused publication leaves behind.
+struct OrphanJourney {
+    /// Independent serving and maintenance nodes.
+    roles: CloseoutJourney,
+    /// Table whose rewrite is refused at the real catalog boundary.
+    table: JourneyTable,
+    /// Same public name in a different tenant.
+    neighbour_table: JourneyTable,
+    /// Authenticated public query client on the dedicated Oracle node.
+    reader: WyrdClient,
+    /// Authenticated neighbor query client on that same public endpoint.
+    neighbour_reader: WyrdClient,
+    /// Public ingest transport retained across successive appends.
+    transport: BifrostGrpcTransport,
+    /// Fixed partition, deterministic payload and exact acknowledged identities.
+    workload: GeometryWorkload,
+    /// Neighbor identities that must remain unchanged throughout collection.
+    neighbour_expected: Vec<ManagedRow>,
+    /// Shared control over the real Forge catalog publication boundary.
+    catalog: Arc<CommitUncertaintyCatalog>,
+    /// Exact objects the refused rewrite closed and never published.
+    orphans: BTreeSet<String>,
+}
+
+impl OrphanJourney {
+    /// Publishes a real compacted cut, then refuses the next rewrite's commit.
+    ///
+    /// # Panics
+    /// Panics if public setup, promotion, or the refused publication does not
+    /// leave at least one closed output that no snapshot names.
+    async fn start() -> Self {
+        // The production collection route ages objects against the wall clock
+        // its planning demand is stamped with, not the manual maintenance
+        // clock, so the terminal floor has to be a real interval this journey
+        // can outlive. Two seconds is long enough that the object is provably
+        // young while its own rewrite is still open and short enough that the
+        // bounded collection loop below crosses it.
+        let mut roles = CloseoutJourney::start_with_config(ForgeConfig {
+            orphan_gc_ttl: std::time::Duration::from_secs(2),
+            maintenance_trigger_interval: std::time::Duration::from_millis(1),
+            ..ForgeConfig::default()
+        })
+        .await;
+        let catalog = roles
+            .cluster
+            .commit_uncertainty_catalog()
+            .expect("the topology wraps the real Forge catalog boundary");
+        let tenant = roles.cluster.data_tenant_id();
+        let neighbour = roles
+            .cluster
+            .add_tenant(&unique_table("orphan_neighbour"))
+            .await
+            .expect("neighbor tenant");
+        let table = roles
+            .register_payload_table(tenant, unique_table("never_published"))
+            .await;
+        let neighbour_table = register_table(roles.scribe(), neighbour, &table.name).await;
+        let writer = tenant_client(roles.scribe(), tenant).await;
+        let reader = tenant_client(roles.oracle(), tenant).await;
+        let neighbour_writer = tenant_client(roles.scribe(), neighbour).await;
+        let neighbour_reader = tenant_client(roles.oracle(), neighbour).await;
+        let transport = BifrostGrpcTransport::connect(&writer)
+            .await
+            .expect("public ingest");
+        let neighbour_expected = canonical_order(
+            append_values(
+                &neighbour_writer,
+                &table.qualified,
+                Uuid::now_v7(),
+                &[7001, 7002],
+            )
+            .await,
+        );
+        let mut workload = GeometryWorkload::new();
+        for values in [&[1, 2][..], &[3, 4]] {
+            workload
+                .append_batch(&transport, &table.qualified, values)
+                .await;
+            roles
+                .scribe()
+                .flush_bifrost()
+                .await
+                .expect("acknowledged inputs flush");
+        }
+        roles
+            .cluster
+            .restart_node(roles.coordinator_node)
+            .await
+            .expect("coordinator starts");
+        // No maintenance-clock advance here. This journey's terminal age floor
+        // is a real interval measured by the production planning demand, so a
+        // manual clock running ahead of storage would report every object as
+        // already old and erase the young window the scenario has to observe.
+        // The table owes maintenance on its own trigger interval instead.
+        roles.compact_small_table(&table.binding).await;
+
+        // One more acknowledged flush, promoted on its own pass. Promotion is a
+        // catalog commit too, so it has to be finished and live before the seam
+        // is armed; otherwise the held commit would be the promotion's, which
+        // writes no Forge output and therefore strands nothing.
+        workload
+            .append_batch(&transport, &table.qualified, &[5, 6])
+            .await;
+        roles
+            .scribe()
+            .flush_bifrost()
+            .await
+            .expect("later rows flush");
+        roles.scheduler_pass().await;
+        roles.drain_tasks().await;
+        let (_, promoted) = roles.live_files(&table.binding).await;
+        assert!(
+            promoted.len() >= 2,
+            "the promoted input is live and a rewrite is now due"
+        );
+
+        Self::prove_commit_window_retention(&roles, &table, &catalog).await;
+
+        // A further acknowledged flush, promoted on its own pass, leaves the
+        // table owing one more real rewrite: the attempt that will be refused.
+        workload
+            .append_batch(&transport, &table.qualified, &[7, 8])
+            .await;
+        roles
+            .scribe()
+            .flush_bifrost()
+            .await
+            .expect("later rows flush");
+        roles.scheduler_pass().await;
+        roles.drain_tasks().await;
+        let orphans = Self::strand_one_generation(&roles, &table, &catalog).await;
+        Self {
+            roles,
+            table,
+            neighbour_table,
+            reader,
+            neighbour_reader,
+            transport,
+            workload,
+            neighbour_expected,
+            catalog,
+            orphans,
+        }
+    }
+
+    /// Proves an open and a commit-uncertain rewrite both retain their outputs.
+    ///
+    /// Two production windows, observed from the coordinator because the worker
+    /// is the process inside the catalog call: a rewrite whose operation row is
+    /// prepared and whose commit has not been delegated, and one whose commit
+    /// the catalog accepted but has not acknowledged. Collection must refuse
+    /// the outputs in both, and neither verdict may come from a fixture.
+    ///
+    /// # Panics
+    /// Panics if either window is never reached, the rewrite closed no output,
+    /// or the production predicate does not protect it.
+    async fn prove_commit_window_retention(
+        roles: &CloseoutJourney,
+        table: &JourneyTable,
+        catalog: &Arc<CommitUncertaintyCatalog>,
+    ) {
+        let before = roles.forge_objects(&table.binding).await;
+        catalog.pause_before_commit();
+        let drive = async {
+            roles.scheduler_pass().await;
+            roles.drain_tasks().await;
+        };
+        let inspect = async {
+            tokio::time::timeout(REWRITE_BOUND, catalog.wait_for_before_commit())
+                .await
+                .expect("a real rewrite reaches the catalog publication boundary");
+            let open: BTreeSet<String> = roles
+                .forge_objects(&table.binding)
+                .await
+                .difference(&before)
+                .cloned()
+                .collect();
+            assert!(
+                !open.is_empty(),
+                "the held rewrite closed at least one real output"
+            );
+            roles
+                .assert_eligibility(&table.binding, &open, "Protected", "open rewrite")
+                .await;
+            // Arm the post-acceptance hold before releasing this one, so the
+            // retry's own commit cannot slip past the uncertain window.
+            catalog.pause_after_commit();
+            catalog.reject_paused_before_commit();
+            tokio::time::timeout(REWRITE_BOUND, catalog.wait_for_commit())
+                .await
+                .expect("the retry's commit is held after the catalog accepted it");
+            roles
+                .assert_eligibility(&table.binding, &open, "Protected", "uncertain commit")
+                .await;
+            catalog.release_paused_commit();
+        };
+        tokio::join!(drive, inspect);
+    }
+
+    /// Refuses one real rewrite after it closed its outputs and before it prepared.
+    ///
+    /// The refusal is a production one. The rewrite is held at the point its
+    /// managed execution is finished and its publication has not yet reacquired
+    /// authoritative metadata, and that reacquisition is then made to fail. The
+    /// objects the attempt already closed are therefore named by no snapshot,
+    /// no operation row, and no audit transition, and the retry runs under a
+    /// new attempt identity that cannot reuse them. While the attempt is still
+    /// open those same objects must be protected, observed from the coordinator
+    /// because the worker is the process holding the rewrite.
+    ///
+    /// # Panics
+    /// Panics if the barrier is never reached, the refused rewrite closed no
+    /// output, or the production predicate does not retain it.
+    async fn strand_one_generation(
+        roles: &CloseoutJourney,
+        table: &JourneyTable,
+        catalog: &Arc<CommitUncertaintyCatalog>,
+    ) -> BTreeSet<String> {
+        let before = roles.forge_objects(&table.binding).await;
+        roles.observer.hold_after_next_rewrite_handoff_for_test();
+        let drive = async {
+            roles.scheduler_pass().await;
+            roles.drain_tasks_allowing_injected_refusal().await;
+        };
+        let inspect = async {
+            tokio::time::timeout(
+                REWRITE_BOUND,
+                roles.observer.wait_for_held_rewrite_handoff_for_test(),
+            )
+            .await
+            .expect("a real rewrite reaches its post-execution barrier");
+            let orphans: BTreeSet<String> = roles
+                .forge_objects(&table.binding)
+                .await
+                .difference(&before)
+                .cloned()
+                .collect();
+            assert!(
+                !orphans.is_empty(),
+                "the held rewrite closed at least one real output"
+            );
+            // Before the operation row prepares, the age floor is the only
+            // thing standing between a collection pass and an output a live
+            // attempt is still working on, so that is what must hold here.
+            roles
+                .assert_eligibility(&table.binding, &orphans, "TooYoung", "unprepared rewrite")
+                .await;
+            // Refuse the metadata reacquisition this rewrite performs next,
+            // which is the last authority it consults before preparing.
+            catalog.fail_next_load_table();
+            roles.observer.release_held_rewrite_handoff_for_test();
+            orphans
+        };
+        let ((), orphans) = tokio::join!(drive, inspect);
+
+        let (_, live) = roles.live_files(&table.binding).await;
+        for path in &orphans {
+            assert!(
+                !live.contains_key(path),
+                "a refused rewrite output reached a published snapshot: {path}"
+            );
+        }
+        orphans
+    }
+
+    /// Crosses the terminal age floor and collects exactly the stranded output.
+    ///
+    /// # Panics
+    /// Panics if collection removes a protected object, misses the orphan, or
+    /// either tenant's exact rows or production evidence change.
+    async fn finish(self) {
+        self.roles
+            .assert_eligibility(
+                &self.table.binding,
+                &self.orphans,
+                "TooYoung",
+                "young output",
+            )
+            .await;
+        let (_, live) = self.roles.live_files(&self.table.binding).await;
+        self.roles.advance_maintenance(chrono::Duration::days(2));
+        self.roles
+            .assert_eligibility(
+                &self.table.binding,
+                &self.orphans,
+                "Eligible",
+                "aged output",
+            )
+            .await;
+
+        let before = self
+            .roles
+            .coordinator()
+            .completed_forge_scheduler_passes_for_test();
+        for _ in 0..12 {
+            self.roles.scheduler_pass().await;
+            self.roles.drain_tasks_allowing_injected_refusal().await;
+            let mut remaining = false;
+            for path in &self.orphans {
+                remaining |= !self.roles.object_missing(path).await;
+            }
+            if !remaining {
+                break;
+            }
+        }
+        for path in &self.orphans {
+            assert!(
+                self.roles.object_missing(path).await,
+                "the never-published output survived its own collection route: {path}"
+            );
+        }
+        assert!(
+            self.roles
+                .coordinator()
+                .completed_forge_scheduler_passes_for_test()
+                > before,
+            "collection ran through the existing scheduler trigger"
+        );
+        self.roles.assert_objects(&live).await;
+        self.roles
+            .assert_orphan_evidence(self.table.binding.tenant)
+            .await;
+        assert_eq!(
+            read_managed_rows(&self.reader, &self.table.qualified).await,
+            canonical_order(self.workload.expected.clone())
+        );
+        assert_eq!(
+            read_managed_rows(&self.neighbour_reader, &self.neighbour_table.qualified).await,
+            self.neighbour_expected
+        );
+        drop(self.transport);
+        drop(self.catalog);
+        self.roles
+            .cluster
+            .shutdown()
+            .await
+            .expect("all production roles drain");
+    }
+}
+
+/// A real never-published Forge output is collected only after terminal age.
+///
+/// # Panics
+/// Panics when protection, exact deletion ownership, or tenant rows fail.
+#[tokio::test]
+#[ignore = "requires Postgres and independent Oracle/Forge roles"]
+async fn failed_never_published_output_is_collected_after_terminal_age() {
+    let journey = OrphanJourney::start().await;
     journey.finish().await;
 }

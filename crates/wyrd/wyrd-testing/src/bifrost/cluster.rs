@@ -1401,6 +1401,11 @@ impl WyrdTestCluster {
     /// When `delay_last_node` is true, retain the highest node identity for later
     /// startup through `restart_node`, allowing ingestion before maintenance.
     ///
+    /// When `inject_uncertainty` is true every Forge process wraps its catalog
+    /// in the shared commit seam, which is inert until a journey arms it. That
+    /// is what lets one journey pause or definitively refuse a real publication
+    /// while the sibling journeys on the same topology see the plain catalog.
+    ///
     /// # Errors
     /// Returns the same topology, resource, configuration, and role-supervision
     /// errors as [`Self::start_spec_with_forge_completion_observer`].
@@ -1408,6 +1413,7 @@ impl WyrdTestCluster {
         spec: BifrostClusterSpec,
         config: ForgeConfig,
         delay_last_node: bool,
+        inject_uncertainty: bool,
     ) -> Result<Self, ClusterError> {
         Self::start_spec_with_all_options(
             spec,
@@ -1420,6 +1426,7 @@ impl WyrdTestCluster {
                 ForgeHarnessOptions {
                     completion_observer: Some(ForgeWorkerCompletionObserver::new()),
                     config: Some(config),
+                    inject_uncertainty,
                     ..ForgeHarnessOptions::default()
                 },
                 ClusterResourceSource::Owned {

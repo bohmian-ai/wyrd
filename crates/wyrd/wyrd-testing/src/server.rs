@@ -1706,6 +1706,37 @@ impl WyrdTestServer {
         self.inner.forge_object_store.as_ref().map(Arc::clone)
     }
 
+    /// Classifies one object through this node's production orphan predicate.
+    ///
+    /// The verdict is produced by the retained production protection loader and
+    /// its single eligibility truth, not by a harness reimplementation, so a
+    /// journey can observe what a collection pass on this node would decide
+    /// about a named object without driving a destructive pass to find out.
+    /// That matters while another process holds a catalog commit open: the
+    /// node executing the rewrite cannot answer, and this one can.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WyrdTestServerError::Start`] when this node composes no Forge
+    /// coordinator, and the production catalog, SQL, object-metadata, or
+    /// path-validation failure when the proof cannot be assembled.
+    pub async fn forge_gc_eligibility_for_test(
+        &self,
+        binding: &TenantTableBinding,
+        path: &str,
+    ) -> Result<String, WyrdTestServerError> {
+        self.inner
+            .state
+            .forge()
+            .and_then(|forge| forge.coordinator())
+            .ok_or_else(|| {
+                WyrdTestServerError::Start("Forge coordinator is not composed".to_owned())
+            })?
+            .gc_eligibility_for_test(binding, path)
+            .await
+            .map_err(|error| WyrdTestServerError::Start(error.to_string()))
+    }
+
     /// Return deterministic expiration gates from the supervised Forge owner.
     #[must_use]
     pub fn forge_expiry_controls_for_test(

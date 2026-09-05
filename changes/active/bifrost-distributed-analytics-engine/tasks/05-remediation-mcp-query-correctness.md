@@ -364,3 +364,8 @@ contract rather than consuming its existing validators.
 - RED mutation: deliberately omitted `RequestHandle::cancel` while retaining the request. The exact named journey failed: `the active MCP query did not record Analytical cancellation before disconnect`. Ordinary completion cannot satisfy the new assertion.
 - GREEN: restored the cancel call; the exact named Postgres-wrapped Oracle journey passed (18.6 seconds). No production cancellation behavior changed and no new fixture control or telemetry family was added.
 - `mise run fmt` passed.
+
+### Final inspection correction — preserve non-input wrapper mappings
+
+- Added cases to the same named planning test for contextual tenant, reconciliation, audit, and resource failures. RED showed recursive delegation discarded a tenant-bearing outer context and returned `QueryExecutionFailed`.
+- GREEN: unwrap only to classify input errors, but delegate every other failure with its original complete chain. The exact corrected unit command passes all cases; no general mapper changed.

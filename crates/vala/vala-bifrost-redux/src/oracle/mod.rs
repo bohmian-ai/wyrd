@@ -4951,15 +4951,19 @@ fn admission_limits(usable_slots: u32, class: QueryClass) -> (u32, u32) {
     }
 }
 
-/// Classifies planning refusals without exposing dependency diagnostics.
+/// Classifies typed planning refusals through context/diagnostic wrappers.
+///
+/// Resource refusals take precedence; all other failures retain their complete
+/// original chain for the general mapper. No dependency diagnostic is exposed.
 fn map_query_planning_error(error: &DataFusionError) -> BifrostError {
     if datafusion_resources_exhausted(error) {
         return map_datafusion_error(error);
     }
-    match error {
-        DataFusionError::Context(_, source) | DataFusionError::Diagnostic(_, source) => {
-            map_query_planning_error(source)
-        }
+    let mut cause = error;
+    while let DataFusionError::Context(_, source) | DataFusionError::Diagnostic(_, source) = cause {
+        cause = source;
+    }
+    match cause {
         DataFusionError::SQL(..)
         | DataFusionError::Plan(_)
         | DataFusionError::SchemaError(..)
@@ -5314,6 +5318,28 @@ mod tests {
         assert_eq!(
             map_datafusion_error(&DataFusionError::Plan("private".to_owned())),
             BifrostError::QueryExecutionFailed
+        );
+        for (context, expected) in [
+            ("tenant invariant", BifrostError::QueryTenantInvariant),
+            (
+                "reconciliation invariant",
+                BifrostError::QueryReconciliationInvariant,
+            ),
+            ("audit unavailable", BifrostError::QueryAuditUnavailable),
+        ] {
+            let error = DataFusionError::Context(
+                context.to_owned(),
+                Box::new(DataFusionError::Internal("private".to_owned())),
+            );
+            assert_eq!(map_query_planning_error(&error), expected);
+        }
+        let exhausted = DataFusionError::Context(
+            "private".to_owned(),
+            Box::new(DataFusionError::ResourcesExhausted("private".to_owned())),
+        );
+        assert_eq!(
+            map_query_planning_error(&exhausted),
+            BifrostError::QueryAdmissionRejected
         );
     }
 

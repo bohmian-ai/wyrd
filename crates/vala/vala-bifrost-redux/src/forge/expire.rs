@@ -412,8 +412,15 @@ impl Forge {
             .watermarks(key.tenant, &key.table_ref)
             .await?;
         conn.commit().await.map_err(ForgeError::Sql)?;
+        // The cutoff is the minimum of configured retention and every watermark
+        // this pass already saw, so a reader sitting exactly on it is the reader
+        // that lowered it and is protected by construction — selection expires
+        // only snapshots strictly older. Refusing at the cutoff would refuse
+        // every pass that a protected old reader made safe. What is unsafe is a
+        // reader the pass never saw: one on a doomed snapshot, or one that would
+        // have pulled the cutoff further back.
         for reader in &readers {
-            if doomed.contains(&reader.snapshot_id) || reader.timestamp_ms <= cutoff_ms {
+            if doomed.contains(&reader.snapshot_id) || reader.timestamp_ms < cutoff_ms {
                 return Err(ForgeError::SnapshotExpiry {
                     detail: format!(
                         "a live reader on snapshot {} at {}ms was admitted after this expiry was \
@@ -525,8 +532,10 @@ fn head_lineage_snapshot_id(table: &iceberg::table::Table) -> Option<i64> {
 /// # Errors
 ///
 /// Returns snapshot-expiry failure when a watermark is absent from retained
-/// ancestry, the ancestry graph is malformed or over its bound, or its
-/// persisted timestamp does not match Iceberg metadata.
+/// ancestry, a ref head is itself unretained, the ancestry graph cycles or
+/// exceeds its bound, or a watermark's persisted timestamp does not match
+/// Iceberg metadata. A parent an earlier expiration removed is not a failure:
+/// it truncates the retained walk.
 pub(super) fn validate_watermarks(
     snapshots: &[SnapshotSummary],
     current_snapshot_id: Option<i64>,
@@ -567,6 +576,11 @@ pub(super) fn validate_watermarks(
     }
     let mut reachable = HashSet::new();
     for head in heads {
+        if !by_id.contains_key(&head) {
+            return Err(ForgeError::SnapshotExpiry {
+                detail: format!("Iceberg snapshot ancestry is missing head snapshot {head}"),
+            });
+        }
         let mut path = HashSet::new();
         let mut cursor = Some(head);
         while let Some(id) = cursor {
@@ -575,15 +589,22 @@ pub(super) fn validate_watermarks(
                     detail: format!("Iceberg snapshot ancestry contains a cycle at {id}"),
                 });
             }
+            // A parent an earlier expiration already removed is where the
+            // retained ancestry ends, not a malformed graph: Iceberg leaves the
+            // surviving snapshot's `parent_snapshot_id` pointing at the deleted
+            // one. Every snapshot a watermark can still protect is newer than
+            // the cutoff that removed these, so the truncated walk still reaches
+            // all of them, and a watermark below the truncation is caught by the
+            // detached-from-heads refusal below.
+            let Some(snapshot) = by_id.get(&id) else {
+                break;
+            };
             if reachable.len() >= traversal_limit && !reachable.contains(&id) {
                 return Err(ForgeError::SnapshotExpiry {
                     detail: "Iceberg snapshot ancestry exceeded its traversal bound".to_owned(),
                 });
             }
             reachable.insert(id);
-            let snapshot = by_id.get(&id).ok_or_else(|| ForgeError::SnapshotExpiry {
-                detail: format!("Iceberg snapshot ancestry is missing snapshot {id}"),
-            })?;
             cursor = snapshot.parent_id;
         }
     }

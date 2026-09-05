@@ -220,6 +220,7 @@ impl CloseoutJourney {
     async fn drain_tasks(&self) {
         tokio::time::timeout(REWRITE_BOUND, async {
             loop {
+                assert!(self.observer.returned_errors().is_empty(), "worker failed: {:?}", self.observer.returned_errors());
                 let next = self.observer.attempts() + 1;
                 let (pending, attempts): (i64, i64) = sqlx::query_as(
                     "SELECT count(*) FILTER (WHERE state NOT IN \

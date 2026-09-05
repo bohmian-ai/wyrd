@@ -2,7 +2,7 @@
 id: TASK-004
 title: Change Request coordination workspace
 kind: implementation
-status: review
+status: approved
 spec: SPEC-wyrd-ui-foundation
 spec_revision: 6
 requirements: [REQ-005, REQ-006, REQ-007, REQ-008, REQ-060, REQ-061, REQ-062, REQ-063, REQ-064, REQ-065, REQ-081, REQ-082, REQ-092, REQ-095, REQ-099, REQ-100, REQ-101, REQ-127, REQ-128, REQ-132, INV-001, INV-002, INV-008, INV-009, INV-012, INV-013, INV-014, INV-021, INV-022, AC-001, AC-003, AC-004, AC-005, AC-010, AC-011]
@@ -236,3 +236,10 @@ side-qualified diff anchors and removal of the fabricated Verifier link. New
 paired browser captures prove the compact narrow Review/Subject regions in both
 themes. Full UI verification passes 111 tests, typing, build and token checks.
 The original review and failed screenshots are preserved for comparison.
+
+
+## Cumulative review recorded — 2026-09-05
+
+[APPROVE](../evidence/TASK-004-remediation-review.md) for the original base through
+`7a4d76ecd1be75f030ee0ac416b60cd94058d4c4`. All five finding IDs are closed.
+This task approval does not complete the broader change or authorize deployment.

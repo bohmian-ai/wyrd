@@ -69,3 +69,10 @@ post-remediation focused HTTP journey passes (7 tests). Post-remediation full UI
 0 errors and 0 warnings; production build: passed. Workspace Clippy is still limited
 by the documented unchanged `wyrd-client/src/transport/http.rs:600` failure.
 No lint or test was weakened. Commit authorization does not approve this task.
+
+
+## Subsequent remediation
+
+The historical REMEDIATE verdict above is superseded by the
+[cumulative APPROVE review](TASK-004-remediation-review.md). Original findings
+and limitations remain visible here; R2–R5 record their implementation evidence.

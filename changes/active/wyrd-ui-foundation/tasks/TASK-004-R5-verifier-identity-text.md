@@ -2,7 +2,7 @@
 id: TASK-004-R5
 title: Remove the fabricated Verifier Card destination
 kind: remediation
-status: review
+status: approved
 spec: SPEC-wyrd-ui-foundation
 spec_revision: 6
 requirements: [REQ-060, REQ-063, AC-001]
@@ -106,3 +106,10 @@ passed. Svelte check: zero errors / warnings. Production build, check:tokens and
 whitespace checks pass. Original Rust codegen/format evidence remains applicable;
 no Rust or generated source changed. The previously documented unrelated workspace
 Clippy warning remains a limitation, not a remediated TASK-004 defect.
+
+
+## Cumulative review recorded — 2026-09-05
+
+[APPROVE](../evidence/TASK-004-remediation-review.md) for the original base through
+`7a4d76ecd1be75f030ee0ac416b60cd94058d4c4`. All five finding IDs are closed.
+This task approval does not complete the broader change or authorize deployment.

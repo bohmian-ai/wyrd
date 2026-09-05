@@ -2,7 +2,7 @@
 id: TASK-004-R1
 title: Preserve draft-owned metadata
 kind: remediation
-status: ready
+status: approved
 spec: SPEC-wyrd-ui-foundation
 spec_revision: 6
 requirements: [REQ-060, REQ-062, REQ-065, REQ-099, INV-009]
@@ -42,3 +42,10 @@ Execution: the HTTP journey failed on the missing saved-revision event (RED),
 then passed with the revision event and submitted-team filter assertions
 (GREEN). All 108 UI tests, Svelte check, build, and whitespace checks pass.
 No unrelated refactor. Closure evidence is in TASK-004-review.md.
+
+
+## Cumulative review recorded — 2026-09-05
+
+[APPROVE](../evidence/TASK-004-remediation-review.md) for the original base through
+`7a4d76ecd1be75f030ee0ac416b60cd94058d4c4`. All five finding IDs are closed.
+This task approval does not complete the broader change or authorize deployment.

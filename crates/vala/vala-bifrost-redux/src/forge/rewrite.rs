@@ -2,8 +2,9 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
+use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::memory_pool::{
     MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation,
 };
@@ -11,6 +12,8 @@ use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use uuid::Uuid;
 
 use super::error::ForgeError;
+use crate::catalog::TenantTableBinding;
+use crate::resources::{ForgeResources, ForgeRewriteRequest};
 
 /// Attempt-local aggregate pool view recording the root reservation peak.
 #[derive(Debug)]
@@ -19,12 +22,24 @@ struct ForgeAttemptMemoryPool {
     inner: Arc<dyn MemoryPool>,
     /// Largest aggregate reservation observed after successful growth.
     peak_bytes: Arc<AtomicU64>,
+    /// Persisted sort working bytes excluding non-spillable merge headroom.
+    sort_allowance: usize,
+    /// Live spillable bytes subject to the shared spill-pressure allowance.
+    sort_bytes: AtomicUsize,
+    /// Registered spillable consumers sharing the allowance for this plan.
+    sort_consumers: AtomicUsize,
 }
 
 impl ForgeAttemptMemoryPool {
     /// Wraps the one aggregate attempt lease without creating child ledgers.
-    fn new(inner: Arc<dyn MemoryPool>, peak_bytes: Arc<AtomicU64>) -> Self {
-        Self { inner, peak_bytes }
+    fn new(inner: Arc<dyn MemoryPool>, peak_bytes: Arc<AtomicU64>, sort_allowance: usize) -> Self {
+        Self {
+            inner,
+            peak_bytes,
+            sort_allowance,
+            sort_bytes: AtomicUsize::new(0),
+            sort_consumers: AtomicUsize::new(0),
+        }
     }
 
     /// Retains the largest aggregate reservation after successful pool growth.
@@ -49,34 +64,75 @@ impl MemoryPool for ForgeAttemptMemoryPool {
         "forge_attempt"
     }
 
-    /// Delegates registration to the aggregate pool.
+    /// Counts spillable consumers before delegating aggregate registration.
     fn register(&self, consumer: &MemoryConsumer) {
+        if consumer.can_spill() {
+            self.sort_consumers.fetch_add(1, Ordering::AcqRel);
+        }
         self.inner.register(consumer);
     }
 
-    /// Delegates removal to the aggregate pool.
+    /// Returns the departing consumer's fair share after aggregate removal.
     fn unregister(&self, consumer: &MemoryConsumer) {
         self.inner.unregister(consumer);
+        if consumer.can_spill() {
+            self.sort_consumers.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 
-    /// Grows the one aggregate reservation and records its peak.
+    /// Accounts infallible growth in both sort pressure and aggregate peak.
     fn grow(&self, reservation: &MemoryReservation, additional: usize) {
+        if reservation.consumer().can_spill() {
+            self.sort_bytes.fetch_add(additional, Ordering::AcqRel);
+        }
         self.inner.grow(reservation, additional);
         self.observe_peak();
     }
 
-    /// Releases bytes from the one aggregate reservation.
+    /// Releases aggregate ownership before making sort allowance available.
     fn shrink(&self, reservation: &MemoryReservation, shrink: usize) {
         self.inner.shrink(reservation, shrink);
+        if reservation.consumer().can_spill() {
+            self.sort_bytes.fetch_sub(shrink, Ordering::AcqRel);
+        }
     }
 
-    /// Attempts aggregate growth without claiming a fungible child ledger.
-    fn try_grow(
-        &self,
-        reservation: &MemoryReservation,
-        additional: usize,
-    ) -> datafusion::error::Result<()> {
-        self.inner.try_grow(reservation, additional)?;
+    /// Applies fair sort pressure before attempting aggregate growth.
+    ///
+    /// # Errors
+    ///
+    /// Returns resource exhaustion when sorting must spill to preserve another
+    /// sorter's share or decode headroom, or when the aggregate pool refuses.
+    fn try_grow(&self, reservation: &MemoryReservation, additional: usize) -> DataFusionResult<()> {
+        let spillable = reservation.consumer().can_spill();
+        if spillable {
+            let fair_share =
+                self.sort_allowance / self.sort_consumers.load(Ordering::Acquire).max(1);
+            if reservation
+                .size()
+                .checked_add(additional)
+                .is_none_or(|size| size > fair_share)
+                || self
+                    .sort_bytes
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |bytes| {
+                        bytes
+                            .checked_add(additional)
+                            .filter(|total| *total <= self.sort_allowance)
+                    })
+                    .is_err()
+            {
+                return Err(DataFusionError::ResourcesExhausted(format!(
+                    "Forge sort allowance {} bytes exhausted; consumer fair share {fair_share} bytes",
+                    self.sort_allowance,
+                )));
+            }
+        }
+        if let Err(error) = self.inner.try_grow(reservation, additional) {
+            if spillable {
+                self.sort_bytes.fetch_sub(additional, Ordering::AcqRel);
+            }
+            return Err(error);
+        }
         self.observe_peak();
         Ok(())
     }
@@ -184,15 +240,25 @@ impl ForgeAttemptResources {
     /// Returns [`ForgeError::Capacity`] when the root governor refuses either
     /// counter, a runtime construction error when the owned spill child cannot
     /// be created, and [`ForgeError::Invariant`] when the constructed runtime
-    /// did not retain the lease-issued pool.
+    /// did not retain the lease-issued pool or its sort allowance is invalid.
     pub(crate) fn acquire(
-        resources: &crate::resources::ForgeResources,
-        request: crate::resources::ForgeRewriteRequest,
-        binding: &crate::catalog::TenantTableBinding,
+        resources: &ForgeResources,
+        request: ForgeRewriteRequest,
+        binding: &TenantTableBinding,
         pod_spill_root: &Path,
         task_id: Uuid,
         attempt_id: Uuid,
     ) -> Result<Self, ForgeError> {
+        let sort_allowance = request
+            .envelope
+            .sort_working_bytes
+            .checked_sub(request.envelope.sort_merge_reservation_bytes)
+            .and_then(|bytes| usize::try_from(bytes).ok())
+            .filter(|bytes| *bytes > 0)
+            .ok_or_else(|| ForgeError::Invariant {
+                detail: "Forge envelope must retain positive representable sort working headroom"
+                    .to_owned(),
+            })?;
         let lease =
             resources
                 .try_acquire_rewrite(request)
@@ -204,6 +270,7 @@ impl ForgeAttemptResources {
         let pool: Arc<dyn MemoryPool> = Arc::new(ForgeAttemptMemoryPool::new(
             lease.memory_pool(),
             Arc::clone(&peak_memory_bytes),
+            sort_allowance,
         ));
         let runtime = ForgeRewriteRuntime::new_attempt(
             Arc::clone(&pool),
@@ -500,20 +567,102 @@ impl ForgeRewriteRuntime {
 mod tests {
     use super::*;
     use datafusion::execution::memory_pool::FairSpillPool;
+    use std::sync::Barrier;
+    use std::thread;
 
     /// Sort pressure must spill before consuming the next decoder's headroom.
+    ///
+    /// # Panics
+    ///
+    /// Panics if admitted growth, fair sharing, rollback, or concurrent release
+    /// violates the real pool's reservation accounting.
     #[test]
     fn spillable_sort_preserves_decode_headroom() {
         let pool: Arc<dyn MemoryPool> = Arc::new(ForgeAttemptMemoryPool::new(
             Arc::new(FairSpillPool::new(128)),
             Arc::new(AtomicU64::new(0)),
+            64,
         ));
-        let mut sort = MemoryConsumer::new("sort").with_can_spill(true).register(&pool);
-        let mut decode = MemoryConsumer::new("decode").register(&pool);
+        let sort = MemoryConsumer::new("sort")
+            .with_can_spill(true)
+            .register(&pool);
+        let decode = MemoryConsumer::new("decode").register(&pool);
         sort.try_grow(64).expect("sort fits its admitted allowance");
-        assert!(sort.try_grow(1).is_err(), "sort must preserve decode headroom");
-        decode.try_grow(64).expect("decode uses its retained headroom");
+        assert!(
+            sort.try_grow(1).is_err(),
+            "sort must preserve decode headroom"
+        );
+        decode
+            .try_grow(64)
+            .expect("decode uses its retained headroom");
+        sort.free();
+        sort.try_grow(64)
+            .expect("released allowance can be refilled");
+        sort.free();
+        decode.free();
+
+        decode
+            .try_grow(100)
+            .expect("non-spillable work fits the aggregate");
+        assert!(sort.try_grow(32).is_err(), "parent pool must refuse");
+        decode.free();
+        sort.try_grow(64)
+            .expect("parent refusal rolls back the sort charge");
+        sort.free();
+        sort.grow(64);
+        assert!(
+            sort.try_grow(1).is_err(),
+            "infallible growth is also charged"
+        );
+        sort.shrink(32);
+        sort.try_grow(32).expect("shrink returns sort allowance");
         drop((sort, decode));
+        assert_eq!(pool.reserved(), 0);
+
+        let first = MemoryConsumer::new("first")
+            .with_can_spill(true)
+            .register(&pool);
+        let second = MemoryConsumer::new("second")
+            .with_can_spill(true)
+            .register(&pool);
+        first
+            .try_grow(32)
+            .expect("first sort receives its fair share");
+        assert!(
+            first.try_grow(1).is_err(),
+            "empty second sorter retains its share"
+        );
+        second
+            .try_grow(32)
+            .expect("second sorter admits its first batch");
+        drop((first, second));
+        assert_eq!(pool.reserved(), 0);
+
+        let first = MemoryConsumer::new("shared")
+            .with_can_spill(true)
+            .register(&pool);
+        let second = first.new_empty();
+        let barrier = Barrier::new(2);
+        let successes = thread::scope(|scope| {
+            let handles = [first, second].map(|reservation| {
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    let success = reservation.try_grow(40).is_ok();
+                    barrier.wait();
+                    drop(reservation);
+                    usize::from(success)
+                })
+            });
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("reservation thread completes"))
+                .sum::<usize>()
+        });
+        assert_eq!(
+            successes, 1,
+            "shared reservations cannot multiply the allowance"
+        );
         assert_eq!(pool.reserved(), 0);
     }
 }

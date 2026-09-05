@@ -441,3 +441,132 @@ resource ceiling rather than a defect. Re-running the reported failures at
 pre-existing: `wyrd-sql tests::transaction_discipline_is_documented` asserts on
 a sentence absent from `architecture/v1/00-foundations/sql-foundation.md` at
 base commit `f6148fbbb`; nothing under `architecture/` is in this write set.
+
+## CR-005 remediation — verified delegation reaches Bifrost attribution and audit
+
+Trace: REQ-012; AC-009; approved specification revision 6. Reviewed candidate
+`171fac9242363ec95f7e260759ec5df4a7f37aab`.
+
+### Scenario 1 — a delegated agent's real Bifrost read is attributed
+
+RED. `crates/wyrd/wyrd-mcp/tests/bifrost/mcp/query.rs::query::pg_tests::delegated_agent_query_is_attributed_in_its_durable_audit_record`
+mints a two-hop delegated token (initiator → middle → subject), calls the real
+`bifrost.query` tool, and reads the committed `bifrost.query.read_decision` row
+for its own request id. Against the pre-change caller boundary — reproduced by
+returning an empty chain from `Caller::from_authenticated` — it fails with
+`"the read decision records a delegation chain"`, which is exactly CR-005: the
+row named the effective principal with no delegation.
+
+```bash
+scripts/postgres/with-test-postgres.sh -- bash -lc "cargo nextest run --locked -p wyrd-mcp --test mcp -P journey --run-ignored=all -E 'test(=query::pg_tests::delegated_agent_query_is_attributed_in_its_durable_audit_record)'"
+```
+
+GREEN. `Caller` gained `delegation_chain` and one inherent
+`Caller::from_authenticated` constructor that derives tenant, effective
+principal, and chain together from the already verified
+`AuthenticatedPrincipal`; the HTTP extractor and `mcp/mod.rs` both use it, and
+the two gRPC boundaries copy the chain the verifier produced (`AuthContext`
+now retains it). `AuthorizedQueryContext` carries the same typed chain, set by
+`query/service.rs::oracle_context` and preserved through the signed forwarding
+envelope by the existing whole-struct serialization. The journey now asserts
+the ordered `[initiator, middle]` chain, each step's `principal_kind`, card
+identity and non-empty card scope, the effective principal, tenant, and request
+id — and that the same tenant's nondelegated caller still commits a row with no
+`delegation_chain` key at all.
+
+The same journey covers the denial flow: an under-privileged delegated token is
+refused with `WYRD_PERMISSION_403_DENIED_RBAC`, no rows, no additional
+read-decision acceptance (`bifrost_read_decision_count_for_tenant` unchanged),
+and exactly one `vala.query.sync` deny row whose typed
+`delegation_attribution` detail still names the delegator. The trust boundary
+retains its existing proof in
+`connectivity::pg_tests::mcp_rejects_credentials_and_joins_request_and_process_cancellation`,
+which passes spoofed `tenant_id`/`principal_id` arguments and still observes
+the server-verified identity.
+
+### Scenario 2 — forwarding-only ingress audits the same chain
+
+RED. `crates/wyrd/wyrd-testing/tests/bifrost/server/query.rs` —
+`prove_scheduled_analytical_completion`, reached from
+`query::generated_grpc_and_scheduled_queries_share_audit_terminal_and_cleanup`
+— now runs its scheduled Analytical query from the Scribe-only ingress under a
+delegated context and asserts the leader's committed read decision carries the
+same ordered chain. Neutering `AuthorizedQueryContext::with_delegation_chain`
+failed that test; restoring it passes.
+
+```bash
+mise run test:bifrost:journey:server
+```
+
+GREEN. 4/4. Because the ingress node owns no Oracle, the audited decision was
+built and committed by the remote leader from the context the signed envelope
+carried, so remote and local execution demonstrably audit the same chain.
+
+### Scenario 3 — durability across WAL acceptance and replay
+
+RED/GREEN.
+`oracle::query_audit::pg_tests::oracle_audit_relay_preserves_delegation_through_replay_pg`
+publishes a delegated read decision, loses its checkpoint in the existing
+commit/checkpoint window, restarts the publisher, and asserts the replayed
+Postgres row still carries the exact ordered chain — proving the chain is
+present before the fsynced WAL acceptance and survives framing and relay. A
+nondelegated record published alongside it keeps a detail with no
+`delegation_chain` key.
+
+```bash
+scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p wyrd-server --lib --all-features -E 'test(/oracle::query_audit::pg_tests::/)'"
+```
+
+7/7.
+
+The canonical-hash half is pinned in `wyrd-spec`:
+`vala::audit_detail::tests::delegation_attribution_is_omitted_when_absent_and_hashed_when_present`
+proves an empty chain is omitted from `audit_detail_canonical_json` entirely
+(so historical records keep their original bytes and entry hash), while adding,
+lengthening, or reordering a chain each produce a different canonical detail.
+
+```bash
+mise exec -- cargo nextest run --locked -p wyrd-spec --lib -E 'test(=vala::audit_detail::tests::delegation_attribution_is_omitted_when_absent_and_hashed_when_present)'
+```
+
+### Owners changed
+
+`wyrd-spec` gained `AuditDelegationStep` (principal id, principal kind tag,
+card ref, card scope — verified identity only, no credential material) and
+`AuditDetail::DelegationAttribution`, plus a `default`/`skip_serializing_if`
+`delegation_chain` on the existing `BifrostQueryReadDecision` and
+`BifrostSecurityViolation` details. The runtime-to-wire conversion lives on
+`wyrd_runtime::DelegationStep::audit_projection` /
+`audit_delegation_chain`, keeping runtime types out of `wyrd-spec`. Event
+building changed only at the existing owners: `wyrd-server/src/audit.rs`
+(attribution-only detail, and only where `detail` was previously `None`),
+`wyrd-server/src/oracle/query_audit.rs`, and the retained transactional Oracle
+audit plus both read-decision builders in
+`vala-bifrost-redux/src/oracle/mod.rs`. Unauthenticated peer and tail security
+rejections carry an empty chain, because no verified caller exists there. No
+new column, table, audit event, MCP audit service, dependency, tool argument,
+or delegation policy was added, and permission evaluation still runs against
+the effective principal alone.
+
+### Broader verification
+
+`mise run fmt`, `mise run lints`, `mise run codegen:regen` +
+`mise run codegen:check`, `mise run test:bifrost:journey:mcp` (7/7),
+`mise run test:bifrost:journey:oracle` (23/23),
+`mise run test:bifrost:journey:server` (4/4), and `git diff --check` all pass.
+`crates/wyrd-spec/schemas/bifrost_audit_event.json` and its test copy were
+regenerated by the existing generator; no generated artifact was hand-edited
+and no historical audit row was rewritten.
+
+### Limitations
+
+`mise run test:sql` fails only on `wyrd-sql tests::transaction_discipline_is_documented`,
+identically on the unmodified tree (verified by `git stash`), and is the
+pre-existing failure this remediation was scoped to leave alone.
+
+`mise run test:wyrd` does not run clean on this machine: 16 failures with the
+change, 19 at the same tree without it. The overlapping families
+(`state::tests`, `pg_authz_check_route`, `forge_harness`, `oracle::query_audit`)
+are the known shared-Postgres/parallelism ceiling recorded above, not a
+regression — the whole `oracle::query_audit::pg_tests` module passes 7/7 when
+run as its own selection.

@@ -571,7 +571,10 @@ impl OracleAudit for OracleAuditPublisher {
             AuditDetail::BifrostSecurityViolation {
                 violation: violation.violation,
                 phase: violation.phase,
-                query_digest: context.query_digest,
+                query_digest: context.query_digest.clone(),
+                delegation_chain: wyrd_runtime::audit_delegation_chain(
+                    &context.query.delegation_chain,
+                ),
             },
         );
         self.append(context.query.data_tenant_id, event).await
@@ -636,6 +639,19 @@ mod pg_tests {
 
     use super::*;
 
+    /// Builds a two-hop verified delegation chain in initiator-first order.
+    fn delegation_chain() -> Vec<wyrd_runtime::DelegationStep> {
+        [uuid::Uuid::from_u128(1), uuid::Uuid::from_u128(2)]
+            .into_iter()
+            .map(|id| wyrd_runtime::DelegationStep {
+                principal: wyrd_runtime::PrincipalRef {
+                    id: PrincipalId::new(id),
+                    kind: PrincipalKind::User,
+                },
+            })
+            .collect()
+    }
+
     /// Builds the valid tenant-bound context used by relay integration tests.
     fn context(tenant: wyrd_spec::DataTenantId) -> AuthorizedQueryContext {
         let principal = Principal::new(
@@ -658,6 +674,13 @@ mod pg_tests {
 
     /// Builds one valid read decision accepted by the production publisher.
     fn decision() -> BifrostQueryReadDecision {
+        decision_with_delegation(Vec::new())
+    }
+
+    /// Builds one valid read decision carrying the given attribution chain.
+    fn decision_with_delegation(
+        delegation_chain: Vec<wyrd_spec::vala::AuditDelegationStep>,
+    ) -> BifrostQueryReadDecision {
         let digest = |value: &str| QueryAuditDigest::new(value).expect("valid digest");
         BifrostQueryReadDecision::try_new(AuditDetail::BifrostQueryReadDecision {
             query_digest: digest("sha256:query"),
@@ -674,6 +697,7 @@ mod pg_tests {
             slot_units: 1,
             retry_ordinal: 0,
             deadline_ms: 1_000,
+            delegation_chain,
         })
         .expect("valid decision")
     }
@@ -760,6 +784,102 @@ mod pg_tests {
                 count >= 2,
                 "commit/checkpoint window replays a valid duplicate"
             );
+            restarted
+                .shutdown(Instant::now() + Duration::from_secs(1))
+                .await;
+        });
+    }
+
+    #[test]
+    /// Proves verified delegation attribution survives the WAL and its replay.
+    ///
+    /// The record is accepted locally, then loses its checkpoint in the same
+    /// commit/checkpoint window the replay test exercises, so the row that
+    /// reaches Postgres came back out of the local WAL framing rather than from
+    /// the in-memory event. A nondelegated record published alongside it proves
+    /// the other half: its canonical detail still omits the field entirely, so
+    /// records written before delegation attribution keep their exact bytes.
+    fn oracle_audit_relay_preserves_delegation_through_replay_pg() {
+        run(async {
+            let vala = crate::test_support::test_vala_postgres().await;
+            let tenant = crate::test_support::test_tenant().await;
+            let root = tempfile::tempdir().expect("WAL root");
+            let config = OracleAuditWalConfig {
+                audit_wal_root: Some(root.path().to_owned()),
+                ..OracleAuditWalConfig::default()
+            };
+            let publisher =
+                OracleAuditPublisher::new(vala.clone(), config.clone()).expect("publisher");
+            let chain = delegation_chain();
+            let delegated = context(tenant).with_delegation_chain(chain.clone());
+            let delegated_request = delegated.request_id.to_string();
+            let plain = context(tenant);
+            let plain_request = plain.request_id.to_string();
+
+            let _pause = publisher.pause_relay_before_postgres();
+            publisher
+                .publish_read_decision(
+                    &delegated,
+                    decision_with_delegation(wyrd_runtime::audit_delegation_chain(&chain)),
+                )
+                .await
+                .expect("delegated acceptance");
+            publisher.fail_after_next_postgres_commit_before_checkpoint();
+            drop(_pause);
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            publisher
+                .shutdown(Instant::now() + Duration::from_secs(1))
+                .await;
+            drop(publisher);
+
+            let restarted = OracleAuditPublisher::new(vala.clone(), config).expect("restart");
+            restarted
+                .publish_read_decision(&plain, decision())
+                .await
+                .expect("nondelegated acceptance");
+            tokio::time::sleep(Duration::from_millis(400)).await;
+
+            let mut conn = vala.tenant_conn(tenant).await.expect("tenant connection");
+            let delegated_detail: String = sqlx::query_scalar(
+                "SELECT detail FROM vala.audit_outbox \
+                 WHERE operation = 'bifrost.query.read_decision' AND request_id = $1 \
+                 ORDER BY seq DESC LIMIT 1",
+            )
+            .bind(&delegated_request)
+            .fetch_one(&mut **conn.transaction())
+            .await
+            .expect("replayed delegated detail");
+            let plain_detail: String = sqlx::query_scalar(
+                "SELECT detail FROM vala.audit_outbox \
+                 WHERE operation = 'bifrost.query.read_decision' AND request_id = $1 \
+                 ORDER BY seq DESC LIMIT 1",
+            )
+            .bind(&plain_request)
+            .fetch_one(&mut **conn.transaction())
+            .await
+            .expect("nondelegated detail");
+            conn.commit().await.expect("read-only commit");
+
+            let parsed: serde_json::Value =
+                serde_json::from_str(&delegated_detail).expect("detail is JSON");
+            assert_eq!(
+                parsed["delegation_chain"]
+                    .as_array()
+                    .expect("chain is an array")
+                    .iter()
+                    .map(|step| step["principal_id"].as_str().unwrap_or_default().to_owned())
+                    .collect::<Vec<_>>(),
+                chain
+                    .iter()
+                    .map(|step| step.principal.id.to_string())
+                    .collect::<Vec<_>>(),
+                "the exact ordered chain survives WAL framing and replay: {delegated_detail}"
+            );
+            assert!(
+                !plain_detail.contains("delegation_chain"),
+                "a nondelegated record keeps its original encoding: {plain_detail}"
+            );
+
             restarted
                 .shutdown(Instant::now() + Duration::from_secs(1))
                 .await;

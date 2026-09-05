@@ -304,6 +304,30 @@ pub enum CardScopeMintKind {
     JwtBearer,
 }
 
+/// One verified delegation hop projected into a durable audit record.
+///
+/// The projection is deliberately identity-only: a delegation chain reaches
+/// audit from a token the verifier already accepted, so the record needs the
+/// delegator's identity and the card authority it was acting under, never the
+/// credential that carried them. Steps are stored in the same initiator-first
+/// order the verifier produced, because the order is the delegation, not an
+/// incidental encoding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct AuditDelegationStep {
+    /// Stable identity of the delegating principal.
+    pub principal_id: PrincipalId,
+    /// Card-free kind discriminator of the delegating principal.
+    pub principal_kind: PrincipalKindTag,
+    /// Card bound to the delegator; absent for a `User` principal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub card_ref: Option<CardRef>,
+    /// Transitive card authorization the delegator acted under; empty for a
+    /// `User` principal.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub card_ref_scope: Vec<CardRef>,
+}
+
 /// Structured detail for one auditable operation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
@@ -352,6 +376,12 @@ pub enum AuditDetail {
         retry_ordinal: u8,
         /// Settled deadline in milliseconds.
         deadline_ms: u64,
+        /// Verified initiator-first delegation chain, empty when the caller
+        /// presented no `act` claim. Omitted from the canonical encoding when
+        /// empty so records written before delegation attribution keep their
+        /// original bytes and hash.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        delegation_chain: Vec<AuditDelegationStep>,
     },
     /// Scrubbed tenant or peer security violation.
     BifrostSecurityViolation {
@@ -361,6 +391,10 @@ pub enum AuditDetail {
         phase: BifrostSecurityPhase,
         /// Trusted query digest when one exists.
         query_digest: Option<QueryAuditDigest>,
+        /// Verified initiator-first delegation chain, empty and omitted when
+        /// the refused caller presented no `act` claim.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        delegation_chain: Vec<AuditDelegationStep>,
     },
     /// A live Iceberg file replacement and its recoverable external boundary.
     ///
@@ -539,6 +573,17 @@ pub enum AuditDetail {
         status_code: u16,
         /// Stable failure code, when applicable.
         error_code: Option<AuditErrorCode>,
+    },
+    /// Delegation attribution for an audited operation that carries no
+    /// operation-specific detail of its own.
+    ///
+    /// This variant exists so an RBAC denial or other detail-free event can
+    /// still name who was acting for whom. It never replaces an
+    /// operation-specific detail: an event that already has one carries its
+    /// delegation inside that detail instead.
+    DelegationAttribution {
+        /// Verified initiator-first delegation chain.
+        delegation_chain: Vec<AuditDelegationStep>,
     },
     /// Ingest batch metadata.
     Ingest {
@@ -823,6 +868,72 @@ mod tests {
         ));
     }
 
+    /// Delegation attribution is hash-covered when present and invisible when
+    /// absent.
+    ///
+    /// The two halves are one claim: an audit chain can only stay verifiable
+    /// across this change if a record written without delegation keeps the
+    /// exact bytes it had before the field existed, while a delegated record
+    /// carries the chain inside the same canonical detail the entry hash covers.
+    #[test]
+    fn delegation_attribution_is_omitted_when_absent_and_hashed_when_present() {
+        let digest = || QueryAuditDigest::new("sha256:abc").expect("valid digest");
+        let read = |delegation_chain: Vec<super::AuditDelegationStep>| {
+            AuditDetail::BifrostQueryReadDecision {
+                query_digest: digest(),
+                query_class: QueryClass::Interactive,
+                visibility: VisibilityMode::PublishedOnly,
+                binding_digests: vec![digest()],
+                snapshot_digest: digest(),
+                manifest_digest: digest(),
+                projection_digest: digest(),
+                permission_digest: digest(),
+                execution: QueryExecutionMode::Local,
+                selected_node_count: 1,
+                worker_count: 0,
+                slot_units: 1,
+                retry_ordinal: 0,
+                deadline_ms: 100,
+                delegation_chain,
+            }
+        };
+
+        let historical = audit_detail_canonical_json(&read(Vec::new()));
+        assert!(
+            !historical.contains("delegation_chain"),
+            "a nondelegated record keeps its original encoding: {historical}"
+        );
+
+        let step = super::AuditDelegationStep {
+            principal_id: PrincipalId::new(uuid::Uuid::nil()),
+            principal_kind: PrincipalKindTag::Service,
+            card_ref: None,
+            card_ref_scope: Vec::new(),
+        };
+        let delegated = audit_detail_canonical_json(&read(vec![step.clone()]));
+        assert_ne!(
+            delegated, historical,
+            "delegation changes the canonical detail the entry hash covers"
+        );
+        assert!(delegated.contains("delegation_chain"));
+        assert_ne!(
+            audit_detail_canonical_json(&read(vec![step.clone(), step.clone()])),
+            delegated,
+            "a longer chain is a different canonical record"
+        );
+
+        // Order is the delegation, so reversing it must change the record.
+        let other = super::AuditDelegationStep {
+            principal_id: PrincipalId::new(uuid::Uuid::max()),
+            ..step.clone()
+        };
+        assert_ne!(
+            audit_detail_canonical_json(&read(vec![step.clone(), other.clone()])),
+            audit_detail_canonical_json(&read(vec![other, step])),
+            "initiator-first order survives canonicalization"
+        );
+    }
+
     /// Bifrost read details serialize only digests and enforce topology bounds.
     #[test]
     fn bifrost_read_detail_is_scrubbed_and_bounded() {
@@ -842,6 +953,7 @@ mod tests {
             slot_units: 1,
             retry_ordinal: 0,
             deadline_ms: 100,
+            delegation_chain: Vec::new(),
         };
         detail.validate().expect("bounded detail validates");
         let json = audit_detail_canonical_json(&detail);
@@ -863,6 +975,7 @@ mod tests {
             slot_units: 1,
             retry_ordinal: 0,
             deadline_ms: 100,
+            delegation_chain: Vec::new(),
         };
         assert!(matches!(
             invalid.validate(),
@@ -886,6 +999,7 @@ mod tests {
             slot_units: 1,
             retry_ordinal: 0,
             deadline_ms: 100,
+            delegation_chain: Vec::new(),
         };
         assert!(matches!(
             duplicate.validate(),
@@ -912,6 +1026,7 @@ mod tests {
             slot_units: 1,
             retry_ordinal: 0,
             deadline_ms: 100,
+            delegation_chain: Vec::new(),
         };
         assert!(unsorted.validate().is_err());
     }

@@ -18,7 +18,7 @@ use base64::Engine;
 use secrecy::{ExposeSecret, SecretString};
 use wyrd_auth_oidc::IssuerConfigResolver;
 use wyrd_auth_verify::{PermissionResolver, TokenVerifier};
-use wyrd_runtime::Principal;
+use wyrd_runtime::{DelegationStep, Principal};
 use wyrd_spec::ids::DataTenantId;
 use wyrd_spec::request_id::RequestId;
 use wyrd_tonic::tonic::metadata::MetadataMap;
@@ -40,6 +40,13 @@ pub struct AuthContext {
     pub tenant: DataTenantId,
     /// The request correlator, read from metadata or freshly minted.
     pub request_id: RequestId,
+    /// The verifier's initiator-first delegation chain, empty when the token
+    /// carries no `act` claim.
+    ///
+    /// Retained for attribution only: authorization stays bound to
+    /// [`Self::principal`], while the chain travels with it so the operation's
+    /// audit record can name who was acting for whom.
+    pub delegation_chain: Vec<DelegationStep>,
 }
 
 /// Read the bearer token from the `x-wyrd-access-token` metadata, stripping an
@@ -115,6 +122,7 @@ pub async fn authenticate<R: PermissionResolver + 'static, I: IssuerConfigResolv
         principal: verified_token.principal.clone(),
         tenant: expected_tenant,
         request_id,
+        delegation_chain: verified_token.delegation_chain.clone(),
     })
 }
 
@@ -149,6 +157,7 @@ pub async fn authenticate_owned<
         principal: verified_token.principal.clone(),
         tenant: expected_tenant,
         request_id,
+        delegation_chain: verified_token.delegation_chain.clone(),
     })
 }
 

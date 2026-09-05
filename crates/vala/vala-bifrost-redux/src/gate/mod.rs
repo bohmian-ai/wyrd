@@ -1212,6 +1212,7 @@ mod tests {
             principal,
             tenant,
             request_id: RequestId::now_v7(),
+            delegation_chain: Vec::new(),
         }
     }
 
@@ -1422,6 +1423,7 @@ mod tests {
             trace_id: None,
             auth_method: wyrd_spec::vala::api::AuthMethod::Jwt,
             permission: "bifrost:record:read".to_owned(),
+            delegation_chain: auth.delegation_chain,
         }
     }
 

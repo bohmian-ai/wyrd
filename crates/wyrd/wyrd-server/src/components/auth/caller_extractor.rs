@@ -1,6 +1,6 @@
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
-use wyrd_runtime::Principal;
+use wyrd_runtime::{DelegationStep, Principal};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
@@ -15,9 +15,43 @@ pub struct Caller {
     /// Resolved tenant isolation key for data-plane access.
     pub data_tenant_id: DataTenantId,
     /// Authenticated principal.
+    ///
+    /// This is the *effective* principal — the identity every authorization
+    /// decision is made against. Delegation never displaces it.
     pub principal: Principal,
     /// Request correlation ID.
     pub request_id: RequestId,
+    /// Verified initiator-first delegation chain, empty for a nondelegated
+    /// caller.
+    ///
+    /// Attribution only: the chain says who was acting for whom and is copied
+    /// into the audit record, while authorization stays bound to
+    /// [`Self::principal`]. It is only ever populated from a verifier result,
+    /// never from tool arguments, request bodies, or arbitrary headers.
+    pub delegation_chain: Vec<DelegationStep>,
+}
+
+impl Caller {
+    /// Derives the tenant-scoped caller from one already verified principal.
+    ///
+    /// Tenant, effective principal, and delegation chain are taken together
+    /// from the same [`AuthenticatedPrincipal`] so they cannot disagree: the
+    /// tenant is the principal's own, and the chain is the verifier's, in the
+    /// order it produced. Every authenticated Wyrd boundary — the HTTP
+    /// extractor below and the MCP handler — goes through here rather than
+    /// building the struct field by field, which is what previously let the
+    /// chain be silently dropped at one of them.
+    #[must_use]
+    pub fn from_authenticated(principal: &AuthenticatedPrincipal, request_id: RequestId) -> Self {
+        let delegation_chain = principal.delegation_chain().to_vec();
+        let principal = principal.principal().clone();
+        Self {
+            data_tenant_id: principal.tenant_id,
+            principal,
+            request_id,
+            delegation_chain,
+        }
+    }
 }
 
 impl FromRequestParts<AppState> for Caller {
@@ -27,8 +61,7 @@ impl FromRequestParts<AppState> for Caller {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        let principal =
-            Principal::from(AuthenticatedPrincipal::from_request_parts(parts, state).await?);
+        let principal = AuthenticatedPrincipal::from_request_parts(parts, state).await?;
         let request_id = parts
             .extensions
             .get::<RequestId>()
@@ -36,11 +69,7 @@ impl FromRequestParts<AppState> for Caller {
             .ok_or_else(missing_request_id)
             .map_err(WyrdErrorResponse::from)?;
 
-        Ok(Self {
-            data_tenant_id: principal.tenant_id,
-            principal,
-            request_id,
-        })
+        Ok(Self::from_authenticated(&principal, request_id))
     }
 }
 

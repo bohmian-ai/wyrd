@@ -18,6 +18,7 @@ mod pg_tests {
     use rmcp::service::PeerRequestOptions;
     use rmcp::service::ServiceError;
     use wyrd_client::transport::credential::ResolvedCredential;
+    use wyrd_spec::request_id::RequestId;
     use wyrd_testing::WyrdTestServer;
     use wyrd_testing::bifrost::seed_query_fixture;
     use wyrd_testing::server::BifrostQueryResourceSnapshot;
@@ -34,6 +35,242 @@ mod pg_tests {
                 .expect("query arguments are a JSON object")
                 .clone(),
         )
+    }
+
+    /// An agent acting for another agent is attributed as such, all the way to
+    /// the durable audit record of the read it performed.
+    ///
+    /// This is the whole delegation contract in one path: a real two-hop
+    /// delegated token reaches a real Bifrost tool, authorization stays bound
+    /// to the effective principal the token names, and the read-decision row
+    /// Oracle commits before any row is disclosed carries the exact
+    /// initiator-first chain — the identity, kind, and card authority of each
+    /// delegator — under the caller's own request id and tenant. The
+    /// nondelegated caller in the same tenant proves the negative half: its row
+    /// carries no chain and keeps the encoding it always had.
+    ///
+    /// # Errors
+    ///
+    /// Returns fixture, delegation, transport, audit, or shutdown failures.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the Postgres-backed Bifrost journey lane"]
+    async fn delegated_agent_query_is_attributed_in_its_durable_audit_record()
+    -> Result<(), McpJourneyError> {
+        let server = WyrdTestServer::start_bound().await?;
+        let tenant = server.data_tenant_id();
+        let fixture = seed_query_fixture(&server, "mcp-delegation").await?;
+        let sql = format!("SELECT id, value FROM {} ORDER BY id", fixture.table);
+
+        // A acts through B, which acts as C. Only C's own roles authorize the
+        // read; A and B are attribution.
+        let initiator = server
+            .bootstrap_service("mcp-delegation-initiator", &["runtime_admin"])
+            .await?;
+        let middle = server
+            .bootstrap_service("mcp-delegation-middle", &["runtime_admin"])
+            .await?;
+        let subject = server
+            .bootstrap_service("mcp-delegation-subject", &["admin"])
+            .await?;
+        let initiator_jwt = server
+            .exchange_api_key(initiator.api_key().ok_or("a service carries a key")?)
+            .await?;
+        let one_hop = server.delegate(
+            &initiator_jwt,
+            middle.card_ref().ok_or("a service carries a card ref")?,
+        );
+        let one_hop = one_hop.await?;
+        let two_hop = server
+            .delegate(
+                &one_hop,
+                subject.card_ref().ok_or("a service carries a card ref")?,
+            )
+            .await?;
+
+        let request_id = RequestId::now_v7();
+        let client = ()
+            .serve_with_lifecycle(
+                transport(
+                    &server,
+                    ResolvedCredential::BearerToken(two_hop.into()),
+                    Some(&request_id),
+                )?,
+                discover(),
+            )
+            .await?;
+        let result = client
+            .call_tool(query(serde_json::json!({"sql": sql, "max_rows": 10})))
+            .await?;
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "the delegated agent reads: {:?}",
+            result.structured_content
+        );
+        client.cancel().await?;
+
+        let detail = read_decision_detail(&server, tenant, request_id.as_str()).await?;
+        let chain = detail["delegation_chain"]
+            .as_array()
+            .ok_or("the read decision records a delegation chain")?;
+        assert_eq!(
+            chain
+                .iter()
+                .map(|step| step["principal_id"].as_str().unwrap_or_default())
+                .collect::<Vec<_>>(),
+            vec![
+                initiator.id().to_string().as_str(),
+                middle.id().to_string().as_str(),
+            ],
+            "the chain is initiator-first and complete: {detail}"
+        );
+        for (step, service) in chain.iter().zip([&initiator, &middle]) {
+            assert_eq!(step["principal_kind"], serde_json::json!("service"));
+            let card_ref = service.card_ref().ok_or("a service carries a card ref")?;
+            assert_eq!(
+                step["card_ref"]["name"],
+                serde_json::json!(card_ref.name.as_str()),
+                "each step names the card authority it acted under: {step}"
+            );
+            assert!(
+                step["card_ref_scope"]
+                    .as_array()
+                    .is_some_and(|scope| !scope.is_empty()),
+                "each step carries its verified card scope: {step}"
+            );
+        }
+        assert!(
+            !detail.to_string().contains(&fixture.token),
+            "no credential material reaches the audit record"
+        );
+
+        // Same tenant, same tool, no delegation: an unchanged record shape.
+        let plain_request_id = RequestId::now_v7();
+        let plain = ()
+            .serve_with_lifecycle(
+                transport(
+                    &server,
+                    ResolvedCredential::BearerToken(fixture.token.clone().into()),
+                    Some(&plain_request_id),
+                )?,
+                discover(),
+            )
+            .await?;
+        let plain_result = plain
+            .call_tool(query(serde_json::json!({"sql": sql, "max_rows": 10})))
+            .await?;
+        assert_ne!(plain_result.is_error, Some(true));
+        plain.cancel().await?;
+        let plain_detail = read_decision_detail(&server, tenant, plain_request_id.as_str()).await?;
+        assert!(
+            plain_detail.get("delegation_chain").is_none(),
+            "a nondelegated caller keeps the original record shape: {plain_detail}"
+        );
+
+        // A delegated token that lacks the permission is refused by the same
+        // audited RBAC path, and the refusal still says who was acting for whom.
+        let underprivileged = server
+            .bootstrap_service("mcp-delegation-reader", &["reader"])
+            .await?;
+        let denied_token = server
+            .delegate(
+                &initiator_jwt,
+                underprivileged
+                    .card_ref()
+                    .ok_or("a service carries a card ref")?,
+            )
+            .await?;
+        let denied_request_id = RequestId::now_v7();
+        let reads_before = server
+            .bifrost_read_decision_count_for_tenant(tenant)
+            .await?;
+        let denied_client = ()
+            .serve_with_lifecycle(
+                transport(
+                    &server,
+                    ResolvedCredential::BearerToken(denied_token.into()),
+                    Some(&denied_request_id),
+                )?,
+                discover(),
+            )
+            .await?;
+        let refusal = problem(
+            denied_client
+                .call_tool(query(serde_json::json!({"sql": sql, "max_rows": 10})))
+                .await?,
+        )?;
+        assert_eq!(
+            refusal["code"],
+            serde_json::json!("WYRD_PERMISSION_403_DENIED_RBAC"),
+            "the under-privileged delegate is refused: {refusal}"
+        );
+        assert!(
+            refusal.get("rows").is_none(),
+            "a refused delegate sees no rows: {refusal}"
+        );
+        denied_client.cancel().await?;
+        assert_eq!(
+            server
+                .bifrost_read_decision_count_for_tenant(tenant)
+                .await?,
+            reads_before,
+            "a refused delegate produces no read-decision acceptance"
+        );
+
+        let mut conn = server.tenant_conn_for(tenant).await?;
+        let denial: Vec<(uuid::Uuid, String, Option<String>)> = sqlx::query_as(
+            "SELECT principal_id, decision, detail FROM vala.audit_outbox \
+             WHERE operation = 'vala.query.sync' AND request_id = $1",
+        )
+        .bind(denied_request_id.as_str())
+        .fetch_all(&mut **conn.transaction())
+        .await?;
+        conn.commit().await?;
+        assert_eq!(denial.len(), 1, "the denial is audited exactly once");
+        assert_eq!(denial[0].0, underprivileged.id().as_uuid());
+        assert_eq!(denial[0].1, "deny");
+        let denial_detail: serde_json::Value = serde_json::from_str(
+            denial[0]
+                .2
+                .as_deref()
+                .ok_or("the denial retains delegation attribution")?,
+        )?;
+        assert_eq!(
+            denial_detail["kind"],
+            serde_json::json!("delegation_attribution")
+        );
+        assert_eq!(
+            denial_detail["delegation_chain"]
+                .as_array()
+                .ok_or("the denial names its delegators")?
+                .iter()
+                .map(|step| step["principal_id"].as_str().unwrap_or_default())
+                .collect::<Vec<_>>(),
+            vec![initiator.id().to_string().as_str()],
+            "the denial keeps the verified chain: {denial_detail}"
+        );
+
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    /// Read the exact committed read-decision detail for one request id.
+    async fn read_decision_detail(
+        server: &WyrdTestServer,
+        tenant: wyrd_spec::DataTenantId,
+        request_id: &str,
+    ) -> Result<serde_json::Value, McpJourneyError> {
+        let mut conn = server.tenant_conn_for(tenant).await?;
+        let detail: String = sqlx::query_scalar(
+            "SELECT detail FROM vala.audit_outbox \
+             WHERE operation = 'bifrost.query.read_decision' AND request_id = $1 \
+             ORDER BY seq DESC LIMIT 1",
+        )
+        .bind(request_id)
+        .fetch_one(&mut **conn.transaction())
+        .await?;
+        conn.commit().await?;
+        Ok(serde_json::from_str(&detail)?)
     }
 
     /// Every way an agent can write an unusable query fails before rows run,

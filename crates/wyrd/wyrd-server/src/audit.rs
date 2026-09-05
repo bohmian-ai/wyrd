@@ -22,7 +22,7 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::DataTenantId;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::BifrostError as ValaError;
-use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
+use wyrd_spec::vala::api::{AuditDecision, AuditDetail, AuditEvent, AuditResult, AuthMethod};
 
 use crate::components::auth::Caller;
 
@@ -54,8 +54,28 @@ pub fn audit_event(
         decision,
         result,
         payload_summary: payload_summary.to_owned(),
-        detail: None,
+        detail: delegation_detail(caller),
     }
+}
+
+/// Project the caller's verified delegation chain into a durable detail.
+///
+/// Operations reached through this builder carry no operation-specific detail
+/// of their own, so an attribution-only detail is the one place their audit row
+/// can record who was acting for whom. A nondelegated caller keeps `None`, which
+/// is exactly the encoding every such row had before delegation attribution
+/// existed, so historical rows and new nondelegated rows hash identically.
+///
+/// Callers that already build an operation-specific detail must fold the chain
+/// into that detail instead of calling this; overwriting a read decision with
+/// an attribution-only detail would lose the decision.
+fn delegation_detail(caller: &Caller) -> Option<AuditDetail> {
+    if caller.delegation_chain.is_empty() {
+        return None;
+    }
+    Some(AuditDetail::DelegationAttribution {
+        delegation_chain: wyrd_runtime::audit_delegation_chain(&caller.delegation_chain),
+    })
 }
 
 /// Build an [`AuditEvent`] for a pre-authentication attempt, attributed to

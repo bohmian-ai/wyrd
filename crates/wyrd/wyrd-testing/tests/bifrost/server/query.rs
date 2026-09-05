@@ -57,6 +57,47 @@ fn scheduled_context(tenant: DataTenantId) -> Result<AuthorizedQueryContext, Ser
     )?)
 }
 
+/// Builds one two-hop verified delegation chain for attribution assertions.
+///
+/// The chain is a stand-in for a verified `act` claim: the scheduled caller has
+/// no HTTP edge to mint one, but Oracle receives a chain the same way either
+/// path delivers it — on the authorized context — so a forwarded query is the
+/// honest place to prove the chain survives the signed envelope.
+fn journey_delegation_chain() -> Vec<wyrd_runtime::DelegationStep> {
+    [uuid::Uuid::from_u128(0xA), uuid::Uuid::from_u128(0xB)]
+        .into_iter()
+        .map(|id| wyrd_runtime::DelegationStep {
+            principal: wyrd_runtime::PrincipalRef {
+                id: PrincipalId::new(id),
+                kind: PrincipalKind::User,
+            },
+        })
+        .collect()
+}
+
+/// Reads the exact committed read-decision detail for one request id.
+///
+/// # Errors
+///
+/// Returns a SQL or JSON failure, or the absence of the expected audit row.
+async fn read_decision_detail(
+    server: &WyrdTestServer,
+    tenant: DataTenantId,
+    request_id: &str,
+) -> Result<serde_json::Value, ServerJourneyError> {
+    let mut conn = server.tenant_conn_for(tenant).await?;
+    let detail: String = sqlx::query_scalar(
+        "SELECT detail FROM vala.audit_outbox \
+         WHERE operation = 'bifrost.query.read_decision' AND request_id = $1 \
+         ORDER BY seq DESC LIMIT 1",
+    )
+    .bind(request_id)
+    .fetch_one(&mut **conn.transaction())
+    .await?;
+    conn.commit().await?;
+    Ok(serde_json::from_str(&detail)?)
+}
+
 /// Counts audit rows written under one operation name.
 ///
 /// # Errors
@@ -683,9 +724,15 @@ async fn prove_scheduled_analytical_completion(
         "forwarded ingress retains lifecycle routing"
     );
     let before = audit_rows(ingress, tenant, "bifrost.query.read_decision").await?;
+    // Forwarding-only ingress: this node owns no Oracle, so the read decision
+    // below is built and committed by the remote leader from the context the
+    // signed forwarding envelope carried.
+    let chain = journey_delegation_chain();
+    let delegated = scheduled_context(tenant)?.with_delegation_chain(chain.clone());
+    let delegated_request_id = delegated.request_id.to_string();
     let outcome = ScheduledQueryCaller::new(
         ingress.state().clone(),
-        scheduled_context(tenant)?,
+        delegated,
         tokio_util::sync::CancellationToken::new(),
     )
     .run(request(sql))
@@ -704,6 +751,20 @@ async fn prove_scheduled_analytical_completion(
     assert_eq!(
         audit_rows(ingress, tenant, "bifrost.query.read_decision").await?,
         before + 1
+    );
+    let detail = read_decision_detail(ingress, tenant, &delegated_request_id).await?;
+    assert_eq!(
+        detail["delegation_chain"]
+            .as_array()
+            .ok_or("the forwarded read decision records its delegation chain")?
+            .iter()
+            .map(|step| step["principal_id"].as_str().unwrap_or_default().to_owned())
+            .collect::<Vec<_>>(),
+        chain
+            .iter()
+            .map(|step| step.principal.id.to_string())
+            .collect::<Vec<_>>(),
+        "remote execution audits the same ordered chain local execution would: {detail}"
     );
 
     let leader_id = cluster

@@ -69,6 +69,7 @@ async fn caller_from_metadata(
         data_tenant_id: auth.tenant,
         principal: auth.principal,
         request_id,
+        delegation_chain: auth.delegation_chain,
     })
 }
 

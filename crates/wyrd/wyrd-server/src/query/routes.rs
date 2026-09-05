@@ -509,6 +509,8 @@ mod tests {
                 PermissionSet::from_iter([Permission::bifrost_query_read()]),
             ),
             request_id: RequestId::now_v7(),
+            // Nondelegated fixture caller: no verified `act` chain exists.
+            delegation_chain: Vec::new(),
         }
     }
 

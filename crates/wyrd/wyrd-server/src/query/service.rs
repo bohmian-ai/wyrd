@@ -66,6 +66,9 @@ pub(crate) async fn authorize_audited(
 
 /// Converts the authenticated server caller into Oracle's exact context.
 ///
+/// The verified delegation chain travels with the effective principal so both
+/// local and forwarded execution build the same attributed read decision.
+///
 /// # Errors
 ///
 /// Returns the tenant invariant error if the principal and extractor tenant
@@ -79,6 +82,7 @@ fn oracle_context(caller: &Caller) -> Result<AuthorizedQueryContext, WyrdError> 
         AuthMethod::Jwt,
         Permission::bifrost_query_read().to_string(),
     )
+    .map(|context| context.with_delegation_chain(caller.delegation_chain.clone()))
     .map_err(Into::into)
 }
 
@@ -610,6 +614,8 @@ mod tests {
                 PermissionSet::from_iter(permissions),
             ),
             request_id: RequestId::now_v7(),
+            // Nondelegated fixture caller: no verified `act` chain exists.
+            delegation_chain: Vec::new(),
         }
     }
 

@@ -93,6 +93,7 @@ async fn caller(
         data_tenant_id: auth.tenant,
         principal: auth.principal,
         request_id: vala_bifrost_redux::gate::auth::read_or_mint_request_id(&metadata),
+        delegation_chain: auth.delegation_chain,
     })
 }
 

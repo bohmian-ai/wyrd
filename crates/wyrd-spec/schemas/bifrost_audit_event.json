@@ -127,6 +127,47 @@
         }
       ]
     },
+    "AuditDelegationStep": {
+      "description": "One verified delegation hop projected into a durable audit record.\n\nThe projection is deliberately identity-only: a delegation chain reaches audit from a token the verifier already accepted, so the record needs the delegator's identity and the card authority it was acting under, never the credential that carried them. Steps are stored in the same initiator-first order the verifier produced, because the order is the delegation, not an incidental encoding.",
+      "type": "object",
+      "required": [
+        "principal_id",
+        "principal_kind"
+      ],
+      "properties": {
+        "card_ref": {
+          "description": "Card bound to the delegator; absent for a `User` principal.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CardRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "card_ref_scope": {
+          "description": "Transitive card authorization the delegator acted under; empty for a `User` principal.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/CardRef"
+          }
+        },
+        "principal_id": {
+          "description": "Stable identity of the delegating principal.",
+          "type": "string",
+          "format": "uuid"
+        },
+        "principal_kind": {
+          "description": "Card-free kind discriminator of the delegating principal.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/PrincipalKindTag"
+            }
+          ]
+        }
+      }
+    },
     "AuditDetail": {
       "description": "Structured detail for one auditable operation.",
       "oneOf": [
@@ -214,6 +255,13 @@
               "format": "uint64",
               "minimum": 0.0
             },
+            "delegation_chain": {
+              "description": "Verified initiator-first delegation chain, empty when the caller presented no `act` claim. Omitted from the canonical encoding when empty so records written before delegation attribution keep their original bytes and hash.",
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/AuditDelegationStep"
+              }
+            },
             "execution": {
               "description": "Local or distributed execution decision.",
               "allOf": [
@@ -299,6 +347,13 @@
             "violation"
           ],
           "properties": {
+            "delegation_chain": {
+              "description": "Verified initiator-first delegation chain, empty and omitted when the refused caller presented no `act` claim.",
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/AuditDelegationStep"
+              }
+            },
             "kind": {
               "type": "string",
               "enum": [
@@ -1002,6 +1057,29 @@
                 "null"
               ],
               "format": "uuid"
+            }
+          }
+        },
+        {
+          "description": "Delegation attribution for an audited operation that carries no operation-specific detail of its own.\n\nThis variant exists so an RBAC denial or other detail-free event can still name who was acting for whom. It never replaces an operation-specific detail: an event that already has one carries its delegation inside that detail instead.",
+          "type": "object",
+          "required": [
+            "delegation_chain",
+            "kind"
+          ],
+          "properties": {
+            "delegation_chain": {
+              "description": "Verified initiator-first delegation chain.",
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/AuditDelegationStep"
+              }
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "delegation_attribution"
+              ]
             }
           }
         },

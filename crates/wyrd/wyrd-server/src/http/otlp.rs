@@ -433,6 +433,7 @@ fn caller_auth_context(caller: &Caller) -> AuthContext {
         principal: caller.principal.clone(),
         tenant: caller.data_tenant_id,
         request_id: caller.request_id.clone(),
+        delegation_chain: caller.delegation_chain.clone(),
     }
 }
 

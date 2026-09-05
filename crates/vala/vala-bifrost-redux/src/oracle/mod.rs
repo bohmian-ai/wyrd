@@ -31,7 +31,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 use vala_sql::ValaPostgres;
-use wyrd_runtime::Principal;
+use wyrd_runtime::{DelegationStep, Principal};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::BifrostError;
@@ -165,6 +165,18 @@ pub struct AuthorizedQueryContext {
     pub auth_method: AuthMethod,
     /// Effective permission checked before the query entered Oracle.
     pub permission: String,
+    /// Verified initiator-first delegation chain, empty when the caller
+    /// presented no `act` claim.
+    ///
+    /// Attribution only — Oracle authorizes against [`Self::principal`] and
+    /// never consults this. It rides on the context so that both local and
+    /// forwarded execution build the same audit detail: the signed forwarding
+    /// envelope serializes this whole struct, so a remote leader receives the
+    /// same ordered chain the ingress node verified. Omitted from the wire and
+    /// defaulted on read when empty, so a nondelegated query keeps its
+    /// original encoding.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub delegation_chain: Vec<DelegationStep>,
 }
 
 /// Builds one valid pinned-Iceberg descriptor for assignment-shape tests.
@@ -293,7 +305,21 @@ impl AuthorizedQueryContext {
             trace_id,
             auth_method,
             permission: permission.into(),
+            delegation_chain: Vec::new(),
         })
+    }
+
+    /// Attaches the verified initiator-first delegation chain to this context.
+    ///
+    /// Kept separate from [`Self::try_new`] because delegation is attribution,
+    /// not authorization: a context is complete and valid without it, and an
+    /// internal or scheduled caller correctly carries none. Callers at an
+    /// authenticated boundary pass the verifier's chain here so it reaches the
+    /// read-decision audit detail.
+    #[must_use]
+    pub fn with_delegation_chain(mut self, delegation_chain: Vec<DelegationStep>) -> Self {
+        self.delegation_chain = delegation_chain;
+        self
     }
 }
 
@@ -1356,6 +1382,9 @@ impl OracleAudit for TestPostgresOracleAudit {
                 violation: violation.violation,
                 phase: violation.phase,
                 query_digest: context.query_digest,
+                delegation_chain: wyrd_runtime::audit_delegation_chain(
+                    &context.query.delegation_chain,
+                ),
             },
         )
         .await
@@ -4760,6 +4789,7 @@ fn read_decision(
         // ordinal, and Oracle now only ever writes its first value.
         retry_ordinal: 0,
         deadline_ms,
+        delegation_chain: wyrd_runtime::audit_delegation_chain(&context.delegation_chain),
     })
 }
 
@@ -4814,6 +4844,7 @@ fn plan_read_decision(
         slot_units: admission_limits(u32::MAX, query_class).1,
         retry_ordinal: 0,
         deadline_ms,
+        delegation_chain: wyrd_runtime::audit_delegation_chain(&context.delegation_chain),
     })
 }
 

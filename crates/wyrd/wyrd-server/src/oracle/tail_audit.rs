@@ -70,6 +70,9 @@ impl PostgresTailSecurityAudit {
             violation,
             phase: BifrostSecurityPhase::Peer,
             query_digest: None,
+            // A rejected peer or tail presenter never became an authenticated
+            // Wyrd caller, so there is no verified chain to attribute.
+            delegation_chain: Vec::new(),
         });
         let mut conn = self.postgres.tenant_conn(tenant_id).await.map_err(|_| {
             TailReadError::Authorization {

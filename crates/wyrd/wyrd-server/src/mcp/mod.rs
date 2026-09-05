@@ -111,17 +111,17 @@ impl WyrdMcpHandler {
 
     /// Derive the tenant-scoped [`Caller`] every Wyrd service operation takes.
     ///
+    /// The whole verified principal is handed to
+    /// [`Caller::from_authenticated`] so the token's delegation chain reaches
+    /// the operation's audit record alongside the effective principal that
+    /// authorizes it.
+    ///
     /// # Errors
     ///
     /// Propagates [`Self::request_context`]'s wiring failures.
     fn caller(context: &RequestContext<RoleServer>) -> Result<Caller, WyrdError> {
         let (principal, request_id) = Self::request_context(context)?;
-        let principal = wyrd_runtime::Principal::from(principal);
-        Ok(Caller {
-            data_tenant_id: principal.tenant_id,
-            principal,
-            request_id,
-        })
+        Ok(Caller::from_authenticated(&principal, request_id))
     }
 
     /// The tools this handler advertises and accepts.

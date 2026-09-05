@@ -5,6 +5,7 @@ use std::fmt;
 use chrono::{DateTime, Utc};
 use wyrd_spec::ids::IdempotencyKey;
 use wyrd_spec::request_id::RequestId;
+use wyrd_spec::vala::AuditDelegationStep;
 
 use crate::principal::{Principal, PrincipalRef};
 
@@ -14,6 +15,38 @@ use crate::principal::{Principal, PrincipalRef};
 pub struct DelegationStep {
     /// Self-describing delegating principal projection.
     pub principal: PrincipalRef,
+}
+
+impl DelegationStep {
+    /// Projects one verified delegation hop into its durable audit wire form.
+    ///
+    /// The conversion lives here rather than in `wyrd-spec` because the
+    /// runtime owns [`PrincipalRef`]; the spec crate stays free of runtime
+    /// types. Only verified identity crosses: the principal's id, its
+    /// card-free kind tag, and the card authority it acted under. No
+    /// credential material is representable in the result.
+    #[must_use]
+    pub fn audit_projection(&self) -> AuditDelegationStep {
+        AuditDelegationStep {
+            principal_id: self.principal.id,
+            principal_kind: self.principal.kind.tag(),
+            card_ref: self.principal.card_ref().cloned(),
+            card_ref_scope: self
+                .principal
+                .card_ref_scope()
+                .map(|scope| scope.as_slice().to_vec())
+                .unwrap_or_default(),
+        }
+    }
+}
+
+/// Projects an ordered delegation chain into its durable audit wire form.
+///
+/// Order is preserved exactly: the chain is initiator-first, and that order is
+/// the delegation itself rather than an incidental encoding.
+#[must_use]
+pub fn audit_delegation_chain(chain: &[DelegationStep]) -> Vec<AuditDelegationStep> {
+    chain.iter().map(DelegationStep::audit_projection).collect()
 }
 
 /// Per-request context carried through runtime boundaries.

@@ -170,3 +170,9 @@ the exact envelope selector fail at its expected typed-refusal assertion
 all-rejected inputs with zero projected material and checked configuration
 overflow. This cap failure has no cross-boundary state; it is deliberately
 forced in the pure planner rather than by reconfiguring a live server.
+
+Real OTLP journey GREEN: the exact Postgres-wrapped MCP selector passes
+(2.551s), including actual error-span discovery/query, ceilings, and cancellation.
+Refactor removes the obsolete decoded-input projection estimate entirely:
+request bytes are validated first; validated counters and measured material
+form one final root/replay plan. No intermediate estimated root is retained.

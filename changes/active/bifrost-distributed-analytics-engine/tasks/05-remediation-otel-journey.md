@@ -112,3 +112,8 @@ Final test-only candidate verification: `mise run fmt` and `mise run lints`
 PASS (workspace linting 37.16s). `mise run test:bifrost:journey:mcp` FAIL:
 5 passed, 1 failed (the real OTLP journey, same HTTP 413 sizing mismatch).
 The original discovery/authentication/malformed-input MCP journeys remain green.
+
+Production dependency remediation `05-remediation-otlp-material.md` restores
+GREEN: the exact OTLP MCP selector passed (2.551s) after correcting Scribe
+projection accounting. The earlier TASK_REVISION_REQUIRED condition is resolved
+by that independently reviewed task; final cumulative verification follows.

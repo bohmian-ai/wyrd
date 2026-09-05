@@ -215,38 +215,6 @@ impl IngestMaterialPlan {
         }
     }
 
-    /// Replaces the decoded-input estimate with exact accepted OTLP material.
-    ///
-    /// The decoded request remains independently charged. Arrow ownership also
-    /// supplies the immutable persistence candidate used by the replay guard.
-    ///
-    /// # Errors
-    ///
-    /// Returns a checked material-size overflow before root admission.
-    fn with_otlp_material(
-        mut self,
-        material: Option<OtlpManagedMaterialPlan>,
-    ) -> Result<Self, ScribeError> {
-        self.sources = [SourceMaterialPlan::default(); MAX_SOURCE_PLANS];
-        self.source_count = usize::from(material.is_some());
-        self.time_partition_count = self.source_count;
-        self.durable_metadata_bytes =
-            self.source_count * crate::scribe::shards::DURABLE_SLICE_LAYOUT_BYTES;
-        self.rows = material.as_ref().map_or(0, |value| value.rows);
-        self.current_material_bytes = material
-            .as_ref()
-            .map_or(Ok(0), |value| value.admitted_bytes(usize::MAX))?;
-        self.persistence_candidate_bytes = material.as_ref().map_or(0, |value| value.arrow_bytes);
-        if self.source_count != 0 {
-            self.sources[0] = SourceMaterialPlan {
-                rows: self.rows,
-                body_bytes: self.current_material_bytes,
-                ..SourceMaterialPlan::default()
-            };
-        }
-        self.finish()
-    }
-
     /// Completes checked simultaneous-live-set arithmetic.
     ///
     /// # Errors
@@ -292,6 +260,21 @@ pub(crate) struct ScribeIngressPlanner {
 }
 
 impl ScribeIngressPlanner {
+    /// Rejects an oversized retained request before signal projection planning.
+    ///
+    /// # Errors
+    ///
+    /// Returns the configured request limit and observed bytes on excess.
+    fn validate_otlp_request_bytes(&self, bytes: usize) -> Result<(), ScribeError> {
+        if bytes > self.limits.otlp.request_bytes {
+            return Err(ScribeError::PayloadTooLarge {
+                bytes,
+                limit: self.limits.otlp.request_bytes,
+            });
+        }
+        Ok(())
+    }
+
     /// Constructs one planner from the same frozen limits snapshot used by Gate.
     #[must_use]
     pub(crate) const fn new(limits: crate::gate::limits::IngestLimits) -> Self {
@@ -789,6 +772,7 @@ impl ScribeIngressPlanner {
         name_bytes: usize,
         projection: &OtlpProjection<'_>,
     ) -> Result<IngestMaterialPlan, ScribeError> {
+        self.validate_otlp_request_bytes(request_bytes)?;
         let mut counts = OtlpCounts::new(self.limits);
         for resource in &request.resource_spans {
             counts.add_resources(1)?;
@@ -829,10 +813,9 @@ impl ScribeIngressPlanner {
                 }
             }
         }
-        let counted = counts.finish(request_bytes, name_bytes)?;
         let material =
             projection.measure_traces(request, configured_otlp_material_bytes(self.limits)?)?;
-        counted.with_otlp_material(material)
+        counts.finish(request_bytes, name_bytes, material)
     }
 
     /// Counts a typed metrics request without projecting records.
@@ -848,6 +831,7 @@ impl ScribeIngressPlanner {
         name_bytes: usize,
         projection: &OtlpProjection<'_>,
     ) -> Result<IngestMaterialPlan, ScribeError> {
+        self.validate_otlp_request_bytes(request_bytes)?;
         let mut counts = OtlpCounts::new(self.limits);
         for resource in &request.resource_metrics {
             counts.add_resources(1)?;
@@ -900,10 +884,9 @@ impl ScribeIngressPlanner {
                 }
             }
         }
-        let counted = counts.finish(request_bytes, name_bytes)?;
         let material =
             projection.measure_metrics(request, configured_otlp_material_bytes(self.limits)?)?;
-        counted.with_otlp_material(material)
+        counts.finish(request_bytes, name_bytes, material)
     }
 
     /// Counts a typed logs request without projecting records.
@@ -919,6 +902,7 @@ impl ScribeIngressPlanner {
         name_bytes: usize,
         projection: &OtlpProjection<'_>,
     ) -> Result<IngestMaterialPlan, ScribeError> {
+        self.validate_otlp_request_bytes(request_bytes)?;
         let mut counts = OtlpCounts::new(self.limits);
         for resource in &request.resource_logs {
             counts.add_resources(1)?;
@@ -948,10 +932,9 @@ impl ScribeIngressPlanner {
                 }
             }
         }
-        let counted = counts.finish(request_bytes, name_bytes)?;
         let material =
             projection.measure_logs(request, configured_otlp_material_bytes(self.limits)?)?;
-        counted.with_otlp_material(material)
+        counts.finish(request_bytes, name_bytes, material)
     }
 }
 
@@ -1444,7 +1427,7 @@ impl OtlpCounts {
         Ok(())
     }
 
-    /// Freezes counters into one conservative fixed-capacity material plan.
+    /// Freezes validated counters and exact projected material into one root plan.
     ///
     /// # Errors
     ///
@@ -1453,34 +1436,20 @@ impl OtlpCounts {
         self,
         request_bytes: usize,
         name_bytes: usize,
+        material: Option<OtlpManagedMaterialPlan>,
     ) -> Result<IngestMaterialPlan, ScribeError> {
-        if request_bytes > self.limits.otlp.request_bytes {
-            return Err(ScribeError::PayloadTooLarge {
-                bytes: request_bytes,
-                limit: self.limits.otlp.request_bytes,
-            });
-        }
-        let current_material_bytes = request_bytes
-            .checked_add(self.value_bytes)
-            .and_then(|value| {
-                managed_projection_bytes(self.records, 36)
-                    .ok()
-                    .and_then(|managed| value.checked_add(managed))
-            })
-            .ok_or(ScribeError::DecodedPayloadTooLarge {
-                bytes: usize::MAX,
-                limit: usize::MAX,
-            })?;
+        let rows = material.as_ref().map_or(0, |value| value.rows);
+        let current_material_bytes = material
+            .as_ref()
+            .map_or(Ok(0), |value| value.admitted_bytes(usize::MAX))?;
+        let persistence_candidate_bytes = material.as_ref().map_or(0, |value| value.arrow_bytes);
+        let source_count = usize::from(material.is_some());
         let mut sources = [SourceMaterialPlan::default(); MAX_SOURCE_PLANS];
-        if self.records != 0 {
+        if source_count != 0 {
             sources[0] = SourceMaterialPlan {
-                rows: self.records,
+                rows,
                 body_bytes: current_material_bytes,
-                buffers: 0,
-                frame_start: 0,
-                body_start: 0,
-                body_end: 0,
-                frame_end: 0,
+                ..SourceMaterialPlan::default()
             };
         }
         IngestMaterialPlan {
@@ -1494,13 +1463,13 @@ impl OtlpCounts {
             native_schema_material_bytes: 0,
             native_metadata_scratch_bytes: 0,
             sources,
-            source_count: usize::from(self.records != 0),
-            rows: self.records,
-            time_partition_count: usize::from(self.records != 0),
+            source_count,
+            rows,
+            time_partition_count: source_count,
             current_material_bytes,
             active_output_bytes: 0,
-            persistence_candidate_bytes: 0,
-            durable_metadata_bytes: usize::from(self.records != 0)
+            persistence_candidate_bytes,
+            durable_metadata_bytes: source_count
                 .checked_mul(crate::scribe::shards::DURABLE_SLICE_LAYOUT_BYTES)
                 .ok_or(ScribeError::DecodedPayloadTooLarge {
                     bytes: usize::MAX,

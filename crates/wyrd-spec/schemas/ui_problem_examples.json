@@ -1,0 +1,47 @@
+{
+  "denied": {
+    "code": "WYRD_PERMISSION_403_DENIED_RBAC",
+    "detail": "Permission denied (RBAC)",
+    "details": {},
+    "remediation": "Request the required role from a workspace admin.",
+    "status": 403,
+    "title": "Permission denied (RBAC)",
+    "type": "https://wyrd.dev/problems/WYRD_PERMISSION_403_DENIED_RBAC"
+  },
+  "expired": {
+    "code": "WYRD_AUTH_401_TOKEN_EXPIRED",
+    "detail": "Token expired",
+    "details": {},
+    "remediation": "Re-authenticate to obtain a fresh token.",
+    "status": 401,
+    "title": "Token expired",
+    "type": "https://wyrd.dev/problems/WYRD_AUTH_401_TOKEN_EXPIRED"
+  },
+  "internal": {
+    "code": "WYRD_SPEC_500_INTERNAL",
+    "detail": "Internal error",
+    "details": {},
+    "remediation": "Retry later or inspect server logs using the request ID.",
+    "status": 500,
+    "title": "Internal error",
+    "type": "https://wyrd.dev/problems/WYRD_SPEC_500_INTERNAL"
+  },
+  "unauthenticated": {
+    "code": "WYRD_AUTH_401_UNAUTHENTICATED",
+    "detail": "Not authenticated",
+    "details": {},
+    "remediation": "Present a valid Wyrd token in the Authorization header.",
+    "status": 401,
+    "title": "Not authenticated",
+    "type": "https://wyrd.dev/problems/WYRD_AUTH_401_UNAUTHENTICATED"
+  },
+  "upstream": {
+    "code": "WYRD_SPEC_502_UPSTREAM_FAILURE",
+    "detail": "Upstream dependency failed",
+    "details": {},
+    "remediation": "Check the upstream dependency health and retry policy.",
+    "status": 502,
+    "title": "Upstream dependency failed",
+    "type": "https://wyrd.dev/problems/WYRD_SPEC_502_UPSTREAM_FAILURE"
+  }
+}

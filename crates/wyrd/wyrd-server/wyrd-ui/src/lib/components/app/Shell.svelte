@@ -16,7 +16,12 @@
     pathname: string;
     children: Snippet;
   } = $props();
-  let navOpen = $state(true);
+  let navOpen = $state(false);
+  let menuButton: HTMLButtonElement;
+  function closeMenu() {
+    navOpen = false;
+    menuButton?.focus();
+  }
   const entries = [
     ['Home', ''],
     ['Cards', '/cards'],
@@ -33,16 +38,20 @@
   );
 </script>
 
+<svelte:window onkeydown={(event) => { if (event.key === 'Escape' && navOpen) closeMenu(); }} />
 <a class="skip" href="#main">Skip to content</a>
 <div class="app-shell">
   <aside>
     <a class="wordmark" href={base}><img src={logo} alt="" width="28" height="28" />bohmian</a>
-    <button class="app-control mobile-menu" type="button" aria-controls="primary-navigation" aria-expanded={navOpen} onclick={() => navOpen = !navOpen}>Navigation</button>
-    <nav id="primary-navigation" aria-label="Primary" class:collapsed={!navOpen}>
+    <button class="app-control mobile-menu" type="button" bind:this={menuButton} aria-controls="menu-disclosure" aria-expanded={navOpen} onclick={() => navOpen = !navOpen}>Menu</button>
+    <div id="menu-disclosure" class="menu-panel" class:collapsed={!navOpen} role="region" aria-label="Menu">
+      <div class="menu-context mobile-menu"><span>Current area: {current}</span><span>{tenant.name}</span><button class="app-control" type="button" onclick={closeMenu}>Close menu</button></div>
+    <nav id="primary-navigation" aria-label="Primary">
       {#each entries as [label, suffix] (label)}
         <a href={base + suffix} aria-current={current === label ? 'page' : undefined}>{label}</a>
       {/each}
     </nav>
+    </div>
   </aside>
   <div class="workspace">
     <header>
@@ -169,6 +178,9 @@
     padding: 24px;
     min-width: 0;
   }
+  .menu-panel {
+    display: contents;
+  }
   .mobile-menu {
     display: none;
   }
@@ -192,9 +204,13 @@
       border-right: 0;
       border-bottom: 2px solid var(--border);
       padding: 14px 18px;
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 12px;
     }
     .wordmark {
-      margin-bottom: 12px;
+      margin-bottom: 0;
     }
     .mobile-menu {
       display: block;
@@ -202,7 +218,28 @@
     nav {
       margin-top: 16px;
     }
-    nav.collapsed {
+    .menu-panel {
+      display: block;
+      width: 100%;
+      padding: 14px;
+      border: 2px solid var(--border);
+      border-radius: var(--r);
+      box-shadow: 3px 3px 0 var(--shadow);
+    }
+    .menu-context {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 10px;
+      font: 11px var(--font-mono);
+    }
+    .menu-context button {
+      margin-left: auto;
+    }
+    aside > button {
+      order: -1;
+    }
+    .menu-panel.collapsed {
       display: none;
     }
     header {

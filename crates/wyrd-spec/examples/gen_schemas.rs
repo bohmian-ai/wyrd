@@ -1,9 +1,11 @@
 //! Generate JSON schema goldens.
 
+use std::error::Error as StdError;
 use std::fs;
 use std::path::Path;
 
 use schemars::schema_for;
+use serde_json::{Map, Value, json, to_string_pretty};
 use wyrd_spec::auth::{
     AbsoluteUrl, CallbackQuery, IssuerUrl, LoginInitResponse, PrincipalKindTag,
     RevokePrincipalRequest, RevokePrincipalResponse, TokenRequest, TokenResponse,
@@ -39,6 +41,7 @@ use wyrd_spec::card::source::{
 use wyrd_spec::card::trigger::{TriggerSchedule, TriggerSource, TriggerSpec};
 use wyrd_spec::card::workflow::WorkflowSpec;
 use wyrd_spec::envelope::{Card, CardKind};
+use wyrd_spec::error::WyrdError;
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::registry::{
     ArtifactInventoryResponse, ArtifactManifestEntry, CardLifecycleStatus, CardLocator,
@@ -79,6 +82,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let golden = Path::new("crates/wyrd-spec/tests/schemas");
     fs::create_dir_all(out)?;
     fs::create_dir_all(golden)?;
+    ProblemExamples { out, golden }.write()?;
 
     write::<Card>(out, golden, "card")?;
     write::<CardKind>(out, golden, "card_kind")?;
@@ -288,4 +292,69 @@ fn write_fixture<T: schemars::JsonSchema>(
     let json = serde_json::to_string_pretty(&schema)?;
     fs::write(dir.join(format!("{name}.schema.json")), format!("{json}\n"))?;
     Ok(())
+}
+
+/// Exports safe BFF examples using the same error projection as the Rust server.
+struct ProblemExamples<'a> {
+    /// Public generated contract directory.
+    out: &'a Path,
+    /// Golden directory checked by the existing codegen lane.
+    golden: &'a Path,
+}
+
+impl ProblemExamples<'_> {
+    /// Write catalog-derived examples without duplicating wire metadata.
+    ///
+    /// # Errors
+    /// Returns serialization or filesystem failures from either output.
+    fn write(&self) -> Result<(), Box<dyn StdError>> {
+        let examples = [
+            (
+                "unauthenticated",
+                WyrdError::Unauthenticated {
+                    message: String::new(),
+                    details: json!({}),
+                },
+            ),
+            (
+                "expired",
+                WyrdError::TokenExpired {
+                    message: String::new(),
+                    details: json!({}),
+                },
+            ),
+            (
+                "denied",
+                WyrdError::PermissionDeniedRbac {
+                    message: String::new(),
+                    details: json!({}),
+                },
+            ),
+            (
+                "internal",
+                WyrdError::Internal {
+                    message: String::new(),
+                    details: json!({}),
+                },
+            ),
+            (
+                "upstream",
+                WyrdError::UpstreamFailure {
+                    message: String::new(),
+                    details: json!({}),
+                },
+            ),
+        ];
+        let mut catalog = Map::new();
+        for (name, error) in examples {
+            let mut value = error.as_problem_json();
+            value["detail"] = Value::from(error.title());
+            catalog.insert(name.to_owned(), value);
+        }
+        let output = to_string_pretty(&catalog)? + "\n";
+        for directory in [self.out, self.golden] {
+            fs::write(directory.join("ui_problem_examples.json"), &output)?;
+        }
+        Ok(())
+    }
 }

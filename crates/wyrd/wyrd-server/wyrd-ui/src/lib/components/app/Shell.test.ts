@@ -36,14 +36,26 @@ test('multiple tenants have searchable CSRF-protected switching and accessible m
     pathname: '/t/acme',
     children
   });
-  await fireEvent.input(view.getByLabelText('Search tenants'), { target: { value: 'research' } });
+  await fireEvent.input(view.getByLabelText('Search tenants'), {
+    target: { value: 'research' }
+  });
   expect(view.queryByRole('button', { name: 'Acme' })).toBeNull();
   const destination = view.getByRole('button', { name: 'Research' });
   expect(destination.closest('form')).toHaveAttribute('action', '/?/switch');
   expect(destination.closest('form')?.querySelector('[name="csrf"]')).toHaveValue('csrf');
-  const menu = view.getByRole('button', { name: 'Navigation' });
-  await fireEvent.click(menu);
-  expect(menu).toHaveAttribute('aria-expanded', 'false');
+  const menu = view.getByRole('button', { name: /^Menu$/ });
   await fireEvent.click(menu);
   expect(menu).toHaveAttribute('aria-expanded', 'true');
+  const disclosure = within(view.getByRole('region', { name: 'Menu' }));
+  expect(disclosure.getAllByRole('link')).toHaveLength(5);
+  expect(disclosure.getByText('Acme')).toBeInTheDocument();
+  expect(disclosure.getByText('Current area: Home')).toBeInTheDocument();
+  await fireEvent.click(disclosure.getByRole('button', { name: 'Close menu' }));
+  expect(menu).toHaveAttribute('aria-expanded', 'false');
+  expect(menu).toHaveFocus();
+  await fireEvent.click(menu);
+  expect(menu).toHaveAttribute('aria-expanded', 'true');
+  await fireEvent.keyDown(window, { key: 'Escape' });
+  expect(menu).toHaveAttribute('aria-expanded', 'false');
+  expect(menu).toHaveFocus();
 });

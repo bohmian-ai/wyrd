@@ -3463,7 +3463,7 @@ mod tests {
     /// fence stays Oracle either way. The signed
     /// `assignment_authority_digest` is minted over the finished assignment,
     /// so a caller that mutates the request afterwards is exactly the tamper
-    /// case protocol v3 must reject.
+    /// case the current peer protocol must reject.
     ///
     /// # Panics
     ///

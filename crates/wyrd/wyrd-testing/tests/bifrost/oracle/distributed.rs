@@ -220,8 +220,9 @@ impl DeadlineJourney {
             let (accepted, _, _) = futures_util::future::select_all(ready).await;
             let accepted = accepted?;
             if cancel {
-                let request_id =
-                    wyrd_spec::request_id::RequestId::parse(&accepted.query_id.as_uuid().to_string())?;
+                let request_id = wyrd_spec::request_id::RequestId::parse(
+                    &accepted.query_id.as_uuid().to_string(),
+                )?;
                 let cancelled = QueryClient::new(&self.reader).cancel(&request_id).await?;
                 assert!(cancelled.cancellation_started);
             }

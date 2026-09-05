@@ -409,7 +409,9 @@ function validateAnchor(change: Change, anchor: Anchor): void {
     subject?.files.some(
       (file) =>
         file.path === anchor.file &&
-        file.lines.some((line) => line.number === anchor.line)
+        file.lines.some(
+          (line) => line.number === anchor.line && line.side === anchor.side
+        )
     )
   )
     return;

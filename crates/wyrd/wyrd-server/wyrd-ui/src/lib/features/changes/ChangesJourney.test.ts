@@ -1,6 +1,7 @@
-// @vitest-environment node
+// @vitest-environment jsdom
 import { spawn, type ChildProcess } from 'node:child_process';
 import { once } from 'node:events';
+import { fixtureChange, summaries } from '$lib/server/changes/fixtures';
 import { beforeAll, afterAll, expect, test } from 'vitest';
 
 let server: ChildProcess;
@@ -335,7 +336,8 @@ test('timeline and read-only subject drilldowns keep exact revisions and anchore
     revision: 'rev_07',
     target: 'subject_api',
     file: 'src/capture/rank.rs',
-    line: 121
+    line: 121,
+    side: 'new'
   };
   expect(
     (
@@ -361,4 +363,105 @@ test('global mock disable withholds Changes without dropping URL filters', async
   expect(html.includes('WYRD_SPEC_502_UPSTREAM_FAILURE')).toBe(true);
   expect(html.includes('value="ranking"')).toBe(true);
   expect(html.includes('Raise checkout ranking cutoff')).toBe(false);
+});
+
+test('Verifier identity stays inspectable without a fabricated Card destination', async () => {
+  const html = await (await get('/t/acme/changes/change_01/verification')).text();
+  expect(html).toContain('checkout-verifier v5');
+  expect(html).not.toContain('/cards/card_verifier_01');
+});
+
+test('seeded ledger draft resumes and saves its own content unchanged', async () => {
+  const path = '/t/acme/changes/change_03';
+  const expected = fixtureChange(summaries[2]);
+  const readForm = async (suffix = '') => {
+    const html = await (await get(path + '?edit=draft' + suffix)).text();
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    const form = doc.querySelector<HTMLFormElement>('form.draft')!;
+    return Object.fromEntries(new FormData(form).entries()) as Record<string, string>;
+  };
+  const before = await readForm();
+  expect(before.intent).toBe(expected.intent);
+  expect(before.impact).toBe(expected.impact);
+  expect(before.owner).toBe(expected.owner);
+  expect(before.teams).toBe(expected.owners);
+  expect(JSON.parse(before.subjects)).toEqual(expected.subjects);
+  expect(JSON.parse(before.claims)).toEqual(
+    expected.claims.map((claim) => ({
+      id: claim.id,
+      title: claim.title,
+      checks: claim.checks.map(({ name, required, mode, billable }) => ({
+        name,
+        required,
+        mode,
+        billable
+      }))
+    }))
+  );
+  expect((await post(path + '?/save', before)).status).toBe(303);
+  expect((await post(path + '?/save', before)).status).toBe(303);
+  const after = await readForm();
+  for (const key of ['title', 'intent', 'impact', 'owner', 'teams'])
+    expect(after[key], key).toBe(before[key]);
+  for (const key of ['subjects', 'claims'])
+    expect(JSON.parse(after[key])).toEqual(JSON.parse(before[key]));
+  expect(after.revision).toBe('rev_08');
+  const historical = await (await get(path + '?revision=rev_07')).text();
+  expect(historical).toContain('acme/ledger');
+  expect(historical).toContain(expected.intent);
+});
+
+test('equal-number old and new diff rows keep distinct validated discussions', async () => {
+  const path = '/t/acme/changes/change_01/subjects/subject_model';
+  const documentAt = async (route: string) =>
+    new DOMParser().parseFromString(await (await get(route)).text(), 'text/html');
+  const initial = await documentAt(path);
+  expect(initial.querySelectorAll('#line-old-1')).toHaveLength(1);
+  expect(initial.querySelectorAll('#line-new-1')).toHaveLength(1);
+  const anchor = {
+    kind: 'source',
+    revision: 'rev_07',
+    target: 'subject_model',
+    file: 'eval/threshold.yaml',
+    line: 1,
+    side: 'old'
+  };
+  for (const side of ['old', 'new']) {
+    const input = {
+      operation: 'comment',
+      revision: 'rev_07',
+      requestKey: 'diff-' + side,
+      body: 'Discussion on ' + side,
+      anchor: JSON.stringify({ ...anchor, side })
+    };
+    expect((await post(path + '?/review', input)).status).toBe(200);
+    expect((await post(path + '?/review', input)).status).toBe(200);
+  }
+  const source = await documentAt(path);
+  const oldLinks = source.querySelectorAll('#line-old-1 a');
+  const newLinks = source.querySelectorAll('#line-new-1 a');
+  expect(oldLinks).toHaveLength(1);
+  expect(newLinks).toHaveLength(1);
+  expect(oldLinks[0].getAttribute('href')).not.toBe(newLinks[0].getAttribute('href'));
+  const review = await documentAt('/t/acme/changes/change_01/review');
+  for (const side of ['old', 'new'])
+    expect(review.querySelector(`a[href$="#line-${side}-1"]`)).not.toBeNull();
+  for (const patch of [
+    { side: undefined },
+    { side: 'invalid' },
+    { line: 999 },
+    { target: 'subject_api' },
+    { file: 'other.yaml' },
+    { revision: 'rev_06' }
+  ]) {
+    const result = await post(path + '?/review', {
+      operation: 'comment',
+      revision: 'rev_07',
+      requestKey: JSON.stringify(patch),
+      body: 'Invalid coordinate',
+      anchor: JSON.stringify({ ...anchor, ...patch })
+    });
+    expect(result.status).toBe(patch.revision ? 409 : 400);
+  }
+  expect((await documentAt(path)).querySelectorAll('.diff-line a')).toHaveLength(2);
 });

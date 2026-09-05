@@ -262,7 +262,7 @@
   }
   .changes .change-header .channels {
     gap: 4px;
-    font-size: 8px;
+    font-size: 8.5px;
   }
   .changes .change-header p {
     line-height: 1.4;
@@ -276,5 +276,79 @@
   }
   .changes .draft .footer {
     padding-bottom: 8px;
+  }
+}
+
+@media (max-width: 600px) {
+  .app-shell:has(.changes) > aside {
+    padding: 4px 14px;
+  }
+  .app-shell:has(.changes) > aside .app-control {
+    padding: 4px 8px;
+  }
+  .app-shell:has(.changes) .wordmark {
+    font-size: 16px;
+  }
+  .app-shell:has(.changes) .wordmark img {
+    width: 22px;
+    height: 22px;
+    flex-basis: 22px;
+  }
+  .app-shell:has(.changes) .workspace > header {
+    min-height: 28px;
+    padding: 3px 14px;
+  }
+  .app-shell:has(.changes) main {
+    padding: 8px 14px;
+  }
+  .changes .review .wy-panel-head {
+    font-size: 8.5px;
+    padding: 5px 7px;
+  }
+  .changes .review .wy-panel-body {
+    padding: 6px 8px;
+  }
+  .changes .review .composer textarea {
+    min-height: 30px;
+    height: 32px;
+    padding: 4px;
+    font-size: 10px;
+  }
+  .changes .review .composer {
+    gap: 3px;
+  }
+  .changes .review .composer .text-action {
+    font-size: 9px;
+  }
+  .changes .review .composer .control {
+    padding: 4px 8px;
+  }
+}
+
+@media (max-width: 600px) {
+  .changes .review.columns {
+    gap: 12px;
+  }
+  .changes .review .wy-panel-head {
+    flex-wrap: nowrap;
+    padding: 3px 7px;
+  }
+  .changes .review .wy-panel-head .t {
+    flex: 1;
+    min-width: 0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .changes .review .wy-panel-body {
+    padding: 4px 8px;
+  }
+  .source-page .compact-next {
+    display: none;
+  }
+}
+@media (max-width: 600px) {
+  .app-shell:has(.changes) {
+    grid-template-rows: auto 1fr;
   }
 }

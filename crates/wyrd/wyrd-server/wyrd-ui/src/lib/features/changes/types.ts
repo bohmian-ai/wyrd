@@ -32,7 +32,8 @@ export type Subject = {
     path: string;
     additions: number;
     deletions: number;
-    lines: { number: number; kind: ' ' | '+' | '-'; text: string }[];
+    /** Context rows use the new side; deletions use old and additions use new. */
+    lines: { number: number; side: 'old' | 'new'; kind: ' ' | '+' | '-'; text: string }[];
   }[];
 };
 export type Check = {
@@ -73,13 +74,15 @@ export type Claim = {
   resolution: 'pending' | 'satisfied' | 'not_satisfied';
   checks: Check[];
 };
-export type Anchor = {
-  kind: 'change' | 'claim' | 'subject' | 'evidence' | 'result' | 'source';
-  revision: string;
-  target: string;
-  file?: string;
-  line?: number;
-};
+export type Anchor = { revision: string; target: string } & (
+  | { kind: 'source'; file: string; line: number; side: 'old' | 'new' }
+  | {
+      kind: 'change' | 'claim' | 'subject' | 'evidence' | 'result';
+      file?: never;
+      line?: never;
+      side?: never;
+    }
+);
 export type Mention = { id: string; name: string; team: string; kind: 'user' | 'team' };
 export type CommentRevision = {
   id: string;

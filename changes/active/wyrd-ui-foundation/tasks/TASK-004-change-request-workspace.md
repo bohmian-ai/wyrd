@@ -2,7 +2,7 @@
 id: TASK-004
 title: Change Request coordination workspace
 kind: implementation
-status: proposed
+status: review
 spec: SPEC-wyrd-ui-foundation
 spec_revision: 6
 requirements: [REQ-005, REQ-006, REQ-007, REQ-008, REQ-060, REQ-061, REQ-062, REQ-063, REQ-064, REQ-065, REQ-081, REQ-082, REQ-092, REQ-095, REQ-099, REQ-100, REQ-101, REQ-127, REQ-128, REQ-132, INV-001, INV-002, INV-008, INV-009, INV-012, INV-013, INV-014, INV-021, INV-022, AC-001, AC-003, AC-004, AC-005, AC-010, AC-011]
@@ -226,3 +226,13 @@ this task's changes; no commit was created.
 and revision history through TASK-004-R1. Narrow visual fidelity and seeded
 draft consistency remain open findings; this task is not approved. The user
 authorized committing the reviewed implementation.
+
+
+## R2–R5 implemented — 2026-09-05
+
+All four user-validated findings have implementation and closure evidence in their
+remediation packets. New HTTP regressions cover seeded-draft preservation,
+side-qualified diff anchors and removal of the fabricated Verifier link. New
+paired browser captures prove the compact narrow Review/Subject regions in both
+themes. Full UI verification passes 111 tests, typing, build and token checks.
+The original review and failed screenshots are preserved for comparison.

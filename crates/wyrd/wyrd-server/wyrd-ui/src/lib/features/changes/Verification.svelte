@@ -6,10 +6,8 @@
   let {
     view,
     csrf,
-    base,
     result
-  }: { view: ChangeView; csrf: string; base: string; result?: ActionResult | null } =
-    $props();
+  }: { view: ChangeView; csrf: string; result?: ActionResult | null } = $props();
   let selected = $state('');
   let change = $derived(view.change);
   let chosen = $derived(
@@ -19,7 +17,7 @@
 <div class="columns verification"><div class="stack">
   <Panel title="Verification state"><div class="row"><Badge tone={change.verification.tone}>{change.verification.label === 'Needs attention' ? 'Not verified' : change.verification.label}</Badge><strong>{change.satisfied} of {change.total} required Claims satisfied</strong></div><p>{change.blockers.map(blocker => blocker.text).join(' · ') || change.nextAction}</p></Panel>
   <Panel title="Claims"><div class="claim-list">{#each change.claims as claim}<section id={claim.id}><div class="row between claim-heading"><span class="mono">{claim.id} · Required</span><h2>{claim.title}</h2><Badge tone={claim.resolution === 'satisfied' ? 'ok' : claim.resolution === 'pending' ? 'warn' : 'danger'}>{claim.resolution.replaceAll('_',' ')}</Badge></div>
-    {#each claim.checks as check}<div class="check" id={`check-${check.id}`}><div><h3>{check.name}</h3><p class="mono"><a href={`/t/${base.split('/')[2]}/cards/card_verifier_01`}>{check.verifier} v{check.version}</a> · {check.required ? 'required' : 'advisory'} · {check.mode === 'manual' ? 'manual' : 'on new evidence'}{check.billable ? ' · billable' : ''}</p></div><div><Badge tone={check.summary.tone}>{check.summary.label}</Badge>{#if check.provenance !== 'current'} <Badge tone={check.provenance === 'stale' ? 'warn' : 'neutral'}>{check.provenance.replaceAll('_',' ')}</Badge>{/if}<p>{check.explanation}</p></div><div class="check-actions">{#if check.eligible && view.capabilities.run}<button class="control" type="button" onclick={() => selected = check.id}>{check.action}</button>{/if}
+    {#each claim.checks as check}<div class="check" id={`check-${check.id}`}><div><h3>{check.name}</h3><p class="mono">{check.verifier} v{check.version} · {check.required ? 'required' : 'advisory'} · {check.mode === 'manual' ? 'manual' : 'on new evidence'}{check.billable ? ' · billable' : ''}</p></div><div><Badge tone={check.summary.tone}>{check.summary.label}</Badge>{#if check.provenance !== 'current'} <Badge tone={check.provenance === 'stale' ? 'warn' : 'neutral'}>{check.provenance.replaceAll('_',' ')}</Badge>{/if}<p>{check.explanation}</p></div><div class="check-actions">{#if check.eligible && view.capabilities.run}<button class="control" type="button" onclick={() => selected = check.id}>{check.action}</button>{/if}
       <details id={`result-${check.id}`}><summary>{check.evidence.some(item => !item.present) ? 'View missing Evidence' : check.execution === 'queued' ? 'View queue position' : check.execution === 'running' ? 'View run' : check.verdict === 'failed' ? 'View findings' : 'View result'} →</summary><div class="inspection"><h3>{check.name}</h3><p>Execution: {check.execution.replaceAll('_',' ')}</p><p>Verdict: {check.verdict ?? 'No verdict — run not completed'}</p><p>Provenance: {check.provenance.replaceAll('_',' ')} · bound to {check.revision}</p><p>{check.explanation}</p><section id={`evidence-${check.id}`}><h3>Evidence inputs</h3>{#each check.evidence as evidence}<div id={evidence.id}><p><strong>{evidence.name}</strong> · {evidence.present ? '✓ Received' : '○ Missing Evidence'}</p><p>{evidence.detail}</p>{#if evidence.digest}<p class="mono">{evidence.digest}</p>{/if}</div>{/each}</section>{#if check.history.length}<h3>Previous attempts</h3>{#each check.history as attempt}<p class="mono">{attempt.revision} · {attempt.execution.replaceAll('_',' ')} · verdict: {attempt.verdict ?? 'none'}</p>{/each}{/if}</div></details>
     </div></div>{/each}
   </section>{/each}</div><p class="muted">Approval and override do not turn unresolved verification into a pass.</p></Panel>

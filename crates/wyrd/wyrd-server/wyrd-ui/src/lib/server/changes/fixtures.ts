@@ -116,14 +116,49 @@ export const subjects: Subject[] = [
         additions: 18,
         deletions: 4,
         lines: [
-          { number: 114, kind: ' ', text: 'fn cutoff(band: RiskBand) -> f32 {' },
-          { number: 115, kind: '-', text: '    RiskBand::High => 0.50,' },
-          { number: 116, kind: '-', text: '    RiskBand::Med => 0.34,' },
-          { number: 117, kind: '+', text: '    let cutoff = policy::cutoff_for(band);' },
-          { number: 118, kind: '+', text: '    RiskBand::High => cutoff.high,' },
-          { number: 119, kind: '+', text: '    RiskBand::Med => cutoff.med,' },
-          { number: 120, kind: ' ', text: '    RiskBand::Low => 0.20,' },
-          { number: 121, kind: ' ', text: '}' }
+          {
+            number: 114,
+            side: 'new' as const,
+            kind: ' ',
+            text: 'fn cutoff(band: RiskBand) -> f32 {'
+          },
+          {
+            number: 115,
+            side: 'old' as const,
+            kind: '-',
+            text: '    RiskBand::High => 0.50,'
+          },
+          {
+            number: 116,
+            side: 'old' as const,
+            kind: '-',
+            text: '    RiskBand::Med => 0.34,'
+          },
+          {
+            number: 117,
+            side: 'new' as const,
+            kind: '+',
+            text: '    let cutoff = policy::cutoff_for(band);'
+          },
+          {
+            number: 118,
+            side: 'new' as const,
+            kind: '+',
+            text: '    RiskBand::High => cutoff.high,'
+          },
+          {
+            number: 119,
+            side: 'new' as const,
+            kind: '+',
+            text: '    RiskBand::Med => cutoff.med,'
+          },
+          {
+            number: 120,
+            side: 'new' as const,
+            kind: ' ',
+            text: '    RiskBand::Low => 0.20,'
+          },
+          { number: 121, side: 'new' as const, kind: ' ', text: '}' }
         ]
       },
       ...[
@@ -139,6 +174,7 @@ export const subjects: Subject[] = [
         lines: [
           {
             number: 1,
+            side: 'new' as const,
             kind: '+' as const,
             text: [
               'mod rank;',
@@ -167,7 +203,14 @@ export const subjects: Subject[] = [
         path: 'src/worker.rs',
         additions: 2,
         deletions: 0,
-        lines: [{ number: 1, kind: '+', text: 'let cutoff = policy::cutoff_for(band);' }]
+        lines: [
+          {
+            number: 1,
+            side: 'new' as const,
+            kind: '+',
+            text: 'let cutoff = policy::cutoff_for(band);'
+          }
+        ]
       }
     ]
   },
@@ -187,8 +230,8 @@ export const subjects: Subject[] = [
         additions: 1,
         deletions: 1,
         lines: [
-          { number: 1, kind: '-', text: 'threshold: 0.50' },
-          { number: 1, kind: '+', text: 'threshold: 0.62' }
+          { number: 1, side: 'old' as const, kind: '-', text: 'threshold: 0.50' },
+          { number: 1, side: 'new' as const, kind: '+', text: 'threshold: 0.62' }
         ]
       }
     ]
@@ -232,7 +275,7 @@ export const newDraft: Draft = {
 };
 export function fixtureChange(summary = summaries[0]): Change {
   const primary = summary.id === 'change_01';
-  return {
+  const change: Change = {
     ...structuredClone(summary),
     title: primary ? 'Raise checkout ranking cutoff for high-risk carts' : summary.title,
     revision: 'rev_07',
@@ -339,7 +382,8 @@ export function fixtureChange(summary = summaries[0]): Change {
               revision: 'rev_07',
               target: 'subject_api',
               file: 'src/capture/rank.rs',
-              line: 118
+              line: 118,
+              side: 'new'
             },
             resolved: true,
             transitions: [
@@ -500,11 +544,28 @@ export function fixtureChange(summary = summaries[0]): Change {
           }
         ]
       : [],
-    priorRevisions: ['rev_06', 'rev_05'],
-    ...(summary.lifecycle === 'draft'
-      ? { draft: { ...structuredClone(newDraft), title: summary.title } }
-      : {})
+    priorRevisions: ['rev_06', 'rev_05']
   };
+  if (change.lifecycle === 'draft')
+    change.draft = {
+      title: change.title,
+      intent: change.intent,
+      impact: change.impact,
+      owner: change.owner,
+      teams: change.owners,
+      subjects: structuredClone(change.subjects),
+      claims: change.claims.map((claim) => ({
+        id: claim.id,
+        title: claim.title,
+        checks: claim.checks.map(({ name, required, mode, billable }) => ({
+          name,
+          required,
+          mode,
+          billable
+        }))
+      }))
+    };
+  return change;
 }
 
 function check(id: string, name: string, patch: Partial<Check> = {}): Check {

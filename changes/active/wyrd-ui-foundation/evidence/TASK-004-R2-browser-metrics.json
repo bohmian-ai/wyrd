@@ -1,0 +1,258 @@
+[
+  {
+    "name": "review",
+    "width": 390,
+    "theme": "light",
+    "overflow": false,
+    "detailsOpen": false,
+    "threads": [
+      {
+        "top": 267.375,
+        "bottom": 441.375
+      },
+      {
+        "top": 451.375,
+        "bottom": 605.375
+      }
+    ],
+    "submission": {
+      "top": 617.375,
+      "bottom": 798.375
+    },
+    "submitButton": {
+      "top": 747.375,
+      "bottom": 776.375
+    },
+    "diffPanel": null,
+    "diff": null,
+    "discussion": null,
+    "threadsPanel": null,
+    "footer": null,
+    "mode": "light"
+  },
+  {
+    "name": "review",
+    "width": 390,
+    "theme": "dark",
+    "overflow": false,
+    "detailsOpen": false,
+    "threads": [
+      {
+        "top": 267.375,
+        "bottom": 441.375
+      },
+      {
+        "top": 451.375,
+        "bottom": 605.375
+      }
+    ],
+    "submission": {
+      "top": 617.375,
+      "bottom": 798.375
+    },
+    "submitButton": {
+      "top": 747.375,
+      "bottom": 776.375
+    },
+    "diffPanel": null,
+    "diff": null,
+    "discussion": null,
+    "threadsPanel": null,
+    "footer": null,
+    "mode": "dark"
+  },
+  {
+    "name": "subjects",
+    "width": 390,
+    "theme": "light",
+    "overflow": false,
+    "detailsOpen": false,
+    "threads": [],
+    "submission": null,
+    "submitButton": null,
+    "diffPanel": {
+      "top": 211.28125,
+      "bottom": 614.21875
+    },
+    "diff": {
+      "top": 253.28125,
+      "bottom": 445.28125
+    },
+    "discussion": {
+      "top": 527.21875,
+      "bottom": 583.21875
+    },
+    "threadsPanel": {
+      "top": 624.21875,
+      "bottom": 693.265625
+    },
+    "footer": {
+      "top": 723.265625,
+      "bottom": 770.265625
+    },
+    "mode": "light"
+  },
+  {
+    "name": "subjects",
+    "width": 390,
+    "theme": "dark",
+    "overflow": false,
+    "detailsOpen": false,
+    "threads": [],
+    "submission": null,
+    "submitButton": null,
+    "diffPanel": {
+      "top": 211.28125,
+      "bottom": 614.21875
+    },
+    "diff": {
+      "top": 253.28125,
+      "bottom": 445.28125
+    },
+    "discussion": {
+      "top": 527.21875,
+      "bottom": 583.21875
+    },
+    "threadsPanel": {
+      "top": 624.21875,
+      "bottom": 693.265625
+    },
+    "footer": {
+      "top": 723.265625,
+      "bottom": 770.265625
+    },
+    "mode": "dark"
+  },
+  {
+    "name": "review",
+    "width": 1440,
+    "theme": "light",
+    "overflow": false,
+    "detailsOpen": true,
+    "threads": [
+      {
+        "top": 413.046875,
+        "bottom": 699.1875
+      },
+      {
+        "top": 715.1875,
+        "bottom": 993.328125
+      },
+      {
+        "top": 1009.328125,
+        "bottom": 1223.46875
+      }
+    ],
+    "submission": {
+      "top": 267.046875,
+      "bottom": 629.828125
+    },
+    "submitButton": {
+      "top": 564.828125,
+      "bottom": 596.828125
+    },
+    "diffPanel": null,
+    "diff": null,
+    "discussion": null,
+    "threadsPanel": null,
+    "footer": null,
+    "mode": "light"
+  },
+  {
+    "name": "review",
+    "width": 1440,
+    "theme": "dark",
+    "overflow": false,
+    "detailsOpen": true,
+    "threads": [
+      {
+        "top": 413.046875,
+        "bottom": 699.1875
+      },
+      {
+        "top": 715.1875,
+        "bottom": 993.328125
+      },
+      {
+        "top": 1009.328125,
+        "bottom": 1223.46875
+      }
+    ],
+    "submission": {
+      "top": 267.046875,
+      "bottom": 629.828125
+    },
+    "submitButton": {
+      "top": 564.828125,
+      "bottom": 596.828125
+    },
+    "diffPanel": null,
+    "diff": null,
+    "discussion": null,
+    "threadsPanel": null,
+    "footer": null,
+    "mode": "dark"
+  },
+  {
+    "name": "subjects",
+    "width": 1440,
+    "theme": "light",
+    "overflow": false,
+    "detailsOpen": true,
+    "threads": [],
+    "submission": null,
+    "submitButton": null,
+    "diffPanel": {
+      "top": 337.046875,
+      "bottom": 854.09375
+    },
+    "diff": {
+      "top": 419.046875,
+      "bottom": 627.046875
+    },
+    "discussion": {
+      "top": 736.09375,
+      "bottom": 808.09375
+    },
+    "threadsPanel": {
+      "top": 605.1875,
+      "bottom": 754.375
+    },
+    "footer": {
+      "top": 922,
+      "bottom": 980
+    },
+    "mode": "light"
+  },
+  {
+    "name": "subjects",
+    "width": 1440,
+    "theme": "dark",
+    "overflow": false,
+    "detailsOpen": true,
+    "threads": [],
+    "submission": null,
+    "submitButton": null,
+    "diffPanel": {
+      "top": 337.046875,
+      "bottom": 854.09375
+    },
+    "diff": {
+      "top": 419.046875,
+      "bottom": 627.046875
+    },
+    "discussion": {
+      "top": 736.09375,
+      "bottom": 808.09375
+    },
+    "threadsPanel": {
+      "top": 605.1875,
+      "bottom": 754.375
+    },
+    "footer": {
+      "top": 922,
+      "bottom": 980
+    },
+    "mode": "dark"
+  }
+]

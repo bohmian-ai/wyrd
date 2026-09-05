@@ -4,6 +4,8 @@ import { svelteTesting } from '@testing-library/svelte/vite';
 import { defineConfig } from 'vitest/config';
 
 export default defineConfig({
+  // Vitest resolves server modules; keep its optimized dependencies out of the browser cache.
+  cacheDir: process.env.VITEST ? 'node_modules/.vite-vitest' : 'node_modules/.vite',
   plugins: [tailwindcss(), sveltekit(), svelteTesting()],
   test: {
     environment: 'jsdom',

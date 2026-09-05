@@ -5,4 +5,4 @@
   let { data, form } = $props();
   let base = $derived(`/t/${data.tenant.key}/changes/${data.change.id}`);
 </script>
-<div class="changes"><ChangeHeader view={data} {base} active="Verification" /><Verification view={data} csrf={data.session.csrf} {base} result={form} /></div>
+<div class="changes"><ChangeHeader view={data} {base} active="Verification" /><Verification view={data} csrf={data.session.csrf} result={form} /></div>

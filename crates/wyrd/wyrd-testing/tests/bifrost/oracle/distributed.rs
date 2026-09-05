@@ -22,6 +22,190 @@ use wyrd_testing::bifrost::{BifrostClusterSpec, WyrdTestCluster};
 
 use crate::support::*;
 
+/// Local and remote accepted followers retain the caller's execution budget.
+///
+/// # Panics
+///
+/// Panics if setup, exact rows, deadline behavior, or resource release fails.
+#[tokio::test]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn accepted_follower_outlives_ticket_expiry_and_honors_query_deadline() {
+    for (spec, query_index) in [
+        (BifrostClusterSpec::one_mixed(), 0),
+        (BifrostClusterSpec::three_mixed(), 2),
+    ] {
+        DeadlineJourney::start(spec, query_index)
+            .await
+            .expect("deadline journey setup")
+            .run()
+            .await
+            .expect("accepted follower preserves execution deadline");
+    }
+}
+
+/// Real cluster and tenant clients for the accepted follower deadline journey.
+struct DeadlineJourney {
+    /// Owns server lifetimes and production resource inspection.
+    cluster: WyrdTestCluster,
+    /// Public caller whose query is held inside its accepted follower.
+    reader: WyrdClient,
+    /// Neighbour sharing the logical table name with different exact rows.
+    neighbour: WyrdClient,
+    /// Qualified logical table shared by both tenants.
+    table: String,
+    /// Query ingress index, also distinguishing the local and remote legs.
+    query_index: usize,
+}
+
+impl DeadlineJourney {
+    /// Registers and flushes real public writes for two isolated tenants.
+    ///
+    /// # Errors
+    ///
+    /// Returns cluster, catalog, public transport, or snapshot refresh failures.
+    async fn start(spec: BifrostClusterSpec, query_index: usize) -> Result<Self, JourneyError> {
+        let cluster = WyrdTestCluster::start_spec(spec).await?;
+        let ingest = cluster.servers().find(|server| server.bifrost_scribe().is_some())
+            .ok_or("missing ingest node")?;
+        let table = unique_table("oracle_deadline");
+        let neighbour_tenant = cluster.add_tenant("deadline-neighbour").await?;
+        for (tenant, id, name) in [
+            (cluster.data_tenant_id(), 7, "deadline-writer"),
+            (neighbour_tenant, 91, "deadline-neighbour-writer"),
+        ] {
+            register_table(ingest, tenant, &table).await?;
+            let writer = client_for_tenant(ingest, tenant, name).await?;
+            ingest_marked(&writer, &format!("vala.bifrost.{table}"), id, name).await?;
+        }
+        ingest.flush_bifrost().await?;
+        cluster.refresh_oracle_snapshots().await?;
+        let ingress = cluster.server(query_index).ok_or("missing query ingress")?;
+        let reader = client(ingress, "deadline-reader").await?;
+        let neighbour = client_for_tenant(ingress, neighbour_tenant, "deadline-neighbour-reader").await?;
+        Ok(Self { cluster, reader, neighbour, table: format!("vala.bifrost.{table}"), query_index })
+    }
+
+    /// Holds the accepted batch beyond its actual ticket expiry, then checks exact rows.
+    ///
+    /// Dropping this future releases the pauses and the cluster's server owners.
+    ///
+    /// # Errors
+    ///
+    /// Returns public query, gate, inspection, shutdown, or diagnostic timeout failures.
+    ///
+    /// # Panics
+    ///
+    /// Panics if execution locality, exact tenant rows, or released resources disagree.
+    async fn run(self) -> Result<(), JourneyError> {
+        let mut pauses = FollowerPauses { workers: Vec::new(), releases: Vec::new() };
+        let mut ready = Vec::new();
+        for server in self.cluster.servers() {
+            if let Some(peer) = server.state().oracle_peer() {
+                let worker = peer.worker();
+                let (accepted, release) = worker.pause_next_batch_for_test()?;
+                pauses.workers.push(worker);
+                pauses.releases.push(release);
+                ready.push(accepted);
+            }
+        }
+        assert!(!ready.is_empty(), "at least one Oracle worker must be armed");
+        let request = BifrostQueryRequest {
+            sql: format!("SELECT id FROM {} ORDER BY id", self.table),
+            visibility: VisibilityMode::PublishedOnly,
+            freshness: FreshnessPolicy::Strict,
+            deadline_ms: Some(30_000),
+        };
+        let query = self.query_ids(&request);
+        let release = async {
+            let (accepted, _, _) = futures_util::future::select_all(ready).await;
+            let accepted = accepted?;
+            let ingress = self.cluster.server(self.query_index).ok_or("missing ingress")?;
+            if self.query_index == 0 {
+                assert_eq!(accepted.worker_node_id, ingress.node_id());
+            } else {
+                assert_ne!(accepted.worker_node_id, ingress.node_id(), "remote leg must execute remotely");
+            }
+            eprintln!("accepted follower: {accepted:?}");
+            let wait_ms = accepted.ticket_expires_at_ms + 50 - chrono::Utc::now().timestamp_millis();
+            if let Ok(wait_ms) = u64::try_from(wait_ms) {
+                tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+            }
+            pauses.release()?;
+            Ok::<_, JourneyError>(())
+        };
+        let (rows, released) = tokio::time::timeout(std::time::Duration::from_secs(35), async {
+            tokio::join!(query, release)
+        }).await?;
+        released?;
+        assert_eq!(rows?, vec![7], "accepted query must return its exact tenant row");
+        assert_eq!(query_ids(&self.neighbour, format!("SELECT id FROM {} ORDER BY id", self.table)).await?, vec![91]);
+        let inspection = self.cluster.oracle_inspection().await?;
+        assert_eq!(inspection.active_queries, 0, "{inspection:?}");
+        assert_eq!(inspection.queued_queries, 0, "{inspection:?}");
+        assert_eq!(inspection.reserved_memory_bytes, 0, "{inspection:?}");
+        assert_eq!(inspection.reserved_spill_bytes, 0, "{inspection:?}");
+        assert_eq!(inspection.peer_pending, 0, "{inspection:?}");
+        assert_eq!(inspection.peer_running, 0, "{inspection:?}");
+        self.cluster.shutdown().await?;
+        Ok(())
+    }
+
+    /// Drains a public query, requiring a successful terminal and exact integer rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns transport, Arrow shape, or missing-terminal failures.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a row is null or the query terminal is not successful.
+    async fn query_ids(&self, request: &BifrostQueryRequest) -> Result<Vec<i64>, JourneyError> {
+        let mut stream = QueryClient::new(&self.reader).query(request).await?;
+        let mut ids = Vec::new();
+        while let Some(batch) = stream.next_batch().await? {
+            let column = batch.column(0).as_any().downcast_ref::<Int64Array>()
+                .ok_or("query id is not Int64")?;
+            assert_eq!(column.null_count(), 0);
+            ids.extend(column.values().iter().copied());
+        }
+        let terminal = stream.terminal().ok_or("query terminal missing")?;
+        assert_eq!(terminal.outcome, QueryTerminalOutcome::Success);
+        assert!(terminal.error.is_none());
+        Ok(ids)
+    }
+}
+
+/// Owns all armed worker pauses so every exit disarms unused gates.
+struct FollowerPauses {
+    /// Actual production workers containing the optional first-batch gate.
+    workers: Vec<Arc<vala_bifrost_redux::oracle::dispatcher::OraclePeerWorker>>,
+    /// Dropping a sender releases its accepted stream without a second timeout.
+    releases: Vec<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl FollowerPauses {
+    /// Disarms unused gates and releases every accepted stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns a worker's poisoned gate-lock failure.
+    fn release(&mut self) -> Result<(), JourneyError> {
+        for worker in &self.workers {
+            worker.clear_batch_pause_for_test()?;
+        }
+        self.releases.clear();
+        Ok(())
+    }
+}
+
+impl Drop for FollowerPauses {
+    fn drop(&mut self) {
+        for worker in &self.workers {
+            let _ = worker.clear_batch_pause_for_test();
+        }
+    }
+}
+
 /// Which physical pruning signal a topology's follower cut can actually move.
 enum PruningExpectation {
     /// One node plans and scans locally: file-level or row-group-level

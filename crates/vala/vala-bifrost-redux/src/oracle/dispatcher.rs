@@ -597,6 +597,32 @@ pub struct OraclePeerWorker {
     physical_follower: Arc<PhysicalPlanFollower<Arc<dyn FollowerSourceResolver>>>,
     /// Test-tier observer attached to the exact production physical path.
     physical_observer: Arc<PhysicalWorkerObserver>,
+    /// One-shot pause beneath the production batch deadline, used by journeys.
+    #[cfg(any(test, feature = "test-support"))]
+    batch_gate: Mutex<Option<FollowerBatchGate>>,
+}
+
+/// Accepted authority observed when the first follower batch is polled.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug)]
+pub struct AcceptedFollower {
+    /// Query whose accepted stream owns this pause.
+    pub query_id: QueryId,
+    /// Executing worker, which may differ from the query ingress.
+    pub worker_node_id: NodeId,
+    /// Worker epoch authenticated by the ticket.
+    pub oracle_fence: FencingToken,
+    /// Last wall-clock instant at which the ticket could be accepted.
+    pub ticket_expires_at_ms: i64,
+}
+
+/// One first-batch notification and its release receiver.
+#[cfg(any(test, feature = "test-support"))]
+struct FollowerBatchGate {
+    /// Reports actual accepted authority from inside the lazy batch stream.
+    ready: tokio::sync::oneshot::Sender<AcceptedFollower>,
+    /// Dropping the sender also releases the pause.
+    release: tokio::sync::oneshot::Receiver<()>,
 }
 
 /// Directly observed native follower activity for one production worker.
@@ -678,6 +704,8 @@ impl OraclePeerWorker {
             oracle_resources,
             physical_follower: Arc::new(follower),
             physical_observer: Arc::new(PhysicalWorkerObserver::default()),
+            #[cfg(any(test, feature = "test-support"))]
+            batch_gate: Mutex::new(None),
         }
     }
 
@@ -725,7 +753,74 @@ impl OraclePeerWorker {
             oracle_resources: self.oracle_resources.clone(),
             physical_follower: Arc::new(self.physical_follower.without_reader_authority_for_test()),
             physical_observer: Arc::new(PhysicalWorkerObserver::default()),
+            batch_gate: Mutex::new(None),
         }
+    }
+
+    /// Arms one first-batch pause without replacing deadline enforcement.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the gate lock is poisoned or a pause is already armed.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn pause_next_batch_for_test(
+        &self,
+    ) -> Result<
+        (
+            tokio::sync::oneshot::Receiver<AcceptedFollower>,
+            tokio::sync::oneshot::Sender<()>,
+        ),
+        DispatchError,
+    > {
+        let mut gate = self.batch_gate.lock().map_err(|_| DispatchError::Terminal)?;
+        if gate.is_some() {
+            return Err(DispatchError::Terminal);
+        }
+        let (ready, accepted) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        *gate = Some(FollowerBatchGate { ready, release: released });
+        Ok((accepted, release))
+    }
+
+    /// Disarms an unused pause so a subsequent query cannot inherit it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the gate lock is poisoned.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn clear_batch_pause_for_test(&self) -> Result<(), DispatchError> {
+        self.batch_gate.lock().map_err(|_| DispatchError::Terminal)?.take();
+        Ok(())
+    }
+
+    /// Wraps only the first batch poll; the frame encoder still owns timeouts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a poisoned gate lock or malformed query identity.
+    #[cfg(any(test, feature = "test-support"))]
+    fn gated_batches_for_test(
+        &self,
+        mut stream: datafusion::physical_plan::SendableRecordBatchStream,
+        claims: &PeerTicketClaims,
+    ) -> Result<datafusion::physical_plan::SendableRecordBatchStream, DispatchError> {
+        let gate = self.batch_gate.lock().map_err(|_| DispatchError::Terminal)?.take();
+        let Some(gate) = gate else { return Ok(stream); };
+        let accepted = AcceptedFollower {
+            query_id: QueryId::new(uuid_from(&claims.query_id)?),
+            worker_node_id: self.worker_node_id,
+            oracle_fence: self.oracle_fence,
+            ticket_expires_at_ms: claims.expires_at_ms,
+        };
+        let schema = stream.schema();
+        let batches = async_stream::stream! {
+            let _ = gate.ready.send(accepted);
+            let _ = gate.release.await;
+            while let Some(batch) = stream.next().await {
+                yield batch;
+            }
+        };
+        Ok(Box::pin(datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(schema, batches)))
     }
 
     /// Captures exact production follower and footer activity for journeys.
@@ -1051,6 +1146,8 @@ impl OraclePeerWorker {
             .oracle_executions
             .fetch_add(1, Ordering::AcqRel);
         let (stream, scan_evidence, reader_protection) = stream.split();
+        #[cfg(any(test, feature = "test-support"))]
+        let stream = self.gated_batches_for_test(stream, &claims)?;
         let output = encode_attempt_frames(
             stream,
             scan_evidence,

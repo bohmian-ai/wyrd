@@ -14,8 +14,9 @@ mod pg_tests {
     use std::time::Duration;
 
     use rmcp::ClientServiceExt as _;
-    use rmcp::model::{CallToolRequest, CallToolRequestParams, ClientRequest};
+    use rmcp::model::{CallToolRequest, CallToolRequestParams, ClientRequest, ErrorCode};
     use rmcp::service::PeerRequestOptions;
+    use rmcp::service::ServiceError;
     use wyrd_client::transport::credential::ResolvedCredential;
     use wyrd_testing::WyrdTestServer;
     use wyrd_testing::bifrost::seed_query_fixture;
@@ -38,10 +39,12 @@ mod pg_tests {
     /// Every way an agent can write an unusable query fails before rows run,
     /// and says enough to repair itself.
     ///
-    /// The cases span all three owning boundaries — the MCP input bounds, the
-    /// server's SQL floor, and Oracle's own planning — because an agent cannot
-    /// tell them apart and should not have to: each returns the same canonical
-    /// Wyrd problem shape with no partial result attached.
+    /// Local argument errors use MCP invalid params; authenticated SQL and
+    /// planning refusals preserve the canonical Wyrd problem with no rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns fixture, transport, or shutdown failures.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires the Postgres-backed Bifrost journey lane"]
     async fn bifrost_query_errors_are_actionable_before_row_execution()
@@ -59,6 +62,76 @@ mod pg_tests {
                 discover(),
             )
             .await?;
+
+        for (case, arguments) in [
+            (
+                "unknown key",
+                serde_json::json!({"sql": "SELECT 1", "path": "analytical"}),
+            ),
+            ("missing sql", serde_json::json!({})),
+            ("wrong type", serde_json::json!({"sql": 1})),
+            ("blank sql", serde_json::json!({"sql": "   "})),
+            (
+                "oversized sql",
+                serde_json::json!({"sql": "a".repeat(65_537)}),
+            ),
+            (
+                "zero deadline",
+                serde_json::json!({"sql": "SELECT 1", "deadline_ms": 0}),
+            ),
+            (
+                "oversized deadline",
+                serde_json::json!({"sql": "SELECT 1", "deadline_ms": 4_294_967_296_u64}),
+            ),
+            (
+                "zero rows",
+                serde_json::json!({"sql": "SELECT 1", "max_rows": 0}),
+            ),
+            (
+                "oversized rows",
+                serde_json::json!({"sql": "SELECT 1", "max_rows": 10_001}),
+            ),
+            (
+                "zero bytes",
+                serde_json::json!({"sql": "SELECT 1", "max_bytes": 0}),
+            ),
+            (
+                "oversized bytes",
+                serde_json::json!({"sql": "SELECT 1", "max_bytes": 16_777_217}),
+            ),
+        ] {
+            let error = client.call_tool(query(arguments)).await.expect_err(case);
+            assert!(
+                matches!(error, ServiceError::McpError(ref error) if error.code == ErrorCode::INVALID_PARAMS),
+                "{case}: {error}"
+            );
+        }
+        for (tool, arguments) in [
+            (
+                "bifrost.list_tables",
+                serde_json::json!({"unexpected": true}),
+            ),
+            (
+                "bifrost.describe_table",
+                serde_json::json!({"namespace": "vala.bifrost"}),
+            ),
+        ] {
+            let error = client
+                .call_tool(
+                    CallToolRequestParams::new(tool).with_arguments(
+                        arguments
+                            .as_object()
+                            .expect("fixture arguments are objects")
+                            .clone(),
+                    ),
+                )
+                .await
+                .expect_err(tool);
+            assert!(
+                matches!(error, ServiceError::McpError(ref error) if error.code == ErrorCode::INVALID_PARAMS),
+                "{tool}: {error}"
+            );
+        }
 
         let cases = [
             (
@@ -90,27 +163,6 @@ mod pg_tests {
                 "unsupported shape",
                 serde_json::json!({"sql": format!("SELECT evil_udf(value) FROM {table}")}),
                 "WYRD_VALA_400_QUERY_INVALID_SQL",
-            ),
-            (
-                "row ceiling above the MCP floor",
-                serde_json::json!({
-                    "sql": format!("SELECT id FROM {table}"),
-                    "max_rows": 10_001,
-                }),
-                "WYRD_SPEC_400_VALIDATION",
-            ),
-            (
-                "byte ceiling above the MCP floor",
-                serde_json::json!({
-                    "sql": format!("SELECT id FROM {table}"),
-                    "max_bytes": 16_777_217_u64,
-                }),
-                "WYRD_SPEC_400_VALIDATION",
-            ),
-            (
-                "blank sql",
-                serde_json::json!({"sql": "   "}),
-                "WYRD_SPEC_400_VALIDATION",
             ),
         ];
         for (case, arguments, code) in cases {

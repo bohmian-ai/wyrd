@@ -12,7 +12,7 @@ use std::sync::Arc;
 use arrow::json::writer::{EncoderOptions, make_encoder};
 use arrow::record_batch::RecordBatch;
 use futures_util::StreamExt as _;
-use rmcp::model::{CallToolResult, Tool, ToolAnnotations};
+use rmcp::model::{CallToolResult, ErrorData, Tool, ToolAnnotations};
 use rmcp::service::{RequestContext, RoleServer};
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
@@ -25,18 +25,18 @@ use wyrd_spec::vala::api::{
 };
 use wyrd_spec::vala::api::{QueryStreamFrame, QueryTerminalFrame, QueryTerminalOutcome};
 
+use super::WyrdMcpHandler;
 use crate::bifrost::service;
 use crate::components::auth::Caller;
-use crate::state::AppState;
 
 /// Wire name of the compact authorized table listing.
-pub const LIST_TABLES: &str = "bifrost.list_tables";
+pub(super) const LIST_TABLES: &str = "bifrost.list_tables";
 
 /// Wire name of the full schema and physical-layout description.
-pub const DESCRIBE_TABLE: &str = "bifrost.describe_table";
+pub(super) const DESCRIBE_TABLE: &str = "bifrost.describe_table";
 
 /// Wire name of the bounded read-only query.
-pub const QUERY: &str = "bifrost.query";
+pub(super) const QUERY: &str = "bifrost.query";
 
 /// Largest SQL text `bifrost.query` accepts, in UTF-8 bytes.
 ///
@@ -73,7 +73,7 @@ const STRUCTURED_OVERHEAD_BYTES: usize = 11 + 8 + 2 + 12 + 1;
 /// Order is part of the contract an agent reads: discovery, then description,
 /// then the query those two exist to make writable.
 #[must_use]
-pub fn descriptors() -> Vec<Tool> {
+pub(super) fn descriptors() -> Vec<Tool> {
     vec![list_tables_tool(), describe_table_tool(), query_tool()]
 }
 
@@ -205,26 +205,6 @@ struct DescribeTableArguments {
     name: String,
 }
 
-/// List the caller's authorized tables as compact entries.
-///
-/// The projection is deliberately narrower than the catalog's own entry: a
-/// listing exists to let an agent choose a table, and uid, fingerprint, and
-/// timestamps are all things `bifrost.describe_table` answers precisely.
-///
-/// # Errors
-///
-/// Propagates the catalog service's authorization, audit, role-availability,
-/// and lookup errors unchanged.
-pub(crate) async fn list_tables(
-    state: &AppState,
-    caller: Caller,
-) -> Result<CallToolResult, WyrdError> {
-    let tables = service::list_tables(state, caller).await?;
-    Ok(CallToolResult::structured(serde_json::json!({
-        "tables": tables.iter().map(compact_entry).collect::<Vec<_>>(),
-    })))
-}
-
 /// Project one catalog entry onto the three fields a listing carries.
 fn compact_entry(entry: &BifrostTableEntry) -> JsonValue {
     serde_json::json!({
@@ -234,48 +214,22 @@ fn compact_entry(entry: &BifrostTableEntry) -> JsonValue {
     })
 }
 
-/// Describe one authorized table's schema and physical layout.
-///
-/// The catalog's description already carries every field, its metadata, the
-/// partition granularity, the ordered sort keys, and the Bloom columns, so the
-/// adapter serializes it whole rather than reassembling a second view of it.
-///
-/// # Errors
-///
-/// Returns [`WyrdError::Validation`] when the arguments do not match the input
-/// schema, propagates the catalog service's authorization, audit, namespace,
-/// and not-found errors, and returns [`WyrdError::Internal`] if the
-/// description cannot be serialized.
-pub(crate) async fn describe_table(
-    state: &AppState,
-    caller: Caller,
-    arguments: Option<serde_json::Map<String, JsonValue>>,
-) -> Result<CallToolResult, WyrdError> {
-    let arguments: DescribeTableArguments = parse_arguments(DESCRIBE_TABLE, arguments)?;
-    let description =
-        service::describe_table(state, caller, arguments.namespace, arguments.name).await?;
-    Ok(CallToolResult::structured(
-        serde_json::to_value(&description).map_err(|error| WyrdError::Internal {
-            message: format!("{DESCRIBE_TABLE} could not serialize its description: {error}"),
-            details: serde_json::json!({ "tool": DESCRIBE_TABLE }),
-        })?,
-    ))
-}
-
 /// Deserialize one tool's closed arguments, defaulting an absent object.
 ///
 /// # Errors
 ///
-/// Returns [`WyrdError::Validation`] naming the tool when the arguments carry
+/// Returns MCP invalid params naming the tool when the arguments carry
 /// an unknown key, a wrong type, or a missing required field.
 fn parse_arguments<T: serde::de::DeserializeOwned>(
     tool: &'static str,
     arguments: Option<serde_json::Map<String, JsonValue>>,
-) -> Result<T, WyrdError> {
+) -> Result<T, ErrorData> {
     let value = JsonValue::Object(arguments.unwrap_or_default());
-    serde_json::from_value(value).map_err(|error| WyrdError::Validation {
-        message: format!("invalid {tool} arguments: {error}"),
-        details: serde_json::json!({ "tool": tool }),
+    serde_json::from_value(value).map_err(|error| {
+        ErrorData::invalid_params(
+            format!("invalid {tool} arguments: {error}"),
+            Some(serde_json::json!({ "tool": tool })),
+        )
     })
 }
 
@@ -332,12 +286,14 @@ impl QueryArguments {
     ///
     /// # Errors
     ///
-    /// Returns [`WyrdError::Validation`] when the SQL is blank or oversized,
+    /// Returns MCP invalid params when the SQL is blank or oversized,
     /// the deadline is zero, or either ceiling is zero or above its maximum.
-    fn validate(&self) -> Result<(), WyrdError> {
-        let invalid = |reason: &str, details: JsonValue| WyrdError::Validation {
-            message: format!("invalid {QUERY} arguments: {reason}"),
-            details,
+    fn validate(&self) -> Result<(), ErrorData> {
+        let invalid = |reason: &str, details: JsonValue| {
+            ErrorData::invalid_params(
+                format!("invalid {QUERY} arguments: {reason}"),
+                Some(details),
+            )
         };
         if self.sql.trim().is_empty() {
             return Err(invalid("sql must not be blank", serde_json::json!({})));
@@ -380,70 +336,135 @@ impl QueryArguments {
     }
 }
 
-/// Run one bounded read-only query and return its complete result.
-///
-/// Everything that decides whether the query may run, what it may read, and how
-/// it ends belongs to [`query::service::stream_query`] and the Oracle stream it
-/// returns. This function owns exactly the MCP-shaped remainder: the closed
-/// input, the lower response budget, the final serialization, and returning the
-/// value only after the stream has settled.
-///
-/// # Errors
-///
-/// Returns [`WyrdError::Validation`] when the arguments do not match the closed
-/// input schema or exceed an MCP bound, propagates the query service's
-/// authorization, audit, SQL, planning, admission, and execution errors, and
-/// returns [`ValaError::QueryResultTooLarge`] when the complete result would
-/// exceed the caller's row or byte ceiling.
-///
-/// [`ValaError::QueryResultTooLarge`]: wyrd_spec::vala::BifrostError::QueryResultTooLarge
-pub(crate) async fn query(
-    state: &AppState,
-    caller: Caller,
-    arguments: Option<serde_json::Map<String, JsonValue>>,
-    context: &RequestContext<RoleServer>,
-) -> Result<CallToolResult, WyrdError> {
-    let arguments: QueryArguments = parse_arguments(QUERY, arguments)?;
-    arguments.validate()?;
-    let stream =
-        crate::query::service::stream_query(state.clone(), caller, arguments.to_request()).await?;
-    #[cfg(feature = "test-support")]
-    let stall = claim_schema_stall(state, &stream);
-    let collector = ResultCollector {
-        max_rows: usize::try_from(arguments.max_rows).unwrap_or(usize::MAX),
-        max_bytes: arguments.max_bytes,
-        bytes: STRUCTURED_OVERHEAD_BYTES,
-        #[cfg(feature = "test-support")]
-        stall,
-    };
-    Ok(CallToolResult::structured(
-        collector.collect(stream, &context.ct).await?,
-    ))
-}
-
-/// Claim the deterministic post-schema hold a cancellation journey armed.
-///
-/// The hold is the only way a journey can cancel a query that is genuinely
-/// mid-flight: a fixture table answers faster than a cancellation notification
-/// can cross the wire, so without it the race the collector must win would
-/// never actually be run. It exists exclusively in `test-support` builds and
-/// binds Oracle's own resource probe so the journey can assert release against
-/// the same query identity.
-#[cfg(feature = "test-support")]
-fn claim_schema_stall(
-    state: &AppState,
-    stream: &OracleQueryStream,
-) -> Option<Arc<crate::state::QueryStreamStall>> {
-    let controller = state.query_stream_fault.as_ref()?;
-    if !matches!(
-        controller.claim(),
-        Some(crate::state::QueryStreamFault::StallAfterSchema)
-    ) {
-        return None;
+impl WyrdMcpHandler {
+    /// List authorized tables using the catalog service and compact their entries.
+    ///
+    /// # Errors
+    ///
+    /// Returns MCP invalid params for any supplied key. Catalog authorization,
+    /// audit, and availability failures become canonical structured tool errors.
+    pub(super) async fn list_tables(
+        &self,
+        caller: Caller,
+        arguments: Option<serde_json::Map<String, JsonValue>>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if arguments
+            .as_ref()
+            .is_some_and(|arguments| !arguments.is_empty())
+        {
+            return Err(ErrorData::invalid_params(
+                "bifrost.list_tables accepts no arguments; omit them or send an empty object.",
+                None,
+            ));
+        }
+        let result = service::list_tables(&self.state, caller)
+            .await
+            .map(|tables| {
+                CallToolResult::structured(serde_json::json!({
+                    "tables": tables.iter().map(compact_entry).collect::<Vec<_>>(),
+                }))
+            });
+        Ok(
+            result
+                .unwrap_or_else(|error| CallToolResult::structured_error(error.as_problem_json())),
+        )
     }
-    let stall = controller.claim_stall()?;
-    stall.bind_resource_probe(stream.resource_probe_for_test());
-    Some(stall)
+
+    /// Describe an authorized table using the catalog's complete schema and layout.
+    ///
+    /// # Errors
+    ///
+    /// Returns MCP invalid params for malformed arguments. Catalog and encoding
+    /// failures become canonical structured tool errors without a partial result.
+    pub(super) async fn describe_table(
+        &self,
+        caller: Caller,
+        arguments: Option<serde_json::Map<String, JsonValue>>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let arguments: DescribeTableArguments = parse_arguments(DESCRIBE_TABLE, arguments)?;
+        let result = async {
+            let description =
+                service::describe_table(&self.state, caller, arguments.namespace, arguments.name)
+                    .await?;
+            let value =
+                serde_json::to_value(&description).map_err(|error| WyrdError::Internal {
+                    message: format!(
+                        "{DESCRIBE_TABLE} could not serialize its description: {error}"
+                    ),
+                    details: serde_json::json!({"tool": DESCRIBE_TABLE}),
+                })?;
+            Ok(CallToolResult::structured(value))
+        }
+        .await;
+        Ok(result.unwrap_or_else(|error: WyrdError| {
+            CallToolResult::structured_error(error.as_problem_json())
+        }))
+    }
+
+    /// Run a bounded query through the authenticated service and collect its result.
+    ///
+    /// Protocol cancellation awaits Oracle stream cancellation before returning;
+    /// Oracle owns authorization, execution, audit, and resource settlement.
+    ///
+    /// # Errors
+    ///
+    /// Returns MCP invalid params for malformed or out-of-range arguments.
+    /// Service, stream, and result-ceiling failures become canonical structured
+    /// tool errors with no partial rows.
+    pub(super) async fn query(
+        &self,
+        caller: Caller,
+        arguments: Option<serde_json::Map<String, JsonValue>>,
+        context: &RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let arguments: QueryArguments = parse_arguments(QUERY, arguments)?;
+        arguments.validate()?;
+        let result = async {
+            let stream = crate::query::service::stream_query(
+                self.state.clone(),
+                caller,
+                arguments.to_request(),
+            )
+            .await?;
+            let collector = ResultCollector {
+                max_rows: usize::try_from(arguments.max_rows).unwrap_or(usize::MAX),
+                max_bytes: arguments.max_bytes,
+                bytes: STRUCTURED_OVERHEAD_BYTES,
+                #[cfg(feature = "test-support")]
+                stall: self.claim_schema_stall(&stream),
+            };
+            collector
+                .collect(stream, &context.ct)
+                .await
+                .map(CallToolResult::structured)
+        }
+        .await;
+        Ok(
+            result
+                .unwrap_or_else(|error| CallToolResult::structured_error(error.as_problem_json())),
+        )
+    }
+
+    /// Bind the armed test-only schema hold to this stream's resource probe.
+    ///
+    /// The cancellation journey waits for this hold before cancelling, so fast
+    /// fixture execution cannot make cancellation evidence vacuous.
+    #[cfg(feature = "test-support")]
+    fn claim_schema_stall(
+        &self,
+        stream: &OracleQueryStream,
+    ) -> Option<Arc<crate::state::QueryStreamStall>> {
+        let controller = self.state.query_stream_fault.as_ref()?;
+        if !matches!(
+            controller.claim(),
+            Some(crate::state::QueryStreamFault::StallAfterSchema)
+        ) {
+            return None;
+        }
+        let stall = controller.claim_stall()?;
+        stall.bind_resource_probe(stream.resource_probe_for_test());
+        Some(stall)
+    }
 }
 
 /// Collects one Oracle stream into the single value `bifrost.query` returns.

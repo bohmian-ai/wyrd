@@ -343,3 +343,10 @@ contract rather than consuming its existing validators.
 - GREEN: both focused tests pass. Direct and Context/Diagnostic-wrapped planning/schema/unsupported errors receive the fixed describe-table/SELECT repair action; the general mapper and Internal mapping stay unchanged.
 - Exact unit command correction: `mise exec -- cargo nextest run --locked -p vala-bifrost-redux --features test-support,bench-support --lib -E 'test(=oracle::tests::datafusion_query_rejections_are_safe_and_actionable)'`. The featureless command cannot compile existing analytical tests using feature-gated `runtime_inspection`; use the canonical repository test union.
 - The task's exact Postgres-wrapped MCP journey command ran unchanged for RED and GREEN. `mise run fmt` passed.
+
+### Scenario 2 — protocol input errors and handler ownership
+
+- RED: the exact named MCP journey received a structured tool result for an unknown query key instead of `ServiceError::McpError(INVALID_PARAMS)`.
+- GREEN: the same exact Postgres-wrapped command passes all local invalid-input cases, including nonempty list arguments and missing describe name, and preserves application-level SQL/catalog errors and Scenario 1 repair hints.
+- List, describe, query, and the test-only schema-stall claim are inherent methods on `WyrdMcpHandler`; `mcp::bifrost` is private. The existing tracker remains held across each complete await.
+- `mise run fmt` passed. No public contract or dependency changed.

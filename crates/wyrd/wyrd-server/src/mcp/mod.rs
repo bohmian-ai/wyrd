@@ -8,19 +8,16 @@
 //! of the work, and translating public [`WyrdError`] values into
 //! protocol-correct MCP errors.
 //!
-//! The production tool catalog is empty in this predecessor: the three Bifrost
-//! tools arrive with the successor task. The only capability that can be
-//! registered today is the test-support context probe, which exists so a real
-//! MCP client journey can observe the bound context and cancellation without a
-//! production tool to lean on.
+//! The production catalog exposes three read-only Bifrost tools for table
+//! discovery, schema/layout description, and bounded terminal-safe queries.
+//! A test-support context probe is available only through explicit fixture opt-in.
 
 use std::borrow::Cow;
 use std::sync::Arc;
 
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, CallToolResult, ErrorCode, ErrorData,
-    InitializeResult, ListToolsResult, PaginatedRequestParams, ProtocolVersion, ServerCapabilities,
-    ServerInfo, Tool,
+    CallToolRequestParams, CallToolResponse, ErrorCode, ErrorData, InitializeResult,
+    ListToolsResult, PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::service::RequestContext;
 use rmcp::transport::streamable_http_server::session::never::NeverSessionManager;
@@ -32,7 +29,7 @@ use wyrd_spec::request_id::RequestId;
 use crate::components::auth::{AuthenticatedPrincipal, Caller};
 use crate::state::AppState;
 
-pub mod bifrost;
+mod bifrost;
 #[cfg(feature = "test-support")]
 pub mod probe;
 
@@ -187,15 +184,15 @@ impl ServerHandler for WyrdMcpHandler {
         let outcome = match request.name.as_ref() {
             bifrost::LIST_TABLES => {
                 let caller = Self::caller(&context).map_err(wyrd_error_to_mcp)?;
-                bifrost::list_tables(&self.state, caller).await
+                self.list_tables(caller, request.arguments).await
             }
             bifrost::DESCRIBE_TABLE => {
                 let caller = Self::caller(&context).map_err(wyrd_error_to_mcp)?;
-                bifrost::describe_table(&self.state, caller, request.arguments).await
+                self.describe_table(caller, request.arguments).await
             }
             bifrost::QUERY => {
                 let caller = Self::caller(&context).map_err(wyrd_error_to_mcp)?;
-                bifrost::query(&self.state, caller, request.arguments, &context).await
+                self.query(caller, request.arguments, &context).await
             }
             unknown => {
                 return Err(ErrorData::new(
@@ -205,9 +202,7 @@ impl ServerHandler for WyrdMcpHandler {
                 ));
             }
         };
-        Ok(CallToolResponse::Complete(outcome.unwrap_or_else(
-            |error| CallToolResult::structured_error(error.as_problem_json()),
-        )))
+        outcome.map(CallToolResponse::Complete)
     }
 }
 

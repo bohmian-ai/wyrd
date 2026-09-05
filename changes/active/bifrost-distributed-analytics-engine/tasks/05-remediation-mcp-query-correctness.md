@@ -414,3 +414,36 @@ measured input and initialize a test limit struct directly; focused proof was
 rerun. The earlier 8 unrelated family failures and tenant/unwrap failures remain
 recorded above, not silently treated as passes. No check, ignored-test policy,
 public error contract, or generated schema was weakened or changed.
+
+### Parent aggregate completion and scope disposition
+
+`mise run test:bifrost` was also run for the original Task 05 packet, rather
+than omitted in favor of its remediation's narrower lanes. It completed with
+7/10 lanes passing. Positive evidence: Python units, TypeScript units (13),
+Bifrost integration (965), SQL integration (130), server integration (43),
+TypeScript journeys (6), and the SQL Forge scale qualification. Within the
+Rust journey aggregate, SDK (9), Forge (1), Oracle (23), server, and MCP (6)
+capabilities pass.
+
+Failures remain explicit:
+
+- Rust unit lane: the same six pre-existing Forge/Scribe harness failures
+  recorded in the family run (70 pass / 6 fail).
+- Rust journey lane: native Scribe fixtures (1 pass / 18 fail), including strict
+  Fused visibility unavailable, outdated plaintext-peer expectations, and
+  native contention/qualification failures; the separate OTLP capability
+  binary selects no tests. The actual OTLP-to-MCP journey added here passes.
+- Python journeys: 15 pass / 2 fail. One expects `shutdown()` to repeat the RBAC
+  error already correctly returned by `flush()`; the other asserts positive
+  active memory for its small HTTP cancellation fixture (observed zero).
+
+These failures are outside the Task 05 write paths: the Scribe journeys use
+native Arrow `BifrostGrpcTransport::insert_batch`, whose planner and admission
+behavior are unchanged; the Fused tail-fence and test peer setup are unchanged.
+The Python SDK, native write authorization/lifecycle, HTTP cancellation fixture,
+and their tests have no diff from Task 05's base. Oracle's only planning change
+maps typed input failures and cannot produce `QueryVisibilityUnavailable`.
+Scribe's new projection owner does no IO or mutation for native ingress, and
+configured boot-envelope arithmetic is unchanged. No failing test was ignored,
+removed, relaxed, or represented as green. These are retained broader-change
+concerns, not closure findings against this bounded MCP remediation.

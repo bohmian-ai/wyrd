@@ -18,7 +18,7 @@ use wyrd_spec::vala::api::{
     VisibilityMode,
 };
 use wyrd_spec::vala::error::BifrostError;
-use wyrd_testing::bifrost::{BifrostClusterSpec, WyrdTestCluster};
+use wyrd_testing::bifrost::{BifrostClusterSpec, OracleFollowerPauses, WyrdTestCluster};
 
 use crate::support::*;
 
@@ -106,7 +106,7 @@ impl DeadlineJourney {
     ///
     /// Panics if execution locality, exact tenant rows, or released resources disagree.
     async fn run(self) -> Result<(), JourneyError> {
-        let (mut pauses, ready) = FollowerPauses::arm(&self.cluster)?;
+        let (mut pauses, ready) = OracleFollowerPauses::arm(&self.cluster)?;
         assert!(
             !ready.is_empty(),
             "at least one Oracle worker must be armed"
@@ -209,7 +209,7 @@ impl DeadlineJourney {
     ///
     /// Panics if the query returns rows, succeeds, or reports the wrong terminal cause.
     async fn fail_held(&self, cancel: bool) -> Result<(), JourneyError> {
-        let (mut pauses, ready) = FollowerPauses::arm(&self.cluster)?;
+        let (mut pauses, ready) = OracleFollowerPauses::arm(&self.cluster)?;
         let request = BifrostQueryRequest {
             sql: format!("SELECT id FROM {} ORDER BY id", self.table),
             visibility: VisibilityMode::PublishedOnly,
@@ -307,72 +307,6 @@ impl DeadlineJourney {
             terminal.outcome,
             terminal.error.as_ref().map(|error| error.code),
         ))
-    }
-}
-
-/// Owns all armed worker pauses so every exit disarms unused gates.
-struct FollowerPauses {
-    /// Actual production workers containing the optional first-batch gate.
-    workers: Vec<Arc<vala_bifrost_redux::oracle::dispatcher::OraclePeerWorker>>,
-    /// Dropping a sender releases its accepted stream without a second timeout.
-    releases: Vec<tokio::sync::oneshot::Sender<()>>,
-}
-
-impl FollowerPauses {
-    /// Arms each real worker once and returns the first-batch notifications.
-    ///
-    /// # Errors
-    ///
-    /// Returns a worker gate error, disarming any earlier successful arms.
-    fn arm(
-        cluster: &WyrdTestCluster,
-    ) -> Result<
-        (
-            Self,
-            Vec<
-                tokio::sync::oneshot::Receiver<
-                    vala_bifrost_redux::oracle::dispatcher::AcceptedFollower,
-                >,
-            >,
-        ),
-        JourneyError,
-    > {
-        let mut pauses = Self {
-            workers: Vec::new(),
-            releases: Vec::new(),
-        };
-        let mut ready = Vec::new();
-        for server in cluster.servers() {
-            if let Some(peer) = server.state().oracle_peer() {
-                let worker = peer.worker();
-                let (accepted, release) = worker.pause_next_batch_for_test()?;
-                pauses.workers.push(worker);
-                pauses.releases.push(release);
-                ready.push(accepted);
-            }
-        }
-        Ok((pauses, ready))
-    }
-
-    /// Disarms unused gates and releases every accepted stream.
-    ///
-    /// # Errors
-    ///
-    /// Returns a worker's poisoned gate-lock failure.
-    fn release(&mut self) -> Result<(), JourneyError> {
-        for worker in &self.workers {
-            worker.clear_batch_pause_for_test()?;
-        }
-        self.releases.clear();
-        Ok(())
-    }
-}
-
-impl Drop for FollowerPauses {
-    fn drop(&mut self) {
-        for worker in &self.workers {
-            let _ = worker.clear_batch_pause_for_test();
-        }
     }
 }
 

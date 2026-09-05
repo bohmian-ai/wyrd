@@ -21,7 +21,9 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 use uuid::Uuid;
-use vala_bifrost_redux::catalog::{BifrostCatalog, TableRef};
+use vala_bifrost_redux::catalog::{
+    BIFROST_CATALOG_NAME, BifrostCatalog, TableRef, TenantTableBinding,
+};
 use vala_bifrost_redux::cluster::{ClusterRegistry, RoleTiming};
 use vala_bifrost_redux::forge::{
     ForgeClock, ForgeClockControl, ForgeConfig, ForgeSchedulerTrigger, ForgeWorker,
@@ -38,6 +40,8 @@ use vala_bifrost_redux::resources::{
 use vala_bifrost_redux::scribe::ScribeImpl;
 use vala_bifrost_redux::scribe::admission::AdmissionConfig;
 use vala_sdk::BifrostGrpcTransport;
+use vala_sql::queries::oracle_reader_authority::OracleTableProtections;
+use vala_sql::row_types::oracle_reader_authority::{ProtectionRecord, TableAuthorityIdentity};
 use wyrd_auth::exchange_api_key::{ExchangeApiKey, TokenExchangeSettings};
 use wyrd_auth::issue_api_key::WyrdApiKey;
 use wyrd_auth::permission_resolver::SqlPermissionResolver;
@@ -73,7 +77,7 @@ use wyrd_server::state::{
 };
 use wyrd_server::{AppState, WyrdServer, WyrdServerConfig, build_router};
 use wyrd_spec::DataTenantId;
-use wyrd_spec::vala::api::NodeId;
+use wyrd_spec::vala::api::{FencingToken, NodeId};
 use wyrd_telemetry::TelemetryGuard;
 
 use crate::bifrost::ForgeObjectStoreControl;
@@ -2551,6 +2555,46 @@ impl WyrdTestServer {
             .tenant_conn_for(tenant_id)
             .await
             .map_err(sql)
+    }
+
+    /// Reads one accepted Oracle epoch's validated durable table protection.
+    ///
+    /// Resolves the registered table UID under tenant RLS and ends the read
+    /// transaction before returning, so inspection holds no maintenance lock.
+    ///
+    /// # Errors
+    /// Returns a harness SQL error for missing or invalid identity, a malformed
+    /// frontier, an unrepresentable fence, or a failed read transaction.
+    pub async fn oracle_table_protection_for_test(
+        &self,
+        binding: &TenantTableBinding,
+        node: NodeId,
+        fence: FencingToken,
+    ) -> Result<Option<ProtectionRecord>, WyrdTestServerError> {
+        let mut conn = self.tenant_conn_for(binding.tenant).await?;
+        let stored: Vec<u8> =
+            sqlx::query_scalar("SELECT table_uid FROM vala.bifrost_tables WHERE fqn = $1")
+                .bind(binding.table_ref.fqn())
+                .fetch_one(&mut **conn.transaction())
+                .await
+                .map_err(sql)?;
+        let identity = TableAuthorityIdentity {
+            tenant: binding.tenant,
+            table_uid: <[u8; 16]>::try_from(stored.as_slice()).map_err(sql)?,
+            catalog_name: BIFROST_CATALOG_NAME.to_owned(),
+            namespace_name: binding.table_ref.namespace.as_str().to_owned(),
+            table_name: binding.table_ref.name.clone(),
+        };
+        let record = OracleTableProtections::new(&mut conn)
+            .read(
+                &identity,
+                node.as_uuid(),
+                i64::try_from(fence).map_err(sql)?,
+            )
+            .await
+            .map_err(sql)?;
+        conn.commit().await.map_err(sql)?;
+        Ok(record)
     }
     /// Return the durable Scribe WAL root this fixture composed the server with.
     ///

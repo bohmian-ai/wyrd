@@ -17,13 +17,16 @@ use vala_bifrost_redux::resources::{
     FORGE_MEMORY_FLOOR_BYTES, ROLE_MEMORY_FLOOR_BYTES, ResourceSource, SystemResourceSnapshot,
 };
 use vala_bifrost_redux::scribe::geometry::DEFAULT_STAGING_TARGET_FILE_SIZE_BYTES;
-use vala_sql::row_types::forge_tasks::ForgeTaskStrategy;
+use vala_sdk::BifrostGrpcTransport;
+use vala_sql::row_types::forge_tasks::{ForgeTaskStrategy, evidence_from_json};
 use wyrd_client::WyrdClient;
 use wyrd_server::config::BifrostRuntimeRole;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::NodeId;
 use wyrd_testing::WyrdTestServer;
-use wyrd_testing::bifrost::{BifrostClusterSpec, TestOracleResources, WyrdTestCluster};
+use wyrd_testing::bifrost::{
+    BifrostClusterSpec, OracleFollowerPauses, TestOracleResources, WyrdTestCluster,
+};
 
 use crate::public_support::{
     JourneyTable, ManagedRow, append_values, canonical_order, read_managed_rows, register_table,
@@ -53,6 +56,8 @@ struct CloseoutJourney {
     scribe_node: NodeId,
     /// Stable identity of the independent query process.
     oracle_node: NodeId,
+    /// Stable identity of the dedicated maintenance worker.
+    worker_node: NodeId,
 }
 
 impl CloseoutJourney {
@@ -61,10 +66,23 @@ impl CloseoutJourney {
     /// # Panics
     /// Panics if the production topology cannot start or lacks its observer.
     async fn start() -> Self {
+        Self::start_with_config(ForgeConfig {
+            small_file_threshold_bytes: 768 * 1024 * 1024,
+            ..ForgeConfig::default()
+        })
+        .await
+    }
+
+    /// Starts the same role topology with the journey's maintenance policy.
+    ///
+    /// # Panics
+    /// Panics if the real role graph cannot start or its observer is absent.
+    async fn start_with_config(config: ForgeConfig) -> Self {
         let mut spec = BifrostClusterSpec::dedicated_forge_workers();
         let coordinator_node = spec.nodes[3].node_id;
         let scribe_node = spec.nodes[0].node_id;
         let oracle_node = spec.nodes[2].node_id;
+        let worker_node = spec.nodes[1].node_id;
         spec.nodes[3].roles = spec.nodes[0].roles.clone();
         spec.nodes[0].roles = [BifrostRuntimeRole::Scribe].into_iter().collect();
         spec.nodes[2].roles = [BifrostRuntimeRole::Oracle].into_iter().collect();
@@ -84,13 +102,7 @@ impl CloseoutJourney {
             }),
         });
         let cluster = WyrdTestCluster::start_spec_with_forge_config_and_completion_observer(
-            spec,
-            ForgeConfig {
-                // Admit production hot files through the existing small-file policy.
-                small_file_threshold_bytes: 768 * 1024 * 1024,
-                ..ForgeConfig::default()
-            },
-            true,
+            spec, config, true,
         )
         .await
         .expect("separate production roles start");
@@ -108,7 +120,148 @@ impl CloseoutJourney {
             coordinator_node,
             scribe_node,
             oracle_node,
+            worker_node,
         }
+    }
+
+    /// Advances only the retained deterministic maintenance clocks.
+    ///
+    /// # Panics
+    /// Panics if the requested test time is unrepresentable.
+    fn advance_maintenance(&self, duration: chrono::Duration) {
+        for server in self.cluster.servers() {
+            server
+                .forge_clock()
+                .advance(duration)
+                .expect("maintenance time advances");
+        }
+    }
+
+    /// Drives real passes until one compacted file owns this small test table.
+    ///
+    /// # Panics
+    /// Panics if promotion/rewrite fails or cannot settle the fixed-hour data.
+    async fn compact_small_table(
+        &self,
+        binding: &TenantTableBinding,
+    ) -> (i64, BTreeMap<String, DataFile>) {
+        let mut previous = None;
+        for _ in 0..12 {
+            self.scheduler_pass().await;
+            self.drain_tasks().await;
+            let current = self.live_files(binding).await;
+            if current.1.len() == 1
+                && previous == Some(current.0)
+                && current.1.keys().all(|path| path.contains("/data/forge/"))
+            {
+                return current;
+            }
+            previous = Some(current.0);
+        }
+        panic!("small fixed-hour table did not converge through real maintenance");
+    }
+
+    /// Requires a named object to be physically absent, rejecting other IO errors.
+    ///
+    /// # Panics
+    /// Panics on a storage error other than absence.
+    async fn object_missing(&self, path: &str) -> bool {
+        match self.cluster.storage_operator().stat(path).await {
+            Ok(_) => false,
+            Err(error) if error.kind() == opendal::ErrorKind::NotFound => true,
+            Err(error) => panic!("object inspection failed: {error}"),
+        }
+    }
+
+    /// Observes an exact production expired-cleanup delete with protection held.
+    ///
+    /// The post-delete pause permits inspection of its still-prepared durable
+    /// claim before settlement; no SQL transaction spans the storage effect.
+    ///
+    /// # Panics
+    /// Panics if deletion stalls, has the wrong owner/route, loses a protected
+    /// object, or lacks its audited terminal settlement.
+    async fn collect_exact(
+        &self,
+        binding: &TenantTableBinding,
+        path: &str,
+        protected: &BTreeMap<String, DataFile>,
+    ) {
+        let worker = self
+            .cluster
+            .server_by_node(self.worker_node)
+            .expect("worker node");
+        let control = worker
+            .forge_object_store_control_for_test()
+            .expect("real storage control");
+        control.pause_after_delete_for_path(path);
+        let drive = async {
+            for _ in 0..12 {
+                self.scheduler_pass().await;
+                self.drain_tasks().await;
+                if self.object_missing(path).await {
+                    return;
+                }
+            }
+            panic!("production cleanup did not delete {path}");
+        };
+        let inspect = async {
+            tokio::time::timeout(PASS_BOUND, control.wait_for_completed_delete())
+                .await
+                .expect("named object is actually deleted");
+            assert!(self.object_missing(path).await);
+            self.assert_objects(protected).await;
+            let mut conn = self
+                .coordinator()
+                .tenant_conn_for(binding.tenant)
+                .await
+                .expect("tenant inspection");
+            let rows: Vec<(Uuid, Uuid, serde_json::Value)> = sqlx::query_as(
+                "SELECT t.task_id, t.claimed_by, t.evidence FROM vala.forge_tasks t \
+                 JOIN vala.forge_tasks s ON s.task_id=(t.plan->'parameters'->>'source_task_id')::uuid \
+                 WHERE t.strategy='expired_cleanup' AND t.state='prepared' \
+                 AND s.strategy='snapshot_expiry' AND s.state='succeeded'",
+            ).fetch_all(&mut **conn.transaction()).await.expect("prepared cleanup claim");
+            conn.commit().await.expect("inspection releases SQL");
+            let matching: Vec<_> = rows
+                .into_iter()
+                .filter_map(|(task, owner, raw)| {
+                    let evidence = evidence_from_json(raw).expect("validated cleanup evidence");
+                    let index = usize::try_from(evidence.prepared_candidate_index?)
+                        .expect("candidate index");
+                    (evidence.cleanup_candidates[index].path.as_str() == path)
+                        .then_some((task, owner))
+                })
+                .collect();
+            assert_eq!(
+                matching.len(),
+                1,
+                "exact expired-cleanup candidate owns the delete"
+            );
+            assert_eq!(matching[0].1, self.worker_node.as_uuid());
+            control.release_completed_delete();
+            matching[0].0
+        };
+        let ((), task) = tokio::join!(drive, inspect);
+        let mut conn = self
+            .coordinator()
+            .tenant_conn_for(binding.tenant)
+            .await
+            .expect("tenant audit");
+        let deleted: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM vala.audit_outbox \
+             WHERE resource=$1 AND operation='forge.expired_cleanup.candidate_deleted'",
+        )
+        .bind(format!("forge-task:{task}"))
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .expect("audited physical deletion");
+        conn.commit().await.expect("audit inspection releases SQL");
+        assert!(deleted > 0);
+        eprintln!(
+            "expired cleanup task={task}, worker={}, physically deleted={path}",
+            self.worker_node.as_uuid()
+        );
     }
 
     /// Registers the payload schema through the retained server catalog harness.
@@ -440,32 +593,44 @@ impl GeometryWorkload {
             let values: Vec<i64> = (first
                 ..first + i64::try_from(ROWS_PER_REQUEST).expect("bounded request"))
                 .collect();
-            let batch = self.batch(&values);
-            let mut ipc = Vec::new();
-            {
-                let mut writer =
-                    arrow::ipc::writer::StreamWriter::try_new(&mut ipc, batch.schema().as_ref())
-                        .expect("IPC writer");
-                writer.write(&batch).expect("IPC batch");
-                writer.finish().expect("IPC terminal");
-            }
-            let batch_id = Uuid::now_v7();
-            transport
-                .insert_batch(table, batch_id.into_bytes(), ipc)
-                .await
-                .expect("public append acknowledged");
-            self.expected
-                .extend(
-                    values
-                        .into_iter()
-                        .enumerate()
-                        .map(|(ordinal, value)| ManagedRow {
-                            batch_id,
-                            row_ordinal: i32::try_from(ordinal).expect("bounded ordinal"),
-                            value,
-                        }),
-                );
+            self.append_batch(&transport, table, &values).await;
         }
+    }
+
+    /// Appends exact values with the workload's fixed event-time partition.
+    ///
+    /// # Panics
+    /// Panics on malformed Arrow data or a refused public append.
+    async fn append_batch(
+        &mut self,
+        transport: &BifrostGrpcTransport,
+        table: &str,
+        values: &[i64],
+    ) {
+        let batch = self.batch(values);
+        let mut ipc = Vec::new();
+        {
+            let mut writer =
+                arrow::ipc::writer::StreamWriter::try_new(&mut ipc, batch.schema().as_ref())
+                    .expect("IPC writer");
+            writer.write(&batch).expect("IPC batch");
+            writer.finish().expect("IPC terminal");
+        }
+        let batch_id = Uuid::now_v7();
+        transport
+            .insert_batch(table, batch_id.into_bytes(), ipc)
+            .await
+            .expect("public append acknowledged");
+        self.expected.extend(
+            values
+                .iter()
+                .enumerate()
+                .map(|(ordinal, value)| ManagedRow {
+                    batch_id,
+                    row_ordinal: i32::try_from(ordinal).expect("bounded ordinal"),
+                    value: *value,
+                }),
+        );
     }
 
     /// Builds the next bounded batch without changing production object geometry.
@@ -707,4 +872,283 @@ async fn compaction_geometry_exact_rows_and_non_destructive_second_pass() {
     journey.assert_objects(&inputs).await;
     journey.assert_rewrite_evidence(tenant, rewrites).await;
     journey.cluster.shutdown().await.expect("all roles drain");
+}
+
+/// Owns two tenants and the real old cut held across destructive maintenance.
+struct ReaderCleanupJourney {
+    /// Independent serving and maintenance nodes.
+    roles: CloseoutJourney,
+    /// Fixed-hour data whose successive snapshots the reader protects.
+    table: JourneyTable,
+    /// Same public name in a different tenant.
+    neighbour_table: JourneyTable,
+    /// Authenticated public query client on the dedicated Oracle node.
+    reader: WyrdClient,
+    /// Authenticated neighbor query client on that same public endpoint.
+    neighbour_reader: WyrdClient,
+    /// Public ingest transport retained across successive appends.
+    transport: BifrostGrpcTransport,
+    /// Fixed partition, deterministic payload and exact acknowledged identities.
+    workload: GeometryWorkload,
+    /// Neighbor identities that must remain unchanged throughout cleanup.
+    neighbour_expected: Vec<ManagedRow>,
+    /// Snapshot selected before the paused query starts.
+    old_snapshot: i64,
+    /// Exact data files the paused query must retain.
+    old_files: BTreeMap<String, DataFile>,
+    /// Earlier replaced data object eligible for deletion while the query lives.
+    earlier_object: String,
+}
+
+impl ReaderCleanupJourney {
+    /// Writes two real hot files, then publishes and compacts the reader's cut.
+    ///
+    /// # Panics
+    /// Panics if public setup, promotion, or compaction fails.
+    async fn start() -> Self {
+        let mut roles = CloseoutJourney::start_with_config(ForgeConfig {
+            snapshot_expiry_enabled: true,
+            ..ForgeConfig::default()
+        })
+        .await;
+        let tenant = roles.cluster.data_tenant_id();
+        let neighbour = roles
+            .cluster
+            .add_tenant(&unique_table("reader_neighbour"))
+            .await
+            .expect("neighbor tenant");
+        let table = roles
+            .register_payload_table(tenant, unique_table("retained_reader"))
+            .await;
+        let neighbour_table = register_table(roles.scribe(), neighbour, &table.name).await;
+        let writer = tenant_client(roles.scribe(), tenant).await;
+        let reader = tenant_client(roles.oracle(), tenant).await;
+        let neighbour_writer = tenant_client(roles.scribe(), neighbour).await;
+        let neighbour_reader = tenant_client(roles.oracle(), neighbour).await;
+        let transport = BifrostGrpcTransport::connect(&writer)
+            .await
+            .expect("public ingest");
+        let neighbour_expected = canonical_order(
+            append_values(
+                &neighbour_writer,
+                &table.qualified,
+                Uuid::now_v7(),
+                &[9001, 9002],
+            )
+            .await,
+        );
+        let mut workload = GeometryWorkload::new();
+        for values in [&[1, 2][..], &[3, 4]] {
+            workload
+                .append_batch(&transport, &table.qualified, values)
+                .await;
+            roles
+                .scribe()
+                .flush_bifrost()
+                .await
+                .expect("acknowledged inputs flush");
+        }
+        roles
+            .cluster
+            .restart_node(roles.coordinator_node)
+            .await
+            .expect("coordinator starts");
+        roles.advance_maintenance(chrono::Duration::hours(2));
+        roles.scheduler_pass().await;
+        roles.drain_tasks().await;
+        let (_, earlier_files) = roles.live_files(&table.binding).await;
+        assert!(earlier_files.len() >= 2, "two real promoted inputs");
+        let earlier_object = earlier_files.keys().next().expect("earlier object").clone();
+        let (old_snapshot, old_files) = roles.compact_small_table(&table.binding).await;
+        assert!(!old_files.contains_key(&earlier_object));
+        roles.assert_objects(&earlier_files).await;
+        assert_eq!(
+            read_managed_rows(&reader, &table.qualified).await,
+            canonical_order(workload.expected.clone())
+        );
+        Self {
+            roles,
+            table,
+            neighbour_table,
+            reader,
+            neighbour_reader,
+            transport,
+            workload,
+            neighbour_expected,
+            old_snapshot,
+            old_files,
+            earlier_object,
+        }
+    }
+
+    /// Waits for every Oracle epoch to narrow its durable frontier after terminal.
+    ///
+    /// # Panics
+    /// Panics if an epoch retains the completed old query or inspection fails.
+    async fn wait_for_reader_release(&self) {
+        tokio::time::timeout(PASS_BOUND, async {
+            loop {
+                let mut retained = false;
+                for server in self.roles.cluster.servers() {
+                    if let Some(oracle) = server.state().bifrost.oracle() {
+                        let authority = oracle.engine().reader_authority();
+                        let record = server
+                            .oracle_table_protection_for_test(
+                                &self.table.binding,
+                                server.node_id(),
+                                u64::try_from(authority.fencing_token())
+                                    .expect("positive Oracle fence"),
+                            )
+                            .await
+                            .expect("durable frontier inspection");
+                        retained |= record.is_some_and(|record| {
+                            record
+                                .frontier
+                                .members
+                                .iter()
+                                .any(|member| member.ancestry_path.contains(&self.old_snapshot))
+                        });
+                    }
+                }
+                if !retained {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("terminal query releases durable protection");
+    }
+
+    /// Holds a public reader while earlier objects are deleted, then releases it.
+    ///
+    /// # Panics
+    /// Panics if the query was not protected, cleanup touches its inputs, or its
+    /// terminal rows change after another process publishes and expires snapshots.
+    async fn protect_during_cleanup(&mut self) {
+        let expected = canonical_order(self.workload.expected.clone());
+        let (mut pauses, ready) =
+            OracleFollowerPauses::arm(&self.roles.cluster).expect("arm actual followers");
+        assert!(!ready.is_empty());
+        let query = read_managed_rows(&self.reader, &self.table.qualified);
+        let maintenance = async {
+            let (accepted, _, _) =
+                tokio::time::timeout(PASS_BOUND, futures_util::future::select_all(ready))
+                    .await
+                    .expect("lazy query reaches its first-batch gate");
+            let accepted = accepted.expect("accepted follower authority");
+            assert_ne!(accepted.worker_node_id, self.roles.worker_node);
+            let record = self
+                .roles
+                .oracle()
+                .oracle_table_protection_for_test(
+                    &self.table.binding,
+                    accepted.worker_node_id,
+                    accepted.oracle_fence,
+                )
+                .await
+                .expect("protection read")
+                .expect("durable protection before first batch");
+            assert!(
+                record
+                    .frontier
+                    .members
+                    .iter()
+                    .any(|member| member.protected_snapshot_id == self.old_snapshot)
+            );
+            eprintln!(
+                "protected old snapshot={}, accepted={accepted:?}",
+                self.old_snapshot
+            );
+            self.workload
+                .append_batch(&self.transport, &self.table.qualified, &[5, 6])
+                .await;
+            self.roles
+                .scribe()
+                .flush_bifrost()
+                .await
+                .expect("new rows flush");
+            let (current, _) = self.roles.compact_small_table(&self.table.binding).await;
+            assert_ne!(current, self.old_snapshot);
+            self.roles.advance_maintenance(chrono::Duration::days(2));
+            self.roles
+                .collect_exact(&self.table.binding, &self.earlier_object, &self.old_files)
+                .await;
+            let metadata = self
+                .roles
+                .coordinator()
+                .bifrost_catalog()
+                .iceberg_catalog()
+                .load_table(&self.table.binding.table_ident())
+                .await
+                .expect("retained snapshot inspection");
+            assert!(
+                metadata
+                    .metadata()
+                    .snapshot_by_id(self.old_snapshot)
+                    .is_some()
+            );
+            pauses.release().expect("release the lazy reader");
+        };
+        let (actual, ()) = tokio::join!(query, maintenance);
+        assert_eq!(
+            actual, expected,
+            "old reader returns exactly its protected cut"
+        );
+        self.wait_for_reader_release().await;
+    }
+
+    /// Moves the rewrite head onward and observes exact old-object deletion.
+    ///
+    /// # Panics
+    /// Panics if released inputs cannot be collected, current or neighbor rows
+    /// change, or production roles fail to drain.
+    async fn finish(mut self) {
+        self.workload
+            .append_batch(&self.transport, &self.table.qualified, &[7, 8])
+            .await;
+        self.roles
+            .scribe()
+            .flush_bifrost()
+            .await
+            .expect("later rows flush");
+        let (_, current) = self.roles.compact_small_table(&self.table.binding).await;
+        self.roles.advance_maintenance(chrono::Duration::days(2));
+        let old_path = self.old_files.keys().next().expect("old compacted object");
+        self.roles
+            .collect_exact(&self.table.binding, old_path, &current)
+            .await;
+        for path in self.old_files.keys() {
+            assert!(
+                self.roles.object_missing(path).await,
+                "released old object is deleted"
+            );
+        }
+        assert_eq!(
+            read_managed_rows(&self.reader, &self.table.qualified).await,
+            canonical_order(self.workload.expected)
+        );
+        assert_eq!(
+            read_managed_rows(&self.neighbour_reader, &self.neighbour_table.qualified).await,
+            self.neighbour_expected
+        );
+        self.roles.assert_objects(&current).await;
+        self.roles
+            .cluster
+            .shutdown()
+            .await
+            .expect("all production roles drain");
+    }
+}
+
+/// An old public reader survives real cross-pod expiration and physical cleanup.
+///
+/// # Panics
+/// Panics when durable protection, exact deletion ownership, or tenant rows fail.
+#[tokio::test]
+#[ignore = "requires Postgres and independent Oracle/Forge roles"]
+async fn lazy_old_reader_survives_cross_pod_expiration_and_physical_cleanup() {
+    let mut journey = ReaderCleanupJourney::start().await;
+    journey.protect_during_cleanup().await;
+    journey.finish().await;
 }

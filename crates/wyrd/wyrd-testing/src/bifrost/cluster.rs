@@ -14,7 +14,8 @@ use vala_bifrost_redux::catalog::BifrostCatalog;
 use vala_bifrost_redux::cluster::RoleTiming;
 use vala_bifrost_redux::forge::{ForgeConfig, ForgeWorkerCompletionObserver};
 use vala_bifrost_redux::oracle::dispatcher::{
-    OraclePeerCredentials, OraclePeerTls, TonicOraclePeerTransport,
+    AcceptedFollower, DispatchError, OraclePeerCredentials, OraclePeerTls, OraclePeerWorker,
+    TonicOraclePeerTransport,
 };
 use vala_bifrost_redux::resources::SystemResourceSnapshot;
 use vala_bifrost_redux::scribe::admission::AdmissionConfig;
@@ -36,6 +37,63 @@ use crate::server::{
     OracleRuntimeInspection, TestOraclePeerTls, WyrdTestServer, WyrdTestServerBuilder,
     WyrdTestServerError, provision_oracle_peer_credentials, reserve_loopback_addr, test_catalog,
 };
+
+/// Owns all armed worker pauses so every exit disarms unused gates.
+pub struct OracleFollowerPauses {
+    /// Actual production workers containing the optional first-batch gate.
+    workers: Vec<Arc<OraclePeerWorker>>,
+    /// Dropping a sender releases its accepted stream without a second timeout.
+    releases: Vec<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl OracleFollowerPauses {
+    /// Arms each real worker once and returns the first-batch notifications.
+    ///
+    /// # Errors
+    ///
+    /// Returns a worker gate error, disarming any earlier successful arms.
+    pub fn arm(
+        cluster: &WyrdTestCluster,
+    ) -> Result<(Self, Vec<tokio::sync::oneshot::Receiver<AcceptedFollower>>), DispatchError> {
+        let mut pauses = Self {
+            workers: Vec::new(),
+            releases: Vec::new(),
+        };
+        let mut ready = Vec::new();
+        for server in cluster.servers() {
+            if let Some(peer) = server.state().oracle_peer() {
+                let worker = peer.worker();
+                let (accepted, release) = worker.pause_next_batch_for_test()?;
+                pauses.workers.push(worker);
+                pauses.releases.push(release);
+                ready.push(accepted);
+            }
+        }
+        Ok((pauses, ready))
+    }
+
+    /// Disarms unused gates and releases every accepted stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns a worker's poisoned gate-lock failure.
+    pub fn release(&mut self) -> Result<(), DispatchError> {
+        for worker in &self.workers {
+            worker.clear_batch_pause_for_test()?;
+        }
+        self.releases.clear();
+        Ok(())
+    }
+}
+
+impl Drop for OracleFollowerPauses {
+    /// Disarms unused gates; dropping release senders resumes accepted streams.
+    fn drop(&mut self) {
+        for worker in &self.workers {
+            let _ = worker.clear_batch_pause_for_test();
+        }
+    }
+}
 
 /// Supported role topology for a Bifrost cluster journey.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

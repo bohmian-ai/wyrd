@@ -752,14 +752,10 @@ impl Catalog for CommitUncertaintyCatalog {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use std::time::Duration;
 
-    use opendal::Operator;
-
     use super::{
-        AtomicBool, ForgeObjectStore, ForgeObjectStoreControl, Ordering, PausedCatalogCallDropAck,
-        wait_for_paused_catalog_call_drop,
+        AtomicBool, Ordering, PausedCatalogCallDropAck, wait_for_paused_catalog_call_drop,
     };
 
     /// Dropping an armed paused-call guard publishes an acknowledgement even before waiting starts.
@@ -788,49 +784,6 @@ mod tests {
 
         assert!(!dropped.load(Ordering::Acquire));
     }
-
-    /// The post-PUT control pauses one armed call while counting every successful notification.
-    #[tokio::test]
-    async fn output_put_control_is_one_shot_and_records_path() {
-        let operator = Operator::new(opendal::services::Memory::default())
-            .expect("memory operator builder")
-            .finish();
-        let control = ForgeObjectStoreControl::new(Arc::new(operator));
-        control.pause_after_next_output_put();
-        let paused = tokio::spawn({
-            let control = Arc::clone(&control);
-            async move {
-                control
-                    .after_output_put("table/data/forge/first.parquet")
-                    .await;
-            }
-        });
-        tokio::time::timeout(Duration::from_secs(1), control.wait_for_output_put())
-            .await
-            .expect("armed post-PUT notification must become observable");
-        assert_eq!(
-            control.last_output_path().as_deref(),
-            Some("table/data/forge/first.parquet")
-        );
-        assert_eq!(control.output_put_calls(), 1);
-        control.release_output_put();
-        tokio::time::timeout(Duration::from_secs(1), paused)
-            .await
-            .expect("released post-PUT task completion bound")
-            .expect("released post-PUT task");
-
-        tokio::time::timeout(
-            Duration::from_secs(1),
-            control.after_output_put("table/data/forge/second.parquet"),
-        )
-        .await
-        .expect("unarmed notification must return immediately");
-        assert_eq!(control.output_put_calls(), 2);
-        assert_eq!(
-            control.last_output_path().as_deref(),
-            Some("table/data/forge/first.parquet")
-        );
-    }
 }
 
 /// Scoped OpenDAL controls for deterministic list/delete interleavings.
@@ -842,30 +795,12 @@ mod tests {
 pub struct ForgeObjectStoreControl {
     /// Real production-shaped operator used for every delegated operation.
     inner: Arc<Operator>,
-    /// One-shot arm flag consumed by the next successful output notification.
-    pause_next_output_put: AtomicBool,
-    /// Durable-in-process signal that the armed notification reached its pause.
-    output_put_reached: AtomicBool,
-    /// Wakes tasks waiting for the armed successful output notification.
-    output_put_ready: tokio::sync::Notify,
-    /// Releases the armed notification after the test schedules its interleaving.
-    output_put_release: tokio::sync::Notify,
-    /// Counts every successful output PUT notification, armed or unarmed.
-    output_put_calls: AtomicUsize,
-    /// Zero-based output ordinal observed since the selected-output fault was armed.
-    output_put_ordinal: AtomicUsize,
-    /// Zero-based output ordinal selected for the next one-shot failure.
-    fail_output_put_ordinal: AtomicUsize,
-    /// Whether the selected-output fault remains armed.
-    fail_output_put_armed: AtomicBool,
     /// Counts every wrapped object-store call made after fixture construction.
     object_io_calls: AtomicUsize,
     /// Arms one injected failure before the next delegated read.
     fail_next_read: AtomicBool,
     /// Counts delegated reads reached since the read fault was armed.
     read_calls: AtomicUsize,
-    /// Retains the exact path observed by the most recent armed notification.
-    last_output_path: Mutex<Option<String>>,
     /// One-shot arm flag for the next delegated object listing.
     pause_next_list: AtomicBool,
     /// Signals that the armed listing has returned from the real operator.
@@ -939,18 +874,9 @@ impl ForgeObjectStoreControl {
     pub fn new(inner: Arc<Operator>) -> Arc<Self> {
         Arc::new(Self {
             inner,
-            pause_next_output_put: AtomicBool::new(false),
-            output_put_reached: AtomicBool::new(false),
-            output_put_ready: tokio::sync::Notify::new(),
-            output_put_release: tokio::sync::Notify::new(),
-            output_put_calls: AtomicUsize::new(0),
-            output_put_ordinal: AtomicUsize::new(0),
-            fail_output_put_ordinal: AtomicUsize::new(0),
-            fail_output_put_armed: AtomicBool::new(false),
             object_io_calls: AtomicUsize::new(0),
             fail_next_read: AtomicBool::new(false),
             read_calls: AtomicUsize::new(0),
-            last_output_path: Mutex::new(None),
             pause_next_list: AtomicBool::new(false),
             list_returned: AtomicBool::new(false),
             list_ready: tokio::sync::Notify::new(),
@@ -970,59 +896,10 @@ impl ForgeObjectStoreControl {
         })
     }
 
-    /// Pause the next successful rewrite output after its real PUT completes.
-    pub fn pause_after_next_output_put(&self) {
-        self.output_put_reached.store(false, Ordering::Release);
-        *self
-            .last_output_path
-            .lock()
-            .expect("Forge output-path observation lock must not be poisoned") = None;
-        self.pause_next_output_put.store(true, Ordering::Release);
-    }
-
-    /// Wait until the armed output has crossed the successful real PUT boundary.
-    pub async fn wait_for_output_put(&self) {
-        while !self.output_put_reached.load(Ordering::Acquire) {
-            self.output_put_ready.notified().await;
-        }
-    }
-
-    /// Resume the post-PUT notification without changing output ownership.
-    pub fn release_output_put(&self) {
-        self.output_put_release.notify_one();
-    }
-
-    /// Return the number of successful rewrite PUT notifications observed.
-    #[must_use]
-    pub fn output_put_calls(&self) -> usize {
-        self.output_put_calls.load(Ordering::Acquire)
-    }
-
-    /// Fail one zero-based output ordinal in the next production Forge attempt.
-    ///
-    /// The fault is consumed before the selected object upload begins, so the
-    /// attempt cannot transfer an incomplete multi-output evidence set into a
-    /// Prepared operation or catalog replacement.
-    pub fn fail_output_put_at_ordinal_for_test(&self, ordinal: usize) {
-        self.output_put_ordinal.store(0, Ordering::Release);
-        self.fail_output_put_ordinal
-            .store(ordinal, Ordering::Release);
-        self.fail_output_put_armed.store(true, Ordering::Release);
-    }
-
     /// Return the number of wrapped object-store operations observed.
     #[must_use]
     pub fn object_io_calls(&self) -> usize {
         self.object_io_calls.load(Ordering::Acquire)
-    }
-
-    /// Return the exact path captured by the most recent armed notification.
-    #[must_use]
-    pub fn last_output_path(&self) -> Option<String> {
-        self.last_output_path
-            .lock()
-            .expect("Forge output-path observation lock must not be poisoned")
-            .clone()
     }
 
     /// Pause one list after the real object-store response is available.
@@ -1116,49 +993,6 @@ impl ForgeObjectStoreControl {
 
 #[async_trait]
 impl ForgeObjectStore for ForgeObjectStoreControl {
-    /// Reject the selected output ordinal before its real upload begins.
-    ///
-    /// # Errors
-    ///
-    /// Returns one injected object-store error when the armed ordinal reaches
-    /// the production upload boundary.
-    async fn before_output_put(&self, path: &str) -> opendal::Result<()> {
-        let observed = self.output_put_ordinal.fetch_add(1, Ordering::AcqRel);
-        if observed == self.fail_output_put_ordinal.load(Ordering::Acquire)
-            && self
-                .fail_output_put_armed
-                .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-        {
-            return Err(ObjectStoreError::new(
-                ObjectStoreErrorKind::Unexpected,
-                "test-injected Forge output verification failure",
-            )
-            .with_context("path", path));
-        }
-        Ok(())
-    }
-
-    /// Observe a durable output and optionally pause the one armed call.
-    ///
-    /// The real write has already completed through the production staging
-    /// operator. This infallible notification only records and synchronizes;
-    /// it never performs a write or changes output ownership.
-    async fn after_output_put(&self, path: &str) {
-        self.output_put_calls.fetch_add(1, Ordering::AcqRel);
-        if !self.pause_next_output_put.swap(false, Ordering::AcqRel) {
-            return;
-        }
-        *self
-            .last_output_path
-            .lock()
-            .expect("Forge output-path observation lock must not be poisoned") =
-            Some(path.to_owned());
-        self.output_put_reached.store(true, Ordering::Release);
-        self.output_put_ready.notify_waiters();
-        self.output_put_release.notified().await;
-    }
-
     /// Read exactly the requested byte range through OpenDAL's native reader.
     ///
     /// Forge uses bounded reads for Parquet metadata and row-group admission;

@@ -788,10 +788,13 @@ async fn tenant_audits(
 /// an object store call is unbounded and a transaction held across it would
 /// pin a connection and block every competing authority for its duration.
 ///
+/// The advisory probe is scoped to this batch's own operation key because
+/// `pg_locks` reports the whole cluster and other tests share this Postgres.
+///
 /// # Panics
 ///
-/// Panics when an advisory lock is held or the prepared row is still locked by
-/// an open transaction.
+/// Panics when this operation's advisory lock is held or the prepared row is
+/// still locked by an open transaction.
 async fn assert_delete_gate_is_sql_free(batch: &OrphanBatch) -> Uuid {
     let fixture = &batch.promoted.fixture;
     let operations = orphan_operations(fixture).await;
@@ -799,11 +802,35 @@ async fn assert_delete_gate_is_sql_free(batch: &OrphanBatch) -> Uuid {
         panic!("exactly one prepared orphan-GC batch exists: {operations:?}");
     };
     assert_eq!(phase, "prepared", "the batch is durable before its delete");
-    let advisory: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM pg_locks WHERE locktype='advisory'")
+    let resource: String =
+        sqlx::query_scalar("SELECT resource FROM vala.forge_operation_state WHERE operation_id=$1")
+            .bind(operation_id)
             .fetch_one(fixture.operator_pool.pool())
             .await
-            .expect("advisory locks are readable");
+            .expect("the prepared batch names its own resource");
+    // pg_locks is cluster-wide, so an unfiltered advisory count also observes
+    // every other test sharing this Postgres. Reconstruct exactly the key
+    // `ForgeOperations::acquire_operation_lock` hashes and match only that
+    // lock, split across the two halves pg_locks exposes.
+    let advisory: i64 = sqlx::query_scalar(
+        "WITH lock_key AS ( \
+             SELECT hashtextextended( \
+                 jsonb_build_array($1::uuid::text, $2::text, 'orphan_gc', $3::uuid::text)::text, \
+                 0 \
+             ) AS key \
+         ) \
+         SELECT count(*) FROM pg_locks, lock_key \
+          WHERE locktype = 'advisory' \
+            AND objsubid = 1 \
+            AND classid = ((lock_key.key >> 32) & 4294967295)::oid \
+            AND objid = (lock_key.key & 4294967295)::oid",
+    )
+    .bind(fixture.tenant.as_uuid())
+    .bind(&resource)
+    .bind(operation_id)
+    .fetch_one(fixture.operator_pool.pool())
+    .await
+    .expect("advisory locks are readable");
     assert_eq!(advisory, 0, "no advisory lock spans the object delete");
     let mut probe = fixture
         .operator_pool

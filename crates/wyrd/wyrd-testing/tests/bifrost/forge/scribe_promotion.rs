@@ -366,11 +366,6 @@ async fn scribe_promotion_revalidates_footer_and_appends_without_data_put() {
             .collect::<Vec<_>>()
     );
     assert_eq!(
-        object_store.output_put_calls(),
-        0,
-        "promotion produced no rewrite output"
-    );
-    assert_eq!(
         object_store.delete_calls(),
         0,
         "promotion deleted no object"

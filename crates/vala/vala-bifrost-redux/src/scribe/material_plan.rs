@@ -2122,10 +2122,16 @@ mod tests {
                 ..ResourceLogs::default()
             }],
         };
-        let mut limits = crate::gate::limits::IngestLimits::default();
-        limits.rows = 1;
-        limits.otlp.request_bytes = 1024;
-        limits.otlp.value_bytes = 1024;
+        let defaults = crate::gate::limits::IngestLimits::default();
+        let mut limits = crate::gate::limits::IngestLimits {
+            rows: 1,
+            otlp: crate::gate::limits::OtlpWireLimits {
+                request_bytes: 1024,
+                value_bytes: 1024,
+                ..defaults.otlp
+            },
+            ..defaults
+        };
         let planner = ScribeIngressPlanner::new(limits);
         let ceiling = configured_otlp_material_bytes(limits)?;
         let measured = projection

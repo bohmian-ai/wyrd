@@ -3,7 +3,7 @@ id: BIFROST-R5-T05-MCP
 title: Project bounded Bifrost discovery and query journeys through MCP
 kind: implementation
 mode: RECONCILE
-status: proposed
+status: review
 spec: SPEC-bifrost-distributed-analytics-engine
 spec_revision: 6
 depends_on: [BIFROST-R5-T05-PRE-MCP-BUILDOUT]

@@ -3,7 +3,7 @@ id: BIFROST-R6-T05-R01-MCP-QUERY-CORRECTNESS
 title: Make MCP query errors, terminals, and cancellation trustworthy
 kind: remediation
 mode: REMEDIATE
-status: ready
+status: review
 spec: SPEC-bifrost-distributed-analytics-engine
 spec_revision: 6
 depends_on: [BIFROST-R5-T05-MCP]
@@ -401,3 +401,16 @@ contract rather than consuming its existing validators.
   focused correctness checks; the later candidate adds only real OTLP journey
   coverage and evidence. Task 05 closeout remains REMEDIATE for finding 7;
   family/boundary failures above remain explicitly unapproved.
+
+## Final cumulative proof
+
+The real trace dependency is resolved by the independently ready and implemented
+`05-remediation-otlp-material.md`; its exact sizing reuses Scribe's three signal
+projectors, preserves the configured envelope, and removes the faulty estimate.
+All 965 Bifrost integration tests, all 6 MCP journeys, and all 23 Oracle journeys
+pass. Final exact OTLP journey, format, workspace lints, client-tier, and
+error-coverage checks pass. Final source changes after broad tests only borrow
+measured input and initialize a test limit struct directly; focused proof was
+rerun. The earlier 8 unrelated family failures and tenant/unwrap failures remain
+recorded above, not silently treated as passes. No check, ignored-test policy,
+public error contract, or generated schema was weakened or changed.

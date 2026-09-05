@@ -2,7 +2,7 @@
 id: BIFROST-R6-T05-R02-OTEL-JOURNEY
 title: Prove actual OTEL trace debugging over MCP
 kind: remediation
-status: ready
+status: review
 spec: SPEC-bifrost-distributed-analytics-engine
 spec_revision: 6
 parent_task: BIFROST-R5-T05-MCP
@@ -117,3 +117,8 @@ Production dependency remediation `05-remediation-otlp-material.md` restores
 GREEN: the exact OTLP MCP selector passed (2.551s) after correcting Scribe
 projection accounting. The earlier TASK_REVISION_REQUIRED condition is resolved
 by that independently reviewed task; final cumulative verification follows.
+
+Final closure proof: exact real OTLP MCP journey PASS (2.628s), full MCP lane
+PASS (6/6), full Oracle lane PASS (23/23), Bifrost integration PASS (965/965),
+format and workspace lints PASS. Both trace coverage finding 6 and its Scribe
+admission dependency finding 7 are ready for cumulative review.

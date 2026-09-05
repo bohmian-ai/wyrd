@@ -2,7 +2,7 @@
 id: BIFROST-R6-T05-R03-OTLP-MATERIAL
 title: Admit OTLP from actual projected material facts
 kind: remediation
-status: ready
+status: review
 spec: SPEC-bifrost-distributed-analytics-engine
 spec_revision: 6
 parent_task: BIFROST-R5-T05-MCP
@@ -176,3 +176,20 @@ Real OTLP journey GREEN: the exact Postgres-wrapped MCP selector passes
 Refactor removes the obsolete decoded-input projection estimate entirely:
 request bytes are validated first; validated counters and measured material
 form one final root/replay plan. No intermediate estimated root is retained.
+
+## Final verification
+
+- All four exact unit selectors passed after the final borrow correction;
+  the envelope selector passed again after its test-only initializer cleanup
+  (0.024s). The exact real OTLP MCP journey passed again (2.628s).
+- `mise run test:bifrost:integration:redux`: PASS, 965 tests (36.036s).
+- `mise run test:bifrost:journey:mcp`: PASS, all 6 journeys (4.219s).
+- `mise run test:bifrost:journey:oracle`: PASS, all 23 journeys (70.851s).
+- `mise run fmt` and `mise run lints`: PASS; final workspace all-features,
+  all-targets lint run completed in 40.09s.
+- The broad lanes preceded only the behavior-preserving borrow correction and
+  test initializer cleanup; the four exact units, real OTLP journey, and final
+  formatting/linting cover those final differences.
+- `git diff --check`: PASS. Public wire/schema/generated contracts unchanged.
+- Final client-tier/error-coverage checks PASS. Tenant-isolation/unwrap checks
+  retain only the previously recorded unrelated failures; no check was changed.

@@ -156,7 +156,9 @@ describe('catalog prop safety', () => {
     for (const [name] of catalogContracts) {
       // `let { onselect }: { onselect?: (v: string) => void }` and friends: a catalog
       // component that takes a callback has made the serialized contract executable.
-      const props = sourceOf(name).match(/let \{[\s\S]*?\} = \$props\(\);/)?.[0] ?? '';
+      const props = sourceOf(name).match(/let \{[\s\S]*?= \$props\(\);/)?.[0] ?? '';
+      expect(props, `${name} has an inspectable prop declaration`).not.toBe('');
+      expect(props, `${name} widens its props with native attributes`).not.toMatch(/HTML\w+Attributes/);
       expect(/=>/.test(props), `${name} takes a callback prop`).toBe(false);
     }
   });
@@ -215,6 +217,21 @@ describe('tables and filter controls are keyboard operable', () => {
     expect(select.tagName).toBe('SELECT');
     expect(select.name).toBe('kind');
     expect(select.value).toBe('Model');
+  });
+
+  test('same-name Select instances keep distinct label and control relationships', () => {
+    const options = [{ value: '1h', label: 'Last 1 hour' }];
+    for (const label of ['Primary range', 'Comparison range']) {
+      render(Select, { props: { label, name: 'range', options } });
+    }
+    const controls = screen.getAllByRole('combobox') as HTMLSelectElement[];
+    expect(controls[0].id).not.toBe(controls[1].id);
+    for (const [i, label] of ['Primary range', 'Comparison range'].entries()) {
+      expect(screen.getByLabelText(label)).toBe(controls[i]);
+      expect(controls[i]).toHaveAccessibleName(label);
+      expect(controls[i].labels?.[0].control).toBe(controls[i]);
+      expect(controls[i].name).toBe('range');
+    }
   });
 
   test('a filter select submits its form instead of calling back into the view', () => {

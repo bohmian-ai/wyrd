@@ -1,6 +1,5 @@
 <script lang="ts">
   import type { Snippet } from 'svelte';
-  import type { HTMLAnchorAttributes, HTMLButtonAttributes } from 'svelte/elements';
 
   // One control surface for both actions and navigation. `href` renders an <a> so a
   // catalog-safe view can offer navigation without handing a callback across the
@@ -9,21 +8,18 @@
   let {
     variant = 'primary',
     href,
-    type = 'button',
-    children,
-    ...rest
+    children
   }: {
     variant?: Variant;
     href?: string;
     children?: Snippet;
-  } & HTMLButtonAttributes &
-    HTMLAnchorAttributes = $props();
+  } = $props();
 </script>
 
 {#if href}
-  <a {href} class="wy-btn" data-variant={variant} {...rest}>{@render children?.()}</a>
+  <a {href} class="wy-btn" data-variant={variant}>{@render children?.()}</a>
 {:else}
-  <button {type} class="wy-btn" data-variant={variant} {...rest}>{@render children?.()}</button>
+  <button type="button" class="wy-btn" data-variant={variant}>{@render children?.()}</button>
 {/if}
 
 <style>
@@ -56,12 +52,6 @@
   .wy-btn:focus-visible {
     outline: 2px solid var(--text);
     outline-offset: 2px;
-  }
-  .wy-btn:disabled {
-    cursor: not-allowed;
-    opacity: 0.55;
-    transform: none;
-    box-shadow: 3px 3px 0 0 var(--shadow);
   }
   /* fill is --brand-btn, never --brand: --brand is a dim navy panel colour in dark mode */
   .wy-btn[data-variant='primary'] {

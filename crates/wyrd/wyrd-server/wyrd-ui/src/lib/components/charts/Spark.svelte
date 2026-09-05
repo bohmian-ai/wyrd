@@ -1,18 +1,9 @@
 <script lang="ts">
-  type Sentiment = 'ok' | 'warn' | 'danger' | 'neutral';
   let {
     points,
-    sentiment = 'neutral',
     width = 90,
     height = 24
-  }: { points: number[]; sentiment?: Sentiment; width?: number; height?: number } = $props();
-
-  const stroke: Record<Sentiment, string> = {
-    ok: 'var(--ok)',
-    danger: 'var(--danger)',
-    warn: 'var(--warn)',
-    neutral: 'var(--muted)'
-  };
+  }: { points: number[]; width?: number; height?: number } = $props();
 
   const d = $derived.by(() => {
     const max = Math.max(...points);
@@ -30,11 +21,10 @@
   viewBox={`0 0 ${width} ${height}`}
   preserveAspectRatio="none"
   fill="none"
-  data-sentiment={sentiment}
 >
   <polyline
     points={d}
-    style={`stroke:${stroke[sentiment]}`}
+    stroke="var(--muted)"
     stroke-width="2"
     stroke-linejoin="round"
     stroke-linecap="round"

@@ -79,7 +79,7 @@ with a coloured dot alone, which INV-008 forbids; it now reads through `Badge`.
 - **No fabricated health (INV-009)** — `ChartPanel` shows no latest value in
   the loading, empty, unauthorized or error states, and `partial` draws the
   plot and the partial notice together rather than presenting an incomplete
-  series as complete. `Spark` defaults to `neutral`.
+  series as complete. `Spark` is neutral geometry only and has no status input.
 - **Keyboard and accessible naming** — `Select` is a native `<select>` bound to
   a visible `<label>`; `Disclosure` is a native `<details>`; `Table` scrolls in
   a `role="region"` with an `aria-label` and `tabindex="0"`; a `Chip`'s remove
@@ -113,7 +113,7 @@ Style guide at `/styleguide`, light and dark side by side, 1600×1100:
   container (chips wrap, the table scrolls in its own region, nothing is
   dropped), and the trusted chrome section.
 
-## Verification
+## Original implementation verification
 
 ```
 pnpm --dir crates/wyrd/wyrd-server/wyrd-ui exec vitest run src/lib/registry.test.ts                          4 passed
@@ -130,3 +130,83 @@ devDependency is declared `latest`, so typescript resolved to 7.0.2 while
 svelte-check 4.7.2 still reaches for the TypeScript 5 sys API. typescript is
 now pinned to `^5.9.0`, which restores the lane; the install re-resolved the
 other `latest` ranges as a side effect.
+
+## Remediation verification (TASK-002-R1, 2026-09-04)
+
+Implemented against `2d2aff2e61fcc752a8df7e72dace9a22416ac150`. The
+consumer matrix and registry membership above are unchanged.
+
+| Obligation / finding | Final contract and proof |
+|---|---|
+| REQ-128, REQ-130, INV-021 / FIND-TASK-002-1 | Button accepts exactly `variant`, `href`, and child content. Native attribute intersections and forwarding are removed; runtime tests prove undeclared handlers, classes, styles, and attributes do not reach either native element. A `Record<keyof ComponentProps<typeof Button>, true>` checked by Svelte/TypeScript and compared to the manifest detects undeclared API keys. The homepage toggle is a local native button. |
+| REQ-128, REQ-131 / FIND-TASK-002-2 | ChartPanel's manifest permits an omitted latest value, all five unavailable states render without one, and supplied stamps require `at`. Plain-text stamp fallbacks are removed. Line ticks accept `{ label, at }`; HTML `<time datetime>` elements accompany the unchanged SVG text, and keyboard tooltips expose the selected instant. |
+| REQ-128, INV-008 / FIND-TASK-002-3 | Spark has only points and optional dimensions. Its sole stroke token is `--muted`; the manifest, typed prop-key test, source, render, and style-guide example agree. |
+| AC-010 / FIND-TASK-002-4 | Select uses `$props.id()`. Two instances named `range` retain distinct IDs, accessible names, and exact label/control associations; both preserve the form name. Existing form-submission coverage still passes. |
+| REQ-131, INV-008 / FIND-TASK-002-5 | Four Line series have four distinct dash and marker identities, matched by the legend. A fifth throws `RangeError` instead of repeating a style. Existing three-series, theme, threshold, and keyboard regressions pass. |
+
+Each ordered scenario completed before the next began:
+
+| Scenario | Expected RED | GREEN |
+|---|---|---|
+| Button | 3 failures: native widening and injected attributes on button/link | 6 Button tests passed |
+| Chart time/state | 2 failures: required latest-value manifest and absent time elements | 49 tests passed across Button, contracts, ChartPanel, and Line |
+| Neutral Spark | 1 failure: manifest still exposed sentiment | 51 focused tests passed |
+| Repeated Select | 1 failure: duplicate `wy-sel-range` IDs | 52 focused tests passed |
+| Line ceiling | 1 failure: fifth series did not throw | 54 focused tests passed |
+
+Refactor: one local timestamp fixture helper in Line tests. The existing catalog
+callback check now requires a matched prop declaration and inspects native
+attribute intersections instead of silently testing an empty match. No new
+parser, renderer, dependency, or verification lane was added. The former
+Button-native-attribute and Spark-sentiment tests were replaced because their
+assertions required the exact behavior this remediation removes.
+
+Final focused commands, each executed separately:
+
+```bash
+mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui exec vitest run src/lib/components/Button.test.ts
+# PASS: 6 tests
+mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui exec vitest run src/lib/components/component-contracts.test.ts
+# PASS: 19 tests
+mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui exec vitest run src/lib/components/charts/ChartPanel.test.ts
+# PASS: 15 tests
+mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui exec vitest run src/lib/components/charts/Spark.test.ts
+# PASS: 2 tests
+mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui exec vitest run src/lib/components/charts/Line.test.ts
+# PASS: 12 tests
+mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui test
+# PASS: 15 files, 78 tests, including registry parity
+mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui check
+# PASS: 0 errors, 0 warnings
+mise exec -- pnpm --dir crates/wyrd/wyrd-server/wyrd-ui build
+# PASS: adapter-node production build
+mise run check:tokens
+# PASS: generated targets in sync with palette.json
+git diff --check
+# PASS
+```
+
+Svelte checking supplies the UI's configured TypeScript and accessibility lint
+checks; this package has no separate format/lint script. New code follows the
+existing two-space style. No Rust, Python, generated wire schema, or SDK surface
+changed, so their verification lanes do not apply.
+
+Browser inspection used the production build with installed Chrome and cached
+Playwright, with no repository dependency changes. At 1600×1100, both modes
+preserve chart geometry, visible labels, neutral sparks, status glyphs, and
+controls. All four Select IDs are unique after hydration and each native
+control has exactly its own label. Home/End navigate timestamped tooltips.
+The 340px containers retain all columns and `overflow-x: auto`; the current
+fixture fits at 308px inner width, so no scroll is needed for those rows.
+At 768px, the paired modes stack and retain the same information. The homepage
+mode toggle works. No browser page errors occurred.
+
+The three existing captures remain representative and were retained: this
+remediation changes contracts, DOM identity, and nonvisual time semantics,
+without changing the style guide's visible output. Temporary inspection
+captures were not added to the repository. No server journey is required by
+this task: no server or durable-state boundary changed.
+
+Result: implementation COMPLETE; cumulative task review remains a separate
+read-only step. The user subsequently authorized committing the remediation.
+Unrelated workspace edits were preserved.

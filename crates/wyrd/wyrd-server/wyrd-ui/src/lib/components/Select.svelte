@@ -18,7 +18,7 @@
     auto?: boolean;
   } = $props();
 
-  const id = $derived(`wy-sel-${name}`);
+  const id = $props.id();
 
   function submit(event: Event): void {
     if (!auto) return;

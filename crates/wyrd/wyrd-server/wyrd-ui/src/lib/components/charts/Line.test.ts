@@ -1,7 +1,12 @@
+import { readFileSync } from 'node:fs';
 import { fireEvent, render } from '@testing-library/svelte';
 import { expect, test } from 'vitest';
 import Line from './Line.svelte';
 import ModeProvider from '../ModeProvider.svelte';
+
+const stamps = (labels: string[]) => labels.map((label, i) => ({
+  label, at: `2026-09-04T17:${i}0:00Z`
+}));
 
 const series = [
   { label: 'p50', points: [120, 118, 131] },
@@ -10,12 +15,12 @@ const series = [
 ];
 
 test('draws one polyline per series', () => {
-  const { container } = render(Line, { props: { series, labels: ['a', '', 'c'] } });
+  const { container } = render(Line, { props: { series, labels: stamps(['a', '', 'c']) } });
   expect(container.querySelectorAll('.plot > svg > polyline')).toHaveLength(3);
 });
 
 test('renders only non-empty x labels', () => {
-  const { container } = render(Line, { props: { series: [series[0]], labels: ['a', '', 'c'] } });
+  const { container } = render(Line, { props: { series: [series[0]], labels: stamps(['a', '', 'c']) } });
   expect(container.querySelectorAll('.wy-line .xl')).toHaveLength(2);
 });
 
@@ -70,7 +75,7 @@ test('light and dark render the same structure and the same non-colour separatio
 });
 
 test('the tooltip is reachable by focus, not by pointer alone, and opens on the latest point', async () => {
-  const { container } = render(Line, { props: { series, labels: ['a', 'b', 'c'], unit: 'ms' } });
+  const { container } = render(Line, { props: { series, labels: stamps(['a', 'b', 'c']), unit: 'ms' } });
   expect(container.querySelector('.tip'), 'at rest the plot carries no tooltip').toBeNull();
 
   await fireEvent.focus(container.querySelector('.plot > svg') as SVGSVGElement);
@@ -83,7 +88,7 @@ test('the tooltip is reachable by focus, not by pointer alone, and opens on the 
 });
 
 test('arrow keys move the tooltip and Home jumps to the start of the range', async () => {
-  const { container } = render(Line, { props: { series, labels: ['a', 'b', 'c'] } });
+  const { container } = render(Line, { props: { series, labels: stamps(['a', 'b', 'c']) } });
   const plot = container.querySelector('.plot > svg') as SVGSVGElement;
   await fireEvent.focus(plot);
   await fireEvent.keyDown(plot, { key: 'ArrowLeft' });
@@ -94,10 +99,54 @@ test('arrow keys move the tooltip and Home jumps to the start of the range', asy
 });
 
 test('the tooltip anchors inward at the ends of the range so it is not clipped', async () => {
-  const { container } = render(Line, { props: { series, labels: ['a', 'b', 'c'] } });
+  const { container } = render(Line, { props: { series, labels: stamps(['a', 'b', 'c']) } });
   const plot = container.querySelector('.plot > svg') as SVGSVGElement;
   await fireEvent.focus(plot);
   expect(container.querySelector('.tip')?.getAttribute('style')).toContain('translate(calc(-100% + 6px)');
   await fireEvent.keyDown(plot, { key: 'Home' });
   expect(container.querySelector('.tip')?.getAttribute('style')).toContain('translate(-6px');
+});
+
+test('exposed time-axis labels and keyboard tooltip carry machine-readable instants', async () => {
+  const manifest = JSON.parse(readFileSync('brand/components.json', 'utf8'));
+  expect(manifest.components.Line.props.labels).toBe('Array<{ label: string, at: string }>?');
+  const labels = [
+    { label: '17:00', at: '2026-09-04T17:00:00Z' },
+    { label: '', at: '2026-09-04T17:10:00Z' },
+    { label: '17:20', at: '2026-09-04T17:20:00Z' }
+  ];
+  const { container } = render(Line, { props: { series, labels } });
+  const times = [...container.querySelectorAll('time')];
+  expect(times.map((t) => [t.textContent, t.getAttribute('datetime')])).toEqual([
+    ['17:00', labels[0].at], ['17:20', labels[2].at]
+  ]);
+  expect(times.every((t) => t.namespaceURI === 'http://www.w3.org/1999/xhtml')).toBe(true);
+  const plot = container.querySelector('.plot > svg') as SVGSVGElement;
+  await fireEvent.focus(plot);
+  expect(container.querySelector('.tip time')).toHaveAttribute('datetime', labels[2].at);
+  await fireEvent.keyDown(plot, { key: 'ArrowLeft' });
+  expect(container.querySelector('.tip time')).toHaveAttribute('datetime', labels[1].at);
+  expect(container.querySelector('.tip time')?.textContent).toBe('point 2 of 3');
+});
+
+test('four series have four distinct dash and marker identities in plot and legend', () => {
+  const four = [...series, { label: 'p99.9', points: [700, 800, 900] }];
+  const { container } = render(Line, { props: { series: four } });
+  for (const selector of ['.plot > svg > polyline', '.legend .sample line']) {
+    const lines = [...container.querySelectorAll(selector)];
+    expect(lines).toHaveLength(4);
+    expect(new Set(lines.map((l) => l.getAttribute('stroke-dasharray') ?? 'solid')).size).toBe(4);
+  }
+  const plotShapes = [...container.querySelectorAll('.plot > svg > path.node')]
+    .filter((_, i) => i % 3 === 0)
+    .map((p) => (p.getAttribute('d') ?? '').replace(/[\d.-]+/g, ''));
+  const legendShapes = [...container.querySelectorAll('.legend path.node')]
+    .map((p) => (p.getAttribute('d') ?? '').replace(/[\d.-]+/g, ''));
+  expect(new Set(plotShapes).size).toBe(4);
+  expect(legendShapes).toEqual(plotShapes);
+});
+
+test('rejects a fifth series rather than repeating a non-colour identity', () => {
+  const five = Array.from({ length: 5 }, (_, i) => ({ label: `series ${i}`, points: [1, 2, 3] }));
+  expect(() => render(Line, { props: { series: five } })).toThrow('Line supports at most four series');
 });

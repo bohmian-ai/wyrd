@@ -57,7 +57,7 @@
 </script>
 
 {#snippet trend()}
-  <Spark points={[18, 14, 16, 9, 11, 5, 7]} sentiment="neutral" />
+  <Spark points={[18, 14, 16, 9, 11, 5, 7]} />
 {/snippet}
 
 {#snippet catalog()}
@@ -159,7 +159,15 @@
           to={{ label: 'Sep 4 17:20', at: '2026-09-04T17:20:00Z' }}
           link={{ label: 'Open in Observe', href: '#chrome' }}
         >
-          <Line series={latency} labels={['-24h', '', '-12h', '', '-6h', '', 'now']} threshold={{ value: 750, label: 'SLO 750ms' }} />
+          <Line series={latency} labels={[
+            { label: '-24h', at: '2026-09-03T17:20:00Z' },
+            { label: '', at: '2026-09-03T23:20:00Z' },
+            { label: '-12h', at: '2026-09-04T05:20:00Z' },
+            { label: '', at: '2026-09-04T08:20:00Z' },
+            { label: '-6h', at: '2026-09-04T11:20:00Z' },
+            { label: '', at: '2026-09-04T14:20:00Z' },
+            { label: 'now', at: '2026-09-04T17:20:00Z' }
+          ]} threshold={{ value: 750, label: 'SLO 750ms' }} />
         </ChartPanel>
       </div>
 

@@ -10,7 +10,7 @@
   // for a loading, empty, unauthorized or failed measure, because a stale or absent
   // reading rendered as a number is a health claim the server never made.
   type State = 'ok' | 'loading' | 'empty' | 'partial' | 'unauthorized' | 'error';
-  type Stamp = { label: string; at?: string };
+  type Stamp = { label: string; at: string };
   let {
     title,
     measure,
@@ -65,7 +65,7 @@
         {#if unit}<span class="lu">{unit}</span>{/if}
         {#if freshness}
           <span class="fr">
-            {#if freshness.at}<time datetime={freshness.at}>{freshness.label}</time>{:else}{freshness.label}{/if}
+            <time datetime={freshness.at}>{freshness.label}</time>
           </span>
         {/if}
       </p>
@@ -82,9 +82,9 @@
     <p class="foot">
       {#if from && to}
         <span class="rng">
-          {#if from.at}<time datetime={from.at}>{from.label}</time>{:else}{from.label}{/if}
+          <time datetime={from.at}>{from.label}</time>
           <span aria-hidden="true"> → </span>
-          {#if to.at}<time datetime={to.at}>{to.label}</time>{:else}{to.label}{/if}
+          <time datetime={to.at}>{to.label}</time>
         </span>
       {/if}
       {#if source}<span class="src">{source}</span>{/if}

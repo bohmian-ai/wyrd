@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { render, screen } from '@testing-library/svelte';
 import { createRawSnippet } from 'svelte';
 import { expect, test } from 'vitest';
@@ -88,3 +89,23 @@ test('a partial series is drawn and labeled partial at the same time', () => {
   expect(container.textContent).toContain('200 of 412 points loaded.');
   expect(container.querySelector('.latest')).toBeNull();
 });
+
+test('the catalog allows unavailable values and requires instants on supplied stamps', () => {
+  const manifest = JSON.parse(readFileSync('brand/components.json', 'utf8'));
+  expect(manifest.components.ChartPanel.props.latestValue).toBe('string | number?');
+  for (const prop of ['freshness', 'from', 'to']) {
+    expect(manifest.components.ChartPanel.props[prop]).toBe('{ label: string, at: string }?');
+  }
+  const source = readFileSync('src/lib/components/charts/ChartPanel.svelte', 'utf8');
+  expect(source).not.toMatch(/at\?:/);
+  expect(source).not.toMatch(/\{#if (freshness|from|to)\.at\}/);
+});
+
+test.each(['loading', 'empty', 'partial', 'unauthorized', 'error'] as const)(
+  'the %s state accepts no latest value',
+  (state) => {
+    const { container } = render(ChartPanel, { props: { title: 'Latency', measure: 'p95', state } });
+    expect(container.querySelector('.latest')).toBeNull();
+    expect(container.querySelector('.wy-state')).toHaveAttribute('data-state', state);
+  }
+);

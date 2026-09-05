@@ -5,13 +5,14 @@
   // sample rather than a block swatch. Series take no colour prop — the style is chosen
   // by position from a fixed table, so a serialized view can never name a token.
   type Series = { label: string; points: number[] };
+  type Stamp = { label: string; at: string };
   type Threshold = { value: number; label: string };
   let {
     series,
     labels = [],
     unit,
     threshold
-  }: { series: Series[]; labels?: string[]; unit?: string; threshold?: Threshold } = $props();
+  }: { series: Series[]; labels?: Stamp[]; unit?: string; threshold?: Threshold } = $props();
 
   const W = 300;
   const H = 148;
@@ -20,7 +21,7 @@
   const yTop = 12;
   const yBot = 120;
 
-  /** Stroke, dash and marker per series position. Four styles; a fifth series repeats. */
+  /** Stroke, dash and marker per series position. Four distinct non-colour identities. */
   const styles = [
     { color: 'var(--brand-strong)', dash: '', marker: 'square' },
     { color: 'var(--control-bar)', dash: '6 3', marker: 'circle' },
@@ -71,10 +72,11 @@
   });
 
   const plotted = $derived.by(() => {
+    if (series.length > styles.length) throw new RangeError('Line supports at most four series');
     const n = series[0]?.points.length ?? 0;
     const step = (x1 - x0) / (n - 1 || 1);
     return series.map((s, i) => {
-      const style = styles[i % styles.length];
+      const style = styles[i];
       const pts = s.points.map((v, j) => ({ x: x0 + step * j, y: scale(v) }));
       return {
         ...style,
@@ -90,7 +92,7 @@
   const activeX = $derived(x0 + ((x1 - x0) / (count - 1 || 1)) * active);
 
   /** What the tooltip is titled: the point's own label, or its position in the range. */
-  const activeLabel = $derived(labels[active] || `point ${active + 1} of ${count}`);
+  const activeLabel = $derived(labels[active]?.label || `point ${active + 1} of ${count}`);
 
   // The tooltip is positioned in percentages of the viewBox, so it tracks the plot at any
   // rendered width. It sits above the highest series at the active point and anchors
@@ -107,7 +109,7 @@
     // The first and last labels anchor inward so an edge label is never clipped.
     return labels
       .map((label, i) => ({
-        label,
+        ...label,
         x: x0 + step * i,
         anchor: i === 0 ? 'start' : i === labels.length - 1 ? 'end' : 'middle'
       }))
@@ -179,17 +181,27 @@
         />
       {/each}
     {/each}
-    {#each xlabels as l (l.label)}
-      <text class="xl" x={l.x.toFixed(1)} y={yBot + 13} text-anchor={l.anchor}>{l.label}</text>
+    {#each xlabels as l (l.at)}
+      <text aria-hidden="true" class="xl" x={l.x.toFixed(1)} y={yBot + 13} text-anchor={l.anchor}>{l.label}</text>
     {/each}
   </svg>
+  <!-- Keep the SVG typography; HTML time elements expose the same ticks semantically. -->
+  <span class="sr-only">
+    {#each xlabels as l (l.at)}
+      <time datetime={l.at}>{l.label}</time>{' '}
+    {/each}
+  </span>
   {#if showing}
     <div
       class="tip"
       style={`left:${tipLeft.toFixed(2)}%;top:${tipTop.toFixed(2)}%;transform:translate(${tipShift},-100%)`}
       aria-live="polite"
     >
-      <span class="at">{activeLabel}</span>
+      {#if labels[active]}
+        <time class="at" datetime={labels[active].at}>{activeLabel}</time>
+      {:else}
+        <span class="at">{activeLabel}</span>
+      {/if}
       <ul>
         {#each plotted as s, i (s.label)}
           <li>

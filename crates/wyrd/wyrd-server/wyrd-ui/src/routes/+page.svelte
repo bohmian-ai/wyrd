@@ -9,6 +9,23 @@
 
   <div class="mt-6 flex gap-3">
     <Button href="/styleguide" variant="primary">Design system →</Button>
-    <Button variant="ghost" onclick={toggleMode}>Toggle mode</Button>
+    <button type="button" class="mode-toggle" onclick={toggleMode}>Toggle mode</button>
   </div>
 </main>
+
+<style>
+  .mode-toggle {
+    font: 700 13px var(--font-mono);
+    padding: 8px 13px;
+    border: 2px solid var(--border);
+    border-radius: var(--r);
+    box-shadow: 3px 3px 0 0 var(--shadow);
+    background: var(--surface);
+    color: var(--text);
+    cursor: pointer;
+  }
+  .mode-toggle:focus-visible {
+    outline: 2px solid var(--text);
+    outline-offset: 2px;
+  }
+</style>

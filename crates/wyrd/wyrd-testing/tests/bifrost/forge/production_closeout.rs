@@ -21,6 +21,7 @@ use vala_sql::row_types::forge_tasks::ForgeTaskStrategy;
 use wyrd_client::WyrdClient;
 use wyrd_server::config::BifrostRuntimeRole;
 use wyrd_spec::DataTenantId;
+use wyrd_spec::vala::api::NodeId;
 use wyrd_testing::WyrdTestServer;
 use wyrd_testing::bifrost::{BifrostClusterSpec, TestOracleResources, WyrdTestCluster};
 
@@ -46,16 +47,26 @@ struct CloseoutJourney {
     cluster: WyrdTestCluster,
     /// Notification source emitted after production worker outcomes.
     observer: ForgeWorkerCompletionObserver,
+    /// Stable identity of the initially delayed coordinator.
+    coordinator_node: NodeId,
+    /// Stable identity of the independent ingest process.
+    scribe_node: NodeId,
+    /// Stable identity of the independent query process.
+    oracle_node: NodeId,
 }
 
 impl CloseoutJourney {
-    /// Starts a server/coordinator, worker, and dedicated Oracle on distinct nodes.
+    /// Starts dedicated ingest, query, and worker nodes, retaining a delayed coordinator.
     ///
     /// # Panics
     /// Panics if the production topology cannot start or lacks its observer.
     async fn start() -> Self {
         let mut spec = BifrostClusterSpec::dedicated_forge_workers();
-        spec.nodes.truncate(3);
+        let coordinator_node = spec.nodes[3].node_id;
+        let scribe_node = spec.nodes[0].node_id;
+        let oracle_node = spec.nodes[2].node_id;
+        spec.nodes[3].roles = spec.nodes[0].roles.clone();
+        spec.nodes[0].roles = [BifrostRuntimeRole::Scribe].into_iter().collect();
         spec.nodes[2].roles = [BifrostRuntimeRole::Oracle].into_iter().collect();
         // Both Oracle replicas must derive the same durable admission ceiling.
         // The dedicated replica needs no Scribe or Forge protected floors.
@@ -79,18 +90,19 @@ impl CloseoutJourney {
                 small_file_threshold_bytes: 768 * 1024 * 1024,
                 ..ForgeConfig::default()
             },
+            true,
         )
         .await
         .expect("separate production roles start");
         let observer = cluster
             .forge_completion_observer()
             .expect("worker observer");
-        assert_eq!(cluster.configured_node_ids().len(), 3);
+        assert_eq!(cluster.configured_node_ids().len(), 4);
         eprintln!(
             "closeout role/node identities: {:?}",
             cluster.configured_node_ids()
         );
-        Self { cluster, observer }
+        Self { cluster, observer, coordinator_node, scribe_node, oracle_node }
     }
 
     /// Registers the payload schema through the retained server catalog harness.
@@ -99,7 +111,7 @@ impl CloseoutJourney {
     /// Panics if registration or tenant-qualified identity validation fails.
     async fn register_payload_table(&self, tenant: DataTenantId, name: String) -> JourneyTable {
         let table_ref = TableRef::new(BifrostNamespace::Datasets, &name);
-        self.coordinator()
+        self.scribe()
             .create_bifrost_table_for_test(CreateTableRequest {
                 table: table_ref.clone(),
                 tenant,
@@ -127,7 +139,7 @@ impl CloseoutJourney {
     /// # Panics
     /// Panics if catalog configuration fails or does not preserve the declared target.
     async fn declare_geometry(&self, binding: &TenantTableBinding) {
-        let catalog = self.coordinator().bifrost_catalog().iceberg_catalog();
+        let catalog = self.scribe().bifrost_catalog().iceberg_catalog();
         let table = catalog
             .load_table(&binding.table_ident())
             .await
@@ -155,12 +167,20 @@ impl CloseoutJourney {
         );
     }
 
-    /// Borrows the Scribe and coordinator node.
+    /// Borrows the live coordinator node.
     ///
     /// # Panics
     /// Panics if the retained node is absent.
     fn coordinator(&self) -> &WyrdTestServer {
-        self.cluster.server(0).expect("coordinator node")
+        self.cluster.server_by_node(self.coordinator_node).expect("coordinator node")
+    }
+
+    /// Borrows the dedicated Scribe serving node.
+    ///
+    /// # Panics
+    /// Panics if the ingest node is absent.
+    fn scribe(&self) -> &WyrdTestServer {
+        self.cluster.server_by_node(self.scribe_node).expect("Scribe node")
     }
 
     /// Borrows the separate Oracle serving node.
@@ -168,7 +188,7 @@ impl CloseoutJourney {
     /// # Panics
     /// Panics if the retained node is absent.
     fn oracle(&self) -> &WyrdTestServer {
-        self.cluster.server(2).expect("Oracle node")
+        self.cluster.server_by_node(self.oracle_node).expect("Oracle node")
     }
 
     /// Requests and observes one real scheduler pass before inspecting SQL.
@@ -201,14 +221,18 @@ impl CloseoutJourney {
         tokio::time::timeout(REWRITE_BOUND, async {
             loop {
                 let next = self.observer.attempts() + 1;
-                let pending: i64 = sqlx::query_scalar(
-                    "SELECT count(*) FROM vala.forge_tasks WHERE state NOT IN \
-                     ('succeeded', 'failed', 'cancelled', 'unschedulable')",
+                let (pending, attempts): (i64, i64) = sqlx::query_as(
+                    "SELECT count(*) FILTER (WHERE state NOT IN \
+                     ('succeeded', 'failed', 'cancelled', 'unschedulable')), \
+                     coalesce(sum(attempt_count), 0)::bigint FROM vala.forge_tasks",
                 )
                 .fetch_one(self.cluster.pg_fixture().operator_pool().pool())
                 .await
-                .expect("pending task inspection");
-                if pending == 0 {
+                .expect("durable task and ownership inspection");
+                if pending == 0
+                    && self.observer.attempts()
+                        >= usize::try_from(attempts).expect("nonnegative attempts")
+                {
                     break;
                 }
                 self.observer.wait_for_attempts_at_least(next).await;
@@ -269,6 +293,76 @@ impl CloseoutJourney {
             }
         }
         (snapshot.snapshot_id(), files)
+    }
+
+    /// Corroborates one completed rewrite with transactional audit and metrics.
+    ///
+    /// # Panics
+    /// Panics on absent or contradictory operation/audit evidence, an unfinished
+    /// ownership gauge, or missing physical data-flow counters.
+    async fn assert_rewrite_evidence(&self) {
+        let rows: Vec<(Uuid, i64, i64, String, String, serde_json::Value)> = sqlx::query_as(
+            "SELECT o.operation_id, o.prepared_audit_seq, o.terminal_audit_seq, \
+             p.operation, t.operation, o.prepared_detail \
+             FROM vala.forge_operation_state o \
+             JOIN vala.audit_outbox p ON p.data_tenant_id=o.data_tenant_id AND p.seq=o.prepared_audit_seq \
+             JOIN vala.audit_outbox t ON t.data_tenant_id=o.data_tenant_id AND t.seq=o.terminal_audit_seq \
+             WHERE o.family='iceberg_rewrite'",
+        ).fetch_all(self.cluster.pg_fixture().operator_pool().pool()).await.expect("rewrite audit evidence");
+        assert_eq!(
+            rows.len(),
+            1,
+            "one rewrite has one audited terminal settlement"
+        );
+        for (operation, prepared, terminal, prepared_name, terminal_name, detail) in rows {
+            assert!(prepared < terminal);
+            assert_eq!(prepared_name, "forge.iceberg_rewrite.prepared");
+            assert_eq!(terminal_name, "forge.iceberg_rewrite.committed");
+            eprintln!(
+                "rewrite {operation}, audit {prepared}->{terminal}, fenced preparation {detail}"
+            );
+        }
+        let metrics = self
+            .cluster
+            .telemetry()
+            .snapshot()
+            .expect("production metrics");
+        for family in [
+            "bifrost_forge_input_files_total",
+            "bifrost_forge_input_bytes_total",
+            "bifrost_forge_output_files_total",
+            "bifrost_forge_output_bytes_total",
+        ] {
+            assert!(
+                metrics.iter().any(|sample| sample.family == family
+                    && sample.value > 0.0
+                    && sample
+                        .labels
+                        .get("task_type")
+                        .is_some_and(|kind| kind == "small_files")),
+                "{family}"
+            );
+        }
+        for sample in metrics
+            .iter()
+            .filter(|sample| sample.family == "bifrost_forge_active_tasks")
+        {
+            assert_eq!(sample.value, 0.0, "settled ownership: {sample:?}");
+        }
+        let authority = self
+            .oracle()
+            .state()
+            .bifrost
+            .oracle()
+            .expect("Oracle role")
+            .engine()
+            .reader_authority();
+        eprintln!(
+            "Oracle epoch node={} fence={}; worker identities={:?}",
+            authority.node_id(),
+            authority.fencing_token(),
+            self.observer.completed_workers()
+        );
     }
 
     /// Proves each named object still physically exists at its committed size.
@@ -431,7 +525,7 @@ fn assert_output_geometry(outputs: &BTreeMap<String, DataFile>, rows: usize) {
 #[tokio::test]
 #[ignore = "requires Postgres and production-sized object storage"]
 async fn compaction_geometry_exact_rows_and_non_destructive_second_pass() {
-    let journey = CloseoutJourney::start().await;
+    let mut journey = CloseoutJourney::start().await;
     let tenant = journey.cluster.data_tenant_id();
     let neighbour = journey
         .cluster
@@ -440,12 +534,12 @@ async fn compaction_geometry_exact_rows_and_non_destructive_second_pass() {
         .expect("second tenant");
     let name = unique_table("geometry");
     let table = journey.register_payload_table(tenant, name).await;
-    let neighbour_table = register_table(journey.coordinator(), neighbour, &table.name).await;
+    let neighbour_table = register_table(journey.scribe(), neighbour, &table.name).await;
     journey.declare_geometry(&table.binding).await;
     journey.declare_geometry(&neighbour_table.binding).await;
-    let writer = tenant_client(journey.coordinator(), tenant).await;
+    let writer = tenant_client(journey.scribe(), tenant).await;
     let reader = tenant_client(journey.oracle(), tenant).await;
-    let neighbour_writer = tenant_client(journey.coordinator(), neighbour).await;
+    let neighbour_writer = tenant_client(journey.scribe(), neighbour).await;
     let neighbour_reader = tenant_client(journey.oracle(), neighbour).await;
     let neighbour_expected = canonical_order(
         append_values(
@@ -461,7 +555,7 @@ async fn compaction_geometry_exact_rows_and_non_destructive_second_pass() {
         let started = Instant::now();
         workload.append_round(&writer, &table.qualified).await;
         journey
-            .coordinator()
+            .scribe()
             .flush_bifrost()
             .await
             .expect("publicly acknowledged rows flush");
@@ -471,7 +565,7 @@ async fn compaction_geometry_exact_rows_and_non_destructive_second_pass() {
         );
     }
     let hot = journey
-        .coordinator()
+        .scribe()
         .published_hot_files_for_test(tenant, BifrostNamespace::Datasets.as_str(), &table.name)
         .await
         .expect("physical Scribe inputs");
@@ -493,6 +587,7 @@ async fn compaction_geometry_exact_rows_and_non_destructive_second_pass() {
         read_managed_rows(&neighbour_reader, &table.qualified).await,
         neighbour_expected
     );
+    journey.cluster.restart_node(journey.coordinator_node).await.expect("coordinator starts after complete ingestion");
     for server in journey.cluster.servers().iter() {
         server
             .forge_clock()
@@ -556,5 +651,6 @@ async fn compaction_geometry_exact_rows_and_non_destructive_second_pass() {
         neighbour_expected
     );
     journey.assert_objects(&inputs).await;
+    journey.assert_rewrite_evidence().await;
     journey.cluster.shutdown().await.expect("all roles drain");
 }

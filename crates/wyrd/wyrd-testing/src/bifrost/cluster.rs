@@ -1340,12 +1340,16 @@ impl WyrdTestCluster {
 
     /// Start an explicit descriptor with a selected Forge configuration and observer.
     ///
+    /// When `delay_last_node` is true, retain the highest node identity for later
+    /// startup through `restart_node`, allowing ingestion before maintenance.
+    ///
     /// # Errors
     /// Returns the same topology, resource, configuration, and role-supervision
     /// errors as [`Self::start_spec_with_forge_completion_observer`].
     pub async fn start_spec_with_forge_config_and_completion_observer(
         spec: BifrostClusterSpec,
         config: ForgeConfig,
+        delay_last_node: bool,
     ) -> Result<Self, ClusterError> {
         Self::start_spec_with_all_options(
             spec,
@@ -1353,7 +1357,7 @@ impl WyrdTestCluster {
             None,
             None,
             false,
-            false,
+            delay_last_node,
             (
                 ForgeHarnessOptions {
                     completion_observer: Some(ForgeWorkerCompletionObserver::new()),

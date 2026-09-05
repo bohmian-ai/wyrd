@@ -2,7 +2,7 @@
 id: BIFROST-R6-T05-R03-OTLP-MATERIAL
 title: Admit OTLP from actual projected material facts
 kind: remediation
-status: proposed
+status: ready
 spec: SPEC-bifrost-distributed-analytics-engine
 spec_revision: 6
 parent_task: BIFROST-R5-T05-MCP
@@ -142,3 +142,18 @@ Return for plan revision if the fixed preflight scratch cannot remain bounded
 independently of request size, or if existing configured envelope arithmetic
 cannot bound the chosen exact material cap without changing operator-facing
 settings or boot behavior. No public behavior revision is authorized here.
+
+## Readiness
+
+Independent `wyrd-task-readiness`: READY, no blocking findings.
+
+## Execution evidence
+
+Scenario 1 shared-root RED: exact trace selector failed because 2337 admitted
+bytes could not hold the existing exact 7512-byte projection (0.456s).
+Initial GREEN: the same exact trace selector passes (0.021s). Signal methods
+now live on one borrowed authenticated `OtlpProjection` owner; all typed
+preflight and post-admission call sites use it. Existing test identity setup
+was consolidated into a small test-only owner because the borrowed projection
+must retain its principal/request lifetime; no test transport or fixture
+framework was added. Sibling regression and cap/journey verification follows.

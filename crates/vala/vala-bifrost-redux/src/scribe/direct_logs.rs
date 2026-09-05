@@ -19,6 +19,7 @@ use wyrd_tonic::otlp::logs_service::ExportLogsServiceRequest;
 
 use super::direct_metrics::{ExactPrimitive, NullableText};
 use super::direct_traces::{ByteCounter, ExactStringColumn, write_any, write_attributes};
+use super::otlp_managed::OtlpProjection;
 use crate::contracts::ScribeError;
 use crate::otlp_contract::LogsOutcome;
 use crate::tables::{DomainTable, RecordsTable};
@@ -131,114 +132,127 @@ impl ExactFixedBinary {
     }
 }
 
-/// Projects one typed logs request through allocation-free planning and exact
-/// fixed-capacity Arrow construction and authoritative managed stamping. The
-/// immutable caller context is planned before source materialization so the
-/// limit covers the final persisted schema and IPC frame.
-///
-/// # Errors
-///
-/// Returns [`ScribeError::InvalidFrame`] on checked arithmetic, serialization,
-/// Arrow construction, fingerprint or managed-context validation, material
-/// refusal, or pass divergence.
-pub(crate) fn project(
-    request: &ExportLogsServiceRequest,
-    material_limit: usize,
-    principal: &wyrd_runtime::Principal,
-    expected_fingerprint: crate::schema::SchemaFingerprint,
-    request_id: &wyrd_spec::request_id::RequestId,
-    batch_id: uuid::Uuid,
-    receipt_micros: i64,
-) -> Result<
-    (
-        Option<crate::scribe::otlp_managed::OtlpManagedBatch>,
-        LogsOutcome,
-    ),
-    ScribeError,
-> {
-    let plan = plan(request)?;
-    let outcome = LogsOutcome {
-        accepted_records: i64::try_from(plan.accepted).unwrap_or(i64::MAX),
-        rejected_records: i64::try_from(plan.rejected).unwrap_or(i64::MAX),
-        rejection_message: plan
-            .first_rejection
-            .map(|ordinal| rejection_reason(request, ordinal))
-            .transpose()?,
-    };
-    if plan.accepted == 0 {
-        return Ok((None, outcome));
+impl OtlpProjection<'_> {
+    /// Counts final logs Arrow and IPC material without allocating row buffers.
+    ///
+    /// # Errors
+    ///
+    /// Returns validation, schema, checked-size, or configured material refusal.
+    pub(crate) fn measure_logs(
+        &self,
+        request: &ExportLogsServiceRequest,
+        material_limit: usize,
+    ) -> Result<Option<super::otlp_managed::OtlpManagedMaterialPlan>, ScribeError> {
+        let plan = plan(request)?;
+        if plan.accepted == 0 {
+            return Ok(None);
+        }
+        let managed = self.managed(write_schema(), plan.accepted)?;
+        plan.material_plan(request, material_limit, &managed)
+            .map(Some)
     }
-    let managed = crate::scribe::otlp_managed::OtlpManagedProjection::plan(
-        write_schema(),
-        expected_fingerprint,
-        plan.accepted,
-        principal,
-        request_id,
-        batch_id,
-        receipt_micros,
-    )?;
-    let material = validate_material_plan(request, plan, material_limit, &managed)?;
-    let batch = materialize(request, plan)?;
-    Ok((Some(managed.finish(batch, material)?), outcome))
 }
 
-/// Refuses an oversized log slice from exact borrowed-source buffer facts.
-///
-/// # Errors
-///
-/// Returns a stable material refusal above `material_limit`, or invalid-frame
-/// when the count walk and canonical schema disagree.
-fn validate_material_plan(
-    request: &ExportLogsServiceRequest,
-    plan: LogPlan,
-    material_limit: usize,
-    managed: &crate::scribe::otlp_managed::OtlpManagedProjection,
-) -> Result<crate::scribe::otlp_managed::OtlpManagedMaterialPlan, ScribeError> {
-    use crate::scribe::fixed_ipc::FixedIpcColumnPlan;
+impl OtlpProjection<'_> {
+    /// Projects one typed logs request through allocation-free planning and exact
+    /// fixed-capacity Arrow construction and authoritative managed stamping. The
+    /// immutable caller context is planned before source materialization so the
+    /// limit covers the final persisted schema and IPC frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::InvalidFrame`] on checked arithmetic, serialization,
+    /// Arrow construction, fingerprint or managed-context validation, material
+    /// refusal, or pass divergence.
+    pub(crate) fn project_logs(
+        &self,
+        request: &ExportLogsServiceRequest,
+        material_limit: usize,
+    ) -> Result<
+        (
+            Option<crate::scribe::otlp_managed::OtlpManagedBatch>,
+            LogsOutcome,
+        ),
+        ScribeError,
+    > {
+        let plan = plan(request)?;
+        let outcome = LogsOutcome {
+            accepted_records: i64::try_from(plan.accepted).unwrap_or(i64::MAX),
+            rejected_records: i64::try_from(plan.rejected).unwrap_or(i64::MAX),
+            rejection_message: plan
+                .first_rejection
+                .map(|ordinal| rejection_reason(request, ordinal))
+                .transpose()?,
+        };
+        if plan.accepted == 0 {
+            return Ok((None, outcome));
+        }
+        let managed = self.managed(write_schema(), plan.accepted)?;
+        let material = plan.material_plan(request, material_limit, &managed)?;
+        let batch = materialize(request, plan)?;
+        Ok((Some(managed.finish(batch, material)?), outcome))
+    }
+}
 
-    let rows = plan.accepted;
-    let nulls = material_nulls(request)?;
-    let bitmap = rows.checked_add(7).ok_or(ScribeError::InvalidFrame)? / 8;
-    let offsets = rows
-        .checked_add(1)
-        .and_then(|value| value.checked_mul(4))
-        .ok_or(ScribeError::InvalidFrame)?;
-    let fixed = |width: usize, index: usize| -> Result<FixedIpcColumnPlan, ScribeError> {
-        Ok(FixedIpcColumnPlan {
+impl LogPlan {
+    /// Refuses an oversized log slice from exact borrowed-source buffer facts.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable material refusal above `material_limit`, or invalid-frame
+    /// when the count walk and canonical schema disagree.
+    fn material_plan(
+        &self,
+        request: &ExportLogsServiceRequest,
+        material_limit: usize,
+        managed: &crate::scribe::otlp_managed::OtlpManagedProjection,
+    ) -> Result<crate::scribe::otlp_managed::OtlpManagedMaterialPlan, ScribeError> {
+        use crate::scribe::fixed_ipc::FixedIpcColumnPlan;
+
+        let rows = self.accepted;
+        let nulls = material_nulls(request)?;
+        let bitmap = rows.checked_add(7).ok_or(ScribeError::InvalidFrame)? / 8;
+        let offsets = rows
+            .checked_add(1)
+            .and_then(|value| value.checked_mul(4))
+            .ok_or(ScribeError::InvalidFrame)?;
+        let fixed = |width: usize, index: usize| -> Result<FixedIpcColumnPlan, ScribeError> {
+            Ok(FixedIpcColumnPlan {
+                null_count: nulls[index],
+                validity_bytes: usize::from(nulls[index] != 0) * bitmap,
+                offsets_bytes: 0,
+                values_bytes: rows.checked_mul(width).ok_or(ScribeError::InvalidFrame)?,
+            })
+        };
+        let utf8 = |bytes: usize, index: usize| FixedIpcColumnPlan {
             null_count: nulls[index],
             validity_bytes: usize::from(nulls[index] != 0) * bitmap,
-            offsets_bytes: 0,
-            values_bytes: rows.checked_mul(width).ok_or(ScribeError::InvalidFrame)?,
-        })
-    };
-    let utf8 = |bytes: usize, index: usize| FixedIpcColumnPlan {
-        null_count: nulls[index],
-        validity_bytes: usize::from(nulls[index] != 0) * bitmap,
-        offsets_bytes: offsets,
-        values_bytes: bytes,
-    };
-    let columns = [
-        fixed(8, 0)?,
-        fixed(8, 1)?,
-        fixed(8, 2)?,
-        utf8(plan.severity_text.bytes, 3),
-        utf8(0, 4),
-        utf8(plan.body.bytes, 5),
-        fixed(16, 6)?,
-        fixed(8, 7)?,
-        fixed(8, 8)?,
-        utf8(plan.attributes.bytes, 9),
-        fixed(8, 10)?,
-        utf8(plan.service_name.bytes, 11),
-        utf8(plan.scope_name.bytes, 12),
-        utf8(plan.scope_version.bytes, 13),
-        utf8(0, 14),
-        utf8(0, 15),
-        utf8(0, 16),
-    ];
-    let final_plan = managed.material_plan(columns.into_iter())?;
-    final_plan.admitted_bytes(material_limit)?;
-    Ok(final_plan)
+            offsets_bytes: offsets,
+            values_bytes: bytes,
+        };
+        let columns = [
+            fixed(8, 0)?,
+            fixed(8, 1)?,
+            fixed(8, 2)?,
+            utf8(self.severity_text.bytes, 3),
+            utf8(0, 4),
+            utf8(self.body.bytes, 5),
+            fixed(16, 6)?,
+            fixed(8, 7)?,
+            fixed(8, 8)?,
+            utf8(self.attributes.bytes, 9),
+            fixed(8, 10)?,
+            utf8(self.service_name.bytes, 11),
+            utf8(self.scope_name.bytes, 12),
+            utf8(self.scope_version.bytes, 13),
+            utf8(0, 14),
+            utf8(0, 15),
+            utf8(0, 16),
+        ];
+        let final_plan = managed.material_plan(columns.into_iter())?;
+        final_plan.admitted_bytes(material_limit)?;
+        Ok(final_plan)
+    }
 }
 
 /// Counts nulls for every accepted logs schema column.
@@ -717,9 +731,6 @@ fn write_schema() -> Arc<Schema> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wyrd_runtime::permission::PermissionSet;
-    use wyrd_runtime::principal::{PrincipalId, PrincipalKind};
-    use wyrd_spec::DataTenantId;
     use wyrd_tonic::otlp::common::v1::{AnyValue, InstrumentationScope};
     use wyrd_tonic::otlp::resource::v1::Resource;
 
@@ -739,31 +750,10 @@ mod tests {
         ),
         ScribeError,
     > {
-        let principal = wyrd_runtime::Principal::new(
-            PrincipalId::new(uuid::Uuid::from_u128(1)),
-            PrincipalKind::User,
-            DataTenantId::new(
-                uuid::Uuid::parse_str("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b01")
-                    .expect("valid UUIDv7"),
-            )
-            .expect("tenant id"),
-            Vec::new(),
-            PermissionSet::new(),
-        );
-        let fingerprint =
-            crate::contracts::projected_source_schema_fingerprint(write_schema().as_ref());
-        let request_id =
-            wyrd_spec::request_id::RequestId::parse("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00")
-                .expect("valid request id");
-        project(
-            request,
-            material_limit,
-            &principal,
-            fingerprint,
-            &request_id,
-            uuid::Uuid::from_u128(3),
-            1_700_000_000_000_000,
-        )
+        let context = super::super::otlp_managed::OtlpTestContext::new();
+        context
+            .projection(write_schema().as_ref())
+            .project_logs(request, material_limit)
     }
 
     /// Computes the exact final Arrow-plus-IPC charge from pre-material facts.
@@ -773,32 +763,12 @@ mod tests {
     /// Returns the planner's validation, fingerprint, or checked-size error.
     fn exact_material_bytes(request: &ExportLogsServiceRequest) -> Result<usize, ScribeError> {
         let source = plan(request)?;
-        let principal = wyrd_runtime::Principal::new(
-            PrincipalId::new(uuid::Uuid::from_u128(1)),
-            PrincipalKind::User,
-            DataTenantId::new(
-                uuid::Uuid::parse_str("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b01")
-                    .expect("valid UUIDv7"),
-            )
-            .expect("tenant id"),
-            Vec::new(),
-            PermissionSet::new(),
-        );
-        let fingerprint =
-            crate::contracts::projected_source_schema_fingerprint(write_schema().as_ref());
-        let request_id =
-            wyrd_spec::request_id::RequestId::parse("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00")
-                .expect("valid request id");
-        let managed = crate::scribe::otlp_managed::OtlpManagedProjection::plan(
-            write_schema(),
-            fingerprint,
-            source.accepted,
-            &principal,
-            &request_id,
-            uuid::Uuid::from_u128(3),
-            1_700_000_000_000_000,
-        )?;
-        validate_material_plan(request, source, usize::MAX, &managed)?.admitted_bytes(usize::MAX)
+        let context = super::super::otlp_managed::OtlpTestContext::new();
+        let projection = context.projection(write_schema().as_ref());
+        let managed = projection.managed(write_schema(), source.accepted)?;
+        source
+            .material_plan(request, usize::MAX, &managed)?
+            .admitted_bytes(usize::MAX)
     }
 
     /// Constructs one rich log request with body, IDs, attributes, resource, and scope.

@@ -34,8 +34,113 @@ const EMPTY_FACT: FixedIpcColumnPlan = FixedIpcColumnPlan {
     values_bytes: 0,
 };
 
+/// Authenticated immutable context shared by OTLP preflight and projection.
+///
+/// Borrowed identity and fixed values keep planning independent of payload ownership.
+/// All signal operations use the same schema authority and managed row values.
+pub(crate) struct OtlpProjection<'a> {
+    /// Authenticated principal supplying tenant and principal identity.
+    principal: &'a Principal,
+    /// Catalog-authoritative user schema fingerprint.
+    expected_fingerprint: SchemaFingerprint,
+    /// Validated correlation identifier retained without copying.
+    request_id: &'a RequestId,
+    /// Durable identity shared by every row in this batch.
+    batch_id: uuid::Uuid,
+    /// Single receipt timestamp used by admission and materialization.
+    receipt_micros: i64,
+}
+
+impl<'a> OtlpProjection<'a> {
+    /// Captures the existing authenticated projection context without allocation.
+    pub(crate) fn new(
+        principal: &'a Principal,
+        expected_fingerprint: SchemaFingerprint,
+        request_id: &'a RequestId,
+        batch_id: uuid::Uuid,
+        receipt_micros: i64,
+    ) -> Self {
+        Self {
+            principal,
+            expected_fingerprint,
+            request_id,
+            batch_id,
+            receipt_micros,
+        }
+    }
+
+    /// Plans authoritative managed columns for one signal's accepted rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns schema, identity, or checked-size validation failures.
+    pub(super) fn managed(
+        &self,
+        schema: Arc<Schema>,
+        rows: usize,
+    ) -> Result<OtlpManagedProjection, ScribeError> {
+        OtlpManagedProjection::plan(
+            schema,
+            self.expected_fingerprint,
+            rows,
+            self.principal,
+            self.request_id,
+            self.batch_id,
+            self.receipt_micros,
+        )
+    }
+}
+
+/// Owns the fixed authenticated identity reused by OTLP projection unit fixtures.
+#[cfg(test)]
+pub(crate) struct OtlpTestContext {
+    /// Fixed principal and tenant shared by sizing and materialization.
+    principal: Principal,
+    /// Fixed request identity with production validation.
+    request_id: RequestId,
+}
+
+#[cfg(test)]
+impl OtlpTestContext {
+    /// Constructs deterministic valid context for IO-free projection tests.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the literal fixture identifiers violate their contracts.
+    pub(crate) fn new() -> Self {
+        Self {
+            principal: Principal::new(
+                wyrd_runtime::principal::PrincipalId::new(uuid::Uuid::from_u128(1)),
+                wyrd_runtime::principal::PrincipalKind::User,
+                wyrd_spec::DataTenantId::new(
+                    uuid::Uuid::parse_str("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b01")
+                        .expect("fixed UUIDv7"),
+                )
+                .expect("fixed tenant"),
+                Vec::new(),
+                wyrd_runtime::permission::PermissionSet::new(),
+            ),
+            request_id: RequestId::parse("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00")
+                .expect("fixed request id"),
+        }
+    }
+
+    /// Borrows the same authenticated context for a canonical signal schema.
+    pub(crate) fn projection(&self, schema: &Schema) -> OtlpProjection<'_> {
+        OtlpProjection::new(
+            &self.principal,
+            crate::contracts::projected_source_schema_fingerprint(schema),
+            &self.request_id,
+            uuid::Uuid::from_u128(3),
+            1_700_000_000_000_000,
+        )
+    }
+}
+
 /// Combined final Arrow backing and IPC sizing result for one OTLP slice.
 pub(crate) struct OtlpManagedMaterialPlan {
+    /// Accepted rows represented by the measured projection.
+    pub(crate) rows: usize,
     /// Exact final fixed IPC plan consumed by WAL slice encoding.
     pub(crate) ipc_plan: FixedIpcPlan,
     /// Exact Arrow public array memory reported by the finished record batch.
@@ -290,6 +395,7 @@ impl OtlpManagedProjection {
             final_facts[..final_count].iter().copied(),
         )?;
         Ok(OtlpManagedMaterialPlan {
+            rows: self.rows,
             ipc_plan,
             arrow_bytes,
         })

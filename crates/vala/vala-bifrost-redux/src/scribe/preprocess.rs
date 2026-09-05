@@ -216,41 +216,27 @@ impl OtlpSliceProducer {
         if self.produced {
             return Ok(None);
         }
+        let projection = super::otlp_managed::OtlpProjection::new(
+            &self.source.principal,
+            self.source.expected_schema_fingerprint,
+            &self.source.request_id,
+            self.source.batch_id,
+            self.source.receipt_micros,
+        );
         let (batch, outcome) = match &self.source.request {
             OtlpTypedRows::Traces(request) => {
-                let (batch, outcome) = crate::scribe::direct_traces::project(
-                    request,
-                    self.source.material_limit,
-                    &self.source.principal,
-                    self.source.expected_schema_fingerprint,
-                    &self.source.request_id,
-                    self.source.batch_id,
-                    self.source.receipt_micros,
-                )?;
+                let (batch, outcome) =
+                    projection.project_traces(request, self.source.material_limit)?;
                 (batch, crate::contracts::ScribeOtlpOutcome::Traces(outcome))
             }
             OtlpTypedRows::Metrics(request) => {
-                let (batch, outcome) = crate::scribe::direct_metrics::project(
-                    request,
-                    self.source.material_limit,
-                    &self.source.principal,
-                    self.source.expected_schema_fingerprint,
-                    &self.source.request_id,
-                    self.source.batch_id,
-                    self.source.receipt_micros,
-                )?;
+                let (batch, outcome) =
+                    projection.project_metrics(request, self.source.material_limit)?;
                 (batch, crate::contracts::ScribeOtlpOutcome::Metrics(outcome))
             }
             OtlpTypedRows::Logs(request) => {
-                let (batch, outcome) = crate::scribe::direct_logs::project(
-                    request,
-                    self.source.material_limit,
-                    &self.source.principal,
-                    self.source.expected_schema_fingerprint,
-                    &self.source.request_id,
-                    self.source.batch_id,
-                    self.source.receipt_micros,
-                )?;
+                let (batch, outcome) =
+                    projection.project_logs(request, self.source.material_limit)?;
                 (batch, crate::contracts::ScribeOtlpOutcome::Logs(outcome))
             }
         };

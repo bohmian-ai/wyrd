@@ -24,6 +24,7 @@ use wyrd_tonic::otlp::metrics::v1::{
 use wyrd_tonic::otlp::metrics_service::ExportMetricsServiceRequest;
 use wyrd_tonic::otlp::trace_service::ExportTraceServiceRequest;
 
+use super::otlp_managed::{OtlpManagedMaterialPlan, OtlpProjection};
 use crate::contracts::ScribeError;
 
 /// Maximum native record-batch descriptors retained by one plan.
@@ -138,12 +139,7 @@ pub(crate) fn configured_maximum_envelope_bytes(
         .max_frame_bytes
         .checked_add(managed)
         .ok_or_else(overflow)?;
-    let otlp_candidate = limits
-        .otlp
-        .request_bytes
-        .checked_add(limits.otlp.value_bytes)
-        .and_then(|bytes| bytes.checked_add(managed))
-        .ok_or_else(overflow)?;
+    let otlp_candidate = configured_otlp_material_bytes(limits)?;
     let candidate = native_candidate.max(otlp_candidate);
     let durable_metadata = limits
         .native_sources
@@ -163,6 +159,28 @@ pub(crate) fn configured_maximum_envelope_bytes(
         )?)
         .ok_or_else(overflow)?;
     Ok(preflight.max(persistence))
+}
+
+/// Returns the existing boot-sized upper material envelope for typed OTLP.
+///
+/// Request-specific exact projections may not exceed this configured envelope.
+/// Sharing the ceiling keeps boot proof and pre-allocation refusals consistent.
+///
+/// # Errors
+///
+/// Returns a material refusal when configured arithmetic overflows.
+fn configured_otlp_material_bytes(
+    limits: crate::gate::limits::IngestLimits,
+) -> Result<usize, ScribeError> {
+    limits
+        .otlp
+        .request_bytes
+        .checked_add(limits.otlp.value_bytes)
+        .and_then(|bytes| bytes.checked_add(managed_projection_bytes(limits.rows, 36).ok()?))
+        .ok_or(ScribeError::DecodedPayloadTooLarge {
+            bytes: usize::MAX,
+            limit: usize::MAX,
+        })
 }
 
 /// Pre-mutation decision for one plan against the node's replayable envelope.
@@ -195,6 +213,38 @@ impl IngestMaterialPlan {
                 limit_bytes: maximum_scribe_envelope_bytes,
             }
         }
+    }
+
+    /// Replaces the decoded-input estimate with exact accepted OTLP material.
+    ///
+    /// The decoded request remains independently charged. Arrow ownership also
+    /// supplies the immutable persistence candidate used by the replay guard.
+    ///
+    /// # Errors
+    ///
+    /// Returns a checked material-size overflow before root admission.
+    fn with_otlp_material(
+        mut self,
+        material: Option<OtlpManagedMaterialPlan>,
+    ) -> Result<Self, ScribeError> {
+        self.sources = [SourceMaterialPlan::default(); MAX_SOURCE_PLANS];
+        self.source_count = usize::from(material.is_some());
+        self.time_partition_count = self.source_count;
+        self.durable_metadata_bytes =
+            self.source_count * crate::scribe::shards::DURABLE_SLICE_LAYOUT_BYTES;
+        self.rows = material.as_ref().map_or(0, |value| value.rows);
+        self.current_material_bytes = material
+            .as_ref()
+            .map_or(Ok(0), |value| value.admitted_bytes(usize::MAX))?;
+        self.persistence_candidate_bytes = material.as_ref().map_or(0, |value| value.arrow_bytes);
+        if self.source_count != 0 {
+            self.sources[0] = SourceMaterialPlan {
+                rows: self.rows,
+                body_bytes: self.current_material_bytes,
+                ..SourceMaterialPlan::default()
+            };
+        }
+        self.finish()
     }
 
     /// Completes checked simultaneous-live-set arithmetic.
@@ -737,6 +787,7 @@ impl ScribeIngressPlanner {
         request: &ExportTraceServiceRequest,
         request_bytes: usize,
         name_bytes: usize,
+        projection: &OtlpProjection<'_>,
     ) -> Result<IngestMaterialPlan, ScribeError> {
         let mut counts = OtlpCounts::new(self.limits);
         for resource in &request.resource_spans {
@@ -778,7 +829,10 @@ impl ScribeIngressPlanner {
                 }
             }
         }
-        counts.finish(request_bytes, name_bytes)
+        let counted = counts.finish(request_bytes, name_bytes)?;
+        let material =
+            projection.measure_traces(request, configured_otlp_material_bytes(self.limits)?)?;
+        counted.with_otlp_material(material)
     }
 
     /// Counts a typed metrics request without projecting records.
@@ -792,6 +846,7 @@ impl ScribeIngressPlanner {
         request: &ExportMetricsServiceRequest,
         request_bytes: usize,
         name_bytes: usize,
+        projection: &OtlpProjection<'_>,
     ) -> Result<IngestMaterialPlan, ScribeError> {
         let mut counts = OtlpCounts::new(self.limits);
         for resource in &request.resource_metrics {
@@ -845,7 +900,10 @@ impl ScribeIngressPlanner {
                 }
             }
         }
-        counts.finish(request_bytes, name_bytes)
+        let counted = counts.finish(request_bytes, name_bytes)?;
+        let material =
+            projection.measure_metrics(request, configured_otlp_material_bytes(self.limits)?)?;
+        counted.with_otlp_material(material)
     }
 
     /// Counts a typed logs request without projecting records.
@@ -859,6 +917,7 @@ impl ScribeIngressPlanner {
         request: &ExportLogsServiceRequest,
         request_bytes: usize,
         name_bytes: usize,
+        projection: &OtlpProjection<'_>,
     ) -> Result<IngestMaterialPlan, ScribeError> {
         let mut counts = OtlpCounts::new(self.limits);
         for resource in &request.resource_logs {
@@ -889,7 +948,10 @@ impl ScribeIngressPlanner {
                 }
             }
         }
-        counts.finish(request_bytes, name_bytes)
+        let counted = counts.finish(request_bytes, name_bytes)?;
+        let material =
+            projection.measure_logs(request, configured_otlp_material_bytes(self.limits)?)?;
+        counted.with_otlp_material(material)
     }
 }
 
@@ -1935,8 +1997,10 @@ mod tests {
                 ..ResourceLogs::default()
             }],
         };
+        let context = super::super::otlp_managed::OtlpTestContext::new();
+        let projection = context.projection(&Schema::empty());
         assert!(matches!(
-            ScribeIngressPlanner::default().plan_logs(&request, 1, 0),
+            ScribeIngressPlanner::default().plan_logs(&request, 1, 0, &projection),
             Err(ScribeError::InvalidFrame)
         ));
     }

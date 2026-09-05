@@ -225,6 +225,7 @@ impl ScribeImpl {
         &self,
         frame: &ScribeIngressFrame,
         physical_binding_peak_bytes: usize,
+        projection: &super::otlp_managed::OtlpProjection<'_>,
     ) -> Result<MaterialPlan, ScribeError> {
         let planner = ScribeIngressPlanner::new(self.ingest_limits);
         let plan = match &frame.payload {
@@ -235,16 +236,19 @@ impl ScribeImpl {
                 &request.request,
                 request.decode_bytes,
                 physical_binding_peak_bytes,
+                projection,
             ),
             IngressPayload::OtlpMetrics(request) => planner.plan_metrics(
                 &request.request,
                 request.decode_bytes,
                 physical_binding_peak_bytes,
+                projection,
             ),
             IngressPayload::OtlpLogs(request) => planner.plan_logs(
                 &request.request,
                 request.decode_bytes,
                 physical_binding_peak_bytes,
+                projection,
             ),
             IngressPayload::ProjectedArrow(batches) => planner.plan_projected(
                 batches,
@@ -410,7 +414,15 @@ impl ScribeImpl {
         let binding_facts =
             crate::catalog::TenantTableBinding::facts(&frame.authenticated_tenant, &frame.table)
                 .map_err(|_| ScribeError::InvalidFrame)?;
-        let material_plan = self.plan_transport_payload(frame, binding_facts.peak_bytes)?;
+        let projection = super::otlp_managed::OtlpProjection::new(
+            &frame.principal,
+            expected_schema_fingerprint,
+            &frame.request_id,
+            frame.batch_id,
+            receipt_micros,
+        );
+        let material_plan =
+            self.plan_transport_payload(frame, binding_facts.peak_bytes, &projection)?;
         if let MaximumEnvelopeDecision::IntrinsicRefusal {
             demand_bytes,
             limit_bytes,

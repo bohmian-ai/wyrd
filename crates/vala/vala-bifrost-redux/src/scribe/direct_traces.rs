@@ -19,6 +19,7 @@ use wyrd_tonic::otlp::common::v1::{AnyValue, KeyValue, any_value};
 use wyrd_tonic::otlp::trace::v1::{ResourceSpans, Span, span, status::StatusCode};
 use wyrd_tonic::otlp::trace_service::ExportTraceServiceRequest;
 
+use super::otlp_managed::OtlpProjection;
 use crate::contracts::ScribeError;
 use crate::otlp_contract::IngestOutcome;
 use crate::tables::{DomainTable, SpansTable};
@@ -221,118 +222,130 @@ impl ExactStringColumn {
     }
 }
 
-/// Projects one typed trace request through an allocation-free sizing pass and
-/// an exact-capacity Arrow construction pass.
-///
-/// # Errors
-///
-/// Returns [`ScribeError::InvalidFrame`] when JSON sizing, checked capacity
-/// arithmetic, Arrow construction, or pass-to-pass validation diverges.
-pub(crate) fn project(
-    request: &ExportTraceServiceRequest,
-    material_limit: usize,
-    principal: &wyrd_runtime::Principal,
-    expected_fingerprint: crate::schema::SchemaFingerprint,
-    request_id: &wyrd_spec::request_id::RequestId,
-    batch_id: uuid::Uuid,
-    receipt_micros: i64,
-) -> Result<
-    (
-        Option<crate::scribe::otlp_managed::OtlpManagedBatch>,
-        IngestOutcome,
-    ),
-    ScribeError,
-> {
-    let plan = plan(request)?;
-    let rejection_message = plan
-        .first_rejection
-        .map(|coordinate| rejection_reason(request, coordinate))
-        .transpose()?;
-    let outcome = IngestOutcome {
-        accepted_spans: i64::try_from(plan.accepted).unwrap_or(i64::MAX),
-        rejected_spans: i64::try_from(plan.rejected).unwrap_or(i64::MAX),
-        rejection_message,
-    };
-    if plan.accepted == 0 {
-        return Ok((None, outcome));
+impl OtlpProjection<'_> {
+    /// Counts final traces Arrow and IPC material without allocating row buffers.
+    ///
+    /// # Errors
+    ///
+    /// Returns validation, schema, checked-size, or configured material refusal.
+    pub(crate) fn measure_traces(
+        &self,
+        request: &ExportTraceServiceRequest,
+        material_limit: usize,
+    ) -> Result<Option<super::otlp_managed::OtlpManagedMaterialPlan>, ScribeError> {
+        let plan = plan(request)?;
+        if plan.accepted == 0 {
+            return Ok(None);
+        }
+        let managed = self.managed(write_schema(), plan.accepted)?;
+        plan.material_plan(material_limit, &managed).map(Some)
     }
-    let managed = crate::scribe::otlp_managed::OtlpManagedProjection::plan(
-        write_schema(),
-        expected_fingerprint,
-        plan.accepted,
-        principal,
-        request_id,
-        batch_id,
-        receipt_micros,
-    )?;
-    let material = validate_material_plan(plan, material_limit, &managed)?;
-    let batch = materialize(request, plan)?;
-    Ok((Some(managed.finish(batch, material)?), outcome))
 }
 
-/// Refuses an oversized trace slice from immutable public Arrow and IPC facts.
-///
-/// # Errors
-///
-/// Returns [`ScribeError::DecodedPayloadTooLarge`] when the exact combined
-/// backing exceeds `material_limit`, and [`ScribeError::InvalidFrame`] when
-/// the canonical schema and count facts disagree.
-fn validate_material_plan(
-    plan: TracePlan,
-    material_limit: usize,
-    managed: &crate::scribe::otlp_managed::OtlpManagedProjection,
-) -> Result<crate::scribe::otlp_managed::OtlpManagedMaterialPlan, ScribeError> {
-    use crate::scribe::fixed_ipc::FixedIpcColumnPlan;
+impl OtlpProjection<'_> {
+    /// Projects one typed trace request through an allocation-free sizing pass and
+    /// an exact-capacity Arrow construction pass.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::InvalidFrame`] when JSON sizing, checked capacity
+    /// arithmetic, Arrow construction, or pass-to-pass validation diverges.
+    pub(crate) fn project_traces(
+        &self,
+        request: &ExportTraceServiceRequest,
+        material_limit: usize,
+    ) -> Result<
+        (
+            Option<crate::scribe::otlp_managed::OtlpManagedBatch>,
+            IngestOutcome,
+        ),
+        ScribeError,
+    > {
+        let plan = plan(request)?;
+        let rejection_message = plan
+            .first_rejection
+            .map(|coordinate| rejection_reason(request, coordinate))
+            .transpose()?;
+        let outcome = IngestOutcome {
+            accepted_spans: i64::try_from(plan.accepted).unwrap_or(i64::MAX),
+            rejected_spans: i64::try_from(plan.rejected).unwrap_or(i64::MAX),
+            rejection_message,
+        };
+        if plan.accepted == 0 {
+            return Ok((None, outcome));
+        }
+        let managed = self.managed(write_schema(), plan.accepted)?;
+        let material = plan.material_plan(material_limit, &managed)?;
+        let batch = materialize(request, plan)?;
+        Ok((Some(managed.finish(batch, material)?), outcome))
+    }
+}
 
-    let rows = plan.accepted;
-    let bitmap = rows.checked_add(7).ok_or(ScribeError::InvalidFrame)? / 8;
-    let offsets = rows
-        .checked_add(1)
-        .and_then(|value| value.checked_mul(4))
-        .ok_or(ScribeError::InvalidFrame)?;
-    let fixed = |width: usize, null_count: usize| -> Result<FixedIpcColumnPlan, ScribeError> {
-        Ok(FixedIpcColumnPlan {
-            null_count,
-            validity_bytes: usize::from(null_count != 0) * bitmap,
-            offsets_bytes: 0,
-            values_bytes: rows.checked_mul(width).ok_or(ScribeError::InvalidFrame)?,
-        })
-    };
-    let utf8 =
-        |values_bytes: usize, null_count: usize| -> Result<FixedIpcColumnPlan, ScribeError> {
+impl TracePlan {
+    /// Refuses an oversized trace slice from immutable public Arrow and IPC facts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::DecodedPayloadTooLarge`] when the exact combined
+    /// backing exceeds `material_limit`, and [`ScribeError::InvalidFrame`] when
+    /// the canonical schema and count facts disagree.
+    fn material_plan(
+        &self,
+        material_limit: usize,
+        managed: &crate::scribe::otlp_managed::OtlpManagedProjection,
+    ) -> Result<crate::scribe::otlp_managed::OtlpManagedMaterialPlan, ScribeError> {
+        use crate::scribe::fixed_ipc::FixedIpcColumnPlan;
+
+        let rows = self.accepted;
+        let bitmap = rows.checked_add(7).ok_or(ScribeError::InvalidFrame)? / 8;
+        let offsets = rows
+            .checked_add(1)
+            .and_then(|value| value.checked_mul(4))
+            .ok_or(ScribeError::InvalidFrame)?;
+        let fixed = |width: usize, null_count: usize| -> Result<FixedIpcColumnPlan, ScribeError> {
             Ok(FixedIpcColumnPlan {
                 null_count,
                 validity_bytes: usize::from(null_count != 0) * bitmap,
-                offsets_bytes: offsets,
-                values_bytes,
+                offsets_bytes: 0,
+                values_bytes: rows.checked_mul(width).ok_or(ScribeError::InvalidFrame)?,
             })
         };
-    let columns = [
-        fixed(16, 0)?,
-        fixed(8, 0)?,
-        fixed(8, plan.parent_nulls)?,
-        fixed(8, 0)?,
-        utf8(plan.utf8.trace_state, 0)?,
-        utf8(plan.utf8.name, 0)?,
-        utf8(plan.utf8.kind, 0)?,
-        fixed(8, 0)?,
-        fixed(8, 0)?,
-        fixed(8, 0)?,
-        utf8(plan.utf8.status, 0)?,
-        utf8(plan.utf8.attributes, 0)?,
-        fixed(8, 0)?,
-        fixed(8, 0)?,
-        fixed(8, 0)?,
-        utf8(plan.utf8.scope_name, 0)?,
-        utf8(plan.utf8.scope_version, plan.scope_version_nulls)?,
-        utf8(plan.utf8.service_name, 0)?,
-        utf8(0, rows)?,
-        utf8(0, rows)?,
-        utf8(0, rows)?,
-    ];
-    let final_plan = managed.material_plan(columns.into_iter())?;
-    final_plan.admitted_bytes(material_limit)?;
-    Ok(final_plan)
+        let utf8 =
+            |values_bytes: usize, null_count: usize| -> Result<FixedIpcColumnPlan, ScribeError> {
+                Ok(FixedIpcColumnPlan {
+                    null_count,
+                    validity_bytes: usize::from(null_count != 0) * bitmap,
+                    offsets_bytes: offsets,
+                    values_bytes,
+                })
+            };
+        let columns = [
+            fixed(16, 0)?,
+            fixed(8, 0)?,
+            fixed(8, self.parent_nulls)?,
+            fixed(8, 0)?,
+            utf8(self.utf8.trace_state, 0)?,
+            utf8(self.utf8.name, 0)?,
+            utf8(self.utf8.kind, 0)?,
+            fixed(8, 0)?,
+            fixed(8, 0)?,
+            fixed(8, 0)?,
+            utf8(self.utf8.status, 0)?,
+            utf8(self.utf8.attributes, 0)?,
+            fixed(8, 0)?,
+            fixed(8, 0)?,
+            fixed(8, 0)?,
+            utf8(self.utf8.scope_name, 0)?,
+            utf8(self.utf8.scope_version, self.scope_version_nulls)?,
+            utf8(self.utf8.service_name, 0)?,
+            utf8(0, rows)?,
+            utf8(0, rows)?,
+            utf8(0, rows)?,
+        ];
+        let final_plan = managed.material_plan(columns.into_iter())?;
+        final_plan.admitted_bytes(material_limit)?;
+        Ok(final_plan)
+    }
 }
 
 /// Plans exact accepted-row and UTF-8 capacities without constructing domain
@@ -999,9 +1012,6 @@ pub(super) fn write_any(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wyrd_runtime::permission::PermissionSet;
-    use wyrd_runtime::principal::{PrincipalId, PrincipalKind};
-    use wyrd_spec::DataTenantId;
     use wyrd_tonic::otlp::common::v1::InstrumentationScope;
     use wyrd_tonic::otlp::resource::v1::Resource;
     use wyrd_tonic::otlp::trace::v1::{ScopeSpans, Status};
@@ -1022,31 +1032,10 @@ mod tests {
         ),
         ScribeError,
     > {
-        let principal = wyrd_runtime::Principal::new(
-            PrincipalId::new(uuid::Uuid::from_u128(1)),
-            PrincipalKind::User,
-            DataTenantId::new(
-                uuid::Uuid::parse_str("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b01")
-                    .expect("valid UUIDv7"),
-            )
-            .expect("tenant id"),
-            Vec::new(),
-            PermissionSet::new(),
-        );
-        let fingerprint =
-            crate::contracts::projected_source_schema_fingerprint(write_schema().as_ref());
-        let request_id =
-            wyrd_spec::request_id::RequestId::parse("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00")
-                .expect("valid request id");
-        project(
-            request,
-            material_limit,
-            &principal,
-            fingerprint,
-            &request_id,
-            uuid::Uuid::from_u128(3),
-            1_700_000_000_000_000,
-        )
+        let context = super::super::otlp_managed::OtlpTestContext::new();
+        context
+            .projection(write_schema().as_ref())
+            .project_traces(request, material_limit)
     }
 
     /// Computes the exact final Arrow-plus-IPC charge from pre-material facts.
@@ -1056,32 +1045,12 @@ mod tests {
     /// Returns the planner's validation, fingerprint, or checked-size error.
     fn exact_material_bytes(request: &ExportTraceServiceRequest) -> Result<usize, ScribeError> {
         let source = plan(request)?;
-        let principal = wyrd_runtime::Principal::new(
-            PrincipalId::new(uuid::Uuid::from_u128(1)),
-            PrincipalKind::User,
-            DataTenantId::new(
-                uuid::Uuid::parse_str("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b01")
-                    .expect("valid UUIDv7"),
-            )
-            .expect("tenant id"),
-            Vec::new(),
-            PermissionSet::new(),
-        );
-        let fingerprint =
-            crate::contracts::projected_source_schema_fingerprint(write_schema().as_ref());
-        let request_id =
-            wyrd_spec::request_id::RequestId::parse("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00")
-                .expect("valid request id");
-        let managed = crate::scribe::otlp_managed::OtlpManagedProjection::plan(
-            write_schema(),
-            fingerprint,
-            source.accepted,
-            &principal,
-            &request_id,
-            uuid::Uuid::from_u128(3),
-            1_700_000_000_000_000,
-        )?;
-        validate_material_plan(source, usize::MAX, &managed)?.admitted_bytes(usize::MAX)
+        let context = super::super::otlp_managed::OtlpTestContext::new();
+        let projection = context.projection(write_schema().as_ref());
+        let managed = projection.managed(write_schema(), source.accepted)?;
+        source
+            .material_plan(usize::MAX, &managed)?
+            .admitted_bytes(usize::MAX)
     }
 
     /// Constructs one typed OTLP key/value fixture.
@@ -1220,5 +1189,32 @@ mod tests {
             project_fixture(&request, exact - 1),
             Err(ScribeError::DecodedPayloadTooLarge { .. })
         ));
+    }
+    /// Small exports reserve the Arrow and IPC projection, not just decoded input.
+    ///
+    /// # Errors
+    ///
+    /// Returns fixture planning or projection failures.
+    #[test]
+    fn ingress_plan_covers_projection() -> Result<(), ScribeError> {
+        let request = request();
+        let context = super::super::otlp_managed::OtlpTestContext::new();
+        let projection = context.projection(write_schema().as_ref());
+        let admitted = crate::scribe::material_plan::ScribeIngressPlanner::default().plan_traces(
+            &request,
+            1024,
+            0,
+            &projection,
+        )?;
+        let exact = exact_material_bytes(&request)?;
+        assert!(
+            admitted.current_material_bytes >= exact,
+            "admitted {} bytes cannot hold the exact {exact}-byte projection",
+            admitted.current_material_bytes
+        );
+        let (batch, _) = project_fixture(&request, admitted.current_material_bytes)?;
+        let batch = batch.expect("valid spans produce rows");
+        assert!(admitted.persistence_candidate_bytes >= batch.rows.get_array_memory_size());
+        Ok(())
     }
 }

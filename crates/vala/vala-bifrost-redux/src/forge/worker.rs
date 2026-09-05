@@ -465,6 +465,18 @@ pub struct ForgeWorkerCompletionObserver {
     /// One-shot injected failure of the next worker-owned table-lease release.
     #[cfg(feature = "test-support")]
     fail_next_lease_release: Arc<AtomicBool>,
+    /// One-shot pause before releasing the worker-owned table lease.
+    #[cfg(feature = "test-support")]
+    hold_next_release: Arc<AtomicBool>,
+    /// Whether the lease release is parked after durable settlement.
+    #[cfg(feature = "test-support")]
+    release_paused: Arc<AtomicBool>,
+    /// Wakes a test when settlement has reached lease release.
+    #[cfg(feature = "test-support")]
+    release_pause_ready: Arc<tokio::sync::Notify>,
+    /// Lets the parked release continue through its real production boundary.
+    #[cfg(feature = "test-support")]
+    release_pause_resume: Arc<tokio::sync::Notify>,
     /// One-shot injected failure of the next cancelled-claim release.
     #[cfg(feature = "test-support")]
     fail_next_cancelled_claim_release: Arc<AtomicBool>,
@@ -901,6 +913,30 @@ impl ForgeWorkerCompletionObserver {
         }
     }
 
+    /// Parks the next table-lease release after execution and durable settlement.
+    pub fn hold_before_next_lease_release_for_test(&self) {
+        self.release_paused.store(false, Ordering::Release);
+        self.hold_next_release.store(true, Ordering::Release);
+    }
+
+    /// Waits until the armed release reaches the production worker boundary.
+    ///
+    /// Callers own a bounded diagnostic timeout and cancellation of spawned work.
+    pub async fn wait_for_held_lease_release_for_test(&self) {
+        loop {
+            let notified = self.release_pause_ready.notified();
+            if self.release_paused.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Releases the parked table-lease operation without changing its result.
+    pub fn release_held_lease_release_for_test(&self) {
+        self.release_pause_resume.notify_one();
+    }
+
     /// Hold supervised workers after a durable claim until `expected` roles participate.
     ///
     /// This is a test-support-only deterministic topology seam. It observes a
@@ -1211,7 +1247,7 @@ impl ScratchVolumeIdentity {
     }
 }
 
-/// Completed fenced execution state awaiting settlement and telemetry.
+/// Fenced execution state awaiting durable failure settlement and lease release.
 struct ClaimExecutionOutcome<'task> {
     /// Durable task claim being settled.
     task: &'task ForgeTaskClaim,
@@ -1221,10 +1257,6 @@ struct ClaimExecutionOutcome<'task> {
     stage: ForgeExecutionStage,
     /// Table fence held through settlement.
     lease: ForgeLease,
-    /// Task span receiving the terminal result.
-    task_span: tracing::Span,
-    /// Complete execution duration.
-    elapsed: Duration,
     /// Fenced execution result: whether the requested effect settled.
     result: Result<bool, ForgeError>,
 }
@@ -1582,6 +1614,9 @@ impl ForgeWorker {
         else {
             return Ok(false);
         };
+        let started = Instant::now();
+        let active = Self::metric_strategy(&claim.strategy)
+            .map(|strategy| self.forge.core.telemetry.active_task(strategy));
         let task_id = claim.task_id;
         let strategy = claim.strategy.clone();
         #[cfg(feature = "test-support")]
@@ -1591,9 +1626,6 @@ impl ForgeWorker {
                 worker_id: self.owner,
             });
         }
-        let metric_strategy = Self::metric_strategy(&strategy);
-        // Held for the whole attempt so every exit balances the increment.
-        let _active = metric_strategy.map(|metric| self.forge.core.telemetry.active_task(metric));
         tracing::info!(
             worker = %self.owner,
             task_id = %task_id,
@@ -1605,7 +1637,9 @@ impl ForgeWorker {
         // Boxed for the same reason `run_slot` is: execution nests deeply, and
         // holding that whole state machine inline inside the startup drain
         // pushes the composed server future past rustc's layout-query budget.
-        if Box::pin(self.execute_claim(claim, shutdown)).await? {
+        let result = Box::pin(self.execute_claim_observed(&claim, shutdown, started)).await;
+        drop(active);
+        if result? {
             self.record_completion(task_id, strategy);
         }
         Ok(true)
@@ -1647,6 +1681,15 @@ impl ForgeWorker {
     /// Returns the lease layer's release failure, or the injected typed SQL
     /// conflict when a test armed the one-shot seam.
     async fn release_table_lease(&self, lease: &mut ForgeLease) -> Result<bool, ForgeError> {
+        #[cfg(feature = "test-support")]
+        if let Some(observer) = &self.completion_observer
+            && observer.hold_next_release.swap(false, Ordering::AcqRel)
+        {
+            observer.release_paused.store(true, Ordering::Release);
+            observer.release_pause_ready.notify_waiters();
+            observer.release_pause_resume.notified().await;
+            observer.release_paused.store(false, Ordering::Release);
+        }
         #[cfg(feature = "test-support")]
         if let Some(observer) = &self.completion_observer
             && observer.take_lease_release_failure()
@@ -1749,6 +1792,9 @@ impl ForgeWorker {
                 }
                 continue;
             };
+            let started = Instant::now();
+            let active = Self::metric_strategy(&claim.strategy)
+                .map(|strategy| self.forge.core.telemetry.active_task(strategy));
             let task_id = claim.task_id;
             #[cfg(feature = "test-support")]
             if let Some(observer) = &self.completion_observer {
@@ -1765,15 +1811,24 @@ impl ForgeWorker {
                 }
             }
             if shutdown.is_cancelled() {
-                if let Some(attempt) = claim.attempt_id
-                    && let Err(error) = self.release_cancelled_claim(task_id, attempt).await
-                {
-                    tracing::error!(worker = %self.owner, task_id = %task_id, error = %error, "Forge claim shutdown release failed; durable state retained for lease recovery");
-                    // The claim is still held by this owner in durable state, so
-                    // this worker cannot honestly report that it drained.
-                    return Err(error);
+                let released = if let Some(attempt) = claim.attempt_id {
+                    self.release_cancelled_claim(task_id, attempt).await
+                } else {
+                    Ok(())
+                };
+                if let Err(error) = &released {
+                    tracing::error!(worker = %self.owner, task_id = %task_id, error = %error,
+                        "Forge claim shutdown release failed; durable state retained for lease recovery");
                 }
-                return Ok(());
+                self.record_task_execution_telemetry(
+                    claim.data_tenant_id,
+                    task_id,
+                    Self::metric_strategy(&claim.strategy),
+                    &tracing::Span::none(),
+                    started,
+                )
+                .await;
+                return released;
             }
             let strategy = claim.strategy.clone();
             // One INFO per claimed task, not per file or per row: Forge tasks are
@@ -1785,13 +1840,10 @@ impl ForgeWorker {
                 strategy = ?strategy,
                 "Forge task claimed"
             );
-            let started = std::time::Instant::now();
-            let metric_strategy = Self::metric_strategy(&strategy);
-            // Held for the whole attempt so every exit — commit, refusal,
-            // cancellation, or unwind — balances the increment exactly once.
-            let _active =
-                metric_strategy.map(|metric| self.forge.core.telemetry.active_task(metric));
-            let result = self.execute_claim(claim, &shutdown).await;
+            let result = self
+                .execute_claim_observed(&claim, &shutdown, started)
+                .await;
+            drop(active);
             tracing::info!(
                 worker = %self.owner,
                 task_id = %task_id,
@@ -1823,8 +1875,8 @@ impl ForgeWorker {
     /// # Errors
     ///
     /// Returns [`ForgeError::Sql`] when the bounded recovery claim fails. A
-    /// reconciliation failure is logged and retains its exact evidence rather
-    /// than failing the slot.
+    /// reconciliation or release failure retains exact evidence and stops the
+    /// slot before any later claim.
     ///
     /// # Cancellation
     ///
@@ -1844,15 +1896,7 @@ impl ForgeWorker {
         };
         let task_id = prepared.task.task_id;
         let strategy = ForgeClaimStrategy::Known(prepared.task.strategy);
-        #[cfg(feature = "test-support")]
-        if let Some(observer) = &self.completion_observer {
-            observer.record_lifecycle(ForgeLifecycleEvent::Claimed {
-                task_id,
-                worker_id: self.owner,
-            });
-        }
         let result = self.reconcile_prepared(prepared, shutdown).await;
-        self.record_attempt(result.as_ref().err());
         #[cfg(feature = "test-support")]
         self.pause_after_attempt_for_test().await;
         match result {
@@ -2106,6 +2150,34 @@ impl ForgeWorker {
         claim: ForgeTaskClaim,
         shutdown: &CancellationToken,
     ) -> Result<(), ForgeError> {
+        let started = Instant::now();
+        let _active = Self::metric_strategy(&claim.strategy)
+            .map(|strategy| self.forge.core.telemetry.active_task(strategy));
+        let result = self
+            .execute_maintenance_claim_attempt_for_test(expected, &claim, shutdown)
+            .await;
+        self.record_task_execution_telemetry(
+            claim.data_tenant_id,
+            claim.task_id,
+            Self::metric_strategy(&claim.strategy),
+            &tracing::Span::none(),
+            started,
+        )
+        .await;
+        result
+    }
+
+    /// Runs the established maintenance adapter under its caller's ownership guard.
+    ///
+    /// # Errors
+    /// Preserves the adapter's validation, fenced execution, and release semantics.
+    #[cfg(feature = "test-support")]
+    async fn execute_maintenance_claim_attempt_for_test(
+        &self,
+        expected: ForgeTaskStrategy,
+        claim: &ForgeTaskClaim,
+        shutdown: &CancellationToken,
+    ) -> Result<(), ForgeError> {
         if claim.strategy != ForgeClaimStrategy::Known(expected) {
             return Err(ForgeError::Invariant {
                 detail: "the maintenance test entrypoint accepts only its own strategy".to_owned(),
@@ -2119,7 +2191,7 @@ impl ForgeWorker {
                 detail: "Forge worker received a claim owned by another attempt".to_owned(),
             });
         }
-        Self::validate_payload_contract(&claim)?;
+        Self::validate_payload_contract(claim)?;
         let binding = task_table_binding(
             claim.data_tenant_id,
             claim.execution_tenant_id,
@@ -2141,7 +2213,7 @@ impl ForgeWorker {
             lease_key: format!("forge:table:{}:{}", claim.data_tenant_id, binding.table_ref),
         })?;
         let result = self
-            .execute_fenced(&claim, attempt, &binding, &mut lease, shutdown)
+            .execute_fenced(claim, attempt, &binding, &mut lease, shutdown)
             .await;
         if let Err(error) = lease.release(&self.forge.core.operator_pool).await {
             tracing::warn!(task_id = %claim.task_id, error = %error, "Forge expiry test lease release failed");
@@ -2284,14 +2356,58 @@ impl ForgeWorker {
         claim: ForgeTaskClaim,
         shutdown: &CancellationToken,
     ) -> Result<bool, ForgeError> {
+        let started = Instant::now();
+        let _active = Self::metric_strategy(&claim.strategy)
+            .map(|strategy| self.forge.core.telemetry.active_task(strategy));
+        self.execute_claim_observed(&claim, shutdown, started).await
+    }
+
+    /// Completes one ordinary ownership episode whose guard is held by the caller.
+    ///
+    /// The claim-time instant includes observer gates, validation, lease acquisition,
+    /// durable failure settlement, release, and the final durable observation.
+    ///
+    /// # Errors
+    /// Preserves the execution/settlement/release result; telemetry is diagnostic-only.
+    ///
+    /// # Cancellation
+    /// Execution's existing durable shutdown settlement runs before observation.
+    async fn execute_claim_observed(
+        &self,
+        claim: &ForgeTaskClaim,
+        shutdown: &CancellationToken,
+        started: Instant,
+    ) -> Result<bool, ForgeError> {
+        let span = tracing::info_span!(
+            "bifrost.forge.task.execute",
+            strategy = claim.strategy.as_str(),
+            result = tracing::field::Empty,
+            role = "forge_worker",
+            task_id = %claim.task_id,
+            attempt_id = tracing::field::Empty,
+        );
+        if let Some(attempt) = claim.attempt_id {
+            span.record("attempt_id", tracing::field::display(attempt));
+        }
         // Exactly one passive observation per attempt. An execution failure the
         // attempt durably settled is reported here even though the attempt
         // itself returns a healthy boolean, so the failure stays observable
         // without turning a settled outcome into a slot-fatal error.
         let mut settled_failure = None;
-        let outcome = self
-            .execute_claim_attempt(claim, shutdown, &mut settled_failure)
-            .await;
+        let outcome = tracing::Instrument::instrument(
+            self.execute_claim_attempt(claim, shutdown, &mut settled_failure),
+            span.clone(),
+        )
+        .await;
+        self.record_task_execution_telemetry(
+            claim.data_tenant_id,
+            claim.task_id,
+            Self::metric_strategy(&claim.strategy),
+            &span,
+            started,
+        )
+        .await;
+        drop(span);
         self.record_attempt(settled_failure.as_ref().or(outcome.as_ref().err()));
         outcome
     }
@@ -2306,11 +2422,11 @@ impl ForgeWorker {
     /// Returns every failure [`Self::execute_claim`] documents.
     async fn execute_claim_attempt(
         &self,
-        claim: ForgeTaskClaim,
+        claim: &ForgeTaskClaim,
         shutdown: &CancellationToken,
         settled_failure: &mut Option<ForgeError>,
     ) -> Result<bool, ForgeError> {
-        let task = &claim;
+        let task = claim;
         if claim.execution_tenant_id != task.data_tenant_id {
             return Err(ForgeError::Invariant {
                 detail: "Forge task tenant differs from claim execution context".to_owned(),
@@ -2365,29 +2481,15 @@ impl ForgeWorker {
         if lease.takeover() {
             tracing::info!(task_id = %task.task_id, "Forge worker took over an expired table fence");
         }
-        let started = Instant::now();
-        let task_span = tracing::info_span!(
-            "bifrost.forge.task.execute",
-            strategy = task.strategy.as_str(),
-            result = tracing::field::Empty,
-            role = "forge_worker",
-            task_id = %task.task_id,
-            attempt_id = %attempt,
-        );
-        let result = tracing::Instrument::instrument(
-            self.execute_fenced(task, attempt, &binding, &mut lease, shutdown),
-            task_span.clone(),
-        )
-        .await;
-        let elapsed = started.elapsed();
+        let result = self
+            .execute_fenced(task, attempt, &binding, &mut lease, shutdown)
+            .await;
         self.settle_claim_execution(
             ClaimExecutionOutcome {
                 task,
                 attempt,
                 stage,
                 lease,
-                task_span,
-                elapsed,
                 result,
             },
             settled_failure,
@@ -2395,7 +2497,7 @@ impl ForgeWorker {
         .await
     }
 
-    /// Settles failure, records telemetry, and releases one task's table lease.
+    /// Settles failure and releases one task's table lease before outer observation.
     ///
     /// Returns whether the requested effect settled. An execution failure whose
     /// durable settlement and lease release both commit is a healthy outcome
@@ -2417,8 +2519,6 @@ impl ForgeWorker {
             attempt,
             stage,
             mut lease,
-            task_span,
-            elapsed,
             result,
         } = outcome;
         if let Err(error) = &result {
@@ -2441,12 +2541,9 @@ impl ForgeWorker {
             tracing::error!(task_id=%task.task_id, error=%settlement, "Forge failure settlement failed; claim retained for expiry recovery");
             fatal = Some(settlement);
         }
-        self.record_task_execution_telemetry(task, &task_span, elapsed)
-            .await;
         tracing::debug!(
             task_id = %task.task_id,
             stage = ?stage,
-            elapsed_seconds = elapsed.as_secs_f64(),
             failed = result.is_err(),
             "Forge task execution stage returned"
         );
@@ -2478,21 +2575,23 @@ impl ForgeWorker {
     /// is the authority, and a nonterminal or unread state emits nothing.
     async fn record_task_execution_telemetry(
         &self,
-        task: &ForgeTaskClaim,
+        tenant: DataTenantId,
+        task_id: Uuid,
+        strategy: Option<ForgeTaskStrategy>,
         span: &tracing::Span,
-        elapsed: Duration,
+        started: Instant,
     ) {
-        let Ok(Some(observation)) = self.durable_task_observation(task).await else {
+        let Ok(Some(observation)) = self.durable_task_observation(tenant, task_id).await else {
             return;
         };
         let Some(result) = durable_task_result(observation) else {
             return;
         };
         span.record("result", result.as_str());
-        let Some(task_type) = Self::metric_strategy(&task.strategy) else {
+        let Some(task_type) = strategy else {
             return;
         };
-        ForgeTelemetry::record_task_attempt(task_type, result, elapsed);
+        ForgeTelemetry::record_task_attempt(task_type, result, started.elapsed());
     }
 
     /// Reads the authoritative post-attempt state and durable failure class.
@@ -2504,20 +2603,21 @@ impl ForgeWorker {
     /// underlying task transition has already committed independently.
     async fn durable_task_observation(
         &self,
-        task: &ForgeTaskClaim,
+        tenant: DataTenantId,
+        task_id: Uuid,
     ) -> Result<Option<(ForgeTaskState, Option<ForgeFailureClass>)>, ForgeError> {
         let mut conn = self
             .forge
             .core
             .vala
-            .tenant_conn(task.data_tenant_id)
+            .tenant_conn(tenant)
             .await
             .map_err(ForgeError::Sql)?;
         let row: Option<(String, Option<String>)> = sqlx::query_as(
             "SELECT state, failure_class FROM vala.forge_tasks WHERE task_id = $1 AND data_tenant_id = $2",
         )
-        .bind(task.task_id)
-        .bind(task.data_tenant_id.as_uuid())
+        .bind(task_id)
+        .bind(tenant.as_uuid())
         .fetch_optional(&mut **conn.transaction())
         .await
         .map_err(vala_sql::SqlError::from)
@@ -2578,12 +2678,69 @@ impl ForgeWorker {
         Ok((attempt, binding))
     }
 
+    /// Observes one Prepared ownership episode from claim through reconciliation.
+    ///
+    /// The ordinary active guard is shared with recovery; no synthetic ordinary
+    /// claim is needed. The guard drops before the caller's post-attempt barrier.
+    ///
+    /// # Errors
+    /// Returns the original reconciliation/release error; telemetry never replaces it.
+    ///
+    /// # Cancellation
+    /// Retains exact Prepared evidence when recovery cannot finish under shutdown.
     async fn reconcile_prepared(
         &self,
         claim: ForgePreparedTaskClaim,
         shutdown: &CancellationToken,
     ) -> Result<(), ForgeError> {
-        let (attempt, binding) = self.prepared_claim_context(&claim)?;
+        let started = Instant::now();
+        let _active = self.forge.core.telemetry.active_task(claim.task.strategy);
+        let span = tracing::info_span!("bifrost.forge.task.execute",
+            strategy = claim.task.strategy.as_str(), result = tracing::field::Empty,
+            role = "forge_worker", task_id = %claim.task.task_id, attempt_id = tracing::field::Empty);
+        if let Some(attempt) = claim.task.attempt_id {
+            span.record("attempt_id", tracing::field::display(attempt));
+        }
+        #[cfg(feature = "test-support")]
+        if let Some(observer) = &self.completion_observer {
+            observer.record_lifecycle(ForgeLifecycleEvent::Claimed {
+                task_id: claim.task.task_id,
+                worker_id: self.owner,
+            });
+            observer.pause_after_claim_for_test().await;
+        }
+        let result = tracing::Instrument::instrument(
+            self.reconcile_prepared_attempt(&claim, shutdown),
+            span.clone(),
+        )
+        .await;
+        self.record_task_execution_telemetry(
+            claim.task.data_tenant_id,
+            claim.task.task_id,
+            Some(claim.task.strategy),
+            &span,
+            started,
+        )
+        .await;
+        drop(span);
+        self.record_attempt(result.as_ref().err());
+        result
+    }
+
+    /// Validates and reconciles a borrowed Prepared claim while its caller owns telemetry.
+    ///
+    /// # Errors
+    /// Returns identity, evidence, heartbeat, settlement, and release failures,
+    /// preserving reconciliation failure ahead of a secondary release failure.
+    ///
+    /// # Cancellation
+    /// Cancellation retains durable evidence for a later fenced owner.
+    async fn reconcile_prepared_attempt(
+        &self,
+        claim: &ForgePreparedTaskClaim,
+        shutdown: &CancellationToken,
+    ) -> Result<(), ForgeError> {
+        let (attempt, binding) = self.prepared_claim_context(claim)?;
         let task = &claim.task;
         let evidence = task
             .evidence
@@ -5721,6 +5878,9 @@ impl ForgeWorker {
 
     /// Terminally audits a malformed or unsupported claim before external effects.
     ///
+    /// Known payloads acquire data-refusal qualification in this same Claimed to
+    /// Failed transaction. The committed failure is counted before replan IO.
+    ///
     /// # Errors
     ///
     /// Returns tenant transaction, lifecycle, or audit errors.
@@ -5751,7 +5911,19 @@ impl ForgeWorker {
             )
             .await
             .map_err(ForgeError::Sql)?;
+        if Self::metric_strategy(&claim.strategy).is_some() {
+            self.tasks
+                .qualify_terminal_failure(
+                    &mut conn,
+                    claim.task_id,
+                    ForgeFailureClass::DataRefusal.as_str(),
+                    None,
+                )
+                .await
+                .map_err(ForgeError::Sql)?;
+        }
         conn.commit().await.map_err(ForgeError::Sql)?;
+        Self::record_settled_failure(claim, ForgeFailureClass::DataRefusal);
         self.request_replan(claim.data_tenant_id, &claim.table_ref)
             .await
     }

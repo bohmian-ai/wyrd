@@ -5,8 +5,13 @@
 //! arbitration order and the immutability of the orphan plan it produces.
 
 use chrono::{Duration as ChronoDuration, Utc};
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::AbortOnDropHandle;
 use uuid::Uuid;
-use vala_bifrost_redux::forge::ForgeScheduler;
+use vala_bifrost_redux::forge::{
+    ForgeClock, ForgeRoleReadiness, ForgeScheduler, ForgeSchedulerTrigger, ForgeWorker,
+    ForgeWorkerCompletionObserver, ForgeWorkerConfig,
+};
 use vala_sql::queries::forge_tasks::{ForgeEnqueueBatch, ForgeTasks};
 use vala_sql::row_types::forge_tasks::{
     ForgePlanningDemand, ForgePlanningDemandSource, ForgeTaskStrategy, ForgeTaskTableIdentity,
@@ -17,6 +22,9 @@ use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::time::timeout;
+use wyrd_bench::BenchmarkMetricSnapshot;
 
 use super::rewrite_support::PromotedRewriteFixture;
 use super::snapshot_expiration::object_exists;
@@ -27,6 +35,9 @@ use super::support::{
     CountingObjectStore, ForgeTelemetryCheckpoint, PromotionCatalogSeam,
     PromotionIntegrationFixture, SupervisedPromotion, manual_clock,
 };
+
+/// Maximum diagnostic wait for a claimed ownership episode.
+const OWNERSHIP_BOUND: Duration = Duration::from_secs(15);
 
 /// Starts one expirable table whose only planner candidate is expiration.
 ///
@@ -397,6 +408,78 @@ fn counter_total(
         .sum()
 }
 
+/// Sums the active ownership series in an already captured snapshot.
+fn active_tasks(snapshot: &BenchmarkMetricSnapshot) -> f64 {
+    snapshot
+        .gauges
+        .iter()
+        .filter(|(name, _)| name.starts_with("bifrost_forge_active_tasks{"))
+        .map(|(_, value)| value)
+        .sum()
+}
+
+/// Checks exact integer debt values representable by these small real fixtures.
+///
+/// # Panics
+/// Panics when a fixture exceeds the exact conversion bound or a gauge differs.
+fn assert_inventory(snapshot: &BenchmarkMetricSnapshot, files: u32, bytes: u64) {
+    let bytes = u32::try_from(bytes).expect("fixture debt fits exact floating-point conversion");
+    for (name, expected) in [
+        ("bifrost_forge_compaction_debt_files", files),
+        ("bifrost_forge_compaction_debt_bytes", bytes),
+    ] {
+        assert!(
+            (snapshot.gauges[name] - f64::from(expected)).abs() < f64::EPSILON,
+            "{name}: actual={}, expected={expected}",
+            snapshot.gauges[name]
+        );
+    }
+}
+
+/// Verifies one completed ownership episode and returns its measured nanoseconds.
+///
+/// # Panics
+/// Panics on leaked ownership, duplicate or misclassified attempts, or short timing.
+fn assert_completed_episode(
+    snapshot: &BenchmarkMetricSnapshot,
+    previous_attempts: u64,
+    result: &str,
+    held: Duration,
+) -> u64 {
+    assert!(
+        active_tasks(snapshot).abs() < f64::EPSILON,
+        "ownership is complete"
+    );
+    assert_eq!(
+        counter_total(snapshot, "bifrost_forge_task_attempts_total", &[]) - previous_attempts,
+        1
+    );
+    assert_eq!(
+        counter_total(
+            snapshot,
+            "bifrost_forge_task_attempts_total",
+            &[("result", result)]
+        ),
+        1
+    );
+    let durations: Vec<_> = snapshot
+        .histograms
+        .iter()
+        .filter(|(name, _)| {
+            name.starts_with("bifrost_forge_task_duration_seconds{")
+                && name.contains(&format!("result=\"{result}\""))
+        })
+        .collect();
+    assert_eq!(durations.len(), 1, "one labelled duration series");
+    let duration = durations[0].1;
+    assert_eq!(duration.count, 1);
+    assert!(
+        u128::from(duration.max) >= held.as_nanos(),
+        "ownership duration={duration:?}, held={held:?}"
+    );
+    duration.max
+}
+
 /// Public Forge metrics describe the data flow each route actually performed.
 ///
 /// The four retained routes are driven through the real scheduler and worker
@@ -528,7 +611,7 @@ async fn forge_metrics_describe_real_data_flow() {
 #[ignore = "requires Postgres, Iceberg, and object storage"]
 async fn coordinator_and_worker_delete_only_exact_never_published_generation() {
     let mut promoted = PromotedRewriteFixture::start_unpromoted("orphan_route").await;
-    promoted.fixture.config.orphan_gc_ttl = std::time::Duration::from_millis(50);
+    promoted.fixture.config.orphan_gc_ttl = Duration::from_millis(50);
     // One entry per page and one page per pass, so the route must checkpoint a
     // durable cursor and resume it across the worker restarts below.
     promoted.fixture.config.orphan_gc_max_list_pages = 1;
@@ -839,4 +922,709 @@ async fn assert_only_the_rowless_generation_is_gone(
             "a protected, live, or invalid object was collected: {path}"
         );
     }
+}
+
+/// A retained nonexistent-table demand cannot hide the authoritative roster or
+/// monopolize the next bounded page; a closed failed cycle retries it later.
+///
+/// # Panics
+/// Panics when healthy discovery starves or a failed cycle publishes inventory.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Postgres, Iceberg, and object storage"]
+async fn scheduler_discovers_roster_despite_failed_demand() {
+    let _telemetry = ForgeTelemetryCheckpoint::install();
+    let mut fixture = PromotionIntegrationFixture::start("cycle_healthy").await;
+    fixture.config.max_hints_per_wake = 1;
+    let store = CountingObjectStore::new(Arc::clone(&fixture.staging));
+    let forge = fixture.build_forge_for_test(
+        fixture.catalog.iceberg_catalog(),
+        store,
+        vala_bifrost_redux::forge::ForgeClock::system(),
+        vala_bifrost_redux::forge::ForgeWorkerCompletionObserver::default(),
+        vala_bifrost_redux::forge::ForgeSchedulerTrigger::default(),
+    );
+    let tasks = ForgeTasks::new(fixture.operator_pool.clone());
+    let missing = ForgeTaskTableIdentity::new("wyrd-redux", "vala.bifrost", "missing")
+        .expect("valid nonexistent identity");
+    tasks
+        .upsert_periodic(fixture.tenant, &missing)
+        .await
+        .expect("failing demand");
+    let mut scheduler = ForgeScheduler::new(&forge).expect("scheduler");
+    let stop = tokio_util::sync::CancellationToken::new();
+    let first = scheduler
+        .schedule_once(&stop)
+        .await
+        .expect("first bounded wake");
+    assert!(
+        first.incomplete,
+        "missing table invalidates cycle: {first:?}"
+    );
+    let second = scheduler
+        .schedule_once(&stop)
+        .await
+        .expect("second bounded wake");
+    assert_eq!(
+        second.demands_acknowledged, 1,
+        "healthy roster member must be planned: {first:?}, {second:?}"
+    );
+    assert!(
+        second.incomplete,
+        "earlier failure remains sticky: {second:?}"
+    );
+    let remaining: Vec<String> =
+        sqlx::query_scalar("SELECT table_name FROM vala.forge_planning_demands")
+            .fetch_all(fixture.operator_pool.pool())
+            .await
+            .expect("remaining demand");
+    assert_eq!(
+        remaining,
+        vec!["missing"],
+        "healthy demand acknowledged without deleting failure"
+    );
+    let third = scheduler
+        .schedule_once(&stop)
+        .await
+        .expect("fresh retry cycle");
+    assert_eq!(third.demands_seen, 1);
+    assert_eq!(
+        third.demands_acknowledged, 0,
+        "failed demand retried in next cycle: {third:?}"
+    );
+    assert!(third.incomplete);
+    assert_eq!(scheduler.complete_publications_for_test(), 0);
+}
+
+/// Inventory includes live rewrite inputs even while promotion has admission priority.
+///
+/// # Panics
+/// Panics when exact production-discovered debt or its published gauge differs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Postgres, Iceberg, and object storage"]
+async fn scheduler_debt_includes_rewrite_and_promotion() {
+    let telemetry = ForgeTelemetryCheckpoint::install();
+    let fixture = PromotionIntegrationFixture::start("cycle_debt").await;
+    let store = CountingObjectStore::new(Arc::clone(&fixture.staging));
+    let forge = fixture.build_forge_for_test(
+        fixture.catalog.iceberg_catalog(),
+        store,
+        ForgeClock::system(),
+        ForgeWorkerCompletionObserver::default(),
+        ForgeSchedulerTrigger::default(),
+    );
+    let mut scheduler = ForgeScheduler::new(&forge).expect("scheduler");
+    let stop = CancellationToken::new();
+    let bytes: i64 = sqlx::query_scalar("SELECT sum(file_size)::bigint FROM vala.file_list")
+        .fetch_one(fixture.operator_pool.pool())
+        .await
+        .expect("exact sealed input bytes");
+    let promotion = scheduler
+        .schedule_once(&stop)
+        .await
+        .expect("promotion discovery");
+    assert!(!promotion.incomplete);
+    assert_eq!(
+        (
+            promotion.compaction_debt_files,
+            promotion.compaction_debt_bytes
+        ),
+        (2, u64::try_from(bytes).expect("nonnegative file bytes"))
+    );
+    let worker = ForgeWorker::new(
+        Arc::clone(&forge),
+        ForgeWorkerConfig::default(),
+        Uuid::now_v7(),
+    )
+    .expect("production worker");
+    assert!(
+        worker
+            .execute_one_for_test(&stop)
+            .await
+            .expect("real promotion")
+    );
+    let executed = telemetry.snapshot();
+    assert_eq!(
+        counter_total(&executed, "bifrost_forge_task_attempts_total", &[]),
+        1,
+        "the execute-one fixture adapter observes exactly one ordinary episode"
+    );
+    assert_eq!(
+        counter_total(
+            &executed,
+            "bifrost_forge_task_attempts_total",
+            &[("result", "succeeded")]
+        ),
+        1
+    );
+    let rewrite = scheduler
+        .schedule_once(&stop)
+        .await
+        .expect("rewrite discovery");
+    assert!(!rewrite.incomplete);
+    assert_eq!(
+        (rewrite.compaction_debt_files, rewrite.compaction_debt_bytes),
+        (2, u64::try_from(bytes).expect("nonnegative file bytes")),
+        "live rewrite debt survives hot promotion settlement"
+    );
+    fixture.seal_more(2).await;
+    let combined_bytes: i64 =
+        sqlx::query_scalar("SELECT sum(file_size)::bigint FROM vala.file_list")
+            .fetch_one(fixture.operator_pool.pool())
+            .await
+            .expect("hot plus live bytes");
+    let combined = scheduler
+        .schedule_once(&stop)
+        .await
+        .expect("simultaneous candidates");
+    assert!(!combined.incomplete);
+    assert_eq!(
+        (
+            combined.compaction_debt_files,
+            combined.compaction_debt_bytes
+        ),
+        (
+            4,
+            u64::try_from(combined_bytes).expect("nonnegative file bytes")
+        )
+    );
+    let snapshot = telemetry.snapshot();
+    assert_inventory(
+        &snapshot,
+        4,
+        u64::try_from(combined_bytes).expect("file bytes"),
+    );
+    eprintln!("debt promotion/rewrite=(2,{bytes}); simultaneous=(4,{combined_bytes})");
+}
+
+/// Bounded pages replace a complete inventory only after all unequal table debts
+/// are observed; failed cycles retain it, and an empty complete roster clears it.
+///
+/// # Panics
+/// Panics on a page subtotal, lost sticky failure, or a stale empty inventory.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Postgres, Iceberg, and object storage"]
+async fn scheduler_publishes_complete_cycle_inventory() {
+    let telemetry = ForgeTelemetryCheckpoint::install();
+    let mut fixture = PromotionIntegrationFixture::start("a_inventory").await;
+    fixture.config.max_hints_per_wake = 1;
+    let store = CountingObjectStore::new(Arc::clone(&fixture.staging));
+    let forge = fixture.build_forge_for_test(
+        fixture.catalog.iceberg_catalog(),
+        store,
+        ForgeClock::system(),
+        ForgeWorkerCompletionObserver::default(),
+        ForgeSchedulerTrigger::default(),
+    );
+    let mut scheduler = ForgeScheduler::new(&forge).expect("scheduler");
+    let stop = CancellationToken::new();
+    let previous = scheduler
+        .schedule_once(&stop)
+        .await
+        .expect("initial complete inventory");
+    assert!(!previous.incomplete);
+    assert_eq!(previous.compaction_debt_files, 2);
+    fixture.seal_more(1).await;
+    fixture.register_and_seal_table("b_inventory", 4).await;
+    let expected_bytes: i64 =
+        sqlx::query_scalar("SELECT sum(file_size)::bigint FROM vala.file_list")
+            .fetch_one(fixture.operator_pool.pool())
+            .await
+            .expect("all seven real input sizes");
+    let first = scheduler.schedule_once(&stop).await.expect("first page");
+    assert!(first.incomplete);
+    assert_eq!(first.demands_acknowledged, 1);
+    assert_inventory(&telemetry.snapshot(), 2, previous.compaction_debt_bytes);
+    let second = scheduler.schedule_once(&stop).await.expect("second page");
+    assert!(!second.incomplete);
+    assert_eq!(second.demands_acknowledged, 1);
+    assert_eq!(
+        (second.compaction_debt_files, second.compaction_debt_bytes),
+        (
+            7,
+            u64::try_from(expected_bytes).expect("nonnegative file bytes")
+        )
+    );
+    assert_inventory(
+        &telemetry.snapshot(),
+        7,
+        u64::try_from(expected_bytes).expect("file bytes"),
+    );
+    // A missing table remains demanded across closed failed cycles. Its absence
+    // from the roster must not remove it from the attempted exclusion set.
+    let tasks = ForgeTasks::new(fixture.operator_pool.clone());
+    let missing = ForgeTaskTableIdentity::new("wyrd-redux", "vala.bifrost", "missing_inventory")
+        .expect("identity");
+    tasks
+        .upsert_periodic(fixture.tenant, &missing)
+        .await
+        .expect("missing demand");
+    for _ in 0..3 {
+        let failed = scheduler
+            .schedule_once(&stop)
+            .await
+            .expect("failed cycle page");
+        assert!(
+            failed.incomplete,
+            "failure sticks through exhaustion: {failed:?}"
+        );
+        assert_inventory(
+            &telemetry.snapshot(),
+            7,
+            u64::try_from(expected_bytes).expect("file bytes"),
+        );
+    }
+    // Retire the tables and the intentionally nonexistent fixture demand to
+    // present a genuinely empty authoritative roster to a new complete cycle.
+    let admin = fixture
+        .database
+        .superuser_pool()
+        .await
+        .expect("fixture administrator");
+    sqlx::query("UPDATE vala.bifrost_tables SET status='deprecated'")
+        .execute(&admin)
+        .await
+        .expect("retired roster");
+    sqlx::query("DELETE FROM vala.forge_planning_demands")
+        .execute(fixture.operator_pool.pool())
+        .await
+        .expect("retire fixture demands");
+    let empty = scheduler
+        .schedule_once(&stop)
+        .await
+        .expect("empty complete cycle");
+    assert!(!empty.incomplete);
+    assert_eq!(
+        (empty.compaction_debt_files, empty.compaction_debt_bytes),
+        (0, 0)
+    );
+    assert_inventory(&telemetry.snapshot(), 0, 0);
+    eprintln!(
+        "inventory previous=(2,{}); first page retains previous; complete=(7,{expected_bytes}); failed pages retain complete; empty=(0,0)",
+        previous.compaction_debt_bytes
+    );
+}
+
+/// A malformed known payload terminalizes and reports exactly one durable refusal
+/// through the same entrypoint used by fixture adapters.
+///
+/// # Panics
+/// Panics when qualification, failure count, attempt count, or duration is absent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Postgres, Iceberg, and object storage"]
+async fn worker_malformed_known_payload_observes_one_refusal() {
+    let telemetry = ForgeTelemetryCheckpoint::install();
+    let fixture = PromotionIntegrationFixture::start("malformed_episode").await;
+    let store = CountingObjectStore::new(Arc::clone(&fixture.staging));
+    let forge = fixture.build_forge_for_test(
+        fixture.catalog.iceberg_catalog(),
+        store,
+        ForgeClock::system(),
+        ForgeWorkerCompletionObserver::default(),
+        ForgeSchedulerTrigger::default(),
+    );
+    let mut scheduler = ForgeScheduler::new(&forge).expect("scheduler");
+    let stop = CancellationToken::new();
+    scheduler
+        .schedule_once(&stop)
+        .await
+        .expect("real promotion plan");
+    sqlx::query("UPDATE vala.forge_tasks SET plan=jsonb_set(plan,'{inputs}','[]')")
+        .execute(fixture.operator_pool.pool())
+        .await
+        .expect("malformed known plan");
+    let worker =
+        ForgeWorker::new(forge, ForgeWorkerConfig::default(), Uuid::now_v7()).expect("worker");
+    assert!(
+        worker
+            .execute_one_for_test(&stop)
+            .await
+            .expect("terminalized payload")
+    );
+    let state: (String, Option<String>, i32) =
+        sqlx::query_as("SELECT state,failure_class,attempt_count FROM vala.forge_tasks")
+            .fetch_one(fixture.operator_pool.pool())
+            .await
+            .expect("durable classification");
+    assert_eq!(
+        state,
+        ("failed".to_owned(), Some("data_refusal".to_owned()), 1)
+    );
+    let snapshot = telemetry.snapshot();
+    assert_eq!(
+        counter_total(
+            &snapshot,
+            "bifrost_forge_task_failures_total",
+            &[
+                ("task_type", "scribe_promotion"),
+                ("reason", "data_refusal")
+            ]
+        ),
+        1
+    );
+    assert_eq!(
+        counter_total(
+            &snapshot,
+            "bifrost_forge_task_attempts_total",
+            &[("task_type", "scribe_promotion"), ("result", "refused")]
+        ),
+        1
+    );
+    assert_eq!(
+        snapshot
+            .histograms
+            .iter()
+            .filter(|(name, _)| name.starts_with("bifrost_forge_task_duration_seconds{"))
+            .map(|(_, value)| value.count)
+            .sum::<u64>(),
+        1
+    );
+    assert!(
+        active_tasks(&snapshot).abs() < f64::EPSILON,
+        "ownership is complete"
+    );
+}
+
+/// Prepared recovery holds active ownership at the claim gate and emits exactly
+/// one completed episode after reconciliation and release.
+///
+/// # Panics
+/// Panics on missing ownership, duplicate/missing telemetry, or lost durable evidence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Postgres, Iceberg, and object storage"]
+async fn worker_prepared_recovery_observes_one_ownership_episode() {
+    let telemetry = ForgeTelemetryCheckpoint::install();
+    let fixture = PromotionIntegrationFixture::start("prepared_episode").await;
+    let observer = ForgeWorkerCompletionObserver::default();
+    let store = CountingObjectStore::new(Arc::clone(&fixture.staging));
+    let forge = fixture.build_forge_for_test(
+        fixture.catalog.iceberg_catalog(),
+        store,
+        ForgeClock::system(),
+        observer.clone(),
+        ForgeSchedulerTrigger::default(),
+    );
+    let mut scheduler = ForgeScheduler::new(&forge).expect("scheduler");
+    let stop = CancellationToken::new();
+    scheduler
+        .schedule_once(&stop)
+        .await
+        .expect("real promotion plan");
+    fixture.prepare_recovery_episode(&forge, &stop).await;
+    let state = "prepared";
+    observer.hold_after_claims_for_test(1);
+    observer.hold_after_next_attempt_for_test();
+    let before = telemetry.snapshot();
+    let worker = ForgeWorker::new(forge, ForgeWorkerConfig::default(), Uuid::now_v7())
+        .expect("recovering worker");
+    let work_stop = stop.clone();
+    let mut work = AbortOnDropHandle::new(tokio::spawn(
+        worker.run(work_stop, ForgeRoleReadiness::default()),
+    ));
+    if timeout(OWNERSHIP_BOUND, observer.wait_for_claims_for_test())
+        .await
+        .is_err()
+    {
+        stop.cancel();
+        work.abort();
+        panic!(
+            "Prepared claim gate missed; state={state}, attempts={}",
+            observer.attempts()
+        );
+    }
+    let held_at = Instant::now();
+    let active = active_tasks(&telemetry.snapshot());
+    let claimed: String = sqlx::query_scalar("SELECT state FROM vala.forge_tasks")
+        .fetch_one(fixture.operator_pool.pool())
+        .await
+        .expect("owned Prepared state");
+    let held = held_at.elapsed();
+    observer.release_claims_for_test();
+    if timeout(OWNERSHIP_BOUND, observer.wait_for_held_attempt_for_test())
+        .await
+        .is_err()
+    {
+        stop.cancel();
+        work.abort();
+        panic!(
+            "Prepared completion gate missed; last state={claimed}, attempts={}",
+            observer.attempts()
+        );
+    }
+    let after = telemetry.snapshot();
+    stop.cancel();
+    observer.release_held_attempt_for_test();
+    if let Ok(result) = timeout(OWNERSHIP_BOUND, &mut work).await {
+        result.expect("worker join").expect("recovery drains");
+    } else {
+        work.abort();
+        panic!("Prepared worker failed to drain; last state={claimed}");
+    }
+    assert!(
+        (active - 1.0).abs() < f64::EPSILON,
+        "claimed ownership is active"
+    );
+    assert_eq!(claimed, "prepared");
+    assert_completed_episode(
+        &after,
+        counter_total(&before, "bifrost_forge_task_attempts_total", &[]),
+        "succeeded",
+        held,
+    );
+}
+
+/// Shutdown before execution balances ownership and reports the durable Retryable
+/// release, even though that transition clears the attempt identity.
+///
+/// # Panics
+/// Panics on unbalanced ownership or a fabricated cancelled outcome.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Postgres, Iceberg, and object storage"]
+async fn worker_pre_execution_cancellation_reports_durable_retry() {
+    let telemetry = ForgeTelemetryCheckpoint::install();
+    let fixture = PromotionIntegrationFixture::start("cancel_episode").await;
+    let observer = ForgeWorkerCompletionObserver::default();
+    observer.hold_after_claims_for_test(1);
+    let stop = CancellationToken::new();
+    let worker = fixture.plan_worker_for_test(observer.clone(), &stop).await;
+    let mut work = AbortOnDropHandle::new(tokio::spawn(
+        worker.run(stop.clone(), ForgeRoleReadiness::default()),
+    ));
+    if timeout(OWNERSHIP_BOUND, observer.wait_for_claims_for_test())
+        .await
+        .is_err()
+    {
+        stop.cancel();
+        work.abort();
+        panic!(
+            "ordinary claim gate missed; last task state=ready, attempts={}",
+            observer.attempts()
+        );
+    }
+    let active = active_tasks(&telemetry.snapshot());
+    stop.cancel();
+    observer.release_claims_for_test();
+    if let Ok(result) = timeout(OWNERSHIP_BOUND, &mut work).await {
+        result.expect("worker join").expect("cancellation release");
+    } else {
+        work.abort();
+        panic!("cancelled claim failed to drain; last task state=claimed, active={active}");
+    }
+    let state: (String, Option<Uuid>) =
+        sqlx::query_as("SELECT state,attempt_id FROM vala.forge_tasks")
+            .fetch_one(fixture.operator_pool.pool())
+            .await
+            .expect("released claim");
+    assert_eq!(state, ("retryable".to_owned(), None));
+    assert!(
+        (active - 1.0).abs() < f64::EPSILON,
+        "claimed ownership is active"
+    );
+    let after = telemetry.snapshot();
+    assert!(
+        active_tasks(&after).abs() < f64::EPSILON,
+        "ownership is complete"
+    );
+    assert_eq!(
+        counter_total(&after, "bifrost_forge_task_attempts_total", &[]),
+        1
+    );
+    assert_eq!(
+        counter_total(
+            &after,
+            "bifrost_forge_task_attempts_total",
+            &[("result", "retry")]
+        ),
+        1
+    );
+    assert_eq!(
+        counter_total(
+            &after,
+            "bifrost_forge_task_attempts_total",
+            &[("result", "cancelled")]
+        ),
+        0
+    );
+    assert_eq!(
+        after
+            .histograms
+            .iter()
+            .filter(|(name, _)| name.starts_with("bifrost_forge_task_duration_seconds{"))
+            .map(|(_, value)| value.count)
+            .sum::<u64>(),
+        1
+    );
+}
+
+/// Ordinary ownership timing includes held claim and settled-but-unreleased lease
+/// intervals; a release failure preserves the known successful durable result.
+///
+/// # Panics
+/// Panics when duration omits either boundary, ownership leaks, or emission duplicates.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Postgres, Iceberg, and object storage"]
+async fn worker_duration_includes_claim_and_failed_release() {
+    let telemetry = ForgeTelemetryCheckpoint::install();
+    let fixture = PromotionIntegrationFixture::start("duration_episode").await;
+    let observer = ForgeWorkerCompletionObserver::default();
+    observer.hold_after_claims_for_test(1);
+    observer.hold_before_next_lease_release_for_test();
+    observer.hold_after_next_attempt_for_test();
+    observer.fail_next_lease_release();
+    let stop = CancellationToken::new();
+    let worker = fixture.plan_worker_for_test(observer.clone(), &stop).await;
+    let mut work = AbortOnDropHandle::new(tokio::spawn(
+        worker.run(stop.clone(), ForgeRoleReadiness::default()),
+    ));
+    if timeout(OWNERSHIP_BOUND, observer.wait_for_claims_for_test())
+        .await
+        .is_err()
+    {
+        stop.cancel();
+        work.abort();
+        panic!(
+            "claim gate missed; last task state=ready, attempts={}",
+            observer.attempts()
+        );
+    }
+    let claim_at = Instant::now();
+    let active_claim = active_tasks(&telemetry.snapshot());
+    let claimed: String = sqlx::query_scalar("SELECT state FROM vala.forge_tasks")
+        .fetch_one(fixture.operator_pool.pool())
+        .await
+        .expect("claimed state");
+    let claim_held = claim_at.elapsed();
+    observer.release_claims_for_test();
+    if timeout(
+        OWNERSHIP_BOUND,
+        observer.wait_for_held_lease_release_for_test(),
+    )
+    .await
+    .is_err()
+    {
+        stop.cancel();
+        work.abort();
+        panic!("release gate missed; last state={claimed}");
+    }
+    let release_at = Instant::now();
+    let execution_bound = claim_at.elapsed();
+    let active_release = active_tasks(&telemetry.snapshot());
+    let mut settled = String::new();
+    // Hold release longer than the observed claim-to-release work, using real
+    // state reads and elapsed comparison rather than a fixed sleep duration.
+    if timeout(OWNERSHIP_BOUND, async {
+        loop {
+            settled = sqlx::query_scalar("SELECT state FROM vala.forge_tasks")
+                .fetch_one(fixture.operator_pool.pool())
+                .await
+                .expect("settled state");
+            if release_at.elapsed() > execution_bound {
+                break;
+            }
+        }
+    })
+    .await
+    .is_err()
+    {
+        stop.cancel();
+        work.abort();
+        panic!("release observation timed out; last state={settled}");
+    }
+    let release_held = release_at.elapsed();
+    let observed_ownership = claim_at.elapsed();
+    observer.release_held_lease_release_for_test();
+    if timeout(OWNERSHIP_BOUND, observer.wait_for_held_attempt_for_test())
+        .await
+        .is_err()
+    {
+        stop.cancel();
+        work.abort();
+        panic!("completion gate missed; last state={settled}");
+    }
+    let after = telemetry.snapshot();
+    observer.release_held_attempt_for_test();
+    let error = if let Ok(result) = timeout(OWNERSHIP_BOUND, &mut work).await {
+        result
+            .expect("worker join")
+            .expect_err("release failure must remain fatal")
+    } else {
+        stop.cancel();
+        work.abort();
+        panic!("release failure did not drain; last state={settled}");
+    };
+    assert!(
+        error.to_string().contains("lease release failure"),
+        "{error}"
+    );
+    assert_eq!(claimed, "claimed");
+    assert_eq!(settled, "succeeded");
+    assert_eq!((active_claim, active_release), (1.0, 1.0));
+    let duration = assert_completed_episode(&after, 0, "succeeded", observed_ownership);
+    eprintln!(
+        "duration={}ns, claim gate={}ns, release gate={}ns; attempts=1 succeeded; active=1/1/0",
+        duration,
+        claim_held.as_nanos(),
+        release_held.as_nanos()
+    );
+}
+
+/// A complete roster observation removes disappeared debt and admits new tables
+/// into an open cycle without replaying its already attempted demand identities.
+///
+/// # Panics
+/// Panics when an open cycle publishes missing-table debt or omits a new member.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Postgres, Iceberg, and object storage"]
+async fn scheduler_open_cycle_tracks_roster_changes() {
+    let mut fixture = PromotionIntegrationFixture::start("a_disappears").await;
+    fixture.config.max_hints_per_wake = 1;
+    fixture.register_and_seal_table("b_remains", 2).await;
+    let store = CountingObjectStore::new(Arc::clone(&fixture.staging));
+    let forge = fixture.build_forge_for_test(
+        fixture.catalog.iceberg_catalog(),
+        store,
+        ForgeClock::system(),
+        ForgeWorkerCompletionObserver::default(),
+        ForgeSchedulerTrigger::default(),
+    );
+    let mut scheduler = ForgeScheduler::new(&forge).expect("scheduler");
+    let stop = CancellationToken::new();
+    let first = scheduler
+        .schedule_once(&stop)
+        .await
+        .expect("first roster page");
+    assert!(first.incomplete);
+    assert_eq!(first.compaction_debt_files, 2);
+    let admin = fixture
+        .database
+        .superuser_pool()
+        .await
+        .expect("fixture administrator");
+    sqlx::query(
+        "UPDATE vala.bifrost_tables SET status='deprecated' WHERE fqn='vala.bifrost.a_disappears'",
+    )
+    .execute(&admin)
+    .await
+    .expect("retire observed table");
+    fixture.register_and_seal_table("c_joins", 3).await;
+    let second = scheduler
+        .schedule_once(&stop)
+        .await
+        .expect("new roster member joins open cycle");
+    assert!(second.incomplete);
+    assert_eq!(
+        second.compaction_debt_files, 2,
+        "disappeared observation removed before publication"
+    );
+    let third = scheduler
+        .schedule_once(&stop)
+        .await
+        .expect("new member completes cycle");
+    assert!(!third.incomplete);
+    let bytes: i64 = sqlx::query_scalar("SELECT sum(file_size)::bigint FROM vala.file_list WHERE table_name IN ('b_remains','c_joins')")
+        .fetch_one(fixture.operator_pool.pool()).await.expect("surviving roster bytes");
+    assert_eq!(
+        (third.compaction_debt_files, third.compaction_debt_bytes),
+        (5, u64::try_from(bytes).expect("nonnegative file bytes"))
+    );
+    eprintln!("roster debt pages: 2, 2 (removed old member), 5/{bytes} bytes complete");
 }

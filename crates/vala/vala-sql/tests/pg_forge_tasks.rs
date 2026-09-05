@@ -2464,7 +2464,8 @@ mod pg_tests {
         }
     }
 
-    /// Proves strict-after tenant rotation, wraparound, takeover, RLS, and malformed-row refusal.
+    /// Proves tenant-qualified exclusion before ranking/overflow, live-generation
+    /// continuity, strict-after rotation, takeover, RLS, and malformed-row refusal.
     ///
     /// # Panics
     /// Panics when the durable cursor or isolation boundary deviates.
@@ -2499,6 +2500,49 @@ mod pg_tests {
             .await
             .expect("lease")
             .expect("fence");
+        assert_eq!(
+            tasks
+                .acquire_scheduler(owner, 30)
+                .await
+                .expect("live reacquisition"),
+            Some(fence),
+            "the same live ownership generation must retain its local cycle"
+        );
+        let excluded = std::collections::BTreeSet::from([(hot, identity.clone())]);
+        let (eligible, overflow) = tasks
+            .planning_demands_excluding(owner, fence, 2, &excluded)
+            .await
+            .expect("cycle-aware tenant page");
+        assert!(!overflow, "excluded demand must not affect overflow");
+        assert_eq!(eligible.len(), 2);
+        assert!(
+            eligible
+                .iter()
+                .any(|d| d.data_tenant_id == hot && d.table_ref == hot_second)
+        );
+        assert!(
+            eligible
+                .iter()
+                .any(|d| d.data_tenant_id == cold && d.table_ref == identity),
+            "exclusion must include the tenant, not merely the logical table"
+        );
+        assert!(
+            tasks
+                .planning_demands_excluding(owner, fence, 1, &excluded)
+                .await
+                .expect("bounded eligible page")
+                .1
+        );
+        let excluded = std::collections::BTreeSet::from([
+            (hot, identity.clone()),
+            (hot, hot_second.clone()),
+            (cold, identity.clone()),
+        ]);
+        let (empty, overflow) = tasks
+            .planning_demands_excluding(owner, fence, 1, &excluded)
+            .await
+            .expect("exhausted traversal with durable demand remaining");
+        assert!(empty.is_empty() && !overflow);
         let page = tasks
             .planning_demands(owner, fence, 2)
             .await
@@ -2530,8 +2574,8 @@ mod pg_tests {
             .await
             .expect("authoritative demand status");
         assert_eq!(
-            status.demands, 2,
-            "the demand snapshot counts every outstanding row, not one bounded page"
+            status.demands, 3,
+            "the demand snapshot counts both hot tables and the cold table, not one bounded page"
         );
         assert!(status.oldest_requested_at.is_some());
         tasks

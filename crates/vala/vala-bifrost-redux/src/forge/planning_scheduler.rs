@@ -1,6 +1,6 @@
 //! Durable demand scheduling without rewrite or Iceberg commit execution.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 #[cfg(feature = "test-support")]
 use std::sync::Arc;
 #[cfg(feature = "test-support")]
@@ -60,9 +60,9 @@ pub struct ForgeScheduleOutcome {
     pub unclaimable_tasks: usize,
     /// Maximum-minus-minimum admitted task count across this complete pass's tenants.
     pub fairness_lag_tasks: usize,
-    /// Candidate input files observed across the complete acknowledged pass.
+    /// Candidate input files observed in this cycle; only complete cycles publish gauges.
     pub compaction_debt_files: u64,
-    /// Candidate input bytes observed across the complete acknowledged pass.
+    /// Candidate input bytes observed in this cycle; only complete cycles publish gauges.
     pub compaction_debt_bytes: u64,
     /// Whether the bounded page or any demand remained incomplete.
     pub incomplete: bool,
@@ -85,6 +85,21 @@ struct DemandPlanningResult {
     compaction_debt_bytes: u64,
 }
 
+/// Disposable coverage of one traversal under an exact scheduler generation.
+#[derive(Default)]
+struct PlanningCycle {
+    /// Generation whose authority bounds every observation in this cycle.
+    fence: i64,
+    /// Roster identities already durably requested, including acknowledged tables.
+    seeded: BTreeSet<(DataTenantId, ForgeTaskTableIdentity)>,
+    /// Demand identities already attempted, including failed or disappeared tables.
+    attempted: BTreeSet<(DataTenantId, ForgeTaskTableIdentity)>,
+    /// Latest successful file/byte debt observation for each table.
+    debt: BTreeMap<(DataTenantId, ForgeTaskTableIdentity), (u64, u64)>,
+    /// Sticky failure or generation race; page exhaustion never clears it.
+    failed: bool,
+}
+
 /// Concrete owner of fenced durable Forge planning and demand convergence.
 pub struct ForgeScheduler<'forge> {
     /// Forge dependency owner used only for catalog reads and deterministic discovery.
@@ -99,6 +114,8 @@ pub struct ForgeScheduler<'forge> {
     owner: Uuid,
     /// Bounded demand page size.
     demand_cap: u32,
+    /// Unfinished local traversal; dropped on cancellation, standby, or fence change.
+    cycle: Option<PlanningCycle>,
     /// Deterministic pause before the post-roster renewal in scheduler tests.
     #[cfg(feature = "test-support")]
     renewal_gate: Arc<SchedulerRenewalGate>,
@@ -190,6 +207,7 @@ impl<'forge> ForgeScheduler<'forge> {
         let capacity = governed_capacity(configured, &governor.plan);
         Ok(Self {
             forge,
+            cycle: None,
             planner: ForgePlanner::new(capacity),
             capacity,
             tasks: ForgeTasks::new(forge.core.operator_pool.clone()),
@@ -302,29 +320,25 @@ impl<'forge> ForgeScheduler<'forge> {
         Ok(())
     }
 
-    /// Drains durable demand before repairing the roster for the next planning cycle.
+    /// Advances one bounded page of a roster-aware planning cycle.
     ///
-    /// This method performs metadata reads and `PostgreSQL` writes only. It never
-    /// invokes `DataFusion`, rewrites objects, or commits an Iceberg transaction.
+    /// Every wake discovers new registered tables without re-requesting already
+    /// seeded identities. Failed demand stays durable but is attempted only once
+    /// per cycle. Inventory is published only after a successful full traversal.
     ///
     /// # Errors
-    /// Returns scheduler lease, roster, catalog, planning, or durable SQL errors.
-    /// Planning and cancellation failures retain the observed demand generation.
-    /// An unfinished page is resumed without re-requesting tables already planned,
-    /// so a roster larger than the page budget can converge across bounded wakes.
-    /// A generation replaced during its atomic acknowledgement is refreshed and
-    /// retried once, while keeping the pass incomplete so complete-only status
-    /// is never published from a raced view.
+    /// Returns fence or SQL failures, retaining an invalidated cycle for traversal
+    /// when authority remains valid. Individual discovery/planning failures make
+    /// the cycle incomplete and retain demand for the next cycle.
     ///
     /// # Cancellation
-    ///
-    /// Caller cancellation returns an incomplete outcome before the next bounded
-    /// roster or demand unit and skips later fence renewal or publication.
-    /// Fence loss returns immediately without later enqueue, status, or metrics.
+    /// Local progress is taken before the first await, so dropping this future
+    /// discards it. Cancellation, standby, and fence loss never publish inventory.
     pub async fn schedule_once(
-        &self,
+        &mut self,
         stop: &CancellationToken,
     ) -> Result<ForgeScheduleOutcome, ForgeError> {
+        let previous = self.cycle.take();
         let Some(fence) = self.acquire_fence().await? else {
             return Ok(ForgeScheduleOutcome {
                 standby: true,
@@ -332,28 +346,75 @@ impl<'forge> ForgeScheduler<'forge> {
             });
         };
         self.renew_fence(fence).await?;
-        let (mut demands, mut overflowed) = self
+        let mut cycle = previous
+            .filter(|cycle| cycle.fence == fence)
+            .unwrap_or_else(|| PlanningCycle {
+                fence,
+                ..PlanningCycle::default()
+            });
+        let result = self.schedule_cycle(&mut cycle, stop).await;
+        match result {
+            Ok((mut outcome, remaining)) => {
+                if remaining && !stop.is_cancelled() {
+                    self.cycle = Some(cycle);
+                }
+                // Traversal has closed before publication reads. A failed final
+                // read must not keep an exhausted failed cycle open another wake.
+                self.publish_status(&mut outcome, fence, stop).await?;
+                #[cfg(feature = "test-support")]
+                if !outcome.incomplete {
+                    self.complete_publications.fetch_add(1, Ordering::AcqRel);
+                }
+                Ok(outcome)
+            }
+            Err(error) => {
+                cycle.failed = true;
+                if !stop.is_cancelled() && !matches!(error, ForgeError::FenceLost { .. }) {
+                    self.cycle = Some(cycle);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Discovers the roster and attempts the next eligible page in this cycle.
+    ///
+    /// Returns whether eligible demand remains; retained failed or successor
+    /// generations for attempted identities do not keep a cycle open.
+    ///
+    /// # Errors
+    /// Returns fence, selection, or demand traversal failures.
+    ///
+    /// # Cancellation
+    /// Stops before the next demand boundary and skips publication.
+    async fn schedule_cycle(
+        &self,
+        cycle: &mut PlanningCycle,
+        stop: &CancellationToken,
+    ) -> Result<(ForgeScheduleOutcome, bool), ForgeError> {
+        let fence = cycle.fence;
+        let mut outcome = ForgeScheduleOutcome::default();
+        match self.repair_roster(stop, cycle).await {
+            Ok(incomplete) => cycle.failed |= incomplete,
+            Err(error @ ForgeError::FenceLost { .. }) => return Err(error),
+            Err(error) => {
+                cycle.failed = true;
+                tracing::warn!(error = %error, "Forge roster discovery failed; cycle cannot publish inventory");
+            }
+        }
+        let (demands, _) = self
             .tasks
-            .planning_demands(self.owner, fence, self.demand_cap)
+            .planning_demands_excluding(self.owner, fence, self.demand_cap, &cycle.attempted)
             .await
             .map_err(ForgeError::Sql)?;
-        let mut outcome = ForgeScheduleOutcome::default();
-        if demands.is_empty() {
-            outcome.incomplete = self.repair_roster(stop, fence).await?;
-            (demands, overflowed) = self
-                .tasks
-                .planning_demands(self.owner, fence, self.demand_cap)
-                .await
-                .map_err(ForgeError::Sql)?;
-        }
         #[cfg(feature = "test-support")]
         self.pause_before_demand_renewal_if_armed().await;
         self.renew_fence(fence).await?;
-        outcome.incomplete |= overflowed;
         outcome.demands_seen = demands.len();
         let mut admitted_by_tenant = BTreeMap::<_, usize>::new();
-        self.plan_demands(demands, fence, stop, &mut outcome, &mut admitted_by_tenant)
+        self.plan_demands(demands, cycle, stop, &mut outcome, &mut admitted_by_tenant)
             .await?;
+        cycle.failed |= outcome.incomplete;
         outcome.fairness_lag_tasks = admitted_by_tenant
             .values()
             .min()
@@ -361,15 +422,26 @@ impl<'forge> ForgeScheduler<'forge> {
             .map_or(0, |(minimum, maximum)| maximum.saturating_sub(*minimum));
         if stop.is_cancelled() {
             outcome.incomplete = true;
-            return Ok(outcome);
+            return Ok((outcome, false));
         }
+        let (eligible, _) = self
+            .tasks
+            .planning_demands_excluding(self.owner, fence, 1, &cycle.attempted)
+            .await
+            .map_err(ForgeError::Sql)?;
+        let remaining = !eligible.is_empty();
+        outcome.incomplete = cycle.failed || remaining;
+        (outcome.compaction_debt_files, outcome.compaction_debt_bytes) = cycle.debt.values().fold(
+            (0_u64, 0_u64),
+            |(files, bytes), (next_files, next_bytes)| {
+                (
+                    files.saturating_add(*next_files),
+                    bytes.saturating_add(*next_bytes),
+                )
+            },
+        );
         self.renew_fence(fence).await?;
-        self.publish_status(&mut outcome, fence).await?;
-        #[cfg(feature = "test-support")]
-        if !outcome.incomplete {
-            self.complete_publications.fetch_add(1, Ordering::AcqRel);
-        }
-        Ok(outcome)
+        Ok((outcome, remaining))
     }
 
     /// Plans a bounded demand page while retaining raced or failed demands for retry.
@@ -385,16 +457,19 @@ impl<'forge> ForgeScheduler<'forge> {
     async fn plan_demands(
         &self,
         demands: Vec<ForgePlanningDemand>,
-        fence: i64,
+        cycle: &mut PlanningCycle,
         stop: &CancellationToken,
         outcome: &mut ForgeScheduleOutcome,
         admitted_by_tenant: &mut BTreeMap<DataTenantId, usize>,
     ) -> Result<(), ForgeError> {
+        let fence = cycle.fence;
         for mut demand in demands {
             if stop.is_cancelled() {
                 outcome.incomplete = true;
                 break;
             }
+            let identity = (demand.data_tenant_id, demand.table_ref.clone());
+            cycle.attempted.insert(identity.clone());
             let mut generation_retries = 0_u8;
             loop {
                 if stop.is_cancelled() {
@@ -412,12 +487,12 @@ impl<'forge> ForgeScheduler<'forge> {
                             .saturating_add(planned.tasks_not_inserted);
                         outcome.unschedulable =
                             outcome.unschedulable.saturating_add(planned.unschedulable);
-                        outcome.compaction_debt_files = outcome
-                            .compaction_debt_files
-                            .saturating_add(planned.compaction_debt_files);
-                        outcome.compaction_debt_bytes = outcome
-                            .compaction_debt_bytes
-                            .saturating_add(planned.compaction_debt_bytes);
+                        if cycle.seeded.contains(&identity) {
+                            cycle.debt.insert(
+                                identity,
+                                (planned.compaction_debt_files, planned.compaction_debt_bytes),
+                            );
+                        }
                         outcome.demands_acknowledged = outcome
                             .demands_acknowledged
                             .saturating_add(usize::from(planned.acknowledged));
@@ -529,24 +604,35 @@ impl<'forge> ForgeScheduler<'forge> {
     async fn repair_roster(
         &self,
         stop: &CancellationToken,
-        fence: i64,
+        cycle: &mut PlanningCycle,
     ) -> Result<bool, ForgeError> {
         let (tables, failures) = self.forge.discover_tables().await?;
+        let mut roster = BTreeSet::new();
         for key in tables {
-            if stop.is_cancelled() {
-                return Ok(true);
-            }
-            self.renew_fence(fence).await?;
             let identity = ForgeTaskTableIdentity::new(
                 crate::catalog::BIFROST_CATALOG_NAME,
                 key.table_ref.namespace.as_str(),
                 key.table_ref.name,
             )
             .map_err(ForgeError::Sql)?;
+            roster.insert((key.tenant, identity));
+        }
+        if failures == 0 {
+            cycle.debt.retain(|identity, _| roster.contains(identity));
+        }
+        for identity in roster {
+            if stop.is_cancelled() {
+                return Ok(true);
+            }
+            if cycle.seeded.contains(&identity) {
+                continue;
+            }
+            self.renew_fence(cycle.fence).await?;
             self.tasks
-                .upsert_periodic(key.tenant, &identity)
+                .upsert_periodic(identity.0, &identity.1)
                 .await
                 .map_err(ForgeError::Sql)?;
+            cycle.seeded.insert(identity);
         }
         Ok(failures > 0)
     }
@@ -649,8 +735,9 @@ impl<'forge> ForgeScheduler<'forge> {
 
     /// Reconstructs the deterministic task candidates for one current table snapshot.
     ///
-    /// Staging work retains priority. Live candidates are materialized only
-    /// when no staging fold is ready, preserving one mutation per base snapshot.
+    /// Promotion and rewrite candidates both contribute debt from the same
+    /// discovery reads, even when promotion takes admission priority. Expiration
+    /// and cleanup never contribute file or byte compaction debt.
     ///
     /// # Errors
     ///
@@ -701,12 +788,15 @@ impl<'forge> ForgeScheduler<'forge> {
             .rewrite_candidate(&table)
             .await?
             .filter(|candidate| super::phase::admits_new_effect(candidate.strategy));
-        let promotion_debt_files = promotion_candidate
-            .as_ref()
-            .map_or(0, |candidate| candidate.inputs.len() as u64);
-        let promotion_debt_bytes = promotion_candidate
-            .as_ref()
-            .map_or(0, |candidate| candidate.bytes);
+        let (compaction_debt_files, compaction_debt_bytes) = promotion_candidate
+            .iter()
+            .chain(rewrite_candidate.iter())
+            .fold((0_u64, 0_u64), |(files, bytes), candidate| {
+                (
+                    files.saturating_add(candidate.inputs.len() as u64),
+                    bytes.saturating_add(candidate.bytes),
+                )
+            });
         // Promotion precedes every other demand for the same table: an object
         // Scribe already published must reach the catalog before any pass that
         // reasons about the catalog's contents runs against it.
@@ -723,8 +813,8 @@ impl<'forge> ForgeScheduler<'forge> {
                     .map_or(0, |snapshot| snapshot.snapshot_id()),
                 candidates,
             },
-            promotion_debt_files,
-            promotion_debt_bytes,
+            compaction_debt_files,
+            compaction_debt_bytes,
             orphan_scan_prefix,
         ))
     }
@@ -1341,7 +1431,7 @@ impl<'forge> ForgeScheduler<'forge> {
     ///
     /// # Errors
     ///
-    /// Returns SQL errors while reading the bounded durable status page.
+    /// Returns SQL errors while reading the full durable status aggregates.
     /// Fence loss after the read suppresses every complete-only gauge update.
     ///
     /// # Cancellation
@@ -1352,6 +1442,7 @@ impl<'forge> ForgeScheduler<'forge> {
         &self,
         outcome: &mut ForgeScheduleOutcome,
         fence: i64,
+        stop: &CancellationToken,
     ) -> Result<(), ForgeError> {
         if outcome.incomplete || outcome.demands_acknowledged != outcome.demands_seen {
             return Ok(());
@@ -1392,6 +1483,11 @@ impl<'forge> ForgeScheduler<'forge> {
             .pending_task_status()
             .await
             .map_err(ForgeError::Sql)?;
+        self.renew_fence(fence).await?;
+        if stop.is_cancelled() {
+            outcome.incomplete = true;
+            return Ok(());
+        }
         self.forge.core.telemetry.publish_planning_status(
             demands.demands,
             demands

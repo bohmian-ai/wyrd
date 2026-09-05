@@ -141,7 +141,7 @@ impl Forge {
         // before the process finishes draining rather than after.
         let _readiness = ForgeReadinessGuard(readiness.clone());
         #[cfg(feature = "test-support")]
-        let scheduler = match self
+        let mut scheduler = match self
             .core
             .scheduler_trigger
             .as_ref()
@@ -151,7 +151,7 @@ impl Forge {
             None => ForgeScheduler::new(self)?,
         };
         #[cfg(not(feature = "test-support"))]
-        let scheduler = ForgeScheduler::new(self)?;
+        let mut scheduler = ForgeScheduler::new(self)?;
         let interval = self.core.maintenance_interval;
         let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -172,12 +172,12 @@ impl Forge {
                     None => hints_open = false,
                 },
                 _ = ticker.tick() => {
-                    if !self.run_planning_pass(&scheduler, &shutdown, false, &readiness).await {
+                    if !self.run_planning_pass(&mut scheduler, &shutdown, false, &readiness).await {
                         return Ok(());
                     }
                 },
                 () = self.await_triggered_pass() => {
-                    if !self.run_planning_pass(&scheduler, &shutdown, true, &readiness).await {
+                    if !self.run_planning_pass(&mut scheduler, &shutdown, true, &readiness).await {
                         return Ok(());
                     }
                 },
@@ -232,7 +232,7 @@ impl Forge {
     /// must exit, or `true` after recording a completed pass attempt.
     async fn run_planning_pass(
         &self,
-        scheduler: &ForgeScheduler<'_>,
+        scheduler: &mut ForgeScheduler<'_>,
         shutdown: &CancellationToken,
         triggered: bool,
         readiness: &super::ForgeRoleReadiness,

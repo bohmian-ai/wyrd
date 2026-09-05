@@ -6,6 +6,7 @@
 
 // raw-query grep allowlist: Forge task tables post-date the sqlx offline cache and remain confined to OperatorPool/TenantConn.
 
+use std::collections::BTreeSet;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -252,13 +253,52 @@ impl ForgeTasks {
         scheduler_fence: i64,
         cap: u32,
     ) -> Result<(Vec<ForgePlanningDemand>, bool), SqlError> {
+        self.planning_demands_excluding(owner, scheduler_fence, cap, &BTreeSet::new())
+            .await
+    }
+
+    /// Selects a tenant-ring page excluding identities attempted in this cycle.
+    ///
+    /// Exclusion precedes tenant ranking, ordering, and overflow detection, so
+    /// retained failures cannot consume the next page. Parallel typed arrays
+    /// carry exact tenant-qualified identities without interpolating SQL.
+    ///
+    /// # Errors
+    /// Returns conflict for a zero cap or stale fence and rejects malformed rows.
+    ///
+    /// # Cancellation
+    /// This read has no durable partial progress.
+    pub async fn planning_demands_excluding(
+        &self,
+        owner: Uuid,
+        scheduler_fence: i64,
+        cap: u32,
+        excluded: &BTreeSet<(DataTenantId, ForgeTaskTableIdentity)>,
+    ) -> Result<(Vec<ForgePlanningDemand>, bool), SqlError> {
+        let tenants: Vec<_> = excluded
+            .iter()
+            .map(|(tenant, _)| tenant.as_uuid())
+            .collect();
+        let catalogs: Vec<_> = excluded
+            .iter()
+            .map(|(_, table)| table.catalog.as_str())
+            .collect();
+        let namespaces: Vec<_> = excluded
+            .iter()
+            .map(|(_, table)| table.namespace.as_str())
+            .collect();
+        let tables: Vec<_> = excluded
+            .iter()
+            .map(|(_, table)| table.table.as_str())
+            .collect();
         if cap == 0 {
             return Err(SqlError::Conflict {
                 detail: "planning demand cap must be positive".to_owned(),
             });
         }
-        let rows = sqlx::query_as::<_, ForgePlanningDemandSqlRow>("WITH scheduler AS MATERIALIZED (SELECT last_tenant_id FROM vala.forge_scheduler_state WHERE singleton AND owner=$1 AND fencing_token=$2 AND expires_at>statement_timestamp()), ranked AS MATERIALIZED (SELECT d.*,row_number() OVER (PARTITION BY d.data_tenant_id ORDER BY d.last_requested_at,d.catalog_name,d.namespace_name,d.table_name) AS tenant_rank FROM vala.forge_planning_demands d) SELECT d.data_tenant_id,d.catalog_name,d.namespace_name,d.table_name,d.first_requested_at,d.last_requested_at,d.last_source,d.generation,d.acknowledged_snapshot_id,d.acknowledged_commit_count FROM ranked d CROSS JOIN scheduler s ORDER BY d.tenant_rank,(s.last_tenant_id IS NULL OR d.data_tenant_id>s.last_tenant_id) DESC,d.data_tenant_id LIMIT $3")
-            .bind(owner).bind(scheduler_fence).bind(i64::from(cap) + 1).fetch_all(self.operator_pool.pool()).await.map_err(SqlError::from)?;
+        let rows = sqlx::query_as::<_, ForgePlanningDemandSqlRow>("WITH scheduler AS MATERIALIZED (SELECT last_tenant_id FROM vala.forge_scheduler_state WHERE singleton AND owner=$1 AND fencing_token=$2 AND expires_at>statement_timestamp()), ranked AS MATERIALIZED (SELECT d.*,row_number() OVER (PARTITION BY d.data_tenant_id ORDER BY d.last_requested_at,d.catalog_name,d.namespace_name,d.table_name) AS tenant_rank FROM vala.forge_planning_demands d WHERE NOT EXISTS (SELECT 1 FROM unnest($4::uuid[], $5::text[], $6::text[], $7::text[]) AS excluded(tenant, catalog, namespace, table_name) WHERE (d.data_tenant_id,d.catalog_name,d.namespace_name,d.table_name)=(excluded.tenant,excluded.catalog,excluded.namespace,excluded.table_name))) SELECT d.data_tenant_id,d.catalog_name,d.namespace_name,d.table_name,d.first_requested_at,d.last_requested_at,d.last_source,d.generation,d.acknowledged_snapshot_id,d.acknowledged_commit_count FROM ranked d CROSS JOIN scheduler s ORDER BY d.tenant_rank,(s.last_tenant_id IS NULL OR d.data_tenant_id>s.last_tenant_id) DESC,d.data_tenant_id LIMIT $3")
+            .bind(owner).bind(scheduler_fence).bind(i64::from(cap) + 1)
+            .bind(tenants).bind(catalogs).bind(namespaces).bind(tables).fetch_all(self.operator_pool.pool()).await.map_err(SqlError::from)?;
         let live: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM vala.forge_scheduler_state WHERE singleton AND owner=$1 AND fencing_token=$2 AND expires_at>statement_timestamp())")
             .bind(owner).bind(scheduler_fence).fetch_one(self.operator_pool.pool()).await.map_err(SqlError::from)?;
         if !live {
@@ -506,6 +546,8 @@ impl ForgeTasks {
     ///
     /// # Cancellation
     /// The single update either advances the fence completely or has no effect.
+    /// Reacquiring a live lease by its exact owner preserves the generation;
+    /// expiry or takeover mints a successor and invalidates local cycle progress.
     pub async fn acquire_scheduler(
         &self,
         owner: Uuid,
@@ -516,7 +558,7 @@ impl ForgeTasks {
                 detail: "scheduler lease must be positive".to_owned(),
             });
         }
-        sqlx::query_scalar("UPDATE vala.forge_scheduler_state SET owner=$1,fencing_token=fencing_token+1,expires_at=statement_timestamp()+($2*interval '1 second'),updated_at=statement_timestamp() WHERE singleton AND (expires_at IS NULL OR expires_at<statement_timestamp() OR owner=$1) RETURNING fencing_token").bind(owner).bind(i64::from(lease_seconds)).fetch_optional(self.operator_pool.pool()).await.map_err(SqlError::from)
+        sqlx::query_scalar("UPDATE vala.forge_scheduler_state SET owner=$1,fencing_token=CASE WHEN owner=$1 AND expires_at>statement_timestamp() THEN fencing_token ELSE fencing_token+1 END,expires_at=statement_timestamp()+($2*interval '1 second'),updated_at=statement_timestamp() WHERE singleton AND (expires_at IS NULL OR expires_at<statement_timestamp() OR owner=$1) RETURNING fencing_token").bind(owner).bind(i64::from(lease_seconds)).fetch_optional(self.operator_pool.pool()).await.map_err(SqlError::from)
     }
 
     /// Renews one live exact scheduler owner and token without changing its generation.

@@ -20,7 +20,7 @@ use crate::public_support::{
 /// Every wait in this journey is a notification wait, never a poll: the bound
 /// is a diagnostic ceiling so a stuck role fails loudly instead of hanging the
 /// suite, and no assertion depends on how long a step took.
-const ATTEMPT_BOUND: Duration = Duration::from_secs(60);
+const ATTEMPT_BOUND: Duration = Duration::from_secs(15);
 
 /// How many production scheduler passes one drain phase may take.
 ///
@@ -1306,17 +1306,32 @@ async fn forge_promoted_files_rewrite_and_remain_exact_across_recovery() {
     let rewrites_before = rewrite_snapshots(&cluster, &shared.binding).await.len();
 
     uncertainty.fail_after_next_commit();
-    let attempts = observer.attempts();
+    let errors_before = observer.returned_errors().len();
     release_retries(&cluster, owner).await;
     cluster.request_forge_scheduler_pass_for_test();
-    tokio::time::timeout(
-        ATTEMPT_BOUND,
-        observer.wait_for_attempts_at_least(attempts + 1),
-    )
-    .await
-    .expect("the uncertain rewrite attempt returned");
+    let mut unsettled = Vec::new();
+    // Roster discovery can admit legitimate sibling maintenance first. Observe
+    // this owner's unsettled rewrite and a returned failure, not just any attempt.
+    let observed = tokio::time::timeout(ATTEMPT_BOUND, async {
+        loop {
+            let target = observer.attempts().saturating_add(1);
+            unsettled = unsettled_rewrites(&cluster, owner).await;
+            if !unsettled.is_empty() && observer.returned_errors().len() > errors_before {
+                break;
+            }
+            observer.wait_for_attempts_at_least(target).await;
+        }
+    })
+    .await;
+    if observed.is_err() {
+        server.state().shutdown_token.cancel();
+        panic!(
+            "uncertain rewrite did not return; last unsettled={unsettled:?}, attempts={}, errors={:?}",
+            observer.attempts(),
+            observer.returned_errors()
+        );
+    }
 
-    let unsettled = unsettled_rewrites(&cluster, owner).await;
     assert_eq!(
         unsettled.len(),
         1,

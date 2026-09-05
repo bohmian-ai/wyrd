@@ -28,13 +28,14 @@ use opendal::{Buffer, Entry, Metadata, Operator};
 use secrecy::ExposeSecret as _;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 use vala_bifrost_redux::catalog::{
     BifrostCatalog, CreateTableRequest, TableRef, TenantTableBinding,
 };
 use vala_bifrost_redux::forge::{
     Forge, ForgeBuildConfig, ForgeClock, ForgeClockControl, ForgeConfig, ForgeError,
-    ForgeObjectStore, ForgeRoleReadiness, ForgeSchedulerTrigger, ForgeTelemetry, ForgeWorker,
-    ForgeWorkerCompletionObserver, ForgeWorkerConfig,
+    ForgeObjectStore, ForgeRoleReadiness, ForgeScheduler, ForgeSchedulerTrigger, ForgeTelemetry,
+    ForgeWorker, ForgeWorkerCompletionObserver, ForgeWorkerConfig,
 };
 use vala_bifrost_redux::maintenance::staging_file_channel;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
@@ -766,6 +767,79 @@ pub(crate) struct PromotionIntegrationFixture {
 }
 
 impl PromotionIntegrationFixture {
+    /// Plans the fixture's real promotion and returns its production worker with
+    /// the requested existing observer gates, without starting that worker yet.
+    ///
+    /// # Panics
+    /// Panics when scheduler construction, planning, or worker construction fails.
+    pub(crate) async fn plan_worker_for_test(
+        &self,
+        observer: ForgeWorkerCompletionObserver,
+        stop: &CancellationToken,
+    ) -> ForgeWorker {
+        let store = CountingObjectStore::new(Arc::clone(&self.staging));
+        let forge = self.build_forge_for_test(
+            self.catalog.iceberg_catalog(),
+            store,
+            ForgeClock::system(),
+            observer,
+            ForgeSchedulerTrigger::default(),
+        );
+        ForgeScheduler::new(&forge)
+            .expect("scheduler")
+            .schedule_once(stop)
+            .await
+            .expect("plan");
+        ForgeWorker::new(forge, ForgeWorkerConfig::default(), Uuid::now_v7()).expect("worker")
+    }
+
+    /// Commits real Prepared evidence, refuses its terminal settlement, and expires
+    /// that owner so a production recovery claim can reconcile the same evidence.
+    ///
+    /// # Panics
+    /// Panics when fault installation, durable preparation, or restoration fails.
+    pub(crate) async fn prepare_recovery_episode(
+        &self,
+        forge: &Arc<Forge>,
+        stop: &CancellationToken,
+    ) {
+        let admin = self
+            .database
+            .superuser_pool()
+            .await
+            .expect("fixture administrator");
+        sqlx::query("CREATE FUNCTION vala.fail_episode_terminal() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.state='succeeded' THEN RAISE EXCEPTION 'held terminal settlement'; END IF; RETURN NEW; END $$")
+        .execute(&admin).await.expect("terminal fault");
+        sqlx::query("CREATE TRIGGER fail_episode_terminal BEFORE UPDATE ON vala.forge_tasks FOR EACH ROW EXECUTE FUNCTION vala.fail_episode_terminal()")
+        .execute(&admin).await.expect("terminal fault boundary");
+        let first = ForgeWorker::new(
+            Arc::clone(forge),
+            ForgeWorkerConfig::default(),
+            Uuid::now_v7(),
+        )
+        .expect("worker");
+        assert!(
+            first.execute_one_for_test(stop).await.is_err(),
+            "terminal SQL refusal must surface"
+        );
+        let state: String = sqlx::query_scalar("SELECT state FROM vala.forge_tasks")
+            .fetch_one(self.operator_pool.pool())
+            .await
+            .expect("prepared state");
+        assert_eq!(
+            state, "prepared",
+            "real evidence must have committed before terminal refusal"
+        );
+        sqlx::query("DROP TRIGGER fail_episode_terminal ON vala.forge_tasks")
+            .execute(&admin)
+            .await
+            .expect("restore terminal settlement");
+        sqlx::query("UPDATE vala.forge_tasks SET claim_expires_at=now()-interval '1 hour'")
+            .execute(&admin)
+            .await
+            .expect("expired owner");
+    }
+
     /// Start Postgres, compose the production graph, and seal two hot objects.
     ///
     /// # Panics
@@ -1040,6 +1114,30 @@ impl PromotionIntegrationFixture {
             before + count,
             "a real Scribe seal publishes one row per batch"
         );
+    }
+
+    /// Registers a sibling and seals real inputs through this fixture's Scribe.
+    ///
+    /// # Panics
+    /// Panics when registration, sealing, or eligibility aging fails.
+    pub(crate) async fn register_and_seal_table(&self, name: &str, count: usize) {
+        let binding = create_table(&self.catalog, self.tenant, name).await;
+        let seeded_at = chrono::Utc::now();
+        let schema = ingress_schema();
+        for number in 0..count {
+            append_and_seal(
+                &self.scribe,
+                &self.catalog,
+                self.tenant,
+                &binding,
+                &ingress_batch(
+                    &schema,
+                    i64::try_from(number).expect("bounded fixture count"),
+                ),
+            )
+            .await;
+        }
+        age_files(&self.operator_pool, self.tenant, &binding, seeded_at).await;
     }
 
     /// Reads every durable Forge task of this fixture's table, in durable order.

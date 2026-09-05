@@ -2550,7 +2550,9 @@ fn forge_table_ident(server: &WyrdTestServer, table: &str) -> iceberg::TableIden
 #[cfg(feature = "test-support")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn coordinator_object_store_failure_clears_readiness() {
+    let observer = vala_bifrost_redux::forge::ForgeWorkerCompletionObserver::new();
     let server = WyrdTestServer::builder()
+        .with_forge_completion_observer_for_test(observer.clone())
         .start_bound()
         .await
         .expect("test server starts");
@@ -2578,6 +2580,9 @@ async fn coordinator_object_store_failure_clears_readiness() {
         .flush_bifrost()
         .await
         .expect("the seeded rows publish as hot files");
+    // Snapshot visibility precedes terminal settlement. Park the worker after
+    // its full attempt so the coordinator's fault proof has a stable demand generation.
+    observer.hold_after_next_attempt_for_test();
     let catalog = server.bifrost_catalog();
     let ident = forge_table_ident(&server, table);
     let mut completed = server.completed_forge_scheduler_passes_for_test();
@@ -2597,12 +2602,28 @@ async fn coordinator_object_store_failure_clears_readiness() {
     .await
     .unwrap_or_else(|_| {
         server.state().shutdown_token.cancel();
+        observer.release_held_attempt_for_test();
         panic!(
             "promotion timed out without a snapshot; ready={}, completed passes={completed}",
             readiness.is_ready()
         );
     });
-    drive_scheduler_pass(&server, "healthy pass after snapshot publication").await;
+    if tokio::time::timeout(
+        FORGE_READINESS_CEILING,
+        observer.wait_for_held_attempt_for_test(),
+    )
+    .await
+    .is_err()
+    {
+        server.state().shutdown_token.cancel();
+        observer.release_held_attempt_for_test();
+        panic!(
+            "promotion did not finish ownership; ready={}, passes={completed}, attempts={}",
+            readiness.is_ready(),
+            observer.attempts()
+        );
+    }
+    drive_scheduler_pass(&server, "healthy pass after promotion ownership completes").await;
     assert!(readiness.is_ready(), "the healthy pass did not complete");
     assert_eq!(
         outstanding_demands(&pool, tenant, table).await,
@@ -2658,6 +2679,8 @@ async fn coordinator_object_store_failure_clears_readiness() {
         "the restored pass left demand unacknowledged"
     );
 
+    server.state().shutdown_token.cancel();
+    observer.release_held_attempt_for_test();
     server.shutdown().await.expect("test server shuts down");
 }
 
@@ -3341,5 +3364,76 @@ async fn oracle_authority_installation_rejects_replacement() {
         .shutdown()
         .await
         .expect("replacement shuts down");
+    server.shutdown().await.expect("server shuts down");
+}
+
+/// Preseeded demand cannot authorize readiness when the independent roster read
+/// is unavailable. Restoring discovery permits a fresh complete cycle.
+///
+/// # Panics
+/// Panics if demand alone raises readiness or discovery restoration cannot recover.
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn coordinator_preseeded_demand_requires_roster_discovery() {
+    let server = WyrdTestServer::start_in_process().await.expect("server");
+    register_forge_table(&server, "roster_required").await;
+    let readiness = server
+        .state()
+        .forge()
+        .expect("Forge")
+        .coordinator_readiness();
+    let pool = server
+        .pg_fixture()
+        .superuser_pool()
+        .await
+        .expect("superuser pool");
+    let tenant = uuid::Uuid::from(server.data_tenant_id());
+    sqlx::query("INSERT INTO vala.forge_planning_demands(data_tenant_id,catalog_name,namespace_name,table_name,last_source) VALUES ($1,'wyrd-redux','vala.bifrost','roster_required','periodic') ON CONFLICT DO NOTHING")
+        .bind(tenant).execute(&pool).await.expect("preseed real demand");
+    sqlx::query("ALTER TABLE vala.bifrost_tables RENAME TO unavailable_forge_roster")
+        .execute(&pool)
+        .await
+        .expect("fail roster read");
+    let stop = server.state().shutdown_token.child_token();
+    let handle = spawn_coordinator(&server, &stop);
+    drive_scheduler_pass(&server, "preseeded demand with unavailable roster").await;
+    assert!(
+        !readiness.is_ready(),
+        "demand does not prove complete discovery"
+    );
+    assert_eq!(
+        table_task_count(&pool, tenant, "roster_required").await,
+        1,
+        "the demand planned successfully despite the unavailable independent roster"
+    );
+    assert_eq!(
+        outstanding_demands(&pool, tenant, "roster_required").await,
+        0
+    );
+    sqlx::query("ALTER TABLE vala.unavailable_forge_roster RENAME TO bifrost_tables")
+        .execute(&pool)
+        .await
+        .expect("restore roster read");
+    drive_scheduler_pass(&server, "restored authoritative roster").await;
+    assert!(
+        readiness.is_ready(),
+        "complete fresh cycle restores readiness"
+    );
+    assert_eq!(
+        outstanding_demands(&pool, tenant, "roster_required").await,
+        0
+    );
+    assert_eq!(
+        table_task_count(&pool, tenant, "roster_required").await,
+        2,
+        "fresh discovery plans a new orphan cutoff in its new cycle"
+    );
+    eprintln!(
+        "roster unavailable: task=1/demand=0/ready=false; restored: tasks=2/demand=0/ready=true"
+    );
+    stop.cancel();
+    join_forge_loop(&server, handle)
+        .await
+        .expect("coordinator stops");
     server.shutdown().await.expect("server shuts down");
 }

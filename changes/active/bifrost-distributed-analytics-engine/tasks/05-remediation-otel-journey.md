@@ -2,7 +2,7 @@
 id: BIFROST-R6-T05-R02-OTEL-JOURNEY
 title: Prove actual OTEL trace debugging over MCP
 kind: remediation
-status: proposed
+status: ready
 spec: SPEC-bifrost-distributed-analytics-engine
 spec_revision: 6
 parent_task: BIFROST-R5-T05-MCP
@@ -79,3 +79,31 @@ If the existing OTLP production path cannot ingest valid spans or Oracle cannot
 serve the required trace query, preserve the failing evidence and return for
 bounded plan revision; do not hide the failure with a generic table or direct
 in-process ingestion.
+
+## Readiness
+
+Independent `wyrd-task-readiness` reviewer returned READY with no blockers.
+
+## Execution evidence
+
+RED: the exact focused command above failed at the actual OTEL table discovery
+assertion (1 failed, 5 skipped; 3.324s), with only the generic fixture registered.
+
+GREEN attempt exposed a production dependency failure before MCP discovery:
+`POST /v1/traces` returns `WYRD_VALA_413_PAYLOAD_TOO_LARGE`, reporting
+8193 bytes against a 2440-byte limit for two valid small spans. The exact
+focused command failed (1 failed, 5 skipped; 2.489s). The journey retains the
+structured response in its assertion so this refusal is diagnosable.
+
+`TASK_REVISION_REQUIRED`: the test-only plan cannot complete. Scribe's
+`material_plan.rs::OtlpCounts::finish` estimates current material from request
+bytes, value bytes, and managed projection; `ingress.rs` passes that estimate
+as the direct projection material limit. The exact Arrow plus IPC requirement
+checked by `otlp_managed.rs::OtlpManagedMaterialPlan::admitted_bytes` exceeds
+that estimate. Correcting the pre-admission sizing in the Scribe owner requires
+a production material-planning task and its allocation/admission evidence;
+increasing an arbitrary limit or padding the test request is not a valid fix.
+The source already has exact trace/log/metric projection sizing, which should
+be examined for reuse before choosing a conservative bound or shared exact
+planning. Existing ownership, pre-reservation, bounded materialization, WAL,
+and replay guarantees must remain intact. No production workaround was made.

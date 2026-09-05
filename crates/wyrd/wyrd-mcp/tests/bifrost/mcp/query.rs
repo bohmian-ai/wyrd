@@ -220,26 +220,83 @@ mod pg_tests {
     /// server because an agent that cannot bound its own read is one bad
     /// `SELECT` away from the failure this tool exists to prevent — and a
     /// bounded refusal must never arrive as a shorter success.
+    ///
+    /// # Errors
+    ///
+    /// Returns setup, ingestion, MCP transport, query, or settlement failures.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires the Postgres-backed Bifrost journey lane"]
     async fn agent_debugs_otel_error_trace_through_mcp() -> Result<(), McpJourneyError> {
         let server = WyrdTestServer::start_bound().await?;
-        let fixture = seed_query_fixture(&server, "mcp-query-trace").await?;
-        let table = &fixture.table;
+        let bootstrap = server
+            .bootstrap_service("mcp-query-trace", &["admin"])
+            .await?;
+        let token = server
+            .exchange_api_key(
+                bootstrap
+                    .api_key()
+                    .ok_or("trace journey requires a service key")?,
+            )
+            .await?;
+        let now = chrono::Utc::now();
+        let start = now
+            .timestamp_nanos_opt()
+            .ok_or("current time fits nanoseconds")?;
+        let spans: Vec<_> = [
+            ("0011223344556677", "healthy-span", 1),
+            ("8899aabbccddeeff", "error-span", 2),
+        ]
+        .into_iter()
+        .map(|(span_id, name, status)| {
+            serde_json::json!({
+                "traceId": "00112233445566778899aabbccddeeff",
+                "spanId": span_id,
+                "name": name,
+                "kind": 2,
+                "startTimeUnixNano": start.to_string(),
+                "endTimeUnixNano": (start + 1_000_000).to_string(),
+                "status": {"code": status},
+            })
+        })
+        .collect();
+        let response = reqwest::Client::new()
+            .post(format!("{}/v1/traces", server.base_url().ok_or("server is bound")?))
+            .header("x-wyrd-access-token", format!("Bearer {token}"))
+            .json(&serde_json::json!({"resourceSpans": [{
+                "resource": {"attributes": [{"key": "service.name", "value": {"stringValue": "mcp-query-trace"}}]},
+                "scopeSpans": [{"spans": spans}],
+            }]}))
+            .send().await?;
+        let status = response.status();
+        let body = response.text().await?;
+        assert!(
+            status.is_success(),
+            "OTLP ingestion failed ({status}): {body}"
+        );
+        server.flush_bifrost().await?;
+        let table = "vala.traces.spans";
         let client = ()
             .serve_with_lifecycle(
-                transport(
-                    &server,
-                    ResolvedCredential::BearerToken(fixture.token.clone().into()),
-                    None,
-                )?,
+                transport(&server, ResolvedCredential::BearerToken(token.into()), None)?,
                 discover(),
             )
             .await?;
 
-        let name = table
-            .strip_prefix("vala.bifrost.")
-            .ok_or("the fixture table is Bifrost-qualified")?;
+        let listed = structured(
+            client
+                .call_tool(CallToolRequestParams::new("bifrost.list_tables"))
+                .await?,
+        )?;
+        assert!(
+            listed["tables"]
+                .as_array()
+                .ok_or("tables is an array")?
+                .iter()
+                .any(|table| table["namespace"] == "vala.traces" && table["name"] == "spans"),
+            "the agent discovers actual OTEL spans: {listed}"
+        );
+
+        let name = "spans";
         assert!(
             client
                 .list_all_tools()
@@ -252,7 +309,7 @@ mod pg_tests {
             client
                 .call_tool(
                     CallToolRequestParams::new("bifrost.describe_table").with_arguments(
-                        serde_json::json!({"namespace": "vala.bifrost", "name": name})
+                        serde_json::json!({"namespace": "vala.traces", "name": name})
                             .as_object()
                             .ok_or("describe arguments are an object")?
                             .clone(),
@@ -262,8 +319,22 @@ mod pg_tests {
         )?;
         assert_eq!(described["entry"]["name"], serde_json::json!(name));
 
+        let fields = described["fields"]
+            .as_array()
+            .ok_or("describe returns fields")?;
+        for name in ["name", "status"] {
+            assert!(
+                fields.iter().any(|field| field["name"] == name),
+                "trace field {name} is discoverable: {described}"
+            );
+        }
+
         // One bounded read-only trace query returns one complete result.
-        let sql = format!("SELECT id, value FROM {table} WHERE value = 'second'");
+        let lower = (now - chrono::Duration::minutes(1)).to_rfc3339();
+        let upper = (now + chrono::Duration::minutes(1)).to_rfc3339();
+        let sql = format!(
+            "SELECT name, status FROM {table} WHERE status = 'ERROR' AND start_time >= TIMESTAMP '{lower}' AND start_time < TIMESTAMP '{upper}'"
+        );
         let result = client
             .call_tool(query(serde_json::json!({"sql": sql, "max_rows": 10})))
             .await?;
@@ -277,14 +348,14 @@ mod pg_tests {
         assert_eq!(
             content["columns"],
             serde_json::json!([
-                {"name": "id", "data_type": "Int64", "nullable": false},
-                {"name": "value", "data_type": "Utf8", "nullable": false},
+                {"name": "name", "data_type": "Utf8", "nullable": false},
+                {"name": "status", "data_type": "Utf8", "nullable": false},
             ]),
             "columns are projected exactly once, in schema order"
         );
         assert_eq!(
             content["rows"],
-            serde_json::json!([[2, "second"]]),
+            serde_json::json!([["error-span", "ERROR"]]),
             "rows are positional arrays carrying the selected trace"
         );
         assert_eq!(
@@ -303,11 +374,11 @@ mod pg_tests {
         for (case, arguments) in [
             (
                 "row ceiling",
-                serde_json::json!({"sql": format!("SELECT id, value FROM {table}"), "max_rows": 1}),
+                serde_json::json!({"sql": format!("SELECT name, status FROM {table}"), "max_rows": 1}),
             ),
             (
                 "byte ceiling",
-                serde_json::json!({"sql": format!("SELECT id, value FROM {table}"), "max_bytes": 1}),
+                serde_json::json!({"sql": format!("SELECT name, status FROM {table}"), "max_bytes": 1}),
             ),
         ] {
             let refusal = problem(client.call_tool(query(arguments)).await?)?;
@@ -329,7 +400,7 @@ mod pg_tests {
         let handle = client
             .send_cancellable_request(
                 ClientRequest::CallToolRequest(CallToolRequest::new(query(
-                    serde_json::json!({"sql": format!("SELECT id, value FROM {table}")}),
+                    serde_json::json!({"sql": format!("SELECT name, status FROM {table}")}),
                 ))),
                 PeerRequestOptions::no_options(),
             )

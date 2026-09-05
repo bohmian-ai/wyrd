@@ -369,3 +369,15 @@ contract rather than consuming its existing validators.
 
 - Added cases to the same named planning test for contextual tenant, reconciliation, audit, and resource failures. RED showed recursive delegation discarded a tenant-bearing outer context and returned `QueryExecutionFailed`.
 - GREEN: unwrap only to classify input errors, but delegate every other failure with its original complete chain. The exact corrected unit command passes all cases; no general mapper changed.
+
+### Resumed boundary verification
+
+- `mise run check:client-tier` and `mise run check:error-coverage`: PASS.
+- `mise run check:tenant-isolation`: FAIL on existing Forge/Oracle migrations
+  and SQL query ownership/justification findings.
+- `mise run check:unwrap-audit`: FAIL on existing OTLP cursor `expect` methods,
+  the Forge harness invariant, and process-cluster control `expect` methods.
+- All reported files and both checker scripts have no diff from the original
+  reviewed candidate `4d3a2839281ff259dda7f58089f4c63f0f2fa7ce`.
+  These are existing failures, not passing gates; no checker was weakened.
+- `mise run fmt`: PASS after the real OTEL follow-up journey edit.

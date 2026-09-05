@@ -546,8 +546,10 @@ shared workflow skill and `mise run check:skills-sync` to detect drift. Codex
 - `$wyrd-spec` turns human intent into a decision-complete behavioral
   specification. Only explicit human approval makes a revision authoritative.
 - `$wyrd-plan` decomposes an approved specification into cohesive TDD tasks or
-  creates bounded remediation tasks from validated `$wyrd-task-review`
-  findings. It never rewrites an approved spec to fit implementation.
+  creates bounded remediation tasks from validated `$wyrd-task-review` or
+  `$wyrd-change-review` implementation findings. Missing review evidence
+  returns to `$wyrd-task-review`. It never rewrites an approved spec to fit
+  implementation.
 - `$wyrd-task-readiness` reviews one or more proposed tasks before
   implementation. It is distinct from post-implementation task review.
 - Wyrd Rust, Python, TypeScript, server, CLI, MCP, storage, Vala, and contract
@@ -562,9 +564,10 @@ shared workflow skill and `mise run check:skills-sync` to detect drift. Codex
   approval.
 - `$wyrd-change-review` performs the final immutable integrated review and maps
   every required specification obligation to credible evidence, including
-  cross-task seams and user journeys. Its review phase remains read-only. An
-  `APPROVE` verdict automatically invokes `$wyrd-complete` in the same workflow
-  turn.
+  independently reviewed cross-task seams and user journeys. Its review phase
+  remains read-only. Implementation findings return to `$wyrd-plan`; missing
+  task-review evidence returns to `$wyrd-task-review`. An `APPROVE` verdict
+  automatically invokes `$wyrd-complete` in the same workflow turn.
 - `$wyrd-complete` requires that approved review, writes one compact durable
   record under `changes/completed/<year>/<slug>.md`, and removes the full
   `changes/active/<slug>` packet. It does not merge, push, deploy, modify

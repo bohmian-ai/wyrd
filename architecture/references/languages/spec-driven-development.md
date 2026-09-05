@@ -106,11 +106,12 @@ lasting contract or material design change is already reflected in its owning
 architecture or product documentation; it never invents those updates during
 cleanup. A missing or contradictory authority update routes to remediation.
 
-The completed record and active-packet deletion are ordinary reviewed changes
-and do not depend on squash merging. Merge-commit and rebase workflows retain
-the deleted Markdown blobs in Git history; squash workflows may not. Optimize
-for a clean current tree and use the repository's chosen merge policy rather
-than rewriting history to remove small text artifacts.
+The completed record and active-packet deletion are ordinary tracked changes
+produced and validated by `$wyrd-complete`; they do not depend on squash
+merging. Merge-commit and rebase workflows retain the deleted Markdown blobs in
+Git history; squash workflows may not. Optimize for a clean current tree and
+use the repository's chosen merge policy rather than rewriting history to
+remove small text artifacts.
 
 ## Specification contract
 
@@ -155,10 +156,12 @@ the spec to draft. An approved spec has no unresolved material decision.
 ## Task contract
 
 `wyrd-plan` derives implementation tasks from an approved spec revision, from
-validated task-review findings under that same spec, or by reconciling an
-approved revision with a frozen partially implemented task candidate and its
-current-state amendment. Use as many tasks as cohesive ownership and real
-dependencies require; task count is not a target.
+validated task- or change-review implementation findings under that same spec,
+or by reconciling an approved revision with a frozen partially implemented task
+candidate and its current-state amendment. Missing or incomplete review
+evidence returns to task review rather than becoming an implementation task.
+Use as many tasks as cohesive ownership and real dependencies require; task
+count is not a target.
 
 Each task identifies:
 
@@ -190,7 +193,9 @@ remediates: []
 - exact focused commands for every specifically named test;
 - broader crate, module, family, integration, codegen, and journey verification;
 - completion evidence and material stop conditions; and
-- for remediation, the parent task and validated finding IDs.
+- for remediation, validated finding IDs and the parent task when one existing
+  task owns the finding; integrated findings spanning tasks instead name the
+  affected task set in scope and consumer closure.
 
 Task planning must choose the plan-level implementation architecture listed in
 the decision-ownership table. It may not weaken or reinterpret the approved
@@ -299,13 +304,43 @@ returns `APPROVE`, `REMEDIATE`, `SPEC_REVISION_REQUIRED`, or `BLOCKED`.
 Post-remediation review always reassesses the original task's complete
 base-to-candidate range, not only the latest fix diff.
 
-Every actionable finding has a stable ID, exact location, mapped spec and task
-obligations, reachable scenario, concrete consequence, required outcome, and
-supporting evidence. A finding is not new product authority.
+Task review combines conformance review with independent code review. A
+separate read-only reviewer covers correctness, security, code quality,
+maintainability, tests, developer experience, and architecture/contracts;
+sensitive changed boundaries receive applicable specialist review from an
+agent distinct from the baseline reviewer. The task reviewer independently
+validates and root-cause deduplicates candidate findings, audits changed-file
+and obligation coverage, and requires adversarial clean evidence before
+approval. The independent reviewers do not implement or plan fixes.
 
-`wyrd-plan` converts validated `REMEDIATE` findings into the minimum cohesive
-remediation tasks. If the required outcome changes the approved behavior or a
-material constraint, route it to `SPEC_REVISION_REQUIRED` instead.
+Every blocking finding has a stable ID, exact location, mapped spec and task
+obligations, reachable scenario, concrete consequence, required outcome, and
+supporting evidence. It blocks only when the cumulative candidate introduces
+or leaves unresolved a reachable material violation of approved behavior,
+repository authority, correctness, security, durability, compatibility, or
+required verification. Optional hardening, preferences, speculative cleanup,
+and unrelated pre-existing debt are non-blocking follow-up. A finding is not
+new product authority.
+
+Approval evidence includes an auditable ledger mapping every changed
+production file, specification obligation, high-risk boundary, and applicable
+review lens to an independent reviewer. Each clean lens records the strongest
+realistic counterexample attempted. The task reviewer keeps a validation ledger
+showing whether each candidate concern was blocking, follow-up, or rejected and
+why. Missing mandatory independent review or coverage evidence blocks approval.
+
+Every blocking finding carries a decision-complete Ponytail recommendation:
+fix the shared root cause with the first viable option among deletion,
+repository reuse, standard-library or native behavior, an installed
+dependency, and minimum new code. It names the production owner, required
+control-flow or state outcome, focused closure test, and deliberate exclusions;
+new abstractions, dependencies, configuration, compatibility layers, and
+speculative flexibility require source-validated necessity.
+
+`wyrd-plan` converts validated task- or change-review implementation findings
+into the minimum cohesive remediation tasks. Missing review evidence routes
+directly to task review. If the required outcome changes the approved behavior
+or a material constraint, route it to `SPEC_REVISION_REQUIRED` instead.
 
 ## Final change verification
 
@@ -314,6 +349,20 @@ specification obligation to the strongest applicable evidence, checks
 cross-task seams and required user journeys, and inspects the complete immutable
 base-to-target range. It returns `APPROVE`, `REMEDIATE`,
 `SPEC_REVISION_REQUIRED`, or `BLOCKED`.
+
+Final review verifies that every task has credible independent code-review and
+validation evidence. It reuses that evidence only when the reviewed task
+candidate is unchanged in the integrated target by ancestry or exact patch
+equivalence; otherwise the affected cumulative task receives a new task review.
+A separate independent reviewer covers integrated interactions, resolution
+drift, and regressions, and the final reviewer validates its findings. Missing
+review coverage routes directly to task review.
+
+Final review applies the same blocking, follow-up, and rejected materiality
+rules as task review. Confirmed cross-task implementation defects under the
+approved spec route to `$wyrd-plan`; missing task-review evidence routes to
+`$wyrd-task-review`; changed behavior or another material decision routes to
+`$wyrd-spec`.
 
 The review phase never edits its subject. `APPROVE` immediately hands its
 validated completion payload to `$wyrd-complete`, which writes the compact

@@ -495,3 +495,25 @@ impl ForgeRewriteRuntime {
         Arc::ptr_eq(&self.runtime.memory_pool, pool)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::execution::memory_pool::FairSpillPool;
+
+    /// Sort pressure must spill before consuming the next decoder's headroom.
+    #[test]
+    fn spillable_sort_preserves_decode_headroom() {
+        let pool: Arc<dyn MemoryPool> = Arc::new(ForgeAttemptMemoryPool::new(
+            Arc::new(FairSpillPool::new(128)),
+            Arc::new(AtomicU64::new(0)),
+        ));
+        let mut sort = MemoryConsumer::new("sort").with_can_spill(true).register(&pool);
+        let mut decode = MemoryConsumer::new("decode").register(&pool);
+        sort.try_grow(64).expect("sort fits its admitted allowance");
+        assert!(sort.try_grow(1).is_err(), "sort must preserve decode headroom");
+        decode.try_grow(64).expect("decode uses its retained headroom");
+        drop((sort, decode));
+        assert_eq!(pool.reserved(), 0);
+    }
+}

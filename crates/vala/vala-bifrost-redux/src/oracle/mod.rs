@@ -18,6 +18,7 @@ use datafusion::common::TableReference;
 use datafusion::dataframe::DataFrame;
 use datafusion::datasource::MemTable;
 use datafusion::datasource::TableProvider;
+use datafusion::error::DataFusionError;
 use datafusion::execution::context::SessionContext;
 use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream, execute_stream};
 use datafusion::sql::parser::{DFParser, Statement as DfStatement};
@@ -4008,8 +4009,9 @@ impl Oracle {
     ///
     /// # Errors
     ///
-    /// Returns a stable execution failure when the statement cannot be planned
-    /// or optimized against the session's registered providers.
+    /// Returns a repairable invalid-query refusal for typed SQL, schema, or
+    /// unsupported-feature errors. Other planning failures retain their stable
+    /// public mapping without exposing dependency diagnostics.
     async fn plan_physical(
         session: &SessionContext,
         sql: &str,
@@ -4017,11 +4019,11 @@ impl Oracle {
         let frame = session
             .sql(sql)
             .await
-            .map_err(|error| map_datafusion_error(&error))?;
+            .map_err(|error| map_query_planning_error(&error))?;
         frame
             .create_physical_plan()
             .await
-            .map_err(|error| map_datafusion_error(&error))
+            .map_err(|error| map_query_planning_error(&error))
             .map_err(OracleExecutionError::from)
     }
 }
@@ -4949,6 +4951,26 @@ fn admission_limits(usable_slots: u32, class: QueryClass) -> (u32, u32) {
     }
 }
 
+/// Classifies planning refusals without exposing dependency diagnostics.
+fn map_query_planning_error(error: &DataFusionError) -> BifrostError {
+    if datafusion_resources_exhausted(error) {
+        return map_datafusion_error(error);
+    }
+    match error {
+        DataFusionError::Context(_, source) | DataFusionError::Diagnostic(_, source) => {
+            map_query_planning_error(source)
+        }
+        DataFusionError::SQL(..)
+        | DataFusionError::Plan(_)
+        | DataFusionError::SchemaError(..)
+        | DataFusionError::NotImplemented(_) => BifrostError::QueryInvalidSql {
+            detail: "Inspect bifrost.describe_table and submit a supported SELECT query."
+                .to_owned(),
+        },
+        _ => map_datafusion_error(error),
+    }
+}
+
 /// Maps a pre-stream `DataFusion` failure into the stable public catalog.
 fn map_datafusion_error(error: &datafusion::error::DataFusionError) -> BifrostError {
     tracing::error!(error = %error, "Oracle DataFusion operation failed");
@@ -5247,6 +5269,53 @@ mod tests {
     use arrow::array::{StringArray, UInt64Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use std::sync::atomic::AtomicUsize;
+
+    /// Planning input errors carry one safe repair action through dependency wrappers.
+    #[test]
+    fn datafusion_query_rejections_are_safe_and_actionable() {
+        for wrapped in [false, true] {
+            for error in [
+                DataFusionError::Plan("private column".to_owned()),
+                DataFusionError::SchemaError(
+                    Box::new(datafusion::common::SchemaError::DuplicateUnqualifiedField {
+                        name: "private column".to_owned(),
+                    }),
+                    Box::new(None),
+                ),
+                DataFusionError::NotImplemented("private function".to_owned()),
+            ] {
+                let candidate = if wrapped {
+                    DataFusionError::Context(
+                        "private context".to_owned(),
+                        Box::new(error.with_diagnostic(
+                            datafusion::common::diagnostic::Diagnostic::new_error(
+                                "private diagnostic",
+                                None,
+                            ),
+                        )),
+                    )
+                } else {
+                    error
+                };
+                assert_eq!(
+                    map_query_planning_error(&candidate),
+                    BifrostError::QueryInvalidSql {
+                        detail:
+                            "Inspect bifrost.describe_table and submit a supported SELECT query."
+                                .to_owned(),
+                    }
+                );
+            }
+        }
+        assert_eq!(
+            map_query_planning_error(&DataFusionError::Internal("private".to_owned())),
+            BifrostError::QueryExecutionFailed
+        );
+        assert_eq!(
+            map_datafusion_error(&DataFusionError::Plan("private".to_owned())),
+            BifrostError::QueryExecutionFailed
+        );
+    }
 
     /// Only eligible live-tail loss under explicit policy becomes degraded.
     #[test]

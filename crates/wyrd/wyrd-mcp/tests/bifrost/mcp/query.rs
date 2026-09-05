@@ -81,20 +81,15 @@ mod pg_tests {
                 serde_json::json!({"sql": "SELECT id FROM vala.bifrost.absent_table"}),
                 "WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND",
             ),
-            // An unresolvable column or function passes the SQL floor and dies
-            // in Oracle's own planner, which scrubs the DataFusion message
-            // rather than leak schema shape. The agent still gets the complete
-            // canonical problem and no partial rows, but the code is Oracle's
-            // opaque execution failure, not a repairable 400.
             (
                 "unknown field",
                 serde_json::json!({"sql": format!("SELECT no_such_column FROM {table}")}),
-                "WYRD_VALA_500_QUERY_EXECUTION_FAILED",
+                "WYRD_VALA_400_QUERY_INVALID_SQL",
             ),
             (
                 "unsupported shape",
                 serde_json::json!({"sql": format!("SELECT evil_udf(value) FROM {table}")}),
-                "WYRD_VALA_500_QUERY_EXECUTION_FAILED",
+                "WYRD_VALA_400_QUERY_INVALID_SQL",
             ),
             (
                 "row ceiling above the MCP floor",
@@ -125,6 +120,12 @@ mod pg_tests {
                 serde_json::json!(code),
                 "{case}: {refusal}"
             );
+            if matches!(case, "unknown field" | "unsupported shape") {
+                assert_eq!(
+                    refusal["detail"],
+                    "invalid or unsupported query SQL: Inspect bifrost.describe_table and submit a supported SELECT query."
+                );
+            }
             for field in [
                 "code",
                 "status",

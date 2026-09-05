@@ -336,3 +336,10 @@ contract rather than consuming its existing validators.
 
 - Independent `$wyrd-task-readiness` review: **READY**, no blocking readiness findings (2026-09-04).
 - Starting candidate: `4d3a2839281ff259dda7f58089f4c63f0f2fa7ce`; working tree contained only this remediation packet.
+
+### Scenario 1 — safe actionable planning refusals
+
+- RED: the named unit test returned `QueryExecutionFailed` instead of `QueryInvalidSql`; the named MCP journey returned `WYRD_VALA_500_QUERY_EXECUTION_FAILED` for the unknown field.
+- GREEN: both focused tests pass. Direct and Context/Diagnostic-wrapped planning/schema/unsupported errors receive the fixed describe-table/SELECT repair action; the general mapper and Internal mapping stay unchanged.
+- Exact unit command correction: `mise exec -- cargo nextest run --locked -p vala-bifrost-redux --features test-support,bench-support --lib -E 'test(=oracle::tests::datafusion_query_rejections_are_safe_and_actionable)'`. The featureless command cannot compile existing analytical tests using feature-gated `runtime_inspection`; use the canonical repository test union.
+- The task's exact Postgres-wrapped MCP journey command ran unchanged for RED and GREEN. `mise run fmt` passed.

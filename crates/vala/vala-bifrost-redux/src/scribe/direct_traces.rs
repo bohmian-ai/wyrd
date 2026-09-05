@@ -240,9 +240,6 @@ impl OtlpProjection<'_> {
         let managed = self.managed(write_schema(), plan.accepted)?;
         plan.material_plan(material_limit, &managed).map(Some)
     }
-}
-
-impl OtlpProjection<'_> {
     /// Projects one typed trace request through an allocation-free sizing pass and
     /// an exact-capacity Arrow construction pass.
     ///
@@ -1033,9 +1030,15 @@ mod tests {
         ScribeError,
     > {
         let context = super::super::otlp_managed::OtlpTestContext::new();
-        context
-            .projection(write_schema().as_ref())
-            .project_traces(request, material_limit)
+        let projection = context.projection(write_schema().as_ref());
+        let material_limit = if material_limit == usize::MAX {
+            super::super::material_plan::ScribeIngressPlanner::default()
+                .plan_traces(request, 1024, 0, &projection)?
+                .current_material_bytes
+        } else {
+            material_limit
+        };
+        projection.project_traces(request, material_limit)
     }
 
     /// Computes the exact final Arrow-plus-IPC charge from pre-material facts.
@@ -1190,31 +1193,49 @@ mod tests {
             Err(ScribeError::DecodedPayloadTooLarge { .. })
         ));
     }
-    /// Small exports reserve the Arrow and IPC projection, not just decoded input.
+
+    /// Ingress includes repeated shared values, escaping, Arrow owners, and IPC.
     ///
     /// # Errors
     ///
-    /// Returns fixture planning or projection failures.
+    /// Returns fixture planning, projection, or IPC encoding failures.
     #[test]
     fn ingress_plan_covers_projection() -> Result<(), ScribeError> {
-        let request = request();
+        let mut request = request();
+        let shared = request.resource_spans[0]
+            .resource
+            .as_mut()
+            .expect("fixture resource");
+        shared.attributes.push(KeyValue {
+            key: "escaped".to_owned(),
+            value: Some(AnyValue {
+                value: Some(any_value::Value::StringValue("quote\"\n\t".repeat(32))),
+            }),
+        });
+        let repeated = request.resource_spans[0].scope_spans[0].clone();
+        request.resource_spans[0].scope_spans.push(repeated);
         let context = super::super::otlp_managed::OtlpTestContext::new();
         let projection = context.projection(write_schema().as_ref());
-        let admitted = crate::scribe::material_plan::ScribeIngressPlanner::default().plan_traces(
+        let admitted = super::super::material_plan::ScribeIngressPlanner::default().plan_traces(
             &request,
             1024,
             0,
             &projection,
         )?;
         let exact = exact_material_bytes(&request)?;
-        assert!(
-            admitted.current_material_bytes >= exact,
-            "admitted {} bytes cannot hold the exact {exact}-byte projection",
-            admitted.current_material_bytes
+        assert_eq!(admitted.current_material_bytes, exact);
+        let (batch, _) = projection.project_traces(&request, admitted.current_material_bytes)?;
+        let batch = batch.expect("valid fixture produces rows");
+        let ipc = batch.ipc_plan.encode(&batch.rows)?;
+        assert_eq!(
+            admitted.current_material_bytes,
+            batch.rows.get_array_memory_size() + ipc.len()
         );
-        let (batch, _) = project_fixture(&request, admitted.current_material_bytes)?;
-        let batch = batch.expect("valid spans produce rows");
-        assert!(admitted.persistence_candidate_bytes >= batch.rows.get_array_memory_size());
+        assert_eq!(
+            admitted.persistence_candidate_bytes,
+            batch.rows.get_array_memory_size()
+        );
+        assert_eq!(admitted.rows, batch.rows.num_rows());
         Ok(())
     }
 }

@@ -1723,7 +1723,8 @@ mod tests {
     };
 
     use super::{
-        OtlpCounts, ScribeIngressPlanner, count_exponential_point, count_histogram_point,
+        OtlpCounts, ScribeIngressPlanner, configured_maximum_envelope_bytes,
+        configured_otlp_material_bytes, count_exponential_point, count_histogram_point,
         count_number_point, count_summary_point, count_value, root_as_message,
     };
     use crate::contracts::ScribeError;
@@ -2110,5 +2111,97 @@ mod tests {
             arrow::ipc::reader::StreamReader::try_new(Cursor::new(canonical_stream()), None)
                 .expect("stream reader");
         assert_eq!(reader.count(), 1);
+    }
+    /// The boot envelope bounds expanded projection without charging phantom rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns fixture planning failures outside the expected material refusal.
+    #[test]
+    fn otlp_projection_respects_configured_envelope() -> Result<(), ScribeError> {
+        use crate::tables::DomainTable;
+        use wyrd_tonic::otlp::resource::v1::Resource;
+        let mut fields = crate::tables::RecordsTable::arrow_fields();
+        for name in ["run_id", "card_uid", "principal_id"] {
+            fields.push(Field::new(name, DataType::Utf8, true));
+        }
+        let schema = Schema::new(fields);
+        let context = super::super::otlp_managed::OtlpTestContext::new();
+        let projection = context.projection(&schema);
+        let mut request = ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                resource: Some(Resource {
+                    attributes: vec![KeyValue {
+                        key: "service.name".to_owned(),
+                        value: Some(AnyValue {
+                            value: Some(any_value::Value::StringValue("fixture".to_owned())),
+                        }),
+                    }],
+                    ..Resource::default()
+                }),
+                scope_logs: vec![ScopeLogs {
+                    log_records: vec![LogRecord {
+                        time_unix_nano: 1_700_000_000_000_000_000,
+                        observed_time_unix_nano: 1_700_000_000_000_000_000,
+                        severity_number: 17,
+                        body: Some(AnyValue {
+                            value: Some(any_value::Value::StringValue("small".to_owned())),
+                        }),
+                        ..LogRecord::default()
+                    }],
+                    ..ScopeLogs::default()
+                }],
+                ..ResourceLogs::default()
+            }],
+        };
+        let mut limits = crate::gate::limits::IngestLimits::default();
+        limits.rows = 1;
+        limits.otlp.request_bytes = 1024;
+        limits.otlp.value_bytes = 1024;
+        let planner = ScribeIngressPlanner::new(limits);
+        let ceiling = configured_otlp_material_bytes(limits)?;
+        let measured = projection
+            .measure_logs(&request, usize::MAX)?
+            .expect("valid log produces material");
+        let bytes = measured.admitted_bytes(usize::MAX)?;
+        assert!(
+            bytes > ceiling,
+            "fixture crosses the configured material ceiling"
+        );
+        assert!(matches!(planner.plan_logs(&request, 1024, 0, &projection),
+            Err(ScribeError::DecodedPayloadTooLarge { bytes: actual, limit })
+                if actual == bytes && limit == ceiling));
+
+        let empty = planner.plan_logs(&ExportLogsServiceRequest::default(), 0, 0, &projection)?;
+        assert_eq!(
+            (
+                empty.rows,
+                empty.source_count,
+                empty.current_material_bytes,
+                empty.persistence_candidate_bytes
+            ),
+            (0, 0, 0, 0)
+        );
+        request.resource_logs[0].scope_logs[0].log_records[0].trace_id = vec![1];
+        let rejected = planner.plan_logs(&request, 1024, 0, &projection)?;
+        assert_eq!(
+            (
+                rejected.rows,
+                rejected.source_count,
+                rejected.current_material_bytes,
+                rejected.persistence_candidate_bytes
+            ),
+            (0, 0, 0, 0)
+        );
+        limits.otlp.request_bytes = usize::MAX;
+        assert!(matches!(
+            configured_otlp_material_bytes(limits),
+            Err(ScribeError::DecodedPayloadTooLarge { .. })
+        ));
+        assert!(matches!(
+            configured_maximum_envelope_bytes(limits),
+            Err(ScribeError::DecodedPayloadTooLarge { .. })
+        ));
+        Ok(())
     }
 }

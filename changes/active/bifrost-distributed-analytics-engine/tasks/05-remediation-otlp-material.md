@@ -157,3 +157,16 @@ preflight and post-admission call sites use it. Existing test identity setup
 was consolidated into a small test-only owner because the borrowed projection
 must retain its principal/request lifetime; no test transport or fixture
 framework was added. Sibling regression and cap/journey verification follows.
+
+Scenario 1 coverage GREEN: all three exact signal selectors pass (traces
+0.022s, logs 0.014s, metrics 0.016s). They compare admitted bytes with actual
+Arrow memory plus actual encoded IPC, including repeated resource/scope data
+and escaped values. Existing normal fixture projections also use production
+admission; standalone exact-limit tests retain their explicit limits.
+
+Scenario 2 RED mutation: bypassing the configured log material ceiling makes
+the exact envelope selector fail at its expected typed-refusal assertion
+(0.435s). Restoring the guard yields GREEN (0.027s), including empty and
+all-rejected inputs with zero projected material and checked configuration
+overflow. This cap failure has no cross-boundary state; it is deliberately
+forced in the pure planner rather than by reconfiguring a live server.

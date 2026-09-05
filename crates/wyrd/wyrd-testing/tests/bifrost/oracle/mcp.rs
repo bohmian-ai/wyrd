@@ -349,7 +349,13 @@ mod pg_tests {
             }
         }
 
-        // An abandoned analytical read settles before the agent disconnects.
+        // Pause a real activated follower before source IO, so ordinary fast
+        // completion cannot masquerade as cancellation.
+        for (index, before) in &baseline {
+            await_baseline(&mut cluster, *index, *before).await?;
+        }
+        let paused = PEER_FOLLOWERS[0];
+        cluster.nodes_mut()[paused].arm_execute_pause()?;
         let handle = client
             .send_cancellable_request(
                 ClientRequest::CallToolRequest(CallToolRequest::new(query(
@@ -358,12 +364,28 @@ mod pg_tests {
                 PeerRequestOptions::no_options(),
             )
             .await?;
+        cluster.nodes_mut()[paused].await_execute_paused()?;
+        let family = "oracle_query_duration_seconds";
+        let labels = std::collections::BTreeMap::from([
+            ("class".to_owned(), "analytical".to_owned()),
+            ("outcome".to_owned(), "cancelled".to_owned()),
+        ]);
+        let before_cancel =
+            cluster.nodes_mut()[COORDINATOR].metric_totals_labeled(&[family], &labels)?[family];
         handle.cancel(None).await?;
-
-        client.cancel().await?;
+        cluster.nodes_mut()[paused].release_execute_pause()?;
         for (index, before) in baseline {
             await_baseline(&mut cluster, index, before).await?;
         }
+        let after_cancel =
+            cluster.nodes_mut()[COORDINATOR].metric_totals_labeled(&[family], &labels)?[family];
+        if after_cancel <= before_cancel {
+            return Err(
+                "the active MCP query did not record Analytical cancellation before disconnect"
+                    .into(),
+            );
+        }
+        client.cancel().await?;
         cluster.shutdown()?;
         Ok(())
     }

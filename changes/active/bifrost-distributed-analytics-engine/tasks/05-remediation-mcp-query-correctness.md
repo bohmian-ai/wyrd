@@ -357,3 +357,10 @@ contract rather than consuming its existing validators.
 - GREEN: the exact named terminal test passes nine cases: matrix, row count, malformed EOS, valid failed terminal, duplicate terminal, trailing batch/error, missing terminal, and cancellation while awaiting missing EOF. All untrusted streams cancel before return; a valid failed terminal preserves `QueryTimeout` and does not cancel again.
 - The exact named positional/exact-byte test passes with a valid PublishedOnly source-completion fixture. Existing decoder and contract validators are reused; no Oracle terminal production changed.
 - `mise run fmt` and `git diff --check` passed.
+
+### Scenario 4 — cancellation before disconnect
+
+- Strengthened the existing four-process MCP journey with the existing activated-follower pause, Analytical/cancelled duration observation, and all three pre-query ownership baselines before MCP disconnect.
+- RED mutation: deliberately omitted `RequestHandle::cancel` while retaining the request. The exact named journey failed: `the active MCP query did not record Analytical cancellation before disconnect`. Ordinary completion cannot satisfy the new assertion.
+- GREEN: restored the cancel call; the exact named Postgres-wrapped Oracle journey passed (18.6 seconds). No production cancellation behavior changed and no new fixture control or telemetry family was added.
+- `mise run fmt` passed.

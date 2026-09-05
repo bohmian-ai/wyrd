@@ -355,3 +355,106 @@ result, Bifrost writes, or weaker auth, tenant, audit, floor, cancellation, or
 terminal semantics. Stop for an approved-plan revision if the Oracle
 remediation changes the application/query seam or the exact terminal/cleanup
 evidence assumed here.
+
+## Implementation evidence
+
+### Scenario 1 — discovery catalog and layout
+
+- **RED.** `query::pg_tests::…` did not exist yet; the new
+  `discovery::pg_tests::agent_discovers_only_authorized_tables_and_layout`
+  failed at `tools/list`, which returned an empty catalog because no Bifrost
+  descriptor was registered.
+- **GREEN.** Added `crates/wyrd/wyrd-server/src/mcp/bifrost.rs` with the three
+  read-only descriptors, `list_tables`, `describe_table`, and the shared
+  argument parser; `mcp/mod.rs::catalog` now returns `bifrost::descriptors()`
+  and only appends the test probe under the existing opt-in.
+- **REFACTOR.** No deletions were required: no Skald MCP registry,
+  `wyrd-server → skald` dependency, or `crates/wyrd/wyrd-mcp/src/bifrost/`
+  remained in the tree.
+- **Correction.** The predecessor's
+  `connectivity::pg_tests::default_server_advertises_no_mcp_tools` asserted an
+  empty catalog, which this task's contract replaces. It is now
+  `default_server_advertises_no_test_probe`, and the probe-fixture assertion in
+  `streamable_http_client_reaches_authenticated_server_context` expects the
+  three read tools followed by the probe.
+
+### Scenario 2 — closed input and pre-execution refusals
+
+- **RED.** The unit test failed with no `bifrost.query` descriptor; the journey
+  failed on every case for the same reason.
+- **GREEN.** `QueryArguments` (closed, `deny_unknown_fields`), its bounds
+  check, `to_request`, and the `ResultCollector` row ceiling.
+- **Command correction.** The task's unit command omits the feature flag the
+  descriptor test needs at the time it was written; both feature configurations
+  now pass, and the recorded command is
+  `mise exec -- cargo nextest run --locked -p wyrd-server --lib -E 'test(=mcp::bifrost::tests::query_schema_is_closed_bounded_and_has_no_path_selector)'`.
+- **Limitation (owning-boundary error codes).** Three journey expectations were
+  corrected to the code the existing owner actually returns, not weakened:
+  - an absent table is `WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND`;
+  - MCP input-bound refusals are `WYRD_SPEC_400_VALIDATION`;
+  - **an unresolvable column or function is `WYRD_VALA_500_QUERY_EXECUTION_FAILED`.**
+    Such SQL passes the server's floor and dies inside Oracle's planner, where
+    `vala-bifrost-redux::oracle::map_datafusion_error` deliberately scrubs the
+    DataFusion message rather than leak schema shape. The refusal still carries
+    the complete canonical problem with no result payload and still precedes
+    row execution, but its content is not repairable by the agent. This is
+    pre-existing behaviour shared with the HTTP and gRPC query surfaces; the
+    task forbids reproducing validation in the MCP adapter, so it is recorded
+    rather than changed.
+
+### Scenario 3 — exact byte accounting and cancellation
+
+- **RED.** The unit test's column and row projections passed on the first run;
+  the exact-byte case failed because no byte ceiling was enforced. The journey
+  then failed at `query schema stall deadline elapsed` and, once the stall was
+  wired, at the settled-lifecycle wait.
+- **GREEN.** `STRUCTURED_OVERHEAD_BYTES` plus `ResultCollector::charge` /
+  `charge_bytes` charge the exact `serde_json::to_vec` length of the columns,
+  every row and its separating comma, and the terminal with checked
+  arithmetic, refusing a candidate before retaining it. `query` now takes
+  `&RequestContext<RoleServer>` and `collect` races every frame against
+  `context.ct.cancelled()` with a biased `tokio::select!`, awaiting
+  `OracleQueryStream::cancel()` before returning.
+- **Bounded correction (deterministic hold).** `stall_next_query_after_schema`
+  is applied by the HTTP route's frame transport, not by `stream_query`, so the
+  MCP consumer could never reach it. `claim_schema_stall` in the adapter claims
+  the same fault under `#[cfg(feature = "test-support")]` and binds Oracle's
+  resource probe, mirroring `query/routes.rs`. Without it a fixture-sized query
+  settles before a cancellation notification can cross the wire, so the race
+  the collector must win would never be run.
+- **Bounded correction (settlement observable).** The journey waits on
+  `QueryLifecycleObserver::wait_for_at_least`, not
+  `wait_for_cancelled_at_least`: Oracle labels an outcome `cancelled` only when
+  the stream also observed a failed step, and a two-row fixture completes its
+  drain. The contract assertion is that the lifecycle settled and that
+  `wait_bifrost_query_resources_released` returns zero admission slots, memory
+  bytes, peer slots, and tail fences.
+- **Cancellation result.** A cancelled query returns
+  `ValaError::QueryStreamIncomplete` — literally what happened — because
+  `BifrostError` has no cancellation variant and this task adds no shared
+  contract.
+
+### Scenario 4 — analytical three-table join over MCP
+
+- **RED.** `crates/wyrd/wyrd-testing/tests/bifrost/oracle/mcp.rs` did not
+  compile until `rmcp` was added as a `wyrd-testing` dev-dependency; it then
+  failed with `HTTP 401 … missing X-Wyrd-Access-Token header`, because Wyrd's
+  edge reads the JWT from `x-wyrd-access-token` rather than `Authorization`.
+- **GREEN.** No adapter change. The journey exchanges the cluster's API key at
+  the pod's real `/auth/token`, attaches the bearer as a custom header, and
+  drives discovery, the join, both ceilings, two repairs, and cancellation.
+  Oracle returns `execution_path: "analytical"`, three groups of 64 matches
+  (4³), and both followers admitted peer bodies.
+- **Assertion verified non-vacuous.** Flipping the expectation to
+  `"interactive"` failed with the observed `"analytical"` terminal, confirming
+  the claim is reached.
+- **REFACTOR.** `await_baseline` and `BASELINE_POLLS` moved from
+  `analytical_activation.rs` to `support.rs` now that a second module needs
+  them, per that file's stated rule. No plan hint, partition inventory,
+  topology, or join-registry code was introduced.
+
+### Broader verification
+
+`mise run fmt`, `lints`, `check:client-tier`, `check:error-coverage`,
+`test:bifrost:journey:mcp` (6/6), and `test:bifrost:journey:oracle` (23/23)
+pass. `git diff --check` is clean.

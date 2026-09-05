@@ -1707,17 +1707,25 @@ mod tests {
         assert!(error.to_string().contains("detached"));
     }
 
-    /// An approved head with a missing parent fails before any watermark can authorize expiry.
+    /// A retained head whose parent an earlier expiration removed still validates.
+    ///
+    /// Iceberg does not rewrite `parent_snapshot_id` when a snapshot expires, so
+    /// every table that has ever expired presents this shape. Truncating the
+    /// walk there is what makes the retained ancestry describable at all; a head
+    /// that is not retained is a different claim and still fails closed.
     #[test]
-    fn missing_parent_fails_closed() {
+    fn expired_parent_truncates_ancestry_and_missing_head_fails_closed() {
         let snapshots = vec![SnapshotSummary {
             id: 2,
             parent_id: Some(1),
             timestamp_ms: 20,
         }];
-        let error = validate_watermarks(&snapshots, Some(2), &[], &[], 100, 2)
-            .expect_err("missing parent must fail");
-        assert!(error.to_string().contains("missing snapshot 1"));
+        validate_watermarks(&snapshots, Some(2), &[], &[], 100, 2)
+            .expect("an already-expired parent ends the retained ancestry");
+
+        let error = validate_watermarks(&snapshots, Some(3), &[], &[], 100, 3)
+            .expect_err("an unretained head must fail");
+        assert!(error.to_string().contains("missing head snapshot 3"));
     }
 
     /// Cyclic ancestry is rejected even when the watermark timestamp is exact.

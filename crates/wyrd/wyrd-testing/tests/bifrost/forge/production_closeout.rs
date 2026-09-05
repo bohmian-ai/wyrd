@@ -300,7 +300,7 @@ impl CloseoutJourney {
     /// # Panics
     /// Panics on absent or contradictory operation/audit evidence, an unfinished
     /// ownership gauge, or missing physical data-flow counters.
-    async fn assert_rewrite_evidence(&self) {
+    async fn assert_rewrite_evidence(&self, expected: usize) {
         let rows: Vec<(Uuid, i64, i64, String, String, serde_json::Value)> = sqlx::query_as(
             "SELECT o.operation_id, o.prepared_audit_seq, o.terminal_audit_seq, \
              p.operation, t.operation, o.prepared_detail \
@@ -311,8 +311,8 @@ impl CloseoutJourney {
         ).fetch_all(self.cluster.pg_fixture().operator_pool().pool()).await.expect("rewrite audit evidence");
         assert_eq!(
             rows.len(),
-            1,
-            "one rewrite has one audited terminal settlement"
+            expected,
+            "every completed rewrite has one audited terminal settlement"
         );
         for (operation, prepared, terminal, prepared_name, terminal_name, detail) in rows {
             assert!(prepared < terminal);
@@ -603,9 +603,21 @@ async fn compaction_geometry_exact_rows_and_non_destructive_second_pass() {
         "promotion retains every physical Scribe object"
     );
     let (neighbour_snapshot, neighbour_files) = journey.live_files(&neighbour_table.binding).await;
-    journey.scheduler_pass().await;
-    journey.drain_tasks().await;
-    let (replacement_snapshot, outputs) = journey.live_files(&table.binding).await;
+    // The managed core first normalizes promoted-file identity, then packs
+    // current-recipe files. Each pass must publish progress until geometry holds.
+    let mut replacement = journey.live_files(&table.binding).await;
+    for pass in 0..8 {
+        journey.scheduler_pass().await;
+        journey.drain_tasks().await;
+        let next = journey.live_files(&table.binding).await;
+        eprintln!("rewrite pass {pass}: {:?}", next.1.values().map(DataFile::file_size_in_bytes).collect::<Vec<_>>());
+        assert_ne!(next.0, replacement.0, "geometry backlog makes snapshot progress");
+        replacement = next;
+        if replacement.1.values().any(|file| file.file_size_in_bytes() >= 900 * 1024 * 1024) {
+            break;
+        }
+    }
+    let (replacement_snapshot, outputs) = replacement;
     assert_ne!(replacement_snapshot, promoted_snapshot);
     assert!(
         outputs.keys().all(|path| !inputs.contains_key(path)),
@@ -651,6 +663,6 @@ async fn compaction_geometry_exact_rows_and_non_destructive_second_pass() {
         neighbour_expected
     );
     journey.assert_objects(&inputs).await;
-    journey.assert_rewrite_evidence().await;
+    journey.assert_rewrite_evidence(rewrites).await;
     journey.cluster.shutdown().await.expect("all roles drain");
 }

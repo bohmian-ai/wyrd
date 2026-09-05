@@ -317,7 +317,12 @@ impl CloseoutJourney {
     /// # Panics
     /// Panics on absent or contradictory operation/audit evidence, an unfinished
     /// ownership gauge, or missing physical data-flow counters.
-    async fn assert_rewrite_evidence(&self, expected: usize) {
+    async fn assert_rewrite_evidence(&self, tenant: DataTenantId, expected: usize) {
+        let mut conn = self
+            .coordinator()
+            .tenant_conn_for(tenant)
+            .await
+            .expect("tenant-scoped audit inspection");
         let rows: Vec<(Uuid, i64, i64, String, String, serde_json::Value)> = sqlx::query_as(
             "SELECT o.operation_id, o.prepared_audit_seq, o.terminal_audit_seq, \
              p.operation, t.operation, o.prepared_detail \
@@ -325,7 +330,10 @@ impl CloseoutJourney {
              JOIN vala.audit_outbox p ON p.data_tenant_id=o.data_tenant_id AND p.seq=o.prepared_audit_seq \
              JOIN vala.audit_outbox t ON t.data_tenant_id=o.data_tenant_id AND t.seq=o.terminal_audit_seq \
              WHERE o.family='iceberg_rewrite'",
-        ).fetch_all(self.cluster.pg_fixture().operator_pool().pool()).await.expect("rewrite audit evidence");
+        ).fetch_all(&mut **conn.transaction()).await.expect("rewrite audit evidence");
+        conn.commit()
+            .await
+            .expect("read-only audit inspection completes");
         assert_eq!(
             rows.len(),
             expected,
@@ -697,6 +705,6 @@ async fn compaction_geometry_exact_rows_and_non_destructive_second_pass() {
         neighbour_expected
     );
     journey.assert_objects(&inputs).await;
-    journey.assert_rewrite_evidence(rewrites).await;
+    journey.assert_rewrite_evidence(tenant, rewrites).await;
     journey.cluster.shutdown().await.expect("all roles drain");
 }

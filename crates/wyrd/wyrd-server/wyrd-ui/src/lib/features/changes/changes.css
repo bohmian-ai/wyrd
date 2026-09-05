@@ -1,0 +1,280 @@
+.changes {
+  color: var(--text);
+  font: 13px var(--font-sans);
+  min-width: 0;
+}
+.changes h1 {
+  font: 700 22px var(--font-display);
+  margin: 0 0 10px;
+}
+.changes h2 {
+  font: 700 16px var(--font-display);
+  margin: 0 0 12px;
+}
+.changes h3 {
+  font: 700 14px var(--font-display);
+  margin: 0 0 8px;
+}
+.changes p {
+  margin: 8px 0;
+  line-height: 1.55;
+}
+.changes a {
+  color: var(--brand-strong);
+}
+.changes .muted,
+.changes small {
+  color: var(--muted);
+}
+.changes .mono {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+.changes .row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.changes .between {
+  justify-content: space-between;
+}
+.changes .stack {
+  display: grid;
+  gap: 16px;
+  min-width: 0;
+}
+.changes .columns {
+  display: grid;
+  grid-template-columns: minmax(0, 2.05fr) minmax(240px, 1fr);
+  gap: 20px;
+  align-items: start;
+}
+.changes .control {
+  border: 2px solid var(--border);
+  border-radius: var(--r);
+  background: var(--surface);
+  color: var(--text);
+  font: 700 11px var(--font-mono);
+  padding: 7px 11px;
+  cursor: pointer;
+  text-decoration: none;
+  display: inline-block;
+}
+.changes .primary {
+  background: var(--brand-btn);
+  color: var(--brand-btn-ink);
+  box-shadow: 3px 3px 0 var(--shadow);
+}
+.changes button:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+.changes :is(button, a, input, select, textarea, summary):focus-visible {
+  outline: 2px solid var(--brand-strong);
+  outline-offset: 3px;
+}
+.changes
+  :is(
+    input:not([type='hidden']):not([type='radio']):not([type='checkbox']),
+    textarea,
+    select
+  ) {
+  border: 2px solid var(--border);
+  border-radius: var(--r);
+  background: var(--surface);
+  color: var(--text);
+  padding: 8px;
+  font: 12px var(--font-sans);
+  min-width: 0;
+  max-width: 100%;
+}
+.changes textarea {
+  width: 100%;
+  resize: vertical;
+  min-height: 80px;
+}
+.changes label {
+  display: grid;
+  gap: 6px;
+  font-size: 12px;
+}
+.changes .nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  border-bottom: 2px solid var(--border);
+  padding: 10px 0;
+  margin-bottom: 16px;
+  font: 700 11px var(--font-mono);
+}
+.changes .nav a {
+  padding: 8px 12px;
+  color: var(--muted);
+  text-decoration: none;
+  border: 2px solid transparent;
+  border-radius: var(--r);
+}
+.changes .nav a[aria-current] {
+  background: var(--brand-soft);
+  border-color: var(--border);
+  color: var(--text);
+}
+.changes summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+.changes .divider {
+  border-top: 2px dashed var(--border);
+  margin-top: 14px;
+  padding-top: 14px;
+}
+.changes .notice {
+  padding: 10px;
+  border: 2px dashed var(--border);
+  border-radius: var(--r);
+}
+.changes .error {
+  color: var(--danger-text);
+}
+.changes .fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+.changes .raised {
+  border-top: 4px solid var(--brand-strong);
+}
+.changes pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: 12px/1.7 var(--font-mono);
+}
+.changes .filters {
+  margin-bottom: 18px;
+}
+.changes .filters input {
+  flex: 1;
+}
+.changes .table-title {
+  display: block;
+  font: 600 13px var(--font-sans);
+  margin: 6px 0;
+}
+.changes .footer {
+  position: sticky;
+  bottom: 44px;
+  z-index: 2;
+  padding: 12px 0;
+  background: var(--bg);
+  border-top: 2px solid var(--border);
+}
+@media (max-width: 1000px) {
+  .changes .columns {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+@media (max-width: 600px) {
+  .changes h1 {
+    font-size: 20px;
+  }
+  .changes .fields {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .changes .nav {
+    gap: 0;
+  }
+  .changes .nav a {
+    padding: 8px;
+  }
+}
+
+@media (max-width: 600px) {
+  .app-shell:has(.changes) > aside {
+    padding: 6px 14px;
+    gap: 8px;
+  }
+  .app-shell:has(.changes) .workspace > header {
+    padding: 6px 14px;
+    min-height: 36px;
+    gap: 6px;
+  }
+  .app-shell:has(.changes) .workspace > header .product {
+    display: none;
+  }
+  .app-shell:has(.changes) .workspace > header .identity {
+    width: auto;
+    margin-left: auto;
+    gap: 4px;
+  }
+  .app-shell:has(.changes) .workspace > header .context {
+    font-size: 9px;
+  }
+  .app-shell:has(.changes) .workspace > header .principal summary {
+    max-width: 74px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .app-shell:has(.changes) main {
+    padding: 12px 14px;
+  }
+  .changes {
+    font-size: 11px;
+  }
+  .changes h1 {
+    font-size: 15px;
+  }
+  .changes .stack {
+    gap: 10px;
+  }
+  .changes .row {
+    gap: 6px;
+  }
+  .changes .mono {
+    font-size: 9px;
+  }
+  .changes .wy-panel-body {
+    padding: 8px;
+  }
+  .changes .wy-panel-head {
+    padding: 6px 8px;
+  }
+  .changes .nav {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    padding: 5px 0;
+    margin-bottom: 10px;
+    font-size: 9px;
+  }
+  .changes .nav a {
+    padding: 6px;
+  }
+  .changes .change-header {
+    gap: 6px;
+  }
+  .changes .change-header h1 {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    width: 100%;
+  }
+  .changes .change-header .channels {
+    gap: 4px;
+    font-size: 8px;
+  }
+  .changes .change-header p {
+    line-height: 1.4;
+  }
+  .changes .control {
+    font-size: 10px;
+    padding: 6px 9px;
+  }
+  .changes .footer {
+    padding: 8px 0;
+  }
+  .changes .draft .footer {
+    padding-bottom: 8px;
+  }
+}

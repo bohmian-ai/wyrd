@@ -1,0 +1,230 @@
+[
+  {
+    "name": "inbox",
+    "width": 1440,
+    "theme": "light",
+    "mode": "light",
+    "overflow": false,
+    "title": "Change Requests · Wyrd",
+    "headings": [
+      "Change Requests"
+    ]
+  },
+  {
+    "name": "inbox",
+    "width": 1440,
+    "theme": "dark",
+    "mode": "dark",
+    "overflow": false,
+    "title": "Change Requests · Wyrd",
+    "headings": [
+      "Change Requests"
+    ]
+  },
+  {
+    "name": "new",
+    "width": 1440,
+    "theme": "light",
+    "mode": "light",
+    "overflow": false,
+    "title": "New Change Request · Wyrd",
+    "headings": [
+      "New Change Request"
+    ]
+  },
+  {
+    "name": "new",
+    "width": 1440,
+    "theme": "dark",
+    "mode": "dark",
+    "overflow": false,
+    "title": "New Change Request · Wyrd",
+    "headings": [
+      "New Change Request"
+    ]
+  },
+  {
+    "name": "overview",
+    "width": 1440,
+    "theme": "light",
+    "mode": "light",
+    "overflow": false,
+    "title": "Raise checkout ranking cutoff for high-risk carts · Overview · Wyrd",
+    "headings": [
+      "Raise checkout ranking cutoff for high-risk carts",
+      "Subjects"
+    ]
+  },
+  {
+    "name": "overview",
+    "width": 1440,
+    "theme": "dark",
+    "mode": "dark",
+    "overflow": false,
+    "title": "Raise checkout ranking cutoff for high-risk carts · Overview · Wyrd",
+    "headings": [
+      "Raise checkout ranking cutoff for high-risk carts",
+      "Subjects"
+    ]
+  },
+  {
+    "name": "verification",
+    "width": 1440,
+    "theme": "light",
+    "mode": "light",
+    "overflow": false,
+    "title": "Raise checkout ranking cutoff for high-risk carts · Verification · Wyrd",
+    "headings": [
+      "Raise checkout ranking cutoff for high-risk carts",
+      "Checkout stays correct for high-risk carts",
+      "Ranking quality does not regress",
+      "No new personal data leaves checkout"
+    ]
+  },
+  {
+    "name": "verification",
+    "width": 1440,
+    "theme": "dark",
+    "mode": "dark",
+    "overflow": false,
+    "title": "Raise checkout ranking cutoff for high-risk carts · Verification · Wyrd",
+    "headings": [
+      "Raise checkout ranking cutoff for high-risk carts",
+      "Checkout stays correct for high-risk carts",
+      "Ranking quality does not regress",
+      "No new personal data leaves checkout"
+    ]
+  },
+  {
+    "name": "review",
+    "width": 1440,
+    "theme": "light",
+    "mode": "light",
+    "overflow": false,
+    "title": "Raise checkout ranking cutoff for high-risk carts · Review · Wyrd",
+    "headings": [
+      "Raise checkout ranking cutoff for high-risk carts"
+    ]
+  },
+  {
+    "name": "review",
+    "width": 1440,
+    "theme": "dark",
+    "mode": "dark",
+    "overflow": false,
+    "title": "Raise checkout ranking cutoff for high-risk carts · Review · Wyrd",
+    "headings": [
+      "Raise checkout ranking cutoff for high-risk carts"
+    ]
+  },
+  {
+    "name": "timeline",
+    "width": 1440,
+    "theme": "light",
+    "mode": "light",
+    "overflow": false,
+    "title": "Raise checkout ranking cutoff for high-risk carts · Timeline · Wyrd",
+    "headings": [
+      "Raise checkout ranking cutoff for high-risk carts"
+    ]
+  },
+  {
+    "name": "timeline",
+    "width": 1440,
+    "theme": "dark",
+    "mode": "dark",
+    "overflow": false,
+    "title": "Raise checkout ranking cutoff for high-risk carts · Timeline · Wyrd",
+    "headings": [
+      "Raise checkout ranking cutoff for high-risk carts"
+    ]
+  },
+  {
+    "name": "subjects",
+    "width": 1440,
+    "theme": "light",
+    "mode": "light",
+    "overflow": false,
+    "title": "Raise checkout ranking cutoff for high-risk carts · Subjects · Wyrd",
+    "headings": [
+      "Raise checkout ranking cutoff for high-risk carts"
+    ]
+  },
+  {
+    "name": "subjects",
+    "width": 1440,
+    "theme": "dark",
+    "mode": "dark",
+    "overflow": false,
+    "title": "Raise checkout ranking cutoff for high-risk carts · Subjects · Wyrd",
+    "headings": [
+      "Raise checkout ranking cutoff for high-risk carts"
+    ]
+  },
+  {
+    "name": "new",
+    "width": 390,
+    "theme": "light",
+    "mode": "light",
+    "overflow": false,
+    "title": "New Change Request · Wyrd",
+    "headings": [
+      "New Change Request"
+    ]
+  },
+  {
+    "name": "new",
+    "width": 390,
+    "theme": "dark",
+    "mode": "dark",
+    "overflow": false,
+    "title": "New Change Request · Wyrd",
+    "headings": [
+      "New Change Request"
+    ]
+  },
+  {
+    "name": "review",
+    "width": 390,
+    "theme": "light",
+    "mode": "light",
+    "overflow": false,
+    "title": "Raise checkout ranking cutoff for high-risk carts · Review · Wyrd",
+    "headings": [
+      "Raise checkout ranking cutoff for high-risk carts"
+    ]
+  },
+  {
+    "name": "review",
+    "width": 390,
+    "theme": "dark",
+    "mode": "dark",
+    "overflow": false,
+    "title": "Raise checkout ranking cutoff for high-risk carts · Review · Wyrd",
+    "headings": [
+      "Raise checkout ranking cutoff for high-risk carts"
+    ]
+  },
+  {
+    "name": "subjects",
+    "width": 390,
+    "theme": "light",
+    "mode": "light",
+    "overflow": false,
+    "title": "Raise checkout ranking cutoff for high-risk carts · Subjects · Wyrd",
+    "headings": [
+      "Raise checkout ranking cutoff for high-risk carts"
+    ]
+  },
+  {
+    "name": "subjects",
+    "width": 390,
+    "theme": "dark",
+    "mode": "dark",
+    "overflow": false,
+    "title": "Raise checkout ranking cutoff for high-risk carts · Subjects · Wyrd",
+    "headings": [
+      "Raise checkout ranking cutoff for high-risk carts"
+    ]
+  }
+]

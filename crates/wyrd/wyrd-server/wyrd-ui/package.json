@@ -28,5 +28,9 @@
     "typescript": "^5.9.0",
     "vite": "latest",
     "vitest": "latest"
+  },
+  "dependencies": {
+    "micromark": "4.0.2",
+    "micromark-extension-gfm": "3.0.0"
   }
 }

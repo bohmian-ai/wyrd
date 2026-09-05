@@ -1,4 +1,13 @@
 {
+  "conflict": {
+    "code": "WYRD_SPEC_409_CONFLICT",
+    "detail": "Conflict",
+    "details": {},
+    "remediation": "Refresh the resource and retry with the current version or idempotency key.",
+    "status": 409,
+    "title": "Conflict",
+    "type": "https://wyrd.dev/problems/WYRD_SPEC_409_CONFLICT"
+  },
   "denied": {
     "code": "WYRD_PERMISSION_403_DENIED_RBAC",
     "detail": "Permission denied (RBAC)",
@@ -26,6 +35,15 @@
     "title": "Internal error",
     "type": "https://wyrd.dev/problems/WYRD_SPEC_500_INTERNAL"
   },
+  "notFound": {
+    "code": "WYRD_SPEC_404_NOT_FOUND",
+    "detail": "Resource not found",
+    "details": {},
+    "remediation": "Check that the referenced Wyrd resource exists.",
+    "status": 404,
+    "title": "Resource not found",
+    "type": "https://wyrd.dev/problems/WYRD_SPEC_404_NOT_FOUND"
+  },
   "unauthenticated": {
     "code": "WYRD_AUTH_401_UNAUTHENTICATED",
     "detail": "Not authenticated",
@@ -43,5 +61,14 @@
     "status": 502,
     "title": "Upstream dependency failed",
     "type": "https://wyrd.dev/problems/WYRD_SPEC_502_UPSTREAM_FAILURE"
+  },
+  "validation": {
+    "code": "WYRD_SPEC_400_VALIDATION",
+    "detail": "Validation failed",
+    "details": {},
+    "remediation": "Check the submitted Wyrd request fields against the published schema and retry.",
+    "status": 400,
+    "title": "Validation failed",
+    "type": "https://wyrd.dev/problems/WYRD_SPEC_400_VALIDATION"
   }
 }

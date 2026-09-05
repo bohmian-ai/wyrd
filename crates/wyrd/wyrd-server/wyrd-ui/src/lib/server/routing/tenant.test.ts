@@ -84,7 +84,16 @@ test('tenant binding rejects unknown, unauthorized, revoked and expired context 
   expect(sessions.bind(session!, 'acme')).toMatchObject({
     tenant: { key: 'acme' },
     subject: session!.subject,
-    permissions: ['cards:read', 'bifrost_query:read', 'evals:read']
+    permissions: [
+      'cards:read',
+      'bifrost_query:read',
+      'evals:read',
+      'changes:read',
+      'changes:write',
+      'changes:review',
+      'changes:run',
+      'changes:override'
+    ]
   });
   expect(() => sessions.bind(session!, 'unknown')).toThrow();
   session!.memberships.splice(1);

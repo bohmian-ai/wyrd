@@ -33,13 +33,31 @@ const localPrincipal: LocalPrincipal = {
       key: 'acme',
       name: 'Acme',
       tenantId: '01990000-0000-7000-8000-000000000002',
-      permissions: ['cards:read', 'bifrost_query:read', 'evals:read']
+      permissions: [
+        'cards:read',
+        'bifrost_query:read',
+        'evals:read',
+        'changes:read',
+        'changes:write',
+        'changes:review',
+        'changes:run',
+        'changes:override'
+      ]
     },
     {
       key: 'research',
       name: 'Research',
       tenantId: '01990000-0000-7000-8000-000000000003',
-      permissions: ['cards:read', 'bifrost_query:read', 'evals:read']
+      permissions: [
+        'cards:read',
+        'bifrost_query:read',
+        'evals:read',
+        'changes:read',
+        'changes:write',
+        'changes:review',
+        'changes:run',
+        'changes:override'
+      ]
     }
   ]
 };

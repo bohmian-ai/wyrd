@@ -310,6 +310,27 @@ impl ProblemExamples<'_> {
     fn write(&self) -> Result<(), Box<dyn StdError>> {
         let examples = [
             (
+                "validation",
+                WyrdError::Validation {
+                    message: String::new(),
+                    details: json!({}),
+                },
+            ),
+            (
+                "notFound",
+                WyrdError::NotFound {
+                    message: String::new(),
+                    details: json!({}),
+                },
+            ),
+            (
+                "conflict",
+                WyrdError::Conflict {
+                    message: String::new(),
+                    details: json!({}),
+                },
+            ),
+            (
                 "unauthenticated",
                 WyrdError::Unauthenticated {
                     message: String::new(),

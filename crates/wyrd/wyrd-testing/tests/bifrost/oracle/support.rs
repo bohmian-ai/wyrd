@@ -558,3 +558,27 @@ pub(crate) async fn file_tier_counts(
     .await?;
     Ok((compacted, hot))
 }
+
+/// Bounded polls the journey waits for a pod to return to its baseline.
+pub(crate) const BASELINE_POLLS: usize = 50;
+
+/// Waits, bounded, until one pod's ownership returns to its recorded baseline.
+///
+/// # Errors
+///
+/// Returns the control-protocol error, or a description of what the pod still
+/// retained when the bound expired.
+pub(crate) async fn await_baseline(
+    cluster: &mut wyrd_testing::bifrost::process_cluster::BifrostProcessCluster,
+    index: usize,
+    before: wyrd_testing::bifrost::process_cluster::OracleOwnershipSnapshot,
+) -> Result<(), JourneyError> {
+    for _ in 0..BASELINE_POLLS {
+        if cluster.nodes_mut()[index].ownership_snapshot()? == before {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let after = cluster.nodes_mut()[index].ownership_snapshot()?;
+    Err(format!("pod {index} did not return to {before:?}, holds {after:?}").into())
+}

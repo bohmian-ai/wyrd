@@ -477,9 +477,6 @@ const PEER_FOLLOWERS: [usize; 2] = [1, 2];
 /// Index of the pod that publishes the data every Oracle reads.
 const PEER_SCRIBE: usize = 3;
 
-/// Bounded polls the journey waits for a pod to return to its baseline.
-const BASELINE_POLLS: usize = 50;
-
 /// Slot units one admitted Analytical graph charges at the resource root.
 ///
 /// The activation topology starts each pod with one unit more than this, so a
@@ -1137,27 +1134,6 @@ fn oracle_indices(
         })
         .map(|(index, _)| index)
         .collect()
-}
-
-/// Waits, bounded, until one pod's ownership returns to its recorded baseline.
-///
-/// # Errors
-///
-/// Returns the control-protocol error, or a description of what the pod still
-/// retained when the bound expired.
-async fn await_baseline(
-    cluster: &mut wyrd_testing::bifrost::process_cluster::BifrostProcessCluster,
-    index: usize,
-    before: wyrd_testing::bifrost::process_cluster::OracleOwnershipSnapshot,
-) -> Result<(), JourneyError> {
-    for _ in 0..BASELINE_POLLS {
-        if cluster.nodes_mut()[index].ownership_snapshot()? == before {
-            return Ok(());
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-    let after = cluster.nodes_mut()[index].ownership_snapshot()?;
-    Err(format!("pod {index} did not return to {before:?}, holds {after:?}").into())
 }
 
 /// Fallback is a pre-selection decision only, and a selected Analytical query

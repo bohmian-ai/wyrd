@@ -11429,6 +11429,7 @@ dependencies = [
  "rand 0.9.5",
  "rcgen",
  "reqwest 0.13.4",
+ "rmcp",
  "secrecy",
  "serde",
  "serde_jcs",

@@ -108,6 +108,13 @@ wyrd-tls = { workspace = true }
 
 [dev-dependencies]
 metrics = { workspace = true }
+# Journey plumbing only: the Oracle MCP journey drives a real MCP client against
+# a process-cluster pod's `/mcp` endpoint, so it needs the protocol client the
+# way an agent would use it. No `wyrd-testing` library code speaks MCP.
+rmcp = { workspace = true, features = [
+    "client",
+    "transport-streamable-http-client-reqwest",
+] }
 
 # One test-support binary, not a test target. Registering it is what makes
 # Cargo hand `CARGO_BIN_EXE_bifrost_peer_test_node` to the Oracle integration

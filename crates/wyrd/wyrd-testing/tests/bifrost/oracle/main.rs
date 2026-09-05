@@ -33,6 +33,7 @@ mod convergence;
 mod distributed;
 mod grpc_surface;
 mod layout;
+mod mcp;
 mod observability;
 mod peer;
 mod peer_network;

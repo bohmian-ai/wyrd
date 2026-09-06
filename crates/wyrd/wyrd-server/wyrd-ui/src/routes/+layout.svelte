@@ -2,10 +2,18 @@
   import '../app.css';
   import favicon from '../../brand/app-icon.svg?inline';
   import { page } from '$app/state';
+  import { browser } from '$app/environment';
   import type { LayoutProps } from './$types';
   import ModeProvider from '$lib/components/ModeProvider.svelte';
+  import { theme } from '$lib/theme.svelte';
 
   let { children, data }: LayoutProps = $props();
+
+  // SSR paints the mode the request's cookie asked for; render is synchronous, so
+  // writing the shared module state here is per-request. The client reads the same
+  // cookie itself in theme.svelte.ts, so hydration agrees without a repaint.
+  // svelte-ignore state_referenced_locally -- SSR-only initial read, by design
+  if (!browser) theme.mode = data.mode;
 </script>
 
 <svelte:head><link rel="icon" type="image/svg+xml" href={favicon} /></svelte:head>

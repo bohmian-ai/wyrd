@@ -2,26 +2,27 @@ import { browser } from '$app/environment';
 
 export type Mode = 'light' | 'dark';
 
-/** localStorage key persisting the viewer's mode choice across reloads and deep links. */
-const storageKey = 'wyrd-mode';
+/** Cookie persisting the viewer's mode choice — readable by the server so SSR paints the right theme on first byte. */
+const cookieName = 'wyrd-mode';
 
 /**
- * Reads the persisted mode choice, falling back to dark for first visits and
- * during server-side rendering.
+ * Reads the persisted mode choice from the cookie, falling back to dark for
+ * first visits. During SSR the root layout overwrites this with the request's
+ * cookie value, so the module default only covers the client bootstrap.
  */
 function initialMode(): Mode {
   if (!browser) return 'dark';
-  const stored = localStorage.getItem(storageKey);
-  return stored === 'light' || stored === 'dark' ? stored : 'dark';
+  const match = document.cookie.match(/(?:^|; )wyrd-mode=(light|dark)/);
+  return match ? (match[1] as Mode) : 'dark';
 }
 
 // App-wide active mode. Shared, reactive ($state) — import and mutate `theme.mode`.
-// ponytail: SSR always renders dark, so a persisted light choice repaints on hydration;
-// move the choice to a cookie if the flash ever matters.
 export const theme = $state<{ mode: Mode }>({ mode: initialMode() });
 
 /** Flips the app-wide mode and persists the choice for future visits. */
 export function toggleMode(): void {
   theme.mode = theme.mode === 'dark' ? 'light' : 'dark';
-  if (browser) localStorage.setItem(storageKey, theme.mode);
+  if (browser) {
+    document.cookie = `${cookieName}=${theme.mode}; path=/; max-age=31536000; samesite=lax`;
+  }
 }

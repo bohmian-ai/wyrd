@@ -975,9 +975,7 @@ fn storage_path(path: &str) -> wyrd_spec::vala::audit_detail::StoragePath {
 fn table_resource(fixture: &PromotionIntegrationFixture) -> String {
     format!(
         "bifrost://{}/{}/{}",
-        fixture.tenant,
-        fixture.binding.table_ref.namespace,
-        fixture.binding.table_ref.name
+        fixture.tenant, fixture.binding.table_ref.namespace, fixture.binding.table_ref.name
     )
 }
 
@@ -1179,7 +1177,7 @@ async fn assert_lease_and_fence_refuse_deletion(batch: &OrphanBatch) {
         &fixture.operator_pool,
         lease_key.clone(),
         Uuid::now_v7(),
-        std::time::Duration::from_secs(300),
+        std::time::Duration::from_mins(5),
     )
     .await
     .expect("the peer lease transaction runs")
@@ -1201,7 +1199,10 @@ async fn assert_lease_and_fence_refuse_deletion(batch: &OrphanBatch) {
         .await
         .expect_err("a table whose fence a peer holds cannot be collected");
     assert!(
-        matches!(refusal, vala_bifrost_redux::forge::ForgeError::FenceLost { .. }),
+        matches!(
+            refusal,
+            vala_bifrost_redux::forge::ForgeError::FenceLost { .. }
+        ),
         "lease loss refuses the claim: {refusal}"
     );
     assert_eq!(batch.store.deletes(), 0, "a refused lease deletes nothing");

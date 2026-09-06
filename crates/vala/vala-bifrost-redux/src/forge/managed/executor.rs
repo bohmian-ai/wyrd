@@ -145,21 +145,8 @@ impl<'attempt> ForgeManagedRewrite<'attempt> {
             attempt.attempt_id,
         )?;
         let observer = Arc::new(ForgeRewriteObserver::new());
-        let spill =
-            SpillLease::new(resources.spill_root()).map_err(|error| ForgeError::Invariant {
-                detail: format!("Forge attempt scratch root is not leasable: {error}"),
-            })?;
-        let memory_bytes = usize::try_from(resources.memory_bytes()).unwrap_or(usize::MAX);
-        let context = ManagedExecutionContext::builder()
-            .with_attempt_id(AttemptId::from_uuid(attempt.attempt_id))
-            .with_memory_pool(resources.memory_pool(), Some(memory_bytes))
-            .with_spill_lease(spill)
-            .with_cancellation(attempt.cancel.clone())
-            .with_observer(Arc::clone(&observer) as Arc<_>)
-            .build()
-            .map_err(|error| ForgeError::Invariant {
-                detail: format!("Forge managed execution context is unusable: {error}"),
-            })?;
+        let context =
+            managed_context_for(&resources, attempt.attempt_id, &attempt.cancel, &observer)?;
         Ok(Self {
             core,
             binding,
@@ -508,6 +495,41 @@ fn total_position_deletes(plans: &[CompactionPlan]) -> usize {
         .sum()
 }
 
+/// Binds one attempt's exact lease into the core's managed execution context.
+///
+/// Every execution term the core is allowed comes from the lease and nothing
+/// else: the pool the governor issued, the resident ceiling it was sized to,
+/// the attempt-owned scratch root, and the exact scratch byte figure that root
+/// was granted. The core builds the single `DataFusion` runtime from these, so
+/// an attempt cannot spill past the disk the governor actually accounted for.
+///
+/// # Errors
+///
+/// Returns [`ForgeError::Invariant`] when the leased scratch root is not
+/// usable as a spill lease or the context refuses the leased terms.
+fn managed_context_for(
+    resources: &ForgeAttemptResources,
+    attempt_id: Uuid,
+    cancel: &CancellationToken,
+    observer: &Arc<ForgeRewriteObserver>,
+) -> Result<Arc<ManagedExecutionContext>, ForgeError> {
+    let spill = SpillLease::new(resources.spill_root()).map_err(|error| ForgeError::Invariant {
+        detail: format!("Forge attempt scratch root is not leasable: {error}"),
+    })?;
+    let memory_bytes = usize::try_from(resources.memory_bytes()).unwrap_or(usize::MAX);
+    ManagedExecutionContext::builder()
+        .with_attempt_id(AttemptId::from_uuid(attempt_id))
+        .with_memory_pool(resources.memory_pool(), Some(memory_bytes))
+        .with_spill_lease(spill)
+        .with_scratch_capacity_bytes(resources.scratch_bytes())
+        .with_cancellation(cancel.clone())
+        .with_observer(Arc::clone(observer) as Arc<_>)
+        .build()
+        .map_err(|error| ForgeError::Invariant {
+            detail: format!("Forge managed execution context is unusable: {error}"),
+        })
+}
+
 /// Counts the equality-delete files the whole selection covers.
 fn total_equality_deletes(plans: &[CompactionPlan]) -> usize {
     plans
@@ -518,9 +540,91 @@ fn total_equality_deletes(plans: &[CompactionPlan]) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::execution_envelope_resource;
+    use super::{execution_envelope_resource, managed_context_for};
+    use crate::catalog::TenantTableBinding;
+    use crate::catalog::table_ref::TableRef;
+    use crate::forge::rewrite::ForgeAttemptResources;
+    use crate::namespaces::BifrostNamespace;
+    use crate::resources::{BifrostRole, BifrostRuntimeResources, ForgeRewriteRequest};
     use datafusion::error::DataFusionError;
     use iceberg_compaction_core::error::CompactionError;
+    use std::sync::Arc;
+    use tokio_util::sync::CancellationToken;
+    use uuid::Uuid;
+    use wyrd_spec::DataTenantId;
+
+    /// The core's runtime is bounded by exactly the scratch the governor issued.
+    ///
+    /// A context built from a lease must carry that lease's scratch figure into
+    /// the single execution runtime, because that limit is the only thing
+    /// stopping an admitted attempt from spilling past its accounted share of
+    /// the pod's disk.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the lease cannot be acquired or the context does not carry
+    /// the leased scratch figure.
+    #[test]
+    fn managed_context_receives_exact_scratch_lease() {
+        const MIB: u64 = 1024 * 1024;
+        const MIB_USIZE: usize = 1024 * 1024;
+        let roles = BifrostRuntimeResources::composed_for_test(
+            1024 * MIB_USIZE,
+            512 * MIB,
+            [BifrostRole::Forge],
+        );
+        let forge = roles.forge().expect("Forge capability");
+        let binding = TenantTableBinding::resolve((
+            DataTenantId::new_v7(),
+            TableRef::new(BifrostNamespace::Traces, "spans"),
+        ))
+        .expect("binding");
+        let root = tempfile::tempdir().expect("pod scratch root");
+        let scratch_bytes = 64 * MIB;
+        let resources = ForgeAttemptResources::acquire(
+            &forge,
+            ForgeRewriteRequest {
+                envelope: vala_sql::row_types::forge_tasks::ForgeTaskEnvelope {
+                    version: vala_sql::row_types::forge_tasks::FORGE_ENVELOPE_VERSION,
+                    reader_permits: 1,
+                    decoded_batch_bytes: MIB,
+                    decoded_input_bytes: MIB,
+                    sort_working_bytes: 3 * MIB,
+                    sort_merge_reservation_bytes: MIB,
+                    encoder_buffer_bytes: 2 * MIB,
+                    upload_chunk_bytes: MIB,
+                    footer_encoded_bytes: 8 * MIB,
+                    footer_decode_workspace_bytes: 32 * MIB,
+                    sort_spill_bytes: MIB,
+                },
+                memory_bytes: 128 * MIB_USIZE,
+                scratch_bytes,
+                reader_permits: 1,
+            },
+            &binding,
+            root.path(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        )
+        .expect("Forge attempt lease");
+        assert_eq!(
+            resources.scratch_bytes(),
+            scratch_bytes,
+            "the lease reports the exact scratch the governor issued"
+        );
+        let context = managed_context_for(
+            &resources,
+            Uuid::new_v4(),
+            &CancellationToken::new(),
+            &Arc::new(super::ForgeRewriteObserver::new()),
+        )
+        .expect("managed execution context");
+        assert_eq!(
+            context.runtime_env().disk_manager.max_temp_directory_size(),
+            scratch_bytes,
+            "the core's only runtime is bounded by the leased scratch figure"
+        );
+    }
 
     /// Only a typed resource failure caused by this attempt's own memory
     /// refusal is an execution-envelope outcome; a peak never classifies.

@@ -2338,7 +2338,11 @@ mod tests {
             let complete = orphan_matrix_protection(paths.roots());
             match case.loss {
                 RootLoss::SubjectBecomesEligible => assert_eq!(
-                    complete.gc_eligibility(&paths.binding, subject, ObjectEvidence::Present(&aged)),
+                    complete.gc_eligibility(
+                        &paths.binding,
+                        subject,
+                        ObjectEvidence::Present(&aged)
+                    ),
                     GcEligibility::Protected,
                     "{authority} protects its subject before it is removed"
                 ),

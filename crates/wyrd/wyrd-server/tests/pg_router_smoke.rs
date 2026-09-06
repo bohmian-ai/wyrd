@@ -1372,8 +1372,7 @@ async fn forge_worker_refuses_staging_without_native_cursor_listing() {
         .expect("the worker composes");
     let error = worker
         .await
-        .err()
-        .expect("an incapable staging backend refuses to start a worker");
+        .expect_err("an incapable staging backend refuses to start a worker");
     assert!(
         matches!(
             error,

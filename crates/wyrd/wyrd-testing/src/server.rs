@@ -3287,11 +3287,10 @@ impl WyrdTestServerBuilder {
                         capability
                     },
                 ));
-            let handle = wyrd_storage::StorageHandle::from_settings_with_operator(
-                settings, operator,
-            )
-            .await
-            .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+            let handle =
+                wyrd_storage::StorageHandle::from_settings_with_operator(settings, operator)
+                    .await
+                    .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
             (Some(Arc::new(root)), handle)
         };
         if self.bifrost_roles.contains(&BifrostRuntimeRole::Oracle)

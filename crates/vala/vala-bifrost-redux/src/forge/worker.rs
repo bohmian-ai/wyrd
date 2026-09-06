@@ -1535,8 +1535,9 @@ impl ForgeWorker {
         // registration, recovery, readiness, or any claim.
         if !self.forge.core.staging_lists_by_cursor {
             return Err(ForgeError::InvalidConfig {
-                detail: "Forge worker staging backend does not support native list_with_start_after"
-                    .to_owned(),
+                detail:
+                    "Forge worker staging backend does not support native list_with_start_after"
+                        .to_owned(),
             });
         }
         let volume = self.scratch_volume_identity()?;

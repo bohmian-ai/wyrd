@@ -8,7 +8,6 @@ use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::memory_pool::{
     MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation,
 };
-use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use uuid::Uuid;
 
 use super::error::ForgeError;
@@ -164,7 +163,7 @@ impl MemoryPool for ForgeAttemptMemoryPool {
 }
 /// Lease-owned rewrite resources for exactly one Forge attempt.
 ///
-/// The attempt's `DataFusion` runtime is built from the pool and scratch bytes
+/// The attempt leases the core's execution runtime the pool and scratch bytes
 /// the root governor granted, so no attempt can execute against capacity it did
 /// not acquire. Field order is load-bearing: `runtime` is declared before
 /// `lease`, so the attempt drops its runtime — releasing the spill child — before
@@ -174,7 +173,7 @@ pub(crate) struct ForgeAttemptResources {
     projection: Option<
         crate::catalog::PhysicalTableProjection<crate::resources::ForgeRewriteMemoryReservation>,
     >,
-    /// Attempt runtime shared with the attempt-local execution pipeline view.
+    /// Attempt scratch and pool owner shared with the execution pipeline view.
     runtime: Option<Arc<ForgeRewriteRuntime>>,
     /// Exact memory and scratch lease returned to the root governor on drop.
     lease: Option<crate::resources::ForgeRewriteResources>,
@@ -258,9 +257,9 @@ impl ForgeAttemptResources {
     /// # Errors
     ///
     /// Returns [`ForgeError::Capacity`] when the root governor refuses either
-    /// counter, a runtime construction error when the owned spill child cannot
-    /// be created, and [`ForgeError::Invariant`] when the constructed runtime
-    /// did not retain the lease-issued pool or its sort allowance is invalid.
+    /// counter, [`ForgeError::ScratchIo`] when the owned spill child cannot be
+    /// created, and [`ForgeError::Invariant`] when the constructed owner did
+    /// not retain the lease-issued pool or its sort allowance is invalid.
     pub(crate) fn acquire(
         resources: &ForgeResources,
         request: ForgeRewriteRequest,
@@ -342,6 +341,14 @@ impl ForgeAttemptResources {
     /// Returns the exact resident memory this attempt was granted, in bytes.
     pub(crate) fn memory_bytes(&self) -> u64 {
         self.observation.acquired_memory
+    }
+
+    /// Returns the exact scratch this attempt was granted, in bytes.
+    ///
+    /// This is the figure the core's execution runtime is bounded by, so the
+    /// disk the attempt can consume is the disk the governor actually issued.
+    pub(crate) fn scratch_bytes(&self) -> u64 {
+        self.observation.acquired_scratch
     }
 
     /// Reports whether this attempt's own memory envelope refused a reservation.
@@ -457,10 +464,14 @@ impl Drop for ForgeAttemptResources {
 pub(crate) const REWRITE_WORKING_SET_FLOOR_BYTES: u64 =
     crate::resources::FORGE_MEMORY_FLOOR_BYTES as u64;
 
-/// `DataFusion` runtime with an owned, bounded spill directory.
+/// Attempt-owned, bounded spill directory and the pool leased alongside it.
+///
+/// The execution runtime itself belongs to the managed compaction core, which
+/// builds one from the scratch root and pool this owner leases it. Keeping no
+/// second `RuntimeEnv` here is what makes the core's the only one that runs.
 pub struct ForgeRewriteRuntime {
-    /// Runtime environment sharing the host-provisioned memory pool.
-    runtime: Arc<RuntimeEnv>,
+    /// Attempt-local pool the lease issued, leased on to the core's runtime.
+    memory_pool: Arc<dyn MemoryPool>,
     /// Current Forge-owned child removed automatically on clean shutdown.
     ///
     /// Owns the directory's lifetime — dropping the runtime is what removes it —
@@ -500,10 +511,9 @@ impl ForgeRewriteRuntime {
     ///
     /// # Errors
     ///
-    /// Returns [`ForgeError::InvalidConfig`] for a zero scratch lease,
+    /// Returns [`ForgeError::InvalidConfig`] for a zero scratch lease and
     /// [`ForgeError::ScratchIo`] when the attempt's unique spill child cannot
-    /// be created beneath the pod root, and [`ForgeError::Invariant`] when the
-    /// execution runtime cannot be built from the granted envelope.
+    /// be created beneath the pod root.
     pub(crate) fn new_attempt(
         memory_pool: Arc<dyn MemoryPool>,
         pod_spill_root: &Path,
@@ -531,18 +541,8 @@ impl ForgeRewriteRuntime {
                 kind: error.kind(),
                 detail: error.to_string(),
             })?;
-        let runtime = Arc::new(
-            RuntimeEnvBuilder::new()
-                .with_memory_pool(memory_pool)
-                .with_temp_file_path(spill_dir.path())
-                .with_max_temp_directory_size(spill_limit_bytes)
-                .build()
-                .map_err(|error| ForgeError::Invariant {
-                    detail: format!("Forge attempt runtime construction failed: {error}"),
-                })?,
-        );
         Ok(Self {
-            runtime,
+            memory_pool,
             spill_dir,
             spill_limit_bytes,
             scratch_peak_bytes: Arc::new(AtomicU64::new(0)),
@@ -561,9 +561,9 @@ impl ForgeRewriteRuntime {
             .min(self.spill_limit_bytes)
     }
 
-    /// Returns the pool this runtime was built over.
+    /// Returns the pool this attempt leases to the core's execution runtime.
     pub(crate) fn memory_pool(&self) -> Arc<dyn MemoryPool> {
-        Arc::clone(&self.runtime.memory_pool)
+        Arc::clone(&self.memory_pool)
     }
 
     /// Returns the attempt-owned scratch root leased to the compaction core.
@@ -584,10 +584,10 @@ impl ForgeRewriteRuntime {
         self.scratch_peak_bytes.fetch_max(bytes, Ordering::AcqRel);
     }
 
-    /// Reports whether this runtime retained the exact leased memory pool.
+    /// Reports whether this owner retained the exact leased memory pool.
     #[must_use]
     pub(crate) fn uses_memory_pool(&self, pool: &Arc<dyn MemoryPool>) -> bool {
-        Arc::ptr_eq(&self.runtime.memory_pool, pool)
+        Arc::ptr_eq(&self.memory_pool, pool)
     }
 }
 

@@ -1604,8 +1604,11 @@ impl OrphanJourney {
     /// objects the attempt already closed are therefore named by no snapshot,
     /// no operation row, and no audit transition, and the retry runs under a
     /// new attempt identity that cannot reuse them. While the attempt is still
-    /// open those same objects must be protected, observed from the coordinator
-    /// because the worker is the process holding the rewrite.
+    /// open those same objects must still be retained, but the age floor is the
+    /// only authority that can retain them: a protection root requires the
+    /// prepared operation row this attempt never reaches. The retention is
+    /// observed from the coordinator because the worker is the process holding
+    /// the rewrite.
     ///
     /// # Panics
     /// Panics if the barrier is never reached, the refused rewrite closed no

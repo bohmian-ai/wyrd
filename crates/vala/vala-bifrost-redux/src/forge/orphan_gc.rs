@@ -2252,64 +2252,134 @@ mod tests {
             .with_last_modified(Timestamp::from_millisecond(0).expect("timestamp"))
     }
 
+    /// Observable consequence of removing exactly one protection root.
+    ///
+    /// Each root defends its object differently, so "load-bearing" cannot be a
+    /// single assertion: dropping catalog reachability or the open-output root
+    /// flips an object to eligible, dropping the `file_list` root removes it
+    /// from the protected union without changing any verdict, and breaking the
+    /// lineage or reader-pin agreement must refuse to compose at all.
+    #[derive(Debug, Clone, Copy)]
+    enum RootLoss {
+        /// The subject becomes deletable, which is the data-loss case.
+        SubjectBecomesEligible,
+        /// The subject leaves the protected union without a verdict change.
+        SubjectLeavesLiveSet,
+        /// The root set no longer composes, so the pass refuses.
+        CompositionFailsClosed,
+    }
+
+    /// One independent protection root, its subject, and its removal.
+    struct RootCase {
+        /// Root being removed, named as the authority it represents.
+        authority: &'static str,
+        /// Removes exactly this one root from an otherwise complete set.
+        remove: fn(&mut OrphanProtectionRoots),
+        /// Object this root alone defends, taken from the shared paths.
+        subject: fn(&OrphanMatrixPaths) -> &String,
+        /// What removing this root must make observable.
+        loss: RootLoss,
+    }
+
+    /// Every protection root, one row each, with the loss its removal causes.
+    ///
+    /// A root added to [`OrphanProtectionRoots`] without a row here is a root
+    /// nothing proves is load-bearing, so the table is the checklist.
+    fn orphan_root_cases() -> Vec<RootCase> {
+        vec![
+            RootCase {
+                authority: "catalog reachability",
+                remove: |roots| roots.catalog = ProtectedLiveSet::default(),
+                subject: |paths| &paths.catalog_output,
+                loss: RootLoss::SubjectBecomesEligible,
+            },
+            RootCase {
+                authority: "the staged/prepared/open/possible/uncertain output root",
+                remove: |roots| roots.open_outputs.clear(),
+                subject: |paths| &paths.open_output,
+                loss: RootLoss::SubjectBecomesEligible,
+            },
+            RootCase {
+                // Scribe pod names are outside the recipe grammar, so the
+                // observable loss here is union membership, not a verdict flip.
+                authority: "committed-but-unpromoted file_list objects",
+                remove: |roots| roots.hot_unpromoted.clear(),
+                subject: |paths| &paths.hot_scribe,
+                loss: RootLoss::SubjectLeavesLiveSet,
+            },
+            RootCase {
+                authority: "an Oracle reader pin inside the proven lineage",
+                remove: |roots| roots.pinned_snapshot_ids = vec![30],
+                subject: |paths| &paths.orphan,
+                loss: RootLoss::CompositionFailsClosed,
+            },
+            RootCase {
+                authority: "the traversed snapshot lineage",
+                remove: |roots| roots.traversed_snapshot_ids.clear(),
+                subject: |paths| &paths.orphan,
+                loss: RootLoss::CompositionFailsClosed,
+            },
+        ]
+    }
+
     /// Requires each protection root to be the only thing protecting its object.
     ///
     /// A root that can be dropped with no observable consequence is a root that
     /// is no longer protecting anything, so each case here must either expose an
-    /// object as unsafely eligible or fail closed.
+    /// object as unsafely eligible, remove it from the protected union, or fail
+    /// closed. Every case first asserts the complete root set does protect its
+    /// subject, so a removal can never pass because the subject was unprotected
+    /// to begin with.
     fn assert_each_orphan_root_is_load_bearing(paths: &OrphanMatrixPaths) {
         let aged = orphan_matrix_aged();
+        for case in orphan_root_cases() {
+            let subject = (case.subject)(paths);
+            let authority = case.authority;
+            let complete = orphan_matrix_protection(paths.roots());
+            match case.loss {
+                RootLoss::SubjectBecomesEligible => assert_eq!(
+                    complete.gc_eligibility(&paths.binding, subject, ObjectEvidence::Present(&aged)),
+                    GcEligibility::Protected,
+                    "{authority} protects its subject before it is removed"
+                ),
+                RootLoss::SubjectLeavesLiveSet => assert!(
+                    complete.live_set.contains(subject),
+                    "{authority} names its subject before it is removed"
+                ),
+                RootLoss::CompositionFailsClosed => {
+                    assert!(
+                        paths.roots().compose().is_ok(),
+                        "{authority} composes before it is broken"
+                    );
+                }
+            }
 
-        let mut without_catalog = paths.roots();
-        without_catalog.catalog = ProtectedLiveSet::default();
-        assert_eq!(
-            orphan_matrix_protection(without_catalog).gc_eligibility(
-                &paths.binding,
-                &paths.catalog_output,
-                ObjectEvidence::Present(&aged)
-            ),
-            GcEligibility::Eligible,
-            "dropping catalog reachability exposes live data, so that root is load-bearing"
-        );
+            let mut mutated = paths.roots();
+            (case.remove)(&mut mutated);
+            match case.loss {
+                RootLoss::SubjectBecomesEligible => assert_eq!(
+                    orphan_matrix_protection(mutated).gc_eligibility(
+                        &paths.binding,
+                        subject,
+                        ObjectEvidence::Present(&aged)
+                    ),
+                    GcEligibility::Eligible,
+                    "dropping {authority} exposes the only object it protected"
+                ),
+                RootLoss::SubjectLeavesLiveSet => assert!(
+                    !orphan_matrix_protection(mutated).live_set.contains(subject),
+                    "dropping {authority} removes the only authority naming its subject"
+                ),
+                RootLoss::CompositionFailsClosed => assert!(
+                    mutated.compose().is_err(),
+                    "breaking {authority} must refuse to compose rather than proceed"
+                ),
+            }
+        }
 
-        let mut without_open = paths.roots();
-        without_open.open_outputs.clear();
-        assert_eq!(
-            orphan_matrix_protection(without_open).gc_eligibility(
-                &paths.binding,
-                &paths.open_output,
-                ObjectEvidence::Present(&aged)
-            ),
-            GcEligibility::Eligible,
-            "dropping the open-output root exposes an attempt's own working set"
-        );
-
-        // Scribe pod names are outside the recipe grammar, so the observable
-        // loss for the `file_list` root is union membership, not an
-        // eligibility flip.
-        let mut without_hot = paths.roots();
-        without_hot.hot_unpromoted.clear();
-        assert!(
-            !orphan_matrix_protection(without_hot)
-                .live_set
-                .contains(&paths.hot_scribe),
-            "dropping the file_list root removes the only authority naming hot objects"
-        );
-
-        let mut unpinned = paths.roots();
-        unpinned.pinned_snapshot_ids = vec![30];
-        assert!(
-            unpinned.compose().is_err(),
-            "an Oracle cut on a snapshot the traversal never saw must fail closed"
-        );
-
-        let mut lineage_lost = paths.roots();
-        lineage_lost.traversed_snapshot_ids.clear();
-        assert!(
-            lineage_lost.compose().is_err(),
-            "a pinned snapshot missing from the traversed lineage must fail closed"
-        );
-
+        // The destructive-maintenance gate is not a per-object root: lease loss,
+        // fence loss, and any open operation raise one gate over the whole
+        // table, so its subject is the otherwise-eligible orphan.
         let mut blocked = paths.roots();
         blocked.blocked = true;
         assert_eq!(

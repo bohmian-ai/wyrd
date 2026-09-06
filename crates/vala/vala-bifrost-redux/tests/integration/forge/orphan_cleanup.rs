@@ -785,6 +785,485 @@ async fn cross_table_plan_refuses_before_lease_or_io() {
     assert_eq!(leases, 0, "the refusal precedes table fence acquisition");
 }
 
+/// One durable authority whose loss must be independently observable.
+///
+/// Orphan collection deletes objects nothing else names, so the protected union
+/// is the whole safety argument. A source that never changes a verdict on its
+/// own is a source whose absence would go unnoticed, which is exactly how a
+/// protection root quietly stops protecting. Each variant is therefore seeded
+/// alone, over an otherwise-eligible orphan, and then removed again.
+#[derive(Debug, Clone, Copy)]
+enum ProtectionSource {
+    /// A committed-but-unpromoted Scribe reference naming the object.
+    HotFileList,
+    /// An open Iceberg rewrite whose prepared outputs name the object.
+    OpenRewrite,
+    /// An open snapshot expiration over the same table.
+    OpenExpire,
+    /// An open orphan-GC batch over the same table.
+    OpenOrphanGc,
+    /// A prepared expired-cleanup candidate naming the object.
+    PreparedCleanup,
+}
+
+impl ProtectionSource {
+    /// Names this authority in assertion messages.
+    const fn authority(self) -> &'static str {
+        match self {
+            Self::HotFileList => "a committed-but-unpromoted file_list reference",
+            Self::OpenRewrite => "an open Iceberg rewrite's prepared outputs",
+            Self::OpenExpire => "an open snapshot expiration",
+            Self::OpenOrphanGc => "an open orphan-GC batch",
+            Self::PreparedCleanup => "a prepared expired-cleanup candidate",
+        }
+    }
+
+    /// Seeds exactly this authority over `orphan` and nothing else.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the durable seed cannot be written.
+    async fn seed(self, fixture: &PromotionIntegrationFixture, orphan: &str) {
+        match self {
+            Self::HotFileList => seed_hot_file_reference(fixture, orphan).await,
+            Self::OpenRewrite => {
+                seed_open_operation(fixture, "iceberg_rewrite", |id| {
+                    rewrite_detail(fixture, id, orphan)
+                })
+                .await;
+            }
+            Self::OpenExpire => {
+                seed_open_operation(fixture, "snapshot_expire", |id| expire_detail(fixture, id))
+                    .await;
+            }
+            Self::OpenOrphanGc => {
+                seed_open_operation(fixture, "orphan_gc", |id| orphan_gc_detail(fixture, id)).await;
+            }
+            Self::PreparedCleanup => seed_prepared_cleanup_candidate(fixture, orphan).await,
+        }
+    }
+
+    /// Removes exactly this authority, restoring the bare fixture.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the durable seed cannot be removed.
+    async fn remove(self, fixture: &PromotionIntegrationFixture) {
+        let statement = match self {
+            Self::HotFileList => "DELETE FROM vala.file_list WHERE data_tenant_id=$1",
+            Self::OpenRewrite | Self::OpenExpire | Self::OpenOrphanGc => {
+                "DELETE FROM vala.forge_operation_state WHERE data_tenant_id=$1"
+            }
+            Self::PreparedCleanup => {
+                "DELETE FROM vala.forge_tasks WHERE data_tenant_id=$1 AND strategy='expired_cleanup'"
+            }
+        };
+        // The operator role may insert into these tables but does not own the
+        // right to delete from every one of them, so the fixture teardown uses
+        // the database owner rather than widening a production grant.
+        let superuser = fixture
+            .database
+            .superuser_pool()
+            .await
+            .expect("superuser pool");
+        sqlx::query(statement)
+            .bind(fixture.tenant.as_uuid())
+            .execute(&superuser)
+            .await
+            .expect("the seeded authority is removable");
+    }
+}
+
+/// Builds one prepared rewrite detail whose only output is `path`.
+///
+/// # Panics
+///
+/// Panics when the fixed partition boundary or storage path is rejected.
+fn rewrite_detail(
+    fixture: &PromotionIntegrationFixture,
+    operation_id: Uuid,
+    path: &str,
+) -> serde_json::Value {
+    use wyrd_spec::vala::api::{TimeGranularityWire, TimePartitionWire};
+    use wyrd_spec::vala::audit_detail::{AuditDetail, ForgeIcebergRewritePhase};
+
+    detail_value(AuditDetail::ForgeIcebergRewrite {
+        operation_id,
+        phase: ForgeIcebergRewritePhase::Prepared,
+        group: table_resource(fixture),
+        base_snapshot_id: 1,
+        committed_snapshot_id: None,
+        partition_spec_id: 0,
+        time_partition: TimePartitionWire::new(
+            TimeGranularityWire::Day,
+            chrono::DateTime::from_timestamp(0, 0).expect("epoch is a valid instant"),
+        )
+        .expect("the epoch is an exact day boundary"),
+        target_file_size_bytes: 1,
+        input_paths: Vec::new(),
+        output_paths: vec![storage_path(path)],
+    })
+}
+
+/// Builds one prepared snapshot-expiration detail over this table.
+///
+/// Expiration carries no output paths, so its protection contribution is the
+/// destructive-maintenance gate its openness raises over the whole table.
+///
+/// # Panics
+///
+/// Panics when the fixed metadata location is rejected.
+fn expire_detail(fixture: &PromotionIntegrationFixture, operation_id: Uuid) -> serde_json::Value {
+    use wyrd_spec::vala::audit_detail::{AuditDetail, ForgeSnapshotExpirePhase};
+
+    detail_value(AuditDetail::ForgeSnapshotExpire {
+        operation_id,
+        phase: ForgeSnapshotExpirePhase::Prepared,
+        group: table_resource(fixture),
+        base_metadata_location: storage_path(&format!(
+            "{}/metadata/v1.metadata.json",
+            fixture.binding.object_prefix
+        )),
+        current_snapshot_id: Some(1),
+        retained_ref_heads: vec![1],
+        cutoff_ms: 0,
+        selected_snapshot_ids: Vec::new(),
+    })
+}
+
+/// Builds one prepared orphan-GC detail over this table.
+///
+/// # Panics
+///
+/// Panics when the detail cannot be serialized.
+fn orphan_gc_detail(
+    fixture: &PromotionIntegrationFixture,
+    operation_id: Uuid,
+) -> serde_json::Value {
+    use wyrd_spec::vala::audit_detail::{AuditDetail, ForgeOrphanGcPhase};
+
+    detail_value(AuditDetail::ForgeOrphanGc {
+        operation_id,
+        phase: ForgeOrphanGcPhase::Prepared,
+        group: table_resource(fixture),
+        candidate_paths: Vec::new(),
+        deleted_paths: Vec::new(),
+        skipped_paths: Vec::new(),
+    })
+}
+
+/// Serializes one audit detail into the persisted projection column shape.
+///
+/// # Panics
+///
+/// Panics when the detail cannot be serialized.
+fn detail_value(detail: wyrd_spec::vala::audit_detail::AuditDetail) -> serde_json::Value {
+    serde_json::to_value(detail).expect("the prepared detail serializes")
+}
+
+/// Validates one object key as an audit storage path.
+///
+/// # Panics
+///
+/// Panics when the key is not a representable storage path.
+fn storage_path(path: &str) -> wyrd_spec::vala::audit_detail::StoragePath {
+    wyrd_spec::vala::audit_detail::StoragePath::new(path.to_owned())
+        .expect("the fixture path is a valid storage path")
+}
+
+/// Returns the canonical resource identity Forge files operations under.
+fn table_resource(fixture: &PromotionIntegrationFixture) -> String {
+    format!(
+        "bifrost://{}/{}/{}",
+        fixture.tenant,
+        fixture.binding.table_ref.namespace,
+        fixture.binding.table_ref.name
+    )
+}
+
+/// Seeds one open operation row of `family` carrying `detail`.
+///
+/// # Panics
+///
+/// Panics when the insert fails.
+async fn seed_open_operation(
+    fixture: &PromotionIntegrationFixture,
+    family: &str,
+    detail: impl FnOnce(Uuid) -> serde_json::Value,
+) {
+    // The projection requires the row's identity and its detail's identity to
+    // agree, so the operation id is minted once and used for both.
+    let operation_id = Uuid::now_v7();
+    let detail = detail(operation_id);
+    sqlx::query(
+        "INSERT INTO vala.forge_operation_state \
+         (data_tenant_id,resource,family,operation_id,phase,prepared_detail,current_detail,\
+          prepared_audit_seq,prepared_at,updated_at) \
+         VALUES ($1,$2,$3,$4,'prepared',$5,$5,1,statement_timestamp(),statement_timestamp())",
+    )
+    .bind(fixture.tenant.as_uuid())
+    .bind(table_resource(fixture))
+    .bind(family)
+    .bind(operation_id)
+    .bind(&detail)
+    .execute(fixture.operator_pool.pool())
+    .await
+    .expect("the open operation row seeds");
+}
+
+/// Seeds one non-terminal `file_list` row naming `path`.
+///
+/// This stands for a reference, not for a file: nothing reads its size, row
+/// count, or LSN range. Scribe has no API for publishing a reference to an
+/// object it did not itself write, so a seal cannot produce this shape.
+///
+/// # Panics
+///
+/// Panics when the insert fails.
+async fn seed_hot_file_reference(fixture: &PromotionIntegrationFixture, path: &str) {
+    let start = super::support::fixture_day()
+        .and_hms_opt(0, 0, 0)
+        .expect("midnight is a valid time")
+        .and_utc();
+    sqlx::query(
+        "INSERT INTO vala.file_list \
+         (id,data_tenant_id,namespace,table_name,file_path,file_size,row_count,min_event_time,\
+          max_event_time,partition_granularity,partition_start,node_id,writer_epoch,wal_lsn_min,\
+          wal_lsn_max,promotion_record) \
+         VALUES ($1,$2,$3,$4,$5,1,1,$6,$7,'day',$8,$9,1,1,1,'{\"fixture\":\"orphan-sources\"}'::jsonb)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(fixture.tenant.as_uuid())
+    .bind(&fixture.binding.logical_namespace)
+    .bind(&fixture.binding.table_name)
+    .bind(path)
+    .bind(start + ChronoDuration::hours(12))
+    .bind(start + ChronoDuration::hours(12) + ChronoDuration::seconds(1))
+    .bind(start)
+    .bind(Uuid::now_v7())
+    .execute(fixture.operator_pool.pool())
+    .await
+    .expect("the hot reference seeds");
+}
+
+/// Seeds one prepared expired-cleanup task whose unresolved candidate is `path`.
+///
+/// # Panics
+///
+/// Panics when the insert fails.
+async fn seed_prepared_cleanup_candidate(fixture: &PromotionIntegrationFixture, path: &str) {
+    let candidate = serde_json::json!({
+        "category": "data",
+        "catalog": "wyrd-redux",
+        "namespace": fixture.binding.table_ref.namespace.as_str(),
+        "table": fixture.binding.table_ref.name,
+        "path": path,
+    });
+    let evidence = serde_json::json!({
+        "version": 2,
+        "committed_snapshot_id": 1,
+        "committed_metadata_location": "s3://fixture/metadata/v1.metadata.json",
+        "committed_metadata_digest": "0".repeat(64),
+        "cleanup_candidates": [candidate],
+        "deleted_candidate_count": 0,
+        "prepared_candidate_index": 0,
+    });
+    sqlx::query(
+        "INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,namespace_name,table_name,strategy,lane,base_snapshot_id,plan,plan_hash,estimated_files,estimated_bytes,estimated_parallelism,estimated_memory_bytes,estimated_spill_bytes,large_task_ceiling_bytes,state,ready_at,attempt_id,claimed_by,claim_expires_at,watermark_snapshot_id,watermark_timestamp_ms,evidence,envelope_version,decoded_batch_bytes,decoded_input_bytes,sort_working_bytes,sort_merge_reservation_bytes,encoder_buffer_bytes,upload_chunk_bytes,footer_encoded_bytes,footer_decode_workspace_bytes,sort_spill_bytes) \
+         VALUES ($1,$2,'wyrd-redux',$3,$4,'expired_cleanup','ordinary',$5,$6,decode(repeat('72',32),'hex'),1,1,1,41943040,1024,1,'prepared',now(),$7,$7,now()+interval '10 minutes',1,0,$8,2,1024,1024,3072,1024,1024,1024,8388608,33554432,1024)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(fixture.tenant.as_uuid())
+    .bind(fixture.binding.table_ref.namespace.as_str())
+    .bind(&fixture.binding.table_ref.name)
+    .bind(1_i64)
+    .bind(serde_json::json!({
+        "version": 1,
+        "inputs": [],
+        "parameters": {
+            "version": 1,
+            "kind": "expired_cleanup",
+            "source_task_id": Uuid::now_v7(),
+            "committed_snapshot_id": 1,
+            "committed_metadata_location": "s3://fixture/metadata/v1.metadata.json",
+            "committed_metadata_digest": "0".repeat(64),
+            "cleanup_candidates": [candidate],
+        },
+    }))
+    .bind(Uuid::now_v7())
+    .bind(&evidence)
+    .execute(fixture.operator_pool.pool())
+    .await
+    .expect("the prepared cleanup task seeds");
+}
+
+/// Every durable protection authority fails closed on its own.
+///
+/// The pure-policy matrix proves each composed root is load-bearing, but it
+/// composes those roots by hand. This proves the other half: that each real
+/// durable source production reads actually reaches the union, one at a time,
+/// through the production loader and the production predicate. A source that is
+/// silently no longer read would leave its object eligible here even though the
+/// policy test still passes.
+///
+/// Lease and fence loss are the two authorities that are not rows in the union
+/// at all — they are the gate the worker holds over the table — so they are
+/// proven through the real claim workflow rather than through the loader.
+///
+/// # Panics
+///
+/// Panics when the fixture cannot start, when a seeded authority does not
+/// protect the orphan, when removing it does not restore eligibility, or when a
+/// refused fence still deletes.
+#[tokio::test]
+async fn orphan_protection_sources_fail_closed_independently() {
+    let batch = one_eligible_orphan("orphan_sources").await;
+    let fixture = &batch.promoted.fixture;
+    let orphan = batch.orphan.clone();
+
+    for source in [
+        ProtectionSource::HotFileList,
+        ProtectionSource::OpenRewrite,
+        ProtectionSource::OpenExpire,
+        ProtectionSource::OpenOrphanGc,
+        ProtectionSource::PreparedCleanup,
+    ] {
+        let authority = source.authority();
+        assert_eligibility(
+            &batch.forge,
+            fixture,
+            std::slice::from_ref(&orphan),
+            "Eligible",
+            &format!("nothing protects the orphan before {authority} is seeded"),
+        )
+        .await;
+        source.seed(fixture, &orphan).await;
+        assert_eligibility(
+            &batch.forge,
+            fixture,
+            std::slice::from_ref(&orphan),
+            "Protected",
+            &format!("{authority} alone protects the orphan"),
+        )
+        .await;
+        source.remove(fixture).await;
+        assert_eligibility(
+            &batch.forge,
+            fixture,
+            std::slice::from_ref(&orphan),
+            "Eligible",
+            &format!("removing {authority} removes the only thing protecting the orphan"),
+        )
+        .await;
+    }
+
+    assert_lease_and_fence_refuse_deletion(&batch).await;
+}
+
+/// Proves lease loss and fence loss each refuse a real claim without deleting.
+///
+/// # Panics
+///
+/// Panics when either refusal is not raised, or when the orphan is deleted.
+async fn assert_lease_and_fence_refuse_deletion(batch: &OrphanBatch) {
+    let fixture = &batch.promoted.fixture;
+    let lease_key = vala_bifrost_redux::forge::forge_lease_key(
+        fixture.tenant,
+        &fixture.binding.logical_namespace,
+        &fixture.binding.table_name,
+    );
+
+    // Lease loss: a live peer already owns this table's exclusive fence, so the
+    // claim is refused before it can classify or delete anything.
+    let peer = vala_bifrost_redux::forge::ForgeLease::acquire(
+        &fixture.operator_pool,
+        lease_key.clone(),
+        Uuid::now_v7(),
+        std::time::Duration::from_secs(300),
+    )
+    .await
+    .expect("the peer lease transaction runs")
+    .expect("an unheld table lease is acquirable");
+    fixture.clear_task_backoff().await;
+    let worker = ForgeWorker::new(
+        Arc::clone(&batch.forge),
+        ForgeWorkerConfig::default(),
+        Uuid::now_v7(),
+    )
+    .expect("fixture Forge worker");
+    let claim = worker
+        .claim_for_test()
+        .await
+        .expect("claim transaction runs")
+        .expect("the ready orphan task is claimable");
+    let refusal = worker
+        .execute_orphan_cleanup_claim_for_test(claim, &CancellationToken::new())
+        .await
+        .expect_err("a table whose fence a peer holds cannot be collected");
+    assert!(
+        matches!(refusal, vala_bifrost_redux::forge::ForgeError::FenceLost { .. }),
+        "lease loss refuses the claim: {refusal}"
+    );
+    assert_eq!(batch.store.deletes(), 0, "a refused lease deletes nothing");
+    peer.release(&fixture.operator_pool)
+        .await
+        .expect("the peer lease releases");
+
+    // Fence loss: this worker takes the lease, and a peer bumps its fencing
+    // token while the first candidate is being stat'ed. The per-candidate fence
+    // recheck sits between that stat and the delete, so the refusal lands with
+    // the object still intact.
+    //
+    // The refused attempt above still owns the row, so the production reclaim
+    // pass returns it to the pool rather than the test resetting durable state.
+    fixture.expire_claims().await;
+    worker
+        .reclaim_expired_attempts_for_test(16)
+        .await
+        .expect("the refused attempt is reclaimed");
+    fixture.clear_task_backoff().await;
+    let claim = worker
+        .claim_for_test()
+        .await
+        .expect("claim transaction runs")
+        .expect("the released task is claimable again");
+    batch.store.pause_stat_at(1);
+    let stop = CancellationToken::new();
+    let (result, ()) = tokio::join!(
+        worker.execute_orphan_cleanup_claim_for_test(claim, &stop),
+        async {
+            batch.store.stat_paused().await;
+            sqlx::query(
+                "UPDATE vala.maintenance_leases SET fencing_token = fencing_token + 1 \
+                 WHERE lease_key = $1",
+            )
+            .bind(&lease_key)
+            .execute(fixture.operator_pool.pool())
+            .await
+            .expect("a peer bumps the fence");
+            batch.store.release_stat();
+        }
+    );
+    // The batch was already prepared when the fence moved, so the attempt ends
+    // in the retained shape an unresolved preparation always takes: its work is
+    // left for the successor that reclaims the lapsed lease. Nothing else about
+    // the pass changed between the paused stat and the release, so the bump is
+    // the only thing that could have stopped it.
+    let refusal = result.expect_err("a lost fence cannot complete a deletion");
+    assert!(
+        matches!(
+            refusal,
+            vala_bifrost_redux::forge::ForgeError::ShutdownRetained
+        ),
+        "a fence lost mid-batch retains the attempt rather than settling it: {refusal}"
+    );
+    assert_eq!(batch.store.deletes(), 0, "a lost fence deletes nothing");
+    assert!(
+        object_exists(fixture, &batch.orphan).await,
+        "the orphan survives every refused authority"
+    );
+}
+
 /// One promoted table carrying exactly one aged, eligible rowless orphan.
 struct OrphanBatch {
     /// Live Scribe/Forge fixture over one repository-managed database.

@@ -1038,13 +1038,13 @@ impl ForgeOperations<'_> {
                 detail: "cannot settle an absent snapshot expiration".to_owned(),
             })?
             .try_into()?;
-        let claimed = self.claimed_snapshots(&mut tx, operation_id).await?;
+        let claims = self.claims_for_operation(&mut tx, operation_id).await?;
 
         if state_row.phase == terminal_phase
             && audit_detail_canonical_json(&detail)
                 == audit_detail_canonical_json(&state_row.current_detail)
             && task_state == "succeeded"
-            && claimed.is_empty()
+            && claims.is_empty()
         {
             let terminal_seq =
                 state_row
@@ -1058,7 +1058,14 @@ impl ForgeOperations<'_> {
             });
         }
 
-        self.require_resolvable_prepared(&state_row, &claimed, task_state.as_str())?;
+        self.require_resolvable_prepared(&state_row, task_state.as_str())?;
+        self.require_claim_identity(
+            &claims,
+            request.authority.task_id,
+            request.authority.attempt_id,
+            request.table,
+            &state_row.prepared_detail,
+        )?;
         lock_expiration_task(&mut tx, request.authority, request.table, &["prepared"]).await?;
 
         let seq = OperatorAudit::new(tenant, &mut tx)
@@ -1127,17 +1134,24 @@ impl ForgeOperations<'_> {
                 detail: "cannot reset an absent snapshot expiration".to_owned(),
             })?
             .try_into()?;
-        let claimed = self.claimed_snapshots(&mut tx, operation_id).await?;
+        let claims = self.claims_for_operation(&mut tx, operation_id).await?;
 
         if state_row.phase == ForgeOperationPhase::Reset
             && state_row.terminal_audit_seq.is_some()
             && task_state == "cancelled"
-            && claimed.is_empty()
+            && claims.is_empty()
         {
             return Ok(ForgeExpirationResetOutcome::AlreadyApplied);
         }
 
-        self.require_resolvable_prepared(&state_row, &claimed, task_state.as_str())?;
+        self.require_resolvable_prepared(&state_row, task_state.as_str())?;
+        self.require_claim_identity(
+            &claims,
+            request.authority.task_id,
+            request.authority.attempt_id,
+            request.table,
+            &state_row.prepared_detail,
+        )?;
         if audit_detail_canonical_json(request.operation_event.detail.as_ref().ok_or_else(
             || SqlError::Conflict {
                 detail: "reset event must carry the prepared detail".to_owned(),
@@ -1209,7 +1223,7 @@ impl ForgeOperations<'_> {
 }
 
 // ---------------------------------------------------------------------------
-// Private snapshot-expiration helpers
+// Snapshot-expiration claim validation and private helpers
 // ---------------------------------------------------------------------------
 
 impl ForgeOperations<'_> {
@@ -1230,16 +1244,95 @@ impl ForgeOperations<'_> {
         }
     }
 
-    /// Requires an unresolved Prepared operation whose claims exactly reproduce
-    /// its prepared selection while the task is still Prepared.
+    /// Requires every claim row to reproduce exactly one prepared operation and
+    /// its immutable preparation identity.
+    ///
+    /// Claim rows are historical evidence written once, at preparation. A
+    /// takeover changes *current* execution authority, never that evidence, so
+    /// the historical worker, lease key, and lease fence are required only to
+    /// agree across rows and are deliberately never compared with the caller's
+    /// live authority. Everything that identifies *which* operation the rows
+    /// belong to — resource, operation, table, originating task and attempt,
+    /// and the exact selected snapshot set — must match both the current
+    /// workflow and the stored Prepared detail before any row is trusted.
+    ///
+    /// `family` is deliberately neither projected nor revalidated: the table's
+    /// `CHECK (family = 'snapshot_expire')`, the family-qualified statements in
+    /// this module, and [`Self::require_snapshot_expire`] already make a family
+    /// contradiction unreachable.
+    ///
+    /// Settlement, reset, and Forge reconciliation share this one
+    /// implementation so a claim-identity rule cannot drift between them.
     ///
     /// # Errors
-    /// Returns [`SqlError::Conflict`] when the operation is already resolved,
-    /// the task is not Prepared, or the claim set is not the exact selection.
+    ///
+    /// Returns [`SqlError::Conflict`] when the claim set is empty, any two rows
+    /// disagree on their prepared identity, a row does not name this resource,
+    /// operation, table, task, or attempt, or the sorted snapshot IDs are not
+    /// exactly the prepared selection.
+    pub fn require_claim_identity(
+        &self,
+        claims: &[ForgeSnapshotExpirationClaim],
+        task_id: Uuid,
+        attempt_id: Uuid,
+        table: &ForgeClaimTable,
+        prepared_detail: &AuditDetail,
+    ) -> Result<(), SqlError> {
+        let Some(first) = claims.first() else {
+            return Err(SqlError::Conflict {
+                detail: "snapshot expiration claim set is empty".to_owned(),
+            });
+        };
+        if claims.iter().any(|claim| {
+            claim.resource != first.resource
+                || claim.operation_id != first.operation_id
+                || claim.table != first.table
+                || claim.prepared_by != first.prepared_by
+        }) {
+            return Err(SqlError::Conflict {
+                detail: "snapshot expiration claim rows disagree on their prepared identity"
+                    .to_owned(),
+            });
+        }
+        let AuditDetail::ForgeSnapshotExpire { operation_id, .. } = prepared_detail else {
+            return Err(SqlError::Conflict {
+                detail: "prepared detail is not a snapshot expiration".to_owned(),
+            });
+        };
+        if first.resource != self.resource
+            || first.operation_id != *operation_id
+            || &first.table != table
+            || first.prepared_by.task_id != task_id
+            || first.prepared_by.attempt_id != attempt_id
+        {
+            return Err(SqlError::Conflict {
+                detail: "snapshot expiration claims do not reproduce the prepared operation"
+                    .to_owned(),
+            });
+        }
+        let mut claimed: Vec<i64> = claims.iter().map(|claim| claim.snapshot_id).collect();
+        claimed.sort_unstable();
+        if claimed != selected_snapshot_ids(prepared_detail)? {
+            return Err(SqlError::Conflict {
+                detail: "snapshot expiration claims do not reproduce the prepared selection"
+                    .to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Requires an unresolved Prepared operation whose task is still Prepared.
+    ///
+    /// Claim identity is a separate concern owned by
+    /// [`Self::require_claim_identity`]; this check answers only whether the
+    /// durable phase pair still admits a terminal transition.
+    ///
+    /// # Errors
+    /// Returns [`SqlError::Conflict`] when the operation is already resolved or
+    /// the task is not Prepared.
     fn require_resolvable_prepared(
         &self,
         state_row: &ForgeOperationStateRow,
-        claimed: &[i64],
         task_state: &str,
     ) -> Result<(), SqlError> {
         if state_row.phase != ForgeOperationPhase::Prepared || task_state != "prepared" {
@@ -1248,12 +1341,6 @@ impl ForgeOperations<'_> {
                     "snapshot expiration is not resolvable: operation {:?}, task {task_state}",
                     state_row.phase
                 ),
-            });
-        }
-        if claimed != selected_snapshot_ids(&state_row.prepared_detail)?.as_slice() {
-            return Err(SqlError::Conflict {
-                detail: "snapshot expiration claims do not reproduce the prepared selection"
-                    .to_owned(),
             });
         }
         Ok(())
@@ -1294,28 +1381,34 @@ impl ForgeOperations<'_> {
         Ok(())
     }
 
-    /// Reads one operation's unresolved claim snapshots in ascending order.
+    /// Reads one operation's unresolved claim rows in ascending snapshot order.
+    ///
+    /// The full immutable projection is read rather than snapshot IDs alone so
+    /// that [`Self::require_claim_identity`] can prove every row reproduces the
+    /// same prepared operation before any row's payload is trusted.
     ///
     /// The read takes no row lock: claims are immutable, and the operation's
     /// advisory lock plus its `FOR UPDATE` state row already serialize the only
     /// transaction that may insert or delete them.
     ///
     /// # Errors
-    /// Returns [`SqlError::Query`] when the read fails.
-    async fn claimed_snapshots(
+    /// Returns [`SqlError::Query`] when the read fails and
+    /// [`SqlError::InvariantViolation`] when a stored row is malformed.
+    async fn claims_for_operation(
         &self,
         conn: &mut PgConnection,
         operation_id: Uuid,
-    ) -> Result<Vec<i64>, SqlError> {
-        sqlx::query_scalar(
-            "SELECT snapshot_id FROM vala.forge_snapshot_expiration_claims WHERE data_tenant_id=wyrd.current_tenant() AND resource=$1 AND family=$2 AND operation_id=$3 ORDER BY snapshot_id",
+    ) -> Result<Vec<ForgeSnapshotExpirationClaim>, SqlError> {
+        let rows: Vec<ForgeSnapshotExpirationClaimSqlRow> = sqlx::query_as(
+            "SELECT resource,operation_id,snapshot_id,task_id,attempt_id,worker_id,lease_key,lease_fencing_token,table_uid,catalog_name,namespace_name,table_name,table_uuid FROM vala.forge_snapshot_expiration_claims WHERE data_tenant_id=wyrd.current_tenant() AND resource=$1 AND family=$2 AND operation_id=$3 ORDER BY snapshot_id",
         )
         .bind(self.resource)
         .bind(self.family.as_str())
         .bind(operation_id)
         .fetch_all(&mut *conn)
         .await
-        .map_err(SqlError::from)
+        .map_err(SqlError::from)?;
+        rows.into_iter().map(TryInto::try_into).collect()
     }
 
     /// Deletes every claim an operation still holds as part of resolving it.

@@ -14,8 +14,8 @@ mod pg_tests {
         //! migrator fixture only to inspect catalogs or arrange deliberately
         //! corrupt projection state that ordinary writers cannot create.
 
-        use sqlx::PgPool;
         use sqlx::types::Uuid;
+        use sqlx::{AssertSqlSafe, PgPool};
         use wyrd_dev_fixtures::pg::PgFixture;
         use wyrd_spec::DataTenantId;
         use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
@@ -1576,6 +1576,51 @@ mod pg_tests {
                 .expect("task state")
         }
 
+        /// Every durable fact a refused expiration transition must leave alone.
+        ///
+        /// Captured as one tuple so a corruption case can compare the complete
+        /// state before and after the refusal instead of asserting each fact
+        /// separately: total claim rows, the operation phase, the task state,
+        /// the tenant's highest planning-demand generation, and the audit
+        /// chain length.
+        ///
+        /// # Panics
+        ///
+        /// Panics when any inspection query fails.
+        async fn durable_expiration_state(
+            superuser: &PgPool,
+            tenant: DataTenantId,
+            operation_id: Uuid,
+            task_id: Uuid,
+        ) -> (i64, Option<String>, String, i64, i64) {
+            let claims: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM vala.forge_snapshot_expiration_claims")
+                    .fetch_one(superuser)
+                    .await
+                    .expect("total claim rows");
+            let phase: Option<String> = sqlx::query_scalar(
+                "SELECT phase FROM vala.forge_operation_state WHERE operation_id=$1",
+            )
+            .bind(operation_id)
+            .fetch_optional(superuser)
+            .await
+            .expect("operation phase");
+            let demand: i64 = sqlx::query_scalar(
+                "SELECT COALESCE(max(generation),-1) FROM vala.forge_planning_demands WHERE data_tenant_id=$1",
+            )
+            .bind(tenant.as_uuid())
+            .fetch_one(superuser)
+            .await
+            .expect("planning demand generation");
+            (
+                claims,
+                phase,
+                task_state_of(superuser, task_id).await,
+                demand,
+                count_audit(superuser, tenant).await,
+            )
+        }
+
         /// Proves the claim table matches its migration and that preparation,
         /// reset, and settlement are each one atomic, replayable transaction.
         ///
@@ -1867,7 +1912,7 @@ mod pg_tests {
             let settle_prepared = event(
                 "forge.snapshot_expire.prepared",
                 resource(),
-                Some(settle_detail),
+                Some(settle_detail.clone()),
             );
             let settle_task_prepared = event(
                 "forge.task.prepared",
@@ -1912,6 +1957,282 @@ mod pg_tests {
                 operation_event: &committed_event,
                 task_event: &task_succeeded,
             };
+            // --- every claim row must exactly reproduce the preparation ----
+            // Claim rows are immutable historical evidence. A takeover changes
+            // current execution authority, never preparation identity, so any
+            // divergence must refuse reconciliation input, reset, and
+            // settlement without touching claims, operation state, the task,
+            // planning demand, or the audit chain.
+            let settle_reset_event = AuditEvent {
+                result: AuditResult::Failure,
+                ..event(
+                    "forge.snapshot_expire.reset",
+                    resource(),
+                    Some(settle_detail.clone()),
+                )
+            };
+            let settle_task_cancelled = event(
+                "forge.task.cancelled",
+                &format!("forge-task:{}", settle_authority.task_id),
+                None,
+            );
+            let settle_reset_request = ForgeExpirationResetRequest {
+                authority: &settle_authority,
+                table: &table,
+                operation_event: &settle_reset_event,
+                task_event: &settle_task_cancelled,
+            };
+
+            // The claim table's foreign keys mean a corrupted row must still
+            // reference real state, so each identity case gets a decoy the
+            // validator is required to reject anyway.
+            let stranger = Uuid::now_v7();
+            let decoy_state = "INSERT INTO vala.forge_operation_state (data_tenant_id,resource,family,operation_id,phase,prepared_detail,current_detail,prepared_audit_seq,terminal_audit_seq,prepared_at,updated_at) VALUES ($1,$2,'snapshot_expire',$3,'prepared',$4::jsonb,$4::jsonb,9100,NULL,now(),now())";
+            for (decoy_resource, decoy_operation) in [
+                ("tenant_a.ns.other", settle_operation),
+                (resource(), stranger),
+            ] {
+                let decoy_detail = expire_detail(
+                    decoy_operation,
+                    ForgeSnapshotExpirePhase::Prepared,
+                    decoy_resource,
+                );
+                sqlx::query(decoy_state)
+                    .bind(tenant.as_uuid())
+                    .bind(decoy_resource)
+                    .bind(decoy_operation)
+                    .bind(serde_json::to_string(&decoy_detail).expect("serialize decoy detail"))
+                    .execute(&superuser)
+                    .await
+                    .expect("seed decoy operation state");
+            }
+            sqlx::query("INSERT INTO vala.bifrost_tables (data_tenant_id,table_uid,fqn,fingerprint,physical_layout) VALUES ($1,decode(repeat('aa',16),'hex'),'vala.bifrost.other',decode(repeat('22',32),'hex'),'{}'::jsonb)")
+                .bind(tenant.as_uuid())
+                .execute(&superuser)
+                .await
+                .expect("seed decoy bifrost table");
+            sqlx::query("INSERT INTO vala.bifrost_table_maintenance_authority (data_tenant_id,catalog_name,namespace_name,table_name,table_uid) VALUES ($1,'wyrd-redux','vala.bifrost','other',decode(repeat('aa',16),'hex'))")
+                .bind(tenant.as_uuid())
+                .execute(&superuser)
+                .await
+                .expect("seed decoy maintenance authority");
+            sqlx::query("INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,namespace_name,table_name,strategy,lane,base_snapshot_id,plan,plan_hash,estimated_files,estimated_bytes,estimated_parallelism,estimated_memory_bytes,estimated_spill_bytes,large_task_ceiling_bytes,state,ready_at) VALUES ($1,$2,'wyrd-redux','vala.bifrost','other','snapshot_expiry','ordinary',79,'{}'::jsonb,decode(repeat('22',32),'hex'),1,1,1,1,1,1,'ready',now())")
+                .bind(stranger)
+                .bind(tenant.as_uuid())
+                .execute(&superuser)
+                .await
+                .expect("seed decoy task");
+
+            let all_rows = format!("WHERE operation_id='{settle_operation}'");
+            let one_row = format!("WHERE operation_id='{settle_operation}' AND snapshot_id=11");
+            let corruptions: Vec<(&str, String, String)> = vec![
+                (
+                    "resource",
+                    format!(
+                        "UPDATE vala.forge_snapshot_expiration_claims SET resource='tenant_a.ns.other' {all_rows}"
+                    ),
+                    format!(
+                        "UPDATE vala.forge_snapshot_expiration_claims SET resource='{}' WHERE operation_id='{settle_operation}'",
+                        resource()
+                    ),
+                ),
+                (
+                    "operation identity",
+                    format!(
+                        "UPDATE vala.forge_snapshot_expiration_claims SET operation_id='{stranger}' {all_rows}"
+                    ),
+                    format!(
+                        "UPDATE vala.forge_snapshot_expiration_claims SET operation_id='{settle_operation}' WHERE operation_id='{stranger}'"
+                    ),
+                ),
+                (
+                    "table uid",
+                    format!(
+                        "UPDATE vala.forge_snapshot_expiration_claims SET table_uid=decode(repeat('aa',16),'hex') {all_rows}"
+                    ),
+                    format!(
+                        "UPDATE vala.forge_snapshot_expiration_claims SET table_uid=decode(repeat('07',16),'hex') {all_rows}"
+                    ),
+                ),
+                (
+                    "table name",
+                    format!(
+                        "UPDATE vala.forge_snapshot_expiration_claims SET table_name='other' {all_rows}"
+                    ),
+                    format!(
+                        "UPDATE vala.forge_snapshot_expiration_claims SET table_name='{}' {all_rows}",
+                        table.table_name
+                    ),
+                ),
+                (
+                    "table uuid",
+                    format!(
+                        "UPDATE vala.forge_snapshot_expiration_claims SET table_uuid='{stranger}' {all_rows}"
+                    ),
+                    format!(
+                        "UPDATE vala.forge_snapshot_expiration_claims SET table_uuid='{}' {all_rows}",
+                        table.table_uuid
+                    ),
+                ),
+                (
+                    "original task",
+                    format!(
+                        "UPDATE vala.forge_snapshot_expiration_claims SET task_id='{stranger}' {all_rows}"
+                    ),
+                    format!(
+                        "UPDATE vala.forge_snapshot_expiration_claims SET task_id='{}' {all_rows}",
+                        settle_authority.task_id
+                    ),
+                ),
+                (
+                    "original attempt",
+                    format!(
+                        "UPDATE vala.forge_snapshot_expiration_claims SET attempt_id='{stranger}' {all_rows}"
+                    ),
+                    format!(
+                        "UPDATE vala.forge_snapshot_expiration_claims SET attempt_id='{}' {all_rows}",
+                        settle_authority.attempt_id
+                    ),
+                ),
+                (
+                    "historical worker disagreement",
+                    format!(
+                        "UPDATE vala.forge_snapshot_expiration_claims SET worker_id='{stranger}' {one_row}"
+                    ),
+                    format!(
+                        "UPDATE vala.forge_snapshot_expiration_claims SET worker_id='{}' {all_rows}",
+                        settle_authority.worker_id
+                    ),
+                ),
+                (
+                    "lease key disagreement",
+                    format!(
+                        "UPDATE vala.forge_snapshot_expiration_claims SET lease_key='forge:tenant_a:other' {one_row}"
+                    ),
+                    format!(
+                        "UPDATE vala.forge_snapshot_expiration_claims SET lease_key='{}' {all_rows}",
+                        settle_authority.lease_key
+                    ),
+                ),
+                (
+                    "lease fence disagreement",
+                    format!(
+                        "UPDATE vala.forge_snapshot_expiration_claims SET lease_fencing_token=99 {one_row}"
+                    ),
+                    format!(
+                        "UPDATE vala.forge_snapshot_expiration_claims SET lease_fencing_token={} {all_rows}",
+                        settle_authority.lease_fencing_token
+                    ),
+                ),
+                (
+                    "selected snapshot membership",
+                    format!(
+                        "UPDATE vala.forge_snapshot_expiration_claims SET snapshot_id=13 WHERE operation_id='{settle_operation}' AND snapshot_id=12"
+                    ),
+                    format!(
+                        "UPDATE vala.forge_snapshot_expiration_claims SET snapshot_id=12 WHERE operation_id='{settle_operation}' AND snapshot_id=13"
+                    ),
+                ),
+                (
+                    "selected snapshot cardinality",
+                    format!(
+                        "INSERT INTO vala.forge_snapshot_expiration_claims SELECT data_tenant_id,resource,family,operation_id,13,task_id,attempt_id,worker_id,lease_key,lease_fencing_token,table_uid,catalog_name,namespace_name,table_name,table_uuid FROM vala.forge_snapshot_expiration_claims {one_row}"
+                    ),
+                    format!(
+                        "DELETE FROM vala.forge_snapshot_expiration_claims WHERE operation_id='{settle_operation}' AND snapshot_id=13"
+                    ),
+                ),
+            ];
+
+            for (label, corrupt, restore) in &corruptions {
+                sqlx::query(AssertSqlSafe(corrupt.as_str()))
+                    .execute(&superuser)
+                    .await
+                    .unwrap_or_else(|error| panic!("corrupt {label}: {error}"));
+                let before = durable_expiration_state(
+                    &superuser,
+                    tenant,
+                    settle_operation,
+                    settle_authority.task_id,
+                )
+                .await;
+
+                let claims = ops
+                    .claims_for_task(operator, tenant, settle_authority.task_id)
+                    .await
+                    .unwrap_or_else(|error| panic!("claim lookup for {label}: {error}"));
+                assert!(
+                    ops.require_claim_identity(
+                        &claims,
+                        settle_authority.task_id,
+                        settle_authority.attempt_id,
+                        &table,
+                        &settle_detail,
+                    )
+                    .is_err(),
+                    "reconciliation input must refuse a corrupted {label}"
+                );
+                assert!(
+                    ops.reset_snapshot_expiration(operator, tenant, &settle_reset_request)
+                        .await
+                        .is_err(),
+                    "reset must refuse a corrupted {label}"
+                );
+                assert!(
+                    ops.settle_snapshot_expiration(operator, tenant, &settlement)
+                        .await
+                        .is_err(),
+                    "settlement must refuse a corrupted {label}"
+                );
+
+                assert_eq!(
+                    durable_expiration_state(
+                        &superuser,
+                        tenant,
+                        settle_operation,
+                        settle_authority.task_id,
+                    )
+                    .await,
+                    before,
+                    "a refused {label} leaves claims, operation, task, demand, and audit unchanged"
+                );
+
+                sqlx::query(AssertSqlSafe(restore.as_str()))
+                    .execute(&superuser)
+                    .await
+                    .unwrap_or_else(|error| panic!("restore {label}: {error}"));
+            }
+
+            // A takeover's current authority is never compared with the
+            // historical worker, lease, and fence the rows agree on.
+            sqlx::query(AssertSqlSafe(format!(
+                "UPDATE vala.forge_snapshot_expiration_claims SET worker_id='{stranger}',lease_key='forge:tenant_a:historic',lease_fencing_token=3 {all_rows}"
+            )))
+            .execute(&superuser)
+            .await
+            .expect("rewrite historical authority consistently");
+            let historical = ops
+                .claims_for_task(operator, tenant, settle_authority.task_id)
+                .await
+                .expect("claim lookup after historical rewrite");
+            ops.require_claim_identity(
+                &historical,
+                settle_authority.task_id,
+                settle_authority.attempt_id,
+                &table,
+                &settle_detail,
+            )
+            .expect("a consistent historical authority is accepted under takeover");
+            sqlx::query(AssertSqlSafe(format!(
+                "UPDATE vala.forge_snapshot_expiration_claims SET worker_id='{}',lease_key='{}',lease_fencing_token={} {all_rows}",
+                settle_authority.worker_id,
+                settle_authority.lease_key,
+                settle_authority.lease_fencing_token
+            )))
+            .execute(&superuser)
+            .await
+            .expect("restore historical authority");
+
             let settled = ops
                 .settle_snapshot_expiration(operator, tenant, &settlement)
                 .await

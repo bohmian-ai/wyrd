@@ -15,7 +15,7 @@ use vala_sql::queries::forge_tasks::ForgeTasks;
 use vala_sql::row_types::forge_operations::{
     ForgeClaimTable, ForgeExpirationAuthority, ForgeExpirationPreparation,
     ForgeExpirationResetRequest, ForgeExpirationSettlement, ForgeExpirationSettlementRequest,
-    ForgeOperationFamily, ForgeOperationStateRow,
+    ForgeOperationFamily, ForgeOperationStateRow, ForgeSnapshotExpirationClaim,
 };
 use vala_sql::row_types::forge_tasks::{
     ForgeCleanupCandidate, ForgeCleanupCategory, ForgeCleanupPath, ForgeTaskEvidence,
@@ -979,24 +979,28 @@ fn selected_ids_are_eligible(
 
 /// Recover this task's prepared expiry operation when its outcome is knowable.
 impl Forge {
-    /// Resolves the single operation this task's surviving claims name.
+    /// Reads this task's surviving claims and the operation they name.
     ///
     /// Returns `None` when the task holds no claims, meaning nothing was
-    /// prepared and there is nothing to reconcile.
+    /// prepared and there is nothing to reconcile. The claim rows are returned
+    /// unvalidated: only the operation lookup key is read from them here, and
+    /// nothing in a row's payload — least of all its table identity — may be
+    /// trusted before
+    /// [`ForgeOperations::require_claim_identity`] has proven the whole set
+    /// reproduces the stored preparation.
     ///
     /// # Errors
     ///
     /// Returns [`ForgeError::Sql`] when the claim index, tenant connection, or
-    /// operation read fails, and [`ForgeError::Reconciliation`] when one task
-    /// owns claims for more than one operation or names an absent operation.
+    /// operation read fails, and [`ForgeError::Reconciliation`] when the claims
+    /// name an absent operation.
     async fn claimed_expiry_operation(
         &self,
+        operations: &ForgeOperations<'_>,
         key: &ForgeTableKey,
         authority: &ExpiryTaskAuthority,
-    ) -> Result<Option<(ForgeClaimTable, ForgeOperationStateRow)>, ForgeError> {
-        let resource = table_resource_for_key(key);
-        let operations = ForgeOperations::new(&resource, ForgeOperationFamily::SnapshotExpire)
-            .map_err(ForgeError::Sql)?;
+    ) -> Result<Option<(Vec<ForgeSnapshotExpirationClaim>, ForgeOperationStateRow)>, ForgeError>
+    {
         let claims = operations
             .claims_for_task(&self.core.operator_pool, key.tenant, authority.task)
             .await
@@ -1004,15 +1008,6 @@ impl Forge {
         let Some(first) = claims.first() else {
             return Ok(None);
         };
-        if claims
-            .iter()
-            .any(|claim| claim.operation_id != first.operation_id)
-        {
-            return Err(ForgeError::Reconciliation {
-                detail: "one Forge task owns claims for more than one expiry operation".to_owned(),
-            });
-        }
-        let claim_table = first.table.clone();
         let operation_id = first.operation_id;
         let mut conn = self
             .core
@@ -1028,7 +1023,7 @@ impl Forge {
         let state = state.ok_or_else(|| ForgeError::Reconciliation {
             detail: format!("expiry claims reference missing operation {operation_id}"),
         })?;
-        Ok(Some((claim_table, state)))
+        Ok(Some((claims, state)))
     }
 
     /// Settles or retains the one operation this task's claims still name.
@@ -1055,7 +1050,12 @@ impl Forge {
         stop: &CancellationToken,
     ) -> Result<ExpiryReconciliationOutcome, ForgeError> {
         let mut outcome = ExpiryReconciliationOutcome::default();
-        let Some((claim_table, state)) = self.claimed_expiry_operation(key, authority).await?
+        let resource = table_resource_for_key(key);
+        let operations = ForgeOperations::new(&resource, ForgeOperationFamily::SnapshotExpire)
+            .map_err(ForgeError::Sql)?;
+        let Some((claims, state)) = self
+            .claimed_expiry_operation(&operations, key, authority)
+            .await?
         else {
             return Ok(outcome);
         };
@@ -1073,6 +1073,16 @@ impl Forge {
         require_running(stop)?;
         lease.require_fence(&self.core.operator_pool).await?;
         let table = self.load_table(&binding.table_ident()).await?;
+        let claim_table = self.expiry_claim_table(key, &table).await?;
+        operations
+            .require_claim_identity(
+                &claims,
+                authority.task,
+                authority.attempt,
+                &claim_table,
+                &detail,
+            )
+            .map_err(ForgeError::Sql)?;
         let all_absent = selected_snapshot_ids
             .iter()
             .all(|id| table.metadata().snapshot_by_id(*id).is_none());

@@ -1828,7 +1828,7 @@ impl WyrdTestCluster {
                 tempfile::tempdir().map_err(|error| ClusterError::Resource(error.to_string()))?,
             ),
         });
-        let storage = StorageHandle::from_settings(StorageSettings {
+        let storage_settings = StorageSettings {
             backend: BackendConfig::Local {
                 root: storage_root.path().to_path_buf(),
             },
@@ -1837,9 +1837,23 @@ impl WyrdTestCluster {
             part_size_bytes: 16 * 1024 * 1024,
             multipart_threshold_bytes: 100 * 1024 * 1024,
             public_base_url: Some("https://wyrd.test".to_owned()),
-        })
-        .await
-        .map_err(|error| ClusterError::Resource(error.to_string()))?;
+        };
+        // The filesystem service resumes a listing from `start_after` correctly
+        // but does not advertise the capability, and Forge workers refuse to
+        // start on a staging backend that cannot resume a bounded orphan scan.
+        // This shared cluster root stands in for a production object store, so
+        // it declares the support it actually has.
+        let operator = wyrd_storage::factory::build_operator(&storage_settings.backend)
+            .map_err(|error| ClusterError::Resource(error.to_string()))?
+            .layer(opendal::layers::CapabilityOverrideLayer::new(
+                |mut capability| {
+                    capability.list_with_start_after = true;
+                    capability
+                },
+            ));
+        let storage = StorageHandle::from_settings_with_operator(storage_settings, operator)
+            .await
+            .map_err(|error| ClusterError::Resource(error.to_string()))?;
         // Only the uncertainty wrapper needs a cluster-level catalog handle;
         // every node otherwise builds its own from its own storage owner, so
         // constructing one unconditionally would create a catalog no node uses.

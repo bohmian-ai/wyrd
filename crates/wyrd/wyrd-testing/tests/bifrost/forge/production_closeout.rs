@@ -495,6 +495,48 @@ impl CloseoutJourney {
             .expect("Oracle node")
     }
 
+    /// Drains tasks while one deliberately abandoned rewrite is expected.
+    ///
+    /// The ordinary drain treats any returned worker error as a defect. One
+    /// scenario needs a real attempt to be refused after it closed its outputs
+    /// and before it prepared, so this variant accepts exactly the refusal that
+    /// scenario injects at the publication reacquisition it drives, and still
+    /// refuses every other worker error. The observer keeps every error it ever
+    /// saw, so every drain after that injection has to use this variant.
+    ///
+    /// # Panics
+    /// Panics on SQL failure, a stalled attempt, or any other worker error.
+    async fn drain_tasks_allowing_injected_refusal(&self) {
+        tokio::time::timeout(REWRITE_BOUND, async {
+            loop {
+                for error in self.observer.returned_errors() {
+                    assert!(
+                        error.contains("injected Forge catalog load failure"),
+                        "worker failed for an unexpected reason: {error}"
+                    );
+                }
+                let next = self.observer.attempts() + 1;
+                let (pending, attempts): (i64, i64) = sqlx::query_as(
+                    "SELECT count(*) FILTER (WHERE state NOT IN \
+                     ('succeeded', 'failed', 'cancelled', 'unschedulable')), \
+                     coalesce(sum(attempt_count), 0)::bigint FROM vala.forge_tasks",
+                )
+                .fetch_one(self.cluster.pg_fixture().operator_pool().pool())
+                .await
+                .expect("durable task and ownership inspection");
+                if pending == 0
+                    && self.observer.attempts()
+                        >= usize::try_from(attempts).expect("nonnegative attempts")
+                {
+                    break;
+                }
+                self.observer.wait_for_attempts_at_least(next).await;
+            }
+        })
+        .await
+        .expect("the abandoned rewrite and its retry both settle");
+    }
+
     /// Requests and observes one real scheduler pass before inspecting SQL.
     ///
     /// # Panics
@@ -1471,7 +1513,21 @@ impl OrphanJourney {
             "the promoted input is live and a rewrite is now due"
         );
 
-        let orphans = Self::prove_commit_window_retention(&roles, &table, &catalog).await;
+        Self::prove_commit_window_retention(&roles, &table, &catalog).await;
+
+        // A further acknowledged flush, promoted on its own pass, leaves the
+        // table owing one more real rewrite: the attempt that will be refused.
+        workload
+            .append_batch(&transport, &table.qualified, &[7, 8])
+            .await;
+        roles
+            .scribe()
+            .flush_bifrost()
+            .await
+            .expect("later rows flush");
+        roles.scheduler_pass().await;
+        roles.drain_tasks().await;
+        let orphans = Self::strand_one_generation(&roles, &table, &catalog).await;
         Self {
             roles,
             table,
@@ -1486,30 +1542,22 @@ impl OrphanJourney {
         }
     }
 
-    /// Retains an open rewrite's outputs, then refuses that rewrite's commit.
+    /// Proves an open and a commit-uncertain rewrite both retain their outputs.
     ///
     /// Two production windows, observed from the coordinator because the worker
     /// is the process inside the catalog call: a rewrite whose operation row is
-    /// prepared and whose commit has not been delegated, and the retry's, whose
-    /// commit the catalog accepted but has not acknowledged. Collection must
-    /// refuse the first rewrite's outputs in both, and neither verdict may come
-    /// from a fixture.
-    ///
-    /// Rejecting that first commit is what strands the objects: the retry runs
-    /// under a new attempt identity and publishes its own outputs, so the ones
-    /// returned here are named by no snapshot and are the exact generation the
-    /// rest of the journey tracks to deletion. The accepted-uncertain window is
-    /// protection evidence only; it strands nothing.
+    /// prepared and whose commit has not been delegated, and one whose commit
+    /// the catalog accepted but has not acknowledged. Collection must refuse
+    /// the outputs in both, and neither verdict may come from a fixture.
     ///
     /// # Panics
     /// Panics if either window is never reached, the rewrite closed no output,
-    /// the production predicate does not protect it, or a returned object
-    /// reaches a published snapshot.
+    /// or the production predicate does not protect it.
     async fn prove_commit_window_retention(
         roles: &CloseoutJourney,
         table: &JourneyTable,
         catalog: &Arc<CommitUncertaintyCatalog>,
-    ) -> BTreeSet<String> {
+    ) {
         let before = roles.forge_objects(&table.binding).await;
         catalog.pause_before_commit();
         let drive = async {
@@ -1544,17 +1592,74 @@ impl OrphanJourney {
                 .assert_eligibility(&table.binding, &open, "Protected", "uncertain commit")
                 .await;
             catalog.release_paused_commit();
-            open
         };
-        let ((), open) = tokio::join!(drive, inspect);
+        tokio::join!(drive, inspect);
+    }
+
+    /// Refuses one real rewrite after it closed its outputs and before it prepared.
+    ///
+    /// The refusal is a production one. The rewrite is held at the point its
+    /// managed execution is finished and its publication has not yet reacquired
+    /// authoritative metadata, and that reacquisition is then made to fail. The
+    /// objects the attempt already closed are therefore named by no snapshot,
+    /// no operation row, and no audit transition, and the retry runs under a
+    /// new attempt identity that cannot reuse them. While the attempt is still
+    /// open those same objects must be protected, observed from the coordinator
+    /// because the worker is the process holding the rewrite.
+    ///
+    /// # Panics
+    /// Panics if the barrier is never reached, the refused rewrite closed no
+    /// output, or the production predicate does not retain it.
+    async fn strand_one_generation(
+        roles: &CloseoutJourney,
+        table: &JourneyTable,
+        catalog: &Arc<CommitUncertaintyCatalog>,
+    ) -> BTreeSet<String> {
+        let before = roles.forge_objects(&table.binding).await;
+        roles.observer.hold_after_next_rewrite_handoff_for_test();
+        let drive = async {
+            roles.scheduler_pass().await;
+            roles.drain_tasks_allowing_injected_refusal().await;
+        };
+        let inspect = async {
+            tokio::time::timeout(
+                REWRITE_BOUND,
+                roles.observer.wait_for_held_rewrite_handoff_for_test(),
+            )
+            .await
+            .expect("a real rewrite reaches its post-execution barrier");
+            let orphans: BTreeSet<String> = roles
+                .forge_objects(&table.binding)
+                .await
+                .difference(&before)
+                .cloned()
+                .collect();
+            assert!(
+                !orphans.is_empty(),
+                "the held rewrite closed at least one real output"
+            );
+            // Before the operation row prepares, the age floor is the only
+            // thing standing between a collection pass and an output a live
+            // attempt is still working on, so that is what must hold here.
+            roles
+                .assert_eligibility(&table.binding, &orphans, "TooYoung", "unprepared rewrite")
+                .await;
+            // Refuse the metadata reacquisition this rewrite performs next,
+            // which is the last authority it consults before preparing.
+            catalog.fail_next_load_table();
+            roles.observer.release_held_rewrite_handoff_for_test();
+            orphans
+        };
+        let ((), orphans) = tokio::join!(drive, inspect);
+
         let (_, live) = roles.live_files(&table.binding).await;
-        for path in &open {
+        for path in &orphans {
             assert!(
                 !live.contains_key(path),
-                "a rejected rewrite output reached a published snapshot: {path}"
+                "a refused rewrite output reached a published snapshot: {path}"
             );
         }
-        open
+        orphans
     }
 
     /// Crosses the terminal age floor and collects exactly the stranded output.
@@ -1595,7 +1700,7 @@ impl OrphanJourney {
             .completed_forge_scheduler_passes_for_test();
         for _ in 0..12 {
             self.roles.scheduler_pass().await;
-            self.roles.drain_tasks().await;
+            self.roles.drain_tasks_allowing_injected_refusal().await;
             let mut remaining = false;
             for path in &self.orphans {
                 remaining |= !self.roles.object_missing(path).await;
@@ -1617,13 +1722,22 @@ impl OrphanJourney {
                 > before,
             "collection ran through the existing scheduler trigger"
         );
-        assert_eq!(
-            self.roles.forge_objects(&self.table.binding).await,
-            before_objects
-                .difference(&self.orphans)
-                .cloned()
-                .collect::<BTreeSet<String>>(),
-            "collection removed exactly the tracked generation"
+        // Ownership is proved by difference, not by membership: every object
+        // this table owned before the pass must survive it except the tracked
+        // generation. The passes driven above can publish their own new
+        // outputs, so the surviving set is a superset of that remainder rather
+        // than equal to it; what may not happen is any other removal.
+        let after_objects = self.roles.forge_objects(&self.table.binding).await;
+        let survivors: BTreeSet<String> =
+            before_objects.difference(&self.orphans).cloned().collect();
+        assert!(
+            survivors.is_subset(&after_objects),
+            "collection removed an object outside the tracked generation: {:?}",
+            survivors.difference(&after_objects).collect::<Vec<_>>()
+        );
+        assert!(
+            after_objects.is_disjoint(&self.orphans),
+            "the tracked generation survived its own collection route"
         );
         self.roles.assert_objects(&live).await;
         self.roles

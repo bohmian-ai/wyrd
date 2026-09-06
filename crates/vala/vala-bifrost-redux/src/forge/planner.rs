@@ -159,16 +159,15 @@ impl ForgeEnvelopeSizer {
                 detail: "Forge topology cannot supply a complete resource envelope".to_owned(),
             });
         }
-        let scratch_term = total_input_bytes
-            .max(
-                super::rewrite::REWRITE_WORKING_SET_FLOOR_BYTES
-                    .checked_mul(16)
-                    .ok_or_else(|| ForgeError::Invariant {
-                        detail: "Forge scratch floor overflows".to_owned(),
-                    })?,
-            )
-            .min(capacity.max_spill_bytes / 2);
-        if scratch_term < MIB || (file_count == 1 && total_input_bytes > scratch_term) {
+        // Scratch is a disk-byte reservation, but `total_input_bytes` counts
+        // compressed Parquet while the external sort spills uncompressed Arrow
+        // IPC of the rows those files encode. What separates the two is the
+        // table's compression ratio, which no Iceberg manifest reports, so no
+        // figure derived from the input can bound the spill for every table.
+        // The reservation is the pod's own scratch instead, halved so two
+        // rewrites can each hold one and the governor defers the third.
+        let scratch_term = capacity.max_spill_bytes / 2;
+        if file_count == 1 && total_input_bytes > scratch_term {
             return Err(ForgeError::Capacity {
                 detail: "Forge input cannot fit the bounded sort-spill reservation".to_owned(),
             });

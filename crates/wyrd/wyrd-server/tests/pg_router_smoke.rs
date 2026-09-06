@@ -1239,6 +1239,85 @@ async fn forge_checks_follow_target_selection() {
     }
 }
 
+/// Process shutdown closes both Forge role bits before it cancels their token.
+///
+/// Readiness answers whether this replica can be routed work right now. If the
+/// token were cancelled first, both loops would keep advertising themselves for
+/// as long as it took them to notice, and the gateway would keep sending
+/// maintenance to a replica that is already tearing down. Closing is terminal,
+/// so a loop that publishes on its way out cannot reopen routing either.
+///
+/// # Panics
+///
+/// Panics when either role fails to reach ready, when a bit survives
+/// `begin_shutdown`, when the Forge token is not cancelled, or when joining a
+/// loop republishes readiness.
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn forge_begin_shutdown_closes_readiness_before_cancellation() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let forge = server
+        .state()
+        .forge()
+        .expect("the default target selects Forge");
+    let coordinator_ready = forge.coordinator_readiness();
+    let worker_ready = forge.worker_readiness();
+
+    let stop = server.state().shutdown_token.child_token();
+    let worker = wyrd_server::boot::spawn_forge_worker(server.state(), stop.clone(), 1, 1)
+        .expect("the worker composes");
+    let worker_handle = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(worker));
+    let scheduler = wyrd_server::boot::spawn_maintenance_scheduler(server.state(), stop.clone())
+        .expect("the scheduler composes")
+        .expect("the default target selects a coordinator");
+    let scheduler_handle = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(scheduler));
+
+    await_forge_role(
+        &server,
+        true,
+        wyrd_server::state::Forge::worker_readiness,
+        "worker before shutdown",
+    )
+    .await;
+    drive_scheduler_pass(&server, "coordinator pass before shutdown").await;
+    assert!(
+        coordinator_ready.is_ready() && worker_ready.is_ready(),
+        "both selected roles are ready before shutdown begins"
+    );
+
+    // No await between the call and the assertions: the contract is that
+    // routing is already closed the moment `begin_shutdown` returns, not that
+    // it closes soon afterwards.
+    server.state().bifrost.begin_shutdown();
+    assert!(
+        !coordinator_ready.is_ready(),
+        "coordinator routing closes synchronously with shutdown"
+    );
+    assert!(
+        !worker_ready.is_ready(),
+        "worker routing closes synchronously with shutdown"
+    );
+    assert!(
+        forge.shutdown_token().is_cancelled(),
+        "the Forge token is cancelled only after routing is already closed"
+    );
+
+    stop.cancel();
+    join_forge_loop(&server, worker_handle)
+        .await
+        .expect("worker loop ok");
+    join_forge_loop(&server, scheduler_handle)
+        .await
+        .expect("pass loop ok");
+    assert!(
+        !coordinator_ready.is_ready() && !worker_ready.is_ready(),
+        "a closed role never republishes readiness while its loop drains"
+    );
+    server.shutdown().await.expect("test server shuts down");
+}
+
 /// A worker whose staging backend cannot resume a listing never starts.
 ///
 /// Orphan collection's only anti-starvation mechanism is an exclusive

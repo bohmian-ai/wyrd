@@ -6,7 +6,7 @@
 //! to recover work after a process or catalog failure.
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU8};
 use std::time::Duration;
 
 use iceberg::Catalog;
@@ -69,6 +69,13 @@ pub use orphan_gc::{OrphanGcReport, current_gc_gate_for_test};
 #[cfg(feature = "test-support")]
 pub use worker::ForgeRewriteEvidenceRecord;
 
+/// Role is not routable and may still become ready.
+const FORGE_ROLE_UNREADY: u8 = 0;
+/// Role currently holds the authority it advertises.
+const FORGE_ROLE_READY: u8 = 1;
+/// Role is shutting down; readiness can never be republished.
+const FORGE_ROLE_CLOSED: u8 = 2;
+
 /// One process-owned readiness bit for a selected Forge role.
 ///
 /// The server owns the bit and publishes it on `/readyz`; the Vala owner that
@@ -77,8 +84,14 @@ pub use worker::ForgeRewriteEvidenceRecord;
 /// the last value the server happened to poll. Cleared before, never after, the
 /// failure that makes the role unusable, so routing closes ahead of authority
 /// loss.
+///
+/// The state is a three-valued atomic rather than a boolean because shutdown
+/// must close routing synchronously, ahead of cancellation, while the role's
+/// loop is still running and may still be mid-`publish`. `closed` is terminal,
+/// so the close cannot be undone by a later publish that raced it — the atomic,
+/// not loop timing, is what keeps the bit down.
 #[derive(Debug, Clone, Default)]
-pub struct ForgeRoleReadiness(Arc<AtomicBool>);
+pub struct ForgeRoleReadiness(Arc<AtomicU8>);
 
 impl ForgeRoleReadiness {
     /// Creates a readiness bit no health surface observes.
@@ -91,14 +104,38 @@ impl ForgeRoleReadiness {
     }
 
     /// Publishes this role's current readiness.
+    ///
+    /// `true` promotes only an open, unready role; `false` demotes only a ready
+    /// one. Either way a closed role stays closed, so a loop that publishes
+    /// after shutdown began cannot reopen routing.
     pub fn publish(&self, ready: bool) {
-        self.0.store(ready, std::sync::atomic::Ordering::Release);
+        let (from, to) = if ready {
+            (FORGE_ROLE_UNREADY, FORGE_ROLE_READY)
+        } else {
+            (FORGE_ROLE_READY, FORGE_ROLE_UNREADY)
+        };
+        let _ = self.0.compare_exchange(
+            from,
+            to,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        );
+    }
+
+    /// Closes this role's routing permanently.
+    ///
+    /// Called by the process shutdown owner before the shared Forge token is
+    /// cancelled, so `/readyz` stops advertising the role before its loops are
+    /// told to stop rather than after they happen to notice.
+    pub fn close(&self) {
+        self.0
+            .store(FORGE_ROLE_CLOSED, std::sync::atomic::Ordering::Release);
     }
 
     /// Reads the currently published readiness.
     #[must_use]
     pub fn is_ready(&self) -> bool {
-        self.0.load(std::sync::atomic::Ordering::Acquire)
+        self.0.load(std::sync::atomic::Ordering::Acquire) == FORGE_ROLE_READY
     }
 }
 
@@ -314,5 +351,39 @@ mod iceberg_maintenance_contract_tests {
         assert!(expired.data_files.is_empty());
         assert_eq!(ManifestRewriteOutcome::NoOp, ManifestRewriteOutcome::NoOp);
         let _ = assert_owned_fork_function_signatures;
+    }
+}
+
+/// Unit coverage for Forge's process-owned role readiness handle.
+#[cfg(test)]
+mod tests {
+    use super::ForgeRoleReadiness;
+
+    /// Closing a role's readiness is terminal for every later publish.
+    ///
+    /// Shutdown closes routing before it cancels the shared Forge token, so a
+    /// role loop that is still running may publish afterwards. Neither value
+    /// may reopen the bit, or `/readyz` would advertise a role the process is
+    /// already tearing down.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a closed handle reports ready again.
+    #[test]
+    fn role_readiness_close_is_terminal() {
+        let readiness = ForgeRoleReadiness::detached();
+        assert!(!readiness.is_ready(), "a fresh role is not ready");
+        readiness.publish(true);
+        assert!(readiness.is_ready(), "an open role publishes ready");
+
+        readiness.close();
+        assert!(!readiness.is_ready(), "closing clears routing");
+        for republish in [false, true] {
+            readiness.publish(republish);
+            assert!(
+                !readiness.is_ready(),
+                "publish({republish}) after close must not reopen routing"
+            );
+        }
     }
 }

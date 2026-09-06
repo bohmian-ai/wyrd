@@ -1348,8 +1348,21 @@ impl Forge {
         self.resources.clone()
     }
 
+    /// Borrows the token every selected Forge capability stops on.
+    #[must_use]
+    pub const fn shutdown_token(&self) -> &CancellationToken {
+        &self.shutdown
+    }
+
     /// Signals selected Forge capabilities to stop accepting work.
+    ///
+    /// Routing closes before the token is cancelled: a role that is losing its
+    /// authority must stop being advertised on `/readyz` ahead of the loops
+    /// noticing, and the close is terminal so a loop still running cannot
+    /// republish readiness on its way out.
     pub fn begin_shutdown(&self) {
+        self.coordinator_ready.close();
+        self.worker_ready.close();
         self.shutdown.cancel();
     }
 

@@ -769,6 +769,120 @@ async fn worker_settled_expiration_returns_success_without_a_second_transition()
     );
 
     supervised.shutdown().await;
+
+    // Durable settlement outranks whatever finishes concurrently.
+    for event in [
+        ConcurrentSettlementEvent::Shutdown,
+        ConcurrentSettlementEvent::ObsoleteHeartbeat,
+    ] {
+        settled_expiration_outranks(event).await;
+    }
+}
+
+/// A concurrent event that must not replace a durable expiration settlement.
+#[derive(Debug, Clone, Copy)]
+enum ConcurrentSettlementEvent {
+    /// The exact shutdown token the claim executes under is cancelled.
+    Shutdown,
+    /// The already-running claim heartbeat takes its post-settlement beat.
+    ObsoleteHeartbeat,
+}
+
+impl ConcurrentSettlementEvent {
+    /// Unique fixture name for this case's isolated expirable table.
+    fn fixture_name(self) -> &'static str {
+        match self {
+            Self::Shutdown => "expiry_settled_beats_shutdown",
+            Self::ObsoleteHeartbeat => "expiry_settled_beats_heartbeat",
+        }
+    }
+}
+
+/// Proves one concurrent event cannot displace a durable expiration settlement.
+///
+/// The worker is held at the production post-settlement barrier — after its
+/// atomic task and operation transition committed, and before it reads shutdown
+/// or joins the heartbeat — so the concurrent event provably precedes the
+/// worker's own interpretation without any timing dependence.
+///
+/// # Panics
+///
+/// Panics when the attempt does not return success, when a terminal owner is
+/// written twice, or when any durable expiration fact is not the settled one.
+async fn settled_expiration_outranks(event: ConcurrentSettlementEvent) {
+    let table = expirable_table(event.fixture_name(), true).await;
+    let worker = ForgeWorker::new(
+        table.supervised.forge(),
+        ForgeWorkerConfig::default(),
+        Uuid::now_v7(),
+    )
+    .expect("fixture Forge worker");
+    let task = seed_ready_expiry_task(&table.fixture, table.watermark, "46").await;
+    let claim = worker
+        .claim_for_test()
+        .await
+        .expect("the production claim transaction runs")
+        .expect("the ready snapshot-expiry task is claimable");
+    let before = expiry_state(&table.fixture, task).await;
+
+    let observer = table.supervised.observer().clone();
+    observer.hold_after_next_durable_settlement_for_test();
+    let shutdown = CancellationToken::new();
+    let claim_shutdown = shutdown.clone();
+    let attempt = tokio::spawn(async move {
+        worker
+            .execute_snapshot_expiry_claim_for_test(claim, &claim_shutdown)
+            .await
+    });
+    observer.wait_for_held_durable_settlement_for_test().await;
+    match event {
+        ConcurrentSettlementEvent::Shutdown => shutdown.cancel(),
+        ConcurrentSettlementEvent::ObsoleteHeartbeat => {
+            observer.beat_claim_heartbeat_now_for_test();
+        }
+    }
+    observer.release_held_durable_settlement_for_test();
+    attempt
+        .await
+        .expect("the held attempt joins")
+        .unwrap_or_else(|error| {
+            panic!("a durably settled expiration stays successful under {event:?}: {error}")
+        });
+
+    let settled = expiry_state(&table.fixture, task).await;
+    assert_eq!(settled.task_state, "succeeded", "{event:?}");
+    assert_eq!(settled.claims, 0, "{event:?}");
+    assert_eq!(
+        settled.operation_phase.as_deref(),
+        Some("committed"),
+        "{event:?}"
+    );
+    assert_eq!(
+        audit_count(&settled.audits, "forge.task.succeeded"),
+        1,
+        "{event:?} leaves exactly one terminal task audit: {:?}",
+        settled.audits
+    );
+    assert_eq!(
+        audit_count(&settled.audits, "forge.snapshot_expire.committed"),
+        1,
+        "{event:?} leaves exactly one terminal operation audit: {:?}",
+        settled.audits
+    );
+    assert_eq!(
+        audit_count(&settled.audits, "forge.task.cancelled")
+            + audit_count(&settled.audits, "forge.task.failed"),
+        0,
+        "{event:?} wrote no replacement terminal transition: {:?}",
+        settled.audits
+    );
+    assert_eq!(
+        settled.demand_generation,
+        Some(before.demand_generation.unwrap_or(0) + 1),
+        "{event:?} advances planning demand exactly once"
+    );
+
+    table.supervised.shutdown().await;
 }
 
 /// Writes one aged, otherwise eligible never-published Forge object.

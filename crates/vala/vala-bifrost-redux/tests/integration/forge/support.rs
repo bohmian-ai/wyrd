@@ -1511,6 +1511,15 @@ impl SupervisedPromotion {
         Arc::clone(&self.forge)
     }
 
+    /// Shares the production completion observer this supervisor registered.
+    ///
+    /// The same observer instance reaches every worker built from
+    /// [`Self::forge`], so a scenario can arm one of its passive barriers on a
+    /// directly constructed worker and still be holding the production seam.
+    pub(crate) fn observer(&self) -> &ForgeWorkerCompletionObserver {
+        &self.worker_observer
+    }
+
     /// Runs the production reclaim transaction once, outside the worker loop.
     ///
     /// The supervised loop reclaims and then claims in one iteration, so a

@@ -498,6 +498,25 @@ pub struct ForgeWorkerCompletionObserver {
     /// One-shot injected failure of the next cancelled-claim release.
     #[cfg(feature = "test-support")]
     fail_next_cancelled_claim_release: Arc<AtomicBool>,
+    /// One-shot passive barrier after a dispatch returns durable settlement.
+    #[cfg(feature = "test-support")]
+    pause_after_next_settlement: Arc<AtomicBool>,
+    /// Whether a durably settled dispatch is currently held at that barrier.
+    #[cfg(feature = "test-support")]
+    settlement_paused: Arc<AtomicBool>,
+    /// Wakeup for tests waiting until the settled dispatch is held.
+    #[cfg(feature = "test-support")]
+    settlement_pause_ready: Arc<tokio::sync::Notify>,
+    /// Release for the one settled dispatch held by the barrier.
+    #[cfg(feature = "test-support")]
+    settlement_pause_release: Arc<tokio::sync::Notify>,
+    /// Extra trigger that makes the running claim heartbeat take one real beat.
+    ///
+    /// Part of the same settlement barrier: while a settled dispatch is held,
+    /// a test uses this to drive the already-running heartbeat through its
+    /// genuine post-settlement conflict instead of waiting on wall-clock ticks.
+    #[cfg(feature = "test-support")]
+    heartbeat_beat_now: Arc<tokio::sync::Notify>,
 }
 
 /// Typed causal evidence from the production Forge scheduler and worker owners.
@@ -889,6 +908,57 @@ impl ForgeWorkerCompletionObserver {
         self.handoff_pause_release.notify_one();
     }
 
+    /// Hold the next dispatch that returned durable settlement.
+    ///
+    /// The barrier is passive and sits immediately after the dispatch returned
+    /// [`ForgeExecutionEvidenceState::Settled`] and before the worker reads
+    /// shutdown or joins the claim heartbeat. The task and its operation are
+    /// already terminal when it runs, so holding there changes only fixture
+    /// timing: it lets a test make a concurrent shutdown or an obsolete
+    /// heartbeat conflict provably precede the worker's own interpretation.
+    #[cfg(feature = "test-support")]
+    pub fn hold_after_next_durable_settlement_for_test(&self) {
+        self.settlement_paused.store(false, Ordering::Release);
+        self.pause_after_next_settlement
+            .store(true, Ordering::Release);
+    }
+
+    /// Wait until the armed post-settlement barrier is holding one dispatch.
+    #[cfg(feature = "test-support")]
+    pub async fn wait_for_held_durable_settlement_for_test(&self) {
+        loop {
+            let notified = self.settlement_pause_ready.notified();
+            if self.settlement_paused.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Release the one dispatch held after its durable settlement.
+    #[cfg(feature = "test-support")]
+    pub fn release_held_durable_settlement_for_test(&self) {
+        self.settlement_pause_release.notify_one();
+    }
+
+    /// Make the running claim heartbeat take one immediate real beat.
+    ///
+    /// The permit is stored, so the beat happens on the heartbeat's next select
+    /// pass whether or not it is already parked, and it takes priority over
+    /// cancellation. The beat itself is the production statement: against an
+    /// already-settled task it returns the genuine obsolete-claim conflict.
+    #[cfg(feature = "test-support")]
+    pub fn beat_claim_heartbeat_now_for_test(&self) {
+        self.heartbeat_beat_now.notify_one();
+    }
+
+    /// Shares the extra heartbeat trigger with the spawned heartbeat task.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn heartbeat_beat_signal(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.heartbeat_beat_now)
+    }
+
     /// Wait until successful tasks have been completed by `expected` distinct workers.
     ///
     /// Callers own any timeout because the task count and role topology are
@@ -1167,6 +1237,21 @@ impl ForgeWorkerCompletionObserver {
         self.handoff_pause_ready.notify_waiters();
         self.handoff_pause_release.notified().await;
         self.handoff_paused.store(false, Ordering::Release);
+    }
+
+    /// Pause once after an armed dispatch returned durable settlement.
+    #[cfg(feature = "test-support")]
+    async fn pause_after_settlement_for_test(&self) {
+        if !self
+            .pause_after_next_settlement
+            .swap(false, Ordering::AcqRel)
+        {
+            return;
+        }
+        self.settlement_paused.store(true, Ordering::Release);
+        self.settlement_pause_ready.notify_waiters();
+        self.settlement_pause_release.notified().await;
+        self.settlement_paused.store(false, Ordering::Release);
     }
 
     /// Observe one persisted claim and pause until the test releases the barrier.
@@ -2071,6 +2156,18 @@ impl ForgeWorker {
     async fn pause_after_handoff_for_test(&self) {
         if let Some(observer) = &self.completion_observer {
             observer.pause_after_handoff_for_test().await;
+        }
+    }
+
+    /// Apply the observer's one-shot passive post-settlement barrier.
+    ///
+    /// Called only after a dispatch returned durable settlement and before the
+    /// worker reads shutdown or joins the heartbeat. Without an armed observer
+    /// it is a no-op, so no production decision depends on it.
+    #[cfg(feature = "test-support")]
+    async fn pause_after_settlement_for_test(&self) {
+        if let Some(observer) = &self.completion_observer {
+            observer.pause_after_settlement_for_test().await;
         }
     }
 
@@ -3416,6 +3513,15 @@ impl ForgeWorker {
                     .await
             }
         };
+        // Test-only barrier: a durably settled snapshot expiration is held
+        // here, after its atomic task and operation settlement committed and
+        // before this worker reads shutdown or joins the heartbeat.
+        #[cfg(feature = "test-support")]
+        if maintenance_recovery
+            && matches!(execution, Ok((_, ForgeExecutionEvidenceState::Settled, _)))
+        {
+            self.pause_after_settlement_for_test().await;
+        }
         // A pre-effect cancellation surfaces as `execution == Err(Shutdown)`
         // (dispatch stopped mid-rewrite before its catalog commit, or a
         // maintenance task stopped before its `prepared()` boundary) and
@@ -3426,19 +3532,27 @@ impl ForgeWorker {
         // propagates as `ForgeError::ShutdownRetained` to keep `run_slot` from
         // matching and releasing it; it stays retained for evidence-based and
         // lease-expiry recovery.
-        let completion = async {
-            let evidence = execution?;
-            if operation_stop.is_cancelled() {
-                return Err(ForgeError::ShutdownRetained);
-            }
-            Ok(evidence)
-        }
-        .await;
+        //
+        // Durable settlement is the exception to both. `Settled` means the
+        // atomic task-and-operation transition has already committed, so a
+        // shutdown that raced it and a now-obsolete heartbeat conflict can
+        // neither undo it nor be retried into a different outcome: reporting
+        // either as this attempt's result would contradict durable state. The
+        // heartbeat is still cancelled and joined so no task is detached.
+        let settled_dispatch =
+            matches!(execution, Ok((_, ForgeExecutionEvidenceState::Settled, _)));
+        let completion = match execution {
+            Ok(evidence) if settled_dispatch || !operation_stop.is_cancelled() => Ok(evidence),
+            Ok(_) => Err(ForgeError::ShutdownRetained),
+            Err(error) => Err(error),
+        };
         operation_stop.cancel();
         let heartbeat_result = heartbeat.await.map_err(|error| ForgeError::Invariant {
             detail: format!("Forge claim heartbeat panicked: {error}"),
         })?;
-        heartbeat_result?;
+        if !settled_dispatch {
+            heartbeat_result?;
+        }
         let (evidence, state, volume) = completion?;
         self.settle_promotion_evidence(claim, binding, lease, &evidence, &state)
             .await?;
@@ -5607,35 +5721,51 @@ impl ForgeWorker {
         let tasks = self.tasks.clone();
         let operator_pool = self.forge.core.operator_pool.clone();
         let owner = self.owner;
+        // A production build never resolves this trigger: nothing outside the
+        // test-support observer holds a handle to it, so the extra select arm
+        // is inert and the loop keeps its interval-only behavior.
+        #[cfg(feature = "test-support")]
+        let beat_now = self.completion_observer.as_ref().map_or_else(
+            || Arc::new(tokio::sync::Notify::new()),
+            ForgeWorkerCompletionObserver::heartbeat_beat_signal,
+        );
+        #[cfg(not(feature = "test-support"))]
+        let beat_now = Arc::new(tokio::sync::Notify::new());
         Ok(tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             ticker.tick().await;
             loop {
-                tokio::select! {
+                let beat = tokio::select! {
                     biased;
-                    () = operation_stop.cancelled() => return Ok(()),
-                    _ = ticker.tick() => {
-                        if let Err(error) = tasks.heartbeat(task_id, attempt, owner, lease_seconds).await {
-                            operation_stop.cancel();
-                            authority_stop.cancel();
-                            return Err(ForgeError::Sql(error));
-                        }
-                        match lease.renew(&operator_pool).await {
-                            Ok(true) => {}
-                            Ok(false) => {
-                                operation_stop.cancel();
-                                authority_stop.cancel();
-                                return Err(ForgeError::FenceLost {
-                                    lease_key: lease.lease_key.clone(),
-                                });
-                            }
-                            Err(error) => {
-                                operation_stop.cancel();
-                                authority_stop.cancel();
-                                return Err(error);
-                            }
-                        }
+                    () = beat_now.notified() => true,
+                    () = operation_stop.cancelled() => false,
+                    _ = ticker.tick() => true,
+                };
+                if !beat {
+                    return Ok(());
+                }
+                if let Err(error) = tasks
+                    .heartbeat(task_id, attempt, owner, lease_seconds)
+                    .await
+                {
+                    operation_stop.cancel();
+                    authority_stop.cancel();
+                    return Err(ForgeError::Sql(error));
+                }
+                match lease.renew(&operator_pool).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        operation_stop.cancel();
+                        authority_stop.cancel();
+                        return Err(ForgeError::FenceLost {
+                            lease_key: lease.lease_key.clone(),
+                        });
+                    }
+                    Err(error) => {
+                        operation_stop.cancel();
+                        authority_stop.cancel();
+                        return Err(error);
                     }
                 }
             }

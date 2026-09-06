@@ -7,7 +7,7 @@
     "loud": "hero / landing only — 10px shadow, tricolor rail, serif display type"
   },
   "ownership": {
-    "$comment": "Blue is primary, lime is secondary. Fathom identity is carried by the ProductPill, the tinted panel head, and the label — NOT by owning a colour. See DESIGN.md 'Never colour alone': --ok and --danger collapse to 1.11:1 under deuteranopia, so no meaning in this system may rest on hue alone.",
+    "$comment": "Blue is primary, lime is secondary. See DESIGN.md 'Never colour alone': --ok and --danger collapse to 1.11:1 under deuteranopia, so no meaning in this system may rest on hue alone.",
     "primary": [
       "--brand",
       "--brand-strong",
@@ -40,12 +40,10 @@
         "--shadow",
         "--muted",
         "--text",
-        "--lime",
         "--r"
       ],
       "props": {
-        "variant": "quiet | raised | flat | wide",
-        "owner": "wyrd | fathom",
+        "variant": "quiet | raised | flat | wide | accent",
         "title": "string?",
         "children": "content"
       },
@@ -53,7 +51,8 @@
         "quiet",
         "raised",
         "flat",
-        "wide"
+        "wide",
+        "accent"
       ],
       "anatomy": [
         "head",
@@ -64,8 +63,8 @@
         "2px border always, 5px radius",
         "quiet = 3px shadow, raised = 6px shadow and marks the page's single attention surface, flat = no shadow for a subordinate block",
         "wide spans grid-column 1 / -1",
-        "container-type: inline-size so contained components respond to the panel, not the viewport",
-        "owner=fathom tints the head color-mix(--lime 26%, --surface), marking the content as Fathom-authored rather than Wyrd's. Its label is --text, NOT --ink-on-fill: the band lands on a dark olive in dark mode where near-black ink falls to 2.12:1."
+        "accent = the page's single dominant work region: 6px shadow plus a brand-tinted head color-mix(--brand-strong 14%, --surface); at most one accent panel per page",
+        "container-type: inline-size so contained components respond to the panel, not the viewport"
       ]
     },
     "Button": {
@@ -104,7 +103,7 @@
       ],
       "rules": [
         "primary = brand blue fill (--brand-btn) — the one strong action on a surface",
-        "secondary = lime fill — the second voice. Fathom-authored actions (open fix PR, re-run verification) use it, but it is NOT reserved to them; any genuine secondary action may take it.",
+        "secondary = lime fill — the second voice. Any genuine secondary action beside a blue primary may take it; it is signal, never decoration.",
         "ghost = surface fill, no accent",
         "href renders an <a> with identical treatment, so a catalog-safe view offers navigation without a callback crossing the contract",
         "fill is --brand-btn, never --brand: --brand is a dim navy panel colour in dark and pairs with --brand-btn-ink at 1.23:1",
@@ -128,12 +127,11 @@
         "--warn-text",
         "--danger-text",
         "--brand-strong",
-        "--lime-text",
         "--muted",
         "--surface"
       ],
       "props": {
-        "tone": "neutral | ok | warn | danger | running | fathom",
+        "tone": "neutral | ok | warn | danger | running",
         "children": "content"
       },
       "variants": [
@@ -141,8 +139,7 @@
         "ok",
         "warn",
         "danger",
-        "running",
-        "fathom"
+        "running"
       ],
       "anatomy": [
         "glyph",
@@ -152,9 +149,10 @@
         "tone is a status signal, not decoration",
         "tone drives border, label, and tint from one --bc custom property, and --bc is always a *-text token: raw --ok/--warn/--danger are fill colours and land at 3.01 / 2.28 / 3.94:1 as an 8.5px label on light",
         "2px border in tone colour, 12% tinted fill, 4px radius",
-        "MUST render an aria-hidden glyph before the label — ok=✓ warn=! danger=✕ running=● fathom=◈. --ok and --danger collapse to 1.11:1 under deuteranopia, so a colour-only badge makes pass and fail identical for ~6% of men.",
+        "MUST render an aria-hidden glyph before the label — ok=✓ warn=! danger=✕running=●. --ok and --danger collapse to 1.11:1 under deuteranopia, so a colour-only badge makes pass and fail identical for ~6% of men.",
         "neutral takes no glyph and no tint: 'neutral' means no status, and a 12% --muted wash lands at 4.46:1 in dark, which the contrast contract rejects"
-      ]
+      ],
+      "tones": []
     },
     "Chip": {
       "status": "built",
@@ -715,24 +713,21 @@
       "tokens": [
         "--brand-btn",
         "--brand-btn-ink",
-        "--lime",
-        "--lime-ink",
         "--border",
         "--r"
       ],
       "props": {
-        "product": "wyrd | fathom"
+        "product": "wyrd"
       },
       "variants": [
-        "wyrd",
-        "fathom"
+        "wyrd"
       ],
       "anatomy": [
         "label"
       ],
       "rules": [
         "uppercase --font-mono, 10px, 700, .08em tracking",
-        "wyrd = --brand-btn fill + --brand-btn-ink; fathom = --lime fill + --lime-ink",
+        "wyrd = --brand-btn fill + --brand-btn-ink",
         "the fill is --brand-btn, NOT --brand: --brand is a dim navy panel colour in dark mode and pairs with --brand-btn-ink at 1.23:1. --brand-btn holds ≥6.5:1 in both modes.",
         "2px border, 3px radius — sits immediately after the bohmian wordmark in the Topbar",
         "names the product layer the current surface belongs to; it is identity, never a control",

@@ -17,11 +17,11 @@
     "--surface":       { "group": "surface", "light": "#ffffff", "dark": "#12141c", "role": "card / table / header surface" },
     "--surface-2":     { "group": "surface", "light": "#eceadf", "dark": "#1a1d28", "role": "insets, hover, pills, code blocks" },
 
-    "--border":        { "group": "ink", "light": "#101014", "dark": "#252838", "role": "2px ink borders (always present, never hairline)" },
-    "--shadow":        { "group": "ink", "light": "#101014", "dark": "#1e2130", "role": "hard-offset zero-blur shadow color" },
+    "--border":        { "group": "ink", "light": "#101014", "dark": "#424866", "role": "2px ink borders (always present, never hairline). Dark stays quiet (~2:1 on surface) — visible structure without light-mode ink loudness" },
+    "--shadow":        { "group": "ink", "light": "#101014", "dark": "#050609", "role": "hard-offset zero-blur shadow color" },
 
     "--text":          { "group": "text", "light": "#101014", "dark": "#e6e4da", "role": "body text — LOCKED for readability (~17:1 light, ~14:1 dark). Do not re-tune." },
-    "--muted":         { "group": "text", "light": "#6b6b76", "dark": "#84879a", "role": "labels, metadata, secondary text" },
+    "--muted":         { "group": "text", "light": "#62626d", "dark": "#84879a", "role": "labels, metadata, secondary text" },
 
     "--brand":         { "group": "brand", "light": "#2745e8", "dark": "#1a2040", "role": "brand blue fill (button/chip), panel top-bar. Collapses onto --brand-strong in light and onto --brand-soft in dark; the tokens stay distinct because their roles differ per mode." },
     "--brand-strong":  { "group": "brand", "light": "#2745e8", "dark": "#7a8cff", "role": "links, selected refs, big stats, llm span kind, heat ramp" },
@@ -29,7 +29,7 @@
     "--brand-btn":     { "group": "brand", "light": "#2745e8", "dark": "#7a8cff", "role": "primary button fill" },
     "--brand-btn-ink": { "group": "brand", "light": "#ffffff", "dark": "#0b0c12", "role": "text on the primary button" },
 
-    "--lime":          { "group": "acid", "light": "#c5f23c", "dark": "#c5f23c", "role": "secondary accent — the second voice after brand blue. Fathom surfaces, the client/runtime plane, and secondary emphasis. Bright lime is a FILL only; it is 1.30:1 on white and can never be text or a thin bar there." },
+    "--lime":          { "group": "acid", "light": "#c5f23c", "dark": "#c5f23c", "role": "secondary accent — the second voice after brand blue. Secondary action fills, the client/runtime plane, and secondary emphasis. Bright lime is a FILL only; it is 1.30:1 on white and can never be text or a thin bar there." },
     "--lime-ink":      { "group": "acid", "light": "#101014", "dark": "#101014", "role": "text on lime fills (both modes — safe because --lime is mode-invariant)" },
     "--lime-text":     { "group": "acid", "light": "#4a7a06", "dark": "#c5f23c", "role": "lime as text or as a thin bar: raw lime on dark, darkened lime on light. 5.15:1 on white." },
 
@@ -65,7 +65,6 @@
     { "ink": "--brand-btn-ink", "fill": "--brand-btn", "min": 4.5, "role": "primary button label" },
     { "ink": "--lime-ink", "fill": "--lime", "min": 4.5, "role": "label on a lime fill" },
     { "ink": "--hero-ink", "fill": "--hero-bg", "min": 4.5, "role": "hero copy" },
-    { "ink": "--text", "fill": { "mix": ["--lime", "--surface"], "pct": 0.26 }, "min": 4.5, "role": "Fathom card head label" },
 
     { "ink": "--ok-text", "fill": { "mix": ["--ok-text", "--surface"], "pct": 0.12 }, "min": 4.5, "role": "ok badge label" },
     { "ink": "--warn-text", "fill": { "mix": ["--warn-text", "--surface"], "pct": 0.12 }, "min": 4.5, "role": "warn badge label" },

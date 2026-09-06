@@ -12,20 +12,20 @@ export function mockHome(tenant: Tenant): HomeView {
         detail: 'change_01 · CLAIM-3',
         age: '12m',
         href: `${base}/changes/change_01`,
-        status: 'Attention',
+        status: 'Action',
         tone: 'warn'
       },
       {
-        title: 'change_03 · draft missing subjects',
-        detail: 'you own this draft',
+        title: 'Split ledger write path — draft missing subjects',
+        detail: 'change_03 · you own this draft',
         age: '1d',
         href: `${base}/changes/change_03`,
         status: 'Draft',
         tone: 'neutral'
       },
       {
-        title: 'card_service_05 · fraud-api unowned',
-        detail: 'policy / ownership',
+        title: 'fraud-api Card unowned',
+        detail: 'card_service_05 · ownership',
         age: '4h',
         href: `${base}/cards/card_service_05`,
         status: 'Action',

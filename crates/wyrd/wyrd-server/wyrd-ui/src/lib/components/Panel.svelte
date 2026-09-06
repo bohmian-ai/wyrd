@@ -5,24 +5,23 @@
   // record, and a panel is only a surface it may be drawn on. Altitude is the panel's
   // job in the page — quiet is the default, raised marks the single attention surface,
   // flat is a subordinate block, wide spans the grid.
-  type Variant = 'quiet' | 'raised' | 'flat' | 'wide';
-  type Owner = 'wyrd' | 'fathom';
+  // `accent` marks the page's single dominant work region with a brand-tinted head —
+  // at most one accent panel per page, the way GitHub treats its merge box.
+  type Variant = 'quiet' | 'raised' | 'flat' | 'wide' | 'accent';
   let {
     variant = 'quiet',
-    owner = 'wyrd',
     title,
     head,
     children
   }: {
     variant?: Variant;
-    owner?: Owner;
     title?: string;
     head?: Snippet;
     children?: Snippet;
   } = $props();
 </script>
 
-<section class="wy-panel" data-variant={variant} data-owner={owner}>
+<section class="wy-panel" data-variant={variant}>
   {#if title || head}
     <header class="wy-panel-head">
       {#if title}<span class="t">{title}</span>{/if}
@@ -64,11 +63,12 @@
     font: 700 13px var(--font-sans);
     color: var(--text);
   }
-  /* owner=fathom tints the head, marking the content as Fathom-authored. Its label stays
-     --text, NOT --ink-on-fill: the band lands on a dark olive in dark mode. */
-  .wy-panel[data-owner='fathom'] .wy-panel-head {
-    background: color-mix(in srgb, var(--lime) 26%, var(--surface));
-    color: var(--text);
+  /* accent = the page's dominant panel: raised altitude plus a brand-tinted head. */
+  .wy-panel[data-variant='accent'] {
+    box-shadow: 6px 6px 0 0 var(--shadow);
+  }
+  .wy-panel[data-variant='accent'] .wy-panel-head {
+    background: color-mix(in srgb, var(--brand-strong) 14%, var(--surface));
   }
   .wy-panel-body {
     padding: 16px;

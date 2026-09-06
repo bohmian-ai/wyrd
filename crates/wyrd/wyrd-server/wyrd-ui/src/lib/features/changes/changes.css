@@ -6,7 +6,7 @@
   --sep: color-mix(in srgb, var(--border) 30%, var(--surface));
 }
 .changes h1 {
-  font: 700 22px var(--font-display);
+  font: 700 26px var(--font-display);
   margin: 0 0 10px;
 }
 .changes h2 {
@@ -79,6 +79,54 @@
   background: var(--brand-btn);
   color: var(--brand-btn-ink);
   box-shadow: 3px 3px 0 var(--shadow);
+}
+/* Lime is the second voice: a genuine secondary action beside a blue primary. */
+.changes .secondary {
+  background: var(--lime);
+  color: var(--lime-ink);
+  box-shadow: 3px 3px 0 var(--shadow);
+}
+/* Interaction life: rows wash, controls react, presses collapse the hard shadow. */
+.changes tbody tr,
+.changes .control,
+.changes .nav a {
+  transition:
+    background 120ms ease,
+    box-shadow 120ms ease,
+    transform 120ms ease,
+    color 120ms ease;
+}
+.changes tbody tr:hover {
+  background: var(--brand-soft);
+}
+.changes .control:hover {
+  background: var(--brand-soft);
+}
+.changes .primary:hover {
+  background: var(--brand-btn);
+  box-shadow: 4px 4px 0 var(--shadow);
+}
+.changes .secondary:hover {
+  background: var(--lime);
+  box-shadow: 4px 4px 0 var(--shadow);
+}
+.changes button.control:active {
+  transform: translate(2px, 2px);
+}
+.changes button.primary:active,
+.changes button.secondary:active {
+  box-shadow: 1px 1px 0 var(--shadow);
+}
+.changes .nav a:hover {
+  background: var(--surface-2);
+  color: var(--text);
+}
+@media (prefers-reduced-motion: reduce) {
+  .changes tbody tr,
+  .changes .control,
+  .changes .nav a {
+    transition: none;
+  }
 }
 .changes button:disabled {
   cursor: not-allowed;
@@ -184,8 +232,12 @@
 }
 .changes .table-title {
   display: block;
-  font: 600 13px var(--font-sans);
+  font: 700 15px var(--font-sans);
   margin: 6px 0;
+}
+/* Prose stays prose: "waiting on …" is a sentence, not an identifier. */
+.changes .waiting {
+  font: 12px var(--font-sans);
 }
 .changes .footer {
   position: sticky;

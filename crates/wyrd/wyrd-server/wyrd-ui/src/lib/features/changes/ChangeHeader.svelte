@@ -21,7 +21,7 @@
 <details class="change-details" bind:open={expanded}>
  <summary class="compact-details">Revision details · navigation · Override: {change.override === 'None' ? 'none' : 'authorized, not verified'}</summary>
 <header class="stack change-header">
-  <div class="row between"><h1>{change.title}</h1><div class="row">{#if view.capabilities.review}<a class="control primary" href={`${base}${suffix}#submit-review`}>Review changes ▾</a>{/if}{#if view.capabilities.write}<details><summary class="control" aria-label="Change actions">⋯</summary><div class="menu"><a href={`${base}${suffix}#close`}>Close Change Request</a></div></details>{/if}</div></div>
+  <div class="row between"><h1>{change.title}</h1><div class="row">{#if view.capabilities.review}<a class="control primary" href={`${base}${suffix}#submit-review`}>Review changes</a>{/if}{#if view.capabilities.write}<details><summary class="control" aria-label="Change actions">⋯</summary><div class="menu"><a href={`${base}${suffix}#close`}>Close Change Request</a></div></details>{/if}</div></div>
   <div class="row meta"><Badge tone={change.lifecycle === 'open' ? 'running' : 'neutral'}>{change.lifecycle === 'open' ? '' : '○ '}{change.lifecycle}</Badge><span class="mono muted">{change.id} · revision {change.revisionNumber} · opened by {change.author}</span></div>
 
 </header>

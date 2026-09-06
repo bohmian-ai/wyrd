@@ -41,7 +41,9 @@ test('request hook rejects expiry and disabled local identity before tenant load
     locals: {},
     params: { tenantKey: 'acme' },
     cookies,
-    setHeaders: vi.fn()
+    setHeaders: vi.fn(),
+    request: new Request('http://localhost/t/acme', { method: 'POST' }),
+    isDataRequest: false
   } as unknown as Parameters<typeof handle>[0]['event'];
   await expect(handle({ event, resolve })).rejects.toMatchObject({
     status: 401,
@@ -49,6 +51,16 @@ test('request hook rejects expiry and disabled local identity before tenant load
   });
   expect(resolve).not.toHaveBeenCalled();
   expect(cookies.delete).toHaveBeenCalledWith('wyrd_session', { path: '/' });
+  // A plain page load with a dead session is a normal flow — it goes to sign-in.
+  const pageEvent = {
+    ...event,
+    request: new Request('http://localhost/t/acme', { method: 'GET' })
+  } as unknown as Parameters<typeof handle>[0]['event'];
+  await expect(handle({ event: pageEvent, resolve })).rejects.toMatchObject({
+    status: 303,
+    location: '/'
+  });
+  expect(resolve).not.toHaveBeenCalled();
   const id = sessions.create();
   cookies.get.mockReturnValue(id);
   env.WYRD_UI_LOCAL_AUTH = 'false';

@@ -13,8 +13,7 @@ test('pairs a glyph with every status tone', () => {
     ['ok', '✓'],
     ['warn', '!'],
     ['danger', '✕'],
-    ['running', '●'],
-    ['fathom', '◈']
+    ['running', '●']
   ] as const) {
     const { container } = render(Badge, { props: { tone } });
     const gl = container.querySelector('.wy-badge .gl');

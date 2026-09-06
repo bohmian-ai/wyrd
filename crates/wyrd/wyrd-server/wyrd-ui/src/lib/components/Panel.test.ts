@@ -6,7 +6,6 @@ test('defaults to the quiet wyrd panel', () => {
   const { container } = render(Panel, { props: {} });
   const panel = container.querySelector('.wy-panel');
   expect(panel).toHaveAttribute('data-variant', 'quiet');
-  expect(panel).toHaveAttribute('data-owner', 'wyrd');
 });
 
 test('renders a head only when a title or head snippet is supplied', () => {
@@ -17,9 +16,8 @@ test('renders a head only when a title or head snippet is supplied', () => {
   expect(titled.container.querySelector('.wy-panel-head .t')?.textContent).toBe('Verification');
 });
 
-test('applies the raised altitude and the fathom owner', () => {
-  const { container } = render(Panel, { props: { variant: 'raised', owner: 'fathom' } });
+test('applies the raised altitude', () => {
+  const { container } = render(Panel, { props: { variant: 'raised' } });
   const panel = container.querySelector('.wy-panel');
   expect(panel).toHaveAttribute('data-variant', 'raised');
-  expect(panel).toHaveAttribute('data-owner', 'fathom');
 });

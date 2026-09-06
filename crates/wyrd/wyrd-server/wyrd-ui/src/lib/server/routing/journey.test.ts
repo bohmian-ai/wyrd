@@ -57,8 +57,9 @@ test('real browser-facing loads and actions contain credentials, enforce CSRF, a
   expect(entryHtml).toContain('Sign in with SSO');
   expect(entryHtml).not.toContain('Research');
   expect(entryHtml).toContain('Mock data: On');
-  const unauthenticated = await fetch(`${origin}/t/acme`);
-  expect(unauthenticated.status).toBe(401);
+  const unauthenticated = await fetch(`${origin}/t/acme`, { redirect: 'manual' });
+  expect(unauthenticated.status).toBe(303);
+  expect(unauthenticated.headers.get('location')).toBe('/');
   const login = await fetch(`${origin}/?/login`, {
     method: 'POST',
     headers: {
@@ -146,7 +147,9 @@ test('real browser-facing loads and actions contain credentials, enforce CSRF, a
     redirect: 'manual'
   });
   expect(logout.status).toBe(303);
-  expect((await fetch(`${origin}/t/acme`, { headers: { cookie } })).status).toBe(401);
+  const afterLogout = await fetch(`${origin}/t/acme`, { headers: { cookie }, redirect: 'manual' });
+  expect(afterLogout.status).toBe(303);
+  expect(afterLogout.headers.get('location')).toBe('/');
 }, 30_000);
 
 test('mock SSO resolves configured organization and dev access scenarios without anonymous tenant discovery', async () => {
@@ -171,7 +174,9 @@ test('mock SSO resolves configured organization and dev access scenarios without
   expect((await post('loginScenario', { scenario: 'none' }, cookie)).status).toBe(403);
   const scenario = await post('loginScenario', { scenario: 'none', csrf }, cookie);
   expect(scenario.status).toBe(303);
-  expect((await fetch(`${origin}/t/acme`, { headers: { cookie } })).status).toBe(401);
+  const revoked = await fetch(`${origin}/t/acme`, { headers: { cookie }, redirect: 'manual' });
+  expect(revoked.status).toBe(303);
+  expect(revoked.headers.get('location')).toBe('/');
   const selection = scenario.headers
     .getSetCookie()
     .find((value) => value.startsWith('wyrd_ui_login_scenario='))!

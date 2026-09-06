@@ -4,7 +4,7 @@ import Topbar from './Topbar.svelte';
 
 test('renders breadcrumbs with the last one marked current', () => {
   const { container } = render(Topbar, {
-    props: { crumbs: ['registry', 'cards', 'fathom-wf'] }
+    props: { crumbs: ['registry', 'cards', 'checkout-wf'] }
   });
   const crumbs = container.querySelectorAll('.crumb');
   expect(crumbs).toHaveLength(3);

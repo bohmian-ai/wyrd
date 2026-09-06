@@ -166,7 +166,7 @@ describe('catalog prop safety', () => {
 
 describe('status and async states are readable without colour', () => {
   test('every status tone pairs a glyph with its text label', () => {
-    for (const tone of ['ok', 'warn', 'danger', 'running', 'fathom'] as const) {
+    for (const tone of ['ok', 'warn', 'danger', 'running'] as const) {
       const { container } = render(Badge, { props: { tone } });
       const badge = container.querySelector('.wy-badge');
       expect(badge?.querySelector('.gl')?.textContent?.trim()).not.toBe('');

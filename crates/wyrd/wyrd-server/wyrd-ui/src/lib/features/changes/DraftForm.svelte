@@ -30,6 +30,7 @@
     result?: ActionResult | null;
   } = $props();
   let draft = $state<Draft>(untrack(() => structuredClone(initial)));
+  let unresolvedSubjects = $derived(draft.subjects.filter(subject => !subject.base || !subject.candidate).length);
   let busy = $state(false);
   $effect(() => {
     if (result?.draft) draft = structuredClone(result.draft);
@@ -66,7 +67,7 @@
       {#each draft.subjects as subject, i (subject.id)}<div class="subject-row"><div class="row between mono"><strong>{subject.repository || 'New subject'}</strong><span>{subject.provider} · {subject.pr ? `#${subject.pr}` : 'No PR'}</span><span>{subject.base || '—'} → {subject.candidate || '—'}</span><span>{subject.candidate ? '✓ Resolved' : '✕ Missing candidate'}</span></div><div class="row"><details open={!subject.repository}><summary>{subject.candidate ? 'Edit' : 'Repair'}</summary><div class="fields divider"><label>Repository<input bind:value={subject.repository} /></label><label>Provider<input bind:value={subject.provider} /></label><label>Base commit<input bind:value={subject.base} /></label><label>Candidate commit<input bind:value={subject.candidate} /></label><label>Pull request<input bind:value={subject.pr} /></label><label>Provider URL<input type="url" bind:value={subject.url} /></label></div></details><button type="button" class="text-action" onclick={() => draft.subjects.splice(i,1)}>Remove</button></div>{#if !subject.candidate}<p class="error">No candidate commit — repair this subject. The draft still saves.</p>{/if}</div>{/each}
       <button class="control" type="button" onclick={addSubject}>+ Add by exact commits</button></div></Panel>
     <Panel title="3 · Claims and Verifiers"><details bind:open={claimsOpen}><summary>{draft.claims.length} Claims · edit requirements</summary><div class="stack">{#each draft.claims as claim, i (claim.id)}<div class="claim-row"><label class="claim-name">Claim<input bind:value={claim.title} /></label>{#each claim.checks as check, j}<div class="check-fields"><label>Requirement<select bind:value={check.required}><option value={true}>Required</option><option value={false}>Advisory</option></select></label><label>Verifier<select bind:value={check.name}><option value="">Select Verifier</option>{#each verifiers as verifier}<option value={verifier.name}>{verifier.name} v{verifier.version}{verifier.billable ? " · billable" : ""}</option>{/each}</select></label><label>Mode<select bind:value={check.mode}><option value="manual">Manual</option><option value="on-new-evidence">On new evidence</option></select></label><button type="button" class="text-action" onclick={() => claim.checks.splice(j,1)}>Remove Verifier</button></div>{/each}<details><summary>Edit requirements</summary><div class="row"><button type="button" class="control" onclick={() => claim.checks.push({ name: '', required: true, mode: 'manual', billable: true })}>+ Add Verifier</button><button type="button" class="control" onclick={() => draft.claims.splice(i,1)}>Remove Claim</button></div></details></div>{/each}<button type="button" class="control" onclick={addClaim}>+ Add Claim</button></div></details></Panel>
-  </div><aside class="stack"><Panel title="Progress"><p>○ Draft — all sections stay editable</p><p>{draft.subjects.filter(subject => !subject.base || !subject.candidate).length} subjects need an exact commit pair.</p></Panel><Panel title="Owners and teams"><div class="stack"><label>Owner<input name="owner" bind:value={draft.owner} /></label><label>Participating teams<textarea name="teams" bind:value={draft.teams} rows="3"></textarea></label></div></Panel><StateBlock state="absent" title="Evidence" detail="Evidence acceptance becomes available after a revision and an exact subject resolve." /></aside></div>
+  </div><aside class="stack"><Panel title="Progress"><p>○ Draft — all sections stay editable</p>{#if unresolvedSubjects === 1}<p>1 subject needs an exact commit pair.</p>{:else if unresolvedSubjects > 1}<p>{unresolvedSubjects} subjects need an exact commit pair.</p>{/if}</Panel><Panel title="Owners and teams"><div class="stack"><label>Owner<input name="owner" bind:value={draft.owner} /></label><label>Participating teams<textarea name="teams" bind:value={draft.teams} rows="3"></textarea></label></div></Panel><StateBlock state="absent" title="Evidence" detail="Evidence acceptance becomes available after a revision and an exact subject resolve." /></aside></div>
   <div class="footer row"><button class="control primary" disabled={busy}>{busy ? 'Saving…' : 'Save draft'}</button><a href={base}>Discard</a><div class="cost-warning"><strong>! Billable mode</strong><p>On new evidence can start a paid run without further confirmation. Manual runs require confirmation.</p></div></div>
 </form>
 <style>
@@ -77,12 +78,12 @@
     min-height: 36px;
   }
   .draft label {
-    font-size: 10px;
+    font-size: 11px;
     gap: 4px;
   }
   .draft :is(input, select, textarea) {
     padding: 5px;
-    font-size: 11px;
+    font-size: 12px;
   }
   .pr-url {
     flex: 1;

@@ -4,7 +4,7 @@
   // Status is never carried by colour alone: --ok and --danger collapse to 1.11:1 under
   // deuteranopia, so every non-neutral tone pairs a glyph with its text label. `neutral`
   // means "no status" and therefore takes neither a glyph nor a tint.
-  type Tone = 'neutral' | 'ok' | 'warn' | 'danger' | 'running' | 'fathom';
+  type Tone = 'neutral' | 'ok' | 'warn' | 'danger' | 'running';
   let { tone = 'neutral', children }: { tone?: Tone; children?: Snippet } = $props();
 
   const glyphs: Record<Tone, string> = {
@@ -12,8 +12,7 @@
     ok: '✓',
     warn: '!',
     danger: '✕',
-    running: '●',
-    fathom: '◈'
+    running: '●'
   };
 </script>
 
@@ -55,9 +54,6 @@
   }
   .wy-badge[data-tone='running'] {
     --bc: var(--brand-strong);
-  }
-  .wy-badge[data-tone='fathom'] {
-    --bc: var(--lime-text);
   }
   .gl {
     font-size: 9px;

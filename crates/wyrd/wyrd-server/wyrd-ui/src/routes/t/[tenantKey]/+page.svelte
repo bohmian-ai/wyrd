@@ -25,7 +25,7 @@
   <div class="home-grid">
     <div class="work">
       <div class="attention">
-        <Panel variant="raised">
+        <Panel variant="accent">
           {#snippet head()}<h2>Requires your action</h2><span>{data.home.attention.length} items</span>{/snippet}
           {#if data.home.attention.length}
             <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
@@ -74,7 +74,7 @@
       {#each data.home.summaries as item (item.href)}
         <Panel variant="flat">
           {#snippet head()}<h2>{item.label}</h2>{/snippet}
-          <div class="summary">
+          <div class="summary" class:lime={item.label === 'Observe'}>
             <strong>{item.signal ? '! ' : ''}{fmtCount(item.value)} {item.unit}</strong>
             <p>{item.detail}</p>
             <a href={item.href}>Open {item.label} →</a>
@@ -166,6 +166,11 @@
   .attention :global(.wy-panel) {
     min-height: 214px;
   }
+  /* Observe is the client/runtime plane — its numeral carries the lime voice, with the
+     "!" glyph and label as the textual channel. */
+  .summary.lime strong {
+    color: var(--lime-text);
+  }
   .work :global(.wy-panel-body) {
     padding: 0 10px 10px;
   }
@@ -195,6 +200,17 @@
     height: 38px;
     border-bottom: 2px solid var(--surface-2);
   }
+  tbody tr {
+    transition: background 120ms ease;
+  }
+  tbody tr:hover {
+    background: var(--brand-soft);
+  }
+  @media (prefers-reduced-motion: reduce) {
+    tbody tr {
+      transition: none;
+    }
+  }
   tr:last-child td {
     border-bottom: 0;
   }
@@ -203,8 +219,9 @@
     padding-left: 12px;
     padding-right: 8px;
   }
-  .attention-table tr:first-child a,
-  .changes-table tr:first-child a {
+  /* Every row leads with its human-readable title; identifiers live in the muted column. */
+  .attention-table a,
+  .changes-table a {
     font-weight: 700;
   }
   table {

@@ -74,7 +74,6 @@
           <Badge tone="warn">stale</Badge>
           <Badge tone="danger">failed</Badge>
           <Badge tone="running">running</Badge>
-          <Badge tone="fathom">fathom</Badge>
         </div>
       </Panel>
 

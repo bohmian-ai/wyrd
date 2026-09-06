@@ -19,17 +19,13 @@ that parity check until they are.
 
 ---
 
-## The two layers
+## The two voices
 
-bohmian ships two products, and the UI must make which one you are looking at obvious
-without a label.
+The palette has two accent voices, and every accent decision starts by picking one.
 
-- **Wyrd** — the record. Observes and governs. Cards, lineage, drift, traces, evals,
-  policy, audit. **Wyrd is blue.**
-- **Fathom** — the intelligence. Verifies. Reviews changes, gates deploys, opens fix PRs,
-  and renders verdicts *on top of* Wyrd's record. **Fathom is lime.**
-
-The lifecycle is 1 + 2, not 3 — Fathom sits on top of Wyrd. Wyrd sees; Fathom judges.
+- **Blue** is primary — Wyrd's identity, the one strong action, links, selection, ramps.
+- **Lime** is secondary — the second voice: secondary actions, the client/runtime plane,
+  second-voice emphasis. Never decoration.
 
 ---
 
@@ -41,6 +37,11 @@ The lifecycle is 1 + 2, not 3 — Fathom sits on top of Wyrd. Wyrd sees; Fathom 
 - Light and dark are **the same geometry**, different palette/atmosphere. Light is warm
   paper (`#f2f0ea`), dark is a flat blue-cast near-black (`#0b0c12`) — no CRT, scanlines,
   vignette, glow, or phosphor.
+- One geometry, **two intensities**. Light renders the geometry in ink: near-black borders
+  and hard shadows carry the neobrutalist signature. Dark renders the same geometry
+  quietly: `--border` sits near 2:1 against `--surface` — enough for panel structure to
+  read at a glance during long sessions, never light-mode loudness. Do not "fix" dark mode
+  by pushing its borders toward ink; the workbench is stared at for hours.
 - Mode is applied via a `data-mode="light|dark"` attribute (see `ModeProvider.svelte`). It
   cascades, so nested subtrees can pin a mode (the styleguide shows both at once).
 - Regenerate `theme.css` after any token edit: `node brand/gen-theme.mjs`. Drift is
@@ -207,19 +208,14 @@ selected refs, the `llm` span kind, hero, the one strong action, and **all
 sequential/heat ramps**.
 
 **Lime `#c5f23c` is the secondary accent** — the second voice after blue. It carries
-Fathom surfaces, the client/runtime plane, and secondary emphasis.
-
-Fathom's identity does **not** rest on owning lime. It is carried by the things that
-actually say so: the `FATHOM` product pill, the tinted card head, and the label. That is
-deliberate — a colour monopoly is a fragile way to encode authorship, and the
-colour-vision data below shows why no meaning in this system may rest on hue alone.
+secondary action fills, the client/runtime plane, and secondary emphasis. It marks a
+genuine second action beside a blue primary; it is never a wash, a hover, or decoration.
 
 ### Bright lime is a fill, never a mark
 
 `--lime` is **1.30:1 on white**. It cannot be text, and it cannot be a thin bar, on any
 light surface. Use `--lime-text` (`#4a7a06` light / `#c5f23c` dark) for anything that
-needs lime as a *mark* rather than a *field*. The client plane is defined this way, and
-so is Fathom text.
+needs lime as a *mark* rather than a *field*. The client plane is defined this way.
 
 ### Two ink traps, both verified
 
@@ -305,7 +301,8 @@ The client plane is **lime, mode-split**: `#4a7a06` light / `#c5f23c` dark. Raw 
 the same one `--lime-text` uses. This is deliberately the *same colour* as the secondary
 accent, not a near-miss of it.
 
-> A previous revision used olive `#8aa829` here, to hold lime in reserve for Fathom. It was
+> A previous revision used olive `#8aa829` here, to keep the client plane distinct from
+> the secondary accent. It was
 > withdrawn on measurement: 2.72:1 on white (below the 3:1 non-text floor), only 1.07:1
 > luminance separation from amber, and — decisively — **0.7° of hue from `--lime`**. It was
 > not a distinct colour, it was lime pretending to be one.
@@ -400,4 +397,4 @@ Recorded so nobody re-adds it by accident.
 - **`Archivo Black`.** Replaced by Space Grotesk 700, which holds up better at KPI sizes.
 - **`wordmark.svg`.** The wordmark is typeset (see above); the old asset was also off-palette.
 - **The `rune` button variant.** It was the violet twin of `primary`; `primary` is now blue
-  and the second variant slot belongs to `fathom`.
+  and the second variant slot is the lime `secondary`.

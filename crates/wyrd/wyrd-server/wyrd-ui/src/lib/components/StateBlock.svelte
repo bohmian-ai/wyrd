@@ -36,6 +36,16 @@
   role={state === 'loading' ? 'status' : 'note'}
   aria-busy={state === 'loading' ? 'true' : undefined}
 >
+  {#if state === 'empty'}
+    <!-- The brand's node-and-curve motif, whispered behind quiet-empty regions only. -->
+    <svg class="bg" aria-hidden="true" viewBox="0 0 320 120" preserveAspectRatio="xMaxYMid slice">
+      <path d="M0 90 C 80 90, 120 30, 200 30 S 300 70, 320 70" fill="none" stroke="var(--brand-strong)" stroke-width="1.5" />
+      <path d="M0 30 C 90 30, 150 100, 240 100 S 310 40, 320 40" fill="none" stroke="var(--lime-text)" stroke-width="1.5" />
+      <circle cx="200" cy="30" r="4" fill="var(--brand-strong)" />
+      <circle cx="240" cy="100" r="4" fill="var(--lime-text)" />
+      <rect x="112" y="58" width="9" height="9" rx="2" fill="var(--muted)" />
+    </svg>
+  {/if}
   <div class="hd">
     <span class="gl" aria-hidden="true">{glyphs[state]}</span>
     <span class="st">{state}</span>
@@ -49,12 +59,28 @@
 <style>
   .wy-state {
     --sc: var(--muted);
+    position: relative;
+    overflow: hidden;
     border: 2px dashed var(--sc);
     border-radius: var(--r);
     background: var(--surface);
     padding: 14px;
     color: var(--text);
     font-family: var(--font-sans);
+  }
+  .bg {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    opacity: 0.14;
+    pointer-events: none;
+  }
+  .hd,
+  .d,
+  .c,
+  .a {
+    position: relative;
   }
   .wy-state[data-state='error'] {
     --sc: var(--danger-text);

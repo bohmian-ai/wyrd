@@ -243,3 +243,28 @@ The original review and failed screenshots are preserved for comparison.
 [APPROVE](../evidence/TASK-004-remediation-review.md) for the original base through
 `7a4d76ecd1be75f030ee0ac416b60cd94058d4c4`. All five finding IDs are closed.
 This task approval does not complete the broader change or authorize deployment.
+
+
+## User-directed visual revisions after approval — 2026-09-06
+
+Three commits after the approved candidate revise the workspace's visual
+treatment at the user's direction, following two live-browser design audits:
+
+- `c7c67548` — GitHub-style panel anatomy applied globally; Change workspace
+  revisions consolidated.
+- `ad85e99b` — audit revisions (dark hard shadows, `accent` panel variant,
+  Verification status washes, lime Observe numeral, interaction states, type
+  hierarchy) and retirement of the Fathom ownership machinery: lime is now the
+  plain secondary accent, applied to verifier run and revision actions.
+- `e7bc19f1` — theme mode persisted in a `wyrd-mode` cookie so SSR paints the
+  chosen theme without a hydration repaint.
+
+These revisions intentionally supersede the Fathom-era treatment in the locked
+artboards (`CRW-01`–`CRW-07`, `golden-CR-04.svg`): the artboards remain the
+authority for information hierarchy, regions, routes, states, and action
+placement, but panel accents, secondary-action colour, and Fathom ownership
+markers now follow the updated `brand/` authority (`DESIGN.md`, `palette.json`,
+`components.json`) committed in `ad85e99b`. Change review should evaluate
+visual conformance against that current brand authority, not against the
+superseded artboard styling. Verification after each commit: Svelte check
+0 errors / 0 warnings, 112 UI tests passed, production build passed.

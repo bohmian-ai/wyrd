@@ -5256,6 +5256,17 @@ fn prune_assignments_by_event_time(assignments: &mut HashMap<String, FollowerSca
     }
 }
 
+/// Splits every signed assignment's persisted files across the selected Oracle
+/// workers and specializes each copy for the worker that will execute it.
+///
+/// Partitioning is deterministic, complete, and disjoint over the input file
+/// list, so the union of the returned partitions is exactly the input union and
+/// no worker is signed to read another's object. Each specialized cut also
+/// carries its own worker's `worker_fence` as `target_epoch_fence`: a follower
+/// that restarted independently holds a different fence than the leader, and it
+/// refuses any cut that does not name its current epoch. Specialization happens
+/// here, before the assignment digest and ticket signature cover the result, so
+/// the targeted fence is part of what the dispatcher signs.
 fn partition_oracle_assignments(
     assignments: &[FollowerScanAssignment],
     workers: &[dispatcher::DispatchCandidate],
@@ -5276,9 +5287,12 @@ fn partition_oracle_assignments(
             wyrd_spec::vala::api::PersistedFileDescriptor::size_bytes,
             |descriptor| descriptor.path().as_bytes().to_vec(),
         );
-        for (partition, files) in partitions.iter_mut().zip(specialized_files) {
+        for ((partition, files), worker) in
+            partitions.iter_mut().zip(specialized_files).zip(workers)
+        {
             let mut specialized = assignment.clone();
             specialized.persisted.files = files;
+            specialized.reader_cut.target_epoch_fence = worker.worker_fence;
             partition.push(specialized);
         }
     }
@@ -5776,11 +5790,11 @@ mod tests {
             test_persisted_assignment("spans", &["a", "b", "c"]),
             test_persisted_assignment("observations", &["d"]),
         ];
-        let workers = (1..=4)
+        let workers = (1_u64..=4)
             .map(|node| dispatcher::DispatchCandidate {
-                node_id: NodeId::new(uuid::Uuid::from_u128(node)),
+                node_id: NodeId::new(uuid::Uuid::from_u128(u128::from(node))),
                 role: wyrd_spec::vala::api::ClusterRole::Oracle,
-                worker_fence: 1,
+                worker_fence: node * 10,
                 endpoint: None,
             })
             .collect::<Vec<_>>();
@@ -5790,6 +5804,14 @@ mod tests {
             partition_oracle_assignments(&originals, &workers)
         );
         assert_eq!(partitions.len(), 4);
+        for (partition, worker) in partitions.iter().zip(&workers) {
+            for assignment in partition {
+                assert_eq!(
+                    assignment.reader_cut.target_epoch_fence, worker.worker_fence,
+                    "every cut targets the epoch of the worker that will execute it"
+                );
+            }
+        }
         for (scan_ordinal, original) in originals.iter().enumerate() {
             let worker_files = partitions
                 .iter()

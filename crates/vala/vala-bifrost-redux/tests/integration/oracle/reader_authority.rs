@@ -1062,21 +1062,21 @@ async fn unjoined_descendants_terminate_at_the_caller_deadline() {
     drop(guard);
 }
 
-/// Registers one more Oracle node and starts its activated epoch.
+/// Registers one Oracle role row for `node_id` and returns its current fence.
 ///
-/// Each node in this journey needs its own fenced role row, because protection
-/// is keyed by node and fence: a follower must be able to protect the same
-/// table the leader protects, under its own epoch, without touching the
-/// leader's row.
+/// A repeated registration for the same node is exactly one replacement: the
+/// role row's fencing token advances, which is how this journey gives its
+/// follower an epoch fence that differs from the leader's without inventing a
+/// token the cluster never issued.
 ///
 /// # Panics
 ///
-/// Panics when registration, acquisition, or activation fails.
-async fn oracle_epoch(
+/// Panics when the registration cannot commit.
+async fn register_oracle_role(
     fixture: &forge_support::PromotionIntegrationFixture,
+    node_id: Uuid,
     address: &str,
-) -> (Arc<OracleReaderAuthority>, Uuid, u64) {
-    let node_id = Uuid::now_v7();
+) -> u64 {
     let mut conn = fixture
         .vala
         .tenant_conn(DataTenantId::SYSTEM_OWNER)
@@ -1108,7 +1108,29 @@ async fn oracle_epoch(
         .await
         .expect("oracle role registers");
     conn.commit().await.expect("registration commits");
-    let fence = row.lease.fencing_token;
+    row.lease.fencing_token
+}
+
+/// Registers one more Oracle node and starts its activated epoch.
+///
+/// Each node in this journey needs its own fenced role row, because protection
+/// is keyed by node and fence: a follower must be able to protect the same
+/// table the leader protects, under its own epoch, without touching the
+/// leader's row.
+///
+/// # Panics
+///
+/// Panics when registration, acquisition, or activation fails.
+async fn oracle_epoch(
+    fixture: &forge_support::PromotionIntegrationFixture,
+    address: &str,
+    registrations: usize,
+) -> (Arc<OracleReaderAuthority>, Uuid, u64) {
+    let node_id = Uuid::now_v7();
+    let mut fence = 0_u64;
+    for _ in 0..registrations {
+        fence = register_oracle_role(fixture, node_id, address).await;
+    }
     let authority = OracleReaderAuthority::start(OracleReaderAuthorityConfig {
         vala: fixture.vala.clone(),
         operator_pool: fixture.operator_pool.clone(),
@@ -1186,9 +1208,13 @@ async fn leader_and_followers_protect_before_io_and_join_before_release() {
     let fixture = forge_support::PromotionIntegrationFixture::start("reader_journey").await;
     commit_one_snapshot(&fixture).await;
     let (leader, leader_node, leader_fence) =
-        oracle_epoch(&fixture, "http://oracle-leader:5002").await;
+        oracle_epoch(&fixture, "http://oracle-leader:5002", 1).await;
     let (follower, follower_node, follower_fence) =
-        oracle_epoch(&fixture, "http://oracle-follower:5002").await;
+        oracle_epoch(&fixture, "http://oracle-follower:5002", 2).await;
+    assert_ne!(
+        follower_fence, leader_fence,
+        "the follower restarted independently and runs under its own epoch fence"
+    );
 
     // Identity resolution is metadata-only: it names the cut and protects nothing.
     let prepared = fixture
@@ -1227,7 +1253,7 @@ async fn leader_and_followers_protect_before_io_and_join_before_release() {
     );
 
     let signed =
-        vala_bifrost_redux::oracle::reader_pins::follower_reader_cut(&pinned, leader_fence)
+        vala_bifrost_redux::oracle::reader_pins::follower_reader_cut(&pinned, follower_fence)
             .expect("the pinned cut signs")
             .expect("a committed snapshot signs a follower cut");
     follower_protection_precedes_resolution(
@@ -1559,7 +1585,7 @@ async fn narrowing_retries_once_and_covered_duplicates_need_no_sql() {
 #[tokio::test]
 async fn catalog_promotion_between_prepare_and_materialize_restarts_all_tables() {
     let fixture = forge_support::PromotionIntegrationFixture::start("reader_revalidate").await;
-    let (authority, _node, _fence) = oracle_epoch(&fixture, "http://oracle-revalidate:5002").await;
+    let (authority, _node, _fence) = oracle_epoch(&fixture, "http://oracle-revalidate:5002", 1).await;
 
     // A real promotion between preparation and revalidation is exactly the
     // drift the authoritative reload exists to find.

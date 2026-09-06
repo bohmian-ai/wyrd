@@ -442,6 +442,29 @@ impl CloseoutJourney {
         );
     }
 
+    /// Reads back the rolling target the table itself declares, in bytes.
+    ///
+    /// Geometry is judged against the published property rather than a
+    /// hard-coded figure, so the assertions describe the policy the writer was
+    /// actually given rather than a size the test happens to expect.
+    ///
+    /// # Panics
+    /// Panics when the table is unreadable or declares no parsable target.
+    async fn declared_target_bytes(&self, binding: &TenantTableBinding) -> u64 {
+        self.scribe()
+            .bifrost_catalog()
+            .iceberg_catalog()
+            .load_table(&binding.table_ident())
+            .await
+            .expect("geometry table")
+            .metadata()
+            .properties()
+            .get("write.target-file-size-bytes")
+            .expect("declared rolling target")
+            .parse()
+            .expect("declared rolling target is a byte count")
+    }
+
     /// Borrows the live coordinator node.
     ///
     /// # Panics
@@ -470,48 +493,6 @@ impl CloseoutJourney {
         self.cluster
             .server_by_node(self.oracle_node)
             .expect("Oracle node")
-    }
-
-    /// Drains tasks while one deliberately abandoned rewrite is expected.
-    ///
-    /// The ordinary drain treats any returned worker error as a defect. One
-    /// scenario needs a real attempt to be refused after it closed its outputs
-    /// and before it prepared, so this variant accepts exactly the refusal that
-    /// scenario injects at the publication reacquisition it drives, and still
-    /// refuses every other worker error. The observer keeps every error it ever
-    /// saw, so every drain after that injection has to use this variant.
-    ///
-    /// # Panics
-    /// Panics on SQL failure, a stalled attempt, or any other worker error.
-    async fn drain_tasks_allowing_injected_refusal(&self) {
-        tokio::time::timeout(REWRITE_BOUND, async {
-            loop {
-                for error in self.observer.returned_errors() {
-                    assert!(
-                        error.contains("injected Forge catalog load failure"),
-                        "worker failed for an unexpected reason: {error}"
-                    );
-                }
-                let next = self.observer.attempts() + 1;
-                let (pending, attempts): (i64, i64) = sqlx::query_as(
-                    "SELECT count(*) FILTER (WHERE state NOT IN \
-                     ('succeeded', 'failed', 'cancelled', 'unschedulable')), \
-                     coalesce(sum(attempt_count), 0)::bigint FROM vala.forge_tasks",
-                )
-                .fetch_one(self.cluster.pg_fixture().operator_pool().pool())
-                .await
-                .expect("durable task and ownership inspection");
-                if pending == 0
-                    && self.observer.attempts()
-                        >= usize::try_from(attempts).expect("nonnegative attempts")
-                {
-                    break;
-                }
-                self.observer.wait_for_attempts_at_least(next).await;
-            }
-        })
-        .await
-        .expect("the abandoned rewrite and its retry both settle");
     }
 
     /// Requests and observes one real scheduler pass before inspecting SQL.
@@ -828,38 +809,66 @@ impl GeometryWorkload {
     }
 }
 
-/// Checks physical policy targets and ordered row-group boundaries from Iceberg.
+/// Proves each output rolled at the declared target on a whole row group.
+///
+/// A writer can only close a file on a completed row group, so the exact
+/// property being checked is that the *final* group is the one that carried the
+/// file across the target: every earlier group ended below it, and nothing was
+/// written after the crossing. That distinguishes a correct rolling threshold
+/// from a writer that keeps appending past its target or cuts early, which a
+/// size band cannot. Exactly one file — the last residue — stays below target.
 ///
 /// # Panics
-/// Panics when no approximately 1 GiB output/residue exists or row groups escape
-/// their physical file. Targets are approximate because writers roll whole groups.
-fn assert_output_geometry(outputs: &BTreeMap<String, DataFile>, rows: usize) {
+/// Panics when no output crosses the target, when a crossing file started its
+/// final group at or beyond the target, when more than one residue exists, or
+/// when a row group escapes its physical file.
+fn assert_output_geometry(outputs: &BTreeMap<String, DataFile>, rows: usize, target: u64) {
     let output_sizes: Vec<_> = outputs.values().map(DataFile::file_size_in_bytes).collect();
     eprintln!(
         "Forge physical bytes: {output_sizes:?}; exact rows: {}",
         rows
     );
-    assert!(
-        output_sizes.iter().any(|size| *size >= 900 * 1024 * 1024),
-        "approximately 1 GiB output: {output_sizes:?}"
+    let residues = output_sizes.iter().filter(|size| **size < target).count();
+    assert_eq!(
+        residues, 1,
+        "only the final residue stays below the declared target {target}: {output_sizes:?}"
     );
     assert!(
-        output_sizes.iter().any(|size| *size < 900 * 1024 * 1024),
-        "valid final residue: {output_sizes:?}"
+        output_sizes.iter().any(|size| *size >= target),
+        "at least one output rolled at the declared target {target}: {output_sizes:?}"
     );
-    for file in outputs.values() {
+    for (path, file) in outputs {
         let offsets = file.split_offsets().expect("row-group offsets");
-        assert!(!offsets.is_empty());
-        if file.file_size_in_bytes() >= 900 * 1024 * 1024 {
-            assert!(
-                offsets.len() > 1,
-                "a production replacement has multiple row groups"
-            );
+        assert!(!offsets.is_empty(), "{path} reports its row groups");
+        assert!(
+            offsets.windows(2).all(|pair| pair[0] < pair[1]),
+            "{path} row-group offsets ascend: {offsets:?}"
+        );
+        assert!(
+            offsets.iter().all(|offset| {
+                u64::try_from(*offset).is_ok_and(|offset| offset < file.file_size_in_bytes())
+            }),
+            "{path} row groups stay inside the physical file"
+        );
+        if file.file_size_in_bytes() < target {
+            continue;
         }
-        assert!(offsets.windows(2).all(|pair| pair[0] < pair[1]));
-        assert!(offsets.iter().all(|offset| {
-            u64::try_from(*offset).is_ok_and(|offset| offset < file.file_size_in_bytes())
-        }));
+        assert!(
+            offsets.len() > 1,
+            "a rolled replacement has multiple row groups: {path}"
+        );
+        let final_group = u64::try_from(
+            *offsets
+                .last()
+                .expect("a non-empty offset list has a last entry"),
+        )
+        .expect("a row-group offset inside the file is representable");
+        assert!(
+            final_group < target,
+            "{path} was still below the declared target {target} when its final row group opened, \
+             so that group is the one that crossed: final group at {final_group}, size {}",
+            file.file_size_in_bytes()
+        );
     }
 }
 
@@ -885,6 +894,7 @@ async fn compaction_geometry_exact_rows_and_non_destructive_second_pass() {
     let neighbour_table = register_table(journey.scribe(), neighbour, &table.name).await;
     journey.declare_geometry(&table.binding).await;
     journey.declare_geometry(&neighbour_table.binding).await;
+    let target = journey.declared_target_bytes(&table.binding).await;
     let writer = tenant_client(journey.scribe(), tenant).await;
     let reader = tenant_client(journey.oracle(), tenant).await;
     let neighbour_writer = tenant_client(journey.scribe(), neighbour).await;
@@ -976,8 +986,8 @@ async fn compaction_geometry_exact_rows_and_non_destructive_second_pass() {
                 replacement
                     .1
                     .values()
-                    .any(|file| file.file_size_in_bytes() >= 900 * 1024 * 1024),
-                "geometry backlog must make progress before reaching an unchanged cut"
+                    .any(|file| file.file_size_in_bytes() >= target),
+                "geometry backlog must roll at the declared target before an unchanged cut"
             );
             break;
         }
@@ -988,13 +998,47 @@ async fn compaction_geometry_exact_rows_and_non_destructive_second_pass() {
         outputs.keys().all(|path| !inputs.contains_key(path)),
         "new cuts use replacements"
     );
-    assert_output_geometry(&outputs, workload.expected.len());
+    assert_output_geometry(&outputs, workload.expected.len(), target);
     journey.assert_objects(&inputs).await;
     journey.assert_objects(&outputs).await;
-    assert_eq!(
-        read_managed_rows(&reader, &table.qualified).await,
-        workload.expected
-    );
+    // A public read that returns the right rows can still be reading a stale
+    // cut. Pause the follower at its first-batch gate and require its durable
+    // protection to name the replacement snapshot: that is what proves the
+    // post-compaction read pinned the new cut rather than the promoted one.
+    let (mut pauses, ready) =
+        OracleFollowerPauses::arm(&journey.cluster).expect("arm actual followers");
+    assert!(!ready.is_empty());
+    let paused_read = read_managed_rows(&reader, &table.qualified);
+    let inspect_protection = async {
+        let (accepted, _, _) =
+            tokio::time::timeout(PASS_BOUND, futures_util::future::select_all(ready))
+                .await
+                .expect("lazy query reaches its first-batch gate");
+        let accepted = accepted.expect("accepted follower authority");
+        let record = journey
+            .oracle()
+            .oracle_table_protection_for_test(
+                &table.binding,
+                accepted.worker_node_id,
+                accepted.oracle_fence,
+            )
+            .await
+            .expect("protection read")
+            .expect("durable protection before first batch");
+        assert!(
+            record
+                .frontier
+                .members
+                .iter()
+                .any(|member| member.protected_snapshot_id == replacement_snapshot),
+            "the post-compaction read pins the replacement snapshot \
+             {replacement_snapshot}: {:?}",
+            record.frontier.members
+        );
+        pauses.release().expect("release the paused reader");
+    };
+    let (actual, ()) = tokio::join!(paused_read, inspect_protection);
+    assert_eq!(actual, workload.expected);
     let rewrites = journey
         .observer
         .completed_strategies()
@@ -1427,21 +1471,7 @@ impl OrphanJourney {
             "the promoted input is live and a rewrite is now due"
         );
 
-        Self::prove_commit_window_retention(&roles, &table, &catalog).await;
-
-        // A further acknowledged flush, promoted on its own pass, leaves the
-        // table owing one more real rewrite: the attempt that will be refused.
-        workload
-            .append_batch(&transport, &table.qualified, &[7, 8])
-            .await;
-        roles
-            .scribe()
-            .flush_bifrost()
-            .await
-            .expect("later rows flush");
-        roles.scheduler_pass().await;
-        roles.drain_tasks().await;
-        let orphans = Self::strand_one_generation(&roles, &table, &catalog).await;
+        let orphans = Self::prove_commit_window_retention(&roles, &table, &catalog).await;
         Self {
             roles,
             table,
@@ -1456,22 +1486,30 @@ impl OrphanJourney {
         }
     }
 
-    /// Proves an open and a commit-uncertain rewrite both retain their outputs.
+    /// Retains an open rewrite's outputs, then refuses that rewrite's commit.
     ///
     /// Two production windows, observed from the coordinator because the worker
     /// is the process inside the catalog call: a rewrite whose operation row is
-    /// prepared and whose commit has not been delegated, and one whose commit
-    /// the catalog accepted but has not acknowledged. Collection must refuse
-    /// the outputs in both, and neither verdict may come from a fixture.
+    /// prepared and whose commit has not been delegated, and the retry's, whose
+    /// commit the catalog accepted but has not acknowledged. Collection must
+    /// refuse the first rewrite's outputs in both, and neither verdict may come
+    /// from a fixture.
+    ///
+    /// Rejecting that first commit is what strands the objects: the retry runs
+    /// under a new attempt identity and publishes its own outputs, so the ones
+    /// returned here are named by no snapshot and are the exact generation the
+    /// rest of the journey tracks to deletion. The accepted-uncertain window is
+    /// protection evidence only; it strands nothing.
     ///
     /// # Panics
     /// Panics if either window is never reached, the rewrite closed no output,
-    /// or the production predicate does not protect it.
+    /// the production predicate does not protect it, or a returned object
+    /// reaches a published snapshot.
     async fn prove_commit_window_retention(
         roles: &CloseoutJourney,
         table: &JourneyTable,
         catalog: &Arc<CommitUncertaintyCatalog>,
-    ) {
+    ) -> BTreeSet<String> {
         let before = roles.forge_objects(&table.binding).await;
         catalog.pause_before_commit();
         let drive = async {
@@ -1506,74 +1544,17 @@ impl OrphanJourney {
                 .assert_eligibility(&table.binding, &open, "Protected", "uncertain commit")
                 .await;
             catalog.release_paused_commit();
+            open
         };
-        tokio::join!(drive, inspect);
-    }
-
-    /// Refuses one real rewrite after it closed its outputs and before it prepared.
-    ///
-    /// The refusal is a production one. The rewrite is held at the point its
-    /// managed execution is finished and its publication has not yet reacquired
-    /// authoritative metadata, and that reacquisition is then made to fail. The
-    /// objects the attempt already closed are therefore named by no snapshot,
-    /// no operation row, and no audit transition, and the retry runs under a
-    /// new attempt identity that cannot reuse them. While the attempt is still
-    /// open those same objects must be protected, observed from the coordinator
-    /// because the worker is the process holding the rewrite.
-    ///
-    /// # Panics
-    /// Panics if the barrier is never reached, the refused rewrite closed no
-    /// output, or the production predicate does not retain it.
-    async fn strand_one_generation(
-        roles: &CloseoutJourney,
-        table: &JourneyTable,
-        catalog: &Arc<CommitUncertaintyCatalog>,
-    ) -> BTreeSet<String> {
-        let before = roles.forge_objects(&table.binding).await;
-        roles.observer.hold_after_next_rewrite_handoff_for_test();
-        let drive = async {
-            roles.scheduler_pass().await;
-            roles.drain_tasks_allowing_injected_refusal().await;
-        };
-        let inspect = async {
-            tokio::time::timeout(
-                REWRITE_BOUND,
-                roles.observer.wait_for_held_rewrite_handoff_for_test(),
-            )
-            .await
-            .expect("a real rewrite reaches its post-execution barrier");
-            let orphans: BTreeSet<String> = roles
-                .forge_objects(&table.binding)
-                .await
-                .difference(&before)
-                .cloned()
-                .collect();
-            assert!(
-                !orphans.is_empty(),
-                "the held rewrite closed at least one real output"
-            );
-            // Before the operation row prepares, the age floor is the only
-            // thing standing between a collection pass and an output a live
-            // attempt is still working on, so that is what must hold here.
-            roles
-                .assert_eligibility(&table.binding, &orphans, "TooYoung", "unprepared rewrite")
-                .await;
-            // Refuse the metadata reacquisition this rewrite performs next,
-            // which is the last authority it consults before preparing.
-            catalog.fail_next_load_table();
-            roles.observer.release_held_rewrite_handoff_for_test();
-            orphans
-        };
-        let ((), orphans) = tokio::join!(drive, inspect);
-
+        let ((), open) = tokio::join!(drive, inspect);
         let (_, live) = roles.live_files(&table.binding).await;
-        for path in &orphans {
+        for path in &open {
             assert!(
                 !live.contains_key(path),
-                "a refused rewrite output reached a published snapshot: {path}"
+                "a rejected rewrite output reached a published snapshot: {path}"
             );
         }
-        orphans
+        open
     }
 
     /// Crosses the terminal age floor and collects exactly the stranded output.
@@ -1592,6 +1573,13 @@ impl OrphanJourney {
             .await;
         let (_, live) = self.roles.live_files(&self.table.binding).await;
         self.roles.advance_maintenance(chrono::Duration::days(2));
+        // Deletion ownership is an equality, not a membership test: the pass
+        // must remove the tracked generation and nothing else this table owns.
+        let before_objects = self.roles.forge_objects(&self.table.binding).await;
+        assert!(
+            self.orphans.is_subset(&before_objects),
+            "the tracked outputs are still present before collection"
+        );
         self.roles
             .assert_eligibility(
                 &self.table.binding,
@@ -1607,7 +1595,7 @@ impl OrphanJourney {
             .completed_forge_scheduler_passes_for_test();
         for _ in 0..12 {
             self.roles.scheduler_pass().await;
-            self.roles.drain_tasks_allowing_injected_refusal().await;
+            self.roles.drain_tasks().await;
             let mut remaining = false;
             for path in &self.orphans {
                 remaining |= !self.roles.object_missing(path).await;
@@ -1628,6 +1616,14 @@ impl OrphanJourney {
                 .completed_forge_scheduler_passes_for_test()
                 > before,
             "collection ran through the existing scheduler trigger"
+        );
+        assert_eq!(
+            self.roles.forge_objects(&self.table.binding).await,
+            before_objects
+                .difference(&self.orphans)
+                .cloned()
+                .collect::<BTreeSet<String>>(),
+            "collection removed exactly the tracked generation"
         );
         self.roles.assert_objects(&live).await;
         self.roles

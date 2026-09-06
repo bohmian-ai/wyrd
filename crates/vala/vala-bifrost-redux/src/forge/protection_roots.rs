@@ -80,10 +80,10 @@ mod tests {
     /// class alone protected to become eligible, so a class that quietly stops
     /// contributing cannot pass as a complete union.
     ///
-    /// This inventory covers pinned Oracle cuts and carries no live-tail case. That
-    /// is a recorded open conflict, not an omission: see
-    /// `changes/active/forge-live-tail-authority-conflict.md`. Until it is
-    /// resolved, no case here may be widened to stand for both roots at once.
+    /// This inventory covers pinned Oracle cuts and carries no live-tail case
+    /// because a v1 live-tail lease names no Forge-collectable object and so
+    /// contributes no independent Forge GC root. No case here may be widened to
+    /// stand for both roots at once.
     #[test]
     fn forge_orphan_protection_includes_all_noncatalog_authority() {
         let catalog_path = "t/spans/data/forge/catalog-00000.parquet";

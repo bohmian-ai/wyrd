@@ -1795,7 +1795,7 @@ impl OracleReaderAuthority {
         Ok(())
     }
 
-    /// Closes the narrowing queue, then joins both of this epoch's workers.
+    /// Closes the narrowing queue, then joins only the narrowing worker.
     ///
     /// The narrowing worker is drained rather than cancelled, because its
     /// queue may still hold reserved releases that must reach Postgres. The
@@ -1836,18 +1836,6 @@ impl OracleReaderAuthority {
         }
     }
 
-    /// Joins the lease supervisor, or ends this process at `deadline`.
-    ///
-    /// A timeout drops the supervisor's [`tokio::task::JoinHandle`] rather than
-    /// aborting it, because an aborted supervisor abandons whatever loss
-    /// transaction it is in the middle of. The process is terminated instead:
-    /// retirement cannot prove the supervisor stopped, so it must not go on to
-    /// release anything.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BifrostError::Internal`] when the supervisor is still running
-    /// at `deadline`.
     /// Ends this process's source IO and reports the stage that exhausted.
     ///
     /// Retirement calls this at most once per attempt and always returns the
@@ -2117,9 +2105,11 @@ impl OracleEpochRecovery {
     ///
     /// # Errors
     ///
-    /// Returns [`BifrostError::Internal`] when the enumeration itself fails. A
-    /// per-epoch failure is logged and skipped rather than aborting the sweep,
-    /// since one unreclaimable epoch must not block the others.
+    /// Returns [`BifrostError::Internal`] on the first failure, whether that is
+    /// the enumeration itself or any single epoch's reclamation. An expired
+    /// epoch this node cannot reclaim still holds protection, so the sweep
+    /// stops and the caller does not start serving: readiness published over
+    /// retention nothing released is the failure this refuses.
     pub async fn reclaim_expired(&self, limit: i64) -> Result<usize, BifrostError> {
         let expired = vala_sql::queries::oracle_reader_authority::list_expired_epochs_for_operator(
             &self.operator_pool,

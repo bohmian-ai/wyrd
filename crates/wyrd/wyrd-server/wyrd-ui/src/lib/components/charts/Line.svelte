@@ -14,12 +14,16 @@
     threshold
   }: { series: Series[]; labels?: Stamp[]; unit?: string; threshold?: Threshold } = $props();
 
-  const W = 300;
-  const H = 148;
-  const x0 = 10;
-  const x1 = 294;
+  // The plot renders at the container's real pixel width: the viewBox tracks the measured
+  // width so a 1.5px stroke is 1.5px on screen. A fixed small viewBox stretched to the
+  // panel would scale strokes, markers and axis text into toy proportions.
+  let width = $state(0);
+  const W = $derived(Math.max(width, 280));
+  const H = 168;
+  const x0 = 8;
+  const x1 = $derived(W - 8);
   const yTop = 12;
-  const yBot = 120;
+  const yBot = 138;
 
   /** Stroke, dash and marker per series position. Four distinct non-colour identities. */
   const styles = [
@@ -65,11 +69,24 @@
     event.preventDefault();
   }
 
-  const scale = $derived.by(() => {
-    const values = series.flatMap((s) => s.points);
-    const max = Math.max(...values, threshold?.value ?? 0) || 1;
-    return (v: number) => yBot - (v / max) * (yBot - yTop);
-  });
+  const maxValue = $derived(
+    Math.max(...series.flatMap((s) => s.points), threshold?.value ?? 0) || 1
+  );
+
+  const scale = $derived((v: number) => yBot - (v / maxValue) * (yBot - yTop));
+
+  /** Compact y tick value, so the axis states real magnitudes ("2.1k", "0.8"). */
+  function fmt(v: number): string {
+    if (v >= 10_000) return `${Math.round(v / 1000)}k`;
+    if (v >= 1000) return `${(v / 1000).toFixed(1)}k`;
+    if (v >= 10) return `${Math.round(v)}`;
+    return `${Math.round(v * 100) / 100}`;
+  }
+
+  /** Value labels at the gridlines — a chart must say what its scale is. */
+  const ylabels = $derived(
+    grid.map((gy, i) => ({ y: gy, label: fmt(maxValue * (1 - i / 3)) }))
+  );
 
   const plotted = $derived.by(() => {
     if (series.length > styles.length) throw new RangeError('Line supports at most four series');
@@ -118,7 +135,7 @@
 
   /** Marker path for one plotted point, so shape reads where colour cannot. */
   function marker(shape: string, x: number, y: number): string {
-    const r = 3;
+    const r = 2.5;
     if (shape === 'circle') return `M ${x - r} ${y} a ${r} ${r} 0 1 0 ${r * 2} 0 a ${r} ${r} 0 1 0 ${-r * 2} 0`;
     if (shape === 'triangle') return `M ${x} ${y - r} L ${x + r} ${y + r} L ${x - r} ${y + r} Z`;
     if (shape === 'diamond') return `M ${x} ${y - r} L ${x + r} ${y} L ${x} ${y + r} L ${x - r} ${y} Z`;
@@ -127,7 +144,7 @@
 </script>
 
 <div class="wy-line">
-  <div class="plot">
+  <div class="plot" bind:clientWidth={width}>
   <!-- A focusable data region, the same case as Table's scroller: the plot is a picture,
        but the point the tooltip reports is a position a reader must be able to move. The
        lint models only widgets and static images, so it sees no legitimate third case.
@@ -150,16 +167,19 @@
     }}
   >
     {#each grid as gy (gy)}
-      <line class="grid" x1={x0} y1={gy.toFixed(1)} x2={x1} y2={gy.toFixed(1)} stroke-width="1" stroke-dasharray="3 3" />
+      <line class="grid" x1={x0} y1={gy.toFixed(1)} x2={x1} y2={gy.toFixed(1)} stroke-width="1" stroke-dasharray="2 4" />
     {/each}
-    <line class="axis" x1={x0} y1={yBot} x2={x1} y2={yBot} stroke-width="2" />
+    {#each ylabels as l (l.y)}
+      <text aria-hidden="true" class="yl" x={x0} y={(l.y - 3).toFixed(1)}>{l.label}{unit && l.y === grid[0] ? ` ${unit}` : ''}</text>
+    {/each}
+    <line class="axis" x1={x0} y1={yBot} x2={x1} y2={yBot} stroke-width="1" />
     {#if threshold}
-      <line class="thr" x1={x0} y1={thresholdY.toFixed(1)} x2={x1} y2={thresholdY.toFixed(1)} stroke-width="2" stroke-dasharray="5 3" />
-      <line class="tick" x1={x0 - 4} y1={thresholdY.toFixed(1)} x2={x0 + 4} y2={thresholdY.toFixed(1)} stroke-width="3" />
-      <text class="thrl" x={x1} y={(thresholdY - 4).toFixed(1)} text-anchor="end">{threshold.label}</text>
+      <line class="thr" x1={x0} y1={thresholdY.toFixed(1)} x2={x1} y2={thresholdY.toFixed(1)} stroke-width="1.5" stroke-dasharray="5 4" />
+      <line class="tick" x1={x0 - 4} y1={thresholdY.toFixed(1)} x2={x0 + 4} y2={thresholdY.toFixed(1)} stroke-width="2.5" />
+      <text class="thrl" x={x1} y={(thresholdY - 5).toFixed(1)} text-anchor="end">{threshold.label}</text>
     {/if}
     {#if showing}
-      <line class="cursor" x1={activeX.toFixed(1)} y1={yTop} x2={activeX.toFixed(1)} y2={yBot} stroke-width="2" stroke-dasharray="2 3" />
+      <line class="cursor" x1={activeX.toFixed(1)} y1={yTop} x2={activeX.toFixed(1)} y2={yBot} stroke-width="1" stroke-dasharray="2 3" />
     {/if}
     {#each plotted as s (s.label)}
       <polyline
@@ -167,7 +187,7 @@
         fill="none"
         style={`stroke:${s.color}`}
         stroke-dasharray={s.dash || undefined}
-        stroke-width="2.5"
+        stroke-width="1.5"
         stroke-linejoin="round"
         stroke-linecap="round"
       />
@@ -177,12 +197,12 @@
           class:read={showing && i === active}
           d={marker(s.marker, p.x, p.y)}
           style={`stroke:${s.color}`}
-          stroke-width="2"
+          stroke-width="1.25"
         />
       {/each}
     {/each}
     {#each xlabels as l (l.at)}
-      <text aria-hidden="true" class="xl" x={l.x.toFixed(1)} y={yBot + 13} text-anchor={l.anchor}>{l.label}</text>
+      <text aria-hidden="true" class="xl" x={l.x.toFixed(1)} y={yBot + 16} text-anchor={l.anchor}>{l.label}</text>
     {/each}
   </svg>
   <!-- Keep the SVG typography; HTML time elements expose the same ticks semantically. -->
@@ -206,8 +226,8 @@
         {#each plotted as s, i (s.label)}
           <li>
             <svg class="sample" viewBox="0 0 26 10" aria-hidden="true">
-              <line x1="1" y1="5" x2="25" y2="5" style={`stroke:${s.color}`} stroke-dasharray={s.dash || undefined} stroke-width="2.5" />
-              <path class="node" d={marker(s.marker, 13, 5)} style={`stroke:${s.color}`} stroke-width="2" />
+              <line x1="1" y1="5" x2="25" y2="5" style={`stroke:${s.color}`} stroke-dasharray={s.dash || undefined} stroke-width="1.5" />
+              <path class="node" d={marker(s.marker, 13, 5)} style={`stroke:${s.color}`} stroke-width="1.25" />
             </svg>
             <span class="sl">{s.label}</span>
             <span class="sv">{series[i].points[active] ?? '–'}{#if unit}<span class="su">{unit}</span>{/if}</span>
@@ -221,8 +241,8 @@
     {#each plotted as s (s.label)}
       <li>
         <svg class="sample" viewBox="0 0 26 10" aria-hidden="true">
-          <line x1="1" y1="5" x2="25" y2="5" style={`stroke:${s.color}`} stroke-dasharray={s.dash || undefined} stroke-width="2.5" />
-          <path class="node" d={marker(s.marker, 13, 5)} style={`stroke:${s.color}`} stroke-width="2" />
+          <line x1="1" y1="5" x2="25" y2="5" style={`stroke:${s.color}`} stroke-dasharray={s.dash || undefined} stroke-width="1.5" />
+          <path class="node" d={marker(s.marker, 13, 5)} style={`stroke:${s.color}`} stroke-width="1.25" />
         </svg>
         {s.label}
       </li>
@@ -253,7 +273,7 @@
   }
   .thrl {
     font-family: var(--fm);
-    font-size: 8.5px;
+    font-size: 10px;
     font-weight: 700;
     fill: var(--danger-text);
   }
@@ -272,9 +292,10 @@
     outline: 2px solid var(--text);
     outline-offset: 2px;
   }
-  .xl {
+  .xl,
+  .yl {
     font-family: var(--fm);
-    font-size: 8.5px;
+    font-size: 10px;
     fill: var(--muted);
   }
   /* Workbench geometry, quiet altitude: 2px border, 5px radius, 3px hard shadow. It is

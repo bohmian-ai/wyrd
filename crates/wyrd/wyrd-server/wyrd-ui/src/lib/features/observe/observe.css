@@ -1,0 +1,525 @@
+/* Observe workspace styles: same neobrutalist grammar as the Changes feature,
+   scoped to `.observe` so the two features stay independently owned. */
+.observe {
+  color: var(--text);
+  font: 13px var(--font-sans);
+  min-width: 0;
+  /* Quiet in-panel separator: full-strength --border is for panel edges only. */
+  --sep: color-mix(in srgb, var(--border) 30%, var(--surface));
+}
+.observe h1 {
+  font: 700 26px var(--font-display);
+  margin: 0 0 10px;
+}
+.observe h2 {
+  font: 700 16px var(--font-display);
+  margin: 0 0 12px;
+}
+.observe h3 {
+  font: 700 14px var(--font-display);
+  margin: 0 0 8px;
+}
+.observe p {
+  margin: 8px 0;
+  line-height: 1.55;
+}
+.observe p.mono,
+.observe td p,
+.observe td small {
+  margin: 2px 0;
+  line-height: 1.4;
+}
+.observe tbody td {
+  vertical-align: top;
+}
+.observe a {
+  color: var(--brand-strong);
+}
+.observe .muted,
+.observe small {
+  color: var(--muted);
+}
+.observe .mono {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+.observe .row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.observe .between {
+  justify-content: space-between;
+}
+.observe .stack {
+  display: grid;
+  gap: 16px;
+  min-width: 0;
+}
+.observe .columns {
+  display: grid;
+  grid-template-columns: minmax(0, 2.05fr) minmax(240px, 1fr);
+  gap: 20px;
+  align-items: start;
+}
+.observe .control {
+  border: 2px solid var(--border);
+  border-radius: var(--r);
+  background: var(--surface);
+  color: var(--text);
+  font: 700 11px var(--font-mono);
+  padding: 7px 11px;
+  cursor: pointer;
+  text-decoration: none;
+  display: inline-block;
+}
+.observe .primary {
+  background: var(--brand-btn);
+  color: var(--brand-btn-ink);
+  box-shadow: 3px 3px 0 var(--shadow);
+}
+/* Lime is the second voice: a genuine secondary action beside a blue primary. */
+.observe .secondary {
+  background: var(--lime);
+  color: var(--lime-ink);
+  box-shadow: 3px 3px 0 var(--shadow);
+}
+.observe tbody tr,
+.observe .control,
+.observe .nav a {
+  transition:
+    background 120ms ease,
+    box-shadow 120ms ease,
+    transform 120ms ease,
+    color 120ms ease;
+}
+.observe tbody tr:hover {
+  background: var(--brand-soft);
+}
+.observe .control:hover {
+  background: var(--brand-soft);
+}
+.observe .primary:hover {
+  background: var(--brand-btn);
+  box-shadow: 4px 4px 0 var(--shadow);
+}
+.observe .secondary:hover {
+  background: var(--lime);
+  box-shadow: 4px 4px 0 var(--shadow);
+}
+.observe button.control:active {
+  transform: translate(2px, 2px);
+}
+.observe button.primary:active,
+.observe button.secondary:active {
+  box-shadow: 1px 1px 0 var(--shadow);
+}
+.observe .nav a:hover {
+  background: var(--surface-2);
+  color: var(--text);
+}
+@media (prefers-reduced-motion: reduce) {
+  .observe tbody tr,
+  .observe .control,
+  .observe .nav a {
+    transition: none;
+  }
+}
+.observe button:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+.observe :is(button, a, input, select, textarea, summary):focus-visible {
+  outline: 2px solid var(--brand-strong);
+  outline-offset: 3px;
+}
+.observe
+  :is(
+    input:not([type='hidden']):not([type='radio']):not([type='checkbox']),
+    textarea,
+    select
+  ) {
+  border: 2px solid var(--border);
+  border-radius: var(--r);
+  background: var(--surface);
+  color: var(--text);
+  padding: 8px;
+  font: 12px var(--font-sans);
+  min-width: 0;
+  max-width: 100%;
+}
+.observe label {
+  display: grid;
+  gap: 6px;
+  font-size: 12px;
+}
+.observe .nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  border-bottom: 2px solid var(--border);
+  padding: 8px 0;
+  margin-bottom: 24px;
+  font: 700 11px var(--font-mono);
+}
+.observe .nav a {
+  padding: 8px 12px;
+  color: var(--muted);
+  text-decoration: none;
+  border: 2px solid transparent;
+  border-radius: var(--r);
+}
+.observe .nav a[aria-current] {
+  background: var(--brand-soft);
+  border-color: var(--border);
+  color: var(--text);
+}
+.observe summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+.observe .divider {
+  border-top: 1px solid var(--sep);
+  margin-top: 14px;
+  padding-top: 14px;
+}
+.observe .kv {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 4px 14px;
+  align-items: baseline;
+  font-size: 12px;
+}
+.observe .kv > .k {
+  font: 10px var(--font-mono);
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.observe .notice {
+  padding: 10px;
+  border: 2px dashed var(--border);
+  border-radius: var(--r);
+}
+.observe .error {
+  color: var(--danger-text);
+}
+.observe .filters {
+  margin-bottom: 18px;
+}
+.observe .filters input[name='q'] {
+  flex: 1;
+  min-width: 160px;
+}
+.observe .chips {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+/* Signal tiles on the overview: compact, one KPI per signal. */
+.observe .tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 14px;
+}
+
+/* Volume/trend bars: an inline mini histogram, error-toned by context. */
+.observe .trendbars {
+  display: flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 52px;
+}
+.observe .trendbars > span {
+  flex: 1;
+  min-width: 2px;
+  border-radius: 1px;
+  background: color-mix(in srgb, var(--danger) 72%, var(--surface));
+}
+.observe .trend-axis {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 4px;
+  font-size: 10px;
+}
+.observe .filters .reset {
+  align-self: center;
+  font-size: 11px;
+}
+
+/* Trace waterfall rows: label column + proportional bar lane. */
+.observe .waterfall {
+  display: grid;
+  gap: 0;
+}
+.observe .waterfall .span-row {
+  display: grid;
+  grid-template-columns: minmax(150px, 220px) minmax(0, 1fr) 58px;
+  gap: 10px;
+  align-items: center;
+  padding: 8px 6px;
+  border-bottom: 1px solid var(--sep);
+  border-left: 4px solid transparent;
+  text-align: left;
+  background: none;
+  border-top: 0;
+  border-right: 0;
+  cursor: pointer;
+  font: 12px var(--font-sans);
+  color: var(--text);
+  text-decoration: none;
+}
+.observe .waterfall .span-row:hover {
+  background: var(--surface-2);
+}
+.observe .waterfall .span-row[aria-current='true'] {
+  background: var(--brand-soft);
+  border-left-color: var(--brand-strong);
+}
+.observe .waterfall .lane {
+  position: relative;
+  height: 14px;
+  min-width: 0;
+}
+.observe .waterfall .bar {
+  position: absolute;
+  top: 0;
+  height: 100%;
+  border: 2px solid var(--brand-strong);
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--brand-strong) 18%, var(--surface));
+}
+.observe .waterfall .bar.err {
+  border-color: var(--danger-text);
+  background: color-mix(in srgb, var(--danger) 30%, var(--surface));
+}
+.observe .waterfall .dur {
+  font: 11px var(--font-mono);
+  text-align: right;
+  color: var(--muted);
+}
+.observe .waterfall .span-row .dur.err {
+  color: var(--danger-text);
+  font-weight: 700;
+}
+
+/* Service graph: nodes joined by plain or error edges. */
+.observe .svc-graph {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  flex-wrap: wrap;
+  padding: 6px 0;
+}
+.observe .svc-graph .node {
+  border: 2px solid var(--border);
+  border-radius: var(--r);
+  background: var(--surface-2);
+  padding: 6px 12px;
+  font: 700 11px var(--font-mono);
+  color: var(--text);
+  text-decoration: none;
+  box-shadow: 3px 3px 0 var(--shadow);
+}
+.observe .svc-graph .edge {
+  width: 44px;
+  height: 0;
+  border-top: 2px solid var(--border);
+  margin: 0 4px;
+}
+.observe .svc-graph .edge.err {
+  border-top-color: var(--danger-text);
+  border-top-width: 3px;
+}
+
+/* Eval workflow drawer: the event page stays behind a scrim; the drawer is
+   a raised sheet holding stages, tasks and the dominant selected task. */
+.observe .drawer-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 5;
+  background: color-mix(in srgb, var(--shadow) 28%, transparent);
+}
+.observe .drawer {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 6;
+  width: min(75vw, 1120px);
+  overflow-y: auto;
+  background: var(--bg);
+  border-left: 3px solid var(--border);
+  box-shadow: -10px 0 0 0 var(--shadow);
+  padding: 20px 24px;
+}
+.observe .stages {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.observe .stages .stage {
+  border: 2px solid var(--border);
+  border-radius: var(--r);
+  padding: 7px 12px;
+  background: var(--surface-2);
+  font: 700 11px var(--font-mono);
+}
+.observe .stages .stage[data-tone='danger'] {
+  background: color-mix(in srgb, var(--danger) 14%, var(--surface));
+  border-color: var(--danger-text);
+}
+.observe .stages .arrow {
+  color: var(--muted);
+}
+.observe .task-list {
+  display: grid;
+  gap: 0;
+}
+.observe .task-list .task {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 2px 10px;
+  padding: 10px 8px;
+  border-bottom: 1px solid var(--sep);
+  border-left: 4px solid transparent;
+  text-align: left;
+  background: none;
+  border-top: 0;
+  border-right: 0;
+  cursor: pointer;
+  font: 12px var(--font-sans);
+  color: var(--text);
+  text-decoration: none;
+}
+.observe .task-list .task:hover {
+  background: var(--surface-2);
+}
+.observe .task-list .task[aria-current='true'] {
+  background: var(--brand-soft);
+  border-left-color: var(--brand-strong);
+}
+
+/* Score block: big numeral, threshold bar with a positional tick. */
+.observe .score {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+  padding: 12px;
+  border: 2px solid var(--border);
+  border-radius: var(--r);
+  background: var(--surface-2);
+}
+.observe .score .n {
+  font: 700 30px var(--font-display);
+}
+.observe .score .n.fail {
+  color: var(--danger-text);
+}
+.observe .score .n.pass {
+  color: var(--ok-text);
+}
+.observe .score-bar {
+  position: relative;
+  flex: 1;
+  min-width: 140px;
+  height: 14px;
+  border: 2px solid var(--border);
+  border-radius: 3px;
+  background: var(--surface);
+}
+.observe .score-bar .fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  background: var(--danger);
+  border-radius: 1px;
+}
+.observe .score-bar .fill.pass {
+  background: var(--ok);
+}
+.observe .score-bar .tick {
+  position: absolute;
+  top: -6px;
+  bottom: -6px;
+  width: 3px;
+  background: var(--text);
+}
+.observe .history {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+}
+.observe .history > span {
+  width: 8px;
+  height: 18px;
+  border-radius: 2px;
+  background: var(--ok);
+}
+.observe .history > span.fail {
+  background: var(--danger);
+}
+
+/* Values comparison: expected beside actual, actual toned by verdict. */
+.observe .values {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+}
+.observe .values .val {
+  border: 2px solid var(--border);
+  border-radius: var(--r);
+  background: var(--surface-2);
+  padding: 10px 12px;
+  font: 11px var(--font-mono);
+}
+.observe .values .val.fail {
+  border-color: var(--danger-text);
+  background: color-mix(in srgb, var(--danger) 10%, var(--surface));
+}
+
+/* Dashboards: read-only panel grid. */
+.observe .panel-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 16px;
+}
+
+@media (max-width: 1000px) {
+  .observe .columns {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .observe .drawer {
+    width: min(94vw, 1120px);
+    padding: 16px;
+  }
+}
+@media (max-width: 600px) {
+  .observe h1 {
+    font-size: 20px;
+  }
+  .observe .nav {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    padding: 5px 0;
+    margin-bottom: 12px;
+    font-size: 10px;
+  }
+  .observe .nav a {
+    padding: 7px 8px;
+    white-space: nowrap;
+  }
+  .observe .waterfall .span-row {
+    grid-template-columns: minmax(110px, 150px) minmax(0, 1fr) 50px;
+    gap: 6px;
+  }
+  .observe .drawer {
+    width: 100vw;
+    border-left: 0;
+  }
+}

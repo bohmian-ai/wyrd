@@ -51,7 +51,7 @@ test('a threshold is a labeled rule with a positional tick', () => {
   });
   const rule = container.querySelector('.thr');
   const tick = container.querySelector('.tick');
-  expect(rule).toHaveAttribute('stroke-dasharray', '5 3');
+  expect(rule).toHaveAttribute('stroke-dasharray', '5 4');
   // Same y as the rule: the tick is the positional read that survives colour blindness.
   expect(tick?.getAttribute('y1')).toBe(rule?.getAttribute('y1'));
   expect(container.querySelector('.thrl')?.textContent).toBe('SLO 750ms');

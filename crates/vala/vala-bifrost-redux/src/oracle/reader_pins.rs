@@ -2148,30 +2148,55 @@ impl OracleEpochRecovery {
 
     /// Invalidates one expired epoch, releases its tables, and retires it.
     ///
+    /// Invalidation is the only transition this sequence performs once, so a
+    /// pass that finds the epoch already invalidated resumes cleanup from the
+    /// stored revision instead of re-invalidating it. That case is reachable
+    /// because retirement can lose the referential race against a protection
+    /// header committing for the same epoch: the header survives, the
+    /// invalidated epoch survives, and this pass is what eventually removes
+    /// both. Resuming appends no second invalidation audit.
+    ///
     /// # Errors
     ///
-    /// Returns [`BifrostError::Internal`] when the epoch is no longer expired,
-    /// when a protection release fails, or when retirement fails. Protection is
+    /// Returns [`BifrostError::Internal`] when the epoch is missing or in any
+    /// state other than invalidated after a refused invalidation, when a
+    /// protection release fails, or when retirement fails. Protection is
     /// retained on every failure.
     async fn reclaim(&self, node_id: uuid::Uuid, fencing_token: i64) -> Result<(), BifrostError> {
         let revision = {
             let mut conn = system_conn(&self.vala).await?;
-            let revision = OracleReaderEpochs::new(&mut conn)
+            let invalidated = OracleReaderEpochs::new(&mut conn)
                 .map_err(|error| internal(error.to_string()))?
                 .invalidate_expired(node_id, fencing_token)
                 .await
-                .map_err(|error| internal(error.to_string()))?
-                .ok_or_else(|| {
-                    internal("Oracle reader epoch is no longer expired and keeps its authority")
-                })?;
-            append_epoch_audit(
-                &mut conn,
-                node_id,
-                fencing_token,
-                OracleReaderEpochPhase::Invalidated,
-                revision,
-            )
-            .await?;
+                .map_err(|error| internal(error.to_string()))?;
+            let revision = match invalidated {
+                Some(revision) => {
+                    append_epoch_audit(
+                        &mut conn,
+                        node_id,
+                        fencing_token,
+                        OracleReaderEpochPhase::Invalidated,
+                        revision,
+                    )
+                    .await?;
+                    revision
+                }
+                None => {
+                    let row = OracleReaderEpochs::new(&mut conn)
+                        .map_err(|error| internal(error.to_string()))?
+                        .read(node_id, fencing_token)
+                        .await
+                        .map_err(|error| internal(error.to_string()))?
+                        .ok_or_else(|| internal("Oracle reader epoch is gone before recovery"))?;
+                    if row.state != OracleEpochState::Invalidated {
+                        return Err(internal(
+                            "Oracle reader epoch is no longer expired and keeps its authority",
+                        ));
+                    }
+                    row.state_revision
+                }
+            };
             conn.commit()
                 .await
                 .map_err(|error| internal(error.to_string()))?;

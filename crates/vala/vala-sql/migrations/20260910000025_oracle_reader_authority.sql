@@ -91,7 +91,12 @@ CREATE TABLE vala.oracle_reader_epochs (
     CHECK (state <> 'acquired' OR activated_at IS NULL),
     CHECK (state NOT IN ('active', 'draining') OR activated_at IS NOT NULL),
     CHECK ((state = 'invalidated') = (invalidated_at IS NOT NULL)),
-    PRIMARY KEY (epoch_owner_tenant_id, node_id, fencing_token)
+    PRIMARY KEY (epoch_owner_tenant_id, node_id, fencing_token),
+    -- A protection header names its epoch by (node, fence) alone, because the
+    -- header belongs to a data tenant while the epoch belongs to the system
+    -- owner. This unique key is what the header's foreign key references, and
+    -- it is what makes the referential lock below reachable.
+    UNIQUE (node_id, fencing_token)
 );
 
 CREATE INDEX oracle_reader_epochs_expiry
@@ -127,7 +132,17 @@ CREATE TABLE vala.oracle_table_protections (
     updated_at                timestamptz NOT NULL,
     PRIMARY KEY (data_tenant_id, table_uid, node_id, fencing_token),
     FOREIGN KEY (data_tenant_id, table_uid)
-        REFERENCES vala.bifrost_table_maintenance_authority(data_tenant_id, table_uid)
+        REFERENCES vala.bifrost_table_maintenance_authority(data_tenant_id, table_uid),
+    -- Publication and retirement are one durable order. Postgres' own
+    -- referential-integrity locks decide the race: an inserting transaction
+    -- takes a key-share lock on the epoch row, and a retiring transaction takes
+    -- the conflicting lock, so exactly one of them commits. If retirement wins,
+    -- the late insert fails; if the insert wins, retirement fails and leaves
+    -- the invalidated epoch for the next recovery pass to finish. Neither
+    -- outcome can leave a protection header without its owning epoch.
+    FOREIGN KEY (node_id, fencing_token)
+        REFERENCES vala.oracle_reader_epochs(node_id, fencing_token)
+        ON DELETE RESTRICT
 );
 
 CREATE INDEX oracle_table_protections_epoch

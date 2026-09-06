@@ -450,6 +450,25 @@ mod pg_tests {
             i64::try_from(row.lease.fencing_token).expect("fence fits an i64")
         }
 
+        /// Acquires this node's durable epoch row at one exact fence.
+        ///
+        /// A protection header references its owning epoch, so every test that
+        /// publishes protection needs the epoch row to exist first. This is the
+        /// same acquisition the authority performs at startup.
+        ///
+        /// # Panics
+        ///
+        /// Panics when acquisition or its transaction fails.
+        async fn acquire_epoch(&self, fence: i64) {
+            let mut conn = self.system_conn().await;
+            OracleReaderEpochs::new(&mut conn)
+                .expect("epochs are system owned")
+                .acquire(self.node_id, fence, std::time::Duration::from_secs(30))
+                .await
+                .expect("epoch acquires");
+            conn.commit().await.expect("epoch acquisition commits");
+        }
+
         /// Opens one `SYSTEM_OWNER` transaction for epoch statements.
         ///
         /// # Panics
@@ -775,6 +794,14 @@ mod pg_tests {
             constraints(&pool, "oracle_reader_epochs", "p").await,
             vec!["PRIMARY KEY (epoch_owner_tenant_id, node_id, fencing_token)".to_owned()]
         );
+        // The epoch key a protection header points at is exactly (node, fence):
+        // the header carries no epoch-owner tenant, so this unique key is what
+        // makes the referential lock reachable at all.
+        assert_eq!(
+            constraints(&pool, "oracle_reader_epochs", "u").await,
+            vec!["UNIQUE (node_id, fencing_token)".to_owned()],
+            "the epoch has exactly one unique key over (node_id, fencing_token)"
+        );
         assert_eq!(
             constraints(&pool, "oracle_table_protections", "p").await,
             vec!["PRIMARY KEY (data_tenant_id, table_uid, node_id, fencing_token)".to_owned()]
@@ -802,6 +829,42 @@ mod pg_tests {
                     && def.contains("ON DELETE CASCADE")
             ),
             "members must cascade from their header: {member_fks:?}"
+        );
+        // Publication and retirement serialize on this foreign key. RESTRICT is
+        // the whole mechanism: the deleting transaction takes a key-share lock
+        // the inserting transaction blocks on, so a header can never outlive
+        // the epoch that owns it. Deferring it would reopen the race, and
+        // `pg_get_constraintdef` omits the default spelling, so the metadata is
+        // asserted directly rather than read out of the printed definition.
+        let epoch_fk: Vec<(bool, bool, String, Vec<String>, Vec<String>)> = sqlx::query_as(
+            "SELECT c.condeferrable, c.condeferred, c.confdeltype::text, \
+                    (SELECT array_agg(a.attname ORDER BY k.ord) \
+                       FROM unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord) \
+                       JOIN pg_attribute a \
+                         ON a.attrelid = c.conrelid AND a.attnum = k.attnum), \
+                    (SELECT array_agg(a.attname ORDER BY k.ord) \
+                       FROM unnest(c.confkey) WITH ORDINALITY AS k(attnum, ord) \
+                       JOIN pg_attribute a \
+                         ON a.attrelid = c.confrelid AND a.attnum = k.attnum) \
+               FROM pg_constraint c \
+              WHERE c.conrelid = 'vala.oracle_table_protections'::regclass \
+                AND c.contype = 'f' \
+                AND c.confrelid = 'vala.oracle_reader_epochs'::regclass",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("epoch foreign key metadata read");
+        assert_eq!(
+            epoch_fk,
+            vec![(
+                false,
+                false,
+                "r".to_owned(),
+                vec!["node_id".to_owned(), "fencing_token".to_owned()],
+                vec!["node_id".to_owned(), "fencing_token".to_owned()],
+            )],
+            "a header references its epoch by (node_id, fencing_token) under a \
+             non-deferrable RESTRICT rule"
         );
         let protection_fks = constraints(&pool, "oracle_table_protections", "f").await;
         assert!(
@@ -1217,6 +1280,7 @@ mod pg_tests {
         let harness = ReaderAuthority::start().await;
         let node = harness.node_id;
         let fence = harness.register_oracle_role().await;
+        harness.acquire_epoch(fence).await;
         let frontier = harness.frontier(vec![30, 20, 10], 300, 100);
         let ProtectionCas::Committed(record) = harness
             .commit_protection(fence, None, &frontier, OracleTableProtectionPhase::Expanded)

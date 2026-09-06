@@ -872,6 +872,10 @@ pub async fn compose_bifrost(
         }
         let rewrite_spill_root = wal_dir.join("forge-spill");
         let staging = Arc::new(storage.operator().clone());
+        // Read from the concrete operator before it is erased behind
+        // `ForgeObjectStore`: only the backend itself can answer whether a
+        // bounded orphan listing can resume from a cursor.
+        let staging_lists_by_cursor = staging.info().full_capability().list_with_start_after;
         #[cfg(feature = "test-support")]
         let object_store: Arc<dyn ForgeObjectStore> = test_controls
             .as_ref()
@@ -903,6 +907,7 @@ pub async fn compose_bifrost(
                 }
             },
             staging,
+            staging_lists_by_cursor,
             object_store,
             rewrite_spill_root,
             hints: staging_file_inbox,

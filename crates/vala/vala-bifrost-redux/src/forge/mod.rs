@@ -114,6 +114,13 @@ pub struct ForgeBuildConfig {
     pub catalog: Arc<dyn Catalog>,
     /// Raw staging operator retained for table-owned producer fixtures.
     pub staging: Arc<opendal::Operator>,
+    /// Whether that staging operator advertises native `list_with_start_after`.
+    ///
+    /// Read once, from the concrete operator, before it is erased behind
+    /// [`ForgeObjectStore`]. Orphan collection resumes a bounded listing by
+    /// cursor, so a worker whose backend cannot do that natively must never
+    /// register, recover, publish ready, or claim.
+    pub staging_lists_by_cursor: bool,
     /// Object-store capability used by rewrites and garbage collection.
     pub object_store: Arc<dyn ForgeObjectStore>,
     /// Pod-local base beneath which each leased rewrite owns scratch.
@@ -158,6 +165,8 @@ pub(crate) struct ForgeCore {
     catalog: Arc<dyn Catalog>,
     /// Raw staging operator retained for the established Forge composition.
     staging: Arc<opendal::Operator>,
+    /// Whether the staging operator natively resumes a listing from a cursor.
+    staging_lists_by_cursor: bool,
     /// Narrow object-store seam used by rewrite and garbage-collection IO.
     object_store: Arc<dyn ForgeObjectStore>,
     /// Pod-local base for attempt-owned disposable scratch directories.
@@ -205,6 +214,7 @@ impl Forge {
             operator_pool: build.operator_pool,
             catalog: build.catalog,
             staging: build.staging,
+            staging_lists_by_cursor: build.staging_lists_by_cursor,
             object_store: build.object_store,
             rewrite_spill_root: build.rewrite_spill_root,
             config: build.config,

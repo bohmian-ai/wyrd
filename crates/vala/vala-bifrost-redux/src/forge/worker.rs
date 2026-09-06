@@ -1527,6 +1527,18 @@ impl ForgeWorker {
     /// probe or shutdown was requested during recovery, so the caller returns
     /// without ever publishing readiness.
     async fn start_and_drain(&self, shutdown: &CancellationToken) -> Result<bool, ForgeError> {
+        // Orphan collection resumes its bounded listing from a cursor, and
+        // emulating that cursor by refiltering would relist every earlier page
+        // on every attempt. A worker whose actual staging backend cannot resume
+        // natively therefore cannot keep the anti-starvation guarantee its
+        // cleanup authority depends on, so it refuses before scratch identity,
+        // registration, recovery, readiness, or any claim.
+        if !self.forge.core.staging_lists_by_cursor {
+            return Err(ForgeError::InvalidConfig {
+                detail: "Forge worker staging backend does not support native list_with_start_after"
+                    .to_owned(),
+            });
+        }
         let volume = self.scratch_volume_identity()?;
         if let Err(error) = self.probe_scratch() {
             self.tasks

@@ -1417,6 +1417,11 @@ impl ForgeFixture {
                 operator_pool: self.operator_pool.clone(),
                 catalog,
                 staging: Arc::clone(&self.staging),
+                staging_lists_by_cursor: self
+                    .staging
+                    .info()
+                    .full_capability()
+                    .list_with_start_after,
                 object_store,
                 rewrite_spill_root: runtime_root,
                 hints: inbox,

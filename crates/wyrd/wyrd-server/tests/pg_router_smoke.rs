@@ -1239,6 +1239,91 @@ async fn forge_checks_follow_target_selection() {
     }
 }
 
+/// A worker whose staging backend cannot resume a listing never starts.
+///
+/// Orphan collection's only anti-starvation mechanism is an exclusive
+/// `start_after` cursor, so a backend that cannot resume natively cannot keep
+/// the guarantee this worker's cleanup authority depends on. The refusal
+/// therefore lands before scratch identity, registration, recovery, readiness,
+/// or any claim — not at the first orphan listing, after the worker has already
+/// advertised itself and taken destructive work. The filesystem service is the
+/// already-installed backend that advertises the capability as absent, which is
+/// exactly the case this gate exists for.
+///
+/// # Panics
+///
+/// Panics when the server cannot start, when the incapable worker starts
+/// anyway, when it registers itself, or when it publishes ready.
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn forge_worker_refuses_staging_without_native_cursor_listing() {
+    let root = tempfile::tempdir().expect("staging root");
+    let server = WyrdTestServer::builder()
+        .with_storage_settings(wyrd_storage::StorageSettings {
+            backend: wyrd_storage::BackendConfig::Local {
+                root: root.path().to_path_buf(),
+            },
+            require_encryption: false,
+            presign_ttl: std::time::Duration::from_secs(600),
+            part_size_bytes: 16 * 1024 * 1024,
+            multipart_threshold_bytes: 100 * 1024 * 1024,
+            public_base_url: Some("https://wyrd.test".to_owned()),
+        })
+        .start_in_process()
+        .await
+        .expect("test server starts");
+    assert!(
+        !server
+            .state()
+            .storage
+            .operator()
+            .info()
+            .full_capability()
+            .list_with_start_after,
+        "the plain filesystem backend is the incapable staging this gate refuses"
+    );
+    let readiness = server
+        .state()
+        .forge()
+        .expect("the default target selects Forge")
+        .worker_readiness();
+
+    let stop = server.state().shutdown_token.child_token();
+    let worker = wyrd_server::boot::spawn_forge_worker(server.state(), stop.clone(), 1, 1)
+        .expect("the worker composes");
+    let error = worker
+        .await
+        .err()
+        .expect("an incapable staging backend refuses to start a worker");
+    assert!(
+        matches!(
+            error,
+            vala_bifrost_redux::forge::ForgeError::InvalidConfig { ref detail }
+                if detail.contains("list_with_start_after")
+        ),
+        "the refusal names the missing native cursor capability, got {error:?}"
+    );
+    assert!(
+        !readiness.is_ready(),
+        "a refused worker never publishes ready"
+    );
+    let registered: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.forge_worker_registry")
+        .fetch_one(
+            &server
+                .pg_fixture()
+                .superuser_pool()
+                .await
+                .expect("superuser pool"),
+        )
+        .await
+        .expect("worker registry is readable");
+    assert_eq!(
+        registered, 0,
+        "a refused worker never registers, healthy or quarantined"
+    );
+    server.shutdown().await.expect("test server shuts down");
+}
+
 /// A selected worker publishes ready only after its recovery drain, and clears
 /// the bit on shutdown while liveness keeps answering.
 #[cfg(feature = "test-support")]

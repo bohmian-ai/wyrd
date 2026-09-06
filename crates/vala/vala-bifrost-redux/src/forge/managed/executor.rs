@@ -77,7 +77,7 @@ impl Forge {
     /// its manifests cannot be read, [`ForgeError::Invariant`] when the core
     /// produced an object this attempt cannot attribute to itself or a handoff
     /// that contradicts itself, and [`ForgeError::ExecutionEnvelopeExceeded`]
-    /// when an admitted attempt exhausted its leased scratch. Any of those
+    /// when an admitted attempt exhausted its leased memory envelope. Any of those
     /// raised after the attempt may already have produced an object arrives
     /// wrapped in [`ForgeError::RewriteUnsettled`], which carries the complete
     /// attempt-global possible-output set so nothing becomes unreclaimable.
@@ -367,8 +367,8 @@ impl<'attempt> ForgeManagedRewrite<'attempt> {
     ///
     /// # Errors
     ///
-    /// Returns [`ForgeError::ExecutionEnvelopeExceeded`] when the leased
-    /// scratch or memory was exhausted, and [`ForgeError::Catalog`] for every
+    /// Returns [`ForgeError::ExecutionEnvelopeExceeded`] when the attempt's own
+    /// leased memory envelope caused the failure, and [`ForgeError::Catalog`] for every
     /// other core failure, whose cause is a manifest, scan, or writer
     /// operation. Either is wrapped in [`ForgeError::RewriteUnsettled`] when
     /// the attempt may already have produced an object.
@@ -383,12 +383,9 @@ impl<'attempt> ForgeManagedRewrite<'attempt> {
                 possible_outputs: self.possible_outputs(),
             });
         }
-        let failure = if let Some(resource) = exhausted_lease(
-            self.observer.peak_scratch_bytes(),
-            self.resources.scratch_bytes(),
-            self.observer.peak_memory_bytes(),
-            self.resources.memory_bytes(),
-        ) {
+        let failure = if let Some(resource) =
+            execution_envelope_resource(error, self.resources.memory_was_refused())
+        {
             ForgeError::ExecutionEnvelopeExceeded {
                 resource,
                 detail: format!("Forge managed rewrite exhausted its {resource} lease: {error}"),
@@ -436,29 +433,34 @@ impl<'attempt> ForgeManagedRewrite<'attempt> {
     }
 }
 
-/// Names the leased execution term an attempt exhausted, if it exhausted one.
+/// Names the execution-envelope term that causally terminated this attempt.
 ///
-/// Both terms are admission promises the attempt was granted before any IO, so
-/// reaching either one is a capacity outcome and not an object-store or catalog
-/// fault. Memory is checked as well as scratch because an attempt whose pool
-/// refused a reservation fails inside the core exactly like a scan failure
-/// does, and classifying that as transient would ask the scheduler to retry an
-/// attempt that cannot fit. Scratch is checked first because an attempt that
-/// spilled to its limit reached memory pressure first by construction, so the
-/// spill is the more specific term to report.
-fn exhausted_lease(
-    peak_scratch: u64,
-    scratch_lease: u64,
-    peak_memory: u64,
-    memory_lease: u64,
+/// Classification needs two independent facts, because neither alone is
+/// causal. The terminal error must have a typed
+/// [`DataFusionError::ResourcesExhausted`] root — a resource refusal actually
+/// ended the attempt — and this attempt's own memory envelope must have
+/// refused a reservation, so the exhaustion belongs to the lease Forge granted
+/// rather than to unrelated work. A resource peak proves only successful
+/// ownership and grants no classification authority, and a recoverable memory
+/// refusal that the plan spilled past never reclassifies a later unrelated
+/// failure. Scratch is deliberately unclassified: the pinned managed core
+/// rebuilds its runtime without Forge's scratch ceiling, and `DataFusion`
+/// reports its own temp-directory limit as an `io::Error`, so no causal
+/// scratch signal exists to read.
+fn execution_envelope_resource(
+    error: &iceberg_compaction_core::error::CompactionError,
+    memory_was_refused: bool,
 ) -> Option<&'static str> {
-    if peak_scratch >= scratch_lease {
-        return Some("scratch");
-    }
-    if peak_memory >= memory_lease {
-        return Some("memory");
-    }
-    None
+    let iceberg_compaction_core::error::CompactionError::DataFusion(error) = error else {
+        return None;
+    };
+    matches!(
+        error.find_root(),
+        datafusion::error::DataFusionError::ResourcesExhausted(_)
+    )
+    .then_some(())
+    .filter(|()| memory_was_refused)
+    .map(|()| "memory")
 }
 
 /// Appends one plan's consumed live paths to the handoff's accumulators.
@@ -516,14 +518,32 @@ fn total_equality_deletes(plans: &[CompactionPlan]) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::exhausted_lease;
+    use super::execution_envelope_resource;
+    use datafusion::error::DataFusionError;
+    use iceberg_compaction_core::error::CompactionError;
 
-    /// An attempt that reached its memory grant is a capacity outcome, not a
-    /// transient object-store one, even when its scratch was never touched.
+    /// Only a typed resource failure caused by this attempt's own memory
+    /// refusal is an execution-envelope outcome; a peak never classifies.
     #[test]
-    fn exhausted_memory_lease_is_named_when_scratch_is_untouched() {
-        assert_eq!(exhausted_lease(0, 4096, 8192, 8192), Some("memory"));
-        assert_eq!(exhausted_lease(4096, 4096, 0, 8192), Some("scratch"));
-        assert_eq!(exhausted_lease(1, 4096, 1, 8192), None);
+    fn execution_envelope_classification_requires_causal_exhaustion() {
+        let exhausted = CompactionError::DataFusion(DataFusionError::ResourcesExhausted(
+            "Forge sort allowance exhausted".to_owned(),
+        ));
+        assert_eq!(
+            execution_envelope_resource(&exhausted, true),
+            Some("memory"),
+            "a typed resource failure with a recorded refusal names memory"
+        );
+        assert_eq!(
+            execution_envelope_resource(&exhausted, false),
+            None,
+            "a typed resource failure this attempt did not cause is not an envelope outcome"
+        );
+        let unrelated = CompactionError::Execution("manifest scan failed".to_owned());
+        assert_eq!(
+            execution_envelope_resource(&unrelated, true),
+            None,
+            "a recoverable memory refusal cannot reclassify an unrelated failure"
+        );
     }
 }

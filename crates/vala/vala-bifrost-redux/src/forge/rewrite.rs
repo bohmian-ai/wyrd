@@ -2,7 +2,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::memory_pool::{
@@ -22,6 +22,13 @@ struct ForgeAttemptMemoryPool {
     inner: Arc<dyn MemoryPool>,
     /// Largest aggregate reservation observed after successful growth.
     peak_bytes: Arc<AtomicU64>,
+    /// Set once this attempt's own memory envelope refused a reservation.
+    ///
+    /// A peak records what an attempt successfully owned and cannot say which
+    /// later operation failed, so this monotonic bit is the only causal
+    /// evidence that a terminal resource error came from the attempt's memory
+    /// envelope rather than from unrelated work.
+    memory_refused: Arc<AtomicBool>,
     /// Persisted sort working bytes excluding non-spillable merge headroom.
     sort_allowance: usize,
     /// Live spillable bytes subject to the shared spill-pressure allowance.
@@ -32,10 +39,16 @@ struct ForgeAttemptMemoryPool {
 
 impl ForgeAttemptMemoryPool {
     /// Wraps the one aggregate attempt lease without creating child ledgers.
-    fn new(inner: Arc<dyn MemoryPool>, peak_bytes: Arc<AtomicU64>, sort_allowance: usize) -> Self {
+    fn new(
+        inner: Arc<dyn MemoryPool>,
+        peak_bytes: Arc<AtomicU64>,
+        memory_refused: Arc<AtomicBool>,
+        sort_allowance: usize,
+    ) -> Self {
         Self {
             inner,
             peak_bytes,
+            memory_refused,
             sort_allowance,
             sort_bytes: AtomicUsize::new(0),
             sort_consumers: AtomicUsize::new(0),
@@ -121,6 +134,7 @@ impl MemoryPool for ForgeAttemptMemoryPool {
                     })
                     .is_err()
             {
+                self.memory_refused.store(true, Ordering::Release);
                 return Err(DataFusionError::ResourcesExhausted(format!(
                     "Forge sort allowance {} bytes exhausted; consumer fair share {fair_share} bytes",
                     self.sort_allowance,
@@ -131,6 +145,7 @@ impl MemoryPool for ForgeAttemptMemoryPool {
             if spillable {
                 self.sort_bytes.fetch_sub(additional, Ordering::AcqRel);
             }
+            self.memory_refused.store(true, Ordering::Release);
             return Err(error);
         }
         self.observe_peak();
@@ -167,6 +182,11 @@ pub(crate) struct ForgeAttemptResources {
     release_result: Option<crate::resources::ForgeResourceReleaseResult>,
     /// Attempt-local resident peak shared with the leased pool wrapper.
     peak_memory_bytes: Arc<AtomicU64>,
+    /// Attempt-local memory refusal shared with the leased pool wrapper.
+    ///
+    /// Retained for the whole attempt lifetime so the managed executor can read
+    /// it after the core's terminal error has drained.
+    memory_refused: Arc<AtomicBool>,
     /// Persisted and acquired totals reported once at finalization.
     observation: ForgeAttemptResourceObservation,
 }
@@ -267,9 +287,11 @@ impl ForgeAttemptResources {
                 })?;
         let projection = project_forge_binding(&lease, binding)?;
         let peak_memory_bytes = Arc::new(AtomicU64::new(0));
+        let memory_refused = Arc::new(AtomicBool::new(false));
         let pool: Arc<dyn MemoryPool> = Arc::new(ForgeAttemptMemoryPool::new(
             lease.memory_pool(),
             Arc::clone(&peak_memory_bytes),
+            Arc::clone(&memory_refused),
             sort_allowance,
         ));
         let runtime = ForgeRewriteRuntime::new_attempt(
@@ -292,6 +314,7 @@ impl ForgeAttemptResources {
             lease: Some(lease),
             release_result: None,
             peak_memory_bytes,
+            memory_refused,
             observation: ForgeAttemptResourceObservation {
                 planned_memory: u64::try_from(request.memory_bytes).unwrap_or(u64::MAX),
                 acquired_memory: u64::try_from(request.memory_bytes).unwrap_or(u64::MAX),
@@ -321,9 +344,14 @@ impl ForgeAttemptResources {
         self.observation.acquired_memory
     }
 
-    /// Returns the exact scratch this attempt was granted, in bytes.
-    pub(crate) fn scratch_bytes(&self) -> u64 {
-        self.observation.acquired_scratch
+    /// Reports whether this attempt's own memory envelope refused a reservation.
+    ///
+    /// The bit is monotonic and attempt-local, so a `true` reading proves only
+    /// that memory pressure occurred somewhere in this attempt; the caller must
+    /// pair it with a terminal typed resource error before treating a failure
+    /// as an exhausted execution envelope.
+    pub(crate) fn memory_was_refused(&self) -> bool {
+        self.memory_refused.load(Ordering::Acquire)
     }
 
     /// Returns the attempt-owned scratch root the compaction core may spill into.
@@ -578,9 +606,11 @@ mod tests {
     /// violates the real pool's reservation accounting.
     #[test]
     fn spillable_sort_preserves_decode_headroom() {
+        let memory_refused = Arc::new(AtomicBool::new(false));
         let pool: Arc<dyn MemoryPool> = Arc::new(ForgeAttemptMemoryPool::new(
             Arc::new(FairSpillPool::new(128)),
             Arc::new(AtomicU64::new(0)),
+            Arc::clone(&memory_refused),
             64,
         ));
         let sort = MemoryConsumer::new("sort")
@@ -589,8 +619,20 @@ mod tests {
         let decode = MemoryConsumer::new("decode").register(&pool);
         sort.try_grow(64).expect("sort fits its admitted allowance");
         assert!(
+            !memory_refused.load(Ordering::Acquire),
+            "successful growth records no refusal"
+        );
+        assert!(
             sort.try_grow(1).is_err(),
             "sort must preserve decode headroom"
+        );
+        assert!(
+            memory_refused.load(Ordering::Acquire),
+            "a refused reservation records attempt-local memory pressure"
+        );
+        assert!(
+            pool.reserved() < 128,
+            "the refusal happened below the aggregate lease"
         );
         decode
             .try_grow(64)

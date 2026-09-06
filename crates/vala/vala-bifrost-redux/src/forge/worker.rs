@@ -2658,6 +2658,26 @@ impl ForgeWorker {
                 return Ok(false);
             }
         };
+        // An orphan-cleanup prefix is a delete authority, and a well-shaped one
+        // belonging to a sibling table would still be a cross-table delete. The
+        // dispatch's catalog-derived comparison catches metadata drift but only
+        // after a lease and a catalog load; the binding already names this
+        // task's own table, so the mismatch is refused here, before any lease,
+        // catalog, listing, stat, or delete happens at all.
+        if matches!(stage, ForgeExecutionStage::OrphanGc) {
+            let prefix = claim
+                .plan
+                .orphan_cleanup_prefix(true)
+                .map_err(ForgeError::Sql)?;
+            let owned = super::orphan_gc::forge_data_prefix(&binding);
+            if prefix != owned {
+                return Err(ForgeError::Invariant {
+                    detail: format!(
+                        "orphan cleanup plan prefix {prefix} is not this task's table Forge root {owned}"
+                    ),
+                });
+            }
+        }
         let lease_key = forge_lease_key(
             task.data_tenant_id,
             &binding.logical_namespace,

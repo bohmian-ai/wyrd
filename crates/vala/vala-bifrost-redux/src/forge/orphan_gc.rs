@@ -290,7 +290,7 @@ impl MaintenanceScope {
 /// binding's `object_prefix` is that same table's object-key form, so appending
 /// the fixed marker and recipe here yields the identical root without needing a
 /// loaded table.
-fn forge_data_prefix(binding: &TenantTableBinding) -> String {
+pub(super) fn forge_data_prefix(binding: &TenantTableBinding) -> String {
     format!(
         "{}{FORGE_DATA_MARKER}{FORGE_WRITER_RECIPE}",
         binding.object_prefix.trim_end_matches('/')

@@ -298,10 +298,27 @@ async fn assert_collection_deletes_only_rowless(
 ///
 /// Panics when the insert fails.
 async fn seed_ready_orphan_task(fixture: &PromotionIntegrationFixture, cutoff_ms: i64) -> Uuid {
+    seed_ready_orphan_task_at(fixture, cutoff_ms, forge_root(fixture)).await
+}
+
+/// Seeds one ready orphan-cleanup task whose scan prefix is `prefix`.
+///
+/// Identical to [`seed_ready_orphan_task`] except that the caller chooses the
+/// plan's single input, which is what lets a scenario file a well-shaped prefix
+/// that belongs to a different table under this table's task row.
+///
+/// # Panics
+///
+/// Panics when the insert fails.
+async fn seed_ready_orphan_task_at(
+    fixture: &PromotionIntegrationFixture,
+    cutoff_ms: i64,
+    prefix: String,
+) -> Uuid {
     let task_id = Uuid::now_v7();
     let plan = serde_json::json!({
         "version": 1,
-        "inputs": [forge_root(fixture)],
+        "inputs": [prefix],
         "parameters": {"version": 1, "kind": "orphan_cleanup", "age_cutoff_ms": cutoff_ms},
     });
     sqlx::query(
@@ -664,6 +681,108 @@ async fn assert_recovered_pass_exhausts_the_prefix(
         evidence.is_none(),
         "a completed orphan task carries no resume position: {evidence:?}"
     );
+}
+
+/// A sibling table's Forge root is refused before any lease, catalog, or IO.
+///
+/// The plan input is a delete authority. A prefix that is well shaped — same
+/// tenant, same warehouse, same `data/forge/v1` recipe root — but names a
+/// different table would still authorise deleting that table's objects, and the
+/// dispatch's catalog-derived comparison only catches it after the worker has
+/// already taken the table fence and loaded metadata. The binding derived from
+/// the task row already names the one table this task may touch, so the refusal
+/// belongs before all of that: no lease row, no catalog load, no listing, no
+/// stat, and no delete may exist when it returns.
+///
+/// # Panics
+///
+/// Panics when the fixture cannot start, when the cross-table prefix is
+/// accepted, or when any effect was reached before the refusal.
+#[tokio::test]
+async fn cross_table_plan_refuses_before_lease_or_io() {
+    let promoted = PromotedRewriteFixture::start_unpromoted("orphan_cross_table").await;
+    let store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
+    let catalog = PromotionCatalogSeam::new(
+        promoted.fixture.catalog.iceberg_catalog(),
+        store.read_counter(),
+    );
+    let (clock, control) = manual_clock();
+    let mut supervisor = SupervisedPromotion::start(
+        &promoted.fixture,
+        Arc::clone(&catalog) as Arc<dyn Catalog>,
+        Arc::clone(&store) as Arc<dyn ForgeObjectStore>,
+        clock,
+    );
+    supervisor.run_one_success().await;
+    let forge = supervisor.forge();
+    supervisor.shutdown().await;
+    let cutoff = control
+        .advance(ChronoDuration::hours(25))
+        .expect("manual clock advance")
+        .timestamp_millis();
+
+    let fixture = &promoted.fixture;
+    let owned = forge_root(fixture);
+    // Same tenant, same warehouse, same recipe root: only the table segment
+    // differs, which is exactly the prefix a confused or hostile planner emits.
+    let sibling = owned.replace(
+        &fixture.binding.table_name,
+        &format!("{}_sibling", fixture.binding.table_name),
+    );
+    assert_ne!(sibling, owned, "the decoy names a different table");
+    let task_id = seed_ready_orphan_task_at(fixture, cutoff, sibling.clone()).await;
+
+    let worker = ForgeWorker::new(
+        Arc::clone(&forge),
+        ForgeWorkerConfig::default(),
+        Uuid::now_v7(),
+    )
+    .expect("fixture Forge worker");
+    let claim = worker
+        .claim_for_test()
+        .await
+        .expect("claim transaction runs")
+        .expect("the ready orphan task is claimable");
+    assert_eq!(claim.task_id, task_id, "no other task is claimable");
+    let loads_before = catalog.loads();
+
+    let refusal = worker
+        .execute_claim(claim, &CancellationToken::new())
+        .await
+        .expect_err("a sibling table's Forge root is not this task's delete authority");
+    assert!(
+        matches!(
+            &refusal,
+            vala_bifrost_redux::forge::ForgeError::Invariant { detail }
+                if detail.contains(&sibling) && detail.contains(&owned)
+        ),
+        "the refusal names the rejected prefix and this task's own root: {refusal}"
+    );
+
+    assert_eq!(
+        catalog.loads(),
+        loads_before,
+        "the refusal precedes every catalog load"
+    );
+    assert!(
+        store.list_cursors().is_empty(),
+        "the refusal precedes every orphan listing"
+    );
+    assert_eq!(store.stats(), 0, "the refusal precedes every stat");
+    assert_eq!(store.deletes(), 0, "the refusal precedes every delete");
+    assert!(
+        orphan_operations(fixture).await.is_empty(),
+        "no orphan-GC batch was ever prepared"
+    );
+    assert!(
+        orphan_gc_audits(fixture).await.is_empty(),
+        "a refusal before any effect appends no orphan-GC audit"
+    );
+    let leases: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.maintenance_leases")
+        .fetch_one(fixture.operator_pool.pool())
+        .await
+        .expect("maintenance leases are readable");
+    assert_eq!(leases, 0, "the refusal precedes table fence acquisition");
 }
 
 /// One promoted table carrying exactly one aged, eligible rowless orphan.

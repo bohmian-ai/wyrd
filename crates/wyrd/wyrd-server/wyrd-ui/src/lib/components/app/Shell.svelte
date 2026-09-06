@@ -30,11 +30,22 @@
     ['Query', '/query']
   ];
   let base = $derived(`/t/${encodeURIComponent(tenant.key)}`);
-  let current = $derived(
+  let area = $derived(
     entries.find(
       ([, suffix]) =>
         suffix && (pathname === base + suffix || pathname.startsWith(base + suffix + '/'))
-    )?.[0] ?? 'Home'
+    )
+  );
+  let current = $derived(area?.[0] ?? 'Home');
+  // Deep-route segments after the area root, so drilldown pages keep their
+  // place in the topbar (e.g. acme / Changes / change_01 / verification).
+  let trail = $derived(
+    area
+      ? pathname
+          .slice((base + area[1]).length)
+          .split('/')
+          .filter(Boolean)
+      : []
   );
 </script>
 
@@ -55,7 +66,7 @@
   </aside>
   <div class="workspace">
     <header>
-      <span class="product">WYRD</span><span class="context">{tenant.key} / <strong>{current}</strong></span>
+      <span class="product">WYRD</span><span class="context">{tenant.key} / <strong>{current}</strong>{#each trail as segment, i (i)}{' / '}{decodeURIComponent(segment)}{/each}</span>
       <div class="identity">
         {#if session.tenants.length > 1}
           <details class="tenant-menu">

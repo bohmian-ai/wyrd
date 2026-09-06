@@ -1,7 +1,12 @@
 import { randomUUID } from 'node:crypto';
 import { mockChanges } from './changes/store';
 import { mentions, newDraft, subjects, verifiers } from './changes/fixtures';
-import type { ChangeView, Draft, ReviewInput } from '$lib/features/changes/types';
+import type {
+  ChangeView,
+  Draft,
+  ReviewInput,
+  ReviseInput
+} from '$lib/features/changes/types';
 import type { ChangeList, ChangeSummary } from '$lib/features/changes/types';
 import { mockHome } from './mock';
 import type { HomeView } from '$lib/views';
@@ -177,6 +182,20 @@ export class WyrdClient {
       checkId,
       requestKey,
       confirmed
+    );
+  }
+
+  reviseChange(id: string, input: ReviseInput): string {
+    this.changeAccess(true);
+    for (const added of input.addClaims)
+      if (added.verifier && !verifiers.some((verifier) => verifier.name === added.verifier))
+        reject('validation');
+    return mockChanges.revise(
+      this.context.tenant.tenantId,
+      this.context.tenant.key,
+      this.context.subject.id,
+      id,
+      input
     );
   }
 

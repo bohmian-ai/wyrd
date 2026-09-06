@@ -141,13 +141,6 @@ export function mockHome(tenant: Tenant): HomeView {
         detail: 'checkout-api error rate 1.2% · ranking drift',
         href: `${base}/observe`,
         signal: true
-      },
-      {
-        label: 'Changes',
-        value: 4,
-        unit: 'open',
-        detail: '1 verified · 1 draft · 2 awaiting your review',
-        href: `${base}/changes`
       }
     ],
     recent: [

@@ -169,6 +169,17 @@ export type ActionResult = {
   currentRevision?: string;
   draft?: Draft;
 };
+export type ReviseInput = {
+  /** Exact open revision being amended; a mismatch is a conflict, never a merge. */
+  revision: string;
+  requestKey: string;
+  /** Human reason recorded on the revision event; required for the audit trail. */
+  reason: string;
+  /** Claims added to the new revision; an empty verifier defers check selection. */
+  addClaims: { title: string; verifier: string }[];
+  /** Claim ids removed from the new revision; every id must exist on the amended revision. */
+  removeClaimIds: string[];
+};
 export type ReviewInput = {
   operation:
     | 'comment'

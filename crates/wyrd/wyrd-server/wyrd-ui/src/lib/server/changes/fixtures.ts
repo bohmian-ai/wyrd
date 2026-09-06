@@ -495,7 +495,7 @@ export function fixtureChange(summary = summaries[0]): Change {
             at: '2026-09-03T10:52:00Z',
             actor: 'm.linden',
             text: 'Commented on Evidence test_hold_threshold',
-            destination: '/review#thread_evidence'
+            destination: '#thread_evidence'
           },
           {
             id: 'event_commit',
@@ -531,7 +531,7 @@ export function fixtureChange(summary = summaries[0]): Change {
             at: '2026-09-02T12:00:00Z',
             actor: 'r.okafor',
             text: 'Opened a thread on CLAIM-2',
-            destination: '/review#thread_claim'
+            destination: '#thread_claim'
           },
           {
             id: 'event_rev6',

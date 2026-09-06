@@ -50,20 +50,19 @@
   .wy-panel[data-variant='wide'] {
     grid-column: 1 / -1;
   }
+  /* GitHub-style anatomy: a tinted, bold header band over a plain body. The band,
+     not the copy inside, is what separates panels from one another. */
   .wy-panel-head {
     display: flex;
     align-items: center;
     justify-content: space-between;
     gap: 8px;
     flex-wrap: wrap;
-    padding: 8px 11px;
+    padding: 10px 14px;
     border-bottom: 2px solid var(--border);
-    font-family: var(--fm);
-    font-size: 9px;
-    font-weight: 700;
-    letter-spacing: 0.5px;
-    text-transform: uppercase;
-    color: var(--muted);
+    background: var(--surface-2);
+    font: 700 13px var(--font-sans);
+    color: var(--text);
   }
   /* owner=fathom tints the head, marking the content as Fathom-authored. Its label stays
      --text, NOT --ink-on-fill: the band lands on a dark olive in dark mode. */
@@ -72,6 +71,6 @@
     color: var(--text);
   }
   .wy-panel-body {
-    padding: 12px;
+    padding: 16px;
   }
 </style>

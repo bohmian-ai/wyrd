@@ -159,6 +159,33 @@ export async function runCheck(event: RequestEvent) {
     return fail(problem.status, { problem });
   }
 }
+export async function reviseChange(event: RequestEvent) {
+  const form = await actionForm(event);
+  try {
+    const removeClaimIds = form.getAll('remove').map((value) => {
+      if (typeof value !== 'string' || value.length > 100 || !value) reject('validation');
+      return value;
+    });
+    if (removeClaimIds.length > 30) reject('validation');
+    const addTitle = text(form, 'addTitle', 300);
+    event.locals.wyrd!.reviseChange(event.params.id!, {
+      revision: text(form, 'revision', 100),
+      requestKey: text(form, 'requestKey', 100),
+      reason: text(form, 'reason'),
+      addClaims: addTitle.trim()
+        ? [{ title: addTitle, verifier: text(form, 'addVerifier', 200) }]
+        : [],
+      removeClaimIds
+    });
+  } catch (cause) {
+    const problem = safeProblem(cause);
+    return fail(problem.status, { problem });
+  }
+  redirect(
+    303,
+    `/t/${encodeURIComponent(event.params.tenantKey!)}/changes/${event.params.id}/verification`
+  );
+}
 export async function reviewChange(event: RequestEvent) {
   const form = await actionForm(event);
   const body = text(form, 'body');

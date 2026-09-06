@@ -19,16 +19,8 @@
   let selectionKey = $derived(
     JSON.stringify([data.change.id, data.change.revision, data.subject.id, data.file?.path])
   );
-  let line = $derived(
-    selection?.key === selectionKey
-      ? selection.line
-      : (data.file?.lines.at(-1)?.number ?? null)
-  );
-  let side = $derived(
-    selection?.key === selectionKey
-      ? selection.side
-      : (data.file?.lines.at(-1)?.side ?? 'new')
-  );
+  let line = $derived(selection?.key === selectionKey ? selection.line : null);
+  let side = $derived(selection?.key === selectionKey ? selection.side : 'new');
   let base = $derived(`/t/${data.tenant.key}/changes/${data.change.id}`);
   let fileIndex = $derived(
     data.subject.files.findIndex((file) => file.path === data.file?.path)
@@ -43,16 +35,16 @@
     return `?revision=${data.change.revision}&file=${encodeURIComponent(data.subject.files[index].path)}`;
   }
 </script>
-<div class="changes source-page"><ChangeHeader view={data} {base} active="Subjects" /><div class="stack">
+<div class="changes source-page"><ChangeHeader view={data} {base} active="Files changed" /><div class="stack">
 <details class="subject-navigation" bind:open={navigationOpen}><summary class="source-identity mono">{data.subject.base} → {data.subject.candidate} · {data.subject.repository} · PR #{data.subject.pr}</summary><div class="row between"><a href={`${base}?revision=${data.change.revision}#subjects`}>← All subjects</a><span class="mono">{data.subject.id} — subject {subjectIndex + 1} of {data.change.subjects.length}</span>{#if data.change.subjects[subjectIndex + 1]}<a href={`${base}/subjects/${data.change.subjects[subjectIndex + 1].id}?revision=${data.change.revision}`}>Next subject →</a>{/if}</div><div class="notice mono source-identity">{data.subject.base} → {data.subject.candidate} · {data.subject.repository} · {data.subject.provider} · PR #{data.subject.pr} · {data.subject.relationship}</div></details>
 
 <div class="source-grid"><section class="files"><Panel title="Changed files"><p>File {fileIndex + 1} of {data.subject.files.length}</p><nav class="file-list" aria-label="Changed files">{#each data.subject.files as file, index}<a href={fileLink(index)} aria-current={data.file?.path === file.path ? 'page' : undefined} title={file.path}><span class="full-path">{file.path}</span><span class="short-path">{file.path.split("/").at(-1)}</span><small> +{file.additions} −{file.deletions}</small></a>{/each}</nav></Panel></section>
 <div class="stack diff-content">{#if data.file}{@const file = data.file}<Panel title={`${data.file.path} — unified diff · Read-only`}>{#snippet head()}<div class="row between file-controls"><span class="mono">+{file.additions} −{file.deletions}</span><div class="row">{#if fileIndex > 0}<a class="control" href={fileLink(fileIndex-1)}>‹ Prev file</a>{/if}{#if fileIndex + 1 < data.subject.files.length}<a class="control" href={fileLink(fileIndex+1)}>Next file ›</a>{/if}</div></div>{/snippet}
-<Table label="Read-only unified diff"><div class="diff">{#each data.file.lines as row}<div id={`line-${row.side}-${row.number}`} class="diff-line" class:added={row.kind === '+'} class:removed={row.kind === '-'}><button class="line-action" type="button" aria-label={`Discuss ${row.side} line ${row.number}`} onclick={() => selection = { key: selectionKey, line: row.number, side: row.side }} disabled={!data.capabilities.review}>+</button><span class="line-number">{row.number}</span><code>{row.kind} {row.text}</code>{#each threads.filter(thread => thread.anchor.file === data.file?.path && thread.anchor.line === row.number && thread.anchor.side === row.side) as thread}<a href={`${base}/review#${thread.id}`}>{thread.resolved ? '✓ Resolved thread' : '● Open thread'}</a>{/each}</div>{/each}</div></Table>
+<Table label="Read-only unified diff"><div class="diff">{#each data.file.lines as row}<div id={`line-${row.side}-${row.number}`} class="diff-line" class:added={row.kind === '+'} class:removed={row.kind === '-'}><button class="line-action" type="button" aria-label={`Discuss ${row.side} line ${row.number}`} onclick={() => selection = { key: selectionKey, line: row.number, side: row.side }} disabled={!data.capabilities.review}>+</button><span class="line-number">{row.number}</span><code>{row.kind} {row.text}</code>{#each threads.filter(thread => thread.anchor.file === data.file?.path && thread.anchor.line === row.number && thread.anchor.side === row.side) as thread}<a href={`${base}#${thread.id}`}>{thread.resolved ? '✓ Resolved thread' : '● Open thread'}</a>{/each}</div>{/each}</div></Table>
 </Panel>{:else}<StateBlock state="absent" title="No source diff received" detail="The exact subject is saved; source inspection is not available yet." />{/if}
-<Panel title={`Start discussion${line ? ' — line ' + line : ''}`}><p class="mono">{data.file?.path} · revision {data.change.revisionNumber}</p>{#if data.file}{#key selectionKey}<Composer view={data} csrf={data.session.csrf} label="Start discussion" anchor={{ kind: 'source', revision: data.change.revision, target: data.subject.id, file: data.file.path, line: line ?? data.file.lines.at(-1)!.number, side }} result={form} />{/key}{/if}</Panel>
+{#if data.file && line !== null}<Panel title={`Start discussion — line ${line}`}><p class="mono">{data.file.path} · revision {data.change.revisionNumber}</p>{#key `${selectionKey}:${line}:${side}`}<Composer view={data} csrf={data.session.csrf} label="Start discussion" anchor={{ kind: 'source', revision: data.change.revision, target: data.subject.id, file: data.file.path, line, side }} result={form} />{/key}</Panel>{:else if form?.problem}<p class="notice" role="alert">{form.problem.title} · {form.problem.code}</p>{:else if data.file}<p class="muted">Select + next to a diff line to <strong>Start discussion</strong>.</p>{/if}
 {#if data.subject.url}<a href={data.subject.url} target="_blank" rel="noreferrer">View in provider ↗ — PR #{data.subject.pr}</a>{/if}
-</div><section class="source-threads"><Panel title="Anchored threads">{#each threads as thread}<p class="mono">{thread.anchor.file}:{thread.anchor.line}</p><Badge tone={thread.resolved ? 'ok' : 'running'}>{thread.resolved ? 'Resolved' : 'Open'}</Badge><p><a href={`${base}/review#${thread.id}`}>Open thread →</a></p>{/each}</Panel></section><details class="source-commits" bind:open={commitsOpen}><summary>Commit history · {data.subject.commits.length}</summary><Panel title="Commits">{#each data.subject.commits as commit}<p class="mono"><strong>{commit.sha}</strong><br />{commit.title}</p>{/each}</Panel></details></div><div class="footer row"><a class="control primary" href={`${base}/review?revision=${data.change.revision}#submit-review`}>Review changes</a></div>
+</div>{#if threads.length}<section class="source-threads"><Panel title="Anchored threads">{#each threads as thread}<p class="mono">{thread.anchor.file}:{thread.anchor.line}</p><Badge tone={thread.resolved ? 'ok' : 'running'}>{thread.resolved ? 'Resolved' : 'Open'}</Badge><p><a href={`${base}#${thread.id}`}>Open thread →</a></p>{/each}</Panel></section>{/if}<details class="source-commits" bind:open={commitsOpen}><summary>Commit history · {data.subject.commits.length}</summary><Panel title="Commits">{#each data.subject.commits as commit}<p class="mono"><strong>{commit.sha}</strong><br />{commit.title}</p>{/each}</Panel></details></div>
 </div></div>
 <style>
   .source-grid {

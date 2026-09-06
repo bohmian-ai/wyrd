@@ -2,6 +2,8 @@
   color: var(--text);
   font: 13px var(--font-sans);
   min-width: 0;
+  /* Quiet in-panel separator: full-strength --border is for panel edges only. */
+  --sep: color-mix(in srgb, var(--border) 30%, var(--surface));
 }
 .changes h1 {
   font: 700 22px var(--font-display);
@@ -18,6 +20,17 @@
 .changes p {
   margin: 8px 0;
   line-height: 1.55;
+}
+/* Metadata lines are grid rows, not prose: tight vertical rhythm so related
+   facts group together and unrelated regions separate. */
+.changes p.mono,
+.changes td p,
+.changes td small {
+  margin: 2px 0;
+  line-height: 1.4;
+}
+.changes tbody td {
+  vertical-align: top;
 }
 .changes a {
   color: var(--brand-strong);
@@ -105,8 +118,8 @@
   flex-wrap: wrap;
   gap: 8px;
   border-bottom: 2px solid var(--border);
-  padding: 10px 0;
-  margin-bottom: 16px;
+  padding: 8px 0;
+  margin-bottom: 24px;
   font: 700 11px var(--font-mono);
 }
 .changes .nav a {
@@ -126,9 +139,24 @@
   font-weight: 600;
 }
 .changes .divider {
-  border-top: 2px dashed var(--border);
+  border-top: 1px solid var(--sep);
   margin-top: 14px;
   padding-top: 14px;
+}
+/* Rail fact rows: mono microlabel column + value column, replacing prose
+   sentences so supporting panels scan as data. */
+.changes .kv {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 4px 14px;
+  align-items: baseline;
+  font-size: 12px;
+}
+.changes .kv > .k {
+  font: 10px var(--font-mono);
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
 }
 .changes .notice {
   padding: 10px;
@@ -142,9 +170,6 @@
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
-}
-.changes .raised {
-  border-top: 4px solid var(--brand-strong);
 }
 .changes pre {
   white-space: pre-wrap;
@@ -164,7 +189,7 @@
 }
 .changes .footer {
   position: sticky;
-  bottom: 44px;
+  bottom: 0;
   z-index: 2;
   padding: 12px 0;
   background: var(--bg);
@@ -235,10 +260,10 @@
   .changes .mono {
     font-size: 9px;
   }
-  .changes .wy-panel-body {
+  .changes .wy-panel .wy-panel-body {
     padding: 8px;
   }
-  .changes .wy-panel-head {
+  .changes .wy-panel .wy-panel-head {
     padding: 6px 8px;
   }
   .changes .nav {

@@ -73,7 +73,7 @@
     <aside aria-label="Workspace summaries and recent work">
       {#each data.home.summaries as item (item.href)}
         <Panel variant="flat">
-          {#snippet head()}<h2>{item.label}</h2><span>linked summary</span>{/snippet}
+          {#snippet head()}<h2>{item.label}</h2>{/snippet}
           <div class="summary">
             <strong>{item.signal ? '! ' : ''}{fmtCount(item.value)} {item.unit}</strong>
             <p>{item.detail}</p>
@@ -157,20 +157,13 @@
   h2 {
     font: inherit;
   }
-  .home-grid :global(.wy-panel-head) {
-    min-height: 30px;
-    padding: 7px 11px;
-  }
   .home-grid :global(.wy-panel-head > span),
   .context-link {
-    font-weight: 400;
-    text-transform: none;
-    letter-spacing: 0;
+    font: 400 11px var(--font-mono);
     color: var(--muted);
     text-decoration: none;
   }
   .attention :global(.wy-panel) {
-    border-top: 4px solid var(--warn);
     min-height: 214px;
   }
   .work :global(.wy-panel-body) {

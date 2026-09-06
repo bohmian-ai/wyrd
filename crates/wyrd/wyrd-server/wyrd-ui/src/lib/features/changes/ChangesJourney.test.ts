@@ -121,7 +121,7 @@ test('incomplete draft saves, resumes, and accepts multiple subjects and require
   const html = await (await get(draftPath)).text();
   expect(html).toContain('Safer checkout');
   expect(html).toContain('Resume draft');
-  expect(await (await get(draftPath + '/timeline')).text()).toContain(
+  expect(await (await get(draftPath + '/audit')).text()).toContain(
     'Draft revision 1 saved'
   );
   const ownTeam = await (
@@ -184,19 +184,18 @@ test('incomplete draft saves, resumes, and accepts multiple subjects and require
 test('Overview leads with intent and impact, exact subjects, and separate decisions', async () => {
   const html = await (await get('/t/acme/changes/change_01')).text();
   for (const text of [
-    'Action summary',
-    'Intent and impact',
+    'opened this Change',
     'r.okafor (Product)',
     'm.linden (Data Science)',
     'j.reyes (Engineering)',
     'subject_worker',
     'c40b7e15',
     '88ff3a02',
-    'Lifecycle',
-    'Verification',
+    'Open Verification',
     'Approval',
     'Override',
     'does not verify',
+    'never runs Verifiers',
     'Review changes'
   ])
     expect(html).toContain(text);
@@ -241,6 +240,44 @@ test('verification exposes prerequisites, provenance and confirmed run actions',
       })
     ).status
   ).toBe(409);
+});
+test('amending Claims creates an immutable new revision through the revise route', async () => {
+  const path = '/t/acme/changes/change_02/verification';
+  const values = {
+    revision: 'rev_07',
+    requestKey: 'revise-1',
+    reason: 'Settlement retirement needs a rollback guarantee.',
+    addTitle: 'Settlement rollback restores prior webhook',
+    addVerifier: '',
+    remove: 'CLAIM-1'
+  };
+  expect((await post(path + '?/revise', values)).status).toBe(303);
+  const html = await (await get(path)).text();
+  expect(html).toContain('revision 8');
+  expect(html).toContain('Settlement rollback restores prior webhook');
+  expect(html).toContain('Claims amended: Settlement retirement needs a rollback guarantee.');
+  const overview = await (await get('/t/acme/changes/change_02')).text();
+  expect(overview).toContain('No reviews');
+  expect((await post(path + '?/revise', values)).status).toBe(303);
+  expect(
+    (
+      await post(path + '?/revise', {
+        ...values,
+        requestKey: 'revise-stale'
+      })
+    ).status
+  ).toBe(409);
+  expect(
+    (
+      await post(path + '?/revise', {
+        revision: 'rev_08',
+        requestKey: 'revise-empty',
+        reason: 'no-op amendments are invalid',
+        addTitle: '',
+        addVerifier: ''
+      })
+    ).status
+  ).toBe(400);
 });
 test('review writes anchored mentions, rejects stale edits, preserves history, resolves and reopens', async () => {
   const path = '/t/acme/changes/change_01/review';
@@ -308,17 +345,11 @@ test('review writes anchored mentions, rejects stale edits, preserves history, r
     ).status
   ).toBe(409);
 });
-test('timeline and read-only subject drilldowns keep exact revisions and anchored discussion', async () => {
-  const timeline = await get('/t/acme/changes/change_01/timeline');
-  expect(timeline.status).toBe(200);
-  const html = await timeline.text();
-  for (const text of [
-    'Audit',
-    'Review activity',
-    'Evidence',
-    'Override',
-    'Close Change Request'
-  ])
+test('audit and read-only subject drilldowns keep exact revisions and anchored discussion', async () => {
+  const audit = await get('/t/acme/changes/change_01/audit');
+  expect(audit.status).toBe(200);
+  const html = await audit.text();
+  for (const text of ['Audit', 'Review activity', 'Evidence', 'Override'])
     expect(html.includes(text), text).toBe(true);
   const path = '/t/acme/changes/change_01/subjects/subject_api';
   const subject = await (await get(path)).text();

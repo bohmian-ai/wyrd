@@ -1,7 +1,13 @@
 import { randomUUID } from 'node:crypto';
 import { reject } from '../auth/session';
 import { mentions, fixtureChange, summaries, verifiers } from './fixtures';
-import type { Change, Draft, ReviewInput, Anchor } from '$lib/features/changes/types';
+import type {
+  Change,
+  Draft,
+  ReviewInput,
+  ReviseInput,
+  Anchor
+} from '$lib/features/changes/types';
 
 /** Process-local development state. No persistence or durable domain contract. */
 export class MockChanges {
@@ -259,8 +265,10 @@ export class MockChanges {
       text: `${input.operation}${input.decision ? ': ' + input.decision : ''}${input.body ? ' — ' + input.body : ''}`,
       destination:
         input.operation === 'close'
-          ? '/timeline'
-          : `/review${thread ? '#' + thread.id : '#submit-review'}`
+          ? '/audit'
+          : thread
+            ? '#' + thread.id
+            : '#submit-review'
     });
     this.records(tenantId, key).set(id, change);
     this.retries.set(token, {
@@ -268,6 +276,135 @@ export class MockChanges {
       id: `${thread?.id ?? ''}/${commentId}`
     });
     return { threadId: thread?.id ?? '', commentId };
+  }
+
+  revise(
+    tenantId: string,
+    key: string,
+    actor: string,
+    id: string,
+    input: ReviseInput
+  ): string {
+    const token = `${tenantId}:${actor}:revise:${input.requestKey}`;
+    const serialized = JSON.stringify({ id, input });
+    const prior = this.retries.get(token);
+    if (prior) {
+      if (prior.input !== serialized) reject('conflict');
+      return prior.id;
+    }
+    if (
+      !input.requestKey ||
+      input.requestKey.length > 100 ||
+      !input.reason.trim() ||
+      input.addClaims.length + input.removeClaimIds.length === 0 ||
+      input.addClaims.length > 10 ||
+      input.addClaims.some((claim) => !claim.title.trim() || claim.title.length > 300)
+    )
+      reject('validation');
+    if (this.retries.size >= 10000) reject('upstream');
+    const current = this.records(tenantId, key).get(id);
+    if (!current) reject('notFound');
+    if (current.revision !== input.revision || current.lifecycle !== 'open')
+      reject('conflict');
+    if (
+      input.removeClaimIds.some(
+        (claimId) => !current.claims.some((claim) => claim.id === claimId)
+      )
+    )
+      reject('validation');
+    const kept = current.claims.filter(
+      (claim) => !input.removeClaimIds.includes(claim.id)
+    );
+    if (kept.length + input.addClaims.length === 0 || kept.length + input.addClaims.length > 30)
+      reject('validation');
+    this.revisions.set(`${tenantId}:${id}:${current.revision}`, structuredClone(current));
+    const change = structuredClone(current);
+    const at = new Date().toISOString();
+    const author = mentions.find((person) => person.id === actor)?.name ?? actor;
+    change.revisionNumber = current.revisionNumber + 1;
+    change.revision = `rev_${String(change.revisionNumber).padStart(2, '0')}`;
+    change.priorRevisions = [current.revision, ...current.priorRevisions];
+    change.created = at;
+    change.activity = 'Just now';
+    const nextIndex =
+      Math.max(
+        0,
+        ...current.claims.map((claim) => Number(claim.id.replace('CLAIM-', '')) || 0)
+      ) + 1;
+    change.claims = [
+      ...change.claims.filter((claim) => !input.removeClaimIds.includes(claim.id)),
+      ...input.addClaims.map((added, index) => {
+        const claimId = `CLAIM-${nextIndex + index}`;
+        const configured = verifiers.find(
+          (verifier) => verifier.name === added.verifier
+        );
+        return {
+          id: claimId,
+          title: added.title,
+          resolution: 'pending' as const,
+          checks: configured
+            ? [
+                {
+                  id: `${claimId}-0`,
+                  name: configured.name,
+                  verifier: configured.name,
+                  version: configured.version,
+                  required: true,
+                  mode: 'manual' as const,
+                  billable: configured.billable,
+                  execution: 'not_run' as const,
+                  verdict: null,
+                  provenance: 'current' as const,
+                  revision: change.revision,
+                  summary: { label: 'Not ready', tone: 'neutral' as const },
+                  explanation: 'Added by amendment; Evidence has not arrived.',
+                  eligible: false,
+                  action: null,
+                  evidence: [
+                    {
+                      id: `${claimId}-evidence-0`,
+                      name: 'TestRunEvidence',
+                      present: false,
+                      digest: '',
+                      detail: 'Awaiting Evidence for the amended revision.'
+                    }
+                  ],
+                  history: []
+                }
+              ]
+            : []
+        };
+      })
+    ];
+    for (const claim of change.claims)
+      for (const check of claim.checks)
+        if (check.verdict !== null) check.provenance = 'carried_forward';
+    change.total = change.claims.length;
+    change.satisfied = change.claims.filter(
+      (claim) => claim.resolution === 'satisfied'
+    ).length;
+    change.verification =
+      change.satisfied === change.total
+        ? { label: 'Verified', tone: 'ok' }
+        : { label: 'Needs attention', tone: 'danger' };
+    change.approval = 'No reviews';
+    change.attention = [{ reason: 'Re-review required', actor: change.owner }];
+    change.nextAction = `Revision ${change.revisionNumber} amended Claims — verification and review start fresh.`;
+    change.blockers = change.blockers.filter(
+      (blocker) => !input.removeClaimIds.some((claimId) => blocker.text.startsWith(claimId))
+    );
+    change.timeline.unshift({
+      id: randomUUID(),
+      kind: 'revision',
+      source: 'Audit',
+      at,
+      actor: author,
+      text: `Revision ${change.revisionNumber} created — Claims amended: ${input.reason}`,
+      destination: '/verification'
+    });
+    this.records(tenantId, key).set(id, change);
+    this.retries.set(token, { input: serialized, id: change.revision });
+    return change.revision;
   }
 
   save(

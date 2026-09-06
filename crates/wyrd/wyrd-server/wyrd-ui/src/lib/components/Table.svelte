@@ -42,7 +42,7 @@
     text-align: left;
     padding: 8px 9px;
     border-bottom: 2px solid var(--border);
-    background: var(--surface);
+    background: var(--surface-2);
     font-size: 9px;
     font-weight: 700;
     letter-spacing: 0.5px;

@@ -796,21 +796,6 @@ pub struct RetainedNodeRoots {
     pub previous_writer_epoch: Option<i64>,
 }
 
-/// Identity evidence returned after a terminated node is rebound.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NodeRestartEvidence {
-    /// Stable logical node identity preserved across replacement.
-    pub node_id: NodeId,
-    /// New HTTP listener address.
-    pub http_addr: std::net::SocketAddr,
-    /// New gRPC listener address.
-    pub grpc_addr: std::net::SocketAddr,
-    /// Previous writer epoch, when the node owned Scribe.
-    pub previous_writer_epoch: Option<i64>,
-    /// Replacement writer epoch, strictly greater for Scribe nodes.
-    pub writer_epoch: Option<i64>,
-}
-
 /// A real multi-pod Bifrost test topology with restartable node slots.
 pub struct WyrdTestCluster {
     /// Stable node-keyed server slots; stopped nodes retain `None`.
@@ -1115,27 +1100,43 @@ impl WyrdTestCluster {
 
     /// Restart an abruptly terminated node on fresh addresses and retained roots.
     ///
+    /// This is the replacement-pod half of an abrupt-termination journey, so it
+    /// proves the two fences a replacement must advance before any assertion
+    /// about replay can mean anything: the node is reachable only at addresses
+    /// the terminated process never held, and a Scribe owner comes back at a
+    /// strictly greater writer epoch. Both addresses are reserved and compared
+    /// before the replacement boots, so a reused address leaves the node stopped
+    /// rather than running behind an error, and a boot failure restores the
+    /// addresses the node was configured with.
+    ///
     /// # Errors
     ///
-    /// Returns an error when the node is running, the retained roots no longer
-    /// match the configured roots, or replacement startup fails.
+    /// Returns [`ClusterError::Resource`] when the node is unknown or still
+    /// running, when `roots` does not match the stopped node's actual retained
+    /// roots and addresses, when either freshly reserved address repeats a
+    /// previous one, or when the replacement's writer epoch does not advance
+    /// exactly as `None -> None` or `Some(old) -> Some(new > old)`. Returns the
+    /// underlying error when address reservation or replacement startup fails.
     pub async fn restart_terminated_node_at_new_address(
         &mut self,
         node_id: NodeId,
         roots: RetainedNodeRoots,
-    ) -> Result<NodeRestartEvidence, ClusterError> {
-        let resources = self
-            .nodes
-            .get(&node_id)
-            .ok_or_else(|| ClusterError::Resource(format!("unknown node {}", node_id.as_uuid())))?;
-        let configured = RetainedNodeRoots {
+    ) -> Result<(), ClusterError> {
+        let unknown = || ClusterError::Resource(format!("unknown node {}", node_id.as_uuid()));
+        if self.servers.get(&node_id).ok_or_else(unknown)?.is_some() {
+            return Err(ClusterError::Resource(format!(
+                "node {} is still running",
+                node_id.as_uuid()
+            )));
+        }
+        let resources = self.nodes.get(&node_id).ok_or_else(unknown)?;
+        let previous_http_addr = resources.http_addr;
+        let previous_grpc_addr = resources.grpc_addr;
+        let observed = RetainedNodeRoots {
             wal_root: resources
                 .wal_root
                 .as_ref()
                 .map(|root| root.path().to_path_buf()),
-            previous_http_addr: roots.previous_http_addr,
-            previous_grpc_addr: roots.previous_grpc_addr,
-            previous_writer_epoch: roots.previous_writer_epoch,
             spill_root: resources
                 .spill_root
                 .as_ref()
@@ -1144,38 +1145,53 @@ impl WyrdTestCluster {
                 .audit_wal_root
                 .as_ref()
                 .map(|root| root.path().to_path_buf()),
-        };
-        if configured != roots {
-            return Err(ClusterError::Resource(
-                "retained node roots do not match configured roots".to_owned(),
-            ));
-        }
-        self.restart_node_at_new_address(node_id).await?;
-        let resources = self
-            .nodes
-            .get(&node_id)
-            .ok_or_else(|| ClusterError::Resource(format!("unknown node {}", node_id.as_uuid())))?;
-        let replacement = self.servers.get(&node_id).and_then(Option::as_ref);
-        let writer_epoch = replacement
-            .and_then(WyrdTestServer::bifrost_scribe)
-            .map(|scribe| scribe.writer_epoch_for_test());
-        if resources.http_addr == roots.previous_http_addr
-            || resources.grpc_addr == roots.previous_grpc_addr
-            || writer_epoch
-                .zip(roots.previous_writer_epoch)
-                .is_some_and(|(new, old)| new <= old)
-        {
-            return Err(ClusterError::Resource(
-                "replacement node did not advance address and writer fences".to_owned(),
-            ));
-        }
-        Ok(NodeRestartEvidence {
-            node_id,
-            http_addr: resources.http_addr,
-            grpc_addr: resources.grpc_addr,
+            previous_http_addr,
+            previous_grpc_addr,
             previous_writer_epoch: roots.previous_writer_epoch,
-            writer_epoch,
-        })
+        };
+        if observed != roots {
+            return Err(ClusterError::Resource(
+                "retained node roots do not match the stopped node".to_owned(),
+            ));
+        }
+
+        // Reserved before anything is mutated: a replacement that reused an
+        // address would prove nothing about the terminated listener, and the
+        // node must stay stopped rather than run behind this error.
+        let http_addr = reserve_loopback_addr()?;
+        let grpc_addr = reserve_loopback_addr()?;
+        if http_addr == previous_http_addr || grpc_addr == previous_grpc_addr {
+            return Err(ClusterError::Resource(
+                "replacement node did not advance its listener addresses".to_owned(),
+            ));
+        }
+        let resources = self.nodes.get_mut(&node_id).ok_or_else(unknown)?;
+        resources.http_addr = http_addr;
+        resources.grpc_addr = grpc_addr;
+        let server = match self.build_node(node_id).await {
+            Ok(server) => server,
+            Err(error) => {
+                let resources = self.nodes.get_mut(&node_id).ok_or_else(unknown)?;
+                resources.http_addr = previous_http_addr;
+                resources.grpc_addr = previous_grpc_addr;
+                return Err(error);
+            }
+        };
+        let writer_epoch = server
+            .bifrost_scribe()
+            .map(|scribe| scribe.writer_epoch_for_test());
+        self.servers.insert(node_id, Some(server));
+        self.abrupt_request_lifetimes
+            .insert(node_id, CancellationToken::new());
+        // The replacement is registered before this check so a cluster shutdown
+        // still drains it; an unadvanced fence is a failed journey, not a leak.
+        match (roots.previous_writer_epoch, writer_epoch) {
+            (None, None) => Ok(()),
+            (Some(previous), Some(replacement)) if replacement > previous => Ok(()),
+            (previous, replacement) => Err(ClusterError::Resource(format!(
+                "replacement node did not advance its writer fence: {previous:?} -> {replacement:?}"
+            ))),
+        }
     }
 
     /// Connect to one real Oracle server through the cluster's configured TLS trust.
@@ -2480,24 +2496,6 @@ impl WyrdTestCluster {
         self.abrupt_request_lifetimes
             .insert(node_id, CancellationToken::new());
         Ok(())
-    }
-
-    /// Restarts one stopped node on newly reserved HTTP and gRPC addresses.
-    ///
-    /// # Errors
-    /// Returns the same unknown/running, address-allocation, or boot errors as
-    /// [`Self::restart_node`].
-    pub async fn restart_node_at_new_address(
-        &mut self,
-        node_id: NodeId,
-    ) -> Result<(), ClusterError> {
-        let resources = self
-            .nodes
-            .get_mut(&node_id)
-            .ok_or_else(|| ClusterError::Resource(format!("unknown node {}", node_id.as_uuid())))?;
-        resources.http_addr = reserve_loopback_addr()?;
-        resources.grpc_addr = reserve_loopback_addr()?;
-        self.restart_node(node_id).await
     }
 
     /// Seeds crash residue and an unrelated sibling beneath one node's Oracle spill root.

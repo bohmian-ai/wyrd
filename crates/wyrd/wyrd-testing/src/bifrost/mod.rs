@@ -34,8 +34,8 @@ pub mod telemetry;
 
 pub use cluster::{
     BifrostClusterSpec, BifrostNodeSpec, BifrostTopology, ClusterError, ClusterShutdownInspection,
-    NodeRestartEvidence, OracleFollowerPauses, RetainedNodeRoots, TestOracleResources,
-    WyrdTestCluster, full_bifrost_topology, shared_process_telemetry_for_test,
+    OracleFollowerPauses, RetainedNodeRoots, TestOracleResources, WyrdTestCluster,
+    full_bifrost_topology, shared_process_telemetry_for_test,
 };
 pub use forge_harness::{
     CommitUncertaintyCatalog, ForgeFixture, ForgeObjectStoreControl, seed_forge_group,

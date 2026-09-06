@@ -313,20 +313,17 @@ impl AuthorityFixture {
     ///
     /// Panics when acquisition, activation, or the transaction fails.
     async fn activate_epoch(&self) {
-        let mut conn = vala_sql::TenantConn::acquire(
-            self.database.app_pool(),
-            DataTenantId::SYSTEM_OWNER,
-        )
-        .await
-        .expect("system connection");
+        let mut conn =
+            vala_sql::TenantConn::acquire(self.database.app_pool(), DataTenantId::SYSTEM_OWNER)
+                .await
+                .expect("system connection");
         let fence = i64::try_from(self.fence).expect("fence fits");
-        let acquired = vala_sql::queries::oracle_reader_authority::OracleReaderEpochs::new(
-            &mut conn,
-        )
-        .expect("epochs are system owned")
-        .acquire(self.node_id, fence, Duration::from_secs(30))
-        .await
-        .expect("epoch acquires");
+        let acquired =
+            vala_sql::queries::oracle_reader_authority::OracleReaderEpochs::new(&mut conn)
+                .expect("epochs are system owned")
+                .acquire(self.node_id, fence, Duration::from_secs(30))
+                .await
+                .expect("epoch acquires");
         vala_sql::queries::oracle_reader_authority::OracleReaderEpochs::new(&mut conn)
             .expect("epochs are system owned")
             .activate(self.node_id, fence, acquired.state_revision)
@@ -485,8 +482,8 @@ impl AuthorityFixture {
 ///
 /// Panics when the ancestry cannot form a valid member or frontier.
 fn single_chain_frontier(identity: &TableAuthorityIdentity) -> ProtectionFrontier {
-    let member = ProtectionMember::new(identity, vec![30, 20, 10], 300, 100)
-        .expect("well-formed ancestry");
+    let member =
+        ProtectionMember::new(identity, vec![30, 20, 10], 300, 100).expect("well-formed ancestry");
     ProtectionFrontier::new(identity, vec![member]).expect("well-formed frontier")
 }
 
@@ -1732,8 +1729,17 @@ async fn follower_protection_precedes_resolution(
 /// remove both rows, or when either transition is audited more than once.
 #[tokio::test]
 async fn protection_commit_and_epoch_retirement_cannot_create_an_orphan() {
-    // Insert first: publication commits while retirement is already blocked on
-    // the exact epoch row it is deleting.
+    late_publication_leaves_a_resumable_epoch().await;
+    retirement_refuses_every_later_publication().await;
+}
+
+/// Drives the insert-first order: publication commits while retirement blocks.
+///
+/// # Panics
+///
+/// Panics when retirement wins, when the losing pass does not leave a resumable
+/// invalidated epoch and its header, or when resuming does not finish both.
+async fn late_publication_leaves_a_resumable_epoch() {
     let fixture = AuthorityFixture::start().await;
     fixture.activate_epoch().await;
     let tenant = fixture.tenant().await;
@@ -1827,9 +1833,15 @@ async fn protection_commit_and_epoch_retirement_cannot_create_an_orphan() {
         ],
         "resuming an invalidated epoch appends no second invalidation"
     );
+}
 
-    // Retirement first: a header can no longer be published for a retired
-    // epoch at all, so the sweep that just finished cannot be undone.
+/// Drives the retirement-first order: the late publication is refused outright.
+///
+/// # Panics
+///
+/// Panics when the reclaimed epoch survives, when the late publication is
+/// accepted, or when its rollback leaves any durable trace.
+async fn retirement_refuses_every_later_publication() {
     let retired = AuthorityFixture::start().await;
     retired.activate_epoch().await;
     let retired_tenant = retired.tenant().await;
@@ -1879,41 +1891,21 @@ async fn protection_commit_and_epoch_retirement_cannot_create_an_orphan() {
     );
 }
 
-/// Proves an expired epoch this node cannot reclaim fails startup recovery
-/// rather than being logged past, so the local epoch never activates.
+/// Seeds one invalidated predecessor epoch whose protection cannot be released.
 ///
-/// Recovery runs before activation precisely so this node does not begin
-/// serving while a dead peer still holds protection. Reporting success after a
-/// per-epoch reclaim failed defeats that ordering: startup would continue, the
-/// epoch would activate, and readiness would be published over retention that
-/// was never released. The failure must therefore reach the caller, and the
-/// epoch must remain exactly as acquired.
+/// The predecessor is exactly what a crashed peer leaves behind: an expired,
+/// already-invalidated epoch, its one audited invalidation, and one durable
+/// protection header over a registered table. Corrupting only the stored header
+/// digest makes the release fail closed without touching the epoch itself, so
+/// the sweep that resumes this epoch fails on the release rather than on any
+/// state transition. Returns the predecessor's fence and the protected table.
 ///
 /// # Panics
 ///
-/// Panics when recovery reports success, when the local epoch admits, or when
-/// its durable row moved past acquisition.
-#[tokio::test]
-async fn startup_recovery_failure_prevents_epoch_activation_and_readiness() {
-    let fixture = AuthorityFixture::start().await;
-    let terminator = Arc::new(RecordingEpochTerminator::default());
-    let authority = OracleReaderAuthority::start(OracleReaderAuthorityConfig {
-        vala: fixture.database.vala_postgres().clone(),
-        operator_pool: fixture.database.operator_pool().clone(),
-        node_id: fixture.node_id,
-        fencing_token: fixture.fence,
-        max_concurrent_queries: 1,
-        terminator: Arc::clone(&terminator) as Arc<_>,
-        shutdown: fixture.shutdown.clone(),
-    })
-    .await
-    .expect("epoch acquires");
-
-    // A dead predecessor epoch, already invalidated and still protecting one
-    // table, is enumerated by the sweep and resumed. Its release is what fails:
-    // the stored header no longer reproduces its own digest, which is corrupt
-    // evidence rather than a smaller protected set. That per-epoch failure is
-    // exactly what startup must not absorb.
+/// Panics when any seeding statement fails.
+async fn seed_unreleasable_predecessor(
+    fixture: &AuthorityFixture,
+) -> (i64, TableAuthorityIdentity) {
     let pool = fixture
         .database
         .superuser_pool()
@@ -1947,13 +1939,7 @@ async fn startup_recovery_failure_prevents_epoch_activation_and_readiness() {
         .commit()
         .await
         .expect("the predecessor's protection is durable");
-    append_invalidation_audit(
-        fixture.database.app_pool(),
-        fixture.node_id,
-        stale_fence,
-        2,
-    )
-    .await;
+    append_invalidation_audit(fixture.database.app_pool(), fixture.node_id, stale_fence, 2).await;
     sqlx::query(
         "UPDATE vala.oracle_table_protections SET frontier_digest = $3 \
           WHERE node_id = $1 AND fencing_token = $2",
@@ -1964,6 +1950,45 @@ async fn startup_recovery_failure_prevents_epoch_activation_and_readiness() {
     .execute(&pool)
     .await
     .expect("the stored header digest is corrupted");
+    (stale_fence, events)
+}
+
+/// Proves an expired epoch this node cannot reclaim fails startup recovery
+/// rather than being logged past, so the local epoch never activates.
+///
+/// Recovery runs before activation precisely so this node does not begin
+/// serving while a dead peer still holds protection. Reporting success after a
+/// per-epoch reclaim failed defeats that ordering: startup would continue, the
+/// epoch would activate, and readiness would be published over retention that
+/// was never released. The failure must therefore reach the caller, and the
+/// epoch must remain exactly as acquired.
+///
+/// # Panics
+///
+/// Panics when recovery reports success, when the local epoch admits, or when
+/// its durable row moved past acquisition.
+#[tokio::test]
+async fn startup_recovery_failure_prevents_epoch_activation_and_readiness() {
+    let fixture = AuthorityFixture::start().await;
+    let terminator = Arc::new(RecordingEpochTerminator::default());
+    let authority = OracleReaderAuthority::start(OracleReaderAuthorityConfig {
+        vala: fixture.database.vala_postgres().clone(),
+        operator_pool: fixture.database.operator_pool().clone(),
+        node_id: fixture.node_id,
+        fencing_token: fixture.fence,
+        max_concurrent_queries: 1,
+        terminator: Arc::clone(&terminator) as Arc<_>,
+        shutdown: fixture.shutdown.clone(),
+    })
+    .await
+    .expect("epoch acquires");
+
+    let pool = fixture
+        .database
+        .superuser_pool()
+        .await
+        .expect("superuser pool");
+    let (stale_fence, events) = seed_unreleasable_predecessor(&fixture).await;
 
     let recovery = OracleEpochRecovery::new(
         fixture.database.operator_pool().clone(),
@@ -2141,7 +2166,8 @@ async fn narrowing_retries_once_and_covered_duplicates_need_no_sql() {
 #[tokio::test]
 async fn catalog_promotion_between_prepare_and_materialize_restarts_all_tables() {
     let fixture = forge_support::PromotionIntegrationFixture::start("reader_revalidate").await;
-    let (authority, _node, _fence) = oracle_epoch(&fixture, "http://oracle-revalidate:5002", 1).await;
+    let (authority, _node, _fence) =
+        oracle_epoch(&fixture, "http://oracle-revalidate:5002", 1).await;
 
     // A real promotion between preparation and revalidation is exactly the
     // drift the authoritative reload exists to find.

@@ -2170,32 +2170,29 @@ impl OracleEpochRecovery {
                 .invalidate_expired(node_id, fencing_token)
                 .await
                 .map_err(|error| internal(error.to_string()))?;
-            let revision = match invalidated {
-                Some(revision) => {
-                    append_epoch_audit(
-                        &mut conn,
-                        node_id,
-                        fencing_token,
-                        OracleReaderEpochPhase::Invalidated,
-                        revision,
-                    )
-                    .await?;
-                    revision
+            let revision = if let Some(revision) = invalidated {
+                append_epoch_audit(
+                    &mut conn,
+                    node_id,
+                    fencing_token,
+                    OracleReaderEpochPhase::Invalidated,
+                    revision,
+                )
+                .await?;
+                revision
+            } else {
+                let row = OracleReaderEpochs::new(&mut conn)
+                    .map_err(|error| internal(error.to_string()))?
+                    .read(node_id, fencing_token)
+                    .await
+                    .map_err(|error| internal(error.to_string()))?
+                    .ok_or_else(|| internal("Oracle reader epoch is gone before recovery"))?;
+                if row.state != OracleEpochState::Invalidated {
+                    return Err(internal(
+                        "Oracle reader epoch is no longer expired and keeps its authority",
+                    ));
                 }
-                None => {
-                    let row = OracleReaderEpochs::new(&mut conn)
-                        .map_err(|error| internal(error.to_string()))?
-                        .read(node_id, fencing_token)
-                        .await
-                        .map_err(|error| internal(error.to_string()))?
-                        .ok_or_else(|| internal("Oracle reader epoch is gone before recovery"))?;
-                    if row.state != OracleEpochState::Invalidated {
-                        return Err(internal(
-                            "Oracle reader epoch is no longer expired and keeps its authority",
-                        ));
-                    }
-                    row.state_revision
-                }
+                row.state_revision
             };
             conn.commit()
                 .await

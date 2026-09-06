@@ -667,6 +667,13 @@ mod pg_tests {
         .expect("constraints read")
     }
 
+    /// One foreign key's deferrability, delete rule, and column pairing.
+    ///
+    /// The tuple is `(condeferrable, condeferred, confdeltype, referencing
+    /// columns, referenced columns)`, read straight from `pg_constraint` so the
+    /// assertion does not depend on how `pg_get_constraintdef` spells defaults.
+    type ForeignKeyShape = (bool, bool, String, Vec<String>, Vec<String>);
+
     /// Projects the privileges one role holds on one table, sorted.
     async fn grants(pool: &PgPool, table: &str, grantee: &str) -> Vec<String> {
         sqlx::query_scalar(
@@ -836,7 +843,7 @@ mod pg_tests {
         // the epoch that owns it. Deferring it would reopen the race, and
         // `pg_get_constraintdef` omits the default spelling, so the metadata is
         // asserted directly rather than read out of the printed definition.
-        let epoch_fk: Vec<(bool, bool, String, Vec<String>, Vec<String>)> = sqlx::query_as(
+        let epoch_fk: Vec<ForeignKeyShape> = sqlx::query_as(
             "SELECT c.condeferrable, c.condeferred, c.confdeltype::text, \
                     (SELECT array_agg(a.attname ORDER BY k.ord) \
                        FROM unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord) \

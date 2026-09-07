@@ -1,6 +1,7 @@
 //! Canonical Redux built-in table definitions and pure table-layer transforms.
 
 use arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef, TimeUnit as ArrowTimeUnit};
+use arrow::record_batch::RecordBatch;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use wyrd_spec::vala::api::{
@@ -135,6 +136,14 @@ pub struct EntityBoundsMapping {
     pub entity_id_column: String,
 }
 
+/// A table-owned canonical value validator.
+///
+/// A canonical signal table supplies one of these so the registry can enforce
+/// the value-level rules its Arrow schema alone cannot express — canonical
+/// payload encoding, and for metrics the kind/column agreement — without any
+/// caller matching on a table name.
+pub type CanonicalBatchValidator = fn(&RecordBatch) -> Result<RecordBatch, String>;
+
 /// Canonical immutable definition for one built-in table.
 #[derive(Debug, Clone, Copy)]
 pub struct BuiltinTableDefinition {
@@ -158,6 +167,8 @@ pub struct BuiltinTableDefinition {
     pub canonical_fields: fn() -> Option<&'static [fields::CanonicalField]>,
     /// Canonical physical fingerprint constructor, `None` when not canonical.
     pub canonical_physical_fingerprint: fn() -> Option<CanonicalPhysicalFingerprint>,
+    /// Canonical value validator, `None` for a pre-declared table.
+    pub canonical_validator: Option<CanonicalBatchValidator>,
     /// Engine-owned physical-layout declaration.
     ///
     /// This is the built-in's single statement of partition granularity, sort
@@ -193,6 +204,13 @@ pub trait DomainTable: Send + Sync + 'static {
     fn canonical_fields() -> Option<&'static [fields::CanonicalField]> {
         None
     }
+
+    /// The table-owned canonical value validator, when this table is canonical.
+    ///
+    /// A canonical signal table sets this to the function that enforces its
+    /// value-level rules; a pre-declared table leaves it `None` and is value
+    /// validated by its declared Arrow schema alone.
+    const CANONICAL_VALIDATOR: Option<CanonicalBatchValidator> = None;
 
     /// User-owned fields, excluding correlation and system fields.
     fn arrow_fields() -> Vec<Field>;
@@ -662,6 +680,7 @@ const fn definition<T: DomainTable>() -> BuiltinTableDefinition {
         schema: T::schema,
         canonical_fields: T::canonical_fields,
         canonical_physical_fingerprint: T::canonical_physical_fingerprint,
+        canonical_validator: T::CANONICAL_VALIDATOR,
         physical_layout: T::physical_layout,
         entity_bounds_mapping: T::entity_bounds_mapping,
     }
@@ -1406,6 +1425,249 @@ mod tests {
                 .expect("the schema fingerprints")
                 .to_hex(),
             "e33647f94358ef330ddd8a07e3533b5e15d485530191c73c450c7d3d36cba269"
+        );
+    }
+
+    /// The registry dispatches one canonical value validator per signal table.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a canonical built-in carries no validator, when a validator
+    /// admits a schema-valid but value-invalid batch, or when a pre-declared
+    /// built-in claims a canonical validator it cannot own.
+    #[test]
+    fn builtin_registry_dispatches_canonical_value_validation() {
+        use arrow::array::{Array, BinaryArray, Int64Array};
+
+        let (spans, _) = crate::tables::traces::project_resource_spans(&span_fixture())
+            .expect("the span fixture projects");
+        let (logs, _) = crate::tables::logs::project_resource_logs(&log_fixture())
+            .expect("the log fixture projects");
+        let (points, _) = crate::tables::metrics::project_resource_metrics(&metric_fixture())
+            .expect("the metric fixture projects");
+
+        for (namespace, name, projected) in [
+            ("traces", "spans", spans),
+            ("logs", "records", logs),
+            ("metrics", "points", points),
+        ] {
+            let definition = builtin_table(namespace, name).expect("canonical built-in");
+            let validate = definition
+                .canonical_validator
+                .expect("a canonical signal table owns a value validator");
+            let batch = crate::tables::signal::without_correlation_columns(&projected)
+                .expect("the correlation columns split off cleanly");
+            validate(&batch).expect("the table's own projection validates");
+
+            let corrupted = RecordBatch::try_new(
+                batch.schema(),
+                batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .zip(batch.columns())
+                    .map(|(field, column)| {
+                        if field.name() == "attributes" {
+                            Arc::new(BinaryArray::from_iter_values(std::iter::repeat_n(
+                                [0xff_u8].as_slice(),
+                                batch.num_rows(),
+                            ))) as Arc<dyn Array>
+                        } else {
+                            Arc::clone(column)
+                        }
+                    })
+                    .collect(),
+            )
+            .expect("the corrupted batch still assembles");
+            assert!(
+                validate(&corrupted).is_err(),
+                "{namespace}.{name} rejects non-canonical payload bytes"
+            );
+        }
+
+        // A summary point may not populate a numeric kind's column, which the
+        // ledger schema alone cannot express.
+        let (points, _) = crate::tables::metrics::project_resource_metrics(&metric_fixture())
+            .expect("the metric fixture projects");
+        let points = crate::tables::signal::without_correlation_columns(&points)
+            .expect("the correlation columns split off cleanly");
+        let kind_violation = RecordBatch::try_new(
+            points.schema(),
+            points
+                .schema()
+                .fields()
+                .iter()
+                .zip(points.columns())
+                .map(|(field, column)| {
+                    if field.name() == "int_value" {
+                        Arc::new(Int64Array::from(vec![Some(1_i64); points.num_rows()]))
+                            as Arc<dyn Array>
+                    } else {
+                        Arc::clone(column)
+                    }
+                })
+                .collect(),
+        )
+        .expect("the kind-violating batch still assembles");
+        let validate = builtin_table("metrics", "points")
+            .expect("points definition")
+            .canonical_validator
+            .expect("the points table owns a value validator");
+        assert!(
+            validate(&kind_violation).is_err(),
+            "a point may not populate a foreign kind's column"
+        );
+
+        assert!(
+            builtin_table("eval", "runs")
+                .expect("runs definition")
+                .canonical_validator
+                .is_none(),
+            "a pre-declared built-in owns no canonical value validation"
+        );
+    }
+
+    /// Assert every widened or re-spelled physical type drifts the identity.
+    ///
+    /// `Utf8`/`LargeUtf8`, `Binary`/`LargeBinary`, and a re-spelled UTC offset
+    /// are the normalizations an Arrow-normalizing intermediary would silently
+    /// apply, so each one is walked over the real physical schema.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a widened field leaves the fingerprint unchanged, or when
+    /// the schema exercises fewer than three drift dimensions.
+    fn assert_widening_and_timezone_drift(
+        physical: &Schema,
+        baseline: CanonicalPhysicalFingerprint,
+    ) {
+        let widen = |data_type: &DataType| match data_type {
+            DataType::Utf8 => Some(DataType::LargeUtf8),
+            DataType::Binary => Some(DataType::LargeBinary),
+            DataType::Timestamp(unit, Some(_)) => {
+                Some(DataType::Timestamp(*unit, Some("+00:00".into())))
+            }
+            _ => None,
+        };
+        let mut widened = 0_usize;
+        for (index, field) in physical.fields().iter().enumerate() {
+            let Some(data_type) = widen(field.data_type()) else {
+                continue;
+            };
+            widened += 1;
+            let mut fields: Vec<Arc<Field>> = physical.fields().iter().map(Arc::clone).collect();
+            fields[index] = Arc::new(
+                Field::new(field.name(), data_type, field.is_nullable())
+                    .with_metadata(field.metadata().clone()),
+            );
+            // A widened type may be refused outright rather than fingerprinted;
+            // either way it never resolves back to the baseline identity.
+            assert!(
+                !CanonicalPhysicalFingerprint::from_physical_fields(&Fields::from(fields))
+                    .is_ok_and(|drifted| drifted == baseline),
+                "a widened or re-spelled {} drifts the canonical physical identity",
+                field.name()
+            );
+        }
+        assert!(
+            widened >= 3,
+            "the physical schema must exercise string, binary, and timestamp drift"
+        );
+    }
+
+    /// The canonical physical identity rejects every normalized drift dimension.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a widened type, a changed timezone spelling, a lost nested
+    /// metadata entry, a changed field id, an unknown `wyrd_*` field, or a
+    /// duplicated reserved field leaves the canonical physical fingerprint
+    /// unchanged.
+    #[test]
+    fn resolved_identity_rejects_normalized_physical_drift() {
+        let definition = builtin_table("traces", "spans").expect("spans definition");
+        let identity = ResolvedSchemaIdentity::for_builtin(definition);
+        let baseline = identity
+            .canonical_physical_fingerprint
+            .expect("a canonical built-in resolves a physical fingerprint");
+        let physical = (definition.schema)();
+
+        assert_widening_and_timezone_drift(&physical, baseline);
+
+        let mutate_first = |predicate: fn(&Field) -> bool, mutate: &dyn Fn(&Field) -> Field| {
+            let mut fields: Vec<Arc<Field>> = physical.fields().iter().map(Arc::clone).collect();
+            let index = fields
+                .iter()
+                .position(|field| predicate(field))
+                .expect("the physical schema carries the drift target");
+            fields[index] = Arc::new(mutate(&fields[index]));
+            Fields::from(fields)
+        };
+
+        let nested_metadata_dropped = mutate_first(
+            |field| matches!(field.data_type(), DataType::List(_)),
+            &|field| match field.data_type() {
+                DataType::List(element) => Field::new(
+                    field.name(),
+                    DataType::List(Arc::new(Field::new(
+                        element.name(),
+                        element.data_type().clone(),
+                        element.is_nullable(),
+                    ))),
+                    field.is_nullable(),
+                )
+                .with_metadata(field.metadata().clone()),
+                other => Field::new(field.name(), other.clone(), field.is_nullable()),
+            },
+        );
+        assert!(
+            !CanonicalPhysicalFingerprint::from_physical_fields(&nested_metadata_dropped)
+                .is_ok_and(|drifted| drifted == baseline),
+            "a nested child that loses its metadata drifts the canonical physical identity"
+        );
+
+        let field_id_changed = mutate_first(|_| true, &|field| {
+            let mut metadata = field.metadata().clone();
+            metadata.insert(fields::PARQUET_FIELD_ID.to_owned(), "9999".to_owned());
+            Field::new(field.name(), field.data_type().clone(), field.is_nullable())
+                .with_metadata(metadata)
+        });
+        assert_ne!(
+            CanonicalPhysicalFingerprint::from_physical_fields(&field_id_changed)
+                .expect("a re-numbered field still fingerprints"),
+            baseline,
+            "a changed stable field id drifts the canonical physical identity"
+        );
+
+        let mut unknown: Vec<Arc<Field>> = physical.fields().iter().map(Arc::clone).collect();
+        unknown.push(Arc::new(
+            Field::new("wyrd_unknown", DataType::Utf8, true).with_metadata(
+                std::collections::HashMap::from([
+                    (fields::PARQUET_FIELD_ID.to_owned(), "9998".to_owned()),
+                    (fields::WYRD_SENSITIVE.to_owned(), "false".to_owned()),
+                ]),
+            ),
+        ));
+        assert_ne!(
+            CanonicalPhysicalFingerprint::from_physical_fields(&Fields::from(unknown))
+                .expect("an extra field still fingerprints"),
+            baseline,
+            "an unknown wyrd_* field drifts the canonical physical identity"
+        );
+
+        let mut duplicated: Vec<Arc<Field>> = physical.fields().iter().map(Arc::clone).collect();
+        let reserved = physical
+            .fields()
+            .iter()
+            .find(|field| field.name() == WYRD_ROW_ORDINAL)
+            .expect("the physical schema carries the reserved envelope")
+            .clone();
+        duplicated.push(reserved);
+        assert_ne!(
+            CanonicalPhysicalFingerprint::from_physical_fields(&Fields::from(duplicated))
+                .expect("a duplicated field still fingerprints"),
+            baseline,
+            "a duplicated reserved field drifts the canonical physical identity"
         );
     }
 }

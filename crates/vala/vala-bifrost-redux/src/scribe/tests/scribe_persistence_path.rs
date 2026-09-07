@@ -11,7 +11,7 @@ use crate::scribe::seal_key::SealKey;
 use crate::scribe::stream_identity::{NodeId, StreamIdentity, WriterEpoch};
 use crate::scribe::tail_rpc::FetchLiveTailRequest;
 use crate::scribe::wal::{WalConfig, WalWriter};
-use arrow::array::{ArrayRef, Int64Array, TimestampMicrosecondArray};
+use arrow::array::{Array, ArrayRef, Int64Array, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use tempfile::TempDir;
@@ -293,6 +293,70 @@ fn assert_payload_modes_agree(
     );
 }
 
+/// The managed envelope every canonical signal table owns, in schema order.
+const MANAGED_COLUMNS: &[&str] = &[
+    "run_id",
+    "card_uid",
+    "principal_id",
+    "wyrd_request_id",
+    "wyrd_event_time",
+    "wyrd_ingested_at",
+    "wyrd_batch_id",
+    "wyrd_row_ordinal",
+    "data_tenant_id",
+];
+
+/// Assert every stored managed column is the table's own `Field` and value.
+///
+/// The canonical path constructs only the managed arrays and clones every
+/// managed `Field` — stable id, sensitivity metadata, type, and nullability —
+/// from `(definition.schema)()`, so a locally reconstructed envelope would
+/// differ here even when the values happen to agree.
+///
+/// # Panics
+///
+/// Panics when a managed column is absent from the stored projection, when its
+/// stored `Field` differs from the table-owned physical field, or when the
+/// tenant isolation key does not carry the authenticated tenant.
+fn assert_managed_columns_are_table_owned(stored: &[RecordBatch], tenant: DataTenantId) {
+    let definition =
+        crate::tables::builtin_table("metrics", "points").expect("the points built-in resolves");
+    let physical = (definition.schema)();
+    for batch in stored {
+        for name in MANAGED_COLUMNS {
+            let stored_index = batch
+                .schema()
+                .index_of(name)
+                .unwrap_or_else(|_| panic!("the stored projection retains {name}"));
+            let owned_index = physical
+                .index_of(name)
+                .unwrap_or_else(|_| panic!("the points table declares {name}"));
+            assert_eq!(
+                batch.schema().field(stored_index),
+                physical.field(owned_index),
+                "{name} is stored as the table-owned physical field"
+            );
+        }
+        let tenants = batch
+            .column(
+                batch
+                    .schema()
+                    .index_of("data_tenant_id")
+                    .expect("tenant column"),
+            )
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("the tenant key is the declared Utf8 column");
+        for row in 0..tenants.len() {
+            assert_eq!(
+                tenants.value(row),
+                tenant.to_string(),
+                "every stored row carries the authenticated tenant"
+            );
+        }
+    }
+}
+
 /// Canonical nested batches take the one managed WAL path (S2).
 ///
 /// The nested, metadata-bearing shape the owning `OTLP` metrics projector
@@ -311,7 +375,10 @@ fn assert_payload_modes_agree(
 #[tokio::test]
 async fn canonical_nested_batches_share_one_managed_wal_path() {
     let tenant = DataTenantId::new_v7();
-    let table = TableRef::new(BifrostNamespace::Bifrost, "scribe_nested_canonical");
+    // The real canonical built-in, so the write travels the registry-dispatched
+    // canonical path and its managed columns must come from the table's own
+    // physical schema rather than from locally reconstructed fields.
+    let table = TableRef::new(BifrostNamespace::Metrics, "points");
     let day = fixture_event_day(1);
     let rows = projected_metric_batch(day);
     let total_rows = rows.num_rows();
@@ -392,12 +459,11 @@ async fn canonical_nested_batches_share_one_managed_wal_path() {
             target_stream: StreamIdentity::new(NodeId::new(Uuid::nil()), WriterEpoch::new(1)),
             start_partition: day,
             end_partition: day,
-            required_columns: vec![
-                "metric_name".to_owned(),
-                "quantile_values".to_owned(),
-                "wyrd_row_ordinal".to_owned(),
-                "wyrd_batch_id".to_owned(),
-            ],
+            required_columns: MANAGED_COLUMNS
+                .iter()
+                .map(|name| (*name).to_owned())
+                .chain(["metric_name".to_owned(), "quantile_values".to_owned()])
+                .collect(),
             predicates: Vec::new(),
             max_batches: 64,
             max_retained_bytes: 64 * 1024 * 1024,
@@ -407,6 +473,7 @@ async fn canonical_nested_batches_share_one_managed_wal_path() {
     let stored: Vec<RecordBatch> = hot.into_iter().map(|batch| batch.rows).collect();
 
     assert_payload_modes_agree(&stored, canonical_batch_id, arrow_batch_id, total_rows);
+    assert_managed_columns_are_table_owned(&stored, tenant);
 
     scribe
         .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(1))

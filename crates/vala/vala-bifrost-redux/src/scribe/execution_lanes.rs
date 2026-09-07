@@ -215,12 +215,16 @@ impl ScribeIngressCpuPool {
     pub(crate) async fn decode(
         &self,
         payload: IngressPayload,
-        principal: Principal,
-        expected_schema_fingerprint: SchemaFingerprint,
-        request_id: RequestId,
-        batch_id: uuid::Uuid,
-        window: EventTimeWindow,
+        inputs: IngressDecodeInputs,
     ) -> Result<RecordBatch, ScribeError> {
+        let IngressDecodeInputs {
+            principal,
+            expected_schema_fingerprint,
+            request_id,
+            batch_id,
+            window,
+            definition,
+        } = inputs;
         let Ok(permit) = self.permits.clone().try_acquire_owned() else {
             self.saturation_events.fetch_add(1, Ordering::Relaxed);
             record_lane_saturation("ingress");
@@ -249,6 +253,7 @@ impl ScribeIngressCpuPool {
                     &request_id,
                     batch_id,
                     window,
+                    definition,
                 )
             }));
             depth.fetch_sub(1, Ordering::AcqRel);
@@ -400,6 +405,7 @@ fn decode(
     request_id: &RequestId,
     batch_id: uuid::Uuid,
     window: EventTimeWindow,
+    definition: Option<&'static crate::tables::BuiltinTableDefinition>,
 ) -> Result<RecordBatch, ScribeError> {
     let batches = match payload {
         IngressPayload::ArrowIpc(bytes) => {
@@ -433,6 +439,7 @@ fn decode(
             window,
             receipt_micros: None,
             start_row_ordinal: 0,
+            definition,
         },
     )
 }
@@ -456,6 +463,25 @@ pub(crate) fn decode_native_batch(
     decode_rows(rows, context)
 }
 
+/// The owned decode inputs one ingress frame hands to the bounded CPU lane.
+///
+/// The lane moves these into its worker, so they are owned rather than the
+/// borrowed [`DecodeContext`] the decode itself assembles from them.
+pub(crate) struct IngressDecodeInputs {
+    /// Authenticated principal used for scope checks and managed columns.
+    pub(crate) principal: Principal,
+    /// Catalog fingerprint required of the caller-owned source schema.
+    pub(crate) expected_schema_fingerprint: SchemaFingerprint,
+    /// Stable request identity stamped into every accepted row.
+    pub(crate) request_id: RequestId,
+    /// Stable batch identity stamped into every accepted row.
+    pub(crate) batch_id: uuid::Uuid,
+    /// Accepted caller event-time window.
+    pub(crate) window: EventTimeWindow,
+    /// Canonical built-in whose physical identity the decode must preserve.
+    pub(crate) definition: Option<&'static crate::tables::BuiltinTableDefinition>,
+}
+
 /// Immutable validation and stamping context for one decoded batch.
 ///
 /// Native persistence preprocessing owns one of these per request and advances
@@ -476,6 +502,12 @@ pub(crate) struct DecodeContext<'a> {
     pub(crate) receipt_micros: Option<i64>,
     /// First physical row ordinal this batch stamps within its request.
     pub(crate) start_row_ordinal: i32,
+    /// Canonical built-in whose physical identity this decode must preserve.
+    ///
+    /// `Some` only for a canonical signal table. A dynamic or pre-declared
+    /// table leaves this `None` and keeps the existing catalog-fingerprint and
+    /// managed-field policy.
+    pub(crate) definition: Option<&'static crate::tables::BuiltinTableDefinition>,
 }
 
 /// Applies source-contract validation and server-managed stamping to one batch.
@@ -522,8 +554,102 @@ fn decode_rows(
             table: "resolved ingress table".to_owned(),
         });
     }
+    if let Some(definition) = context.definition {
+        enforce_canonical_source_contract(rows, definition)?;
+    }
     validate_card_scope(rows, context.principal)?;
     stamp_correlation_columns(rows, context)
+}
+
+/// Enforces one canonical built-in's exact user contract before stamping.
+///
+/// The caller of a canonical signal table owns exactly the table's declared
+/// ledger plus the permitted correlation columns (`card_ref`, `run_id`, and an
+/// optional `wyrd_event_time`). This rejects a duplicated column name and any
+/// unknown `wyrd_*` field, runs the table's own registered value validator over
+/// the remaining user block, and then requires that block to equal
+/// `(definition.arrow_fields)()` exactly, so no normalized-but-different Arrow
+/// spelling reaches the physical schema.
+///
+/// # Errors
+///
+/// Returns [`ScribeError::InvalidFrame`] for a duplicate or unknown reserved
+/// column, and [`ScribeError::FingerprintMismatch`] when the table's value
+/// validator refuses the batch or the remaining user fields differ from the
+/// table's declared fields.
+fn enforce_canonical_source_contract(
+    rows: &RecordBatch,
+    definition: &'static crate::tables::BuiltinTableDefinition,
+) -> Result<(), ScribeError> {
+    let schema = rows.schema();
+    let mut seen = std::collections::HashSet::with_capacity(schema.fields().len());
+    for field in schema.fields() {
+        if !seen.insert(field.name().as_str()) {
+            return Err(ScribeError::InvalidFrame);
+        }
+        if field.name().starts_with("wyrd_") && field.name() != WYRD_EVENT_TIME {
+            return Err(ScribeError::InvalidFrame);
+        }
+    }
+    let permitted = [CARD_REF, RUN_ID, WYRD_EVENT_TIME];
+    let mut fields = Vec::with_capacity(schema.fields().len());
+    let mut columns = Vec::with_capacity(schema.fields().len());
+    for (index, field) in schema.fields().iter().enumerate() {
+        if permitted.contains(&field.name().as_str()) {
+            continue;
+        }
+        fields.push(field.as_ref().clone());
+        columns.push(Arc::clone(rows.column(index)));
+    }
+    let declared = (definition.arrow_fields)();
+    if fields != declared {
+        return Err(ScribeError::FingerprintMismatch {
+            table: format!("{}.{}", definition.namespace, definition.name),
+        });
+    }
+    let user = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+        .map_err(|_| ScribeError::InvalidFrame)?;
+    if let Some(validate) = definition.canonical_validator {
+        validate(&user).map_err(|_| ScribeError::FingerprintMismatch {
+            table: format!("{}.{}", definition.namespace, definition.name),
+        })?;
+    }
+    Ok(())
+}
+
+/// Confirms a stamped canonical batch still carries its table-owned identity.
+///
+/// The stamped batch is built from `(definition.schema)()`, so its correlation
+/// and managed `Field`s — stable ids, sensitivity metadata, nullability — are
+/// the table's own rather than locally reconstructed. This re-derives the
+/// canonical physical fingerprint from the stamped schema and compares it with
+/// the definition's resolved identity, so any future divergence between the
+/// stamping order and the table's declaration fails closed here.
+///
+/// # Errors
+///
+/// Returns [`ScribeError::FingerprintMismatch`] when the stamped physical
+/// schema does not fingerprint to the table's resolved canonical physical
+/// identity.
+fn enforce_canonical_physical_identity(
+    stamped: &RecordBatch,
+    definition: &'static crate::tables::BuiltinTableDefinition,
+) -> Result<(), ScribeError> {
+    let mismatch = || ScribeError::FingerprintMismatch {
+        table: format!("{}.{}", definition.namespace, definition.name),
+    };
+    let expected = crate::tables::ResolvedSchemaIdentity::for_builtin(definition)
+        .canonical_physical_fingerprint
+        .ok_or_else(mismatch)?;
+    let actual = crate::tables::CanonicalPhysicalFingerprint::from_physical_fields(
+        stamped.schema().fields(),
+    )
+    .map_err(|_| mismatch())?;
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(mismatch())
+    }
 }
 
 fn source_schema_fingerprint(schema: &Schema) -> SchemaFingerprint {
@@ -716,8 +842,33 @@ fn stamp_correlation_columns(
         caller_event_time,
         receipt_micros,
     )?;
-    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
-        .map_err(|_| ScribeError::InvalidFrame)
+    // A canonical built-in constructs only the arrays here: every correlation
+    // and managed `Field` — with its stable id and sensitivity metadata — is
+    // cloned from the table's own physical schema, and the locally assembled
+    // field list is compared against it first so a drifting stamping order is
+    // refused rather than silently relabelled.
+    let Some(definition) = context.definition else {
+        return RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+            .map_err(|_| ScribeError::InvalidFrame);
+    };
+    let physical = (definition.schema)();
+    let shape = |field: &Field| {
+        (
+            field.name().clone(),
+            field.data_type().clone(),
+            field.is_nullable(),
+        )
+    };
+    let owned: Vec<_> = physical.fields().iter().map(|field| shape(field)).collect();
+    let assembled: Vec<_> = fields.iter().map(shape).collect();
+    if owned != assembled {
+        return Err(ScribeError::FingerprintMismatch {
+            table: format!("{}.{}", definition.namespace, definition.name),
+        });
+    }
+    let stamped = RecordBatch::try_new(physical, columns).map_err(|_| ScribeError::InvalidFrame)?;
+    enforce_canonical_physical_identity(&stamped, definition)?;
+    Ok(stamped)
 }
 
 /// Validates a caller-supplied native `wyrd_event_time` column before it is
@@ -2024,6 +2175,7 @@ mod tests {
         request_id: &'a RequestId,
     ) -> super::DecodeContext<'a> {
         super::DecodeContext {
+            definition: None,
             principal,
             expected_schema_fingerprint: SchemaFingerprint([0_u8; 32]),
             request_id,
@@ -2471,6 +2623,7 @@ mod tests {
             &RequestId::now_v7(),
             Uuid::now_v7(),
             EventTimeWindow::default(),
+            None,
         )
         .expect("projected run_id is correlation data");
         let run_id = error
@@ -2512,6 +2665,7 @@ mod tests {
             &RequestId::now_v7(),
             Uuid::now_v7(),
             EventTimeWindow::default(),
+            None,
         )
     }
 
@@ -2629,6 +2783,7 @@ mod tests {
             &RequestId::now_v7(),
             Uuid::now_v7(),
             EventTimeWindow::default(),
+            None,
         )
         .expect_err("card outside scope");
         assert!(matches!(
@@ -2658,6 +2813,7 @@ mod tests {
             &RequestId::now_v7(),
             Uuid::now_v7(),
             EventTimeWindow::default(),
+            None,
         )
         .expect("schema is valid");
         assert_eq!(decoded.schema().field(0).name(), "second");
@@ -2698,6 +2854,7 @@ mod tests {
             &RequestId::now_v7(),
             batch_id,
             EventTimeWindow::default(),
+            None,
         )
         .expect("schema is valid");
         assert!(decoded.schema().index_of(DATA_TENANT_ID).is_ok());
@@ -2724,6 +2881,7 @@ mod tests {
             &RequestId::now_v7(),
             Uuid::now_v7(),
             EventTimeWindow::default(),
+            None,
         )
         .expect("schema is valid");
         let ordinal = decoded
@@ -2751,6 +2909,7 @@ mod tests {
             &RequestId::now_v7(),
             Uuid::now_v7(),
             EventTimeWindow::default(),
+            None,
         )
         .expect("schema is valid");
         let schema = decoded.schema();
@@ -2777,6 +2936,7 @@ mod tests {
             &RequestId::now_v7(),
             Uuid::now_v7(),
             EventTimeWindow::default(),
+            None,
         )
         .expect_err("unrepresentable ordinal range fails before WAL dispatch");
         assert!(matches!(
@@ -2802,6 +2962,7 @@ mod tests {
             &RequestId::now_v7(),
             Uuid::now_v7(),
             EventTimeWindow::default(),
+            None,
         )
         .expect_err("row identity is server-owned");
         assert!(matches!(error, ScribeError::InvalidFrame));
@@ -2902,6 +3063,7 @@ mod tests {
             &RequestId::now_v7(),
             Uuid::now_v7(),
             EventTimeWindow::default(),
+            None,
         )
         .expect("native caller event time is accepted");
         assert_eq!(
@@ -2934,6 +3096,7 @@ mod tests {
             &RequestId::now_v7(),
             Uuid::now_v7(),
             EventTimeWindow::default(),
+            None,
         )
         .expect("native ingest without event time is server-stamped");
         assert_eq!(
@@ -2970,6 +3133,7 @@ mod tests {
             &RequestId::now_v7(),
             Uuid::now_v7(),
             EventTimeWindow::default(),
+            None,
         )
         .expect("projected preserved event time is accepted");
         assert_eq!(
@@ -3009,6 +3173,7 @@ mod tests {
             &RequestId::now_v7(),
             Uuid::now_v7(),
             EventTimeWindow::default(),
+            None,
         )
         .expect("native caller event time is accepted");
         let event = decoded
@@ -3080,6 +3245,7 @@ mod tests {
             &RequestId::now_v7(),
             Uuid::now_v7(),
             EventTimeWindow::default(),
+            None,
         )
         .expect("native caller event time is accepted");
         assert_eq!(
@@ -3124,6 +3290,7 @@ mod tests {
             &RequestId::now_v7(),
             Uuid::now_v7(),
             EventTimeWindow::default(),
+            None,
         )
         .expect("native ingest without event time is server-stamped");
         let event_field = decoded
@@ -3222,6 +3389,7 @@ mod tests {
                 &RequestId::now_v7(),
                 Uuid::now_v7(),
                 EventTimeWindow::default(),
+                None,
             )
             .expect_err("invalid native event time fails closed");
             assert!(matches!(error, ScribeError::InvalidFrame), "{error:?}");
@@ -3278,6 +3446,7 @@ mod tests {
             &RequestId::now_v7(),
             Uuid::now_v7(),
             EventTimeWindow::default(),
+            None,
         )
         .expect("in-window native event time is accepted");
         let arr = decoded
@@ -3317,6 +3486,7 @@ mod tests {
             &RequestId::now_v7(),
             Uuid::now_v7(),
             window,
+            None,
         )
         .expect("past-edge value is accepted (inclusive bound)");
     }
@@ -3348,6 +3518,7 @@ mod tests {
             &RequestId::now_v7(),
             Uuid::now_v7(),
             window,
+            None,
         )
         .expect("future-edge value is accepted (inclusive bound)");
     }
@@ -3379,6 +3550,7 @@ mod tests {
             &RequestId::now_v7(),
             Uuid::now_v7(),
             EventTimeWindow::default(),
+            None,
         )
         .expect_err("31-day-old value must be rejected");
         assert!(
@@ -3420,6 +3592,7 @@ mod tests {
             &RequestId::now_v7(),
             Uuid::now_v7(),
             EventTimeWindow::default(),
+            None,
         )
         .expect_err("25-hour-future value must be rejected");
         assert!(
@@ -3452,6 +3625,7 @@ mod tests {
             &RequestId::now_v7(),
             Uuid::now_v7(),
             EventTimeWindow::default(),
+            None,
         )
         .expect("projected in-window event time is accepted");
         let arr = decoded
@@ -3482,6 +3656,7 @@ mod tests {
             &RequestId::now_v7(),
             Uuid::now_v7(),
             EventTimeWindow::default(),
+            None,
         )
         .expect_err("projected out-of-range event time must be rejected");
         assert!(
@@ -3518,6 +3693,7 @@ mod tests {
             &RequestId::now_v7(),
             Uuid::now_v7(),
             tight_window,
+            None,
         )
         .expect("absent event time is server-stamped without window check");
         assert!(
@@ -3594,6 +3770,7 @@ mod tests {
                 &RequestId::now_v7(),
                 Uuid::now_v7(),
                 EventTimeWindow::default(),
+                None,
             )
             .expect_err("server-owned managed columns are reserved");
             assert!(matches!(error, ScribeError::InvalidFrame), "{reserved}");

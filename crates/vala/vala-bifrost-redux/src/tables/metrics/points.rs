@@ -176,6 +176,9 @@ impl DomainTable for PointsTable {
         "scope_attributes",
     ];
 
+    const CANONICAL_VALIDATOR: Option<crate::tables::CanonicalBatchValidator> =
+        Some(crate::tables::metrics::projection::validate_metric_points);
+
     fn canonical_fields() -> Option<&'static [CanonicalField]> {
         Some(METRIC_FIELDS)
     }

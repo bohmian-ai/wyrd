@@ -102,6 +102,11 @@ struct AdmittedRowContext {
         crate::scribe::material_plan::MAX_SOURCE_PLANS],
     /// Live prefix length within `native_sources`.
     native_source_count: usize,
+    /// Canonical built-in whose physical identity the decode must preserve.
+    ///
+    /// `None` for a dynamic table or a pre-declared built-in, which keep the
+    /// existing catalog-fingerprint and managed-field policy.
+    definition: Option<&'static crate::tables::BuiltinTableDefinition>,
 }
 
 /// The registered contract Scribe resolves for one logical frame before it
@@ -272,6 +277,7 @@ impl ScribeImpl {
             native_schema_end,
             native_sources,
             native_source_count,
+            definition,
         } = context;
         match payload {
             IngressPayload::ArrowIpc(bytes) => {
@@ -287,6 +293,7 @@ impl ScribeImpl {
                     schema_end: native_schema_end,
                     sources: native_sources,
                     source_count: native_source_count,
+                    definition,
                 })))
             }
             IngressPayload::Canonical(canonical) => {
@@ -294,11 +301,14 @@ impl ScribeImpl {
                     .ingress_cpu
                     .decode(
                         IngressPayload::Canonical(canonical),
-                        principal,
-                        expected_schema_fingerprint,
-                        request_id,
-                        batch_id,
-                        event_time_window,
+                        crate::scribe::execution_lanes::IngressDecodeInputs {
+                            principal,
+                            expected_schema_fingerprint,
+                            request_id,
+                            batch_id,
+                            window: event_time_window,
+                            definition,
+                        },
                     )
                     .await?;
                 let decoded_request_bytes = rows.get_array_memory_size();
@@ -408,6 +418,26 @@ impl ScribeImpl {
         memory.transfer_category(MemoryCategory::Prepared)
     }
 
+    /// Resolve the canonical built-in one logical table names, when it has one.
+    ///
+    /// Only a canonical signal table carries a value validator, so this is also
+    /// the single test for "does this write owe the canonical physical
+    /// contract". A dynamic or pre-declared table resolves to `None` and keeps
+    /// the existing catalog-fingerprint and managed-field policy.
+    fn canonical_definition(
+        table: &crate::catalog::TableRef,
+    ) -> Option<&'static crate::tables::BuiltinTableDefinition> {
+        crate::tables::builtin_table(
+            table
+                .namespace
+                .as_str()
+                .strip_prefix("vala.")
+                .unwrap_or_default(),
+            &table.name,
+        )
+        .filter(|definition| definition.canonical_validator.is_some())
+    }
+
     /// Prepares one request and dispatches its owned packet to its fixed shard.
     ///
     /// The global item reservation is acquired before decoding and remains
@@ -447,6 +477,7 @@ impl ScribeImpl {
             }
         };
         let tenant = frame.principal.tenant_id;
+        let canonical_definition = Self::canonical_definition(&frame.table);
         let rows = match self
             .prepare_admitted_rows(
                 frame.payload,
@@ -462,6 +493,7 @@ impl ScribeImpl {
                     native_schema_end: material_plan.native_schema_end,
                     native_sources: material_plan.sources,
                     native_source_count: material_plan.source_count,
+                    definition: canonical_definition,
                 },
             )
             .await

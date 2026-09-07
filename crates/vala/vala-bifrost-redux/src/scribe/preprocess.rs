@@ -89,6 +89,8 @@ pub(crate) struct NativeAdmittedRows {
         crate::scribe::material_plan::MAX_SOURCE_PLANS],
     /// Live prefix length within `sources`.
     pub(crate) source_count: usize,
+    /// Canonical built-in whose physical identity every source must preserve.
+    pub(crate) definition: Option<&'static crate::tables::BuiltinTableDefinition>,
 }
 
 /// A request after deterministic event-day splitting and serialization.
@@ -392,6 +394,7 @@ fn stamp_native_source(
             window: source.event_time_window,
             receipt_micros: Some(source.receipt_micros),
             start_row_ordinal,
+            definition: source.definition,
         },
     )
 }
@@ -1014,6 +1017,7 @@ mod tests {
             .expect("native plan");
         let tenant = DataTenantId::new_v7();
         NativeAdmittedRows {
+            definition: None,
             bytes,
             principal: Principal {
                 id: PrincipalId::new(uuid::Uuid::now_v7()),

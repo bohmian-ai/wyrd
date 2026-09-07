@@ -123,6 +123,9 @@ impl DomainTable for SpansTable {
         "scope_attributes",
     ];
 
+    const CANONICAL_VALIDATOR: Option<crate::tables::CanonicalBatchValidator> =
+        Some(validate_canonical_user_batch_for_table);
+
     fn canonical_fields() -> Option<&'static [crate::tables::fields::CanonicalField]> {
         Some(SPAN_FIELDS)
     }
@@ -144,4 +147,22 @@ impl DomainTable for SpansTable {
             entity_id_column: "trace_id".into(),
         })
     }
+}
+
+/// Validate one supplied user batch against this table's canonical ledger.
+///
+/// The registry stores this as the table's
+/// [`crate::tables::CanonicalBatchValidator`] so every canonical value rule is
+/// dispatched from the definition rather than from a caller that knows the
+/// table's name.
+///
+/// # Errors
+///
+/// Returns the shared canonical reason when the supplied schema drifts from
+/// the declared ledger or a canonical payload value is not canonically
+/// encoded.
+fn validate_canonical_user_batch_for_table(
+    batch: &arrow::array::RecordBatch,
+) -> Result<arrow::array::RecordBatch, String> {
+    crate::tables::signal::validate_canonical_user_batch(SPAN_FIELDS, batch)
 }

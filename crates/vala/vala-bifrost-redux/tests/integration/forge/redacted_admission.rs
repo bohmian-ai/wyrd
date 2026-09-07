@@ -655,3 +655,311 @@ fn staging_key(promoted: &PromotedRewriteFixture, path: &str) -> String {
         |(_, suffix)| format!("{prefix}/{suffix}"),
     )
 }
+
+/// Deterministic bound every wait in the worker-wide admission scenario shares.
+const ADMISSION_BOUND: std::time::Duration = std::time::Duration::from_mins(1);
+
+/// Reads every Forge task this tenant holds, across all of its tables.
+///
+/// [`super::support::PromotionIntegrationFixture::forge_tasks`] is scoped to the
+/// fixture's own table, which is exactly what a scenario about two concurrently
+/// owned attempts cannot use: the second attempt belongs to a sibling table.
+///
+/// # Panics
+///
+/// Panics when the read-only diagnostic query fails.
+async fn tenant_tasks(
+    fixture: &super::support::PromotionIntegrationFixture,
+) -> Vec<(uuid::Uuid, String, String, String)> {
+    sqlx::query_as(
+        "SELECT task_id, strategy, state, table_name FROM vala.forge_tasks \
+         WHERE data_tenant_id = $1 ORDER BY created_at, task_id",
+    )
+    .bind(fixture.tenant.as_uuid())
+    .fetch_all(fixture.operator_pool.pool())
+    .await
+    .expect("Forge tasks are readable")
+}
+
+/// Counts this tenant's successfully settled Scribe promotions.
+async fn promotions_succeeded(fixture: &super::support::PromotionIntegrationFixture) -> usize {
+    tenant_tasks(fixture)
+        .await
+        .into_iter()
+        .filter(|(_, strategy, state, _)| strategy == "scribe_promotion" && state == "succeeded")
+        .count()
+}
+
+/// Counts this tenant's small-files tasks whose state is one of `states`.
+async fn small_files_in_state(
+    fixture: &super::support::PromotionIntegrationFixture,
+    states: &[&str],
+) -> usize {
+    tenant_tasks(fixture)
+        .await
+        .into_iter()
+        .filter(|(_, strategy, task_state, _)| {
+            strategy == "small_files" && states.contains(&task_state.as_str())
+        })
+        .count()
+}
+
+/// Polls the durable task rows until `expected` small-files tasks hold `states`.
+///
+/// Returns the count actually observed, which is at least `expected` on
+/// success. Polling the durable rows rather than a worker-local counter is
+/// deliberate: the fact under test is that one worker genuinely *owns* two
+/// attempts at once, and ownership is a Postgres row, not an in-process number.
+///
+/// # Panics
+///
+/// Panics when the count is not reached inside [`ADMISSION_BOUND`], reporting
+/// the durable rows it did observe.
+async fn await_small_files_in_state(
+    fixture: &super::support::PromotionIntegrationFixture,
+    states: &[&str],
+    expected: usize,
+) -> usize {
+    let reached = tokio::time::timeout(ADMISSION_BOUND, async {
+        loop {
+            let observed = small_files_in_state(fixture, states).await;
+            if observed >= expected {
+                return observed;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    if let Ok(observed) = reached {
+        return observed;
+    }
+    panic!(
+        "{expected} small-files tasks never reached {states:?}; \
+         durable tasks are the authority on ownership: {:?}",
+        tenant_tasks(fixture).await
+    )
+}
+
+/// Publishes both fixture tables and leaves each owing one ready rewrite.
+///
+/// Settling as the tables are planned would compact one of them before the
+/// other owed anything, which is the opposite of the state under test, so
+/// promotion is settled first and compaction is only planned.
+///
+/// # Panics
+///
+/// Panics when the two tables do not reach two simultaneously ready
+/// small-files tasks.
+async fn plan_two_ready_rewrites(
+    promoted: &PromotedRewriteFixture,
+    supervisor: &mut SupervisedPromotion,
+) {
+    // Two tables, each with enough hot objects that its attempt plans more than
+    // one group and the worker has siblings to interleave.
+    promoted.fixture.seal_more(2).await;
+    promoted
+        .fixture
+        .register_and_seal_table("wide_fifo_b", 4)
+        .await;
+
+    // Promote both tables first, and only then plan their compaction. Settling
+    // as the tables are planned would compact one of them before the other owed
+    // anything, which is the opposite of the state under test. The worker is
+    // stopped by every settle helper, so it is rearmed between passes.
+    let mut worker_running = true;
+    for _ in 0..12 {
+        if promotions_succeeded(&promoted.fixture).await >= 2 {
+            break;
+        }
+        supervisor.schedule_only().await;
+        if tenant_tasks(&promoted.fixture)
+            .await
+            .iter()
+            .all(|(_, _, state, _)| state != "ready")
+        {
+            continue;
+        }
+        if !worker_running {
+            supervisor.restart_worker();
+        }
+        supervisor.settle_some_success().await;
+        worker_running = false;
+    }
+    assert!(
+        promotions_succeeded(&promoted.fixture).await >= 2,
+        "both tables must be published before either owes compaction: {:?}",
+        tenant_tasks(&promoted.fixture).await
+    );
+    // Plan only. Both small-files tasks have to be ready at the same time for
+    // one worker to own both of them.
+    for _ in 0..8 {
+        if small_files_in_state(&promoted.fixture, &["ready"]).await >= 2 {
+            break;
+        }
+        supervisor.schedule_only().await;
+    }
+    assert_eq!(
+        small_files_in_state(&promoted.fixture, &["ready"]).await,
+        2,
+        "two tables must owe compaction at once: {:?}",
+        tenant_tasks(&promoted.fixture).await
+    );
+}
+
+/// One worker's FIFO bounds every attempt it owns, not one attempt at a time.
+///
+/// The admission budgets belong to the *worker*, so the queue, the join set,
+/// and the attempt map have to outlive any single claim. Two tables owe
+/// compaction debt at once, and the per-tenant claim cap is raised to two so a
+/// single worker genuinely holds both durable claims. One plan is then parked
+/// inside its own runner, between its managed handoff and its publication.
+///
+/// That park is the whole proof. A worker that drained a queue inside one claim
+/// frame would be blocked there: the parked plan would hold the only event loop
+/// there is, the second task could never be claimed, and nothing else could
+/// publish. Because the queue, the joins, and the attempts are worker-wide, the
+/// loop instead claims the sibling task, admits its plans onto the same budgets,
+/// and lets them publish out of order around the parked one.
+///
+/// A definite catalog refusal is injected across the same window so at least
+redacted
+/// any-success rule then has to hold across two concurrently owned attempts:
+/// every task settles successfully, every plan keeps its own operation, and the
+/// conflict costs the plan a retry rather than costing the task its outcome.
+///
+/// The queue's own invariants — strict FIFO order under capacity pressure,
+/// head-of-line blocking, uncharged waiting memory, aggregate running
+/// parallelism and memory, task-scoped cancellation, and exactly-once
+/// reservation release — are proved directly against the production queue by
+/// `forge::managed::queue::tests`, and the offer pass's stop-on-refusal rule by
+/// `forge::worker::tests::pending_capacity_refusal_stops_offer_pass`. This
+/// scenario proves the part only the real worker can show: that those budgets
+/// are shared across concurrently owned attempts at all.
+///
+/// # Panics
+///
+/// Panics when the worker cannot own two attempts at once, when a parked plan
+/// blocks its siblings, when a task fails despite a sibling publishing, when
+/// two plans share an operation identity, when an operation is left open, or
+/// when the worker does not drain its joins cleanly at shutdown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn worker_wide_fifo_bounds_concurrent_attempts() {
+    let promoted = PromotedRewriteFixture::start_unpromoted("wide_fifo_a").await;
+    let object_store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
+    let catalog = PromotionCatalogSeam::new(
+        promoted.fixture.catalog.iceberg_catalog(),
+        object_store.read_counter(),
+    );
+    let mut supervisor = SupervisedPromotion::start_with_worker_bounds(
+        &promoted.fixture,
+        Arc::clone(&catalog) as Arc<dyn iceberg::Catalog>,
+        Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
+        ForgeClock::system(),
+        vala_bifrost_redux::forge::ForgeWorkerConfig {
+            // One worker, several concurrently owned claims. The always-due
+            // orphan fallback competes for the same cap, so the bound is set
+            // above the two compaction claims under test rather than exactly at
+            // them. Every other bound stays at the production default so the
+            // budgets under test are the real ones.
+            per_tenant_active_cap: 4,
+            ..vala_bifrost_redux::forge::ForgeWorkerConfig::default()
+        },
+    );
+    plan_two_ready_rewrites(&promoted, &mut supervisor).await;
+
+    let inputs = promoted
+        .live_data_files()
+        .await
+        .into_iter()
+        .map(|file| file.file_path().to_owned())
+        .collect::<BTreeSet<_>>();
+    let operations_before = promoted.fixture.rewrite_operations().await.len();
+
+    // Park one plan between its managed handoff and its publication, and refuse
+    // one commit outright so a sibling also spends a revalidated retry.
+    supervisor
+        .observer()
+        .hold_after_next_rewrite_handoff_for_test();
+    catalog.reject_next_commits(1);
+    // Setup left the worker stopped at its own barrier; this generation runs
+    // free so the scenario, not a fixture helper, decides when it has seen
+    // enough.
+    supervisor.restart_worker();
+    supervisor.start_worker();
+    tokio::time::timeout(
+        ADMISSION_BOUND,
+        supervisor
+            .observer()
+            .wait_for_held_rewrite_handoff_for_test(),
+    )
+    .await
+    .expect("a production plan parks at its publication authority");
+
+    // The parked plan holds a spawned runner, not the event loop: the same
+    // worker must be able to claim and admit the sibling attempt meanwhile.
+    let owned =
+        await_small_files_in_state(&promoted.fixture, &["claimed", "running", "prepared"], 2).await;
+    assert_eq!(
+        owned,
+        2,
+        "one worker owns both attempts while a plan is parked: {:?}",
+        tenant_tasks(&promoted.fixture).await
+    );
+
+    supervisor
+        .observer()
+        .release_held_rewrite_handoff_for_test();
+    await_small_files_in_state(&promoted.fixture, &["succeeded"], 2).await;
+    // A clean shutdown drains every join before the worker returns; the helper
+    // panics if the production loop exits any other way.
+    supervisor.shutdown().await;
+
+    let settled = tenant_tasks(&promoted.fixture)
+        .await
+        .into_iter()
+        .filter(|(_, strategy, _, _)| strategy == "small_files")
+        .collect::<Vec<_>>();
+    assert!(
+        settled
+            .iter()
+            .filter(|(_, _, state, _)| state == "succeeded")
+            .count()
+            >= 2,
+        "a definite conflict costs its plan a retry, never its task's outcome: {settled:?}"
+    );
+
+    let operations = promoted.fixture.rewrite_operations().await;
+    let published = operations.len() - operations_before;
+    assert!(
+        published >= 2,
+        "both concurrently owned attempts published: {operations:?}"
+    );
+    assert!(
+        operations.iter().all(|(_, phase)| phase == "committed"),
+        "no concurrently admitted plan left its operation open: {operations:?}"
+    );
+    assert_eq!(
+        operations
+            .iter()
+            .map(|(id, _)| *id)
+            .collect::<BTreeSet<_>>()
+            .len(),
+        operations.len(),
+        "plans that ran concurrently kept their own operation identities: {operations:?}"
+    );
+    assert!(
+        promoted
+            .live_data_files()
+            .await
+            .into_iter()
+            .map(|file| file.file_path().to_owned())
+            .collect::<BTreeSet<_>>()
+            .is_disjoint(&inputs),
+        "every rewritten input left the live set"
+    );
+    assert_eq!(
+        promoted.fixture.live_leases().await,
+        0,
+        "a drained worker holds no table fence"
+    );
+}

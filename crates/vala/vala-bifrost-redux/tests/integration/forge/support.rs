@@ -1621,7 +1621,7 @@ impl SupervisedPromotion {
     /// # Panics
     ///
     /// Panics when the fixture cannot construct a validated worker graph.
-    fn start_with_worker_bounds(
+    pub(crate) fn start_with_worker_bounds(
         fixture: &PromotionIntegrationFixture,
         catalog: Arc<dyn Catalog>,
         object_store: Arc<dyn ForgeObjectStore>,
@@ -1748,6 +1748,21 @@ impl SupervisedPromotion {
             worker.run(stop, ForgeRoleReadiness::detached()).await
         }));
         self.worker_armed = false;
+    }
+
+    /// Spawn the armed worker and leave it running under the caller's control.
+    ///
+    /// Every `run_one_*` helper stops the worker at its first returned attempt,
+    /// which is exactly what a scenario about *concurrent* attempts must not
+    /// do. This starts the same production worker and hands the scenario the
+    /// job of deciding when it has seen enough, so two claims can be in flight
+    /// at once against one worker's admission budgets.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the validated worker graph cannot be constructed.
+    pub(crate) fn start_worker(&mut self) {
+        self.start_armed_worker();
     }
 
     /// Request and await one production planning pass without running work.

@@ -53,7 +53,10 @@ mod pg_tests {
                 parameters: serde_json::json!({}),
             },
             plan_hash: [hash; 32],
-            estimates: ForgeTaskEstimates { files: 1, bytes: 100 },
+            estimates: ForgeTaskEstimates {
+                files: 1,
+                bytes: 100,
+            },
             ready_at: Utc::now() - Duration::seconds(1),
         }
     }
@@ -326,11 +329,7 @@ mod pg_tests {
         let tenant = fixture.data_tenant_id();
         let owner = Uuid::now_v7();
         let task_id = tasks
-            .enqueue(&task(
-                tenant,
-                "superseded",
-                92,
-            ))
+            .enqueue(&task(tenant, "superseded", 92))
             .await
             .expect("enqueue superseded task");
         let claim = tasks
@@ -612,11 +611,7 @@ mod pg_tests {
         // third large task on a new table and prove owner A cannot take it while
         // its first large task is still active.
         tasks
-            .enqueue(&task(
-                tenant_a,
-                "large-a-second",
-                4,
-            ))
+            .enqueue(&task(tenant_a, "large-a-second", 4))
             .await
             .expect("second large for owner A tenant");
         assert!(
@@ -643,19 +638,11 @@ mod pg_tests {
         let tenant = fixture.data_tenant_id();
         let owner = Uuid::now_v7();
         let first_id = tasks
-            .enqueue(&task(
-                tenant,
-                "large-first",
-                21,
-            ))
+            .enqueue(&task(tenant, "large-first", 21))
             .await
             .expect("first large");
         tasks
-            .enqueue(&task(
-                tenant,
-                "large-second",
-                22,
-            ))
+            .enqueue(&task(tenant, "large-second", 22))
             .await
             .expect("second large");
         let first = tasks
@@ -811,11 +798,7 @@ mod pg_tests {
         // A second large task on a distinct table is refused for the same owner
         // while its first large task is active, even though ordinary work flows.
         tasks
-            .enqueue(&task(
-                tenant,
-                "large-second",
-                73,
-            ))
+            .enqueue(&task(tenant, "large-second", 73))
             .await
             .expect("second large task");
         assert!(
@@ -849,11 +832,7 @@ mod pg_tests {
         let tasks = ForgeTasks::new(op.clone());
         let tenant = fixture.data_tenant_id();
         let task_id = tasks
-            .enqueue(&task(
-                tenant,
-                "malformed-claim",
-                12,
-            ))
+            .enqueue(&task(tenant, "malformed-claim", 12))
             .await
             .expect("enqueue");
         sqlx::query("UPDATE vala.forge_tasks SET plan=jsonb_set(plan,'{version}','99'::jsonb) WHERE task_id=$1").bind(task_id).execute(&admin).await.expect("corrupt plan");
@@ -1112,11 +1091,7 @@ mod pg_tests {
         let tenant = fixture.data_tenant_id();
         let original_owner = Uuid::now_v7();
         let task_id = tasks
-            .enqueue(&task(
-                tenant,
-                "prepared-takeover",
-                73,
-            ))
+            .enqueue(&task(tenant, "prepared-takeover", 73))
             .await
             .expect("enqueue");
         let claimed = tasks
@@ -1212,11 +1187,7 @@ mod pg_tests {
         let tenant = fixture.data_tenant_id();
         let original_owner = Uuid::now_v7();
         let task_id = tasks
-            .enqueue(&task(
-                tenant,
-                "large-prepared-takeover",
-                74,
-            ))
+            .enqueue(&task(tenant, "large-prepared-takeover", 74))
             .await
             .expect("enqueue");
         let claimed = tasks
@@ -1299,11 +1270,7 @@ mod pg_tests {
             .expect("table identity");
         let owner = Uuid::now_v7();
         let task_id = tasks
-            .enqueue(&task(
-                tenant,
-                "atomic-successor",
-                91,
-            ))
+            .enqueue(&task(tenant, "atomic-successor", 91))
             .await
             .expect("enqueue");
         let claim = tasks
@@ -1430,11 +1397,7 @@ mod pg_tests {
         )
         .expect("no-op table identity");
         let noop_id = tasks
-            .enqueue(&task(
-                tenant,
-                "atomic-noop-acknowledgement",
-                93,
-            ))
+            .enqueue(&task(tenant, "atomic-noop-acknowledgement", 93))
             .await
             .expect("enqueue no-op");
         let noop_claim = tasks
@@ -1786,11 +1749,7 @@ mod pg_tests {
         assert!(!overflowed);
         assert_eq!(listed[0].generation, 3);
         let captured = listed[0].clone();
-        let mismatched = task(
-            DataTenantId::new_v7(),
-            "demand",
-            41,
-        );
+        let mismatched = task(DataTenantId::new_v7(), "demand", 41);
         assert!(
             tasks
                 .enqueue_and_acknowledge(
@@ -2348,9 +2307,7 @@ mod pg_tests {
                     owner,
                     fence,
                     &first,
-                    ForgeEnqueueBatch {
-                        executable: &[],
-                    }
+                    ForgeEnqueueBatch { executable: &[] }
                 )
                 .await
                 .is_err(),
@@ -2372,9 +2329,7 @@ mod pg_tests {
                     owner,
                     fence,
                     &current,
-                    ForgeEnqueueBatch {
-                        executable: &[],
-                    }
+                    ForgeEnqueueBatch { executable: &[] }
                 )
                 .await
                 .expect("acknowledge current generation")
@@ -2468,11 +2423,7 @@ mod pg_tests {
         // A compaction backlog across distinct tables, each independently ready.
         for index in 0..3_u8 {
             tasks
-                .enqueue(&task(
-                    tenant,
-                    &format!("compaction_{index}"),
-                    index,
-                ))
+                .enqueue(&task(tenant, &format!("compaction_{index}"), index))
                 .await
                 .expect("enqueue compaction backlog");
         }
@@ -4298,11 +4249,7 @@ mod pg_tests {
         {
             // Parked under a strategy that is also pending, so an owned or
             // finished row inflating its queue count fails here.
-            let seed = task(
-                tenant,
-                &format!("owned-{index}"),
-                hash,
-            );
+            let seed = task(tenant, &format!("owned-{index}"), hash);
             hash += 1;
             let task_id = tasks.enqueue(&seed).await.expect("non-pending seed");
             sqlx::query(

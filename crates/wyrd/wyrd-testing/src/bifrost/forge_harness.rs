@@ -1130,7 +1130,6 @@ impl ForgeFixture {
                 scheduler_trigger: Some(scheduler_trigger),
             },
         )
-        
         .expect("validated Forge fixture config")
     }
 
@@ -1188,7 +1187,6 @@ impl ForgeFixture {
             Arc::clone(&self.object_store),
             Some(system_memory_limit_bytes),
         )
-        
         .expect("validated Forge fixture config")
     }
 

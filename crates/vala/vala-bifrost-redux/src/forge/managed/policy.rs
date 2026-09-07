@@ -444,8 +444,8 @@ mod tests {
             (FILE_TARGET_PROPERTY, "268435456"),
             (ROW_GROUP_TARGET_PROPERTY, "134217728"),
         ]);
-        let policy =
-            ForgeTablePolicy::extract(&metadata, &limits()).expect("declared geometry is admissible");
+        let policy = ForgeTablePolicy::extract(&metadata, &limits())
+            .expect("declared geometry is admissible");
 
         assert_eq!(policy.target_file_size_bytes, 268_435_456);
         assert_eq!(policy.row_group_target_bytes, 134_217_728);
@@ -499,10 +499,7 @@ mod tests {
     #[test]
     fn forge_table_policy_rejects_impossible_geometry() {
         assert!(matches!(
-            ForgeTablePolicy::extract(
-                &metadata_with(vec![(FILE_TARGET_PROPERTY, "0")]),
-                &limits(),
-            ),
+            ForgeTablePolicy::extract(&metadata_with(vec![(FILE_TARGET_PROPERTY, "0")]), &limits(),),
             Err(ForgeError::InvalidConfig { .. })
         ));
         assert!(matches!(

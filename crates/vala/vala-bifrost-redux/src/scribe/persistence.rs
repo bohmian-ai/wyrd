@@ -3321,11 +3321,7 @@ mod tests {
             let scribe_stage = wal_root.path().join("scribe-stage");
             let scribe_output = scratch_root.path().join("scribe-output");
             let oracle_scratch = scratch_root.path().join("oracle");
-            for root in [
-                &scribe_stage,
-                &scribe_output,
-                &oracle_scratch,
-            ] {
+            for root in [&scribe_stage, &scribe_output, &oracle_scratch] {
                 std::fs::create_dir(root).expect("test volume root");
             }
             let node_id = crate::scribe::stream_identity::NodeId::generate();

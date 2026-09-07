@@ -14,7 +14,7 @@ use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef, TenantTableBindi
 use vala_bifrost_redux::forge::{ForgeConfig, ForgeWorkerCompletionObserver};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::resources::{
-    FORGE_MEMORY_FLOOR_BYTES, ROLE_MEMORY_FLOOR_BYTES, ResourceSource, SystemResourceSnapshot,
+    ROLE_MEMORY_FLOOR_BYTES, ResourceSource, SystemResourceSnapshot,
 };
 use vala_bifrost_redux::scribe::geometry::DEFAULT_STAGING_TARGET_FILE_SIZE_BYTES;
 use vala_sdk::BifrostGrpcTransport;
@@ -88,13 +88,12 @@ impl CloseoutJourney {
         spec.nodes[0].roles = [BifrostRuntimeRole::Scribe].into_iter().collect();
         spec.nodes[2].roles = [BifrostRuntimeRole::Oracle].into_iter().collect();
         // Both Oracle replicas must derive the same durable admission ceiling.
-        // The dedicated replica needs no Scribe or Forge protected floors.
+        // The dedicated replica needs no Scribe protected floor, and Forge
+        // holds none at all.
         spec.nodes[2].oracle = Some(TestOracleResources {
             spill_root: None,
             system_resources: Some(SystemResourceSnapshot {
-                memory_limit_bytes: 3 * 1024 * 1024 * 1024
-                    - ROLE_MEMORY_FLOOR_BYTES
-                    - FORGE_MEMORY_FLOOR_BYTES,
+                memory_limit_bytes: 3 * 1024 * 1024 * 1024 - ROLE_MEMORY_FLOOR_BYTES,
                 effective_cpu: 4,
                 scratch_capacity_bytes: 4 * 1024 * 1024 * 1024,
                 scratch_available_bytes: 4 * 1024 * 1024 * 1024,

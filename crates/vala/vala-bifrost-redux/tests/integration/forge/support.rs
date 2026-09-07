@@ -1947,11 +1947,7 @@ fn fixture_roles(
     let scribe_stage = wal_root.join("scribe-stage");
     let scribe_output = scratch_root.join("scribe-output");
     let oracle_scratch = scratch_root.join("oracle");
-    for root in [
-        &scribe_stage,
-        &scribe_output,
-        &oracle_scratch,
-    ] {
+    for root in [&scribe_stage, &scribe_output, &oracle_scratch] {
         std::fs::create_dir_all(root).expect("fixture volume root");
     }
     BifrostRuntimeResources::from_snapshot(

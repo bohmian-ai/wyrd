@@ -15,9 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
 use iceberg::spec::DataContentType;
-use vala_bifrost_redux::forge::{
-    ForgeClock, ForgeError, ForgeObjectStore, ForgeUnsettledOutput,
-};
+use vala_bifrost_redux::forge::{ForgeClock, ForgeError, ForgeObjectStore, ForgeUnsettledOutput};
 
 use super::rewrite_support::{AttemptRun, PromotedRewriteFixture, RewriteOutputBreak};
 use super::support::{CountingObjectStore, PromotionCatalogSeam, SupervisedPromotion};

@@ -6403,8 +6403,7 @@ impl Drop for ForgeWorkerReadinessGuard {
 #[cfg(test)]
 mod tests {
     use vala_sql::row_types::forge_tasks::{
-        FORGE_TASK_PAYLOAD_VERSION, ForgeTaskEstimates, ForgeTaskPlan,
-        ForgeTaskTableIdentity,
+        FORGE_TASK_PAYLOAD_VERSION, ForgeTaskEstimates, ForgeTaskPlan, ForgeTaskTableIdentity,
     };
 
     use super::*;
@@ -6563,10 +6562,7 @@ mod tests {
                 inputs: vec!["data/one.parquet".to_owned()],
                 parameters,
             },
-            estimates: ForgeTaskEstimates {
-                files: 1,
-                bytes: 1,
-            },
+            estimates: ForgeTaskEstimates { files: 1, bytes: 1 },
             state: ForgeTaskState::Claimed,
             attempt_id: Some(Uuid::now_v7()),
             claimed_by: Some(Uuid::now_v7()),

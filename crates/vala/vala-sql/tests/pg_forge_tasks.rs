@@ -103,6 +103,80 @@ mod pg_tests {
         }
     }
 
+    /// Rewrite enqueue and claim carry no synthetic execution envelope or lane.
+    ///
+    /// The superseded Forge path persisted a per-task execution envelope and a
+    /// `lane` discriminator, then filtered the fair claim on those synthetic
+    /// memory, spill, and scratch predicates. Local compaction admission now
+    /// owns every execution decision, so the durable row must describe the work
+    /// only — identity, strategy, plan, and observed input files/bytes — and the
+    /// claim must order purely on tenant fairness and time. This asserts both
+    /// halves against the live schema and the live claim.
+    ///
+    /// # Panics
+    /// Panics when an envelope or lane column survives, or when a claim that is
+    /// ordered only by readiness fails to return the oldest eligible task.
+    #[tokio::test]
+    async fn rewrite_claims_do_not_persist_or_filter_synthetic_execution_envelopes() {
+        let (fixture, admin) = setup().await;
+        let tasks = ForgeTasks::new(fixture.operator_pool().clone());
+        let tenant = fixture.data_tenant_id();
+        let columns: Vec<String> = sqlx::query_scalar(
+            "SELECT column_name FROM information_schema.columns \
+             WHERE table_schema='vala' AND table_name='forge_tasks'",
+        )
+        .fetch_all(&admin)
+        .await
+        .expect("forge_tasks columns");
+        for banned in [
+            "lane",
+            "envelope_version",
+            "estimated_parallelism",
+            "estimated_memory_bytes",
+            "estimated_spill_bytes",
+            "large_task_ceiling_bytes",
+            "decoded_batch_bytes",
+            "decoded_input_bytes",
+            "sort_working_bytes",
+            "sort_merge_reservation_bytes",
+            "encoder_buffer_bytes",
+            "upload_chunk_bytes",
+            "footer_encoded_bytes",
+            "footer_decode_workspace_bytes",
+            "sort_spill_bytes",
+        ] {
+            assert!(
+                !columns.iter().any(|column| column == banned),
+                "vala.forge_tasks must not persist the synthetic execution column {banned}"
+            );
+        }
+        // Two ready rewrite tasks on distinct tables differ only in readiness, so
+        // an order that still consulted a synthetic execution predicate could not
+        // return them oldest-first.
+        let owner = Uuid::now_v7();
+        let mut older = task(tenant, "older", 51);
+        older.ready_at = Utc::now() - Duration::seconds(120);
+        let older_id = tasks.enqueue(&older).await.expect("older task");
+        let mut newer = task(tenant, "newer", 52);
+        newer.ready_at = Utc::now() - Duration::seconds(1);
+        tasks.enqueue(&newer).await.expect("newer task");
+        tasks
+            .acquire_scheduler(owner, 30)
+            .await
+            .expect("scheduler")
+            .expect("fence");
+        assert_eq!(
+            tasks
+                .claim_fair(owner, limits(2), None)
+                .await
+                .expect("claim")
+                .expect("an eligible rewrite task")
+                .task_id,
+            older_id,
+            "the fair claim orders on tenant fairness and readiness alone"
+        );
+    }
+
     /// Retry settlement persists the closed failure class and its bounded delay.
     #[tokio::test]
     async fn failure_taxonomy_backoff_is_durable() {
@@ -286,11 +360,11 @@ mod pg_tests {
             .expect("enqueue worker-only task");
         assert!(
             tasks
-                .claim_fair(owner, limits(0), None)
+                .claim_fair(owner, limits(1), Some(&[ForgeTaskStrategy::SnapshotExpiry]))
                 .await
                 .expect("refused claim")
                 .is_none(),
-            "an exhausted tenant slot admits nothing"
+            "a strategy filter that matches nothing admits nothing"
         );
         let unchanged: (Option<Uuid>,) = sqlx::query_as(
             "SELECT last_tenant_id FROM vala.forge_worker_claim_state WHERE singleton",
@@ -558,146 +632,6 @@ mod pg_tests {
             first.data_tenant_id, second.data_tenant_id,
             "cursor resumes strictly after prior tenant"
         );
-    }
-
-    /// Proves oversized single-file compactions on distinct tables run
-    /// concurrently across owners, bounded only by the per-owner
-    /// one-active-large rule (D78): two owners each claim a large task in the
-    /// same window, while a second large claim by an owner that already holds an
-    /// active large task is refused. Replaces the removed cluster-wide singleton.
-    ///
-    /// # Panics
-    /// Panics when PostgreSQL setup or a concurrency assertion fails.
-    #[tokio::test]
-    async fn large_tasks_on_distinct_tables_claim_concurrently_across_owners() {
-        let (fixture, _admin) = setup().await;
-        let op = fixture.operator_pool();
-        let tasks = ForgeTasks::new(op.clone());
-        let tenant_a = fixture.data_tenant_id();
-        let tenant_b = DataTenantId::new_v7();
-        fixture
-            .seed_additional_tenant_with_uuid(tenant_b, "forge-second")
-            .await
-            .expect("seed tenant");
-        tasks
-            .enqueue(&task(tenant_a, "large-a", 2))
-            .await
-            .expect("a");
-        tasks
-            .enqueue(&task(tenant_b, "large-b", 3))
-            .await
-            .expect("b");
-        let owner_a = Uuid::now_v7();
-        let owner_b = Uuid::now_v7();
-        let (left, right) = tokio::join!(
-            tasks.claim_fair(owner_a, limits(1), None),
-            tasks.claim_fair(owner_b, limits(1), None)
-        );
-        let claims = [
-            left.expect("left").expect("owner A claims a large task"),
-            right.expect("right").expect("owner B claims a large task"),
-        ];
-        assert_eq!(
-            claims.len(),
-            2,
-            "both tasks on distinct tables claim concurrently across owners"
-        );
-        assert_ne!(
-            claims[0].task_id, claims[1].task_id,
-            "each owner claims a distinct large task"
-        );
-
-        // The per-owner rule refuses a second concurrent large claim: enqueue a
-        // third large task on a new table and prove owner A cannot take it while
-        // its first large task is still active.
-        tasks
-            .enqueue(&task(tenant_a, "large-a-second", 4))
-            .await
-            .expect("second large for owner A tenant");
-        assert!(
-            tasks
-                .claim_fair(owner_a, limits(4), None)
-                .await
-                .expect("owner A second large claim")
-                .is_none(),
-            "owner A cannot hold two active large tasks at once"
-        );
-    }
-
-    /// Proves an owner holding one active large task cannot claim a second large
-    /// task until its first reaches a terminal state, at which point the freed
-    /// per-owner slot admits the next large claim (D78).
-    ///
-    /// # Panics
-    /// Panics when the per-owner large bound does not release on terminalization.
-    #[tokio::test]
-    async fn same_owner_second_large_claim_refused_until_terminal() {
-        let (fixture, _admin) = setup().await;
-        let op = fixture.operator_pool();
-        let tasks = ForgeTasks::new(op.clone());
-        let tenant = fixture.data_tenant_id();
-        let owner = Uuid::now_v7();
-        let first_id = tasks
-            .enqueue(&task(tenant, "large-first", 21))
-            .await
-            .expect("first large");
-        tasks
-            .enqueue(&task(tenant, "large-second", 22))
-            .await
-            .expect("second large");
-        let first = tasks
-            .claim_fair(owner, limits(4), None)
-            .await
-            .expect("first claim")
-            .expect("owner claims first large");
-        assert_eq!(first.task_id, first_id);
-        let attempt = first.attempt_id.expect("attempt");
-        assert!(
-            tasks
-                .claim_fair(owner, limits(4), None)
-                .await
-                .expect("second claim")
-                .is_none(),
-            "second large claim refused while first is active"
-        );
-
-        // Drive the first large task to a terminal state, freeing the owner's slot.
-        tasks
-            .start(
-                first_id,
-                attempt,
-                owner,
-                SnapshotWatermark {
-                    snapshot_id: 21,
-                    timestamp_ms: 21,
-                },
-            )
-            .await
-            .expect("start first large");
-        let mut conn = TenantConn::acquire(fixture.app_pool(), tenant)
-            .await
-            .expect("tenant connection");
-        tasks
-            .terminal(
-                &mut conn,
-                ForgeTaskTransition {
-                    task_id: first_id,
-                    attempt_id: attempt,
-                    owner,
-                    expected: ForgeTaskState::Running,
-                    next: ForgeTaskState::Failed,
-                },
-                &event("forge.task.failed", first_id),
-            )
-            .await
-            .expect("terminalize first large");
-        conn.commit().await.expect("commit terminal");
-        let second = tasks
-            .claim_fair(owner, limits(4), None)
-            .await
-            .expect("post-terminal claim")
-            .expect("owner claims second large after first terminal");
-        assert_ne!(second.task_id, first_id, "distinct second large task");
     }
 
     /// Proves claimability excludes an active table generation before FIFO
@@ -1945,8 +1879,8 @@ mod pg_tests {
         );
     }
 
-    /// Proves failures after task, audit, demand, and cursor mutations roll
-    /// back the complete fenced planning transaction.
+    /// Proves failures after task, demand, and cursor mutations roll back the
+    /// complete fenced planning transaction.
     ///
     /// # Panics
     /// Panics when failure injection or any rollback assertion fails.
@@ -1967,10 +1901,6 @@ mod pg_tests {
         sqlx::query("CREATE FUNCTION vala.fail_forge_planning_step() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected Forge planning failure'; END $$")
             .execute(&admin).await.expect("failure function");
         let stages = [
-            (
-                "audit_outbox",
-                "CREATE TRIGGER forge_fail_step BEFORE INSERT ON vala.audit_outbox FOR EACH ROW EXECUTE FUNCTION vala.fail_forge_planning_step()",
-            ),
             (
                 "forge_planning_demands",
                 "CREATE TRIGGER forge_fail_step BEFORE DELETE ON vala.forge_planning_demands FOR EACH ROW EXECUTE FUNCTION vala.fail_forge_planning_step()",
@@ -2022,7 +1952,8 @@ mod pg_tests {
                         }
                     )
                     .await
-                    .is_err()
+                    .is_err(),
+                "enqueue stage {index} must fail"
             );
             let drop_trigger = format!("DROP TRIGGER forge_fail_step ON vala.{trigger_table}");
             sqlx::query(sqlx::AssertSqlSafe(drop_trigger))

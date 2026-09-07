@@ -580,9 +580,10 @@ async fn assert_expired_deadline_makes_no_second_call() {
     let phases = promoted.fixture.rewrite_phases().await;
     assert_eq!(
         catalog.attempts() - attempts_before,
-        1 + 4 * (phases.len() - 1),
+        1,
         "a conflict answered past the publication deadline buys no second call, \
-         while each sibling plan spends its own full retry budget"
+         and a sibling plan under the same spent budget never submits at all: \
+         {phases:?}"
     );
     assert_eq!(
         phases,
@@ -656,9 +657,10 @@ async fn assert_retry_inherits_only_the_remaining_budget() {
     let phases = promoted.fixture.rewrite_phases().await;
     assert_eq!(
         catalog.attempts() - attempts_before,
-        2 + 4 * (phases.len() - 1),
+        2 * phases.len(),
         "the publication made its initial call and exactly one retry, and every \
-         sibling plan spent its own full retry budget"
+         sibling plan got the same two calls out of what the attempt's one \
+         shared budget still had left: {phases:?}"
     );
     assert_eq!(
         phases.first().map(String::as_str),
@@ -785,11 +787,17 @@ async fn rewrite_publication_ambiguity_restart_settles_once() {
     supervisor.restart_worker();
     supervisor.run_one_success().await;
     let settled = promoted.fixture.rewrite_phases().await;
+    // The drained operation is reset first; every operation after it belongs to
+    // the takeover, which opens one per plan it publishes.
     assert_eq!(
-        settled,
-        vec!["reset".to_owned(), "committed".to_owned()],
+        settled.first().map(String::as_str),
+        Some("reset"),
         "the drained operation settles from retained evidence before the \
          takeover opens its own: {settled:?}"
+    );
+    assert!(
+        settled.len() > 1 && settled[1..].iter().all(|phase| phase == "committed"),
+        "every operation the takeover opened committed exactly once: {settled:?}"
     );
     let published = promoted
         .live_data_files()

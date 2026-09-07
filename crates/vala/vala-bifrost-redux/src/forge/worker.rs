@@ -281,6 +281,15 @@ struct ForgeRewriteAttempt<'attempt> {
     table: Table,
     /// Planning evidence every plan of this attempt records under its operation.
     evidence: super::managed::ForgeRewriteEvidence,
+    /// One absolute publication budget every plan of this attempt shares.
+    ///
+    /// Attempt-scoped, not plan-scoped: the budget bounds how long this claim
+    /// may keep asking the catalog to accept work planned against one table
+    /// read, and a per-plan budget would let an attempt with many plans keep
+    /// submitting for a multiple of the configured window. A plan that finds
+    /// the budget spent refuses before it prepares anything, which is ordinary
+    /// planning debt the next attempt replans.
+    deadline: super::publication::RewritePublicationDeadline,
 }
 
 enum ForgeDispatchResult {
@@ -4076,6 +4085,10 @@ impl ForgeWorker {
             rewrite: &rewrite,
             table,
             evidence,
+            deadline: super::publication::RewritePublicationDeadline::new(
+                self.forge.core.clock.now()?,
+                self.forge.core.config.iceberg_total_retry_timeout,
+            )?,
         };
         let mut outcomes: Vec<(usize, Result<ForgeDispatchResult, ForgeError>)> = Vec::new();
         while let Some(popped) = queue.pop() {
@@ -4174,10 +4187,7 @@ impl ForgeWorker {
                 metadata,
             )?,
             planned_schema_id: metadata.current_schema_id(),
-            deadline: super::publication::RewritePublicationDeadline::new(
-                self.forge.core.clock.now()?,
-                self.forge.core.config.iceberg_total_retry_timeout,
-            )?,
+            deadline: attempt.deadline,
         };
         #[cfg(feature = "test-support")]
         self.record_rewrite_evidence_for_test(&context.identity);
@@ -4222,8 +4232,8 @@ redacted
             return Ok(result);
         }
         failures.sort_by_key(|(plan_index, _)| *plan_index);
-        if let Some((_, error)) = failures.into_iter().next() {
-            return Err(error);
+        if !failures.is_empty() {
+            return Err(Self::unsettled_across_plans(failures));
         }
         refusals.sort_by_key(|(plan_index, _)| *plan_index);
         match refusals.into_iter().next() {
@@ -4243,6 +4253,42 @@ redacted
                 detail: "Forge planning produced plans that were neither admitted nor refused"
                     .to_owned(),
             }),
+        }
+    }
+
+    /// Reports one attempt's failure while keeping every plan's loose objects.
+    ///
+    /// The deciding failure is the lowest plan index's, which is what makes an
+    /// attempt settle the same way regardless of completion order. Its possible
+    /// outputs alone are not enough, though: a sibling plan that also failed
+    /// wrote objects that only this attempt can still name, and dropping them
+    /// with its error would leave objects no reclaiming caller ever hears
+    /// about. So the returned error carries the union, ordered by plan, and is
+    /// only wrapped when there is something to carry.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `failures` is empty, which its one caller has already
+    /// excluded.
+    fn unsettled_across_plans(failures: Vec<(usize, ForgeError)>) -> ForgeError {
+        let mut possible_outputs: Vec<super::managed::ForgeUnsettledOutput> = Vec::new();
+        for (_, error) in &failures {
+            possible_outputs.extend_from_slice(error.possible_rewrite_outputs());
+        }
+        let (_, deciding) = failures
+            .into_iter()
+            .next()
+            .expect("the caller reduces at least one failure");
+        if possible_outputs.len() <= deciding.possible_rewrite_outputs().len() {
+            return deciding;
+        }
+        let source = match deciding {
+            ForgeError::RewriteUnsettled { source, .. } => source,
+            other => Box::new(other),
+        };
+        ForgeError::RewriteUnsettled {
+            source,
+            possible_outputs,
         }
     }
 

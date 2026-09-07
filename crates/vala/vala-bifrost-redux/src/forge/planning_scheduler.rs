@@ -197,14 +197,7 @@ impl<'forge> ForgeScheduler<'forge> {
     fn with_owner(forge: &'forge Forge, owner: Uuid) -> Result<Self, ForgeError> {
         let config = &forge.core.config;
         let configured = ForgeCapacity::try_from(config)?;
-        let governor = forge
-            .core
-            .resources
-            .snapshot()
-            .map_err(|error| ForgeError::Capacity {
-                detail: error.to_string(),
-            })?;
-        let capacity = governed_capacity(configured, &governor.plan);
+        let capacity = governed_capacity(configured, &forge.core.resource_plan);
         Ok(Self {
             forge,
             cycle: None,
@@ -1447,17 +1440,9 @@ impl<'forge> ForgeScheduler<'forge> {
         if outcome.incomplete || outcome.demands_acknowledged != outcome.demands_seen {
             return Ok(());
         }
-        let governor =
-            self.forge
-                .core
-                .resources
-                .snapshot()
-                .map_err(|error| ForgeError::Capacity {
-                    detail: error.to_string(),
-                })?;
         let capacity = governed_capacity(
             ForgeCapacity::try_from(&self.forge.core.config)?,
-            &governor.plan,
+            &self.forge.core.resource_plan,
         );
         let limits = status_claim_limits(capacity);
         let unclaimable_task_ids = self

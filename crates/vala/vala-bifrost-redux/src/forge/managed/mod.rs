@@ -17,8 +17,10 @@ pub(crate) mod executor;
 pub(crate) mod fingerprint;
 pub(crate) mod handoff;
 pub(crate) mod identity;
+pub(crate) mod memory;
 pub(crate) mod observer;
 pub(crate) mod policy;
+pub(crate) mod queue;
 
 pub use executor::ForgeRewriteAttempt;
 pub use fingerprint::{ForgeRewriteEvidence, ForgeRewriteOutcome, ForgeUnsettledOutput};

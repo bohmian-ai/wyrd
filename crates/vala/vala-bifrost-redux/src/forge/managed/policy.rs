@@ -9,7 +9,6 @@
 //! use.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use iceberg::spec::{TableMetadata, TableProperties};
@@ -80,8 +79,6 @@ pub(crate) struct ForgeTablePolicy {
     pub(crate) writer_recipe: String,
     /// Base location beneath which every rewrite output is written.
     pub(crate) data_location: String,
-    /// Maximum core plans one attempt may execute before it must yield.
-    pub(crate) max_plans_per_attempt: usize,
 }
 
 /// Reads the target output size one table declares for its data files.
@@ -106,11 +103,10 @@ pub(crate) fn declared_target_file_size_bytes(metadata: &TableMetadata) -> Resul
 impl ForgeTablePolicy {
     /// Derives one attempt's policy from a loaded table and validated limits.
     ///
-    /// `admitted_memory_bytes` is the memory the root governor actually granted
-    /// this attempt, not a configured ceiling: a rewrite cannot buffer a row
-    /// group it was never admitted the memory to hold, and finding that out
-    /// here is what keeps it from being discovered as an out-of-memory failure
-    /// mid-write.
+    /// There is no admitted-memory term. Execution is unbounded and admission
+    /// happens against a per-plan estimate in the worker's queue, so a
+    /// row-group target can never be larger than a grant this policy was
+    /// checked against.
     ///
     /// # Errors
     ///
@@ -118,14 +114,11 @@ impl ForgeTablePolicy {
     /// unparseable or zero, when the small-file threshold is not strictly below
     /// the file target, when the row-group target exceeds the file target, when
     /// the file target cannot be represented on this platform or would overflow
-    /// the core's oversized ceiling, when the plan budget is zero, or when the
-    /// table's declared data location is not the registered Forge recipe
-    /// location. Returns [`ForgeError::Capacity`] when the admitted memory is
-    /// below one row-group target.
+    /// the core's oversized ceiling, or when the table's declared data location
+    /// is not the registered Forge recipe location.
     pub(crate) fn extract(
         metadata: &TableMetadata,
         config: &ForgeConfig,
-        admitted_memory_bytes: u64,
     ) -> Result<Self, ForgeError> {
         let properties = metadata.properties();
         let target_file_size_bytes =
@@ -164,9 +157,8 @@ impl ForgeTablePolicy {
             })?,
             writer_recipe: FORGE_WRITER_RECIPE.to_owned(),
             data_location: expected_location,
-            max_plans_per_attempt: config.rewrite_max_plans_per_attempt,
         };
-        policy.validate(admitted_memory_bytes)?;
+        policy.validate()?;
         Ok(policy)
     }
 
@@ -179,7 +171,7 @@ impl ForgeTablePolicy {
     /// # Errors
     ///
     /// See [`Self::extract`]; this method raises exactly those conditions.
-    fn validate(&self, admitted_memory_bytes: u64) -> Result<(), ForgeError> {
+    fn validate(&self) -> Result<(), ForgeError> {
         let refuse = |detail: String| Err(ForgeError::InvalidConfig { detail });
         if self.target_file_size_bytes == 0 {
             return refuse("rewrite target file size must be positive".to_owned());
@@ -189,9 +181,6 @@ impl ForgeTablePolicy {
         }
         if self.small_file_threshold_bytes == 0 {
             return refuse("rewrite small-file threshold must be positive".to_owned());
-        }
-        if self.max_plans_per_attempt == 0 {
-            return refuse("rewrite plan budget must admit at least one plan".to_owned());
         }
         if self.small_file_threshold_bytes >= self.target_file_size_bytes {
             return refuse(format!(
@@ -220,15 +209,6 @@ impl ForgeTablePolicy {
                 "target file size {} exceeds this platform",
                 self.target_file_size_bytes
             ));
-        }
-        if admitted_memory_bytes < self.row_group_target_bytes {
-            return Err(ForgeError::Capacity {
-                detail: format!(
-                    "admitted rewrite memory {admitted_memory_bytes} is below one \
-                     row-group target of {}",
-                    self.row_group_target_bytes
-                ),
-            });
         }
         Ok(())
     }
@@ -277,8 +257,6 @@ impl ForgeTablePolicy {
         data_file_prefix: String,
         bloom_columns: &[String],
         max_concurrent_closes: usize,
-        memory_bytes: usize,
-        spill_dir: PathBuf,
     ) -> Result<Arc<CompactionConfig>, ForgeError> {
         let execution: CompactionExecutionConfig = CompactionExecutionConfigBuilder::default()
             .target_file_size_bytes(self.target_file_size_bytes)
@@ -288,9 +266,11 @@ impl ForgeTablePolicy {
                 self.row_group_target_bytes,
                 bloom_columns,
             ))
-            .max_concurrent_compaction_plans(self.max_plans_per_attempt)
-            .max_memory_bytes(Some(memory_bytes))
-            .spill_dir(Some(spill_dir))
+            // One runner executes exactly one plan, so the core's own
+            // multi-plan concurrency is never used. Memory and spill are left
+            // unset so the processor selects the unbounded pool and no disk
+redacted
+            .max_concurrent_compaction_plans(1)
             .build()
             .map_err(|error| ForgeError::InvalidConfig {
                 detail: format!("Forge rewrite execution configuration is incomplete: {error}"),
@@ -299,8 +279,11 @@ impl ForgeTablePolicy {
             // ponytail: one stream matches the admitted writer working set;
             // widen only with a per-writer envelope that preserves rolling geometry.
             max_output_parallelism: 1,
+            // The complete real plan set must survive planning: deferral is
+            // the worker queue's job, and a truncated set would make the
+            // selection report describe work the plans do not contain.
             ..WyrdIdentityAwareConfig::new(self.to_selection_policy())
-                .with_max_selection_plans(self.max_plans_per_attempt)
+                .with_max_selection_plans(usize::MAX)
         };
         Ok(Arc::new(CompactionConfig::new(
             CompactionPlanningConfig::WyrdIdentityAware(planning),

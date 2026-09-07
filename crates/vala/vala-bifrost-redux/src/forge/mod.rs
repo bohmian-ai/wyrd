@@ -31,7 +31,6 @@ mod planning_scheduler;
 mod protection_roots;
 pub(crate) mod publication;
 mod reader_protection;
-pub(crate) mod rewrite;
 mod scheduler;
 pub(crate) mod scribe_promotion;
 mod worker;
@@ -51,7 +50,6 @@ pub use planner::{
     PlannedForgeTask,
 };
 pub use planning_scheduler::{ForgeScheduleOutcome, ForgeScheduler};
-pub use rewrite::ForgeRewriteRuntime;
 #[cfg(feature = "test-support")]
 pub use scheduler::ForgeSchedulerTrigger;
 #[cfg(feature = "test-support")]
@@ -141,8 +139,12 @@ impl ForgeRoleReadiness {
 
 /// Construction-time dependency graph for one Forge maintenance handle.
 pub struct ForgeBuildConfig {
-    /// Narrow Forge capability issued by the one production composition.
-    pub resources: crate::resources::ForgeResources,
+    /// Immutable root resource plan this process booted with.
+    ///
+    /// Forge reads the plan rather than holding a live root lease: its only
+    /// dynamic memory accounting is the worker-local compaction queue, charged
+    /// against `forge_compaction_memory_limit_bytes`.
+    pub resource_plan: crate::resources::ResourcePlan,
     /// SQL handle used by tenant-scoped durable Forge transitions.
     pub vala: vala_sql::ValaPostgres,
     /// Cross-tenant operator pool used by discovery and table leases.
@@ -160,8 +162,6 @@ pub struct ForgeBuildConfig {
     pub staging_lists_by_cursor: bool,
     /// Object-store capability used by rewrites and garbage collection.
     pub object_store: Arc<dyn ForgeObjectStore>,
-    /// Pod-local base beneath which each leased rewrite owns scratch.
-    pub rewrite_spill_root: std::path::PathBuf,
     /// Bounded advisory Scribe wake-up inbox.
     pub hints: crate::maintenance::StagingFileInbox,
     /// Validated maintenance and rewrite limits.
@@ -192,8 +192,8 @@ pub struct Forge {
 
 /// Immutable dependency graph shared by one Forge owner.
 pub(crate) struct ForgeCore {
-    /// Narrow Forge capability used for exact rewrite resource leases.
-    resources: crate::resources::ForgeResources,
+    /// Immutable root resource plan this process booted with.
+    resource_plan: crate::resources::ResourcePlan,
     /// Vala SQL handle used by tenant-scoped transitions.
     vala: vala_sql::ValaPostgres,
     /// Operator pool used by discovery and lease operations.
@@ -206,8 +206,6 @@ pub(crate) struct ForgeCore {
     staging_lists_by_cursor: bool,
     /// Narrow object-store seam used by rewrite and garbage-collection IO.
     object_store: Arc<dyn ForgeObjectStore>,
-    /// Pod-local base for attempt-owned disposable scratch directories.
-    rewrite_spill_root: std::path::PathBuf,
     /// Validated maintenance and rewrite limits.
     config: ForgeConfig,
     /// Delay between periodic scheduler ticks.
@@ -244,16 +242,14 @@ impl Forge {
             });
         }
         build.config.validate()?;
-        ForgeRewriteRuntime::prepare_root(&build.rewrite_spill_root)?;
         let core = ForgeCore {
-            resources: build.resources,
+            resource_plan: build.resource_plan,
             vala: build.vala,
             operator_pool: build.operator_pool,
             catalog: build.catalog,
             staging: build.staging,
             staging_lists_by_cursor: build.staging_lists_by_cursor,
             object_store: build.object_store,
-            rewrite_spill_root: build.rewrite_spill_root,
             config: build.config,
             maintenance_interval: build.maintenance_interval,
             clock: build.clock,
@@ -283,13 +279,13 @@ impl Forge {
 
     /// Returns this Forge's narrow resource capability for lifecycle assertions.
     ///
-    /// The capability observes the same process root the worker leases from, so
-    /// a test can inspect baselines and root identity without gaining the
+    /// The plan is the same immutable calculation the worker admits against,
+    /// so a test can assert the composed Forge budget without gaining the
     /// ability to construct a sibling governor or a raw pool.
     #[cfg(feature = "test-support")]
     #[must_use]
-    pub fn resources_for_test(&self) -> crate::resources::ForgeResources {
-        self.core.resources.clone()
+    pub fn resource_plan_for_test(&self) -> crate::resources::ResourcePlan {
+        self.core.resource_plan
     }
 
     /// Returns deterministic controls for the expiry commit boundaries.

@@ -137,21 +137,6 @@ SCRIBE_BATCH_COMMITS_MODULE = (
 )
 
 
-def test_forge_worker_registry_is_the_only_new_control_table_exception() -> None:
-    assert "vala.forge_worker_registry" in VALA_NON_RLS_CONTROL_TABLES
-    migration = strip_sql_line_comments(
-        _repo_text(
-            "crates/vala/vala-sql/migrations/"
-            "20260910000019_forge_task_failure_taxonomy.sql"
-        )
-    )
-    windows = dict(tenant_table_windows(migration, "vala"))
-    assert "forge_worker_registry" in windows
-    assert "data_tenant_id" not in windows["forge_worker_registry"], (
-        "the registry exception is only justified while the table has no tenant column"
-    )
-
-
 def test_both_oracle_admission_tables_carry_a_complete_rls_triple() -> None:
     migration = strip_sql_line_comments(_repo_text(ORACLE_ADMISSION_MIGRATION))
     windows = dict(tenant_table_windows(migration, "vala"))

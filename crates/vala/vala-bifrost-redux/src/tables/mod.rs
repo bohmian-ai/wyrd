@@ -183,7 +183,7 @@ pub trait DomainTable: Send + Sync + 'static {
     /// Sensitive payload fields.
     const SENSITIVE_PAYLOAD_COLUMNS: &'static [&'static str] = &[];
 
-    /// The canonical signal ledger, when this table owns an OTel signal.
+    /// The canonical signal ledger, when this table owns an `OTel` signal.
     ///
     /// Returning `Some` makes the table canonical: its physical schema, stable
     /// field ids, sensitivity metadata, and canonical physical fingerprint are
@@ -214,7 +214,7 @@ pub trait DomainTable: Send + Sync + 'static {
         }
     }
 
-    /// The canonical physical fingerprint, when this table owns an OTel signal.
+    /// The canonical physical fingerprint, when this table owns an `OTel` signal.
     ///
     /// This is a different identity from [`Self::schema_fingerprint`], which
     /// keeps its user-schema meaning for catalog rows. The canonical physical

@@ -1,5 +1,5 @@
 //! Narrow encode/decode, resource/scope, and Arrow-column helpers shared by the
-//! three canonical OTel signal tables.
+//! three canonical `OTel` signal tables.
 //!
 //! Everything here is deliberately signal-agnostic. The per-signal meaning —
 //! which field holds which protocol value, in which order, under which stable
@@ -14,7 +14,10 @@ use arrow::array::{
     Int32Array, Int64Array, ListArray, StringArray, StructArray, UInt32Array, UInt64Array,
 };
 use arrow::buffer::OffsetBuffer;
-use arrow::datatypes::{Field, Fields};
+use arrow::datatypes::{Field, Fields, Schema};
+use arrow::record_batch::RecordBatch;
+
+use crate::tables::fields::{self, CanonicalField, CanonicalType};
 use prost::Message;
 use prost::encoding::{WireType, encode_key};
 use std::sync::Arc;
@@ -434,6 +437,159 @@ pub fn required_binary(array: &BinaryArray, row: usize) -> Result<&[u8], &'stati
         .is_valid(row)
         .then(|| array.value(row))
         .ok_or("required canonical payload is null")
+}
+
+/// Validate one supplied canonical user-column batch against a ledger.
+///
+/// Binding is by field *name*, never by position: a caller may present the
+/// canonical columns in any order and still be accepted, and the returned batch
+/// is that input projected back into declared ledger order so every downstream
+/// authority sees one canonical column order. For each declared field the
+/// supplied field must agree on stable id, Arrow type, nullability, and
+/// sensitivity metadata, recursively through every nested child. Canonical
+/// binary payloads are additionally decoded and re-encoded so a malformed or
+/// non-canonical protobuf value is refused before any row is accepted.
+///
+/// # Errors
+///
+/// Returns a stable reason when a declared field is missing, an extra column is
+/// present, an identity or type check fails, or a canonical payload value is
+/// not canonically encoded.
+pub fn validate_canonical_user_batch(
+    declared: &[CanonicalField],
+    batch: &RecordBatch,
+) -> Result<RecordBatch, String> {
+    let schema = batch.schema();
+    if schema.fields().len() != declared.len() {
+        return Err(format!(
+            "canonical batch declares {} columns, expected {}",
+            schema.fields().len(),
+            declared.len()
+        ));
+    }
+
+    let mut columns = Vec::with_capacity(declared.len());
+    for field in declared {
+        let index = schema
+            .index_of(field.name)
+            .map_err(|_| format!("canonical batch is missing column {}", field.name))?;
+        let supplied = schema.field(index);
+        validate_field_identity(field, supplied)?;
+        let column = batch.column(index);
+        validate_column_values(field, column.as_ref())?;
+        columns.push(std::sync::Arc::clone(column));
+    }
+
+    let canonical = Schema::new(
+        declared
+            .iter()
+            .map(CanonicalField::to_arrow)
+            .collect::<Vec<_>>(),
+    );
+    RecordBatch::try_new(std::sync::Arc::new(canonical), columns)
+        .map_err(|error| format!("canonical batch does not assemble: {error}"))
+}
+
+/// Verify one supplied Arrow field against its ledger declaration.
+///
+/// # Errors
+///
+/// Returns a stable reason naming the first disagreement in name, stable id,
+/// type, nullability, sensitivity, or any nested child.
+fn validate_field_identity(declared: &CanonicalField, supplied: &Field) -> Result<(), String> {
+    if supplied.name() != declared.name {
+        return Err(format!(
+            "canonical field {} was supplied as {}",
+            declared.name,
+            supplied.name()
+        ));
+    }
+    let expected = declared.to_arrow();
+    if supplied.data_type() != expected.data_type() {
+        return Err(format!(
+            "canonical field {} has type {}, expected {}",
+            declared.name,
+            supplied.data_type(),
+            expected.data_type()
+        ));
+    }
+    if supplied.is_nullable() != declared.nullable {
+        return Err(format!(
+            "canonical field {} nullability is {}, expected {}",
+            declared.name,
+            supplied.is_nullable(),
+            declared.nullable
+        ));
+    }
+    for key in [fields::PARQUET_FIELD_ID, fields::WYRD_SENSITIVE] {
+        if supplied.metadata().get(key) != expected.metadata().get(key) {
+            return Err(format!(
+                "canonical field {} carries the wrong {key}",
+                declared.name
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Verify one supplied column's canonical payload values.
+///
+/// Only binary payloads carry an encoding contract Arrow cannot express, so
+/// this walks into lists and structs to reach every `Binary` leaf and leaves
+/// every other type to the identity check above.
+///
+/// # Errors
+///
+/// Returns a stable reason when a payload value is not canonically encoded.
+fn validate_column_values(declared: &CanonicalField, column: &dyn Array) -> Result<(), String> {
+    match declared.ty {
+        CanonicalType::Binary => {
+            let array = column
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .ok_or_else(|| format!("canonical field {} is not binary", declared.name))?;
+            let verify = canonical_binary_verifier(declared.name);
+            for row in 0..array.len() {
+                if array.is_null(row) {
+                    continue;
+                }
+                verify(array.value(row))
+                    .map_err(|reason| format!("canonical field {}: {reason}", declared.name))?;
+            }
+            Ok(())
+        }
+        CanonicalType::List(element) => {
+            let array = column
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .ok_or_else(|| format!("canonical field {} is not a list", declared.name))?;
+            validate_column_values(element, array.values().as_ref())
+        }
+        CanonicalType::Struct(children) => {
+            let array = column
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .ok_or_else(|| format!("canonical field {} is not a struct", declared.name))?;
+            for (index, child) in children.iter().enumerate() {
+                validate_column_values(child, array.column(index).as_ref())?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Select the canonical protobuf verifier for one declared binary field.
+///
+/// A log body and a metric or attribute payload are different pinned messages,
+/// so the verifier is chosen by the declared field name rather than by type
+/// alone. Any other binary field is an opaque canonical `EntityRef`.
+fn canonical_binary_verifier(name: &str) -> fn(&[u8]) -> Result<(), &'static str> {
+    match name {
+        "body" => verify_canonical_any_value,
+        "entity_ref" => verify_canonical_entity_ref,
+        _ => verify_canonical_attributes,
+    }
 }
 
 #[cfg(test)]

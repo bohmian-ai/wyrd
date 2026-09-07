@@ -2,7 +2,7 @@
 //!
 //! Two layers live here. The free `utf8`/`int64`/… constructors are the small
 //! helpers every pre-declared domain table's `arrow_fields()` uses. Above them,
-//! [`CanonicalField`] is the declarative ledger entry the three canonical OTel
+//! [`CanonicalField`] is the declarative ledger entry the three canonical `OTel`
 //! signal tables are built from: one immutable record carrying a table-local
 //! stable field identity, its name, its physical type, nullability, and its
 //! projection/permission class. Every downstream representation — the Arrow

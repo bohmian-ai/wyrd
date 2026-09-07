@@ -2606,23 +2606,9 @@ impl ForgeWorker {
                 });
             }
         }
-        let lease_key = forge_lease_key(
-            task.data_tenant_id,
-            &binding.logical_namespace,
-            &binding.table_name,
-        );
-        let Some(mut lease) = ForgeLease::acquire(
-            &self.forge.core.operator_pool,
-            lease_key,
-            self.owner,
-            self.forge.core.config.lease_ttl,
-        )
-        .await?
-        else {
-            return Err(ForgeError::FenceLost {
-                lease_key: format!("forge:table:{}:{}", task.data_tenant_id, binding.table_ref),
-            });
-        };
+        let mut lease = self
+            .acquire_table_lease(task.data_tenant_id, &binding)
+            .await?;
         if lease.takeover() {
             tracing::info!(task_id = %task.task_id, "Forge worker took over an expired table fence");
         }
@@ -2883,6 +2869,36 @@ impl ForgeWorker {
         result
     }
 
+    /// Takes this table's exclusive Forge lease, or reports the fence as lost.
+    ///
+    /// An attempt cannot recover or reconcile a table without the same
+    /// table-level exclusivity its original owner held: another owner may
+    /// already be mid-recovery on the very evidence this pass would act on. A
+    /// refused acquisition is therefore reported as a lost fence rather than
+    /// waited on, leaving the durable state for whoever does hold it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::FenceLost`] when another owner holds the lease,
+    /// and the SQL failures the acquisition raises.
+    async fn acquire_table_lease(
+        &self,
+        tenant: DataTenantId,
+        binding: &TenantTableBinding,
+    ) -> Result<ForgeLease, ForgeError> {
+        let lease_key = forge_lease_key(tenant, &binding.logical_namespace, &binding.table_name);
+        ForgeLease::acquire(
+            &self.forge.core.operator_pool,
+            lease_key,
+            self.owner,
+            self.forge.core.config.lease_ttl,
+        )
+        .await?
+        .ok_or_else(|| ForgeError::FenceLost {
+            lease_key: format!("forge:table:{tenant}:{}", binding.table_ref),
+        })
+    }
+
     /// Validates and reconciles a borrowed Prepared claim while its caller owns telemetry.
     ///
     /// # Errors
@@ -2905,23 +2921,9 @@ impl ForgeWorker {
             .ok_or_else(|| ForgeError::Reconciliation {
                 detail: "Prepared Forge task has no committed evidence".to_owned(),
             })?;
-        let lease_key = forge_lease_key(
-            task.data_tenant_id,
-            &binding.logical_namespace,
-            &binding.table_name,
-        );
-        let Some(mut lease) = ForgeLease::acquire(
-            &self.forge.core.operator_pool,
-            lease_key,
-            self.owner,
-            self.forge.core.config.lease_ttl,
-        )
-        .await?
-        else {
-            return Err(ForgeError::FenceLost {
-                lease_key: format!("forge:table:{}:{}", task.data_tenant_id, binding.table_ref),
-            });
-        };
+        let mut lease = self
+            .acquire_table_lease(task.data_tenant_id, &binding)
+            .await?;
         // Prepared-effect recovery runs post-commit idempotent cleanup behind a
         // durable cursor; graceful shutdown cooperatively drains it, so both
         // heartbeat tokens are the same shutdown-sensitive `operation_stop`

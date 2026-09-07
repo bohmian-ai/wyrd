@@ -465,7 +465,21 @@ redacted
         );
         assert!(queue.finish_running((task(1), 0)));
         assert_eq!(queue.push(admission(1, 0, 4), ()), ForgePushResult::Added);
+    }
 
+    /// Budget pressure blocks the head rather than letting a smaller plan pass.
+    ///
+    /// Running parallelism, a whole-worker plan, out-of-order finishes across
+    /// one task's plans, cancellation of only the waiting siblings, and the
+    /// deliberate exemption of waiting memory from the running bound are all
+    /// admission-order properties: none of them may reorder the queue.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any pop, finish, or cancellation deviates from the ported
+    /// state machine.
+    #[test]
+    fn queue_capacity_pressure_never_reorders_admission() {
         // Head-of-line blocking on running parallelism.
         let mut queue = ForgeCompactionQueue::new(8, 32, usize::MAX);
         assert_eq!(queue.push(admission(1, 0, 6), ()), ForgePushResult::Added);

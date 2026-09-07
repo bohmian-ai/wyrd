@@ -180,7 +180,7 @@ impl BifrostTarget {
 /// behavior byte-for-byte; the resolved values are assembled and validated once
 /// at boot in `crate::boot`. Durations are expressed in whole seconds. Unknown
 /// keys are rejected at parse time by `deny_unknown_fields`.
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ForgeRuntimeConfig {
     /// Maximum active tasks one tenant may hold concurrently (the D78 fairness
@@ -229,22 +229,6 @@ pub struct ForgeRuntimeConfig {
     /// positive when set. Default 60.
     #[serde(default)]
     pub maintenance_interval_secs: Option<u64>,
-}
-
-impl Default for ForgeRuntimeConfig {
-    fn default() -> Self {
-        Self {
-            per_tenant_active_cap: None,
-            snapshot_retention_secs: None,
-            retain_last: None,
-            orphan_gc_ttl_secs: None,
-            maintenance_trigger_snapshot_count: None,
-            maintenance_trigger_interval_secs: None,
-            orphan_gc_max_list_pages: None,
-            orphan_gc_run_budget_secs: None,
-            maintenance_interval_secs: None,
-        }
-    }
 }
 
 impl ForgeRuntimeConfig {

@@ -105,6 +105,351 @@ const HASH_JOIN_ROW_OVERHEAD_BYTES: usize = 40;
 /// Per-row Arrow and hashing overhead for the two position-delete join keys.
 const POSITION_DELETE_KEY_OVERHEAD_BYTES: usize = 32;
 
+/// The plan facts the `DataFusion` pool estimate is derived from.
+///
+/// They are grouped because the sorted and streaming branches read overlapping
+/// but different subsets of them, and threading eleven positional arguments
+/// through would make the branch that reads each one unreadable.
+struct PoolInputs {
+    /// Number of data files the plan reads.
+    data_file_count: usize,
+    /// Parallelism the plan recommends for its scan side.
+    executor_parallelism: usize,
+    /// Compressed bytes across every input data file.
+    compressed_input_bytes: usize,
+    /// Decoded bytes the inputs expand to.
+    decoded_input_bytes: usize,
+    /// Bytes staged by prefetch, or zero when prefetch is disabled.
+    prefetch: usize,
+    /// Bytes the broadcast equality-delete side materialises.
+    equality_delete_bytes: usize,
+    /// Bytes the position-delete anti-join hash table holds.
+    position_delete_join_bytes: usize,
+    /// Tracked sort workspace, or zero for a streaming plan.
+    sort_workspace_bytes: usize,
+    /// Merge reservation pinned per sorted output partition.
+    sort_merge_headroom_bytes: usize,
+    /// One record batch's allocation.
+    batch_allocation_bytes: usize,
+    /// Concurrent batch allocation across every scan partition.
+    batch_overhead_bytes: usize,
+}
+
+/// Returns the retained-operator bytes and the `DataFusion` pool peak.
+///
+/// The two branches are upstream's and are not interchangeable: a sorted plan
+/// peaks when the sorter holds its full workspace beside the reservations it
+/// pinned before reading, while a streaming plan never exceeds what it retains,
+/// so its peak and its retention are the same figure.
+fn datafusion_pool_bytes(requires_sort: bool, inputs: &PoolInputs) -> (usize, usize) {
+    if requires_sort {
+        let retained_operator_bytes = inputs
+            .sort_merge_headroom_bytes
+            .saturating_add(inputs.equality_delete_bytes)
+            .saturating_add(inputs.position_delete_join_bytes)
+            .saturating_add(inputs.prefetch)
+            .saturating_add(inputs.batch_overhead_bytes);
+        let sort_peak = inputs
+            .sort_workspace_bytes
+            .saturating_add(inputs.sort_merge_headroom_bytes)
+            .saturating_add(inputs.equality_delete_bytes)
+            .saturating_add(inputs.position_delete_join_bytes)
+            .saturating_add(inputs.prefetch);
+        (
+            retained_operator_bytes,
+            sort_peak.max(retained_operator_bytes),
+        )
+    } else {
+        let data_file_count = inputs.data_file_count.max(1);
+        let active_files = inputs.executor_parallelism.min(inputs.data_file_count);
+        // Bound the extra decoder window from two directions: one partition's proportional share
+        // of the decoded input, and the active files' fair share with 25% pipeline headroom.
+        let per_partition_share = inputs
+            .decoded_input_bytes
+            .checked_div(active_files.max(1))
+            .unwrap_or(inputs.decoded_input_bytes);
+        let active_file_share = inputs
+            .decoded_input_bytes
+            .checked_div(data_file_count)
+            .unwrap_or(inputs.decoded_input_bytes)
+            .saturating_mul(active_files);
+        let active_file_share_with_headroom =
+            active_file_share.saturating_add(active_file_share / 4);
+        let decoded_in_flight = per_partition_share
+            .min(active_file_share_with_headroom)
+            .min(DATAFUSION_STREAMING_DECODED_WINDOW_BYTES);
+        let overlap_input_threshold =
+            DATAFUSION_STREAMING_DECODED_WINDOW_BYTES / COMPRESSED_TO_DECODED_INFLATION;
+        let scan_buffer_bytes = if active_files
+            >= STREAMING_PREFETCH_DECODE_OVERLAP_MIN_ACTIVE_FILES
+            && inputs.compressed_input_bytes >= overlap_input_threshold
+        {
+            inputs.prefetch.saturating_add(decoded_in_flight)
+        } else {
+            inputs.prefetch.max(decoded_in_flight)
+        };
+        let common_bytes = scan_buffer_bytes
+            .saturating_add(inputs.batch_overhead_bytes)
+            .saturating_add(inputs.equality_delete_bytes);
+        let retained_operator_bytes = common_bytes
+            .saturating_add(inputs.position_delete_join_bytes)
+            .max(inputs.batch_allocation_bytes)
+            .max(DATAFUSION_RUNTIME_FIXED_BYTES);
+        (retained_operator_bytes, retained_operator_bytes)
+    }
+}
+
+/// The plan facts the actual-heap estimate is derived from.
+///
+/// Grouped for the same reason as [`PoolInputs`]: the sorted, streaming, and
+/// delete-join phases each read a different subset, and fifteen positional
+/// arguments would hide which phase reads which.
+struct HeapInputs {
+    /// Number of data files the plan reads.
+    data_file_count: usize,
+    /// Parallelism the plan recommends for its scan side.
+    executor_parallelism: usize,
+    /// Parallelism the plan recommends for its write side.
+    output_parallelism: usize,
+    /// Rows across every input data file that reported a count.
+    record_count: usize,
+    /// Configured maximum rows per record batch.
+    max_record_batch_rows: usize,
+    /// Per-row bytes of the hidden columns a delete join retains.
+    hidden_row_width: usize,
+    /// Fixed per-row width, or `None` for a variable-width schema.
+    schema_row_width: Option<usize>,
+    /// Decoded bytes the inputs expand to.
+    decoded_input_bytes: usize,
+    /// Decoded bytes the outputs expand to.
+    decoded_output_bytes: usize,
+    /// Bytes the broadcast equality-delete side materialises.
+    equality_delete_bytes: usize,
+    /// Raw bytes of the position-delete files, before the join factor.
+    position_delete_raw_bytes: usize,
+    /// One record batch's allocation.
+    batch_allocation_bytes: usize,
+    /// Concurrent batch allocation across every scan partition.
+    batch_overhead_bytes: usize,
+    /// Bytes the pool estimate says the plan retains.
+    retained_operator_bytes: usize,
+    /// The pool peak the plan estimate reached.
+    estimated_datafusion_peak_bytes: usize,
+}
+
+/// Bytes a delete join retains beside the scan phase.
+///
+/// A position delete scales the retained hidden columns by how much of the
+/// scan it actually overlaps, then adds the raw delete bytes the anti-join
+/// hash table expands to. An equality delete is broadcast instead, so it
+/// retains its whole materialised side. A plan with neither retains nothing.
+fn delete_join_heap_bytes(plan: &CompactionPlan, inputs: &HeapInputs) -> usize {
+    // Delete joins retain hidden probe columns while the build side remains materialized.
+    let hidden_total_bytes = inputs.hidden_row_width.saturating_mul(inputs.record_count);
+    let position_delete_records = widen(
+        plan.file_group
+            .position_delete_files
+            .iter()
+            .filter_map(|task| task.record_count)
+            .fold(0u64, u64::saturating_add),
+    );
+    if position_delete_records > 0 {
+        let delete_ratio = as_f64(position_delete_records) / as_f64(inputs.record_count.max(1));
+        let overlap_factor = 0.6 + 0.3 * delete_ratio.min(1.0);
+        return as_usize(as_f64(hidden_total_bytes) * overlap_factor)
+            + inputs.position_delete_raw_bytes.saturating_mul(8);
+    }
+    if plan.file_group.equality_delete_files.is_empty() {
+        return 0;
+    }
+    hidden_total_bytes.saturating_add(inputs.equality_delete_bytes)
+}
+
+/// Returns the plan's estimated peak actual heap, with its fixed headroom.
+///
+/// This is the half of the estimate that is not `DataFusion`'s logical pool:
+/// the `OpenDAL` input buffers, the decode window, the writer window, and the
+/// delete-join retention. The pool estimate enters it only as a floor, because
+/// with an unbounded pool the pool figure is an accounting of overlap rather
+/// than a limit anything is allocated against.
+fn heap_peak_bytes(
+    plan: &CompactionPlan,
+    format_version: FormatVersion,
+    requires_sort: bool,
+    inputs: &HeapInputs,
+) -> usize {
+    let data_file_count = inputs.data_file_count.max(1);
+    let active_data_files = inputs.executor_parallelism.min(inputs.data_file_count);
+    let active_decoded_bytes = inputs
+        .decoded_input_bytes
+        .checked_div(data_file_count)
+        .unwrap_or(inputs.decoded_input_bytes)
+        .saturating_mul(active_data_files);
+    let active_input_bytes = estimate_prefetch_bytes(plan, format_version);
+    let total_batches = inputs
+        .record_count
+        .saturating_add(inputs.max_record_batch_rows.saturating_sub(1))
+        .checked_div(inputs.max_record_batch_rows)
+        .unwrap_or_default();
+    let batch_overlap =
+        (as_f64(total_batches) / as_f64(inputs.executor_parallelism.saturating_mul(8))).min(1.0);
+    let batch_heap_bytes = as_usize(as_f64(inputs.batch_overhead_bytes) * batch_overlap);
+    // OpenDAL S3 buffers the active compressed input while Parquet decoding and scan batches
+    // overlap. This phase is independent from DataFusion's logical pool reservations.
+    let scan_heap_bytes = active_input_bytes
+        .saturating_add(active_input_bytes.min(DATAFUSION_STREAMING_DECODED_WINDOW_BYTES))
+        .saturating_add(active_decoded_bytes.min(DATAFUSION_STREAMING_DECODED_WINDOW_BYTES))
+        .saturating_add(batch_heap_bytes);
+    let writer_heap_bytes = if inputs.schema_row_width.is_some() {
+        inputs.decoded_output_bytes.saturating_mul(3) / 2
+    } else {
+        let output_scale = as_f64(inputs.output_parallelism.min(4)) / 4.0;
+        let large_single_scan_scale = if inputs.executor_parallelism == 1 {
+            (as_f64(active_input_bytes) / as_f64(DATAFUSION_STREAMING_DECODED_WINDOW_BYTES))
+                .min(1.0)
+        } else {
+            0.0
+        };
+        as_usize(
+            as_f64((inputs.decoded_output_bytes / 2).min(DATAFUSION_WRITER_WINDOW_BYTES))
+                * output_scale.max(large_single_scan_scale),
+        )
+    }
+    .min(DATAFUSION_WRITER_WINDOW_BYTES);
+    let streaming_heap_bytes = scan_heap_bytes.saturating_add(writer_heap_bytes);
+
+    let join_heap_bytes = delete_join_heap_bytes(plan, inputs);
+    // Large sorts retain their full decoded input. Smaller sorts release part of each partition as
+    // merge runs, based on the S3 heap profiles used to calibrate this estimate.
+    let sorted_decoded_bytes = if inputs.decoded_output_bytes > 64 * 1024 * 1024 {
+        inputs.decoded_output_bytes
+    } else {
+        inputs.decoded_output_bytes.saturating_mul(2) / 3
+    };
+    let sorted_heap_bytes = active_input_bytes
+        .saturating_add(active_input_bytes.min(DATAFUSION_STREAMING_DECODED_WINDOW_BYTES))
+        .saturating_add(sorted_decoded_bytes);
+    let execution_heap_bytes = if requires_sort {
+        sorted_heap_bytes
+    } else {
+        streaming_heap_bytes
+    };
+    let join_phase_bytes = scan_heap_bytes.saturating_add(join_heap_bytes);
+    let join_phase_bytes = if requires_sort {
+        join_phase_bytes.saturating_mul(3) / 4
+    } else {
+        join_phase_bytes
+    };
+    let large_sorted = requires_sort && inputs.decoded_output_bytes > LARGE_SORT_THRESHOLD_BYTES;
+    let fixed_heap_peak_bytes = if large_sorted {
+        scan_heap_bytes.max(join_phase_bytes)
+    } else {
+        execution_heap_bytes.max(join_phase_bytes)
+    };
+    let datafusion_peak_with_headroom = inputs
+        .estimated_datafusion_peak_bytes
+        .saturating_add(inputs.batch_allocation_bytes)
+        .saturating_add(if requires_sort {
+            DATAFUSION_STREAMING_DECODED_WINDOW_BYTES
+        } else {
+            0
+        });
+    // Preserve a progress-phase floor in the estimate. With an unbounded pool this is not an
+    // allocation limit; it accounts for decoded input that can overlap while the pipeline fills.
+    let datafusion_progress_peak_bytes = if large_sorted {
+        inputs
+            .retained_operator_bytes
+            .saturating_add(active_decoded_bytes.saturating_mul(2))
+            .saturating_add(DATAFUSION_STREAMING_DECODED_WINDOW_BYTES)
+            .saturating_add(inputs.batch_allocation_bytes)
+    } else if requires_sort {
+        datafusion_peak_with_headroom
+    } else {
+        inputs
+            .retained_operator_bytes
+            .saturating_add(inputs.batch_allocation_bytes)
+    };
+    let estimated_datafusion_peak_bytes =
+        datafusion_peak_with_headroom.max(datafusion_progress_peak_bytes);
+
+    let peak_bytes = if large_sorted {
+        fixed_heap_peak_bytes.max(
+            inputs
+                .retained_operator_bytes
+                .saturating_add(estimated_datafusion_peak_bytes / 2)
+                .saturating_add(SORT_TEMPORARY_HEADROOM_BYTES),
+        )
+    } else if requires_sort {
+        fixed_heap_peak_bytes.max(estimated_datafusion_peak_bytes.saturating_mul(3) / 4)
+    } else {
+        fixed_heap_peak_bytes
+    }
+    .saturating_add(HEAP_FIXED_HEADROOM_BYTES);
+
+    peak_bytes.saturating_add(peak_bytes / 50)
+}
+
+/// Row counts and decoded sizes the rest of the estimate is scaled by.
+struct DecodedGeometry {
+    /// Rows across every input data file that reported a count.
+    record_count: usize,
+    /// Per-row bytes used to size one record batch.
+    batch_row_width: usize,
+    /// Decoded bytes the inputs expand to.
+    decoded_input_bytes: usize,
+    /// Decoded bytes the outputs expand to.
+    decoded_output_bytes: usize,
+}
+
+/// Derives decoded geometry from the manifest, falling back when counts are absent.
+///
+/// The exact path multiplies a fixed row width by the counted rows. When the
+/// schema has no fixed width, or any file omitted its count, the fallback
+/// inflates compressed bytes instead — and keeps whole-input inflation separate
+/// from batch sizing, so missing counts cannot turn the entire compressed input
+/// into one synthetic row-sized batch.
+fn decoded_geometry(
+    data_files: &[FileScanTask],
+    schema_row_width: Option<usize>,
+    hidden_row_width: usize,
+    compressed_input_bytes: usize,
+) -> DecodedGeometry {
+    let mut record_count = 0usize;
+    let mut has_complete_record_counts = true;
+    for task in data_files {
+        match task.record_count {
+            Some(count) => {
+                record_count = record_count.saturating_add(widen(count));
+            }
+            None => has_complete_record_counts = false,
+        }
+    }
+    if let (Some(schema_row_width), true) = (schema_row_width, has_complete_record_counts) {
+        let row_width = schema_row_width.saturating_add(hidden_row_width);
+        return DecodedGeometry {
+            record_count,
+            batch_row_width: row_width,
+            decoded_input_bytes: row_width.saturating_mul(record_count),
+            decoded_output_bytes: schema_row_width.saturating_mul(record_count),
+        };
+    }
+    let fallback_row_count = record_count.max(1);
+    let fallback_row_width = compressed_input_bytes
+        .checked_div(fallback_row_count)
+        .unwrap_or_default()
+        .saturating_mul(COMPRESSED_TO_DECODED_INFLATION)
+        .max(1);
+    let decoded_output_bytes =
+        compressed_input_bytes.saturating_mul(COMPRESSED_TO_DECODED_INFLATION);
+    DecodedGeometry {
+        record_count,
+        batch_row_width: fallback_row_width.saturating_add(hidden_row_width),
+        decoded_input_bytes: decoded_output_bytes
+            .saturating_add(hidden_row_width.saturating_mul(record_count)),
+        decoded_output_bytes,
+    }
+}
+
 /// Estimates the peak heap bytes of one compaction plan for scheduler admission.
 pub(crate) fn estimate_plan_memory(
     plan: &CompactionPlan,
@@ -125,43 +470,19 @@ pub(crate) fn estimate_plan_memory(
         0
     };
 
-    let mut record_count = 0usize;
-    let mut has_complete_record_counts = true;
-    for task in data_files {
-        match task.record_count {
-            Some(count) => {
-                record_count = record_count.saturating_add(widen(count));
-            }
-            None => has_complete_record_counts = false,
-        }
-    }
-
     let schema_row_width = estimated_schema_row_width(schema);
     let hidden_row_width = hidden_row_width(plan, format_version);
-    let (batch_row_width, decoded_input_bytes, decoded_output_bytes) =
-        if let (Some(schema_row_width), true) = (schema_row_width, has_complete_record_counts) {
-            let row_width = schema_row_width.saturating_add(hidden_row_width);
-            (
-                row_width,
-                row_width.saturating_mul(record_count),
-                schema_row_width.saturating_mul(record_count),
-            )
-        } else {
-            let fallback_row_count = record_count.max(1);
-            let fallback_row_width = compressed_input_bytes
-                .checked_div(fallback_row_count)
-                .unwrap_or_default()
-                .saturating_mul(COMPRESSED_TO_DECODED_INFLATION)
-                .max(1);
-            // Keep whole-input inflation separate from batch sizing. Missing counts must not
-            // turn the entire compressed input into one synthetic row-sized batch.
-            let batch_row_width = fallback_row_width.saturating_add(hidden_row_width);
-            let decoded_output_bytes =
-                compressed_input_bytes.saturating_mul(COMPRESSED_TO_DECODED_INFLATION);
-            let decoded_input_bytes =
-                decoded_output_bytes.saturating_add(hidden_row_width.saturating_mul(record_count));
-            (batch_row_width, decoded_input_bytes, decoded_output_bytes)
-        };
+    let DecodedGeometry {
+        record_count,
+        batch_row_width,
+        decoded_input_bytes,
+        decoded_output_bytes,
+    } = decoded_geometry(
+        data_files,
+        schema_row_width,
+        hidden_row_width,
+        compressed_input_bytes,
+    );
 
     // Equality deletes are broadcast and fully materialized by the merge-on-read plan.
     let equality_delete_bytes = estimate_equality_delete_join_bytes(plan);
@@ -209,178 +530,45 @@ pub(crate) fn estimate_plan_memory(
     } else {
         concurrent_batch_allocation_bytes.saturating_mul(2)
     };
-    let (retained_operator_bytes, estimated_datafusion_peak_bytes) = if requires_sort {
-        let retained_operator_bytes = sort_merge_headroom_bytes
-            .saturating_add(equality_delete_bytes)
-            .saturating_add(position_delete_join_bytes)
-            .saturating_add(prefetch)
-            .saturating_add(batch_overhead_bytes);
-        let sort_peak = sort_workspace_bytes
-            .saturating_add(sort_merge_headroom_bytes)
-            .saturating_add(equality_delete_bytes)
-            .saturating_add(position_delete_join_bytes)
-            .saturating_add(prefetch);
-        (
+    let (retained_operator_bytes, estimated_datafusion_peak_bytes) = datafusion_pool_bytes(
+        requires_sort,
+        &PoolInputs {
+            data_file_count: data_files.len(),
+            executor_parallelism,
+            compressed_input_bytes,
+            decoded_input_bytes,
+            prefetch,
+            equality_delete_bytes,
+            position_delete_join_bytes,
+            sort_workspace_bytes,
+            sort_merge_headroom_bytes,
+            batch_allocation_bytes,
+            batch_overhead_bytes,
+        },
+    );
+
+    heap_peak_bytes(
+        plan,
+        format_version,
+        requires_sort,
+        &HeapInputs {
+            data_file_count: data_files.len(),
+            executor_parallelism,
+            output_parallelism,
+            record_count,
+            max_record_batch_rows,
+            hidden_row_width,
+            schema_row_width,
+            decoded_input_bytes,
+            decoded_output_bytes,
+            equality_delete_bytes,
+            position_delete_raw_bytes,
+            batch_allocation_bytes,
+            batch_overhead_bytes,
             retained_operator_bytes,
-            sort_peak.max(retained_operator_bytes),
-        )
-    } else {
-        let data_file_count = data_files.len().max(1);
-        let active_files = executor_parallelism.min(data_files.len());
-        // Bound the extra decoder window from two directions: one partition's proportional share
-        // of the decoded input, and the active files' fair share with 25% pipeline headroom.
-        let per_partition_share = decoded_input_bytes
-            .checked_div(active_files.max(1))
-            .unwrap_or(decoded_input_bytes);
-        let active_file_share = decoded_input_bytes
-            .checked_div(data_file_count)
-            .unwrap_or(decoded_input_bytes)
-            .saturating_mul(active_files);
-        let active_file_share_with_headroom =
-            active_file_share.saturating_add(active_file_share / 4);
-        let decoded_in_flight = per_partition_share
-            .min(active_file_share_with_headroom)
-            .min(DATAFUSION_STREAMING_DECODED_WINDOW_BYTES);
-        let overlap_input_threshold =
-            DATAFUSION_STREAMING_DECODED_WINDOW_BYTES / COMPRESSED_TO_DECODED_INFLATION;
-        let scan_buffer_bytes = if active_files
-            >= STREAMING_PREFETCH_DECODE_OVERLAP_MIN_ACTIVE_FILES
-            && compressed_input_bytes >= overlap_input_threshold
-        {
-            prefetch.saturating_add(decoded_in_flight)
-        } else {
-            prefetch.max(decoded_in_flight)
-        };
-        let common_bytes = scan_buffer_bytes
-            .saturating_add(batch_overhead_bytes)
-            .saturating_add(equality_delete_bytes);
-        let retained_operator_bytes = common_bytes
-            .saturating_add(position_delete_join_bytes)
-            .max(batch_allocation_bytes)
-            .max(DATAFUSION_RUNTIME_FIXED_BYTES);
-        (retained_operator_bytes, retained_operator_bytes)
-    };
-
-    let data_file_count = data_files.len().max(1);
-    let active_data_files = executor_parallelism.min(data_files.len());
-    let active_decoded_bytes = decoded_input_bytes
-        .checked_div(data_file_count)
-        .unwrap_or(decoded_input_bytes)
-        .saturating_mul(active_data_files);
-    let active_input_bytes = estimate_prefetch_bytes(plan, format_version);
-    let total_batches = record_count
-        .saturating_add(max_record_batch_rows.saturating_sub(1))
-        .checked_div(max_record_batch_rows)
-        .unwrap_or_default();
-    let batch_overlap =
-        (as_f64(total_batches) / as_f64(executor_parallelism.saturating_mul(8))).min(1.0);
-    let batch_heap_bytes = as_usize(as_f64(batch_overhead_bytes) * batch_overlap);
-    // OpenDAL S3 buffers the active compressed input while Parquet decoding and scan batches
-    // overlap. This phase is independent from DataFusion's logical pool reservations.
-    let scan_heap_bytes = active_input_bytes
-        .saturating_add(active_input_bytes.min(DATAFUSION_STREAMING_DECODED_WINDOW_BYTES))
-        .saturating_add(active_decoded_bytes.min(DATAFUSION_STREAMING_DECODED_WINDOW_BYTES))
-        .saturating_add(batch_heap_bytes);
-    let writer_heap_bytes = if schema_row_width.is_some() {
-        decoded_output_bytes.saturating_mul(3) / 2
-    } else {
-        let output_scale = as_f64(output_parallelism.min(4)) / 4.0;
-        let large_single_scan_scale = if executor_parallelism == 1 {
-            (as_f64(active_input_bytes) / as_f64(DATAFUSION_STREAMING_DECODED_WINDOW_BYTES))
-                .min(1.0)
-        } else {
-            0.0
-        };
-        as_usize(
-            as_f64((decoded_output_bytes / 2).min(DATAFUSION_WRITER_WINDOW_BYTES))
-                * output_scale.max(large_single_scan_scale),
-        )
-    }
-    .min(DATAFUSION_WRITER_WINDOW_BYTES);
-    let streaming_heap_bytes = scan_heap_bytes.saturating_add(writer_heap_bytes);
-
-    // Delete joins retain hidden probe columns while the build side remains materialized.
-    let hidden_total_bytes = hidden_row_width.saturating_mul(record_count);
-    let position_delete_records = plan
-        .file_group
-        .position_delete_files
-        .iter()
-        .filter_map(|task| task.record_count)
-        .fold(0u64, u64::saturating_add);
-    let position_delete_records = widen(position_delete_records);
-    let join_heap_bytes = if position_delete_records > 0 {
-        let delete_ratio = as_f64(position_delete_records) / as_f64(record_count.max(1));
-        let overlap_factor = 0.6 + 0.3 * delete_ratio.min(1.0);
-        as_usize(as_f64(hidden_total_bytes) * overlap_factor)
-            + position_delete_raw_bytes.saturating_mul(8)
-    } else if !plan.file_group.equality_delete_files.is_empty() {
-        hidden_total_bytes.saturating_add(equality_delete_bytes)
-    } else {
-        0
-    };
-    // Large sorts retain their full decoded input. Smaller sorts release part of each partition as
-    // merge runs, based on the S3 heap profiles used to calibrate this estimate.
-    let sorted_decoded_bytes = if decoded_output_bytes > 64 * 1024 * 1024 {
-        decoded_output_bytes
-    } else {
-        decoded_output_bytes.saturating_mul(2) / 3
-    };
-    let sorted_heap_bytes = active_input_bytes
-        .saturating_add(active_input_bytes.min(DATAFUSION_STREAMING_DECODED_WINDOW_BYTES))
-        .saturating_add(sorted_decoded_bytes);
-    let execution_heap_bytes = if requires_sort {
-        sorted_heap_bytes
-    } else {
-        streaming_heap_bytes
-    };
-    let join_phase_bytes = scan_heap_bytes.saturating_add(join_heap_bytes);
-    let join_phase_bytes = if requires_sort {
-        join_phase_bytes.saturating_mul(3) / 4
-    } else {
-        join_phase_bytes
-    };
-    let large_sorted = requires_sort && decoded_output_bytes > LARGE_SORT_THRESHOLD_BYTES;
-    let fixed_heap_peak_bytes = if large_sorted {
-        scan_heap_bytes.max(join_phase_bytes)
-    } else {
-        execution_heap_bytes.max(join_phase_bytes)
-    };
-    let datafusion_peak_with_headroom = estimated_datafusion_peak_bytes
-        .saturating_add(batch_allocation_bytes)
-        .saturating_add(if requires_sort {
-            DATAFUSION_STREAMING_DECODED_WINDOW_BYTES
-        } else {
-            0
-        });
-    // Preserve a progress-phase floor in the estimate. With an unbounded pool this is not an
-    // allocation limit; it accounts for decoded input that can overlap while the pipeline fills.
-    let datafusion_progress_peak_bytes = if large_sorted {
-        retained_operator_bytes
-            .saturating_add(active_decoded_bytes.saturating_mul(2))
-            .saturating_add(DATAFUSION_STREAMING_DECODED_WINDOW_BYTES)
-            .saturating_add(batch_allocation_bytes)
-    } else if requires_sort {
-        datafusion_peak_with_headroom
-    } else {
-        retained_operator_bytes.saturating_add(batch_allocation_bytes)
-    };
-    let estimated_datafusion_peak_bytes =
-        datafusion_peak_with_headroom.max(datafusion_progress_peak_bytes);
-
-    let heap_peak_bytes = if large_sorted {
-        fixed_heap_peak_bytes.max(
-            retained_operator_bytes
-                .saturating_add(estimated_datafusion_peak_bytes / 2)
-                .saturating_add(SORT_TEMPORARY_HEADROOM_BYTES),
-        )
-    } else if requires_sort {
-        fixed_heap_peak_bytes.max(estimated_datafusion_peak_bytes.saturating_mul(3) / 4)
-    } else {
-        fixed_heap_peak_bytes
-    }
-    .saturating_add(HEAP_FIXED_HEADROOM_BYTES);
-
-    heap_peak_bytes.saturating_add(heap_peak_bytes / 50)
+            estimated_datafusion_peak_bytes,
+        },
+    )
 }
 
 fn estimate_prefetch_bytes(plan: &CompactionPlan, format_version: FormatVersion) -> usize {
@@ -658,6 +846,28 @@ redacted
                 > estimate_plan_memory(&large_sort, &fixed, FormatVersion::V2, 1024, false, true),
             "staged compressed input adds to a large sort's retained operators"
         );
+    }
+
+    /// Delete files, format version, and parallelism move the estimate exactly
+    /// as upstream's arithmetic requires.
+    ///
+    /// Equality deletes are broadcast and fully materialised; a pre-V3 position
+    /// delete builds an anti-join hash table that a V3 deletion vector does
+    /// not; parallelism multiplies the concurrently allocated batches; and
+    /// every accumulation saturates, so an absurd manifest yields a refusably
+    /// large figure rather than a wrapped small one or a panic.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any branch stops changing the estimate in the direction
+    /// upstream's arithmetic requires.
+    #[test]
+redacted
+        let fixed = schema_of(PrimitiveType::Long);
+        let one_file = || vec![task("data-0.parquet", 10_000, Some(1_000), &fixed)];
+        let streaming = plan_of(one_file(), Vec::new(), Vec::new(), 1, 1);
+        let streaming_bytes =
+            estimate_plan_memory(&streaming, &fixed, FormatVersion::V2, 1024, false, false);
 
         // Equality deletes are broadcast and fully materialised.
         let with_equality = plan_of(
@@ -713,6 +923,21 @@ redacted
             v3_position < v2_position,
             "a V3 deletion vector builds no join, so it must not be charged for one"
         );
+    }
+
+    /// Parallelism multiplies concurrently allocated batches, and every
+    /// accumulation saturates.
+    ///
+    /// An absurd manifest must yield a refusably large figure rather than a
+    /// wrapped small one the queue would admit, or a panic.
+    ///
+    /// # Panics
+    ///
+    /// Panics when parallelism stops raising the estimate or when saturation
+    /// does not hold.
+    #[test]
+redacted
+        let fixed = schema_of(PrimitiveType::Long);
 
         // Parallelism multiplies the concurrently allocated batches.
         let wide = plan_of(

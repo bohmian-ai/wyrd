@@ -247,7 +247,7 @@ impl PromotedRewriteFixture {
                 &self.fixture.binding,
                 uuid::Uuid::now_v7(),
                 attempt_id,
-                cancel,
+                &cancel,
             )
             .expect("the attempt context builds");
         let planned = match rewrite.plan().await {

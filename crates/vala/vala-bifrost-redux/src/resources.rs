@@ -2496,6 +2496,48 @@ fn forge_budget_for_test(roles: &BTreeSet<BifrostRole>) -> Option<usize> {
         .then_some(FORGE_TEST_BUDGET_BYTES)
 }
 
+/// Resolves the disposable scratch budget and the availability it was cut from.
+///
+/// The configured limit never raises detected capacity, and the filesystem
+/// floor is reserved before anything is offered, so a full disk yields zero
+/// rather than a negative figure. Oracle cannot plan against zero disposable
+/// scratch, so that combination refuses the plan here instead of failing at
+/// the first spill. The second returned figure is the post-floor availability
+/// the caller records as the plan's scratch source evidence.
+///
+/// # Errors
+///
+/// Returns [`BifrostResourceError::InvalidPlan`] when availability cannot
+/// preserve the filesystem floor, or when Oracle is enabled and no disposable
+/// scratch remains after it.
+fn scratch_budget(
+    snapshot: &SystemResourceSnapshot,
+    policy: &BifrostResourcePolicy,
+) -> Result<(u64, u64), BifrostResourceError> {
+    let configured_scratch = policy
+        .scratch_limit_bytes
+        .map_or(snapshot.scratch_capacity_bytes, |limit| {
+            limit.min(snapshot.scratch_capacity_bytes)
+        });
+    let available_after_floor = snapshot
+        .scratch_available_bytes
+        .checked_sub(MIN_SCRATCH_FREE_BYTES)
+        .ok_or_else(|| BifrostResourceError::InvalidPlan {
+            detail: format!(
+                "scratch availability {} cannot preserve filesystem floor {MIN_SCRATCH_FREE_BYTES}",
+                snapshot.scratch_available_bytes
+            ),
+        })?;
+    let scratch_limit_bytes = configured_scratch.min(available_after_floor);
+    if policy.roles.contains(&BifrostRole::Oracle) && scratch_limit_bytes == 0 {
+        return Err(BifrostResourceError::InvalidPlan {
+            detail: "Oracle requires positive disposable scratch after the filesystem floor"
+                .to_owned(),
+        });
+    }
+    Ok((scratch_limit_bytes, available_after_floor))
+}
+
 /// Resolves the immutable Forge compaction budget and the elastic remainder.
 ///
 /// The default is four fifths of the resolved process memory, which is the
@@ -2591,24 +2633,7 @@ impl BifrostResourceGovernor {
             safe_forge_budget_bytes,
             policy.forge_compaction_memory_limit_bytes,
         )?;
-        let configured_scratch = policy
-            .scratch_limit_bytes
-            .map_or(snapshot.scratch_capacity_bytes, |limit| {
-                limit.min(snapshot.scratch_capacity_bytes)
-            });
-        let available_after_floor = snapshot
-            .scratch_available_bytes
-            .checked_sub(MIN_SCRATCH_FREE_BYTES)
-            .ok_or_else(|| BifrostResourceError::InvalidPlan {
-                detail: format!("scratch availability {} cannot preserve filesystem floor {MIN_SCRATCH_FREE_BYTES}", snapshot.scratch_available_bytes),
-            })?;
-        let scratch_limit_bytes = configured_scratch.min(available_after_floor);
-        if policy.roles.contains(&BifrostRole::Oracle) && scratch_limit_bytes == 0 {
-            return Err(BifrostResourceError::InvalidPlan {
-                detail: "Oracle requires positive disposable scratch after the filesystem floor"
-                    .to_owned(),
-            });
-        }
+        let (scratch_limit_bytes, available_after_floor) = scratch_budget(&snapshot, &policy)?;
         drop(policy.scratch_root);
         let root = Self {
             inner: Arc::new(ResourceGovernorInner {

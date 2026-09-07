@@ -3,51 +3,19 @@
 use thiserror::Error;
 pub use vala_sql::row_types::forge_tasks::ForgeFailureClass;
 
-/// Boundary at which a capacity refusal occurred.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ForgeCapacityFailurePhase {
-    /// Live root capacity was occupied before the attempt began.
-    Admission,
-    /// An admitted attempt exhausted one persisted envelope term.
-    Execution,
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{ForgeCapacityFailurePhase, ForgeError, ForgeFailureClass};
+    use super::{ForgeError, ForgeFailureClass};
 
-    /// Typed execution errors map to the six durable failure classes without text parsing.
+    /// Typed execution errors map to the durable failure classes without text parsing.
     #[test]
-    fn failure_mapping_is_exhaustive_and_capacity_phase_aware() {
-        assert_eq!(
-            ForgeError::ScratchIo {
-                kind: std::io::ErrorKind::PermissionDenied,
-                detail: "scratch".to_owned(),
-            }
-            .failure_class(),
-            ForgeFailureClass::StorageHealth
-        );
-        assert_eq!(
-            ForgeError::Capacity {
-                detail: "envelope".to_owned()
-            }
-            .failure_class(),
-            ForgeFailureClass::CapacityRefused
-        );
+    fn failure_mapping_is_exhaustive() {
         assert_eq!(
             ForgeError::Capacity {
                 detail: "occupied".to_owned()
             }
-            .capacity_failure_phase(),
-            Some(ForgeCapacityFailurePhase::Admission)
-        );
-        assert_eq!(
-            ForgeError::ExecutionEnvelopeExceeded {
-                resource: "memory",
-                detail: "pool".to_owned()
-            }
-            .capacity_failure_phase(),
-            Some(ForgeCapacityFailurePhase::Execution)
+            .failure_class(),
+            ForgeFailureClass::CapacityRefused
         );
         assert_eq!(
             ForgeError::Timeout {
@@ -65,17 +33,9 @@ pub enum ForgeError {
     /// A construction or runtime limit cannot safely execute Forge.
     #[error("invalid Forge configuration: {detail}")]
     InvalidConfig { detail: String },
-    /// Pod-local elastic memory or scratch is temporarily occupied.
+    /// The worker's local compaction admission refused this attempt for now.
     #[error("Forge resources are temporarily unavailable: {detail}")]
     Capacity { detail: String },
-    /// An admitted rewrite exhausted one exact persisted execution term.
-    #[error("Forge execution envelope exceeded for {resource}: {detail}")]
-    ExecutionEnvelopeExceeded {
-        /// Closed resource label identifying the exhausted term family.
-        resource: &'static str,
-        /// Bounded diagnostic detail from the typed refusal boundary.
-        detail: String,
-    },
     /// A lease acquisition, renewal, fence, or release query failed.
     #[error("Forge lease query failed: {0}")]
     Lease(#[source] vala_sql::SqlError),
@@ -88,14 +48,6 @@ pub enum ForgeError {
     /// A staging or rewritten object operation failed.
     #[error("Forge staging object read failed: {0}")]
     ObjectStore(#[source] opendal::Error),
-    /// Attempt-local scratch IO failed with its typed operating-system category.
-    #[error("Forge scratch IO failed ({kind:?}): {detail}")]
-    ScratchIo {
-        /// Stable IO category consumed by durable failure classification.
-        kind: std::io::ErrorKind,
-        /// Path-safe diagnostic detail for tracing and operator evidence.
-        detail: String,
-    },
     /// Snapshot-expiry planning or reconciliation failed.
     #[error("Forge snapshot expiry failed: {detail}")]
     SnapshotExpiry { detail: String },
@@ -195,10 +147,7 @@ impl ForgeError {
     pub fn failure_class(&self) -> ForgeFailureClass {
         match self {
             Self::RewriteUnsettled { source, .. } => source.failure_class(),
-            Self::ScratchIo { .. } => ForgeFailureClass::StorageHealth,
-            Self::Capacity { .. } | Self::ExecutionEnvelopeExceeded { .. } => {
-                ForgeFailureClass::CapacityRefused
-            }
+            Self::Capacity { .. } => ForgeFailureClass::CapacityRefused,
             Self::ObjectStore(_)
             | Self::ObjectList(_)
             | Self::ObjectDelete(_)
@@ -217,22 +166,6 @@ impl ForgeError {
             | Self::AlreadyRunning
             | Self::Shutdown
             | Self::ShutdownRetained => ForgeFailureClass::InternalInvariant,
-        }
-    }
-
-    /// Returns the capacity phase for typed capacity failures.
-    ///
-    /// [`Self::RewriteUnsettled`] delegates to the failure it wraps: the
-    /// possible-output set is evidence carried alongside a refusal, never a
-    /// refusal of its own, so wrapping must not move a capacity failure out of
-    /// the phase its own boundary declared.
-    #[must_use]
-    pub fn capacity_failure_phase(&self) -> Option<ForgeCapacityFailurePhase> {
-        match self {
-            Self::Capacity { .. } => Some(ForgeCapacityFailurePhase::Admission),
-            Self::ExecutionEnvelopeExceeded { .. } => Some(ForgeCapacityFailurePhase::Execution),
-            Self::RewriteUnsettled { source, .. } => source.capacity_failure_phase(),
-            _ => None,
         }
     }
 

@@ -771,6 +771,49 @@ mod tests {
         )
     }
 
+    /// A stock production plan is admissible on a documented 8 GiB Forge pod.
+    ///
+    /// Two standard 512 MiB variable-width inputs, the production batch width,
+    /// prefetch, and a sort are the heaviest shape the ordinary compaction
+    /// route plans. The 80-percent default budget of a dedicated 8 GiB pod is
+    /// 6.4 GiB, and this pins that such a plan is admitted there rather than
+    /// requiring the oversized pod an earlier qualification journey injected.
+    ///
+    /// The estimate is admission control, not an allocation guarantee: it
+    /// decides whether the plan may start, and the execution engine still
+    /// spills and bounds its own pools at run time.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the stock plan no longer fits the documented pod budget.
+    #[test]
+    fn stock_variable_width_plan_fits_documented_production_pod() {
+        const STOCK_INPUT_BYTES: u64 = 512 * 1024 * 1024;
+        const STOCK_ROW_BYTES: u64 = 1024;
+        /// Four fifths of a dedicated 8 GiB Forge pod.
+        const POD_BUDGET_BYTES: usize = 8 * 1024 * 1024 * 1024 / 5 * 4;
+
+        let variable = schema_of(PrimitiveType::String);
+        let rows = STOCK_INPUT_BYTES / STOCK_ROW_BYTES;
+        let plan = plan_of(
+            vec![
+                task("stock-0.parquet", STOCK_INPUT_BYTES, Some(rows), &variable),
+                task("stock-1.parquet", STOCK_INPUT_BYTES, Some(rows), &variable),
+            ],
+            Vec::new(),
+            Vec::new(),
+            4,
+            4,
+        );
+
+        let estimate = estimate_plan_memory(&plan, &variable, FormatVersion::V2, 1024, true, true);
+        assert!(
+            estimate <= POD_BUDGET_BYTES,
+            "a stock two-input production plan must be admissible on the documented \
+             8 GiB pod: estimate {estimate} exceeds the {POD_BUDGET_BYTES} byte budget"
+        );
+    }
+
     /// The port reproduces `origin/main`'s estimate on every branch it owns.
     ///
     /// Two fully hand-evaluated anchors pin the streaming and sorted arithmetic

@@ -16,7 +16,6 @@ use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::resources::{
     ROLE_MEMORY_FLOOR_BYTES, ResourceSource, SystemResourceSnapshot,
 };
-use vala_bifrost_redux::scribe::geometry::DEFAULT_STAGING_TARGET_FILE_SIZE_BYTES;
 use vala_sdk::BifrostGrpcTransport;
 use vala_sql::row_types::forge_tasks::{ForgeTaskStrategy, evidence_from_json};
 use wyrd_client::WyrdClient;
@@ -39,10 +38,75 @@ use crate::public_support::{
 const PASS_BOUND: Duration = Duration::from_secs(15);
 /// Production-sized rewrites may spend several minutes encoding physical bytes.
 const REWRITE_BOUND: Duration = Duration::from_secs(600);
-/// Payload requests stay below the production 16 MiB ingress limit.
-const ROWS_PER_REQUEST: usize = 12_000;
-/// One flush carries roughly 610 MiB, producing a 512 MiB object and residue.
-const REQUESTS_PER_FLUSH: usize = 52;
+/// Environment flag selecting the standard production geometry profile.
+///
+/// Journey-only: it changes nothing but the sizes this test's own setup
+/// declares, so both modes run the identical body, workload, and assertions.
+const PRODUCTION_GEOMETRY_FLAG: &str = "WYRD_FORGE_PRODUCTION_GEOMETRY";
+
+/// Physical sizes one qualification mode declares for Scribe and Iceberg.
+///
+/// The proof is geometric — target rolling, exactly one residue, multi-row-group
+/// outputs, replanned backlog — and every one of those properties is a ratio
+/// rather than an absolute size. Scaling all of the sizes together therefore
+/// keeps the assertions meaningful while letting the ordinary lane finish in
+/// seconds; the production profile runs the same test at the standard sizes.
+#[derive(Clone, Copy)]
+struct GeometryProfile {
+    /// Rows one public append request carries.
+    rows_per_request: usize,
+    /// Requests one flushed round issues.
+    requests_per_flush: usize,
+    /// Scribe assembled-object target the staging geometry rolls at.
+    scribe_target_bytes: u64,
+    /// Iceberg rolling target the table declares.
+    iceberg_target_bytes: u64,
+    /// Parquet row-group target, always below the file target so a rolled
+    /// output necessarily contains more than one group.
+    row_group_bytes: u64,
+    /// Compaction eligibility threshold this journey's Forge config uses.
+    small_file_threshold_bytes: u64,
+    /// Whether the qualification sizing of the worker and Oracle pods applies.
+    production_resources: bool,
+}
+
+impl GeometryProfile {
+    /// Scaled default: the same geometry two orders of magnitude smaller.
+    const FAST: Self = Self {
+        // One round carries the same multiple of the target as production
+        // does, but in fewer, larger requests: a staging claim closes on the
+        // smallest member prefix whose bytes reach the target, and the merged
+        // object re-encodes a fraction below that sum. Coarse members keep the
+        // crossing object above the target instead of a fraction under it.
+        rows_per_request: 940,
+        requests_per_flush: 6,
+        scribe_target_bytes: 4 * 1024 * 1024,
+        iceberg_target_bytes: 8 * 1024 * 1024,
+        row_group_bytes: 1024 * 1024,
+        small_file_threshold_bytes: 6 * 1024 * 1024,
+        production_resources: false,
+    };
+
+    /// Standard production sizing, selected only by the focused lane.
+    const PRODUCTION: Self = Self {
+        rows_per_request: 12_000,
+        requests_per_flush: 52,
+        scribe_target_bytes: 512 * 1024 * 1024,
+        iceberg_target_bytes: 1024 * 1024 * 1024,
+        row_group_bytes: 128 * 1024 * 1024,
+        small_file_threshold_bytes: 768 * 1024 * 1024,
+        production_resources: true,
+    };
+
+    /// Reads the profile this process runs, defaulting to the fast one.
+    fn selected() -> Self {
+        if std::env::var_os(PRODUCTION_GEOMETRY_FLAG).is_some() {
+            Self::PRODUCTION
+        } else {
+            Self::FAST
+        }
+    }
+}
 /// Incompressible payload width makes physical targets measurable.
 const PAYLOAD_BYTES: usize = 1024;
 
@@ -69,7 +133,7 @@ impl CloseoutJourney {
     /// Panics if the production topology cannot start or lacks its observer.
     async fn start() -> Self {
         Self::start_with_config(ForgeConfig {
-            small_file_threshold_bytes: 768 * 1024 * 1024,
+            small_file_threshold_bytes: GeometryProfile::selected().small_file_threshold_bytes,
             ..ForgeConfig::default()
         })
         .await
@@ -80,7 +144,12 @@ impl CloseoutJourney {
     /// # Panics
     /// Panics if the real role graph cannot start or its observer is absent.
     async fn start_with_config(config: ForgeConfig) -> Self {
-        let mut spec = BifrostClusterSpec::dedicated_forge_workers();
+        let profile = GeometryProfile::selected();
+        let mut spec = BifrostClusterSpec::dedicated_forge_workers().with_scribe_geometry_for_test(
+            vala_bifrost_redux::scribe::geometry::ScribeGeometry::default()
+                .with_staging_target_file_size_bytes(profile.scribe_target_bytes)
+                .expect("the selected staging target is a valid geometry"),
+        );
         let coordinator_node = spec.nodes[3].node_id;
         let scribe_node = spec.nodes[0].node_id;
         let oracle_node = spec.nodes[2].node_id;
@@ -88,10 +157,13 @@ impl CloseoutJourney {
         spec.nodes[3].roles = spec.nodes[0].roles.clone();
         spec.nodes[0].roles = [BifrostRuntimeRole::Scribe].into_iter().collect();
         spec.nodes[2].roles = [BifrostRuntimeRole::Oracle].into_iter().collect();
-        // The surviving dedicated worker compacts the journey's production-sized
-        // 512 MiB inputs, whose decoded working set the admission estimate puts
-        // well past a 3 GiB pod. Size that pod for the plans it must admit.
-        spec.nodes[1].forge_compaction_memory_limit_bytes = Some(16 * 1024 * 1024 * 1024);
+        // Only the qualification profile needs an oversized worker pod: its
+        // 512 MiB inputs decode into a working set the admission estimate puts
+        // well past an ordinary pod. The scaled default admits its plans on the
+        // harness default budget.
+        if profile.production_resources {
+            spec.nodes[1].forge_compaction_memory_limit_bytes = Some(16 * 1024 * 1024 * 1024);
+        }
         spec.nodes[1].oracle = Some(TestOracleResources {
             spill_root: None,
             system_resources: Some(SystemResourceSnapshot {
@@ -103,10 +175,11 @@ impl CloseoutJourney {
                 cpu_source: ResourceSource::Injected,
             }),
         });
-        // Both Oracle replicas must derive the same durable admission ceiling.
-        // The dedicated replica needs neither the Scribe protected floor nor
-        // the Forge compaction reservation the co-located coordinator takes, so
-        // its injected limit sheds exactly those two.
+        // Both Oracle replicas must derive the same durable admission ceiling,
+        // in either geometry mode: this is replica agreement, not sizing. The
+        // dedicated replica needs neither the Scribe protected floor nor the
+        // Forge compaction reservation the co-located coordinator takes, so its
+        // injected limit sheds exactly those two.
         spec.nodes[2].oracle = Some(TestOracleResources {
             spill_root: None,
             system_resources: Some(SystemResourceSnapshot {
@@ -432,6 +505,7 @@ impl CloseoutJourney {
     /// # Panics
     /// Panics if catalog configuration fails or does not preserve the declared target.
     async fn declare_geometry(&self, binding: &TenantTableBinding) {
+        let profile = GeometryProfile::selected();
         let catalog = self.scribe().bifrost_catalog().iceberg_catalog();
         let table = catalog
             .load_table(&binding.table_ident())
@@ -442,7 +516,13 @@ impl CloseoutJourney {
             .update_table_properties()
             .set(
                 "write.target-file-size-bytes".to_owned(),
-                "1073741824".to_owned(),
+                profile.iceberg_target_bytes.to_string(),
+            )
+            // Below the file target in both modes, so every output that rolled
+            // at the target necessarily closed more than one row group.
+            .set(
+                "write.parquet.row-group-size-bytes".to_owned(),
+                profile.row_group_bytes.to_string(),
             )
             .apply(tx)
             .expect("declared table geometry");
@@ -456,7 +536,7 @@ impl CloseoutJourney {
                 .properties()
                 .get("write.target-file-size-bytes")
                 .map(String::as_str),
-            Some("1073741824")
+            Some(profile.iceberg_target_bytes.to_string().as_str())
         );
     }
 
@@ -807,6 +887,8 @@ struct GeometryWorkload {
     random: StdRng,
     /// Exact acknowledged managed identities and payload values.
     expected: Vec<ManagedRow>,
+    /// Sizes this process runs the qualification at.
+    profile: GeometryProfile,
 }
 
 impl GeometryWorkload {
@@ -816,6 +898,7 @@ impl GeometryWorkload {
             event_time: chrono::Utc::now(),
             random: StdRng::seed_from_u64(0x5eed),
             expected: Vec::new(),
+            profile: GeometryProfile::selected(),
         }
     }
 
@@ -827,10 +910,10 @@ impl GeometryWorkload {
         let transport = vala_sdk::grpc::BifrostGrpcTransport::connect(client)
             .await
             .expect("ingest transport");
-        for _ in 0..REQUESTS_PER_FLUSH {
+        for _ in 0..self.profile.requests_per_flush {
             let first = i64::try_from(self.expected.len()).expect("bounded row count");
             let values: Vec<i64> = (first
-                ..first + i64::try_from(ROWS_PER_REQUEST).expect("bounded request"))
+                ..first + i64::try_from(self.profile.rows_per_request).expect("bounded request"))
                 .collect();
             self.append_batch(&transport, table, &values).await;
         }
@@ -1044,10 +1127,10 @@ async fn compaction_geometry_exact_rows_and_non_destructive_second_pass() {
     eprintln!("Scribe physical bytes: {sizes:?}");
     assert!(
         hot.iter()
-            .filter(|file| file.file_size >= DEFAULT_STAGING_TARGET_FILE_SIZE_BYTES)
+            .filter(|file| file.file_size >= workload.profile.scribe_target_bytes)
             .count()
             >= 2,
-        "multiple production 512 MiB inputs required: {sizes:?}"
+        "multiple inputs at the selected staging target required: {sizes:?}"
     );
     workload.expected = canonical_order(workload.expected);
     assert_eq!(
@@ -1097,18 +1180,30 @@ async fn compaction_geometry_exact_rows_and_non_destructive_second_pass() {
         );
         let unchanged = next.0 == replacement.0;
         replacement = next;
-        if unchanged {
-            assert!(
-                replacement
-                    .1
-                    .values()
-                    .any(|file| file.file_size_in_bytes() >= target),
-                "geometry backlog must roll at the declared target before an unchanged cut"
-            );
+        // A pass that publishes nothing is not necessarily the end of the
+        // backlog: a busy worker can return one before the packing it owes has
+        // run. The cut is settled only once it is both unchanged and rolled at
+        // the declared target, which is the property this loop is packing for.
+        if unchanged
+            && replacement
+                .1
+                .values()
+                .any(|file| file.file_size_in_bytes() >= target)
+        {
             break;
         }
     }
     let (replacement_snapshot, outputs) = replacement;
+    assert!(
+        outputs
+            .values()
+            .any(|file| file.file_size_in_bytes() >= target),
+        "geometry backlog must roll at the declared target: {:?}",
+        outputs
+            .values()
+            .map(DataFile::file_size_in_bytes)
+            .collect::<Vec<_>>()
+    );
     assert_ne!(replacement_snapshot, promoted_snapshot);
     assert!(
         passes > 1,
@@ -1733,12 +1828,28 @@ impl OrphanJourney {
                 !orphans.is_empty(),
                 "the held rewrite closed at least one real output"
             );
-            // Before the operation row prepares, the age floor is the only
-            // thing standing between a collection pass and an output a live
-            // attempt is still working on, so that is what must hold here.
-            roles
-                .assert_eligibility(&table.binding, &orphans, "TooYoung", "unprepared rewrite")
-                .await;
+            // The attempt admits every eligible plan, and a sibling plan can
+            // already have prepared and published while this one is held. Its
+            // outputs are live and protected by that prepared operation, so the
+            // stranded generation is the held plan's own outputs: the ones no
+            // operation row names, retained by the age floor alone.
+            // They must still be retained while the attempt is open. Which
+            // authority answers is not fixed: the age floor retains an object
+            // no operation names, and a sibling plan of the same attempt that
+            // has already prepared blocks destructive maintenance for the whole
+            // table until it settles. Either verdict is retention; only
+            // `Eligible` would be a collectible live attempt's output.
+            for path in &orphans {
+                let verdict = roles
+                    .coordinator()
+                    .forge_gc_eligibility_for_test(&table.binding, path)
+                    .await
+                    .expect("the production orphan predicate answers");
+                assert!(
+                    verdict == "TooYoung" || verdict == "Protected",
+                    "an open attempt's closed output must be retained: {path} => {verdict}"
+                );
+            }
             // Refuse the metadata reacquisition this rewrite performs next,
             // which is the last authority it consults before preparing.
             catalog.fail_next_load_table();
@@ -1747,13 +1858,43 @@ impl OrphanJourney {
         };
         let ((), orphans) = tokio::join!(drive, inspect);
 
+        // Sibling plans of the same attempt publish on their own operations, so
+        // the stranded generation is the closed outputs no snapshot names once
+        // the refusal has settled the attempt.
         let (_, live) = roles.live_files(&table.binding).await;
-        for path in &orphans {
-            assert!(
-                !live.contains_key(path),
-                "a refused rewrite output reached a published snapshot: {path}"
-            );
-        }
+        let orphans: BTreeSet<String> = orphans
+            .into_iter()
+            .filter(|path| !live.contains_key(path))
+            .collect();
+        assert!(
+            !orphans.is_empty(),
+            "the refused rewrite left at least one output no snapshot names"
+        );
+        let named: BTreeSet<String> = sqlx::query_scalar::<_, serde_json::Value>(
+            "SELECT prepared_detail FROM vala.forge_operation_state \
+             WHERE data_tenant_id = $1 AND family = 'iceberg_rewrite'",
+        )
+        .bind(table.binding.tenant.as_uuid())
+        .fetch_all(roles.cluster.pg_fixture().operator_pool().pool())
+        .await
+        .expect("Forge operation-state inspection")
+        .iter()
+        .flat_map(|detail| {
+            detail
+                .get("output_paths")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+        })
+        .filter_map(|path| path.as_str().map(str::to_owned))
+        .collect();
+        assert!(
+            orphans
+                .iter()
+                .all(|path| !named.iter().any(|output| output.ends_with(path))),
+            "the refused plan never prepared, so no operation row names its \
+             outputs: {orphans:?} in {named:?}"
+        );
         orphans
     }
 

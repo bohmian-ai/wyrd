@@ -46,6 +46,21 @@ async fn rewrite_phases(cluster: &WyrdTestCluster, tenant: DataTenantId) -> Vec<
     .expect("Forge operation-state inspection")
 }
 
+/// Reads one exact rewrite operation's durable phase, when the row exists.
+///
+/// # Panics
+///
+/// Panics when the read-only diagnostic query fails.
+async fn rewrite_phase_of(cluster: &WyrdTestCluster, operation: Uuid) -> Option<String> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT phase FROM vala.forge_operation_state WHERE operation_id = $1",
+    )
+    .bind(operation)
+    .fetch_optional(cluster.pg_fixture().operator_pool().pool())
+    .await
+    .expect("Forge operation-state inspection")
+}
+
 /// Identifies one tenant's rewrite operations that claim no terminal outcome.
 ///
 /// Returned newest first, so the caller can name the operation the pod just
@@ -1357,13 +1372,28 @@ async fn forge_promoted_files_rewrite_and_remain_exact_across_recovery() {
         observer.returned_errors()
     );
     let uncertain = landed_uncertain[0];
+    // Each plan owns its own operation, so the attempt leaves a mixture: the
+    // one whose commit landed without a learnable answer stays open, because
+    // only proof about that exact operation may close it, while every sibling
+    // the attempt can prove never reached the catalog is reset. The open row is
+    // therefore identified by operation, not by position.
+    let phases = rewrite_phases(&cluster, owner).await;
+    // Each plan of the attempt opened its own operation, and the attempt closed
+    // only the ones it could prove never reached the catalog. Every earlier
+    // drain settled its operations as committed or recovered, so the open plus
+    // reset rows are exactly this attempt's plans.
+    let attempt_plans = phases
+        .iter()
+        .filter(|phase| *phase == "prepared" || *phase == "reset")
+        .count();
     assert_eq!(
-        rewrite_phases(&cluster, owner)
-            .await
-            .last()
-            .map(String::as_str),
+        rewrite_phase_of(&cluster, uncertain).await.as_deref(),
         Some("prepared"),
-        "the operation the pod could not settle is the one it just attempted"
+        "the operation the pod could not settle is the one it just attempted: {phases:?}"
+    );
+    assert!(
+        phases.iter().filter(|phase| *phase == "prepared").count() == 1,
+        "no sibling stays open beside it: {phases:?}"
     );
 
     // Cut 3 — across the uncertain commit. The customer answer first; the
@@ -1753,7 +1783,7 @@ async fn forge_promoted_files_rewrite_and_remain_exact_across_recovery() {
         &RecoveryTelemetry {
             task_id: landed_task,
             attempt_id: landed_attempt,
-            plan_commits: unsettled.len(),
+            plan_commits: attempt_plans,
             input_files: landed.removed_data.len() as u64,
             output_files: landed.added_data.len() as u64,
             input_bytes: landed.removed_bytes,

@@ -437,3 +437,221 @@ redacted
          {reconciliation} over {open:?}"
     );
 }
+
+/// A plan whose input left the current head is refused, never republished.
+///
+/// A retained planning snapshot is what lets a plan compose on a head that
+/// moved for an unrelated reason. It is not permission to replace an input a
+/// concurrent writer already replaced: doing that would publish the same source
+/// rows a second time under a new snapshot. Two independent authorities have to
+/// refuse it, and both are exercised here against the real catalog.
+///
+/// The first is explicit and pre-submit. The attempt is held between its
+/// managed handoff and its publication while a competing writer replaces every
+/// live data file of the table, so when the held plan reacquires authority its
+/// own inputs are gone from the head. It must refuse before any `update_table`
+/// call, close its operation as never-published, and carry its outputs out as
+/// merely possible orphans.
+///
+/// The second closes the window the first cannot: a definite conflict makes an
+/// attempt re-encode its plan against the head it lost to, and the inputs it
+/// chose are gone from that head. The pinned transaction publication builds
+/// refuses that request itself, before the catalog is asked anything.
+///
+/// # Panics
+///
+/// Panics when a stale plan submits or lands a catalog update, when a refused
+/// plan leaves its operation open, or when any source row becomes readable more
+/// than once.
+#[tokio::test]
+async fn stale_planned_input_cannot_be_republished() {
+redacted
+    let object_store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
+    let catalog = PromotionCatalogSeam::new(
+        promoted.fixture.catalog.iceberg_catalog(),
+        object_store.read_counter(),
+    );
+    let mut supervisor = SupervisedPromotion::start(
+        &promoted.fixture,
+        Arc::clone(&catalog) as Arc<dyn iceberg::Catalog>,
+        Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
+        ForgeClock::system(),
+    );
+    promoted.fixture.seal_more(2).await;
+    supervisor.run_one_success().await;
+
+    let sources = live_row_values(&promoted).await;
+    assert!(
+        !sources.is_empty(),
+        "the promoted table publishes the seeded rows"
+    );
+
+    // The explicit current-head check: the head moves while the attempt holds
+    // its handoff, so every plan of it is stale by the time it asks to publish.
+    let operations_before = promoted.fixture.rewrite_operations().await.len();
+    let attempts_before = catalog.attempts();
+    supervisor.restart_worker();
+    let refusal = supervisor
+        .run_one_failure_holding_handoff(replace_every_live_data_file(&promoted))
+        .await;
+
+    assert!(
+        refusal.contains("InputsChanged"),
+        "a plan whose input left the head is refused for exactly that reason: {refusal}"
+    );
+    assert_eq!(
+        catalog.attempts(),
+        attempts_before,
+        "no stale plan reached the catalog at all: {refusal}"
+    );
+    let operations = promoted.fixture.rewrite_operations().await;
+    assert_eq!(
+        operations.len(),
+        operations_before,
+        "a refusal reached before the Prepared audit leaves no operation for a \
+         successor to reconcile: {operations:?}"
+    );
+    assert!(
+        supervisor
+            .last_possible_rewrite_outputs()
+            .is_some_and(|outputs| !outputs.is_empty()),
+        "the refused outputs leave as possible orphan evidence, not as a commit"
+    );
+    assert_eq!(
+        live_row_values(&promoted).await,
+        sources,
+        "the competing replacement is the only live copy of each source row"
+    );
+
+    // The commit-time backstop. A definite conflict makes an attempt reload
+    // the table and re-encode its plan against the head it actually lost to.
+    // That re-encoded request still names the inputs the losing plan chose, so
+    // the pinned transaction — not the catalog — has to be the authority that
+    // refuses them. Encoding one here the way publication does proves the
+    // refusal is the pinned action's own.
+    let stale_inputs = promoted.live_data_files().await;
+    let snapshots_before = promoted.snapshot_count().await;
+    replace_every_live_data_file(&promoted).await;
+
+    let reloaded = promoted.load_table().await;
+    let transaction = iceberg::transaction::Transaction::new(&reloaded);
+    let action = transaction
+        .rewrite_files()
+        .set_enable_delete_filter_manager(false)
+        .set_check_file_existence(true)
+        .delete_files(stale_inputs);
+    let republished = iceberg::transaction::ApplyTransactionAction::apply(action, transaction)
+        .expect("a revalidated stale request still encodes")
+        .commit(promoted.fixture.catalog.iceberg_catalog().as_ref())
+        .await;
+    assert!(
+        republished.is_err(),
+        "a revalidated plan whose inputs left the head is refused by the \
+         transaction itself, before any catalog decision"
+    );
+    assert_eq!(
+        promoted.snapshot_count().await,
+        snapshots_before + 1,
+        "only the competing writer's own replacement reached the table"
+    );
+    assert_eq!(
+        live_row_values(&promoted).await,
+        sources,
+        "no source row is published twice by a raced stale commit"
+    );
+
+    supervisor.shutdown().await;
+}
+
+/// Reads every source row the table currently publishes, in ascending order.
+///
+/// Row identity rather than file identity is what a republished stale input
+/// would corrupt, so the liveness assertions are made against values.
+///
+/// # Panics
+///
+/// Panics when a live object cannot be read as Parquet.
+async fn live_row_values(promoted: &PromotedRewriteFixture) -> Vec<i64> {
+    let paths = promoted
+        .live_data_files()
+        .await
+        .into_iter()
+        .map(|file| file.file_path().to_owned())
+        .collect::<Vec<_>>();
+    promoted.object_values(&paths).await
+}
+
+/// Replaces every live data file with a byte-identical copy at a new path.
+///
+/// This is a competing writer, not a Forge attempt: it commits directly through
+/// the real catalog, so the head genuinely moves without touching the table
+/// lease the held Forge attempt still owns. Copying rather than rewriting keeps
+/// the published row set identical, which is what makes "each source row is
+/// readable once" a statement about republication rather than about content.
+///
+/// # Panics
+///
+/// Panics when the table holds no live data file, when an object cannot be
+/// copied, or when the competing replacement is refused.
+async fn replace_every_live_data_file(promoted: &PromotedRewriteFixture) {
+    let table = promoted.load_table().await;
+    let live = promoted.live_data_files().await;
+    assert!(
+        !live.is_empty(),
+        "a competing writer needs at least one live file to replace"
+    );
+    let mut added = Vec::with_capacity(live.len());
+    for file in &live {
+        let replacement = format!("{}.competing.parquet", file.file_path());
+        let bytes = promoted
+            .fixture
+            .staging
+            .read(&staging_key(promoted, file.file_path()))
+            .await
+            .expect("a live object is readable")
+            .to_bytes();
+        promoted
+            .fixture
+            .staging
+            .write(&staging_key(promoted, &replacement), bytes)
+            .await
+            .expect("the competing copy is writable");
+        added.push(
+            iceberg::spec::DataFileBuilder::default()
+                .content(iceberg::spec::DataContentType::Data)
+                .file_path(replacement)
+                .file_format(file.file_format())
+                .partition(file.partition().clone())
+                .record_count(file.record_count())
+                .file_size_in_bytes(file.file_size_in_bytes())
+                .partition_spec_id(file.partition_spec_id())
+                .build()
+                .expect("the competing descriptor is publishable"),
+        );
+    }
+    let transaction = iceberg::transaction::Transaction::new(&table);
+    let action = transaction
+        .rewrite_files()
+        .set_enable_delete_filter_manager(false)
+        .add_data_files(added)
+        .delete_files(live);
+    iceberg::transaction::ApplyTransactionAction::apply(action, transaction)
+        .expect("the competing replacement encodes")
+        .commit(promoted.fixture.catalog.iceberg_catalog().as_ref())
+        .await
+        .expect("the competing replacement commits");
+}
+
+/// Maps one catalog file path onto the staging operator's own key.
+///
+/// The catalog stores table-qualified paths while the fixture operator is
+/// rooted at the warehouse, so a scenario that reads or writes an object by its
+/// catalog identity has to re-anchor it the same way the fixture's own readers
+/// do.
+fn staging_key(promoted: &PromotedRewriteFixture, path: &str) -> String {
+    let prefix = &promoted.fixture.binding.object_prefix;
+    path.split_once(&format!("{prefix}/")).map_or_else(
+        || path.to_owned(),
+        |(_, suffix)| format!("{prefix}/{suffix}"),
+    )
+}

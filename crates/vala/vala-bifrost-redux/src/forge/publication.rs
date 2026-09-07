@@ -170,6 +170,22 @@ impl RewriteBase {
             || self.position_deletes.contains_key(path)
             || self.equality_deletes.contains_key(path)
     }
+
+    /// Returns whether every path is a live *data* file of this view.
+    ///
+    /// Publication asks this of the current head rather than of the planning
+    /// base: a plan whose inputs left the head would replace files that a
+    /// concurrent writer already replaced, which is how the same rows get
+    /// published twice. Only the data map is consulted, because a rewritten
+    /// input is always a data file.
+    pub(super) fn holds_all_data<'path>(
+        &self,
+        paths: impl IntoIterator<Item = &'path String>,
+    ) -> bool {
+        paths
+            .into_iter()
+            .all(|path| self.data.contains_key(path.as_str()))
+    }
 }
 
 /// Whether one delete at `delete_sequence` still reaches replacement rows.
@@ -539,6 +555,14 @@ impl RewriteCommitRequest {
     /// disposition itself and a second, independent resolution could silently
     /// disagree with the retained set this rewrite committed to.
     ///
+    /// File-existence validation is enabled deliberately, and it is the
+    /// commit-time half of the current-head liveness check the caller already
+    /// made explicitly. The explicit check reads the head before submission and
+    /// gives a typed refusal; this one closes the window between that read and
+    /// the catalog's own commit, turning a head move that removed an input into
+    /// a definite conflict the bounded revalidation schedule handles instead of
+    /// a republished stale snapshot.
+    ///
     /// # Errors
     ///
     /// Returns [`ForgeError::Catalog`] when the transaction layer refuses to
@@ -555,6 +579,7 @@ impl RewriteCommitRequest {
         let mut action = transaction
             .rewrite_files()
             .set_enable_delete_filter_manager(false)
+            .set_check_file_existence(true)
             .set_new_data_file_sequence_number(self.new_data_file_sequence_number)
             .add_data_files(self.added_data_files.iter().cloned())
             .delete_files(removed);

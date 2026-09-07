@@ -4425,7 +4425,7 @@ redacted
             .await
             .map_err(ForgeError::Catalog)?;
         if let Some(refusal) = self
-            .rewrite_publication_refusal(context, &current, lease, stop)
+            .rewrite_publication_refusal(context, &current, handoff, lease, stop)
             .await?
         {
             return Err(self
@@ -4671,7 +4671,15 @@ redacted
                 }
             }
             let (action, reloaded_after_conflict) = self
-                .rewrite_follow_up(context, acceptance, request, retries_spent, lease, stop)
+                .rewrite_follow_up(
+                    context,
+                    acceptance,
+                    request,
+                    handoff,
+                    retries_spent,
+                    lease,
+                    stop,
+                )
                 .await?;
             match action {
                 super::publication::RewriteConflictAction::ReconcileWithoutRecommit => {
@@ -4713,12 +4721,13 @@ redacted
     /// # Errors
     ///
     /// Returns [`ForgeError::Lease`] or [`ForgeError::Sql`] when the lease
-    /// cannot be renewed, and the clock failures the deadline comparison
-    /// raises.
+    /// cannot be renewed, the clock failures the deadline comparison raises,
+    /// and the catalog failures the current-head live-set read raises.
     async fn rewrite_publication_refusal(
         &self,
         context: &RewritePublication<'_>,
         current: &Table,
+        handoff: &super::managed::RewriteHandoff,
         lease: &mut ForgeLease,
         stop: &CancellationToken,
     ) -> Result<Option<super::publication::RewriteRefusal>, ForgeError> {
@@ -4729,6 +4738,7 @@ redacted
                 context.claim.base_snapshot_id,
                 context.planned_schema_id,
                 context.deadline,
+                &handoff.rewritten_data_files,
                 stop,
             )
             .await?;
@@ -4882,6 +4892,7 @@ redacted
         context: &RewritePublication<'_>,
         acceptance: super::publication::RewriteAcceptance,
         request: &super::publication::RewriteCommitRequest,
+        handoff: &super::managed::RewriteHandoff,
         retries_spent: u32,
         lease: &mut ForgeLease,
         stop: &CancellationToken,
@@ -4925,6 +4936,7 @@ redacted
                         request.base_snapshot_id,
                         context.planned_schema_id,
                         context.deadline,
+                        &handoff.rewritten_data_files,
                         stop,
                     )
                     .await?;
@@ -4947,20 +4959,28 @@ redacted
     /// before any of them is acted on is what keeps a refusal free of partial
     /// effects.
     ///
-    /// `inputs_all_live` and `delete_scope_safe` are recorded as held because
-    /// [`super::publication::RewriteCommitRequest::derive`] is their owner and
-    /// refuses otherwise: the caller derives against this exact base right
+    /// `inputs_all_live` is answered against the *current head*, not against
+    /// the planning base. A retained planning snapshot lets a disjoint plan
+    /// compose on a moving head, but it never permits replacing an input a
+    /// concurrent writer already removed: doing so would resurrect the rows the
+    /// earlier replacement retired. The head's live data set is therefore read
+    /// through the same manifest reader publication already owns, and the
+    /// authority holds only when every rewritten path is still in it.
+    ///
+    /// `delete_scope_safe` is recorded as held because
+    /// [`super::publication::RewriteCommitRequest::derive`] is its owner and
+    /// refuses otherwise: the caller derives against the planning base right
     /// after this call and settles that refusal the same way, so the two halves
     /// of the decision cover every dimension between them.
     ///
     /// The base is named by the durable claim rather than read off a derived
-    /// request, so this can run against freshly loaded metadata before any
-    /// manifest is read.
+    /// request, so this can run against freshly loaded metadata.
     ///
     /// # Errors
     ///
     /// Returns [`ForgeError::Sql`] when the lease cannot be renewed against the
-    /// operator pool, and the clock failures the deadline comparison raises.
+    /// operator pool, the clock failures the deadline comparison raises, and
+    /// the catalog and manifest failures the current-head live-set read raises.
     async fn rewrite_authority(
         &self,
         lease: &mut ForgeLease,
@@ -4968,8 +4988,12 @@ redacted
         base_snapshot_id: i64,
         planned_schema_id: i32,
         deadline: super::publication::RewritePublicationDeadline,
+        rewritten_data_files: &[String],
         stop: &CancellationToken,
     ) -> Result<super::publication::RewriteCommitAuthority, ForgeError> {
+        let inputs_all_live = self
+            .current_head_holds_inputs(table, rewritten_data_files)
+            .await?;
         let metadata = table.metadata();
         Ok(super::publication::RewriteCommitAuthority {
             fence: super::publication::RewriteFenceAuthority {
@@ -4987,10 +5011,36 @@ redacted
                 schema_unchanged: planned_schema_id == metadata.current_schema_id(),
             },
             files: super::publication::RewriteFileAuthority {
-                inputs_all_live: true,
+                inputs_all_live,
                 delete_scope_safe: true,
             },
         })
+    }
+
+    /// Reports whether every rewritten input is still live on the current head.
+    ///
+    /// The head's own live file set is read through
+    /// [`super::Forge::rewrite_base_at`], the one manifest-reading owner, so
+    /// this check never duplicates manifest traversal. A table with no current
+    /// snapshot holds nothing, which refuses any plan that names an input.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Catalog`] when the manifest list or a manifest
+    /// cannot be read, and the invariant failures the base assembly raises.
+    async fn current_head_holds_inputs(
+        &self,
+        table: &Table,
+        rewritten_data_files: &[String],
+    ) -> Result<bool, ForgeError> {
+        if rewritten_data_files.is_empty() {
+            return Ok(true);
+        }
+        let Some(head) = table.metadata().current_snapshot_id() else {
+            return Ok(false);
+        };
+        let live = self.forge.rewrite_base_at(table, head).await?;
+        Ok(live.holds_all_data(rewritten_data_files))
     }
 
     /// Converts catalog file paths into the audit row's storage paths.

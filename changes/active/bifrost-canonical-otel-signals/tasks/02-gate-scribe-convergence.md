@@ -384,3 +384,30 @@ git diff --check
 The scenario test path is `scribe::scribe_persistence_path::...`, not
 `scribe::tests::scribe_persistence_path::...`; the module is mounted without a
 `tests` segment.
+
+### Pre-existing failures outside this task
+
+`mise run test:bifrost` (the family lane containing this task's
+`test:bifrost:journey:scribe`) reports six failures. All six live in
+`crates/wyrd/wyrd-testing/src/bifrost/`, which no commit in this change's range
+(`f21d0efd4..HEAD`) touches — `git log --name-only` over that range matches zero
+files under `wyrd-testing/src`. They are unrelated baseline defects, not T02
+fallout:
+
+- `bifrost::forge_harness::worker_lifecycle_tests::{forge_worker_error_restores_resource_baselines,
+  forge_worker_drop_restores_resource_baselines, forge_harness_observes_worker_operation_lease,
+  forge_harness_refusal_releases_claim_without_data_io,
+  forge_worker_cancellation_drops_runtime_before_lease_release}` — all five panic at
+  `forge_harness.rs:1292` with "this Forge fixture was built by
+  `seed_synthetic_forge_group_for_test`, which has no Scribe". A fixture-construction
+  mismatch entirely inside `wyrd-testing`.
+- `bifrost::scribe_workload::tests::scribe_workload_read_boundaries_may_not_reuse_an_earlier_read`
+  — `scribe_workload.rs:2265`: `ScribeProductionWorkloadV1::validate` accepts a record whose
+  second read-required boundary reuses the first boundary's read. `validate` is local to
+  `scribe_workload.rs` and depends on nothing in `vala-bifrost-redux`.
+
+Reproduced under the lane's own Postgres wrapper
+(`scripts/postgres/with-test-postgres.sh -- ... cargo nextest run --locked -p wyrd-testing --lib
+-E 'test(/^bifrost::forge_harness::worker_lifecycle_tests::/) +
+test(=bifrost::scribe_workload::tests::scribe_workload_read_boundaries_may_not_reuse_an_earlier_read)'`)
+so the failures are not the bare-`cargo` missing-`WYRD_DATABASE_URL` variety.

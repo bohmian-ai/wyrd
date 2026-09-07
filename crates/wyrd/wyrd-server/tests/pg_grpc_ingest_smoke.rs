@@ -266,7 +266,7 @@ async fn seed_tail_rows(state: &AppState, tenant: DataTenantId) {
             batch_id: uuid::Uuid::now_v7(),
             audit_event,
             measured_wire_bytes,
-            payload: IngressPayload::ProjectedArrow(vec![rows]),
+            payload: IngressPayload::Canonical(vala_bifrost_redux::contracts::CanonicalIngress::unreserved(vec![rows])),
         },
     )
     .await

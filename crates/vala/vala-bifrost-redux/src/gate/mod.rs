@@ -873,7 +873,8 @@ mod tests {
 
     use super::limits::IngestLimits;
     use super::{AuthContext, Gate, IngestError};
-    use crate::contracts::{DecodedOtlp, IngressPayload, ScribeOtlpOutcome};
+    use arrow::record_batch::RecordBatch;
+    use crate::contracts::DecodedOtlp;
     use async_trait::async_trait;
     use futures_util::StreamExt as _;
     use wyrd_auth_oidc::IssuerConfigResolver;
@@ -1125,19 +1126,10 @@ mod tests {
             &self,
             frame: crate::contracts::ScribeIngressFrame,
         ) -> Result<crate::contracts::FrameAdmission, crate::contracts::ScribeError> {
+            let _ = frame;
             Ok(crate::contracts::FrameAdmission {
                 batch_id: uuid::Uuid::now_v7(),
                 rows_accepted: 0,
-                otlp_outcome: match frame.payload {
-                    IngressPayload::OtlpTraces(_) => Some(ScribeOtlpOutcome::Traces(
-                        crate::otlp_contract::IngestOutcome {
-                            accepted_spans: 0,
-                            rejected_spans: 0,
-                            rejection_message: None,
-                        },
-                    )),
-                    _ => None,
-                },
             })
         }
     }
@@ -1160,6 +1152,18 @@ mod tests {
 
     struct CountingScribe {
         calls: Arc<AtomicUsize>,
+        /// Row count of every canonical batch Gate handed to Scribe, in order.
+        rows: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl CountingScribe {
+        /// Builds one counting double sharing `calls` and its own row log.
+        fn new(calls: Arc<AtomicUsize>) -> Self {
+            Self {
+                calls,
+                rows: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
     }
 
     #[async_trait]
@@ -1182,20 +1186,17 @@ mod tests {
             assert_eq!(frame.authenticated_tenant, frame.principal.tenant_id);
             assert_eq!(frame.table.fqn(), "vala.traces.spans");
             assert!(frame.expected_schema_fingerprint.is_none());
-            assert!(matches!(
-                frame.payload,
-                IngressPayload::OtlpTraces(crate::contracts::DecodedOtlp { owner: Some(_), .. })
-            ));
+            let crate::contracts::IngressPayload::Canonical(canonical) = &frame.payload else {
+                panic!("Gate must hand Scribe validated canonical batches");
+            };
+            assert!(canonical.owner.is_some(), "Gate must move its decode owner");
+            self.rows
+                .lock()
+                .expect("row log is not poisoned")
+                .extend(canonical.batches.iter().map(RecordBatch::num_rows));
             Ok(crate::contracts::FrameAdmission {
                 batch_id: uuid::Uuid::now_v7(),
                 rows_accepted: 0,
-                otlp_outcome: Some(ScribeOtlpOutcome::Traces(
-                    crate::otlp_contract::IngestOutcome {
-                        accepted_spans: 0,
-                        rejected_spans: 0,
-                        rejection_message: None,
-                    },
-                )),
             })
         }
     }
@@ -1278,9 +1279,7 @@ mod tests {
     async fn gate_enforces_bifrost_record_write() {
         let scribe_calls = Arc::new(AtomicUsize::new(0));
         let gate = Gate::with_test_scribe(
-            Arc::new(CountingScribe {
-                calls: Arc::clone(&scribe_calls),
-            }),
+            Arc::new(CountingScribe::new(Arc::clone(&scribe_calls))),
             test_interceptor(),
             IngestLimits::default(),
         );
@@ -1307,13 +1306,68 @@ mod tests {
         assert!(gate.authenticate(&metadata).await.is_err());
     }
 
+    /// One valid span in `resource_spans` position `index`, or an invalid one.
+    ///
+    /// An invalid span carries a truncated trace id, which the canonical trace
+    /// projection rejects whole while accepting its siblings.
+    fn span_resource(index: u8, valid: bool) -> wyrd_tonic::otlp::trace::v1::ResourceSpans {
+        wyrd_tonic::otlp::trace::v1::ResourceSpans {
+            scope_spans: vec![wyrd_tonic::otlp::trace::v1::ScopeSpans {
+                spans: vec![wyrd_tonic::otlp::trace::v1::Span {
+                    trace_id: if valid { vec![index; 16] } else { vec![index; 3] },
+                    span_id: vec![index; 8],
+                    name: format!("span-{index}"),
+                    start_time_unix_nano: 1,
+                    end_time_unix_nano: 2,
+                    ..wyrd_tonic::otlp::trace::v1::Span::default()
+                }],
+                ..wyrd_tonic::otlp::trace::v1::ScopeSpans::default()
+            }],
+            ..wyrd_tonic::otlp::trace::v1::ResourceSpans::default()
+        }
+    }
+
+    /// Gate projects a mixed OTLP export into exactly the accepted rows (S1).
+    ///
+    /// Scribe receives one canonical batch whose row count equals the accepted
+    /// span count, so the ordinals it stamps form one contiguous range starting
+    /// at zero with no gap left by a rejected span.
     #[tokio::test]
-    async fn gate_routes_logical_frame_without_catalog_resolution() {
+    async fn mixed_otlp_projection_assigns_only_accepted_contiguous_ordinals() {
+        let scribe_calls = Arc::new(AtomicUsize::new(0));
+        let scribe = Arc::new(CountingScribe::new(Arc::clone(&scribe_calls)));
+        let rows = Arc::clone(&scribe.rows);
+        let gate = Gate::with_test_scribe(scribe, test_interceptor(), IngestLimits::default());
+
+        let outcome = gate
+            .ingest_decoded_resource_spans(
+                &auth_context(true),
+                decoded_trace(ExportTraceServiceRequest {
+                    resource_spans: vec![
+                        span_resource(1, true),
+                        span_resource(2, false),
+                        span_resource(3, true),
+                    ],
+                }),
+            )
+            .await
+            .expect("Gate must route without consulting its catalog adapter");
+
+        assert_eq!((outcome.accepted_spans, outcome.rejected_spans), (2, 1));
+        assert!(outcome.rejection_message.is_some());
+        assert_eq!(scribe_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(*rows.lock().expect("row log is not poisoned"), vec![2]);
+    }
+
+    /// An export with no accepted span never reaches Scribe (S1).
+    ///
+    /// Gate still returns the projection's own partial-success outcome, so the
+    /// OTLP caller observes its rejections unchanged.
+    #[tokio::test]
+    async fn all_invalid_otlp_returns_existing_outcome_without_scribe() {
         let scribe_calls = Arc::new(AtomicUsize::new(0));
         let gate = Gate::with_test_scribe(
-            Arc::new(CountingScribe {
-                calls: Arc::clone(&scribe_calls),
-            }),
+            Arc::new(CountingScribe::new(Arc::clone(&scribe_calls))),
             test_interceptor(),
             IngestLimits::default(),
         );
@@ -1321,21 +1375,23 @@ mod tests {
         let outcome = gate
             .ingest_decoded_resource_spans(
                 &auth_context(true),
-                decoded_trace(ExportTraceServiceRequest::default()),
+                decoded_trace(ExportTraceServiceRequest {
+                    resource_spans: vec![span_resource(1, false), span_resource(2, false)],
+                }),
             )
             .await
-            .expect("Gate must route without consulting its catalog adapter");
-        assert_eq!(outcome.accepted_spans, 0);
-        assert_eq!(scribe_calls.load(Ordering::Relaxed), 1);
+            .expect("a fully rejected export is a successful partial response");
+
+        assert_eq!((outcome.accepted_spans, outcome.rejected_spans), (0, 2));
+        assert!(outcome.rejection_message.is_some());
+        assert_eq!(scribe_calls.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
     async fn close_rejects_new_work_before_scribe_handoff() {
         let scribe_calls = Arc::new(AtomicUsize::new(0));
         let gate = Gate::with_test_scribe(
-            Arc::new(CountingScribe {
-                calls: Arc::clone(&scribe_calls),
-            }),
+            Arc::new(CountingScribe::new(Arc::clone(&scribe_calls))),
             test_interceptor(),
             IngestLimits::default(),
         );

@@ -211,7 +211,7 @@ async fn ingest_as(
             request_id,
             batch_id,
             measured_wire_bytes: 0,
-            payload: IngressPayload::ProjectedArrow(vec![rows]),
+            payload: IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![rows])),
         },
     )
     .await
@@ -244,7 +244,7 @@ async fn ingest_value(
             request_id,
             batch_id,
             measured_wire_bytes: 0,
-            payload: IngressPayload::ProjectedArrow(vec![rows]),
+            payload: IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![rows])),
         },
     )
     .await
@@ -277,7 +277,7 @@ async fn ingest_measured(
             request_id,
             batch_id,
             measured_wire_bytes,
-            payload: IngressPayload::ProjectedArrow(vec![rows]),
+            payload: IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![rows])),
         },
     )
     .await

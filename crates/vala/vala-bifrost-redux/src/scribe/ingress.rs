@@ -651,7 +651,7 @@ mod tests {
     use super::{ScribeImpl, take_transport_decode_owner, validate_decoded_request_size};
     use crate::catalog::TableRef;
     use crate::contracts::{
-        DecodedOtlp, IngressPayload, Scribe, ScribeError, ScribeIngressFrame,
+        CanonicalIngress, IngressPayload, Scribe, ScribeError, ScribeIngressFrame,
         projected_source_schema_fingerprint,
     };
     use crate::namespaces::BifrostNamespace;
@@ -665,51 +665,39 @@ mod tests {
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::PrincipalId;
     use wyrd_spec::request_id::RequestId;
-    use wyrd_tonic::otlp::logs_service::ExportLogsServiceRequest;
-    use wyrd_tonic::otlp::metrics_service::ExportMetricsServiceRequest;
-    use wyrd_tonic::otlp::trace_service::ExportTraceServiceRequest;
 
-    /// Every typed OTLP payload fails closed without its adapter decode owner.
+    /// The Scribe ingress boundary carries no OTLP signal payload (S4).
+    ///
+    /// `IngressPayload` is closed over exactly the native transport frame and
+    /// Gate-validated canonical batches. Neither variant can name a typed OTLP
+    /// request, so Scribe cannot reacquire signal mapping authority without a
+    /// contract change that fails this test.
     #[test]
-    fn otlp_transport_requires_one_decode_owner() {
-        let mut payloads = [
-            IngressPayload::OtlpTraces(DecodedOtlp {
-                request: Box::new(ExportTraceServiceRequest::default()),
-                wire_bytes: 0,
-                decode_bytes: 0,
-                owner: None,
-            }),
-            IngressPayload::OtlpMetrics(DecodedOtlp {
-                request: Box::new(ExportMetricsServiceRequest::default()),
-                wire_bytes: 0,
-                decode_bytes: 0,
-                owner: None,
-            }),
-            IngressPayload::OtlpLogs(DecodedOtlp {
-                request: Box::new(ExportLogsServiceRequest::default()),
-                wire_bytes: 0,
-                decode_bytes: 0,
-                owner: None,
-            }),
-        ];
-        for payload in &mut payloads {
-            assert!(matches!(
-                take_transport_decode_owner(payload),
-                Err(ScribeError::InvalidFrame)
-            ));
-        }
-
+    fn scribe_boundary_contains_no_otlp_signal_payload() {
         let mut native = IngressPayload::ArrowIpc(bytes::Bytes::new());
         assert!(
             take_transport_decode_owner(&mut native)
                 .expect("native owner branch")
                 .is_none()
         );
-        let mut projected = IngressPayload::ProjectedArrow(Vec::new());
+        let mut canonical = IngressPayload::Canonical(CanonicalIngress::unreserved(Vec::new()));
         assert!(
-            take_transport_decode_owner(&mut projected)
-                .expect("projected owner branch")
+            take_transport_decode_owner(&mut canonical)
+                .expect("canonical owner branch")
                 .is_none()
+        );
+        let boundary =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/contracts.rs"))
+                .expect("read the Scribe ingress contract");
+        let payload = boundary
+            .split("pub enum IngressPayload {")
+            .nth(1)
+            .and_then(|rest| rest.split_once('}'))
+            .expect("locate the IngressPayload variants")
+            .0;
+        assert!(
+            !payload.contains("Otlp"),
+            "IngressPayload regained an OTLP signal variant: {payload}"
         );
     }
 
@@ -812,7 +800,7 @@ mod tests {
                 detail: None,
             },
             measured_wire_bytes: 0,
-            payload: IngressPayload::ProjectedArrow(vec![rows]),
+            payload: IngressPayload::Canonical(CanonicalIngress::unreserved(vec![rows])),
         }
     }
 

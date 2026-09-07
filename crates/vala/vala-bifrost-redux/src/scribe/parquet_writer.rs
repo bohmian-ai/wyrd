@@ -1031,9 +1031,10 @@ fn inspect_sealed_artifact(
 /// The projection is the managed Iceberg writer's own footer-to-`DataFile`
 /// conversion, so the per-column sizes, counts, and bounds Scribe persists are
 /// exactly the ones a catalog promoter would compute from the same object.
-/// Field ids come from the same automatic assignment the Bifrost catalog used
-/// when it created the physical table, which is what makes the ids in this
-/// projection the table's ids rather than a private numbering.
+/// Field ids come from the same conversion the Bifrost catalog used when it
+/// created the physical table — the canonical table's own declared ids, or the
+/// automatic assignment for a dynamic table — which is what makes the ids in
+/// this projection the table's ids rather than a private numbering.
 ///
 /// # Errors
 ///
@@ -1046,10 +1047,11 @@ fn derive_data_file_metrics(
     object_identity: &str,
     file_size: u64,
 ) -> Result<crate::scribe::promotion::ScribeDataFileV1, ScribeError> {
-    let iceberg_schema = iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(expected_schema)
-        .map_err(|error| ScribeError::Internal {
+    let iceberg_schema = crate::tables::iceberg_schema_for(expected_schema).map_err(|error| {
+        ScribeError::Internal {
             detail: format!("sealed artifact schema has no Iceberg projection: {error}"),
-        })?;
+        }
+    })?;
     let written = usize::try_from(file_size).map_err(|_| ScribeError::Internal {
         detail: "sealed artifact size exceeds address space".to_owned(),
     })?;

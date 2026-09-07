@@ -354,6 +354,93 @@ impl ResolvedSchemaIdentity {
     }
 }
 
+/// Convert one physical Arrow schema into its Iceberg schema.
+///
+/// A canonical signal table declares an immutable stable id on every field,
+/// including every nested child, so its Iceberg schema must adopt those ids
+/// rather than a positional assignment. A dynamic user table declares none and
+/// keeps the existing automatic assignment. The distinction is read from the
+/// schema itself, so no consumer needs to know which table it holds.
+///
+/// # Errors
+///
+/// Propagates the Iceberg conversion error when the schema has no Iceberg
+/// projection.
+pub fn iceberg_schema_for(schema: &Schema) -> Result<iceberg::spec::Schema, iceberg::Error> {
+    if declares_stable_field_ids(schema) {
+        iceberg::arrow::arrow_schema_to_schema(schema)
+    } else {
+        iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(schema)
+    }
+}
+
+/// Report whether every top-level field carries a stable field id.
+///
+/// An empty schema declares none, which keeps the automatic assignment for the
+/// degenerate case rather than claiming canonical identity.
+fn declares_stable_field_ids(schema: &Schema) -> bool {
+    !schema.fields().is_empty()
+        && schema
+            .fields()
+            .iter()
+            .all(|field| field.metadata().contains_key(fields::PARQUET_FIELD_ID))
+}
+
+/// Report whether an actual Arrow type is the expected one after a storage
+/// round trip.
+///
+/// The installed Iceberg conversion normalizes some Arrow types on the way
+/// back — a binary or string column widens to its large variant, a list may
+/// return as a large list, and a zoned timestamp may return as `+00:00` — so a
+/// physical table's schema is compared by shape rather than by exact equality.
+/// Nested children are compared by name, never by position.
+#[must_use]
+pub fn arrow_type_shape_matches(
+    expected: &arrow::datatypes::DataType,
+    actual: &arrow::datatypes::DataType,
+) -> bool {
+    use arrow::datatypes::DataType as Arrow;
+    if expected.equals_datatype(actual) {
+        return true;
+    }
+    match (expected, actual) {
+        (Arrow::Binary, Arrow::LargeBinary)
+        | (Arrow::LargeBinary, Arrow::Binary)
+        | (Arrow::Utf8, Arrow::LargeUtf8)
+        | (Arrow::LargeUtf8, Arrow::Utf8) => true,
+        (Arrow::List(expected), Arrow::List(actual) | Arrow::LargeList(actual))
+        | (Arrow::LargeList(expected), Arrow::List(actual) | Arrow::LargeList(actual)) => {
+            expected.is_nullable() == actual.is_nullable()
+                && arrow_type_shape_matches(expected.data_type(), actual.data_type())
+        }
+        (Arrow::Struct(expected), Arrow::Struct(actual)) => {
+            expected.len() == actual.len()
+                && expected.iter().all(|field| {
+                    actual
+                        .iter()
+                        .find(|candidate| candidate.name() == field.name())
+                        .is_some_and(|candidate| {
+                            field.is_nullable() == candidate.is_nullable()
+                                && arrow_type_shape_matches(
+                                    field.data_type(),
+                                    candidate.data_type(),
+                                )
+                        })
+                })
+        }
+        (
+            arrow::datatypes::DataType::Timestamp(expected_unit, Some(expected_timezone)),
+            arrow::datatypes::DataType::Timestamp(actual_unit, Some(actual_timezone)),
+        ) => {
+            expected_unit == actual_unit
+                && ((expected_timezone.as_ref() == "UTC" && actual_timezone.as_ref() == "+00:00")
+                    || (expected_timezone.as_ref() == "+00:00"
+                        && actual_timezone.as_ref() == "UTC"))
+        }
+        _ => false,
+    }
+}
+
 /// Version byte prefixing every canonical physical fingerprint encoding.
 ///
 /// Any change to the encoding below must take the next unused version byte so
@@ -556,10 +643,37 @@ fn fingerprint_fields(fields: &[Field]) -> [u8; 32] {
     for field in fields {
         hasher.update(field.name().as_bytes());
         hasher.update(b"\0");
-        hasher.update(format!("{:?}", field.data_type()).as_bytes());
+        hasher.update(format!("{:?}", strip_metadata(field.data_type())).as_bytes());
         hasher.update(b"\0");
     }
     hasher.finalize().into()
+}
+
+/// Return one Arrow type with every nested field's metadata removed.
+///
+/// A nested type's `Debug` rendering includes its children's metadata map,
+/// whose iteration order is not stable across `HashMap` instances. Stripping it
+/// keeps the catalog fingerprint a function of names and types alone, which is
+/// what it has always claimed to be; the stable ids and sensitivity markers the
+/// metadata carries are committed by
+/// [`CanonicalPhysicalFingerprint`] instead.
+fn strip_metadata(data_type: &DataType) -> DataType {
+    match data_type {
+        DataType::List(child) => DataType::List(std::sync::Arc::new(bare_field(child))),
+        DataType::Struct(children) => {
+            DataType::Struct(children.iter().map(|child| bare_field(child)).collect())
+        }
+        other => other.clone(),
+    }
+}
+
+/// Return one field with no metadata and a metadata-free nested type.
+fn bare_field(field: &Field) -> Field {
+    Field::new(
+        field.name(),
+        strip_metadata(field.data_type()),
+        field.is_nullable(),
+    )
 }
 
 const fn definition<T: DomainTable>() -> BuiltinTableDefinition {
@@ -623,6 +737,11 @@ pub fn builtin_fqns() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use arrow::datatypes::{DataType, TimeUnit as ArrowTimeUnit};
+    use arrow::record_batch::RecordBatch;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use wyrd_tonic::otlp::common::v1::any_value::Value;
+    use wyrd_tonic::otlp::common::v1::{AnyValue, KeyValue};
 
     use super::*;
     use wyrd_spec::vala::{CARD_UID, PRINCIPAL_ID, RUN_ID};
@@ -973,6 +1092,341 @@ mod tests {
             CorrelationPolicy::Observation
                 .appended_correlation_columns()
                 .contains(&PRINCIPAL_ID)
+        );
+    }
+
+    /// One attribute entry used by the round-trip fixtures.
+    fn attribute(key: &str, value: Value) -> KeyValue {
+        KeyValue {
+            key: key.to_owned(),
+            value: Some(AnyValue { value: Some(value) }),
+        }
+    }
+
+    /// One span carrying a nested event, a link, and an entity reference.
+    fn span_fixture() -> Vec<wyrd_tonic::otlp::trace::v1::ResourceSpans> {
+        use wyrd_tonic::otlp::trace::v1::{ResourceSpans, ScopeSpans, Span, span};
+        vec![ResourceSpans {
+            resource: Some(wyrd_tonic::otlp::resource::v1::Resource {
+                attributes: vec![attribute(
+                    "service.name",
+                    Value::StringValue("wyrd".to_owned()),
+                )],
+                dropped_attributes_count: 0,
+                entity_refs: Vec::new(),
+            }),
+            scope_spans: vec![ScopeSpans {
+                scope: None,
+                spans: vec![Span {
+                    trace_id: vec![1; 16],
+                    span_id: vec![2; 8],
+                    trace_state: String::new(),
+                    parent_span_id: Vec::new(),
+                    flags: 0,
+                    name: "round-trip".to_owned(),
+                    kind: span::SpanKind::Internal as i32,
+                    start_time_unix_nano: 1,
+                    end_time_unix_nano: 2,
+                    attributes: vec![attribute("k", Value::IntValue(1))],
+                    dropped_attributes_count: 0,
+                    events: vec![span::Event {
+                        time_unix_nano: 1,
+                        name: "event".to_owned(),
+                        attributes: Vec::new(),
+                        dropped_attributes_count: 0,
+                    }],
+                    dropped_events_count: 0,
+                    links: vec![span::Link {
+                        trace_id: vec![3; 16],
+                        span_id: vec![4; 8],
+                        trace_state: String::new(),
+                        attributes: Vec::new(),
+                        dropped_attributes_count: 0,
+                        flags: 0,
+                    }],
+                    dropped_links_count: 0,
+                    status: None,
+                }],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }]
+    }
+
+    /// One log record carrying a body and an attribute payload.
+    fn log_fixture() -> Vec<wyrd_tonic::otlp::logs::v1::ResourceLogs> {
+        use wyrd_tonic::otlp::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+        vec![ResourceLogs {
+            resource: None,
+            scope_logs: vec![ScopeLogs {
+                scope: None,
+                log_records: vec![LogRecord {
+                    body: Some(AnyValue {
+                        value: Some(Value::StringValue("round-trip".to_owned())),
+                    }),
+                    attributes: vec![attribute("k", Value::BoolValue(true))],
+                    ..LogRecord::default()
+                }],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }]
+    }
+
+    /// One histogram point carrying nested buckets and bounds.
+    fn metric_fixture() -> Vec<wyrd_tonic::otlp::metrics::v1::ResourceMetrics> {
+        use wyrd_tonic::otlp::metrics::v1::{
+            Histogram, HistogramDataPoint, Metric, ResourceMetrics, ScopeMetrics, metric,
+        };
+        vec![ResourceMetrics {
+            resource: None,
+            scope_metrics: vec![ScopeMetrics {
+                scope: None,
+                metrics: vec![Metric {
+                    name: "round.trip".to_owned(),
+                    description: String::new(),
+                    unit: String::new(),
+                    metadata: Vec::new(),
+                    data: Some(metric::Data::Histogram(Histogram {
+                        data_points: vec![HistogramDataPoint {
+                            attributes: Vec::new(),
+                            start_time_unix_nano: 1,
+                            time_unix_nano: 2,
+                            count: 3,
+                            sum: Some(1.0),
+                            bucket_counts: vec![1, 2],
+                            explicit_bounds: vec![0.5],
+                            exemplars: Vec::new(),
+                            flags: 0,
+                            min: None,
+                            max: None,
+                        }],
+                        aggregation_temporality: 1,
+                    })),
+                }],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }]
+    }
+
+    /// Recursively assert two field sequences agree by declared identity.
+    ///
+    /// Binding is by stable id and name, never by position, so a reordering
+    /// storage layer cannot silently pass.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a declared field is missing from `actual`, or when its type,
+    /// nullability, or stable id differs.
+    fn assert_identity_matches(expected: &Fields, actual: &Fields, context: &str) {
+        assert_eq!(
+            expected.len(),
+            actual.len(),
+            "{context} keeps its declared field count"
+        );
+        for field in expected {
+            let found = actual
+                .iter()
+                .find(|candidate| candidate.name() == field.name())
+                .unwrap_or_else(|| panic!("{context} keeps field {}", field.name()));
+            assert_field_pair(field, found, context);
+        }
+    }
+
+    /// Assert one declared field and its round-tripped counterpart agree.
+    ///
+    /// A list's single element is matched positionally because the Iceberg
+    /// projection renames it to `element`; everything else is matched by name.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the stable id, nullability, type shape, or any nested child
+    /// differs.
+    fn assert_field_pair(expected: &Field, actual: &Field, context: &str) {
+        assert_eq!(
+            stable_field_id(expected).expect("declared stable id"),
+            stable_field_id(actual).expect("round-tripped stable id"),
+            "{context} keeps the stable id of {}",
+            expected.name()
+        );
+        assert_eq!(
+            expected.is_nullable(),
+            actual.is_nullable(),
+            "{context} keeps the nullability of {}",
+            expected.name()
+        );
+        assert!(
+            arrow_type_shape_matches(expected.data_type(), actual.data_type()),
+            "{context} keeps the type of {}: {:?} became {:?}",
+            expected.name(),
+            expected.data_type(),
+            actual.data_type()
+        );
+        match (expected.data_type(), actual.data_type()) {
+            (
+                DataType::List(expected_child) | DataType::LargeList(expected_child),
+                DataType::List(actual_child) | DataType::LargeList(actual_child),
+            ) => assert_field_pair(expected_child, actual_child, context),
+            (DataType::Struct(expected_children), DataType::Struct(actual_children)) => {
+                assert_identity_matches(expected_children, actual_children, context);
+            }
+            _ => {}
+        }
+    }
+
+    /// Round-trip one canonical batch through Arrow IPC and read it back.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the batch cannot be written or read back.
+    fn ipc_round_trip(batch: &RecordBatch) -> RecordBatch {
+        let mut buffer: Vec<u8> = Vec::new();
+        let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut buffer, &batch.schema())
+            .expect("canonical schema is IPC writable");
+        writer
+            .write(batch)
+            .expect("canonical batch is IPC writable");
+        writer.finish().expect("the IPC stream finishes");
+        let mut reader =
+            arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(buffer), None)
+                .expect("the IPC stream is readable");
+        reader
+            .next()
+            .expect("the IPC stream carries one batch")
+            .expect("the IPC batch decodes")
+    }
+
+    /// Round-trip one canonical batch through Parquet and read it back.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the batch cannot be written or read back.
+    fn parquet_round_trip(batch: &RecordBatch) -> RecordBatch {
+        let mut buffer: Vec<u8> = Vec::new();
+        let mut writer = parquet::arrow::ArrowWriter::try_new(&mut buffer, batch.schema(), None)
+            .expect("canonical schema is Parquet writable");
+        writer
+            .write(batch)
+            .expect("canonical batch is Parquet writable");
+        writer.close().expect("the Parquet footer writes");
+        let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+            bytes::Bytes::from(buffer),
+        )
+        .expect("the Parquet object is readable")
+        .build()
+        .expect("the Parquet reader builds");
+        arrow::compute::concat_batches(
+            &Arc::new(Schema::new(batch.schema().fields().clone())),
+            &reader
+                .map(|batch| batch.expect("the Parquet batch decodes"))
+                .collect::<Vec<_>>(),
+        )
+        .expect("the Parquet batches concatenate")
+    }
+
+    /// The canonical schemas survive Arrow, IPC, Parquet, and Iceberg intact.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a stable id, name, nested type, nullability, or value is
+    /// lost by any leg of the round trip.
+    #[test]
+    fn canonical_signal_schemas_round_trip_arrow_parquet_and_iceberg() {
+        let (spans, _) = crate::tables::traces::project_resource_spans(&span_fixture())
+            .expect("the span fixture projects");
+        let (logs, _) = crate::tables::logs::project_resource_logs(&log_fixture())
+            .expect("the log fixture projects");
+        let (points, _) = crate::tables::metrics::project_resource_metrics(&metric_fixture())
+            .expect("the metric fixture projects");
+
+        for (label, batch) in [("spans", spans), ("logs", logs), ("points", points)] {
+            let declared = batch.schema().fields().clone();
+            assert!(batch.num_rows() > 0, "{label} fixture produces rows");
+
+            let ipc = ipc_round_trip(&batch);
+            assert_identity_matches(&declared, ipc.schema().fields(), label);
+            assert_eq!(ipc, batch, "{label} keeps every value through IPC");
+
+            let parquet = parquet_round_trip(&batch);
+            assert_identity_matches(&declared, parquet.schema().fields(), label);
+            assert_eq!(
+                parquet.columns(),
+                batch.columns(),
+                "{label} keeps every value through Parquet"
+            );
+
+            let iceberg = iceberg_schema_for(&Schema::new(declared.clone()))
+                .expect("the canonical schema converts to Iceberg");
+            let restored = iceberg::arrow::schema_to_arrow_schema(&iceberg)
+                .expect("the Iceberg schema converts back to Arrow");
+            assert_identity_matches(&declared, restored.fields(), label);
+        }
+    }
+
+    /// The canonical fingerprint encoding is byte-stable.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the pre-hash encoding or its digest differs from the pinned
+    /// golden, which would silently change every canonical table's identity.
+    #[test]
+    fn canonical_physical_fingerprint_bytes_are_stable() {
+        let child = Field::new("item", DataType::Utf8, true).with_metadata(HashMap::from([
+            (fields::WYRD_SENSITIVE.to_owned(), "true".to_owned()),
+            (fields::PARQUET_FIELD_ID.to_owned(), "3".to_owned()),
+        ]));
+        let naive = Field::new(
+            "naive",
+            DataType::Timestamp(ArrowTimeUnit::Microsecond, None),
+            false,
+        )
+        .with_metadata(HashMap::from([
+            (fields::WYRD_SENSITIVE.to_owned(), "false".to_owned()),
+            (fields::PARQUET_FIELD_ID.to_owned(), "2".to_owned()),
+        ]));
+        let zoned = Field::new(
+            "zoned",
+            DataType::Timestamp(ArrowTimeUnit::Microsecond, Some("".into())),
+            true,
+        )
+        .with_metadata(HashMap::from([
+            (fields::PARQUET_FIELD_ID.to_owned(), "4".to_owned()),
+            (fields::WYRD_SENSITIVE.to_owned(), "false".to_owned()),
+        ]));
+        let nested = Field::new(
+            "nested",
+            DataType::Struct(Fields::from(vec![
+                Field::new("values", DataType::List(Arc::new(child)), false).with_metadata(
+                    HashMap::from([
+                        (fields::WYRD_SENSITIVE.to_owned(), "true".to_owned()),
+                        (fields::PARQUET_FIELD_ID.to_owned(), "5".to_owned()),
+                    ]),
+                ),
+            ])),
+            true,
+        )
+        .with_metadata(HashMap::from([
+            (fields::PARQUET_FIELD_ID.to_owned(), "1".to_owned()),
+            (fields::WYRD_SENSITIVE.to_owned(), "false".to_owned()),
+        ]));
+
+        let schema = Fields::from(vec![nested, naive, zoned]);
+        let bytes = canonical_physical_fingerprint_bytes(&schema).expect("the schema encodes");
+        let hex = bytes.iter().fold(String::new(), |mut hex, byte| {
+            use std::fmt::Write as _;
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        });
+        assert_eq!(
+            hex,
+            "010000000300000001000000066e65737465640c01000000000200000010504152515545543a6669656c645f696400000001310000000e777972643a73656e7369746976650000000566616c736500000001000000050000000676616c7565730b00010000000200000010504152515545543a6669656c645f696400000001350000000e777972643a73656e73697469766500000004747275650000000100000003000000046974656d0701010000000200000010504152515545543a6669656c645f696400000001330000000e777972643a73656e73697469766500000004747275650000000000000002000000056e616976650a020000000000000200000010504152515545543a6669656c645f696400000001320000000e777972643a73656e7369746976650000000566616c73650000000000000004000000057a6f6e65640a02010000000001000000000200000010504152515545543a6669656c645f696400000001340000000e777972643a73656e7369746976650000000566616c736500000000"
+        );
+        assert_eq!(
+            CanonicalPhysicalFingerprint::from_physical_fields(&schema)
+                .expect("the schema fingerprints")
+                .to_hex(),
+            "e33647f94358ef330ddd8a07e3533b5e15d485530191c73c450c7d3d36cba269"
         );
     }
 }

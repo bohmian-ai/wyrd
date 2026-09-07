@@ -25,10 +25,10 @@ use crate::otlp_contract::IngestOutcome;
 use crate::tables::TableError;
 use crate::tables::fields::canonical_arrow_fields;
 use crate::tables::signal::{
-    ResourceEnvelope, ScopeEnvelope, binary_column, bool_column, encode_attributes,
-    fixed_binary_column, fixed_binary_opt_column, i32_column, i32_opt_column, i64_opt_column,
-    internal, last_attribute, last_string_attribute, list_column, nested_fields, span_id_bytes,
-    struct_column, trace_id_bytes, u32_column, u64_column, utf8_column, utf8_opt_column,
+    ResourceEnvelope, ScopeEnvelope, binary_column, bool_column, checked_i64, encode_attributes,
+    fixed_binary_column, fixed_binary_opt_column, i32_column, i32_opt_column, i64_column,
+    i64_opt_column, internal, last_attribute, last_string_attribute, list_column, nested_fields,
+    span_id_bytes, struct_column, trace_id_bytes, u32_as_i64_column, utf8_column, utf8_opt_column,
 };
 
 /// Largest accepted span or event name, in bytes.
@@ -179,16 +179,16 @@ struct SpanColumns {
     flags: Vec<u32>,
     name: Vec<String>,
     kind: Vec<i32>,
-    start_time_unix_nano: Vec<u64>,
-    end_time_unix_nano: Vec<u64>,
-    duration_nano: Vec<u64>,
+    start_time_unix_nano: Vec<i64>,
+    end_time_unix_nano: Vec<i64>,
+    duration_nano: Vec<i64>,
     status_present: Vec<bool>,
     status_code: Vec<Option<i32>>,
     status_message: Vec<Option<String>>,
     attributes: Vec<Vec<u8>>,
     dropped_attributes_count: Vec<u32>,
     event_lengths: Vec<Option<usize>>,
-    event_time: Vec<u64>,
+    event_time: Vec<i64>,
     event_name: Vec<String>,
     event_attributes: Vec<Vec<u8>>,
     event_dropped: Vec<u32>,
@@ -251,9 +251,11 @@ impl SpanColumns {
         if unique_keys(&span.attributes) > MAX_SPAN_ATTRIBUTE_KEYS {
             return Err("span declares too many distinct attribute keys");
         }
-        let duration = span
-            .end_time_unix_nano
-            .checked_sub(span.start_time_unix_nano)
+        let start = checked_i64(span.start_time_unix_nano)?;
+        let end = checked_i64(span.end_time_unix_nano)?;
+        let duration = end
+            .checked_sub(start)
+            .filter(|duration| *duration >= 0)
             .ok_or("span ends before it starts")?;
 
         let promotions = GenAiPromotions::extract(&span.attributes)?;
@@ -269,8 +271,8 @@ impl SpanColumns {
         self.flags.push(span.flags);
         self.name.push(span.name.clone());
         self.kind.push(span.kind);
-        self.start_time_unix_nano.push(span.start_time_unix_nano);
-        self.end_time_unix_nano.push(span.end_time_unix_nano);
+        self.start_time_unix_nano.push(start);
+        self.end_time_unix_nano.push(end);
         self.duration_nano.push(duration);
         self.status_present.push(span.status.is_some());
         self.status_code
@@ -366,7 +368,10 @@ impl SpanColumns {
     /// Append one validated span's ordered events into the flattened storage.
     fn push_events(&mut self, span: &Span) {
         for event in &span.events {
-            self.event_time.push(event.time_unix_nano);
+            self.event_time.push(
+                checked_i64(event.time_unix_nano)
+                    .expect("a validated event time never exceeds its span's checked end"),
+            );
             self.event_name.push(event.name.clone());
             self.event_attributes
                 .push(encode_attributes(&event.attributes));
@@ -403,10 +408,10 @@ impl SpanColumns {
         let events = struct_column(
             &event_children,
             vec![
-                u64_column(self.event_time),
+                i64_column(self.event_time),
                 utf8_column(self.event_name),
                 binary_column(&self.event_attributes),
-                u32_column(self.event_dropped),
+                u32_as_i64_column(self.event_dropped),
             ],
             None,
         )
@@ -417,9 +422,9 @@ impl SpanColumns {
                 fixed_binary_column(16, &self.link_trace_id).map_err(internal)?,
                 fixed_binary_column(8, &self.link_span_id).map_err(internal)?,
                 utf8_column(self.link_trace_state),
-                u32_column(self.link_flags),
+                u32_as_i64_column(self.link_flags),
                 binary_column(&self.link_attributes),
-                u32_column(self.link_dropped),
+                u32_as_i64_column(self.link_dropped),
             ],
             None,
         )
@@ -432,26 +437,26 @@ impl SpanColumns {
             fixed_binary_column(8, &self.span_id).map_err(internal)?,
             fixed_binary_opt_column(8, &self.parent_span_id).map_err(internal)?,
             utf8_column(self.trace_state),
-            u32_column(self.flags),
+            u32_as_i64_column(self.flags),
             utf8_column(self.name),
             i32_column(self.kind),
-            u64_column(self.start_time_unix_nano),
-            u64_column(self.end_time_unix_nano),
-            u64_column(self.duration_nano),
+            i64_column(self.start_time_unix_nano),
+            i64_column(self.end_time_unix_nano),
+            i64_column(self.duration_nano),
             bool_column(self.status_present),
             i32_opt_column(self.status_code),
             utf8_opt_column(self.status_message),
             binary_column(&self.attributes),
-            u32_column(self.dropped_attributes_count),
+            u32_as_i64_column(self.dropped_attributes_count),
             list_column(&SPAN_EVENT_ELEMENT.to_arrow(), events, &self.event_lengths)
                 .map_err(internal)?,
-            u32_column(self.dropped_events_count),
+            u32_as_i64_column(self.dropped_events_count),
             list_column(&SPAN_LINK_ELEMENT.to_arrow(), links, &self.link_lengths)
                 .map_err(internal)?,
-            u32_column(self.dropped_links_count),
+            u32_as_i64_column(self.dropped_links_count),
             bool_column(self.resource_present),
             binary_column(&self.resource_attributes),
-            u32_column(self.resource_dropped_attributes_count),
+            u32_as_i64_column(self.resource_dropped_attributes_count),
             utf8_column(self.resource_schema_url),
             list_column(
                 &RESOURCE_ENTITY_REF_ELEMENT.to_arrow(),
@@ -463,7 +468,7 @@ impl SpanColumns {
             utf8_column(self.scope_name),
             utf8_column(self.scope_version),
             binary_column(&self.scope_attributes),
-            u32_column(self.scope_dropped_attributes_count),
+            u32_as_i64_column(self.scope_dropped_attributes_count),
             utf8_column(self.scope_schema_url),
             utf8_opt_column(self.service_name),
             utf8_opt_column(gen_ai_strings.next().unwrap_or_default()),

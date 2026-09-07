@@ -11,7 +11,7 @@
 
 use arrow::array::{
     Array, ArrayRef, BinaryArray, BinaryBuilder, BooleanArray, FixedSizeBinaryArray, Float64Array,
-    Int32Array, Int64Array, ListArray, StringArray, StructArray, UInt32Array, UInt64Array,
+    Int32Array, Int64Array, ListArray, StringArray, StructArray,
 };
 use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, Field, Fields, Schema};
@@ -326,22 +326,33 @@ pub fn bool_opt_column(values: Vec<Option<bool>>) -> ArrayRef {
     Arc::new(BooleanArray::from(values))
 }
 
-/// Build a non-nullable unsigned 32-bit column.
+/// Build a non-nullable signed 64-bit column from unsigned protocol counters.
+///
+/// Unsigned 32-bit protocol values widen losslessly, and signed 64 is the only
+/// integer width the installed Iceberg conversion accepts on both legs of a
+/// round trip, so the canonical ledger declares no unsigned column.
 #[must_use]
-pub fn u32_column(values: Vec<u32>) -> ArrayRef {
-    Arc::new(UInt32Array::from(values))
+pub fn u32_as_i64_column(values: Vec<u32>) -> ArrayRef {
+    Arc::new(Int64Array::from(
+        values.into_iter().map(i64::from).collect::<Vec<_>>(),
+    ))
 }
 
-/// Build a non-nullable unsigned 64-bit column.
+/// Build a non-nullable signed 64-bit column.
 #[must_use]
-pub fn u64_column(values: Vec<u64>) -> ArrayRef {
-    Arc::new(UInt64Array::from(values))
+pub fn i64_column(values: Vec<i64>) -> ArrayRef {
+    Arc::new(Int64Array::from(values))
 }
 
-/// Build a nullable unsigned 64-bit column.
-#[must_use]
-pub fn u64_opt_column(values: Vec<Option<u64>>) -> ArrayRef {
-    Arc::new(UInt64Array::from(values))
+/// Widen one unsigned 64-bit protocol value into the declared signed column.
+///
+/// # Errors
+///
+/// Returns a stable reason when the value exceeds [`i64::MAX`], which no real
+/// nanosecond timestamp or observation count reaches and which the durable
+/// column cannot represent.
+pub fn checked_i64(value: u64) -> Result<i64, &'static str> {
+    i64::try_from(value).map_err(|_| "unsigned protocol value exceeds the durable column width")
 }
 
 /// Build a non-nullable signed 32-bit column.

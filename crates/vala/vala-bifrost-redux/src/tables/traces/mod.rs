@@ -14,7 +14,7 @@ pub use spans::SpansTable;
 mod tests {
     use arrow::array::{
         Array, BinaryArray, BooleanArray, FixedSizeBinaryArray, Int32Array, Int64Array, ListArray,
-        StringArray, StructArray, UInt32Array, UInt64Array,
+        StringArray, StructArray,
     };
     use arrow::record_batch::RecordBatch;
     use std::sync::Arc;
@@ -210,21 +210,21 @@ mod tests {
             typed::<StringArray>(&batch, "trace_state").value(0),
             "vendor=value"
         );
-        assert_eq!(typed::<UInt32Array>(&batch, "flags").value(0), 0x0000_0101);
+        assert_eq!(typed::<Int64Array>(&batch, "flags").value(0), 0x0000_0101);
         assert_eq!(typed::<StringArray>(&batch, "name").value(0), "POST /chat");
         assert_eq!(
             typed::<Int32Array>(&batch, "kind").value(0),
             span::SpanKind::Server as i32
         );
         assert_eq!(
-            typed::<UInt64Array>(&batch, "start_time_unix_nano").value(0),
+            typed::<Int64Array>(&batch, "start_time_unix_nano").value(0),
             1_700_000_000_000_000_000
         );
         assert_eq!(
-            typed::<UInt64Array>(&batch, "end_time_unix_nano").value(0),
+            typed::<Int64Array>(&batch, "end_time_unix_nano").value(0),
             1_700_000_000_000_000_500
         );
-        assert_eq!(typed::<UInt64Array>(&batch, "duration_nano").value(0), 500);
+        assert_eq!(typed::<Int64Array>(&batch, "duration_nano").value(0), 500);
         assert!(typed::<BooleanArray>(&batch, "status_present").value(0));
         assert_eq!(typed::<Int32Array>(&batch, "status_code").value(0), 2);
         assert_eq!(
@@ -236,15 +236,15 @@ mod tests {
             encode_attributes(&attributes).as_slice()
         );
         assert_eq!(
-            typed::<UInt32Array>(&batch, "dropped_attributes_count").value(0),
+            typed::<Int64Array>(&batch, "dropped_attributes_count").value(0),
             11
         );
         assert_eq!(
-            typed::<UInt32Array>(&batch, "dropped_events_count").value(0),
+            typed::<Int64Array>(&batch, "dropped_events_count").value(0),
             13
         );
         assert_eq!(
-            typed::<UInt32Array>(&batch, "dropped_links_count").value(0),
+            typed::<Int64Array>(&batch, "dropped_links_count").value(0),
             17
         );
 
@@ -298,7 +298,7 @@ mod tests {
         assert_eq!(event_names.value(1), "second");
         let event_times = events
             .column_by_name("time_unix_nano")
-            .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
+            .and_then(|column| column.as_any().downcast_ref::<Int64Array>())
             .expect("event time column");
         assert_eq!(event_times.value(0), 1_700_000_000_000_000_100);
         assert_eq!(event_times.value(1), 1_700_000_000_000_000_200);
@@ -329,7 +329,7 @@ mod tests {
         assert_eq!(linked_traces.value(1), &[6; 16]);
         let link_flags = links
             .column_by_name("flags")
-            .and_then(|column| column.as_any().downcast_ref::<UInt32Array>())
+            .and_then(|column| column.as_any().downcast_ref::<Int64Array>())
             .expect("link flag column");
         assert_eq!(link_flags.value(0), 0x0000_0201);
     }
@@ -343,7 +343,7 @@ mod tests {
     fn assert_span_context_and_promotions(batch: &RecordBatch) {
         assert!(typed::<BooleanArray>(batch, "resource_present").value(0));
         assert_eq!(
-            typed::<UInt32Array>(batch, "resource_dropped_attributes_count").value(0),
+            typed::<Int64Array>(batch, "resource_dropped_attributes_count").value(0),
             3
         );
         assert_eq!(
@@ -366,7 +366,7 @@ mod tests {
             "1.2.3"
         );
         assert_eq!(
-            typed::<UInt32Array>(batch, "scope_dropped_attributes_count").value(0),
+            typed::<Int64Array>(batch, "scope_dropped_attributes_count").value(0),
             5
         );
         assert_eq!(

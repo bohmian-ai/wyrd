@@ -729,8 +729,7 @@ impl BifrostCatalog {
             let physical = self.catalog.load_table(&table_ident).await?;
             self.validate_physical_table(&physical, &binding, &arrow_schema, &layout)?;
         } else {
-            let iceberg_schema =
-                iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(&arrow_schema)?;
+            let iceberg_schema = crate::tables::iceberg_schema_for(&arrow_schema)?;
             let partition_spec = layout
                 .iceberg_partition_spec(&iceberg_schema)
                 .map_err(BifrostCatalogError::MetadataMismatch)?;
@@ -1090,7 +1089,10 @@ pub(crate) fn schema_shape_matches(expected: &Schema, actual: &Schema) -> bool {
             .all(|(expected, actual)| {
                 expected.name() == actual.name()
                     && expected.is_nullable() == actual.is_nullable()
-                    && data_type_shape_matches(expected.data_type(), actual.data_type())
+                    && crate::tables::arrow_type_shape_matches(
+                        expected.data_type(),
+                        actual.data_type(),
+                    )
             })
 }
 
@@ -1123,27 +1125,6 @@ fn resolve_registration_layout(
     let layout = PhysicalLayout::resolve(fqn, &arrow_schema, declared)
         .map_err(BifrostCatalogError::Layout)?;
     Ok((arrow_schema, layout))
-}
-
-fn data_type_shape_matches(
-    expected: &arrow::datatypes::DataType,
-    actual: &arrow::datatypes::DataType,
-) -> bool {
-    if expected.equals_datatype(actual) {
-        return true;
-    }
-    match (expected, actual) {
-        (
-            arrow::datatypes::DataType::Timestamp(expected_unit, Some(expected_timezone)),
-            arrow::datatypes::DataType::Timestamp(actual_unit, Some(actual_timezone)),
-        ) => {
-            expected_unit == actual_unit
-                && ((expected_timezone.as_ref() == "UTC" && actual_timezone.as_ref() == "+00:00")
-                    || (expected_timezone.as_ref() == "+00:00"
-                        && actual_timezone.as_ref() == "UTC"))
-        }
-        _ => false,
-    }
 }
 
 async fn acquire_table_advisory_lock(

@@ -24,10 +24,10 @@ use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 /// Everything an event carries is caller content, so the whole subtree is
 /// sensitive payload and is skipped by a metadata-only projection.
 pub static SPAN_EVENT_FIELDS: [F; 4] = [
-    F::sensitive(18, "time_unix_nano", T::UInt64, false),
+    F::sensitive(18, "time_unix_nano", T::Int64, false),
     F::sensitive(19, "name", T::Utf8, false),
     F::sensitive(20, "attributes", T::Binary, false),
-    F::sensitive(21, "dropped_attributes_count", T::UInt32, false),
+    F::sensitive(21, "dropped_attributes_count", T::Int64, false),
 ];
 
 /// Element declaration of the ordered span-event collection.
@@ -38,9 +38,9 @@ pub static SPAN_LINK_FIELDS: [F; 6] = [
     F::sensitive(25, "trace_id", T::FixedSizeBinary(16), false),
     F::sensitive(26, "span_id", T::FixedSizeBinary(8), false),
     F::sensitive(27, "trace_state", T::Utf8, false),
-    F::sensitive(28, "flags", T::UInt32, false),
+    F::sensitive(28, "flags", T::Int64, false),
     F::sensitive(29, "attributes", T::Binary, false),
-    F::sensitive(30, "dropped_attributes_count", T::UInt32, false),
+    F::sensitive(30, "dropped_attributes_count", T::Int64, false),
 ];
 
 /// Element declaration of the ordered span-link collection.
@@ -66,24 +66,24 @@ pub static SPAN_FIELDS: &[F] = &[
     F::meta(2, "span_id", T::FixedSizeBinary(8), false),
     F::meta(3, "parent_span_id", T::FixedSizeBinary(8), true),
     F::meta(4, "trace_state", T::Utf8, false),
-    F::meta(5, "flags", T::UInt32, false),
+    F::meta(5, "flags", T::Int64, false),
     F::meta(6, "name", T::Utf8, false),
     F::meta(7, "kind", T::Int32, false),
-    F::meta(8, "start_time_unix_nano", T::UInt64, false),
-    F::meta(9, "end_time_unix_nano", T::UInt64, false),
-    F::meta(10, "duration_nano", T::UInt64, false),
+    F::meta(8, "start_time_unix_nano", T::Int64, false),
+    F::meta(9, "end_time_unix_nano", T::Int64, false),
+    F::meta(10, "duration_nano", T::Int64, false),
     F::meta(11, "status_present", T::Bool, false),
     F::meta(12, "status_code", T::Int32, true),
     F::payload(13, "status_message", T::Utf8, true),
     F::sensitive(14, "attributes", T::Binary, false),
-    F::meta(15, "dropped_attributes_count", T::UInt32, false),
+    F::meta(15, "dropped_attributes_count", T::Int64, false),
     F::sensitive(16, "events", T::List(&SPAN_EVENT_ELEMENT), false),
-    F::meta(22, "dropped_events_count", T::UInt32, false),
+    F::meta(22, "dropped_events_count", T::Int64, false),
     F::sensitive(23, "links", T::List(&SPAN_LINK_ELEMENT), false),
-    F::meta(31, "dropped_links_count", T::UInt32, false),
+    F::meta(31, "dropped_links_count", T::Int64, false),
     F::meta(32, "resource_present", T::Bool, false),
     F::sensitive(33, "resource_attributes", T::Binary, false),
-    F::meta(34, "resource_dropped_attributes_count", T::UInt32, false),
+    F::meta(34, "resource_dropped_attributes_count", T::Int64, false),
     F::meta(35, "resource_schema_url", T::Utf8, false),
     F::sensitive(
         36,
@@ -95,7 +95,7 @@ pub static SPAN_FIELDS: &[F] = &[
     F::meta(39, "scope_name", T::Utf8, false),
     F::meta(40, "scope_version", T::Utf8, false),
     F::sensitive(41, "scope_attributes", T::Binary, false),
-    F::meta(42, "scope_dropped_attributes_count", T::UInt32, false),
+    F::meta(42, "scope_dropped_attributes_count", T::Int64, false),
     F::meta(43, "scope_schema_url", T::Utf8, false),
     F::meta(44, "service_name", T::Utf8, true),
     F::meta(45, "gen_ai_operation_name", T::Utf8, true),

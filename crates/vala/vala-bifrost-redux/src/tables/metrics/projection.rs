@@ -31,10 +31,10 @@ use crate::otlp_contract::MetricsOutcome;
 use crate::tables::TableError;
 use crate::tables::fields::canonical_arrow_fields;
 use crate::tables::signal::{
-    ResourceEnvelope, ScopeEnvelope, binary_column, bool_column, bool_opt_column,
+    ResourceEnvelope, ScopeEnvelope, binary_column, bool_column, bool_opt_column, checked_i64,
     encode_attributes, f64_column, f64_opt_column, fixed_binary_opt_column, i32_column,
-    i32_opt_column, i64_opt_column, internal, list_column, nested_fields, span_id_bytes,
-    struct_column, trace_id_bytes, u32_column, u64_column, u64_opt_column, utf8_column,
+    i32_opt_column, i64_column, i64_opt_column, internal, list_column, nested_fields,
+    span_id_bytes, struct_column, trace_id_bytes, u32_as_i64_column, utf8_column,
     validate_canonical_user_batch,
 };
 
@@ -376,14 +376,14 @@ struct BucketRow {
     /// Signed index of the first populated bucket.
     offset: i32,
     /// Ordered bucket counts.
-    counts: Vec<u64>,
+    counts: Vec<i64>,
 }
 
 /// One validated exemplar.
 #[derive(Debug)]
 struct ExemplarRow {
     /// Exemplar observation time.
-    time_unix_nano: u64,
+    time_unix_nano: i64,
     /// Integer alternative, when the exemplar carries one.
     int_value: Option<i64>,
     /// Double alternative, when the exemplar carries one.
@@ -400,9 +400,9 @@ struct ExemplarRow {
 #[derive(Debug, Default)]
 struct PointRow {
     /// Point observation time.
-    time_unix_nano: u64,
+    time_unix_nano: i64,
     /// Start of the point's aggregation window.
-    start_time_unix_nano: u64,
+    start_time_unix_nano: i64,
     /// Raw data-point flag word.
     flags: u32,
     /// Canonical encoding of the point attributes.
@@ -412,7 +412,7 @@ struct PointRow {
     /// Double numeric alternative.
     double_value: Option<f64>,
     /// Histogram or exponential-histogram total count.
-    histogram_count: Option<u64>,
+    histogram_count: Option<i64>,
     /// Histogram or exponential-histogram sum.
     histogram_sum: Option<f64>,
     /// Histogram or exponential-histogram minimum.
@@ -420,13 +420,13 @@ struct PointRow {
     /// Histogram or exponential-histogram maximum.
     histogram_max: Option<f64>,
     /// Explicit bucket counts.
-    bucket_counts: Option<Vec<u64>>,
+    bucket_counts: Option<Vec<i64>>,
     /// Explicit bucket bounds.
     explicit_bounds: Option<Vec<f64>>,
     /// Exponential resolution scale.
     exponential_scale: Option<i32>,
     /// Exponential zero-bucket population.
-    exponential_zero_count: Option<u64>,
+    exponential_zero_count: Option<i64>,
     /// Exponential zero-bucket width.
     exponential_zero_threshold: Option<f64>,
     /// Positive exponential buckets.
@@ -434,7 +434,7 @@ struct PointRow {
     /// Negative exponential buckets.
     negative_buckets: Option<BucketRow>,
     /// Summary total count.
-    summary_count: Option<u64>,
+    summary_count: Option<i64>,
     /// Summary sum.
     summary_sum: Option<f64>,
     /// Summary quantiles, in request order.
@@ -457,8 +457,8 @@ impl PointRow {
             None => return Err("numeric data point carries no value"),
         };
         Ok(Self {
-            time_unix_nano: point.time_unix_nano,
-            start_time_unix_nano: point.start_time_unix_nano,
+            time_unix_nano: checked_i64(point.time_unix_nano)?,
+            start_time_unix_nano: checked_i64(point.start_time_unix_nano)?,
             flags: point.flags,
             attributes: encode_attributes(&point.attributes),
             int_value,
@@ -501,15 +501,21 @@ impl PointRow {
             return Err("histogram bucket counts do not sum to the declared count");
         }
         Ok(Self {
-            time_unix_nano: point.time_unix_nano,
-            start_time_unix_nano: point.start_time_unix_nano,
+            time_unix_nano: checked_i64(point.time_unix_nano)?,
+            start_time_unix_nano: checked_i64(point.start_time_unix_nano)?,
             flags: point.flags,
             attributes: encode_attributes(&point.attributes),
-            histogram_count: Some(point.count),
+            histogram_count: Some(checked_i64(point.count)?),
             histogram_sum: point.sum,
             histogram_min: point.min,
             histogram_max: point.max,
-            bucket_counts: Some(point.bucket_counts.clone()),
+            bucket_counts: Some(
+                point
+                    .bucket_counts
+                    .iter()
+                    .map(|count| checked_i64(*count))
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
             explicit_bounds: Some(point.explicit_bounds.clone()),
             exemplars: exemplar_rows(&point.exemplars)?,
             ..Self::default()
@@ -529,16 +535,16 @@ impl PointRow {
         let positive = point.positive.as_ref().map(bucket_row).transpose()?;
         let negative = point.negative.as_ref().map(bucket_row).transpose()?;
         Ok(Self {
-            time_unix_nano: point.time_unix_nano,
-            start_time_unix_nano: point.start_time_unix_nano,
+            time_unix_nano: checked_i64(point.time_unix_nano)?,
+            start_time_unix_nano: checked_i64(point.start_time_unix_nano)?,
             flags: point.flags,
             attributes: encode_attributes(&point.attributes),
-            histogram_count: Some(point.count),
+            histogram_count: Some(checked_i64(point.count)?),
             histogram_sum: point.sum,
             histogram_min: point.min,
             histogram_max: point.max,
             exponential_scale: Some(point.scale),
-            exponential_zero_count: Some(point.zero_count),
+            exponential_zero_count: Some(checked_i64(point.zero_count)?),
             exponential_zero_threshold: Some(point.zero_threshold),
             positive_buckets: positive,
             negative_buckets: negative,
@@ -565,11 +571,11 @@ impl PointRow {
             quantiles.push((entry.quantile, entry.value));
         }
         Ok(Self {
-            time_unix_nano: point.time_unix_nano,
-            start_time_unix_nano: point.start_time_unix_nano,
+            time_unix_nano: checked_i64(point.time_unix_nano)?,
+            start_time_unix_nano: checked_i64(point.start_time_unix_nano)?,
             flags: point.flags,
             attributes: encode_attributes(&point.attributes),
-            summary_count: Some(point.count),
+            summary_count: Some(checked_i64(point.count)?),
             summary_sum: Some(point.sum),
             quantile_values: Some(quantiles),
             ..Self::default()
@@ -590,7 +596,11 @@ fn bucket_row(
     }
     Ok(BucketRow {
         offset: buckets.offset,
-        counts: buckets.bucket_counts.clone(),
+        counts: buckets
+            .bucket_counts
+            .iter()
+            .map(|count| checked_i64(*count))
+            .collect::<Result<Vec<_>, _>>()?,
     })
 }
 
@@ -624,7 +634,7 @@ fn exemplar_rows(exemplars: &[Exemplar]) -> Result<Vec<ExemplarRow>, &'static st
                 Some(span_id_bytes(&value.span_id)?.to_vec())
             };
             Ok(ExemplarRow {
-                time_unix_nano: value.time_unix_nano,
+                time_unix_nano: checked_i64(value.time_unix_nano)?,
                 int_value,
                 double_value,
                 filtered_attributes: encode_attributes(&value.filtered_attributes),
@@ -644,40 +654,40 @@ struct PointColumns {
     unit: Vec<String>,
     metadata: Vec<Vec<u8>>,
     metric_type: Vec<String>,
-    time_unix_nano: Vec<u64>,
-    start_time_unix_nano: Vec<u64>,
+    time_unix_nano: Vec<i64>,
+    start_time_unix_nano: Vec<i64>,
     flags: Vec<u32>,
     attributes: Vec<Vec<u8>>,
     int_value: Vec<Option<i64>>,
     double_value: Vec<Option<f64>>,
     aggregation_temporality: Vec<Option<i32>>,
     is_monotonic: Vec<Option<bool>>,
-    histogram_count: Vec<Option<u64>>,
+    histogram_count: Vec<Option<i64>>,
     histogram_sum: Vec<Option<f64>>,
     histogram_min: Vec<Option<f64>>,
     histogram_max: Vec<Option<f64>>,
     bucket_count_lengths: Vec<Option<usize>>,
-    bucket_counts: Vec<u64>,
+    bucket_counts: Vec<i64>,
     explicit_bound_lengths: Vec<Option<usize>>,
     explicit_bounds: Vec<f64>,
     exponential_scale: Vec<Option<i32>>,
-    exponential_zero_count: Vec<Option<u64>>,
+    exponential_zero_count: Vec<Option<i64>>,
     exponential_zero_threshold: Vec<Option<f64>>,
     positive_valid: Vec<bool>,
     positive_offset: Vec<i32>,
     positive_count_lengths: Vec<Option<usize>>,
-    positive_counts: Vec<u64>,
+    positive_counts: Vec<i64>,
     negative_valid: Vec<bool>,
     negative_offset: Vec<i32>,
     negative_count_lengths: Vec<Option<usize>>,
-    negative_counts: Vec<u64>,
-    summary_count: Vec<Option<u64>>,
+    negative_counts: Vec<i64>,
+    summary_count: Vec<Option<i64>>,
     summary_sum: Vec<Option<f64>>,
     quantile_lengths: Vec<Option<usize>>,
     quantile_quantiles: Vec<f64>,
     quantile_measured: Vec<f64>,
     exemplar_lengths: Vec<Option<usize>>,
-    exemplar_time: Vec<u64>,
+    exemplar_time: Vec<i64>,
     exemplar_int: Vec<Option<i64>>,
     exemplar_double: Vec<Option<f64>>,
     exemplar_attributes: Vec<Vec<u8>>,
@@ -841,7 +851,7 @@ impl PointColumns {
         let exemplars = struct_column(
             &nested_fields(&EXEMPLAR_ELEMENT.to_arrow())?,
             vec![
-                u64_column(std::mem::take(&mut self.exemplar_time)),
+                i64_column(std::mem::take(&mut self.exemplar_time)),
                 i64_opt_column(std::mem::take(&mut self.exemplar_int)),
                 f64_opt_column(std::mem::take(&mut self.exemplar_double)),
                 binary_column(&self.exemplar_attributes),
@@ -868,21 +878,21 @@ impl PointColumns {
             utf8_column(self.unit),
             binary_column(&self.metadata),
             utf8_column(self.metric_type),
-            u64_column(self.time_unix_nano),
-            u64_column(self.start_time_unix_nano),
-            u32_column(self.flags),
+            i64_column(self.time_unix_nano),
+            i64_column(self.start_time_unix_nano),
+            u32_as_i64_column(self.flags),
             binary_column(&self.attributes),
             i64_opt_column(self.int_value),
             f64_opt_column(self.double_value),
             i32_opt_column(self.aggregation_temporality),
             bool_opt_column(self.is_monotonic),
-            u64_opt_column(self.histogram_count),
+            i64_opt_column(self.histogram_count),
             f64_opt_column(self.histogram_sum),
             f64_opt_column(self.histogram_min),
             f64_opt_column(self.histogram_max),
             list_column(
                 &BUCKET_COUNT_ELEMENT.to_arrow(),
-                u64_column(self.bucket_counts),
+                i64_column(self.bucket_counts),
                 &self.bucket_count_lengths,
             )
             .map_err(internal)?,
@@ -893,11 +903,11 @@ impl PointColumns {
             )
             .map_err(internal)?,
             i32_opt_column(self.exponential_scale),
-            u64_opt_column(self.exponential_zero_count),
+            i64_opt_column(self.exponential_zero_count),
             f64_opt_column(self.exponential_zero_threshold),
             nested.positive,
             nested.negative,
-            u64_opt_column(self.summary_count),
+            i64_opt_column(self.summary_count),
             f64_opt_column(self.summary_sum),
             list_column(
                 &QUANTILE_VALUE_ELEMENT.to_arrow(),
@@ -913,7 +923,7 @@ impl PointColumns {
             .map_err(internal)?,
             bool_column(self.resource_present),
             binary_column(&self.resource_attributes),
-            u32_column(self.resource_dropped_attributes_count),
+            u32_as_i64_column(self.resource_dropped_attributes_count),
             utf8_column(self.resource_schema_url),
             list_column(
                 &METRIC_ENTITY_REF_ELEMENT.to_arrow(),
@@ -925,7 +935,7 @@ impl PointColumns {
             utf8_column(self.scope_name),
             utf8_column(self.scope_version),
             binary_column(&self.scope_attributes),
-            u32_column(self.scope_dropped_attributes_count),
+            u32_as_i64_column(self.scope_dropped_attributes_count),
             utf8_column(self.scope_schema_url),
         ];
         RecordBatch::try_new(canonical_metric_schema(), columns)
@@ -956,7 +966,7 @@ fn push_buckets(
     valid: &mut Vec<bool>,
     offsets: &mut Vec<i32>,
     lengths: &mut Vec<Option<usize>>,
-    counts: &mut Vec<u64>,
+    counts: &mut Vec<i64>,
 ) {
     if let Some(row) = buckets {
         valid.push(true);
@@ -982,9 +992,9 @@ fn bucket_struct(
     valid: Vec<bool>,
     offsets: Vec<i32>,
     lengths: &[Option<usize>],
-    counts: Vec<u64>,
+    counts: Vec<i64>,
 ) -> Result<ArrayRef, TableError> {
-    let counts = list_column(&element.to_arrow(), u64_column(counts), lengths).map_err(internal)?;
+    let counts = list_column(&element.to_arrow(), i64_column(counts), lengths).map_err(internal)?;
     let children = Fields::from(canonical_arrow_fields(declared));
     struct_column(&children, vec![i32_column(offsets), counts], Some(valid)).map_err(internal)
 }

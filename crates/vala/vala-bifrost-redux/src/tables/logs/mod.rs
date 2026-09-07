@@ -9,8 +9,8 @@ pub use records::RecordsTable;
 #[cfg(test)]
 mod tests {
     use arrow::array::{
-        Array, BinaryArray, BooleanArray, FixedSizeBinaryArray, Int32Array, ListArray, StringArray,
-        UInt32Array, UInt64Array,
+        Array, BinaryArray, BooleanArray, FixedSizeBinaryArray, Int32Array, Int64Array, ListArray,
+        StringArray,
     };
     use arrow::record_batch::RecordBatch;
     use std::sync::Arc;
@@ -193,11 +193,11 @@ mod tests {
     /// Panics when a raw flag word, nanosecond timestamp, severity, drop
     /// count, correlation identifier, or attribute payload differs.
     fn assert_record_scalars(batch: &RecordBatch, correlated: usize) {
-        let flags = typed::<UInt32Array>(batch, "flags");
+        let flags = typed::<Int64Array>(batch, "flags");
         assert_eq!(flags.value(0), 0xdead_beef, "raw flag word is not decoded");
-        let time = typed::<UInt64Array>(batch, "time_unix_nano");
+        let time = typed::<Int64Array>(batch, "time_unix_nano");
         assert_eq!(time.value(0), 1_700_000_000_123_456_789);
-        let observed = typed::<UInt64Array>(batch, "observed_time_unix_nano");
+        let observed = typed::<Int64Array>(batch, "observed_time_unix_nano");
         assert_eq!(observed.value(0), 1_700_000_000_987_654_321);
         assert_eq!(typed::<Int32Array>(batch, "severity_number").value(0), 9);
         assert_eq!(
@@ -205,7 +205,7 @@ mod tests {
             "INFO"
         );
         assert_eq!(
-            typed::<UInt32Array>(batch, "dropped_attributes_count").value(0),
+            typed::<Int64Array>(batch, "dropped_attributes_count").value(0),
             3
         );
 
@@ -244,7 +244,7 @@ mod tests {
             "https://wyrd.test/resource"
         );
         assert_eq!(
-            typed::<UInt32Array>(batch, "resource_dropped_attributes_count").value(0),
+            typed::<Int64Array>(batch, "resource_dropped_attributes_count").value(0),
             5
         );
         assert_eq!(
@@ -256,7 +256,7 @@ mod tests {
             "1.2.3"
         );
         assert_eq!(
-            typed::<UInt32Array>(batch, "scope_dropped_attributes_count").value(0),
+            typed::<Int64Array>(batch, "scope_dropped_attributes_count").value(0),
             7
         );
         assert_eq!(

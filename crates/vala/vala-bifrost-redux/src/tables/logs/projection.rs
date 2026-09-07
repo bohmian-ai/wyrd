@@ -20,9 +20,9 @@ use crate::otlp_contract::LogsOutcome;
 use crate::tables::TableError;
 use crate::tables::fields::canonical_arrow_fields;
 use crate::tables::signal::{
-    ResourceEnvelope, ScopeEnvelope, binary_column, binary_opt_column, bool_column,
-    encode_any_value, encode_attributes, fixed_binary_opt_column, i32_column, list_column,
-    span_id_bytes, trace_id_bytes, u32_column, u64_column, utf8_column, utf8_opt_column,
+    ResourceEnvelope, ScopeEnvelope, binary_column, binary_opt_column, bool_column, checked_i64,
+    encode_any_value, encode_attributes, fixed_binary_opt_column, i32_column, i64_column,
+    list_column, span_id_bytes, trace_id_bytes, u32_as_i64_column, utf8_column, utf8_opt_column,
 };
 
 /// Largest accepted severity text, in bytes.
@@ -85,8 +85,8 @@ pub fn canonical_log_schema() -> Arc<Schema> {
 #[derive(Debug, Default)]
 struct LogColumns {
     rows: usize,
-    time_unix_nano: Vec<u64>,
-    observed_time_unix_nano: Vec<u64>,
+    time_unix_nano: Vec<i64>,
+    observed_time_unix_nano: Vec<i64>,
     severity_number: Vec<i32>,
     severity_text: Vec<String>,
     event_name: Vec<Option<String>>,
@@ -141,6 +141,8 @@ impl LogColumns {
         } else {
             Some(span_id_bytes(&record.span_id)?.to_vec())
         };
+        let time_unix_nano = checked_i64(record.time_unix_nano)?;
+        let observed_time_unix_nano = checked_i64(record.observed_time_unix_nano)?;
         let body = record.body.as_ref().map(encode_any_value);
         if body
             .as_ref()
@@ -153,9 +155,8 @@ impl LogColumns {
             return Err("log attributes exceed the accepted payload size");
         }
 
-        self.time_unix_nano.push(record.time_unix_nano);
-        self.observed_time_unix_nano
-            .push(record.observed_time_unix_nano);
+        self.time_unix_nano.push(time_unix_nano);
+        self.observed_time_unix_nano.push(observed_time_unix_nano);
         self.severity_number.push(record.severity_number);
         self.severity_text.push(record.severity_text.clone());
         self.event_name
@@ -198,20 +199,20 @@ impl LogColumns {
     /// assembled columns do not match the canonical schema.
     fn finish(self) -> Result<RecordBatch, TableError> {
         let columns: Vec<ArrayRef> = vec![
-            u64_column(self.time_unix_nano),
-            u64_column(self.observed_time_unix_nano),
+            i64_column(self.time_unix_nano),
+            i64_column(self.observed_time_unix_nano),
             i32_column(self.severity_number),
             utf8_column(self.severity_text),
             utf8_opt_column(self.event_name),
             binary_opt_column(&self.body),
             fixed_binary_opt_column(16, &self.trace_id).map_err(internal)?,
             fixed_binary_opt_column(8, &self.span_id).map_err(internal)?,
-            u32_column(self.flags),
+            u32_as_i64_column(self.flags),
             binary_column(&self.attributes),
-            u32_column(self.dropped_attributes_count),
+            u32_as_i64_column(self.dropped_attributes_count),
             bool_column(self.resource_present),
             binary_column(&self.resource_attributes),
-            u32_column(self.resource_dropped_attributes_count),
+            u32_as_i64_column(self.resource_dropped_attributes_count),
             utf8_column(self.resource_schema_url),
             list_column(
                 &LOG_ENTITY_REF_ELEMENT.to_arrow(),
@@ -223,7 +224,7 @@ impl LogColumns {
             utf8_column(self.scope_name),
             utf8_column(self.scope_version),
             binary_column(&self.scope_attributes),
-            u32_column(self.scope_dropped_attributes_count),
+            u32_as_i64_column(self.scope_dropped_attributes_count),
             utf8_column(self.scope_schema_url),
         ];
         RecordBatch::try_new(canonical_log_schema(), columns)

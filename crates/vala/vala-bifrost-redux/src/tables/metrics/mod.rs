@@ -10,7 +10,7 @@ pub use projection::{canonical_metric_schema, project_resource_metrics, validate
 mod tests {
     use arrow::array::{
         Array, BooleanArray, Float64Array, Int32Array, Int64Array, ListArray, StringArray,
-        StructArray, UInt64Array,
+        StructArray,
     };
     use arrow::record_batch::RecordBatch;
     use std::sync::Arc;
@@ -96,11 +96,11 @@ mod tests {
     }
 
     /// Read one nested `UInt64` list row as a plain vector.
-    fn u64_list(batch: &RecordBatch, name: &str, row: usize) -> Vec<u64> {
+    fn u64_list(batch: &RecordBatch, name: &str, row: usize) -> Vec<i64> {
         let values = typed::<ListArray>(batch, name).value(row);
         let values = values
             .as_any()
-            .downcast_ref::<UInt64Array>()
+            .downcast_ref::<Int64Array>()
             .expect("nested unsigned list");
         values.iter().map(|value| value.expect("no null")).collect()
     }
@@ -244,7 +244,7 @@ mod tests {
             2
         );
 
-        assert_eq!(typed::<UInt64Array>(&batch, "histogram_count").value(2), 6);
+        assert_eq!(typed::<Int64Array>(&batch, "histogram_count").value(2), 6);
         assert_eq!(u64_list(&batch, "bucket_counts", 2), vec![1, 2, 3]);
         assert_eq!(f64_list(&batch, "explicit_bounds", 2), vec![0.5, 1.5]);
         assert_eq!(
@@ -265,7 +265,7 @@ mod tests {
             -3
         );
         assert_eq!(
-            typed::<UInt64Array>(&batch, "exponential_zero_count").value(3),
+            typed::<Int64Array>(&batch, "exponential_zero_count").value(3),
             4
         );
         let positive = typed::<StructArray>(&batch, "positive_buckets");
@@ -282,7 +282,7 @@ mod tests {
         let negative = typed::<StructArray>(&batch, "negative_buckets");
         assert!(!negative.is_valid(3), "an absent bucket collection is null");
 
-        assert_eq!(typed::<UInt64Array>(&batch, "summary_count").value(4), 11);
+        assert_eq!(typed::<Int64Array>(&batch, "summary_count").value(4), 11);
         let quantiles = typed::<ListArray>(&batch, "quantile_values").value(4);
         let quantiles = quantiles
             .as_any()
@@ -385,7 +385,7 @@ mod tests {
             .zip(batch.columns())
             .map(|(field, values)| {
                 if field.name() == "summary_count" {
-                    Arc::new(UInt64Array::from(vec![Some(3u64)])) as Arc<dyn Array>
+                    Arc::new(Int64Array::from(vec![Some(3i64)])) as Arc<dyn Array>
                 } else {
                     Arc::clone(values)
                 }

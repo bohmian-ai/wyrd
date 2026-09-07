@@ -435,6 +435,8 @@ pub(crate) struct PromotionCatalogSeam {
     parked_drop_ready: tokio::sync::Notify,
     /// Whether every accepted commit's response is discarded before returning.
     lose_response: AtomicBool,
+    /// Remaining accepted commits whose response never arrives at all.
+    stall_response_budget: AtomicUsize,
     /// Storage adapter every loaded table is rebound to, once one is installed.
     ///
     /// The managed core reads inputs and writes rewrite outputs through the
@@ -462,6 +464,7 @@ impl PromotionCatalogSeam {
             parked_dropped: AtomicBool::new(false),
             parked_drop_ready: tokio::sync::Notify::new(),
             lose_response: AtomicBool::new(false),
+            stall_response_budget: AtomicUsize::new(0),
             file_io: std::sync::OnceLock::new(),
         })
     }
@@ -562,6 +565,19 @@ impl PromotionCatalogSeam {
     /// that budget delivers the uncertainty to the Forge expiry owner.
     pub(crate) fn lose_commit_responses(&self, armed: bool) {
         self.lose_response.store(armed, Ordering::Release);
+    }
+
+    /// Withhold the next `count` accepted commit responses indefinitely.
+    ///
+    /// [`Self::lose_commit_responses`] returns a retryable error, which the
+    /// pinned Iceberg transaction answers by committing again — and the second
+    /// call is refused by the real catalog because the first one landed, so the
+    /// caller ends up with a *definite* conflict rather than an unknown
+    /// acceptance. Withholding the answer instead leaves the call in flight
+    /// until the publication budget ends it, which is the one shape that
+    /// delivers a landed replacement and an unknowable outcome together.
+    pub(crate) fn stall_next_commit_responses(&self, count: usize) {
+        self.stall_response_budget.store(count, Ordering::Release);
     }
 
     /// Release the parked commit as a definite conflict.
@@ -693,6 +709,24 @@ impl Catalog for PromotionCatalogSeam {
                 )
                 .with_retryable(false));
             }
+        }
+        if self
+            .stall_response_budget
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |budget| {
+                budget.checked_sub(1)
+            })
+            .is_ok()
+        {
+            // The call is handed to a task the caller cannot cancel, so the
+            // replacement lands exactly as it would have while this call never
+            // answers. Awaiting the commit here instead would let the caller's
+            // publication budget cancel the commit itself, which is a different
+            // fault entirely: nothing landed.
+            let inner = Arc::clone(&self.inner);
+            tokio::spawn(async move {
+                let _ = inner.update_table(commit).await;
+            });
+            return std::future::pending::<iceberg::Result<Table>>().await;
         }
         let committed = self.inner.update_table(commit).await?;
         if self.lose_response.load(Ordering::Acquire) {
@@ -1564,6 +1598,12 @@ pub(crate) struct SupervisedPromotion {
     forge: Arc<Forge>,
     /// Worker bounds every generation of this supervisor's worker is built with.
     worker_config: ForgeWorkerConfig,
+    /// Readiness bit every generation of this supervisor's worker publishes.
+    ///
+    /// The production loop retracts readiness while it holds work it cannot
+    /// settle yet, so a scenario about retained ambiguity has to observe the
+    /// same handle a server's `/readyz` would rather than a detached one.
+    readiness: ForgeRoleReadiness,
 }
 
 impl SupervisedPromotion {
@@ -1641,6 +1681,7 @@ impl SupervisedPromotion {
             .expect("fixture Forge worker");
         let scheduler_stop = CancellationToken::new();
         let worker_stop = CancellationToken::new();
+        let readiness = ForgeRoleReadiness::detached();
         let scheduler_task = tokio::spawn({
             let forge = Arc::clone(&forge);
             let stop = scheduler_stop.clone();
@@ -1648,7 +1689,8 @@ impl SupervisedPromotion {
         });
         let worker_task = tokio::spawn({
             let stop = worker_stop.clone();
-            async move { worker.run(stop, ForgeRoleReadiness::detached()).await }
+            let readiness = readiness.clone();
+            async move { worker.run(stop, readiness).await }
         });
         Self {
             scheduler_trigger,
@@ -1660,7 +1702,13 @@ impl SupervisedPromotion {
             worker_armed: false,
             forge,
             worker_config,
+            readiness,
         }
+    }
+
+    /// Reads the readiness this supervisor's worker generation publishes.
+    pub(crate) fn worker_ready(&self) -> bool {
+        self.readiness.is_ready()
     }
 
     /// Borrows the retained Forge graph so a scenario can drive one production
@@ -1744,9 +1792,10 @@ impl SupervisedPromotion {
         )
         .expect("fixture Forge worker");
         let stop = self.worker_stop.clone();
-        self.worker_task = Some(tokio::spawn(async move {
-            worker.run(stop, ForgeRoleReadiness::detached()).await
-        }));
+        let readiness = self.readiness.clone();
+        self.worker_task = Some(tokio::spawn(
+            async move { worker.run(stop, readiness).await },
+        ));
         self.worker_armed = false;
     }
 
@@ -2051,7 +2100,7 @@ impl SupervisedPromotion {
     /// # Panics
     ///
     /// Panics when the worker misses its bounded shutdown or exits unexpectedly.
-    async fn stop_worker(&mut self) {
+    pub(crate) async fn stop_worker(&mut self) {
         self.worker_stop.cancel();
         self.worker_observer.release_held_attempt_for_test();
         let task = self.worker_task.take().expect("worker is stopped once");

@@ -393,7 +393,7 @@ redacted
     promoted.fixture.seal_more(2).await;
     supervisor.run_one_success().await;
 
-    catalog.lose_commit_responses(true);
+    catalog.stall_next_commit_responses(8);
     supervisor.restart_worker();
     supervisor.run_one_failure().await;
     catalog.lose_commit_responses(false);
@@ -961,5 +961,316 @@ async fn worker_wide_fifo_bounds_concurrent_attempts() {
         promoted.fixture.live_leases().await,
         0,
         "a drained worker holds no table fence"
+    );
+}
+
+/// Reads the phase of every rewrite operation this tenant holds, by id.
+///
+/// The retained-ambiguity contract is stated in operation identities: the same
+/// UUIDs must still be there, still Prepared, after a reconciliation pass that
+/// resubmitted nothing.
+async fn operation_phases(
+    fixture: &super::support::PromotionIntegrationFixture,
+) -> std::collections::BTreeMap<uuid::Uuid, String> {
+    fixture.rewrite_operations().await.into_iter().collect()
+}
+
+/// Polls the durable operation rows until every one of `ids` holds `phase`.
+///
+/// # Panics
+///
+/// Panics when the phase is not reached inside [`ADMISSION_BOUND`].
+async fn await_operation_phase(
+    fixture: &super::support::PromotionIntegrationFixture,
+    ids: &BTreeSet<uuid::Uuid>,
+    phase: &str,
+) {
+    let reached = tokio::time::timeout(ADMISSION_BOUND, async {
+        loop {
+            let phases = operation_phases(fixture).await;
+            if ids
+                .iter()
+                .all(|id| phases.get(id).is_some_and(|held| held == phase))
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    assert!(
+        reached.is_ok(),
+        "operations {ids:?} never reached {phase}: {:?}",
+        operation_phases(fixture).await
+    );
+}
+
+/// Unknown acceptance retains a Running task until its exact UUID is settled.
+///
+/// A lost answer is not a failure. The operation is open, its outputs may be
+/// live, and the only thing that can close it is proof about that exact UUID.
+/// So the attempt is neither retried nor failed: the task stays Running, the
+/// worker stops taking new work and goes unready, and the retained attempt
+/// reconciles its own operation identities until each is proven.
+///
+/// Three shapes are proved against one production worker:
+///
+/// 1. A commit that runs out of publication budget while it is still in flight
+///    leaves nothing landed. The task is retained Running and resubmits
+///    nothing, and only once the uncertainty bound lapses does the exact
+///    reconciliation prove the operation absent and Reset it.
+/// 2. A commit the catalog accepted whose answer was lost leaves the
+///    replacement live. The exact reconciliation Recovers it, and that
+///    recovery is a success: the task settles Succeeded, not retried.
+/// 3. One ordinary success beside one ambiguous sibling never reaches local
+///    reconciliation at all: the any-success reduction settles the task
+///    immediately and the Prepared sibling is left to the table-wide owner.
+///
+/// # Panics
+///
+/// Panics when a retained attempt fails or retries instead of staying Running,
+/// when reconciliation resubmits a commit, when an operation identity changes,
+/// or when a proven operation does not reach its exact terminal phase.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn acceptance_unknown_retains_running_until_exact_reconciliation() {
+    let mut promoted = PromotedRewriteFixture::start_unpromoted("unknown_acceptance").await;
+    // A parked commit has to run out of publication budget while the scenario
+    // is still watching, so the budget is the seconds a test can wait rather
+    // than the production minutes.
+    promoted.fixture.config.iceberg_total_retry_timeout = std::time::Duration::from_secs(2);
+    let object_store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
+    let catalog = PromotionCatalogSeam::new(
+        promoted.fixture.catalog.iceberg_catalog(),
+        object_store.read_counter(),
+    );
+    let (clock, control) = super::support::manual_clock();
+    // Serial, because every fault here is injected by commit count: a
+    // concurrent sibling would make which plan received it unknowable.
+    let mut supervisor = SupervisedPromotion::start_serial(
+        &promoted.fixture,
+        Arc::clone(&catalog) as Arc<dyn iceberg::Catalog>,
+        Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
+        clock,
+    );
+    supervisor.run_one_success().await;
+
+    // 1. Nothing landed, and nobody can say so yet.
+    catalog.park_next_commit();
+    supervisor.restart_worker();
+    supervisor.start_worker();
+    supervisor.schedule_only().await;
+    tokio::time::timeout(ADMISSION_BOUND, catalog.wait_for_parked_commit())
+        .await
+        .expect("one plan reaches the catalog");
+    // A sibling that published would settle the task on its own, which is the
+    // *other* case. Refusing every later commit outright leaves this attempt
+    // with exactly one thing it cannot explain.
+    catalog.reject_remaining_commits();
+    let unresolved = tokio::time::timeout(ADMISSION_BOUND, async {
+        loop {
+            let open = operation_phases(&promoted.fixture).await;
+            if open.values().any(|phase| phase == "prepared") {
+                return open
+                    .into_iter()
+                    .filter(|(_, phase)| phase == "prepared")
+                    .map(|(id, _)| id)
+                    .collect::<BTreeSet<_>>();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the parked plan opened its operation");
+    await_small_files_in_state(&promoted.fixture, &["claimed", "running"], 1).await;
+
+    // The budget lapses, the plan returns with acceptance unknown, and the
+    // attempt is retained rather than settled. Retraction of readiness is the
+    // worker saying so: it has stopped claiming because it cannot account for
+    // an operation it opened.
+    tokio::time::timeout(ADMISSION_BOUND, async {
+        while supervisor.worker_ready() {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("a worker holding an unresolved operation stops advertising itself");
+    let submissions = catalog.attempts();
+    assert_eq!(
+        small_files_in_state(&promoted.fixture, &["claimed", "running"]).await,
+        1,
+        "an unresolved operation keeps its task Running: {:?}",
+        tenant_tasks(&promoted.fixture).await
+    );
+
+    // Nothing changes over a window the ordinary settlement would have used.
+    tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+    assert_eq!(
+        catalog.attempts(),
+        submissions,
+        "reconciliation asks about an operation; it never resubmits one"
+    );
+    assert_eq!(
+        small_files_in_state(&promoted.fixture, &["claimed", "running"]).await,
+        1,
+        "repeated reconciliation of an unproven operation settles nothing: {:?}",
+        tenant_tasks(&promoted.fixture).await
+    );
+    assert_eq!(
+        operation_phases(&promoted.fixture)
+            .await
+            .into_iter()
+            .filter(|(_, phase)| phase == "prepared")
+            .map(|(id, _)| id)
+            .collect::<BTreeSet<_>>(),
+        unresolved,
+        "a retained attempt keeps the operation identities it minted"
+    );
+
+    // Only age makes absence provable, so the terminal is reached exactly when
+    // the uncertainty bound lapses and not before.
+    control
+        .set(
+            chrono::Utc::now()
+                + chrono::Duration::from_std(promoted.fixture.config.uncertainty_bound)
+                    .expect("the uncertainty bound is representable")
+                + chrono::Duration::seconds(1),
+        )
+        .expect("manual Forge clock advances");
+    await_operation_phase(&promoted.fixture, &unresolved, "reset").await;
+    supervisor.stop_worker().await;
+    assert_eq!(
+        supervisor.returned_errors().len(),
+        1,
+        "a retained attempt settles once, with the failure its own plan returned: {:?}",
+        supervisor.returned_errors()
+    );
+
+    landed_replacement_recovers_into_success(&promoted, &catalog, &mut supervisor).await;
+    known_success_leaves_its_ambiguous_sibling_open(&promoted, &catalog, &mut supervisor).await;
+    supervisor.shutdown().await;
+    assert_eq!(
+        promoted.fixture.live_leases().await,
+        0,
+        "every settled attempt released its table fence"
+    );
+}
+
+/// Proves that a landed replacement whose answer never arrived recovers.
+///
+/// The seam hands the commit to a task the caller cannot cancel, so the
+/// replacement lands exactly as it would have while the publication budget ends
+/// the call with nothing learned. The retained attempt then proves its own
+/// operation live and settles Succeeded — and the first proof is enough, so a
+/// sibling that is still unresolved is left open for the table-wide owner
+/// rather than failed or reset.
+///
+/// # Panics
+///
+/// Panics when an exact recovery is retried instead of settled, or when a
+/// proven operation is not closed as recovered.
+async fn landed_replacement_recovers_into_success(
+    promoted: &PromotedRewriteFixture,
+    catalog: &Arc<PromotionCatalogSeam>,
+    supervisor: &mut SupervisedPromotion,
+) {
+    // 2. The replacement landed and only the answer was lost.
+    catalog.reject_next_commits(0);
+    promoted.fixture.clear_task_backoff().await;
+    let landed_before = promoted.fixture.rewrite_operations().await.len();
+    catalog.stall_next_commit_responses(8);
+    supervisor.restart_worker();
+    supervisor.start_worker();
+    let recovered_to_success = tokio::time::timeout(ADMISSION_BOUND, async {
+        while small_files_in_state(&promoted.fixture, &["succeeded"]).await == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    assert!(
+        recovered_to_success.is_ok(),
+        "an exact recovery is a success, not a retry: {:?} / {:?} / {:?}",
+        tenant_tasks(&promoted.fixture).await,
+        supervisor.returned_errors(),
+        promoted.fixture.rewrite_operations().await
+    );
+    catalog.stall_next_commit_responses(0);
+    supervisor.stop_worker().await;
+    let recovered = promoted
+        .fixture
+        .rewrite_operations()
+        .await
+        .into_iter()
+        .skip(landed_before)
+        .collect::<Vec<_>>();
+    assert!(
+        recovered.iter().any(|(_, phase)| phase == "recovered"),
+        "an exact recovery closes the operation it proved: {recovered:?}"
+    );
+    assert!(
+        recovered
+            .iter()
+            .all(|(_, phase)| phase == "recovered" || phase == "prepared"),
+        "the first proven operation settles the task and the rest stay open for \
+         the table-wide owner, which never fails or resets them: {recovered:?}"
+    );
+}
+
+/// Proves that a known success settles the task without local reconciliation.
+///
+/// One plan publishes ordinarily while a sibling's answer never arrives. The
+/// any-success reduction decides the task on the spot, so no local
+/// reconciliation runs at all and the ambiguous sibling's Prepared row stays
+/// open for the existing table-wide owner.
+///
+/// # Panics
+///
+/// Panics when the ordinary success does not settle the task, or when its
+/// ambiguous sibling is closed by this attempt.
+async fn known_success_leaves_its_ambiguous_sibling_open(
+    promoted: &PromotedRewriteFixture,
+    catalog: &Arc<PromotionCatalogSeam>,
+    supervisor: &mut SupervisedPromotion,
+) {
+    // 3. One known success beside one ambiguous sibling.
+    promoted.fixture.seal_more(4).await;
+    promoted.fixture.clear_task_backoff().await;
+    supervisor.restart_worker();
+    supervisor.start_worker();
+    supervisor.schedule_only().await;
+    tokio::time::timeout(ADMISSION_BOUND, async {
+        while promotions_succeeded(&promoted.fixture).await < 2 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the new hot objects are published before compaction plans them");
+    supervisor.stop_worker().await;
+
+    let succeeded_before = small_files_in_state(&promoted.fixture, &["succeeded"]).await;
+    let open_before = operation_phases(&promoted.fixture).await.len();
+    promoted.fixture.clear_task_backoff().await;
+    catalog.stall_next_commit_responses(1);
+    supervisor.restart_worker();
+    supervisor.start_worker();
+    supervisor.schedule_only().await;
+    await_small_files_in_state(
+        &promoted.fixture,
+        &["succeeded"],
+        succeeded_before.saturating_add(1),
+    )
+    .await;
+    let known_success = operation_phases(&promoted.fixture)
+        .await
+        .into_iter()
+        .skip(open_before)
+        .collect::<Vec<_>>();
+    assert!(
+        known_success.iter().any(|(_, phase)| phase == "committed"),
+        "a plan that published ordinarily settles the task on its own: {known_success:?}"
+    );
+    assert!(
+        known_success.iter().any(|(_, phase)| phase == "prepared"),
+        "its ambiguous sibling is left open for the table-wide owner, not failed: \
+         {known_success:?}"
     );
 }

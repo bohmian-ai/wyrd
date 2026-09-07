@@ -170,12 +170,15 @@ fabricate task completion to make health checks pass.
 - Only the live lease and fence may create effects or acknowledge demand.
   Stale workers cannot publish, settle, or delete.
 - The managed compaction core produces bounded outputs and never commits the
-  Iceberg catalog. Forge validates the exact handoff and owns one fenced
-  `commit_once` operation per attempt.
-- A definite non-commit returns the logical task to durable scheduling under a
-  new claim, attempt, output generation, and fence. An ambiguous commit enters
-  durable uncertainty and is reconciled from snapshot properties and object
-  evidence before any retry or terminal audit.
+  Iceberg catalog. Forge validates each exact handoff; every admitted plan owns
+  one fenced `commit_once` operation, and sibling plans may publish
+  concurrently under the task attempt's lease and fence.
+- A definite non-commit leaves that plan's work as replannable debt. The task
+  returns to durable failure scheduling only when no sibling published; any
+  known committed or recovered sibling settles the task successfully. An
+  ambiguous operation with no known success retains the Running attempt for
+  exact reconciliation. When a sibling already succeeded, the task settles and
+  the still-Prepared operation remains for table-wide reconciliation.
 - Promotion, rewrite, snapshot expiration, expired-object deletion, and
   never-published orphan deletion are separate durable operations with
   independent protection sets and cursors.

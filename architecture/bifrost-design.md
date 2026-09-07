@@ -403,11 +403,14 @@ gRPC, Python, TypeScript, and MCP.
 ### Scheduling, admission, and fences
 
 Forge schedules durable Postgres tasks with tenant-fair admission. At most one
-publication attempt is active per tenant-qualified table, while bounded
-per-tenant and per-worker lanes permit independent tables to progress
-concurrently. Each attempt binds tenant, table, task, plan hash, base snapshot,
-target branch, attempt UUIDv7, operation ID, output generation, lease, and
-fence. Loss of authority cancels and drains physical work before settlement.
+durable task attempt owns the lease and fence for a tenant-qualified table.
+Within that attempt, admitted ordinary compaction plans are independent child
+operations: fitting siblings may rewrite and publish concurrently, while
+bounded per-tenant and per-worker admission also permits independent tables to
+progress concurrently. Each plan binds the owning tenant, table, task, plan
+hash, base snapshot, target branch, attempt UUIDv7, operation ID, output
+generation, lease, and fence. Loss of authority cancels and drains physical
+work before settlement.
 
 Forge owns runtime leases, pod-local plan admission, read streams, writer
 fanout, upload buffers, close futures, SQL state, audit, reconciliation, and
@@ -526,14 +529,17 @@ the exact rewritten data files, adds the exact outputs, preserves delete
 correctness, and writes operation and lineage properties in the same snapshot.
 
 Committed, definitely uncommitted, fence-refused, cancelled, and uncertain are
-distinct outcomes. On a definite catalog compare-and-swap conflict, Forge
-refreshes the branch head and revalidates base ancestry, selected inputs,
-delete scope, schema/spec/sort policy, lease, and fence. When all assumptions
-remain true, the same attempt, operation ID, output generation, and objects may
-issue at most one additional `commit_once` within the original deadline. A
-second conflict, expired deadline, or changed assumption settles the attempt as
-definitely uncommitted and returns durable demand for a new plan and attempt.
-No conflict retry creates new output objects.
+distinct per-plan outcomes. Concurrent siblings may optimistically race on the
+same branch head and cause an expected compare-and-swap conflict. On a definite
+conflict, Forge refreshes the branch head and revalidates the retained planning
+snapshot, current schema identity, selected-input existence, lease, and fence.
+When those assumptions remain true, the same plan operation, output generation,
+and objects may make at most three further `commit_once` calls after fixed
+1s/2s/4s delays within the original deadline. Exhausted retries, an expired
+deadline, or a changed assumption settles only that plan as definitely
+uncommitted. Successful sibling snapshots remain visible; the task succeeds
+when any admitted plan publishes, and later discovery replans remaining debt
+from the current head. No conflict retry creates new output objects.
 
 An uncertain attempt protects its outputs and reconciles under the same
 identity; it never retries the catalog call, starts a fresh attempt, or reports

@@ -54,18 +54,21 @@ the pod's aggregate memory and parallelism budgets. Waiting plans consume only
 the bounded pending-queue parallelism budget; they do not reserve running
 memory or parallelism and cannot bypass the head. The estimate is not a hard
 DataFusion ceiling, so pod OOM remains possible and is recovered through
-durable task, lease, and fence state. Physical writers may run concurrently,
-but one fence owns final catalog publication. Pressure defers or refuses work
-without changing file size, row-group geometry, selection scope, or
-correctness.
+durable task, lease, and fence state. Physical writers and sibling plan
+publications may run concurrently under one task attempt's lease and fence;
+each plan owns an independent catalog compare-and-swap operation. Pressure
+defers or refuses work without changing file size, row-group geometry,
+selection scope, or correctness.
 
 ## Cross-system commit and recovery
 
 Postgres and object storage do not share a transaction. Every external effect
 uses deterministic identity plus explicit prepared, terminal, and uncertain
-evidence. Catalog publication uses compare-and-swap/`commit_once`; timeout or
-transport loss reconciles by operation identity before a new attempt begins.
-Never report success merely because output objects exist.
+evidence. Each Forge plan publishes through its own
+compare-and-swap/`commit_once`; definite conflicts use the bounded per-plan
+retry schedule, and any successful sibling makes the task successful while
+unfinished work remains replannable debt. Timeout or transport loss reconciles
+by operation identity and is never inferred from output objects alone.
 
 Startup restores in dependency order: WAL, staged manifests and checksums,
 live-tail registry, deterministic claims, pending uploads/publications,

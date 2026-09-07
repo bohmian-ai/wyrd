@@ -980,7 +980,7 @@ impl<'forge> ForgeScheduler<'forge> {
             .await
             .map_err(ForgeError::Sql)?;
         let page = operations
-            .list_open(&mut conn, 1)
+            .list_open(&mut conn, 1, None)
             .await
             .map_err(ForgeError::Sql)?;
         conn.commit().await.map_err(ForgeError::Sql)?;

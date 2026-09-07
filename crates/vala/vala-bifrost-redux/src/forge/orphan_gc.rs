@@ -1091,7 +1091,7 @@ impl Forge {
         ] {
             let page = ForgeOperations::new(&resource, family)
                 .map_err(ForgeError::Sql)?
-                .list_open(&mut conn, cap)
+                .list_open(&mut conn, cap, None)
                 .await
                 .map_err(ForgeError::Sql)?;
             roots.blocked |= page.overflowed || !page.operations.is_empty();
@@ -1103,7 +1103,7 @@ impl Forge {
         }
         let open_gc = ForgeOperations::new(&resource, ForgeOperationFamily::OrphanGc)
             .map_err(ForgeError::Sql)?
-            .list_open(&mut conn, cap)
+            .list_open(&mut conn, cap, None)
             .await
             .map_err(ForgeError::Sql)?;
         roots.blocked |= open_gc.overflowed;
@@ -1579,7 +1579,11 @@ impl Forge {
             .map_err(ForgeError::Sql)?;
         let page = ForgeOperations::new(&resource, ForgeOperationFamily::OrphanGc)
             .map_err(ForgeError::Sql)?
-            .list_open(&mut conn, self.core.config.max_open_operations_per_table)
+            .list_open(
+                &mut conn,
+                self.core.config.max_open_operations_per_table,
+                None,
+            )
             .await
             .map_err(ForgeError::Sql)?;
         conn.commit().await.map_err(ForgeError::Sql)?;

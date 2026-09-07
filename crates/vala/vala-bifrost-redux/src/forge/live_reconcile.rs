@@ -226,7 +226,11 @@ impl Forge {
             .await
             .map_err(ForgeError::Sql)?;
         let page = operations
-            .list_open(&mut conn, self.core.config.max_open_operations_per_table)
+            .list_open(
+                &mut conn,
+                self.core.config.max_open_operations_per_table,
+                None,
+            )
             .await
             .map_err(ForgeError::Sql)?;
         conn.commit().await.map_err(ForgeError::Sql)?;

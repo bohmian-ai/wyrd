@@ -317,10 +317,17 @@ impl<'resource> ForgeOperations<'resource> {
     ///
     /// The method selects `cap + 1` state rows from the partial
     /// `forge_operation_state_open` index and validates every row (including
-    /// the overflow sentinel). An `overflowed = true` page means the caller
-    /// should narrow the resource/family scope or paginate. The read touches
-    /// only the state projection: `vala.audit_outbox` is a delivery table with
-    /// its own retention, and Forge recovery must not depend on it.
+    /// the overflow sentinel). An `overflowed = true` page means more open
+    /// operations exist past this page. The read touches only the state
+    /// projection: `vala.audit_outbox` is a delivery table with its own
+    /// retention, and Forge recovery must not depend on it.
+    ///
+    /// `after` continues an earlier page from the last row it returned, as
+    /// `(prepared_at, operation_id)` — the exact index order this query already
+    /// uses. It is a keyset rather than an offset because reconciliation must
+    /// see *every* open operation: an offset re-reads or skips rows whenever a
+    /// concurrent owner settles one mid-walk, which is precisely when a
+    /// complete walk matters. Pass `None` for the first page.
     ///
     /// # Errors
     ///
@@ -338,6 +345,7 @@ impl<'resource> ForgeOperations<'resource> {
         &self,
         conn: &mut TenantConn<'_>,
         cap: usize,
+        after: Option<(chrono::DateTime<chrono::Utc>, uuid::Uuid)>,
     ) -> Result<OpenForgeOperationPage, SqlError> {
         if cap == 0 {
             return Err(SqlError::Conflict {
@@ -352,6 +360,9 @@ impl<'resource> ForgeOperations<'resource> {
                 detail: "cap overflow".to_owned(),
             })?;
 
+        // A `NULL` cursor makes the row comparison unknown, so the coalesce
+        // turns "no cursor" into "every row", keeping one statement rather than
+        // two that could drift apart.
         let rows: Vec<ForgeOperationStateSqlRow> = sqlx::query_as(
             r#"
             SELECT *
@@ -360,6 +371,7 @@ impl<'resource> ForgeOperations<'resource> {
                AND resource = $1
                AND family = $2
                AND phase = 'prepared'
+               AND COALESCE((prepared_at, operation_id) > ($4, $5), TRUE)
              ORDER BY prepared_at, operation_id
              LIMIT $3
             "#,
@@ -367,6 +379,8 @@ impl<'resource> ForgeOperations<'resource> {
         .bind(self.resource)
         .bind(self.family.as_str())
         .bind(limit)
+        .bind(after.map(|(prepared_at, _)| prepared_at))
+        .bind(after.map(|(_, operation_id)| operation_id))
         .fetch_all(&mut **conn.transaction())
         .await
         .map_err(SqlError::from)?;

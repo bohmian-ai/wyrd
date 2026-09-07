@@ -1155,6 +1155,140 @@ mod pg_tests {
             );
         }
 
+        /// Keyset paging over open operations is complete and scope-isolated.
+        ///
+        /// Reconciliation must observe every open operation exactly once, so
+        /// the page boundary is walked with the cursor the previous page ended
+        /// on rather than an offset — an offset silently repeats or skips a row
+        /// whenever a concurrent owner settles one mid-walk. Two rows are
+        /// deliberately seeded with the same `prepared_at`, because that is the
+        /// case a timestamp-only cursor loses. The listing is also confined to
+        /// its own family: an open operation of a different family sharing the
+        /// resource must never appear in the page or shift its ordering.
+        ///
+        /// # Panics
+        ///
+        /// Panics when setup fails, when the walk repeats, skips, or reorders a
+        /// row, when overflow is misreported, or when a foreign-family
+        /// operation leaks into the page.
+        #[tokio::test]
+        async fn open_operation_keyset_pagination_is_complete_and_isolated() {
+            let TestFixtures { fixture, .. } = setup().await;
+            let pool = fixture.app_pool();
+            let tenant = fixture.data_tenant_id();
+
+            /// Seeds one Prepared orphan-GC row and returns its id.
+            async fn seed_open(
+                pool: &PgPool,
+                tenant: DataTenantId,
+                family: ForgeOperationFamily,
+                seq: i64,
+            ) -> Uuid {
+                let operation_id = Uuid::now_v7();
+                let detail = match family {
+                    ForgeOperationFamily::OrphanGc => AuditDetail::ForgeOrphanGc {
+                        operation_id,
+                        phase: ForgeOrphanGcPhase::Prepared,
+                        group: resource().to_owned(),
+                        candidate_paths: vec![
+                            StoragePath::new("table/orphans/a.parquet").expect("valid path"),
+                        ],
+                        deleted_paths: vec![],
+                        skipped_paths: vec![],
+                    },
+                    _ => {
+                        expire_detail(operation_id, ForgeSnapshotExpirePhase::Prepared, resource())
+                    }
+                };
+                seed_state_row(
+                    pool,
+                    tenant,
+                    family,
+                    operation_id,
+                    "prepared",
+                    &detail,
+                    &detail,
+                    seq,
+                    None,
+                )
+                .await;
+                operation_id
+            }
+
+            for seq in 0..5_i64 {
+                seed_open(pool, tenant, ForgeOperationFamily::OrphanGc, 100 + seq).await;
+            }
+            // A different family on the same resource must be invisible here.
+            let foreign = seed_open(pool, tenant, ForgeOperationFamily::SnapshotExpire, 200).await;
+
+            // Two rows share one `prepared_at`, so the cursor must carry the
+            // operation id to make progress across that boundary.
+            let mut conn = TenantConn::acquire(pool, tenant)
+                .await
+                .expect("tenant connection for the collision update");
+            sqlx::query(
+                r#"
+                UPDATE vala.forge_operation_state
+                   SET prepared_at = (
+                        SELECT MIN(prepared_at)
+                          FROM vala.forge_operation_state
+                         WHERE family = 'orphan_gc')
+                 WHERE family = 'orphan_gc'
+                "#,
+            )
+            .execute(&mut **conn.transaction())
+            .await
+            .expect("collapse the prepared timestamps");
+            conn.commit().await.expect("collision update commits");
+
+            let ops = ForgeOperations::new(resource(), ForgeOperationFamily::OrphanGc)
+                .expect("valid Forge resource");
+            let mut walked: Vec<Uuid> = Vec::new();
+            let mut cursor = None;
+            let mut pages = 0;
+            loop {
+                let mut conn = TenantConn::acquire(pool, tenant)
+                    .await
+                    .expect("tenant connection for one page");
+                let page = ops
+                    .list_open(&mut conn, 2, cursor)
+                    .await
+                    .expect("bounded open listing");
+                conn.commit().await.expect("page commit");
+                pages += 1;
+                assert!(pages <= 4, "a cursor that does not advance would loop here");
+                for row in &page.operations {
+                    walked.push(row.operation_id);
+                }
+                let Some(last) = page.operations.last() else {
+                    assert!(!page.overflowed, "an empty page cannot overflow");
+                    break;
+                };
+                cursor = Some((last.prepared_at, last.operation_id));
+                if !page.overflowed {
+                    break;
+                }
+            }
+
+            assert_eq!(
+                walked.len(),
+                5,
+                "every open operation is visited exactly once"
+            );
+            let unique: std::collections::BTreeSet<Uuid> = walked.iter().copied().collect();
+            assert_eq!(unique.len(), 5, "no operation is returned twice");
+            assert!(
+                !walked.contains(&foreign),
+                "a different family never leaks into this family's page"
+            );
+            let mut sorted = walked.clone();
+            sorted.sort_unstable();
+            assert_eq!(
+                walked, sorted,
+                "with one shared timestamp the walk is ordered by operation id"
+            );
+        }
+
         /// Builds one snapshot-expiry detail for the fixed test resource.
         ///
         /// # Panics
@@ -1196,7 +1330,7 @@ mod pg_tests {
                 .await
                 .expect("tenant connection for open listing");
             let ops = ForgeOperations::new(resource(), family).expect("valid Forge resource");
-            let result = ops.list_open(&mut conn, 8).await;
+            let result = ops.list_open(&mut conn, 8, None).await;
             conn.commit().await.expect("open listing commit");
             result
         }

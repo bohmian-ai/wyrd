@@ -61,6 +61,7 @@ fn forge_runtime_resources(
             scratch_limit_bytes: None,
             effective_cpu: None,
             oracle_query_slot_limit: None,
+            forge_compaction_memory_limit_bytes: None,
             scratch_root: scratch_root.to_owned(),
             volume_roots: None,
         },
@@ -137,28 +138,6 @@ struct ForgeFixtureSupervision {
     completion_observer: Option<ForgeWorkerCompletionObserver>,
     /// Trigger that wakes the production scheduler loop without invoking it directly.
     scheduler_trigger: Option<ForgeSchedulerTrigger>,
-}
-
-/// Read-only probe for the DataFusion pool owned by one Forge fixture.
-#[derive(Clone)]
-pub struct ForgeMemoryProbe {
-    /// Closure-backed reservation read that avoids exposing DataFusion types.
-    sample: Arc<dyn Fn() -> usize + Send + Sync>,
-}
-
-impl ForgeMemoryProbe {
-    /// Build a probe over the exact pool supplied to Forge.
-    fn new(sample: impl Fn() -> usize + Send + Sync + 'static) -> Self {
-        Self {
-            sample: Arc::new(sample),
-        }
-    }
-
-    /// Return the pool's current reservation in bytes.
-    #[must_use]
-    pub fn current_reserved(&self) -> usize {
-        (self.sample)()
-    }
 }
 
 /// Catalog wrapper used by uncertainty tests.
@@ -1113,7 +1092,7 @@ impl ForgeFixture {
         completion_observer: ForgeWorkerCompletionObserver,
         scheduler_trigger: ForgeSchedulerTrigger,
     ) -> Arc<Forge> {
-        self.build_forge_with_publisher_and_memory_probe_and_supervision(
+        self.build_forge_with_publisher_and_supervision(
             config,
             Arc::clone(&self.catalog),
             Arc::clone(&self.object_store),
@@ -1123,7 +1102,7 @@ impl ForgeFixture {
                 scheduler_trigger: Some(scheduler_trigger),
             },
         )
-        .map(|(forge, _publisher, _probe)| forge)
+        .map(|(forge, _publisher)| forge)
         .expect("validated Forge fixture config")
     }
 
@@ -1141,7 +1120,7 @@ impl ForgeFixture {
         completion_observer: ForgeWorkerCompletionObserver,
         scheduler_trigger: ForgeSchedulerTrigger,
     ) -> (Arc<Forge>, StagingFilePublisher) {
-        self.build_forge_with_publisher_and_memory_probe_and_supervision(
+        self.build_forge_with_publisher_and_supervision(
             config,
             catalog,
             object_store,
@@ -1151,7 +1130,7 @@ impl ForgeFixture {
                 scheduler_trigger: Some(scheduler_trigger),
             },
         )
-        .map(|(forge, publisher, _probe)| (forge, publisher))
+        
         .expect("validated Forge fixture config")
     }
 
@@ -1167,7 +1146,7 @@ impl ForgeFixture {
         scheduler_trigger: ForgeSchedulerTrigger,
         spill_root: &std::path::Path,
     ) -> Arc<Forge> {
-        self.build_forge_with_publisher_and_memory_probe_and_supervision_at(
+        self.build_forge_with_publisher_and_supervision_at(
             config,
             Arc::clone(&self.catalog),
             Arc::clone(&self.object_store),
@@ -1178,7 +1157,7 @@ impl ForgeFixture {
             },
             Some(spill_root),
         )
-        .map(|(forge, _publisher, _probe)| forge)
+        .map(|(forge, _publisher)| forge)
         .expect("validated Forge fixture spill-root config")
     }
 
@@ -1203,29 +1182,13 @@ impl ForgeFixture {
         config: ForgeConfig,
         system_memory_limit_bytes: usize,
     ) -> (Arc<Forge>, StagingFilePublisher) {
-        self.build_forge_with_publisher_and_memory_probe(
+        self.build_forge_with_publisher_and_memory_limit(
             config,
             Arc::clone(&self.catalog),
             Arc::clone(&self.object_store),
             Some(system_memory_limit_bytes),
         )
-        .map(|(forge, publisher, _probe)| (forge, publisher))
-        .expect("validated Forge fixture config")
-    }
-
-    /// Build from a constrained process observation and expose root ownership.
-    #[must_use]
-    pub fn context_with_constrained_memory_and_probe(
-        &self,
-        config: ForgeConfig,
-        system_memory_limit_bytes: usize,
-    ) -> (Arc<Forge>, StagingFilePublisher, ForgeMemoryProbe) {
-        self.build_forge_with_publisher_and_memory_probe(
-            config,
-            Arc::clone(&self.catalog),
-            Arc::clone(&self.object_store),
-            Some(system_memory_limit_bytes),
-        )
+        
         .expect("validated Forge fixture config")
     }
 
@@ -1318,8 +1281,8 @@ impl ForgeFixture {
         object_store: Arc<dyn ForgeObjectStore>,
         memory_limit_bytes: Option<usize>,
     ) -> (Arc<Forge>, StagingFilePublisher) {
-        let (forge, publisher, _probe) = self
-            .build_forge_with_publisher_and_memory_probe(
+        let (forge, publisher) = self
+            .build_forge_with_publisher_and_memory_limit(
                 config,
                 catalog,
                 object_store,
@@ -1329,19 +1292,19 @@ impl ForgeFixture {
         (forge, publisher)
     }
 
-    /// Construct Forge and a probe over its exact DataFusion pool.
+    /// Construct Forge under an optional constrained memory observation.
     ///
     /// # Errors
     ///
     /// Returns an error when the supplied Forge configuration is invalid.
-    fn build_forge_with_publisher_and_memory_probe(
+    fn build_forge_with_publisher_and_memory_limit(
         &self,
         config: ForgeConfig,
         catalog: Arc<dyn Catalog>,
         object_store: Arc<dyn ForgeObjectStore>,
         memory_limit_bytes: Option<usize>,
-    ) -> Result<(Arc<Forge>, StagingFilePublisher, ForgeMemoryProbe), &'static str> {
-        self.build_forge_with_publisher_and_memory_probe_and_supervision(
+    ) -> Result<(Arc<Forge>, StagingFilePublisher), &'static str> {
+        self.build_forge_with_publisher_and_supervision(
             config,
             catalog,
             object_store,
@@ -1350,20 +1313,20 @@ impl ForgeFixture {
         )
     }
 
-    /// Construct Forge, its memory probe, and optional passive supervisor controls.
+    /// Construct Forge with optional passive supervisor controls.
     ///
     /// # Errors
     ///
     /// Returns an error when the supplied Forge configuration is invalid.
-    fn build_forge_with_publisher_and_memory_probe_and_supervision(
+    fn build_forge_with_publisher_and_supervision(
         &self,
         config: ForgeConfig,
         catalog: Arc<dyn Catalog>,
         object_store: Arc<dyn ForgeObjectStore>,
         memory_limit_bytes: Option<usize>,
         supervision: ForgeFixtureSupervision,
-    ) -> Result<(Arc<Forge>, StagingFilePublisher, ForgeMemoryProbe), &'static str> {
-        self.build_forge_with_publisher_and_memory_probe_and_supervision_at(
+    ) -> Result<(Arc<Forge>, StagingFilePublisher), &'static str> {
+        self.build_forge_with_publisher_and_supervision_at(
             config,
             catalog,
             object_store,
@@ -1374,7 +1337,7 @@ impl ForgeFixture {
     }
 
     /// Constructs Forge with an optional caller-owned scratch root.
-    fn build_forge_with_publisher_and_memory_probe_and_supervision_at(
+    fn build_forge_with_publisher_and_supervision_at(
         &self,
         config: ForgeConfig,
         catalog: Arc<dyn Catalog>,
@@ -1382,7 +1345,7 @@ impl ForgeFixture {
         memory_limit_bytes: Option<usize>,
         supervision: ForgeFixtureSupervision,
         spill_root: Option<&std::path::Path>,
-    ) -> Result<(Arc<Forge>, StagingFilePublisher, ForgeMemoryProbe), &'static str> {
+    ) -> Result<(Arc<Forge>, StagingFilePublisher), &'static str> {
         let (publisher, inbox) =
             staging_file_channel(config.max_hints_per_wake).expect("validated Forge hint capacity");
         let runtime_root = spill_root.map_or_else(
@@ -1401,18 +1364,9 @@ impl ForgeFixture {
         let roles = runtime_resources
             .compose_roles()
             .map_err(|_| "invalid Forge resource composition")?;
-        let forge_resources = roles
-            .forge()
-            .ok_or("Forge composition must issue a Forge capability")?;
-        let probe_resources = forge_resources.clone();
-        let probe = ForgeMemoryProbe::new(move || {
-            probe_resources
-                .snapshot()
-                .map_or(0, |snapshot| snapshot.elastic_memory_used_bytes)
-        });
         let forge = Arc::new(
             Forge::new(ForgeBuildConfig {
-                resources: forge_resources,
+                resource_plan: roles.plan(),
                 vala: self.vala.clone(),
                 operator_pool: self.operator_pool.clone(),
                 catalog,
@@ -1423,7 +1377,6 @@ impl ForgeFixture {
                     .full_capability()
                     .list_with_start_after,
                 object_store,
-                rewrite_spill_root: runtime_root,
                 hints: inbox,
                 config,
                 maintenance_interval: std::time::Duration::from_secs(60),
@@ -1434,7 +1387,7 @@ impl ForgeFixture {
             })
             .map_err(|_| "invalid Forge fixture config")?,
         );
-        Ok((forge, publisher, probe))
+        Ok((forge, publisher))
     }
 
     /// Append one aged Scribe-shaped Parquet file and its durable file-list row.

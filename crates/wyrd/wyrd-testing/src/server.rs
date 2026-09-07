@@ -35,7 +35,7 @@ use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::oracle::dispatcher::{DispatchError, OraclePeerCredentials};
 use vala_bifrost_redux::resources::{
     BifrostResourcePolicy, BifrostRole, BifrostRuntimeResources, BifrostVolumeRoots,
-    ForgeRewriteRequest, ForgeRewriteResources, ResourceSource, SystemResourceSnapshot,
+    ResourceSource, SystemResourceSnapshot,
 };
 use vala_bifrost_redux::scribe::ScribeImpl;
 use vala_bifrost_redux::scribe::admission::AdmissionConfig;
@@ -1749,63 +1749,6 @@ impl WyrdTestServer {
             .map(|forge| forge.expiry_controls_for_test())
     }
 
-    /// Hold the live process root's available Forge capacity through one RAII lease.
-    ///
-    /// The returned production lease is opaque to the harness. Dropping it
-    /// releases memory, scratch, and reader counters through the root-owned
-    /// finalizer used by real rewrites.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when Forge is absent or its live root cannot admit the
-    /// exact remaining memory and reader capacity atomically.
-    pub fn hold_forge_root_capacity_for_test(
-        &self,
-    ) -> Result<ForgeRewriteResources, WyrdTestServerError> {
-        let resources = self
-            .inner
-            .state
-            .forge()
-            .ok_or_else(|| WyrdTestServerError::Start("Forge is not composed".to_owned()))?
-            .resources();
-        let snapshot = resources
-            .snapshot()
-            .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-        let memory_bytes = snapshot
-            .plan
-            .elastic_memory_bytes
-            .checked_sub(snapshot.elastic_memory_used_bytes)
-            .ok_or_else(|| {
-                WyrdTestServerError::Start("Forge root memory accounting diverged".to_owned())
-            })?;
-        let reader_permits = u16::try_from(snapshot.plan.effective_cpu).map_err(|_| {
-            WyrdTestServerError::Start("Forge reader capacity exceeds u16".to_owned())
-        })?;
-        let envelope = vala_sql::row_types::forge_tasks::ForgeTaskEnvelope {
-            version: vala_sql::row_types::forge_tasks::FORGE_ENVELOPE_VERSION,
-            reader_permits,
-            decoded_batch_bytes: 0,
-            decoded_input_bytes: u64::try_from(memory_bytes).map_err(|_| {
-                WyrdTestServerError::Start("Forge memory capacity exceeds u64".to_owned())
-            })?,
-            sort_working_bytes: 0,
-            sort_merge_reservation_bytes: 0,
-            encoder_buffer_bytes: 0,
-            upload_chunk_bytes: 0,
-            footer_encoded_bytes: 0,
-            footer_decode_workspace_bytes: 0,
-            sort_spill_bytes: 0,
-        };
-        resources
-            .try_acquire_rewrite(ForgeRewriteRequest {
-                envelope,
-                memory_bytes,
-                scratch_bytes: 1,
-                reader_permits,
-            })
-            .map_err(|error| WyrdTestServerError::Start(error.to_string()))
-    }
-
     /// Arm the canonical one-shot Prepared audit failure on the composed Forge owner.
     ///
     /// # Errors
@@ -3435,13 +3378,11 @@ impl WyrdTestServerBuilder {
             let wal_volume_root = wal_root.path().to_owned();
             let scribe_stage = wal_volume_root.join("scribe-stage");
             let scribe_output = scratch_root.join("scribe-output");
-            let forge_scratch = scratch_root.join("forge");
             let oracle_scratch = scratch_root.join("oracle");
             for root in [
                 &wal_volume_root,
                 &scribe_stage,
                 &scribe_output,
-                &forge_scratch,
                 &oracle_scratch,
             ] {
                 std::fs::create_dir_all(root)
@@ -3451,7 +3392,6 @@ impl WyrdTestServerBuilder {
                 wal: wal_volume_root,
                 scribe_stage,
                 scribe_output_scratch: scribe_output,
-                forge_scratch,
                 oracle_scratch,
             })
         };
@@ -3473,6 +3413,7 @@ impl WyrdTestServerBuilder {
                     scratch_limit_bytes: None,
                     effective_cpu: None,
                     oracle_query_slot_limit: None,
+                    forge_compaction_memory_limit_bytes: None,
                     scratch_root,
                     volume_roots,
                 },
@@ -4167,6 +4108,7 @@ mod production_composition_tests {
                 scratch_limit_bytes: None,
                 effective_cpu: None,
                 oracle_query_slot_limit: None,
+                forge_compaction_memory_limit_bytes: None,
                 scratch_root: scratch.path().to_owned(),
                 volume_roots: None,
             },
@@ -4180,7 +4122,7 @@ mod production_composition_tests {
             "an Oracle node must receive its narrow Oracle capability"
         );
         assert!(
-            composed.forge().is_none(),
+            composed.scribe().is_none(),
             "composition must not issue capabilities for unselected roles"
         );
         let sources = composed.sources();

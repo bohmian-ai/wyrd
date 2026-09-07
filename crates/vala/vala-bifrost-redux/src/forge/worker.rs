@@ -4343,7 +4343,7 @@ impl ForgeWorker {
         // Retains the request each pass derived, which is both the Prepared
         // marker and the exact detail a terminal transition must describe.
         let mut prepared: Option<super::publication::RewriteCommitRequest> = None;
-        let mut retried = false;
+        let mut retries_spent = 0_u32;
         loop {
             let request = self
                 .prepare_rewrite_request(context, handoff, &current, prepared.as_ref(), lease)
@@ -4384,7 +4384,7 @@ impl ForgeWorker {
                 }
             };
             let (action, reloaded_after_conflict) = self
-                .rewrite_follow_up(context, acceptance, request, retried, lease, stop)
+                .rewrite_follow_up(context, acceptance, request, retries_spent, lease, stop)
                 .await?;
             match action {
                 super::publication::RewriteConflictAction::ReconcileWithoutRecommit => {
@@ -4410,9 +4410,30 @@ impl ForgeWorker {
             tracing::debug!(
                 task_id = %context.claim.task_id,
                 error = %conflict,
+                retries_spent,
                 "re-deriving one Forge rewrite after a definite catalog conflict"
             );
-            retried = true;
+            // The schedule owes a delay before the resubmission, and the one
+            // absolute deadline still bounds it. Every way that wait can fail
+            // is definite non-acceptance, so each closes the operation here.
+            if let Err(stopped) = super::publication::RewriteConflictSchedule::wait(
+                retries_spent,
+                context.deadline,
+                self.forge.core.clock.now()?,
+                stop,
+            )
+            .await
+            {
+                let reason = match stopped {
+                    super::publication::RewriteRetryStop::Cancelled => ForgeError::Shutdown,
+                    super::publication::RewriteRetryStop::Exhausted
+                    | super::publication::RewriteRetryStop::DeadlineTruncated => conflict,
+                };
+                return Err(self
+                    .abandon_unsubmitted_rewrite(context, Some(request), handoff, reason, lease)
+                    .await);
+            }
+            retries_spent = retries_spent.saturating_add(1);
             current = reloaded_after_conflict.ok_or_else(|| ForgeError::Invariant {
                 detail: "a revalidated Forge rewrite retry has no reloaded table".to_owned(),
             })?;
@@ -4600,14 +4621,14 @@ impl ForgeWorker {
         context: &RewritePublication<'_>,
         acceptance: super::publication::RewriteAcceptance,
         request: &super::publication::RewriteCommitRequest,
-        retried: bool,
+        retries_spent: u32,
         lease: &mut ForgeLease,
         stop: &CancellationToken,
     ) -> Result<(super::publication::RewriteConflictAction, Option<Table>), ForgeError> {
         match acceptance {
             super::publication::RewriteAcceptance::Ambiguous => Ok((
                 acceptance.next_action(
-                    retried,
+                    retries_spent,
                     false,
                     super::publication::RewriteCommitDecision::Proceed,
                 ),
@@ -4642,7 +4663,7 @@ impl ForgeWorker {
                     )
                     .await?;
                 let action = acceptance.next_action(
-                    retried,
+                    retries_spent,
                     context.deadline.passed(self.forge.core.clock.now()?),
                     authority.decide(),
                 );

@@ -904,24 +904,114 @@ pub(super) enum RewriteConflictAction {
     ReconcileWithoutRecommit,
 }
 
+/// Retries permitted after the initial submission of one plan.
+const REWRITE_CONFLICT_RETRIES: u32 = 3;
+
+/// Delay before the first retry; each later one multiplies by the factor.
+const REWRITE_CONFLICT_INITIAL_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Growth factor of the retry delay. Deliberately not configurable.
+const REWRITE_CONFLICT_BACKOFF_FACTOR: u32 = 2;
+
+/// Ceiling one retry delay may reach, regardless of the factor.
+const REWRITE_CONFLICT_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Backoff schedule for the definite-conflict retries of one plan.
+///
+/// The schedule is a pure function of how many retries this plan has already
+/// spent, so it holds no clock, no timer, and no configuration: 1s, 2s, 4s, and
+/// then nothing. There is no jitter, because the contention this backs off from
+/// is one worker's own plans against one table head — a spread that jitter
+/// would only blur — and the absolute publication deadline, not the schedule,
+/// is what bounds the total wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct RewriteConflictSchedule;
+
+/// Why a scheduled retry did not happen.
+///
+/// All three are definite non-acceptance — the plan is provably uncommitted —
+/// but they differ in what the caller records, so they stay distinct rather
+/// than collapsing into one boolean.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RewriteRetryStop {
+    /// The schedule owes no further retry.
+    Exhausted,
+    /// The absolute publication deadline cannot cover the delay plus a call.
+    DeadlineTruncated,
+    /// The attempt was cancelled while waiting.
+    Cancelled,
+}
+
+impl RewriteConflictSchedule {
+    /// Returns the delay owed before the retry after `retries_spent`.
+    ///
+    /// `None` means the plan has exhausted its retries and is definitely
+    /// uncommitted.
+    pub(super) fn delay_after(retries_spent: u32) -> Option<std::time::Duration> {
+        if retries_spent >= REWRITE_CONFLICT_RETRIES {
+            return None;
+        }
+        let scaled = REWRITE_CONFLICT_INITIAL_BACKOFF
+            .checked_mul(REWRITE_CONFLICT_BACKOFF_FACTOR.checked_pow(retries_spent)?)?;
+        Some(scaled.min(REWRITE_CONFLICT_MAX_BACKOFF))
+    }
+
+    /// Waits the delay owed after `retries_spent`, or explains why it will not.
+    ///
+    /// The deadline is checked *before* the sleep, against the delay the sleep
+    /// would consume, because a wait that consumes the last of the budget
+    /// leaves the resubmission no time to be answered in — and an unanswered
+    /// resubmission is exactly the ambiguity this whole path exists to avoid.
+    /// Cancellation is observed during the wait rather than only around it, so
+    /// a shutdown does not have to outlast the longest backoff.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RewriteRetryStop`] when the schedule is exhausted, the
+    /// deadline cannot cover the delay, or the attempt was cancelled.
+    ///
+    /// # Cancellation
+    ///
+    /// Cancellation during the wait returns [`RewriteRetryStop::Cancelled`]
+    /// without resubmitting, leaving the plan definitely uncommitted.
+    pub(super) async fn wait(
+        retries_spent: u32,
+        deadline: RewritePublicationDeadline,
+        now: chrono::DateTime<chrono::Utc>,
+        stop: &tokio_util::sync::CancellationToken,
+    ) -> Result<(), RewriteRetryStop> {
+        let delay = Self::delay_after(retries_spent).ok_or(RewriteRetryStop::Exhausted)?;
+        if deadline
+            .remaining(now)
+            .is_none_or(|remaining| remaining <= delay)
+        {
+            return Err(RewriteRetryStop::DeadlineTruncated);
+        }
+        tokio::select! {
+            () = tokio::time::sleep(delay) => Ok(()),
+            () = stop.cancelled() => Err(RewriteRetryStop::Cancelled),
+        }
+    }
+}
+
 impl RewriteAcceptance {
     /// Chooses the one legal follow-up for this acceptance.
     ///
     /// Ambiguity always reconciles: no amount of remaining budget or unchanged
-    /// authority makes resubmitting an unknown commit safe. A definite
-    /// conflict buys exactly one revalidated retry, and only while the retry
-    /// has not already been spent, the original deadline still holds, and every
-    /// assumption the first attempt was built on is still true.
-    pub(super) const fn next_action(
+    /// authority makes resubmitting an unknown commit safe. A definite conflict
+    /// buys a revalidated retry while the schedule still owes one, the original
+    /// deadline still holds, and every assumption the first attempt was built
+    /// on is still true.
+    pub(super) fn next_action(
         self,
-        already_retried: bool,
+        retries_spent: u32,
         deadline_passed: bool,
         authority: RewriteCommitDecision,
     ) -> RewriteConflictAction {
         match self {
             Self::Ambiguous => RewriteConflictAction::ReconcileWithoutRecommit,
             Self::DefiniteConflict => {
-                if already_retried
+                if RewriteConflictSchedule::delay_after(retries_spent).is_none()
                     || deadline_passed
                     || !matches!(authority, RewriteCommitDecision::Proceed)
                 {
@@ -2052,34 +2142,158 @@ mod tests {
         }
 
         // Uncertain acceptance never recommits, whatever else is true.
-        for retried in [false, true] {
+        for retries_spent in 0..=super::REWRITE_CONFLICT_RETRIES {
             assert_eq!(
-                RewriteAcceptance::Ambiguous.next_action(retried, false, authorized.decide()),
+                RewriteAcceptance::Ambiguous.next_action(retries_spent, false, authorized.decide()),
                 RewriteConflictAction::ReconcileWithoutRecommit
             );
         }
-        // A definite conflict buys exactly one fully revalidated retry.
+        // A definite conflict buys each scheduled retry and no more.
+        for retries_spent in 0..super::REWRITE_CONFLICT_RETRIES {
+            assert_eq!(
+                RewriteAcceptance::DefiniteConflict.next_action(
+                    retries_spent,
+                    false,
+                    authorized.decide()
+                ),
+                RewriteConflictAction::RevalidateAndRecommit
+            );
+        }
         assert_eq!(
-            RewriteAcceptance::DefiniteConflict.next_action(false, false, authorized.decide()),
-            RewriteConflictAction::RevalidateAndRecommit
-        );
-        assert_eq!(
-            RewriteAcceptance::DefiniteConflict.next_action(true, false, authorized.decide()),
+            RewriteAcceptance::DefiniteConflict.next_action(
+                super::REWRITE_CONFLICT_RETRIES,
+                false,
+                authorized.decide()
+            ),
             RewriteConflictAction::ResetDefinitelyUncommitted
         );
         assert_eq!(
-            RewriteAcceptance::DefiniteConflict.next_action(false, true, authorized.decide()),
+            RewriteAcceptance::DefiniteConflict.next_action(0, true, authorized.decide()),
             RewriteConflictAction::ResetDefinitelyUncommitted
         );
         assert_eq!(
             RewriteAcceptance::DefiniteConflict.next_action(
-                false,
+                0,
                 false,
                 RewriteCommitDecision::Refuse(RewriteRefusal::InputsChanged)
             ),
             RewriteConflictAction::ResetDefinitelyUncommitted,
             "a changed assumption ends the attempt instead of buying a retry"
         );
+    }
+
+    /// The retry schedule and unknown acceptance are exact, not approximate.
+    ///
+    /// Every branch of the definite-conflict path is here because each one is a
+    /// way to publish twice or to strand an operation: a delay that drifts, a
+    /// wait the deadline cannot cover, a cancellation that resubmits anyway, or
+    /// an ambiguous answer treated as a refusal. Time is paused, so the elapsed
+    /// figures are the schedule's own and not a timing artefact.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a delay, the exhaustion point, the deadline truncation, the
+    /// cancellation behaviour, or the ambiguous action changes.
+    #[tokio::test(start_paused = true)]
+    async fn definite_conflict_retry_schedule_and_unknown_acceptance_are_exact() {
+        use std::time::Duration;
+        use tokio_util::sync::CancellationToken;
+
+        // Exactly three retries at 1s, 2s, 4s — factor two, no jitter, and
+        // nothing after the third.
+        assert_eq!(
+            (0..=super::REWRITE_CONFLICT_RETRIES)
+                .map(RewriteConflictSchedule::delay_after)
+                .collect::<Vec<_>>(),
+            vec![
+                Some(Duration::from_secs(1)),
+                Some(Duration::from_secs(2)),
+                Some(Duration::from_secs(4)),
+                None,
+            ]
+        );
+        assert!(
+            RewriteConflictSchedule::delay_after(u32::MAX).is_none(),
+            "an impossible retry count is exhaustion, never an overflow"
+        );
+        assert!(
+            super::REWRITE_CONFLICT_INITIAL_BACKOFF.saturating_mul(
+                super::REWRITE_CONFLICT_BACKOFF_FACTOR.pow(super::REWRITE_CONFLICT_RETRIES - 1)
+            ) <= super::REWRITE_CONFLICT_MAX_BACKOFF,
+            "the retained ceiling must not silently reshape the schedule"
+        );
+
+        let stop = CancellationToken::new();
+        let now = chrono::Utc::now();
+        let generous = RewritePublicationDeadline::new(now, Duration::from_secs(600))
+            .expect("a representable deadline");
+
+        // Each wait consumes exactly its scheduled delay.
+        for retries_spent in 0..super::REWRITE_CONFLICT_RETRIES {
+            let before = tokio::time::Instant::now();
+            RewriteConflictSchedule::wait(retries_spent, generous, now, &stop)
+                .await
+                .expect("a scheduled retry waits");
+            assert_eq!(
+                before.elapsed(),
+                RewriteConflictSchedule::delay_after(retries_spent).expect("scheduled"),
+                "the wait is the schedule's delay, exactly"
+            );
+        }
+        assert_eq!(
+            RewriteConflictSchedule::wait(super::REWRITE_CONFLICT_RETRIES, generous, now, &stop)
+                .await,
+            Err(RewriteRetryStop::Exhausted)
+        );
+
+        // A deadline that cannot cover the delay plus an answer truncates
+        // before sleeping rather than shortening the wait.
+        let tight = RewritePublicationDeadline::new(now, Duration::from_millis(1_000))
+            .expect("a representable deadline");
+        let before = tokio::time::Instant::now();
+        assert_eq!(
+            RewriteConflictSchedule::wait(0, tight, now, &stop).await,
+            Err(RewriteRetryStop::DeadlineTruncated)
+        );
+        assert_eq!(
+            before.elapsed(),
+            Duration::ZERO,
+            "truncation does not sleep"
+        );
+        assert_eq!(
+            RewriteConflictSchedule::wait(0, tight, now + chrono::Duration::seconds(5), &stop)
+                .await,
+            Err(RewriteRetryStop::DeadlineTruncated),
+            "an elapsed deadline is also a truncation, never an unbounded wait"
+        );
+
+        // Cancellation interrupts the backoff instead of outlasting it.
+        let cancelled = CancellationToken::new();
+        let before = tokio::time::Instant::now();
+        let waiting = tokio::spawn({
+            let cancelled = cancelled.clone();
+            async move { RewriteConflictSchedule::wait(2, generous, now, &cancelled).await }
+        });
+        tokio::time::advance(Duration::from_secs(1)).await;
+        cancelled.cancel();
+        assert_eq!(
+            waiting.await.expect("the waiter joins"),
+            Err(RewriteRetryStop::Cancelled)
+        );
+        assert!(
+            before.elapsed() < Duration::from_secs(4),
+            "cancellation must not wait out the full backoff"
+        );
+
+        // Ambiguity never resubmits, at any point in the schedule.
+        let authorized = authorized_rewrite_commit_authority();
+        for retries_spent in 0..=super::REWRITE_CONFLICT_RETRIES {
+            assert_eq!(
+                RewriteAcceptance::Ambiguous.next_action(retries_spent, false, authorized.decide()),
+                RewriteConflictAction::ReconcileWithoutRecommit,
+                "an unknown acceptance leaves the operation Prepared for reconciliation"
+            );
+        }
     }
 
     /// The closed matrix always reports its outermost broken dimension.

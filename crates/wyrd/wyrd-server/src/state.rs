@@ -1282,8 +1282,6 @@ pub struct Forge {
     coordinator: Option<Arc<ForgeCoordinator>>,
     /// Selected bounded task worker.
     worker: Option<Arc<ForgeWorker>>,
-    /// Root-derived Forge resource capability.
-    resources: vala_bifrost_redux::resources::ForgeResources,
     /// Process lifecycle signal shared by both selected capabilities.
     shutdown: CancellationToken,
     /// Stable physical node identity retained by the selected Forge owner.
@@ -1302,14 +1300,12 @@ impl Forge {
     pub fn new(
         coordinator: Option<Arc<ForgeCoordinator>>,
         worker: Option<Arc<ForgeWorker>>,
-        resources: vala_bifrost_redux::resources::ForgeResources,
         shutdown: CancellationToken,
         node_id: wyrd_spec::vala::api::NodeId,
     ) -> Self {
         Self {
             coordinator,
             worker,
-            resources,
             shutdown,
             node_id,
             supervision_drained: Arc::new(AtomicBool::new(false)),
@@ -1340,12 +1336,6 @@ impl Forge {
     #[must_use]
     pub const fn worker(&self) -> Option<&Arc<ForgeWorker>> {
         self.worker.as_ref()
-    }
-
-    /// Returns the root-derived Forge resource capability.
-    #[must_use]
-    pub fn resources(&self) -> vala_bifrost_redux::resources::ForgeResources {
-        self.resources.clone()
     }
 
     /// Borrows the token every selected Forge capability stops on.
@@ -1660,13 +1650,15 @@ impl Bifrost {
     }
 
     /// Returns the shared root-health signal through one selected role capability.
+    ///
+    /// Forge is not a source here: it holds no memory or scratch capability, so
+    /// a Forge-only target has no root ledger to report on.
     #[must_use]
     pub fn resource_health(&self) -> Option<vala_bifrost_redux::resources::BifrostResourceHealth> {
         self.scribe
             .as_ref()
             .map(|scribe| scribe.resources.health())
             .or_else(|| self.oracle.as_ref().map(|oracle| oracle.resources.health()))
-            .or_else(|| self.forge.as_ref().map(|forge| forge.resources.health()))
     }
 
     /// Dispatches one authorized SQL request through Gate into the selected Oracle.

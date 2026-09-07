@@ -470,13 +470,7 @@ async fn build_bifrost_external_dependencies(
     let oracle_scratch = prepare_oracle_spill_root(Some(wal_dir.clone()))?;
     let scribe_stage = wal_dir.join("scribe-stage");
     let scribe_output_scratch = wal_dir.join("scribe-output-scratch");
-    let forge_scratch = wal_dir.join("forge-spill");
-    for root in [
-        &wal_dir,
-        &scribe_stage,
-        &scribe_output_scratch,
-        &forge_scratch,
-    ] {
+    for root in [&wal_dir, &scribe_stage, &scribe_output_scratch] {
         std::fs::create_dir_all(root).map_err(|error| {
             ServerBootError::Scribe(format!("Bifrost volume root creation failed: {error}"))
         })?;
@@ -500,12 +494,12 @@ async fn build_bifrost_external_dependencies(
             scratch_limit_bytes: config.resources.scratch_limit_bytes,
             effective_cpu: config.resources.effective_cpu,
             oracle_query_slot_limit: config.resources.oracle_query_slot_limit,
+            forge_compaction_memory_limit_bytes: None,
             scratch_root: oracle_scratch.clone(),
             volume_roots: Some(vala_bifrost_redux::resources::BifrostVolumeRoots {
                 wal: wal_dir.clone(),
                 scribe_stage,
                 scribe_output_scratch,
-                forge_scratch,
                 oracle_scratch,
             }),
         },
@@ -600,13 +594,7 @@ pub async fn compose_bifrost(
     let scribe_config = bifrost_config.scribe;
     let scribe_stage = wal_dir.join("scribe-stage");
     let scribe_output_scratch = wal_dir.join("scribe-output-scratch");
-    let forge_scratch = wal_dir.join("forge-spill");
-    for root in [
-        &wal_dir,
-        &scribe_stage,
-        &scribe_output_scratch,
-        &forge_scratch,
-    ] {
+    for root in [&wal_dir, &scribe_stage, &scribe_output_scratch] {
         std::fs::create_dir_all(root).map_err(|error| {
             ServerBootError::Scribe(format!("Bifrost volume root creation failed: {error}"))
         })?;
@@ -870,7 +858,6 @@ pub async fn compose_bifrost(
         {
             forge_config = config;
         }
-        let rewrite_spill_root = wal_dir.join("forge-spill");
         let staging = Arc::new(storage.operator().clone());
         // Read from the concrete operator before it is erased behind
         // `ForgeObjectStore`: only the backend itself can answer whether a
@@ -884,13 +871,8 @@ pub async fn compose_bifrost(
         #[cfg(not(feature = "test-support"))]
         let object_store: Arc<dyn ForgeObjectStore> =
             Arc::new(OpenDalForgeObjectStore::new(Arc::clone(&staging)));
-        let forge_resources = bifrost_resources.forge().ok_or_else(|| {
-            ServerBootError::Scribe(
-                "Forge role selected without a composed Forge capability".to_owned(),
-            )
-        })?;
         let coordinator = Arc::new(ForgeCoordinator::new(ForgeBuildConfig {
-            resources: forge_resources.clone(),
+            resource_plan,
             vala: postgres.vala().clone(),
             operator_pool: operator_pool.clone(),
             catalog: {
@@ -909,7 +891,6 @@ pub async fn compose_bifrost(
             staging,
             staging_lists_by_cursor,
             object_store,
-            rewrite_spill_root,
             hints: staging_file_inbox,
             config: forge_config,
             maintenance_interval,
@@ -955,7 +936,6 @@ pub async fn compose_bifrost(
                 .contains(&BifrostRuntimeRole::ForgeCoordinator)
                 .then_some(coordinator),
             worker,
-            forge_resources,
             shutdown.clone(),
             node_id,
         )))

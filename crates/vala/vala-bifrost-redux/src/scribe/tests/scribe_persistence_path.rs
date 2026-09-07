@@ -110,6 +110,163 @@ fn principal(tenant: DataTenantId) -> Principal {
     }
 }
 
+/// Build a canonical nested batch shaped like the signal ledgers' output.
+///
+/// The columns carry `PARQUET:field_id` metadata and a `List<Struct<..>>`
+/// repeated-record column, which is the deepest shape any canonical signal
+/// projection emits. Only the recursive fixed IPC encoder can persist it, so
+/// this fixture proves the managed WAL path accepts canonical nesting.
+///
+/// # Panics
+/// Panics when the Arrow fixture cannot be constructed.
+fn nested_batch(partition: crate::catalog::layout::TimePartition) -> RecordBatch {
+    use arrow::array::{Float64Array, ListArray, StringArray, StructArray};
+    use arrow::buffer::OffsetBuffer;
+    use arrow::datatypes::Fields;
+    use std::collections::HashMap;
+
+    let with_id = |field: Field, id: i32| {
+        field.with_metadata(HashMap::from([(
+            "PARQUET:field_id".to_owned(),
+            id.to_string(),
+        )]))
+    };
+    let quantile_fields = Fields::from(vec![
+        with_id(Field::new("quantile", DataType::Float64, false), 3),
+        with_id(Field::new("value", DataType::Float64, true), 4),
+    ]);
+    let quantiles = Arc::new(StructArray::new(
+        quantile_fields.clone(),
+        vec![
+            Arc::new(Float64Array::from(vec![0.5, 0.9])) as ArrayRef,
+            Arc::new(Float64Array::from(vec![Some(1.0), None])),
+        ],
+        None,
+    ));
+    let element = Arc::new(with_id(
+        Field::new("item", DataType::Struct(quantile_fields), false),
+        2,
+    ));
+    let quantile_values = ListArray::new(
+        Arc::clone(&element),
+        OffsetBuffer::new(vec![0, 2].into()),
+        quantiles,
+        None,
+    );
+    let timestamp = partition.start_utc().timestamp_micros();
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new(
+                "wyrd_event_time",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                false,
+            ),
+            with_id(Field::new("metric_name", DataType::Utf8, false), 1),
+            Field::new(
+                "quantile_values",
+                DataType::List(Arc::clone(&element)),
+                false,
+            )
+                .with_metadata(HashMap::from([(
+                    "PARQUET:field_id".to_owned(),
+                    "5".to_owned(),
+                )])),
+        ])),
+        vec![
+            Arc::new(TimestampMicrosecondArray::from(vec![timestamp]).with_timezone("UTC")),
+            Arc::new(StringArray::from(vec!["latency"])),
+            Arc::new(quantile_values),
+        ],
+    )
+    .expect("canonical nested batch")
+}
+
+/// Canonical nested batches take the one managed WAL path (S2).
+///
+/// The nested, metadata-bearing shape an OTLP projection produces is admitted,
+/// managed-stamped, and durably appended through exactly the path a flat
+/// public canonical write takes, then read back losslessly from the tail.
+#[tokio::test]
+async fn canonical_nested_batches_share_one_managed_wal_path() {
+    let tenant = DataTenantId::new_v7();
+    let table = TableRef::new(BifrostNamespace::Bifrost, "scribe_nested_canonical");
+    let day = fixture_event_day(1);
+    let rows = nested_batch(day);
+    let quantiles = Arc::clone(rows.column(2));
+    let batch_id = Uuid::now_v7();
+    let temp_dir = TempDir::new().expect("WAL temp dir");
+    let operator = Arc::new(
+        opendal::Operator::new(opendal::services::Memory::default())
+            .expect("memory operator")
+            .finish(),
+    );
+    let wal = Arc::new(
+        WalWriter::new(
+            temp_dir.path(),
+            *Uuid::nil().as_bytes(),
+            1,
+            WalConfig::default(),
+        )
+        .expect("WAL writer"),
+    );
+    let scribe = ScribeImpl::new_for_embedded_with_deps(operator, wal, &Uuid::nil().to_string(), 1);
+
+    let principal = principal(tenant);
+    let request_id = RequestId::now_v7();
+    let admission = Scribe::ingest_frame(
+        &scribe,
+        ScribeIngressFrame {
+            authenticated_tenant: tenant,
+            audit_event: frame_audit_event(&principal, &table, &request_id),
+            principal,
+            table: table.clone(),
+            expected_schema_fingerprint: Some(projected_source_schema_fingerprint(
+                rows.schema().as_ref(),
+            )),
+            request_id,
+            batch_id,
+            measured_wire_bytes: 0,
+            payload: IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(
+                vec![rows],
+            )),
+        },
+    )
+    .await
+    .expect("nested canonical batches reach the managed WAL path");
+    assert_eq!(admission.rows_accepted, 1);
+
+    let binding = TenantTableBinding::resolve((tenant, table)).expect("binding");
+    let hot = scribe
+        .tail_service()
+        .expect("tail service")
+        .fetch_hot_batches(FetchLiveTailRequest {
+            binding,
+            target_stream: StreamIdentity::new(NodeId::new(Uuid::nil()), WriterEpoch::new(1)),
+            start_partition: day,
+            end_partition: day,
+            required_columns: vec!["quantile_values".to_owned(), "wyrd_row_ordinal".to_owned()],
+            predicates: Vec::new(),
+            max_batches: 64,
+            max_retained_bytes: 64 * 1024 * 1024,
+        })
+        .await
+        .expect("hot snapshot");
+    assert_eq!(hot.len(), 1);
+    let projected = &hot[0].rows;
+    let nested = projected
+        .column_by_name("quantile_values")
+        .expect("the nested canonical column survives the managed WAL path");
+    assert_eq!(nested.as_ref(), quantiles.as_ref());
+    assert!(
+        projected.column_by_name("wyrd_row_ordinal").is_some(),
+        "the managed envelope stamps nested batches like every other write"
+    );
+
+    scribe
+        .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(1))
+        .await;
+}
+
 #[tokio::test]
 /// Production shards expose exact projections and WAL bounds to tail readers.
 async fn production_shard_snapshot_serves_exact_projection_and_lsn_range() {

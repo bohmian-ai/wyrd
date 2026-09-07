@@ -122,6 +122,32 @@ These checks are part of the storage boundary. A path that escapes the table
 prefix, a foreign tenant row, a missing field, or a partition mismatch stops
 the operation before the catalog commit.
 
+### Publishing one attempt's plans
+
+One compaction attempt plans every eligible group of its table and publishes
+each plan on its own Iceberg commit and its own operation, against the head the
+plan before it left. Plans of the same attempt run and commit concurrently: a
+plan that fails costs only itself, and a plan that commits is durable
+immediately.
+
+Each plan's publication runs under one absolute deadline captured when the
+attempt starts. Within that budget a plan submits its commit once, and a
+*definite* conflict — the catalog answered, so nothing landed — buys a
+revalidated retry: the fixed schedule allows three, delayed 1s, 2s, and 4s.
+Each retry reloads the table and re-derives the replacement before resubmitting,
+and it is taken only while the deadline still covers the delay plus a call. The
+schedule is not configurable, and no retry extends the deadline. A plan that
+exhausts its retries is definitely uncommitted and closes its operation. A
+submission whose acceptance is never learned closes nothing: its operation
+stays prepared until proof about that exact operation settles it.
+
+The attempt itself settles on any success. One committed plan makes the task
+successful however its siblings ended, and the groups that did not finish stay
+ordinary compaction debt that a later pass replans against the current head.
+
+Scribe promotion is a different operation with its own protocol and is not
+subject to this rewrite retry schedule.
+
 ### Durable compaction states
 
 Postgres and Iceberg cannot participate in one transaction. Forge makes that

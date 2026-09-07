@@ -1055,11 +1055,12 @@ impl RewriteAcceptance {
 
 /// The one absolute instant every catalog call of one publication shares.
 ///
-/// A publication is allowed at most two catalog calls, and both of them are the
-/// same operation. Giving each call its own timeout would let a first call that
-/// burned the whole budget hand the retry a second full one, so the budget is
-/// captured once as an *instant* rather than a duration and every later call
-/// derives its wait from what is left of it. Nothing may renew it.
+/// A publication is allowed its initial submission plus the scheduled
+/// definite-conflict retries, and every one of those calls is the same
+/// operation. Giving each call its own timeout would let a first call that
+/// burned the whole budget hand the next one a second full budget, so the
+/// budget is captured once as an *instant* rather than a duration and every
+/// later call derives its wait from what is left of it. Nothing may renew it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct RewritePublicationDeadline {
     /// Absolute UTC instant no catalog call may start at or complete after.

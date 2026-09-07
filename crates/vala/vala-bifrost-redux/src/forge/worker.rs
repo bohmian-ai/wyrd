@@ -5707,16 +5707,19 @@ redacted
     ///    naming the inputs and outputs a successor would reconcile.
     /// 3. The commit is submitted under `context.deadline`, one absolute budget
     ///    shared by every pass. A definite conflict — the catalog *answered*,
-    ///    so nothing landed — buys at most one revalidated retry against the
-    ///    reloaded table, and only while that same deadline still has budget;
-    ///    the retry never renews it.
+    ///    so nothing landed — buys a revalidated retry against the reloaded
+    ///    table: the fixed schedule permits three of them, delayed 1s, 2s and
+    ///    4s, and each one only while that same deadline still has budget for
+    ///    the delay plus a call. No retry renews the deadline, and the schedule
+    ///    is deliberately not configurable. Sibling plans of the same attempt
+    ///    publish concurrently and independently while this one retries.
     /// 4. A committed submission settles the operation terminally through
     ///    [`Self::settle_committed_rewrite`], which writes the SQL settlement
     ///    and the terminal audit in the same transition.
     ///
     /// The distinction the return value carries is the point of the whole
     /// method. *Definitely unsubmitted* — a refusal, a not-submitted transport
-    /// failure, or a definite conflict with the retry spent — closes the
+    /// failure, or a definite conflict with the schedule spent — closes the
     /// operation here as Reset, because asking a successor to reconcile a
     /// commit that never started would block that table's fresh work forever.
     /// *Submitted but acceptance unknown* claims nothing: the operation is left
@@ -5907,7 +5910,8 @@ redacted
         Err(conflict)
     }
 
-    /// Waits the definite-conflict backoff owed before one revalidated retry.
+    /// Waits the definite-conflict backoff owed before the next revalidated
+    /// retry.
     ///
     /// The wait belongs before the revalidation, not after it: a plan that
     /// reloaded metadata and then slept would resubmit against a picture of the

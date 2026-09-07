@@ -11,8 +11,8 @@ mod orphan_cleanup;
 mod production_routes;
 mod promotion;
 mod publication;
-redacted
 mod reader_expiry_ordering;
 mod rewrite_support;
+redacted
 pub(crate) mod snapshot_expiration;
 pub(crate) mod support;

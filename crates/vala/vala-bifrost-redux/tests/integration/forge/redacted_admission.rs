@@ -12,7 +12,7 @@ use std::sync::Arc;
 use vala_bifrost_redux::forge::{ForgeClock, ForgeObjectStore};
 
 use super::rewrite_support::PromotedRewriteFixture;
-use super::support::{CountingObjectStore, SupervisedPromotion};
+use super::support::{CountingObjectStore, PromotionCatalogSeam, SupervisedPromotion};
 
 /// Every admitted plan publishes its own operation onto the current head.
 ///
@@ -77,9 +77,7 @@ redacted
         "every published plan opened exactly one operation: {operations:?}"
     );
     assert!(
-        operations
-            .iter()
-            .all(|(_, phase)| phase == "committed"),
+        operations.iter().all(|(_, phase)| phase == "committed"),
         "every published plan settled its own operation: {operations:?}"
     );
     assert_eq!(
@@ -129,4 +127,230 @@ redacted
         live.is_disjoint(&inputs),
         "the composed cut is made of replacements, never the inputs they replaced: {live:?}"
     );
+}
+
+redacted
+///
+/// An attempt is many independent publications, so its task result is a
+redacted
+/// rule
+/// is that partial progress is progress: a single durable commit makes the
+/// whole attempt successful and leaves its unfinished siblings as ordinary
+/// planning debt, because the commit cannot be undone and re-running the debt
+/// is exactly what the next attempt already does. Only when nothing at all
+/// published does a failure decide the task, and only when planning selects
+/// nothing does the attempt acknowledge an already-compact table without
+/// spending an attempt against it.
+///
+/// The three phases below are the three outcomes that rule distinguishes, and
+/// they are driven through the real catalog seam rather than a verdict: a
+/// bounded refusal budget kills the head plan through its whole retry
+/// schedule, an unbounded one kills every plan, and a compacted table plans
+/// nothing.
+///
+/// # Panics
+///
+/// Panics when a partly published attempt is reported as a failure, when a
+/// wholly refused attempt is reported as a success or misclassified, when a
+/// refused plan leaves its operation open, or when an attempt that planned
+/// nothing consumes the task's attempt budget or writes an operation.
+#[tokio::test]
+redacted
+redacted
+    let object_store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
+    let catalog = PromotionCatalogSeam::new(
+        promoted.fixture.catalog.iceberg_catalog(),
+        object_store.read_counter(),
+    );
+    let mut supervisor = SupervisedPromotion::start(
+        &promoted.fixture,
+        Arc::clone(&catalog) as Arc<dyn iceberg::Catalog>,
+        Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
+        ForgeClock::system(),
+    );
+    promoted.fixture.seal_more(2).await;
+    supervisor.run_one_success().await;
+
+    // Phase one: the head plan exhausts its whole retry schedule against a
+    // definite refusal while its siblings commit. One durable commit is
+    // progress, so the attempt succeeds and spends nothing.
+    let snapshots_before = promoted.load_table().await.metadata().snapshots().count();
+    catalog.reject_next_commits(REFUSALS_PER_PLAN);
+    supervisor.restart_worker();
+    supervisor.run_one_success().await;
+
+    let operations = promoted.fixture.rewrite_operations().await;
+    let published = promoted.load_table().await.metadata().snapshots().count() - snapshots_before;
+    assert!(
+        published >= 1,
+        "a sibling of the refused plan published its own commit: {operations:?}"
+    );
+    assert_eq!(
+        operations
+            .iter()
+            .filter(|(_, phase)| phase == "reset")
+            .count(),
+        1,
+        "the refused plan closed its own operation as never-published: {operations:?}"
+    );
+    assert_eq!(
+        operations
+            .iter()
+            .filter(|(_, phase)| phase == "committed")
+            .count(),
+        published,
+        "every other plan settled its own operation as committed: {operations:?}"
+    );
+    let partial = latest_small_files_task(&promoted.fixture).await;
+    assert_eq!(
+        partial.state, "succeeded",
+        "a partly published attempt is a successful task: {partial:?}"
+    );
+    assert_eq!(
+        partial.failure_class, None,
+        "a successful task records no failure class: {partial:?}"
+    );
+
+    // Phase two: nothing publishes, so the reduction reports one plan's typed
+    // failure, and that failure — not a sibling's — is what the task carries.
+    let snapshots_before = promoted.load_table().await.metadata().snapshots().count();
+    let operations_before = promoted.fixture.rewrite_operations().await.len();
+    catalog.reject_remaining_commits();
+    supervisor.restart_worker();
+    let error = supervisor.run_one_failure().await;
+
+    let operations = promoted.fixture.rewrite_operations().await;
+    assert_eq!(
+        promoted.load_table().await.metadata().snapshots().count(),
+        snapshots_before,
+        "an attempt whose every plan was refused publishes nothing: {error}"
+    );
+    assert!(
+        operations.len() > operations_before,
+        "every admitted plan still opened its own operation: {operations:?}"
+    );
+    assert!(
+        operations[operations_before..]
+            .iter()
+            .all(|(_, phase)| phase == "reset"),
+        "every refused plan closed its operation as never-published: {operations:?}"
+    );
+    let refused = latest_small_files_task(&promoted.fixture).await;
+    assert_eq!(
+        refused.state, "retryable",
+        "a wholly refused attempt leaves the task retryable: {refused:?}"
+    );
+    assert_eq!(
+        refused.failure_class.as_deref(),
+        Some("transient_object_store"),
+        "the deciding plan's own typed catalog failure classifies the task, \
+         not a generic reduction verdict: {refused:?}"
+    );
+    assert_eq!(
+        refused.attempt_count, 1,
+        "exactly one attempt was spent: {refused:?}"
+    );
+    assert!(
+        refused.next_eligible_at > chrono::Utc::now(),
+        "a retryable task backs off before it is claimable again: {refused:?}"
+    );
+
+    assert_compact_table_is_acknowledged(&promoted, supervisor, &catalog).await;
+}
+
+/// Drives the fixture table to compaction and proves a zero-plan attempt.
+///
+/// Planning that selects nothing is the third outcome the reduction has to
+/// distinguish: it is not a failure, so it must acknowledge the table rather
+/// than spend the task's attempt budget and terminalize an idle table after
+/// five passes. The table is first compacted through ordinary passes, and the
+/// settled task is then re-offered, because that is the only state in which the
+/// worker reaches its planner with nothing to select.
+///
+/// # Panics
+///
+/// Panics when the acknowledgement fails the task, spends an attempt, records a
+/// failure class, opens an operation, or publishes a snapshot.
+async fn assert_compact_table_is_acknowledged(
+    promoted: &PromotedRewriteFixture,
+    mut supervisor: SupervisedPromotion,
+    catalog: &Arc<PromotionCatalogSeam>,
+) {
+    // Phase three: planning selects nothing on a compacted table. That is not a
+    // failure and must not spend an attempt, open an operation, or publish.
+    catalog.reject_next_commits(0);
+    promoted.fixture.clear_task_backoff().await;
+    for _ in 0..8 {
+        supervisor.schedule_only().await;
+        if latest_small_files_task(&promoted.fixture).await.state == "succeeded" {
+            break;
+        }
+        promoted.fixture.clear_task_backoff().await;
+        supervisor.restart_worker();
+        supervisor.settle_one_success().await;
+    }
+    let snapshots_before = promoted.load_table().await.metadata().snapshots().count();
+    let operations_before = promoted.fixture.rewrite_operations().await.len();
+    promoted.fixture.reoffer_settled_small_files_task().await;
+    // Maintenance work the earlier passes made ready shares the worker, so the
+    // re-offered task is settled by whichever attempt reaches it rather than by
+    // a fixed number of them.
+    for _ in 0..4 {
+        supervisor.restart_worker();
+        supervisor.settle_one_success().await;
+        if latest_small_files_task(&promoted.fixture).await.state != "ready" {
+            break;
+        }
+    }
+    supervisor.shutdown().await;
+
+    let acknowledged = latest_small_files_task(&promoted.fixture).await;
+    assert_eq!(
+        acknowledged.state, "succeeded",
+        "an already-compact table is acknowledged, not failed: {acknowledged:?}"
+    );
+    assert_eq!(
+        acknowledged.attempt_count, 0,
+        "acknowledging a compact table spends no attempt: {acknowledged:?}"
+    );
+    assert_eq!(
+        acknowledged.failure_class, None,
+        "acknowledging a compact table records no failure: {acknowledged:?}"
+    );
+    assert_eq!(
+        promoted.fixture.rewrite_operations().await.len(),
+        operations_before,
+        "an attempt that planned nothing opens no operation"
+    );
+    assert_eq!(
+        promoted.load_table().await.metadata().snapshots().count(),
+        snapshots_before,
+        "an attempt that planned nothing publishes no snapshot"
+    );
+}
+
+/// One definite refusal costs a plan its initial submission plus three retries.
+///
+/// The publication protocol is pinned at three retries, so a scenario that
+/// wants to exhaust exactly one plan has to spend exactly this many refusals.
+const REFUSALS_PER_PLAN: usize = 4;
+
+/// Reads the most recently created small-files task for the fixture table.
+///
+/// The reduction is observable only through the task row the attempt settled,
+/// and each phase enqueues a fresh task, so every assertion is against the
+/// newest one rather than a remembered id.
+///
+/// # Panics
+///
+/// Panics when the fixture has planned no small-files task at all.
+async fn latest_small_files_task(
+    fixture: &super::support::PromotionIntegrationFixture,
+) -> super::support::ForgeTaskRow {
+    fixture
+        .forge_tasks()
+        .await
+        .into_iter()
+        .rfind(|task| task.strategy == "small_files")
+        .expect("the fixture planned at least one small-files task")
 }

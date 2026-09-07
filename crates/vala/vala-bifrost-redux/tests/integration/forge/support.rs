@@ -742,6 +742,12 @@ pub(crate) struct ForgeTaskRow {
     pub(crate) plan: serde_json::Value,
     /// Canonical hash of that plan payload.
     pub(crate) plan_hash: Vec<u8>,
+    /// Number of settled attempts the failure taxonomy has counted.
+    pub(crate) attempt_count: i32,
+    /// Persisted failure class, or `None` while the task carries no failure.
+    pub(crate) failure_class: Option<String>,
+    /// Earliest instant a claim may take this task again.
+    pub(crate) next_eligible_at: chrono::DateTime<chrono::Utc>,
 }
 
 pub(crate) struct PromotionIntegrationFixture {
@@ -1175,8 +1181,22 @@ impl PromotionIntegrationFixture {
     ///
     /// Panics when the read-only diagnostic query fails.
     pub(crate) async fn forge_tasks(&self) -> Vec<ForgeTaskRow> {
-        sqlx::query_as::<_, (uuid::Uuid, String, String, i64, serde_json::Value, Vec<u8>)>(
-            "SELECT task_id, strategy, state, base_snapshot_id, plan, plan_hash \
+        sqlx::query_as::<
+            _,
+            (
+                uuid::Uuid,
+                String,
+                String,
+                i64,
+                serde_json::Value,
+                Vec<u8>,
+                i32,
+                Option<String>,
+                chrono::DateTime<chrono::Utc>,
+            ),
+        >(
+            "SELECT task_id, strategy, state, base_snapshot_id, plan, plan_hash, \
+                    attempt_count, failure_class, next_eligible_at \
              FROM vala.forge_tasks \
              WHERE data_tenant_id = $1 AND namespace_name = $2 AND table_name = $3 \
              ORDER BY created_at, task_id",
@@ -1189,13 +1209,26 @@ impl PromotionIntegrationFixture {
         .expect("fixture Forge task inspection")
         .into_iter()
         .map(
-            |(task_id, strategy, state, base_snapshot_id, plan, plan_hash)| ForgeTaskRow {
+            |(
                 task_id,
                 strategy,
                 state,
                 base_snapshot_id,
                 plan,
                 plan_hash,
+                attempt_count,
+                failure_class,
+                next_eligible_at,
+            )| ForgeTaskRow {
+                task_id,
+                strategy,
+                state,
+                base_snapshot_id,
+                plan,
+                plan_hash,
+                attempt_count,
+                failure_class,
+                next_eligible_at,
             },
         )
         .collect()
@@ -1340,6 +1373,46 @@ impl PromotionIntegrationFixture {
         .execute(self.operator_pool.pool())
         .await
         .expect("fixture backoff aging");
+    }
+
+    /// Re-offers the newest settled small-files task as fresh claimable work.
+    ///
+    /// A task is bound to the snapshot it was planned against, so a table that
+    /// another writer compacts between planning and execution hands the worker
+    /// a task whose work no longer exists. That is the only way an attempt
+    /// reaches the planner and is told to do nothing, and it is not reachable
+    /// by scheduling alone: the scheduler stops planning as soon as the table
+    /// is compact. Re-offering an already-settled task reproduces exactly that
+    /// state — a claimable task over a table with nothing left to select.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the update fails or no small-files task exists to re-offer.
+    pub(crate) async fn reoffer_settled_small_files_task(&self) {
+        let requeued = sqlx::query(
+            "UPDATE vala.forge_tasks SET state = 'ready', attempt_id = NULL, \
+                    claimed_by = NULL, claim_expires_at = NULL, \
+                    watermark_snapshot_id = NULL, watermark_timestamp_ms = NULL, \
+                    evidence = NULL, attempt_count = 0, failure_class = NULL, \
+                    ready_at = statement_timestamp(), \
+                    next_eligible_at = statement_timestamp() \
+              WHERE task_id = ( \
+                    SELECT task_id FROM vala.forge_tasks \
+                     WHERE data_tenant_id = $1 AND namespace_name = $2 \
+                       AND table_name = $3 AND strategy = 'small_files' \
+                     ORDER BY created_at DESC, task_id DESC LIMIT 1)",
+        )
+        .bind(self.tenant.as_uuid())
+        .bind(&self.binding.logical_namespace)
+        .bind(&self.binding.table_name)
+        .execute(self.operator_pool.pool())
+        .await
+        .expect("fixture task re-offer");
+        assert_eq!(
+            requeued.rows_affected(),
+            1,
+            "the fixture has one small-files task to re-offer"
+        );
     }
 
     /// Reads the durable promotion operation phases for this fixture's tenant.

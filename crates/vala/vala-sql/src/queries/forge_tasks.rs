@@ -301,7 +301,7 @@ impl ForgeTasks {
     ///
     /// # Cancellation
     /// Cancellation rolls back the transaction, retaining the demand.
-    pub async fn enqueue_and_acknowledge<F>(
+    pub async fn enqueue_and_acknowledge(
         &self,
         owner: Uuid,
         scheduler_fence: i64,

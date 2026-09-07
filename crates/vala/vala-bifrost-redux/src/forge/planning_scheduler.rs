@@ -12,17 +12,14 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use vala_sql::SqlError;
 use vala_sql::queries::forge_operations::ForgeOperations;
-use vala_sql::queries::forge_tasks::{ForgeClaimLimits, ForgeEnqueueBatch, ForgeTasks};
+use vala_sql::queries::forge_tasks::{ForgeEnqueueBatch, ForgeTasks};
 use vala_sql::row_types::forge_operations::ForgeOperationFamily;
 use vala_sql::row_types::forge_tasks::{
     ExpiredCleanupPayload, FORGE_TASK_PAYLOAD_VERSION, ForgePlanningDemand, ForgeTaskEstimates,
-    ForgeTaskLane, ForgeTaskPlan, ForgeTaskStrategy, ForgeTaskTableIdentity, NewForgeTask,
+    ForgeTaskPlan, ForgeTaskStrategy, ForgeTaskTableIdentity, NewForgeTask,
     ORPHAN_CLEANUP_PAYLOAD_VERSION, OrphanCleanupPayload,
 };
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
-use wyrd_spec::request_id::RequestId;
-use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
 
 use super::Forge;
 use super::compact::ForgeGroupKey;
@@ -30,16 +27,11 @@ use super::error::ForgeError;
 use super::identity::task_table_binding;
 use super::metrics::{ForgePendingTasks, ForgeTelemetry};
 use super::path::catalog_path_to_object_key;
-use super::planner::{
-    ForgeCapacity, ForgeEnvelopeSizer, ForgePlanCandidate, ForgePlanCapacity, ForgePlanner,
-    ForgeTableSnapshot, plan_hash,
-};
+use super::planner::{ForgePlanCandidate, ForgeTableSnapshot, plan_hash, plan_table};
 #[cfg(feature = "test-support")]
 use super::worker::ForgeLifecycleEvent;
-use super::worker::forge_claim_memory_limit;
 use crate::catalog::layout::forge_data_location;
 use crate::maintenance::StagingFileCommitted;
-use crate::resources::ResourcePlan;
 
 /// Complete classification from one bounded durable scheduler pass.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -54,10 +46,6 @@ pub struct ForgeScheduleOutcome {
     pub tasks_enqueued: usize,
     /// Planned rows dropped by idempotent enqueue conflicts.
     pub tasks_not_inserted: usize,
-    /// Plans classified terminally outside every lane.
-    pub unschedulable: usize,
-    /// Ready rows whose persisted envelope exceeds this pod's governor capacity.
-    pub unclaimable_tasks: usize,
     /// Maximum-minus-minimum admitted task count across this complete pass's tenants.
     pub fairness_lag_tasks: usize,
     /// Candidate input files observed in this cycle; only complete cycles publish gauges.
@@ -75,8 +63,6 @@ struct DemandPlanningResult {
     tasks_enqueued: usize,
     /// Planned rows not inserted because the exact task already existed.
     tasks_not_inserted: usize,
-    /// Tasks terminalized because no configured lane can execute them.
-    unschedulable: usize,
     /// Whether the exact observed demand generation was acknowledged.
     acknowledged: bool,
     /// Candidate input files represented by this exact demand generation.
@@ -104,10 +90,6 @@ struct PlanningCycle {
 pub struct ForgeScheduler<'forge> {
     /// Forge dependency owner used only for catalog reads and deterministic discovery.
     forge: &'forge Forge,
-    /// Single pure planner used by hints and periodic roster repair.
-    planner: ForgePlanner,
-    /// Live governor-clamped capacity shared by candidate sizing and admission.
-    capacity: ForgeCapacity,
     /// Durable task and demand owner.
     tasks: ForgeTasks,
     /// Stable scheduler lease owner for this process.
@@ -176,7 +158,7 @@ impl<'forge> ForgeScheduler<'forge> {
     /// Constructs one scheduler over the established Forge dependency graph.
     ///
     /// # Errors
-    /// Returns invalid configuration when derived capacity is not positive.
+    /// Returns invalid configuration when the demand page bound is invalid.
     pub fn new(forge: &'forge Forge) -> Result<Self, ForgeError> {
         Self::with_owner(forge, Uuid::now_v7())
     }
@@ -184,7 +166,7 @@ impl<'forge> ForgeScheduler<'forge> {
     /// Constructs a scheduler with a stable fixture owner across bounded passes.
     ///
     /// # Errors
-    /// Returns invalid configuration when derived capacity is not positive.
+    /// Returns invalid configuration when the demand page bound is invalid.
     #[cfg(feature = "test-support")]
     pub fn with_owner_for_test(forge: &'forge Forge, owner: Uuid) -> Result<Self, ForgeError> {
         Self::with_owner(forge, owner)
@@ -193,16 +175,12 @@ impl<'forge> ForgeScheduler<'forge> {
     /// Constructs the scheduler dependency graph for one explicit lease owner.
     ///
     /// # Errors
-    /// Returns invalid configuration when derived capacity is not positive.
+    /// Returns invalid configuration when the demand page bound is invalid.
     fn with_owner(forge: &'forge Forge, owner: Uuid) -> Result<Self, ForgeError> {
         let config = &forge.core.config;
-        let configured = ForgeCapacity::try_from(config)?;
-        let capacity = governed_capacity(configured, &forge.core.resource_plan);
         Ok(Self {
             forge,
             cycle: None,
-            planner: ForgePlanner::new(capacity),
-            capacity,
             tasks: ForgeTasks::new(forge.core.operator_pool.clone()),
             owner,
             demand_cap: u32::try_from(config.max_hints_per_wake).unwrap_or(u32::MAX),
@@ -478,8 +456,6 @@ impl<'forge> ForgeScheduler<'forge> {
                         outcome.tasks_not_inserted = outcome
                             .tasks_not_inserted
                             .saturating_add(planned.tasks_not_inserted);
-                        outcome.unschedulable =
-                            outcome.unschedulable.saturating_add(planned.unschedulable);
                         if cycle.seeded.contains(&identity) {
                             cycle.debt.insert(
                                 identity,
@@ -634,7 +610,7 @@ impl<'forge> ForgeScheduler<'forge> {
     ///
     /// # Errors
     ///
-    /// Returns identity, catalog, discovery, planning, lane, or SQL errors. A
+    /// Returns identity, catalog, discovery, planning, or SQL errors. A
     /// failure leaves the demand generation available to a later scheduler.
     async fn plan_demand(
         &self,
@@ -643,10 +619,7 @@ impl<'forge> ForgeScheduler<'forge> {
     ) -> Result<DemandPlanningResult, ForgeError> {
         let (snapshot, compaction_debt_files, compaction_debt_bytes, orphan_scan_prefix) =
             self.discover_snapshot(demand).await?;
-        let ForgeDemandArbitration {
-            executable,
-            unschedulable,
-        } = self
+        let ForgeDemandArbitration { executable } = self
             .arbitrate_demand(demand, &snapshot, orphan_scan_prefix)
             .await?;
         let inserted = {
@@ -659,20 +632,14 @@ impl<'forge> ForgeScheduler<'forge> {
                     demand,
                     ForgeEnqueueBatch {
                         executable: &executable,
-                        unschedulable: &unschedulable,
                     },
-                    unschedulable_event,
                 )
                 .await
                 .map_err(ForgeError::Sql)?
         };
         let result = DemandPlanningResult {
             tasks_enqueued: inserted.len(),
-            tasks_not_inserted: executable
-                .len()
-                .saturating_add(unschedulable.len())
-                .saturating_sub(inserted.len()),
-            unschedulable: unschedulable.len(),
+            tasks_not_inserted: executable.len().saturating_sub(inserted.len()),
             acknowledged: true,
             compaction_debt_files,
             compaction_debt_bytes,
@@ -861,31 +828,11 @@ impl<'forge> ForgeScheduler<'forge> {
             .map(|file| file.path().as_str().to_owned())
             .collect::<Vec<_>>();
         inputs.sort_unstable();
-        let bytes = total_bytes;
-        let working_set_bytes = super::rewrite::REWRITE_WORKING_SET_FLOOR_BYTES;
-        let envelope = super::planner::ForgeEnvelopeSizer::size(
-            working_set_bytes,
-            inputs.len(),
-            1,
-            self.capacity,
-        )?;
         Ok(Some(ForgePlanCandidate {
             strategy: ForgeTaskStrategy::ScribePromotion,
             input_bytes: vec![1; inputs.len()],
             inputs,
-            bytes: bytes.max(1),
-            working_set_bytes,
-            parallelism: envelope.reader_permits,
-            memory_bytes: envelope
-                .memory_bytes()
-                .map_err(|error| ForgeError::Invariant {
-                    detail: error.to_string(),
-                })?,
-            spill_bytes: envelope
-                .scratch_bytes()
-                .map_err(|error| ForgeError::Invariant {
-                    detail: error.to_string(),
-                })?,
+            bytes: total_bytes.max(1),
             parameters: plan.to_parameters(),
         }))
     }
@@ -904,17 +851,14 @@ impl<'forge> ForgeScheduler<'forge> {
     /// smallest input set the managed core can produce a smaller live set from.
     ///
     /// Selection here is a *bound*, not the execution plan. The managed core
-    /// performs its own selection inside the admitted envelope and reports what
-    /// it actually consumed; this candidate exists to size the attempt, to bind
-    /// the durable task to one immutable base, and to name the inputs recovery
-    /// will look for.
+    /// performs its own selection and reports what it actually consumed; this
+    /// candidate exists to bind the durable task to one immutable base and to
+    /// name the inputs recovery will look for.
     ///
     /// # Errors
     ///
     /// Returns [`ForgeError::Catalog`] when the base snapshot's manifest list
-    /// or one of its manifests cannot be read, [`ForgeError::Capacity`] when
-    /// the derived working set does not fit this scheduler's ceilings, and
-    /// [`ForgeError::Invariant`] when that envelope reports an unusable total.
+    /// or one of its manifests cannot be read.
     async fn rewrite_candidate(
         &self,
         table: &iceberg::table::Table,
@@ -950,30 +894,11 @@ impl<'forge> ForgeScheduler<'forge> {
         let inputs = selected.keys().cloned().collect::<Vec<_>>();
         let input_bytes = selected.values().copied().collect::<Vec<_>>();
         let bytes = input_bytes.iter().copied().fold(0_u64, u64::saturating_add);
-        let working_set_bytes = bytes.max(super::rewrite::REWRITE_WORKING_SET_FLOOR_BYTES);
-        let envelope = super::planner::ForgeEnvelopeSizer::size(
-            working_set_bytes,
-            inputs.len(),
-            self.forge.core.config.max_concurrent_reads,
-            self.capacity,
-        )?;
         Ok(Some(ForgePlanCandidate {
             strategy: ForgeTaskStrategy::SmallFiles,
             input_bytes,
             inputs,
             bytes: bytes.max(1),
-            working_set_bytes,
-            parallelism: envelope.reader_permits,
-            memory_bytes: envelope
-                .memory_bytes()
-                .map_err(|error| ForgeError::Invariant {
-                    detail: error.to_string(),
-                })?,
-            spill_bytes: envelope
-                .scratch_bytes()
-                .map_err(|error| ForgeError::Invariant {
-                    detail: error.to_string(),
-                })?,
             parameters: serde_json::json!({ "kind": super::worker::LIVE_REWRITE_PARAMETER_KIND }),
         }))
     }
@@ -1151,39 +1076,11 @@ impl<'forge> ForgeScheduler<'forge> {
             return Ok(None);
         }
         let estimate = bytes.max(1);
-        // Parallelism is the concurrent-read width of the expiry, not the count
-        // of manifests to retire, so bound it by `max_concurrent_reads`. Leaving
-        // it equal to the manifest count would push any table whose retained
-        // history exceeds `max_concurrent_reads` into the Unschedulable lane
-        // (its input count is not one, so the large-singleton path never
-        // applies), wedging deep-history tables. The full manifest window still
-        // drives `inputs`, so successive expiries retire bounded slices and the
-        // plan hash advances as history shrinks.
-        let envelope = super::planner::ForgeEnvelopeSizer::size(
-            estimate,
-            inputs.len(),
-            inputs
-                .len()
-                .min(self.forge.core.config.max_concurrent_reads),
-            self.capacity,
-        )?;
         Ok(Some(ForgePlanCandidate {
             strategy: ForgeTaskStrategy::SnapshotExpiry,
             inputs,
             input_bytes,
             bytes: estimate,
-            working_set_bytes: estimate,
-            parallelism: envelope.reader_permits,
-            memory_bytes: envelope
-                .memory_bytes()
-                .map_err(|error| ForgeError::Invariant {
-                    detail: error.to_string(),
-                })?,
-            spill_bytes: envelope
-                .scratch_bytes()
-                .map_err(|error| ForgeError::Invariant {
-                    detail: error.to_string(),
-                })?,
             parameters: serde_json::json!({
                 "kind":"maintenance",
                 "trigger_commit_count": table.metadata().snapshots().count()
@@ -1203,7 +1100,7 @@ impl<'forge> ForgeScheduler<'forge> {
     ///
     /// # Errors
     ///
-    /// Returns the handoff, planner, lane, and orphan-projection errors of the
+    /// Returns the handoff, planner, and orphan-projection errors of the
     /// branch that ran. A failure leaves the demand unacknowledged.
     async fn arbitrate_demand(
         &self,
@@ -1212,7 +1109,6 @@ impl<'forge> ForgeScheduler<'forge> {
         orphan_scan_prefix: String,
     ) -> Result<ForgeDemandArbitration, ForgeError> {
         let mut executable = Vec::new();
-        let mut unschedulable = Vec::new();
         // Expired cleanup outranks fresh planning for this table: it consumes a
         // handoff an expiration already committed, and the one-active-task
         // index would refuse a second task anyway. Draining the handoff first
@@ -1221,48 +1117,34 @@ impl<'forge> ForgeScheduler<'forge> {
             executable.push(cleanup);
         }
         let planned = if executable.is_empty() {
-            self.planner.plan_table(snapshot)?
+            plan_table(snapshot)?
         } else {
             Vec::new()
         };
         for task in planned.into_iter().take(1) {
-            let terminal = task.capacity == ForgePlanCapacity::Unschedulable;
-            let durable = NewForgeTask {
+            executable.push(NewForgeTask {
                 data_tenant_id: demand.data_tenant_id,
                 table_ref: demand.table_ref.clone(),
                 strategy: task.strategy,
-                lane: if terminal {
-                    ForgeTaskLane::Ordinary
-                } else {
-                    task.lane()?
-                },
                 base_snapshot_id: task.base_snapshot_id,
                 plan: task.plan,
                 plan_hash: task.plan_hash,
                 estimates: task.estimates,
                 ready_at: Utc::now(),
-            };
-            if terminal {
-                unschedulable.push(durable);
-            } else {
-                executable.push(durable);
-            }
+            });
         }
         // Orphan cleanup is deliberately last. It reclaims objects no metadata
         // references, so it must never displace a compaction, expiration, or
         // cleanup effect that a reader can still observe. It fills the table's
         // single active-task slot only when nothing else claimed it.
-        if executable.is_empty() && unschedulable.is_empty() {
+        if executable.is_empty() {
             executable.push(self.orphan_cleanup_task(
                 demand,
                 snapshot.snapshot_id,
                 orphan_scan_prefix,
             )?);
         }
-        Ok(ForgeDemandArbitration {
-            executable,
-            unschedulable,
-        })
+        Ok(ForgeDemandArbitration { executable })
     }
 
     /// Runs one production arbitration for an integration fixture.
@@ -1278,11 +1160,7 @@ impl<'forge> ForgeScheduler<'forge> {
     ) -> Result<Vec<NewForgeTask>, ForgeError> {
         let (snapshot, _, _, prefix) = self.discover_snapshot(demand).await?;
         let arbitration = self.arbitrate_demand(demand, &snapshot, prefix).await?;
-        Ok(arbitration
-            .executable
-            .into_iter()
-            .chain(arbitration.unschedulable)
-            .collect())
+        Ok(arbitration.executable)
     }
 
     /// Builds the one cleanup task an unconsumed expiration handoff demands.
@@ -1318,8 +1196,7 @@ impl<'forge> ForgeScheduler<'forge> {
     /// # Errors
     ///
     /// Returns [`ForgeError::Invariant`] when the configured TTL cannot be
-    /// converted or the cutoff underflows the representable timestamp range,
-    /// and [`ForgeError::Capacity`] when the topology supplies no envelope.
+    /// converted or the cutoff underflows the representable timestamp range.
     fn orphan_cleanup_task(
         &self,
         demand: &ForgePlanningDemand,
@@ -1343,9 +1220,6 @@ impl<'forge> ForgeScheduler<'forge> {
             version: ORPHAN_CLEANUP_PAYLOAD_VERSION,
             age_cutoff_ms,
         };
-        // The scan is a bounded listing walk with no data read, so the estimate
-        // is the minimum admissible envelope rather than a sized workload.
-        let envelope = ForgeEnvelopeSizer::size(1, 1, 1, self.capacity)?;
         let plan = ForgeTaskPlan {
             version: FORGE_TASK_PAYLOAD_VERSION,
             inputs: vec![scan_prefix],
@@ -1356,27 +1230,10 @@ impl<'forge> ForgeScheduler<'forge> {
             data_tenant_id: demand.data_tenant_id,
             table_ref: demand.table_ref.clone(),
             strategy: ForgeTaskStrategy::OrphanCleanup,
-            lane: ForgeTaskLane::Ordinary,
             base_snapshot_id,
             plan,
             plan_hash,
-            estimates: ForgeTaskEstimates {
-                files: 1,
-                bytes: 1,
-                parallelism: 1,
-                memory_bytes: envelope
-                    .memory_bytes()
-                    .map_err(|error| ForgeError::Invariant {
-                        detail: error.to_string(),
-                    })?,
-                spill_bytes: envelope
-                    .scratch_bytes()
-                    .map_err(|error| ForgeError::Invariant {
-                        detail: error.to_string(),
-                    })?,
-                large_ceiling_bytes: self.capacity.max_large_task_bytes,
-                envelope: Some(envelope),
-            },
+            estimates: ForgeTaskEstimates { files: 1, bytes: 1 },
             ready_at: Utc::now(),
         })
     }
@@ -1401,7 +1258,7 @@ impl<'forge> ForgeScheduler<'forge> {
         else {
             return Ok(None);
         };
-        cleanup_projection(demand, &payload, self.capacity).map(Some)
+        cleanup_projection(demand, &payload).map(Some)
     }
 
     /// Builds the production cleanup projection for one integration fixture.
@@ -1439,23 +1296,6 @@ impl<'forge> ForgeScheduler<'forge> {
     ) -> Result<(), ForgeError> {
         if outcome.incomplete || outcome.demands_acknowledged != outcome.demands_seen {
             return Ok(());
-        }
-        let capacity = governed_capacity(
-            ForgeCapacity::try_from(&self.forge.core.config)?,
-            &self.forge.core.resource_plan,
-        );
-        let limits = status_claim_limits(capacity);
-        let unclaimable_task_ids = self
-            .tasks
-            .unclaimable_ready_task_ids(limits)
-            .await
-            .map_err(ForgeError::Sql)?;
-        outcome.unclaimable_tasks = unclaimable_task_ids.len();
-        for task_id in unclaimable_task_ids {
-            tracing::warn!(
-                %task_id,
-                "Forge ready tasks exceed the live pod governor envelope"
-            );
         }
         self.renew_fence(fence).await?;
         let demands = self
@@ -1499,48 +1339,6 @@ impl<'forge> ForgeScheduler<'forge> {
     }
 }
 
-/// Apply the live resource plan to configured scheduler planning capacity.
-///
-/// Forge owns its protected floor plus the elastic remainder, while CPU and
-/// scratch retain their existing live-plan ceilings.
-#[must_use]
-fn governed_capacity(configured: ForgeCapacity, plan: &ResourcePlan) -> ForgeCapacity {
-    ForgeCapacity {
-        max_parallelism: configured
-            .max_parallelism
-            .min(u16::try_from(plan.effective_cpu).unwrap_or(u16::MAX)),
-        max_memory_bytes: forge_claim_memory_limit(
-            configured.max_memory_bytes,
-            plan.forge_floor_bytes,
-            plan.elastic_memory_bytes,
-        ),
-        max_spill_bytes: configured.max_spill_bytes.min(plan.scratch_limit_bytes),
-        max_large_task_bytes: configured.max_large_task_bytes,
-    }
-}
-
-/// Project governed scheduler capacity into status claimability limits.
-///
-/// This preserves the exact planning envelope so status never marks a task
-/// unclaimable under a stricter memory interpretation than construction uses.
-///
-/// The promotion route carries no ordinary file-count ceiling, so the durable
-/// `max_files` filter is left fully open and the byte filter reuses the single
-/// configured byte ceiling that planning already classified against.
-#[must_use]
-fn status_claim_limits(capacity: ForgeCapacity) -> ForgeClaimLimits {
-    ForgeClaimLimits {
-        max_active_per_tenant: u32::MAX,
-        lease_seconds: 1,
-        max_files: u32::MAX,
-        max_bytes: capacity.max_large_task_bytes,
-        max_parallelism: capacity.max_parallelism,
-        max_memory_bytes: capacity.max_memory_bytes,
-        max_spill_bytes: capacity.max_spill_bytes,
-        max_large_task_bytes: capacity.max_large_task_bytes,
-    }
-}
-
 /// Pure retention-gated count-OR-interval snapshot-expiry trigger predicate.
 ///
 /// `commits` is the count of retained snapshots past `retain_last`, and
@@ -1571,55 +1369,31 @@ pub(super) fn maintenance_trigger_due(
     oldest_age.is_some_and(|age| age >= interval)
 }
 
-/// Builds the exact audited terminal envelope after SQL chooses the task UUID.
-fn unschedulable_event(task_id: Uuid) -> AuditEvent {
-    AuditEvent::new(
-        RequestId::now_v7(),
-        None,
-        "forge.task.unschedulable".to_owned(),
-        format!("forge-task:{task_id}"),
-        None,
-        PrincipalId::new(Uuid::nil()),
-        PrincipalKindTag::Service,
-        AuthMethod::Internal,
-        "bifrost:forge".to_owned(),
-        AuditDecision::Allow,
-        AuditResult::Success,
-        "Forge plan exceeds configured capacity".to_owned(),
-    )
-}
-
 /// The one active-task slot this table's planning pass filled.
 struct ForgeDemandArbitration {
     /// At most one enqueueable task, in arbitration order.
     executable: Vec<NewForgeTask>,
-    /// At most one terminal task recorded as unschedulable.
-    unschedulable: Vec<NewForgeTask>,
 }
 
 /// Builds the fixed bounded durable task one cleanup handoff projects to.
 ///
 /// The projection is deterministic in the payload alone: candidate count is the
-/// file estimate, the canonical serialization length is the byte estimate, one
-/// reader permit reflects the strictly serial per-candidate protocol, and the
-/// base snapshot is the identity the expiration committed.
+/// file estimate, the canonical serialization length is the byte estimate, and
+/// the base snapshot is the identity the expiration committed.
 ///
 /// # Errors
 ///
 /// Returns [`ForgeError::Invariant`] when the candidate count exceeds the
-/// durable estimate bound or an envelope term cannot be represented, and
-/// [`ForgeError::Capacity`] when the topology supplies no complete envelope.
+/// durable estimate bound.
 pub(super) fn cleanup_projection(
     demand: &ForgePlanningDemand,
     payload: &ExpiredCleanupPayload,
-    capacity: ForgeCapacity,
 ) -> Result<NewForgeTask, ForgeError> {
     let count = payload.cleanup_candidates.len();
     let files = u32::try_from(count).map_err(|_| ForgeError::Invariant {
         detail: "expired cleanup candidate count exceeds u32".to_owned(),
     })?;
     let bytes = payload.serialized_candidate_bytes().max(1);
-    let envelope = ForgeEnvelopeSizer::size(bytes, count, 1, capacity)?;
     let plan = ForgeTaskPlan {
         version: FORGE_TASK_PAYLOAD_VERSION,
         inputs: Vec::new(),
@@ -1630,27 +1404,10 @@ pub(super) fn cleanup_projection(
         data_tenant_id: demand.data_tenant_id,
         table_ref: demand.table_ref.clone(),
         strategy: ForgeTaskStrategy::ExpiredCleanup,
-        lane: ForgeTaskLane::Ordinary,
         base_snapshot_id: payload.committed_snapshot_id,
         plan,
         plan_hash,
-        estimates: ForgeTaskEstimates {
-            files,
-            bytes,
-            parallelism: 1,
-            memory_bytes: envelope
-                .memory_bytes()
-                .map_err(|error| ForgeError::Invariant {
-                    detail: error.to_string(),
-                })?,
-            spill_bytes: envelope
-                .scratch_bytes()
-                .map_err(|error| ForgeError::Invariant {
-                    detail: error.to_string(),
-                })?,
-            large_ceiling_bytes: capacity.max_large_task_bytes,
-            envelope: Some(envelope),
-        },
+        estimates: ForgeTaskEstimates { files, bytes },
         ready_at: Utc::now(),
     })
 }
@@ -1659,40 +1416,8 @@ pub(super) fn cleanup_projection(
 mod source_tests {
     use std::time::Duration;
 
-    use super::{governed_capacity, maintenance_trigger_due, status_claim_limits};
+    use super::maintenance_trigger_due;
     use vala_sql::row_types::forge_tasks::ForgeTaskStrategy;
-
-    use crate::forge::planner::ForgeCapacity;
-    use crate::resources::ResourcePlan;
-
-    /// Scheduler construction and status retain a positive Forge floor without elasticity.
-    #[test]
-    fn scheduler_capacity_and_status_use_forge_floor_without_elastic_memory() {
-        let configured = ForgeCapacity {
-            max_parallelism: 2,
-            max_memory_bytes: 128 * 1024 * 1024,
-            max_spill_bytes: 256 * 1024 * 1024,
-            max_large_task_bytes: 128 * 1024 * 1024,
-        };
-        let plan = ResourcePlan {
-            memory_limit_bytes: 256 * 1024 * 1024,
-            effective_cpu: 2,
-            oracle_query_slot_limit: None,
-            unmanaged_reserve_bytes: 64 * 1024 * 1024,
-            managed_memory_bytes: 192 * 1024 * 1024,
-            scribe_floor_bytes: 64 * 1024 * 1024,
-            oracle_floor_bytes: 64 * 1024 * 1024,
-            forge_floor_bytes: 64 * 1024 * 1024,
-            elastic_memory_bytes: 0,
-            scratch_limit_bytes: 256 * 1024 * 1024,
-        };
-
-        let scheduler_capacity = governed_capacity(configured, &plan);
-        let status_limits = status_claim_limits(scheduler_capacity);
-
-        assert_eq!(scheduler_capacity.max_memory_bytes, 64 * 1024 * 1024);
-        assert_eq!(status_limits.max_memory_bytes, 64 * 1024 * 1024);
-    }
 
     /// The count arm fires at threshold once the oldest snapshot is eligible.
     #[test]

@@ -4,7 +4,6 @@
 //! processes. `PostgreSQL` claims assign compute, while the table-scoped
 //! [`ForgeLease`] remains the only publication fence.
 
-use std::path::Path;
 use std::str::FromStr;
 #[cfg(feature = "test-support")]
 use std::sync::Mutex;
@@ -51,7 +50,7 @@ use super::path::catalog_path_to_object_key;
 use super::scribe_promotion::{
     ForgePromotionCommit, ForgePromotionSettlement, ScribePromotionPlan,
 };
-use super::{Forge, ForgeCapacity, ForgeRoleReadiness};
+use super::{Forge, ForgeRoleReadiness};
 use crate::catalog::TenantTableBinding;
 use crate::catalog::layout::forge_data_location;
 
@@ -1367,37 +1366,6 @@ impl ForgeWorkerConfig {
     }
 }
 
-/// Stable pod-local scratch-volume identity used for quarantine deferral.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ScratchVolumeIdentity(String);
-
-impl ScratchVolumeIdentity {
-    /// Derives identity from the canonical root and Unix device number.
-    ///
-    /// # Errors
-    /// Returns typed scratch IO when canonicalization or metadata inspection fails.
-    fn from_root(root: &Path) -> Result<Self, ForgeError> {
-        use std::os::unix::fs::MetadataExt;
-        let canonical = root.canonicalize().map_err(|error| ForgeError::ScratchIo {
-            kind: error.kind(),
-            detail: format!("canonicalize {}: {error}", root.display()),
-        })?;
-        let metadata = canonical
-            .metadata()
-            .map_err(|error| ForgeError::ScratchIo {
-                kind: error.kind(),
-                detail: format!("inspect {}: {error}", canonical.display()),
-            })?;
-        Ok(Self(format!("{}:{}", canonical.display(), metadata.dev())))
-    }
-
-    /// Returns the durable closed identity spelling.
-    #[must_use]
-    fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
 /// Fenced execution state awaiting durable failure settlement and lease release.
 struct ClaimExecutionOutcome<'task> {
     /// Durable task claim being settled.
@@ -1442,8 +1410,6 @@ pub struct ForgeWorker {
     /// Optional observer that receives only completed supervised executions.
     #[cfg(feature = "test-support")]
     completion_observer: Option<ForgeWorkerCompletionObserver>,
-    /// Complete capacity declaration passed to atomic `PostgreSQL` admission.
-    capacity: ForgeCapacity,
     /// Present only on spawned slots, never on direct fixtures or startup recovery.
     run_controls: Option<ForgeWorkerRunControls>,
 }
@@ -1461,8 +1427,6 @@ impl ForgeWorker {
         owner: Uuid,
     ) -> Result<Self, ForgeError> {
         let config = config.validate()?;
-        let limits = &forge.core.config;
-        let capacity = ForgeCapacity::try_from(limits)?;
         Ok(Self {
             #[cfg(feature = "test-support")]
             completion_observer: forge.core.completion_observer.clone(),
@@ -1470,7 +1434,6 @@ impl ForgeWorker {
             forge,
             owner,
             config,
-            capacity,
             run_controls: None,
         })
     }
@@ -1508,7 +1471,7 @@ impl ForgeWorker {
     pub fn owner_for_test(&self) -> Uuid {
         self.owner
     }
-    /// Probes scratch, registers this worker, and drains its recoverable work.
+    /// Drains this worker's recoverable work before it can become ready.
     ///
     /// This is everything that must succeed before a worker may advertise
     /// itself: a writable spill volume, a durable healthy-worker registration,
@@ -1518,36 +1481,24 @@ impl ForgeWorker {
     ///
     /// # Errors
     ///
-    /// Returns typed scratch IO when the spill volume cannot be identified,
-    /// SQL errors from quarantine or registration, and any settlement,
-    /// reconciliation, audit, catalog, object-store, or SQL failure the
-    /// recovery drain returns.
+    /// Returns any settlement, reconciliation, audit, catalog, object-store, or
+    /// SQL failure the recovery drain returns.
     ///
-    /// Returns `Ok(false)` when the worker quarantined itself on its scratch
-    /// probe or shutdown was requested during recovery, so the caller returns
-    /// without ever publishing readiness.
+    /// Returns `Ok(false)` when shutdown was requested during recovery, so the
+    /// caller returns without ever publishing readiness.
     async fn start_and_drain(&self, shutdown: &CancellationToken) -> Result<bool, ForgeError> {
         // Orphan collection resumes its bounded listing from a cursor, and
         // emulating that cursor by refiltering would relist every earlier page
         // on every attempt. A worker whose actual staging backend cannot resume
         // natively therefore cannot keep the anti-starvation guarantee its
-        // cleanup authority depends on, so it refuses before scratch identity,
-        // registration, recovery, readiness, or any claim.
+        // cleanup authority depends on, so it refuses before recovery,
+        // readiness, or any claim.
         if !self.forge.core.staging_lists_by_cursor {
             return Err(ForgeError::InvalidConfig {
                 detail:
                     "Forge worker staging backend does not support native list_with_start_after"
                         .to_owned(),
             });
-        }
-        let volume = self.scratch_volume_identity()?;
-        if let Err(error) = self.probe_scratch() {
-            self.tasks
-                .quarantine_worker(self.owner, volume.as_str())
-                .await
-                .map_err(ForgeError::Sql)?;
-            tracing::error!(worker=%self.owner, error=%error, "Forge worker quarantined by startup scratch probe");
-            return Ok(false);
         }
         #[cfg(feature = "test-support")]
         if let Some(observer) = &self.completion_observer
@@ -1557,16 +1508,7 @@ impl ForgeWorker {
                 detail: "injected Forge worker registration failure".to_owned(),
             }));
         }
-        self.tasks
-            .register_healthy_worker(self.owner, volume.as_str())
-            .await
-            .map_err(ForgeError::Sql)?;
-        tracing::info!(
-            worker = %self.owner,
-            volume = volume.as_str(),
-            slots = self.config.worker_concurrency,
-            "Forge worker started"
-        );
+        tracing::info!(worker = %self.owner, "Forge worker started");
         // Readiness is recovery-gated. A Prepared attempt or a lapsed claim is
         // durable evidence a reader can already observe, so this worker
         // resolves all of it before advertising itself and taking new work.
@@ -1688,7 +1630,7 @@ impl ForgeWorker {
     ///
     /// # Errors
     ///
-    /// Returns the SQL, reconciliation, settlement, audit, or scratch failures
+    /// Returns the SQL, reconciliation, settlement, or audit failures
     /// recovery itself raises. Each leaves durable state this owner cannot
     /// account for, so the worker must not become ready.
     ///
@@ -1821,30 +1763,6 @@ impl ForgeWorker {
         Ok(true)
     }
 
-    /// Returns the stable identity of this worker's configured scratch volume.
-    ///
-    /// # Errors
-    /// Returns typed scratch IO when the root cannot be canonicalized or inspected.
-    fn scratch_volume_identity(&self) -> Result<ScratchVolumeIdentity, ForgeError> {
-        ScratchVolumeIdentity::from_root(&self.forge.core.rewrite_spill_root)
-    }
-
-    /// Probes scratch writability through create, fsync, and exact-file delete.
-    ///
-    /// # Errors
-    /// Returns typed scratch IO for any local filesystem failure.
-    fn probe_scratch(&self) -> Result<(), ForgeError> {
-        probe_scratch_root(&self.forge.core.rewrite_spill_root, self.owner)
-    }
-
-    /// Deletes only scratch directories owned by one exact durable attempt.
-    ///
-    /// # Errors
-    /// Returns typed scratch IO when directory inspection or deletion fails.
-    fn cleanup_attempt_scratch(&self, task_id: Uuid, attempt_id: Uuid) -> Result<(), ForgeError> {
-        cleanup_attempt_scratch_root(&self.forge.core.rewrite_spill_root, task_id, attempt_id)
-    }
-
     /// Releases one worker-owned table fence through the single fault seam.
     ///
     /// Both worker-owned release sites route here so an injected release
@@ -1877,27 +1795,22 @@ impl ForgeWorker {
         lease.release(&self.forge.core.operator_pool).await
     }
 
-    /// Reclaims expired durable attempts and removes only their exact scratch prefixes.
+    /// Reclaims expired durable attempts.
     ///
     /// # Errors
-    /// Returns SQL or typed scratch errors; durable reclaim may precede cleanup.
+    /// Returns SQL errors from the bounded operator reclaim.
     async fn reclaim_expired_attempts(&self, cap: u32) -> Result<Vec<(Uuid, Uuid)>, ForgeError> {
-        let reclaimed = self
-            .tasks
+        self.tasks
             .reclaim_expired_attempts(cap)
             .await
-            .map_err(ForgeError::Sql)?;
-        for (task_id, attempt_id) in &reclaimed {
-            self.cleanup_attempt_scratch(*task_id, *attempt_id)?;
-        }
-        Ok(reclaimed)
+            .map_err(ForgeError::Sql)
     }
 
     /// Reclaims expired attempts through the production worker owner in tests.
     ///
     /// # Errors
     ///
-    /// Returns the production SQL or exact scratch-cleanup failure.
+    /// Returns the production SQL failure.
     #[cfg(feature = "test-support")]
     pub async fn reclaim_expired_attempts_for_test(
         &self,
@@ -2638,12 +2551,6 @@ impl ForgeWorker {
                 detail: "Forge worker received a claim owned by another attempt".to_owned(),
             });
         }
-        if task.estimates.envelope.is_none() {
-            let result = self.cancel_superseded(task).await;
-            // Superseding a legacy envelope settles the row without running the
-            // requested effect, so it never counts as a successful completion.
-            return result.map(|()| false);
-        }
         let binding = task_table_binding(
             task.data_tenant_id,
             claim.execution_tenant_id,
@@ -3368,32 +3275,6 @@ impl ForgeWorker {
     ///
     /// Returns catalog, stale-snapshot, lifecycle, heartbeat, rewrite, evidence,
     /// object-store, fence, cancellation, or audit failures.
-    /// Acquires the durable plan's exact memory and scratch before rewrite IO.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ForgeError::Capacity`] when the claim's estimates fail this
-    /// worker's validated ceilings, the platform cannot represent the planned
-    /// memory, or the global resource owner cannot grant both counters, and
-    /// [`ForgeError::Invariant`] when the attempt runtime loses its leased pool.
-    fn acquire_rewrite_resources(
-        &self,
-        claim: &ForgeTaskClaim,
-        attempt: Uuid,
-        binding: &TenantTableBinding,
-    ) -> Result<super::rewrite::ForgeAttemptResources, ForgeError> {
-        let request =
-            crate::resources::ForgeRewriteRequest::from_claim(&claim.estimates, self.capacity)?;
-        super::rewrite::ForgeAttemptResources::acquire(
-            &self.forge.core.resources,
-            request,
-            binding,
-            &self.forge.core.rewrite_spill_root,
-            claim.task_id,
-            attempt,
-        )
-    }
-
     /// Dispatches one fresh claim and reduces its result to durable evidence.
     ///
     /// Splits the strategy-specific dispatch and evidence reduction out of the
@@ -3473,23 +3354,6 @@ impl ForgeWorker {
         shutdown: &CancellationToken,
     ) -> Result<bool, ForgeError> {
         lease.require_fence(&self.forge.core.operator_pool).await?;
-        // Held for the whole fenced attempt: dropping the lease is what returns
-        // the granted memory and scratch counters to the root governor.
-        let _resources = match claim.strategy {
-            // A live rewrite leases the identical envelope for itself around the
-            // only phase that actually holds bytes, so acquiring here as well
-            // would charge the root governor twice for one attempt.
-            // Metadata and cleanup work opens no data file. Charging it a
-            // rewrite envelope would reserve memory and scratch nothing uses and
-            // let one table's retention debt refuse another table's rewrite.
-            ForgeClaimStrategy::Known(
-                ForgeTaskStrategy::SmallFiles
-                | ForgeTaskStrategy::SnapshotExpiry
-                | ForgeTaskStrategy::ExpiredCleanup
-                | ForgeTaskStrategy::OrphanCleanup,
-            ) => None,
-            _ => Some(self.acquire_rewrite_resources(claim, attempt, binding)?),
-        };
         let table = self.forge.load_table(&binding.table_ident()).await?;
         let base_matches = Self::base_snapshot_matches(&table, claim.base_snapshot_id);
         let committed_recovery = if base_matches {
@@ -4213,16 +4077,14 @@ impl ForgeWorker {
     /// # Errors
     ///
     /// Returns [`ForgeError::Shutdown`] when the attempt drained,
-    /// [`ForgeError::Reconciliation`] when the core made no progress,
-    /// [`ForgeError::InvalidConfig`] when the table's bloom-column property is
-    /// unusable, and the capacity, object-store, and execution failures the
-    /// managed core raises.
+    /// [`ForgeError::Reconciliation`] when planning selected no real work, and
+    /// the object-store and execution failures the managed core raises.
     async fn execute_rewrite_handoff(
         &self,
         claim: &ForgeTaskClaim,
         attempt: Uuid,
         binding: &TenantTableBinding,
-        table: &Table,
+        _table: &Table,
         stop: &CancellationToken,
     ) -> Result<
         (
@@ -4231,43 +4093,17 @@ impl ForgeWorker {
         ),
         ForgeError,
     > {
-        let bloom_columns = crate::catalog::layout::PhysicalLayout::bloom_columns_from_property(
-            table
-                .metadata()
-                .properties()
-                .get(crate::catalog::layout::BLOOM_COLUMNS_PROPERTY),
-        )
-        .map_err(|detail| ForgeError::InvalidConfig { detail })?;
-        let outcome = self
+        let rewrite = self
             .forge
-            .execute_rewrite_attempt(
-                binding,
-                super::managed::ForgeRewriteAttempt {
-                    task_id: claim.task_id,
-                    attempt_id: attempt,
-                    request: crate::resources::ForgeRewriteRequest::from_claim(
-                        &claim.estimates,
-                        self.capacity,
-                    )?,
-                    bloom_columns: &bloom_columns,
-                    previous: None,
-                    cancel: stop.clone(),
-                },
-            )
-            .await?;
-        match outcome {
-            super::managed::ForgeRewriteOutcome::Rewritten { evidence, handoff } => {
-                Ok((evidence, *handoff))
-            }
-            super::managed::ForgeRewriteOutcome::Cancelled { .. } => Err(ForgeError::Shutdown),
-            super::managed::ForgeRewriteOutcome::NoProgress {
-                debt_fingerprint, ..
-            } => Err(ForgeError::Reconciliation {
-                detail: format!(
-                    "managed rewrite produced no publishable work for debt {debt_fingerprint}"
-                ),
-            }),
-        }
+            .managed_rewrite(binding, claim.task_id, attempt, stop.clone())?;
+        let planned = rewrite.plan().await?;
+        let Some(first) = planned.plans.into_iter().next() else {
+            return Err(ForgeError::Reconciliation {
+                detail: "managed planning selected no compaction plan".to_owned(),
+            });
+        };
+        let handoff = rewrite.rewrite_plan(first, &planned.table).await?;
+        Ok((planned.evidence, handoff))
     }
 
     /// Derives, prepares, and commits one handoff, retrying at most once.
@@ -6213,7 +6049,6 @@ impl ForgeWorker {
                     &mut conn,
                     claim.task_id,
                     ForgeFailureClass::DataRefusal.as_str(),
-                    None,
                 )
                 .await
                 .map_err(ForgeError::Sql)?;
@@ -6244,39 +6079,17 @@ impl ForgeWorker {
             ForgeError::ShutdownRetained => Ok(()),
             _ => {
                 let class = error.failure_class();
-                let volume = if class == ForgeFailureClass::StorageHealth {
-                    let volume = self.scratch_volume_identity()?;
-                    self.tasks
-                        .quarantine_worker(self.owner, volume.as_str())
-                        .await
-                        .map_err(ForgeError::Sql)?;
-                    Some(volume)
-                } else {
-                    None
-                };
                 let attempts = self
                     .tasks
                     .attempt_count(claim.task_id)
                     .await
                     .map_err(ForgeError::Sql)?;
                 if failure_is_terminal(class, attempts) {
-                    self.terminal_failure(
-                        claim,
-                        attempt,
-                        class,
-                        volume.as_ref().map(ScratchVolumeIdentity::as_str),
-                        error.to_string(),
-                    )
-                    .await?;
+                    self.terminal_failure(claim, attempt, class, error.to_string())
+                        .await?;
                 } else {
                     self.tasks
-                        .retry_failure(
-                            claim.task_id,
-                            attempt,
-                            self.owner,
-                            class.as_str(),
-                            volume.as_ref().map(ScratchVolumeIdentity::as_str),
-                        )
+                        .retry_failure(claim.task_id, attempt, self.owner, class.as_str())
                         .await
                         .map(|_| ())
                         .map_err(ForgeError::Sql)?;
@@ -6325,7 +6138,6 @@ impl ForgeWorker {
         claim: &ForgeTaskClaim,
         attempt: Uuid,
         class: ForgeFailureClass,
-        failed_volume_identity: Option<&str>,
         detail: String,
     ) -> Result<(), ForgeError> {
         let mut conn = self
@@ -6336,12 +6148,7 @@ impl ForgeWorker {
             .await
             .map_err(ForgeError::Sql)?;
         self.tasks
-            .qualify_terminal_failure(
-                &mut conn,
-                claim.task_id,
-                class.as_str(),
-                failed_volume_identity,
-            )
+            .qualify_terminal_failure(&mut conn, claim.task_id, class.as_str())
             .await
             .map_err(ForgeError::Sql)?;
         self.tasks
@@ -6436,8 +6243,8 @@ impl ForgeWorker {
     /// [`MAINTENANCE_STRATEGIES`]; when no maintenance task is ready it falls
     /// back to an unfiltered claim so the slot still performs compaction rather
     /// than idling. A non-reserved slot claims across every strategy directly.
-    /// Both paths share the same fair-claim transaction, so tenancy, lane, and
-    /// size admission are identical.
+    /// Both paths share the same fair-claim transaction, so tenancy admission
+    /// is identical.
     ///
     /// # Errors
     ///
@@ -6447,20 +6254,10 @@ impl ForgeWorker {
         limits: ForgeClaimLimits,
         reserved_maintenance: bool,
     ) -> Result<Option<ForgeTaskClaim>, vala_sql::SqlError> {
-        let volume = self.scratch_volume_identity().map_err(|error| {
-            vala_sql::SqlError::InvariantViolation {
-                detail: error.to_string(),
-            }
-        })?;
         if reserved_maintenance
             && let Some(claim) = self
                 .tasks
-                .claim_fair_for_volume(
-                    self.owner,
-                    limits,
-                    Some(MAINTENANCE_STRATEGIES),
-                    Some(volume.as_str()),
-                )
+                .claim_fair(self.owner, limits, Some(MAINTENANCE_STRATEGIES))
                 .await?
         {
             return Ok(Some(claim));
@@ -6472,25 +6269,15 @@ impl ForgeWorker {
         {
             return Ok(None);
         }
-        self.tasks
-            .claim_fair_for_volume(self.owner, limits, None, Some(volume.as_str()))
-            .await
+        self.tasks.claim_fair(self.owner, limits, None).await
     }
 
-    /// Builds the positive atomic claim limits from Forge capacity.
+    /// Builds the positive atomic claim limits used by every fair claim.
     ///
     /// # Errors
     ///
     /// Returns invalid configuration when the claim TTL exceeds `u32`.
     fn claim_limits(&self) -> Result<ForgeClaimLimits, ForgeError> {
-        let governor =
-            self.forge
-                .core
-                .resources
-                .snapshot()
-                .map_err(|error| ForgeError::Capacity {
-                    detail: error.to_string(),
-                })?;
         Ok(ForgeClaimLimits {
             max_active_per_tenant: u32::try_from(self.config.per_tenant_active_cap)
                 .unwrap_or(u32::MAX),
@@ -6499,22 +6286,6 @@ impl ForgeWorker {
                     detail: "Forge claim TTL exceeds u32 seconds".to_owned(),
                 },
             )?,
-            max_files: u32::MAX,
-            max_bytes: self.capacity.max_large_task_bytes,
-            max_parallelism: self
-                .capacity
-                .max_parallelism
-                .min(u16::try_from(governor.plan.effective_cpu).unwrap_or(u16::MAX)),
-            max_memory_bytes: forge_claim_memory_limit(
-                self.capacity.max_memory_bytes,
-                governor.plan.forge_floor_bytes,
-                governor.plan.elastic_memory_bytes,
-            ),
-            max_spill_bytes: self
-                .capacity
-                .max_spill_bytes
-                .min(governor.plan.scratch_limit_bytes),
-            max_large_task_bytes: self.capacity.max_large_task_bytes,
         })
     }
 }
@@ -6542,63 +6313,6 @@ pub(super) fn forge_claim_memory_limit(
     configured_max_memory_bytes.min(
         u64::try_from(forge_floor_bytes.saturating_add(elastic_memory_bytes)).unwrap_or(u64::MAX),
     )
-}
-
-/// Probes one scratch root through create, fsync, and exact-file deletion.
-///
-/// # Errors
-/// Returns typed scratch IO for any local filesystem failure.
-fn probe_scratch_root(root: &Path, owner: Uuid) -> Result<(), ForgeError> {
-    let path = root.join(format!("forge-probe-{owner}"));
-    let file = std::fs::File::create(&path).map_err(|error| ForgeError::ScratchIo {
-        kind: error.kind(),
-        detail: format!("create {}: {error}", path.display()),
-    })?;
-    file.sync_all().map_err(|error| ForgeError::ScratchIo {
-        kind: error.kind(),
-        detail: format!("fsync {}: {error}", path.display()),
-    })?;
-    drop(file);
-    std::fs::remove_file(&path).map_err(|error| ForgeError::ScratchIo {
-        kind: error.kind(),
-        detail: format!("delete {}: {error}", path.display()),
-    })
-}
-
-/// Deletes scratch directories belonging to one exact task attempt.
-///
-/// Names outside the attempt-scoped prefix are deliberately preserved because
-/// filesystem listings are not an ownership authority.
-///
-/// # Errors
-/// Returns typed scratch IO when the root cannot be listed or an owned
-/// directory cannot be removed.
-fn cleanup_attempt_scratch_root(
-    root: &Path,
-    task_id: Uuid,
-    attempt_id: Uuid,
-) -> Result<(), ForgeError> {
-    let prefix = format!("forge-runtime-{task_id}-{attempt_id}-");
-    let entries = std::fs::read_dir(root).map_err(|error| ForgeError::ScratchIo {
-        kind: error.kind(),
-        detail: format!("list exact attempt root {}: {error}", root.display()),
-    })?;
-    for entry in entries {
-        let entry = entry.map_err(|error| ForgeError::ScratchIo {
-            kind: error.kind(),
-            detail: format!("read exact attempt entry: {error}"),
-        })?;
-        if entry.file_name().to_string_lossy().starts_with(&prefix) {
-            std::fs::remove_dir_all(entry.path()).map_err(|error| ForgeError::ScratchIo {
-                kind: error.kind(),
-                detail: format!(
-                    "delete exact attempt scratch {}: {error}",
-                    entry.path().display()
-                ),
-            })?;
-        }
-    }
-    Ok(())
 }
 
 /// Rejects a new worker maintenance effect after shared authority is cancelled.
@@ -6726,56 +6440,6 @@ mod tests {
             ForgeFailureClass::StorageHealth,
             ATTEMPT_BOUND - 1
         ));
-    }
-
-    /// Scratch probing proves a writable root and leaves no probe artifact.
-    #[test]
-    fn scratch_probe_accepts_writable_root() {
-        let root = tempfile::tempdir().expect("writable scratch root");
-        let owner = Uuid::now_v7();
-
-        probe_scratch_root(root.path(), owner).expect("writable scratch probe");
-
-        assert!(!root.path().join(format!("forge-probe-{owner}")).exists());
-    }
-
-    /// Scratch probing returns typed local IO when the configured root is not a directory.
-    #[test]
-    fn scratch_probe_rejects_unwritable_root() {
-        let parent = tempfile::tempdir().expect("scratch probe parent");
-        let root = parent.path().join("not-a-directory");
-        std::fs::File::create(&root).expect("scratch root file");
-
-        assert!(matches!(
-            probe_scratch_root(&root, Uuid::now_v7()),
-            Err(ForgeError::ScratchIo { .. })
-        ));
-    }
-
-    /// Exact-attempt cleanup removes owned directories and preserves every peer.
-    #[test]
-    fn scratch_cleanup_is_exactly_attempt_scoped() {
-        let root = tempfile::tempdir().expect("scratch root");
-        let task_id = Uuid::now_v7();
-        let attempt_id = Uuid::now_v7();
-        let other_attempt = Uuid::now_v7();
-        let owned = root
-            .path()
-            .join(format!("forge-runtime-{task_id}-{attempt_id}-owned"));
-        let peer_attempt = root
-            .path()
-            .join(format!("forge-runtime-{task_id}-{other_attempt}-peer"));
-        let foreign = root.path().join("caller-owned-directory");
-        std::fs::create_dir(&owned).expect("owned attempt directory");
-        std::fs::create_dir(&peer_attempt).expect("peer attempt directory");
-        std::fs::create_dir(&foreign).expect("foreign directory");
-
-        cleanup_attempt_scratch_root(root.path(), task_id, attempt_id)
-            .expect("exact attempt cleanup");
-
-        assert!(!owned.exists(), "the exact attempt directory is removed");
-        assert!(peer_attempt.exists(), "a sibling attempt is preserved");
-        assert!(foreign.exists(), "an unscoped directory is preserved");
     }
 
     /// Raw metadata evidence hashes exact bytes and uses lowercase encoding.

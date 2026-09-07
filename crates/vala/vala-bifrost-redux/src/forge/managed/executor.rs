@@ -20,7 +20,7 @@ use std::sync::Arc;
 use iceberg::Catalog;
 use iceberg::spec::Schema;
 use iceberg::table::Table;
-use iceberg_compaction_core::compaction::{CompactionPlan, RewriteResult};
+use iceberg_compaction_core::compaction::CompactionPlan;
 use iceberg_compaction_core::managed::{
     AttemptId, ManagedExecutionContext, NonCommittingCompaction,
 };
@@ -311,7 +311,7 @@ impl ForgeManagedRewrite {
         let base_snapshot_id = table
             .metadata()
             .snapshot_for_ref(crate::forge::scribe_promotion::PROMOTION_BRANCH)
-            .map(iceberg::spec::Snapshot::snapshot_id)
+            .map(|snapshot| snapshot.snapshot_id())
             .ok_or_else(|| ForgeError::Invariant {
                 detail: format!(
                     "table {} has no {} snapshot to rewrite",

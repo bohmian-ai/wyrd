@@ -41,14 +41,10 @@ pub use clock::ForgeClockControl;
 pub use compact::{ForgeConfig, ForgeObjectPages, ForgeObjectStore};
 pub use error::ForgeError;
 pub use managed::{
-    ForgeRewriteAttempt, ForgeRewriteEvidence, ForgeRewriteOutcome, ForgeUnsettledOutput,
-    RewriteHandoff,
+    ForgeRewriteEvidence, ForgeRewriteOutcome, ForgeUnsettledOutput, RewriteHandoff,
 };
 pub use metrics::ForgeTelemetry;
-pub use planner::{
-    ForgeCapacity, ForgeEnvelopeSizer, ForgePlanCandidate, ForgePlanCapacity, ForgePlanner,
-    PlannedForgeTask,
-};
+pub use planner::{ForgePlanCandidate, PlannedForgeTask};
 pub use planning_scheduler::{ForgeScheduleOutcome, ForgeScheduler};
 #[cfg(feature = "test-support")]
 pub use scheduler::ForgeSchedulerTrigger;

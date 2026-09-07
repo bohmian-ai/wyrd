@@ -22,6 +22,5 @@ pub(crate) mod observer;
 pub(crate) mod policy;
 pub(crate) mod queue;
 
-pub use executor::ForgeRewriteAttempt;
 pub use fingerprint::{ForgeRewriteEvidence, ForgeRewriteOutcome, ForgeUnsettledOutput};
 pub use handoff::RewriteHandoff;

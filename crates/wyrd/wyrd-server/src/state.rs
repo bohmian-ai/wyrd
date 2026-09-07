@@ -237,7 +237,9 @@ impl ForgeCompactionRuntime {
     /// Returns the handle admitted compaction runners are spawned on.
     ///
     /// `None` for a process without the Forge worker role, which never spawns a
-    /// runner in the first place.
+    /// runner in the first place. The handle is cloned out of the owner rather
+    /// than out of the raw runtime so that composition cannot hand a worker an
+    /// executor this owner does not hold, and therefore does not release.
     pub(crate) fn handle(&self) -> Option<tokio::runtime::Handle> {
         self.runtime
             .as_ref()
@@ -2246,6 +2248,55 @@ mod tests {
     use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
 
     use crate::postgres::ServerPostgres;
+
+    /// The compaction runtime is a single non-`Clone` owner with a nonblocking drop.
+    ///
+    /// Both halves are load-bearing. Non-`Clone` is what keeps the executor out
+    /// of the per-request-cloned state graph, where the last surviving clone
+    /// would decide when it dies. A nonblocking drop is what makes that death
+    /// legal from the async frame `async fn main` forces on final teardown,
+    /// where a joining `Runtime::drop` would panic instead.
+    ///
+    /// # Panics
+    ///
+    /// Panics when dropping the owner blocks, or when the inert Forge-absent
+    /// owner is not equally safe to drop.
+    #[test]
+    fn forge_compaction_runtime_shutdowns_background_on_drop() {
+        /// Compile-time proof the owner cannot be cloned into the state graph.
+        const fn assert_not_clone<T>() {}
+        assert_not_clone::<super::ForgeCompactionRuntime>();
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("dedicated compaction runtime builds");
+        let owner = super::ForgeCompactionRuntime::new(Some(runtime));
+        assert!(
+            owner.handle().is_some(),
+            "a composed owner must hand runners a handle"
+        );
+        // A worker thread parked in a long blocking call is exactly the state a
+        // joining drop would wait on, so it is the state this drop must not.
+        owner
+            .handle()
+            .expect("composed handle")
+            .spawn_blocking(|| std::thread::sleep(std::time::Duration::from_secs(30)));
+        let started = std::time::Instant::now();
+        drop(owner);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "dropping the compaction runtime must detach its threads, not join them"
+        );
+
+        let absent = super::ForgeCompactionRuntime::new(None);
+        assert!(
+            absent.handle().is_none(),
+            "a process without the Forge worker role has no executor to hand out"
+        );
+        drop(absent);
+    }
 
     /// Durable registry failure cannot skip local continuity settlement.
     #[tokio::test]

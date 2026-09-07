@@ -3389,3 +3389,62 @@ async fn coordinator_preseeded_demand_requires_roster_discovery() {
         .expect("coordinator stops");
     server.shutdown().await.expect("server shuts down");
 }
+
+/// A real boot reserves a usable compaction budget only for a Forge process.
+///
+/// The budget is decided during composition, against the same Postgres-backed
+/// graph the worker later admits plans on, so the only place it can be observed
+/// as the worker sees it is a booted server. Two facts are asserted there: a
+/// Forge process reserves a positive budget that leaves both protected floors
+/// intact, and a process without the Forge role composes no Forge at all — so
+/// there is no admitting worker charging memory it never reserved.
+///
+/// # Panics
+///
+/// Panics when either server fails to boot, when the composed budget is zero or
+/// exceeds what the floors leave, or when a Forge-absent target still composes
+/// a Forge.
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn forge_budget_and_runtime_compose_with_postgres() {
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let plan = server
+        .state()
+        .forge()
+        .and_then(|forge| forge.coordinator())
+        .expect("the default target selects Forge")
+        .resource_plan_for_test();
+
+    assert!(
+        plan.forge_compaction_memory_limit_bytes > 0,
+        "a booted Forge process must reserve memory it can admit plans against"
+    );
+    let safe = plan.managed_memory_bytes - plan.scribe_floor_bytes - plan.oracle_floor_bytes;
+    assert!(
+        plan.forge_compaction_memory_limit_bytes <= safe,
+        "the reserved budget must leave both co-located floors intact"
+    );
+    vala_bifrost_redux::forge::ForgeWorkerConfig {
+        per_tenant_active_cap: 1,
+        compaction_memory_budget_bytes: plan.forge_compaction_memory_limit_bytes,
+        max_task_parallelism: 3,
+        pending_task_parallelism: 12,
+    }
+    .validate()
+    .expect("the composed budget yields usable admission bounds");
+
+    server.shutdown().await.expect("server shuts down");
+
+    let scribe = WyrdTestServer::builder()
+        .with_bifrost_target_for_test(wyrd_server::config::BifrostTarget::Scribe)
+        .start_in_process()
+        .await
+        .expect("a Scribe-only server starts");
+    assert!(
+        scribe.state().forge().is_none(),
+        "a process without the Forge role composes no admitting Forge"
+    );
+    scribe.shutdown().await.expect("server shuts down");
+}

@@ -190,6 +190,82 @@ pub async fn run_forge_worker_process_for_test(
 #[cfg(test)]
 /// Static composition assertions that keep API and dedicated-worker ownership separate.
 mod tests {
+    /// The compaction runtime outlives every path that supervises Forge work.
+    ///
+    /// The owner's drop detaches its threads instead of joining them, so a
+    /// runner that has written output objects and is about to Prepare its
+    /// operation would be abandoned mid-flight if the executor were released
+    /// first. Ownership therefore sits outside the serving future in `run`, and
+    /// the release must be sequenced strictly after serving — which is the
+    /// frame that both the API topology and the dedicated worker runner drain
+    /// their supervision inside.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the owner is bound inside the serving future, released
+    /// before serving returns, or released after the Scribe coordination
+    /// runtime it must precede.
+    #[test]
+    fn forge_runtime_lives_until_worker_supervision_drains() {
+        let production = include_str!("mod.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("application module has production source before tests");
+
+        let bind = production
+            .find("compaction_runtime,\n    } = build_state(")
+            .expect("run binds the compaction runtime out of BootedServer");
+        let serve = production
+            .find("let result = if !config.role.serves_api()")
+            .expect("run serves after binding its runtimes");
+        let release = production
+            .find("drop(compaction_runtime);")
+            .expect("run releases the compaction runtime");
+        let coordination = production
+            .find("drop(coordination_runtime);")
+            .expect("run releases the coordination runtime");
+
+        assert!(
+            bind < serve,
+            "the executor must be owned outside the serving future, not inside it"
+        );
+        assert!(
+            serve < release,
+            "serving — which drains Forge supervision — must return before release"
+        );
+        assert!(
+            release < coordination,
+            "Forge threads release before the Scribe coordination threads they may still call"
+        );
+        assert!(
+            production[serve..release].contains(".await"),
+            "the release must follow an awaited serving frame, not a detached spawn"
+        );
+        assert_eq!(
+            production.matches("drop(compaction_runtime);").count(),
+            1,
+            "exactly one release site keeps the ordering above auditable"
+        );
+
+        // Both supervised topologies drain inside that awaited frame.
+        assert!(
+            production.contains("run_forge_worker_process(&config, state, metrics_handle).await"),
+            "the dedicated worker runner is awaited by the serving frame"
+        );
+        assert!(
+            production.contains("let terminal = supervise("),
+            "the dedicated runner drains its Forge supervision before returning"
+        );
+
+        // The harness that composes the same graph honours the same ordering by
+        // owning the runtime for the whole server lifetime.
+        let harness = include_str!("../../../wyrd-testing/src/server.rs");
+        assert!(
+            harness.contains("_compaction_runtime: wyrd_server::state::ForgeCompactionRuntime"),
+            "the test harness must retain the executor for the server's lifetime"
+        );
+    }
+
     /// The API lifecycle has no worker-only branch, while the dedicated runner
     /// has exactly one top-level worker construction path.
     #[test]

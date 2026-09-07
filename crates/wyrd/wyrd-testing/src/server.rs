@@ -3350,6 +3350,20 @@ impl WyrdTestServerBuilder {
         };
 
         let postgres = Arc::new(ServerPostgres::from_parts(runtime_wyrd, runtime_vala));
+        // The formula's default (four fifths of the memory limit) deliberately
+        // does not clamp, so a co-located harness whose Scribe and Oracle floors
+        // are also protected must name a budget that fits the remainder —
+        // exactly as a co-located deployment configures one.
+        let forge_budget_bytes = self
+            .bifrost_roles
+            .iter()
+            .any(|role| {
+                matches!(
+                    role,
+                    BifrostRuntimeRole::ForgeCoordinator | BifrostRuntimeRole::ForgeWorker
+                )
+            })
+            .then_some(256 * 1024 * 1024);
         let resource_roles = self
             .bifrost_roles
             .iter()
@@ -3409,7 +3423,12 @@ impl WyrdTestServerBuilder {
                     scratch_limit_bytes: None,
                     effective_cpu: None,
                     oracle_query_slot_limit: None,
-                    forge_compaction_memory_limit_bytes: None,
+                    // The formula's default (four fifths of the memory limit)
+                    // deliberately does not clamp, so a co-located harness whose
+                    // Scribe and Oracle floors are also protected must name a
+                    // budget that fits the remainder — exactly as a co-located
+                    // deployment configures one.
+                    forge_compaction_memory_limit_bytes: forge_budget_bytes,
                     scratch_root,
                     volume_roots,
                 },

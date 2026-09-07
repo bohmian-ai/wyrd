@@ -6538,6 +6538,146 @@ mod tests {
         drop((analytical, interactive));
     }
 
+    /// The Forge compaction budget is derived once and never crosses a floor.
+    ///
+    /// This is the whole of Forge's root memory ownership: one immutable figure
+    /// on the plan, reserved at planning time, that the worker's admission queue
+    /// charges running plans against. There is no live Forge root lease, so if
+    /// this arithmetic is wrong nothing later corrects it — which is why the
+    /// dedicated, co-located, absent, override, rounding, overflow, and refusal
+    /// cases are all pinned here on their owner rather than inferred from a
+    /// worker test.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any case selects a different budget, leaves different
+    /// elastic memory, weakens a protected role floor, or accepts a budget the
+    /// protected floors cannot cover.
+    #[test]
+    fn forge_compaction_budget_preserves_role_floors() {
+        /// Plans one node from an injected observation and an explicit policy.
+        fn plan_for(
+            memory_limit_bytes: usize,
+            roles: &[BifrostRole],
+            override_bytes: Option<usize>,
+        ) -> Result<ResourcePlan, BifrostResourceError> {
+            let scratch_limit_bytes = 1024 * MIB as u64;
+            let scratch_available_bytes = scratch_limit_bytes + MIN_SCRATCH_FREE_BYTES;
+            BifrostRuntimeResources::from_snapshot(
+                SystemResourceSnapshot {
+                    memory_limit_bytes,
+                    effective_cpu: 4,
+                    scratch_capacity_bytes: scratch_available_bytes,
+                    scratch_available_bytes,
+                    memory_source: ResourceSource::Injected,
+                    cpu_source: ResourceSource::Injected,
+                },
+                BifrostResourcePolicy {
+                    roles: roles.iter().copied().collect(),
+                    memory_limit_bytes: None,
+                    unmanaged_reserve_bytes: None,
+                    scratch_limit_bytes: Some(scratch_limit_bytes),
+                    effective_cpu: None,
+                    oracle_query_slot_limit: None,
+                    forge_compaction_memory_limit_bytes: override_bytes,
+                    scratch_root: PathBuf::new(),
+                    volume_roots: None,
+                },
+            )
+            .map(|resources| resources.plan())
+        }
+
+        // Dedicated Forge: no protected floor competes, so the whole managed
+        // pool less the derived budget stays elastic.
+        let memory = 4096 * MIB;
+        let dedicated = plan_for(memory, &[BifrostRole::Forge], None).expect("dedicated Forge");
+        assert_eq!(dedicated.scribe_floor_bytes, 0);
+        assert_eq!(dedicated.oracle_floor_bytes, 0);
+        let expected_default = memory * 4 / 5;
+        assert_eq!(
+            dedicated.forge_compaction_memory_limit_bytes, expected_default,
+            "the default budget is four fifths of the resolved memory limit"
+        );
+        assert_eq!(
+            dedicated.elastic_memory_bytes,
+            dedicated.managed_memory_bytes - expected_default
+        );
+
+        // Co-located `All`: the same formula, but both protected floors are
+        // still deducted before anything is elastic.
+        let colocated = plan_for(
+            memory,
+            &[BifrostRole::Scribe, BifrostRole::Oracle, BifrostRole::Forge],
+            None,
+        )
+        .expect("co-located All");
+        assert_eq!(colocated.scribe_floor_bytes, ROLE_MEMORY_FLOOR_BYTES);
+        assert_eq!(colocated.oracle_floor_bytes, ROLE_MEMORY_FLOOR_BYTES);
+        assert_eq!(
+            colocated.forge_compaction_memory_limit_bytes, expected_default,
+            "the budget formula does not change with co-location"
+        );
+        let safe = colocated.managed_memory_bytes
+            - colocated.scribe_floor_bytes
+            - colocated.oracle_floor_bytes;
+        assert_eq!(colocated.elastic_memory_bytes, safe - expected_default);
+
+        // Forge absent: zero budget, and today's elastic result is preserved.
+        let without = plan_for(memory, &[BifrostRole::Scribe, BifrostRole::Oracle], None)
+            .expect("Forge-absent node");
+        assert_eq!(without.forge_compaction_memory_limit_bytes, 0);
+        assert_eq!(
+            without.elastic_memory_bytes,
+            without.managed_memory_bytes - without.scribe_floor_bytes - without.oracle_floor_bytes
+        );
+
+        // An explicit positive override wins outright, in either direction.
+        for override_bytes in [64 * MIB, expected_default + MIB] {
+            let overridden = plan_for(memory, &[BifrostRole::Forge], Some(override_bytes))
+                .expect("an override inside the safe budget is accepted");
+            assert_eq!(
+                overridden.forge_compaction_memory_limit_bytes,
+                override_bytes
+            );
+            assert_eq!(
+                overridden.elastic_memory_bytes,
+                overridden.managed_memory_bytes - override_bytes
+            );
+        }
+
+        // Rounding floors rather than rounds: a limit that is not a multiple of
+        // five loses the remainder to elastic instead of over-committing.
+        let odd = plan_for(memory + 3, &[BifrostRole::Forge], None).expect("odd memory limit");
+        assert_eq!(
+            odd.forge_compaction_memory_limit_bytes,
+            (memory + 3) * 4 / 5
+        );
+
+        // Zero and above-safe both refuse; neither is clamped into range.
+        assert!(
+            plan_for(memory, &[BifrostRole::Forge], Some(0)).is_err(),
+            "a zero Forge budget admits no plan and must refuse boot"
+        );
+        let colocated_safe = colocated.managed_memory_bytes
+            - colocated.scribe_floor_bytes
+            - colocated.oracle_floor_bytes;
+        assert!(
+            plan_for(
+                memory,
+                &[BifrostRole::Scribe, BifrostRole::Oracle, BifrostRole::Forge],
+                Some(colocated_safe + 1),
+            )
+            .is_err(),
+            "a budget past the protected floors must refuse boot, never clamp"
+        );
+
+        // The overflow guard is checked arithmetic, not a wrapping multiply.
+        assert!(
+            plan_for(usize::MAX, &[BifrostRole::Forge], None).is_err(),
+            "a memory limit whose four-fifths derivation overflows must refuse"
+        );
+    }
+
     /// Every role retains multiple exact owners in the same checked root ledger.
     #[test]
     fn role_leases_share_one_root_without_crossing_floors_or_elastic() {

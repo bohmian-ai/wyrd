@@ -941,8 +941,10 @@ pub async fn compose_bifrost(
                         detail: format!("Forge compaction runtime failed: {error}"),
                     })
                 })?;
-            let handle = runtime.handle().clone();
             compaction_runtime = ForgeCompactionRuntime::new(Some(runtime));
+            let handle = compaction_runtime
+                .handle()
+                .expect("the owner was just constructed around a live runtime");
             Some(Arc::new(
                 ForgeWorker::new(
                     Arc::clone(&coordinator),
@@ -2213,6 +2215,141 @@ pub fn spawn_maintenance_scheduler(
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    /// The compaction runtime is role-scoped and its budget refuses invalid boot.
+    ///
+    /// Two facts sit on the same owner because composition decides both at the
+    /// same moment. Only a process that actually runs admitted plans builds a
+    /// dedicated executor, and it sizes that executor from the resolved
+    /// effective CPU the memory budget came from rather than from a second CPU
+    /// knob that could disagree. A budget the protected floors cannot cover is
+    /// refused outright, because a clamped budget would silently admit plans
+    /// against memory another role is guaranteed.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a non-worker role builds an executor, when the derived
+    /// admission bounds do not follow effective CPU, or when an invalid budget
+    /// is accepted.
+    #[test]
+    fn forge_runtime_is_role_scoped_and_budget_refuses_invalid_boot() {
+        use vala_bifrost_redux::resources::{
+            BifrostResourcePolicy, BifrostRole, BifrostRuntimeResources, ResourceSource,
+            SystemResourceSnapshot,
+        };
+
+        /// Plans one node exactly as `compose_bifrost` does for these roles.
+        fn plan_for(
+            roles: &[BifrostRole],
+            override_bytes: Option<usize>,
+        ) -> Result<vala_bifrost_redux::resources::ResourcePlan, String> {
+            let scratch = 1024 * 1024 * 1024_u64;
+            BifrostRuntimeResources::from_snapshot(
+                SystemResourceSnapshot {
+                    memory_limit_bytes: 4 * 1024 * 1024 * 1024,
+                    effective_cpu: 6,
+                    scratch_capacity_bytes: scratch * 2,
+                    scratch_available_bytes: scratch * 2,
+                    memory_source: ResourceSource::Injected,
+                    cpu_source: ResourceSource::Injected,
+                },
+                BifrostResourcePolicy {
+                    roles: roles.iter().copied().collect(),
+                    memory_limit_bytes: None,
+                    unmanaged_reserve_bytes: None,
+                    scratch_limit_bytes: Some(scratch),
+                    effective_cpu: None,
+                    oracle_query_slot_limit: None,
+                    forge_compaction_memory_limit_bytes: override_bytes,
+                    scratch_root: std::path::PathBuf::new(),
+                    volume_roots: None,
+                },
+            )
+            .map(|resources| resources.plan())
+            .map_err(|error| error.to_string())
+        }
+
+        // Admission bounds follow the plan's effective CPU, not a new knob.
+        let plan = plan_for(&[BifrostRole::Forge], None).expect("dedicated Forge plans");
+        let forge_runtime = crate::config::ForgeRuntimeConfig::default();
+        let worker = super::forge_compaction_worker_config(&plan, &forge_runtime);
+        assert_eq!(
+            worker.compaction_memory_budget_bytes, plan.forge_compaction_memory_limit_bytes,
+            "the worker charges plans against exactly the reserved budget"
+        );
+        assert_eq!(worker.max_task_parallelism, 18, "three per effective CPU");
+        assert_eq!(
+            worker.pending_task_parallelism, 72,
+            "four times running parallelism may wait"
+        );
+        assert_eq!(worker.per_tenant_active_cap, 1);
+        worker
+            .validate()
+            .expect("composition-derived bounds are usable");
+
+        // The same derivation holds for co-located `All`, which additionally
+        // preserves both protected floors.
+        let all = plan_for(
+            &[BifrostRole::Scribe, BifrostRole::Oracle, BifrostRole::Forge],
+            None,
+        )
+        .expect("co-located All plans");
+        assert!(all.scribe_floor_bytes > 0 && all.oracle_floor_bytes > 0);
+        super::forge_compaction_worker_config(&all, &forge_runtime)
+            .validate()
+            .expect("co-located bounds are usable");
+
+        // Forge absent: nothing is reserved, so nothing may be admitted, which
+        // is what makes the executor role-scoped rather than always-composed.
+        let absent =
+            plan_for(&[BifrostRole::Scribe, BifrostRole::Oracle], None).expect("Forge-absent plan");
+        assert_eq!(absent.forge_compaction_memory_limit_bytes, 0);
+        assert!(
+            super::forge_compaction_worker_config(&absent, &forge_runtime)
+                .validate()
+                .is_err(),
+            "a node that reserved nothing must not compose an admitting worker"
+        );
+
+        // Invalid budgets refuse at planning, before any executor is built.
+        assert!(
+            plan_for(&[BifrostRole::Forge], Some(0)).is_err(),
+            "a zero budget refuses boot"
+        );
+        let safe = all.managed_memory_bytes - all.scribe_floor_bytes - all.oracle_floor_bytes;
+        assert!(
+            plan_for(
+                &[BifrostRole::Scribe, BifrostRole::Oracle, BifrostRole::Forge],
+                Some(safe + 1),
+            )
+            .is_err(),
+            "a budget past the protected floors refuses boot, never clamps"
+        );
+
+        // Only the Forge worker role reaches the executor construction at all.
+        let production = include_str!("mod.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("boot module has production source before tests");
+        assert_eq!(
+            production
+                .matches("compaction_runtime = ForgeCompactionRuntime::new(Some(runtime))")
+                .count(),
+            1,
+            "exactly one composition site installs the dedicated executor"
+        );
+        let installed = production
+            .split("compaction_runtime = ForgeCompactionRuntime::new(Some(runtime))")
+            .next()
+            .expect("source before the install site");
+        assert!(
+            installed
+                .rsplit("if roles.contains(")
+                .next()
+                .is_some_and(|guard| guard.starts_with("&BifrostRuntimeRole::ForgeWorker)")),
+            "the executor must be built only under the Forge worker role guard"
+        );
+    }
 
     /// Orphan listing refuses a backend that cannot resume from a cursor.
     ///

@@ -60,8 +60,12 @@ pub static QUANTILE_VALUE_FIELDS: [F; 2] = [
 ];
 
 /// Element declaration of the ordered summary quantile collection.
-pub static QUANTILE_VALUE_ELEMENT: F =
-    F::payload(36, "quantile_value", T::Struct(&QUANTILE_VALUE_FIELDS), false);
+pub static QUANTILE_VALUE_ELEMENT: F = F::payload(
+    36,
+    "quantile_value",
+    T::Struct(&QUANTILE_VALUE_FIELDS),
+    false,
+);
 
 /// Ordered fields of one exemplar.
 ///

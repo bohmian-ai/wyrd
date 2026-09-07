@@ -2465,14 +2465,78 @@ mod tests {
             "the fence carries the request that produced the accepted subset"
         );
 
-        let recovered = arrow::ipc::reader::StreamReader::try_new(
-            Cursor::new(state.data_records[0].as_slice()),
-            None,
-        )
-        .expect("recovered Arrow stream")
-        .next()
-        .expect("one recovered batch")
-        .expect("recovered batch decodes");
+        assert_recovered_slices_are_canonical(state, commit);
+
+        assert_replay_is_idempotent(temp_dir.path(), state, commit);
+
+        assert_truncated_arrow_fails_closed(&decode_replayed_slice(&state.data_records[0]));
+    }
+
+    /// Assert every recovered slice authenticates the fence and its schema.
+    ///
+    /// The fence digest is the *logical* identity, distinct from the WAL
+    /// payload digest that authenticates the frames, so it is recomputed here
+    /// from the recovered slices alone. Each recovered slice must also still be
+    /// exactly the table's own physical schema, by complete field list and by
+    /// canonical physical identity.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a recovered slice does not decode, when the recomputed
+    /// logical digest differs from the fence, or when a recovered schema is not
+    /// the table-owned physical schema.
+    fn assert_recovered_slices_are_canonical(
+        state: &ReplayedSealKey,
+        commit: &ReplayedCommitIdentity,
+    ) {
+        let mut recovered_slices: Vec<(u32, arrow::record_batch::RecordBatch, [u8; 32])> = state
+            .append_metas
+            .iter()
+            .zip(&state.data_records)
+            .map(|(meta, data)| {
+                (
+                    meta.append_slice_id.slice_index,
+                    decode_replayed_slice(data),
+                    meta.schema_fingerprint,
+                )
+            })
+            .collect();
+        recovered_slices.sort_by_key(|(slice_index, _, _)| *slice_index);
+        let mut logical = crate::scribe::preprocess::LogicalBatchDigest::new();
+        for (slice_index, rows, schema_fingerprint) in &recovered_slices {
+            let (data_digest, data_len) =
+                crate::scribe::preprocess::logical_data_identity(rows).expect("logical identity");
+            logical.push_slice(*slice_index, schema_fingerprint, &data_digest, data_len);
+        }
+        assert_eq!(
+            logical.finish(),
+            commit.slice_set_digest,
+            "the fence authenticates the logical identity of the recovered slices"
+        );
+
+        let definition =
+            crate::tables::builtin_table("traces", "spans").expect("the spans built-in resolves");
+        let physical = (definition.schema)();
+        let expected_identity = crate::tables::ResolvedSchemaIdentity::for_builtin(definition)
+            .canonical_physical_fingerprint
+            .expect("a canonical built-in resolves a physical fingerprint");
+        for (_, rows, _) in &recovered_slices {
+            assert_eq!(
+                rows.schema().fields(),
+                physical.fields(),
+                "recovery preserves the complete table-owned physical schema"
+            );
+            assert_eq!(
+                crate::tables::CanonicalPhysicalFingerprint::from_physical_fields(
+                    rows.schema().fields()
+                )
+                .expect("the recovered schema fingerprints"),
+                expected_identity,
+                "recovery preserves the canonical physical identity"
+            );
+        }
+
+        let recovered = &recovered_slices[0].1;
         assert_eq!(recovered.num_rows(), 2);
         assert!(
             recovered
@@ -2482,6 +2546,152 @@ mod tests {
                 .any(|field| matches!(field.data_type(), arrow::datatypes::DataType::List(_))),
             "recovery preserves the nested canonical columns"
         );
+    }
+
+    /// Assert a second replay of the same WAL restores exactly one same fence.
+    ///
+    /// Recovery must be repeatable: rereading the directory may not synthesize
+    /// a second commit, reorder or duplicate a slice identity, or return
+    /// different rows.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the second replay finds no committed seal key, adds a
+    /// commit, or restores different fence, slice, or row bytes.
+    fn assert_replay_is_idempotent(
+        wal_dir: &std::path::Path,
+        state: &ReplayedSealKey,
+        commit: &ReplayedCommitIdentity,
+    ) {
+        let again = replay_wal_directory(wal_dir).expect("second replay");
+        let again = again
+            .values()
+            .find(|state| !state.commits.is_empty())
+            .expect("one committed seal key");
+        assert_eq!(again.commits.len(), 1, "a second replay adds no commit");
+        assert_eq!(
+            again
+                .commits
+                .iter()
+                .map(|identity| (identity.batch_id, identity.slice_set_digest))
+                .collect::<Vec<_>>(),
+            vec![(commit.batch_id, commit.slice_set_digest)],
+            "a second replay restores the same fence identity"
+        );
+        assert_eq!(
+            again
+                .append_metas
+                .iter()
+                .map(|meta| (meta.append_slice_id.clone(), meta.payload_digest))
+                .collect::<Vec<_>>(),
+            state
+                .append_metas
+                .iter()
+                .map(|meta| (meta.append_slice_id.clone(), meta.payload_digest))
+                .collect::<Vec<_>>(),
+            "a second replay restores the same slice identities"
+        );
+        assert_eq!(again.data_records, state.data_records);
+    }
+
+    /// Decode one replayed Arrow IPC slice into its single record batch.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the recovered bytes are not one decodable Arrow IPC stream
+    /// carrying exactly one record batch.
+    fn decode_replayed_slice(data: &[u8]) -> arrow::record_batch::RecordBatch {
+        arrow::ipc::reader::StreamReader::try_new(Cursor::new(data), None)
+            .expect("recovered Arrow stream")
+            .next()
+            .expect("one recovered batch")
+            .expect("recovered batch decodes")
+    }
+
+    /// A structurally invalid Arrow payload inside a valid WAL frame fails closed.
+    ///
+    /// The WAL frame is complete and CRC-valid, so replay reconstructs the seal
+    /// state; only the Arrow body is truncated mid-`RecordBatch`. Decoding that
+    /// state must refuse rather than yield a partial generation, so no
+    /// `FrozenMemtable` is produced.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the truncated payload still decodes, when the refusal is not
+    /// the existing Arrow decode failure, or when replay does not reconstruct
+    /// the seal state that carries it.
+    fn assert_truncated_arrow_fails_closed(rows: &arrow::record_batch::RecordBatch) {
+        let complete = {
+            let mut buffer = Vec::new();
+            let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut buffer, &rows.schema())
+                .expect("stream writer");
+            writer.write(rows).expect("write batch");
+            writer.finish().expect("finish stream");
+            buffer
+        };
+        let schema_only = {
+            let mut buffer = Vec::new();
+            let writer = arrow::ipc::writer::StreamWriter::try_new(&mut buffer, &rows.schema())
+                .expect("schema-only writer");
+            drop(writer);
+            buffer.len()
+        };
+        // Past the schema message, inside the first RecordBatch body.
+        let cut = schema_only + (complete.len() - schema_only) / 2;
+        assert!(cut > schema_only && cut < complete.len());
+        let truncated = &complete[..cut];
+        assert!(
+            arrow::ipc::reader::StreamReader::try_new(Cursor::new(truncated), None)
+                .ok()
+                .and_then(|mut reader| reader.next())
+                .is_none_or(|batch| batch.is_err()),
+            "the truncated payload must not decode into a batch"
+        );
+
+        let temp_dir = TempDir::new().expect("temp dir");
+        let node_id = NodeId::generate();
+        let tenant = DataTenantId::new_v7();
+        let wal = WalWriter::new(
+            temp_dir.path(),
+            *node_id.as_bytes(),
+            1,
+            WalConfig::default(),
+        )
+        .expect("writer");
+        let seal_key = replay_key(tenant);
+        let audit = crate::scribe::audit_envelope::encode_audit_event(&AuditEvent {
+            request_id: RequestId::now_v7(),
+            trace_id: None,
+            operation: "bifrost.otlp".to_owned(),
+            resource: "vala.traces.spans".to_owned(),
+            card_ref: None,
+            principal_id: PrincipalId::new(uuid::Uuid::now_v7()),
+            principal_kind: PrincipalKindTag::User,
+            auth_method: AuthMethod::Jwt,
+            permission: "bifrost:record:write".to_owned(),
+            decision: AuditDecision::Allow,
+            result: AuditResult::Success,
+            payload_summary: "truncated Arrow body".to_owned(),
+            detail: None,
+        })
+        .expect("audit");
+        wal.append_and_commit_for_replay_test(&seal_key, [7; 16], &audit, truncated)
+            .expect("a valid WAL frame carrying an invalid Arrow body");
+
+        let replayed = replay_wal_directory(temp_dir.path()).expect("replay");
+        let state = replayed
+            .values()
+            .find(|state| !state.data_records.is_empty())
+            .expect("the truncated payload is reconstructed");
+        let error = crate::scribe::memtable::Memtable::decode_replayed(state)
+            .expect_err("a structurally invalid Arrow body must fail closed");
+        match error {
+            ScribeError::Internal { detail } => assert!(
+                detail.starts_with("replayed Arrow IPC decode failed"),
+                "unexpected refusal: {detail}"
+            ),
+            other => panic!("unexpected refusal: {other:?}"),
+        }
     }
 
     /// Proves production writer ordering emits each committed batch while an

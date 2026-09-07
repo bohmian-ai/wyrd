@@ -378,6 +378,10 @@ async fn latest_small_files_task(
 async fn reconciliation_walks_every_open_operation_a_page_cannot_hold() {
 redacted
     promoted.fixture.config.max_open_operations_per_table = 1;
+    // A stalled commit has to run out of publication budget while the scenario
+    // is still watching, so the budget is the seconds a test can wait rather
+    // than the production minutes.
+    promoted.fixture.config.iceberg_total_retry_timeout = std::time::Duration::from_secs(2);
     let object_store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
     let catalog = PromotionCatalogSeam::new(
         promoted.fixture.catalog.iceberg_catalog(),
@@ -393,26 +397,42 @@ redacted
     promoted.fixture.seal_more(2).await;
     supervisor.run_one_success().await;
 
+    // Every plan lands and none of them is answered, so the attempt ends
+    // holding several operations it cannot account for. It proves the first one
+    // live, settles on that success, and leaves the rest open — which is what
+    // puts more open rows on this table than one page holds.
     catalog.stall_next_commit_responses(8);
     supervisor.restart_worker();
-    supervisor.run_one_failure().await;
-    catalog.lose_commit_responses(false);
-
-    let open = promoted.fixture.rewrite_operations().await;
+    supervisor.schedule_only().await;
+    supervisor.start_worker();
+    await_small_files_in_state(&promoted.fixture, &["succeeded"], 1).await;
+    catalog.stall_next_commit_responses(0);
+    supervisor.stop_worker().await;
     assert!(
-        open.len() > promoted.fixture.config.max_open_operations_per_table,
-        "the attempt must leave more open operations than one page holds: {open:?}"
-    );
-    assert!(
-        open.iter().all(|(_, phase)| phase == "prepared"),
-        "a lost commit response leaves its operation open: {open:?}"
+        supervisor.returned_errors().is_empty(),
+        "no attempt is failed or retried while one of its operations is still \
+         Prepared and one is proven live: {:?}",
+        supervisor.returned_errors()
     );
 
-    // Reconciliation refuses to call a young operation absent, so the takeover
-    // only starts once the uncertainty bound and the reclaim backoff lapse.
-    // Measured from wall clock rather than from the manual clock's own base:
-    // the operations were prepared with database timestamps taken while this
-    // attempt ran, so only a bound taken after them makes them old enough.
+    let captured = operation_phases(&promoted.fixture)
+        .await
+        .into_iter()
+        .filter(|(_, phase)| phase == "prepared")
+        .map(|(id, _)| id)
+        .collect::<BTreeSet<_>>();
+    assert!(
+        captured.len() > promoted.fixture.config.max_open_operations_per_table,
+        "the attempt must leave more open operations than one page holds: {:?}",
+        operation_phases(&promoted.fixture).await
+    );
+
+    // The whole-table takeover. Reconciliation refuses to call a young
+    // operation absent, so it only starts once the uncertainty bound and the
+    // reclaim backoff lapse. Measured from wall clock rather than from the
+    // manual clock's own base: the operations were prepared with database
+    // timestamps taken while the attempt ran, so only a bound taken after them
+    // makes them old enough.
     let settled_at = chrono::Utc::now()
         + chrono::Duration::from_std(promoted.fixture.config.uncertainty_bound)
             .expect("the uncertainty bound is representable")
@@ -424,17 +444,21 @@ redacted
     supervisor.reclaim_expired_claims().await;
     promoted.fixture.clear_task_backoff().await;
     supervisor.restart_worker();
-    let reconciliation = supervisor.run_one_failure().await;
-    supervisor.shutdown().await;
+    supervisor.schedule_only().await;
+    supervisor.start_worker();
 
-    // The successor refuses to plan while any open operation is unaccounted
-    // for, and it names how many it accounted for. That count is the proof: a
-    // reader bounded by one page would have reported one open operation and
-    // silently left the rest of them unclassified.
+    // The proof is the durable rows: every captured UUID is classified, so a
+    // reader bounded by one page — which would have settled one and silently
+    // left the rest Prepared forever — cannot produce this state.
+    await_operation_phase(&promoted.fixture, &captured, "recovered").await;
+    supervisor.shutdown().await;
     assert!(
-        reconciliation.contains(&format!("{} unresolved live operations", open.len())),
-        "reconciliation classified every open operation, not one page of them: \
-         {reconciliation} over {open:?}"
+        operation_phases(&promoted.fixture)
+            .await
+            .into_values()
+            .all(|phase| phase != "prepared"),
+        "the takeover leaves no open operation behind: {:?}",
+        operation_phases(&promoted.fixture).await
     );
 }
 

@@ -1526,6 +1526,16 @@ struct WalDiskState {
     /// second copy could only diverge into a pod that refuses every append with
     /// nothing left able to clear the refusal.
     hard_failed: AtomicBool,
+    /// Sticky "the disk is still full" condition owned by a test injection.
+    ///
+    /// A real ENOSPC latch is re-evaluated against the filesystem, and a test
+    /// host's filesystem is never actually full, so an injected trip would be
+    /// cleared by the first retirement that happened to run — including one a
+    /// concurrent background rotation owed from earlier work. This flag stands
+    /// in for the full disk itself: while it is set, re-evaluation reports the
+    /// condition as still present, and only an explicit test clear removes it.
+    #[cfg(any(test, feature = "test-support"))]
+    forced_hard: AtomicBool,
     accounted_bytes: AtomicU64,
     #[cfg(test)]
     forced_sample: Mutex<Option<ForcedSample>>,
@@ -1572,6 +1582,18 @@ impl WalDiskBreaker {
     pub fn trip(&self) {
         self.disk.mark_hard_failed();
     }
+
+    /// Trips the breaker as a held test condition rather than a sampled one.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn trip_injected(&self) {
+        self.disk.mark_hard_failed_injected();
+    }
+
+    /// Releases a held test condition so retirement can clear the latch.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn clear_injection(&self) {
+        self.disk.clear_injected_hard();
+    }
 }
 
 impl WalDiskState {
@@ -1581,6 +1603,8 @@ impl WalDiskState {
             configured_limit_bytes,
             sample: Mutex::new(None),
             hard_failed: AtomicBool::new(false),
+            #[cfg(any(test, feature = "test-support"))]
+            forced_hard: AtomicBool::new(false),
             accounted_bytes: AtomicU64::new(0),
             #[cfg(test)]
             forced_sample: Mutex::new(None),
@@ -1706,6 +1730,23 @@ impl WalDiskState {
         self.hard_failed.store(true, Ordering::Release);
     }
 
+    /// Marks the disk hard-failed and holds the condition against re-evaluation.
+    ///
+    /// Used by the test injections so a refusal window is not ended by an
+    /// unrelated retirement observing the host's genuinely writable disk.
+    #[cfg(any(test, feature = "test-support"))]
+    fn mark_hard_failed_injected(&self) {
+        self.forced_hard.store(true, Ordering::Release);
+        self.mark_hard_failed();
+    }
+
+    /// Removes the injected condition, leaving the latch to the ordinary
+    /// retirement-driven re-evaluation.
+    #[cfg(any(test, feature = "test-support"))]
+    fn clear_injected_hard(&self) {
+        self.forced_hard.store(false, Ordering::Release);
+    }
+
     /// Clears the latch once the disk-full condition has actually passed.
     ///
     /// The latch exists so a pod stops hammering a disk it cannot write to, not
@@ -1719,6 +1760,10 @@ impl WalDiskState {
     fn recover_if_drained(&self) -> bool {
         if !self.hard_failed.load(Ordering::Acquire) {
             return true;
+        }
+        #[cfg(any(test, feature = "test-support"))]
+        if self.forced_hard.load(Ordering::Acquire) {
+            return false;
         }
         if self.pressure(self.bytes(), 0).hard {
             return false;
@@ -2562,7 +2607,7 @@ impl WalWriter {
     /// therefore exercises rejection before LSN allocation or file mutation.
     #[cfg(any(test, feature = "test-support"))]
     pub fn trip_disk_full_for_test(&self) {
-        self.disk.mark_hard_failed();
+        self.disk.mark_hard_failed_injected();
     }
 
     /// Re-evaluates the disk-full latch the way retirement does.
@@ -2572,6 +2617,7 @@ impl WalWriter {
     /// the production one.
     #[cfg(any(test, feature = "test-support"))]
     pub fn recover_disk_for_test(&self) {
+        self.disk.clear_injected_hard();
         self.disk.recover_if_drained();
     }
 

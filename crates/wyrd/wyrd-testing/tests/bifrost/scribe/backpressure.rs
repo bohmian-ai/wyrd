@@ -137,8 +137,13 @@ async fn scribe_backpressure_disk_pressure_and_fairness_recover() {
         "the second tenant's acknowledged rows must stay readable under pressure"
     );
 
-    // Publication retires the closed WAL segments, which is the event that
-    // frees space and therefore the only event allowed to clear the breaker.
+    // The injected condition stands in for the full disk; releasing it is the
+    // disk draining, not the breaker clearing. Publication retires the closed
+    // WAL segments, which is the event that frees space and therefore the only
+    // event allowed to clear the breaker.
+    server
+        .clear_bifrost_wal_disk_full_injection_for_test()
+        .expect("the WAL breaker is reachable");
     server
         .flush_bifrost()
         .await

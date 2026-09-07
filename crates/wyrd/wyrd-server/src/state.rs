@@ -2284,6 +2284,19 @@ impl AppState {
         Ok(())
     }
 
+    /// Release the held Scribe WAL refusal so retirement clears the breaker.
+    ///
+    /// # Errors
+    /// Returns an error when this server hosts no Scribe.
+    #[cfg(feature = "test-support")]
+    pub fn clear_scribe_wal_disk_full_injection_for_test(&self) -> Result<(), String> {
+        let Some(runtime) = self.bifrost.scribe() else {
+            return Err("Scribe is not configured".to_owned());
+        };
+        runtime.scribe().clear_wal_disk_full_injection_for_test();
+        Ok(())
+    }
+
     /// Return the bounded Scribe ownership snapshot for test-tier inspection.
     #[cfg(feature = "test-support")]
     pub fn scribe_inspection_snapshot_for_test(

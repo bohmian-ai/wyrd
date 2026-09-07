@@ -671,6 +671,27 @@ impl AdmissionController {
         }
     }
 
+    /// Trip the pod-wide WAL breaker as a held test condition.
+    ///
+    /// Unlike [`Self::trip_wal_disk_full`], the condition survives an unrelated
+    /// retirement re-evaluating a host disk that was never actually full.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn trip_wal_disk_full_injected(&self) {
+        match &self.inner.wal_breaker {
+            Some(breaker) => breaker.trip_injected(),
+            None => self.inner.wal_disk_full.store(true, Ordering::Release),
+        }
+    }
+
+    /// Release a held test condition so the next retirement clears the latch.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn clear_wal_disk_full_injection(&self) {
+        match &self.inner.wal_breaker {
+            Some(breaker) => breaker.clear_injection(),
+            None => self.inner.wal_disk_full.store(false, Ordering::Release),
+        }
+    }
+
     fn release_request(&self, bytes: usize) -> Result<(), ScribeError> {
         let mut state = self.inner.state.lock().map_err(|_| ScribeError::Internal {
             detail: "admission state lock poisoned during request release".to_owned(),

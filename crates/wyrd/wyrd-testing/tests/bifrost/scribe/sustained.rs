@@ -153,7 +153,10 @@ impl Participant {
 /// ever refused, when any read returns other than the exact acknowledged rows,
 /// when publication does not account for every row, or when terminal ownership
 /// and telemetry do not reconcile.
-#[tokio::test]
+// Four tenants must actually run at once for the pod's single vector to be
+// contended; a current-thread runtime lets a loaded host serialize them and the
+// run then observes no refusal at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires Postgres and object storage"]
 async fn scribe_sustained_ingest_oracle_hot_read_journey() {
     let admission = AdmissionConfig {

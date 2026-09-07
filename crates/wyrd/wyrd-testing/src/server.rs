@@ -1690,6 +1690,19 @@ impl WyrdTestServer {
             .map_err(WyrdTestServerError::Start)
     }
 
+    /// Release the held WAL refusal so a real retirement clears the breaker.
+    ///
+    /// # Errors
+    /// Returns a start error when this server hosts no Scribe.
+    pub fn clear_bifrost_wal_disk_full_injection_for_test(
+        &self,
+    ) -> Result<(), WyrdTestServerError> {
+        self.inner
+            .state
+            .clear_scribe_wal_disk_full_injection_for_test()
+            .map_err(WyrdTestServerError::Start)
+    }
+
     /// Return the server-owned Scribe snapshot used by journey inspection.
     pub fn scribe_inspection_snapshot(
         &self,

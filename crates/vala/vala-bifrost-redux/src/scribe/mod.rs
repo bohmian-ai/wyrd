@@ -2452,9 +2452,19 @@ impl ScribeImpl {
     }
 
     /// Trip the WAL availability breaker for deterministic test-tier probes.
+    ///
+    /// The refusal is held until [`Self::clear_wal_disk_full_injection_for_test`]
+    /// releases it, so a concurrent retirement observing a writable host disk
+    /// cannot end the probe's refusal window early.
     #[cfg(any(test, feature = "test-support"))]
     pub fn trip_wal_disk_full_for_test(&self) {
-        self.admission.trip_wal_disk_full();
+        self.admission.trip_wal_disk_full_injected();
+    }
+
+    /// Release the held test refusal, leaving the latch to real retirement.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn clear_wal_disk_full_injection_for_test(&self) {
+        self.admission.clear_wal_disk_full_injection();
     }
 
     /// Returns the bounded CPU pool used by Scribe's ingest materialization.

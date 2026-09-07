@@ -175,8 +175,10 @@ def test_negative_empty_permissions_denied_rbac_on_write(wyrd_server: WyrdTestSe
     )
     with pytest.raises(RuntimeError, match="WYRD_PERMISSION_403_DENIED_RBAC"):
         bifrost.flush()
-    with pytest.raises(RuntimeError, match="WYRD_PERMISSION_403_DENIED_RBAC"):
-        bifrost.shutdown()
+    # A denial is terminal, not ambiguous: the refused batch is not retained for
+    # retry, so the caller is told once, at the boundary that carried the write,
+    # and the shutdown that follows has nothing left to send.
+    bifrost.shutdown()
 
     async def readback() -> list[tuple[int, str]]:
         stream = await BifrostQueryClient(wyrd_server.base_url, token).query(

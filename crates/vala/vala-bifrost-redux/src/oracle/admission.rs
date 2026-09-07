@@ -354,6 +354,11 @@ pub struct QueryResourceSnapshot {
     /// Local running slot units retained by this query.
     pub admission_slots: u64,
     /// Query-owned memory bytes retained after live-tail drain.
+    ///
+    /// The drain moves the tail into this query's own admitted pool, so the
+    /// figure is read from that pool rather than from a separate tally: a
+    /// second counter could only report zero for a query that is demonstrably
+    /// holding bytes.
     pub memory_bytes: u64,
     /// Local peer-worker slot units retained by this query.
     pub peer_slots: u64,
@@ -432,6 +437,11 @@ impl QueryResourceProbe {
             .pool
             .as_ref()
             .map_or(0, |pool| u64::try_from(pool.reserved()).unwrap_or(u64::MAX));
+        // Released ownership is reported by the watch channel; a live query's
+        // held bytes are whatever its own pool holds right now.
+        if snapshot.admission_slots > 0 {
+            snapshot.memory_bytes = snapshot.pool_current_bytes;
+        }
         snapshot.pool_peak_bytes = self.memory_peak_bytes.as_ref().map_or(0, |peak| {
             u64::try_from(peak.load(Ordering::Acquire)).unwrap_or(u64::MAX)
         });

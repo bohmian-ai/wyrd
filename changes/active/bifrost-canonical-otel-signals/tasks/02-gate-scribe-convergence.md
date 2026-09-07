@@ -232,10 +232,8 @@ dependency, feature, new test target, or new harness belongs here.
 Run every named command, then:
 
 ```bash
-mise run test:bifrost:integration:redux
-mise run test:bifrost:integration:server
 mise run test:bifrost:journey:scribe
-mise run check:bifrost-resource-governance
+mise run verify:bifrost
 mise run fmt
 mise run lints
 git diff --check

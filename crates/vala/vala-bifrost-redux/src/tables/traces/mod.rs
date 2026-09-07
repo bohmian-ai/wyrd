@@ -248,7 +248,43 @@ mod tests {
             17
         );
 
-        let events = typed::<ListArray>(&batch, "events").value(0);
+        assert_span_children(&batch);
+        assert_span_context_and_promotions(&batch);
+        for declared in SPAN_FIELDS {
+            let field = batch
+                .schema()
+                .field_with_name(declared.name)
+                .expect("every declared field is present")
+                .clone();
+            assert_eq!(
+                field.metadata().get(PARQUET_FIELD_ID),
+                Some(&declared.id.to_string()),
+                "{} carries its stable id",
+                declared.name
+            );
+            assert_eq!(
+                field.metadata().get(WYRD_SENSITIVE),
+                Some(&declared.class.is_sensitive().to_string()),
+                "{} carries its sensitivity",
+                declared.name
+            );
+        }
+
+        let permuted = permute(&batch);
+        let revalidated =
+            validate_canonical_user_batch(SPAN_FIELDS, &permuted).expect("names bind, not indexes");
+        assert_eq!(revalidated.schema(), canonical_span_schema());
+        assert_eq!(revalidated, batch);
+    }
+
+    /// Assert the nested event and link collections survive intact.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a nested event or link value, order, or present-but-empty
+    /// payload differs.
+    fn assert_span_children(batch: &RecordBatch) {
+        let events = typed::<ListArray>(batch, "events").value(0);
         let events = events
             .as_any()
             .downcast_ref::<StructArray>()
@@ -279,7 +315,7 @@ mod tests {
             "an empty event attribute collection stays present and empty"
         );
 
-        let links = typed::<ListArray>(&batch, "links").value(0);
+        let links = typed::<ListArray>(batch, "links").value(0);
         let links = links
             .as_any()
             .downcast_ref::<StructArray>()
@@ -296,94 +332,76 @@ mod tests {
             .and_then(|column| column.as_any().downcast_ref::<UInt32Array>())
             .expect("link flag column");
         assert_eq!(link_flags.value(0), 0x0000_0201);
+    }
 
-        assert!(typed::<BooleanArray>(&batch, "resource_present").value(0));
+    /// Assert resource, scope, and pinned promotion columns are exact.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a presence bit, context scalar, entity-reference count, or
+    /// promoted `GenAI` value differs.
+    fn assert_span_context_and_promotions(batch: &RecordBatch) {
+        assert!(typed::<BooleanArray>(batch, "resource_present").value(0));
         assert_eq!(
-            typed::<UInt32Array>(&batch, "resource_dropped_attributes_count").value(0),
+            typed::<UInt32Array>(batch, "resource_dropped_attributes_count").value(0),
             3
         );
         assert_eq!(
-            typed::<StringArray>(&batch, "resource_schema_url").value(0),
+            typed::<StringArray>(batch, "resource_schema_url").value(0),
             "https://schemas/resource/1"
         );
-        let entity_refs = typed::<ListArray>(&batch, "resource_entity_refs").value(0);
+        let entity_refs = typed::<ListArray>(batch, "resource_entity_refs").value(0);
         let entity_refs = entity_refs
             .as_any()
             .downcast_ref::<BinaryArray>()
             .expect("entity refs are binary");
         assert_eq!(entity_refs.len(), 2);
-        assert!(typed::<BooleanArray>(&batch, "scope_present").value(0));
+        assert!(typed::<BooleanArray>(batch, "scope_present").value(0));
         assert_eq!(
-            typed::<StringArray>(&batch, "scope_name").value(0),
+            typed::<StringArray>(batch, "scope_name").value(0),
             "wyrd.tracer"
         );
         assert_eq!(
-            typed::<StringArray>(&batch, "scope_version").value(0),
+            typed::<StringArray>(batch, "scope_version").value(0),
             "1.2.3"
         );
         assert_eq!(
-            typed::<UInt32Array>(&batch, "scope_dropped_attributes_count").value(0),
+            typed::<UInt32Array>(batch, "scope_dropped_attributes_count").value(0),
             5
         );
         assert_eq!(
-            typed::<StringArray>(&batch, "scope_schema_url").value(0),
+            typed::<StringArray>(batch, "scope_schema_url").value(0),
             "https://schemas/scope/1"
         );
 
         assert_eq!(
-            typed::<StringArray>(&batch, "service_name").value(0),
+            typed::<StringArray>(batch, "service_name").value(0),
             "checkout"
         );
         assert_eq!(
-            typed::<StringArray>(&batch, "gen_ai_operation_name").value(0),
+            typed::<StringArray>(batch, "gen_ai_operation_name").value(0),
             "chat"
         );
         assert_eq!(
-            typed::<StringArray>(&batch, "gen_ai_provider_name").value(0),
+            typed::<StringArray>(batch, "gen_ai_provider_name").value(0),
             "anthropic"
         );
         assert_eq!(
-            typed::<StringArray>(&batch, "gen_ai_request_model").value(0),
+            typed::<StringArray>(batch, "gen_ai_request_model").value(0),
             "claude"
         );
         assert_eq!(
-            typed::<StringArray>(&batch, "gen_ai_conversation_id").value(0),
+            typed::<StringArray>(batch, "gen_ai_conversation_id").value(0),
             "conversation-1"
         );
         assert_eq!(
-            typed::<Int64Array>(&batch, "gen_ai_usage_input_tokens").value(0),
+            typed::<Int64Array>(batch, "gen_ai_usage_input_tokens").value(0),
             1_024
         );
         assert_eq!(
-            typed::<Int64Array>(&batch, "gen_ai_usage_output_tokens").value(0),
+            typed::<Int64Array>(batch, "gen_ai_usage_output_tokens").value(0),
             -1
         );
-
-        for declared in SPAN_FIELDS {
-            let field = batch
-                .schema()
-                .field_with_name(declared.name)
-                .expect("every declared field is present")
-                .clone();
-            assert_eq!(
-                field.metadata().get(PARQUET_FIELD_ID),
-                Some(&declared.id.to_string()),
-                "{} carries its stable id",
-                declared.name
-            );
-            assert_eq!(
-                field.metadata().get(WYRD_SENSITIVE),
-                Some(&declared.class.is_sensitive().to_string()),
-                "{} carries its sensitivity",
-                declared.name
-            );
-        }
-
-        let permuted = permute(&batch);
-        let revalidated =
-            validate_canonical_user_batch(SPAN_FIELDS, &permuted).expect("names bind, not indexes");
-        assert_eq!(revalidated.schema(), canonical_span_schema());
-        assert_eq!(revalidated, batch);
     }
 
     /// Reverse a batch's column order without changing any value.

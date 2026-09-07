@@ -4083,7 +4083,10 @@ impl ForgeWorker {
             // A drained attempt must not start plans it has not started yet.
             // Dropping them here is not a lost outcome: an unstarted plan wrote
             // nothing, holds no operation, and is ordinary planning debt the
-            // next attempt replans from the same table.
+            // next attempt replans from the same table. The plans that did run
+            // are kept: their publications are durable and their failures carry
+            // the objects only this attempt can still name, so the drain stops
+            // the loop rather than discarding what it already holds.
             if stop.is_cancelled() {
                 let dropped = queue.cancel_waiting_task(claim.task_id);
                 tracing::debug!(
@@ -4093,7 +4096,10 @@ impl ForgeWorker {
                     running_memory_reservation_bytes = queue.running_memory_reservation_bytes(),
                     "Forge dropped the plans a drained attempt had not started"
                 );
-                return Err(ForgeError::Shutdown);
+                if outcomes.is_empty() {
+                    return Err(ForgeError::Shutdown);
+                }
+                break;
             }
             let outcome = match popped.runner {
                 Some(plan) => {

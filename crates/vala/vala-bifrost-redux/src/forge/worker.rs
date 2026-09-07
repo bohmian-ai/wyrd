@@ -3356,7 +3356,7 @@ impl ForgeWorker {
         let committed_recovery = if base_matches {
             None
         } else {
-            self.find_retained_task_evidence(binding, &table, claim.task_id)
+            self.find_retained_task_evidence(binding, &table, "forge.task_id", claim.task_id)
                 .await?
         };
         let maintenance_recovery = matches!(
@@ -4379,6 +4379,41 @@ impl ForgeWorker {
                     (super::publication::RewriteAcceptance::Ambiguous, error)
                 }
             };
+            // The delay comes before the revalidation, not after it: a plan
+            // that reloaded metadata and then slept would resubmit against a
+            // picture of the table that is already as old as the backoff.
+            // Ambiguity never reaches here, because no delay makes an unknown
+            // commit safe to repeat.
+            if matches!(
+                acceptance,
+                super::publication::RewriteAcceptance::DefiniteConflict
+            ) {
+                tracing::debug!(
+                    task_id = %context.claim.task_id,
+                    error = %conflict,
+                    retries_spent,
+                    "re-deriving one Forge rewrite after a definite catalog conflict"
+                );
+                // Every way that wait can fail is definite non-acceptance, so
+                // each closes the operation here.
+                if let Err(stopped) = super::publication::RewriteConflictSchedule::wait(
+                    retries_spent,
+                    context.deadline,
+                    self.forge.core.clock.now()?,
+                    stop,
+                )
+                .await
+                {
+                    let reason = match stopped {
+                        super::publication::RewriteRetryStop::Cancelled => ForgeError::Shutdown,
+                        super::publication::RewriteRetryStop::Exhausted
+                        | super::publication::RewriteRetryStop::DeadlineTruncated => conflict,
+                    };
+                    return Err(self
+                        .abandon_unsubmitted_rewrite(context, Some(request), handoff, reason, lease)
+                        .await);
+                }
+            }
             let (action, reloaded_after_conflict) = self
                 .rewrite_follow_up(context, acceptance, request, retries_spent, lease, stop)
                 .await?;
@@ -4402,32 +4437,6 @@ impl ForgeWorker {
                         .await);
                 }
                 super::publication::RewriteConflictAction::RevalidateAndRecommit => {}
-            }
-            tracing::debug!(
-                task_id = %context.claim.task_id,
-                error = %conflict,
-                retries_spent,
-                "re-deriving one Forge rewrite after a definite catalog conflict"
-            );
-            // The schedule owes a delay before the resubmission, and the one
-            // absolute deadline still bounds it. Every way that wait can fail
-            // is definite non-acceptance, so each closes the operation here.
-            if let Err(stopped) = super::publication::RewriteConflictSchedule::wait(
-                retries_spent,
-                context.deadline,
-                self.forge.core.clock.now()?,
-                stop,
-            )
-            .await
-            {
-                let reason = match stopped {
-                    super::publication::RewriteRetryStop::Cancelled => ForgeError::Shutdown,
-                    super::publication::RewriteRetryStop::Exhausted
-                    | super::publication::RewriteRetryStop::DeadlineTruncated => conflict,
-                };
-                return Err(self
-                    .abandon_unsubmitted_rewrite(context, Some(request), handoff, reason, lease)
-                    .await);
             }
             retries_spent = retries_spent.saturating_add(1);
             current = reloaded_after_conflict.ok_or_else(|| ForgeError::Invariant {
@@ -4639,7 +4648,12 @@ impl ForgeWorker {
                     .await
                     .map_err(ForgeError::Catalog)?;
                 if self
-                    .find_retained_task_evidence(context.binding, &refreshed, context.claim.task_id)
+                    .find_retained_task_evidence(
+                        context.binding,
+                        &refreshed,
+                        "forge.operation_id",
+                        context.identity.operation_id,
+                    )
                     .await?
                     .is_some()
                 {
@@ -4847,7 +4861,12 @@ impl ForgeWorker {
             // is never reset and never re-appended: the operation stays open
             // and a successor settles it from that same evidence.
             if self
-                .find_retained_task_evidence(binding, &reloaded_after_conflict, claim.task_id)
+                .find_retained_task_evidence(
+                    binding,
+                    &reloaded_after_conflict,
+                    "forge.operation_id",
+                    operation_id,
+                )
                 .await?
                 .is_some()
             {
@@ -5719,12 +5738,19 @@ impl Forge {
 }
 
 impl ForgeWorker {
-    /// Locates the earliest retained metadata object whose current snapshot was
-    /// committed by one exact Forge task.
+    /// Locates the earliest retained metadata object whose current snapshot
+    /// carries `identity` under the snapshot property `key`.
+    ///
+    /// The key is a parameter because the two questions this answers are not
+    /// the same question. Task recovery asks whether *this task* left an
+    /// effect, and has no operation to name yet. A publication asks whether
+    /// *this exact operation* landed, and must not be answered by a sibling
+    /// plan of the same task that published its own snapshot — which is
+    /// precisely what per-plan publication makes possible.
     ///
     /// The metadata log is searched oldest-to-newest before the current
     /// location so a later property-only catalog commit cannot replace the
-    /// task's original raw-byte evidence. Search is bounded by the configured
+    /// original raw-byte evidence. Search is bounded by the configured
     /// retained-snapshot ceiling and every candidate is table-path validated.
     ///
     /// # Errors
@@ -5736,7 +5762,8 @@ impl ForgeWorker {
         &self,
         binding: &TenantTableBinding,
         table: &Table,
-        task_id: Uuid,
+        key: &str,
+        identity: Uuid,
     ) -> Result<Option<ForgeTaskEvidence>, ForgeError> {
         let mut locations = table
             .metadata()
@@ -5792,12 +5819,7 @@ impl ForgeWorker {
             let Some(snapshot) = metadata.current_snapshot() else {
                 continue;
             };
-            if snapshot
-                .summary()
-                .additional_properties
-                .get("forge.task_id")
-                != Some(&task_id.to_string())
-            {
+            if snapshot.summary().additional_properties.get(key) != Some(&identity.to_string()) {
                 continue;
             }
             if table

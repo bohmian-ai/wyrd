@@ -2223,7 +2223,7 @@ mod tests {
 
         let stop = CancellationToken::new();
         let now = chrono::Utc::now();
-        let generous = RewritePublicationDeadline::new(now, Duration::from_secs(600))
+        let generous = RewritePublicationDeadline::new(now, Duration::from_secs(599))
             .expect("a representable deadline");
 
         // Each wait consumes exactly its scheduled delay.
@@ -2246,7 +2246,7 @@ mod tests {
 
         // A deadline that cannot cover the delay plus an answer truncates
         // before sleeping rather than shortening the wait.
-        let tight = RewritePublicationDeadline::new(now, Duration::from_millis(1_000))
+        let tight = RewritePublicationDeadline::new(now, Duration::from_secs(1))
             .expect("a representable deadline");
         let before = tokio::time::Instant::now();
         assert_eq!(

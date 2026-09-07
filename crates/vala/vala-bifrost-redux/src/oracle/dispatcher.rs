@@ -1706,7 +1706,12 @@ mod resource_tests {
                 scratch_limit_bytes: None,
                 effective_cpu: None,
                 oracle_query_slot_limit: None,
-                forge_compaction_memory_limit_bytes: None,
+                // The unclamped production default cannot sit beside the
+                // Oracle floor; this topology names one rewrite working set,
+                // exactly as its co-located deployment configures one.
+                forge_compaction_memory_limit_bytes: Some(
+                    crate::resources::FORGE_TEST_BUDGET_BYTES,
+                ),
                 scratch_root: PathBuf::new(),
                 volume_roots: None,
             },

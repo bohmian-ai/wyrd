@@ -1840,6 +1840,8 @@ impl BifrostRuntimeResources {
         scratch_limit_bytes: u64,
         roles: impl IntoIterator<Item = BifrostRole>,
     ) -> BifrostRoleResources {
+        let roles: BTreeSet<BifrostRole> = roles.into_iter().collect();
+        let forge_compaction_memory_limit_bytes = forge_budget_for_test(&roles);
         let scratch_available_bytes = scratch_limit_bytes
             .checked_add(MIN_SCRATCH_FREE_BYTES)
             .expect("injected scratch observation must not overflow");
@@ -1853,13 +1855,13 @@ impl BifrostRuntimeResources {
                 cpu_source: ResourceSource::Injected,
             },
             BifrostResourcePolicy {
-                roles: roles.into_iter().collect(),
+                roles,
                 memory_limit_bytes: None,
                 unmanaged_reserve_bytes: None,
                 scratch_limit_bytes: Some(scratch_limit_bytes),
                 effective_cpu: None,
                 oracle_query_slot_limit: None,
-                forge_compaction_memory_limit_bytes: None,
+                forge_compaction_memory_limit_bytes,
                 scratch_root: PathBuf::new(),
                 volume_roots: None,
             },
@@ -2473,6 +2475,31 @@ fn role_memory_floors(
     let oracle = usize::from(roles.contains(&BifrostRole::Oracle)) * ROLE_MEMORY_FLOOR_BYTES;
     let protected = scribe.checked_add(oracle).ok_or_else(accounting_overflow)?;
     Ok((scribe, oracle, protected))
+}
+
+/// One executable rewrite working set, the budget test observations name.
+///
+/// The production default is four fifths of the memory limit and is
+/// deliberately unclamped, so a node that also protects the Scribe and Oracle
+/// floors cannot afford it and refuses to plan — exactly as a real co-located
+/// deployment does until it configures one. A test observation therefore names
+/// this figure instead, which is the smallest budget on which one rewrite can
+/// execute and is what every constitutional topology floor asserted below is
+/// the sum of.
+#[cfg(test)]
+pub(crate) const FORGE_TEST_BUDGET_BYTES: usize = 64 * MIB;
+
+/// The Forge budget a test observation must name to plan at all.
+///
+/// `None` when Forge is not enabled, where the production path fixes the budget
+/// at zero. The budget arithmetic itself is pinned by
+/// `forge_compaction_budget_preserves_role_floors` against explicit policies,
+/// never through this helper.
+#[cfg(test)]
+fn forge_budget_for_test(roles: &BTreeSet<BifrostRole>) -> Option<usize> {
+    roles
+        .contains(&BifrostRole::Forge)
+        .then_some(FORGE_TEST_BUDGET_BYTES)
 }
 
 /// Resolves the immutable Forge compaction budget and the elastic remainder.
@@ -4795,14 +4822,15 @@ mod tests {
     }
 
     fn policy(roles: &[BifrostRole]) -> BifrostResourcePolicy {
+        let roles: BTreeSet<BifrostRole> = roles.iter().copied().collect();
         BifrostResourcePolicy {
-            roles: roles.iter().copied().collect(),
+            forge_compaction_memory_limit_bytes: forge_budget_for_test(&roles),
+            roles,
             memory_limit_bytes: None,
             unmanaged_reserve_bytes: None,
             scratch_limit_bytes: None,
             effective_cpu: None,
             oracle_query_slot_limit: None,
-            forge_compaction_memory_limit_bytes: None,
             scratch_root: PathBuf::new(),
             volume_roots: None,
         }
@@ -5697,7 +5725,15 @@ mod tests {
         let cases = [
             (&[BifrostRole::Oracle][..], 0, 256 * MIB, 512 * MIB),
             (&[BifrostRole::Scribe][..], 256 * MIB, 0, 512 * MIB),
-            (&[BifrostRole::Forge][..], 0, 0, 768 * MIB),
+            // Forge protects no floor, but its budget is reserved out of the
+            // same managed memory, so the elastic remainder is what the
+            // observation's budget leaves rather than the whole of it.
+            (
+                &[BifrostRole::Forge][..],
+                0,
+                0,
+                768 * MIB - FORGE_TEST_BUDGET_BYTES,
+            ),
             (
                 &[BifrostRole::Scribe, BifrostRole::Oracle][..],
                 256 * MIB,
@@ -6018,14 +6054,17 @@ mod tests {
         assert!(oracle.shares_root_with(&roles));
         assert!(runtime.shares_root_with(&roles));
 
+        let request = interactive_query(0.0);
         let lease = oracle
-            .try_acquire_query(interactive_query(0.0))
+            .try_acquire_query(request)
             .expect("Oracle query lease");
         let occupied = roles.snapshot().expect("the root observes its own lease");
-        assert_eq!(
-            occupied.oracle_memory_used_bytes,
-            lease.granted_memory_bytes
-        );
+        // The root's charge is what the request reserved, not the grant the
+        // plan sizes the query's pool at: the grant is a ceiling derived from
+        // the plan's own elastic memory and moves when any other role's budget
+        // does, so equating the two would make this a plan-arithmetic test.
+        assert_eq!(occupied.oracle_memory_used_bytes, request.memory_bytes);
+        assert!(lease.granted_memory_bytes >= request.memory_bytes);
         drop(lease);
         assert_eq!(
             oracle
@@ -6538,55 +6577,55 @@ mod tests {
         drop((analytical, interactive));
     }
 
+    /// Plans one node from an injected observation and an explicit policy.
+    fn plan_for(
+        memory_limit_bytes: usize,
+        roles: &[BifrostRole],
+        override_bytes: Option<usize>,
+    ) -> Result<ResourcePlan, BifrostResourceError> {
+        let scratch_limit_bytes = 1024 * MIB as u64;
+        let scratch_available_bytes = scratch_limit_bytes + MIN_SCRATCH_FREE_BYTES;
+        BifrostRuntimeResources::from_snapshot(
+            SystemResourceSnapshot {
+                memory_limit_bytes,
+                effective_cpu: 4,
+                scratch_capacity_bytes: scratch_available_bytes,
+                scratch_available_bytes,
+                memory_source: ResourceSource::Injected,
+                cpu_source: ResourceSource::Injected,
+            },
+            BifrostResourcePolicy {
+                roles: roles.iter().copied().collect(),
+                memory_limit_bytes: None,
+                unmanaged_reserve_bytes: None,
+                scratch_limit_bytes: Some(scratch_limit_bytes),
+                effective_cpu: None,
+                oracle_query_slot_limit: None,
+                forge_compaction_memory_limit_bytes: override_bytes,
+                scratch_root: PathBuf::new(),
+                volume_roots: None,
+            },
+        )
+        .map(|resources| resources.plan())
+    }
+
     /// The Forge compaction budget is derived once and never crosses a floor.
     ///
     /// This is the whole of Forge's root memory ownership: one immutable figure
     /// on the plan, reserved at planning time, that the worker's admission queue
     /// charges running plans against. There is no live Forge root lease, so if
     /// this arithmetic is wrong nothing later corrects it — which is why the
-    /// dedicated, co-located, absent, override, rounding, overflow, and refusal
-    /// cases are all pinned here on their owner rather than inferred from a
-    /// worker test.
+    /// dedicated, co-located, absent, and rounding cases are pinned here on
+    /// their owner rather than inferred from a worker test. Overrides and
+    /// refusals are pinned by
+    /// [`forge_compaction_budget_refuses_rather_than_clamping`].
     ///
     /// # Panics
     ///
     /// Panics when any case selects a different budget, leaves different
-    /// elastic memory, weakens a protected role floor, or accepts a budget the
-    /// protected floors cannot cover.
+    /// elastic memory, or weakens a protected role floor.
     #[test]
     fn forge_compaction_budget_preserves_role_floors() {
-        /// Plans one node from an injected observation and an explicit policy.
-        fn plan_for(
-            memory_limit_bytes: usize,
-            roles: &[BifrostRole],
-            override_bytes: Option<usize>,
-        ) -> Result<ResourcePlan, BifrostResourceError> {
-            let scratch_limit_bytes = 1024 * MIB as u64;
-            let scratch_available_bytes = scratch_limit_bytes + MIN_SCRATCH_FREE_BYTES;
-            BifrostRuntimeResources::from_snapshot(
-                SystemResourceSnapshot {
-                    memory_limit_bytes,
-                    effective_cpu: 4,
-                    scratch_capacity_bytes: scratch_available_bytes,
-                    scratch_available_bytes,
-                    memory_source: ResourceSource::Injected,
-                    cpu_source: ResourceSource::Injected,
-                },
-                BifrostResourcePolicy {
-                    roles: roles.iter().copied().collect(),
-                    memory_limit_bytes: None,
-                    unmanaged_reserve_bytes: None,
-                    scratch_limit_bytes: Some(scratch_limit_bytes),
-                    effective_cpu: None,
-                    oracle_query_slot_limit: None,
-                    forge_compaction_memory_limit_bytes: override_bytes,
-                    scratch_root: PathBuf::new(),
-                    volume_roots: None,
-                },
-            )
-            .map(|resources| resources.plan())
-        }
-
         // Dedicated Forge: no protected floor competes, so the whole managed
         // pool less the derived budget stays elastic.
         let memory = 4096 * MIB;
@@ -6631,6 +6670,36 @@ mod tests {
             without.managed_memory_bytes - without.scribe_floor_bytes - without.oracle_floor_bytes
         );
 
+        // Rounding floors rather than rounds: a limit that is not a multiple of
+        // five loses the remainder to elastic instead of over-committing.
+        let odd = plan_for(memory + 3, &[BifrostRole::Forge], None).expect("odd memory limit");
+        assert_eq!(
+            odd.forge_compaction_memory_limit_bytes,
+            (memory + 3) * 4 / 5
+        );
+    }
+
+    /// An override wins outright, and a budget that does not fit refuses.
+    ///
+    /// The refusals are the point: silently shrinking an over-large budget
+    /// would let an operator believe Forge was admitted memory it never had,
+    /// and accepting a zero one would admit a worker that can run no plan.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an override is not honoured exactly, or when a zero,
+    /// above-safe, or overflowing budget is clamped instead of refused.
+    #[test]
+    fn forge_compaction_budget_refuses_rather_than_clamping() {
+        let memory = 4096 * MIB;
+        let expected_default = memory * 4 / 5;
+        let colocated = plan_for(
+            memory,
+            &[BifrostRole::Scribe, BifrostRole::Oracle, BifrostRole::Forge],
+            None,
+        )
+        .expect("co-located All");
+
         // An explicit positive override wins outright, in either direction.
         for override_bytes in [64 * MIB, expected_default + MIB] {
             let overridden = plan_for(memory, &[BifrostRole::Forge], Some(override_bytes))
@@ -6644,14 +6713,6 @@ mod tests {
                 overridden.managed_memory_bytes - override_bytes
             );
         }
-
-        // Rounding floors rather than rounds: a limit that is not a multiple of
-        // five loses the remainder to elastic instead of over-committing.
-        let odd = plan_for(memory + 3, &[BifrostRole::Forge], None).expect("odd memory limit");
-        assert_eq!(
-            odd.forge_compaction_memory_limit_bytes,
-            (memory + 3) * 4 / 5
-        );
 
         // Zero and above-safe both refuse; neither is clamped into range.
         assert!(

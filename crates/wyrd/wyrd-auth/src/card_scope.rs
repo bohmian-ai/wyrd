@@ -31,7 +31,21 @@ pub const MINT_KIND_JWT_BEARER: &str = "jwt_bearer";
 /// Resolve the observation-target scope for a card-bound principal.
 ///
 /// The walk is tenant-scoped, fail-closed, cycle-guarded, and capped. Only
-/// observation-target kinds are included and expanded.
+/// observation-target kinds are included and expanded. Every resolved member
+/// carries its registry `card_uid`, because ingest stamps `card_uid` from the
+/// signed claim alone.
+///
+/// # Errors
+///
+/// Returns [`WyrdError::CardScopeTooLarge`] when the walk exceeds its depth or
+/// member cap, and the mapped registry error when a referenced Card cannot be
+/// read in the caller's tenant.
+///
+/// # Panics
+///
+/// Panics only if the walk terminates with no resolved member, which cannot
+/// happen: the frontier is seeded with the root, and a root that fails to
+/// resolve returns an error before the split.
 pub async fn resolve_card_ref_scope(
     conn: &mut TenantConn<'_>,
     root: &CardRef,

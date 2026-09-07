@@ -903,17 +903,24 @@ fn user_columns(rows: &RecordBatch, server_owned: &[&str]) -> Vec<ArrayRef> {
     columns
 }
 
-/// Resolves row card references against the authenticated principal.
+/// Resolves row card references against the principal's signed Card scope.
 ///
-/// A null row reference resolves to no UID and needs no principal card, so an
-/// entirely uncorrelated batch resolves without consulting the principal.
+/// A null row reference resolves to no UID and needs no signed scope, so an
+/// entirely uncorrelated batch resolves without consulting the principal. A
+/// present reference is matched by exact identity — kind, space, name, and
+/// version — against the authenticated principal's verified signed
+/// [`CardRefScope`](wyrd_spec::reference::CardRefScope), and only the UID the
+/// mint signed onto that same member is stamped. Root and secondary members
+/// each stamp their own UID; the principal's root is never substituted for
+/// another identity, and a client-supplied UID is never trusted. Resolution is
+/// decided entirely from signed claims, so it performs no registry IO.
 ///
 /// # Errors
 ///
 /// Returns [`ScribeError::CardUnresolved`] when the card column has the wrong
-/// type, or when a row supplies a present reference that is malformed, differs
-/// from the bound card, or the principal does not provide the required card
-/// identity.
+/// type, or when a row supplies a present reference and the principal carries
+/// no signed scope, the reference is malformed, its identity lies outside the
+/// signed scope, or the matching signed member carries no UID.
 fn resolve_card_uids(
     rows: &RecordBatch,
     principal: &Principal,
@@ -933,18 +940,26 @@ fn resolve_card_uids(
             if cards.is_null(row) {
                 None
             } else {
-                let bound = principal.card_ref().ok_or(ScribeError::CardUnresolved)?;
+                let scope = principal
+                    .card_ref_scope()
+                    .ok_or(ScribeError::CardUnresolved)?;
                 let raw = cards.value(row);
                 let card = CardRef::from_str(raw).map_err(|_| ScribeError::CardUnresolved)?;
-                if !bound.same_identity(&card) {
+                if !scope.authorizes(&card) {
                     return Err(ScribeError::CardUnresolved);
                 }
-                bound
-                    .uid
-                    .as_ref()
-                    .map(ToString::to_string)
-                    .map(Some)
-                    .ok_or(ScribeError::CardUnresolved)?
+                let member = scope
+                    .as_slice()
+                    .iter()
+                    .find(|member| member.same_identity(&card))
+                    .ok_or(ScribeError::CardUnresolved)?;
+                Some(
+                    member
+                        .uid
+                        .as_ref()
+                        .ok_or(ScribeError::CardUnresolved)?
+                        .to_string(),
+                )
             }
         });
     }
@@ -1967,8 +1982,8 @@ mod tests {
     use wyrd_spec::reference::{CardRef, CardRefScope};
     use wyrd_spec::request_id::RequestId;
     use wyrd_spec::vala::managed_columns::{
-        CARD_REF, DATA_TENANT_ID, PRINCIPAL_ID, WYRD_BATCH_ID, WYRD_EVENT_TIME, WYRD_INGESTED_AT,
-        WYRD_REQUEST_ID, WYRD_ROW_ORDINAL,
+        CARD_REF, CARD_UID, DATA_TENANT_ID, PRINCIPAL_ID, WYRD_BATCH_ID, WYRD_EVENT_TIME,
+        WYRD_INGESTED_AT, WYRD_REQUEST_ID, WYRD_ROW_ORDINAL,
     };
 
     use bytes::Bytes;
@@ -3602,5 +3617,168 @@ mod tests {
                 .iter()
                 .any(|forbidden| key.contains(forbidden))
         }));
+    }
+
+    /// Resolve one card text into a reference carrying a freshly minted UID.
+    ///
+    /// Scope members are signed with their registry UID at mint time, so a test
+    /// scope must model the same shape: identity plus a trusted UID.
+    fn resolved_card(text: &str) -> CardRef {
+        let card = CardRef::from_str(text).expect("scope member parses");
+        CardRef {
+            uid: Some(CardUid::new(Uuid::now_v7().to_string()).expect("card uid")),
+            ..card
+        }
+    }
+
+    /// Build a service principal whose signed scope is exactly `scope`.
+    fn scoped_principal(root: &CardRef, scope: CardRefScope) -> Principal {
+        Principal::new(
+            PrincipalId::new(Uuid::now_v7()),
+            PrincipalKind::Service {
+                card_ref: root.clone(),
+                card_ref_scope: scope,
+            },
+            crate::test_support::tenant(),
+            Vec::new(),
+            PermissionSet::new(),
+        )
+    }
+
+    /// Stamp one single-row batch carrying the supplied optional `card_ref`.
+    ///
+    /// `None` omits the column entirely so the absent-correlation path is
+    /// reachable through the same helper as the explicit-null path.
+    fn stamp_card_ref(
+        principal: &Principal,
+        card_ref: Option<Option<&str>>,
+    ) -> Result<RecordBatch, ScribeError> {
+        let mut fields = vec![Field::new("value", DataType::Int64, false)];
+        let mut columns: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![1_i64]))];
+        if let Some(value) = card_ref {
+            fields.push(Field::new(CARD_REF, DataType::Utf8, true));
+            columns.push(Arc::new(StringArray::from(vec![value])));
+        }
+        stamp_correlation_columns(
+            &batch(fields, columns),
+            principal,
+            &RequestId::now_v7(),
+            Uuid::now_v7(),
+            EventTimeWindow::default(),
+            None,
+        )
+    }
+
+    /// Read the single stamped `card_uid` value of a one-row batch.
+    fn stamped_card_uid(stamped: &RecordBatch) -> Option<String> {
+        let index = stamped
+            .schema()
+            .index_of(CARD_UID)
+            .expect("card_uid column");
+        let uids = stamped
+            .column(index)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("card_uid is Utf8");
+        (!uids.is_null(0)).then(|| uids.value(0).to_owned())
+    }
+
+    /// Optional and scoped Card correlation stamps only signed, trusted UIDs.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an absent or null correlation does not stamp a null
+    /// `card_uid`, when a scoped member does not stamp its own signed UID, when
+    /// a client-supplied UID displaces the signed one, when the principal's
+    /// root is substituted for an unrelated Card, or when a UID-less,
+    /// malformed, or out-of-scope assertion is admitted.
+    #[test]
+    fn optional_and_scoped_card_correlations_stamp_trusted_uids() {
+        let root = resolved_card("prod/Service/checkout@1.0.0");
+        let secondary = resolved_card("prod/Agent/planner@2.0.0");
+        let principal = scoped_principal(
+            &root,
+            CardRefScope::from_root_and_members(&root, [secondary.clone()]),
+        );
+
+        for (label, supplied) in [("absent", None), ("explicit null", Some(None))] {
+            let stamped = stamp_card_ref(&principal, supplied)
+                .unwrap_or_else(|_| panic!("{label} correlation is admitted"));
+            assert_eq!(
+                stamped_card_uid(&stamped),
+                None,
+                "{label} correlation stamps no card_uid"
+            );
+            let principal_index = stamped
+                .schema()
+                .index_of(PRINCIPAL_ID)
+                .expect("principal_id column");
+            let principals = stamped
+                .column(principal_index)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("principal_id is Utf8");
+            assert_eq!(
+                principals.value(0),
+                principal.id.to_string(),
+                "{label} correlation still stamps the exact principal"
+            );
+        }
+
+        for member in [&root, &secondary] {
+            let identity = CardRef {
+                uid: None,
+                ..member.clone()
+            };
+            let stamped = stamp_card_ref(&principal, Some(Some(&identity.to_string())))
+                .expect("a signed scope member is admitted");
+            assert_eq!(
+                stamped_card_uid(&stamped).as_deref(),
+                member.uid.as_ref().map(CardUid::as_str),
+                "{identity} stamps its own signed UID, never the root's"
+            );
+        }
+
+        let forged = CardRef {
+            uid: Some(CardUid::new(Uuid::now_v7().to_string()).expect("forged uid")),
+            ..secondary.clone()
+        };
+        let stamped = stamp_card_ref(&principal, Some(Some(&forged.to_string())))
+            .expect("a client UID does not change the signed identity");
+        assert_eq!(
+            stamped_card_uid(&stamped).as_deref(),
+            secondary.uid.as_ref().map(CardUid::as_str),
+            "the signed UID wins over the client-supplied one"
+        );
+
+        let unsigned = CardRef::from_str("prod/Service/unsigned@1.0.0").expect("card");
+        let unsigned_principal = scoped_principal(
+            &root,
+            CardRefScope::from_root_and_members(&root, [unsigned.clone()]),
+        );
+        for (label, principal, supplied) in [
+            (
+                "a UID-less signed membership",
+                &unsigned_principal,
+                unsigned.to_string(),
+            ),
+            (
+                "malformed correlation text",
+                &principal,
+                "not-a-card-ref".to_owned(),
+            ),
+            (
+                "an out-of-scope identity",
+                &principal,
+                "prod/Service/other@1.0.0".to_owned(),
+            ),
+        ] {
+            let error =
+                stamp_card_ref(principal, Some(Some(&supplied))).expect_err("{label} fails closed");
+            assert!(
+                matches!(error, ScribeError::CardUnresolved),
+                "{label} fails closed without registry IO"
+            );
+        }
     }
 }

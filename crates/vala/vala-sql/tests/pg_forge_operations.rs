@@ -1507,7 +1507,7 @@ mod pg_tests {
                 .execute(superuser)
                 .await
                 .expect("seed lease");
-            sqlx::query("INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,namespace_name,table_name,strategy,lane,base_snapshot_id,plan,plan_hash,estimated_files,estimated_bytes,estimated_parallelism,estimated_memory_bytes,estimated_spill_bytes,large_task_ceiling_bytes,state,attempt_id,claimed_by,claim_expires_at,watermark_snapshot_id,watermark_timestamp_ms,ready_at) VALUES ($1,$2,$3,$4,$5,'snapshot_expiry','ordinary',77,'{}'::jsonb,decode(repeat('00',32),'hex'),1,1,1,1,1,1,'running',$6,$7,now()+interval '10 minutes',77,1,now())")
+            sqlx::query("INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,namespace_name,table_name,strategy,base_snapshot_id,plan,plan_hash,estimated_files,estimated_bytes,state,attempt_id,claimed_by,claim_expires_at,watermark_snapshot_id,watermark_timestamp_ms,ready_at) VALUES ($1,$2,$3,$4,$5,'snapshot_expiry',77,'{}'::jsonb,decode(repeat('00',32),'hex'),1,1,'running',$6,$7,now()+interval '10 minutes',77,1,now())")
                 .bind(authority.task_id)
                 .bind(tenant.as_uuid())
                 .bind(&table.catalog_name)
@@ -1891,7 +1891,7 @@ mod pg_tests {
                 .execute(&superuser)
                 .await
                 .expect("seed settle lease");
-            sqlx::query("INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,namespace_name,table_name,strategy,lane,base_snapshot_id,plan,plan_hash,estimated_files,estimated_bytes,estimated_parallelism,estimated_memory_bytes,estimated_spill_bytes,large_task_ceiling_bytes,state,attempt_id,claimed_by,claim_expires_at,watermark_snapshot_id,watermark_timestamp_ms,ready_at) VALUES ($1,$2,$3,$4,$5,'snapshot_expiry','ordinary',78,'{}'::jsonb,decode(repeat('11',32),'hex'),1,1,1,1,1,1,'running',$6,$7,now()+interval '10 minutes',78,1,now())")
+            sqlx::query("INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,namespace_name,table_name,strategy,base_snapshot_id,plan,plan_hash,estimated_files,estimated_bytes,state,attempt_id,claimed_by,claim_expires_at,watermark_snapshot_id,watermark_timestamp_ms,ready_at) VALUES ($1,$2,$3,$4,$5,'snapshot_expiry',78,'{}'::jsonb,decode(repeat('11',32),'hex'),1,1,'running',$6,$7,now()+interval '10 minutes',78,1,now())")
                 .bind(settle_authority.task_id)
                 .bind(tenant.as_uuid())
                 .bind(&table.catalog_name)
@@ -2016,7 +2016,7 @@ mod pg_tests {
                 .execute(&superuser)
                 .await
                 .expect("seed decoy maintenance authority");
-            sqlx::query("INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,namespace_name,table_name,strategy,lane,base_snapshot_id,plan,plan_hash,estimated_files,estimated_bytes,estimated_parallelism,estimated_memory_bytes,estimated_spill_bytes,large_task_ceiling_bytes,state,ready_at) VALUES ($1,$2,'wyrd-redux','vala.bifrost','other','snapshot_expiry','ordinary',79,'{}'::jsonb,decode(repeat('22',32),'hex'),1,1,1,1,1,1,'ready',now())")
+            sqlx::query("INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,namespace_name,table_name,strategy,base_snapshot_id,plan,plan_hash,estimated_files,estimated_bytes,state,ready_at) VALUES ($1,$2,'wyrd-redux','vala.bifrost','other','snapshot_expiry',79,'{}'::jsonb,decode(repeat('22',32),'hex'),1,1,'ready',now())")
                 .bind(stranger)
                 .bind(tenant.as_uuid())
                 .execute(&superuser)

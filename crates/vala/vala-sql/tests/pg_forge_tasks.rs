@@ -316,7 +316,7 @@ mod pg_tests {
         assert_eq!(advanced.0, Some(tenant.as_uuid()));
     }
 
-    /// Superseded cancellation is terminal, audited, lane-releasing, and repairable.
+    /// Superseded cancellation is terminal, audited, and repairable.
     ///
     /// # Panics
     /// Panics when rollback, exact cancellation, demand repair, or reclaim
@@ -749,76 +749,6 @@ mod pg_tests {
         .await
         .expect("deferred state");
         assert_eq!(deferred, "ready");
-    }
-
-    /// Proves that an owner holding an active large task still makes ordinary
-    /// progress, that a same-owner second large claim is refused (D78), and that
-    /// the database rejects a multi-file singleton-large row.
-    ///
-    /// # Panics
-    /// Panics when ordinary progress stalls, the per-owner large bound leaks, or
-    /// the durable single-file check weakens.
-    #[tokio::test]
-    async fn active_large_allows_ordinary_progress_refuses_second_large_and_rejects_multi_file() {
-        let (fixture, admin) = setup().await;
-        let op = fixture.operator_pool();
-        let tasks = ForgeTasks::new(op.clone());
-        let tenant = fixture.data_tenant_id();
-        let owner = Uuid::now_v7();
-        let mut large = task(tenant, "large", 71);
-        large.ready_at = Utc::now() - Duration::seconds(1);
-        let large_id = tasks.enqueue(&large).await.expect("large task");
-        let ordinary_id = tasks
-            .enqueue(&task(tenant, "ordinary", 72))
-            .await
-            .expect("ordinary task");
-        tasks
-            .acquire_scheduler(owner, 30)
-            .await
-            .expect("scheduler")
-            .expect("fence");
-        assert_eq!(
-            tasks
-                .claim_fair(owner, limits(4), None)
-                .await
-                .expect("large claim")
-                .expect("large task")
-                .task_id,
-            large_id
-        );
-        assert_eq!(
-            tasks
-                .claim_fair(owner, limits(4), None)
-                .await
-                .expect("ordinary claim")
-                .expect("ordinary remains eligible")
-                .task_id,
-            ordinary_id
-        );
-        // A second large task on a distinct table is refused for the same owner
-        // while its first large task is active, even though ordinary work flows.
-        tasks
-            .enqueue(&task(tenant, "large-second", 73))
-            .await
-            .expect("second large task");
-        assert!(
-            tasks
-                .claim_fair(owner, limits(4), None)
-                .await
-                .expect("second large claim")
-                .is_none(),
-            "same owner cannot hold two active large tasks"
-        );
-        let invalid = sqlx::query(
-            "UPDATE vala.forge_tasks SET lane='large_singleton',estimated_files=2 WHERE task_id=$1",
-        )
-        .bind(ordinary_id)
-        .execute(&admin)
-        .await;
-        assert!(
-            invalid.is_err(),
-            "PostgreSQL must enforce singleton file count"
-        );
     }
 
     /// Proves malformed returned rows roll back the claim and cursor writes.
@@ -1558,7 +1488,7 @@ mod pg_tests {
             .execute(&admin)
             .await
             .expect("remove uniqueness only to arrange overflow corruption");
-        sqlx::query("INSERT INTO vala.forge_tasks SELECT $2,data_tenant_id,catalog_name,namespace_name,table_name,strategy,lane,base_snapshot_id+100,plan,$3,estimated_files,estimated_bytes,estimated_parallelism,estimated_memory_bytes,estimated_spill_bytes,large_task_ceiling_bytes,'running',$4,claimed_by,claim_expires_at,2,20,evidence,ready_at,created_at,updated_at FROM vala.forge_tasks WHERE task_id=$1")
+        sqlx::query("INSERT INTO vala.forge_tasks SELECT $2,data_tenant_id,catalog_name,namespace_name,table_name,strategy,base_snapshot_id+100,plan,$3,estimated_files,estimated_bytes,'running',$4,claimed_by,claim_expires_at,2,20,evidence,ready_at,created_at,updated_at FROM vala.forge_tasks WHERE task_id=$1")
             .bind(first.task_id).bind(Uuid::now_v7()).bind([10_u8;32].as_slice()).bind(Uuid::now_v7()).execute(&admin).await.expect("arrange second active watermark");
         let mut overflow_conn = TenantConn::acquire(fixture.app_pool(), tenant)
             .await
@@ -2500,12 +2430,12 @@ mod pg_tests {
     /// exactly `scribe_promotion` and nothing else, so the same test proves the
     /// canonical constraint accepts the new value and that a forward-
     /// incompatible or corrupted tag is retained verbatim as
-    /// [`ForgeClaimStrategy::Unknown`]. Promotion is ordinary-lane publication
+    /// [`ForgeClaimStrategy::Unknown`]. Promotion is ordinary publication
     /// work, so it is deliberately excluded from the maintenance-reserved slot.
     ///
     /// # Panics
     /// Panics when PostgreSQL setup, enqueue, claim, or the exact strategy,
-    /// lane, and parameter assertions fail.
+    /// and parameter assertions fail.
     #[tokio::test]
     async fn scribe_promotion_task_round_trips_and_unknown_strategy_quarantines() {
         let (fixture, admin) = setup().await;
@@ -2732,7 +2662,7 @@ mod pg_tests {
         evidence: &ForgeTaskEvidence,
     ) -> Uuid {
         let task_id = Uuid::now_v7();
-        sqlx::query("INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,namespace_name,table_name,strategy,lane,base_snapshot_id,plan,plan_hash,estimated_files,estimated_bytes,estimated_parallelism,estimated_memory_bytes,estimated_spill_bytes,large_task_ceiling_bytes,state,evidence,ready_at,updated_at) VALUES ($1,$2,$3,$4,$5,'snapshot_expiry','ordinary',41,'{\"version\":1,\"inputs\":[\"m.avro\"],\"parameters\":{}}'::jsonb,decode(repeat('11',32),'hex'),1,1,1,1,1,1,'succeeded',$6::jsonb,now()-interval '2 days',now()-interval '2 days')")
+        sqlx::query("INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,namespace_name,table_name,strategy,base_snapshot_id,plan,plan_hash,estimated_files,estimated_bytes,state,evidence,ready_at,updated_at) VALUES ($1,$2,$3,$4,$5,'snapshot_expiry',41,'{\"version\":1,\"inputs\":[\"m.avro\"],\"parameters\":{}}'::jsonb,decode(repeat('11',32),'hex'),1,1,'succeeded',$6::jsonb,now()-interval '2 days',now()-interval '2 days')")
             .bind(task_id)
             .bind(tenant.as_uuid())
             .bind(&table.catalog_name)
@@ -3879,9 +3809,7 @@ mod pg_tests {
     /// Expired cleanup is only reachable through a validated expiration
     /// handoff, and both cleanup strategies reach the recovery states under
     /// test through a release rather than an enqueue, so the row is written
-    /// directly. The envelope columns reproduce the version-two shape the
-    /// enqueue path persists, which is what keeps the row claimable under the
-    /// same resource predicate ordinary work is claimed by.
+    /// directly.
     ///
     /// # Panics
     /// Panics when the insert fails.
@@ -3901,15 +3829,10 @@ mod pg_tests {
         let task_id = Uuid::now_v7();
         sqlx::query(
             "INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,namespace_name,\
-             table_name,strategy,lane,base_snapshot_id,plan,plan_hash,estimated_files,\
-             estimated_bytes,estimated_parallelism,estimated_memory_bytes,estimated_spill_bytes,\
-             large_task_ceiling_bytes,envelope_version,decoded_batch_bytes,decoded_input_bytes,\
-             sort_working_bytes,sort_merge_reservation_bytes,encoder_buffer_bytes,\
-             upload_chunk_bytes,footer_encoded_bytes,footer_decode_workspace_bytes,\
-             sort_spill_bytes,state,evidence,ready_at,next_eligible_at,updated_at) \
-             VALUES ($1,$2,'wyrd-redux','vala.bifrost',$3,$4,'ordinary',4242,$5::jsonb,\
-             decode(repeat('22',32),'hex'),1,100,1,41943040,50,67108864,2,10,10,30,10,40,20,\
-             8388608,33554432,50,$6,$7::jsonb,\
+             table_name,strategy,base_snapshot_id,plan,plan_hash,estimated_files,\
+             estimated_bytes,state,evidence,ready_at,next_eligible_at,updated_at) \
+             VALUES ($1,$2,'wyrd-redux','vala.bifrost',$3,$4,4242,$5::jsonb,\
+             decode(repeat('22',32),'hex'),1,100,$6,$7::jsonb,\
              statement_timestamp()+($8*interval '1 hour'),\
              statement_timestamp()+($8*interval '1 hour'),statement_timestamp())",
         )

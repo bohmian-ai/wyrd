@@ -2139,7 +2139,6 @@ async fn run_worker_over_invalid_prepared_evidence(
         uuid::Uuid::from(server.data_tenant_id()),
         table,
         "small_files",
-        true,
         LIVE_REWRITE_PLAN,
     )
     .await;
@@ -2283,7 +2282,6 @@ async fn cancellation_release_failure_closes_readiness() {
         uuid::Uuid::from(server.data_tenant_id()),
         "cancelled_release",
         "small_files",
-        true,
         LIVE_REWRITE_PLAN,
     )
     .await;
@@ -2350,12 +2348,11 @@ async fn cancellation_release_failure_closes_readiness() {
 
 /// Seeds one claimable Forge task row directly.
 ///
-/// Both durable non-success outcomes under test are reachable only from a row
-/// the planner would not produce today — a pre-envelope legacy row and a row
-/// whose plan parameters do not match its strategy — so the row is written
-/// directly rather than through an enqueue that would reject it. `envelope`
-/// controls whether the version-two resource columns are present, and
-/// `parameters` is the exact plan parameter object: the worker's pre-effect gate
+/// The durable non-success outcome under test is reachable only from a row the
+/// planner would not produce today — a row whose plan parameters do not match
+/// its strategy — so the row is written directly rather than through an enqueue
+/// that would reject it. `parameters` is the exact plan parameter object: the
+/// worker's pre-effect gate
 /// refuses a claim whose parameters do not match its strategy contract before it
 /// acquires any table fence, so a case that needs the fenced path must supply the
 /// contract-valid object rather than an empty one.
@@ -2369,34 +2366,15 @@ async fn seed_ready_forge_task(
     tenant: uuid::Uuid,
     table_name: &str,
     strategy: &str,
-    envelope: bool,
     parameters: &str,
 ) -> uuid::Uuid {
     let task_id = uuid::Uuid::now_v7();
-    let statement = if envelope {
-        "INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,namespace_name,\
-         table_name,strategy,lane,base_snapshot_id,plan,plan_hash,estimated_files,\
-         estimated_bytes,estimated_parallelism,estimated_memory_bytes,estimated_spill_bytes,\
-         large_task_ceiling_bytes,envelope_version,decoded_batch_bytes,decoded_input_bytes,\
-         sort_working_bytes,sort_merge_reservation_bytes,encoder_buffer_bytes,\
-         upload_chunk_bytes,footer_encoded_bytes,footer_decode_workspace_bytes,\
-         sort_spill_bytes,state,ready_at,next_eligible_at,updated_at) \
-         VALUES ($1,$2,'wyrd-redux','vala.bifrost',$3,$4,'ordinary',4242,\
-         $5::jsonb,\
-         decode(repeat('33',32),'hex'),1,100,1,41943040,50,67108864,2,10,10,30,10,40,20,\
-         8388608,33554432,50,'ready',statement_timestamp()-interval '1 hour',\
-         statement_timestamp()-interval '1 hour',statement_timestamp())"
-    } else {
-        "INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,namespace_name,\
-         table_name,strategy,lane,base_snapshot_id,plan,plan_hash,estimated_files,\
-         estimated_bytes,estimated_parallelism,estimated_memory_bytes,estimated_spill_bytes,\
-         large_task_ceiling_bytes,state,ready_at,next_eligible_at,updated_at) \
-         VALUES ($1,$2,'wyrd-redux','vala.bifrost',$3,$4,'ordinary',4242,\
-         $5::jsonb,\
-         decode(repeat('33',32),'hex'),1,100,1,41943040,50,67108864,\
-         'ready',statement_timestamp()-interval '1 hour',\
-         statement_timestamp()-interval '1 hour',statement_timestamp())"
-    };
+    let statement = "INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,\
+         namespace_name,table_name,strategy,base_snapshot_id,plan,plan_hash,estimated_files,\
+         estimated_bytes,state,ready_at,next_eligible_at,updated_at) \
+         VALUES ($1,$2,'wyrd-redux','vala.bifrost',$3,$4,4242,$5::jsonb,\
+         decode(repeat('33',32),'hex'),1,100,'ready',statement_timestamp()-interval '1 hour',\
+         statement_timestamp()-interval '1 hour',statement_timestamp())";
     sqlx::query(statement)
         .bind(task_id)
         .bind(tenant)
@@ -2457,23 +2435,19 @@ async fn await_settled_task_state(
 /// A claim that settles durably without producing an effect keeps the worker
 /// ready and reports no completion.
 ///
-/// Both a pre-envelope legacy row and a row whose payload does not match its
-/// strategy are healthy worker outcomes: the worker terminalized durable state
-/// and produced nothing. Readiness answers whether this replica can take the
-/// next claim, so neither outcome may clear it.
+/// A row whose payload does not match its strategy is a healthy worker outcome:
+/// the worker terminalized durable state and produced nothing. Readiness answers
+/// whether this replica can take the next claim, so that outcome may not clear it.
 ///
 /// # Panics
 ///
-/// Panics when either row is reported as a completion or clears readiness.
+/// Panics when the row is reported as a completion or clears readiness.
 #[cfg(feature = "test-support")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn durably_settled_claims_keep_readiness() {
-    for (table_name, strategy, envelope, expected) in [
-        ("legacy_supersession", "small_files", false, "cancelled"),
-        // Expired cleanup's exact work is its parameters, so a copied input set
-        // is exactly what its payload contract forbids.
-        ("malformed_payload", "expired_cleanup", true, "failed"),
-    ] {
+    // Expired cleanup's exact work is its parameters, so a copied input set is
+    // exactly what its payload contract forbids.
+    for (table_name, strategy, expected) in [("malformed_payload", "expired_cleanup", "failed")] {
         let (server, observer) = server_with_forge_observer().await;
         let readiness = server
             .state()
@@ -2490,7 +2464,6 @@ async fn durably_settled_claims_keep_readiness() {
             uuid::Uuid::from(server.data_tenant_id()),
             table_name,
             strategy,
-            envelope,
             MALFORMED_PLAN,
         )
         .await;
@@ -2731,7 +2704,6 @@ async fn transient_execution_failure_retries_and_keeps_readiness() {
         uuid::Uuid::from(server.data_tenant_id()),
         "absent_table",
         "small_files",
-        true,
         LIVE_REWRITE_PLAN,
     )
     .await;
@@ -2818,7 +2790,6 @@ async fn live_foreign_claim_does_not_block_readiness() {
         uuid::Uuid::from(server.data_tenant_id()),
         "foreign_claim",
         "small_files",
-        true,
         MALFORMED_PLAN,
     )
     .await;
@@ -2908,7 +2879,6 @@ async fn release_failure_clears_readiness() {
         uuid::Uuid::from(server.data_tenant_id()),
         "release_only",
         "small_files",
-        true,
         LIVE_REWRITE_PLAN,
     )
     .await;
@@ -2921,7 +2891,6 @@ async fn release_failure_clears_readiness() {
             uuid::Uuid::from(server.data_tenant_id()),
             "parked_release_sibling",
             "small_files",
-            true,
             LIVE_REWRITE_PLAN,
         )
         .await;
@@ -2969,7 +2938,6 @@ async fn release_failure_clears_readiness() {
         uuid::Uuid::from(server.data_tenant_id()),
         "release_sibling",
         "small_files",
-        true,
         LIVE_REWRITE_PLAN,
     )
     .await;

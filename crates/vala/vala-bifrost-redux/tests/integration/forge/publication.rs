@@ -713,9 +713,15 @@ async fn assert_retry_inherits_only_the_remaining_budget() {
          sibling plan got the same two calls out of what the attempt's one \
          shared budget still had left: {phases:?}"
     );
-    assert_eq!(
-        phases.first().map(String::as_str),
-        Some("prepared"),
+    // A submitted call that ran out of budget claims no outcome. The row stays
+    // open until something proves what happened to that exact operation: either
+    // this attempt's own retained reconciliation, which can only reset it once
+    // the uncertainty window shows nothing live, or a successor's takeover.
+    // Neither may report the commit as accepted.
+    assert!(
+        phases
+            .iter()
+            .all(|phase| phase == "prepared" || phase == "reset"),
         "a submitted call that ran out of budget claims no outcome: {phases:?}"
     );
     assert_eq!(

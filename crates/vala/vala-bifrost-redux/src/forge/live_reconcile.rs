@@ -1281,7 +1281,7 @@ mod tests {
             .find("for row in page.operations")
             .expect("operation loop exists");
         let classify_position = source[loop_position..]
-            .find("self.classify_live_operation")
+            .find(".classify_live_operation")
             .expect("classification follows observations");
         let loop_body = &source[loop_position..loop_position + classify_position];
         assert_eq!(loop_body.matches("observe_retained_manifests").count(), 2);

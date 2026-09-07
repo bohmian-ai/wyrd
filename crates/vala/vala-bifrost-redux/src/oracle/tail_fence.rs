@@ -924,21 +924,10 @@ fn tail_fence_request(
     let arrow_schema =
         iceberg::arrow::schema_to_arrow_schema(cut.iceberg_table.metadata().current_schema())
             .map_err(|_| BifrostError::QueryVisibilityUnavailable)?;
-    let normalized_fields = arrow_schema
-        .fields()
-        .iter()
-        .map(|field| {
-            let data_type = match field.data_type() {
-                DataType::Timestamp(unit, Some(timezone)) if timezone.as_ref() == "+00:00" => {
-                    DataType::Timestamp(*unit, Some("UTC".into()))
-                }
-                data_type => data_type.clone(),
-            };
-            Field::new(field.name(), data_type, field.is_nullable())
-        })
-        .collect::<Vec<_>>();
-    let normalized_schema = Schema::new(normalized_fields);
-    let fingerprint = crate::contracts::projected_source_schema_fingerprint(&normalized_schema);
+    // The fingerprint itself normalizes the renderings an Iceberg round trip
+    // changes (element naming, large variable-width types, the UTC offset), so
+    // the restored schema is compared as-is.
+    let fingerprint = crate::contracts::projected_source_schema_fingerprint(&arrow_schema);
     let fingerprint = wyrd_spec::vala::api::SchemaFingerprint::new(hex::encode(fingerprint.0))
         .map_err(|_| BifrostError::QueryVisibilityUnavailable)?;
     Ok(wyrd_spec::vala::api::AcquireTailFenceRequest {

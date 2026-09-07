@@ -448,66 +448,86 @@ where
     }
 }
 
-/// Builds one `vala.traces.spans` batch carrying `values` as `duration_ms`.
+/// Builds one `vala.traces.spans` batch carrying `values` as `duration_nano`.
 ///
-/// Every other column is a well-formed constant: the cases that send these rows
-/// are about how Scribe schedules, stages and publishes the built-in, so the
-/// payload only has to be a real built-in row that public ingest accepts, with
-/// one column (`duration_ms`) a read-back can compare exactly.
+/// The rows come from the canonical `OTLP` span projection rather than
+/// hand-assembled columns, so this fixture tracks the ledger's field list
+/// automatically and exercises the same nested canonical shape public ingest
+/// receives. The cases that send these rows are about how Scribe schedules,
+/// stages and publishes the built-in, so every other field is a well-formed
+/// constant and only `duration_nano` is compared exactly on read-back.
+///
+/// # Panics
+///
+/// Panics when the canonical projection rejects a fixture span.
 pub(super) fn span_batch(values: &[i64]) -> arrow::record_batch::RecordBatch {
-    use arrow::array::{
-        FixedSizeBinaryBuilder, Int64Array, StringArray, TimestampMicrosecondArray,
+    use wyrd_tonic::otlp::common::v1::{AnyValue, KeyValue, any_value};
+    use wyrd_tonic::otlp::resource::v1::Resource;
+    use wyrd_tonic::otlp::trace::v1::{ResourceSpans, ScopeSpans, Span, Status, status};
+
+    // A real span carries attributes. Empty rows would make these rows far
+    // cheaper than the traffic the pressure cases mean to generate, so the
+    // fixture keeps a realistic per-row payload.
+    let attribute = |key: &str, value: &str| KeyValue {
+        key: key.to_owned(),
+        value: Some(AnyValue {
+            value: Some(any_value::Value::StringValue(value.to_owned())),
+        }),
     };
-    let definition = vala_bifrost_redux::tables::builtin_table("traces", "spans")
-        .expect("traces spans built-in");
-    let schema = std::sync::Arc::new(arrow::datatypes::Schema::new((definition.arrow_fields)()));
-    let rows = values.len();
-    let mut trace_id = FixedSizeBinaryBuilder::with_capacity(rows, 16);
-    let mut span_id = FixedSizeBinaryBuilder::with_capacity(rows, 8);
-    let mut parent_span_id = FixedSizeBinaryBuilder::with_capacity(rows, 8);
-    for value in values {
-        let mut trace = [0_u8; 16];
-        trace[..8].copy_from_slice(&value.to_be_bytes());
-        trace_id.append_value(trace).expect("trace id width");
-        span_id
-            .append_value(value.to_be_bytes())
-            .expect("span id width");
-        parent_span_id.append_null();
-    }
-    let now = chrono::Utc::now().timestamp_micros();
-    let text = |literal: &str| {
-        std::sync::Arc::new(StringArray::from(vec![literal; rows])) as arrow::array::ArrayRef
-    };
-    let zeros =
-        || std::sync::Arc::new(Int64Array::from(vec![0_i64; rows])) as arrow::array::ArrayRef;
-    let stamps = || {
-        std::sync::Arc::new(TimestampMicrosecondArray::from(vec![now; rows]).with_timezone("UTC"))
-            as arrow::array::ArrayRef
-    };
-    arrow::record_batch::RecordBatch::try_new(
-        schema,
-        vec![
-            std::sync::Arc::new(trace_id.finish()),
-            std::sync::Arc::new(span_id.finish()),
-            std::sync::Arc::new(parent_span_id.finish()),
-            zeros(),
-            text("scribe-journey"),
-            text("scribe-journey"),
-            text("SPAN_KIND_INTERNAL"),
-            stamps(),
-            stamps(),
-            std::sync::Arc::new(Int64Array::from(values.to_vec())),
-            text("STATUS_CODE_OK"),
-            text("{}"),
-            zeros(),
-            zeros(),
-            zeros(),
-            text("scribe"),
-            text("1"),
-            text("wyrd-testing"),
-        ],
-    )
-    .expect("span batch")
+
+    let now = u64::try_from(chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)).unwrap_or(0);
+    let spans = values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            // A canonical span refuses an all-zero trace or span id, so the
+            // fixture keys every identifier off a non-zero base.
+            let ordinal = u64::try_from(index).unwrap_or(0).saturating_add(1);
+            let mut trace_id = [0_u8; 16];
+            trace_id[..8].copy_from_slice(&value.to_be_bytes());
+            trace_id[8..].copy_from_slice(&ordinal.to_be_bytes());
+            Span {
+                trace_id: trace_id.to_vec(),
+                span_id: ordinal.to_be_bytes().to_vec(),
+                name: "scribe-journey".to_owned(),
+                kind: 1,
+                start_time_unix_nano: now,
+                end_time_unix_nano: now.saturating_add(u64::try_from(*value).unwrap_or(0)),
+                status: Some(Status {
+                    code: status::StatusCode::Ok.into(),
+                    message: "scribe journey fixture completed".to_owned(),
+                }),
+                attributes: (0..8)
+                    .map(|slot| {
+                        attribute(
+                            &format!("wyrd.journey.attribute.{slot}"),
+                            &format!("scribe-journey-value-{value}-{slot}"),
+                        )
+                    })
+                    .collect(),
+                ..Span::default()
+            }
+        })
+        .collect();
+    let (batch, outcome) =
+        vala_bifrost_redux::tables::traces::project_resource_spans(&[ResourceSpans {
+            resource: Some(Resource {
+                attributes: vec![attribute("service.name", "scribe-journey")],
+                ..Resource::default()
+            }),
+            scope_spans: vec![ScopeSpans {
+                spans,
+                ..ScopeSpans::default()
+            }],
+            schema_url: "https://wyrd.test/schemas/scribe-journey".to_owned(),
+        }])
+        .expect("span batch");
+    assert_eq!(
+        outcome.rejected_spans, 0,
+        "the journey fixture must project losslessly: {:?}",
+        outcome.rejection_message
+    );
+    batch
 }
 
 /// Returns the hour-partition boundary one event time belongs to.

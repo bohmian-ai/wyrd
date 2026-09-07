@@ -19,8 +19,10 @@ use bytes::Bytes;
 
 /// Maximum native record-batch descriptors retained by one plan.
 pub(crate) const MAX_SOURCE_PLANS: usize = 64;
-/// Maximum top-level fields in the canonical native schema.
+/// Maximum flattened field nodes in the canonical native schema.
 pub(crate) const MAX_NATIVE_FIELDS: usize = 256;
+/// Maximum accepted nesting depth of one canonical native field.
+const MAX_NATIVE_DEPTH: usize = 8;
 /// Metadata-only facts for one current source.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct SourceMaterialPlan {
@@ -276,6 +278,10 @@ enum NativeFieldLayout {
     Fixed(usize),
     /// Variable values use validity, offset, and value buffers.
     Variable(usize),
+    /// Struct values contribute only a validity buffer; children follow.
+    Struct,
+    /// List values use validity and offset buffers; the item node follows.
+    List(usize),
 }
 
 /// Owns the bounded state accumulated while scanning one native Arrow stream.
@@ -298,6 +304,10 @@ struct NativeScan {
     field_layouts: [NativeFieldLayout; MAX_NATIVE_FIELDS],
     /// Nullability for each schema field.
     field_nullable: [bool; MAX_NATIVE_FIELDS],
+    /// Whether each flattened node is a top-level batch column.
+    field_top_level: [bool; MAX_NATIVE_FIELDS],
+    /// Top-level column count declared by the stream schema.
+    top_level_fields: usize,
     /// Number of admitted record-batch sources.
     source_count: usize,
     /// Aggregate admitted rows.
@@ -325,6 +335,8 @@ impl NativeScan {
             fields: 0,
             field_layouts: [NativeFieldLayout::Null; MAX_NATIVE_FIELDS],
             field_nullable: [false; MAX_NATIVE_FIELDS],
+            field_top_level: [false; MAX_NATIVE_FIELDS],
+            top_level_fields: 0,
             source_count: 0,
             rows: 0,
             max_metadata_bytes: 0,
@@ -430,13 +442,12 @@ impl NativeScan {
             return Err(ScribeError::InvalidFrame);
         }
         let schema_fields = schema.fields().ok_or(ScribeError::InvalidFrame)?;
-        self.fields = schema_fields.len();
-        if self.fields == 0 || self.fields > self.limits.native_fields {
+        self.top_level_fields = schema_fields.len();
+        if self.top_level_fields == 0 || self.top_level_fields > self.limits.native_fields {
             return Err(ScribeError::InvalidFrame);
         }
-        for (index, field) in schema_fields.into_iter().enumerate() {
-            self.field_layouts[index] = native_field_layout(field)?;
-            self.field_nullable[index] = field.nullable();
+        for field in schema_fields {
+            self.push_field(field, 0)?;
             self.schema_material_bytes = self
                 .schema_material_bytes
                 .checked_add(size_of::<arrow::datatypes::Field>())
@@ -457,10 +468,53 @@ impl NativeScan {
                     limit: self.limits.max_frame_bytes,
                 })?;
         }
+        if self.fields > self.limits.native_fields {
+            return Err(ScribeError::InvalidFrame);
+        }
         self.schema_seen = true;
         self.schema_start = frame_start;
         self.schema_end = self.cursor;
         self.max_metadata_bytes = self.max_metadata_bytes.max(self.cursor - frame_start);
+        Ok(())
+    }
+
+    /// Appends one field and every descendant to the flattened node plan.
+    ///
+    /// Arrow lays out field nodes and buffers depth-first, so the preflight
+    /// records the same order. The canonical signal ledgers nest at most one
+    /// `List<Struct<scalar>>`, and every node beyond a top-level field carries
+    /// its own row count rather than the batch length.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError::InvalidFrame`] for an unsupported field layout,
+    /// nesting beyond [`MAX_NATIVE_DEPTH`], or more nodes than the configured
+    /// native field budget admits.
+    fn push_field(
+        &mut self,
+        field: arrow::ipc::Field<'_>,
+        depth: usize,
+    ) -> Result<(), ScribeError> {
+        if depth > MAX_NATIVE_DEPTH || self.fields == MAX_NATIVE_FIELDS {
+            return Err(ScribeError::InvalidFrame);
+        }
+        let layout = native_field_layout(field)?;
+        self.field_layouts[self.fields] = layout;
+        self.field_nullable[self.fields] = field.nullable();
+        self.field_top_level[self.fields] = depth == 0;
+        self.fields += 1;
+        if matches!(
+            layout,
+            NativeFieldLayout::Struct | NativeFieldLayout::List(_)
+        ) {
+            let children = field.children().ok_or(ScribeError::InvalidFrame)?;
+            if children.is_empty() {
+                return Err(ScribeError::InvalidFrame);
+            }
+            for child in children {
+                self.push_field(child, depth + 1)?;
+            }
+        }
         Ok(())
     }
 
@@ -503,7 +557,8 @@ impl NativeScan {
         let nodes = batch.nodes().ok_or(ScribeError::InvalidFrame)?;
         if nodes.len() != self.fields
             || nodes.into_iter().enumerate().any(|(index, node)| {
-                node.length() != batch.length()
+                (self.field_top_level[index] && node.length() != batch.length())
+                    || node.length() < 0
                     || node.null_count() < 0
                     || node.null_count() > node.length()
                     || (!self.field_nullable[index] && node.null_count() != 0)
@@ -823,13 +878,13 @@ fn align_eight(value: usize) -> Result<usize, ScribeError> {
 /// Returns [`ScribeError::InvalidFrame`] for dictionary, extension, nested,
 /// view, union, map, list, run-end, unknown, or unsupported field types.
 fn native_field_layout(field: arrow::ipc::Field<'_>) -> Result<NativeFieldLayout, ScribeError> {
-    if field.dictionary().is_some()
-        || field
+    if field.dictionary().is_some() {
+        return Err(ScribeError::InvalidFrame);
+    }
+    if !matches!(field.type_type(), Type::List | Type::Struct_)
+        && field
             .children()
             .is_some_and(|children| !children.is_empty())
-        || field
-            .custom_metadata()
-            .is_some_and(|metadata| !metadata.is_empty())
     {
         return Err(ScribeError::InvalidFrame);
     }
@@ -889,6 +944,8 @@ fn native_field_layout(field: arrow::ipc::Field<'_>) -> Result<NativeFieldLayout
             }
         }
         Type::Timestamp | Type::Duration => Ok(NativeFieldLayout::Fixed(8)),
+        Type::List => Ok(NativeFieldLayout::List(4)),
+        Type::Struct_ => Ok(NativeFieldLayout::Struct),
         Type::Interval => match field.type_as_interval().map(|value| value.unit()) {
             Some(IntervalUnit::YEAR_MONTH) => Ok(NativeFieldLayout::Fixed(4)),
             Some(IntervalUnit::DAY_TIME) => Ok(NativeFieldLayout::Fixed(8)),
@@ -940,7 +997,10 @@ fn validate_buffer_layouts<'a>(
     let expected_buffers = layouts.iter().try_fold(0_usize, |total, layout| {
         total.checked_add(match layout {
             NativeFieldLayout::Null => 0,
-            NativeFieldLayout::Boolean | NativeFieldLayout::Fixed(_) => 2,
+            NativeFieldLayout::Struct => 1,
+            NativeFieldLayout::Boolean
+            | NativeFieldLayout::Fixed(_)
+            | NativeFieldLayout::List(_) => 2,
             NativeFieldLayout::Variable(_) => 3,
         })
     });
@@ -948,8 +1008,17 @@ fn validate_buffer_layouts<'a>(
         return Err(ScribeError::InvalidFrame);
     }
     let mut buffers = buffers;
-    for (layout, node) in layouts.iter().copied().zip(nodes) {
+    let node_list: Vec<&arrow::ipc::FieldNode> = nodes.collect();
+    for (index, layout) in layouts.iter().copied().enumerate() {
+        let node = node_list[index];
         let rows = usize::try_from(node.length()).map_err(|_| ScribeError::InvalidFrame)?;
+        // A list's item node is the next entry in the depth-first walk, so its
+        // length is the exact terminal offset the list's offsets must reach.
+        let item_rows = node_list
+            .get(index + 1)
+            .map(|item| usize::try_from(item.length()).map_err(|_| ScribeError::InvalidFrame))
+            .transpose()?
+            .unwrap_or(0);
         if layout == NativeFieldLayout::Null {
             continue;
         }
@@ -967,39 +1036,122 @@ fn validate_buffer_layouts<'a>(
         } else {
             validate_validity(body, validity, rows, node.null_count())?;
         }
-        let values = buffers.next().ok_or(ScribeError::InvalidFrame)?;
-        let values_length =
-            usize::try_from(values.length()).map_err(|_| ScribeError::InvalidFrame)?;
-        match layout {
-            NativeFieldLayout::Null => return Err(ScribeError::InvalidFrame),
-            NativeFieldLayout::Boolean => {
-                let expected = rows.checked_add(7).ok_or(ScribeError::InvalidFrame)? / 8;
-                if values_length != expected {
-                    return Err(ScribeError::InvalidFrame);
-                }
-            }
-            NativeFieldLayout::Fixed(width) => {
-                if values_length != rows.checked_mul(width).ok_or(ScribeError::InvalidFrame)? {
-                    return Err(ScribeError::InvalidFrame);
-                }
-            }
-            NativeFieldLayout::Variable(offset_width) => {
-                let expected = rows
-                    .checked_add(1)
-                    .and_then(|value| value.checked_mul(offset_width))
-                    .ok_or(ScribeError::InvalidFrame)?;
-                if values_length != expected {
-                    return Err(ScribeError::InvalidFrame);
-                }
-                let data = buffers.next().ok_or(ScribeError::InvalidFrame)?;
-                validate_offsets(body, values, data, rows, offset_width)?;
-            }
+        if layout == NativeFieldLayout::Struct {
+            continue;
         }
+        let values = buffers.next().ok_or(ScribeError::InvalidFrame)?;
+        let data = matches!(layout, NativeFieldLayout::Variable(_))
+            .then(|| buffers.next().ok_or(ScribeError::InvalidFrame))
+            .transpose()?;
+        validate_values_layout(layout, body, values, data, rows, item_rows)?;
     }
     if buffers.next().is_some() {
         return Err(ScribeError::InvalidFrame);
     }
     Ok(buffer_bytes)
+}
+
+/// Validates one node's value buffers against its layout.
+///
+/// The validity buffer is already consumed by the caller. `data` is present
+/// only for a variable-width scalar, whose values follow its offsets, and
+/// `item_rows` is the following node's length, which a list's offsets must
+/// terminate at.
+///
+/// # Errors
+///
+/// Returns [`ScribeError::InvalidFrame`] for a values length that contradicts
+/// the layout, a missing variable-width data buffer, or an invalid offset
+/// sequence.
+fn validate_values_layout(
+    layout: NativeFieldLayout,
+    body: &[u8],
+    values: &arrow::ipc::Buffer,
+    data: Option<&arrow::ipc::Buffer>,
+    rows: usize,
+    item_rows: usize,
+) -> Result<(), ScribeError> {
+    let values_length = usize::try_from(values.length()).map_err(|_| ScribeError::InvalidFrame)?;
+    match layout {
+        NativeFieldLayout::Null | NativeFieldLayout::Struct => Err(ScribeError::InvalidFrame),
+        NativeFieldLayout::Boolean => {
+            let expected = rows.checked_add(7).ok_or(ScribeError::InvalidFrame)? / 8;
+            if values_length == expected {
+                Ok(())
+            } else {
+                Err(ScribeError::InvalidFrame)
+            }
+        }
+        NativeFieldLayout::Fixed(width) => {
+            if values_length == rows.checked_mul(width).ok_or(ScribeError::InvalidFrame)? {
+                Ok(())
+            } else {
+                Err(ScribeError::InvalidFrame)
+            }
+        }
+        NativeFieldLayout::List(offset_width) => {
+            if values_length != offsets_length(rows, offset_width)? {
+                return Err(ScribeError::InvalidFrame);
+            }
+            validate_list_offsets(body, values, rows, offset_width, item_rows)
+        }
+        NativeFieldLayout::Variable(offset_width) => {
+            if values_length != offsets_length(rows, offset_width)? {
+                return Err(ScribeError::InvalidFrame);
+            }
+            let data = data.ok_or(ScribeError::InvalidFrame)?;
+            validate_offsets(body, values, data, rows, offset_width)
+        }
+    }
+}
+
+/// Returns the exact offset-buffer length for `rows` at `width` bytes each.
+///
+/// # Errors
+///
+/// Returns [`ScribeError::InvalidFrame`] on checked arithmetic overflow.
+fn offsets_length(rows: usize, width: usize) -> Result<usize, ScribeError> {
+    rows.checked_add(1)
+        .and_then(|count| count.checked_mul(width))
+        .ok_or(ScribeError::InvalidFrame)
+}
+
+/// Validates one list offset buffer against its declared item cardinality.
+///
+/// # Errors
+///
+/// Returns [`ScribeError::InvalidFrame`] for a nonzero first offset, negative
+/// or descending offsets, an unsupported width, or a terminal offset that does
+/// not equal the item node's length.
+fn validate_list_offsets(
+    body: &[u8],
+    offsets: &arrow::ipc::Buffer,
+    rows: usize,
+    width: usize,
+    item_rows: usize,
+) -> Result<(), ScribeError> {
+    let offset_start = usize::try_from(offsets.offset()).map_err(|_| ScribeError::InvalidFrame)?;
+    let mut prior = 0_usize;
+    for index in 0..=rows {
+        let start = index
+            .checked_mul(width)
+            .and_then(|value| offset_start.checked_add(value))
+            .ok_or(ScribeError::InvalidFrame)?;
+        let end = start.checked_add(width).ok_or(ScribeError::InvalidFrame)?;
+        let encoded = body.get(start..end).ok_or(ScribeError::InvalidFrame)?;
+        let value = usize::try_from(i32::from_le_bytes(
+            encoded.try_into().map_err(|_| ScribeError::InvalidFrame)?,
+        ))
+        .map_err(|_| ScribeError::InvalidFrame)?;
+        if (index == 0 && value != 0) || value < prior || value > item_rows {
+            return Err(ScribeError::InvalidFrame);
+        }
+        prior = value;
+    }
+    if prior != item_rows {
+        return Err(ScribeError::InvalidFrame);
+    }
+    Ok(())
 }
 
 /// Confirms the validity bitmap agrees with the record-batch null count.

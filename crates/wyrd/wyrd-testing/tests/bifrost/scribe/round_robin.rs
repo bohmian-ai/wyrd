@@ -287,7 +287,7 @@ async fn scribe_system_and_dynamic_tables_are_round_robin_equal() {
     );
     let mut system_read = read_sql(
         &client,
-        &format!("SELECT duration_ms AS value FROM {SYSTEM_TABLE}"),
+        &format!("SELECT duration_nano AS value FROM {SYSTEM_TABLE}"),
     )
     .await;
     system_read.sort_unstable();

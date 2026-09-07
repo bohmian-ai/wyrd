@@ -640,42 +640,14 @@ fn count_u32(value: usize) -> Result<u32, TableError> {
         .map_err(|_| TableError::Internal("canonical schema count exceeds u32".to_owned()))
 }
 
-fn fingerprint_fields(fields: &[Field]) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    for field in fields {
-        hasher.update(field.name().as_bytes());
-        hasher.update(b"\0");
-        hasher.update(format!("{:?}", strip_metadata(field.data_type())).as_bytes());
-        hasher.update(b"\0");
-    }
-    hasher.finalize().into()
-}
-
-/// Return one Arrow type with every nested field's metadata removed.
+/// Fingerprint one built-in's declared fields for catalog registration.
 ///
-/// A nested type's `Debug` rendering includes its children's metadata map,
-/// whose iteration order is not stable across `HashMap` instances. Stripping it
-/// keeps the catalog fingerprint a function of names and types alone, which is
-/// what it has always claimed to be; the stable ids and sensitivity markers the
-/// metadata carries are committed by
-/// [`CanonicalPhysicalFingerprint`] instead.
-fn strip_metadata(data_type: &DataType) -> DataType {
-    match data_type {
-        DataType::List(child) => DataType::List(std::sync::Arc::new(bare_field(child))),
-        DataType::Struct(children) => {
-            DataType::Struct(children.iter().map(|child| bare_field(child)).collect())
-        }
-        other => other.clone(),
-    }
-}
-
-/// Return one field with no metadata and a metadata-free nested type.
-fn bare_field(field: &Field) -> Field {
-    Field::new(
-        field.name(),
-        strip_metadata(field.data_type()),
-        field.is_nullable(),
-    )
+/// Delegates to [`crate::schema::fingerprint::SchemaFingerprint`] so a
+/// registered table and an ingested batch of the same shape always agree.
+fn fingerprint_fields(fields: &[Field]) -> [u8; 32] {
+    let owned: Vec<std::sync::Arc<Field>> =
+        fields.iter().cloned().map(std::sync::Arc::new).collect();
+    crate::schema::fingerprint::SchemaFingerprint::from_fields(owned.iter()).0
 }
 
 const fn definition<T: DomainTable>() -> BuiltinTableDefinition {

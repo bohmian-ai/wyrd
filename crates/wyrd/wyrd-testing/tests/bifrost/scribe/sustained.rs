@@ -71,18 +71,18 @@ impl Participant {
     ///
     /// The read is deliberately narrow and filtered: it requests one column of
     /// a wide built-in and constrains a second one the result never carries.
-    /// That is the signed projection closure `[duration_ms, status,
+    /// That is the signed projection closure `[duration_nano, status_code,
     /// data_tenant_id]` exercised end to end through whichever authority
     /// currently owns the rows — active buckets, staged members, or published
-    /// hot objects. Every fixture row carries `STATUS_CODE_OK`, so the
-    /// predicate cannot change which rows come back; a row lost here is a
-    /// projection or predicate defect, not a fixture one.
+    /// hot objects. Every fixture row carries the canonical `Ok` status code,
+    /// so the predicate cannot change which rows come back; a row lost here is
+    /// a projection or predicate defect, not a fixture one.
     async fn read_system(&self) -> Vec<i64> {
         let mut values = read_sql(
             &self.client,
             &format!(
-                "SELECT duration_ms AS value FROM {SYSTEM_TABLE} \
-                 WHERE status = 'STATUS_CODE_OK'"
+                "SELECT duration_nano AS value FROM {SYSTEM_TABLE} \
+                 WHERE status_code = 1"
             ),
         )
         .await;

@@ -98,16 +98,58 @@ async fn read_decision_detail(
     Ok(serde_json::from_str(&detail)?)
 }
 
-/// Counts audit rows written under one operation name.
+/// Bounded budget for the read-audit relay to drain before a durable count.
+const AUDIT_RELAY_CONVERGENCE_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Waits until the Oracle read-audit WAL residual reaches zero.
+///
+/// A query's read decision is durable at its local WAL fsync and reaches
+/// `vala.audit_outbox` through the production relay, so a count taken the
+/// instant a query settles can precede the relay. This polls the production
+/// residual counter — not a sleep, and not a retry over the assertion itself —
+/// so the asserted row counts observe a fully relayed server.
+///
+/// A server that hosts no Oracle role owns no read-audit WAL, so there is
+/// nothing to converge and the wait returns immediately.
 ///
 /// # Errors
 ///
-/// Returns the tenant-connection or SQL error.
+/// Returns a convergence failure naming the residual and oldest record age
+/// when the relay does not drain within [`AUDIT_RELAY_CONVERGENCE_BUDGET`].
+async fn await_audit_relay_convergence(server: &WyrdTestServer) -> Result<(), ServerJourneyError> {
+    let deadline = std::time::Instant::now() + AUDIT_RELAY_CONVERGENCE_BUDGET;
+    loop {
+        let Ok(inspection) = server.oracle_runtime_inspection() else {
+            return Ok(());
+        };
+        if inspection.audit_wal_records == 0 {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "read-audit relay did not converge: {} WAL records pending (oldest {:?}) after {AUDIT_RELAY_CONVERGENCE_BUDGET:?}",
+                inspection.audit_wal_records, inspection.audit_oldest_age,
+            )
+            .into());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// Counts audit rows written under one operation name.
+///
+/// Waits for read-audit relay convergence first so the count reflects every
+/// accepted read decision rather than the relay's current progress.
+///
+/// # Errors
+///
+/// Returns the relay convergence, tenant-connection, or SQL error.
 async fn audit_rows(
     server: &WyrdTestServer,
     tenant: DataTenantId,
     operation: &str,
 ) -> Result<i64, ServerJourneyError> {
+    await_audit_relay_convergence(server).await?;
     let mut conn = server.tenant_conn_for(tenant).await?;
     let count: i64 =
         sqlx::query_scalar("SELECT count(*) FROM vala.audit_outbox WHERE operation LIKE $1")

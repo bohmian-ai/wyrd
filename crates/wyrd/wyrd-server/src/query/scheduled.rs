@@ -152,6 +152,11 @@ impl ScheduledQueryCaller {
         let mut settled: Option<ScheduledQueryOutcome> = None;
         loop {
             let frame = tokio::select! {
+                // Cancellation and the pinned deadline are settlement claims, not
+                // a race against buffered frames: an already-cancelled token or an
+                // elapsed deadline must settle even when the stream has a frame
+                // ready, so this branch order is biased rather than random.
+                biased;
                 () = cancellation.cancelled() => {
                     return Err(BifrostError::QueryStreamIncomplete.into());
                 }

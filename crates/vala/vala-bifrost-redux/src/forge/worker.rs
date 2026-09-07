@@ -4031,21 +4031,21 @@ impl ForgeWorker {
             self.config.pending_task_parallelism,
             self.config.compaction_memory_budget_bytes,
         );
-        let mut refusals: Vec<(usize, super::managed::queue::ForgePushResult)> = Vec::new();
         let planned = plans.len();
-        for plan in plans {
-            let plan_index = plan.plan_index;
-            let admission = super::managed::queue::ForgePlanAdmission {
-                task_id: claim.task_id,
-                plan_index,
-                required_parallelism: plan.required_parallelism,
-                memory_reservation_bytes: plan.memory_reservation_bytes,
-            };
-            match queue.push(admission, plan) {
-                super::managed::queue::ForgePushResult::Added => {}
-                refusal => refusals.push((plan_index, refusal)),
-            }
-        }
+        let refusals = Self::offer_planned_rewrites(
+            &mut queue,
+            plans.into_iter().map(|plan| {
+                (
+                    super::managed::queue::ForgePlanAdmission {
+                        task_id: claim.task_id,
+                        plan_index: plan.plan_index,
+                        required_parallelism: plan.required_parallelism,
+                        memory_reservation_bytes: plan.memory_reservation_bytes,
+                    },
+                    plan,
+                )
+            }),
+        );
         tracing::debug!(
             task_id = %claim.task_id,
             planned,
@@ -4099,6 +4099,43 @@ impl ForgeWorker {
             outcomes.push((plan_index, outcome));
         }
         Self::reduce_plan_outcomes(refusals, outcomes)
+    }
+
+    /// Offers one attempt's planner-ordered plans to the worker-wide queue.
+    ///
+    /// The pass is ordered because the queue is a FIFO: index `n` must occupy a
+    /// position ahead of index `n + 1`, so offering out of order would let a
+    /// later plan start before an earlier one. A pending-capacity refusal ends
+    /// the pass rather than skipping to the next plan, because the budget the
+    /// refused plan did not fit is worker-wide: continuing would let a smaller
+    /// later sibling take the waiting slot the blocked earlier head needs, and
+    /// that is exactly the head-of-line bypass the queue exists to prevent. The
+    /// unoffered remainder is ordinary planning debt the next attempt replans.
+    ///
+    /// Every other refusal is recorded and the pass continues, because those
+    /// describe the individual plan (an invalid estimate, a duplicate key)
+    /// rather than the worker's remaining room.
+    ///
+    /// Returns each refused plan's index and reason, in offer order.
+    fn offer_planned_rewrites<R>(
+        queue: &mut super::managed::queue::ForgeCompactionQueue<R>,
+        plans: impl IntoIterator<Item = (super::managed::queue::ForgePlanAdmission, R)>,
+    ) -> Vec<(usize, super::managed::queue::ForgePushResult)> {
+        let mut refusals = Vec::new();
+        for (admission, runner) in plans {
+            let plan_index = admission.plan_index;
+            match queue.push(admission, runner) {
+                super::managed::queue::ForgePushResult::Added => {}
+                refusal @ super::managed::queue::ForgePushResult::RejectedCapacity => {
+                    refusals.push((plan_index, refusal));
+                    break;
+                }
+                refusal => {
+                    refusals.push((plan_index, refusal));
+                }
+            }
+        }
+        refusals
     }
 
     /// Settles an attempt whose planning selected nothing as a success.
@@ -6820,6 +6857,53 @@ mod tests {
         assert!(
             matches!(invariant, Err(ForgeError::Invariant { .. })),
             "an invariant refusal below the capacity one is still reported as one"
+        );
+    }
+
+    /// A pending-capacity refusal ends the offer pass instead of skipping ahead.
+    ///
+    /// The waiting budget is worker-wide, so the plan that did not fit it is
+    /// blocking a position, not failing on its own terms. Offering the next
+    /// plan anyway would let a smaller later sibling take the slot the blocked
+    /// head needs and start ahead of it, which is the head-of-line bypass the
+    /// FIFO exists to prevent.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a plan after the refused one is offered, or when the refusal
+    /// is not recorded against exactly the plan that did not fit.
+    #[test]
+    fn pending_capacity_refusal_stops_offer_pass() {
+        use super::super::managed::queue::{
+            ForgeCompactionQueue, ForgePlanAdmission, ForgePushResult,
+        };
+
+        let task_id = Uuid::now_v7();
+        let admission = |plan_index: usize, required_parallelism: u32| ForgePlanAdmission {
+            task_id,
+            plan_index,
+            required_parallelism,
+            memory_reservation_bytes: 1,
+        };
+        let mut queue = ForgeCompactionQueue::new(8, 12, 1 << 20);
+        let refusals = ForgeWorker::offer_planned_rewrites(
+            &mut queue,
+            [
+                (admission(0, 8), ()),
+                (admission(1, 8), ()),
+                (admission(2, 4), ()),
+            ],
+        );
+
+        assert_eq!(
+            refusals,
+            vec![(1, ForgePushResult::RejectedCapacity)],
+            "only the plan that did not fit is refused, and no later plan is offered"
+        );
+        assert_eq!(
+            queue.waiting_parallelism_sum(),
+            8,
+            "the plan behind the refused one never took the blocked head's slot"
         );
     }
 

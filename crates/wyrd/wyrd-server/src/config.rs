@@ -3111,12 +3111,12 @@ maintenance_interval_secs = 45
     }
 
     /// The optional Forge compaction memory budget replaces the deleted
-    /// `forge.worker_concurrency` executor knob completely.
+    /// per-worker executor concurrency knob completely.
     ///
     /// Three facts travel together because they are one operator-visible
     /// change. Local compaction parallelism is now the worker's own queue,
     /// bounded by the node's compaction memory budget, so the budget is what an
-    /// operator sets and `worker_concurrency` no longer exists in any surface:
+    /// operator sets and that knob no longer exists in any surface:
     /// not the struct, not TOML, not the environment. `per_tenant_active_cap`
     /// therefore has nothing to alias and defaults directly to one.
     ///

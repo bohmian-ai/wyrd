@@ -5868,8 +5868,8 @@ redacted
     /// `operation_stop` and the authority-only `authority_stop` tokens, so a
     /// maintenance strategy observing `authority_stop` still aborts on genuine
     /// fence loss even though graceful shutdown never reaches that token. The
-    /// task heartbeat also renews a large-lane reservation when the claim owns
-    /// one, while the cloned table lease retains the same publication fence
+    /// task heartbeat also renews the claim's durable reservation, while the
+    /// cloned table lease retains the same publication fence
     /// token. The renewal loop exits cleanly when `operation_stop` is cancelled
     /// (graceful shutdown or the caller's post-effect drain).
     ///
@@ -6474,7 +6474,7 @@ impl ForgeWorker {
     ///
     /// # Errors
     ///
-    /// Returns tenant transaction, exact lifecycle, audit, lane-release, demand,
+    /// Returns tenant transaction, exact lifecycle, audit, release, demand,
     /// or commit errors. Rollback preserves the original claim for repair.
     async fn cancel_superseded(&self, claim: &ForgeTaskClaim) -> Result<(), ForgeError> {
         let mut conn = self

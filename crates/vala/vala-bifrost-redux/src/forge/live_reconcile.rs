@@ -42,7 +42,7 @@ pub(crate) struct IcebergReconciliationOutcome {
     pub pending: usize,
     /// Operations with canonical but inconclusive evidence.
     pub unresolved: usize,
-    /// Whether the open-operation query found a cap sentinel.
+    /// Whether an open operation was still present after the walk.
     ///
     /// Gated to `test-support`: the only reader is the
     /// `LiveReconciliationTestOutcome` projection, which is itself
@@ -219,45 +219,7 @@ impl Forge {
         let resource = ForgeGroupKey::table_audit_resource(key.tenant, &key.table_ref);
         let operations = ForgeOperations::new(&resource, ForgeOperationFamily::IcebergRewrite)
             .map_err(ForgeError::Sql)?;
-        let mut conn = self
-            .core
-            .vala
-            .tenant_conn(key.tenant)
-            .await
-            .map_err(ForgeError::Sql)?;
-        let page = operations
-            .list_open(
-                &mut conn,
-                self.core.config.max_open_operations_per_table,
-                None,
-            )
-            .await
-            .map_err(ForgeError::Sql)?;
-        conn.commit().await.map_err(ForgeError::Sql)?;
-        if page.overflowed {
-            return Ok(IcebergReconciliationOutcome {
-                recovered: 0,
-                reset: 0,
-                pending: 0,
-                unresolved: 0,
-                #[cfg(feature = "test-support")]
-                overflowed: true,
-                protected_output_paths: BTreeSet::new(),
-                destructive_maintenance: DestructiveMaintenance::Blocked,
-            });
-        }
-        if page.operations.is_empty() {
-            return Ok(IcebergReconciliationOutcome {
-                recovered: 0,
-                reset: 0,
-                pending: 0,
-                unresolved: 0,
-                #[cfg(feature = "test-support")]
-                overflowed: false,
-                protected_output_paths: BTreeSet::new(),
-                destructive_maintenance: DestructiveMaintenance::Allowed,
-            });
-        }
+        let cap = self.core.config.max_open_operations_per_table;
         let mut outcome = IcebergReconciliationOutcome {
             recovered: 0,
             reset: 0,
@@ -268,28 +230,94 @@ impl Forge {
             protected_output_paths: BTreeSet::new(),
             destructive_maintenance: DestructiveMaintenance::Allowed,
         };
-        for row in page.operations {
-            let observation_a = self.observe_retained_manifests(binding, stop).await?;
-            let observation_b = self.observe_retained_manifests(binding, stop).await?;
-            self.classify_live_operation(
-                LiveClassificationContext {
-                    lease,
-                    key,
-                    binding,
-                    stop,
-                    now,
-                    observation_a: &observation_a,
-                    observation_b: &observation_b,
-                },
-                &row,
-                &mut outcome,
-            )
+        // Paged rather than capped: one attempt now opens an operation per
+        // published plan, so a table can legitimately hold more open rows than
+        // one page. A keyset walk advances past every row it has classified —
+        // including the ones it could not resolve — so a table with more open
+        // work than a page still gets every operation looked at exactly once.
+        let mut cursor = None;
+        loop {
+            let page = self
+                .open_rewrite_operations(key, &operations, cap, cursor)
+                .await?;
+            let Some(last) = page.operations.last() else {
+                break;
+            };
+            let next = (last.prepared_at, last.operation_id);
+            for row in page.operations {
+                let observation_a = self.observe_retained_manifests(binding, stop).await?;
+                let observation_b = self.observe_retained_manifests(binding, stop).await?;
+                self.classify_live_operation(
+                    LiveClassificationContext {
+                        lease,
+                        key,
+                        binding,
+                        stop,
+                        now,
+                        observation_a: &observation_a,
+                        observation_b: &observation_b,
+                    },
+                    &row,
+                    &mut outcome,
+                )
+                .await?;
+            }
+            cursor = Some(next);
+            if !page.overflowed {
+                break;
+            }
+        }
+        // One recheck of the first page closes the walk. Every operation this
+        // pass proved is gone from it, so anything the recheck still returns is
+        // either work this pass could not settle or work a concurrent owner
+        // opened underneath it — both of which must block destructive
+        // maintenance rather than be assumed absent.
+        let remaining = self
+            .open_rewrite_operations(key, &operations, cap, None)
             .await?;
+        if !remaining.operations.is_empty() {
+            #[cfg(feature = "test-support")]
+            {
+                outcome.overflowed = true;
+            }
+            outcome.destructive_maintenance = DestructiveMaintenance::Blocked;
         }
         if outcome.pending > 0 || outcome.unresolved > 0 {
             outcome.destructive_maintenance = DestructiveMaintenance::Blocked;
         }
         Ok(outcome)
+    }
+
+    /// Reads one bounded page of this table's open rewrite operations.
+    ///
+    /// Split out because the walk reads the same page twice for different
+    /// reasons — once to classify and once to recheck — and each read owns its
+    /// own short tenant transaction so a long classification never holds one
+    /// open across catalog IO.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Sql`] when the tenant connection, the bounded
+    /// listing, or its commit fails.
+    async fn open_rewrite_operations(
+        &self,
+        key: &ForgeTableKey,
+        operations: &ForgeOperations<'_>,
+        cap: usize,
+        after: Option<(DateTime<Utc>, uuid::Uuid)>,
+    ) -> Result<vala_sql::row_types::forge_operations::OpenForgeOperationPage, ForgeError> {
+        let mut conn = self
+            .core
+            .vala
+            .tenant_conn(key.tenant)
+            .await
+            .map_err(ForgeError::Sql)?;
+        let page = operations
+            .list_open(&mut conn, cap, after)
+            .await
+            .map_err(ForgeError::Sql)?;
+        conn.commit().await.map_err(ForgeError::Sql)?;
+        Ok(page)
     }
 
     /// Reconcile one binding through the production owner for integration tests.

@@ -28,7 +28,7 @@ use wyrd_testing::bifrost::{
     BifrostClusterSpec, CommitUncertaintyCatalog, OracleFollowerPauses, TestOracleResources,
     WyrdTestCluster,
 };
-use wyrd_testing::server::harness_forge_compaction_budget_bytes;
+use wyrd_testing::server::HARNESS_FORGE_COMPACTION_BUDGET_BYTES;
 
 use crate::public_support::{
     JourneyTable, ManagedRow, append_values, canonical_order, read_managed_rows, register_table,
@@ -91,6 +91,7 @@ impl CloseoutJourney {
         // The surviving dedicated worker compacts the journey's production-sized
         // 512 MiB inputs, whose decoded working set the admission estimate puts
         // well past a 3 GiB pod. Size that pod for the plans it must admit.
+        spec.nodes[1].forge_compaction_memory_limit_bytes = Some(16 * 1024 * 1024 * 1024);
         spec.nodes[1].oracle = Some(TestOracleResources {
             spill_root: None,
             system_resources: Some(SystemResourceSnapshot {
@@ -111,7 +112,7 @@ impl CloseoutJourney {
             system_resources: Some(SystemResourceSnapshot {
                 memory_limit_bytes: 3 * 1024 * 1024 * 1024
                     - ROLE_MEMORY_FLOOR_BYTES
-                    - harness_forge_compaction_budget_bytes(3 * 1024 * 1024 * 1024),
+                    - HARNESS_FORGE_COMPACTION_BUDGET_BYTES,
                 effective_cpu: 4,
                 scratch_capacity_bytes: 4 * 1024 * 1024 * 1024,
                 scratch_available_bytes: 4 * 1024 * 1024 * 1024,

@@ -178,6 +178,9 @@ pub struct BifrostNodeSpec {
     pub roles: BTreeSet<BifrostRuntimeRole>,
     /// Optional Oracle-local resource placement.
     pub oracle: Option<TestOracleResources>,
+    /// Forge compaction budget this pod admits plans against, when it is not
+    /// the harness default.
+    pub forge_compaction_memory_limit_bytes: Option<usize>,
     /// Optional accelerated role cadence applied only by test-support builders.
     pub role_timing: Option<RoleTiming>,
 }
@@ -346,6 +349,7 @@ impl BifrostClusterSpec {
             node_id: NodeId::new(uuid::Uuid::from_u128(id)),
             roles: roles.into_iter().collect(),
             oracle: None,
+            forge_compaction_memory_limit_bytes: None,
             role_timing: None,
         }
     }
@@ -2015,6 +2019,9 @@ impl WyrdTestCluster {
             .and_then(|oracle| oracle.system_resources)
         {
             builder = builder.with_system_resources_for_test(snapshot);
+        }
+        if let Some(bytes) = resources.spec.forge_compaction_memory_limit_bytes {
+            builder = builder.with_forge_compaction_memory_limit_for_test(bytes);
         }
         builder = builder.with_forge_process_role_for_test(resources.process_role);
         builder = builder.with_forge_interval(self.forge_interval);

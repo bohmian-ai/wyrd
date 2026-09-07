@@ -816,6 +816,8 @@ struct RecoveryTelemetry {
     task_id: Uuid,
     /// Attempt identity the uncertain publication committed under.
     attempt_id: Uuid,
+    /// Plans the attempt admitted, each of which publishes independently.
+    plan_commits: usize,
     /// Live data files the operation promised to remove.
     input_files: u64,
     /// Managed data files the operation promised to add.
@@ -905,8 +907,9 @@ fn assert_recovery_telemetry(
             .collect::<BTreeSet<_>>()
     );
 
-    // 2. Exactly one catalog commit was made under the published attempt, and
-    //    it reported the non-success the injected seam actually produced.
+    // 2. Each of the attempt's plans submitted exactly one catalog commit —
+    //    per-plan publication, not a retried one — and every one of them
+    //    reported the non-success the injected seam actually produced.
     let commits = journey
         .spans
         .iter()
@@ -917,30 +920,31 @@ fn assert_recovery_telemetry(
         .collect::<Vec<_>>();
     assert_eq!(
         commits.len(),
-        1,
-        "the uncertain attempt submitted exactly one catalog commit: {commits:?}"
+        facts.plan_commits,
+        "the uncertain attempt submitted one catalog commit per admitted plan: {commits:?}"
     );
-    let commit = commits[0];
-    assert_eq!(
-        attribute(commit, "task_id"),
-        Some(facts.task_id.to_string().as_str()),
-        "the commit span names the durable task the landed snapshot named: {commit:?}"
-    );
-    assert_eq!(
-        attribute(commit, "strategy"),
-        Some("iceberg_rewrite"),
-        "the commit span names the managed rewrite strategy: {commit:?}"
-    );
-    assert_eq!(
-        attribute(commit, "role"),
-        Some("forge_worker"),
-        "the commit span names the owning production role: {commit:?}"
-    );
-    assert_eq!(
-        attribute(commit, "result"),
-        Some("failed"),
-        "a submission whose acceptance was never learned reports no success: {commit:?}"
-    );
+    for commit in &commits {
+        assert_eq!(
+            attribute(commit, "task_id"),
+            Some(facts.task_id.to_string().as_str()),
+            "the commit span names the durable task the landed snapshot named: {commit:?}"
+        );
+        assert_eq!(
+            attribute(commit, "strategy"),
+            Some("iceberg_rewrite"),
+            "the commit span names the managed rewrite strategy: {commit:?}"
+        );
+        assert_eq!(
+            attribute(commit, "role"),
+            Some("forge_worker"),
+            "the commit span names the owning production role: {commit:?}"
+        );
+        assert_eq!(
+            attribute(commit, "result"),
+            Some("failed"),
+            "a submission whose acceptance was never learned reports no success: {commit:?}"
+        );
+    }
 
     // 3. The uncertain attempt and its successor both executed the one durable
     //    task, under the strategy the plan selected.
@@ -1332,13 +1336,27 @@ async fn forge_promoted_files_rewrite_and_remain_exact_across_recovery() {
         );
     }
 
+    // Each of the attempt's plans publishes independently, so an attempt the
+    // injected uncertainty stops leaves one operation per plan behind: the one
+    // whose commit reached the catalog without a learnable answer, and the
+    // siblings that never called it. Exactly one of them may name a snapshot.
+    let published_after = rewrite_snapshots(&cluster, &shared.binding).await;
+    let landed_uncertain = unsettled
+        .iter()
+        .copied()
+        .filter(|operation| {
+            published_after.iter().any(|snapshot| {
+                snapshot.summary.get("forge.operation_id") == Some(&operation.to_string())
+            })
+        })
+        .collect::<Vec<_>>();
     assert_eq!(
-        unsettled.len(),
+        landed_uncertain.len(),
         1,
         "an uncertain rewrite claims no outcome: {:?}",
         observer.returned_errors()
     );
-    let uncertain = unsettled[0];
+    let uncertain = landed_uncertain[0];
     assert_eq!(
         rewrite_phases(&cluster, owner)
             .await
@@ -1388,10 +1406,18 @@ async fn forge_promoted_files_rewrite_and_remain_exact_across_recovery() {
         "the uncertain commit landed exactly one rewrite snapshot: {published:?}"
     );
     let landed = landed[0].clone();
-    assert_eq!(
-        landed.summary.get("forge.attempt_id"),
-        Some(&uncertain.to_string()),
-        "the landed snapshot carries the publishing attempt's identity: {landed:?}"
+    // One attempt publishes each of its plans under its own operation identity,
+    // so the attempt that committed is named by the snapshot rather than being
+    // the operation itself. Every later statement about the publishing attempt
+    // is made against the identity the snapshot itself carries.
+    let landed_attempt = landed
+        .summary
+        .get("forge.attempt_id")
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .unwrap_or_else(|| panic!("the landed snapshot names its publishing attempt: {landed:?}"));
+    assert_ne!(
+        landed_attempt, uncertain,
+        "an attempt's plan commits under a per-plan operation, not the attempt's own id"
     );
     assert_eq!(
         landed
@@ -1437,7 +1463,7 @@ async fn forge_promoted_files_rewrite_and_remain_exact_across_recovery() {
         Some(&plan_hash),
         "the landed snapshot carries the durable task's canonical plan hash: {landed:?}"
     );
-    let evidence = attempt_evidence(&observer, landed_task, uncertain, uncertain);
+    let evidence = attempt_evidence(&observer, landed_task, landed_attempt, uncertain);
     assert_eq!(
         landed.summary.get("forge.rewrite.selection_fingerprint"),
         Some(&evidence.selection_fingerprint),
@@ -1726,7 +1752,8 @@ async fn forge_promoted_files_rewrite_and_remain_exact_across_recovery() {
         &recovery_window,
         &RecoveryTelemetry {
             task_id: landed_task,
-            attempt_id: uncertain,
+            attempt_id: landed_attempt,
+            plan_commits: unsettled.len(),
             input_files: landed.removed_data.len() as u64,
             output_files: landed.added_data.len() as u64,
             input_bytes: landed.removed_bytes,

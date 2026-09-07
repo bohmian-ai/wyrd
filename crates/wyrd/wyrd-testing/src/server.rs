@@ -152,21 +152,15 @@ use crate::time::ClockHandle;
 /// Dedicated least-privilege role assigned to the test Oracle Service.
 const ORACLE_PEER_ROLE: &str = "bifrost_oracle_peer";
 
-/// Forge compaction budget every harness node carrying a Forge role names.
+/// Default Forge compaction budget a harness node carrying a Forge role names.
 ///
 /// The production default is four fifths of the memory limit and deliberately
 /// does not clamp, so a co-located harness whose Scribe and Oracle floors are
-/// also protected must name a budget that fits the remainder. Half the limit
-/// is the largest simple fraction that still fits a pod protecting both the
-/// Scribe and Oracle floors, and it keeps a Forge-only pod's budget
-/// proportional to the memory a journey injects for it. The helper is public
-/// because a test that pins two Oracle replicas to one durable admission
-/// ceiling has to subtract the same reservation the Forge-carrying replica
-/// takes.
-#[must_use]
-pub fn harness_forge_compaction_budget_bytes(memory_limit_bytes: usize) -> usize {
-    memory_limit_bytes / 2
-}
+/// also protected must name a budget that fits the remainder — exactly as a
+/// co-located deployment configures one. The constant is public because a test
+/// that pins two Oracle replicas to one durable admission ceiling has to
+/// subtract the same reservation the Forge-carrying replica takes.
+pub const HARNESS_FORGE_COMPACTION_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 
 /// Separates a serve-task join failure from the server's own terminal outcome.
 ///
@@ -457,6 +451,8 @@ pub struct WyrdTestServerBuilder {
     oracle_spill_root: Option<Arc<tempfile::TempDir>>,
     /// Complete process observations injected into the production resource policy.
     system_resources: Option<SystemResourceSnapshot>,
+    /// Forge compaction budget replacing the harness default on this node.
+    forge_compaction_memory_limit_bytes: Option<usize>,
     /// Cluster-retained Oracle audit WAL root reused across restarts.
     oracle_audit_wal_root: Option<Arc<tempfile::TempDir>>,
     /// Process-installed production telemetry guard shared by every node.
@@ -531,6 +527,7 @@ impl Default for WyrdTestServerBuilder {
             scribe_wal_root: None,
             oracle_spill_root: None,
             system_resources: None,
+            forge_compaction_memory_limit_bytes: None,
             oracle_audit_wal_root: None,
             telemetry: None,
             bind_addrs: None,
@@ -3155,6 +3152,17 @@ impl WyrdTestServerBuilder {
         self
     }
 
+    /// Names the Forge compaction budget this node admits plans against.
+    ///
+    /// The harness default is sized for the small tables most fixtures compact.
+    /// A journey that compacts production-sized inputs states the budget its
+    /// pod was sized for here, exactly as a deployment configures one.
+    #[must_use]
+    pub(crate) fn with_forge_compaction_memory_limit_for_test(mut self, bytes: usize) -> Self {
+        self.forge_compaction_memory_limit_bytes = Some(bytes);
+        self
+    }
+
     /// Attach the process-installed production telemetry pipeline.
     #[must_use]
     pub(crate) fn with_telemetry(mut self, telemetry: Arc<TelemetryGuard>) -> Self {
@@ -3428,7 +3436,10 @@ impl WyrdTestServerBuilder {
                     BifrostRuntimeRole::ForgeCoordinator | BifrostRuntimeRole::ForgeWorker
                 )
             })
-            .then(|| harness_forge_compaction_budget_bytes(snapshot.memory_limit_bytes));
+            .then(|| {
+                self.forge_compaction_memory_limit_bytes
+                    .unwrap_or(HARNESS_FORGE_COMPACTION_BUDGET_BYTES)
+            });
         let runtime_resources =
             BifrostRuntimeResources::from_snapshot_with_transport_message_limit(
                 snapshot,

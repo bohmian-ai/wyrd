@@ -67,7 +67,7 @@ pub(super) enum ForgeTaskResult {
     Failed,
     /// The attempt was superseded or cancelled before a durable effect.
     Cancelled,
-    /// Local admission or the execution envelope refused the attempt.
+    /// Local compaction admission refused the attempt.
     Refused,
     /// Externally accepted work retains Prepared evidence for recovery.
     Uncertain,

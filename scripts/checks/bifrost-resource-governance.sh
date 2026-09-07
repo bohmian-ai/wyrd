@@ -54,7 +54,7 @@ scan_resources_owner() {
     $production =~ s/let\s+root\s*=\s*BifrostResourceGovernor\s*::\s*from_snapshot\s*\(/let root = permitted_runtime_constructor(/g;
     print "$ARGV:production:unexpected direct root construction\n" if $production =~ /\bBifrostResourceGovernor\s*::\s*from_snapshot\s*\(/;
     print "$ARGV:tests:direct root construction\n" if defined($tests) && $tests =~ /\bBifrostResourceGovernor\s*::\s*from_snapshot\s*\(/;
-    print "$ARGV:tests:direct root acquisition\n" if defined($tests) && $tests =~ /\.try_acquire_(?:scribe_memory|oracle|oracle_memory|forge)\s*\(/;
+    print "$ARGV:tests:direct root acquisition\n" if defined($tests) && $tests =~ /\.try_acquire_(?:scribe_memory|oracle|oracle_memory)\s*\(/;
   ' "$owner_file" 2>/dev/null || true)"
   if [[ -n "$violations" ]]; then
     printf 'Invalid Bifrost root ownership inside resources.rs:\n%s\n' "$violations"
@@ -82,7 +82,7 @@ if [[ "${BIFROST_RESOURCE_GOVERNANCE_SELF_TEST:-0}" == "1" ]]; then
   fi
   printf '%s\n' 'fn from_snapshot(snapshot: Snapshot, policy: Policy) { let root = BifrostResourceGovernor::from_snapshot(snapshot, policy); } #[cfg(test)] mod tests { let request = ImmutableRequest; }' > "$fixture_dir/owner-valid/resources.rs"
   scan_resources_owner "$fixture_dir/owner-valid/resources.rs"
-  printf '%s\n' 'fn from_snapshot(snapshot: Snapshot, policy: Policy) { let root = BifrostResourceGovernor::from_snapshot(snapshot, policy); } #[cfg(test)] mod tests { fn bypass(snapshot: Snapshot, policy: Policy) { let root = BifrostResourceGovernor::from_snapshot(snapshot, policy); root.try_acquire_forge(1, 1, 1); } }' > "$fixture_dir/owner-invalid/resources.rs"
+  printf '%s\n' 'fn from_snapshot(snapshot: Snapshot, policy: Policy) { let root = BifrostResourceGovernor::from_snapshot(snapshot, policy); } #[cfg(test)] mod tests { fn bypass(snapshot: Snapshot, policy: Policy) { let root = BifrostResourceGovernor::from_snapshot(snapshot, policy); root.try_acquire_oracle(1, 1); } }' > "$fixture_dir/owner-invalid/resources.rs"
   if scan_resources_owner "$fixture_dir/owner-invalid/resources.rs" >/dev/null 2>&1; then
     printf 'Bifrost resources.rs test-module fixture was not rejected.\n'
     exit 1

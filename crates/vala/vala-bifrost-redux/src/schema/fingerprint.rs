@@ -16,6 +16,27 @@ impl SchemaFingerprint {
         Self::from_fields(schema.fields())
     }
 
+    /// Compute a fingerprint over the schema exactly as it is spelled.
+    ///
+    /// [`Self::from_arrow_schema`] answers a catalog question — is this the same
+    /// table? — and therefore normalizes the renderings an Iceberg round trip
+    /// changes. A reader that has to decode bytes is asking a different
+    /// question: are these the same arrays? `Utf8` and `LargeUtf8` are one
+    /// Iceberg type but two memory layouts, so a decode-side identity that
+    /// collapsed them would accept a schema whose offset width does not match
+    /// the file. This variant hashes the raw Arrow types with no normalization.
+    #[must_use]
+    pub fn from_arrow_schema_exact(schema: &Schema) -> Self {
+        let mut hasher = Sha256::new();
+        for field in schema.fields() {
+            hasher.update(field.name().as_bytes());
+            hasher.update(b"\x00");
+            hasher.update(format!("{:?}", field.data_type()).as_bytes());
+            hasher.update(b"\x00");
+        }
+        Self(hasher.finalize().into())
+    }
+
     /// Compute the same fingerprint from a borrowed field list.
     ///
     /// The catalog registers a built-in from its declared fields while ingest

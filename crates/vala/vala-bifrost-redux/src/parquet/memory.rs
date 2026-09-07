@@ -135,7 +135,7 @@ impl BifrostLeafWidthProfile {
         schema: &Schema,
         selection: &BifrostLeafSelection,
     ) -> Result<u64, String> {
-        if SchemaFingerprint::from_arrow_schema(schema) != self.schema_fingerprint {
+        if SchemaFingerprint::from_arrow_schema_exact(schema) != self.schema_fingerprint {
             return Err("leaf-width profile schema fingerprint does not match".to_owned());
         }
         let leaf_paths = normalized_leaf_paths(schema)?;
@@ -214,7 +214,7 @@ impl BifrostParquetMemoryEnvelope {
         expected_schema: &Schema,
         expected_object_identity: &str,
     ) -> Result<Self, String> {
-        let expected_fingerprint = SchemaFingerprint::from_arrow_schema(expected_schema);
+        let expected_fingerprint = SchemaFingerprint::from_arrow_schema_exact(expected_schema);
         let metadata = footer
             .key_value_metadata()
             .ok_or_else(|| "writer-v2 footer metadata is missing".to_owned())?;
@@ -326,7 +326,7 @@ impl BifrostFooterAccumulator {
     pub fn new(schema: &Schema) -> Result<Self, String> {
         let leaf_paths = normalized_leaf_paths(schema)?;
         Ok(Self {
-            schema_fingerprint: SchemaFingerprint::from_arrow_schema(schema),
+            schema_fingerprint: SchemaFingerprint::from_arrow_schema_exact(schema),
             max_logical_row_bytes: 0,
             leaf_maxima: vec![0_u64; leaf_paths.len()],
             rows: 0,
@@ -343,7 +343,8 @@ impl BifrostFooterAccumulator {
     /// than the object was opened with, uses an unsupported Arrow layout, or
     /// overflows a canonical standalone-row calculation.
     pub fn observe(&mut self, batch: &RecordBatch) -> Result<(), String> {
-        if SchemaFingerprint::from_arrow_schema(batch.schema().as_ref()) != self.schema_fingerprint
+        if SchemaFingerprint::from_arrow_schema_exact(batch.schema().as_ref())
+            != self.schema_fingerprint
         {
             return Err("writer-v2 footer accumulator observed a foreign schema".to_owned());
         }
@@ -1212,7 +1213,7 @@ fn append_leaf_paths(field: &Field, path: &str, paths: &mut Vec<String>) -> Resu
 /// Returns the schema fingerprint used by producer metadata construction.
 #[must_use]
 pub fn schema_fingerprint(schema: &Schema) -> SchemaFingerprint {
-    SchemaFingerprint::from_arrow_schema(schema)
+    SchemaFingerprint::from_arrow_schema_exact(schema)
 }
 
 /// Validates the conjunctive decoded writer-v2 footer ceilings.
@@ -1945,7 +1946,7 @@ mod tests {
             Field::new("nested", DataType::Struct(nested_fields.into()), true),
         ]);
         let profile = BifrostLeafWidthProfile {
-            schema_fingerprint: SchemaFingerprint::from_arrow_schema(&schema),
+            schema_fingerprint: SchemaFingerprint::from_arrow_schema_exact(&schema),
             max_logical_bytes: [8_u64, 9, 10]
                 .into_iter()
                 .map(|value| NonZeroU64::new(value).expect("positive width"))

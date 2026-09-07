@@ -1218,6 +1218,28 @@ impl PromotionIntegrationFixture {
         .expect("fixture operation-state inspection")
     }
 
+    /// Returns each rewrite operation this tenant holds, oldest first.
+    ///
+    /// The identity is what [`Self::rewrite_phases`] cannot show: an attempt
+    /// publishes each of its plans under its own operation, so a scenario that
+    /// asks whether the plans settled independently has to compare the ids, not
+    /// just count the phases.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the read-only diagnostic query fails.
+    pub(crate) async fn rewrite_operations(&self) -> Vec<(uuid::Uuid, String)> {
+        sqlx::query_as::<_, (uuid::Uuid, String)>(
+            "SELECT operation_id, phase FROM vala.forge_operation_state \
+             WHERE data_tenant_id = $1 AND family = 'iceberg_rewrite' \
+             ORDER BY prepared_at, operation_id",
+        )
+        .bind(self.tenant.as_uuid())
+        .fetch_all(self.operator_pool.pool())
+        .await
+        .expect("fixture operation-state inspection")
+    }
+
     /// Counts the Forge audit rows this tenant's hash-chained outbox holds.
     ///
     /// Every durable Forge transition appends exactly one row, so an unchanged

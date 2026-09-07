@@ -361,7 +361,7 @@ struct CleanupAttempt<'a> {
 /// loop's own fatal path must reach: the role readiness it must retract and the
 /// child token that stops any in-flight compaction runner it spawned.
 #[derive(Clone)]
-struct ForgeWorkerRunControls {
+struct ForgeWorkerLoopHandles {
     /// Existing role handle; the loop is the only readiness decider.
     readiness: ForgeRoleReadiness,
     /// Child token cancelling admitted runners without touching process shutdown.
@@ -1476,7 +1476,7 @@ pub struct ForgeWorker {
     #[cfg(feature = "test-support")]
     completion_observer: Option<ForgeWorkerCompletionObserver>,
     /// Readiness and stop bookkeeping, present only while the event loop runs.
-    run_controls: Option<ForgeWorkerRunControls>,
+    loop_handles: Option<ForgeWorkerLoopHandles>,
     /// Executor admitted compaction runners are spawned on.
     ///
     /// `None` on a direct fixture or an embedded deployment with no dedicated
@@ -1506,7 +1506,7 @@ impl ForgeWorker {
             forge,
             owner,
             config,
-            run_controls: None,
+            loop_handles: None,
             compaction_runtime: None,
         })
     }
@@ -1530,7 +1530,7 @@ impl ForgeWorker {
     /// Direct execution and startup recovery run outside the event loop and
     /// therefore have no controls to close.
     fn close_after_fatal(&self) {
-        let Some(controls) = &self.run_controls else {
+        let Some(controls) = &self.loop_handles else {
             return;
         };
         controls.readiness.publish(false);
@@ -1635,7 +1635,7 @@ impl ForgeWorker {
         }
         readiness.publish(true);
         let stop = shutdown.child_token();
-        self.run_controls = Some(ForgeWorkerRunControls {
+        self.loop_handles = Some(ForgeWorkerLoopHandles {
             readiness: readiness.clone(),
             stop: stop.clone(),
         });
@@ -1784,7 +1784,7 @@ impl ForgeWorker {
         );
         // Either healthy boolean is progress: a settled refusal or retry is a
         // durable result, and the predicate decides whether more remains.
-        // Boxed for the same reason `run_slot` is: execution nests deeply, and
+        // Boxed for the same reason the event loop is: execution nests deeply, and
         // holding that whole state machine inline inside the startup drain
         // pushes the composed server future past rustc's layout-query budget.
         let result = Box::pin(self.execute_claim_observed(&claim, shutdown, started)).await;
@@ -3295,12 +3295,12 @@ impl ForgeWorker {
     /// A cooperative cancellation observed before the durable effect (dispatch
     /// stopped mid-rewrite before its catalog commit, or a maintenance task
     /// stopped before its `prepared()` boundary) propagates unchanged as
-    /// [`ForgeError::Shutdown`]; the caller [`Self::run_slot`] owns the single
+    /// [`ForgeError::Shutdown`]; the caller [`Self::run_event_loop`] owns the single
     /// release seam and drains the claim to `retryable` through
     /// [`Self::release_cancelled_claim`] for a clean shutdown. A cancellation
     /// observed after the durable effect — the fresh catalog commit or recovered
     /// committed snapshot below, whose task row is still `running` — instead
-    /// returns [`ForgeError::ShutdownRetained`] so `run_slot` retains it for
+    /// returns [`ForgeError::ShutdownRetained`] so the event loop retains it for
     /// evidence-based recovery rather than releasing it.
     ///
     /// Returns whether the requested effect settled. A base snapshot that moved
@@ -3459,10 +3459,10 @@ impl ForgeWorker {
         // (dispatch stopped mid-rewrite before its catalog commit, or a
         // maintenance task stopped before its `prepared()` boundary) and
         // propagates unchanged as `ForgeError::Shutdown`, which the single
-        // `run_slot` release seam drains through `release_cancelled_claim`. The
+        // the event loop release seam drains through `release_cancelled_claim`. The
         // post-effect cancellation at the check below instead has a durable
         // effect already committed while its task row is still `running`, so it
-        // propagates as `ForgeError::ShutdownRetained` to keep `run_slot` from
+        // propagates as `ForgeError::ShutdownRetained` to keep the event loop from
         // matching and releasing it; it stays retained for evidence-based and
         // lease-expiry recovery.
         //
@@ -4022,36 +4022,8 @@ impl ForgeWorker {
             plans,
         } = rewrite.plan().await?;
         if plans.is_empty() {
-            // Planning that selects nothing is the table already being
-            // compact, not a failure of this attempt. Returning an error here
-            // would consume the attempt budget and terminalize an idle table
-            // after five passes, so the no-op is acknowledged instead: the
-            // task succeeds and its planning demand records the exact snapshot
-            // and commit backlog the acknowledgement was made against.
-            let metadata = table.metadata();
-            self.persist_terminal_success(
-                ForgeTaskTransition {
-                    task_id: claim.task_id,
-                    attempt_id: attempt,
-                    owner: self.owner,
-                    expected: ForgeTaskState::Running,
-                    next: ForgeTaskState::Succeeded,
-                },
-                claim.data_tenant_id,
-                &claim.table_ref,
-                lease,
-                TaskProgressEffect::NoOpAcknowledged {
-                    snapshot_id: metadata.current_snapshot_id().unwrap_or(0),
-                    commit_count: u64::try_from(
-                        metadata
-                            .snapshots()
-                            .count()
-                            .saturating_sub(self.forge.core.config.retain_last),
-                    )
-                    .unwrap_or(u64::MAX),
-                },
-            )
-            .await?;
+            self.acknowledge_compact_table(claim, attempt, &table, lease)
+                .await?;
             return Ok(ForgeDispatchResult::SelfSettled);
         }
         let mut queue = super::managed::queue::ForgeCompactionQueue::new(
@@ -4127,6 +4099,52 @@ impl ForgeWorker {
             outcomes.push((plan_index, outcome));
         }
         Self::reduce_plan_outcomes(refusals, outcomes)
+    }
+
+    /// Settles an attempt whose planning selected nothing as a success.
+    ///
+    /// Planning that selects nothing means the table is already compact, not
+    /// that this attempt failed. Reporting a failure would consume the task's
+    /// attempt budget and terminalize an idle table after five passes, so the
+    /// no-op is acknowledged instead: the task succeeds and its planning demand
+    /// records the exact snapshot and commit backlog the acknowledgement was
+    /// made against, which is what keeps the next demand honest.
+    ///
+    /// # Errors
+    ///
+    /// Returns the audit, fence, and SQL failures the terminal transition
+    /// raises; the caller has already refused to publish anything.
+    async fn acknowledge_compact_table(
+        &self,
+        claim: &ForgeTaskClaim,
+        attempt: Uuid,
+        table: &Table,
+        lease: &ForgeLease,
+    ) -> Result<(), ForgeError> {
+        let metadata = table.metadata();
+        self.persist_terminal_success(
+            ForgeTaskTransition {
+                task_id: claim.task_id,
+                attempt_id: attempt,
+                owner: self.owner,
+                expected: ForgeTaskState::Running,
+                next: ForgeTaskState::Succeeded,
+            },
+            claim.data_tenant_id,
+            &claim.table_ref,
+            lease,
+            TaskProgressEffect::NoOpAcknowledged {
+                snapshot_id: metadata.current_snapshot_id().unwrap_or(0),
+                commit_count: u64::try_from(
+                    metadata
+                        .snapshots()
+                        .count()
+                        .saturating_sub(self.forge.core.config.retain_last),
+                )
+                .unwrap_or(u64::MAX),
+            },
+        )
+        .await
     }
 
     /// Rewrites one admitted plan and publishes it under its own operation.
@@ -4541,7 +4559,7 @@ redacted
     /// the replacement or when a definite non-acceptance closes the operation,
     /// carrying the possible outputs as unsettled evidence;
     /// [`ForgeError::Shutdown`] or [`ForgeError::ShutdownRetained`] for a
-    /// cancelled attempt, returned bare so `run_slot` can release the claim;
+    /// cancelled attempt, returned bare so the event loop can release the claim;
     /// [`ForgeError::Timeout`] when the absolute deadline expires with a call
     /// in flight; [`ForgeError::Invariant`] when a revalidated retry has no
     /// reloaded table; and the lease, fence, audit, and SQL failures raised by
@@ -4729,7 +4747,7 @@ redacted
     /// as unsettled evidence, because this attempt is the last thing that can
     /// name them; they stay unreferenced and are reclaimed as orphans.
     ///
-    /// Cancellation is the one refusal that is returned bare. `run_slot`
+    /// Cancellation is the one refusal that is returned bare. The event loop
     /// matches [`ForgeError::Shutdown`] exactly to release a cleanly cancelled
     /// claim, and a wrapper would silently turn that release into a retention.
     ///
@@ -6547,7 +6565,7 @@ impl ForgeWorker {
             return Ok(Some(claim));
         }
         if self
-            .run_controls
+            .loop_handles
             .as_ref()
             .is_some_and(|controls| controls.stop.is_cancelled())
         {

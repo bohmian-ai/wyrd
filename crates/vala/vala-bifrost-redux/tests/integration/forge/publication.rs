@@ -300,7 +300,10 @@ async fn rewrite_publication_commits_exact_handoff_and_delete_disposition() {
     // run actually added is the property that matters and the one a combined
     // commit or a silent retry would both break.
     let published_plans = promoted.snapshot_count().await - snapshots_before;
-    assert!(published_plans > 0, "the rewrite published at least one plan");
+    assert!(
+        published_plans > 0,
+        "the rewrite published at least one plan"
+    );
     assert_eq!(
         catalog.attempts() - attempts_before,
         published_plans,
@@ -472,6 +475,60 @@ async fn rewrite_publication_conflict_revalidates_once_or_resets() {
         .map(|file| file.file_path().to_owned())
         .collect::<BTreeSet<_>>();
 
+    assert_spent_retry_closes_every_operation(SpentRetryPhase {
+        promoted: &promoted,
+        catalog: &catalog,
+        supervisor,
+        standing,
+        published_plans,
+        telemetry: &telemetry,
+    })
+    .await;
+
+    // The retry the rule grants is bounded by the same absolute deadline the
+    // initial call started under, so the two phases below take that budget away
+    // in the only two ways it can end: entirely, and almost entirely.
+    assert_expired_deadline_makes_no_second_call().await;
+    assert_retry_inherits_only_the_remaining_budget().await;
+}
+
+/// Everything the spent-retry phase needs from the run that preceded it.
+struct SpentRetryPhase<'a> {
+    /// Promoted table the refused attempt runs over.
+    promoted: &'a PromotedRewriteFixture,
+    /// Catalog seam that counts and refuses this phase's commits.
+    catalog: &'a Arc<PromotionCatalogSeam>,
+    /// Supervisor the earlier phases left, consumed by this final one.
+    supervisor: SupervisedPromotion,
+    /// Live cut the earlier phases published, which must survive untouched.
+    standing: BTreeSet<String>,
+    /// Plans the earlier successful rewrite published, one operation each.
+    published_plans: usize,
+    /// Scenario-wide production telemetry checkpoint.
+    telemetry: &'a ForgeTelemetryCheckpoint,
+}
+
+/// Refuses every commit of one attempt and proves each plan closed exactly once.
+///
+/// Split out of the scenario because it is the third and last phase of one
+/// story, not a separate one: it inherits the supervisor, the published cut,
+/// and the operation history the first two phases created, and its assertions
+/// are stated relative to them.
+///
+/// # Panics
+///
+/// Panics when a plan made a call past its retry budget, when the refused
+/// attempt changed the published cut, when an operation was left open, or when
+/// production telemetry did not report every commit attempt.
+async fn assert_spent_retry_closes_every_operation(phase: SpentRetryPhase<'_>) {
+    let SpentRetryPhase {
+        promoted,
+        catalog,
+        mut supervisor,
+        standing,
+        published_plans,
+        telemetry,
+    } = phase;
     // Every plan refused twice: each spends its one retry, so no plan commits
     // and the attempt has no partial progress to report as success.
     catalog.reject_next_commits(usize::MAX);
@@ -480,7 +537,10 @@ async fn rewrite_publication_conflict_revalidates_once_or_resets() {
     supervisor.shutdown().await;
     let phases = promoted.fixture.rewrite_phases().await;
     let refused_plans = phases.iter().filter(|phase| *phase == "reset").count();
-    assert!(refused_plans > 0, "the refused attempt planned work: {error}");
+    assert!(
+        refused_plans > 0,
+        "the refused attempt planned work: {error}"
+    );
     // Four calls per plan: the first submission plus the bounded conflict
     // retries the publication schedule grants, and not one call past them.
     assert_eq!(
@@ -520,12 +580,6 @@ async fn rewrite_publication_conflict_revalidates_once_or_resets() {
         published_plans + 1 + 4 * refused_plans,
         "every rewrite commit attempt was reported by production telemetry: {commits:?}"
     );
-
-    // The retry the rule grants is bounded by the same absolute deadline the
-    // initial call started under, so the two phases below take that budget away
-    // in the only two ways it can end: entirely, and almost entirely.
-    assert_expired_deadline_makes_no_second_call().await;
-    assert_retry_inherits_only_the_remaining_budget().await;
 }
 
 /// One publication whose deadline elapses while its first call is in flight.

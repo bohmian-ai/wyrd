@@ -2,13 +2,14 @@
 
 use arrow::array::{
     Array, BinaryArray, BooleanArray, FixedSizeBinaryArray, LargeBinaryArray, LargeStringArray,
-    NullArray, PrimitiveArray, RecordBatch, StringArray,
+    ListArray, NullArray, PrimitiveArray, RecordBatch, StringArray, StructArray,
 };
 use arrow::datatypes::{
     ArrowPrimitiveType, DataType, Date32Type, Date64Type, Decimal128Type, Decimal256Type,
     DurationMicrosecondType, DurationMillisecondType, DurationNanosecondType, DurationSecondType,
     Field, Float16Type, Float32Type, Float64Type, Int8Type, Int16Type, Int32Type, Int64Type,
-    IntervalDayTimeType, IntervalMonthDayNanoType, IntervalUnit, IntervalYearMonthType, Schema,
+    Fields, IntervalDayTimeType, IntervalMonthDayNanoType, IntervalUnit, IntervalYearMonthType,
+    Schema,
     Time32MillisecondType, Time32SecondType, Time64MicrosecondType, Time64NanosecondType, TimeUnit,
     TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
     TimestampSecondType, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
@@ -16,29 +17,28 @@ use arrow::datatypes::{
 
 use crate::contracts::ScribeError;
 
-/// Maximum number of flat scalar fields accepted by the native V1 contract.
+/// Maximum number of Arrow IPC field nodes accepted by the native V1 contract.
+///
+/// A nested field contributes one node per level, so this bounds the complete
+/// depth-first node list rather than the record batch's top-level column count.
 const MAX_FIELDS: usize = 256;
-/// Maximum number of physical buffers emitted for one accepted flat field.
+/// Maximum number of physical buffers emitted across every accepted node.
 const MAX_BUFFERS: usize = MAX_FIELDS * 3;
+/// Maximum accepted nesting depth of one canonical field.
+///
+/// The deepest shape the canonical signal ledgers declare is
+/// `List<Struct<scalar>>`, so this leaves headroom while keeping the recursive
+/// schema walk bounded by a constant rather than by caller input.
+const MAX_NESTING_DEPTH: usize = 8;
+/// Maximum accepted `custom_metadata` entries on one field.
+///
+/// Canonical fields carry at most a stable field id and a sensitivity tag. The
+/// bound lets both metadata passes sort entries in fixed inline storage so the
+/// counted and written `FlatBuffer` layouts cannot diverge on map iteration
+/// order.
+const MAX_FIELD_METADATA: usize = 8;
 /// Arrow stream continuation marker used before every V5 metadata message.
 const CONTINUATION: [u8; 4] = [0xff; 4];
-
-/// Exact logical buffer facts for one not-yet-materialized projected column.
-///
-/// A projection count pass constructs these values in schema order. Fixed-width
-/// columns set `offsets_bytes` to zero. Variable-width columns provide their
-/// exact terminal values length and complete offset-buffer length.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct FixedIpcColumnPlan {
-    /// Logical null count written into the IPC field node.
-    pub(crate) null_count: usize,
-    /// Exact validity bitmap bytes, or zero when no bitmap is materialized.
-    pub(crate) validity_bytes: usize,
-    /// Exact variable-width offsets bytes, or zero for fixed-width fields.
-    pub(crate) offsets_bytes: usize,
-    /// Exact logical values bytes before IPC alignment padding.
-    pub(crate) values_bytes: usize,
-}
 
 /// Exact immutable sizing result for one schema and one record batch.
 ///
@@ -90,28 +90,6 @@ impl FixedIpcPlan {
     /// Its result is later consumed by [`Self::encode`], which recomputes and
     /// compares the materialized batch facts before writing.
     ///
-    /// # Errors
-    ///
-    /// Returns [`ScribeError::InvalidFrame`] for unsupported schemas, zero
-    /// rows, field-count mismatch, or physically inconsistent column facts.
-    /// Returns [`ScribeError::DecodedPayloadTooLarge`] on checked arithmetic
-    /// overflow.
-    pub(crate) fn count_schema<I>(
-        schema: &Schema,
-        rows: usize,
-        columns: I,
-    ) -> Result<Self, ScribeError>
-    where
-        I: ExactSizeIterator<Item = FixedIpcColumnPlan>,
-    {
-        validate_schema(schema)?;
-        if rows == 0 || columns.len() != schema.fields().len() {
-            return Err(ScribeError::InvalidFrame);
-        }
-        let batch_facts = BatchFacts::from_columns(schema, rows, columns)?;
-        Self::from_facts(schema, rows, batch_facts)
-    }
-
     /// Completes exact stream framing from already validated batch facts.
     ///
     /// # Errors
@@ -219,268 +197,45 @@ impl BatchFacts {
     /// Returns [`ScribeError::InvalidFrame`] for unsupported or inconsistent
     /// arrays and [`ScribeError::DecodedPayloadTooLarge`] on overflow.
     fn count(batch: &RecordBatch) -> Result<Self, ScribeError> {
-        let fields = batch.schema().fields().len();
-        if fields == 0 || fields > MAX_FIELDS || fields != batch.num_columns() {
-            return Err(ScribeError::InvalidFrame);
-        }
-        let mut facts = Self {
-            nodes: fixed_box(MAX_FIELDS, FieldNodeFact::EMPTY),
-            node_count: fields,
-            buffers: fixed_box(MAX_BUFFERS, BufferFact::EMPTY),
-            buffer_count: 0,
-            body_bytes: 0,
-        };
-        for (column, array) in batch.columns().iter().enumerate() {
-            if array.offset() != 0 || array.len() != batch.num_rows() {
-                return Err(ScribeError::InvalidFrame);
-            }
-            if !batch.schema().field(column).is_nullable() && array.logical_null_count() != 0 {
-                return Err(ScribeError::InvalidFrame);
-            }
-            let length = i64::try_from(array.len()).map_err(|_| material_overflow())?;
-            let null_count =
-                i64::try_from(array.logical_null_count()).map_err(|_| material_overflow())?;
-            facts.nodes[column] = FieldNodeFact { length, null_count };
-            facts.count_column(column, array.as_ref())?;
-        }
-        Ok(facts)
-    }
-
-    /// Builds physical facts from a projection's allocation-free count pass.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ScribeError::InvalidFrame`] when a column contradicts its
-    /// schema layout and [`ScribeError::DecodedPayloadTooLarge`] on checked
-    /// arithmetic overflow.
-    fn from_columns<I>(schema: &Schema, rows: usize, columns: I) -> Result<Self, ScribeError>
-    where
-        I: ExactSizeIterator<Item = FixedIpcColumnPlan>,
-    {
+        let schema = batch.schema();
         let fields = schema.fields().len();
+        if fields == 0 || fields != batch.num_columns() {
+            return Err(ScribeError::InvalidFrame);
+        }
         let mut facts = Self {
             nodes: fixed_box(MAX_FIELDS, FieldNodeFact::EMPTY),
-            node_count: fields,
+            node_count: 0,
             buffers: fixed_box(MAX_BUFFERS, BufferFact::EMPTY),
             buffer_count: 0,
             body_bytes: 0,
         };
-        for (column, (field, plan)) in schema.fields().iter().zip(columns).enumerate() {
-            if plan.null_count > rows || (!field.is_nullable() && plan.null_count != 0) {
+        for (field, array) in schema.fields().iter().zip(batch.columns()) {
+            if array.len() != batch.num_rows() {
                 return Err(ScribeError::InvalidFrame);
             }
-            facts.nodes[column] = FieldNodeFact {
-                length: i64::try_from(rows).map_err(|_| material_overflow())?,
-                null_count: i64::try_from(plan.null_count).map_err(|_| material_overflow())?,
-            };
-            facts.push_planned_column(column, field.data_type(), rows, plan)?;
+            visit_nodes(field, array.as_ref(), 0, &mut |array| facts.push_node(array))?;
         }
         Ok(facts)
     }
 
-    /// Validates and appends one projection-planned column layout.
+    /// Records one visited array's field node and its canonical buffers.
     ///
     /// # Errors
     ///
-    /// Returns [`ScribeError::InvalidFrame`] for a noncanonical fact tuple and
-    /// [`ScribeError::DecodedPayloadTooLarge`] on checked arithmetic overflow.
-    fn push_planned_column(
-        &mut self,
-        column: usize,
-        data_type: &DataType,
-        rows: usize,
-        plan: FixedIpcColumnPlan,
-    ) -> Result<(), ScribeError> {
-        if matches!(data_type, DataType::Null) {
-            if plan.null_count != rows
-                || plan.validity_bytes != 0
-                || plan.offsets_bytes != 0
-                || plan.values_bytes != 0
-            {
-                return Err(ScribeError::InvalidFrame);
-            }
-            return Ok(());
-        }
-        let expected_validity = if plan.null_count == 0 {
-            0
-        } else {
-            bitmap_bytes(rows)?
-        };
-        if plan.validity_bytes != expected_validity {
-            return Err(ScribeError::InvalidFrame);
-        }
-        self.push_buffer(column, BufferSource::Validity, plan.validity_bytes)?;
-
-        if matches!(data_type, DataType::Boolean) {
-            if plan.offsets_bytes != 0 || plan.values_bytes != bitmap_bytes(rows)? {
-                return Err(ScribeError::InvalidFrame);
-            }
-            self.push_buffer(column, BufferSource::Values, plan.values_bytes)?;
-            return Ok(());
-        }
-        let fixed_width = fixed_value_width(data_type)?;
-        if let Some(width) = fixed_width {
-            let expected_values = rows.checked_mul(width).ok_or_else(material_overflow)?;
-            if plan.offsets_bytes != 0 || plan.values_bytes != expected_values {
-                return Err(ScribeError::InvalidFrame);
-            }
-            self.push_buffer(column, BufferSource::Values, plan.values_bytes)?;
-            return Ok(());
-        }
-
-        let offset_width = variable_offset_width(data_type).ok_or(ScribeError::InvalidFrame)?;
-        let expected_offsets = rows
-            .checked_add(1)
-            .and_then(|count| count.checked_mul(offset_width))
-            .ok_or_else(material_overflow)?;
-        if plan.offsets_bytes != expected_offsets {
-            return Err(ScribeError::InvalidFrame);
-        }
-        self.push_buffer(column, BufferSource::Offsets, plan.offsets_bytes)?;
-        self.push_buffer(column, BufferSource::Values, plan.values_bytes)
-    }
-
-    /// Appends the canonical buffer sequence for one flat array.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ScribeError::InvalidFrame`] for malformed physical storage and
+    /// Returns [`ScribeError::InvalidFrame`] when the fixed node table is
+    /// exhausted or a physical buffer contradicts its array, and
     /// [`ScribeError::DecodedPayloadTooLarge`] on checked length overflow.
-    fn count_column(&mut self, column: usize, array: &dyn Array) -> Result<(), ScribeError> {
-        let data_type = array.data_type();
-        if matches!(data_type, DataType::Null) {
-            if array.logical_null_count() != array.len()
-                || array.as_any().downcast_ref::<NullArray>().is_none()
-            {
-                return Err(ScribeError::InvalidFrame);
-            }
-            return Ok(());
+    fn push_node(&mut self, array: &dyn Array) -> Result<(), ScribeError> {
+        if self.node_count == MAX_FIELDS {
+            return Err(ScribeError::InvalidFrame);
         }
-
-        let validity_len = if array.logical_null_count() == 0 {
-            0
-        } else {
-            bitmap_bytes(array.len())?
+        self.nodes[self.node_count] = FieldNodeFact {
+            length: i64::try_from(array.len()).map_err(|_| material_overflow())?,
+            null_count: i64::try_from(array.logical_null_count())
+                .map_err(|_| material_overflow())?,
         };
-        if validity_len != 0
-            && array
-                .nulls()
-                .is_none_or(|nulls| nulls.buffer().len() < validity_len)
-        {
-            return Err(ScribeError::InvalidFrame);
-        }
-        self.push_buffer(column, BufferSource::Validity, validity_len)?;
-
-        match data_type {
-            DataType::Boolean => {
-                self.push_values(column, array, bitmap_bytes(array.len())?)?;
-            }
-            DataType::Int8 | DataType::UInt8 => {
-                self.push_fixed(column, array, 1)?;
-            }
-            DataType::Int16 | DataType::UInt16 | DataType::Float16 => {
-                self.push_fixed(column, array, 2)?;
-            }
-            DataType::Int32
-            | DataType::UInt32
-            | DataType::Float32
-            | DataType::Date32
-            | DataType::Time32(_)
-            | DataType::Interval(IntervalUnit::YearMonth) => {
-                self.push_fixed(column, array, 4)?;
-            }
-            DataType::Int64
-            | DataType::UInt64
-            | DataType::Float64
-            | DataType::Date64
-            | DataType::Time64(_)
-            | DataType::Timestamp(_, _)
-            | DataType::Duration(_)
-            | DataType::Interval(IntervalUnit::DayTime) => {
-                self.push_fixed(column, array, 8)?;
-            }
-            DataType::Decimal128(_, _) | DataType::Interval(IntervalUnit::MonthDayNano) => {
-                self.push_fixed(column, array, 16)?;
-            }
-            DataType::Decimal256(_, _) => {
-                self.push_fixed(column, array, 32)?;
-            }
-            DataType::FixedSizeBinary(width) if *width > 0 => {
-                let width = usize::try_from(*width).map_err(|_| ScribeError::InvalidFrame)?;
-                self.push_fixed(column, array, width)?;
-            }
-            DataType::Binary | DataType::Utf8 => {
-                self.push_variable(column, array, 4)?;
-            }
-            DataType::LargeBinary | DataType::LargeUtf8 => {
-                self.push_variable(column, array, 8)?;
-            }
-            _ => return Err(ScribeError::InvalidFrame),
-        }
-        Ok(())
-    }
-
-    /// Appends one fixed-width value buffer.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ScribeError::InvalidFrame`] when storage is too short and
-    /// [`ScribeError::DecodedPayloadTooLarge`] on length overflow.
-    fn push_fixed(
-        &mut self,
-        column: usize,
-        array: &dyn Array,
-        width: usize,
-    ) -> Result<(), ScribeError> {
-        let length = array
-            .len()
-            .checked_mul(width)
-            .ok_or_else(material_overflow)?;
-        self.push_values(column, array, length)
-    }
-
-    /// Appends offsets followed by the referenced variable values.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ScribeError::InvalidFrame`] for malformed offsets or storage
-    /// and [`ScribeError::DecodedPayloadTooLarge`] on length overflow.
-    fn push_variable(
-        &mut self,
-        column: usize,
-        array: &dyn Array,
-        offset_width: usize,
-    ) -> Result<(), ScribeError> {
-        let offsets = array
-            .len()
-            .checked_add(1)
-            .and_then(|count| count.checked_mul(offset_width))
-            .ok_or_else(material_overflow)?;
-        let offset_source = borrowed_buffer(array, BufferSource::Offsets)?;
-        if offset_source.len() < offsets {
-            return Err(ScribeError::InvalidFrame);
-        }
-        self.push_buffer(column, BufferSource::Offsets, offsets)?;
-        let terminal = read_terminal_offset(offset_source, offsets, offset_width)?;
-        self.push_values(column, array, terminal)
-    }
-
-    /// Appends a values-buffer descriptor after checking its borrowed source.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ScribeError::InvalidFrame`] when the source buffer is too
-    /// short and propagates descriptor arithmetic failures.
-    fn push_values(
-        &mut self,
-        column: usize,
-        array: &dyn Array,
-        length: usize,
-    ) -> Result<(), ScribeError> {
-        if borrowed_buffer(array, BufferSource::Values)?.len() < length {
-            return Err(ScribeError::InvalidFrame);
-        }
-        self.push_buffer(column, BufferSource::Values, length)
+        self.node_count += 1;
+        array_buffers(array, &mut |source, length| self.push_buffer(source, length))
     }
 
     /// Records one physical buffer and advances the aligned body cursor.
@@ -489,17 +244,11 @@ impl BatchFacts {
     ///
     /// Returns [`ScribeError::InvalidFrame`] when the fixed descriptor array is
     /// exhausted and [`ScribeError::DecodedPayloadTooLarge`] on overflow.
-    fn push_buffer(
-        &mut self,
-        column: usize,
-        source: BufferSource,
-        length: usize,
-    ) -> Result<(), ScribeError> {
+    fn push_buffer(&mut self, source: BufferSource, length: usize) -> Result<(), ScribeError> {
         if self.buffer_count == MAX_BUFFERS {
             return Err(ScribeError::InvalidFrame);
         }
         self.buffers[self.buffer_count] = BufferFact {
-            column,
             source,
             offset: self.body_bytes,
             length,
@@ -511,6 +260,181 @@ impl BatchFacts {
             .ok_or_else(material_overflow)?;
         Ok(())
     }
+}
+
+/// Visits one array and its canonical children in Arrow IPC field-node order.
+///
+/// Arrow lays a record batch out depth-first: a node's own field node and
+/// buffers come first, then its children's, then its siblings'. Counting and
+/// writing share this one walk so the plan's descriptor order and the body
+/// writer's traversal cannot drift apart.
+///
+/// Slices are refused. The encoder writes each array's storage verbatim, so an
+/// array with a nonzero offset — or a list whose values buffer holds slack past
+/// its terminal offset — would produce a stream that decodes to a different
+/// batch than the one that was counted.
+///
+/// # Errors
+///
+/// Returns [`ScribeError::InvalidFrame`] when nesting exceeds
+/// [`MAX_NESTING_DEPTH`], the concrete array does not match its declared field,
+/// an array is sliced, a non-nullable field carries nulls, or a list's child
+/// length diverges from its terminal offset. Propagates the visitor's error.
+fn visit_nodes(
+    field: &Field,
+    array: &dyn Array,
+    depth: usize,
+    visit: &mut dyn FnMut(&dyn Array) -> Result<(), ScribeError>,
+) -> Result<(), ScribeError> {
+    if depth > MAX_NESTING_DEPTH
+        || array.offset() != 0
+        || array.data_type() != field.data_type()
+        || (!field.is_nullable() && array.logical_null_count() != 0)
+    {
+        return Err(ScribeError::InvalidFrame);
+    }
+    visit(array)?;
+    match field.data_type() {
+        DataType::List(item) => {
+            let list = array
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .ok_or(ScribeError::InvalidFrame)?;
+            let values = list.values();
+            let terminal = list
+                .offsets()
+                .last()
+                .copied()
+                .and_then(|offset| usize::try_from(offset).ok())
+                .ok_or(ScribeError::InvalidFrame)?;
+            if values.len() != terminal {
+                return Err(ScribeError::InvalidFrame);
+            }
+            visit_nodes(item, values.as_ref(), depth + 1, visit)
+        }
+        DataType::Struct(children) => {
+            let record = array
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .ok_or(ScribeError::InvalidFrame)?;
+            if record.columns().len() != children.len() {
+                return Err(ScribeError::InvalidFrame);
+            }
+            for (child, column) in children.iter().zip(record.columns()) {
+                if column.len() != record.len() {
+                    return Err(ScribeError::InvalidFrame);
+                }
+                visit_nodes(child, column.as_ref(), depth + 1, visit)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Emits the canonical physical buffers of one array in Arrow IPC order.
+///
+/// Nested arrays contribute only their own buffers: a `Struct` owns just its
+/// validity bitmap and a `List` its validity bitmap and offsets, because their
+/// values live in child nodes the caller's walk reaches separately.
+///
+/// # Errors
+///
+/// Returns [`ScribeError::InvalidFrame`] for a type outside the accepted
+/// subset, malformed offsets, or physical storage shorter than its logical
+/// length. Returns [`ScribeError::DecodedPayloadTooLarge`] on checked length
+/// overflow. Propagates the emitter's error.
+fn array_buffers(
+    array: &dyn Array,
+    emit: &mut dyn FnMut(BufferSource, usize) -> Result<(), ScribeError>,
+) -> Result<(), ScribeError> {
+    let data_type = array.data_type();
+    if matches!(data_type, DataType::Null) {
+        if array.logical_null_count() != array.len()
+            || array.as_any().downcast_ref::<NullArray>().is_none()
+        {
+            return Err(ScribeError::InvalidFrame);
+        }
+        return Ok(());
+    }
+
+    let validity_len = if array.logical_null_count() == 0 {
+        0
+    } else {
+        bitmap_bytes(array.len())?
+    };
+    if validity_len != 0
+        && array
+            .nulls()
+            .is_none_or(|nulls| nulls.buffer().len() < validity_len)
+    {
+        return Err(ScribeError::InvalidFrame);
+    }
+    emit(BufferSource::Validity, validity_len)?;
+
+    match data_type {
+        DataType::Struct(_) => Ok(()),
+        DataType::List(_) => emit_offsets(array, 4, emit).map(|_| ()),
+        DataType::Boolean => emit_values(array, bitmap_bytes(array.len())?, emit),
+        DataType::Binary | DataType::Utf8 => {
+            let terminal = emit_offsets(array, 4, emit)?;
+            emit_values(array, terminal, emit)
+        }
+        DataType::LargeBinary | DataType::LargeUtf8 => {
+            let terminal = emit_offsets(array, 8, emit)?;
+            emit_values(array, terminal, emit)
+        }
+        _ => {
+            let width = fixed_value_width(data_type)?.ok_or(ScribeError::InvalidFrame)?;
+            let length = array
+                .len()
+                .checked_mul(width)
+                .ok_or_else(material_overflow)?;
+            emit_values(array, length, emit)
+        }
+    }
+}
+
+/// Emits one offsets buffer and returns the terminal offset it declares.
+///
+/// # Errors
+///
+/// Returns [`ScribeError::InvalidFrame`] for storage shorter than the logical
+/// offsets length or a malformed terminal offset, and
+/// [`ScribeError::DecodedPayloadTooLarge`] on checked length overflow.
+fn emit_offsets(
+    array: &dyn Array,
+    offset_width: usize,
+    emit: &mut dyn FnMut(BufferSource, usize) -> Result<(), ScribeError>,
+) -> Result<usize, ScribeError> {
+    let offsets = array
+        .len()
+        .checked_add(1)
+        .and_then(|count| count.checked_mul(offset_width))
+        .ok_or_else(material_overflow)?;
+    let source = borrowed_buffer(array, BufferSource::Offsets)?;
+    if source.len() < offsets {
+        return Err(ScribeError::InvalidFrame);
+    }
+    emit(BufferSource::Offsets, offsets)?;
+    read_terminal_offset(source, offsets, offset_width)
+}
+
+/// Emits one values buffer after checking its borrowed source is long enough.
+///
+/// # Errors
+///
+/// Returns [`ScribeError::InvalidFrame`] when the source buffer is shorter than
+/// `length`. Propagates the emitter's error.
+fn emit_values(
+    array: &dyn Array,
+    length: usize,
+    emit: &mut dyn FnMut(BufferSource, usize) -> Result<(), ScribeError>,
+) -> Result<(), ScribeError> {
+    if borrowed_buffer(array, BufferSource::Values)?.len() < length {
+        return Err(ScribeError::InvalidFrame);
+    }
+    emit(BufferSource::Values, length)
 }
 
 /// One Arrow IPC field-node struct.
@@ -542,11 +466,13 @@ enum BufferSource {
 }
 
 /// One planned record-batch body buffer.
+///
+/// Buffers are identified by their position in the depth-first walk rather than
+/// by a column index: a nested field contributes its own buffers between its
+/// parent's and its siblings', so no single top-level column owns them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct BufferFact {
-    /// Source record-batch column.
-    column: usize,
-    /// Borrowed physical source within the column.
+    /// Borrowed physical source within the owning array.
     source: BufferSource,
     /// Aligned byte offset in the record-batch body.
     offset: usize,
@@ -557,7 +483,6 @@ struct BufferFact {
 impl BufferFact {
     /// Zero placeholder for unused fixed array entries.
     const EMPTY: Self = Self {
-        column: 0,
         source: BufferSource::Validity,
         offset: 0,
         length: 0,
@@ -784,18 +709,94 @@ fn write_schema_message(writer: &mut FlatWriter<'_>, schema: &Schema) -> Result<
     let fields = writer.vector(schema.fields().len(), 4, 4)?;
     writer.put_offset(schema_table + 8, fields)?;
     for (index, field) in schema.fields().iter().enumerate() {
-        let field_table = writer.table(&[4, 8, 9, 12, 0, 0, 0], 16, 4)?;
+        let field_table = write_field(writer, field)?;
         writer.put_offset(fields + 4 + index * 4, field_table)?;
-        writer.put_u8(field_table + 8, u8::from(field.is_nullable()));
-        let name = writer.string(field.name())?;
-        writer.put_offset(field_table + 4, name)?;
-        let encoded_type = write_type(writer, field.data_type())?;
-        writer.put_u8(field_table + 9, encoded_type.tag);
-        writer.put_offset(field_table + 12, encoded_type.table)?;
     }
     writer.put_offset(message + 8, schema_table)?;
     writer.put_offset(root, message)?;
     Ok(())
+}
+
+/// Writes one `Field` table, recursing into its children.
+///
+/// The table always reserves the `children` and `custom_metadata` slots so a
+/// flat and a nested field share one layout; an absent value becomes an empty
+/// vector rather than a second vtable shape.
+///
+/// # Errors
+///
+/// Returns [`ScribeError::InvalidFrame`] for a type outside the accepted subset
+/// and propagates checked metadata-layout failures.
+fn write_field(writer: &mut FlatWriter<'_>, field: &Field) -> Result<usize, ScribeError> {
+    let field_table = writer.table(&[4, 8, 9, 12, 0, 16, 20], 24, 4)?;
+    writer.put_u8(field_table + 8, u8::from(field.is_nullable()));
+    let name = writer.string(field.name())?;
+    writer.put_offset(field_table + 4, name)?;
+    let encoded_type = write_type(writer, field.data_type())?;
+    writer.put_u8(field_table + 9, encoded_type.tag);
+    writer.put_offset(field_table + 12, encoded_type.table)?;
+
+    let children = field_children(field.data_type());
+    let children_vector = writer.vector(children.len(), 4, 4)?;
+    writer.put_offset(field_table + 16, children_vector)?;
+    for (index, child) in children.iter().enumerate() {
+        let child_table = write_field(writer, child)?;
+        writer.put_offset(children_vector + 4 + index * 4, child_table)?;
+    }
+
+    let metadata = write_custom_metadata(writer, field)?;
+    writer.put_offset(field_table + 20, metadata)?;
+    Ok(field_table)
+}
+
+/// Returns the declared child fields of one accepted nested type.
+///
+/// Scalar types have none, so the caller writes an empty children vector.
+#[must_use]
+fn field_children(data_type: &DataType) -> Fields {
+    match data_type {
+        DataType::List(item) => std::slice::from_ref(item).into(),
+        DataType::Struct(children) => children.clone(),
+        _ => Fields::empty(),
+    }
+}
+
+/// Writes one field's `custom_metadata` vector in stable key order.
+///
+/// Arrow stores field metadata in a `HashMap`, whose iteration order is not a
+/// contract. Both metadata passes must lay out identical bytes, so entries are
+/// sorted by key in fixed inline storage before they are written.
+///
+/// # Errors
+///
+/// Returns [`ScribeError::InvalidFrame`] when the field carries more than
+/// [`MAX_FIELD_METADATA`] entries, and propagates checked layout failures.
+fn write_custom_metadata(
+    writer: &mut FlatWriter<'_>,
+    field: &Field,
+) -> Result<usize, ScribeError> {
+    let mut entries: [Option<(&str, &str)>; MAX_FIELD_METADATA] = [None; MAX_FIELD_METADATA];
+    let mut count = 0_usize;
+    for (key, value) in field.metadata() {
+        if count == MAX_FIELD_METADATA {
+            return Err(ScribeError::InvalidFrame);
+        }
+        entries[count] = Some((key.as_str(), value.as_str()));
+        count += 1;
+    }
+    entries[..count].sort_unstable();
+
+    let vector = writer.vector(count, 4, 4)?;
+    for (index, entry) in entries[..count].iter().enumerate() {
+        let (key, value) = entry.ok_or(ScribeError::InvalidFrame)?;
+        let pair = writer.table(&[4, 8], 12, 4)?;
+        writer.put_offset(vector + 4 + index * 4, pair)?;
+        let key = writer.string(key)?;
+        writer.put_offset(pair + 4, key)?;
+        let value = writer.string(value)?;
+        writer.put_offset(pair + 8, value)?;
+    }
+    Ok(vector)
 }
 
 /// Writes one `RecordBatch` `Message` `FlatBuffer` from fixed physical facts.
@@ -926,6 +927,10 @@ fn write_type(
             arrow::ipc::Type::FixedSizeBinary.0,
             scalar_i32_table(writer, *width)?,
         ),
+        DataType::List(_) => (arrow::ipc::Type::List.0, empty_table(writer)?),
+        DataType::Struct(fields) if !fields.is_empty() => {
+            (arrow::ipc::Type::Struct_.0, empty_table(writer)?)
+        }
         _ => return Err(ScribeError::InvalidFrame),
     };
     Ok(EncodedType { tag, table })
@@ -1079,21 +1084,26 @@ fn validate_schema(schema: &Schema) -> Result<(), ScribeError> {
         return Err(ScribeError::InvalidFrame);
     }
     for field in schema.fields() {
-        if !field.metadata().is_empty() {
-            return Err(ScribeError::InvalidFrame);
-        }
-        validate_field(field)?;
+        validate_field(field, 0)?;
     }
     Ok(())
 }
 
-/// Validates one canonical flat scalar field.
+/// Validates one canonical field and, for `List`/`Struct`, its children.
+///
+/// Field `custom_metadata` is accepted and preserved: the canonical signal
+/// ledgers carry their stable field ids and sensitivity tags there, and
+/// dropping them at the WAL boundary would lose the identity replay needs.
 ///
 /// # Errors
 ///
-/// Returns [`ScribeError::InvalidFrame`] for unsupported types or invalid
-/// type parameters.
-fn validate_field(field: &Field) -> Result<(), ScribeError> {
+/// Returns [`ScribeError::InvalidFrame`] for unsupported types, invalid type
+/// parameters, an empty struct, metadata beyond [`MAX_FIELD_METADATA`], or
+/// nesting beyond [`MAX_NESTING_DEPTH`].
+fn validate_field(field: &Field, depth: usize) -> Result<(), ScribeError> {
+    if depth > MAX_NESTING_DEPTH || field.metadata().len() > MAX_FIELD_METADATA {
+        return Err(ScribeError::InvalidFrame);
+    }
     match field.data_type() {
         DataType::Null
         | DataType::Boolean
@@ -1122,6 +1132,13 @@ fn validate_field(field: &Field) -> Result<(), ScribeError> {
         DataType::Decimal128(precision, scale) if decimal_valid(*precision, *scale, 38) => Ok(()),
         DataType::Decimal256(precision, scale) if decimal_valid(*precision, *scale, 76) => Ok(()),
         DataType::FixedSizeBinary(width) if *width > 0 => Ok(()),
+        DataType::List(item) => validate_field(item, depth + 1),
+        DataType::Struct(children) if !children.is_empty() => {
+            for child in children {
+                validate_field(child, depth + 1)?;
+            }
+            Ok(())
+        }
         _ => Err(ScribeError::InvalidFrame),
     }
 }
@@ -1166,16 +1183,6 @@ fn fixed_value_width(data_type: &DataType) -> Result<Option<usize>, ScribeError>
         _ => return Err(ScribeError::InvalidFrame),
     };
     Ok(Some(width))
-}
-
-/// Returns the public offset width for one accepted variable-width scalar.
-#[must_use]
-fn variable_offset_width(data_type: &DataType) -> Option<usize> {
-    match data_type {
-        DataType::Binary | DataType::Utf8 => Some(4),
-        DataType::LargeBinary | DataType::LargeUtf8 => Some(8),
-        _ => None,
-    }
 }
 
 /// Returns whether one decimal precision and scale satisfy its width limit.
@@ -1232,20 +1239,40 @@ fn write_body(
     if output.len() != facts.body_bytes {
         return Err(ScribeError::InvalidFrame);
     }
-    for fact in &facts.buffers[..facts.buffer_count] {
-        if fact.length == 0 {
-            continue;
-        }
-        let source = borrowed_buffer(batch.column(fact.column).as_ref(), fact.source)?;
-        let source = source.get(..fact.length).ok_or(ScribeError::InvalidFrame)?;
-        let end = fact
-            .offset
-            .checked_add(fact.length)
-            .ok_or_else(material_overflow)?;
-        output
-            .get_mut(fact.offset..end)
-            .ok_or(ScribeError::InvalidFrame)?
-            .copy_from_slice(source);
+    let mut cursor = 0_usize;
+    let schema = batch.schema();
+    for (field, array) in schema.fields().iter().zip(batch.columns()) {
+        visit_nodes(field, array.as_ref(), 0, &mut |array| {
+            array_buffers(array, &mut |source, length| {
+                let fact = facts
+                    .buffers
+                    .get(cursor)
+                    .filter(|_| cursor < facts.buffer_count)
+                    .ok_or(ScribeError::InvalidFrame)?;
+                cursor += 1;
+                if fact.source != source || fact.length != length {
+                    return Err(ScribeError::InvalidFrame);
+                }
+                if length == 0 {
+                    return Ok(());
+                }
+                let bytes = borrowed_buffer(array, source)?
+                    .get(..length)
+                    .ok_or(ScribeError::InvalidFrame)?;
+                let end = fact
+                    .offset
+                    .checked_add(length)
+                    .ok_or_else(material_overflow)?;
+                output
+                    .get_mut(fact.offset..end)
+                    .ok_or(ScribeError::InvalidFrame)?
+                    .copy_from_slice(bytes);
+                Ok(())
+            })
+        })?;
+    }
+    if cursor != facts.buffer_count {
+        return Err(ScribeError::InvalidFrame);
     }
     Ok(())
 }
@@ -1340,6 +1367,11 @@ fn borrowed_buffer(array: &dyn Array, source: BufferSource) -> Result<&[u8], Scr
             .map(|values| values.values().as_slice())
             .ok_or(ScribeError::InvalidFrame),
         (DataType::Binary, BufferSource::Values) => byte_values::<BinaryArray>(array),
+        (DataType::List(_), BufferSource::Offsets) => array
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .map(|list| list.offsets().inner().inner().as_slice())
+            .ok_or(ScribeError::InvalidFrame),
         (DataType::Binary, BufferSource::Offsets) => byte_offsets::<BinaryArray>(array),
         (DataType::LargeBinary, BufferSource::Values) => byte_values::<LargeBinaryArray>(array),
         (DataType::LargeBinary, BufferSource::Offsets) => byte_offsets::<LargeBinaryArray>(array),
@@ -1510,6 +1542,7 @@ fn material_overflow() -> ScribeError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::io::Cursor;
     use std::mem::size_of;
     use std::sync::Arc;
@@ -1594,68 +1627,6 @@ mod tests {
         assert_eq!(observed, reference);
     }
 
-    /// Proves projection facts produce the same exact plan before arrays exist.
-    #[test]
-    fn pre_material_column_facts_encode_the_observed_batch() {
-        let batch = mixed_batch();
-        let columns = [
-            FixedIpcColumnPlan {
-                null_count: 1,
-                validity_bytes: 1,
-                offsets_bytes: 0,
-                values_bytes: 24,
-            },
-            FixedIpcColumnPlan {
-                null_count: 1,
-                validity_bytes: 1,
-                offsets_bytes: 0,
-                values_bytes: 1,
-            },
-            FixedIpcColumnPlan {
-                null_count: 1,
-                validity_bytes: 1,
-                offsets_bytes: 16,
-                values_bytes: 10,
-            },
-            FixedIpcColumnPlan {
-                null_count: 1,
-                validity_bytes: 1,
-                offsets_bytes: 16,
-                values_bytes: 1,
-            },
-            FixedIpcColumnPlan {
-                null_count: 3,
-                validity_bytes: 0,
-                offsets_bytes: 0,
-                values_bytes: 0,
-            },
-        ];
-        let plan = FixedIpcPlan::count_schema(batch.schema_ref(), 3, columns.into_iter())
-            .expect("pre-material IPC plan");
-        let encoded = plan.encode(&batch).expect("planned batch encoding");
-
-        assert_eq!(encoded.len(), plan.encoded_bytes());
-        assert_eq!(encoded.capacity(), encoded.len());
-        assert_eq!(decode_one(encoded), batch);
-    }
-
-    /// Proves projection facts with a noncanonical offsets length fail closed.
-    #[test]
-    fn pre_material_column_facts_reject_wrong_offsets() {
-        let schema = Schema::new(vec![Field::new("message", DataType::Utf8, false)]);
-        let columns = [FixedIpcColumnPlan {
-            null_count: 0,
-            validity_bytes: 0,
-            offsets_bytes: 8,
-            values_bytes: 5,
-        }];
-
-        assert!(matches!(
-            FixedIpcPlan::count_schema(&schema, 3, columns.into_iter()),
-            Err(ScribeError::InvalidFrame)
-        ));
-    }
-
     /// Proves changed batch facts cannot consume a previously counted plan.
     #[test]
     fn fixed_plan_rejects_changed_batch() {
@@ -1679,19 +1650,113 @@ mod tests {
         ));
     }
 
-    /// Proves nested and metadata-bearing schemas fail before IPC allocation.
+    /// Builds the canonical nested fixture: metadata, `List`, and `List<Struct>`.
+    ///
+    /// This mirrors the shape the canonical signal ledgers actually produce —
+    /// per-field `PARQUET:field_id` metadata, a repeated scalar column, and a
+    /// repeated record column — so the encoder is proved against the real
+    /// canonical layout rather than a synthetic nested toy.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the fixture arrays do not satisfy their declared schema.
+    fn nested_batch() -> RecordBatch {
+        use arrow::array::{Float64Array, ListArray, StructArray};
+        use arrow::buffer::OffsetBuffer;
+        use arrow::datatypes::Fields;
+
+        fn with_id(field: Field, id: i32) -> Field {
+            field.with_metadata(HashMap::from([(
+                "PARQUET:field_id".to_owned(),
+                id.to_string(),
+            )]))
+        }
+
+        let bucket_item = Arc::new(with_id(Field::new("item", DataType::Int64, false), 11));
+        let buckets = ListArray::new(
+            Arc::clone(&bucket_item),
+            OffsetBuffer::new(vec![0, 2, 2, 5].into()),
+            Arc::new(Int64Array::from(vec![1_i64, 2, 3, 4, 5])) as ArrayRef,
+            Some(vec![true, false, true].into()),
+        );
+
+        let quantile_fields: Fields = vec![
+            Arc::new(with_id(Field::new("quantile", DataType::Float64, false), 21)),
+            Arc::new(with_id(Field::new("value", DataType::Float64, true), 22)),
+        ]
+        .into();
+        let quantile_struct = StructArray::new(
+            quantile_fields.clone(),
+            vec![
+                Arc::new(Float64Array::from(vec![0.5_f64, 0.9, 0.99])) as ArrayRef,
+                Arc::new(Float64Array::from(vec![Some(1.0_f64), None, Some(3.0)])) as ArrayRef,
+            ],
+            None,
+        );
+        let quantile_item = Arc::new(with_id(
+            Field::new("item", DataType::Struct(quantile_fields), false),
+            20,
+        ));
+        let quantiles = ListArray::new(
+            Arc::clone(&quantile_item),
+            OffsetBuffer::new(vec![0, 1, 3, 3].into()),
+            Arc::new(quantile_struct) as ArrayRef,
+            None,
+        );
+
+        let schema = Arc::new(Schema::new(vec![
+            with_id(Field::new("metric_name", DataType::Utf8, false), 1),
+            with_id(
+                Field::new("bucket_counts", DataType::List(bucket_item), true),
+                10,
+            ),
+            with_id(
+                Field::new("quantile_values", DataType::List(quantile_item), false),
+                19,
+            ),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["a", "b", "c"])) as ArrayRef,
+                Arc::new(buckets) as ArrayRef,
+                Arc::new(quantiles) as ArrayRef,
+            ],
+        )
+        .expect("valid nested batch")
+    }
+
+    /// Proves the recursive walk encodes nested, metadata-bearing canonical rows.
+    ///
+    /// Nested Arrow is the shape every canonical signal batch has, and this
+    /// encoder is the sole WAL writer, so exact capacity and reference parity
+    /// over `List` and `List<Struct>` is what makes canonical rows persistable.
+    #[test]
+    fn recursive_plan_roundtrips_nested_metadata_batch() {
+        let batch = nested_batch();
+        let plan = FixedIpcPlan::count(&batch).expect("count nested IPC");
+        let encoded = plan.encode(&batch).expect("encode nested IPC");
+
+        assert_eq!(encoded.len(), plan.encoded_bytes());
+        assert_eq!(encoded.capacity(), encoded.len());
+        let observed = decode_one(encoded);
+        assert_eq!(observed, batch);
+        assert_eq!(observed, reference_roundtrip(&batch));
+    }
+
+    /// Proves a schema outside the recursive accepted subset still fails closed.
     #[test]
     fn fixed_plan_rejects_noncanonical_schema() {
         let field = Field::new(
-            "nested",
-            DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+            "dictionary",
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
             true,
         );
         let schema = Arc::new(Schema::new(vec![field]));
-        let array = arrow::array::ListArray::from_iter_primitive::<arrow::datatypes::Int64Type, _, _>(
-            vec![Some(vec![Some(1_i64)])],
-        );
-        let batch = RecordBatch::try_new(schema, vec![Arc::new(array)]).expect("valid list batch");
+        let mut values = arrow::array::StringDictionaryBuilder::<arrow::datatypes::Int32Type>::new();
+        values.append_value("alpha");
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(values.finish()) as ArrayRef]).expect("valid dictionary batch");
 
         assert!(matches!(
             FixedIpcPlan::count(&batch),

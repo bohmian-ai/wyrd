@@ -5,11 +5,9 @@ use crate::contracts::{FrameAdmission, IngressPayload, ScribeError, ScribeIngres
 use crate::scribe::execution_lanes::{ScribePersistenceCpuOp, ScribePersistenceCpuResult};
 use crate::scribe::material_plan::{MaterialPlan, MaximumEnvelopeDecision, ScribeIngressPlanner};
 use crate::scribe::memory::MemoryCategory;
-use crate::scribe::preprocess::{
-    AdmittedAppend, AdmittedRows, NativeAdmittedRows, OtlpAdmittedRows, OtlpTypedRows,
-};
+use crate::scribe::preprocess::{AdmittedAppend, AdmittedRows, NativeAdmittedRows};
 use crate::scribe::routing::shard_for;
-use std::sync::{Arc, OnceLock};
+
 use std::time::Instant;
 
 /// Validates that one decoded request fits the persistence bucket that must own it.
@@ -64,36 +62,18 @@ fn validate_logical_transport_frame(
     Ok(())
 }
 
-/// Takes the adapter-decode owner required by an OTLP transport payload.
+/// Takes the transport-decode owner a canonical payload may already hold.
 ///
-/// Native IPC and engine-only projected rows do not have an adapter typed-
-/// decode allocation, so they deliberately return no owner and acquire their
-/// one root through the normal Scribe admission branch.
-///
-/// # Errors
-///
-/// Returns [`ScribeError::InvalidFrame`] when any typed OTLP payload arrives
-/// without the move-only owner created before adapter construction.
+/// Gate materializes canonical batches inside the capacity it reserved before
+/// decoding, so that child moves here and is grown into Scribe's one complete
+/// root. Native IPC, and canonical batches from engine-internal producers, have
+/// no such reservation and acquire their root through ordinary admission.
 fn take_transport_decode_owner(
     payload: &mut IngressPayload,
 ) -> Result<Option<crate::contracts::OtlpDecodeOwner>, ScribeError> {
     match payload {
-        IngressPayload::OtlpTraces(decoded) => decoded
-            .owner
-            .take()
-            .map(Some)
-            .ok_or(ScribeError::InvalidFrame),
-        IngressPayload::OtlpMetrics(decoded) => decoded
-            .owner
-            .take()
-            .map(Some)
-            .ok_or(ScribeError::InvalidFrame),
-        IngressPayload::OtlpLogs(decoded) => decoded
-            .owner
-            .take()
-            .map(Some)
-            .ok_or(ScribeError::InvalidFrame),
-        IngressPayload::ArrowIpc(_) | IngressPayload::ProjectedArrow(_) => Ok(None),
+        IngressPayload::Canonical(canonical) => Ok(canonical.owner.take()),
+        IngressPayload::ArrowIpc(_) => Ok(None),
     }
 }
 
@@ -113,8 +93,6 @@ struct AdmittedRowContext {
     material_limit: usize,
     /// Native event-time acceptance window.
     event_time_window: crate::scribe::admission::EventTimeWindow,
-    /// Shared publication slot read only after the durable ACK.
-    otlp_outcome: Arc<OnceLock<crate::contracts::ScribeOtlpOutcome>>,
     /// Native schema frame start established by preflight.
     native_schema_start: usize,
     /// Native schema frame end established by preflight.
@@ -225,44 +203,26 @@ impl ScribeImpl {
         &self,
         frame: &ScribeIngressFrame,
         physical_binding_peak_bytes: usize,
-        projection: &super::otlp_managed::OtlpProjection<'_>,
     ) -> Result<MaterialPlan, ScribeError> {
         let planner = ScribeIngressPlanner::new(self.ingest_limits);
         let plan = match &frame.payload {
             IngressPayload::ArrowIpc(bytes) => {
-                planner.plan_native(bytes, physical_binding_peak_bytes)
+                planner.plan_native(bytes, physical_binding_peak_bytes)?
             }
-            IngressPayload::OtlpTraces(request) => planner.plan_traces(
-                &request.request,
-                request.decode_bytes,
-                physical_binding_peak_bytes,
-                projection,
-            ),
-            IngressPayload::OtlpMetrics(request) => planner.plan_metrics(
-                &request.request,
-                request.decode_bytes,
-                physical_binding_peak_bytes,
-                projection,
-            ),
-            IngressPayload::OtlpLogs(request) => planner.plan_logs(
-                &request.request,
-                request.decode_bytes,
-                physical_binding_peak_bytes,
-                projection,
-            ),
-            IngressPayload::ProjectedArrow(batches) => planner.plan_projected(
-                batches,
-                frame.measured_wire_bytes,
-                physical_binding_peak_bytes,
-            ),
-        }?;
-        if matches!(&frame.payload, IngressPayload::ProjectedArrow(_)) {
-            validate_decoded_request_size(
-                plan.current_material_bytes,
-                plan.request_bytes,
-                self.decoded_request_limit(),
-            )?;
-        }
+            IngressPayload::Canonical(canonical) => {
+                let plan = planner.plan_canonical(
+                    &canonical.batches,
+                    frame.measured_wire_bytes,
+                    physical_binding_peak_bytes,
+                )?;
+                validate_decoded_request_size(
+                    plan.current_material_bytes,
+                    plan.request_bytes,
+                    self.decoded_request_limit(),
+                )?;
+                plan
+            }
+        };
         Ok(plan)
     }
 
@@ -286,9 +246,10 @@ impl ScribeImpl {
 
     /// Converts one move-only transport payload into its retained row source.
     ///
-    /// Typed OTLP remains unprojected, native Arrow retains its preflight
-    /// descriptors, and the engine-only projected path uses the bounded ingress
-    /// CPU lane.
+    /// Native Arrow retains its preflight descriptors and decodes one source at
+    /// a time on the persistence lane. Canonical batches are already
+    /// materialized, so they are validated and stamped on the bounded ingress
+    /// CPU lane before admission completes.
     ///
     /// # Errors
     ///
@@ -307,7 +268,6 @@ impl ScribeImpl {
             receipt_micros,
             material_limit,
             event_time_window,
-            otlp_outcome,
             native_schema_start,
             native_schema_end,
             native_sources,
@@ -329,47 +289,11 @@ impl ScribeImpl {
                     source_count: native_source_count,
                 })))
             }
-            IngressPayload::OtlpTraces(decoded) => {
-                Ok(AdmittedRows::Otlp(Box::new(OtlpAdmittedRows {
-                    request: OtlpTypedRows::Traces(decoded.request),
-                    principal,
-                    expected_schema_fingerprint,
-                    request_id,
-                    batch_id,
-                    receipt_micros,
-                    material_limit,
-                    outcome: otlp_outcome,
-                })))
-            }
-            IngressPayload::OtlpMetrics(decoded) => {
-                Ok(AdmittedRows::Otlp(Box::new(OtlpAdmittedRows {
-                    request: OtlpTypedRows::Metrics(decoded.request),
-                    principal,
-                    expected_schema_fingerprint,
-                    request_id,
-                    batch_id,
-                    receipt_micros,
-                    material_limit,
-                    outcome: otlp_outcome,
-                })))
-            }
-            IngressPayload::OtlpLogs(decoded) => {
-                Ok(AdmittedRows::Otlp(Box::new(OtlpAdmittedRows {
-                    request: OtlpTypedRows::Logs(decoded.request),
-                    principal,
-                    expected_schema_fingerprint,
-                    request_id,
-                    batch_id,
-                    receipt_micros,
-                    material_limit,
-                    outcome: otlp_outcome,
-                })))
-            }
-            payload @ IngressPayload::ProjectedArrow(_) => {
+            IngressPayload::Canonical(canonical) => {
                 let rows = self
                     .ingress_cpu
                     .decode(
-                        payload,
+                        IngressPayload::Canonical(canonical),
                         principal,
                         expected_schema_fingerprint,
                         request_id,
@@ -414,15 +338,7 @@ impl ScribeImpl {
         let binding_facts =
             crate::catalog::TenantTableBinding::facts(&frame.authenticated_tenant, &frame.table)
                 .map_err(|_| ScribeError::InvalidFrame)?;
-        let projection = super::otlp_managed::OtlpProjection::new(
-            &frame.principal,
-            expected_schema_fingerprint,
-            &frame.request_id,
-            frame.batch_id,
-            receipt_micros,
-        );
-        let material_plan =
-            self.plan_transport_payload(frame, binding_facts.peak_bytes, &projection)?;
+        let material_plan = self.plan_transport_payload(frame, binding_facts.peak_bytes)?;
         if let MaximumEnvelopeDecision::IntrinsicRefusal {
             demand_bytes,
             limit_bytes,
@@ -492,24 +408,6 @@ impl ScribeImpl {
         memory.transfer_category(MemoryCategory::Prepared)
     }
 
-    /// Returns accepted rows from a published OTLP outcome or the planned fallback.
-    fn accepted_otlp_rows(
-        outcome: Option<&crate::contracts::ScribeOtlpOutcome>,
-        planned: u64,
-    ) -> u64 {
-        outcome.map_or(planned, |outcome| match outcome {
-            crate::contracts::ScribeOtlpOutcome::Traces(value) => {
-                u64::try_from(value.accepted_spans).unwrap_or(u64::MAX)
-            }
-            crate::contracts::ScribeOtlpOutcome::Metrics(value) => {
-                u64::try_from(value.accepted_points).unwrap_or(u64::MAX)
-            }
-            crate::contracts::ScribeOtlpOutcome::Logs(value) => {
-                u64::try_from(value.accepted_records).unwrap_or(u64::MAX)
-            }
-        })
-    }
-
     /// Prepares one request and dispatches its owned packet to its fixed shard.
     ///
     /// The global item reservation is acquired before decoding and remains
@@ -548,7 +446,6 @@ impl ScribeImpl {
                 return Err(error);
             }
         };
-        let otlp_outcome = Arc::new(OnceLock::new());
         let tenant = frame.principal.tenant_id;
         let rows = match self
             .prepare_admitted_rows(
@@ -561,7 +458,6 @@ impl ScribeImpl {
                     receipt_micros,
                     material_limit: material_plan.current_material_bytes,
                     event_time_window: self.admission.config().event_time_window,
-                    otlp_outcome: Arc::clone(&otlp_outcome),
                     native_schema_start: material_plan.native_schema_start,
                     native_schema_end: material_plan.native_schema_end,
                     native_sources: material_plan.sources,
@@ -620,14 +516,10 @@ impl ScribeImpl {
         durable_rx.await.map_err(|_| ScribeError::Internal {
             detail: "shard owner dropped durable batch completion".to_owned(),
         })??;
-        let published_outcome = otlp_outcome.get().cloned();
-        let rows_accepted =
-            Self::accepted_otlp_rows(published_outcome.as_ref(), planned_rows_accepted);
-        record_accepted_frame(rows_accepted, append_started.elapsed());
+        record_accepted_frame(planned_rows_accepted, append_started.elapsed());
         Ok(FrameAdmission {
             batch_id: frame.batch_id,
-            rows_accepted,
-            otlp_outcome: published_outcome,
+            rows_accepted: planned_rows_accepted,
         })
     }
 

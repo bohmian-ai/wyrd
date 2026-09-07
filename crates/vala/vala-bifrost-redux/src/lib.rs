@@ -18,6 +18,7 @@ pub mod maintenance;
 pub mod namespaces;
 pub mod oracle;
 mod otlp_contract;
+mod otlp_limits;
 pub mod parquet;
 pub mod provider;
 pub mod resources;

@@ -67,7 +67,11 @@ pub struct ScribeIngressFrame {
     pub authenticated_tenant: wyrd_spec::DataTenantId,
     /// Requested logical table, unchanged by physical resolution.
     pub table: TableRef,
-    /// Engine-only expected fingerprint for already projected fixture rows.
+    /// Fingerprint asserted by an engine-internal producer with no catalog.
+    ///
+    /// Production writes leave this absent: Scribe re-resolves the table
+    /// through its own catalog authority and compares that. It exists only for
+    /// the crate-private seam that runs a Scribe without a catalog owner.
     pub expected_schema_fingerprint: Option<SchemaFingerprint>,
     /// The request correlation identifier.
     pub request_id: RequestId,
@@ -84,21 +88,53 @@ pub struct ScribeIngressFrame {
 
 /// Payload forms accepted by the transport-neutral Scribe boundary.
 ///
-/// Public OTLP adapters transfer typed, fixed-capacity requests and their
-/// decode owners through Gate; they do not project Arrow before Scribe.
+/// Both forms describe caller-owned user columns. Nothing below this boundary
+/// knows which signal, transport, or codec produced them: Gate decodes and
+/// projects every public shape — OTLP protobuf/JSON and public canonical
+/// Arrow alike — into the same validated user-column batches before Scribe
+/// stamps its managed envelope.
 #[derive(Debug)]
 pub enum IngressPayload {
     /// One self-contained Arrow IPC stream from the native transport.
     ArrowIpc(Bytes),
-    /// Engine-internal preprojected Arrow batches used outside public OTLP
-    /// adapter and Gate routing.
-    ProjectedArrow(Vec<RecordBatch>),
-    /// Fixed-capacity typed OTLP trace request plus its move-only decode owner.
-    OtlpTraces(DecodedOtlp<wyrd_tonic::otlp::trace_service::ExportTraceServiceRequest>),
-    /// Fixed-capacity typed OTLP metrics request plus its move-only decode owner.
-    OtlpMetrics(DecodedOtlp<wyrd_tonic::otlp::metrics_service::ExportMetricsServiceRequest>),
-    /// Fixed-capacity typed OTLP logs request plus its move-only decode owner.
-    OtlpLogs(DecodedOtlp<wyrd_tonic::otlp::logs_service::ExportLogsServiceRequest>),
+    /// Validated user-column batches Gate already projected and authorized.
+    Canonical(CanonicalIngress),
+}
+
+/// Validated canonical batches paired with the reservation that backs them.
+///
+/// Gate materializes these arrays inside the capacity it reserved before
+/// decoding, so the owner moves with them: Scribe grows that one child into its
+/// complete admission root instead of admitting the same bytes twice.
+#[derive(Debug)]
+pub struct CanonicalIngress {
+    /// Accepted user-column batches in request order.
+    pub batches: Vec<RecordBatch>,
+    /// Move-only reservation that already covers `batches`, when Gate held one.
+    pub(crate) owner: Option<OtlpDecodeOwner>,
+}
+
+impl CanonicalIngress {
+    /// Pairs validated batches with the reservation Gate materialized them in.
+    #[must_use]
+    pub fn new(batches: Vec<RecordBatch>, owner: OtlpDecodeOwner) -> Self {
+        Self {
+            batches,
+            owner: Some(owner),
+        }
+    }
+
+    /// Carries validated batches that no transport reservation backs.
+    ///
+    /// Engine-internal producers allocate their arrays outside any adapter
+    /// decode reservation, so Scribe admits them through its ordinary root.
+    #[must_use]
+    pub fn unreserved(batches: Vec<RecordBatch>) -> Self {
+        Self {
+            batches,
+            owner: None,
+        }
+    }
 }
 
 /// Move-only adapter-decoded OTLP request paired with its root-backed owner.
@@ -196,19 +232,6 @@ pub struct FrameAdmission {
     pub batch_id: uuid::Uuid,
     /// Number of rows durably admitted into the active ingest pipeline.
     pub rows_accepted: u64,
-    /// OTLP projection result returned to its transport adapter.
-    pub otlp_outcome: Option<ScribeOtlpOutcome>,
-}
-
-/// Closed OTLP projection outcome returned through the private Scribe seam.
-#[derive(Debug, Clone)]
-pub enum ScribeOtlpOutcome {
-    /// Trace export counts and partial-success detail.
-    Traces(crate::otlp_contract::IngestOutcome),
-    /// Metrics export counts and partial-success detail.
-    Metrics(crate::otlp_contract::MetricsOutcome),
-    /// Log export counts and partial-success detail.
-    Logs(crate::otlp_contract::LogsOutcome),
 }
 
 /// Scribe-layer errors per CONTRACTS §10.

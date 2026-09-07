@@ -7,9 +7,6 @@ pub mod claim_assembly;
 pub mod claim_merge;
 pub mod claim_publication;
 pub mod contention;
-mod direct_logs;
-mod direct_metrics;
-mod direct_traces;
 pub mod execution_lanes;
 pub mod file_list_writer;
 pub mod filename;
@@ -23,7 +20,6 @@ mod material_plan;
 pub mod member_stager;
 pub mod memory;
 pub mod memtable;
-mod otlp_managed;
 pub mod parquet_writer;
 pub mod persistence;
 pub mod preprocess;
@@ -39,8 +35,6 @@ pub mod staging_runtime;
 pub mod stream_identity;
 pub mod tail_rpc;
 pub mod telemetry;
-#[cfg(any(test, feature = "test-support"))]
-pub mod test_projection_oracle;
 pub mod wal;
 mod write_recipe;
 

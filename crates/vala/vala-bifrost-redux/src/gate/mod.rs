@@ -24,8 +24,8 @@ use wyrd_tonic::wyrd::v1::{InsertBatchRequest, InsertBatchResponse};
 
 use crate::catalog::TableRef;
 use crate::contracts::{
-    DecodedOtlp, IngressPayload, OracleQueryDispatch, OtlpDecodeOwner, Scribe, ScribeIngressFrame,
-    ScribeOtlpOutcome,
+    CanonicalIngress, DecodedOtlp, IngressPayload, OracleQueryDispatch, OtlpDecodeOwner, Scribe,
+    ScribeIngressFrame,
 };
 pub use crate::gate::auth::{AuthContext, IngestAuthInterceptor, WYRD_REQUEST_ID_METADATA};
 pub use crate::gate::error::IngestError;
@@ -482,24 +482,22 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> Gate<R,
             record_gate_event("otlp_rejection");
             return Err(error);
         }
-        let wire_bytes = decoded.wire_bytes;
-        let outcome = self
-            .dispatch_otlp(
-                auth,
-                TableRef::new(BifrostNamespace::Traces, "spans"),
-                wire_bytes,
-                IngressPayload::OtlpTraces(decoded),
-            )
-            .await?;
-        match outcome {
-            ScribeOtlpOutcome::Traces(outcome) => {
-                record_gate_rows(outcome.accepted_spans, outcome.rejected_spans);
-                Ok(outcome)
-            }
-            _ => Err(IngestError::Internal(
-                "Scribe returned the wrong OTLP outcome".to_owned(),
-            )),
-        }
+        crate::otlp_limits::enforce_trace_limits(&decoded.request, decoded.wire_bytes, self.limits)
+            .map_err(IngestError::from_scribe)?;
+        let (batch, outcome) = crate::tables::traces::project_resource_spans(
+            &decoded.request.resource_spans,
+        )
+        .map_err(|error| IngestError::Internal(format!("trace projection failed: {error}")))?;
+        self.dispatch_canonical(
+            auth,
+            TableRef::new(BifrostNamespace::Traces, "spans"),
+            decoded.wire_bytes,
+            batch,
+            decoded.owner,
+        )
+        .await?;
+        record_gate_rows(outcome.accepted_spans, outcome.rejected_spans);
+        Ok(outcome)
     }
 
     /// Routes one adapter-decoded metrics export and its move-only owner.
@@ -519,24 +517,26 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> Gate<R,
             record_gate_event("otlp_rejection");
             return Err(error);
         }
-        let wire_bytes = decoded.wire_bytes;
-        let outcome = self
-            .dispatch_otlp(
-                auth,
-                TableRef::new(BifrostNamespace::Metrics, "points"),
-                wire_bytes,
-                IngressPayload::OtlpMetrics(decoded),
-            )
-            .await?;
-        match outcome {
-            ScribeOtlpOutcome::Metrics(outcome) => {
-                record_gate_rows(outcome.accepted_points, outcome.rejected_points);
-                Ok(outcome)
-            }
-            _ => Err(IngestError::Internal(
-                "Scribe returned the wrong OTLP outcome".to_owned(),
-            )),
-        }
+        crate::otlp_limits::enforce_metric_limits(
+            &decoded.request,
+            decoded.wire_bytes,
+            self.limits,
+        )
+        .map_err(IngestError::from_scribe)?;
+        let (batch, outcome) = crate::tables::metrics::project_resource_metrics(
+            &decoded.request.resource_metrics,
+        )
+        .map_err(|error| IngestError::Internal(format!("metric projection failed: {error}")))?;
+        self.dispatch_canonical(
+            auth,
+            TableRef::new(BifrostNamespace::Metrics, "points"),
+            decoded.wire_bytes,
+            batch,
+            decoded.owner,
+        )
+        .await?;
+        record_gate_rows(outcome.accepted_points, outcome.rejected_points);
+        Ok(outcome)
     }
 
     /// Routes one adapter-decoded log export and its move-only owner.
@@ -556,24 +556,23 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> Gate<R,
             record_gate_event("otlp_rejection");
             return Err(error);
         }
-        let wire_bytes = decoded.wire_bytes;
-        let outcome = self
-            .dispatch_otlp(
-                auth,
-                TableRef::new(BifrostNamespace::Logs, "records"),
-                wire_bytes,
-                IngressPayload::OtlpLogs(decoded),
-            )
-            .await?;
-        match outcome {
-            ScribeOtlpOutcome::Logs(outcome) => {
-                record_gate_rows(outcome.accepted_records, outcome.rejected_records);
-                Ok(outcome)
-            }
-            _ => Err(IngestError::Internal(
-                "Scribe returned the wrong OTLP outcome".to_owned(),
-            )),
-        }
+        crate::otlp_limits::enforce_log_limits(&decoded.request, decoded.wire_bytes, self.limits)
+            .map_err(IngestError::from_scribe)?;
+        let (batch, outcome) =
+            crate::tables::logs::project_resource_logs(&decoded.request.resource_logs)
+                .map_err(|error| {
+                    IngestError::Internal(format!("log projection failed: {error}"))
+                })?;
+        self.dispatch_canonical(
+            auth,
+            TableRef::new(BifrostNamespace::Logs, "records"),
+            decoded.wire_bytes,
+            batch,
+            decoded.owner,
+        )
+        .await?;
+        record_gate_rows(outcome.accepted_records, outcome.rejected_records);
+        Ok(outcome)
     }
 
     #[tracing::instrument(
@@ -581,13 +580,14 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> Gate<R,
         fields(tenant = %auth.tenant, table = %table, request_id = %auth.request_id,
                wire_bytes = measured_wire_bytes)
     )]
-    async fn dispatch_otlp(
+    async fn dispatch_canonical(
         &self,
         auth: &AuthContext,
         table: TableRef,
         measured_wire_bytes: usize,
-        payload: IngressPayload,
-    ) -> Result<ScribeOtlpOutcome, IngestError> {
+        batch: arrow::record_batch::RecordBatch,
+        owner: Option<OtlpDecodeOwner>,
+    ) -> Result<(), IngestError> {
         self.ensure_open()?;
         if measured_wire_bytes > self.limits.max_frame_bytes {
             return Err(IngestError::PayloadTooLarge {
@@ -610,6 +610,13 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> Gate<R,
             payload_summary: "one bounded OTLP frame".to_owned(),
             detail: None,
         };
+        if batch.num_rows() == 0 {
+            return Ok(());
+        }
+        let payload = IngressPayload::Canonical(match owner {
+            Some(owner) => CanonicalIngress::new(vec![batch], owner),
+            None => CanonicalIngress::unreserved(vec![batch]),
+        });
         let scribe = self.scribe.as_ref().ok_or(IngestError::IngressClosed)?;
         scribe
             .ingest_frame(ScribeIngressFrame {
@@ -627,9 +634,8 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> Gate<R,
             .map_err(|error| {
                 record_gate_event("scribe_failure");
                 IngestError::from_scribe(error)
-            })?
-            .otlp_outcome
-            .ok_or_else(|| IngestError::Internal("Scribe omitted the OTLP outcome".to_owned()))
+            })?;
+        Ok(())
     }
 
     /// Authorizes and routes one bounded native batch to Scribe.

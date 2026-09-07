@@ -5,7 +5,6 @@ use arrow::buffer::Buffer;
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
-use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 use tokio::sync::oneshot;
 use uuid::Uuid;
@@ -62,40 +61,6 @@ pub(crate) enum AdmittedRows {
     Projected(RecordBatch),
     /// One native stream decoded a record batch at a time on the persistence lane.
     Native(Box<NativeAdmittedRows>),
-    /// One typed OTLP request projected only when persistence requests its slice.
-    Otlp(Box<OtlpAdmittedRows>),
-}
-
-/// Closed typed request retained by the private Scribe OTLP producer.
-#[derive(Debug)]
-pub(crate) enum OtlpTypedRows {
-    /// Typed trace export.
-    Traces(Box<wyrd_tonic::otlp::trace_service::ExportTraceServiceRequest>),
-    /// Typed metrics export.
-    Metrics(Box<wyrd_tonic::otlp::metrics_service::ExportMetricsServiceRequest>),
-    /// Typed logs export.
-    Logs(Box<wyrd_tonic::otlp::logs_service::ExportLogsServiceRequest>),
-}
-
-/// Retained typed OTLP request and deterministic managed-column context.
-#[derive(Debug)]
-pub(crate) struct OtlpAdmittedRows {
-    /// Move-only typed request consumed by the sole pre-WAL projection pass.
-    pub(crate) request: OtlpTypedRows,
-    /// Authenticated principal stamped into the current projected slice.
-    pub(crate) principal: Principal,
-    /// Catalog fingerprint checked against the projected schema.
-    pub(crate) expected_schema_fingerprint: SchemaFingerprint,
-    /// Stable request identity stamped into every accepted row.
-    pub(crate) request_id: RequestId,
-    /// Stable batch identity stamped into every accepted row.
-    pub(crate) batch_id: Uuid,
-    /// One authoritative receipt instant and partition day.
-    pub(crate) receipt_micros: i64,
-    /// Configured combined Arrow plus IPC ceiling for the sole current slice.
-    pub(crate) material_limit: usize,
-    /// Outcome published by the producer after its deterministic projection pass.
-    pub(crate) outcome: Arc<OnceLock<crate::contracts::ScribeOtlpOutcome>>,
 }
 
 /// Retained native source and immutable stamping context.
@@ -163,128 +128,6 @@ pub(crate) struct ExactMaterialFacts {
     pub(crate) persistence_candidate_peak: usize,
     /// Immutable candidate plus its serial incremental Parquet workspace.
     pub(crate) persistence_envelope_peak: usize,
-}
-
-/// One-shot typed OTLP current-slice producer.
-#[derive(Debug)]
-pub(crate) struct OtlpSliceProducer {
-    /// Retained request and immutable stamping context.
-    source: OtlpAdmittedRows,
-    /// Whether the sole receipt-partition slice has been produced.
-    produced: bool,
-    /// Canonical batch audit moved only into the current durable slice.
-    audit_event: AuditEvent,
-    /// Authenticated tenant used by the slice seal key.
-    tenant: DataTenantId,
-    /// Logical table used by the slice seal key.
-    table: TableRef,
-    /// Registered partition granularity used to bucket the produced slice.
-    partition_granularity: TimeGranularity,
-    /// Exact-capacity audit JSON ceiling.
-    wal_workspace_bytes: usize,
-}
-
-impl OtlpSliceProducer {
-    /// Builds one retained producer without projecting the typed request.
-    #[must_use]
-    fn new(
-        source: OtlpAdmittedRows,
-        audit_event: AuditEvent,
-        tenant: DataTenantId,
-        table: TableRef,
-        partition_granularity: TimeGranularity,
-        wal_workspace_bytes: usize,
-    ) -> Self {
-        Self {
-            source,
-            produced: false,
-            audit_event,
-            tenant,
-            table,
-            partition_granularity,
-            wal_workspace_bytes,
-        }
-    }
-
-    /// Projects and prepares the sole receipt-day slice.
-    ///
-    /// # Errors
-    ///
-    /// Returns a stable projection, schema, stamping, day, or IPC preparation
-    /// error. A second call after success returns exhaustion without allocating.
-    pub(crate) fn next_slice(&mut self) -> Result<Option<PreparedSlice>, ScribeError> {
-        if self.produced {
-            return Ok(None);
-        }
-        let projection = super::otlp_managed::OtlpProjection::new(
-            &self.source.principal,
-            self.source.expected_schema_fingerprint,
-            &self.source.request_id,
-            self.source.batch_id,
-            self.source.receipt_micros,
-        );
-        let (batch, outcome) = match &self.source.request {
-            OtlpTypedRows::Traces(request) => {
-                let (batch, outcome) =
-                    projection.project_traces(request, self.source.material_limit)?;
-                (batch, crate::contracts::ScribeOtlpOutcome::Traces(outcome))
-            }
-            OtlpTypedRows::Metrics(request) => {
-                let (batch, outcome) =
-                    projection.project_metrics(request, self.source.material_limit)?;
-                (batch, crate::contracts::ScribeOtlpOutcome::Metrics(outcome))
-            }
-            OtlpTypedRows::Logs(request) => {
-                let (batch, outcome) =
-                    projection.project_logs(request, self.source.material_limit)?;
-                (batch, crate::contracts::ScribeOtlpOutcome::Logs(outcome))
-            }
-        };
-        if self.source.outcome.get().is_none() {
-            let _ = self.source.outcome.set(outcome);
-        }
-        self.produced = true;
-        let Some(batch) = batch else {
-            return Ok(None);
-        };
-        let crate::scribe::otlp_managed::OtlpManagedBatch { rows, ipc_plan } = batch;
-        let receipt = chrono::DateTime::from_timestamp_micros(self.source.receipt_micros)
-            .ok_or(ScribeError::InvalidFrame)?;
-        let partition = self
-            .partition_granularity
-            .bucket(receipt)
-            .map_err(|error| ScribeError::Internal {
-                detail: format!("OTLP receipt time has no partition: {error}"),
-            })?;
-        let current_bytes = rows
-            .get_array_memory_size()
-            .checked_add(ipc_plan.encoded_bytes())
-            .ok_or(ScribeError::DecodedPayloadTooLarge {
-                bytes: usize::MAX,
-                limit: self.source.material_limit,
-            })?;
-        if current_bytes > self.source.material_limit {
-            return Err(ScribeError::DecodedPayloadTooLarge {
-                bytes: current_bytes,
-                limit: self.source.material_limit,
-            });
-        }
-        let mut slice = prepare_slice(
-            SliceContext {
-                batch_id: self.source.batch_id,
-                audit_event: &self.audit_event,
-                tenant: self.tenant,
-                table: &self.table,
-                wal_workspace_bytes: self.wal_workspace_bytes,
-            },
-            partition,
-            rows,
-            Some(ipc_plan),
-        )?;
-        slice.wal_append.assign_slice_ordinal(0, 1);
-        slice.id.slice_index = 0;
-        Ok(Some(slice))
-    }
 }
 
 /// Stateful current-only native slice producer.
@@ -719,19 +562,6 @@ fn prepare_rows(
                 slices.push(slice);
             }
             assign_slice_ordinals(&mut slices)?;
-            let prepared_bytes = prepared_slice_bytes(&slices, memory_bytes)?;
-            Ok((PreparedSliceSet::Materialized(slices), prepared_bytes))
-        }
-        AdmittedRows::Otlp(otlp) => {
-            let mut producer = OtlpSliceProducer::new(
-                *otlp,
-                audit_event,
-                tenant,
-                table,
-                partition_granularity,
-                wal_workspace_bytes,
-            );
-            let slices = producer.next_slice()?.into_iter().collect::<Vec<_>>();
             let prepared_bytes = prepared_slice_bytes(&slices, memory_bytes)?;
             Ok((PreparedSliceSet::Materialized(slices), prepared_bytes))
         }

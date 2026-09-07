@@ -401,7 +401,6 @@ fn decode(
     batch_id: uuid::Uuid,
     window: EventTimeWindow,
 ) -> Result<RecordBatch, ScribeError> {
-    let native_payload = matches!(payload, IngressPayload::ArrowIpc(_));
     let batches = match payload {
         IngressPayload::ArrowIpc(bytes) => {
             let reader = arrow::ipc::reader::StreamReader::try_new(Cursor::new(bytes), None)
@@ -410,10 +409,7 @@ fn decode(
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|_| ScribeError::InvalidFrame)?
         }
-        IngressPayload::ProjectedArrow(batches) => batches,
-        IngressPayload::OtlpTraces(_)
-        | IngressPayload::OtlpMetrics(_)
-        | IngressPayload::OtlpLogs(_) => return Err(ScribeError::InvalidFrame),
+        IngressPayload::Canonical(canonical) => canonical.batches,
     };
     let schema = batches
         .first()
@@ -434,7 +430,6 @@ fn decode(
             expected_schema_fingerprint,
             request_id,
             batch_id,
-            native_payload,
             window,
             receipt_micros: None,
         },
@@ -466,7 +461,6 @@ pub(crate) fn decode_native_batch(
             expected_schema_fingerprint,
             request_id,
             batch_id,
-            native_payload: true,
             window,
             receipt_micros: Some(receipt_micros),
         },
@@ -483,8 +477,6 @@ struct DecodeContext<'a> {
     request_id: &'a RequestId,
     /// Stable batch identity stamped into every accepted row.
     batch_id: uuid::Uuid,
-    /// Whether the caller supplied native Arrow rather than projected rows.
-    native_payload: bool,
     /// Accepted caller event-time window.
     window: EventTimeWindow,
     /// Fixed receipt time retained by current-only native production.
@@ -509,12 +501,14 @@ fn decode_rows(
         });
     }
     for field in rows.schema().fields() {
-        // `wyrd_event_time` is intentionally absent from this reserved set:
-        // native payloads MAY supply it as the authoritative event time (it is
-        // then validated and preserved in `stamp_correlation_columns`), and
-        // projected payloads already carry it from the projection path. Every
-        // other managed column remains unconditionally server-owned.
-        let reserved = matches!(
+        // `wyrd_event_time` is intentionally absent from this reserved set: a
+        // caller MAY supply it as the authoritative event time, and it is then
+        // validated and preserved in `stamp_correlation_columns`. `run_id` is
+        // likewise absent: it is caller correlation that this function
+        // relinquishes and restamps exactly once in its canonical slot. Every
+        // other managed column is unconditionally server-owned, so supplying
+        // one is a refusal rather than an override.
+        if matches!(
             field.name().as_str(),
             CARD_UID
                 | PRINCIPAL_ID
@@ -523,11 +517,7 @@ fn decode_rows(
                 | WYRD_ROW_ORDINAL
                 | WYRD_INGESTED_AT
                 | WYRD_REQUEST_ID
-        );
-        let native_run_id = context.native_payload && field.name() == "run_id";
-        let projected_correlation = !context.native_payload
-            && matches!(field.name().as_str(), CARD_UID | PRINCIPAL_ID | "run_id");
-        if reserved && !projected_correlation && !native_run_id {
+        ) {
             return Err(ScribeError::InvalidFrame);
         }
     }
@@ -543,7 +533,6 @@ fn decode_rows(
         context.principal,
         context.request_id,
         context.batch_id,
-        context.native_payload,
         context.window,
         context.receipt_micros,
     )
@@ -645,7 +634,6 @@ fn stamp_correlation_columns(
     principal: &Principal,
     request_id: &RequestId,
     batch_id: uuid::Uuid,
-    native_payload: bool,
     window: EventTimeWindow,
     receipt_micros: Option<i64>,
 ) -> Result<RecordBatch, ScribeError> {
@@ -653,12 +641,10 @@ fn stamp_correlation_columns(
     // Compute one receipt instant for the whole batch so clock ticks mid-batch
     // cannot split the verdict.
     let receipt_micros = receipt_micros.map_or_else(current_receipt_micros, Ok)?;
-    // Native type/null/duplicate checks come first (T38). A malformed column
-    // stays `InvalidFrame` regardless of window membership.
-    if native_payload {
-        validate_native_event_time(rows)?;
-    }
-    // Enforce the acceptance window for a present column in either payload mode.
+    // Type/null/duplicate checks come first (T38). A malformed column stays
+    // `InvalidFrame` regardless of window membership.
+    validate_native_event_time(rows)?;
+    // Enforce the acceptance window for a present caller column.
     if rows.schema().index_of(WYRD_EVENT_TIME).is_ok() {
         enforce_event_time_window(rows, window, receipt_micros)?;
     }
@@ -674,11 +660,11 @@ fn stamp_correlation_columns(
         .index_of(WYRD_EVENT_TIME)
         .ok()
         .map(|index| Arc::clone(rows.column(index)));
-    let native_run_id = if native_payload {
+    let caller_run_id = {
         let schema = rows.schema();
         let mut matched = None;
         for (index, field) in schema.fields().iter().enumerate() {
-            if field.name() != "run_id" {
+            if field.name() != RUN_ID {
                 continue;
             }
             if matched.replace((index, field)).is_some() {
@@ -693,19 +679,15 @@ fn stamp_correlation_columns(
                 Ok(Arc::clone(rows.column(index)))
             })
             .transpose()?
-    } else {
-        None
     };
-    let server_owned = server_owned_columns(native_payload);
+    let server_owned = server_owned_columns();
     let card_uids = resolve_card_uids(rows, principal, row_count)?;
     let mut fields = user_fields(rows, &server_owned);
     let mut columns = user_columns(rows, &server_owned);
-    if native_payload {
-        fields.push(Field::new(RUN_ID, DataType::Utf8, true));
-        columns.push(native_run_id.unwrap_or_else(|| {
-            Arc::new(StringArray::from(vec![None::<&str>; row_count])) as ArrayRef
-        }));
-    }
+    fields.push(Field::new(RUN_ID, DataType::Utf8, true));
+    columns.push(caller_run_id.unwrap_or_else(|| {
+        Arc::new(StringArray::from(vec![None::<&str>; row_count])) as ArrayRef
+    }));
     columns.push(Arc::new(StringArray::from(card_uids)) as ArrayRef);
     columns.push(Arc::new(StringArray::from(vec![
         principal.id.to_string();
@@ -846,12 +828,11 @@ fn enforce_event_time_window(
 /// the canonical slot, and when it is absent the server stamps the receipt time
 /// there. Decoupling exclusion from the value source keeps the stamped field
 /// order equal to [`with_managed_columns`](crate::schema::with_managed_columns)
-/// in every payload mode (D88). `native_payload` additionally governs the inbound
-/// `run_id` field, which native payloads relinquish so the canonical nullable
-/// physical `run_id` can be stamped exactly once; projected payloads keep their
-/// `run_id` as correlation data in the user projection.
-fn server_owned_columns(native_payload: bool) -> Vec<&'static str> {
-    let mut columns = vec![
+/// in every payload mode (D88). `run_id` is listed here for the same reason:
+/// the caller relinquishes it from the user projection so the canonical
+/// nullable physical column can be stamped exactly once.
+fn server_owned_columns() -> Vec<&'static str> {
+    vec![
         CARD_REF,
         CARD_UID,
         PRINCIPAL_ID,
@@ -861,11 +842,8 @@ fn server_owned_columns(native_payload: bool) -> Vec<&'static str> {
         WYRD_BATCH_ID,
         WYRD_ROW_ORDINAL,
         DATA_TENANT_ID,
-    ];
-    if native_payload {
-        columns.push("run_id");
-    }
-    columns
+        RUN_ID,
+    ]
 }
 
 fn user_fields(rows: &RecordBatch, server_owned: &[&str]) -> Vec<Field> {

@@ -2296,6 +2296,160 @@ mod tests {
         logical.finish()
     }
 
+    /// Recovery replays exactly the Gate-accepted nested subset (S3).
+    ///
+    /// A mixed OTLP export is projected the way Gate projects it, so only the
+    /// accepted spans reach Scribe. After a durable append, replaying the WAL
+    /// directory must reconstruct one fence for that batch whose slice-set
+    /// digest authenticates the single recovered slice, and the recovered Arrow
+    /// payload must still carry the nested canonical columns and exactly the
+    /// accepted rows.
+    #[tokio::test]
+    async fn nested_accepted_subset_replays_one_fence_and_digest() {
+        use crate::contracts::{CanonicalIngress, IngressPayload, Scribe, ScribeIngressFrame};
+        use wyrd_tonic::otlp::trace::v1::{ResourceSpans, ScopeSpans, Span};
+
+        let span = |index: u8, valid: bool| ResourceSpans {
+            scope_spans: vec![ScopeSpans {
+                spans: vec![Span {
+                    trace_id: if valid { vec![index; 16] } else { vec![index; 3] },
+                    span_id: vec![index; 8],
+                    name: format!("span-{index}"),
+                    start_time_unix_nano: 1,
+                    end_time_unix_nano: 2,
+                    ..Span::default()
+                }],
+                ..ScopeSpans::default()
+            }],
+            ..ResourceSpans::default()
+        };
+        let (rows, outcome) = crate::tables::traces::project_resource_spans(&[
+            span(1, true),
+            span(2, false),
+            span(3, true),
+        ])
+        .expect("canonical trace projection");
+        assert_eq!((outcome.accepted_spans, outcome.rejected_spans), (2, 1));
+        assert!(
+            rows.schema()
+                .fields()
+                .iter()
+                .any(|field| matches!(field.data_type(), arrow::datatypes::DataType::List(_))),
+            "the canonical span projection carries nested columns"
+        );
+
+        let tenant = DataTenantId::new_v7();
+        let table = TableRef::new(crate::namespaces::BifrostNamespace::Traces, "spans");
+        let temp_dir = TempDir::new().expect("temp dir");
+        let wal = std::sync::Arc::new(
+            WalWriter::new(
+                temp_dir.path(),
+                *uuid::Uuid::nil().as_bytes(),
+                1,
+                WalConfig::default(),
+            )
+            .expect("writer"),
+        );
+        let operator = std::sync::Arc::new(
+            opendal::Operator::new(opendal::services::Memory::default())
+                .expect("memory operator")
+                .finish(),
+        );
+        let scribe = crate::scribe::ScribeImpl::new_for_embedded_with_deps(
+            operator,
+            wal,
+            &uuid::Uuid::nil().to_string(),
+            1,
+        );
+        let principal = wyrd_runtime::Principal {
+            id: PrincipalId::new(uuid::Uuid::now_v7()),
+            kind: wyrd_runtime::PrincipalKind::User,
+            tenant_id: tenant,
+            roles: Vec::new(),
+            effective_permissions: wyrd_runtime::PermissionSet::new(),
+        };
+        let request_id = RequestId::now_v7();
+        let fence_request_id = request_id.clone();
+        let batch_id = uuid::Uuid::now_v7();
+        let admission = Scribe::ingest_frame(
+            &scribe,
+            ScribeIngressFrame {
+                authenticated_tenant: tenant,
+                audit_event: AuditEvent {
+                    request_id: request_id.clone(),
+                    trace_id: None,
+                    operation: "bifrost.otlp".to_owned(),
+                    resource: table.fqn(),
+                    card_ref: None,
+                    principal_id: principal.id,
+                    principal_kind: principal.kind.tag(),
+                    auth_method: AuthMethod::Jwt,
+                    permission: "bifrost:record:write".to_owned(),
+                    decision: AuditDecision::Allow,
+                    result: AuditResult::Success,
+                    payload_summary: "one accepted nested subset".to_owned(),
+                    detail: None,
+                },
+                principal,
+                table,
+                expected_schema_fingerprint: Some(
+                    crate::contracts::projected_source_schema_fingerprint(rows.schema().as_ref()),
+                ),
+                request_id,
+                batch_id,
+                measured_wire_bytes: 0,
+                payload: IngressPayload::Canonical(CanonicalIngress::unreserved(vec![rows])),
+            },
+        )
+        .await
+        .expect("durable append of the accepted subset");
+        assert_eq!(admission.rows_accepted, 2);
+        scribe
+            .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(5))
+            .await;
+
+        let replayed = replay_wal_directory(temp_dir.path()).expect("replay");
+        let state = replayed
+            .values()
+            .find(|state| !state.commits.is_empty())
+            .expect("one committed seal key");
+        assert_eq!(state.commits.len(), 1, "the batch produced exactly one fence");
+        assert_eq!(state.append_metas.len(), 1);
+        let commit = &state.commits[0];
+        let meta = &state.append_metas[0];
+        assert_eq!(commit.batch_id, *batch_id.as_bytes());
+        assert_eq!((commit.slice_count, meta.slice_count), (1, 1));
+        assert_eq!(meta.rows_accepted, 2);
+
+        assert_ne!(
+            commit.slice_set_digest, [0_u8; 32],
+            "the fence authenticates its one recovered slice"
+        );
+        assert_eq!(
+            commit.request_id.to_string(),
+            fence_request_id.as_str(),
+            "the fence carries the request that produced the accepted subset"
+        );
+
+        let recovered = arrow::ipc::reader::StreamReader::try_new(
+            Cursor::new(state.data_records[0].as_slice()),
+            None,
+        )
+        .expect("recovered Arrow stream")
+        .next()
+        .expect("one recovered batch")
+        .expect("recovered batch decodes");
+        assert_eq!(recovered.num_rows(), 2);
+        assert!(
+            recovered
+                .schema()
+                .fields()
+                .iter()
+                .any(|field| matches!(field.data_type(), arrow::datatypes::DataType::List(_))),
+            "recovery preserves the nested canonical columns"
+        );
+    }
+
     /// Proves production writer ordering emits each committed batch while an
     /// unrelated cross-segment slice set remains pending under a near-full
     /// replay root reservation.

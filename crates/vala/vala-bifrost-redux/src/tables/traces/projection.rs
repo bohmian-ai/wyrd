@@ -11,7 +11,7 @@
 //! [`super::spans::SPAN_FIELDS`]; nothing in this module restates them.
 
 use arrow::array::ArrayRef;
-use arrow::datatypes::{DataType, Field, Fields, Schema};
+use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 use std::sync::Arc;
 use wyrd_tonic::otlp::common::v1::KeyValue;
@@ -27,8 +27,8 @@ use crate::tables::fields::canonical_arrow_fields;
 use crate::tables::signal::{
     ResourceEnvelope, ScopeEnvelope, binary_column, bool_column, encode_attributes,
     fixed_binary_column, fixed_binary_opt_column, i32_column, i32_opt_column, i64_opt_column,
-    last_attribute, last_string_attribute, list_column, span_id_bytes, struct_column,
-    trace_id_bytes, u32_column, u64_column, utf8_column, utf8_opt_column,
+    internal, last_attribute, last_string_attribute, list_column, nested_fields, span_id_bytes,
+    struct_column, trace_id_bytes, u32_column, u64_column, utf8_column, utf8_opt_column,
 };
 
 /// Largest accepted span or event name, in bytes.
@@ -486,27 +486,6 @@ impl SpanColumns {
 #[must_use]
 pub fn canonical_span_schema() -> Arc<Schema> {
     Arc::new(Schema::new(canonical_arrow_fields(SPAN_FIELDS)))
-}
-
-/// Read the ordered child fields out of a declared struct element field.
-///
-/// # Errors
-///
-/// Returns [`TableError::Internal`] when the declaration is not a struct, which
-/// would mean the ledger and this projector disagree.
-fn nested_fields(element: &Field) -> Result<Fields, TableError> {
-    match element.data_type() {
-        DataType::Struct(children) => Ok(children.clone()),
-        other => Err(TableError::Internal(format!(
-            "canonical element {} is {other}, expected a struct",
-            element.name()
-        ))),
-    }
-}
-
-/// Wrap a stable assembly reason as an internal projection defect.
-fn internal(reason: &'static str) -> TableError {
-    TableError::Internal(reason.to_owned())
 }
 
 /// The pinned `GenAI` promotions extracted from one span's attributes.

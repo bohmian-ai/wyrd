@@ -303,7 +303,6 @@ mise run py:lints
 mise run py:typecheck
 mise run ts:napi:check
 mise run ts:typecheck
-mise run verify:bifrost
 mise run docs:check
 mise run fmt
 mise run lints

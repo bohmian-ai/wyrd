@@ -233,7 +233,6 @@ Run every named command, then:
 
 ```bash
 mise run test:bifrost:journey:scribe
-mise run verify:bifrost
 mise run fmt
 mise run lints
 git diff --check

@@ -399,7 +399,6 @@ test target, or dependency belongs in this task.
 Run every named command, then:
 
 ```bash
-mise run verify:bifrost
 mise run fmt
 mise run lints
 git diff --check

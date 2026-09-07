@@ -14,9 +14,10 @@ use arrow::array::{
     Int32Array, Int64Array, ListArray, StringArray, StructArray, UInt32Array, UInt64Array,
 };
 use arrow::buffer::OffsetBuffer;
-use arrow::datatypes::{Field, Fields, Schema};
+use arrow::datatypes::{DataType, Field, Fields, Schema};
 use arrow::record_batch::RecordBatch;
 
+use crate::tables::TableError;
 use crate::tables::fields::{self, CanonicalField, CanonicalType};
 use prost::Message;
 use prost::encoding::{WireType, encode_key};
@@ -425,6 +426,34 @@ pub fn struct_column(
     )
     .map(|array| Arc::new(array) as ArrayRef)
     .map_err(|_| "nested record does not match its declared fields")
+}
+
+/// Borrow the declared children of one nested struct element.
+///
+/// # Errors
+///
+/// Returns [`TableError::Internal`] when the declaration is not a struct, which
+/// would mean the ledger and its projector disagree.
+pub fn nested_fields(element: &Field) -> Result<Fields, TableError> {
+    match element.data_type() {
+        DataType::Struct(children) => Ok(children.clone()),
+        other => Err(TableError::Internal(format!(
+            "canonical element {} is {other}, expected a struct",
+            element.name()
+        ))),
+    }
+}
+
+/// Wrap a stable assembly reason as an internal projection defect.
+#[must_use]
+pub fn internal(reason: &'static str) -> TableError {
+    TableError::Internal(reason.to_owned())
+}
+
+/// Assemble one non-null `Float64` column.
+#[must_use]
+pub fn f64_column(values: Vec<f64>) -> ArrayRef {
+    Arc::new(Float64Array::from(values))
 }
 
 /// Read one binary array value, rejecting an unexpected null.

@@ -494,10 +494,119 @@ fn total_equality_deletes(plans: &[CompactionPlan]) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use super::super::policy::ForgeTablePolicy;
     use super::unbounded_context_for;
+    use iceberg_compaction_core::config::{CompactionPlanningConfig, DEFAULT_MAX_SELECTION_PLANS};
+    use iceberg_compaction_core::managed::{CandidateIdentity, IdentityAwareSelector};
     use std::sync::Arc;
     use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
+
+    /// Planning enumerates every eligible group, with no side effect.
+    ///
+    /// The pinned core caps selection at 1,024 groups by default, which would
+    /// silently drop work and — worse — leave the selection report describing
+    /// files the returned plans do not contain. Forge therefore configures the
+    /// cap away and defers by admission instead, so this exercises the exact
+    /// selection the shipped configuration performs over a fixture one group
+    /// past that default. Selection is pure: it takes identities and returns
+    /// groups, so no output write, SQL or audit mutation, catalog commit, or
+    /// queue offer is reachable from it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the shipped configuration reintroduces a plan cap, when the
+    /// selector returns fewer than every eligible group, or when the returned
+    /// groups are not in planner order.
+    #[test]
+    fn planning_returns_all_real_plans_before_admission() {
+        // The one geometry every candidate below is classified against.
+        let policy = ForgeTablePolicy {
+            target_file_size_bytes: 512 * 1024 * 1024,
+            row_group_target_bytes: 128 * 1024 * 1024,
+            small_file_threshold_bytes: 64 * 1024 * 1024,
+            schema_id: 7,
+            partition_spec_id: 3,
+            sort_order_id: 0,
+            writer_recipe: "v1".to_owned(),
+            data_location: "s3://bucket/table/data/forge/v1".to_owned(),
+        };
+
+        // The shipped configuration must not carry a plan cap at all.
+        let config = policy
+            .to_core_config("attempt".to_owned(), &[], 2)
+            .expect("the shipped core configuration builds");
+        let CompactionPlanningConfig::WyrdIdentityAware(planning) = &config.planning else {
+            panic!("Forge plans through the identity-aware policy");
+        };
+        assert_eq!(
+            planning.max_selection_plans,
+            usize::MAX,
+            "deferral is the queue's job, so selection must never truncate"
+        );
+        assert_eq!(
+            DEFAULT_MAX_SELECTION_PLANS, 1_024,
+            "the fixture below is sized one group past the core default"
+        );
+
+        // 1,025 oversized files: `Oversized` is individually actionable, so each
+        // one is its own group and the group count is exact rather than packing
+        // dependent.
+        let oversized_bytes = policy
+            .to_selection_policy()
+            .max_file_size_bytes()
+            .expect("the geometry has an oversized bound")
+            + 1;
+        let candidates = (0..1_025)
+            .map(|index| CandidateIdentity {
+                file_path: format!("s3://bucket/table/data/forge/v1/part-{index:05}.parquet"),
+                schema_id: policy.schema_id,
+                partition_spec_id: policy.partition_spec_id,
+                sort_order_id: Some(policy.sort_order_id),
+                partition_key: String::new(),
+                file_size_in_bytes: oversized_bytes,
+                min_event_time: None,
+                max_event_time: None,
+            })
+            .collect::<Vec<_>>();
+        let expected_paths = candidates
+            .iter()
+            .map(|candidate| candidate.file_path.clone())
+            .collect::<Vec<_>>();
+
+        let mut groups = IdentityAwareSelector::new(policy.to_selection_policy())
+            .expect("the selection policy is valid")
+            .select(candidates)
+            .expect("selection is total");
+        assert_eq!(
+            groups.len(),
+            1_025,
+            "every eligible group survives planning, including the 1,025th"
+        );
+        assert_eq!(
+            groups
+                .iter()
+                .map(|group| {
+                    assert_eq!(group.files.len(), 1, "an oversized file stands alone");
+                    group.files[0].file_path.clone()
+                })
+                .collect::<Vec<_>>(),
+            expected_paths,
+            "groups are returned in planner order, which is also queue-key order"
+        );
+
+        // The cap the core would otherwise apply is what this configuration
+        // removes: applying the default here loses the last group.
+        let complete = groups.len();
+        groups.truncate(planning.max_selection_plans);
+        assert_eq!(groups.len(), complete, "the shipped cap truncates nothing");
+        groups.truncate(DEFAULT_MAX_SELECTION_PLANS);
+        assert_eq!(
+            groups.len(),
+            1_024,
+            "the core default would have dropped the 1,025th group"
+        );
+    }
 
     /// The attempt's context executes unbounded and spills nowhere.
     ///

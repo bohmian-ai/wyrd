@@ -481,3 +481,259 @@ fn primitive_width(primitive: &PrimitiveType) -> Option<usize> {
     };
     Some(width)
 }
+
+#[cfg(test)]
+/// Branch coverage for the ported estimator.
+mod tests {
+    use std::sync::Arc;
+
+    use iceberg::spec::{DataFileFormat, FormatVersion, NestedField, PrimitiveType, Schema, Type};
+    use iceberg_compaction_core::compaction::CompactionPlan;
+    use iceberg_compaction_core::file_selection::FileGroup;
+
+    use super::{FileScanTask, estimate_plan_memory};
+
+    /// Builds a one-column schema of the given primitive type.
+    fn schema_of(primitive: PrimitiveType) -> Schema {
+        Schema::builder()
+            .with_schema_id(0)
+            .with_fields(vec![
+                NestedField::required(1, "value", Type::Primitive(primitive)).into(),
+            ])
+            .build()
+            .expect("a one-column schema builds")
+    }
+
+    /// Builds one scan task with an explicit compressed size and row count.
+    fn task(path: &str, bytes: u64, rows: Option<u64>, schema: &Schema) -> FileScanTask {
+        FileScanTask::builder()
+            .with_file_size_in_bytes(bytes)
+            .with_start(0)
+            .with_length(bytes)
+            .with_record_count(rows)
+            .with_data_file_path(path.to_string())
+            .with_data_file_format(DataFileFormat::Parquet)
+            .with_schema(Arc::new(schema.clone()))
+            .with_project_field_ids(vec![1])
+            .with_case_sensitive(true)
+            .build()
+    }
+
+    /// Assembles a plan from explicit data and delete groups.
+    fn plan_of(
+        data_files: Vec<FileScanTask>,
+        position_delete_files: Vec<FileScanTask>,
+        equality_delete_files: Vec<FileScanTask>,
+        executor_parallelism: usize,
+        output_parallelism: usize,
+    ) -> CompactionPlan {
+        let total_size = data_files.iter().map(|task| task.length).sum();
+        let data_file_count = data_files.len();
+        CompactionPlan::new(
+            FileGroup {
+                data_files,
+                position_delete_files,
+                equality_delete_files,
+                total_size,
+                data_file_count,
+                executor_parallelism,
+                output_parallelism,
+            },
+            "main",
+            1,
+        )
+    }
+
+    /// The port reproduces `origin/main`'s estimate on every branch it owns.
+    ///
+    /// Two fully hand-evaluated anchors pin the streaming and sorted arithmetic
+    /// to exact bytes, so any edit to a constant or an operator moves a number
+    /// this test names. The remaining cases pin the direction of each branch the
+    /// anchors cannot reach — schema fallback, prefetch overlap, both delete
+    /// shapes, the V3 deletion-vector exemption, parallelism, and saturation —
+    /// because each of those is a distinct upstream code path rather than a
+    /// scaling of the same one.
+    ///
+redacted
+    /// `src/storage/src/hummock/compactor/iceberg_compaction/memory.rs`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any anchor moves or when a branch stops changing the estimate
+    /// in the direction upstream's arithmetic requires.
+    #[test]
+redacted
+        let fixed = schema_of(PrimitiveType::Long);
+        let variable = schema_of(PrimitiveType::String);
+        let one_file = || vec![task("data-0.parquet", 10_000, Some(1_000), &fixed)];
+
+        // Anchor 1 — streaming, fixed-width schema, no deletes, no prefetch.
+        let streaming = plan_of(one_file(), Vec::new(), Vec::new(), 1, 1);
+        let streaming_bytes =
+            estimate_plan_memory(&streaming, &fixed, FormatVersion::V2, 1024, false, false);
+        assert_eq!(
+            streaming_bytes, 310_275,
+            "the streaming estimate is fixed by the ported constants"
+        );
+
+        // Anchor 2 — the same plan sorted, which pins the merge reservation,
+        // the sorted decoded retention, and the sorted headroom together.
+        let sorted_bytes =
+            estimate_plan_memory(&streaming, &fixed, FormatVersion::V2, 1024, false, true);
+        assert_eq!(
+            sorted_bytes, 21_136_097,
+            "the sorted estimate is fixed by the ported constants"
+        );
+
+        // A variable-width schema has no row width, so the estimator falls back
+        // to inflating compressed bytes and reaches the other writer branch.
+        let variable_bytes =
+            estimate_plan_memory(&streaming, &variable, FormatVersion::V2, 1024, false, false);
+        assert_ne!(
+            variable_bytes, streaming_bytes,
+            "a schema with no computable row width takes the fallback path"
+        );
+
+        // Prefetch stages the largest files per scan partition. It reaches the
+        // result only through the retained-operator term, which the large-sorted
+        // branch is the one that reads, so the fixture has to be a real
+        // large sort rather than the anchors above.
+        let large_sort = plan_of(
+            (0..4)
+                .map(|index| {
+                    task(
+                        &format!("bulk-{index}.parquet"),
+                        16 * 1024 * 1024,
+                        Some(3_000_000),
+                        &fixed,
+                    )
+                })
+                .collect(),
+            Vec::new(),
+            Vec::new(),
+            4,
+            4,
+        );
+        assert!(
+            estimate_plan_memory(&large_sort, &fixed, FormatVersion::V2, 1024, true, true)
+                > estimate_plan_memory(&large_sort, &fixed, FormatVersion::V2, 1024, false, true),
+            "staged compressed input adds to a large sort's retained operators"
+        );
+
+        // Equality deletes are broadcast and fully materialised.
+        let with_equality = plan_of(
+            one_file(),
+            Vec::new(),
+            vec![task("eq-0.parquet", 4_000, Some(100), &fixed)],
+            1,
+            1,
+        );
+        assert!(
+            estimate_plan_memory(
+                &with_equality,
+                &fixed,
+                FormatVersion::V2,
+                1024,
+                false,
+                false
+            ) > streaming_bytes,
+            "an equality-delete join adds its build side to the estimate"
+        );
+
+        // Pre-V3 position deletes build an anti-join hash table; a V3 deletion
+        // vector attaches to the data task and builds none, so the identical
+        // plan must cost less under V3.
+        let with_position = plan_of(
+            one_file(),
+            vec![task("pos-0.parquet", 4_000, Some(100), &fixed)],
+            Vec::new(),
+            1,
+            1,
+        );
+        let v2_position = estimate_plan_memory(
+            &with_position,
+            &fixed,
+            FormatVersion::V2,
+            1024,
+            false,
+            false,
+        );
+        let v3_position = estimate_plan_memory(
+            &with_position,
+            &fixed,
+            FormatVersion::V3,
+            1024,
+            false,
+            false,
+        );
+        assert!(
+            v2_position > streaming_bytes,
+            "a pre-V3 position-delete join adds its hash table to the estimate"
+        );
+        assert!(
+            v3_position < v2_position,
+            "a V3 deletion vector builds no join, so it must not be charged for one"
+        );
+
+        // Parallelism multiplies the concurrently allocated batches.
+        let wide = plan_of(
+            (0..8)
+                .map(|index| {
+                    task(
+                        &format!("data-{index}.parquet"),
+                        10_000,
+                        Some(1_000),
+                        &fixed,
+                    )
+                })
+                .collect(),
+            Vec::new(),
+            Vec::new(),
+            8,
+            4,
+        );
+        let narrow = plan_of(
+            (0..8)
+                .map(|index| {
+                    task(
+                        &format!("data-{index}.parquet"),
+                        10_000,
+                        Some(1_000),
+                        &fixed,
+                    )
+                })
+                .collect(),
+            Vec::new(),
+            Vec::new(),
+            1,
+            1,
+        );
+        assert!(
+            estimate_plan_memory(&wide, &fixed, FormatVersion::V2, 1024, true, false)
+                > estimate_plan_memory(&narrow, &fixed, FormatVersion::V2, 1024, true, false),
+            "more scan partitions hold more batches and prefetched files at once"
+        );
+
+        // Every accumulation saturates, so an absurd manifest yields a refusably
+        // large number rather than a wrapped small one or a panic.
+        let saturating = plan_of(
+            vec![task("huge.parquet", u64::MAX, Some(u64::MAX), &fixed)],
+            Vec::new(),
+            Vec::new(),
+            usize::MAX,
+            usize::MAX,
+        );
+        let saturated = estimate_plan_memory(
+            &saturating,
+            &fixed,
+            FormatVersion::V2,
+            usize::MAX,
+            true,
+            true,
+        );
+        assert!(
+            saturated > u64::MAX as usize / 2,
+            "saturating arithmetic keeps an absurd plan absurdly large"
+        );
+    }
+}

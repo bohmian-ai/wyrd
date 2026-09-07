@@ -1,6 +1,6 @@
 ---
 id: SPEC-bifrost-canonical-otel-signals
-revision: 7
+revision: 9
 status: approved
 ---
 
@@ -114,6 +114,15 @@ behavior.
   request in which at least one complete record was accepted and at least one
   complete record was rejected. It never means that part of a record was
   stored.
+- **Optional Card correlation:** a telemetry row may omit `card_ref`; the
+  authenticated `principal_id` still identifies its publisher and `card_uid`
+  is null. When present, `card_ref` selects one Card from the principal's
+  signed scope and resolves through the trusted Card-identity-to-UID mapping in
+  that signed claim.
+- **OTLP correlation attributes:** the final record-level `wyrd.card_ref` and
+  `wyrd.run_id` attributes, when present, project into the canonical
+  correlation columns. Earlier duplicate keys remain in the lossless attribute
+  payload but do not override the final value.
 
 ## Required behavior
 
@@ -134,13 +143,14 @@ independently encode table column order or field semantics.
 `wyrd-server` shall own bounded OTLP protobuf/JSON transport decoding into the
 repository's pinned generated OTLP types. Gate shall authenticate, authorize
 the tenant and requested operation, validate request identity, and route the
-decoded signal or canonical Arrow write. Gate shall assign contiguous row
-ordinals in request order before Scribe admission. `wyrd_event_time` is the
-sole managed column whose value may originate from signal data. For OTLP input,
-the table-owned projection shall derive its candidate value from the record's
-canonical signal timestamp. Canonical Arrow input may supply the same candidate
-column. Scribe shall validate the candidate against the configured event-time
-window and stamp server receipt time only when the candidate is absent. Gate
+decoded signal or transfer the canonical Arrow write to Scribe. Gate shall not
+decode Arrow, project OTLP fields, own table validation, or assign row
+ordinals. `wyrd_event_time` is the sole managed column whose value may
+originate from signal data. For OTLP input, the table-owned projection shall
+derive its candidate value from the record's canonical signal timestamp.
+Canonical Arrow input may supply the same candidate column. Scribe shall
+validate the candidate against the configured event-time window and stamp
+server receipt time only when the candidate is absent. Table-owned validation
 shall reject client-supplied values for every other server-managed column.
 Neither Gate nor the server transport shall own canonical table-field mapping.
 
@@ -148,12 +158,13 @@ Neither Gate nor the server transport shall own canonical table-field mapping.
 
 Scribe shall own admission, server-managed and correlation-column stamping,
 partition validation, WAL encoding and fsync, durable batch fencing, memtable
-authority, staging, replay, recovery, and acknowledgement. Scribe shall accept
-only a table-validated canonical user-column `RecordBatch` plus trusted Gate
-context. It shall materialize the server-managed and correlation envelope,
-including Gate-assigned row ordinals, before WAL encoding. It shall neither
-accept decoded OTLP signal types nor invoke OTLP semantic projection, and it
-shall contain no signal-specific schema copy.
+authority, staging, replay, recovery, and acknowledgement. Scribe may invoke
+the table-owned canonical validator while consuming transferred Arrow IPC, but
+shall not own or duplicate its schema rules. It shall materialize the
+server-managed and correlation envelope and assign contiguous zero-based row
+ordinals across the complete logical request before WAL encoding. It shall
+neither accept decoded OTLP signal types nor invoke OTLP semantic projection,
+and it shall contain no signal-specific schema copy.
 
 #### REQ-004 — One canonical persistence path
 
@@ -167,6 +178,39 @@ shall already carry the canonical user schema and shall undergo table-owned
 schema and value validation without semantic re-projection. The two paths
 shall converge before WAL preparation. Transport choice shall not change
 stored semantics, row identity, durability, tenancy, or query results.
+
+#### REQ-022 — Optional Card correlation and trusted UID resolution
+
+Every accepted public ingest row shall carry the non-null `principal_id`
+derived from its required verified principal token. `card_ref` is optional. An
+absent or null `card_ref` shall be accepted and shall produce a null
+`card_uid`; the server shall not infer a Card from the principal's root Card.
+
+When `card_ref` is present, the server shall parse its exact
+`(kind, space, name, version)` identity, require that identity in the
+principal's signed Card scope, and stamp only the `card_uid` paired with that
+identity by trusted signed claims. Token mint and refresh shall resolve each
+scoped Card against the tenant-local Card registry and include the resulting
+bounded identity-to-UID mapping in the signed principal claims. Ingest shall
+perform no Postgres lookup or new cache lookup for Card resolution.
+
+For OTLP input, the table owner shall read optional correlation only from the
+record-level attributes named exactly `wyrd.card_ref` and `wyrd.run_id`. The
+final occurrence of a duplicate key is authoritative, matching the existing
+OTLP attribute lookup rule. `wyrd.card_ref` shall use the existing compact
+`CardRef` grammar; a supplied `#uid` suffix is accepted as syntax but is
+untrusted and ignored during authorization and UID resolution. `wyrd.run_id`
+shall use the existing `RunId` text grammar. Projection shall retain every
+original attribute entry losslessly. A final occurrence with the wrong OTLP
+value type or malformed text shall reject only that record under REQ-005.
+
+A malformed, out-of-scope, or signed-scope entry without a trusted UID shall
+fail closed. OTLP applies that refusal atomically to each affected record under
+REQ-005; canonical Arrow retains whole-write schema/value refusal. The table
+owner extracts transport-specific Card correlation, Gate remains responsible
+only for principal authentication, operation authorization, and routing, and
+Scribe stamps the already-authorized correlation without acquiring Card
+registry authority.
 
 #### REQ-005 — Atomic records and standard OTLP batch results
 
@@ -461,6 +505,13 @@ The change shall extend the existing Bifrost harness, table registry, public
 ingest routes, Scribe path, Forge publication, and Oracle query owners. A new
 harness or parallel ingest/query implementation is prohibited.
 
+#### INV-011 — Publisher identity without mandatory Card identity
+
+An accepted public ingest row always identifies its authenticated publisher by
+`principal_id`. Missing Card correlation never causes the server to substitute
+the principal's root Card, and resolving a present `card_ref` never adds
+Postgres or a new cache to the ingest hot path.
+
 ## Externally observable behavior and failures
 
 - An authorized OTLP client can export complete traces, logs, and every
@@ -511,17 +562,17 @@ OTLP protobuf/JSON
   -> wyrd-server bounded transport decode
   -> Gate authentication, authorization, tenant and request routing
   -> table-owned signal projection
-  -> canonical TableRef + validated user-column RecordBatch + trusted Gate context
-  -> Gate contiguous row-ordinal assignment
-  -> Scribe managed-envelope materialization, partitioning, admission, WAL and live authority
+  -> canonical TableRef + user-column RecordBatch + trusted request context
+  -> Scribe request-wide row-ordinal and managed-envelope materialization
+  -> partitioning, admission, WAL and live authority
   -> Forge publication and maintenance
   -> Oracle canonical query result
 
 Canonical Arrow IPC
   -> Gate authentication, authorization, tenant and request routing
-  -> table-owned canonical schema/value validation
-  -> canonical TableRef + validated user-column RecordBatch + trusted Gate context
-  -> the same Gate ordinal, Scribe, Forge and Oracle path
+  -> ownership transfer to Scribe
+  -> table-owned canonical schema/value validation invoked by Scribe
+  -> the same Scribe ordinal, managed-envelope, Forge and Oracle path
 ```
 
 No client or route may supply server-managed columns other than the validated
@@ -642,6 +693,16 @@ existing owner rather than a new parallel suite. A new test owner is permitted
 only when no existing owner can execute the required public boundary, and that
 gap must be demonstrated before the new owner is created.
 
+#### AC-012 — Optional Card correlation without ingest IO
+
+Existing auth and Bifrost tests shall prove that an authenticated row without
+`card_ref` is accepted with non-null `principal_id` and null `card_uid`; root
+and secondary scoped references receive the UID paired with their identity in
+verified signed claims; malformed, unmapped, and out-of-scope references fail
+closed; OTLP uses the exact approved record keys, final-entry behavior, and
+existing text grammars while retaining the original attributes; and no tenant
+Card-registry query or new cache participates in ingest.
+
 ## Open material decisions
 
 None.
@@ -654,6 +715,9 @@ this specification:
 - the smallest cohesive task boundaries for contracts, canonical table
   schemas/projections, Scribe convergence, query adaptation, stale deletion,
   generated artifacts, and integrated journeys;
+- the smallest signed-claim representation that preserves each bounded scoped
+  Card identity with its tenant-registry-resolved UID through mint, refresh,
+  verification, and in-memory ingest lookup;
 - the exact lossless Arrow/Parquet representation for OTLP `AnyValue` and
   nested collections, using the pinned dependency capabilities;
 - the deletion and replacement order for the pre-release schemas and stale
@@ -673,6 +737,17 @@ choice.
 
 ## Revision history
 
+- Revision 9 (2026-09-07): bind optional OTLP Card and Run correlation to the
+  exact record-level `wyrd.card_ref` and `wyrd.run_id` attributes, reuse the
+  existing `CardRef` and `RunId` text grammars, retain last-entry lookup
+  semantics and lossless source attributes, and ignore any client-supplied
+  Card UID during trusted scope resolution.
+- Revision 8 (2026-09-07): make Card correlation optional while retaining
+  required authenticated publisher identity; resolve present Card references
+  from a bounded trusted identity-to-UID mapping populated during token mint
+  and refresh with no Postgres or new cache on the ingest hot path; restore
+  Gate to authentication and routing; and assign request-wide row ordinals in
+  Scribe.
 - Revision 7 (2026-09-06): preserve the existing all-rejected OTLP response,
   add lossless metric metadata, and require reuse or extension of existing
   tests, fixtures, journeys, integration targets, and topology owners instead

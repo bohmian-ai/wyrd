@@ -33,8 +33,15 @@ Required execution skill: `$wyrd-implement`.
   stamping, request-wide ordinals, WAL, fence, replay, and ACK.
 - `wyrd-auth` enriches the existing bounded `CardRefScope` during token mint and
   refresh. The existing compact claim remains the sole Card-scope contract.
-- OTLP correlation uses the exact record attributes `wyrd.card_ref` and
+- `card_ref` is supplied per record by the client. It is never derived from the
+  authenticated principal or replaced with the principal's root Card. OTLP
+  correlation uses the exact record attributes `wyrd.card_ref` and
   `wyrd.run_id` under approved spec revision 9.
+- Every present client-supplied `card_ref` must match an exact
+  `(kind, space, name, version)` identity in the authenticated principal's
+  verified signed `CardRefScope`. Scribe stamps only the UID paired with that
+  exact scope member. Missing or null `card_ref` is valid and stamps null
+  `card_uid`; malformed, UID-less, or out-of-scope values fail closed.
 - No Gate Arrow decoder, table projector, schema validator, ordinal owner, new
   claim object, ingest Postgres/cache lookup, resolver trait, validator trait,
   second table registry, WAL version, digest change, dependency, migration,
@@ -72,11 +79,13 @@ callers, token ceiling, and string serialization.
 
 ## Scenario 2 — Every signal table applies the approved OTLP contract
 
-**Behavior.** Each table reads only the final record-level `wyrd.card_ref` and
-`wyrd.run_id`. Missing values project null. Valid strings use existing
-`CardRef` and `RunId` grammars. Wrong-typed or malformed final values reject
-only that record. All original attributes remain losslessly stored. Maps
-REQ-001, REQ-005, REQ-022, INV-010, and AC-011/AC-012.
+**Behavior.** The client supplies optional correlation independently on each
+record. Each table reads only the final record-level `wyrd.card_ref` and
+`wyrd.run_id`; neither the table nor any downstream owner derives `card_ref`
+from the authenticated principal. Missing values project null. Valid strings
+use existing `CardRef` and `RunId` grammars. Wrong-typed or malformed final
+values reject only that record. All original attributes remain losslessly
+stored. Maps REQ-001, REQ-005, REQ-022, INV-010, and AC-011/AC-012.
 
 **RED.** Add:
 
@@ -107,11 +116,14 @@ transport-specific mapping belongs in Gate or Scribe.
 
 ## Scenario 3 — Scribe stamps optional and scoped Card correlation
 
-**Behavior.** Every accepted row receives non-null `principal_id`. Missing or
-null `card_ref` yields null `card_uid`. Root and secondary identities get their
-own signed UIDs. Malformed, UID-less, or out-of-scope assertions fail closed
-without registry IO. Maps REQ-002/REQ-003/REQ-022, INV-007/INV-011, and
-AC-006/AC-012.
+**Behavior.** Every accepted row receives non-null `principal_id`. A missing or
+null client-supplied `card_ref` yields null `card_uid`; Scribe never substitutes
+the principal's root Card. Every present client-supplied `card_ref` must match
+an exact identity in the authenticated principal's verified signed
+`CardRefScope` before the corresponding trusted UID is stamped. Root and
+secondary identities get their own signed UIDs. Malformed, UID-less, or
+out-of-scope assertions fail closed without registry IO. Maps
+REQ-002/REQ-003/REQ-022, INV-007/INV-011, and AC-006/AC-012.
 
 **RED.** Add
 `scribe::execution_lanes::tests::optional_and_scoped_card_correlations_stamp_trusted_uids`.
@@ -134,10 +146,12 @@ construct the server without an ingest Card resolver.
 mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-testing --test scribe -P journey --run-ignored=all -E 'test(=write_read::scribe_optional_and_scoped_card_correlation_journey)'"
 ```
 
-**GREEN.** Keep nulls valid in Scribe's scope validator. For non-null parsed
-identity, use `CardRefScope::authorizes`, find the same verified member by
-`same_identity`, require its UID, and stamp that UID. Never substitute the
-principal root or client UID.
+**GREEN.** Keep missing and null client correlation valid. For every present
+client-supplied `card_ref`, parse its exact `(kind, space, name, version)`, call
+`CardRefScope::authorizes` against the authenticated principal's verified signed
+scope, find that same member by `same_identity`, require its trusted UID, and
+stamp only that UID. Reject the row when any step fails. Never derive or
+substitute the principal's root Card, and never trust a client-supplied UID.
 
 **REFACTOR.** Reuse `CardRef`, `CardRefScope`, and the existing mint-time
 registry walk. Remove root-only UID substitution reached by the test.
@@ -321,3 +335,221 @@ Return those to `$wyrd-spec`.
 Append scenario-by-scenario results, exact commands/outcomes, final changed-file
 audit, consumer closure, and independently proven baseline failures. Do not edit
 the immutable parent task.
+
+---
+
+## Execution evidence
+
+Six commits, one per scenario, on `oracle-distributed`:
+
+| Scenario | Commit |
+| --- | --- |
+| 1 — signed scope carries every authoritative UID | `2fc97abbd` |
+| 2 — every signal table applies the OTLP contract | `4ebec40fc` |
+| 3 — Scribe stamps optional and scoped Card correlation | `90c217c4c` |
+| 4 — native Arrow ordinals span the complete request | `0605df84c` |
+| 5 — registry validation preserves canonical physical identity | `2a72148ca` |
+| 6 — replay proves identity, digest, and physical schema | `25607e294` |
+
+### Scenario 1 — signed scope preserves every authoritative Card UID
+
+RED: `wyrd-auth` scope-walk tests failed because `resolve_card_ref_scope` dropped
+the registry UID off every non-root member. GREEN: the walk now carries the
+resolved UID onto each expanded `Spec::Service.components[].ref` member.
+REFACTOR: none beyond documenting `# Errors`/`# Panics` on the walk.
+
+### Scenario 2 — every signal table applies the approved OTLP contract
+
+RED: the three named projector tests
+(`traces|logs|metrics::tests::optional_card_correlation_is_atomic_and_lossless`)
+failed — no projector read `wyrd.card_ref` / `wyrd.run_id`.
+
+GREEN: one shared tri-state extractor in `tables/signal.rs`
+(`RecordCorrelation::extract`) reuses the existing final-entry attribute lookup
+and identifier parsers, and is called by all three table-owned projectors before
+they mutate their accumulators. Missing, valid, duplicate (final wins),
+wrong-typed, and malformed values are proven for traces, logs, and metrics; a
+wrong-typed or malformed value rejects only its own record (REQ-005 atomicity),
+and every original OTLP attribute is preserved losslessly. `card_ref` is read
+per record from the client payload and is never derived from the authenticated
+principal. Two nullable correlation columns are appended for Scribe; Gate stays
+authentication/routing only.
+
+REFACTOR: `signal::without_correlation_columns` splits the two appended columns
+back off, so every authority that compares a batch against its declared ledger —
+schema identity, IPC/Parquet round trips — reads the ledger projection rather
+than a special-cased column count.
+
+### Scenario 3 — Scribe stamps optional and scoped Card correlation
+
+RED: `optional_and_scoped_card_correlations_stamp_trusted_uids` failed — the
+decoder resolved UIDs from the principal's own root Card.
+
+GREEN: `resolve_card_uids` now decides entirely from signed claims. A null row
+resolves to a null `card_uid` and consults no scope at all, so an uncorrelated
+batch never needs a scope. A present reference must parse, must be authorized by
+the principal's verified `CardRefScope`, and must match a signed member by exact
+identity; only that member's signed UID is stamped. A client-supplied UID is
+never trusted and the principal root is never substituted. No registry, Postgres,
+or cache lookup is performed on the ingest path — resolution reads
+`Principal::card_ref_scope()` only.
+
+### Scenario 4 — native Arrow ordinals span the complete request
+
+RED: `canonical_nested_batches_share_one_managed_wal_path` failed — each record
+batch of one Arrow IPC stream restarted its ordinals at zero.
+
+GREEN: `NativeSliceProducer` owns a request-wide `next_row_ordinal` cursor,
+passes it into `DecodeContext::start_row_ordinal`, and advances it with checked
+arithmetic (`TooManyRows` on overflow). The fixture drives the real metrics
+projection through both payload modes, so the canonical batch and the split
+Arrow stream must read back identical user columns and the same contiguous
+`0..total_rows`.
+
+REFACTOR: the six-plus stamping parameters became `DecodeContext`, which also
+removed two `too_many_arguments` violations.
+
+### Scenario 5 — registry validation preserves canonical physical identity
+
+RED: `tables::tests::builtin_registry_dispatches_canonical_value_validation` and
+`tables::tests::resolved_identity_rejects_normalized_physical_drift` failed —
+`BuiltinTableDefinition` had no validator member.
+
+GREEN: one function-pointer alias `CanonicalBatchValidator`, a
+`canonical_validator: Option<CanonicalBatchValidator>` field on
+`BuiltinTableDefinition`, a default-`None` `DomainTable::CANONICAL_VALIDATOR`
+associated const (the existing constructor is a `const fn`, so this had to be an
+associated const rather than a method), and one line copying it in `definition`.
+Traces and logs supply thin wrappers around `validate_canonical_user_batch`;
+metrics reuses the existing `validate_metric_points`; the other eleven built-ins
+stay `None`.
+
+Native and canonical planning resolve that definition once from the frame's
+`TableRef` (`ScribeIngress::canonical_definition`) and carry it to the decode.
+`enforce_canonical_source_contract` rejects a duplicate column name and any
+unknown `wyrd_*` field, lifts the permitted correlations (`card_ref`, `run_id`,
+`wyrd_event_time`), invokes the table's validator, and requires the remaining
+user fields to equal `(definition.arrow_fields)()` exactly before stamping.
+Stamping then constructs only the arrays: every correlation and managed `Field`
+is cloned from `(definition.schema)()`, the locally assembled field list is
+compared against it first, and `enforce_canonical_physical_identity` re-derives
+the `CanonicalPhysicalFingerprint` and compares it with
+`ResolvedSchemaIdentity::for_builtin`. Dynamic and pre-declared tables resolve to
+`None` and keep the existing `SchemaFingerprint` and managed-field policy.
+
+The Scenario 4 persistence test now writes to the real `vala.metrics.points`
+built-in and asserts every stored managed `Field` equals the table-owned physical
+field, plus the tenant isolation value on every row.
+
+REFACTOR: no validator trait, table enum, Scribe table-name match, second
+registry, or change to the Iceberg-facing normalized fingerprint. The drift test
+was split into one named helper purely to satisfy `clippy::too_many_lines`.
+
+### Scenario 6 — replay proves identity, digest, and physical schema
+
+RED: the strengthened
+`scribe::replay::tests::nested_accepted_subset_replays_one_fence_and_digest`
+asserted properties the previous test never checked.
+
+GREEN: no production digest change was required. The fence digest is recomputed
+independently from the recovered slices in ordinal order as
+`slice_index || schema_fingerprint || logical_data_digest || logical_data_len`
+(reusing `LogicalBatchDigest` and `logical_data_identity`) and compared with
+`ReplayedCommitIdentity::slice_set_digest`; every recovered slice is decoded and
+compared field-for-field with `(definition.schema)().fields()` and by
+`CanonicalPhysicalFingerprint` against `ResolvedSchemaIdentity::for_builtin`; a
+second `replay_wal_directory` must restore one commit with the same fence
+identity, the same slice identities, and the same bytes; and a valid, CRC-clean
+WAL frame carrying an Arrow stream truncated inside its first `RecordBatch` body
+must make `Memtable::decode_replayed` refuse with the existing
+`replayed Arrow IPC decode failed` and return no `FrozenMemtable`.
+
+REFACTOR (recorded here, not in the immutable parent task): **T02 conflated the
+WAL payload digest with the distinct logical SQL-fence digest.** They answer
+different questions and the v6 COMMIT persists both. `validate_pending_batch`
+recomputes `slice_set_digest(...)` over frame payloads and compares it with
+`identity.wal_digest`; `replayed_commit_identity` is separately handed
+`identity.logical_digest` for the fence. The production wiring is already
+correct; the parent task's prose treated them as one value, which is why the
+original test could pass while proving neither.
+
+### Broader verification
+
+| Command | Outcome |
+| --- | --- |
+| every scenario-named focused command | pass |
+| `mise run test:bifrost:journey:scribe` | 20 passed, 0 failed |
+| `mise run codegen:check` | All checks passed |
+| `mise run fmt` | clean |
+| `mise run lints` | clean |
+| `mise exec -- cargo nextest run -p vala-bifrost-redux --lib --features test-support,bench-support` | 950 passed, 5 failed (all baseline, below) |
+| `mise run test:wyrd` | see baseline analysis below |
+| `mise run verify:bifrost` | fails only on `check:tenant-isolation`, entirely in `vala-sql` files this task does not touch |
+| `git diff --check` | clean |
+
+### Independently proven pre-existing baseline failures
+
+None of these lie in this task's write set; each was attributed to a commit or
+file outside it.
+
+**`vala-bifrost-redux` (5).** Reproduced before any Scenario 2–6 edit by stashing
+the crate's working tree (`git stash push -- crates/vala`) and rerunning the lane:
+
+- `catalog::bifrost_catalog::production_pin_tests::pinned_provider_refuses_a_snapshot_the_table_does_not_publish`
+- `catalog::bifrost_catalog::production_pin_tests::pinned_snapshot_decodes_manifest_event_time_by_writer_field_id`
+- `parquet::memory::tests::bifrost_footer_fingerprint_does_not_alias_utc_spellings`
+- `scribe::persistence::tests::persist_once_emits_compression_telemetry`
+- `scribe::persistence::tests::persistence_runtime_registers_idle_queue_gauges`
+
+**Named in the task instruction as out of scope, reproduced unchanged.**
+
+- `wyrd-spec query::tests::display_parse_roundtrip_for_small_queries`.
+- The seven `wyrd-auth-verify verify_external_*` reqwest panics.
+
+Both still fail with the same signature they had before this task; neither is in
+a file this task touches.
+
+**`wyrd-testing` (6).** Already recorded in `fcb53a31e` as baseline defects
+inside `crates/wyrd/wyrd-testing/src/bifrost/`: the five
+`bifrost::forge_harness::worker_lifecycle_tests::*` fixture failures and
+`bifrost::scribe_workload::tests::scribe_workload_read_boundaries_may_not_reuse_an_earlier_read`.
+
+**`wyrd-sql tests::transaction_discipline_is_documented`.** Documentation drift,
+not code: the test asserts
+`architecture/v1/00-foundations/sql-foundation.md` contains the sentence
+"Every tenant-scoped logical operation opens exactly one". `grep` finds no such
+string in that file, whose last commit is `68919ba05` ("docs: align Wyrd skills
+and architecture authority", 2026-08-28) — an ancestor of `HEAD~6`, so it
+predates every commit in this task.
+
+**`wyrd-server` `pg_*` and `state::tests::with_limits_updates_all_fields`.**
+Load-dependent flakes in the family lane, not a regression. The failing set
+differs on every run of `mise run test:wyrd` (11, 13, then 16 failures with
+different members each time), and each one passes in isolation under the lane's
+own Postgres wrapper — e.g.
+`scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p wyrd-server --test pg_authz_check_route -E 'test(=authz_delegated_token_allows)'"`
+passes. Nothing in this task touches `wyrd-server`, auth routes, or bootstrap.
+
+**`check:tenant-isolation` / `check:bifrost`.** Every finding is in
+`crates/vala/vala-sql/{migrations/20260910000019_forge_task_failure_taxonomy.sql,
+migrations/20260910000022_oracle_admission_blocks.sql,
+src/queries/oracle_admission.rs, src/queries/scribe_batch_commits.rs}`, last
+touched by `9aba79645` and `d65d7af60` — the in-flight Forge and
+Oracle-admission work, not this task. `check:bifrost` fails only because it
+aggregates `check:tenant-isolation`.
+
+No test, gate, or check was weakened, ignored, deleted, or allow-listed.
+
+### Cumulative closure of FIND-02-1 through FIND-02-4
+
+- **FIND-02-1** (scope dropped authoritative UIDs) — Scenario 1: the scope walk
+  carries every resolved member UID, and Scenario 3 stamps only those.
+- **FIND-02-2** (per-record OTLP correlation unimplemented) — Scenario 2: one
+  shared extractor, all three tables, atomic and lossless.
+- **FIND-02-3** (native Arrow ordinals restarted per record batch) — Scenario 4:
+  one request, one contiguous checked ordinal range, proven in both payload
+  modes.
+- **FIND-02-4** (canonical physical identity unenforced at ingest and unproven at
+  replay) — Scenario 5 enforces it on the write path from the table's own
+  registry definition; Scenario 6 proves it survives recovery and that a
+  structurally invalid Arrow body fails closed.

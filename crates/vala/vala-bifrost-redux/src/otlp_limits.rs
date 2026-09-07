@@ -130,7 +130,6 @@ impl OtlpCounts {
         }
         Ok(())
     }
-
 }
 
 /// Adds one bounded counter.

@@ -7,11 +7,10 @@ use arrow::array::{
 use arrow::datatypes::{
     ArrowPrimitiveType, DataType, Date32Type, Date64Type, Decimal128Type, Decimal256Type,
     DurationMicrosecondType, DurationMillisecondType, DurationNanosecondType, DurationSecondType,
-    Field, Float16Type, Float32Type, Float64Type, Int8Type, Int16Type, Int32Type, Int64Type,
-    Fields, IntervalDayTimeType, IntervalMonthDayNanoType, IntervalUnit, IntervalYearMonthType,
-    Schema,
-    Time32MillisecondType, Time32SecondType, Time64MicrosecondType, Time64NanosecondType, TimeUnit,
-    TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
+    Field, Fields, Float16Type, Float32Type, Float64Type, Int8Type, Int16Type, Int32Type,
+    Int64Type, IntervalDayTimeType, IntervalMonthDayNanoType, IntervalUnit, IntervalYearMonthType,
+    Schema, Time32MillisecondType, Time32SecondType, Time64MicrosecondType, Time64NanosecondType,
+    TimeUnit, TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
     TimestampSecondType, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
 };
 
@@ -213,7 +212,9 @@ impl BatchFacts {
             if array.len() != batch.num_rows() {
                 return Err(ScribeError::InvalidFrame);
             }
-            visit_nodes(field, array.as_ref(), 0, &mut |array| facts.push_node(array))?;
+            visit_nodes(field, array.as_ref(), 0, &mut |array| {
+                facts.push_node(array)
+            })?;
         }
         Ok(facts)
     }
@@ -235,7 +236,9 @@ impl BatchFacts {
                 .map_err(|_| material_overflow())?,
         };
         self.node_count += 1;
-        array_buffers(array, &mut |source, length| self.push_buffer(source, length))
+        array_buffers(array, &mut |source, length| {
+            self.push_buffer(source, length)
+        })
     }
 
     /// Records one physical buffer and advances the aligned body cursor.
@@ -771,10 +774,7 @@ fn field_children(data_type: &DataType) -> Fields {
 ///
 /// Returns [`ScribeError::InvalidFrame`] when the field carries more than
 /// [`MAX_FIELD_METADATA`] entries, and propagates checked layout failures.
-fn write_custom_metadata(
-    writer: &mut FlatWriter<'_>,
-    field: &Field,
-) -> Result<usize, ScribeError> {
+fn write_custom_metadata(writer: &mut FlatWriter<'_>, field: &Field) -> Result<usize, ScribeError> {
     let mut entries: [Option<(&str, &str)>; MAX_FIELD_METADATA] = [None; MAX_FIELD_METADATA];
     let mut count = 0_usize;
     for (key, value) in field.metadata() {
@@ -1681,7 +1681,10 @@ mod tests {
         );
 
         let quantile_fields: Fields = vec![
-            Arc::new(with_id(Field::new("quantile", DataType::Float64, false), 21)),
+            Arc::new(with_id(
+                Field::new("quantile", DataType::Float64, false),
+                21,
+            )),
             Arc::new(with_id(Field::new("value", DataType::Float64, true), 22)),
         ]
         .into();
@@ -1753,10 +1756,11 @@ mod tests {
             true,
         );
         let schema = Arc::new(Schema::new(vec![field]));
-        let mut values = arrow::array::StringDictionaryBuilder::<arrow::datatypes::Int32Type>::new();
+        let mut values =
+            arrow::array::StringDictionaryBuilder::<arrow::datatypes::Int32Type>::new();
         values.append_value("alpha");
-        let batch =
-            RecordBatch::try_new(schema, vec![Arc::new(values.finish()) as ArrayRef]).expect("valid dictionary batch");
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(values.finish()) as ArrayRef])
+            .expect("valid dictionary batch");
 
         assert!(matches!(
             FixedIpcPlan::count(&batch),

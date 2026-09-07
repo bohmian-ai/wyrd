@@ -484,10 +484,11 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> Gate<R,
         }
         crate::otlp_limits::enforce_trace_limits(&decoded.request, decoded.wire_bytes, self.limits)
             .map_err(IngestError::from_scribe)?;
-        let (batch, outcome) = crate::tables::traces::project_resource_spans(
-            &decoded.request.resource_spans,
-        )
-        .map_err(|error| IngestError::Internal(format!("trace projection failed: {error}")))?;
+        let (batch, outcome) =
+            crate::tables::traces::project_resource_spans(&decoded.request.resource_spans)
+                .map_err(|error| {
+                    IngestError::Internal(format!("trace projection failed: {error}"))
+                })?;
         self.dispatch_canonical(
             auth,
             TableRef::new(BifrostNamespace::Traces, "spans"),
@@ -523,10 +524,11 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> Gate<R,
             self.limits,
         )
         .map_err(IngestError::from_scribe)?;
-        let (batch, outcome) = crate::tables::metrics::project_resource_metrics(
-            &decoded.request.resource_metrics,
-        )
-        .map_err(|error| IngestError::Internal(format!("metric projection failed: {error}")))?;
+        let (batch, outcome) =
+            crate::tables::metrics::project_resource_metrics(&decoded.request.resource_metrics)
+                .map_err(|error| {
+                    IngestError::Internal(format!("metric projection failed: {error}"))
+                })?;
         self.dispatch_canonical(
             auth,
             TableRef::new(BifrostNamespace::Metrics, "points"),
@@ -558,11 +560,10 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> Gate<R,
         }
         crate::otlp_limits::enforce_log_limits(&decoded.request, decoded.wire_bytes, self.limits)
             .map_err(IngestError::from_scribe)?;
-        let (batch, outcome) =
-            crate::tables::logs::project_resource_logs(&decoded.request.resource_logs)
-                .map_err(|error| {
-                    IngestError::Internal(format!("log projection failed: {error}"))
-                })?;
+        let (batch, outcome) = crate::tables::logs::project_resource_logs(
+            &decoded.request.resource_logs,
+        )
+        .map_err(|error| IngestError::Internal(format!("log projection failed: {error}")))?;
         self.dispatch_canonical(
             auth,
             TableRef::new(BifrostNamespace::Logs, "records"),
@@ -873,8 +874,8 @@ mod tests {
 
     use super::limits::IngestLimits;
     use super::{AuthContext, Gate, IngestError};
-    use arrow::record_batch::RecordBatch;
     use crate::contracts::DecodedOtlp;
+    use arrow::record_batch::RecordBatch;
     use async_trait::async_trait;
     use futures_util::StreamExt as _;
     use wyrd_auth_oidc::IssuerConfigResolver;
@@ -1314,7 +1315,11 @@ mod tests {
         wyrd_tonic::otlp::trace::v1::ResourceSpans {
             scope_spans: vec![wyrd_tonic::otlp::trace::v1::ScopeSpans {
                 spans: vec![wyrd_tonic::otlp::trace::v1::Span {
-                    trace_id: if valid { vec![index; 16] } else { vec![index; 3] },
+                    trace_id: if valid {
+                        vec![index; 16]
+                    } else {
+                        vec![index; 3]
+                    },
                     span_id: vec![index; 8],
                     name: format!("span-{index}"),
                     start_time_unix_nano: 1,

@@ -685,9 +685,11 @@ fn stamp_correlation_columns(
     let mut fields = user_fields(rows, &server_owned);
     let mut columns = user_columns(rows, &server_owned);
     fields.push(Field::new(RUN_ID, DataType::Utf8, true));
-    columns.push(caller_run_id.unwrap_or_else(|| {
-        Arc::new(StringArray::from(vec![None::<&str>; row_count])) as ArrayRef
-    }));
+    columns.push(
+        caller_run_id.unwrap_or_else(|| {
+            Arc::new(StringArray::from(vec![None::<&str>; row_count])) as ArrayRef
+        }),
+    );
     columns.push(Arc::new(StringArray::from(card_uids)) as ArrayRef);
     columns.push(Arc::new(StringArray::from(vec![
         principal.id.to_string();
@@ -2416,7 +2418,9 @@ mod tests {
             vec![Arc::new(StringArray::from(vec!["client-run"]))],
         );
         let error = decode(
-            IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![rows.clone()])),
+            IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![
+                rows.clone(),
+            ])),
             &principal(),
             source_schema_fingerprint(rows.schema().as_ref()),
             &RequestId::now_v7(),
@@ -2572,7 +2576,9 @@ mod tests {
             ]))],
         );
         let error = decode(
-            IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![rows.clone()])),
+            IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![
+                rows.clone(),
+            ])),
             &principal,
             source_schema_fingerprint(rows.schema().as_ref()),
             &RequestId::now_v7(),
@@ -2599,7 +2605,9 @@ mod tests {
             ],
         );
         let decoded = decode(
-            IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![rows.clone()])),
+            IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![
+                rows.clone(),
+            ])),
             &principal(),
             source_schema_fingerprint(rows.schema().as_ref()),
             &RequestId::now_v7(),
@@ -2637,7 +2645,9 @@ mod tests {
         );
         let batch_id = Uuid::now_v7();
         let decoded = decode(
-            IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![rows.clone()])),
+            IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![
+                rows.clone(),
+            ])),
             &principal(),
             source_schema_fingerprint(rows.schema().as_ref()),
             &RequestId::now_v7(),
@@ -2661,7 +2671,9 @@ mod tests {
             vec![Arc::new(Int64Array::from(vec![1_i64, 2_i64, 3_i64]))],
         );
         let decoded = decode(
-            IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![rows.clone()])),
+            IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![
+                rows.clone(),
+            ])),
             &principal(),
             source_schema_fingerprint(rows.schema().as_ref()),
             &RequestId::now_v7(),
@@ -2686,7 +2698,9 @@ mod tests {
             vec![Arc::new(Int64Array::from(vec![1_i64]))],
         );
         let decoded = decode(
-            IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![rows.clone()])),
+            IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![
+                rows.clone(),
+            ])),
             &principal(),
             source_schema_fingerprint(rows.schema().as_ref()),
             &RequestId::now_v7(),
@@ -2710,7 +2724,9 @@ mod tests {
             vec![Arc::new(NullArray::new(i32::MAX as usize))],
         );
         let error = decode(
-            IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![rows.clone()])),
+            IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![
+                rows.clone(),
+            ])),
             &principal(),
             source_schema_fingerprint(rows.schema().as_ref()),
             &RequestId::now_v7(),
@@ -2733,7 +2749,9 @@ mod tests {
             vec![Arc::new(Int32Array::from(vec![0_i32]))],
         );
         let error = decode(
-            IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![rows.clone()])),
+            IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![
+                rows.clone(),
+            ])),
             &principal(),
             source_schema_fingerprint(rows.schema().as_ref()),
             &RequestId::now_v7(),
@@ -2899,7 +2917,9 @@ mod tests {
             ],
         );
         let decoded = decode(
-            IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![rows.clone()])),
+            IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![
+                rows.clone(),
+            ])),
             &principal(),
             source_schema_fingerprint(rows.schema().as_ref()),
             &RequestId::now_v7(),
@@ -3379,7 +3399,9 @@ mod tests {
             vec![Arc::new(Int64Array::from(vec![1_i64])), event_array],
         );
         let decoded = decode(
-            IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![rows.clone()])),
+            IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![
+                rows.clone(),
+            ])),
             &principal(),
             source_schema_fingerprint(rows.schema().as_ref()),
             &RequestId::now_v7(),
@@ -3407,7 +3429,9 @@ mod tests {
             vec![Arc::new(Int64Array::from(vec![1_i64])), event_array],
         );
         let err = decode(
-            IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![rows.clone()])),
+            IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![
+                rows.clone(),
+            ])),
             &principal(),
             source_schema_fingerprint(rows.schema().as_ref()),
             &RequestId::now_v7(),
@@ -3441,7 +3465,9 @@ mod tests {
             future: std::time::Duration::from_secs(1),
         };
         let decoded = decode(
-            IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![rows.clone()])),
+            IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![
+                rows.clone(),
+            ])),
             &principal(),
             source_schema_fingerprint(rows.schema().as_ref()),
             &RequestId::now_v7(),

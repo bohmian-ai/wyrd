@@ -167,10 +167,10 @@ fn nested_batch(partition: crate::catalog::layout::TimePartition) -> RecordBatch
                 DataType::List(Arc::clone(&element)),
                 false,
             )
-                .with_metadata(HashMap::from([(
-                    "PARQUET:field_id".to_owned(),
-                    "5".to_owned(),
-                )])),
+            .with_metadata(HashMap::from([(
+                "PARQUET:field_id".to_owned(),
+                "5".to_owned(),
+            )])),
         ])),
         vec![
             Arc::new(TimestampMicrosecondArray::from(vec![timestamp]).with_timezone("UTC")),
@@ -307,7 +307,9 @@ async fn production_shard_snapshot_serves_exact_projection_and_lsn_range() {
             request_id,
             batch_id,
             measured_wire_bytes: 0,
-            payload: IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![rows])),
+            payload: IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(
+                vec![rows],
+            )),
         },
     )
     .await
@@ -406,7 +408,9 @@ async fn oracle_hot_snapshot_preserves_pointer_identity_and_day_isolation() {
             request_id: pointer_request_id,
             batch_id: Uuid::now_v7(),
             measured_wire_bytes: 0,
-            payload: IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![source.clone()])),
+            payload: IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(
+                vec![source.clone()],
+            )),
         },
     )
     .await
@@ -439,7 +443,9 @@ async fn oracle_hot_snapshot_preserves_pointer_identity_and_day_isolation() {
             request_id: cross_day_request_id,
             batch_id: Uuid::now_v7(),
             measured_wire_bytes: 0,
-            payload: IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![cross_day])),
+            payload: IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(
+                vec![cross_day],
+            )),
         },
     )
     .await
@@ -651,7 +657,9 @@ async fn shard_wal_failure_reaches_the_durable_completion() {
             request_id,
             batch_id: Uuid::now_v7(),
             measured_wire_bytes: 0,
-            payload: IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![rows])),
+            payload: IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(
+                vec![rows],
+            )),
         },
     )
     .await

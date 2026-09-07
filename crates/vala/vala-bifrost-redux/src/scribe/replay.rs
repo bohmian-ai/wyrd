@@ -2296,6 +2296,77 @@ mod tests {
         logical.finish()
     }
 
+    /// Builds one embedded Scribe writing its WAL under `wal_dir`.
+    ///
+    /// The in-memory object store keeps the fixture self-contained: only the
+    /// WAL directory is durable, which is exactly what recovery reads back.
+    fn embedded_scribe(wal_dir: &std::path::Path) -> crate::scribe::ScribeImpl {
+        let wal = std::sync::Arc::new(
+            WalWriter::new(
+                wal_dir,
+                *uuid::Uuid::nil().as_bytes(),
+                1,
+                WalConfig::default(),
+            )
+            .expect("writer"),
+        );
+        let operator = std::sync::Arc::new(
+            opendal::Operator::new(opendal::services::Memory::default())
+                .expect("memory operator")
+                .finish(),
+        );
+        crate::scribe::ScribeImpl::new_for_embedded_with_deps(
+            operator,
+            wal,
+            &uuid::Uuid::nil().to_string(),
+            1,
+        )
+    }
+
+    /// Builds the Gate-shaped frame carrying one accepted canonical subset.
+    ///
+    /// The audit event mirrors the allow/success record Gate mints for an
+    /// authenticated OTLP export, since `Scribe::ingest_frame` never creates
+    /// one of its own.
+    fn accepted_subset_frame(
+        tenant: DataTenantId,
+        table: TableRef,
+        principal: wyrd_runtime::Principal,
+        request_id: RequestId,
+        batch_id: uuid::Uuid,
+        rows: arrow::record_batch::RecordBatch,
+    ) -> crate::contracts::ScribeIngressFrame {
+        crate::contracts::ScribeIngressFrame {
+            authenticated_tenant: tenant,
+            audit_event: AuditEvent {
+                request_id: request_id.clone(),
+                trace_id: None,
+                operation: "bifrost.otlp".to_owned(),
+                resource: table.fqn(),
+                card_ref: None,
+                principal_id: principal.id,
+                principal_kind: principal.kind.tag(),
+                auth_method: AuthMethod::Jwt,
+                permission: "bifrost:record:write".to_owned(),
+                decision: AuditDecision::Allow,
+                result: AuditResult::Success,
+                payload_summary: "one accepted nested subset".to_owned(),
+                detail: None,
+            },
+            principal,
+            table,
+            expected_schema_fingerprint: Some(
+                crate::contracts::projected_source_schema_fingerprint(rows.schema().as_ref()),
+            ),
+            request_id,
+            batch_id,
+            measured_wire_bytes: 0,
+            payload: crate::contracts::IngressPayload::Canonical(
+                crate::contracts::CanonicalIngress::unreserved(vec![rows]),
+            ),
+        }
+    }
+
     /// Recovery replays exactly the Gate-accepted nested subset (S3).
     ///
     /// A mixed OTLP export is projected the way Gate projects it, so only the
@@ -2306,13 +2377,17 @@ mod tests {
     /// accepted rows.
     #[tokio::test]
     async fn nested_accepted_subset_replays_one_fence_and_digest() {
-        use crate::contracts::{CanonicalIngress, IngressPayload, Scribe, ScribeIngressFrame};
+        use crate::contracts::Scribe;
         use wyrd_tonic::otlp::trace::v1::{ResourceSpans, ScopeSpans, Span};
 
         let span = |index: u8, valid: bool| ResourceSpans {
             scope_spans: vec![ScopeSpans {
                 spans: vec![Span {
-                    trace_id: if valid { vec![index; 16] } else { vec![index; 3] },
+                    trace_id: if valid {
+                        vec![index; 16]
+                    } else {
+                        vec![index; 3]
+                    },
                     span_id: vec![index; 8],
                     name: format!("span-{index}"),
                     start_time_unix_nano: 1,
@@ -2341,26 +2416,7 @@ mod tests {
         let tenant = DataTenantId::new_v7();
         let table = TableRef::new(crate::namespaces::BifrostNamespace::Traces, "spans");
         let temp_dir = TempDir::new().expect("temp dir");
-        let wal = std::sync::Arc::new(
-            WalWriter::new(
-                temp_dir.path(),
-                *uuid::Uuid::nil().as_bytes(),
-                1,
-                WalConfig::default(),
-            )
-            .expect("writer"),
-        );
-        let operator = std::sync::Arc::new(
-            opendal::Operator::new(opendal::services::Memory::default())
-                .expect("memory operator")
-                .finish(),
-        );
-        let scribe = crate::scribe::ScribeImpl::new_for_embedded_with_deps(
-            operator,
-            wal,
-            &uuid::Uuid::nil().to_string(),
-            1,
-        );
+        let scribe = embedded_scribe(temp_dir.path());
         let principal = wyrd_runtime::Principal {
             id: PrincipalId::new(uuid::Uuid::now_v7()),
             kind: wyrd_runtime::PrincipalKind::User,
@@ -2373,33 +2429,7 @@ mod tests {
         let batch_id = uuid::Uuid::now_v7();
         let admission = Scribe::ingest_frame(
             &scribe,
-            ScribeIngressFrame {
-                authenticated_tenant: tenant,
-                audit_event: AuditEvent {
-                    request_id: request_id.clone(),
-                    trace_id: None,
-                    operation: "bifrost.otlp".to_owned(),
-                    resource: table.fqn(),
-                    card_ref: None,
-                    principal_id: principal.id,
-                    principal_kind: principal.kind.tag(),
-                    auth_method: AuthMethod::Jwt,
-                    permission: "bifrost:record:write".to_owned(),
-                    decision: AuditDecision::Allow,
-                    result: AuditResult::Success,
-                    payload_summary: "one accepted nested subset".to_owned(),
-                    detail: None,
-                },
-                principal,
-                table,
-                expected_schema_fingerprint: Some(
-                    crate::contracts::projected_source_schema_fingerprint(rows.schema().as_ref()),
-                ),
-                request_id,
-                batch_id,
-                measured_wire_bytes: 0,
-                payload: IngressPayload::Canonical(CanonicalIngress::unreserved(vec![rows])),
-            },
+            accepted_subset_frame(tenant, table, principal, request_id, batch_id, rows),
         )
         .await
         .expect("durable append of the accepted subset");
@@ -2413,7 +2443,11 @@ mod tests {
             .values()
             .find(|state| !state.commits.is_empty())
             .expect("one committed seal key");
-        assert_eq!(state.commits.len(), 1, "the batch produced exactly one fence");
+        assert_eq!(
+            state.commits.len(),
+            1,
+            "the batch produced exactly one fence"
+        );
         assert_eq!(state.append_metas.len(), 1);
         let commit = &state.commits[0];
         let meta = &state.append_metas[0];

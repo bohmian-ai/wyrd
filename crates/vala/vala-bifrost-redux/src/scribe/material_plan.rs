@@ -8,6 +8,7 @@
 use std::io::Write;
 use std::mem::size_of;
 
+use crate::contracts::ScribeError;
 use arrow::ipc::writer::StreamWriter;
 use arrow::ipc::{
     DateUnit, Endianness, IntervalUnit, MessageHeader, MetadataVersion, Precision, TimeUnit, Type,
@@ -15,7 +16,6 @@ use arrow::ipc::{
 };
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
-use crate::contracts::ScribeError;
 
 /// Maximum native record-batch descriptors retained by one plan.
 pub(crate) const MAX_SOURCE_PLANS: usize = 64;
@@ -735,7 +735,6 @@ impl ScribeIngressPlanner {
         scan.scan(bytes)?;
         scan.finish(bytes, name_bytes)
     }
-
 }
 
 /// Byte-counting sink used to derive one exact IPC output capacity.
@@ -1136,6 +1135,11 @@ mod tests {
     use std::io::Cursor;
     use std::sync::Arc;
 
+    use super::{
+        ScribeIngressPlanner, configured_maximum_envelope_bytes, configured_otlp_material_bytes,
+        root_as_message,
+    };
+    use crate::contracts::ScribeError;
     use arrow::array::{
         ArrayRef, Decimal128Array, Int64Array, NullArray, StringArray, Time64MicrosecondArray,
     };
@@ -1143,11 +1147,6 @@ mod tests {
     use arrow::ipc::writer::StreamWriter;
     use arrow::record_batch::RecordBatch;
     use bytes::Bytes;
-    use super::{
-        ScribeIngressPlanner, configured_maximum_envelope_bytes, configured_otlp_material_bytes,
-        root_as_message,
-    };
-    use crate::contracts::ScribeError;
 
     /// Encodes one canonical V5 stream for scanner tests.
     ///

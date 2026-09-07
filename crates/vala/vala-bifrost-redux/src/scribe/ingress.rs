@@ -70,10 +70,10 @@ fn validate_logical_transport_frame(
 /// no such reservation and acquire their root through ordinary admission.
 fn take_transport_decode_owner(
     payload: &mut IngressPayload,
-) -> Result<Option<crate::contracts::OtlpDecodeOwner>, ScribeError> {
+) -> Option<crate::contracts::OtlpDecodeOwner> {
     match payload {
-        IngressPayload::Canonical(canonical) => Ok(canonical.owner.take()),
-        IngressPayload::ArrowIpc(_) => Ok(None),
+        IngressPayload::Canonical(canonical) => canonical.owner.take(),
+        IngressPayload::ArrowIpc(_) => None,
     }
 }
 
@@ -329,7 +329,7 @@ impl ScribeImpl {
         lifecycle: &mut crate::scribe::telemetry::ScribeIngressLifecycleOwner,
     ) -> Result<RootAdmission, ScribeError> {
         validate_logical_transport_frame(frame, self.ingest_limits.otlp.request_bytes)?;
-        let decode_owner = take_transport_decode_owner(&mut frame.payload)?;
+        let decode_owner = take_transport_decode_owner(&mut frame.payload);
         let LogicalFrameContract {
             expected_schema_fingerprint,
             partition_granularity,
@@ -675,17 +675,9 @@ mod tests {
     #[test]
     fn scribe_boundary_contains_no_otlp_signal_payload() {
         let mut native = IngressPayload::ArrowIpc(bytes::Bytes::new());
-        assert!(
-            take_transport_decode_owner(&mut native)
-                .expect("native owner branch")
-                .is_none()
-        );
+        assert!(take_transport_decode_owner(&mut native).is_none());
         let mut canonical = IngressPayload::Canonical(CanonicalIngress::unreserved(Vec::new()));
-        assert!(
-            take_transport_decode_owner(&mut canonical)
-                .expect("canonical owner branch")
-                .is_none()
-        );
+        assert!(take_transport_decode_owner(&mut canonical).is_none());
         let boundary =
             std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/contracts.rs"))
                 .expect("read the Scribe ingress contract");

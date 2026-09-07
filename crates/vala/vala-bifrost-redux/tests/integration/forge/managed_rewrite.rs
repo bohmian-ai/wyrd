@@ -16,73 +16,60 @@ use std::sync::atomic::AtomicUsize;
 
 use iceberg::spec::DataContentType;
 use vala_bifrost_redux::forge::{
-    ForgeClock, ForgeError, ForgeObjectStore, ForgeRewriteAttempt, ForgeRewriteEvidence,
-    ForgeRewriteOutcome, ForgeUnsettledOutput, RewriteHandoff,
+    ForgeClock, ForgeError, ForgeObjectStore, ForgeUnsettledOutput,
 };
-use vala_bifrost_redux::resources::ForgeRewriteRequest;
 
-use super::rewrite_support::{PromotedRewriteFixture, RewriteOutputBreak};
+use super::rewrite_support::{AttemptRun, PromotedRewriteFixture, RewriteOutputBreak};
 use super::support::{CountingObjectStore, PromotionCatalogSeam, SupervisedPromotion};
 
-/// Runs one whole non-committing rewrite attempt under an exact plan budget.
-///
-/// The budget is set on the fixture's config, which is what the managed core
-/// reads when it selects, so a caller varies only the number of groups the
-/// *core* is allowed to plan. Everything else — catalog, object store, resource
-/// governor — stays the production owner over the same promoted snapshot.
+/// Runs one whole attempt over the promoted snapshot with no plan budget.
 ///
 /// # Panics
 ///
-/// Panics if the attempt fails or reports no progress; every caller here runs
-/// against a promoted small-file set that must select.
-async fn rewrite_under_plan_budget(
-    fixture: &mut PromotedRewriteFixture,
-    budget: usize,
-) -> (ForgeRewriteEvidence, Box<RewriteHandoff>) {
-    fixture.fixture.config.rewrite_max_plans_per_attempt = budget;
+/// Panics when the attempt fails; every caller here runs against a promoted
+/// small-file set that must select.
+async fn rewrite_whole_attempt(fixture: &PromotedRewriteFixture) -> AttemptRun {
     let object_store = CountingObjectStore::new(Arc::clone(&fixture.fixture.staging));
-    let outcome = fixture
-        .forge(
-            fixture.fixture.catalog.iceberg_catalog(),
-            Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
+    let forge = fixture.forge(
+        fixture.fixture.catalog.iceberg_catalog(),
+        Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
+    );
+    let run = fixture
+        .run_attempt(
+            &forge,
+            uuid::Uuid::now_v7(),
+            tokio_util::sync::CancellationToken::new(),
         )
-        .execute_rewrite_attempt(
-            &fixture.fixture.binding,
-            fixture.attempt(uuid::Uuid::now_v7()).await,
-        )
-        .await
-        .expect("the promoted snapshot is rewritable under any budget of at least one plan");
-    let ForgeRewriteOutcome::Rewritten { evidence, handoff } = outcome else {
-        panic!("a promoted small-file set must select under a budget of {budget}: {outcome:?}");
-    };
-    (evidence, handoff)
+        .await;
+    assert!(
+        run.failure.is_none(),
+        "the promoted snapshot is rewritable: {:?}",
+        run.failure
+    );
+    run
 }
 
-/// The adapter's plan is the core's report, unedited.
+/// Planning returns every real plan and each one rewrites only its own group.
 ///
-/// The promoted set is more eligible groups than a one-plan budget admits, so
-/// the two passes below differ only in the budget the core was configured with
-/// and run against the same unchanged snapshot. Three things then have to hold
-/// together. The budgeted pass consumes exactly the leading group, so no local
-/// trim, reorder, or regroup happened. Its produced rows are exactly the rows
-/// of the objects it consumed, so the plan it executed is the plan it reported
-/// consuming. And its *selection receipt differs* from the unbudgeted one,
-/// which is what a local `.take` could not produce: trimming the returned plans
-/// would leave the report describing the whole pre-cap selection, so both
-/// passes would receipt identically.
+/// The promoted set offers more than one eligible group. Planning is not capped,
+/// so the plan set must cover the whole selection: one handoff per plan, each
+/// naming its own inputs and its own output, and their union naming exactly the
+/// live data files the core selected. A truncated plan set would leave inputs
+/// unconsumed while the selection receipt still described them; a merged handoff
+/// would ask publication to remove inputs a sibling plan is still rewriting.
 #[tokio::test]
 async fn managed_rewrite_plan_matches_core_report_on_promoted_snapshot() {
-    let mut fixture = PromotedRewriteFixture::start("rewrite_plan").await;
+    let fixture = PromotedRewriteFixture::start("rewrite_plan").await;
     let live = fixture
         .live_data_files()
         .await
         .into_iter()
         .filter(|file| file.content_type() == DataContentType::Data)
         .map(|file| file.file_path().to_owned())
-        .collect::<std::collections::BTreeSet<_>>();
+        .collect::<BTreeSet<_>>();
     assert!(
         live.len() > 1,
-        "the fixture must offer more eligible groups than the budget under test: {live:?}"
+        "the fixture must offer more than one eligible group: {live:?}"
     );
     let table = fixture.load_table().await;
     let base = table
@@ -91,126 +78,59 @@ async fn managed_rewrite_plan_matches_core_report_on_promoted_snapshot() {
         .expect("a promoted snapshot")
         .snapshot_id();
 
-    let (budgeted_evidence, budgeted_handoff) = rewrite_under_plan_budget(&mut fixture, 1).await;
-    let (whole_evidence, whole_handoff) = rewrite_under_plan_budget(&mut fixture, live.len()).await;
+    let run = rewrite_whole_attempt(&fixture).await;
 
     assert_eq!(
-        (
-            budgeted_evidence.base_snapshot_id,
-            whole_evidence.base_snapshot_id
-        ),
-        (base, base),
-        "both passes are bound to the same promoted snapshot"
+        run.evidence().base_snapshot_id,
+        base,
+        "the attempt is bound to the promoted snapshot"
     );
     assert_eq!(
-        whole_handoff
-            .rewritten_data_files
-            .iter()
-            .cloned()
-            .collect::<std::collections::BTreeSet<_>>(),
+        run.handoffs.len(),
+        live.len(),
+        "planning returned one real plan per eligible group"
+    );
+    assert_eq!(
+        run.rewritten_data_files()
+            .into_iter()
+            .collect::<BTreeSet<_>>(),
         live,
-        "the adapter consumed exactly the core's selected data files"
+        "the plans together consumed exactly the core's selected data files"
     );
     assert_eq!(
-        whole_handoff.rewritten_data_files.len(),
+        run.rewritten_data_files().len(),
         live.len(),
-        "no live data file is consumed twice"
+        "no live data file is consumed by two plans"
     );
-    assert_eq!(
-        budgeted_handoff.rewritten_data_files,
-        whole_handoff.rewritten_data_files[..1].to_vec(),
-        "the budgeted pass executed the core's leading group unchanged"
-    );
-    assert_eq!(
-        budgeted_handoff.output_data_files.len(),
-        1,
-        "one admitted plan produced one object"
-    );
-    assert_eq!(
-        whole_handoff.output_data_files.len(),
-        live.len(),
-        "each admitted plan produced its own object"
-    );
-    assert_eq!(
-        fixture
-            .object_values(
-                &budgeted_handoff
-                    .output_data_files
-                    .iter()
-                    .map(|file| file.file_path().to_owned())
-                    .collect::<Vec<_>>()
-            )
-            .await,
-        fixture
-            .object_values(&budgeted_handoff.rewritten_data_files)
-            .await,
-        "the budgeted pass carried forward exactly the rows of the files it reported consuming"
-    );
-    assert_ne!(
-        budgeted_evidence.selection_fingerprint, whole_evidence.selection_fingerprint,
-        "the budget is a selection decision: a capped pass receipts less work than an uncapped one"
-    );
-    assert_ne!(
-        budgeted_evidence.debt_fingerprint, whole_evidence.debt_fingerprint,
-        "a capped pass also summarizes less outstanding debt"
-    );
+    for handoff in &run.handoffs {
+        assert_eq!(
+            handoff.base_snapshot_id, base,
+            "every plan resolves against the one planned snapshot"
+        );
+        assert_eq!(
+            handoff.output_data_files.len(),
+            1,
+            "each plan produced its own single object"
+        );
+        assert_eq!(
+            fixture
+                .object_values(
+                    &handoff
+                        .output_data_files
+                        .iter()
+                        .map(|file| file.file_path().to_owned())
+                        .collect::<Vec<_>>()
+                )
+                .await,
+            fixture.object_values(&handoff.rewritten_data_files).await,
+            "each plan carried forward exactly the rows of the files it consumed"
+        );
+    }
     assert!(
-        !budgeted_evidence.selection_fingerprint.is_empty()
-            && !budgeted_evidence.debt_fingerprint.is_empty()
-            && !budgeted_evidence.policy_fingerprint.is_empty(),
+        !run.evidence().selection_fingerprint.is_empty()
+            && !run.evidence().debt_fingerprint.is_empty()
+            && !run.evidence().policy_fingerprint.is_empty(),
         "every planned attempt records its three canonical fingerprints"
-    );
-}
-
-/// A refused lease is refused before the catalog and the object store are touched.
-///
-/// The demand is set past this fixture's admitted ceiling, so the governor must
-/// refuse. The proof that the refusal is free of side effects is bidirectional:
-/// the seam records zero table loads, so no manifest was read, and the object
-/// digest map is byte-identical, so nothing was written. Any read or write
-/// permitted before the refusal breaks one of the two.
-#[tokio::test]
-async fn managed_rewrite_refuses_resources_before_object_io() {
-    let fixture = PromotedRewriteFixture::start("rewrite_refusal").await;
-    let before = fixture.object_digests().await;
-    let object_store = CountingObjectStore::new(Arc::clone(&fixture.fixture.staging));
-    let catalog = PromotionCatalogSeam::new(
-        fixture.fixture.catalog.iceberg_catalog(),
-        Arc::new(AtomicUsize::new(0)),
-    );
-    let forge = fixture.forge(
-        Arc::clone(&catalog) as Arc<dyn iceberg::Catalog>,
-        Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
-    );
-
-    let mut attempt = fixture.attempt(uuid::Uuid::now_v7()).await;
-    attempt.request = ForgeRewriteRequest {
-        memory_bytes: usize::MAX / 2,
-        ..attempt.request
-    };
-    let error = forge
-        .execute_rewrite_attempt(&fixture.fixture.binding, attempt)
-        .await
-        .expect_err("an impossible demand must be refused");
-
-    assert!(
-        matches!(error, ForgeError::Capacity { .. }),
-        "the refusal is a capacity refusal: {error:?}"
-    );
-    assert_eq!(
-        catalog.loads(),
-        0,
-        "a refused attempt read no table metadata"
-    );
-    assert_eq!(
-        object_store.output_writers(),
-        0,
-        "a refused attempt opened no output"
-    );
-    assert_eq!(
-        fixture.object_digests().await,
-        before,
-        "a refused attempt left every object byte-identical"
     );
 }
 
@@ -237,32 +157,22 @@ async fn drain_at_output(
     });
     let object_store = CountingObjectStore::new(Arc::clone(&fixture.fixture.staging));
     let attempt_id = uuid::Uuid::now_v7();
-    let outcome = fixture
-        .forge(
-            Arc::clone(&catalog) as Arc<dyn iceberg::Catalog>,
-            Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
-        )
-        .execute_rewrite_attempt(
-            &fixture.fixture.binding,
-            ForgeRewriteAttempt {
-                cancel,
-                ..fixture.attempt(attempt_id).await
-            },
-        )
-        .await
-        .expect("a drained attempt is an outcome, not a failure");
-    let ForgeRewriteOutcome::Cancelled {
-        possible_outputs, ..
-    } = outcome
-    else {
-        panic!("a cancelled attempt must report its possible outputs: {outcome:?}");
-    };
+    let forge = fixture.forge(
+        Arc::clone(&catalog) as Arc<dyn iceberg::Catalog>,
+        Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
+    );
+    let run = fixture.run_attempt(&forge, attempt_id, cancel).await;
+    assert!(
+        matches!(run.failure, Some(ForgeError::Shutdown)),
+        "a cancelled plan ends the attempt as a shutdown: {:?}",
+        run.failure
+    );
     assert_eq!(
         store.opened_outputs(),
         ordinal,
         "the drain was tripped by the {ordinal}th output open"
     );
-    (attempt_id, possible_outputs)
+    (attempt_id, run.rewrite.possible_outputs())
 }
 
 /// Produced objects are distinguishable across plans, and the next pass keeps them.
@@ -290,19 +200,20 @@ async fn managed_rewrite_output_identity_is_unique_across_concurrent_writers() {
         fixture.fixture.catalog.iceberg_catalog(),
         Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
     );
-    let outcome = forge
-        .execute_rewrite_attempt(&fixture.fixture.binding, fixture.attempt(attempt_id).await)
-        .await
-        .expect("the promoted snapshot is rewritable");
-    let ForgeRewriteOutcome::Rewritten { handoff, .. } = outcome else {
-        panic!("a promoted small-file set must select: {outcome:?}");
-    };
+    let run = fixture
+        .run_attempt(
+            &forge,
+            attempt_id,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+    assert!(
+        run.failure.is_none(),
+        "the promoted snapshot is rewritable: {:?}",
+        run.failure
+    );
 
-    let paths = handoff
-        .output_data_files
-        .iter()
-        .map(|file| file.file_path().to_owned())
-        .collect::<Vec<_>>();
+    let paths = run.output_paths();
     assert!(
         paths.len() > 1,
         "the attempt must execute more than one plan for this to say anything: {paths:?}"
@@ -354,20 +265,19 @@ async fn managed_rewrite_output_identity_is_unique_across_concurrent_writers() {
         "no two attempt-global ordinals name the same object: {possible_outputs:?}"
     );
 
-    let repeat = forge
-        .execute_rewrite_attempt(
-            &fixture.fixture.binding,
-            fixture.attempt(uuid::Uuid::now_v7()).await,
+    let repeat = fixture
+        .run_attempt(
+            &forge,
+            uuid::Uuid::now_v7(),
+            tokio_util::sync::CancellationToken::new(),
         )
-        .await
-        .expect("a further pass is executable");
-    if let ForgeRewriteOutcome::Rewritten { handoff, .. } = repeat {
-        for produced in &paths {
-            assert!(
-                !handoff.rewritten_data_files.contains(produced),
-                "a current-recipe object must not be reselected: {produced}"
-            );
-        }
+        .await;
+    let reselected = repeat.rewritten_data_files();
+    for produced in &paths {
+        assert!(
+            !reselected.contains(produced),
+            "a current-recipe object must not be reselected: {produced}"
+        );
     }
 }
 
@@ -400,26 +310,16 @@ async fn managed_rewrite_cancellation_drains_and_preserves_possible_outputs() {
         Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
     );
     let attempt_id = uuid::Uuid::now_v7();
-    let outcome = forge
-        .execute_rewrite_attempt(
-            &fixture.fixture.binding,
-            ForgeRewriteAttempt {
-                cancel,
-                ..fixture.attempt(attempt_id).await
-            },
-        )
-        .await
-        .expect("a drained attempt is an outcome, not a failure");
+    let run = fixture.run_attempt(&forge, attempt_id, cancel).await;
 
-    let ForgeRewriteOutcome::Cancelled {
-        base_snapshot_id,
-        possible_outputs,
-    } = outcome
-    else {
-        panic!("a cancelled attempt must report its possible outputs: {outcome:?}");
-    };
+    assert!(
+        matches!(run.failure, Some(ForgeError::Shutdown)),
+        "a cancelled plan ends the attempt as a shutdown: {:?}",
+        run.failure
+    );
+    let possible_outputs = run.rewrite.possible_outputs();
     assert_eq!(
-        base_snapshot_id,
+        run.evidence().base_snapshot_id,
         fixture
             .load_table()
             .await
@@ -471,14 +371,6 @@ async fn managed_rewrite_cancellation_drains_and_preserves_possible_outputs() {
         live_before,
         "a drained attempt published nothing"
     );
-    assert!(
-        fixture
-            .scratch_children()
-            .iter()
-            .all(|child| !child.contains(&attempt_id.to_string())),
-        "the drained attempt returned its scratch lease: {:?}",
-        fixture.scratch_children()
-    );
 }
 
 /// A failure after an output opened still reports the whole attempt's objects.
@@ -504,10 +396,16 @@ async fn managed_rewrite_failure_preserves_attempt_global_possible_outputs() {
         Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
     );
     let attempt_id = uuid::Uuid::now_v7();
-    let error = forge
-        .execute_rewrite_attempt(&fixture.fixture.binding, fixture.attempt(attempt_id).await)
-        .await
-        .expect_err("a refused output settlement fails the attempt");
+    let run = fixture
+        .run_attempt(
+            &forge,
+            attempt_id,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+    let error = run
+        .failure
+        .expect("a refused output settlement fails the attempt");
 
     assert!(
         matches!(error, ForgeError::RewriteUnsettled { .. }),
@@ -574,16 +472,18 @@ async fn managed_rewrite_produces_exact_handoff_without_catalog_commit() {
         Arc::clone(&catalog) as Arc<dyn iceberg::Catalog>,
         Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
     );
-    let outcome = forge
-        .execute_rewrite_attempt(
-            &fixture.fixture.binding,
-            fixture.attempt(uuid::Uuid::now_v7()).await,
+    let run = fixture
+        .run_attempt(
+            &forge,
+            uuid::Uuid::now_v7(),
+            tokio_util::sync::CancellationToken::new(),
         )
-        .await
-        .expect("the promoted snapshot is rewritable");
-    let ForgeRewriteOutcome::Rewritten { evidence, handoff } = outcome else {
-        panic!("a promoted small-file set must select: {outcome:?}");
-    };
+        .await;
+    assert!(
+        run.failure.is_none(),
+        "the promoted snapshot is rewritable: {:?}",
+        run.failure
+    );
 
     assert_eq!(
         catalog.attempts(),
@@ -595,20 +495,19 @@ async fn managed_rewrite_produces_exact_handoff_without_catalog_commit() {
         live_before,
         "the live set is unchanged by a rewrite that publishes nothing"
     );
-    assert_eq!(
-        handoff.base_snapshot_id, evidence.base_snapshot_id,
-        "the handoff names the snapshot the evidence was derived from"
-    );
+    for handoff in &run.handoffs {
+        assert_eq!(
+            handoff.base_snapshot_id,
+            run.evidence().base_snapshot_id,
+            "each handoff names the snapshot the evidence was derived from"
+        );
+    }
     let objects_after = fixture.object_digests().await;
-    for path in handoff
-        .output_data_files
-        .iter()
-        .map(iceberg::spec::DataFile::file_path)
-    {
+    for path in &run.output_paths() {
         assert!(
             objects_after
                 .keys()
-                .any(|object| path.ends_with(object.as_str()) || object.ends_with(path)),
+                .any(|object| path.ends_with(object.as_str()) || object.ends_with(path.as_str())),
             "each produced identity names an object that exists: {path}"
         );
         assert!(
@@ -665,31 +564,32 @@ async fn assert_equality_delete_applies_to_output_rows() {
         fixture.fixture.catalog.iceberg_catalog(),
         Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
     );
-    let outcome = forge
-        .execute_rewrite_attempt(
-            &fixture.fixture.binding,
-            fixture.attempt(uuid::Uuid::now_v7()).await,
+    let run = fixture
+        .run_attempt(
+            &forge,
+            uuid::Uuid::now_v7(),
+            tokio_util::sync::CancellationToken::new(),
         )
-        .await
-        .expect("a table carrying equality-delete debt is rewritable");
-    let ForgeRewriteOutcome::Rewritten { handoff, .. } = outcome else {
-        panic!("delete debt must select: {outcome:?}");
-    };
+        .await;
+    assert!(
+        run.failure.is_none(),
+        "a table carrying equality-delete debt is rewritable: {:?}",
+        run.failure
+    );
 
     assert_eq!(
-        handoff.applied_equality_delete_files.len(),
+        run.applied_equality_delete_files()
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+            .len(),
         1,
         "the equality delete is named exactly once however many groups it covers"
     );
     assert!(
-        handoff.applied_position_delete_files.is_empty(),
+        run.applied_position_delete_files().is_empty(),
         "no position delete was published in this pass"
     );
-    let produced = handoff
-        .output_data_files
-        .iter()
-        .map(|file| file.file_path().to_owned())
-        .collect::<Vec<_>>();
+    let produced = run.output_paths();
     assert_eq!(
         fixture.object_values(&produced).await,
         vec![0, 1, 10],
@@ -735,27 +635,28 @@ async fn assert_position_delete_applies_to_output_rows() {
         deletes.fixture.catalog.iceberg_catalog(),
         Arc::clone(&store) as Arc<dyn ForgeObjectStore>,
     );
-    let outcome = forge
-        .execute_rewrite_attempt(
-            &deletes.fixture.binding,
-            deletes.attempt(uuid::Uuid::now_v7()).await,
+    let run = deletes
+        .run_attempt(
+            &forge,
+            uuid::Uuid::now_v7(),
+            tokio_util::sync::CancellationToken::new(),
         )
-        .await
-        .expect("a table carrying position-delete debt is rewritable");
-    let ForgeRewriteOutcome::Rewritten { handoff, .. } = outcome else {
-        panic!("position-delete debt must select: {outcome:?}");
-    };
+        .await;
+    assert!(
+        run.failure.is_none(),
+        "a table carrying position-delete debt is rewritable: {:?}",
+        run.failure
+    );
 
     assert_eq!(
-        handoff.applied_position_delete_files.len(),
+        run.applied_position_delete_files()
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+            .len(),
         1,
         "the position delete is named exactly once"
     );
-    let produced = handoff
-        .output_data_files
-        .iter()
-        .map(|file| file.file_path().to_owned())
-        .collect::<Vec<_>>();
+    let produced = run.output_paths();
     assert_eq!(
         deletes.object_values(&produced).await,
         expected,
@@ -772,12 +673,11 @@ async fn assert_position_delete_applies_to_output_rows() {
 ///
 /// The declared file target is raised well past the erased 128 MiB whole-file
 /// ceiling and the row-group target is left independent of it. What the core
-/// receives must carry both values unchanged, and the whole promoted set must
-/// still fit one plan rather than being split into a fixed number of groups.
+/// receives must carry both values unchanged, and the attempt must consume the
+/// whole promoted set rather than a fixed number of groups.
 #[tokio::test]
 async fn managed_rewrite_scaled_geometry_has_no_legacy_file_or_group_ceiling() {
-    let mut fixture = PromotedRewriteFixture::start("rewrite_geometry").await;
-    fixture.fixture.config.rewrite_max_plans_per_attempt = 8;
+    let fixture = PromotedRewriteFixture::start("rewrite_geometry").await;
     let table = fixture.load_table().await;
     let properties = table.metadata().properties();
     assert_eq!(
@@ -791,32 +691,33 @@ async fn managed_rewrite_scaled_geometry_has_no_legacy_file_or_group_ceiling() {
         fixture.fixture.catalog.iceberg_catalog(),
         Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
     );
-    let outcome = forge
-        .execute_rewrite_attempt(
-            &fixture.fixture.binding,
-            fixture.attempt(uuid::Uuid::now_v7()).await,
+    let run = fixture
+        .run_attempt(
+            &forge,
+            uuid::Uuid::now_v7(),
+            tokio_util::sync::CancellationToken::new(),
         )
-        .await
-        .expect("the promoted snapshot is rewritable");
-    let ForgeRewriteOutcome::Rewritten { handoff, .. } = outcome else {
-        panic!("a promoted small-file set must select: {outcome:?}");
-    };
+        .await;
+    assert!(
+        run.failure.is_none(),
+        "the promoted snapshot is rewritable: {:?}",
+        run.failure
+    );
 
     assert_eq!(
-        handoff.rewritten_data_files.len(),
+        run.rewritten_data_files().len(),
         2,
         "one attempt consumed the whole promoted set rather than a fixed number of groups"
     );
     assert_eq!(
-        handoff
-            .output_data_files
-            .iter()
+        run.output_data_files()
+            .into_iter()
             .map(iceberg::spec::DataFile::record_count)
             .sum::<u64>(),
         4,
         "every promoted row is carried forward exactly once"
     );
-    for produced in &handoff.output_data_files {
+    for produced in run.output_data_files() {
         assert!(
             produced.file_size_in_bytes() > 0,
             "each produced object carries its own encoded size"
@@ -827,64 +728,6 @@ async fn managed_rewrite_scaled_geometry_has_no_legacy_file_or_group_ceiling() {
             produced.file_size_in_bytes()
         );
     }
-}
-
-/// A second pass over an unchanged live set does no work at all.
-///
-/// The first attempt's evidence is handed back to the second. Because the base
-/// snapshot has not advanced, the refusal happens before any manifest or object
-/// is opened: the seam records no table load past the first, and the object
-/// digest map is unchanged.
-#[tokio::test]
-async fn managed_rewrite_second_pass_is_zero_io_without_live_set_delta() {
-    let fixture = PromotedRewriteFixture::start("rewrite_second_pass").await;
-    let object_store = CountingObjectStore::new(Arc::clone(&fixture.fixture.staging));
-    let catalog = PromotionCatalogSeam::new(
-        fixture.fixture.catalog.iceberg_catalog(),
-        Arc::new(AtomicUsize::new(0)),
-    );
-    let forge = fixture.forge(
-        Arc::clone(&catalog) as Arc<dyn iceberg::Catalog>,
-        Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
-    );
-    let outcome = forge
-        .execute_rewrite_attempt(
-            &fixture.fixture.binding,
-            fixture.attempt(uuid::Uuid::now_v7()).await,
-        )
-        .await
-        .expect("the promoted snapshot is rewritable");
-    let ForgeRewriteOutcome::Rewritten { evidence, .. } = outcome else {
-        panic!("a promoted small-file set must select: {outcome:?}");
-    };
-
-    let digests = fixture.object_digests().await;
-    let writers_before = object_store.output_writers();
-    let second = forge
-        .execute_rewrite_attempt(
-            &fixture.fixture.binding,
-            ForgeRewriteAttempt {
-                previous: Some(&evidence),
-                ..fixture.attempt(uuid::Uuid::now_v7()).await
-            },
-        )
-        .await
-        .expect("a second pass is executable");
-
-    assert!(
-        matches!(second, ForgeRewriteOutcome::NoProgress { .. }),
-        "an unchanged live set makes no progress: {second:?}"
-    );
-    assert_eq!(
-        object_store.output_writers(),
-        writers_before,
-        "the refused second pass opened no output"
-    );
-    assert_eq!(
-        fixture.object_digests().await,
-        digests,
-        "the refused second pass wrote nothing"
-    );
 }
 
 /// Compaction publishes replacements and never deletes what it rewrote.

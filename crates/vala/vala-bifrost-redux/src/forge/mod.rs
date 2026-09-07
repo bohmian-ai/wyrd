@@ -41,7 +41,8 @@ pub use clock::ForgeClockControl;
 pub use compact::{ForgeConfig, ForgeObjectPages, ForgeObjectStore};
 pub use error::ForgeError;
 pub use managed::{
-    ForgeRewriteEvidence, ForgeRewriteOutcome, ForgeUnsettledOutput, RewriteHandoff,
+    ForgeManagedRewrite, ForgePlannedAttempt, ForgePlannedRewrite, ForgeRewriteEvidence,
+    ForgeRewriteOutcome, ForgeUnsettledOutput, RewriteHandoff,
 };
 pub use metrics::ForgeTelemetry;
 pub use planner::{ForgePlanCandidate, PlannedForgeTask};

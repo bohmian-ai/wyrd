@@ -48,7 +48,7 @@ use super::policy::ForgeTablePolicy;
 /// would let a plan be admitted against different figures from the ones it was
 /// planned with.
 #[derive(Debug)]
-pub(crate) struct ForgePlannedRewrite {
+pub struct ForgePlannedRewrite {
     /// Planner ordinal, which is also this plan's queue key component.
     pub plan_index: usize,
     /// The core's plan, executed verbatim by exactly one runner.
@@ -66,7 +66,7 @@ redacted
 /// carries no compaction debt — and is settled as an audited no-op rather than
 /// as a failure.
 #[derive(Debug)]
-pub(crate) struct ForgePlannedAttempt {
+pub struct ForgePlannedAttempt {
     /// The table snapshot every plan was produced against.
     pub table: Table,
     /// Evidence fingerprints derived from the core's selection report.
@@ -86,7 +86,7 @@ impl Forge {
     /// Returns [`ForgeError::Invariant`] when the managed execution context
     /// cannot be built from the attempt's identity, cancellation token, and
     /// observer.
-    pub(crate) fn managed_rewrite(
+    pub fn managed_rewrite(
         &self,
         binding: &TenantTableBinding,
         task_id: Uuid,
@@ -105,7 +105,7 @@ impl Forge {
 /// ledger's ordinals for every plan, so two objects from one attempt could
 /// carry the same ordinal and a failure could name only the last plan's
 /// objects.
-pub(crate) struct ForgeManagedRewrite {
+pub struct ForgeManagedRewrite {
     /// Shared Forge dependency graph.
     core: Arc<ForgeCore>,
     /// Physical and logical identity of the table being rewritten.
@@ -156,12 +156,12 @@ impl ForgeManagedRewrite {
     }
 
     /// Returns the durable task this attempt belongs to.
-    pub(crate) fn task_id(&self) -> Uuid {
+    pub fn task_id(&self) -> Uuid {
         self.task_id
     }
 
     /// Returns the attempt identity every produced object is named for.
-    pub(crate) fn attempt_id(&self) -> Uuid {
+    pub fn attempt_id(&self) -> Uuid {
         self.attempt_id
     }
 
@@ -184,7 +184,7 @@ impl ForgeManagedRewrite {
     /// columns or geometry are unusable, [`ForgeError::Catalog`] when the table
     /// or its manifests cannot be read, and [`ForgeError::Invariant`] when a
     /// plan recommends an execution parallelism outside `u32`.
-    pub(crate) async fn plan(&self) -> Result<ForgePlannedAttempt, ForgeError> {
+    pub async fn plan(&self) -> Result<ForgePlannedAttempt, ForgeError> {
         let table_ident = self.binding.table_ident();
         let table = self
             .core
@@ -283,7 +283,7 @@ impl ForgeManagedRewrite {
     /// Any of those raised after an object may exist arrives wrapped in
     /// [`ForgeError::RewriteUnsettled`], carrying the attempt-global
     /// possible-output set so nothing becomes unreclaimable.
-    pub(crate) async fn rewrite_plan(
+    pub async fn rewrite_plan(
         &self,
         planned: ForgePlannedRewrite,
         table: &Table,
@@ -387,7 +387,7 @@ impl ForgeManagedRewrite {
     /// plan the attempt executed rather than the plan that happened to fail.
     /// Callers snapshot it only after every runner has drained, because a
     /// running sibling can still add to it.
-    pub(crate) fn possible_outputs(&self) -> Vec<ForgeUnsettledOutput> {
+    pub fn possible_outputs(&self) -> Vec<ForgeUnsettledOutput> {
         self.observer
             .outputs()
             .into_iter()

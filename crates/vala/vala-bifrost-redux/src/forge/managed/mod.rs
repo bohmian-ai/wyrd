@@ -13,7 +13,7 @@
 //! reclaimable by construction: they are named for their attempt, they are
 //! under the recipe path, and no snapshot references them.
 
-pub(crate) mod executor;
+pub mod executor;
 pub(crate) mod fingerprint;
 pub(crate) mod handoff;
 pub(crate) mod identity;
@@ -22,5 +22,6 @@ pub(crate) mod observer;
 pub(crate) mod policy;
 pub(crate) mod queue;
 
+pub use executor::{ForgeManagedRewrite, ForgePlannedAttempt, ForgePlannedRewrite};
 pub use fingerprint::{ForgeRewriteEvidence, ForgeRewriteOutcome, ForgeUnsettledOutput};
 pub use handoff::RewriteHandoff;

@@ -2,9 +2,9 @@
 //!
 //! Everything here builds on [`PromotionIntegrationFixture`], which owns the
 //! production graph. This module adds only what a rewrite scenario needs and
-//! promotion did not: a promoted snapshot to rewrite, an exact resource demand
-//! derived the way the planner derives it, the delete state Scribe cannot yet
-//! produce, and the readers that turn produced objects back into rows.
+//! promotion did not: a promoted snapshot to rewrite, a driver that runs one
+//! attempt across every plan the core returned, the delete state Scribe cannot
+//! yet produce, and the readers that turn produced objects back into rows.
 //!
 //! No production behavior is reimplemented. The delete writers are the Iceberg
 //! writers the format defines, and the commit that publishes them is an
@@ -32,10 +32,9 @@ use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use iceberg::writer::{IcebergWriter as _, IcebergWriterBuilder as _};
 use iceberg::{Catalog, TableIdent};
 use vala_bifrost_redux::forge::{
-    Forge, ForgeCapacity, ForgeClock, ForgeEnvelopeSizer, ForgeObjectStore, ForgeRewriteAttempt,
-    ForgeSchedulerTrigger, ForgeWorkerCompletionObserver,
+    Forge, ForgeClock, ForgeError, ForgeManagedRewrite, ForgeObjectStore, ForgeRewriteEvidence,
+    ForgeSchedulerTrigger, ForgeWorkerCompletionObserver, RewriteHandoff,
 };
-use vala_bifrost_redux::resources::ForgeRewriteRequest;
 
 use super::support::{
     CountingObjectStore, PromotionCatalogSeam, PromotionIntegrationFixture, SupervisedPromotion,
@@ -211,47 +210,6 @@ impl PromotedRewriteFixture {
         sequences
     }
 
-    /// Builds the exact resource demand the promoted live set justifies.
-    ///
-    /// Derived through the production [`ForgeEnvelopeSizer`] against the
-    /// production [`ForgeCapacity`], so a scenario cannot request capacity the
-    /// planner would not have persisted.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the configured capacity or the derived envelope is invalid.
-    pub(crate) async fn rewrite_request(&self) -> ForgeRewriteRequest {
-        let files = self.live_data_files().await;
-        let total_bytes = files
-            .iter()
-            .filter(|file| file.content_type() == iceberg::spec::DataContentType::Data)
-            .map(iceberg::spec::DataFile::file_size_in_bytes)
-            .sum::<u64>()
-            .max(1);
-        let capacity =
-            ForgeCapacity::try_from(&self.fixture.config).expect("fixture Forge capacity");
-        let envelope = ForgeEnvelopeSizer::size(
-            total_bytes,
-            files.len().max(1),
-            self.fixture.config.max_concurrent_reads,
-            capacity,
-        )
-        .expect("fixture rewrite envelope");
-        ForgeRewriteRequest {
-            envelope,
-            memory_bytes: usize::try_from(
-                envelope
-                    .memory_bytes()
-                    .expect("fixture envelope resident total"),
-            )
-            .unwrap_or(usize::MAX),
-            scratch_bytes: envelope
-                .scratch_bytes()
-                .expect("fixture envelope scratch total"),
-            reader_permits: 1,
-        }
-    }
-
     /// Builds one production Forge owner with no scheduler and no worker.
     ///
     /// # Panics
@@ -271,19 +229,55 @@ impl PromotedRewriteFixture {
         )
     }
 
-    /// Forms one attempt request against the promoted table.
+    /// Runs one whole attempt: plans once, then rewrites every plan in turn.
     ///
-    /// # Panics
-    ///
-    /// Panics when the resource demand cannot be derived.
-    pub(crate) async fn attempt(&self, attempt_id: uuid::Uuid) -> ForgeRewriteAttempt<'static> {
-        ForgeRewriteAttempt {
-            task_id: uuid::Uuid::now_v7(),
-            attempt_id,
-            request: self.rewrite_request().await,
-            bloom_columns: &[],
-            previous: None,
-            cancel: tokio_util::sync::CancellationToken::new(),
+    /// Every ordinary plan is rewritten independently, which is what the worker
+    /// does, so a scenario observes the same per-plan handoffs the publication
+    /// path receives. Execution stops at the first plan that fails, and the
+    /// attempt handle is returned either way so a scenario can read the
+    /// attempt-global possible-output set after a drain or a failure.
+    pub(crate) async fn run_attempt(
+        &self,
+        forge: &Arc<Forge>,
+        attempt_id: uuid::Uuid,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> AttemptRun {
+        let rewrite = forge
+            .managed_rewrite(
+                &self.fixture.binding,
+                uuid::Uuid::now_v7(),
+                attempt_id,
+                cancel,
+            )
+            .expect("the attempt context builds");
+        let planned = match rewrite.plan().await {
+            Ok(planned) => planned,
+            Err(failure) => {
+                return AttemptRun {
+                    rewrite,
+                    evidence: None,
+                    handoffs: Vec::new(),
+                    failure: Some(failure),
+                };
+            }
+        };
+        let evidence = planned.evidence.clone();
+        let mut handoffs = Vec::with_capacity(planned.plans.len());
+        let mut failure = None;
+        for plan in planned.plans {
+            match rewrite.rewrite_plan(plan, &planned.table).await {
+                Ok(handoff) => handoffs.push(handoff),
+                Err(error) => {
+                    failure = Some(error);
+                    break;
+                }
+            }
+        }
+        AttemptRun {
+            rewrite,
+            evidence: Some(evidence),
+            handoffs,
+            failure,
         }
     }
 
@@ -308,30 +302,6 @@ impl PromotedRewriteFixture {
             .build(),
         );
         (catalog, store)
-    }
-
-    /// Returns every scratch child still present beneath the pod spill root.
-    ///
-    /// An attempt whose lease was finalized leaves none of its own, so this is
-    /// read after an attempt ends to prove the scratch was returned.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the spill root exists but cannot be read.
-    pub(crate) fn scratch_children(&self) -> Vec<String> {
-        let root = self.fixture.rewrite_spill_root();
-        let Ok(entries) = std::fs::read_dir(&root) else {
-            return Vec::new();
-        };
-        entries
-            .map(|entry| {
-                entry
-                    .expect("fixture scratch entry")
-                    .file_name()
-                    .to_string_lossy()
-                    .into_owned()
-            })
-            .collect()
     }
 
     /// Publishes delete files against the promoted snapshot in one commit.
@@ -902,5 +872,76 @@ impl iceberg::io::StorageFactory for RewriteSeamFactory {
         _config: &iceberg::io::StorageConfig,
     ) -> iceberg::Result<Arc<dyn iceberg::io::Storage>> {
         Ok(Arc::clone(&self.storage))
+    }
+}
+
+/// One whole attempt's per-plan results and the attempt handle behind them.
+///
+/// Kept as a struct rather than a tuple because a drained or failed attempt is
+/// still read for its attempt-global possible-output set, which only the
+/// retained handle can answer.
+pub(crate) struct AttemptRun {
+    /// The attempt handle every plan of this run executed under.
+    pub(crate) rewrite: ForgeManagedRewrite,
+    /// Selection evidence, absent only when planning itself failed.
+    pub(crate) evidence: Option<ForgeRewriteEvidence>,
+    /// One handoff per plan that completed, in planner order.
+    pub(crate) handoffs: Vec<RewriteHandoff>,
+    /// The failure that stopped the run, if one did.
+    pub(crate) failure: Option<ForgeError>,
+}
+
+impl AttemptRun {
+    /// Returns the selection evidence of a run that reached execution.
+    ///
+    /// # Panics
+    /// Panics when planning failed, which no caller of this accessor expects.
+    pub(crate) fn evidence(&self) -> &ForgeRewriteEvidence {
+        self.evidence.as_ref().expect("the attempt planned")
+    }
+
+    /// Returns every input path consumed across the run's plans, in order.
+    pub(crate) fn rewritten_data_files(&self) -> Vec<String> {
+        self.handoffs
+            .iter()
+            .flat_map(|handoff| handoff.rewritten_data_files.iter().cloned())
+            .collect()
+    }
+
+    /// Returns every produced object path across the run's plans, in order.
+    pub(crate) fn output_paths(&self) -> Vec<String> {
+        self.handoffs
+            .iter()
+            .flat_map(|handoff| {
+                handoff
+                    .output_data_files
+                    .iter()
+                    .map(|file| file.file_path().to_owned())
+            })
+            .collect()
+    }
+
+    /// Returns every produced object descriptor across the run's plans.
+    pub(crate) fn output_data_files(&self) -> Vec<&DataFile> {
+        self.handoffs
+            .iter()
+            .flat_map(|handoff| handoff.output_data_files.iter())
+            .collect()
+    }
+
+    /// Returns every position-delete path materialized across the run.
+    pub(crate) fn applied_position_delete_files(&self) -> Vec<String> {
+        self.handoffs
+            .iter()
+            .flat_map(|handoff| handoff.applied_position_delete_files.iter().cloned())
+            .collect()
+    }
+
+    /// Returns every equality-delete path materialized across the run.
+    pub(crate) fn applied_equality_delete_files(&self) -> Vec<String> {
+        self.handoffs
+            .iter()
+            .flat_map(|handoff| handoff.applied_equality_delete_files.iter().cloned())
+            .collect()
     }
 }

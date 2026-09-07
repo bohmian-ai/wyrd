@@ -56,9 +56,20 @@ than copying examples from a newer upstream release.
 
 Forge uses DataFusion through the managed compaction core for manifest-backed
 selection, delete application, optional sort execution, partition fan-out, and
-rolling Parquet production. Wyrd injects the admitted runtime, memory/spill
-resources, cancellation token, attempt output identity, immutable table policy,
-and non-semantic observer. It does not reimplement planning or physical rewrite.
+rolling Parquet production. The core first produces real `CompactionPlan`
+values. Forge estimates each plan's peak heap use, then admits plans through a
+strict pod-local FIFO constrained by aggregate estimated memory and
+parallelism. Waiting plans do not count against running memory and cannot
+bypass a blocked head. A plan that fits the worker totals waits for running
+capacity; a plan larger than the worker's total estimated-memory or parallelism
+budget is refused.
+
+The estimate is scheduler accounting, not a hard allocation limit. Forge uses
+DataFusion's default unbounded memory pool, configures no disk spilling, and
+provisions no local scratch storage. Estimator undershoot may OOM the worker;
+durable task, lease, and fence recovery handles that process loss. Wyrd still
+supplies cancellation, attempt output identity, immutable table policy, and a
+non-semantic observer. It does not reimplement planning or physical rewrite.
 
 The managed core may expose narrow seams for runtime injection, structured
 cancellation/drain, output identity, selection evidence, and observations. It
@@ -67,17 +78,16 @@ uncertain-outcome reconciliation.
 
 ## Memory, spill, and concurrency
 
-- Make each query or Forge attempt own its memory-pool lifetime. A process pool
+- Each Oracle query owns its memory-pool and spill lifetime. The process pool
   is an aggregate capacity root, not an operation-local grant.
-- Account scan buffers, repartition buffers, hash state, exchange buffers,
-  output builders, object-store writer buffers, Parquet row groups, footer
-  state, and close/upload concurrency before admission.
-- Keep spill allocation tenant- and operation-bound. Configure capacity,
-  compression, file rotation, cleanup, and failure behavior. Disk exhaustion
-  is a typed operation failure, not a reason to borrow another tenant's space.
+- Oracle accounts scan, repartition, hash, and exchange buffers before
+  admission and keeps spill tenant- and operation-bound.
+- Forge accounts the real plan's scan and prefetch buffers, decoded Arrow
+  batches, sort workspace, writer buffers, delete joins, and fixed headroom in
+  its scheduler estimate. The pod-local FIFO tracks only running estimates.
 - Bound target partitions, file-read concurrency, exchange fan-out, and open
   writers from measured resources. More partitions can increase retained
-  buffers and memory even when each operator is individually bounded.
+  buffers and memory.
 - Stream `RecordBatch` output. A user-sized `collect()` is forbidden.
 
 Accurate statistics drive pruning, join choice, repartitioning, and routing.
@@ -88,10 +98,10 @@ cardinality, null count, or value distribution.
 ## Metrics and dependency boundary
 
 Collect DataFusion plan and operator metrics for rows, batches, elapsed work,
-spills, and partition behavior. Wyrd separately owns admission waits, queue
-age, snapshot acquisition, exchange reservation, peer retry, WAL/catalog age,
-object-store errors, and successful-terminal accounting. Never infer resource
-or durability success from a metric descriptor alone.
+Oracle spills, and partition behavior. Wyrd separately owns admission waits,
+queue age, snapshot acquisition, exchange reservation, peer retry, WAL/catalog
+age, object-store errors, and successful-terminal accounting. Never infer
+resource or durability success from a metric descriptor alone.
 
 `datafusion-distributed` is a pinned `datafusion-contrib` dependency, not part
 of Apache DataFusion core. Wyrd must qualify its planner/codec compatibility,
@@ -129,3 +139,6 @@ DataFusion's owned abstractions already satisfy the required boundary.
 - [DataFusion operator metrics](https://datafusion.apache.org/user-guide/metrics.html)
 - [DataFusion 55 `TableProvider`](https://docs.rs/datafusion/55.0.0/datafusion/catalog/trait.TableProvider.html)
 - [datafusion-distributed](https://github.com/datafusion-contrib/datafusion-distributed)
+redacted
+redacted
+redacted

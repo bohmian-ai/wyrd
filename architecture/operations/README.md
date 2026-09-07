@@ -47,7 +47,7 @@ for it.
 | Scribe | Object storage, stable node identity, WAL/staged persistent volume, resource governors, recovery reconciliation, live-tail peer identity and listener |
 | Oracle | Object storage and catalog, query memory/scratch governors, persistent audit-acceptance WAL, bounded relay health, peer trust and analytical capacity |
 | Forge coordinator | Object storage and Iceberg catalog, `OperatorPool`/`OperatorAudit`, durable demand/task/lease state, scheduler resources, reconciliation and cleanup cursors |
-| Forge worker | Object storage and Iceberg catalog, authenticated assignment/peer trust, `OperatorPool`/`OperatorAudit`, task/lease/fence state, managed-core memory/scratch resources, cancellation and reconciliation health |
+| Forge worker | Object storage and Iceberg catalog, authenticated assignment/peer trust, `OperatorPool`/`OperatorAudit`, task/lease/fence state, pod-local estimated-memory/parallelism admission, cancellation and reconciliation health |
 
 The closed target mapping is:
 

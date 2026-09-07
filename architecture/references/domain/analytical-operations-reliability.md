@@ -28,12 +28,13 @@ their pinned cut and never discover unqualified objects by listing storage.
 
 ## Bounded ownership and backpressure
 
-Every queue and resource class is bounded by its natural unit: items, bytes,
-age, slots, open files, fan-out, or deadline. Scribe accounts global, tenant,
-and table admission; active and immutable memory; durable stage; merge scratch;
-claim ownership; and upload lanes separately. Capacity is work-conserving, but
-contention enforces tenant-then-table fairness and prevents over-share owners
-from reacquiring while an admitted competitor waits.
+Every Wyrd admission queue and governed resource class is bounded by its
+natural unit: items, estimated bytes, age, slots, open files, fan-out, or
+deadline. Scribe accounts global, tenant, and table admission; active and
+immutable memory; durable stage; merge scratch; claim ownership; and upload
+lanes separately. Capacity is work-conserving, but contention enforces
+tenant-then-table fairness and prevents over-share owners from reacquiring
+while an admitted competitor waits.
 
 Scribe preserves acknowledged authority under downstream pressure. It rejects
 new work with a typed retryable response before WAL, stage, scratch, or object
@@ -47,10 +48,16 @@ spill allocation, cancellation tree, and deadline. A reservation refusal never
 mutates the root grant. Cancellation releases every descendant reservation and
 temporary file.
 
-Forge leases resources per tenant/table/task/attempt. Physical writers may run
-concurrently within an attempt, but one fence owns final catalog publication.
-Resource pressure defers or refuses a task; it never silently reduces file
-size, row-group geometry, selection scope, or correctness.
+Forge plans before memory admission, estimates each real compaction plan, and
+queues it in a strict pod-local FIFO. Only running plan estimates count against
+the pod's aggregate memory and parallelism budgets. Waiting plans consume only
+the bounded pending-queue parallelism budget; they do not reserve running
+memory or parallelism and cannot bypass the head. The estimate is not a hard
+DataFusion ceiling, so pod OOM remains possible and is recovered through
+durable task, lease, and fence state. Physical writers may run concurrently,
+but one fence owns final catalog publication. Pressure defers or refuses work
+without changing file size, row-group geometry, selection scope, or
+correctness.
 
 ## Cross-system commit and recovery
 
@@ -95,19 +102,21 @@ Measure at minimum:
 
 - admission refusal by resource category; active owners; queue depth and age;
 - WAL append/fsync/fence latency, bytes, replay, and retirement lag;
-- active, immutable, staged, scratch, claim, upload, and spill ownership;
+- active, immutable, staged, Scribe scratch, claim, upload, and Oracle spill
+  ownership;
 - staged dwell, merge fan-in/passes, row groups, hot-object PUT amplification,
   `file_list` publication, reconciliation, and live-tail source counts;
 - Oracle route, slot wait, planning, pruning, exchange bytes, worker fan-out,
   peer retry, cancellation, TTFF, terminal latency, and incomplete streams;
-- Forge promotion debt, rewrite debt, task queue age, attempts, failure class,
+- Forge promotion debt, rewrite debt, local FIFO age, estimated and observed
+  plan memory, running parallelism, worker loss, attempts, failure class,
   accepted-delete rate, writer estimates and close reasons, commit conflicts,
-  uncertain operations, no-progress refusals, snapshot age, role readiness, and
-  the durable cleanup cursor. Orphan cleanup is measured this way — by its own
-  queue age, attempts, failures, and physically deleted objects — and not by an
-  orphan-backlog gauge: that number is only knowable by a full storage scan
-  that is stale on completion, is not comparable between partial scans, and is
-  not safely aggregatable across replicas;
+  uncertain operations, no-progress refusals, snapshot age, role readiness,
+  and the durable cleanup cursor. Orphan cleanup is measured this way — by its
+  own queue age, attempts, failures, and physically deleted objects — and not
+  by an orphan-backlog gauge: that number is only knowable by a full storage
+  scan that is stale on completion, is not comparable between partial scans,
+  and is not safely aggregatable across replicas;
 - catalog refresh age and object-store latency/error/throughput.
 
 Metrics use stable bounded labels. Tenant, table, batch, task, attempt, path,

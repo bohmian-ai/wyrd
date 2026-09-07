@@ -210,7 +210,7 @@ is not an SSRF control.
   tenant equality, lease generation, and fence before mutation. It is not a
   generic query escape hatch.
 - Bifrost object keys, Iceberg namespaces, WAL, staged runs, Scribe objects,
-  Forge scratch, Oracle spill, caches, and telemetry are tenant-qualified.
+  Oracle spill, caches, and telemetry are tenant-qualified.
 - Encryption keys are scoped so compromise or erasure of one tenant does not
   require decrypting another tenant's data. Deployments that cannot provide
   per-tenant keys use independently encrypted storage domains and retain the

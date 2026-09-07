@@ -409,10 +409,10 @@ concurrently. Each attempt binds tenant, table, task, plan hash, base snapshot,
 target branch, attempt UUIDv7, operation ID, output generation, lease, and
 fence. Loss of authority cancels and drains physical work before settlement.
 
-Forge owns runtime leases, memory, spill, read streams, writer fanout, upload
-buffers, close futures, SQL state, audit, reconciliation, and garbage
-collection. Resource admission may defer a task but never changes table file
-geometry or creates a second grouping algorithm.
+Forge owns runtime leases, pod-local plan admission, read streams, writer
+fanout, upload buffers, close futures, SQL state, audit, reconciliation, and
+garbage collection. Resource admission may defer a plan but never changes
+table file geometry or creates a second grouping algorithm.
 
 ### Scribe hot promotion
 
@@ -451,11 +451,28 @@ guarantee.
 
 The managed compaction core is the sole owner of candidate selection, grouping,
 bin packing, delete application, sorting, partition fanout, bounded concurrent
-writing, rolling, and output `DataFile` production. It consumes one
-Wyrd-admitted execution context with the attempt runtime, memory pool, spill
-root, cancellation tree, output identity, and closed physical observer. It
-never owns tenant authority, leases, SQL, audit, reconciliation, object GC, or
-catalog commit.
+writing, rolling, and output `DataFile` production. After it produces real
+`CompactionPlan` values, Forge estimates each plan's peak heap use from the
+plan, table schema and format version, batch size, prefetch and sort settings,
+delete files, and recommended parallelism.
+
+Each Forge worker owns one strict FIFO queue of those plans. The queue starts
+only its head when both the pod's aggregate estimated-memory budget and running
+parallelism have room. Waiting plans do not consume the running-memory budget,
+and a later smaller plan cannot bypass a blocked head; pending parallelism
+bounds the queue itself. The memory budget is configured per worker or defaults
+to 80 percent of that worker's declared memory. A plan larger than either total
+budget is refused, while a plan that fits the totals waits for running plans to
+release capacity. The budget is an admission estimate, not a `DataFusion`
+allocation ceiling. `DataFusion` runs Forge plans with its default unbounded
+memory pool and without disk spilling; Forge provisions no local scratch
+storage. An underestimated plan can exhaust the pod, after which the durable
+task, lease, and fence recovery path reclaims the lost work. One plan executes
+within one worker; Forge does not split a compaction plan across pods.
+
+The managed core consumes the attempt cancellation tree, output identity, and
+closed physical observer. It never owns tenant authority, leases, SQL, audit,
+reconciliation, object GC, or catalog commit.
 
 The non-committing boundary returns exactly:
 
@@ -546,8 +563,11 @@ No cleanup infers safety from age or path shape alone.
 
 ## Resource and failure invariants
 
-- Every queue, mailbox, stream, fanout, task set, buffer, memory pool, scratch
-  root, spill path, staged namespace, and object upload lane is bounded.
+- Every Wyrd-owned queue, mailbox, stream, fanout, task set, buffer, staged
+  namespace, and object upload lane is bounded. Scribe scratch and Oracle
+  memory pools, scratch roots, and spill paths remain hard-bounded. Forge uses
+  bounded FIFO admission from estimated plan memory instead of a hard
+  `DataFusion` pool or spill path.
 - Global resource owners account tenant and table attribution without creating
   an independent root pool per tenant.
 - Cancellation is structured: stop admission, cancel descendants, join work,

@@ -48,8 +48,8 @@ writes, rolls before accepting the following write once the target is crossed,
 and preserves the final residue for each partition. Neither target is a
 universal lower or upper bound on physical object bytes. The managed core owns selection, grouping, delete
 application, sorting, partition fan-out, rolling, and produced `DataFile`
-values. Forge owns leases, Wyrd resources, attempt identity, handoff validation,
-catalog publication, reconciliation, audit, and SQL settlement.
+values. Forge owns leases, pod-local plan admission, attempt identity, handoff
+validation, catalog publication, reconciliation, audit, and SQL settlement.
 
 The rewrite seam is exactly:
 

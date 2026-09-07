@@ -36,9 +36,7 @@ pub use layout::{
     LayoutSortKey, NullOrder, PhysicalLayout, SortDirection, TimeGranularity, TimePartition,
     TimePartitionError, TimePartitionSpec,
 };
-pub(crate) use logical_table_identity::{
-    LogicalTableIdentity, PhysicalProjectionRole, PhysicalTableProjection,
-};
+pub(crate) use logical_table_identity::{LogicalTableIdentity, PhysicalTableProjection};
 pub use table_ref::TableRef;
 pub(crate) use tenant_table::PhysicalBindingFacts;
 pub use tenant_table::{TenantTableBinding, TenantTableBindingError, TenantTableKey};

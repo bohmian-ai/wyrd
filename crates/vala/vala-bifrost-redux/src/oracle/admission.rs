@@ -1169,7 +1169,7 @@ impl AdmittedQueryGuard {
             )
             .map_err(|_| BifrostError::QueryAdmissionRejected)?;
             let projection = logical
-                .try_project(crate::catalog::PhysicalProjectionRole::Oracle, |facts| {
+                .try_project(|facts| {
                     resources
                         .try_split_memory("oracle_physical_table_projection", facts.material_bytes)
                 })
@@ -1554,7 +1554,7 @@ mod tests {
         let expected_bytes =
             crate::catalog::LogicalTableIdentity::try_new(&tenant, &tenant, &table)
                 .expect("logical identity")
-                .projection_facts(crate::catalog::PhysicalProjectionRole::Oracle)
+                .projection_facts()
                 .expect("checked projection facts")
                 .material_bytes;
         let pool = admitted.memory_pool().expect("admitted query memory pool");

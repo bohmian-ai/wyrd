@@ -160,7 +160,7 @@ impl<'forge> ForgeScheduler<'forge> {
     /// # Errors
     /// Returns invalid configuration when the demand page bound is invalid.
     pub fn new(forge: &'forge Forge) -> Result<Self, ForgeError> {
-        Self::with_owner(forge, Uuid::now_v7())
+        Ok(Self::with_owner(forge, Uuid::now_v7()))
     }
 
     /// Constructs a scheduler with a stable fixture owner across bounded passes.
@@ -169,16 +169,17 @@ impl<'forge> ForgeScheduler<'forge> {
     /// Returns invalid configuration when the demand page bound is invalid.
     #[cfg(feature = "test-support")]
     pub fn with_owner_for_test(forge: &'forge Forge, owner: Uuid) -> Result<Self, ForgeError> {
-        Self::with_owner(forge, owner)
+        Ok(Self::with_owner(forge, owner))
     }
 
     /// Constructs the scheduler dependency graph for one explicit lease owner.
     ///
-    /// # Errors
-    /// Returns invalid configuration when the demand page bound is invalid.
-    fn with_owner(forge: &'forge Forge, owner: Uuid) -> Result<Self, ForgeError> {
+    /// The demand page bound saturates rather than refusing: an out-of-range
+    /// configured value can only mean "more hints than one wake will ever
+    /// page", which the maximum already expresses.
+    fn with_owner(forge: &'forge Forge, owner: Uuid) -> Self {
         let config = &forge.core.config;
-        Ok(Self {
+        Self {
             forge,
             cycle: None,
             tasks: ForgeTasks::new(forge.core.operator_pool.clone()),
@@ -192,7 +193,7 @@ impl<'forge> ForgeScheduler<'forge> {
             demand_refresh_gate: Arc::new(SchedulerDemandRefreshGate::default()),
             #[cfg(feature = "test-support")]
             complete_publications: Arc::new(AtomicUsize::new(0)),
-        })
+        }
     }
 
     /// Arms a deterministic pause before demand discovery for a fence-loss test.

@@ -2974,12 +2974,16 @@ impl ForgeWorker {
                 .map_err(ForgeError::Sql)?;
             lease.require_fence(&self.forge.core.operator_pool).await?;
             self.persist_terminal_success(
-                task.task_id,
+                ForgeTaskTransition {
+                    task_id: task.task_id,
+                    attempt_id: attempt,
+                    owner: self.owner,
+                    expected: ForgeTaskState::Prepared,
+                    next: ForgeTaskState::Succeeded,
+                },
                 task.data_tenant_id,
                 &task.table_ref,
-                attempt,
                 &lease,
-                ForgeTaskState::Prepared,
                 task_progress_effect(
                     &ForgeClaimStrategy::Known(task.strategy),
                     task.base_snapshot_id,
@@ -3691,12 +3695,16 @@ impl ForgeWorker {
             ForgeExecutionEvidenceState::Settled => Ok(()),
             ForgeExecutionEvidenceState::Prepared => {
                 self.persist_terminal_success(
-                    claim.task_id,
+                    ForgeTaskTransition {
+                        task_id: claim.task_id,
+                        attempt_id: attempt,
+                        owner: self.owner,
+                        expected: ForgeTaskState::Prepared,
+                        next: ForgeTaskState::Succeeded,
+                    },
                     claim.data_tenant_id,
                     &claim.table_ref,
-                    attempt,
                     lease,
-                    ForgeTaskState::Prepared,
                     task_progress_effect(
                         &claim.strategy,
                         claim.base_snapshot_id,
@@ -3996,7 +4004,7 @@ impl ForgeWorker {
             .await?;
         let rewrite = self
             .forge
-            .managed_rewrite(binding, claim.task_id, attempt, stop.clone())?;
+            .managed_rewrite(binding, claim.task_id, attempt, stop)?;
         let super::managed::ForgePlannedAttempt {
             table,
             evidence,
@@ -4011,12 +4019,16 @@ impl ForgeWorker {
             // and commit backlog the acknowledgement was made against.
             let metadata = table.metadata();
             self.persist_terminal_success(
-                claim.task_id,
+                ForgeTaskTransition {
+                    task_id: claim.task_id,
+                    attempt_id: attempt,
+                    owner: self.owner,
+                    expected: ForgeTaskState::Running,
+                    next: ForgeTaskState::Succeeded,
+                },
                 claim.data_tenant_id,
                 &claim.table_ref,
-                attempt,
                 lease,
-                ForgeTaskState::Running,
                 TaskProgressEffect::NoOpAcknowledged {
                     snapshot_id: metadata.current_snapshot_id().unwrap_or(0),
                     commit_count: u64::try_from(
@@ -4050,6 +4062,12 @@ impl ForgeWorker {
                 refusal => refusals.push((plan_index, refusal)),
             }
         }
+        tracing::debug!(
+            task_id = %claim.task_id,
+            waiting_parallelism = queue.waiting_parallelism_sum(),
+            refused = refusals.len(),
+            "Forge admitted one attempt's compaction plans"
+        );
         let shared = ForgeRewriteAttempt {
             rewrite: &rewrite,
             table,
@@ -4058,6 +4076,21 @@ impl ForgeWorker {
         let mut outcomes: Vec<(usize, Result<ForgeDispatchResult, ForgeError>)> = Vec::new();
         while let Some(popped) = queue.pop() {
             let plan_index = popped.admission.plan_index;
+            // A drained attempt must not start plans it has not started yet.
+            // Dropping them here is not a lost outcome: an unstarted plan wrote
+            // nothing, holds no operation, and is ordinary planning debt the
+            // next attempt replans from the same table.
+            if stop.is_cancelled() {
+                let dropped = queue.cancel_waiting_task(claim.task_id);
+                tracing::debug!(
+                    task_id = %claim.task_id,
+                    dropped,
+                    running_parallelism = queue.running_parallelism_sum(),
+                    running_memory_reservation_bytes = queue.running_memory_reservation_bytes(),
+                    "Forge dropped the plans a drained attempt had not started"
+                );
+                return Err(ForgeError::Shutdown);
+            }
             let outcome = match popped.runner {
                 Some(plan) => {
                     self.publish_one_plan(claim, binding, lease, &shared, plan, stop)
@@ -5029,18 +5062,7 @@ redacted
                 // operation is closed here rather than left open for a
                 // successor to reconcile a commit that never happened. No row
                 // is settled: `committed_snapshot_id` stays `None`.
-                self.forge
-                    .settle_promotion(
-                        lease,
-                        binding,
-                        ForgePromotionSettlement {
-                            plan: &plan,
-                            phase: ForgeScribePromotionPhase::Reset,
-                            operation_id,
-                            base_snapshot_id: claim.base_snapshot_id,
-                            committed_snapshot_id: None,
-                        },
-                    )
+                self.reset_promotion_operation(claim, binding, lease, &plan, operation_id)
                     .await?;
                 return Err(ForgeError::Catalog(conflict));
             }
@@ -5052,6 +5074,41 @@ redacted
             retried = true;
             reloaded = Some(reloaded_after_conflict);
         }
+    }
+
+    /// Closes one promotion operation as `Reset` after certain non-acceptance.
+    ///
+    /// Reached only once the catalog has definitely refused and the table has
+    /// been read back without this operation's effect, so the commit certainly
+    /// did not land. Closing here is what keeps a successor from reconciling a
+    /// commit that never happened; `committed_snapshot_id` stays `None`
+    /// because no snapshot was settled.
+    ///
+    /// # Errors
+    ///
+    /// Returns the SQL, audit, and fence failures the promotion settlement
+    /// boundary raises.
+    async fn reset_promotion_operation(
+        &self,
+        claim: &ForgeTaskClaim,
+        binding: &TenantTableBinding,
+        lease: &mut ForgeLease,
+        plan: &ScribePromotionPlan,
+        operation_id: Uuid,
+    ) -> Result<(), ForgeError> {
+        self.forge
+            .settle_promotion(
+                lease,
+                binding,
+                ForgePromotionSettlement {
+                    plan,
+                    phase: ForgeScribePromotionPhase::Reset,
+                    operation_id,
+                    base_snapshot_id: claim.base_snapshot_id,
+                    committed_snapshot_id: None,
+                },
+            )
+            .await
     }
 
     /// Decodes one promotion claim's persisted plan.
@@ -6142,14 +6199,13 @@ impl ForgeWorker {
     /// Returns tenant connection, exact lifecycle, audit, fence, or commit errors.
     async fn persist_terminal_success(
         &self,
-        task_id: Uuid,
+        transition: ForgeTaskTransition,
         tenant: DataTenantId,
         table_ref: &ForgeTaskTableIdentity,
-        attempt: Uuid,
         lease: &ForgeLease,
-        expected: ForgeTaskState,
         progress_effect: TaskProgressEffect,
     ) -> Result<(), ForgeError> {
+        let task_id = transition.task_id;
         let mut terminal = self
             .forge
             .core
@@ -6160,13 +6216,7 @@ impl ForgeWorker {
         self.tasks
             .terminal_and_request_replan(
                 &mut terminal,
-                ForgeTaskTransition {
-                    task_id,
-                    attempt_id: attempt,
-                    owner: self.owner,
-                    expected,
-                    next: ForgeTaskState::Succeeded,
-                },
+                transition,
                 table_ref,
                 progress_effect,
                 &task_event(

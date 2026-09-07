@@ -2445,12 +2445,6 @@ impl OracleResources {
 struct ResourceGovernorInner {
     plan: ResourcePlan,
     sources: ResolvedResourceSources,
-    /// Exact roles activated by the checked policy stage.
-    ///
-    /// Forge carries no protected memory floor, so the plan alone cannot report
-    /// whether the role is enabled. Role composition reads this set instead of
-    /// re-deriving activation from floor bytes.
-    roles: BTreeSet<BifrostRole>,
     state: Mutex<ResourceState>,
     /// Lost-wakeup-safe notification paired with `ResourceState::memory_epoch`.
     memory_changed: Notify,
@@ -2655,7 +2649,6 @@ impl BifrostResourceGovernor {
                         ResourceSource::Filesystem
                     },
                 },
-                roles: policy.roles,
                 state: Mutex::new(ResourceState::default()),
                 memory_changed: Notify::new(),
                 cgroup_limit_bytes: crate::scribe::memory::read_cgroup_limit(),
@@ -2665,12 +2658,6 @@ impl BifrostResourceGovernor {
         };
         root.record_plan_metrics();
         Ok(root)
-    }
-
-    /// Reports whether the checked policy stage activated `role`.
-    #[must_use]
-    pub(crate) fn is_enabled(&self, role: BifrostRole) -> bool {
-        self.inner.roles.contains(&role)
     }
 
     /// Publishes immutable closed-role memory and scratch plan gauges.

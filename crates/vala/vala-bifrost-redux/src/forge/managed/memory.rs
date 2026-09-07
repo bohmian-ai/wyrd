@@ -3,7 +3,7 @@
 redacted
 //! `origin/main` `6f8fbbfd06d25d195bdff9a4f1cb246cf4363903`, file
 //! `src/storage/src/hummock/compactor/iceberg_compaction/memory.rs`
-//! (lines 21-468). Licensed Apache-2.0, Copyright RisingWave Labs.
+//! (lines 21-468). Licensed Apache-2.0, Copyright `RisingWave` Labs.
 //!
 //! Only imports and visibility are adapted; every constant, branch, and
 //! arithmetic operation is byte-for-byte upstream. Forge admits plans against
@@ -32,6 +32,41 @@ use std::mem::size_of;
 use iceberg::scan::FileScanTask;
 use iceberg::spec::{DataContentType, FormatVersion, PrimitiveType, Schema, Type};
 use iceberg_compaction_core::compaction::CompactionPlan;
+use num_traits::ToPrimitive;
+
+/// Widens an unsigned 64-bit count to the pointer-sized arithmetic the
+/// estimator sums in.
+///
+/// Every caller is a file size or record count that upstream widens with a
+/// plain cast. On the 64-bit targets Bifrost supports the conversion is exact;
+/// the saturation only exists so a hypothetical 32-bit target degrades to the
+/// largest representable estimate — which the queue then refuses as too large —
+/// instead of wrapping to a small one that would be admitted.
+fn widen(value: u64) -> usize {
+    usize::try_from(value).unwrap_or(usize::MAX)
+}
+
+/// Converts a byte or record count to the float the ratio arithmetic uses.
+///
+/// The conversion is total for every `usize`, so the fallback is unreachable;
+/// it is written rather than asserted because an estimate is not worth a panic.
+/// Precision loss above 2^53 is upstream's and is irrelevant at that magnitude:
+/// the resulting estimate is refused as too large either way.
+fn as_f64(value: usize) -> f64 {
+    value.to_f64().unwrap_or(f64::MAX)
+}
+
+/// Converts a scaled float estimate back to bytes with saturating semantics.
+///
+/// Matches the primitive cast upstream uses: a negative or NaN scale becomes
+/// zero and an overflowing one becomes the largest representable estimate, so
+/// no scale can produce a small figure the queue would wrongly admit.
+fn as_usize(value: f64) -> usize {
+    if value.is_nan() || value <= 0.0 {
+        return 0;
+    }
+    value.to_usize().unwrap_or(usize::MAX)
+}
 
 /// `DataFusion`'s `datafusion.execution.sort_spill_reservation_bytes` default.
 ///
@@ -95,7 +130,7 @@ pub(crate) fn estimate_plan_memory(
     for task in data_files {
         match task.record_count {
             Some(count) => {
-                record_count = record_count.saturating_add(count as usize);
+                record_count = record_count.saturating_add(widen(count));
             }
             None => has_complete_record_counts = false,
         }
@@ -238,8 +273,8 @@ pub(crate) fn estimate_plan_memory(
         .checked_div(max_record_batch_rows)
         .unwrap_or_default();
     let batch_overlap =
-        (total_batches as f64 / executor_parallelism.saturating_mul(8) as f64).min(1.0);
-    let batch_heap_bytes = (batch_overhead_bytes as f64 * batch_overlap) as usize;
+        (as_f64(total_batches) / as_f64(executor_parallelism.saturating_mul(8))).min(1.0);
+    let batch_heap_bytes = as_usize(as_f64(batch_overhead_bytes) * batch_overlap);
     // OpenDAL S3 buffers the active compressed input while Parquet decoding and scan batches
     // overlap. This phase is independent from DataFusion's logical pool reservations.
     let scan_heap_bytes = active_input_bytes
@@ -249,14 +284,17 @@ pub(crate) fn estimate_plan_memory(
     let writer_heap_bytes = if schema_row_width.is_some() {
         decoded_output_bytes.saturating_mul(3) / 2
     } else {
-        let output_scale = output_parallelism.min(4) as f64 / 4.0;
+        let output_scale = as_f64(output_parallelism.min(4)) / 4.0;
         let large_single_scan_scale = if executor_parallelism == 1 {
-            (active_input_bytes as f64 / DATAFUSION_STREAMING_DECODED_WINDOW_BYTES as f64).min(1.0)
+            (as_f64(active_input_bytes) / as_f64(DATAFUSION_STREAMING_DECODED_WINDOW_BYTES))
+                .min(1.0)
         } else {
             0.0
         };
-        ((decoded_output_bytes / 2).min(DATAFUSION_WRITER_WINDOW_BYTES) as f64
-            * output_scale.max(large_single_scan_scale)) as usize
+        as_usize(
+            as_f64((decoded_output_bytes / 2).min(DATAFUSION_WRITER_WINDOW_BYTES))
+                * output_scale.max(large_single_scan_scale),
+        )
     }
     .min(DATAFUSION_WRITER_WINDOW_BYTES);
     let streaming_heap_bytes = scan_heap_bytes.saturating_add(writer_heap_bytes);
@@ -268,11 +306,12 @@ pub(crate) fn estimate_plan_memory(
         .position_delete_files
         .iter()
         .filter_map(|task| task.record_count)
-        .fold(0u64, u64::saturating_add) as usize;
+        .fold(0u64, u64::saturating_add);
+    let position_delete_records = widen(position_delete_records);
     let join_heap_bytes = if position_delete_records > 0 {
-        let delete_ratio = position_delete_records as f64 / record_count.max(1) as f64;
+        let delete_ratio = as_f64(position_delete_records) / as_f64(record_count.max(1));
         let overlap_factor = 0.6 + 0.3 * delete_ratio.min(1.0);
-        (hidden_total_bytes as f64 * overlap_factor) as usize
+        as_usize(as_f64(hidden_total_bytes) * overlap_factor)
             + position_delete_raw_bytes.saturating_mul(8)
     } else if !plan.file_group.equality_delete_files.is_empty() {
         hidden_total_bytes.saturating_add(equality_delete_bytes)
@@ -378,7 +417,7 @@ fn estimate_provider_prefetch<'a>(
     concurrency: usize,
 ) -> usize {
     let mut file_sizes = tasks
-        .map(|task| task.file_size_in_bytes as usize)
+        .map(|task| widen(task.file_size_in_bytes))
         .collect::<Vec<_>>();
     file_sizes.sort_unstable_by(|left, right| right.cmp(left));
     file_sizes
@@ -389,7 +428,7 @@ fn estimate_provider_prefetch<'a>(
 
 fn sum_file_sizes<'a>(tasks: impl Iterator<Item = &'a FileScanTask>) -> usize {
     tasks
-        .map(|task| task.file_size_in_bytes as usize)
+        .map(|task| widen(task.file_size_in_bytes))
         .fold(0usize, usize::saturating_add)
 }
 
@@ -436,10 +475,10 @@ fn position_delete_row_width(plan: &CompactionPlan) -> usize {
 fn hidden_row_width(plan: &CompactionPlan, format_version: FormatVersion) -> usize {
     // Match DataFusionTaskContextBuilder: equality deletes add an i64 sequence number, while
     // pre-V3 position deletes add the data path Utf8 array and an i64 row position.
-    let sequence_number_width = if !plan.file_group.equality_delete_files.is_empty() {
-        size_of::<i64>()
-    } else {
+    let sequence_number_width = if plan.file_group.equality_delete_files.is_empty() {
         0
+    } else {
+        size_of::<i64>()
     };
     let position_delete_width = if format_version < FormatVersion::V3
         && !plan.file_group.position_delete_files.is_empty()
@@ -476,7 +515,7 @@ fn primitive_width(primitive: &PrimitiveType) -> Option<usize> {
         | PrimitiveType::TimestampNs
         | PrimitiveType::TimestamptzNs => 8,
         PrimitiveType::Decimal { .. } | PrimitiveType::Uuid => 16,
-        PrimitiveType::Fixed(size) => *size as usize,
+        PrimitiveType::Fixed(size) => widen(*size),
         PrimitiveType::String | PrimitiveType::Binary => return None,
     };
     Some(width)
@@ -732,7 +771,7 @@ redacted
             true,
         );
         assert!(
-            saturated > u64::MAX as usize / 2,
+            saturated > usize::MAX / 2,
             "saturating arithmetic keeps an absurd plan absurdly large"
         );
     }

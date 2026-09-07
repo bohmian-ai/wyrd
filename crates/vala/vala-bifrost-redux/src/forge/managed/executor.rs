@@ -91,7 +91,7 @@ impl Forge {
         binding: &TenantTableBinding,
         task_id: Uuid,
         attempt_id: Uuid,
-        cancel: CancellationToken,
+        cancel: &CancellationToken,
     ) -> Result<ForgeManagedRewrite, ForgeError> {
         ForgeManagedRewrite::new(Arc::clone(&self.core), binding, task_id, attempt_id, cancel)
     }
@@ -141,10 +141,10 @@ impl ForgeManagedRewrite {
         binding: &TenantTableBinding,
         task_id: Uuid,
         attempt_id: Uuid,
-        cancel: CancellationToken,
+        cancel: &CancellationToken,
     ) -> Result<Self, ForgeError> {
         let observer = Arc::new(ForgeRewriteObserver::new());
-        let context = unbounded_context_for(attempt_id, &cancel, &observer)?;
+        let context = unbounded_context_for(attempt_id, cancel, &observer)?;
         Ok(Self {
             core,
             binding: binding.clone(),

@@ -3,7 +3,7 @@
 redacted
 //! `origin/main` `6f8fbbfd06d25d195bdff9a4f1cb246cf4363903`, file
 //! `src/storage/src/hummock/compactor/iceberg_compaction/mod.rs`
-//! (lines 40-385). Licensed Apache-2.0, Copyright RisingWave Labs.
+//! (lines 40-385). Licensed Apache-2.0, Copyright `RisingWave` Labs.
 //!
 //! The accounting rules are upstream's exactly, because they are the reason a
 //! worker cannot over-commit itself: waiting plans charge parallelism only,
@@ -142,7 +142,9 @@ impl<R> std::fmt::Debug for ForgeCompactionQueue<R> {
                 &self.pending_parallelism_budget,
             )
             .field("total_memory_budget_bytes", &self.total_memory_budget_bytes)
-            .finish()
+            .field("resource_map", &self.resource_map.len())
+            .field("runners", &self.runners.len())
+            .finish_non_exhaustive()
     }
 }
 
@@ -196,17 +198,6 @@ impl<R> ForgeCompactionQueue<R> {
     /// Returns the estimated memory currently charged to running plans.
     pub(crate) fn running_memory_reservation_bytes(&self) -> usize {
         self.running_memory_reservation_bytes
-    }
-
-    /// Returns how many additional plan runners the worker may pull.
-    ///
-    /// This is upstream's `min(max - running_parallelism, 4)`: waiting work and
-    /// waiting memory deliberately do not reduce it, because the pull bound
-    /// exists to keep the running set inside the worker's parallelism, not to
-    /// keep the queue short.
-    pub(crate) fn pull_count(&self) -> usize {
-        const MAX_PULL_BATCH: u32 = 4;
-        usize::try_from(self.available_parallelism().min(MAX_PULL_BATCH)).unwrap_or(0)
     }
 
     /// Returns parallelism available to a plan that would start now.
@@ -569,21 +560,6 @@ redacted
         assert!(queue.finish_running((task(1), 0)));
         assert_eq!(queue.pop().expect("head fits").admission.task_id, task(2));
         assert_eq!(queue.pop().expect("tail fits").admission.task_id, task(3));
-
-        // The pull bound is min(free running parallelism, 4) and ignores waiting work.
-        let mut queue = ForgeCompactionQueue::new(8, 32, usize::MAX);
-        assert_eq!(queue.pull_count(), 4);
-        assert_eq!(queue.push(admission(1, 0, 6), ()), ForgePushResult::Added);
-        assert_eq!(
-            queue.pull_count(),
-            4,
-            "waiting work does not reduce the pull"
-        );
-        queue.pop().expect("head fits");
-        assert_eq!(queue.pull_count(), 2);
-        assert_eq!(queue.push(admission(2, 0, 2), ()), ForgePushResult::Added);
-        queue.pop().expect("head fits the remaining parallelism");
-        assert_eq!(queue.pull_count(), 0);
 
         // An empty queue is inert.
         let mut queue: ForgeCompactionQueue<()> = ForgeCompactionQueue::new(8, 32, usize::MAX);

@@ -211,8 +211,8 @@ Observability code is explicit about:
 - Projection and pruning behavior
 - Ingestion vs query responsibilities
 
-Every observation row carries `card_ref` (per row, server-authorized) plus
-opaque client-generated `run_id`.
+Every observation row carries server-stamped `principal_id`. Optional per-row
+`card_ref` is server-authorized when present; `run_id` remains opaque.
 
 Evaluation code keeps deterministic assertions deterministic.
 Model-based judging is isolated from assertion logic and tested with mock

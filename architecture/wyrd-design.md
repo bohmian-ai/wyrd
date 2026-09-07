@@ -105,11 +105,13 @@ to this version from their owning sources.
     `Audit`, `Operator`, `Trigger`) may be referenced for governance but never
     enter the emit scope. Service principals start from their Service card and
     therefore include declared `Service.components`; Agent principals start from
-    their Agent card and include its declared card refs. The observation envelope
-    carries the run's Target `card_ref`, which the server authorizes against that
-    scope, and `run_id` carries which action emitted it. A separate emit
-    credential was redundant — see "Observation identity — Card → Run →
-    Observation".
+    their Agent card and include its declared card refs. Token mint and refresh
+    resolve those bounded scope identities to Card UIDs and sign that mapping.
+    An observation may carry the run's Target `card_ref`; when present, the
+    server authorizes it against that scope and stamps the mapped `card_uid`.
+    Generic telemetry may omit it and retains the authenticated publisher through
+    `principal_id`. A separate emit credential was redundant — see "Observation
+    identity — Card → Run → Observation".
     - **Auth** gates Wyrd API calls: `Permission { resource, action }` on the
       handler, stateless pubkey verify of the access token. Answers "is this
       principal allowed to hit this Wyrd route?" This covers data-plane ingest
@@ -474,38 +476,52 @@ introduce a competing request identity.
 
 #### Observation identity — `Card → Run → Observation`
 
-How an observation ties to a Run and a Card, and how the server resolves it.
-The lineage spine is fixed: every Run is bound to a Card version, its
-**Target**, and every Observation anchors to both that Card version and the Run
-it belongs to. The server owns runtime resolution of that identity.
+How Card-correlated telemetry ties to a Run and a Card, and how the server
+resolves it. Every Run is bound to a Card version, its **Target**. A telemetry
+row may omit Card correlation; when supplied, the `(card_ref, run_id)` pair
+anchors it to that Target and Run. The server owns resolution of that identity.
 
 **A principal is not a card.** A Service or Agent principal is bound to one card
 (its `card_ref`), but a Service card *nests components* — each a card in its own
 right (e.g. Model A, Model B, a Prompt; `Service.components`). `wyrd_state["a"]
 .run()` and `wyrd_state["b"].run()` execute under the **same** JWT yet target
 **different** component cards, and a Run is specific to the card that opened it.
-So the JWT alone cannot say which card a record belongs to — the run's Target
-card must be carried on the wire.
+So the principal's root Card cannot say which card a correlated record belongs
+to — the run's Target Card must be carried on that row. Generic telemetry may
+omit a Target Card.
 
-Every observation row carries:
+Every accepted row carries authenticated publisher and request identity; Card
+and Run correlation are optional per-row values:
 
 | Value | Source | Grain | Means |
 |---|---|---|---|
-| `card_ref` | **client asserts the run's Target card; server authorizes it** | **per row** | the Card-version anchor — *which* card |
-| `run_id` | client-generated per `.run()`; passed through opaquely | **per row** | the Run anchor — *which* execution |
+| `card_ref` | optional client assertion of the run's Target Card; server authorizes it when present | per row | the optional Card-version anchor — *which* Card |
+| `run_id` | optional client-generated value per `.run()`; passed through opaquely | per row | the optional Run anchor — *which* execution |
+| `principal_id` | server-stamped from the verified JWT | per request | the authenticated publisher — *who* emitted it |
 | `tenant_id` | server-stamped from the verified JWT | per request | the tenancy boundary |
 | `wyrd_request_id` | the propagated `Wyrd-Request-Id` (minted at first sighting) | per request | the request spine — one request spans **many** runs and hops |
 
-Resolution rule: **tenant comes from the token; `card_ref` is client-asserted
-and server-authorized; `run_id` and `wyrd_request_id` pass through untouched.**
+Resolution rule: **tenant and `principal_id` come from the token; a present
+`card_ref` is client-asserted, server-authorized, and resolved from its trusted
+signed scope mapping; absent Card correlation produces null `card_uid`;
+`run_id` and `wyrd_request_id` pass through untouched.**
+
+On OTLP input, canonical table projection reads these optional values from the
+record-level attributes named exactly `wyrd.card_ref` and `wyrd.run_id`. The
+final duplicate key wins, matching Wyrd's existing OTLP attribute lookup rule,
+while every original attribute entry remains in the lossless payload.
+`wyrd.card_ref` uses the compact `CardRef` text grammar; a client `#uid` suffix
+is syntactically valid but untrusted and ignored when the server selects the UID
+from signed scope. `wyrd.run_id` uses the existing `RunId` text grammar.
 Consequences, stated so they stop drifting:
 
-- **`card_ref` and `run_id` are per-row columns on the observation payload, not
+- **`card_ref` and `run_id` are optional per-row columns on the observation payload, not
   request metadata.** A client-side queue batches records from different runs —
   and different cards — before it flushes, so one sealed batch (one
   `wyrd_batch_id`) freely mixes them. The producer is keyed by **table only**; it
-  never splits a batch by card or run. The server therefore authorizes `card_ref`
-  **per row** (every distinct card in the batch must be in the principal's scope),
+  never splits a batch by card or run. The server therefore authorizes every
+  present `card_ref` **per row** (every distinct asserted Card in the batch must
+  be in the principal's scope),
   validates the client-generated UUIDv7 `wyrd_batch_id`, stamps
   request-scoped `data_tenant_id`, `wyrd_request_id`, and
   `wyrd_ingested_at`, validates caller-supplied `wyrd_event_time` against a
@@ -513,7 +529,9 @@ Consequences, stated so they stop drifting:
   normalizes them), and assigns one `wyrd_row_ordinal` per row across the
   complete logical batch.
 
-- **`card_ref` is authorized, not trusted.** The server checks the asserted
+- **`card_ref` is optional and authorized, not trusted.** Its absence is valid
+  generic telemetry and produces null `card_uid`; the authenticated publisher
+  remains available through non-null `principal_id`. When present, the server checks the asserted
   `card_ref` against the principal's **card scope**. For Service and Agent
   principals, the scope is the principal's own `card_ref` plus the
   **observation-target** cards reachable through the transitive card-ref graph
@@ -525,7 +543,10 @@ Consequences, stated so they stop drifting:
   specs contribute their declared card refs according to the shared card-ref
   extraction rules. A `card_ref` outside that set is rejected: a principal may
   not attribute records to a card outside its declared graph. The scope can be resolved from the
-  signed `card_ref_scope` claim minted into the JWT at `/auth/token`.
+  signed `card_ref_scope` claim minted into the JWT at `/auth/token`. Token mint
+  and refresh resolve each bounded member against the tenant Card registry and
+  sign its authoritative UID with the identity. Ingest uses that verified
+  in-memory mapping and performs no Card-registry Postgres or cache lookup.
 - **This is not the governance token.** `card_ref` is one field in the
   observation envelope, authorized by the existing JWT plus the principal's
   declared card-ref graph — not a separate per-card credential (doctrine #18).
@@ -535,7 +556,8 @@ Consequences, stated so they stop drifting:
   server never persists a run table and never resolves `run_id` back to a card
   — the card is the authorized `card_ref` on the row. `run_id` is an **opaque**
   correlation id, never a composite that encodes the card.
-- **`Card → Run → Observation` is the `(card_ref, run_id)` pair on the row;** the
+- **When present, `Card → Run → Observation` is the `(card_ref, run_id)` pair on
+  the row;** generic telemetry remains attributable to `principal_id`, and the
   request spine is the `wyrd_request_id` label that joins many runs across hops.
 - **Subject ≠ emitter belongs to produced kinds.** A monitor emitting Drift or
   Eval about a card outside its own scope carries an explicit, independently

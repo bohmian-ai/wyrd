@@ -559,18 +559,22 @@ mod pg_tests {
         let fields = described["fields"]
             .as_array()
             .ok_or("describe returns fields")?;
-        for name in ["name", "status"] {
+        for name in ["name", "status_code"] {
             assert!(
                 fields.iter().any(|field| field["name"] == name),
                 "trace field {name} is discoverable: {described}"
             );
         }
 
-        // One bounded read-only trace query returns one complete result.
-        let lower = (now - chrono::Duration::minutes(1)).to_rfc3339();
-        let upper = (now + chrono::Duration::minutes(1)).to_rfc3339();
+        // One bounded read-only trace query returns one complete result. The
+        // canonical span ledger stores the OTLP status as its numeric
+        // `status_code` and the start instant as `start_time_unix_nano`, so the
+        // window is expressed in nanoseconds rather than as a timestamp.
+        let minute_nanos = 60_000_000_000_i64;
+        let lower = start - minute_nanos;
+        let upper = start + minute_nanos;
         let sql = format!(
-            "SELECT name, status FROM {table} WHERE status = 'ERROR' AND start_time >= TIMESTAMP '{lower}' AND start_time < TIMESTAMP '{upper}'"
+            "SELECT name, status_code FROM {table} WHERE status_code = 2 AND start_time_unix_nano >= {lower} AND start_time_unix_nano < {upper}"
         );
         let result = client
             .call_tool(query(serde_json::json!({"sql": sql, "max_rows": 10})))
@@ -586,13 +590,13 @@ mod pg_tests {
             content["columns"],
             serde_json::json!([
                 {"name": "name", "data_type": "Utf8", "nullable": false},
-                {"name": "status", "data_type": "Utf8", "nullable": false},
+                {"name": "status_code", "data_type": "Int32", "nullable": true},
             ]),
             "columns are projected exactly once, in schema order"
         );
         assert_eq!(
             content["rows"],
-            serde_json::json!([["error-span", "ERROR"]]),
+            serde_json::json!([["error-span", 2]]),
             "rows are positional arrays carrying the selected trace"
         );
         assert_eq!(
@@ -611,11 +615,11 @@ mod pg_tests {
         for (case, arguments) in [
             (
                 "row ceiling",
-                serde_json::json!({"sql": format!("SELECT name, status FROM {table}"), "max_rows": 1}),
+                serde_json::json!({"sql": format!("SELECT name, status_code FROM {table}"), "max_rows": 1}),
             ),
             (
                 "byte ceiling",
-                serde_json::json!({"sql": format!("SELECT name, status FROM {table}"), "max_bytes": 1}),
+                serde_json::json!({"sql": format!("SELECT name, status_code FROM {table}"), "max_bytes": 1}),
             ),
         ] {
             let refusal = problem(client.call_tool(query(arguments)).await?)?;
@@ -637,7 +641,7 @@ mod pg_tests {
         let handle = client
             .send_cancellable_request(
                 ClientRequest::CallToolRequest(CallToolRequest::new(query(
-                    serde_json::json!({"sql": format!("SELECT name, status FROM {table}")}),
+                    serde_json::json!({"sql": format!("SELECT name, status_code FROM {table}")}),
                 ))),
                 PeerRequestOptions::no_options(),
             )

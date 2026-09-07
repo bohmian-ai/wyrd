@@ -48,9 +48,17 @@ non-null columns:
 - `wyrd_request_id`: server-minted or validated request correlation;
 - `data_tenant_id`: authenticated tenant-isolation identity.
 
-Nullable `run_id`, `card_uid`, and `principal_id` provide correlation and do
-not participate in row identity. Within a tenant-qualified physical table, row
-identity is:
+Nullable `run_id` and `card_uid` provide optional Card/Run correlation.
+Required, non-null `principal_id` identifies the authenticated publisher. None
+participates in row identity.
+
+For OTLP records, table-owned projection reads correlation only from the final
+record-level `wyrd.card_ref` and `wyrd.run_id` attributes, retaining all source
+attributes losslessly. The values use the existing `CardRef` and `RunId` text
+grammars. Any client Card UID is ignored; Scribe stamps only the UID from the
+verified principal scope.
+
+Within a tenant-qualified physical table, row identity is:
 
 ```text
 (wyrd_batch_id, wyrd_row_ordinal)
@@ -64,9 +72,10 @@ Globally it is:
 
 The ordinal is contiguous across request order and never resets at an Arrow
 batch, WAL segment, shard, staged run, Parquet row group, object, snapshot, or
-Forge rewrite. Gate validates the batch identity, assigns ordinals before
-Scribe admission, and prevents payload columns from supplying server-owned
-fields. A retry preserves the batch ID. Within the idempotency-retention window,
+Forge rewrite. Gate validates the batch identity and routes the authenticated
+write. Scribe assigns request-wide ordinals while table-owned validation
+prevents payload columns from supplying server-owned fields. A retry preserves
+the batch ID. Within the idempotency-retention window,
 reusing an accepted ID requires the same schema fingerprint, row count, row
 order, and payload digest; any mismatch is a stable batch-identity conflict.
 

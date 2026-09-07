@@ -5,11 +5,13 @@ description: Review one immutable cumulative Wyrd task implementation against it
 
 # Wyrd Task Review
 
-Keep the reviewed source and active packet read-only. Verification may write
-ordinary build artifacts or isolated test state. Review exactly one task's
-complete immutable base-to-candidate range. After remediation, include the
-original task, every remediation task, prior findings, and the cumulative
-candidate; never review only the latest fix diff.
+Keep the reviewed source and active packet authority read-only. The sole
+active-packet write allowed during review is review output under
+`changes/active/<slug>/review/`. Verification may also write ordinary build
+artifacts or isolated test state. Review exactly one task's complete immutable
+base-to-candidate range. After remediation, include the original task, every
+remediation task, prior findings, and the cumulative candidate; never review
+only the latest fix diff.
 
 ## Establish the review subject
 
@@ -33,12 +35,19 @@ Follow CodeGraph instructions. Inspect changed owners plus only the callers,
 consumers, negative and cleanup paths, generated surfaces, tests, manifests,
 and `mise.toml` commands needed to evaluate the task.
 
+Before dispatching reviewers, create the associated change's
+`changes/active/<slug>/review/` directory. Assign each reviewer a unique path
+using `<task-id>-<candidate-short-sha>-reviewer-<n>.md`; never overwrite an
+existing report. These files are review evidence, not part of the immutable
+candidate being reviewed.
+
 ## Run independent code review
 
 Dispatch one independent read-only reviewer over the exact immutable task
 subject before deciding the verdict. Give it the approved spec and complete
-task authority, but not an intended verdict. The reviewer never edits,
-implements, plans remediation, or changes the review subject.
+task authority, but not an intended verdict. Apart from its assigned review
+report, the reviewer never edits, implements, plans remediation, or changes the
+review subject.
 
 Require explicit coverage of correctness, security, code quality,
 maintainability, tests, developer experience, and architecture/contracts.
@@ -46,7 +55,8 @@ Audit every diff for persistence and transactions, async and concurrency,
 PyO3, Vala or Bifrost, and UI or TypeScript boundaries, plus any other
 high-risk boundary identified from repository authority. For each category,
 record either the distinct independent specialist who reviewed it or the
-source-backed reason it is not applicable. Each reviewer returns:
+source-backed reason it is not applicable. Each reviewer writes the following
+complete report to its assigned review path:
 
 - a coverage ledger for changed production files, mapped obligations,
   high-risk boundaries, user-facing behavior, and applicable repository rules;
@@ -61,6 +71,11 @@ and does not validate its own candidates. A triggered specialist also runs in
 a separate context from the baseline reviewer. One specialist may cover
 multiple triggered lenses only when its ledger names each lens and demonstrates
 the relevant source inspection; otherwise dispatch another specialist.
+
+The reviewer returns to the orchestrator only its completion status and report
+path. Do not inline the report, findings, coverage ledger, or reasoning in
+terminal or agent output. The orchestrator reads the report file before
+validating its candidates.
 
 The task-review orchestrator independently validates every candidate against
 source and authority. Reject unsupported, unreachable, preference-only,
@@ -143,8 +158,11 @@ Return one verdict:
 - `BLOCKED` — the immutable subject, essential authority, mandatory independent
   review, or required coverage ledger cannot be obtained.
 
-Use this exact user-facing structure for every verdict. Keep every heading and
-field in this order; write `None` when a field has no entries.
+Write every verdict to
+`changes/active/<slug>/review/<task-id>-<candidate-short-sha>-verdict.md` using
+this exact structure. Never overwrite an existing verdict; add the next
+available numeric suffix when the same candidate is reviewed again. Keep every
+heading and field in this order; write `None` when a field has no entries.
 
 ```markdown
 # <VERDICT>
@@ -207,5 +225,7 @@ compact instead of repeating the task or spec. List only validated blocking
 findings and validated follow-up.
 `REMEDIATE` routes them to `$wyrd-plan`, not directly to ad hoc implementation.
 `APPROVE` approves only this task candidate; it does not merge, push, deploy, or
-replace final `$wyrd-change-review`. The review phase does not edit the active
-packet; the caller or execution harness may record the returned verdict there.
+replace final `$wyrd-change-review`. Terminal output contains only the verdict,
+the saved verdict path, the next skill, and finding IDs when present; never
+inline the saved review. The review phase does not edit active-packet authority
+or task evidence outside `review/`.

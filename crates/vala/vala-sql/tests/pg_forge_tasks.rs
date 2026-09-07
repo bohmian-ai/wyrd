@@ -12,7 +12,7 @@ mod pg_tests {
         ExpiredCleanupCandidateRequest, ExpiredCleanupOutcome, ExpiredCleanupPayload,
         FORGE_TASK_PAYLOAD_VERSION, ForgeClaimStrategy, ForgeCleanupCandidate,
         ForgeCleanupCategory, ForgeCleanupPath, ForgeTaskEstimates, ForgeTaskEvidence,
-        ForgeTaskLane, ForgeTaskPlan, ForgeTaskRowEvidence, ForgeTaskState, ForgeTaskStrategy,
+        ForgeTaskPlan, ForgeTaskRowEvidence, ForgeTaskState, ForgeTaskStrategy,
         ForgeTaskTableIdentity, ForgeTaskTransition, ForgeTaskTransitionOutcome,
         MAINTENANCE_STRATEGIES, NewForgeTask, ORPHAN_CLEANUP_PAYLOAD_VERSION, OrphanCleanupPayload,
         SnapshotWatermark,
@@ -33,20 +33,19 @@ mod pg_tests {
         (fixture, admin)
     }
 
-    /// Builds one valid, already-eligible enqueue request with caller-selected identity and lane.
+    /// Builds one valid, already-eligible enqueue request with caller-selected identity.
     ///
     /// The one-second margin keeps host and container clocks from making an
     /// immediate claim nondeterministically observe a future `ready_at`.
     ///
     /// # Panics
     /// Panics when the fixed test identity is invalid.
-    fn task(tenant: DataTenantId, table: &str, lane: ForgeTaskLane, hash: u8) -> NewForgeTask {
+    fn task(tenant: DataTenantId, table: &str, hash: u8) -> NewForgeTask {
         NewForgeTask {
             data_tenant_id: tenant,
             table_ref: ForgeTaskTableIdentity::new("wyrd-redux", "vala.bifrost", table)
                 .expect("identity"),
             strategy: ForgeTaskStrategy::SmallFiles,
-            lane,
             base_snapshot_id: i64::from(hash),
             plan: ForgeTaskPlan {
                 version: FORGE_TASK_PAYLOAD_VERSION,
@@ -54,27 +53,7 @@ mod pg_tests {
                 parameters: serde_json::json!({}),
             },
             plan_hash: [hash; 32],
-            estimates: ForgeTaskEstimates {
-                files: 1,
-                bytes: 100,
-                parallelism: 1,
-                memory_bytes: 40 * 1024 * 1024,
-                spill_bytes: 50,
-                large_ceiling_bytes: 64 * 1024 * 1024,
-                envelope: Some(vala_sql::row_types::forge_tasks::ForgeTaskEnvelope {
-                    version: vala_sql::row_types::forge_tasks::FORGE_ENVELOPE_VERSION,
-                    reader_permits: 1,
-                    decoded_batch_bytes: 10,
-                    decoded_input_bytes: 10,
-                    sort_working_bytes: 30,
-                    sort_merge_reservation_bytes: 10,
-                    encoder_buffer_bytes: 40,
-                    upload_chunk_bytes: 20,
-                    footer_encoded_bytes: 8 * 1024 * 1024,
-                    footer_decode_workspace_bytes: 32 * 1024 * 1024,
-                    sort_spill_bytes: 50,
-                }),
-            },
+            estimates: ForgeTaskEstimates { files: 1, bytes: 100 },
             ready_at: Utc::now() - Duration::seconds(1),
         }
     }
@@ -91,7 +70,7 @@ mod pg_tests {
                 inputs: vec![format!("metadata/{table}.avro")],
                 parameters: serde_json::json!({"kind": "maintenance"}),
             },
-            ..task(tenant, table, ForgeTaskLane::Ordinary, hash)
+            ..task(tenant, table, hash)
         }
     }
 
@@ -113,188 +92,33 @@ mod pg_tests {
         )
     }
 
-    /// Returns permissive positive capacity limits for lifecycle tests.
+    /// Returns permissive positive claim limits for lifecycle tests.
     fn limits(max_active_per_tenant: u32) -> ForgeClaimLimits {
         ForgeClaimLimits {
             max_active_per_tenant,
             lease_seconds: 30,
-            max_files: 10,
-            max_bytes: 1_000,
-            max_parallelism: 4,
-            max_memory_bytes: 128 * 1024 * 1024,
-            max_spill_bytes: 1_000,
-            max_large_task_bytes: 2_000,
         }
     }
 
-    /// Version-two envelope terms survive enqueue and fair-claim decoding exactly.
+    /// Retry settlement persists the closed failure class and its bounded delay.
     #[tokio::test]
-    async fn forge_envelope_v2_round_trips_and_aggregates_match() {
-        let (fixture, _admin) = setup().await;
-        let tasks = ForgeTasks::new(fixture.operator_pool().clone());
-        let expected = task(
-            fixture.data_tenant_id(),
-            "envelope-round-trip",
-            ForgeTaskLane::Ordinary,
-            211,
-        );
-        tasks.enqueue(&expected).await.expect("enqueue envelope");
-
-        let claim = tasks
-            .claim_fair(Uuid::now_v7(), limits(1), None)
-            .await
-            .expect("claim query")
-            .expect("claim");
-
-        assert_eq!(claim.estimates.files, expected.estimates.files);
-        assert_eq!(claim.estimates.bytes, expected.estimates.bytes);
-        assert_eq!(claim.estimates.parallelism, expected.estimates.parallelism);
-        assert_eq!(
-            claim.estimates.memory_bytes,
-            expected.estimates.memory_bytes
-        );
-        assert_eq!(claim.estimates.spill_bytes, expected.estimates.spill_bytes);
-        assert_eq!(claim.estimates.envelope, expected.estimates.envelope);
-        let envelope = claim.estimates.envelope.expect("version-two envelope");
-        assert_eq!(
-            envelope.memory_bytes().expect("resident total"),
-            claim.estimates.memory_bytes
-        );
-        assert_eq!(
-            envelope.scratch_bytes().expect("scratch total"),
-            claim.estimates.spill_bytes
-        );
-    }
-
-    /// Version-zero rows decode without manufacturing executable detail terms.
-    #[tokio::test]
-    async fn legacy_envelope_defaults_are_non_executable() {
-        let (fixture, admin) = setup().await;
-        let tasks = ForgeTasks::new(fixture.operator_pool().clone());
-        let legacy = task(
-            fixture.data_tenant_id(),
-            "legacy-default",
-            ForgeTaskLane::Ordinary,
-            212,
-        );
-        let task_id = tasks.enqueue(&legacy).await.expect("enqueue legacy seed");
-        make_legacy(&admin, task_id, false).await;
-
-        let claim = tasks
-            .claim_fair(Uuid::now_v7(), limits(1), None)
-            .await
-            .expect("claim query")
-            .expect("legacy claim");
-
-        assert_eq!(claim.task_id, task_id);
-        assert_eq!(claim.estimates.envelope, None);
-        assert_eq!(claim.estimates.memory_bytes, 100);
-        assert_eq!(claim.estimates.spill_bytes, 100);
-    }
-
-    /// Oversized legacy rows bypass only envelope and lane resource bounds.
-    #[tokio::test]
-    async fn oversized_legacy_envelope_bypasses_resource_bounds_for_supersession() {
-        let (fixture, admin) = setup().await;
-        let tasks = ForgeTasks::new(fixture.operator_pool().clone());
-        let legacy = task(
-            fixture.data_tenant_id(),
-            "legacy-oversized",
-            ForgeTaskLane::LargeSingleton,
-            213,
-        );
-        let task_id = tasks.enqueue(&legacy).await.expect("enqueue legacy seed");
-        make_legacy(&admin, task_id, true).await;
-
-        let claim = tasks
-            .claim_fair(Uuid::now_v7(), limits(1), None)
-            .await
-            .expect("claim query")
-            .expect("oversized legacy claim");
-
-        assert_eq!(claim.task_id, task_id);
-        assert_eq!(claim.estimates.envelope, None);
-        assert_eq!(claim.estimates.files, 1);
-        assert_eq!(claim.estimates.memory_bytes, 100_000);
-    }
-
-    /// Converts one seeded version-one row into the migration-defined legacy shape.
-    ///
-    /// # Panics
-    /// Panics when the exact test row cannot be converted.
-    async fn make_legacy(admin: &PgPool, task_id: Uuid, oversized: bool) {
-        let estimate = if oversized { 100_000_i64 } else { 100_i64 };
-        sqlx::query(
-            "UPDATE vala.forge_tasks SET envelope_version=0, decoded_batch_bytes=NULL, decoded_input_bytes=NULL, sort_working_bytes=NULL, sort_merge_reservation_bytes=NULL, encoder_buffer_bytes=NULL, upload_chunk_bytes=NULL, footer_encoded_bytes=NULL, footer_decode_workspace_bytes=NULL, sort_spill_bytes=NULL, estimated_files=1, estimated_bytes=$2, estimated_parallelism=1, estimated_memory_bytes=$2, estimated_spill_bytes=$2, large_task_ceiling_bytes=$2 WHERE task_id=$1",
-        )
-        .bind(task_id)
-        .bind(estimate)
-        .execute(admin)
-        .await
-        .expect("convert legacy row");
-    }
-
-    /// Persisted envelope terms drive both fair claim admission and skew visibility.
-    #[tokio::test]
-    async fn persisted_envelope_claim_gate_and_unclaimable_signal_match() {
-        let (fixture, _admin) = setup().await;
-        let tasks = ForgeTasks::new(fixture.operator_pool().clone());
-        let tenant = fixture.data_tenant_id();
-        let fitting = task(tenant, "envelope-fit", ForgeTaskLane::Ordinary, 201);
-        let mut oversized = task(tenant, "envelope-over", ForgeTaskLane::Ordinary, 202);
-        oversized
-            .estimates
-            .envelope
-            .as_mut()
-            .expect("version-two test envelope")
-            .encoder_buffer_bytes = 128 * 1024 * 1024;
-        oversized.estimates.memory_bytes = oversized
-            .estimates
-            .envelope
-            .expect("version-two test envelope")
-            .memory_bytes()
-            .expect("oversized resident total");
-        tasks.enqueue(&fitting).await.expect("fitting envelope");
-        tasks.enqueue(&oversized).await.expect("oversized envelope");
-        let fitting_id = tasks.task_id_for_plan(&fitting).await.expect("fitting id");
-        let oversized_id = tasks
-            .task_id_for_plan(&oversized)
-            .await
-            .expect("oversized id");
-        let claim = tasks
-            .claim_fair(Uuid::now_v7(), limits(2), None)
-            .await
-            .expect("claim query")
-            .expect("fitting task");
-        assert_eq!(claim.task_id, fitting_id);
-        assert_eq!(
-            tasks
-                .unclaimable_ready_task_ids(limits(2))
-                .await
-                .expect("unclaimable identities"),
-            vec![oversized_id]
-        );
-    }
-
-    /// Retry settlement persists the closed class, bounded delay, and volume deferral.
-    #[tokio::test]
-    async fn failure_taxonomy_backoff_and_volume_deferral_are_durable() {
+    async fn failure_taxonomy_backoff_is_durable() {
         let (fixture, admin) = setup().await;
         let tasks = ForgeTasks::new(fixture.operator_pool().clone());
         let tenant = fixture.data_tenant_id();
         let owner = Uuid::now_v7();
-        let task = task(tenant, "fault-taxonomy", ForgeTaskLane::Ordinary, 203);
+        let task = task(tenant, "fault-taxonomy", 203);
         let task_id = tasks.enqueue(&task).await.expect("enqueue fault task");
-        let defaults: (i32, Option<String>, bool, Option<String>) = sqlx::query_as(
-            "SELECT attempt_count,failure_class,next_eligible_at<=statement_timestamp(),failed_volume_identity FROM vala.forge_tasks WHERE task_id=$1",
+        let defaults: (i32, Option<String>, bool) = sqlx::query_as(
+            "SELECT attempt_count,failure_class,next_eligible_at<=statement_timestamp() FROM vala.forge_tasks WHERE task_id=$1",
         )
         .bind(task_id)
         .fetch_one(&admin)
         .await
         .expect("failure taxonomy defaults");
-        assert_eq!(defaults, (0, None, true, None));
+        assert_eq!(defaults, (0, None, true));
         let claim = tasks
-            .claim_fair_for_volume(owner, limits(1), None, Some("volume-a"))
+            .claim_fair(owner, limits(1), None)
             .await
             .expect("initial claim")
             .expect("fault task");
@@ -302,13 +126,13 @@ mod pg_tests {
 
         assert_eq!(
             tasks
-                .retry_failure(task_id, attempt, owner, "storage_health", Some("volume-a"))
+                .retry_failure(task_id, attempt, owner, "storage_health")
                 .await
                 .expect("storage-health retry"),
             1
         );
-        let persisted: (String, i32, Option<String>, Option<String>, bool) = sqlx::query_as(
-            "SELECT state,attempt_count,failure_class,failed_volume_identity,next_eligible_at>statement_timestamp() FROM vala.forge_tasks WHERE task_id=$1",
+        let persisted: (String, i32, Option<String>, bool) = sqlx::query_as(
+            "SELECT state,attempt_count,failure_class,next_eligible_at>statement_timestamp() FROM vala.forge_tasks WHERE task_id=$1",
         )
         .bind(task_id)
         .fetch_one(&admin)
@@ -317,36 +141,27 @@ mod pg_tests {
         assert_eq!(persisted.0, "retryable");
         assert_eq!(persisted.1, 1);
         assert_eq!(persisted.2.as_deref(), Some("storage_health"));
-        assert_eq!(persisted.3.as_deref(), Some("volume-a"));
-        assert!(persisted.4, "backoff remains in the future");
+        assert!(persisted.3, "backoff remains in the future");
         assert!(
             tasks
-                .claim_fair_for_volume(Uuid::now_v7(), limits(1), None, Some("volume-b"))
+                .claim_fair(Uuid::now_v7(), limits(1), None)
                 .await
                 .expect("claim during backoff")
                 .is_none(),
-            "all volumes honor next eligibility"
+            "the retry backoff defers every owner equally"
         );
 
         sqlx::query("UPDATE vala.forge_tasks SET ready_at=statement_timestamp(),next_eligible_at=statement_timestamp() WHERE task_id=$1")
             .bind(task_id)
             .execute(&admin)
             .await
-            .expect("advance first eligibility");
-        assert!(
-            tasks
-                .claim_fair_for_volume(Uuid::now_v7(), limits(1), None, Some("volume-a"))
-                .await
-                .expect("same-volume deferred claim")
-                .is_none(),
-            "the failed volume is softly deferred for one additional backoff"
-        );
-        let healthy_claim = tasks
-            .claim_fair_for_volume(Uuid::now_v7(), limits(1), None, Some("volume-b"))
+            .expect("advance eligibility");
+        let resumed = tasks
+            .claim_fair(Uuid::now_v7(), limits(1), None)
             .await
-            .expect("different-volume claim")
-            .expect("a healthy volume may take over");
-        assert_eq!(healthy_claim.task_id, task_id);
+            .expect("post-backoff claim")
+            .expect("an eligible retryable task is reclaimable");
+        assert_eq!(resumed.task_id, task_id);
     }
 
     /// Capacity refusal preserves retry budget while lease reclaim consumes it without audit.
@@ -356,7 +171,7 @@ mod pg_tests {
         let tasks = ForgeTasks::new(fixture.operator_pool().clone());
         let tenant = fixture.data_tenant_id();
         let owner = Uuid::now_v7();
-        let capacity = task(tenant, "capacity-refusal", ForgeTaskLane::Ordinary, 204);
+        let capacity = task(tenant, "capacity-refusal", 204);
         let capacity_id = tasks
             .enqueue(&capacity)
             .await
@@ -463,24 +278,23 @@ mod pg_tests {
         assert_eq!(empty.0, None);
 
         tasks
-            .enqueue(&task(tenant, "worker-only", ForgeTaskLane::Ordinary, 91))
+            .enqueue(&task(tenant, "worker-only", 91))
             .await
             .expect("enqueue worker-only task");
-        let mut no_fit = limits(1);
-        no_fit.max_bytes = 1;
         assert!(
             tasks
-                .claim_fair(owner, no_fit, None)
+                .claim_fair(owner, limits(0), None)
                 .await
-                .expect("no-fit claim")
-                .is_none()
+                .expect("refused claim")
+                .is_none(),
+            "an exhausted tenant slot admits nothing"
         );
         let unchanged: (Option<Uuid>,) = sqlx::query_as(
             "SELECT last_tenant_id FROM vala.forge_worker_claim_state WHERE singleton",
         )
         .fetch_one(&admin)
         .await
-        .expect("no-fit worker cursor");
+        .expect("refused worker cursor");
         assert_eq!(unchanged.0, None);
 
         let claim = tasks
@@ -515,7 +329,6 @@ mod pg_tests {
             .enqueue(&task(
                 tenant,
                 "superseded",
-                ForgeTaskLane::LargeSingleton,
                 92,
             ))
             .await
@@ -607,13 +420,13 @@ mod pg_tests {
         let tasks = ForgeTasks::new(op.clone());
         let tenant = fixture.data_tenant_id();
         let id = tasks
-            .enqueue(&task(tenant, "race", ForgeTaskLane::Ordinary, 1))
+            .enqueue(&task(tenant, "race", 1))
             .await
             .expect("enqueue");
         assert_eq!(
             id,
             tasks
-                .enqueue(&task(tenant, "race", ForgeTaskLane::Ordinary, 1))
+                .enqueue(&task(tenant, "race", 1))
                 .await
                 .expect("duplicate")
         );
@@ -662,29 +475,6 @@ mod pg_tests {
                 .await
                 .is_err()
         );
-        let mut oversized = task(tenant, "oversized", ForgeTaskLane::Ordinary, 11);
-        oversized.estimates.bytes = 5_000;
-        let oversized_id = tasks.enqueue(&oversized).await.expect("oversized enqueue");
-        assert!(
-            tasks
-                .claim_fair(owner, limits(2), None)
-                .await
-                .expect("capacity claim")
-                .is_none(),
-            "ordinary work beyond byte capacity is not claimed"
-        );
-        let mut unschedulable = TenantConn::acquire(fixture.app_pool(), tenant)
-            .await
-            .expect("unschedulable conn");
-        tasks
-            .unschedulable(
-                &mut unschedulable,
-                oversized_id,
-                &event("forge.task.unschedulable", oversized_id),
-            )
-            .await
-            .expect("terminalize oversized");
-        unschedulable.commit().await.expect("commit unschedulable");
     }
 
     /// Proves the durable tenant cursor rotates strictly forward across a
@@ -707,11 +497,11 @@ mod pg_tests {
             .await
             .expect("seed tenant");
         tasks
-            .enqueue(&task(tenant_a, "rotate-a", ForgeTaskLane::Ordinary, 2))
+            .enqueue(&task(tenant_a, "rotate-a", 2))
             .await
             .expect("a");
         tasks
-            .enqueue(&task(tenant_b, "rotate-b", ForgeTaskLane::Ordinary, 3))
+            .enqueue(&task(tenant_b, "rotate-b", 3))
             .await
             .expect("b");
         let leader = Uuid::now_v7();
@@ -791,11 +581,11 @@ mod pg_tests {
             .await
             .expect("seed tenant");
         tasks
-            .enqueue(&task(tenant_a, "large-a", ForgeTaskLane::LargeSingleton, 2))
+            .enqueue(&task(tenant_a, "large-a", 2))
             .await
             .expect("a");
         tasks
-            .enqueue(&task(tenant_b, "large-b", ForgeTaskLane::LargeSingleton, 3))
+            .enqueue(&task(tenant_b, "large-b", 3))
             .await
             .expect("b");
         let owner_a = Uuid::now_v7();
@@ -809,12 +599,9 @@ mod pg_tests {
             right.expect("right").expect("owner B claims a large task"),
         ];
         assert_eq!(
-            claims
-                .iter()
-                .filter(|c| c.lane == ForgeTaskLane::LargeSingleton)
-                .count(),
+            claims.len(),
             2,
-            "both large tasks on distinct tables claim concurrently across owners"
+            "both tasks on distinct tables claim concurrently across owners"
         );
         assert_ne!(
             claims[0].task_id, claims[1].task_id,
@@ -828,7 +615,6 @@ mod pg_tests {
             .enqueue(&task(
                 tenant_a,
                 "large-a-second",
-                ForgeTaskLane::LargeSingleton,
                 4,
             ))
             .await
@@ -860,7 +646,6 @@ mod pg_tests {
             .enqueue(&task(
                 tenant,
                 "large-first",
-                ForgeTaskLane::LargeSingleton,
                 21,
             ))
             .await
@@ -869,7 +654,6 @@ mod pg_tests {
             .enqueue(&task(
                 tenant,
                 "large-second",
-                ForgeTaskLane::LargeSingleton,
                 22,
             ))
             .await
@@ -926,7 +710,6 @@ mod pg_tests {
             .await
             .expect("post-terminal claim")
             .expect("owner claims second large after first terminal");
-        assert_eq!(second.lane, ForgeTaskLane::LargeSingleton);
         assert_ne!(second.task_id, first_id, "distinct second large task");
     }
 
@@ -943,15 +726,15 @@ mod pg_tests {
         let tenant = fixture.data_tenant_id();
         let owner = Uuid::now_v7();
         let first = tasks
-            .enqueue(&task(tenant, "same-table", ForgeTaskLane::Ordinary, 61))
+            .enqueue(&task(tenant, "same-table", 61))
             .await
             .expect("first generation");
         tasks
-            .enqueue(&task(tenant, "same-table", ForgeTaskLane::Ordinary, 62))
+            .enqueue(&task(tenant, "same-table", 62))
             .await
             .expect("second generation");
         let independent = tasks
-            .enqueue(&task(tenant, "independent", ForgeTaskLane::Ordinary, 63))
+            .enqueue(&task(tenant, "independent", 63))
             .await
             .expect("independent task");
         tasks
@@ -995,11 +778,11 @@ mod pg_tests {
         let tasks = ForgeTasks::new(op.clone());
         let tenant = fixture.data_tenant_id();
         let owner = Uuid::now_v7();
-        let mut large = task(tenant, "large", ForgeTaskLane::LargeSingleton, 71);
+        let mut large = task(tenant, "large", 71);
         large.ready_at = Utc::now() - Duration::seconds(1);
         let large_id = tasks.enqueue(&large).await.expect("large task");
         let ordinary_id = tasks
-            .enqueue(&task(tenant, "ordinary", ForgeTaskLane::Ordinary, 72))
+            .enqueue(&task(tenant, "ordinary", 72))
             .await
             .expect("ordinary task");
         tasks
@@ -1031,7 +814,6 @@ mod pg_tests {
             .enqueue(&task(
                 tenant,
                 "large-second",
-                ForgeTaskLane::LargeSingleton,
                 73,
             ))
             .await
@@ -1070,7 +852,6 @@ mod pg_tests {
             .enqueue(&task(
                 tenant,
                 "malformed-claim",
-                ForgeTaskLane::LargeSingleton,
                 12,
             ))
             .await
@@ -1127,7 +908,7 @@ mod pg_tests {
         let tasks = ForgeTasks::new(op.clone());
         let tenant = fixture.data_tenant_id();
         let id = tasks
-            .enqueue(&task(tenant, "audit", ForgeTaskLane::Ordinary, 4))
+            .enqueue(&task(tenant, "audit", 4))
             .await
             .expect("enqueue");
         let owner = Uuid::now_v7();
@@ -1334,7 +1115,6 @@ mod pg_tests {
             .enqueue(&task(
                 tenant,
                 "prepared-takeover",
-                ForgeTaskLane::Ordinary,
                 73,
             ))
             .await
@@ -1435,7 +1215,6 @@ mod pg_tests {
             .enqueue(&task(
                 tenant,
                 "large-prepared-takeover",
-                ForgeTaskLane::LargeSingleton,
                 74,
             ))
             .await
@@ -1446,7 +1225,6 @@ mod pg_tests {
             .expect("claim")
             .expect("task");
         assert_eq!(claimed.task_id, task_id);
-        assert_eq!(claimed.lane, ForgeTaskLane::LargeSingleton);
         let attempt = claimed.attempt_id.expect("attempt");
         tasks
             .start(
@@ -1524,7 +1302,6 @@ mod pg_tests {
             .enqueue(&task(
                 tenant,
                 "atomic-successor",
-                ForgeTaskLane::Ordinary,
                 91,
             ))
             .await
@@ -1656,7 +1433,6 @@ mod pg_tests {
             .enqueue(&task(
                 tenant,
                 "atomic-noop-acknowledgement",
-                ForgeTaskLane::Ordinary,
                 93,
             ))
             .await
@@ -1748,19 +1524,19 @@ mod pg_tests {
         assert!(ForgeTaskTableIdentity::new("unsupported", "vala.bifrost", "events").is_err());
         assert!(ForgeTaskTableIdentity::new("wyrd-redux", "unsupported", "events").is_err());
         assert!(ForgeTaskTableIdentity::new("wyrd-redux", "vala.bifrost", "../events").is_err());
-        let mut malformed = task(tenant, "malformed", ForgeTaskLane::Ordinary, 5);
+        let mut malformed = task(tenant, "malformed", 5);
         malformed.plan.version = 99;
         assert!(tasks.enqueue(&malformed).await.is_err());
         let _ready = tasks
-            .enqueue(&task(tenant, "ready", ForgeTaskLane::Ordinary, 6))
+            .enqueue(&task(tenant, "ready", 6))
             .await
             .expect("ready");
         let prepared_id = tasks
-            .enqueue(&task(tenant, "prepared", ForgeTaskLane::Ordinary, 7))
+            .enqueue(&task(tenant, "prepared", 7))
             .await
             .expect("prepared enqueue");
         let terminal_id = tasks
-            .enqueue(&task(tenant, "terminal", ForgeTaskLane::Ordinary, 8))
+            .enqueue(&task(tenant, "terminal", 8))
             .await
             .expect("terminal enqueue");
         let owner = Uuid::now_v7();
@@ -1905,7 +1681,7 @@ mod pg_tests {
                 .any(|v| v.0 == "wyrd_platform_admin" && v.1 == "UPDATE")
         );
         let invalid_id = tasks
-            .enqueue(&task(tenant, "invalid-tenant", ForgeTaskLane::Ordinary, 9))
+            .enqueue(&task(tenant, "invalid-tenant", 9))
             .await
             .expect("invalid seed");
         let invalid_tenant = Uuid::nil();
@@ -2013,7 +1789,6 @@ mod pg_tests {
         let mismatched = task(
             DataTenantId::new_v7(),
             "demand",
-            ForgeTaskLane::Ordinary,
             41,
         );
         assert!(
@@ -2024,9 +1799,7 @@ mod pg_tests {
                     &captured,
                     ForgeEnqueueBatch {
                         executable: std::slice::from_ref(&mismatched),
-                        unschedulable: &[],
-                    },
-                    |id| event("forge.task.unschedulable", id),
+                    }
                 )
                 .await
                 .is_err(),
@@ -2046,7 +1819,7 @@ mod pg_tests {
                 .expect("newer"),
             4
         );
-        let exact = task(tenant, "demand", ForgeTaskLane::Ordinary, 42);
+        let exact = task(tenant, "demand", 42);
         let stale_cursor_before: Option<Uuid> = sqlx::query_scalar(
             "SELECT last_tenant_id FROM vala.forge_scheduler_state WHERE singleton",
         )
@@ -2065,9 +1838,7 @@ mod pg_tests {
                     &captured,
                     ForgeEnqueueBatch {
                         executable: std::slice::from_ref(&exact),
-                        unschedulable: &[],
-                    },
-                    |id| event("forge.task.unschedulable", id)
+                    }
                 )
                 .await
                 .is_err(),
@@ -2104,7 +1875,7 @@ mod pg_tests {
             .await
             .expect("takeover")
             .expect("successor fence");
-        let stale_terminal = task(tenant, "demand", ForgeTaskLane::LargeSingleton, 44);
+        let stale_terminal = task(tenant, "demand", 44);
         assert!(
             tasks
                 .enqueue_and_acknowledge(
@@ -2112,10 +1883,8 @@ mod pg_tests {
                     fence,
                     &retryable[0],
                     ForgeEnqueueBatch {
-                        executable: &[],
-                        unschedulable: std::slice::from_ref(&stale_terminal),
-                    },
-                    |id| event("forge.task.unschedulable", id)
+                        executable: std::slice::from_ref(&stale_terminal),
+                    }
                 )
                 .await
                 .is_err()
@@ -2138,9 +1907,7 @@ mod pg_tests {
                     &retryable[0],
                     ForgeEnqueueBatch {
                         executable: std::slice::from_ref(&exact),
-                        unschedulable: &[],
-                    },
-                    |id| event("forge.task.unschedulable", id)
+                    }
                 )
                 .await
                 .expect("successor ack")
@@ -2155,9 +1922,7 @@ mod pg_tests {
                     &retryable[0],
                     ForgeEnqueueBatch {
                         executable: std::slice::from_ref(&exact),
-                        unschedulable: &[],
-                    },
-                    |id| event("forge.task.unschedulable", id),
+                    }
                 )
                 .await
                 .is_err(),
@@ -2188,7 +1953,7 @@ mod pg_tests {
             .expect("terminal list")
             .0
             .remove(0);
-        let terminal = task(tenant, "demand", ForgeTaskLane::LargeSingleton, 43);
+        let terminal = task(tenant, "demand", 43);
         assert_eq!(
             tasks
                 .enqueue_and_acknowledge(
@@ -2196,26 +1961,23 @@ mod pg_tests {
                     successor_fence,
                     &terminal_demand,
                     ForgeEnqueueBatch {
-                        executable: &[],
-                        unschedulable: std::slice::from_ref(&terminal),
-                    },
-                    |id| event("forge.task.unschedulable", id)
+                        executable: std::slice::from_ref(&terminal),
+                    }
                 )
                 .await
                 .expect("terminal ack")
                 .len(),
             1
         );
-        let terminal_count: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.forge_tasks WHERE data_tenant_id=$1 AND table_name='demand' AND state='unschedulable'").bind(tenant.as_uuid()).fetch_one(&admin).await.expect("terminal count");
-        assert_eq!(terminal_count, 1);
+        let terminal_count: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.forge_tasks WHERE data_tenant_id=$1 AND table_name='demand' AND state='ready'").bind(tenant.as_uuid()).fetch_one(&admin).await.expect("enqueued count");
+        assert_eq!(terminal_count, 2);
         let audit_after: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.audit_outbox")
             .fetch_one(&admin)
             .await
             .expect("audit after");
         assert_eq!(
-            audit_after,
-            audit_before + 1,
-            "only terminal Unschedulable emits audit; demand coordination does not"
+            audit_after, audit_before,
+            "demand coordination and enqueue emit no audit"
         );
         let forced: bool = sqlx::query_scalar("SELECT relforcerowsecurity FROM pg_class WHERE oid='vala.forge_planning_demands'::regclass").fetch_one(&admin).await.expect("forced RLS");
         assert!(forced);
@@ -2359,7 +2121,7 @@ mod pg_tests {
                 .await
                 .expect("create trigger");
             let hash = u8::try_from(80 + index).expect("bounded stage");
-            let terminal = task(tenant, "step-failure", ForgeTaskLane::LargeSingleton, hash);
+            let terminal = task(tenant, "step-failure", hash);
             assert!(
                 tasks
                     .enqueue_and_acknowledge(
@@ -2367,10 +2129,8 @@ mod pg_tests {
                         fence,
                         &demand,
                         ForgeEnqueueBatch {
-                            executable: &[],
-                            unschedulable: std::slice::from_ref(&terminal)
-                        },
-                        |id| event("forge.task.unschedulable", id)
+                            executable: std::slice::from_ref(&terminal)
+                        }
                     )
                     .await
                     .is_err()
@@ -2590,9 +2350,7 @@ mod pg_tests {
                     &first,
                     ForgeEnqueueBatch {
                         executable: &[],
-                        unschedulable: &[],
-                    },
-                    |id| event("forge.task.unschedulable", id),
+                    }
                 )
                 .await
                 .is_err(),
@@ -2616,9 +2374,7 @@ mod pg_tests {
                     &current,
                     ForgeEnqueueBatch {
                         executable: &[],
-                        unschedulable: &[],
-                    },
-                    |id| event("forge.task.unschedulable", id),
+                    }
                 )
                 .await
                 .expect("acknowledge current generation")
@@ -2715,7 +2471,6 @@ mod pg_tests {
                 .enqueue(&task(
                     tenant,
                     &format!("compaction_{index}"),
-                    ForgeTaskLane::Ordinary,
                     index,
                 ))
                 .await
@@ -2832,7 +2587,7 @@ mod pg_tests {
                 ],
                 parameters: parameters.clone(),
             },
-            ..task(tenant, "promotion_table", ForgeTaskLane::Ordinary, 7)
+            ..task(tenant, "promotion_table", 7)
         };
 
         assert_eq!(
@@ -2876,7 +2631,6 @@ mod pg_tests {
             claim.strategy,
             ForgeClaimStrategy::Known(ForgeTaskStrategy::ScribePromotion)
         );
-        assert_eq!(claim.lane, ForgeTaskLane::Ordinary);
         assert_eq!(claim.plan.parameters, parameters);
         assert_eq!(claim.plan.parameters["kind"], "scribe_promotion");
 
@@ -2886,7 +2640,7 @@ mod pg_tests {
         // constraint that ordinary writers cannot bypass.
         let quarantined = tasks
             .enqueue(&NewForgeTask {
-                ..task(tenant, "quarantine_table", ForgeTaskLane::Ordinary, 9)
+                ..task(tenant, "quarantine_table", 9)
             })
             .await
             .expect("enqueue quarantine candidate");
@@ -3139,7 +2893,7 @@ mod pg_tests {
             .find(|value| value.table_ref == *identity)
             .expect("malformed source still raises a cleanup demand");
 
-        let mut cleanup = task(tenant, "cleanup", ForgeTaskLane::Ordinary, 9);
+        let mut cleanup = task(tenant, "cleanup", 9);
         cleanup.strategy = ForgeTaskStrategy::ExpiredCleanup;
         cleanup.base_snapshot_id = evidence.committed_snapshot_id.expect("committed snapshot");
         cleanup.plan = ForgeTaskPlan {
@@ -3175,9 +2929,7 @@ mod pg_tests {
                     &demand,
                     ForgeEnqueueBatch {
                         executable: std::slice::from_ref(&cleanup),
-                        unschedulable: &[],
-                    },
-                    |id| event("forge.task.unschedulable", id),
+                    }
                 )
                 .await
                 .is_err(),
@@ -3233,7 +2985,7 @@ mod pg_tests {
         let source = seed_expiration_source(&admin, tenant, &table, &candidates).await;
 
         // The generic enqueue path can never create a cleanup task.
-        let mut generic = task(tenant, "cleanup", ForgeTaskLane::Ordinary, 3);
+        let mut generic = task(tenant, "cleanup", 3);
         generic.strategy = ForgeTaskStrategy::ExpiredCleanup;
         assert!(
             tasks.enqueue(&generic).await.is_err(),
@@ -3308,7 +3060,7 @@ mod pg_tests {
             .into_iter()
             .find(|value| value.table_ref == identity)
             .expect("cleanup demand");
-        let mut cleanup = task(tenant, "cleanup", ForgeTaskLane::Ordinary, 5);
+        let mut cleanup = task(tenant, "cleanup", 5);
         cleanup.strategy = ForgeTaskStrategy::ExpiredCleanup;
         cleanup.base_snapshot_id = payload.committed_snapshot_id;
         cleanup.plan = ForgeTaskPlan {
@@ -3333,9 +3085,7 @@ mod pg_tests {
                     &demand,
                     ForgeEnqueueBatch {
                         executable: std::slice::from_ref(&divergent),
-                        unschedulable: &[],
-                    },
-                    |id| event("forge.task.unschedulable", id),
+                    }
                 )
                 .await
                 .is_err(),
@@ -3350,9 +3100,7 @@ mod pg_tests {
                     &demand,
                     ForgeEnqueueBatch {
                         executable: std::slice::from_ref(&cleanup),
-                        unschedulable: &[],
-                    },
-                    |id| event("forge.task.unschedulable", id),
+                    }
                 )
                 .await
                 .expect("enqueue cleanup")
@@ -3654,7 +3402,7 @@ mod pg_tests {
         NewForgeTask {
             strategy: ForgeTaskStrategy::OrphanCleanup,
             plan: orphan_plan(prefix, age_cutoff_ms),
-            ..task(tenant, table, ForgeTaskLane::Ordinary, 7)
+            ..task(tenant, table, 7)
         }
     }
 
@@ -4271,7 +4019,7 @@ mod pg_tests {
         // is this worker's own residue from a previous process lifetime.
         for state in ["claimed", "running", "prepared"] {
             let id = tasks
-                .enqueue(&task(tenant, "owned", ForgeTaskLane::Ordinary, 11))
+                .enqueue(&task(tenant, "owned", 11))
                 .await
                 .expect("enqueue owned task");
             force_claim_state(&admin, id, state, owner, false).await;
@@ -4289,7 +4037,7 @@ mod pg_tests {
         // owner can no longer prove what it did to durable state.
         for state in ["claimed", "running", "prepared"] {
             let id = tasks
-                .enqueue(&task(tenant, "expired", ForgeTaskLane::Ordinary, 12))
+                .enqueue(&task(tenant, "expired", 12))
                 .await
                 .expect("enqueue expired task");
             force_claim_state(&admin, id, state, foreign, true).await;
@@ -4431,7 +4179,7 @@ mod pg_tests {
         // live claim are all outside recovery: none of them is residue this
         // owner must resolve before it may advertise itself.
         let ordinary = tasks
-            .enqueue(&task(tenant, "ordinary", ForgeTaskLane::Ordinary, 14))
+            .enqueue(&task(tenant, "ordinary", 14))
             .await
             .expect("enqueue ordinary task");
         let bare = tasks
@@ -4443,7 +4191,7 @@ mod pg_tests {
             "a freshly enqueued cleanup task carries no cursor"
         );
         let live = tasks
-            .enqueue(&task(tenant, "live", ForgeTaskLane::Ordinary, 15))
+            .enqueue(&task(tenant, "live", 15))
             .await
             .expect("enqueue live foreign claim");
         force_claim_state(&admin, live, "running", foreign, false).await;
@@ -4516,7 +4264,7 @@ mod pg_tests {
                 let table = format!("pending-{index}-{suffix}");
                 let seed = NewForgeTask {
                     strategy,
-                    ..task(tenant, &table, ForgeTaskLane::Ordinary, hash)
+                    ..task(tenant, &table, hash)
                 };
                 hash += 1;
                 let task_id = tasks.enqueue(&seed).await.expect("pending seed");
@@ -4544,7 +4292,6 @@ mod pg_tests {
             "succeeded",
             "failed",
             "cancelled",
-            "unschedulable",
         ]
         .into_iter()
         .enumerate()
@@ -4554,7 +4301,6 @@ mod pg_tests {
             let seed = task(
                 tenant,
                 &format!("owned-{index}"),
-                ForgeTaskLane::Ordinary,
                 hash,
             );
             hash += 1;

@@ -293,11 +293,16 @@ enum ForgeDispatchResult {
     SnapshotExpiry(Box<ForgeSnapshotExpiryResult>),
     /// A fully drained expired-cleanup candidate set with its final evidence.
     Cleaned(Box<ForgeTaskEvidence>),
-    /// One bounded orphan-cleanup pass that already wrote its own durable task
-    /// transition: either a cursor checkpoint plus a non-consuming release, or
-    /// the audited terminal success that exhaustion earns. The worker owes it
-    /// no further transition.
-    OrphanSettled,
+    /// A dispatch that already wrote its own durable task transition and owes
+    /// the worker no further one.
+    ///
+    /// Two dispatches settle themselves. A bounded orphan-cleanup pass writes
+    /// either a cursor checkpoint plus a non-consuming release or the audited
+    /// terminal success that exhaustion earns. A compaction attempt whose
+    /// planning selected nothing writes the audited no-op success directly,
+    /// because it holds no operation and produced no evidence for the ordinary
+    /// Prepared path to reconcile.
+    SelfSettled,
 }
 
 /// Durable task state accompanying exact committed evidence.
@@ -2974,6 +2979,7 @@ impl ForgeWorker {
                 &task.table_ref,
                 attempt,
                 &lease,
+                ForgeTaskState::Prepared,
                 task_progress_effect(
                     &ForgeClaimStrategy::Known(task.strategy),
                     task.base_snapshot_id,
@@ -3340,7 +3346,7 @@ impl ForgeWorker {
             ForgeDispatchResult::Cleaned(evidence) => {
                 Ok((*evidence, ForgeExecutionEvidenceState::Prepared, None))
             }
-            ForgeDispatchResult::OrphanSettled => Ok((
+            ForgeDispatchResult::SelfSettled => Ok((
                 ForgeTaskEvidence {
                     version: FORGE_TASK_PAYLOAD_VERSION,
                     committed_snapshot_id: None,
@@ -3690,6 +3696,7 @@ impl ForgeWorker {
                     &claim.table_ref,
                     attempt,
                     lease,
+                    ForgeTaskState::Prepared,
                     task_progress_effect(
                         &claim.strategy,
                         claim.base_snapshot_id,
@@ -3996,9 +4003,33 @@ impl ForgeWorker {
             plans,
         } = rewrite.plan().await?;
         if plans.is_empty() {
-            return Err(ForgeError::Reconciliation {
-                detail: "managed planning selected no compaction plan".to_owned(),
-            });
+            // Planning that selects nothing is the table already being
+            // compact, not a failure of this attempt. Returning an error here
+            // would consume the attempt budget and terminalize an idle table
+            // after five passes, so the no-op is acknowledged instead: the
+            // task succeeds and its planning demand records the exact snapshot
+            // and commit backlog the acknowledgement was made against.
+            let metadata = table.metadata();
+            self.persist_terminal_success(
+                claim.task_id,
+                claim.data_tenant_id,
+                &claim.table_ref,
+                attempt,
+                lease,
+                ForgeTaskState::Running,
+                TaskProgressEffect::NoOpAcknowledged {
+                    snapshot_id: metadata.current_snapshot_id().unwrap_or(0),
+                    commit_count: u64::try_from(
+                        metadata
+                            .snapshots()
+                            .count()
+                            .saturating_sub(self.forge.core.config.retain_last),
+                    )
+                    .unwrap_or(u64::MAX),
+                },
+            )
+            .await?;
+            return Ok(ForgeDispatchResult::SelfSettled);
         }
         let mut queue = super::managed::queue::ForgeCompactionQueue::new(
             self.config.max_task_parallelism,
@@ -5362,7 +5393,7 @@ redacted
                 .await
                 .map_err(ForgeError::Sql)?;
         }
-        Ok(ForgeDispatchResult::OrphanSettled)
+        Ok(ForgeDispatchResult::SelfSettled)
     }
 
     async fn dispatch_expired_cleanup(
@@ -6116,6 +6147,7 @@ impl ForgeWorker {
         table_ref: &ForgeTaskTableIdentity,
         attempt: Uuid,
         lease: &ForgeLease,
+        expected: ForgeTaskState,
         progress_effect: TaskProgressEffect,
     ) -> Result<(), ForgeError> {
         let mut terminal = self
@@ -6132,7 +6164,7 @@ impl ForgeWorker {
                     task_id,
                     attempt_id: attempt,
                     owner: self.owner,
-                    expected: ForgeTaskState::Prepared,
+                    expected,
                     next: ForgeTaskState::Succeeded,
                 },
                 table_ref,
@@ -6538,6 +6570,84 @@ mod tests {
     };
 
     use super::*;
+
+    /// The per-plan reducer applies exactly the documented priority.
+    ///
+    /// Success outranks every sibling outcome, the lowest plan index decides an
+    /// unpublished attempt regardless of completion order, and a refusal
+    /// decides only when nothing was admitted — with the lowest refused index
+    /// separating a non-consuming capacity refusal from an invariant violation.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any of those priorities is not the one applied.
+    #[test]
+    fn plan_reduction_applies_the_documented_priority() {
+        use super::super::managed::queue::ForgePushResult;
+
+        let published = ForgeWorker::reduce_plan_outcomes(
+            vec![(2, ForgePushResult::RejectedCapacity)],
+            vec![
+                (
+                    0,
+                    Err(ForgeError::Invariant {
+                        detail: "lower sibling failed".to_owned(),
+                    }),
+                ),
+                (1, Ok(ForgeDispatchResult::SelfSettled)),
+            ],
+        );
+        assert!(
+            matches!(published, Ok(ForgeDispatchResult::SelfSettled)),
+            "one publication makes the task successful whatever its siblings did"
+        );
+
+        let failed = ForgeWorker::reduce_plan_outcomes(
+            Vec::new(),
+            vec![
+                (
+                    3,
+                    Err(ForgeError::Invariant {
+                        detail: "arrived first".to_owned(),
+                    }),
+                ),
+                (
+                    1,
+                    Err(ForgeError::Capacity {
+                        detail: "lowest index".to_owned(),
+                    }),
+                ),
+            ],
+        );
+        assert!(
+            matches!(failed, Err(ForgeError::Capacity { .. })),
+            "the lowest plan index decides, never the first completion to arrive"
+        );
+
+        let refused = ForgeWorker::reduce_plan_outcomes(
+            vec![
+                (0, ForgePushResult::RejectedCapacity),
+                (1, ForgePushResult::RejectedDuplicate),
+            ],
+            Vec::new(),
+        );
+        assert!(
+            matches!(refused, Err(ForgeError::Capacity { .. })),
+            "a capacity refusal below every invariant refusal stays non-consuming"
+        );
+
+        let invariant = ForgeWorker::reduce_plan_outcomes(
+            vec![
+                (0, ForgePushResult::RejectedInvalidParallelism),
+                (1, ForgePushResult::RejectedCapacity),
+            ],
+            Vec::new(),
+        );
+        assert!(
+            matches!(invariant, Err(ForgeError::Invariant { .. })),
+            "an invariant refusal below the capacity one is still reported as one"
+        );
+    }
 
     /// Retryable classes terminalize on the fifth failure while data refusal is immediate.
     #[test]

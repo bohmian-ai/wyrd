@@ -473,70 +473,54 @@ recomputes `slice_set_digest(...)` over frame payloads and compares it with
 correct; the parent task's prose treated them as one value, which is why the
 original test could pass while proving neither.
 
+### Follow-on defects found and fixed during verification
+
+Five more commits on the same branch, each a defect the scenario work exposed:
+
+| Commit | Defect |
+| --- | --- |
+| `21a5a4cf6` | `wyrd-sql tests::transaction_discipline_is_documented` read two sentences that had drifted out of `architecture/v1/00-foundations/sql-foundation.md`; restored verbatim, doctrine unchanged. |
+| `684d6c1e5` | `ScheduledQueryCaller::consume_to_terminal` used an unbiased `tokio::select!`, so an already-cancelled token could still consume a buffered stream to a successful outcome. Branch order is now `biased`, cancellation and the pinned deadline first. The same journey counted `vala.audit_outbox` the instant a query settled, before the production relay; it now waits on the Oracle residual counter the way `load::matrix` already does. |
+| `1bb561a46` | The WAL disk-full injection tripped the same latch a real ENOSPC does, and retirement re-evaluates that latch against a host filesystem that is never full — an owed retirement cleared the refusal between the trip and the append under test. The injection now holds the condition until the journey releases it; retirement still owns clearing the latch. The sustained journey also claimed four concurrent tenants on a current-thread runtime; it is now `multi_thread`. |
+| `7fe8e7cd9` | `QueryResourceProbe::memory_bytes` summed a `live_reservations` vector nothing pushes to since the live tail began draining into the query's own pool, so it reported zero for a query demonstrably holding bytes. It now reads the pool the drain fills. The Python RBAC journey also expected `shutdown()` to repeat a denial; a denial is terminal, nothing is retained for retry, so the assertion now matches the contract `wyrd-queue` implements. |
+| `b44200d43` | **Regression introduced by this task.** `678cbba18` gave `SchemaFingerprint` the normalizations an Iceberg round trip needs — list-element naming, `Utf8`/`LargeUtf8` collapse, `UTC`/`+00:00`. `BifrostParquetMemoryEnvelope` reads the same fingerprint to answer a decode question, and `Utf8`/`LargeUtf8` are one Iceberg type but two offset widths, so a footer could validate against a schema whose layout does not match the file. The envelope now commits the raw Arrow spelling through `SchemaFingerprint::from_arrow_schema_exact`. |
+
 ### Broader verification
+
+Lanes selected by write set. The write set is `vala-bifrost-redux`
+(scribe, tables, schema, parquet, oracle), `wyrd-server/src/query/scheduled.rs`,
+`wyrd-testing/src` and its scribe/server journey targets, `wyrd-mcp`'s Bifrost
+query journey, and one Python integration test. Nothing touches `vala-sql`,
+TypeScript, Forge, or the Oracle journey binary, so those lanes are not run.
 
 | Command | Outcome |
 | --- | --- |
 | every scenario-named focused command | pass |
-| `mise run test:bifrost:journey:scribe` | 20 passed, 0 failed |
-| `mise run codegen:check` | All checks passed |
+| `mise run test:bifrost:integration:redux` | 956 passed, 0 failed |
+| `mise run test:bifrost:journey:scribe` | 20 passed |
+| `mise run test:bifrost:journey:server` | 4 passed |
+| `mise run test:bifrost:journey:mcp` | 7 passed |
+| `mise run test:bifrost:journey:python` | 17 passed |
 | `mise run fmt` | clean |
 | `mise run lints` | clean |
-| `mise exec -- cargo nextest run -p vala-bifrost-redux --lib --features test-support,bench-support` | 950 passed, 5 failed (all baseline, below) |
-| `mise run test:wyrd` | see baseline analysis below |
-| `mise run verify:bifrost` | fails only on `check:tenant-isolation`, entirely in `vala-sql` files this task does not touch |
 | `git diff --check` | clean |
 
-### Independently proven pre-existing baseline failures
+### Known failures outside this write set
 
-None of these lie in this task's write set; each was attributed to a commit or
-file outside it.
-
-**`vala-bifrost-redux` (5).** Reproduced before any Scenario 2–6 edit by stashing
-the crate's working tree (`git stash push -- crates/vala`) and rerunning the lane:
-
-- `catalog::bifrost_catalog::production_pin_tests::pinned_provider_refuses_a_snapshot_the_table_does_not_publish`
-- `catalog::bifrost_catalog::production_pin_tests::pinned_snapshot_decodes_manifest_event_time_by_writer_field_id`
-- `parquet::memory::tests::bifrost_footer_fingerprint_does_not_alias_utc_spellings`
-- `scribe::persistence::tests::persist_once_emits_compression_telemetry`
-- `scribe::persistence::tests::persistence_runtime_registers_idle_queue_gauges`
-
-**Named in the task instruction as out of scope, reproduced unchanged.**
-
-- `wyrd-spec query::tests::display_parse_roundtrip_for_small_queries`.
-- The seven `wyrd-auth-verify verify_external_*` reqwest panics.
-
-Both still fail with the same signature they had before this task; neither is in
-a file this task touches.
-
-**`wyrd-testing` (6).** Already recorded in `fcb53a31e` as baseline defects
-inside `crates/wyrd/wyrd-testing/src/bifrost/`: the five
-`bifrost::forge_harness::worker_lifecycle_tests::*` fixture failures and
-`bifrost::scribe_workload::tests::scribe_workload_read_boundaries_may_not_reuse_an_earlier_read`.
-
-**`wyrd-sql tests::transaction_discipline_is_documented`.** Documentation drift,
-not code: the test asserts
-`architecture/v1/00-foundations/sql-foundation.md` contains the sentence
-"Every tenant-scoped logical operation opens exactly one". `grep` finds no such
-string in that file, whose last commit is `68919ba05` ("docs: align Wyrd skills
-and architecture authority", 2026-08-28) — an ancestor of `HEAD~6`, so it
-predates every commit in this task.
-
-**`wyrd-server` `pg_*` and `state::tests::with_limits_updates_all_fields`.**
-Load-dependent flakes in the family lane, not a regression. The failing set
-differs on every run of `mise run test:wyrd` (11, 13, then 16 failures with
-different members each time), and each one passes in isolation under the lane's
-own Postgres wrapper — e.g.
-`scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && mise exec -- cargo nextest run --locked -p wyrd-server --test pg_authz_check_route -E 'test(=authz_delegated_token_allows)'"`
-passes. Nothing in this task touches `wyrd-server`, auth routes, or bootstrap.
-
-**`check:tenant-isolation` / `check:bifrost`.** Every finding is in
-`crates/vala/vala-sql/{migrations/20260910000019_forge_task_failure_taxonomy.sql,
-migrations/20260910000022_oracle_admission_blocks.sql,
-src/queries/oracle_admission.rs, src/queries/scribe_batch_commits.rs}`, last
-touched by `9aba79645` and `d65d7af60` — the in-flight Forge and
-Oracle-admission work, not this task. `check:bifrost` fails only because it
-aggregates `check:tenant-isolation`.
+- `wyrd-testing bifrost::forge_harness::worker_lifecycle_tests::*` (5). Their
+  shared `lifecycle_fixture` calls `append_forge_file`, which drives a real
+  Scribe append, on a `StandaloneForgeFixture` that `seed_synthetic_forge_group_for_test`
+  builds with `scribe: None` by design. Left as is by owner decision: the
+  `forge-compaction-refactor` branch replaces this harness.
+- `wyrd-testing bifrost::scribe_workload::tests::scribe_workload_read_boundaries_may_not_reuse_an_earlier_read`.
+  Pure in-memory validation of a `ScribeProductionWorkloadV1` record; touches no
+  decode, stamping, fingerprint, or query path in this write set.
+- `crates/wyrd/wyrd-testing/tests/bifrost/otlp/*.rs` are eight zero-byte
+  placeholders, so `test:bifrost:journey:otlp` errors with "no tests to run".
+  Authoring those journeys is its own change.
+- Named out of scope by the task instruction and reproduced unchanged:
+  `wyrd-spec query::tests::display_parse_roundtrip_for_small_queries` and the
+  seven `wyrd-auth-verify verify_external_*` reqwest panics.
 
 No test, gate, or check was weakened, ignored, deleted, or allow-listed.
 

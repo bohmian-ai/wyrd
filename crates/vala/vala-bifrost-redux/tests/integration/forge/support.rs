@@ -747,8 +747,8 @@ pub(crate) struct PromotionIntegrationFixture {
     pub(crate) binding: TenantTableBinding,
     /// Validated Forge limits every supervised pair is built with.
     pub(crate) config: ForgeConfig,
-    /// Narrow Forge capability issued by this fixture's resource composition.
-    forge_resources: vala_bifrost_redux::resources::ForgeResources,
+    /// Boot resource plan every supervised Forge owner is built with.
+    resource_plan: vala_bifrost_redux::resources::ResourcePlan,
     /// Real Scribe retained so its owned WAL and workers outlive the seals,
     /// and reused by [`PromotionIntegrationFixture::seal_more`] to publish
     /// further hot objects through the same writer.
@@ -761,9 +761,8 @@ pub(crate) struct PromotionIntegrationFixture {
     _warehouse: tempfile::TempDir,
     /// WAL root retained for the fixture lifetime.
     _wal_root: tempfile::TempDir,
-    /// Scratch root retained for the fixture lifetime and used as the base for
-    /// each supervised Forge owner's attempt-scoped rewrite spill directory.
-    scratch_root: tempfile::TempDir,
+    /// Scratch root retained for the fixture lifetime.
+    _scratch_root: tempfile::TempDir,
 }
 
 impl PromotionIntegrationFixture {
@@ -879,7 +878,7 @@ impl PromotionIntegrationFixture {
 
         let roles = fixture_roles(scratch_root.path(), wal_root.path());
         let scribe_resources = roles.scribe().expect("fixture Scribe capability");
-        let forge_resources = roles.forge().expect("fixture Forge capability");
+        let resource_plan = roles.plan();
 
         let scribe = start_scribe(
             &database,
@@ -917,12 +916,12 @@ impl PromotionIntegrationFixture {
             tenant,
             binding,
             config: ForgeConfig::default(),
-            forge_resources,
+            resource_plan,
             scribe,
             database,
             _warehouse: warehouse,
             _wal_root: wal_root,
-            scratch_root,
+            _scratch_root: scratch_root,
         };
         let sealed = fixture.file_rows().await;
         assert_eq!(
@@ -950,7 +949,7 @@ impl PromotionIntegrationFixture {
             staging_file_channel(self.config.max_hints_per_wake).expect("fixture hint capacity");
         Arc::new(
             Forge::new(ForgeBuildConfig {
-                resources: self.forge_resources.clone(),
+                resource_plan: self.resource_plan,
                 vala: self.vala.clone(),
                 operator_pool: self.operator_pool.clone(),
                 catalog,
@@ -961,7 +960,6 @@ impl PromotionIntegrationFixture {
                     .full_capability()
                     .list_with_start_after,
                 object_store,
-                rewrite_spill_root: self.scratch_root.path().join("forge"),
                 hints,
                 config: self.config.clone(),
                 maintenance_interval: Duration::from_hours(1),
@@ -1391,16 +1389,6 @@ impl PromotionIntegrationFixture {
             }
         }
         paths
-    }
-
-    /// Returns the pod-wide scratch root every attempt takes its child from.
-    ///
-    /// An admitted attempt creates one `forge-runtime-{task}-{attempt}-*` child
-    /// beneath this root and removes it when its lease is finalized, so the
-    /// absence of a child naming an attempt is the direct evidence that the
-    /// attempt's scratch was released rather than leaked.
-    pub(crate) fn rewrite_spill_root(&self) -> std::path::PathBuf {
-        self.scratch_root.path().join("forge")
     }
 
     /// Snapshots every object under the table prefix with its exact content hash.
@@ -1958,12 +1946,10 @@ fn fixture_roles(
 ) -> vala_bifrost_redux::resources::BifrostRoleResources {
     let scribe_stage = wal_root.join("scribe-stage");
     let scribe_output = scratch_root.join("scribe-output");
-    let forge_scratch = scratch_root.join("forge");
     let oracle_scratch = scratch_root.join("oracle");
     for root in [
         &scribe_stage,
         &scribe_output,
-        &forge_scratch,
         &oracle_scratch,
     ] {
         std::fs::create_dir_all(root).expect("fixture volume root");
@@ -1986,12 +1972,12 @@ fn fixture_roles(
             scratch_limit_bytes: None,
             effective_cpu: None,
             oracle_query_slot_limit: None,
+            forge_compaction_memory_limit_bytes: None,
             scratch_root: scratch_root.to_owned(),
             volume_roots: Some(BifrostVolumeRoots {
                 wal: wal_root.to_owned(),
                 scribe_stage,
                 scribe_output_scratch: scribe_output,
-                forge_scratch,
                 oracle_scratch,
             }),
         },

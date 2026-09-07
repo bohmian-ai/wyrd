@@ -23,7 +23,7 @@ use vala_sql::queries::oracle_reader_authority::BIFROST_CATALOG_NAME;
 use vala_sql::row_types::cluster_nodes::RoleRegistration;
 use vala_sql::row_types::forge_tasks::{
     ExpiredCleanupPayload, ForgeCleanupCandidate, ForgeCleanupCategory, ForgeCleanupPath,
-    ForgeTaskClaim, ForgeTaskLane, ForgeTaskStrategy, ForgeTaskTableIdentity, NewForgeTask,
+    ForgeTaskClaim, ForgeTaskStrategy, ForgeTaskTableIdentity, NewForgeTask,
 };
 use vala_sql::row_types::oracle_reader_authority::TableAuthorityIdentity;
 use wyrd_spec::DataTenantId;
@@ -191,15 +191,12 @@ async fn drained_expiration(name: &str) -> DrainedExpiration {
         .expect("the fixed bounded projection builds")
         .expect("one unconsumed handoff projects one cleanup task");
     assert_eq!(projected.strategy, ForgeTaskStrategy::ExpiredCleanup);
-    assert_eq!(projected.lane, ForgeTaskLane::Ordinary);
     assert_eq!(projected.base_snapshot_id, payload.committed_snapshot_id);
     assert_eq!(
         projected.estimates.files as usize,
         payload.cleanup_candidates.len()
     );
-    assert_eq!(projected.estimates.parallelism, 1);
     assert!(projected.plan.inputs.is_empty());
-    assert!(projected.estimates.envelope.is_some());
 
     assert_eq!(
         tasks
@@ -209,9 +206,7 @@ async fn drained_expiration(name: &str) -> DrainedExpiration {
                 &demand,
                 ForgeEnqueueBatch {
                     executable: std::slice::from_ref(&projected),
-                    unschedulable: &[],
                 },
-                |id| task_event("forge.task.unschedulable", id),
             )
             .await
             .expect("cleanup enqueue")

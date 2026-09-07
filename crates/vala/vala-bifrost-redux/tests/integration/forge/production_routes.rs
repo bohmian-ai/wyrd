@@ -17,9 +17,6 @@ use vala_sql::row_types::forge_tasks::{
     ForgePlanningDemand, ForgePlanningDemandSource, ForgeTaskStrategy, ForgeTaskTableIdentity,
     NewForgeTask, ORPHAN_CLEANUP_PAYLOAD_VERSION,
 };
-use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
-use wyrd_spec::request_id::RequestId;
-use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -248,23 +245,6 @@ async fn enqueue(
             &acknowledged,
             ForgeEnqueueBatch {
                 executable: std::slice::from_ref(task),
-                unschedulable: &[],
-            },
-            |id| {
-                AuditEvent::new(
-                    RequestId::now_v7(),
-                    None,
-                    "forge.task.unschedulable".to_owned(),
-                    format!("forge-task:{id}"),
-                    None,
-                    PrincipalId::new(Uuid::nil()),
-                    PrincipalKindTag::Service,
-                    AuthMethod::Internal,
-                    "bifrost:forge".to_owned(),
-                    AuditDecision::Allow,
-                    AuditResult::Success,
-                    "unschedulable".to_owned(),
-                )
             },
         )
         .await

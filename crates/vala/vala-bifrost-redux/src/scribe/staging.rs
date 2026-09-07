@@ -1933,7 +1933,6 @@ mod tests {
             wal: wal_root.clone(),
             scribe_stage: scribe_stage.clone(),
             scribe_output_scratch: scribe_scratch.clone(),
-            forge_scratch: forge_scratch.clone(),
             oracle_scratch: oracle_scratch.clone(),
         };
         let governor =
@@ -2000,7 +1999,6 @@ mod tests {
                 wal: wal_root.clone(),
                 scribe_stage,
                 scribe_output_scratch: scribe_scratch,
-                forge_scratch,
                 oracle_scratch,
             },
             &wal_root,

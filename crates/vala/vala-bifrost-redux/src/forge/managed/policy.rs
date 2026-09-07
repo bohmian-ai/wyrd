@@ -498,10 +498,6 @@ mod tests {
     /// no work, so the refusal belongs at extraction rather than mid-rewrite.
     #[test]
     fn forge_table_policy_rejects_impossible_geometry() {
-        let metadata = metadata_with(vec![
-            (FILE_TARGET_PROPERTY, "268435456"),
-            (ROW_GROUP_TARGET_PROPERTY, "134217728"),
-        ]);
         assert!(matches!(
             ForgeTablePolicy::extract(
                 &metadata_with(vec![(FILE_TARGET_PROPERTY, "0")]),

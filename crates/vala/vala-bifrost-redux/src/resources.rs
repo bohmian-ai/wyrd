@@ -4794,23 +4794,6 @@ mod tests {
         assert!(parquet_options.enable_page_index);
     }
 
-    /// Returns a valid envelope for resource-ledger tests that do not execute it.
-    fn envelope() -> vala_sql::row_types::forge_tasks::ForgeTaskEnvelope {
-        vala_sql::row_types::forge_tasks::ForgeTaskEnvelope {
-            version: vala_sql::row_types::forge_tasks::FORGE_ENVELOPE_VERSION,
-            reader_permits: 1,
-            decoded_batch_bytes: MIB as u64,
-            decoded_input_bytes: MIB as u64,
-            sort_working_bytes: 3 * MIB as u64,
-            sort_merge_reservation_bytes: MIB as u64,
-            encoder_buffer_bytes: 2 * MIB as u64,
-            upload_chunk_bytes: MIB as u64,
-            footer_encoded_bytes: 8 * MIB as u64,
-            footer_decode_workspace_bytes: 32 * MIB as u64,
-            sort_spill_bytes: MIB as u64,
-        }
-    }
-
     fn policy(roles: &[BifrostRole]) -> BifrostResourcePolicy {
         BifrostResourcePolicy {
             roles: roles.iter().copied().collect(),
@@ -4935,7 +4918,6 @@ mod tests {
             "the role capability projects the sole root plan"
         );
         assert!(roles.oracle().is_some());
-        assert!(roles.forge().is_none());
         assert_eq!(runtime.sources().memory, ResourceSource::Injected);
     }
 
@@ -5322,9 +5304,8 @@ mod tests {
         let wal = temp.path().join("wal");
         let stage_root = temp.path().join("scribe-stage");
         let scribe = temp.path().join("scribe-output-scratch");
-        let forge = temp.path().join("forge");
         let oracle = temp.path().join("oracle");
-        for path in [&wal, &stage_root, &scribe, &forge, &oracle] {
+        for path in [&wal, &stage_root, &scribe, &oracle] {
             fs::create_dir(path).expect("registered volume root");
         }
         fs::write(wal.join("retained.wal"), [0_u8; 16]).expect("retained WAL fixture");
@@ -5334,7 +5315,6 @@ mod tests {
                 wal,
                 scribe_stage: stage_root,
                 scribe_output_scratch: scribe,
-                forge_scratch: forge,
                 oracle_scratch: oracle,
             },
             80,
@@ -5347,11 +5327,11 @@ mod tests {
                 .wal
                 .try_reserve_growth(32)
                 .expect("provisional WAL growth");
-            assert!(capabilities.forge.try_acquire(33).is_err());
+            assert!(capabilities.oracle.try_acquire(33).is_err());
             drop(provisional);
         }
         let scratch = capabilities
-            .forge
+            .oracle
             .try_acquire(64)
             .expect("retained WAL plus exact-limit scratch succeeds");
         assert!(capabilities.oracle.try_acquire(1).is_err());
@@ -5376,9 +5356,8 @@ mod tests {
         let wal = temp.path().join("wal");
         let stage_root = temp.path().join("scribe-stage");
         let scribe = temp.path().join("scribe-output-scratch");
-        let forge = temp.path().join("forge");
         let oracle = temp.path().join("oracle");
-        for path in [&wal, &stage_root, &scribe, &forge, &oracle] {
+        for path in [&wal, &stage_root, &scribe, &oracle] {
             fs::create_dir(path).expect("registered volume root");
         }
         let governor = BifrostVolumeGovernor::register(
@@ -5386,7 +5365,6 @@ mod tests {
                 wal,
                 scribe_stage: stage_root,
                 scribe_output_scratch: scribe,
-                forge_scratch: forge,
                 oracle_scratch: oracle,
             },
             64,
@@ -5413,7 +5391,7 @@ mod tests {
                 } else {
                     governor
                         .capabilities()
-                        .forge
+                        .oracle
                         .try_acquire(64)
                         .map(|owner| Box::new(owner) as Box<dyn std::any::Any>)
                 };
@@ -5446,9 +5424,8 @@ mod tests {
         let wal = temp.path().join("wal");
         let stage_root = wal.join("scribe-stage");
         let scribe = wal.join("scribe-output-scratch");
-        let forge = wal.join("forge");
         let oracle = wal.join("oracle");
-        for path in [&wal, &stage_root, &scribe, &forge, &oracle] {
+        for path in [&wal, &stage_root, &scribe, &oracle] {
             fs::create_dir_all(path).expect("registered volume root");
         }
         let retained_wal = wal.join("retained.wal");
@@ -5464,7 +5441,6 @@ mod tests {
                 wal,
                 scribe_stage: stage_root,
                 scribe_output_scratch: scribe.clone(),
-                forge_scratch: forge,
                 oracle_scratch: oracle,
             },
             1024,
@@ -5506,9 +5482,8 @@ mod tests {
         let wal = temp.path().join("wal");
         let stage_root = wal.join("scribe-stage");
         let scribe = wal.join("scribe-output-scratch");
-        let forge = wal.join("forge");
         let oracle = wal.join("oracle");
-        for path in [&wal, &stage_root, &scribe, &forge, &oracle] {
+        for path in [&wal, &stage_root, &scribe, &oracle] {
             fs::create_dir_all(path).expect("registered volume root");
         }
         let health = BifrostResourceHealth::default();
@@ -5517,7 +5492,6 @@ mod tests {
                 wal,
                 scribe_stage: stage_root,
                 scribe_output_scratch: scribe,
-                forge_scratch: forge,
                 oracle_scratch: oracle,
             },
             1024,
@@ -5621,9 +5595,8 @@ mod tests {
             let wal = temp.path().join("wal");
             let stage_root = temp.path().join("scribe-stage");
             let scribe = temp.path().join("scribe-output-scratch");
-            let forge = temp.path().join("forge");
             let oracle_root = temp.path().join("oracle");
-            for path in [&wal, &stage_root, &scribe, &forge, &oracle_root] {
+            for path in [&wal, &stage_root, &scribe, &oracle_root] {
                 fs::create_dir(path).expect("registered volume root");
             }
             let volumes = BifrostVolumeGovernor::register(
@@ -5631,14 +5604,13 @@ mod tests {
                     wal,
                     scribe_stage: stage_root,
                     scribe_output_scratch: scribe,
-                    forge_scratch: forge,
                     oracle_scratch: oracle_root,
                 },
                 64,
                 BifrostResourceHealth::default(),
             )
             .expect("volume plan");
-            let capability = volumes.capabilities().forge;
+            let capability = volumes.capabilities().oracle;
             let scratch = capability.try_acquire(64).expect("volume grant");
             assert!(capability.try_acquire(1).is_err());
             drop(scratch);
@@ -5657,7 +5629,7 @@ mod tests {
             "result=\"acquired\"",
             "result=\"refused\"",
             "result=\"released\"",
-            "volume_class=\"forge\"",
+            "volume_class=\"oracle\"",
             "bifrost_resource_current_bytes",
         ] {
             assert!(
@@ -5682,12 +5654,11 @@ mod tests {
         let wal = disk.path().join("wal");
         let stage_root = disk.path().join("scribe-stage");
         let scribe = disk.path().join("scribe-output-scratch");
-        let forge = disk.path().join("forge");
         let oracle = memory.path().join("oracle");
-        for path in [&wal, &stage_root, &scribe, &forge, &oracle] {
+        for path in [&wal, &stage_root, &scribe, &oracle] {
             fs::create_dir(path).expect("registered volume root");
         }
-        if fs::metadata(&forge).expect("Forge metadata").dev()
+        if fs::metadata(&scribe).expect("Scribe metadata").dev()
             == fs::metadata(&oracle).expect("Oracle metadata").dev()
             || filesystem_available_bytes(&oracle)
                 .map_or(true, |available| available < MIN_SCRATCH_FREE_BYTES + 64)
@@ -5699,7 +5670,6 @@ mod tests {
                 wal,
                 scribe_stage: stage_root,
                 scribe_output_scratch: scribe,
-                forge_scratch: forge,
                 oracle_scratch: oracle,
             },
             64,
@@ -5707,17 +5677,17 @@ mod tests {
         )
         .expect("distinct roots register");
         let capabilities = governor.capabilities();
-        let forge_lease = capabilities
-            .forge
+        let scribe_lease = capabilities
+            .scribe_output
             .try_acquire(64)
-            .expect("Forge consumes its device boundary");
+            .expect("Scribe output consumes its device boundary");
         let oracle_lease = capabilities
             .oracle
             .try_acquire(64)
             .expect("Oracle independently consumes its device boundary");
-        assert!(capabilities.forge.try_acquire(1).is_err());
+        assert!(capabilities.scribe_output.try_acquire(1).is_err());
         assert!(capabilities.oracle.try_acquire(1).is_err());
-        drop((forge_lease, oracle_lease));
+        drop((scribe_lease, oracle_lease));
     }
 
     /// Enabled roles alone receive protected floors and elastic arithmetic is exact.
@@ -5725,25 +5695,23 @@ mod tests {
     fn resource_plan_reserves_only_enabled_role_floors() {
         let gib = 1024 * MIB;
         let cases = [
-            (&[BifrostRole::Oracle][..], 0, 256 * MIB, 0, 512 * MIB),
-            (&[BifrostRole::Scribe][..], 256 * MIB, 0, 0, 512 * MIB),
-            (&[BifrostRole::Forge][..], 0, 0, 64 * MIB, 704 * MIB),
+            (&[BifrostRole::Oracle][..], 0, 256 * MIB, 512 * MIB),
+            (&[BifrostRole::Scribe][..], 256 * MIB, 0, 512 * MIB),
+            (&[BifrostRole::Forge][..], 0, 0, 768 * MIB),
             (
                 &[BifrostRole::Scribe, BifrostRole::Oracle][..],
                 256 * MIB,
                 256 * MIB,
-                0,
                 256 * MIB,
             ),
         ];
-        for (roles, scribe, oracle, forge, elastic) in cases {
+        for (roles, scribe, oracle, elastic) in cases {
             let runtime = BifrostRuntimeResources::from_snapshot(snapshot(gib), policy(roles))
                 .expect("resource plan must fit");
             let plan = runtime.plan();
             assert_eq!(plan.managed_memory_bytes, 768 * MIB);
             assert_eq!(plan.scribe_floor_bytes, scribe);
             assert_eq!(plan.oracle_floor_bytes, oracle);
-            assert_eq!(plan.forge_floor_bytes, forge);
             assert_eq!(plan.elastic_memory_bytes, elastic);
         }
     }
@@ -5781,10 +5749,8 @@ mod tests {
                 plan: roles.plan(),
                 scribe_memory_used_bytes: 0,
                 oracle_memory_used_bytes: 0,
-                forge_memory_used_bytes: 0,
                 elastic_memory_used_bytes: 0,
                 scratch_used_bytes: 0,
-                forge_reader_permits_used: 0,
                 oracle_active_queries: 0,
                 oracle_interactive_queries: 0,
                 oracle_analytical_queries: 0,
@@ -5981,36 +5947,6 @@ mod tests {
         assert!(!roles.snapshot().expect("snapshot").oracle_query_active);
     }
 
-    /// Forge's runtime pool remains nested in and bounded by its retained lease.
-    #[test]
-    fn forge_harness_pool_is_issued_by_operation_lease() {
-        let roles = BifrostRuntimeResources::composed_for_test(
-            1024 * MIB,
-            512 * MIB as u64,
-            [BifrostRole::Forge],
-        );
-        let forge = roles.forge().expect("Forge capability");
-        let lease = forge
-            .try_acquire_rewrite(ForgeRewriteRequest {
-                envelope: envelope(),
-                memory_bytes: 128 * MIB,
-                scratch_bytes: 64 * MIB as u64,
-                reader_permits: 1,
-            })
-            .expect("Forge operation lease");
-        let pool = lease.memory_pool();
-        let reservation = MemoryConsumer::new("forge-operation-test").register(&pool);
-        reservation
-            .try_grow(128 * MIB)
-            .expect("lease pool accepts exact capacity");
-        assert!(reservation.try_grow(1).is_err());
-        reservation.shrink(128 * MIB);
-        drop(lease);
-        let released = forge.snapshot().expect("released Forge snapshot");
-        assert_eq!(released.elastic_memory_used_bytes, 0);
-        assert_eq!(released.scratch_used_bytes, 0);
-    }
-
     /// Live detection reaches the same checked constructor as an injection.
     ///
     /// `detect` may legitimately fail on a constrained CI host. Scratch free
@@ -6042,7 +5978,6 @@ mod tests {
                         replayed_plan.managed_memory_bytes,
                         replayed_plan.scribe_floor_bytes,
                         replayed_plan.oracle_floor_bytes,
-                        replayed_plan.forge_floor_bytes,
                         replayed_plan.elastic_memory_bytes,
                     ),
                     (
@@ -6052,7 +5987,6 @@ mod tests {
                         live_plan.managed_memory_bytes,
                         live_plan.scribe_floor_bytes,
                         live_plan.oracle_floor_bytes,
-                        live_plan.forge_floor_bytes,
                         live_plan.elastic_memory_bytes,
                     ),
                     "detection must resolve deterministic fields through one constructor"
@@ -6081,22 +6015,17 @@ mod tests {
         .expect("all-role plan must fit");
         let roles = runtime.compose_roles().expect("composition");
         let oracle = roles.oracle().expect("Oracle capability");
-        let forge = roles.forge().expect("Forge capability");
         assert!(oracle.shares_root_with(&roles));
-        assert!(forge.shares_root_with(&roles));
         assert!(runtime.shares_root_with(&roles));
 
-        let lease = forge
-            .try_acquire_rewrite(ForgeRewriteRequest {
-                envelope: envelope(),
-                memory_bytes: 64 * MIB,
-                scratch_bytes: 64 * MIB as u64,
-                reader_permits: 1,
-            })
-            .expect("Forge lease");
-        let occupied = oracle.snapshot().expect("Oracle observes the shared root");
-        assert_eq!(occupied.forge_memory_used_bytes, 64 * MIB);
-        assert_eq!(occupied.elastic_memory_used_bytes, 0);
+        let lease = oracle
+            .try_acquire_query(interactive_query(0.0))
+            .expect("Oracle query lease");
+        let occupied = roles.snapshot().expect("the root observes its own lease");
+        assert_eq!(
+            occupied.oracle_memory_used_bytes,
+            lease.granted_memory_bytes
+        );
         drop(lease);
         assert_eq!(
             oracle
@@ -6619,7 +6548,6 @@ mod tests {
         );
         let oracle = roles.oracle().expect("Oracle capability");
         let scribe = roles.scribe().expect("Scribe capability");
-        let forge = roles.forge().expect("Forge capability");
         let queries = [
             oracle
                 .try_acquire_query(interactive_query(0.0))
@@ -6644,29 +6572,9 @@ mod tests {
                 })
                 .expect("Scribe lease two"),
         ];
-        let forge_leases = [
-            forge
-                .try_acquire_rewrite(ForgeRewriteRequest {
-                    envelope: envelope(),
-                    memory_bytes: 32 * MIB,
-                    scratch_bytes: 32 * MIB as u64,
-                    reader_permits: 1,
-                })
-                .expect("Forge lease one"),
-            forge
-                .try_acquire_rewrite(ForgeRewriteRequest {
-                    envelope: envelope(),
-                    memory_bytes: 32 * MIB,
-                    scratch_bytes: 32 * MIB as u64,
-                    reader_permits: 1,
-                })
-                .expect("Forge lease two"),
-        ];
         let snapshot = roles.snapshot().expect("shared-root snapshot");
         assert!(
-            snapshot.scribe_memory_used_bytes
-                + snapshot.oracle_memory_used_bytes
-                + snapshot.forge_memory_used_bytes
+            snapshot.scribe_memory_used_bytes + snapshot.oracle_memory_used_bytes
                 <= snapshot.plan.managed_memory_bytes
         );
         // Stated as the floor-first invariant rather than a fixed number: elastic
@@ -6678,16 +6586,12 @@ mod tests {
             .saturating_sub(snapshot.plan.scribe_floor_bytes)
             + snapshot
                 .oracle_memory_used_bytes
-                .saturating_sub(snapshot.plan.oracle_floor_bytes)
-            + snapshot
-                .forge_memory_used_bytes
-                .saturating_sub(snapshot.plan.forge_floor_bytes);
+                .saturating_sub(snapshot.plan.oracle_floor_bytes);
         assert_eq!(snapshot.elastic_memory_used_bytes, expected_elastic);
-        drop((queries, scribe_leases, forge_leases));
+        drop((queries, scribe_leases));
         let released = roles.snapshot().expect("shared-root release");
         assert_eq!(released.scribe_memory_used_bytes, 0);
         assert_eq!(released.oracle_memory_used_bytes, 0);
-        assert_eq!(released.forge_memory_used_bytes, 0);
         assert_eq!(released.scratch_used_bytes, 0);
     }
 
@@ -6799,99 +6703,6 @@ mod tests {
         );
     }
 
-    /// A refused Forge rewrite leaves both counters exactly as it found them.
-    #[test]
-    fn forge_capability_refusal_is_atomic() {
-        let roles = BifrostRuntimeResources::composed_for_test(
-            1024 * MIB,
-            512 * MIB as u64,
-            [BifrostRole::Forge],
-        );
-        let forge = roles.forge().expect("Forge capability");
-        let plan = roles.plan();
-        let baseline = forge.snapshot().expect("baseline");
-
-        assert!(
-            forge
-                .try_acquire_rewrite(ForgeRewriteRequest {
-                    envelope: envelope(),
-                    memory_bytes: plan.forge_floor_bytes + plan.elastic_memory_bytes + 1,
-                    scratch_bytes: 1,
-                    reader_permits: 1,
-                })
-                .is_err(),
-            "memory beyond the elastic pool must be refused"
-        );
-        assert_eq!(forge.snapshot().expect("after memory refusal"), baseline);
-
-        assert!(
-            forge
-                .try_acquire_rewrite(ForgeRewriteRequest {
-                    envelope: envelope(),
-                    memory_bytes: 1,
-                    scratch_bytes: plan.scratch_limit_bytes + 1,
-                    reader_permits: 1,
-                })
-                .is_err(),
-            "scratch beyond the disposable ceiling must be refused"
-        );
-        assert_eq!(forge.snapshot().expect("after scratch refusal"), baseline);
-
-        assert!(
-            forge
-                .try_acquire_rewrite(ForgeRewriteRequest {
-                    envelope: envelope(),
-                    memory_bytes: 1,
-                    scratch_bytes: 1,
-                    reader_permits: u16::try_from(plan.effective_cpu + 1).unwrap_or(u16::MAX),
-                })
-                .is_err(),
-            "reader permits beyond live CPU capacity must be refused atomically"
-        );
-        assert_eq!(forge.snapshot().expect("after reader refusal"), baseline);
-    }
-
-    /// Concurrent Forge grants contend on reader permits in the same atomic ledger.
-    #[test]
-    fn forge_reader_permits_are_atomic_under_contention() {
-        let roles = BifrostRuntimeResources::composed_for_test(
-            1024 * MIB,
-            512 * MIB as u64,
-            [BifrostRole::Forge],
-        );
-        let forge = roles.forge().expect("Forge capability");
-        let permits = u16::try_from(roles.plan().effective_cpu).unwrap_or(u16::MAX);
-        let lease = forge
-            .try_acquire_rewrite(ForgeRewriteRequest {
-                envelope: envelope(),
-                memory_bytes: 1,
-                scratch_bytes: 1,
-                reader_permits: permits,
-            })
-            .expect("first lease owns every reader permit");
-        let held = forge.snapshot().expect("held snapshot");
-        assert_eq!(held.forge_reader_permits_used, usize::from(permits));
-        assert!(
-            forge
-                .try_acquire_rewrite(ForgeRewriteRequest {
-                    envelope: envelope(),
-                    memory_bytes: 1,
-                    scratch_bytes: 1,
-                    reader_permits: 1,
-                })
-                .is_err()
-        );
-        assert_eq!(forge.snapshot().expect("refusal snapshot"), held);
-        drop(lease);
-        assert_eq!(
-            forge
-                .snapshot()
-                .expect("released")
-                .forge_reader_permits_used,
-            0
-        );
-    }
-
     /// The Oracle runtime pool is the lease's own, and drop restores baselines.
     #[test]
     fn oracle_lease_pool_identity_and_drop_cleanup() {
@@ -6921,44 +6732,6 @@ mod tests {
             oracle.snapshot().expect("released"),
             baseline,
             "dropping the query lease must restore every baseline"
-        );
-    }
-
-    /// The Forge runtime pool is the lease's own, and drop restores baselines.
-    #[test]
-    fn forge_lease_pool_identity_and_drop_cleanup() {
-        let roles = BifrostRuntimeResources::composed_for_test(
-            1024 * MIB,
-            512 * MIB as u64,
-            [BifrostRole::Forge],
-        );
-        let forge = roles.forge().expect("Forge capability");
-        let baseline = forge.snapshot().expect("baseline");
-        let lease = forge
-            .try_acquire_rewrite(ForgeRewriteRequest {
-                envelope: envelope(),
-                memory_bytes: 128 * MIB,
-                scratch_bytes: 64 * MIB as u64,
-                reader_permits: 1,
-            })
-            .expect("Forge operation lease");
-        let pool = lease.memory_pool();
-        assert!(
-            Arc::ptr_eq(&pool, &lease.memory_pool()),
-            "the lease must issue one stable pool"
-        );
-        let reservation = MemoryConsumer::new("forge-lease-identity").register(&pool);
-        reservation
-            .try_grow(128 * MIB)
-            .expect("the lease pool admits exactly its grant");
-        assert!(reservation.try_grow(1).is_err());
-        reservation.shrink(128 * MIB);
-        assert_eq!(lease.scratch_bytes(), 64 * MIB as u64);
-        drop(lease);
-        assert_eq!(
-            forge.snapshot().expect("released"),
-            baseline,
-            "dropping the operation lease must restore every baseline"
         );
     }
 
@@ -7018,7 +6791,7 @@ mod tests {
     }
 
     #[test]
-    fn scribe_floor_survives_oracle_and_forge_elastic_pressure() {
+    fn scribe_floor_survives_oracle_elastic_pressure() {
         let roles = BifrostRuntimeResources::composed_for_test(
             1024 * MIB,
             512 * MIB as u64,
@@ -7028,7 +6801,6 @@ mod tests {
         assert_eq!(plan.scribe_floor_bytes, ROLE_MEMORY_FLOOR_BYTES);
         let scribe = roles.scribe().expect("Scribe capability");
         let oracle = roles.oracle().expect("Oracle capability");
-        let forge = roles.forge().expect("Forge capability");
         let scribe_owner = scribe
             .try_acquire_memory(ScribeMemoryRequest {
                 bytes: 300 * MIB,
@@ -7046,28 +6818,9 @@ mod tests {
             query.memory_bytes, ORACLE_PARTITION_WORKING_MEMORY_BYTES,
             "an interactive query charges one slot-unit quantum against the budget"
         );
-        let concurrent_forge = forge
-            .try_acquire_rewrite(ForgeRewriteRequest {
-                envelope: envelope(),
-                memory_bytes: 1,
-                scratch_bytes: 1,
-                reader_permits: 1,
-            })
-            .expect("Forge retains its floor while Oracle owns an exact query");
         assert_eq!(roles.plan().scribe_floor_bytes, ROLE_MEMORY_FLOOR_BYTES);
-        drop(concurrent_forge);
         drop(query);
         drop(scribe_owner);
-        let forge_owner = forge
-            .try_acquire_rewrite(ForgeRewriteRequest {
-                envelope: envelope(),
-                memory_bytes: plan.forge_floor_bytes + plan.elastic_memory_bytes,
-                scratch_bytes: plan.scratch_limit_bytes,
-                reader_permits: 1,
-            })
-            .expect("Forge may own all elastic resources after Oracle releases");
-        assert_eq!(roles.plan().scribe_floor_bytes, ROLE_MEMORY_FLOOR_BYTES);
-        drop(forge_owner);
         let snapshot = roles.snapshot().expect("released resource snapshot");
         assert_eq!(snapshot.elastic_memory_used_bytes, 0);
         assert_eq!(snapshot.scratch_used_bytes, 0);

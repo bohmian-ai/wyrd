@@ -35,7 +35,7 @@ use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::oracle::dispatcher::{DispatchError, OraclePeerCredentials};
 use vala_bifrost_redux::resources::{
     BifrostResourcePolicy, BifrostRole, BifrostRuntimeResources, BifrostVolumeRoots,
-    ResourceSource, SystemResourceSnapshot,
+    MIN_UNMANAGED_RESERVE_BYTES, ROLE_MEMORY_FLOOR_BYTES, ResourceSource, SystemResourceSnapshot,
 };
 use vala_bifrost_redux::scribe::ScribeImpl;
 use vala_bifrost_redux::scribe::admission::AdmissionConfig;
@@ -3437,8 +3437,28 @@ impl WyrdTestServerBuilder {
                 )
             })
             .then(|| {
-                self.forge_compaction_memory_limit_bytes
-                    .unwrap_or(HARNESS_FORGE_COMPACTION_BUDGET_BYTES)
+                self.forge_compaction_memory_limit_bytes.unwrap_or_else(|| {
+                    // The default is sized for the tables most fixtures
+                    // compact, but a small pod still has to leave elastic
+                    // memory for the Scribe and Oracle work beside it, so the
+                    // remainder left by the protected floors halves it.
+                    let protected = self
+                        .bifrost_roles
+                        .iter()
+                        .filter(|role| {
+                            matches!(
+                                role,
+                                BifrostRuntimeRole::Scribe | BifrostRuntimeRole::Oracle
+                            )
+                        })
+                        .count()
+                        * ROLE_MEMORY_FLOOR_BYTES;
+                    let safe = snapshot
+                        .memory_limit_bytes
+                        .saturating_sub(MIN_UNMANAGED_RESERVE_BYTES)
+                        .saturating_sub(protected);
+                    HARNESS_FORGE_COMPACTION_BUDGET_BYTES.min(safe / 2)
+                })
             });
         let runtime_resources =
             BifrostRuntimeResources::from_snapshot_with_transport_message_limit(

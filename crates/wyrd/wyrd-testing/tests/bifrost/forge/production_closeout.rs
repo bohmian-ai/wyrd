@@ -517,7 +517,7 @@ impl CloseoutJourney {
                 let next = self.observer.attempts() + 1;
                 let (pending, attempts): (i64, i64) = sqlx::query_as(
                     "SELECT count(*) FILTER (WHERE state NOT IN \
-                     ('succeeded', 'failed', 'cancelled', 'unschedulable')), \
+                     ('succeeded', 'failed', 'cancelled')), \
                      coalesce(sum(attempt_count), 0)::bigint FROM vala.forge_tasks",
                 )
                 .fetch_one(self.cluster.pg_fixture().operator_pool().pool())
@@ -573,7 +573,7 @@ impl CloseoutJourney {
                 let next = self.observer.attempts() + 1;
                 let (pending, attempts): (i64, i64) = sqlx::query_as(
                     "SELECT count(*) FILTER (WHERE state NOT IN \
-                     ('succeeded', 'failed', 'cancelled', 'unschedulable')), \
+                     ('succeeded', 'failed', 'cancelled')), \
                      coalesce(sum(attempt_count), 0)::bigint FROM vala.forge_tasks",
                 )
                 .fetch_one(self.cluster.pg_fixture().operator_pool().pool())

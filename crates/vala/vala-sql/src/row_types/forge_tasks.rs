@@ -1465,8 +1465,6 @@ pub enum ForgeTaskState {
     Succeeded,
     /// Eligible for a later attempt.
     Retryable,
-    /// Permanently exceeds capacity.
-    Unschedulable,
     /// Permanently failed.
     Failed,
     /// Superseded before external effects or explicitly cancelled by an operator.
@@ -1483,7 +1481,6 @@ impl ForgeTaskState {
             Self::Prepared => "prepared",
             Self::Succeeded => "succeeded",
             Self::Retryable => "retryable",
-            Self::Unschedulable => "unschedulable",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
         }
@@ -1493,7 +1490,7 @@ impl ForgeTaskState {
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
-            Self::Succeeded | Self::Unschedulable | Self::Failed | Self::Cancelled
+            Self::Succeeded | Self::Failed | Self::Cancelled
         )
     }
 }
@@ -1510,7 +1507,6 @@ impl FromStr for ForgeTaskState {
             "prepared" => Ok(Self::Prepared),
             "succeeded" => Ok(Self::Succeeded),
             "retryable" => Ok(Self::Retryable),
-            "unschedulable" => Ok(Self::Unschedulable),
             "failed" => Ok(Self::Failed),
             "cancelled" => Ok(Self::Cancelled),
             _ => Err(SqlError::InvariantViolation {

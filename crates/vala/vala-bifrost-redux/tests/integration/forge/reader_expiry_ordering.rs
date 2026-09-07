@@ -81,7 +81,7 @@ async fn seed_running_expiry_task(
         .execute(pool)
         .await
         .expect("lease seeds");
-    sqlx::query("INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,namespace_name,table_name,strategy,lane,base_snapshot_id,plan,plan_hash,estimated_files,estimated_bytes,estimated_parallelism,estimated_memory_bytes,estimated_spill_bytes,large_task_ceiling_bytes,state,attempt_id,claimed_by,claim_expires_at,watermark_snapshot_id,watermark_timestamp_ms,ready_at) VALUES ($1,$2,$3,$4,$5,'snapshot_expiry','ordinary',$8,'{}'::jsonb,decode(repeat($9,32),'hex'),1,1,1,1,1,1,'running',$6,$7,now()+interval '10 minutes',$8,1,now())")
+    sqlx::query("INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,namespace_name,table_name,strategy,base_snapshot_id,plan,plan_hash,estimated_files,estimated_bytes,state,attempt_id,claimed_by,claim_expires_at,watermark_snapshot_id,watermark_timestamp_ms,ready_at) VALUES ($1,$2,$3,$4,$5,'snapshot_expiry',$8,'{}'::jsonb,decode(repeat($9,32),'hex'),1,1,'running',$6,$7,now()+interval '10 minutes',$8,1,now())")
         .bind(authority.task_id)
         .bind(tenant.as_uuid())
         .bind(&identity.catalog_name)

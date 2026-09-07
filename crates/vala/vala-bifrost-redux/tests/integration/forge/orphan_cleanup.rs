@@ -322,8 +322,8 @@ async fn seed_ready_orphan_task_at(
         "parameters": {"version": 1, "kind": "orphan_cleanup", "age_cutoff_ms": cutoff_ms},
     });
     sqlx::query(
-        "INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,namespace_name,table_name,strategy,lane,base_snapshot_id,plan,plan_hash,estimated_files,estimated_bytes,estimated_parallelism,estimated_memory_bytes,estimated_spill_bytes,large_task_ceiling_bytes,state,ready_at,envelope_version,decoded_batch_bytes,decoded_input_bytes,sort_working_bytes,sort_merge_reservation_bytes,encoder_buffer_bytes,upload_chunk_bytes,footer_encoded_bytes,footer_decode_workspace_bytes,sort_spill_bytes) \
-         VALUES ($1,$2,'wyrd-redux',$3,$4,'orphan_cleanup','ordinary',$5,$6,decode(repeat('71',32),'hex'),1,1,1,41943040,1024,1,'ready',now(),2,1024,1024,3072,1024,1024,1024,8388608,33554432,1024)",
+        "INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,namespace_name,table_name,strategy,base_snapshot_id,plan,plan_hash,estimated_files,estimated_bytes,state,ready_at) \
+         VALUES ($1,$2,'wyrd-redux',$3,$4,'orphan_cleanup',$5,$6,decode(repeat('71',32),'hex'),1,1,'ready',now())",
     )
     .bind(task_id)
     .bind(fixture.tenant.as_uuid())
@@ -1067,8 +1067,8 @@ async fn seed_prepared_cleanup_candidate(fixture: &PromotionIntegrationFixture, 
         "prepared_candidate_index": 0,
     });
     sqlx::query(
-        "INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,namespace_name,table_name,strategy,lane,base_snapshot_id,plan,plan_hash,estimated_files,estimated_bytes,estimated_parallelism,estimated_memory_bytes,estimated_spill_bytes,large_task_ceiling_bytes,state,ready_at,attempt_id,claimed_by,claim_expires_at,watermark_snapshot_id,watermark_timestamp_ms,evidence,envelope_version,decoded_batch_bytes,decoded_input_bytes,sort_working_bytes,sort_merge_reservation_bytes,encoder_buffer_bytes,upload_chunk_bytes,footer_encoded_bytes,footer_decode_workspace_bytes,sort_spill_bytes) \
-         VALUES ($1,$2,'wyrd-redux',$3,$4,'expired_cleanup','ordinary',$5,$6,decode(repeat('72',32),'hex'),1,1,1,41943040,1024,1,'prepared',now(),$7,$7,now()+interval '10 minutes',1,0,$8,2,1024,1024,3072,1024,1024,1024,8388608,33554432,1024)",
+        "INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,namespace_name,table_name,strategy,base_snapshot_id,plan,plan_hash,estimated_files,estimated_bytes,state,ready_at,attempt_id,claimed_by,claim_expires_at,watermark_snapshot_id,watermark_timestamp_ms,evidence) \
+         VALUES ($1,$2,'wyrd-redux',$3,$4,'expired_cleanup',$5,$6,decode(repeat('72',32),'hex'),1,1,'prepared',now(),$7,$7,now()+interval '10 minutes',1,0,$8)",
     )
     .bind(Uuid::now_v7())
     .bind(fixture.tenant.as_uuid())

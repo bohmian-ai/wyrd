@@ -1918,13 +1918,11 @@ mod tests {
         let wal_root = directory.path().join("wal");
         let scribe_stage = directory.path().join("scribe-stage");
         let scribe_scratch = directory.path().join("scribe-scratch");
-        let forge_scratch = directory.path().join("forge-scratch");
         let oracle_scratch = directory.path().join("oracle-scratch");
         for path in [
             &wal_root,
             &scribe_stage,
             &scribe_scratch,
-            &forge_scratch,
             &oracle_scratch,
         ] {
             std::fs::create_dir(path).expect("registered volume root");

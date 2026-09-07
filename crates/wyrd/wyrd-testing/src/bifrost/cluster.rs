@@ -2166,7 +2166,7 @@ impl WyrdTestCluster {
                     COUNT(DISTINCT attempt_id) FILTER (WHERE state IN ('claimed', 'running', 'prepared'))::bigint,
                     COUNT(*) FILTER (WHERE state IN ('ready', 'retryable') AND ready_at <= statement_timestamp())::bigint,
                     COUNT(*) FILTER (WHERE attempt_id IS NOT NULL)::bigint,
-                    COUNT(*) FILTER (WHERE state IN ('succeeded', 'failed', 'cancelled', 'unschedulable') AND evidence IS NOT NULL)::bigint
+                    COUNT(*) FILTER (WHERE state IN ('succeeded', 'failed', 'cancelled') AND evidence IS NOT NULL)::bigint
                  FROM vala.forge_tasks",
             )
             .fetch_one(pool)

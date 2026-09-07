@@ -521,8 +521,8 @@ impl ForgeTasks {
     ///
     /// The worker-cursor row is locked first. PostgreSQL 16-compatible
     /// `FOR UPDATE SKIP LOCKED` then selects one row and advances the cursor in
-    /// the same transaction. Three durable bounds govern concurrency (D78):
-    /// The two durable bounds on concurrency are the retained per-table
+    /// the same transaction. Two durable bounds govern concurrency (D78): the
+    /// retained per-table
     /// publication index (`forge_tasks_publication_active`), which admits one
     /// active task per (tenant, catalog, namespace, table), and the per-tenant
     /// active cap (`max_active_per_tenant`), which bounds a single tenant's
@@ -652,10 +652,8 @@ impl ForgeTasks {
     ///
     /// Prepared evidence belongs to the committing attempt, so recovery keeps
     /// that attempt UUID while assigning a new compute owner. Recovery is
-    /// governed by the same per-owner one-active-large rule as the fair claim
-    /// (D78): a `large_singleton` Prepared task is taken over only when the
-    /// recovering owner holds no other active large task. There is no separate
-    /// lease row to reacquire; the retained per-table publication index and the
+    /// governed by the same durable bounds as the fair claim (D78). There is no
+    /// separate lease row to reacquire; the retained per-table publication index and the
     /// task's own `claim_expires_at` expiry are the recovery authority. Because
     /// a candidate's own Prepared row is excluded from the per-owner scan, an
     /// owner that already holds it can renew ownership without self-blocking.

@@ -174,7 +174,7 @@ async fn hot_rows(cluster: &WyrdTestCluster, tenant: DataTenantId) -> i64 {
 async fn pending_tasks(cluster: &WyrdTestCluster) -> i64 {
     sqlx::query_scalar::<_, i64>(
         "SELECT count(*) FROM vala.forge_tasks \
-         WHERE state NOT IN ('succeeded', 'failed', 'cancelled', 'unschedulable')",
+         WHERE state NOT IN ('succeeded', 'failed', 'cancelled')",
     )
     .fetch_one(cluster.pg_fixture().operator_pool().pool())
     .await

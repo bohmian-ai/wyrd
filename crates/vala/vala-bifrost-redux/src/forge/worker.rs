@@ -6679,10 +6679,7 @@ fn durable_task_result(
             }
             _ => ForgeTaskResult::Failed,
         }),
-        ForgeTaskState::Ready
-        | ForgeTaskState::Claimed
-        | ForgeTaskState::Running
-        | ForgeTaskState::Unschedulable => None,
+        ForgeTaskState::Ready | ForgeTaskState::Claimed | ForgeTaskState::Running => None,
     }
 }
 

@@ -1323,7 +1323,7 @@ async fn forge_begin_shutdown_closes_readiness_before_cancellation() {
 /// Orphan collection's only anti-starvation mechanism is an exclusive
 /// `start_after` cursor, so a backend that cannot resume natively cannot keep
 /// the guarantee this worker's cleanup authority depends on. The refusal
-/// therefore lands before scratch identity, registration, recovery, readiness,
+/// therefore lands before registration, recovery, readiness,
 /// or any claim — not at the first orphan listing, after the worker has already
 /// advertised itself and taken destructive work. The filesystem service is the
 /// already-installed backend that advertises the capability as absent, which is
@@ -1699,48 +1699,6 @@ async fn run_forge_worker_once(
     let outcome = outcome.expect("bounded worker").expect("worker joins");
     stop.cancel();
     outcome
-}
-
-/// A worker whose scratch volume is not a writable directory quarantines
-/// itself, never publishes ready, and recovers once the volume is restored.
-///
-/// The scratch probe is the first thing a worker does, before it registers or
-/// drains anything, so a pod whose spill volume failed to mount must not be
-/// routed work. Quarantine is durable, so an operator can see which pod refused
-/// itself rather than inferring it from an unready replica.
-///
-/// # Panics
-///
-/// Panics when the quarantined worker publishes ready or the restored worker
-/// does not.
-#[cfg(feature = "test-support")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn worker_scratch_failure_quarantines_without_readiness() {
-    let (server, _observer) = server_with_forge_observer().await;
-    let scratch = server
-        .scribe_wal_root_for_test()
-        .expect("the in-process server owns a WAL root")
-        .join("forge-spill");
-    std::fs::remove_dir_all(&scratch).expect("the composed scratch root is removable");
-    std::fs::write(&scratch, b"not a directory").expect("a regular file replaces the scratch root");
-
-    let readiness = server
-        .state()
-        .forge()
-        .expect("the default target selects Forge")
-        .worker_readiness();
-    run_forge_worker_once(&server)
-        .await
-        .expect("a quarantined worker returns rather than crashing the pod");
-    assert!(
-        !readiness.is_ready(),
-        "a worker quarantined by its scratch probe advertised ready"
-    );
-
-    std::fs::remove_file(&scratch).expect("the placeholder file is removable");
-    std::fs::create_dir_all(&scratch).expect("the scratch root is restorable");
-    await_forge_role_while_running(&server, "worker after its scratch volume is restored").await;
-    server.shutdown().await.expect("test server shuts down");
 }
 
 /// A worker whose durable registration fails returns that error and never

@@ -114,8 +114,8 @@ async fn seed_running_task(
     let task_id = Uuid::now_v7();
     let (base_snapshot_id, watermark_timestamp_ms) = watermark;
     sqlx::query(
-        "INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,namespace_name,table_name,strategy,lane,base_snapshot_id,plan,plan_hash,estimated_files,estimated_bytes,estimated_parallelism,estimated_memory_bytes,estimated_spill_bytes,large_task_ceiling_bytes,state,attempt_id,claimed_by,claim_expires_at,watermark_snapshot_id,watermark_timestamp_ms,ready_at) \
-         VALUES ($1,$2,'wyrd-redux',$3,$4,'snapshot_expiry','ordinary',$7,'{\"version\":1,\"inputs\":[],\"parameters\":{\"kind\":\"maintenance\",\"trigger_commit_count\":1}}'::jsonb,decode(repeat($9,32),'hex'),1,1,1,1,1,1,'running',$5,$6,now()+interval '10 minutes',$7,$8,now())",
+        "INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,namespace_name,table_name,strategy,base_snapshot_id,plan,plan_hash,estimated_files,estimated_bytes,state,attempt_id,claimed_by,claim_expires_at,watermark_snapshot_id,watermark_timestamp_ms,ready_at) \
+         VALUES ($1,$2,'wyrd-redux',$3,$4,'snapshot_expiry',$7,'{\"version\":1,\"inputs\":[],\"parameters\":{\"kind\":\"maintenance\",\"trigger_commit_count\":1}}'::jsonb,decode(repeat($9,32),'hex'),1,1,'running',$5,$6,now()+interval '10 minutes',$7,$8,now())",
     )
     .bind(task_id)
     .bind(tenant.as_uuid())
@@ -657,8 +657,8 @@ pub(super) async fn seed_ready_expiry_task(
         },
     });
     sqlx::query(
-        "INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,namespace_name,table_name,strategy,lane,base_snapshot_id,plan,plan_hash,estimated_files,estimated_bytes,estimated_parallelism,estimated_memory_bytes,estimated_spill_bytes,large_task_ceiling_bytes,state,ready_at,envelope_version,decoded_batch_bytes,decoded_input_bytes,sort_working_bytes,sort_merge_reservation_bytes,encoder_buffer_bytes,upload_chunk_bytes,footer_encoded_bytes,footer_decode_workspace_bytes,sort_spill_bytes) \
-         VALUES ($1,$2,'wyrd-redux',$3,$4,'snapshot_expiry','ordinary',$5,$7,decode(repeat($6,32),'hex'),1,1,1,41943040,1024,1,'ready',now(),2,1024,1024,3072,1024,1024,1024,8388608,33554432,1024)",
+        "INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,namespace_name,table_name,strategy,base_snapshot_id,plan,plan_hash,estimated_files,estimated_bytes,state,ready_at) \
+         VALUES ($1,$2,'wyrd-redux',$3,$4,'snapshot_expiry',$5,$7,decode(repeat($6,32),'hex'),1,1,'ready',now())",
     )
     .bind(task_id)
     .bind(fixture.tenant.as_uuid())

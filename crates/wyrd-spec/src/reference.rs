@@ -105,6 +105,12 @@ impl CardRefScope {
     ///
     /// Duplicate identity (same `(kind, name, version, space)`, ignoring `uid`)
     /// is removed. Root is always retained as the first element.
+    ///
+    /// A duplicate that carries a resolved `uid` donates it to the retained
+    /// entry. Mint resolves each scope member against the tenant-local
+    /// registry while its callers still hold the authored, UID-less root, so
+    /// without this the resolved root identity would be dropped and ingest
+    /// could not stamp `card_uid` from signed claims alone.
     #[must_use]
     pub fn from_root_and_members(
         root: &CardRef,
@@ -112,8 +118,16 @@ impl CardRefScope {
     ) -> Self {
         let mut scope = vec![root.clone()];
         for member in members {
-            if !scope.iter().any(|existing| existing.same_identity(&member)) {
-                scope.push(member);
+            match scope
+                .iter_mut()
+                .find(|existing| existing.same_identity(&member))
+            {
+                Some(existing) => {
+                    if existing.uid.is_none() {
+                        existing.uid = member.uid;
+                    }
+                }
+                None => scope.push(member),
             }
         }
         Self(scope)
@@ -464,6 +478,74 @@ mod tests {
             "space must serialize"
         );
         assert!(!json.contains("uid"), "uid=None must skip");
+    }
+
+    /// The compact claim encoding is the only Card-scope contract on the wire,
+    /// so it must carry each member's resolved registry UID through mint,
+    /// signing, and verification without a parallel identity-to-UID map.
+    #[test]
+    fn card_ref_scope_serde_preserves_resolved_uids() {
+        let root = CardRef {
+            uid: Some(
+                CardUid::new("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b11").expect("static uid is valid"),
+            ),
+            ..sample_ref()
+        };
+        let secondary = CardRef {
+            kind: CardKind::Model,
+            name: CardName::new("scorer").expect("static name is valid"),
+            uid: Some(
+                CardUid::new("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b22").expect("static uid is valid"),
+            ),
+            ..sample_ref()
+        };
+        let scope = CardRefScope::from_root_and_members(&root, [secondary.clone()]);
+
+        let json = serde_json::to_string(&scope).expect("scope serializes");
+        let parsed: CardRefScope = serde_json::from_str(&json).expect("scope deserializes");
+
+        assert_eq!(
+            json,
+            r#"["prod/Artifact/weights@1.0.0#01890f28-7c4a-7cc3-98e7-4f4a3c2d1b11","prod/Model/scorer@1.0.0#01890f28-7c4a-7cc3-98e7-4f4a3c2d1b22"]"#,
+            "compact claim encoding carries every resolved uid"
+        );
+        assert_eq!(parsed, scope, "round trip preserves the whole scope");
+        assert_eq!(
+            parsed.as_slice()[0].uid,
+            root.uid,
+            "root uid survives the claim round trip"
+        );
+        assert_eq!(
+            parsed.as_slice()[1].uid,
+            secondary.uid,
+            "secondary uid survives the claim round trip"
+        );
+    }
+
+    /// Mint holds the authored, UID-less root while the registry walk resolves
+    /// the same identity, so the resolved UID must survive deduplication.
+    #[test]
+    fn from_root_and_members_adopts_resolved_root_uid() {
+        let authored = sample_ref();
+        let resolved = CardRef {
+            uid: Some(
+                CardUid::new("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b11").expect("static uid is valid"),
+            ),
+            ..sample_ref()
+        };
+
+        let scope = CardRefScope::from_root_and_members(&authored, [resolved.clone()]);
+
+        assert_eq!(
+            scope.len(),
+            1,
+            "the resolved duplicate is still deduplicated"
+        );
+        assert_eq!(
+            scope.as_slice()[0].uid,
+            resolved.uid,
+            "the resolved uid is adopted onto the retained root"
+        );
     }
 
     #[test]

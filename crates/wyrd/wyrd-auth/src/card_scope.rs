@@ -46,9 +46,7 @@ pub async fn resolve_card_ref_scope(
         if members.iter().any(|m| m.same_identity(&card_ref)) {
             continue;
         }
-
-        members.push(card_ref.clone());
-        if members.len() > MAX_SCOPE_CARDS {
+        if members.len() == MAX_SCOPE_CARDS {
             return Err(too_large("cards", MAX_SCOPE_CARDS, root));
         }
 
@@ -62,6 +60,13 @@ pub async fn resolve_card_ref_scope(
         .await
         .map_err(|error| scope_resolution_error(error, root, &card_ref))?;
 
+        // Ingest stamps `card_uid` from the signed claim alone, so every scope
+        // member must leave the mint walk carrying its registry identity.
+        members.push(CardRef {
+            uid: Some(row.card_uid),
+            ..card_ref
+        });
+
         for child in wyrd_spec::reference::scope_child_card_refs(&row.spec) {
             if child.kind.is_observation_target() {
                 frontier.push((child, depth + 1));
@@ -69,7 +74,13 @@ pub async fn resolve_card_ref_scope(
         }
     }
 
-    Ok(CardRefScope::from_root_and_members(root, members))
+    let (resolved_root, rest) = members
+        .split_first()
+        .expect("scope walk invariant: the root is always the first resolved member");
+    Ok(CardRefScope::from_root_and_members(
+        resolved_root,
+        rest.to_vec(),
+    ))
 }
 
 /// Build the stable `413` error for card-ref scope count or depth overflow.
@@ -294,10 +305,10 @@ fn scope_member_summary(members: &[String]) -> Value {
 #[cfg(test)]
 mod pg_tests {
     use wyrd_auth_issue::IssueError;
-    use wyrd_dev_fixtures::cards::seed_backing_card;
+    use wyrd_dev_fixtures::cards::{seed_backing_card, seed_card_with_spec};
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_semver::VersionBlock;
-    use wyrd_spec::envelope::CardKind;
+    use wyrd_spec::envelope::{CardKind, Spec};
     use wyrd_spec::error::WyrdError;
     use wyrd_spec::ids::{CardName, SpaceName};
     use wyrd_spec::reference::CardRef;
@@ -488,6 +499,83 @@ mod pg_tests {
 
         assert_eq!(scope.as_slice().len(), 1);
         assert!(scope.as_slice()[0].same_identity(&root));
+    }
+
+    /// Ingest stamps `card_uid` from trusted signed claims alone, so the mint
+    /// walk must replace each authored reference — root and secondary — with the
+    /// exact tenant-local registry identity and its `card_uid`.
+    #[tokio::test]
+    async fn resolve_scope_populates_every_member_uid() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let created_by = uuid::Uuid::new_v4();
+        let root = make_card_ref(CardKind::Service, "prod", "svc-uid-root");
+        let secondary = make_card_ref(CardKind::Service, "prod", "svc-uid-secondary");
+
+        let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");
+        seed_backing_card(&mut conn, &secondary, created_by).await;
+        let root_spec = Spec::from_kind_and_value(
+            &CardKind::Service,
+            json!({
+                "components": [{
+                    "alias": "secondary",
+                    "ref": {
+                        "kind": "Service",
+                        "space": secondary.space.as_str(),
+                        "name": secondary.name.as_str(),
+                        "version": secondary.version.as_str(),
+                    },
+                }],
+            }),
+        )
+        .expect("root service spec decodes");
+        seed_card_with_spec(&mut conn, &root, &root_spec, created_by).await;
+
+        let expected_root_uid = get_card_by_ref(
+            &mut conn,
+            root.kind.clone(),
+            &root.space,
+            &root.name,
+            &root.version,
+        )
+        .await
+        .expect("root card row loads")
+        .card_uid;
+        let expected_secondary_uid = get_card_by_ref(
+            &mut conn,
+            secondary.kind.clone(),
+            &secondary.space,
+            &secondary.name,
+            &secondary.version,
+        )
+        .await
+        .expect("secondary card row loads")
+        .card_uid;
+
+        let scope = resolve_card_ref_scope(&mut conn, &root)
+            .await
+            .expect("resolves without error");
+
+        assert_eq!(scope.len(), 2, "root and secondary are both scoped");
+        let resolved_root = &scope.as_slice()[0];
+        assert!(
+            resolved_root.same_identity(&root),
+            "root stays the first member"
+        );
+        assert_eq!(
+            resolved_root.uid.as_ref(),
+            Some(&expected_root_uid),
+            "root member carries its registry uid"
+        );
+        let resolved_secondary = scope
+            .as_slice()
+            .iter()
+            .find(|member| member.same_identity(&secondary))
+            .expect("secondary member is present");
+        assert_eq!(
+            resolved_secondary.uid.as_ref(),
+            Some(&expected_secondary_uid),
+            "secondary member carries its registry uid"
+        );
     }
 
     #[tokio::test]

@@ -488,6 +488,18 @@ impl PromotionCatalogSeam {
         self.reject_budget.store(count, Ordering::Release);
     }
 
+    /// Refuse every later commit as a definite conflict, keeping the counters.
+    ///
+    /// Unlike [`Self::reject_next_commits`] this does not zero the attempt
+    /// counter, because it is armed *during* a run whose earlier calls the
+    /// scenario is still counting. It is what keeps a scenario that parks one
+    /// plan's commit meaningful now that an attempt publishes each of its plans
+    /// independently: without it the plans the parked one does not represent
+    /// would commit normally and hand the attempt a success.
+    pub(crate) fn reject_remaining_commits(&self) {
+        self.reject_budget.store(usize::MAX, Ordering::Release);
+    }
+
     /// Return how many commit attempts crossed this seam.
     pub(crate) fn attempts(&self) -> usize {
         self.attempts.load(Ordering::Acquire)

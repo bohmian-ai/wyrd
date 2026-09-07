@@ -289,15 +289,22 @@ async fn rewrite_publication_commits_exact_handoff_and_delete_disposition() {
     let expected = seeded.expected;
     let base_sequence = seeded.base_sequence;
     let attempts_before = catalog.attempts();
+    let snapshots_before = promoted.snapshot_count().await;
 
     supervisor.restart_worker();
     supervisor.run_one_success().await;
     supervisor.shutdown().await;
 
+    // Each admitted plan publishes independently, so the attempt count is not
+    // one -- it is one per published plan. Comparing it to the snapshots the
+    // run actually added is the property that matters and the one a combined
+    // commit or a silent retry would both break.
+    let published_plans = promoted.snapshot_count().await - snapshots_before;
+    assert!(published_plans > 0, "the rewrite published at least one plan");
     assert_eq!(
         catalog.attempts() - attempts_before,
-        1,
-        "one rewrite publishes through exactly one catalog commit"
+        published_plans,
+        "every published plan commits exactly once, and nothing commits twice"
     );
     let published = promoted.live_data_files().await;
     let live_paths = published
@@ -308,20 +315,29 @@ async fn rewrite_publication_commits_exact_handoff_and_delete_disposition() {
         live_paths.is_disjoint(&inputs),
         "every rewritten input left the live set: {live_paths:?}"
     );
+    // A position delete names the exact object it applies to, so rewriting that
+    // object always ends its scope inside the one plan that rewrote it. An
+    // equality delete's scope is every live file below its sequence, which can
+    // span sibling plans -- and a plan may only drop a delete whose whole scope
+    // its own inputs covered, so an equality delete that outlives one plan's
+    // publication is retained rather than dropped on a sibling's evidence.
     assert!(
         published
             .iter()
-            .all(|file| file.content_type() == iceberg::spec::DataContentType::Data),
-        "both applied deletes lost their whole scope and were removed: {published:?}"
+            .all(|file| file.content_type() != iceberg::spec::DataContentType::PositionDeletes),
+        "every applied position delete lost its whole scope and was removed: {published:?}"
     );
     assert!(
         !published.is_empty(),
         "the rewrite published its replacement data"
     );
+    let data_paths = published
+        .iter()
+        .filter(|file| file.content_type() == iceberg::spec::DataContentType::Data)
+        .map(|file| file.file_path().to_owned())
+        .collect::<Vec<_>>();
     assert_eq!(
-        promoted
-            .object_values(&live_paths.iter().cloned().collect::<Vec<_>>())
-            .await,
+        promoted.object_values(&data_paths).await,
         expected,
         "the published cut reads exactly the rows the deletes left behind"
     );
@@ -332,16 +348,19 @@ async fn rewrite_publication_commits_exact_handoff_and_delete_disposition() {
     // planning — which sits at a higher sequence — still does.
     let sequences = promoted.live_file_sequences().await;
     assert!(
-        live_paths
+        data_paths
             .iter()
             .all(|path| sequences.get(path) == Some(&base_sequence)),
         "the replacements carry the base sequence {base_sequence}: {sequences:?}"
     );
 
+    // One operation per published plan, each settled exactly once. A combined
+    // commit would leave one phase for two snapshots, and a plan that retried
+    // or was reset would leave a phase that is not "committed".
     assert_eq!(
         promoted.fixture.rewrite_phases().await,
-        vec!["committed".to_owned()],
-        "the rewrite settles its operation exactly once"
+        vec!["committed".to_owned(); published_plans],
+        "every published plan settles its own operation exactly once"
     );
     let tasks = promoted
         .fixture
@@ -408,12 +427,14 @@ async fn rewrite_publication_conflict_revalidates_once_or_resets() {
     // One refusal: revalidate against the reloaded table and commit once more.
     // Arming the seam also zeroes its counter, so the counts below are absolute.
     catalog.reject_next_commits(1);
+    let snapshots_before = promoted.snapshot_count().await;
     supervisor.restart_worker();
     supervisor.run_one_success().await;
+    let published_plans = promoted.snapshot_count().await - snapshots_before;
     assert_eq!(
         catalog.attempts(),
-        2,
-        "one refusal buys exactly one more commit attempt"
+        published_plans + 1,
+        "one refusal buys exactly one more commit attempt, and no plan retries twice"
     );
     let published = promoted
         .live_data_files()
@@ -427,8 +448,8 @@ async fn rewrite_publication_conflict_revalidates_once_or_resets() {
     );
     assert_eq!(
         promoted.fixture.rewrite_phases().await,
-        vec!["committed".to_owned()],
-        "a retried publication still settles its operation exactly once"
+        vec!["committed".to_owned(); published_plans],
+        "a retried publication still settles each plan's operation exactly once"
     );
 
     // Give the table a fresh rewrite demand through the production route.
@@ -451,15 +472,21 @@ async fn rewrite_publication_conflict_revalidates_once_or_resets() {
         .map(|file| file.file_path().to_owned())
         .collect::<BTreeSet<_>>();
 
-    // Two refusals: the retry is spent, so the operation closes as uncommitted.
-    catalog.reject_next_commits(2);
+    // Every plan refused twice: each spends its one retry, so no plan commits
+    // and the attempt has no partial progress to report as success.
+    catalog.reject_next_commits(usize::MAX);
     supervisor.restart_worker();
     let error = supervisor.run_one_failure().await;
     supervisor.shutdown().await;
+    let phases = promoted.fixture.rewrite_phases().await;
+    let refused_plans = phases.iter().filter(|phase| *phase == "reset").count();
+    assert!(refused_plans > 0, "the refused attempt planned work: {error}");
+    // Four calls per plan: the first submission plus the bounded conflict
+    // retries the publication schedule grants, and not one call past them.
     assert_eq!(
         catalog.attempts(),
-        2,
-        "a spent retry makes no third catalog call: {error}"
+        4 * refused_plans,
+        "each refused plan spends exactly its bounded retry budget: {error}"
     );
     assert_eq!(
         promoted
@@ -472,9 +499,13 @@ async fn rewrite_publication_conflict_revalidates_once_or_resets() {
         "a refused publication leaves the published cut exactly as it was"
     );
     assert_eq!(
-        promoted.fixture.rewrite_phases().await,
-        vec!["committed".to_owned(), "reset".to_owned()],
-        "the refused operation is recorded as definitely uncommitted"
+        phases,
+        [
+            vec!["committed".to_owned(); published_plans],
+            vec!["reset".to_owned(); refused_plans],
+        ]
+        .concat(),
+        "every refused operation is recorded as definitely uncommitted"
     );
 
     let commits = telemetry.spans_named("bifrost.forge.catalog.commit");
@@ -486,7 +517,7 @@ async fn rewrite_publication_conflict_revalidates_once_or_resets() {
                 .get("strategy")
                 .is_some_and(|value| value.contains("iceberg_rewrite")))
             .count(),
-        4,
+        published_plans + 1 + 4 * refused_plans,
         "every rewrite commit attempt was reported by production telemetry: {commits:?}"
     );
 
@@ -538,18 +569,24 @@ async fn assert_expired_deadline_makes_no_second_call() {
                 .set(expired_publication_deadline(&promoted, &control))
                 .expect("manual Forge clock advances");
             catalog.reject_parked_commit();
+            // The plans this one does not represent must not publish either,
+            // or the attempt would report their success instead of this
+            // plan's refusal.
+            catalog.reject_remaining_commits();
         })
         .await;
     supervisor.shutdown().await;
 
+    let phases = promoted.fixture.rewrite_phases().await;
     assert_eq!(
         catalog.attempts() - attempts_before,
-        1,
-        "a conflict answered past the publication deadline buys no second call"
+        1 + 4 * (phases.len() - 1),
+        "a conflict answered past the publication deadline buys no second call, \
+         while each sibling plan spends its own full retry budget"
     );
     assert_eq!(
-        promoted.fixture.rewrite_phases().await,
-        vec!["reset".to_owned()],
+        phases,
+        vec!["reset".to_owned(); phases.len()],
         "the refused publication is recorded as definitely uncommitted"
     );
     assert_eq!(
@@ -599,27 +636,34 @@ async fn assert_retry_inherits_only_the_remaining_budget() {
     let supervisor = supervisor
         .run_one_failure_while(async {
             catalog.wait_for_parked_commit().await;
+            // Three seconds short of the deadline, not one: the retry the
+            // conflict buys is owed a one-second backoff first, and a margin
+            // that only just covers it would leave whether the retry is
+            // submitted or truncated to rounding.
             let nearly_spent =
-                expired_publication_deadline(&promoted, &control) - chrono::Duration::seconds(2);
+                expired_publication_deadline(&promoted, &control) - chrono::Duration::seconds(3);
             control
                 .set(nearly_spent)
                 .expect("manual Forge clock advances");
             catalog.reject_parked_commit_and_park_next();
             catalog.wait_for_parked_commit().await;
             catalog.wait_for_parked_commit_drop().await;
+            catalog.reject_remaining_commits();
         })
         .await;
     supervisor.shutdown().await;
 
+    let phases = promoted.fixture.rewrite_phases().await;
     assert_eq!(
         catalog.attempts() - attempts_before,
-        2,
-        "the publication made its initial call and exactly one retry"
+        2 + 4 * (phases.len() - 1),
+        "the publication made its initial call and exactly one retry, and every \
+         sibling plan spent its own full retry budget"
     );
     assert_eq!(
-        promoted.fixture.rewrite_phases().await,
-        vec!["prepared".to_owned()],
-        "a submitted call that ran out of budget claims no outcome"
+        phases.first().map(String::as_str),
+        Some("prepared"),
+        "a submitted call that ran out of budget claims no outcome: {phases:?}"
     );
     assert_eq!(
         live_data_paths(&promoted).await,

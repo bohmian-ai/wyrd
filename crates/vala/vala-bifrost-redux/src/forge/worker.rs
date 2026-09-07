@@ -4051,6 +4051,7 @@ impl ForgeWorker {
             self.config.compaction_memory_budget_bytes,
         );
         let mut refusals: Vec<(usize, super::managed::queue::ForgePushResult)> = Vec::new();
+        let planned = plans.len();
         for plan in plans {
             let plan_index = plan.plan_index;
             let admission = super::managed::queue::ForgePlanAdmission {
@@ -4066,6 +4067,7 @@ impl ForgeWorker {
         }
         tracing::debug!(
             task_id = %claim.task_id,
+            planned,
             waiting_parallelism = queue.waiting_parallelism_sum(),
             refused = refusals.len(),
             "Forge admitted one attempt's compaction plans"

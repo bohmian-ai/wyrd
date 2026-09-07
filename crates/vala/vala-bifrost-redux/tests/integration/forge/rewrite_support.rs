@@ -143,6 +143,19 @@ impl PromotedRewriteFixture {
             .expect("promoted fixture table")
     }
 
+    /// Returns how many snapshots the table's metadata retains.
+    ///
+    /// One rewrite attempt publishes one snapshot per admitted plan, so the
+    /// delta across a run is the count a per-plan assertion compares its
+    /// observed catalog commits against.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the table cannot be loaded.
+    pub(crate) async fn snapshot_count(&self) -> usize {
+        self.load_table().await.metadata().snapshots().count()
+    }
+
     /// Returns every live data file of the promoted snapshot.
     ///
     /// # Panics

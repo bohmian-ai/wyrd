@@ -1,6 +1,6 @@
 //! Canonical Redux built-in table definitions and pure table-layer transforms.
 
-use arrow::datatypes::{Field, Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef, TimeUnit as ArrowTimeUnit};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use wyrd_spec::vala::api::{
@@ -20,6 +20,7 @@ pub mod genai;
 pub mod logs;
 pub mod managed_columns;
 pub mod metrics;
+pub mod signal;
 pub mod traces;
 
 pub use audit::AuditLogTable;
@@ -153,6 +154,10 @@ pub struct BuiltinTableDefinition {
     pub schema_fingerprint: fn() -> [u8; 32],
     /// Full physical schema constructor.
     pub schema: fn() -> SchemaRef,
+    /// Canonical signal ledger constructor, `None` for a pre-declared table.
+    pub canonical_fields: fn() -> Option<&'static [fields::CanonicalField]>,
+    /// Canonical physical fingerprint constructor, `None` when not canonical.
+    pub canonical_physical_fingerprint: fn() -> Option<CanonicalPhysicalFingerprint>,
     /// Engine-owned physical-layout declaration.
     ///
     /// This is the built-in's single statement of partition granularity, sort
@@ -178,15 +183,55 @@ pub trait DomainTable: Send + Sync + 'static {
     /// Sensitive payload fields.
     const SENSITIVE_PAYLOAD_COLUMNS: &'static [&'static str] = &[];
 
+    /// The canonical signal ledger, when this table owns an OTel signal.
+    ///
+    /// Returning `Some` makes the table canonical: its physical schema, stable
+    /// field ids, sensitivity metadata, and canonical physical fingerprint are
+    /// all derived from the returned declaration rather than from a separately
+    /// maintained Arrow field list. Pre-declared tables return `None` and keep
+    /// their existing auto-assigned Iceberg ids and user-schema fingerprint.
+    fn canonical_fields() -> Option<&'static [fields::CanonicalField]> {
+        None
+    }
+
     /// User-owned fields, excluding correlation and system fields.
     fn arrow_fields() -> Vec<Field>;
 
     /// Full physical schema.
+    ///
+    /// A canonical table derives its whole physical schema, including the
+    /// Observation envelope's stable ids, from its ledger. Every other table
+    /// keeps the existing managed-column append.
     fn schema() -> SchemaRef {
-        SchemaRef::new(Schema::new(managed_columns::ensure_managed_columns(
-            Self::arrow_fields(),
-            Self::CORRELATION_POLICY,
-        )))
+        match Self::canonical_fields() {
+            Some(declared) => SchemaRef::new(Schema::new(
+                managed_columns::canonical_physical_fields(declared),
+            )),
+            None => SchemaRef::new(Schema::new(managed_columns::ensure_managed_columns(
+                Self::arrow_fields(),
+                Self::CORRELATION_POLICY,
+            ))),
+        }
+    }
+
+    /// The canonical physical fingerprint, when this table owns an OTel signal.
+    ///
+    /// This is a different identity from [`Self::schema_fingerprint`], which
+    /// keeps its user-schema meaning for catalog rows. The canonical physical
+    /// fingerprint covers the complete physical schema — envelope included —
+    /// with every stable id, nested child, nullability, sensitivity, and
+    /// metadata entry, and is what the Arrow validator, the Gate validation
+    /// proof, the Parquet/Iceberg checks, and recovery compare.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a canonical ledger cannot be fingerprinted, which would mean
+    /// the declaration escaped the closed canonical type set.
+    fn canonical_physical_fingerprint() -> Option<CanonicalPhysicalFingerprint> {
+        Self::canonical_fields().map(|_| {
+            CanonicalPhysicalFingerprint::from_physical_fields(Self::schema().fields())
+                .expect("a canonical ledger is always fingerprintable")
+        })
     }
 
     /// User-schema fingerprint.
@@ -232,6 +277,280 @@ pub fn reject_reserved_domain_fields(
     Ok(())
 }
 
+/// Versioned recursive fingerprint over one complete canonical physical schema.
+///
+/// This is a distinct identity from [`crate::schema::SchemaFingerprint`], which
+/// keeps its existing user-schema meaning for `BifrostTableEntry.fingerprint`
+/// and dynamic-table catalog rows. A canonical physical fingerprint commits to
+/// the *whole* physical schema — envelope fields included — plus every stable
+/// field id, nested child, nullability, sensitivity, and semantic metadata
+/// entry, so a canonical built-in cannot drift in any of those dimensions
+/// without the fingerprint changing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CanonicalPhysicalFingerprint(pub [u8; 32]);
+
+impl CanonicalPhysicalFingerprint {
+    /// Compute the fingerprint of one complete canonical physical schema.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TableError::Internal`] when a field carries no parsable
+    /// `PARQUET:field_id`, no `wyrd:sensitive` marker, or an Arrow type outside
+    /// the closed canonical set.
+    pub fn from_physical_fields(fields: &Fields) -> Result<Self, TableError> {
+        let mut hasher = Sha256::new();
+        hasher.update(canonical_physical_fingerprint_bytes(fields)?);
+        Ok(Self(hasher.finalize().into()))
+    }
+
+    /// Render the fingerprint as lowercase hexadecimal.
+    #[must_use]
+    pub fn to_hex(self) -> String {
+        hex::encode(self.0)
+    }
+}
+
+/// The two schema identities a resolved table registration carries.
+///
+/// `catalog_fingerprint` is the existing user-schema fingerprint every table
+/// has, and is what `BifrostTableEntry.fingerprint` and the dynamic-table
+/// catalog rows mean. `canonical_physical_fingerprint` is present only for a
+/// canonical signal built-in and covers its complete physical schema. Keeping
+/// both on one value is what stops a caller from comparing one meaning against
+/// the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedSchemaIdentity {
+    /// User-schema fingerprint stored in the catalog control row.
+    pub catalog_fingerprint: crate::schema::SchemaFingerprint,
+    /// Complete physical fingerprint, present only for a canonical built-in.
+    pub canonical_physical_fingerprint: Option<CanonicalPhysicalFingerprint>,
+}
+
+impl ResolvedSchemaIdentity {
+    /// Resolve both identities for one built-in definition.
+    #[must_use]
+    pub fn for_builtin(definition: &BuiltinTableDefinition) -> Self {
+        Self {
+            catalog_fingerprint: crate::schema::SchemaFingerprint::from_arrow_schema(&Schema::new(
+                (definition.arrow_fields)(),
+            )),
+            canonical_physical_fingerprint: (definition.canonical_physical_fingerprint)(),
+        }
+    }
+
+    /// Resolve the identity of a caller-registered dynamic table.
+    ///
+    /// A dynamic table never has a canonical physical fingerprint: its Iceberg
+    /// ids are auto-assigned and its catalog fingerprint is the only identity
+    /// its registration contract commits to.
+    #[must_use]
+    pub fn for_dynamic(user_fields: &[Field]) -> Self {
+        Self {
+            catalog_fingerprint: crate::schema::SchemaFingerprint::from_arrow_schema(&Schema::new(
+                user_fields.to_vec(),
+            )),
+            canonical_physical_fingerprint: None,
+        }
+    }
+}
+
+/// Version byte prefixing every canonical physical fingerprint encoding.
+///
+/// Any change to the encoding below must take the next unused version byte so
+/// an old and a new encoding can never collide.
+const CANONICAL_FINGERPRINT_VERSION: u8 = 1;
+
+/// Encode one canonical physical schema into its pre-hash fingerprint bytes.
+///
+/// The encoding is a version byte, the top-level field count, and then each
+/// field in declared order as: stable id, length-prefixed name, type bytes,
+/// nullability, sensitivity, its metadata entries in ascending raw key-byte
+/// order, and finally its nested child count followed depth-first by the same
+/// record for each child. Every count and length is an unsigned big-endian
+/// `u32`; field ids and fixed-binary widths are signed big-endian `i32`.
+///
+/// The bytes are exposed separately from the hash so a golden test can pin the
+/// exact encoding rather than only its digest.
+///
+/// # Errors
+///
+/// Returns [`TableError::Internal`] for a missing or unparsable stable id, a
+/// missing sensitivity marker, or an Arrow type with no pinned type tag.
+pub fn canonical_physical_fingerprint_bytes(fields: &Fields) -> Result<Vec<u8>, TableError> {
+    let mut bytes = vec![CANONICAL_FINGERPRINT_VERSION];
+    encode_field_sequence(fields, &mut bytes)?;
+    Ok(bytes)
+}
+
+/// Encode one ordered field sequence as a count followed by each field record.
+///
+/// # Errors
+///
+/// Propagates every [`encode_field`] failure.
+fn encode_field_sequence(fields: &Fields, out: &mut Vec<u8>) -> Result<(), TableError> {
+    out.extend_from_slice(&count_u32(fields.len())?.to_be_bytes());
+    for field in fields {
+        encode_field(field, out)?;
+    }
+    Ok(())
+}
+
+/// Encode one field record, then recurse depth-first into its children.
+///
+/// # Errors
+///
+/// Returns [`TableError::Internal`] when the field lacks a parsable stable id
+/// or sensitivity marker, or when its type has no pinned tag.
+fn encode_field(field: &Field, out: &mut Vec<u8>) -> Result<(), TableError> {
+    out.extend_from_slice(&stable_field_id(field)?.to_be_bytes());
+    encode_len_prefixed(field.name().as_bytes(), out)?;
+    encode_data_type(field.data_type(), out)?;
+    out.push(u8::from(field.is_nullable()));
+    out.push(u8::from(sensitivity(field)?));
+
+    let metadata = field.metadata();
+    out.extend_from_slice(&count_u32(metadata.len())?.to_be_bytes());
+    let mut entries: Vec<(&String, &String)> = metadata.iter().collect();
+    entries.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
+    for (key, value) in entries {
+        encode_len_prefixed(key.as_bytes(), out)?;
+        encode_len_prefixed(value.as_bytes(), out)?;
+    }
+
+    let children = child_fields(field.data_type());
+    match children {
+        Some(children) => encode_field_sequence(&children, out)?,
+        None => out.extend_from_slice(&0_u32.to_be_bytes()),
+    }
+    Ok(())
+}
+
+/// Encode one pinned type tag and its inline parameters.
+///
+/// List and struct parameters are deliberately absent here: they exist only in
+/// the following child records, so a nested type's shape is committed exactly
+/// once.
+///
+/// # Errors
+///
+/// Returns [`TableError::Internal`] for any Arrow type outside the closed
+/// canonical set.
+fn encode_data_type(data_type: &DataType, out: &mut Vec<u8>) -> Result<(), TableError> {
+    match data_type {
+        DataType::Boolean => out.push(0x01),
+        DataType::Int32 => out.push(0x02),
+        DataType::Int64 => out.push(0x03),
+        DataType::UInt32 => out.push(0x04),
+        DataType::UInt64 => out.push(0x05),
+        DataType::Float64 => out.push(0x06),
+        DataType::Utf8 => out.push(0x07),
+        DataType::Binary => out.push(0x08),
+        DataType::FixedSizeBinary(width) => {
+            out.push(0x09);
+            out.extend_from_slice(&width.to_be_bytes());
+        }
+        DataType::Timestamp(unit, zone) => {
+            out.push(0x0a);
+            out.push(match unit {
+                ArrowTimeUnit::Second => 0x00,
+                ArrowTimeUnit::Millisecond => 0x01,
+                ArrowTimeUnit::Microsecond => 0x02,
+                ArrowTimeUnit::Nanosecond => 0x03,
+            });
+            match zone {
+                None => out.push(0x00),
+                Some(zone) => {
+                    out.push(0x01);
+                    encode_len_prefixed(zone.as_bytes(), out)?;
+                }
+            }
+        }
+        DataType::List(_) => out.push(0x0b),
+        DataType::Struct(_) => out.push(0x0c),
+        other => {
+            return Err(TableError::Internal(format!(
+                "canonical schema has no fingerprint tag for {other}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Return the ordered child fields of a nested Arrow type.
+///
+/// `None` marks a scalar, which encodes a zero child count.
+fn child_fields(data_type: &DataType) -> Option<Fields> {
+    match data_type {
+        DataType::List(child) => Some(Fields::from(vec![child.as_ref().clone()])),
+        DataType::Struct(children) => Some(children.clone()),
+        _ => None,
+    }
+}
+
+/// Read one field's table-local stable identity from its Arrow metadata.
+///
+/// # Errors
+///
+/// Returns [`TableError::Internal`] when the metadata entry is absent or is not
+/// a decimal `i32`.
+pub fn stable_field_id(field: &Field) -> Result<i32, TableError> {
+    field
+        .metadata()
+        .get(fields::PARQUET_FIELD_ID)
+        .ok_or_else(|| {
+            TableError::Internal(format!("field {} carries no stable id", field.name()))
+        })?
+        .parse::<i32>()
+        .map_err(|error| {
+            TableError::Internal(format!(
+                "field {} has an unparsable stable id: {error}",
+                field.name()
+            ))
+        })
+}
+
+/// Read one field's declared sensitivity from its Arrow metadata.
+///
+/// # Errors
+///
+/// Returns [`TableError::Internal`] when the marker is absent or is not
+/// `true`/`false`.
+pub fn sensitivity(field: &Field) -> Result<bool, TableError> {
+    match field
+        .metadata()
+        .get(fields::WYRD_SENSITIVE)
+        .map(String::as_str)
+    {
+        Some("true") => Ok(true),
+        Some("false") => Ok(false),
+        _ => Err(TableError::Internal(format!(
+            "field {} carries no sensitivity marker",
+            field.name()
+        ))),
+    }
+}
+
+/// Encode one byte string as an unsigned big-endian `u32` length plus bytes.
+///
+/// # Errors
+///
+/// Returns [`TableError::Internal`] when the length exceeds `u32`.
+fn encode_len_prefixed(value: &[u8], out: &mut Vec<u8>) -> Result<(), TableError> {
+    out.extend_from_slice(&count_u32(value.len())?.to_be_bytes());
+    out.extend_from_slice(value);
+    Ok(())
+}
+
+/// Narrow one count to the encoding's unsigned big-endian `u32` width.
+///
+/// # Errors
+///
+/// Returns [`TableError::Internal`] when the count exceeds `u32`.
+fn count_u32(value: usize) -> Result<u32, TableError> {
+    u32::try_from(value)
+        .map_err(|_| TableError::Internal("canonical schema count exceeds u32".to_owned()))
+}
+
 fn fingerprint_fields(fields: &[Field]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     for field in fields {
@@ -253,6 +572,8 @@ const fn definition<T: DomainTable>() -> BuiltinTableDefinition {
         arrow_fields: T::arrow_fields,
         schema_fingerprint: T::schema_fingerprint,
         schema: T::schema,
+        canonical_fields: T::canonical_fields,
+        canonical_physical_fingerprint: T::canonical_physical_fingerprint,
         physical_layout: T::physical_layout,
         entity_bounds_mapping: T::entity_bounds_mapping,
     }

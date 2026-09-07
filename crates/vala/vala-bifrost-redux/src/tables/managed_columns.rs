@@ -1,6 +1,7 @@
 use arrow::datatypes::{DataType, Field, TimeUnit};
 
 use crate::tables::CorrelationPolicy;
+use crate::tables::fields::{CanonicalField, CanonicalType, canonical_arrow_fields};
 use wyrd_spec::vala::{
     CARD_UID, DATA_TENANT_ID, PRINCIPAL_ID, RUN_ID, WYRD_BATCH_ID, WYRD_EVENT_TIME,
     WYRD_INGESTED_AT, WYRD_REQUEST_ID, WYRD_ROW_ORDINAL,
@@ -59,6 +60,58 @@ pub fn ensure_managed_columns(
     user_fields.push(Field::new(DATA_TENANT_ID, DataType::Utf8, false));
 
     user_fields
+}
+
+/// The Observation envelope appended to every canonical signal table.
+///
+/// These nine fields are physical schema authority: they carry stable ids
+/// 1000-1008 and the same names, types, order, and nullability
+/// [`ensure_managed_columns`] appends for [`CorrelationPolicy::Observation`],
+/// so a canonical table's envelope and a pre-declared table's envelope remain
+/// one contract. They are stripped from the canonical user batch and stamped
+/// from trusted Gate context, never supplied by a client.
+///
+/// The ids live in a range far above any signal ledger so a signal can add
+/// fields indefinitely without ever colliding with the envelope.
+pub static CANONICAL_ENVELOPE_FIELDS: &[CanonicalField] = &[
+    CanonicalField::meta(1000, RUN_ID, CanonicalType::Utf8, true),
+    CanonicalField::meta(1001, CARD_UID, CanonicalType::Utf8, true),
+    CanonicalField::meta(1002, PRINCIPAL_ID, CanonicalType::Utf8, false),
+    CanonicalField::meta(1003, WYRD_REQUEST_ID, CanonicalType::Utf8, false),
+    CanonicalField::meta(
+        1004,
+        WYRD_EVENT_TIME,
+        CanonicalType::Timestamp(TimeUnit::Microsecond, Some("UTC")),
+        false,
+    ),
+    CanonicalField::meta(
+        1005,
+        WYRD_INGESTED_AT,
+        CanonicalType::Timestamp(TimeUnit::Microsecond, Some("UTC")),
+        false,
+    ),
+    CanonicalField::meta(
+        1006,
+        WYRD_BATCH_ID,
+        CanonicalType::FixedSizeBinary(16),
+        false,
+    ),
+    CanonicalField::meta(1007, WYRD_ROW_ORDINAL, CanonicalType::Int32, false),
+    CanonicalField::meta(1008, DATA_TENANT_ID, CanonicalType::Utf8, false),
+];
+
+/// Build one canonical signal table's complete physical Arrow fields.
+///
+/// The declared signal ledger comes first in declaration order, then the
+/// Observation envelope. Every field — signal and envelope, at every nesting
+/// depth — carries its stable id and sensitivity metadata, which is what lets
+/// Iceberg adopt the table's own ids and lets the canonical physical
+/// fingerprint cover the whole schema.
+#[must_use]
+pub fn canonical_physical_fields(declared: &[CanonicalField]) -> Vec<Field> {
+    let mut physical = canonical_arrow_fields(declared);
+    physical.extend(canonical_arrow_fields(CANONICAL_ENVELOPE_FIELDS));
+    physical
 }
 
 #[cfg(test)]

@@ -190,6 +190,11 @@ impl<R> ForgeCompactionQueue<R> {
         self.running_parallelism_sum
     }
 
+    /// Returns how many plans are waiting to start.
+    pub(crate) fn waiting_plan_count(&self) -> usize {
+        self.deque.len()
+    }
+
     /// Returns the parallelism currently charged to waiting plans.
     pub(crate) fn waiting_parallelism_sum(&self) -> u32 {
         self.waiting_parallelism_sum

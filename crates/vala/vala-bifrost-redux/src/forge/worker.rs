@@ -4,6 +4,7 @@
 //! processes. `PostgreSQL` claims assign compute, while the table-scoped
 //! [`ForgeLease`] remains the only publication fence.
 
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 #[cfg(feature = "test-support")]
@@ -14,6 +15,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use super::metrics::ForgeActiveTask;
 use iceberg::spec::TableMetadata;
 use iceberg::table::Table;
 use serde_json::{Map, Value};
@@ -293,6 +295,241 @@ struct ForgeRewriteAttempt {
     /// the budget spent refuses before it prepares anything, which is ordinary
     /// planning debt the next attempt replans.
     deadline: super::publication::RewritePublicationDeadline,
+}
+
+/// One claimed ownership episode's observation frame.
+///
+/// Held from the moment a claim is taken until its single passive observation,
+/// so an attempt that suspends on the worker-wide plan queue keeps the same
+/// span, gauge, and claim-time instant an inline one would.
+struct OpenClaim {
+    /// The durable claim this episode owns.
+    claim: ForgeTaskClaim,
+    /// Claim-time instant every attempt-duration metric measures from.
+    started: Instant,
+    /// Active-task gauge guard, dropped when the episode is observed.
+    active: Option<ForgeActiveTask>,
+    /// Execution span every phase of this episode records into.
+    span: tracing::Span,
+}
+
+/// One admitted compaction attempt suspended on the worker-wide plan queue.
+///
+/// Everything the attempt still needs to settle lives here: its observation
+/// frame, its fence, its fenced tokens and heartbeat, the managed context its
+/// plans publish through, and the per-plan results collected so far. Holding it
+/// beside the queue rather than inside a call frame is what lets one worker
+/// keep several attempts in flight against one parallelism budget.
+struct ForgeAttemptState {
+    /// Observation frame this attempt closes when its last plan drains.
+    open: OpenClaim,
+    /// Durable attempt generation this episode writes under.
+    attempt: Uuid,
+    /// Tenant-scoped table this attempt publishes to.
+    binding: TenantTableBinding,
+    /// Validated execution stage, used by failure settlement.
+    stage: ForgeExecutionStage,
+    /// Table fence every plan of this attempt publishes under.
+    lease: ForgeLease,
+    /// Cancellation seams and heartbeat this attempt opened.
+    fenced: FencedAttempt,
+    /// Managed context and publication budget every plan shares.
+    shared: Arc<ForgeRewriteAttempt>,
+    /// Plans the queue refused, with the reason, in offer order.
+    refusals: Vec<(usize, super::managed::queue::ForgePushResult)>,
+    /// Per-plan results collected in completion order.
+    outcomes: Vec<(usize, Result<ForgeDispatchResult, ForgeError>)>,
+    /// Plans admitted to the queue that have not started yet.
+    queued: usize,
+    /// Plans started on the executor that have not been joined yet.
+    running: usize,
+}
+
+impl ForgeAttemptState {
+    /// Returns whether every admitted plan of this attempt has been joined.
+    fn drained(&self) -> bool {
+        self.queued == 0 && self.running == 0
+    }
+}
+
+/// The worker's compaction admission state: one FIFO, one join set, one map.
+///
+/// The three are one owner because they describe one fact together — which of
+/// this worker's plans are waiting, which are running, and which attempt each
+/// belongs to — and separating them would let the parallelism budget disagree
+/// with what is actually in flight.
+struct ForgeAttemptPool {
+    /// Worker-wide FIFO holding every attempt's unstarted plans in offer order.
+    queue: super::managed::queue::ForgeCompactionQueue<super::managed::ForgePlannedRewrite>,
+    /// Every started plan, joined in completion order.
+    joins: ForgePlanJoins,
+    /// Suspended attempts, keyed by the task each plan belongs to.
+    attempts: HashMap<Uuid, ForgeAttemptState>,
+}
+
+impl ForgeAttemptPool {
+    /// Builds an empty pool bounded by one worker's configured budgets.
+    fn new(config: &ForgeWorkerConfig) -> Self {
+        Self {
+            queue: super::managed::queue::ForgeCompactionQueue::new(
+                config.max_task_parallelism,
+                config.pending_task_parallelism,
+                config.compaction_memory_budget_bytes,
+            ),
+            joins: ForgePlanJoins::new(),
+            attempts: HashMap::new(),
+        }
+    }
+
+    /// Returns whether this worker has no suspended attempt left to settle.
+    fn is_idle(&self) -> bool {
+        self.attempts.is_empty()
+    }
+
+    /// Offers one attempt's planner-ordered plans and suspends it on the queue.
+    ///
+    /// The offer happens here rather than in the attempt's own frame because
+    /// the budget the plans compete for belongs to the worker, not the attempt.
+    ///
+    /// Returns the attempt unchanged when the queue admitted none of its plans:
+    /// nothing will ever complete for it, so it must settle now rather than
+    /// wait for a plan that was never started.
+    fn admit(
+        &mut self,
+        mut state: ForgeAttemptState,
+        plans: Vec<super::managed::ForgePlannedRewrite>,
+    ) -> Option<ForgeAttemptState> {
+        let task_id = state.open.claim.task_id;
+        let planned = plans.len();
+        let admissions = plans.into_iter().map(|plan| {
+            (
+                super::managed::queue::ForgePlanAdmission {
+                    task_id,
+                    plan_index: plan.plan_index,
+                    required_parallelism: plan.required_parallelism,
+                    memory_reservation_bytes: plan.memory_reservation_bytes,
+                },
+                plan,
+            )
+        });
+        let before = self.queue.waiting_plan_count();
+        state.refusals = ForgeWorker::offer_planned_rewrites(&mut self.queue, admissions);
+        state.queued = self.queue.waiting_plan_count() - before;
+        tracing::debug!(
+            task_id = %task_id,
+            planned,
+            queued = state.queued,
+            waiting_parallelism = self.queue.waiting_parallelism_sum(),
+            refused = state.refusals.len(),
+            "Forge admitted one attempt's compaction plans"
+        );
+        if state.queued == 0 {
+            return Some(state);
+        }
+        self.attempts.insert(task_id, state);
+        None
+    }
+}
+
+/// One compaction attempt whose plans still have to enter the worker pool.
+struct AdmittedRewrite {
+    /// Durable attempt generation this episode writes under.
+    attempt: Uuid,
+    /// Tenant-scoped table this attempt publishes to.
+    binding: TenantTableBinding,
+    /// Validated execution stage, used by failure settlement.
+    stage: ForgeExecutionStage,
+    /// Table fence every plan of this attempt publishes under.
+    lease: ForgeLease,
+    /// Cancellation seams and heartbeat this attempt opened.
+    fenced: FencedAttempt,
+    /// Managed context and publication budget every plan shares.
+    shared: Arc<ForgeRewriteAttempt>,
+    /// Planner-ordered plans still to be offered to the queue.
+    plans: Vec<super::managed::ForgePlannedRewrite>,
+}
+
+/// What starting one claimed attempt produced.
+enum AttemptStart {
+    /// The attempt settled inside its own frame; carries whether an effect landed.
+    Settled(bool),
+    /// The attempt planned compaction work the worker pool must admit.
+    Planned(Box<AdmittedRewrite>),
+}
+
+/// What opening one attempt's fenced frame produced for its caller.
+enum OpenedFrame {
+    /// The attempt ran to a settled or failed outcome inside this frame.
+    Complete(bool),
+    /// The attempt's compaction plans must be admitted to the worker pool.
+    Planned(
+        Arc<ForgeRewriteAttempt>,
+        Vec<super::managed::ForgePlannedRewrite>,
+        FencedAttempt,
+    ),
+}
+
+/// What planning one compaction attempt selected.
+enum RewriteAdmission {
+    /// Planning selected nothing, so the table is already compact.
+    SelfSettled,
+    /// Plans to admit, with the managed context every one of them shares.
+    Planned(
+        Arc<ForgeRewriteAttempt>,
+        Vec<super::managed::ForgePlannedRewrite>,
+    ),
+}
+
+/// What opening one claim episode produced.
+enum ClaimStep {
+    /// The episode settled and observed itself inside its own frame.
+    Closed(Result<bool, ForgeError>),
+    /// The episode's plans entered the worker-wide pool; settlement waits.
+    Admitted,
+}
+
+/// The fenced frame an attempt holds between opening and settlement.
+///
+/// Kept as one value so an attempt that suspends across the worker-wide plan
+/// queue carries its cancellation seams and heartbeat forward intact instead of
+/// threading four fields through the resumption path.
+struct FencedAttempt {
+    /// Shutdown-sensitive token every non-maintenance dispatch observes.
+    ///
+    /// Cancelling it is also how settlement drains a post-effect attempt.
+    operation_stop: CancellationToken,
+    /// Authority-loss token the heartbeat cancels; shutdown never reaches it.
+    authority_stop: CancellationToken,
+    /// The claim heartbeat keeping this attempt's ownership provable.
+    heartbeat: tokio::task::JoinHandle<Result<(), ForgeError>>,
+    /// Whether this strategy observes authority loss instead of shutdown.
+    maintenance_recovery: bool,
+}
+
+impl FencedAttempt {
+    /// Returns the token this frame's dispatch must observe.
+    ///
+    /// Maintenance completes through a graceful shutdown and stops only on
+    /// genuine authority loss; every other strategy drains cooperatively.
+    fn dispatch_stop(&self) -> &CancellationToken {
+        if self.maintenance_recovery {
+            &self.authority_stop
+        } else {
+            &self.operation_stop
+        }
+    }
+}
+
+/// What opening an attempt's fenced frame produced.
+enum FencedStart {
+    /// The base moved past this plan, so the claim was cancelled as superseded.
+    Superseded,
+    /// A prior attempt's commit was proven from retained evidence.
+    ///
+    /// Boxed because committed evidence is far larger than the other variants.
+    Recovered(Box<ForgeTaskEvidence>, FencedAttempt),
+    /// The frame is open and this attempt's strategy must still be dispatched.
+    Open(Table, FencedAttempt),
 }
 
 enum ForgeDispatchResult {
@@ -1775,9 +2012,6 @@ impl ForgeWorker {
         else {
             return Ok(false);
         };
-        let started = Instant::now();
-        let active = Self::metric_strategy(&claim.strategy)
-            .map(|strategy| self.forge.core.telemetry.active_task(strategy));
         let task_id = claim.task_id;
         let strategy = claim.strategy.clone();
         #[cfg(feature = "test-support")]
@@ -1798,8 +2032,7 @@ impl ForgeWorker {
         // Boxed for the same reason the event loop is: execution nests deeply, and
         // holding that whole state machine inline inside the startup drain
         // pushes the composed server future past rustc's layout-query budget.
-        let result = Box::pin(self.execute_claim_observed(&claim, shutdown, started)).await;
-        drop(active);
+        let result = Box::pin(self.execute_claim(claim, shutdown)).await;
         if result? {
             self.record_completion(task_id, strategy);
         }
@@ -1893,28 +2126,55 @@ impl ForgeWorker {
         // on every pass so a ready snapshot expiry is never starved behind
         // compaction backlog.
         let reserved_maintenance = true;
+        // One FIFO, one join set, and one attempt map for the whole worker.
+        // Constructing them here rather than per attempt is what makes the
+        // parallelism and memory budgets describe this worker's real load: two
+        // tasks claimed a moment apart compete for the same room, in the order
+        // their plans were offered.
+        let mut pool = ForgeAttemptPool::new(&self.config);
         loop {
+            for stranded in self.start_fitting_plans(&mut pool, &shutdown) {
+                self.settle_pooled_attempt(stranded, &shutdown).await?;
+            }
             if shutdown.is_cancelled() {
-                return Ok(());
+                // A stopped worker still owns the plans it started: their
+                // publications are durable and their attempts hold leases and
+                // operations only this owner can settle.
+                if pool.is_idle() {
+                    return Ok(());
+                }
+                if let Some(state) = Self::drain_one_plan(&mut pool).await? {
+                    self.settle_pooled_attempt(state, &shutdown).await?;
+                }
+                continue;
             }
             self.reclaim_expired_attempts(claim_limits.max_active_per_tenant)
                 .await?;
             // Checked immediately before each durable claim so a stop signal
             // lands before this loop takes new work.
             if shutdown.is_cancelled() {
-                return Ok(());
+                continue;
             }
             if self.reconcile_one_prepared(claim_limits, &shutdown).await? {
                 continue;
             }
             if shutdown.is_cancelled() {
-                return Ok(());
+                continue;
             }
             let claim = self
                 .claim_next(claim_limits, reserved_maintenance)
                 .await
                 .map_err(ForgeError::Sql)?;
             let Some(claim) = claim else {
+                // Waiting on a running plan is the idle wait when this worker
+                // holds any: polling for new work on a timer while a plan is in
+                // flight would delay the settlement that frees its budget.
+                if !pool.is_idle() {
+                    if let Some(state) = Self::drain_one_plan(&mut pool).await? {
+                        self.settle_pooled_attempt(state, &shutdown).await?;
+                    }
+                    continue;
+                }
                 tokio::select! {
                     () = shutdown.cancelled() => return Ok(()),
                     () = tokio::time::sleep(Duration::from_millis(250)) => {}
@@ -1940,25 +2200,7 @@ impl ForgeWorker {
                 }
             }
             if shutdown.is_cancelled() {
-                let released = if let Some(attempt) = claim.attempt_id {
-                    self.release_cancelled_claim(task_id, attempt).await
-                } else {
-                    Ok(())
-                };
-                if let Err(error) = &released {
-                    self.close_after_fatal();
-                    tracing::error!(worker = %self.owner, task_id = %task_id, error = %error,
-                        "Forge claim shutdown release failed; durable state retained for lease recovery");
-                }
-                self.record_task_execution_telemetry(
-                    claim.data_tenant_id,
-                    task_id,
-                    Self::metric_strategy(&claim.strategy),
-                    &tracing::Span::none(),
-                    started,
-                )
-                .await;
-                return released;
+                return self.release_claim_at_shutdown(&claim, started).await;
             }
             let strategy = claim.strategy.clone();
             // One INFO per claimed task, not per file or per row: Forge tasks are
@@ -1970,29 +2212,106 @@ impl ForgeWorker {
                 strategy = ?strategy,
                 "Forge task claimed"
             );
-            let result = self
-                .execute_claim_observed(&claim, &shutdown, started)
-                .await;
-            drop(active);
-            tracing::info!(
-                worker = %self.owner,
-                task_id = %task_id,
-                strategy = ?strategy,
-                outcome = if result.is_ok() { "committed" } else { "failed" },
-                elapsed_ms = started.elapsed().as_millis(),
-                "Forge task settled"
-            );
-            #[cfg(feature = "test-support")]
-            self.pause_after_attempt_for_test().await;
-            match result {
-                // Only a settled effect is a completion; a superseded envelope,
-                // a terminalized payload, and a settled execution failure are
-                // all healthy exits that permit the next claim.
-                Ok(true) => self.record_completion(task_id, strategy),
-                Ok(false) => {}
-                Err(error) => return Err(error),
+            let open = Self::open_claim_episode(claim, started, active);
+            match self.begin_claim_episode(open, &shutdown, &mut pool).await {
+                // The attempt's plans are on the queue; it settles when they drain.
+                ClaimStep::Admitted => {}
+                ClaimStep::Closed(result) => {
+                    self.record_settled_claim(task_id, strategy, started, result)
+                        .await?;
+                }
             }
         }
+    }
+
+    /// Drains one claim this owner took as shutdown was signalled.
+    ///
+    /// The claim is released back to `retryable` so a stopping worker leaves no
+    /// task owned by a process that will never run it, and the episode is still
+    /// observed so its duration is not lost.
+    ///
+    /// # Errors
+    ///
+    /// Returns the release failure, which leaves the claim for lease-expiry
+    /// recovery and stops this owner.
+    async fn release_claim_at_shutdown(
+        &self,
+        claim: &ForgeTaskClaim,
+        started: Instant,
+    ) -> Result<(), ForgeError> {
+        let task_id = claim.task_id;
+        let released = if let Some(attempt) = claim.attempt_id {
+            self.release_cancelled_claim(task_id, attempt).await
+        } else {
+            Ok(())
+        };
+        if let Err(error) = &released {
+            self.close_after_fatal();
+            tracing::error!(worker = %self.owner, task_id = %task_id, error = %error,
+                "Forge claim shutdown release failed; durable state retained for lease recovery");
+        }
+        self.record_task_execution_telemetry(
+            claim.data_tenant_id,
+            task_id,
+            Self::metric_strategy(&claim.strategy),
+            &tracing::Span::none(),
+            started,
+        )
+        .await;
+        released
+    }
+
+    /// Settles one drained attempt and records the episode it completes.
+    ///
+    /// # Errors
+    ///
+    /// Returns the settlement, audit, SQL, or lease-release failure that makes
+    /// a further claim by this owner unsafe.
+    async fn settle_pooled_attempt(
+        &self,
+        state: ForgeAttemptState,
+        shutdown: &CancellationToken,
+    ) -> Result<(), ForgeError> {
+        let task_id = state.open.claim.task_id;
+        let strategy = state.open.claim.strategy.clone();
+        let started = state.open.started;
+        let result = self.finish_admitted_attempt(state, shutdown).await;
+        self.record_settled_claim(task_id, strategy, started, result)
+            .await
+    }
+
+    /// Records one settled episode and decides whether this owner keeps going.
+    ///
+    /// Only a settled effect is a completion; a superseded envelope, a
+    /// terminalized payload, and a settled execution failure are all healthy
+    /// exits that permit the next claim.
+    ///
+    /// # Errors
+    ///
+    /// Returns `result`'s failure unchanged, which stops this owner.
+    async fn record_settled_claim(
+        &self,
+        task_id: Uuid,
+        strategy: ForgeClaimStrategy,
+        started: Instant,
+        result: Result<bool, ForgeError>,
+    ) -> Result<(), ForgeError> {
+        tracing::info!(
+            worker = %self.owner,
+            task_id = %task_id,
+            strategy = ?strategy,
+            outcome = if result.is_ok() { "committed" } else { "failed" },
+            elapsed_ms = started.elapsed().as_millis(),
+            "Forge task settled"
+        );
+        #[cfg(feature = "test-support")]
+        self.pause_after_attempt_for_test().await;
+        match result {
+            Ok(true) => self.record_completion(task_id, strategy),
+            Ok(false) => {}
+            Err(error) => return Err(error),
+        }
+        Ok(())
     }
 
     /// Reconciles one Prepared attempt this owner may claim, if any exists.
@@ -2355,7 +2674,7 @@ impl ForgeWorker {
             lease_key: format!("forge:table:{}:{}", claim.data_tenant_id, binding.table_ref),
         })?;
         let result = self
-            .execute_fenced(claim, attempt, &binding, &mut lease, shutdown)
+            .open_rewrite_frame(claim, attempt, &binding, &mut lease, shutdown)
             .await;
         if let Err(error) = lease.release(&self.forge.core.operator_pool).await {
             tracing::warn!(task_id = %claim.task_id, error = %error, "Forge expiry test lease release failed");
@@ -2499,27 +2818,53 @@ impl ForgeWorker {
         shutdown: &CancellationToken,
     ) -> Result<bool, ForgeError> {
         let started = Instant::now();
-        let _active = Self::metric_strategy(&claim.strategy)
+        let active = Self::metric_strategy(&claim.strategy)
             .map(|strategy| self.forge.core.telemetry.active_task(strategy));
-        self.execute_claim_observed(&claim, shutdown, started).await
+        let open = Self::open_claim_episode(claim, started, active);
+        // One claim of its own still runs through the pool, because the pool is
+        // the only implementation of plan admission and drain. A single-attempt
+        // pool simply never has a sibling to interleave with.
+        let mut pool = ForgeAttemptPool::new(&self.config);
+        match self.begin_claim_episode(open, shutdown, &mut pool).await {
+            ClaimStep::Closed(result) => result,
+            ClaimStep::Admitted => self.drain_pool(&mut pool, shutdown).await,
+        }
     }
 
-    /// Completes one ordinary ownership episode whose guard is held by the caller.
+    /// Drains every attempt suspended in one pool, reporting the last result.
     ///
-    /// The claim-time instant includes observer gates, validation, lease acquisition,
-    /// durable failure settlement, release, and the final durable observation.
+    /// Used by the single-claim entry points, whose pool holds exactly one
+    /// attempt; the event loop drains incrementally instead so it can keep
+    /// claiming while plans run.
     ///
     /// # Errors
-    /// Preserves the execution/settlement/release result; telemetry is diagnostic-only.
     ///
-    /// # Cancellation
-    /// Execution's existing durable shutdown settlement runs before observation.
-    async fn execute_claim_observed(
+    /// Returns the first settlement failure that makes further work unsafe.
+    async fn drain_pool(
         &self,
-        claim: &ForgeTaskClaim,
+        pool: &mut ForgeAttemptPool,
         shutdown: &CancellationToken,
-        started: Instant,
     ) -> Result<bool, ForgeError> {
+        let mut settled = false;
+        while !pool.is_idle() {
+            self.start_fitting_plans(pool, shutdown);
+            if let Some(state) = Self::drain_one_plan(pool).await? {
+                settled = self.finish_admitted_attempt(state, shutdown).await?;
+            }
+        }
+        Ok(settled)
+    }
+
+    /// Opens one ownership episode's observation frame.
+    ///
+    /// The claim-time instant and the active-task gauge are taken before any
+    /// validation, so an episode that suspends on the worker-wide plan queue
+    /// measures and reports exactly what an inline one does.
+    fn open_claim_episode(
+        claim: ForgeTaskClaim,
+        started: Instant,
+        active: Option<ForgeActiveTask>,
+    ) -> OpenClaim {
         let span = tracing::info_span!(
             "bifrost.forge.task.execute",
             strategy = claim.strategy.as_str(),
@@ -2531,16 +2876,104 @@ impl ForgeWorker {
         if let Some(attempt) = claim.attempt_id {
             span.record("attempt_id", tracing::field::display(attempt));
         }
+        OpenClaim {
+            claim,
+            started,
+            active,
+            span,
+        }
+    }
+
+    /// Starts one claimed episode, suspending it when it plans compaction work.
+    ///
+    /// Returns [`ClaimStep::Admitted`] once the attempt's plans are in the
+    /// worker pool; the episode is then settled by
+    /// [`Self::finish_admitted_attempt`] when its last plan drains. Every other
+    /// strategy and every short-circuit settles and observes itself here, so
+    /// both paths reach exactly one [`Self::close_claim_episode`].
+    async fn begin_claim_episode(
+        &self,
+        open: OpenClaim,
+        shutdown: &CancellationToken,
+        pool: &mut ForgeAttemptPool,
+    ) -> ClaimStep {
         // Exactly one passive observation per attempt. An execution failure the
-        // attempt durably settled is reported here even though the attempt
+        // attempt durably settled is reported at close even though the attempt
         // itself returns a healthy boolean, so the failure stays observable
         // without turning a settled outcome into a slot-fatal error.
         let mut settled_failure = None;
-        let outcome = tracing::Instrument::instrument(
-            self.execute_claim_attempt(claim, shutdown, &mut settled_failure),
-            span.clone(),
+        let started = tracing::Instrument::instrument(
+            self.begin_claim_attempt(&open.claim, shutdown, &mut settled_failure),
+            open.span.clone(),
         )
         .await;
+        match started {
+            Ok(AttemptStart::Planned(admitted)) => {
+                let AdmittedRewrite {
+                    attempt,
+                    binding,
+                    stage,
+                    lease,
+                    fenced,
+                    shared,
+                    plans,
+                } = *admitted;
+                let refused = pool.admit(
+                    ForgeAttemptState {
+                        open,
+                        attempt,
+                        binding,
+                        stage,
+                        lease,
+                        fenced,
+                        shared,
+                        refusals: Vec::new(),
+                        outcomes: Vec::new(),
+                        queued: 0,
+                        running: 0,
+                    },
+                    plans,
+                );
+                match refused {
+                    Some(state) => {
+                        ClaimStep::Closed(self.finish_admitted_attempt(state, shutdown).await)
+                    }
+                    None => ClaimStep::Admitted,
+                }
+            }
+            Ok(AttemptStart::Settled(settled)) => ClaimStep::Closed(
+                self.close_claim_episode(open, settled_failure, Ok(settled))
+                    .await,
+            ),
+            Err(error) => ClaimStep::Closed(
+                self.close_claim_episode(open, settled_failure, Err(error))
+                    .await,
+            ),
+        }
+    }
+
+    /// Observes one finished episode exactly once and releases its frame.
+    ///
+    /// Both the inline and the pooled path end here, so an attempt is observed
+    /// once no matter which one settled it. Telemetry is read from the durable
+    /// row before the active-task gauge is released, so a reader never sees a
+    /// task counted as active after its result was recorded.
+    ///
+    /// # Errors
+    ///
+    /// Returns `outcome` unchanged; observation is diagnostic-only.
+    async fn close_claim_episode(
+        &self,
+        open: OpenClaim,
+        settled_failure: Option<ForgeError>,
+        outcome: Result<bool, ForgeError>,
+    ) -> Result<bool, ForgeError> {
+        let OpenClaim {
+            claim,
+            started,
+            active,
+            span,
+        } = open;
         if outcome.is_err() {
             self.close_after_fatal();
         }
@@ -2560,6 +2993,7 @@ impl ForgeWorker {
         .await;
         drop(span);
         self.record_attempt(settled_failure.as_ref().or(outcome.as_ref().err()));
+        drop(active);
         outcome
     }
 
@@ -2571,12 +3005,12 @@ impl ForgeWorker {
     /// # Errors
     ///
     /// Returns every failure [`Self::execute_claim`] documents.
-    async fn execute_claim_attempt(
+    async fn begin_claim_attempt(
         &self,
         claim: &ForgeTaskClaim,
         shutdown: &CancellationToken,
         settled_failure: &mut Option<ForgeError>,
-    ) -> Result<bool, ForgeError> {
+    ) -> Result<AttemptStart, ForgeError> {
         let task = claim;
         if claim.execution_tenant_id != task.data_tenant_id {
             return Err(ForgeError::Invariant {
@@ -2603,7 +3037,7 @@ impl ForgeWorker {
                     .await?;
                 // Terminalizing a malformed payload is a healthy worker outcome
                 // that produced no effect.
-                return Ok(false);
+                return Ok(AttemptStart::Settled(false));
             }
         };
         // An orphan-cleanup prefix is a delete authority, and a well-shaped one
@@ -2632,9 +3066,24 @@ impl ForgeWorker {
         if lease.takeover() {
             tracing::info!(task_id = %task.task_id, "Forge worker took over an expired table fence");
         }
-        let result = self
-            .execute_fenced(task, attempt, &binding, &mut lease, shutdown)
+        let opened = self
+            .open_rewrite_frame(task, attempt, &binding, &mut lease, shutdown)
             .await;
+        let result = match opened {
+            Ok(OpenedFrame::Planned(shared, plans, fenced)) => {
+                return Ok(AttemptStart::Planned(Box::new(AdmittedRewrite {
+                    attempt,
+                    binding,
+                    stage,
+                    lease,
+                    fenced,
+                    shared,
+                    plans,
+                })));
+            }
+            Ok(OpenedFrame::Complete(settled)) => Ok(settled),
+            Err(error) => Err(error),
+        };
         self.settle_claim_execution(
             ClaimExecutionOutcome {
                 task,
@@ -2646,6 +3095,7 @@ impl ForgeWorker {
             settled_failure,
         )
         .await
+        .map(AttemptStart::Settled)
     }
 
     /// Settles failure and releases one task's table lease before outer observation.
@@ -3348,7 +3798,7 @@ impl ForgeWorker {
         ),
         ForgeError,
     > {
-        match self
+        let result = self
             .dispatch_claim(ForgeDispatchRequest {
                 claim,
                 attempt,
@@ -3357,8 +3807,38 @@ impl ForgeWorker {
                 table,
                 stop,
             })
-            .await?
-        {
+            .await?;
+        self.reduce_dispatch_result(claim, attempt, binding, lease, result, stop)
+            .await
+    }
+
+    /// Reduces one dispatched result to the evidence its attempt settles with.
+    ///
+    /// Split out of [`Self::dispatch_evidence`] because a compaction attempt
+    /// whose plans ran on the worker-wide pool produces its result outside that
+    /// call and must still reduce it through exactly the same mapping.
+    ///
+    /// # Errors
+    ///
+    /// Returns the catalog, object-store, SQL, and audit failures evidence
+    /// collection and snapshot-expiry completion raise.
+    async fn reduce_dispatch_result(
+        &self,
+        claim: &ForgeTaskClaim,
+        attempt: Uuid,
+        binding: &TenantTableBinding,
+        lease: &mut ForgeLease,
+        result: ForgeDispatchResult,
+        stop: &CancellationToken,
+    ) -> Result<
+        (
+            ForgeTaskEvidence,
+            ForgeExecutionEvidenceState,
+            Option<ForgeCommittedVolume>,
+        ),
+        ForgeError,
+    > {
+        match result {
             ForgeDispatchResult::Committed(publication) => self
                 .committed_evidence(binding, &publication.table)
                 .await
@@ -3372,19 +3852,7 @@ impl ForgeWorker {
             ForgeDispatchResult::Cleaned(evidence) => {
                 Ok((*evidence, ForgeExecutionEvidenceState::Prepared, None))
             }
-            ForgeDispatchResult::SelfSettled => Ok((
-                ForgeTaskEvidence {
-                    version: FORGE_TASK_PAYLOAD_VERSION,
-                    committed_snapshot_id: None,
-                    committed_metadata_location: None,
-                    committed_metadata_digest: None,
-                    cleanup_candidates: Vec::new(),
-                    deleted_candidate_count: 0,
-                    prepared_candidate_index: None,
-                },
-                ForgeExecutionEvidenceState::Settled,
-                None,
-            )),
+            ForgeDispatchResult::SelfSettled => Ok(Self::self_settled_evidence()),
             ForgeDispatchResult::SnapshotExpiry(result) => self
                 .complete_snapshot_expiry(claim, attempt, binding, lease, *result, stop)
                 .await
@@ -3392,14 +3860,114 @@ impl ForgeWorker {
         }
     }
 
-    async fn execute_fenced(
+    async fn open_rewrite_frame(
         &self,
         claim: &ForgeTaskClaim,
         attempt: Uuid,
         binding: &TenantTableBinding,
         lease: &mut ForgeLease,
         shutdown: &CancellationToken,
-    ) -> Result<bool, ForgeError> {
+    ) -> Result<OpenedFrame, ForgeError> {
+        let (execution, fenced) = match self
+            .prepare_fenced_attempt(claim, attempt, binding, lease, shutdown)
+            .await?
+        {
+            FencedStart::Superseded => return Ok(OpenedFrame::Complete(false)),
+            FencedStart::Recovered(evidence, fenced) => (
+                Ok((
+                    *evidence,
+                    ForgeExecutionEvidenceState::RecoveredCommit,
+                    None,
+                )),
+                fenced,
+            ),
+            // Compaction is the one strategy that suspends: its plans compete
+            // for a budget that belongs to the worker, not to this attempt, so
+            // admission and execution happen outside this frame.
+            FencedStart::Open(_, fenced)
+                if matches!(
+                    claim.strategy,
+                    ForgeClaimStrategy::Known(ForgeTaskStrategy::SmallFiles)
+                ) =>
+            {
+                match self
+                    .plan_rewrite_attempt(claim, attempt, binding, lease, fenced.dispatch_stop())
+                    .await
+                {
+                    Ok(RewriteAdmission::Planned(shared, plans)) => {
+                        return Ok(OpenedFrame::Planned(shared, plans, fenced));
+                    }
+                    Ok(RewriteAdmission::SelfSettled) => {
+                        (Ok(Self::self_settled_evidence()), fenced)
+                    }
+                    Err(error) => (Err(error), fenced),
+                }
+            }
+            FencedStart::Open(table, fenced) => {
+                let execution = self
+                    .dispatch_evidence(
+                        claim,
+                        attempt,
+                        binding,
+                        lease,
+                        table,
+                        fenced.dispatch_stop(),
+                    )
+                    .await;
+                (execution, fenced)
+            }
+        };
+        self.settle_fenced_attempt(claim, attempt, binding, lease, fenced, execution, shutdown)
+            .await
+            .map(OpenedFrame::Complete)
+    }
+
+    /// Returns the evidence an attempt that produced no effect settles with.
+    ///
+    /// Planning that selected nothing already wrote its own durable
+    /// acknowledgement, so this evidence names no snapshot and no candidate.
+    fn self_settled_evidence() -> (
+        ForgeTaskEvidence,
+        ForgeExecutionEvidenceState,
+        Option<ForgeCommittedVolume>,
+    ) {
+        (
+            ForgeTaskEvidence {
+                version: FORGE_TASK_PAYLOAD_VERSION,
+                committed_snapshot_id: None,
+                committed_metadata_location: None,
+                committed_metadata_digest: None,
+                cleanup_candidates: Vec::new(),
+                deleted_candidate_count: 0,
+                prepared_candidate_index: None,
+            },
+            ForgeExecutionEvidenceState::Settled,
+            None,
+        )
+    }
+
+    /// Opens one attempt's fenced frame up to the point its strategy dispatches.
+    ///
+    /// Everything here is the part of an attempt that must happen before any
+    /// effect: the fence check, the base-snapshot decision, the durable attempt
+    /// begin, and the heartbeat that keeps ownership provable while the effect
+    /// runs. It is separated from settlement so a compaction attempt can hold
+    /// this frame open across the worker-wide plan queue instead of owning its
+    /// own dispatch inline.
+    ///
+    /// # Errors
+    ///
+    /// Returns the fence, catalog, watermark, lifecycle, and heartbeat-spawn
+    /// failures the opening sequence raises. A superseded base cancels the task
+    /// durably and reports [`FencedStart::Superseded`] rather than an error.
+    async fn prepare_fenced_attempt(
+        &self,
+        claim: &ForgeTaskClaim,
+        attempt: Uuid,
+        binding: &TenantTableBinding,
+        lease: &mut ForgeLease,
+        shutdown: &CancellationToken,
+    ) -> Result<FencedStart, ForgeError> {
         lease.require_fence(&self.forge.core.operator_pool).await?;
         let table = self.forge.load_table(&binding.table_ident()).await?;
         let base_matches = Self::base_snapshot_matches(&table, claim.base_snapshot_id);
@@ -3420,7 +3988,7 @@ impl ForgeWorker {
             self.cancel_superseded(claim).await?;
             // The requested effect never ran, so this is a healthy exit that
             // recorded no successful completion.
-            return Ok(false);
+            return Ok(FencedStart::Superseded);
         }
         let watermark = Self::execution_watermark(&table, claim, committed_recovery.as_ref())?;
         self.begin_attempt(claim, attempt, watermark).await?;
@@ -3445,18 +4013,67 @@ impl ForgeWorker {
             operation_stop.clone(),
             authority_stop.clone(),
         )?;
-        let dispatch_stop = if maintenance_recovery {
-            &authority_stop
-        } else {
-            &operation_stop
+        let fenced = FencedAttempt {
+            operation_stop,
+            authority_stop,
+            heartbeat,
+            maintenance_recovery,
         };
-        let execution = match committed_recovery {
-            Some(evidence) => Ok((evidence, ForgeExecutionEvidenceState::RecoveredCommit, None)),
-            None => {
-                self.dispatch_evidence(claim, attempt, binding, lease, table, dispatch_stop)
-                    .await
-            }
-        };
+        Ok(match committed_recovery {
+            Some(evidence) => FencedStart::Recovered(Box::new(evidence), fenced),
+            None => FencedStart::Open(table, fenced),
+        })
+    }
+
+    /// Settles one fenced attempt from the outcome its dispatch produced.
+    ///
+    /// Owns the whole post-effect sequence: the cancellation classification
+    /// that decides whether a stopped attempt is released or retained, the
+    /// heartbeat join, evidence settlement, and the durable finish. It is
+    /// separated from [`Self::prepare_fenced_attempt`] so a compaction attempt
+    /// whose plans ran on the worker-wide queue settles through exactly the
+    /// same seam as an inline one.
+    ///
+    /// Returns whether the requested effect settled.
+    ///
+    /// # Errors
+    ///
+    /// Returns the dispatch failure, [`ForgeError::ShutdownRetained`] for a
+    /// cancellation observed after a durable effect, the heartbeat's authority
+    /// failure, and the evidence, audit, SQL, and fence failures settlement
+    /// raises.
+    ///
+    /// # Panics
+    ///
+    /// Does not panic; a heartbeat panic is reported as
+    /// [`ForgeError::Invariant`].
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "settlement needs the whole attempt frame: claim, generation, binding, fence, fenced tokens, dispatch outcome, and shutdown"
+    )]
+    async fn settle_fenced_attempt(
+        &self,
+        claim: &ForgeTaskClaim,
+        attempt: Uuid,
+        binding: &TenantTableBinding,
+        lease: &mut ForgeLease,
+        fenced: FencedAttempt,
+        execution: Result<
+            (
+                ForgeTaskEvidence,
+                ForgeExecutionEvidenceState,
+                Option<ForgeCommittedVolume>,
+            ),
+            ForgeError,
+        >,
+        shutdown: &CancellationToken,
+    ) -> Result<bool, ForgeError> {
+        let FencedAttempt {
+            operation_stop,
+            authority_stop: _,
+            heartbeat,
+            maintenance_recovery,
+        } = fenced;
         // Test-only barrier: a durably settled snapshot expiration is held
         // here, after its atomic task and operation settlement committed and
         // before this worker reads shutdown or joins the heartbeat.
@@ -3966,8 +4583,9 @@ impl ForgeWorker {
                     .await
             }
             ForgeClaimStrategy::Known(ForgeTaskStrategy::SmallFiles) => {
-                self.dispatch_iceberg_rewrite(claim, attempt, binding, lease, stop)
-                    .await
+                Err(ForgeError::Invariant {
+                    detail: "Forge compaction dispatches through the worker plan pool".to_owned(),
+                })
             }
             ForgeClaimStrategy::Known(ForgeTaskStrategy::ExpiredCleanup) => {
                 self.dispatch_expired_cleanup(claim, attempt, binding, lease, &table, stop)
@@ -4014,14 +4632,14 @@ impl ForgeWorker {
     /// is not representable as a deadline, and the capacity, audit, fence,
     /// object-store, and catalog failures raised by execution, preparation, and
     /// the commit.
-    async fn dispatch_iceberg_rewrite(
+    async fn plan_rewrite_attempt(
         &self,
         claim: &ForgeTaskClaim,
         attempt: Uuid,
         binding: &TenantTableBinding,
         lease: &mut ForgeLease,
         stop: &CancellationToken,
-    ) -> Result<ForgeDispatchResult, ForgeError> {
+    ) -> Result<RewriteAdmission, ForgeError> {
         self.rewrite_settlement_barrier(claim, binding, lease, stop)
             .await?;
         let rewrite = self
@@ -4035,128 +4653,201 @@ impl ForgeWorker {
         if plans.is_empty() {
             self.acknowledge_compact_table(claim, attempt, &table, lease)
                 .await?;
-            return Ok(ForgeDispatchResult::SelfSettled);
+            return Ok(RewriteAdmission::SelfSettled);
         }
-        let mut queue = super::managed::queue::ForgeCompactionQueue::new(
-            self.config.max_task_parallelism,
-            self.config.pending_task_parallelism,
-            self.config.compaction_memory_budget_bytes,
-        );
-        let planned = plans.len();
-        let refusals = Self::offer_planned_rewrites(
-            &mut queue,
-            plans.into_iter().map(|plan| {
-                (
-                    super::managed::queue::ForgePlanAdmission {
-                        task_id: claim.task_id,
-                        plan_index: plan.plan_index,
-                        required_parallelism: plan.required_parallelism,
-                        memory_reservation_bytes: plan.memory_reservation_bytes,
-                    },
-                    plan,
-                )
+        Ok(RewriteAdmission::Planned(
+            Arc::new(ForgeRewriteAttempt {
+                rewrite: Arc::new(rewrite),
+                table,
+                evidence,
+                deadline: super::publication::RewritePublicationDeadline::new(
+                    self.forge.core.clock.now()?,
+                    self.forge.core.config.iceberg_total_retry_timeout,
+                )?,
             }),
-        );
-        tracing::debug!(
-            task_id = %claim.task_id,
-            planned,
-            waiting_parallelism = queue.waiting_parallelism_sum(),
-            refused = refusals.len(),
-            "Forge admitted one attempt's compaction plans"
-        );
-        let shared = Arc::new(ForgeRewriteAttempt {
-            rewrite: Arc::new(rewrite),
-            table,
-            evidence,
-            deadline: super::publication::RewritePublicationDeadline::new(
-                self.forge.core.clock.now()?,
-                self.forge.core.config.iceberg_total_retry_timeout,
-            )?,
-        });
-        let mut joins = ForgePlanJoins::new();
-        let mut outcomes: Vec<(usize, Result<ForgeDispatchResult, ForgeError>)> = Vec::new();
-        loop {
-            // A drained attempt must not start plans it has not started yet.
-            // Dropping them here is not a lost outcome: an unstarted plan wrote
-            // nothing, holds no operation, and is ordinary planning debt the
-            // next attempt replans from the same table. The plans that did run
-            // are kept: their publications are durable and their failures carry
-            // the objects only this attempt can still name, so the drain stops
-            // starting work rather than discarding what it already holds.
-            if stop.is_cancelled() {
-                let dropped = queue.cancel_waiting_task(claim.task_id);
-                if dropped > 0 {
-                    tracing::debug!(
-                        task_id = %claim.task_id,
-                        dropped,
-                        running_parallelism = queue.running_parallelism_sum(),
-                        running_memory_reservation_bytes = queue.running_memory_reservation_bytes(),
-                        "Forge dropped the plans a drained attempt had not started"
-                    );
-                }
-            } else {
-                for popped in Self::pop_fitting_plans(&mut queue) {
-                    self.spawn_plan_runner(
-                        &mut joins, claim, binding, lease, &shared, stop, popped,
-                    );
-                }
-            }
-            let Some((_, plan_index, outcome)) = Self::join_next_plan(&mut joins).await? else {
-                break;
-            };
-            queue.finish_running((claim.task_id, plan_index));
-            outcomes.push((plan_index, outcome));
-        }
-        if outcomes.is_empty() {
-            return Err(ForgeError::Shutdown);
-        }
-        Self::reduce_plan_outcomes(refusals, outcomes)
+            plans,
+        ))
     }
 
-    /// Pops every queued head the running budgets currently admit.
+    /// Starts every queued head the worker's running budgets currently admit.
     ///
     /// Only the FIFO head is ever considered, so a plan that does not fit blocks
     /// the ones behind it rather than being skipped: that head-of-line behavior
-    /// is what makes the queue's start order the planner's order. The pops are
-    /// collected rather than started here so the caller can spawn each one with
-    /// the context of the task it belongs to.
-    fn pop_fitting_plans(
-        queue: &mut super::managed::queue::ForgeCompactionQueue<
-            super::managed::ForgePlannedRewrite,
-        >,
-    ) -> Vec<super::managed::queue::PoppedForgePlan<super::managed::ForgePlannedRewrite>> {
-        let mut started = Vec::new();
-        while let Some(popped) = queue.pop() {
-            started.push(popped);
+    /// is what makes the queue's start order the planner's order across every
+    /// attempt this worker holds, not just within one of them.
+    ///
+    /// A drained worker starts nothing and instead drops the plans it has not
+    /// started. That is not a lost outcome: an unstarted plan wrote nothing,
+    /// holds no operation, and is ordinary planning debt the next attempt
+    /// replans from the same table. The plans that did run are kept, because
+    /// their publications are durable and their failures carry objects only
+    /// their attempt can still name.
+    ///
+    /// Returns the attempts a drain left with nothing to join, so the caller
+    /// settles them instead of waiting for a plan that will never start.
+    fn start_fitting_plans(
+        &self,
+        pool: &mut ForgeAttemptPool,
+        shutdown: &CancellationToken,
+    ) -> Vec<ForgeAttemptState> {
+        if shutdown.is_cancelled() {
+            return Self::drop_waiting_plans(pool);
         }
-        started
+        while let Some(popped) = pool.queue.pop() {
+            let task_id = popped.admission.task_id;
+            let Some(state) = pool.attempts.get_mut(&task_id) else {
+                continue;
+            };
+            state.queued = state.queued.saturating_sub(1);
+            state.running += 1;
+            self.spawn_plan_runner(&mut pool.joins, state, popped);
+        }
+        Vec::new()
     }
 
-    /// Starts one admitted plan on the worker's compaction executor.
+    /// Drops every unstarted plan this worker holds for a graceful drain.
     ///
-    /// The runner owns everything it needs: a worker clone, the claim and
-    /// binding it publishes under, its own handle on the table fence, and the
-    /// attempt's shared managed context. Sibling plans therefore neither block
-    /// nor observe each other, which is what lets the worker hold plans from
-    /// several tasks in flight at once. Cloning the lease shares its fencing
-    /// token and confirmation instant rather than copying them, so every runner
-    /// publishes under one fence generation.
+    /// Returns the attempts that are left with nothing in flight.
+    fn drop_waiting_plans(pool: &mut ForgeAttemptPool) -> Vec<ForgeAttemptState> {
+        let suspended: Vec<Uuid> = pool.attempts.keys().copied().collect();
+        let mut stranded = Vec::new();
+        for task_id in suspended {
+            let dropped = pool.queue.cancel_waiting_task(task_id);
+            let Some(state) = pool.attempts.get_mut(&task_id) else {
+                continue;
+            };
+            if dropped > 0 {
+                state.queued = state.queued.saturating_sub(dropped);
+                tracing::debug!(
+                    task_id = %task_id,
+                    dropped,
+                    running_parallelism = pool.queue.running_parallelism_sum(),
+                    running_memory_reservation_bytes = pool.queue.running_memory_reservation_bytes(),
+                    "Forge dropped the plans a drained attempt had not started"
+                );
+            }
+            if state.drained()
+                && let Some(state) = pool.attempts.remove(&task_id)
+            {
+                stranded.push(state);
+            }
+        }
+        stranded
+    }
+
+    /// Awaits one plan completion and reports the attempt it finished, if any.
     ///
-    /// A worker with a dedicated compaction runtime spawns there so a saturated
-    /// rewrite cannot starve the loop that has to settle it; a direct fixture or
-    /// an embedded deployment without one shares the ambient runtime.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "one plan runner owns its claim, binding, fence, attempt context, and cancellation"
-    )]
+    /// Returns `None` when nothing is in flight, or when the finished plan has
+    /// siblings this worker is still running for the same attempt.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Invariant`] when a runner could not be joined, or
+    /// when a joined plan names an attempt this worker is not holding: either
+    /// way the owner can no longer prove what it published.
+    async fn drain_one_plan(
+        pool: &mut ForgeAttemptPool,
+    ) -> Result<Option<ForgeAttemptState>, ForgeError> {
+        let Some((task_id, plan_index, outcome)) = Self::join_next_plan(&mut pool.joins).await?
+        else {
+            return Ok(None);
+        };
+        pool.queue.finish_running((task_id, plan_index));
+        let Some(state) = pool.attempts.get_mut(&task_id) else {
+            return Err(ForgeError::Invariant {
+                detail: format!("Forge joined plan {plan_index} of an attempt it does not hold"),
+            });
+        };
+        state.running = state.running.saturating_sub(1);
+        state.outcomes.push((plan_index, outcome));
+        if state.drained() {
+            return Ok(pool.attempts.remove(&task_id));
+        }
+        Ok(None)
+    }
+
+    /// Settles one attempt whose every admitted plan has drained.
+    ///
+    /// Reduces the per-plan results to one task result and then walks exactly
+    /// the seams an inline attempt walks — evidence reduction, fenced
+    /// settlement, claim settlement, and one passive observation — so a pooled
+    /// attempt is indistinguishable from an inline one in durable state.
+    ///
+    /// Returns whether the requested effect settled.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Shutdown`] when a drain stopped every plan before
+    /// any ran, and otherwise the settlement, audit, SQL, and lease-release
+    /// failures that make a further claim by this owner unsafe.
+    async fn finish_admitted_attempt(
+        &self,
+        state: ForgeAttemptState,
+        shutdown: &CancellationToken,
+    ) -> Result<bool, ForgeError> {
+        let ForgeAttemptState {
+            open,
+            attempt,
+            binding,
+            stage,
+            mut lease,
+            fenced,
+            shared,
+            refusals,
+            outcomes,
+            ..
+        } = state;
+        drop(shared);
+        let execution = if outcomes.is_empty() {
+            Err(ForgeError::Shutdown)
+        } else {
+            match Self::reduce_plan_outcomes(refusals, outcomes) {
+                Ok(result) => {
+                    self.reduce_dispatch_result(
+                        &open.claim,
+                        attempt,
+                        &binding,
+                        &mut lease,
+                        result,
+                        fenced.dispatch_stop(),
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            }
+        };
+        let result = self
+            .settle_fenced_attempt(
+                &open.claim,
+                attempt,
+                &binding,
+                &mut lease,
+                fenced,
+                execution,
+                shutdown,
+            )
+            .await;
+        let mut settled_failure = None;
+        let settled = self
+            .settle_claim_execution(
+                ClaimExecutionOutcome {
+                    task: &open.claim,
+                    attempt,
+                    stage,
+                    lease,
+                    result,
+                },
+                &mut settled_failure,
+            )
+            .await;
+        self.close_claim_episode(open, settled_failure, settled)
+            .await
+    }
+
     fn spawn_plan_runner(
         &self,
         joins: &mut ForgePlanJoins,
-        claim: &ForgeTaskClaim,
-        binding: &TenantTableBinding,
-        lease: &ForgeLease,
-        shared: &Arc<ForgeRewriteAttempt>,
-        stop: &CancellationToken,
+        state: &ForgeAttemptState,
         popped: super::managed::queue::PoppedForgePlan<super::managed::ForgePlannedRewrite>,
     ) {
         let task_id = popped.admission.task_id;
@@ -4174,11 +4865,11 @@ impl ForgeWorker {
             return;
         };
         let worker = self.clone();
-        let claim = claim.clone();
-        let binding = binding.clone();
-        let mut lease = lease.clone();
-        let shared = Arc::clone(shared);
-        let stop = stop.clone();
+        let claim = state.open.claim.clone();
+        let binding = state.binding.clone();
+        let mut lease = state.lease.clone();
+        let shared = Arc::clone(&state.shared);
+        let stop = state.fenced.operation_stop.clone();
         let runner = async move {
             let outcome = worker
                 .publish_one_plan(&claim, &binding, &mut lease, &shared, plan, &stop)

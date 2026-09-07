@@ -111,7 +111,7 @@ async fn rewrite_scheduler_dispatches_only_after_promotion_and_authority() {
     let telemetry = ForgeTelemetryCheckpoint::install();
     let fixture = PromotionIntegrationFixture::start("rewrite_scheduler").await;
     let object_store = CountingObjectStore::new(Arc::clone(&fixture.staging));
-    let mut supervisor = SupervisedPromotion::start(
+    let mut supervisor = SupervisedPromotion::start_serial(
         &fixture,
         fixture.catalog.iceberg_catalog(),
         Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
@@ -276,7 +276,7 @@ async fn rewrite_publication_commits_exact_handoff_and_delete_disposition() {
         promoted.fixture.catalog.iceberg_catalog(),
         object_store.read_counter(),
     );
-    let mut supervisor = SupervisedPromotion::start(
+    let mut supervisor = SupervisedPromotion::start_serial(
         &promoted.fixture,
         Arc::clone(&catalog) as Arc<dyn Catalog>,
         Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
@@ -413,7 +413,7 @@ async fn rewrite_publication_conflict_revalidates_once_or_resets() {
         promoted.fixture.catalog.iceberg_catalog(),
         object_store.read_counter(),
     );
-    let mut supervisor = SupervisedPromotion::start(
+    let mut supervisor = SupervisedPromotion::start_serial(
         &promoted.fixture,
         Arc::clone(&catalog) as Arc<dyn Catalog>,
         Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
@@ -604,7 +604,7 @@ async fn assert_expired_deadline_makes_no_second_call() {
         object_store.read_counter(),
     );
     let (clock, control) = manual_clock();
-    let mut supervisor = SupervisedPromotion::start(
+    let mut supervisor = SupervisedPromotion::start_serial(
         &promoted.fixture,
         Arc::clone(&catalog) as Arc<dyn Catalog>,
         Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
@@ -676,7 +676,7 @@ async fn assert_retry_inherits_only_the_remaining_budget() {
         object_store.read_counter(),
     );
     let (clock, control) = manual_clock();
-    let mut supervisor = SupervisedPromotion::start(
+    let mut supervisor = SupervisedPromotion::start_serial(
         &promoted.fixture,
         Arc::clone(&catalog) as Arc<dyn Catalog>,
         Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
@@ -793,7 +793,7 @@ async fn rewrite_publication_ambiguity_restart_settles_once() {
         object_store.read_counter(),
     );
     let (clock, control) = manual_clock();
-    let mut supervisor = SupervisedPromotion::start(
+    let mut supervisor = SupervisedPromotion::start_serial(
         &promoted.fixture,
         Arc::clone(&catalog) as Arc<dyn Catalog>,
         Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
@@ -987,7 +987,7 @@ async fn assert_held_authority_change_refuses(
         object_store.read_counter(),
     );
     let (clock, control) = manual_clock();
-    let mut supervisor = SupervisedPromotion::start(
+    let mut supervisor = SupervisedPromotion::start_serial(
         &promoted.fixture,
         Arc::clone(&catalog) as Arc<dyn Catalog>,
         Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,

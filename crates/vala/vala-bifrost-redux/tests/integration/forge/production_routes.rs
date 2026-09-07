@@ -53,7 +53,7 @@ async fn expirable_table_without_rewrite_debt(name: &str) -> ExpirableTable {
     let store = CountingObjectStore::new(Arc::clone(&fixture.staging));
     let seam = PromotionCatalogSeam::new(fixture.catalog.iceberg_catalog(), store.read_counter());
     let (clock, control) = manual_clock();
-    let mut supervised = SupervisedPromotion::start(
+    let mut supervised = SupervisedPromotion::start_serial(
         &fixture,
         Arc::clone(&seam) as Arc<dyn iceberg::Catalog>,
         Arc::clone(&store) as Arc<dyn vala_bifrost_redux::forge::ForgeObjectStore>,
@@ -611,7 +611,7 @@ async fn coordinator_and_worker_delete_only_exact_never_published_generation() {
         promoted.fixture.catalog.iceberg_catalog(),
         object_store.read_counter(),
     );
-    let mut supervisor = SupervisedPromotion::start(
+    let mut supervisor = SupervisedPromotion::start_serial(
         &promoted.fixture,
         Arc::clone(&catalog) as Arc<dyn iceberg::Catalog>,
         Arc::clone(&object_store) as Arc<dyn vala_bifrost_redux::forge::ForgeObjectStore>,

@@ -1562,6 +1562,8 @@ pub(crate) struct SupervisedPromotion {
     /// is never released on shutdown, so a second supervisor in one test would
     /// stand by and plan nothing.
     forge: Arc<Forge>,
+    /// Worker bounds every generation of this supervisor's worker is built with.
+    worker_config: ForgeWorkerConfig,
 }
 
 impl SupervisedPromotion {
@@ -1576,6 +1578,56 @@ impl SupervisedPromotion {
         object_store: Arc<dyn ForgeObjectStore>,
         clock: ForgeClock,
     ) -> Self {
+        Self::start_with_worker_bounds(
+            fixture,
+            catalog,
+            object_store,
+            clock,
+            ForgeWorkerConfig::default(),
+        )
+    }
+
+    /// Start one supervisor whose worker runs a single compaction plan at a time.
+    ///
+    /// A scenario that injects a fault by commit *count* — a refusal budget, a
+    /// lost response, a parked call — needs to know which plan received it, and
+    /// concurrent siblings make that unknowable. The scenarios that prove
+    /// reduction, publication, and recovery semantics therefore bound running
+    /// parallelism to one, and concurrency has its own scenario.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture cannot construct a validated worker graph.
+    pub(crate) fn start_serial(
+        fixture: &PromotionIntegrationFixture,
+        catalog: Arc<dyn Catalog>,
+        object_store: Arc<dyn ForgeObjectStore>,
+        clock: ForgeClock,
+    ) -> Self {
+        Self::start_with_worker_bounds(
+            fixture,
+            catalog,
+            object_store,
+            clock,
+            ForgeWorkerConfig {
+                max_task_parallelism: 1,
+                ..ForgeWorkerConfig::default()
+            },
+        )
+    }
+
+    /// Start one production scheduler and worker under explicit worker bounds.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture cannot construct a validated worker graph.
+    fn start_with_worker_bounds(
+        fixture: &PromotionIntegrationFixture,
+        catalog: Arc<dyn Catalog>,
+        object_store: Arc<dyn ForgeObjectStore>,
+        clock: ForgeClock,
+        worker_config: ForgeWorkerConfig,
+    ) -> Self {
         let scheduler_trigger = ForgeSchedulerTrigger::with_owner_for_test(uuid::Uuid::now_v7());
         let worker_observer = ForgeWorkerCompletionObserver::new();
         let forge = fixture.build_forge_for_test(
@@ -1585,12 +1637,8 @@ impl SupervisedPromotion {
             worker_observer.clone(),
             scheduler_trigger.clone(),
         );
-        let worker = ForgeWorker::new(
-            Arc::clone(&forge),
-            ForgeWorkerConfig::default(),
-            uuid::Uuid::now_v7(),
-        )
-        .expect("fixture Forge worker");
+        let worker = ForgeWorker::new(Arc::clone(&forge), worker_config, uuid::Uuid::now_v7())
+            .expect("fixture Forge worker");
         let scheduler_stop = CancellationToken::new();
         let worker_stop = CancellationToken::new();
         let scheduler_task = tokio::spawn({
@@ -1611,6 +1659,7 @@ impl SupervisedPromotion {
             worker_task: Some(worker_task),
             worker_armed: false,
             forge,
+            worker_config,
         }
     }
 
@@ -1642,7 +1691,7 @@ impl SupervisedPromotion {
     pub(crate) async fn reclaim_expired_claims(&self) {
         let worker = ForgeWorker::new(
             Arc::clone(&self.forge),
-            ForgeWorkerConfig::default(),
+            self.worker_config,
             uuid::Uuid::now_v7(),
         )
         .expect("fixture Forge worker");
@@ -1690,7 +1739,7 @@ impl SupervisedPromotion {
         }
         let worker = ForgeWorker::new(
             Arc::clone(&self.forge),
-            ForgeWorkerConfig::default(),
+            self.worker_config,
             uuid::Uuid::now_v7(),
         )
         .expect("fixture Forge worker");

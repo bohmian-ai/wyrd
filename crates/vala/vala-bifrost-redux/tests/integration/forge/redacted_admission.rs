@@ -36,7 +36,7 @@ use super::support::{CountingObjectStore, PromotionCatalogSeam, SupervisedPromot
 async fn independent_plan_publications_compose_on_current_head() {
 redacted
     let object_store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
-    let mut supervisor = SupervisedPromotion::start(
+    let mut supervisor = SupervisedPromotion::start_serial(
         &promoted.fixture,
         promoted.fixture.catalog.iceberg_catalog(),
         Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
@@ -162,7 +162,7 @@ redacted
         promoted.fixture.catalog.iceberg_catalog(),
         object_store.read_counter(),
     );
-    let mut supervisor = SupervisedPromotion::start(
+    let mut supervisor = SupervisedPromotion::start_serial(
         &promoted.fixture,
         Arc::clone(&catalog) as Arc<dyn iceberg::Catalog>,
         Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
@@ -384,7 +384,7 @@ redacted
         object_store.read_counter(),
     );
     let (clock, control) = super::support::manual_clock();
-    let mut supervisor = SupervisedPromotion::start(
+    let mut supervisor = SupervisedPromotion::start_serial(
         &promoted.fixture,
         Arc::clone(&catalog) as Arc<dyn iceberg::Catalog>,
         Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
@@ -471,7 +471,7 @@ redacted
         promoted.fixture.catalog.iceberg_catalog(),
         object_store.read_counter(),
     );
-    let mut supervisor = SupervisedPromotion::start(
+    let mut supervisor = SupervisedPromotion::start_serial(
         &promoted.fixture,
         Arc::clone(&catalog) as Arc<dyn iceberg::Catalog>,
         Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,

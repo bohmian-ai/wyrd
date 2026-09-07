@@ -274,9 +274,12 @@ struct ForgeCommittedPublication {
 /// the one selection the whole attempt was admitted on. Passing them
 /// individually alongside the per-plan arguments would obscure exactly that
 /// split.
-struct ForgeRewriteAttempt<'attempt> {
+struct ForgeRewriteAttempt {
     /// Managed core seam this attempt's plans execute through.
-    rewrite: &'attempt super::managed::ForgeManagedRewrite,
+    ///
+    /// Owned behind an `Arc` rather than borrowed because every plan runs on
+    /// the worker's compaction executor, outside the frame that planned it.
+    rewrite: Arc<super::managed::ForgeManagedRewrite>,
     /// Table as planning read it, used for geometry and publication authority.
     table: Table,
     /// Planning evidence every plan of this attempt records under its operation.
@@ -1441,6 +1444,14 @@ impl ForgeWorkerConfig {
         Ok(self)
     }
 }
+
+/// Join set of one worker's in-flight plan runners.
+///
+/// Each entry reports the durable task it belongs to, its planner ordinal, and
+/// the plan's own publication result, because the worker admits plans from
+/// several tasks at once and they complete in whatever order their objects and
+/// commits allow.
+type ForgePlanJoins = tokio::task::JoinSet<(Uuid, usize, Result<ForgeDispatchResult, ForgeError>)>;
 
 /// Fenced execution state awaiting durable failure settlement and lease release.
 struct ClaimExecutionOutcome<'task> {
@@ -4053,52 +4064,156 @@ impl ForgeWorker {
             refused = refusals.len(),
             "Forge admitted one attempt's compaction plans"
         );
-        let shared = ForgeRewriteAttempt {
-            rewrite: &rewrite,
+        let shared = Arc::new(ForgeRewriteAttempt {
+            rewrite: Arc::new(rewrite),
             table,
             evidence,
             deadline: super::publication::RewritePublicationDeadline::new(
                 self.forge.core.clock.now()?,
                 self.forge.core.config.iceberg_total_retry_timeout,
             )?,
-        };
+        });
+        let mut joins = ForgePlanJoins::new();
         let mut outcomes: Vec<(usize, Result<ForgeDispatchResult, ForgeError>)> = Vec::new();
-        while let Some(popped) = queue.pop() {
-            let plan_index = popped.admission.plan_index;
+        loop {
             // A drained attempt must not start plans it has not started yet.
             // Dropping them here is not a lost outcome: an unstarted plan wrote
             // nothing, holds no operation, and is ordinary planning debt the
             // next attempt replans from the same table. The plans that did run
             // are kept: their publications are durable and their failures carry
             // the objects only this attempt can still name, so the drain stops
-            // the loop rather than discarding what it already holds.
+            // starting work rather than discarding what it already holds.
             if stop.is_cancelled() {
                 let dropped = queue.cancel_waiting_task(claim.task_id);
-                tracing::debug!(
-                    task_id = %claim.task_id,
-                    dropped,
-                    running_parallelism = queue.running_parallelism_sum(),
-                    running_memory_reservation_bytes = queue.running_memory_reservation_bytes(),
-                    "Forge dropped the plans a drained attempt had not started"
-                );
-                if outcomes.is_empty() {
-                    return Err(ForgeError::Shutdown);
+                if dropped > 0 {
+                    tracing::debug!(
+                        task_id = %claim.task_id,
+                        dropped,
+                        running_parallelism = queue.running_parallelism_sum(),
+                        running_memory_reservation_bytes = queue.running_memory_reservation_bytes(),
+                        "Forge dropped the plans a drained attempt had not started"
+                    );
                 }
-                break;
+            } else {
+                for popped in Self::pop_fitting_plans(&mut queue) {
+                    self.spawn_plan_runner(
+                        &mut joins, claim, binding, lease, &shared, stop, popped,
+                    );
+                }
             }
-            let outcome = match popped.runner {
-                Some(plan) => {
-                    self.publish_one_plan(claim, binding, lease, &shared, plan, stop)
-                        .await
-                }
-                None => Err(ForgeError::Invariant {
-                    detail: format!("Forge admitted plan {plan_index} carried no runner"),
-                }),
+            let Some((_, plan_index, outcome)) = Self::join_next_plan(&mut joins).await? else {
+                break;
             };
             queue.finish_running((claim.task_id, plan_index));
             outcomes.push((plan_index, outcome));
         }
+        if outcomes.is_empty() {
+            return Err(ForgeError::Shutdown);
+        }
         Self::reduce_plan_outcomes(refusals, outcomes)
+    }
+
+    /// Pops every queued head the running budgets currently admit.
+    ///
+    /// Only the FIFO head is ever considered, so a plan that does not fit blocks
+    /// the ones behind it rather than being skipped: that head-of-line behavior
+    /// is what makes the queue's start order the planner's order. The pops are
+    /// collected rather than started here so the caller can spawn each one with
+    /// the context of the task it belongs to.
+    fn pop_fitting_plans(
+        queue: &mut super::managed::queue::ForgeCompactionQueue<
+            super::managed::ForgePlannedRewrite,
+        >,
+    ) -> Vec<super::managed::queue::PoppedForgePlan<super::managed::ForgePlannedRewrite>> {
+        let mut started = Vec::new();
+        while let Some(popped) = queue.pop() {
+            started.push(popped);
+        }
+        started
+    }
+
+    /// Starts one admitted plan on the worker's compaction executor.
+    ///
+    /// The runner owns everything it needs: a worker clone, the claim and
+    /// binding it publishes under, its own handle on the table fence, and the
+    /// attempt's shared managed context. Sibling plans therefore neither block
+    /// nor observe each other, which is what lets the worker hold plans from
+    /// several tasks in flight at once. Cloning the lease shares its fencing
+    /// token and confirmation instant rather than copying them, so every runner
+    /// publishes under one fence generation.
+    ///
+    /// A worker with a dedicated compaction runtime spawns there so a saturated
+    /// rewrite cannot starve the loop that has to settle it; a direct fixture or
+    /// an embedded deployment without one shares the ambient runtime.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one plan runner owns its claim, binding, fence, attempt context, and cancellation"
+    )]
+    fn spawn_plan_runner(
+        &self,
+        joins: &mut ForgePlanJoins,
+        claim: &ForgeTaskClaim,
+        binding: &TenantTableBinding,
+        lease: &ForgeLease,
+        shared: &Arc<ForgeRewriteAttempt>,
+        stop: &CancellationToken,
+        popped: super::managed::queue::PoppedForgePlan<super::managed::ForgePlannedRewrite>,
+    ) {
+        let task_id = popped.admission.task_id;
+        let plan_index = popped.admission.plan_index;
+        let Some(plan) = popped.runner else {
+            joins.spawn(async move {
+                (
+                    task_id,
+                    plan_index,
+                    Err(ForgeError::Invariant {
+                        detail: format!("Forge admitted plan {plan_index} carried no runner"),
+                    }),
+                )
+            });
+            return;
+        };
+        let worker = self.clone();
+        let claim = claim.clone();
+        let binding = binding.clone();
+        let mut lease = lease.clone();
+        let shared = Arc::clone(shared);
+        let stop = stop.clone();
+        let runner = async move {
+            let outcome = worker
+                .publish_one_plan(&claim, &binding, &mut lease, &shared, plan, &stop)
+                .await;
+            (task_id, plan_index, outcome)
+        };
+        match &self.compaction_runtime {
+            Some(handle) => {
+                joins.spawn_on(runner, handle);
+            }
+            None => {
+                joins.spawn(runner);
+            }
+        }
+    }
+
+    /// Awaits the next plan runner to finish, in completion order.
+    ///
+    /// Returns `None` when nothing is in flight.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Invariant`] when a runner panicked or was aborted:
+    /// its plan's outcome cannot be attributed, so the owner can no longer
+    /// prove what it published and must stop rather than settle a guess.
+    async fn join_next_plan(
+        joins: &mut ForgePlanJoins,
+    ) -> Result<Option<(Uuid, usize, Result<ForgeDispatchResult, ForgeError>)>, ForgeError> {
+        match joins.join_next().await {
+            None => Ok(None),
+            Some(Ok(joined)) => Ok(Some(joined)),
+            Some(Err(error)) => Err(ForgeError::Invariant {
+                detail: format!("Forge compaction plan runner did not complete: {error}"),
+            }),
+        }
     }
 
     /// Offers one attempt's planner-ordered plans to the worker-wide queue.
@@ -4212,7 +4327,7 @@ impl ForgeWorker {
         claim: &ForgeTaskClaim,
         binding: &TenantTableBinding,
         lease: &mut ForgeLease,
-        attempt: &ForgeRewriteAttempt<'_>,
+        attempt: &ForgeRewriteAttempt,
         plan: super::managed::ForgePlannedRewrite,
         stop: &CancellationToken,
     ) -> Result<ForgeDispatchResult, ForgeError> {
@@ -4689,14 +4804,7 @@ redacted
                 );
                 // Every way that wait can fail is definite non-acceptance, so
                 // each closes the operation here.
-                if let Err(stopped) = super::publication::RewriteConflictSchedule::wait(
-                    retries_spent,
-                    context.deadline,
-                    self.forge.core.clock.now()?,
-                    stop,
-                )
-                .await
-                {
+                if let Some(stopped) = self.conflict_backoff(context, retries_spent, stop).await? {
                     let reason = match stopped {
                         super::publication::RewriteRetryStop::Cancelled => ForgeError::Shutdown,
                         super::publication::RewriteRetryStop::Exhausted
@@ -4746,6 +4854,35 @@ redacted
         }
     }
 
+    /// Waits the definite-conflict backoff owed before one revalidated retry.
+    ///
+    /// The wait belongs before the revalidation, not after it: a plan that
+    /// reloaded metadata and then slept would resubmit against a picture of the
+    /// table that is already as old as the backoff.
+    ///
+    /// Returns the stop that ended the wait, or `None` when the retry may
+    /// proceed. Every stop is definite non-acceptance, so the caller closes the
+    /// operation rather than resubmitting.
+    ///
+    /// # Errors
+    ///
+    /// Returns the clock failure the deadline comparison raises.
+    async fn conflict_backoff(
+        &self,
+        context: &RewritePublication<'_>,
+        retries_spent: u32,
+        stop: &CancellationToken,
+    ) -> Result<Option<super::publication::RewriteRetryStop>, ForgeError> {
+        Ok(super::publication::RewriteConflictSchedule::wait(
+            retries_spent,
+            context.deadline,
+            self.forge.core.clock.now()?,
+            stop,
+        )
+        .await
+        .err())
+    }
+
     /// Reports the one authority a fresh publication pass fails, if any.
     ///
     /// Split out so the refusal is decided against `current` — metadata loaded
@@ -4772,10 +4909,9 @@ redacted
             .rewrite_authority(
                 lease,
                 current,
+                context,
                 context.claim.base_snapshot_id,
-                context.planned_schema_id,
-                context.deadline,
-                &handoff.rewritten_data_files,
+                handoff,
                 stop,
             )
             .await?;
@@ -4924,6 +5060,10 @@ redacted
     /// Returns [`ForgeError::Reconciliation`] when the refusal arrived after
     /// this task's own effect landed, and the catalog, object-store, clock, and
     /// fence failures the reload and the authority read raise.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a follow-up decision needs the whole publication frame: context, acceptance, request, handoff, retry count, fence, and cancellation"
+    )]
     async fn rewrite_follow_up(
         &self,
         context: &RewritePublication<'_>,
@@ -4970,10 +5110,9 @@ redacted
                     .rewrite_authority(
                         lease,
                         &refreshed,
+                        context,
                         request.base_snapshot_id,
-                        context.planned_schema_id,
-                        context.deadline,
-                        &handoff.rewritten_data_files,
+                        handoff,
                         stop,
                     )
                     .await?;
@@ -5022,14 +5161,13 @@ redacted
         &self,
         lease: &mut ForgeLease,
         table: &Table,
+        context: &RewritePublication<'_>,
         base_snapshot_id: i64,
-        planned_schema_id: i32,
-        deadline: super::publication::RewritePublicationDeadline,
-        rewritten_data_files: &[String],
+        handoff: &super::managed::RewriteHandoff,
         stop: &CancellationToken,
     ) -> Result<super::publication::RewriteCommitAuthority, ForgeError> {
         let inputs_all_live = self
-            .current_head_holds_inputs(table, rewritten_data_files)
+            .current_head_holds_inputs(table, &handoff.rewritten_data_files)
             .await?;
         let metadata = table.metadata();
         Ok(super::publication::RewriteCommitAuthority {
@@ -5041,11 +5179,11 @@ redacted
             },
             attempt: super::publication::RewriteAttemptAuthority {
                 cancelled: stop.is_cancelled(),
-                deadline_passed: deadline.passed(self.forge.core.clock.now()?),
+                deadline_passed: context.deadline.passed(self.forge.core.clock.now()?),
             },
             table: super::publication::RewriteTableAuthority {
                 base_is_retained: metadata.snapshot_by_id(base_snapshot_id).is_some(),
-                schema_unchanged: planned_schema_id == metadata.current_schema_id(),
+                schema_unchanged: context.planned_schema_id == metadata.current_schema_id(),
             },
             files: super::publication::RewriteFileAuthority {
                 inputs_all_live,

@@ -28,6 +28,7 @@ use wyrd_testing::bifrost::{
     BifrostClusterSpec, CommitUncertaintyCatalog, OracleFollowerPauses, TestOracleResources,
     WyrdTestCluster,
 };
+use wyrd_testing::server::harness_forge_compaction_budget_bytes;
 
 use crate::public_support::{
     JourneyTable, ManagedRow, append_values, canonical_order, read_managed_rows, register_table,
@@ -87,13 +88,30 @@ impl CloseoutJourney {
         spec.nodes[3].roles = spec.nodes[0].roles.clone();
         spec.nodes[0].roles = [BifrostRuntimeRole::Scribe].into_iter().collect();
         spec.nodes[2].roles = [BifrostRuntimeRole::Oracle].into_iter().collect();
+        // The surviving dedicated worker compacts the journey's production-sized
+        // 512 MiB inputs, whose decoded working set the admission estimate puts
+        // well past a 3 GiB pod. Size that pod for the plans it must admit.
+        spec.nodes[1].oracle = Some(TestOracleResources {
+            spill_root: None,
+            system_resources: Some(SystemResourceSnapshot {
+                memory_limit_bytes: 32 * 1024 * 1024 * 1024,
+                effective_cpu: 4,
+                scratch_capacity_bytes: 4 * 1024 * 1024 * 1024,
+                scratch_available_bytes: 4 * 1024 * 1024 * 1024,
+                memory_source: ResourceSource::Injected,
+                cpu_source: ResourceSource::Injected,
+            }),
+        });
         // Both Oracle replicas must derive the same durable admission ceiling.
-        // The dedicated replica needs no Scribe protected floor, and Forge
-        // holds none at all.
+        // The dedicated replica needs neither the Scribe protected floor nor
+        // the Forge compaction reservation the co-located coordinator takes, so
+        // its injected limit sheds exactly those two.
         spec.nodes[2].oracle = Some(TestOracleResources {
             spill_root: None,
             system_resources: Some(SystemResourceSnapshot {
-                memory_limit_bytes: 3 * 1024 * 1024 * 1024 - ROLE_MEMORY_FLOOR_BYTES,
+                memory_limit_bytes: 3 * 1024 * 1024 * 1024
+                    - ROLE_MEMORY_FLOOR_BYTES
+                    - harness_forge_compaction_budget_bytes(3 * 1024 * 1024 * 1024),
                 effective_cpu: 4,
                 scratch_capacity_bytes: 4 * 1024 * 1024 * 1024,
                 scratch_available_bytes: 4 * 1024 * 1024 * 1024,
@@ -645,12 +663,41 @@ impl CloseoutJourney {
         (snapshot.snapshot_id(), files)
     }
 
-    /// Corroborates one completed rewrite with transactional audit and metrics.
+    /// Counts the snapshots the table currently retains.
+    ///
+    /// Publication is per plan, so the retained snapshot count — not the task
+    /// count — is what an attempt's operations have to line up against.
     ///
     /// # Panics
-    /// Panics on absent or contradictory operation/audit evidence, an unfinished
-    /// ownership gauge, or missing physical data-flow counters.
-    async fn assert_rewrite_evidence(&self, tenant: DataTenantId, expected: usize) {
+    /// Panics when the catalog cannot load the table.
+    async fn snapshot_count(&self, binding: &TenantTableBinding) -> usize {
+        self.coordinator()
+            .bifrost_catalog()
+            .iceberg_catalog()
+            .load_table(&binding.table_ident())
+            .await
+            .expect("catalog table")
+            .metadata()
+            .snapshots()
+            .count()
+    }
+
+    /// Corroborates every completed rewrite with transactional audit and metrics.
+    ///
+    /// An attempt publishes each of its admitted plans independently, so a
+    /// completed rewrite settles *one operation per plan*, not one per task.
+    /// The count is therefore a floor rather than an equality, and the
+    /// identities carry the real evidence: each plan holds its own operation,
+    /// its own Prepared audit, and its own committed terminal after it.
+    ///
+    /// Returns how many operations that evidence covers, so the caller can hold
+    /// it against the snapshots the same passes published.
+    ///
+    /// # Panics
+    /// Panics on absent or contradictory operation/audit evidence, on two plans
+    /// sharing one operation identity, on an unfinished ownership gauge, or on
+    /// missing physical data-flow counters.
+    async fn assert_rewrite_evidence(&self, tenant: DataTenantId, expected: usize) -> usize {
         let mut conn = self
             .coordinator()
             .tenant_conn_for(tenant)
@@ -667,11 +714,21 @@ impl CloseoutJourney {
         conn.commit()
             .await
             .expect("read-only audit inspection completes");
-        assert_eq!(
-            rows.len(),
-            expected,
-            "every completed rewrite has one audited terminal settlement"
+        assert!(
+            rows.len() >= expected,
+            "every completed rewrite audits at least one plan's terminal settlement: \
+             {} operations for {expected} rewrites",
+            rows.len()
         );
+        assert_eq!(
+            rows.iter()
+                .map(|(operation, ..)| *operation)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            rows.len(),
+            "no two published plans settled under one operation identity"
+        );
+        let operations = rows.len();
         for (operation, prepared, terminal, prepared_name, terminal_name, detail) in rows {
             assert!(prepared < terminal);
             assert_eq!(prepared_name, "forge.iceberg_rewrite.prepared");
@@ -721,6 +778,7 @@ impl CloseoutJourney {
             authority.fencing_token(),
             self.observer.completed_workers()
         );
+        operations
     }
 
     /// Proves each named object still physically exists at its committed size.
@@ -940,15 +998,28 @@ async fn compaction_geometry_exact_rows_and_non_destructive_second_pass() {
     let reader = tenant_client(journey.oracle(), tenant).await;
     let neighbour_writer = tenant_client(journey.scribe(), neighbour).await;
     let neighbour_reader = tenant_client(journey.oracle(), neighbour).await;
-    let neighbour_expected = canonical_order(
-        append_values(
-            &neighbour_writer,
-            &neighbour_table.qualified,
-            Uuid::now_v7(),
-            &[9001, 9002, 9003],
-        )
-        .await,
-    );
+    // The neighbour is written in separate flushed rounds so it owns several
+    // hot objects of its own. That gives it real maintenance demand, and its
+    // tasks then compete for the same worker as the geometry table's plans
+    // rather than sitting idle beside them.
+    let mut neighbour_rows = Vec::new();
+    for values in [[9001, 9002, 9003], [9004, 9005, 9006], [9007, 9008, 9009]] {
+        neighbour_rows.extend(
+            append_values(
+                &neighbour_writer,
+                &neighbour_table.qualified,
+                Uuid::now_v7(),
+                &values,
+            )
+            .await,
+        );
+        journey
+            .scribe()
+            .flush_bifrost()
+            .await
+            .expect("the competing tenant's rows flush");
+    }
+    let neighbour_expected = canonical_order(neighbour_rows);
     let mut workload = GeometryWorkload::new();
     for round in 0..2 {
         let started = Instant::now();
@@ -1005,11 +1076,14 @@ async fn compaction_geometry_exact_rows_and_non_destructive_second_pass() {
         hot.len(),
         "promotion retains every physical Scribe object"
     );
-    let (neighbour_snapshot, neighbour_files) = journey.live_files(&neighbour_table.binding).await;
+    let (neighbour_promoted, _) = journey.live_files(&neighbour_table.binding).await;
+    let published_before = journey.snapshot_count(&table.binding).await;
     // The managed core first normalizes promoted-file identity, then packs
     // current-recipe files. Continue packing residues until a pass is unchanged.
     let mut replacement = journey.live_files(&table.binding).await;
+    let mut passes = 0;
     for pass in 0..8 {
+        passes += 1;
         journey.scheduler_pass().await;
         journey.drain_tasks().await;
         let next = journey.live_files(&table.binding).await;
@@ -1035,6 +1109,17 @@ async fn compaction_geometry_exact_rows_and_non_destructive_second_pass() {
     }
     let (replacement_snapshot, outputs) = replacement;
     assert_ne!(replacement_snapshot, promoted_snapshot);
+    assert!(
+        passes > 1,
+        "the geometry backlog is packed over more than one pass, so its residue \
+         is replanned rather than published in one commit"
+    );
+    let (neighbour_snapshot, neighbour_files) = journey.live_files(&neighbour_table.binding).await;
+    assert_ne!(
+        neighbour_snapshot, neighbour_promoted,
+        "the competing table's own maintenance drained through the same worker \
+         as the geometry table's plans"
+    );
     assert!(
         outputs.keys().all(|path| !inputs.contains_key(path)),
         "new cuts use replacements"
@@ -1113,7 +1198,14 @@ async fn compaction_geometry_exact_rows_and_non_destructive_second_pass() {
         neighbour_expected
     );
     journey.assert_objects(&inputs).await;
-    journey.assert_rewrite_evidence(tenant, rewrites).await;
+    // Each admitted plan publishes on its own, so the rewrite passes owe one
+    // audited operation per snapshot they added — not one per completed task.
+    let operations = journey.assert_rewrite_evidence(tenant, rewrites).await;
+    assert_eq!(
+        operations,
+        journey.snapshot_count(&table.binding).await - published_before,
+        "every snapshot the rewrite passes published carries its own operation"
+    );
     journey.cluster.shutdown().await.expect("all roles drain");
 }
 

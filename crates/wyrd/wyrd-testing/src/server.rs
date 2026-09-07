@@ -152,6 +152,22 @@ use crate::time::ClockHandle;
 /// Dedicated least-privilege role assigned to the test Oracle Service.
 const ORACLE_PEER_ROLE: &str = "bifrost_oracle_peer";
 
+/// Forge compaction budget every harness node carrying a Forge role names.
+///
+/// The production default is four fifths of the memory limit and deliberately
+/// does not clamp, so a co-located harness whose Scribe and Oracle floors are
+/// also protected must name a budget that fits the remainder. Half the limit
+/// is the largest simple fraction that still fits a pod protecting both the
+/// Scribe and Oracle floors, and it keeps a Forge-only pod's budget
+/// proportional to the memory a journey injects for it. The helper is public
+/// because a test that pins two Oracle replicas to one durable admission
+/// ceiling has to subtract the same reservation the Forge-carrying replica
+/// takes.
+#[must_use]
+pub fn harness_forge_compaction_budget_bytes(memory_limit_bytes: usize) -> usize {
+    memory_limit_bytes / 2
+}
+
 /// Separates a serve-task join failure from the server's own terminal outcome.
 ///
 /// The load-bearing case is [`tokio::task::JoinError::is_panic`]: a panic on the
@@ -3350,20 +3366,6 @@ impl WyrdTestServerBuilder {
         };
 
         let postgres = Arc::new(ServerPostgres::from_parts(runtime_wyrd, runtime_vala));
-        // The formula's default (four fifths of the memory limit) deliberately
-        // does not clamp, so a co-located harness whose Scribe and Oracle floors
-        // are also protected must name a budget that fits the remainder —
-        // exactly as a co-located deployment configures one.
-        let forge_budget_bytes = self
-            .bifrost_roles
-            .iter()
-            .any(|role| {
-                matches!(
-                    role,
-                    BifrostRuntimeRole::ForgeCoordinator | BifrostRuntimeRole::ForgeWorker
-                )
-            })
-            .then_some(256 * 1024 * 1024);
         let resource_roles = self
             .bifrost_roles
             .iter()
@@ -3413,6 +3415,20 @@ impl WyrdTestServerBuilder {
             memory_source: ResourceSource::Injected,
             cpu_source: ResourceSource::Injected,
         });
+        // The formula's default (four fifths of the memory limit) deliberately
+        // does not clamp, so a co-located harness whose Scribe and Oracle floors
+        // are also protected must name a budget that fits the remainder —
+        // exactly as a co-located deployment configures one.
+        let forge_budget_bytes = self
+            .bifrost_roles
+            .iter()
+            .any(|role| {
+                matches!(
+                    role,
+                    BifrostRuntimeRole::ForgeCoordinator | BifrostRuntimeRole::ForgeWorker
+                )
+            })
+            .then(|| harness_forge_compaction_budget_bytes(snapshot.memory_limit_bytes));
         let runtime_resources =
             BifrostRuntimeResources::from_snapshot_with_transport_message_limit(
                 snapshot,

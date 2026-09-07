@@ -26,6 +26,7 @@ mod tests {
     use crate::tables::fields::{PARQUET_FIELD_ID, WYRD_SENSITIVE};
     use crate::tables::signal::{
         encode_any_value, encode_attributes, validate_canonical_user_batch,
+        without_correlation_columns,
     };
 
     /// Build one attribute entry with the supplied protocol value.
@@ -164,7 +165,11 @@ mod tests {
         assert_eq!(outcome.rejected_records, 0);
         assert!(outcome.rejection_message.is_none());
         assert_eq!(batch.num_rows(), correlated + 1);
-        assert_eq!(batch.num_columns(), LOG_FIELDS.len());
+        assert_eq!(
+            batch.num_columns(),
+            LOG_FIELDS.len() + 2,
+            "the ledger columns plus the two appended correlation columns"
+        );
 
         let bodies = typed::<BinaryArray>(&batch, "body");
         for (row, value) in forms.into_iter().enumerate() {
@@ -182,8 +187,10 @@ mod tests {
 
         assert_record_scalars(&batch, correlated);
         assert_context_presence(&batch, correlated);
-        assert_schema_identity(&batch);
-        assert_non_canonical_inputs_are_rejected(&batch);
+        let ledger = without_correlation_columns(&batch)
+            .expect("the appended correlation columns split off cleanly");
+        assert_schema_identity(&ledger);
+        assert_non_canonical_inputs_are_rejected(&ledger);
     }
 
     /// Assert every scalar log column retains its exact protocol value.
@@ -359,5 +366,111 @@ mod tests {
             validate_canonical_user_batch(LOG_FIELDS, &drifted).is_err(),
             "a drifted stable field id is rejected without a row"
         );
+    }
+
+    /// Build resource logs whose records vary only by attribute set.
+    ///
+    /// Every other record field is copied from the maximal fixture, so a test
+    /// can vary correlation attributes alone and still exercise a complete
+    /// record.
+    fn logs_with_attribute_sets(sets: Vec<Vec<KeyValue>>) -> Vec<ResourceLogs> {
+        let mut request = maximal_resource_logs();
+        let template = request[0].scope_logs[0].log_records[0].clone();
+        request[0].scope_logs[0].log_records = sets
+            .into_iter()
+            .map(|attributes| LogRecord {
+                attributes,
+                ..template.clone()
+            })
+            .collect();
+        request.truncate(1);
+        request
+    }
+
+    /// Optional Card correlation is read from the final record attribute only,
+    /// rejects exactly its own record, and never disturbs the lossless payload.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a missing value is not null, a final duplicate does not win,
+    /// a wrongly typed or malformed value rejects more than its own record, an
+    /// original attribute entry changes, or the outcome counts and first reason
+    /// are not exact.
+    #[test]
+    fn optional_card_correlation_is_atomic_and_lossless() {
+        const CARD: &str = "prod/Service/checkout@1.0.0";
+        const RUN: &str = "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b11";
+
+        let base = || vec![attribute("payload.bytes", Value::BytesValue(vec![0xab]))];
+        let missing = base();
+        let mut valid = base();
+        valid.push(attribute(
+            "wyrd.card_ref",
+            Value::StringValue(CARD.to_owned()),
+        ));
+        valid.push(attribute("wyrd.run_id", Value::StringValue(RUN.to_owned())));
+        let mut duplicate = base();
+        duplicate.push(attribute(
+            "wyrd.card_ref",
+            Value::StringValue("prod/Service/superseded@9.9.9".to_owned()),
+        ));
+        duplicate.push(attribute(
+            "wyrd.card_ref",
+            Value::StringValue(CARD.to_owned()),
+        ));
+        let mut wrong_typed = base();
+        wrong_typed.push(attribute("wyrd.run_id", Value::IntValue(7)));
+        let mut malformed = base();
+        malformed.push(attribute(
+            "wyrd.card_ref",
+            Value::StringValue("not-a-card-ref".to_owned()),
+        ));
+
+        let request = logs_with_attribute_sets(vec![
+            missing.clone(),
+            valid.clone(),
+            duplicate.clone(),
+            wrong_typed,
+            malformed,
+        ]);
+        let (batch, outcome) = project_resource_logs(&request).expect("projection completes");
+
+        assert_eq!(outcome.accepted_records, 3);
+        assert_eq!(outcome.rejected_records, 2);
+        assert_eq!(
+            outcome.rejection_message.as_deref(),
+            Some("wyrd.run_id is not a valid run correlation"),
+            "the first rejection in traversal order is reported"
+        );
+        assert_eq!(
+            batch.num_rows(),
+            3,
+            "only the two defective records are lost"
+        );
+
+        let card_refs = typed::<StringArray>(&batch, "card_ref");
+        assert!(
+            card_refs.is_null(0),
+            "a missing wyrd.card_ref projects null"
+        );
+        assert_eq!(card_refs.value(1), CARD);
+        assert_eq!(
+            card_refs.value(2),
+            CARD,
+            "the final duplicate is authoritative"
+        );
+        let run_ids = typed::<StringArray>(&batch, "run_id");
+        assert!(run_ids.is_null(0), "a missing wyrd.run_id projects null");
+        assert_eq!(run_ids.value(1), RUN);
+        assert!(run_ids.is_null(2));
+
+        let attributes = typed::<BinaryArray>(&batch, "attributes");
+        for (row, source) in [missing, valid, duplicate].iter().enumerate() {
+            assert_eq!(
+                attributes.value(row),
+                encode_attributes(source).as_slice(),
+                "row {row} retains every ordered source attribute byte for byte"
+            );
+        }
     }
 }

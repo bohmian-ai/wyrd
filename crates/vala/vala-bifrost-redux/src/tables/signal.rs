@@ -21,8 +21,12 @@ use crate::tables::TableError;
 use crate::tables::fields::{self, CanonicalField, CanonicalType};
 use prost::Message;
 use prost::encoding::{WireType, encode_key};
+use std::str::FromStr;
 use std::sync::Arc;
-use wyrd_spec::vala::ids::{SpanId, TraceId};
+use wyrd_spec::reference::CardRef;
+use wyrd_spec::vala::ids::{RunId, SpanId, TraceId};
+use wyrd_spec::vala::managed_columns::{CARD_REF, RUN_ID};
+use wyrd_tonic::otlp::common::v1::any_value::Value;
 use wyrd_tonic::otlp::common::v1::{
     AnyValue, EntityRef, InstrumentationScope, KeyValue, KeyValueList,
 };
@@ -246,6 +250,143 @@ pub fn last_string_attribute<'a>(attributes: &'a [KeyValue], key: &str) -> Optio
 #[must_use]
 pub fn last_attribute<'a>(attributes: &'a [KeyValue], key: &str) -> Option<&'a KeyValue> {
     attributes.iter().rev().find(|entry| entry.key == key)
+}
+
+/// Record-level `OTLP` attribute carrying optional Card correlation.
+///
+/// The value uses the existing compact [`CardRef`] grammar. A supplied `#uid`
+/// suffix parses as syntax but is untrusted: Scribe authorizes and resolves by
+/// `(kind, space, name, version)` identity against the signed scope alone.
+pub const CARD_REF_ATTRIBUTE: &str = "wyrd.card_ref";
+
+/// Record-level `OTLP` attribute carrying optional run correlation.
+pub const RUN_ID_ATTRIBUTE: &str = "wyrd.run_id";
+
+/// Stable rejection reason for a wrongly typed or malformed `wyrd.card_ref`.
+const CARD_REF_REJECTION: &str = "wyrd.card_ref is not a valid card correlation";
+
+/// Stable rejection reason for a wrongly typed `wyrd.run_id`.
+const RUN_ID_REJECTION: &str = "wyrd.run_id is not a valid run correlation";
+
+/// Optional Card and run correlation read from one record's attributes.
+///
+/// This is the one place the three canonical signals share the tri-state rule
+/// the specification fixes: an absent attribute projects null, a present final
+/// occurrence with the declared string type and valid grammar projects its
+/// text, and a present final occurrence of any other protocol type or invalid
+/// text rejects only its own record. Earlier duplicate keys are left entirely
+/// to the lossless attribute payload — extraction never rewrites, reorders, or
+/// removes a source entry.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RecordCorrelation {
+    /// Client-supplied Card reference text, when present and valid.
+    pub card_ref: Option<String>,
+    /// Client-supplied run identifier text, when present and valid.
+    pub run_id: Option<String>,
+}
+
+impl RecordCorrelation {
+    /// Extract both optional correlations from one record's attributes.
+    ///
+    /// # Errors
+    ///
+    /// Returns the stable rejection reason when the final `wyrd.card_ref`
+    /// occurrence is not a string or does not parse as a [`CardRef`], or when
+    /// the final `wyrd.run_id` occurrence is not a string. [`RunId`] adopts any
+    /// string, so a run identifier has no further grammar to fail.
+    pub fn extract(attributes: &[KeyValue]) -> Result<Self, &'static str> {
+        let card_ref = correlation_text(attributes, CARD_REF_ATTRIBUTE, CARD_REF_REJECTION)?;
+        if let Some(text) = card_ref {
+            CardRef::from_str(text).map_err(|_| CARD_REF_REJECTION)?;
+        }
+        let run_id = correlation_text(attributes, RUN_ID_ATTRIBUTE, RUN_ID_REJECTION)?;
+        Ok(Self {
+            card_ref: card_ref.map(str::to_owned),
+            run_id: run_id
+                .map(|text| RunId::from_string(text.to_owned()))
+                .map(|run| run.as_str().to_owned()),
+        })
+    }
+}
+
+/// Read the final occurrence of one correlation attribute as text.
+///
+/// # Errors
+///
+/// Returns `wrong_type` when the final occurrence carries any protocol value
+/// other than a string.
+fn correlation_text<'a>(
+    attributes: &'a [KeyValue],
+    key: &str,
+    wrong_type: &'static str,
+) -> Result<Option<&'a str>, &'static str> {
+    match last_attribute(attributes, key) {
+        None => Ok(None),
+        Some(entry) => match entry.value.as_ref().and_then(|value| value.value.as_ref()) {
+            Some(Value::StringValue(text)) => Ok(Some(text.as_str())),
+            _ => Err(wrong_type),
+        },
+    }
+}
+
+/// The two nullable correlation fields every canonical signal projection appends.
+///
+/// They are not ledger fields and carry no stable id: Scribe strips `card_ref`
+/// and relinquishes `run_id` before stamping the canonical envelope, and the
+/// source schema fingerprint excludes both, so appending them here cannot
+/// perturb a table's catalog or canonical physical identity.
+#[must_use]
+pub fn correlation_fields() -> [Field; 2] {
+    [
+        Field::new(CARD_REF, DataType::Utf8, true),
+        Field::new(RUN_ID, DataType::Utf8, true),
+    ]
+}
+
+/// Build the projected schema of one canonical signal: ledger then correlation.
+#[must_use]
+pub fn projected_signal_schema(declared: &[CanonicalField]) -> Arc<Schema> {
+    let mut schema_fields = fields::canonical_arrow_fields(declared);
+    schema_fields.extend(correlation_fields());
+    Arc::new(Schema::new(schema_fields))
+}
+
+/// Return one projected signal batch without its appended correlation columns.
+///
+/// Every authority that compares a batch against its canonical ledger — schema
+/// validation, physical identity, and storage round trips — reads this
+/// projection, because the correlation columns belong to Scribe's stamping
+/// contract rather than to the table's declared schema.
+///
+/// # Errors
+///
+/// Returns [`TableError::Internal`] when the remaining columns do not assemble.
+pub fn without_correlation_columns(batch: &RecordBatch) -> Result<RecordBatch, TableError> {
+    let appended = correlation_fields();
+    let schema = batch.schema();
+    let kept: Vec<usize> = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .filter(|(_, field)| {
+            !appended
+                .iter()
+                .any(|correlation| correlation.name() == field.name())
+        })
+        .map(|(index, _)| index)
+        .collect();
+    let retained = Schema::new(
+        kept.iter()
+            .map(|index| schema.field(*index).clone())
+            .collect::<Vec<_>>(),
+    );
+    RecordBatch::try_new(
+        Arc::new(retained),
+        kept.iter()
+            .map(|index| Arc::clone(batch.column(*index)))
+            .collect(),
+    )
+    .map_err(|error| TableError::Internal(format!("ledger projection: {error}")))
 }
 
 /// Build a non-nullable UTF-8 column.

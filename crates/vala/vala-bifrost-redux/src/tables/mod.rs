@@ -1314,7 +1314,12 @@ mod tests {
         let (points, _) = crate::tables::metrics::project_resource_metrics(&metric_fixture())
             .expect("the metric fixture projects");
 
-        for (label, batch) in [("spans", spans), ("logs", logs), ("points", points)] {
+        for (label, projected) in [("spans", spans), ("logs", logs), ("points", points)] {
+            // The appended correlation columns are Scribe's stamping contract,
+            // not declared ledger fields, so the canonical identity round trip
+            // reads the ledger projection.
+            let batch = crate::tables::signal::without_correlation_columns(&projected)
+                .expect("the correlation columns split off cleanly");
             let declared = batch.schema().fields().clone();
             assert!(batch.num_rows() > 0, "{label} fixture produces rows");
 

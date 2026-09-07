@@ -572,12 +572,24 @@ pub(crate) fn current_receipt_micros() -> Result<i64, ScribeError> {
         })
 }
 
+/// Authorize every client-supplied `card_ref` against the principal's scope.
+///
+/// A batch without the column carries no Card correlation and is admitted
+/// unchanged. Within the column, a null is a valid uncorrelated row; a present
+/// value must parse under the `CardRef` grammar and name an identity the
+/// principal's verified signed [`CardRefScope`](wyrd_spec::reference::CardRefScope)
+/// authorizes. Authorization is decided for the whole batch before any row is
+/// admitted, so a single denied row refuses the frame.
+///
+/// # Errors
+///
+/// Returns [`ScribeError::CardScopeDenied`] when the column is not UTF-8, or
+/// when a row supplies a present value and the principal carries no signed
+/// scope, the value is malformed, or the value lies outside the signed scope.
+/// A batch whose correlation column is entirely null needs no scope.
 fn validate_card_scope(rows: &RecordBatch, principal: &Principal) -> Result<(), ScribeError> {
     let Some(column) = rows.column_by_name(CARD_REF) else {
         return Ok(());
-    };
-    let Some(scope) = principal.card_ref_scope() else {
-        return Err(ScribeError::CardScopeDenied);
     };
     let cards = column
         .as_any()
@@ -585,8 +597,12 @@ fn validate_card_scope(rows: &RecordBatch, principal: &Principal) -> Result<(), 
         .ok_or(ScribeError::CardScopeDenied)?;
     for index in 0..cards.len() {
         if cards.is_null(index) {
-            return Err(ScribeError::CardScopeDenied);
+            // An absent correlation is a valid row: it simply carries no Card.
+            continue;
         }
+        let scope = principal
+            .card_ref_scope()
+            .ok_or(ScribeError::CardScopeDenied)?;
         let raw = cards.value(index);
         let card = CardRef::from_str(raw).map_err(|_| ScribeError::CardScopeDenied)?;
         if !scope.authorizes(&card) {
@@ -889,11 +905,15 @@ fn user_columns(rows: &RecordBatch, server_owned: &[&str]) -> Vec<ArrayRef> {
 
 /// Resolves row card references against the authenticated principal.
 ///
+/// A null row reference resolves to no UID and needs no principal card, so an
+/// entirely uncorrelated batch resolves without consulting the principal.
+///
 /// # Errors
 ///
 /// Returns [`ScribeError::CardUnresolved`] when the card column has the wrong
-/// type, a row reference is malformed or differs from the bound card, or the
-/// principal does not provide the required card identity.
+/// type, or when a row supplies a present reference that is malformed, differs
+/// from the bound card, or the principal does not provide the required card
+/// identity.
 fn resolve_card_uids(
     rows: &RecordBatch,
     principal: &Principal,
@@ -907,21 +927,22 @@ fn resolve_card_uids(
         .as_any()
         .downcast_ref::<StringArray>()
         .ok_or(ScribeError::CardUnresolved)?;
-    let bound = principal.card_ref().ok_or(ScribeError::CardUnresolved)?;
-    let bound_card_uid = bound.uid.as_ref().map(ToString::to_string);
     let mut resolved = Vec::with_capacity(row_count);
     for row in 0..row_count {
         resolved.push({
             if cards.is_null(row) {
                 None
             } else {
+                let bound = principal.card_ref().ok_or(ScribeError::CardUnresolved)?;
                 let raw = cards.value(row);
                 let card = CardRef::from_str(raw).map_err(|_| ScribeError::CardUnresolved)?;
                 if !bound.same_identity(&card) {
                     return Err(ScribeError::CardUnresolved);
                 }
-                bound_card_uid
-                    .clone()
+                bound
+                    .uid
+                    .as_ref()
+                    .map(ToString::to_string)
                     .map(Some)
                     .ok_or(ScribeError::CardUnresolved)?
             }

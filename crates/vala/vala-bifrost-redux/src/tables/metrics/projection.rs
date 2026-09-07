@@ -31,11 +31,11 @@ use crate::otlp_contract::MetricsOutcome;
 use crate::tables::TableError;
 use crate::tables::fields::canonical_arrow_fields;
 use crate::tables::signal::{
-    ResourceEnvelope, ScopeEnvelope, binary_column, bool_column, bool_opt_column, checked_i64,
-    encode_attributes, f64_column, f64_opt_column, fixed_binary_opt_column, i32_column,
-    i32_opt_column, i64_column, i64_opt_column, internal, list_column, nested_fields,
-    span_id_bytes, struct_column, trace_id_bytes, u32_as_i64_column, utf8_column,
-    validate_canonical_user_batch,
+    RecordCorrelation, ResourceEnvelope, ScopeEnvelope, binary_column, bool_column,
+    bool_opt_column, checked_i64, encode_attributes, f64_column, f64_opt_column,
+    fixed_binary_opt_column, i32_column, i32_opt_column, i64_column, i64_opt_column, internal,
+    list_column, nested_fields, projected_signal_schema, span_id_bytes, struct_column,
+    trace_id_bytes, u32_as_i64_column, utf8_column, utf8_opt_column, validate_canonical_user_batch,
 };
 
 /// Largest accepted metric name, in bytes.
@@ -407,6 +407,8 @@ struct PointRow {
     flags: u32,
     /// Canonical encoding of the point attributes.
     attributes: Vec<u8>,
+    /// Optional client-supplied Card and run correlation for this point.
+    correlation: RecordCorrelation,
     /// Integer numeric alternative.
     int_value: Option<i64>,
     /// Double numeric alternative.
@@ -448,8 +450,9 @@ impl PointRow {
     ///
     /// # Errors
     ///
-    /// Returns a stable reason when the numeric oneof is absent or an exemplar
-    /// is invalid.
+    /// Returns a stable reason when the numeric oneof is absent, a
+    /// `wyrd.card_ref` or `wyrd.run_id` attribute is wrongly typed or
+    /// malformed, or an exemplar is invalid.
     fn number(point: &NumberDataPoint) -> Result<Self, &'static str> {
         let (int_value, double_value) = match point.value {
             Some(number_data_point::Value::AsInt(value)) => (Some(value), None),
@@ -461,6 +464,7 @@ impl PointRow {
             start_time_unix_nano: checked_i64(point.start_time_unix_nano)?,
             flags: point.flags,
             attributes: encode_attributes(&point.attributes),
+            correlation: RecordCorrelation::extract(&point.attributes)?,
             int_value,
             double_value,
             exemplars: exemplar_rows(&point.exemplars)?,
@@ -474,8 +478,9 @@ impl PointRow {
     ///
     /// Returns a stable reason when the bucket and bound counts disagree, the
     /// bucket counts do not sum to the declared count, a bound is not finite or
-    /// not strictly increasing, the collection exceeds its accepted size, or an
-    /// exemplar is invalid.
+    /// not strictly increasing, the collection exceeds its accepted size, a
+    /// `wyrd.card_ref` or `wyrd.run_id` attribute is wrongly typed or
+    /// malformed, or an exemplar is invalid.
     fn histogram(point: &HistogramDataPoint) -> Result<Self, &'static str> {
         if point.bucket_counts.len() > MAX_BUCKETS {
             return Err("histogram bucket collection exceeds the accepted size");
@@ -505,6 +510,7 @@ impl PointRow {
             start_time_unix_nano: checked_i64(point.start_time_unix_nano)?,
             flags: point.flags,
             attributes: encode_attributes(&point.attributes),
+            correlation: RecordCorrelation::extract(&point.attributes)?,
             histogram_count: Some(checked_i64(point.count)?),
             histogram_sum: point.sum,
             histogram_min: point.min,
@@ -527,7 +533,9 @@ impl PointRow {
     /// # Errors
     ///
     /// Returns a stable reason when a bucket collection exceeds its accepted
-    /// size, the zero threshold is negative, or an exemplar is invalid.
+    /// size, the zero threshold is negative, a `wyrd.card_ref` or
+    /// `wyrd.run_id` attribute is wrongly typed or malformed, or an exemplar
+    /// is invalid.
     fn exponential_histogram(point: &ExponentialHistogramDataPoint) -> Result<Self, &'static str> {
         if point.zero_threshold < 0.0 {
             return Err("exponential histogram zero threshold is negative");
@@ -539,6 +547,7 @@ impl PointRow {
             start_time_unix_nano: checked_i64(point.start_time_unix_nano)?,
             flags: point.flags,
             attributes: encode_attributes(&point.attributes),
+            correlation: RecordCorrelation::extract(&point.attributes)?,
             histogram_count: Some(checked_i64(point.count)?),
             histogram_sum: point.sum,
             histogram_min: point.min,
@@ -558,7 +567,9 @@ impl PointRow {
     /// # Errors
     ///
     /// Returns a stable reason when the quantile collection exceeds its
-    /// accepted size or a quantile lies outside the closed unit interval.
+    /// accepted size, a quantile lies outside the closed unit interval, or a
+    /// `wyrd.card_ref` or `wyrd.run_id` attribute is wrongly typed or
+    /// malformed.
     fn summary(point: &SummaryDataPoint) -> Result<Self, &'static str> {
         if point.quantile_values.len() > MAX_QUANTILES {
             return Err("summary quantile collection exceeds the accepted size");
@@ -575,6 +586,7 @@ impl PointRow {
             start_time_unix_nano: checked_i64(point.start_time_unix_nano)?,
             flags: point.flags,
             attributes: encode_attributes(&point.attributes),
+            correlation: RecordCorrelation::extract(&point.attributes)?,
             summary_count: Some(checked_i64(point.count)?),
             summary_sum: Some(point.sum),
             quantile_values: Some(quantiles),
@@ -705,6 +717,8 @@ struct PointColumns {
     scope_attributes: Vec<Vec<u8>>,
     scope_dropped_attributes_count: Vec<u32>,
     scope_schema_url: Vec<String>,
+    card_ref: Vec<Option<String>>,
+    run_id: Vec<Option<String>>,
 }
 
 impl PointColumns {
@@ -732,6 +746,8 @@ impl PointColumns {
         self.start_time_unix_nano.push(row.start_time_unix_nano);
         self.flags.push(row.flags);
         self.attributes.push(row.attributes);
+        self.card_ref.push(row.correlation.card_ref);
+        self.run_id.push(row.correlation.run_id);
         self.int_value.push(row.int_value);
         self.double_value.push(row.double_value);
         self.histogram_count.push(row.histogram_count);
@@ -937,8 +953,10 @@ impl PointColumns {
             binary_column(&self.scope_attributes),
             u32_as_i64_column(self.scope_dropped_attributes_count),
             utf8_column(self.scope_schema_url),
+            utf8_opt_column(self.card_ref),
+            utf8_opt_column(self.run_id),
         ];
-        RecordBatch::try_new(canonical_metric_schema(), columns)
+        RecordBatch::try_new(projected_signal_schema(METRIC_FIELDS), columns)
             .map_err(|error| TableError::Internal(format!("canonical metric batch: {error}")))
     }
 }

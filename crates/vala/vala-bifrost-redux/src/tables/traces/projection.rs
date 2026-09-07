@@ -25,10 +25,11 @@ use crate::otlp_contract::IngestOutcome;
 use crate::tables::TableError;
 use crate::tables::fields::canonical_arrow_fields;
 use crate::tables::signal::{
-    ResourceEnvelope, ScopeEnvelope, binary_column, bool_column, checked_i64, encode_attributes,
-    fixed_binary_column, fixed_binary_opt_column, i32_column, i32_opt_column, i64_column,
-    i64_opt_column, internal, last_attribute, last_string_attribute, list_column, nested_fields,
-    span_id_bytes, struct_column, trace_id_bytes, u32_as_i64_column, utf8_column, utf8_opt_column,
+    RecordCorrelation, ResourceEnvelope, ScopeEnvelope, binary_column, bool_column, checked_i64,
+    encode_attributes, fixed_binary_column, fixed_binary_opt_column, i32_column, i32_opt_column,
+    i64_column, i64_opt_column, internal, last_attribute, last_string_attribute, list_column,
+    nested_fields, projected_signal_schema, span_id_bytes, struct_column, trace_id_bytes,
+    u32_as_i64_column, utf8_column, utf8_opt_column,
 };
 
 /// Largest accepted span or event name, in bytes.
@@ -216,6 +217,8 @@ struct SpanColumns {
     service_name: Vec<Option<String>>,
     gen_ai_strings: [Vec<Option<String>>; 4],
     gen_ai_ints: [Vec<Option<i64>>; 2],
+    card_ref: Vec<Option<String>>,
+    run_id: Vec<Option<String>>,
 }
 
 impl SpanColumns {
@@ -225,9 +228,10 @@ impl SpanColumns {
     ///
     /// Returns the stable rejection reason for an invalid identifier, an
     /// out-of-range timestamp pair, an over-long or empty name, an attribute
-    /// cardinality breach, an invalid event or link, or a `GenAI` promotion whose
-    /// source attribute carries the wrong protocol type. Nothing is appended
-    /// when an error is returned.
+    /// cardinality breach, an invalid event or link, a `GenAI` promotion whose
+    /// source attribute carries the wrong protocol type, or an optional
+    /// correlation attribute that is wrongly typed or malformed. Nothing is
+    /// appended when an error is returned.
     fn push(
         &mut self,
         span: &Span,
@@ -259,6 +263,7 @@ impl SpanColumns {
             .ok_or("span ends before it starts")?;
 
         let promotions = GenAiPromotions::extract(&span.attributes)?;
+        let correlation = RecordCorrelation::extract(&span.attributes)?;
         Self::validate_events(span)?;
         Self::validate_links(span)?;
         self.push_events(span);
@@ -313,6 +318,8 @@ impl SpanColumns {
         for (column, value) in self.gen_ai_ints.iter_mut().zip(promotions.ints) {
             column.push(value);
         }
+        self.card_ref.push(correlation.card_ref);
+        self.run_id.push(correlation.run_id);
 
         self.rows += 1;
         Ok(())
@@ -395,7 +402,9 @@ impl SpanColumns {
     /// Assemble the accepted rows into the canonical span batch.
     ///
     /// Column order comes from [`SPAN_FIELDS`], so this method and the ledger
-    /// cannot drift apart without the assembly failing.
+    /// cannot drift apart without the assembly failing. The two nullable
+    /// correlation columns follow the ledger and belong to Scribe's stamping
+    /// contract, not to the declared schema.
     ///
     /// # Errors
     ///
@@ -477,9 +486,11 @@ impl SpanColumns {
             utf8_opt_column(gen_ai_strings.next().unwrap_or_default()),
             i64_opt_column(gen_ai_ints.next().unwrap_or_default()),
             i64_opt_column(gen_ai_ints.next().unwrap_or_default()),
+            utf8_opt_column(self.card_ref),
+            utf8_opt_column(self.run_id),
         ];
 
-        RecordBatch::try_new(canonical_span_schema(), columns)
+        RecordBatch::try_new(projected_signal_schema(SPAN_FIELDS), columns)
             .map_err(|error| TableError::Internal(format!("canonical span batch: {error}")))
     }
 }

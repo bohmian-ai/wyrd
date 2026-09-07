@@ -20,9 +20,10 @@ use crate::otlp_contract::LogsOutcome;
 use crate::tables::TableError;
 use crate::tables::fields::canonical_arrow_fields;
 use crate::tables::signal::{
-    ResourceEnvelope, ScopeEnvelope, binary_column, binary_opt_column, bool_column, checked_i64,
-    encode_any_value, encode_attributes, fixed_binary_opt_column, i32_column, i64_column,
-    list_column, span_id_bytes, trace_id_bytes, u32_as_i64_column, utf8_column, utf8_opt_column,
+    RecordCorrelation, ResourceEnvelope, ScopeEnvelope, binary_column, binary_opt_column,
+    bool_column, checked_i64, encode_any_value, encode_attributes, fixed_binary_opt_column,
+    i32_column, i64_column, list_column, projected_signal_schema, span_id_bytes, trace_id_bytes,
+    u32_as_i64_column, utf8_column, utf8_opt_column,
 };
 
 /// Largest accepted severity text, in bytes.
@@ -108,6 +109,8 @@ struct LogColumns {
     scope_attributes: Vec<Vec<u8>>,
     scope_dropped_attributes_count: Vec<u32>,
     scope_schema_url: Vec<String>,
+    card_ref: Vec<Option<String>>,
+    run_id: Vec<Option<String>>,
 }
 
 impl LogColumns {
@@ -116,7 +119,8 @@ impl LogColumns {
     /// # Errors
     ///
     /// Returns the stable rejection reason for an invalid correlation
-    /// identifier, an over-long severity text or event name, or a body or
+    /// identifier, a malformed or wrong-typed `wyrd.card_ref` / `wyrd.run_id`
+    /// record attribute, an over-long severity text or event name, or a body or
     /// attribute payload beyond the configured material limits. Nothing is
     /// appended when an error is returned.
     fn push(
@@ -154,6 +158,7 @@ impl LogColumns {
         if attributes.len() > wyrd_spec::vala::logs::record::MAX_LOG_ATTRIBUTES_BYTES {
             return Err("log attributes exceed the accepted payload size");
         }
+        let correlation = RecordCorrelation::extract(&record.attributes)?;
 
         self.time_unix_nano.push(time_unix_nano);
         self.observed_time_unix_nano.push(observed_time_unix_nano);
@@ -187,11 +192,17 @@ impl LogColumns {
             .push(scope.dropped_attributes_count);
         self.scope_schema_url.push(scope.schema_url.clone());
 
+        self.card_ref.push(correlation.card_ref);
+        self.run_id.push(correlation.run_id);
+
         self.rows += 1;
         Ok(())
     }
 
-    /// Assemble the accepted rows into the canonical log batch.
+    /// Assemble the accepted rows into the projected log batch.
+    ///
+    /// The batch carries the canonical ledger columns plus the two nullable
+    /// `card_ref` and `run_id` correlation columns Scribe consumes.
     ///
     /// # Errors
     ///
@@ -226,8 +237,10 @@ impl LogColumns {
             binary_column(&self.scope_attributes),
             u32_as_i64_column(self.scope_dropped_attributes_count),
             utf8_column(self.scope_schema_url),
+            utf8_opt_column(self.card_ref),
+            utf8_opt_column(self.run_id),
         ];
-        RecordBatch::try_new(canonical_log_schema(), columns)
+        RecordBatch::try_new(projected_signal_schema(LOG_FIELDS), columns)
             .map_err(|error| TableError::Internal(format!("canonical log batch: {error}")))
     }
 }

@@ -9,8 +9,8 @@ pub use projection::{canonical_metric_schema, project_resource_metrics, validate
 #[cfg(test)]
 mod tests {
     use arrow::array::{
-        Array, BooleanArray, Float64Array, Int32Array, Int64Array, ListArray, StringArray,
-        StructArray,
+        Array, BinaryArray, BooleanArray, Float64Array, Int32Array, Int64Array, ListArray,
+        StringArray, StructArray,
     };
     use arrow::record_batch::RecordBatch;
     use std::sync::Arc;
@@ -25,6 +25,7 @@ mod tests {
 
     use super::points::METRIC_FIELDS;
     use super::{project_resource_metrics, validate_metric_points};
+    use crate::tables::signal::{encode_attributes, without_correlation_columns};
 
     /// The double whose exact bits must survive projection unchanged.
     const SIGNALLING_NAN: u64 = 0x7ff8_0000_0000_0001;
@@ -219,7 +220,11 @@ mod tests {
         assert_eq!(outcome.rejected_points, 0);
         assert!(outcome.rejection_message.is_none());
         assert_eq!(batch.num_rows(), 5);
-        assert_eq!(batch.num_columns(), METRIC_FIELDS.len());
+        assert_eq!(
+            batch.num_columns(),
+            METRIC_FIELDS.len() + 2,
+            "the ledger columns plus the two appended correlation columns"
+        );
 
         let kinds = typed::<StringArray>(&batch, "metric_type");
         assert_eq!(kinds.value(0), "gauge");
@@ -294,7 +299,9 @@ mod tests {
         assert_eq!(exemplars.value_length(0), 1);
         assert_eq!(exemplars.value_length(2), 0);
 
-        validate_metric_points(&batch).expect("the projected batch validates its own kind shapes");
+        let ledger = without_correlation_columns(&batch)
+            .expect("the appended correlation columns split off cleanly");
+        validate_metric_points(&ledger).expect("the projected batch validates its own kind shapes");
     }
 
     /// Inconsistent point shapes are rejected one record at a time.
@@ -397,5 +404,104 @@ mod tests {
             validate_metric_points(&foreign).is_err(),
             "a gauge row may not populate a summary column"
         );
+    }
+
+    /// Optional Card correlation is read from the final point attribute only,
+    /// rejects exactly its own point, and never disturbs the lossless payload.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a missing value is not null, a final duplicate does not win,
+    /// a wrongly typed or malformed value rejects more than its own point, an
+    /// original attribute entry changes, or the outcome counts and first reason
+    /// are not exact.
+    #[test]
+    fn optional_card_correlation_is_atomic_and_lossless() {
+        const CARD: &str = "prod/Service/checkout@1.0.0";
+        const RUN: &str = "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b11";
+
+        let base = || vec![attribute("k", Value::IntValue(1))];
+        let missing = base();
+        let mut valid = base();
+        valid.push(attribute(
+            "wyrd.card_ref",
+            Value::StringValue(CARD.to_owned()),
+        ));
+        valid.push(attribute("wyrd.run_id", Value::StringValue(RUN.to_owned())));
+        let mut duplicate = base();
+        duplicate.push(attribute(
+            "wyrd.card_ref",
+            Value::StringValue("prod/Service/superseded@9.9.9".to_owned()),
+        ));
+        duplicate.push(attribute(
+            "wyrd.card_ref",
+            Value::StringValue(CARD.to_owned()),
+        ));
+        let mut wrong_typed = base();
+        wrong_typed.push(attribute("wyrd.run_id", Value::IntValue(7)));
+        let mut malformed = base();
+        malformed.push(attribute(
+            "wyrd.card_ref",
+            Value::StringValue("not-a-card-ref".to_owned()),
+        ));
+
+        let sets = vec![
+            missing.clone(),
+            valid.clone(),
+            duplicate.clone(),
+            wrong_typed,
+            malformed,
+        ];
+        let requested = request(vec![metric(
+            "gauge.correlated",
+            metric::Data::Gauge(Gauge {
+                data_points: sets
+                    .into_iter()
+                    .map(|attributes| NumberDataPoint {
+                        attributes,
+                        ..number_point(number_data_point::Value::AsInt(1))
+                    })
+                    .collect(),
+            }),
+        )]);
+        let (batch, outcome) = project_resource_metrics(&requested).expect("projection completes");
+
+        assert_eq!(outcome.accepted_points, 3);
+        assert_eq!(outcome.rejected_points, 2);
+        assert_eq!(
+            outcome.rejection_message.as_deref(),
+            Some("wyrd.run_id is not a valid run correlation"),
+            "the first rejection in traversal order is reported"
+        );
+        assert_eq!(
+            batch.num_rows(),
+            3,
+            "only the two defective points are lost"
+        );
+
+        let card_refs = typed::<StringArray>(&batch, "card_ref");
+        assert!(
+            card_refs.is_null(0),
+            "a missing wyrd.card_ref projects null"
+        );
+        assert_eq!(card_refs.value(1), CARD);
+        assert_eq!(
+            card_refs.value(2),
+            CARD,
+            "the final duplicate is authoritative"
+        );
+        let run_ids = typed::<StringArray>(&batch, "run_id");
+        assert!(run_ids.is_null(0), "a missing wyrd.run_id projects null");
+        assert_eq!(run_ids.value(1), RUN);
+        assert!(run_ids.is_null(2));
+
+        let attributes = typed::<BinaryArray>(&batch, "attributes");
+        for (row, source) in [missing, valid, duplicate].iter().enumerate() {
+            assert_eq!(
+                attributes.value(row),
+                encode_attributes(source).as_slice(),
+                "row {row} retains every ordered source attribute byte for byte"
+            );
+        }
     }
 }

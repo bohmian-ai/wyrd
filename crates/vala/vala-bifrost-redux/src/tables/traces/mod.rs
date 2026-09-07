@@ -28,7 +28,9 @@ mod tests {
     use super::spans::SPAN_FIELDS;
     use super::{canonical_span_schema, project_resource_spans};
     use crate::tables::fields::{PARQUET_FIELD_ID, WYRD_SENSITIVE};
-    use crate::tables::signal::{encode_attributes, validate_canonical_user_batch};
+    use crate::tables::signal::{
+        encode_attributes, validate_canonical_user_batch, without_correlation_columns,
+    };
 
     /// Build one attribute entry with the supplied protocol value.
     fn attribute(key: &str, value: Value) -> KeyValue {
@@ -270,11 +272,20 @@ mod tests {
             );
         }
 
-        let permuted = permute(&batch);
+        let card_refs = typed::<StringArray>(&batch, "card_ref");
+        let run_ids = typed::<StringArray>(&batch, "run_id");
+        assert!(
+            card_refs.is_null(0) && run_ids.is_null(0),
+            "a span with no correlation attributes projects null correlation"
+        );
+
+        let ledger = without_correlation_columns(&batch)
+            .expect("the appended correlation columns split off cleanly");
+        let permuted = permute(&ledger);
         let revalidated =
             validate_canonical_user_batch(SPAN_FIELDS, &permuted).expect("names bind, not indexes");
         assert_eq!(revalidated.schema(), canonical_span_schema());
-        assert_eq!(revalidated, batch);
+        assert_eq!(revalidated, ledger);
     }
 
     /// Assert the nested event and link collections survive intact.
@@ -413,6 +424,107 @@ mod tests {
         columns.reverse();
         RecordBatch::try_new(Arc::new(arrow::datatypes::Schema::new(fields)), columns)
             .expect("a reversed batch still assembles")
+    }
+
+    /// Build one request whose spans differ only in their attribute collections.
+    ///
+    /// Every other span field is copied from the maximal fixture, so a test can
+    /// vary correlation attributes alone and still exercise a complete span.
+    fn spans_with_attribute_sets(sets: Vec<Vec<KeyValue>>) -> Vec<ResourceSpans> {
+        let mut request = maximal_resource_spans(Vec::new());
+        let template = request[0].scope_spans[0].spans[0].clone();
+        request[0].scope_spans[0].spans = sets
+            .into_iter()
+            .enumerate()
+            .map(|(index, attributes)| Span {
+                span_id: vec![u8::try_from(index + 1).expect("fixture index is small"); 8],
+                attributes,
+                ..template.clone()
+            })
+            .collect();
+        request
+    }
+
+    /// Optional Card correlation is read from the final record attribute only,
+    /// rejects exactly its own record, and never disturbs the lossless payload.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a missing value is not null, a final duplicate does not win,
+    /// a wrongly typed or malformed value rejects more than its own span, an
+    /// original attribute entry changes, or the outcome counts and first reason
+    /// are not exact.
+    #[test]
+    fn optional_card_correlation_is_atomic_and_lossless() {
+        const CARD: &str = "prod/Service/checkout@1.0.0";
+        const RUN: &str = "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b11";
+
+        let missing = maximal_span_attributes();
+        let mut valid = maximal_span_attributes();
+        valid.push(attribute(
+            "wyrd.card_ref",
+            Value::StringValue(CARD.to_owned()),
+        ));
+        valid.push(attribute("wyrd.run_id", Value::StringValue(RUN.to_owned())));
+        let mut duplicate = maximal_span_attributes();
+        duplicate.push(attribute(
+            "wyrd.card_ref",
+            Value::StringValue("prod/Service/superseded@9.9.9".to_owned()),
+        ));
+        duplicate.push(attribute(
+            "wyrd.card_ref",
+            Value::StringValue(CARD.to_owned()),
+        ));
+        let mut wrong_typed = maximal_span_attributes();
+        wrong_typed.push(attribute("wyrd.run_id", Value::IntValue(7)));
+        let mut malformed = maximal_span_attributes();
+        malformed.push(attribute(
+            "wyrd.card_ref",
+            Value::StringValue("not-a-card-ref".to_owned()),
+        ));
+
+        let request = spans_with_attribute_sets(vec![
+            missing.clone(),
+            valid.clone(),
+            duplicate.clone(),
+            wrong_typed,
+            malformed,
+        ]);
+        let (batch, outcome) = project_resource_spans(&request).expect("projection completes");
+
+        assert_eq!(outcome.accepted_spans, 3);
+        assert_eq!(outcome.rejected_spans, 2);
+        assert_eq!(
+            outcome.rejection_message.as_deref(),
+            Some("wyrd.run_id is not a valid run correlation"),
+            "the first rejection in traversal order is reported"
+        );
+        assert_eq!(batch.num_rows(), 3, "only the two defective spans are lost");
+
+        let card_refs = typed::<StringArray>(&batch, "card_ref");
+        assert!(
+            card_refs.is_null(0),
+            "a missing wyrd.card_ref projects null"
+        );
+        assert_eq!(card_refs.value(1), CARD);
+        assert_eq!(
+            card_refs.value(2),
+            CARD,
+            "the final duplicate is authoritative"
+        );
+        let run_ids = typed::<StringArray>(&batch, "run_id");
+        assert!(run_ids.is_null(0), "a missing wyrd.run_id projects null");
+        assert_eq!(run_ids.value(1), RUN);
+        assert!(run_ids.is_null(2));
+
+        let attributes = typed::<BinaryArray>(&batch, "attributes");
+        for (row, source) in [missing, valid, duplicate].iter().enumerate() {
+            assert_eq!(
+                attributes.value(row),
+                encode_attributes(source).as_slice(),
+                "row {row} retains every ordered source attribute byte for byte"
+            );
+        }
     }
 
     /// A wrongly typed pinned `GenAI` attribute rejects its whole span.

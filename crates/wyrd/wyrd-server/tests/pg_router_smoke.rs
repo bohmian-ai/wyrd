@@ -1266,7 +1266,7 @@ async fn forge_begin_shutdown_closes_readiness_before_cancellation() {
     let worker_ready = forge.worker_readiness();
 
     let stop = server.state().shutdown_token.child_token();
-    let worker = wyrd_server::boot::spawn_forge_worker(server.state(), stop.clone(), 1, 1)
+    let worker = wyrd_server::boot::spawn_forge_worker(server.state(), stop.clone())
         .expect("the worker composes");
     let worker_handle = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(worker));
     let scheduler = wyrd_server::boot::spawn_maintenance_scheduler(server.state(), stop.clone())
@@ -1368,7 +1368,7 @@ async fn forge_worker_refuses_staging_without_native_cursor_listing() {
         .worker_readiness();
 
     let stop = server.state().shutdown_token.child_token();
-    let worker = wyrd_server::boot::spawn_forge_worker(server.state(), stop.clone(), 1, 1)
+    let worker = wyrd_server::boot::spawn_forge_worker(server.state(), stop.clone())
         .expect("the worker composes");
     let error = worker
         .await
@@ -1407,7 +1407,7 @@ async fn forge_worker_readiness_gates_on_recovery() {
     );
 
     let stop = server.state().shutdown_token.child_token();
-    let worker = wyrd_server::boot::spawn_forge_worker(server.state(), stop.clone(), 1, 1)
+    let worker = wyrd_server::boot::spawn_forge_worker(server.state(), stop.clone())
         .expect("the worker composes");
     let handle = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(worker));
 
@@ -1679,7 +1679,7 @@ async fn run_forge_worker_once(
     server: &WyrdTestServer,
 ) -> Result<(), vala_bifrost_redux::forge::ForgeError> {
     let stop = server.state().shutdown_token.child_token();
-    let worker = wyrd_server::boot::spawn_forge_worker(server.state(), stop.clone(), 1, 1)
+    let worker = wyrd_server::boot::spawn_forge_worker(server.state(), stop.clone())
         .expect("the worker composes");
     let mut handle = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(worker));
     let outcome = tokio::time::timeout(FORGE_READINESS_CEILING, &mut handle).await;
@@ -1767,7 +1767,7 @@ async fn worker_recovery_failure_never_publishes_ready() {
 #[cfg(feature = "test-support")]
 async fn await_forge_role_while_running(server: &WyrdTestServer, label: &str) {
     let stop = server.state().shutdown_token.child_token();
-    let worker = wyrd_server::boot::spawn_forge_worker(server.state(), stop.clone(), 1, 1)
+    let worker = wyrd_server::boot::spawn_forge_worker(server.state(), stop.clone())
         .expect("the worker composes");
     let handle = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(worker));
     await_forge_role(
@@ -2105,7 +2105,7 @@ async fn run_worker_over_invalid_prepared_evidence(
         observer.fail_next_lease_release();
     }
     let stop = server.state().shutdown_token.child_token();
-    let worker = wyrd_server::boot::spawn_forge_worker(server.state(), stop.clone(), 1, 1)
+    let worker = wyrd_server::boot::spawn_forge_worker(server.state(), stop.clone())
         .expect("the worker composes");
     let error = tokio::time::timeout(FORGE_READINESS_CEILING, worker)
         .await
@@ -2249,7 +2249,7 @@ async fn cancellation_release_failure_closes_readiness() {
     observer.fail_next_cancelled_claim_release();
 
     let stop = server.state().shutdown_token.child_token();
-    let worker = wyrd_server::boot::spawn_forge_worker(server.state(), stop.clone(), 1, 1)
+    let worker = wyrd_server::boot::spawn_forge_worker(server.state(), stop.clone())
         .expect("the worker composes");
     let handle = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(worker));
     if tokio::time::timeout(FORGE_READINESS_CEILING, observer.wait_for_claims_for_test())
@@ -2427,7 +2427,7 @@ async fn durably_settled_claims_keep_readiness() {
         .await;
 
         let stop = server.state().shutdown_token.child_token();
-        let worker = wyrd_server::boot::spawn_forge_worker(server.state(), stop.clone(), 1, 1)
+        let worker = wyrd_server::boot::spawn_forge_worker(server.state(), stop.clone())
             .expect("the worker composes");
         let handle = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(worker));
         await_forge_role(
@@ -2667,7 +2667,7 @@ async fn transient_execution_failure_retries_and_keeps_readiness() {
     .await;
 
     let stop = server.state().shutdown_token.child_token();
-    let worker = wyrd_server::boot::spawn_forge_worker(server.state(), stop.clone(), 1, 1)
+    let worker = wyrd_server::boot::spawn_forge_worker(server.state(), stop.clone())
         .expect("the worker composes");
     let handle = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(worker));
     await_forge_role(
@@ -2781,12 +2781,15 @@ async fn live_foreign_claim_does_not_block_readiness() {
 ///
 /// The settlement itself already committed, so the release failure is the only
 /// unsafe part: the fence is still held by an owner that is no longer running
-/// it. Readiness must clear before any sibling can claim behind that fence.
+/// it. Readiness must clear before anything can claim behind that fence, and
+/// the stopping worker must take no further work of its own — newly eligible
+/// demand has to wait for a successor.
 ///
 /// # Panics
 ///
-/// Panics when the release failure is swallowed, readiness survives it, or the
-/// respawned worker does not recover.
+/// Panics when the release failure is swallowed, readiness survives it, the
+/// stopping worker claims newly eligible work, or the respawned worker does not
+/// recover.
 #[cfg(feature = "test-support")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn release_failure_clears_readiness() {
@@ -2796,10 +2799,9 @@ async fn release_failure_clears_readiness() {
     let observer = vala_bifrost_redux::forge::ForgeWorkerCompletionObserver::new();
     let server = WyrdTestServer::builder()
         .with_forge_completion_observer_for_test(observer.clone())
-        .with_forge_worker_concurrency_for_test(2)
         .start_in_process()
         .await
-        .expect("two-slot server starts");
+        .expect("the test server starts");
     let readiness = server
         .state()
         .forge()
@@ -2812,7 +2814,7 @@ async fn release_failure_clears_readiness() {
         .expect("superuser pool");
 
     let stop = server.state().shutdown_token.child_token();
-    let worker = wyrd_server::boot::spawn_forge_worker(server.state(), stop.clone(), 2, 2)
+    let worker = wyrd_server::boot::spawn_forge_worker(server.state(), stop.clone())
         .expect("the worker composes");
     let mut handle = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(worker));
     // The fault is a one-shot, so it is armed only after the recovery drain has
@@ -2825,7 +2827,6 @@ async fn release_failure_clears_readiness() {
         "worker before its release fault is armed",
     )
     .await;
-    observer.hold_before_next_lease_release_for_test();
     observer.hold_before_fatal_observation_for_test();
     observer.fail_next_lease_release();
 
@@ -2841,33 +2842,6 @@ async fn release_failure_clears_readiness() {
     )
     .await;
 
-    let setup = tokio::time::timeout(FORGE_READINESS_CEILING, async {
-        observer.wait_for_held_lease_release_for_test().await;
-        observer.hold_after_claims_for_test(1);
-        let parked = seed_ready_forge_task(
-            &pool,
-            uuid::Uuid::from(server.data_tenant_id()),
-            "parked_release_sibling",
-            "small_files",
-            LIVE_REWRITE_PLAN,
-        )
-        .await;
-        observer.wait_for_claims_for_test().await;
-        observer.release_held_lease_release_for_test();
-        parked
-    })
-    .await;
-    let parked = if let Ok(parked) = setup {
-        parked
-    } else {
-        stop.cancel();
-        handle.abort();
-        panic!(
-            "release/sibling setup timeout: ready={}, attempts={}",
-            readiness.is_ready(),
-            observer.attempts()
-        );
-    };
     if tokio::time::timeout(
         FORGE_READINESS_CEILING,
         observer.wait_for_fatal_observation_for_test(),
@@ -2891,10 +2865,13 @@ async fn release_failure_clears_readiness() {
         !readiness.is_ready(),
         "known fatal release must close readiness before telemetry"
     );
-    let sibling = seed_ready_forge_task(
+
+    // Demand that becomes eligible while the worker is stopping belongs to a
+    // successor, not to the owner that is on its way out.
+    let successor_work = seed_ready_forge_task(
         &pool,
         uuid::Uuid::from(server.data_tenant_id()),
-        "release_sibling",
+        "release_successor_work",
         "small_files",
         LIVE_REWRITE_PLAN,
     )
@@ -2902,32 +2879,14 @@ async fn release_failure_clears_readiness() {
     let before: (String, i32, Option<uuid::Uuid>) = sqlx::query_as(
         "SELECT state,attempt_count,attempt_id FROM vala.forge_tasks WHERE task_id=$1",
     )
-    .bind(sibling)
+    .bind(successor_work)
     .fetch_one(&pool)
     .await
-    .expect("parked sibling row");
+    .expect("newly eligible row");
     assert_eq!(before.0, "ready");
-    assert_eq!(before.1, 0, "parked claim has not executed an attempt");
+    assert_eq!(before.1, 0, "the new task has not executed an attempt");
     assert!(before.2.is_none());
-    observer.release_claims_for_test();
-    if tokio::time::timeout(
-        FORGE_READINESS_CEILING,
-        observer.wait_for_joined_slots_for_test(1),
-    )
-    .await
-    .is_err()
-    {
-        stop.cancel();
-        handle.abort();
-        panic!(
-            "cancelled sibling did not join: ready={}, new demand={before:?}",
-            readiness.is_ready()
-        );
-    }
-    assert!(
-        !handle.is_finished(),
-        "primary observation must not be aborted"
-    );
+
     observer.release_fatal_observation_for_test();
     let joined = tokio::time::timeout(FORGE_READINESS_CEILING, &mut handle).await;
     stop.cancel();
@@ -2938,7 +2897,7 @@ async fn release_failure_clears_readiness() {
         Err(_) => {
             handle.abort();
             panic!(
-                "faulted worker did not return; last sibling={before:?}, ready={}, attempts={}",
+                "faulted worker did not return; new demand={before:?}, ready={}, attempts={}",
                 readiness.is_ready(),
                 observer.attempts()
             )
@@ -2953,24 +2912,19 @@ async fn release_failure_clears_readiness() {
         "a worker still holding an unreleased table fence advertised ready"
     );
     let rendered = metrics.render();
-    for family in [
-        "bifrost_forge_task_attempts_total",
-        "bifrost_forge_task_duration_seconds_count",
-    ] {
-        let sample = rendered
-            .lines()
-            .find(|line| {
-                line.starts_with(family)
-                    && line.contains("task_type=\"small_files\"")
-                    && line.contains("result=\"retry\"")
-            })
-            .expect("both durable Retryable ownership episodes are observed");
-        assert_eq!(
-            sample.rsplit_once(' ').expect("Prometheus sample").1,
-            "2",
-            "{sample}"
-        );
-    }
+    let sample = rendered
+        .lines()
+        .find(|line| {
+            line.starts_with("bifrost_forge_task_attempts_total")
+                && line.contains("task_type=\"small_files\"")
+                && line.contains("result=\"retry\"")
+        })
+        .expect("the durable Retryable ownership episode is observed");
+    assert_eq!(
+        sample.rsplit_once(' ').expect("Prometheus sample").1,
+        "1",
+        "{sample}"
+    );
     let active = rendered
         .lines()
         .find(|line| {
@@ -2995,24 +2949,22 @@ async fn release_failure_clears_readiness() {
     let after: (String, i32, Option<uuid::Uuid>) = sqlx::query_as(
         "SELECT state,attempt_count,attempt_id FROM vala.forge_tasks WHERE task_id=$1",
     )
-    .bind(sibling)
+    .bind(successor_work)
     .fetch_one(&pool)
     .await
-    .expect("sibling after worker joins");
+    .expect("newly eligible row after the worker joins");
     assert_eq!(
         after, before,
-        "the aborted sibling must not execute or claim again"
+        "the stopping worker must not execute or claim newly eligible work"
     );
-    let sibling_claims = observer.lifecycle_events().iter().filter(|event| matches!(event,
-        vala_bifrost_redux::forge::ForgeLifecycleEvent::Claimed { task_id, .. } if *task_id == sibling
+    let successor_claims = observer.lifecycle_events().iter().filter(|event| matches!(event,
+        vala_bifrost_redux::forge::ForgeLifecycleEvent::Claimed { task_id, .. } if *task_id == successor_work
     )).count();
     assert_eq!(
-        sibling_claims, 0,
-        "newly eligible work must receive no sibling claim"
+        successor_claims, 0,
+        "newly eligible work must receive no claim from the stopping worker"
     );
-    eprintln!("after worker join: sibling={after:?}; no later claim or attempt");
-    sqlx::query("UPDATE vala.forge_tasks SET claim_expires_at=statement_timestamp()-interval '1 second' WHERE task_id=$1 AND state='claimed'")
-        .bind(parked).execute(&pool).await.expect("recover any supervisor-aborted parked claim");
+    eprintln!("after worker join: new demand={after:?}; no later claim or attempt");
     await_forge_role_while_running(&server, "worker after its release recovers").await;
     server.shutdown().await.expect("test server shuts down");
 }

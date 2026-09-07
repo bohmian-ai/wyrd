@@ -203,6 +203,67 @@ impl Drop for ScribeCoordinationRuntime {
     }
 }
 
+/// Sole owner of the dedicated Tokio runtime that hosts Forge compaction runners.
+///
+/// Only admitted compaction plan runners execute here. Everything else the
+/// Forge worker does — durable claims, maintenance strategies, reconciliation,
+/// settlement — stays on the ambient server runtime, so a saturated rewrite
+/// cannot starve the loop that would otherwise settle it.
+///
+/// Ownership follows [`ScribeCoordinationRuntime`] exactly and for the same
+/// reason: consumers hold a [`tokio::runtime::Handle`], this owner holds the
+/// only [`Runtime`], it is deliberately **not** `Clone`, and it is never stored
+/// on a per-request-cloned graph whose last surviving clone would run blocking
+/// [`Runtime::drop`] glue on an async frame.
+///
+/// [`Runtime`]: tokio::runtime::Runtime
+/// [`Runtime::drop`]: tokio::runtime::Runtime
+pub struct ForgeCompactionRuntime {
+    /// The dedicated executor, present only when this process selected the
+    /// Forge worker role.
+    runtime: Option<tokio::runtime::Runtime>,
+}
+
+impl ForgeCompactionRuntime {
+    /// Takes sole ownership of a composed compaction runtime.
+    ///
+    /// `runtime` is `None` for every process that did not select the Forge
+    /// worker role; those targets never build a dedicated executor and their
+    /// owner is an inert value whose drop does nothing.
+    pub(crate) const fn new(runtime: Option<tokio::runtime::Runtime>) -> Self {
+        Self { runtime }
+    }
+
+    /// Returns the handle admitted compaction runners are spawned on.
+    ///
+    /// `None` for a process without the Forge worker role, which never spawns a
+    /// runner in the first place.
+    pub(crate) fn handle(&self) -> Option<tokio::runtime::Handle> {
+        self.runtime
+            .as_ref()
+            .map(|runtime| runtime.handle().clone())
+    }
+}
+
+impl Drop for ForgeCompactionRuntime {
+    /// Releases the compaction runtime without blocking the dropping thread.
+    ///
+    /// [`tokio::runtime::Runtime::shutdown_background`] detaches the worker
+    /// threads rather than joining them, so it is legal from the async frame
+    /// that `async fn main` forces on the final drop of the composed server.
+    /// Because it does not wait, drop ordering is load-bearing: this owner must
+    /// outlive Forge worker supervision, otherwise a runner that has already
+    /// written output objects and is about to Prepare its operation is
+    /// abandoned mid-flight and leaves durable ambiguity behind. Both
+    /// production (`app::run` drops it after the supervised worker returns) and
+    /// the test harness satisfy that ordering.
+    fn drop(&mut self) {
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_background();
+        }
+    }
+}
+
 /// One composed Bifrost graph paired with the coordination runtime that hosts it.
 ///
 /// `compose_bifrost` produces two values with different ownership rules: the
@@ -215,6 +276,8 @@ pub struct ComposedBifrost {
     pub bifrost: Arc<Bifrost>,
     /// Sole owner of the executor backing the composed Scribe role.
     pub coordination_runtime: ScribeCoordinationRuntime,
+    /// Sole owner of the executor backing admitted Forge compaction runners.
+    pub compaction_runtime: ForgeCompactionRuntime,
 }
 
 /// Existing concrete production controls injected by server journeys.

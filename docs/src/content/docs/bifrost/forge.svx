@@ -232,7 +232,7 @@ two planning gauges and the expired-snapshot counter:
 | `retry` | The attempt failed and the task is eligible for another attempt. |
 | `failed` | The attempt failed terminally and will not be retried. |
 | `cancelled` | The attempt was superseded or cancelled before any durable effect. |
-| `refused` | Local admission or the execution envelope declined the attempt. |
+| `refused` | The worker's local compaction queue declined every plan of the attempt. |
 | `uncertain` | Work was externally accepted and Prepared evidence is retained for recovery. |
 
 `reason` names the durable failure class of a retry, refusal, or terminal
@@ -243,8 +243,8 @@ failure:
 | `data_refusal` | The source data is deterministically unusable. |
 | `transient_object_store` | Object storage or the catalog transport failed and may succeed later. |
 | `transient_coordination` | SQL, lease, fence, or reconciliation failed and may succeed later. |
-| `storage_health` | The local scratch volume is unhealthy. |
-| `capacity_refused` | Admission or the execution envelope refused the attempt. |
+| `storage_health` | Local durable storage the attempt depends on is unhealthy. |
+| `capacity_refused` | The compaction queue refused every plan for waiting-parallelism capacity or per-plan size. |
 | `internal_invariant` | An internal invariant failed; this is a defect, not a condition. |
 
 ### The seventeen families
@@ -352,7 +352,7 @@ The implementation follows the lifecycle described above:
 | `forge/scheduler.rs` | Supervised scheduler loop, tick cadence, hint intake, and shutdown. |
 | `forge/planning_scheduler.rs` | Discovery, demand arbitration, and durable task enqueue. |
 | `forge/worker.rs` | Claim, fenced dispatch, settlement, and recovery reconciliation. |
-| `forge/planner.rs` | Candidate selection and rewrite envelope sizing. |
+| `forge/planner.rs` | Candidate selection and durable task identity. |
 | `forge/metrics.rs` | The sole Forge metric owner and its closed label schema. |
 | `forge/compact.rs` | Candidate selection, staged-file validation, Iceberg compaction, audit transitions, and reconciliation. |
 | `forge/expire.rs` | Snapshot selection, expiry commit, and expiry recovery. |

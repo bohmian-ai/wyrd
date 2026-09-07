@@ -1919,12 +1919,7 @@ mod tests {
         let scribe_stage = directory.path().join("scribe-stage");
         let scribe_scratch = directory.path().join("scribe-scratch");
         let oracle_scratch = directory.path().join("oracle-scratch");
-        for path in [
-            &wal_root,
-            &scribe_stage,
-            &scribe_scratch,
-            &oracle_scratch,
-        ] {
+        for path in [&wal_root, &scribe_stage, &scribe_scratch, &oracle_scratch] {
             std::fs::create_dir(path).expect("registered volume root");
         }
         let roots = BifrostVolumeRoots {

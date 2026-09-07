@@ -1488,10 +1488,7 @@ impl ForgeTaskState {
     /// Reports whether this state is terminal and eligible for retention pruning.
     #[must_use]
     pub fn is_terminal(self) -> bool {
-        matches!(
-            self,
-            Self::Succeeded | Self::Failed | Self::Cancelled
-        )
+        matches!(self, Self::Succeeded | Self::Failed | Self::Cancelled)
     }
 }
 impl FromStr for ForgeTaskState {

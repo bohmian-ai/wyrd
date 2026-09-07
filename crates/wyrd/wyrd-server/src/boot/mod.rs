@@ -62,7 +62,8 @@ use crate::oracle::{
 };
 use crate::postgres::ServerPostgres;
 use crate::state::{
-    AppState, Forge, Oracle, ProductionValidationError, Scribe, ScribeCoordinationRuntime,
+    AppState, Forge, ForgeCompactionRuntime, Oracle, ProductionValidationError, Scribe,
+    ScribeCoordinationRuntime,
 };
 
 const DEFAULT_MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
@@ -491,7 +492,9 @@ async fn build_bifrost_external_dependencies(
             scratch_limit_bytes: config.resources.scratch_limit_bytes,
             effective_cpu: config.resources.effective_cpu,
             oracle_query_slot_limit: config.resources.oracle_query_slot_limit,
-            forge_compaction_memory_limit_bytes: None,
+            forge_compaction_memory_limit_bytes: config
+                .resources
+                .forge_compaction_memory_limit_bytes,
             scratch_root: oracle_scratch.clone(),
             volume_roots: Some(vala_bifrost_redux::resources::BifrostVolumeRoots {
                 wal: wal_dir.clone(),
@@ -620,6 +623,9 @@ pub async fn compose_bifrost(
     // same non-blocking path, instead of running blocking `Runtime` drop glue on
     // this async frame.
     let mut coordination_runtime = ScribeCoordinationRuntime::new(None);
+    // Same ownership rule as the coordination runtime above: declared here so an
+    // early error from any later stage releases the executor without blocking.
+    let mut compaction_runtime = ForgeCompactionRuntime::new(None);
     let scribe = if roles.contains(&BifrostRuntimeRole::Scribe) {
         let scribe_role = cluster_registry
             .reserve_scribe(
@@ -913,21 +919,42 @@ pub async fn compose_bifrost(
                 .map(|controls| controls.forge_scheduler_trigger.clone()),
             telemetry: Arc::new(ForgeTelemetry::new()),
         })?);
-        let worker = roles
-            .contains(&BifrostRuntimeRole::ForgeWorker)
-            .then(|| {
+        // Only the Forge worker role runs admitted compaction plans, so only it
+        // builds the dedicated executor. Its thread count is the resolved
+        // effective CPU the same plan derived the memory budget from, rather
+        // than a second CPU knob that could disagree with it.
+        let worker = if roles.contains(&BifrostRuntimeRole::ForgeWorker) {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(resource_plan.effective_cpu)
+                .thread_name_fn(|| {
+                    static THREAD_INDEX: std::sync::atomic::AtomicUsize =
+                        std::sync::atomic::AtomicUsize::new(0);
+                    format!(
+                        "wyrd-forge-compaction-{}",
+                        THREAD_INDEX.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    )
+                })
+                .enable_all()
+                .build()
+                .map_err(|error| {
+                    ServerBootError::Forge(vala_bifrost_redux::forge::ForgeError::InvalidConfig {
+                        detail: format!("Forge compaction runtime failed: {error}"),
+                    })
+                })?;
+            let handle = runtime.handle().clone();
+            compaction_runtime = ForgeCompactionRuntime::new(Some(runtime));
+            Some(Arc::new(
                 ForgeWorker::new(
                     Arc::clone(&coordinator),
-                    ForgeWorkerConfig {
-                        worker_concurrency: forge_runtime.worker_concurrency,
-                        per_tenant_active_cap: forge_runtime.resolved_per_tenant_active_cap(),
-                    },
+                    forge_compaction_worker_config(&resource_plan, &forge_runtime),
                     node_id.as_uuid(),
                 )
-                .map(Arc::new)
-            })
-            .transpose()
-            .map_err(ServerBootError::Forge)?;
+                .map_err(ServerBootError::Forge)?
+                .on_compaction_runtime(handle),
+            ))
+        } else {
+            None
+        };
         Some(Arc::new(Forge::new(
             roles
                 .contains(&BifrostRuntimeRole::ForgeCoordinator)
@@ -1085,15 +1112,42 @@ pub async fn compose_bifrost(
             resources: Some(bifrost_resources.clone()),
         }),
         coordination_runtime,
+        compaction_runtime,
     })
+}
+
+/// Derives one Forge worker's local compaction-admission bounds.
+///
+/// Every bound comes from values the immutable [`ResourcePlan`] already
+/// resolved, so a node cannot admit compaction work its own resource plan did
+/// not reserve. The memory budget is the plan's selected Forge budget verbatim.
+/// Running parallelism is three units per effective CPU, matching upstream's
+/// task multiplier over its detected worker threads, and waiting parallelism is
+/// four times that, so a burst of planned work queues rather than being refused
+/// while earlier plans still run. Tenant fairness is unrelated to either and
+/// stays with the SQL fair claim.
+///
+/// [`ResourcePlan`]: vala_bifrost_redux::resources::ResourcePlan
+fn forge_compaction_worker_config(
+    plan: &vala_bifrost_redux::resources::ResourcePlan,
+    forge_runtime: &crate::config::ForgeRuntimeConfig,
+) -> ForgeWorkerConfig {
+    let max_task_parallelism = u32::try_from(plan.effective_cpu.saturating_mul(3))
+        .unwrap_or(u32::MAX)
+        .max(1);
+    ForgeWorkerConfig {
+        per_tenant_active_cap: forge_runtime.resolved_per_tenant_active_cap(),
+        compaction_memory_budget_bytes: plan.forge_compaction_memory_limit_bytes,
+        max_task_parallelism,
+        pending_task_parallelism: max_task_parallelism.saturating_mul(4),
+    }
 }
 
 /// Build the bounded Forge worker future shared by embedded and worker roles.
 ///
-/// `worker_concurrency` sizes the executor pool; `per_tenant_active_cap` is the
-/// resolved per-tenant admission bound (see
-/// [`crate::config::ForgeRuntimeConfig::resolved_per_tenant_active_cap`]).
-/// Passing them separately keeps tenant fairness decoupled from parallelism.
+/// The bounded worker's local compaction parallelism comes from its own
+/// admission queue, sized once at composition from the immutable resource plan.
+/// This entry point only supervises the resulting single event loop.
 ///
 /// # Errors
 /// Returns [`ServerBootError::ForgeSchedulerRequired`] when Forge is absent or
@@ -1102,8 +1156,6 @@ pub async fn compose_bifrost(
 pub fn spawn_forge_worker(
     state: &AppState,
     shutdown: CancellationToken,
-    _worker_concurrency: usize,
-    _per_tenant_active_cap: usize,
 ) -> Result<
     impl std::future::Future<Output = Result<(), vala_bifrost_redux::forge::ForgeError>>
     + Send
@@ -1144,6 +1196,12 @@ pub struct BootedServer {
     /// Must be dropped only after the Bifrost graph has drained — in the server
     /// process that is after `BoundServer::run` returns.
     pub coordination_runtime: ScribeCoordinationRuntime,
+    /// Sole owner of the dedicated Forge compaction runtime.
+    ///
+    /// Must be dropped only after Forge worker supervision drains, so an
+    /// admitted plan runner is never abandoned between writing its outputs and
+    /// Preparing its operation.
+    pub compaction_runtime: ForgeCompactionRuntime,
 }
 
 /// Emit pre-telemetry warnings for relaxed config that is still safe to run.
@@ -1227,6 +1285,7 @@ pub async fn build_state(
     let crate::state::ComposedBifrost {
         bifrost,
         coordination_runtime,
+        compaction_runtime,
     } = compose_bifrost(crate::state::BifrostBuildInputs {
         target: config.role,
         deployment_profile: config.deployment_profile,
@@ -1285,6 +1344,7 @@ pub async fn build_state(
     Ok(BootedServer {
         state,
         coordination_runtime,
+        compaction_runtime,
     })
 }
 

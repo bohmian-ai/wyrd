@@ -173,7 +173,7 @@ impl BifrostTarget {
 
 /// Forge worker capacity and operational tuning for the current process role.
 ///
-/// Every field except `worker_concurrency` is optional and defaults to the
+/// Every field is optional and defaults to the
 /// value compiled into `vala_bifrost_redux::forge::ForgeConfig::default()` (or,
 /// for `maintenance_interval_secs`, the boot maintenance-interval default). A
 /// `[forge]` section that sets nothing therefore reproduces today's compiled
@@ -183,18 +183,13 @@ impl BifrostTarget {
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ForgeRuntimeConfig {
-    /// Number of bounded Forge worker executors this process spawns.
-    ///
-    /// Controls parallelism only. Must be positive (rejected in
-    /// [`WyrdServerConfig::validate`]). Default 1.
-    #[serde(default = "default_forge_worker_concurrency")]
-    pub worker_concurrency: usize,
     /// Maximum active tasks one tenant may hold concurrently (the D78 fairness
-    /// bound). When unset it resolves to `worker_concurrency`, preserving
-    /// today's coupled behavior; set it to tune per-tenant admission
-    /// independently of executor parallelism. May be above or below
-    /// `worker_concurrency`. Must be positive when set. Default: tracks
-    /// `worker_concurrency`.
+    /// bound).
+    ///
+    /// This bounds only the SQL fair claim, never local execution parallelism:
+    /// a single claimed compaction task fans out into as many concurrent plan
+    /// runners as the worker's compaction queue admits. Must be positive when
+    /// set. Default 1.
     #[serde(default)]
     pub per_tenant_active_cap: Option<usize>,
     /// Age (seconds) after which old Iceberg snapshots become eligible for
@@ -236,14 +231,9 @@ pub struct ForgeRuntimeConfig {
     pub maintenance_interval_secs: Option<u64>,
 }
 
-const fn default_forge_worker_concurrency() -> usize {
-    1
-}
-
 impl Default for ForgeRuntimeConfig {
     fn default() -> Self {
         Self {
-            worker_concurrency: default_forge_worker_concurrency(),
             per_tenant_active_cap: None,
             snapshot_retention_secs: None,
             retain_last: None,
@@ -258,17 +248,19 @@ impl Default for ForgeRuntimeConfig {
 }
 
 impl ForgeRuntimeConfig {
-    /// Resolve the per-tenant active cap, falling back to `worker_concurrency`.
+    /// Resolve the per-tenant active cap, defaulting directly to one.
     ///
     /// This is the single place the D78 per-tenant fairness bound is derived
-    /// from operator config: an unset `per_tenant_active_cap` tracks
-    /// `worker_concurrency` so existing deployments keep today's behavior, while
-    /// an explicit value decouples the bound from executor parallelism. The
-    /// result feeds `ForgeWorkerConfig::per_tenant_active_cap` at worker spawn.
+    /// from operator config. It is independent of execution parallelism, which
+    /// the worker's compaction queue owns, so an unset value is one active task
+    /// per tenant. The result feeds `ForgeWorkerConfig::per_tenant_active_cap`
+    /// at worker spawn.
     #[must_use]
-    pub fn resolved_per_tenant_active_cap(&self) -> usize {
-        self.per_tenant_active_cap
-            .unwrap_or(self.worker_concurrency)
+    pub const fn resolved_per_tenant_active_cap(&self) -> usize {
+        match self.per_tenant_active_cap {
+            Some(cap) => cap,
+            None => 1,
+        }
     }
 }
 
@@ -1266,6 +1258,16 @@ pub struct BifrostResourceConfig {
     /// Optional effective CPU cap; process/cgroup affinity may be tighter.
     #[serde(default)]
     pub effective_cpu: Option<usize>,
+    /// Optional explicit Forge compaction memory budget for this node, in bytes.
+    ///
+    /// When unset the plan derives four fifths of the resolved process memory
+    /// limit. An explicit value replaces that default outright: it is a capacity
+    /// decision, not a detected bound, so it may raise as well as lower the
+    /// derived figure. Boot refuses a Forge-enabled process whose selected
+    /// budget is zero or exceeds the memory left by the protected Scribe and
+    /// Oracle floors; there is no clamp.
+    #[serde(default)]
+    pub forge_compaction_memory_limit_bytes: Option<usize>,
     /// Optional Oracle query slot-unit concurrency limit for this node.
     ///
     /// Unlike the caps above this is a capacity decision rather than a detected
@@ -2191,6 +2193,10 @@ impl WyrdServerConfig {
             "WYRD_BIFROST_ORACLE_QUERY_SLOT_LIMIT",
             self.bifrost.resources.oracle_query_slot_limit,
         )?;
+        self.bifrost.resources.forge_compaction_memory_limit_bytes = parse_optional_env(
+            "WYRD_BIFROST_FORGE_COMPACTION_MEMORY_LIMIT_BYTES",
+            self.bifrost.resources.forge_compaction_memory_limit_bytes,
+        )?;
         // deployment_profile (APP_ENV: development | staging | production).
         // staging and production both select the hardened production profile, so
         // both fail closed without a signing key; only development is lenient.
@@ -2426,11 +2432,6 @@ impl WyrdServerConfig {
     /// Returns [`ConfigError`] for any violated constraint.
     fn validate(&self) -> Result<(), ConfigError> {
         let serves_api = self.role.serves_api();
-        if self.forge.worker_concurrency == 0 {
-            return Err(ConfigError::Invalid {
-                message: "forge.worker_concurrency must be positive".to_owned(),
-            });
-        }
         if self.forge.per_tenant_active_cap == Some(0) {
             return Err(ConfigError::Invalid {
                 message: "forge.per_tenant_active_cap must be positive".to_owned(),
@@ -3077,7 +3078,6 @@ mod tests {
     fn forge_operational_fields_default_to_none_when_absent() {
         let config = from_toml_str_with_dev_oracle_opt_in("").expect("empty config parses");
         let forge = &config.forge;
-        assert_eq!(forge.worker_concurrency, 1);
         assert_eq!(forge.per_tenant_active_cap, None);
         assert_eq!(forge.snapshot_retention_secs, None);
         assert_eq!(forge.retain_last, None);
@@ -3095,7 +3095,6 @@ mod tests {
     fn forge_operational_fields_parse_from_toml() {
         let toml = r#"
 [forge]
-worker_concurrency = 4
 per_tenant_active_cap = 2
 snapshot_retention_secs = 7200
 retain_last = 3
@@ -3108,7 +3107,6 @@ maintenance_interval_secs = 45
 "#;
         let config = from_toml_str_with_dev_oracle_opt_in(toml).expect("forge section parses");
         let forge = &config.forge;
-        assert_eq!(forge.worker_concurrency, 4);
         assert_eq!(forge.per_tenant_active_cap, Some(2));
         assert_eq!(forge.snapshot_retention_secs, Some(7200));
         assert_eq!(forge.retain_last, Some(3));
@@ -3128,17 +3126,80 @@ maintenance_interval_secs = 45
         assert!(from_toml_str_with_dev_oracle_opt_in(toml).is_err());
     }
 
-    /// `resolved_per_tenant_active_cap` falls back to `worker_concurrency` when
-    /// unset and honors an explicit override otherwise.
+    /// The optional Forge compaction memory budget replaces the deleted
+    /// `forge.worker_concurrency` executor knob completely.
+    ///
+    /// Three facts travel together because they are one operator-visible
+    /// change. Local compaction parallelism is now the worker's own queue,
+    /// bounded by the node's compaction memory budget, so the budget is what an
+    /// operator sets and `worker_concurrency` no longer exists in any surface:
+    /// not the struct, not TOML, not the environment. `per_tenant_active_cap`
+    /// therefore has nothing to alias and defaults directly to one.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the budget does not parse from file or environment, when the
+    /// removed executor knob is still accepted, or when the per-tenant cap does
+    /// not default to one.
     #[test]
-    fn forge_resolved_per_tenant_active_cap_fallback_and_override() {
-        let mut forge = ForgeRuntimeConfig {
-            worker_concurrency: 6,
+    fn forge_compaction_budget_config_replaces_worker_concurrency() {
+        let _guard = ENV_LOCK.lock().expect("environment test lock");
+
+        // Unset: the plan derives the budget, and fairness defaults to one.
+        let bare = from_toml_str_with_dev_oracle_opt_in("").expect("empty config parses");
+        assert_eq!(
+            bare.bifrost.resources.forge_compaction_memory_limit_bytes, None,
+            "an unset budget leaves the derived default to resource planning"
+        );
+        assert_eq!(
+            bare.forge.resolved_per_tenant_active_cap(),
+            1,
+            "the fairness cap no longer tracks a deleted executor count"
+        );
+
+        // File: the budget is an ordinary optional resource field.
+        let configured = from_toml_str_with_dev_oracle_opt_in(
+            "[bifrost.resources]\nforge_compaction_memory_limit_bytes = 268435456\n",
+        )
+        .expect("the budget parses from the resource section");
+        assert_eq!(
+            configured
+                .bifrost
+                .resources
+                .forge_compaction_memory_limit_bytes,
+            Some(268_435_456)
+        );
+
+        // Environment: the documented override wins over the file value.
+        temp_env::with_vars(
+            [(
+                "WYRD_BIFROST_FORGE_COMPACTION_MEMORY_LIMIT_BYTES",
+                Some("134217728"),
+            )],
+            || {
+                let mut config = configured.clone();
+                config
+                    .apply_env_overrides()
+                    .expect("the budget environment override applies");
+                assert_eq!(
+                    config.bifrost.resources.forge_compaction_memory_limit_bytes,
+                    Some(134_217_728)
+                );
+            },
+        );
+
+        // The deleted executor knob is not silently tolerated anywhere.
+        assert!(
+            from_toml_str_with_dev_oracle_opt_in("[forge]\nworker_concurrency = 4\n").is_err(),
+            "`deny_unknown_fields` must reject the removed executor knob"
+        );
+
+        // An explicit cap still overrides the direct default.
+        let capped = ForgeRuntimeConfig {
+            per_tenant_active_cap: Some(2),
             ..ForgeRuntimeConfig::default()
         };
-        assert_eq!(forge.resolved_per_tenant_active_cap(), 6);
-        forge.per_tenant_active_cap = Some(2);
-        assert_eq!(forge.resolved_per_tenant_active_cap(), 2);
+        assert_eq!(capped.resolved_per_tenant_active_cap(), 2);
     }
 
     /// A zero `forge.per_tenant_active_cap` fails boot validation fail-closed.

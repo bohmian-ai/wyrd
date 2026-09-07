@@ -5,20 +5,19 @@
 //! [`ForgeLease`] remains the only publication fence.
 
 use std::str::FromStr;
+use std::sync::Arc;
 #[cfg(feature = "test-support")]
 use std::sync::Mutex;
 #[cfg(feature = "test-support")]
 use std::sync::atomic::AtomicBool;
 #[cfg(feature = "test-support")]
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use iceberg::spec::TableMetadata;
 use iceberg::table::Table;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
-use tokio::task::{Id, JoinSet};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use vala_sql::queries::forge_tasks::{ForgeClaimLimits, ForgeTasks};
@@ -324,25 +323,53 @@ struct CleanupAttempt<'a> {
     binding: &'a TenantTableBinding,
 }
 
-/// Fixed process-local bounds for one Forge worker pool.
+/// Readiness and stop bookkeeping owned by one running worker's event loop.
+///
+/// A worker no longer has sibling slots, so this holds only the two handles the
+/// loop's own fatal path must reach: the role readiness it must retract and the
+/// child token that stops any in-flight compaction runner it spawned.
+#[derive(Clone)]
+struct ForgeWorkerRunControls {
+    /// Existing role handle; the loop is the only readiness decider.
+    readiness: ForgeRoleReadiness,
+    /// Child token cancelling admitted runners without touching process shutdown.
+    stop: CancellationToken,
+}
+
+/// Compaction memory budget used by embedded fixtures and defaults.
+///
+/// Production always overrides this from the node's immutable resource plan.
+/// The value only has to be large enough that a small fixture table's single
+/// plan is admitted rather than refused as too large for the whole worker.
+const DEFAULT_COMPACTION_MEMORY_BUDGET_BYTES: usize = 1 << 30;
+
+/// Fixed process-local bounds for one Forge worker.
+///
+/// One worker runs exactly one event loop and one compaction-admission queue.
+/// Local execution concurrency is therefore not an executor count: it is the
+/// parallelism and estimated-memory budget the queue admits plans against,
+/// resolved once from the immutable node resource plan.
 #[derive(Debug, Clone, Copy)]
 pub struct ForgeWorkerConfig {
-    /// Number of task executors spawned by this process.
-    ///
-    /// Controls parallelism only: how many claim executors this worker runs
-    /// (see the executor spawn loop in [`ForgeWorker::run`]). It no longer
-    /// determines the per-tenant admission cap; that value now lives in
-    /// [`Self::per_tenant_active_cap`] so parallelism can scale without
-    /// silently widening what one tenant may consume.
-    pub worker_concurrency: usize,
     /// Maximum active tasks one tenant may hold concurrently (the D78 fairness
     /// bound, `max_active_per_tenant` in the fair claim).
     ///
-    /// Previously aliased to `worker_concurrency`; it is now an independent
-    /// value. The server resolves it to `worker_concurrency` when an operator
-    /// leaves it unset, preserving today's behavior, but it may be set higher
-    /// or lower to tune tenant fairness separately from executor parallelism.
+    /// This bounds durable claims only. It is deliberately independent of local
+    /// execution parallelism, because one claimed compaction task fans out into
+    /// as many concurrent plan runners as the queue admits.
     pub per_tenant_active_cap: usize,
+    /// Estimated heap this worker charges against concurrently running plans.
+    ///
+    /// Waiting plans are uncharged, so a large queued plan cannot starve
+    /// smaller running ones. Must be positive.
+    pub compaction_memory_budget_bytes: usize,
+    /// Maximum parallelism summed across concurrently running plans.
+    pub max_task_parallelism: u32,
+    /// Maximum parallelism summed across waiting plans.
+    ///
+    /// Must be at least [`Self::max_task_parallelism`], otherwise the queue
+    /// could not hold one maximally parallel plan.
+    pub pending_task_parallelism: u32,
 }
 
 /// One admitted rewrite attempt's publication evidence, keyed by its identities.
@@ -1338,28 +1365,45 @@ impl Default for ForgeWorkerConfig {
     /// deployments share dedicated semantics.
     fn default() -> Self {
         Self {
-            worker_concurrency: 1,
             per_tenant_active_cap: 1,
+            compaction_memory_budget_bytes: DEFAULT_COMPACTION_MEMORY_BUDGET_BYTES,
+            max_task_parallelism: 3,
+            pending_task_parallelism: 12,
         }
     }
 }
 
 impl ForgeWorkerConfig {
-    /// Validates the fixed worker set before any executor is spawned.
+    /// Validates the fixed worker bounds before the event loop starts.
     ///
     /// # Errors
     ///
-    /// Returns invalid configuration when the executor count or the per-tenant
-    /// active cap is zero; a zero cap would admit no task for any tenant.
+    /// Returns invalid configuration when the per-tenant active cap is zero (no
+    /// task would ever be claimable), when the compaction memory budget is zero
+    /// (no plan could ever run), when running parallelism is zero, or when the
+    /// waiting budget cannot hold one maximally parallel plan.
     pub fn validate(self) -> Result<Self, ForgeError> {
-        if self.worker_concurrency == 0 {
-            return Err(ForgeError::InvalidConfig {
-                detail: "Forge worker concurrency must be positive".to_owned(),
-            });
-        }
         if self.per_tenant_active_cap == 0 {
             return Err(ForgeError::InvalidConfig {
                 detail: "Forge per-tenant active cap must be positive".to_owned(),
+            });
+        }
+        if self.compaction_memory_budget_bytes == 0 {
+            return Err(ForgeError::InvalidConfig {
+                detail: "Forge compaction memory budget must be positive".to_owned(),
+            });
+        }
+        if self.max_task_parallelism == 0 {
+            return Err(ForgeError::InvalidConfig {
+                detail: "Forge compaction running parallelism must be positive".to_owned(),
+            });
+        }
+        if self.pending_task_parallelism < self.max_task_parallelism {
+            return Err(ForgeError::InvalidConfig {
+                detail: format!(
+                    "Forge waiting parallelism {} cannot hold one maximally parallel plan of {}",
+                    self.pending_task_parallelism, self.max_task_parallelism
+                ),
             });
         }
         Ok(self)
@@ -1385,17 +1429,6 @@ fn prepared_effect_progressed(evidence: &ForgeTaskEvidence, base_snapshot_id: i6
     evidence.committed_snapshot_id != Some(base_snapshot_id) || evidence.deleted_candidate_count > 0
 }
 
-/// Shared bookkeeping for one running worker's existing slots and readiness.
-#[derive(Clone)]
-struct ForgeWorkerRunControls {
-    /// Existing role handle; no slot owns an independent readiness decision.
-    readiness: ForgeRoleReadiness,
-    /// Existing shared child token used to stop sibling claims.
-    stop: CancellationToken,
-    /// Causal slot whose actual error must survive cleanup and observation.
-    first_failure: Arc<OnceLock<Id>>,
-}
-
 /// Claim-driven Forge executor shared by embedded and dedicated topologies.
 #[derive(Clone)]
 pub struct ForgeWorker {
@@ -1410,8 +1443,15 @@ pub struct ForgeWorker {
     /// Optional observer that receives only completed supervised executions.
     #[cfg(feature = "test-support")]
     completion_observer: Option<ForgeWorkerCompletionObserver>,
-    /// Present only on spawned slots, never on direct fixtures or startup recovery.
+    /// Readiness and stop bookkeeping, present only while the event loop runs.
     run_controls: Option<ForgeWorkerRunControls>,
+    /// Executor admitted compaction runners are spawned on.
+    ///
+    /// `None` on a direct fixture or an embedded deployment with no dedicated
+    /// executor, in which case runners share the ambient server runtime. Only
+    /// a [`tokio::runtime::Handle`] ever reaches this worker; the `Runtime`
+    /// itself is owned by the server composition that outlives supervision.
+    compaction_runtime: Option<tokio::runtime::Handle>,
 }
 
 impl ForgeWorker {
@@ -1435,16 +1475,32 @@ impl ForgeWorker {
             owner,
             config,
             run_controls: None,
+            compaction_runtime: None,
         })
     }
 
-    /// Registers the causal slot, closes readiness, and cancels siblings without yielding.
-    /// Direct execution and startup recovery have no shared slot controls to close.
+    /// Selects the executor admitted compaction runners are spawned on.
+    ///
+    /// Composition hands the worker a [`tokio::runtime::Handle`] for the
+    /// server-owned dedicated compaction runtime. Only admitted plan runners
+    /// use it; claims, maintenance, reconciliation, and settlement stay on the
+    /// ambient runtime, so a saturated rewrite cannot starve the loop that must
+    /// settle it. A worker without one runs runners on the ambient runtime,
+    /// which is what an embedded deployment and every direct fixture want.
+    #[must_use]
+    pub fn on_compaction_runtime(mut self, handle: tokio::runtime::Handle) -> Self {
+        self.compaction_runtime = Some(handle);
+        self
+    }
+
+    /// Closes readiness and stops in-flight runners without yielding.
+    ///
+    /// Direct execution and startup recovery run outside the event loop and
+    /// therefore have no controls to close.
     fn close_after_fatal(&self) {
         let Some(controls) = &self.run_controls else {
             return;
         };
-        let _ = controls.first_failure.set(tokio::task::id());
         controls.readiness.publish(false);
         controls.stop.cancel();
     }
@@ -1516,110 +1572,54 @@ impl ForgeWorker {
         Ok(!shutdown.is_cancelled())
     }
 
-    /// Runs the fixed worker set until shutdown stops claims and drains slots.
+    /// Runs the one worker event loop until shutdown stops claims and drains.
     ///
-    /// Each slot claims at most one task at a time. Cancellation stops new
-    /// claims immediately; active operations observe the same token at their
-    /// established safe boundaries before the pool joins every slot.
+    /// A worker is a single mutable loop, not a pool: local compaction
+    /// concurrency comes from its admission queue, so there is nothing to fan
+    /// out into slots and no cross-slot error selection to make. Cancellation
+    /// stops new claims immediately; admitted work observes the same token at
+    /// its established safe boundaries before the loop returns.
     ///
     /// # Errors
     ///
-    /// Returns a slot panic or an unexpected slot-level configuration failure.
+    /// Returns the first failure the loop could not settle. Readiness is
+    /// retracted before returning, so a worker that stopped — cleanly, by
+    /// refusal, or by failure — never keeps advertising itself.
+    ///
+    /// # Cancellation
+    ///
+    /// Cancellation retracts readiness, stops admitting new work, and drains
+    /// what is already admitted before returning `Ok(())`.
     pub async fn run(
-        self,
+        mut self,
         shutdown: CancellationToken,
         readiness: ForgeRoleReadiness,
     ) -> Result<(), ForgeError> {
         // Cleared on every exit, so a worker that stopped — cleanly, by
-        // quarantine, or by a slot failure — never keeps advertising itself.
+        // quarantine, or by failure — never keeps advertising itself.
         let _readiness = ForgeWorkerReadinessGuard(readiness.clone());
         if !self.start_and_drain(&shutdown).await? {
             return Ok(());
         }
         readiness.publish(true);
-        let mut slots = JoinSet::new();
-        let controls = ForgeWorkerRunControls {
+        let stop = shutdown.child_token();
+        self.run_controls = Some(ForgeWorkerRunControls {
             readiness: readiness.clone(),
-            stop: shutdown.child_token(),
-            first_failure: Arc::new(OnceLock::new()),
-        };
-        for index in 0..self.config.worker_concurrency {
-            let mut worker = self.clone();
-            worker.run_controls = Some(controls.clone());
-            let stop = controls.stop.clone();
-            // Slot zero retains the existing maintenance reservation.
-            slots.spawn(async move {
-                let outcome = Box::pin(worker.run_slot(stop, index == 0)).await;
-                if outcome.is_err() {
-                    worker.close_after_fatal();
-                }
-                outcome
-            });
-        }
-        let first_error = self.join_slots(&mut slots, &shutdown, &controls).await;
-        if let Some(error) = first_error {
-            tracing::error!(worker = %self.owner, error = %error, "Forge worker stopped after a slot could not settle its work");
+            stop: stop.clone(),
+        });
+        // Boxed because the loop's per-claim execution arms are large enough
+        // that inlining the whole state machine here overflows a default task
+        // stack in debug builds.
+        let outcome = Box::pin(self.run_event_loop(stop)).await;
+        if let Err(error) = outcome {
+            readiness.publish(false);
+            tracing::error!(worker = %self.owner, error = %error, "Forge worker stopped after it could not settle its work");
             return Err(error);
         }
         // Pairs with the start event so an operator can tell a worker that
         // drained cleanly from one that vanished.
         tracing::info!(worker = %self.owner, "Forge worker stopped");
         Ok(())
-    }
-
-    /// Drains slots without aborting the causal reporter's cleanup or telemetry.
-    /// Concurrent process shutdown closes routing but uses the same error selection.
-    /// Unexpected task failures select their task ID; only our own aborts are ignored.
-    async fn join_slots(
-        &self,
-        slots: &mut JoinSet<Result<(), ForgeError>>,
-        shutdown: &CancellationToken,
-        controls: &ForgeWorkerRunControls,
-    ) -> Option<ForgeError> {
-        let mut first_error = None;
-        let mut shutting_down = false;
-        let mut aborted = false;
-        loop {
-            let joined = tokio::select! {
-                () = shutdown.cancelled(), if !shutting_down => {
-                    controls.readiness.publish(false);
-                    controls.stop.cancel();
-                    shutting_down = true;
-                    continue;
-                }
-                joined = slots.join_next_with_id() => joined,
-            };
-            let Some(joined) = joined else {
-                break;
-            };
-            let (id, outcome) = match joined {
-                Ok(joined) => joined,
-                Err(error) if aborted && error.is_cancelled() => continue,
-                Err(error) => (
-                    error.id(),
-                    Err(ForgeError::Invariant {
-                        detail: format!("Forge worker slot panicked: {error}"),
-                    }),
-                ),
-            };
-            if let Err(error) = outcome {
-                let reporter = *controls.first_failure.get_or_init(|| id);
-                controls.readiness.publish(false);
-                controls.stop.cancel();
-                if id == reporter {
-                    first_error = Some(error);
-                    slots.abort_all();
-                    aborted = true;
-                }
-                // A secondary error never displaces or aborts the registered slot.
-            }
-            #[cfg(feature = "test-support")]
-            if let Some(observer) = &self.completion_observer {
-                observer.joined_slots.fetch_add(1, Ordering::AcqRel);
-                observer.joined_slot_ready.notify_waiters();
-            }
-        }
-        first_error
     }
 
     /// Resolves every durable attempt left unsettled before this worker starts.
@@ -1840,27 +1840,24 @@ impl ForgeWorker {
     /// Returns only failures that make a further claim by this owner unsafe:
     /// configuration, durable settlement, audit, SQL, reconciliation, claim, and
     /// cancellation-release failures. Each leaves durable state that no longer
-    /// describes what this owner did, so the slot stops rather than claiming
+    /// describes what this owner did, so the loop stops rather than claiming
     /// again. An execution failure this attempt durably settled is not one of
     /// them: it stays a healthy exit that permits the next claim.
-    ///
-    /// When `reserved_maintenance` is set this slot attempts a maintenance-only
-    /// claim before any unfiltered claim on every iteration, reserving its
-    /// capacity for maintenance whenever such work is ready.
-    async fn run_slot(
-        &self,
-        shutdown: CancellationToken,
-        reserved_maintenance: bool,
-    ) -> Result<(), ForgeError> {
+    async fn run_event_loop(&mut self, shutdown: CancellationToken) -> Result<(), ForgeError> {
         let claim_limits = self.claim_limits()?;
+        // One worker owns exactly one maintenance execution position, and it is
+        // outside the compaction queue: maintenance strategies are tried first
+        // on every pass so a ready snapshot expiry is never starved behind
+        // compaction backlog.
+        let reserved_maintenance = true;
         loop {
             if shutdown.is_cancelled() {
                 return Ok(());
             }
             self.reclaim_expired_attempts(claim_limits.max_active_per_tenant)
                 .await?;
-            // Checked immediately before each durable claim so a sibling slot's
-            // failure stops this one before it takes new work.
+            // Checked immediately before each durable claim so a stop signal
+            // lands before this loop takes new work.
             if shutdown.is_cancelled() {
                 return Ok(());
             }
@@ -6421,28 +6418,45 @@ mod tests {
         );
     }
 
-    /// Worker concurrency and the per-tenant cap are hard positive invariants.
+    /// Every worker bound is a hard invariant resolved once at composition.
+    ///
+    /// Each one, violated, makes the worker unable to do the thing it exists
+    /// for: a zero tenant cap claims nothing, a zero memory budget admits no
+    /// plan, zero running parallelism runs no plan, and a waiting budget below
+    /// running parallelism cannot even hold one maximally parallel plan.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any of those is accepted or when the defaults change.
     #[test]
-    fn worker_concurrency_must_be_positive() {
-        assert!(
+    fn worker_admission_bounds_must_be_positive_and_ordered() {
+        let base = ForgeWorkerConfig::default();
+        for invalid in [
             ForgeWorkerConfig {
-                worker_concurrency: 0,
-                per_tenant_active_cap: 1,
-            }
-            .validate()
-            .is_err()
-        );
-        assert!(
-            ForgeWorkerConfig {
-                worker_concurrency: 1,
                 per_tenant_active_cap: 0,
-            }
-            .validate()
-            .is_err()
-        );
-        let defaults = ForgeWorkerConfig::default();
-        assert_eq!(defaults.worker_concurrency, 1);
-        assert_eq!(defaults.per_tenant_active_cap, 1);
+                ..base
+            },
+            ForgeWorkerConfig {
+                compaction_memory_budget_bytes: 0,
+                ..base
+            },
+            ForgeWorkerConfig {
+                max_task_parallelism: 0,
+                ..base
+            },
+            ForgeWorkerConfig {
+                max_task_parallelism: 8,
+                pending_task_parallelism: 4,
+                ..base
+            },
+        ] {
+            assert!(
+                invalid.validate().is_err(),
+                "an unusable worker bound must be refused: {invalid:?}"
+            );
+        }
+        assert_eq!(base.per_tenant_active_cap, 1);
+        assert!(base.validate().is_ok(), "the compiled defaults are usable");
     }
 
     /// Snapshot-expiry intent decodes only the canonical four-field plan.
@@ -6587,29 +6601,38 @@ mod tests {
         );
     }
 
-    /// The per-tenant cap is stored and read independently of executor count.
+    /// The per-tenant cap is independent of local compaction parallelism.
     ///
-    /// Proves the fields are decoupled at the config layer: a config may carry
-    /// a per-tenant cap that differs from `worker_concurrency` in either
-    /// direction and still validate, which is the whole point of separating the
-    /// D78 fairness bound from parallelism.
+    /// The D78 fairness bound governs durable claims; the queue's parallelism
+    /// governs how many plans of one claim run at once. Proving they validate
+    /// in either relative direction is what keeps a deployment from silently
+    /// re-coupling them the way the deleted executor count did.
+    ///
+    /// # Panics
+    ///
+    /// Panics when either combination is refused or read back changed.
     #[test]
-    fn per_tenant_active_cap_is_independent_of_worker_concurrency() {
+    fn per_tenant_active_cap_is_independent_of_compaction_parallelism() {
+        let base = ForgeWorkerConfig::default();
         let wider = ForgeWorkerConfig {
-            worker_concurrency: 2,
             per_tenant_active_cap: 8,
+            max_task_parallelism: 2,
+            pending_task_parallelism: 8,
+            ..base
         }
         .validate()
-        .expect("a per-tenant cap above the executor count is legal");
+        .expect("a per-tenant cap above running parallelism is legal");
         assert_eq!(wider.per_tenant_active_cap, 8);
-        assert_eq!(wider.worker_concurrency, 2);
+        assert_eq!(wider.max_task_parallelism, 2);
 
         let narrower = ForgeWorkerConfig {
-            worker_concurrency: 8,
             per_tenant_active_cap: 1,
+            max_task_parallelism: 8,
+            pending_task_parallelism: 32,
+            ..base
         }
         .validate()
-        .expect("a per-tenant cap below the executor count is legal");
+        .expect("a per-tenant cap below running parallelism is legal");
         assert_eq!(narrower.per_tenant_active_cap, 1);
     }
 

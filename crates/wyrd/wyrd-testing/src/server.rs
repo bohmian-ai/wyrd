@@ -231,6 +231,12 @@ struct WyrdTestServerInner {
     /// same single owner. Declared last so struct drop order releases it after
     /// `state`, which is the order production teardown also takes.
     _coordination_runtime: ScribeCoordinationRuntime,
+    /// Sole owner of the dedicated Forge compaction runtime this server composed.
+    ///
+    /// Retained for the same reason as the coordination runtime above, and
+    /// released in the same struct drop order: an admitted plan runner must not
+    /// be abandoned between writing its outputs and Preparing its operation.
+    _compaction_runtime: wyrd_server::state::ForgeCompactionRuntime,
 }
 
 /// Concrete lifecycle evidence returned after one test server stops.
@@ -414,7 +420,6 @@ pub struct WyrdTestServerBuilder {
     workload_binding_configs: Vec<WorkloadBindingEntry>,
     forge_interval: Duration,
     /// Executor slots composed into the production Forge worker.
-    forge_worker_concurrency: usize,
     wal_sync_delay: Duration,
     scribe_admission: Option<AdmissionConfig>,
     /// One immutable lowerable limits snapshot shared by the test server's ingest owners.
@@ -492,7 +497,6 @@ impl Default for WyrdTestServerBuilder {
             trusted_issuer_configs: Vec::new(),
             workload_binding_configs: Vec::new(),
             forge_interval: Duration::from_secs(60),
-            forge_worker_concurrency: 1,
             wal_sync_delay: Duration::ZERO,
             scribe_admission: None,
             scribe_ingest_limits: IngestLimits::default(),
@@ -2671,9 +2675,8 @@ impl WyrdTestServer {
         let shutdown_token = state.shutdown_token.clone();
 
         if self.forge_process_role() == BifrostTarget::ForgeWorker {
-            let worker =
-                wyrd_server::boot::spawn_forge_worker(&state, shutdown_token.clone(), 1, 1)
-                    .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+            let worker = wyrd_server::boot::spawn_forge_worker(&state, shutdown_token.clone())
+                .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
             // A dedicated Forge worker never runs the bounded Bifrost drain, so
             // its serve task reports that nothing drained rather than claiming a
             // drain outcome it did not produce.
@@ -2843,13 +2846,6 @@ impl WyrdTestServerBuilder {
     #[must_use]
     pub fn with_forge_config_for_test(mut self, config: ForgeConfig) -> Self {
         self.forge_config = Some(config);
-        self
-    }
-
-    /// Sets the production worker's slot count and default per-tenant active cap.
-    #[must_use]
-    pub fn with_forge_worker_concurrency_for_test(mut self, concurrency: usize) -> Self {
-        self.forge_worker_concurrency = concurrency;
         self
     }
 
@@ -3487,7 +3483,6 @@ impl WyrdTestServerBuilder {
         let mut bifrost_config = BifrostRuntimeConfig::default();
         bifrost_config.scribe.ingest_request_bytes = self.scribe_ingest_limits.max_frame_bytes;
         let forge_runtime = ForgeRuntimeConfig {
-            worker_concurrency: self.forge_worker_concurrency,
             maintenance_interval_secs: Some(self.forge_interval.as_secs()),
             ..ForgeRuntimeConfig::default()
         };
@@ -3495,6 +3490,7 @@ impl WyrdTestServerBuilder {
         let ComposedBifrost {
             bifrost: bifrost_runtime,
             coordination_runtime,
+            compaction_runtime,
         } = wyrd_server::boot::compose_bifrost(BifrostBuildInputs {
             target,
             deployment_profile: DeploymentProfile::Development,
@@ -3581,6 +3577,7 @@ impl WyrdTestServerBuilder {
                 query_control_audit_fault,
                 query_stream_stall: std::sync::Mutex::new(None),
                 _coordination_runtime: coordination_runtime,
+                _compaction_runtime: compaction_runtime,
             },
             mode: Mode::InProcess,
             shutdown_token: None,

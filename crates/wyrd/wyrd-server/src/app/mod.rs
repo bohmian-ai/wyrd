@@ -60,14 +60,16 @@ pub async fn run(mode: Option<ServeMode>) -> Result<(), BootExit> {
 
     let mode = mode.unwrap_or(config.serve.mode);
 
-    // `coordination_runtime` is the sole owner of the dedicated Scribe executor.
-    // It is bound here, outside the serving future, so it outlives the Bifrost
-    // drain that `BoundServer::run` performs and is released only once serving
-    // has returned. Its drop is non-blocking, which is required because this
-    // frame is inside `#[tokio::main]`.
+    // `coordination_runtime` and `compaction_runtime` are the sole owners of
+    // the dedicated Scribe and Forge executors. They are bound here, outside
+    // the serving future, so they outlive both the Bifrost drain that
+    // `BoundServer::run` performs and the supervised Forge worker, and are
+    // released only once serving has returned. Their drops are non-blocking,
+    // which is required because this frame is inside `#[tokio::main]`.
     let BootedServer {
         state,
         coordination_runtime,
+        compaction_runtime,
     } = build_state(&config, telemetry.clone(), StateOverrides::default())
         .await
         .map_err(|e| BootExit::Other(Box::new(e)))?;
@@ -84,6 +86,7 @@ pub async fn run(mode: Option<ServeMode>) -> Result<(), BootExit> {
             .await
     };
 
+    drop(compaction_runtime); // release Forge compaction threads after supervision drains
     drop(coordination_runtime); // release Scribe coordination threads after drain
     drop(telemetry); // flush OTLP exporters after serving stops
     drop(telemetry_runtime);
@@ -111,13 +114,8 @@ async fn run_forge_worker_process(
         .ok_or_else(|| BootExit::Other("configured Bifrost node identity is unavailable".into()))?;
     let shutdown = state.shutdown_token.clone();
     let mut set: JoinSet<TaskExit> = JoinSet::new();
-    let worker = spawn_forge_worker(
-        &state,
-        shutdown.clone(),
-        config.forge.worker_concurrency,
-        config.forge.resolved_per_tenant_active_cap(),
-    )
-    .map_err(|error| BootExit::Other(Box::new(error)))?;
+    let worker = spawn_forge_worker(&state, shutdown.clone())
+        .map_err(|error| BootExit::Other(Box::new(error)))?;
     set.spawn(fallible_task(TaskId::Worker("forge_worker"), worker));
     if let Some(health) = state.bifrost.resource_health() {
         set.spawn(fallible_task(

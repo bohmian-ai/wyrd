@@ -165,11 +165,6 @@ impl ForgeManagedRewrite {
         self.attempt_id
     }
 
-    /// Returns the one context every plan of this attempt shares.
-    pub(crate) fn context(&self) -> &Arc<ManagedExecutionContext> {
-        &self.context
-    }
-
     /// Loads the table, enumerates every real plan, and estimates each one.
     ///
     /// The core's selection limit is set to `usize::MAX` so its default cap

@@ -265,6 +265,24 @@ struct ForgeCommittedPublication {
     volume: Option<ForgeCommittedVolume>,
 }
 
+/// The three things every plan of one rewrite attempt publishes against.
+///
+/// They are grouped because they are attempt-scoped, not plan-scoped: the
+/// managed rewrite owns the one execution context, observer, and cancellation
+/// token every plan runner shares; the table is the single metadata read every
+/// plan's publication derives its geometry from; and the planning evidence is
+/// the one selection the whole attempt was admitted on. Passing them
+/// individually alongside the per-plan arguments would obscure exactly that
+/// split.
+struct ForgeRewriteAttempt<'attempt> {
+    /// Managed core seam this attempt's plans execute through.
+    rewrite: &'attempt super::managed::ForgeManagedRewrite,
+    /// Table as planning read it, used for geometry and publication authority.
+    table: Table,
+    /// Planning evidence every plan of this attempt records under its operation.
+    evidence: super::managed::ForgeRewriteEvidence,
+}
+
 enum ForgeDispatchResult {
     /// Ordinary publication whose evidence is not yet Prepared.
     ///
@@ -3911,7 +3929,7 @@ impl ForgeWorker {
                     .await
             }
             ForgeClaimStrategy::Known(ForgeTaskStrategy::SmallFiles) => {
-                self.dispatch_iceberg_rewrite(claim, attempt, binding, lease, &table, stop)
+                self.dispatch_iceberg_rewrite(claim, attempt, binding, lease, stop)
                     .await
             }
             ForgeClaimStrategy::Known(ForgeTaskStrategy::ExpiredCleanup) => {
@@ -3965,32 +3983,109 @@ impl ForgeWorker {
         attempt: Uuid,
         binding: &TenantTableBinding,
         lease: &mut ForgeLease,
-        table: &Table,
         stop: &CancellationToken,
     ) -> Result<ForgeDispatchResult, ForgeError> {
         self.rewrite_settlement_barrier(claim, binding, lease, stop)
             .await?;
-        let (evidence, handoff) = self
-            .execute_rewrite_handoff(claim, attempt, binding, table, stop)
-            .await?;
-        let metadata = table.metadata();
+        let rewrite = self
+            .forge
+            .managed_rewrite(binding, claim.task_id, attempt, stop.clone())?;
+        let super::managed::ForgePlannedAttempt {
+            table,
+            evidence,
+            plans,
+        } = rewrite.plan().await?;
+        if plans.is_empty() {
+            return Err(ForgeError::Reconciliation {
+                detail: "managed planning selected no compaction plan".to_owned(),
+            });
+        }
+        let mut queue = super::managed::queue::ForgeCompactionQueue::new(
+            self.config.max_task_parallelism,
+            self.config.pending_task_parallelism,
+            self.config.compaction_memory_budget_bytes,
+        );
+        let mut refusals: Vec<(usize, super::managed::queue::ForgePushResult)> = Vec::new();
+        for plan in plans {
+            let plan_index = plan.plan_index;
+            let admission = super::managed::queue::ForgePlanAdmission {
+                task_id: claim.task_id,
+                plan_index,
+                required_parallelism: plan.required_parallelism,
+                memory_reservation_bytes: plan.memory_reservation_bytes,
+            };
+            match queue.push(admission, plan) {
+                super::managed::queue::ForgePushResult::Added => {}
+                refusal => refusals.push((plan_index, refusal)),
+            }
+        }
+        let shared = ForgeRewriteAttempt {
+            rewrite: &rewrite,
+            table,
+            evidence,
+        };
+        let mut outcomes: Vec<(usize, Result<ForgeDispatchResult, ForgeError>)> = Vec::new();
+        while let Some(popped) = queue.pop() {
+            let plan_index = popped.admission.plan_index;
+            let outcome = match popped.runner {
+                Some(plan) => {
+                    self.publish_one_plan(claim, binding, lease, &shared, plan, stop)
+                        .await
+                }
+                None => Err(ForgeError::Invariant {
+                    detail: format!("Forge admitted plan {plan_index} carried no runner"),
+                }),
+            };
+            queue.finish_running((claim.task_id, plan_index));
+            outcomes.push((plan_index, outcome));
+        }
+        Self::reduce_plan_outcomes(refusals, outcomes)
+    }
+
+    /// Rewrites one admitted plan and publishes it under its own operation.
+    ///
+    /// The operation identity is minted here, per plan, because a durable
+    /// operation's Prepared detail is immutable and names exactly the inputs
+    /// and outputs one commit replaces. Sibling plans of the same attempt
+    /// replace different inputs, so one operation shared across them could only
+    /// describe one of them truthfully. The attempt identity stays shared: it
+    /// is what every object this attempt wrote is named for, and what the
+    /// unsettled-output ledger is keyed by.
+    ///
+    /// The publication authority, deadline, and retry budget are the
+    /// single-plan ones: this method is the whole of one plan's independent
+    /// publication, and a sibling's refusal or failure neither cancels nor
+    /// weakens it.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever managed execution and publication raise for this plan
+    /// alone: [`ForgeError::Shutdown`] when the attempt drained,
+    /// [`ForgeError::RewriteUnsettled`] when objects exist that no commit
+    /// names, [`ForgeError::Catalog`] or [`ForgeError::Reconciliation`] when
+    /// the catalog refused or its answer was lost, and the clock, audit,
+    /// fence, and object-store failures the boundary raises.
+    async fn publish_one_plan(
+        &self,
+        claim: &ForgeTaskClaim,
+        binding: &TenantTableBinding,
+        lease: &mut ForgeLease,
+        attempt: &ForgeRewriteAttempt<'_>,
+        plan: super::managed::ForgePlannedRewrite,
+        stop: &CancellationToken,
+    ) -> Result<ForgeDispatchResult, ForgeError> {
+        let handoff = attempt.rewrite.rewrite_plan(plan, &attempt.table).await?;
+        let metadata = attempt.table.metadata();
         let context = RewritePublication {
             claim,
             binding,
-            // The operation identity is the *attempt*, not the task. A rewrite
-            // task retried after an ambiguous drain produces different objects
-            // than the attempt before it, and a durable operation's Prepared
-            // detail is immutable — so one operation per task would either have
-            // to lie about its outputs or refuse the retry. Recovery does not
-            // depend on it: a landed snapshot is found by its task identity,
-            // which is stable.
             identity: super::publication::RewriteCommitIdentity {
                 task_id: claim.task_id,
-                attempt_id: attempt,
-                operation_id: attempt,
+                attempt_id: attempt.rewrite.attempt_id(),
+                operation_id: Uuid::now_v7(),
                 group: ForgeGroupKey::table_audit_resource(binding.tenant, &binding.table_ref),
                 plan_hash: super::planner::plan_hash(&claim.plan)?,
-                evidence,
+                evidence: attempt.evidence.clone(),
             },
             key: ForgeGroupKey {
                 tenant: binding.tenant,
@@ -4013,6 +4108,68 @@ impl ForgeWorker {
         #[cfg(feature = "test-support")]
         self.record_rewrite_evidence_for_test(&context.identity);
         self.publish_rewrite(&context, &handoff, lease, stop).await
+    }
+
+    /// Reduces one attempt's per-plan refusals and outcomes to one task result.
+    ///
+redacted
+    /// fall-through: any single published plan makes the task successful no
+    /// matter how its siblings ended, because the commit is durable and the
+    /// unfinished siblings remain ordinary planning debt for the next attempt.
+    /// Only when nothing published does a failure decide the task, and then it
+    /// is the *lowest plan index*'s failure — never the first to arrive, and
+    /// never a severity ranking — so the same plan set always settles the same
+    /// way regardless of completion order.
+    ///
+    /// A refusal decides only when no plan was admitted at all. The lowest
+    /// refused index supplies it, which is what keeps a capacity refusal
+    /// non-consuming while an invalid parallelism or duplicate key at a lower
+    /// index is still reported as the invariant violation it is.
+    ///
+    /// # Errors
+    ///
+    /// Returns the deciding plan's exact failure unchanged,
+    /// [`ForgeError::Capacity`] when the whole attempt was refused for
+    /// capacity, and [`ForgeError::Invariant`] for a queue refusal that is an
+    /// invariant violation or for an attempt that produced neither.
+    fn reduce_plan_outcomes(
+        mut refusals: Vec<(usize, super::managed::queue::ForgePushResult)>,
+        outcomes: Vec<(usize, Result<ForgeDispatchResult, ForgeError>)>,
+    ) -> Result<ForgeDispatchResult, ForgeError> {
+        let mut published = None;
+        let mut failures: Vec<(usize, ForgeError)> = Vec::new();
+        for (plan_index, outcome) in outcomes {
+            match outcome {
+                Ok(result) => published = Some(result),
+                Err(error) => failures.push((plan_index, error)),
+            }
+        }
+        if let Some(result) = published {
+            return Ok(result);
+        }
+        failures.sort_by_key(|(plan_index, _)| *plan_index);
+        if let Some((_, error)) = failures.into_iter().next() {
+            return Err(error);
+        }
+        refusals.sort_by_key(|(plan_index, _)| *plan_index);
+        match refusals.into_iter().next() {
+            Some((
+                plan_index,
+                super::managed::queue::ForgePushResult::RejectedCapacity
+                | super::managed::queue::ForgePushResult::RejectedTooLarge,
+            )) => Err(ForgeError::Capacity {
+                detail: format!(
+                    "Forge admitted no plan of this attempt; plan {plan_index} did not fit"
+                ),
+            }),
+            Some((plan_index, refusal)) => Err(ForgeError::Invariant {
+                detail: format!("Forge admission refused plan {plan_index}: {refusal:?}"),
+            }),
+            None => Err(ForgeError::Invariant {
+                detail: "Forge planning produced plans that were neither admitted nor refused"
+                    .to_owned(),
+            }),
+        }
     }
 
     /// Settles every live replacement this table still owes, before any effect.
@@ -4058,45 +4215,6 @@ impl ForgeWorker {
             });
         }
         Ok(())
-    }
-
-    /// Runs the managed core once and returns its publishable handoff.
-    ///
-    /// The core writes its outputs to storage and commits nothing, so a handoff
-    /// that comes back describes objects that exist and belong to no snapshot.
-    /// Anything other than a rewritten outcome is a failure of this attempt,
-    /// not a publication with fewer files.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ForgeError::Shutdown`] when the attempt drained,
-    /// [`ForgeError::Reconciliation`] when planning selected no real work, and
-    /// the object-store and execution failures the managed core raises.
-    async fn execute_rewrite_handoff(
-        &self,
-        claim: &ForgeTaskClaim,
-        attempt: Uuid,
-        binding: &TenantTableBinding,
-        _table: &Table,
-        stop: &CancellationToken,
-    ) -> Result<
-        (
-            super::managed::ForgeRewriteEvidence,
-            super::managed::RewriteHandoff,
-        ),
-        ForgeError,
-    > {
-        let rewrite = self
-            .forge
-            .managed_rewrite(binding, claim.task_id, attempt, stop.clone())?;
-        let planned = rewrite.plan().await?;
-        let Some(first) = planned.plans.into_iter().next() else {
-            return Err(ForgeError::Reconciliation {
-                detail: "managed planning selected no compaction plan".to_owned(),
-            });
-        };
-        let handoff = rewrite.rewrite_plan(first, &planned.table).await?;
-        Ok((planned.evidence, handoff))
     }
 
     /// Derives, prepares, and commits one handoff, retrying at most once.

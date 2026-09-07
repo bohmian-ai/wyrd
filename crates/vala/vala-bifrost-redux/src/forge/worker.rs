@@ -6403,7 +6403,7 @@ impl Drop for ForgeWorkerReadinessGuard {
 #[cfg(test)]
 mod tests {
     use vala_sql::row_types::forge_tasks::{
-        FORGE_TASK_PAYLOAD_VERSION, ForgeTaskEstimates, ForgeTaskLane, ForgeTaskPlan,
+        FORGE_TASK_PAYLOAD_VERSION, ForgeTaskEstimates, ForgeTaskPlan,
         ForgeTaskTableIdentity,
     };
 
@@ -6557,7 +6557,6 @@ mod tests {
                 table: "activation".to_owned(),
             },
             strategy: ForgeClaimStrategy::Known(strategy),
-            lane: ForgeTaskLane::Ordinary,
             base_snapshot_id: 1,
             plan: ForgeTaskPlan {
                 version: FORGE_TASK_PAYLOAD_VERSION,
@@ -6567,11 +6566,6 @@ mod tests {
             estimates: ForgeTaskEstimates {
                 files: 1,
                 bytes: 1,
-                parallelism: 1,
-                memory_bytes: 1,
-                spill_bytes: 1,
-                large_ceiling_bytes: 1,
-                envelope: None,
             },
             state: ForgeTaskState::Claimed,
             attempt_id: Some(Uuid::now_v7()),
@@ -6582,7 +6576,6 @@ mod tests {
             attempt_count: 0,
             failure_class: None,
             next_eligible_at: chrono::Utc::now(),
-            failed_volume_identity: None,
             ready_at: chrono::Utc::now(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),

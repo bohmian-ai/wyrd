@@ -3911,6 +3911,7 @@ mod tests {
                 scratch_limit_bytes: Some(1024 * 1024 * 1024),
                 effective_cpu: None,
                 oracle_query_slot_limit: None,
+                forge_compaction_memory_limit_bytes: None,
                 scratch_root: std::env::temp_dir(),
                 volume_roots: None,
             },

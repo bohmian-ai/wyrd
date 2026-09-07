@@ -1706,6 +1706,7 @@ mod resource_tests {
                 scratch_limit_bytes: None,
                 effective_cpu: None,
                 oracle_query_slot_limit: None,
+                forge_compaction_memory_limit_bytes: None,
                 scratch_root: PathBuf::new(),
                 volume_roots: None,
             },

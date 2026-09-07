@@ -335,17 +335,10 @@ mod tests {
                 small_file_threshold_bytes: 768 * 1024 * 1024,
                 ..limits()
             },
-            1024 * 1024 * 1024,
         )
         .expect("valid production geometry");
         let config = policy
-            .to_core_config(
-                "attempt".to_owned(),
-                &[],
-                2,
-                1024 * 1024 * 1024,
-                std::path::PathBuf::from("/tmp"),
-            )
+            .to_core_config("attempt".to_owned(), &[], 2)
             .expect("native configuration");
         for sizes_mib in [&[700_u64, 700][..], &[256, 256], &[2048]] {
             let files = sizes_mib
@@ -451,8 +444,8 @@ mod tests {
             (FILE_TARGET_PROPERTY, "268435456"),
             (ROW_GROUP_TARGET_PROPERTY, "134217728"),
         ]);
-        let policy = ForgeTablePolicy::extract(&metadata, &limits(), 1024 * 1024 * 1024)
-            .expect("declared geometry is admissible");
+        let policy =
+            ForgeTablePolicy::extract(&metadata, &limits()).expect("declared geometry is admissible");
 
         assert_eq!(policy.target_file_size_bytes, 268_435_456);
         assert_eq!(policy.row_group_target_bytes, 134_217_728);
@@ -462,13 +455,7 @@ mod tests {
             "the declared target reaches selection unchanged"
         );
         let config = policy
-            .to_core_config(
-                "attempt".to_owned(),
-                &["value".to_owned()],
-                2,
-                512 * 1024 * 1024,
-                std::path::PathBuf::from("/tmp"),
-            )
+            .to_core_config("attempt".to_owned(), &["value".to_owned()], 2)
             .expect("core configuration builds");
         assert_eq!(
             config.execution.target_file_size_bytes, 268_435_456,
@@ -495,7 +482,7 @@ mod tests {
             "the file target and the row-group target are not one term"
         );
 
-        let unset = ForgeTablePolicy::extract(&metadata_with(Vec::new()), &limits(), 1 << 30)
+        let unset = ForgeTablePolicy::extract(&metadata_with(Vec::new()), &limits())
             .expect("undeclared geometry falls back to the pinned Iceberg defaults");
         assert_eq!(unset.target_file_size_bytes, FILE_TARGET_DEFAULT);
         assert_eq!(unset.row_group_target_bytes, ROW_GROUP_TARGET_DEFAULT);
@@ -506,8 +493,7 @@ mod tests {
     /// One case per way the geometry can be impossible: a zero target, a
     /// non-numeric target, a threshold that is not below the target, a row-group
     /// target above the file target, a target whose oversized ceiling overflows,
-    /// a data location that is not the registered recipe location, admitted
-    /// memory too small to hold one row group, and a zero plan budget. Each is
+    /// and a data location that is not the registered recipe location. Each is
     /// a condition under which an admitted attempt could only produce wrong or
     /// no work, so the refusal belongs at extraction rather than mid-rewrite.
     #[test]
@@ -520,7 +506,6 @@ mod tests {
             ForgeTablePolicy::extract(
                 &metadata_with(vec![(FILE_TARGET_PROPERTY, "0")]),
                 &limits(),
-                1 << 30
             ),
             Err(ForgeError::InvalidConfig { .. })
         ));
@@ -528,7 +513,6 @@ mod tests {
             ForgeTablePolicy::extract(
                 &metadata_with(vec![(FILE_TARGET_PROPERTY, "not-a-number")]),
                 &limits(),
-                1 << 30
             ),
             Err(ForgeError::InvalidConfig { .. })
         ));
@@ -537,7 +521,6 @@ mod tests {
                 ForgeTablePolicy::extract(
                     &metadata_with(vec![(FILE_TARGET_PROPERTY, "1024")]),
                     &limits(),
-                    1 << 30
                 ),
                 Err(ForgeError::InvalidConfig { .. })
             ),
@@ -551,7 +534,6 @@ mod tests {
                         (ROW_GROUP_TARGET_PROPERTY, "134217728"),
                     ]),
                     &limits(),
-                    1 << 30
                 ),
                 Err(ForgeError::InvalidConfig { .. })
             ),
@@ -562,7 +544,6 @@ mod tests {
                 ForgeTablePolicy::extract(
                     &metadata_with(vec![(FILE_TARGET_PROPERTY, &u64::MAX.to_string())]),
                     &limits(),
-                    1 << 30
                 ),
                 Err(ForgeError::InvalidConfig { .. })
             ),
@@ -576,32 +557,10 @@ mod tests {
                         "file:///warehouse/tenant/table/data"
                     )]),
                     &limits(),
-                    1 << 30
                 ),
                 Err(ForgeError::InvalidConfig { .. })
             ),
             "outputs written outside the recipe location can never settle"
-        );
-        assert!(
-            matches!(
-                ForgeTablePolicy::extract(&metadata, &limits(), 1024),
-                Err(ForgeError::Capacity { .. })
-            ),
-            "an attempt that cannot hold one row group is refused as capacity"
-        );
-        assert!(
-            matches!(
-                ForgeTablePolicy::extract(
-                    &metadata,
-                    &ForgeConfig {
-                        rewrite_max_plans_per_attempt: 0,
-                        ..limits()
-                    },
-                    1 << 30
-                ),
-                Err(ForgeError::InvalidConfig { .. })
-            ),
-            "a zero plan budget would admit an attempt that can do nothing"
         );
     }
 }

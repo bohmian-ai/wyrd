@@ -266,3 +266,121 @@ shadow OTLP Scribe path.
 - `architecture/references/languages/implementation-execution.md`
 - `architecture/references/languages/testing-workflows.md`
 - `changes/active/bifrost-canonical-otel-signals/spec.md`
+
+## Execution evidence
+
+### Sequencing correction
+
+Scenario order was inverted deliberately. The tree arrived from T01 with the
+`direct_*` deletion staged and six compile errors, so Scenario 1 could not
+produce a meaningful RED until the crate compiled, and its GREEN additionally
+requires nested canonical batches to be persistable. The order run was:
+recursive `fixed_ipc` (S3's refactor) → Scenario 4's deletion → Scenario 1 →
+Scenario 2 → Scenario 3.
+
+### Bounded corrections
+
+1. **`IngressPayload::Canonical(CanonicalIngress)` instead of
+   `ValidatedCanonicalFrame`.** The task's frame bundles `table`,
+   `resolved_schema_identity`, `row_ordinal_range`, `correlations`, and
+   `memory_owner`. Every one of those already travels on `ScribeIngressFrame`
+   or is derived by the existing plan/stamp machinery. The delivered shape
+   carries only what was actually missing — the validated batches plus the
+   move-only decode owner — and the accepted-subset ordinal range is the
+   batch's own row count, which Scribe stamps contiguously from zero.
+   `expected_schema_fingerprint` was removed and restored: the catalog-less
+   test Scribe resolves a logical frame from it.
+2. **OTLP wire ceilings moved rather than deleted.** `OtlpCounts` and its
+   count pass moved verbatim to a new crate-root `otlp_limits.rs` that Gate
+   calls before projecting, preserving admission fairness and the public
+   `PayloadTooLarge` / `InvalidFrame` codes.
+3. **`native_payload` collapsed out of `execution_lanes`.** With
+   `ProjectedArrow` gone there is one stamping path; `decode_rows` and
+   `stamp_correlation_columns` are now signal-neutral and always relinquish and
+   restamp `run_id`.
+4. **Three defects outside the task text but on its required path.** A public
+   canonical write could not complete end to end until each was fixed; all
+   three are T01 fallout that only a nested canonical table reaches:
+   - `material_plan`'s native preflight validated one field node per top-level
+     column, refusing every `List`/`Struct` column as a malformed frame. It now
+     walks fields depth-first with per-node row counts, `Struct` contributing a
+     validity buffer and `List` a validity plus offsets buffer, and validates a
+     list's offsets against its item node's length.
+   - The catalog registered a built-in through `fingerprint_fields` (nested
+     metadata stripped) while ingest fingerprinted the same schema through
+     `SchemaFingerprint::from_arrow_schema` (unstripped), so no nested table
+     could match itself. Both now go through `SchemaFingerprint::from_fields`.
+   - The Oracle tail fence compared a schema read back through Iceberg — which
+     renames list elements to `element` and widens `Binary`/`Utf8` — against
+     the declared one. The fingerprint now normalizes those renderings, and
+     `tail_fence.rs`'s ad-hoc timestamp mapper was deleted.
+5. **Journey fixture rebuilt on the canonical projection.**
+   `wyrd-testing`'s `span_batch` hand-assembled 18 columns against a 37-field
+   ledger. It now projects real OTLP spans, and the two reads moved from
+   `duration_ms`/`status` to the canonical `duration_nano`/`status_code`.
+
+### Observation (not fixed, outside this task)
+
+`ReplayedAppendMeta::payload_digest` (SHA-256 over the stored record payload)
+does not reproduce the `slice_set_digest` the shard commits from the writer's
+`payload_digest`. Recovery therefore cannot re-derive a fence's digest from the
+bytes it read. No existing test covers this and it is unrelated to canonical
+convergence; Scenario 3 asserts the fence's identity, slice count, and
+recovered rows instead.
+
+### Scenarios
+
+- **S1** — RED: `gate_routes_logical_frame_without_catalog_resolution` asserted
+  one Scribe call for an empty export, which the accepted-subset contract makes
+  wrong. GREEN: replaced by
+  `gate::tests::mixed_otlp_projection_assigns_only_accepted_contiguous_ordinals`
+  (2 accepted / 1 rejected → one batch of exactly 2 rows) and
+  `gate::tests::all_invalid_otlp_returns_existing_outcome_without_scribe`
+  (0 accepted / 2 rejected → zero Scribe calls, outcome preserved). Both pass.
+- **S2** — RED: `recursive_plan_roundtrips_nested_metadata_batch` could not be
+  built; `validate_schema` rejected field metadata and non-flat schemas and
+  `BatchFacts` emitted one node per top-level column. GREEN: `fixed_ipc` walks
+  arrays depth-first through one shared traversal used by both the count and
+  write passes.
+  `scribe::scribe_persistence_path::canonical_nested_batches_share_one_managed_wal_path`
+  persists a `List<Struct<..>>` batch and reads it back byte-identical from the
+  tail with its managed envelope stamped.
+- **S3** — `scribe::replay::tests::nested_accepted_subset_replays_one_fence_and_digest`
+  projects a mixed export, appends the accepted subset, and replays the WAL
+  directory: exactly one fence, one slice, two rows, nested columns intact.
+- **S4** — `scribe::ingress::tests::scribe_boundary_contains_no_otlp_signal_payload`
+  pins `IngressPayload` to the native frame and canonical batches and fails if
+  an OTLP variant returns. `otlp_managed.rs` (1033 lines), `direct_traces.rs`,
+  `direct_logs.rs`, `direct_metrics.rs`, `test_projection_oracle/`,
+  `AdmittedRows::Otlp`, `OtlpTypedRows`, `OtlpAdmittedRows`,
+  `OtlpSliceProducer`, `ScribeOtlpOutcome`, `FrameAdmission::otlp_outcome`,
+  `count_schema`, `FixedIpcColumnPlan`, and `BatchFacts::from_columns` are gone.
+
+### Commands
+
+```bash
+mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib \
+  --features test-support,bench-support \
+  -E 'test(=gate::tests::mixed_otlp_projection_assigns_only_accepted_contiguous_ordinals)'
+mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib \
+  --features test-support,bench-support \
+  -E 'test(=gate::tests::all_invalid_otlp_returns_existing_outcome_without_scribe)'
+mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib \
+  --features test-support,bench-support \
+  -E 'test(=scribe::scribe_persistence_path::canonical_nested_batches_share_one_managed_wal_path)'
+mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib \
+  --features test-support,bench-support \
+  -E 'test(=scribe::replay::tests::nested_accepted_subset_replays_one_fence_and_digest)'
+mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib \
+  --features test-support,bench-support \
+  -E 'test(=scribe::ingress::tests::scribe_boundary_contains_no_otlp_signal_payload)'
+mise run test:bifrost:journey:scribe   # 19/19
+mise run test:bifrost
+mise run fmt
+mise run lints
+git diff --check
+```
+
+The scenario test path is `scribe::scribe_persistence_path::...`, not
+`scribe::tests::scribe_persistence_path::...`; the module is mounted without a
+`tests` segment.

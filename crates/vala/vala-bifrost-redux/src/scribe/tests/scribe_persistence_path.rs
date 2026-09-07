@@ -110,90 +110,213 @@ fn principal(tenant: DataTenantId) -> Principal {
     }
 }
 
-/// Build a canonical nested batch shaped like the signal ledgers' output.
+/// Build the projected metric batch this fixture drives, at a fixed partition.
 ///
-/// The columns carry `PARQUET:field_id` metadata and a `List<Struct<..>>`
-/// repeated-record column, which is the deepest shape any canonical signal
-/// projection emits. Only the recursive fixed IPC encoder can persist it, so
-/// this fixture proves the managed WAL path accepts canonical nesting.
+/// The rows come from the owning `OTLP` metrics projector, so the fixture
+/// carries exactly the nested, metadata-bearing, correlation-column shape a
+/// real signal write produces rather than a hand-built imitation. One
+/// caller-supplied `wyrd_event_time` column is prepended so every row lands in
+/// one deterministic partition the tail request can select.
 ///
 /// # Panics
-/// Panics when the Arrow fixture cannot be constructed.
-fn nested_batch(partition: crate::catalog::layout::TimePartition) -> RecordBatch {
-    use arrow::array::{Float64Array, ListArray, StringArray, StructArray};
-    use arrow::buffer::OffsetBuffer;
-    use arrow::datatypes::Fields;
-    use std::collections::HashMap;
-
-    let with_id = |field: Field, id: i32| {
-        field.with_metadata(HashMap::from([(
-            "PARQUET:field_id".to_owned(),
-            id.to_string(),
-        )]))
+///
+/// Panics when the projection rejects a point or the event-time column cannot
+/// be attached.
+fn projected_metric_batch(partition: crate::catalog::layout::TimePartition) -> RecordBatch {
+    use wyrd_tonic::otlp::metrics::v1::{
+        Metric, ResourceMetrics, ScopeMetrics, Summary, SummaryDataPoint, metric,
+        summary_data_point::ValueAtQuantile,
     };
-    let quantile_fields = Fields::from(vec![
-        with_id(Field::new("quantile", DataType::Float64, false), 3),
-        with_id(Field::new("value", DataType::Float64, true), 4),
-    ]);
-    let quantiles = Arc::new(StructArray::new(
-        quantile_fields.clone(),
-        vec![
-            Arc::new(Float64Array::from(vec![0.5, 0.9])) as ArrayRef,
-            Arc::new(Float64Array::from(vec![Some(1.0), None])),
+
+    let point = |index: u64| SummaryDataPoint {
+        attributes: Vec::new(),
+        start_time_unix_nano: 0,
+        time_unix_nano: index + 1,
+        count: index + 1,
+        sum: 1.5,
+        quantile_values: vec![
+            ValueAtQuantile {
+                quantile: 0.5,
+                value: 1.0,
+            },
+            ValueAtQuantile {
+                quantile: 0.9,
+                value: 2.0,
+            },
         ],
-        None,
-    ));
-    let element = Arc::new(with_id(
-        Field::new("item", DataType::Struct(quantile_fields), false),
-        2,
-    ));
-    let quantile_values = ListArray::new(
-        Arc::clone(&element),
-        OffsetBuffer::new(vec![0, 2].into()),
-        quantiles,
-        None,
-    );
+        flags: 0,
+    };
+    let request = vec![ResourceMetrics {
+        resource: None,
+        scope_metrics: vec![ScopeMetrics {
+            scope: None,
+            metrics: vec![Metric {
+                name: "latency".to_owned(),
+                description: String::new(),
+                unit: String::new(),
+                metadata: Vec::new(),
+                data: Some(metric::Data::Summary(Summary {
+                    data_points: (0..4).map(point).collect(),
+                })),
+            }],
+            schema_url: String::new(),
+        }],
+        schema_url: String::new(),
+    }];
+    let (projected, outcome) = crate::tables::metrics::project_resource_metrics(&request)
+        .expect("the owning metrics projector accepts the fixture");
+    assert_eq!(outcome.accepted_points, 4);
+
     let timestamp = partition.start_utc().timestamp_micros();
-    RecordBatch::try_new(
-        Arc::new(Schema::new(vec![
-            Field::new(
-                "wyrd_event_time",
-                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-                false,
-            ),
-            with_id(Field::new("metric_name", DataType::Utf8, false), 1),
-            Field::new(
-                "quantile_values",
-                DataType::List(Arc::clone(&element)),
-                false,
-            )
-            .with_metadata(HashMap::from([(
-                "PARQUET:field_id".to_owned(),
-                "5".to_owned(),
-            )])),
-        ])),
-        vec![
-            Arc::new(TimestampMicrosecondArray::from(vec![timestamp]).with_timezone("UTC")),
-            Arc::new(StringArray::from(vec!["latency"])),
-            Arc::new(quantile_values),
-        ],
-    )
-    .expect("canonical nested batch")
+    let mut fields = vec![Field::new(
+        "wyrd_event_time",
+        DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+        false,
+    )];
+    fields.extend(
+        projected
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.as_ref().clone()),
+    );
+    let mut columns: Vec<ArrayRef> = vec![Arc::new(
+        TimestampMicrosecondArray::from(vec![timestamp; projected.num_rows()]).with_timezone("UTC"),
+    )];
+    columns.extend(projected.columns().iter().map(Arc::clone));
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+        .expect("the projected batch accepts one caller event time")
+}
+
+/// Encode the supplied batches as one Arrow IPC stream.
+///
+/// # Panics
+///
+/// Panics when the batches cannot be written or the stream cannot be finished.
+fn ipc_stream(batches: &[RecordBatch]) -> Vec<u8> {
+    let schema = batches.first().expect("at least one batch").schema();
+    let mut bytes = Vec::new();
+    let mut writer =
+        arrow::ipc::writer::StreamWriter::try_new(&mut bytes, schema.as_ref()).expect("IPC writer");
+    for batch in batches {
+        writer.write(batch).expect("IPC batch");
+    }
+    writer.finish().expect("IPC terminal");
+    bytes
+}
+
+/// Read every stamped row of one frame, keyed by its batch id.
+///
+/// # Panics
+///
+/// Panics when a managed column is absent or carries the wrong Arrow type.
+fn stamped_rows(
+    batches: &[RecordBatch],
+    batch_id: Uuid,
+) -> Vec<(i32, String, arrow::array::ArrayRef)> {
+    use arrow::array::{Array, FixedSizeBinaryArray, Int32Array, StringArray};
+
+    let mut rows = Vec::new();
+    for batch in batches {
+        let ordinals = batch
+            .column_by_name("wyrd_row_ordinal")
+            .and_then(|column| column.as_any().downcast_ref::<Int32Array>())
+            .expect("wyrd_row_ordinal is Int32");
+        let ids = batch
+            .column_by_name("wyrd_batch_id")
+            .and_then(|column| column.as_any().downcast_ref::<FixedSizeBinaryArray>())
+            .expect("wyrd_batch_id is FixedSizeBinary(16)");
+        let names = batch
+            .column_by_name("metric_name")
+            .and_then(|column| column.as_any().downcast_ref::<StringArray>())
+            .expect("metric_name is Utf8");
+        let quantiles = batch
+            .column_by_name("quantile_values")
+            .expect("the nested canonical column survives the managed WAL path");
+        for row in 0..batch.num_rows() {
+            if ids.value(row) != batch_id.as_bytes() {
+                continue;
+            }
+            rows.push((
+                ordinals.value(row),
+                names.value(row).to_owned(),
+                quantiles.slice(row, 1),
+            ));
+        }
+    }
+    rows.sort_by_key(|(ordinal, _, _)| *ordinal);
+    rows
+}
+
+/// Assert both payload modes stamped one contiguous range and the same rows.
+///
+/// # Panics
+///
+/// Panics when either frame's ordinals are not `0..total_rows` in input order,
+/// or when the two frames do not read back identical user columns.
+fn assert_payload_modes_agree(
+    stored: &[RecordBatch],
+    canonical_batch_id: Uuid,
+    arrow_batch_id: Uuid,
+    total_rows: usize,
+) {
+    let canonical_rows = stamped_rows(stored, canonical_batch_id);
+    let arrow_rows = stamped_rows(stored, arrow_batch_id);
+    let expected_ordinals: Vec<i32> =
+        (0..i32::try_from(total_rows).expect("row count fits i32")).collect();
+    assert_eq!(
+        canonical_rows
+            .iter()
+            .map(|(ordinal, _, _)| *ordinal)
+            .collect::<Vec<_>>(),
+        expected_ordinals,
+        "one canonical batch stamps one contiguous ordinal range"
+    );
+    assert_eq!(
+        arrow_rows
+            .iter()
+            .map(|(ordinal, _, _)| *ordinal)
+            .collect::<Vec<_>>(),
+        expected_ordinals,
+        "one Arrow IPC stream stamps one contiguous ordinal range across every record batch"
+    );
+    assert_eq!(
+        canonical_rows
+            .iter()
+            .map(|(_, name, quantiles)| (name.clone(), quantiles.to_data()))
+            .collect::<Vec<_>>(),
+        arrow_rows
+            .iter()
+            .map(|(_, name, quantiles)| (name.clone(), quantiles.to_data()))
+            .collect::<Vec<_>>(),
+        "both payload modes read back identical user columns in input order"
+    );
 }
 
 /// Canonical nested batches take the one managed WAL path (S2).
 ///
-/// The nested, metadata-bearing shape an OTLP projection produces is admitted,
-/// managed-stamped, and durably appended through exactly the path a flat
-/// public canonical write takes, then read back losslessly from the tail.
+/// The nested, metadata-bearing shape the owning `OTLP` metrics projector
+/// produces is admitted, managed-stamped, and durably appended through exactly
+/// the path a flat public canonical write takes, in both payload modes. The
+/// same rows are submitted once as one canonical batch and once split across
+/// two record batches of one Arrow IPC stream, and the stream must behave as
+/// one request: one batch id, and one disjoint contiguous ordinal range over
+/// the whole stream rather than a range that restarts per record batch.
+///
+/// # Panics
+///
+/// Panics when either frame is refused, when the two payload modes do not read
+/// back identical user columns in input order, or when the Arrow stream does
+/// not carry one batch id and the contiguous ordinals `0..total_rows`.
 #[tokio::test]
 async fn canonical_nested_batches_share_one_managed_wal_path() {
     let tenant = DataTenantId::new_v7();
     let table = TableRef::new(BifrostNamespace::Bifrost, "scribe_nested_canonical");
     let day = fixture_event_day(1);
-    let rows = nested_batch(day);
-    let quantiles = Arc::clone(rows.column(2));
-    let batch_id = Uuid::now_v7();
+    let rows = projected_metric_batch(day);
+    let total_rows = rows.num_rows();
+    let canonical_batch_id = Uuid::now_v7();
+    let arrow_batch_id = Uuid::now_v7();
     let temp_dir = TempDir::new().expect("WAL temp dir");
     let operator = Arc::new(
         opendal::Operator::new(opendal::services::Memory::default())
@@ -211,29 +334,54 @@ async fn canonical_nested_batches_share_one_managed_wal_path() {
     );
     let scribe = ScribeImpl::new_for_embedded_with_deps(operator, wal, &Uuid::nil().to_string(), 1);
 
-    let principal = principal(tenant);
-    let request_id = RequestId::now_v7();
-    let admission = Scribe::ingest_frame(
-        &scribe,
+    let fingerprint = projected_source_schema_fingerprint(rows.schema().as_ref());
+    let frame = |batch_id: Uuid, payload: IngressPayload| {
+        let principal = principal(tenant);
+        let request_id = RequestId::now_v7();
         ScribeIngressFrame {
             authenticated_tenant: tenant,
             audit_event: frame_audit_event(&principal, &table, &request_id),
             principal,
             table: table.clone(),
-            expected_schema_fingerprint: Some(projected_source_schema_fingerprint(
-                rows.schema().as_ref(),
-            )),
+            expected_schema_fingerprint: Some(fingerprint),
             request_id,
             batch_id,
             measured_wire_bytes: 0,
-            payload: IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(
-                vec![rows],
-            )),
-        },
+            payload,
+        }
+    };
+
+    let canonical = Scribe::ingest_frame(
+        &scribe,
+        frame(
+            canonical_batch_id,
+            IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![
+                rows.clone(),
+            ])),
+        ),
     )
     .await
     .expect("nested canonical batches reach the managed WAL path");
-    assert_eq!(admission.rows_accepted, 1);
+    assert_eq!(
+        canonical.rows_accepted,
+        u64::try_from(total_rows).expect("row count")
+    );
+
+    let split = [rows.slice(0, 2), rows.slice(2, total_rows - 2)];
+    assert!(split.iter().all(|batch| batch.num_rows() > 0));
+    let arrow = Scribe::ingest_frame(
+        &scribe,
+        frame(
+            arrow_batch_id,
+            IngressPayload::ArrowIpc(bytes::Bytes::from(ipc_stream(&split))),
+        ),
+    )
+    .await
+    .expect("one Arrow IPC stream reaches the same managed WAL path");
+    assert_eq!(
+        arrow.rows_accepted,
+        u64::try_from(total_rows).expect("row count")
+    );
 
     let binding = TenantTableBinding::resolve((tenant, table)).expect("binding");
     let hot = scribe
@@ -244,23 +392,21 @@ async fn canonical_nested_batches_share_one_managed_wal_path() {
             target_stream: StreamIdentity::new(NodeId::new(Uuid::nil()), WriterEpoch::new(1)),
             start_partition: day,
             end_partition: day,
-            required_columns: vec!["quantile_values".to_owned(), "wyrd_row_ordinal".to_owned()],
+            required_columns: vec![
+                "metric_name".to_owned(),
+                "quantile_values".to_owned(),
+                "wyrd_row_ordinal".to_owned(),
+                "wyrd_batch_id".to_owned(),
+            ],
             predicates: Vec::new(),
             max_batches: 64,
             max_retained_bytes: 64 * 1024 * 1024,
         })
         .await
         .expect("hot snapshot");
-    assert_eq!(hot.len(), 1);
-    let projected = &hot[0].rows;
-    let nested = projected
-        .column_by_name("quantile_values")
-        .expect("the nested canonical column survives the managed WAL path");
-    assert_eq!(nested.as_ref(), quantiles.as_ref());
-    assert!(
-        projected.column_by_name("wyrd_row_ordinal").is_some(),
-        "the managed envelope stamps nested batches like every other write"
-    );
+    let stored: Vec<RecordBatch> = hot.into_iter().map(|batch| batch.rows).collect();
+
+    assert_payload_modes_agree(&stored, canonical_batch_id, arrow_batch_id, total_rows);
 
     scribe
         .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(1))

@@ -432,6 +432,7 @@ fn decode(
             batch_id,
             window,
             receipt_micros: None,
+            start_row_ordinal: 0,
         },
     )
 }
@@ -440,6 +441,9 @@ fn decode(
 ///
 /// This entry point lets persistence preprocessing consume a native stream one
 /// source at a time without collecting or concatenating its record batches.
+/// `start_row_ordinal` is the request-wide cursor its caller advances, so every
+/// record batch of one Arrow stream receives a disjoint contiguous ordinal
+/// range rather than restarting at zero.
 ///
 /// # Errors
 ///
@@ -447,40 +451,31 @@ fn decode(
 /// as the ordinary ingress decode path.
 pub(crate) fn decode_native_batch(
     rows: &RecordBatch,
-    principal: &Principal,
-    expected_schema_fingerprint: SchemaFingerprint,
-    request_id: &RequestId,
-    batch_id: uuid::Uuid,
-    window: EventTimeWindow,
-    receipt_micros: i64,
+    context: &DecodeContext<'_>,
 ) -> Result<RecordBatch, ScribeError> {
-    decode_rows(
-        rows,
-        &DecodeContext {
-            principal,
-            expected_schema_fingerprint,
-            request_id,
-            batch_id,
-            window,
-            receipt_micros: Some(receipt_micros),
-        },
-    )
+    decode_rows(rows, context)
 }
 
 /// Immutable validation and stamping context for one decoded batch.
-struct DecodeContext<'a> {
+///
+/// Native persistence preprocessing owns one of these per request and advances
+/// `start_row_ordinal` across the record batches of one Arrow stream, so the
+/// whole request shares one contiguous physical ordinal range.
+pub(crate) struct DecodeContext<'a> {
     /// Authenticated principal used for scope checks and managed columns.
-    principal: &'a Principal,
+    pub(crate) principal: &'a Principal,
     /// Catalog fingerprint required of the caller-owned source schema.
-    expected_schema_fingerprint: SchemaFingerprint,
+    pub(crate) expected_schema_fingerprint: SchemaFingerprint,
     /// Stable request identity stamped into every accepted row.
-    request_id: &'a RequestId,
+    pub(crate) request_id: &'a RequestId,
     /// Stable batch identity stamped into every accepted row.
-    batch_id: uuid::Uuid,
+    pub(crate) batch_id: uuid::Uuid,
     /// Accepted caller event-time window.
-    window: EventTimeWindow,
+    pub(crate) window: EventTimeWindow,
     /// Fixed receipt time retained by current-only native production.
-    receipt_micros: Option<i64>,
+    pub(crate) receipt_micros: Option<i64>,
+    /// First physical row ordinal this batch stamps within its request.
+    pub(crate) start_row_ordinal: i32,
 }
 
 /// Applies source-contract validation and server-managed stamping to one batch.
@@ -528,14 +523,7 @@ fn decode_rows(
         });
     }
     validate_card_scope(rows, context.principal)?;
-    stamp_correlation_columns(
-        rows,
-        context.principal,
-        context.request_id,
-        context.batch_id,
-        context.window,
-        context.receipt_micros,
-    )
+    stamp_correlation_columns(rows, context)
 }
 
 fn source_schema_fingerprint(schema: &Schema) -> SchemaFingerprint {
@@ -647,12 +635,17 @@ fn validate_card_scope(rows: &RecordBatch, principal: &Principal) -> Result<(), 
 /// fails.
 fn stamp_correlation_columns(
     rows: &RecordBatch,
-    principal: &Principal,
-    request_id: &RequestId,
-    batch_id: uuid::Uuid,
-    window: EventTimeWindow,
-    receipt_micros: Option<i64>,
+    context: &DecodeContext<'_>,
 ) -> Result<RecordBatch, ScribeError> {
+    let DecodeContext {
+        principal,
+        request_id,
+        window,
+        receipt_micros,
+        ..
+    } = context;
+    let (principal, request_id, window) = (*principal, *request_id, *window);
+    let receipt_micros = *receipt_micros;
     let row_count = rows.num_rows();
     // Compute one receipt instant for the whole batch so clock ticks mid-batch
     // cannot split the verdict.
@@ -718,8 +711,7 @@ fn stamp_correlation_columns(
     append_managed_columns(
         &mut fields,
         &mut columns,
-        principal,
-        batch_id,
+        context,
         row_count,
         caller_event_time,
         receipt_micros,
@@ -989,15 +981,21 @@ fn resolve_card_uids(
 /// Returns [`ScribeError::Internal`] when the system clock precedes the UNIX
 /// epoch, the receipt timestamp exceeds Arrow's range, or batch-id stamping
 /// fails, and [`ScribeError::TooManyRows`] when a row ordinal exceeds `i32`.
+///
+/// Row ordinals run `start_row_ordinal..start_row_ordinal + row_count`, so a
+/// caller streaming one request across several record batches passes its
+/// advancing cursor here and the request's rows carry one disjoint contiguous
+/// range.
 fn append_managed_columns(
     fields: &mut Vec<Field>,
     columns: &mut Vec<ArrayRef>,
-    principal: &Principal,
-    batch_id: uuid::Uuid,
+    context: &DecodeContext<'_>,
     row_count: usize,
     caller_event_time: Option<ArrayRef>,
     receipt_micros: i64,
 ) -> Result<(), ScribeError> {
+    let batch_id = context.batch_id;
+    let start_row_ordinal = context.start_row_ordinal;
     fields.extend([
         Field::new(CARD_UID, DataType::Utf8, true),
         Field::new(PRINCIPAL_ID, DataType::Utf8, false),
@@ -1033,17 +1031,20 @@ fn append_managed_columns(
     }
     columns.push(Arc::new(batch_id_builder.finish()));
     let mut ordinal_builder = Int32Builder::with_capacity(row_count);
-    for ordinal in 0..row_count {
-        ordinal_builder.append_value(i32::try_from(ordinal).map_err(|_| {
-            ScribeError::TooManyRows {
-                rows: row_count as u64,
+    for offset in 0..row_count {
+        let ordinal = i32::try_from(offset)
+            .ok()
+            .and_then(|offset| start_row_ordinal.checked_add(offset))
+            .ok_or(ScribeError::TooManyRows {
+                rows: u64::try_from(start_row_ordinal).unwrap_or_default() + row_count as u64,
                 limit: (i32::MAX - 1) as u64,
-            }
-        })?);
+            })?;
+        ordinal_builder.append_value(ordinal);
     }
     columns.push(Arc::new(ordinal_builder.finish()));
     columns.push(Arc::new(StringArray::from(vec![
-        principal
+        context
+            .principal
             .tenant_id
             .to_string();
         row_count
@@ -2013,6 +2014,26 @@ mod tests {
         )
     }
 
+    /// Build the default stamping context these unit cases decode under.
+    ///
+    /// Every field but the principal and request identity is the production
+    /// default, and the ordinal cursor starts at zero, which is what a
+    /// single-batch decode always passes.
+    fn stamping_context<'a>(
+        principal: &'a Principal,
+        request_id: &'a RequestId,
+    ) -> super::DecodeContext<'a> {
+        super::DecodeContext {
+            principal,
+            expected_schema_fingerprint: SchemaFingerprint([0_u8; 32]),
+            request_id,
+            batch_id: Uuid::now_v7(),
+            window: EventTimeWindow::default(),
+            receipt_micros: None,
+            start_row_ordinal: 0,
+        }
+    }
+
     fn batch(fields: Vec<Field>, columns: Vec<ArrayRef>) -> RecordBatch {
         RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("test batch")
     }
@@ -2024,15 +2045,9 @@ mod tests {
             vec![Field::new("value", DataType::Int64, false)],
             vec![Arc::clone(&value)],
         );
-        let stamped = stamp_correlation_columns(
-            &rows,
-            &principal(),
-            &RequestId::now_v7(),
-            Uuid::now_v7(),
-            EventTimeWindow::default(),
-            None,
-        )
-        .expect("stamp");
+        let stamped =
+            stamp_correlation_columns(&rows, &stamping_context(&principal(), &RequestId::now_v7()))
+                .expect("stamp");
         let value_index = stamped.schema().index_of("value").expect("value column");
         assert!(Arc::ptr_eq(&value, stamped.column(value_index)));
     }
@@ -2045,15 +2060,9 @@ mod tests {
             vec![Arc::new(Int64Array::from(vec![1_i64, 2_i64]))],
         );
 
-        let stamped = stamp_correlation_columns(
-            &rows,
-            &principal(),
-            &RequestId::now_v7(),
-            Uuid::now_v7(),
-            EventTimeWindow::default(),
-            None,
-        )
-        .expect("stamp native batch");
+        let stamped =
+            stamp_correlation_columns(&rows, &stamping_context(&principal(), &RequestId::now_v7()))
+                .expect("stamp native batch");
 
         let run_id = stamped.schema().index_of("run_id").expect("run_id field");
         assert!(stamped.schema().field(run_id).is_nullable());
@@ -3645,27 +3654,36 @@ mod tests {
         )
     }
 
+    /// How a single-row fixture carries its optional `card_ref` correlation.
+    #[derive(Debug, Clone, Copy)]
+    enum SuppliedCardRef<'a> {
+        /// The batch has no `card_ref` column at all.
+        Absent,
+        /// The batch has the column and the row's value is null.
+        Null,
+        /// The batch has the column and the row carries this text.
+        Text(&'a str),
+    }
+
     /// Stamp one single-row batch carrying the supplied optional `card_ref`.
-    ///
-    /// `None` omits the column entirely so the absent-correlation path is
-    /// reachable through the same helper as the explicit-null path.
     fn stamp_card_ref(
         principal: &Principal,
-        card_ref: Option<Option<&str>>,
+        card_ref: SuppliedCardRef<'_>,
     ) -> Result<RecordBatch, ScribeError> {
         let mut fields = vec![Field::new("value", DataType::Int64, false)];
         let mut columns: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![1_i64]))];
-        if let Some(value) = card_ref {
+        let value = match card_ref {
+            SuppliedCardRef::Absent => None,
+            SuppliedCardRef::Null => Some(None),
+            SuppliedCardRef::Text(text) => Some(Some(text)),
+        };
+        if let Some(value) = value {
             fields.push(Field::new(CARD_REF, DataType::Utf8, true));
             columns.push(Arc::new(StringArray::from(vec![value])));
         }
         stamp_correlation_columns(
             &batch(fields, columns),
-            principal,
-            &RequestId::now_v7(),
-            Uuid::now_v7(),
-            EventTimeWindow::default(),
-            None,
+            &stamping_context(principal, &RequestId::now_v7()),
         )
     }
 
@@ -3701,7 +3719,10 @@ mod tests {
             CardRefScope::from_root_and_members(&root, [secondary.clone()]),
         );
 
-        for (label, supplied) in [("absent", None), ("explicit null", Some(None))] {
+        for (label, supplied) in [
+            ("absent", SuppliedCardRef::Absent),
+            ("explicit null", SuppliedCardRef::Null),
+        ] {
             let stamped = stamp_card_ref(&principal, supplied)
                 .unwrap_or_else(|_| panic!("{label} correlation is admitted"));
             assert_eq!(
@@ -3730,7 +3751,7 @@ mod tests {
                 uid: None,
                 ..member.clone()
             };
-            let stamped = stamp_card_ref(&principal, Some(Some(&identity.to_string())))
+            let stamped = stamp_card_ref(&principal, SuppliedCardRef::Text(&identity.to_string()))
                 .expect("a signed scope member is admitted");
             assert_eq!(
                 stamped_card_uid(&stamped).as_deref(),
@@ -3743,7 +3764,7 @@ mod tests {
             uid: Some(CardUid::new(Uuid::now_v7().to_string()).expect("forged uid")),
             ..secondary.clone()
         };
-        let stamped = stamp_card_ref(&principal, Some(Some(&forged.to_string())))
+        let stamped = stamp_card_ref(&principal, SuppliedCardRef::Text(&forged.to_string()))
             .expect("a client UID does not change the signed identity");
         assert_eq!(
             stamped_card_uid(&stamped).as_deref(),
@@ -3773,8 +3794,8 @@ mod tests {
                 "prod/Service/other@1.0.0".to_owned(),
             ),
         ] {
-            let error =
-                stamp_card_ref(principal, Some(Some(&supplied))).expect_err("{label} fails closed");
+            let error = stamp_card_ref(principal, SuppliedCardRef::Text(&supplied))
+                .expect_err("{label} fails closed");
             assert!(
                 matches!(error, ScribeError::CardUnresolved),
                 "{label} fails closed without registry IO"

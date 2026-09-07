@@ -143,6 +143,8 @@ pub(crate) struct NativeSliceProducer {
     current: Option<NativeCurrentSource>,
     /// Zero-based ordinal assigned to the next slice.
     slice_index: u32,
+    /// Request-wide physical row ordinal assigned to the next decoded row.
+    next_row_ordinal: i32,
     /// Exact count established by the non-retaining first pass.
     slice_count: u32,
     /// Canonical batch audit cloned only into the current durable slice.
@@ -191,6 +193,7 @@ impl NativeSliceProducer {
             source_index: 0,
             current: None,
             slice_index: 0,
+            next_row_ordinal: 0,
             slice_count: 0,
             audit_event,
             tenant,
@@ -246,7 +249,17 @@ impl NativeSliceProducer {
                 return Ok(None);
             };
             self.source_index += 1;
-            let rows = stamp_native_source(&rows, &self.source)?;
+            let rows = stamp_native_source(&rows, &self.source, self.next_row_ordinal)?;
+            // Advance only after stamping succeeded, so a refused record batch
+            // never consumes ordinals the accepted stream would have used.
+            self.next_row_ordinal = i32::try_from(rows.num_rows())
+                .ok()
+                .and_then(|count| self.next_row_ordinal.checked_add(count))
+                .ok_or(ScribeError::TooManyRows {
+                    rows: u64::try_from(self.next_row_ordinal).unwrap_or_default()
+                        + rows.num_rows() as u64,
+                    limit: (i32::MAX - 1) as u64,
+                })?;
             let partitions = plan_time_partitions(&rows, self.partition_granularity)?;
             self.current = Some(NativeCurrentSource {
                 rows,
@@ -367,15 +380,19 @@ fn decode_planned_native_source(
 fn stamp_native_source(
     rows: &RecordBatch,
     source: &NativeAdmittedRows,
+    start_row_ordinal: i32,
 ) -> Result<RecordBatch, ScribeError> {
     crate::scribe::execution_lanes::decode_native_batch(
         rows,
-        &source.principal,
-        source.expected_schema_fingerprint,
-        &source.request_id,
-        source.batch_id,
-        source.event_time_window,
-        source.receipt_micros,
+        &crate::scribe::execution_lanes::DecodeContext {
+            principal: &source.principal,
+            expected_schema_fingerprint: source.expected_schema_fingerprint,
+            request_id: &source.request_id,
+            batch_id: source.batch_id,
+            window: source.event_time_window,
+            receipt_micros: Some(source.receipt_micros),
+            start_row_ordinal,
+        },
     )
 }
 

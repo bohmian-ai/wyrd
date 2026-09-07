@@ -1287,6 +1287,44 @@ mod pg_tests {
                 walked, sorted,
                 "with one shared timestamp the walk is ordered by operation id"
             );
+            assert_eq!(
+                pages, 3,
+                "five open operations at a cap of two are exactly three pages"
+            );
+
+            // The overflow flag is the walk's only stopping condition, so it
+            // must be exact at the boundary rather than merely eventually
+            // false: a page holding every remaining row has not overflowed even
+            // though the reader asked for one more than it can return.
+            let mut conn = TenantConn::acquire(pool, tenant)
+                .await
+                .expect("tenant connection for the boundary page");
+            let exact = ops
+                .list_open(&mut conn, 5, None)
+                .await
+                .expect("a page that holds every open operation");
+            assert_eq!(exact.operations.len(), 5);
+            assert!(
+                !exact.overflowed,
+                "a page that returned every open operation has nothing past it"
+            );
+            let under = ops
+                .list_open(&mut conn, 4, None)
+                .await
+                .expect("a page one short of the open set");
+            assert_eq!(under.operations.len(), 4);
+            assert!(
+                under.overflowed,
+                "a page one short of the open set reports what it could not return"
+            );
+            assert!(
+                matches!(
+                    ops.list_open(&mut conn, 0, None).await,
+                    Err(SqlError::Conflict { .. })
+                ),
+                "a zero cap is refused rather than silently returning nothing"
+            );
+            conn.commit().await.expect("boundary read commit");
         }
 
         /// Builds one snapshot-expiry detail for the fixed test resource.

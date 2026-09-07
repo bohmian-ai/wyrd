@@ -354,3 +354,86 @@ async fn latest_small_files_task(
         .rfind(|task| task.strategy == "small_files")
         .expect("the fixture planned at least one small-files task")
 }
+
+/// Reconciliation classifies every open operation, not one bounded page of them.
+///
+/// One attempt now opens an operation per published plan, so a table can hold
+/// more open rows than the per-table page bound. A reader that stopped at the
+/// first page would leave the rest of them unclassified and permanently
+/// blocking, so the walk continues from the row it last classified — including
+/// the rows it could not resolve — and closes with one recheck of the first
+/// page. The page bound is set to one here so that a single ordinary attempt
+/// already exceeds it.
+///
+/// Every commit's response is lost after the catalog accepted it, which is the
+/// one failure that leaves an operation genuinely open: the replacement landed,
+/// but only the retained evidence can prove it. The successor is then required
+/// to settle all of them.
+///
+/// # Panics
+///
+/// Panics when the attempt leaves no more open operations than one page holds,
+/// or when the takeover leaves any of them open.
+#[tokio::test]
+async fn reconciliation_walks_every_open_operation_a_page_cannot_hold() {
+redacted
+    promoted.fixture.config.max_open_operations_per_table = 1;
+    let object_store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
+    let catalog = PromotionCatalogSeam::new(
+        promoted.fixture.catalog.iceberg_catalog(),
+        object_store.read_counter(),
+    );
+    let (clock, control) = super::support::manual_clock();
+    let mut supervisor = SupervisedPromotion::start(
+        &promoted.fixture,
+        Arc::clone(&catalog) as Arc<dyn iceberg::Catalog>,
+        Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
+        clock,
+    );
+    promoted.fixture.seal_more(2).await;
+    supervisor.run_one_success().await;
+
+    catalog.lose_commit_responses(true);
+    supervisor.restart_worker();
+    supervisor.run_one_failure().await;
+    catalog.lose_commit_responses(false);
+
+    let open = promoted.fixture.rewrite_operations().await;
+    assert!(
+        open.len() > promoted.fixture.config.max_open_operations_per_table,
+        "the attempt must leave more open operations than one page holds: {open:?}"
+    );
+    assert!(
+        open.iter().all(|(_, phase)| phase == "prepared"),
+        "a lost commit response leaves its operation open: {open:?}"
+    );
+
+    // Reconciliation refuses to call a young operation absent, so the takeover
+    // only starts once the uncertainty bound and the reclaim backoff lapse.
+    // Measured from wall clock rather than from the manual clock's own base:
+    // the operations were prepared with database timestamps taken while this
+    // attempt ran, so only a bound taken after them makes them old enough.
+    let settled_at = chrono::Utc::now()
+        + chrono::Duration::from_std(promoted.fixture.config.uncertainty_bound)
+            .expect("the uncertainty bound is representable")
+        + chrono::Duration::seconds(1);
+    control
+        .set(settled_at)
+        .expect("manual Forge clock advances");
+    promoted.fixture.expire_claims().await;
+    supervisor.reclaim_expired_claims().await;
+    promoted.fixture.clear_task_backoff().await;
+    supervisor.restart_worker();
+    let reconciliation = supervisor.run_one_failure().await;
+    supervisor.shutdown().await;
+
+    // The successor refuses to plan while any open operation is unaccounted
+    // for, and it names how many it accounted for. That count is the proof: a
+    // reader bounded by one page would have reported one open operation and
+    // silently left the rest of them unclassified.
+    assert!(
+        reconciliation.contains(&format!("{} unresolved live operations", open.len())),
+        "reconciliation classified every open operation, not one page of them: \
+         {reconciliation} over {open:?}"
+    );
+}

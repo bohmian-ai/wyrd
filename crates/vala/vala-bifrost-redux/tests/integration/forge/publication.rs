@@ -191,7 +191,6 @@ async fn rewrite_scheduler_dispatches_only_after_promotion_and_authority() {
         HeldAuthorityMutation::LeaseExpired,
         HeldAuthorityMutation::AttemptCancelled,
         HeldAuthorityMutation::DeadlineElapsed,
-        HeldAuthorityMutation::BranchMovedByAnotherWriter,
     ] {
         assert_held_authority_change_refuses(&telemetry, mutation).await;
     }
@@ -797,22 +796,19 @@ enum HeldAuthorityMutation {
     AttemptCancelled,
     /// The manual Forge clock passes the publication's absolute deadline.
     DeadlineElapsed,
-    /// Another writer commits, moving the branch off the planned base.
-    BranchMovedByAnotherWriter,
 }
 
 impl HeldAuthorityMutation {
     /// Names the table this phase owns.
     ///
-    /// Each phase gets a fresh table because a refusal is durable: a moved
-    /// branch or an expired lease stays refused, so phases sharing one table
-    /// would prove only the first mutation.
+    /// Each phase gets a fresh table because a refusal is durable: an expired
+    /// lease stays refused, so phases sharing one table would prove only the
+    /// first mutation.
     const fn table_name(self) -> &'static str {
         match self {
             Self::LeaseExpired => "rewrite_hold_lease",
             Self::AttemptCancelled => "rewrite_hold_cancel",
             Self::DeadlineElapsed => "rewrite_hold_deadline",
-            Self::BranchMovedByAnotherWriter => "rewrite_hold_branch",
         }
     }
 
@@ -827,7 +823,6 @@ impl HeldAuthorityMutation {
             Self::LeaseExpired => "LeaseLost",
             Self::AttemptCancelled => "Cancelled",
             Self::DeadlineElapsed => "Deadline",
-            Self::BranchMovedByAnotherWriter => "BranchMoved",
         }
     }
 }
@@ -907,24 +902,9 @@ async fn assert_held_authority_change_refuses(
     let span_mark = telemetry.mark();
     supervisor.restart_worker();
     let worker_stop = supervisor.worker_stop();
-    // Filled only by the branch-moved phase, from inside the held window: the
-    // cut the concurrent writer left is captured after its own commit and
-    // before publication is released, so it is an expectation this attempt
-    // cannot have influenced.
-    let concurrent_cut = std::sync::Mutex::new(None::<LiveCut>);
     let error = supervisor
         .run_one_failure_holding_handoff(async {
-            *concurrent_cut
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                apply_held_authority_mutation(
-                    mutation,
-                    &promoted,
-                    &control,
-                    &worker_stop,
-                    &planned,
-                )
-                .await;
+            apply_held_authority_mutation(mutation, &promoted, &control, &worker_stop).await;
         })
         .await;
     let possible_outputs = supervisor.last_possible_rewrite_outputs();
@@ -971,9 +951,6 @@ async fn assert_held_authority_change_refuses(
         mutation,
         span_mark,
         planned: &planned,
-        concurrent: concurrent_cut
-            .into_inner()
-            .unwrap_or_else(std::sync::PoisonError::into_inner),
         objects_before: &objects_before,
         possible_outputs,
         error: &error,
@@ -984,11 +961,8 @@ async fn assert_held_authority_change_refuses(
 /// Applies one held-authority phase's mutation while publication is held.
 ///
 /// Each arm changes the durable owner production code consults and nothing
-/// else; no verdict, branch, or decision is injected. Returns the live cut the
-/// concurrent writer left for
-/// [`HeldAuthorityMutation::BranchMovedByAnotherWriter`], captured after that
-/// writer's own commit and before publication is released, and `None` for
-/// every other phase, which expects the pre-mutation cut unchanged.
+/// else; no verdict, branch, or decision is injected. Every phase expects the
+/// pre-mutation cut unchanged afterwards.
 ///
 /// # Panics
 ///
@@ -999,16 +973,13 @@ async fn apply_held_authority_mutation(
     promoted: &PromotedRewriteFixture,
     control: &vala_bifrost_redux::forge::ForgeClockControl,
     worker_stop: &tokio_util::sync::CancellationToken,
-    planned: &LiveCut,
-) -> Option<LiveCut> {
+) {
     match mutation {
         HeldAuthorityMutation::LeaseExpired => {
             promoted.fixture.expire_table_lease().await;
-            None
         }
         HeldAuthorityMutation::AttemptCancelled => {
             worker_stop.cancel();
-            None
         }
         HeldAuthorityMutation::DeadlineElapsed => {
             let elapsed = control.now().expect("manual Forge clock")
@@ -1016,12 +987,6 @@ async fn apply_held_authority_mutation(
                     .expect("the Iceberg retry budget is representable")
                 + chrono::Duration::seconds(1);
             control.set(elapsed).expect("manual Forge clock advances");
-            None
-        }
-        HeldAuthorityMutation::BranchMovedByAnotherWriter => {
-            let target = planned.data.iter().next().expect("a delete target").clone();
-            promoted.publish_deletes(&target, Some(0), None).await;
-            Some(live_cut(promoted).await)
         }
     }
 }
@@ -1042,13 +1007,6 @@ struct HeldAuthorityAftermath<'a> {
     span_mark: usize,
     /// Live cut the promotion left, before the mutation was applied.
     planned: &'a LiveCut,
-    /// Cut a concurrent writer committed inside the held window, when the
-    /// phase's mutation was such a commit.
-    ///
-    /// `Some` only for [`HeldAuthorityMutation::BranchMovedByAnotherWriter`],
-    /// where it is the independent expectation the post-refusal cut must equal.
-    /// Every other phase expects [`Self::planned`] unchanged, so it is `None`.
-    concurrent: Option<LiveCut>,
     /// Object digests taken immediately before the held attempt began.
     objects_before: &'a std::collections::BTreeMap<String, String>,
     /// Typed unsettled-output evidence the refusal carried, if it was typed.
@@ -1071,7 +1029,6 @@ async fn assert_refused_publication_left_no_trace(aftermath: HeldAuthorityAfterm
         mutation,
         span_mark,
         planned,
-        concurrent,
         objects_before,
         possible_outputs,
         error,
@@ -1080,29 +1037,9 @@ async fn assert_refused_publication_left_no_trace(aftermath: HeldAuthorityAfterm
     // 4. The live cut is exactly what the concurrent owner left, deletes
     //    included, and no managed output became live.
     let after = live_cut(promoted).await;
-    let expected = match mutation {
-        // This phase's mutation *is* a real commit by another writer, so the
-        // authoritative cut is the one that writer left — captured inside the
-        // held window, never re-read from the table after the refusal.
-        HeldAuthorityMutation::BranchMovedByAnotherWriter => concurrent
-            .unwrap_or_else(|| panic!("the branch-moved phase retained the concurrent cut")),
-        _ => planned.clone(),
-    };
-    if matches!(mutation, HeldAuthorityMutation::BranchMovedByAnotherWriter) {
-        // The concurrent commit has to have really attached something, or the
-        // equality below would be satisfied by a branch that never moved.
-        let attached = expected
-            .deletes
-            .difference(&planned.deletes)
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        assert!(
-            !attached.is_empty(),
-            "the concurrent writer attached the delete this phase committed: {expected:?}"
-        );
-    }
     assert_eq!(
-        after, expected,
+        after,
+        planned.clone(),
         "a refused publication leaves the published cut exactly as it was ({mutation:?})"
     );
     assert_eq!(
@@ -1117,9 +1054,8 @@ async fn assert_refused_publication_left_no_trace(aftermath: HeldAuthorityAfterm
     //    that no attempt can name, and nothing may be named that never existed.
     let objects_after = promoted.fixture.object_digests().await;
     let prefix = format!("{}/", promoted.fixture.binding.object_prefix);
-    // Scoped to the managed core's own output namespace: the branch-moved phase
-    // mutates the table by really committing, which legitimately writes fixture
-    // delete objects and Iceberg metadata that no rewrite attempt produced.
+    // Scoped to the managed core's own output namespace, so fixture objects
+    // and Iceberg metadata that no rewrite attempt produced stay out of it.
     let managed_prefix = format!("{prefix}data/forge/");
     let appeared = objects_after
         .keys()

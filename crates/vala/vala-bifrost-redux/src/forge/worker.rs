@@ -80,8 +80,8 @@ struct RewritePublication<'publication> {
     partition_spec_id: i32,
     /// Target file size the table's own property declared.
     target_file_size_bytes: u64,
-    /// Schema, spec, and sort identities the plan was authorized against.
-    planned_policy: (i32, i32, i64),
+    /// Schema identity the plan was authorized against.
+    planned_schema_id: i32,
     /// One commit budget, captured before the first attempt and never renewed.
     deadline: super::publication::RewritePublicationDeadline,
 }
@@ -4004,11 +4004,7 @@ impl ForgeWorker {
             target_file_size_bytes: super::managed::policy::declared_target_file_size_bytes(
                 metadata,
             )?,
-            planned_policy: (
-                metadata.current_schema_id(),
-                metadata.default_partition_spec_id(),
-                metadata.default_sort_order().order_id,
-            ),
+            planned_schema_id: metadata.current_schema_id(),
             deadline: super::publication::RewritePublicationDeadline::new(
                 self.forge.core.clock.now()?,
                 self.forge.core.config.iceberg_total_retry_timeout,
@@ -4466,7 +4462,7 @@ impl ForgeWorker {
                 lease,
                 current,
                 context.claim.base_snapshot_id,
-                context.planned_policy,
+                context.planned_schema_id,
                 context.deadline,
                 stop,
             )
@@ -4657,7 +4653,7 @@ impl ForgeWorker {
                         lease,
                         &refreshed,
                         request.base_snapshot_id,
-                        context.planned_policy,
+                        context.planned_schema_id,
                         context.deadline,
                         stop,
                     )
@@ -4700,7 +4696,7 @@ impl ForgeWorker {
         lease: &mut ForgeLease,
         table: &Table,
         base_snapshot_id: i64,
-        planned_policy: (i32, i32, i64),
+        planned_schema_id: i32,
         deadline: super::publication::RewritePublicationDeadline,
         stop: &CancellationToken,
     ) -> Result<super::publication::RewriteCommitAuthority, ForgeError> {
@@ -4717,16 +4713,8 @@ impl ForgeWorker {
                 deadline_passed: deadline.passed(self.forge.core.clock.now()?),
             },
             table: super::publication::RewriteTableAuthority {
-                branch_head_is_base: metadata
-                    .snapshot_for_ref(super::scribe_promotion::PROMOTION_BRANCH)
-                    .is_some_and(|snapshot| snapshot.snapshot_id() == base_snapshot_id),
                 base_is_retained: metadata.snapshot_by_id(base_snapshot_id).is_some(),
-                policy_unchanged: planned_policy
-                    == (
-                        metadata.current_schema_id(),
-                        metadata.default_partition_spec_id(),
-                        metadata.default_sort_order().order_id,
-                    ),
+                schema_unchanged: planned_schema_id == metadata.current_schema_id(),
             },
             files: super::publication::RewriteFileAuthority {
                 inputs_all_live: true,

@@ -765,12 +765,21 @@ pub(super) struct RewriteAttemptAuthority {
 /// Authority the table still being the planned table grants.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct RewriteTableAuthority {
-    /// The target branch head is still the planning base.
-    pub(super) branch_head_is_base: bool,
-    /// The planning base is still a retained snapshot.
+    /// The recorded planning snapshot is still retained.
+    ///
+    /// Retention, not currency: a rewrite is a replacement of a named file
+    /// set, so a head that has moved on for an unrelated reason does not
+    /// invalidate it. What would is the planning snapshot being expired out
+    /// from under the plan, because then nothing can say what the plan was
+    /// derived from.
     pub(super) base_is_retained: bool,
-    /// Schema, partition spec, and sort order still match the plan's policy.
-    pub(super) policy_unchanged: bool,
+    /// The current schema identity still equals the plan's.
+    ///
+    /// Partition spec and sort order are deliberately not here: neither
+    /// changes the meaning of the rows the outputs already carry, so neither
+    /// is an independent refusal. A changed schema is, because the outputs
+    /// were written against the old one.
+    pub(super) schema_unchanged: bool,
 }
 
 /// Authority the planned file set still being publishable grants.
@@ -815,12 +824,10 @@ pub(super) enum RewriteRefusal {
     Cancelled,
     /// The attempt's immutable deadline elapsed.
     Deadline,
-    /// The target branch head moved off the planning base.
-    BranchMoved,
-    /// The planning base is no longer retained.
+    /// The recorded planning snapshot is no longer retained.
     BaseNotRetained,
-    /// The table's schema, spec, or sort policy changed.
-    PolicyChanged,
+    /// The table's current schema identity changed.
+    SchemaChanged,
     /// A selected input is no longer live.
     InputsChanged,
     /// A delete this commit would remove still covers surviving data.
@@ -859,14 +866,11 @@ impl RewriteCommitAuthority {
         if self.attempt.deadline_passed {
             return RewriteCommitDecision::Refuse(RewriteRefusal::Deadline);
         }
-        if !self.table.branch_head_is_base {
-            return RewriteCommitDecision::Refuse(RewriteRefusal::BranchMoved);
-        }
         if !self.table.base_is_retained {
             return RewriteCommitDecision::Refuse(RewriteRefusal::BaseNotRetained);
         }
-        if !self.table.policy_unchanged {
-            return RewriteCommitDecision::Refuse(RewriteRefusal::PolicyChanged);
+        if !self.table.schema_unchanged {
+            return RewriteCommitDecision::Refuse(RewriteRefusal::SchemaChanged);
         }
         if !self.files.inputs_all_live {
             return RewriteCommitDecision::Refuse(RewriteRefusal::InputsChanged);
@@ -2040,12 +2044,11 @@ mod tests {
             2 => authority.fence.commit_window_fits = held,
             3 => authority.attempt.cancelled = !held,
             4 => authority.attempt.deadline_passed = !held,
-            5 => authority.table.branch_head_is_base = held,
-            6 => authority.table.base_is_retained = held,
-            7 => authority.table.policy_unchanged = held,
-            8 => authority.files.inputs_all_live = held,
-            9 => authority.files.delete_scope_safe = held,
-            _ => unreachable!("the authority matrix has exactly ten dimensions"),
+            5 => authority.table.base_is_retained = held,
+            6 => authority.table.schema_unchanged = held,
+            7 => authority.files.inputs_all_live = held,
+            8 => authority.files.delete_scope_safe = held,
+            _ => unreachable!("the authority matrix has exactly nine dimensions"),
         }
     }
 
@@ -2065,9 +2068,8 @@ mod tests {
                 deadline_passed: false,
             },
             table: RewriteTableAuthority {
-                branch_head_is_base: true,
                 base_is_retained: true,
-                policy_unchanged: true,
+                schema_unchanged: true,
             },
             files: RewriteFileAuthority {
                 inputs_all_live: true,
@@ -2076,12 +2078,12 @@ mod tests {
         }
     }
 
-    /// The ten single-dimension breaks in exact refusal order.
+    /// The nine single-dimension breaks in exact refusal order.
     ///
     /// Each case breaks exactly one dimension of an otherwise complete
     /// authority, so the expected refusal is also a proof of the order: an
     /// earlier check would have reported a different one.
-    fn single_dimension_refusals() -> [RefusalCase; 10] {
+    fn single_dimension_refusals() -> [RefusalCase; 9] {
         [
             (
                 |authority| authority.fence.lease_held = false,
@@ -2104,16 +2106,12 @@ mod tests {
                 RewriteRefusal::Deadline,
             ),
             (
-                |authority| authority.table.branch_head_is_base = false,
-                RewriteRefusal::BranchMoved,
-            ),
-            (
                 |authority| authority.table.base_is_retained = false,
                 RewriteRefusal::BaseNotRetained,
             ),
             (
-                |authority| authority.table.policy_unchanged = false,
-                RewriteRefusal::PolicyChanged,
+                |authority| authority.table.schema_unchanged = false,
+                RewriteRefusal::SchemaChanged,
             ),
             (
                 |authority| authority.files.inputs_all_live = false,
@@ -2299,7 +2297,7 @@ mod tests {
     /// The closed matrix always reports its outermost broken dimension.
     ///
     /// The single-break cases prove the mapping; this proves the matrix is
-    /// closed. Every one of the 1024 combinations must proceed only when
+    /// closed. Every one of the 512 combinations must proceed only when
     /// nothing is broken, and must report the outermost broken dimension, so a
     /// later reordering or an added early `Proceed` cannot hide a refusal
     /// behind a dimension that happens to be checked first.

@@ -255,6 +255,22 @@ struct ForgeCommittedVolume {
     output_bytes: u64,
 }
 
+impl ForgeCommittedVolume {
+    /// Adds another committed effect's volume to this one.
+    ///
+    /// Saturating because a counter that wrapped would report less throughput
+    /// than the durable record holds, and one attempt's plans are summed before
+    /// anything is emitted.
+    fn saturating_add(self, other: Self) -> Self {
+        Self {
+            input_files: self.input_files.saturating_add(other.input_files),
+            input_bytes: self.input_bytes.saturating_add(other.input_bytes),
+            output_files: self.output_files.saturating_add(other.output_files),
+            output_bytes: self.output_bytes.saturating_add(other.output_bytes),
+        }
+    }
+}
+
 /// One committed publication and the exact volume its commit measured.
 ///
 /// Boxed into its dispatch variant because the loaded table dominates every
@@ -5372,6 +5388,7 @@ redacted
         outcomes: Vec<(usize, Result<ForgeDispatchResult, ForgeError>)>,
     ) -> Result<ForgeDispatchResult, ForgeError> {
         let mut published = None;
+        let mut committed_volume: Option<ForgeCommittedVolume> = None;
         let mut failures: Vec<(usize, ForgeError)> = Vec::new();
         for (plan_index, outcome) in outcomes {
             match outcome {
@@ -5381,11 +5398,28 @@ redacted
                 Ok(ForgeDispatchResult::AcceptanceUnknown(unknown)) => {
                     failures.push((plan_index, unknown.error));
                 }
-                Ok(result) => published = Some(result),
+                Ok(result) => {
+                    // Every plan of one attempt commits its own operation, so
+                    // the task's throughput is the sum of them all. Retaining
+                    // only the surviving publication's own measurement would
+                    // report one plan's volume for the whole attempt.
+                    if let ForgeDispatchResult::Committed(publication) = &result
+                        && let Some(volume) = publication.volume
+                    {
+                        committed_volume = Some(
+                            committed_volume
+                                .map_or(volume, |running| running.saturating_add(volume)),
+                        );
+                    }
+                    published = Some(result);
+                }
                 Err(error) => failures.push((plan_index, error)),
             }
         }
-        if let Some(result) = published {
+        if let Some(mut result) = published {
+            if let ForgeDispatchResult::Committed(publication) = &mut result {
+                publication.volume = committed_volume;
+            }
             return Ok(result);
         }
         failures.sort_by_key(|(plan_index, _)| *plan_index);

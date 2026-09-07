@@ -370,7 +370,7 @@ async fn four_strategies_schedule_dispatch_and_settle_independently() {
 }
 
 /// Sums every recorded counter series of one family carrying all given labels.
-fn counter_total(
+pub(crate) fn counter_total(
     snapshot: &wyrd_bench::BenchmarkMetricSnapshot,
     family: &str,
     labels: &[(&str, &str)],

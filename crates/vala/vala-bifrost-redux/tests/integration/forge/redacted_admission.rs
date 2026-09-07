@@ -462,6 +462,201 @@ redacted
     );
 }
 
+/// Reads one Forge volume counter for the compaction route.
+fn small_files_volume(telemetry: &super::support::ForgeTelemetryCheckpoint, family: &str) -> u64 {
+    super::production_routes::counter_total(
+        &telemetry.snapshot(),
+        family,
+        &[("task_type", "small_files")],
+    )
+}
+
+/// Settles one compaction window and returns the live inputs it consumed.
+///
+/// The table's own live data files are the arithmetic ground truth: promotion
+/// only adds files, so every path that stops being live across a window was
+/// consumed by a committed rewrite plan. That makes the expected counter total
+/// independent of any knowledge of how planning grouped the files.
+///
+/// # Panics
+///
+/// Panics when the awaited task count is not reached inside the bound.
+async fn consumed_by_settled_compaction(
+    promoted: &PromotedRewriteFixture,
+    supervisor: &mut SupervisedPromotion,
+    settled_tasks: usize,
+) -> usize {
+    let before = promoted.fixture.live_data_paths().await;
+    promoted.fixture.clear_task_backoff().await;
+    supervisor.restart_worker();
+    supervisor.schedule_only().await;
+    supervisor.start_worker();
+    await_small_files_in_state(&promoted.fixture, &["succeeded"], settled_tasks).await;
+    supervisor.stop_worker().await;
+    let after = promoted.fixture.live_data_paths().await;
+    before.difference(&after).count()
+}
+
+/// Seals and promotes one more generation so the next window has work.
+///
+/// # Panics
+///
+/// Panics when the promotion attempt does not settle successfully.
+async fn promote_more_inputs(
+    promoted: &PromotedRewriteFixture,
+    supervisor: &mut SupervisedPromotion,
+) {
+    let promoted_before = promotions_succeeded(&promoted.fixture).await;
+    promoted.fixture.seal_more(4).await;
+    promoted.fixture.clear_task_backoff().await;
+    supervisor.restart_worker();
+    supervisor.start_worker();
+    supervisor.schedule_only().await;
+    tokio::time::timeout(ADMISSION_BOUND, async {
+        while promotions_succeeded(&promoted.fixture).await <= promoted_before {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the new hot objects are published before compaction plans them");
+    supervisor.stop_worker().await;
+}
+
+/// A multi-plan attempt counts every committed plan's volume exactly once.
+///
+/// One attempt now commits one operation per plan, so the task's reported
+/// throughput is a sum, not a sample. Three shapes have to agree with the
+/// files the table actually lost: several ordinary successes, an attempt whose
+/// plans are all unresolved until its own reconciliation proves one live, and
+/// an ordinary success beside a still-Prepared sibling that only the later
+/// table-wide owner can account for. In every shape the cumulative counter must
+/// equal the arithmetic sum of the consumed inputs, and a further reconciliation
+/// pass and replan must not move it again.
+///
+/// # Panics
+///
+/// Panics when a settled window reports volume other than the inputs it
+/// consumed, when the unresolved sibling is counted before it is proved, or
+/// when a later pass counts any plan a second time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multi_plan_success_counts_all_committed_volume_once() {
+    let telemetry = super::support::ForgeTelemetryCheckpoint::install();
+    let mut promoted = PromotedRewriteFixture::start_unpromoted("volume_sum").await;
+    // Every stalled plan has to run out of publication budget while the
+    // scenario is still watching.
+    promoted.fixture.config.iceberg_total_retry_timeout = std::time::Duration::from_secs(2);
+    let object_store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
+    let catalog = PromotionCatalogSeam::new(
+        promoted.fixture.catalog.iceberg_catalog(),
+        object_store.read_counter(),
+    );
+    let (clock, control) = super::support::manual_clock();
+    let mut supervisor = SupervisedPromotion::start_serial(
+        &promoted.fixture,
+        Arc::clone(&catalog) as Arc<dyn iceberg::Catalog>,
+        Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
+        clock,
+    );
+    promoted.fixture.seal_more(4).await;
+    supervisor.run_one_success().await;
+
+    // Several ordinary successes in one attempt: the counter is their sum, so
+    // a reduction that kept only one plan's measurement is short here.
+    let mut consumed = consumed_by_settled_compaction(&promoted, &mut supervisor, 1).await;
+    assert_eq!(
+        small_files_volume(&telemetry, "bifrost_forge_input_files_total"),
+        consumed as u64,
+        "an ordinary multi-plan success reports every committed plan's inputs"
+    );
+    assert!(
+        small_files_volume(&telemetry, "bifrost_forge_input_bytes_total") > 0
+            && small_files_volume(&telemetry, "bifrost_forge_output_bytes_total") > 0,
+        "the committed plans reported the bytes they moved"
+    );
+
+    // No plan learns its acceptance, so the attempt settles on the one
+    // operation its own reconciliation proves live and reports that plan's
+    // retained request volume.
+    promote_more_inputs(&promoted, &mut supervisor).await;
+    catalog.stall_next_commit_responses(8);
+    consumed += consumed_by_settled_compaction(&promoted, &mut supervisor, 2).await;
+    catalog.stall_next_commit_responses(0);
+    let after_local_recovery = small_files_volume(&telemetry, "bifrost_forge_input_files_total");
+    assert!(
+        after_local_recovery > 0 && after_local_recovery <= consumed as u64,
+        "a locally recovered plan is counted, and no unproved sibling is: \
+         {after_local_recovery} of {consumed}"
+    );
+
+    // One ordinary success beside one unresolved sibling: the task settles at
+    // once on what it knows, and the sibling stays uncounted until the
+    // table-wide owner proves it.
+    promote_more_inputs(&promoted, &mut supervisor).await;
+    catalog.stall_next_commit_responses(1);
+    consumed += consumed_by_settled_compaction(&promoted, &mut supervisor, 3).await;
+    catalog.stall_next_commit_responses(0);
+    assert!(
+        small_files_volume(&telemetry, "bifrost_forge_input_files_total") < consumed as u64,
+        "the still-Prepared sibling is not counted before it is proved"
+    );
+
+    // The takeover only starts once the uncertainty bound and the reclaim
+    // backoff lapse, measured from wall clock because the operations carry
+    // database timestamps taken while their attempts ran.
+    let settled_at = chrono::Utc::now()
+        + chrono::Duration::from_std(promoted.fixture.config.uncertainty_bound)
+            .expect("the uncertainty bound is representable")
+        + chrono::Duration::seconds(1);
+    control
+        .set(settled_at)
+        .expect("manual Forge clock advances");
+    promoted.fixture.expire_claims().await;
+    supervisor.reclaim_expired_claims().await;
+    promoted.fixture.clear_task_backoff().await;
+    supervisor.restart_worker();
+    supervisor.schedule_only().await;
+    supervisor.start_worker();
+    await_operation_phase(
+        &promoted.fixture,
+        &operation_phases(&promoted.fixture)
+            .await
+            .into_iter()
+            .filter(|(_, phase)| phase == "prepared")
+            .map(|(id, _)| id)
+            .collect::<BTreeSet<_>>(),
+        "recovered",
+    )
+    .await;
+    supervisor.stop_worker().await;
+    let settled_total = small_files_volume(&telemetry, "bifrost_forge_input_files_total");
+    assert_eq!(
+        settled_total, consumed as u64,
+        "recovery adds only the sibling volume nobody had counted yet"
+    );
+
+    // One further reconciliation pass and replan changes nothing beyond the
+    // inputs it consumes itself: a second owner counting the same proof, or a
+    // repeated reconciliation, would show up as a counter that outruns the
+    // files the table lost.
+    let idle = promoted.fixture.live_data_paths().await;
+    supervisor.restart_worker();
+    supervisor.schedule_only().await;
+    supervisor.start_worker();
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    supervisor.shutdown().await;
+    let consumed_by_extra_pass = consumed_paths(&idle, &promoted.fixture.live_data_paths().await);
+    assert_eq!(
+        small_files_volume(&telemetry, "bifrost_forge_input_files_total"),
+        settled_total + u64::try_from(consumed_by_extra_pass).expect("a consumed path count fits"),
+        "no plan is counted twice by a later pass"
+    );
+}
+
+/// Counts the live inputs one window removed.
+fn consumed_paths(before: &BTreeSet<String>, after: &BTreeSet<String>) -> usize {
+    before.difference(after).count()
+}
+
 /// A plan whose input left the current head is refused, never republished.
 ///
 /// A retained planning snapshot is what lets a plan compose on a head that

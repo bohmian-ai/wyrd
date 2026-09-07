@@ -408,8 +408,10 @@ pub fn arrow_type_shape_matches(
         | (Arrow::LargeBinary, Arrow::Binary)
         | (Arrow::Utf8, Arrow::LargeUtf8)
         | (Arrow::LargeUtf8, Arrow::Utf8) => true,
-        (Arrow::List(expected), Arrow::List(actual) | Arrow::LargeList(actual))
-        | (Arrow::LargeList(expected), Arrow::List(actual) | Arrow::LargeList(actual)) => {
+        (
+            Arrow::List(expected) | Arrow::LargeList(expected),
+            Arrow::List(actual) | Arrow::LargeList(actual),
+        ) => {
             expected.is_nullable() == actual.is_nullable()
                 && arrow_type_shape_matches(expected.data_type(), actual.data_type())
         }

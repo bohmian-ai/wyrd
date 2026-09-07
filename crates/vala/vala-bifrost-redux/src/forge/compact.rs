@@ -22,15 +22,6 @@ use super::Forge;
 use super::error::ForgeError;
 
 const DEFAULT_MAX_CONCURRENT_READS: usize = 4;
-/// Core rewrite plans one admitted attempt may execute before it must yield.
-///
-/// One attempt holds one exact memory and scratch lease for its whole
-/// lifetime, so an unbounded plan count would let a single fragmented table
-/// hold that lease indefinitely while other tables wait. Four is the smallest
-/// budget that still lets a multi-partition table make visible progress in one
-/// attempt.
-const DEFAULT_REWRITE_MAX_PLANS_PER_ATTEMPT: usize = 4;
-const DEFAULT_SPILL_LIMIT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const DEFAULT_MAX_OPEN_OPERATIONS_PER_TABLE: usize = 256;
 const DEFAULT_MAX_RETAINED_SNAPSHOTS_PER_TABLE: usize = 256;
 /// Small-file candidacy threshold.
@@ -75,10 +66,6 @@ const SYSTEM_PRINCIPAL: PrincipalId = PrincipalId::new(uuid::Uuid::nil());
 /// numbers. `PartialEq`/`Eq` let boot-time resolution pin that an empty config
 /// reproduces [`ForgeConfig::default`] exactly.
 pub struct ForgeConfig {
-    /// Maximum peak memory estimate admitted for either Forge execution lane.
-    pub max_memory_bytes: u64,
-    /// Hard ceiling for one oversized singleton admitted outside the ordinary byte lane.
-    pub max_large_task_bytes: u64,
     /// Lease duration used to fence one table's maintenance work.
     pub lease_ttl: Duration,
     /// Total time reserved for a retried Iceberg commit.
@@ -120,15 +107,6 @@ pub struct ForgeConfig {
     pub max_maintenance_bytes_per_tick: u64,
     /// Maximum concurrent staged-object reads during rewrite.
     pub max_concurrent_reads: usize,
-    /// Maximum core rewrite plans one admitted attempt may execute.
-    ///
-    /// Bounds how long a single attempt can hold its exact resource lease on a
-    /// heavily fragmented table. An attempt that reaches the budget returns its
-    /// completed plans and yields; the remaining plans are a later attempt's
-    /// work. Operator-tunable via `forge.rewrite_max_plans_per_attempt`.
-    pub rewrite_max_plans_per_attempt: usize,
-    /// `DataFusion` spill ceiling for Forge rewrites.
-    pub spill_limit_bytes: u64,
     /// Maximum staging hints drained by one wake-up.
     pub max_hints_per_wake: usize,
     /// Maximum bounded open operations classified for one table and family.
@@ -163,8 +141,6 @@ impl Default for ForgeConfig {
     /// Return the production defaults for Forge maintenance limits.
     fn default() -> Self {
         Self {
-            max_memory_bytes: 4 * 512 * 1024 * 1024,
-            max_large_task_bytes: 4 * 512 * 1024 * 1024,
             lease_ttl: Duration::from_mins(15),
             iceberg_total_retry_timeout: Duration::from_mins(5),
             catalog_request_timeout: Duration::from_secs(30),
@@ -180,8 +156,6 @@ impl Default for ForgeConfig {
             max_maintenance_items_per_tick: DEFAULT_MAX_MAINTENANCE_ITEMS_PER_TICK,
             max_maintenance_bytes_per_tick: DEFAULT_MAX_MAINTENANCE_BYTES_PER_TICK,
             max_concurrent_reads: DEFAULT_MAX_CONCURRENT_READS,
-            rewrite_max_plans_per_attempt: DEFAULT_REWRITE_MAX_PLANS_PER_ATTEMPT,
-            spill_limit_bytes: DEFAULT_SPILL_LIMIT_BYTES,
             max_hints_per_wake: 256,
             max_open_operations_per_table: DEFAULT_MAX_OPEN_OPERATIONS_PER_TABLE,
             max_retained_snapshots_per_table: DEFAULT_MAX_RETAINED_SNAPSHOTS_PER_TABLE,
@@ -204,9 +178,7 @@ impl ForgeConfig {
     /// (`max_retained_snapshots_per_table`), which would make reconciliation
     /// unable to see every snapshot the expiry policy is asked to retain.
     pub fn validate(&self) -> Result<(), ForgeError> {
-        if self.max_memory_bytes == 0
-            || self.max_large_task_bytes == 0
-            || self.lease_ttl.is_zero()
+        if self.lease_ttl.is_zero()
             || self.iceberg_total_retry_timeout.is_zero()
             || self.catalog_request_timeout.is_zero()
             || self.uncertainty_margin.is_zero()
@@ -220,8 +192,6 @@ impl ForgeConfig {
             || self.max_maintenance_items_per_tick == 0
             || self.max_maintenance_bytes_per_tick == 0
             || self.max_concurrent_reads == 0
-            || self.rewrite_max_plans_per_attempt == 0
-            || self.spill_limit_bytes == 0
             || self.max_hints_per_wake == 0
             || self.max_open_operations_per_table == 0
             || self.max_retained_snapshots_per_table == 0
@@ -609,16 +579,6 @@ mod tests {
         let mut invalid_snapshots = config;
         invalid_snapshots.max_retained_snapshots_per_table = 0;
         assert!(invalid_snapshots.validate().is_err());
-    }
-
-    /// Forge rejects a zero planner memory ceiling before composing scheduler or workers.
-    #[test]
-    fn forge_config_rejects_zero_memory_capacity() {
-        let config = ForgeConfig {
-            max_memory_bytes: 0,
-            ..ForgeConfig::default()
-        };
-        assert!(config.validate().is_err());
     }
 
     /// Both orphan-GC scan bounds default to positive values and reject zero.

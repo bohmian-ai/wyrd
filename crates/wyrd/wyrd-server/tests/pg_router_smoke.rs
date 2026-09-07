@@ -1385,20 +1385,6 @@ async fn forge_worker_refuses_staging_without_native_cursor_listing() {
         !readiness.is_ready(),
         "a refused worker never publishes ready"
     );
-    let registered: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.forge_worker_registry")
-        .fetch_one(
-            &server
-                .pg_fixture()
-                .superuser_pool()
-                .await
-                .expect("superuser pool"),
-        )
-        .await
-        .expect("worker registry is readable");
-    assert_eq!(
-        registered, 0,
-        "a refused worker never registers, healthy or quarantined"
-    );
     server.shutdown().await.expect("test server shuts down");
 }
 
@@ -2094,105 +2080,6 @@ async fn coordinator_task_insert_failure_clears_readiness() {
     server.shutdown().await.expect("test server shuts down");
 }
 
-/// A coordinator whose unschedulable-task audit append fails rolls the task,
-/// the audit, and the demand acknowledgement back together, and recovers on the
-/// next complete pass.
-///
-/// The audit append only happens for a task planning classified unschedulable,
-/// so the fixture drives a real promotion candidate against a byte ceiling it
-/// cannot fit. The unfaulted table proves the append is genuinely reached before
-/// a second, freshly registered table is failed at it.
-///
-/// # Panics
-///
-/// Panics when the unfaulted pass never appends, a failed pass publishes ready
-/// or leaks a task, or the restored pass does not recover.
-#[cfg(feature = "test-support")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn coordinator_audit_append_failure_clears_readiness() {
-    // One byte is below every executable working set, so any real promotion
-    // candidate this server plans is classified unschedulable and carries the
-    // audit append the fault targets.
-    let server = WyrdTestServer::builder()
-        .with_forge_config_for_test(vala_bifrost_redux::forge::ForgeConfig {
-            max_large_task_bytes: 1,
-            ..vala_bifrost_redux::forge::ForgeConfig::default()
-        })
-        .start_bound()
-        .await
-        .expect("test server starts");
-    let readiness = server
-        .state()
-        .forge()
-        .expect("the default target selects Forge")
-        .coordinator_readiness();
-    let pool = server
-        .pg_fixture()
-        .superuser_pool()
-        .await
-        .expect("superuser pool");
-    let tenant = uuid::Uuid::from(server.data_tenant_id());
-
-    // A bound server already runs the production maintenance scheduler, so this
-    // case drives that loop rather than composing a second one.
-
-    // The unfaulted table proves the audit append is on the path at all.
-    publish_unschedulable_demand(&server, "coordinator_audit_reached").await;
-    drive_scheduler_pass(&server, "unfaulted unschedulable pass").await;
-    assert!(
-        readiness.is_ready(),
-        "the unfaulted unschedulable pass did not complete"
-    );
-    assert_eq!(
-        unschedulable_audits(&pool, tenant).await,
-        1,
-        "an unschedulable planning result did not append its audit"
-    );
-
-    publish_unschedulable_demand(&server, "coordinator_audit_faulted").await;
-    install_planning_failure(
-        &pool,
-        "CREATE TRIGGER forge_fail_step BEFORE INSERT ON vala.audit_outbox \
-         FOR EACH ROW EXECUTE FUNCTION vala.fail_forge_planning_step()",
-    )
-    .await;
-
-    drive_scheduler_pass(&server, "faulted audit pass").await;
-    assert!(
-        !readiness.is_ready(),
-        "a coordinator whose audit_outbox write failed advertised ready"
-    );
-    assert_eq!(
-        table_task_count(&pool, tenant, "coordinator_audit_faulted").await,
-        0,
-        "the task rolled back with its audit was left behind"
-    );
-    assert_eq!(
-        outstanding_demands(&pool, tenant, "coordinator_audit_faulted").await,
-        1,
-        "a rolled-back pass acknowledged demand whose audit never committed"
-    );
-
-    remove_planning_failure(&pool, "audit_outbox").await;
-    drive_scheduler_pass(&server, "restoration pass").await;
-    assert!(
-        readiness.is_ready(),
-        "the pass after the audit_outbox fault was removed stayed unready"
-    );
-    assert_eq!(
-        table_task_count(&pool, tenant, "coordinator_audit_faulted").await,
-        1,
-        "the recovered pass did not enqueue the task the failed pass rolled back"
-    );
-    assert_eq!(
-        outstanding_demands(&pool, tenant, "coordinator_audit_faulted").await,
-        0,
-        "the recovered pass left demand unacknowledged"
-    );
-
-    server.shutdown().await.expect("test server shuts down");
-}
-
 /// Publication evidence naming a snapshot the table never retained.
 ///
 /// Reconciliation validates prepared evidence against the live table before it
@@ -2459,42 +2346,6 @@ async fn cancellation_release_failure_closes_readiness() {
         "a drained claim was reported as a completion"
     );
     server.shutdown().await.expect("test server shuts down");
-}
-
-/// Registers one table and publishes rows through it so the next planning pass
-/// derives a real Scribe-promotion candidate for it.
-///
-/// # Panics
-///
-/// Panics when registration, ingest, or the durable flush fails.
-#[cfg(feature = "test-support")]
-async fn publish_unschedulable_demand(server: &WyrdTestServer, table: &str) {
-    register_forge_table(server, table).await;
-    server
-        .seed_bifrost_rows(&format!("vala.bifrost.{table}"), &[1, 2, 3])
-        .await
-        .expect("publish rows the coordinator can plan against");
-}
-
-/// Counts the tenant's committed unschedulable-task audit records.
-///
-/// This is the exact durable row the coordinator's planning transaction appends
-/// beside an unschedulable task, so it distinguishes a pass that reached the
-/// audit step from one that never planned a terminal task at all.
-///
-/// # Panics
-///
-/// Panics when the audit outbox cannot be read.
-#[cfg(feature = "test-support")]
-async fn unschedulable_audits(pool: &sqlx::PgPool, tenant: uuid::Uuid) -> i64 {
-    sqlx::query_scalar(
-        "SELECT count(*) FROM vala.audit_outbox \
-         WHERE data_tenant_id=$1 AND operation='forge.task.unschedulable'",
-    )
-    .bind(tenant)
-    .fetch_one(pool)
-    .await
-    .expect("the audit outbox is readable")
 }
 
 /// Seeds one claimable Forge task row directly.

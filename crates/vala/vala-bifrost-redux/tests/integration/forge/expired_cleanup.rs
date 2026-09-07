@@ -27,11 +27,8 @@ use vala_sql::row_types::forge_tasks::{
 };
 use vala_sql::row_types::oracle_reader_authority::TableAuthorityIdentity;
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
-use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
-    AuditDecision, AuditEvent, AuditResult, AuthMethod, ClusterCapabilities, ClusterNodeKey,
-    ClusterRole, NodeId, OracleCapabilitiesV1, QueryClass,
+    ClusterCapabilities, ClusterNodeKey, ClusterRole, NodeId, OracleCapabilitiesV1, QueryClass,
 };
 
 use crate::oracle::reader_authority::cut;
@@ -51,24 +48,6 @@ struct DrainedExpiration {
     cleanup_id: Uuid,
     /// Immutable handoff the cleanup task carries.
     payload: ExpiredCleanupPayload,
-}
-
-/// Builds one lifecycle audit event for a cleanup task.
-fn task_event(operation: &str, task_id: Uuid) -> AuditEvent {
-    AuditEvent::new(
-        RequestId::now_v7(),
-        None,
-        operation.to_owned(),
-        format!("forge-task:{task_id}"),
-        None,
-        PrincipalId::new(Uuid::nil()),
-        PrincipalKindTag::Service,
-        AuthMethod::Internal,
-        "bifrost:forge".to_owned(),
-        AuditDecision::Allow,
-        AuditResult::Success,
-        "unschedulable".to_owned(),
-    )
 }
 
 /// Lists one task's audit operations in durable sequence order.

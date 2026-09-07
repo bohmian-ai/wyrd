@@ -375,9 +375,6 @@ fn resolve_forge_config(
             .orphan_gc_run_budget_secs
             .map(std::time::Duration::from_secs)
             .unwrap_or(base.orphan_gc_run_budget),
-        rewrite_max_plans_per_attempt: forge_runtime
-            .rewrite_max_plans_per_attempt
-            .unwrap_or(base.rewrite_max_plans_per_attempt),
         ..base
     };
     let maintenance_interval = forge_runtime
@@ -2325,7 +2322,6 @@ mod tests {
             maintenance_trigger_interval_secs: Some(900),
             orphan_gc_max_list_pages: Some(64),
             orphan_gc_run_budget_secs: Some(30),
-            rewrite_max_plans_per_attempt: Some(2),
             maintenance_interval_secs: Some(45),
             ..crate::config::ForgeRuntimeConfig::default()
         };
@@ -2346,7 +2342,6 @@ mod tests {
             config.orphan_gc_run_budget,
             std::time::Duration::from_secs(30)
         );
-        assert_eq!(config.rewrite_max_plans_per_attempt, 2);
         assert_eq!(maintenance_interval, std::time::Duration::from_secs(45));
         config
             .validate()

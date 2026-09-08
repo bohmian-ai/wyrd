@@ -903,14 +903,70 @@ const ADMISSION_BOUND: std::time::Duration = std::time::Duration::from_mins(1);
 async fn tenant_tasks(
     fixture: &super::support::PromotionIntegrationFixture,
 ) -> Vec<(uuid::Uuid, String, String, String)> {
+    tasks_of(fixture, fixture.tenant).await
+}
+
+/// Reads one named tenant's Forge task rows in durable creation order.
+///
+/// A scenario that has to prove one tenant's ownership does not stop another's
+/// reads a tenant it does not own, which [`tenant_tasks`] cannot express.
+///
+/// # Panics
+///
+/// Panics when the read-only diagnostic query fails.
+async fn tasks_of(
+    fixture: &super::support::PromotionIntegrationFixture,
+    tenant: wyrd_spec::ids::DataTenantId,
+) -> Vec<(uuid::Uuid, String, String, String)> {
     sqlx::query_as(
         "SELECT task_id, strategy, state, table_name FROM vala.forge_tasks \
          WHERE data_tenant_id = $1 ORDER BY created_at, task_id",
     )
-    .bind(fixture.tenant.as_uuid())
+    .bind(tenant.as_uuid())
     .fetch_all(fixture.operator_pool.pool())
     .await
     .expect("Forge tasks are readable")
+}
+
+/// Counts one tenant's small-files tasks whose table name starts with `prefix`.
+///
+/// Earlier phases of a long scenario leave settled rows behind on other tables,
+/// so a count that is about *this* phase's tables has to name them.
+async fn small_files_named(
+    fixture: &super::support::PromotionIntegrationFixture,
+    tenant: wyrd_spec::ids::DataTenantId,
+    prefix: &str,
+    states: &[&str],
+) -> usize {
+    tasks_of(fixture, tenant)
+        .await
+        .into_iter()
+        .filter(|(_, strategy, state, table)| {
+            strategy == "small_files"
+                && states.contains(&state.as_str())
+                && table.starts_with(prefix)
+        })
+        .count()
+}
+
+/// Counts the tasks these tenants currently owe to a worker, across strategies.
+///
+/// A pull turn's allowance is spent on tasks, not on tables or strategies, so
+/// the durable evidence of what one turn took is every row in a state only a
+/// claiming worker can hold.
+async fn owned_tasks(
+    fixture: &super::support::PromotionIntegrationFixture,
+    tenants: &[wyrd_spec::ids::DataTenantId],
+) -> usize {
+    let mut owned = 0;
+    for tenant in tenants {
+        owned += tasks_of(fixture, *tenant)
+            .await
+            .into_iter()
+            .filter(|(_, _, state, _)| matches!(state.as_str(), "claimed" | "running" | "prepared"))
+            .count();
+    }
+    owned
 }
 
 /// Counts this tenant's successfully settled Scribe promotions.
@@ -1076,7 +1132,11 @@ redacted
 /// when the worker does not drain its joins cleanly at shutdown.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn worker_wide_fifo_bounds_concurrent_attempts() {
-    let promoted = PromotedRewriteFixture::start_unpromoted("wide_fifo_a").await;
+    let mut promoted = PromotedRewriteFixture::start_unpromoted("wide_fifo_a").await;
+    // A withheld commit answer has to end inside a test's patience rather than
+    // the production minutes, because the pull-turn phase below keeps its
+    // running plans in flight exactly that long.
+    promoted.fixture.config.iceberg_total_retry_timeout = std::time::Duration::from_secs(4);
     let object_store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
     let catalog = PromotionCatalogSeam::new(
         promoted.fixture.catalog.iceberg_catalog(),
@@ -1093,10 +1153,16 @@ async fn worker_wide_fifo_bounds_concurrent_attempts() {
             // above the two compaction claims under test rather than exactly at
             // them. Every other bound stays at the production default so the
             // budgets under test are the real ones.
-            per_tenant_active_cap: 4,
+            per_tenant_active_cap: 8,
+redacted
+            // the running bound to it is what makes one turn's claims saturate
+            // execution exactly: a later turn then has no allowance of its own
+            // to spend, which is the state the pull-turn phase below measures.
+            max_task_parallelism: 4,
             ..vala_bifrost_redux::forge::ForgeWorkerConfig::default()
         },
     );
+    let other_tenant = promoted.fixture.seed_tenant("wide-fifo-tenant-2").await;
     plan_two_ready_rewrites(&promoted, &mut supervisor).await;
 
     let inputs = promoted
@@ -1143,10 +1209,32 @@ async fn worker_wide_fifo_bounds_concurrent_attempts() {
         .release_held_rewrite_handoff_for_test();
     await_small_files_in_state(&promoted.fixture, &["succeeded"], 2).await;
     assert_reservations_released_once(&supervisor);
+    // The worker stops rather than shuts down, because the pull-turn phase at
+    // the end of this scenario runs one more generation of the same supervisor.
+    supervisor.stop_worker().await;
+
+    assert_concurrent_attempts_published(&promoted, operations_before, &inputs).await;
+
+redacted
+        .await;
     // A clean shutdown drains every join before the worker returns; the helper
     // panics if the production loop exits any other way.
     supervisor.shutdown().await;
+}
 
+/// Asserts both concurrently owned attempts published under their own identity.
+///
+/// # Panics
+///
+/// Panics when a task failed despite a sibling publishing, when fewer than two
+/// operations were published, when an operation was left open, when two plans
+/// shared an identity, when a rewritten input is still live, or when a fence
+/// outlived the attempt.
+async fn assert_concurrent_attempts_published(
+    promoted: &PromotedRewriteFixture,
+    operations_before: usize,
+    inputs: &BTreeSet<String>,
+) {
     let settled = tenant_tasks(&promoted.fixture)
         .await
         .into_iter()
@@ -1187,7 +1275,7 @@ async fn worker_wide_fifo_bounds_concurrent_attempts() {
             .into_iter()
             .map(|file| file.file_path().to_owned())
             .collect::<BTreeSet<_>>()
-            .is_disjoint(&inputs),
+            .is_disjoint(inputs),
         "every rewritten input left the live set"
     );
     assert_eq!(
@@ -1195,6 +1283,222 @@ async fn worker_wide_fifo_bounds_concurrent_attempts() {
         0,
         "a drained worker holds no table fence"
     );
+}
+
+/// Registers, seals, and publishes every named table before it owes compaction.
+///
+/// Passes are requested only while some table still has no promotion planned at
+/// all. Every further pass would also plan compaction for the tables already
+/// published, and the running worker would compact away the very debt the
+/// caller needs them to owe.
+///
+/// # Panics
+///
+/// Panics when a table does not publish inside [`ADMISSION_BOUND`].
+async fn promote_tables(
+    promoted: &PromotedRewriteFixture,
+    supervisor: &mut SupervisedPromotion,
+    tables: &[(wyrd_spec::ids::DataTenantId, &str)],
+) {
+    for (tenant, name) in tables {
+        promoted
+            .fixture
+            // Two inputs is one compaction group, so each of these tasks admits
+            // exactly one plan and spends exactly one unit of running
+            // parallelism. A table with more debt would let a single claim
+            // saturate the worker and end the turn before its bound is reached.
+            .register_and_seal_table_for(*tenant, name, 2)
+            .await;
+    }
+    supervisor.restart_worker();
+    supervisor.start_worker();
+    let settled = tokio::time::timeout(ADMISSION_BOUND, async {
+        loop {
+            let mut unplanned = false;
+            let mut unsettled = false;
+            for (tenant, name) in tables {
+                let promotion = tasks_of(&promoted.fixture, *tenant).await.into_iter().find(
+                    |(_, strategy, _, table)| strategy == "scribe_promotion" && table == name,
+                );
+                match promotion {
+                    None => {
+                        unplanned = true;
+                        unsettled = true;
+                    }
+                    Some((_, _, state, _)) => unsettled |= state != "succeeded",
+                }
+            }
+            if !unsettled {
+                return;
+            }
+            if unplanned {
+                supervisor.schedule_only().await;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    })
+    .await;
+    supervisor.stop_worker().await;
+    assert!(
+        settled.is_ok(),
+        "every registered table publishes before it owes compaction: {:?}",
+        tenant_tasks(&promoted.fixture).await
+    );
+}
+
+redacted
+///
+/// The allowance is `(max_task_parallelism - running) .min(4)`, and a turn that
+/// failed to spend a unit per claim would keep claiming past it. Proving that
+/// needs more claimable tasks than one turn may take, across two tenants so the
+/// per-tenant cap is not what stops it, and it needs every admitted plan to
+/// stay running so no freed capacity can be mistaken for an overrun.
+///
+/// # Panics
+///
+/// Panics when the tables do not owe compaction together, when an earlier
+/// phase's claim is still held as the turn begins, when a turn claims more than
+/// four tasks, or when it leaves nothing claimable behind.
+redacted
+    promoted: &PromotedRewriteFixture,
+    catalog: &Arc<PromotionCatalogSeam>,
+    supervisor: &mut SupervisedPromotion,
+    other_tenant: wyrd_spec::ids::DataTenantId,
+) {
+    let own = promoted.fixture.tenant;
+    promote_tables(
+        promoted,
+        supervisor,
+        &[
+            (own, "pull_bound_a"),
+            (own, "pull_bound_b"),
+            (own, "pull_bound_c"),
+            (own, "pull_bound_d"),
+            (own, "pull_bound_e"),
+            (own, "pull_bound_f"),
+            (own, "pull_bound_g"),
+            (own, "pull_bound_h"),
+            (other_tenant, "pull_bound_t2"),
+        ],
+    )
+    .await;
+
+    // Plan only: every table has to owe compaction at the same moment for one
+    // pull turn to be able to overrun its allowance.
+    promoted.fixture.clear_task_backoff().await;
+    let ready = tokio::time::timeout(ADMISSION_BOUND, async {
+        loop {
+            supervisor.schedule_only().await;
+            let mine = small_files_named(&promoted.fixture, own, "pull_bound", &["ready"]).await;
+            let theirs =
+                small_files_named(&promoted.fixture, other_tenant, "pull_bound", &["ready"]).await;
+            if mine >= 4 && theirs >= 1 {
+                return (mine, theirs);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("every table owes compaction at once");
+    assert!(
+        ready.0 + ready.1 >= 5 && ready.1 >= 1,
+        "more tasks than one turn may claim are ready, across both tenants: {ready:?}"
+    );
+
+    // Withholding every commit answer keeps each admitted plan running, so the
+    // worker's running parallelism stays saturated and no later turn has any
+    // allowance of its own to spend.
+    catalog.stall_next_commit_responses(64);
+    let tenants = [own, other_tenant];
+    // Rows an earlier phase left claimed belong to a worker that has already
+    // stopped. Returning them through the production reclaim transaction is
+    // what makes every claim counted below one this turn actually took.
+    promoted.fixture.expire_claims().await;
+    supervisor.reclaim_expired_claims().await;
+    promoted.fixture.clear_task_backoff().await;
+    assert_eq!(
+        owned_tasks(&promoted.fixture, &tenants).await,
+        0,
+        "no earlier claim is still held when the turn under test starts: {:?} / {:?}",
+        tasks_of(&promoted.fixture, own).await,
+        tasks_of(&promoted.fixture, other_tenant).await
+    );
+    supervisor.restart_worker();
+    supervisor.start_worker();
+    let sample = first_turn_sample(promoted, &tenants).await;
+    let Ok((held, still_ready, rows)) = sample else {
+        let mine = tasks_of(&promoted.fixture, own).await;
+        let theirs = tasks_of(&promoted.fixture, other_tenant).await;
+        panic!("the first pull turn claims its full allowance: {mine:?} / {theirs:?}");
+    };
+    assert_eq!(
+        held, 4,
+redacted
+    );
+    assert!(
+        still_ready >= 1,
+        "the tasks the turn did not claim are still ready for the next one: {rows:?}"
+    );
+
+    // A task whose plans all settle frees its parallelism and lets the next turn
+    // spend it, so the bound is a ceiling on concurrent ownership rather than a
+    // total. Sampling it across the window is what proves no turn ever overran
+    // the allowance, not just the one sampled above.
+    for _ in 0..30 {
+        let held = owned_tasks(&promoted.fixture, &tenants).await;
+        assert!(
+            held <= 4,
+redacted
+            tasks_of(&promoted.fixture, own).await,
+            tasks_of(&promoted.fixture, other_tenant).await
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    supervisor.stop_worker().await;
+    catalog.stall_next_commit_responses(0);
+}
+
+/// Samples one turn's ownership and its leftovers from a single snapshot.
+///
+/// Reading both halves of the bound from one snapshot is what makes "no more
+/// than four" and "the rest stay claimable" describe the same turn rather than
+/// two moments a later turn could sit between.
+///
+/// Returns the number of tasks a worker owned, the number of `pull_bound`
+/// small-files tasks still ready beside them, and the rows both came from, or
+/// the elapsed error when no turn ever reached its full allowance.
+async fn first_turn_sample(
+    promoted: &PromotedRewriteFixture,
+    tenants: &[wyrd_spec::ids::DataTenantId],
+) -> Result<(usize, usize, Vec<(uuid::Uuid, String, String, String)>), tokio::time::error::Elapsed>
+{
+    tokio::time::timeout(ADMISSION_BOUND, async {
+        loop {
+            let mut rows = Vec::new();
+            for tenant in tenants {
+                rows.extend(tasks_of(&promoted.fixture, *tenant).await);
+            }
+            let held = rows
+                .iter()
+                .filter(|(_, _, state, _)| {
+                    matches!(state.as_str(), "claimed" | "running" | "prepared")
+                })
+                .count();
+            if held >= 4 {
+                let ready = rows
+                    .iter()
+                    .filter(|(_, strategy, state, table)| {
+                        strategy == "small_files"
+                            && state == "ready"
+                            && table.starts_with("pull_bound")
+                    })
+                    .count();
+                return (held, ready, rows);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
 }
 
 /// Reads the commit-submission count once the attempt's own plans stop adding.
@@ -1205,6 +1509,11 @@ async fn worker_wide_fifo_bounds_concurrent_attempts() {
 /// and only stops taking more. Reading the count after it has stopped moving is
 /// what makes a later quiet window describe reconciliation alone.
 ///
+/// The lull has to outlast a definite refusal's revalidated retry, which is why
+/// it is the publication budget rather than a few hundred milliseconds: a
+/// shorter sample can land between a sibling's retries and read a count that is
+/// still moving.
+///
 /// # Panics
 ///
 /// Panics when submissions never stop inside [`ADMISSION_BOUND`].
@@ -1212,7 +1521,7 @@ async fn await_settled_submissions(catalog: &PromotionCatalogSeam) -> usize {
     tokio::time::timeout(ADMISSION_BOUND, async {
         loop {
             let before = catalog.attempts();
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             if catalog.attempts() == before {
                 return before;
             }
@@ -1411,7 +1720,7 @@ async fn acceptance_unknown_retains_running_until_exact_reconciliation() {
 
     landed_replacement_recovers_into_success(&promoted, &catalog, &mut supervisor).await;
     known_success_leaves_its_ambiguous_sibling_open(&promoted, &catalog, &mut supervisor).await;
-    shutdown_hands_off_retained_authority(&promoted, &catalog, &mut supervisor).await;
+    shutdown_hands_off_retained_authority(&promoted, &catalog, &mut supervisor, &control).await;
     supervisor.shutdown().await;
     assert_eq!(
         promoted.fixture.live_leases().await,
@@ -1540,25 +1849,206 @@ async fn known_success_leaves_its_ambiguous_sibling_open(
     );
 }
 
-/// Proves that a stopping worker leaves an unresolved attempt for its successor.
+/// Publishes a second tenant's table and leaves this one owing more debt.
 ///
-/// A worker that cannot say what its own operation did has nothing durable it
-/// may write about it: failing the task would be a guess and retrying it would
-/// republish an effect that may already be live. So shutdown closes only what
-/// is local — the heartbeat and the table fence — and leaves the task Running
-/// with its operation Prepared, which is exactly the state a lost process
-/// leaves and the one the table-wide reconciliation owner takes over from.
+/// The other tenant's table is published now and its compaction offered later,
+/// on purpose: work that was claimable here would be claimable before the
+/// ambiguity under test exists. The extra inputs are what make the attempt
+/// under test plan more than one rewrite — one to park at the catalog and one
+/// to hold before it publishes.
+///
+/// Returns the second tenant's isolation key.
 ///
 /// # Panics
 ///
-/// Panics when shutdown settles, fails, retries, or resets a retained
-/// attempt, when it changes an operation identity, when it does not return
-/// inside the fixture's shutdown bound, or when it leaves a table fence held.
-async fn shutdown_hands_off_retained_authority(
+/// Panics when either tenant does not publish inside [`ADMISSION_BOUND`].
+async fn publish_second_tenant_and_new_debt(
+    promoted: &PromotedRewriteFixture,
+    supervisor: &mut SupervisedPromotion,
+) -> wyrd_spec::ids::DataTenantId {
+    let other = promoted.fixture.seed_tenant("gate-tenant-2").await;
+    promoted
+        .fixture
+        .register_and_seal_table_for(other, "gate_probe", 4)
+        .await;
+
+    // The other tenant's table is published now and its compaction is offered
+    // later, on purpose: work that was claimable here would be claimable before
+    // the ambiguity under test exists.
+    // Four more inputs, so the attempt under test plans more than one rewrite:
+    // one to park at the catalog and one to hold before it publishes.
+    promoted.fixture.seal_more(4).await;
+    promoted.fixture.clear_task_backoff().await;
+    let promoted_before = promotions_succeeded(&promoted.fixture).await;
+    supervisor.restart_worker();
+    supervisor.start_worker();
+    supervisor.schedule_only().await;
+    tokio::time::timeout(ADMISSION_BOUND, async {
+        loop {
+            let published = tasks_of(&promoted.fixture, other).await.into_iter().any(
+                |(_, strategy, state, _)| strategy == "scribe_promotion" && state == "succeeded",
+            );
+            if published && promotions_succeeded(&promoted.fixture).await > promoted_before {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("both tenants publish before either owes compaction");
+    supervisor.stop_worker().await;
+
+    other
+}
+
+/// An unknown acceptance stops new authority before its siblings have drained.
+///
+/// Retention is a property of an attempt's own indexed outcomes, and the moment
+/// one of them is an unknown acceptance this owner can no longer say what it
+/// did. Waiting for the whole attempt to drain first would leave a reachable
+/// window in which the worker republishes readiness and claims more work while
+/// it already holds an operation it cannot account for.
+///
+/// One plan is parked at the catalog until its publication budget ends it with
+/// nothing learned, while a sibling of the same attempt is held before its own
+/// publication so the attempt cannot drain. A second tenant's task is then
+/// offered: it is claimable — the per-tenant cap this owner is already at does
+/// not apply to it — so the only thing that may keep it waiting is the
+/// ambiguity gate itself.
+///
+/// # Panics
+///
+/// Panics when the worker stays ready while it holds an unknown outcome, or
+/// when it claims the other tenant's waiting task before that outcome is
+/// decided.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ambiguity_stops_new_authority_before_siblings_drain() {
+    let mut promoted = PromotedRewriteFixture::start_unpromoted("ambiguity_gate").await;
+    // A parked commit has to run out of publication budget while the scenario
+    // is still watching, so the budget is the seconds a test can wait rather
+    // than the production minutes.
+    promoted.fixture.config.iceberg_total_retry_timeout = std::time::Duration::from_secs(2);
+    let object_store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
+    let catalog = PromotionCatalogSeam::new(
+        promoted.fixture.catalog.iceberg_catalog(),
+        object_store.read_counter(),
+    );
+    // Two plans of one attempt must be in flight at once, and the other
+    // tenant's task must still fit the pull allowance afterwards, or capacity
+    // rather than the ambiguity gate would be what holds it.
+    let mut supervisor = SupervisedPromotion::start_with_worker_bounds(
+        &promoted.fixture,
+        Arc::clone(&catalog) as Arc<dyn iceberg::Catalog>,
+        Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
+        ForgeClock::system(),
+        vala_bifrost_redux::forge::ForgeWorkerConfig {
+            max_task_parallelism: 4,
+            ..vala_bifrost_redux::forge::ForgeWorkerConfig::default()
+        },
+    );
+    promoted.fixture.seal_more(4).await;
+    supervisor.run_one_success().await;
+
+    let other = publish_second_tenant_and_new_debt(&promoted, &mut supervisor).await;
+
+    // One plan is held before it publishes and another is parked at the
+    // catalog, so this attempt stores an unknown outcome while a sibling of the
+    // same attempt is still running.
+    supervisor
+        .observer()
+        .hold_after_next_rewrite_handoff_for_test();
+    catalog.park_next_commit();
+    promoted.fixture.clear_task_backoff().await;
+    // One pass plans both tenants' compaction, so the other tenant's task is
+    // held out of the window before any worker runs. It is released only once
+    // the ambiguity exists, which leaves the gate as the single thing that can
+    // still keep it waiting.
+    supervisor.schedule_only().await;
+    promoted.fixture.offer_tasks_of(other, 3_600).await;
+    supervisor.restart_worker();
+    supervisor.start_worker();
+    tokio::time::timeout(
+        ADMISSION_BOUND,
+        supervisor
+            .observer()
+            .wait_for_held_rewrite_handoff_for_test(),
+    )
+    .await
+    .expect("one plan is held before its publication");
+    tokio::time::timeout(ADMISSION_BOUND, catalog.wait_for_parked_commit())
+        .await
+        .expect("a sibling plan reaches the catalog");
+    // No later commit may succeed: a known success would settle the attempt on
+    // the spot and there would be nothing unknown left to gate on.
+    catalog.reject_remaining_commits();
+
+    // The parked plan's publication budget ends it with nothing learned. Its
+    // held sibling is still running, so the attempt has not drained - and the
+    // worker must already have stopped advertising itself.
+    tokio::time::timeout(ADMISSION_BOUND, async {
+        while supervisor.worker_ready() {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("an unknown outcome retracts readiness before its siblings drain");
+
+    // Now offer the other tenant's work. Nothing but the ambiguity gate stands
+    // between this owner and that claim.
+    promoted.fixture.offer_tasks_of(other, 0).await;
+    let planted = tasks_of(&promoted.fixture, other)
+        .await
+        .into_iter()
+        .find(|(_, strategy, _, _)| strategy == "small_files")
+        .map(|(_, _, state, _)| state);
+    assert_eq!(
+        planted,
+        Some("ready".to_owned()),
+        "the offered task starts out claimable: {:?}",
+        tasks_of(&promoted.fixture, other).await
+    );
+
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    assert!(
+        !supervisor.worker_ready(),
+        "readiness stays retracted while an unknown outcome is unresolved"
+    );
+    assert_eq!(
+        tasks_of(&promoted.fixture, other)
+            .await
+            .into_iter()
+            .find(|(_, strategy, _, _)| strategy == "small_files")
+            .map(|(_, _, state, _)| state),
+        Some("ready".to_owned()),
+        "an owner holding an unknown outcome takes no further authority, from \
+         any tenant: {:?}",
+        tasks_of(&promoted.fixture, other).await
+    );
+
+    supervisor
+        .observer()
+        .release_held_rewrite_handoff_for_test();
+    supervisor.shutdown().await;
+}
+
+/// Drives one attempt into a retained, unresolved state and reports its shape.
+///
+/// One plan reaches the catalog and never learns what happened, and every
+/// sibling is refused outright so no success can settle the task instead.
+///
+/// Returns the operation identities the attempt left Prepared, the number of
+/// operations that existed before this phase, and the settlement count its
+/// supervisor had already returned.
+///
+/// # Panics
+///
+/// Panics when the parked plan never opens its operation, or when the worker
+/// keeps advertising itself while holding it.
+async fn retain_one_unresolved_attempt(
     promoted: &PromotedRewriteFixture,
     catalog: &Arc<PromotionCatalogSeam>,
     supervisor: &mut SupervisedPromotion,
-) {
+) -> (BTreeSet<uuid::Uuid>, usize, usize) {
     supervisor.stop_worker().await;
     // The new hot objects are published first, so the seam armed below meets
     // the rewrite's own commit rather than the promotion's.
@@ -1615,19 +2105,124 @@ async fn shutdown_hands_off_retained_authority(
     })
     .await
     .expect("a worker holding an unresolved operation stops advertising itself");
-    let submissions = catalog.attempts();
+    (retained, open_before, errors_before)
+}
 
+/// Asserts a retained shutdown captured the attempt's possible-output snapshot.
+///
+/// # Panics
+///
+/// Panics when no snapshot was captured, when it is empty, when an entry has no
+/// path, or when the entries are not in the attempt's own output order.
+fn assert_handoff_snapshot(supervisor: &SupervisedPromotion, handoffs_before: usize) {
+    // The runbook's ambiguous-commit procedure starts from the object names an
+    // unresolved attempt may have written, so the handoff has to carry the
+    // exact ordered set - including the objects a sibling produced before its
+    // own commit was refused, which nothing else records.
+    let handoffs = supervisor.observer().retained_handoff_outputs_for_test();
+    assert!(
+        handoffs.len() > handoffs_before,
+        "a retained shutdown captures one attempt-wide possible-output snapshot"
+    );
+    let handed_off = &handoffs[handoffs_before];
+    assert!(
+        !handed_off.is_empty(),
+        "the captured snapshot names the objects the attempt may have written"
+    );
+    assert!(
+        handed_off.iter().all(|output| !output.path.is_empty()),
+        "every captured entry carries its exact path: {handed_off:?}"
+    );
+    assert!(
+        handed_off
+            .windows(2)
+            .all(|pair| pair[0].logical_ordinal <= pair[1].logical_ordinal),
+        "the captured snapshot keeps the attempt's own output order: {handed_off:?}"
+    );
+}
+
+/// Proves that a stopping worker leaves an unresolved attempt for its successor.
+///
+/// A worker that cannot say what its own operation did has nothing durable it
+/// may write about it: failing the task would be a guess and retrying it would
+/// republish an effect that may already be live. So shutdown closes only what
+/// is local — the heartbeat and the table fence — and leaves the task Running
+/// with its operation Prepared, which is exactly the state a lost process
+/// leaves and the one the table-wide reconciliation owner takes over from.
+///
+/// # Panics
+///
+/// Panics when shutdown settles, fails, retries, or resets a retained
+/// attempt, when it changes an operation identity, when it does not return
+/// inside the fixture's shutdown bound, or when it leaves a table fence held.
+async fn shutdown_hands_off_retained_authority(
+    promoted: &PromotedRewriteFixture,
+    catalog: &Arc<PromotionCatalogSeam>,
+    supervisor: &mut SupervisedPromotion,
+    control: &vala_bifrost_redux::forge::ForgeClockControl,
+) {
+    let (retained, open_before, errors_before) =
+        retain_one_unresolved_attempt(promoted, catalog, supervisor).await;
     // The stop lands while the attempt is still unresolved. A worker that
     // waited for proof it cannot obtain would hang here; the helper's bound is
     // what proves it does not.
     let owned = small_files_in_state(&promoted.fixture, &["claimed", "running"]).await;
+    let retained_ids = retained.iter().copied().collect::<Vec<_>>();
+    // The siblings refused above are still settling rows of their own, so the
+    // baseline is taken once durable state has stopped moving. A baseline read
+    // mid-settlement would blame shutdown for a write already in flight.
+    let (accounting_before, audit_before, submissions) =
+        tokio::time::timeout(ADMISSION_BOUND, async {
+            loop {
+                let accounting = small_files_retry_accounting(&promoted.fixture).await;
+                let audit = promoted
+                    .fixture
+                    .forge_terminal_audit_count_for(&retained_ids)
+                    .await;
+                let submissions = catalog.attempts();
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                if accounting == small_files_retry_accounting(&promoted.fixture).await
+                    && audit
+                        == promoted
+                            .fixture
+                            .forge_terminal_audit_count_for(&retained_ids)
+                            .await
+                    && submissions == catalog.attempts()
+                {
+                    return (accounting, audit, submissions);
+                }
+            }
+        })
+        .await
+        .expect("the refused siblings stop writing before shutdown is measured");
+    let handoffs_before = supervisor
+        .observer()
+        .retained_handoff_outputs_for_test()
+        .len();
     supervisor.stop_worker().await;
+
+    assert_handoff_snapshot(supervisor, handoffs_before);
 
     assert_eq!(
         supervisor.returned_errors().len(),
         errors_before,
         "shutdown settles nothing for an attempt it cannot account for: {:?}",
         supervisor.returned_errors()
+    );
+    assert_eq!(
+        small_files_retry_accounting(&promoted.fixture).await,
+        accounting_before,
+        "shutdown writes no attempt count, failure class, or state for a \
+         retained attempt"
+    );
+    assert_eq!(
+        promoted
+            .fixture
+            .forge_terminal_audit_count_for(&retained_ids)
+            .await,
+        audit_before,
+        "a handed-off attempt appends no terminal rewrite audit row for its \
+         own operation"
     );
     assert_eq!(
         catalog.attempts(),
@@ -1652,6 +2247,145 @@ async fn shutdown_hands_off_retained_authority(
         0,
         "a handed-off attempt still releases its table fence"
     );
+    assert!(
+        !supervisor.worker_ready(),
+        "a worker stopped while still holding an unresolved operation never \
+         advertises itself again"
+    );
+
+    // Every operation this phase left open is what a successor inherits, not
+    // only the first one the wait above happened to see.
+    let inherited = after
+        .iter()
+        .skip(open_before)
+        .filter(|(_, phase)| *phase == "prepared")
+        .map(|(id, _)| *id)
+        .collect::<BTreeSet<_>>();
+    assert!(
+        !inherited.is_empty(),
+        "the handed-off attempt leaves at least one open operation: {after:?}"
+    );
+
+    successor_reconciles_before_publishing(promoted, catalog, supervisor, control, &inherited)
+        .await;
+}
+
+/// Proves a successor closes the inherited operation before it publishes again.
+///
+/// The parked commit is released as the definite conflict it always was, so the
+/// inherited operation is provably absent from the catalog and a successor can
+/// decide it. New debt is what gives the takeover something to publish — and
+/// what makes "reconciled before it published" a question with an answer.
+///
+/// # Panics
+///
+/// Panics when the successor publishes a snapshot while an inherited operation
+/// is still Prepared, or when it never reconciles one inside
+/// [`ADMISSION_BOUND`].
+async fn successor_reconciles_before_publishing(
+    promoted: &PromotedRewriteFixture,
+    catalog: &Arc<PromotionCatalogSeam>,
+    supervisor: &mut SupervisedPromotion,
+    control: &vala_bifrost_redux::forge::ForgeClockControl,
+    inherited: &BTreeSet<uuid::Uuid>,
+) {
+    // The successor takes over the exact operation identity its predecessor
+    // minted, and it closes that operation before it publishes anything new on
+    // the table: a takeover that compacted first would be publishing over an
+    // effect nobody has accounted for yet.
+    //
+    // The parked commit is released as the definite conflict it always was, so
+    // the inherited operation is now provably absent from the catalog and a
+    // successor can decide it. New debt is what gives the takeover something to
+    // publish - and what makes "reconciled before it published" a question with
+    // an answer.
+    catalog.reject_parked_commit();
+    catalog.reject_next_commits(0);
+    // Absence is only provable once the uncertainty bound has lapsed, and this
+    // fixture's clock is manual, so the successor's "now" is moved past the
+    // bound for the operation it just inherited.
+    control
+        .set(
+            chrono::Utc::now()
+                + chrono::Duration::from_std(promoted.fixture.config.uncertainty_bound)
+                    .expect("the uncertainty bound is representable")
+                + chrono::Duration::seconds(1),
+        )
+        .expect("manual Forge clock advances");
+    let promoted_before = promotions_succeeded(&promoted.fixture).await;
+    promoted.fixture.expire_claims().await;
+    promoted.fixture.seal_more(4).await;
+    promoted.fixture.clear_task_backoff().await;
+    supervisor.restart_worker();
+    supervisor.start_worker();
+    supervisor.reclaim_expired_claims().await;
+    supervisor.schedule_only().await;
+    // The new hot objects publish first, so a later snapshot is the rewrite the
+    // ordering assertion below is about rather than a promotion.
+    tokio::time::timeout(ADMISSION_BOUND, async {
+        while promotions_succeeded(&promoted.fixture).await <= promoted_before {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the successor publishes the new hot objects");
+    let snapshots_before = promoted.load_table().await.metadata().snapshots().count();
+    promoted.fixture.clear_task_backoff().await;
+    supervisor.schedule_only().await;
+    let reconciled = tokio::time::timeout(ADMISSION_BOUND, async {
+        loop {
+            let phases = operation_phases(&promoted.fixture).await;
+            // The first operation a takeover decides settles the task, and any
+            // other unresolved row is left to the table-wide owner, so the
+            // evidence of a successor-first takeover is that one of the exact
+            // inherited identities is closed - not that all of them are.
+            if inherited
+                .iter()
+                .any(|id| phases.get(id).is_some_and(|phase| phase != "prepared"))
+            {
+                return phases;
+            }
+            assert_eq!(
+                promoted.load_table().await.metadata().snapshots().count(),
+                snapshots_before,
+                "a successor publishes nothing before it has reconciled the \
+                 operation it inherited: {phases:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    assert!(
+        reconciled.is_ok(),
+        "a successor reconciles the exact operation it inherited: {inherited:?} / {:?}",
+        operation_phases(&promoted.fixture).await
+    );
+    supervisor.stop_worker().await;
+}
+
+/// Reads the durable retry-accounting fields of every small-files task.
+///
+/// Shutdown of a retained attempt must write none of them: an attempt whose
+/// operation cannot be accounted for has no retry, no failure class, and no
+/// re-scheduled state to record, so the exact tuple is what proves the handoff
+/// wrote nothing rather than writing something that happens to look unchanged
+/// in the state column alone.
+///
+/// # Panics
+///
+/// Panics when the read-only diagnostic query fails.
+async fn small_files_retry_accounting(
+    fixture: &super::support::PromotionIntegrationFixture,
+) -> Vec<(uuid::Uuid, i32, Option<String>, String)> {
+    sqlx::query_as(
+        "SELECT task_id, attempt_count, failure_class, state FROM vala.forge_tasks \
+         WHERE data_tenant_id = $1 AND strategy = 'small_files' \
+         ORDER BY created_at, task_id",
+    )
+    .bind(fixture.tenant.as_uuid())
+    .fetch_all(fixture.operator_pool.pool())
+    .await
+    .expect("Forge task retry accounting is readable")
 }
 
 /// Asserts no plan completion released a reservation the queue had already freed.

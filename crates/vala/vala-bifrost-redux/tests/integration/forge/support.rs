@@ -1235,6 +1235,55 @@ impl PromotionIntegrationFixture {
         );
     }
 
+    /// Seeds one more active tenant and returns its isolation key.
+    ///
+    /// The Forge claim, admission, and settlement paths are all tenant
+    /// qualified, so a scenario that has to prove one tenant's work does not
+    /// stop another's needs a second real tenant row rather than a second table
+    /// under the same one.
+    ///
+    /// # Panics
+    /// Panics when the tenant row cannot be seeded.
+    pub(crate) async fn seed_tenant(&self, slug: &str) -> DataTenantId {
+        self.database
+            .seed_additional_tenant(slug)
+            .await
+            .expect("fixture additional tenant")
+    }
+
+    /// Registers a table under `tenant` and seals real inputs into it.
+    ///
+    /// Identical to [`Self::register_and_seal_table`] except that every durable
+    /// write is bound to the supplied tenant, which is what lets one fixture
+    /// hold two tenants' compaction debt at once.
+    ///
+    /// # Panics
+    /// Panics when registration, sealing, or eligibility aging fails.
+    pub(crate) async fn register_and_seal_table_for(
+        &self,
+        tenant: DataTenantId,
+        name: &str,
+        count: usize,
+    ) {
+        let binding = create_table(&self.catalog, tenant, name).await;
+        let seeded_at = chrono::Utc::now();
+        let schema = ingress_schema();
+        for number in 0..count {
+            append_and_seal(
+                &self.scribe,
+                &self.catalog,
+                tenant,
+                &binding,
+                &ingress_batch(
+                    &schema,
+                    i64::try_from(number).expect("bounded fixture count"),
+                ),
+            )
+            .await;
+        }
+        age_files(&self.operator_pool, tenant, &binding, seeded_at).await;
+    }
+
     /// Registers a sibling and seals real inputs through this fixture's Scribe.
     ///
     /// # Panics
@@ -1389,6 +1438,38 @@ impl PromotionIntegrationFixture {
         count
     }
 
+    /// Counts terminal rewrite transitions recorded for `operation_ids`.
+    ///
+    /// Shutdown, maintenance, orphan collection, and every *other* attempt's
+    /// reconciliation all append ordinary Forge audit rows, so a whole-outbox
+    /// count cannot say whether one retained attempt was settled. Recovered and
+    /// Reset are the only transitions that close an unresolved rewrite, and the
+    /// operation identity is carried in the row's detail, which makes this the
+    /// exact evidence that a handed-off attempt was left for its successor.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the read-only diagnostic query fails.
+    pub(crate) async fn forge_terminal_audit_count_for(&self, operation_ids: &[Uuid]) -> i64 {
+        let patterns: Vec<String> = operation_ids.iter().map(|id| format!("%{id}%")).collect();
+        let mut conn = self
+            .vala
+            .tenant_conn(self.tenant)
+            .await
+            .expect("fixture tenant connection");
+        let count = sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM vala.audit_outbox \
+             WHERE operation IN ('forge.iceberg_rewrite.recovered', \
+             'forge.iceberg_rewrite.reset') AND detail LIKE ANY($1)",
+        )
+        .bind(&patterns)
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .expect("fixture Forge terminal audit inspection");
+        conn.commit().await.expect("fixture audit read commit");
+        count
+    }
+
     /// Ages every live claim deadline past due for this fixture's tenant.
     ///
     /// A worker that dies mid-attempt leaves its claim held until the deadline
@@ -1462,6 +1543,30 @@ impl PromotionIntegrationFixture {
         .execute(self.operator_pool.pool())
         .await
         .expect("fixture backoff aging");
+    }
+
+    /// Moves another tenant's Forge tasks to `offset_secs` from now.
+    ///
+    /// A scenario that must decide *when* a second tenant's work becomes
+    /// claimable cannot rely on planning order: the scheduler plans every
+    /// eligible table in one pass. Holding that tenant's tasks past the window
+    /// and releasing them afterwards makes the moment exact, with no race
+    /// against a running worker.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the update fails.
+    pub(crate) async fn offer_tasks_of(&self, tenant: DataTenantId, offset_secs: i64) {
+        sqlx::query(
+            "UPDATE vala.forge_tasks \
+             SET next_eligible_at = statement_timestamp() + ($2::text || ' seconds')::interval \
+             WHERE data_tenant_id = $1",
+        )
+        .bind(tenant.as_uuid())
+        .bind(offset_secs.to_string())
+        .execute(self.operator_pool.pool())
+        .await
+        .expect("fixture task offer window");
     }
 
     /// Re-offers the newest settled small-files task as fresh claimable work.

@@ -425,12 +425,17 @@ impl ForgeAttemptPool {
         self.attempts.values().any(|state| !state.drained())
     }
 
-    /// Returns whether any locally held attempt is unresolved.
+    /// Returns whether any locally held attempt already stores an unknown
+    /// acceptance.
     ///
-    /// Derived from the attempts' own indexed outcomes, so it is exactly the
-    /// set that [`ForgeWorker::reconcile_retained_attempts`] will visit.
+    /// Derived from the attempts' own indexed outcomes and deliberately not
+    /// gated on drain: an owner that already cannot account for one operation
+    /// must stop advertising authority immediately, while its sibling plans
+    /// keep running. Reconciliation still visits only drained attempts.
     fn has_local_ambiguity(&self) -> bool {
-        self.attempts.values().any(ForgeAttemptState::retained)
+        self.attempts
+            .values()
+            .any(ForgeWorker::retains_unknown_acceptance)
     }
 
     /// Returns every unresolved attempt's task id, in ascending order.
@@ -779,6 +784,14 @@ pub struct ForgeWorkerCompletionObserver {
     /// neither holds the vector nor clones an unsettled attempt's paths into it.
     #[cfg(feature = "test-support")]
     returned_unsettled: Arc<Mutex<Vec<Option<Vec<crate::forge::managed::ForgeUnsettledOutput>>>>>,
+    /// Attempt-wide possible-output snapshots taken at retained shutdown.
+    ///
+    /// One entry per attempt handed off unresolved, in handoff order, holding
+    /// the exact ordered set the shared context carried before it was dropped.
+    /// Compiled only under `test-support`; the production path renders the same
+    /// snapshot into its shutdown warning, which is the operator's evidence.
+    #[cfg(feature = "test-support")]
+    retained_handoff_outputs: Arc<Mutex<Vec<Vec<crate::forge::managed::ForgeUnsettledOutput>>>>,
     /// Publication evidence each admitted rewrite attempt produced, in order.
     ///
     /// Compiled only under `test-support`. Recorded at the production dispatch
@@ -1139,6 +1152,35 @@ impl ForgeWorkerCompletionObserver {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    /// Return each retained shutdown's exact ordered possible-output snapshot.
+    ///
+    /// Ordered by handoff. Passive diagnostic evidence: it is appended from the
+    /// same snapshot the shutdown warning renders and is never read by a
+    /// durable path.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn retained_handoff_outputs_for_test(
+        &self,
+    ) -> Vec<Vec<crate::forge::managed::ForgeUnsettledOutput>> {
+        self.retained_handoff_outputs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Record one retained attempt's final attempt-wide possible-output set.
+    #[cfg(feature = "test-support")]
+    pub(crate) fn record_retained_handoff_outputs_for_test(
+        &self,
+        outputs: Vec<crate::forge::managed::ForgeUnsettledOutput>,
+    ) {
+        self.retained_handoff_outputs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(outputs);
+        self.ready.notify_waiters();
     }
 
     /// Record one admitted rewrite attempt's publication evidence.
@@ -2422,10 +2464,13 @@ redacted
                         .await?;
                 }
             }
-            // Recomputed after this task's plans were offered, so the next
-            // claim of the same turn sees the room they took.
-            pending_pull_task_count =
-                (self.config.max_task_parallelism - pool.queue.running_parallelism_sum()).min(4);
+            // This claim consumed one unit of the turn's allowance, and the
+            // remainder is clamped to the room recomputed after its plans were
+            // offered. Consuming the unit is what bounds one turn to four
+            // tasks even when no plan has started yet.
+            pending_pull_task_count = pending_pull_task_count.saturating_sub(1).min(
+                (self.config.max_task_parallelism - pool.queue.running_parallelism_sum()).min(4),
+            );
         }
         Ok(Some(claimed))
     }
@@ -2512,13 +2557,22 @@ redacted
         }
         // The one final snapshot of what this attempt may have written is read
         // before its shared context is dropped, so a successor's operator has
-        // the object names even though nothing durable is settled here.
+        // the object names even though nothing durable is settled here. The
+        // exact ordered paths are what the ambiguous-commit runbook asks for,
+        // so they are rendered, not counted: a sibling that produced an object
+        // before Prepared has no other record of it.
+        let possible_outputs = shared.rewrite.possible_outputs();
         tracing::warn!(
             worker = %self.owner,
             task_id = %task_id,
-            possible_outputs = shared.rewrite.possible_outputs().len(),
+            possible_output_count = possible_outputs.len(),
+            possible_outputs = ?possible_outputs,
             "Forge shutdown retained an unresolved attempt for table-wide takeover"
         );
+        #[cfg(feature = "test-support")]
+        if let Some(observer) = &self.completion_observer {
+            observer.record_retained_handoff_outputs_for_test(possible_outputs);
+        }
         drop(shared);
         drop(open);
     }

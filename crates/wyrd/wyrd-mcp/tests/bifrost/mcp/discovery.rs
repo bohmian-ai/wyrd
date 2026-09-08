@@ -159,9 +159,9 @@ mod pg_tests {
             "the server-resolved correlation columns are their own class: {correlation_names:?}"
         );
         assert!(
-            correlation
-                .iter()
-                .all(|field| field["metadata"].as_object().is_some_and(|meta| !meta.is_empty())),
+            correlation.iter().all(|field| field["metadata"]
+                .as_object()
+                .is_some_and(|meta| !meta.is_empty())),
             "field metadata reaches the agent: {correlation:?}"
         );
         let layout = &described["physical_layout"];

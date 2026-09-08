@@ -1129,6 +1129,7 @@ async fn worker_wide_fifo_bounds_concurrent_attempts() {
         .observer()
         .release_held_rewrite_handoff_for_test();
     await_small_files_in_state(&promoted.fixture, &["succeeded"], 2).await;
+    assert_reservations_released_once(&supervisor);
     // A clean shutdown drains every join before the worker returns; the helper
     // panics if the production loop exits any other way.
     supervisor.shutdown().await;
@@ -1366,6 +1367,7 @@ async fn acceptance_unknown_retains_running_until_exact_reconciliation() {
 
     landed_replacement_recovers_into_success(&promoted, &catalog, &mut supervisor).await;
     known_success_leaves_its_ambiguous_sibling_open(&promoted, &catalog, &mut supervisor).await;
+    shutdown_hands_off_retained_authority(&promoted, &catalog, &mut supervisor).await;
     supervisor.shutdown().await;
     assert_eq!(
         promoted.fixture.live_leases().await,
@@ -1491,5 +1493,123 @@ async fn known_success_leaves_its_ambiguous_sibling_open(
         known_success.iter().any(|(_, phase)| phase == "prepared"),
         "its ambiguous sibling is left open for the table-wide owner, not failed: \
          {known_success:?}"
+    );
+}
+
+/// Proves that a stopping worker leaves an unresolved attempt for its successor.
+///
+/// A worker that cannot say what its own operation did has nothing durable it
+/// may write about it: failing the task would be a guess and retrying it would
+/// republish an effect that may already be live. So shutdown closes only what
+/// is local — the heartbeat and the table fence — and leaves the task Running
+/// with its operation Prepared, which is exactly the state a lost process
+/// leaves and the one the table-wide reconciliation owner takes over from.
+///
+/// # Panics
+///
+/// Panics when shutdown settles, fails, retries, or resets a retained
+/// attempt, when it changes an operation identity, when it does not return
+/// inside the fixture's shutdown bound, or when it leaves a table fence held.
+async fn shutdown_hands_off_retained_authority(
+    promoted: &PromotedRewriteFixture,
+    catalog: &Arc<PromotionCatalogSeam>,
+    supervisor: &mut SupervisedPromotion,
+) {
+    supervisor.stop_worker().await;
+    promoted.fixture.seal_more(4).await;
+    promoted.fixture.clear_task_backoff().await;
+    let open_before = operation_phases(&promoted.fixture).await.len();
+    let errors_before = supervisor.returned_errors().len();
+
+    // One plan reaches the catalog and never learns what happened, and every
+    // sibling is refused outright so no success can settle the task instead.
+    catalog.park_next_commit();
+    supervisor.restart_worker();
+    supervisor.start_worker();
+    supervisor.schedule_only().await;
+    tokio::time::timeout(ADMISSION_BOUND, catalog.wait_for_parked_commit())
+        .await
+        .expect("one plan reaches the catalog");
+    catalog.reject_remaining_commits();
+    let retained = tokio::time::timeout(ADMISSION_BOUND, async {
+        loop {
+            let open = operation_phases(&promoted.fixture).await;
+            let prepared = open
+                .into_iter()
+                .skip(open_before)
+                .filter(|(_, phase)| phase == "prepared")
+                .map(|(id, _)| id)
+                .collect::<BTreeSet<_>>();
+            if !prepared.is_empty() {
+                return prepared;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the parked plan opened its operation");
+    tokio::time::timeout(ADMISSION_BOUND, async {
+        while supervisor.worker_ready() {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("a worker holding an unresolved operation stops advertising itself");
+    let submissions = catalog.attempts();
+
+    // The stop lands while the attempt is still unresolved. A worker that
+    // waited for proof it cannot obtain would hang here; the helper's bound is
+    // what proves it does not.
+    let owned = small_files_in_state(&promoted.fixture, &["claimed", "running"]).await;
+    supervisor.stop_worker().await;
+
+    assert_eq!(
+        supervisor.returned_errors().len(),
+        errors_before,
+        "shutdown settles nothing for an attempt it cannot account for: {:?}",
+        supervisor.returned_errors()
+    );
+    assert_eq!(
+        catalog.attempts(),
+        submissions,
+        "shutdown resubmits nothing for a retained attempt"
+    );
+    assert_eq!(
+        small_files_in_state(&promoted.fixture, &["claimed", "running"]).await,
+        owned,
+        "a handed-off task stays Running for its successor: {:?}",
+        tenant_tasks(&promoted.fixture).await
+    );
+    let after = operation_phases(&promoted.fixture).await;
+    assert!(
+        retained
+            .iter()
+            .all(|id| after.get(id).is_some_and(|phase| phase == "prepared")),
+        "shutdown leaves every unresolved operation exactly as it was: {after:?}"
+    );
+    assert_eq!(
+        promoted.fixture.live_leases().await,
+        0,
+        "a handed-off attempt still releases its table fence"
+    );
+}
+
+/// Asserts no plan completion released a reservation the queue had already freed.
+///
+/// The worker treats a second release of one `(task_id, plan_index)` as an
+/// invariant failure and returns it, so an exactly-once violation surfaces as a
+/// returned attempt error rather than as silently corrupted budgets.
+///
+/// # Panics
+///
+/// Panics when any returned attempt error reports a double release.
+fn assert_reservations_released_once(supervisor: &SupervisedPromotion) {
+    assert!(
+        supervisor
+            .returned_errors()
+            .iter()
+            .all(|error| !error.contains("more than once")),
+        "each plan released its own reservation exactly once: {:?}",
+        supervisor.returned_errors()
     );
 }

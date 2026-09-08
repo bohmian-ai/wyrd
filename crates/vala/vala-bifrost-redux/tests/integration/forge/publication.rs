@@ -815,7 +815,7 @@ async fn rewrite_publication_ambiguity_restart_settles_once() {
     supervisor.restart_worker();
     let worker_stop = supervisor.worker_stop();
     let supervisor = supervisor
-        .run_one_failure_while(async {
+        .run_one_handoff_while(async {
             catalog.wait_for_parked_commit().await;
             worker_stop.cancel();
             catalog.wait_for_parked_commit_drop().await;

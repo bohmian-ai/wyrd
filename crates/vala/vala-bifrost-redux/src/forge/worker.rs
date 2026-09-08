@@ -2257,12 +2257,14 @@ impl ForgeWorker {
                 // owner cannot account for. A stopping worker cannot wait for
                 // an operation to become provable and must not guess: it hands
                 // the Prepared authority to its successor untouched.
-                for task_id in pool.retained_task_ids() {
+                let mut held: Vec<Uuid> = pool.attempts.keys().copied().collect();
+                held.sort_unstable();
+                for task_id in held {
                     if let Some(state) = pool.attempts.remove(&task_id) {
                         self.hand_off_retained_attempt(state).await;
                     }
                 }
-                continue;
+                return Ok(());
             }
             if pool.has_local_ambiguity() {
                 // An owner that cannot say what its own operation did has no
@@ -2295,7 +2297,10 @@ impl ForgeWorker {
                         .await?;
                 }
             }
-            if pool.has_local_ambiguity() {
+            // Readiness is asserted on three facts together: no local attempt
+            // is unresolved, every drained attempt finished its durable
+            // settlement above, and this worker is not stopping.
+            if pool.has_local_ambiguity() || shutdown.is_cancelled() {
                 continue;
             }
             self.publish_readiness(true);

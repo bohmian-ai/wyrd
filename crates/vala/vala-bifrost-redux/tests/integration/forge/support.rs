@@ -1981,6 +1981,38 @@ impl SupervisedPromotion {
         self
     }
 
+    /// Run one attempt to a shutdown handoff and join the worker.
+    ///
+    /// The attempt under test ends with an operation its own worker cannot
+    /// account for, so a stopping owner settles nothing for it: there is no
+    /// returned attempt to wait on and no error to collect. The `during`
+    /// future parks the seam and cancels the worker; this returns once that
+    /// worker has joined, having closed only its heartbeat and table fence.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a deterministic bound is missed, when the worker does not
+    /// join, or when shutdown settled the attempt it could not account for.
+    pub(crate) async fn run_one_handoff_while<F>(mut self, during: F) -> Self
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        let settled_before = self.worker_observer.returned_errors().len();
+        self.start_armed_worker();
+        self.schedule_once().await;
+        tokio::time::timeout(FIXTURE_BOUND, during)
+            .await
+            .expect("parked production commit seam bound");
+        self.stop_worker().await;
+        assert_eq!(
+            self.worker_observer.returned_errors().len(),
+            settled_before,
+            "shutdown settles nothing for an attempt it cannot account for: {:?}",
+            self.worker_observer.returned_errors()
+        );
+        self
+    }
+
     /// Schedule one pass and await exactly one returned worker error.
     ///
     /// Unlike [`Self::run_one_failure_while`] no seam is parked, because the

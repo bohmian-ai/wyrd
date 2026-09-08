@@ -90,8 +90,10 @@ struct TestOraclePeerCredentials {
     api_key: SecretString,
     /// Production exchange service used for each access-token acquisition.
     exchange: ExchangeApiKey,
-    /// Cached short-lived service bearer shared by every peer RPC in the cluster.
-    bearer: tokio::sync::Mutex<Option<String>>,
+    /// Cached short-lived service bearer shared by every peer RPC in the
+    /// cluster, retained with its own expiry so a journey that outlives one
+    /// access TTL re-exchanges instead of presenting an expired token.
+    bearer: tokio::sync::Mutex<Option<(String, chrono::DateTime<chrono::Utc>)>>,
 }
 
 impl std::fmt::Debug for TestOraclePeerCredentials {
@@ -107,7 +109,11 @@ impl OraclePeerCredentials for TestOraclePeerCredentials {
     /// Exchange the retained API key through the production auth service.
     async fn bearer(&self, force_refresh: bool) -> Result<String, DispatchError> {
         let mut cached = self.bearer.lock().await;
-        if !force_refresh && let Some(bearer) = cached.as_ref() {
+        let fresh_until = chrono::Utc::now() + chrono::Duration::seconds(60);
+        if !force_refresh
+            && let Some((bearer, expires_at)) = cached.as_ref()
+            && *expires_at > fresh_until
+        {
             return Ok(bearer.clone());
         }
         let mut conn = self
@@ -126,7 +132,7 @@ impl OraclePeerCredentials for TestOraclePeerCredentials {
             .map_err(|_| DispatchError::Terminal)?;
         conn.commit().await.map_err(|_| DispatchError::Terminal)?;
         let bearer = exchanged.access_token.expose_secret().to_owned();
-        *cached = Some(bearer.clone());
+        *cached = Some((bearer.clone(), exchanged.expires_at));
         Ok(bearer)
     }
 }

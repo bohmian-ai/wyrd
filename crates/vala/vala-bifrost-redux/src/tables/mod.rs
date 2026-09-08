@@ -745,7 +745,11 @@ mod tests {
     /// physical name resolves again.
     #[test]
     fn canonical_otel_registry_has_no_child_or_genai_tables() {
-        for (namespace, name) in [("traces", "spans"), ("logs", "records"), ("metrics", "points")] {
+        for (namespace, name) in [
+            ("traces", "spans"),
+            ("logs", "records"),
+            ("metrics", "points"),
+        ] {
             assert!(
                 builtin_table(namespace, name).is_some(),
                 "the canonical {namespace}.{name} signal table resolves"

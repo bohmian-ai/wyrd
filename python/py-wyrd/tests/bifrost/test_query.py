@@ -4,6 +4,8 @@ import asyncio
 import inspect
 import json
 import threading
+import uuid
+from datetime import datetime, timezone
 
 import pyarrow
 import pytest
@@ -259,3 +261,131 @@ def test_bifrost_query_cancellation_waits_for_cleanup_and_preserves_cancelled_er
     assert reason == "original cancellation"
     assert native.closed
     assert close_calls == 2
+
+
+def test_typed_trace_and_genai_client_contracts() -> None:
+    calls: list[tuple[str, tuple[object, ...]]] = []
+
+    class NativeClient:
+        def get_trace(
+            self, trace_id: str, since: str | None, until: str | None
+        ) -> dict[str, object]:
+            calls.append(("get_trace", (trace_id, since, until)))
+            return {
+                "trace": {
+                    "trace_id": trace_id,
+                    "spans": [
+                        {
+                            "span_id": "0102030405060708",
+                            "name": "chat",
+                            "start_time_unix_nano": 7,
+                            "events": [{"time_unix_nano": 8, "name": "chunk"}],
+                            "links": [],
+                        }
+                    ],
+                }
+            }
+
+        def query_genai(self, *args: object) -> dict[str, object]:
+            calls.append(("query_genai", args))
+            return {
+                "rows": [
+                    {
+                        "model": "gpt-4o",
+                        "start_time_unix_nano": 11,
+                        "input_messages": [{"role": "user", "parts": [1, None]}],
+                    }
+                ],
+                "next_page_token": "next",
+            }
+
+    client = object.__new__(BifrostQueryClient)
+    client._native = NativeClient()
+
+    async def run() -> tuple[dict[str, object], dict[str, object]]:
+        trace = await client.get_trace(
+            "0102030405060708090a0b0c0d0e0f10",
+            since=datetime(2026, 7, 1, tzinfo=timezone.utc),
+        )
+        generations = await client.query_genai(model="gpt-4o", limit=10)
+        return trace, generations
+
+    trace, generations = asyncio.run(run())
+
+    assert calls[0] == (
+        "get_trace",
+        ("0102030405060708090a0b0c0d0e0f10", "2026-07-01T00:00:00+00:00", None),
+    )
+    assert calls[1] == ("query_genai", (None, None, 10, None, None, "gpt-4o", None))
+
+    spans = trace["trace"]["spans"]
+    assert len(spans) == 1
+    assert len(spans[0]["events"]) == 1, "events stay nested on their owning span"
+    assert "events" not in trace["trace"], "trace detail carries no top-level children"
+
+    assert generations["next_page_token"] == "next"
+    row = generations["rows"][0]
+    assert row["input_messages"] == [{"role": "user", "parts": [1, None]}]
+    assert "output_messages" not in row, "an omitted payload stays absent"
+    assert "prompt" not in row and "cost_usd" not in row
+
+
+def test_canonical_arrow_insert_uses_described_schema() -> None:
+    described = {
+        "entry": {"namespace": "vala.traces", "name": "spans"},
+        "user_fields": [{"name": "trace_id"}],
+        "correlation_fields": [{"name": "card_ref"}, {"name": "run_id"}],
+        "managed_candidates": [{"name": "wyrd_event_time"}],
+        "physical_layout": {"partition_granularity": "hour"},
+    }
+    schema = pyarrow.schema(
+        [
+            pyarrow.field("trace_id", pyarrow.binary(), nullable=False),
+            pyarrow.field("card_ref", pyarrow.string(), nullable=False),
+            pyarrow.field("run_id", pyarrow.string(), nullable=True),
+        ]
+    )
+    sink = pyarrow.BufferOutputStream()
+    with pyarrow.ipc.new_stream(sink, schema):
+        pass
+    schema_only_ipc = sink.getvalue().to_pybytes()
+    sent: list[tuple[str, bytes, bytes]] = []
+    requested: list[tuple[str, bool]] = []
+
+    class NativeClient:
+        def writable_schema_ipc(self, description_json: str, include_event_time: bool) -> bytes:
+            requested.append((description_json, include_event_time))
+            return schema_only_ipc
+
+        def insert_batch(self, table: str, batch_id: bytes, arrow_ipc: bytes) -> bytes:
+            sent.append((table, batch_id, arrow_ipc))
+            return batch_id
+
+    client = object.__new__(BifrostQueryClient)
+    client._native = NativeClient()
+    batch_id = uuid.uuid4()
+
+    async def run() -> tuple[pyarrow.Schema, uuid.UUID]:
+        writable = await client.writable_schema(described)
+        batch = pyarrow.record_batch(
+            [
+                pyarrow.array([b"\x01"], type=pyarrow.binary()),
+                pyarrow.array(["space/Data/spans@1"]),
+                pyarrow.array([None], type=pyarrow.string()),
+            ],
+            schema=writable,
+        )
+        return writable, await client.insert_batch("vala.traces.spans", batch_id, batch)
+
+    writable, acked = asyncio.run(run())
+
+    assert json.loads(requested[0][0])["user_fields"] == [{"name": "trace_id"}]
+    assert requested[0][1] is False, "a writer supplies event time only when it asks to"
+    assert writable.names == ["trace_id", "card_ref", "run_id"]
+    assert acked == batch_id
+    table, sent_id, ipc = sent[0]
+    assert table == "vala.traces.spans"
+    assert sent_id == batch_id.bytes
+    assert pyarrow.ipc.open_stream(ipc).schema == writable, (
+        "the batch travels on the described schema, not a rebuilt one"
+    )

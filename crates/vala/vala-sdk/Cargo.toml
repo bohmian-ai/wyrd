@@ -18,6 +18,7 @@ python = ["dep:pyo3", "dep:wyrd-utils", "wyrd-utils/python"]
 
 [dependencies]
 bytes = { workspace = true }
+chrono = { workspace = true }
 wyrd-queue = { workspace = true }
 wyrd-client = { workspace = true }
 wyrd-tonic = { workspace = true, features = ["client"] }

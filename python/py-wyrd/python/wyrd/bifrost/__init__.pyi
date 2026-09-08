@@ -1,6 +1,8 @@
 # AUTO-GENERATED STUB FILE. DO NOT EDIT.
 # pylint: disable=redefined-builtin, invalid-name, dangerous-default-value
+import uuid
 from collections.abc import AsyncIterator
+from datetime import datetime
 from typing import Any, TypedDict
 
 import pyarrow
@@ -58,6 +60,25 @@ class BifrostQueryError(RuntimeError):
 
 class IncompleteQueryStreamError(BifrostQueryError):
     """Raised when transport EOF arrives before a validated terminal."""
+
+class TableDescription(TypedDict):
+    """Server projection of one registered table's stored physical schema."""
+
+    entry: dict[str, Any]
+    user_fields: list[dict[str, Any]]
+    correlation_fields: list[dict[str, Any]]
+    managed_candidates: list[dict[str, Any]]
+    physical_layout: dict[str, Any]
+
+class TraceDetail(TypedDict):
+    """One complete authorized cut of a trace; children nest on their span."""
+
+    trace: dict[str, Any]
+
+class GenAiPage(TypedDict):
+    """One page of GenAI generation records."""
+
+    rows: list[dict[str, Any]]
 
 class RunningQueryProgress(TypedDict):
     """Participant progress for one live Oracle query."""
@@ -122,6 +143,47 @@ class BifrostQueryClient:
     async def cancel(self, request_id: str) -> CancelRunningQueryResult:
         """Request server-side cancellation without closing a local stream."""
         ...
+    async def describe_table(self, namespace: str, name: str) -> TableDescription:
+        """Describe one registered table's stored physical schema."""
+        ...
+    async def writable_schema(
+        self,
+        description: TableDescription,
+        *,
+        include_event_time: bool = False,
+    ) -> pyarrow.Schema:
+        """Return the exact Arrow schema a writer builds batches on."""
+        ...
+    async def get_trace(
+        self,
+        trace_id: str,
+        *,
+        since: datetime | None = None,
+        until: datetime | None = None,
+    ) -> TraceDetail:
+        """Read one complete authorized cut of a single trace."""
+        ...
+    async def query_genai(
+        self,
+        *,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        limit: int | None = None,
+        page_token: str | None = None,
+        conversation_id: str | None = None,
+        model: str | None = None,
+        provider: str | None = None,
+    ) -> GenAiPage:
+        """Read one page of GenAI generation records."""
+        ...
+    async def insert_batch(
+        self,
+        table: str,
+        batch_id: uuid.UUID,
+        batch: pyarrow.RecordBatch,
+    ) -> uuid.UUID:
+        """Send one Arrow batch built on a described schema."""
+        ...
 
 __all__ = [
     "Bifrost",
@@ -129,7 +191,10 @@ __all__ = [
     "BifrostQueryError",
     "BifrostQueryStream",
     "CancelRunningQueryResult",
+    "GenAiPage",
     "IncompleteQueryStreamError",
     "RunningQuery",
     "RunningQueryProgress",
+    "TableDescription",
+    "TraceDetail",
 ]

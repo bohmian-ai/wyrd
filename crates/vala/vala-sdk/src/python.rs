@@ -21,7 +21,10 @@ use wyrd_client::transport::{HttpConfig, HttpTransport, ResolvedCredential};
 use wyrd_queue::QueueConfig;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
-use wyrd_spec::vala::api::{BifrostQueryRequest, FreshnessPolicy, VisibilityMode};
+use wyrd_spec::vala::api::{
+    BifrostQueryRequest, BifrostTableDescription, FreshnessPolicy, GetTraceRequest,
+    QueryGenAiRequest, QueryWindow, VisibilityMode,
+};
 use wyrd_utils::py::json_to_pyobject;
 
 use crate::native_owner::NativeStreamOwner;
@@ -178,6 +181,12 @@ impl Bifrost {
 pub struct PyBifrostQueryClient {
     /// Rust owner sharing one authenticated HTTP connection pool.
     client: QueryClient,
+    /// The same authenticated client, retained for the Bifrost ingest wire.
+    ///
+    /// A canonical Arrow insert is a write on the gRPC transport rather than a
+    /// query, so this class keeps the client the transport connects from
+    /// instead of standing up a second authenticated owner.
+    transport_client: WyrdClient,
 }
 
 #[pymethods]
@@ -214,6 +223,7 @@ impl PyBifrostQueryClient {
         let client = WyrdClient::from_parts(auth, http, config.grpc);
         Ok(Self {
             client: QueryClient::new(&client),
+            transport_client: client,
         })
     }
 
@@ -296,6 +306,199 @@ impl PyBifrostQueryClient {
             .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
         json_to_pyobject(py, &value)
     }
+
+    /// Describes one registered table's stored physical schema.
+    ///
+    /// The result is the server's own JSON description projected into Python,
+    /// so a caller reads its user fields, correlation inputs, managed
+    /// candidates, and canonical physical fingerprint without any local copy of
+    /// the table contract.
+    ///
+    /// # Errors
+    ///
+    /// Raises a typed Bifrost query error for transport, authorization, or
+    /// not-found failures.
+    fn describe_table(&self, py: Python<'_>, namespace: &str, name: &str) -> PyResult<Py<PyAny>> {
+        let description = py
+            .detach(|| {
+                wyrd_runtime::runtime().block_on(self.client.describe_table(namespace, name))
+            })
+            .map_err(query_error_to_py)?;
+        let value = serde_json::to_value(description)
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+        json_to_pyobject(py, &value)
+    }
+
+    /// Reads one complete authorized cut of a single trace.
+    ///
+    /// # Errors
+    ///
+    /// Raises a typed Bifrost query error for an inverted window, transport,
+    /// authorization, or not-found failures, and `ValueError` when a bound is
+    /// not an RFC 3339 timestamp.
+    #[pyo3(signature = (trace_id, since=None, until=None))]
+    fn get_trace(
+        &self,
+        py: Python<'_>,
+        trace_id: &str,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> PyResult<Py<PyAny>> {
+        let request = GetTraceRequest {
+            trace_id: trace_id.to_owned(),
+            since: parse_window_bound(since, "since")?,
+            until: parse_window_bound(until, "until")?,
+        };
+        let response = py
+            .detach(|| wyrd_runtime::runtime().block_on(self.client.get_trace(&request)))
+            .map_err(query_error_to_py)?;
+        let value = serde_json::to_value(response)
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+        json_to_pyobject(py, &value)
+    }
+
+    /// Reads one page of GenAI generation records.
+    ///
+    /// # Errors
+    ///
+    /// Raises a typed Bifrost query error for transport, authorization, or
+    /// validation failures, and `ValueError` when a bound is not an RFC 3339
+    /// timestamp.
+    #[pyo3(signature = (
+        since=None,
+        until=None,
+        limit=None,
+        page_token=None,
+        conversation_id=None,
+        model=None,
+        provider=None
+    ))]
+    fn query_genai(
+        &self,
+        py: Python<'_>,
+        since: Option<&str>,
+        until: Option<&str>,
+        limit: Option<u32>,
+        page_token: Option<String>,
+        conversation_id: Option<String>,
+        model: Option<String>,
+        provider: Option<String>,
+    ) -> PyResult<Py<PyAny>> {
+        let request = QueryGenAiRequest {
+            window: QueryWindow {
+                since: parse_window_bound(since, "since")?,
+                until: parse_window_bound(until, "until")?,
+                limit,
+                page_token,
+            },
+            conversation_id,
+            model,
+            provider,
+        };
+        let response = py
+            .detach(|| wyrd_runtime::runtime().block_on(self.client.query_genai(&request)))
+            .map_err(query_error_to_py)?;
+        let value = serde_json::to_value(response)
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+        json_to_pyobject(py, &value)
+    }
+
+    /// Projects one described table's writable Arrow schema as schema-only IPC.
+    ///
+    /// The bytes carry no batch, so Python decodes them with its installed
+    /// Arrow implementation instead of rebuilding a schema from the
+    /// description's field declarations. `include_event_time` selects whether
+    /// the caller intends to supply the managed event-time column.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ValueError` when `description_json` is not one describe
+    /// response or declares a column the write path already appends, and
+    /// `RuntimeError` when the schema cannot be encoded.
+    #[pyo3(signature = (description_json, include_event_time))]
+    fn writable_schema_ipc(
+        &self,
+        description_json: &str,
+        include_event_time: bool,
+    ) -> PyResult<Vec<u8>> {
+        let description: BifrostTableDescription = serde_json::from_str(description_json)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        let schema = wyrd_queue::schema::writable_schema(&description, include_event_time)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        let mut buffer = Vec::new();
+        {
+            let mut writer = StreamWriter::try_new(&mut buffer, &schema)
+                .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+            writer
+                .finish()
+                .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+        }
+        Ok(buffer)
+    }
+
+    /// Sends one Arrow IPC batch through the existing Bifrost ingest wire.
+    ///
+    /// This is the direct canonical write path: the caller already built a
+    /// batch on the described physical schema, so the bytes travel as-is rather
+    /// than through the buffered JSON row API, which would rebuild a schema of
+    /// its own. Batch identity is the caller's, so a retry of the same bytes
+    /// stays one durable batch.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ValueError` when `batch_id` is not exactly 16 bytes, and a typed
+    /// Bifrost query error when the transport cannot connect or the server
+    /// rejects the frame.
+    #[pyo3(signature = (table, batch_id, arrow_ipc))]
+    fn insert_batch(
+        &self,
+        py: Python<'_>,
+        table: &str,
+        batch_id: &[u8],
+        arrow_ipc: Vec<u8>,
+    ) -> PyResult<Vec<u8>> {
+        let batch_id = <[u8; 16]>::try_from(batch_id).map_err(|_| {
+            PyValueError::new_err("bifrost batch_id must contain exactly 16 bytes")
+        })?;
+        py.detach(|| {
+            wyrd_runtime::runtime().block_on(async {
+                let transport = BifrostGrpcTransport::connect(&self.transport_client)
+                    .await
+                    .map_err(|_| {
+                        ValaSdkError::Transport(WyrdError::ServiceUnavailable {
+                            message: "Bifrost ingest transport is unavailable".to_owned(),
+                            details: serde_json::json!({"transport": "grpc"}),
+                        })
+                    })?;
+                transport
+                    .insert_batch(table, batch_id, arrow_ipc)
+                    .await
+                    .map_err(ValaSdkError::Transport)
+            })
+        })
+        .map_err(query_error_to_py)?;
+        Ok(batch_id.to_vec())
+    }
+}
+
+/// Parses one optional RFC 3339 window bound at the Python boundary.
+///
+/// # Errors
+///
+/// Returns `ValueError` naming the offending field when the text is not an
+/// RFC 3339 timestamp.
+fn parse_window_bound(
+    value: Option<&str>,
+    field: &str,
+) -> PyResult<Option<chrono::DateTime<chrono::Utc>>> {
+    value
+        .map(|text| {
+            text.parse::<chrono::DateTime<chrono::Utc>>()
+                .map_err(|error| {
+                    PyValueError::new_err(format!("{field} must be an RFC 3339 timestamp: {error}"))
+                })
+        })
+        .transpose()
 }
 
 /// Parses one lifecycle request identity into the canonical structured error boundary.

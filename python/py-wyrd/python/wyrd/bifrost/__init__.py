@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import uuid
 from collections.abc import AsyncIterator
+from datetime import datetime
 from typing import Any, TypedDict
 
 import pyarrow
@@ -143,6 +145,121 @@ class BifrostQueryClient:
 
         return await asyncio.to_thread(self._native.cancel, request_id)
 
+    async def describe_table(self, namespace: str, name: str) -> TableDescription:
+        """Describe one registered table's stored physical schema."""
+
+        return await asyncio.to_thread(self._native.describe_table, namespace, name)
+
+    async def writable_schema(
+        self,
+        description: TableDescription,
+        *,
+        include_event_time: bool = False,
+    ) -> pyarrow.Schema:
+        """Return the exact Arrow schema a writer builds batches on.
+
+        The schema is decoded from schema-only Arrow IPC produced by Rust from
+        the same description, so Python never rebuilds the physical contract
+        from the description's field declarations.
+        """
+
+        payload = await asyncio.to_thread(
+            self._native.writable_schema_ipc,
+            json.dumps(description),
+            include_event_time,
+        )
+        return pyarrow.ipc.open_stream(payload).schema
+
+    async def get_trace(
+        self,
+        trace_id: str,
+        *,
+        since: datetime | None = None,
+        until: datetime | None = None,
+    ) -> TraceDetail:
+        """Read one complete authorized cut of a single trace."""
+
+        return await asyncio.to_thread(
+            self._native.get_trace,
+            trace_id,
+            since.isoformat() if since is not None else None,
+            until.isoformat() if until is not None else None,
+        )
+
+    async def query_genai(
+        self,
+        *,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        limit: int | None = None,
+        page_token: str | None = None,
+        conversation_id: str | None = None,
+        model: str | None = None,
+        provider: str | None = None,
+    ) -> GenAiPage:
+        """Read one page of GenAI generation records."""
+
+        return await asyncio.to_thread(
+            self._native.query_genai,
+            since.isoformat() if since is not None else None,
+            until.isoformat() if until is not None else None,
+            limit,
+            page_token,
+            conversation_id,
+            model,
+            provider,
+        )
+
+    async def insert_batch(
+        self,
+        table: str,
+        batch_id: uuid.UUID,
+        batch: pyarrow.RecordBatch,
+    ) -> uuid.UUID:
+        """Send one Arrow batch built on a described schema, returning its acked identity.
+
+        The batch travels as written — this is not the buffered JSON row path
+        and rebuilds no schema. The returned identity is the server's echo of
+        the caller's own batch id, so a retry of the same bytes stays one
+        durable batch.
+        """
+
+        sink = pyarrow.BufferOutputStream()
+        with pyarrow.ipc.new_stream(sink, batch.schema) as writer:
+            writer.write_batch(batch)
+        acked = await asyncio.to_thread(
+            self._native.insert_batch,
+            table,
+            batch_id.bytes,
+            sink.getvalue().to_pybytes(),
+        )
+        acked = uuid.UUID(bytes=bytes(acked))
+        if acked != batch_id:
+            raise BifrostQueryError(f"bifrost acked batch {acked} for submitted batch {batch_id}")
+        return acked
+
+
+class TableDescription(TypedDict):
+    """Server projection of one registered table's stored physical schema."""
+
+    entry: dict[str, Any]
+    user_fields: list[dict[str, Any]]
+    correlation_fields: list[dict[str, Any]]
+    managed_candidates: list[dict[str, Any]]
+    physical_layout: dict[str, Any]
+
+
+class TraceDetail(TypedDict):
+    """One complete authorized cut of a trace; children nest on their span."""
+
+    trace: dict[str, Any]
+
+
+class GenAiPage(TypedDict):
+    """One page of GenAI generation records."""
+
+    rows: list[dict[str, Any]]
+
 
 class RunningQueryProgress(TypedDict):
     """Participant progress for one live Oracle query."""
@@ -176,7 +293,10 @@ __all__ = [
     "BifrostQueryError",
     "BifrostQueryStream",
     "CancelRunningQueryResult",
+    "GenAiPage",
     "IncompleteQueryStreamError",
     "RunningQuery",
     "RunningQueryProgress",
+    "TableDescription",
+    "TraceDetail",
 ]

@@ -82,7 +82,7 @@ export declare class NativeBifrostQueryClient {
    */
   getTrace(traceId: string, since?: string | undefined | null, until?: string | undefined | null): Promise<NativeLifecycleResult>
   /**
-   * Reads one page of GenAI generation records.
+   * Reads one page of `GenAI` generation records.
    *
    * # Errors
    *
@@ -160,7 +160,7 @@ export declare class NativeQueryStart {
 }
 
 /**
- * GenAI filter request as JavaScript sends it.
+ * `GenAI` filter request as JavaScript sends it.
  *
  * Window bounds arrive as RFC 3339 text because napi has no native chrono
  * projection; every field is optional so an unfiltered page is the default.

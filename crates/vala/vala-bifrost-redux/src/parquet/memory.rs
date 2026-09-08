@@ -1854,6 +1854,12 @@ mod tests {
     }
 
     /// Writer-v2 footer identity remains exact across UTC spelling aliases.
+    ///
+    /// It must also accept a schema a reader rebuilt independently — same
+    /// layout, its own metadata — because the envelope binds stored memory
+    /// estimates to the Arrow layout that produced them, not to the object that
+    /// happened to describe it. A nullability change is a layout change and is
+    /// refused.
     #[test]
     fn bifrost_footer_fingerprint_does_not_alias_utc_spellings() {
         let utc_schema = Arc::new(Schema::new(vec![Field::new(
@@ -1892,6 +1898,31 @@ mod tests {
             )
             .is_err(),
             "footer fingerprint must not alias a different Arrow schema spelling"
+        );
+
+        let rebuilt = Schema::new(vec![
+            Field::new(
+                "observed_at",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                false,
+            )
+            .with_metadata(std::collections::HashMap::from([
+                ("reader.note".to_owned(), "rebuilt".to_owned()),
+                ("reader.origin".to_owned(), "catalog".to_owned()),
+            ])),
+        ]);
+        BifrostParquetMemoryEnvelope::from_footer(footer.file_metadata(), &rebuilt, object)
+            .expect("an independently rebuilt equivalent layout is accepted");
+
+        let relaxed = Schema::new(vec![Field::new(
+            "observed_at",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            true,
+        )]);
+        assert!(
+            BifrostParquetMemoryEnvelope::from_footer(footer.file_metadata(), &relaxed, object)
+                .is_err(),
+            "a nullability change is a validity-buffer change the envelope must refuse"
         );
     }
 

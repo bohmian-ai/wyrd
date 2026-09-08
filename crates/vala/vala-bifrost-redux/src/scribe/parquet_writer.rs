@@ -1707,6 +1707,14 @@ mod tests {
     /// and — for the fingerprint and object identity — the artifact's own
     /// rather than a sibling's.
     ///
+    /// The footer's fingerprint is the Parquet memory envelope's exact layout
+    /// identity, which is a different question from the catalog identity the
+    /// artifact reports: the envelope binds stored memory estimates to the Arrow
+    /// layout that produced them, so it must separate spellings — `Utf8` from
+    /// `LargeUtf8`, nullable from required — that the catalog deliberately
+    /// normalizes across an Iceberg round trip. `sealed_fingerprint` is
+    /// therefore computed through the envelope's own entry point.
+    ///
     /// # Panics
     ///
     /// Panics when a field is missing, empty, unversioned, or names another
@@ -1714,6 +1722,7 @@ mod tests {
     fn assert_footer_envelope_names_this_artifact(
         fields: &std::collections::BTreeMap<String, String>,
         artifact: &BoundedParquetArtifact,
+        sealed_fingerprint: &str,
     ) {
         assert_eq!(
             fields.get("wyrd.bifrost.writer_recipe").map(String::as_str),
@@ -1736,8 +1745,8 @@ mod tests {
             fields
                 .get("wyrd.bifrost.schema_fingerprint")
                 .map(String::as_str),
-            Some(artifact.schema_fingerprint.as_str()),
-            "the footer fingerprint is the one the writer reported"
+            Some(sealed_fingerprint),
+            "the footer fingerprint is the exact layout the envelope sealed"
         );
         assert_eq!(
             fields
@@ -1834,7 +1843,11 @@ mod tests {
                 })
                 .collect();
 
-            assert_footer_envelope_names_this_artifact(&fields, artifact);
+            assert_footer_envelope_names_this_artifact(
+                &fields,
+                artifact,
+                &hex::encode(crate::parquet::memory::schema_fingerprint(frozen.schema.as_ref()).0),
+            );
 
             assert_row_group_stats_match_footer(metadata, artifact);
 

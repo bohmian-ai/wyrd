@@ -499,6 +499,144 @@ impl NativeBifrostQueryClient {
         }
     }
 
+    /// Describes one registered table's stored physical schema.
+    ///
+    /// The description is the server's own projection: the user fields a caller
+    /// declares, the correlation inputs the write path resolves, the managed
+    /// candidates it may supply, and a canonical table's physical fingerprint.
+    /// JavaScript builds its insertable schema from this rather than from a
+    /// local copy of the table contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error only when the native result cannot be projected;
+    /// Wyrd control failures are returned in [`NativeLifecycleResult`].
+    #[napi]
+    pub async fn describe_table(
+        &self,
+        namespace: String,
+        name: String,
+    ) -> napi::Result<NativeLifecycleResult> {
+        match self.client.describe_table(&namespace, &name).await {
+            Ok(description) => NativeLifecycleResult::success(
+                &serde_json::to_value(description).map_err(napi_error)?,
+            ),
+            Err(error) => Ok(NativeLifecycleResult::failure(&error)),
+        }
+    }
+
+    /// Reads one complete authorized cut of a single trace.
+    ///
+    /// Trace detail has no continuation token: `since` and `until` bound the
+    /// scanned window only, and each span carries its own events and links.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error only when the native result cannot be projected;
+    /// window, authorization, and transport failures are returned in
+    /// [`NativeLifecycleResult`].
+    #[napi]
+    pub async fn get_trace(
+        &self,
+        trace_id: String,
+        since: Option<String>,
+        until: Option<String>,
+    ) -> napi::Result<NativeLifecycleResult> {
+        let request = wyrd_spec::vala::api::GetTraceRequest {
+            trace_id,
+            since: match parse_window_bound(since.as_deref(), "since") {
+                Ok(bound) => bound,
+                Err(error) => {
+                    return Ok(NativeLifecycleResult::failure(&ValaSdkError::Transport(error)));
+                }
+            },
+            until: match parse_window_bound(until.as_deref(), "until") {
+                Ok(bound) => bound,
+                Err(error) => {
+                    return Ok(NativeLifecycleResult::failure(&ValaSdkError::Transport(error)));
+                }
+            },
+        };
+        match self.client.get_trace(&request).await {
+            Ok(response) => {
+                NativeLifecycleResult::success(&serde_json::to_value(response).map_err(napi_error)?)
+            }
+            Err(error) => Ok(NativeLifecycleResult::failure(&error)),
+        }
+    }
+
+    /// Reads one page of GenAI generation records.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error only when the native result cannot be projected;
+    /// window, authorization, and transport failures are returned in
+    /// [`NativeLifecycleResult`].
+    #[napi]
+    pub async fn query_genai(
+        &self,
+        request: NativeGenAiRequest,
+    ) -> napi::Result<NativeLifecycleResult> {
+        let query = wyrd_spec::vala::api::QueryGenAiRequest {
+            window: wyrd_spec::vala::api::QueryWindow {
+                since: match parse_window_bound(request.since.as_deref(), "since") {
+                    Ok(bound) => bound,
+                    Err(error) => {
+                    return Ok(NativeLifecycleResult::failure(&ValaSdkError::Transport(error)));
+                }
+                },
+                until: match parse_window_bound(request.until.as_deref(), "until") {
+                    Ok(bound) => bound,
+                    Err(error) => {
+                    return Ok(NativeLifecycleResult::failure(&ValaSdkError::Transport(error)));
+                }
+                },
+                limit: request.limit,
+                page_token: request.page_token,
+            },
+            conversation_id: request.conversation_id,
+            model: request.model,
+            provider: request.provider,
+        };
+        match self.client.query_genai(&query).await {
+            Ok(response) => {
+                NativeLifecycleResult::success(&serde_json::to_value(response).map_err(napi_error)?)
+            }
+            Err(error) => Ok(NativeLifecycleResult::failure(&error)),
+        }
+    }
+
+    /// Projects one described table's writable Arrow schema as schema-only IPC.
+    ///
+    /// The buffer carries no batch, so JavaScript decodes it with its installed
+    /// Arrow implementation instead of reimplementing the description's
+    /// field/type conversion. `include_event_time` selects whether the caller
+    /// intends to supply the managed event-time column.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error when `description_json` is not one describe
+    /// response, when the description declares a column the write path already
+    /// appends, or when the schema cannot be encoded.
+    #[napi]
+    pub fn writable_schema_ipc(
+        &self,
+        description_json: String,
+        include_event_time: bool,
+    ) -> napi::Result<Buffer> {
+        let description: wyrd_spec::vala::api::BifrostTableDescription =
+            serde_json::from_str(&description_json).map_err(napi_error)?;
+        let schema = wyrd_queue::schema::writable_schema(&description, include_event_time)
+            .map_err(napi_error)?;
+        let mut buffer = Vec::new();
+        {
+            let mut writer =
+                arrow::ipc::writer::StreamWriter::try_new(&mut buffer, &schema).map_err(napi_error)?;
+            writer.finish().map_err(napi_error)?;
+        }
+        Ok(Buffer::from(buffer))
+    }
+
     /// Sends one Arrow IPC batch through the existing Bifrost ingest wire.
     ///
     /// The Rust client-tier transport owns UUID validation, authentication,
@@ -541,6 +679,50 @@ impl NativeBifrostQueryClient {
             Err(error) => Ok(NativeInsertResult::failure(&error)),
         }
     }
+}
+
+/// GenAI filter request as JavaScript sends it.
+///
+/// Window bounds arrive as RFC 3339 text because napi has no native chrono
+/// projection; every field is optional so an unfiltered page is the default.
+#[napi(object)]
+pub struct NativeGenAiRequest {
+    /// Inclusive lower bound on event time, RFC 3339.
+    pub since: Option<String>,
+    /// Exclusive upper bound on event time, RFC 3339.
+    pub until: Option<String>,
+    /// Requested page size.
+    pub limit: Option<u32>,
+    /// Continuation token from a prior page.
+    pub page_token: Option<String>,
+    /// Conversation-id filter.
+    pub conversation_id: Option<String>,
+    /// Model-name filter.
+    pub model: Option<String>,
+    /// Provider filter.
+    pub provider: Option<String>,
+}
+
+/// Parses one optional RFC 3339 window bound at the napi boundary.
+///
+/// # Errors
+///
+/// Returns the stable Wyrd validation error naming the offending field when
+/// the text is not an RFC 3339 timestamp.
+fn parse_window_bound(
+    value: Option<&str>,
+    field: &str,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, wyrd_spec::error::WyrdError> {
+    value
+        .map(|text| {
+            text.parse::<chrono::DateTime<chrono::Utc>>().map_err(|error| {
+                wyrd_spec::error::WyrdError::Validation {
+                    message: format!("{field} must be an RFC 3339 timestamp"),
+                    details: serde_json::json!({"field": field, "reason": error.to_string()}),
+                }
+            })
+        })
+        .transpose()
 }
 
 /// Build the stable scrubbed projection for a failed gRPC connection.

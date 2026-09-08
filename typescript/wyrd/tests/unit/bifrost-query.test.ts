@@ -367,3 +367,115 @@ describe("BifrostClient", () => {
     },
   );
 });
+
+describe("BifrostQueryClient typed reads", () => {
+  it("typed trace and GenAI client contracts", async () => {
+    const described = {
+      entry: { namespace: "vala.traces", name: "spans" },
+      user_fields: [
+        {
+          name: "trace_id",
+          data_type: "Binary",
+          nullable: false,
+          metadata: { "PARQUET:field_id": "1" },
+        },
+      ],
+      correlation_fields: [
+        {
+          name: "card_ref",
+          data_type: "Utf8",
+          nullable: false,
+          metadata: { "wyrd:input_class": "gate_correlation" },
+        },
+      ],
+      managed_candidates: [],
+      canonical_physical_fingerprint: "a".repeat(64),
+      physical_layout: { partition_granularity: "hour" },
+    };
+    const schemaOnlyIpc = tableToIPC(
+      tableFromArrays({ trace_id: Int32Array.from([]) }),
+      "stream",
+    );
+    const calls: unknown[][] = [];
+    const native = {
+      async describeTable(namespace: string, name: string) {
+        calls.push(["describeTable", namespace, name]);
+        return { valueJson: JSON.stringify(described) };
+      },
+      async writableSchemaIpc(
+        descriptionJson: string,
+        includeEventTime: boolean,
+      ) {
+        calls.push(["writableSchemaIpc", descriptionJson, includeEventTime]);
+        return Buffer.from(schemaOnlyIpc);
+      },
+      async getTrace(traceId: string, since?: string, until?: string) {
+        calls.push(["getTrace", traceId, since, until]);
+        return {
+          valueJson: JSON.stringify({
+            trace: {
+              trace_id: traceId,
+              spans: [
+                {
+                  span_id: "0102030405060708",
+                  name: "chat",
+                  start_time_unix_nano: 7,
+                  events: [{ time_unix_nano: 8, name: "chunk" }],
+                  links: [],
+                },
+              ],
+            },
+          }),
+        };
+      },
+      async queryGenai(request: unknown) {
+        calls.push(["queryGenai", request]);
+        return {
+          valueJson: JSON.stringify({
+            rows: [
+              {
+                model: "gpt-4o",
+                start_time_unix_nano: 11,
+                input_messages: [{ role: "user", parts: [1, null] }],
+              },
+            ],
+            next_page_token: "next",
+          }),
+        };
+      },
+    };
+    const client = new BifrostClient(native as never);
+
+    const description = await client.describeTable("vala.traces", "spans");
+    expect(description.canonical_physical_fingerprint).toBe("a".repeat(64));
+    expect(description.user_fields[0].metadata["PARQUET:field_id"]).toBe("1");
+
+    const schema = await client.writableSchema(description);
+    expect(schema.fields.map((field) => field.name)).toEqual(["trace_id"]);
+    expect(calls[1][2]).toBe(false);
+
+    const trace = await client.getTrace("0102030405060708090a0b0c0d0e0f10", {
+      since: "2026-07-01T00:00:00Z",
+    });
+    expect(trace.trace.spans).toHaveLength(1);
+    expect(
+      (trace.trace.spans[0] as { events: unknown[] }).events,
+    ).toHaveLength(1);
+    expect(trace.trace).not.toHaveProperty("events");
+    expect(calls[2]).toEqual([
+      "getTrace",
+      "0102030405060708090a0b0c0d0e0f10",
+      "2026-07-01T00:00:00Z",
+      undefined,
+    ]);
+
+    const generations = await client.queryGenAi({ model: "gpt-4o", limit: 10 });
+    expect(generations.next_page_token).toBe("next");
+    expect(generations.rows[0].input_messages).toEqual([
+      { role: "user", parts: [1, null] },
+    ]);
+    expect(generations.rows[0]).not.toHaveProperty("output_messages");
+    expect(generations.rows[0]).not.toHaveProperty("cost_usd");
+    expect(calls[3][1]).toMatchObject({ model: "gpt-4o", limit: 10 });
+  });
+});

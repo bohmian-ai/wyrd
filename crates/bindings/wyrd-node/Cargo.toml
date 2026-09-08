@@ -13,6 +13,8 @@ crate-type = ["cdylib"]
 
 [dependencies]
 arrow = { workspace = true }
+chrono = { workspace = true }
+wyrd-queue = { workspace = true }
 napi = { workspace = true }
 napi-derive = { workspace = true }
 secrecy = { workspace = true }

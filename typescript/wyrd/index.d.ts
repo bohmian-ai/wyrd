@@ -54,6 +54,59 @@ export declare class NativeBifrostQueryClient {
    */
   cancel(requestId: string): Promise<NativeLifecycleResult>
   /**
+   * Describes one registered table's stored physical schema.
+   *
+   * The description is the server's own projection: the user fields a caller
+   * declares, the correlation inputs the write path resolves, the managed
+   * candidates it may supply, and a canonical table's physical fingerprint.
+   * JavaScript builds its insertable schema from this rather than from a
+   * local copy of the table contract.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the native result cannot be projected;
+   * Wyrd control failures are returned in [`NativeLifecycleResult`].
+   */
+  describeTable(namespace: string, name: string): Promise<NativeLifecycleResult>
+  /**
+   * Reads one complete authorized cut of a single trace.
+   *
+   * Trace detail has no continuation token: `since` and `until` bound the
+   * scanned window only, and each span carries its own events and links.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the native result cannot be projected;
+   * window, authorization, and transport failures are returned in
+   * [`NativeLifecycleResult`].
+   */
+  getTrace(traceId: string, since?: string | undefined | null, until?: string | undefined | null): Promise<NativeLifecycleResult>
+  /**
+   * Reads one page of GenAI generation records.
+   *
+   * # Errors
+   *
+   * Returns a napi error only when the native result cannot be projected;
+   * window, authorization, and transport failures are returned in
+   * [`NativeLifecycleResult`].
+   */
+  queryGenai(request: NativeGenAiRequest): Promise<NativeLifecycleResult>
+  /**
+   * Projects one described table's writable Arrow schema as schema-only IPC.
+   *
+   * The buffer carries no batch, so JavaScript decodes it with its installed
+   * Arrow implementation instead of reimplementing the description's
+   * field/type conversion. `include_event_time` selects whether the caller
+   * intends to supply the managed event-time column.
+   *
+   * # Errors
+   *
+   * Returns a napi error when `description_json` is not one describe
+   * response, when the description declares a column the write path already
+   * appends, or when the schema cannot be encoded.
+   */
+  writableSchemaIpc(descriptionJson: string, includeEventTime: boolean): Buffer
+  /**
    * Sends one Arrow IPC batch through the existing Bifrost ingest wire.
    *
    * The Rust client-tier transport owns UUID validation, authentication,
@@ -104,6 +157,29 @@ export declare class NativeQueryStart {
   get errorRemediation(): string | null
   /** Returns serialized JSON-safe structured details when startup failed. */
   get errorDetailsJson(): string | null
+}
+
+/**
+ * GenAI filter request as JavaScript sends it.
+ *
+ * Window bounds arrive as RFC 3339 text because napi has no native chrono
+ * projection; every field is optional so an unfiltered page is the default.
+ */
+export interface NativeGenAiRequest {
+  /** Inclusive lower bound on event time, RFC 3339. */
+  since?: string
+  /** Exclusive upper bound on event time, RFC 3339. */
+  until?: string
+  /** Requested page size. */
+  limit?: number
+  /** Continuation token from a prior page. */
+  pageToken?: string
+  /** Conversation-id filter. */
+  conversationId?: string
+  /** Model-name filter. */
+  model?: string
+  /** Provider filter. */
+  provider?: string
 }
 
 /** Structured result of one public Bifrost ingest acknowledgement. */

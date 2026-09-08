@@ -11090,6 +11090,7 @@ name = "wyrd-node"
 version = "0.0.1"
 dependencies = [
  "arrow",
+ "chrono",
  "napi",
  "napi-build",
  "napi-derive",
@@ -11098,6 +11099,7 @@ dependencies = [
  "tokio",
  "vala-sdk",
  "wyrd-client",
+ "wyrd-queue",
  "wyrd-spec",
 ]
 

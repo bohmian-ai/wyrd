@@ -1,8 +1,9 @@
-import { tableFromIPC, type RecordBatch } from "apache-arrow";
+import { tableFromIPC, type RecordBatch, type Schema } from "apache-arrow";
 import { createRequire } from "node:module";
 
 import type {
   NativeBifrostQueryStream,
+  NativeGenAiRequest,
   NativeInsertResult,
   NativeLifecycleResult,
   NativeQueryRequest,
@@ -26,6 +27,60 @@ export interface BifrostQueryRequest {
 
 export interface BifrostInsertAck {
   readonly batchId: Uint8Array;
+}
+
+/**
+ * One column declaration in a table description, exactly as stored.
+ *
+ * `metadata` carries the Arrow field metadata the physical schema holds,
+ * including the stable `PARQUET:field_id`.
+ */
+export interface FieldDescription {
+  readonly name: string;
+  readonly data_type: unknown;
+  readonly nullable: boolean;
+  readonly metadata: Readonly<Record<string, string>>;
+}
+
+/**
+ * The server's projection of one registered table's stored physical schema.
+ *
+ * A writer declares `user_fields`, supplies `correlation_fields`, and may
+ * supply `managed_candidates`. `canonical_physical_fingerprint` is present only
+ * for a canonical signal table.
+ */
+export interface TableDescription {
+  readonly entry: Readonly<Record<string, unknown>>;
+  readonly user_fields: readonly FieldDescription[];
+  readonly correlation_fields: readonly FieldDescription[];
+  readonly managed_candidates: readonly FieldDescription[];
+  readonly canonical_physical_fingerprint?: string;
+  readonly physical_layout: Readonly<Record<string, unknown>>;
+}
+
+/** One complete authorized cut of a trace; children nest on their own span. */
+export interface TraceDetail {
+  readonly trace: {
+    readonly trace_id: string;
+    readonly spans: readonly Readonly<Record<string, unknown>>[];
+  };
+}
+
+/** One page of GenAI generation records. */
+export interface GenAiPage {
+  readonly rows: readonly Readonly<Record<string, unknown>>[];
+  readonly next_page_token?: string;
+}
+
+/** Filters for one page of GenAI generation records. */
+export interface GenAiQuery {
+  readonly since?: string;
+  readonly until?: string;
+  readonly limit?: number;
+  readonly pageToken?: string;
+  readonly conversationId?: string;
+  readonly model?: string;
+  readonly provider?: string;
 }
 
 export interface RunningQueryProgress {
@@ -348,6 +403,67 @@ export class BifrostClient {
       requestId: wire.request_id,
       cancellationStarted: wire.cancellation_started,
     };
+  }
+
+  /**
+   * Describe one registered table's stored physical schema.
+   */
+  async describeTable(
+    namespace: string,
+    name: string,
+  ): Promise<TableDescription> {
+    return lifecycleValue<TableDescription>(
+      await this.#native.describeTable(namespace, name),
+    );
+  }
+
+  /**
+   * Return the exact Arrow schema a writer builds batches on.
+   *
+   * The schema is decoded from schema-only Arrow IPC produced by Rust from the
+   * same description, so JavaScript never reimplements the field/type
+   * conversion the physical contract depends on.
+   */
+  async writableSchema(
+    description: TableDescription,
+    includeEventTime = false,
+  ): Promise<Schema> {
+    const ipc = await this.#native.writableSchemaIpc(
+      JSON.stringify(description),
+      includeEventTime,
+    );
+    return tableFromIPC(new Uint8Array(ipc)).schema;
+  }
+
+  /**
+   * Read one complete authorized cut of a single trace.
+   *
+   * Trace detail has no continuation token: the bounds narrow the scanned
+   * window only, and each span carries its own events and links.
+   */
+  async getTrace(
+    traceId: string,
+    bounds: { readonly since?: string; readonly until?: string } = {},
+  ): Promise<TraceDetail> {
+    return lifecycleValue<TraceDetail>(
+      await this.#native.getTrace(traceId, bounds.since, bounds.until),
+    );
+  }
+
+  /**
+   * Read one page of GenAI generation records.
+   */
+  async queryGenAi(query: GenAiQuery = {}): Promise<GenAiPage> {
+    const request: NativeGenAiRequest = {
+      since: query.since,
+      until: query.until,
+      limit: query.limit,
+      pageToken: query.pageToken,
+      conversationId: query.conversationId,
+      model: query.model,
+      provider: query.provider,
+    };
+    return lifecycleValue<GenAiPage>(await this.#native.queryGenai(request));
   }
 
   async insertBatch(

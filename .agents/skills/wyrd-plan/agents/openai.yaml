@@ -1,4 +1,4 @@
 interface:
   display_name: "Wyrd Plan"
-  short_description: "Create TDD tasks from an approved spec"
-  default_prompt: "Use $wyrd-plan to decompose this approved Wyrd spec into cohesive test-driven tasks or plan bounded remediation from validated findings."
+  short_description: "Create small tasks from an approved spec"
+  default_prompt: "Use $wyrd-plan to turn this approved Wyrd spec into the minimum set of outcome-complete implementation tasks."

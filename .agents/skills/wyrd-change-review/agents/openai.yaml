@@ -1,4 +1,4 @@
 interface:
   display_name: "Wyrd Change Review"
-  short_description: "Verify and finalize an integrated Wyrd change"
-  default_prompt: "Use $wyrd-change-review to verify this immutable integrated Wyrd change and automatically invoke $wyrd-complete if it is approved."
+  short_description: "Acceptance-audit an integrated Wyrd change"
+  default_prompt: "Use $wyrd-change-review to audit this immutable integrated Wyrd change and automatically invoke $wyrd-complete if it passes."

@@ -1,231 +1,129 @@
 ---
 name: wyrd-task-review
-description: Review one immutable cumulative Wyrd task implementation against its approved spec, original task, remediation tasks, repository authority, and evidence. Use after implementation or remediation; return approval, bounded findings, or a required spec revision.
+description: Adversarially audit one immutable cumulative Wyrd task implementation for exact acceptance and Ponytail minimalism, then write a verdict and any remediation task.
 ---
 
 # Wyrd Task Review
 
-Keep the reviewed source and active packet authority read-only. The sole
-active-packet write allowed during review is review output under
-`changes/active/<slug>/review/`. Verification may also write ordinary build
-artifacts or isolated test state. Review exactly one task's complete immutable
-base-to-candidate range. After remediation, include the original task, every
-remediation task, prior findings, and the cumulative candidate; never review
-only the latest fix diff.
+Answer one question: does the resulting repository satisfy the original task
+exactly? This is an acceptance audit, not an opportunity to improve, redesign,
+or refactor the implementation.
 
-## Establish the review subject
+Keep the reviewed source immutable. Review the complete base-to-candidate range,
+not the implementation summary or only the latest fix diff. After remediation,
+include the original task, prior verdict and findings, remediation task, and
+cumulative candidate.
 
-Require repository root, unambiguous base and candidate commits, the approved
-`changes/active/<slug>/spec.md` revision, the original active task, available
-execution evidence, and any remediation tasks or prior findings. If the subject
-changes during review, return `BLOCKED` rather than implying the new candidate
-was reviewed.
+## Establish the subject
+
+Require the repository root, unambiguous base and candidate commits, approved
+spec, original task, actual diff, repository rules, and available verification
+results. If the candidate changes during review, return `BLOCKED`.
 
 Read `AGENTS.md`, [agent rules](../../../architecture/agent-rules.md),
 [spec-driven development](../../../architecture/references/languages/spec-driven-development.md),
-[implementation execution](../../../architecture/references/languages/implementation-execution.md),
-and [testing workflows](../../../architecture/references/languages/testing-workflows.md).
-Start at [the reference router](../../../architecture/references/README.md) and
-load applicable [Wyrd design](../../../architecture/wyrd-design.md),
-[Wyrd doctrine](../../../architecture/wyrd-doctrine.mdx),
-[Bifrost design](../../../architecture/bifrost-design.md), security, operations,
-language, and domain references.
+and only the architecture and testing references applicable to the task. Follow
+CodeGraph instructions. Inspect the diff and enough surrounding owners,
+callers, consumers, negative paths, tests, manifests, and generated surfaces to
+judge the task.
 
-Follow CodeGraph instructions. Inspect changed owners plus only the callers,
-consumers, negative and cleanup paths, generated surfaces, tests, manifests,
-and `mise.toml` commands needed to evaluate the task.
+The reviewer must be fresh relative to implementation. If the current context
+implemented the change, delegate this audit to one fresh reviewer; otherwise
+review directly. The reviewer receives the original specification and task,
+actual diff, relevant repository rules, and verification results—not the
+implementation agent's completion summary or an intended verdict. Add a
+separate specialist only when a changed high-risk security, tenancy,
+concurrency, durability, or persistent-data boundary needs expert review.
 
-Before dispatching reviewers, create the associated change's
-`changes/active/<slug>/review/` directory. Assign each reviewer a unique path
-using `<task-id>-<candidate-short-sha>-reviewer-<n>.md`; never overwrite an
-existing report. These files are review evidence, not part of the immutable
-candidate being reviewed.
+## Apply adversarial Ponytail review
 
-## Run independent code review
+Start unconvinced. The candidate earns `PASS` through repository, diff, and
+verification evidence; intent, summaries, plausible code, and green checks alone
+do not establish completion. Try to falsify every acceptance criterion,
+constraint, non-goal, and claimed regression boundary through a realistic
+reachable path.
 
-Dispatch one independent read-only reviewer over the exact immutable task
-subject before deciding the verdict. Give it the approved spec and complete
-task authority, but not an intended verdict. Apart from its assigned review
-report, the reviewer never edits, implements, plans remediation, or changes the
-review subject.
+Apply the Ponytail ladder to every changed abstraction, dependency,
+configuration surface, compatibility path, generic layer, and speculative
+extension:
 
-Require explicit coverage of correctness, security, code quality,
-maintainability, tests, developer experience, and architecture/contracts.
-Audit every diff for persistence and transactions, async and concurrency,
-PyO3, Vala or Bifrost, and UI or TypeScript boundaries, plus any other
-high-risk boundary identified from repository authority. For each category,
-record either the distinct independent specialist who reviewed it or the
-source-backed reason it is not applicable. Each reviewer writes the following
-complete report to its assigned review path:
+1. Can it be deleted while preserving the complete task?
+2. Does existing repository behavior already solve it?
+3. Does the standard library or native platform solve it?
+4. Does an already-installed dependency solve it?
+5. Only then, is the new code the minimum necessary behavior?
 
-- a coverage ledger for changed production files, mapped obligations,
-  high-risk boundaries, user-facing behavior, and applicable repository rules;
-- candidate findings with exact locations, current flow, a realistic failure
-  path and consequence, supporting and counterevidence, and focused closure
-  verification; and
-- for every clean lens, the strongest realistic counterexample attempted and
-  why the candidate resisted it.
+Require source evidence for the complexity. When a smaller existing solution
+satisfies every requirement and constraint, classify the unnecessary addition
+as `DRIFT` and require deletion or simplification. Prefer one root-cause fix in
+the shared owner over repeated symptom guards. Do not mistake fewer lines for a
+valid simplification when it weakens validation, error handling, security,
+accessibility, durability, or another explicit requirement.
 
-An independent reviewer runs in a separate agent context from the orchestrator
-and does not validate its own candidates. A triggered specialist also runs in
-a separate context from the baseline reviewer. One specialist may cover
-multiple triggered lenses only when its ledger names each lens and demonstrates
-the relevant source inspection; otherwise dispatch another specialist.
+Best-practice review means enforcing applicable repository rules and the
+simplest maintainable solution required by the task. It does not authorize
+subjective cleanup, a preferred style, or broader redesign.
 
-The reviewer returns to the orchestrator only its completion status and report
-path. Do not inline the report, findings, coverage ledger, or reasoning in
-terminal or agent output. The orchestrator reads the report file before
-validating its candidates.
+## Audit acceptance
 
-The task-review orchestrator independently validates every candidate against
-source and authority. Reject unsupported, unreachable, preference-only,
-duplicate, and unrelated pre-existing concerns; root-cause deduplicate the
-remainder. Audit the coverage ledger rather than treating a clean reviewer
-result as sufficient evidence. Missing required coverage blocks `APPROVE`;
-return `BLOCKED` when a mandatory independent review or its coverage ledger
-cannot be obtained.
+Build an explicit matrix:
 
-## Review adversarially and validate conservatively
+| Requirement, acceptance criterion, constraint, or non-goal | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| `<obligation>` | `<diff or source location>` | `<test/check or N/A>` | `PASS | FAIL` |
 
-Try to falsify each mapped requirement, invariant, acceptance obligation, TDD
-scenario, changed state transition, and claimed evidence. Check exact authority
-alignment, complete behavior and consumer closure, regressions, applicable hard
-rules, test effectiveness and RED-to-GREEN evidence, exact named-test commands,
-broader proof, absence of hidden spec changes, and resolution of every prior
-finding across the cumulative candidate.
+Inspect specifically for:
 
-Reuse credible current evidence. Run only the narrowest sequential checks
-needed to resolve missing, contradictory, suspicious, or stale proof. A passing
-command is not evidence when its assertions cannot detect the claimed defect.
-Bind executable evidence to the candidate commit and record its source, exact
-command, exit status, date, required setup or environment, and retained output
-or result summary. For executable behavior changed by the task, `APPROVE`
-cannot use `None` for the evidence snapshot. Static-only obligations instead
-name their candidate-bound proof.
+- **MISSING** — required behavior was not implemented;
+- **INCORRECT** — behavior exists but does not satisfy the requirement;
+- **DRIFT** — implementation extends beyond the requested scope;
+- **VIOLATION** — an explicit constraint, non-goal, or repository rule was
+  violated; and
+- **REGRESSION** — existing behavior was unintentionally changed.
 
-## Findings
+Do not report optional improvements, speculative hardening, preferences,
+unrelated pre-existing debt, or refactors not required by the task. Tests prove
+behavior; they do not prove that the requested behavior was the behavior built.
+Rely on repository source and the diff, not agent summaries.
 
-Classify each reviewed concern as blocking, follow-up, or rejected. A concern
-blocks approval only when it is source-validated, reachable, introduced or
-left unresolved by the cumulative task candidate, and materially violates the
-approved spec, task authority, repository authority, correctness, security,
-durability, compatibility, or required verification. A concrete
-maintainability defect blocks only when it creates a reachable risk to safe
-operation or change. Optional hardening, preference, speculative cleanup, and
-unrelated pre-existing debt are follow-up at most; unsupported, unreachable,
-or duplicate concerns are rejected.
+Give every material finding a stable `FIND-<task>-<n>` ID plus its
+classification, violated obligation, exact location, evidence, observable
+consequence, and required testable correction. For `DRIFT`, identify what can be
+deleted or which existing or native mechanism already covers the outcome.
+Prescribe the outcome and boundary, not private implementation mechanics when
+several equally minimal corrections remain.
 
-Every blocking finding includes a stable `FIND-<task>-<n>` ID and severity,
-exact source or authority location, mapped spec and task obligations, reachable
-scenario and consequence, required testable outcome, supporting and
-counterevidence, a decision-complete Ponytail recommendation, and focused
-closure verification. Preserve validated follow-up separately without routing
-it into required remediation.
+## Verdict and remediation task
 
-Use `CRITICAL` for an exploitable security or tenant boundary, likely data loss
-or corruption, or another broad irreversible consequence; `MAJOR` for a
-reachable user, agent, or operational failure of an approved obligation; and
-`MODERATE` for a bounded but material in-scope defect that still makes task
-approval unsafe. Severity never turns follow-up into a blocking finding.
+Create a new `changes/active/<slug>/review/<review-name>/` directory without
+overwriting a prior attempt. Write `verdict.md` containing the immutable subject,
+acceptance matrix, verification limits, material findings, prior-finding
+closure, and one verdict:
 
-For the Ponytail recommendation, walk the ladder in order: delete; reuse
-existing repository behavior; use the standard library or native platform;
-use an installed dependency; then write the minimum new code. Name the shared
-root cause, production owner, exact control-flow, state, or API outcome,
-existing mechanism to reuse, focused test change, and deliberate exclusions.
-Do not propose a new abstraction, dependency, configuration surface,
-compatibility layer, or speculative flexibility without source-validated
-necessity. A recommendation is planning input, not new authority. When
-multiple materially different corrections remain valid, state the unresolved
-choice and its fixed constraints instead of inventing a preferred private
-design. Decision-complete means the required outcome, owner, boundaries, and
-closure proof are fixed; it does not require prescribing one private
-implementation when several minimal corrections satisfy them.
+- `PASS` — every obligation passes, non-goals remain excluded, verification is
+  credible, and no unrelated change entered the diff;
+- `FIX_REQUIRED` — one or more bounded implementation findings remain;
+- `SPEC_REVISION_REQUIRED` — correction requires changing approved behavior or
+  an expensive-to-reverse decision; or
+- `BLOCKED` — the immutable subject, authority, diff, or required independent
+  review cannot be obtained.
 
-Use `CRITICAL`, `MAJOR`, or `MODERATE` only for concrete in-scope defects.
-Preference, speculative cleanup, and unrelated baseline concerns do not block.
-A finding is not product authority and does not prescribe private mechanics
-when several solutions satisfy the required outcome.
+For `FIX_REQUIRED`, also write one self-contained remediation task named
+`<task-id>-R<n>-<name>.md` in the same review directory. It must contain:
 
-## Verdict
+1. the approved spec path, original task path, and candidate identities;
+2. the material finding IDs and evidence;
+3. the correction outcome;
+4. constraints, preserved behavior, and explicit non-goals;
+5. acceptance criteria proving each finding closed; and
+6. focused and broader verification.
 
-Return one verdict:
+The remediation task packages validated findings for a fresh implementation
+agent; it is not another design plan. Do not specify helpers, private methods,
+local control flow, fixture structure, or optional improvements. Route it
+directly to `$wyrd-implement`. A later review reassesses the complete cumulative
+candidate against the original task.
 
-- `APPROVE` — the cumulative candidate satisfies the task and mapped spec;
-- `REMEDIATE` — bounded corrections remain under the approved spec;
-- `SPEC_REVISION_REQUIRED` — correction requires changed behavior or another
-  material decision; or
-- `BLOCKED` — the immutable subject, essential authority, mandatory independent
-  review, or required coverage ledger cannot be obtained.
-
-Write every verdict to
-`changes/active/<slug>/review/<task-id>-<candidate-short-sha>-verdict.md` using
-this exact structure. Never overwrite an existing verdict; add the next
-available numeric suffix when the same candidate is reviewed again. Keep every
-heading and field in this order; write `None` when a field has no entries.
-
-```markdown
-# <VERDICT>
-
-## Subject
-- Base: <commit>
-- Candidate: <commit>
-- Planning snapshot: <commit or None>
-- Evidence snapshot: <commit or None>
-
-## Verdict Basis
-- <why this verdict follows from validated findings, review coverage, or a blocking condition>
-
-## Verification
-- Reused: <current recorded evidence or None>
-- Rerun: <commands or None>
-- Not run: <commands and limits or None>
-
-## Findings
-
-### <FINDING-ID> — <SEVERITY>: <title>
-- Obligations: <spec and task IDs>
-- Locations: <source and authority locations>
-- Scenario: <reachable path>
-- Consequence: <observable failure>
-- Supporting evidence: <evidence>
-- Counterevidence: <evidence or None>
-- Ponytail recommendation: <smallest root-cause correction after walking delete, reuse, native/stdlib, installed dependency, minimum code; production owner; focused test; deliberate exclusions>
-- Required outcome: <testable result>
-- Closure verification: <focused tests and commands>
-
-## Follow-up
-- <FOLLOW-task-n: validated concern, exact location, evidence, and reason it does not block, or None>
-
-## Obligation Coverage
-- <compact coverage statement>
-
-## Code Review Coverage
-- Baseline lenses: <coverage and independent reviewer identity>
-- Specialist trigger audit: <each sensitive category, reviewing specialist identity, or source-backed not-applicable reason>
-- Changed production files: <each file mapped to inspecting reviewer and lenses>
-- Obligations: <each mapped obligation and inspecting reviewer>
-- High-risk boundaries and user-facing behavior: <each boundary and inspecting reviewer, or None>
-- Adversarial clean evidence: <lens, attempted counterexample, and result, or None>
-
-## Validation Ledger
-- <candidate concern, blocking/follow-up/rejected classification, and source-validated reason>
-
-## Prior Finding Closure
-- <finding ID and status, or None>
-
-## Routing
-- Next skill: <$wyrd-plan, $wyrd-spec, $wyrd-change-review, or None>
-- Finding IDs: <IDs or None>
-```
-
-When there are no blocking findings, replace the complete example finding
-block under `Findings` with `- None`. Under `APPROVE`, keep obligation coverage
-compact instead of repeating the task or spec. List only validated blocking
-findings and validated follow-up.
-`REMEDIATE` routes them to `$wyrd-plan`, not directly to ad hoc implementation.
-`APPROVE` approves only this task candidate; it does not merge, push, deploy, or
-replace final `$wyrd-change-review`. Terminal output contains only the verdict,
-the saved verdict path, the next skill, and finding IDs when present; never
-inline the saved review. The review phase does not edit active-packet authority
-or task evidence outside `review/`.
+Return only the verdict, verdict path, remediation task path when present, and
+finding IDs. `PASS` is the task's completion gate. Review does not implement,
+merge, push, or deploy.

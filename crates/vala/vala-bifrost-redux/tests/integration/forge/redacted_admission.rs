@@ -397,21 +397,34 @@ redacted
     promoted.fixture.seal_more(2).await;
     supervisor.run_one_success().await;
 
-    // Every plan lands and none of them is answered, so the attempt ends
-    // holding several operations it cannot account for. It proves the first one
-    // live, settles on that success, and leaves the rest open — which is what
-    // puts more open rows on this table than one page holds.
+    // Every plan lands and none of them is answered, so the attempt holds
+    // several operations it cannot account for. Its owner is stopped while they
+    // are still open, and a stopping owner settles none of them: it hands the
+    // Prepared authority on, which is what puts more open rows on this table
+    // than one page holds.
     catalog.stall_next_commit_responses(8);
     supervisor.restart_worker();
     supervisor.schedule_only().await;
     supervisor.start_worker();
-    await_small_files_in_state(&promoted.fixture, &["succeeded"], 1).await;
-    catalog.stall_next_commit_responses(0);
+    tokio::time::timeout(ADMISSION_BOUND, async {
+        loop {
+            let open = operation_phases(&promoted.fixture).await;
+            if open.values().filter(|phase| *phase == "prepared").count()
+                > promoted.fixture.config.max_open_operations_per_table
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the stalled plans open more operations than one page holds");
     supervisor.stop_worker().await;
+    catalog.stall_next_commit_responses(0);
     assert!(
         supervisor.returned_errors().is_empty(),
-        "no attempt is failed or retried while one of its operations is still \
-         Prepared and one is proven live: {:?}",
+        "no attempt is failed or retried while its operations are still \
+         Prepared: {:?}",
         supervisor.returned_errors()
     );
 
@@ -450,7 +463,7 @@ redacted
     // The proof is the durable rows: every captured UUID is classified, so a
     // reader bounded by one page — which would have settled one and silently
     // left the rest Prepared forever — cannot produce this state.
-    await_operation_phase(&promoted.fixture, &captured, "recovered").await;
+    await_operation_phase(&promoted.fixture, &captured, &["recovered", "reset"]).await;
     supervisor.shutdown().await;
     assert!(
         operation_phases(&promoted.fixture)
@@ -624,7 +637,7 @@ async fn multi_plan_success_counts_all_committed_volume_once() {
             .filter(|(_, phase)| phase == "prepared")
             .map(|(id, _)| id)
             .collect::<BTreeSet<_>>(),
-        "recovered",
+        &["recovered"],
     )
     .await;
     supervisor.stop_worker().await;
@@ -1195,23 +1208,29 @@ async fn operation_phases(
     fixture.rewrite_operations().await.into_iter().collect()
 }
 
-/// Polls the durable operation rows until every one of `ids` holds `phase`.
+/// Polls the durable operation rows until every one of `ids` holds one of
+/// `phases`.
+///
+/// A caller that proves classification rather than one exact outcome passes
+/// every terminal phase it accepts: an operation whose commit never reached the
+/// catalog is `reset`, one whose commit landed is `recovered`, and both prove
+/// the row was read and settled.
 ///
 /// # Panics
 ///
-/// Panics when the phase is not reached inside [`ADMISSION_BOUND`].
+/// Panics when a phase is not reached inside [`ADMISSION_BOUND`].
 async fn await_operation_phase(
     fixture: &super::support::PromotionIntegrationFixture,
     ids: &BTreeSet<uuid::Uuid>,
-    phase: &str,
+    phases: &[&str],
 ) {
     let reached = tokio::time::timeout(ADMISSION_BOUND, async {
         loop {
-            let phases = operation_phases(fixture).await;
-            if ids
-                .iter()
-                .all(|id| phases.get(id).is_some_and(|held| held == phase))
-            {
+            let held = operation_phases(fixture).await;
+            if ids.iter().all(|id| {
+                held.get(id)
+                    .is_some_and(|phase| phases.contains(&phase.as_str()))
+            }) {
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1220,7 +1239,7 @@ async fn await_operation_phase(
     .await;
     assert!(
         reached.is_ok(),
-        "operations {ids:?} never reached {phase}: {:?}",
+        "operations {ids:?} never reached one of {phases:?}: {:?}",
         operation_phases(fixture).await
     );
 }
@@ -1314,7 +1333,23 @@ async fn acceptance_unknown_retains_running_until_exact_reconciliation() {
     })
     .await
     .expect("a worker holding an unresolved operation stops advertising itself");
-    let submissions = catalog.attempts();
+    // Readiness is retracted the moment the first unknown outcome is stored, so
+    // the plans this attempt already admitted may still be reaching the seam:
+    // an owner that cannot account for one operation keeps the work it started
+    // moving and only stops taking more. The submission count is therefore read
+    // once it has stopped moving, which is what makes the window below describe
+    // reconciliation alone.
+    let submissions = tokio::time::timeout(ADMISSION_BOUND, async {
+        loop {
+            let before = catalog.attempts();
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            if catalog.attempts() == before {
+                return before;
+            }
+        }
+    })
+    .await
+    .expect("the attempt's own admitted plans stop reaching the catalog");
     assert_eq!(
         small_files_in_state(&promoted.fixture, &["claimed", "running"]).await,
         1,
@@ -1322,8 +1357,8 @@ async fn acceptance_unknown_retains_running_until_exact_reconciliation() {
         tenant_tasks(&promoted.fixture).await
     );
 
-    // Nothing changes over a window the ordinary settlement would have used.
-    tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+    // Nothing changes over a window several reconciliation passes fall inside.
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
     assert_eq!(
         catalog.attempts(),
         submissions,
@@ -1356,7 +1391,7 @@ async fn acceptance_unknown_retains_running_until_exact_reconciliation() {
                 + chrono::Duration::seconds(1),
         )
         .expect("manual Forge clock advances");
-    await_operation_phase(&promoted.fixture, &unresolved, "reset").await;
+    await_operation_phase(&promoted.fixture, &unresolved, &["reset"]).await;
     supervisor.stop_worker().await;
     assert_eq!(
         supervisor.returned_errors().len(),
@@ -1516,14 +1551,30 @@ async fn shutdown_hands_off_retained_authority(
     supervisor: &mut SupervisedPromotion,
 ) {
     supervisor.stop_worker().await;
+    // The new hot objects are published first, so the seam armed below meets
+    // the rewrite's own commit rather than the promotion's.
+    let promoted_before = promotions_succeeded(&promoted.fixture).await;
     promoted.fixture.seal_more(4).await;
     promoted.fixture.clear_task_backoff().await;
+    supervisor.restart_worker();
+    supervisor.start_worker();
+    supervisor.schedule_only().await;
+    tokio::time::timeout(ADMISSION_BOUND, async {
+        while promotions_succeeded(&promoted.fixture).await <= promoted_before {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the new hot objects are published before compaction plans them");
+    supervisor.stop_worker().await;
+
     let open_before = operation_phases(&promoted.fixture).await.len();
     let errors_before = supervisor.returned_errors().len();
 
     // One plan reaches the catalog and never learns what happened, and every
     // sibling is refused outright so no success can settle the task instead.
     catalog.park_next_commit();
+    promoted.fixture.clear_task_backoff().await;
     supervisor.restart_worker();
     supervisor.start_worker();
     supervisor.schedule_only().await;

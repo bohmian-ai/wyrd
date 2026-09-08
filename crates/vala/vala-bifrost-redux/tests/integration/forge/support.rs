@@ -997,6 +997,61 @@ impl PromotionIntegrationFixture {
         completion_observer: ForgeWorkerCompletionObserver,
         scheduler_trigger: ForgeSchedulerTrigger,
     ) -> Arc<Forge> {
+        // An hour: the scheduler's periodic pass must never fire on its own, so
+        // every planning pass a scenario observes is one it asked for.
+        self.build_forge_with_interval(
+            catalog,
+            object_store,
+            clock,
+            completion_observer,
+            scheduler_trigger,
+            Duration::from_hours(1),
+        )
+    }
+
+    /// Build one production Forge owner whose worker cadence a scenario can wait on.
+    ///
+    /// A worker's own delayed cadence is the maintenance interval, which is
+    /// also the scheduler's periodic planning period. A supervised worker is
+    /// therefore built over its own Forge: the scheduler keeps the inert hour
+    /// that makes planning explicit, and the worker gets a cadence short enough
+    /// that a scenario can wait for one exact-operation reconciliation pass.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture cannot produce a validated Forge graph.
+    pub(crate) fn build_worker_forge_for_test(
+        &self,
+        catalog: Arc<dyn Catalog>,
+        object_store: Arc<dyn ForgeObjectStore>,
+        clock: ForgeClock,
+        completion_observer: ForgeWorkerCompletionObserver,
+        scheduler_trigger: ForgeSchedulerTrigger,
+    ) -> Arc<Forge> {
+        self.build_forge_with_interval(
+            catalog,
+            object_store,
+            clock,
+            completion_observer,
+            scheduler_trigger,
+            Duration::from_millis(1000),
+        )
+    }
+
+    /// Build one production Forge owner over an explicit maintenance interval.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture cannot produce a validated Forge graph.
+    fn build_forge_with_interval(
+        &self,
+        catalog: Arc<dyn Catalog>,
+        object_store: Arc<dyn ForgeObjectStore>,
+        clock: ForgeClock,
+        completion_observer: ForgeWorkerCompletionObserver,
+        scheduler_trigger: ForgeSchedulerTrigger,
+        maintenance_interval: Duration,
+    ) -> Arc<Forge> {
         let (_publisher, hints) =
             staging_file_channel(self.config.max_hints_per_wake).expect("fixture hint capacity");
         Arc::new(
@@ -1014,7 +1069,7 @@ impl PromotionIntegrationFixture {
                 object_store,
                 hints,
                 config: self.config.clone(),
-                maintenance_interval: Duration::from_hours(1),
+                maintenance_interval,
                 clock,
                 completion_observer: Some(completion_observer),
                 scheduler_trigger: Some(scheduler_trigger),
@@ -1596,6 +1651,12 @@ pub(crate) struct SupervisedPromotion {
     /// is never released on shutdown, so a second supervisor in one test would
     /// stand by and plan nothing.
     forge: Arc<Forge>,
+    /// Graph every generation of this supervisor's worker is built over.
+    ///
+    /// Identical to [`Self::forge`] except for its maintenance interval, which
+    /// is the worker's own delayed reconciliation cadence rather than the
+    /// scheduler's deliberately inert planning period.
+    worker_forge: Arc<Forge>,
     /// Worker bounds every generation of this supervisor's worker is built with.
     worker_config: ForgeWorkerConfig,
     /// Readiness bit every generation of this supervisor's worker publishes.
@@ -1671,14 +1732,27 @@ impl SupervisedPromotion {
         let scheduler_trigger = ForgeSchedulerTrigger::with_owner_for_test(uuid::Uuid::now_v7());
         let worker_observer = ForgeWorkerCompletionObserver::new();
         let forge = fixture.build_forge_for_test(
+            Arc::clone(&catalog),
+            Arc::clone(&object_store),
+            clock.clone(),
+            worker_observer.clone(),
+            scheduler_trigger.clone(),
+        );
+        // Every supervised worker generation is built over this one, so the
+        // cadence a scenario waits on is the worker's, not the scheduler's.
+        let worker_forge = fixture.build_worker_forge_for_test(
             catalog,
             object_store,
             clock,
             worker_observer.clone(),
             scheduler_trigger.clone(),
         );
-        let worker = ForgeWorker::new(Arc::clone(&forge), worker_config, uuid::Uuid::now_v7())
-            .expect("fixture Forge worker");
+        let worker = ForgeWorker::new(
+            Arc::clone(&worker_forge),
+            worker_config,
+            uuid::Uuid::now_v7(),
+        )
+        .expect("fixture Forge worker");
         let scheduler_stop = CancellationToken::new();
         let worker_stop = CancellationToken::new();
         let readiness = ForgeRoleReadiness::detached();
@@ -1701,6 +1775,7 @@ impl SupervisedPromotion {
             worker_task: Some(worker_task),
             worker_armed: false,
             forge,
+            worker_forge,
             worker_config,
             readiness,
         }
@@ -1738,7 +1813,7 @@ impl SupervisedPromotion {
     /// Panics when the worker cannot be built or the reclaim fails.
     pub(crate) async fn reclaim_expired_claims(&self) {
         let worker = ForgeWorker::new(
-            Arc::clone(&self.forge),
+            Arc::clone(&self.worker_forge),
             self.worker_config,
             uuid::Uuid::now_v7(),
         )
@@ -1786,7 +1861,7 @@ impl SupervisedPromotion {
             return;
         }
         let worker = ForgeWorker::new(
-            Arc::clone(&self.forge),
+            Arc::clone(&self.worker_forge),
             self.worker_config,
             uuid::Uuid::now_v7(),
         )
@@ -2003,7 +2078,7 @@ impl SupervisedPromotion {
         tokio::time::timeout(FIXTURE_BOUND, during)
             .await
             .expect("parked production commit seam bound");
-        self.stop_worker().await;
+        self.join_worker().await;
         assert_eq!(
             self.worker_observer.returned_errors().len(),
             settled_before,
@@ -2135,6 +2210,22 @@ impl SupervisedPromotion {
     pub(crate) async fn stop_worker(&mut self) {
         self.worker_stop.cancel();
         self.worker_observer.release_held_attempt_for_test();
+        self.join_worker().await;
+    }
+
+    /// Cancel and join a worker that is not sitting on the held-attempt barrier.
+    ///
+    /// Releasing an unheld barrier is not free: the release is a stored
+    /// notification permit, so it would let the *next* armed hold fall straight
+    /// through and leave its waiter watching a barrier the worker already
+    /// passed. A caller that never armed the hold joins the worker directly.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the worker misses its bounded shutdown or exits
+    /// unexpectedly.
+    async fn join_worker(&mut self) {
+        self.worker_stop.cancel();
         let task = self.worker_task.take().expect("worker is stopped once");
         tokio::time::timeout(FIXTURE_BOUND, task)
             .await

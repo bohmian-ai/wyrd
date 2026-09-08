@@ -2250,7 +2250,16 @@ impl ForgeWorker {
                     return Ok(());
                 }
                 if pool.has_plans_in_flight() {
-                    Box::pin(self.await_loop_event(&mut pool, &mut maintenance, &shutdown)).await?;
+                    // A stopping worker waits only for the plans it started.
+                    // It runs no reconciliation pass: nothing it could learn
+                    // now may be written durably, and the successor owns that
+                    // proof.
+                    if let Some(completion) = pool.completion_rx.recv().await
+                        && let Some(state) = self.record_plan_completion(&mut pool, completion)?
+                    {
+                        self.settle_or_retain_attempt(&mut pool, state, &shutdown)
+                            .await?;
+                    }
                     continue;
                 }
                 // Nothing is in flight, so every attempt still held is one this

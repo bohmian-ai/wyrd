@@ -830,8 +830,11 @@ async fn rewrite_publication_ambiguity_restart_settles_once() {
     let mut supervisor = supervisor;
     // Reconciliation deliberately refuses to call a young operation absent:
     // the answer may still be in flight. Advancing past the uncertainty bound
-    // is what turns "unknown" into evidence a successor may act on.
-    let settled_at = control.now().expect("manual Forge clock")
+    // is what turns "unknown" into evidence a successor may act on. Measured
+    // from wall clock rather than from the manual clock's own base: the
+    // operation was prepared with a database timestamp taken while the attempt
+    // ran, so only a bound taken after it makes the operation old enough.
+    let settled_at = chrono::Utc::now()
         + chrono::Duration::from_std(promoted.fixture.config.uncertainty_bound)
             .expect("the uncertainty bound is representable")
         + chrono::Duration::seconds(1);

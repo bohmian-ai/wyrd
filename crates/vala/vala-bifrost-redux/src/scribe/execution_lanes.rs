@@ -514,9 +514,9 @@ pub(crate) struct DecodeContext<'a> {
 ///
 /// # Errors
 ///
-/// Returns a stable Scribe refusal for row overflow, reserved columns,
-/// fingerprint mismatch, card-scope failure, invalid event time, or managed
-/// column construction failure.
+/// Returns a stable Scribe refusal for row overflow, a duplicated column name,
+/// reserved columns, fingerprint mismatch, card-scope failure, invalid event
+/// time, or managed column construction failure.
 fn decode_rows(
     rows: &RecordBatch,
     context: &DecodeContext<'_>,
@@ -527,7 +527,17 @@ fn decode_rows(
             limit: (i32::MAX - 1) as u64,
         });
     }
+    let mut seen = std::collections::HashSet::with_capacity(rows.schema().fields().len());
     for field in rows.schema().fields() {
+        // Duplicate names are refused for every table kind — built-in, dynamic,
+        // and pre-declared — before fingerprint, correlation, or stamping work.
+        // `card_ref` is a permitted client correlation column, so a duplicate
+        // pair is removed wholesale by projection while name lookup only ever
+        // resolves the first occurrence; an authorized first value would
+        // otherwise hide a second, unauthorized assertion.
+        if !seen.insert(field.name().as_str()) {
+            return Err(ScribeError::InvalidFrame);
+        }
         // `wyrd_event_time` is intentionally absent from this reserved set: a
         // caller MAY supply it as the authoritative event time, and it is then
         // validated and preserved in `stamp_correlation_columns`. `run_id` is
@@ -565,16 +575,16 @@ fn decode_rows(
 ///
 /// The caller of a canonical signal table owns exactly the table's declared
 /// ledger plus the permitted correlation columns (`card_ref`, `run_id`, and an
-/// optional `wyrd_event_time`). This rejects a duplicated column name and any
-/// unknown `wyrd_*` field, runs the table's own registered value validator over
+/// optional `wyrd_event_time`). This rejects any unknown `wyrd_*` field, runs
+/// the table's own registered value validator over
 /// the remaining user block, and then requires that block to equal
 /// `(definition.arrow_fields)()` exactly, so no normalized-but-different Arrow
 /// spelling reaches the physical schema.
 ///
 /// # Errors
 ///
-/// Returns [`ScribeError::InvalidFrame`] for a duplicate or unknown reserved
-/// column, and [`ScribeError::FingerprintMismatch`] when the table's value
+/// Returns [`ScribeError::InvalidFrame`] for an unknown reserved column, and
+/// [`ScribeError::FingerprintMismatch`] when the table's value
 /// validator refuses the batch or the remaining user fields differ from the
 /// table's declared fields.
 fn enforce_canonical_source_contract(
@@ -582,11 +592,7 @@ fn enforce_canonical_source_contract(
     definition: &'static crate::tables::BuiltinTableDefinition,
 ) -> Result<(), ScribeError> {
     let schema = rows.schema();
-    let mut seen = std::collections::HashSet::with_capacity(schema.fields().len());
     for field in schema.fields() {
-        if !seen.insert(field.name().as_str()) {
-            return Err(ScribeError::InvalidFrame);
-        }
         if field.name().starts_with("wyrd_") && field.name() != WYRD_EVENT_TIME {
             return Err(ScribeError::InvalidFrame);
         }
@@ -2790,6 +2796,41 @@ mod tests {
             error,
             crate::contracts::ScribeError::CardScopeDenied
         ));
+    }
+
+    /// A duplicated Arrow column name is refused before any correlation or
+    /// managed-column work, on a dynamic table with no built-in definition.
+    ///
+    /// `card_ref` is a permitted client correlation column rather than a
+    /// server-owned one, so a duplicate pair is removed wholesale by the later
+    /// projection while name lookup only ever sees the first occurrence. An
+    /// authorized (here null) first column could therefore hide a second,
+    /// out-of-scope assertion. The shared decode guard rejects the frame first.
+    #[test]
+    fn duplicate_arrow_column_names_fail_closed_for_dynamic_tables() {
+        let rows = batch(
+            vec![
+                Field::new(CARD_REF, DataType::Utf8, true),
+                Field::new(CARD_REF, DataType::Utf8, true),
+            ],
+            vec![
+                Arc::new(StringArray::from(vec![None::<&str>])),
+                Arc::new(StringArray::from(vec![Some("prod/Service/other@1.0.0")])),
+            ],
+        );
+        let error = decode(
+            IngressPayload::Canonical(crate::contracts::CanonicalIngress::unreserved(vec![
+                rows.clone(),
+            ])),
+            &principal(),
+            source_schema_fingerprint(rows.schema().as_ref()),
+            &RequestId::now_v7(),
+            Uuid::now_v7(),
+            EventTimeWindow::default(),
+            None,
+        )
+        .expect_err("a duplicated column name fails closed before WAL");
+        assert!(matches!(error, ScribeError::InvalidFrame));
     }
 
     #[test]

@@ -1156,8 +1156,12 @@ async fn forge_promoted_files_rewrite_and_remain_exact_across_recovery() {
     let checkpoint = telemetry
         .checkpoint()
         .expect("production telemetry baseline");
+    // The pod's maintenance interval is also the delayed cadence a retained
+    // attempt reconciles its own operations on. It has to be long enough that
+    // every phase below observes the uncertain state it arms, and short enough
+    // that the recovery phase can wait for one pass rather than for a redeploy.
     let cluster =
-        WyrdTestCluster::start_embedded_forge_uncertainty_for_test(Duration::from_hours(1))
+        WyrdTestCluster::start_embedded_forge_uncertainty_for_test(Duration::from_secs(30))
             .await
             .expect("one bound embedded Bifrost pod starts");
     let observer = cluster
@@ -1329,27 +1333,40 @@ async fn forge_promoted_files_rewrite_and_remain_exact_across_recovery() {
     release_retries(&cluster, owner).await;
     cluster.request_forge_scheduler_pass_for_test();
     let mut unsettled = Vec::new();
-    // Roster discovery can admit legitimate sibling maintenance first. Observe
-    // this owner's unsettled rewrite and a returned failure, not just any attempt.
+    // Roster discovery can admit legitimate sibling maintenance first, so this
+    // waits for *this* owner's unsettled rewrite rather than for any attempt.
+    // An attempt that cannot account for its own operation returns nothing: the
+    // owner that opened it retains it and settles only once exact evidence about
+    // that operation exists, so the durable open row — not a returned failure —
+    // is what says the uncertainty landed.
     let observed = tokio::time::timeout(ATTEMPT_BOUND, async {
         loop {
-            let target = observer.attempts().saturating_add(1);
             unsettled = unsettled_rewrites(&cluster, owner).await;
-            if !unsettled.is_empty() && observer.returned_errors().len() > errors_before {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            // The attempt has drained once its open rows stop appearing: every
+            // plan reached the refusing seam, and the owner retains the whole
+            // set until exact evidence about each operation exists.
+            if !unsettled.is_empty() && unsettled_rewrites(&cluster, owner).await == unsettled {
                 break;
             }
-            observer.wait_for_attempts_at_least(target).await;
         }
     })
     .await;
     if observed.is_err() {
         server.state().shutdown_token.cancel();
         panic!(
-            "uncertain rewrite did not return; last unsettled={unsettled:?}, attempts={}, errors={:?}",
+            "uncertain rewrite left no open operation; last unsettled={unsettled:?}, attempts={}, errors={:?}, phases={:?}",
             observer.attempts(),
-            observer.returned_errors()
+            observer.returned_errors(),
+            rewrite_phases(&cluster, owner).await
         );
     }
+    assert_eq!(
+        observer.returned_errors().len(),
+        errors_before,
+        "a retained attempt returns no failure while its operation is open: {:?}",
+        observer.returned_errors()
+    );
 
     // Each of the attempt's plans publishes independently, so an attempt the
     // injected uncertainty stops leaves one operation per plan behind: the one
@@ -1391,9 +1408,11 @@ async fn forge_promoted_files_rewrite_and_remain_exact_across_recovery() {
         Some("prepared"),
         "the operation the pod could not settle is the one it just attempted: {phases:?}"
     );
-    assert!(
-        phases.iter().filter(|phase| *phase == "prepared").count() == 1,
-        "no sibling stays open beside it: {phases:?}"
+    assert_eq!(
+        phases.iter().filter(|phase| *phase == "prepared").count(),
+        unsettled.len(),
+        "the owner retains every operation it cannot account for, and exactly \
+         one of them named a snapshot: {phases:?}"
     );
 
     // Cut 3 — across the uncertain commit. The customer answer first; the

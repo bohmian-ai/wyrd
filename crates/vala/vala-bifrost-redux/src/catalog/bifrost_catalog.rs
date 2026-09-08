@@ -978,23 +978,40 @@ impl BifrostCatalog {
             .lookup_table_row(&fqn, tenant)
             .await?
             .ok_or_else(|| BifrostCatalogError::TableNotFound(fqn))?;
-        let binding = TenantTableBinding::resolve((tenant, table.clone()))
-            .map_err(|error| BifrostCatalogError::InvalidBinding(error.to_string()))?;
-        let iceberg_table = self.catalog.load_table(&binding.table_ident()).await?;
-        let arrow_schema =
-            iceberg::arrow::schema_to_arrow_schema(iceberg_table.metadata().current_schema())?;
+        let builtin = builtin_table(
+            table
+                .namespace
+                .as_str()
+                .strip_prefix("vala.")
+                .unwrap_or_default(),
+            &table.name,
+        );
+        // A canonical built-in is described from its own declaration, not from
+        // the Iceberg round trip. The catalog assigns its own sequential field
+        // ids at table creation, so the stored schema's ids diverge from the
+        // ledger's after the first nested column — and it is the ledger's ids
+        // that Scribe enforces on every stamped canonical batch. Describing the
+        // stored ids would hand a writer a schema its own batches fail against.
+        let arrow_schema = match builtin {
+            Some(definition) => (definition.schema)(),
+            None => {
+                let binding = TenantTableBinding::resolve((tenant, table.clone()))
+                    .map_err(|error| BifrostCatalogError::InvalidBinding(error.to_string()))?;
+                let iceberg_table = self.catalog.load_table(&binding.table_ident()).await?;
+                Arc::new(iceberg::arrow::schema_to_arrow_schema(
+                    iceberg_table.metadata().current_schema(),
+                )?)
+            }
+        };
         let described = described_fields_from_stored_schema(&arrow_schema)?;
         Ok(BifrostTableDescription {
             entry: entry_from_row(&row)?,
             user_fields: described.user_fields,
             correlation_fields: described.correlation_fields,
             managed_candidates: described.managed_candidates,
-            canonical_physical_fingerprint: builtin_table(
-                table.namespace.as_str().strip_prefix("vala.").unwrap_or_default(),
-                &table.name,
-            )
-            .and_then(|definition| (definition.canonical_physical_fingerprint)())
-            .map(|fingerprint| fingerprint.to_hex()),
+            canonical_physical_fingerprint: builtin
+                .and_then(|definition| (definition.canonical_physical_fingerprint)())
+                .map(|fingerprint| fingerprint.to_hex()),
             physical_layout: layout_wire_from_row(&row)?,
         })
     }

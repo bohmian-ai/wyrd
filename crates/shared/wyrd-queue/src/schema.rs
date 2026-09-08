@@ -52,7 +52,9 @@ pub fn arrow_schema_to_fieldspec(schema: &Schema) -> Vec<FieldSpec> {
 /// Returns `Ok` for all supported `DataTypeSpec` variants. The function
 /// signature returns `Result` for symmetry with `json_schema_to_arrow`.
 pub fn fieldspec_to_arrow(fields: &[FieldSpec]) -> Result<Schema, WyrdQueueError> {
-    Ok(Schema::new(fields.iter().map(spec_to_field).collect::<Vec<_>>()))
+    Ok(Schema::new(
+        fields.iter().map(spec_to_field).collect::<Vec<_>>(),
+    ))
 }
 
 /// Build the Arrow schema a writer sends for one described table.
@@ -352,9 +354,9 @@ fn data_type_to_arrow(spec: &DataTypeSpec) -> DataType {
         DataTypeSpec::Time64 { unit } => DataType::Time64(time_unit_to_arrow(*unit)),
         DataTypeSpec::Decimal128 { precision, scale } => DataType::Decimal128(*precision, *scale),
         DataTypeSpec::List(element) => DataType::List(Arc::new(spec_to_field(element))),
-        DataTypeSpec::Struct(fields) => {
-            DataType::Struct(Fields::from(fields.iter().map(spec_to_field).collect::<Vec<_>>()))
-        }
+        DataTypeSpec::Struct(fields) => DataType::Struct(Fields::from(
+            fields.iter().map(spec_to_field).collect::<Vec<_>>(),
+        )),
     }
 }
 

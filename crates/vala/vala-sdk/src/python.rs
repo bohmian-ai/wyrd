@@ -457,9 +457,8 @@ impl PyBifrostQueryClient {
         batch_id: &[u8],
         arrow_ipc: Vec<u8>,
     ) -> PyResult<Vec<u8>> {
-        let batch_id = <[u8; 16]>::try_from(batch_id).map_err(|_| {
-            PyValueError::new_err("bifrost batch_id must contain exactly 16 bytes")
-        })?;
+        let batch_id = <[u8; 16]>::try_from(batch_id)
+            .map_err(|_| PyValueError::new_err("bifrost batch_id must contain exactly 16 bytes"))?;
         py.detach(|| {
             wyrd_runtime::runtime().block_on(async {
                 let transport = BifrostGrpcTransport::connect(&self.transport_client)

@@ -547,13 +547,17 @@ impl NativeBifrostQueryClient {
             since: match parse_window_bound(since.as_deref(), "since") {
                 Ok(bound) => bound,
                 Err(error) => {
-                    return Ok(NativeLifecycleResult::failure(&ValaSdkError::Transport(error)));
+                    return Ok(NativeLifecycleResult::failure(&ValaSdkError::Transport(
+                        error,
+                    )));
                 }
             },
             until: match parse_window_bound(until.as_deref(), "until") {
                 Ok(bound) => bound,
                 Err(error) => {
-                    return Ok(NativeLifecycleResult::failure(&ValaSdkError::Transport(error)));
+                    return Ok(NativeLifecycleResult::failure(&ValaSdkError::Transport(
+                        error,
+                    )));
                 }
             },
         };
@@ -582,14 +586,18 @@ impl NativeBifrostQueryClient {
                 since: match parse_window_bound(request.since.as_deref(), "since") {
                     Ok(bound) => bound,
                     Err(error) => {
-                    return Ok(NativeLifecycleResult::failure(&ValaSdkError::Transport(error)));
-                }
+                        return Ok(NativeLifecycleResult::failure(&ValaSdkError::Transport(
+                            error,
+                        )));
+                    }
                 },
                 until: match parse_window_bound(request.until.as_deref(), "until") {
                     Ok(bound) => bound,
                     Err(error) => {
-                    return Ok(NativeLifecycleResult::failure(&ValaSdkError::Transport(error)));
-                }
+                        return Ok(NativeLifecycleResult::failure(&ValaSdkError::Transport(
+                            error,
+                        )));
+                    }
                 },
                 limit: request.limit,
                 page_token: request.page_token,
@@ -630,8 +638,8 @@ impl NativeBifrostQueryClient {
             .map_err(napi_error)?;
         let mut buffer = Vec::new();
         {
-            let mut writer =
-                arrow::ipc::writer::StreamWriter::try_new(&mut buffer, &schema).map_err(napi_error)?;
+            let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut buffer, &schema)
+                .map_err(napi_error)?;
             writer.finish().map_err(napi_error)?;
         }
         Ok(Buffer::from(buffer))
@@ -715,12 +723,11 @@ fn parse_window_bound(
 ) -> Result<Option<chrono::DateTime<chrono::Utc>>, wyrd_spec::error::WyrdError> {
     value
         .map(|text| {
-            text.parse::<chrono::DateTime<chrono::Utc>>().map_err(|error| {
-                wyrd_spec::error::WyrdError::Validation {
+            text.parse::<chrono::DateTime<chrono::Utc>>()
+                .map_err(|error| wyrd_spec::error::WyrdError::Validation {
                     message: format!("{field} must be an RFC 3339 timestamp"),
                     details: serde_json::json!({"field": field, "reason": error.to_string()}),
-                }
-            })
+                })
         })
         .transpose()
 }

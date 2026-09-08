@@ -4065,10 +4065,7 @@ mod bifrost_wire_tests {
                     tz: Some("UTC".to_string()),
                 },
                 nullable: false,
-                metadata: BTreeMap::from([(
-                    PARQUET_FIELD_ID_KEY.to_string(),
-                    "1004".to_string(),
-                )]),
+                metadata: BTreeMap::from([(PARQUET_FIELD_ID_KEY.to_string(), "1004".to_string())]),
             }],
             canonical_physical_fingerprint: None,
             physical_layout: PhysicalLayoutWire {

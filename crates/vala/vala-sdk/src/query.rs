@@ -1728,7 +1728,6 @@ mod tests {
         );
     }
 
-
     /// Serves one canned JSON body and records every request line it answers.
     ///
     /// The recorded lines are the proof of a typed method's HTTP contract: the
@@ -1954,8 +1953,16 @@ mod tests {
             client
                 .get_trace(&GetTraceRequest {
                     trace_id: "0102030405060708090a0b0c0d0e0f10".to_owned(),
-                    since: Some("2026-07-02T00:00:00Z".parse().expect("a fixed bound parses")),
-                    until: Some("2026-07-01T00:00:00Z".parse().expect("a fixed bound parses")),
+                    since: Some(
+                        "2026-07-02T00:00:00Z"
+                            .parse()
+                            .expect("a fixed bound parses")
+                    ),
+                    until: Some(
+                        "2026-07-01T00:00:00Z"
+                            .parse()
+                            .expect("a fixed bound parses")
+                    ),
                 })
                 .await
                 .is_err(),

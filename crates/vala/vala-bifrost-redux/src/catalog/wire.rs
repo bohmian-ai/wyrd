@@ -317,7 +317,9 @@ mod tests {
             "correlation is exactly the card reference input and the run id"
         );
         assert_eq!(
-            described.correlation_fields[0].metadata.get(INPUT_CLASS_KEY),
+            described.correlation_fields[0]
+                .metadata
+                .get(INPUT_CLASS_KEY),
             Some(&INPUT_CLASS_GATE_CORRELATION.to_owned()),
             "card_ref is a Gate input, not a stored column"
         );

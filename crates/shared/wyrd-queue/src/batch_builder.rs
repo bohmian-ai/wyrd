@@ -72,9 +72,7 @@ impl BatchBuilder {
     /// Returns [`WyrdQueueError::SchemaParse`] when a described user column is
     /// not representable as Arrow, and [`WyrdQueueError::ReservedColumn`] when
     /// the description carries a server-owned column among its user fields.
-    pub fn from_description(
-        description: &BifrostTableDescription,
-    ) -> Result<Self, WyrdQueueError> {
+    pub fn from_description(description: &BifrostTableDescription) -> Result<Self, WyrdQueueError> {
         for spec in &description.user_fields {
             if is_reserved_column(&spec.name) {
                 return Err(WyrdQueueError::ReservedColumn(format!(

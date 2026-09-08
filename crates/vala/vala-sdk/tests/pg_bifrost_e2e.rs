@@ -980,6 +980,201 @@ mod pg_tests {
         srv.shutdown().await.expect("server shutdown");
     }
 
+    /// Describe reaches the exact stored physical schema for both table kinds.
+    ///
+    /// The whole point of describe is that a writer never keeps its own copy of
+    /// the physical contract. For a canonical signal table that means the
+    /// description's projected Arrow schema is the registry's physical schema —
+    /// every name, type, nullability, and stable field id — plus the one Gate
+    /// input (`card_ref`) the write path resolves rather than stores, and the
+    /// exact canonical physical fingerprint. Types are compared through the
+    /// storage layer's own round-trip equivalence, which is what "the stored
+    /// schema" actually means once Iceberg has widened a byte or string column. For a dynamic table it means a
+    /// batch built straight from the description is accepted by the real ingest
+    /// wire and lands durably, with each correlation column appended exactly
+    /// once.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a described schema diverges from the stored physical schema,
+    /// when the canonical fingerprint does not match the registry, or when a
+    /// description-built batch is rejected or fails to land.
+    #[tokio::test]
+    async fn described_canonical_and_dynamic_schemas_reach_exact_physical_schema() {
+        let srv = WyrdTestServer::start_bound()
+            .await
+            .expect("test server start");
+        let table_name = format!("described_{}", uuid::Uuid::now_v7().simple());
+        srv.state()
+            .bifrost_catalog()
+            .expect("Bifrost catalog")
+            .create_table(CreateTableRequest {
+                table: TableRef::new(BifrostNamespace::Bifrost, &table_name),
+                user_fields: vec![
+                    Field::new("id", DataType::Int64, false),
+                    Field::new("value", DataType::Utf8, false),
+                ],
+                tenant: srv.data_tenant_id(),
+                physical_layout: None,
+                audit: None,
+            })
+            .await
+            .expect("register the dynamic journey table");
+        srv.ensure_traces_spans_table_for_test(srv.data_tenant_id())
+            .await
+            .expect("provision the canonical span table");
+
+        let bootstrap = srv
+            .bootstrap_service("sdk-describe-writer", &["admin"])
+            .await
+            .expect("bootstrap the describing writer");
+        let api_key = bootstrap.api_key().expect("machine API key").clone();
+        let writer_card = bootstrap
+            .card_ref()
+            .expect("machine principal card ref")
+            .clone();
+        let mut config = client_config(&srv);
+        config.api_key = Some(api_key);
+        config.grpc.endpoint = srv.grpc_url().expect("gRPC URL");
+        config.grpc.connect_retries = 0;
+        let client = WyrdClient::with_config(config).expect("SDK client");
+        let query = QueryClient::new(&client);
+
+        // The canonical signal table: its description must reproduce the
+        // registry's own physical schema rather than an approximation of it.
+        let canonical = query
+            .describe_table("vala.traces", "spans")
+            .await
+            .expect("describe the canonical span table");
+        let definition = vala_bifrost_redux::tables::builtin_table("traces", "spans")
+            .expect("the spans built-in resolves");
+        assert_eq!(
+            canonical.canonical_physical_fingerprint.as_deref(),
+            Some(
+                (definition.canonical_physical_fingerprint)()
+                    .expect("a canonical table has a physical fingerprint")
+                    .to_hex()
+                    .as_str()
+            ),
+            "the description publishes the registry's exact canonical fingerprint"
+        );
+
+        let described_schema = wyrd_queue::schema::writable_schema(&canonical, true)
+            .expect("the canonical description projects an Arrow schema");
+        let physical = (definition.schema)();
+        for stored in physical.fields() {
+            let name = stored.name().as_str();
+            // Server-resolved columns are not a writer's to supply, so they are
+            // deliberately absent from every description; `wyrd_event_time` and
+            // `run_id` are the two the writer may still send.
+            if (wyrd_spec::vala::is_reserved_managed_column(name)
+                || wyrd_spec::vala::is_reserved_correlation_column(name))
+                && name != "wyrd_event_time"
+                && name != "run_id"
+            {
+                continue;
+            }
+            let described = described_schema
+                .field_with_name(stored.name())
+                .unwrap_or_else(|_| panic!("described schema keeps `{}`", stored.name()));
+            assert!(
+                vala_bifrost_redux::tables::arrow_type_shape_matches(
+                    stored.data_type(),
+                    described.data_type()
+                ),
+                "`{}` keeps its stored type shape: stored {:?}, described {:?}",
+                stored.name(),
+                stored.data_type(),
+                described.data_type()
+            );
+            assert_eq!(
+                described.is_nullable(),
+                stored.is_nullable(),
+                "`{}` keeps its stored nullability",
+                stored.name()
+            );
+            assert_eq!(
+                described.metadata().get("PARQUET:field_id"),
+                stored.metadata().get("PARQUET:field_id"),
+                "`{}` keeps its stable field id",
+                stored.name()
+            );
+        }
+        assert_eq!(
+            described_schema
+                .field_with_name("card_ref")
+                .expect("the Gate correlation input is described")
+                .metadata()
+                .get("wyrd:input_class")
+                .map(String::as_str),
+            Some("gate_correlation"),
+            "card_ref is a resolved Gate input, not a stored column"
+        );
+        for name in ["card_ref", "run_id", "wyrd_event_time"] {
+            assert_eq!(
+                described_schema
+                    .fields()
+                    .iter()
+                    .filter(|field| field.name() == name)
+                    .count(),
+                1,
+                "`{name}` is declared exactly once"
+            );
+        }
+
+        // The dynamic table: a batch built straight from its description is
+        // accepted by the real ingest wire and lands durably.
+        let dynamic = query
+            .describe_table("vala.bifrost", &table_name)
+            .await
+            .expect("describe the dynamic journey table");
+        assert!(
+            dynamic.canonical_physical_fingerprint.is_none(),
+            "a dynamic table publishes no canonical physical fingerprint"
+        );
+        let mut builder = wyrd_queue::batch_builder::BatchBuilder::from_description(&dynamic)
+            .expect("the dynamic description builds a row builder");
+        builder
+            .append_json_row(r#"{"id": 1, "value": "described"}"#, &writer_card, None)
+            .expect("a described row is accepted");
+        let ipc = builder.finish_ipc().expect("seal the described batch");
+
+        let transport = BifrostGrpcTransport::connect(&client)
+            .await
+            .expect("connect the public SDK transport");
+        transport
+            .insert_batch(
+                &format!("vala.bifrost.{table_name}"),
+                uuid::Uuid::now_v7().into_bytes(),
+                ipc,
+            )
+            .await
+            .expect("the described batch is accepted by the real wire");
+        srv.flush_bifrost()
+            .await
+            .expect("flush server-owned Scribe");
+
+        let mut conn = srv
+            .tenant_conn_for(srv.data_tenant_id())
+            .await
+            .expect("tenant-scoped read connection");
+        let row_count: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(row_count), 0)::bigint
+               FROM vala.file_list
+              WHERE namespace = 'vala.bifrost' AND table_name = $1",
+        )
+        .bind(&table_name)
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .expect("read Scribe file-list rows");
+        conn.commit().await.expect("commit tenant-scoped read");
+        assert_eq!(
+            row_count, 1,
+            "the description-built batch reached the durable read boundary"
+        );
+        srv.shutdown().await.expect("server shutdown");
+    }
+
     #[tokio::test]
     async fn public_sdk_bidi_write_ack_and_durable_readback() {
         let srv = WyrdTestServer::start_bound()

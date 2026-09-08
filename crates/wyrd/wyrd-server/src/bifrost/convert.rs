@@ -280,7 +280,8 @@ mod tests {
     /// schema rather than an approximation of it.
     #[test]
     fn nested_field_description_preserves_identity_and_metadata() {
-        let id = |value: i32| BTreeMap::from([(PARQUET_FIELD_ID_KEY.to_owned(), value.to_string())]);
+        let id =
+            |value: i32| BTreeMap::from([(PARQUET_FIELD_ID_KEY.to_owned(), value.to_string())]);
         let spec = FieldSpec {
             name: "events".to_owned(),
             data_type: DataTypeSpec::List(Box::new(FieldSpec {
@@ -299,7 +300,10 @@ mod tests {
         };
 
         let arrow = field_to_arrow(&spec);
-        assert_eq!(arrow.metadata().get(PARQUET_FIELD_ID_KEY), Some(&"16".to_owned()));
+        assert_eq!(
+            arrow.metadata().get(PARQUET_FIELD_ID_KEY),
+            Some(&"16".to_owned())
+        );
         let DataType::List(element) = arrow.data_type() else {
             panic!("a list declaration must project an Arrow list");
         };

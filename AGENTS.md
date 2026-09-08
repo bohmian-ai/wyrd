@@ -540,31 +540,34 @@ generated Claude discovery mirror. Run `mise run skills:sync` after editing a
 shared workflow skill and `mise run check:skills-sync` to detect drift. Codex
 `agents/openai.yaml` metadata remains only in the canonical source.
 
-- `$wyrd-spec` turns human intent into a decision-complete behavioral
-  specification. Only explicit human approval makes a revision authoritative.
-- `$wyrd-plan` decomposes an approved specification into cohesive TDD tasks or
-  creates bounded remediation tasks from validated `$wyrd-task-review` or
-  `$wyrd-change-review` implementation findings. Missing review evidence
-  returns to `$wyrd-task-review`. It never rewrites an approved spec to fit
-  implementation.
-- `$wyrd-task-readiness` reviews one or more proposed tasks before
-  implementation. It is distinct from post-implementation task review.
+- `$wyrd-spec` fixes intent, externally observable behavior, constraints, and
+  expensive-to-reverse decisions. Only explicit human approval makes a revision
+  authoritative; reversible implementation choices remain open.
+- `$wyrd-plan` decomposes an approved specification into the minimum cohesive
+  set of outcome-complete tasks. It stops once implementation can begin without
+  an unresolved product, public API, architecture, security, compatibility,
+  cross-service, concurrency-semantics, or persistent-data decision. It does
+  not plan review remediation.
 - Wyrd Rust, Python, TypeScript, server, CLI, MCP, storage, Vala, and contract
   implementors must receive the `$wyrd-implement` skill in their task packet.
-  It executes one ready task through scenario-by-scenario Red-Green-Refactor
-  cycles, then runs the broader focused verification required here.
+  It owns reversible local decisions, implements the smallest sufficient
+  change, and records acceptance and verification evidence.
 - Wyrd UI implementors additionally receive the `wyrd-ui` skill when their
   write set enters the UI tree.
-- `$wyrd-task-review` performs read-only review of one immutable cumulative
-  task candidate. `REMEDIATE` findings return to `$wyrd-plan`;
-  behavior-changing conflicts return to `$wyrd-spec` and require renewed human
-  approval.
+- `$wyrd-task-review` uses a fresh independent reviewer to compare one immutable
+  cumulative candidate with the original task, approved spec, actual diff,
+  repository rules, and verification. It starts unconvinced, tries to falsify
+  completion, and applies the Ponytail delete/reuse/native/installed/minimum-code
+  ladder to every changed complexity. It classifies only `MISSING`, `INCORRECT`,
+  `DRIFT`, `VIOLATION`, and `REGRESSION` findings and writes an explicit
+  acceptance matrix. For `FIX_REQUIRED`, it writes one self-contained
+  remediation task under `changes/active/<slug>/review/<review-name>/` for a
+  fresh `$wyrd-implement` agent; it does not invoke another planning cycle.
 - `$wyrd-change-review` performs the final immutable integrated review and maps
   every required specification obligation to credible evidence, including
-  independently reviewed cross-task seams and user journeys. Its review phase
-  remains read-only. Implementation findings return to `$wyrd-plan`; missing
-  task-review evidence returns to `$wyrd-task-review`. An `APPROVE` verdict
-  automatically invokes `$wyrd-complete` in the same workflow turn.
+  cross-task seams and user journeys. It uses the same acceptance classifications
+  and direct remediation-task flow. A `PASS` verdict automatically invokes
+  `$wyrd-complete` in the same workflow turn.
 - `$wyrd-complete` requires that approved review, writes one compact durable
   record under `changes/completed/<year>/<slug>.md`, and removes the full
   `changes/active/<slug>` packet. It does not merge, push, deploy, modify

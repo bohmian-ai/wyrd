@@ -82,7 +82,9 @@ pub struct DescribedFields {
 ///
 /// `card_ref` is a Gate input rather than a stored column: it resolves to
 /// `card_uid` on write, so it is synthesized here with the gate-correlation
-/// input class and carries no field id. Every other declaration is taken from
+/// input class and carries no field id. It is nullable because Card correlation
+/// is optional: a row without one is accepted and stored with an authenticated
+/// `principal_id` and a null `card_uid`. Every other declaration is taken from
 /// the stored schema, so its type, nullability, and stable field id are the
 /// table's actual ones rather than a restatement.
 ///
@@ -98,7 +100,7 @@ pub fn described_fields_from_stored_schema(
         correlation_fields: vec![FieldSpec {
             name: CARD_REF.to_owned(),
             data_type: DataTypeSpec::Utf8,
-            nullable: false,
+            nullable: true,
             metadata: std::collections::BTreeMap::from([(
                 INPUT_CLASS_KEY.to_owned(),
                 INPUT_CLASS_GATE_CORRELATION.to_owned(),

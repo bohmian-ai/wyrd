@@ -1,4 +1,4 @@
 interface:
   display_name: "Wyrd Complete"
-  short_description: "Condense and retire an approved Wyrd change"
-  default_prompt: "Use $wyrd-complete with the APPROVE output from $wyrd-change-review to write the compact completed record and remove the active change packet."
+  short_description: "Condense and retire a passed Wyrd change"
+  default_prompt: "Use $wyrd-complete with the PASS output from $wyrd-change-review to write the compact completed record and remove the active change packet."

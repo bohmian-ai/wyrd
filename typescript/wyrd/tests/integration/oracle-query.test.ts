@@ -15,16 +15,8 @@ describe("Oracle query journey", () => {
       "test-token",
       "://invalid-grpc-endpoint",
     );
-    const batchId = new Uint8Array(16);
-    batchId[6] = 0x70;
-    batchId[8] = 0x80;
-
     await expect(
-      client.bifrost.insertBatch(
-        "vala.bifrost.events",
-        batchId,
-        new Uint8Array(),
-      ),
+      client.bifrost.insertBatch("vala.bifrost.events", new Uint8Array()),
     ).rejects.toMatchObject({
       code: "WYRD_SERVER_503_SERVICE_UNAVAILABLE",
       status: 503,
@@ -38,15 +30,12 @@ describe("Oracle query journey", () => {
     try {
       const client = new WyrdClient(server.baseUrl, server.token, server.grpcUrl);
       const expected = [11, 22];
-      const batchId = new Uint8Array(16);
-      batchId[6] = 0x70;
-      batchId[8] = 0x80;
       const ipc = tableToIPC(
         tableFromArrays({ value: [11n, 22n] }),
         "stream",
       );
-      const ack = await client.bifrost.insertBatch(server.tableFqn, batchId, ipc);
-      expect(Array.from(ack.batchId)).toEqual(Array.from(batchId));
+      const ack = await client.bifrost.insertBatch(server.tableFqn, ipc);
+      expect(ack.batchId).toHaveLength(16);
       server.waitForBifrostPublication();
       const stream = await client.bifrost.query({
         sql: `SELECT * FROM ${server.tableFqn}`,

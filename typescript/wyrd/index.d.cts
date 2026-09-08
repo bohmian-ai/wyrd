@@ -109,9 +109,9 @@ export declare class NativeBifrostQueryClient {
   /**
    * Sends one Arrow IPC batch through the existing Bifrost ingest wire.
    *
-   * The Rust client-tier transport owns UUID validation, authentication,
-   * retries, and stable error projection; this napi method only converts
-   * JavaScript buffers into the transport's typed frame.
+   * The Rust client-tier transport owns batch identity, authentication,
+   * retries, and stable error projection; this napi method only converts the
+   * JavaScript buffer into the transport's call and projects its result.
    *
    * # Errors
    *
@@ -119,7 +119,7 @@ export declare class NativeBifrostQueryClient {
    * authentication, transport, or server rejection. A napi error is
    * returned only when the bridge cannot construct that result.
    */
-  insertBatch(table: string, batchId: Buffer, ipc: Buffer): Promise<NativeInsertResult>
+  insertBatch(table: string, ipc: Buffer): Promise<NativeInsertResult>
 }
 
 /** Native query stream that retains Rust terminal validation and emits raw IPC. */

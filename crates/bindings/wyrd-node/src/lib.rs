@@ -9,7 +9,7 @@ use napi::bindgen_prelude::Buffer;
 use napi_derive::napi;
 use secrecy::SecretString;
 use tokio::sync::Mutex as AsyncMutex;
-use vala_sdk::{BifrostFrame, BifrostGrpcTransport, QueryClient, QueryResultStream, ValaSdkError};
+use vala_sdk::{BifrostGrpcTransport, QueryClient, QueryResultStream, ValaSdkError};
 use wyrd_client::WyrdClient;
 use wyrd_client::auth::AuthMiddleware;
 use wyrd_client::config::ClientConfig;
@@ -650,9 +650,9 @@ impl NativeBifrostQueryClient {
 
     /// Sends one Arrow IPC batch through the existing Bifrost ingest wire.
     ///
-    /// The Rust client-tier transport owns UUID validation, authentication,
-    /// retries, and stable error projection; this napi method only converts
-    /// JavaScript buffers into the transport's typed frame.
+    /// The Rust client-tier transport owns batch identity, authentication,
+    /// retries, and stable error projection; this napi method only converts the
+    /// JavaScript buffer into the transport's call and projects its result.
     ///
     /// # Errors
     ///
@@ -663,16 +663,8 @@ impl NativeBifrostQueryClient {
     pub async fn insert_batch(
         &self,
         table: String,
-        batch_id: Buffer,
         ipc: Buffer,
     ) -> napi::Result<NativeInsertResult> {
-        let Ok(batch_id) = <[u8; 16]>::try_from(batch_id.as_ref()) else {
-            let error = wyrd_spec::error::WyrdError::Validation {
-                message: "bifrost batch_id must contain exactly 16 bytes".to_owned(),
-                details: serde_json::json!({"field": "batch_id", "expected_bytes": 16}),
-            };
-            return Ok(NativeInsertResult::failure(&error));
-        };
         let transport = match BifrostGrpcTransport::connect(&self.transport_client).await {
             Ok(transport) => transport,
             Err(_error) => {
@@ -680,13 +672,8 @@ impl NativeBifrostQueryClient {
                 return Ok(NativeInsertResult::failure(&error));
             }
         };
-        let frame = BifrostFrame {
-            table,
-            batch_id,
-            arrow_ipc: ipc.as_ref().to_vec().into(),
-        };
-        match transport.send_frame(frame).await {
-            Ok(()) => Ok(NativeInsertResult::success(batch_id)),
+        match transport.insert_batch(&table, ipc.as_ref().to_vec()).await {
+            Ok(batch_id) => Ok(NativeInsertResult::success(batch_id.into_bytes())),
             Err(error) => Ok(NativeInsertResult::failure(&error)),
         }
     }

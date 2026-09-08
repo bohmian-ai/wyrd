@@ -9,19 +9,24 @@ changes/
 |-- active/
 |   `-- <slug>/
 |       |-- spec.md
-|       `-- tasks/
+|       |-- tasks/
+|       `-- review/
+|           `-- <review-name>/
+|               |-- verdict.md
+|               `-- TASK-001-R1-<name>.md
 `-- completed/
     `-- <year>/
         `-- <slug>.md
 ```
 
 `$wyrd-spec` creates and revises the active specification. `$wyrd-plan` creates
-implementation and remediation tasks. Implementors append focused execution
-evidence to their tasks. Final `$wyrd-change-review` keeps the complete packet
-available while it performs read-only verification. Task files carry their
-execution evidence; the final reviewer builds the integrated evidence matrix.
+small outcome-complete implementation tasks. Implementors append focused
+acceptance evidence. `$wyrd-task-review` writes its verdict and, when needed, a
+self-contained remediation task under the named review directory for a fresh
+`$wyrd-implement` agent. Final `$wyrd-change-review` keeps the complete packet
+available while it performs read-only integrated acceptance review.
 
-An `APPROVE` verdict automatically invokes `$wyrd-complete`. Completion writes
+A final `PASS` verdict automatically invokes `$wyrd-complete`. Completion writes
 the compact record, verifies that lasting behavior is already represented by
 the owning architecture or product documentation, and removes the active
 packet. The completed record is historical context; current architecture,

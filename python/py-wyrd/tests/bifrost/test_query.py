@@ -360,13 +360,13 @@ def test_canonical_arrow_insert_uses_described_schema() -> None:
             requested.append((description_json, include_event_time))
             return schema_only_ipc
 
-        def insert_batch(self, table: str, batch_id: bytes, arrow_ipc: bytes) -> bytes:
-            sent.append((table, batch_id, arrow_ipc))
-            return batch_id
+        def insert_batch(self, table: str, arrow_ipc: bytes) -> bytes:
+            sent.append((table, ACKED_ID.bytes, arrow_ipc))
+            return ACKED_ID.bytes
 
     client = object.__new__(BifrostQueryClient)
     client._native = NativeClient()
-    batch_id = uuid.uuid4()
+    ACKED_ID = uuid.uuid4()
 
     async def run() -> tuple[pyarrow.Schema, uuid.UUID]:
         writable = await client.writable_schema(described)
@@ -378,17 +378,17 @@ def test_canonical_arrow_insert_uses_described_schema() -> None:
             ],
             schema=writable,
         )
-        return writable, await client.insert_batch("vala.traces.spans", batch_id, batch)
+        return writable, await client.insert_batch("vala.traces.spans", batch)
 
     writable, acked = asyncio.run(run())
 
     assert json.loads(requested[0][0])["user_fields"] == [{"name": "trace_id"}]
     assert requested[0][1] is False, "a writer supplies event time only when it asks to"
     assert writable.names == ["trace_id", "card_ref", "run_id"]
-    assert acked == batch_id
+    assert acked == ACKED_ID
     table, sent_id, ipc = sent[0]
     assert table == "vala.traces.spans"
-    assert sent_id == batch_id.bytes
+    assert sent_id == ACKED_ID.bytes
     assert pyarrow.ipc.open_stream(ipc).schema == writable, (
         "the batch travels on the described schema, not a rebuilt one"
     )

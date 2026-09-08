@@ -204,7 +204,7 @@ impl RecordQueue {
             let json = std::str::from_utf8(&row.json).map_err(|error| {
                 WyrdQueueError::SchemaParse(format!("row is not UTF-8: {error}"))
             })?;
-            builder.append_json_row(json, &row.card_ref, row.run_id.as_ref())?;
+            builder.append_json_row(json, Some(&row.card_ref), row.run_id.as_ref())?;
         }
         builder.finish_ipc()
     }

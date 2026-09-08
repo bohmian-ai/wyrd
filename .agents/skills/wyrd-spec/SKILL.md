@@ -1,113 +1,79 @@
 ---
 name: wyrd-spec
-description: Design, refine, or revise a human-approved Wyrd change specification that fixes intent, constraints, invariants, and externally observable behavior while preserving implementation freedom. Use before task planning for a material Wyrd change; this is not the wyrd-spec Rust crate workflow.
+description: Define or revise a human-approved Wyrd change specification covering intent, observable behavior, constraints, and expensive-to-reverse decisions while preserving implementation freedom.
 ---
 
 # Wyrd Spec
 
-Turn human intent into a decision-complete behavioral specification. The human
-and agent own design reasoning together; the agent may draft and research, but
-only explicit human approval makes a revision authoritative.
+Turn human intent into a decision-complete behavioral specification. The agent
+may draft and research, but only explicit human approval makes a revision
+authoritative. Do not create implementation tasks or edit implementation code;
+hand an approved specification to `$wyrd-plan`.
 
-Do not create implementation tasks or edit implementation code under this
-skill. Route approved decomposition to `$wyrd-plan`.
+## Establish authority
 
-## Establish design authority
+Read `AGENTS.md`, [agent rules](../../../architecture/agent-rules.md),
+[Wyrd design](../../../architecture/wyrd-design.md), and
+[Wyrd doctrine](../../../architecture/wyrd-doctrine.mdx). Read
+[Bifrost design](../../../architecture/bifrost-design.md) when the change touches
+Bifrost. Start at [the reference router](../../../architecture/references/README.md)
+and completely read only the applicable references. Follow CodeGraph
+instructions before tracing repository behavior.
 
-Read `AGENTS.md` and [agent rules](../../../architecture/agent-rules.md). Read
-[Wyrd design](../../../architecture/wyrd-design.md) and
-[Wyrd doctrine](../../../architecture/wyrd-doctrine.mdx) for governed behavior,
-contracts, ownership, and public or internal surfaces. Read
-[Bifrost design](../../../architecture/bifrost-design.md) whenever the change
-touches Scribe, Oracle, Forge, analytical storage, ingest, query, maintenance,
-or reliability.
+Repository authority constrains the specification; implementation drift does
+not. Inspect existing owners, consumers, tests, manifests, and verification only
+far enough to distinguish current behavior from the requested outcome.
 
-Start at [the reference router](../../../architecture/references/README.md),
-read [spec-driven development](../../../architecture/references/languages/spec-driven-development.md),
-and completely read the smallest applicable architecture, language, domain,
-security, and operations references. Follow CodeGraph instructions before
-locating or tracing repository behavior. Inspect the owning implementation,
-tests, manifests, consumers, and `mise.toml` only far enough to distinguish
-current facts from desired behavior.
+## Specify decisions, not code
 
-Repository authority constrains the spec; implementation drift does not.
-Record links that materially informed a requirement or decision. Do not attach
-irrelevant references merely to populate a section.
+Fix:
 
-## Preserve behavioral constraint and design freedom
+- human intent and user or operator value;
+- required observable success, failure, and edge behavior;
+- scope, non-goals, and invariants;
+- security, tenancy, durability, performance, and compatibility constraints;
+- required public interfaces and cross-boundary behavior; and
+- decisions expensive to reverse, including public or persisted contracts,
+  architectural ownership, cross-service semantics, concurrency guarantees,
+  security assumptions, compatibility, and persistent data formats.
 
-Specify what the system must accomplish, what must always or never be true,
-externally observable success and failure behavior, material constraints,
-required public interfaces and cross-boundary flow, and system boundaries that
-architecture or the user intentionally locks.
+Do not prescribe helper functions, private methods, module layout, variable
+names, local control flow, dependency APIs already available inside approved
+boundaries, test fixture structure, or other reversible choices. Include an
+implementation mechanism only when the user or architecture makes that
+mechanism part of the contract.
 
-Leave ordinary implementation mechanics to tasks: private signatures, module
-boundaries, data structures, algorithms, internal APIs, persistence mechanics,
-and concurrency mechanisms. Include one only when it is itself an approved
-constraint or an architecture authority already fixes it.
-
-Identify the categories of plan-level decisions the approved spec intentionally
-leaves open, without choosing them here. Examples include the required durable
-identity, state machine, cross-process ordering, atomicity, shutdown/crash
-recovery, dependency capability, and test topology. This planning-decision
-inventory is a handoff obligation for `$wyrd-plan`, not an implementation plan.
-
-Challenge ambiguous architecture language. “Persist separately” is an
-implementation choice unless independent persistence is required for a named
-durability, security, ownership, or externally observable invariant.
-
-## Draft the specification
+## Write and approve the specification
 
 For an active change, write `changes/active/<slug>/spec.md` on the caller's
-change/integration branch. The change packet is normally tracked and travels
-with task branches; never force-stage an ignored path or create a separate
-planning branch.
+change branch. Use proportionate Markdown containing:
 
-Use proportionate Markdown with stable local IDs:
+1. spec ID, revision, and `draft | approved | superseded` status;
+2. objective and user value;
+3. requirements and externally observable behavior;
+4. constraints, invariants, scope, and non-goals;
+5. expensive-to-reverse decisions and required boundaries;
+6. acceptance criteria and credible evidence classes;
+7. open material decisions; and
+8. revision history and materially relevant authority links.
 
-1. metadata: spec ID, revision, and `draft | approved | superseded` status;
-2. human intent and user value;
-3. scope and non-goals;
-4. definitions;
-5. `REQ-*` required behavior;
-6. `INV-*` invariants and prohibited outcomes;
-7. externally observable behavior and failure modes;
-8. material constraints;
-9. required system boundaries, public interfaces, and cross-boundary flow;
-10. `AC-*` acceptance obligations and credible evidence classes;
-11. open material decisions; and
-12. planning-decision inventory; and
-13. revision history and materially relevant authority links.
+Use stable `REQ-*`, `INV-*`, and `AC-*` IDs where traceability helps. Keep them
+atomic enough to map to tasks and evidence without turning the specification
+into a test inventory or implementation plan. An approved revision has no open
+product, public API, architecture, security, compatibility, concurrency,
+cross-service, or persistent-data decision.
 
-Use exact Wyrd vocabulary. Requirements and invariants must be atomic enough to
-map to tasks and evidence, but do not turn the spec into a test inventory or
-implementation plan. An approved spec has no unresolved material decision.
+Present unresolved material decisions and consequences one at a time. Move a
+revision to `approved` only after explicit human approval. A later material edit
+increments the revision and returns it to `draft`. Git staging and commits still
+require caller authorization.
 
-## Refine and approve
-
-Present unresolved material decisions and their consequences one at a time.
-Revise the draft from explicit human direction. Do not infer approval from
-silence, implementation activity, or phrases that do not clearly accept the
-specification.
-
-On explicit approval, set the current revision to `approved`, record the
-approval in revision history, and recommend recording that revision in a
-commit before task branches fork. Make no further material edit without
-returning the spec to `draft` and incrementing its revision. Git staging and
-commits require caller authorization.
-
-## Handle implementation-discovered conflicts
-
-When implementation or review proves the design wrong, create a new draft
-revision. State the conflicting requirement or invariant, repository evidence,
-affected tasks and tests, and the smallest proposed semantic change. Stop
-downstream work until the human explicitly approves the new revision and
-`$wyrd-plan` reconciles affected tasks.
+If implementation or review proves an approved decision wrong, draft the
+smallest semantic revision, cite the conflicting evidence, and stop affected
+work until the human approves it.
 
 ## Handoff
 
-Report the spec path, revision, status, a one-sentence outcome, and any exact
-approval or blocking decision needed. Do not repeat obligations, implementation
-freedoms, decision inventories, or authority links already recorded in the
-spec. Never claim task or implementation readiness merely because the spec is
-approved.
+Return the spec path, revision, status, one-sentence outcome, and any exact
+approval or blocking decision. Never claim implementation readiness merely
+because the specification is approved.

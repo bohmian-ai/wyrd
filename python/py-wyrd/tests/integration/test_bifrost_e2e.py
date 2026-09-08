@@ -6,6 +6,7 @@ import asyncio
 import json
 from typing import TYPE_CHECKING
 
+import pyarrow
 import pytest
 from wyrd.bifrost import Bifrost, BifrostQueryClient, BifrostQueryError
 from wyrd.observe import record
@@ -233,3 +234,54 @@ def test_positive_audit_trail(wyrd_server: WyrdTestServer) -> None:
 
     asyncio.run(query())
     assert wyrd_server.bifrost_read_decision_count() > before
+
+
+@pytest.mark.integration
+def test_direct_arrow_insert_reaches_the_configured_grpc_endpoint(
+    wyrd_server: WyrdTestServer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A direct Arrow insert dials the configured gRPC endpoint, not the default.
+
+    The harness binds an ephemeral gRPC port and exports it as `WYRD_GRPC_URL`,
+    so the batch only reaches a live server when the query client retains that
+    environment's gRPC configuration alongside the explicitly supplied HTTP URL.
+    The two arms are the discriminator: the configured endpoint answers with the
+    server's own row validation, while pointing `WYRD_GRPC_URL` at a dead port
+    fails in the transport, which is exactly how the configured endpoint failed
+    before the client kept the environment's gRPC config.
+
+    The batch carries a `card_ref` outside the principal's scope so the server
+    rejects it during validation. That rejection is proof of delivery — only the
+    configured server can produce it — and it leaves nothing staged behind for
+    the session's later journeys.
+    """
+    table_fqn, token = wyrd_server.prepare_oracle_query_fixture()
+    namespace, name = table_fqn.rsplit(".", 1)
+
+    async def build_batch(client: BifrostQueryClient) -> pyarrow.RecordBatch:
+        schema = await client.writable_schema(await client.describe_table(namespace, name))
+        assert schema.field("card_ref").nullable, "correlation is optional on the write schema"
+        return pyarrow.record_batch(
+            [
+                pyarrow.array([9], type=schema.field("id").type),
+                pyarrow.array(["direct-arrow"], type=schema.field("value").type),
+                pyarrow.array([CARD_REF], type=schema.field("card_ref").type),
+                pyarrow.array([None], type=schema.field("run_id").type),
+            ],
+            schema=schema,
+        )
+
+    async def insert(client: BifrostQueryClient) -> None:
+        await client.insert_batch(table_fqn, await build_batch(client))
+
+    configured = BifrostQueryClient(wyrd_server.base_url, token)
+    with pytest.raises(BifrostQueryError) as reached:
+        asyncio.run(insert(configured))
+    assert "card_ref outside principal card scope" in str(reached.value)
+
+    monkeypatch.setenv("WYRD_GRPC_URL", "http://127.0.0.1:1")
+    stranded = BifrostQueryClient(wyrd_server.base_url, token)
+    with pytest.raises(BifrostQueryError) as unreachable:
+        asyncio.run(insert(stranded))
+    assert "transport is unavailable" in str(unreachable.value)

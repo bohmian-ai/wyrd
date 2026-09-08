@@ -455,8 +455,14 @@ pub async fn build_query_metrics_plan(
     Ok(df.logical_plan().clone())
 }
 
-/// Build the `LogicalPlan` for `QueryLogs`. Payload columns (`body`, `attributes`)
-/// are projected away unless the caller holds `BifrostLogPayload:Read`.
+/// Build the `LogicalPlan` for `QueryLogs`. The log table's registry-declared
+/// sensitive payload columns are projected away unless the caller holds
+/// `BifrostLogPayload:Read`, so an unauthorized plan never reads any of them.
+///
+/// # Panics
+///
+/// Panics when `vala.logs.records` is absent from the built-in registry, which
+/// is a compile-time-fixed array this plan has already resolved through Oracle.
 pub async fn build_query_logs_plan(
     state: &AppState,
     caller: &Caller,
@@ -474,10 +480,13 @@ pub async fn build_query_logs_plan(
     // trace_id in logs is FixedSizeBinary(16); string filter deferred to Stage 5
     // event_name is Utf8 — safe to filter directly
     let df = opt_filter_str(df, "event_name", &req.event_name)?;
-    let df = if !has_perm(caller, Resource::BifrostLogPayload) {
-        df.drop_columns(&["body", "attributes"]).map_err(df_err)?
-    } else {
+    let df = if has_perm(caller, Resource::BifrostLogPayload) {
         df
+    } else {
+        let sensitive = vala_bifrost_redux::tables::builtin_table("logs", "records")
+            .expect("vala.logs.records is a built-in registry table")
+            .sensitive_payload_columns;
+        df.drop_columns(sensitive).map_err(df_err)?
     };
 
     Ok(df.logical_plan().clone())

@@ -507,7 +507,7 @@ async fn prepare_oracle_query_fixture(
         .await
         .map_err(harness_error)?;
     transport
-        .insert_batch(&table_fqn, uuid::Uuid::now_v7().into_bytes(), ipc)
+        .insert_batch(&table_fqn, ipc)
         .await
         .map_err(harness_error)?;
     let ingest = srv
@@ -565,7 +565,7 @@ async fn prepare_oracle_query_fixture(
             .map_err(harness_error)?;
     }
     transport
-        .insert_batch(&table_fqn, uuid::Uuid::now_v7().into_bytes(), live_ipc)
+        .insert_batch(&table_fqn, live_ipc)
         .await
         .map_err(harness_error)?;
     let token = srv

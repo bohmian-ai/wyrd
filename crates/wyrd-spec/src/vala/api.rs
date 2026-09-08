@@ -109,10 +109,14 @@ pub struct BifrostTableDescription {
     pub user_fields: Vec<FieldSpec>,
     /// The correlation inputs a writer supplies alongside its user fields.
     ///
-    /// Exactly non-null `card_ref: Utf8` — a Gate input tagged
+    /// Exactly nullable `card_ref: Utf8` — a Gate input tagged
     /// [`INPUT_CLASS_KEY`]`=`[`INPUT_CLASS_GATE_CORRELATION`] that resolves to
     /// the stored `card_uid` and therefore carries no field id — followed by
     /// nullable `run_id: Utf8` with the field id its physical column holds.
+    ///
+    /// Card correlation is optional, so a writer may omit `card_ref` entirely;
+    /// the server then stores the row with its authenticated `principal_id` and
+    /// a null `card_uid`.
     pub correlation_fields: Vec<FieldSpec>,
     /// Managed columns a writer may supply itself rather than let the server
     /// stamp: non-null `wyrd_event_time: Timestamp(Microsecond, UTC)`.
@@ -908,11 +912,11 @@ pub struct MetricRow {
 }
 
 /// One log record. `body` is payload-gated and omitted when the caller lacks
-/// `bifrost_log_payload:read`. No floats/JSON value → derives `Eq`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+/// `bifrost_log_payload:read`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct LogRow {
-    /// Record timestamp.
+    /// Canonical observed record timestamp, carrying the stored nanoseconds.
     pub timestamp: DateTime<Utc>,
     /// OTEL severity number.
     pub severity_number: i32,
@@ -928,8 +932,12 @@ pub struct LogRow {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event_name: Option<String>,
     /// Payload-gated log body; omitted without `bifrost_log_payload:read`.
+    ///
+    /// The canonical body is an `AnyValue`, so it carries any JSON shape the
+    /// protocol allows — a scalar, `null`, an array, or an object — rather than
+    /// only a string.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub body: Option<String>,
+    pub body: Option<serde_json::Value>,
 }
 
 /// One agent/dev-session trace row. `payload` is payload-gated and omitted when
@@ -1023,8 +1031,8 @@ pub struct QueryMetricsResponse {
     pub next_page_token: Option<String>,
 }
 
-/// `QueryLogs` response — a page of log rows. No floats/JSON value → derives `Eq`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+/// `QueryLogs` response — a page of log rows.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct QueryLogsResponse {
     /// Log rows in this page.

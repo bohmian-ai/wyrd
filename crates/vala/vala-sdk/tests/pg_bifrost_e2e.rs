@@ -787,7 +787,7 @@ mod pg_tests {
         BifrostGrpcTransport::connect(&client)
             .await
             .expect("connect ingest")
-            .insert_batch(&table_fqn, uuid::Uuid::now_v7().into_bytes(), native_ipc())
+            .insert_batch(&table_fqn, native_ipc())
             .await
             .expect("durable ingest ACK");
         srv.flush_bifrost().await.expect("flush Scribe");
@@ -901,11 +901,7 @@ mod pg_tests {
             BifrostGrpcTransport::connect(&client)
                 .await
                 .expect("connect ingest")
-                .insert_batch(
-                    &table_fqn,
-                    uuid::Uuid::now_v7().into_bytes(),
-                    native_ipc_ids(chunk),
-                )
+                .insert_batch(&table_fqn, native_ipc_ids(chunk))
                 .await
                 .expect("durable ingest ACK");
             srv.flush_bifrost().await.expect("flush Scribe");
@@ -1093,10 +1089,10 @@ mod pg_tests {
                 "`{}` keeps its stored nullability",
                 stored.name()
             );
-            assert_eq!(
-                described.metadata().get("PARQUET:field_id"),
-                stored.metadata().get("PARQUET:field_id"),
-                "`{}` keeps its stable field id",
+            assert!(
+                described.metadata().is_empty(),
+                "`{}` sends no field id: the id is the server's physical \
+                 identity, which it assigns and ignores on an incoming batch",
                 stored.name()
             );
         }
@@ -1132,22 +1128,33 @@ mod pg_tests {
             dynamic.canonical_physical_fingerprint.is_none(),
             "a dynamic table publishes no canonical physical fingerprint"
         );
+        assert!(
+            wyrd_queue::schema::writable_schema(&dynamic, false)
+                .expect("the dynamic description projects an Arrow schema")
+                .field_with_name("card_ref")
+                .expect("the Gate correlation input is described")
+                .is_nullable(),
+            "Card correlation is optional, so describe must not demand it"
+        );
         let mut builder = wyrd_queue::batch_builder::BatchBuilder::from_description(&dynamic)
             .expect("the dynamic description builds a row builder");
         builder
-            .append_json_row(r#"{"id": 1, "value": "described"}"#, &writer_card, None)
+            .append_json_row(
+                r#"{"id": 1, "value": "described"}"#,
+                Some(&writer_card),
+                None,
+            )
             .expect("a described row is accepted");
+        builder
+            .append_json_row(r#"{"id": 2, "value": "uncorrelated"}"#, None, None)
+            .expect("a described row without Card correlation is accepted");
         let ipc = builder.finish_ipc().expect("seal the described batch");
 
         let transport = BifrostGrpcTransport::connect(&client)
             .await
             .expect("connect the public SDK transport");
         transport
-            .insert_batch(
-                &format!("vala.bifrost.{table_name}"),
-                uuid::Uuid::now_v7().into_bytes(),
-                ipc,
-            )
+            .insert_batch(&format!("vala.bifrost.{table_name}"), ipc)
             .await
             .expect("the described batch is accepted by the real wire");
         srv.flush_bifrost()
@@ -1169,8 +1176,39 @@ mod pg_tests {
         .expect("read Scribe file-list rows");
         conn.commit().await.expect("commit tenant-scoped read");
         assert_eq!(
-            row_count, 1,
+            row_count, 2,
             "the description-built batch reached the durable read boundary"
+        );
+
+        // The uncorrelated row is stored under the authenticated principal with
+        // no Card, which is exactly what optional correlation has to mean.
+        let mut stream = query
+            .query(&BifrostQueryRequest {
+                sql: format!(
+                    "SELECT id, card_uid, principal_id \
+                     FROM vala.bifrost.{table_name} ORDER BY id"
+                ),
+                visibility: VisibilityMode::PublishedOnly,
+                freshness: FreshnessPolicy::Strict,
+                deadline_ms: None,
+            })
+            .await
+            .expect("Oracle reads the stored correlation columns");
+        let mut correlation = Vec::new();
+        while let Some(batch) = stream.next_batch().await.expect("valid terminal stream") {
+            let card_uid = batch.column_by_name("card_uid").expect("card_uid column");
+            let principal_id = batch
+                .column_by_name("principal_id")
+                .expect("principal_id column");
+            for row in 0..batch.num_rows() {
+                correlation.push((card_uid.is_null(row), principal_id.is_null(row)));
+            }
+        }
+        assert_eq!(
+            correlation,
+            vec![(false, false), (true, false)],
+            "the correlated row keeps its card_uid; the uncorrelated row stores \
+             a null card_uid and still carries its authenticated principal"
         );
         srv.shutdown().await.expect("server shutdown");
     }
@@ -1219,13 +1257,8 @@ mod pg_tests {
         let transport = BifrostGrpcTransport::connect(&client)
             .await
             .expect("connect public SDK transport");
-        let batch_id = uuid::Uuid::now_v7().into_bytes();
         transport
-            .insert_batch(
-                &format!("vala.bifrost.{table_name}"),
-                batch_id,
-                native_ipc(),
-            )
+            .insert_batch(&format!("vala.bifrost.{table_name}"), native_ipc())
             .await
             .expect("durable batch ACK");
 

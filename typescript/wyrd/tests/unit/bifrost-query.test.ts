@@ -6,6 +6,9 @@ import {
   BifrostQueryStream,
   IncompleteQueryStreamError,
   WyrdError,
+  type GenAiPage,
+  type TableDescription,
+  type TraceDetail,
 } from "@wyrd/sdk";
 
 const REQUEST_ID = "01890f28-7c4a-7cc3-98e7-4f4a3c2d1bff";
@@ -219,9 +222,8 @@ describe("BifrostClient", () => {
       },
     };
     const client = new BifrostClient(native as never);
-    const batchId = new Uint8Array([1, 2, 3]);
     const ipc = new Uint8Array([4, 5]);
-    const ack = await client.insertBatch("vala.bifrost.events", batchId, ipc);
+    const ack = await client.insertBatch("vala.bifrost.events", ipc);
     expect(Array.from(ack.batchId)).toEqual([1, 2, 3]);
     expect(requests).toHaveLength(1);
     expect((requests[0] as unknown[])[0]).toBe("vala.bifrost.events");
@@ -243,7 +245,7 @@ describe("BifrostClient", () => {
     };
     const client = new BifrostClient(native as never);
     await expect(
-      client.insertBatch("vala.bifrost.events", new Uint8Array(16), new Uint8Array()),
+      client.insertBatch("vala.bifrost.events", new Uint8Array()),
     ).rejects.toMatchObject({
       code: "WYRD_PERMISSION_403_DENIED_RBAC",
       status: 403,
@@ -448,7 +450,7 @@ describe("BifrostQueryClient typed reads", () => {
 
     const description = await client.describeTable("vala.traces", "spans");
     expect(description.canonical_physical_fingerprint).toBe("a".repeat(64));
-    expect(description.user_fields[0].metadata["PARQUET:field_id"]).toBe("1");
+    expect(description.user_fields[0].metadata?.["PARQUET:field_id"]).toBe("1");
 
     const schema = await client.writableSchema(description);
     expect(schema.fields.map((field) => field.name)).toEqual(["trace_id"]);
@@ -458,9 +460,7 @@ describe("BifrostQueryClient typed reads", () => {
       since: "2026-07-01T00:00:00Z",
     });
     expect(trace.trace.spans).toHaveLength(1);
-    expect(
-      (trace.trace.spans[0] as { events: unknown[] }).events,
-    ).toHaveLength(1);
+    expect(trace.trace.spans[0].events).toHaveLength(1);
     expect(trace.trace).not.toHaveProperty("events");
     expect(calls[2]).toEqual([
       "getTrace",
@@ -477,5 +477,99 @@ describe("BifrostQueryClient typed reads", () => {
     expect(generations.rows[0]).not.toHaveProperty("output_messages");
     expect(generations.rows[0]).not.toHaveProperty("cost_usd");
     expect(calls[3][1]).toMatchObject({ model: "gpt-4o", limit: 10 });
+  });
+});
+
+describe("bifrost public typing", () => {
+  it("reaches recursive fields, nested events and links, and page tokens without casts", () => {
+    // Compile-only fixture: `tsc --noEmit` fails here if any position below
+    // collapses back to `unknown` or a `Record<string, unknown>`.
+    const description: TableDescription = {
+      entry: {
+        namespace: "vala.traces",
+        name: "spans",
+        table_uid: "01J0",
+        status: "Active",
+        fingerprint: "fp",
+        registered_at: "2026-07-01T00:00:00Z",
+        updated_at: "2026-07-01T00:00:00Z",
+      },
+      user_fields: [
+        {
+          name: "attributes",
+          data_type: {
+            List: {
+              name: "item",
+              data_type: { Struct: [{ name: "inner", data_type: "Utf8", nullable: true }] },
+              nullable: false,
+            },
+          },
+          nullable: true,
+          metadata: { "PARQUET:field_id": "7" },
+        },
+      ],
+      correlation_fields: [],
+      managed_candidates: [],
+      canonical_physical_fingerprint: "canonical-fp",
+      physical_layout: {
+        partition_granularity: "Hour",
+        sort_keys: [{ column: "trace_id", direction: "Ascending", null_order: "Last" }],
+        bloom_columns: ["trace_id"],
+      },
+    };
+    const nested = description.user_fields[0].data_type;
+    const item = typeof nested === "string" || !("List" in nested) ? undefined : nested.List;
+    const struct = item === undefined || typeof item.data_type === "string" ? undefined : item.data_type;
+
+    const detail: TraceDetail = {
+      trace: {
+        trace_id: "0102",
+        spans: [
+          {
+            span_id: "aabb",
+            trace_state: "",
+            flags: 1,
+            name: "chat",
+            kind: 3,
+            start_time_unix_nano: 1,
+            end_time_unix_nano: 2,
+            duration_nano: 1,
+            dropped_attributes_count: 0,
+            events: [
+              { time_unix_nano: 1, name: "retry", attributes: { attempt: 1 }, dropped_attributes_count: 0 },
+            ],
+            dropped_events_count: 0,
+            links: [
+              {
+                linked_trace_id: "0304",
+                linked_span_id: "ccdd",
+                trace_state: "",
+                flags: 0,
+                dropped_attributes_count: 0,
+              },
+            ],
+            dropped_links_count: 0,
+            resource_dropped_attributes_count: 0,
+            resource_schema_url: "",
+            scope_name: "wyrd",
+            scope_version: "1",
+            scope_dropped_attributes_count: 0,
+            scope_schema_url: "",
+          },
+        ],
+      },
+    };
+    const page: GenAiPage = {
+      rows: [{ start_time_unix_nano: 1, model: "claude", input_messages: [{ role: "user" }] }],
+      next_page_token: "cursor",
+    };
+
+    expect(struct !== undefined && "Struct" in struct ? struct.Struct[0].name : undefined).toBe("inner");
+    expect(description.physical_layout.sort_keys[0].column).toBe("trace_id");
+    expect(description.canonical_physical_fingerprint).toBe("canonical-fp");
+    expect(detail.trace.spans[0].events?.[0].name).toBe("retry");
+    expect(detail.trace.spans[0].links?.[0].linked_span_id).toBe("ccdd");
+    expect(page.rows[0].model).toBe("claude");
+    expect(page.next_page_token).toBe("cursor");
   });
 });

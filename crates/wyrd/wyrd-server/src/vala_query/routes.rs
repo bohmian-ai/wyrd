@@ -27,11 +27,11 @@ use chrono::{DateTime, Utc};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{
     AgentTraceRow, DriftRow, EvalRow, GenAiRow, GetTraceRequest, GetTraceResponse, LogRow,
-    MAX_QUERY_PAGE_SIZE, MetricRow, QueryAgentTracesRequest, QueryAgentTracesResponse,
-    QueryDriftRequest, QueryDriftResponse, QueryEvalRequest, QueryEvalResponse, QueryGenAiRequest,
-    QueryGenAiResponse, QueryLogsRequest, QueryLogsResponse, QueryMetricsRequest,
-    QueryMetricsResponse, QueryRecentTracesRequest, QueryRecentTracesResponse, QueryTracesRequest,
-    QueryTracesResponse, SpanEventRow, SpanLinkRow, SpanRow, TraceSummaryRow, TraceWaterfall,
+    MetricRow, QueryAgentTracesRequest, QueryAgentTracesResponse, QueryDriftRequest,
+    QueryDriftResponse, QueryEvalRequest, QueryEvalResponse, QueryGenAiRequest, QueryGenAiResponse,
+    QueryLogsRequest, QueryLogsResponse, QueryMetricsRequest, QueryMetricsResponse,
+    QueryRecentTracesRequest, QueryRecentTracesResponse, QueryTracesRequest, QueryTracesResponse,
+    SpanEventRow, SpanLinkRow, SpanRow, TraceSummaryRow, TraceWaterfall,
 };
 
 use crate::AppState;
@@ -692,40 +692,48 @@ pub(crate) fn extract_metric_rows(batches: &[RecordBatch]) -> Vec<MetricRow> {
     rows
 }
 
-pub(crate) fn extract_log_rows(batches: &[RecordBatch]) -> Vec<LogRow> {
+/// Extract public log rows from the canonical `vala.logs.records` columns.
+///
+/// The ledger stores the observed timestamp as `observed_time_unix_nano`
+/// (`Int64`), the severity as `Int32`, and the body as a pinned `AnyValue`, so
+/// every cell is read at its declared canonical name and type instead of being
+/// defaulted away by a failed lookup. Payload gating shows up as column absence:
+/// a metadata-only projection has no `body` column and the field stays `None`.
+///
+/// # Errors
+///
+/// Returns [`WyrdError::Internal`] when a stored body cannot be decoded into the
+/// public JSON contract.
+pub(crate) fn extract_log_rows(batches: &[RecordBatch]) -> Result<Vec<LogRow>, WyrdError> {
     let mut rows = Vec::new();
     for batch in batches {
-        let ts_col = col_ts(batch, "observed_time");
-        // Severity numbers are stored as Int64 because Iceberg has no unsigned
-        // integer type.
-        let sev_num_col = col_i64(batch, "severity_number");
+        let batch = &narrow_byte_layouts(batch)?;
+        let ts_col = col_i64(batch, "observed_time_unix_nano");
+        let sev_num_col = col_i32(batch, "severity_number");
         let sev_txt_col = col_str(batch, "severity_text");
         let trace_col = col_fixed_binary(batch, "trace_id");
-        let span_col = batch
-            .column_by_name("span_id")
-            .and_then(|c| c.as_any().downcast_ref::<FixedSizeBinaryArray>());
+        let span_col = col_fixed_binary(batch, "span_id");
         let evt_col = col_str(batch, "event_name");
-        let body_col = col_str(batch, "body");
+        let body_col = col_binary(batch, "body");
 
         for i in 0..batch.num_rows() {
             rows.push(LogRow {
-                timestamp: ts_col
-                    .filter(|a| !a.is_null(i))
-                    .map(|a| ts_us_to_dt(a.value(i)))
-                    .unwrap_or_default(),
+                timestamp: DateTime::from_timestamp_nanos(req_i64(ts_col, i)),
                 severity_number: sev_num_col
                     .filter(|a| !a.is_null(i))
-                    .map(|a| a.value(i) as i32)
-                    .unwrap_or(0),
-                severity_text: get_str(sev_txt_col, i).unwrap_or("").to_owned(),
+                    .map(|a| a.value(i))
+                    .unwrap_or_default(),
+                severity_text: req_str(sev_txt_col, i),
                 trace_id: get_hex(trace_col, i),
                 span_id: get_hex(span_col, i),
-                event_name: get_str(evt_col, i).map(|s| s.to_owned()),
-                body: get_str(body_col, i).map(|s| s.to_owned()),
+                event_name: get_str(evt_col, i).map(ToOwned::to_owned),
+                body: get_binary(body_col, i)
+                    .map(payload::body_to_json)
+                    .transpose()?,
             });
         }
     }
-    rows
+    Ok(rows)
 }
 
 pub(crate) fn extract_agent_trace_rows(batches: &[RecordBatch]) -> Vec<AgentTraceRow> {
@@ -816,7 +824,7 @@ async fn get_trace(
     let plan = build_get_trace_plan(&state, &caller, &req)
         .await
         .map_err(WyrdErrorResponse::from)?;
-    let (batches, _) = run_typed_query(&state, &caller, plan, MAX_QUERY_PAGE_SIZE)
+    let (batches, _) = run_typed_query(&state, &caller, plan, None)
         .await
         .map_err(WyrdErrorResponse::from)?;
 
@@ -873,7 +881,7 @@ async fn query_traces(
     let plan = build_query_traces_plan(&state, &caller, &req)
         .await
         .map_err(WyrdErrorResponse::from)?;
-    let (batches, has_more) = run_typed_query(&state, &caller, plan, limit)
+    let (batches, has_more) = run_typed_query(&state, &caller, plan, Some(limit))
         .await
         .map_err(WyrdErrorResponse::from)?;
 
@@ -921,7 +929,7 @@ async fn query_recent_traces(
     let plan = build_query_recent_traces_plan(&state, &caller, &req)
         .await
         .map_err(WyrdErrorResponse::from)?;
-    let (batches, has_more) = run_typed_query(&state, &caller, plan, limit)
+    let (batches, has_more) = run_typed_query(&state, &caller, plan, Some(limit))
         .await
         .map_err(WyrdErrorResponse::from)?;
 
@@ -966,7 +974,7 @@ async fn query_genai(
     let plan = build_query_genai_plan(&state, &caller, &req)
         .await
         .map_err(WyrdErrorResponse::from)?;
-    let (batches, has_more) = run_typed_query(&state, &caller, plan, limit)
+    let (batches, has_more) = run_typed_query(&state, &caller, plan, Some(limit))
         .await
         .map_err(WyrdErrorResponse::from)?;
 
@@ -1007,7 +1015,7 @@ async fn query_eval(
     let plan = build_query_eval_plan(&state, &caller, &req)
         .await
         .map_err(WyrdErrorResponse::from)?;
-    let (batches, has_more) = run_typed_query(&state, &caller, plan, limit)
+    let (batches, has_more) = run_typed_query(&state, &caller, plan, Some(limit))
         .await
         .map_err(WyrdErrorResponse::from)?;
 
@@ -1048,7 +1056,7 @@ async fn query_drift(
     let plan = build_query_drift_plan(&state, &caller, &req)
         .await
         .map_err(WyrdErrorResponse::from)?;
-    let (batches, has_more) = run_typed_query(&state, &caller, plan, limit)
+    let (batches, has_more) = run_typed_query(&state, &caller, plan, Some(limit))
         .await
         .map_err(WyrdErrorResponse::from)?;
 
@@ -1095,7 +1103,7 @@ async fn query_metrics(
     let plan = build_query_metrics_plan(&state, &caller, &req)
         .await
         .map_err(WyrdErrorResponse::from)?;
-    let (batches, has_more) = run_typed_query(&state, &caller, plan, limit)
+    let (batches, has_more) = run_typed_query(&state, &caller, plan, Some(limit))
         .await
         .map_err(WyrdErrorResponse::from)?;
 
@@ -1133,11 +1141,11 @@ async fn query_logs(
     let plan = build_query_logs_plan(&state, &caller, &req)
         .await
         .map_err(WyrdErrorResponse::from)?;
-    let (batches, has_more) = run_typed_query(&state, &caller, plan, limit)
+    let (batches, has_more) = run_typed_query(&state, &caller, plan, Some(limit))
         .await
         .map_err(WyrdErrorResponse::from)?;
 
-    let rows = extract_log_rows(&batches);
+    let rows = extract_log_rows(&batches).map_err(WyrdErrorResponse::from)?;
     let next_page_token = maybe_issue_token(has_more, &state, &caller, "query_logs", qhash);
     Ok(Json(QueryLogsResponse {
         rows,
@@ -1181,7 +1189,7 @@ async fn query_agent_traces(
     let plan = build_query_agent_traces_plan(&state, &caller, &req)
         .await
         .map_err(WyrdErrorResponse::from)?;
-    let (batches, has_more) = run_typed_query(&state, &caller, plan, limit)
+    let (batches, has_more) = run_typed_query(&state, &caller, plan, Some(limit))
         .await
         .map_err(WyrdErrorResponse::from)?;
 
@@ -1191,4 +1199,51 @@ async fn query_agent_traces(
         rows,
         next_page_token,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The trace-detail bounds a first-class SDK emits survive Axum's
+    /// form-style query decoding.
+    ///
+    /// `vala_sdk::QueryClient::get_trace` formats UTC bounds with the canonical
+    /// `Z` suffix precisely so this decode holds: a raw `+00:00` offset would
+    /// arrive here with its `+` already read as a space and fail to parse.
+    #[test]
+    fn utc_trace_bounds_survive_query_deserialization() {
+        let uri: axum::http::Uri = "/v1/traces/0102030405060708090a0b0c0d0e0f10\
+             ?since=2026-07-01T00:00:00.000000000Z&until=2026-07-02T00:00:00.000000000Z"
+            .parse()
+            .expect("the emitted request target is a valid URI");
+        let Query(bounds) =
+            Query::<TraceDetailBounds>::try_from_uri(&uri).expect("emitted UTC bounds deserialize");
+
+        assert_eq!(
+            bounds.since,
+            Some(
+                "2026-07-01T00:00:00Z"
+                    .parse()
+                    .expect("a fixed bound parses")
+            )
+        );
+        assert_eq!(
+            bounds.until,
+            Some(
+                "2026-07-02T00:00:00Z"
+                    .parse()
+                    .expect("a fixed bound parses")
+            )
+        );
+
+        let plus_uri: axum::http::Uri = "/v1/traces/0102030405060708090a0b0c0d0e0f10\
+             ?since=2026-07-01T00:00:00+00:00"
+            .parse()
+            .expect("the unescaped target is still a valid URI");
+        assert!(
+            Query::<TraceDetailBounds>::try_from_uri(&plus_uri).is_err(),
+            "a raw `+` offset is decoded as a space and is not a valid bound"
+        );
+    }
 }

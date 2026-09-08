@@ -421,11 +421,7 @@ async fn ingest_marked(
 ) -> Result<(), JourneyError> {
     BifrostGrpcTransport::connect(client)
         .await?
-        .insert_batch(
-            table,
-            uuid::Uuid::now_v7().into_bytes(),
-            ipc_marked(id, filter_key),
-        )
+        .insert_batch(table, ipc_marked(id, filter_key))
         .await?;
     Ok(())
 }

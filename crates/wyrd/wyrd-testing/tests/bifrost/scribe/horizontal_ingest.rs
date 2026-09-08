@@ -377,7 +377,11 @@ async fn append_values(client: &WyrdClient, table: &str, batch_id: uuid::Uuid, v
     vala_sdk::grpc::BifrostGrpcTransport::connect(client)
         .await
         .expect("public ingest transport connects")
-        .insert_batch(table, batch_id.into_bytes(), encode_ipc(&batch))
+        .send_frame(vala_sdk::BifrostFrame {
+            table: table.to_owned(),
+            batch_id: batch_id.into_bytes(),
+            arrow_ipc: encode_ipc(&batch).into(),
+        })
         .await
         .unwrap_or_else(|error| panic!("append to `{table}` must be acknowledged: {error:?}"));
 }

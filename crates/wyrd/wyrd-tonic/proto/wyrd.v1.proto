@@ -317,7 +317,7 @@ message GenAiRow {
 message EvalRow   { string eval_id = 1; string run_id = 2; string metric = 3; double score = 4; string started_at = 5; }
 message DriftRow  { string feature = 1; string run_id = 2; double drift_score = 3; double threshold = 4; string computed_at = 5; }
 message MetricRow { string metric_name = 1; string metric_type = 2; double value = 3; string timestamp = 4; string attributes_json = 5; }
-message LogRow    { string timestamp = 1; int32 severity_number = 2; string severity_text = 3; string trace_id = 4; string span_id = 5; string event_name = 6; string body = 7; }
+message LogRow    { string timestamp = 1; int32 severity_number = 2; string severity_text = 3; string trace_id = 4; string span_id = 5; string event_name = 6; optional string body_json = 7; }
 message AgentTraceRow { string dev_session_id = 1; string repo = 2; string commit_sha = 3; string branch = 4; string run_id = 5; string started_at = 6; string payload_json = 7; }
 
 message GetTraceResponse         { TraceWaterfall trace = 1; }

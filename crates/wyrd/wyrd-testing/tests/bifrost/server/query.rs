@@ -387,11 +387,7 @@ async fn prove_shared_query_surfaces() -> Result<(), ServerJourneyError> {
     let transport = vala_sdk::BifrostGrpcTransport::connect(&writer).await?;
     for value in FIXTURE_VALUES {
         transport
-            .insert_batch(
-                &format!("vala.bifrost.{table}"),
-                uuid::Uuid::now_v7().into_bytes(),
-                ipc_value(value),
-            )
+            .insert_batch(&format!("vala.bifrost.{table}"), ipc_value(value))
             .await?;
     }
     server.flush_bifrost().await?;
@@ -655,11 +651,7 @@ async fn prove_scheduled_analytical_peer_loss() -> Result<(), ServerJourneyError
     for _ in 0..2 {
         for value in FIXTURE_VALUES {
             transport
-                .insert_batch(
-                    &format!("vala.bifrost.{table}"),
-                    uuid::Uuid::now_v7().into_bytes(),
-                    ipc_value(value),
-                )
+                .insert_batch(&format!("vala.bifrost.{table}"), ipc_value(value))
                 .await?;
         }
         ingest.flush_bifrost().await?;

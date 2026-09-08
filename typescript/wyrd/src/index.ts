@@ -30,16 +30,56 @@ export interface BifrostInsertAck {
 }
 
 /**
+ * One column's logical type: a scalar variant name, or a single-key object for
+ * a parameterized form. `List` and `Struct` carry full field declarations,
+ * which is what makes the contract recursive.
+ */
+export type DataTypeSpec =
+  | string
+  | { readonly FixedSizeBinary: Readonly<Record<string, number>> }
+  | { readonly Timestamp: Readonly<Record<string, string | null>> }
+  | { readonly Time32: Readonly<Record<string, string>> }
+  | { readonly Time64: Readonly<Record<string, string>> }
+  | { readonly Decimal128: Readonly<Record<string, number>> }
+  | { readonly List: FieldDescription }
+  | { readonly Struct: readonly FieldDescription[] };
+
+/**
  * One column declaration in a table description, exactly as stored.
  *
  * `metadata` carries the Arrow field metadata the physical schema holds,
- * including the stable `PARQUET:field_id`.
+ * including the stable `PARQUET:field_id`. The server omits it when empty.
  */
 export interface FieldDescription {
   readonly name: string;
-  readonly data_type: unknown;
+  readonly data_type: DataTypeSpec;
   readonly nullable: boolean;
-  readonly metadata: Readonly<Record<string, string>>;
+  readonly metadata?: Readonly<Record<string, string>>;
+}
+
+/** The lightweight table identity shared by the list and describe routes. */
+export interface TableEntry {
+  readonly namespace: string;
+  readonly name: string;
+  readonly table_uid: string;
+  readonly status: string;
+  readonly fingerprint: string;
+  readonly registered_at: string;
+  readonly updated_at: string;
+}
+
+/** One resolved sort key of a table's physical layout. */
+export interface SortKey {
+  readonly column: string;
+  readonly direction: string;
+  readonly null_order: string;
+}
+
+/** A table's server-resolved partitioning, sort order, and Bloom columns. */
+export interface PhysicalLayout {
+  readonly partition_granularity: string;
+  readonly sort_keys: readonly SortKey[];
+  readonly bloom_columns: readonly string[];
 }
 
 /**
@@ -50,25 +90,103 @@ export interface FieldDescription {
  * for a canonical signal table.
  */
 export interface TableDescription {
-  readonly entry: Readonly<Record<string, unknown>>;
+  readonly entry: TableEntry;
   readonly user_fields: readonly FieldDescription[];
   readonly correlation_fields: readonly FieldDescription[];
   readonly managed_candidates: readonly FieldDescription[];
   readonly canonical_physical_fingerprint?: string;
-  readonly physical_layout: Readonly<Record<string, unknown>>;
+  readonly physical_layout: PhysicalLayout;
 }
 
-/** One complete authorized cut of a trace; children nest on their own span. */
+/**
+ * One event nested on its owning span, in producer order.
+ *
+ * `attributes` is producer-defined JSON, and the server omits it entirely
+ * without `bifrost_trace_payload:read`.
+ */
+export interface SpanEvent {
+  readonly time_unix_nano: number;
+  readonly name: string;
+  readonly attributes?: unknown;
+  readonly dropped_attributes_count: number;
+}
+
+/** One link nested on its owning span, in producer order. */
+export interface SpanLink {
+  readonly linked_trace_id: string;
+  readonly linked_span_id: string;
+  readonly trace_state: string;
+  readonly flags: number;
+  readonly attributes?: unknown;
+  readonly dropped_attributes_count: number;
+}
+
+/**
+ * One complete span, carrying its own events and links.
+ *
+ * Every optional member is either genuinely absent on the record or
+ * payload-gated: without `bifrost_trace_payload:read` the server omits it from
+ * the wire rather than returning it empty.
+ */
+export interface Span {
+  readonly span_id: string;
+  readonly parent_span_id?: string;
+  readonly trace_state: string;
+  readonly flags: number;
+  readonly name: string;
+  readonly kind: number;
+  readonly start_time_unix_nano: number;
+  readonly end_time_unix_nano: number;
+  readonly duration_nano: number;
+  readonly status_code?: number;
+  readonly status_message?: string;
+  readonly attributes?: unknown;
+  readonly dropped_attributes_count: number;
+  readonly events?: readonly SpanEvent[];
+  readonly dropped_events_count: number;
+  readonly links?: readonly SpanLink[];
+  readonly dropped_links_count: number;
+  readonly service_name?: string;
+  readonly resource_attributes?: unknown;
+  readonly resource_dropped_attributes_count: number;
+  readonly resource_schema_url: string;
+  readonly scope_name: string;
+  readonly scope_version: string;
+  readonly scope_attributes?: unknown;
+  readonly scope_dropped_attributes_count: number;
+  readonly scope_schema_url: string;
+}
+
+/** One complete authorized cut of a trace, as returned by `getTrace`. */
 export interface TraceDetail {
   readonly trace: {
     readonly trace_id: string;
-    readonly spans: readonly Readonly<Record<string, unknown>>[];
+    readonly spans: readonly Span[];
   };
+}
+
+/**
+ * One GenAI generation read from the canonical span table.
+ *
+ * Each promoted scalar is absent when its source attribute was; the two message
+ * payloads are additionally gated on `bifrost_genai_payload:read`. They stay
+ * `unknown` because a message list is producer-defined JSON, not a fixed wire
+ * shape.
+ */
+export interface GenAiRow {
+  readonly conversation_id?: string;
+  readonly model?: string;
+  readonly provider?: string;
+  readonly start_time_unix_nano: number;
+  readonly input_tokens?: number;
+  readonly output_tokens?: number;
+  readonly input_messages?: unknown;
+  readonly output_messages?: unknown;
 }
 
 /** One page of GenAI generation records. */
 export interface GenAiPage {
-  readonly rows: readonly Readonly<Record<string, unknown>>[];
+  readonly rows: readonly GenAiRow[];
   readonly next_page_token?: string;
 }
 
@@ -466,14 +584,9 @@ export class BifrostClient {
     return lifecycleValue<GenAiPage>(await this.#native.queryGenai(request));
   }
 
-  async insertBatch(
-    table: string,
-    batchId: Uint8Array,
-    ipc: Uint8Array,
-  ): Promise<BifrostInsertAck> {
+  async insertBatch(table: string, ipc: Uint8Array): Promise<BifrostInsertAck> {
     const result: NativeInsertResult = await this.#native.insertBatch(
       table,
-      Buffer.from(batchId),
       Buffer.from(ipc),
     );
     const error = projectedError(result);

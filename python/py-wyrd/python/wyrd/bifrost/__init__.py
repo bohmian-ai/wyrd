@@ -216,18 +216,13 @@ class BifrostQueryClient:
             request["provider"] = provider
         return await asyncio.to_thread(self._native.query_genai, json.dumps(request))
 
-    async def insert_batch(
-        self,
-        table: str,
-        batch_id: uuid.UUID,
-        batch: pyarrow.RecordBatch,
-    ) -> uuid.UUID:
-        """Send one Arrow batch built on a described schema, returning its acked identity.
+    async def insert_batch(self, table: str, batch: pyarrow.RecordBatch) -> uuid.UUID:
+        """Send one Arrow batch built on a described schema, returning its durable identity.
 
         The batch travels as written — this is not the buffered JSON row path
-        and rebuilds no schema. The returned identity is the server's echo of
-        the caller's own batch id, so a retry of the same bytes stays one
-        durable batch.
+        and rebuilds no schema. The transport mints the batch identity and
+        retries that one identity itself, so the caller neither supplies nor
+        reconciles it.
         """
 
         sink = pyarrow.BufferOutputStream()
@@ -236,35 +231,212 @@ class BifrostQueryClient:
         acked = await asyncio.to_thread(
             self._native.insert_batch,
             table,
-            batch_id.bytes,
             sink.getvalue().to_pybytes(),
         )
-        acked = uuid.UUID(bytes=bytes(acked))
-        if acked != batch_id:
-            raise BifrostQueryError(f"bifrost acked batch {acked} for submitted batch {batch_id}")
-        return acked
+        return uuid.UUID(bytes=bytes(acked))
 
 
-class TableDescription(TypedDict):
+class DataTypeSpecVariants(TypedDict, total=False):
+    """The parameterized `DataTypeSpec` forms, tagged by their variant name.
+
+    A scalar type is the bare variant name as a string; everything below carries
+    parameters, so it arrives as a single-key object. `List` and `Struct` hold
+    full field declarations, which is what makes the type recursive.
+    """
+
+    FixedSizeBinary: dict[str, int]
+    Timestamp: dict[str, str | None]
+    Time32: dict[str, str]
+    Time64: dict[str, str]
+    Decimal128: dict[str, int]
+    List: FieldSpec
+    Struct: list[FieldSpec]
+
+
+DataTypeSpec = str | DataTypeSpecVariants
+"""One column's logical type: a scalar variant name or a parameterized form."""
+
+
+class _FieldSpecOptional(TypedDict, total=False):
+    """The described-column keys the server omits when they carry nothing.
+
+    `metadata` holds the stable field id under `PARQUET:field_id` and, for a
+    write-time correlation input, `wyrd:input_class`; an empty map is omitted.
+    """
+
+    metadata: dict[str, str]
+
+
+class FieldSpec(_FieldSpecOptional):
+    """One described column, carrying its own identity metadata."""
+
+    name: str
+    data_type: DataTypeSpec
+    nullable: bool
+
+
+class TableEntry(TypedDict):
+    """The lightweight table identity shared by the list and describe routes."""
+
+    namespace: str
+    name: str
+    table_uid: str
+    status: str
+    fingerprint: str
+    registered_at: str
+    updated_at: str
+
+
+class SortKey(TypedDict):
+    """One resolved sort key of a table's physical layout."""
+
+    column: str
+    direction: str
+    null_order: str
+
+
+class PhysicalLayout(TypedDict):
+    """A table's server-resolved partitioning, sort order, and Bloom columns."""
+
+    partition_granularity: str
+    sort_keys: list[SortKey]
+    bloom_columns: list[str]
+
+
+class _TableDescriptionOptional(TypedDict, total=False):
+    """The whole-physical-schema identity only a canonical built-in publishes."""
+
+    canonical_physical_fingerprint: str
+
+
+class TableDescription(_TableDescriptionOptional):
     """Server projection of one registered table's stored physical schema."""
 
-    entry: dict[str, Any]
-    user_fields: list[dict[str, Any]]
-    correlation_fields: list[dict[str, Any]]
-    managed_candidates: list[dict[str, Any]]
-    physical_layout: dict[str, Any]
+    entry: TableEntry
+    user_fields: list[FieldSpec]
+    correlation_fields: list[FieldSpec]
+    managed_candidates: list[FieldSpec]
+    physical_layout: PhysicalLayout
+
+
+class _SpanEventOptional(TypedDict, total=False):
+    """The event payload omitted without `bifrost_trace_payload:read`."""
+
+    attributes: Any
+
+
+class SpanEvent(_SpanEventOptional):
+    """One event nested on its owning span, in producer order."""
+
+    time_unix_nano: int
+    name: str
+    dropped_attributes_count: int
+
+
+class _SpanLinkOptional(TypedDict, total=False):
+    """The link payload omitted without `bifrost_trace_payload:read`."""
+
+    attributes: Any
+
+
+class SpanLink(_SpanLinkOptional):
+    """One link nested on its owning span, in producer order."""
+
+    linked_trace_id: str
+    linked_span_id: str
+    trace_state: str
+    flags: int
+    dropped_attributes_count: int
+
+
+class _SpanOptional(TypedDict, total=False):
+    """The span keys the server omits.
+
+    Each is either genuinely absent on the record or payload-gated: without
+    `bifrost_trace_payload:read` the server omits it from the wire rather than
+    returning it empty.
+    """
+
+    parent_span_id: str
+    status_code: int
+    status_message: str
+    attributes: Any
+    events: list[SpanEvent]
+    links: list[SpanLink]
+    service_name: str
+    resource_attributes: Any
+    scope_attributes: Any
+
+
+class Span(_SpanOptional):
+    """One complete span, carrying its own events and links."""
+
+    span_id: str
+    trace_state: str
+    flags: int
+    name: str
+    kind: int
+    start_time_unix_nano: int
+    end_time_unix_nano: int
+    duration_nano: int
+    dropped_attributes_count: int
+    dropped_events_count: int
+    dropped_links_count: int
+    resource_dropped_attributes_count: int
+    resource_schema_url: str
+    scope_name: str
+    scope_version: str
+    scope_dropped_attributes_count: int
+    scope_schema_url: str
+
+
+class TraceWaterfall(TypedDict):
+    """Every authorized span of one trace, flat, each carrying its own events and links."""
+
+    trace_id: str
+    spans: list[Span]
 
 
 class TraceDetail(TypedDict):
-    """One complete authorized cut of a trace; children nest on their span."""
+    """One complete authorized cut of a trace, as returned by `get_trace`."""
 
-    trace: dict[str, Any]
+    trace: TraceWaterfall
 
 
-class GenAiPage(TypedDict):
+class _GenAiRowOptional(TypedDict, total=False):
+    """The generation keys the server omits.
+
+    Each promoted scalar is absent when its source attribute was; the two
+    message payloads are additionally gated on `bifrost_genai_payload:read`.
+    They stay `Any` because a message list is producer-defined JSON, not a
+    fixed wire shape.
+    """
+
+    conversation_id: str
+    model: str
+    provider: str
+    input_tokens: int
+    output_tokens: int
+    input_messages: Any
+    output_messages: Any
+
+
+class GenAiRow(_GenAiRowOptional):
+    """One GenAI generation read from the canonical span table."""
+
+    start_time_unix_nano: int
+
+
+class _GenAiPageOptional(TypedDict, total=False):
+    """The continuation token, absent on the last page."""
+
+    next_page_token: str
+
+
+class GenAiPage(_GenAiPageOptional):
     """One page of GenAI generation records."""
 
-    rows: list[dict[str, Any]]
+    rows: list[GenAiRow]
 
 
 class RunningQueryProgress(TypedDict):
@@ -299,10 +471,21 @@ __all__ = [
     "BifrostQueryError",
     "BifrostQueryStream",
     "CancelRunningQueryResult",
+    "DataTypeSpec",
+    "DataTypeSpecVariants",
+    "FieldSpec",
     "GenAiPage",
+    "GenAiRow",
     "IncompleteQueryStreamError",
+    "PhysicalLayout",
     "RunningQuery",
     "RunningQueryProgress",
+    "SortKey",
+    "Span",
+    "SpanEvent",
+    "SpanLink",
     "TableDescription",
+    "TableEntry",
     "TraceDetail",
+    "TraceWaterfall",
 ]

@@ -1126,7 +1126,7 @@ impl WyrdTestServer {
         BifrostGrpcTransport::connect(&client)
             .await
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?
-            .insert_batch(table, Uuid::now_v7().into_bytes(), ipc)
+            .insert_batch(table, ipc)
             .await
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
         self.flush_bifrost().await?;

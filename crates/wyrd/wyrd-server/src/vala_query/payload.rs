@@ -113,6 +113,25 @@ pub(crate) fn attributes_to_json(bytes: &[u8]) -> Result<serde_json::Value, Wyrd
     key_value_list_to_json(&list, ByteRule::Tagged)
 }
 
+/// Decode one stored canonical log body into its public JSON form.
+///
+/// The body column stores a single pinned `AnyValue`, so every protocol shape —
+/// scalar, null, array, or key/value list — is preserved as its JSON
+/// counterpart. A stored byte string keeps the lossless tagged
+/// [`ByteRule::Tagged`] envelope the attribute columns use, because a log body
+/// is authorized payload the caller asked for rather than the plain-JSON GenAI
+/// message contract.
+///
+/// # Errors
+///
+/// Returns [`WyrdError::Internal`] when the stored bytes are not an `AnyValue`
+/// or carry a value with no JSON form.
+pub(crate) fn body_to_json(bytes: &[u8]) -> Result<serde_json::Value, WyrdError> {
+    let value =
+        AnyValue::decode(bytes).map_err(|_| corrupt("a stored log body is not decodable"))?;
+    any_value_to_json(&value, ByteRule::Tagged)
+}
+
 /// Look one canonical attribute up by key and project it as structured JSON.
 ///
 /// Returns `None` when the key is absent. The final occurrence wins, matching

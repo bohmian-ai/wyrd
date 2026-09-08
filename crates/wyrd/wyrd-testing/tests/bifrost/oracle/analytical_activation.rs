@@ -86,11 +86,7 @@ async fn ingest_row(
 ) -> Result<(), JourneyError> {
     BifrostGrpcTransport::connect(client)
         .await?
-        .insert_batch(
-            table,
-            uuid::Uuid::now_v7().into_bytes(),
-            ipc_row(id, filter_key),
-        )
+        .insert_batch(table, ipc_row(id, filter_key))
         .await?;
     Ok(())
 }

@@ -19,7 +19,7 @@
       ]
     },
     "correlation_fields": {
-      "description": "The correlation inputs a writer supplies alongside its user fields.\n\nExactly non-null `card_ref: Utf8` — a Gate input tagged [`INPUT_CLASS_KEY`]`=`[`INPUT_CLASS_GATE_CORRELATION`] that resolves to the stored `card_uid` and therefore carries no field id — followed by nullable `run_id: Utf8` with the field id its physical column holds.",
+      "description": "The correlation inputs a writer supplies alongside its user fields.\n\nExactly nullable `card_ref: Utf8` — a Gate input tagged [`INPUT_CLASS_KEY`]`=`[`INPUT_CLASS_GATE_CORRELATION`] that resolves to the stored `card_uid` and therefore carries no field id — followed by nullable `run_id: Utf8` with the field id its physical column holds.\n\nCard correlation is optional, so a writer may omit `card_ref` entirely; the server then stores the row with its authenticated `principal_id` and a null `card_uid`.",
       "type": "array",
       "items": {
         "$ref": "#/definitions/FieldSpec"

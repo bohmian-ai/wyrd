@@ -17,7 +17,7 @@ use secrecy::SecretString;
 use wyrd_client::WyrdClient;
 use wyrd_client::auth::AuthMiddleware;
 use wyrd_client::config::ClientConfig;
-use wyrd_client::transport::{HttpConfig, HttpTransport, ResolvedCredential};
+use wyrd_client::transport::{HttpTransport, ResolvedCredential};
 use wyrd_queue::QueueConfig;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
@@ -193,6 +193,12 @@ pub struct PyBifrostQueryClient {
 impl PyBifrostQueryClient {
     /// Constructs a token-authenticated query client without performing IO.
     ///
+    /// `server_url` selects the HTTP plane explicitly. Everything else — the
+    /// gRPC endpoint a canonical Arrow insert writes to included — comes from
+    /// [`ClientConfig::from_env`], the same owner the Python write handle uses,
+    /// so `WYRD_GRPC_URL` reaches a split-plane or remote deployment instead of
+    /// silently staying on the default localhost port.
+    ///
     /// # Errors
     ///
     /// Raises `ValueError` when the server URL is empty or transport
@@ -206,13 +212,8 @@ impl PyBifrostQueryClient {
         if token.is_empty() {
             return Err(PyValueError::new_err("token must not be empty"));
         }
-        let config = ClientConfig {
-            http: HttpConfig {
-                base_url: server_url.trim_end_matches('/').to_owned(),
-                ..HttpConfig::default()
-            },
-            ..ClientConfig::default()
-        };
+        let mut config = ClientConfig::from_env();
+        config.http.base_url = server_url.trim_end_matches('/').to_owned();
         let auth = AuthMiddleware::new(
             &config,
             ResolvedCredential::BearerToken(SecretString::from(token.to_owned())),
@@ -418,42 +419,34 @@ impl PyBifrostQueryClient {
     /// This is the direct canonical write path: the caller already built a
     /// batch on the described physical schema, so the bytes travel as-is rather
     /// than through the buffered JSON row API, which would rebuild a schema of
-    /// its own. Batch identity is the caller's, so a retry of the same bytes
-    /// stays one durable batch.
+    /// its own. The transport mints the durable batch identity and returns it,
+    /// so no caller has to construct a `UUIDv7`.
     ///
     /// # Errors
     ///
-    /// Raises `ValueError` when `batch_id` is not exactly 16 bytes, and a typed
-    /// Bifrost query error when the transport cannot connect or the server
-    /// rejects the frame.
-    #[pyo3(signature = (table, batch_id, arrow_ipc))]
-    fn insert_batch(
-        &self,
-        py: Python<'_>,
-        table: &str,
-        batch_id: &[u8],
-        arrow_ipc: Vec<u8>,
-    ) -> PyResult<Vec<u8>> {
-        let batch_id = <[u8; 16]>::try_from(batch_id)
-            .map_err(|_| PyValueError::new_err("bifrost batch_id must contain exactly 16 bytes"))?;
-        py.detach(|| {
-            wyrd_runtime::runtime().block_on(async {
-                let transport = BifrostGrpcTransport::connect(&self.transport_client)
-                    .await
-                    .map_err(|_| {
-                        ValaSdkError::Transport(WyrdError::ServiceUnavailable {
-                            message: "Bifrost ingest transport is unavailable".to_owned(),
-                            details: serde_json::json!({"transport": "grpc"}),
-                        })
-                    })?;
-                transport
-                    .insert_batch(table, batch_id, arrow_ipc)
-                    .await
-                    .map_err(ValaSdkError::Transport)
+    /// Raises a typed Bifrost query error when the transport cannot connect or
+    /// the server rejects the frame.
+    #[pyo3(signature = (table, arrow_ipc))]
+    fn insert_batch(&self, py: Python<'_>, table: &str, arrow_ipc: Vec<u8>) -> PyResult<Vec<u8>> {
+        let batch_id = py
+            .detach(|| {
+                wyrd_runtime::runtime().block_on(async {
+                    let transport = BifrostGrpcTransport::connect(&self.transport_client)
+                        .await
+                        .map_err(|_| {
+                            ValaSdkError::Transport(WyrdError::ServiceUnavailable {
+                                message: "Bifrost ingest transport is unavailable".to_owned(),
+                                details: serde_json::json!({"transport": "grpc"}),
+                            })
+                        })?;
+                    transport
+                        .insert_batch(table, arrow_ipc)
+                        .await
+                        .map_err(ValaSdkError::Transport)
+                })
             })
-        })
-        .map_err(query_error_to_py)?;
-        Ok(batch_id.to_vec())
+            .map_err(query_error_to_py)?;
+        Ok(batch_id.into_bytes().to_vec())
     }
 }
 

@@ -1,20 +1,20 @@
 ---
 name: wyrd-complete
-description: Finalize an approved Wyrd change by writing one compact completed record and removing its active specification and task packet. Automatically invoked by wyrd-change-review after APPROVE; do not use before final review approval.
+description: Finalize a passed Wyrd change by writing one compact completed record and removing its active specification and task packet. Automatically invoked by wyrd-change-review after PASS.
 ---
 
 # Wyrd Complete
 
-Own the bounded write transition from an approved active change packet to one
+Own the bounded write transition from a passed active change packet to one
 durable completed record. This skill is normally invoked automatically by
 `$wyrd-change-review`; developers should not need to remember a separate step.
 
-## Require approved completion authority
+## Require completion authority
 
-Require the `APPROVE` output from the immediately preceding final change review,
+Require the `PASS` output from the immediately preceding final change review,
 including reviewed base and target commits, the complete
-`changes/active/<slug>` packet, task-review closure, requirement-to-evidence
-matrix, completion payload, and delivery context when available.
+`changes/active/<slug>` packet, task-review closure, acceptance matrix,
+completion payload, and delivery context when available.
 
 Read `AGENTS.md`, [agent rules](../../../architecture/agent-rules.md), and
 [spec-driven development](../../../architecture/references/languages/spec-driven-development.md).
@@ -23,11 +23,12 @@ completion worktree's `HEAD` equals the reviewed target. Require the exact
 active packet to match that target before writing. Do not reinterpret the spec
 or repeat final review.
 
-Stop with `BLOCKED` if the review did not return `APPROVE`, the reviewed target
+Stop with `BLOCKED` if the review did not return `PASS`, the reviewed target
 changed, the active packet is incomplete, the completion payload lacks credible
-evidence, or lasting behavior is missing from or contradicts its current
-architecture authority. Missing product or architecture documentation is
-remediation through `$wyrd-plan`, not cleanup work.
+evidence, or lasting behavior is missing from or contradicts current
+architecture authority. Missing required architecture or product documentation
+is a `MISSING` implementation finding requiring a review-produced remediation
+task, not completion cleanup.
 
 Derive `<slug>` from the single reviewed directory entry under
 `changes/active/`, not from unchecked caller text. Accept only a lowercase
@@ -48,11 +49,11 @@ Markdown containing:
 4. lasting invariants and constraints;
 5. material decisions and rationale;
 6. approved spec revisions and material deviations;
-7. compact requirement-to-evidence closure; and
+7. compact acceptance-to-evidence closure; and
 8. links to current architecture, contracts, code owners, and tests.
 
 The record is historical context, not a replacement for current architecture.
-Do not retain task checklists, RED/GREEN mechanics, review conversation, command
+Do not retain task checklists, Red-Green mechanics, review conversation, command
 transcripts, agent metadata, branch scheduling, or worktree state. Do not create
 an ADR for every change; link a focused existing or newly approved decision
 record only when the change contains an architecturally significant decision.
@@ -61,7 +62,7 @@ Never overwrite an existing completed record blindly. When both the completed
 record and active packet exist, resume only after proving that the record
 represents the same reviewed target and completion payload; otherwise return
 `BLOCKED`. When the active packet is already absent and the record matches the
-approved change, return an idempotent `COMPLETE` without writing.
+passed change, return an idempotent `COMPLETE` without writing.
 
 ## Retire the active packet
 

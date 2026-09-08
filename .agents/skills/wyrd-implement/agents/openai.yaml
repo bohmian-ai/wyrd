@@ -1,4 +1,4 @@
 interface:
   display_name: "Wyrd Implement"
-  short_description: "Implement one Wyrd task with TDD"
-  default_prompt: "Use $wyrd-implement to implement this ready Wyrd task through Red-Green-Refactor cycles and focused verification."
+  short_description: "Implement and prove one Wyrd task"
+  default_prompt: "Use $wyrd-implement to make the smallest change satisfying this Wyrd task or remediation task and verify its acceptance criteria."

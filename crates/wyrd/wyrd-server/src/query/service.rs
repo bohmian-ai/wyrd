@@ -327,7 +327,13 @@ pub async fn cancel_running_query(
 }
 
 /// Executes one already-lowered typed plan through retained Oracle and collects
-/// no more than the typed route's `limit + 1` pagination window.
+/// its rows under the caller's pagination policy.
+///
+/// `Some(limit)` is the paginated policy: at most `limit + 1` rows are retained
+/// so the route can report `has_more`. `None` is the complete-result policy used
+/// by routes that have no continuation token; every decoded row is retained and
+/// the result stays bounded only by the encoded-byte ceiling and the sync query
+/// timeout, so the caller can never observe a silently truncated success.
 ///
 /// # Errors
 ///
@@ -337,7 +343,7 @@ pub async fn run_typed_query(
     state: &AppState,
     caller: &Caller,
     plan: datafusion::logical_expr::LogicalPlan,
-    limit: u32,
+    limit: Option<u32>,
 ) -> Result<(Vec<RecordBatch>, bool), WyrdError> {
     let context = oracle_context(caller)?;
     let deadline = Instant::now()
@@ -358,10 +364,14 @@ pub async fn run_typed_query(
     collect_bounded(stream, limit).await
 }
 
-/// Collects one Oracle stream under the typed pagination row and byte ceilings.
+/// Collects one Oracle stream under the caller's row policy and the byte
+/// ceiling.
 ///
-/// The collector requires exactly one terminal, rejects failed/incomplete
-/// streams, and retains at most `limit + 1` rows before producing `has_more`.
+/// The collector requires exactly one terminal and rejects failed/incomplete
+/// streams. With `Some(limit)` it retains at most `limit + 1` rows before
+/// producing `has_more`; with `None` it retains every row and always reports
+/// `has_more = false`, leaving the encoded-byte ceiling and the Oracle deadline
+/// as the only bounds.
 ///
 /// # Errors
 ///
@@ -369,11 +379,13 @@ pub async fn run_typed_query(
 /// logical frame contract or configured bounds are violated.
 async fn collect_bounded(
     mut stream: OracleQueryStream,
-    limit: u32,
+    limit: Option<u32>,
 ) -> Result<(Vec<RecordBatch>, bool), WyrdError> {
-    let row_ceiling = usize::try_from(limit)
-        .unwrap_or(usize::MAX)
-        .saturating_add(1);
+    let row_ceiling = limit.map_or(usize::MAX, |limit| {
+        usize::try_from(limit)
+            .unwrap_or(usize::MAX)
+            .saturating_add(1)
+    });
     let mut batches = Vec::new();
     let mut rows = 0_usize;
     let mut encoded_bytes = 0_usize;
@@ -461,6 +473,9 @@ async fn collect_bounded(
         stream.cancel().await;
         return Err(wyrd_spec::vala::error::BifrostError::QueryStreamIncomplete.into());
     }
+    let Some(limit) = limit else {
+        return Ok((batches, false));
+    };
     let limit = usize::try_from(limit).unwrap_or(usize::MAX);
     let has_more = rows > limit;
     Ok((truncate_batches(batches, limit), has_more))
@@ -771,7 +786,7 @@ mod tests {
                 )
             };
 
-            let (batches, has_more) = collect_bounded(stream(frames(eos.clone())), 100)
+            let (batches, has_more) = collect_bounded(stream(frames(eos.clone())), Some(100))
                 .await
                 .expect("split stream collects");
             assert_eq!(
@@ -782,7 +797,7 @@ mod tests {
             assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 5);
             assert!(!has_more);
 
-            let (bounded, has_more) = collect_bounded(stream(frames(eos)), 2)
+            let (bounded, has_more) = collect_bounded(stream(frames(eos.clone())), Some(2))
                 .await
                 .expect("bounded collection still consumes the whole stream");
             assert_eq!(
@@ -792,8 +807,21 @@ mod tests {
             );
             assert!(has_more);
 
+            let (complete, has_more) = collect_bounded(stream(frames(eos)), None)
+                .await
+                .expect("the complete-result policy collects");
+            assert_eq!(
+                complete.iter().map(RecordBatch::num_rows).sum::<usize>(),
+                5,
+                "a `None` limit retains every row instead of truncating"
+            );
             assert!(
-                collect_bounded(stream(frames(Vec::new())), 100)
+                !has_more,
+                "a complete result never reports a continuation it cannot serve"
+            );
+
+            assert!(
+                collect_bounded(stream(frames(Vec::new())), Some(100))
                     .await
                     .is_err(),
                 "a successful terminal without its end-of-stream is refused"
@@ -863,7 +891,7 @@ mod tests {
                     cancellation.clone(),
                 );
                 assert!(
-                    collect_bounded(stream, 100).await.is_err(),
+                    collect_bounded(stream, Some(100)).await.is_err(),
                     "{name} must fail"
                 );
                 assert!(cancellation.is_cancelled(), "{name} must cancel cleanup");

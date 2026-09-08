@@ -7,7 +7,7 @@
 //! `query::service::run_typed_query` seam the HTTP routes use.
 
 use chrono::DateTime;
-use wyrd_spec::vala::api::{MAX_QUERY_PAGE_SIZE, QueryWindow};
+use wyrd_spec::vala::api::QueryWindow;
 use wyrd_tonic::tonic::{Request, Response, Status};
 use wyrd_tonic::wyrd::v1::vala_query_service_server::{ValaQueryService, ValaQueryServiceServer};
 use wyrd_tonic::wyrd::v1::{
@@ -75,28 +75,43 @@ async fn caller_from_metadata(
 
 // ─── proto→api converters ─────────────────────────────────────────────────────
 
-fn proto_window(w: proto::QueryWindow) -> QueryWindow {
-    QueryWindow {
-        since: DateTime::parse_from_rfc3339(&w.since)
-            .ok()
-            .map(|dt| dt.with_timezone(&chrono::Utc)),
-        until: DateTime::parse_from_rfc3339(&w.until)
-            .ok()
-            .map(|dt| dt.with_timezone(&chrono::Utc)),
+/// Convert one protobuf query window into its API form.
+///
+/// # Errors
+///
+/// Returns `invalid_argument` when either bound is non-empty and not RFC3339,
+/// propagated from [`proto_timestamp`].
+fn proto_window(w: proto::QueryWindow) -> Result<QueryWindow, Status> {
+    Ok(QueryWindow {
+        since: proto_timestamp(&w.since)?,
+        until: proto_timestamp(&w.until)?,
         limit: if w.limit == 0 { None } else { Some(w.limit) },
         page_token: if w.page_token.is_empty() {
             None
         } else {
             Some(w.page_token)
         },
-    }
+    })
 }
 
 /// Parse one RFC3339 protobuf timestamp field; an empty string means unbounded.
-fn proto_timestamp(value: &str) -> Option<DateTime<chrono::Utc>> {
+///
+/// This is the sole parser for every protobuf bound, so malformed text is
+/// refused before planning instead of silently collapsing into an unbounded
+/// scan that would return unrelated rows and disagree with the HTTP surface.
+///
+/// # Errors
+///
+/// Returns `invalid_argument` when `value` is non-empty and not RFC3339.
+fn proto_timestamp(value: &str) -> Result<Option<DateTime<chrono::Utc>>, Status> {
+    if value.is_empty() {
+        return Ok(None);
+    }
     DateTime::parse_from_rfc3339(value)
-        .ok()
-        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .map(|dt| Some(dt.with_timezone(&chrono::Utc)))
+        .map_err(|error| {
+            Status::invalid_argument(format!("`{value}` is not an RFC3339 timestamp: {error}"))
+        })
 }
 
 fn opt_str(s: String) -> Option<String> {
@@ -240,7 +255,7 @@ fn log_row_to_proto(r: wyrd_spec::vala::api::LogRow) -> proto::LogRow {
         trace_id: r.trace_id.unwrap_or_default(),
         span_id: r.span_id.unwrap_or_default(),
         event_name: r.event_name.unwrap_or_default(),
-        body: r.body.unwrap_or_default(),
+        body_json: opt_json(r.body),
     }
 }
 
@@ -314,13 +329,13 @@ impl ValaQueryService for ValaQueryGrpc {
         let p = request.into_inner();
         let api_req = wyrd_spec::vala::api::GetTraceRequest {
             trace_id: p.trace_id,
-            since: proto_timestamp(&p.since),
-            until: proto_timestamp(&p.until),
+            since: proto_timestamp(&p.since)?,
+            until: proto_timestamp(&p.until)?,
         };
         let plan = build_get_trace_plan(&self.state, &caller, &api_req)
             .await
             .map_err(status_from_wyrd)?;
-        let (batches, _) = run_typed_query(&self.state, &caller, plan, MAX_QUERY_PAGE_SIZE)
+        let (batches, _) = run_typed_query(&self.state, &caller, plan, None)
             .await
             .map_err(status_from_wyrd)?;
 
@@ -347,7 +362,7 @@ impl ValaQueryService for ValaQueryGrpc {
         let caller = caller_from_metadata(&self.state, request.metadata()).await?;
         let p = request.into_inner();
         let api_req = wyrd_spec::vala::api::QueryTracesRequest {
-            window: proto_window(p.window.unwrap_or_default()),
+            window: proto_window(p.window.unwrap_or_default())?,
             service: opt_str(p.service),
             min_duration_ms: opt_u32(p.min_duration_ms),
             status: opt_str(p.status),
@@ -377,7 +392,7 @@ impl ValaQueryService for ValaQueryGrpc {
         let plan = build_query_traces_plan(&self.state, &caller, &api_req)
             .await
             .map_err(status_from_wyrd)?;
-        let (batches, has_more) = run_typed_query(&self.state, &caller, plan, limit)
+        let (batches, has_more) = run_typed_query(&self.state, &caller, plan, Some(limit))
             .await
             .map_err(status_from_wyrd)?;
 
@@ -402,7 +417,7 @@ impl ValaQueryService for ValaQueryGrpc {
         let caller = caller_from_metadata(&self.state, request.metadata()).await?;
         let p = request.into_inner();
         let api_req = wyrd_spec::vala::api::QueryRecentTracesRequest {
-            window: proto_window(p.window.unwrap_or_default()),
+            window: proto_window(p.window.unwrap_or_default())?,
             service: opt_str(p.service),
             status: opt_str(p.status),
             min_duration_ms: opt_u32(p.min_duration_ms),
@@ -430,7 +445,7 @@ impl ValaQueryService for ValaQueryGrpc {
         let plan = build_query_recent_traces_plan(&self.state, &caller, &api_req)
             .await
             .map_err(status_from_wyrd)?;
-        let (batches, has_more) = run_typed_query(&self.state, &caller, plan, limit)
+        let (batches, has_more) = run_typed_query(&self.state, &caller, plan, Some(limit))
             .await
             .map_err(status_from_wyrd)?;
 
@@ -456,7 +471,7 @@ impl ValaQueryService for ValaQueryGrpc {
         let caller = caller_from_metadata(&self.state, request.metadata()).await?;
         let p = request.into_inner();
         let api_req = wyrd_spec::vala::api::QueryGenAiRequest {
-            window: proto_window(p.window.unwrap_or_default()),
+            window: proto_window(p.window.unwrap_or_default())?,
             conversation_id: opt_str(p.conversation_id),
             model: opt_str(p.model),
             provider: opt_str(p.provider),
@@ -478,7 +493,7 @@ impl ValaQueryService for ValaQueryGrpc {
         let plan = build_query_genai_plan(&self.state, &caller, &api_req)
             .await
             .map_err(status_from_wyrd)?;
-        let (batches, has_more) = run_typed_query(&self.state, &caller, plan, limit)
+        let (batches, has_more) = run_typed_query(&self.state, &caller, plan, Some(limit))
             .await
             .map_err(status_from_wyrd)?;
 
@@ -504,7 +519,7 @@ impl ValaQueryService for ValaQueryGrpc {
         let caller = caller_from_metadata(&self.state, request.metadata()).await?;
         let p = request.into_inner();
         let api_req = wyrd_spec::vala::api::QueryEvalRequest {
-            window: proto_window(p.window.unwrap_or_default()),
+            window: proto_window(p.window.unwrap_or_default())?,
             eval_id: opt_str(p.eval_id),
             run_id: opt_str(p.run_id),
         };
@@ -524,7 +539,7 @@ impl ValaQueryService for ValaQueryGrpc {
         let plan = build_query_eval_plan(&self.state, &caller, &api_req)
             .await
             .map_err(status_from_wyrd)?;
-        let (batches, has_more) = run_typed_query(&self.state, &caller, plan, limit)
+        let (batches, has_more) = run_typed_query(&self.state, &caller, plan, Some(limit))
             .await
             .map_err(status_from_wyrd)?;
 
@@ -549,7 +564,7 @@ impl ValaQueryService for ValaQueryGrpc {
         let caller = caller_from_metadata(&self.state, request.metadata()).await?;
         let p = request.into_inner();
         let api_req = wyrd_spec::vala::api::QueryDriftRequest {
-            window: proto_window(p.window.unwrap_or_default()),
+            window: proto_window(p.window.unwrap_or_default())?,
             feature: opt_str(p.feature),
             run_id: opt_str(p.run_id),
         };
@@ -569,7 +584,7 @@ impl ValaQueryService for ValaQueryGrpc {
         let plan = build_query_drift_plan(&self.state, &caller, &api_req)
             .await
             .map_err(status_from_wyrd)?;
-        let (batches, has_more) = run_typed_query(&self.state, &caller, plan, limit)
+        let (batches, has_more) = run_typed_query(&self.state, &caller, plan, Some(limit))
             .await
             .map_err(status_from_wyrd)?;
 
@@ -594,7 +609,7 @@ impl ValaQueryService for ValaQueryGrpc {
         let caller = caller_from_metadata(&self.state, request.metadata()).await?;
         let p = request.into_inner();
         let api_req = wyrd_spec::vala::api::QueryMetricsRequest {
-            window: proto_window(p.window.unwrap_or_default()),
+            window: proto_window(p.window.unwrap_or_default())?,
             metric_name: opt_str(p.metric_name),
             metric_type: opt_str(p.metric_type),
         };
@@ -621,7 +636,7 @@ impl ValaQueryService for ValaQueryGrpc {
         let plan = build_query_metrics_plan(&self.state, &caller, &api_req)
             .await
             .map_err(status_from_wyrd)?;
-        let (batches, has_more) = run_typed_query(&self.state, &caller, plan, limit)
+        let (batches, has_more) = run_typed_query(&self.state, &caller, plan, Some(limit))
             .await
             .map_err(status_from_wyrd)?;
 
@@ -646,7 +661,7 @@ impl ValaQueryService for ValaQueryGrpc {
         let caller = caller_from_metadata(&self.state, request.metadata()).await?;
         let p = request.into_inner();
         let api_req = wyrd_spec::vala::api::QueryLogsRequest {
-            window: proto_window(p.window.unwrap_or_default()),
+            window: proto_window(p.window.unwrap_or_default())?,
             severity_number_min: opt_i32(p.severity_number_min),
             trace_id: opt_str(p.trace_id),
             event_name: opt_str(p.event_name),
@@ -664,11 +679,12 @@ impl ValaQueryService for ValaQueryGrpc {
         let plan = build_query_logs_plan(&self.state, &caller, &api_req)
             .await
             .map_err(status_from_wyrd)?;
-        let (batches, has_more) = run_typed_query(&self.state, &caller, plan, limit)
+        let (batches, has_more) = run_typed_query(&self.state, &caller, plan, Some(limit))
             .await
             .map_err(status_from_wyrd)?;
 
         let rows: Vec<proto::LogRow> = extract_log_rows(&batches)
+            .map_err(status_from_wyrd)?
             .into_iter()
             .map(log_row_to_proto)
             .collect();
@@ -689,7 +705,7 @@ impl ValaQueryService for ValaQueryGrpc {
         let caller = caller_from_metadata(&self.state, request.metadata()).await?;
         let p = request.into_inner();
         let api_req = wyrd_spec::vala::api::QueryAgentTracesRequest {
-            window: proto_window(p.window.unwrap_or_default()),
+            window: proto_window(p.window.unwrap_or_default())?,
             dev_session_id: opt_str(p.dev_session_id),
             repo: opt_str(p.repo),
             commit_sha: opt_str(p.commit_sha),
@@ -720,7 +736,7 @@ impl ValaQueryService for ValaQueryGrpc {
         let plan = build_query_agent_traces_plan(&self.state, &caller, &api_req)
             .await
             .map_err(status_from_wyrd)?;
-        let (batches, has_more) = run_typed_query(&self.state, &caller, plan, limit)
+        let (batches, has_more) = run_typed_query(&self.state, &caller, plan, Some(limit))
             .await
             .map_err(status_from_wyrd)?;
 
@@ -734,5 +750,47 @@ impl ValaQueryService for ValaQueryGrpc {
             rows,
             next_page_token,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every protobuf bound is parsed by one fallible owner.
+    ///
+    /// An empty field stays unbounded, a valid field normalizes to UTC, and
+    /// malformed non-empty text is refused with `invalid_argument` before any
+    /// plan is built — so a typed gRPC query can never silently widen into an
+    /// unbounded scan the caller did not ask for.
+    #[test]
+    fn protobuf_bounds_reject_malformed_text_and_keep_empty_unbounded() {
+        assert_eq!(
+            proto_timestamp("").expect("an empty bound is unbounded"),
+            None
+        );
+        assert_eq!(
+            proto_timestamp("2026-07-01T00:00:00Z").expect("a valid bound parses"),
+            Some(
+                "2026-07-01T00:00:00Z"
+                    .parse()
+                    .expect("a fixed bound parses")
+            )
+        );
+        for malformed in ["not-a-time", "2026-07-01", "2026-07-01T00:00:00"] {
+            let status = proto_timestamp(malformed).expect_err("malformed text is refused");
+            assert_eq!(
+                status.code(),
+                wyrd_tonic::tonic::Code::InvalidArgument,
+                "`{malformed}` is refused as an invalid argument"
+            );
+        }
+
+        let status = proto_window(proto::QueryWindow {
+            since: "not-a-time".to_owned(),
+            ..proto::QueryWindow::default()
+        })
+        .expect_err("a window carrying a malformed bound is refused");
+        assert_eq!(status.code(), wyrd_tonic::tonic::Code::InvalidArgument);
     }
 }

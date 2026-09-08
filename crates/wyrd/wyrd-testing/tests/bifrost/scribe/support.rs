@@ -219,9 +219,12 @@ pub(super) async fn append_batch(
     vala_sdk::grpc::BifrostGrpcTransport::connect(client)
         .await
         .expect("public ingest transport connects")
-        .insert_batch(table, batch_id.into_bytes(), encode_ipc(batch))
+        .send_frame(vala_sdk::BifrostFrame {
+            table: table.to_owned(),
+            batch_id: batch_id.into_bytes(),
+            arrow_ipc: encode_ipc(batch).into(),
+        })
         .await
-        .map(|_| ())
 }
 
 /// Appends one batch whose rows all carry the caller's chosen event time.

@@ -113,7 +113,7 @@ pub async fn seed_query_fixture(
     BifrostGrpcTransport::connect(&client)
         .await
         .map_err(|error| WyrdTestServerError::Start(error.to_string()))?
-        .insert_batch(&table, uuid::Uuid::now_v7().into_bytes(), ipc)
+        .insert_batch(&table, ipc)
         .await
         .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
     server.flush_bifrost().await?;

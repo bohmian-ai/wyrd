@@ -131,24 +131,29 @@ impl BifrostGrpcTransport {
     /// External callers cross [`Self::copy_external_frame`] before the internal
     /// owned-byte path; queue-owned frames use [`IngestTransport`] directly.
     ///
+    /// The batch identity is minted here rather than supplied. It is the
+    /// server's idempotency key, and the only retries that can observe it are
+    /// the ones [`Self::send_owned_bytes`] performs against this single call,
+    /// which already reuse one identity. Returning it lets a caller correlate
+    /// the durable batch without having to mint a `UUIDv7` of its own.
+    ///
     /// # Errors
     ///
     /// Returns transport, validation, or terminal server errors. A retryable
-    /// external call retries its stable identity inside this transport.
-    pub async fn insert_batch(
-        &self,
-        table: &str,
-        batch_id: [u8; 16],
-        arrow_ipc: Vec<u8>,
-    ) -> Result<(), WyrdError> {
-        validate_frame(table, batch_id, arrow_ipc.len())?;
+    /// call retries its stable identity inside this transport.
+    pub async fn insert_batch(&self, table: &str, arrow_ipc: Vec<u8>) -> Result<Uuid, WyrdError> {
+        let batch_id = Uuid::now_v7();
+        validate_frame(table, arrow_ipc.len())?;
         let bytes = self.copy_external_frame(&arrow_ipc)?;
-        self.send_owned_bytes(table, batch_id, bytes).await
+        self.send_owned_bytes(table, batch_id.into_bytes(), bytes)
+            .await?;
+        Ok(batch_id)
     }
 
     /// Sends one sealed batch through the unary ingest RPC.
     pub async fn send_frame(&self, frame: BifrostFrame) -> Result<(), WyrdError> {
-        validate_frame(&frame.table, frame.batch_id, frame.arrow_ipc.len())?;
+        validate_frame(&frame.table, frame.arrow_ipc.len())?;
+        validate_batch_id(frame.batch_id)?;
         self.send_owned_bytes(&frame.table, frame.batch_id, frame.arrow_ipc)
             .await
     }
@@ -263,7 +268,9 @@ impl IngestTransport<ClientByteGuard> for BifrostGrpcTransport {
         &self,
         batch: &SealedBatch<ClientByteGuard>,
     ) -> Result<DurableBatchAck, SinkError> {
-        if let Err(error) = validate_frame(&batch.table, batch.batch_id, batch.bytes().len()) {
+        if let Err(error) = validate_frame(&batch.table, batch.bytes().len())
+            .and_then(|()| validate_batch_id(batch.batch_id))
+        {
             return Err(SinkError::Terminal(error));
         }
         let bytes = Bytes::from_owner(batch.frame.shared_bytes());
@@ -322,7 +329,7 @@ impl AttemptError {
     }
 }
 
-fn validate_frame(table: &str, batch_id: [u8; 16], arrow_bytes: usize) -> Result<(), WyrdError> {
+fn validate_frame(table: &str, arrow_bytes: usize) -> Result<(), WyrdError> {
     if table.is_empty() {
         return Err(WyrdError::Validation {
             message: "bifrost batch table must not be empty".to_owned(),
@@ -339,6 +346,19 @@ fn validate_frame(table: &str, batch_id: [u8; 16], arrow_bytes: usize) -> Result
             }),
         });
     }
+    Ok(())
+}
+
+/// Refuses a queue-owned frame identity that is not a `UUIDv7`.
+///
+/// Only [`GrpcBifrostTransport::send_frame`] needs this: its identity is
+/// supplied by the producer that sealed the frame, while
+/// [`GrpcBifrostTransport::insert_batch`] mints its own and cannot be wrong.
+///
+/// # Errors
+///
+/// Returns [`WyrdError::Validation`] when `batch_id` is not a `UUIDv7`.
+fn validate_batch_id(batch_id: [u8; 16]) -> Result<(), WyrdError> {
     if Uuid::from_bytes(batch_id).get_version() != Some(Version::SortRand) {
         return Err(WyrdError::Validation {
             message: "bifrost batch_id must be UUIDv7".to_owned(),
@@ -465,16 +485,15 @@ mod tests {
 
     #[test]
     fn frame_limit_is_enforced() {
-        let batch_id = Uuid::now_v7().into_bytes();
-        assert!(validate_frame("events", batch_id, MAX_FRAME_BYTES).is_ok());
-        let error = validate_frame("events", batch_id, MAX_FRAME_BYTES + 1)
+        assert!(validate_frame("events", MAX_FRAME_BYTES).is_ok());
+        let error = validate_frame("events", MAX_FRAME_BYTES + 1)
             .expect_err("one byte above the frame limit must fail");
         assert_eq!(error.code(), "WYRD_SPEC_413_PAYLOAD_TOO_LARGE");
     }
 
     #[test]
     fn invalid_batch_id_is_rejected_before_transport() {
-        let error = validate_frame("events", [0; 16], 0).expect_err("non-v7 ID must fail");
+        let error = validate_batch_id([0; 16]).expect_err("non-v7 ID must fail");
         assert_eq!(error.code(), "WYRD_SPEC_400_VALIDATION");
     }
 
@@ -524,16 +543,16 @@ mod tests {
         )
         .await
         .expect("real test gRPC transport connects");
-        let batch_id = Uuid::now_v7().into_bytes();
-        transport
-            .insert_batch("events", batch_id, vec![1, 2, 3])
+        let batch_id = transport
+            .insert_batch("events", vec![1, 2, 3])
             .await
-            .expect("stable busy retries to concrete ACK");
+            .expect("stable busy retries to concrete ACK")
+            .into_bytes();
         let observed = service.batch_ids.lock().await.clone();
         assert_eq!(observed, vec![batch_id.to_vec(), batch_id.to_vec()]);
 
         let terminal = transport
-            .insert_batch("events", Uuid::now_v7().into_bytes(), vec![4])
+            .insert_batch("events", vec![4])
             .await
             .expect_err("permanent capacity terminalizes without retry");
         assert_ne!(terminal.code(), "WYRD_VALA_429_INGEST_BUSY");

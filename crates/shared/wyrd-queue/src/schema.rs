@@ -45,8 +45,8 @@ pub fn arrow_schema_to_fieldspec(schema: &Schema) -> Vec<FieldSpec> {
 /// Every `DataTypeSpec` variant in the register-accepted set maps to exactly the
 /// `arrow::DataType` the server twin `data_type_to_arrow` would produce. A list
 /// element and a struct child are full declarations, so their names,
-/// nullability, and metadata — the stable `PARQUET:field_id` included — are
-/// reproduced rather than synthesized.
+/// nullability are reproduced rather than synthesized. Field metadata is
+/// dropped at every depth: see [`spec_to_field`].
 ///
 /// # Errors
 /// Returns `Ok` for all supported `DataTypeSpec` variants. The function
@@ -252,17 +252,24 @@ fn field_to_spec(field: &Field) -> FieldSpec {
     }
 }
 
-/// Project one wire declaration onto its Arrow field, metadata included.
+/// Project one wire declaration onto its Arrow field, metadata dropped.
 ///
-/// This is the exact inverse of [`field_to_spec`]; the two are the only
-/// conversion between the wire declaration and Arrow, at every depth.
+/// Name, nullability, and the exact type — everything that shapes an Arrow
+/// buffer — are reproduced at every depth. Field metadata is not: a
+/// `PARQUET:field_id` is the server's own physical identity, which it assigns
+/// at registration, re-derives on every stamp, and ignores on an incoming
+/// batch. Emitting it here would put a value on the wire that looks
+/// load-bearing and is not, which is exactly what a client cannot be right or
+/// wrong about. `describe_table` still reports it; a writer does not repeat it.
+///
+/// This is therefore the lossy forward half of [`field_to_spec`], not its
+/// inverse.
 fn spec_to_field(spec: &FieldSpec) -> Field {
     Field::new(
         spec.name.as_str(),
         data_type_to_arrow(&spec.data_type),
         spec.nullable,
     )
-    .with_metadata(spec.metadata.clone().into_iter().collect())
 }
 
 fn dtspec_from_arrow(dt: &DataType) -> DataTypeSpec {
@@ -711,19 +718,21 @@ mod schema_tests {
         assert_eq!(err.code(), "WYRD_VALA_400_SCHEMA_PARSE");
     }
 
-    /// A recursive declaration keeps every child's identity through Arrow.
+    /// A recursive declaration keeps every child's shape and drops its ids.
     ///
     /// The list element is the declaration the description carried — its own
-    /// name, nullability, and stable `PARQUET:field_id` — not a synthesized
-    /// nullable `item`, and a struct child keeps the same. This is what lets a
-    /// client rebuild the exact stored physical schema from a describe
-    /// response.
+    /// name and nullability — not a synthesized nullable `item`, and a struct
+    /// child keeps the same, so a client rebuilds the exact buffer layout the
+    /// server stores. It does not rebuild the server's `PARQUET:field_id`: that
+    /// is physical identity the server assigns and ignores on an incoming
+    /// batch, so no depth of this projection puts it on the wire.
     ///
     /// # Panics
     ///
-    /// Panics when Arrow loses a nested name, nullability, or field id.
+    /// Panics when Arrow loses a nested name or nullability, or when any field
+    /// at any depth carries metadata onto the wire.
     #[test]
-    fn fieldspec_to_arrow_preserves_recursive_field_contract() {
+    fn fieldspec_to_arrow_keeps_recursive_shape_without_field_ids() {
         use std::collections::BTreeMap;
         use wyrd_spec::vala::api::PARQUET_FIELD_ID_KEY;
 
@@ -752,32 +761,48 @@ mod schema_tests {
 
         let arrow = fieldspec_to_arrow(&specs).expect("the declaration maps to Arrow");
         let column = arrow.field(0);
-        assert_eq!(
-            column.metadata().get(PARQUET_FIELD_ID_KEY),
-            Some(&"16".to_owned())
-        );
+        assert!(column.metadata().is_empty(), "a column sends no field id");
         let DataType::List(element) = column.data_type() else {
             panic!("a list declaration must project an Arrow list");
         };
         assert_eq!(element.name(), "event");
         assert!(!element.is_nullable());
-        assert_eq!(
-            element.metadata().get(PARQUET_FIELD_ID_KEY),
-            Some(&"17".to_owned())
+        assert!(
+            element.metadata().is_empty(),
+            "a list element sends no field id"
         );
         let DataType::Struct(children) = element.data_type() else {
             panic!("the list element must project its declared struct");
         };
         assert_eq!(children[0].name(), "name");
-        assert_eq!(
-            children[0].metadata().get(PARQUET_FIELD_ID_KEY),
-            Some(&"19".to_owned())
+        assert!(
+            children[0].metadata().is_empty(),
+            "a struct child sends no field id"
         );
 
+        let round_tripped = arrow_schema_to_fieldspec(&arrow);
         assert_eq!(
-            arrow_schema_to_fieldspec(&arrow),
-            specs,
-            "both directions preserve every nested name, nullability, and field id"
+            round_tripped,
+            specs.iter().map(strip_ids).collect::<Vec<_>>(),
+            "reading the projection back yields the same shape with no ids"
         );
+    }
+
+    /// Clears one declaration's metadata at every depth for comparison.
+    fn strip_ids(spec: &FieldSpec) -> FieldSpec {
+        use std::collections::BTreeMap;
+
+        FieldSpec {
+            name: spec.name.clone(),
+            data_type: match &spec.data_type {
+                DataTypeSpec::List(element) => DataTypeSpec::List(Box::new(strip_ids(element))),
+                DataTypeSpec::Struct(children) => {
+                    DataTypeSpec::Struct(children.iter().map(strip_ids).collect())
+                }
+                other => other.clone(),
+            },
+            nullable: spec.nullable,
+            metadata: BTreeMap::new(),
+        }
     }
 }

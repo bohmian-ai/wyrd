@@ -7,6 +7,7 @@ use std::pin::Pin;
 use arrow::datatypes::SchemaRef;
 use arrow::ipc::reader::StreamReader;
 use arrow::record_batch::RecordBatch;
+use chrono::SecondsFormat;
 use futures_util::{Stream, StreamExt};
 use wyrd_client::WyrdClient;
 use wyrd_spec::error::WyrdError;
@@ -376,16 +377,26 @@ impl QueryClient {
                 "trace detail requires since <= until".to_owned(),
             ));
         }
+        // The bounds go into a raw query string, where form-style decoding
+        // reads `+` as a space. `to_rfc3339_opts(.., true)` emits the canonical
+        // `Z` suffix instead of `+00:00`, so a UTC bound survives the wire
+        // unchanged without any escaping machinery here.
         let mut path = format!("/v1/traces/{}", request.trace_id);
         let mut separator = '?';
         if let Some(since) = request.since {
             path.push(separator);
-            path.push_str(&format!("since={}", since.to_rfc3339()));
+            path.push_str(&format!(
+                "since={}",
+                since.to_rfc3339_opts(SecondsFormat::Nanos, true)
+            ));
             separator = '&';
         }
         if let Some(until) = request.until {
             path.push(separator);
-            path.push_str(&format!("until={}", until.to_rfc3339()));
+            path.push_str(&format!(
+                "until={}",
+                until.to_rfc3339_opts(SecondsFormat::Nanos, true)
+            ));
         }
         self.client
             .request_json::<(), _>(reqwest::Method::GET, &path, None)
@@ -1807,7 +1818,7 @@ mod tests {
                   "metadata": { "PARQUET:field_id": "1" } }
             ],
             "correlation_fields": [
-                { "name": "card_ref", "data_type": "Utf8", "nullable": false,
+                { "name": "card_ref", "data_type": "Utf8", "nullable": true,
                   "metadata": { "wyrd:input_class": "gate_correlation" } },
                 { "name": "run_id", "data_type": "Utf8", "nullable": true,
                   "metadata": { "PARQUET:field_id": "1000" } }
@@ -1848,10 +1859,12 @@ mod tests {
             ["trace_id", "card_ref", "run_id", "wyrd_event_time"],
             "user fields precede correlation inputs, then the managed candidate"
         );
-        assert_eq!(
-            writable.field(3).metadata().get("PARQUET:field_id"),
-            Some(&"1004".to_owned()),
-            "the managed candidate keeps its stable canonical field id"
+        assert!(
+            writable
+                .fields()
+                .iter()
+                .all(|field| field.metadata().is_empty()),
+            "no writable column repeats the server-owned field id back on the wire"
         );
         assert_eq!(
             wyrd_queue::schema::writable_schema(&described, false)
@@ -1873,6 +1886,14 @@ mod tests {
                 .count(),
             1,
             "the write path appends each correlation column exactly once"
+        );
+        assert!(
+            writable.field(1).is_nullable(),
+            "card_ref is nullable: a writer may submit a row with no Card correlation"
+        );
+        assert!(
+            builder.output_schema().field(1).is_nullable(),
+            "the JSON row path carries the same optional correlation contract"
         );
     }
 
@@ -1933,7 +1954,11 @@ mod tests {
                         .parse()
                         .expect("a fixed bound parses"),
                 ),
-                until: None,
+                until: Some(
+                    "2026-07-02T00:00:00Z"
+                        .parse()
+                        .expect("a fixed bound parses"),
+                ),
             })
             .await
             .expect("trace detail returns one complete cut");
@@ -2005,8 +2030,9 @@ mod tests {
 
         assert_eq!(
             seen.lock().expect("recording is readable")[0],
-            "GET /v1/traces/0102030405060708090a0b0c0d0e0f10?since=2026-07-01T00:00:00+00:00 HTTP/1.1",
-            "trace detail carries only its window bounds, never a page token"
+            "GET /v1/traces/0102030405060708090a0b0c0d0e0f10?since=2026-07-01T00:00:00.000000000Z&until=2026-07-02T00:00:00.000000000Z HTTP/1.1",
+            "UTC bounds reach the query string as `Z`, never a raw `+` a form \
+             decoder would read as a space"
         );
         assert_eq!(
             genai_seen.lock().expect("recording is readable")[0],

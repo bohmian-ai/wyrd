@@ -662,6 +662,130 @@ fn canonical_trace_export() -> wyrd_tonic::otlp::trace_service::ExportTraceServi
     }
 }
 
+/// Fixed observed timestamp of the canonical log record, in protocol nanoseconds.
+///
+/// Deliberately distinct from its `time_unix_nano` and carrying sub-microsecond
+/// digits, so a reader that binds the wrong column or a coarser unit is visible.
+const LOG_OBSERVED_NANOS: u64 = 1_800_000_000_246_813_579;
+
+/// Fixed emit timestamp of the canonical log record, in protocol nanoseconds.
+const LOG_TIME_NANOS: u64 = 1_800_000_000_111_111_111;
+
+/// Non-default OTLP severity of the canonical log record (`ERROR`).
+const LOG_SEVERITY_NUMBER: i32 = 17;
+
+/// Build the OTLP logs export payload the canonical read case ingests.
+///
+/// The body is a key/value list holding a nested array and a byte string, so
+/// the served value proves the whole `AnyValue` contract survives rather than
+/// only the string case a `Utf8` reader could carry.
+fn canonical_log_export() -> wyrd_tonic::otlp::logs_service::ExportLogsServiceRequest {
+    use wyrd_tonic::otlp::common::v1::{AnyValue, ArrayValue, KeyValue, KeyValueList, any_value};
+    use wyrd_tonic::otlp::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+    use wyrd_tonic::otlp::logs_service::ExportLogsServiceRequest;
+    use wyrd_tonic::otlp::resource::v1::Resource;
+
+    let body = AnyValue {
+        value: Some(any_value::Value::KvlistValue(KeyValueList {
+            values: vec![
+                otlp_str("message", "canonical body"),
+                KeyValue {
+                    key: "retries".to_owned(),
+                    value: Some(AnyValue {
+                        value: Some(any_value::Value::ArrayValue(ArrayValue {
+                            values: vec![
+                                AnyValue {
+                                    value: Some(any_value::Value::IntValue(1)),
+                                },
+                                AnyValue { value: None },
+                            ],
+                        })),
+                    }),
+                },
+                KeyValue {
+                    key: "raw".to_owned(),
+                    value: Some(AnyValue {
+                        value: Some(any_value::Value::BytesValue(vec![0xde, 0xad])),
+                    }),
+                },
+            ],
+        })),
+    };
+
+    ExportLogsServiceRequest {
+        resource_logs: vec![ResourceLogs {
+            resource: Some(Resource {
+                attributes: vec![otlp_str("service.name", "canonical-read-case")],
+                ..Resource::default()
+            }),
+            scope_logs: vec![ScopeLogs {
+                log_records: vec![LogRecord {
+                    time_unix_nano: LOG_TIME_NANOS,
+                    observed_time_unix_nano: LOG_OBSERVED_NANOS,
+                    severity_number: LOG_SEVERITY_NUMBER,
+                    severity_text: "ERROR".to_owned(),
+                    event_name: "canonical.event".to_owned(),
+                    body: Some(body),
+                    attributes: vec![otlp_str("log.origin", "canonical-read-case")],
+                    trace_id: CANONICAL_TRACE_ID.to_vec(),
+                    span_id: 1_u64.to_be_bytes().to_vec(),
+                    ..LogRecord::default()
+                }],
+                ..ScopeLogs::default()
+            }],
+            ..ResourceLogs::default()
+        }],
+    }
+}
+
+/// Number of spans in the wide trace proving complete detail is not row-capped.
+///
+/// One more than the typed pagination page size, so a collector that applied
+/// that ceiling would silently drop the tail.
+const WIDE_TRACE_SPAN_COUNT: u64 = 1_001;
+
+/// Trace id of the wide trace used to prove trace detail returns every span.
+const WIDE_TRACE_ID: [u8; 16] = [
+    0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f, 0x30,
+];
+
+/// Build one OTLP export carrying [`WIDE_TRACE_SPAN_COUNT`] metadata-only spans.
+///
+/// The spans carry no attribute payload so the export stays far below the
+/// collector's encoded-byte ceiling: the only bound this case exercises is the
+/// row policy.
+fn wide_trace_export() -> wyrd_tonic::otlp::trace_service::ExportTraceServiceRequest {
+    use wyrd_tonic::otlp::resource::v1::Resource;
+    use wyrd_tonic::otlp::trace::v1::{ResourceSpans, ScopeSpans, Span, span};
+    use wyrd_tonic::otlp::trace_service::ExportTraceServiceRequest;
+
+    let spans = (0..WIDE_TRACE_SPAN_COUNT)
+        .map(|index| Span {
+            trace_id: WIDE_TRACE_ID.to_vec(),
+            span_id: (index + 1).to_be_bytes().to_vec(),
+            name: format!("wide-{index}"),
+            kind: span::SpanKind::Internal.into(),
+            start_time_unix_nano: GENERATION_START_NANOS,
+            end_time_unix_nano: GENERATION_END_NANOS,
+            ..Span::default()
+        })
+        .collect();
+
+    ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            resource: Some(Resource {
+                attributes: vec![otlp_str("service.name", "wide-trace-case")],
+                ..Resource::default()
+            }),
+            scope_spans: vec![ScopeSpans {
+                spans,
+                ..ScopeSpans::default()
+            }],
+            ..ResourceSpans::default()
+        }],
+    }
+}
+
 /// Build one caller holding exactly the supplied permissions in `tenant`.
 fn caller_with(
     tenant: wyrd_spec::DataTenantId,
@@ -722,7 +846,9 @@ async fn json_body(response: axum::response::Response, expected: StatusCode) -> 
 #[tokio::test]
 async fn canonical_trace_and_genai_queries_filter_promotions_before_payload_projection() {
     use wyrd_runtime::{Permission, Resource};
-    use wyrd_server::vala_query::service::{build_get_trace_plan, build_query_genai_plan};
+    use wyrd_server::vala_query::service::{
+        build_get_trace_plan, build_query_genai_plan, build_query_logs_plan,
+    };
     use wyrd_spec::vala::api::{GetTraceRequest, QueryGenAiRequest, QueryWindow};
     use wyrd_tonic::prost::Message;
 
@@ -1019,6 +1145,208 @@ async fn canonical_trace_and_genai_queries_filter_promotions_before_payload_proj
             "{gated} must be omitted without BifrostGenAiPayload:Read"
         );
     }
+
+    // ── canonical logs: the whole registry-declared sensitive set is gated ──
+    let log_export = canonical_log_export().encode_to_vec();
+    let log_ingest = server
+        .oneshot_authenticated(
+            admin.jwt().expect("admin carries a token"),
+            Request::builder()
+                .method("POST")
+                .uri("/v1/logs")
+                .header("content-type", "application/x-protobuf")
+                .body(axum::body::Body::from(log_export))
+                .expect("request builds"),
+        )
+        .await
+        .expect("router responds");
+    assert_eq!(
+        log_ingest.status(),
+        StatusCode::OK,
+        "OTLP log export is accepted"
+    );
+    server
+        .flush_bifrost()
+        .await
+        .expect("records become readable");
+
+    let log_request = wyrd_spec::vala::api::QueryLogsRequest {
+        window: QueryWindow::default(),
+        severity_number_min: None,
+        trace_id: None,
+        event_name: None,
+    };
+    let log_payload_caller = caller_with(
+        tenant,
+        [
+            Permission::bifrost_query_read(),
+            Permission {
+                resource: Resource::BifrostLogPayload,
+                action: wyrd_runtime::Action::Read,
+            },
+        ],
+    );
+    let authorized_log_columns = plan_columns(
+        &build_query_logs_plan(server.state(), &log_payload_caller, &log_request)
+            .await
+            .expect("authorized log plan builds"),
+    );
+    let bounded_log_columns = plan_columns(
+        &build_query_logs_plan(server.state(), &bounded_caller, &log_request)
+            .await
+            .expect("bounded log plan builds"),
+    );
+    let declared_sensitive = vala_bifrost_redux::tables::builtin_table("logs", "records")
+        .expect("the log table is a built-in")
+        .sensitive_payload_columns;
+    assert_eq!(
+        declared_sensitive.len(),
+        5,
+        "the registry owns the complete sensitive log set this gate must honor"
+    );
+    for gated in declared_sensitive {
+        assert!(
+            authorized_log_columns.iter().any(|name| name == gated),
+            "authorized log plan must project {gated}"
+        );
+        assert!(
+            !bounded_log_columns.iter().any(|name| name == gated),
+            "bounded log plan must never project {gated}"
+        );
+    }
+    assert!(
+        bounded_log_columns
+            .iter()
+            .any(|name| name == "observed_time_unix_nano"),
+        "bounded log plan still returns record metadata"
+    );
+
+    let authorized_logs = json_body(
+        server
+            .oneshot_authenticated(
+                admin.jwt().expect("admin carries a token"),
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/logs/query")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from("{}"))
+                    .expect("request builds"),
+            )
+            .await
+            .expect("router responds"),
+        StatusCode::OK,
+    )
+    .await;
+    let log_rows = authorized_logs["rows"].as_array().expect("rows array");
+    assert_eq!(log_rows.len(), 1, "the canonical record is served");
+    let expected_timestamp = chrono::DateTime::from_timestamp_nanos(
+        i64::try_from(LOG_OBSERVED_NANOS).expect("the fixture timestamp fits i64"),
+    )
+    .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+    assert_eq!(
+        log_rows[0]["timestamp"].as_str().map(|stamp| {
+            chrono::DateTime::parse_from_rfc3339(stamp)
+                .expect("the served timestamp is RFC3339")
+                .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+        }),
+        Some(expected_timestamp),
+        "the served timestamp is the exact canonical observed nanosecond"
+    );
+    assert_eq!(
+        log_rows[0]["severity_number"], LOG_SEVERITY_NUMBER,
+        "severity is read from its Int32 canonical column, not defaulted"
+    );
+    assert_eq!(log_rows[0]["severity_text"], "ERROR");
+    assert_eq!(log_rows[0]["event_name"], "canonical.event");
+    assert_eq!(log_rows[0]["body"]["message"], "canonical body");
+    assert_eq!(
+        log_rows[0]["body"]["retries"],
+        serde_json::json!([1, null]),
+        "a nested array keeps its order, scalars, and nulls"
+    );
+    assert_eq!(
+        log_rows[0]["body"]["raw"]["bytesValue"], "3q0=",
+        "a byte-bearing body stays lossless in its tagged envelope"
+    );
+
+    let bounded_logs = json_body(
+        server
+            .oneshot_authenticated(
+                metadata_only.jwt().expect("reader carries a token"),
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/logs/query")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from("{}"))
+                    .expect("request builds"),
+            )
+            .await
+            .expect("router responds"),
+        StatusCode::OK,
+    )
+    .await;
+    let bounded_log_rows = bounded_logs["rows"].as_array().expect("rows array");
+    assert_eq!(bounded_log_rows.len(), 1, "log metadata stays visible");
+    assert!(
+        bounded_log_rows[0].get("body").is_none(),
+        "body must be omitted without BifrostLogPayload:Read"
+    );
+    assert_eq!(
+        bounded_log_rows[0]["severity_number"], LOG_SEVERITY_NUMBER,
+        "omitting the payload must not silently change record metadata"
+    );
+
+    // ── complete trace detail is bounded by bytes and time, never by rows ──
+    let wide_ingest = server
+        .oneshot_authenticated(
+            admin.jwt().expect("admin carries a token"),
+            Request::builder()
+                .method("POST")
+                .uri("/v1/traces")
+                .header("content-type", "application/x-protobuf")
+                .body(axum::body::Body::from(wide_trace_export().encode_to_vec()))
+                .expect("request builds"),
+        )
+        .await
+        .expect("router responds");
+    assert_eq!(
+        wide_ingest.status(),
+        StatusCode::OK,
+        "the wide OTLP export is accepted"
+    );
+    server.flush_bifrost().await.expect("spans become readable");
+
+    let wide_hex = WIDE_TRACE_ID
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let wide_trace = json_body(
+        server
+            .oneshot_authenticated(
+                admin.jwt().expect("admin carries a token"),
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/v1/traces/{wide_hex}"))
+                    .body(axum::body::Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("router responds"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(
+        wide_trace["trace"]["spans"]
+            .as_array()
+            .expect("spans array")
+            .len(),
+        usize::try_from(WIDE_TRACE_SPAN_COUNT).expect("the fixture span count fits usize"),
+        "trace detail returns every span; it has no continuation token to offer"
+    );
+    assert!(
+        wide_trace.get("next_page_token").is_none(),
+        "complete trace detail never advertises a continuation"
+    );
 
     server.shutdown().await.expect("server shuts down");
 }

@@ -25,6 +25,7 @@ use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchR
 
 use crate::catalog::layout::PhysicalLayout;
 use crate::contracts::ScribeError;
+use crate::schema::SchemaFingerprint;
 
 /// Stable tie-breakers appended after every layout sort key.
 ///
@@ -224,7 +225,7 @@ impl StagedRunMerge {
             self.cursors[cursor].drained = true;
             return Ok(());
         };
-        if batch.schema_ref().fields() != self.schema.fields() {
+        if !self.is_claim_schema(batch.schema_ref()) {
             return Err(ScribeError::Internal {
                 detail: "staged run changed schema between batches".to_owned(),
             });
@@ -236,26 +237,36 @@ impl StagedRunMerge {
         Ok(())
     }
 
+    /// Reports whether a decoded run carries the claim's physical schema.
+    ///
+    /// The comparison is the same decode-side identity ingress admitted the
+    /// batch under, so a run cannot be refused here for a difference admission
+    /// already deemed irrelevant. `SchemaFingerprint::from_arrow_schema_exact`
+    /// commits field names, order, nullability, and each type's exact variant
+    /// and parameters — everything that changes an Arrow buffer — and excludes
+    /// field metadata, which changes no buffer and whose map iteration order is
+    /// not stable.
+    fn is_claim_schema(&self, schema: &SchemaRef) -> bool {
+        SchemaFingerprint::from_arrow_schema_exact(schema)
+            == SchemaFingerprint::from_arrow_schema_exact(&self.schema)
+    }
+
     /// Opens one run and positions it on its first row.
     ///
     /// A run that decodes no rows is dropped rather than carried as an empty
     /// cursor: the staged writer never seals an empty run, so this only absorbs
     /// a caller passing a run list that outlived its rows.
     ///
-    /// # Errors
-    ///
-    /// The comparison is over fields alone. A claim's schema may arrive
-    /// carrying the writer-v2 key/value envelope a sealed run's footer records,
-    /// while a batch decoded back out of Parquet carries none, and those two
-    /// describe the same physical layout: metadata is publication evidence, not
-    /// column identity. Comparing whole schemas refuses such a run for a
-    /// difference that has no bearing on merging it.
+    /// Schema identity is [`Self::is_claim_schema`], not whole-schema equality:
+    /// metadata is publication evidence, not column identity, and a claim's
+    /// schema may carry the writer-v2 key/value envelope a sealed run's footer
+    /// records while a batch decoded back out of Parquet carries none.
     ///
     /// # Errors
     ///
     /// Returns [`ScribeError::Internal`] when the run cannot be opened or
-    /// decoded, its fields are not the claim's fields, or its sort key cannot
-    /// be encoded.
+    /// decoded, it does not carry the claim's physical schema, or its sort key
+    /// cannot be encoded.
     fn open_cursor(&mut self, run: &Path) -> Result<Option<RunCursor>, ScribeError> {
         let file = std::fs::File::open(run).map_err(|error| ScribeError::Internal {
             detail: format!("open the staged run for merge: {error}"),
@@ -272,7 +283,7 @@ impl StagedRunMerge {
         let Some(batch) = decode_next(&mut reader)? else {
             return Ok(None);
         };
-        if batch.schema_ref().fields() != self.schema.fields() {
+        if !self.is_claim_schema(batch.schema_ref()) {
             return Err(ScribeError::Internal {
                 detail: format!(
                     "staged run `{}` was encoded under a different physical schema: run [{}], claim [{}]",

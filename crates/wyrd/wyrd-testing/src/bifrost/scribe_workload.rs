@@ -1301,7 +1301,11 @@ impl crate::WyrdTestServer {
         vala_sdk::grpc::BifrostGrpcTransport::connect(&client)
             .await
             .map_err(|error| crate::WyrdTestServerError::Start(error.to_string()))?
-            .insert_batch(table_fqn, batch_id.into_bytes(), ipc)
+            .send_frame(vala_sdk::BifrostFrame {
+                table: table_fqn.to_owned(),
+                batch_id: batch_id.into_bytes(),
+                arrow_ipc: ipc.into(),
+            })
             .await
             .map_err(|error| crate::WyrdTestServerError::Start(error.to_string()))?;
         Ok(())

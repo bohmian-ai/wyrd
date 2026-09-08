@@ -512,7 +512,7 @@ async fn append_active_row(client: &wyrd_client::WyrdClient, table: &str) {
     vala_sdk::grpc::BifrostGrpcTransport::connect(client)
         .await
         .expect("public ingest transport")
-        .insert_batch(table, uuid::Uuid::now_v7().into_bytes(), ipc)
+        .insert_batch(table, ipc)
         .await
         .expect("active row append");
 }
@@ -814,7 +814,7 @@ async fn append_correlated(
     vala_sdk::grpc::BifrostGrpcTransport::connect(client)
         .await
         .expect("public ingest transport")
-        .insert_batch(table, uuid::Uuid::now_v7().into_bytes(), ipc)
+        .insert_batch(table, ipc)
         .await
         .map(|_| ())
 }

@@ -564,7 +564,7 @@ fn pruning_exclusions(
 async fn ingest_row(client: &WyrdClient, table: &str, id: i64) -> Result<(), JourneyError> {
     BifrostGrpcTransport::connect(client)
         .await?
-        .insert_batch(table, uuid::Uuid::now_v7().into_bytes(), ipc_row(id))
+        .insert_batch(table, ipc_row(id))
         .await?;
     Ok(())
 }

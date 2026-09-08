@@ -2698,16 +2698,38 @@ redacted
     /// Returns the SQL, catalog, storage, fence, and settlement failures
     /// reconciliation and settlement raise. Each leaves the retained attempt
     /// durable for a later owner.
+    ///
+    /// # Cancellation
+    ///
+    /// A stop signal ends the pass, not the worker. The pass writes nothing
+    /// durable until it has proven an exact operation, so abandoning it — even
+    /// part-way through the retained table observation one operation's await is
+    /// blocked on — loses only work that was never going to be recorded. It
+    /// returns `Ok` so the event loop reaches the handoff branch that leaves
+    /// every still-unresolved attempt Prepared for its successor; propagating
+    /// the cancellation instead would end `run` in an error and skip that
+    /// handoff entirely.
     async fn reconcile_retained_attempts(
         &self,
         pool: &mut ForgeAttemptPool,
         shutdown: &CancellationToken,
     ) -> Result<(), ForgeError> {
         for task_id in pool.retained_task_ids() {
+            if shutdown.is_cancelled() {
+                return Ok(());
+            }
             let Some(state) = pool.attempts.get_mut(&task_id) else {
                 continue;
             };
-            if !self.reconcile_retained_attempt(state).await? {
+            let decided = match self.reconcile_retained_attempt(state).await {
+                Ok(decided) => decided,
+                // The exact-operation reads this pass makes are cancellable, so
+                // a stop taken inside one surfaces here as the loop's own stop
+                // signal rather than as a failure to account for anything.
+                Err(ForgeError::Shutdown) if shutdown.is_cancelled() => return Ok(()),
+                Err(error) => return Err(error),
+            };
+            if !decided {
                 continue;
             }
             // The reducer runs once, after this attempt's pass completed, and

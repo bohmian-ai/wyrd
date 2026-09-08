@@ -2723,10 +2723,11 @@ fn assert_handoff_snapshot(supervisor: &SupervisedPromotion, handoffs_before: us
 ///
 /// Returns this tenant's small-files retry accounting, the terminal rewrite
 /// audit count for the retained operations, the catalog submission count, and
-/// the planning demand. The siblings refused before retention are still
-/// settling rows of their own, so every field is sampled twice and accepted
-/// only when nothing moved between the samples: a baseline read mid-settlement
-/// would blame shutdown for a write that was already in flight.
+/// the planning demand. Callers read it with the worker held inside one exact
+/// reconciliation await, and every field is still sampled twice and accepted
+/// only when nothing moved between the samples: a plan or sibling settlement
+/// that was already in flight when the hold took effect would otherwise be
+/// blamed on the stop that follows.
 ///
 /// # Panics
 ///
@@ -2798,6 +2799,34 @@ async fn await_reconciliation_pass_gap(catalog: &PromotionCatalogSeam, after: us
     .expect("a retained owner's reconciliation passes are separated by a quiet window")
 }
 
+/// Measures reconciliation passes until two consecutive ones agree.
+///
+/// Returns the seam's load count at the gap that closes the last measured pass
+/// and the number of loads that pass issued. Agreement is what the caller
+/// needs and what it cannot assume: the attempt's plans reach their unknown
+/// acceptances one publication budget at a time, so the earliest passes walk
+/// fewer operations than the retained set will finally hold, and a scenario
+/// that counted its way into one of those would be pausing on the wrong
+/// operation of a shorter pass.
+///
+/// # Panics
+///
+/// Panics when the pass shape does not settle inside [`ADMISSION_BOUND`].
+async fn stable_reconciliation_pass(catalog: &PromotionCatalogSeam) -> (usize, usize) {
+    tokio::time::timeout(ADMISSION_BOUND, async {
+        let mut previous = measure_reconciliation_pass(catalog).await;
+        loop {
+            let observed = measure_reconciliation_pass(catalog).await;
+            if observed.1 == previous.1 {
+                return observed;
+            }
+            previous = observed;
+        }
+    })
+    .await
+    .expect("a retained attempt's reconciliation pass settles on one load shape")
+}
+
 /// Measures one complete exact-operation reconciliation pass.
 ///
 /// Returns the seam's load count at the gap that closes the measured pass and
@@ -2843,14 +2872,8 @@ async fn shutdown_hands_off_retained_authority(
     // The stop lands while the attempt is still unresolved. A worker that
     // waited for proof it cannot obtain would hang here; the helper's bound is
     // what proves it does not.
-    let owned = small_files_in_state(&promoted.fixture, &["claimed", "running"]).await;
     let retained_ids = retained.iter().copied().collect::<Vec<_>>();
-    let (accounting_before, audit_before, submissions, demand_before) =
-        settled_retention_baseline(promoted, catalog, &retained_ids).await;
-    let handoffs_before = supervisor
-        .observer()
-        .retained_handoff_outputs_for_test()
-        .len();
+    let pass = stable_reconciliation_pass(catalog).await.1;
 
     // The stop lands *inside the last* reconciliation await of a pass, not
     // between two of them and not on the pass's first operation. A retained
@@ -2858,18 +2881,12 @@ async fn shutdown_hands_off_retained_authority(
     // can be making are the ones this pass is asking about; counting them is
     // what turns "some await" into the exact one that follows every earlier
     // operation's completed visit.
-    let pass_loads = measure_reconciliation_pass(catalog).await;
-    let anchor = measure_reconciliation_pass(catalog).await;
-    assert_eq!(
-        pass_loads.1, anchor.1,
-        "one retained reconciliation pass has one exact load shape"
-    );
-    let (loads_before, pass) = anchor;
     assert!(
         pass >= 4 && pass.is_multiple_of(2),
         "the measured pass walks more than one unresolved operation, two \
          retained observations each: {pass} loads"
     );
+    let loads_before = await_reconciliation_pass_gap(catalog, 0).await;
     catalog.pause_load_after(pass - 2);
     tokio::time::timeout(ADMISSION_BOUND, catalog.wait_for_paused_load())
         .await
@@ -2877,7 +2894,8 @@ async fn shutdown_hands_off_retained_authority(
     assert_eq!(
         catalog.loads() - loads_before,
         pass - 1,
-        "the held load opens the final operation's await, after every earlier          operation of the same pass was visited to completion"
+        "the held load opens the final operation's await, after every earlier \
+         operation of the same pass was visited to completion"
     );
     let held = operation_phases(&promoted.fixture).await;
     assert!(
@@ -2886,6 +2904,20 @@ async fn shutdown_hands_off_retained_authority(
             .all(|id| held.get(id).is_some_and(|phase| phase == "prepared")),
         "the held load belongs to a pass over operations nothing has decided: {held:?}"
     );
+
+    // Everything shutdown must not change is read here, with the worker held
+    // inside that final await. The siblings refused before retention keep
+    // settling and resubmitting on their own task backoff for as long as this
+    // owner exists, so a baseline read before the freeze would credit shutdown
+    // with writes the scenario merely waited through; a baseline read at the
+    // freeze describes exactly the window the stop below opens.
+    let owned = small_files_in_state(&promoted.fixture, &["claimed", "running"]).await;
+    let (accounting_before, audit_before, submissions, demand_before) =
+        settled_retention_baseline(promoted, catalog, &retained_ids).await;
+    let handoffs_before = supervisor
+        .observer()
+        .retained_handoff_outputs_for_test()
+        .len();
     supervisor.worker_stop().cancel();
     assert!(
         !supervisor.worker_ready(),

@@ -17,7 +17,6 @@ pub mod dev;
 pub mod drift;
 pub mod eval;
 pub mod fields;
-pub mod genai;
 pub mod logs;
 pub mod managed_columns;
 pub mod metrics;
@@ -28,10 +27,9 @@ pub use audit::AuditLogTable;
 pub use dev::AgentTracesTable;
 pub use drift::ObservationsTable;
 pub use eval::{AssertionsTable, RunsTable};
-pub use genai::{EmbeddingsTable, MemoryTable, MessagesTable, ToolCallsTable};
 pub use logs::RecordsTable;
 pub use metrics::PointsTable;
-pub use traces::{EventsTable, LinksTable, SpansTable};
+pub use traces::SpansTable;
 
 /// Errors from pure table schema and projection operations.
 #[derive(Debug, Error)]
@@ -686,15 +684,9 @@ const fn definition<T: DomainTable>() -> BuiltinTableDefinition {
     }
 }
 
-/// The single canonical list of fourteen server-owned built-in tables.
-pub static BUILTIN_TABLES: [BuiltinTableDefinition; 14] = [
+/// The single canonical list of eight server-owned built-in tables.
+pub static BUILTIN_TABLES: [BuiltinTableDefinition; 8] = [
     definition::<SpansTable>(),
-    definition::<EventsTable>(),
-    definition::<LinksTable>(),
-    definition::<MessagesTable>(),
-    definition::<EmbeddingsTable>(),
-    definition::<ToolCallsTable>(),
-    definition::<MemoryTable>(),
     definition::<PointsTable>(),
     definition::<RecordsTable>(),
     definition::<RunsTable>(),
@@ -706,7 +698,7 @@ pub static BUILTIN_TABLES: [BuiltinTableDefinition; 14] = [
 
 /// Return all immutable built-in definitions.
 #[must_use]
-pub const fn builtin_tables() -> &'static [BuiltinTableDefinition; 14] {
+pub const fn builtin_tables() -> &'static [BuiltinTableDefinition; 8] {
     &BUILTIN_TABLES
 }
 
@@ -718,7 +710,7 @@ pub fn builtin_table(namespace: &str, name: &str) -> Option<&'static BuiltinTabl
         .find(|definition| definition.namespace == namespace && definition.name == name)
 }
 
-/// Return the fourteen built-in logical FQNs in canonical order.
+/// Return the eight built-in logical FQNs in canonical order.
 #[must_use]
 pub fn builtin_fqns() -> Vec<String> {
     BUILTIN_TABLES
@@ -739,11 +731,45 @@ mod tests {
     use super::*;
     use wyrd_spec::vala::{CARD_UID, PRINCIPAL_ID, RUN_ID};
 
+    /// The registry owns three OTel signal tables and no removed physical name.
+    ///
+    /// The trace-child and GenAI tables were registered physical schemas that
+    /// no writer ever filled; a canonical span now carries its own events,
+    /// links, and GenAI promotions. Absence is enforced here by the closed
+    /// registry itself: a removed name cannot resolve, so nothing downstream
+    /// can create, query, or maintain it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a canonical signal table stops resolving or a removed
+    /// physical name resolves again.
     #[test]
-    fn registry_contains_exactly_the_fourteen_builtins() {
-        assert_eq!(BUILTIN_TABLES.len(), 14);
-        assert!(builtin_table("genai", "memory").is_some());
-        assert_eq!(builtin_fqns().len(), 14);
+    fn canonical_otel_registry_has_no_child_or_genai_tables() {
+        for (namespace, name) in [("traces", "spans"), ("logs", "records"), ("metrics", "points")] {
+            assert!(
+                builtin_table(namespace, name).is_some(),
+                "the canonical {namespace}.{name} signal table resolves"
+            );
+        }
+        for (namespace, name) in [
+            ("traces", "events"),
+            ("traces", "links"),
+            ("genai", "messages"),
+            ("genai", "embeddings"),
+            ("genai", "tool_calls"),
+            ("genai", "memory"),
+        ] {
+            assert!(
+                builtin_table(namespace, name).is_none(),
+                "the removed vala.{namespace}.{name} table must not resolve"
+            );
+        }
+        let fqns = builtin_fqns();
+        assert_eq!(BUILTIN_TABLES.len(), fqns.len());
+        assert!(
+            !fqns.iter().any(|fqn| fqn.starts_with("vala.genai.")),
+            "no GenAI namespace table remains: {fqns:?}"
+        );
     }
 
     #[test]
@@ -778,7 +804,7 @@ mod tests {
     }
 
     /// The one authoritative physical-layout contract for every registration
-    /// path: all fourteen built-ins plus each dynamic declaration class.
+    /// path: all eight built-ins plus each dynamic declaration class.
     ///
     /// Built-ins and dynamic tables run the same single resolution entry point,
     /// so this proves in one place that the system injects no sort key, that

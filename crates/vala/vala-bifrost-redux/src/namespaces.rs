@@ -9,7 +9,6 @@ pub enum BifrostNamespace {
     Traces,
     Metrics,
     Logs,
-    GenAi,
     Eval,
     Drift,
     Dev,
@@ -19,13 +18,12 @@ pub enum BifrostNamespace {
 impl BifrostNamespace {
     /// All known namespaces. Adding a variant here causes a compile error at every
     /// `match` that is missing a branch — the exhaustiveness guard.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 9] = [
         Self::Audit,
         Self::Bifrost,
         Self::Traces,
         Self::Metrics,
         Self::Logs,
-        Self::GenAi,
         Self::Eval,
         Self::Drift,
         Self::Dev,
@@ -39,7 +37,6 @@ impl BifrostNamespace {
             Self::Traces => "vala.traces",
             Self::Metrics => "vala.metrics",
             Self::Logs => "vala.logs",
-            Self::GenAi => "vala.genai",
             Self::Eval => "vala.eval",
             Self::Drift => "vala.drift",
             Self::Dev => "vala.dev",
@@ -62,7 +59,6 @@ impl BifrostNamespace {
             "traces" => Some(Self::Traces),
             "metrics" => Some(Self::Metrics),
             "logs" => Some(Self::Logs),
-            "genai" => Some(Self::GenAi),
             "eval" => Some(Self::Eval),
             "drift" => Some(Self::Drift),
             "dev" => Some(Self::Dev),

@@ -1,12 +1,8 @@
 //! Canonical trace-signal table definitions and their table-owned projection.
 
-mod events;
-mod links;
 pub mod projection;
 pub mod spans;
 
-pub use events::EventsTable;
-pub use links::LinksTable;
 pub use projection::{canonical_span_schema, project_resource_spans};
 pub use spans::SpansTable;
 

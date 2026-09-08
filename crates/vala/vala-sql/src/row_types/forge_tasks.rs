@@ -326,7 +326,6 @@ impl ForgeTaskTableIdentity {
             "vala.traces",
             "vala.metrics",
             "vala.logs",
-            "vala.genai",
             "vala.eval",
             "vala.drift",
             "vala.dev",

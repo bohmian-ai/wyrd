@@ -5891,7 +5891,7 @@ mod tests {
         let mut other_tenant = left_source.clone();
         other_tenant.tenant = wyrd_spec::DataTenantId::new_v7();
         let mut other_table = left_source.clone();
-        other_table.table = "vala.traces.links".to_owned();
+        other_table.table = "vala.logs.records".to_owned();
         let mut other_tier = left_source.clone();
         other_tier.tier = crate::oracle::RemotePersistedTier::Hot;
         let mut other_schema = left_source.clone();

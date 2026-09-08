@@ -252,11 +252,9 @@ All categories flow through unified Bifrost schema:
 | Category | Table | Partitioning | Isolation |
 |----------|-------|--------------|-----------|
 | **Agent traces** | `vala.dev.agent_traces` | `Day(event_time)` | Tenant-qualified namespace + `data_tenant_id` |
-| **Traces (spans)** | `vala.traces.spans` | `Day(event_time)` | Tenant-qualified namespace + `data_tenant_id` |
-| **Traces (events, links)** | `vala.traces.events`, `vala.traces.links` | `Day(event_time)` | Tenant-qualified namespace + `data_tenant_id` |
+| **Traces (spans, incl. nested events/links and promoted GenAI attributes)** | `vala.traces.spans` | `Day(event_time)` | Tenant-qualified namespace + `data_tenant_id` |
 | **Metrics** | `vala.metrics.points` | `Day(event_time)` | Tenant-qualified namespace + `data_tenant_id` |
 | **Logs** | `vala.logs.records` | `Day(event_time)` | Tenant-qualified namespace + `data_tenant_id` |
-| **GenAI signals** | `vala.genai.*` | `Day(event_time)` | Tenant-qualified namespace + `data_tenant_id` |
 | **Evaluations** | `vala.eval.*` | `Day(event_time)` | Tenant-qualified namespace + `data_tenant_id` |
 | **Drift** | `vala.drift.*` | `Day(event_time)` | Tenant-qualified namespace + `data_tenant_id` |
 | **User datasets** | `vala.datasets.<name>` | `Day(event_time)` | Tenant-qualified namespace + `data_tenant_id` |
@@ -269,7 +267,7 @@ Every queryable table in Bifrost is a `DomainTable`: a pre-declared, validated d
 
 A `DomainTable` carries:
 
-- **FQN.** `vala.traces.spans`, `vala.genai.messages`, etc.
+- **FQN.** `vala.traces.spans`, `vala.logs.records`, etc.
 - **Schema.** Arrow field list with types, nullability, and metadata.
 - **Physical identity.** `(data_tenant_id, logical TableRef)`; built-ins and datasets use the same tenant-qualified storage model.
 - **Partition spec.** `Day(event_time)`.

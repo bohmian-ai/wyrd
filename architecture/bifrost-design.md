@@ -621,7 +621,7 @@ The surface includes:
 - agent-facing read and write operations governed by explicit permissions.
 
 Typed observation queries cover `vala.traces`, `vala.metrics`, `vala.logs`,
-`vala.genai`, `vala.eval`, `vala.drift`, `vala.dev`, and `vala.system`. The
+`vala.eval`, `vala.drift`, `vala.dev`, and `vala.system`. The
 corresponding physical tables remain tenant-qualified Bifrost tables; the
 namespace does not create another storage or authorization model.
 

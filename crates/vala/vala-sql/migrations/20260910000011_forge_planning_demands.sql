@@ -3,7 +3,7 @@
 CREATE TABLE vala.forge_planning_demands (
     data_tenant_id uuid NOT NULL,
     catalog_name text NOT NULL CHECK (catalog_name = 'wyrd-redux'),
-    namespace_name text NOT NULL CHECK (namespace_name IN ('vala.system','vala.bifrost','vala.traces','vala.metrics','vala.logs','vala.genai','vala.eval','vala.drift','vala.dev','vala.datasets')),
+    namespace_name text NOT NULL CHECK (namespace_name IN ('vala.system','vala.bifrost','vala.traces','vala.metrics','vala.logs','vala.eval','vala.drift','vala.dev','vala.datasets')),
     table_name text NOT NULL CHECK (table_name <> '' AND length(table_name) <= 63 AND table_name ~ '^[A-Za-z0-9_.-]+$' AND table_name NOT LIKE '%..%' AND table_name !~ '^\\.|\\.$'),
     first_requested_at timestamptz NOT NULL DEFAULT statement_timestamp(),
     last_requested_at timestamptz NOT NULL DEFAULT statement_timestamp(),

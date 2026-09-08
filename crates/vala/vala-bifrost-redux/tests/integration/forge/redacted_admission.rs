@@ -1256,214 +1256,9 @@ redacted
 redacted
         .await;
 
-    admitted_work_finishes_while_another_tenant_is_ambiguous(
-        &promoted,
-        &catalog,
-        &mut supervisor,
-        other_tenant,
-    )
-    .await;
     // A clean shutdown drains every join before the worker returns; the helper
     // panics if the production loop exits any other way.
     supervisor.shutdown().await;
-}
-
-/// One tenant's admitted plan finishes while another's outcome is unknown.
-///
-/// Retention is a property of one attempt, not of the worker: an owner that
-/// cannot account for one tenant's operation stops taking *new* authority, and
-/// that is all it stops. Work it has already admitted for every other tenant
-/// has to run to completion, because freezing it would strand durable claims
-/// behind an ambiguity those tenants have nothing to do with and that only a
-/// table-wide owner can ever resolve.
-///
-/// Both halves are made exact rather than sampled. The progressing tenant's
-/// plan is admitted and held immediately before its own publication, so it is
-/// already inside the worker when the ambiguity appears. The commit park is
-/// armed only then, and only the ambiguous tenant's task is offered afterwards,
-/// so the commit that runs out of publication budget with nothing learned is
-/// provably that tenant's. Nothing releases or resolves it: its exact operation
-/// stays `Prepared` and readiness stays retracted for the whole of the other
-/// tenant's remaining work.
-///
-/// This phase runs last because it leaves one attempt retained on purpose. The
-/// scenario's closing shutdown hands that attempt off, which is the production
-/// path a stopping owner takes for an operation it cannot explain.
-///
-/// # Panics
-///
-/// Panics when the ambiguous tenant does not store an unknown acceptance, when
-/// its exact operation is resolved, when readiness is republished, or when the
-/// progressing tenant's exact task does not settle while all of that holds.
-async fn admitted_work_finishes_while_another_tenant_is_ambiguous(
-    promoted: &PromotedRewriteFixture,
-    catalog: &Arc<PromotionCatalogSeam>,
-    supervisor: &mut SupervisedPromotion,
-    other_tenant: wyrd_spec::ids::DataTenantId,
-) {
-    let own = promoted.fixture.tenant;
-    // Earlier phases left claims held by workers that have since stopped and
-    // rows that are claimable again. Returning those claims through the
-    // production reclaim transaction and holding every existing row out of the
-    // window is what makes the only claimable work in this phase its own.
-    promoted.fixture.expire_claims_of(own).await;
-    promoted.fixture.expire_claims_of(other_tenant).await;
-    supervisor.reclaim_expired_claims().await;
-    promoted.fixture.offer_tasks_of(own, 3_600).await;
-    promoted.fixture.offer_tasks_of(other_tenant, 3_600).await;
-
-    // One fresh table per tenant, published before either owes compaction. Two
-    // inputs is one compaction group, so each attempt admits exactly one plan
-    // and the fault each of them receives is unambiguous.
-    promote_tables(
-        promoted,
-        supervisor,
-        &[(own, "ambiguous_a"), (other_tenant, "progress_b")],
-    )
-    .await;
-
-    // Plan only, and then hold every row out again: the order in which the two
-    // tenants enter the worker is this scenario's to choose, not the
-    // scheduler's.
-    let (ambiguous_task, progress_task) = tokio::time::timeout(ADMISSION_BOUND, async {
-        loop {
-            supervisor.schedule_only().await;
-            if let (Some((ambiguous, ambiguous_state)), Some((progress, progress_state))) = (
-                newest_small_files_task(&promoted.fixture, own, "ambiguous_a").await,
-                newest_small_files_task(&promoted.fixture, other_tenant, "progress_b").await,
-            ) && ambiguous_state == "ready"
-                && progress_state == "ready"
-            {
-                return (ambiguous, progress);
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        }
-    })
-    .await
-    .expect("both tenants owe compaction on a table only this phase uses");
-    promoted.fixture.offer_tasks_of(own, 3_600).await;
-    promoted.fixture.offer_tasks_of(other_tenant, 3_600).await;
-    let operations_before = operation_phases(&promoted.fixture).await;
-
-    // The progressing tenant is admitted first and held immediately before it
-    // publishes, so its plan is already inside this worker when the ambiguity
-    // below appears.
-    supervisor
-        .observer()
-        .hold_after_next_rewrite_handoff_for_test();
-    supervisor.restart_worker();
-    supervisor.start_worker();
-    promoted.fixture.offer_task(progress_task, 0).await;
-    tokio::time::timeout(
-        ADMISSION_BOUND,
-        supervisor
-            .observer()
-            .wait_for_held_rewrite_handoff_for_test(),
-    )
-    .await
-    .expect("the progressing tenant's plan is held before its publication");
-    tokio::time::timeout(ADMISSION_BOUND, async {
-        while !supervisor.worker_ready() {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-    })
-    .await
-    .expect("a worker that holds no unknown outcome advertises itself");
-
-    // The next commit to reach the catalog is therefore the ambiguous tenant's,
-    // and nothing ever answers it: the publication budget ends the call with
-    // nothing learned, which is the one outcome this owner cannot account for.
-    catalog.park_next_commit();
-    promoted.fixture.offer_task(ambiguous_task, 0).await;
-    tokio::time::timeout(ADMISSION_BOUND, catalog.wait_for_parked_commit())
-        .await
-        .expect("the ambiguous tenant's plan reaches the catalog");
-    tokio::time::timeout(ADMISSION_BOUND, async {
-        while supervisor.worker_ready() {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-    })
-    .await
-    .expect("an unknown acceptance retracts this worker's readiness");
-
-    let phases = operation_phases(&promoted.fixture).await;
-    let opened = phases
-        .iter()
-        .filter(|(id, phase)| phase.as_str() == "prepared" && !operations_before.contains_key(*id))
-        .map(|(id, _)| *id)
-        .collect::<BTreeSet<_>>();
-    assert_eq!(
-        opened.len(),
-        1,
-        "the ambiguous tenant's single plan opened one operation: {phases:?}"
-    );
-    let ambiguous_operation = opened
-        .into_iter()
-        .next()
-        .expect("the ambiguous tenant opened one operation");
-    assert!(
-        task_state(&promoted.fixture, own, ambiguous_task)
-            .await
-            .is_some_and(|state| OWNED_TASK_STATES.contains(&state.as_str())),
-        "the ambiguous tenant's exact task is retained by this owner: {:?}",
-        tasks_of(&promoted.fixture, own).await
-    );
-    assert!(
-        task_state(&promoted.fixture, other_tenant, progress_task)
-            .await
-            .is_some_and(|state| OWNED_TASK_STATES.contains(&state.as_str())),
-        "the progressing tenant's exact task is admitted and unfinished: {:?}",
-        tasks_of(&promoted.fixture, other_tenant).await
-    );
-
-    // Only the progressing tenant's hold is released. The ambiguous operation
-    // is neither resolved nor handed off, so this owner is holding an outcome
-    // it cannot explain for the whole of the other tenant's remaining work.
-    supervisor
-        .observer()
-        .release_held_rewrite_handoff_for_test();
-    let settled = tokio::time::timeout(ADMISSION_BOUND, async {
-        loop {
-            assert_eq!(
-                operation_phases(&promoted.fixture)
-                    .await
-                    .get(&ambiguous_operation)
-                    .map(String::as_str),
-                Some("prepared"),
-                "nothing resolves the ambiguous tenant's operation while the \
-                 other tenant is running"
-            );
-            if task_state(&promoted.fixture, other_tenant, progress_task)
-                .await
-                .as_deref()
-                == Some("succeeded")
-            {
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-    })
-    .await;
-    assert!(
-        settled.is_ok(),
-        "an owner holding one tenant's unknown outcome still finishes the work \
-         it admitted for another: {:?} / {:?}",
-        tasks_of(&promoted.fixture, other_tenant).await,
-        operation_phases(&promoted.fixture).await
-    );
-    assert_eq!(
-        operation_phases(&promoted.fixture)
-            .await
-            .get(&ambiguous_operation)
-            .map(String::as_str),
-        Some("prepared"),
-        "the other tenant's task settled while this operation was still \
-         unaccounted for"
-    );
-    assert!(
-        !supervisor.worker_ready(),
-        "readiness stays retracted across the other tenant's whole progress"
-    );
 }
 
 /// Leaves a second tenant owing one ready rewrite on a table only it owns.
@@ -2597,6 +2392,293 @@ async fn ambiguity_stops_new_authority_before_siblings_drain() {
     supervisor.shutdown().await;
 }
 
+/// Admitted work finishes while another tenant's acceptance is unknown.
+///
+/// Retention is a property of one attempt, not of the worker. An owner that
+/// cannot account for one tenant's operation stops taking *new* authority, and
+/// that is all it stops: the work it has already admitted for every other
+/// tenant has to run to completion, because freezing it would strand durable
+/// claims behind an ambiguity those tenants have nothing to do with and that
+/// only a table-wide owner can ever resolve.
+///
+/// Both halves are made exact rather than sampled. The progressing tenant's
+/// plan is admitted and held immediately before its own publication, so it is
+/// already inside the worker when the ambiguity appears. Only then is the
+/// commit park armed and the ambiguous tenant's task offered, so the commit
+/// that runs out of publication budget with nothing learned is provably that
+/// tenant's. That attempt keeps a sibling plan of its own held as well, which
+/// is what makes the ambiguity durable rather than a single reconciliation
+/// tick: an attempt that drained would have its parked plan decided within the
+/// next pass, and "readiness stayed retracted" would then be a statement about
+/// that pass. Nothing releases or resolves the unknown operation: it stays
+/// `Prepared` and readiness stays retracted while the other tenant's exact task
+/// is required to reach `succeeded`.
+///
+/// The barrier wakes its oldest waiter first, so the single release between
+/// those two assertions is the progressing tenant's and nothing else.
+///
+/// The complementary direction — that an unknown acceptance stops this owner
+/// claiming *new* work from any tenant — is
+/// [`ambiguity_stops_new_authority_before_siblings_drain`]. Together they are
+/// the whole of the gate: new authority stops, admitted authority does not.
+///
+/// # Panics
+///
+/// Panics when the ambiguous tenant does not store an unknown acceptance, when
+/// its exact operation is resolved or its identity changes, when readiness is
+/// republished, or when the progressing tenant's exact task does not settle
+/// while all of that holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn admitted_work_finishes_while_another_tenant_is_ambiguous() {
+    let mut promoted = PromotedRewriteFixture::start_unpromoted("cross_tenant_progress").await;
+    // A parked commit has to run out of publication budget while the scenario
+    // is still watching, so the budget is the seconds a test can wait rather
+    // than the production minutes.
+    promoted.fixture.config.iceberg_total_retry_timeout = std::time::Duration::from_secs(2);
+    let object_store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
+    let catalog = PromotionCatalogSeam::new(
+        promoted.fixture.catalog.iceberg_catalog(),
+        object_store.read_counter(),
+    );
+    // Both tenants' plans must be able to sit inside one worker at once, or
+    // capacity rather than the ambiguity gate would be what decides the order
+    // this scenario observes.
+    let mut supervisor = SupervisedPromotion::start_with_worker_bounds(
+        &promoted.fixture,
+        Arc::clone(&catalog) as Arc<dyn iceberg::Catalog>,
+        Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
+        ForgeClock::system(),
+        vala_bifrost_redux::forge::ForgeWorkerConfig {
+            max_task_parallelism: 4,
+            ..vala_bifrost_redux::forge::ForgeWorkerConfig::default()
+        },
+    );
+    supervisor.run_one_success().await;
+
+    let own = promoted.fixture.tenant;
+    let other = promoted.fixture.seed_tenant("cross-tenant-2").await;
+    // This tenant's own fixture table is held out of every claim window: the
+    // work under test is one exact task per tenant, and the fixture table's own
+    // compaction debt would be a third claimable attempt competing for the
+    // faults this scenario injects by count.
+    promoted.fixture.offer_tasks_of(own, 3_600).await;
+    // Two inputs is one compaction group, so each of these tables owes exactly
+    // one plan and the fault each of them receives is unambiguous.
+    promote_tables(
+        &promoted,
+        &mut supervisor,
+        &[(own, "cross_ambiguous"), (other, "cross_progress")],
+    )
+    .await;
+
+    // Plan only, with the worker stopped, and then hold every row out again:
+    // the order in which the two tenants enter the worker is this scenario's to
+    // choose, not the scheduler's.
+    let (ambiguous_task, progress_task) = tokio::time::timeout(ADMISSION_BOUND, async {
+        loop {
+            supervisor.schedule_only().await;
+            if let (Some((ambiguous, ambiguous_state)), Some((progress, progress_state))) = (
+                newest_small_files_task(&promoted.fixture, own, "cross_ambiguous").await,
+                newest_small_files_task(&promoted.fixture, other, "cross_progress").await,
+            ) && ambiguous_state == "ready"
+                && progress_state == "ready"
+            {
+                return (ambiguous, progress);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("both tenants owe compaction on a table only they own");
+    promoted.fixture.expire_claims_of(own).await;
+    promoted.fixture.expire_claims_of(other).await;
+    supervisor.reclaim_expired_claims().await;
+    promoted.fixture.offer_tasks_of(own, 3_600).await;
+    promoted.fixture.offer_tasks_of(other, 3_600).await;
+    assert_eq!(
+        owned_tasks(&promoted.fixture, &[own, other]).await,
+        0,
+        "the setup's own work is settled and returned before the interleaving \
+         arms its holds: {:?} / {:?}",
+        tasks_of(&promoted.fixture, own).await,
+        tasks_of(&promoted.fixture, other).await
+    );
+    let operations_before = operation_phases(&promoted.fixture).await;
+
+    // The progressing tenant is admitted first and held immediately before it
+    // publishes, so its plan is already inside this worker when the ambiguity
+    // below appears.
+    supervisor
+        .observer()
+        .hold_after_next_rewrite_handoff_for_test();
+    supervisor.restart_worker();
+    supervisor.start_worker();
+    promoted.fixture.offer_task(progress_task, 0).await;
+    tokio::time::timeout(
+        ADMISSION_BOUND,
+        supervisor
+            .observer()
+            .wait_for_held_rewrite_handoff_for_test(),
+    )
+    .await
+    .expect("the progressing tenant's plan is held before its publication");
+    // One attempt publishes each of its plans under its own operation and the
+    // barrier holds exactly one of them, so this tenant still has a sibling
+    // commit of its own in flight. That sibling has to reach a terminal phase
+    // before the commit park is armed, or the commit the park meets would be
+    // this tenant's rather than the ambiguous one's. The held plan writes
+    // nothing durable until it is released, so an operation set that is
+    // non-empty and holds nothing Prepared is exactly that boundary.
+    let progressing = tokio::time::timeout(ADMISSION_BOUND, async {
+        loop {
+            let settled = promoted.fixture.rewrite_operations_of(other).await;
+            if !settled.is_empty() && settled.iter().all(|(_, phase)| phase != "prepared") {
+                return settled;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the progressing tenant's unheld plan settles without this owner's help");
+    assert!(
+        !progressing.is_empty(),
+        "the progressing tenant is admitted and publishing before the ambiguity"
+    );
+    tokio::time::timeout(ADMISSION_BOUND, async {
+        while !supervisor.worker_ready() {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("a worker that holds no unknown outcome advertises itself");
+
+    // The barrier is re-armed before the ambiguous tenant is offered anything,
+    // so that tenant's attempt keeps one plan of its own held while the other
+    // is parked. Without the held sibling the attempt would drain into the
+    // retained pool and its next reconciliation pass would decide the parked
+    // plan within a tick, which would make "readiness stayed retracted" a
+    // statement about that tick rather than about the ambiguity.
+    supervisor
+        .observer()
+        .hold_after_next_rewrite_handoff_for_test();
+    // The next commit to reach the catalog is therefore the ambiguous tenant's,
+    // and nothing ever answers it: the publication budget ends the call with
+    // nothing learned, which is the one outcome this owner cannot account for.
+    catalog.park_next_commit();
+    promoted.fixture.offer_task(ambiguous_task, 0).await;
+    tokio::time::timeout(ADMISSION_BOUND, catalog.wait_for_parked_commit())
+        .await
+        .expect("the ambiguous tenant's plan reaches the catalog");
+    tokio::time::timeout(
+        ADMISSION_BOUND,
+        supervisor
+            .observer()
+            .wait_for_held_rewrite_handoff_for_test(),
+    )
+    .await
+    .expect("a sibling of the ambiguous attempt is held before its publication");
+    tokio::time::timeout(ADMISSION_BOUND, async {
+        while supervisor.worker_ready() {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("an unknown acceptance retracts this worker's readiness");
+
+    // Only the parked plan reached its Prepared audit: the held sibling stops
+    // before that audit is written, so the one operation this attempt opened is
+    // exactly the one whose acceptance is unknown.
+    let phases = operation_phases(&promoted.fixture).await;
+    let opened = phases
+        .iter()
+        .filter(|(id, phase)| phase.as_str() == "prepared" && !operations_before.contains_key(*id))
+        .map(|(id, _)| *id)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        opened.len(),
+        1,
+        "the ambiguous tenant's parked plan opened the one unaccounted-for \
+         operation: {phases:?}"
+    );
+    let ambiguous_operation = opened
+        .into_iter()
+        .next()
+        .expect("the ambiguous tenant opened one operation");
+    assert!(
+        task_state(&promoted.fixture, own, ambiguous_task)
+            .await
+            .is_some_and(|state| OWNED_TASK_STATES.contains(&state.as_str())),
+        "the ambiguous tenant's exact task is retained by this owner: {:?}",
+        tasks_of(&promoted.fixture, own).await
+    );
+    assert!(
+        task_state(&promoted.fixture, other, progress_task)
+            .await
+            .is_some_and(|state| OWNED_TASK_STATES.contains(&state.as_str())),
+        "the progressing tenant's exact task is admitted and unfinished: {:?}",
+        tasks_of(&promoted.fixture, other).await
+    );
+
+    // Only the progressing tenant's hold is released. The ambiguous operation
+    // is neither resolved nor handed off, so this owner is holding an outcome
+    // it cannot explain for the whole of the other tenant's remaining work.
+    // The barrier releases its oldest waiter first, and the progressing
+    // tenant's plan entered it before the ambiguous attempt's sibling did. That
+    // sibling therefore stays held, so nothing releases, resolves, or hands off
+    // the unknown operation for the whole of the other tenant's remaining work.
+    supervisor
+        .observer()
+        .release_held_rewrite_handoff_for_test();
+    let settled = tokio::time::timeout(ADMISSION_BOUND, async {
+        loop {
+            assert_eq!(
+                operation_phases(&promoted.fixture)
+                    .await
+                    .get(&ambiguous_operation)
+                    .map(String::as_str),
+                Some("prepared"),
+                "nothing resolves the ambiguous tenant's operation while the \
+                 other tenant is still running"
+            );
+            if task_state(&promoted.fixture, other, progress_task)
+                .await
+                .as_deref()
+                == Some("succeeded")
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    assert!(
+        settled.is_ok(),
+        "an owner holding one tenant's unknown outcome still finishes the work \
+         it admitted for another: {:?} / {:?}",
+        tasks_of(&promoted.fixture, other).await,
+        operation_phases(&promoted.fixture).await
+    );
+    assert_eq!(
+        operation_phases(&promoted.fixture)
+            .await
+            .get(&ambiguous_operation)
+            .map(String::as_str),
+        Some("prepared"),
+        "the other tenant's task settled while this operation was still \
+         unaccounted for"
+    );
+    assert!(
+        !supervisor.worker_ready(),
+        "readiness stays retracted across the other tenant's whole progress"
+    );
+    // The ambiguous attempt's held sibling is released only now, so the worker
+    // is not left blocked on a barrier its own shutdown cannot cancel.
+    supervisor
+        .observer()
+        .release_held_rewrite_handoff_for_test();
+    supervisor.shutdown().await;
+}
+
 /// Drives one attempt into a retained, unresolved state and reports its shape.
 ///
 /// Two plans reach the catalog and never learn what happened, and every later
@@ -2856,11 +2938,24 @@ async fn measure_reconciliation_pass(catalog: &PromotionCatalogSeam) -> (usize, 
 /// with its operation Prepared, which is exactly the state a lost process
 /// leaves and the one the table-wide reconciliation owner takes over from.
 ///
+/// The stop lands in the *final* operation's reconciliation await, not the
+/// first. A pass is measured, the catalog seam's load countdown is armed for
+/// the load that opens the last unresolved operation's observation, and the
+/// load-count delta proves every earlier operation of that same pass was
+/// already walked to completion. Stopping on the first operation would leave
+/// the interesting half untested: a worker that handles an early stop
+/// correctly can still republish readiness or reduce the attempt once it has
+/// visited operations and is waiting on the last one. Every durable baseline
+/// is read while the worker is frozen inside that await, so the comparison is
+/// against one instant rather than against sibling retries still in flight.
+///
 /// # Panics
 ///
 /// Panics when shutdown settles, fails, retries, or resets a retained
-/// attempt, when it changes an operation identity, when it does not return
-/// inside the fixture's shutdown bound, or when it leaves a table fence held.
+/// attempt, when it changes an operation identity, when the measured pass does
+/// not walk more than one operation, when the held load is not the one that
+/// opens the final operation's await, when it does not return inside the
+/// fixture's shutdown bound, or when it leaves a table fence held.
 async fn shutdown_hands_off_retained_authority(
     promoted: &PromotedRewriteFixture,
     catalog: &Arc<PromotionCatalogSeam>,
@@ -3007,11 +3102,21 @@ async fn shutdown_hands_off_retained_authority(
 /// decide it. New debt is what gives the takeover something to publish — and
 /// what makes "reconciled before it published" a question with an answer.
 ///
+/// The ordering is proven by a barrier rather than by polling. The successor's
+/// own rewrite is parked at the catalog *before* delegation, so while the test
+/// reads the inherited operations that publication provably cannot have
+/// entered the catalog — the snapshot count is asserted unchanged at the same
+/// instant. Polling for a phase change and then checking snapshots reads two
+/// states at two times, and a reconciliation and a publication that both land
+/// between polls would leave the ordering unobserved.
+///
 /// # Panics
 ///
-/// Panics when the successor publishes a snapshot while an inherited operation
-/// is still Prepared, or when it never reconciles one inside
-/// [`ADMISSION_BOUND`].
+/// Panics when the successor's rewrite never reaches the parked boundary,
+/// when the parked commit's publication has already entered the catalog, when
+/// no inherited operation is reconciled by the time the successor is at that
+/// boundary, or when the released rewrite never settles its own publication
+/// inside [`ADMISSION_BOUND`].
 async fn successor_reconciles_before_publishing(
     promoted: &PromotedRewriteFixture,
     catalog: &Arc<PromotionCatalogSeam>,

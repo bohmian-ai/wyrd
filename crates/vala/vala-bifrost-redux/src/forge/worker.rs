@@ -366,15 +366,6 @@ impl ForgeAttemptState {
     fn drained(&self) -> bool {
         self.queued == 0 && self.running == 0
     }
-
-    /// Returns whether this attempt is drained but cannot yet be settled.
-    ///
-    /// A retained attempt still owns its claim, fence, heartbeat, and exact
-    /// operation identities. It is neither failed nor retried: only proof about
-    /// those exact operations can decide it.
-    fn retained(&self) -> bool {
-        self.drained() && ForgeWorker::retains_unknown_acceptance(self)
-    }
 }
 
 /// The worker's compaction admission state: one FIFO, one map, one channel.
@@ -384,10 +375,11 @@ impl ForgeAttemptState {
 /// belongs to — and separating them would let the parallelism budget disagree
 /// with what is actually in flight.
 ///
-/// A drained attempt whose operations are unresolved stays in `attempts` rather
-/// than moving to a second container: retention is a property of an attempt's
-/// own indexed outcomes, so a parallel list would be a second place for the
-/// same fact to be wrong.
+/// An attempt leaves `attempts` the moment it drains, whatever it proved: a
+/// worker holds no attempt it is not currently running plans for. An attempt
+/// that drained without proving what its own operation did is released to
+/// durable recovery rather than parked here, so this map never becomes a
+/// second, in-memory record of unresolved durable work.
 struct ForgeAttemptPool {
     /// Worker-wide FIFO holding every attempt's unstarted plans in offer order.
     queue: super::managed::queue::ForgeCompactionQueue,
@@ -423,31 +415,6 @@ impl ForgeAttemptPool {
     /// Returns whether any attempt still has a plan waiting or running.
     fn has_plans_in_flight(&self) -> bool {
         self.attempts.values().any(|state| !state.drained())
-    }
-
-    /// Returns whether any locally held attempt already stores an unknown
-    /// acceptance.
-    ///
-    /// Derived from the attempts' own indexed outcomes and deliberately not
-    /// gated on drain: an owner that already cannot account for one operation
-    /// must stop advertising authority immediately, while its sibling plans
-    /// keep running. Reconciliation still visits only drained attempts.
-    fn has_local_ambiguity(&self) -> bool {
-        self.attempts
-            .values()
-            .any(ForgeWorker::retains_unknown_acceptance)
-    }
-
-    /// Returns every unresolved attempt's task id, in ascending order.
-    fn retained_task_ids(&self) -> Vec<Uuid> {
-        let mut retained: Vec<Uuid> = self
-            .attempts
-            .iter()
-            .filter(|(_, state)| state.retained())
-            .map(|(task_id, _)| *task_id)
-            .collect();
-        retained.sort_unstable();
-        retained
     }
 
     /// Offers one attempt's planner-ordered plans and suspends it on the queue.
@@ -631,19 +598,17 @@ enum ForgeDispatchResult {
     SelfSettled,
 }
 
-/// Everything a retained attempt needs to settle one unresolved operation.
+/// What one plan knows about an operation it could not prove the fate of.
 ///
-/// The exact UUID is what reconciliation asks about, the typed error is what
-/// the plan settles with if the operation is proven absent, and the volume is
-/// what it reports if the operation is proven live — none of which can be
-/// re-derived once the attempt's frame is gone.
+/// The exact UUID names the durable `Prepared` row a later owner's table-wide
+/// reconciliation pass will classify, and the typed error is the failure this
+/// plan returned with. Both are diagnostic here: this worker settles nothing
+/// from them, it releases the attempt so the durable row decides.
 struct ForgeUnknownAcceptance {
     /// Prepared operation whose acceptance is unknown.
     operation_id: Uuid,
     /// Original typed failure this plan returned with.
     error: ForgeError,
-    /// Exact request volume this plan submitted.
-    volume: ForgeCommittedVolume,
 }
 
 /// Durable task state accompanying exact committed evidence.
@@ -784,14 +749,6 @@ pub struct ForgeWorkerCompletionObserver {
     /// neither holds the vector nor clones an unsettled attempt's paths into it.
     #[cfg(feature = "test-support")]
     returned_unsettled: Arc<Mutex<Vec<Option<Vec<crate::forge::managed::ForgeUnsettledOutput>>>>>,
-    /// Attempt-wide possible-output snapshots taken at retained shutdown.
-    ///
-    /// One entry per attempt handed off unresolved, in handoff order, holding
-    /// the exact ordered set the shared context carried before it was dropped.
-    /// Compiled only under `test-support`; the production path renders the same
-    /// snapshot into its shutdown warning, which is the operator's evidence.
-    #[cfg(feature = "test-support")]
-    retained_handoff_outputs: Arc<Mutex<Vec<Vec<crate::forge::managed::ForgeUnsettledOutput>>>>,
     /// Publication evidence each admitted rewrite attempt produced, in order.
     ///
     /// Compiled only under `test-support`. Recorded at the production dispatch
@@ -1152,35 +1109,6 @@ impl ForgeWorkerCompletionObserver {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
-    }
-
-    /// Return each retained shutdown's exact ordered possible-output snapshot.
-    ///
-    /// Ordered by handoff. Passive diagnostic evidence: it is appended from the
-    /// same snapshot the shutdown warning renders and is never read by a
-    /// durable path.
-    #[cfg(feature = "test-support")]
-    #[must_use]
-    pub fn retained_handoff_outputs_for_test(
-        &self,
-    ) -> Vec<Vec<crate::forge::managed::ForgeUnsettledOutput>> {
-        self.retained_handoff_outputs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-    }
-
-    /// Record one retained attempt's final attempt-wide possible-output set.
-    #[cfg(feature = "test-support")]
-    pub(crate) fn record_retained_handoff_outputs_for_test(
-        &self,
-        outputs: Vec<crate::forge::managed::ForgeUnsettledOutput>,
-    ) {
-        self.retained_handoff_outputs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(outputs);
-        self.ready.notify_waiters();
     }
 
     /// Record one admitted rewrite attempt's publication evidence.
@@ -2271,18 +2199,10 @@ impl ForgeWorker {
         // two tasks claimed a moment apart compete for the same room, in the
         // order their plans were offered.
         let mut pool = ForgeAttemptPool::new(&self.config);
-        // The one delayed cadence this loop waits on. `Delay` is what keeps a
-        // process that was blocked past several periods from firing a burst of
-        // catalog reconciliation passes when it resumes.
-        let period = self.forge.core.maintenance_interval;
-        let mut maintenance =
-            tokio::time::interval_at(tokio::time::Instant::now() + period, period);
-        maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             let stranded = self.start_fitting_plans(&mut pool, &shutdown);
             for state in stranded {
-                self.settle_or_retain_attempt(&mut pool, state, &shutdown)
-                    .await?;
+                self.settle_or_release_attempt(state, &shutdown).await?;
             }
             if shutdown.is_cancelled() {
                 // A stopped worker still owns the plans it started: their
@@ -2297,34 +2217,15 @@ impl ForgeWorker {
                     // now may be written durably, and the successor owns that
                     // proof.
                     if let Some(completion) = pool.completion_rx.recv().await
-                        && let Some(state) = self.record_plan_completion(&mut pool, completion)?
+                        && let Some(state) = Self::record_plan_completion(&mut pool, completion)?
                     {
-                        self.settle_or_retain_attempt(&mut pool, state, &shutdown)
-                            .await?;
+                        self.settle_or_release_attempt(state, &shutdown).await?;
                     }
                     continue;
                 }
-                // Nothing is in flight, so every attempt still held is one this
-                // owner cannot account for. A stopping worker cannot wait for
-                // an operation to become provable and must not guess: it hands
-                // the Prepared authority to its successor untouched.
-                let mut held: Vec<Uuid> = pool.attempts.keys().copied().collect();
-                held.sort_unstable();
-                for task_id in held {
-                    if let Some(state) = pool.attempts.remove(&task_id) {
-                        self.hand_off_retained_attempt(state).await;
-                    }
-                }
+                // An attempt leaves the map as soon as it drains, so a pool
+                // with nothing in flight and nothing idle cannot exist.
                 return Ok(());
-            }
-            if pool.has_local_ambiguity() {
-                // An owner that cannot say what its own operation did has no
-                // business taking more of them: it stops claiming and retracts
-                // readiness, while the plans it already admitted keep running
-                // and settling normally.
-                self.publish_readiness(false);
-                Box::pin(self.await_loop_event(&mut pool, &mut maintenance, &shutdown)).await?;
-                continue;
             }
             self.reclaim_expired_attempts(claim_limits.max_active_per_tenant)
                 .await?;
@@ -2343,15 +2244,14 @@ impl ForgeWorker {
             // authority is acquired, so the budget a finished plan freed is the
             // budget the pull calculation below sees.
             while let Ok(completion) = pool.completion_rx.try_recv() {
-                if let Some(state) = self.record_plan_completion(&mut pool, completion)? {
-                    self.settle_or_retain_attempt(&mut pool, state, &shutdown)
-                        .await?;
+                if let Some(state) = Self::record_plan_completion(&mut pool, completion)? {
+                    self.settle_or_release_attempt(state, &shutdown).await?;
                 }
             }
-            // Readiness is asserted on three facts together: no local attempt
-            // is unresolved, every drained attempt finished its durable
-            // settlement above, and this worker is not stopping.
-            if pool.has_local_ambiguity() || shutdown.is_cancelled() {
+            // Readiness is asserted after every drained attempt above finished
+            // its durable settlement or release, and only while this worker is
+            // not stopping.
+            if shutdown.is_cancelled() {
                 continue;
             }
             self.publish_readiness(true);
@@ -2360,7 +2260,7 @@ impl ForgeWorker {
                 // No running parallelism remains, so this turn acquires no
                 // authority at all. Waiting plans keep their pending
                 // reservation; it does not authorize a pull.
-                Box::pin(self.await_loop_event(&mut pool, &mut maintenance, &shutdown)).await?;
+                Box::pin(self.await_loop_event(&mut pool, &shutdown)).await?;
                 continue;
             }
             let Some(claimed) = self
@@ -2382,7 +2282,7 @@ impl ForgeWorker {
             // Nothing to claim while this worker still holds work: waiting on a
             // running plan is the idle wait, because polling for new work on a
             // timer would delay the settlement that frees its budget.
-            Box::pin(self.await_loop_event(&mut pool, &mut maintenance, &shutdown)).await?;
+            Box::pin(self.await_loop_event(&mut pool, &shutdown)).await?;
         }
     }
 
@@ -2475,55 +2375,48 @@ redacted
         Ok(Some(claimed))
     }
 
-    /// Waits for the next plan completion, maintenance tick, or stop signal.
+    /// Waits for the next plan completion or stop signal.
     ///
     /// This is the loop's only wait once it holds work. A completion is
-    /// recorded and, when it drained its attempt, settled or retained; a tick
-    /// runs one complete exact-operation reconciliation pass over every
-    /// retained attempt; a stop signal returns so the caller re-reads it.
+    /// recorded and, when it drained its attempt, settled or released; a stop
+    /// signal returns so the caller re-reads it.
     ///
     /// # Errors
     ///
-    /// Returns the invariant, reconciliation, settlement, audit, SQL, and
-    /// lease-release failures the recorded completion or the pass raises.
+    /// Returns the invariant, settlement, audit, SQL, and lease-release
+    /// failures the recorded completion raises.
     async fn await_loop_event(
         &self,
         pool: &mut ForgeAttemptPool,
-        maintenance: &mut tokio::time::Interval,
         shutdown: &CancellationToken,
     ) -> Result<(), ForgeError> {
-        let mut ticked = false;
         let completion = tokio::select! {
             () = shutdown.cancelled() => None,
             completion = pool.completion_rx.recv() => completion,
-            _ = maintenance.tick() => {
-                ticked = true;
-                None
-            }
         };
-        if let Some(completion) = completion {
-            if let Some(state) = self.record_plan_completion(pool, completion)? {
-                self.settle_or_retain_attempt(pool, state, shutdown).await?;
-            }
-        } else if ticked {
-            self.reconcile_retained_attempts(pool, shutdown).await?;
+        if let Some(completion) = completion
+            && let Some(state) = Self::record_plan_completion(pool, completion)?
+        {
+            self.settle_or_release_attempt(state, shutdown).await?;
         }
         Ok(())
     }
 
-    /// Leaves one unresolved attempt's Prepared authority for its successor.
+    /// Leaves one unresolved attempt's Prepared authority for durable recovery.
     ///
-    /// A stopping owner writes nothing durable for an attempt it cannot
-    /// account for: no retry, no failure, no success, no planning demand, and
-    /// no terminal audit. It closes only what is local — the heartbeat and the
-    /// table fence — and leaves the task `Running` with its operation
-    /// `Prepared`, which is exactly the state a lost process leaves and the one
-    /// the table-wide reconciliation owner takes over from.
+    /// An owner writes nothing durable for an attempt it cannot account for:
+    /// no retry, no failure, no success, no planning demand, and no terminal
+    /// audit. It closes only what is local — the heartbeat and the table fence
+    /// — and leaves the task `Running` with its operation `Prepared`, which is
+    /// exactly the state a killed process leaves behind. Recovery is therefore
+    /// one path, not two: the durable trio of a `Running` task, a `Prepared`
+    /// operation, and a lapsed claim lease is what the next owner's table-wide
+    /// reconciliation pass classifies, whether this worker exited cleanly, was
+    /// killed, or simply lost one commit response and kept running.
     ///
-    /// A local closure failure is logged rather than returned: this worker is
-    /// already stopping, nothing durable depends on the closure, and a
-    /// retained fence lapses on its own TTL.
-    async fn hand_off_retained_attempt(&self, state: ForgeAttemptState) {
+    /// A local closure failure is logged rather than returned: nothing durable
+    /// depends on the closure, and an unreleased fence lapses on its own TTL.
+    async fn release_unresolved_attempt(&self, state: ForgeAttemptState) {
         let ForgeAttemptState {
             open,
             mut lease,
@@ -2552,7 +2445,7 @@ redacted
         if let Err(error) = self.release_table_lease(&mut lease).await {
             tracing::warn!(
                 worker = %self.owner, task_id = %task_id, error = %error,
-                "Forge table lease release failed at shutdown; the fence lapses on its TTL"
+                "Forge table lease release failed; the fence lapses on its TTL"
             );
         }
         // The one final snapshot of what this attempt may have written is read
@@ -2567,21 +2460,17 @@ redacted
             task_id = %task_id,
             possible_output_count = possible_outputs.len(),
             possible_outputs = ?possible_outputs,
-            "Forge shutdown retained an unresolved attempt for table-wide takeover"
+            "Forge released an unresolved attempt for table-wide takeover"
         );
-        #[cfg(feature = "test-support")]
-        if let Some(observer) = &self.completion_observer {
-            observer.record_retained_handoff_outputs_for_test(possible_outputs);
-        }
         drop(shared);
         drop(open);
     }
 
     /// Publishes this loop's readiness, when it is running under a role handle.
     ///
-    /// The loop is the only readiness decider, so retracting the bit while an
-    /// operation is unresolved is what stops a gateway routing new work to an
-    /// owner that has stopped claiming.
+    /// The loop is the only readiness decider, so retracting the bit while this
+    /// worker is stopping is what keeps a gateway from routing new work to an
+    /// owner that will not claim it.
     fn publish_readiness(&self, ready: bool) {
         if let Some(handles) = &self.loop_handles {
             handles.readiness.publish(ready);
@@ -2625,23 +2514,23 @@ redacted
         released
     }
 
-    /// Retains one drained attempt whose operations are unresolved, or settles it.
+    /// Settles one drained attempt, or releases it to durable recovery.
     ///
     /// The reducer runs first, as a predicate: any plan this attempt is known
     /// to have published decides the task immediately and leaves its ambiguous
-    /// siblings' Prepared rows to the table-wide reconciliation owner. Only an
-    /// attempt with no known success and at least one unresolved operation is
-    /// retained, because for that one nothing durable can be written yet — a
-    /// failure would be a guess and a retry would republish an effect that may
-    /// already be live.
+    /// siblings' Prepared rows to the table-wide reconciliation owner. An
+    /// attempt with no known success and at least one unresolved operation
+    /// cannot be settled at all — a failure would be a guess and a retry would
+    /// republish an effect that may already be live — so it is released
+    /// instead, leaving exactly the durable residue a lost process leaves.
     ///
     /// # Errors
     ///
     /// Returns the settlement, audit, SQL, or lease-release failure that makes
-    /// a further claim by this owner unsafe.
-    async fn settle_or_retain_attempt(
+    /// a further claim by this owner unsafe. Releasing an unresolved attempt is
+    /// infallible: it writes nothing durable.
+    async fn settle_or_release_attempt(
         &self,
-        pool: &mut ForgeAttemptPool,
         state: ForgeAttemptState,
         shutdown: &CancellationToken,
     ) -> Result<(), ForgeError> {
@@ -2652,13 +2541,13 @@ redacted
             worker = %self.owner,
             task_id = %state.open.claim.task_id,
             unresolved = Self::unknown_operations(&state).len(),
-            "Forge task retained: an operation's acceptance is unknown and no plan is known to have published"
+            "Forge task released: an operation's acceptance is unknown and no plan is known to have published"
         );
-        pool.attempts.insert(state.open.claim.task_id, state);
+        self.release_unresolved_attempt(state).await;
         Ok(())
     }
 
-    /// Returns whether this drained attempt must be retained rather than settled.
+    /// Returns whether this drained attempt cannot be settled from what it knows.
     fn retains_unknown_acceptance(state: &ForgeAttemptState) -> bool {
         let known_success = state.outcomes.iter().any(|(_, outcome)| {
             matches!(outcome, Ok(result) if !matches!(result, ForgeDispatchResult::AcceptanceUnknown(_)))
@@ -2680,174 +2569,6 @@ redacted
             .collect();
         unresolved.sort_unstable();
         unresolved
-    }
-
-    /// Reconciles every retained attempt's unresolved operations once.
-    ///
-    /// One pass visits every retained attempt in task order and every one of
-    /// that attempt's unresolved operations, so a worker holding several
-    /// ambiguous attempts resolves all of them on one delayed cadence rather
-    /// than one per tick. An attempt leaves the pool only when it is decided:
-    /// the first operation proven live settles the task successfully and
-    /// leaves any other unresolved row to the table-wide owner, and an attempt
-    /// whose every operation is proven absent settles with the failure its
-    /// plans returned.
-    ///
-    /// # Errors
-    ///
-    /// Returns the SQL, catalog, storage, fence, and settlement failures
-    /// reconciliation and settlement raise. Each leaves the retained attempt
-    /// durable for a later owner.
-    ///
-    /// # Cancellation
-    ///
-    /// A stop signal ends the pass, not the worker. The pass writes nothing
-    /// durable until it has proven an exact operation, so abandoning it — even
-    /// part-way through the retained table observation one operation's await is
-    /// blocked on — loses only work that was never going to be recorded. It
-    /// returns `Ok` so the event loop reaches the handoff branch that leaves
-    /// every still-unresolved attempt Prepared for its successor; propagating
-    /// the cancellation instead would end `run` in an error and skip that
-    /// handoff entirely.
-    async fn reconcile_retained_attempts(
-        &self,
-        pool: &mut ForgeAttemptPool,
-        shutdown: &CancellationToken,
-    ) -> Result<(), ForgeError> {
-        for task_id in pool.retained_task_ids() {
-            if shutdown.is_cancelled() {
-                return Ok(());
-            }
-            let Some(state) = pool.attempts.get_mut(&task_id) else {
-                continue;
-            };
-            let decided = match self.reconcile_retained_attempt(state).await {
-                Ok(decided) => decided,
-                // The exact-operation reads this pass makes are cancellable, so
-                // a stop taken inside one surfaces here as the loop's own stop
-                // signal rather than as a failure to account for anything.
-                Err(ForgeError::Shutdown) if shutdown.is_cancelled() => return Ok(()),
-                Err(error) => return Err(error),
-            };
-            if !decided {
-                continue;
-            }
-            // The reducer runs once, after this attempt's pass completed, and
-            // only because that pass changed at least one phase.
-            if let Some(state) = pool.attempts.remove(&task_id) {
-                self.settle_pooled_attempt(state, shutdown).await?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Reconciles one retained attempt's unresolved operations, in plan order.
-    ///
-    /// Each pass walks the ordered unresolved list to completion — no early
-    /// return on the first change — and asks the durable operation row and the
-    /// retained table evidence what each one did, updating the stored outcome
-    /// in place. Nothing is resubmitted, and an operation still unproven is
-    /// left exactly as it was.
-    ///
-    /// Returns whether this pass changed a phase and left the attempt decided,
-    /// which is the only condition under which its caller reduces and settles.
-    ///
-    /// # Errors
-    ///
-    /// Returns the SQL, catalog, storage, fence, and clock failures exact
-    /// reconciliation raises, and [`ForgeError::Invariant`] when the recovered
-    /// table can no longer be loaded.
-    async fn reconcile_retained_attempt(
-        &self,
-        state: &mut ForgeAttemptState,
-    ) -> Result<bool, ForgeError> {
-        let key = super::compact::ForgeTableKey {
-            tenant: state.open.claim.data_tenant_id,
-            table_ref: state.binding.table_ref.clone(),
-        };
-        let now = self.forge.core.clock.now()?;
-        let stop = state.fenced.dispatch_stop().clone();
-        let mut changed = false;
-        for (plan_index, operation_id) in Self::unknown_operations(state) {
-            let settlement = self
-                .forge
-                .reconcile_exact_live_operation(
-                    &mut state.lease,
-                    &key,
-                    &state.binding,
-                    &stop,
-                    now,
-                    operation_id,
-                )
-                .await?;
-            match settlement {
-                super::live_reconcile::ForgeLiveSettlement::Prepared => {}
-                super::live_reconcile::ForgeLiveSettlement::Recovered(_) => {
-                    // The retained request volume is the exact one this plan
-                    // submitted, so recovery reports it rather than the
-                    // reconciler emitting a second copy of the same effect.
-                    let table = self.forge.load_table(&state.binding.table_ident()).await?;
-                    let unknown = Self::take_retained_unknown(state, plan_index);
-                    Self::replace_plan_outcome(
-                        state,
-                        plan_index,
-                        Ok(ForgeDispatchResult::Committed(Box::new(
-                            ForgeCommittedPublication {
-                                table,
-                                volume: Some(unknown.volume),
-                            },
-                        ))),
-                    );
-                    changed = true;
-                }
-                super::live_reconcile::ForgeLiveSettlement::Reset => {
-                    let unknown = Self::take_retained_unknown(state, plan_index);
-                    Self::replace_plan_outcome(state, plan_index, Err(unknown.error));
-                    changed = true;
-                }
-            }
-        }
-        Ok(changed && !Self::retains_unknown_acceptance(state))
-    }
-
-    /// Removes and returns one unresolved plan's retained payload.
-    ///
-    /// The slot is left holding a placeholder its caller overwrites in the same
-    /// step, which is what lets the exact operation identity, typed error, and
-    /// request volume move out of the attempt without cloning any of them.
-    ///
-    /// # Panics
-    ///
-    /// Panics when `plan_index` is not an unresolved plan of `state`, which
-    /// every caller has already established.
-    fn take_retained_unknown(
-        state: &mut ForgeAttemptState,
-        plan_index: usize,
-    ) -> ForgeUnknownAcceptance {
-        let slot = state
-            .outcomes
-            .iter_mut()
-            .find(|(index, _)| *index == plan_index)
-            .expect("the caller selected a plan this attempt holds");
-        match std::mem::replace(&mut slot.1, Err(ForgeError::Shutdown)) {
-            Ok(ForgeDispatchResult::AcceptanceUnknown(unknown)) => *unknown,
-            _ => unreachable!("the caller selected an unresolved plan"),
-        }
-    }
-
-    /// Replaces one plan's retained outcome with its settled result.
-    fn replace_plan_outcome(
-        state: &mut ForgeAttemptState,
-        plan_index: usize,
-        settled: Result<ForgeDispatchResult, ForgeError>,
-    ) {
-        if let Some(slot) = state
-            .outcomes
-            .iter_mut()
-            .find(|(index, _)| *index == plan_index)
-        {
-            slot.1 = settled;
-        }
     }
 
     /// Settles one drained attempt and records the episode it completes.
@@ -3413,7 +3134,7 @@ redacted
             let Some(completion) = pool.completion_rx.recv().await else {
                 return Ok(settled);
             };
-            if let Some(state) = self.record_plan_completion(pool, completion)? {
+            if let Some(state) = Self::record_plan_completion(pool, completion)? {
                 settled = self.finish_admitted_attempt(state, shutdown).await?;
             }
         }
@@ -5317,8 +5038,8 @@ redacted
 
     /// Drops every unstarted plan this worker holds for a graceful drain.
     ///
-    /// Returns the attempts that are left with nothing in flight and are not
-    /// retained; a retained attempt stays in the pool for the shutdown handoff.
+    /// Returns the attempts that are left with nothing in flight, which the
+    /// caller settles or releases; every other attempt still has a plan running.
     fn drop_waiting_plans(pool: &mut ForgeAttemptPool) -> Vec<ForgeAttemptState> {
         let suspended: Vec<Uuid> = pool.attempts.keys().copied().collect();
         let mut stranded = Vec::new();
@@ -5338,7 +5059,6 @@ redacted
                 );
             }
             if state.drained()
-                && !state.retained()
                 && let Some(state) = pool.attempts.remove(&task_id)
             {
                 stranded.push(state);
@@ -5351,8 +5071,7 @@ redacted
     ///
     /// The exact queue reservation is released before the outcome is stored, so
     /// a completion that names a key this worker does not hold is refused
-    /// rather than double-crediting a budget. An unknown acceptance retracts
-    /// readiness in this same transition, before any classifier reads it.
+    /// rather than double-crediting a budget.
     ///
     /// Returns `None` when the finished plan has siblings this worker is still
     /// running for the same attempt.
@@ -5363,7 +5082,6 @@ redacted
     /// released, or when it names an attempt this worker is not holding: either
     /// way the owner can no longer prove what it published.
     fn record_plan_completion(
-        &self,
         pool: &mut ForgeAttemptPool,
         completion: ForgePlanCompletion,
     ) -> Result<Option<ForgeAttemptState>, ForgeError> {
@@ -5375,9 +5093,6 @@ redacted
                     key.1, key.0
                 ),
             });
-        }
-        if matches!(outcome, Ok(ForgeDispatchResult::AcceptanceUnknown(_))) {
-            self.publish_readiness(false);
         }
         let Some(state) = pool.attempts.get_mut(&key.0) else {
             return Err(ForgeError::Invariant {
@@ -6315,9 +6030,7 @@ impl ForgeCompactionPlanRunner {
                 .await?;
             match action {
                 super::publication::RewriteConflictAction::ReconcileWithoutRecommit => {
-                    return Self::reconcile_without_recommit(
-                        context, acceptance, request, conflict,
-                    );
+                    return Self::reconcile_without_recommit(context, acceptance, conflict);
                 }
                 super::publication::RewriteConflictAction::ResetDefinitelyUncommitted => {
                     // Certain non-acceptance, so this operation is closed here
@@ -6346,11 +6059,11 @@ impl ForgeCompactionPlanRunner {
     /// Reports one publication that must reconcile rather than commit again.
     ///
     /// Ambiguity is the one non-success this owner may not settle: the
-    /// operation is open, its outputs may be live, and this attempt holds the
-    /// only copy of the identity, error, and volume a later proof needs. Every
-    /// other reconcile-without-recommit outcome is a definite refusal whose
-    /// effect was already found on the table, which its caller settles as the
-    /// failure it is.
+    /// operation is open and its outputs may be live, so the attempt is
+    /// released to durable recovery carrying the operation id and the failure
+    /// as diagnostics. Every other reconcile-without-recommit outcome is a
+    /// definite refusal whose effect was already found on the table, which its
+    /// caller settles as the failure it is.
     ///
     /// # Errors
     ///
@@ -6358,7 +6071,6 @@ impl ForgeCompactionPlanRunner {
     fn reconcile_without_recommit(
         context: &RewritePublication<'_>,
         acceptance: super::publication::RewriteAcceptance,
-        request: &super::publication::RewriteCommitRequest,
         conflict: ForgeError,
     ) -> Result<ForgeDispatchResult, ForgeError> {
         if matches!(acceptance, super::publication::RewriteAcceptance::Ambiguous) {
@@ -6366,7 +6078,6 @@ impl ForgeCompactionPlanRunner {
                 ForgeUnknownAcceptance {
                     operation_id: context.identity.operation_id,
                     error: conflict,
-                    volume: rewrite_volume(request),
                 },
             )));
         }

@@ -399,13 +399,6 @@ impl Drop for ParkedCommitDropAck<'_> {
     }
 }
 
-/// Sentinel countdown value meaning no table load is to be held.
-///
-/// The countdown and its disarmed state share one atomic because a load has to
-/// read both in a single step: a two-field arm could be observed half-applied
-/// by a worker already inside [`PromotionCatalogSeam::load_table`].
-const LOAD_PAUSE_DISARMED: usize = usize::MAX;
-
 /// Catalog seam that delegates everything and can refuse or park one commit.
 ///
 /// Only `update_table` is instrumented, and only before delegation, which is
@@ -440,14 +433,6 @@ pub(crate) struct PromotionCatalogSeam {
     parked_dropped: AtomicBool,
     /// Wakes tests waiting for that cancellation.
     parked_drop_ready: tokio::sync::Notify,
-    /// Loads still to delegate before one is held, or [`LOAD_PAUSE_DISARMED`].
-    pause_after_loads: AtomicUsize,
-    /// Records that a held load is sitting at this seam.
-    load_paused: AtomicBool,
-    /// Wakes tests waiting for that held load.
-    load_paused_ready: tokio::sync::Notify,
-    /// Releases the held load.
-    load_release: tokio::sync::Notify,
     /// Whether every accepted commit's response is discarded before returning.
     lose_response: AtomicBool,
     /// Remaining accepted commits whose response never arrives at all.
@@ -478,10 +463,6 @@ impl PromotionCatalogSeam {
             parked_release: tokio::sync::Notify::new(),
             parked_dropped: AtomicBool::new(false),
             parked_drop_ready: tokio::sync::Notify::new(),
-            pause_after_loads: AtomicUsize::new(LOAD_PAUSE_DISARMED),
-            load_paused: AtomicBool::new(false),
-            load_paused_ready: tokio::sync::Notify::new(),
-            load_release: tokio::sync::Notify::new(),
             lose_response: AtomicBool::new(false),
             stall_response_budget: AtomicUsize::new(0),
             file_io: std::sync::OnceLock::new(),
@@ -599,50 +580,6 @@ impl PromotionCatalogSeam {
         self.stall_response_budget.store(count, Ordering::Release);
     }
 
-    /// Delegate the next `skip` table loads normally, then hold the one after.
-    ///
-    /// Exact-operation reconciliation reads the retained table through this
-    /// seam, so a held load is the one place a scenario can stand inside a
-    /// reconciliation await and act while the worker is stuck there. It is the
-    /// load counterpart of [`Self::park_next_commit`], and it is a countdown
-    /// rather than a one-shot because one pass reads the retained table twice
-    /// for every operation it visits, in the attempt's own plan order: the load
-    /// that opens the *last* operation's await is an exact ordinal within that
-    /// pass, not simply the next load to cross this seam. The arm is spent when
-    /// it fires, so every later load delegates untouched and a scenario that
-    /// held them all would stop the worker doing anything else it is being
-    /// observed for.
-    pub(crate) fn pause_load_after(&self, skip: usize) {
-        assert!(
-            skip < LOAD_PAUSE_DISARMED,
-            "a load-pause countdown is a real number of loads"
-        );
-        self.load_paused.store(false, Ordering::Release);
-        self.pause_after_loads.store(skip, Ordering::Release);
-    }
-
-    /// Wait until a table load is held at this seam.
-    ///
-    /// The wakeup is registered before the flag is read so a release that lands
-    /// between the two is observed rather than lost.
-    pub(crate) async fn wait_for_paused_load(&self) {
-        loop {
-            let ready = self.load_paused_ready.notified();
-            tokio::pin!(ready);
-            ready.as_mut().enable();
-            if self.load_paused.load(Ordering::Acquire) {
-                return;
-            }
-            ready.await;
-        }
-    }
-
-    /// Release the held table load.
-    pub(crate) fn release_paused_load(&self) {
-        self.load_paused.store(false, Ordering::Release);
-        self.load_release.notify_waiters();
-    }
-
     /// Release the parked commit as a definite conflict.
     pub(crate) fn reject_parked_commit(&self) {
         self.reject_parked.store(true, Ordering::Release);
@@ -701,32 +638,6 @@ impl Catalog for PromotionCatalogSeam {
 
     async fn load_table(&self, table: &TableIdent) -> iceberg::Result<Table> {
         self.loads.fetch_add(1, Ordering::AcqRel);
-        // The countdown is spent one load at a time and disarms itself as it
-        // fires, so an armed seam holds exactly the load its scenario counted
-        // to and every later load delegates untouched.
-        let hold = self
-            .pause_after_loads
-            .fetch_update(
-                Ordering::AcqRel,
-                Ordering::Acquire,
-                |remaining| match remaining {
-                    LOAD_PAUSE_DISARMED => None,
-                    0 => Some(LOAD_PAUSE_DISARMED),
-                    remaining => Some(remaining - 1),
-                },
-            )
-            .is_ok_and(|remaining| remaining == 0);
-        if hold {
-            // The release waiter is registered before the hold is announced, so
-            // a test that releases the instant it observes the hold cannot miss
-            // its own notification and strand the worker here.
-            let release = self.load_release.notified();
-            tokio::pin!(release);
-            release.as_mut().enable();
-            self.load_paused.store(true, Ordering::Release);
-            self.load_paused_ready.notify_waiters();
-            release.await;
-        }
         let loaded = self.inner.load_table(table).await?;
         let Some(file_io) = self.file_io.get() else {
             return Ok(loaded);
@@ -2028,11 +1939,6 @@ impl SupervisedPromotion {
             worker_config,
             readiness,
         }
-    }
-
-    /// Reads the readiness this supervisor's worker generation publishes.
-    pub(crate) fn worker_ready(&self) -> bool {
-        self.readiness.is_ready()
     }
 
     /// Borrows the retained Forge graph so a scenario can drive one production

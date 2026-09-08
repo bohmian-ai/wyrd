@@ -7,9 +7,7 @@ use iceberg::spec::DataContentType;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use vala_sql::queries::forge_operations::ForgeOperations;
-use vala_sql::row_types::forge_operations::{
-    ForgeOperationFamily, ForgeOperationPhase, ForgeOperationStateRow,
-};
+use vala_sql::row_types::forge_operations::{ForgeOperationFamily, ForgeOperationStateRow};
 use vala_sql::row_types::forge_tasks::ForgeTaskStrategy;
 use wyrd_spec::vala::api::{AuditDetail, ForgeIcebergRewritePhase, StoragePath};
 
@@ -329,84 +327,6 @@ impl Forge {
             volume.added_data_files,
             volume.added_bytes,
         );
-    }
-
-    /// Classifies exactly one operation this owner still holds open.
-    ///
-    /// The table-wide walk is the recovery owner for operations nobody is
-    /// holding. An attempt whose own submission returned with unknown
-    /// acceptance is the opposite case: it knows the exact UUID, still holds
-    /// the fence, and must not touch its siblings' rows or resubmit anything.
-    /// This reads that one row and runs the same classifier over it.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ForgeError::Invariant`] when the operation this owner minted
-    /// is not in durable state at all, and the SQL, catalog, storage,
-    /// cancellation, fence, and terminal-write failures classification raises.
-    pub(super) async fn reconcile_exact_live_operation(
-        &self,
-        lease: &mut ForgeLease,
-        key: &ForgeTableKey,
-        binding: &TenantTableBinding,
-        stop: &CancellationToken,
-        now: DateTime<Utc>,
-        operation_id: Uuid,
-    ) -> Result<ForgeLiveSettlement, ForgeError> {
-        let resource = ForgeGroupKey::table_audit_resource(key.tenant, &key.table_ref);
-        let operations = ForgeOperations::new(&resource, ForgeOperationFamily::IcebergRewrite)
-            .map_err(ForgeError::Sql)?;
-        let mut conn = self
-            .core
-            .vala
-            .tenant_conn(key.tenant)
-            .await
-            .map_err(ForgeError::Sql)?;
-        let row = operations
-            .operation(&mut conn, operation_id)
-            .await
-            .map_err(ForgeError::Sql)?;
-        conn.commit().await.map_err(ForgeError::Sql)?;
-        let Some(row) = row else {
-            return Err(ForgeError::Invariant {
-                detail: format!(
-                    "Forge holds unknown acceptance for absent operation {operation_id}"
-                ),
-            });
-        };
-        match row.phase {
-            ForgeOperationPhase::Committed | ForgeOperationPhase::Recovered => {
-                return Ok(ForgeLiveSettlement::Recovered(None));
-            }
-            ForgeOperationPhase::Reset => return Ok(ForgeLiveSettlement::Reset),
-            ForgeOperationPhase::Prepared => {}
-        }
-        let observation_a = self.observe_retained_manifests(binding, stop).await?;
-        let observation_b = self.observe_retained_manifests(binding, stop).await?;
-        let mut outcome = IcebergReconciliationOutcome {
-            recovered: 0,
-            reset: 0,
-            pending: 0,
-            unresolved: 0,
-            #[cfg(feature = "test-support")]
-            overflowed: false,
-            protected_output_paths: BTreeSet::new(),
-            destructive_maintenance: DestructiveMaintenance::Allowed,
-        };
-        self.classify_live_operation(
-            LiveClassificationContext {
-                lease,
-                key,
-                binding,
-                stop,
-                now,
-                observation_a: &observation_a,
-                observation_b: &observation_b,
-            },
-            &row,
-            &mut outcome,
-        )
-        .await
     }
 
     /// Reads one bounded page of this table's open rewrite operations.

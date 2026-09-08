@@ -162,6 +162,14 @@ const ORACLE_PEER_ROLE: &str = "bifrost_oracle_peer";
 /// subtract the same reservation the Forge-carrying replica takes.
 pub const HARNESS_FORGE_COMPACTION_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 
+/// Memory limit a harness node observes when a test injects no snapshot.
+///
+/// Every node in a test cluster is carved from the same fixed observation, so
+/// role placement is the only thing that moves a node's derived plan. The
+/// constant is public because a test that pins two Oracle replicas to one
+/// durable admission ceiling has to name the limit it sheds role floors from.
+pub const HARNESS_NODE_MEMORY_LIMIT_BYTES: usize = 3 * 1024 * 1024 * 1024;
+
 /// Separates a serve-task join failure from the server's own terminal outcome.
 ///
 /// The load-bearing case is [`tokio::task::JoinError::is_panic`]: a panic on the
@@ -3416,7 +3424,7 @@ impl WyrdTestServerBuilder {
             })
         };
         let snapshot = self.system_resources.unwrap_or(SystemResourceSnapshot {
-            memory_limit_bytes: 3 * 1024 * 1024 * 1024,
+            memory_limit_bytes: HARNESS_NODE_MEMORY_LIMIT_BYTES,
             effective_cpu: 4,
             scratch_capacity_bytes: 4 * 1024 * 1024 * 1024,
             scratch_available_bytes: 4 * 1024 * 1024 * 1024,

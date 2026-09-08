@@ -27,7 +27,9 @@ use wyrd_testing::bifrost::{
     BifrostClusterSpec, CommitUncertaintyCatalog, OracleFollowerPauses, TestOracleResources,
     WyrdTestCluster,
 };
-use wyrd_testing::server::HARNESS_FORGE_COMPACTION_BUDGET_BYTES;
+use wyrd_testing::server::{
+    HARNESS_FORGE_COMPACTION_BUDGET_BYTES, HARNESS_NODE_MEMORY_LIMIT_BYTES,
+};
 
 use crate::public_support::{
     JourneyTable, ManagedRow, append_values, canonical_order, read_managed_rows, register_table,
@@ -83,7 +85,11 @@ impl GeometryProfile {
         scribe_target_bytes: 4 * 1024 * 1024,
         iceberg_target_bytes: 8 * 1024 * 1024,
         row_group_bytes: 1024 * 1024,
-        small_file_threshold_bytes: 6 * 1024 * 1024,
+        // Just under the file target, as production's is: a packed residue that
+        // has not yet reached the target is still small, so the backlog keeps
+        // rolling instead of stalling on one intermediate output the next pass
+        // may no longer touch.
+        small_file_threshold_bytes: 7 * 1024 * 1024,
         production_resources: false,
     };
 
@@ -174,39 +180,42 @@ impl CloseoutJourney {
                     cpu_source: ResourceSource::Injected,
                 }),
             });
-            // Both Oracle replicas must derive the same durable admission
-            // ceiling under the qualification sizing: this is replica
-            // agreement, not sizing. The dedicated replica needs neither the
-            // Scribe protected floor nor the Forge compaction reservation the
-            // co-located coordinator takes, so its injected limit sheds exactly
-            // those two.
-            spec.nodes[2].oracle = Some(TestOracleResources {
-                spill_root: None,
-                system_resources: Some(SystemResourceSnapshot {
-                    memory_limit_bytes: 3 * 1024 * 1024 * 1024
-                        - ROLE_MEMORY_FLOOR_BYTES
-                        - HARNESS_FORGE_COMPACTION_BUDGET_BYTES,
-                    effective_cpu: 4,
-                    scratch_capacity_bytes: 4 * 1024 * 1024 * 1024,
-                    scratch_available_bytes: 4 * 1024 * 1024 * 1024,
-                    memory_source: ResourceSource::Injected,
-                    cpu_source: ResourceSource::Injected,
-                }),
-            });
-        } else {
-            // The scaled default runs the same journey on whatever the node's
-            // own resource plan reports: no compaction budget override and no
-            // injected Oracle snapshot anywhere in the topology.
+        }
+        // Both Oracle replicas must derive the same durable admission ceiling,
+        // in either profile: the canonical policy rows are globally scoped, so a
+        // dedicated replica and a co-located one that disagree fail the second
+        // pod's boot outright. This is replica agreement, not sizing. The
+        // dedicated replica needs neither the Scribe protected floor nor the
+        // Forge compaction reservation the co-located coordinator takes, so its
+        // injected limit sheds exactly those two from the harness default.
+        spec.nodes[2].oracle = Some(TestOracleResources {
+            spill_root: None,
+            system_resources: Some(SystemResourceSnapshot {
+                memory_limit_bytes: HARNESS_NODE_MEMORY_LIMIT_BYTES
+                    - ROLE_MEMORY_FLOOR_BYTES
+                    - HARNESS_FORGE_COMPACTION_BUDGET_BYTES,
+                effective_cpu: 4,
+                scratch_capacity_bytes: 4 * 1024 * 1024 * 1024,
+                scratch_available_bytes: 4 * 1024 * 1024 * 1024,
+                memory_source: ResourceSource::Injected,
+                cpu_source: ResourceSource::Injected,
+            }),
+        });
+        if !profile.production_resources {
+            // The scaled default runs the same journey on the resource plan
+            // every node reports for itself: no Forge compaction budget
+            // anywhere, and no node sized past the harness default.
             for node in &spec.nodes {
                 assert_eq!(
                     node.forge_compaction_memory_limit_bytes, None,
                     "the fast profile overrides no Forge compaction budget"
                 );
                 assert!(
-                    node.oracle
-                        .as_ref()
-                        .is_none_or(|oracle| oracle.system_resources.is_none()),
-                    "the fast profile injects no Oracle resource snapshot"
+                    node.oracle.as_ref().is_none_or(|oracle| oracle
+                        .system_resources
+                        .is_none_or(|resources| resources.memory_limit_bytes
+                            <= HARNESS_NODE_MEMORY_LIMIT_BYTES)),
+                    "the fast profile sizes no node past the harness default"
                 );
             }
         }

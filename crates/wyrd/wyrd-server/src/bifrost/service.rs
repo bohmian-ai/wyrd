@@ -80,8 +80,10 @@ fn assert_registered_layout_matches(
 ) -> Result<(), WyrdError> {
     let stored_schema = arrow::datatypes::Schema::new(
         existing
-            .fields
+            .user_fields
             .iter()
+            .chain(&existing.correlation_fields)
+            .chain(&existing.managed_candidates)
             .map(convert::field_to_arrow)
             .collect::<Vec<_>>(),
     );
@@ -499,7 +501,7 @@ mod pg_tests {
             assert_eq!(described.entry.name, name);
             assert!(
                 described
-                    .fields
+                    .user_fields
                     .iter()
                     .any(|f| f.name == "value" && f.data_type == DataTypeSpec::Int64),
                 "describe surfaces the user field"

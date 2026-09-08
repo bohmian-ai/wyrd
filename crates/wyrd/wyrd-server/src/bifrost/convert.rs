@@ -72,11 +72,7 @@ pub fn data_type_to_arrow(spec: &DataTypeSpec) -> DataType {
         DataTypeSpec::Time32 { unit } => DataType::Time32(time_unit_to_arrow(*unit)),
         DataTypeSpec::Time64 { unit } => DataType::Time64(time_unit_to_arrow(*unit)),
         DataTypeSpec::Decimal128 { precision, scale } => DataType::Decimal128(*precision, *scale),
-        DataTypeSpec::List(inner) => DataType::List(Arc::new(Field::new(
-            "item",
-            data_type_to_arrow(inner),
-            true,
-        ))),
+        DataTypeSpec::List(element) => DataType::List(Arc::new(field_to_arrow(element))),
         DataTypeSpec::Struct(fields) => {
             DataType::Struct(fields.iter().map(field_to_arrow).collect())
         }
@@ -121,9 +117,7 @@ pub fn data_type_from_arrow(dt: &DataType) -> Result<DataTypeSpec, WyrdError> {
             precision: *precision,
             scale: *scale,
         },
-        DataType::List(field) => {
-            DataTypeSpec::List(Box::new(data_type_from_arrow(field.data_type())?))
-        }
+        DataType::List(element) => DataTypeSpec::List(Box::new(field_from_arrow(element)?)),
         DataType::Struct(fields) => {
             let mut specs = Vec::with_capacity(fields.len());
             for field in fields {
@@ -142,21 +136,34 @@ pub fn data_type_from_arrow(dt: &DataType) -> Result<DataTypeSpec, WyrdError> {
 }
 
 /// Convert a wire [`FieldSpec`] into an Arrow [`Field`].
+///
+/// Metadata travels with the field, so a stable `PARQUET:field_id` supplied by
+/// a description survives the round trip into Arrow at every nesting depth.
 pub fn field_to_arrow(field: &FieldSpec) -> Field {
     Field::new(
         field.name.clone(),
         data_type_to_arrow(&field.data_type),
         field.nullable,
     )
+    .with_metadata(field.metadata.clone().into_iter().collect())
 }
 
 /// Convert an Arrow [`Field`] back into a wire [`FieldSpec`].
+///
+/// # Errors
+///
+/// Returns [`WyrdError::Internal`] when the stored type is outside the
+/// register-accepted set, propagated from [`data_type_from_arrow`].
 pub fn field_from_arrow(field: &Field) -> Result<FieldSpec, WyrdError> {
     Ok(FieldSpec {
         name: field.name().clone(),
         data_type: data_type_from_arrow(field.data_type())?,
         nullable: field.is_nullable(),
-        metadata: std::collections::BTreeMap::new(),
+        metadata: field
+            .metadata()
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
     })
 }
 
@@ -183,8 +190,11 @@ pub fn fingerprint_hex(user_fields: &[Field]) -> String {
 mod tests {
     use super::*;
 
+    use std::collections::BTreeMap;
+
+    use wyrd_spec::vala::api::PARQUET_FIELD_ID_KEY;
+
     fn sample_field_specs() -> Vec<FieldSpec> {
-        use std::collections::BTreeMap;
         let plain = |name: &str, data_type: DataTypeSpec| FieldSpec {
             name: name.to_owned(),
             data_type,
@@ -213,7 +223,15 @@ mod tests {
                     scale: 9,
                 },
             ),
-            plain("tags", DataTypeSpec::List(Box::new(DataTypeSpec::Utf8))),
+            plain(
+                "tags",
+                DataTypeSpec::List(Box::new(FieldSpec {
+                    name: "item".to_owned(),
+                    data_type: DataTypeSpec::Utf8,
+                    nullable: true,
+                    metadata: BTreeMap::new(),
+                })),
+            ),
             plain(
                 "nested",
                 DataTypeSpec::Struct(vec![plain("inner", DataTypeSpec::Int32)]),
@@ -251,5 +269,58 @@ mod tests {
         );
         let err = namespace_from_wire("public").expect_err("unknown namespace rejected");
         assert_eq!(err.status(), 400);
+    }
+
+    /// A nested description keeps every child's identity through Arrow.
+    ///
+    /// The list child is a full declaration, not a synthesized nullable
+    /// `item`, and both it and a struct child carry their stable
+    /// `PARQUET:field_id` in each direction. A client that rebuilds an Arrow
+    /// schema from a description therefore reproduces the stored physical
+    /// schema rather than an approximation of it.
+    #[test]
+    fn nested_field_description_preserves_identity_and_metadata() {
+        let id = |value: i32| BTreeMap::from([(PARQUET_FIELD_ID_KEY.to_owned(), value.to_string())]);
+        let spec = FieldSpec {
+            name: "events".to_owned(),
+            data_type: DataTypeSpec::List(Box::new(FieldSpec {
+                name: "event".to_owned(),
+                data_type: DataTypeSpec::Struct(vec![FieldSpec {
+                    name: "attributes".to_owned(),
+                    data_type: DataTypeSpec::Binary,
+                    nullable: false,
+                    metadata: id(20),
+                }]),
+                nullable: false,
+                metadata: id(17),
+            })),
+            nullable: false,
+            metadata: id(16),
+        };
+
+        let arrow = field_to_arrow(&spec);
+        assert_eq!(arrow.metadata().get(PARQUET_FIELD_ID_KEY), Some(&"16".to_owned()));
+        let DataType::List(element) = arrow.data_type() else {
+            panic!("a list declaration must project an Arrow list");
+        };
+        assert_eq!(element.name(), "event");
+        assert!(!element.is_nullable());
+        assert_eq!(
+            element.metadata().get(PARQUET_FIELD_ID_KEY),
+            Some(&"17".to_owned())
+        );
+        let DataType::Struct(children) = element.data_type() else {
+            panic!("the list element must project its declared struct");
+        };
+        assert_eq!(
+            children[0].metadata().get(PARQUET_FIELD_ID_KEY),
+            Some(&"20".to_owned())
+        );
+
+        assert_eq!(
+            field_from_arrow(&arrow).expect("the Arrow field maps back to its declaration"),
+            spec,
+            "every nested name, nullability, and field id survives both directions"
+        );
     }
 }

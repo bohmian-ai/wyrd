@@ -101,11 +101,30 @@ pub struct BifrostTableEntry {
 pub struct BifrostTableDescription {
     /// The same lightweight entry returned by the list route.
     pub entry: BifrostTableEntry,
-    /// The stored schema as Arrow-free [`FieldSpec`]s. Includes the universal
-    /// `card_ref`/`run_id` correlation columns (flagged in
-    /// [`FieldSpec::metadata`]); the server-stamped `wyrd_*`/`data_tenant_id`
-    /// system columns are excluded.
-    pub fields: Vec<FieldSpec>,
+    /// The table's own declared columns, in stored order.
+    ///
+    /// Server-owned correlation and managed columns are not here; they are
+    /// reported separately so a writer can tell what it declares from what the
+    /// server appends.
+    pub user_fields: Vec<FieldSpec>,
+    /// The correlation inputs a writer supplies alongside its user fields.
+    ///
+    /// Exactly non-null `card_ref: Utf8` — a Gate input tagged
+    /// [`INPUT_CLASS_KEY`]`=`[`INPUT_CLASS_GATE_CORRELATION`] that resolves to
+    /// the stored `card_uid` and therefore carries no field id — followed by
+    /// nullable `run_id: Utf8` with the field id its physical column holds.
+    pub correlation_fields: Vec<FieldSpec>,
+    /// Managed columns a writer may supply itself rather than let the server
+    /// stamp: non-null `wyrd_event_time: Timestamp(Microsecond, UTC)`.
+    pub managed_candidates: Vec<FieldSpec>,
+    /// Lower-case 64-character hex of the complete canonical physical
+    /// fingerprint, present only for a canonical `OTel` signal built-in.
+    ///
+    /// [`BifrostTableEntry::fingerprint`] keeps its user-schema meaning for
+    /// every table; this is the separate whole-physical-schema identity, and it
+    /// is omitted for a dynamically registered table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_physical_fingerprint: Option<String>,
     /// The server-resolved canonical physical layout, fully populated.
     pub physical_layout: PhysicalLayoutWire,
 }
@@ -195,8 +214,14 @@ pub enum DataTypeSpec {
         /// Number of fractional digits.
         scale: i8,
     },
-    /// Variable-length list of a single element type.
-    List(Box<DataTypeSpec>),
+    /// Variable-length list whose boxed element declaration carries the child's
+    /// name, nullability, metadata, and stable field id.
+    ///
+    /// The element is a full [`FieldSpec`] rather than a bare type so a nested
+    /// child keeps the same identity the physical schema stores; a client that
+    /// rebuilds an Arrow schema from a description reproduces the stored list
+    /// child exactly instead of inventing a nullable `item`.
+    List(Box<FieldSpec>),
     /// Nested struct of named fields.
     Struct(Vec<FieldSpec>),
 }
@@ -213,11 +238,26 @@ pub struct FieldSpec {
     /// Whether the column is nullable. Defaults to `true`.
     #[serde(default = "default_true")]
     pub nullable: bool,
-    /// String metadata. Bifrost describe uses the `wyrd:column_class` key to
-    /// flag `correlation` columns distinctly from user columns.
+    /// String metadata carried verbatim through every schema conversion.
+    ///
+    /// Two keys are meaningful to Bifrost: [`PARQUET_FIELD_ID_KEY`] holds the
+    /// stored stable field id as decimal text, and [`INPUT_CLASS_KEY`] marks a
+    /// declaration that is a write-time input rather than a stored column.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub metadata: BTreeMap<String, String>,
 }
+
+/// Metadata key holding one field's stable id, as decimal text.
+///
+/// This is the same key Parquet and Iceberg read a field id from, so a
+/// description round-trips through Arrow without a second id convention.
+pub const PARQUET_FIELD_ID_KEY: &str = "PARQUET:field_id";
+
+/// Metadata key marking a declaration as a write-time input class.
+pub const INPUT_CLASS_KEY: &str = "wyrd:input_class";
+
+/// [`INPUT_CLASS_KEY`] value for a correlation input Gate resolves on write.
+pub const INPUT_CLASS_GATE_CORRELATION: &str = "gate_correlation";
 
 /// Descriptor for one entry in the Bifrost error catalog.
 ///
@@ -3809,8 +3849,11 @@ impl AuditEvent {
 mod bifrost_wire_tests {
     //! Contract tests for the Arrow-free Bifrost wire types in `crate::vala::api`.
 
+    use std::collections::BTreeMap;
+
     use crate::vala::api::{
-        BifrostTableDescription, BifrostTableEntry, DataTypeSpec, FieldSpec, NullOrderWire,
+        BifrostTableDescription, BifrostTableEntry, DataTypeSpec, FieldSpec,
+        INPUT_CLASS_GATE_CORRELATION, INPUT_CLASS_KEY, NullOrderWire, PARQUET_FIELD_ID_KEY,
         PhysicalLayoutWire, QueryParam, RegisterOutcome, RegisterTableRequest,
         RegisterTableResponse, SortDirectionWire, SortKeyWire, SyncQueryRequest, TableStatus,
         TimeGranularityWire, TimeUnit,
@@ -3948,7 +3991,15 @@ mod bifrost_wire_tests {
             data_type: DataTypeSpec::Struct(vec![
                 FieldSpec {
                     name: "tags".to_string(),
-                    data_type: DataTypeSpec::List(Box::new(DataTypeSpec::Utf8)),
+                    data_type: DataTypeSpec::List(Box::new(FieldSpec {
+                        name: "item".to_string(),
+                        data_type: DataTypeSpec::Utf8,
+                        nullable: false,
+                        metadata: BTreeMap::from([(
+                            PARQUET_FIELD_ID_KEY.to_string(),
+                            "42".to_string(),
+                        )]),
+                    })),
                     nullable: true,
                     metadata: Default::default(),
                 },
@@ -3981,12 +4032,45 @@ mod bifrost_wire_tests {
         };
         let desc = BifrostTableDescription {
             entry: entry.clone(),
-            fields: vec![FieldSpec {
+            user_fields: vec![FieldSpec {
                 name: "value".to_string(),
                 data_type: DataTypeSpec::Int64,
                 nullable: false,
                 metadata: Default::default(),
             }],
+            correlation_fields: vec![
+                FieldSpec {
+                    name: "card_ref".to_string(),
+                    data_type: DataTypeSpec::Utf8,
+                    nullable: false,
+                    metadata: BTreeMap::from([(
+                        INPUT_CLASS_KEY.to_string(),
+                        INPUT_CLASS_GATE_CORRELATION.to_string(),
+                    )]),
+                },
+                FieldSpec {
+                    name: "run_id".to_string(),
+                    data_type: DataTypeSpec::Utf8,
+                    nullable: true,
+                    metadata: BTreeMap::from([(
+                        PARQUET_FIELD_ID_KEY.to_string(),
+                        "1000".to_string(),
+                    )]),
+                },
+            ],
+            managed_candidates: vec![FieldSpec {
+                name: "wyrd_event_time".to_string(),
+                data_type: DataTypeSpec::Timestamp {
+                    unit: TimeUnit::Microsecond,
+                    tz: Some("UTC".to_string()),
+                },
+                nullable: false,
+                metadata: BTreeMap::from([(
+                    PARQUET_FIELD_ID_KEY.to_string(),
+                    "1004".to_string(),
+                )]),
+            }],
+            canonical_physical_fingerprint: None,
             physical_layout: PhysicalLayoutWire {
                 partition_granularity: TimeGranularityWire::Hour,
                 sort_keys: vec![SortKeyWire {

@@ -3,14 +3,14 @@
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit as ArrowTimeUnit};
 use vala_sql::row_types::olap_catalog::BifrostTableRow;
 use wyrd_spec::vala::api::{
-    BifrostTableEntry, DataTypeSpec, FieldSpec, PhysicalLayoutWire, TableStatus, TimeUnit,
+    BifrostTableEntry, DataTypeSpec, FieldSpec, INPUT_CLASS_GATE_CORRELATION, INPUT_CLASS_KEY,
+    PhysicalLayoutWire, TableStatus, TimeUnit,
 };
-use wyrd_spec::vala::{is_reserved_correlation_column, is_reserved_managed_column};
+use wyrd_spec::vala::{
+    CARD_REF, RUN_ID, WYRD_EVENT_TIME, is_reserved_correlation_column, is_reserved_managed_column,
+};
 
 use crate::catalog::BifrostCatalogError;
-
-const COLUMN_CLASS_KEY: &str = "wyrd:column_class";
-const COLUMN_CLASS_CORRELATION: &str = "correlation";
 
 /// Reject user fields that collide with server-owned physical columns.
 pub fn reject_reserved_field_names(user_fields: &[Field]) -> Result<(), BifrostCatalogError> {
@@ -62,24 +62,72 @@ pub fn layout_wire_from_row(
     })
 }
 
-/// Project a stored physical schema onto user and correlation fields.
-pub fn fields_from_stored_schema(schema: &Schema) -> Result<Vec<FieldSpec>, BifrostCatalogError> {
-    let mut fields = Vec::new();
+/// The three describe field classes projected from one stored physical schema.
+///
+/// Splitting them is what lets a writer tell what it declares (`user_fields`)
+/// from the correlation inputs Gate resolves (`correlation_fields`) and the
+/// managed columns it may supply instead of letting the server stamp them
+/// (`managed_candidates`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DescribedFields {
+    /// The table's own declared columns, in stored order.
+    pub user_fields: Vec<FieldSpec>,
+    /// `card_ref` then `run_id`, the correlation inputs a writer supplies.
+    pub correlation_fields: Vec<FieldSpec>,
+    /// `wyrd_event_time`, the one managed column a writer may supply itself.
+    pub managed_candidates: Vec<FieldSpec>,
+}
+
+/// Project a stored physical schema onto the three describe field classes.
+///
+/// `card_ref` is a Gate input rather than a stored column: it resolves to
+/// `card_uid` on write, so it is synthesized here with the gate-correlation
+/// input class and carries no field id. Every other declaration is taken from
+/// the stored schema, so its type, nullability, and stable field id are the
+/// table's actual ones rather than a restatement.
+///
+/// # Errors
+///
+/// Returns [`BifrostCatalogError::MetadataMismatch`] when a stored column type
+/// is not representable on the wire.
+pub fn described_fields_from_stored_schema(
+    schema: &Schema,
+) -> Result<DescribedFields, BifrostCatalogError> {
+    let mut described = DescribedFields {
+        user_fields: Vec::new(),
+        correlation_fields: vec![FieldSpec {
+            name: CARD_REF.to_owned(),
+            data_type: DataTypeSpec::Utf8,
+            nullable: false,
+            metadata: std::collections::BTreeMap::from([(
+                INPUT_CLASS_KEY.to_owned(),
+                INPUT_CLASS_GATE_CORRELATION.to_owned(),
+            )]),
+        }],
+        managed_candidates: Vec::new(),
+    };
+    let mut run_id = None;
     for field in schema.fields() {
-        let name = field.name();
-        if is_reserved_managed_column(name) {
-            continue;
+        let name = field.name().as_str();
+        if name == RUN_ID {
+            run_id = Some(field_to_spec(field)?);
+        } else if name == WYRD_EVENT_TIME {
+            described.managed_candidates.push(field_to_spec(field)?);
+        } else if !is_reserved_managed_column(name) && !is_reserved_correlation_column(name) {
+            described.user_fields.push(field_to_spec(field)?);
         }
-        let mut spec = field_to_spec(field)?;
-        if is_reserved_correlation_column(name) {
-            spec.metadata.insert(
-                COLUMN_CLASS_KEY.to_owned(),
-                COLUMN_CLASS_CORRELATION.to_owned(),
-            );
-        }
-        fields.push(spec);
     }
-    Ok(fields)
+    // A table whose correlation policy appends no `run_id` column still accepts
+    // one on the wire; it simply has no stored field id to report.
+    described
+        .correlation_fields
+        .push(run_id.unwrap_or_else(|| FieldSpec {
+            name: RUN_ID.to_owned(),
+            data_type: DataTypeSpec::Utf8,
+            nullable: true,
+            metadata: std::collections::BTreeMap::new(),
+        }));
+    Ok(described)
 }
 
 fn status_from_db(status: &str) -> Result<TableStatus, BifrostCatalogError> {
@@ -93,12 +141,25 @@ fn status_from_db(status: &str) -> Result<TableStatus, BifrostCatalogError> {
     }
 }
 
+/// Project one stored Arrow field onto its wire declaration.
+///
+/// Arrow metadata is carried verbatim, which is what puts the stored
+/// `PARQUET:field_id` (and every nested child's) onto the wire.
+///
+/// # Errors
+///
+/// Returns [`BifrostCatalogError::MetadataMismatch`] when the stored type is
+/// not representable on the wire.
 fn field_to_spec(field: &Field) -> Result<FieldSpec, BifrostCatalogError> {
     Ok(FieldSpec {
         name: field.name().clone(),
         data_type: data_type_from_arrow(field.data_type())?,
         nullable: field.is_nullable(),
-        metadata: std::collections::BTreeMap::new(),
+        metadata: field
+            .metadata()
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
     })
 }
 
@@ -136,9 +197,7 @@ fn data_type_from_arrow(data_type: &DataType) -> Result<DataTypeSpec, BifrostCat
             precision: *precision,
             scale: *scale,
         },
-        DataType::List(field) => {
-            DataTypeSpec::List(Box::new(data_type_from_arrow(field.data_type())?))
-        }
+        DataType::List(element) => DataTypeSpec::List(Box::new(field_to_spec(element)?)),
         DataType::Struct(fields) => {
             let fields = fields
                 .iter()
@@ -205,42 +264,71 @@ mod tests {
         );
     }
 
-    /// Projection classifies exactly the correlation columns, hides the managed
-    /// ones, and leaves user fields unannotated.
+    /// Projection splits every stored column into its describe class.
     ///
-    /// The correlation class is what tells a client which columns it may not
-    /// declare but will still read back. Missing one member — again, the case
-    /// `principal_id` was in — would present a server-stamped column as an
-    /// ordinary user field.
+    /// The split is what tells a client which columns it declares, which it
+    /// supplies as correlation inputs, and which the server stamps. Leaking a
+    /// server-stamped column such as `principal_id` into `user_fields` would
+    /// present it as an ordinary declarable column.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a class gains or loses a column.
     #[test]
     fn stored_schema_projection_classifies_every_correlation_column() {
         let mut fields: Vec<Field> = RESERVED_MANAGED_COLUMNS
             .iter()
             .chain(RESERVED_CORRELATION_COLUMNS.iter())
-            .map(|name| Field::new(*name, DataType::Utf8, true))
+            .map(|name| {
+                if *name == WYRD_EVENT_TIME {
+                    Field::new(
+                        *name,
+                        DataType::Timestamp(ArrowTimeUnit::Microsecond, Some("UTC".into())),
+                        false,
+                    )
+                } else {
+                    Field::new(*name, DataType::Utf8, true)
+                }
+            })
             .collect();
         fields.push(Field::new("value", DataType::Int64, true));
         let schema = Schema::new(fields);
 
-        let projected =
-            fields_from_stored_schema(&schema).expect("the stored schema projects onto the wire");
+        let described = described_fields_from_stored_schema(&schema)
+            .expect("the stored schema projects onto the wire");
 
-        let classified: Vec<&str> = projected
-            .iter()
-            .filter(|spec| {
-                spec.metadata.get(COLUMN_CLASS_KEY).map(String::as_str)
-                    == Some(COLUMN_CLASS_CORRELATION)
-            })
-            .map(|spec| spec.name.as_str())
-            .collect();
         assert_eq!(
-            classified, RESERVED_CORRELATION_COLUMNS,
-            "exactly the canonical correlation columns carry the correlation class"
+            described
+                .user_fields
+                .iter()
+                .map(|spec| spec.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["value"],
+            "only declarable columns are user fields: {:?}",
+            described.user_fields
         );
         assert_eq!(
-            projected.len(),
-            RESERVED_CORRELATION_COLUMNS.len() + 1,
-            "managed columns must not reach the wire: {projected:?}"
+            described
+                .correlation_fields
+                .iter()
+                .map(|spec| spec.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![CARD_REF, RUN_ID],
+            "correlation is exactly the card reference input and the run id"
+        );
+        assert_eq!(
+            described.correlation_fields[0].metadata.get(INPUT_CLASS_KEY),
+            Some(&INPUT_CLASS_GATE_CORRELATION.to_owned()),
+            "card_ref is a Gate input, not a stored column"
+        );
+        assert_eq!(
+            described
+                .managed_candidates
+                .iter()
+                .map(|spec| spec.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![WYRD_EVENT_TIME],
+            "event time is the one managed column a writer may supply"
         );
     }
 }

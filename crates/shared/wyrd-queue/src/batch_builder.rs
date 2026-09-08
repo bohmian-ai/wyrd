@@ -18,6 +18,7 @@ use arrow::ipc::writer::StreamWriter;
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use serde_json::{Map, Value};
 use wyrd_spec::reference::CardRef;
+use wyrd_spec::vala::api::BifrostTableDescription;
 use wyrd_spec::vala::ids::RunId;
 
 use crate::error::WyrdQueueError;
@@ -56,6 +57,35 @@ impl BatchBuilder {
             schema,
             rows: Vec::new(),
         }
+    }
+
+    /// Construct a builder from one describe response.
+    ///
+    /// Only `user_fields` become builder columns: the correlation columns are
+    /// appended once by [`Self::output_schema`], and the managed candidates are
+    /// omitted because this JSON-row API takes no timestamp argument and lets
+    /// the server stamp event time. Passing the described correlation fields in
+    /// here as well would send each of them twice.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WyrdQueueError::SchemaParse`] when a described user column is
+    /// not representable as Arrow, and [`WyrdQueueError::ReservedColumn`] when
+    /// the description carries a server-owned column among its user fields.
+    pub fn from_description(
+        description: &BifrostTableDescription,
+    ) -> Result<Self, WyrdQueueError> {
+        for spec in &description.user_fields {
+            if is_reserved_column(&spec.name) {
+                return Err(WyrdQueueError::ReservedColumn(format!(
+                    "described user column `{}` is server-owned",
+                    spec.name
+                )));
+            }
+        }
+        Ok(Self::new(Arc::new(crate::schema::fieldspec_to_arrow(
+            &description.user_fields,
+        )?)))
     }
 
     /// Number of rows buffered so far.

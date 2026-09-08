@@ -25,7 +25,8 @@ use iceberg::io::StorageFactory;
 use crate::catalog::iceberg_storage::BifrostIcebergStorageFactory;
 use crate::catalog::storage::{iceberg_catalog_properties, warehouse_uri};
 use crate::catalog::wire::{
-    entry_from_row, fields_from_stored_schema, layout_wire_from_row, reject_reserved_field_names,
+    described_fields_from_stored_schema, entry_from_row, layout_wire_from_row,
+    reject_reserved_field_names,
 };
 use crate::catalog::{TableRef, TenantTableBinding};
 use crate::namespaces::BifrostNamespace;
@@ -982,9 +983,18 @@ impl BifrostCatalog {
         let iceberg_table = self.catalog.load_table(&binding.table_ident()).await?;
         let arrow_schema =
             iceberg::arrow::schema_to_arrow_schema(iceberg_table.metadata().current_schema())?;
+        let described = described_fields_from_stored_schema(&arrow_schema)?;
         Ok(BifrostTableDescription {
             entry: entry_from_row(&row)?,
-            fields: fields_from_stored_schema(&arrow_schema)?,
+            user_fields: described.user_fields,
+            correlation_fields: described.correlation_fields,
+            managed_candidates: described.managed_candidates,
+            canonical_physical_fingerprint: builtin_table(
+                table.namespace.as_str().strip_prefix("vala.").unwrap_or_default(),
+                &table.name,
+            )
+            .and_then(|definition| (definition.canonical_physical_fingerprint)())
+            .map(|fingerprint| fingerprint.to_hex()),
             physical_layout: layout_wire_from_row(&row)?,
         })
     }

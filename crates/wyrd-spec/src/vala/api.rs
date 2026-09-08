@@ -396,20 +396,28 @@ pub struct QueryWindow {
     pub page_token: Option<String>,
 }
 
-/// `GetTrace` request — fetch one full trace waterfall by id.
+/// `GetTrace` request — fetch one complete trace by id.
+///
+/// Trace detail returns one complete authorized cut of the requested trace, so
+/// this contract carries no page size and no continuation token. `since` and
+/// `until` bound the `wyrd_event_time` scan only; the server rejects a request
+/// whose `since` is later than its `until`.
 ///
 /// # Example
 /// ```json
-/// { "trace_id": "b7f3c1e2a4d5", "since": "2026-07-01T00:00:00Z" }
+/// { "trace_id": "0102030405060708090a0b0c0d0e0f10", "since": "2026-07-01T00:00:00Z" }
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct GetTraceRequest {
-    /// Shared time-window + pagination envelope.
-    #[serde(flatten)]
-    pub window: QueryWindow,
-    /// Trace id to fetch. Required.
+    /// Trace id to fetch, as lower-case hex of the 16-byte id. Required.
     pub trace_id: String,
+    /// Inclusive lower bound on `wyrd_event_time`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<DateTime<Utc>>,
+    /// Exclusive upper bound on `wyrd_event_time`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until: Option<DateTime<Utc>>,
 }
 
 /// `QueryTraces` request — list trace summaries matching the filters.
@@ -596,83 +604,152 @@ pub struct QueryAgentTracesRequest {
     pub run_id: Option<String>,
 }
 
-/// One span in a trace waterfall. `attributes` is payload-gated and omitted when
-/// the caller lacks `bifrost_trace_payload:read`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-pub struct SpanRow {
-    /// Span id.
-    pub span_id: String,
-    /// Parent span id; absent for the root span.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parent_span_id: Option<String>,
-    /// Span name.
-    pub name: String,
-    /// Span kind (e.g. `"SERVER"`, `"CLIENT"`).
-    pub kind: String,
-    /// Span start time.
-    pub started_at: DateTime<Utc>,
-    /// Span duration in milliseconds.
-    pub duration_ms: f64,
-    /// Span status (e.g. `"OK"`, `"ERROR"`).
-    pub status: String,
-    /// Payload-gated span attributes; omitted without `bifrost_trace_payload:read`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub attributes: Option<serde_json::Value>,
-}
-
-/// One span event. `attributes` is payload-gated (`bifrost_trace_payload:read`).
+/// One nested span event, ordered within its owning span.
+///
+/// Everything an event carries is caller content, so `attributes` is projected
+/// only for a caller holding `BifrostTracePayload:Read` and is omitted from the
+/// wire entirely otherwise.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct SpanEventRow {
+    /// Event timestamp at exact protocol nanosecond precision.
+    pub time_unix_nano: i64,
     /// Event name.
     pub name: String,
-    /// Event timestamp.
-    pub timestamp: DateTime<Utc>,
-    /// Payload-gated event attributes; omitted without `bifrost_trace_payload:read`.
+    /// Payload-gated event attributes; omitted without `BifrostTracePayload:Read`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attributes: Option<serde_json::Value>,
+    /// Attributes the producer dropped before export.
+    pub dropped_attributes_count: i64,
 }
 
-/// One span link. `attributes` is payload-gated (`bifrost_trace_payload:read`).
+/// One nested span link, ordered within its owning span.
+///
+/// `attributes` is payload-gated the same way [`SpanEventRow::attributes`] is;
+/// the linked identifiers, trace state, and raw flag word remain metadata.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct SpanLinkRow {
-    /// Linked trace id.
+    /// Linked trace id as lower-case hex of its 16 bytes.
     pub linked_trace_id: String,
-    /// Linked span id.
+    /// Linked span id as lower-case hex of its 8 bytes.
     pub linked_span_id: String,
-    /// Payload-gated link attributes; omitted without `bifrost_trace_payload:read`.
+    /// W3C trace state carried by the link.
+    pub trace_state: String,
+    /// Raw protocol flag word, uninterpreted.
+    pub flags: i64,
+    /// Payload-gated link attributes; omitted without `BifrostTracePayload:Read`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attributes: Option<serde_json::Value>,
+    /// Attributes the producer dropped before export.
+    pub dropped_attributes_count: i64,
 }
 
-/// `GetTrace` response — the full waterfall for one trace. Nested-row payload
-/// fields are omitted when the caller lacks `bifrost_trace_payload:read`.
+/// One complete span in a trace, with its events and links nested on it.
+///
+/// Metadata, dropped counts, and the promoted `service_name` are returned under
+/// the ordinary trace-read permission. The sensitive payload columns —
+/// `attributes`, `events`, `links`, `resource_attributes`, and
+/// `scope_attributes` — are `None` and omitted from the wire unless the caller
+/// holds `BifrostTracePayload:Read`; the server never reads those physical
+/// columns for an unauthorized plan. Timestamps stay at exact protocol
+/// nanosecond precision and `kind`/`flags`/`status_code` keep their raw wire
+/// values rather than a collapsed textual form.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct SpanRow {
+    /// Span id as lower-case hex of its 8 bytes.
+    pub span_id: String,
+    /// Parent span id as lower-case hex; absent for the root span.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_span_id: Option<String>,
+    /// W3C trace state carried by the span.
+    pub trace_state: String,
+    /// Raw protocol flag word, uninterpreted.
+    pub flags: i64,
+    /// Span name.
+    pub name: String,
+    /// Raw protocol span-kind discriminant, not collapsed to a label.
+    pub kind: i32,
+    /// Start timestamp at exact protocol nanosecond precision.
+    pub start_time_unix_nano: i64,
+    /// End timestamp at exact protocol nanosecond precision.
+    pub end_time_unix_nano: i64,
+    /// Consistently derived duration in nanoseconds.
+    pub duration_nano: i64,
+    /// Raw protocol status-code discriminant; absent when the span carried no status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_code: Option<i32>,
+    /// Status description; bulk payload, not access-gated caller content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_message: Option<String>,
+    /// Payload-gated span attributes; omitted without `BifrostTracePayload:Read`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attributes: Option<serde_json::Value>,
+    /// Attributes the producer dropped before export.
+    pub dropped_attributes_count: i64,
+    /// Payload-gated ordered span events; omitted without `BifrostTracePayload:Read`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub events: Option<Vec<SpanEventRow>>,
+    /// Events the producer dropped before export.
+    pub dropped_events_count: i64,
+    /// Payload-gated ordered span links; omitted without `BifrostTracePayload:Read`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub links: Option<Vec<SpanLinkRow>>,
+    /// Links the producer dropped before export.
+    pub dropped_links_count: i64,
+    /// Promoted `service.name` resource attribute; null when absent or non-string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_name: Option<String>,
+    /// Payload-gated resource attributes; omitted without `BifrostTracePayload:Read`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_attributes: Option<serde_json::Value>,
+    /// Resource attributes the producer dropped before export.
+    pub resource_dropped_attributes_count: i64,
+    /// Resource schema URL; empty when the producer sent none.
+    pub resource_schema_url: String,
+    /// Instrumentation-scope name; empty when the producer sent none.
+    pub scope_name: String,
+    /// Instrumentation-scope version; empty when the producer sent none.
+    pub scope_version: String,
+    /// Payload-gated scope attributes; omitted without `BifrostTracePayload:Read`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_attributes: Option<serde_json::Value>,
+    /// Scope attributes the producer dropped before export.
+    pub scope_dropped_attributes_count: i64,
+    /// Instrumentation-scope schema URL; empty when the producer sent none.
+    pub scope_schema_url: String,
+}
+
+/// `GetTrace` response body — one complete authorized cut of a trace.
+///
+/// Span children live on their owning [`SpanRow`], so this carries no
+/// top-level event or link collection.
 ///
 /// # Example
 /// ```json
 /// {
-///   "trace_id": "b7f3c1e2a4d5",
+///   "trace_id": "0102030405060708090a0b0c0d0e0f10",
 ///   "spans": [
-///     { "span_id": "1", "name": "GET /checkout", "kind": "SERVER",
-///       "started_at": "2026-07-01T00:00:00Z", "duration_ms": 42.5, "status": "OK" }
-///   ],
-///   "events": [],
-///   "links": []
+///     { "span_id": "00000000000000a1", "trace_state": "", "flags": 0,
+///       "name": "GET /checkout", "kind": 2,
+///       "start_time_unix_nano": 1725000000000000000,
+///       "end_time_unix_nano": 1725000000042500000,
+///       "duration_nano": 42500000,
+///       "dropped_attributes_count": 0, "dropped_events_count": 0,
+///       "dropped_links_count": 0, "resource_dropped_attributes_count": 0,
+///       "resource_schema_url": "", "scope_name": "", "scope_version": "",
+///       "scope_dropped_attributes_count": 0, "scope_schema_url": "" }
+///   ]
 /// }
 /// ```
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct TraceWaterfall {
-    /// Trace id.
+    /// Trace id as lower-case hex of its 16 bytes.
     pub trace_id: String,
-    /// Spans in the trace.
+    /// Every authorized span in the trace, each carrying its own children.
     pub spans: Vec<SpanRow>,
-    /// Span events in the trace. Stage 4 stub — always empty until traces.events extraction is implemented.
-    pub events: Vec<SpanEventRow>,
-    /// Span links in the trace. Stage 4 stub — always empty until traces.links extraction is implemented.
-    pub links: Vec<SpanLinkRow>,
 }
 
 /// `GetTrace` response — wraps the full waterfall for one trace.
@@ -703,34 +780,39 @@ pub struct TraceSummaryRow {
     pub error: bool,
 }
 
-/// One GenAI generation record. `prompt`/`completion` are payload-gated and
-/// omitted when the caller lacks `bifrost_genai_payload:read`.
+/// One GenAI generation record read from `vala.traces.spans`.
+///
+/// Every scalar is a promoted span column and is null when its canonical source
+/// attribute was absent. `input_messages`/`output_messages` carry the decoded
+/// `gen_ai.input.messages` and `gen_ai.output.messages` payloads with their
+/// array order, object structure, scalar types, and nulls preserved; both are
+/// omitted from the wire unless the caller holds `BifrostGenAiPayload:Read`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct GenAiRow {
-    /// Conversation id.
-    pub conversation_id: String,
-    /// Model name.
-    pub model: String,
-    /// Provider.
-    pub provider: String,
-    /// Generation start time.
-    pub started_at: DateTime<Utc>,
-    /// Input token count, if recorded.
+    /// Promoted `gen_ai.conversation.id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<String>,
+    /// Promoted `gen_ai.request.model`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Promoted `gen_ai.provider.name`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// Generation start timestamp at exact protocol nanosecond precision.
+    pub start_time_unix_nano: i64,
+    /// Promoted `gen_ai.usage.input_tokens`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_tokens: Option<i64>,
-    /// Output token count, if recorded.
+    /// Promoted `gen_ai.usage.output_tokens`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_tokens: Option<i64>,
-    /// Cost in USD. Always absent — planned for a future stage when the column is added to `genai.messages`.
+    /// Payload-gated structured `gen_ai.input.messages`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cost_usd: Option<f64>,
-    /// Payload-gated prompt text; omitted without `bifrost_genai_payload:read`.
+    pub input_messages: Option<serde_json::Value>,
+    /// Payload-gated structured `gen_ai.output.messages`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prompt: Option<String>,
-    /// Payload-gated completion text; omitted without `bifrost_genai_payload:read`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub completion: Option<String>,
+    pub output_messages: Option<serde_json::Value>,
 }
 
 /// One evaluation result row.
@@ -3074,16 +3156,6 @@ mod tests {
             page_token: None,
         };
 
-        let get_trace = GetTraceRequest {
-            window: window.clone(),
-            trace_id: "b7f3c1e2a4d5".to_owned(),
-        };
-        let v = serde_json::to_value(&get_trace).unwrap();
-        assert_eq!(
-            serde_json::from_value::<GetTraceRequest>(v).unwrap(),
-            get_trace
-        );
-
         let query_traces = QueryTracesRequest {
             window: window.clone(),
             service: Some("checkout".to_owned()),
@@ -3182,28 +3254,6 @@ mod tests {
 
         let now = Utc::now();
 
-        let span_row = SpanRow {
-            span_id: "s1".to_owned(),
-            parent_span_id: None,
-            name: "GET /checkout".to_owned(),
-            kind: "SERVER".to_owned(),
-            started_at: now,
-            duration_ms: 42.5,
-            status: "OK".to_owned(),
-            attributes: None,
-        };
-        let waterfall = TraceWaterfall {
-            trace_id: "b7f3c1e2a4d5".to_owned(),
-            spans: vec![span_row],
-            events: vec![],
-            links: vec![],
-        };
-        let v = serde_json::to_value(&waterfall).unwrap();
-        assert_eq!(
-            serde_json::from_value::<TraceWaterfall>(v).unwrap(),
-            waterfall
-        );
-
         let summary = TraceSummaryRow {
             trace_id: "t1".to_owned(),
             root_name: "GET /".to_owned(),
@@ -3231,27 +3281,6 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<QueryRecentTracesResponse>(v).unwrap(),
             recent_resp
-        );
-
-        let genai_row = GenAiRow {
-            conversation_id: "conv-1".to_owned(),
-            model: "gpt-4o".to_owned(),
-            provider: "openai".to_owned(),
-            started_at: now,
-            input_tokens: Some(100),
-            output_tokens: Some(200),
-            cost_usd: Some(0.002),
-            prompt: None,
-            completion: None,
-        };
-        let genai_resp = QueryGenAiResponse {
-            rows: vec![genai_row],
-            next_page_token: None,
-        };
-        let v = serde_json::to_value(&genai_resp).unwrap();
-        assert_eq!(
-            serde_json::from_value::<QueryGenAiResponse>(v).unwrap(),
-            genai_resp
         );
 
         let eval_row = EvalRow {
@@ -3351,8 +3380,214 @@ mod tests {
         let _ = schemars::schema_for!(QueryMetricsRequest);
         let _ = schemars::schema_for!(QueryLogsRequest);
         let _ = schemars::schema_for!(QueryAgentTracesRequest);
-        let _ = schemars::schema_for!(GetTraceRequest);
-        let _ = schemars::schema_for!(TraceWaterfall);
+    }
+
+    /// Canonical trace detail and GenAI rows serialize without pre-release stubs.
+    ///
+    /// This pins the whole T03 public contract in one place: nanosecond timing
+    /// and raw protocol discriminants survive JSON exactly, span children are
+    /// nested on their owning span rather than hoisted to the waterfall, every
+    /// payload-gated field disappears from the wire when it is `None`, and the
+    /// GenAI message payloads keep arbitrary canonical JSON structure. It also
+    /// asserts that the removed `events`/`links`/`prompt`/`completion`/
+    /// `cost_usd` names appear in neither the serialized value nor the
+    /// generated JSON schema.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a contract cannot serialize, cannot deserialize, changes
+    /// value across the round trip, or still exposes a removed field.
+    #[test]
+    fn canonical_trace_and_genai_rows_round_trip_without_stubs() {
+        let authorized_span = SpanRow {
+            span_id: "00000000000000a1".to_owned(),
+            parent_span_id: Some("00000000000000a0".to_owned()),
+            trace_state: "vendor=1".to_owned(),
+            flags: 257,
+            name: "chat gpt-4o".to_owned(),
+            kind: 3,
+            start_time_unix_nano: 1_725_000_000_123_456_789,
+            end_time_unix_nano: 1_725_000_000_987_654_321,
+            duration_nano: 864_197_532,
+            status_code: Some(2),
+            status_message: Some("upstream refused".to_owned()),
+            attributes: Some(serde_json::json!({ "gen_ai.provider.name": "openai" })),
+            dropped_attributes_count: 4,
+            events: Some(vec![
+                SpanEventRow {
+                    time_unix_nano: 1_725_000_000_200_000_001,
+                    name: "first".to_owned(),
+                    attributes: Some(serde_json::json!({ "seq": 1 })),
+                    dropped_attributes_count: 0,
+                },
+                SpanEventRow {
+                    time_unix_nano: 1_725_000_000_300_000_002,
+                    name: "second".to_owned(),
+                    attributes: None,
+                    dropped_attributes_count: 7,
+                },
+            ]),
+            dropped_events_count: 1,
+            links: Some(vec![SpanLinkRow {
+                linked_trace_id: "0102030405060708090a0b0c0d0e0f10".to_owned(),
+                linked_span_id: "1112131415161718".to_owned(),
+                trace_state: "peer=2".to_owned(),
+                flags: 1,
+                attributes: Some(serde_json::json!({ "rel": "follows" })),
+                dropped_attributes_count: 2,
+            }]),
+            dropped_links_count: 3,
+            service_name: Some("checkout".to_owned()),
+            resource_attributes: Some(serde_json::json!({ "service.name": "checkout" })),
+            resource_dropped_attributes_count: 5,
+            resource_schema_url: "https://opentelemetry.io/schemas/1.30.0".to_owned(),
+            scope_name: "wyrd.skald".to_owned(),
+            scope_version: "0.9.1".to_owned(),
+            scope_attributes: Some(serde_json::json!({ "scope.tag": true })),
+            scope_dropped_attributes_count: 6,
+            scope_schema_url: "https://opentelemetry.io/schemas/1.31.0".to_owned(),
+        };
+
+        let encoded = serde_json::to_value(&authorized_span).expect("span serializes");
+        assert_eq!(
+            encoded["start_time_unix_nano"],
+            serde_json::json!(1_725_000_000_123_456_789_i64),
+            "nanosecond precision must survive JSON exactly"
+        );
+        assert_eq!(encoded["kind"], serde_json::json!(3));
+        assert_eq!(encoded["flags"], serde_json::json!(257));
+        assert_eq!(encoded["events"][0]["name"], serde_json::json!("first"));
+        assert_eq!(encoded["events"][1]["name"], serde_json::json!("second"));
+        assert!(
+            encoded["events"][1].get("attributes").is_none(),
+            "an unauthorized nested payload field is omitted, not null"
+        );
+        assert_eq!(
+            serde_json::from_value::<SpanRow>(encoded).expect("span deserializes"),
+            authorized_span
+        );
+
+        let redacted_span = SpanRow {
+            status_message: Some("upstream refused".to_owned()),
+            attributes: None,
+            events: None,
+            links: None,
+            resource_attributes: None,
+            scope_attributes: None,
+            ..authorized_span.clone()
+        };
+        let redacted = serde_json::to_value(&redacted_span).expect("redacted span serializes");
+        for gated in [
+            "attributes",
+            "events",
+            "links",
+            "resource_attributes",
+            "scope_attributes",
+        ] {
+            assert!(
+                redacted.get(gated).is_none(),
+                "{gated} must be omitted without BifrostTracePayload:Read"
+            );
+        }
+        assert_eq!(
+            redacted["dropped_events_count"],
+            serde_json::json!(1),
+            "counts stay visible under the plain trace-read permission"
+        );
+        assert_eq!(
+            redacted["status_message"],
+            serde_json::json!("upstream refused"),
+            "status message is bulk payload, not access-gated content"
+        );
+        assert_eq!(
+            serde_json::from_value::<SpanRow>(redacted).expect("redacted span deserializes"),
+            redacted_span
+        );
+
+        let waterfall = TraceWaterfall {
+            trace_id: "0102030405060708090a0b0c0d0e0f10".to_owned(),
+            spans: vec![authorized_span],
+        };
+        let encoded = serde_json::to_value(&waterfall).expect("waterfall serializes");
+        assert!(
+            encoded.get("events").is_none() && encoded.get("links").is_none(),
+            "span children are nested on their owning span, never hoisted"
+        );
+        assert_eq!(
+            serde_json::from_value::<TraceWaterfall>(encoded).expect("waterfall deserializes"),
+            waterfall
+        );
+
+        let request = GetTraceRequest {
+            trace_id: "0102030405060708090a0b0c0d0e0f10".to_owned(),
+            since: Some(Utc::now()),
+            until: None,
+        };
+        let encoded = serde_json::to_value(&request).expect("request serializes");
+        assert!(
+            encoded.get("limit").is_none() && encoded.get("page_token").is_none(),
+            "complete trace detail has no continuation contract"
+        );
+        assert_eq!(
+            serde_json::from_value::<GetTraceRequest>(encoded).expect("request deserializes"),
+            request
+        );
+
+        let genai_row = GenAiRow {
+            conversation_id: Some("conv-1".to_owned()),
+            model: Some("gpt-4o".to_owned()),
+            provider: None,
+            start_time_unix_nano: 1_725_000_000_123_456_789,
+            input_tokens: Some(100),
+            output_tokens: None,
+            input_messages: Some(serde_json::json!([
+                { "role": "user", "parts": ["hello", 7, 1.5, true, null] }
+            ])),
+            output_messages: Some(serde_json::json!({ "finish": null })),
+        };
+        let encoded = serde_json::to_value(&genai_row).expect("genai row serializes");
+        assert_eq!(
+            encoded["input_messages"][0]["parts"][4],
+            serde_json::Value::Null,
+            "structured message payload keeps arrays, scalars, and nulls"
+        );
+        assert!(encoded.get("provider").is_none());
+        for removed in ["prompt", "completion", "cost_usd"] {
+            assert!(
+                encoded.get(removed).is_none(),
+                "{removed} must not exist on the canonical GenAI row"
+            );
+        }
+        assert_eq!(
+            serde_json::from_value::<GenAiRow>(encoded).expect("genai row deserializes"),
+            genai_row
+        );
+
+        let trace_schemas = [
+            serde_json::to_value(schemars::schema_for!(TraceWaterfall)).expect("trace schema"),
+            serde_json::to_value(schemars::schema_for!(GetTraceRequest)).expect("request schema"),
+        ];
+        for schema in &trace_schemas {
+            assert!(
+                !schema.to_string().contains("page_token"),
+                "generated trace schema still names a continuation token"
+            );
+        }
+        let genai_schema =
+            serde_json::to_value(schemars::schema_for!(QueryGenAiResponse)).expect("genai schema");
+        assert!(
+            genai_schema.to_string().contains("next_page_token"),
+            "GenAI search keeps its existing pagination contract"
+        );
+        for schema in trace_schemas.iter().chain(std::iter::once(&genai_schema)) {
+            let text = schema.to_string();
+            for removed in ["cost_usd", "\"prompt\"", "\"completion\""] {
+                assert!(
+                    !text.contains(removed),
+                    "generated schema still names removed field {removed}"
+                );
+            }
+        }
     }
 
     /// Running-query controls retain one request identity and SQL-free state.

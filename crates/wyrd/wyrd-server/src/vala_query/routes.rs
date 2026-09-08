@@ -14,21 +14,22 @@
 use std::collections::HashMap;
 
 use arrow::array::{
-    Array, FixedSizeBinaryArray, Float64Array, Int64Array, RecordBatch, StringArray,
-    TimestampMicrosecondArray,
+    Array, BinaryArray, FixedSizeBinaryArray, Float64Array, Int32Array, Int64Array, ListArray,
+    RecordBatch, StringArray, StructArray, TimestampMicrosecondArray,
 };
 use axum::Json;
 use axum::Router;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::routing::{get, post};
 use chrono::{DateTime, Utc};
+use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{
     AgentTraceRow, DriftRow, EvalRow, GenAiRow, GetTraceRequest, GetTraceResponse, LogRow,
-    MetricRow, QueryAgentTracesRequest, QueryAgentTracesResponse, QueryDriftRequest,
-    QueryDriftResponse, QueryEvalRequest, QueryEvalResponse, QueryGenAiRequest, QueryGenAiResponse,
-    QueryLogsRequest, QueryLogsResponse, QueryMetricsRequest, QueryMetricsResponse,
-    QueryRecentTracesRequest, QueryRecentTracesResponse, QueryTracesRequest, QueryTracesResponse,
-    SpanRow, TraceSummaryRow, TraceWaterfall,
+    MAX_QUERY_PAGE_SIZE, MetricRow, QueryAgentTracesRequest, QueryAgentTracesResponse,
+    QueryDriftRequest, QueryDriftResponse, QueryEvalRequest, QueryEvalResponse, QueryGenAiRequest,
+    QueryGenAiResponse, QueryLogsRequest, QueryLogsResponse, QueryMetricsRequest,
+    QueryMetricsResponse, QueryRecentTracesRequest, QueryRecentTracesResponse, QueryTracesRequest,
+    QueryTracesResponse, SpanEventRow, SpanLinkRow, SpanRow, TraceSummaryRow, TraceWaterfall,
 };
 
 use crate::AppState;
@@ -36,6 +37,7 @@ use crate::components::auth::Caller;
 use crate::http::error::WyrdErrorResponse;
 use crate::query::service::run_typed_query;
 use crate::vala_query::page_token;
+use crate::vala_query::payload;
 use crate::vala_query::service::effective_limit;
 
 /// Router for all typed ValaQuery HTTP routes (merged into `/v1`).
@@ -97,7 +99,25 @@ fn col_f64<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a Float64Array> {
         .and_then(|c| c.as_any().downcast_ref::<Float64Array>())
 }
 
-fn col_bin16<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a FixedSizeBinaryArray> {
+fn col_i32<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a Int32Array> {
+    batch
+        .column_by_name(name)
+        .and_then(|c| c.as_any().downcast_ref::<Int32Array>())
+}
+
+fn col_binary<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a BinaryArray> {
+    batch
+        .column_by_name(name)
+        .and_then(|c| c.as_any().downcast_ref::<BinaryArray>())
+}
+
+fn col_list<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a ListArray> {
+    batch
+        .column_by_name(name)
+        .and_then(|c| c.as_any().downcast_ref::<ListArray>())
+}
+
+fn col_fixed_binary<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a FixedSizeBinaryArray> {
     batch
         .column_by_name(name)
         .and_then(|c| c.as_any().downcast_ref::<FixedSizeBinaryArray>())
@@ -128,110 +148,346 @@ fn get_json_str(arr: Option<&StringArray>, i: usize) -> Option<serde_json::Value
 
 // ─── row extractors ───────────────────────────────────────────────────────────
 
-pub(crate) fn extract_span_rows_filtered(batches: &[RecordBatch], trace_id: &str) -> Vec<SpanRow> {
-    extract_span_rows_impl(batches, Some(trace_id))
+/// Read one nullable `Int64` cell, treating an absent column as absent data.
+fn get_i64(arr: Option<&Int64Array>, i: usize) -> Option<i64> {
+    arr.filter(|a| !a.is_null(i)).map(|a| a.value(i))
 }
 
-fn extract_span_rows_impl(batches: &[RecordBatch], trace_id_filter: Option<&str>) -> Vec<SpanRow> {
+/// Read one required `Int64` cell, defaulting an absent column to zero.
+///
+/// Every canonical count and nanosecond column is non-null, so a default is
+/// only reachable when a metadata-only projection dropped the column.
+fn req_i64(arr: Option<&Int64Array>, i: usize) -> i64 {
+    get_i64(arr, i).unwrap_or_default()
+}
+
+/// Read one required `Utf8` cell, defaulting an absent column to the empty string.
+fn req_str(arr: Option<&StringArray>, i: usize) -> String {
+    get_str(arr, i).unwrap_or_default().to_owned()
+}
+
+/// Read one nullable canonical `Binary` payload cell.
+///
+/// `None` distinguishes "the plan did not project this column" — the shape an
+/// unauthorized payload projection produces — from a present empty payload.
+fn get_binary<'a>(arr: Option<&'a BinaryArray>, i: usize) -> Option<&'a [u8]> {
+    arr.filter(|a| !a.is_null(i)).map(|a| a.value(i))
+}
+
+/// Project one canonical attribute column cell into public JSON.
+///
+/// # Errors
+///
+/// Propagates the stored-payload failures documented on
+/// [`payload::attributes_to_json`].
+fn attributes_json(
+    arr: Option<&BinaryArray>,
+    i: usize,
+) -> Result<Option<serde_json::Value>, WyrdError> {
+    get_binary(arr, i)
+        .map(payload::attributes_to_json)
+        .transpose()
+}
+
+/// Extract every span of one trace with its events and links nested on it.
+///
+/// The batches were produced by an already-authorized plan, so payload gating
+/// shows up here as column absence: a metadata-only projection simply has no
+/// `attributes`, `events`, `links`, `resource_attributes`, or
+/// `scope_attributes` column, and the corresponding public fields stay `None`.
+/// The `trace_id` filter is retained as defense in depth against a provider
+/// returning a row the predicate should have excluded.
+///
+/// # Errors
+///
+/// Returns [`WyrdError::Internal`] when a stored canonical payload column
+/// cannot be decoded into the public JSON contract.
+pub(crate) fn extract_span_rows_filtered(
+    batches: &[RecordBatch],
+    trace_id: &str,
+) -> Result<Vec<SpanRow>, WyrdError> {
     let mut rows = Vec::new();
     for batch in batches {
-        let trace_id_col = col_bin16(batch, "trace_id");
-        let span_id_col = col_bin16(batch, "span_id");
-        let parent_span_id_col = col_bin16(batch, "parent_span_id");
+        let trace_id_col = col_fixed_binary(batch, "trace_id");
+        let span_id_col = col_fixed_binary(batch, "span_id");
+        let parent_span_id_col = col_fixed_binary(batch, "parent_span_id");
+        let trace_state_col = col_str(batch, "trace_state");
+        let flags_col = col_i64(batch, "flags");
         let name_col = col_str(batch, "name");
-        let kind_col = col_str(batch, "kind");
-        let start_col = col_ts(batch, "start_time");
-        let dur_col = col_i64(batch, "duration_ms");
-        let status_col = col_str(batch, "status");
-        let attr_col = col_str(batch, "attributes");
+        let kind_col = col_i32(batch, "kind");
+        let start_col = col_i64(batch, "start_time_unix_nano");
+        let end_col = col_i64(batch, "end_time_unix_nano");
+        let duration_col = col_i64(batch, "duration_nano");
+        let status_code_col = col_i32(batch, "status_code");
+        let status_message_col = col_str(batch, "status_message");
+        let attributes_col = col_binary(batch, "attributes");
+        let dropped_attributes_col = col_i64(batch, "dropped_attributes_count");
+        let events_col = col_list(batch, "events");
+        let dropped_events_col = col_i64(batch, "dropped_events_count");
+        let links_col = col_list(batch, "links");
+        let dropped_links_col = col_i64(batch, "dropped_links_count");
+        let service_name_col = col_str(batch, "service_name");
+        let resource_attributes_col = col_binary(batch, "resource_attributes");
+        let resource_dropped_col = col_i64(batch, "resource_dropped_attributes_count");
+        let resource_schema_url_col = col_str(batch, "resource_schema_url");
+        let scope_name_col = col_str(batch, "scope_name");
+        let scope_version_col = col_str(batch, "scope_version");
+        let scope_attributes_col = col_binary(batch, "scope_attributes");
+        let scope_dropped_col = col_i64(batch, "scope_dropped_attributes_count");
+        let scope_schema_url_col = col_str(batch, "scope_schema_url");
 
         for i in 0..batch.num_rows() {
-            if let Some(filter) = trace_id_filter {
-                let row_trace_id = get_hex(trace_id_col, i);
-                if row_trace_id.as_deref() != Some(filter) {
-                    continue;
-                }
+            if get_hex(trace_id_col, i).as_deref() != Some(trace_id) {
+                continue;
             }
             rows.push(SpanRow {
                 span_id: get_hex(span_id_col, i).unwrap_or_default(),
                 parent_span_id: get_hex(parent_span_id_col, i),
-                name: get_str(name_col, i).unwrap_or("").to_owned(),
-                kind: get_str(kind_col, i).unwrap_or("").to_owned(),
-                started_at: start_col
+                trace_state: req_str(trace_state_col, i),
+                flags: req_i64(flags_col, i),
+                name: req_str(name_col, i),
+                kind: kind_col
                     .filter(|a| !a.is_null(i))
-                    .map(|a| ts_us_to_dt(a.value(i)))
+                    .map(|a| a.value(i))
                     .unwrap_or_default(),
-                duration_ms: dur_col
+                start_time_unix_nano: req_i64(start_col, i),
+                end_time_unix_nano: req_i64(end_col, i),
+                duration_nano: req_i64(duration_col, i),
+                status_code: status_code_col
                     .filter(|a| !a.is_null(i))
-                    .map(|a| a.value(i) as f64)
-                    .unwrap_or(0.0),
-                status: get_str(status_col, i).unwrap_or("").to_owned(),
-                attributes: get_json_str(attr_col, i),
+                    .map(|a| a.value(i)),
+                status_message: get_str(status_message_col, i).map(ToOwned::to_owned),
+                attributes: attributes_json(attributes_col, i)?,
+                dropped_attributes_count: req_i64(dropped_attributes_col, i),
+                events: extract_span_events(events_col, i)?,
+                dropped_events_count: req_i64(dropped_events_col, i),
+                links: extract_span_links(links_col, i)?,
+                dropped_links_count: req_i64(dropped_links_col, i),
+                service_name: get_str(service_name_col, i).map(ToOwned::to_owned),
+                resource_attributes: attributes_json(resource_attributes_col, i)?,
+                resource_dropped_attributes_count: req_i64(resource_dropped_col, i),
+                resource_schema_url: req_str(resource_schema_url_col, i),
+                scope_name: req_str(scope_name_col, i),
+                scope_version: req_str(scope_version_col, i),
+                scope_attributes: attributes_json(scope_attributes_col, i)?,
+                scope_dropped_attributes_count: req_i64(scope_dropped_col, i),
+                scope_schema_url: req_str(scope_schema_url_col, i),
             });
         }
     }
-    rows
+    Ok(rows)
 }
 
-/// Aggregate raw span batches into trace summaries grouped by trace_id.
+/// Project one row's ordered span-event collection.
+///
+/// Returns `None` when the plan did not project the sensitive `events` column,
+/// which is exactly the unauthorized case; a present empty list stays
+/// `Some(vec![])` so "no events recorded" is never confused with "not permitted".
+///
+/// # Errors
+///
+/// Returns [`WyrdError::Internal`] when the stored list does not carry the
+/// declared nested struct or an event attribute payload is undecodable.
+fn extract_span_events(
+    list: Option<&ListArray>,
+    row: usize,
+) -> Result<Option<Vec<SpanEventRow>>, WyrdError> {
+    let Some(values) = nested_struct(list, row)? else {
+        return Ok(None);
+    };
+    let time_col = struct_i64(&values, "time_unix_nano")?;
+    let name_col = struct_str(&values, "name")?;
+    let attributes_col = struct_binary(&values, "attributes")?;
+    let dropped_col = struct_i64(&values, "dropped_attributes_count")?;
+    let mut events = Vec::with_capacity(values.len());
+    for i in 0..values.len() {
+        events.push(SpanEventRow {
+            time_unix_nano: req_i64(Some(time_col), i),
+            name: req_str(Some(name_col), i),
+            attributes: attributes_json(Some(attributes_col), i)?,
+            dropped_attributes_count: req_i64(Some(dropped_col), i),
+        });
+    }
+    Ok(Some(events))
+}
+
+/// Project one row's ordered span-link collection.
+///
+/// Presence semantics match [`extract_span_events`].
+///
+/// # Errors
+///
+/// Returns [`WyrdError::Internal`] when the stored list does not carry the
+/// declared nested struct or a link attribute payload is undecodable.
+fn extract_span_links(
+    list: Option<&ListArray>,
+    row: usize,
+) -> Result<Option<Vec<SpanLinkRow>>, WyrdError> {
+    let Some(values) = nested_struct(list, row)? else {
+        return Ok(None);
+    };
+    let trace_id_col = struct_fixed_binary(&values, "trace_id")?;
+    let span_id_col = struct_fixed_binary(&values, "span_id")?;
+    let trace_state_col = struct_str(&values, "trace_state")?;
+    let flags_col = struct_i64(&values, "flags")?;
+    let attributes_col = struct_binary(&values, "attributes")?;
+    let dropped_col = struct_i64(&values, "dropped_attributes_count")?;
+    let mut links = Vec::with_capacity(values.len());
+    for i in 0..values.len() {
+        links.push(SpanLinkRow {
+            linked_trace_id: get_hex(Some(trace_id_col), i).unwrap_or_default(),
+            linked_span_id: get_hex(Some(span_id_col), i).unwrap_or_default(),
+            trace_state: req_str(Some(trace_state_col), i),
+            flags: req_i64(Some(flags_col), i),
+            attributes: attributes_json(Some(attributes_col), i)?,
+            dropped_attributes_count: req_i64(Some(dropped_col), i),
+        });
+    }
+    Ok(Some(links))
+}
+
+/// Slice one row's list cell into the nested struct it declares.
+///
+/// # Errors
+///
+/// Returns [`WyrdError::Internal`] when the stored list element is not the
+/// declared struct.
+fn nested_struct(list: Option<&ListArray>, row: usize) -> Result<Option<StructArray>, WyrdError> {
+    let Some(list) = list.filter(|a| !a.is_null(row)) else {
+        return Ok(None);
+    };
+    let values = list.value(row);
+    let structs = values
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .ok_or_else(|| stored_shape("nested span child is not a struct"))?;
+    Ok(Some(structs.clone()))
+}
+
+/// Read one nested struct child as `Int64`.
+///
+/// # Errors
+///
+/// Returns [`WyrdError::Internal`] when the child is missing or mistyped.
+fn struct_i64<'a>(values: &'a StructArray, name: &str) -> Result<&'a Int64Array, WyrdError> {
+    values
+        .column_by_name(name)
+        .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+        .ok_or_else(|| stored_shape("nested span child is missing an int64 field"))
+}
+
+/// Read one nested struct child as `Utf8`.
+///
+/// # Errors
+///
+/// Returns [`WyrdError::Internal`] when the child is missing or mistyped.
+fn struct_str<'a>(values: &'a StructArray, name: &str) -> Result<&'a StringArray, WyrdError> {
+    values
+        .column_by_name(name)
+        .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+        .ok_or_else(|| stored_shape("nested span child is missing a string field"))
+}
+
+/// Read one nested struct child as `Binary`.
+///
+/// # Errors
+///
+/// Returns [`WyrdError::Internal`] when the child is missing or mistyped.
+fn struct_binary<'a>(values: &'a StructArray, name: &str) -> Result<&'a BinaryArray, WyrdError> {
+    values
+        .column_by_name(name)
+        .and_then(|c| c.as_any().downcast_ref::<BinaryArray>())
+        .ok_or_else(|| stored_shape("nested span child is missing a binary field"))
+}
+
+/// Read one nested struct child as fixed-width binary.
+///
+/// # Errors
+///
+/// Returns [`WyrdError::Internal`] when the child is missing or mistyped.
+fn struct_fixed_binary<'a>(
+    values: &'a StructArray,
+    name: &str,
+) -> Result<&'a FixedSizeBinaryArray, WyrdError> {
+    values
+        .column_by_name(name)
+        .and_then(|c| c.as_any().downcast_ref::<FixedSizeBinaryArray>())
+        .ok_or_else(|| stored_shape("nested span child is missing an id field"))
+}
+
+/// A stored canonical row does not carry the shape its table declares.
+fn stored_shape(detail: &'static str) -> WyrdError {
+    WyrdError::Internal {
+        message: "stored canonical span does not match its declared schema".to_owned(),
+        details: serde_json::json!({ "detail": detail }),
+    }
+}
+
+/// Aggregate raw canonical span batches into trace summaries grouped by trace id.
+///
+/// Summaries are metadata only: they read the promoted `service_name`, the
+/// nanosecond bounds, and the raw status discriminant, and never touch a
+/// payload column.
 pub(crate) fn aggregate_spans_to_summaries(batches: &[RecordBatch]) -> Vec<TraceSummaryRow> {
+    /// Running per-trace aggregate over one collected span set.
     #[derive(Default)]
     struct Acc {
+        /// Name of the trace's root span.
         root_name: String,
+        /// Promoted service name of the root span, or the first span seen.
         service: String,
-        min_start_us: i64,
-        max_end_us: i64,
+        /// Earliest span start in protocol nanoseconds.
+        min_start_nanos: i64,
+        /// Latest span end in protocol nanoseconds.
+        max_end_nanos: i64,
+        /// Number of spans observed for this trace.
         span_count: u32,
+        /// Whether any span carried the OTLP `ERROR` status code.
         error: bool,
     }
+    /// OTLP `Status.StatusCode.STATUS_CODE_ERROR`.
+    const STATUS_CODE_ERROR: i32 = 2;
+
     let mut map: HashMap<String, Acc> = HashMap::new();
 
     for batch in batches {
-        let trace_id_col = col_bin16(batch, "trace_id");
+        let trace_id_col = col_fixed_binary(batch, "trace_id");
         let name_col = col_str(batch, "name");
         let svc_col = col_str(batch, "service_name");
-        let start_col = col_ts(batch, "start_time");
-        let end_col = col_ts(batch, "end_time");
-        let status_col = col_str(batch, "status");
-        let parent_col = col_bin16(batch, "parent_span_id");
+        let start_col = col_i64(batch, "start_time_unix_nano");
+        let end_col = col_i64(batch, "end_time_unix_nano");
+        let status_code_col = col_i32(batch, "status_code");
+        let parent_col = col_fixed_binary(batch, "parent_span_id");
 
         for i in 0..batch.num_rows() {
             let trace_id = get_hex(trace_id_col, i).unwrap_or_default();
             let acc = map.entry(trace_id).or_default();
 
-            let start_us = start_col
-                .filter(|a| !a.is_null(i))
-                .map(|a| a.value(i))
-                .unwrap_or(0);
-            let end_us = end_col
-                .filter(|a| !a.is_null(i))
-                .map(|a| a.value(i))
-                .unwrap_or(start_us);
+            let start_nanos = req_i64(start_col, i);
+            let end_nanos = get_i64(end_col, i).unwrap_or(start_nanos);
 
-            // Initialize or update min/max
             if acc.span_count == 0 {
-                acc.min_start_us = start_us;
-                acc.max_end_us = end_us;
+                acc.min_start_nanos = start_nanos;
+                acc.max_end_nanos = end_nanos;
             } else {
-                if start_us < acc.min_start_us {
-                    acc.min_start_us = start_us;
-                }
-                if end_us > acc.max_end_us {
-                    acc.max_end_us = end_us;
-                }
+                acc.min_start_nanos = acc.min_start_nanos.min(start_nanos);
+                acc.max_end_nanos = acc.max_end_nanos.max(end_nanos);
             }
             acc.span_count += 1;
 
-            // Root span: parent_span_id IS NULL
             let is_root = parent_col.map(|a| a.is_null(i)).unwrap_or(false);
             if is_root {
-                acc.root_name = get_str(name_col, i).unwrap_or("").to_owned();
-                acc.service = get_str(svc_col, i).unwrap_or("").to_owned();
+                acc.root_name = req_str(name_col, i);
+                acc.service = req_str(svc_col, i);
             } else if acc.service.is_empty() {
-                acc.service = get_str(svc_col, i).unwrap_or("").to_owned();
+                acc.service = req_str(svc_col, i);
             }
 
-            if get_str(status_col, i) == Some("ERROR") {
+            if status_code_col
+                .filter(|a| !a.is_null(i))
+                .map(|a| a.value(i))
+                == Some(STATUS_CODE_ERROR)
+            {
                 acc.error = true;
             }
         }
@@ -243,8 +499,8 @@ pub(crate) fn aggregate_spans_to_summaries(batches: &[RecordBatch]) -> Vec<Trace
             trace_id,
             root_name: acc.root_name,
             service: acc.service,
-            started_at: ts_us_to_dt(acc.min_start_us),
-            duration_ms: (acc.max_end_us - acc.min_start_us).max(0) as f64 / 1000.0,
+            started_at: ts_us_to_dt(acc.min_start_nanos / 1_000),
+            duration_ms: nanos_to_millis(acc.max_end_nanos - acc.min_start_nanos),
             span_count: acc.span_count,
             error: acc.error,
         })
@@ -254,37 +510,62 @@ pub(crate) fn aggregate_spans_to_summaries(batches: &[RecordBatch]) -> Vec<Trace
     rows
 }
 
-pub(crate) fn extract_genai_rows(batches: &[RecordBatch]) -> Vec<GenAiRow> {
+/// Convert a non-negative nanosecond span into fractional milliseconds.
+fn nanos_to_millis(nanos: i64) -> f64 {
+    nanos.max(0) as f64 / 1_000_000.0
+}
+
+/// Extract GenAI generation rows from canonical span batches.
+///
+/// Every scalar is a promoted span column. The structured message payloads are
+/// read out of the canonical `attributes` column, which the plan projects only
+/// for a caller holding `BifrostGenAiPayload:Read`; without that column the
+/// message fields stay `None` and no payload byte was read.
+///
+/// # Errors
+///
+/// Returns [`WyrdError::Internal`] when a stored canonical attribute payload
+/// cannot satisfy the public structured-JSON contract.
+pub(crate) fn extract_genai_rows(batches: &[RecordBatch]) -> Result<Vec<GenAiRow>, WyrdError> {
+    /// Canonical attribute key holding the ordered input messages.
+    const INPUT_MESSAGES: &str = "gen_ai.input.messages";
+    /// Canonical attribute key holding the ordered output messages.
+    const OUTPUT_MESSAGES: &str = "gen_ai.output.messages";
+
     let mut rows = Vec::new();
     for batch in batches {
-        let conv_col = col_str(batch, "conversation_id");
-        let model_col = col_str(batch, "request_model");
-        let prov_col = col_str(batch, "provider_name");
-        let start_col = col_ts(batch, "start_time");
-        // `usage_*_tokens` are physically int64 in genai.messages.
-        let in_tok_i64 = col_i64(batch, "usage_input_tokens");
-        let out_tok_i64 = col_i64(batch, "usage_output_tokens");
-        let prompt_col = col_str(batch, "input_messages");
-        let completion_col = col_str(batch, "output_messages");
+        let conv_col = col_str(batch, "gen_ai_conversation_id");
+        let model_col = col_str(batch, "gen_ai_request_model");
+        let prov_col = col_str(batch, "gen_ai_provider_name");
+        let start_col = col_i64(batch, "start_time_unix_nano");
+        let in_tok_col = col_i64(batch, "gen_ai_usage_input_tokens");
+        let out_tok_col = col_i64(batch, "gen_ai_usage_output_tokens");
+        let attributes_col = col_binary(batch, "attributes");
 
         for i in 0..batch.num_rows() {
+            let (input_messages, output_messages) = match get_binary(attributes_col, i) {
+                Some(bytes) => {
+                    let attributes = payload::decode_attributes(bytes)?;
+                    (
+                        payload::structured_attribute(&attributes, INPUT_MESSAGES)?,
+                        payload::structured_attribute(&attributes, OUTPUT_MESSAGES)?,
+                    )
+                }
+                None => (None, None),
+            };
             rows.push(GenAiRow {
-                conversation_id: get_str(conv_col, i).unwrap_or("").to_owned(),
-                model: get_str(model_col, i).unwrap_or("").to_owned(),
-                provider: get_str(prov_col, i).unwrap_or("").to_owned(),
-                started_at: start_col
-                    .filter(|a| !a.is_null(i))
-                    .map(|a| ts_us_to_dt(a.value(i)))
-                    .unwrap_or_default(),
-                input_tokens: in_tok_i64.filter(|a| !a.is_null(i)).map(|a| a.value(i)),
-                output_tokens: out_tok_i64.filter(|a| !a.is_null(i)).map(|a| a.value(i)),
-                cost_usd: None, // Stage N placeholder — no physical column in genai.messages yet
-                prompt: get_str(prompt_col, i).map(|s| s.to_owned()),
-                completion: get_str(completion_col, i).map(|s| s.to_owned()),
+                conversation_id: get_str(conv_col, i).map(ToOwned::to_owned),
+                model: get_str(model_col, i).map(ToOwned::to_owned),
+                provider: get_str(prov_col, i).map(ToOwned::to_owned),
+                start_time_unix_nano: req_i64(start_col, i),
+                input_tokens: get_i64(in_tok_col, i),
+                output_tokens: get_i64(out_tok_col, i),
+                input_messages,
+                output_messages,
             });
         }
     }
-    rows
+    Ok(rows)
 }
 
 pub(crate) fn extract_eval_rows(batches: &[RecordBatch]) -> Vec<EvalRow> {
@@ -378,7 +659,7 @@ pub(crate) fn extract_log_rows(batches: &[RecordBatch]) -> Vec<LogRow> {
         // integer type.
         let sev_num_col = col_i64(batch, "severity_number");
         let sev_txt_col = col_str(batch, "severity_text");
-        let trace_col = col_bin16(batch, "trace_id");
+        let trace_col = col_fixed_binary(batch, "trace_id");
         let span_col = batch
             .column_by_name("span_id")
             .and_then(|c| c.as_any().downcast_ref::<FixedSizeBinaryArray>());
@@ -461,37 +742,46 @@ fn maybe_issue_token(
     page_token::encode(&body, key).ok()
 }
 
+/// Optional scan bounds carried as query parameters on the trace-detail route.
+///
+/// Trace detail returns one complete authorized cut, so these narrow the
+/// `wyrd_event_time` scan only; there is no page size and no continuation
+/// token on this contract.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub(crate) struct TraceDetailBounds {
+    /// Inclusive lower bound on `wyrd_event_time`.
+    #[serde(default)]
+    since: Option<DateTime<Utc>>,
+    /// Exclusive upper bound on `wyrd_event_time`.
+    #[serde(default)]
+    until: Option<DateTime<Utc>>,
+}
+
 // ─── handlers ────────────────────────────────────────────────────────────────
 
 async fn get_trace(
     State(state): State<AppState>,
     caller: Caller,
     Path(trace_id): Path<String>,
+    Query(bounds): Query<TraceDetailBounds>,
 ) -> Result<Json<GetTraceResponse>, WyrdErrorResponse> {
     use crate::vala_query::service::build_get_trace_plan;
-    use wyrd_spec::vala::api::QueryWindow;
 
     let req = GetTraceRequest {
-        window: QueryWindow {
-            since: None,
-            until: None,
-            limit: None,
-            // TODO(Stage 5): accept since/until as optional query parameters. Window is
-            // hardcoded to the default 7-day scan for Stage 4.
-            page_token: None,
-        },
         trace_id: trace_id.clone(),
+        since: bounds.since,
+        until: bounds.until,
     };
     let plan = build_get_trace_plan(&state, &caller, &req)
         .await
         .map_err(WyrdErrorResponse::from)?;
-    let limit = effective_limit(req.window.limit);
-    let (batches, _) = run_typed_query(&state, &caller, plan, limit)
+    let (batches, _) = run_typed_query(&state, &caller, plan, MAX_QUERY_PAGE_SIZE)
         .await
         .map_err(WyrdErrorResponse::from)?;
 
     // Keep the extraction filter as a defense-in-depth check for provider rows.
-    let spans: Vec<SpanRow> = extract_span_rows_filtered(&batches, &trace_id);
+    let spans: Vec<SpanRow> =
+        extract_span_rows_filtered(&batches, &trace_id).map_err(WyrdErrorResponse::from)?;
 
     if spans.is_empty() {
         let err: wyrd_spec::error::WyrdError = wyrd_spec::vala::BifrostError::TraceNotFound {
@@ -502,12 +792,7 @@ async fn get_trace(
     }
 
     Ok(Json(GetTraceResponse {
-        trace: TraceWaterfall {
-            trace_id,
-            spans,
-            events: vec![],
-            links: vec![],
-        },
+        trace: TraceWaterfall { trace_id, spans },
     }))
 }
 
@@ -644,7 +929,7 @@ async fn query_genai(
         .await
         .map_err(WyrdErrorResponse::from)?;
 
-    let rows = extract_genai_rows(&batches);
+    let rows = extract_genai_rows(&batches).map_err(WyrdErrorResponse::from)?;
     let next_page_token = maybe_issue_token(has_more, &state, &caller, "query_genai", qhash);
     Ok(Json(QueryGenAiResponse {
         rows,

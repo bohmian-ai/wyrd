@@ -125,6 +125,48 @@ fn opt_filter_u32(df: DataFrame, column: &str, value: Option<u32>) -> Result<Dat
     }
 }
 
+/// Filter spans by the textual OTLP status name used by the public contract.
+///
+/// The canonical column is the raw `status_code` discriminant, so the request's
+/// `"UNSET"`/`"OK"`/`"ERROR"` text is mapped to that discriminant here rather
+/// than compared against a stored string. An unrecognized name is a client
+/// error, never a silently empty result.
+///
+/// # Errors
+///
+/// Returns [`WyrdError::Validation`] for an unrecognized status name, or a
+/// plan-construction error.
+fn opt_filter_status(df: DataFrame, value: &Option<String>) -> Result<DataFrame, WyrdError> {
+    let Some(name) = value else { return Ok(df) };
+    let code = match name.to_ascii_uppercase().as_str() {
+        "UNSET" => 0,
+        "OK" => 1,
+        "ERROR" => 2,
+        _ => {
+            return Err(WyrdError::Validation {
+                message: "status must be UNSET, OK, or ERROR".to_owned(),
+                details: serde_json::json!({ "status": name }),
+            });
+        }
+    };
+    df.filter(col("status_code").eq(lit(code))).map_err(df_err)
+}
+
+/// Filter spans by a minimum duration expressed in milliseconds.
+///
+/// The canonical column is `duration_nano`, so the requested millisecond bound
+/// is widened to nanoseconds instead of compared against a derived column.
+///
+/// # Errors
+///
+/// Returns a plan-construction error.
+fn opt_filter_min_duration(df: DataFrame, value: Option<u32>) -> Result<DataFrame, WyrdError> {
+    let Some(millis) = value else { return Ok(df) };
+    let nanos = i64::from(millis) * 1_000_000;
+    df.filter(col("duration_nano").gt_eq(lit(nanos)))
+        .map_err(df_err)
+}
+
 fn opt_filter_i32(df: DataFrame, column: &str, value: Option<i32>) -> Result<DataFrame, WyrdError> {
     match value {
         Some(v) => df.filter(col(column).gt_eq(lit(v))).map_err(df_err),
@@ -142,14 +184,43 @@ fn has_perm(caller: &Caller, resource: Resource) -> bool {
         })
 }
 
-/// Build the `LogicalPlan` for `GetTrace` (spans filtered to one trace_id + window).
-/// Payload `attributes` column is projected away unless the caller holds
+/// Sensitive span payload columns a trace read may project only with
 /// `BifrostTracePayload:Read`.
+///
+/// This is the span table's declared sensitive set minus
+/// `resource_entity_refs`, which no public trace contract returns and which is
+/// therefore dropped from every trace plan.
+const SPAN_PAYLOAD_COLUMNS: [&str; 5] = [
+    "attributes",
+    "events",
+    "links",
+    "resource_attributes",
+    "scope_attributes",
+];
+
+/// Span columns no public trace contract returns, dropped from every plan.
+const SPAN_UNPROJECTED_COLUMNS: [&str; 1] = ["resource_entity_refs"];
+
+/// Build the `LogicalPlan` for `GetTrace` — one complete authorized trace cut.
+///
+/// The plan filters `vala.traces.spans` to the requested trace inside the
+/// requested `wyrd_event_time` bounds and returns every matching span. The
+/// sensitive payload columns are dropped from the projection unless the caller
+/// holds `BifrostTracePayload:Read`, so an unauthorized plan never reads
+/// attributes, events, links, or resource/scope payload from storage.
+///
+/// # Errors
+///
+/// Returns [`WyrdError::Validation`] when `trace_id` is not exactly 16
+/// hexadecimal bytes or `since` is later than `until`, the stable authorization
+/// or audit error from [`typed_dataframe`], or a plan-construction error.
 pub async fn build_get_trace_plan(
     state: &AppState,
     caller: &Caller,
     req: &GetTraceRequest,
 ) -> Result<LogicalPlan, WyrdError> {
+    validate_bounds(req.since, req.until)?;
+    let trace_id = trace_id_bytes(&req.trace_id)?;
     let df = typed_dataframe(
         state,
         caller,
@@ -157,27 +228,62 @@ pub async fn build_get_trace_plan(
         "vala.traces.spans",
     )
     .await?;
-    let df = apply_window(df, req.window.since, req.window.until)?;
-    let trace_id = hex::decode(&req.trace_id).map_err(|error| WyrdError::Validation {
-        message: "trace_id must be a hexadecimal value".to_owned(),
-        details: serde_json::json!({ "trace_id": req.trace_id, "detail": error.to_string() }),
-    })?;
-    if trace_id.len() != 16 {
-        return Err(WyrdError::Validation {
-            message: "trace_id must contain exactly 16 bytes".to_owned(),
-            details: serde_json::json!({ "trace_id": req.trace_id, "bytes": trace_id.len() }),
-        });
-    }
+    let df = apply_window(df, req.since, req.until)?;
     let df = df
         .filter(col("trace_id").eq(lit(ScalarValue::FixedSizeBinary(16, Some(trace_id)))))
         .map_err(df_err)?;
-    let df = if !has_perm(caller, Resource::BifrostTracePayload) {
-        df.drop_columns(&["attributes"]).map_err(df_err)?
-    } else {
+    let df = df.drop_columns(&SPAN_UNPROJECTED_COLUMNS).map_err(df_err)?;
+    let df = if has_perm(caller, Resource::BifrostTracePayload) {
         df
+    } else {
+        df.drop_columns(&SPAN_PAYLOAD_COLUMNS).map_err(df_err)?
     };
 
     Ok(df.logical_plan().clone())
+}
+
+/// Reject a scan window whose lower bound is later than its upper bound.
+///
+/// # Errors
+///
+/// Returns [`WyrdError::Validation`] when both bounds are present and `since`
+/// is strictly later than `until`.
+fn validate_bounds(
+    since: Option<DateTime<Utc>>,
+    until: Option<DateTime<Utc>>,
+) -> Result<(), WyrdError> {
+    if let (Some(since), Some(until)) = (since, until)
+        && since > until
+    {
+        return Err(WyrdError::Validation {
+            message: "since must not be later than until".to_owned(),
+            details: serde_json::json!({
+                "since": since.to_rfc3339(),
+                "until": until.to_rfc3339(),
+            }),
+        });
+    }
+    Ok(())
+}
+
+/// Decode one hexadecimal trace id into its exact 16 protocol bytes.
+///
+/// # Errors
+///
+/// Returns [`WyrdError::Validation`] when the text is not hexadecimal or does
+/// not decode to exactly 16 bytes.
+fn trace_id_bytes(trace_id: &str) -> Result<Vec<u8>, WyrdError> {
+    let bytes = hex::decode(trace_id).map_err(|error| WyrdError::Validation {
+        message: "trace_id must be a hexadecimal value".to_owned(),
+        details: serde_json::json!({ "trace_id": trace_id, "detail": error.to_string() }),
+    })?;
+    if bytes.len() != 16 {
+        return Err(WyrdError::Validation {
+            message: "trace_id must contain exactly 16 bytes".to_owned(),
+            details: serde_json::json!({ "trace_id": trace_id, "bytes": bytes.len() }),
+        });
+    }
+    Ok(bytes)
 }
 
 /// Build the `LogicalPlan` for `QueryTraces` (filtered spans; aggregation deferred to handler).
@@ -196,9 +302,9 @@ pub async fn build_query_traces_plan(
     let df = apply_window(df, req.window.since, req.window.until)?;
     // service_name is the physical column; matches req.service filter name
     let df = opt_filter_str(df, "service_name", &req.service)?;
-    let df = opt_filter_str(df, "status", &req.status)?;
+    let df = opt_filter_status(df, &req.status)?;
     let df = opt_filter_str(df, "name", &req.name)?;
-    let df = opt_filter_u32(df, "duration_ms", req.min_duration_ms)?;
+    let df = opt_filter_min_duration(df, req.min_duration_ms)?;
 
     Ok(df.logical_plan().clone())
 }
@@ -219,15 +325,42 @@ pub async fn build_query_recent_traces_plan(
     .await?;
     let df = apply_window(df, req.window.since, req.window.until)?;
     let df = opt_filter_str(df, "service_name", &req.service)?;
-    let df = opt_filter_str(df, "status", &req.status)?;
-    let df = opt_filter_u32(df, "duration_ms", req.min_duration_ms)?;
+    let df = opt_filter_status(df, &req.status)?;
+    let df = opt_filter_min_duration(df, req.min_duration_ms)?;
 
     Ok(df.logical_plan().clone())
 }
 
-/// Build the `LogicalPlan` for `QueryGenAi`.
-/// Payload columns (`input_messages`, `output_messages`) are projected away unless
-/// the caller holds `BifrostGenAiPayload:Read`.
+/// Canonical `gen_ai.operation.name` values that denote a generation span.
+///
+/// Embedding, retrieval, agent, workflow, planning, memory, fetch-response, and
+/// tool spans carry other operation names and are excluded by membership rather
+/// than by scanning the attributes payload.
+const GENAI_GENERATION_OPERATIONS: [&str; 3] = ["chat", "generate_content", "text_completion"];
+
+/// Metadata and promoted columns the GenAI generation search always projects.
+const GENAI_BASE_COLUMNS: [&str; 6] = [
+    "start_time_unix_nano",
+    "gen_ai_conversation_id",
+    "gen_ai_request_model",
+    "gen_ai_provider_name",
+    "gen_ai_usage_input_tokens",
+    "gen_ai_usage_output_tokens",
+];
+
+/// Build the `LogicalPlan` for `QueryGenAi` over canonical spans.
+///
+/// Generation membership and every request predicate bind to the promoted
+/// `gen_ai_*` columns, so classification never decodes the attributes payload.
+/// The base projection is metadata and promotions only; the canonical
+/// `attributes` column — the single source of the structured input/output
+/// messages — is added to the projection only for a caller holding
+/// `BifrostGenAiPayload:Read`, so an unauthorized plan never scans it.
+///
+/// # Errors
+///
+/// Returns the stable authorization or audit error from [`typed_dataframe`], or
+/// a plan-construction error.
 pub async fn build_query_genai_plan(
     state: &AppState,
     caller: &Caller,
@@ -237,19 +370,30 @@ pub async fn build_query_genai_plan(
         state,
         caller,
         "vala.query.typed.query_genai",
-        "vala.genai.messages",
+        "vala.traces.spans",
     )
     .await?;
     let df = apply_window(df, req.window.since, req.window.until)?;
-    let df = opt_filter_str(df, "conversation_id", &req.conversation_id)?;
-    let df = opt_filter_str(df, "request_model", &req.model)?;
-    let df = opt_filter_str(df, "provider_name", &req.provider)?;
-    let df = if !has_perm(caller, Resource::BifrostGenAiPayload) {
-        df.drop_columns(&["input_messages", "output_messages"])
-            .map_err(df_err)?
-    } else {
-        df
-    };
+    let df = df
+        .filter(
+            col("gen_ai_operation_name").in_list(
+                GENAI_GENERATION_OPERATIONS
+                    .iter()
+                    .map(|op| lit(*op))
+                    .collect(),
+                false,
+            ),
+        )
+        .map_err(df_err)?;
+    let df = opt_filter_str(df, "gen_ai_conversation_id", &req.conversation_id)?;
+    let df = opt_filter_str(df, "gen_ai_request_model", &req.model)?;
+    let df = opt_filter_str(df, "gen_ai_provider_name", &req.provider)?;
+
+    let mut projection: Vec<_> = GENAI_BASE_COLUMNS.iter().map(|name| col(*name)).collect();
+    if has_perm(caller, Resource::BifrostGenAiPayload) {
+        projection.push(col("attributes"));
+    }
+    let df = df.select(projection).map_err(df_err)?;
 
     Ok(df.logical_plan().clone())
 }

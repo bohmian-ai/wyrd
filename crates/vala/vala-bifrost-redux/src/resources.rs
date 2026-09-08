@@ -12,9 +12,9 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 #[cfg(any(test, feature = "test-support"))]
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicU8, Ordering as AtomicOrdering};
 #[cfg(any(test, feature = "test-support"))]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 

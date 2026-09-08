@@ -7,7 +7,7 @@
 //! `query::service::run_typed_query` seam the HTTP routes use.
 
 use chrono::DateTime;
-use wyrd_spec::vala::api::QueryWindow;
+use wyrd_spec::vala::api::{MAX_QUERY_PAGE_SIZE, QueryWindow};
 use wyrd_tonic::tonic::{Request, Response, Status};
 use wyrd_tonic::wyrd::v1::vala_query_service_server::{ValaQueryService, ValaQueryServiceServer};
 use wyrd_tonic::wyrd::v1::{
@@ -92,6 +92,13 @@ fn proto_window(w: proto::QueryWindow) -> QueryWindow {
     }
 }
 
+/// Parse one RFC3339 protobuf timestamp field; an empty string means unbounded.
+fn proto_timestamp(value: &str) -> Option<DateTime<chrono::Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+}
+
 fn opt_str(s: String) -> Option<String> {
     if s.is_empty() { None } else { Some(s) }
 }
@@ -106,16 +113,67 @@ fn opt_u32(v: u32) -> Option<u32> {
 
 // ─── api→proto row converters ─────────────────────────────────────────────────
 
+/// Serialize one payload-gated JSON value for the protobuf projection.
+///
+/// `None` — the shape an unauthorized projection produces — stays absent on the
+/// wire rather than becoming an empty string, so a gRPC caller sees the same
+/// omission an HTTP caller sees.
+fn opt_json(value: Option<serde_json::Value>) -> Option<String> {
+    value.map(|value| value.to_string())
+}
+
+fn span_event_to_proto(r: wyrd_spec::vala::api::SpanEventRow) -> proto::SpanEventRow {
+    proto::SpanEventRow {
+        time_unix_nano: r.time_unix_nano,
+        name: r.name,
+        attributes_json: opt_json(r.attributes),
+        dropped_attributes_count: r.dropped_attributes_count,
+    }
+}
+
+fn span_link_to_proto(r: wyrd_spec::vala::api::SpanLinkRow) -> proto::SpanLinkRow {
+    proto::SpanLinkRow {
+        linked_trace_id: r.linked_trace_id,
+        linked_span_id: r.linked_span_id,
+        trace_state: r.trace_state,
+        flags: r.flags,
+        attributes_json: opt_json(r.attributes),
+        dropped_attributes_count: r.dropped_attributes_count,
+    }
+}
+
 fn span_row_to_proto(r: wyrd_spec::vala::api::SpanRow) -> proto::SpanRow {
     proto::SpanRow {
         span_id: r.span_id,
-        parent_span_id: r.parent_span_id.unwrap_or_default(),
+        parent_span_id: r.parent_span_id,
+        trace_state: r.trace_state,
+        flags: r.flags,
         name: r.name,
         kind: r.kind,
-        started_at: r.started_at.to_rfc3339(),
-        duration_ms: r.duration_ms,
-        status: r.status,
-        attributes_json: r.attributes.map(|v| v.to_string()).unwrap_or_default(),
+        start_time_unix_nano: r.start_time_unix_nano,
+        end_time_unix_nano: r.end_time_unix_nano,
+        duration_nano: r.duration_nano,
+        status_code: r.status_code,
+        status_message: r.status_message,
+        attributes_json: opt_json(r.attributes),
+        dropped_attributes_count: r.dropped_attributes_count,
+        events: r.events.map(|events| proto::SpanEvents {
+            events: events.into_iter().map(span_event_to_proto).collect(),
+        }),
+        dropped_events_count: r.dropped_events_count,
+        links: r.links.map(|links| proto::SpanLinks {
+            links: links.into_iter().map(span_link_to_proto).collect(),
+        }),
+        dropped_links_count: r.dropped_links_count,
+        service_name: r.service_name,
+        resource_attributes_json: opt_json(r.resource_attributes),
+        resource_dropped_attributes_count: r.resource_dropped_attributes_count,
+        resource_schema_url: r.resource_schema_url,
+        scope_name: r.scope_name,
+        scope_version: r.scope_version,
+        scope_attributes_json: opt_json(r.scope_attributes),
+        scope_dropped_attributes_count: r.scope_dropped_attributes_count,
+        scope_schema_url: r.scope_schema_url,
     }
 }
 
@@ -136,12 +194,11 @@ fn genai_row_to_proto(r: wyrd_spec::vala::api::GenAiRow) -> proto::GenAiRow {
         conversation_id: r.conversation_id,
         model: r.model,
         provider: r.provider,
-        started_at: r.started_at.to_rfc3339(),
-        input_tokens: r.input_tokens.unwrap_or(0),
-        output_tokens: r.output_tokens.unwrap_or(0),
-        cost_usd: r.cost_usd.unwrap_or(0.0),
-        prompt: r.prompt.unwrap_or_default(),
-        completion: r.completion.unwrap_or_default(),
+        start_time_unix_nano: r.start_time_unix_nano,
+        input_tokens: r.input_tokens,
+        output_tokens: r.output_tokens,
+        input_messages_json: opt_json(r.input_messages),
+        output_messages_json: opt_json(r.output_messages),
     }
 }
 
@@ -256,26 +313,25 @@ impl ValaQueryService for ValaQueryGrpc {
         let caller = caller_from_metadata(&self.state, request.metadata()).await?;
         let p = request.into_inner();
         let api_req = wyrd_spec::vala::api::GetTraceRequest {
-            window: proto_window(p.window.unwrap_or_default()),
             trace_id: p.trace_id,
+            since: proto_timestamp(&p.since),
+            until: proto_timestamp(&p.until),
         };
-        let limit = effective_limit(api_req.window.limit);
         let plan = build_get_trace_plan(&self.state, &caller, &api_req)
             .await
             .map_err(status_from_wyrd)?;
-        let (batches, _) = run_typed_query(&self.state, &caller, plan, limit)
+        let (batches, _) = run_typed_query(&self.state, &caller, plan, MAX_QUERY_PAGE_SIZE)
             .await
             .map_err(status_from_wyrd)?;
 
         let spans: Vec<proto::SpanRow> = extract_span_rows_filtered(&batches, &api_req.trace_id)
+            .map_err(status_from_wyrd)?
             .into_iter()
             .map(span_row_to_proto)
             .collect();
         let waterfall = proto::TraceWaterfall {
             trace_id: api_req.trace_id,
             spans,
-            events: vec![],
-            links: vec![],
         };
         Ok(Response::new(PGetTraceResponse {
             trace: Some(waterfall),
@@ -427,6 +483,7 @@ impl ValaQueryService for ValaQueryGrpc {
             .map_err(status_from_wyrd)?;
 
         let rows: Vec<proto::GenAiRow> = extract_genai_rows(&batches)
+            .map_err(status_from_wyrd)?
             .into_iter()
             .map(genai_row_to_proto)
             .collect();

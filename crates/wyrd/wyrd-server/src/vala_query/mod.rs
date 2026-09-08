@@ -8,6 +8,8 @@
 
 pub mod grpc;
 pub mod page_token;
+/// Response-edge decoding of canonical protobuf payload columns into public JSON.
+pub mod payload;
 pub mod routes;
 pub mod service;
 

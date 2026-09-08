@@ -255,7 +255,8 @@ message QueryWindow {
   string page_token = 4;   // opaque continuation token
 }
 
-message GetTraceRequest        { QueryWindow window = 1; string trace_id = 2; }
+// Complete trace detail: one authorized cut, so no limit and no page token.
+message GetTraceRequest        { string trace_id = 1; string since = 2; string until = 3; }
 message QueryTracesRequest      { QueryWindow window = 1; string service = 2; uint32 min_duration_ms = 3; string status = 4; string name = 5; }
 message QueryRecentTracesRequest{ QueryWindow window = 1; string service = 2; string status = 3; uint32 min_duration_ms = 4; }
 message QueryGenAiRequest        { QueryWindow window = 1; string conversation_id = 2; string model = 3; string provider = 4; }
@@ -265,12 +266,54 @@ message QueryMetricsRequest      { QueryWindow window = 1; string metric_name = 
 message QueryLogsRequest         { QueryWindow window = 1; int32 severity_number_min = 2; string trace_id = 3; string event_name = 4; }
 message QueryAgentTracesRequest  { QueryWindow window = 1; string dev_session_id = 2; string repo = 3; string commit_sha = 4; string branch = 5; string run_id = 6; }
 
-message SpanRow      { string span_id = 1; string parent_span_id = 2; string name = 3; string kind = 4; string started_at = 5; double duration_ms = 6; string status = 7; string attributes_json = 8; }
-message SpanEventRow { string name = 1; string timestamp = 2; string attributes_json = 3; }
-message SpanLinkRow  { string linked_trace_id = 1; string linked_span_id = 2; string attributes_json = 3; }
-message TraceWaterfall { string trace_id = 1; repeated SpanRow spans = 2; repeated SpanEventRow events = 3; repeated SpanLinkRow links = 4; }
+message SpanEventRow { int64 time_unix_nano = 1; string name = 2; optional string attributes_json = 3; int64 dropped_attributes_count = 4; }
+message SpanLinkRow  { string linked_trace_id = 1; string linked_span_id = 2; string trace_state = 3; int64 flags = 4; optional string attributes_json = 5; int64 dropped_attributes_count = 6; }
+
+// Presence wrappers: an absent collection means the caller lacked
+// bifrost_trace_payload:read, which a bare `repeated` field cannot express.
+message SpanEvents { repeated SpanEventRow events = 1; }
+message SpanLinks  { repeated SpanLinkRow  links  = 1; }
+
+message SpanRow {
+  string span_id                             = 1;
+  optional string parent_span_id             = 2;
+  string trace_state                         = 3;
+  int64  flags                               = 4;
+  string name                                = 5;
+  int32  kind                                = 6;
+  int64  start_time_unix_nano                = 7;
+  int64  end_time_unix_nano                  = 8;
+  int64  duration_nano                       = 9;
+  optional int32  status_code                = 10;
+  optional string status_message             = 11;
+  optional string attributes_json            = 12;
+  int64  dropped_attributes_count            = 13;
+  SpanEvents events                          = 14;
+  int64  dropped_events_count                = 15;
+  SpanLinks  links                           = 16;
+  int64  dropped_links_count                 = 17;
+  optional string service_name               = 18;
+  optional string resource_attributes_json   = 19;
+  int64  resource_dropped_attributes_count   = 20;
+  string resource_schema_url                 = 21;
+  string scope_name                          = 22;
+  string scope_version                       = 23;
+  optional string scope_attributes_json      = 24;
+  int64  scope_dropped_attributes_count      = 25;
+  string scope_schema_url                    = 26;
+}
+message TraceWaterfall { string trace_id = 1; repeated SpanRow spans = 2; }
 message TraceSummaryRow { string trace_id = 1; string root_name = 2; string service = 3; string started_at = 4; double duration_ms = 5; uint32 span_count = 6; bool error = 7; }
-message GenAiRow  { string conversation_id = 1; string model = 2; string provider = 3; string started_at = 4; int64 input_tokens = 5; int64 output_tokens = 6; double cost_usd = 7; string prompt = 8; string completion = 9; }
+message GenAiRow {
+  optional string conversation_id     = 1;
+  optional string model               = 2;
+  optional string provider            = 3;
+  int64  start_time_unix_nano         = 4;
+  optional int64  input_tokens        = 5;
+  optional int64  output_tokens       = 6;
+  optional string input_messages_json = 7;
+  optional string output_messages_json = 8;
+}
 message EvalRow   { string eval_id = 1; string run_id = 2; string metric = 3; double score = 4; string started_at = 5; }
 message DriftRow  { string feature = 1; string run_id = 2; double drift_score = 3; double threshold = 4; string computed_at = 5; }
 message MetricRow { string metric_name = 1; string metric_type = 2; double value = 3; string timestamp = 4; string attributes_json = 5; }

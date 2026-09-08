@@ -2341,7 +2341,6 @@ mod tests {
                 object_key: "scribe/workload/000.parquet",
                 file_checksum: &"0".repeat(64),
                 partition,
-                schema_fingerprint: "0".repeat(64),
                 partition_spec_id: BIFROST_PARTITION_SPEC_ID,
                 sort_order_id: BIFROST_SORT_ORDER_ID,
             },

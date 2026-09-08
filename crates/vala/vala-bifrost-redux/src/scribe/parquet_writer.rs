@@ -264,8 +264,6 @@ pub struct BoundedParquetArtifact {
     /// persisted record the writer's own evidence rather than a later
     /// reconstruction.
     pub data_file_metrics: crate::scribe::promotion::ScribeDataFileV1,
-    /// Lowercase hex Wyrd schema fingerprint the footer was sealed with.
-    pub schema_fingerprint: String,
 }
 
 /// Statistics for a single row group.
@@ -767,7 +765,6 @@ impl<'a> RollingArtifactWriter<'a> {
         let SealedArtifactEvidence {
             row_group_stats,
             data_file_metrics,
-            schema_fingerprint,
         } = evidence;
         self.row_group_stats.extend(row_group_stats.iter().cloned());
         self.artifacts.push(BoundedParquetArtifact {
@@ -779,7 +776,6 @@ impl<'a> RollingArtifactWriter<'a> {
             row_count: rows,
             row_group_stats,
             data_file_metrics,
-            schema_fingerprint,
         });
         Ok(())
     }
@@ -911,8 +907,6 @@ struct SealedArtifactEvidence {
     row_group_stats: Vec<RowGroupStats>,
     /// Iceberg-ready metrics for the whole object.
     data_file_metrics: crate::scribe::promotion::ScribeDataFileV1,
-    /// Lowercase hex Wyrd schema fingerprint the footer carries.
-    schema_fingerprint: String,
 }
 
 /// Validates one sealed artifact and returns everything its footer proves.
@@ -1020,9 +1014,6 @@ fn inspect_sealed_artifact(
     Ok(SealedArtifactEvidence {
         row_group_stats,
         data_file_metrics,
-        schema_fingerprint: hex::encode(
-            crate::schema::SchemaFingerprint::from_arrow_schema(expected_schema).0,
-        ),
     })
 }
 
@@ -2011,7 +2002,7 @@ mod tests {
     }
 
     /// Every sealed artifact carries Iceberg metrics that agree with the exact
-    /// footer it closed, plus the fingerprint of the schema it was sealed with.
+    /// footer it closed.
     ///
     /// The metrics exist so a promoter never has to reopen the object. That is
     /// only safe if they are the footer's own numbers, so this compares each
@@ -2020,9 +2011,8 @@ mod tests {
     ///
     /// # Panics
     ///
-    /// Panics when a projected metric contradicts the footer, when the split
-    /// offsets do not name the artifact's row groups, or when the recorded
-    /// fingerprint is not the sealed schema's.
+    /// Panics when a projected metric contradicts the footer or when the split
+    /// offsets do not name the artifact's row groups.
     #[test]
     fn sealed_artifacts_carry_footer_agreeing_iceberg_metrics() {
         let tenant = DataTenantId::new_v7();
@@ -2108,10 +2098,6 @@ mod tests {
         );
         assert_eq!(metrics.lower_bounds.len(), schema.fields().len());
         assert_eq!(metrics.upper_bounds.len(), schema.fields().len());
-        assert_eq!(
-            artifact.schema_fingerprint,
-            hex::encode(crate::schema::SchemaFingerprint::from_arrow_schema(schema.as_ref()).0)
-        );
     }
 
     /// Generation encoding sorts every stored batch together, stamps the

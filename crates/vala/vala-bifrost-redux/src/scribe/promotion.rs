@@ -229,8 +229,6 @@ pub struct PublishedHotFileIdentity<'a> {
     pub file_checksum: &'a str,
     /// Physical partition the object belongs to.
     pub partition: TimePartition,
-    /// Wyrd schema fingerprint the footer was sealed with, as lowercase hex.
-    pub schema_fingerprint: String,
     /// Iceberg partition-spec identity the object was written under.
     pub partition_spec_id: i32,
     /// Iceberg sort-order identity the object was written under.
@@ -272,8 +270,6 @@ pub struct ScribePublishedHotFileV1 {
     pub object_key: String,
     /// Lowercase SHA-256 of the sealed object bytes.
     pub file_checksum: String,
-    /// Wyrd schema fingerprint the footer was sealed with, as lowercase hex.
-    pub schema_fingerprint: String,
     /// Iceberg partition-spec identity the object was written under.
     pub partition_spec_id: i32,
     /// Iceberg sort-order identity the object was written under.
@@ -305,7 +301,6 @@ impl ScribePublishedHotFileV1 {
             file_list_id: identity.file_list_id,
             object_key: identity.object_key.to_owned(),
             file_checksum: identity.file_checksum.to_owned(),
-            schema_fingerprint: identity.schema_fingerprint.clone(),
             partition_spec_id: identity.partition_spec_id,
             sort_order_id: identity.sort_order_id,
             partition: ScribePartitionValueV1::from_partition(identity.partition),
@@ -478,7 +473,6 @@ mod tests {
                 object_key: "tenant/table/day=1970-01-01/scribe-0-00000.parquet",
                 file_checksum: &"ab".repeat(32),
                 partition,
-                schema_fingerprint: "cd".repeat(32),
                 partition_spec_id: BIFROST_PARTITION_SPEC_ID,
                 sort_order_id: BIFROST_SORT_ORDER_ID,
             },

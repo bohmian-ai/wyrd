@@ -1,9 +1,9 @@
 # BIFROST-OTEL-T02-R2 — Fast convergence closeout
 
-Status: READY  
-Scope: one remediation task for `FIND-02-R1-1`, `FIND-02-R1-2`, and `FIND-02-R1-3`  
-Candidate reviewed: `e09c2c72d4bb83064096faa0dbe99ce16ce46ff7`  
-Authority: approved `spec.md` revision 9 and `BIFROST-OTEL-T02-R1-e09c2c72d-verdict.md`
+- Status: READY
+- Scope: one remediation task for `FIND-02-R1-1`, `FIND-02-R1-2`, and `FIND-02-R1-3`
+- Candidate reviewed: `e09c2c72d4bb83064096faa0dbe99ce16ce46ff7`
+- Authority: approved `spec.md` revision 9 and `BIFROST-OTEL-T02-R1-e09c2c72d-verdict.md`
 
 ## Goal
 
@@ -240,3 +240,43 @@ and the three `optional_card_correlation_is_atomic_and_lossless` tests — 8 run
   production_pin_tests`, two `scribe::persistence::tests`) fail under a bare
   `cargo nextest` invocation both before and after this change; they pass in
   the `test:bifrost:integration:redux` lane, which provides their environment.
+
+## R2 verdict closeout (`BIFROST-OTEL-T02-R2-6f46cd5dd-verdict.md`)
+
+### FIND-02-R2-1 — unused normalized fingerprint deleted end to end
+
+The observation recorded above is now closed by deletion rather than by
+correcting the value. `schema_fingerprint` is gone from
+`SealedArtifactEvidence`, `BoundedParquetArtifact`, `PublishedHotFileIdentity`,
+and `ScribePublishedHotFileV1`, along with its single producer
+(`inspect_sealed_artifact`), its single consumer (`file_list_writer`), and the
+three fixtures that supplied it (`promotion.rs`, `staging.rs`,
+`scribe_workload.rs`). No replacement field, compatibility shim, version bump,
+or migration was added: the record is unshipped and nothing read the value.
+
+`from_arrow_schema_exact` keeps exactly one caller,
+`crate::parquet::memory::schema_fingerprint`, which remains the identity the
+Parquet footer is sealed with and the identity staging, replay, and Oracle
+admission compare. Two rustdoc claims that named the removed field were
+narrowed to what the code still proves.
+
+### FIND-02-R2-2 — candidate-bound whitespace
+
+The three metadata lines carried trailing double-space Markdown hard breaks.
+They are now list items, which keeps them on separate rendered lines without
+trailing whitespace. `git diff --check` exits 0.
+
+### Verification
+
+- `mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib
+  --features test-support,bench-support -E
+  'test(=scribe::promotion::tests::promotion_record_round_trips_and_encodes_deterministically)
+  | test(=scribe::parquet_writer::tests::parquet_footer_preserves_complete_claim_evidence)
+  | test(=scribe::parquet_writer::tests::sealed_artifacts_carry_footer_agreeing_iceberg_metrics)
+  | test(=schema::fingerprint::tests::exact_fingerprint_commits_layout_and_nullability_only)
+  | test(=parquet::memory::tests::bifrost_footer_fingerprint_does_not_alias_utc_spellings)'`
+  — 5/5 passed.
+- `mise run test:bifrost:integration:redux` — 958/958 passed.
+- `mise run test:bifrost:journey:scribe` — 20/20 passed.
+- `mise run fmt`, `mise run lints` — clean.
+- `git diff --check` — exit 0.

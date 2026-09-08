@@ -433,6 +433,14 @@ pub(crate) struct PromotionCatalogSeam {
     parked_dropped: AtomicBool,
     /// Wakes tests waiting for that cancellation.
     parked_drop_ready: tokio::sync::Notify,
+    /// One-shot arm for holding the next table load before delegation.
+    pause_next_load: AtomicBool,
+    /// Records that a held load is sitting at this seam.
+    load_paused: AtomicBool,
+    /// Wakes tests waiting for that held load.
+    load_paused_ready: tokio::sync::Notify,
+    /// Releases the held load.
+    load_release: tokio::sync::Notify,
     /// Whether every accepted commit's response is discarded before returning.
     lose_response: AtomicBool,
     /// Remaining accepted commits whose response never arrives at all.
@@ -463,6 +471,10 @@ impl PromotionCatalogSeam {
             parked_release: tokio::sync::Notify::new(),
             parked_dropped: AtomicBool::new(false),
             parked_drop_ready: tokio::sync::Notify::new(),
+            pause_next_load: AtomicBool::new(false),
+            load_paused: AtomicBool::new(false),
+            load_paused_ready: tokio::sync::Notify::new(),
+            load_release: tokio::sync::Notify::new(),
             lose_response: AtomicBool::new(false),
             stall_response_budget: AtomicUsize::new(0),
             file_io: std::sync::OnceLock::new(),
@@ -580,6 +592,41 @@ impl PromotionCatalogSeam {
         self.stall_response_budget.store(count, Ordering::Release);
     }
 
+    /// Hold the next delegated table load until the test releases it.
+    ///
+    /// Exact-operation reconciliation reads the retained table through this
+    /// seam, so a held load is the one place a scenario can stand inside a
+    /// reconciliation await and act while the worker is stuck there. It is the
+    /// load counterpart of [`Self::park_next_commit`] and one-shot for the same
+    /// reason: a scenario that held every load would stop the worker doing
+    /// anything else it is being observed for.
+    pub(crate) fn pause_next_load(&self) {
+        self.load_paused.store(false, Ordering::Release);
+        self.pause_next_load.store(true, Ordering::Release);
+    }
+
+    /// Wait until a table load is held at this seam.
+    ///
+    /// The wakeup is registered before the flag is read so a release that lands
+    /// between the two is observed rather than lost.
+    pub(crate) async fn wait_for_paused_load(&self) {
+        loop {
+            let ready = self.load_paused_ready.notified();
+            tokio::pin!(ready);
+            ready.as_mut().enable();
+            if self.load_paused.load(Ordering::Acquire) {
+                return;
+            }
+            ready.await;
+        }
+    }
+
+    /// Release the held table load.
+    pub(crate) fn release_paused_load(&self) {
+        self.load_paused.store(false, Ordering::Release);
+        self.load_release.notify_waiters();
+    }
+
     /// Release the parked commit as a definite conflict.
     pub(crate) fn reject_parked_commit(&self) {
         self.reject_parked.store(true, Ordering::Release);
@@ -638,6 +685,17 @@ impl Catalog for PromotionCatalogSeam {
 
     async fn load_table(&self, table: &TableIdent) -> iceberg::Result<Table> {
         self.loads.fetch_add(1, Ordering::AcqRel);
+        if self.pause_next_load.swap(false, Ordering::AcqRel) {
+            // The release waiter is registered before the hold is announced, so
+            // a test that releases the instant it observes the hold cannot miss
+            // its own notification and strand the worker here.
+            let release = self.load_release.notified();
+            tokio::pin!(release);
+            release.as_mut().enable();
+            self.load_paused.store(true, Ordering::Release);
+            self.load_paused_ready.notify_waiters();
+            release.await;
+        }
         let loaded = self.inner.load_table(table).await?;
         let Some(file_io) = self.file_io.get() else {
             return Ok(loaded);
@@ -1482,11 +1540,25 @@ impl PromotionIntegrationFixture {
     ///
     /// Panics when the update fails.
     pub(crate) async fn expire_claims(&self) {
+        self.expire_claims_of(self.tenant).await;
+    }
+
+    /// Ages another tenant's live claims out the same way.
+    ///
+    /// A scenario that owns more than one tenant has to return the claims a
+    /// stopped generation still holds for *both* of them before the next phase
+    /// starts, because one active task per table is a production bound and a
+    /// stranded claim of either tenant keeps its table unclaimable.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the update fails.
+    pub(crate) async fn expire_claims_of(&self, tenant: DataTenantId) {
         sqlx::query(
             "UPDATE vala.forge_tasks SET claim_expires_at = statement_timestamp() - interval '1 minute' \
              WHERE data_tenant_id = $1 AND state IN ('claimed', 'running')",
         )
-        .bind(self.tenant.as_uuid())
+        .bind(tenant.as_uuid())
         .execute(self.operator_pool.pool())
         .await
         .expect("fixture claim aging");
@@ -1567,6 +1639,30 @@ impl PromotionIntegrationFixture {
         .execute(self.operator_pool.pool())
         .await
         .expect("fixture task offer window");
+    }
+
+    /// Moves one exact task to `offset_secs` from now.
+    ///
+    /// Offering by tenant also releases every unrelated row that tenant owns,
+    /// and a scenario that measures one turn's claims cannot afford the tables
+    /// an earlier phase left behind competing for them. Naming the task is what
+    /// keeps the work under test the work the scenario chose.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the update fails or names no task.
+    pub(crate) async fn offer_task(&self, task_id: Uuid, offset_secs: i64) {
+        let offered = sqlx::query(
+            "UPDATE vala.forge_tasks \
+             SET next_eligible_at = statement_timestamp() + ($2::text || ' seconds')::interval \
+             WHERE task_id = $1",
+        )
+        .bind(task_id)
+        .bind(offset_secs.to_string())
+        .execute(self.operator_pool.pool())
+        .await
+        .expect("fixture task offer");
+        assert_eq!(offered.rows_affected(), 1, "the named task exists to offer");
     }
 
     /// Re-offers the newest settled small-files task as fresh claimable work.

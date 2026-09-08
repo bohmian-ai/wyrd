@@ -136,9 +136,9 @@ mod pg_tests {
                 .await?,
         )?;
         assert_eq!(described["entry"]["name"], serde_json::json!(authorized));
-        let fields = described["fields"]
+        let fields = described["user_fields"]
             .as_array()
-            .ok_or("describe returns the stored field list")?;
+            .ok_or("describe returns the stored user field list")?;
         let field_names: Vec<&str> = fields
             .iter()
             .filter_map(|field| field["name"].as_str())
@@ -147,11 +147,14 @@ mod pg_tests {
             field_names.contains(&"id") && field_names.contains(&"value"),
             "every user field is described: {field_names:?}"
         );
+        let correlation = described["correlation_fields"]
+            .as_array()
+            .ok_or("describe returns the server-resolved correlation fields")?;
         assert!(
-            fields
+            correlation
                 .iter()
                 .any(|field| field["metadata"]["wyrd:column_class"] == "correlation"),
-            "field metadata reaches the agent: {fields:?}"
+            "field metadata reaches the agent: {correlation:?}"
         );
         let layout = &described["physical_layout"];
         assert!(

@@ -258,9 +258,9 @@ mod pg_tests {
                     )
                     .await?,
             )?;
-            let columns: Vec<&str> = described["fields"]
+            let columns: Vec<&str> = described["user_fields"]
                 .as_array()
-                .ok_or("describe returns the stored field list")?
+                .ok_or("describe returns the stored user field list")?
                 .iter()
                 .filter_map(|field| field["name"].as_str())
                 .collect();

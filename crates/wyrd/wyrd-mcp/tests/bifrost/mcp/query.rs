@@ -556,9 +556,9 @@ mod pg_tests {
         )?;
         assert_eq!(described["entry"]["name"], serde_json::json!(name));
 
-        let fields = described["fields"]
+        let fields = described["user_fields"]
             .as_array()
-            .ok_or("describe returns fields")?;
+            .ok_or("describe returns user fields")?;
         for name in ["name", "status_code"] {
             assert!(
                 fields.iter().any(|field| field["name"] == name),

@@ -12,8 +12,10 @@ use wyrd_client::WyrdClient;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
-    BifrostQueryRequest, CancelRunningQueryResponse, ListRunningQueriesResponse, QueryStreamFrame,
-    QueryTerminalErrorCode, QueryTerminalFrame, QueryTerminalOutcome, RunningQuerySummary,
+    BifrostQueryRequest, BifrostTableDescription, CancelRunningQueryResponse, GetTraceRequest,
+    GetTraceResponse, ListRunningQueriesResponse, QueryGenAiRequest, QueryGenAiResponse,
+    QueryStreamFrame, QueryTerminalErrorCode, QueryTerminalFrame, QueryTerminalOutcome,
+    RunningQuerySummary,
 };
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_tonic::frame_codec::FrameDecoder;
@@ -308,6 +310,111 @@ impl QueryClient {
                 &format!("/v1/query/{request_id}"),
                 None,
             )
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Describes one registered table's stored physical schema.
+    ///
+    /// The description is the server's own projection of the stored schema: the
+    /// user fields a caller writes, the correlation fields the write path
+    /// resolves, the managed candidates it may supply, and — for a canonical
+    /// signal table — the canonical physical fingerprint. A client builds its
+    /// insertable Arrow schema from this rather than from a local table
+    /// definition, so no client owns a second copy of the physical contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns stable authentication, authorization, not-found, availability,
+    /// or protocol errors.
+    ///
+    /// # Cancellation
+    ///
+    /// Cancelling the future abandons the pending request; describe reads
+    /// nothing durable, so an abandoned call leaves no server state behind.
+    pub async fn describe_table(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> Result<BifrostTableDescription, ValaSdkError> {
+        self.client
+            .request_json::<(), _>(
+                reqwest::Method::GET,
+                &format!("/v1/bifrost/tables/{namespace}/{name}"),
+                None,
+            )
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Reads one complete authorized cut of a single trace.
+    ///
+    /// Trace detail has no pagination: the response carries every span the
+    /// caller may see, with each span's events and links nested on it. `since`
+    /// and `until` bound the scanned event-time window only and travel as query
+    /// parameters, matching the server's route contract. Sensitive payload is
+    /// omitted by the server when the caller lacks payload read permission,
+    /// which the client neither detects nor compensates for.
+    ///
+    /// # Errors
+    ///
+    /// Returns a protocol error when `since` is later than `until`, and stable
+    /// authentication, authorization, not-found, availability, or protocol
+    /// errors from the server.
+    ///
+    /// # Cancellation
+    ///
+    /// Cancelling the future abandons the pending read request.
+    pub async fn get_trace(
+        &self,
+        request: &GetTraceRequest,
+    ) -> Result<GetTraceResponse, ValaSdkError> {
+        if let (Some(since), Some(until)) = (request.since, request.until)
+            && since > until
+        {
+            return Err(ValaSdkError::Protocol(
+                "trace detail requires since <= until".to_owned(),
+            ));
+        }
+        let mut path = format!("/v1/traces/{}", request.trace_id);
+        let mut separator = '?';
+        if let Some(since) = request.since {
+            path.push(separator);
+            path.push_str(&format!("since={}", since.to_rfc3339()));
+            separator = '&';
+        }
+        if let Some(until) = request.until {
+            path.push(separator);
+            path.push_str(&format!("until={}", until.to_rfc3339()));
+        }
+        self.client
+            .request_json::<(), _>(reqwest::Method::GET, &path, None)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Reads GenAI generation records matching the request's filters.
+    ///
+    /// Generations are the promoted rows of the canonical span table, so this
+    /// is one filtered read of that table rather than a query against a
+    /// separate GenAI store. Paging, permission, and structured-message
+    /// projection all remain server behavior; the client sends the request and
+    /// projects the response.
+    ///
+    /// # Errors
+    ///
+    /// Returns stable authentication, authorization, validation, availability,
+    /// or protocol errors.
+    ///
+    /// # Cancellation
+    ///
+    /// Cancelling the future abandons the pending read request.
+    pub async fn query_genai(
+        &self,
+        request: &QueryGenAiRequest,
+    ) -> Result<QueryGenAiResponse, ValaSdkError> {
+        self.client
+            .request_json(reqwest::Method::POST, "/v1/genai/query", Some(request))
             .await
             .map_err(Into::into)
     }
@@ -1618,6 +1725,286 @@ mod tests {
             counts.cancels.load(Ordering::Acquire),
             0,
             "a terminal proven by clean EOF owes the server nothing"
+        );
+    }
+
+
+    /// Serves one canned JSON body and records every request line it answers.
+    ///
+    /// The recorded lines are the proof of a typed method's HTTP contract: the
+    /// exact verb, path, and query string a caller's request produced. Each
+    /// connection is answered once and closed so the recording stays ordered.
+    fn recording_server(body: &'static str) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("test listener binds");
+        let address = listener.local_addr().expect("listener has an address");
+        listener
+            .set_nonblocking(true)
+            .expect("listener converts to tokio");
+        let listener = TcpListener::from_std(listener).expect("listener adopts the runtime");
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&seen);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let recorded = Arc::clone(&recorded);
+                tokio::spawn(async move {
+                    let mut request = [0_u8; 4096];
+                    let Ok(read) = socket.read(&mut request).await else {
+                        return;
+                    };
+                    let request = String::from_utf8_lossy(&request[..read]).to_string();
+                    let response = if request.starts_with("POST /auth/token") {
+                        let token = "{\"access_token\":\"test-token\",\"token_type\":\"Bearer\",\"expires_at\":\"2099-01-01T00:00:00Z\"}";
+                        format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{token}",
+                            token.len()
+                        )
+                    } else {
+                        let line = request.lines().next().unwrap_or_default().to_owned();
+                        if let Ok(mut recorded) = recorded.lock() {
+                            recorded.push(line);
+                        }
+                        format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                    };
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        (format!("http://{address}"), seen)
+    }
+
+    /// A described canonical table builds its insertable Arrow schema directly.
+    ///
+    /// The three describe classes are exactly what a writer needs: it declares
+    /// the user fields, supplies the correlation inputs, and may supply the
+    /// managed candidate. Building a schema from that description must append
+    /// each correlation column exactly once — a writer that also re-declared
+    /// `card_ref` would collide with the one the write path resolves.
+    ///
+    /// # Panics
+    ///
+    /// Panics when describe does not reach its route, when the projected
+    /// schema loses a declared column or its stable field id, or when a
+    /// correlation column appears twice.
+    #[tokio::test]
+    async fn describe_builds_writable_schema_without_duplicate_correlation() {
+        let body = r#"{
+            "entry": {
+                "namespace": "vala.traces",
+                "name": "spans",
+                "table_uid": "0102030405060708090a0b0c0d0e0f10",
+                "status": "Active",
+                "fingerprint": "aa",
+                "registered_at": "2026-07-01T00:00:00Z",
+                "updated_at": "2026-07-01T00:00:00Z"
+            },
+            "user_fields": [
+                { "name": "trace_id", "data_type": "Binary", "nullable": false,
+                  "metadata": { "PARQUET:field_id": "1" } }
+            ],
+            "correlation_fields": [
+                { "name": "card_ref", "data_type": "Utf8", "nullable": false,
+                  "metadata": { "wyrd:input_class": "gate_correlation" } },
+                { "name": "run_id", "data_type": "Utf8", "nullable": true,
+                  "metadata": { "PARQUET:field_id": "1000" } }
+            ],
+            "managed_candidates": [
+                { "name": "wyrd_event_time",
+                  "data_type": { "Timestamp": { "unit": "Microsecond", "tz": "UTC" } },
+                  "nullable": false, "metadata": { "PARQUET:field_id": "1004" } }
+            ],
+            "canonical_physical_fingerprint": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "physical_layout": { "partition_granularity": "hour" }
+        }"#;
+        let (base_url, seen) = recording_server(body);
+        let described = client_for(&base_url)
+            .describe_table("vala.traces", "spans")
+            .await
+            .expect("describe returns the stored schema projection");
+
+        assert_eq!(
+            seen.lock().expect("recording is readable").as_slice(),
+            ["GET /v1/bifrost/tables/vala.traces/spans HTTP/1.1"],
+            "describe reads the one table route and sends no body"
+        );
+        assert_eq!(
+            described.canonical_physical_fingerprint.as_deref(),
+            Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+            "a canonical table publishes its exact physical fingerprint"
+        );
+
+        let writable = wyrd_queue::schema::writable_schema(&described, true)
+            .expect("the description projects an Arrow schema");
+        assert_eq!(
+            writable
+                .fields()
+                .iter()
+                .map(|field| field.name().as_str())
+                .collect::<Vec<_>>(),
+            ["trace_id", "card_ref", "run_id", "wyrd_event_time"],
+            "user fields precede correlation inputs, then the managed candidate"
+        );
+        assert_eq!(
+            writable.field(3).metadata().get("PARQUET:field_id"),
+            Some(&"1004".to_owned()),
+            "the managed candidate keeps its stable canonical field id"
+        );
+        assert_eq!(
+            wyrd_queue::schema::writable_schema(&described, false)
+                .expect("event time is optional")
+                .fields()
+                .len(),
+            3,
+            "a writer that supplies no event time declares no event-time column"
+        );
+
+        let builder = wyrd_queue::batch_builder::BatchBuilder::from_description(&described)
+            .expect("the description builds a JSON row builder");
+        assert_eq!(
+            builder
+                .output_schema()
+                .fields()
+                .iter()
+                .filter(|field| field.name() == "card_ref")
+                .count(),
+            1,
+            "the write path appends each correlation column exactly once"
+        );
+    }
+
+    /// The typed trace and GenAI reads project their exact HTTP contracts.
+    ///
+    /// Trace detail is a complete cut with no continuation token, so it is a
+    /// GET whose only parameters bound the scanned window; GenAI is a filtered
+    /// read of the canonical span table and posts its request. Both decode the
+    /// server's response verbatim — a client never reconstructs a nested span
+    /// or a structured message itself.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a method reaches the wrong route, drops a window bound,
+    /// loses a nested child, or alters a structured message payload.
+    #[tokio::test]
+    async fn typed_trace_and_genai_methods_project_http_contracts() {
+        let (base_url, seen) = recording_server(
+            r#"{
+                "trace": {
+                    "trace_id": "0102030405060708090a0b0c0d0e0f10",
+                    "spans": [{
+                        "span_id": "0102030405060708",
+                        "trace_state": "",
+                        "flags": 1,
+                        "name": "chat",
+                        "kind": 3,
+                        "start_time_unix_nano": 7,
+                        "end_time_unix_nano": 9,
+                        "duration_nano": 2,
+                        "status_code": 1,
+                        "dropped_attributes_count": 0,
+                        "events": [{
+                            "time_unix_nano": 8,
+                            "name": "chunk",
+                            "dropped_attributes_count": 0
+                        }],
+                        "dropped_events_count": 0,
+                        "links": [],
+                        "dropped_links_count": 0,
+                        "service_name": "checkout",
+                        "resource_dropped_attributes_count": 0,
+                        "resource_schema_url": "",
+                        "scope_name": "wyrd",
+                        "scope_version": "1",
+                        "scope_dropped_attributes_count": 0,
+                        "scope_schema_url": ""
+                    }]
+                }
+            }"#,
+        );
+        let client = client_for(&base_url);
+        let trace = client
+            .get_trace(&GetTraceRequest {
+                trace_id: "0102030405060708090a0b0c0d0e0f10".to_owned(),
+                since: Some(
+                    "2026-07-01T00:00:00Z"
+                        .parse()
+                        .expect("a fixed bound parses"),
+                ),
+                until: None,
+            })
+            .await
+            .expect("trace detail returns one complete cut");
+        assert_eq!(trace.trace.spans.len(), 1);
+        assert_eq!(
+            trace.trace.spans[0]
+                .events
+                .as_ref()
+                .map(Vec::len)
+                .expect("an authorized cut carries the span's events"),
+            1,
+            "each event stays nested on the span that owns it"
+        );
+        assert_eq!(trace.trace.spans[0].start_time_unix_nano, 7);
+
+        assert!(
+            client
+                .get_trace(&GetTraceRequest {
+                    trace_id: "0102030405060708090a0b0c0d0e0f10".to_owned(),
+                    since: Some("2026-07-02T00:00:00Z".parse().expect("a fixed bound parses")),
+                    until: Some("2026-07-01T00:00:00Z".parse().expect("a fixed bound parses")),
+                })
+                .await
+                .is_err(),
+            "an inverted window is refused before it reaches the server"
+        );
+
+        let (genai_url, genai_seen) = recording_server(
+            r#"{
+                "rows": [{
+                    "model": "gpt-4o",
+                    "start_time_unix_nano": 11,
+                    "input_tokens": 3,
+                    "input_messages": [{ "role": "user", "parts": [1, null] }]
+                }],
+                "next_page_token": "next"
+            }"#,
+        );
+        let generations = client_for(&genai_url)
+            .query_genai(&QueryGenAiRequest {
+                window: wyrd_spec::vala::api::QueryWindow {
+                    limit: Some(10),
+                    ..wyrd_spec::vala::api::QueryWindow::default()
+                },
+                conversation_id: None,
+                model: Some("gpt-4o".to_owned()),
+                provider: None,
+            })
+            .await
+            .expect("GenAI returns one page of generations");
+        assert_eq!(generations.next_page_token.as_deref(), Some("next"));
+        assert_eq!(
+            generations.rows[0].input_messages,
+            Some(serde_json::json!([{ "role": "user", "parts": [1, null] }])),
+            "structured messages keep their order, nesting, scalars, and nulls"
+        );
+        assert!(
+            generations.rows[0].output_messages.is_none(),
+            "an omitted payload stays absent rather than becoming empty"
+        );
+
+        assert_eq!(
+            seen.lock().expect("recording is readable")[0],
+            "GET /v1/traces/0102030405060708090a0b0c0d0e0f10?since=2026-07-01T00:00:00+00:00 HTTP/1.1",
+            "trace detail carries only its window bounds, never a page token"
+        );
+        assert_eq!(
+            genai_seen.lock().expect("recording is readable")[0],
+            "POST /v1/genai/query HTTP/1.1",
+            "GenAI posts its filters to the canonical query route"
         );
     }
 

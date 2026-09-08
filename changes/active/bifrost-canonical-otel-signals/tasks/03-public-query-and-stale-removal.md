@@ -340,3 +340,145 @@ or read sensitive columns and redact afterward.
 - `architecture/references/languages/python-api-and-stubs.md`
 - `architecture/references/languages/typescript-guide.md`
 - `changes/active/bifrost-canonical-otel-signals/spec.md`
+
+## Execution evidence
+
+### Scenario 1 — Public DTOs express complete nested traces and structured GenAI
+
+- **RED.** `wyrd-spec` `vala::api::tests::trace_and_genai_dtos_carry_nested_and_structured_content`
+  failed on the flat `SpanRow`/`GenAiRow` shape: no nested `events`/`links` on a
+  span, no structured message parts, and the always-absent `cost_usd` still
+  declared.
+- **GREEN.** `GetTraceResponse` now nests `SpanEventRow`/`SpanLinkRow` under
+  their owning span; `GenAiRow` carries structured `input_messages`/
+  `output_messages` and drops `cost_usd`. Commit `05f49af3c`.
+
+### Scenario 2 — Query plans filter promotions and gate payload before IO
+
+- **RED.** `wyrd-server` `tests/pg_router_smoke.rs` failed because the GenAI plan
+  scanned canonical `attributes` and the bounded caller's plan still projected
+  sensitive columns.
+- **GREEN.** Both plans are built from the promoted `gen_ai_*` columns and the
+  payload gate is applied to the projection list before any scan is issued;
+  `resource_entity_refs` is projected by no plan. Commit `464af919b`.
+- **Bounded correction.** Byte-layout normalization and the `struct_child`
+  projection helper are shared by the trace and GenAI plans rather than
+  duplicated per query; `run_id` is synthesized as NULL for a table whose
+  correlation policy appends none, so one projection shape serves both.
+
+### Scenario 3 — Describe and first-class clients project one recursive schema
+
+- **RED.** `wyrd-server` `bifrost::convert::tests::nested_field_description_preserves_identity_and_metadata`
+  failed: the described field DTO was flat and dropped nested children,
+  `PARQUET:field_id`, and `wyrd:sensitive`.
+- **GREEN.** One recursive `BifrostFieldSpec` carries children plus identity
+  metadata across HTTP, the Python `wyrd.bifrost` wrapper, and the TypeScript
+  `BifrostClient`. `wyrd_queue::schema::writable_schema` is the single owner of
+  the described-to-writable Arrow projection, and every SDK decodes the same
+  schema-only IPC instead of rebuilding fields locally. Commits `22dea17dd`,
+  `8fe6b0d15`, `6cb6207ea`, `fd27e17d5`, `1c27f7a52`.
+- **Material finding — canonical describe must not use the Iceberg round trip.**
+  The journey showed the catalog renumbers top-level field ids sequentially at
+  table creation (declared `dropped_events_count` 22 stored as 17, `links`
+  23→18, `run_id` 1000→38, `wyrd_event_time` 1004→42), while
+  `scribe::execution_lanes::enforce_canonical_physical_identity` enforces the
+  *ledger* ids on every stamped canonical batch. Describing the stored ids would
+  hand a writer a schema its own batches fail against, so
+  `BifrostCatalog::describe_table` describes a canonical built-in from
+  `(definition.schema)()` and keeps the Iceberg round trip for dynamic tables
+  only — matching this task's own statement that canonical correlation fields
+  carry ids 1000/1004 while dynamic descriptions copy their stored ids.
+- **Reuse.** The journey compares physical types through the existing
+  `vala_bifrost_redux::tables::arrow_type_shape_matches`, which already owns
+  Binary/LargeBinary and Utf8/LargeUtf8 round-trip equivalence, rather than
+  adding a second comparison rule.
+- **Limitation.** The two `vala-sdk` unit tests
+  (`query::tests::describe_builds_writable_schema_without_duplicate_correlation`
+  and `query::tests::typed_trace_and_genai_methods_project_http_contracts`) were
+  authored alongside their methods, so a separate RED run was not observed for
+  them; the journey test above supplied the failing-first proof for the surface.
+
+### Scenario 4 — Removed physical names are unreachable
+
+- **RED.** `vala-bifrost-redux`
+  `tables::tests::canonical_otel_registry_has_no_child_or_genai_tables` failed
+  against the 14-table registry.
+- **GREEN.** Deleted `tables/traces/events.rs`, `tables/traces/links.rs`, and the
+  whole `tables/genai/` module, their registry entries, the `GenAi` namespace
+  variant, and the `vala.genai` Forge admission control state (the two
+  `namespace_name` CHECK lists and `ForgeTaskTableIdentity::NAMESPACES`).
+  Documentation naming the removed tables was rewritten: `docs/.../schema.svx`
+  now documents the canonical span ledger including nested events, links, and
+  the promoted `gen_ai_*` columns; `docs/.../architecture.svx` and
+  `architecture/bifrost-design.md` drop their rows and namespace entries. No
+  tombstone, alias, or ban script was added — the closed registry is the
+  enforcement, and `builtin_fqns()` is exactly the bootstrap input, so asserting
+  it also asserts that bootstrap creates none of the removed names.
+- **Bounded correction.** The task text says "seven registry entries" and
+  "registry 14 → 7", but REQ-019 enumerates six physical names
+  (`vala.traces.events`, `vala.traces.links`, `vala.genai.{messages,embeddings,
+  tool_calls,memory}`). The enumerated names are authoritative: the registry is
+  now eight built-ins.
+- **Consumer closure.** `crates/wyrd/wyrd-mcp/` names no trace or GenAI query
+  surface, so it required no change despite appearing in the write set.
+  No SQL data migration was added (REQ-021, pre-release).
+
+### Cross-task consumer repairs found by verification
+
+Splitting the describe response broke three consumers that the scenario tests
+did not reach; each was fixed at its owner, not worked around:
+
+- `wyrd-server::bifrost::service::assert_registered_layout_matches` rebuilt a
+  schema from the describe response to canonicalize a re-registered layout.
+  Describe reports only the managed column a writer may supply, so the rebuilt
+  schema lost the server-stamped columns that decide the managed Bloom floor
+  and an identical re-registration became `PhysicalLayoutMismatch`. The handler
+  now resolves against `BifrostCatalog::assignment_schema`, the provider's own
+  schema, which is where that floor is actually determined
+  (`bifrost::service::pg_tests::bifrost_tables_register_is_idempotent`).
+- The MCP journeys (`wyrd-mcp` discovery and query, `wyrd-testing` oracle mcp)
+  read `described["fields"]`; they now read the class that owns each column.
+  The discovery journey's `wyrd:column_class == "correlation"` assertion was
+  replaced by membership in `correlation_fields` plus non-empty identity
+  metadata: splitting the response made the per-field marker redundant, and the
+  server no longer emits it.
+
+### Verification
+
+Passing: `codegen:check`, `check:client-tier`, `check:pyo3-scope`, `fmt`,
+`lints`, `py:format`, `py:lints`, `py:typecheck`, `py:test:unit` (441 passed),
+`ts:napi:check`, `ts:typecheck`, `ts:test:unit` (14 passed), `docs:check`,
+`git diff --check`.
+
+`mise run test:bifrost`: 8/10 lanes passed. `unit:rust` and `journey` failed
+only on the pre-existing items below; every lane-member command those two lanes
+abort before reaching was then run directly and passed —
+`wyrd-server --lib --features test-support` (136 tests), `vala-sdk --lib`,
+`wyrd-mcp --lib`, and the `mcp` and `oracle` journey lanes after the consumer
+repairs above.
+
+Focused: `tables::tests::canonical_otel_registry_has_no_child_or_genai_tables`
+PASS via
+`mise exec -- cargo nextest run --offline -p vala-bifrost-redux --all-features --lib -E 'test(=tables::tests::canonical_otel_registry_has_no_child_or_genai_tables)'`.
+The task's command omits `--all-features`; `vala-bifrost-redux` does not compile
+its test targets without them, so the feature flag is the recorded correction.
+
+Pre-existing baseline failures, unrelated to this task and reproduced at the
+pre-task commit `8c107b344`:
+
+- `wyrd-spec query::tests::display_parse_roundtrip_for_small_queries` (proptest).
+- `wyrd-queue producer::tests::flush_timeout_retains_batch_until_later_ack`.
+- `mise run check:unwrap-audit` fails on 77 lines across files this task does
+  not touch (no overlap with `git diff --name-only 8c107b344..HEAD`).
+- Six `wyrd-testing` lib tests — `bifrost::scribe_workload::tests::scribe_workload_read_boundaries_may_not_reuse_an_earlier_read`
+  and the five `bifrost::forge_harness::worker_lifecycle_tests::*` cases, which
+  panic on a fixture built with no Scribe. All six fail identically in a
+  worktree at `8c107b344`. This is what aborts the `unit:rust` lane before its
+  remaining packages.
+- The `otlp` journey lane fails with `no tests to run`: every file under
+  `crates/wyrd/wyrd-testing/tests/bifrost/otlp/` is a 0-byte archived target at
+  `8c107b344` as well.
+- `wyrd-mcp::mcp query::pg_tests::delegated_agent_query_is_attributed_in_its_durable_audit_record`
+  fails with `RowNotFound` when the seven-test MCP journey lane runs in
+  parallel and passes when run alone — the audit relay race. It reproduces
+  identically in the baseline worktree at `8c107b344`.

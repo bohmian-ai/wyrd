@@ -780,8 +780,9 @@ mod tests {
     /// requiring the oversized pod an earlier qualification journey injected.
     ///
     /// The estimate is admission control, not an allocation guarantee: it
-    /// decides whether the plan may start, and the execution engine still
-    /// spills and bounds its own pools at run time.
+    /// decides whether the plan may start, and nothing bounds the plan once it
+    /// runs — an admitted plan executes against `DataFusion`'s unbounded pool
+    /// with no disk manager, so it never spills.
     ///
     /// # Panics
     ///

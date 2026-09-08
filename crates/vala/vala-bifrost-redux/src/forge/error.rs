@@ -75,8 +75,8 @@ pub enum ForgeError {
     /// Cancellation stopped work at a bounded stage or batch boundary *before*
     /// any durable side effect, so the claim is safe to release.
     ///
-    /// This is the pre-effect shutdown marker. `run_slot`'s error path drains
-    /// such a claim through `release_cancelled_claim`, whose SQL guard matches
+    /// This is the pre-effect shutdown marker. The event loop's error path
+    /// drains such a claim through `release_cancelled_claim`, whose SQL guard matches
     /// only `claimed`/`running` rows for the owner and attempt; a claim that has
     /// since advanced to `prepared` therefore no-matches and is retained anyway,
     /// so routing every plain `Shutdown` through release is safe.
@@ -87,8 +87,8 @@ pub enum ForgeError {
     /// is conservatively retained for evidence-based or lease-expiry recovery
     /// rather than released.
     ///
-    /// This is the post-effect shutdown marker. It exists so `run_slot` can
-    /// distinguish a committed-but-not-finalized claim, whose row is still
+    /// This is the post-effect shutdown marker. It exists so the event loop
+    /// can distinguish a committed-but-not-finalized claim, whose row is still
     /// `running` and would otherwise be matched and wrongly released by
     /// `release_cancelled_claim`, from the pre-effect [`ForgeError::Shutdown`]
     /// case. It carries the same internal control-flow meaning as `Shutdown`

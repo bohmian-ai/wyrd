@@ -366,47 +366,83 @@ impl ForgeAttemptState {
     fn drained(&self) -> bool {
         self.queued == 0 && self.running == 0
     }
+
+    /// Returns whether this attempt is drained but cannot yet be settled.
+    ///
+    /// A retained attempt still owns its claim, fence, heartbeat, and exact
+    /// operation identities. It is neither failed nor retried: only proof about
+    /// those exact operations can decide it.
+    fn retained(&self) -> bool {
+        self.drained() && ForgeWorker::retains_unknown_acceptance(self)
+    }
 }
 
-/// The worker's compaction admission state: one FIFO, one join set, one map.
+/// The worker's compaction admission state: one FIFO, one map, one channel.
 ///
 /// The three are one owner because they describe one fact together — which of
 /// this worker's plans are waiting, which are running, and which attempt each
 /// belongs to — and separating them would let the parallelism budget disagree
 /// with what is actually in flight.
+///
+/// A drained attempt whose operations are unresolved stays in `attempts` rather
+/// than moving to a second container: retention is a property of an attempt's
+/// own indexed outcomes, so a parallel list would be a second place for the
+/// same fact to be wrong.
 struct ForgeAttemptPool {
     /// Worker-wide FIFO holding every attempt's unstarted plans in offer order.
-    queue: super::managed::queue::ForgeCompactionQueue<super::managed::ForgePlannedRewrite>,
-    /// Every started plan, joined in completion order.
-    joins: ForgePlanJoins,
+    queue: super::managed::queue::ForgeCompactionQueue,
     /// Suspended attempts, keyed by the task each plan belongs to.
     attempts: HashMap<Uuid, ForgeAttemptState>,
-    /// Drained attempts holding an operation whose acceptance is unknown.
-    ///
-    /// They are not settled and not retried: each still owns its claim, fence,
-    /// heartbeat, and exact operation identities, and leaves this list only
-    /// when reconciliation proves what those operations did.
-    retained: Vec<ForgeAttemptState>,
+    /// Sender every spawned runner sends its one keyed completion through.
+    completion_tx: tokio::sync::mpsc::UnboundedSender<ForgePlanCompletion>,
+    /// The worker's single completion receiver, polled by its one event loop.
+    completion_rx: tokio::sync::mpsc::UnboundedReceiver<ForgePlanCompletion>,
 }
 
 impl ForgeAttemptPool {
     /// Builds an empty pool bounded by one worker's configured budgets.
     fn new(config: &ForgeWorkerConfig) -> Self {
+        let (completion_tx, completion_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             queue: super::managed::queue::ForgeCompactionQueue::new(
                 config.max_task_parallelism,
                 config.pending_task_parallelism,
                 config.compaction_memory_budget_bytes,
             ),
-            joins: ForgePlanJoins::new(),
             attempts: HashMap::new(),
-            retained: Vec::new(),
+            completion_tx,
+            completion_rx,
         }
     }
 
     /// Returns whether this worker has no suspended attempt left to settle.
     fn is_idle(&self) -> bool {
-        self.attempts.is_empty() && self.retained.is_empty()
+        self.attempts.is_empty()
+    }
+
+    /// Returns whether any attempt still has a plan waiting or running.
+    fn has_plans_in_flight(&self) -> bool {
+        self.attempts.values().any(|state| !state.drained())
+    }
+
+    /// Returns whether any locally held attempt is unresolved.
+    ///
+    /// Derived from the attempts' own indexed outcomes, so it is exactly the
+    /// set that [`ForgeWorker::reconcile_retained_attempts`] will visit.
+    fn has_local_ambiguity(&self) -> bool {
+        self.attempts.values().any(ForgeAttemptState::retained)
+    }
+
+    /// Returns every unresolved attempt's task id, in ascending order.
+    fn retained_task_ids(&self) -> Vec<Uuid> {
+        let mut retained: Vec<Uuid> = self
+            .attempts
+            .iter()
+            .filter(|(_, state)| state.retained())
+            .map(|(task_id, _)| *task_id)
+            .collect();
+        retained.sort_unstable();
+        retained
     }
 
     /// Offers one attempt's planner-ordered plans and suspends it on the queue.
@@ -419,22 +455,29 @@ impl ForgeAttemptPool {
     /// wait for a plan that was never started.
     fn admit(
         &mut self,
+        worker: &ForgeWorker,
         mut state: ForgeAttemptState,
         plans: Vec<super::managed::ForgePlannedRewrite>,
     ) -> Option<ForgeAttemptState> {
         let task_id = state.open.claim.task_id;
         let planned = plans.len();
-        let admissions = plans.into_iter().map(|plan| {
-            (
-                super::managed::queue::ForgePlanAdmission {
-                    task_id,
-                    plan_index: plan.plan_index,
-                    required_parallelism: plan.required_parallelism,
-                    memory_reservation_bytes: plan.memory_reservation_bytes,
-                },
-                plan,
-            )
-        });
+        // One concrete runner is built per plan before the plan is offered, so
+        // the queue owns the thing that will execute rather than a description
+        // of it, and popping is what hands execution its owner.
+        let admissions = plans
+            .into_iter()
+            .map(|plan| {
+                (
+                    super::managed::queue::ForgePlanAdmission {
+                        task_id,
+                        plan_index: plan.plan_index,
+                        required_parallelism: plan.required_parallelism,
+                        memory_reservation_bytes: plan.memory_reservation_bytes,
+                    },
+                    Some(ForgeCompactionPlanRunner::new(worker, &state, plan)),
+                )
+            })
+            .collect::<Vec<_>>();
         let before = self.queue.waiting_plan_count();
         state.refusals = ForgeWorker::offer_planned_rewrites(&mut self.queue, admissions);
         state.queued = self.queue.waiting_plan_count() - before;
@@ -1732,7 +1775,18 @@ impl ForgeWorkerConfig {
 /// the plan's own publication result, because the worker admits plans from
 /// several tasks at once and they complete in whatever order their objects and
 /// commits allow.
-type ForgePlanJoins = tokio::task::JoinSet<(Uuid, usize, Result<ForgeDispatchResult, ForgeError>)>;
+/// One finished plan's exact queue key and the result it returned.
+///
+/// This is the only thing a spawned runner ever sends back. It carries the key
+/// rather than the attempt so the event loop can release exactly the
+/// reservation that plan held before it stores the outcome, which is what makes
+/// a double release detectable rather than silently double-crediting a budget.
+struct ForgePlanCompletion {
+    /// Exact `(task_id, plan_index)` reservation this completion releases.
+    key: super::managed::queue::ForgePlanKey,
+    /// The plan's own typed publication result.
+    outcome: Result<ForgeDispatchResult, ForgeError>,
+}
 
 /// Fenced execution state awaiting durable failure settlement and lease release.
 struct ClaimExecutionOutcome<'task> {
@@ -1854,10 +1908,9 @@ impl ForgeWorker {
     /// Drains this worker's recoverable work before it can become ready.
     ///
     /// This is everything that must succeed before a worker may advertise
-    /// itself: a writable spill volume, a durable healthy-worker registration,
-    /// and a complete recovery drain of every `Prepared` attempt and lapsed
-    /// claim it already owns. Readiness is published by the caller only when
-    /// this returns `true`.
+    /// itself: a durable healthy-worker registration, and a complete recovery
+    /// drain of every `Prepared` attempt and lapsed claim it already owns.
+    /// Readiness is published by the caller only when this returns `true`.
     ///
     /// # Errors
     ///
@@ -2170,12 +2223,19 @@ impl ForgeWorker {
         // on every pass so a ready snapshot expiry is never starved behind
         // compaction backlog.
         let reserved_maintenance = true;
-        // One FIFO, one join set, and one attempt map for the whole worker.
-        // Constructing them here rather than per attempt is what makes the
-        // parallelism and memory budgets describe this worker's real load: two
-        // tasks claimed a moment apart compete for the same room, in the order
-        // their plans were offered.
+        // One FIFO, one attempt map, and one completion channel for the whole
+        // worker. Constructing them here rather than per attempt is what makes
+        // the parallelism and memory budgets describe this worker's real load:
+        // two tasks claimed a moment apart compete for the same room, in the
+        // order their plans were offered.
         let mut pool = ForgeAttemptPool::new(&self.config);
+        // The one delayed cadence this loop waits on. `Delay` is what keeps a
+        // process that was blocked past several periods from firing a burst of
+        // catalog reconciliation passes when it resumes.
+        let period = self.forge.core.maintenance_interval;
+        let mut maintenance =
+            tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+        maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             let stranded = self.start_fitting_plans(&mut pool, &shutdown);
             for state in stranded {
@@ -2189,26 +2249,30 @@ impl ForgeWorker {
                 if pool.is_idle() {
                     return Ok(());
                 }
-                if let Some(state) = Self::drain_one_plan(&mut pool).await? {
-                    self.settle_or_retain_attempt(&mut pool, state, &shutdown)
+                if pool.has_plans_in_flight() {
+                    self.await_loop_event(&mut pool, &mut maintenance, &shutdown)
                         .await?;
                     continue;
                 }
-                // A stopping worker cannot wait for an operation to become
-                // provable, so each retained attempt settles with the failure
-                // its plans returned. That transition retains exact durable
-                // evidence rather than releasing the claim, which is the same
-                // state a lost process leaves and the same one the table-wide
-                // reconciliation owner takes over from.
-                if let Some(state) = pool.retained.pop() {
-                    self.settle_pooled_attempt(state, &shutdown).await?;
+                // Nothing is in flight, so every attempt still held is one this
+                // owner cannot account for. A stopping worker cannot wait for
+                // an operation to become provable and must not guess: it hands
+                // the Prepared authority to its successor untouched.
+                for task_id in pool.retained_task_ids() {
+                    if let Some(state) = pool.attempts.remove(&task_id) {
+                        self.hand_off_retained_attempt(state).await;
+                    }
                 }
                 continue;
             }
-            if self
-                .hold_for_retained_attempts(&mut pool, &shutdown)
-                .await?
-            {
+            if pool.has_local_ambiguity() {
+                // An owner that cannot say what its own operation did has no
+                // business taking more of them: it stops claiming and retracts
+                // readiness, while the plans it already admitted keep running
+                // and settling normally.
+                self.publish_readiness(false);
+                self.await_loop_event(&mut pool, &mut maintenance, &shutdown)
+                    .await?;
                 continue;
             }
             self.reclaim_expired_attempts(claim_limits.max_active_per_tenant)
@@ -2224,99 +2288,197 @@ impl ForgeWorker {
             if shutdown.is_cancelled() {
                 continue;
             }
-            let claim = self
-                .claim_next(claim_limits, reserved_maintenance)
-                .await
-                .map_err(ForgeError::Sql)?;
-            let Some(claim) = claim else {
-                // Waiting on a running plan is the idle wait when this worker
-                // holds any: polling for new work on a timer while a plan is in
-                // flight would delay the settlement that frees its budget.
-                if !pool.is_idle() {
-                    if let Some(state) = Self::drain_one_plan(&mut pool).await? {
-                        self.settle_or_retain_attempt(&mut pool, state, &shutdown)
+            // Completions that are already waiting are taken before any new
+            // authority is acquired, so the budget a finished plan freed is the
+            // budget the pull calculation below sees.
+            while let Ok(completion) = pool.completion_rx.try_recv() {
+                if let Some(state) = self.record_plan_completion(&mut pool, completion)? {
+                    self.settle_or_retain_attempt(&mut pool, state, &shutdown)
+                        .await?;
+                }
+            }
+            if pool.has_local_ambiguity() {
+                continue;
+            }
+            self.publish_readiness(true);
+redacted
+            // most the parallelism this worker still has free, and never more
+            // than four tasks.
+            let mut pending_pull_task_count =
+                (self.config.max_task_parallelism - pool.queue.running_parallelism_sum()).min(4);
+            if pending_pull_task_count == 0 {
+                // No running parallelism remains, so this turn acquires no
+                // authority at all. Waiting plans keep their pending
+                // reservation; it does not authorize a pull.
+                self.await_loop_event(&mut pool, &mut maintenance, &shutdown)
+                    .await?;
+                continue;
+            }
+            let mut claimed = 0_u32;
+            while pending_pull_task_count > 0 {
+                let claim = self
+                    .claim_next(claim_limits, reserved_maintenance)
+                    .await
+                    .map_err(ForgeError::Sql)?;
+                let Some(claim) = claim else {
+                    break;
+                };
+                claimed += 1;
+                let started = Instant::now();
+                let active = Self::metric_strategy(&claim.strategy)
+                    .map(|strategy| self.forge.core.telemetry.active_task(strategy));
+                let task_id = claim.task_id;
+                #[cfg(feature = "test-support")]
+                if let Some(observer) = &self.completion_observer {
+                    observer.record_lifecycle(ForgeLifecycleEvent::Claimed {
+                        task_id,
+                        worker_id: self.owner,
+                    });
+                }
+                #[cfg(feature = "test-support")]
+                if let Some(observer) = &self.completion_observer {
+                    observer.pause_after_claim_for_test().await;
+                    if observer.abandon_claim_for_test(&claim, self.owner) {
+                        return Ok(());
+                    }
+                }
+                if shutdown.is_cancelled() {
+                    return self.release_claim_at_shutdown(&claim, started).await;
+                }
+                let strategy = claim.strategy.clone();
+                // One INFO per claimed task, not per file or per row: Forge tasks are
+                // coarse, so this stays bounded by compaction throughput and gives an
+                // operator the claim/settle pair that shows whether work is moving.
+                tracing::info!(
+                    worker = %self.owner,
+                    task_id = %task_id,
+                    strategy = ?strategy,
+                    "Forge task claimed"
+                );
+                let open = Self::open_claim_episode(claim, started, active);
+                match self.begin_claim_episode(open, &shutdown, &mut pool).await {
+                    // The attempt's plans are on the queue; it settles when they drain.
+                    ClaimStep::Admitted => {}
+                    ClaimStep::Closed(result) => {
+                        self.record_settled_claim(task_id, strategy, started, result)
                             .await?;
                     }
-                    continue;
                 }
+                // Recomputed after this task's plans were offered, so the next
+                // claim of the same turn sees the room they took.
+                pending_pull_task_count = (self.config.max_task_parallelism
+                    - pool.queue.running_parallelism_sum())
+                .min(4);
+            }
+            if claimed > 0 {
+                continue;
+            }
+            if pool.is_idle() {
                 tokio::select! {
                     () = shutdown.cancelled() => return Ok(()),
                     () = tokio::time::sleep(Duration::from_millis(250)) => {}
                 }
                 continue;
-            };
-            let started = Instant::now();
-            let active = Self::metric_strategy(&claim.strategy)
-                .map(|strategy| self.forge.core.telemetry.active_task(strategy));
-            let task_id = claim.task_id;
-            #[cfg(feature = "test-support")]
-            if let Some(observer) = &self.completion_observer {
-                observer.record_lifecycle(ForgeLifecycleEvent::Claimed {
-                    task_id,
-                    worker_id: self.owner,
-                });
             }
-            #[cfg(feature = "test-support")]
-            if let Some(observer) = &self.completion_observer {
-                observer.pause_after_claim_for_test().await;
-                if observer.abandon_claim_for_test(&claim, self.owner) {
-                    return Ok(());
-                }
-            }
-            if shutdown.is_cancelled() {
-                return self.release_claim_at_shutdown(&claim, started).await;
-            }
-            let strategy = claim.strategy.clone();
-            // One INFO per claimed task, not per file or per row: Forge tasks are
-            // coarse, so this stays bounded by compaction throughput and gives an
-            // operator the claim/settle pair that shows whether work is moving.
-            tracing::info!(
-                worker = %self.owner,
-                task_id = %task_id,
-                strategy = ?strategy,
-                "Forge task claimed"
-            );
-            let open = Self::open_claim_episode(claim, started, active);
-            match self.begin_claim_episode(open, &shutdown, &mut pool).await {
-                // The attempt's plans are on the queue; it settles when they drain.
-                ClaimStep::Admitted => {}
-                ClaimStep::Closed(result) => {
-                    self.record_settled_claim(task_id, strategy, started, result)
-                        .await?;
-                }
-            }
+            // Nothing to claim while this worker still holds work: waiting on a
+            // running plan is the idle wait, because polling for new work on a
+            // timer would delay the settlement that frees its budget.
+            self.await_loop_event(&mut pool, &mut maintenance, &shutdown)
+                .await?;
         }
     }
 
-    /// Reconciles retained attempts and reports whether new work must wait.
+    /// Waits for the next plan completion, maintenance tick, or stop signal.
     ///
-    /// An owner that cannot say what its own operation did has no business
-    /// taking more of them: while any attempt is retained it stops claiming,
-    /// retracts readiness, and delays before the next reconciliation pass. The
-    /// delay is the loop's own idle wait rather than the whole-table
-    /// maintenance interval, because a retained attempt holds a TTL-bound lease
-    /// that a maintenance-length wait would outlive.
+    /// This is the loop's only wait once it holds work. A completion is
+    /// recorded and, when it drained its attempt, settled or retained; a tick
+    /// runs one complete exact-operation reconciliation pass over every
+    /// retained attempt; a stop signal returns so the caller re-reads it.
     ///
     /// # Errors
     ///
-    /// Returns the reconciliation and settlement failures a retained attempt
-    /// raises, each of which leaves it durable for a later owner.
-    async fn hold_for_retained_attempts(
+    /// Returns the invariant, reconciliation, settlement, audit, SQL, and
+    /// lease-release failures the recorded completion or the pass raises.
+    async fn await_loop_event(
         &self,
         pool: &mut ForgeAttemptPool,
+        maintenance: &mut tokio::time::Interval,
         shutdown: &CancellationToken,
-    ) -> Result<bool, ForgeError> {
-        self.reconcile_retained_attempts(pool, shutdown).await?;
-        if pool.retained.is_empty() {
-            self.publish_readiness(true);
-            return Ok(false);
+    ) -> Result<(), ForgeError> {
+        let mut ticked = false;
+        let completion = tokio::select! {
+            () = shutdown.cancelled() => None,
+            completion = pool.completion_rx.recv() => completion,
+            _ = maintenance.tick() => {
+                ticked = true;
+                None
+            }
+        };
+        if let Some(completion) = completion {
+            if let Some(state) = self.record_plan_completion(pool, completion)? {
+                self.settle_or_retain_attempt(pool, state, shutdown).await?;
+            }
+        } else if ticked {
+            self.reconcile_retained_attempts(pool, shutdown).await?;
         }
-        self.publish_readiness(false);
-        tokio::select! {
-            () = shutdown.cancelled() => {}
-            () = tokio::time::sleep(Duration::from_millis(250)) => {}
+        Ok(())
+    }
+
+    /// Leaves one unresolved attempt's Prepared authority for its successor.
+    ///
+    /// A stopping owner writes nothing durable for an attempt it cannot
+    /// account for: no retry, no failure, no success, no planning demand, and
+    /// no terminal audit. It closes only what is local — the heartbeat and the
+    /// table fence — and leaves the task `Running` with its operation
+    /// `Prepared`, which is exactly the state a lost process leaves and the one
+    /// the table-wide reconciliation owner takes over from.
+    ///
+    /// A local closure failure is logged rather than returned: this worker is
+    /// already stopping, nothing durable depends on the closure, and a
+    /// retained fence lapses on its own TTL.
+    async fn hand_off_retained_attempt(&self, state: ForgeAttemptState) {
+        let ForgeAttemptState {
+            open,
+            mut lease,
+            fenced,
+            shared,
+            ..
+        } = state;
+        let task_id = open.claim.task_id;
+        let FencedAttempt {
+            operation_stop,
+            heartbeat,
+            ..
+        } = fenced;
+        operation_stop.cancel();
+        match heartbeat.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::debug!(
+                worker = %self.owner, task_id = %task_id, error = %error,
+                "Forge claim heartbeat ended before its retained attempt was handed off"
+            ),
+            Err(error) => tracing::warn!(
+                worker = %self.owner, task_id = %task_id, error = %error,
+                "Forge claim heartbeat did not join at shutdown"
+            ),
         }
-        Ok(true)
+        if let Err(error) = self.release_table_lease(&mut lease).await {
+            tracing::warn!(
+                worker = %self.owner, task_id = %task_id, error = %error,
+                "Forge table lease release failed at shutdown; the fence lapses on its TTL"
+            );
+        }
+        // The one final snapshot of what this attempt may have written is read
+        // before its shared context is dropped, so a successor's operator has
+        // the object names even though nothing durable is settled here.
+        tracing::warn!(
+            worker = %self.owner,
+            task_id = %task_id,
+            possible_outputs = shared.rewrite.possible_outputs().len(),
+            "Forge shutdown retained an unresolved attempt for table-wide takeover"
+        );
+        drop(shared);
+        drop(open);
     }
 
     /// Publishes this loop's readiness, when it is running under a role handle.
@@ -2396,7 +2558,7 @@ impl ForgeWorker {
             unresolved = Self::unknown_operations(&state).len(),
             "Forge task retained: an operation's acceptance is unknown and no plan is known to have published"
         );
-        pool.retained.push(state);
+        pool.attempts.insert(state.open.claim.task_id, state);
         Ok(())
     }
 
@@ -2426,10 +2588,14 @@ impl ForgeWorker {
 
     /// Reconciles every retained attempt's unresolved operations once.
     ///
-    /// A retained attempt leaves this list only when it is decided: the first
-    /// operation proven live settles the task successfully and leaves any other
-    /// unresolved row to the table-wide owner, and an attempt whose every
-    /// operation is proven absent settles with the failure its plans returned.
+    /// One pass visits every retained attempt in task order and every one of
+    /// that attempt's unresolved operations, so a worker holding several
+    /// ambiguous attempts resolves all of them on one delayed cadence rather
+    /// than one per tick. An attempt leaves the pool only when it is decided:
+    /// the first operation proven live settles the task successfully and
+    /// leaves any other unresolved row to the table-wide owner, and an attempt
+    /// whose every operation is proven absent settles with the failure its
+    /// plans returned.
     ///
     /// # Errors
     ///
@@ -2441,27 +2607,32 @@ impl ForgeWorker {
         pool: &mut ForgeAttemptPool,
         shutdown: &CancellationToken,
     ) -> Result<(), ForgeError> {
-        let mut decided = Vec::new();
-        for (slot, state) in pool.retained.iter_mut().enumerate() {
-            if self.reconcile_retained_attempt(state).await? {
-                decided.push(slot);
+        for task_id in pool.retained_task_ids() {
+            let Some(state) = pool.attempts.get_mut(&task_id) else {
+                continue;
+            };
+            if !self.reconcile_retained_attempt(state).await? {
+                continue;
             }
-        }
-        for slot in decided.into_iter().rev() {
-            let state = pool.retained.remove(slot);
-            self.settle_pooled_attempt(state, shutdown).await?;
+            // The reducer runs once, after this attempt's pass completed, and
+            // only because that pass changed at least one phase.
+            if let Some(state) = pool.attempts.remove(&task_id) {
+                self.settle_pooled_attempt(state, shutdown).await?;
+            }
         }
         Ok(())
     }
 
     /// Reconciles one retained attempt's unresolved operations, in plan order.
     ///
-    /// Each pass visits every unresolved operation exactly once and asks the
-    /// durable operation row and the retained table evidence what it did.
-    /// Nothing is resubmitted, and an operation still unproven is left exactly
-    /// as it was.
+    /// Each pass walks the ordered unresolved list to completion — no early
+    /// return on the first change — and asks the durable operation row and the
+    /// retained table evidence what each one did, updating the stored outcome
+    /// in place. Nothing is resubmitted, and an operation still unproven is
+    /// left exactly as it was.
     ///
-    /// Returns whether the attempt is now decided and may settle.
+    /// Returns whether this pass changed a phase and left the attempt decided,
+    /// which is the only condition under which its caller reduces and settles.
     ///
     /// # Errors
     ///
@@ -2478,6 +2649,7 @@ impl ForgeWorker {
         };
         let now = self.forge.core.clock.now()?;
         let stop = state.fenced.dispatch_stop().clone();
+        let mut changed = false;
         for (plan_index, operation_id) in Self::unknown_operations(state) {
             let settlement = self
                 .forge
@@ -2508,17 +2680,16 @@ impl ForgeWorker {
                             },
                         ))),
                     );
-                    // Any-success decides the task now; a sibling that is still
-                    // unresolved belongs to the table-wide owner from here.
-                    return Ok(true);
+                    changed = true;
                 }
                 super::live_reconcile::ForgeLiveSettlement::Reset => {
                     let unknown = Self::take_retained_unknown(state, plan_index);
                     Self::replace_plan_outcome(state, plan_index, Err(unknown.error));
+                    changed = true;
                 }
             }
         }
-        Ok(Self::unknown_operations(state).is_empty())
+        Ok(changed && !Self::retains_unknown_acceptance(state))
     }
 
     /// Removes and returns one unresolved plan's retained payload.
@@ -2704,43 +2875,11 @@ impl ForgeWorker {
     }
 
     /// Publish the passive publication-evidence event for one admitted rewrite.
-    ///
-    /// Called once managed execution has produced the attempt's immutable
-    /// evidence and before publication consumes it, which is the only point
-    /// where the evidence and all three durable identities are known together.
-    /// Test-support only and side-effect free.
-    #[cfg(feature = "test-support")]
-    fn record_rewrite_evidence_for_test(
-        &self,
-        identity: &super::publication::RewriteCommitIdentity,
-    ) {
-        if let Some(observer) = &self.completion_observer {
-            observer.record_rewrite_evidence_for_test(ForgeRewriteEvidenceRecord {
-                task_id: identity.task_id,
-                attempt_id: identity.attempt_id,
-                operation_id: identity.operation_id,
-                evidence: identity.evidence.clone(),
-            });
-        }
-    }
-
     /// Apply the observer's one-shot passive returned-attempt barrier.
     #[cfg(feature = "test-support")]
     async fn pause_after_attempt_for_test(&self) {
         if let Some(observer) = &self.completion_observer {
             observer.pause_after_attempt_for_test().await;
-        }
-    }
-
-    /// Apply the observer's one-shot passive post-handoff barrier.
-    ///
-    /// Called by publication after managed execution produced the handoff and
-    /// before authoritative metadata is reacquired. Without an armed observer
-    /// it is a no-op, so no production decision depends on it.
-    #[cfg(feature = "test-support")]
-    async fn pause_after_handoff_for_test(&self) {
-        if let Some(observer) = &self.completion_observer {
-            observer.pause_after_handoff_for_test().await;
         }
     }
 
@@ -3146,13 +3285,20 @@ impl ForgeWorker {
         shutdown: &CancellationToken,
     ) -> Result<bool, ForgeError> {
         let mut settled = false;
-        while !pool.is_idle() {
-            self.start_fitting_plans(pool, shutdown);
-            if let Some(state) = Self::drain_one_plan(pool).await? {
+        loop {
+            for state in self.start_fitting_plans(pool, shutdown) {
+                settled = self.finish_admitted_attempt(state, shutdown).await?;
+            }
+            if !pool.has_plans_in_flight() {
+                return Ok(settled);
+            }
+            let Some(completion) = pool.completion_rx.recv().await else {
+                return Ok(settled);
+            };
+            if let Some(state) = self.record_plan_completion(pool, completion)? {
                 settled = self.finish_admitted_attempt(state, shutdown).await?;
             }
         }
-        Ok(settled)
     }
 
     /// Opens one ownership episode's observation frame.
@@ -3219,6 +3365,7 @@ impl ForgeWorker {
                     plans,
                 } = *admitted;
                 let refused = pool.admit(
+                    self,
                     ForgeAttemptState {
                         open,
                         attempt,
@@ -4280,8 +4427,14 @@ impl ForgeWorker {
         let committed_recovery = if base_matches {
             None
         } else {
-            self.find_retained_task_evidence(binding, &table, "forge.task_id", claim.task_id)
-                .await?
+            Self::find_retained_task_evidence(
+                &self.forge,
+                binding,
+                &table,
+                "forge.task_id",
+                claim.task_id,
+            )
+            .await?
         };
         let maintenance_recovery = matches!(
             claim.strategy,
@@ -4982,6 +5135,10 @@ impl ForgeWorker {
     /// is what makes the queue's start order the planner's order across every
     /// attempt this worker holds, not just within one of them.
     ///
+    /// Popping moves the plan's concrete runner out of the queue and into the
+    /// future scheduled on the compaction executor, so exactly one owner holds
+    /// it at every moment and the future captures nothing else of this worker.
+    ///
     /// A drained worker starts nothing and instead drops the plans it has not
     /// started. That is not a lost outcome: an unstarted plan wrote nothing,
     /// holds no operation, and is ordinary planning debt the next attempt
@@ -4989,8 +5146,9 @@ impl ForgeWorker {
     /// their publications are durable and their failures carry objects only
     /// their attempt can still name.
     ///
-    /// Returns the attempts a drain left with nothing to join, so the caller
-    /// settles them instead of waiting for a plan that will never start.
+    /// Returns the attempts a drain or a missing runner left with nothing to
+    /// join, so the caller settles them instead of waiting for a plan that will
+    /// never start.
     fn start_fitting_plans(
         &self,
         pool: &mut ForgeAttemptPool,
@@ -4999,21 +5157,50 @@ impl ForgeWorker {
         if shutdown.is_cancelled() {
             return Self::drop_waiting_plans(pool);
         }
+        let completion_tx = pool.completion_tx.clone();
+        let mut without_runner = Vec::new();
         while let Some(popped) = pool.queue.pop() {
-            let task_id = popped.admission.task_id;
-            let Some(state) = pool.attempts.get_mut(&task_id) else {
+            let key = (popped.admission.task_id, popped.admission.plan_index);
+            let Some(state) = pool.attempts.get_mut(&key.0) else {
+                pool.queue.finish_running(key);
                 continue;
             };
             state.queued = state.queued.saturating_sub(1);
+            let Some(runner) = popped.runner else {
+                // Upstream finishes the exact reservation and schedules
+                // nothing. The attempt still owes an outcome for this index, so
+                // the invariant violation is recorded against it directly.
+                state.outcomes.push((
+                    key.1,
+                    Err(ForgeError::Invariant {
+                        detail: format!("Forge admitted plan {} carried no runner", key.1),
+                    }),
+                ));
+                without_runner.push(key.0);
+                pool.queue.finish_running(key);
+                continue;
+            };
             state.running += 1;
-            self.spawn_plan_runner(&mut pool.joins, state, popped);
+            self.spawn_plan_runner(runner, key, completion_tx.clone());
         }
-        Vec::new()
+        let mut stranded = Vec::new();
+        for task_id in without_runner {
+            if pool
+                .attempts
+                .get(&task_id)
+                .is_some_and(ForgeAttemptState::drained)
+                && let Some(state) = pool.attempts.remove(&task_id)
+            {
+                stranded.push(state);
+            }
+        }
+        stranded
     }
 
     /// Drops every unstarted plan this worker holds for a graceful drain.
     ///
-    /// Returns the attempts that are left with nothing in flight.
+    /// Returns the attempts that are left with nothing in flight and are not
+    /// retained; a retained attempt stays in the pool for the shutdown handoff.
     fn drop_waiting_plans(pool: &mut ForgeAttemptPool) -> Vec<ForgeAttemptState> {
         let suspended: Vec<Uuid> = pool.attempts.keys().copied().collect();
         let mut stranded = Vec::new();
@@ -5033,6 +5220,7 @@ impl ForgeWorker {
                 );
             }
             if state.drained()
+                && !state.retained()
                 && let Some(state) = pool.attempts.remove(&task_id)
             {
                 stranded.push(state);
@@ -5041,33 +5229,47 @@ impl ForgeWorker {
         stranded
     }
 
-    /// Awaits one plan completion and reports the attempt it finished, if any.
+    /// Records one keyed plan completion and reports the attempt it drained.
     ///
-    /// Returns `None` when nothing is in flight, or when the finished plan has
-    /// siblings this worker is still running for the same attempt.
+    /// The exact queue reservation is released before the outcome is stored, so
+    /// a completion that names a key this worker does not hold is refused
+    /// rather than double-crediting a budget. An unknown acceptance retracts
+    /// readiness in this same transition, before any classifier reads it.
+    ///
+    /// Returns `None` when the finished plan has siblings this worker is still
+    /// running for the same attempt.
     ///
     /// # Errors
     ///
-    /// Returns [`ForgeError::Invariant`] when a runner could not be joined, or
-    /// when a joined plan names an attempt this worker is not holding: either
+    /// Returns [`ForgeError::Invariant`] when the completion's key was already
+    /// released, or when it names an attempt this worker is not holding: either
     /// way the owner can no longer prove what it published.
-    async fn drain_one_plan(
+    fn record_plan_completion(
+        &self,
         pool: &mut ForgeAttemptPool,
+        completion: ForgePlanCompletion,
     ) -> Result<Option<ForgeAttemptState>, ForgeError> {
-        let Some((task_id, plan_index, outcome)) = Self::join_next_plan(&mut pool.joins).await?
-        else {
-            return Ok(None);
-        };
-        pool.queue.finish_running((task_id, plan_index));
-        let Some(state) = pool.attempts.get_mut(&task_id) else {
+        let ForgePlanCompletion { key, outcome } = completion;
+        if !pool.queue.finish_running(key) {
             return Err(ForgeError::Invariant {
-                detail: format!("Forge joined plan {plan_index} of an attempt it does not hold"),
+                detail: format!(
+                    "Forge released plan {} of task {} more than once",
+                    key.1, key.0
+                ),
+            });
+        }
+        if matches!(outcome, Ok(ForgeDispatchResult::AcceptanceUnknown(_))) {
+            self.publish_readiness(false);
+        }
+        let Some(state) = pool.attempts.get_mut(&key.0) else {
+            return Err(ForgeError::Invariant {
+                detail: format!("Forge joined plan {} of an attempt it does not hold", key.1),
             });
         };
         state.running = state.running.saturating_sub(1);
-        state.outcomes.push((plan_index, outcome));
+        state.outcomes.push((key.1, outcome));
         if state.drained() {
-            return Ok(pool.attempts.remove(&task_id));
+            return Ok(pool.attempts.remove(&key.0));
         }
         Ok(None)
     }
@@ -5078,6 +5280,13 @@ impl ForgeWorker {
     /// the seams an inline attempt walks — evidence reduction, fenced
     /// settlement, claim settlement, and one passive observation — so a pooled
     /// attempt is indistinguishable from an inline one in durable state.
+    ///
+    /// The attempt-shared managed context is snapshotted exactly once here,
+    /// after the last plan completion arrived and before anything is reduced,
+    /// and is dropped only after settlement, the heartbeat join, the lease
+    /// release, and the episode closure. A running sibling can still add to
+    /// that ledger, so an earlier snapshot would name fewer objects than the
+    /// attempt actually wrote and a later drop would race the ledger's readers.
     ///
     /// Returns whether the requested effect settled.
     ///
@@ -5103,11 +5312,14 @@ impl ForgeWorker {
             outcomes,
             ..
         } = state;
-        drop(shared);
+        let possible_outputs = shared.rewrite.possible_outputs();
         let execution = if outcomes.is_empty() {
-            Err(ForgeError::Shutdown)
+            Err(Self::attach_attempt_outputs(
+                ForgeError::Shutdown,
+                possible_outputs,
+            ))
         } else {
-            match Self::reduce_plan_outcomes(refusals, outcomes) {
+            match Self::reduce_plan_outcomes(refusals, outcomes, possible_outputs) {
                 Ok(result) => {
                     self.reduce_dispatch_result(
                         &open.claim,
@@ -5146,70 +5358,44 @@ impl ForgeWorker {
                 &mut settled_failure,
             )
             .await;
-        self.close_claim_episode(open, settled_failure, settled)
-            .await
+        let closed = self
+            .close_claim_episode(open, settled_failure, settled)
+            .await;
+        drop(shared);
+        closed
     }
 
+    /// Schedules one popped runner and returns its keyed completion to the loop.
+    ///
+    /// The future owns the runner and one sender clone and nothing else: it
+    /// never captures this worker, so a plan cannot reach claims, readiness,
+    /// recovery, or settlement while it executes.
     fn spawn_plan_runner(
         &self,
-        joins: &mut ForgePlanJoins,
-        state: &ForgeAttemptState,
-        popped: super::managed::queue::PoppedForgePlan<super::managed::ForgePlannedRewrite>,
+        runner: ForgeCompactionPlanRunner,
+        key: super::managed::queue::ForgePlanKey,
+        completion_tx: tokio::sync::mpsc::UnboundedSender<ForgePlanCompletion>,
     ) {
-        let task_id = popped.admission.task_id;
-        let plan_index = popped.admission.plan_index;
-        let Some(plan) = popped.runner else {
-            joins.spawn(async move {
-                (
-                    task_id,
-                    plan_index,
-                    Err(ForgeError::Invariant {
-                        detail: format!("Forge admitted plan {plan_index} carried no runner"),
-                    }),
-                )
-            });
-            return;
-        };
-        let worker = self.clone();
-        let claim = state.open.claim.clone();
-        let binding = state.binding.clone();
-        let mut lease = state.lease.clone();
-        let shared = Arc::clone(&state.shared);
-        let stop = state.fenced.operation_stop.clone();
-        let runner = async move {
-            let outcome = worker
-                .publish_one_plan(&claim, &binding, &mut lease, &shared, plan, &stop)
-                .await;
-            (task_id, plan_index, outcome)
+        let future = async move {
+            let outcome = runner.compact().await;
+            if completion_tx
+                .send(ForgePlanCompletion { key, outcome })
+                .is_err()
+            {
+                tracing::warn!(
+                    task_id = %key.0,
+                    plan_index = key.1,
+                    "Forge plan completion could not be delivered to its worker"
+                );
+            }
         };
         match &self.compaction_runtime {
             Some(handle) => {
-                joins.spawn_on(runner, handle);
+                handle.spawn(future);
             }
             None => {
-                joins.spawn(runner);
+                tokio::spawn(future);
             }
-        }
-    }
-
-    /// Awaits the next plan runner to finish, in completion order.
-    ///
-    /// Returns `None` when nothing is in flight.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ForgeError::Invariant`] when a runner panicked or was aborted:
-    /// its plan's outcome cannot be attributed, so the owner can no longer
-    /// prove what it published and must stop rather than settle a guess.
-    async fn join_next_plan(
-        joins: &mut ForgePlanJoins,
-    ) -> Result<Option<(Uuid, usize, Result<ForgeDispatchResult, ForgeError>)>, ForgeError> {
-        match joins.join_next().await {
-            None => Ok(None),
-            Some(Ok(joined)) => Ok(Some(joined)),
-            Some(Err(error)) => Err(ForgeError::Invariant {
-                detail: format!("Forge compaction plan runner did not complete: {error}"),
-            }),
         }
     }
 
@@ -5229,9 +5415,14 @@ impl ForgeWorker {
     /// rather than the worker's remaining room.
     ///
     /// Returns each refused plan's index and reason, in offer order.
-    fn offer_planned_rewrites<R>(
-        queue: &mut super::managed::queue::ForgeCompactionQueue<R>,
-        plans: impl IntoIterator<Item = (super::managed::queue::ForgePlanAdmission, R)>,
+    fn offer_planned_rewrites(
+        queue: &mut super::managed::queue::ForgeCompactionQueue,
+        plans: impl IntoIterator<
+            Item = (
+                super::managed::queue::ForgePlanAdmission,
+                Option<ForgeCompactionPlanRunner>,
+            ),
+        >,
     ) -> Vec<(usize, super::managed::queue::ForgePushResult)> {
         let mut refusals = Vec::new();
         for (admission, runner) in plans {
@@ -5296,71 +5487,6 @@ impl ForgeWorker {
         .await
     }
 
-    /// Rewrites one admitted plan and publishes it under its own operation.
-    ///
-    /// The operation identity is minted here, per plan, because a durable
-    /// operation's Prepared detail is immutable and names exactly the inputs
-    /// and outputs one commit replaces. Sibling plans of the same attempt
-    /// replace different inputs, so one operation shared across them could only
-    /// describe one of them truthfully. The attempt identity stays shared: it
-    /// is what every object this attempt wrote is named for, and what the
-    /// unsettled-output ledger is keyed by.
-    ///
-    /// The publication authority, deadline, and retry budget are the
-    /// single-plan ones: this method is the whole of one plan's independent
-    /// publication, and a sibling's refusal or failure neither cancels nor
-    /// weakens it.
-    ///
-    /// # Errors
-    ///
-    /// Returns whatever managed execution and publication raise for this plan
-    /// alone: [`ForgeError::Shutdown`] when the attempt drained,
-    /// [`ForgeError::RewriteUnsettled`] when objects exist that no commit
-    /// names, [`ForgeError::Catalog`] or [`ForgeError::Reconciliation`] when
-    /// the catalog refused or its answer was lost, and the clock, audit,
-    /// fence, and object-store failures the boundary raises.
-    async fn publish_one_plan(
-        &self,
-        claim: &ForgeTaskClaim,
-        binding: &TenantTableBinding,
-        lease: &mut ForgeLease,
-        attempt: &ForgeRewriteAttempt,
-        plan: super::managed::ForgePlannedRewrite,
-        stop: &CancellationToken,
-    ) -> Result<ForgeDispatchResult, ForgeError> {
-        let handoff = attempt.rewrite.rewrite_plan(plan, &attempt.table).await?;
-        let metadata = attempt.table.metadata();
-        let context = RewritePublication {
-            claim,
-            binding,
-            identity: super::publication::RewriteCommitIdentity {
-                task_id: claim.task_id,
-                attempt_id: attempt.rewrite.attempt_id(),
-                operation_id: Uuid::now_v7(),
-                group: ForgeGroupKey::table_audit_resource(binding.tenant, &binding.table_ref),
-                plan_hash: super::planner::plan_hash(&claim.plan)?,
-                evidence: attempt.evidence.clone(),
-            },
-            key: ForgeGroupKey {
-                tenant: binding.tenant,
-                table_ref: binding.table_ref.clone(),
-                partition: super::publication::rewrite_group_partition(
-                    metadata.default_partition_spec(),
-                    handoff.output_data_files.iter(),
-                )?,
-            },
-            partition_spec_id: metadata.default_partition_spec_id(),
-            target_file_size_bytes: super::managed::policy::declared_target_file_size_bytes(
-                metadata,
-            )?,
-            planned_schema_id: metadata.current_schema_id(),
-            deadline: attempt.deadline,
-        };
-        #[cfg(feature = "test-support")]
-        self.record_rewrite_evidence_for_test(&context.identity);
-        self.publish_rewrite(&context, &handoff, lease, stop).await
-    }
-
     /// Reduces one attempt's per-plan refusals and outcomes to one task result.
     ///
 redacted
@@ -5386,6 +5512,7 @@ redacted
     fn reduce_plan_outcomes(
         mut refusals: Vec<(usize, super::managed::queue::ForgePushResult)>,
         outcomes: Vec<(usize, Result<ForgeDispatchResult, ForgeError>)>,
+        possible_outputs: Vec<super::managed::ForgeUnsettledOutput>,
     ) -> Result<ForgeDispatchResult, ForgeError> {
         let mut published = None;
         let mut committed_volume: Option<ForgeCommittedVolume> = None;
@@ -5424,7 +5551,7 @@ redacted
         }
         failures.sort_by_key(|(plan_index, _)| *plan_index);
         if !failures.is_empty() {
-            return Err(Self::unsettled_across_plans(failures));
+            return Err(Self::unsettled_across_plans(failures, possible_outputs));
         }
         refusals.sort_by_key(|(plan_index, _)| *plan_index);
         match refusals.into_iter().next() {
@@ -5450,30 +5577,42 @@ redacted
     /// Reports one attempt's failure while keeping every plan's loose objects.
     ///
     /// The deciding failure is the lowest plan index's, which is what makes an
-    /// attempt settle the same way regardless of completion order. Its possible
-    /// outputs alone are not enough, though: a sibling plan that also failed
+    /// attempt settle the same way regardless of completion order. Its own
+    /// possible outputs are not enough, though: a sibling plan that also failed
     /// wrote objects that only this attempt can still name, and dropping them
     /// with its error would leave objects no reclaiming caller ever hears
-    /// about. So the returned error carries the union, ordered by plan, and is
-    /// only wrapped when there is something to carry.
+    /// about. So the returned error carries `possible_outputs` — the one
+    /// attempt-global snapshot the caller took after every plan drained.
     ///
     /// # Panics
     ///
     /// Panics when `failures` is empty, which its one caller has already
     /// excluded.
-    fn unsettled_across_plans(failures: Vec<(usize, ForgeError)>) -> ForgeError {
-        let mut possible_outputs: Vec<super::managed::ForgeUnsettledOutput> = Vec::new();
-        for (_, error) in &failures {
-            possible_outputs.extend_from_slice(error.possible_rewrite_outputs());
-        }
+    fn unsettled_across_plans(
+        failures: Vec<(usize, ForgeError)>,
+        possible_outputs: Vec<super::managed::ForgeUnsettledOutput>,
+    ) -> ForgeError {
         let (_, deciding) = failures
             .into_iter()
             .next()
             .expect("the caller reduces at least one failure");
-        if possible_outputs.len() <= deciding.possible_rewrite_outputs().len() {
-            return deciding;
+        Self::attach_attempt_outputs(deciding, possible_outputs)
+    }
+
+    /// Carries one attempt's final possible-output snapshot out with a failure.
+    ///
+    /// Returns `failure` unchanged when the attempt can have produced nothing,
+    /// so [`ForgeError::RewriteUnsettled`] only ever appears when it names
+    /// objects a caller has to reclaim. An already-wrapped failure has its
+    /// per-plan set replaced by the attempt-global one, which is its superset.
+    fn attach_attempt_outputs(
+        failure: ForgeError,
+        possible_outputs: Vec<super::managed::ForgeUnsettledOutput>,
+    ) -> ForgeError {
+        if possible_outputs.is_empty() {
+            return failure;
         }
-        let source = match deciding {
+        let source = match failure {
             ForgeError::RewriteUnsettled { source, .. } => source,
             other => Box::new(other),
         };
@@ -5526,6 +5665,212 @@ redacted
             });
         }
         Ok(())
+    }
+}
+
+/// One admitted plan's complete execution and publication owner.
+///
+/// The queue owns one of these per plan; popping moves it into the future
+/// scheduled on the compaction executor, and consuming it is the whole of that
+/// plan's work. It therefore owns exactly what one plan needs and nothing the
+/// worker keeps: no queue, no readiness, no worker configuration, no runtime,
+/// no heartbeat, no task settlement, and no recovery or maintenance state. That
+/// boundary is what lets the worker stay retained for supervision while its
+/// plans run without any of them being able to reach it.
+pub(crate) struct ForgeCompactionPlanRunner {
+    /// Durable task this plan belongs to; the first half of its queue key.
+    task_id: Uuid,
+    /// Planner ordinal of this plan; the second half of its queue key.
+    plan_index: usize,
+    /// The real plan this runner executes, taken exactly once by
+    /// [`Self::compact`].
+    plan: Option<super::managed::ForgePlannedRewrite>,
+    /// Operation identity minted before admission and used by this plan alone.
+    ///
+    /// A durable operation's Prepared detail is immutable and names exactly the
+    /// inputs and outputs one commit replaces. Sibling plans of the same
+    /// attempt replace different inputs, so one shared operation could only
+    /// describe one of them truthfully.
+    operation_id: Uuid,
+    /// Shared Forge dependency graph this plan publishes through.
+    forge: Arc<Forge>,
+    /// Stable identity of the worker that admitted this plan.
+    owner: Uuid,
+    /// Durable claim this plan publishes under.
+    claim: ForgeTaskClaim,
+    /// Tenant-scoped table this plan publishes to.
+    binding: TenantTableBinding,
+    /// This attempt's table fence, cloned per plan.
+    lease: ForgeLease,
+    /// Managed context, table, evidence, and publication budget the attempt
+    /// shares with every one of its plans.
+    shared: Arc<ForgeRewriteAttempt>,
+    /// The attempt's cancellation seam; this plan drains when it is cancelled.
+    stop: CancellationToken,
+    /// Passive test evidence sink; never consulted by a production decision.
+    #[cfg(feature = "test-support")]
+    completion_observer: Option<ForgeWorkerCompletionObserver>,
+}
+
+impl std::fmt::Debug for ForgeCompactionPlanRunner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ForgeCompactionPlanRunner")
+            .field("task_id", &self.task_id)
+            .field("plan_index", &self.plan_index)
+            .field("operation_id", &self.operation_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ForgeCompactionPlanRunner {
+    /// Builds one plan's runner from its worker and its suspended attempt.
+    ///
+    /// Everything is captured by value or by `Arc` here, before the plan is
+    /// offered, so nothing the runner holds can later be invalidated by the
+    /// worker moving on to another claim.
+    fn new(
+        worker: &ForgeWorker,
+        state: &ForgeAttemptState,
+        plan: super::managed::ForgePlannedRewrite,
+    ) -> Self {
+        Self {
+            task_id: state.open.claim.task_id,
+            plan_index: plan.plan_index,
+            plan: Some(plan),
+            operation_id: Uuid::now_v7(),
+            forge: Arc::clone(&worker.forge),
+            owner: worker.owner,
+            claim: state.open.claim.clone(),
+            binding: state.binding.clone(),
+            lease: state.lease.clone(),
+            shared: Arc::clone(&state.shared),
+            stop: state.fenced.operation_stop.clone(),
+            #[cfg(feature = "test-support")]
+            completion_observer: worker.completion_observer.clone(),
+        }
+    }
+
+    /// Rewrites this plan and publishes it under its own operation.
+    ///
+    /// This is the whole of one plan's work, and it consumes the runner so it
+    /// can happen only once. The publication authority, deadline, and retry
+    /// budget are the single-plan ones: a sibling's refusal or failure neither
+    /// cancels nor weakens it. The attempt identity stays shared, because it is
+    /// what every object this attempt wrote is named for and what the
+    /// unsettled-output ledger is keyed by.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever managed execution and publication raise for this plan
+    /// alone: [`ForgeError::Shutdown`] when the attempt drained,
+    /// [`ForgeError::RewriteUnsettled`] when objects exist that no commit
+    /// names, [`ForgeError::Catalog`] or [`ForgeError::Reconciliation`] when
+    /// the catalog refused or its answer was lost, and the clock, audit,
+    /// fence, and object-store failures the boundary raises.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the plan was already taken, which consuming `self` prevents.
+    async fn compact(mut self) -> Result<ForgeDispatchResult, ForgeError> {
+        let plan = self
+            .plan
+            .take()
+            .expect("a runner is consumed once and holds its plan until then");
+        // A per-plan clone of the attempt's fence: every clone shares one
+        // renewal record, so this is a mutable handle onto the same lease
+        // rather than a second acquisition.
+        let mut lease = self.lease.clone();
+        tracing::debug!(
+            worker = %self.owner,
+            task_id = %self.task_id,
+            plan_index = self.plan_index,
+            operation_id = %self.operation_id,
+            "Forge compaction plan started from the queue"
+        );
+        let handoff = self
+            .shared
+            .rewrite
+            .rewrite_plan(plan, &self.shared.table)
+            .await?;
+        let metadata = self.shared.table.metadata();
+        let context = RewritePublication {
+            claim: &self.claim,
+            binding: &self.binding,
+            identity: super::publication::RewriteCommitIdentity {
+                task_id: self.task_id,
+                attempt_id: self.shared.rewrite.attempt_id(),
+                operation_id: self.operation_id,
+                group: ForgeGroupKey::table_audit_resource(
+                    self.binding.tenant,
+                    &self.binding.table_ref,
+                ),
+                plan_hash: super::planner::plan_hash(&self.claim.plan)?,
+                evidence: self.shared.evidence.clone(),
+            },
+            key: ForgeGroupKey {
+                tenant: self.binding.tenant,
+                table_ref: self.binding.table_ref.clone(),
+                partition: super::publication::rewrite_group_partition(
+                    metadata.default_partition_spec(),
+                    handoff.output_data_files.iter(),
+                )?,
+            },
+            partition_spec_id: metadata.default_partition_spec_id(),
+            target_file_size_bytes: super::managed::policy::declared_target_file_size_bytes(
+                metadata,
+            )?,
+            planned_schema_id: metadata.current_schema_id(),
+            deadline: self.shared.deadline,
+        };
+        #[cfg(feature = "test-support")]
+        self.record_rewrite_evidence_for_test(&context.identity);
+        let outcome = self
+            .publish_rewrite(&context, &handoff, &mut lease, &self.stop)
+            .await;
+        if let Err(error) = &outcome {
+            tracing::warn!(
+                worker = %self.owner,
+                task_id = %self.task_id,
+                plan_index = self.plan_index,
+                operation_id = %self.operation_id,
+                error = %error,
+                "Forge compaction plan failed"
+            );
+        }
+        outcome
+    }
+
+    /// Records this plan's immutable evidence for a passive test observer.
+    ///
+    /// Called once managed execution has produced the attempt's evidence and
+    /// before publication consumes it, which is the only point where the
+    /// evidence and all three durable identities are known together.
+    /// Test-support only and side-effect free.
+    #[cfg(feature = "test-support")]
+    fn record_rewrite_evidence_for_test(
+        &self,
+        identity: &super::publication::RewriteCommitIdentity,
+    ) {
+        if let Some(observer) = &self.completion_observer {
+            observer.record_rewrite_evidence_for_test(ForgeRewriteEvidenceRecord {
+                task_id: identity.task_id,
+                attempt_id: identity.attempt_id,
+                operation_id: identity.operation_id,
+                evidence: identity.evidence.clone(),
+            });
+        }
+    }
+
+    /// Apply the observer's one-shot passive post-handoff barrier.
+    ///
+    /// Called by publication after managed execution produced the handoff and
+    /// before authoritative metadata is reacquired. Without an armed observer
+    /// it is a no-op, so no production decision depends on it.
+    #[cfg(feature = "test-support")]
+    async fn pause_after_handoff_for_test(&self) {
+        if let Some(observer) = &self.completion_observer {
+            observer.pause_after_handoff_for_test().await;
+        }
     }
 
     /// Derives, prepares, and commits one handoff, retrying at most once.
@@ -6148,15 +6493,15 @@ redacted
                     .load_table(&context.binding.table_ident())
                     .await
                     .map_err(ForgeError::Catalog)?;
-                if self
-                    .find_retained_task_evidence(
-                        context.binding,
-                        &refreshed,
-                        "forge.operation_id",
-                        context.identity.operation_id,
-                    )
-                    .await?
-                    .is_some()
+                if ForgeWorker::find_retained_task_evidence(
+                    &self.forge,
+                    context.binding,
+                    &refreshed,
+                    "forge.operation_id",
+                    context.identity.operation_id,
+                )
+                .await?
+                .is_some()
                 {
                     return Err(ForgeError::Reconciliation {
                         detail: "Forge rewrite commit was refused after its own effect landed"
@@ -6274,7 +6619,9 @@ redacted
         let live = self.forge.rewrite_base_at(table, head).await?;
         Ok(live.holds_all_data(rewritten_data_files))
     }
+}
 
+impl ForgeWorker {
     /// Converts catalog file paths into the audit row's storage paths.
     ///
     /// # Errors
@@ -6398,15 +6745,15 @@ redacted
             // off the table separates the two, so an already-landed promotion
             // is never reset and never re-appended: the operation stays open
             // and a successor settles it from that same evidence.
-            if self
-                .find_retained_task_evidence(
-                    binding,
-                    &reloaded_after_conflict,
-                    "forge.operation_id",
-                    operation_id,
-                )
-                .await?
-                .is_some()
+            if ForgeWorker::find_retained_task_evidence(
+                &self.forge,
+                binding,
+                &reloaded_after_conflict,
+                "forge.operation_id",
+                operation_id,
+            )
+            .await?
+            .is_some()
             {
                 return Err(ForgeError::Reconciliation {
                     detail: "Scribe promotion commit was refused after its own effect landed"
@@ -7321,7 +7668,7 @@ impl ForgeWorker {
     /// retention errors. A failure leaves the claim nonterminal and never
     /// fabricates evidence.
     async fn find_retained_task_evidence(
-        &self,
+        forge: &Forge,
         binding: &TenantTableBinding,
         table: &Table,
         key: &str,
@@ -7339,8 +7686,7 @@ impl ForgeWorker {
                 .map_err(ForgeError::Catalog)?
                 .to_owned(),
         );
-        let max_locations = self
-            .forge
+        let max_locations = forge
             .core
             .config
             .max_retained_snapshots_per_table
@@ -7360,11 +7706,10 @@ impl ForgeWorker {
             let object_path = catalog_path_to_object_key(
                 table.metadata().location(),
                 binding,
-                &self.forge.core.staging,
+                &forge.core.staging,
                 &location,
             )?;
-            let raw = self
-                .forge
+            let raw = forge
                 .core
                 .object_store
                 .read(&object_path)
@@ -8002,6 +8347,7 @@ mod tests {
                 ),
                 (1, Ok(ForgeDispatchResult::SelfSettled)),
             ],
+            Vec::new(),
         );
         assert!(
             matches!(published, Ok(ForgeDispatchResult::SelfSettled)),
@@ -8024,6 +8370,7 @@ mod tests {
                     }),
                 ),
             ],
+            Vec::new(),
         );
         assert!(
             matches!(failed, Err(ForgeError::Capacity { .. })),
@@ -8036,6 +8383,7 @@ mod tests {
                 (1, ForgePushResult::RejectedDuplicate),
             ],
             Vec::new(),
+            Vec::new(),
         );
         assert!(
             matches!(refused, Err(ForgeError::Capacity { .. })),
@@ -8047,6 +8395,7 @@ mod tests {
                 (0, ForgePushResult::RejectedInvalidParallelism),
                 (1, ForgePushResult::RejectedCapacity),
             ],
+            Vec::new(),
             Vec::new(),
         );
         assert!(
@@ -8084,9 +8433,9 @@ mod tests {
         let refusals = ForgeWorker::offer_planned_rewrites(
             &mut queue,
             [
-                (admission(0, 8), ()),
-                (admission(1, 8), ()),
-                (admission(2, 4), ()),
+                (admission(0, 8), None),
+                (admission(1, 8), None),
+                (admission(2, 4), None),
             ],
         );
 

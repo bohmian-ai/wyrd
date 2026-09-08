@@ -126,7 +126,7 @@ the operation before the catalog commit.
 
 One compaction attempt plans every eligible group of its table and publishes
 each plan on its own Iceberg commit and its own operation, against the head the
-plan before it left. Plans of the same attempt run and commit concurrently: a
+plan published before it left. Plans of the same attempt run and commit concurrently: a
 plan that fails costs only itself, and a plan that commits is durable
 immediately.
 

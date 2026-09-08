@@ -163,36 +163,53 @@ impl CloseoutJourney {
         // harness default budget.
         if profile.production_resources {
             spec.nodes[1].forge_compaction_memory_limit_bytes = Some(16 * 1024 * 1024 * 1024);
+            spec.nodes[1].oracle = Some(TestOracleResources {
+                spill_root: None,
+                system_resources: Some(SystemResourceSnapshot {
+                    memory_limit_bytes: 32 * 1024 * 1024 * 1024,
+                    effective_cpu: 4,
+                    scratch_capacity_bytes: 4 * 1024 * 1024 * 1024,
+                    scratch_available_bytes: 4 * 1024 * 1024 * 1024,
+                    memory_source: ResourceSource::Injected,
+                    cpu_source: ResourceSource::Injected,
+                }),
+            });
+            // Both Oracle replicas must derive the same durable admission
+            // ceiling under the qualification sizing: this is replica
+            // agreement, not sizing. The dedicated replica needs neither the
+            // Scribe protected floor nor the Forge compaction reservation the
+            // co-located coordinator takes, so its injected limit sheds exactly
+            // those two.
+            spec.nodes[2].oracle = Some(TestOracleResources {
+                spill_root: None,
+                system_resources: Some(SystemResourceSnapshot {
+                    memory_limit_bytes: 3 * 1024 * 1024 * 1024
+                        - ROLE_MEMORY_FLOOR_BYTES
+                        - HARNESS_FORGE_COMPACTION_BUDGET_BYTES,
+                    effective_cpu: 4,
+                    scratch_capacity_bytes: 4 * 1024 * 1024 * 1024,
+                    scratch_available_bytes: 4 * 1024 * 1024 * 1024,
+                    memory_source: ResourceSource::Injected,
+                    cpu_source: ResourceSource::Injected,
+                }),
+            });
+        } else {
+            // The scaled default runs the same journey on whatever the node's
+            // own resource plan reports: no compaction budget override and no
+            // injected Oracle snapshot anywhere in the topology.
+            for node in &spec.nodes {
+                assert_eq!(
+                    node.forge_compaction_memory_limit_bytes, None,
+                    "the fast profile overrides no Forge compaction budget"
+                );
+                assert!(
+                    node.oracle
+                        .as_ref()
+                        .is_none_or(|oracle| oracle.system_resources.is_none()),
+                    "the fast profile injects no Oracle resource snapshot"
+                );
+            }
         }
-        spec.nodes[1].oracle = Some(TestOracleResources {
-            spill_root: None,
-            system_resources: Some(SystemResourceSnapshot {
-                memory_limit_bytes: 32 * 1024 * 1024 * 1024,
-                effective_cpu: 4,
-                scratch_capacity_bytes: 4 * 1024 * 1024 * 1024,
-                scratch_available_bytes: 4 * 1024 * 1024 * 1024,
-                memory_source: ResourceSource::Injected,
-                cpu_source: ResourceSource::Injected,
-            }),
-        });
-        // Both Oracle replicas must derive the same durable admission ceiling,
-        // in either geometry mode: this is replica agreement, not sizing. The
-        // dedicated replica needs neither the Scribe protected floor nor the
-        // Forge compaction reservation the co-located coordinator takes, so its
-        // injected limit sheds exactly those two.
-        spec.nodes[2].oracle = Some(TestOracleResources {
-            spill_root: None,
-            system_resources: Some(SystemResourceSnapshot {
-                memory_limit_bytes: 3 * 1024 * 1024 * 1024
-                    - ROLE_MEMORY_FLOOR_BYTES
-                    - HARNESS_FORGE_COMPACTION_BUDGET_BYTES,
-                effective_cpu: 4,
-                scratch_capacity_bytes: 4 * 1024 * 1024 * 1024,
-                scratch_available_bytes: 4 * 1024 * 1024 * 1024,
-                memory_source: ResourceSource::Injected,
-                cpu_source: ResourceSource::Injected,
-            }),
-        });
         let cluster = WyrdTestCluster::start_spec_with_forge_config_and_completion_observer(
             spec, config, true, true,
         )

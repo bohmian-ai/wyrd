@@ -237,10 +237,8 @@ impl ForgeManagedRewrite {
                     config.execution.enable_prefetch,
                     requires_sort,
                 );
-                let required_parallelism = u32::try_from(
-                    plan.recommended_executor_parallelism().max(1),
-                )
-                .map_err(|_| ForgeError::Invariant {
+                let required_parallelism = u32::try_from(plan.recommended_executor_parallelism())
+                    .map_err(|_| ForgeError::Invariant {
                     detail: format!(
                         "plan {plan_index} recommends an execution parallelism \
                                  outside the admissible range"

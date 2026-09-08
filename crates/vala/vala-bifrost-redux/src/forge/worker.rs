@@ -2250,8 +2250,7 @@ impl ForgeWorker {
                     return Ok(());
                 }
                 if pool.has_plans_in_flight() {
-                    self.await_loop_event(&mut pool, &mut maintenance, &shutdown)
-                        .await?;
+                    Box::pin(self.await_loop_event(&mut pool, &mut maintenance, &shutdown)).await?;
                     continue;
                 }
                 // Nothing is in flight, so every attempt still held is one this
@@ -2271,8 +2270,7 @@ impl ForgeWorker {
                 // readiness, while the plans it already admitted keep running
                 // and settling normally.
                 self.publish_readiness(false);
-                self.await_loop_event(&mut pool, &mut maintenance, &shutdown)
-                    .await?;
+                Box::pin(self.await_loop_event(&mut pool, &mut maintenance, &shutdown)).await?;
                 continue;
             }
             self.reclaim_expired_attempts(claim_limits.max_active_per_tenant)
@@ -2301,75 +2299,20 @@ impl ForgeWorker {
                 continue;
             }
             self.publish_readiness(true);
-redacted
-            // most the parallelism this worker still has free, and never more
-            // than four tasks.
-            let mut pending_pull_task_count =
-                (self.config.max_task_parallelism - pool.queue.running_parallelism_sum()).min(4);
-            if pending_pull_task_count == 0 {
+            if (self.config.max_task_parallelism - pool.queue.running_parallelism_sum()).min(4) == 0
+            {
                 // No running parallelism remains, so this turn acquires no
                 // authority at all. Waiting plans keep their pending
                 // reservation; it does not authorize a pull.
-                self.await_loop_event(&mut pool, &mut maintenance, &shutdown)
-                    .await?;
+                Box::pin(self.await_loop_event(&mut pool, &mut maintenance, &shutdown)).await?;
                 continue;
             }
-            let mut claimed = 0_u32;
-            while pending_pull_task_count > 0 {
-                let claim = self
-                    .claim_next(claim_limits, reserved_maintenance)
-                    .await
-                    .map_err(ForgeError::Sql)?;
-                let Some(claim) = claim else {
-                    break;
-                };
-                claimed += 1;
-                let started = Instant::now();
-                let active = Self::metric_strategy(&claim.strategy)
-                    .map(|strategy| self.forge.core.telemetry.active_task(strategy));
-                let task_id = claim.task_id;
-                #[cfg(feature = "test-support")]
-                if let Some(observer) = &self.completion_observer {
-                    observer.record_lifecycle(ForgeLifecycleEvent::Claimed {
-                        task_id,
-                        worker_id: self.owner,
-                    });
-                }
-                #[cfg(feature = "test-support")]
-                if let Some(observer) = &self.completion_observer {
-                    observer.pause_after_claim_for_test().await;
-                    if observer.abandon_claim_for_test(&claim, self.owner) {
-                        return Ok(());
-                    }
-                }
-                if shutdown.is_cancelled() {
-                    return self.release_claim_at_shutdown(&claim, started).await;
-                }
-                let strategy = claim.strategy.clone();
-                // One INFO per claimed task, not per file or per row: Forge tasks are
-                // coarse, so this stays bounded by compaction throughput and gives an
-                // operator the claim/settle pair that shows whether work is moving.
-                tracing::info!(
-                    worker = %self.owner,
-                    task_id = %task_id,
-                    strategy = ?strategy,
-                    "Forge task claimed"
-                );
-                let open = Self::open_claim_episode(claim, started, active);
-                match self.begin_claim_episode(open, &shutdown, &mut pool).await {
-                    // The attempt's plans are on the queue; it settles when they drain.
-                    ClaimStep::Admitted => {}
-                    ClaimStep::Closed(result) => {
-                        self.record_settled_claim(task_id, strategy, started, result)
-                            .await?;
-                    }
-                }
-                // Recomputed after this task's plans were offered, so the next
-                // claim of the same turn sees the room they took.
-                pending_pull_task_count = (self.config.max_task_parallelism
-                    - pool.queue.running_parallelism_sum())
-                .min(4);
-            }
+            let Some(claimed) = self
+                .pull_claimed_tasks(&mut pool, claim_limits, reserved_maintenance, &shutdown)
+                .await?
+            else {
+                return Ok(());
+            };
             if claimed > 0 {
                 continue;
             }
@@ -2383,9 +2326,94 @@ redacted
             // Nothing to claim while this worker still holds work: waiting on a
             // running plan is the idle wait, because polling for new work on a
             // timer would delay the settlement that frees its budget.
-            self.await_loop_event(&mut pool, &mut maintenance, &shutdown)
-                .await?;
+            Box::pin(self.await_loop_event(&mut pool, &mut maintenance, &shutdown)).await?;
         }
+    }
+
+    /// Claims and admits tasks for one pull turn, up to this worker's free room.
+    ///
+    /// The pull budget is recomputed after every claim's plans are offered, so
+    /// a task that filled the queue ends the turn instead of letting the next
+    /// claim overcommit the same parallelism. Claims are taken one at a time
+    /// through the fair SQL selection, which is what keeps two workers from
+    /// splitting a tenant's backlog unevenly.
+    ///
+    /// Returns the number of tasks claimed, or `None` when a stop signal or a
+    /// test-support abandonment ended this worker's loop.
+    ///
+    /// # Errors
+    ///
+    /// Returns the SQL, planning, settlement, audit, and lease failures the
+    /// claim and its episode raise.
+    async fn pull_claimed_tasks(
+        &self,
+        pool: &mut ForgeAttemptPool,
+        claim_limits: ForgeClaimLimits,
+        reserved_maintenance: bool,
+        shutdown: &CancellationToken,
+    ) -> Result<Option<u32>, ForgeError> {
+redacted
+        // the parallelism this worker still has free, and never more than four
+        // tasks.
+        let mut pending_pull_task_count =
+            (self.config.max_task_parallelism - pool.queue.running_parallelism_sum()).min(4);
+        let mut claimed = 0_u32;
+        while pending_pull_task_count > 0 {
+            let claim = self
+                .claim_next(claim_limits, reserved_maintenance)
+                .await
+                .map_err(ForgeError::Sql)?;
+            let Some(claim) = claim else {
+                break;
+            };
+            claimed += 1;
+            let started = Instant::now();
+            let active = Self::metric_strategy(&claim.strategy)
+                .map(|strategy| self.forge.core.telemetry.active_task(strategy));
+            let task_id = claim.task_id;
+            #[cfg(feature = "test-support")]
+            if let Some(observer) = &self.completion_observer {
+                observer.record_lifecycle(ForgeLifecycleEvent::Claimed {
+                    task_id,
+                    worker_id: self.owner,
+                });
+            }
+            #[cfg(feature = "test-support")]
+            if let Some(observer) = &self.completion_observer {
+                observer.pause_after_claim_for_test().await;
+                if observer.abandon_claim_for_test(&claim, self.owner) {
+                    return Ok(None);
+                }
+            }
+            if shutdown.is_cancelled() {
+                self.release_claim_at_shutdown(&claim, started).await?;
+                return Ok(None);
+            }
+            let strategy = claim.strategy.clone();
+            // One INFO per claimed task, not per file or per row: Forge tasks are
+            // coarse, so this stays bounded by compaction throughput and gives an
+            // operator the claim/settle pair that shows whether work is moving.
+            tracing::info!(
+                worker = %self.owner,
+                task_id = %task_id,
+                strategy = ?strategy,
+                "Forge task claimed"
+            );
+            let open = Self::open_claim_episode(claim, started, active);
+            match self.begin_claim_episode(open, shutdown, pool).await {
+                // The attempt's plans are on the queue; it settles when they drain.
+                ClaimStep::Admitted => {}
+                ClaimStep::Closed(result) => {
+                    self.record_settled_claim(task_id, strategy, started, result)
+                        .await?;
+                }
+            }
+            // Recomputed after this task's plans were offered, so the next
+            // claim of the same turn sees the room they took.
+            pending_pull_task_count =
+                (self.config.max_task_parallelism - pool.queue.running_parallelism_sum()).min(4);
+        }
+        Ok(Some(claimed))
     }
 
     /// Waits for the next plan completion, maintenance tick, or stop signal.

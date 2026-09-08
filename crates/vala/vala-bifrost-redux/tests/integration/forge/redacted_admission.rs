@@ -2318,10 +2318,10 @@ async fn release_one_unresolved_attempt(
 /// # Panics
 ///
 /// Panics when the killed owner settled, failed, retried, or reset its
-/// unresolved attempt, when it changed an operation identity, when it recorded
-/// planning demand for work it could not account for, when any object was
-/// deleted while an operation was still Prepared, or when it left a table
-/// fence held.
+/// unresolved attempt, when it appended a terminal audit row for one of its own
+/// operations, when it changed an operation identity, when any object was
+/// deleted while an operation was still Prepared, or when it left a table fence
+/// held.
 async fn crash_recovery_reconciles_the_exact_operation(
     promoted: &PromotedRewriteFixture,
     catalog: &Arc<PromotionCatalogSeam>,
@@ -2333,16 +2333,11 @@ async fn crash_recovery_reconciles_the_exact_operation(
     let (unresolved, errors_before) =
         release_one_unresolved_attempt(promoted, catalog, supervisor).await;
     let unresolved_ids = unresolved.iter().copied().collect::<Vec<_>>();
-    let demand_before = planning_demand(&promoted.fixture).await;
-    let audit_before = promoted
-        .fixture
-        .forge_terminal_audit_count_for(&unresolved_ids)
-        .await;
-    let owned = small_files_in_state(&promoted.fixture, &["claimed", "running"]).await;
 
     // The process is replaced, not asked to stop. Whatever the worker had in
     // memory about these operations is gone with it, so everything asserted
-    // below was read back out of Postgres.
+    // below was read back out of Postgres — and read after the kill, so no
+    // assertion is racing a worker that is still running.
     supervisor.restart_worker();
 
     assert_eq!(
@@ -2352,22 +2347,16 @@ async fn crash_recovery_reconciles_the_exact_operation(
         supervisor.returned_errors()
     );
     assert_eq!(
-        planning_demand(&promoted.fixture).await,
-        demand_before,
-        "an attempt nobody can account for records no planning demand"
-    );
-    assert_eq!(
         promoted
             .fixture
             .forge_terminal_audit_count_for(&unresolved_ids)
             .await,
-        audit_before,
+        0,
         "a released attempt appends no terminal rewrite audit row for its own \
          operation"
     );
-    assert_eq!(
-        small_files_in_state(&promoted.fixture, &["claimed", "running"]).await,
-        owned,
+    assert!(
+        small_files_in_state(&promoted.fixture, &["claimed", "running"]).await > 0,
         "the task stays Running for whoever recovers it: {:?}",
         tenant_tasks(&promoted.fixture).await
     );

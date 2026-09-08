@@ -584,7 +584,8 @@ enum ForgeDispatchResult {
     ///
     /// Not a failure and not a success: the operation is open, its outputs may
     /// already be live, and only proof about this exact operation can close it.
-    /// The owner therefore retains it rather than settling the task.
+    /// The owner therefore releases the attempt rather than settling the task,
+    /// leaving the durable row for the table-wide reconciliation owner.
     AcceptanceUnknown(Box<ForgeUnknownAcceptance>),
     /// A dispatch that already wrote its own durable task transition and owes
     /// the worker no further one.
@@ -2174,8 +2175,8 @@ impl ForgeWorker {
     /// [`ForgeError::Shutdown`] because a pre-effect checkpoint fired before any
     /// durable side effect. Both cases performed no durable work, so a successor
     /// reclaims the released task losslessly. A post-effect cancellation instead
-    /// returns [`ForgeError::ShutdownRetained`] and is retained here for
-    /// evidence-based and lease-expiry recovery, never released. Settling
+    /// returns [`ForgeError::ShutdownRetained`] and is left here for
+    /// lease-expiry recovery, never released. Settling
     /// before telemetry ensures the task span reflects authoritative SQL state.
     ///
     /// # Errors
@@ -2435,7 +2436,7 @@ redacted
             Ok(Ok(())) => {}
             Ok(Err(error)) => tracing::debug!(
                 worker = %self.owner, task_id = %task_id, error = %error,
-                "Forge claim heartbeat ended before its retained attempt was handed off"
+                "Forge claim heartbeat ended before its unresolved attempt was released"
             ),
             Err(error) => tracing::warn!(
                 worker = %self.owner, task_id = %task_id, error = %error,
@@ -4389,8 +4390,7 @@ redacted
         // post-effect cancellation at the check below instead has a durable
         // effect already committed while its task row is still `running`, so it
         // propagates as `ForgeError::ShutdownRetained` to keep the event loop from
-        // matching and releasing it; it stays retained for evidence-based and
-        // lease-expiry recovery.
+        // matching and releasing it; it stays durable for lease-expiry recovery.
         //
         // Durable settlement is the exception to both. `Settled` means the
         // atomic task-and-operation transition has already committed, so a

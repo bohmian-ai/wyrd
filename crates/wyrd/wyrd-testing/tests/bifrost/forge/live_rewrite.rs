@@ -144,6 +144,30 @@ async fn release_retries(cluster: &WyrdTestCluster, tenant: DataTenantId) {
     .expect("Forge retry eligibility advance");
 }
 
+/// Lapses the claim lease of every task this tenant still holds Running.
+///
+/// An owner that could not account for its own operation releases the attempt
+/// and stops renewing its heartbeat, so the claim lease lapses on its own TTL
+/// and the production reclaim pass takes the task back. That TTL is production
+/// minutes, and a journey proves the recovery rather than the wait: this
+/// advances the persisted deadline the reclaim reads, leaving the reclaim
+/// itself to the real bounded transaction.
+///
+/// # Panics
+///
+/// Panics when the deadline update fails.
+async fn expire_running_claims(cluster: &WyrdTestCluster, tenant: DataTenantId) {
+    sqlx::query(
+        "UPDATE vala.forge_tasks \
+         SET claim_expires_at = statement_timestamp() - interval '1 millisecond' \
+         WHERE data_tenant_id = $1 AND state = 'running'",
+    )
+    .bind(tenant.as_uuid())
+    .execute(cluster.pg_fixture().operator_pool().pool())
+    .await
+    .expect("Forge running-claim deadline lapse");
+}
+
 /// Collects the object paths one tenant's table currently owns, by tier.
 ///
 /// # Panics
@@ -646,6 +670,31 @@ async fn durable_plan_hash(cluster: &WyrdTestCluster, task_id: Uuid) -> String {
     hex::encode(plan_hash)
 }
 
+/// Counts the plans one named attempt admitted and published under.
+///
+/// One attempt publishes each of its plans under its own operation identity,
+/// and the production dispatch boundary records one evidence entry per plan.
+/// Counting those entries is what makes "one catalog commit per admitted plan"
+/// a statement about *this* attempt: the durable operation rows on the table
+/// also carry whatever a successor opened after the release, so a phase count
+/// would answer for more than one attempt.
+fn attempt_plan_count(
+    observer: &vala_bifrost_redux::forge::ForgeWorkerCompletionObserver,
+    attempt_id: Uuid,
+) -> usize {
+    for record in observer.rewrite_evidence_for_test() {
+        eprintln!(
+            "DBGEVID task={} attempt={} op={}",
+            record.task_id, record.attempt_id, record.operation_id
+        );
+    }
+    observer
+        .rewrite_evidence_for_test()
+        .iter()
+        .filter(|record| record.attempt_id == attempt_id)
+        .count()
+}
+
 /// Selects the publication evidence one named attempt produced.
 ///
 /// The three remaining rewrite fingerprints are execution evidence rather than
@@ -933,6 +982,14 @@ fn assert_recovery_telemetry(
                 && attribute(span, "attempt_id") == Some(facts.attempt_id.to_string().as_str())
         })
         .collect::<Vec<_>>();
+    for span in journey
+        .spans
+        .iter()
+        .filter(|span| span.name == "bifrost.forge.catalog.commit")
+    {
+        eprintln!("DBGCOMMIT {:?}", span.attributes);
+    }
+    eprintln!("DBGFACTS attempt={} task={}", facts.attempt_id, facts.task_id);
     assert_eq!(
         commits.len(),
         facts.plan_commits,
@@ -1156,10 +1213,10 @@ async fn forge_promoted_files_rewrite_and_remain_exact_across_recovery() {
     let checkpoint = telemetry
         .checkpoint()
         .expect("production telemetry baseline");
-    // The pod's maintenance interval is also the delayed cadence a retained
-    // attempt reconciles its own operations on. It has to be long enough that
-    // every phase below observes the uncertain state it arms, and short enough
-    // that the recovery phase can wait for one pass rather than for a redeploy.
+    // The pod's maintenance interval paces its scheduler passes. It has to be
+    // long enough that every phase below observes the uncertain state it arms,
+    // and short enough that the recovery phase can wait for one pass rather
+    // than for a redeploy.
     let cluster =
         WyrdTestCluster::start_embedded_forge_uncertainty_for_test(Duration::from_secs(30))
             .await
@@ -1335,17 +1392,16 @@ async fn forge_promoted_files_rewrite_and_remain_exact_across_recovery() {
     let mut unsettled = Vec::new();
     // Roster discovery can admit legitimate sibling maintenance first, so this
     // waits for *this* owner's unsettled rewrite rather than for any attempt.
-    // An attempt that cannot account for its own operation returns nothing: the
-    // owner that opened it retains it and settles only once exact evidence about
-    // that operation exists, so the durable open row — not a returned failure —
-    // is what says the uncertainty landed.
+    // An attempt that cannot account for its own operation returns nothing: it
+    // is released with the operation left open, so the durable open row — not a
+    // returned failure — is what says the uncertainty landed.
     let observed = tokio::time::timeout(ATTEMPT_BOUND, async {
         loop {
             unsettled = unsettled_rewrites(&cluster, owner).await;
             tokio::time::sleep(Duration::from_millis(250)).await;
             // The attempt has drained once its open rows stop appearing: every
-            // plan reached the refusing seam, and the owner retains the whole
-            // set until exact evidence about each operation exists.
+            // plan reached the refusing seam, and the released attempt left the
+            // whole set open for whoever recovers it.
             if !unsettled.is_empty() && unsettled_rewrites(&cluster, owner).await == unsettled {
                 break;
             }
@@ -1364,7 +1420,7 @@ async fn forge_promoted_files_rewrite_and_remain_exact_across_recovery() {
     assert_eq!(
         observer.returned_errors().len(),
         errors_before,
-        "a retained attempt returns no failure while its operation is open: {:?}",
+        "a released attempt returns no failure while its operation is open: {:?}",
         observer.returned_errors()
     );
 
@@ -1395,14 +1451,6 @@ async fn forge_promoted_files_rewrite_and_remain_exact_across_recovery() {
     // the attempt can prove never reached the catalog is reset. The open row is
     // therefore identified by operation, not by position.
     let phases = rewrite_phases(&cluster, owner).await;
-    // Each plan of the attempt opened its own operation, and the attempt closed
-    // only the ones it could prove never reached the catalog. Every earlier
-    // drain settled its operations as committed or recovered, so the open plus
-    // reset rows are exactly this attempt's plans.
-    let attempt_plans = phases
-        .iter()
-        .filter(|phase| *phase == "prepared" || *phase == "reset")
-        .count();
     assert_eq!(
         rewrite_phase_of(&cluster, uncertain).await.as_deref(),
         Some("prepared"),
@@ -1411,8 +1459,8 @@ async fn forge_promoted_files_rewrite_and_remain_exact_across_recovery() {
     assert_eq!(
         phases.iter().filter(|phase| *phase == "prepared").count(),
         unsettled.len(),
-        "the owner retains every operation it cannot account for, and exactly \
-         one of them named a snapshot: {phases:?}"
+        "the release leaves open every operation the owner cannot account for, \
+         and exactly one of them named a snapshot: {phases:?}"
     );
 
     // Cut 3 — across the uncertain commit. The customer answer first; the
@@ -1662,6 +1710,11 @@ async fn forge_promoted_files_rewrite_and_remain_exact_across_recovery() {
             settled = true;
             break;
         }
+        // The released attempt stopped renewing its claim, so recovery starts
+        // from a lapsed lease rather than from anything this process still
+        // remembers. The deadline is advanced and the production reclaim pass
+        // then takes the task back, exactly as it would after a kill.
+        expire_running_claims(&cluster, owner).await;
         server
             .reclaim_expired_forge_attempts_for_test(16)
             .await
@@ -1802,7 +1855,7 @@ async fn forge_promoted_files_rewrite_and_remain_exact_across_recovery() {
         &RecoveryTelemetry {
             task_id: landed_task,
             attempt_id: landed_attempt,
-            plan_commits: attempt_plans,
+            plan_commits: attempt_plan_count(&observer, landed_attempt),
             input_files: landed.removed_data.len() as u64,
             output_files: landed.added_data.len() as u64,
             input_bytes: landed.removed_bytes,

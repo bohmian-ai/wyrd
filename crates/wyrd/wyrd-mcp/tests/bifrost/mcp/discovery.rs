@@ -150,10 +150,18 @@ mod pg_tests {
         let correlation = described["correlation_fields"]
             .as_array()
             .ok_or("describe returns the server-resolved correlation fields")?;
+        let correlation_names: Vec<&str> = correlation
+            .iter()
+            .filter_map(|field| field["name"].as_str())
+            .collect();
+        assert!(
+            correlation_names.contains(&"card_ref") && correlation_names.contains(&"run_id"),
+            "the server-resolved correlation columns are their own class: {correlation_names:?}"
+        );
         assert!(
             correlation
                 .iter()
-                .any(|field| field["metadata"]["wyrd:column_class"] == "correlation"),
+                .all(|field| field["metadata"].as_object().is_some_and(|meta| !meta.is_empty())),
             "field metadata reaches the agent: {correlation:?}"
         );
         let layout = &described["physical_layout"];

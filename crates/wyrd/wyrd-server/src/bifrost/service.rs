@@ -67,6 +67,11 @@ async fn authorize_audited(
 /// versus an explicit empty one) still retries cleanly, while a genuinely
 /// different physical layout conflicts.
 ///
+/// `stored_schema` is the provider's own schema rather than anything rebuilt
+/// from the describe response: the managed Bloom floor is decided by which
+/// server-stamped columns the table actually carries, and describe reports
+/// only the managed column a writer may supply itself.
+///
 /// # Errors
 ///
 /// Returns [`wyrd_spec::vala::BifrostError::PhysicalLayoutMismatch`]
@@ -75,22 +80,14 @@ async fn authorize_audited(
 /// stored schema.
 fn assert_registered_layout_matches(
     fqn: &str,
-    existing: &BifrostTableDescription,
+    stored_schema: &arrow::datatypes::Schema,
+    stored_layout: &PhysicalLayoutWire,
     declared: Option<&PhysicalLayoutWire>,
 ) -> Result<(), WyrdError> {
-    let stored_schema = arrow::datatypes::Schema::new(
-        existing
-            .user_fields
-            .iter()
-            .chain(&existing.correlation_fields)
-            .chain(&existing.managed_candidates)
-            .map(convert::field_to_arrow)
-            .collect::<Vec<_>>(),
-    );
     let canonical =
-        vala_bifrost_redux::catalog::layout::PhysicalLayout::resolve(fqn, &stored_schema, declared)
+        vala_bifrost_redux::catalog::layout::PhysicalLayout::resolve(fqn, stored_schema, declared)
             .map_err(WyrdError::from)?;
-    if canonical.to_wire() == existing.physical_layout {
+    if &canonical.to_wire() == stored_layout {
         return Ok(());
     }
     Err(wyrd_spec::vala::BifrostError::PhysicalLayoutMismatch {
@@ -134,7 +131,16 @@ pub async fn register_table(
     match catalog.describe_table(&table, caller.data_tenant_id).await {
         Ok(existing) => {
             if existing.entry.fingerprint == fingerprint {
-                assert_registered_layout_matches(&fqn, &existing, body.physical_layout.as_ref())?;
+                let stored_schema = catalog
+                    .assignment_schema(&table, caller.data_tenant_id)
+                    .await
+                    .map_err(map_engine_error)?;
+                assert_registered_layout_matches(
+                    &fqn,
+                    &stored_schema,
+                    &existing.physical_layout,
+                    body.physical_layout.as_ref(),
+                )?;
                 Ok(RegisterTableResponse {
                     outcome: RegisterOutcome::AlreadyExists,
                     table_uid: existing.entry.table_uid,

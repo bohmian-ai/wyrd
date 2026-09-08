@@ -118,13 +118,6 @@ fn opt_filter_str(
     }
 }
 
-fn opt_filter_u32(df: DataFrame, column: &str, value: Option<u32>) -> Result<DataFrame, WyrdError> {
-    match value {
-        Some(v) => df.filter(col(column).gt_eq(lit(v as i64))).map_err(df_err),
-        None => Ok(df),
-    }
-}
-
 /// Filter spans by the textual OTLP status name used by the public contract.
 ///
 /// The canonical column is the raw `status_code` discriminant, so the request's

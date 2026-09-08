@@ -12,11 +12,13 @@
 //! Physical→API column mapping happens in `extract_*` helpers below.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use arrow::array::{
     Array, BinaryArray, FixedSizeBinaryArray, Float64Array, Int32Array, Int64Array, ListArray,
     RecordBatch, StringArray, StructArray, TimestampMicrosecondArray,
 };
+use arrow::datatypes::{DataType, Field, Schema};
 use axum::Json;
 use axum::Router;
 use axum::extract::{Path, Query, State};
@@ -189,6 +191,67 @@ fn attributes_json(
         .transpose()
 }
 
+/// Narrow one Arrow type's 64-bit byte layouts to their 32-bit spelling.
+///
+/// Returns `None` when nothing changes. The canonical table layer treats
+/// `Utf8`/`LargeUtf8` and `Binary`/`LargeBinary` as one physical shape, so a
+/// stored column may legitimately arrive in either spelling and every reader
+/// below binds to a single one.
+fn narrowed_type(data_type: &DataType) -> Option<DataType> {
+    match data_type {
+        DataType::LargeUtf8 => Some(DataType::Utf8),
+        DataType::LargeBinary => Some(DataType::Binary),
+        DataType::List(child) => narrowed_field(child).map(|f| DataType::List(Arc::new(f))),
+        DataType::Struct(children) => {
+            let narrowed: Vec<_> = children
+                .iter()
+                .map(|child| narrowed_field(child).unwrap_or_else(|| child.as_ref().clone()))
+                .collect();
+            children
+                .iter()
+                .zip(&narrowed)
+                .any(|(before, after)| before.as_ref() != after)
+                .then(|| DataType::Struct(narrowed.into()))
+        }
+        _ => None,
+    }
+}
+
+/// Narrow one Arrow field, preserving its name, nullability, and metadata.
+fn narrowed_field(field: &Field) -> Option<Field> {
+    narrowed_type(field.data_type()).map(|data_type| {
+        Field::new(field.name(), data_type, field.is_nullable())
+            .with_metadata(field.metadata().clone())
+    })
+}
+
+/// Rewrite one collected batch into the byte layouts the extractors bind to.
+///
+/// This is a read-side normalization of an equivalence the storage layer
+/// already declares, applied once per batch so no extractor has to branch on
+/// the spelling of every string or binary column, nested children included.
+///
+/// # Errors
+///
+/// Returns [`WyrdError::Internal`] when Arrow refuses the narrowing cast.
+fn narrow_byte_layouts(batch: &RecordBatch) -> Result<RecordBatch, WyrdError> {
+    let Some(DataType::Struct(fields)) =
+        narrowed_type(&DataType::Struct(batch.schema().fields().clone()))
+    else {
+        return Ok(batch.clone());
+    };
+    let schema = Arc::new(Schema::new(fields).with_metadata(batch.schema().metadata().clone()));
+    let columns = batch
+        .columns()
+        .iter()
+        .zip(schema.fields())
+        .map(|(column, field)| arrow::compute::cast(column, field.data_type()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| stored_shape(format!("stored byte layout is not readable: {error}")))?;
+    RecordBatch::try_new(schema, columns)
+        .map_err(|error| stored_shape(format!("narrowed batch is not constructible: {error}")))
+}
+
 /// Extract every span of one trace with its events and links nested on it.
 ///
 /// The batches were produced by an already-authorized plan, so payload gating
@@ -208,6 +271,7 @@ pub(crate) fn extract_span_rows_filtered(
 ) -> Result<Vec<SpanRow>, WyrdError> {
     let mut rows = Vec::new();
     for batch in batches {
+        let batch = &narrow_byte_layouts(batch)?;
         let trace_id_col = col_fixed_binary(batch, "trace_id");
         let span_id_col = col_fixed_binary(batch, "span_id");
         let parent_span_id_col = col_fixed_binary(batch, "parent_span_id");
@@ -295,10 +359,10 @@ fn extract_span_events(
     let Some(values) = nested_struct(list, row)? else {
         return Ok(None);
     };
-    let time_col = struct_i64(&values, "time_unix_nano")?;
-    let name_col = struct_str(&values, "name")?;
-    let attributes_col = struct_binary(&values, "attributes")?;
-    let dropped_col = struct_i64(&values, "dropped_attributes_count")?;
+    let time_col = struct_child::<Int64Array>(&values, "time_unix_nano")?;
+    let name_col = struct_child::<StringArray>(&values, "name")?;
+    let attributes_col = struct_child::<BinaryArray>(&values, "attributes")?;
+    let dropped_col = struct_child::<Int64Array>(&values, "dropped_attributes_count")?;
     let mut events = Vec::with_capacity(values.len());
     for i in 0..values.len() {
         events.push(SpanEventRow {
@@ -326,12 +390,12 @@ fn extract_span_links(
     let Some(values) = nested_struct(list, row)? else {
         return Ok(None);
     };
-    let trace_id_col = struct_fixed_binary(&values, "trace_id")?;
-    let span_id_col = struct_fixed_binary(&values, "span_id")?;
-    let trace_state_col = struct_str(&values, "trace_state")?;
-    let flags_col = struct_i64(&values, "flags")?;
-    let attributes_col = struct_binary(&values, "attributes")?;
-    let dropped_col = struct_i64(&values, "dropped_attributes_count")?;
+    let trace_id_col = struct_child::<FixedSizeBinaryArray>(&values, "trace_id")?;
+    let span_id_col = struct_child::<FixedSizeBinaryArray>(&values, "span_id")?;
+    let trace_state_col = struct_child::<StringArray>(&values, "trace_state")?;
+    let flags_col = struct_child::<Int64Array>(&values, "flags")?;
+    let attributes_col = struct_child::<BinaryArray>(&values, "attributes")?;
+    let dropped_col = struct_child::<Int64Array>(&values, "dropped_attributes_count")?;
     let mut links = Vec::with_capacity(values.len());
     for i in 0..values.len() {
         links.push(SpanLinkRow {
@@ -360,63 +424,39 @@ fn nested_struct(list: Option<&ListArray>, row: usize) -> Result<Option<StructAr
     let structs = values
         .as_any()
         .downcast_ref::<StructArray>()
-        .ok_or_else(|| stored_shape("nested span child is not a struct"))?;
+        .ok_or_else(|| stored_shape("nested span child is not a struct".to_owned()))?;
     Ok(Some(structs.clone()))
 }
 
-/// Read one nested struct child as `Int64`.
+/// Read one nested struct child as the declared Arrow array type.
+///
+/// Nested children are declared non-null by the canonical ledger, so a missing
+/// or mistyped child means the stored row does not match the table it was
+/// written under rather than that the caller asked for something optional.
 ///
 /// # Errors
 ///
-/// Returns [`WyrdError::Internal`] when the child is missing or mistyped.
-fn struct_i64<'a>(values: &'a StructArray, name: &str) -> Result<&'a Int64Array, WyrdError> {
-    values
-        .column_by_name(name)
-        .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
-        .ok_or_else(|| stored_shape("nested span child is missing an int64 field"))
-}
-
-/// Read one nested struct child as `Utf8`.
-///
-/// # Errors
-///
-/// Returns [`WyrdError::Internal`] when the child is missing or mistyped.
-fn struct_str<'a>(values: &'a StructArray, name: &str) -> Result<&'a StringArray, WyrdError> {
-    values
-        .column_by_name(name)
-        .and_then(|c| c.as_any().downcast_ref::<StringArray>())
-        .ok_or_else(|| stored_shape("nested span child is missing a string field"))
-}
-
-/// Read one nested struct child as `Binary`.
-///
-/// # Errors
-///
-/// Returns [`WyrdError::Internal`] when the child is missing or mistyped.
-fn struct_binary<'a>(values: &'a StructArray, name: &str) -> Result<&'a BinaryArray, WyrdError> {
-    values
-        .column_by_name(name)
-        .and_then(|c| c.as_any().downcast_ref::<BinaryArray>())
-        .ok_or_else(|| stored_shape("nested span child is missing a binary field"))
-}
-
-/// Read one nested struct child as fixed-width binary.
-///
-/// # Errors
-///
-/// Returns [`WyrdError::Internal`] when the child is missing or mistyped.
-fn struct_fixed_binary<'a>(
+/// Returns [`WyrdError::Internal`] naming the child and the type actually
+/// stored when the child is absent or is not `A`.
+fn struct_child<'a, A: Array + 'static>(
     values: &'a StructArray,
     name: &str,
-) -> Result<&'a FixedSizeBinaryArray, WyrdError> {
-    values
-        .column_by_name(name)
-        .and_then(|c| c.as_any().downcast_ref::<FixedSizeBinaryArray>())
-        .ok_or_else(|| stored_shape("nested span child is missing an id field"))
+) -> Result<&'a A, WyrdError> {
+    let Some(column) = values.column_by_name(name) else {
+        return Err(stored_shape(format!(
+            "nested span child `{name}` is missing"
+        )));
+    };
+    column.as_any().downcast_ref::<A>().ok_or_else(|| {
+        stored_shape(format!(
+            "nested span child `{name}` is stored as {}",
+            column.data_type()
+        ))
+    })
 }
 
 /// A stored canonical row does not carry the shape its table declares.
-fn stored_shape(detail: &'static str) -> WyrdError {
+fn stored_shape(detail: String) -> WyrdError {
     WyrdError::Internal {
         message: "stored canonical span does not match its declared schema".to_owned(),
         details: serde_json::json!({ "detail": detail }),
@@ -534,6 +574,7 @@ pub(crate) fn extract_genai_rows(batches: &[RecordBatch]) -> Result<Vec<GenAiRow
 
     let mut rows = Vec::new();
     for batch in batches {
+        let batch = &narrow_byte_layouts(batch)?;
         let conv_col = col_str(batch, "gen_ai_conversation_id");
         let model_col = col_str(batch, "gen_ai_request_model");
         let prov_col = col_str(batch, "gen_ai_provider_name");

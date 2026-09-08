@@ -520,3 +520,505 @@ async fn production_profile_refuses_a_serving_target_with_stub_defaults() {
 
     server.shutdown().await.expect("server shuts down");
 }
+
+// ─── canonical trace and GenAI reads ──────────────────────────────────────────
+
+/// Trace id every fixture span in the canonical read case shares.
+const CANONICAL_TRACE_ID: [u8; 16] = [
+    0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x01,
+];
+
+/// Fixed start timestamp of the generation span, in protocol nanoseconds.
+const GENERATION_START_NANOS: u64 = 1_800_000_000_123_456_789;
+
+/// Fixed end timestamp of the generation span, in protocol nanoseconds.
+const GENERATION_END_NANOS: u64 = 1_800_000_000_987_654_321;
+
+/// Name of the role granting bounded query read without any payload permission.
+const METADATA_ONLY_ROLE: &str = "bifrost_metadata_reader";
+
+/// Build one OTLP string attribute.
+fn otlp_str(key: &str, value: &str) -> wyrd_tonic::otlp::common::v1::KeyValue {
+    use wyrd_tonic::otlp::common::v1::{AnyValue, KeyValue, any_value};
+    KeyValue {
+        key: key.to_owned(),
+        value: Some(AnyValue {
+            value: Some(any_value::Value::StringValue(value.to_owned())),
+        }),
+    }
+}
+
+/// Build one OTLP signed-integer attribute.
+fn otlp_int(key: &str, value: i64) -> wyrd_tonic::otlp::common::v1::KeyValue {
+    use wyrd_tonic::otlp::common::v1::{AnyValue, KeyValue, any_value};
+    KeyValue {
+        key: key.to_owned(),
+        value: Some(AnyValue {
+            value: Some(any_value::Value::IntValue(value)),
+        }),
+    }
+}
+
+/// Build one structured GenAI message list attribute.
+///
+/// Each element is a keyvalue list carrying a `role` and a `content` string, so
+/// the decoded public value is an array of objects rather than a stringified
+/// blob.
+fn otlp_messages(key: &str, turns: &[(&str, &str)]) -> wyrd_tonic::otlp::common::v1::KeyValue {
+    use wyrd_tonic::otlp::common::v1::{AnyValue, ArrayValue, KeyValue, KeyValueList, any_value};
+    KeyValue {
+        key: key.to_owned(),
+        value: Some(AnyValue {
+            value: Some(any_value::Value::ArrayValue(ArrayValue {
+                values: turns
+                    .iter()
+                    .map(|(role, content)| AnyValue {
+                        value: Some(any_value::Value::KvlistValue(KeyValueList {
+                            values: vec![otlp_str("role", role), otlp_str("content", content)],
+                        })),
+                    })
+                    .collect(),
+            })),
+        }),
+    }
+}
+
+/// Build the OTLP export payload the canonical read case ingests.
+///
+/// One `chat` generation span carries promoted GenAI metadata, structured
+/// input/output messages, one event and one link. Three sibling spans use
+/// operation names outside the approved generation set, so they belong to the
+/// same trace but must never appear in a GenAI generation search.
+fn canonical_trace_export() -> wyrd_tonic::otlp::trace_service::ExportTraceServiceRequest {
+    use wyrd_tonic::otlp::resource::v1::Resource;
+    use wyrd_tonic::otlp::trace::v1::{ResourceSpans, ScopeSpans, Span, Status, span, status};
+    use wyrd_tonic::otlp::trace_service::ExportTraceServiceRequest;
+
+    let generation = Span {
+        trace_id: CANONICAL_TRACE_ID.to_vec(),
+        span_id: 1_u64.to_be_bytes().to_vec(),
+        name: "chat gpt-canonical".to_owned(),
+        kind: span::SpanKind::Client.into(),
+        start_time_unix_nano: GENERATION_START_NANOS,
+        end_time_unix_nano: GENERATION_END_NANOS,
+        status: Some(Status {
+            code: status::StatusCode::Ok.into(),
+            message: "generation completed".to_owned(),
+        }),
+        attributes: vec![
+            otlp_str("gen_ai.operation.name", "chat"),
+            otlp_str("gen_ai.provider.name", "openai"),
+            otlp_str("gen_ai.request.model", "gpt-canonical"),
+            otlp_str("gen_ai.conversation.id", "conversation-canonical"),
+            otlp_int("gen_ai.usage.input_tokens", 41),
+            otlp_int("gen_ai.usage.output_tokens", 17),
+            otlp_messages("gen_ai.input.messages", &[("user", "what is wyrd?")]),
+            otlp_messages("gen_ai.output.messages", &[("assistant", "an AI layer")]),
+        ],
+        events: vec![span::Event {
+            time_unix_nano: GENERATION_START_NANOS.saturating_add(5),
+            name: "first_token".to_owned(),
+            attributes: vec![otlp_int("token.index", 0)],
+            dropped_attributes_count: 0,
+        }],
+        links: vec![span::Link {
+            trace_id: CANONICAL_TRACE_ID.to_vec(),
+            span_id: 2_u64.to_be_bytes().to_vec(),
+            attributes: vec![otlp_str("link.kind", "follows_from")],
+            ..span::Link::default()
+        }],
+        ..Span::default()
+    };
+
+    let excluded = ["embeddings", "invoke_agent", "execute_tool"]
+        .into_iter()
+        .enumerate()
+        .map(|(index, operation)| Span {
+            trace_id: CANONICAL_TRACE_ID.to_vec(),
+            span_id: (index as u64 + 2).to_be_bytes().to_vec(),
+            name: operation.to_owned(),
+            kind: span::SpanKind::Internal.into(),
+            start_time_unix_nano: GENERATION_START_NANOS,
+            end_time_unix_nano: GENERATION_END_NANOS,
+            attributes: vec![
+                otlp_str("gen_ai.operation.name", operation),
+                otlp_str("gen_ai.request.model", "gpt-canonical"),
+            ],
+            ..Span::default()
+        });
+
+    ExportTraceServiceRequest {
+        resource_spans: vec![ResourceSpans {
+            resource: Some(Resource {
+                attributes: vec![otlp_str("service.name", "canonical-read-case")],
+                ..Resource::default()
+            }),
+            scope_spans: vec![ScopeSpans {
+                spans: std::iter::once(generation).chain(excluded).collect(),
+                ..ScopeSpans::default()
+            }],
+            ..ResourceSpans::default()
+        }],
+    }
+}
+
+/// Build one caller holding exactly the supplied permissions in `tenant`.
+fn caller_with(
+    tenant: wyrd_spec::DataTenantId,
+    permissions: impl IntoIterator<Item = wyrd_runtime::Permission>,
+) -> wyrd_server::components::auth::Caller {
+    use wyrd_runtime::Principal;
+    use wyrd_runtime::permission::PermissionSet;
+    use wyrd_runtime::principal::{PrincipalId, PrincipalKind};
+    use wyrd_spec::request_id::RequestId;
+
+    wyrd_server::components::auth::Caller {
+        data_tenant_id: tenant,
+        principal: Principal::new(
+            PrincipalId::new(uuid::Uuid::now_v7()),
+            PrincipalKind::User,
+            tenant,
+            Vec::new(),
+            PermissionSet::from_iter(permissions),
+        ),
+        request_id: RequestId::now_v7(),
+        delegation_chain: Vec::new(),
+    }
+}
+
+/// Collect the projected output column names of one built plan.
+fn plan_columns(plan: &datafusion::logical_expr::LogicalPlan) -> Vec<String> {
+    plan.schema()
+        .fields()
+        .iter()
+        .map(|field| field.name().clone())
+        .collect()
+}
+
+/// Read a JSON response body, requiring the supplied status.
+async fn json_body(response: axum::response::Response, expected: StatusCode) -> serde_json::Value {
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body collects");
+    assert_eq!(
+        status,
+        expected,
+        "unexpected status; body was {}",
+        String::from_utf8_lossy(&body)
+    );
+    serde_json::from_slice(&body).expect("JSON body")
+}
+
+/// Canonical trace and GenAI reads must classify generations through promoted
+/// columns and gate every payload column before any storage read.
+///
+/// The case ingests one real OTLP export through the production `/v1/traces`
+/// route, then compares the plans and the served responses of a payload-bearing
+/// caller against a caller holding only `bifrost_query:read`. The unauthorized
+/// plan must not project `attributes`, `events`, `links`, or the resource/scope
+/// payload at all — the gate is a projection decision taken before IO, not a
+/// redaction applied after reading.
+#[tokio::test]
+async fn canonical_trace_and_genai_queries_filter_promotions_before_payload_projection() {
+    use wyrd_runtime::{Permission, Resource};
+    use wyrd_server::vala_query::service::{build_get_trace_plan, build_query_genai_plan};
+    use wyrd_spec::vala::api::{GetTraceRequest, QueryGenAiRequest, QueryWindow};
+    use wyrd_tonic::prost::Message;
+
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let tenant = server.data_tenant_id();
+    let admin = server
+        .bootstrap_user("canonical-reads-admin", &["admin"])
+        .await
+        .expect("admin bootstraps");
+
+    // A metadata-only reader is not a builtin role: query read without any
+    // payload permission is exactly the identity this case has to contrast.
+    let mut conn = server
+        .tenant_conn_for(tenant)
+        .await
+        .expect("tenant connection");
+    sqlx::query(
+        "INSERT INTO wyrd.auth_roles (id, data_tenant_id, name, permissions, builtin) \
+         VALUES ($1, $2, $3, $4, FALSE)",
+    )
+    .bind(uuid::Uuid::now_v7())
+    .bind(tenant.as_uuid())
+    .bind(METADATA_ONLY_ROLE)
+    .bind(serde_json::json!([{ "resource": "bifrost_query", "action": "read" }]))
+    .execute(&mut **conn.transaction())
+    .await
+    .expect("metadata-only role inserts");
+    conn.commit().await.expect("role commits");
+
+    let metadata_only = server
+        .bootstrap_user("canonical-reads-metadata", &[METADATA_ONLY_ROLE])
+        .await
+        .expect("metadata-only user bootstraps");
+
+    let export = canonical_trace_export().encode_to_vec();
+    let ingest = server
+        .oneshot_authenticated(
+            admin.jwt().expect("admin carries a token"),
+            Request::builder()
+                .method("POST")
+                .uri("/v1/traces")
+                .header("content-type", "application/x-protobuf")
+                .body(axum::body::Body::from(export))
+                .expect("request builds"),
+        )
+        .await
+        .expect("router responds");
+    assert_eq!(ingest.status(), StatusCode::OK, "OTLP export is accepted");
+    server.flush_bifrost().await.expect("spans become readable");
+
+    let trace_hex = CANONICAL_TRACE_ID
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+
+    // ── plan shape: the payload gate is a projection taken before IO ──
+    let payload_caller = caller_with(
+        tenant,
+        [
+            Permission::bifrost_query_read(),
+            Permission {
+                resource: Resource::BifrostTracePayload,
+                action: wyrd_runtime::Action::Read,
+            },
+            Permission {
+                resource: Resource::BifrostGenAiPayload,
+                action: wyrd_runtime::Action::Read,
+            },
+        ],
+    );
+    let bounded_caller = caller_with(tenant, [Permission::bifrost_query_read()]);
+    let trace_request = GetTraceRequest {
+        trace_id: trace_hex.clone(),
+        since: None,
+        until: None,
+    };
+
+    let authorized_trace_plan =
+        build_get_trace_plan(server.state(), &payload_caller, &trace_request)
+            .await
+            .expect("authorized trace plan builds");
+    let bounded_trace_plan = build_get_trace_plan(server.state(), &bounded_caller, &trace_request)
+        .await
+        .expect("bounded trace plan builds");
+    let authorized_columns = plan_columns(&authorized_trace_plan);
+    let bounded_columns = plan_columns(&bounded_trace_plan);
+    for gated in [
+        "attributes",
+        "events",
+        "links",
+        "resource_attributes",
+        "scope_attributes",
+    ] {
+        assert!(
+            authorized_columns.iter().any(|name| name == gated),
+            "authorized trace plan must project {gated}"
+        );
+        assert!(
+            !bounded_columns.iter().any(|name| name == gated),
+            "bounded trace plan must never project {gated}"
+        );
+    }
+    for unprojected in ["resource_entity_refs"] {
+        assert!(
+            !authorized_columns.iter().any(|name| name == unprojected),
+            "no trace plan returns {unprojected}"
+        );
+    }
+    assert!(
+        bounded_columns.iter().any(|name| name == "span_id"),
+        "bounded trace plan still returns span metadata"
+    );
+
+    let genai_request = QueryGenAiRequest {
+        window: QueryWindow::default(),
+        conversation_id: None,
+        model: None,
+        provider: None,
+    };
+    let authorized_genai_plan =
+        build_query_genai_plan(server.state(), &payload_caller, &genai_request)
+            .await
+            .expect("authorized GenAI plan builds");
+    let bounded_genai_plan =
+        build_query_genai_plan(server.state(), &bounded_caller, &genai_request)
+            .await
+            .expect("bounded GenAI plan builds");
+    assert_eq!(
+        plan_columns(&bounded_genai_plan),
+        vec![
+            "start_time_unix_nano",
+            "gen_ai_conversation_id",
+            "gen_ai_request_model",
+            "gen_ai_provider_name",
+            "gen_ai_usage_input_tokens",
+            "gen_ai_usage_output_tokens",
+        ],
+        "a bounded GenAI search projects promotions only"
+    );
+    assert_eq!(
+        plan_columns(&authorized_genai_plan)
+            .last()
+            .map(String::as_str),
+        Some("attributes"),
+        "the canonical message payload is added only for an authorized caller"
+    );
+    let plan_text = format!("{}", authorized_genai_plan.display_indent());
+    for operation in ["chat", "generate_content", "text_completion"] {
+        assert!(
+            plan_text.contains(operation),
+            "generation membership must bind {operation} in the plan"
+        );
+    }
+    for excluded in ["embeddings", "invoke_agent", "execute_tool"] {
+        assert!(
+            !plan_text.contains(excluded),
+            "{excluded} is not an approved generation operation"
+        );
+    }
+    assert!(
+        plan_text.contains("gen_ai_operation_name"),
+        "classification binds the promoted column, never the attributes payload"
+    );
+
+    // ── served responses ──
+    let authorized_trace = json_body(
+        server
+            .oneshot_authenticated(
+                admin.jwt().expect("admin carries a token"),
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/v1/traces/{trace_hex}"))
+                    .body(axum::body::Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("router responds"),
+        StatusCode::OK,
+    )
+    .await;
+    let spans = authorized_trace["trace"]["spans"]
+        .as_array()
+        .expect("spans array");
+    assert_eq!(spans.len(), 4, "the complete trace cut returns every span");
+    let generation = spans
+        .iter()
+        .find(|span| span["name"] == "chat gpt-canonical")
+        .expect("generation span is served");
+    assert_eq!(generation["start_time_unix_nano"], GENERATION_START_NANOS);
+    assert_eq!(generation["end_time_unix_nano"], GENERATION_END_NANOS);
+    assert_eq!(
+        generation["duration_nano"],
+        GENERATION_END_NANOS - GENERATION_START_NANOS
+    );
+    assert_eq!(generation["service_name"], "canonical-read-case");
+    assert_eq!(
+        generation["attributes"]["gen_ai.request.model"],
+        "gpt-canonical"
+    );
+    assert_eq!(generation["events"][0]["name"], "first_token");
+    assert_eq!(generation["events"][0]["attributes"]["token.index"], 0);
+    assert_eq!(generation["links"][0]["linked_trace_id"], trace_hex);
+    assert_eq!(
+        generation["links"][0]["attributes"]["link.kind"],
+        "follows_from"
+    );
+
+    let bounded_trace = json_body(
+        server
+            .oneshot_authenticated(
+                metadata_only.jwt().expect("reader carries a token"),
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/v1/traces/{trace_hex}"))
+                    .body(axum::body::Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("router responds"),
+        StatusCode::OK,
+    )
+    .await;
+    let bounded_spans = bounded_trace["trace"]["spans"]
+        .as_array()
+        .expect("spans array");
+    assert_eq!(bounded_spans.len(), 4, "metadata stays fully visible");
+    for span in bounded_spans {
+        assert!(span["name"].is_string(), "span metadata is served");
+        for gated in ["attributes", "events", "links", "resource_attributes"] {
+            assert!(
+                span.get(gated).is_none(),
+                "{gated} must be omitted without BifrostTracePayload:Read"
+            );
+        }
+    }
+
+    let authorized_genai = json_body(
+        server
+            .oneshot_authenticated(
+                admin.jwt().expect("admin carries a token"),
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/genai/query")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from("{}"))
+                    .expect("request builds"),
+            )
+            .await
+            .expect("router responds"),
+        StatusCode::OK,
+    )
+    .await;
+    let rows = authorized_genai["rows"].as_array().expect("rows array");
+    assert_eq!(
+        rows.len(),
+        1,
+        "only the approved generation operations are generations"
+    );
+    assert_eq!(rows[0]["model"], "gpt-canonical");
+    assert_eq!(rows[0]["provider"], "openai");
+    assert_eq!(rows[0]["conversation_id"], "conversation-canonical");
+    assert_eq!(rows[0]["input_tokens"], 41);
+    assert_eq!(rows[0]["output_tokens"], 17);
+    assert_eq!(rows[0]["start_time_unix_nano"], GENERATION_START_NANOS);
+    assert_eq!(rows[0]["input_messages"][0]["role"], "user");
+    assert_eq!(rows[0]["input_messages"][0]["content"], "what is wyrd?");
+    assert_eq!(rows[0]["output_messages"][0]["role"], "assistant");
+    assert_eq!(rows[0]["output_messages"][0]["content"], "an AI layer");
+
+    let bounded_genai = json_body(
+        server
+            .oneshot_authenticated(
+                metadata_only.jwt().expect("reader carries a token"),
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/genai/query")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from("{}"))
+                    .expect("request builds"),
+            )
+            .await
+            .expect("router responds"),
+        StatusCode::OK,
+    )
+    .await;
+    let bounded_rows = bounded_genai["rows"].as_array().expect("rows array");
+    assert_eq!(bounded_rows.len(), 1, "promotions stay searchable");
+    assert_eq!(bounded_rows[0]["model"], "gpt-canonical");
+    for gated in ["input_messages", "output_messages"] {
+        assert!(
+            bounded_rows[0].get(gated).is_none(),
+            "{gated} must be omitted without BifrostGenAiPayload:Read"
+        );
+    }
+
+    server.shutdown().await.expect("server shuts down");
+}

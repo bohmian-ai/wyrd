@@ -113,31 +113,19 @@ pub(crate) fn attributes_to_json(bytes: &[u8]) -> Result<serde_json::Value, Wyrd
     key_value_list_to_json(&list, ByteRule::Tagged)
 }
 
-/// Decode one stored canonical `AnyValue` into the structured message contract.
-///
-/// This is the `gen_ai.input.messages` / `gen_ai.output.messages` projection:
-/// the value keeps its array order, object structure, scalar types, and nulls,
-/// and a shape the public JSON contract cannot express is refused rather than
-/// flattened into a string.
-///
-/// # Errors
-///
-/// Returns [`WyrdError::Internal`] when the stored bytes are not an `AnyValue`
-/// or carry a byte string or non-finite double.
-pub(crate) fn structured_message_to_json(bytes: &[u8]) -> Result<serde_json::Value, WyrdError> {
-    let value =
-        AnyValue::decode(bytes).map_err(|_| corrupt("stored GenAI messages are not decodable"))?;
-    any_value_to_json(&value, ByteRule::Reject)
-}
-
 /// Look one canonical attribute up by key and project it as structured JSON.
 ///
 /// Returns `None` when the key is absent. The final occurrence wins, matching
 /// the ingest-side lookup rule.
 ///
+/// The value keeps its array order, object structure, scalar types, and nulls;
+/// a shape the public JSON contract cannot express is refused rather than
+/// flattened into a string.
+///
 /// # Errors
 ///
-/// Propagates the failures documented on [`structured_message_to_json`].
+/// Returns [`WyrdError::Internal`] when the stored value carries a byte string
+/// or a non-finite double.
 pub(crate) fn structured_attribute(
     attributes: &KeyValueList,
     key: &str,
@@ -223,18 +211,34 @@ mod tests {
                 AnyValue { value: None },
             ],
         }));
-        let encoded = value.encode_to_vec();
+        let messages = KeyValueList {
+            values: vec![KeyValue {
+                key: "gen_ai.input.messages".to_owned(),
+                value: Some(value),
+            }],
+        };
         assert_eq!(
-            structured_message_to_json(&encoded).expect("structured message decodes"),
-            serde_json::json!([
+            structured_attribute(&messages, "gen_ai.input.messages")
+                .expect("structured message decodes"),
+            Some(serde_json::json!([
                 { "role": "user", "n": 7, "score": 1.5, "flag": true, "missing": null },
                 null
-            ])
+            ]))
+        );
+        assert_eq!(
+            structured_attribute(&messages, "gen_ai.output.messages").expect("absent key"),
+            None,
+            "an absent message key is absent, never an empty list"
         );
 
-        let bytes_value = any(Value::BytesValue(vec![1, 2, 3])).encode_to_vec();
+        let bytes_messages = KeyValueList {
+            values: vec![KeyValue {
+                key: "gen_ai.input.messages".to_owned(),
+                value: Some(any(Value::BytesValue(vec![1, 2, 3]))),
+            }],
+        };
         assert!(
-            structured_message_to_json(&bytes_value).is_err(),
+            structured_attribute(&bytes_messages, "gen_ai.input.messages").is_err(),
             "a stored byte string must be refused, never stringified"
         );
     }

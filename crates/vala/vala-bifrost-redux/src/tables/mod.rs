@@ -731,13 +731,13 @@ mod tests {
     use super::*;
     use wyrd_spec::vala::{CARD_UID, PRINCIPAL_ID, RUN_ID};
 
-    /// The registry owns three OTel signal tables and no removed physical name.
+    /// The registry owns three `OTel` signal tables and no removed physical name.
     ///
-    /// The trace-child and GenAI tables were registered physical schemas that
-    /// no writer ever filled; a canonical span now carries its own events,
-    /// links, and GenAI promotions. Absence is enforced here by the closed
-    /// registry itself: a removed name cannot resolve, so nothing downstream
-    /// can create, query, or maintain it.
+    /// The trace-child and `GenAI` tables were registered physical schemas
+    /// that no writer ever filled; a canonical span now carries its own
+    /// events, links, and `GenAI` promotions. Absence is enforced here by the
+    /// closed registry itself: a removed name cannot resolve, so nothing
+    /// downstream can create, query, or maintain it.
     ///
     /// # Panics
     ///

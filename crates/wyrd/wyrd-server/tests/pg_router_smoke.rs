@@ -827,12 +827,12 @@ async fn canonical_trace_and_genai_queries_filter_promotions_before_payload_proj
             "bounded trace plan must never project {gated}"
         );
     }
-    for unprojected in ["resource_entity_refs"] {
-        assert!(
-            !authorized_columns.iter().any(|name| name == unprojected),
-            "no trace plan returns {unprojected}"
-        );
-    }
+    assert!(
+        !authorized_columns
+            .iter()
+            .any(|name| name == "resource_entity_refs"),
+        "no trace plan returns resource_entity_refs"
+    );
     assert!(
         bounded_columns.iter().any(|name| name == "span_id"),
         "bounded trace plan still returns span metadata"

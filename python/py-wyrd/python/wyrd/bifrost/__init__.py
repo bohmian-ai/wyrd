@@ -199,16 +199,22 @@ class BifrostQueryClient:
     ) -> GenAiPage:
         """Read one page of GenAI generation records."""
 
-        return await asyncio.to_thread(
-            self._native.query_genai,
-            since.isoformat() if since is not None else None,
-            until.isoformat() if until is not None else None,
-            limit,
-            page_token,
-            conversation_id,
-            model,
-            provider,
-        )
+        request: dict[str, object] = {}
+        if since is not None:
+            request["since"] = since.isoformat()
+        if until is not None:
+            request["until"] = until.isoformat()
+        if limit is not None:
+            request["limit"] = limit
+        if page_token is not None:
+            request["page_token"] = page_token
+        if conversation_id is not None:
+            request["conversation_id"] = conversation_id
+        if model is not None:
+            request["model"] = model
+        if provider is not None:
+            request["provider"] = provider
+        return await asyncio.to_thread(self._native.query_genai, json.dumps(request))
 
     async def insert_batch(
         self,

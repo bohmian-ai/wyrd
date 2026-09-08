@@ -992,16 +992,15 @@ impl BifrostCatalog {
         // ledger's after the first nested column — and it is the ledger's ids
         // that Scribe enforces on every stamped canonical batch. Describing the
         // stored ids would hand a writer a schema its own batches fail against.
-        let arrow_schema = match builtin {
-            Some(definition) => (definition.schema)(),
-            None => {
-                let binding = TenantTableBinding::resolve((tenant, table.clone()))
-                    .map_err(|error| BifrostCatalogError::InvalidBinding(error.to_string()))?;
-                let iceberg_table = self.catalog.load_table(&binding.table_ident()).await?;
-                Arc::new(iceberg::arrow::schema_to_arrow_schema(
-                    iceberg_table.metadata().current_schema(),
-                )?)
-            }
+        let arrow_schema = if let Some(definition) = builtin {
+            (definition.schema)()
+        } else {
+            let binding = TenantTableBinding::resolve((tenant, table.clone()))
+                .map_err(|error| BifrostCatalogError::InvalidBinding(error.to_string()))?;
+            let iceberg_table = self.catalog.load_table(&binding.table_ident()).await?;
+            Arc::new(iceberg::arrow::schema_to_arrow_schema(
+                iceberg_table.metadata().current_schema(),
+            )?)
         };
         let described = described_fields_from_stored_schema(&arrow_schema)?;
         Ok(BifrostTableDescription {
@@ -1011,7 +1010,7 @@ impl BifrostCatalog {
             managed_candidates: described.managed_candidates,
             canonical_physical_fingerprint: builtin
                 .and_then(|definition| (definition.canonical_physical_fingerprint)())
-                .map(|fingerprint| fingerprint.to_hex()),
+                .map(crate::tables::CanonicalPhysicalFingerprint::to_hex),
             physical_layout: layout_wire_from_row(&row)?,
         })
     }

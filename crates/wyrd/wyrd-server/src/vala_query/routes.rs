@@ -172,7 +172,7 @@ fn req_str(arr: Option<&StringArray>, i: usize) -> String {
 ///
 /// `None` distinguishes "the plan did not project this column" — the shape an
 /// unauthorized payload projection produces — from a present empty payload.
-fn get_binary<'a>(arr: Option<&'a BinaryArray>, i: usize) -> Option<&'a [u8]> {
+fn get_binary(arr: Option<&BinaryArray>, i: usize) -> Option<&[u8]> {
     arr.filter(|a| !a.is_null(i)).map(|a| a.value(i))
 }
 

@@ -80,11 +80,11 @@ pub fn writable_schema(
         .user_fields
         .iter()
         .chain(&description.correlation_fields)
-        .chain(
-            include_event_time
-                .then_some(description.managed_candidates.as_slice())
-                .unwrap_or_default(),
-        );
+        .chain(if include_event_time {
+            description.managed_candidates.as_slice()
+        } else {
+            &[]
+        });
     let mut fields = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
     for spec in declared {

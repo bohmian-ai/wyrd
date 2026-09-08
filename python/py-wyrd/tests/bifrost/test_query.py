@@ -316,7 +316,10 @@ def test_typed_trace_and_genai_client_contracts() -> None:
         "get_trace",
         ("0102030405060708090a0b0c0d0e0f10", "2026-07-01T00:00:00+00:00", None),
     )
-    assert calls[1] == ("query_genai", (None, None, 10, None, None, "gpt-4o", None))
+    assert calls[1] == (
+        "query_genai",
+        ('{"limit": 10, "model": "gpt-4o"}',),
+    )
 
     spans = trace["trace"]["spans"]
     assert len(spans) == 1

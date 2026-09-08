@@ -569,7 +569,7 @@ impl NativeBifrostQueryClient {
         }
     }
 
-    /// Reads one page of GenAI generation records.
+    /// Reads one page of `GenAI` generation records.
     ///
     /// # Errors
     ///
@@ -626,6 +626,9 @@ impl NativeBifrostQueryClient {
     /// Returns a napi error when `description_json` is not one describe
     /// response, when the description declares a column the write path already
     /// appends, or when the schema cannot be encoded.
+    // justification: napi boundary; a JavaScript string is primitive and cannot
+    // be passed by reference, so the generated binding requires an owned String
+    #[allow(clippy::needless_pass_by_value)]
     #[napi]
     pub fn writable_schema_ipc(
         &self,
@@ -689,7 +692,7 @@ impl NativeBifrostQueryClient {
     }
 }
 
-/// GenAI filter request as JavaScript sends it.
+/// `GenAI` filter request as JavaScript sends it.
 ///
 /// Window bounds arrive as RFC 3339 text because napi has no native chrono
 /// projection; every field is optional so an unfiltered page is the default.

@@ -23,7 +23,7 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
     BifrostQueryRequest, BifrostTableDescription, FreshnessPolicy, GetTraceRequest,
-    QueryGenAiRequest, QueryWindow, VisibilityMode,
+    QueryGenAiRequest, VisibilityMode,
 };
 use wyrd_utils::py::json_to_pyobject;
 
@@ -359,42 +359,19 @@ impl PyBifrostQueryClient {
 
     /// Reads one page of GenAI generation records.
     ///
+    /// The request arrives as one serialized [`QueryGenAiRequest`] so the
+    /// wire contract stays the single source of the filter set; the Python
+    /// wrapper owns the keyword-argument ergonomics.
+    ///
     /// # Errors
     ///
-    /// Raises a typed Bifrost query error for transport, authorization, or
-    /// validation failures, and `ValueError` when a bound is not an RFC 3339
-    /// timestamp.
-    #[pyo3(signature = (
-        since=None,
-        until=None,
-        limit=None,
-        page_token=None,
-        conversation_id=None,
-        model=None,
-        provider=None
-    ))]
-    fn query_genai(
-        &self,
-        py: Python<'_>,
-        since: Option<&str>,
-        until: Option<&str>,
-        limit: Option<u32>,
-        page_token: Option<String>,
-        conversation_id: Option<String>,
-        model: Option<String>,
-        provider: Option<String>,
-    ) -> PyResult<Py<PyAny>> {
-        let request = QueryGenAiRequest {
-            window: QueryWindow {
-                since: parse_window_bound(since, "since")?,
-                until: parse_window_bound(until, "until")?,
-                limit,
-                page_token,
-            },
-            conversation_id,
-            model,
-            provider,
-        };
+    /// Raises `ValueError` when `request_json` is not one GenAI query
+    /// request, and a typed Bifrost query error for transport,
+    /// authorization, or validation failures.
+    #[pyo3(signature = (request_json))]
+    fn query_genai(&self, py: Python<'_>, request_json: &str) -> PyResult<Py<PyAny>> {
+        let request: QueryGenAiRequest = serde_json::from_str(request_json)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
         let response = py
             .detach(|| wyrd_runtime::runtime().block_on(self.client.query_genai(&request)))
             .map_err(query_error_to_py)?;

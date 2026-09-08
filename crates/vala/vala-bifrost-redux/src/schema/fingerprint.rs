@@ -84,7 +84,7 @@ fn hash_tag(hasher: &mut Sha256, tag: &str) {
 }
 
 /// Hash one Arrow time unit as its own stable tag.
-fn hash_time_unit(hasher: &mut Sha256, unit: &TimeUnit) {
+fn hash_time_unit(hasher: &mut Sha256, unit: TimeUnit) {
     hash_tag(
         hasher,
         match unit {
@@ -96,38 +96,84 @@ fn hash_time_unit(hasher: &mut Sha256, unit: &TimeUnit) {
     );
 }
 
+/// Hash one tagged type that carries a single time unit.
+fn hash_timed(hasher: &mut Sha256, tag: &str, unit: TimeUnit) {
+    hash_tag(hasher, tag);
+    hash_time_unit(hasher, unit);
+}
+
+/// Hash one tagged type that wraps exactly one child field.
+fn hash_nested(hasher: &mut Sha256, tag: &str, child: &Field) {
+    hash_tag(hasher, tag);
+    hash_exact_field(hasher, child);
+}
+
+/// Return the stable tag of every Arrow type that carries no parameters.
+///
+/// Returning `None` for a parameterized type is what keeps the layout encoding
+/// honest: this match is exhaustive, so an Arrow upgrade that adds a variant
+/// fails to compile here instead of silently fingerprinting as an existing
+/// layout.
+fn parameterless_tag(data_type: &DataType) -> Option<&'static str> {
+    Some(match data_type {
+        DataType::Null => "null",
+        DataType::Boolean => "bool",
+        DataType::Int8 => "i8",
+        DataType::Int16 => "i16",
+        DataType::Int32 => "i32",
+        DataType::Int64 => "i64",
+        DataType::UInt8 => "u8",
+        DataType::UInt16 => "u16",
+        DataType::UInt32 => "u32",
+        DataType::UInt64 => "u64",
+        DataType::Float16 => "f16",
+        DataType::Float32 => "f32",
+        DataType::Float64 => "f64",
+        DataType::Date32 => "date32",
+        DataType::Date64 => "date64",
+        DataType::Binary => "binary",
+        DataType::LargeBinary => "large-binary",
+        DataType::BinaryView => "binary-view",
+        DataType::Utf8 => "utf8",
+        DataType::LargeUtf8 => "large-utf8",
+        DataType::Utf8View => "utf8-view",
+        DataType::Timestamp(_, _)
+        | DataType::Time32(_)
+        | DataType::Time64(_)
+        | DataType::Duration(_)
+        | DataType::Interval(_)
+        | DataType::FixedSizeBinary(_)
+        | DataType::List(_)
+        | DataType::ListView(_)
+        | DataType::LargeList(_)
+        | DataType::LargeListView(_)
+        | DataType::FixedSizeList(_, _)
+        | DataType::Struct(_)
+        | DataType::Union(_, _)
+        | DataType::Dictionary(_, _)
+        | DataType::Decimal32(_, _)
+        | DataType::Decimal64(_, _)
+        | DataType::Decimal128(_, _)
+        | DataType::Decimal256(_, _)
+        | DataType::Map(_, _)
+        | DataType::RunEndEncoded(_, _) => return None,
+    })
+}
+
 /// Hash one Arrow data type exactly, recursing into every nested child.
 ///
 /// Every variant writes its own tag before its parameters, so no parameter
-/// encoding can be confused with another variant's. The match is exhaustive on
-/// purpose: an Arrow upgrade that adds a layout must fail to compile here
-/// rather than silently fingerprint to an existing one.
+/// encoding can be confused with another variant's.
+///
+/// # Panics
+///
+/// Panics when a type is neither parameterless nor one of the parameterized
+/// variants below, which [`parameterless_tag`]'s exhaustive match makes
+/// unreachable.
 fn hash_exact_type(hasher: &mut Sha256, data_type: &DataType) {
     match data_type {
-        DataType::Null => hash_tag(hasher, "null"),
-        DataType::Boolean => hash_tag(hasher, "bool"),
-        DataType::Int8 => hash_tag(hasher, "i8"),
-        DataType::Int16 => hash_tag(hasher, "i16"),
-        DataType::Int32 => hash_tag(hasher, "i32"),
-        DataType::Int64 => hash_tag(hasher, "i64"),
-        DataType::UInt8 => hash_tag(hasher, "u8"),
-        DataType::UInt16 => hash_tag(hasher, "u16"),
-        DataType::UInt32 => hash_tag(hasher, "u32"),
-        DataType::UInt64 => hash_tag(hasher, "u64"),
-        DataType::Float16 => hash_tag(hasher, "f16"),
-        DataType::Float32 => hash_tag(hasher, "f32"),
-        DataType::Float64 => hash_tag(hasher, "f64"),
-        DataType::Date32 => hash_tag(hasher, "date32"),
-        DataType::Date64 => hash_tag(hasher, "date64"),
-        DataType::Binary => hash_tag(hasher, "binary"),
-        DataType::LargeBinary => hash_tag(hasher, "large-binary"),
-        DataType::BinaryView => hash_tag(hasher, "binary-view"),
-        DataType::Utf8 => hash_tag(hasher, "utf8"),
-        DataType::LargeUtf8 => hash_tag(hasher, "large-utf8"),
-        DataType::Utf8View => hash_tag(hasher, "utf8-view"),
         DataType::Timestamp(unit, zone) => {
-            hash_tag(hasher, "timestamp");
-            hash_time_unit(hasher, unit);
+            hash_timed(hasher, "timestamp", *unit);
             match zone {
                 Some(zone) => {
                     hash_tag(hasher, "zoned");
@@ -136,18 +182,9 @@ fn hash_exact_type(hasher: &mut Sha256, data_type: &DataType) {
                 None => hash_tag(hasher, "naive"),
             }
         }
-        DataType::Time32(unit) => {
-            hash_tag(hasher, "time32");
-            hash_time_unit(hasher, unit);
-        }
-        DataType::Time64(unit) => {
-            hash_tag(hasher, "time64");
-            hash_time_unit(hasher, unit);
-        }
-        DataType::Duration(unit) => {
-            hash_tag(hasher, "duration");
-            hash_time_unit(hasher, unit);
-        }
+        DataType::Time32(unit) => hash_timed(hasher, "time32", *unit),
+        DataType::Time64(unit) => hash_timed(hasher, "time64", *unit),
+        DataType::Duration(unit) => hash_timed(hasher, "duration", *unit),
         DataType::Interval(unit) => {
             hash_tag(hasher, "interval");
             hash_tag(
@@ -163,22 +200,10 @@ fn hash_exact_type(hasher: &mut Sha256, data_type: &DataType) {
             hash_tag(hasher, "fixed-size-binary");
             hasher.update(width.to_le_bytes());
         }
-        DataType::List(child) => {
-            hash_tag(hasher, "list");
-            hash_exact_field(hasher, child);
-        }
-        DataType::ListView(child) => {
-            hash_tag(hasher, "list-view");
-            hash_exact_field(hasher, child);
-        }
-        DataType::LargeList(child) => {
-            hash_tag(hasher, "large-list");
-            hash_exact_field(hasher, child);
-        }
-        DataType::LargeListView(child) => {
-            hash_tag(hasher, "large-list-view");
-            hash_exact_field(hasher, child);
-        }
+        DataType::List(child) => hash_nested(hasher, "list", child),
+        DataType::ListView(child) => hash_nested(hasher, "list-view", child),
+        DataType::LargeList(child) => hash_nested(hasher, "large-list", child),
+        DataType::LargeListView(child) => hash_nested(hasher, "large-list-view", child),
         DataType::FixedSizeList(child, width) => {
             hash_tag(hasher, "fixed-size-list");
             hasher.update(width.to_le_bytes());
@@ -230,6 +255,11 @@ fn hash_exact_type(hasher: &mut Sha256, data_type: &DataType) {
             hash_exact_field(hasher, run_ends);
             hash_exact_field(hasher, values);
         }
+        parameterless => hash_tag(
+            hasher,
+            parameterless_tag(parameterless)
+                .expect("every non-parameterized Arrow type has a stable tag"),
+        ),
     }
 }
 
@@ -291,6 +321,12 @@ fn bare_field(field: &Field) -> Field {
         strip_metadata(field.data_type()),
         field.is_nullable(),
     )
+}
+
+impl AsRef<[u8]> for SchemaFingerprint {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
 }
 
 #[cfg(test)]
@@ -361,11 +397,5 @@ mod tests {
                 "the offset width is part of the memory layout"
             );
         }
-    }
-}
-
-impl AsRef<[u8]> for SchemaFingerprint {
-    fn as_ref(&self) -> &[u8] {
-        &self.0
     }
 }

@@ -509,8 +509,8 @@ pub(super) fn span_batch(values: &[i64]) -> arrow::record_batch::RecordBatch {
             }
         })
         .collect();
-    let (batch, outcome) =
-        vala_bifrost_redux::tables::traces::project_resource_spans(&[ResourceSpans {
+    let (batch, outcome) = vala_bifrost_redux::tables::traces::project_resource_spans(
+        &[ResourceSpans {
             resource: Some(Resource {
                 attributes: vec![attribute("service.name", "scribe-journey")],
                 ..Resource::default()
@@ -520,8 +520,10 @@ pub(super) fn span_batch(values: &[i64]) -> arrow::record_batch::RecordBatch {
                 ..ScopeSpans::default()
             }],
             schema_url: "https://wyrd.test/schemas/scribe-journey".to_owned(),
-        }])
-        .expect("span batch");
+        }],
+        None,
+    )
+    .expect("span batch");
     assert_eq!(
         outcome.rejected_spans, 0,
         "the journey fixture must project losslessly: {:?}",

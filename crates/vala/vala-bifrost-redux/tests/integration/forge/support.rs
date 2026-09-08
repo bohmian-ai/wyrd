@@ -1034,7 +1034,7 @@ impl PromotionIntegrationFixture {
             clock,
             completion_observer,
             scheduler_trigger,
-            Duration::from_millis(1000),
+            Duration::from_secs(1),
         )
     }
 

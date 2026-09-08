@@ -1197,6 +1197,31 @@ async fn worker_wide_fifo_bounds_concurrent_attempts() {
     );
 }
 
+/// Reads the commit-submission count once the attempt's own plans stop adding.
+///
+/// Readiness is retracted the moment the first unknown outcome is stored, so
+/// the plans an attempt already admitted may still be reaching the seam: an
+/// owner that cannot account for one operation keeps the work it started moving
+/// and only stops taking more. Reading the count after it has stopped moving is
+/// what makes a later quiet window describe reconciliation alone.
+///
+/// # Panics
+///
+/// Panics when submissions never stop inside [`ADMISSION_BOUND`].
+async fn await_settled_submissions(catalog: &PromotionCatalogSeam) -> usize {
+    tokio::time::timeout(ADMISSION_BOUND, async {
+        loop {
+            let before = catalog.attempts();
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            if catalog.attempts() == before {
+                return before;
+            }
+        }
+    })
+    .await
+    .expect("the attempt's own admitted plans stop reaching the catalog")
+}
+
 /// Reads the phase of every rewrite operation this tenant holds, by id.
 ///
 /// The retained-ambiguity contract is stated in operation identities: the same
@@ -1333,23 +1358,7 @@ async fn acceptance_unknown_retains_running_until_exact_reconciliation() {
     })
     .await
     .expect("a worker holding an unresolved operation stops advertising itself");
-    // Readiness is retracted the moment the first unknown outcome is stored, so
-    // the plans this attempt already admitted may still be reaching the seam:
-    // an owner that cannot account for one operation keeps the work it started
-    // moving and only stops taking more. The submission count is therefore read
-    // once it has stopped moving, which is what makes the window below describe
-    // reconciliation alone.
-    let submissions = tokio::time::timeout(ADMISSION_BOUND, async {
-        loop {
-            let before = catalog.attempts();
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            if catalog.attempts() == before {
-                return before;
-            }
-        }
-    })
-    .await
-    .expect("the attempt's own admitted plans stop reaching the catalog");
+    let submissions = await_settled_submissions(&catalog).await;
     assert_eq!(
         small_files_in_state(&promoted.fixture, &["claimed", "running"]).await,
         1,

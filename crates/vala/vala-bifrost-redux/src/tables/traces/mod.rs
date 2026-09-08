@@ -189,7 +189,8 @@ mod tests {
     fn maximal_span_projection_is_lossless_and_identity_mapped() {
         let attributes = maximal_span_attributes();
         let request = maximal_resource_spans(attributes.clone());
-        let (batch, outcome) = project_resource_spans(&request).expect("maximal span projects");
+        let (batch, outcome) =
+            project_resource_spans(&request, None).expect("maximal span projects");
 
         assert_eq!(outcome.accepted_spans, 1);
         assert_eq!(outcome.rejected_spans, 0);
@@ -446,17 +447,19 @@ mod tests {
     }
 
     /// Optional Card correlation is read from the final record attribute only,
-    /// rejects exactly its own record, and never disturbs the lossless payload.
+    /// authorized against the principal's signed scope, rejects exactly its own
+    /// span, and never disturbs the lossless payload.
     ///
     /// # Panics
     ///
     /// Panics when a missing value is not null, a final duplicate does not win,
-    /// a wrongly typed or malformed value rejects more than its own span, an
-    /// original attribute entry changes, or the outcome counts and first reason
-    /// are not exact.
+    /// a wrongly typed, malformed, out-of-scope, or UID-less value rejects more
+    /// than its own span, an original attribute entry changes, or the outcome
+    /// counts and first reason are not exact.
     #[test]
     fn optional_card_correlation_is_atomic_and_lossless() {
-        const CARD: &str = "prod/Service/checkout@1.0.0";
+        use crate::tables::signal::correlation_fixture;
+        const CARD: &str = correlation_fixture::IN_SCOPE;
         const RUN: &str = "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b11";
 
         let missing = maximal_span_attributes();
@@ -482,6 +485,16 @@ mod tests {
             "wyrd.card_ref",
             Value::StringValue("not-a-card-ref".to_owned()),
         ));
+        let mut out_of_scope = maximal_span_attributes();
+        out_of_scope.push(attribute(
+            "wyrd.card_ref",
+            Value::StringValue(correlation_fixture::OUT_OF_SCOPE.to_owned()),
+        ));
+        let mut without_uid = maximal_span_attributes();
+        without_uid.push(attribute(
+            "wyrd.card_ref",
+            Value::StringValue(correlation_fixture::WITHOUT_UID.to_owned()),
+        ));
 
         let request = spans_with_attribute_sets(vec![
             missing.clone(),
@@ -489,11 +502,18 @@ mod tests {
             duplicate.clone(),
             wrong_typed,
             malformed,
+            out_of_scope,
+            without_uid,
         ]);
-        let (batch, outcome) = project_resource_spans(&request).expect("projection completes");
+        let (batch, outcome) =
+            project_resource_spans(&request, Some(&correlation_fixture::scope()))
+                .expect("projection completes");
 
         assert_eq!(outcome.accepted_spans, 3);
-        assert_eq!(outcome.rejected_spans, 2);
+        assert_eq!(
+            outcome.rejected_spans, 4,
+            "an out-of-scope and a UID-less reference each reject only their own span"
+        );
         assert_eq!(
             outcome.rejection_message.as_deref(),
             Some("wyrd.run_id is not a valid run correlation"),
@@ -541,7 +561,8 @@ mod tests {
             Value::StringValue("1024".to_owned()),
         ));
         let request = maximal_resource_spans(attributes);
-        let (batch, outcome) = project_resource_spans(&request).expect("projection completes");
+        let (batch, outcome) =
+            project_resource_spans(&request, None).expect("projection completes");
 
         assert_eq!(outcome.accepted_spans, 0);
         assert_eq!(outcome.rejected_spans, 1);

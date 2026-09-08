@@ -154,7 +154,7 @@ mod tests {
     #[test]
     fn maximal_log_projection_preserves_body_context_and_presence() {
         let request = maximal_resource_logs();
-        let (batch, outcome) = project_resource_logs(&request).expect("maximal logs project");
+        let (batch, outcome) = project_resource_logs(&request, None).expect("maximal logs project");
 
         let forms = body_forms();
         let correlated = forms.len();
@@ -388,17 +388,19 @@ mod tests {
     }
 
     /// Optional Card correlation is read from the final record attribute only,
-    /// rejects exactly its own record, and never disturbs the lossless payload.
+    /// authorized against the principal's signed scope, rejects exactly its own
+    /// record, and never disturbs the lossless payload.
     ///
     /// # Panics
     ///
     /// Panics when a missing value is not null, a final duplicate does not win,
-    /// a wrongly typed or malformed value rejects more than its own record, an
-    /// original attribute entry changes, or the outcome counts and first reason
-    /// are not exact.
+    /// a wrongly typed, malformed, out-of-scope, or UID-less value rejects more
+    /// than its own record, an original attribute entry changes, or the outcome
+    /// counts and first reason are not exact.
     #[test]
     fn optional_card_correlation_is_atomic_and_lossless() {
-        const CARD: &str = "prod/Service/checkout@1.0.0";
+        use crate::tables::signal::correlation_fixture;
+        const CARD: &str = correlation_fixture::IN_SCOPE;
         const RUN: &str = "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b11";
 
         let base = || vec![attribute("payload.bytes", Value::BytesValue(vec![0xab]))];
@@ -425,6 +427,16 @@ mod tests {
             "wyrd.card_ref",
             Value::StringValue("not-a-card-ref".to_owned()),
         ));
+        let mut out_of_scope = base();
+        out_of_scope.push(attribute(
+            "wyrd.card_ref",
+            Value::StringValue(correlation_fixture::OUT_OF_SCOPE.to_owned()),
+        ));
+        let mut without_uid = base();
+        without_uid.push(attribute(
+            "wyrd.card_ref",
+            Value::StringValue(correlation_fixture::WITHOUT_UID.to_owned()),
+        ));
 
         let request = logs_with_attribute_sets(vec![
             missing.clone(),
@@ -432,11 +444,17 @@ mod tests {
             duplicate.clone(),
             wrong_typed,
             malformed,
+            out_of_scope,
+            without_uid,
         ]);
-        let (batch, outcome) = project_resource_logs(&request).expect("projection completes");
+        let (batch, outcome) = project_resource_logs(&request, Some(&correlation_fixture::scope()))
+            .expect("projection completes");
 
         assert_eq!(outcome.accepted_records, 3);
-        assert_eq!(outcome.rejected_records, 2);
+        assert_eq!(
+            outcome.rejected_records, 4,
+            "an out-of-scope and a UID-less reference each reject only their own record"
+        );
         assert_eq!(
             outcome.rejection_message.as_deref(),
             Some("wyrd.run_id is not a valid run correlation"),

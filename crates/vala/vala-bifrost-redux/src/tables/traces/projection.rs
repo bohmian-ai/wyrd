@@ -31,6 +31,7 @@ use crate::tables::signal::{
     nested_fields, projected_signal_schema, span_id_bytes, struct_column, trace_id_bytes,
     u32_as_i64_column, utf8_column, utf8_opt_column,
 };
+use wyrd_spec::reference::CardRefScope;
 
 /// Largest accepted span or event name, in bytes.
 const MAX_NAME_BYTES: usize = 256;
@@ -83,6 +84,7 @@ const GEN_AI_INT_PROMOTIONS: [&str; 2] =
 /// projection rather than caller input.
 pub fn project_resource_spans(
     resource_spans: &[ResourceSpans],
+    card_scope: Option<&CardRefScope>,
 ) -> Result<(RecordBatch, IngestOutcome), TableError> {
     let mut columns = SpanColumns::default();
     let mut rejected: i64 = 0;
@@ -101,7 +103,9 @@ pub fn project_resource_spans(
             for span in &scope.spans {
                 let outcome = match scope_defect {
                     Some(reason) => Err(reason),
-                    None => columns.push(span, &envelope, &scope_envelope, service_name),
+                    None => {
+                        columns.push(span, &envelope, &scope_envelope, service_name, card_scope)
+                    }
                 };
                 if let Err(reason) = outcome {
                     rejected = rejected.saturating_add(1);
@@ -238,6 +242,7 @@ impl SpanColumns {
         resource: &ResourceEnvelope,
         scope: &ScopeEnvelope,
         service_name: Option<&str>,
+        card_scope: Option<&CardRefScope>,
     ) -> Result<(), &'static str> {
         let trace_id = trace_id_bytes(&span.trace_id)?;
         let span_id = span_id_bytes(&span.span_id)?;
@@ -263,7 +268,7 @@ impl SpanColumns {
             .ok_or("span ends before it starts")?;
 
         let promotions = GenAiPromotions::extract(&span.attributes)?;
-        let correlation = RecordCorrelation::extract(&span.attributes)?;
+        let correlation = RecordCorrelation::extract(&span.attributes, card_scope)?;
         Self::validate_events(span)?;
         Self::validate_links(span)?;
         self.push_events(span);

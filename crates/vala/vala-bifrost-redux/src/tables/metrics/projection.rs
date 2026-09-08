@@ -37,6 +37,7 @@ use crate::tables::signal::{
     list_column, nested_fields, projected_signal_schema, span_id_bytes, struct_column,
     trace_id_bytes, u32_as_i64_column, utf8_column, utf8_opt_column, validate_canonical_user_batch,
 };
+use wyrd_spec::reference::CardRefScope;
 
 /// Largest accepted metric name, in bytes.
 const MAX_METRIC_NAME_BYTES: usize = 256;
@@ -153,6 +154,7 @@ const KIND_SPECIFIC_COLUMNS: [&str; 20] = [
 /// assembled into the canonical Arrow batch.
 pub fn project_resource_metrics(
     resource_metrics: &[ResourceMetrics],
+    card_scope: Option<&CardRefScope>,
 ) -> Result<(RecordBatch, MetricsOutcome), TableError> {
     let mut columns = PointColumns::default();
     let mut rejected: i64 = 0;
@@ -180,7 +182,7 @@ pub fn project_resource_metrics(
                         continue;
                     }
                 };
-                for row in point_rows(metric) {
+                for row in point_rows(metric, card_scope) {
                     match row {
                         Ok(row) => columns.push(&descriptor, row, &envelope, &scope_envelope),
                         Err(reason) => {
@@ -347,25 +349,36 @@ impl MetricDescriptor {
 }
 
 /// Validate every data point of one metric, in request order.
-fn point_rows(metric: &Metric) -> Vec<Result<PointRow, &'static str>> {
+fn point_rows(
+    metric: &Metric,
+    card_scope: Option<&CardRefScope>,
+) -> Vec<Result<PointRow, &'static str>> {
     match &metric.data {
-        Some(metric::Data::Gauge(gauge)) => {
-            gauge.data_points.iter().map(PointRow::number).collect()
-        }
-        Some(metric::Data::Sum(sum)) => sum.data_points.iter().map(PointRow::number).collect(),
+        Some(metric::Data::Gauge(gauge)) => gauge
+            .data_points
+            .iter()
+            .map(|point| PointRow::number(point, card_scope))
+            .collect(),
+        Some(metric::Data::Sum(sum)) => sum
+            .data_points
+            .iter()
+            .map(|point| PointRow::number(point, card_scope))
+            .collect(),
         Some(metric::Data::Histogram(histogram)) => histogram
             .data_points
             .iter()
-            .map(PointRow::histogram)
+            .map(|point| PointRow::histogram(point, card_scope))
             .collect(),
         Some(metric::Data::ExponentialHistogram(histogram)) => histogram
             .data_points
             .iter()
-            .map(PointRow::exponential_histogram)
+            .map(|point| PointRow::exponential_histogram(point, card_scope))
             .collect(),
-        Some(metric::Data::Summary(summary)) => {
-            summary.data_points.iter().map(PointRow::summary).collect()
-        }
+        Some(metric::Data::Summary(summary)) => summary
+            .data_points
+            .iter()
+            .map(|point| PointRow::summary(point, card_scope))
+            .collect(),
         None => Vec::new(),
     }
 }
@@ -453,7 +466,10 @@ impl PointRow {
     /// Returns a stable reason when the numeric oneof is absent, a
     /// `wyrd.card_ref` or `wyrd.run_id` attribute is wrongly typed or
     /// malformed, or an exemplar is invalid.
-    fn number(point: &NumberDataPoint) -> Result<Self, &'static str> {
+    fn number(
+        point: &NumberDataPoint,
+        card_scope: Option<&CardRefScope>,
+    ) -> Result<Self, &'static str> {
         let (int_value, double_value) = match point.value {
             Some(number_data_point::Value::AsInt(value)) => (Some(value), None),
             Some(number_data_point::Value::AsDouble(value)) => (None, Some(value)),
@@ -464,7 +480,7 @@ impl PointRow {
             start_time_unix_nano: checked_i64(point.start_time_unix_nano)?,
             flags: point.flags,
             attributes: encode_attributes(&point.attributes),
-            correlation: RecordCorrelation::extract(&point.attributes)?,
+            correlation: RecordCorrelation::extract(&point.attributes, card_scope)?,
             int_value,
             double_value,
             exemplars: exemplar_rows(&point.exemplars)?,
@@ -481,7 +497,10 @@ impl PointRow {
     /// not strictly increasing, the collection exceeds its accepted size, a
     /// `wyrd.card_ref` or `wyrd.run_id` attribute is wrongly typed or
     /// malformed, or an exemplar is invalid.
-    fn histogram(point: &HistogramDataPoint) -> Result<Self, &'static str> {
+    fn histogram(
+        point: &HistogramDataPoint,
+        card_scope: Option<&CardRefScope>,
+    ) -> Result<Self, &'static str> {
         if point.bucket_counts.len() > MAX_BUCKETS {
             return Err("histogram bucket collection exceeds the accepted size");
         }
@@ -510,7 +529,7 @@ impl PointRow {
             start_time_unix_nano: checked_i64(point.start_time_unix_nano)?,
             flags: point.flags,
             attributes: encode_attributes(&point.attributes),
-            correlation: RecordCorrelation::extract(&point.attributes)?,
+            correlation: RecordCorrelation::extract(&point.attributes, card_scope)?,
             histogram_count: Some(checked_i64(point.count)?),
             histogram_sum: point.sum,
             histogram_min: point.min,
@@ -536,7 +555,10 @@ impl PointRow {
     /// size, the zero threshold is negative, a `wyrd.card_ref` or
     /// `wyrd.run_id` attribute is wrongly typed or malformed, or an exemplar
     /// is invalid.
-    fn exponential_histogram(point: &ExponentialHistogramDataPoint) -> Result<Self, &'static str> {
+    fn exponential_histogram(
+        point: &ExponentialHistogramDataPoint,
+        card_scope: Option<&CardRefScope>,
+    ) -> Result<Self, &'static str> {
         if point.zero_threshold < 0.0 {
             return Err("exponential histogram zero threshold is negative");
         }
@@ -547,7 +569,7 @@ impl PointRow {
             start_time_unix_nano: checked_i64(point.start_time_unix_nano)?,
             flags: point.flags,
             attributes: encode_attributes(&point.attributes),
-            correlation: RecordCorrelation::extract(&point.attributes)?,
+            correlation: RecordCorrelation::extract(&point.attributes, card_scope)?,
             histogram_count: Some(checked_i64(point.count)?),
             histogram_sum: point.sum,
             histogram_min: point.min,
@@ -570,7 +592,10 @@ impl PointRow {
     /// accepted size, a quantile lies outside the closed unit interval, or a
     /// `wyrd.card_ref` or `wyrd.run_id` attribute is wrongly typed or
     /// malformed.
-    fn summary(point: &SummaryDataPoint) -> Result<Self, &'static str> {
+    fn summary(
+        point: &SummaryDataPoint,
+        card_scope: Option<&CardRefScope>,
+    ) -> Result<Self, &'static str> {
         if point.quantile_values.len() > MAX_QUANTILES {
             return Err("summary quantile collection exceeds the accepted size");
         }
@@ -586,7 +611,7 @@ impl PointRow {
             start_time_unix_nano: checked_i64(point.start_time_unix_nano)?,
             flags: point.flags,
             attributes: encode_attributes(&point.attributes),
-            correlation: RecordCorrelation::extract(&point.attributes)?,
+            correlation: RecordCorrelation::extract(&point.attributes, card_scope)?,
             summary_count: Some(checked_i64(point.count)?),
             summary_sum: Some(point.sum),
             quantile_values: Some(quantiles),

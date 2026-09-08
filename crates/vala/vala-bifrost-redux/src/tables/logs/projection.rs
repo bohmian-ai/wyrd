@@ -25,6 +25,7 @@ use crate::tables::signal::{
     i32_column, i64_column, list_column, projected_signal_schema, span_id_bytes, trace_id_bytes,
     u32_as_i64_column, utf8_column, utf8_opt_column,
 };
+use wyrd_spec::reference::CardRefScope;
 
 /// Largest accepted severity text, in bytes.
 const MAX_SEVERITY_TEXT_BYTES: usize = 64;
@@ -45,6 +46,7 @@ const MAX_EVENT_NAME_BYTES: usize = 256;
 /// assembled into the canonical Arrow batch.
 pub fn project_resource_logs(
     resource_logs: &[ResourceLogs],
+    card_scope: Option<&CardRefScope>,
 ) -> Result<(RecordBatch, LogsOutcome), TableError> {
     let mut columns = LogColumns::default();
     let mut rejected: i64 = 0;
@@ -55,7 +57,7 @@ pub fn project_resource_logs(
         for scope in &resource.scope_logs {
             let scope_envelope = ScopeEnvelope::project(scope.scope.as_ref(), &scope.schema_url);
             for record in &scope.log_records {
-                if let Err(reason) = columns.push(record, &envelope, &scope_envelope) {
+                if let Err(reason) = columns.push(record, &envelope, &scope_envelope, card_scope) {
                     rejected = rejected.saturating_add(1);
                     rejection_message.get_or_insert_with(|| reason.to_owned());
                 }
@@ -128,6 +130,7 @@ impl LogColumns {
         record: &LogRecord,
         resource: &ResourceEnvelope,
         scope: &ScopeEnvelope,
+        card_scope: Option<&CardRefScope>,
     ) -> Result<(), &'static str> {
         if record.severity_text.len() > MAX_SEVERITY_TEXT_BYTES {
             return Err("log severity_text exceeds the accepted length");
@@ -158,7 +161,7 @@ impl LogColumns {
         if attributes.len() > wyrd_spec::vala::logs::record::MAX_LOG_ATTRIBUTES_BYTES {
             return Err("log attributes exceed the accepted payload size");
         }
-        let correlation = RecordCorrelation::extract(&record.attributes)?;
+        let correlation = RecordCorrelation::extract(&record.attributes, card_scope)?;
 
         self.time_unix_nano.push(time_unix_nano);
         self.observed_time_unix_nano.push(observed_time_unix_nano);

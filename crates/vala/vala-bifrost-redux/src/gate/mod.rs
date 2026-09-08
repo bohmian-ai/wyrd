@@ -484,11 +484,11 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> Gate<R,
         }
         crate::otlp_limits::enforce_trace_limits(&decoded.request, decoded.wire_bytes, self.limits)
             .map_err(IngestError::from_scribe)?;
-        let (batch, outcome) =
-            crate::tables::traces::project_resource_spans(&decoded.request.resource_spans)
-                .map_err(|error| {
-                    IngestError::Internal(format!("trace projection failed: {error}"))
-                })?;
+        let (batch, outcome) = crate::tables::traces::project_resource_spans(
+            &decoded.request.resource_spans,
+            auth.principal.card_ref_scope(),
+        )
+        .map_err(|error| IngestError::Internal(format!("trace projection failed: {error}")))?;
         self.dispatch_canonical(
             auth,
             TableRef::new(BifrostNamespace::Traces, "spans"),
@@ -524,11 +524,11 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> Gate<R,
             self.limits,
         )
         .map_err(IngestError::from_scribe)?;
-        let (batch, outcome) =
-            crate::tables::metrics::project_resource_metrics(&decoded.request.resource_metrics)
-                .map_err(|error| {
-                    IngestError::Internal(format!("metric projection failed: {error}"))
-                })?;
+        let (batch, outcome) = crate::tables::metrics::project_resource_metrics(
+            &decoded.request.resource_metrics,
+            auth.principal.card_ref_scope(),
+        )
+        .map_err(|error| IngestError::Internal(format!("metric projection failed: {error}")))?;
         self.dispatch_canonical(
             auth,
             TableRef::new(BifrostNamespace::Metrics, "points"),
@@ -562,6 +562,7 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> Gate<R,
             .map_err(IngestError::from_scribe)?;
         let (batch, outcome) = crate::tables::logs::project_resource_logs(
             &decoded.request.resource_logs,
+            auth.principal.card_ref_scope(),
         )
         .map_err(|error| IngestError::Internal(format!("log projection failed: {error}")))?;
         self.dispatch_canonical(
@@ -868,6 +869,7 @@ pub fn validate_batch(
 
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr as _;
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -875,6 +877,7 @@ mod tests {
     use super::limits::IngestLimits;
     use super::{AuthContext, Gate, IngestError};
     use crate::contracts::DecodedOtlp;
+    use arrow::array::Array as _;
     use arrow::record_batch::RecordBatch;
     use async_trait::async_trait;
     use futures_util::StreamExt as _;
@@ -1155,6 +1158,8 @@ mod tests {
         calls: Arc<AtomicUsize>,
         /// Row count of every canonical batch Gate handed to Scribe, in order.
         rows: Arc<Mutex<Vec<usize>>>,
+        /// `card_ref` value of every handed row, in accepted order.
+        card_refs: Arc<Mutex<Vec<Option<String>>>>,
     }
 
     impl CountingScribe {
@@ -1163,6 +1168,7 @@ mod tests {
             Self {
                 calls,
                 rows: Arc::new(Mutex::new(Vec::new())),
+                card_refs: Arc::new(Mutex::new(Vec::new())),
             }
         }
     }
@@ -1195,6 +1201,30 @@ mod tests {
                 .lock()
                 .expect("row log is not poisoned")
                 .extend(canonical.batches.iter().map(RecordBatch::num_rows));
+            let scope = frame.principal.card_ref_scope();
+            let mut handed = self.card_refs.lock().expect("card log is not poisoned");
+            for batch in &canonical.batches {
+                let column = batch
+                    .column_by_name("card_ref")
+                    .expect("a canonical signal batch carries its correlation column")
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .expect("card_ref is Utf8");
+                for row in 0..column.len() {
+                    if column.is_null(row) {
+                        handed.push(None);
+                        continue;
+                    }
+                    let raw = column.value(row);
+                    let card = wyrd_spec::reference::CardRef::from_str(raw)
+                        .expect("Gate must only hand Scribe parseable references");
+                    assert!(
+                        scope.is_some_and(|scope| scope.authorizes(&card)),
+                        "Gate must not hand Scribe a reference outside the signed scope"
+                    );
+                    handed.push(Some(raw.to_owned()));
+                }
+            }
             Ok(crate::contracts::FrameAdmission {
                 batch_id: uuid::Uuid::now_v7(),
                 rows_accepted: 0,
@@ -1222,6 +1252,50 @@ mod tests {
             request_id: RequestId::now_v7(),
             delegation_chain: Vec::new(),
         }
+    }
+
+    /// One authenticated context whose principal carries the shared signed scope.
+    ///
+    /// Card correlation is only assertable from a signed scope, so a Gate test
+    /// that exercises `wyrd.card_ref` needs a service principal rather than the
+    /// plain user `auth_context` builds.
+    fn scoped_auth_context() -> AuthContext {
+        let tenant = DataTenantId::new_v7();
+        let scope = crate::tables::signal::correlation_fixture::scope();
+        let principal = Principal::new(
+            PrincipalId::new(uuid::Uuid::now_v7()),
+            PrincipalKind::Service {
+                card_ref: scope.as_slice()[0].clone(),
+                card_ref_scope: scope,
+            },
+            tenant,
+            Vec::new(),
+            PermissionSet::from_iter([Permission::bifrost_record_write()]),
+        );
+        AuthContext {
+            principal,
+            tenant,
+            request_id: RequestId::now_v7(),
+            delegation_chain: Vec::new(),
+        }
+    }
+
+    /// One valid span carrying `card_ref` as its record correlation attribute.
+    fn span_resource_with_card(
+        index: u8,
+        card_ref: &str,
+    ) -> wyrd_tonic::otlp::trace::v1::ResourceSpans {
+        let mut resource = span_resource(index, true);
+        resource.scope_spans[0].spans[0].attributes =
+            vec![wyrd_tonic::otlp::common::v1::KeyValue {
+                key: "wyrd.card_ref".to_owned(),
+                value: Some(wyrd_tonic::otlp::common::v1::AnyValue {
+                    value: Some(wyrd_tonic::otlp::common::v1::any_value::Value::StringValue(
+                        card_ref.to_owned(),
+                    )),
+                }),
+            }];
+        resource
     }
 
     /// Couples one trace fixture to a real root-backed decode owner.
@@ -1336,32 +1410,52 @@ mod tests {
     ///
     /// Scribe receives one canonical batch whose row count equals the accepted
     /// span count, so the ordinals it stamps form one contiguous range starting
-    /// at zero with no gap left by a rejected span.
+    /// at zero with no gap left by a rejected span. A span whose `wyrd.card_ref`
+    /// lies outside the principal's signed scope, or names a signed member the
+    /// mint left without a UID, is one more rejected sibling rather than a
+    /// whole-request refusal: its valid siblings still store, and the returned
+    /// partial-success counts stay exact. Scribe stamps `card_uid` from the
+    /// matching signed member alone, which its own resolution tests pin.
     #[tokio::test]
     async fn mixed_otlp_projection_assigns_only_accepted_contiguous_ordinals() {
+        use crate::tables::signal::correlation_fixture;
+
         let scribe_calls = Arc::new(AtomicUsize::new(0));
         let scribe = Arc::new(CountingScribe::new(Arc::clone(&scribe_calls)));
         let rows = Arc::clone(&scribe.rows);
+        let card_refs = Arc::clone(&scribe.card_refs);
         let gate = Gate::with_test_scribe(scribe, test_interceptor(), IngestLimits::default());
 
         let outcome = gate
             .ingest_decoded_resource_spans(
-                &auth_context(true),
+                &scoped_auth_context(),
                 decoded_trace(ExportTraceServiceRequest {
                     resource_spans: vec![
                         span_resource(1, true),
                         span_resource(2, false),
-                        span_resource(3, true),
+                        span_resource_with_card(3, correlation_fixture::IN_SCOPE),
+                        span_resource_with_card(4, correlation_fixture::OUT_OF_SCOPE),
+                        span_resource_with_card(5, correlation_fixture::WITHOUT_UID),
+                        span_resource(6, true),
                     ],
                 }),
             )
             .await
             .expect("Gate must route without consulting its catalog adapter");
 
-        assert_eq!((outcome.accepted_spans, outcome.rejected_spans), (2, 1));
+        assert_eq!(
+            (outcome.accepted_spans, outcome.rejected_spans),
+            (3, 3),
+            "an unauthorized reference rejects only its own span"
+        );
         assert!(outcome.rejection_message.is_some());
         assert_eq!(scribe_calls.load(Ordering::Relaxed), 1);
-        assert_eq!(*rows.lock().expect("row log is not poisoned"), vec![2]);
+        assert_eq!(*rows.lock().expect("row log is not poisoned"), vec![3]);
+        assert_eq!(
+            *card_refs.lock().expect("card log is not poisoned"),
+            vec![None, Some(correlation_fixture::IN_SCOPE.to_owned()), None,],
+            "only accepted rows reach Scribe, in request order"
+        );
     }
 
     /// An export with no accepted span never reaches Scribe (S1).

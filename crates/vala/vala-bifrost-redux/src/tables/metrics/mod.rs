@@ -215,7 +215,7 @@ mod tests {
     fn all_pinned_metric_point_kinds_project_without_narrowing() {
         let requested = all_kind_request();
         let (batch, outcome) =
-            project_resource_metrics(&requested).expect("every pinned kind projects");
+            project_resource_metrics(&requested, None).expect("every pinned kind projects");
         assert_eq!(outcome.accepted_points, 5);
         assert_eq!(outcome.rejected_points, 0);
         assert!(outcome.rejection_message.is_none());
@@ -372,7 +372,7 @@ mod tests {
         ]);
 
         let (batch, outcome) =
-            project_resource_metrics(&requested).expect("the valid point still projects");
+            project_resource_metrics(&requested, None).expect("the valid point still projects");
         assert_eq!(outcome.accepted_points, 1);
         assert_eq!(outcome.rejected_points, 4);
         assert_eq!(
@@ -407,17 +407,19 @@ mod tests {
     }
 
     /// Optional Card correlation is read from the final point attribute only,
-    /// rejects exactly its own point, and never disturbs the lossless payload.
+    /// authorized against the principal's signed scope, rejects exactly its own
+    /// point, and never disturbs the lossless payload.
     ///
     /// # Panics
     ///
     /// Panics when a missing value is not null, a final duplicate does not win,
-    /// a wrongly typed or malformed value rejects more than its own point, an
-    /// original attribute entry changes, or the outcome counts and first reason
-    /// are not exact.
+    /// a wrongly typed, malformed, out-of-scope, or UID-less value rejects more
+    /// than its own point, an original attribute entry changes, or the outcome
+    /// counts and first reason are not exact.
     #[test]
     fn optional_card_correlation_is_atomic_and_lossless() {
-        const CARD: &str = "prod/Service/checkout@1.0.0";
+        use crate::tables::signal::correlation_fixture;
+        const CARD: &str = correlation_fixture::IN_SCOPE;
         const RUN: &str = "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b11";
 
         let base = || vec![attribute("k", Value::IntValue(1))];
@@ -444,6 +446,16 @@ mod tests {
             "wyrd.card_ref",
             Value::StringValue("not-a-card-ref".to_owned()),
         ));
+        let mut out_of_scope = base();
+        out_of_scope.push(attribute(
+            "wyrd.card_ref",
+            Value::StringValue(correlation_fixture::OUT_OF_SCOPE.to_owned()),
+        ));
+        let mut without_uid = base();
+        without_uid.push(attribute(
+            "wyrd.card_ref",
+            Value::StringValue(correlation_fixture::WITHOUT_UID.to_owned()),
+        ));
 
         let sets = vec![
             missing.clone(),
@@ -451,6 +463,8 @@ mod tests {
             duplicate.clone(),
             wrong_typed,
             malformed,
+            out_of_scope,
+            without_uid,
         ];
         let requested = request(vec![metric(
             "gauge.correlated",
@@ -464,10 +478,15 @@ mod tests {
                     .collect(),
             }),
         )]);
-        let (batch, outcome) = project_resource_metrics(&requested).expect("projection completes");
+        let (batch, outcome) =
+            project_resource_metrics(&requested, Some(&correlation_fixture::scope()))
+                .expect("projection completes");
 
         assert_eq!(outcome.accepted_points, 3);
-        assert_eq!(outcome.rejected_points, 2);
+        assert_eq!(
+            outcome.rejected_points, 4,
+            "an out-of-scope and a UID-less reference each reject only their own point"
+        );
         assert_eq!(
             outcome.rejection_message.as_deref(),
             Some("wyrd.run_id is not a valid run correlation"),

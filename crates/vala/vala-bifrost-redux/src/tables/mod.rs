@@ -1326,11 +1326,11 @@ mod tests {
     /// lost by any leg of the round trip.
     #[test]
     fn canonical_signal_schemas_round_trip_arrow_parquet_and_iceberg() {
-        let (spans, _) = crate::tables::traces::project_resource_spans(&span_fixture())
+        let (spans, _) = crate::tables::traces::project_resource_spans(&span_fixture(), None)
             .expect("the span fixture projects");
-        let (logs, _) = crate::tables::logs::project_resource_logs(&log_fixture())
+        let (logs, _) = crate::tables::logs::project_resource_logs(&log_fixture(), None)
             .expect("the log fixture projects");
-        let (points, _) = crate::tables::metrics::project_resource_metrics(&metric_fixture())
+        let (points, _) = crate::tables::metrics::project_resource_metrics(&metric_fixture(), None)
             .expect("the metric fixture projects");
 
         for (label, projected) in [("spans", spans), ("logs", logs), ("points", points)] {
@@ -1439,11 +1439,11 @@ mod tests {
     fn builtin_registry_dispatches_canonical_value_validation() {
         use arrow::array::{Array, BinaryArray, Int64Array};
 
-        let (spans, _) = crate::tables::traces::project_resource_spans(&span_fixture())
+        let (spans, _) = crate::tables::traces::project_resource_spans(&span_fixture(), None)
             .expect("the span fixture projects");
-        let (logs, _) = crate::tables::logs::project_resource_logs(&log_fixture())
+        let (logs, _) = crate::tables::logs::project_resource_logs(&log_fixture(), None)
             .expect("the log fixture projects");
-        let (points, _) = crate::tables::metrics::project_resource_metrics(&metric_fixture())
+        let (points, _) = crate::tables::metrics::project_resource_metrics(&metric_fixture(), None)
             .expect("the metric fixture projects");
 
         for (namespace, name, projected) in [
@@ -1487,7 +1487,7 @@ mod tests {
 
         // A summary point may not populate a numeric kind's column, which the
         // ledger schema alone cannot express.
-        let (points, _) = crate::tables::metrics::project_resource_metrics(&metric_fixture())
+        let (points, _) = crate::tables::metrics::project_resource_metrics(&metric_fixture(), None)
             .expect("the metric fixture projects");
         let points = crate::tables::signal::without_correlation_columns(&points)
             .expect("the correlation columns split off cleanly");

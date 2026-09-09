@@ -657,8 +657,8 @@ async fn assert_expired_deadline_makes_no_second_call() {
 /// has about a second of budget, and the parked second call is never released —
 /// only the production deadline can end it. It does, leaving acceptance
 /// unknown, which is the honest answer for a call that was submitted: the
-/// operation stays Prepared for evidence-based recovery, and no third call is
-/// made.
+/// attempt is released with its operation still Prepared for durable recovery,
+/// and no third call is made.
 ///
 /// # Panics
 ///
@@ -686,7 +686,7 @@ async fn assert_retry_inherits_only_the_remaining_budget() {
     catalog.park_next_commit();
     supervisor.restart_worker();
     let supervisor = supervisor
-        .run_one_failure_while(async {
+        .run_one_release_while(async {
             catalog.wait_for_parked_commit().await;
             // Three seconds short of the deadline, not one: the retry the
             // conflict buys is owed a one-second backoff first, and a margin
@@ -713,11 +713,10 @@ async fn assert_retry_inherits_only_the_remaining_budget() {
          sibling plan got the same two calls out of what the attempt's one \
          shared budget still had left: {phases:?}"
     );
-    // A submitted call that ran out of budget claims no outcome. The row stays
-    // open until something proves what happened to that exact operation: either
-    // this attempt's own retained reconciliation, which can only reset it once
-    // the uncertainty window shows nothing live, or a successor's takeover.
-    // Neither may report the commit as accepted.
+    // A submitted call that ran out of budget claims no outcome. The attempt is
+    // released rather than settled, and the row stays open until the durable
+    // takeover proves what happened to that exact operation. Nothing here may
+    // report the commit as accepted.
     assert!(
         phases
             .iter()

@@ -2211,6 +2211,46 @@ impl SupervisedPromotion {
         self
     }
 
+    /// Schedule one pass and await the release of one unresolved attempt while
+    /// `during` drives the seam the attempt is parked on.
+    ///
+    /// The sibling of [`Self::run_one_failure_while`] for the outcome that is
+    /// not a failure at all: an attempt that cannot account for one of its
+    /// operations returns nothing, settles nothing, and writes nothing
+    /// durable, so the only thing to wait for is the release itself.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a deterministic bound is missed or the attempt returned an
+    /// error instead of being released.
+    pub(crate) async fn run_one_release_while<F>(mut self, during: F) -> Self
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        let errors_before = self.worker_observer.returned_errors().len();
+        let released_before = self.worker_observer.released_attempts_for_test().len();
+        self.start_armed_worker();
+        self.schedule_once().await;
+        tokio::time::timeout(FIXTURE_BOUND, during)
+            .await
+            .expect("parked production commit seam bound");
+        tokio::time::timeout(FIXTURE_BOUND, async {
+            while self.worker_observer.released_attempts_for_test().len() == released_before {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("production Forge unresolved-release bound");
+        self.stop_worker().await;
+        assert_eq!(
+            self.worker_observer.returned_errors().len(),
+            errors_before,
+            "a released attempt reports no failure: {:?}",
+            self.worker_observer.returned_errors()
+        );
+        self
+    }
+
     /// Run one attempt to a shutdown handoff and join the worker.
     ///
     /// The attempt under test ends with an operation its own worker cannot

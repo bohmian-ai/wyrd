@@ -2111,7 +2111,10 @@ mod pg_tests {
     #[derive(Debug, serde::Deserialize)]
     struct MistypedRow {
         /// Declared as an integer against a string column, so every row fails.
-        #[expect(dead_code, reason = "the field exists to force a deserialization failure")]
+        #[expect(
+            dead_code,
+            reason = "the field exists to force a deserialization failure"
+        )]
         model: i64,
     }
 

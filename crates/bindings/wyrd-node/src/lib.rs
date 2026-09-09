@@ -1016,8 +1016,8 @@ fn encode_batch(batch: &arrow::record_batch::RecordBatch) -> napi::Result<Vec<u8
 /// Returns a napi error when IPC writing fails.
 fn encode_schema(schema: &arrow::datatypes::SchemaRef) -> napi::Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    let mut writer =
-        arrow::ipc::writer::StreamWriter::try_new(&mut bytes, schema.as_ref()).map_err(napi_error)?;
+    let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut bytes, schema.as_ref())
+        .map_err(napi_error)?;
     writer.finish().map_err(napi_error)?;
     Ok(bytes)
 }

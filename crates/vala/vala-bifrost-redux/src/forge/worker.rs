@@ -2290,6 +2290,19 @@ impl ForgeWorker {
             if shutdown.is_cancelled() {
                 continue;
             }
+            if self.holds_unattended_authority(&pool).await? {
+                // This owner released an attempt it could not account for: the
+                // task is still Running under its name, its operation is still
+                // Prepared, and its claim is owned until the lease lapses.
+                // Advertising ready here would offer an operator and a gateway
+                // a worker whose own publication is unreconciled, so the bit is
+                // retracted and no new task, maintenance, or plan authority is
+                // taken. Attempts already admitted keep draining: they are
+                // attended work with owners that can still settle them.
+                self.publish_readiness(false);
+                self.wait_for_progress(&mut pool, &shutdown).await?;
+                continue;
+            }
             self.publish_readiness(true);
             if (self.config.max_task_parallelism - pool.queue.running_parallelism_sum()).min(4) == 0
             {
@@ -2504,6 +2517,57 @@ redacted
         if let Some(observer) = &self.completion_observer {
             observer.record_released_attempt_for_test(task_id);
         }
+    }
+
+    /// Reports whether this owner holds durable authority no attempt is tending.
+    ///
+    /// The pool's keys are the tasks this loop is still executing, so they are
+    /// the exclusion the durable predicate needs to tell ordinary in-flight
+    /// work apart from a released attempt's residue. Losing that set — a kill,
+    /// a restart — is not a loss of correctness state: the successor holds no
+    /// attempts, so the same predicate simply reports every pre-terminal row
+    /// this owner still holds, which is what startup recovery already drains.
+    ///
+    /// # Errors
+    ///
+    /// Returns the SQL failure the predicate raised. The answer gates readiness
+    /// and new claims, so an unanswered question must stop the loop rather than
+    /// be read as "nothing unresolved".
+    async fn holds_unattended_authority(
+        &self,
+        pool: &ForgeAttemptPool,
+    ) -> Result<bool, ForgeError> {
+        let attended: Vec<Uuid> = pool.attempts.keys().copied().collect();
+        self.tasks
+            .has_unattended_work(self.owner, &attended)
+            .await
+            .map_err(ForgeError::Sql)
+    }
+
+    /// Waits for whichever progress this loop is able to make next.
+    ///
+    /// A worker holding attempts waits on their completions, because a poll
+    /// timer would only delay the settlement that frees its budget. An idle
+    /// worker has nothing to be woken by, so it waits out a short interval and
+    /// re-reads durable state at the top of the loop.
+    ///
+    /// # Errors
+    ///
+    /// Returns the settlement, audit, SQL, and lease-release failures a
+    /// recorded completion raises.
+    async fn wait_for_progress(
+        &self,
+        pool: &mut ForgeAttemptPool,
+        shutdown: &CancellationToken,
+    ) -> Result<(), ForgeError> {
+        if pool.is_idle() {
+            tokio::select! {
+                () = shutdown.cancelled() => {}
+                () = tokio::time::sleep(Duration::from_millis(250)) => {}
+            }
+            return Ok(());
+        }
+        Box::pin(self.await_loop_event(pool, shutdown)).await
     }
 
     /// Publishes this loop's readiness, when it is running under a role handle.

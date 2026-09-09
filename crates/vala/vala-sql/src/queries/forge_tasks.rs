@@ -694,6 +694,49 @@ impl ForgeTasks {
         Ok(task)
     }
 
+    /// Reports whether this owner holds pre-terminal work it is not attending.
+    ///
+    /// A running worker keeps its live attempts in memory, so its own durable
+    /// `claimed`, `running`, or `prepared` rows are ordinary in-flight work
+    /// rather than residue. The exception is the row an owner released without
+    /// being able to account for it: an unresolved acceptance leaves the task
+    /// `Running`, its operation `Prepared`, and its claim owned until the lease
+    /// lapses, and nothing in memory records that ambiguity. `attended` is the
+    /// task set the caller is still executing; every other pre-terminal row
+    /// this owner holds is authority it can no longer explain, which is what
+    /// keeps it unready and stops it claiming more.
+    ///
+    /// An empty `attended` therefore asks the broader question — does this
+    /// owner hold anything pre-terminal at all — which is the right question
+    /// for a caller that holds no attempts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqlError`] when the cross-tenant operator pool or the
+    /// predicate query fails.
+    ///
+    /// # Cancellation
+    ///
+    /// The single read has no side effects, so cancellation loses only the
+    /// answer and the caller simply stays unready for one more iteration.
+    pub async fn has_unattended_work(
+        &self,
+        owner: Uuid,
+        attended: &[Uuid],
+    ) -> Result<bool, SqlError> {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM vala.forge_tasks t \
+             WHERE t.state IN ('claimed','running','prepared') \
+               AND t.claimed_by=$1 \
+               AND t.task_id <> ALL($2))",
+        )
+        .bind(owner)
+        .bind(attended)
+        .fetch_one(self.operator_pool.pool())
+        .await
+        .map_err(SqlError::from)
+    }
+
     /// Reports whether any durable recovery work remains before new claims.
     ///
     /// Forge worker readiness is recovery-gated: a worker must not advertise

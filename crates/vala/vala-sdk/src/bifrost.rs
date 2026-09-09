@@ -373,6 +373,30 @@ impl Bifrost {
         })
     }
 
+    /// Run one SQL SELECT and deserialize every row into `T`.
+    ///
+    /// The typed counterpart of [`Self::sql`]: the same query, authorization,
+    /// limits, and validated terminal, projected onto the caller's own type
+    /// after the result is complete. `T` describes the columns the query
+    /// selects; it is never sent to the server and says nothing about how a
+    /// table is stored.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::sql`], plus [`ValaSdkError::RowDeserialization`] when any row
+    /// does not fit `T`. That failure is total: no partially converted result
+    /// is returned.
+    ///
+    /// # Cancellation
+    ///
+    /// As [`Self::sql`]; conversion happens only after the query completes.
+    pub async fn sql_as<T: serde::de::DeserializeOwned>(
+        &self,
+        query: &str,
+    ) -> Result<Vec<T>, ValaSdkError> {
+        self.sql(query).await?.deserialize()
+    }
+
     /// Run one SQL SELECT and return its batches as they arrive.
     ///
     /// The stream owns the HTTP response body: dropping it propagates
@@ -515,6 +539,37 @@ impl QueryResult {
     #[must_use]
     pub fn num_rows(&self) -> usize {
         self.batches.iter().map(RecordBatch::num_rows).sum()
+    }
+
+    /// Deserialize every row into `T` through the Arrow JSON projection.
+    ///
+    /// Arrow's own writer produces one JSON array over the retained batches, so
+    /// the column names and types `T` sees are exactly the schema the server
+    /// sent — there is no second, hand-written type mapping to disagree with
+    /// it. An empty result writes no array at all, which is the zero-row case.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValaSdkError::Arrow`] when the JSON projection fails and
+    /// [`ValaSdkError::RowDeserialization`] when any row does not fit `T`.
+    fn deserialize<T: serde::de::DeserializeOwned>(&self) -> Result<Vec<T>, ValaSdkError> {
+        let mut bytes = Vec::new();
+        {
+            let mut writer = arrow::json::ArrayWriter::new(&mut bytes);
+            for batch in &self.batches {
+                writer
+                    .write(batch)
+                    .map_err(|error| ValaSdkError::Arrow(error.to_string()))?;
+            }
+            writer
+                .finish()
+                .map_err(|error| ValaSdkError::Arrow(error.to_string()))?;
+        }
+        if bytes.is_empty() {
+            return Ok(Vec::new());
+        }
+        serde_json::from_slice(&bytes)
+            .map_err(|error| ValaSdkError::RowDeserialization(error.to_string()))
     }
 
     /// Encode the whole result as one Arrow IPC stream.

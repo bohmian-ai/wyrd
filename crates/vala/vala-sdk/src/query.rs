@@ -63,6 +63,14 @@ pub enum ValaSdkError {
     /// internal error to every language SDK.
     #[error("bifrost write failed: {0}")]
     Queue(#[from] WyrdQueueError),
+    /// One completed result row did not deserialize into the caller's type.
+    ///
+    /// Client-tier `WYRD_CLIENT_422_ROW_DESERIALIZATION`: the query itself
+    /// succeeded and its terminal validated, so this blames the local typed
+    /// projection rather than the server, and never reports the rows that did
+    /// convert as a partial success.
+    #[error("query row deserialization failed: {0}")]
+    RowDeserialization(String),
     /// A client-tier configuration, credential, or transport failure.
     ///
     /// Carried verbatim for the same reason [`ValaSdkError::Queue`] is: the
@@ -84,7 +92,9 @@ impl ValaSdkError {
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("query transport failed")
                 .to_owned(),
-            Self::Protocol(detail) | Self::Arrow(detail) => detail.clone(),
+            Self::Protocol(detail) | Self::Arrow(detail) | Self::RowDeserialization(detail) => {
+                detail.clone()
+            }
             Self::IncompleteQueryStream => {
                 "query stream ended before its required terminal frame".to_owned()
             }
@@ -111,6 +121,7 @@ impl ValaSdkError {
             Self::FailedTerminal { terminal } => serde_json::to_value(terminal).ok(),
             Self::Protocol(_)
             | Self::Arrow(_)
+            | Self::RowDeserialization(_)
             | Self::IncompleteQueryStream
             | Self::ResultTooLarge
             | Self::NoActiveTable
@@ -125,6 +136,7 @@ impl ValaSdkError {
         match self {
             Self::Transport(error) => error.code(),
             Self::Protocol(_) | Self::Arrow(_) => "WYRD_VALA_502_QUERY_STREAM_PROTOCOL",
+            Self::RowDeserialization(_) => "WYRD_CLIENT_422_ROW_DESERIALIZATION",
             Self::IncompleteQueryStream => "WYRD_VALA_502_QUERY_STREAM_INCOMPLETE",
             Self::FailedTerminal { terminal } => terminal_bifrost_error(terminal).code(),
             Self::ResultTooLarge => "WYRD_VALA_413_QUERY_RESULT_TOO_LARGE",
@@ -140,6 +152,7 @@ impl ValaSdkError {
         match self {
             Self::Transport(error) => error.status(),
             Self::Protocol(_) | Self::Arrow(_) | Self::IncompleteQueryStream => 502,
+            Self::RowDeserialization(_) => 422,
             Self::FailedTerminal { terminal } => terminal_bifrost_error(terminal).status(),
             Self::ResultTooLarge => 413,
             Self::NoActiveTable => BifrostError::NoActiveTable.status(),
@@ -154,6 +167,7 @@ impl ValaSdkError {
         match self {
             Self::Transport(error) => error.title(),
             Self::Protocol(_) | Self::Arrow(_) => "Query stream protocol failed",
+            Self::RowDeserialization(_) => "Query row deserialization failed",
             Self::IncompleteQueryStream => "Query stream incomplete",
             Self::FailedTerminal { terminal } => terminal_bifrost_error(terminal).title(),
             Self::ResultTooLarge => "Query result too large",
@@ -170,6 +184,9 @@ impl ValaSdkError {
             Self::Transport(error) => error.remediation(),
             Self::Protocol(_) | Self::Arrow(_) => {
                 "Retry the query; if the error persists, verify client and server contract versions."
+            }
+            Self::RowDeserialization(_) => {
+                "Align the caller's row type with the columns and types the query selects."
             }
             Self::IncompleteQueryStream => {
                 "Retry the query because the response ended before its required terminal frame."
@@ -192,6 +209,7 @@ impl ValaSdkError {
             Self::Transport(_)
             | Self::Protocol(_)
             | Self::Arrow(_)
+            | Self::RowDeserialization(_)
             | Self::IncompleteQueryStream
             | Self::ResultTooLarge
             | Self::NoActiveTable

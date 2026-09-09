@@ -51,6 +51,19 @@ impl NativeStreamOwner {
             Self::Test(stream) => stream.terminal(),
         }
     }
+
+    /// Returns the authoritative schema the stream's initial schema frame set.
+    ///
+    /// Available once that frame is decoded, which precedes every batch, so a
+    /// query returning no rows still has one. The injectable test owner carries
+    /// no stream and therefore no schema.
+    fn schema(&self) -> Option<&arrow::datatypes::SchemaRef> {
+        match self {
+            Self::Production(stream) => stream.schema(),
+            #[cfg(test)]
+            Self::Test(_) => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -745,6 +758,7 @@ impl NativeBifrostQueryStream {
                 Box::new(stream),
             )))),
             terminal_json: Arc::new(Mutex::new(None)),
+            schema_ipc: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -755,6 +769,7 @@ impl NativeBifrostQueryStream {
             request_id: RequestId::now_v7().to_string(),
             stream: Arc::new(AsyncMutex::new(Some(NativeStreamOwner::Test(owner)))),
             terminal_json: Arc::new(Mutex::new(None)),
+            schema_ipc: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -768,6 +783,8 @@ pub struct NativeBifrostQueryStream {
     stream: Arc<AsyncMutex<Option<NativeStreamOwner>>>,
     /// Validated serialized terminal retained after the Rust stream is released.
     terminal_json: Arc<Mutex<Option<String>>>,
+    /// Schema-only Arrow IPC stream retained after the Rust stream is released.
+    schema_ipc: Arc<Mutex<Option<Vec<u8>>>>,
 }
 
 #[napi]
@@ -808,6 +825,13 @@ impl NativeBifrostQueryStream {
                 }
             },
             Ok(None) => {
+                let schema = match stream.schema().map(encode_schema).transpose() {
+                    Ok(schema) => schema,
+                    Err(error) => {
+                        *stream_slot = None;
+                        return Err(error);
+                    }
+                };
                 let terminal = if let Some(terminal) = stream.terminal() {
                     match serde_json::to_string(terminal) {
                         Ok(terminal) => terminal,
@@ -826,6 +850,11 @@ impl NativeBifrostQueryStream {
                     .lock()
                     .map_err(|_| napi::Error::from_reason("terminal lock poisoned".to_owned()))? =
                     Some(terminal.clone());
+                *self
+                    .schema_ipc
+                    .lock()
+                    .map_err(|_| napi::Error::from_reason("schema lock poisoned".to_owned()))? =
+                    schema;
                 Ok(NativeQueryStep {
                     ipc: None,
                     terminal_json: Some(terminal),
@@ -870,6 +899,23 @@ impl NativeBifrostQueryStream {
     #[napi]
     pub async fn close(&self) {
         *self.stream.lock().await = None;
+    }
+
+    /// Returns the result's authoritative schema as a schema-only IPC stream.
+    ///
+    /// Retained when the stream completes, so a query that produced no batch
+    /// still carries the server's schema and JavaScript never has to infer one
+    /// from the batches it happened to receive.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error when the retaining lock is poisoned.
+    #[napi(getter)]
+    pub fn schema_ipc(&self) -> napi::Result<Option<Buffer>> {
+        self.schema_ipc
+            .lock()
+            .map(|schema| schema.clone().map(Buffer::from))
+            .map_err(|_| napi::Error::from_reason("schema lock poisoned".to_owned()))
     }
 
     /// Returns serialized terminal metadata after validated completion.
@@ -957,6 +1003,22 @@ fn encode_batch(batch: &arrow::record_batch::RecordBatch) -> napi::Result<Vec<u8
         .write(batch)
         .and_then(|()| writer.finish())
         .map_err(napi_error)?;
+    Ok(bytes)
+}
+
+/// Encodes one Arrow schema as a schema-only IPC stream with no batches.
+///
+/// The same encoding [`encode_batch`] uses, minus the batch, so the JavaScript
+/// facade decodes an empty result exactly as it decodes a populated one.
+///
+/// # Errors
+///
+/// Returns a napi error when IPC writing fails.
+fn encode_schema(schema: &arrow::datatypes::SchemaRef) -> napi::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let mut writer =
+        arrow::ipc::writer::StreamWriter::try_new(&mut bytes, schema.as_ref()).map_err(napi_error)?;
+    writer.finish().map_err(napi_error)?;
     Ok(bytes)
 }
 

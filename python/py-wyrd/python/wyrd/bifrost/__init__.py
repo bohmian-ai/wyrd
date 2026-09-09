@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator, Iterator
-from typing import Any, TypedDict, cast
+from typing import Any, Protocol, TypedDict, TypeVar, cast, overload
 
 import pyarrow
 
@@ -15,6 +15,24 @@ from .._wyrd.bifrost import (
     IncompleteQueryStreamError,
     NoCredentialsError,
 )
+
+_Row = TypeVar("_Row", bound="RowModel")
+
+
+class RowModel(Protocol):
+    """Anything that validates one row mapping and returns itself typed.
+
+    A Pydantic ``BaseModel`` subclass satisfies this by construction, which is
+    what ``sql(query, Model)`` accepts. The shape is structural, so Pydantic is
+    not required by this module and any peer offering ``model_validate`` works
+    unchanged.
+    """
+
+    @classmethod
+    def model_validate(cls: type[_Row], obj: Any, /) -> _Row:
+        """Validate one row mapping into an instance of this model."""
+
+        ...
 
 
 class BifrostQueryStream(AsyncIterator[pyarrow.RecordBatch]):
@@ -474,10 +492,28 @@ class Bifrost(_BifrostBase):
 
         self._native.shutdown()
 
-    def sql(self, query: str) -> QueryResult:
-        """Run one SQL SELECT over any authorized table and collect every batch."""
+    @overload
+    def sql(self, query: str) -> QueryResult: ...
 
-        return QueryResult(self._native.sql(query))
+    @overload
+    def sql(self, query: str, model: type[_Row]) -> list[_Row]: ...
+
+    def sql(self, query: str, model: type[_Row] | None = None) -> QueryResult | list[_Row]:
+        """Run one SQL SELECT over any authorized table and collect every batch.
+
+        Passing ``model`` validates every row through it and returns model
+        instances instead of the Arrow-backed ``QueryResult``. That projection
+        is purely local: the model never reaches the server and describes the
+        columns the query selects, not how a table is stored.
+
+        Raises:
+            pydantic.ValidationError: a row did not fit ``model``. Nothing
+                partially converted is returned.
+
+        """
+
+        result = QueryResult(self._native.sql(query))
+        return result if model is None else _validated_rows(result, model)
 
     def stream(
         self,
@@ -540,10 +576,26 @@ class AsyncBifrost(_BifrostBase):
 
         await asyncio.to_thread(self._native.shutdown)
 
-    async def sql(self, query: str) -> QueryResult:
-        """Run one SQL SELECT over any authorized table and collect every batch."""
+    @overload
+    async def sql(self, query: str) -> QueryResult: ...
 
-        return QueryResult(await asyncio.to_thread(self._native.sql, query))
+    @overload
+    async def sql(self, query: str, model: type[_Row]) -> list[_Row]: ...
+
+    async def sql(self, query: str, model: type[_Row] | None = None) -> QueryResult | list[_Row]:
+        """Run one SQL SELECT over any authorized table and collect every batch.
+
+        As ``Bifrost.sql``, including the optional ``model`` projection; only
+        the query itself moves to a worker thread.
+
+        Raises:
+            pydantic.ValidationError: a row did not fit ``model``. Nothing
+                partially converted is returned.
+
+        """
+
+        result = QueryResult(await asyncio.to_thread(self._native.sql, query))
+        return result if model is None else _validated_rows(result, model)
 
     async def stream(
         self,
@@ -700,6 +752,17 @@ class CancelRunningQueryResult(TypedDict):
     cancellation_started: bool
 
 
+def _validated_rows(result: QueryResult, model: type[_Row]) -> list[_Row]:
+    """Validate every row of a completed result through ``model``.
+
+    The rows come from the Arrow table the result already decoded, so the keys
+    ``model`` sees are exactly the columns the server returned. Validation is
+    all-or-nothing: the first rejected row raises and no partial list escapes.
+    """
+
+    return [model.model_validate(row) for row in result.to_arrow().to_pylist()]
+
+
 __all__ = [
     "AsyncBifrost",
     "Bifrost",
@@ -716,6 +779,7 @@ __all__ = [
     "PhysicalLayout",
     "QueryResult",
     "ResolvedTable",
+    "RowModel",
     "RunningQuery",
     "RunningQueryProgress",
     "SortKey",

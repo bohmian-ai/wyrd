@@ -148,6 +148,18 @@ impl Bifrost {
         block_on(self.inner.sql(query))
     }
 
+    /// Run one SQL SELECT and deserialize every row into `T`.
+    ///
+    /// # Errors
+    ///
+    /// As [`crate::Bifrost::sql_as`].
+    pub fn sql_as<T: serde::de::DeserializeOwned>(
+        &self,
+        query: &str,
+    ) -> Result<Vec<T>, ValaSdkError> {
+        block_on(self.inner.sql_as(query))
+    }
+
     /// Run one SQL SELECT and iterate its batches as they arrive.
     ///
     /// # Errors

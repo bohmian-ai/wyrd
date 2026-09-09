@@ -301,6 +301,20 @@ export class BifrostQueryStream
     return this.#native.requestId;
   }
 
+  /**
+   * The result's authoritative schema, retained once the stream completes.
+   *
+   * The server sends it before any batch, so it is the schema of a zero-row
+   * result too — which is the whole reason it is read here rather than
+   * reconstructed from whatever batches arrived.
+   */
+  get schema(): Schema | undefined {
+    const ipc = this.#native.schemaIpc;
+    return ipc === null || ipc === undefined
+      ? undefined
+      : tableFromIPC(ipc).schema;
+  }
+
   [Symbol.asyncIterator](): AsyncIterableIterator<RecordBatch> {
     return this;
   }
@@ -520,6 +534,18 @@ export class TableConfig {
 }
 
 /**
+ * Anything that validates one row and returns it typed.
+ *
+ * A Zod schema satisfies this by construction. The shape is structural, so no
+ * schema library is a dependency of this SDK and any peer offering `parse`
+ * works unchanged — the same reason {@link TableConfig.fromJsonSchema} accepts
+ * a structural JSON Schema source.
+ */
+export interface RowSchema<T> {
+  parse(value: unknown): T;
+}
+
+/**
  * Arrow batches from one query, converted on demand.
  *
  * Collected by draining {@link Bifrost.stream}, so a collected result and a
@@ -529,10 +555,21 @@ export class TableConfig {
 export class QueryResult {
   readonly #batches: readonly RecordBatch[];
   readonly #terminal: QueryTerminal;
+  readonly #schema: Schema;
 
-  constructor(batches: readonly RecordBatch[], terminal: QueryTerminal) {
+  constructor(
+    batches: readonly RecordBatch[],
+    terminal: QueryTerminal,
+    schema: Schema,
+  ) {
     this.#batches = batches;
     this.#terminal = terminal;
+    this.#schema = schema;
+  }
+
+  /** The server-supplied result schema, present even with no batches. */
+  get schema(): Schema {
+    return this.#schema;
   }
 
   /** Every batch the query produced, in arrival order. */
@@ -553,12 +590,14 @@ export class QueryResult {
   /**
    * The whole result as one Apache Arrow `Table`.
    *
-   * A view over the batches this result already holds — no copy, no re-decode,
-   * and no second schema mapping — so a caller reaching for columns, `toArray`,
-   * or `get` uses the same Arrow implementation the batches were decoded with.
+   * A view over the batches this result already holds, under the schema the
+   * server sent — no copy, no re-decode, and no second schema mapping — so a
+   * caller reaching for columns, `toArray`, or `get` uses the same Arrow
+   * implementation the batches were decoded with, and a zero-row result still
+   * reports its selected fields.
    */
   toArrow(): Table {
-    return new Table([...this.#batches]);
+    return new Table(this.#schema, [...this.#batches]);
   }
 
   /**
@@ -683,21 +722,47 @@ export class Bifrost {
    * Drains {@link Bifrost.stream}, so the two cannot disagree about the rows a
    * query returns or about the terminal frame each requires.
    */
-  async sql(query: string): Promise<QueryResult> {
+  async sql(query: string): Promise<QueryResult>;
+  /**
+   * Run one SQL SELECT and return each row parsed by `rows`.
+   *
+   * A purely local projection over the completed result: the query, its
+   * authorization, its limits, and its terminal are the same ones raw
+   * {@link Bifrost.sql} runs. The schema never reaches the server and says
+   * nothing about the table's stored layout.
+   *
+   * @throws whatever `rows.parse` throws for the first row it rejects, so a
+   * partially valid result is never returned as success.
+   */
+  async sql<T>(query: string, rows: RowSchema<T>): Promise<T[]>;
+  async sql<T>(
+    query: string,
+    rows?: RowSchema<T>,
+  ): Promise<QueryResult | T[]> {
     const stream = await this.stream({ sql: query });
     const batches: RecordBatch[] = [];
     for await (const batch of stream) {
       batches.push(batch);
     }
     const terminal = stream.terminal;
-    if (terminal === undefined) {
+    const schema = stream.schema;
+    if (terminal === undefined || schema === undefined) {
       throw new IncompleteQueryStreamError(
         502,
         "Query stream incomplete",
         "query stream completed without terminal metadata",
       );
     }
-    return new QueryResult(batches, terminal);
+    const result = new QueryResult(batches, terminal, schema);
+    if (rows === undefined) {
+      return result;
+    }
+    return result
+      .toArrow()
+      .toArray()
+      .map((row: { toJSON(): Record<string, unknown> }) =>
+        rows.parse(row.toJSON()),
+      );
   }
 
   /** Run one SQL SELECT and iterate its batches as they arrive. */

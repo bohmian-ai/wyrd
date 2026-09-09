@@ -767,4 +767,3 @@ export class Bifrost {
     );
   }
 }
-

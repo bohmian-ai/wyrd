@@ -102,4 +102,3 @@ Not applicable. This is the first acceptance review of candidate `ae18fea3d` for
 ## Verdict
 
 `FIX_REQUIRED`
-

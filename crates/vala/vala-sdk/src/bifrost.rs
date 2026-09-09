@@ -397,8 +397,9 @@ impl Bifrost {
             .await
     }
 
-    /// Escape hatch to the full query surface: lifecycle controls, typed trace
-    /// and GenAI reads, describe.
+    /// Escape hatch to the query plane's lifecycle surface: running, status,
+    /// cancel, describe, and the raw request form [`Self::sql`] and
+    /// [`Self::stream`] wrap.
     #[must_use]
     pub fn query_client(&self) -> &QueryClient {
         &self.query

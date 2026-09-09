@@ -1,25 +1,21 @@
 //! Auth-bound adapters from Gate transports and typed plans into retained Oracle.
 
-use std::time::Instant;
 
-use arrow::record_batch::RecordBatch;
-use futures_util::StreamExt;
 use vala_bifrost_redux::oracle::{
-    AuthorizedQueryContext, OracleQueryStream, QueryIpcDecodeError, QueryIpcDecoder, QueryOptions,
+    AuthorizedQueryContext, OracleQueryStream, QueryIpcDecodeError,
 };
 use wyrd_runtime::{Permission, PermissionVerdict};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
     AuditDecision, AuditResult, AuthMethod, BifrostQueryRequest, CancelRunningQueryResponse,
-    QueryStreamFrame, QueryTerminalOutcome, RunningQuerySummary, VisibilityMode,
+    RunningQuerySummary,
 };
 
 use crate::AppState;
 use crate::audit;
 use crate::components::auth::Caller;
 use crate::http::error::permission_deny_reason_to_wyrd;
-use crate::query::floor;
 
 /// Authorizes one query permission and durably audits a denial.
 ///
@@ -326,165 +322,7 @@ pub async fn cancel_running_query(
     outcome
 }
 
-/// Executes one already-lowered typed plan through retained Oracle and collects
-/// its rows under the caller's pagination policy.
-///
-/// `Some(limit)` is the paginated policy: at most `limit + 1` rows are retained
-/// so the route can report `has_more`. `None` is the complete-result policy used
-/// by routes that have no continuation token; every decoded row is retained and
-/// the result stays bounded only by the encoded-byte ceiling and the sync query
-/// timeout, so the caller can never observe a silently truncated success.
-///
-/// # Errors
-///
-/// Returns Oracle planning/admission/audit, stream protocol, Arrow decoding,
-/// timeout, or bounded-result errors.
-pub async fn run_typed_query(
-    state: &AppState,
-    caller: &Caller,
-    plan: datafusion::logical_expr::LogicalPlan,
-    limit: Option<u32>,
-) -> Result<(Vec<RecordBatch>, bool), WyrdError> {
-    let context = oracle_context(caller)?;
-    let deadline = Instant::now()
-        .checked_add(floor::SYNC_QUERY_TIMEOUT)
-        .ok_or(wyrd_spec::vala::error::BifrostError::QueryTimeout)?;
-    let stream = state
-        .bifrost
-        .query_plan(
-            context,
-            plan,
-            QueryOptions {
-                visibility: VisibilityMode::PublishedOnly,
-                deadline,
-            },
-        )
-        .await
-        .map_err(WyrdError::from)?;
-    collect_bounded(stream, limit).await
-}
 
-/// Collects one Oracle stream under the caller's row policy and the byte
-/// ceiling.
-///
-/// The collector requires exactly one terminal and rejects failed/incomplete
-/// streams. With `Some(limit)` it retains at most `limit + 1` rows before
-/// producing `has_more`; with `None` it retains every row and always reports
-/// `has_more = false`, leaving the encoded-byte ceiling and the Oracle deadline
-/// as the only bounds.
-///
-/// # Errors
-///
-/// Returns a stable stream, execution, decoding, or result-size error when the
-/// logical frame contract or configured bounds are violated.
-async fn collect_bounded(
-    mut stream: OracleQueryStream,
-    limit: Option<u32>,
-) -> Result<(Vec<RecordBatch>, bool), WyrdError> {
-    let row_ceiling = limit.map_or(usize::MAX, |limit| {
-        usize::try_from(limit)
-            .unwrap_or(usize::MAX)
-            .saturating_add(1)
-    });
-    let mut batches = Vec::new();
-    let mut rows = 0_usize;
-    let mut encoded_bytes = 0_usize;
-    let mut ipc = QueryIpcDecoder::new();
-    let mut schema_seen = false;
-    let mut terminal_seen = false;
-    while let Some(frame) = stream.frames.next().await {
-        let frame = match frame {
-            Ok(frame) => frame,
-            Err(error) => {
-                stream.cancel().await;
-                return Err(WyrdError::from(error));
-            }
-        };
-        match frame {
-            QueryStreamFrame::Schema(schema) if !schema_seen && batches.is_empty() => {
-                if let Err(error) = ipc.accept_schema(&schema.arrow_ipc_schema) {
-                    stream.cancel().await;
-                    return Err(arrow_decode_error(&error));
-                }
-                schema_seen = true;
-            }
-            QueryStreamFrame::Batch(batch) if schema_seen && !terminal_seen => {
-                let retaining = rows < row_ceiling;
-                if retaining {
-                    // The byte ceiling is charged before decoding so an
-                    // oversized fragment is refused without expanding it.
-                    encoded_bytes = match encoded_bytes.checked_add(batch.arrow_ipc_batch.len()) {
-                        Some(bytes) => bytes,
-                        None => {
-                            stream.cancel().await;
-                            return Err(floor::result_too_large());
-                        }
-                    };
-                    if encoded_bytes > floor::MAX_SYNC_RESULT_BYTES {
-                        stream.cancel().await;
-                        return Err(floor::result_too_large());
-                    }
-                }
-                // Every retained-or-not fragment is still fed: the decoder is
-                // stateful, so skipping one would corrupt the remaining stream
-                // and the terminal end-of-stream delta.
-                let decoded = match ipc.accept_batch(&batch.arrow_ipc_batch) {
-                    Ok(decoded) => decoded,
-                    Err(error) => {
-                        stream.cancel().await;
-                        return Err(arrow_decode_error(&error));
-                    }
-                };
-                if !retaining {
-                    continue;
-                }
-                rows = match rows.checked_add(decoded.num_rows()) {
-                    Some(rows) => rows,
-                    None => {
-                        stream.cancel().await;
-                        return Err(floor::result_too_large());
-                    }
-                };
-                batches.push(decoded);
-            }
-            QueryStreamFrame::Terminal(terminal) if schema_seen && !terminal_seen => {
-                terminal_seen = true;
-                if terminal.outcome == QueryTerminalOutcome::Failed {
-                    let error = terminal.error.as_ref().map_or(
-                        wyrd_spec::vala::error::BifrostError::QueryExecutionFailed,
-                        |error| terminal_error_to_bifrost(error.code),
-                    );
-                    return Err(error.into());
-                }
-                if let Err(error) = ipc.accept_eos(&terminal.arrow_ipc_eos) {
-                    return Err(arrow_decode_error(&error));
-                }
-            }
-            _ => {
-                stream.cancel().await;
-                return Err(wyrd_spec::vala::error::BifrostError::QueryStreamProtocol.into());
-            }
-        }
-        if terminal_seen {
-            break;
-        }
-    }
-    if !terminal_seen {
-        stream.cancel().await;
-        return Err(wyrd_spec::vala::error::BifrostError::QueryStreamIncomplete.into());
-    }
-    let Some(limit) = limit else {
-        return Ok((batches, false));
-    };
-    let limit = usize::try_from(limit).unwrap_or(usize::MAX);
-    let has_more = rows > limit;
-    Ok((truncate_batches(batches, limit), has_more))
-}
-
-/// Projects a query IPC decoding refusal onto the stable internal error shape.
-///
-/// Decoding failures are server-side stream defects, not caller errors, so they
-/// keep the existing internal projection while retaining the closed reason for
 /// operators.
 pub(crate) fn arrow_decode_error(error: &QueryIpcDecodeError) -> WyrdError {
     WyrdError::Internal {
@@ -492,7 +330,6 @@ pub(crate) fn arrow_decode_error(error: &QueryIpcDecodeError) -> WyrdError {
         details: serde_json::json!({ "detail": error.to_string() }),
     }
 }
-
 /// Preserves the stable terminal error catalog across typed query adapters.
 pub(crate) fn terminal_error_to_bifrost(
     code: wyrd_spec::vala::api::QueryTerminalErrorCode,
@@ -520,97 +357,16 @@ pub(crate) fn terminal_error_to_bifrost(
         QueryTerminalErrorCode::QueryExecutionFailed => BifrostError::QueryExecutionFailed,
     }
 }
-
-/// Truncates already bounded batches without copying their Arrow buffers.
-#[must_use]
-fn truncate_batches(batches: Vec<RecordBatch>, limit: usize) -> Vec<RecordBatch> {
-    let mut result = Vec::with_capacity(batches.len());
-    let mut remaining = limit;
-    for batch in batches {
-        if remaining == 0 {
-            break;
-        }
-        if batch.num_rows() <= remaining {
-            remaining -= batch.num_rows();
-            result.push(batch);
-        } else {
-            result.push(batch.slice(0, remaining));
-            break;
-        }
-    }
-    result
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::Path;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use tokio_util::sync::CancellationToken;
     use wyrd_runtime::permission::PermissionSet;
     use wyrd_runtime::{Principal, PrincipalKind};
     use wyrd_spec::auth::PrincipalId;
     use wyrd_spec::request_id::RequestId;
-    use wyrd_spec::vala::api::{
-        FreshnessPolicy, QueryBatchFrame, QueryFreshness, QuerySchemaFrame, QuerySource,
-        QueryStreamFrame, QueryTerminalFrame, SourceCompletion, SourceCompletionOutcome,
-        VisibilityMode,
-    };
+    use wyrd_spec::vala::api::{FreshnessPolicy, VisibilityMode};
 
     use super::*;
-
-    /// Encodes one split query IPC stream exactly as the Oracle encoder does.
-    ///
-    /// Returns the schema fragment, one bare fragment per written batch, and the
-    /// end-of-stream fragment the terminal frame carries.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the fixture batches cannot be encoded.
-    fn split_ipc_stream(batches: &[&[i64]]) -> (Vec<u8>, Vec<Vec<u8>>, Vec<u8>) {
-        use arrow::array::Int64Array;
-        use arrow::datatypes::{DataType, Field, Schema};
-
-        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-        let mut writer = arrow::ipc::writer::StreamWriter::try_new(Vec::new(), schema.as_ref())
-            .expect("schema writer starts");
-        let prefix = std::mem::take(writer.get_mut());
-        let fragments = batches
-            .iter()
-            .map(|values| {
-                let batch = RecordBatch::try_new(
-                    Arc::clone(&schema),
-                    vec![Arc::new(Int64Array::from(values.to_vec()))],
-                )
-                .expect("fixture batch is valid");
-                writer.write(&batch).expect("fixture batch writes");
-                std::mem::take(writer.get_mut())
-            })
-            .collect();
-        writer.finish().expect("fixture writer finishes");
-        (prefix, fragments, std::mem::take(writer.get_mut()))
-    }
-
-    /// Synthetic owner probe for admission release and fenced-tail cleanup.
-    #[derive(Default)]
-    struct CollectorOwnerProbe {
-        /// Number of local slots retained by the owner.
-        slots_in_use: AtomicUsize,
-        /// Whether durable release completed before collection returned.
-        release_complete: AtomicBool,
-        /// Whether fenced tail state completed release.
-        fence_released: AtomicBool,
-    }
-
-    impl CollectorOwnerProbe {
-        /// Releases local slots and marks durable/fenced cleanup complete.
-        async fn release(&self) {
-            tokio::task::yield_now().await;
-            self.slots_in_use.store(0, Ordering::Release);
-            self.fence_released.store(true, Ordering::Release);
-            self.release_complete.store(true, Ordering::Release);
-        }
-    }
 
     /// Builds one caller with the requested effective permissions.
     ///
@@ -692,15 +448,6 @@ mod tests {
         for (path, complete_source) in [
             ("query/service.rs", own_source),
             ("query/routes.rs", include_str!("routes.rs")),
-            (
-                "vala_query/service.rs",
-                include_str!("../vala_query/service.rs"),
-            ),
-            (
-                "vala_query/routes.rs",
-                include_str!("../vala_query/routes.rs"),
-            ),
-            ("vala_query/grpc.rs", include_str!("../vala_query/grpc.rs")),
         ] {
             let source = complete_source
                 .split("#[cfg(test)]")
@@ -732,173 +479,4 @@ mod tests {
         }
     }
 
-    /// The collector decodes one split IPC stream per query and requires its close.
-    ///
-    /// Bounded collection is the server's own consumer of the public stream, so
-    /// it must hold one stateful decoder for the whole query: a schema fragment
-    /// once, bare deltas per batch, and the terminal end-of-stream that proves
-    /// the stream closed rather than truncated.
-    #[test]
-    fn stateful_ipc_decoder_contract() {
-        wyrd_runtime::runtime().block_on(async {
-            let (prefix, fragments, eos) = split_ipc_stream(&[&[1, 2], &[3], &[4, 5]]);
-            let terminal = |arrow_ipc_eos: Vec<u8>| QueryTerminalFrame {
-                outcome: QueryTerminalOutcome::Success,
-                freshness: QueryFreshness::Complete,
-                execution_path: wyrd_spec::vala::api::QueryExecutionPath::Interactive,
-                row_count: 5,
-                warnings: Vec::new(),
-                source_completion: vec![
-                    SourceCompletion {
-                        source: QuerySource::Iceberg,
-                        outcome: SourceCompletionOutcome::Complete,
-                    },
-                    SourceCompletion {
-                        source: QuerySource::HotSealed,
-                        outcome: SourceCompletionOutcome::Complete,
-                    },
-                ],
-                error: None,
-                arrow_ipc_eos,
-            };
-            let frames = |arrow_ipc_eos: Vec<u8>| {
-                let mut frames = vec![Ok(QueryStreamFrame::Schema(QuerySchemaFrame {
-                    schema_fingerprint: "test".to_owned(),
-                    arrow_ipc_schema: prefix.clone(),
-                }))];
-                frames.extend(fragments.iter().map(|fragment| {
-                    Ok(QueryStreamFrame::Batch(QueryBatchFrame {
-                        arrow_ipc_batch: fragment.clone(),
-                    }))
-                }));
-                frames.push(Ok(QueryStreamFrame::Terminal(terminal(arrow_ipc_eos))));
-                frames
-            };
-            let stream = |frames: Vec<_>| {
-                OracleQueryStream::test_new(
-                    "test".to_owned(),
-                    Box::pin(async_stream::stream! {
-                        for frame in frames {
-                            yield frame;
-                        }
-                    }),
-                    CancellationToken::new(),
-                )
-            };
-
-            let (batches, has_more) = collect_bounded(stream(frames(eos.clone())), Some(100))
-                .await
-                .expect("split stream collects");
-            assert_eq!(
-                batches.len(),
-                3,
-                "each fragment decodes to exactly one batch"
-            );
-            assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 5);
-            assert!(!has_more);
-
-            let (bounded, has_more) = collect_bounded(stream(frames(eos.clone())), Some(2))
-                .await
-                .expect("bounded collection still consumes the whole stream");
-            assert_eq!(
-                bounded.iter().map(RecordBatch::num_rows).sum::<usize>(),
-                2,
-                "row ceiling truncates without abandoning decoder state"
-            );
-            assert!(has_more);
-
-            let (complete, has_more) = collect_bounded(stream(frames(eos)), None)
-                .await
-                .expect("the complete-result policy collects");
-            assert_eq!(
-                complete.iter().map(RecordBatch::num_rows).sum::<usize>(),
-                5,
-                "a `None` limit retains every row instead of truncating"
-            );
-            assert!(
-                !has_more,
-                "a complete result never reports a continuation it cannot serve"
-            );
-
-            assert!(
-                collect_bounded(stream(frames(Vec::new())), Some(100))
-                    .await
-                    .is_err(),
-                "a successful terminal without its end-of-stream is refused"
-            );
-        });
-    }
-
-    /// Proves every pre-terminal collector failure actively cancels its stream.
-    #[test]
-    fn collector_failures_cancel_stream_cleanup() {
-        wyrd_runtime::runtime().block_on(async {
-            let (prefix, _fragments, _eos) = split_ipc_stream(&[&[1, 2]]);
-            let schema_frame = QueryStreamFrame::Schema(QuerySchemaFrame {
-                schema_fingerprint: "test".to_owned(),
-                arrow_ipc_schema: prefix,
-            });
-            let cases = [
-                (
-                    "oversized",
-                    vec![
-                        Ok(schema_frame.clone()),
-                        Ok(QueryStreamFrame::Batch(QueryBatchFrame {
-                            arrow_ipc_batch: vec![0; floor::MAX_SYNC_RESULT_BYTES + 1],
-                        })),
-                    ],
-                ),
-                (
-                    "malformed",
-                    vec![
-                        Ok(schema_frame.clone()),
-                        Ok(QueryStreamFrame::Batch(QueryBatchFrame {
-                            arrow_ipc_batch: vec![1, 2, 3],
-                        })),
-                    ],
-                ),
-                (
-                    "unreadable schema",
-                    vec![Ok(QueryStreamFrame::Schema(QuerySchemaFrame {
-                        schema_fingerprint: "test".to_owned(),
-                        arrow_ipc_schema: Vec::new(),
-                    }))],
-                ),
-                (
-                    "protocol",
-                    vec![Ok(QueryStreamFrame::Batch(QueryBatchFrame {
-                        arrow_ipc_batch: vec![1],
-                    }))],
-                ),
-                ("incomplete", vec![Ok(schema_frame)]),
-            ];
-            for (name, frames) in cases {
-                let cancellation = CancellationToken::new();
-                let owner = Arc::new(CollectorOwnerProbe {
-                    slots_in_use: AtomicUsize::new(1),
-                    ..CollectorOwnerProbe::default()
-                });
-                let owner_for_stream = Arc::clone(&owner);
-                let frames = async_stream::stream! {
-                    for frame in frames {
-                        yield frame;
-                    }
-                    owner_for_stream.release().await;
-                };
-                let stream = OracleQueryStream::test_new(
-                    "test".to_owned(),
-                    Box::pin(frames),
-                    cancellation.clone(),
-                );
-                assert!(
-                    collect_bounded(stream, Some(100)).await.is_err(),
-                    "{name} must fail"
-                );
-                assert!(cancellation.is_cancelled(), "{name} must cancel cleanup");
-                assert_eq!(owner.slots_in_use.load(Ordering::Acquire), 0);
-                assert!(owner.release_complete.load(Ordering::Acquire));
-                assert!(owner.fence_released.load(Ordering::Acquire));
-            }
-        });
-    }
 }

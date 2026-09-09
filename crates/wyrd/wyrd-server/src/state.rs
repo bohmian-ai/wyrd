@@ -20,7 +20,7 @@ use vala_bifrost_redux::oracle::dispatcher::{BifrostPeerTls, OraclePeerCredentia
 use vala_bifrost_redux::oracle::follower::{PhysicalPlanFollower, ScribeTailResolver};
 use vala_bifrost_redux::oracle::peer::{PeerSecurityAudit, PeerTicketVerifier};
 use vala_bifrost_redux::oracle::{
-    AuthorizedQueryContext, OracleQueryStream, QueryOptions, RunningQueryRegistry,
+    AuthorizedQueryContext, OracleQueryStream, RunningQueryRegistry,
 };
 use vala_bifrost_redux::resources::{BifrostRoleResources, OracleResources, ScribeResources};
 use vala_bifrost_redux::scribe::ScribeImpl;
@@ -1774,25 +1774,6 @@ impl Bifrost {
         request: BifrostQueryRequest,
     ) -> Result<OracleQueryStream, wyrd_spec::vala::error::BifrostError> {
         self.gate().query_sql(context, request).await
-    }
-
-    /// Dispatches one authorized logical plan through Gate into the selected Oracle.
-    ///
-    /// # Errors
-    /// Returns role-unavailable, admission, planning, or execution errors.
-    pub async fn query_plan(
-        &self,
-        context: AuthorizedQueryContext,
-        plan: datafusion::logical_expr::LogicalPlan,
-        options: QueryOptions,
-    ) -> Result<OracleQueryStream, wyrd_spec::vala::error::BifrostError> {
-        self.gate().ensure_query_open()?;
-        let oracle = self
-            .oracle
-            .as_ref()
-            .filter(|oracle| oracle.is_ready())
-            .ok_or(wyrd_spec::vala::error::BifrostError::OracleRoleUnavailable)?;
-        oracle.engine.query_plan(context, plan, options).await
     }
 
     /// Closes public admission and synchronously removes local readiness advertisement.

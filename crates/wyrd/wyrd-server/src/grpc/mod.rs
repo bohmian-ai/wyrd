@@ -319,7 +319,6 @@ where
     let traces = otlp::TraceOtlpGrpcService::new(Arc::clone(&bifrost));
     let metrics = otlp::MetricsOtlpGrpcService::new(Arc::clone(&bifrost));
     let logs = otlp::LogsOtlpGrpcService::new(Arc::clone(&bifrost));
-    let query = crate::vala_query::grpc::ValaQueryGrpc::new(state.clone());
     let bifrost_query = query::BifrostQueryGrpc::new(state.clone());
     let transport = state.bifrost.transport_admission();
     Ok(router
@@ -336,10 +335,6 @@ where
             transport.clone(),
         ))
         .add_service(GrpcTransportAdmissionService::new(logs, transport.clone()))
-        .add_service(GrpcTransportAdmissionService::new(
-            query.into_server(),
-            transport.clone(),
-        ))
         .add_service(GrpcTransportAdmissionService::new(
             bifrost_query.into_server(),
             transport,

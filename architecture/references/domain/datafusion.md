@@ -40,9 +40,12 @@ before decoding the physical plan or performing IO. Install the admitted
 query-owned `RuntimeEnv` and dynamic `MemoryPool` on leader and workers; never
 fall back to a worker's process-global runtime for Wyrd query work.
 
-Operators and streamed exchanges use the same finite query-owned memory pool;
-do not create a predicted exchange child or separate operator/exchange
-sublimits. Before dispatch, enforce the configured selected-worker limit,
+Operators and streamed exchanges use the same query-owned memory pool view; do
+not create a predicted exchange child or separate operator/exchange sublimits.
+That view is a private ceiling over the one process-wide Oracle memory root, not
+an independently sized pool: every leader, follower, operator, and exchange
+consumer registers with the same root, so aggregate cooperative reservation
+cannot exceed the pod's bound. Before dispatch, enforce the configured selected-worker limit,
 admitted tasks/partitions, Wyrd-owned admission queue and slots, and scratch
 demand with checked count/range arithmetic. Dependency-owned exchange queues
 retain their pinned byte backpressure without a Wyrd item-count guarantee. Do
@@ -86,8 +89,12 @@ uncertain-outcome reconciliation.
 
 ## Memory, spill, and concurrency
 
-- Each Oracle query owns its memory-pool and spill lifetime. The process pool
-  is an aggregate capacity root, not an operation-local grant.
+- Each Oracle query owns its memory-pool view and spill lifetime. The process
+  pool is the aggregate capacity root every Oracle consumer shares, not an
+  operation-local grant, and a query view allocates no capacity of its own.
+- Only fallible reservation is hard-limited. Infallible growth is measured as
+  explicit process headroom that makes later fallible growth refuse sooner; the
+  root bounds cooperative reservation, not total process memory.
 - Oracle accounts scan, repartition, hash, and exchange buffers before
   admission and keeps spill tenant- and operation-bound.
 - Forge accounts the real plan's scan and prefetch buffers, decoded Arrow

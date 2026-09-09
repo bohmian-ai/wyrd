@@ -3,6 +3,7 @@
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use num_traits::ToPrimitive as _;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use wyrd_spec::vala::api::{
@@ -190,6 +191,11 @@ impl OracleQueryAttemptRoster {
         // replica is therefore absent from the cut entirely and cannot receive
         // a request or affect the result.
         select_bounded_workers(&mut oracles, &leader, attempt_id);
+        // The selected count is the fan-out an operator can actually act on:
+        // it is what reserves remote slots and memory, and it is bounded by
+        // this node's own advertised limit rather than by roster size.
+        metrics::histogram!("bifrost_oracle_selected_workers")
+            .record(oracles.len().saturating_sub(1).to_f64().unwrap_or(f64::MAX));
         Ok(Self {
             observed_at: snapshot.observed_at(),
             attempt_id,

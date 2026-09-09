@@ -4520,6 +4520,125 @@ minimum_slots = 2
         assert!(ServeMode::Grpc.serves_grpc());
     }
 
+    /// Local Oracle capacity is bounded by this pod's own CPU and memory.
+    ///
+    /// The derivation must consult both terms rather than sizing concurrency
+    /// from memory alone, an explicit operator limit must win over it outright,
+    /// and calibration must supply the fixed tenant caps while refusing a
+    /// document from the superseded schema.
+    ///
+    /// # Panics
+    ///
+    /// Panics when derivation, override precedence, tenant caps, or schema
+    /// acceptance does not match the local model.
+    #[test]
+    fn oracle_capacity_is_local_cpu_and_memory_bounded() {
+        use vala_bifrost_redux::resources::{
+            ORACLE_PARTITION_WORKING_MEMORY_BYTES, ResourcePlan, oracle_worker_slots,
+        };
+
+        let plan = |effective_cpu: usize, oracle_bytes: usize, limit: Option<usize>| ResourcePlan {
+            memory_limit_bytes: oracle_bytes * 2,
+            effective_cpu,
+            oracle_query_slot_limit: limit,
+            unmanaged_reserve_bytes: 0,
+            managed_memory_bytes: oracle_bytes,
+            scribe_floor_bytes: 0,
+            oracle_floor_bytes: oracle_bytes,
+            forge_compaction_memory_limit_bytes: 0,
+            elastic_memory_bytes: 0,
+            scratch_limit_bytes: 0,
+        };
+        // Memory is generous, so CPU is what bounds concurrency; the ratio is
+        // two units per effective core.
+        assert_eq!(
+            oracle_worker_slots(plan(4, 64 * ORACLE_PARTITION_WORKING_MEMORY_BYTES, None))
+                .expect("a CPU-bounded plan derives slots"),
+            8
+        );
+        // Memory is what bounds the same CPU capacity here, so a pod that cannot
+        // hold eight working sets does not advertise eight units.
+        assert_eq!(
+            oracle_worker_slots(plan(4, 3 * ORACLE_PARTITION_WORKING_MEMORY_BYTES, None))
+                .expect("a memory-bounded plan derives slots"),
+            3
+        );
+        // An explicit limit is a capacity decision, not a detected bound: it
+        // replaces the derivation in both directions.
+        assert_eq!(
+            oracle_worker_slots(plan(4, 3 * ORACLE_PARTITION_WORKING_MEMORY_BYTES, Some(32)))
+                .expect("an explicit limit is honored"),
+            32
+        );
+        assert!(
+            oracle_worker_slots(plan(0, 64 * ORACLE_PARTITION_WORKING_MEMORY_BYTES, None)).is_err(),
+            "a plan without effective CPU cannot derive local capacity"
+        );
+
+        let directory = tempfile::tempdir().expect("calibration temp directory");
+        let path = directory.path().join("oracle-calibration.toml");
+        std::fs::write(&path, complete_oracle_calibration("approved"))
+            .expect("calibration profile is writable");
+        let mut runtime = OracleRuntimeConfig {
+            calibration_profile: path.clone(),
+            ..OracleRuntimeConfig::default()
+        };
+        let translated = load_oracle_admission_translation(&runtime, 24)
+            .expect("an approved schema-v2 profile translates")
+            .expect("a configured profile yields a translation");
+        // Tenant caps come from the profile's own leaves and are clamped to the
+        // local class capacities they schedule against, never to a cluster-wide
+        // figure.
+        assert!(translated.tenant_interactive_slots >= 1);
+        assert!(
+            translated.tenant_interactive_slots
+                <= translated.interactive_slots + translated.analytical_slots
+        );
+        assert!(translated.tenant_analytical_slots <= translated.analytical_slots);
+        assert_eq!(
+            translated.queue_capacity,
+            u32::try_from(runtime.admission_waiters).expect("queue capacity fits u32")
+        );
+
+        // Schema acceptance is boot configuration validation, which is the one
+        // gate a profile passes before translation ever sees it.
+        let validated = |contents: String| {
+            let profile = directory.path().join("boot-calibration.toml");
+            std::fs::write(&profile, contents).expect("calibration profile is writable");
+            let mut config = WyrdServerConfig {
+                deployment_profile: DeploymentProfile::Production,
+                ..WyrdServerConfig::default()
+            };
+            config.bifrost.oracle.calibration_profile = profile;
+            config.validate()
+        };
+        assert!(
+            validated(complete_oracle_calibration("approved").replacen(
+                "schema_version = 2",
+                "schema_version = 1",
+                1,
+            ))
+            .is_err(),
+            "a superseded schema-v1 profile must fail closed"
+        );
+        assert!(
+            validated(format!(
+                "cpu_cores = 4\n{}",
+                complete_oracle_calibration("approved")
+            ))
+            .is_err(),
+            "the deleted cpu_cores key must fail closed rather than be ignored"
+        );
+
+        // No profile at all leaves boot on its derived local defaults.
+        runtime.calibration_profile = PathBuf::new();
+        assert!(
+            load_oracle_admission_translation(&runtime, 24)
+                .expect("an absent profile is not an error")
+                .is_none()
+        );
+    }
+
     /// Calibration translation applies headroom, class shares, and parent caps.
     #[test]
     fn oracle_admission_config_translates_calibration() {

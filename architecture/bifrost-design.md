@@ -357,8 +357,14 @@ share one elastic memory and scratch root plus one leader/peer capacity counter.
 `QueryClass` is derived from the one returned physical root and is never a
 caller-controlled hint.
 
-When Analytical execution is enabled, configuration requires
-`1 <= interactive_floor_slots < total_oracle_slots`; otherwise startup fails.
+Local capacity is pod-local and is derived from this node's own CPU and memory,
+never from a cluster-wide quota. Total slot units default to the smaller of two
+units per effective CPU and the Oracle memory budget divided by the 32 MiB
+working set a unit represents; an explicit operator limit replaces that
+derivation outright. The resulting total splits once at boot into
+`interactive_floor_units + analytical_max_units`. `analytical_max_units` of zero
+is valid on a pod too small to run one two-unit Analytical query: its Analytical
+admission is refused immediately rather than queued forever.
 
 Within each path, queries are FIFO per tenant and tenants are selected by
 weighted round robin. The arbiter first fills the protected Interactive floor,
@@ -367,10 +373,12 @@ preserving tenant rotation. A continuously ready path cannot be skipped
 indefinitely, and Analytical work never consumes the Interactive floor.
 
 Slots admit; the actual grant sizes only the execution memory ceiling. A slot
-unit charges 32 MiB of working memory.
-Interactive work normally charges one unit and Analytical work two, with the
-selected physical plan owning the checked final cost. A query-local memory
-ceiling is derived once at admission:
+unit represents the 32 MiB working set used to derive local capacity; it is not
+itself charged as resident query memory. Concurrency is governed by slot units,
+actual cooperative reservation by the shared memory root, and spill by the
+separately leased scratch share. Interactive work charges one unit and
+Analytical work two, with the selected physical plan owning the checked final
+cost. A query-local memory ceiling is derived once at admission:
 
 ```text
 grant = oracle_budget * query_slots / sum(running_slots)
@@ -379,9 +387,20 @@ grant = clamp(grant, 32 MiB, 256 MiB)
 
 The denominator includes the candidate query's slots plus every running
 query's admitted slots. The grant is a non-reserved per-query ceiling held for
-the query lifetime and never recomputed under running operators. Each query's
-DataFusion pool enforces that ceiling while actual allocations draw from the
-shared root, whose hard limit remains authoritative.
+the query lifetime and never recomputed under running operators. Every leader
+and follower query receives a private view over one process-wide Oracle memory
+root, never an independently sized pool: the view refuses growth past that
+query's own ceiling, and the root's single tracked spill-fair pool, bounded by
+the Oracle floor plus the elastic borrow, arbitrates what all live queries hold
+together. Aggregate governed reservations therefore cannot sum above what the
+pod owns.
+
+Only fallible cooperative reservation is hard-limited. Growth DataFusion does
+not let fail is still real memory, so it is charged to an explicit process
+headroom counter that makes later fallible growth refuse sooner. The resource
+plan retains that headroom alongside the unmanaged reserve for dependency
+allocations outside cooperative reservation; the pool is the Oracle safety
+boundary, not a guarantee against operating-system or cgroup OOM.
 
 The guaranteed minimum successful grant fixes one `OracleSessionShape` before
 physical planning: the 32 MiB memory floor, the minimum two execution
@@ -400,7 +419,15 @@ cancels the full query; it never borrows from another query's ceiling. Scratch
 space is separately reserved because spill consumes real disk.
 
 Tenant fairness is owned separately by per-tenant FIFO and weighted
-round-robin admission. Grants are tenant-blind. Memory governance protects
+round-robin admission, scheduled pod-locally: tenant slot caps are local
+scheduling caps rather than cluster quotas. Grants are tenant-blind.
+
+An Analytical leader selects at most `max_workers_per_query` remote workers from
+the pinned eligible cut, rotating the starting position by the attempt identity
+so selection is deterministic, stable across re-projection of the same roster,
+and spread across attempts. Only selected workers reserve resources, receive
+requests, or affect the result; an unselected replica is absent from the cut
+entirely. Memory governance protects
 stability; pruning, vectorization, layout, and IO efficiency determine latency.
 
 ### Read audit and terminal contract

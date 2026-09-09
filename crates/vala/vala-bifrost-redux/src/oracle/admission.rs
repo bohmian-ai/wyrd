@@ -1280,7 +1280,7 @@ pub(super) struct AdmittedQueryGuard {
     local_permit: Option<LocalPermit>,
     /// Canonical local slot-use gauge retained with the running permit.
     /// Parent reservations retaining drained live batches through stream cleanup.
-    pub(super) live_reservations: Vec<AccountedMemoryReservation>,
+    pub(super) live_reservations: Vec<crate::resources::OracleQueryMemoryReservation>,
     /// Inactive Analytical graph and attempt ownership retained until cleanup.
     ///
     /// Present only on an attempt that the production-unreachable Analytical
@@ -1561,7 +1561,7 @@ impl AdmittedQueryGuard {
         let memory_bytes = self
             .live_reservations
             .iter()
-            .map(|reservation| reservation.bytes as u64)
+            .map(|reservation| reservation.bytes() as u64)
             .sum();
         let slot_units = self.local_permit.as_ref().map_or(0_u64, |_| 1_u64);
         let probe = Arc::new(QueryResourceProbe::new(

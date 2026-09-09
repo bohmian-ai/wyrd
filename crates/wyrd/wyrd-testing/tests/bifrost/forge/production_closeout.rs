@@ -13,9 +13,7 @@ use uuid::Uuid;
 use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef, TenantTableBinding};
 use vala_bifrost_redux::forge::{ForgeConfig, ForgeWorkerCompletionObserver};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
-use vala_bifrost_redux::resources::{
-    ROLE_MEMORY_FLOOR_BYTES, ResourceSource, SystemResourceSnapshot,
-};
+use vala_bifrost_redux::resources::{ResourceSource, SystemResourceSnapshot};
 use vala_bifrost_redux::storage::{StorageOperation, StorageOperationBarrier};
 use vala_sql::row_types::forge_tasks::{ForgeTaskStrategy, evidence_from_json};
 use wyrd_client::WyrdClient;
@@ -27,10 +25,6 @@ use wyrd_testing::bifrost::write::RawIngest;
 use wyrd_testing::bifrost::{
     BifrostClusterSpec, CommitUncertaintyCatalog, TestOracleResources, WyrdTestCluster,
 };
-use wyrd_testing::server::{
-    HARNESS_FORGE_COMPACTION_BUDGET_BYTES, HARNESS_NODE_MEMORY_LIMIT_BYTES,
-};
-
 use crate::public_support::{
     JourneyTable, ManagedRow, append_values, canonical_order, read_managed_rows, register_table,
     tenant_client, unique_table,
@@ -277,41 +271,22 @@ impl CloseoutJourney {
                 }),
             });
         }
-        // Both Oracle replicas must derive the same durable admission ceiling,
-        // in either profile: the canonical policy rows are globally scoped, so a
-        // dedicated replica and a co-located one that disagree fail the second
-        // pod's boot outright. This is replica agreement, not sizing. The
-        // dedicated replica needs neither the Scribe protected floor nor the
-        // Forge compaction reservation the co-located coordinator takes, so its
-        // injected limit sheds exactly those two from the harness default.
-        spec.nodes[2].oracle = Some(TestOracleResources {
-            spill_root: None,
-            system_resources: Some(SystemResourceSnapshot {
-                memory_limit_bytes: HARNESS_NODE_MEMORY_LIMIT_BYTES
-                    - ROLE_MEMORY_FLOOR_BYTES
-                    - HARNESS_FORGE_COMPACTION_BUDGET_BYTES,
-                effective_cpu: 4,
-                scratch_capacity_bytes: 4 * 1024 * 1024 * 1024,
-                scratch_available_bytes: 4 * 1024 * 1024 * 1024,
-                memory_source: ResourceSource::Injected,
-                cpu_source: ResourceSource::Injected,
-            }),
-        });
         if !profile.production_resources {
             // The scaled default runs the same journey on the resource plan
-            // every node reports for itself: no Forge compaction budget
-            // anywhere, and no node sized past the harness default.
+            // every node reports for itself: no Forge compaction budget and no
+            // injected snapshot anywhere. Each Oracle now derives its own local
+            // capacity, so two replicas no longer have to agree on one durable
+            // ceiling.
             for node in &spec.nodes {
                 assert_eq!(
                     node.forge_compaction_memory_limit_bytes, None,
                     "the fast profile overrides no Forge compaction budget"
                 );
                 assert!(
-                    node.oracle.as_ref().is_none_or(|oracle| oracle
-                        .system_resources
-                        .is_none_or(|resources| resources.memory_limit_bytes
-                            <= HARNESS_NODE_MEMORY_LIMIT_BYTES)),
-                    "the fast profile sizes no node past the harness default"
+                    node.oracle
+                        .as_ref()
+                        .is_none_or(|oracle| oracle.system_resources.is_none()),
+                    "the fast profile injects no node resource snapshot"
                 );
             }
         }

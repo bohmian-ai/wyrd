@@ -122,10 +122,6 @@ pub(super) struct TailFenceDrainer<'a> {
     pub(super) memory: &'a OracleMemoryResources,
     /// Query-local pool shared with `DataFusion` and retained live batches.
     pub(super) query_pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
-    /// Query telemetry retaining live-tail memory accounting.
-    pub(super) telemetry: Arc<OracleTelemetry>,
-    /// Immutable admission class applied to live-tail memory metrics.
-    pub(super) query_class: QueryClass,
     /// Absolute deadline shared by fence acquisition and every page read.
     pub(super) deadline: Instant,
     /// Admission lifecycle cancellation shared with streaming.
@@ -176,7 +172,7 @@ pub(super) struct DrainedTails {
     /// Per-table shallow Arrow batches.
     pub(super) batches: HashMap<String, Vec<RecordBatch>>,
     /// Reservations retained until the final query stream drops.
-    pub(super) reservations: Vec<AccountedMemoryReservation>,
+    pub(super) reservations: Vec<crate::resources::OracleQueryMemoryReservation>,
     /// Whether one requested live source was unavailable.
     pub(super) degraded: bool,
 }
@@ -188,17 +184,13 @@ pub(super) struct DrainedTailFence {
     /// Shallow live batches retained by this interval.
     pub(super) batches: Vec<RecordBatch>,
     /// Parent reservations retaining every decoded batch.
-    pub(super) reservations: Vec<AccountedMemoryReservation>,
+    pub(super) reservations: Vec<crate::resources::OracleQueryMemoryReservation>,
 }
 
 /// Query-scoped dependencies and limits used by [`TailFenceDrainer`].
 pub(super) struct TailFenceDrainerConfig {
-    /// Query telemetry retaining live-tail memory accounting.
-    pub(super) telemetry: Arc<OracleTelemetry>,
     /// Query-local pool charged for every decoded live batch.
     pub(super) query_pool: Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
-    /// Immutable admission class applied to live-tail memory metrics.
-    pub(super) query_class: QueryClass,
     /// Absolute deadline shared by fence acquisition and every page read.
     pub(super) deadline: Instant,
     /// Admission lifecycle cancellation shared with streaming.
@@ -292,8 +284,6 @@ impl TailFenceDrainer<'_> {
             tails,
             memory,
             query_pool: config.query_pool,
-            telemetry: config.telemetry,
-            query_class: config.query_class,
             deadline: config.deadline,
             cancellation: config.cancellation,
             freshness: config.freshness,
@@ -819,11 +809,7 @@ impl TailFenceDrainer<'_> {
                     self.release_one(&mut acquired).await;
                     return Err((table, BifrostError::QueryVisibilityUnavailable));
                 };
-                reservations.push(self.telemetry.account_query_memory(
-                    reservation,
-                    self.query_class,
-                    OracleMemoryKind::Tail,
-                ));
+                reservations.push(reservation);
                 batches.push(batch.as_ref().clone());
             }
             after = page.next;
@@ -1205,9 +1191,7 @@ mod tests {
             tails,
             memory,
             TailFenceDrainerConfig {
-                telemetry: Arc::new(OracleTelemetry::new()),
                 query_pool: crate::resources::bounded_memory_pool(1024 * 1024 * 1024),
-                query_class: QueryClass::Interactive,
                 deadline: Instant::now() + Duration::from_secs(1),
                 cancellation: CancellationToken::new(),
                 freshness: wyrd_spec::vala::api::FreshnessPolicy::Strict,

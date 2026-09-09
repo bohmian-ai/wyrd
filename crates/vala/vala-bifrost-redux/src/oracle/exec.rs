@@ -70,8 +70,8 @@ use wyrd_spec::vala::api::{BifrostSecurityPhase, BifrostSecurityViolationKind, Q
 use wyrd_spec::vala::managed_columns::DATA_TENANT_ID;
 
 use super::{
-    AccountedMemoryReservation, AuthorizedQueryContext, BifrostSecurityViolation, OracleAudit,
-    OracleMemoryKind, OracleMemoryResources, OracleTelemetry, VerifiedSecurityContext,
+    AuthorizedQueryContext, BifrostSecurityViolation, OracleAudit, OracleMemoryResources,
+    OracleTelemetry, VerifiedSecurityContext,
 };
 
 #[cfg(feature = "test-support")]
@@ -2010,34 +2010,12 @@ type HotReadOverride = Arc<
         + Sync,
 >;
 
-/// Owner-backed range bytes whose Oracle charge follows every clone and slice.
+/// Owner-backed range bytes whose Oracle reservation follows every clone and slice.
 struct AccountedRangeOwner {
     /// Exact bytes returned by the storage range read.
     bytes: bytes::Bytes,
     /// Oracle child and parent capacity retained through the final byte owner.
     reservation: crate::resources::OracleQueryMemoryReservation,
-    /// Canonical Oracle telemetry owner charged for the same byte lifetime.
-    telemetry: Arc<OracleTelemetry>,
-    /// Immutable query class used for balanced gauge release.
-    query_class: QueryClass,
-}
-
-impl AccountedRangeOwner {
-    /// Couples exact range capacity to the canonical Oracle memory gauges.
-    fn new(
-        bytes: bytes::Bytes,
-        reservation: crate::resources::OracleQueryMemoryReservation,
-        telemetry: Arc<OracleTelemetry>,
-        query_class: QueryClass,
-    ) -> Self {
-        telemetry.charge_memory(bytes.len(), query_class, OracleMemoryKind::Source);
-        Self {
-            bytes,
-            reservation,
-            telemetry,
-            query_class,
-        }
-    }
 }
 
 impl AsRef<[u8]> for AccountedRangeOwner {
@@ -2049,15 +2027,11 @@ impl AsRef<[u8]> for AccountedRangeOwner {
 }
 
 impl Drop for AccountedRangeOwner {
-    /// Releases gauge accounting before the coupled governor reservation drops.
+    /// Asserts the coupled reservation still matches the bytes it retains.
     fn drop(&mut self) {
-        if self
-            .telemetry
-            .release_memory(self.query_class, OracleMemoryKind::Source, self.bytes.len())
-            .is_err()
-        {
+        if self.reservation.bytes() != self.bytes.len() {
             self.reservation.poison();
-            tracing::error!("Oracle hot-range wrapper cleanup poisoned accounting");
+            tracing::error!("Oracle hot-range reservation no longer matches its bytes");
         }
     }
 }
@@ -2181,7 +2155,7 @@ enum HotDecodedReservation {
     /// Governor reservation with its coupled leader gauge charge.
     Leader {
         /// Capacity and gauge charge released when this value drops.
-        _reservation: AccountedMemoryReservation,
+        _reservation: crate::resources::OracleQueryMemoryReservation,
     },
     /// Request-local pool reservation held for one yielded batch.
     Follower {
@@ -2246,19 +2220,12 @@ impl HotParquetGovernance {
         reservation: HotRangeReservation,
     ) -> parquet::errors::Result<bytes::Bytes> {
         match (self, reservation) {
-            (
-                Self::Leader {
-                    telemetry,
-                    query_class,
-                    ..
-                },
-                HotRangeReservation::Leader(reservation),
-            ) => Ok(bytes::Bytes::from_owner(AccountedRangeOwner::new(
-                bytes,
-                reservation,
-                Arc::clone(telemetry),
-                *query_class,
-            ))),
+            (Self::Leader { .. }, HotRangeReservation::Leader(reservation)) => {
+                Ok(bytes::Bytes::from_owner(AccountedRangeOwner {
+                    bytes,
+                    reservation,
+                }))
+            }
             (Self::Follower { .. }, HotRangeReservation::Follower(reservation)) => {
                 Ok(bytes::Bytes::from_owner(PooledRangeOwner {
                     bytes,
@@ -2280,19 +2247,14 @@ impl HotParquetGovernance {
             Self::Leader {
                 memory,
                 memory_pool,
-                telemetry,
-                query_class,
+                ..
             } => {
                 let reservation = memory
                     .resources
                     .try_split_query_memory(memory_pool, "oracle-hot-decoded-batch", bytes)
                     .map_err(|error| DataFusionError::External(Box::new(error)))?;
                 Ok(HotDecodedReservation::Leader {
-                    _reservation: telemetry.account_query_memory(
-                        reservation,
-                        *query_class,
-                        OracleMemoryKind::Source,
-                    ),
+                    _reservation: reservation,
                 })
             }
             Self::Follower { memory_pool } => {
@@ -4032,11 +3994,9 @@ mod tests {
     async fn drain_projected_int64_batches(
         batches: &mut datafusion::execution::SendableRecordBatchStream,
         projected: &Arc<Schema>,
-        observed: (&Arc<dyn MemoryPool>, &Arc<OracleTelemetry>),
-        peaks: (&Arc<AtomicU64>, &Arc<AtomicU64>),
+        query_pool: &Arc<dyn MemoryPool>,
+        peak_pool: &Arc<AtomicU64>,
     ) -> usize {
-        let (query_pool, telemetry) = observed;
-        let (peak_pool, peak_telemetry) = peaks;
         let mut rows = 0;
         while let Some(batch) = batches.next().await {
             let batch = batch.expect("bounded batch");
@@ -4050,10 +4010,6 @@ mod tests {
             assert_eq!(values.values().as_ref(), &[1, 2, 3]);
             rows += batch.num_rows();
             peak_pool.fetch_max(query_pool.reserved() as u64, Ordering::AcqRel);
-            peak_telemetry.fetch_max(
-                telemetry.memory_bytes.load(Ordering::Acquire),
-                Ordering::AcqRel,
-            );
         }
         rows
     }
@@ -4110,19 +4066,17 @@ mod tests {
 
     /// Asserts a finished hot scan returned every governed byte it charged.
     ///
-    /// A completed stream must leave the root governor, the query pool, and the
-    /// Oracle telemetry gauge all back at zero; a nonzero residue is a leaked
-    /// reservation rather than a measurement artifact.
+    /// A completed stream must leave the root governor and the query pool both
+    /// back at zero; a nonzero residue is a leaked reservation rather than a
+    /// measurement artifact.
     fn assert_hot_scan_baselines(
         roles: &crate::resources::BifrostRoleResources,
         query_pool: &Arc<dyn MemoryPool>,
-        telemetry: &OracleTelemetry,
     ) {
         let snapshot = roles.snapshot().expect("root snapshot");
         assert_eq!(snapshot.oracle_memory_used_bytes, 0);
         assert_eq!(snapshot.elastic_memory_used_bytes, 0);
         assert_eq!(query_pool.reserved(), 0);
-        assert_eq!(telemetry.memory_bytes.load(Ordering::Acquire), 0);
     }
 
     /// In-memory sources remain unavailable while hot reads aggregate actual bytes.
@@ -4842,12 +4796,9 @@ mod tests {
         let recorded = Arc::clone(&ranges);
         let source = fixture.bytes.clone();
         let peak_pool = Arc::new(AtomicU64::new(0));
-        let peak_telemetry = Arc::new(AtomicU64::new(0));
         let query_pool = crate::resources::bounded_memory_pool(1024 * 1024 * 1024);
         let observed_pool = Arc::clone(&query_pool);
-        let range_telemetry = Arc::clone(&telemetry);
         let range_peak_pool = Arc::clone(&peak_pool);
-        let range_peak_telemetry = Arc::clone(&peak_telemetry);
         let projected = Arc::new(Schema::new(vec![Field::new(
             "value",
             DataType::Int64,
@@ -4872,10 +4823,6 @@ mod tests {
         )
         .with_test_reader(Arc::new(move |_, range| {
             range_peak_pool.fetch_max(observed_pool.reserved() as u64, Ordering::AcqRel);
-            range_peak_telemetry.fetch_max(
-                range_telemetry.memory_bytes.load(Ordering::Acquire),
-                Ordering::AcqRel,
-            );
             recorded
                 .lock()
                 .expect("recorded ranges")
@@ -4898,13 +4845,8 @@ mod tests {
                 ),
             )
             .expect("production hot stream");
-        let rows = drain_projected_int64_batches(
-            &mut batches,
-            &projected,
-            (&query_pool, &telemetry),
-            (&peak_pool, &peak_telemetry),
-        )
-        .await;
+        let rows =
+            drain_projected_int64_batches(&mut batches, &projected, &query_pool, &peak_pool).await;
         assert_eq!(rows, 3);
         assert!(fixture.bytes.len() > budget);
         let ranges = ranges.lock().expect("recorded ranges");
@@ -4921,12 +4863,9 @@ mod tests {
         assert_eq!(metrics.terminal_values(), (Some(physical), 1, 1));
         let peak_pool =
             usize::try_from(peak_pool.load(Ordering::Acquire)).expect("query peak fits usize");
-        let peak_telemetry = usize::try_from(peak_telemetry.load(Ordering::Acquire))
-            .expect("telemetry peak fits usize");
         assert!(peak_pool > 0 && peak_pool <= budget);
-        assert!(peak_telemetry > 0 && peak_telemetry <= budget);
         drop(ranges);
-        assert_hot_scan_baselines(&governor, &query_pool, &telemetry);
+        assert_hot_scan_baselines(&governor, &query_pool);
     }
 
     /// Footer metadata is fetched only through governed ranged IO.
@@ -5089,7 +5028,6 @@ mod tests {
             .expect("first yielded batch");
         assert_eq!(batch.num_rows(), 3);
         assert!(query_pool.reserved() > 0);
-        assert!(telemetry.memory_bytes.load(Ordering::Acquire) > 0);
         let attempts_at_yield = attempts.load(Ordering::Acquire);
         drop(stream);
         drop(batch);
@@ -5108,7 +5046,6 @@ mod tests {
             0
         );
         assert_eq!(query_pool.reserved(), 0);
-        assert_eq!(telemetry.memory_bytes.load(Ordering::Acquire), 0);
         assert_eq!(attempts.load(Ordering::Acquire), attempts_at_yield);
     }
 
@@ -6203,7 +6140,7 @@ mod tests {
                 leader_metrics.terminal_values(),
                 follower_metrics.terminal_values()
             );
-            assert_hot_scan_baselines(&governor, &leader_pool, &telemetry);
+            assert_hot_scan_baselines(&governor, &leader_pool);
             assert_eq!(follower_pool.reserved(), 0);
         }
 

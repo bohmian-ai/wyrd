@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 use wyrd_spec::vala::api::QueryClass;
 use wyrd_spec::vala::error::BifrostError;
 
-use super::{AccountedMemoryReservation, OracleMemoryResources, OracleTelemetry};
+use super::{OracleMemoryResources, OracleTelemetry};
 
 /// Complete planned authority of one physical remote-scan occurrence.
 ///
@@ -207,7 +207,7 @@ pub(super) struct OracleExecutionBindings {
     /// Completed follower assignments keyed by their full planned occurrence.
     follower_assignments: HashMap<OracleSourceKey, wyrd_spec::vala::api::FollowerScanAssignment>,
     /// Reservations retaining those batches until the query settles.
-    _reservations: Vec<AccountedMemoryReservation>,
+    _reservations: Vec<crate::resources::OracleQueryMemoryReservation>,
     /// Whether one requested live source was unavailable at drain time.
     degraded: bool,
 }
@@ -233,7 +233,7 @@ pub(super) struct OracleExecutionBindingInputs {
     pub(super) follower_assignments:
         HashMap<OracleSourceKey, wyrd_spec::vala::api::FollowerScanAssignment>,
     /// Reservations retaining those batches until the query settles.
-    pub(super) reservations: Vec<AccountedMemoryReservation>,
+    pub(super) reservations: Vec<crate::resources::OracleQueryMemoryReservation>,
     /// Whether one requested live source was unavailable at drain time.
     pub(super) degraded: bool,
 }

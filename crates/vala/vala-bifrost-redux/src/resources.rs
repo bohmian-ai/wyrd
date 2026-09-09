@@ -374,6 +374,42 @@ fn record_memory_transition(role: &'static str, result: &'static str, current_by
     .set(current_bytes.to_f64().unwrap_or(f64::MAX));
 }
 
+/// Emits the pod-local Oracle capacity gauges from one locked ledger read.
+///
+/// Every series is local: the cooperative memory root, the headroom holding
+/// `DataFusion`'s infallible growth, scratch, and the aggregate slot ledger with
+/// its protected Interactive floor. Labels come from a closed `kind` domain and
+/// never carry tenant, query, node, or table identity, and nothing here claims a
+/// cluster-wide quota. It is called wherever an Oracle owner is admitted or
+/// released, so an Oracle-only pod that never runs the Scribe tick still
+/// exports live occupancy.
+fn record_oracle_capacity(state: &ResourceState, plan: &ResourcePlan, split: OracleClassSplit) {
+    let bytes = |kind: &'static str, value: usize| {
+        metrics::gauge!("bifrost_oracle_local_bytes", "kind" => kind)
+            .set(value.to_f64().unwrap_or(f64::MAX));
+    };
+    bytes(
+        "memory_limit",
+        plan.oracle_floor_bytes
+            .saturating_add(plan.elastic_memory_bytes),
+    );
+    bytes("memory_used", state.oracle_query_memory_used_bytes);
+    bytes("memory_headroom", state.oracle_infallible_bytes);
+    metrics::gauge!("bifrost_oracle_local_bytes", "kind" => "scratch_used").set(
+        state
+            .oracle_query_scratch_used_bytes
+            .to_f64()
+            .unwrap_or(f64::MAX),
+    );
+    let slot_units = |kind: &'static str, value: u32| {
+        metrics::gauge!("bifrost_oracle_local_slot_units", "kind" => kind).set(f64::from(value));
+    };
+    slot_units("limit", split.total_units());
+    slot_units("used", state.oracle_query_slot_units);
+    slot_units("analytical_used", state.oracle_analytical_slot_units);
+    slot_units("interactive_floor", split.interactive_floor_units);
+}
+
 /// One registered root resolved to its physical filesystem device.
 #[derive(Debug, Clone)]
 struct RegisteredVolumeRoot {
@@ -3413,6 +3449,7 @@ impl BifrostResourceGovernor {
         state.oracle_analytical_queries = next_analytical;
         state.oracle_query_scratch_used_bytes = next_query_scratch;
         record_memory_transition("oracle", "acquired", state.oracle_memory_used_bytes);
+        record_oracle_capacity(&state, &plan, self.oracle_class_split());
         let memory_peak_bytes = Arc::new(AtomicUsize::new(0));
         let memory_pool = memory_root.query_view(granted_memory_bytes, &memory_peak_bytes);
         Ok(OracleQueryResources {
@@ -3466,6 +3503,7 @@ impl BifrostResourceGovernor {
         state.oracle_memory_used_bytes = next;
         state.elastic_memory_used_bytes = next_elastic;
         record_memory_transition("oracle", "acquired", next);
+        record_oracle_capacity(&state, &plan, self.oracle_class_split());
         Ok(OracleMemoryLease {
             bytes,
             governor: self.clone(),
@@ -4777,6 +4815,7 @@ impl OracleMemoryLease {
         state.elastic_memory_used_bytes -= released_elastic;
         state.memory_epoch = state.memory_epoch.wrapping_add(1);
         record_memory_transition("oracle", "released", state.oracle_memory_used_bytes);
+        record_oracle_capacity(&state, &plan, self.governor.oracle_class_split());
         self.released = true;
         drop(state);
         self.governor.inner.memory_changed.notify_waiters();
@@ -4991,6 +5030,11 @@ impl OracleQueryResources {
         state.oracle_query_scratch_used_bytes -= self.scratch_bytes;
         state.memory_epoch = state.memory_epoch.wrapping_add(1);
         record_memory_transition("oracle", "released", state.oracle_memory_used_bytes);
+        record_oracle_capacity(
+            &state,
+            &self.governor.plan(),
+            self.governor.oracle_class_split(),
+        );
         self.volume_scratch.take();
         self.released = true;
         drop(state);

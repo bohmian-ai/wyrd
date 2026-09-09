@@ -451,21 +451,9 @@ impl AttemptPhaseTimer {
 /// update gauges from real guard lifetimes. It emits through the recorder
 /// installed by the server and never installs an exporter or subscriber.
 #[derive(Debug)]
-struct OracleTelemetry {
-    /// Oracle-owned parent-memory bytes retained by live reservations.
-    memory_bytes: AtomicU64,
-}
+struct OracleTelemetry;
 
 impl OracleTelemetry {
-    /// Adds one live Oracle memory owner to the canonical gauge accounting.
-    fn charge_memory(&self, bytes: usize, query_class: QueryClass, memory_kind: OracleMemoryKind) {
-        let total = self
-            .memory_bytes
-            .fetch_add(bytes as u64, Ordering::AcqRel)
-            .saturating_add(bytes as u64);
-        let _ = (total, query_class, memory_kind);
-    }
-
     /// Creates the process-local Oracle metric owner with zeroed gauges.
     #[must_use]
     fn new() -> Self {
@@ -523,9 +511,7 @@ impl OracleTelemetry {
                 .increment(0);
         }
         telemetry::register_analytical_series();
-        Self {
-            memory_bytes: AtomicU64::new(0),
-        }
+        Self
     }
 
     /// Starts production accounting for one classified logical query.
@@ -601,67 +587,6 @@ impl OracleTelemetry {
             finished: false,
         }
     }
-
-    /// Couples a nested query-pool reservation to canonical Oracle gauges.
-    #[must_use]
-    fn account_query_memory(
-        self: &Arc<Self>,
-        reservation: crate::resources::OracleQueryMemoryReservation,
-        query_class: QueryClass,
-        memory_kind: OracleMemoryKind,
-    ) -> AccountedMemoryReservation {
-        let bytes = reservation.bytes();
-        self.charge_memory(bytes, query_class, memory_kind);
-        AccountedMemoryReservation {
-            reservation: Some(OracleGovernorReservation::Query(reservation)),
-            owner: Arc::clone(self),
-            query_class,
-            memory_kind,
-            bytes,
-        }
-    }
-
-    /// Releases gauge accounting before the governor reservation is dropped.
-    ///
-    /// # Errors
-    ///
-    /// Returns `Err(())` when the wrapper total cannot cover `bytes`; its
-    /// caller poisons the coupled governor because ownership no longer agrees.
-    fn release_memory(
-        &self,
-        query_class: QueryClass,
-        memory_kind: OracleMemoryKind,
-        bytes: usize,
-    ) -> Result<(), ()> {
-        let bytes = u64::try_from(bytes).map_err(|_| ())?;
-        let mut current = self.memory_bytes.load(Ordering::Acquire);
-        loop {
-            let Some(total) = current.checked_sub(bytes) else {
-                return Err(());
-            };
-            match self.memory_bytes.compare_exchange(
-                current,
-                total,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    let _ = (total, query_class, memory_kind, bytes);
-                    return Ok(());
-                }
-                Err(observed) => current = observed,
-            }
-        }
-    }
-}
-
-/// Closed Oracle memory purpose used by the canonical class gauge.
-#[derive(Debug, Clone, Copy)]
-enum OracleMemoryKind {
-    /// Encoded or decoded source buffers.
-    Source,
-    /// Fenced live-tail batches retained through query completion.
-    Tail,
 }
 
 /// Closed state machine for one query's terminal metric emission.
@@ -855,52 +780,6 @@ impl Drop for AdmissionWaitTelemetryGuard {
         }
         metrics::gauge!("oracle_queries_queued", "class" => query_class_label(self.query_class))
             .decrement(1.0);
-    }
-}
-
-/// Governor reservation coupled to canonical Oracle memory gauges.
-enum OracleGovernorReservation {
-    /// Nested ownership inside the complete query envelope.
-    Query(crate::resources::OracleQueryMemoryReservation),
-}
-
-impl OracleGovernorReservation {
-    /// Poison the shared governor after wrapper-accounting corruption.
-    fn poison(&self) {
-        match self {
-            Self::Query(reservation) => reservation.poison(),
-        }
-    }
-}
-
-/// Governor reservation coupled to canonical Oracle memory gauges.
-struct AccountedMemoryReservation {
-    /// Governor reservation released before the gauges are decremented.
-    reservation: Option<OracleGovernorReservation>,
-    /// Retained process-local telemetry owner.
-    owner: Arc<OracleTelemetry>,
-    /// Query class charged for the reservation.
-    query_class: QueryClass,
-    /// Closed memory purpose.
-    memory_kind: OracleMemoryKind,
-    /// Exact reserved bytes.
-    bytes: usize,
-}
-
-impl Drop for AccountedMemoryReservation {
-    /// Releases checked wrapper accounting, then drops parent capacity.
-    fn drop(&mut self) {
-        if self
-            .owner
-            .release_memory(self.query_class, self.memory_kind, self.bytes)
-            .is_err()
-        {
-            if let Some(reservation) = &self.reservation {
-                reservation.poison();
-            }
-            tracing::error!("Oracle memory wrapper cleanup poisoned accounting");
-        }
-        self.reservation.take();
     }
 }
 
@@ -3298,11 +3177,11 @@ impl Oracle {
         let value = bindings::OracleExecutionBindings::try_new(
             bindings::OracleExecutionBindingInputs {
                 grant: bindings::OracleExecutionGrant {
+                    telemetry: Arc::clone(&self.telemetry),
                     query_class,
                     cancellation: admitted.cancellation.clone(),
                     deadline,
                     memory: self.memory.clone(),
-                    telemetry: Arc::clone(&self.telemetry),
                 },
                 local_batches,
                 follower_assignments,
@@ -3423,9 +3302,7 @@ impl Oracle {
             &self.tails,
             &self.memory,
             TailFenceDrainerConfig {
-                telemetry: Arc::clone(&self.telemetry),
                 query_pool,
-                query_class: input.query_class,
                 deadline: input.deadline,
                 cancellation: input.admitted.cancellation.clone(),
                 freshness: input.request.freshness,
@@ -3581,11 +3458,9 @@ impl Oracle {
             &self.tails,
             &self.memory,
             TailFenceDrainerConfig {
-                telemetry: Arc::clone(&self.telemetry),
                 query_pool: admitted
                     .memory_pool()
                     .ok_or(BifrostError::QueryAdmissionRejected)?,
-                query_class: class,
                 deadline: options.deadline,
                 cancellation: admitted.cancellation.clone(),
                 freshness: wyrd_spec::vala::api::FreshnessPolicy::Strict,
@@ -5839,6 +5714,90 @@ mod tests {
             observed,
             "canonical stream metric was not recorded: {snapshot:?}"
         );
+    }
+
+    /// Oracle capacity metrics describe this pod only, with closed labels.
+    ///
+    /// A real admitted query is what publishes them, so this drives one through
+    /// the shared root and asserts the local memory, headroom, scratch, and slot
+    /// families appear with the exact `kind` domain the emitter owns — and that
+    /// no series claims a cluster-wide quota or a delegated, leased, renewed, or
+    /// overdrawn allocation.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture cannot admit a query or a series is missing,
+    /// unbounded, or forbidden.
+    #[test]
+    fn oracle_metrics_describe_only_local_capacity() {
+        let recorder = wyrd_bench::BenchmarkRecorder::new();
+        metrics::with_local_recorder(&recorder, || {
+            let roles = crate::resources::BifrostRuntimeResources::composed_for_test(
+                768 * 1024 * 1024,
+                8 * 1024 * 1024 * 1024,
+                [crate::resources::BifrostRole::Oracle],
+            );
+            let oracle = roles.oracle().expect("Oracle capability");
+            let admitted = oracle
+                .try_acquire_query(crate::resources::OracleResourceRequest::for_class(
+                    QueryClass::Interactive,
+                    0.0,
+                ))
+                .expect("one interactive query is admitted");
+            drop(admitted);
+        });
+        let snapshot = recorder.snapshot();
+        let expected = [
+            "bifrost_oracle_local_bytes{kind=\"memory_limit\"}",
+            "bifrost_oracle_local_bytes{kind=\"memory_used\"}",
+            "bifrost_oracle_local_bytes{kind=\"memory_headroom\"}",
+            "bifrost_oracle_local_bytes{kind=\"scratch_used\"}",
+            "bifrost_oracle_local_slot_units{kind=\"limit\"}",
+            "bifrost_oracle_local_slot_units{kind=\"used\"}",
+            "bifrost_oracle_local_slot_units{kind=\"analytical_used\"}",
+            "bifrost_oracle_local_slot_units{kind=\"interactive_floor\"}",
+        ];
+        for series in expected {
+            assert!(
+                snapshot.gauges.contains_key(series),
+                "missing local capacity series {series}: {snapshot:?}"
+            );
+        }
+        // The released query returns every local unit it charged, so a stale
+        // gauge would be indistinguishable from a leaked one.
+        assert_eq!(
+            snapshot
+                .gauges
+                .get("bifrost_oracle_local_slot_units{kind=\"used\"}"),
+            Some(&0.0)
+        );
+        assert_eq!(
+            snapshot
+                .gauges
+                .get("bifrost_oracle_local_bytes{kind=\"memory_used\"}"),
+            Some(&0.0)
+        );
+        let families = snapshot
+            .gauges
+            .keys()
+            .chain(snapshot.counters.keys())
+            .chain(snapshot.histograms.keys());
+        for series in families {
+            for forbidden in ["delegated", "_lease", "renewal", "overdraft", "quota"] {
+                assert!(
+                    !series.contains(forbidden),
+                    "series {series} names the removed {forbidden} model"
+                );
+            }
+            // Bounded cardinality: the only labels this owner emits come from
+            // closed domains, so no series may carry an identity value.
+            for identity in ["tenant=", "query=", "node=", "table=", "path="] {
+                assert!(
+                    !series.contains(identity),
+                    "series {series} carries the unbounded label {identity}"
+                );
+            }
+        }
     }
 
     /// Oracle construction publishes every closed idle query, slot, and

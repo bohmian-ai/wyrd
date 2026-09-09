@@ -44,9 +44,12 @@ to one absolute deadline; unsettled work retains exact replay evidence.
 
 Oracle derives Interactive or Analytical from the one physical root returned by
 the pinned planner, then admits their slots separately under one atomic total
-bound. Each query owns its runtime, one aggregate memory pool shared by
-operators and exchanges, spill allocation, bounded Wyrd-owned admission queues
-and graph controls, cancellation tree, and deadline. Dependency-owned exchange
+bound derived from this pod's own CPU and memory. Each query owns its runtime, a
+private ceiling view over the one process-wide memory root shared by every
+operator, exchange, leader, and selected worker, spill allocation, bounded
+Wyrd-owned admission queues and graph controls, cancellation tree, and deadline.
+Tenant slot caps schedule that local capacity fairly; they are not cluster-wide
+quotas, and no Oracle control claims a cluster-wide capacity guarantee. Dependency-owned exchange
 queues retain their pinned byte backpressure without a Wyrd item-count
 guarantee. Admission refusal never mutates the root grant. Cancellation releases
 every descendant reservation and temporary file.
@@ -112,7 +115,10 @@ Measure at minimum:
   ownership;
 - staged dwell, merge fan-in/passes, row groups, hot-object PUT amplification,
   `file_list` publication, reconciliation, and live-tail source counts;
-- Oracle route, slot wait, planning, pruning, exchange bytes, worker fan-out,
+- Oracle local slot and scratch occupancy, aggregate governed memory use,
+  memory refusal, and measured infallible headroom;
+- Oracle route, slot wait, planning, pruning, exchange bytes, selected worker
+  count, worker fan-out,
   terminal peer failure, cancellation, TTFF, terminal latency, and incomplete
   streams;
 - Forge promotion debt, rewrite debt, local FIFO age, estimated and observed

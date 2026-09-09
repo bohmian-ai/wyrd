@@ -2556,7 +2556,6 @@ mod tests {
         );
     }
 
-
     /// Running-query controls retain one request identity and SQL-free state.
     ///
     /// # Panics

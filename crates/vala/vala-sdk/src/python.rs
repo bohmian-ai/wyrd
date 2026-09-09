@@ -25,8 +25,7 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
-    BifrostQueryRequest, FreshnessPolicy, PhysicalLayoutWire,
-    VisibilityMode,
+    BifrostQueryRequest, FreshnessPolicy, PhysicalLayoutWire, VisibilityMode,
 };
 use wyrd_spec::vala::ids::RunId;
 use wyrd_utils::py::json_to_pyobject;
@@ -548,12 +547,6 @@ fn to_python_json(
     let value = value.map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
     json_to_pyobject(py, &value)
 }
-
-/// Parses one optional RFC 3339 window bound at the Python boundary.
-///
-/// # Errors
-///
-/// Returns `ValueError` naming the offending field when the text is not an
 
 /// Parses one lifecycle request identity into the canonical structured error boundary.
 ///

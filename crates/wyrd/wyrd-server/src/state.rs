@@ -19,9 +19,7 @@ use vala_bifrost_redux::oracle::Oracle as OracleEngine;
 use vala_bifrost_redux::oracle::dispatcher::{BifrostPeerTls, OraclePeerCredentials};
 use vala_bifrost_redux::oracle::follower::{PhysicalPlanFollower, ScribeTailResolver};
 use vala_bifrost_redux::oracle::peer::{PeerSecurityAudit, PeerTicketVerifier};
-use vala_bifrost_redux::oracle::{
-    AuthorizedQueryContext, OracleQueryStream, RunningQueryRegistry,
-};
+use vala_bifrost_redux::oracle::{AuthorizedQueryContext, OracleQueryStream, RunningQueryRegistry};
 use vala_bifrost_redux::resources::{BifrostRoleResources, OracleResources, ScribeResources};
 use vala_bifrost_redux::scribe::ScribeImpl;
 use vala_bifrost_redux::scribe::tail_rpc::{

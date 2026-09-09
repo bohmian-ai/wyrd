@@ -15,9 +15,8 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
     BifrostQueryRequest, BifrostTableDescription, CancelRunningQueryResponse,
-    ListRunningQueriesResponse,
-    QueryStreamFrame, QueryTerminalErrorCode, QueryTerminalFrame, QueryTerminalOutcome,
-    RunningQuerySummary,
+    ListRunningQueriesResponse, QueryStreamFrame, QueryTerminalErrorCode, QueryTerminalFrame,
+    QueryTerminalOutcome, RunningQuerySummary,
 };
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_tonic::frame_codec::FrameDecoder;

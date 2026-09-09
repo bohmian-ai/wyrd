@@ -1,9 +1,6 @@
 //! Auth-bound adapters from Gate transports and typed plans into retained Oracle.
 
-
-use vala_bifrost_redux::oracle::{
-    AuthorizedQueryContext, OracleQueryStream, QueryIpcDecodeError,
-};
+use vala_bifrost_redux::oracle::{AuthorizedQueryContext, OracleQueryStream, QueryIpcDecodeError};
 use wyrd_runtime::{Permission, PermissionVerdict};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
@@ -322,7 +319,6 @@ pub async fn cancel_running_query(
     outcome
 }
 
-
 /// operators.
 pub(crate) fn arrow_decode_error(error: &QueryIpcDecodeError) -> WyrdError {
     WyrdError::Internal {
@@ -478,5 +474,4 @@ mod tests {
             );
         }
     }
-
 }

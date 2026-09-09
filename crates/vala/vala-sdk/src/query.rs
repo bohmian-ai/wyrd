@@ -7,7 +7,6 @@ use std::pin::Pin;
 use arrow::datatypes::SchemaRef;
 use arrow::ipc::reader::StreamReader;
 use arrow::record_batch::RecordBatch;
-use chrono::SecondsFormat;
 use futures_util::{Stream, StreamExt};
 use wyrd_client::WyrdClient;
 use wyrd_client::error::WyrdClientError;
@@ -15,8 +14,8 @@ use wyrd_queue::WyrdQueueError;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
-    BifrostQueryRequest, BifrostTableDescription, CancelRunningQueryResponse, GetTraceRequest,
-    GetTraceResponse, ListRunningQueriesResponse, QueryGenAiRequest, QueryGenAiResponse,
+    BifrostQueryRequest, BifrostTableDescription, CancelRunningQueryResponse,
+    ListRunningQueriesResponse,
     QueryStreamFrame, QueryTerminalErrorCode, QueryTerminalFrame, QueryTerminalOutcome,
     RunningQuerySummary,
 };
@@ -509,88 +508,6 @@ impl QueryClient {
                 &format!("/v1/bifrost/tables/{namespace}/{name}"),
                 None,
             )
-            .await
-            .map_err(Into::into)
-    }
-
-    /// Reads one complete authorized cut of a single trace.
-    ///
-    /// Trace detail has no pagination: the response carries every span the
-    /// caller may see, with each span's events and links nested on it. `since`
-    /// and `until` bound the scanned event-time window only and travel as query
-    /// parameters, matching the server's route contract. Sensitive payload is
-    /// omitted by the server when the caller lacks payload read permission,
-    /// which the client neither detects nor compensates for.
-    ///
-    /// # Errors
-    ///
-    /// Returns a protocol error when `since` is later than `until`, and stable
-    /// authentication, authorization, not-found, availability, or protocol
-    /// errors from the server.
-    ///
-    /// # Cancellation
-    ///
-    /// Cancelling the future abandons the pending read request.
-    pub async fn get_trace(
-        &self,
-        request: &GetTraceRequest,
-    ) -> Result<GetTraceResponse, ValaSdkError> {
-        if let (Some(since), Some(until)) = (request.since, request.until)
-            && since > until
-        {
-            return Err(ValaSdkError::Protocol(
-                "trace detail requires since <= until".to_owned(),
-            ));
-        }
-        // The bounds go into a raw query string, where form-style decoding
-        // reads `+` as a space. `to_rfc3339_opts(.., true)` emits the canonical
-        // `Z` suffix instead of `+00:00`, so a UTC bound survives the wire
-        // unchanged without any escaping machinery here.
-        let mut path = format!("/v1/traces/{}", request.trace_id);
-        let mut separator = '?';
-        if let Some(since) = request.since {
-            path.push(separator);
-            path.push_str(&format!(
-                "since={}",
-                since.to_rfc3339_opts(SecondsFormat::Nanos, true)
-            ));
-            separator = '&';
-        }
-        if let Some(until) = request.until {
-            path.push(separator);
-            path.push_str(&format!(
-                "until={}",
-                until.to_rfc3339_opts(SecondsFormat::Nanos, true)
-            ));
-        }
-        self.client
-            .request_json::<(), _>(reqwest::Method::GET, &path, None)
-            .await
-            .map_err(Into::into)
-    }
-
-    /// Reads GenAI generation records matching the request's filters.
-    ///
-    /// Generations are the promoted rows of the canonical span table, so this
-    /// is one filtered read of that table rather than a query against a
-    /// separate GenAI store. Paging, permission, and structured-message
-    /// projection all remain server behavior; the client sends the request and
-    /// projects the response.
-    ///
-    /// # Errors
-    ///
-    /// Returns stable authentication, authorization, validation, availability,
-    /// or protocol errors.
-    ///
-    /// # Cancellation
-    ///
-    /// Cancelling the future abandons the pending read request.
-    pub async fn query_genai(
-        &self,
-        request: &QueryGenAiRequest,
-    ) -> Result<QueryGenAiResponse, ValaSdkError> {
-        self.client
-            .request_json(reqwest::Method::POST, "/v1/genai/query", Some(request))
             .await
             .map_err(Into::into)
     }
@@ -2062,154 +1979,6 @@ mod tests {
         );
     }
 
-    /// The typed trace and GenAI reads project their exact HTTP contracts.
-    ///
-    /// Trace detail is a complete cut with no continuation token, so it is a
-    /// GET whose only parameters bound the scanned window; GenAI is a filtered
-    /// read of the canonical span table and posts its request. Both decode the
-    /// server's response verbatim — a client never reconstructs a nested span
-    /// or a structured message itself.
-    ///
-    /// # Panics
-    ///
-    /// Panics when a method reaches the wrong route, drops a window bound,
-    /// loses a nested child, or alters a structured message payload.
-    #[tokio::test]
-    async fn typed_trace_and_genai_methods_project_http_contracts() {
-        let (base_url, seen) = recording_server(
-            r#"{
-                "trace": {
-                    "trace_id": "0102030405060708090a0b0c0d0e0f10",
-                    "spans": [{
-                        "span_id": "0102030405060708",
-                        "trace_state": "",
-                        "flags": 1,
-                        "name": "chat",
-                        "kind": 3,
-                        "start_time_unix_nano": 7,
-                        "end_time_unix_nano": 9,
-                        "duration_nano": 2,
-                        "status_code": 1,
-                        "dropped_attributes_count": 0,
-                        "events": [{
-                            "time_unix_nano": 8,
-                            "name": "chunk",
-                            "dropped_attributes_count": 0
-                        }],
-                        "dropped_events_count": 0,
-                        "links": [],
-                        "dropped_links_count": 0,
-                        "service_name": "checkout",
-                        "resource_dropped_attributes_count": 0,
-                        "resource_schema_url": "",
-                        "scope_name": "wyrd",
-                        "scope_version": "1",
-                        "scope_dropped_attributes_count": 0,
-                        "scope_schema_url": ""
-                    }]
-                }
-            }"#,
-        );
-        let client = client_for(&base_url);
-        let trace = client
-            .get_trace(&GetTraceRequest {
-                trace_id: "0102030405060708090a0b0c0d0e0f10".to_owned(),
-                since: Some(
-                    "2026-07-01T00:00:00Z"
-                        .parse()
-                        .expect("a fixed bound parses"),
-                ),
-                until: Some(
-                    "2026-07-02T00:00:00Z"
-                        .parse()
-                        .expect("a fixed bound parses"),
-                ),
-            })
-            .await
-            .expect("trace detail returns one complete cut");
-        assert_eq!(trace.trace.spans.len(), 1);
-        assert_eq!(
-            trace.trace.spans[0]
-                .events
-                .as_ref()
-                .map(Vec::len)
-                .expect("an authorized cut carries the span's events"),
-            1,
-            "each event stays nested on the span that owns it"
-        );
-        assert_eq!(trace.trace.spans[0].start_time_unix_nano, 7);
-
-        assert!(
-            client
-                .get_trace(&GetTraceRequest {
-                    trace_id: "0102030405060708090a0b0c0d0e0f10".to_owned(),
-                    since: Some(
-                        "2026-07-02T00:00:00Z"
-                            .parse()
-                            .expect("a fixed bound parses")
-                    ),
-                    until: Some(
-                        "2026-07-01T00:00:00Z"
-                            .parse()
-                            .expect("a fixed bound parses")
-                    ),
-                })
-                .await
-                .is_err(),
-            "an inverted window is refused before it reaches the server"
-        );
-
-        let (genai_url, genai_seen) = recording_server(
-            r#"{
-                "rows": [{
-                    "model": "gpt-4o",
-                    "start_time_unix_nano": 11,
-                    "input_tokens": 3,
-                    "input_messages": [{ "role": "user", "parts": [1, null] }]
-                }],
-                "next_page_token": "next"
-            }"#,
-        );
-        let generations = client_for(&genai_url)
-            .query_genai(&QueryGenAiRequest {
-                window: wyrd_spec::vala::api::QueryWindow {
-                    limit: Some(10),
-                    ..wyrd_spec::vala::api::QueryWindow::default()
-                },
-                conversation_id: None,
-                model: Some("gpt-4o".to_owned()),
-                provider: None,
-            })
-            .await
-            .expect("GenAI returns one page of generations");
-        assert_eq!(generations.next_page_token.as_deref(), Some("next"));
-        assert_eq!(
-            generations.rows[0].input_messages,
-            Some(serde_json::json!([{ "role": "user", "parts": [1, null] }])),
-            "structured messages keep their order, nesting, scalars, and nulls"
-        );
-        assert!(
-            generations.rows[0].output_messages.is_none(),
-            "an omitted payload stays absent rather than becoming empty"
-        );
-
-        assert_eq!(
-            seen.lock().expect("recording is readable")[0],
-            "GET /v1/traces/0102030405060708090a0b0c0d0e0f10?since=2026-07-01T00:00:00.000000000Z&until=2026-07-02T00:00:00.000000000Z HTTP/1.1",
-            "UTC bounds reach the query string as `Z`, never a raw `+` a form \
-             decoder would read as a space"
-        );
-        assert_eq!(
-            genai_seen.lock().expect("recording is readable")[0],
-            "POST /v1/genai/query HTTP/1.1",
-            "GenAI posts its filters to the canonical query route"
-        );
-    }
-
-    /// Serves the token exchange and then answers nothing at all.
-    ///
-    /// Settlement's cancellation and status legs each have to be bounded by the
-    /// stream's own deadline rather than by the server answering, which is only
     /// observable against a peer that never does.
     fn unanswering_server() -> String {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("test listener binds");

@@ -25,7 +25,7 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
-    BifrostQueryRequest, FreshnessPolicy, GetTraceRequest, PhysicalLayoutWire, QueryGenAiRequest,
+    BifrostQueryRequest, FreshnessPolicy, PhysicalLayoutWire,
     VisibilityMode,
 };
 use wyrd_spec::vala::ids::RunId;
@@ -447,53 +447,6 @@ impl Bifrost {
         to_python_json(py, serde_json::to_value(description))
     }
 
-    /// Reads one complete authorized cut of a single trace.
-    ///
-    /// # Errors
-    ///
-    /// Raises `ValueError` when a bound is not an RFC 3339 timestamp, and a
-    /// typed Bifrost query error for an inverted window, transport,
-    /// authorization, or not-found failures.
-    #[pyo3(signature = (trace_id, since=None, until=None))]
-    fn get_trace(
-        &self,
-        py: Python<'_>,
-        trace_id: &str,
-        since: Option<&str>,
-        until: Option<&str>,
-    ) -> PyResult<Py<PyAny>> {
-        let request = GetTraceRequest {
-            trace_id: trace_id.to_owned(),
-            since: parse_window_bound(since, "since")?,
-            until: parse_window_bound(until, "until")?,
-        };
-        let response = py
-            .detach(|| wyrd_runtime::runtime().block_on(self.query_client().get_trace(&request)))
-            .map_err(query_error_to_py)?;
-        to_python_json(py, serde_json::to_value(response))
-    }
-
-    /// Reads one page of GenAI generation records.
-    ///
-    /// The request arrives as one serialized [`QueryGenAiRequest`] so the wire
-    /// contract stays the single source of the filter set; the Python wrapper
-    /// owns the keyword-argument ergonomics.
-    ///
-    /// # Errors
-    ///
-    /// Raises `ValueError` when `request_json` is not one GenAI query request,
-    /// and a typed Bifrost query error for transport, authorization, or
-    /// validation failures.
-    #[pyo3(signature = (request_json))]
-    fn query_genai(&self, py: Python<'_>, request_json: &str) -> PyResult<Py<PyAny>> {
-        let request: QueryGenAiRequest = serde_json::from_str(request_json)
-            .map_err(|error| PyValueError::new_err(error.to_string()))?;
-        let response = py
-            .detach(|| wyrd_runtime::runtime().block_on(self.query_client().query_genai(&request)))
-            .map_err(query_error_to_py)?;
-        to_python_json(py, serde_json::to_value(response))
-    }
-
     /// Rows dropped by the fire-and-forget observe path under backpressure.
     ///
     /// Always zero for [`Bifrost::insert`], which refuses rather than drops.
@@ -601,20 +554,6 @@ fn to_python_json(
 /// # Errors
 ///
 /// Returns `ValueError` naming the offending field when the text is not an
-/// RFC 3339 timestamp.
-fn parse_window_bound(
-    value: Option<&str>,
-    field: &str,
-) -> PyResult<Option<chrono::DateTime<chrono::Utc>>> {
-    value
-        .map(|text| {
-            text.parse::<chrono::DateTime<chrono::Utc>>()
-                .map_err(|error| {
-                    PyValueError::new_err(format!("{field} must be an RFC 3339 timestamp: {error}"))
-                })
-        })
-        .transpose()
-}
 
 /// Parses one lifecycle request identity into the canonical structured error boundary.
 ///

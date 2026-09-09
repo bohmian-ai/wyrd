@@ -1419,12 +1419,46 @@ async fn released_authority_gates_readiness_and_new_claims() {
     let released_task = ready[0];
     let blocked_task = ready[1];
 
-    // 1. Every plan of one attempt has its commit answer withheld past the
-    //    publication budget. Every plan, because one that published ordinarily
-    //    would settle the task by the any-success rule, which is the opposite
-    //    of the state under test. The attempt therefore drains with nothing it
-    //    can say about its own operations and is released: Running task,
-    //    Prepared operations, claim owned until its lease lapses.
+    release_one_unresolvable_attempt(&promoted, &catalog, &mut supervisor, released_task).await;
+    let unresolved = assert_unready_takes_no_new_authority(
+        &promoted,
+        &supervisor,
+        own_tenant,
+        released_task,
+        blocked_task,
+    )
+    .await;
+    assert_lapsed_claim_restores_readiness(
+        &promoted,
+        &supervisor,
+        own_tenant,
+        blocked_task,
+        &unresolved,
+    )
+    .await;
+    supervisor.stop_worker().await;
+    supervisor.shutdown().await;
+}
+
+/// Drives one attempt into a release nothing durable can account for.
+///
+/// Every plan of the attempt has its commit answer withheld past the
+/// publication budget. Every plan, because one that published ordinarily would
+/// settle the task by the any-success rule, which is the opposite of the state
+/// under test. The attempt therefore drains with nothing it can say about its
+/// own operations and is released: `Running` task, `Prepared` operations, and a
+/// claim owned until its lease lapses.
+///
+/// # Panics
+///
+/// Panics when the attempt settles instead of being released inside
+/// [`ADMISSION_BOUND`].
+async fn release_one_unresolvable_attempt(
+    promoted: &PromotedRewriteFixture,
+    catalog: &Arc<PromotionCatalogSeam>,
+    supervisor: &mut SupervisedPromotion,
+    released_task: uuid::Uuid,
+) {
     let released_before = supervisor.observer().released_attempts_for_test().len();
     catalog.stall_next_commit_responses(8);
     supervisor.restart_worker();
@@ -1443,16 +1477,38 @@ async fn released_authority_gates_readiness_and_new_claims() {
         promoted.fixture.rewrite_operations().await
     );
     catalog.stall_next_commit_responses(0);
+}
 
-    // 2. Readiness is retracted from the durable row alone, and the exact
-    //    identities the release left behind are the ones it is retracted for.
+/// Asserts the released owner is unready and claims nothing new.
+///
+/// Readiness is retracted from the durable row alone, and the exact identities
+/// the release left behind are the ones it is retracted for. `blocked_task` is
+/// then made eligible inside that window and must stay `ready`: three seconds
+/// is many turns of the loop's idle interval, so an owner that was going to
+/// take it has had every opportunity to.
+///
+/// Returns the operation identities the release left `Prepared`, so the caller
+/// can prove the window closed on the same ones.
+///
+/// # Panics
+///
+/// Panics when readiness is not retracted, when the released task does not stay
+/// `Running`, when it left no `Prepared` operation, or when the offered task is
+/// claimed.
+async fn assert_unready_takes_no_new_authority(
+    promoted: &PromotedRewriteFixture,
+    supervisor: &SupervisedPromotion,
+    own_tenant: wyrd_spec::ids::DataTenantId,
+    released_task: uuid::Uuid,
+    blocked_task: uuid::Uuid,
+) -> BTreeSet<uuid::Uuid> {
     await_readiness(
-        &supervisor,
+        supervisor,
         false,
         "an owner whose own operations are unreconciled retracts readiness",
     )
     .await;
-    let unresolved = prepared_operations(&promoted).await;
+    let unresolved = prepared_operations(promoted).await;
     assert!(
         !unresolved.is_empty(),
         "the released attempt left its operations Prepared: {:?}",
@@ -1465,9 +1521,6 @@ async fn released_authority_gates_readiness_and_new_claims() {
         tenant_tasks(&promoted.fixture).await
     );
 
-    // 3. A named task made eligible inside that window is not claimed. Three
-    //    seconds is many turns of the loop's idle interval, so a worker that
-    //    was going to take it has had every opportunity to.
     promoted.fixture.offer_task(blocked_task, 0).await;
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
     assert_eq!(
@@ -1482,17 +1535,39 @@ async fn released_authority_gates_readiness_and_new_claims() {
         promoted.fixture.rewrite_operations().await
     );
     assert_eq!(
-        prepared_operations(&promoted).await,
+        prepared_operations(promoted).await,
         unresolved,
         "nothing inside the unready window republished or closed the exact operations"
     );
+    unresolved
+}
 
-    // 4. The claim lapses, the ordinary reclaim hands the task on, and the
-    //    authority this owner could not explain is no longer its own. Readiness
-    //    returns and the demand held back in step 3 progresses.
+/// Asserts the gate reopens once the unresolved claim is handed on.
+///
+/// The claim lapses, the ordinary reclaim the loop already runs every turn
+/// takes the task back, and the authority this owner could not explain is no
+/// longer its own. Readiness returns without the worker being restarted —
+/// which is also what shows the gated loop kept working rather than freezing —
+/// and the demand it held back becomes claimable again.
+///
+/// # Panics
+///
+/// Panics when readiness does not return or the held-back task never leaves
+/// `ready` inside [`ADMISSION_BOUND`].
+async fn assert_lapsed_claim_restores_readiness(
+    promoted: &PromotedRewriteFixture,
+    supervisor: &SupervisedPromotion,
+    own_tenant: wyrd_spec::ids::DataTenantId,
+    blocked_task: uuid::Uuid,
+    unresolved: &BTreeSet<uuid::Uuid>,
+) {
+    assert!(
+        !unresolved.is_empty(),
+        "the window this closes was opened by a real unresolved operation"
+    );
     promoted.fixture.expire_claims_of(own_tenant).await;
     await_readiness(
-        &supervisor,
+        supervisor,
         true,
         "readiness returns once the unresolved authority is handed on",
     )
@@ -1514,8 +1589,6 @@ async fn released_authority_gates_readiness_and_new_claims() {
         "the demand the gate held back is claimable again: {:?}",
         tenant_tasks(&promoted.fixture).await
     );
-    supervisor.stop_worker().await;
-    supervisor.shutdown().await;
 }
 
 /// Lists one tenant's ready small-files task ids, in durable creation order.

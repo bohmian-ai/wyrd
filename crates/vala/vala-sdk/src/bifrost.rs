@@ -15,8 +15,8 @@ use wyrd_client::WyrdClient;
 use wyrd_client::config::ClientConfig;
 use wyrd_queue::QueueConfig;
 use wyrd_spec::vala::api::{
-    BifrostQueryRequest, FreshnessPolicy, QueryTerminalFrame, RegisterOutcome,
-    RegisterTableResponse, VisibilityMode,
+    BifrostQueryRequest, BifrostTableDescription, FreshnessPolicy, QueryTerminalFrame,
+    RegisterOutcome, RegisterTableResponse, VisibilityMode,
 };
 
 use crate::grpc::BifrostGrpcTransport;
@@ -400,8 +400,29 @@ impl Bifrost {
     /// Escape hatch to the full query surface: lifecycle controls, typed trace
     /// and GenAI reads, describe.
     #[must_use]
-    pub fn query(&self) -> &QueryClient {
+    pub fn query_client(&self) -> &QueryClient {
         &self.query
+    }
+
+    /// Read one registered table's server-owned description.
+    ///
+    /// The canonical introspection door on this client: schema, identity, and
+    /// physical layout exactly as the server holds them. `fqn` is
+    /// `<namespace>.<name>`, the same form [`Bifrost::use_table_by_name`] and
+    /// SQL take, so a caller never restates the name in two shapes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a schema-parse error when `fqn` is not `<namespace>.<name>`, and
+    /// the stable not-found, authentication, authorization, availability, or
+    /// protocol error the server reported.
+    ///
+    /// # Cancellation
+    ///
+    /// Abandoning the future leaves no server state behind; describe is a read.
+    pub async fn describe(&self, fqn: &str) -> Result<BifrostTableDescription, ValaSdkError> {
+        let (namespace, name) = crate::table::split_fqn(fqn)?;
+        self.query.describe_table(&namespace, &name).await
     }
 
     /// The client scope every pooled producer is keyed under.

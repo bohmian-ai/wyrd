@@ -1722,9 +1722,7 @@ mod pg_tests {
     /// Register, insert, swap the active table before flushing, insert again,
     /// drain, then read both tables back — one through `sql` and one through
     /// `stream`, so the collected and streamed doors are both exercised on the
-    /// rows this journey actually wrote. The blocking facade's advanced query
-    /// escape hatch is reached on the same client, off the runtime's worker
-    /// threads, because that surface has no async twin to stand in for it.
+    /// rows this journey actually wrote.
     #[tokio::test]
     async fn unified_client_registers_writes_swaps_and_reads_both_tables() {
         let srv = WyrdTestServer::start_bound()
@@ -1817,27 +1815,74 @@ mod pg_tests {
             "a complete stream carries its validated terminal"
         );
 
-        // The blocking facade's escape hatch is the async client's own
-        // `QueryClient`, so describing the registered table through it must
-        // answer the same identity register minted.
-        let blocking_client = client.clone();
-        let described_fqn = first_fqn.clone();
-        let described = tokio::task::spawn_blocking(move || {
-            let blocking =
-                vala_sdk::blocking::Bifrost::connect(&blocking_client).expect("blocking facade");
-            let (namespace, name) = described_fqn
-                .rsplit_once('.')
-                .expect("the journey table is `<namespace>.<name>`");
-            wyrd_runtime::runtime()
-                .block_on(blocking.query().describe_table(namespace, name))
-                .expect("describe through the blocking escape hatch")
-        })
-        .await
-        .expect("blocking describe task joins");
+        srv.shutdown().await.expect("server shutdown");
+    }
+
+    /// The blocking facade's own journey: register, write, drain, read back.
+    ///
+    /// A plain `#[test]` rather than a `#[tokio::test]`, because the facade
+    /// panics inside an async context by design. Only the harness steps with no
+    /// synchronous door — starting the server, minting the client, publishing
+    /// the Scribe — are driven on the shared runtime; every Bifrost call is the
+    /// synchronous one a caller with no runtime of its own would write.
+    #[test]
+    fn blocking_client_registers_writes_and_reads_back() {
+        let runtime = wyrd_runtime::runtime();
+        let srv = runtime
+            .block_on(WyrdTestServer::start_bound())
+            .expect("test server start");
+        let client = runtime.block_on(admin_client(&srv, "sdk-blocking-journey"));
+
+        let fqn = owned_fqn("blocking_journey");
+        let bifrost = vala_sdk::blocking::Bifrost::connect_with_table(&client, table(&fqn))
+            .expect("blocking client connects");
+
+        assert_eq!(
+            bifrost.register().expect("register the table"),
+            RegisterOutcome::Created
+        );
+        let resolved = bifrost
+            .table()
+            .expect("the table stays bound")
+            .resolved()
+            .cloned()
+            .expect("register resolves the server identity");
+
+        let rows = vec![(1i64, "first".to_owned()), (2, "second".to_owned())];
+        for (id, value) in &rows {
+            bifrost
+                .insert(
+                    format!(r#"{{"id": {id}, "value": "{value}"}}"#).into_bytes(),
+                    Correlation::default(),
+                )
+                .expect("insert into the blocking table");
+        }
+        bifrost.flush().expect("flush every pooled producer");
+        bifrost.shutdown().expect("shutdown drains and stops");
+        runtime
+            .block_on(srv.flush_bifrost())
+            .expect("publish the server-owned Scribe");
+
+        let collected = bifrost
+            .sql(&format!("SELECT id, value FROM {fqn} ORDER BY id"))
+            .expect("collect through the blocking door");
+        assert_eq!(collected.terminal().outcome, QueryTerminalOutcome::Success);
+        assert_eq!(id_value_rows(collected.batches()), rows);
+
+        let streamed = bifrost
+            .stream(&format!("SELECT id, value FROM {fqn} ORDER BY id"))
+            .expect("stream through the blocking door")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("every streamed batch");
+        assert_eq!(id_value_rows(&streamed), rows);
+
+        let described = bifrost
+            .describe(&fqn)
+            .expect("describe through the blocking door");
         assert_eq!(described.entry.table_uid, resolved.table_uid);
         assert_eq!(described.entry.fingerprint, resolved.fingerprint);
 
-        srv.shutdown().await.expect("server shutdown");
+        runtime.block_on(srv.shutdown()).expect("server shutdown");
     }
 
     /// A table swapped in while registration is in flight keeps its own identity.

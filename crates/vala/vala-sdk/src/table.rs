@@ -324,7 +324,7 @@ pub struct Correlation {
 /// # Errors
 ///
 /// Returns a schema-parse error when either half is empty or the dot is absent.
-fn split_fqn(fqn: &str) -> Result<(String, String), ValaSdkError> {
+pub(crate) fn split_fqn(fqn: &str) -> Result<(String, String), ValaSdkError> {
     let (namespace, name) = fqn.rsplit_once('.').ok_or_else(|| {
         wyrd_queue::WyrdQueueError::SchemaParse(format!(
             "table `{fqn}` is not `<namespace>.<name>`"

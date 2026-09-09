@@ -380,7 +380,7 @@ impl Bifrost {
             deadline_ms,
         };
         let stream = py
-            .detach(|| wyrd_runtime::runtime().block_on(self.handle.query().query(&request)))
+            .detach(|| wyrd_runtime::runtime().block_on(self.handle.query_client().query(&request)))
             .map_err(query_error_to_py)?;
         let request_id = stream.request_id().as_str().to_owned();
         Ok(PyBifrostQueryStream {
@@ -399,7 +399,7 @@ impl Bifrost {
     /// Raises a typed Bifrost query error for transport or server failures.
     fn running(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let queries = py
-            .detach(|| wyrd_runtime::runtime().block_on(self.query().running()))
+            .detach(|| wyrd_runtime::runtime().block_on(self.query_client().running()))
             .map_err(query_error_to_py)?;
         to_python_json(py, serde_json::to_value(queries))
     }
@@ -413,7 +413,7 @@ impl Bifrost {
     fn status(&self, py: Python<'_>, request_id: &str) -> PyResult<Py<PyAny>> {
         let request_id = parse_query_request_id(request_id).map_err(query_error_to_py)?;
         let summary = py
-            .detach(|| wyrd_runtime::runtime().block_on(self.query().status(&request_id)))
+            .detach(|| wyrd_runtime::runtime().block_on(self.query_client().status(&request_id)))
             .map_err(query_error_to_py)?;
         to_python_json(py, serde_json::to_value(summary))
     }
@@ -426,7 +426,7 @@ impl Bifrost {
     fn cancel(&self, py: Python<'_>, request_id: &str) -> PyResult<Py<PyAny>> {
         let request_id = parse_query_request_id(request_id).map_err(query_error_to_py)?;
         let response = py
-            .detach(|| wyrd_runtime::runtime().block_on(self.query().cancel(&request_id)))
+            .detach(|| wyrd_runtime::runtime().block_on(self.query_client().cancel(&request_id)))
             .map_err(query_error_to_py)?;
         to_python_json(py, serde_json::to_value(response))
     }
@@ -440,7 +440,8 @@ impl Bifrost {
     fn describe_table(&self, py: Python<'_>, namespace: &str, name: &str) -> PyResult<Py<PyAny>> {
         let description = py
             .detach(|| {
-                wyrd_runtime::runtime().block_on(self.query().describe_table(namespace, name))
+                wyrd_runtime::runtime()
+                    .block_on(self.query_client().describe_table(namespace, name))
             })
             .map_err(query_error_to_py)?;
         to_python_json(py, serde_json::to_value(description))
@@ -467,7 +468,7 @@ impl Bifrost {
             until: parse_window_bound(until, "until")?,
         };
         let response = py
-            .detach(|| wyrd_runtime::runtime().block_on(self.query().get_trace(&request)))
+            .detach(|| wyrd_runtime::runtime().block_on(self.query_client().get_trace(&request)))
             .map_err(query_error_to_py)?;
         to_python_json(py, serde_json::to_value(response))
     }
@@ -488,7 +489,7 @@ impl Bifrost {
         let request: QueryGenAiRequest = serde_json::from_str(request_json)
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
         let response = py
-            .detach(|| wyrd_runtime::runtime().block_on(self.query().query_genai(&request)))
+            .detach(|| wyrd_runtime::runtime().block_on(self.query_client().query_genai(&request)))
             .map_err(query_error_to_py)?;
         to_python_json(py, serde_json::to_value(response))
     }
@@ -513,8 +514,8 @@ impl Bifrost {
     ///
     /// Not a `#[pymethods]` entry: Python reaches these reads through the
     /// client's own methods rather than a second exported client object.
-    fn query(&self) -> &QueryClient {
-        self.handle.query()
+    fn query_client(&self) -> &QueryClient {
+        self.handle.query_client()
     }
 }
 

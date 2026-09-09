@@ -628,7 +628,7 @@ impl NativeBifrost {
             },
             deadline_ms: request.deadline_ms.map(u64::from),
         };
-        Ok(match self.client.query().query(&request).await {
+        Ok(match self.client.query_client().query(&request).await {
             Ok(stream) => NativeQueryStart::success(stream),
             Err(error) => NativeQueryStart::failure(&error),
         })
@@ -645,7 +645,7 @@ impl NativeBifrost {
     /// Wyrd control failures are returned in [`NativeLifecycleResult`].
     #[napi]
     pub async fn running(&self) -> napi::Result<NativeLifecycleResult> {
-        match self.client.query().running().await {
+        match self.client.query_client().running().await {
             Ok(queries) => {
                 NativeLifecycleResult::success(&serde_json::to_value(queries).map_err(napi_error)?)
             }
@@ -670,7 +670,7 @@ impl NativeBifrost {
                 return Ok(NativeLifecycleResult::failure(&error));
             }
         };
-        match self.client.query().status(&request_id).await {
+        match self.client.query_client().status(&request_id).await {
             Ok(summary) => {
                 NativeLifecycleResult::success(&serde_json::to_value(summary).map_err(napi_error)?)
             }
@@ -695,7 +695,7 @@ impl NativeBifrost {
                 return Ok(NativeLifecycleResult::failure(&error));
             }
         };
-        match self.client.query().cancel(&request_id).await {
+        match self.client.query_client().cancel(&request_id).await {
             Ok(response) => {
                 NativeLifecycleResult::success(&serde_json::to_value(response).map_err(napi_error)?)
             }
@@ -721,7 +721,12 @@ impl NativeBifrost {
         namespace: String,
         name: String,
     ) -> napi::Result<NativeLifecycleResult> {
-        match self.client.query().describe_table(&namespace, &name).await {
+        match self
+            .client
+            .query_client()
+            .describe_table(&namespace, &name)
+            .await
+        {
             Ok(description) => NativeLifecycleResult::success(
                 &serde_json::to_value(description).map_err(napi_error)?,
             ),
@@ -765,7 +770,7 @@ impl NativeBifrost {
                 }
             },
         };
-        match self.client.query().get_trace(&request).await {
+        match self.client.query_client().get_trace(&request).await {
             Ok(response) => {
                 NativeLifecycleResult::success(&serde_json::to_value(response).map_err(napi_error)?)
             }
@@ -810,7 +815,7 @@ impl NativeBifrost {
             model: request.model,
             provider: request.provider,
         };
-        match self.client.query().query_genai(&query).await {
+        match self.client.query_client().query_genai(&query).await {
             Ok(response) => {
                 NativeLifecycleResult::success(&serde_json::to_value(response).map_err(napi_error)?)
             }

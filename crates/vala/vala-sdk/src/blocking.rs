@@ -10,7 +10,7 @@
 use arrow::record_batch::RecordBatch;
 use wyrd_client::WyrdClient;
 use wyrd_queue::QueueConfig;
-use wyrd_spec::vala::api::RegisterOutcome;
+use wyrd_spec::vala::api::{BifrostTableDescription, RegisterOutcome};
 
 use crate::bifrost::QueryResult;
 use crate::query::{QueryClient, QueryResultStream, ValaSdkError};
@@ -159,15 +159,24 @@ impl Bifrost {
         })
     }
 
-    /// Escape hatch to the full query surface: lifecycle controls, typed trace
-    /// and GenAI reads, describe.
+    /// Read one registered table's server-owned description.
+    ///
+    /// # Errors
+    ///
+    /// As [`crate::Bifrost::describe`].
+    pub fn describe(&self, fqn: &str) -> Result<BifrostTableDescription, ValaSdkError> {
+        block_on(self.inner.describe(fqn))
+    }
+
+    /// Escape hatch to the query plane's lifecycle surface: running, status,
+    /// cancel, and the raw request form `sql` and `stream` wrap.
     ///
     /// The async client's own [`QueryClient`], not a second implementation: its
     /// methods are futures a caller drives on whatever runtime it already has,
     /// so the blocking facade adds no advanced-query behavior of its own.
     #[must_use]
-    pub fn query(&self) -> &QueryClient {
-        self.inner.query()
+    pub fn query_client(&self) -> &QueryClient {
+        self.inner.query_client()
     }
 
     /// The async client underneath, for a caller that acquires a runtime later.

@@ -510,6 +510,80 @@ async fn consumed_by_settled_compaction(
     before.difference(&after).count()
 }
 
+/// Drives one window whose every plan loses its answer, through the durable
+/// recovery that settles it, and returns the live inputs it consumed.
+///
+/// An attempt that cannot account for any of its operations settles nothing:
+/// it is released, leaving a Running task, Prepared operations, and a claim
+/// lease it stopped renewing. Nothing local can close that, so this drives the
+/// production sequence a lost process would get — the lease lapses, the
+/// reclaim pass returns the task, and the next owner's table-wide
+/// reconciliation classifies the exact operations before anything is counted.
+///
+/// # Panics
+///
+/// Panics when the attempt is not released, or its operations never leave
+/// `prepared`, inside [`ADMISSION_BOUND`].
+async fn consumed_by_recovered_compaction(
+    promoted: &PromotedRewriteFixture,
+    supervisor: &mut SupervisedPromotion,
+    catalog: &PromotionCatalogSeam,
+) -> usize {
+    let before = promoted.fixture.live_data_paths().await;
+    let released_before = supervisor.observer().released_attempts_for_test().len();
+    promoted.fixture.clear_task_backoff().await;
+    supervisor.restart_worker();
+    supervisor.schedule_only().await;
+    supervisor.start_worker();
+    let released = tokio::time::timeout(ADMISSION_BOUND, async {
+        while supervisor.observer().released_attempts_for_test().len() == released_before {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    assert!(
+        released.is_ok(),
+        "an attempt that learned nothing releases its task: {:?}",
+        tenant_tasks(&promoted.fixture).await
+    );
+    supervisor.stop_worker().await;
+
+    // The catalog answers again, so recovery reads real evidence rather than
+    // the fault that produced the ambiguity.
+    catalog.stall_next_commit_responses(0);
+    let open = operation_phases(&promoted.fixture)
+        .await
+        .into_iter()
+        .filter(|(_, phase)| phase == "prepared")
+        .map(|(id, _)| id)
+        .collect::<BTreeSet<_>>();
+    promoted.fixture.expire_claims().await;
+    supervisor.reclaim_expired_claims().await;
+    // No new planning pass: recovery is driven by the reclaimed task and the
+    // table-wide reconciliation it carries, and a fresh rewrite planned into
+    // the same window would consume files this window itself created.
+    promoted.fixture.clear_task_backoff().await;
+    supervisor.restart_worker();
+    supervisor.start_worker();
+    await_operation_phase(&promoted.fixture, &open, &["recovered", "reset"]).await;
+    // The task itself is recovered too, not just its operations: a table whose
+    // rewrite task is still owned admits no further maintenance of any kind.
+    let returned = tokio::time::timeout(ADMISSION_BOUND, async {
+        while small_files_in_state(&promoted.fixture, &["claimed", "running"]).await > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    assert!(
+        returned.is_ok(),
+        "recovery returns the task it reconciled: {:?}",
+        tenant_tasks(&promoted.fixture).await
+    );
+    supervisor.stop_worker().await;
+    let after = promoted.fixture.live_data_paths().await;
+    before.difference(&after).count()
+}
+
 /// Seals and promotes one more generation so the next window has work.
 ///
 /// # Panics
@@ -587,18 +661,17 @@ async fn multi_plan_success_counts_all_committed_volume_once() {
         "the committed plans reported the bytes they moved"
     );
 
-    // No plan learns its acceptance, so the attempt settles on the one
-    // operation its own reconciliation proves live and reports that plan's
-    // retained request volume.
+    // No plan learns its acceptance, so the attempt settles nothing at all:
+    // it is released, and the durable recovery that follows reports the volume
+    // of whichever operation it proves live.
     promote_more_inputs(&promoted, &mut supervisor).await;
     catalog.stall_next_commit_responses(8);
-    consumed += consumed_by_settled_compaction(&promoted, &mut supervisor, 2).await;
-    catalog.stall_next_commit_responses(0);
-    let after_local_recovery = small_files_volume(&telemetry, "bifrost_forge_input_files_total");
+    consumed += consumed_by_recovered_compaction(&promoted, &mut supervisor, &catalog).await;
+    let after_recovery = small_files_volume(&telemetry, "bifrost_forge_input_files_total");
     assert!(
-        after_local_recovery > 0 && after_local_recovery <= consumed as u64,
-        "a locally recovered plan is counted, and no unproved sibling is: \
-         {after_local_recovery} of {consumed}"
+        after_recovery > 0 && after_recovery <= consumed as u64,
+        "a durably recovered plan is counted, and no unproved sibling is: \
+         {after_recovery} of {consumed}"
     );
 
     // One ordinary success beside one unresolved sibling: the task settles at

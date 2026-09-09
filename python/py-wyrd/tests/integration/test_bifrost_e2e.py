@@ -364,6 +364,58 @@ def test_negative_empty_permissions_denied_rbac_on_write(wyrd_server: WyrdTestSe
 
 
 @pytest.mark.integration
+def test_registering_a_different_schema_on_one_name_conflicts(
+    wyrd_server: WyrdTestServer,
+) -> None:
+    """A second declaration of the same table is a stable conflict, not a silent evolution."""
+
+    fqn = f"vala.datasets.conflict_{uuid.uuid4().hex}"
+    assert _fixture_client(wyrd_server, fqn, wyrd_server.api_key).register() == "created"
+
+    # `Prompt` declares model/tokens/score where `Fixture` declared id/value:
+    # same name, different columns, so the server refuses rather than evolving.
+    conflicting = Bifrost(
+        TableConfig(Prompt, fqn),
+        server_url=wyrd_server.base_url,
+        credential=wyrd_server.api_key,
+    )
+    with pytest.raises(BifrostQueryError) as captured:
+        conflicting.register()
+    assert captured.value.code == "WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH"
+    assert captured.value.status == 409
+    assert conflicting.table.resolved is None, "a refused registration mints no identity"
+
+
+@pytest.mark.integration
+def test_negative_non_select_query_is_refused(wyrd_server: WyrdTestServer) -> None:
+    """The read plane is read-only: a mutation never reaches execution."""
+
+    table_fqn, token = wyrd_server.prepare_oracle_query_fixture()
+    bifrost = Bifrost(server_url=wyrd_server.base_url, credential=token)
+
+    with pytest.raises(BifrostQueryError) as captured:
+        bifrost.sql(f"DELETE FROM {table_fqn}")
+    assert captured.value.code == "WYRD_VALA_400_QUERY_INVALID_SQL"
+    assert captured.value.status == 400
+
+
+@pytest.mark.integration
+def test_negative_oversized_query_is_refused(wyrd_server: WyrdTestServer) -> None:
+    """A statement past the SQL byte ceiling is refused before it is planned."""
+
+    table_fqn, token = wyrd_server.prepare_oracle_query_fixture()
+    bifrost = Bifrost(server_url=wyrd_server.base_url, credential=token)
+
+    # The floor is 64 KiB of SQL; pad a valid SELECT past it with a comment so
+    # the refusal is about size rather than syntax.
+    oversized = f"SELECT id FROM {table_fqn} -- {'x' * (64 * 1024)}"
+    with pytest.raises(BifrostQueryError) as captured:
+        bifrost.sql(oversized)
+    assert captured.value.code == "WYRD_VALA_400_QUERY_INVALID_SQL"
+    assert captured.value.status == 400
+
+
+@pytest.mark.integration
 def test_negative_invalid_sql_query(wyrd_server: WyrdTestServer) -> None:
     _table_fqn, token = wyrd_server.prepare_oracle_query_fixture()
     bifrost = Bifrost(server_url=wyrd_server.base_url, credential=token)

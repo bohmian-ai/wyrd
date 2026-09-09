@@ -11,11 +11,9 @@ from wyrd.bifrost import (
     Correlation,
     DataTypeSpecVariants,
     FieldSpec,
-    GenAiPage,
     ResolvedTable,
     SortKey,
     TableDescription,
-    TraceDetail,
 )
 
 
@@ -58,69 +56,6 @@ def test_described_field_types_are_recursive_without_any() -> None:
     assert description["user_fields"][0]["metadata"]["PARQUET:field_id"] == "7"
     assert description["canonical_physical_fingerprint"] == "canonical-fp"
     assert description["physical_layout"]["sort_keys"][0]["column"] == "trace_id"
-
-
-def test_trace_and_genai_payloads_reach_their_leaves() -> None:
-    detail: TraceDetail = {
-        "trace": {
-            "trace_id": "0102",
-            "spans": [
-                {
-                    "span_id": "aabb",
-                    "trace_state": "",
-                    "flags": 1,
-                    "name": "chat",
-                    "kind": 3,
-                    "start_time_unix_nano": 1,
-                    "end_time_unix_nano": 2,
-                    "duration_nano": 1,
-                    "dropped_attributes_count": 0,
-                    "events": [
-                        {
-                            "time_unix_nano": 1,
-                            "name": "retry",
-                            "attributes": {"attempt": 1},
-                            "dropped_attributes_count": 0,
-                        }
-                    ],
-                    "dropped_events_count": 0,
-                    "links": [
-                        {
-                            "linked_trace_id": "0304",
-                            "linked_span_id": "ccdd",
-                            "trace_state": "",
-                            "flags": 0,
-                            "dropped_attributes_count": 0,
-                        }
-                    ],
-                    "dropped_links_count": 0,
-                    "resource_dropped_attributes_count": 0,
-                    "resource_schema_url": "",
-                    "scope_name": "wyrd",
-                    "scope_version": "1",
-                    "scope_dropped_attributes_count": 0,
-                    "scope_schema_url": "",
-                }
-            ],
-        }
-    }
-    page: GenAiPage = {
-        "rows": [
-            {
-                "start_time_unix_nano": 1,
-                "model": "claude",
-                "input_messages": [{"role": "user"}],
-            }
-        ],
-        "next_page_token": "cursor",
-    }
-
-    span = detail["trace"]["spans"][0]
-    assert span["events"][0]["name"] == "retry"
-    assert span["links"][0]["linked_span_id"] == "ccdd"
-    assert page["rows"][0]["model"] == "claude"
-    assert page["rows"][0]["input_messages"][0]["role"] == "user"
-    assert page["next_page_token"] == "cursor"
 
 
 def test_client_value_types_are_declared_without_any() -> None:

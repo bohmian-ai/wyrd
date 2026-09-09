@@ -27,7 +27,7 @@ pub mod queue;
 pub mod schema;
 pub mod sink;
 
-pub use batch_builder::BatchBuilder;
+pub use batch_builder::{BatchBuilder, is_reserved_column};
 pub use bounded_arrow::{
     ArrowIpcMaterialError, ArrowIpcMaterialFacts, ArrowIpcMaterialPlan,
     ArrowIpcMaterializedCapacity, BoundedArrowIpc,

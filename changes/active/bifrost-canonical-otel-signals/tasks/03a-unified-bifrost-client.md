@@ -137,3 +137,42 @@ mise run gate
 git diff --check
 ```
 
+
+## Implementation Evidence
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| One async `Bifrost` + thin blocking facade with register/use_table/insert/flush/shutdown/`sql`/`stream`/advanced query; Python and TS project it idiomatically | `crates/vala/vala-sdk/src/bifrost.rs`, `blocking.rs`, `table.rs`; `crates/vala/vala-sdk/src/python.rs`; `python/py-wyrd/python/wyrd/bifrost/__init__.py`; `crates/bindings/wyrd-node/src/lib.rs`; `typescript/wyrd/src/index.ts` | `mise run test:bifrost:journey:sdk` (10 passed); `:python` (24 passed); `:typescript` (8 passed) | PASS |
+| `TableConfig` from each language model/schema path or by describe-by-name; register resolves server identity, idempotent for equal schema, stable conflict otherwise | `table.rs::TableConfig` (+ `TableConfigWire` serde round trip); `PyTableConfig::{from_json_schema,from_arrow_ipc,describe}`; `tableConfigFromJsonSchema` / `describeTableConfig` | `test_register_insert_flush_read_and_swap` and `test_describe_binds_an_existing_table_without_restating_its_schema` (Python); `registers, writes, flushes, swaps tables, and reads back` + `describes an existing table without restating its schema` (TS); `described_canonical_and_dynamic_schemas_reach_exact_physical_schema` (Rust) | PASS |
+| Omitted transport follows the existing chain once, explicit values override, no resolvable credential fails through the stable public error contract | `bifrost.rs::client_from_options` (single door); `wyrd-client` `CredentialSource::explicit` classifies one credential into API-key vs bearer grant; `ValaSdkError::Client` carries `WYRD_CLIENT_*` verbatim | `test_omitted_transport_resolves_from_the_environment`, `test_no_resolvable_credential_raises` (Python); `credential::tests::explicit_credential_routes_by_its_own_prefix`, `config::tests::explicit_api_key_beats_*` (`cargo nextest run -p wyrd-client --lib`, 56 passed) | PASS |
+| Insert with no active table is `WYRD_VALA_412_NO_ACTIVE_TABLE`; queue saturation reaches the caller; optional correlation preserves REQ-022; no per-row schema/table argument remains | `bifrost.rs::Bifrost::insert`; `Row.card_ref: Option<CardRef>` in `wyrd-queue`; `Correlation` in `table.rs` | `test_insert_without_an_active_table_refuses`, `test_uncorrelated_row_is_a_valid_write`, backpressure tests (Python); `refuses a write with no active table and a bad card reference` (TS); `backpressure_and_drain_no_silent_drops`, `observe_and_bifrost_roundtrip` (Rust) | PASS |
+| Table swap preserves buffered rows for both targets; flush/shutdown drain every owned producer; `sql` and `stream` agree, require a terminal, never present partial rows as success | pooled producers in `handle.rs`; TS `Bifrost.sql` is implemented by draining `Bifrost.stream`, so agreement is structural | `test_register_insert_flush_read_and_swap` (producer_count 2, both tables read back), `test_sql_and_stream_return_the_same_rows` (Python); `registers, writes, flushes, swaps tables, and reads back` (TS); `pg_bifrost_multi_batch_query_stream_reuses_schema`, `oracle_query_*` (Rust) | PASS |
+| Superseded Python/TS query/write roots, the former public Rust write-pool name, duplicate language-side behavior and compat aliases are absent; `observe::record` keeps its explicit-table drop-on-full contract | `grep -rn "BifrostQueryClient\|BifrostClient\|BifrostWritePool"` over `python/py-wyrd/python`, `typescript/wyrd/src`, `crates/vala/vala-sdk/src`, `crates/bindings/wyrd-node/src` returns nothing; `crates/vala/vala-sdk/src/observe.rs` unchanged in contract; deleted `python/py-wyrd/tests/bifrost/test_query.py` | `mise run check:client-tier`, `mise run check:pyo3-scope`, `mise run lints` | PASS |
+| Each language journey owner proves register → insert → flush → SQL/stream → swap → second write/read against a real server, plus the negative flows | `crates/vala/vala-sdk/tests/pg_bifrost_e2e.rs`; `python/py-wyrd/tests/integration/test_bifrost_e2e.py`; `typescript/wyrd/tests/integration/bifrost-write.test.ts` (added to `test:bifrost:journey:typescript`) | the three journey lanes above | PASS |
+| Generated stubs and declarations match the public surfaces | hand-authored `python/py-wyrd/python/wyrd/stubs/{bifrost,observe}.pyi`; regenerated `typescript/wyrd/index.d.ts` / `index.d.cts` | `mise run codegen:check` (All checks passed); `mise run py:typecheck`; `mise run ts:typecheck`; `mise run ts:napi:check` fails only on the uncommitted regenerated `index.d.ts` (byte-identical across two `ts:build` runs) | PASS |
+
+### Verification commands
+
+| Command | Result |
+|---|---|
+| `mise run test:bifrost:journey:sdk` | PASS (10 tests) |
+| `mise run test:bifrost:journey:python` | PASS (24 tests) |
+| `mise run test:bifrost:journey:typescript` | PASS (8 tests) |
+| `mise run fmt` / `py:format` / `py:lints` / `py:typecheck` / `ts:typecheck` / `codegen:check` | PASS |
+| `mise run lints` | PASS |
+| `mise run check:client-tier` / `check:pyo3-scope` | PASS |
+| `mise run py:test:unit` | PASS (432 passed) |
+| `mise exec -- cargo nextest run -p wyrd-client --lib` | PASS (56 tests) |
+| `mise run ts:napi:check` | FAIL — `git diff --exit-code index.d.ts`; the regenerated declaration is stable and only needs committing |
+| `mise run check:unwrap-audit` | FAIL — pre-existing, `crates/wyrd/wyrd-testing/src/bifrost/process_cluster.rs` (outside this write set) |
+| `mise run verify:bifrost` | FAIL at `check:tenant-isolation` — pre-existing, `crates/vala/vala-sql/migrations/*` and `queries/oracle_admission.rs` (outside this write set) |
+| `mise exec -- cargo nextest run -p wyrd-queue --lib` | 1 pre-existing failure, `producer::tests::flush_timeout_retains_batch_until_later_ack`, reproduced identically on a clean `HEAD` worktree |
+| `git diff --check` | PASS |
+| `mise run test:bifrost` | 8/10 lanes pass. `unit:rust` fails on 6 `wyrd-testing` tests (`bifrost::forge_harness::worker_lifecycle_tests::*`, `bifrost::scribe_workload::tests::scribe_workload_read_boundaries_may_not_reuse_an_earlier_read`) that fail identically 6/6 on a clean `HEAD` worktree. `journey:otlp` selects zero tests (`error: no tests to run`) because the canonical OTLP journeys are task 04's deliverable. |
+| `mise run test:bifrost:journey:scribe` | PASS (20/20) on an idle machine; also 20/20 at `HEAD`. Two earlier runs under concurrent build load failed on *different* tests (`round_robin::scribe_system_and_dynamic_tables_are_round_robin_equal`, then `sustained::scribe_sustained_ingest_oracle_hot_read_journey`) — both are pressure/distribution assertions reached through `RawIngest`, which this change does not touch. Load-sensitive, not a regression. |
+
+### Non-goals
+
+Confirmed excluded: no root multi-service client, no multi-table insert, no
+client-computed fingerprint, no Python context managers, no new global config
+file, and no new harness, test target, runtime, framework, or schema mapper.

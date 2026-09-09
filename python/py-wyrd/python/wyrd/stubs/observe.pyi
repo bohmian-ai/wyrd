@@ -1,5 +1,5 @@
 #### begin imports ####
-from .bifrost import Bifrost
+from .bifrost import Bifrost, Correlation
 
 #### end of imports ####
 
@@ -8,13 +8,14 @@ def record(
     table: str,
     schema: str,
     row: str,
-    card_ref: str,
-    run_id: str | None = None,
+    correlation: Correlation | None = None,
 ) -> None:
     """Record one telemetry observation, fire-and-forget.
 
-    ``schema`` is JSON-Schema text; ``card_ref`` is ``space/Kind/name@version``.
-    Queue-full is swallowed and counted on the handle, never raised.
+    Telemetry names its own ``table`` and ``schema`` per call rather than using
+    the client's active binding. ``schema`` is JSON-Schema text; ``correlation``
+    optionally carries ``card_ref`` (``space/Kind/name@version``) and ``run_id``.
+    Queue-full is swallowed and counted on ``bifrost.dropped``, never raised.
     """
     ...
 

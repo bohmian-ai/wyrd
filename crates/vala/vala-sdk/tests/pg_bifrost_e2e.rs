@@ -23,8 +23,8 @@ mod pg_tests {
     use vala_bifrost_redux::namespaces::BifrostNamespace;
     use vala_bifrost_redux::resources::ORACLE_MAX_BATCH_SIZE;
     use vala_sdk::{
-        Bifrost, BifrostGrpcTransport, BifrostIngestSink, BifrostTransportConfig, ClientScope,
-        IngestTransport, QueryClient, SinkKind, observe,
+        Bifrost, BifrostGrpcTransport, BifrostIngestSink, BifrostTransportConfig, Correlation,
+        IngestTransport, QueryClient, TableConfig, observe,
     };
     use wyrd_client::WyrdClient;
     use wyrd_client::config::ClientConfig;
@@ -66,6 +66,34 @@ mod pg_tests {
             api_key: Some(srv.api_key().expose_secret().to_owned().into()),
             ..ClientConfig::default()
         }
+    }
+
+    /// The `id`/`value` table declaration these journeys write through.
+    fn table(fqn: &str) -> TableConfig {
+        TableConfig::from_arrow(fqn, schema()).expect("declared journey table")
+    }
+
+    /// One row correlated to the journey card.
+    fn correlated() -> Correlation {
+        Correlation {
+            card_ref: Some(card()),
+            run_id: None,
+        }
+    }
+
+    /// A public client over `sink`, bound to `fqn`.
+    ///
+    /// `with_sink` is the same seam production uses for its gRPC sink, so the
+    /// pooling, backpressure, and drop-counting behavior under test is the
+    /// production behavior; only the destination is a mock.
+    fn client_over(
+        srv: &WyrdTestServer,
+        fqn: &str,
+        sink: Arc<dyn BatchSink<ClientByteGuard>>,
+        config: QueueConfig,
+    ) -> Bifrost {
+        let client = WyrdClient::with_config(client_config(srv)).expect("journey client");
+        Bifrost::with_sink(&client, Some(table(fqn)), sink, config)
     }
 
     /// Returns durable lifecycle audit facts for one tenant and operation in sequence order.
@@ -1068,14 +1096,19 @@ mod pg_tests {
                 stored.name()
             );
         }
+        // The tag lives on the description, not on the projected Arrow schema:
+        // `writable_schema` drops field metadata at every depth so a writer
+        // never repeats server-owned identity onto the wire.
         assert_eq!(
-            described_schema
-                .field_with_name("card_ref")
+            canonical
+                .correlation_fields
+                .iter()
+                .find(|field| field.name == "card_ref")
                 .expect("the Gate correlation input is described")
-                .metadata()
-                .get("wyrd:input_class")
+                .metadata
+                .get(wyrd_spec::vala::api::INPUT_CLASS_KEY)
                 .map(String::as_str),
-            Some("gate_correlation"),
+            Some(wyrd_spec::vala::api::INPUT_CLASS_GATE_CORRELATION),
             "card_ref is a resolved Gate input, not a stored column"
         );
         for name in ["card_ref", "run_id", "wyrd_event_time"] {
@@ -1335,7 +1368,6 @@ mod pg_tests {
             api_key: Some(bootstrap.api_key().expect("machine API key").clone()),
             ..ClientConfig::default()
         };
-        let scope = ClientScope::from_config(&config).expect("public SDK scope");
         let client = WyrdClient::with_config(config).expect("public SDK client");
         let transport = BifrostGrpcTransport::connect_with_config(
             &client,
@@ -1344,33 +1376,30 @@ mod pg_tests {
         .await
         .expect("connect timeout-retry transport");
         let recording = Arc::new(RecordingTransport::new(transport));
-        let bifrost = Arc::new(Bifrost::new(
-            scope,
+        let bifrost = Bifrost::with_sink(
+            &client,
+            Some(table(&table_fqn)),
             Arc::new(BifrostIngestSink::new(recording.clone())),
             QueueConfig {
                 flush_interval_ms: 0,
                 ..QueueConfig::default()
             },
-        ));
+        );
 
         bifrost
             .insert(
-                SinkKind::Record,
-                &table_fqn,
-                &schema(),
                 row(41),
-                target,
-                None,
+                Correlation {
+                    card_ref: Some(target),
+                    run_id: None,
+                },
             )
             .expect("enqueue one owned JSON row");
-        let first_error = tokio::task::spawn_blocking({
-            let bifrost = Arc::clone(&bifrost);
-            move || bifrost.flush()
-        })
-        .await
-        .expect("first flush task joins")
-        .expect_err("short deadline after server receipt must leave the durable result ambiguous");
-        let WyrdQueueError::Sink(first_sink_error) = &first_error else {
+        let first_error = bifrost.flush().await.expect_err(
+            "short deadline after server receipt must leave the durable result ambiguous",
+        );
+        let vala_sdk::ValaSdkError::Queue(WyrdQueueError::Sink(first_sink_error)) = &first_error
+        else {
             panic!("the queue must receive an ambiguous sink result: {first_error}");
         };
         assert!(
@@ -1399,13 +1428,10 @@ mod pg_tests {
         );
 
         tokio::time::sleep(Duration::from_millis(350)).await;
-        tokio::task::spawn_blocking({
-            let bifrost = Arc::clone(&bifrost);
-            move || bifrost.flush()
-        })
-        .await
-        .expect("retry flush task joins")
-        .expect("retry resolves the post-receipt ambiguity through durable dedup");
+        bifrost
+            .flush()
+            .await
+            .expect("retry resolves the post-receipt ambiguity through durable dedup");
         let attempts = recording.attempts();
         assert!(attempts.len() >= 2, "one deadline then at least one retry");
         assert!(
@@ -1450,13 +1476,7 @@ mod pg_tests {
         .expect("read durable deduplicated rows");
         assert_eq!(row_count, 1, "retry did not create a duplicate durable row");
         conn.commit().await.expect("commit tenant-scoped read");
-        tokio::task::spawn_blocking({
-            let bifrost = Arc::clone(&bifrost);
-            move || bifrost.shutdown()
-        })
-        .await
-        .expect("shutdown task joins")
-        .expect("settled producer shutdown");
+        bifrost.shutdown().await.expect("settled producer shutdown");
         assert_eq!(
             bifrost.metrics().total_reserved_bytes,
             0,
@@ -1472,23 +1492,18 @@ mod pg_tests {
         let srv = WyrdTestServer::start_bound()
             .await
             .expect("test server start");
-        let config = client_config(&srv);
-        let scope = ClientScope::from_config(&config).expect("scope");
-        let bifrost = Bifrost::new(scope, Arc::new(MockSink::new()), QueueConfig::default());
+        let bifrost = client_over(
+            &srv,
+            "test.roundtrip",
+            Arc::new(MockSink::new()),
+            QueueConfig::default(),
+        );
         let schema = schema();
-        let target = card();
 
         for i in 0..500i64 {
             bifrost
-                .insert(
-                    SinkKind::Record,
-                    "test.roundtrip",
-                    &schema,
-                    row(i),
-                    target.clone(),
-                    None,
-                )
-                .expect("insert via Bifrost handle");
+                .insert(row(i), correlated())
+                .expect("insert into the active table");
         }
         assert_eq!(
             bifrost.dropped(),
@@ -1496,16 +1511,14 @@ mod pg_tests {
             "Bifrost handle: no drops on happy path"
         );
 
+        // An uncorrelated row is a valid write: the server stores it against
+        // the authenticated principal with a null card_uid.
+        bifrost
+            .insert(row(500), Correlation::default())
+            .expect("an omitted card_ref is accepted");
+
         for i in 0..500i64 {
-            observe::record(
-                &bifrost,
-                SinkKind::Record,
-                "test.roundtrip",
-                &schema,
-                row(i),
-                target.clone(),
-                None,
-            );
+            observe::record(&bifrost, "test.roundtrip", &schema, row(i), correlated());
         }
         assert_eq!(bifrost.dropped(), 0, "observe path: no drops on happy path");
         assert_eq!(bifrost.producer_count(), 1, "one producer for one table");
@@ -1520,42 +1533,34 @@ mod pg_tests {
         let srv = WyrdTestServer::start_bound()
             .await
             .expect("test server start");
-        let config = client_config(&srv);
-        let scope = ClientScope::from_config(&config).expect("scope");
         let stall = Arc::new(StallSink::default());
-        let bifrost = Bifrost::new(scope, stall.clone(), saturating_config());
+        let bifrost = client_over(
+            &srv,
+            "test.backpressure",
+            stall.clone(),
+            saturating_config(),
+        );
         let schema = schema();
-        let target = card();
 
         // Prime the stall: first insert starts draining then parks forever.
         bifrost
-            .insert(
-                SinkKind::Record,
-                "test.backpressure",
-                &schema,
-                row(0),
-                target.clone(),
-                None,
-            )
+            .insert(row(0), correlated())
             .expect("first accepted");
         wait_until_started(&stall);
 
         // Flood until rejection.
         let mut saw_queue_full = false;
         for i in 1..=100 {
-            match bifrost.insert(
-                SinkKind::Record,
-                "test.backpressure",
-                &schema,
-                row(i),
-                target.clone(),
-                None,
-            ) {
+            match bifrost.insert(row(i), correlated()) {
                 Ok(()) => {}
-                Err(WyrdQueueError::QueueFull) => {
+                Err(error) => {
+                    assert_eq!(
+                        error.code(),
+                        "WYRD_CLIENT_429_QUEUE_FULL",
+                        "unexpected error: {error}"
+                    );
                     saw_queue_full = true;
                 }
-                Err(e) => panic!("unexpected error: {e}"),
             }
         }
         assert!(
@@ -1564,27 +1569,27 @@ mod pg_tests {
         );
 
         // Observe path swallows queue-full.
-        let scope2 = ClientScope::from_config(&client_config(&srv)).expect("scope2");
-        let bifrost2 = Bifrost::new(scope2, stall.clone(), saturating_config());
+        let bifrost2 = client_over(
+            &srv,
+            "test.backpressure.obs",
+            stall.clone(),
+            saturating_config(),
+        );
         observe::record(
             &bifrost2,
-            SinkKind::Record,
             "test.backpressure.obs",
             &schema,
             row(0),
-            target.clone(),
-            None,
+            correlated(),
         );
         wait_until_started(&stall);
         for i in 1..=100 {
             observe::record(
                 &bifrost2,
-                SinkKind::Record,
                 "test.backpressure.obs",
                 &schema,
                 row(i),
-                target.clone(),
-                None,
+                correlated(),
             );
         }
         assert!(
@@ -1605,21 +1610,16 @@ mod pg_tests {
         let srv = WyrdTestServer::start_bound()
             .await
             .expect("test server start");
-        let scope = ClientScope::from_config(&client_config(&srv)).expect("scope");
         let sink = Arc::new(ReleasingSink::default());
-        let bifrost = Bifrost::new(scope, sink.clone(), saturating_config());
-        let schema = schema();
-        let target = card();
+        let bifrost = client_over(
+            &srv,
+            "test.downstream_stall",
+            sink.clone(),
+            saturating_config(),
+        );
 
         bifrost
-            .insert(
-                SinkKind::Record,
-                "test.downstream_stall",
-                &schema,
-                row(0),
-                target.clone(),
-                None,
-            )
+            .insert(row(0), correlated())
             .expect("first accepted");
         let deadline = Instant::now() + Duration::from_secs(5);
         while !sink.started.load(Ordering::SeqCst) {
@@ -1630,17 +1630,16 @@ mod pg_tests {
         let mut accepted = 1_usize;
         let mut rejected = 0_usize;
         for i in 1..=100 {
-            match bifrost.insert(
-                SinkKind::Record,
-                "test.downstream_stall",
-                &schema,
-                row(i),
-                target.clone(),
-                None,
-            ) {
+            match bifrost.insert(row(i), correlated()) {
                 Ok(()) => accepted += 1,
-                Err(WyrdQueueError::QueueFull) => rejected += 1,
-                Err(error) => panic!("unexpected queue error: {error}"),
+                Err(error) => {
+                    assert_eq!(
+                        error.code(),
+                        "WYRD_CLIENT_429_QUEUE_FULL",
+                        "unexpected queue error: {error}"
+                    );
+                    rejected += 1;
+                }
             }
         }
         assert!(
@@ -1653,14 +1652,7 @@ mod pg_tests {
         wait_until_sent(&sink, accepted);
 
         bifrost
-            .insert(
-                SinkKind::Record,
-                "test.downstream_stall",
-                &schema,
-                row(101),
-                target,
-                None,
-            )
+            .insert(row(101), correlated())
             .expect("post-drain write accepted");
         wait_until_sent(&sink, accepted + 1);
         assert_eq!(sink.sent_rows.load(Ordering::SeqCst), accepted + 1);

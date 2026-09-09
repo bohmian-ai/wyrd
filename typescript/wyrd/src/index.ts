@@ -11,9 +11,10 @@ import type {
 
 const require = createRequire(import.meta.url);
 const nativeBinding = require("../index.cjs") as typeof import("../index.cjs");
-const { NativeBifrostQueryClient, connectBifrost } = nativeBinding;
-type NativeBifrostQueryClient = import("../index.cjs").NativeBifrostQueryClient;
+const { connectBifrost, describeTableConfig, tableConfigFromJsonSchema } =
+  nativeBinding;
 type NativeBifrost = import("../index.cjs").NativeBifrost;
+type NativeTableConfig = import("../index.cjs").NativeTableConfig;
 
 export type VisibilityMode = "published_only" | "fused";
 export type FreshnessPolicy = "strict" | "allow_degraded";
@@ -467,48 +468,334 @@ export class BifrostQueryStream
   }
 }
 
-export class BifrostClient {
-  readonly #native: NativeBifrostQueryClient;
+/**
+ * The physical layout a table asks the server to create.
+ *
+ * Sort keys reuse {@link SortKey} — the same shape the describe route returns —
+ * so a layout read back from the server can be declared again unchanged.
+ */
+export interface TableLayout {
+  partitionGranularity?: "hour" | "day";
+  sortKeys?: readonly SortKey[];
+  bloomColumns?: readonly string[];
+}
 
-  constructor(native: NativeBifrostQueryClient) {
+/** Optional per-row correlation; an omitted field is a null on the wire. */
+export interface Correlation {
+  cardRef?: string;
+  runId?: string;
+}
+
+/** The server-minted identity of a registered table. */
+export interface ResolvedTable {
+  readonly tableUid: string;
+  readonly fingerprint: string;
+}
+
+function layoutJson(layout?: TableLayout): string | undefined {
+  if (layout === undefined) {
+    return undefined;
+  }
+  return JSON.stringify({
+    partition_granularity: layout.partitionGranularity ?? "hour",
+    sort_keys: layout.sortKeys ?? [],
+    bloom_columns: layout.bloomColumns ?? [],
+  });
+}
+
+/**
+ * One Bifrost table: its name, the columns a model declares, and the physical
+ * layout to request.
+ *
+ * Build it from a JSON Schema document — `z.toJSONSchema()` for Zod, or a
+ * literal — or fetch an existing table by name. No fingerprint is computed
+ * here: the server mints it, so `resolved` is undefined until the table is
+ * registered or described.
+ */
+export class TableConfig {
+  readonly #native: NativeTableConfig;
+
+  private constructor(native: NativeTableConfig) {
     this.#native = native;
   }
 
-  async query(request: BifrostQueryRequest): Promise<BifrostQueryStream> {
+  /** @internal Wrap one config the native client handed back. */
+  static fromNative(native: NativeTableConfig): TableConfig {
+    return new TableConfig(native);
+  }
+
+  /** @internal The value the native client reads back. */
+  get native(): NativeTableConfig {
+    return this.#native;
+  }
+
+  static fromJsonSchema(
+    table: string,
+    schema: Readonly<Record<string, unknown>>,
+    layout?: TableLayout,
+  ): TableConfig {
+    return new TableConfig(
+      tableConfigFromJsonSchema(table, JSON.stringify(schema), layoutJson(layout)),
+    );
+  }
+
+  /**
+   * Fetch an already-registered table's config by name.
+   *
+   * Transport fields auto-resolve when omitted, exactly as `Bifrost.connect`
+   * does.
+   */
+  static async describe(
+    table: string,
+    transport: {
+      readonly serverUrl?: string;
+      readonly credential?: string;
+      readonly grpcUrl?: string;
+    } = {},
+  ): Promise<TableConfig> {
+    return new TableConfig(
+      await describeTableConfig(
+        table,
+        transport.serverUrl,
+        transport.credential,
+        transport.grpcUrl,
+      ),
+    );
+  }
+
+  /** `namespace.name` — the name SQL and the ingest batch both use. */
+  get fqn(): string {
+    return this.#native.fqn;
+  }
+
+  /**
+   * The declared user columns only; correlation and managed columns are
+   * appended by the write path and the server.
+   */
+  get arrowSchema(): Schema {
+    return tableFromIPC(new Uint8Array(this.#native.schemaIpc)).schema;
+  }
+
+  /** The server-assigned identity, or undefined while unregistered. */
+  get resolved(): ResolvedTable | undefined {
+    const resolved = this.#native.resolvedJson;
+    if (resolved === null || resolved === undefined) {
+      return undefined;
+    }
+    const wire = JSON.parse(resolved) as {
+      table_uid: string;
+      fingerprint: string;
+    };
+    return { tableUid: wire.table_uid, fingerprint: wire.fingerprint };
+  }
+}
+
+/**
+ * Arrow batches from one query, converted on demand.
+ *
+ * Collected by draining {@link Bifrost.stream}, so a collected result and a
+ * streamed one are the same rows read the same way — only the batches are
+ * retained rather than yielded.
+ */
+export class QueryResult {
+  readonly #batches: readonly RecordBatch[];
+  readonly #terminal: QueryTerminal;
+
+  constructor(batches: readonly RecordBatch[], terminal: QueryTerminal) {
+    this.#batches = batches;
+    this.#terminal = terminal;
+  }
+
+  /** Every batch the query produced, in arrival order. */
+  get batches(): readonly RecordBatch[] {
+    return this.#batches;
+  }
+
+  /** The validated terminal frame the server closed the stream with. */
+  get terminal(): QueryTerminal {
+    return this.#terminal;
+  }
+
+  /** Total rows across every batch. */
+  get numRows(): number {
+    return this.#batches.reduce((total, batch) => total + batch.numRows, 0);
+  }
+}
+
+/**
+ * The one Bifrost client: query any authorized table, write to the active one.
+ *
+ * Rows are batched, so a write is durable only once {@link Bifrost.flush} or
+ * {@link Bifrost.shutdown} resolves. `insert` is synchronous because enqueueing
+ * is a bounded, non-blocking operation that propagates queue-full to the
+ * caller; the drains and reads are async because they wait on the server.
+ */
+export class Bifrost {
+  readonly #native: NativeBifrost;
+
+  private constructor(native: NativeBifrost) {
+    this.#native = native;
+  }
+
+  /**
+   * Connect one client, optionally already bound to a write target.
+   *
+   * Connecting performs IO, so this is a static factory rather than a
+   * constructor. Every option is optional: `serverUrl` resolves from
+   * `WYRD_SERVER_URL`, `grpcUrl` from `WYRD_GRPC_URL`, and `credential`
+   * through `WYRD_ACCESS_TOKEN` → `WYRD_WORKLOAD_TOKEN` + tenant →
+   * `WYRD_API_KEY` → `~/.config/wyrd/credentials.toml`.
+   */
+  static async connect(
+    options: {
+      readonly table?: TableConfig;
+      readonly serverUrl?: string;
+      readonly credential?: string;
+      readonly grpcUrl?: string;
+    } = {},
+  ): Promise<Bifrost> {
+    return new Bifrost(
+      await connectBifrost(
+        options.table?.native,
+        options.serverUrl,
+        options.credential,
+        options.grpcUrl,
+      ),
+    );
+  }
+
+  /** Create the active table; resolves to `created` or `already_exists`. */
+  async register(): Promise<"created" | "already_exists"> {
+    return lifecycleValue<"created" | "already_exists">(
+      await this.#native.register(),
+    );
+  }
+
+  /**
+   * Bind `table` as the write target, returning the previous binding.
+   *
+   * The previous table's producer stays pooled, so its buffered rows still
+   * flush; a swap loses nothing.
+   */
+  useTable(table: TableConfig): TableConfig | undefined {
+    const previous = this.#native.useTable(table.native);
+    return previous === null || previous === undefined
+      ? undefined
+      : TableConfig.fromNative(previous);
+  }
+
+  /** Bind an already-registered table by name, describing it first. */
+  async useTableByName(table: string): Promise<void> {
+    lifecycleValue<null>(await this.#native.useTableByName(table));
+  }
+
+  /** The active write binding, if any. */
+  get table(): TableConfig | undefined {
+    const native = this.#native.table;
+    return native === null || native === undefined
+      ? undefined
+      : TableConfig.fromNative(native);
+  }
+
+  /**
+   * Enqueue one row into the active table.
+   *
+   * Synchronous and non-blocking; durable after {@link Bifrost.flush}. A
+   * saturated queue throws the stable refusal rather than dropping the row.
+   */
+  insert(
+    row: Readonly<Record<string, unknown>>,
+    correlation: Correlation = {},
+  ): void {
+    lifecycleValue<null>(
+      this.#native.insert(
+        JSON.stringify(row),
+        correlation.cardRef,
+        correlation.runId,
+      ),
+    );
+  }
+
+  /** Flush every pooled producer and await each durable acknowledgement. */
+  async flush(): Promise<void> {
+    lifecycleValue<null>(await this.#native.flush());
+  }
+
+  /** Drain every producer and stop its background task. */
+  async shutdown(): Promise<void> {
+    lifecycleValue<null>(await this.#native.shutdown());
+  }
+
+  /**
+   * Run one SQL SELECT over any authorized table and collect every batch.
+   *
+   * Drains {@link Bifrost.stream}, so the two cannot disagree about the rows a
+   * query returns or about the terminal frame each requires.
+   */
+  async sql(query: string): Promise<QueryResult> {
+    const stream = await this.stream({ sql: query });
+    const batches: RecordBatch[] = [];
+    for await (const batch of stream) {
+      batches.push(batch);
+    }
+    const terminal = stream.terminal;
+    if (terminal === undefined) {
+      throw new IncompleteQueryStreamError(
+        502,
+        "Query stream incomplete",
+        "query stream completed without terminal metadata",
+      );
+    }
+    return new QueryResult(batches, terminal);
+  }
+
+  /** Run one SQL SELECT and iterate its batches as they arrive. */
+  async stream(
+    request: BifrostQueryRequest | string,
+  ): Promise<BifrostQueryStream> {
+    const query = typeof request === "string" ? { sql: request } : request;
     const nativeRequest: NativeQueryRequest = {
-      sql: request.sql,
-      visibility: request.visibility ?? "published_only",
-      freshness: request.freshness ?? "strict",
-      deadlineMs: request.deadlineMs,
+      sql: query.sql,
+      visibility: query.visibility ?? "published_only",
+      freshness: query.freshness ?? "strict",
+      deadlineMs: query.deadlineMs,
     };
     const start = await this.#native.query(nativeRequest);
     const error = projectedError(start);
     if (error !== undefined) {
       throw error;
     }
-    const stream = start.takeStream();
-    if (stream === null || stream === undefined) {
+    const native = start.takeStream();
+    if (native === null || native === undefined) {
       throw new IncompleteQueryStreamError(
         502,
         "Query stream incomplete",
         "native query startup returned neither a stream nor structured error",
       );
     }
-    return new BifrostQueryStream(stream);
+    return new BifrostQueryStream(native);
   }
 
+  /** Number of distinct table producers currently pooled. */
+  get producerCount(): number {
+    return this.#native.producerCount;
+  }
+
+  /** List active queries visible to the authenticated tenant. */
   async running(): Promise<RunningQuery[]> {
     return lifecycleValue<RunningQueryWire[]>(await this.#native.running()).map(
       runningQuery,
     );
   }
 
+  /** Return one active query by its canonical request ID. */
   async status(requestId: string): Promise<RunningQuery> {
     return runningQuery(
       lifecycleValue<RunningQueryWire>(await this.#native.status(requestId)),
     );
   }
 
+  /** Request server-side cancellation without closing a local stream. */
   async cancel(requestId: string): Promise<CancelRunningQueryResult> {
     const wire = lifecycleValue<CancelRunningQueryWire>(
       await this.#native.cancel(requestId),
@@ -519,9 +806,7 @@ export class BifrostClient {
     };
   }
 
-  /**
-   * Describe one registered table's stored physical schema.
-   */
+  /** Describe one registered table's stored physical schema. */
   async describeTable(
     namespace: string,
     name: string,
@@ -529,24 +814,6 @@ export class BifrostClient {
     return lifecycleValue<TableDescription>(
       await this.#native.describeTable(namespace, name),
     );
-  }
-
-  /**
-   * Return the exact Arrow schema a writer builds batches on.
-   *
-   * The schema is decoded from schema-only Arrow IPC produced by Rust from the
-   * same description, so JavaScript never reimplements the field/type
-   * conversion the physical contract depends on.
-   */
-  async writableSchema(
-    description: TableDescription,
-    includeEventTime = false,
-  ): Promise<Schema> {
-    const ipc = await this.#native.writableSchemaIpc(
-      JSON.stringify(description),
-      includeEventTime,
-    );
-    return tableFromIPC(new Uint8Array(ipc)).schema;
   }
 
   /**
@@ -564,9 +831,7 @@ export class BifrostClient {
     );
   }
 
-  /**
-   * Read one page of GenAI generation records.
-   */
+  /** Read one page of GenAI generation records. */
   async queryGenAi(query: GenAiQuery = {}): Promise<GenAiPage> {
     const request: NativeGenAiRequest = {
       since: query.since,
@@ -578,115 +843,5 @@ export class BifrostClient {
       provider: query.provider,
     };
     return lifecycleValue<GenAiPage>(await this.#native.queryGenai(request));
-  }
-}
-
-/**
- * One row's write correlation and payload, as a caller supplies it.
- *
- * `schema` is a JSON Schema document describing the row's user columns; it is
- * the same cross-language contract the Python SDK takes, so the same table can
- * be written from either language. `row` is the row itself. Both are sent to
- * the server as JSON text — this SDK stringifies them so a caller never has to.
- */
-export interface BifrostWrite {
-  table: string;
-  schema: Readonly<Record<string, unknown>>;
-  row: Readonly<Record<string, unknown>>;
-  cardRef: string;
-  runId?: string;
-}
-
-/**
- * The Bifrost write handle: a pooled producer per table behind one gRPC sink.
- *
- * Rows are batched, so a write is durable only once {@link Bifrost.flush} or
- * {@link Bifrost.shutdown} resolves. `insert` is synchronous because enqueueing
- * is a bounded, non-blocking operation that propagates queue-full to the
- * caller; the drains are async because they block on server acknowledgement.
- */
-export class Bifrost {
-  readonly #native: NativeBifrost;
-
-  private constructor(native: NativeBifrost) {
-    this.#native = native;
-  }
-
-  /**
-   * Connect one authenticated write handle.
-   *
-   * Connecting performs IO, so this is a static factory rather than a
-   * constructor. `grpcUrl` overrides the ingest endpoint for split-plane and
-   * local test deployments.
-   */
-  static async connect(
-    serverUrl: string,
-    apiKey: string,
-    grpcUrl?: string,
-  ): Promise<Bifrost> {
-    return new Bifrost(await connectBifrost(serverUrl, apiKey, grpcUrl));
-  }
-
-  /** Enqueue one row, throwing on a full or draining queue. */
-  insert(write: BifrostWrite): void {
-    this.#native.insert(
-      write.table,
-      JSON.stringify(write.schema),
-      JSON.stringify(write.row),
-      write.cardRef,
-      write.runId,
-    );
-  }
-
-  /**
-   * Enqueue one row fire-and-forget, counting rather than throwing saturation.
-   *
-   * Use this for telemetry, where losing a row under backpressure is preferable
-   * to failing the caller. Losses are visible through {@link Bifrost.dropped}.
-   */
-  record(write: BifrostWrite): void {
-    this.#native.record(
-      write.table,
-      JSON.stringify(write.schema),
-      JSON.stringify(write.row),
-      write.cardRef,
-      write.runId,
-    );
-  }
-
-  /** Flush every pooled producer and await each durable acknowledgement. */
-  async flush(): Promise<void> {
-    await this.#native.flush();
-  }
-
-  /** Drain every producer and stop its background task. */
-  async shutdown(): Promise<void> {
-    await this.#native.shutdown();
-  }
-
-  /** Rows dropped by {@link Bifrost.record} under backpressure. */
-  get dropped(): number {
-    return this.#native.dropped;
-  }
-
-  /** Number of distinct producers currently pooled. */
-  get producerCount(): number {
-    return this.#native.producerCount;
-  }
-}
-
-export class BifrostQueryClient extends BifrostClient {
-  constructor(serverUrl: string, token: string, grpcUrl?: string) {
-    super(new NativeBifrostQueryClient(serverUrl, token, grpcUrl));
-  }
-}
-
-export class WyrdClient {
-  readonly bifrost: BifrostClient;
-
-  constructor(serverUrl: string, token: string, grpcUrl?: string) {
-    this.bifrost = new BifrostClient(
-      new NativeBifrostQueryClient(serverUrl, token, grpcUrl),
-    );
   }
 }

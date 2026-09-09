@@ -1499,6 +1499,32 @@ impl WyrdTestServer {
             .collect()
     }
 
+    /// Wait until every locally accepted Oracle audit record has relayed.
+    ///
+    /// Oracle read acceptance is fsynced to a local WAL before rows are
+    /// permitted and relayed into the canonical outbox by a background task, so
+    /// a journey that asserts on the outbox must first observe the relay
+    /// converge. This polls the exact pending counter rather than sleeping a
+    /// fixed interval: the returned count is the real residual, and a nonzero
+    /// return within `budget` is a genuine failure to drain, not a masked race.
+    ///
+    /// # Errors
+    ///
+    /// Returns a start error when this server does not host an Oracle role.
+    pub async fn wait_oracle_audit_relayed(
+        &self,
+        budget: std::time::Duration,
+    ) -> Result<u64, WyrdTestServerError> {
+        let deadline = std::time::Instant::now() + budget;
+        loop {
+            let pending = self.oracle_runtime_inspection()?.audit_wal_records;
+            if pending == 0 || std::time::Instant::now() >= deadline {
+                return Ok(pending);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
     /// Count Bifrost read-decision audit rows for the fixture tenant.
     ///
     /// Agent-surface denial journeys use this test-only probe to prove Gate

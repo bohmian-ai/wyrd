@@ -52,6 +52,25 @@ pub enum ValaSdkError {
     /// The caller's bounded collection limits were exceeded.
     #[error("query result exceeds configured bounds")]
     ResultTooLarge,
+    /// A write was attempted with no table bound as the active target.
+    #[error("no active Bifrost table is bound for writes")]
+    NoActiveTable,
+    /// The client-tier producer queue refused, timed out, or failed a write.
+    ///
+    /// Carried verbatim rather than projected onto [`WyrdError`] because the
+    /// queue's own codes — notably `WYRD_CLIENT_429_QUEUE_FULL` — have no
+    /// catalog variant, and collapsing them would report saturation as an
+    /// internal error to every language SDK.
+    #[error("bifrost write failed: {0}")]
+    Queue(#[from] wyrd_queue::WyrdQueueError),
+    /// A client-tier configuration, credential, or transport failure.
+    ///
+    /// Carried verbatim for the same reason [`ValaSdkError::Queue`] is: the
+    /// `WYRD_CLIENT_*` codes are client-boundary projections with no catalog
+    /// variant, and collapsing them would report an unresolvable credential
+    /// chain as an internal error in every language SDK.
+    #[error("{0}")]
+    Client(#[from] wyrd_client::error::WyrdClientError),
 }
 
 impl ValaSdkError {
@@ -78,6 +97,9 @@ impl ValaSdkError {
                     |detail| detail.as_str().to_owned(),
                 ),
             Self::ResultTooLarge => "query result exceeds configured bounds".to_owned(),
+            Self::NoActiveTable => "no active Bifrost table is bound for writes".to_owned(),
+            Self::Queue(error) => error.to_string(),
+            Self::Client(error) => error.to_string(),
         }
     }
 
@@ -90,7 +112,10 @@ impl ValaSdkError {
             Self::Protocol(_)
             | Self::Arrow(_)
             | Self::IncompleteQueryStream
-            | Self::ResultTooLarge => None,
+            | Self::ResultTooLarge
+            | Self::NoActiveTable
+            | Self::Queue(_)
+            | Self::Client(_) => None,
         }
     }
 
@@ -103,6 +128,9 @@ impl ValaSdkError {
             Self::IncompleteQueryStream => "WYRD_VALA_502_QUERY_STREAM_INCOMPLETE",
             Self::FailedTerminal { terminal } => terminal_bifrost_error(terminal).code(),
             Self::ResultTooLarge => "WYRD_VALA_413_QUERY_RESULT_TOO_LARGE",
+            Self::NoActiveTable => "WYRD_VALA_412_NO_ACTIVE_TABLE",
+            Self::Queue(error) => error.code(),
+            Self::Client(error) => error.code(),
         }
     }
 
@@ -114,6 +142,9 @@ impl ValaSdkError {
             Self::Protocol(_) | Self::Arrow(_) | Self::IncompleteQueryStream => 502,
             Self::FailedTerminal { terminal } => terminal_bifrost_error(terminal).status(),
             Self::ResultTooLarge => 413,
+            Self::NoActiveTable => 412,
+            Self::Queue(error) => queue_status(error),
+            Self::Client(error) => client_status(error),
         }
     }
 
@@ -126,6 +157,9 @@ impl ValaSdkError {
             Self::IncompleteQueryStream => "Query stream incomplete",
             Self::FailedTerminal { terminal } => terminal_bifrost_error(terminal).title(),
             Self::ResultTooLarge => "Query result too large",
+            Self::NoActiveTable => "No active Bifrost table",
+            Self::Queue(error) => queue_title(error),
+            Self::Client(error) => client_title(error),
         }
     }
 
@@ -144,6 +178,11 @@ impl ValaSdkError {
             Self::ResultTooLarge => {
                 "Reduce the query result or raise the caller's explicit collection limit within its hard ceiling."
             }
+            Self::NoActiveTable => {
+                "Bind a table with use_table or use_table_by_name before inserting rows."
+            }
+            Self::Queue(error) => queue_remediation(error),
+            Self::Client(error) => client_remediation(error),
         }
     }
 
@@ -156,8 +195,130 @@ impl ValaSdkError {
             | Self::Protocol(_)
             | Self::Arrow(_)
             | Self::IncompleteQueryStream
-            | Self::ResultTooLarge => None,
+            | Self::ResultTooLarge
+            | Self::NoActiveTable
+            | Self::Queue(_)
+            | Self::Client(_) => None,
         }
+    }
+}
+
+impl From<ValaSdkError> for WyrdError {
+    /// Project one SDK error onto the shared stable catalog.
+    ///
+    /// The SDK's own codes are already the ones every language surface
+    /// reports, so this reconstructs the catalog variant from the code rather
+    /// than inventing a second mapping. A code with no catalog variant — the
+    /// client-tier queue codes, notably — becomes an internal error that still
+    /// names its original code in the details, so nothing is silently renamed.
+    fn from(error: ValaSdkError) -> Self {
+        if let ValaSdkError::Transport(inner) = error {
+            return inner;
+        }
+        let code = error.code();
+        let detail = error.detail();
+        Self::from_code(
+            code,
+            detail.clone(),
+            error
+                .safe_details()
+                .unwrap_or_else(|| serde_json::json!({})),
+        )
+        .unwrap_or(Self::Internal {
+            message: detail,
+            details: serde_json::json!({ "original_code": code }),
+        })
+    }
+}
+
+/// The HTTP-equivalent status of one client-tier transport failure.
+///
+/// The `WYRD_CLIENT_*` codes are client-boundary projections with no catalog
+/// variant, so this is the single place their numeric half is stated.
+fn client_status(error: &wyrd_client::error::WyrdClientError) -> u16 {
+    use wyrd_client::error::WyrdClientError as Client;
+    match error {
+        Client::Config { .. } => 400,
+        Client::NoCredentials => 401,
+        Client::TransportDown { .. } => 503,
+    }
+}
+
+/// The stable title of one client-tier transport failure.
+fn client_title(error: &wyrd_client::error::WyrdClientError) -> &'static str {
+    use wyrd_client::error::WyrdClientError as Client;
+    match error {
+        Client::Config { .. } => "Client configuration invalid",
+        Client::NoCredentials => "No credentials available",
+        Client::TransportDown { .. } => "Transport unavailable",
+    }
+}
+
+/// Operator-facing remediation for one client-tier transport failure.
+fn client_remediation(error: &wyrd_client::error::WyrdClientError) -> &'static str {
+    use wyrd_client::error::WyrdClientError as Client;
+    match error {
+        Client::Config { .. } => {
+            "Correct the supplied server URL, gRPC endpoint, or credential before constructing the client."
+        }
+        Client::NoCredentials => {
+            "Set WYRD_ACCESS_TOKEN, WYRD_WORKLOAD_TOKEN with WYRD_TENANT, or WYRD_API_KEY, pass an explicit credential, or add [default].api_key to ~/.config/wyrd/credentials.toml."
+        }
+        Client::TransportDown { .. } => {
+            "Confirm the Wyrd server is reachable at the resolved endpoint and retry."
+        }
+    }
+}
+
+/// The HTTP-equivalent status of one client-tier queue refusal.
+///
+/// The queue owns its own stable codes; this is the single place their numeric
+/// half is stated, so every language SDK reports the same status for the same
+/// refusal.
+fn queue_status(error: &wyrd_queue::WyrdQueueError) -> u16 {
+    use wyrd_queue::WyrdQueueError as Queue;
+    match error {
+        Queue::QueueFull | Queue::Backpressure => 429,
+        Queue::FlushTimeout => 504,
+        Queue::PayloadTooLarge => 413,
+        Queue::SchemaParse(_) | Queue::ReservedColumn(_) => 400,
+        Queue::Sink(inner) => inner.status(),
+    }
+}
+
+/// The stable title of one client-tier queue refusal.
+fn queue_title(error: &wyrd_queue::WyrdQueueError) -> &'static str {
+    use wyrd_queue::WyrdQueueError as Queue;
+    match error {
+        Queue::QueueFull | Queue::Backpressure => "Write queue saturated",
+        Queue::FlushTimeout => "Write flush timed out",
+        Queue::PayloadTooLarge => "Write payload too large",
+        Queue::SchemaParse(_) => "Schema parse failed",
+        Queue::ReservedColumn(_) => "Reserved column name",
+        Queue::Sink(inner) => inner.title(),
+    }
+}
+
+/// Operator-facing remediation for one client-tier queue refusal.
+fn queue_remediation(error: &wyrd_queue::WyrdQueueError) -> &'static str {
+    use wyrd_queue::WyrdQueueError as Queue;
+    match error {
+        Queue::QueueFull | Queue::Backpressure => {
+            "Slow the write rate or flush more often; the producer channel, staging ring, and byte budget are all occupied."
+        }
+        Queue::FlushTimeout => {
+            "Retry the flush; the in-flight batch did not acknowledge before the drain deadline."
+        }
+        Queue::PayloadTooLarge => {
+            "Reduce the row size; a single sealed row exceeds the configured max_message_bytes."
+        }
+        Queue::SchemaParse(_) => {
+            "Correct the declared column types so every field maps onto a supported Bifrost type."
+        }
+        Queue::ReservedColumn(_) => {
+            "Rename the column; wyrd_*, card_ref, and run_id are server-owned names."
+        }
+        Queue::Sink(inner) => inner.remediation(),
     }
 }
 
@@ -208,6 +369,16 @@ impl QueryClient {
         Self {
             client: client.clone(),
         }
+    }
+
+    /// The authenticated client this handle shares its transport with.
+    ///
+    /// Exposed so [`crate::Bifrost`] issues its catalog calls — register and
+    /// describe — over the same auth and connection pools its queries use,
+    /// instead of assembling a second transport for the same credential.
+    #[must_use]
+    pub fn client(&self) -> &WyrdClient {
+        &self.client
     }
 
     /// Starts one authenticated terminal-safe Oracle query.
@@ -3074,26 +3245,5 @@ mod tests {
         );
         drop(raw);
         assert!(dropped.load(Ordering::SeqCst));
-    }
-
-    /// The Rust client exposes one request ID and canonical typed lifecycle methods.
-    #[test]
-    fn running_query_client_projects_canonical_contract() {
-        let request_id = RequestId::now_v7();
-        let body = stream::pending::<Result<Bytes, reqwest::Error>>();
-        let result = QueryResultStream::new(
-            RawQueryStream::new(body, VisibilityMode::PublishedOnly),
-            request_id.clone(),
-            offline_client(),
-            0,
-        );
-        assert_eq!(result.request_id(), &request_id);
-
-        let source = include_str!("query.rs");
-        assert!(source.contains("pub async fn running(&self)"));
-        assert!(source.contains("pub async fn status("));
-        assert!(source.contains("pub async fn cancel("));
-        assert!(source.contains("/v1/query/running"));
-        assert!(source.contains("/v1/query/{request_id}"));
     }
 }

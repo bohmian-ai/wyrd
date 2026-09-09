@@ -1,13 +1,20 @@
 //! Vala client SDK — the client-tier Bifrost ingest surface.
 //!
-//! `vala-sdk` ships buffered JSON rows to the Wyrd ingest service as Record
-//! batches. It owns three things:
+//! `vala-sdk` is the one Bifrost client: it registers tables, ships buffered
+//! JSON rows to the Wyrd ingest service as Record batches, and reads them back
+//! with terminal-safe SQL. It owns:
 //!
+//! - [`Bifrost`] — the client. A [`TableConfig`] binds the write target; reads
+//!   are unbound because `POST /v1/query` accepts SQL over any authorized
+//!   table. [`blocking::Bifrost`] is the same client for callers with no
+//!   runtime.
+//! - [`TableConfig`] — one table's identity, declared user columns, and
+//!   requested physical layout, built from Arrow or JSON Schema or fetched by
+//!   name. The server stays authoritative for the uid and fingerprint it
+//!   reports back through [`ResolvedTable`].
 //! - [`BifrostIngestSink`] — the `wyrd-queue` [`BatchSink`] that maps one sealed
 //!   batch onto the ingest RPC (`table`, `wyrd_batch_id`, Arrow IPC frames),
 //!   preserving `batch_id` so the server's commit dedup holds across retries.
-//! - [`Bifrost`] — the write handle that pools one [`Producer`] per destination,
-//!   keyed by `(ClientScope, SinkKind, table)`.
 //! - [`observe`] — fire-and-forget telemetry that never breaks its caller.
 //!
 //! [`ClientScope`] is a credential fingerprint the **token-opaque** client tier
@@ -17,13 +24,14 @@
 //! counts the drop, and warns.
 //!
 //! [`BatchSink`]: wyrd_queue::BatchSink
-//! [`Producer`]: wyrd_queue::Producer
 
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
 
+mod bifrost;
+pub mod blocking;
 pub mod grpc;
-pub mod handle;
+mod handle;
 mod native_owner;
 pub mod observe;
 #[cfg(feature = "python")]
@@ -31,18 +39,21 @@ pub mod python;
 pub mod query;
 pub mod scope;
 pub mod sink;
+mod table;
 
+pub use bifrost::{Bifrost, QueryResult, client_from_options, register_outcome_name};
 pub use grpc::{
     BifrostGrpcTransport, BifrostTransportConfig, MAX_FRAME_BYTES, MAX_FRAME_RETRIES,
     PROTO_FRAME_OVERHEAD_BYTES,
 };
-pub use handle::{Bifrost, BifrostMetrics, schema_from_json_schema};
+pub use handle::BifrostMetrics;
 pub use query::{
     CollectedQueryLimits, CollectedQueryResult, QueryClient, QueryResultStream, RawQueryStream,
     ValaSdkError,
 };
 pub use scope::{ClientScope, SinkKind};
 pub use sink::{BifrostIngestSink, IngestTransport};
+pub use table::{Correlation, ResolvedTable, TableConfig};
 
 // C4a forward schema helpers, re-exported so SDK users build the user Arrow
 // schema from a `FieldSpec` set or a JSON-Schema value without reaching into
@@ -69,7 +80,10 @@ mod sdk {
     use wyrd_spec::error::WyrdError;
     use wyrd_spec::reference::CardRef;
 
-    use crate::{Bifrost, BifrostIngestSink, ClientScope, IngestTransport, SinkKind, observe};
+    use crate::handle::WriterPool;
+    use crate::{
+        Bifrost, BifrostIngestSink, ClientScope, Correlation, IngestTransport, TableConfig, observe,
+    };
 
     fn config_with_key(url: &str, key: &str) -> ClientConfig {
         ClientConfig {
@@ -79,6 +93,36 @@ mod sdk {
             },
             api_key: Some(key.to_owned().into()),
             ..ClientConfig::default()
+        }
+    }
+
+    /// The producer pool under test, keyed on one deterministic scope.
+    fn pool(sink: Arc<dyn BatchSink<ClientByteGuard>>, config: QueueConfig) -> WriterPool {
+        WriterPool::new(
+            ClientScope::from_config(&config_with_key("http://x", "secret")).expect("scope"),
+            sink,
+            config,
+        )
+    }
+
+    /// A client over `sink`, built without any IO so a mock sink can stand in
+    /// for the gRPC transport the production constructor would dial.
+    fn client_over(sink: Arc<dyn BatchSink<ClientByteGuard>>, config: QueueConfig) -> Bifrost {
+        let client = wyrd_client::WyrdClient::with_config(config_with_key("http://x", "secret"))
+            .expect("client assembles without IO");
+        Bifrost::with_sink(&client, None, sink, config)
+    }
+
+    /// A config declaring one `id` column on `fqn`.
+    fn table(fqn: &str) -> TableConfig {
+        TableConfig::from_arrow(fqn, test_schema()).expect("declared table")
+    }
+
+    /// One row correlated to the harness card.
+    fn correlated() -> Correlation {
+        Correlation {
+            card_ref: Some(card()),
+            run_id: None,
         }
     }
 
@@ -191,16 +235,14 @@ mod sdk {
 
     #[test]
     fn identical_key_reuses_one_pooled_producer() {
-        let scope =
-            ClientScope::from_config(&config_with_key("http://x", "secret")).expect("scope");
-        let bifrost = Bifrost::new(scope, Arc::new(MockSink::new()), QueueConfig::default());
+        let bifrost = pool(Arc::new(MockSink::new()), QueueConfig::default());
         let schema = test_schema();
 
         bifrost
-            .insert(SinkKind::Record, "ns.tbl", &schema, row(), card(), None)
+            .insert("ns.tbl", &schema, row(), Some(card()), None)
             .expect("first accepted");
         bifrost
-            .insert(SinkKind::Record, "ns.tbl", &schema, row(), card(), None)
+            .insert("ns.tbl", &schema, row(), Some(card()), None)
             .expect("second accepted");
         assert_eq!(
             bifrost.producer_count(),
@@ -209,18 +251,28 @@ mod sdk {
         );
 
         bifrost
-            .insert(SinkKind::Record, "ns.other", &schema, row(), card(), None)
+            .insert("ns.other", &schema, row(), Some(card()), None)
             .expect("distinct table accepted");
         assert_eq!(bifrost.producer_count(), 2, "a new table is a new producer");
+    }
+
+    /// An omitted `card_ref` is a valid write, not a client-side refusal.
+    ///
+    /// The server stores an uncorrelated row against the authenticated
+    /// principal with a null `card_uid`; the pool must reach it, so this proves
+    /// the client no longer forces a correlation the wire never required.
+    #[test]
+    fn omitted_card_ref_is_accepted() {
+        let bifrost = pool(Arc::new(MockSink::new()), QueueConfig::default());
+        bifrost
+            .insert("ns.tbl", &test_schema(), row(), None, None)
+            .expect("an uncorrelated row is a valid write");
     }
 
     /// Refuses a distinct producer before the handle grows beyond its configured cap.
     #[test]
     fn bifrost_producer_cap_refuses_before_registry_growth() {
-        let scope =
-            ClientScope::from_config(&config_with_key("http://x", "secret")).expect("scope");
-        let bifrost = Bifrost::new(
-            scope,
+        let bifrost = pool(
             Arc::new(MockSink::new()),
             QueueConfig {
                 max_producers: 1,
@@ -229,10 +281,10 @@ mod sdk {
         );
         let schema = test_schema();
         bifrost
-            .insert(SinkKind::Record, "ns.first", &schema, row(), card(), None)
+            .insert("ns.first", &schema, row(), Some(card()), None)
             .expect("first producer accepted");
         assert!(matches!(
-            bifrost.insert(SinkKind::Record, "ns.second", &schema, row(), card(), None),
+            bifrost.insert("ns.second", &schema, row(), Some(card()), None),
             Err(wyrd_queue::WyrdQueueError::Backpressure)
         ));
         assert_eq!(
@@ -245,10 +297,7 @@ mod sdk {
     /// Admits at most the default 64 producer envelopes inside one 32 MiB owner.
     #[test]
     fn default_producer_envelopes_charge_before_registry_growth() {
-        let scope =
-            ClientScope::from_config(&config_with_key("http://x", "secret")).expect("scope");
-        let bifrost = Bifrost::new(
-            scope,
+        let bifrost = pool(
             Arc::new(MockSink::new()),
             QueueConfig {
                 // Disable timer work so the test isolates default cardinality
@@ -261,11 +310,10 @@ mod sdk {
         for index in 0..QueueConfig::MAX_LIVE_ENTRIES {
             bifrost
                 .insert(
-                    SinkKind::Record,
                     &format!("ns.capacity_{index}"),
                     &schema,
                     row(),
-                    card(),
+                    Some(card()),
                     None,
                 )
                 .expect("default producer envelope fits before construction");
@@ -277,14 +325,7 @@ mod sdk {
             "fixed and dynamic ownership stays inside the one 32 MiB budget: {admitted:?}"
         );
         assert!(matches!(
-            bifrost.insert(
-                SinkKind::Record,
-                "ns.capacity_overflow",
-                &schema,
-                row(),
-                card(),
-                None,
-            ),
+            bifrost.insert("ns.capacity_overflow", &schema, row(), Some(card()), None),
             Err(wyrd_queue::WyrdQueueError::Backpressure)
         ));
         let refused = bifrost.metrics();
@@ -310,30 +351,29 @@ mod sdk {
         );
     }
 
+    /// A saturated queue reaches the caller of the public client as a stable
+    /// error, rather than being counted and swallowed.
     #[test]
     fn insert_propagates_queue_full() {
         let sink = Arc::new(StallSink::default());
-        let scope =
-            ClientScope::from_config(&config_with_key("http://x", "secret")).expect("scope");
-        let bifrost = Bifrost::new(scope, sink.clone(), saturating_config());
-        let schema = test_schema();
+        let bifrost = client_over(sink.clone(), saturating_config());
+        bifrost.use_table(table("ns.tbl"));
 
         bifrost
-            .insert(SinkKind::Record, "ns.tbl", &schema, row(), card(), None)
+            .insert(row(), correlated())
             .expect("first enqueue accepted");
         wait_until_started(&sink);
 
         let mut rejected = 0;
         for i in 0..40 {
             let payload = format!(r#"{{"id": {}}}"#, i + 1).into_bytes();
-            if let Err(err) =
-                bifrost.insert(SinkKind::Record, "ns.tbl", &schema, payload, card(), None)
-            {
+            if let Err(err) = bifrost.insert(payload, correlated()) {
                 assert_eq!(
                     err.code(),
                     "WYRD_CLIENT_429_QUEUE_FULL",
                     "insert must surface queue-full to the caller"
                 );
+                assert_eq!(err.status(), 429);
                 rejected += 1;
             }
         }
@@ -341,16 +381,66 @@ mod sdk {
             rejected > 0,
             "a saturated queue must reject on the write path"
         );
+        assert_eq!(
+            bifrost.dropped(),
+            0,
+            "the explicit write path refuses; it never drops"
+        );
+    }
+
+    /// A write with nothing bound refuses instead of guessing a destination.
+    #[test]
+    fn insert_without_an_active_table_refuses() {
+        let bifrost = client_over(Arc::new(MockSink::new()), QueueConfig::default());
+        assert!(bifrost.table().is_none(), "a fresh client binds no table");
+        let error = bifrost
+            .insert(row(), Correlation::default())
+            .expect_err("an unbound write must refuse");
+        assert_eq!(error.code(), "WYRD_VALA_412_NO_ACTIVE_TABLE");
+        assert_eq!(error.status(), 412);
+        assert_eq!(
+            bifrost.producer_count(),
+            0,
+            "a refused write builds no producer"
+        );
+    }
+
+    /// Swapping the active table keeps the previous table's producer, so its
+    /// buffered rows still drain on the next flush.
+    #[test]
+    fn swapping_the_active_table_keeps_the_previous_producer() {
+        let bifrost = client_over(Arc::new(MockSink::new()), QueueConfig::default());
+
+        assert!(
+            bifrost.use_table(table("ns.first")).is_none(),
+            "the first binding replaces nothing"
+        );
+        bifrost.insert(row(), correlated()).expect("first accepted");
+
+        let previous = bifrost
+            .use_table(table("ns.second"))
+            .expect("the swap returns the previous binding");
+        assert_eq!(previous.fqn(), "ns.first");
+        assert_eq!(
+            bifrost.table().expect("a table stays bound").fqn(),
+            "ns.second"
+        );
+
+        bifrost
+            .insert(row(), correlated())
+            .expect("second accepted");
+        assert_eq!(
+            bifrost.producer_count(),
+            2,
+            "the swapped-away table keeps its producer and its buffered rows"
+        );
     }
 
     /// Flush visits every producer and shutdown releases fixed storage after terminal settlement.
     #[test]
     fn lifecycle_drains_all_producers_after_first_error() {
         let sink = Arc::new(LifecycleSink::default());
-        let scope =
-            ClientScope::from_config(&config_with_key("http://x", "secret")).expect("scope");
-        let bifrost = Bifrost::new(
-            scope,
+        let bifrost = pool(
             Arc::clone(&sink) as Arc<dyn BatchSink<ClientByteGuard>>,
             QueueConfig {
                 flush_max_rows: 2,
@@ -360,10 +450,10 @@ mod sdk {
         );
         let schema = test_schema();
         bifrost
-            .insert(SinkKind::Record, "b", &schema, row(), card(), None)
+            .insert("b", &schema, row(), Some(card()), None)
             .expect("later producer accepted");
         bifrost
-            .insert(SinkKind::Record, "a", &schema, row(), card(), None)
+            .insert("a", &schema, row(), Some(card()), None)
             .expect("earlier producer accepted");
 
         let flush_error = bifrost.flush().expect_err("a producer must fail");
@@ -377,7 +467,7 @@ mod sdk {
             .expect("terminally settled producers release their fixed storage on shutdown");
         assert!(
             bifrost
-                .insert(SinkKind::Record, "b", &schema, row(), card(), None)
+                .insert("b", &schema, row(), Some(card()), None)
                 .expect_err("shutdown stops later producer")
                 .to_string()
                 .contains("queue full")
@@ -387,35 +477,17 @@ mod sdk {
     #[test]
     fn observe_record_swallows_and_counts_overflow() {
         let sink = Arc::new(StallSink::default());
-        let scope =
-            ClientScope::from_config(&config_with_key("http://x", "secret")).expect("scope");
-        let bifrost = Bifrost::new(scope, sink.clone(), saturating_config());
+        let bifrost = client_over(sink.clone(), saturating_config());
         let schema = test_schema();
 
         // Prime the stall, then flood the same saturated producer via the telemetry
         // path. `record` returns unit — the caller is never handed an error.
-        observe::record(
-            &bifrost,
-            SinkKind::Record,
-            "ns.tbl",
-            &schema,
-            row(),
-            card(),
-            None,
-        );
+        observe::record(&bifrost, "ns.tbl", &schema, row(), correlated());
         wait_until_started(&sink);
 
         for i in 0..40 {
             let payload = format!(r#"{{"id": {}}}"#, i + 1).into_bytes();
-            observe::record(
-                &bifrost,
-                SinkKind::Record,
-                "ns.tbl",
-                &schema,
-                payload,
-                card(),
-                None,
-            );
+            observe::record(&bifrost, "ns.tbl", &schema, payload, correlated());
         }
         assert!(
             bifrost.dropped() > 0,
@@ -472,16 +544,43 @@ mod sdk {
         );
     }
 
+    /// A JSON-Schema model becomes the config's declared user columns.
     #[test]
-    fn schema_from_json_schema_builds_arrow_schema() {
+    fn table_config_from_json_schema_declares_the_model_columns() {
         let json = serde_json::json!({
             "type": "object",
             "properties": { "id": { "type": "integer" } },
             "required": ["id"],
         });
-        let schema = crate::schema_from_json_schema(&json).expect("schema builds");
-        assert_eq!(schema.fields().len(), 1);
-        assert_eq!(schema.field(0).name(), "id");
+        let config = TableConfig::from_json_schema("ns.tbl", &json).expect("schema builds");
+        assert_eq!(config.fqn(), "ns.tbl");
+        assert_eq!(config.user_schema().fields().len(), 1);
+        assert_eq!(config.user_schema().field(0).name(), "id");
+        assert!(
+            config.resolved().is_none(),
+            "identity is server-minted; a declared config is inert"
+        );
+    }
+
+    /// A name that is not `<namespace>.<name>` is refused before any IO.
+    #[test]
+    fn table_config_requires_a_namespaced_name() {
+        let error = TableConfig::from_arrow("predictions", test_schema())
+            .expect_err("an unqualified name must refuse");
+        assert_eq!(error.code(), "WYRD_VALA_400_SCHEMA_PARSE");
+    }
+
+    /// A server-owned column may not be declared as a user column.
+    #[test]
+    fn table_config_rejects_a_reserved_column() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "card_ref",
+            DataType::Utf8,
+            true,
+        )]));
+        let error = TableConfig::from_arrow("ns.tbl", schema)
+            .expect_err("a correlation column is not a user column");
+        assert_eq!(error.code(), "WYRD_VALA_400_BIFROST_RESERVED_COLUMN");
     }
 }
 

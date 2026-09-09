@@ -3,7 +3,10 @@
 //! [`BifrostWriter`] is the ordinary client path — `Bifrost::insert` into a
 //! pooled `wyrd-queue` producer, sealed and shipped through the SDK's
 //! `IngestTransport`. Every positive journey writes through it, because that is
-//! the only write path a real caller has.
+//! the only write path a real caller has. It binds the table per call rather
+//! than once at construction, because a journey routinely writes several
+//! tables through one credential; the SDK pools a producer per table, so
+//! rebinding costs nothing and strands nothing.
 //!
 //! [`RawIngest`] is the same transport under a caller-chosen batch identity.
 //! `Bifrost::insert` deliberately mints its own UUIDv7 and refuses to expose
@@ -13,12 +16,10 @@
 //! contract: frame validation, auth metadata, and the retry that owns
 //! `WYRD_VALA_429_INGEST_BUSY` all still apply.
 
-use std::sync::Arc;
-
 use arrow::datatypes::SchemaRef;
 use uuid::Uuid;
 use vala_sdk::grpc::BifrostGrpcTransport;
-use vala_sdk::{Bifrost, BifrostIngestSink, ClientScope, IngestTransport, SinkKind};
+use vala_sdk::{Bifrost, Correlation, IngestTransport, TableConfig};
 use wyrd_client::WyrdClient;
 use wyrd_client::config::ClientConfig;
 use wyrd_queue::{ClientByteBudget, OwnedIpcBytes, QueueConfig, SealedBatch, SinkError};
@@ -32,7 +33,7 @@ use wyrd_spec::reference::CardRef;
 /// table, its user schema, and JSON rows.
 pub struct BifrostWriter {
     client: WyrdClient,
-    handle: Arc<Bifrost>,
+    handle: Bifrost,
     card_ref: CardRef,
 }
 
@@ -52,22 +53,20 @@ impl BifrostWriter {
     /// Returns the stable client error when the credential cannot be resolved,
     /// the client cannot be built, or the gRPC transport cannot connect.
     pub async fn connect(config: ClientConfig, card_ref: CardRef) -> Result<Self, WyrdError> {
-        let scope = ClientScope::from_config(&config)?;
         let client =
             WyrdClient::with_config(config).map_err(|error| harness_error(&error.to_string()))?;
-        let transport = BifrostGrpcTransport::connect(&client)
-            .await
-            .map_err(|error| harness_error(&error.to_string()))?;
+        let handle = Bifrost::connect_with_config(
+            &client,
+            None,
+            QueueConfig {
+                flush_interval_ms: 0,
+                ..QueueConfig::default()
+            },
+        )
+        .await?;
         Ok(Self {
             client,
-            handle: Arc::new(Bifrost::new(
-                scope,
-                Arc::new(BifrostIngestSink::new(Arc::new(transport))),
-                QueueConfig {
-                    flush_interval_ms: 0,
-                    ..QueueConfig::default()
-                },
-            )),
+            handle,
             card_ref,
         })
     }
@@ -78,47 +77,38 @@ impl BifrostWriter {
         &self.client
     }
 
-    /// Enqueue one JSON row without sealing it.
+    /// Bind `table` and enqueue one JSON row without sealing it.
     ///
     /// The first row for a table builds the pooled producer from `schema`;
-    /// later rows reuse it.
+    /// later rows reuse it, so rebinding an already-written table reuses its
+    /// producer rather than replacing it.
     ///
     /// # Errors
     ///
     /// Returns the queue-domain refusal (queue-full, reserved column, schema
-    /// parse) projected onto the stable catalog.
+    /// parse) or the table-name rejection, projected onto the stable catalog.
     pub fn enqueue(&self, table: &str, schema: &SchemaRef, row: Vec<u8>) -> Result<(), WyrdError> {
         self.handle
+            .use_table(TableConfig::from_arrow(table, schema.clone())?);
+        self.handle
             .insert(
-                SinkKind::Record,
-                table,
-                schema,
                 row,
-                self.card_ref.clone(),
-                None,
+                Correlation {
+                    card_ref: Some(self.card_ref.clone()),
+                    run_id: None,
+                },
             )
             .map_err(WyrdError::from)
     }
 
     /// Seal and ship every pooled producer, waiting for each durable ACK.
     ///
-    /// The handle's flush is synchronous, so it runs on a blocking thread and
-    /// leaves the caller's runtime free to drive the transport.
-    ///
     /// # Errors
     ///
     /// Returns the first producer or sink failure, including the server's own
     /// stable refusal of the sealed batch.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the blocking flush task cannot be joined.
     pub async fn flush(&self) -> Result<(), WyrdError> {
-        let handle = Arc::clone(&self.handle);
-        tokio::task::spawn_blocking(move || handle.flush())
-            .await
-            .expect("bifrost flush task joins")
-            .map_err(WyrdError::from)
+        self.handle.flush().await.map_err(WyrdError::from)
     }
 
     /// Enqueue every row for one table and flush them as one durable write.

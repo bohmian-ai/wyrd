@@ -1,21 +1,21 @@
 import { startTestServer } from "@wyrd/testing";
 import { describe, expect, it } from "vitest";
 
-import {
-  IncompleteQueryStreamError,
-  WyrdClient,
-  WyrdError,
-} from "@wyrd/sdk";
+import { Bifrost, IncompleteQueryStreamError, WyrdError } from "@wyrd/sdk";
 
 describe("Oracle query journey", () => {
   it("uses the public SDK against an in-process Wyrd server", async () => {
     const server = startTestServer();
     try {
-      const client = new WyrdClient(server.baseUrl, server.token, server.grpcUrl);
+      const client = await Bifrost.connect({
+        serverUrl: server.baseUrl,
+        credential: server.token,
+        grpcUrl: server.grpcUrl,
+      });
       const expected = [11, 22];
       server.seedBifrostRows(server.tableFqn, expected);
       server.waitForBifrostPublication();
-      const stream = await client.bifrost.query({
+      const stream = await client.stream({
         sql: `SELECT * FROM ${server.tableFqn}`,
       });
       const batches = [];
@@ -41,8 +41,12 @@ describe("Oracle query journey", () => {
     const server = startTestServer();
     try {
       server.seedBifrostRows(server.tableFqn, [51, 52, 53]);
-      const client = new WyrdClient(server.baseUrl, server.token, server.grpcUrl);
-      const stream = await client.bifrost.query({
+      const client = await Bifrost.connect({
+        serverUrl: server.baseUrl,
+        credential: server.token,
+        grpcUrl: server.grpcUrl,
+      });
+      const stream = await client.stream({
         sql: `SELECT value FROM ${server.tableFqn} ORDER BY value`,
       });
       const batches = [];
@@ -75,7 +79,12 @@ describe("Oracle query journey", () => {
     try {
       server.seedBifrostRows(server.tableFqn, [31, 32]);
       server[fault]();
-      const stream = await new WyrdClient(server.baseUrl, server.token, server.grpcUrl).bifrost.query({
+      const client = await Bifrost.connect({
+        serverUrl: server.baseUrl,
+        credential: server.token,
+        grpcUrl: server.grpcUrl,
+      });
+      const stream = await client.stream({
         sql: `SELECT value FROM ${server.tableFqn} ORDER BY value`,
       });
       await expect((async () => {
@@ -95,9 +104,13 @@ describe("Oracle query journey", () => {
       server.seedBifrostRows(server.tableFqn, [41, 42]);
       const before = server.bifrostReadDecisionCount();
       const denied = server.queryDeniedToken();
-      const client = new WyrdClient(server.baseUrl, denied, server.grpcUrl);
+      const client = await Bifrost.connect({
+        serverUrl: server.baseUrl,
+        credential: denied,
+        grpcUrl: server.grpcUrl,
+      });
       await expect(
-        client.bifrost.query({ sql: `SELECT * FROM ${server.tableFqn}` }),
+        client.stream({ sql: `SELECT * FROM ${server.tableFqn}` }),
       ).rejects.toMatchObject({
         code: "WYRD_PERMISSION_403_DENIED_RBAC",
         status: 403,

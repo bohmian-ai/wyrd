@@ -177,6 +177,30 @@ impl AuthMiddleware {
         Self::build(config, credential, cache_path)
     }
 
+    /// The credential this middleware authenticates with.
+    ///
+    /// Exposed so a client-tier owner can fingerprint the secret material it
+    /// is already bound to — `vala-sdk`'s [`ClientScope`] keys its producer
+    /// pool on `(base URL, credential fingerprint)` — without re-resolving the
+    /// credential chain and risking a different answer than the live transport
+    /// uses.
+    ///
+    /// [`ClientScope`]: https://docs.rs/vala-sdk
+    #[must_use]
+    pub fn credential(&self) -> &ResolvedCredential {
+        &self.credential
+    }
+
+    /// The HTTP base URL this middleware exchanges tokens against.
+    ///
+    /// The same normalized URL [`HttpTransport`](crate::transport::HttpTransport)
+    /// joins relative paths onto, so a scope derived from it matches the plane
+    /// requests actually reach.
+    #[must_use]
+    pub fn base_url(&self) -> &str {
+        &self.http_base_url
+    }
+
     /// Return the current access token, exchanging or refreshing as needed.
     ///
     /// For an [`ResolvedCredential::ApiKey`]: reads the cache and returns the

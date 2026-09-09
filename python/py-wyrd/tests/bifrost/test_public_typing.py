@@ -8,9 +8,12 @@ static assertion that the public TypedDict graph reaches the leaf without an
 from __future__ import annotations
 
 from wyrd.bifrost import (
+    Correlation,
     DataTypeSpecVariants,
     FieldSpec,
     GenAiPage,
+    ResolvedTable,
+    SortKey,
     TableDescription,
     TraceDetail,
 )
@@ -118,3 +121,22 @@ def test_trace_and_genai_payloads_reach_their_leaves() -> None:
     assert page["rows"][0]["model"] == "claude"
     assert page["rows"][0]["input_messages"][0]["role"] == "user"
     assert page["next_page_token"] == "cursor"
+
+
+def test_client_value_types_are_declared_without_any() -> None:
+    """The three values a caller constructs or reads back are real types.
+
+    `Correlation` is what an `insert` takes, `ResolvedTable` is what `register`
+    resolves, and `SortKey` is what a `TableConfig` layout declares. Each is
+    checked statically here so a caller's editor rejects a wrong key before the
+    server does.
+    """
+
+    correlation: Correlation = {"card_ref": "test/Service/writer@1.0.0"}
+    resolved: ResolvedTable = {"table_uid": "01J0", "fingerprint": "fp"}
+    key: SortKey = {"column": "wyrd_event_time", "direction": "desc", "null_order": "last"}
+
+    assert correlation["card_ref"].endswith("@1.0.0")
+    assert "run_id" not in correlation
+    assert resolved["table_uid"] == "01J0"
+    assert key["column"] == "wyrd_event_time"

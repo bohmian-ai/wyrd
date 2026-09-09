@@ -1,37 +1,39 @@
-//! PyO3 boundary for Vala's Bifrost write and terminal-safe query clients.
+//! PyO3 boundary for the one Bifrost client.
 //!
-//! Every method converts its Python inputs to the native C4b types at the edge
-//! (JSON-Schema text to an Arrow schema, a card-ref string to [`CardRef`]) and
-//! then calls the Rust-native handle — no queue or engine logic is
-//! re-implemented here. [`crate::scope::ProducerKey`]-equivalent pool keys and
-//! [`ClientScope`] stay opaque: Python never names them.
+//! Every method converts its Python inputs to native contract types at the edge
+//! — a JSON-Schema document or Arrow IPC schema to [`crate::TableConfig`], a
+//! card-ref string to [`wyrd_spec::reference::CardRef`] — and then calls the
+//! Rust-native client. No queue, schema-mapping, registration, or query logic
+//! is re-implemented here; the pool key and [`crate::ClientScope`] stay opaque,
+//! and Python never names them.
+//!
+//! Every entry point is blocking and releases the GIL. The public package's
+//! synchronous `Bifrost` calls them directly and its `AsyncBifrost` runs the
+//! same calls through `asyncio.to_thread`, so the two facades share one
+//! implementation rather than two.
 
-use std::sync::{Arc, Mutex};
+use std::io::Cursor;
+use std::sync::Mutex;
 
+use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use futures_util::future::{AbortHandle, Abortable};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyModule, PyType};
-use secrecy::SecretString;
-use wyrd_client::WyrdClient;
-use wyrd_client::auth::AuthMiddleware;
-use wyrd_client::config::ClientConfig;
-use wyrd_client::transport::{HttpTransport, ResolvedCredential};
-use wyrd_queue::QueueConfig;
 use wyrd_spec::error::WyrdError;
+use wyrd_spec::reference::CardRef;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
-    BifrostQueryRequest, BifrostTableDescription, FreshnessPolicy, GetTraceRequest,
-    QueryGenAiRequest, VisibilityMode,
+    BifrostQueryRequest, FreshnessPolicy, GetTraceRequest, PhysicalLayoutWire, QueryGenAiRequest,
+    VisibilityMode,
 };
+use wyrd_spec::vala::ids::RunId;
 use wyrd_utils::py::json_to_pyobject;
 
 use crate::native_owner::NativeStreamOwner;
-use crate::{
-    BifrostGrpcTransport, BifrostIngestSink, ClientScope, QueryClient, SinkKind, ValaSdkError,
-    schema_from_json_schema,
-};
+use crate::table::Correlation;
+use crate::{QueryClient, ValaSdkError, client_from_options};
 
 pyo3::create_exception!(
     wyrd._wyrd.bifrost,
@@ -45,191 +47,325 @@ pyo3::create_exception!(
     BifrostQueryError,
     "Raised when EOF arrives before the required query terminal."
 );
+pyo3::create_exception!(
+    wyrd._wyrd.bifrost,
+    NoCredentialsError,
+    BifrostQueryError,
+    "Raised when the credential chain yields nothing for an omitted credential."
+);
 
-/// Python-facing Bifrost write handle over the pooled native producers.
+/// The stable code the credential chain reports when it resolves nothing.
 ///
-/// Construction resolves the explicit HTTP server URL and API key together
-/// with the configured gRPC endpoint, connects the real ingest transport, and
-/// keeps all buffering and producer ownership in the Rust SDK.
+/// Named here so the boundary can raise the dedicated Python exception for it
+/// without re-deriving the chain or matching on error text.
+const NO_CREDENTIALS_CODE: &str = "WYRD_CLIENT_401_NO_CREDENTIALS";
+
+/// Python-facing [`crate::TableConfig`]: one Bifrost table's identity, declared
+/// user columns, and requested physical layout.
+///
+/// The schema arrives either as a JSON Schema document — what
+/// `BaseModel.model_json_schema()` produces — or as Arrow IPC bytes from a
+/// `pyarrow.Schema`, and is mapped by the same `wyrd-queue` owner every
+/// language uses. No fingerprint is computed here: the server mints it, so
+/// [`PyTableConfig::resolved`] stays `None` until register or describe.
+#[pyclass(module = "wyrd._wyrd.bifrost", name = "TableConfig", from_py_object)]
+#[derive(Clone)]
+pub struct PyTableConfig {
+    /// The native config every write and register call reads.
+    inner: crate::TableConfig,
+}
+
+#[pymethods]
+impl PyTableConfig {
+    /// Builds one config from a JSON Schema document.
+    ///
+    /// `layout_json`, when present, is one serialized `PhysicalLayoutWire`; the
+    /// public Python wrapper assembles it from its keyword arguments so the
+    /// wire contract stays the only layout shape.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ValueError` when the table is not `namespace.name`, the document
+    /// is not one mappable JSON Schema, a declared column is server-owned, or
+    /// the layout is not one physical-layout declaration.
+    #[staticmethod]
+    #[pyo3(signature = (table, schema_json, layout_json=None))]
+    fn from_json_schema(
+        table: &str,
+        schema_json: &str,
+        layout_json: Option<&str>,
+    ) -> PyResult<Self> {
+        let schema: serde_json::Value = serde_json::from_str(schema_json)
+            .map_err(|error| PyValueError::new_err(format!("invalid JSON schema: {error}")))?;
+        let config = crate::TableConfig::from_json_schema(table, &schema)
+            .map_err(|error| PyValueError::new_err(error.detail()))?;
+        Ok(Self {
+            inner: apply_layout(config, layout_json)?,
+        })
+    }
+
+    /// Builds one config from a `pyarrow.Schema` serialized as Arrow IPC.
+    ///
+    /// The precision door: `int32`, a non-UTC timestamp, or `decimal128` has no
+    /// JSON Schema spelling, so the caller hands over Arrow directly rather
+    /// than a document the mapper would have to widen.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ValueError` when the bytes are not one Arrow IPC schema, the
+    /// table is not `namespace.name`, a declared column is server-owned, or the
+    /// layout is not one physical-layout declaration.
+    #[staticmethod]
+    #[pyo3(signature = (table, schema_ipc, layout_json=None))]
+    fn from_arrow_ipc(table: &str, schema_ipc: &[u8], layout_json: Option<&str>) -> PyResult<Self> {
+        let schema = decode_schema_ipc(schema_ipc)?;
+        let config = crate::TableConfig::from_arrow(table, schema)
+            .map_err(|error| PyValueError::new_err(error.detail()))?;
+        Ok(Self {
+            inner: apply_layout(config, layout_json)?,
+        })
+    }
+
+    /// Fetches an already-registered table's config by name.
+    ///
+    /// Every transport argument is optional and resolves through the same chain
+    /// the constructor uses when omitted.
+    ///
+    /// # Errors
+    ///
+    /// Raises [`NoCredentialsError`] when nothing resolves a credential, and a
+    /// typed Bifrost query error for not-found, authorization, transport, or
+    /// schema-projection failures.
+    #[staticmethod]
+    #[pyo3(signature = (table, server_url=None, credential=None, grpc_url=None))]
+    fn describe(
+        py: Python<'_>,
+        table: &str,
+        server_url: Option<&str>,
+        credential: Option<&str>,
+        grpc_url: Option<&str>,
+    ) -> PyResult<Self> {
+        let client =
+            client_from_options(server_url, credential, grpc_url).map_err(query_error_to_py)?;
+        let inner = py
+            .detach(|| {
+                wyrd_runtime::runtime().block_on(crate::TableConfig::describe(&client, table))
+            })
+            .map_err(query_error_to_py)?;
+        Ok(Self { inner })
+    }
+
+    /// The `namespace.name` this config addresses.
+    #[getter]
+    fn fqn(&self) -> String {
+        self.inner.fqn()
+    }
+
+    /// The declared user columns as one schema-only Arrow IPC stream.
+    ///
+    /// Python decodes these with its installed Arrow implementation rather than
+    /// rebuilding a schema from field declarations, so the two sides cannot
+    /// disagree about a column's type.
+    ///
+    /// # Errors
+    ///
+    /// Raises `RuntimeError` when the schema cannot be encoded.
+    #[getter]
+    fn arrow_schema_ipc(&self) -> PyResult<Vec<u8>> {
+        encode_schema_ipc(self.inner.user_schema())
+    }
+
+    /// The server-assigned `(table_uid, fingerprint)`, or `None` while inert.
+    #[getter]
+    fn resolved(&self) -> Option<(String, String)> {
+        self.inner
+            .resolved()
+            .map(|resolved| (resolved.table_uid.clone(), resolved.fingerprint.clone()))
+    }
+}
+
+/// Python-facing collected query result.
+///
+/// Holds the decoded Rust batches; [`PyQueryResult::to_ipc`] encodes them once
+/// so Python builds its own Arrow table, and the terminal is handed over as
+/// JSON so the wire contract stays the only terminal shape.
+#[pyclass(module = "wyrd._wyrd.bifrost", name = "QueryResult")]
+pub struct PyQueryResult {
+    /// The native result every projection reads.
+    inner: crate::QueryResult,
+}
+
+#[pymethods]
+impl PyQueryResult {
+    /// Encodes the whole result as one Arrow IPC stream.
+    ///
+    /// # Errors
+    ///
+    /// Raises a typed Bifrost query error when IPC encoding fails.
+    fn to_ipc(&self) -> PyResult<Vec<u8>> {
+        self.inner.to_ipc().map_err(query_error_to_py)
+    }
+
+    /// The validated terminal frame, serialized.
+    ///
+    /// # Errors
+    ///
+    /// Raises `RuntimeError` when the terminal cannot be serialized.
+    #[getter]
+    fn terminal_json(&self) -> PyResult<String> {
+        serde_json::to_string(self.inner.terminal())
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))
+    }
+
+    /// Total decoded rows across every batch.
+    fn __len__(&self) -> usize {
+        self.inner.num_rows()
+    }
+}
+
+/// Python-facing [`crate::Bifrost`]: query any authorized table, write to the
+/// active one.
+///
+/// Construction dials the ingest channel, so it performs IO; every transport
+/// argument is optional and falls through the existing resolution chain exactly
+/// once when omitted.
 #[pyclass(module = "wyrd._wyrd.bifrost", name = "Bifrost")]
 pub struct Bifrost {
-    /// Rust-native pooled write handle shared with the observe projection.
+    /// The one native client both public Python facades drive.
     handle: crate::Bifrost,
 }
 
 #[pymethods]
 impl Bifrost {
-    /// Connects the native write handle to the configured gRPC ingest endpoint.
-    ///
-    /// `server_url` selects the HTTP authentication plane. The gRPC endpoint
-    /// follows [`ClientConfig::from_env`], including `WYRD_GRPC_URL`, so local
-    /// test servers and split-plane deployments can expose distinct ports.
+    /// Connects one client, optionally already bound to a write target.
     ///
     /// # Errors
     ///
-    /// Raises `ValueError` for empty or invalid configuration and
-    /// `RuntimeError` when the authenticated gRPC connection cannot be made.
+    /// Raises [`NoCredentialsError`] when nothing in the chain resolves a
+    /// credential, and a typed Bifrost query error when the ingest channel
+    /// cannot be dialled.
     #[new]
-    #[pyo3(signature = (server_url, api_key))]
-    fn __new__(py: Python<'_>, server_url: &str, api_key: &str) -> PyResult<Self> {
-        if server_url.trim().is_empty() {
-            return Err(PyValueError::new_err("server_url must not be empty"));
-        }
-        if api_key.is_empty() {
-            return Err(PyValueError::new_err("api_key must not be empty"));
-        }
-
-        let mut config = ClientConfig::from_env();
-        config.http.base_url = server_url.trim_end_matches('/').to_owned();
-        config.api_key = Some(SecretString::from(api_key.to_owned()));
-        let scope = ClientScope::from_config(&config)
-            .map_err(|error| PyValueError::new_err(error.to_string()))?;
-        let client = WyrdClient::with_config(config)
-            .map_err(|error| PyValueError::new_err(error.to_string()))?;
-        let transport = py
-            .detach(|| wyrd_runtime::runtime().block_on(BifrostGrpcTransport::connect(&client)))
-            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
-        let sink = Arc::new(BifrostIngestSink::new(Arc::new(transport)));
-        Ok(Self {
-            handle: crate::Bifrost::new(scope, sink, QueueConfig::default()),
-        })
+    #[pyo3(signature = (table=None, server_url=None, credential=None, grpc_url=None))]
+    fn __new__(
+        py: Python<'_>,
+        table: Option<PyTableConfig>,
+        server_url: Option<&str>,
+        credential: Option<&str>,
+        grpc_url: Option<&str>,
+    ) -> PyResult<Self> {
+        let client =
+            client_from_options(server_url, credential, grpc_url).map_err(query_error_to_py)?;
+        let table = table.map(|table| table.inner);
+        let handle = py
+            .detach(|| {
+                wyrd_runtime::runtime().block_on(crate::Bifrost::connect_with_config(
+                    &client,
+                    table,
+                    wyrd_queue::QueueConfig::default(),
+                ))
+            })
+            .map_err(query_error_to_py)?;
+        Ok(Self { handle })
     }
 
-    /// Explicit write path: parse the JSON schema and card reference, then enqueue one JSON `row`.
-    ///
-    /// The native producer pool owns batching and the authenticated gRPC sink
-    /// owns delivery; this boundary only converts Python strings into native
-    /// contract values and preserves queue backpressure.
+    /// Creates the active table, answering `"created"` or `"already_exists"`.
     ///
     /// # Errors
-    /// Raises `ValueError` for malformed JSON schema, unsupported schema nodes,
-    /// or an invalid card reference. Raises `RuntimeError` when the bounded
-    /// producer queue is full or the producer has begun draining.
-    #[pyo3(signature = (table, schema, row, card_ref, run_id=None))]
-    fn insert(
-        &self,
-        table: &str,
-        schema: &str,
-        row: &str,
-        card_ref: &str,
-        run_id: Option<String>,
-    ) -> PyResult<()> {
-        let schema_value: serde_json::Value = serde_json::from_str(schema)
-            .map_err(|error| PyValueError::new_err(format!("invalid JSON schema: {error}")))?;
-        let schema = schema_from_json_schema(&schema_value)
-            .map_err(|error| PyValueError::new_err(error.to_string()))?;
-        let card_ref = card_ref
-            .parse()
-            .map_err(|error| PyValueError::new_err(format!("invalid card_ref: {error}")))?;
-        let run_id = run_id.map(wyrd_spec::vala::ids::RunId::from_string);
+    ///
+    /// Raises a typed Bifrost query error when no table is bound, when a table
+    /// of this name exists with different columns, or for transport and
+    /// authorization failures.
+    fn register(&self, py: Python<'_>) -> PyResult<&'static str> {
+        let outcome = py
+            .detach(|| wyrd_runtime::runtime().block_on(self.handle.register()))
+            .map_err(query_error_to_py)?;
+        Ok(crate::register_outcome_name(outcome))
+    }
+
+    /// Binds `table` as the write target, returning the previous binding.
+    fn use_table(&self, table: PyTableConfig) -> Option<PyTableConfig> {
         self.handle
-            .insert(
-                SinkKind::Record,
-                table,
-                &schema,
-                row.as_bytes().to_vec(),
-                card_ref,
-                run_id,
-            )
-            .map_err(|error| PyRuntimeError::new_err(error.to_string()))
+            .use_table(table.inner)
+            .map(|inner| PyTableConfig { inner })
     }
 
-    /// Flush all queued rows and await each native ingest acknowledgement.
-    ///
-    /// Releases the Python GIL while the native drain performs queue and
-    /// network work.
+    /// Binds an already-registered table by name, describing it first.
     ///
     /// # Errors
-    /// Raises `RuntimeError` when a batch cannot be sealed or acknowledged by
-    /// the server, preserving the native queue error text at the boundary.
+    ///
+    /// As [`PyTableConfig::describe`].
+    fn use_table_by_name(&self, py: Python<'_>, table: &str) -> PyResult<()> {
+        py.detach(|| wyrd_runtime::runtime().block_on(self.handle.use_table_by_name(table)))
+            .map_err(query_error_to_py)
+    }
+
+    /// The active write binding, if any.
+    #[getter]
+    fn table(&self) -> Option<PyTableConfig> {
+        self.handle.table().map(|inner| PyTableConfig { inner })
+    }
+
+    /// Enqueues one JSON row into the active table.
+    ///
+    /// Non-blocking: the row is durable only after [`Bifrost::flush`] or
+    /// [`Bifrost::shutdown`]. A saturated queue refuses here rather than
+    /// dropping silently.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ValueError` for an invalid card reference, and a typed Bifrost
+    /// query error carrying `WYRD_VALA_412_NO_ACTIVE_TABLE` when no table is
+    /// bound or `WYRD_CLIENT_429_QUEUE_FULL` when the producer is saturated.
+    #[pyo3(signature = (row, card_ref=None, run_id=None))]
+    fn insert(&self, row: &str, card_ref: Option<&str>, run_id: Option<String>) -> PyResult<()> {
+        self.handle
+            .insert(row.as_bytes().to_vec(), correlation(card_ref, run_id)?)
+            .map_err(query_error_to_py)
+    }
+
+    /// Flushes every pooled producer and awaits each durable acknowledgement.
+    ///
+    /// # Errors
+    ///
+    /// Raises a typed Bifrost query error carrying the first producer or sink
+    /// failure after every producer has been attempted.
     fn flush(&self, py: Python<'_>) -> PyResult<()> {
-        py.detach(|| self.handle.flush())
-            .map_err(|error| PyRuntimeError::new_err(error.to_string()))
+        py.detach(|| wyrd_runtime::runtime().block_on(self.handle.flush()))
+            .map_err(query_error_to_py)
     }
 
-    /// Drain queued rows and stop every native producer background task.
-    ///
-    /// Releases the Python GIL while the native terminal drain completes.
+    /// Drains every producer and stops its background task.
     ///
     /// # Errors
-    /// Raises `RuntimeError` when the terminal drain cannot complete or a
-    /// server acknowledgement reports a write failure.
+    ///
+    /// As [`Bifrost::flush`].
     fn shutdown(&self, py: Python<'_>) -> PyResult<()> {
-        py.detach(|| self.handle.shutdown())
-            .map_err(|error| PyRuntimeError::new_err(error.to_string()))
+        py.detach(|| wyrd_runtime::runtime().block_on(self.handle.shutdown()))
+            .map_err(query_error_to_py)
     }
 
-    /// Rows dropped by the fire-and-forget observe path under backpressure.
-    #[getter]
-    fn dropped(&self) -> u64 {
-        self.handle.dropped()
-    }
-
-    /// Number of distinct producers currently pooled.
-    #[getter]
-    fn producer_count(&self) -> usize {
-        self.handle.producer_count()
-    }
-}
-
-/// Native query client used by the thin public Python async facade.
-///
-/// The public package runs these blocking entry points through
-/// `asyncio.to_thread`; each entry point releases the GIL and drives Rust IO on
-/// Wyrd's process-wide runtime.
-#[pyclass(module = "wyrd._wyrd.bifrost", name = "_NativeBifrostQueryClient")]
-pub struct PyBifrostQueryClient {
-    /// Rust owner sharing one authenticated HTTP connection pool.
-    client: QueryClient,
-}
-
-#[pymethods]
-impl PyBifrostQueryClient {
-    /// Constructs a token-authenticated query client without performing IO.
-    ///
-    /// `server_url` selects the HTTP plane explicitly; everything else comes
-    /// from [`ClientConfig::from_env`], the same owner the Python write handle
-    /// uses, so a split-plane or remote deployment is reachable instead of
-    /// silently staying on the default localhost port.
+    /// Runs one SQL SELECT and collects every batch.
     ///
     /// # Errors
     ///
-    /// Raises `ValueError` when the server URL is empty or transport
-    /// configuration is invalid.
-    #[new]
-    #[pyo3(signature = (server_url, token))]
-    fn __new__(server_url: &str, token: &str) -> PyResult<Self> {
-        if server_url.trim().is_empty() {
-            return Err(PyValueError::new_err("server_url must not be empty"));
-        }
-        if token.is_empty() {
-            return Err(PyValueError::new_err("token must not be empty"));
-        }
-        let mut config = ClientConfig::from_env();
-        config.http.base_url = server_url.trim_end_matches('/').to_owned();
-        let auth = AuthMiddleware::new(
-            &config,
-            ResolvedCredential::BearerToken(SecretString::from(token.to_owned())),
-        )
-        .map_err(|error| PyValueError::new_err(error.to_string()))?;
-        let http = HttpTransport::new(&config.http, Arc::clone(&auth))
-            .map_err(|error| PyValueError::new_err(error.to_string()))?;
-        let client = WyrdClient::from_parts(auth, http, config.grpc);
-        Ok(Self {
-            client: QueryClient::new(&client),
-        })
+    /// Raises [`IncompleteQueryStreamError`] when the response ends without its
+    /// required terminal, and a typed Bifrost query error for invalid SQL, the
+    /// query floor's refusal, or transport and authorization failures.
+    fn sql(&self, py: Python<'_>, query: &str) -> PyResult<PyQueryResult> {
+        let inner = py
+            .detach(|| wyrd_runtime::runtime().block_on(self.handle.sql(query)))
+            .map_err(query_error_to_py)?;
+        Ok(PyQueryResult { inner })
     }
 
-    /// Starts one query through the shared Rust runtime.
-    ///
-    /// Python's public async facade calls this method in a worker thread, so
-    /// event-loop execution is never blocked.
+    /// Starts one query and returns its terminal-validating native stream.
     ///
     /// # Errors
     ///
-    /// Raises `RuntimeError` for transport or request-contract failures.
+    /// Raises `ValueError` for an unknown visibility or freshness spelling, and
+    /// a typed Bifrost query error for request-contract or transport failures.
     #[pyo3(signature = (sql, visibility="published_only", freshness="strict", deadline_ms=None))]
-    fn query(
+    fn stream(
         &self,
         py: Python<'_>,
         sql: &str,
@@ -244,7 +380,7 @@ impl PyBifrostQueryClient {
             deadline_ms,
         };
         let stream = py
-            .detach(|| wyrd_runtime::runtime().block_on(self.client.query(&request)))
+            .detach(|| wyrd_runtime::runtime().block_on(self.handle.query().query(&request)))
             .map_err(query_error_to_py)?;
         let request_id = stream.request_id().as_str().to_owned();
         Ok(PyBifrostQueryStream {
@@ -263,49 +399,39 @@ impl PyBifrostQueryClient {
     /// Raises a typed Bifrost query error for transport or server failures.
     fn running(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let queries = py
-            .detach(|| wyrd_runtime::runtime().block_on(self.client.running()))
+            .detach(|| wyrd_runtime::runtime().block_on(self.query().running()))
             .map_err(query_error_to_py)?;
-        let value = serde_json::to_value(queries)
-            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
-        json_to_pyobject(py, &value)
+        to_python_json(py, serde_json::to_value(queries))
     }
 
     /// Gets one active query by its canonical request ID.
     ///
     /// # Errors
     ///
-    /// Raises a typed Bifrost query error for malformed IDs, transport, or server failures.
+    /// Raises a typed Bifrost query error for malformed IDs, transport, or
+    /// server failures.
     fn status(&self, py: Python<'_>, request_id: &str) -> PyResult<Py<PyAny>> {
         let request_id = parse_query_request_id(request_id).map_err(query_error_to_py)?;
         let summary = py
-            .detach(|| wyrd_runtime::runtime().block_on(self.client.status(&request_id)))
+            .detach(|| wyrd_runtime::runtime().block_on(self.query().status(&request_id)))
             .map_err(query_error_to_py)?;
-        let value = serde_json::to_value(summary)
-            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
-        json_to_pyobject(py, &value)
+        to_python_json(py, serde_json::to_value(summary))
     }
 
     /// Requests server-side cancellation without closing a local stream.
     ///
     /// # Errors
     ///
-    /// Raises a typed Bifrost query error for malformed IDs, transport, or server failures.
+    /// As [`Bifrost::status`].
     fn cancel(&self, py: Python<'_>, request_id: &str) -> PyResult<Py<PyAny>> {
         let request_id = parse_query_request_id(request_id).map_err(query_error_to_py)?;
         let response = py
-            .detach(|| wyrd_runtime::runtime().block_on(self.client.cancel(&request_id)))
+            .detach(|| wyrd_runtime::runtime().block_on(self.query().cancel(&request_id)))
             .map_err(query_error_to_py)?;
-        let value = serde_json::to_value(response)
-            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
-        json_to_pyobject(py, &value)
+        to_python_json(py, serde_json::to_value(response))
     }
 
     /// Describes one registered table's stored physical schema.
-    ///
-    /// The result is the server's own JSON description projected into Python,
-    /// so a caller reads its user fields, correlation inputs, managed
-    /// candidates, and canonical physical fingerprint without any local copy of
-    /// the table contract.
     ///
     /// # Errors
     ///
@@ -314,21 +440,19 @@ impl PyBifrostQueryClient {
     fn describe_table(&self, py: Python<'_>, namespace: &str, name: &str) -> PyResult<Py<PyAny>> {
         let description = py
             .detach(|| {
-                wyrd_runtime::runtime().block_on(self.client.describe_table(namespace, name))
+                wyrd_runtime::runtime().block_on(self.query().describe_table(namespace, name))
             })
             .map_err(query_error_to_py)?;
-        let value = serde_json::to_value(description)
-            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
-        json_to_pyobject(py, &value)
+        to_python_json(py, serde_json::to_value(description))
     }
 
     /// Reads one complete authorized cut of a single trace.
     ///
     /// # Errors
     ///
-    /// Raises a typed Bifrost query error for an inverted window, transport,
-    /// authorization, or not-found failures, and `ValueError` when a bound is
-    /// not an RFC 3339 timestamp.
+    /// Raises `ValueError` when a bound is not an RFC 3339 timestamp, and a
+    /// typed Bifrost query error for an inverted window, transport,
+    /// authorization, or not-found failures.
     #[pyo3(signature = (trace_id, since=None, until=None))]
     fn get_trace(
         &self,
@@ -343,68 +467,132 @@ impl PyBifrostQueryClient {
             until: parse_window_bound(until, "until")?,
         };
         let response = py
-            .detach(|| wyrd_runtime::runtime().block_on(self.client.get_trace(&request)))
+            .detach(|| wyrd_runtime::runtime().block_on(self.query().get_trace(&request)))
             .map_err(query_error_to_py)?;
-        let value = serde_json::to_value(response)
-            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
-        json_to_pyobject(py, &value)
+        to_python_json(py, serde_json::to_value(response))
     }
 
     /// Reads one page of GenAI generation records.
     ///
-    /// The request arrives as one serialized [`QueryGenAiRequest`] so the
-    /// wire contract stays the single source of the filter set; the Python
-    /// wrapper owns the keyword-argument ergonomics.
+    /// The request arrives as one serialized [`QueryGenAiRequest`] so the wire
+    /// contract stays the single source of the filter set; the Python wrapper
+    /// owns the keyword-argument ergonomics.
     ///
     /// # Errors
     ///
-    /// Raises `ValueError` when `request_json` is not one GenAI query
-    /// request, and a typed Bifrost query error for transport,
-    /// authorization, or validation failures.
+    /// Raises `ValueError` when `request_json` is not one GenAI query request,
+    /// and a typed Bifrost query error for transport, authorization, or
+    /// validation failures.
     #[pyo3(signature = (request_json))]
     fn query_genai(&self, py: Python<'_>, request_json: &str) -> PyResult<Py<PyAny>> {
         let request: QueryGenAiRequest = serde_json::from_str(request_json)
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
         let response = py
-            .detach(|| wyrd_runtime::runtime().block_on(self.client.query_genai(&request)))
+            .detach(|| wyrd_runtime::runtime().block_on(self.query().query_genai(&request)))
             .map_err(query_error_to_py)?;
-        let value = serde_json::to_value(response)
-            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
-        json_to_pyobject(py, &value)
+        to_python_json(py, serde_json::to_value(response))
     }
 
-    /// Projects one described table's writable Arrow schema as schema-only IPC.
+    /// Rows dropped by the fire-and-forget observe path under backpressure.
     ///
-    /// The bytes carry no batch, so Python decodes them with its installed
-    /// Arrow implementation instead of rebuilding a schema from the
-    /// description's field declarations. `include_event_time` selects whether
-    /// the caller intends to supply the managed event-time column.
-    ///
-    /// # Errors
-    ///
-    /// Raises `ValueError` when `description_json` is not one describe
-    /// response or declares a column the write path already appends, and
-    /// `RuntimeError` when the schema cannot be encoded.
-    #[pyo3(signature = (description_json, include_event_time))]
-    fn writable_schema_ipc(
-        &self,
-        description_json: &str,
-        include_event_time: bool,
-    ) -> PyResult<Vec<u8>> {
-        let description: BifrostTableDescription = serde_json::from_str(description_json)
-            .map_err(|error| PyValueError::new_err(error.to_string()))?;
-        let schema = wyrd_queue::schema::writable_schema(&description, include_event_time)
-            .map_err(|error| PyValueError::new_err(error.to_string()))?;
-        let mut buffer = Vec::new();
-        {
-            let mut writer = StreamWriter::try_new(&mut buffer, &schema)
-                .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
-            writer
-                .finish()
-                .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
-        }
-        Ok(buffer)
+    /// Always zero for [`Bifrost::insert`], which refuses rather than drops.
+    #[getter]
+    fn dropped(&self) -> u64 {
+        self.handle.dropped()
     }
+
+    /// Number of distinct table producers currently pooled.
+    #[getter]
+    fn producer_count(&self) -> usize {
+        self.handle.producer_count()
+    }
+}
+
+impl Bifrost {
+    /// The native query plane every lifecycle and typed read delegates to.
+    ///
+    /// Not a `#[pymethods]` entry: Python reaches these reads through the
+    /// client's own methods rather than a second exported client object.
+    fn query(&self) -> &QueryClient {
+        self.handle.query()
+    }
+}
+
+/// Applies one optional serialized physical layout to a config.
+///
+/// # Errors
+///
+/// Returns `ValueError` when the text is not one `PhysicalLayoutWire`.
+fn apply_layout(
+    config: crate::TableConfig,
+    layout_json: Option<&str>,
+) -> PyResult<crate::TableConfig> {
+    match layout_json {
+        None => Ok(config),
+        Some(layout) => {
+            let layout: PhysicalLayoutWire = serde_json::from_str(layout).map_err(|error| {
+                PyValueError::new_err(format!("invalid physical layout: {error}"))
+            })?;
+            Ok(config.with_layout(layout))
+        }
+    }
+}
+
+/// Parses the optional per-row correlation at the Python boundary.
+///
+/// # Errors
+///
+/// Returns `ValueError` when `card_ref` is not one parsable Card reference.
+fn correlation(card_ref: Option<&str>, run_id: Option<String>) -> PyResult<Correlation> {
+    let card_ref = card_ref
+        .map(str::parse::<CardRef>)
+        .transpose()
+        .map_err(|error| PyValueError::new_err(format!("invalid card_ref: {error}")))?;
+    Ok(Correlation {
+        card_ref,
+        run_id: run_id.map(RunId::from_string),
+    })
+}
+
+/// Decodes one schema-only Arrow IPC stream into a native schema.
+///
+/// # Errors
+///
+/// Returns `ValueError` when the bytes are not one Arrow IPC schema.
+fn decode_schema_ipc(bytes: &[u8]) -> PyResult<arrow_schema::SchemaRef> {
+    let reader = StreamReader::try_new(Cursor::new(bytes), None)
+        .map_err(|error| PyValueError::new_err(format!("invalid Arrow IPC schema: {error}")))?;
+    Ok(reader.schema())
+}
+
+/// Encodes one native schema as a schema-only Arrow IPC stream.
+///
+/// # Errors
+///
+/// Returns `RuntimeError` when the schema cannot be encoded.
+fn encode_schema_ipc(schema: &arrow_schema::SchemaRef) -> PyResult<Vec<u8>> {
+    let mut buffer = Vec::new();
+    {
+        let mut writer = StreamWriter::try_new(&mut buffer, schema)
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+        writer
+            .finish()
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+    }
+    Ok(buffer)
+}
+
+/// Projects one already-serialized server response into plain Python data.
+///
+/// # Errors
+///
+/// Returns `RuntimeError` when the response cannot be serialized.
+fn to_python_json(
+    py: Python<'_>,
+    value: serde_json::Result<serde_json::Value>,
+) -> PyResult<Py<PyAny>> {
+    let value = value.map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+    json_to_pyobject(py, &value)
 }
 
 /// Parses one optional RFC 3339 window bound at the Python boundary.
@@ -693,49 +881,48 @@ impl PyBifrostQueryStream {
 
 /// Record one telemetry observation, fire-and-forget.
 ///
-/// Uses the same native handle and producer pool as explicit Bifrost inserts.
+/// Names its own table and schema per call rather than using the client's
+/// active binding: an instrumented process writes its signals alongside
+/// whatever the application is writing, and must not disturb the table the
+/// application has bound. Queue saturation is swallowed and counted on the
+/// client's drop counter instead of being raised.
 ///
 /// # Errors
-/// Raises `ValueError` for malformed JSON schema, unsupported schema nodes, or
-/// an invalid card reference. Queue saturation is intentionally swallowed by
-/// the native observe path and reflected through the handle's drop counter.
+///
+/// Raises `ValueError` for a malformed JSON schema, an unsupported schema node,
+/// or an invalid card reference.
 #[pyfunction]
-#[pyo3(signature = (bifrost, table, schema, row, card_ref, run_id=None))]
+#[pyo3(signature = (bifrost, table, schema, row, card_ref=None, run_id=None))]
 fn record(
     bifrost: PyRef<'_, Bifrost>,
     table: &str,
     schema: &str,
     row: &str,
-    card_ref: &str,
+    card_ref: Option<&str>,
     run_id: Option<String>,
 ) -> PyResult<()> {
     let schema_value: serde_json::Value = serde_json::from_str(schema)
         .map_err(|error| PyValueError::new_err(format!("invalid JSON schema: {error}")))?;
-    let schema = schema_from_json_schema(&schema_value)
+    let schema = wyrd_queue::json_schema_to_arrow(&schema_value)
         .map_err(|error| PyValueError::new_err(error.to_string()))?;
-    let card_ref = card_ref
-        .parse()
-        .map_err(|error| PyValueError::new_err(format!("invalid card_ref: {error}")))?;
-    let run_id = run_id.map(wyrd_spec::vala::ids::RunId::from_string);
     crate::observe::record(
         &bifrost.handle,
-        SinkKind::Record,
         table,
-        &schema,
+        &std::sync::Arc::new(schema),
         row.as_bytes().to_vec(),
-        card_ref,
-        run_id,
+        correlation(card_ref, run_id)?,
     );
     Ok(())
 }
 
-/// Register the `bifrost` write handle on the supplied module.
+/// Register the one Bifrost client and its result types on the supplied module.
 ///
 /// # Errors
 /// Returns PyO3 registration errors.
 pub fn register_bifrost(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<Bifrost>()?;
-    module.add_class::<PyBifrostQueryClient>()?;
+    module.add_class::<PyTableConfig>()?;
+    module.add_class::<PyQueryResult>()?;
     module.add_class::<PyBifrostQueryStream>()?;
     module.add(
         "BifrostQueryError",
@@ -744,6 +931,10 @@ pub fn register_bifrost(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add(
         "IncompleteQueryStreamError",
         module.py().get_type::<IncompleteQueryStreamError>(),
+    )?;
+    module.add(
+        "NoCredentialsError",
+        module.py().get_type::<NoCredentialsError>(),
     )?;
     Ok(())
 }
@@ -807,6 +998,11 @@ fn encode_batch(batch: &arrow::record_batch::RecordBatch) -> Result<Vec<u8>, Str
 
 /// Converts one SDK failure into its typed Python exception with stable metadata.
 ///
+/// The exception type is selected from the error's stable code, not its text, so
+/// a caller catches `NoCredentialsError` for an unresolvable chain and
+/// `IncompleteQueryStreamError` for a truncated response without string
+/// matching.
+///
 /// # Panics
 ///
 /// Panics only if PyO3 stops allowing attributes on registered exception
@@ -816,6 +1012,8 @@ fn query_error_to_py(error: ValaSdkError) -> PyErr {
         let exception_type: Bound<'_, PyType> =
             if matches!(error, ValaSdkError::IncompleteQueryStream) {
                 py.get_type::<IncompleteQueryStreamError>()
+            } else if error.code() == NO_CREDENTIALS_CODE {
+                py.get_type::<NoCredentialsError>()
             } else {
                 py.get_type::<BifrostQueryError>()
             };

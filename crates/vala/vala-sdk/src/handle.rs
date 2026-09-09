@@ -1,5 +1,5 @@
-//! The [`Bifrost`] write handle: a pool of one [`Producer`] per destination,
-//! keyed by `(ClientScope, SinkKind, table)`.
+//! The [`WriterPool`]: one [`Producer`] per destination table, keyed by
+//! `(ClientScope, SinkKind, table)` and owned by [`crate::Bifrost`].
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -11,7 +11,6 @@ use wyrd_queue::{
     BatchSink, ClientByteBudget, ClientByteGuard, ClientByteMetrics, Producer, QueueConfig,
     WyrdQueueError,
 };
-use wyrd_spec::error::WyrdError;
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::vala::ids::RunId;
 
@@ -25,14 +24,19 @@ struct ProducerKey {
     table: String,
 }
 
-/// The client-tier write handle over the pooled producers.
+/// The client-tier producer pool behind [`crate::Bifrost`].
 ///
 /// One [`Producer`] is lazily constructed per distinct [`ProducerKey`] and
-/// shared across calls; all producers drain into the one [`BatchSink`] the
-/// handle owns (the sink routes by `SealedBatch.table`). Backpressure is
-/// asymmetric — [`Bifrost::insert`] propagates queue-full, while the
-/// [`crate::observe`] path swallows and counts it.
-pub struct Bifrost {
+/// shared across calls; all producers drain into the one [`BatchSink`] the pool
+/// owns (the sink routes by `SealedBatch.table`). Pooling by table is what lets
+/// [`crate::Bifrost::use_table`] swap the active write target without losing
+/// the previous table's buffered rows: the swapped-away producer stays in the
+/// pool and still drains on the next flush.
+///
+/// This type is crate-private. `Bifrost` is the public write door, and
+/// backpressure asymmetry lives above it — `Bifrost::insert` propagates
+/// queue-full while [`crate::observe::record`] swallows and counts it.
+pub(crate) struct WriterPool {
     scope: ClientScope,
     sink: Arc<dyn BatchSink<ClientByteGuard>>,
     config: QueueConfig,
@@ -44,7 +48,7 @@ pub struct Bifrost {
     drop_warned: AtomicBool,
 }
 
-/// Point-in-time settlement accounting for one [`Bifrost`] client handle.
+/// Point-in-time settlement accounting for one [`crate::Bifrost`] client.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BifrostMetrics {
     /// Producers currently registered under the bounded handle pool.
@@ -63,14 +67,14 @@ pub struct BifrostMetrics {
     pub pending_controls: usize,
 }
 
-impl Bifrost {
-    /// Build a handle over a resolved [`ClientScope`], a shared sink, and the
+impl WriterPool {
+    /// Build a pool over a resolved [`ClientScope`], a shared sink, and the
     /// producer tuning [`QueueConfig`].
     ///
     /// Production wraps a [`crate::BifrostIngestSink`]; tests inject a
     /// `wyrd-queue` mock or a stall sink through the same seam.
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         scope: ClientScope,
         sink: Arc<dyn BatchSink<ClientByteGuard>>,
         config: QueueConfig,
@@ -89,19 +93,19 @@ impl Bifrost {
 
     /// The scope every producer in this handle is keyed under.
     #[must_use]
-    pub fn scope(&self) -> &ClientScope {
+    pub(crate) fn scope(&self) -> &ClientScope {
         &self.scope
     }
 
     /// Number of distinct producers currently pooled.
     #[must_use]
-    pub fn producer_count(&self) -> usize {
+    pub(crate) fn producer_count(&self) -> usize {
         self.producers.lock().expect("producer pool poisoned").len()
     }
 
     /// Rows dropped by the fire-and-forget observe path under backpressure.
     #[must_use]
-    pub fn dropped(&self) -> u64 {
+    pub(crate) fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::SeqCst)
     }
 
@@ -119,7 +123,7 @@ impl Bifrost {
     /// Panics if the producer pool mutex is poisoned, which indicates an
     /// invariant-breaking panic in another handle operation.
     #[must_use]
-    pub fn metrics(&self) -> BifrostMetrics {
+    pub(crate) fn metrics(&self) -> BifrostMetrics {
         let ClientByteMetrics {
             owned_bytes,
             fixed_storage_bytes,
@@ -143,32 +147,37 @@ impl Bifrost {
         }
     }
 
-    /// Explicit write path: enqueue one row, **propagating** queue-full.
+    /// Enqueue one row, **propagating** queue-full.
     ///
-    /// On the first call for a `(kind, table)` the producer is built from
-    /// `schema`; later calls reuse the pooled producer and ignore `schema`.
+    /// On the first call for a `table` the producer is built from `schema`;
+    /// later calls reuse the pooled producer, so the schema a table was first
+    /// registered under is the one its batches are sealed with.
+    ///
+    /// Both correlation fields are optional. An omitted `card_ref` becomes a
+    /// null in the sealed batch, which the server stores against the
+    /// authenticated principal with a null `card_uid`.
     ///
     /// The queue-domain [`WyrdQueueError`] is propagated verbatim (rather than
-    /// projected onto [`WyrdError`]) so the client-tier code —
-    /// `WYRD_CLIENT_429_QUEUE_FULL`, which has no dedicated `WyrdError` variant —
-    /// survives to the caller. The PyO3 surface (C4c) maps it at its boundary.
+    /// projected onto the shared catalog) so the client-tier code —
+    /// `WYRD_CLIENT_429_QUEUE_FULL`, which has no dedicated catalog variant —
+    /// survives to the caller. [`crate::Bifrost`] wraps it in
+    /// [`crate::ValaSdkError::Queue`] at the public boundary.
     ///
     /// # Errors
     /// Returns [`WyrdQueueError::QueueFull`] (code `WYRD_CLIENT_429_QUEUE_FULL`)
-    /// when the producer's bounded channel is saturated.
-    pub fn insert(
+    /// when the producer's bounded channel is saturated or the pool has closed.
+    pub(crate) fn insert(
         &self,
-        kind: SinkKind,
         table: &str,
         schema: &SchemaRef,
         json: Vec<u8>,
-        card_ref: CardRef,
+        card_ref: Option<CardRef>,
         run_id: Option<RunId>,
     ) -> Result<(), WyrdQueueError> {
         if self.closed.load(Ordering::Acquire) {
             return Err(WyrdQueueError::QueueFull);
         }
-        self.producer_for(kind, table, schema)?
+        self.producer_for(table, schema)?
             .enqueue(json, card_ref, run_id)
     }
 
@@ -187,7 +196,7 @@ impl Bifrost {
     /// # Panics
     /// Panics if the producer pool mutex is poisoned, which indicates an
     /// invariant-breaking panic in another handle operation.
-    pub fn flush(&self) -> Result<(), WyrdQueueError> {
+    pub(crate) fn flush(&self) -> Result<(), WyrdQueueError> {
         let mut producers = self
             .producers
             .lock()
@@ -223,7 +232,7 @@ impl Bifrost {
     /// # Panics
     /// Panics if the producer pool mutex is poisoned, which indicates an
     /// invariant-breaking panic in another handle operation.
-    pub fn shutdown(&self) -> Result<(), WyrdQueueError> {
+    pub(crate) fn shutdown(&self) -> Result<(), WyrdQueueError> {
         self.closed.store(true, Ordering::Release);
         let mut producers = self
             .producers
@@ -262,13 +271,13 @@ impl Bifrost {
         }
     }
 
-    /// Get-or-create the pooled producer for `(scope, kind, table)`.
+    /// Get-or-create the pooled producer for `(scope, Record, table)`.
     fn producer_for(
         &self,
-        kind: SinkKind,
         table: &str,
         schema: &SchemaRef,
     ) -> Result<Arc<Producer>, WyrdQueueError> {
+        let kind = SinkKind::Record;
         let mut pool = self.producers.lock().expect("producer pool poisoned");
         if let Some(producer) = pool.iter().find_map(|(key, producer)| {
             (key.scope == self.scope && key.kind == kind && key.table == table)
@@ -294,15 +303,4 @@ impl Bifrost {
         pool.insert(key, Arc::clone(&producer));
         Ok(producer)
     }
-}
-
-/// Build a user Arrow [`SchemaRef`] from a JSON-Schema value via C4a's
-/// [`json_schema_to_arrow`](wyrd_queue::json_schema_to_arrow) forward mapping.
-///
-/// # Errors
-/// Returns [`WyrdError`] (code `WYRD_VALA_400_SCHEMA_PARSE`) when the
-/// JSON-Schema node is unsupported or malformed.
-pub fn schema_from_json_schema(schema: &serde_json::Value) -> Result<SchemaRef, WyrdError> {
-    let arrow = wyrd_queue::json_schema_to_arrow(schema)?;
-    Ok(Arc::new(arrow))
 }

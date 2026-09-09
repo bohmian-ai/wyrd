@@ -4,7 +4,7 @@ import asyncio
 
 import pyarrow
 import pytest
-from wyrd.bifrost import BifrostQueryClient, BifrostQueryError, IncompleteQueryStreamError
+from wyrd.bifrost import AsyncBifrost, BifrostQueryError, IncompleteQueryStreamError
 from wyrd.testing import WyrdTestServer
 
 
@@ -13,7 +13,7 @@ def test_bifrost_query_yields_pyarrow_and_terminal(wyrd_server: WyrdTestServer) 
     table_fqn, token = wyrd_server.prepare_oracle_query_fixture()
 
     async def query() -> tuple[list[pyarrow.RecordBatch], dict[str, object] | None]:
-        stream = await BifrostQueryClient(wyrd_server.base_url, token).query(
+        stream = await AsyncBifrost(server_url=wyrd_server.base_url, credential=token).stream(
             f"SELECT id, value FROM {table_fqn} ORDER BY id",
             visibility="published_only",
             freshness="strict",
@@ -42,7 +42,7 @@ def test_query_stream_schema_once_eos(wyrd_server: WyrdTestServer) -> None:
     table_fqn, token = wyrd_server.prepare_oracle_query_fixture()
 
     async def query() -> tuple[list[pyarrow.RecordBatch], dict[str, object] | None]:
-        stream = await BifrostQueryClient(wyrd_server.base_url, token).query(
+        stream = await AsyncBifrost(server_url=wyrd_server.base_url, credential=token).stream(
             f"SELECT id, value FROM {table_fqn} ORDER BY id",
             visibility="published_only",
             freshness="strict",
@@ -71,7 +71,7 @@ def test_bifrost_query_missing_terminal_fails_closed(
     getattr(wyrd_server, f"fail_next_query_after_{fault}")()
 
     async def query() -> None:
-        stream = await BifrostQueryClient(wyrd_server.base_url, token).query(
+        stream = await AsyncBifrost(server_url=wyrd_server.base_url, credential=token).stream(
             f"SELECT id, value FROM {table_fqn} ORDER BY id",
         )
         with pytest.raises(IncompleteQueryStreamError) as captured:
@@ -100,7 +100,7 @@ def test_bifrost_query_gate_denial_has_no_oracle_side_effect(
 
     async def query() -> None:
         with pytest.raises(BifrostQueryError) as captured:
-            await BifrostQueryClient(wyrd_server.base_url, denied_token).query(
+            await AsyncBifrost(server_url=wyrd_server.base_url, credential=denied_token).stream(
                 f"SELECT * FROM {table_fqn}",
             )
         assert captured.value.code == "WYRD_PERMISSION_403_DENIED_RBAC"
@@ -128,7 +128,7 @@ def test_bifrost_query_cancellation_releases_all_resources(
     wyrd_server.stall_next_query_after_schema()
 
     async def cancel_query() -> tuple[dict[str, int], dict[str, int]]:
-        stream = await BifrostQueryClient(wyrd_server.base_url, token).query(
+        stream = await AsyncBifrost(server_url=wyrd_server.base_url, credential=token).stream(
             f"SELECT id, value FROM {table_fqn} ORDER BY id",
             visibility="fused",
             freshness="strict",

@@ -649,6 +649,10 @@ impl Producer {
 
     /// Reserves row capacity before handing it to the bounded channel.
     ///
+    /// `card_ref` is optional because Card correlation is: an omitted value
+    /// becomes a null in the sealed batch's `card_ref` column, which the server
+    /// stores against the authenticated principal with a null `card_uid`.
+    ///
     /// # Errors
     ///
     /// Returns typed backpressure when the producer is draining, its row queue
@@ -656,7 +660,7 @@ impl Producer {
     pub fn enqueue(
         &self,
         json: Vec<u8>,
-        card_ref: CardRef,
+        card_ref: Option<CardRef>,
         run_id: Option<RunId>,
     ) -> Result<(), WyrdQueueError> {
         if self.state.load(Ordering::Acquire) != RUNNING {
@@ -1382,7 +1386,7 @@ mod tests {
         )
         .expect("first producer fits the one-producer envelope");
         producer
-            .enqueue(br#"{"id": 9}"#.to_vec(), card(), None)
+            .enqueue(br#"{"id": 9}"#.to_vec(), Some(card()), None)
             .expect("row accepted before timeout");
         assert!(matches!(
             producer.flush(),
@@ -1570,7 +1574,7 @@ mod tests {
         )
         .expect("fixed queue storage fits the default budget");
         producer
-            .enqueue(br#"{"id": 1}"#.to_vec(), card(), None)
+            .enqueue(br#"{"id": 1}"#.to_vec(), Some(card()), None)
             .expect("row accepted");
         assert!(
             producer.flush().is_err(),
@@ -1643,7 +1647,7 @@ mod tests {
         )
         .expect("fixed queue storage fits the default budget");
         producer
-            .enqueue(br#"{"id": 7}"#.to_vec(), card(), None)
+            .enqueue(br#"{"id": 7}"#.to_vec(), Some(card()), None)
             .expect("row accepted");
         assert!(matches!(
             producer.flush(),
@@ -1710,7 +1714,7 @@ mod tests {
             task.queue
                 .push(Row {
                     json,
-                    card_ref: card(),
+                    card_ref: Some(card()),
                     run_id: None,
                     _guard: guard,
                 })
@@ -1747,7 +1751,7 @@ mod tests {
         let guard = budget.reserve(json.capacity()).expect("row bytes fit");
         tx.send(Row {
             json,
-            card_ref: card(),
+            card_ref: Some(card()),
             run_id: None,
             _guard: guard,
         })

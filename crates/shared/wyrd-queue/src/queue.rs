@@ -21,8 +21,12 @@ use crate::sink::{BatchSink, DurableBatchAck, OwnedIpcBytes, SealedBatch, SinkEr
 pub struct Row {
     /// The caller-owned JSON representation of one row.
     pub json: Vec<u8>,
-    /// The per-row card correlation field.
-    pub card_ref: CardRef,
+    /// The optional per-row card correlation field.
+    ///
+    /// Card correlation is optional on the wire: an absent value stores the
+    /// row against the authenticated principal with a null `card_uid`, so the
+    /// buffered row carries the caller's choice rather than forcing one.
+    pub card_ref: Option<CardRef>,
     /// The optional per-row run correlation field.
     pub run_id: Option<RunId>,
     /// The one handle-wide byte reservation held while the row is buffered.
@@ -204,7 +208,7 @@ impl RecordQueue {
             let json = std::str::from_utf8(&row.json).map_err(|error| {
                 WyrdQueueError::SchemaParse(format!("row is not UTF-8: {error}"))
             })?;
-            builder.append_json_row(json, Some(&row.card_ref), row.run_id.as_ref())?;
+            builder.append_json_row(json, row.card_ref.as_ref(), row.run_id.as_ref())?;
         }
         builder.finish_ipc()
     }
@@ -375,7 +379,7 @@ mod tests {
         Row {
             _guard: budget.reserve(json.capacity()).expect("row bytes fit"),
             json,
-            card_ref: "prod/Service/queue@1.0.0".parse().expect("valid test card"),
+            card_ref: Some("prod/Service/queue@1.0.0".parse().expect("valid test card")),
             run_id: None,
         }
     }

@@ -1,4 +1,4 @@
-//! Thin napi projection of Vala's Rust-owned Oracle query client.
+//! Thin napi projection of the one Rust-owned Bifrost client.
 
 #![deny(missing_docs)]
 
@@ -7,17 +7,8 @@ use std::sync::{Arc, Mutex};
 use arrow::record_batch::RecordBatch;
 use napi::bindgen_prelude::Buffer;
 use napi_derive::napi;
-use secrecy::SecretString;
 use tokio::sync::Mutex as AsyncMutex;
-use vala_sdk::grpc::BifrostGrpcTransport;
-use vala_sdk::{
-    BifrostIngestSink, ClientScope, QueryClient, QueryResultStream, SinkKind, ValaSdkError,
-    schema_from_json_schema,
-};
-use wyrd_client::WyrdClient;
-use wyrd_client::auth::AuthMiddleware;
-use wyrd_client::config::ClientConfig;
-use wyrd_client::transport::{HttpConfig, HttpTransport, ResolvedCredential};
+use vala_sdk::{QueryResultStream, ValaSdkError};
 use wyrd_queue::QueueConfig;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
@@ -301,49 +292,316 @@ impl NativeQueryStart {
     }
 }
 
-/// Authenticated native query client sharing Wyrd's HTTP and auth pools.
+/// One Bifrost table as it crosses the Node boundary.
+///
+/// `configJson` is the authoritative value — the whole `TableConfig`, including
+/// the server identity a described table already carries — so a config that
+/// goes out to JavaScript and comes back is the same config. The other fields
+/// are read-only projections JavaScript would otherwise have to derive, and
+/// deriving them would mean reimplementing the schema mapping this SDK exists
+/// to keep in one place.
+#[napi(object)]
+pub struct NativeTableConfig {
+    /// The serialized `TableConfig`; the only field read back natively.
+    pub config_json: String,
+    /// `namespace.name`.
+    pub fqn: String,
+    /// The declared user columns as one schema-only Arrow IPC stream.
+    pub schema_ipc: Buffer,
+    /// Serialized `{table_uid, fingerprint}` once the server has minted it.
+    pub resolved_json: Option<String>,
+}
+
+impl NativeTableConfig {
+    /// Projects one native config for JavaScript.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error when the config or its schema cannot be encoded.
+    fn project(config: &vala_sdk::TableConfig) -> napi::Result<Self> {
+        let mut schema_ipc = Vec::new();
+        {
+            let mut writer =
+                arrow::ipc::writer::StreamWriter::try_new(&mut schema_ipc, config.user_schema())
+                    .map_err(napi_error)?;
+            writer.finish().map_err(napi_error)?;
+        }
+        Ok(Self {
+            config_json: serde_json::to_string(config).map_err(napi_error)?,
+            fqn: config.fqn(),
+            schema_ipc: Buffer::from(schema_ipc),
+            resolved_json: config
+                .resolved()
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(napi_error)?,
+        })
+    }
+
+    /// Rebuilds the native config from the value JavaScript handed back.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error when the text is not one serialized `TableConfig`.
+    fn parse(&self) -> napi::Result<vala_sdk::TableConfig> {
+        serde_json::from_str(&self.config_json).map_err(napi_error)
+    }
+}
+
+/// Builds one table config from a JSON Schema document.
+///
+/// This is the Zod (`z.toJSONSchema()`) door; the mapping is the same
+/// `wyrd-queue` owner every language uses, so one model declares the same
+/// columns from any SDK.
+///
+/// # Errors
+///
+/// Returns a napi error when the table is not `namespace.name`, the document is
+/// not one mappable JSON Schema, a declared column is server-owned, or the
+/// layout is not one physical-layout declaration.
+// justification: napi boundary; a JavaScript string is primitive and cannot be
+// passed by reference, so the generated binding requires an owned String
+#[allow(clippy::needless_pass_by_value)]
 #[napi]
-pub struct NativeBifrostQueryClient {
-    /// Rust-owned Oracle query client.
-    client: QueryClient,
+pub fn table_config_from_json_schema(
+    table: String,
+    schema_json: String,
+    layout_json: Option<String>,
+) -> napi::Result<NativeTableConfig> {
+    let schema: serde_json::Value = serde_json::from_str(&schema_json)
+        .map_err(|error| napi::Error::from_reason(format!("invalid JSON schema: {error}")))?;
+    let config = vala_sdk::TableConfig::from_json_schema(&table, &schema).map_err(napi_error)?;
+    NativeTableConfig::project(&apply_layout(config, layout_json.as_deref())?)
+}
+
+/// Fetches an already-registered table's config by name.
+///
+/// Every transport argument is optional and resolves through the same chain the
+/// client constructor uses when omitted.
+///
+/// # Errors
+///
+/// Returns a napi error when no credential resolves, or when the server refuses
+/// or cannot describe the table.
+// justification: napi boundary; a JavaScript string is primitive and cannot be
+// passed by reference, so the generated binding requires an owned String
+#[allow(clippy::needless_pass_by_value)]
+#[napi]
+pub async fn describe_table_config(
+    table: String,
+    server_url: Option<String>,
+    credential: Option<String>,
+    grpc_url: Option<String>,
+) -> napi::Result<NativeTableConfig> {
+    let client = vala_sdk::client_from_options(
+        server_url.as_deref(),
+        credential.as_deref(),
+        grpc_url.as_deref(),
+    )
+    .map_err(napi_error)?;
+    let config = vala_sdk::TableConfig::describe(&client, &table)
+        .await
+        .map_err(napi_error)?;
+    NativeTableConfig::project(&config)
+}
+
+/// Applies one optional serialized physical layout to a config.
+///
+/// # Errors
+///
+/// Returns a napi error when the text is not one `PhysicalLayoutWire`.
+fn apply_layout(
+    config: vala_sdk::TableConfig,
+    layout_json: Option<&str>,
+) -> napi::Result<vala_sdk::TableConfig> {
+    match layout_json {
+        None => Ok(config),
+        Some(layout) => {
+            let layout: wyrd_spec::vala::api::PhysicalLayoutWire = serde_json::from_str(layout)
+                .map_err(|error| {
+                    napi::Error::from_reason(format!("invalid physical layout: {error}"))
+                })?;
+            Ok(config.with_layout(layout))
+        }
+    }
+}
+
+/// The one Bifrost client: query any authorized table, write to the active one.
+///
+/// Mirrors the Python binding: both are thin conversions over the one
+/// [`vala_sdk::Bifrost`], so batching, backpressure, registration, and the
+/// query contract have exactly one owner.
+#[napi]
+pub struct NativeBifrost {
+    /// The Rust-owned client every method delegates to.
+    ///
+    /// Shared through an [`Arc`] so a blocking drain can move it onto a
+    /// blocking worker without stalling the Node event loop.
+    client: Arc<vala_sdk::Bifrost>,
+}
+
+/// Connects one Bifrost client, optionally already bound to a write target.
+///
+/// A free function rather than a constructor because connecting is asynchronous
+/// and a napi constructor cannot be. Every transport argument is optional and
+/// falls through the existing resolution chain exactly once when omitted.
+///
+/// # Errors
+///
+/// Returns a napi error when no credential resolves, when the supplied table
+/// config is not one serialized `TableConfig`, or when the gRPC ingest channel
+/// cannot be dialled.
+#[napi]
+pub async fn connect_bifrost(
+    table: Option<NativeTableConfig>,
+    server_url: Option<String>,
+    credential: Option<String>,
+    grpc_url: Option<String>,
+) -> napi::Result<NativeBifrost> {
+    let client = vala_sdk::client_from_options(
+        server_url.as_deref(),
+        credential.as_deref(),
+        grpc_url.as_deref(),
+    )
+    .map_err(napi_error)?;
+    let table = table.map(|table| table.parse()).transpose()?;
+    let handle = vala_sdk::Bifrost::connect_with_config(&client, table, QueueConfig::default())
+        .await
+        .map_err(napi_error)?;
+    Ok(NativeBifrost {
+        client: Arc::new(handle),
+    })
 }
 
 #[napi]
-impl NativeBifrostQueryClient {
-    /// Constructs a bearer-token query client without performing IO.
-    #[napi(constructor)]
-    pub fn new(
-        mut server_url: String,
-        token: String,
-        grpc_url: Option<String>,
-    ) -> napi::Result<Self> {
-        if server_url.trim().is_empty() || token.is_empty() {
-            return Err(napi::Error::from_reason(
-                "serverUrl and token must not be empty".to_owned(),
-            ));
+impl NativeBifrost {
+    /// Creates the active table, answering `created` or `already_exists`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error only when the native result cannot be projected;
+    /// no-active-table, fingerprint-conflict, and transport failures are
+    /// returned in [`NativeLifecycleResult`].
+    #[napi]
+    pub async fn register(&self) -> napi::Result<NativeLifecycleResult> {
+        match self.client.register().await {
+            Ok(outcome) => NativeLifecycleResult::success(&serde_json::Value::String(
+                vala_sdk::register_outcome_name(outcome).to_owned(),
+            )),
+            Err(error) => Ok(NativeLifecycleResult::failure(&error)),
         }
-        let base_url_len = server_url.trim_end_matches('/').len();
-        server_url.truncate(base_url_len);
-        let mut config = ClientConfig {
-            http: HttpConfig {
-                base_url: server_url,
-                ..HttpConfig::default()
-            },
-            ..ClientConfig::default()
-        };
-        if let Some(grpc_url) = grpc_url.filter(|value| !value.trim().is_empty()) {
-            config.grpc.endpoint = grpc_url;
+    }
+
+    /// Binds `table` as the write target, returning the previous binding.
+    ///
+    /// The previous table's producer stays pooled, so its buffered rows still
+    /// flush; a swap loses nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error when the config is not one serialized `TableConfig`
+    /// or the previous binding cannot be projected.
+    // justification: napi boundary; a generated object argument arrives owned
+    #[allow(clippy::needless_pass_by_value)]
+    #[napi]
+    pub fn use_table(&self, table: NativeTableConfig) -> napi::Result<Option<NativeTableConfig>> {
+        self.client
+            .use_table(table.parse()?)
+            .as_ref()
+            .map(NativeTableConfig::project)
+            .transpose()
+    }
+
+    /// Binds an already-registered table by name, describing it first.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error only when the native result cannot be projected;
+    /// not-found, authorization, and transport failures are returned in
+    /// [`NativeLifecycleResult`].
+    // justification: napi boundary; a JavaScript string is primitive and cannot
+    // be passed by reference, so the generated binding requires an owned String
+    #[allow(clippy::needless_pass_by_value)]
+    #[napi]
+    pub async fn use_table_by_name(&self, table: String) -> napi::Result<NativeLifecycleResult> {
+        match self.client.use_table_by_name(&table).await {
+            Ok(()) => NativeLifecycleResult::success(&serde_json::Value::Null),
+            Err(error) => Ok(NativeLifecycleResult::failure(&error)),
         }
-        let auth = AuthMiddleware::new(
-            &config,
-            ResolvedCredential::BearerToken(SecretString::from(token)),
-        )
-        .map_err(napi_error)?;
-        let http = HttpTransport::new(&config.http, Arc::clone(&auth)).map_err(napi_error)?;
-        let client = WyrdClient::from_parts(auth, http, config.grpc);
-        Ok(Self {
-            client: QueryClient::new(&client),
-        })
+    }
+
+    /// The active write binding, if any.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error when the binding cannot be projected.
+    #[napi(getter)]
+    pub fn table(&self) -> napi::Result<Option<NativeTableConfig>> {
+        self.client
+            .table()
+            .as_ref()
+            .map(NativeTableConfig::project)
+            .transpose()
+    }
+
+    /// Enqueues one JSON row into the active table.
+    ///
+    /// Stays synchronous because the producer push is a bounded, non-blocking
+    /// queue operation; only the drains need a worker thread. A saturated queue
+    /// refuses here rather than dropping silently.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error for an invalid card reference; no-active-table and
+    /// queue-full refusals are returned in [`NativeLifecycleResult`].
+    // justification: napi boundary; a JavaScript string is primitive and cannot
+    // be passed by reference, so the generated binding requires an owned String
+    #[allow(clippy::needless_pass_by_value)]
+    #[napi]
+    pub fn insert(
+        &self,
+        row: String,
+        card_ref: Option<String>,
+        run_id: Option<String>,
+    ) -> napi::Result<NativeLifecycleResult> {
+        let correlation = correlation(card_ref.as_deref(), run_id)?;
+        match self.client.insert(row.into_bytes(), correlation) {
+            Ok(()) => NativeLifecycleResult::success(&serde_json::Value::Null),
+            Err(error) => Ok(NativeLifecycleResult::failure(&error)),
+        }
+    }
+
+    /// Flushes every pooled producer and awaits each durable acknowledgement.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error only when the native result cannot be projected;
+    /// producer and sink failures are returned in [`NativeLifecycleResult`].
+    #[napi]
+    pub async fn flush(&self) -> napi::Result<NativeLifecycleResult> {
+        match self.client.flush().await {
+            Ok(()) => NativeLifecycleResult::success(&serde_json::Value::Null),
+            Err(error) => Ok(NativeLifecycleResult::failure(&error)),
+        }
+    }
+
+    /// Drains every producer and stops its background task.
+    ///
+    /// # Errors
+    ///
+    /// As [`NativeBifrost::flush`].
+    #[napi]
+    pub async fn shutdown(&self) -> napi::Result<NativeLifecycleResult> {
+        match self.client.shutdown().await {
+            Ok(()) => NativeLifecycleResult::success(&serde_json::Value::Null),
+            Err(error) => Ok(NativeLifecycleResult::failure(&error)),
+        }
+    }
+
+    /// Number of distinct table producers currently pooled.
+    #[napi(getter)]
+    pub fn producer_count(&self) -> u32 {
+        u32::try_from(self.client.producer_count()).unwrap_or(u32::MAX)
     }
 
     /// Starts one terminal-safe query through the Rust SDK owner.
@@ -370,7 +628,7 @@ impl NativeBifrostQueryClient {
             },
             deadline_ms: request.deadline_ms.map(u64::from),
         };
-        Ok(match self.client.query(&request).await {
+        Ok(match self.client.query().query(&request).await {
             Ok(stream) => NativeQueryStart::success(stream),
             Err(error) => NativeQueryStart::failure(&error),
         })
@@ -387,7 +645,7 @@ impl NativeBifrostQueryClient {
     /// Wyrd control failures are returned in [`NativeLifecycleResult`].
     #[napi]
     pub async fn running(&self) -> napi::Result<NativeLifecycleResult> {
-        match self.client.running().await {
+        match self.client.query().running().await {
             Ok(queries) => {
                 NativeLifecycleResult::success(&serde_json::to_value(queries).map_err(napi_error)?)
             }
@@ -412,7 +670,7 @@ impl NativeBifrostQueryClient {
                 return Ok(NativeLifecycleResult::failure(&error));
             }
         };
-        match self.client.status(&request_id).await {
+        match self.client.query().status(&request_id).await {
             Ok(summary) => {
                 NativeLifecycleResult::success(&serde_json::to_value(summary).map_err(napi_error)?)
             }
@@ -437,7 +695,7 @@ impl NativeBifrostQueryClient {
                 return Ok(NativeLifecycleResult::failure(&error));
             }
         };
-        match self.client.cancel(&request_id).await {
+        match self.client.query().cancel(&request_id).await {
             Ok(response) => {
                 NativeLifecycleResult::success(&serde_json::to_value(response).map_err(napi_error)?)
             }
@@ -463,7 +721,7 @@ impl NativeBifrostQueryClient {
         namespace: String,
         name: String,
     ) -> napi::Result<NativeLifecycleResult> {
-        match self.client.describe_table(&namespace, &name).await {
+        match self.client.query().describe_table(&namespace, &name).await {
             Ok(description) => NativeLifecycleResult::success(
                 &serde_json::to_value(description).map_err(napi_error)?,
             ),
@@ -507,7 +765,7 @@ impl NativeBifrostQueryClient {
                 }
             },
         };
-        match self.client.get_trace(&request).await {
+        match self.client.query().get_trace(&request).await {
             Ok(response) => {
                 NativeLifecycleResult::success(&serde_json::to_value(response).map_err(napi_error)?)
             }
@@ -552,46 +810,12 @@ impl NativeBifrostQueryClient {
             model: request.model,
             provider: request.provider,
         };
-        match self.client.query_genai(&query).await {
+        match self.client.query().query_genai(&query).await {
             Ok(response) => {
                 NativeLifecycleResult::success(&serde_json::to_value(response).map_err(napi_error)?)
             }
             Err(error) => Ok(NativeLifecycleResult::failure(&error)),
         }
-    }
-
-    /// Projects one described table's writable Arrow schema as schema-only IPC.
-    ///
-    /// The buffer carries no batch, so JavaScript decodes it with its installed
-    /// Arrow implementation instead of reimplementing the description's
-    /// field/type conversion. `include_event_time` selects whether the caller
-    /// intends to supply the managed event-time column.
-    ///
-    /// # Errors
-    ///
-    /// Returns a napi error when `description_json` is not one describe
-    /// response, when the description declares a column the write path already
-    /// appends, or when the schema cannot be encoded.
-    // justification: napi boundary; a JavaScript string is primitive and cannot
-    // be passed by reference, so the generated binding requires an owned String
-    #[allow(clippy::needless_pass_by_value)]
-    #[napi]
-    pub fn writable_schema_ipc(
-        &self,
-        description_json: String,
-        include_event_time: bool,
-    ) -> napi::Result<Buffer> {
-        let description: wyrd_spec::vala::api::BifrostTableDescription =
-            serde_json::from_str(&description_json).map_err(napi_error)?;
-        let schema = wyrd_queue::schema::writable_schema(&description, include_event_time)
-            .map_err(napi_error)?;
-        let mut buffer = Vec::new();
-        {
-            let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut buffer, &schema)
-                .map_err(napi_error)?;
-            writer.finish().map_err(napi_error)?;
-        }
-        Ok(Buffer::from(buffer))
     }
 }
 
@@ -785,223 +1009,22 @@ impl NativeBifrostQueryStream {
     }
 }
 
-/// Authenticated native write handle over Vala's pooled producer path.
-///
-/// Mirrors the Python `Bifrost` binding: both are thin conversions over the one
-/// [`vala_sdk::Bifrost`] handle, so the durable batching, backpressure, and
-/// ingest contract have exactly one owner. The handle is shared through an
-/// [`Arc`] so a blocking drain can move it onto a blocking worker without
-/// stalling the Node event loop.
-#[napi]
-pub struct NativeBifrost {
-    /// Rust-owned pooled write handle shared with the observe projection.
-    handle: Arc<vala_sdk::Bifrost>,
-}
-
-/// Connects one authenticated write handle to the configured gRPC ingest plane.
-///
-/// This is a free function rather than a constructor because connecting is
-/// asynchronous and a napi constructor cannot be. The Python binding blocks
-/// inside `__new__` instead; both reach the same handle.
-///
-/// `serverUrl` selects the HTTP authentication plane and `grpcUrl` overrides
-/// the ingest endpoint for split-plane and local test deployments.
+/// Parses the optional per-row correlation at the Node boundary.
 ///
 /// # Errors
 ///
-/// Returns a napi error for empty configuration, an unresolvable credential, or
-/// a gRPC transport that cannot connect.
-#[napi]
-pub async fn connect_bifrost(
-    mut server_url: String,
-    api_key: String,
-    grpc_url: Option<String>,
-) -> napi::Result<NativeBifrost> {
-    if server_url.trim().is_empty() || api_key.is_empty() {
-        return Err(napi::Error::from_reason(
-            "serverUrl and apiKey must not be empty".to_owned(),
-        ));
-    }
-    let base_url_len = server_url.trim_end_matches('/').len();
-    server_url.truncate(base_url_len);
-    let mut config = ClientConfig {
-        http: HttpConfig {
-            base_url: server_url,
-            ..HttpConfig::default()
-        },
-        api_key: Some(SecretString::from(api_key)),
-        ..ClientConfig::default()
-    };
-    if let Some(grpc_url) = grpc_url.filter(|value| !value.trim().is_empty()) {
-        config.grpc.endpoint = grpc_url;
-    }
-    let scope = ClientScope::from_config(&config).map_err(napi_error)?;
-    let client = WyrdClient::with_config(config).map_err(napi_error)?;
-    let transport = BifrostGrpcTransport::connect(&client)
-        .await
-        .map_err(napi_error)?;
-    Ok(NativeBifrost {
-        handle: Arc::new(vala_sdk::Bifrost::new(
-            scope,
-            Arc::new(BifrostIngestSink::new(Arc::new(transport))),
-            QueueConfig::default(),
-        )),
+/// Returns a napi error when `card_ref` is not one parsable Card reference.
+fn correlation(
+    card_ref: Option<&str>,
+    run_id: Option<String>,
+) -> napi::Result<vala_sdk::Correlation> {
+    Ok(vala_sdk::Correlation {
+        card_ref: card_ref
+            .map(str::parse)
+            .transpose()
+            .map_err(|error| napi::Error::from_reason(format!("invalid cardRef: {error}")))?,
+        run_id: run_id.map(wyrd_spec::vala::ids::RunId::from_string),
     })
-}
-
-#[napi]
-impl NativeBifrost {
-    /// Explicit write path: enqueue one JSON row and propagate backpressure.
-    ///
-    /// Stays synchronous because the producer push is a bounded, non-blocking
-    /// queue operation; only the drain needs a worker thread.
-    ///
-    /// # Errors
-    ///
-    /// Returns a napi error for a malformed JSON schema, an unsupported schema
-    /// node, an invalid card reference, or a full or draining producer queue.
-    // justification: napi boundary; a JavaScript string is primitive and cannot
-    // be passed by reference, so the generated binding requires an owned String
-    #[allow(clippy::needless_pass_by_value)]
-    #[napi]
-    pub fn insert(
-        &self,
-        table: String,
-        schema: String,
-        row: String,
-        card_ref: String,
-        run_id: Option<String>,
-    ) -> napi::Result<()> {
-        let inputs = WriteInputs::parse(&schema, &card_ref, run_id)?;
-        self.handle
-            .insert(
-                SinkKind::Record,
-                &table,
-                &inputs.schema,
-                row.into_bytes(),
-                inputs.card_ref,
-                inputs.run_id,
-            )
-            .map_err(napi_error)
-    }
-
-    /// Fire-and-forget observe path: enqueue one row, counting saturation.
-    ///
-    /// Queue saturation is deliberately swallowed and surfaced through
-    /// [`Self::dropped`] rather than raised, so telemetry never fails a caller.
-    ///
-    /// # Errors
-    ///
-    /// Returns a napi error only for a malformed JSON schema or card reference,
-    /// which are caller mistakes rather than backpressure.
-    // justification: napi boundary; a JavaScript string is primitive and cannot
-    // be passed by reference, so the generated binding requires an owned String
-    #[allow(clippy::needless_pass_by_value)]
-    #[napi]
-    pub fn record(
-        &self,
-        table: String,
-        schema: String,
-        row: String,
-        card_ref: String,
-        run_id: Option<String>,
-    ) -> napi::Result<()> {
-        let inputs = WriteInputs::parse(&schema, &card_ref, run_id)?;
-        vala_sdk::observe::record(
-            &self.handle,
-            SinkKind::Record,
-            &table,
-            &inputs.schema,
-            row.into_bytes(),
-            inputs.card_ref,
-            inputs.run_id,
-        );
-        Ok(())
-    }
-
-    /// Flush every pooled producer and await each durable acknowledgement.
-    ///
-    /// The native drain blocks, so it runs on a blocking worker; awaiting it
-    /// keeps the Node event loop free. The Python binding releases the GIL for
-    /// the same reason.
-    ///
-    /// # Errors
-    ///
-    /// Returns a napi error when a batch cannot be sealed or the server refuses
-    /// it, preserving the stable error text at the boundary.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the blocking drain task cannot be joined.
-    #[napi]
-    pub async fn flush(&self) -> napi::Result<()> {
-        let handle = Arc::clone(&self.handle);
-        tokio::task::spawn_blocking(move || handle.flush())
-            .await
-            .expect("bifrost flush task joins")
-            .map_err(napi_error)
-    }
-
-    /// Drain queued rows and stop every producer background task.
-    ///
-    /// # Errors
-    ///
-    /// Returns a napi error when the terminal drain cannot complete or a
-    /// server acknowledgement reports a write failure.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the blocking drain task cannot be joined.
-    #[napi]
-    pub async fn shutdown(&self) -> napi::Result<()> {
-        let handle = Arc::clone(&self.handle);
-        tokio::task::spawn_blocking(move || handle.shutdown())
-            .await
-            .expect("bifrost shutdown task joins")
-            .map_err(napi_error)
-    }
-
-    /// Rows dropped by the fire-and-forget observe path under backpressure.
-    #[napi(getter)]
-    pub fn dropped(&self) -> i64 {
-        i64::try_from(self.handle.dropped()).unwrap_or(i64::MAX)
-    }
-
-    /// Number of distinct producers currently pooled.
-    #[napi(getter)]
-    pub fn producer_count(&self) -> u32 {
-        u32::try_from(self.handle.producer_count()).unwrap_or(u32::MAX)
-    }
-}
-
-/// The parsed contract values both write paths need before enqueueing a row.
-struct WriteInputs {
-    /// Arrow schema resolved from the caller's JSON Schema document.
-    schema: arrow::datatypes::SchemaRef,
-    /// Card the row is correlated to at the ingest Gate.
-    card_ref: wyrd_spec::reference::CardRef,
-    /// Optional run correlation carried alongside the card.
-    run_id: Option<wyrd_spec::vala::ids::RunId>,
-}
-
-impl WriteInputs {
-    /// Converts the boundary's JSON strings into native contract values.
-    ///
-    /// # Errors
-    ///
-    /// Returns a napi error when the schema is not JSON, describes an
-    /// unsupported node, or the card reference does not parse.
-    fn parse(schema: &str, card_ref: &str, run_id: Option<String>) -> napi::Result<Self> {
-        let schema_value: serde_json::Value = serde_json::from_str(schema)
-            .map_err(|error| napi::Error::from_reason(format!("invalid JSON schema: {error}")))?;
-        Ok(Self {
-            schema: schema_from_json_schema(&schema_value).map_err(napi_error)?,
-            card_ref: card_ref
-                .parse()
-                .map_err(|error| napi::Error::from_reason(format!("invalid cardRef: {error}")))?,
-            run_id: run_id.map(wyrd_spec::vala::ids::RunId::from_string),
-        })
-    }
 }
 
 /// Parses the native visibility spelling.

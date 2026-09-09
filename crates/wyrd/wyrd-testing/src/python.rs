@@ -388,6 +388,29 @@ impl WyrdTestServer {
             .block_on(server.bifrost_read_decision_count())
             .map_err(|error| wyrd_error_to_py_err(error.into()))
     }
+
+    /// Wait until every accepted Oracle audit record has relayed to Postgres.
+    ///
+    /// Returns the residual pending count, which is `0` on a converged relay.
+    /// A journey asserting on the read-decision outbox calls this first: the
+    /// relay is a background task, so the outbox lags local acceptance.
+    ///
+    /// # Errors
+    ///
+    /// Raises a Wyrd error when the context manager is inactive or this server
+    /// does not host an Oracle role.
+    #[pyo3(signature = (budget_ms=5000))]
+    fn wait_oracle_audit_relayed(&self, py: Python<'_>, budget_ms: u64) -> PyResult<u64> {
+        let server = self.server.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("WyrdTestServer not started")
+        })?;
+        py.detach(|| {
+            wyrd_runtime::runtime().block_on(
+                server.wait_oracle_audit_relayed(std::time::Duration::from_millis(budget_ms)),
+            )
+        })
+        .map_err(|error| wyrd_error_to_py_err(error.into()))
+    }
 }
 
 /// Projects one exact Rust resource snapshot into a Python dictionary.

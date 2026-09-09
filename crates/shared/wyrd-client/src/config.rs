@@ -38,11 +38,13 @@ pub struct ClientConfig {
     pub grpc: GrpcConfig,
     /// HTTP transport configuration.
     pub http: HttpConfig,
-    /// Explicit API key.
+    /// Explicit credential.
     ///
-    /// When set, this key is prepended to the credential chain as tier 0 and
+    /// When set, this value is prepended to the credential chain as tier 0 and
     /// always wins over `WYRD_API_KEY`, `WYRD_ACCESS_TOKEN`, and the
-    /// `credentials.toml` floor.
+    /// `credentials.toml` floor. It may be either a Wyrd API key or an
+    /// already-issued access token; [`CredentialSource::explicit`] decides
+    /// which grant it belongs to from the key's own prefix.
     pub api_key: Option<SecretString>,
     /// Token cache mode.
     pub token_cache: TokenCacheMode,
@@ -105,7 +107,7 @@ impl ClientConfig {
     pub fn resolve_credential(&self) -> Result<ResolvedCredential, WyrdClientError> {
         let mut chain = CredentialChain::default();
         if let Some(key) = &self.api_key {
-            chain.push(CredentialSource::ApiKey { key: key.clone() });
+            chain.push(CredentialSource::explicit(key.clone()));
         }
         chain.extend(CredentialChain::from_env());
         chain.resolve()
@@ -232,7 +234,7 @@ mod tests {
         }
 
         let mut cfg = ClientConfig::from_env();
-        cfg.api_key = Some("explicit_key_wins".to_owned().into());
+        cfg.api_key = Some("wyrd_sk_explicit_key_wins".to_owned().into());
 
         let cred = cfg.resolve_credential().expect("explicit key resolves");
 
@@ -245,7 +247,7 @@ mod tests {
             ResolvedCredential::ApiKey(k) => {
                 assert_eq!(
                     k.expose_secret(),
-                    "explicit_key_wins",
+                    "wyrd_sk_explicit_key_wins",
                     "explicit api_key must beat ambient WYRD_API_KEY"
                 );
             }
@@ -330,7 +332,7 @@ mod tests {
         }
 
         let mut cfg = ClientConfig::from_env();
-        cfg.api_key = Some("explicit-key-wins".to_owned().into());
+        cfg.api_key = Some("wyrd_sk_explicit-key-wins".to_owned().into());
         let cred = cfg.resolve_credential().expect("explicit key resolves");
 
         // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
@@ -343,7 +345,7 @@ mod tests {
             ResolvedCredential::ApiKey(key) => {
                 assert_eq!(
                     key.expose_secret(),
-                    "explicit-key-wins",
+                    "wyrd_sk_explicit-key-wins",
                     "an explicit api_key must outrank WYRD_WORKLOAD_TOKEN"
                 );
             }

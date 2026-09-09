@@ -1,4 +1,10 @@
-import { tableFromIPC, type RecordBatch, type Schema } from "apache-arrow";
+import {
+  Table,
+  tableFromIPC,
+  tableToIPC,
+  type RecordBatch,
+  type Schema,
+} from "apache-arrow";
 import { createRequire } from "node:module";
 
 import type {
@@ -619,6 +625,28 @@ export class QueryResult {
   /** Total rows across every batch. */
   get numRows(): number {
     return this.#batches.reduce((total, batch) => total + batch.numRows, 0);
+  }
+
+  /**
+   * The whole result as one Apache Arrow `Table`.
+   *
+   * A view over the batches this result already holds — no copy, no re-decode,
+   * and no second schema mapping — so a caller reaching for columns, `toArray`,
+   * or `get` uses the same Arrow implementation the batches were decoded with.
+   */
+  toArrow(): Table {
+    return new Table([...this.#batches]);
+  }
+
+  /**
+   * The whole result encoded as one Arrow IPC stream.
+   *
+   * The handoff format for anything outside this process — a file, another
+   * Arrow runtime, a worker — and the exact bytes {@link QueryResult.toArrow}
+   * represents, because both are built from the same retained batches.
+   */
+  toBytes(): Uint8Array {
+    return tableToIPC(this.toArrow(), "stream");
   }
 }
 

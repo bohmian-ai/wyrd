@@ -1,3 +1,4 @@
+import { tableFromIPC } from "apache-arrow";
 import { startTestServer } from "@wyrd/testing";
 import { describe, expect, it } from "vitest";
 
@@ -66,6 +67,42 @@ describe("Oracle query journey", () => {
       // The terminal closes that stream explicitly; an empty delta would mean a
       // truncated result rather than a complete one.
       expect(stream.terminal?.arrow_ipc_eos).toEqual([255, 255, 255, 255, 0, 0, 0, 0]);
+    } finally {
+      server.shutdown();
+    }
+  }, 15_000);
+
+  it("converts a collected result to Arrow and to IPC bytes", async () => {
+    const server = startTestServer();
+    try {
+      const expected = [61, 62, 63];
+      server.seedBifrostRows(server.tableFqn, expected);
+      server.waitForBifrostPublication();
+      const client = await Bifrost.connect({
+        serverUrl: server.baseUrl,
+        credential: server.token,
+        grpcUrl: server.grpcUrl,
+      });
+      const result = await client.sql(
+        `SELECT value FROM ${server.tableFqn} ORDER BY value`,
+      );
+
+      // Both conversions are views over the batches the result already holds,
+      // so each must carry exactly the rows the result reports.
+      const table = result.toArrow();
+      expect(table.numRows).toBe(result.numRows);
+      expect(Array.from(table.getChild("value")?.toArray() ?? [])).toEqual(
+        expected.map(BigInt),
+      );
+
+      const decoded = tableFromIPC(result.toBytes());
+      expect(decoded.numRows).toBe(result.numRows);
+      expect(decoded.schema.fields.map((field) => field.name)).toEqual(
+        table.schema.fields.map((field) => field.name),
+      );
+      expect(Array.from(decoded.getChild("value")?.toArray() ?? [])).toEqual(
+        expected.map(BigInt),
+      );
     } finally {
       server.shutdown();
     }

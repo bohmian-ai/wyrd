@@ -126,9 +126,8 @@ describe("Bifrost write journey", () => {
 });
 
 // The columns a caller declares, written the way a TypeScript user already
-// models data. `TableConfig.fromJsonSchema` takes JSON Schema, so Zod's own
-// `toJSONSchema` is the whole bridge -- the same shape Pydantic's
-// `model_json_schema()` plays on the Python side.
+// models data and handed to `TableConfig` as-is -- the same one-step
+// declaration Pydantic gives the Python client.
 const Inference = z.object({
   call_id: z.int(),
   model: z.string(),
@@ -141,9 +140,6 @@ const ModelInfo = z.object({
   model: z.string(),
   vendor: z.string(),
 });
-
-const INFERENCE_SCHEMA = z.toJSONSchema(Inference);
-const MODEL_INFO_SCHEMA = z.toJSONSchema(ModelInfo);
 
 const INFERENCES: z.infer<typeof Inference>[] = [
   { call_id: 1, model: "opus", tokens: 100, latency_ms: 120.5, status: "ok" },
@@ -192,8 +188,8 @@ describe("Bifrost analytical read journey", () => {
       const suffix = Date.now().toString(36);
       const facts = `vala.datasets.inference_${suffix}`;
       const dims = `vala.datasets.model_info_${suffix}`;
-      await publishRows(server, facts, INFERENCE_SCHEMA, INFERENCES);
-      await publishRows(server, dims, MODEL_INFO_SCHEMA, MODEL_INFO);
+      await publishRows(server, facts, Inference, INFERENCES);
+      await publishRows(server, dims, ModelInfo, MODEL_INFO);
 
       const reader = await Bifrost.connect({
         serverUrl: server.baseUrl,

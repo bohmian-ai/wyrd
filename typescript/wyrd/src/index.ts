@@ -406,13 +406,24 @@ function layoutJson(layout?: TableLayout): string | undefined {
 }
 
 /**
+ * Anything that can describe itself as JSON Schema.
+ *
+ * Zod 4 schemas satisfy this by construction; the shape is named structurally
+ * so {@link TableConfig.fromJsonSchema} accepts one without this SDK depending
+ * on Zod, or on any other schema library.
+ */
+export interface JsonSchemaSource {
+  toJSONSchema(): Readonly<Record<string, unknown>>;
+}
+
+/**
  * One Bifrost table: its name, the columns a model declares, and the physical
  * layout to request.
  *
- * Build it from a JSON Schema document — `z.toJSONSchema()` for Zod, or a
- * literal — or fetch an existing table by name. No fingerprint is computed
- * here: the server mints it, so `resolved` is undefined until the table is
- * registered or described.
+ * Build it from a JSON Schema document — a Zod 4 schema, a literal, or any
+ * peer that describes itself the same way — or fetch an existing table by
+ * name. No fingerprint is computed here: the server mints it, so `resolved` is
+ * undefined until the table is registered or described.
  */
 export class TableConfig {
   readonly #native: NativeTableConfig;
@@ -431,13 +442,29 @@ export class TableConfig {
     return this.#native;
   }
 
+  /**
+   * Declare a table's columns from JSON Schema, or from a schema that emits it.
+   *
+   * A Zod 4 schema carries its own `toJSONSchema()`, so passing one directly is
+   * the same one-step declaration Pydantic gives the Python client. The check
+   * is structural rather than an `instanceof`, so no schema library is a
+   * dependency of this SDK and any peer offering the same method works
+   * unchanged.
+   *
+   * @throws when the resulting document does not map to an Arrow schema, or
+   * declares a column the write path already owns.
+   */
   static fromJsonSchema(
     table: string,
-    schema: Readonly<Record<string, unknown>>,
+    schema: Readonly<Record<string, unknown>> | JsonSchemaSource,
     layout?: TableLayout,
   ): TableConfig {
+    const document =
+      typeof (schema as JsonSchemaSource).toJSONSchema === "function"
+        ? (schema as JsonSchemaSource).toJSONSchema()
+        : schema;
     return new TableConfig(
-      tableConfigFromJsonSchema(table, JSON.stringify(schema), layoutJson(layout)),
+      tableConfigFromJsonSchema(table, JSON.stringify(document), layoutJson(layout)),
     );
   }
 

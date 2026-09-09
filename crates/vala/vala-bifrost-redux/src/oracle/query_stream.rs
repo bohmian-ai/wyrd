@@ -1468,7 +1468,6 @@ impl OracleQueryStream {
     /// Builds a test stream through the production telemetry and admission owners.
     #[cfg(test)]
     pub(super) fn test_from_physical(
-        telemetry: &Arc<super::OracleTelemetry>,
         schema: &arrow::datatypes::SchemaRef,
         batches: datafusion::physical_plan::SendableRecordBatchStream,
         scan_stats: super::OracleQueryScanStats,
@@ -1488,8 +1487,10 @@ impl OracleQueryStream {
             visibility: VisibilityMode::PublishedOnly,
             freshness_policy: wyrd_spec::vala::api::FreshnessPolicy::Strict,
             degraded_sources: Arc::new(std::sync::Mutex::new(Vec::new())),
-            query_telemetry: telemetry
-                .start_query(VisibilityMode::PublishedOnly, QueryClass::Interactive),
+            query_telemetry: OracleTelemetry::start_query(
+                VisibilityMode::PublishedOnly,
+                QueryClass::Interactive,
+            ),
             scan_stats,
             gate_lifecycle: None,
             running_query: None,
@@ -2139,9 +2140,8 @@ mod tests {
     #[tokio::test]
     async fn success_terminal_requires_completed_local_release() {
         let (admitted, shared, _request_cancellation) = admitted_guard_for_test();
-        let telemetry_owner = Arc::new(OracleTelemetry::new());
         let telemetry =
-            telemetry_owner.start_query(VisibilityMode::PublishedOnly, QueryClass::Interactive);
+            OracleTelemetry::start_query(VisibilityMode::PublishedOnly, QueryClass::Interactive);
         let (ipc, schema_frame) = empty_schema_ipc("production");
         let mut stream = OracleQueryStream::new(QueryStreamInput {
             execution_path: QueryExecutionPath::Interactive,
@@ -2179,7 +2179,6 @@ mod tests {
     #[tokio::test]
     async fn post_output_typed_stale_object_is_terminal_without_replan() {
         let (admitted, shared, _request_cancellation) = admitted_guard_for_test();
-        let telemetry_owner = Arc::new(OracleTelemetry::new());
         let stale = crate::oracle::exec::iceberg_datafusion_error(std::io::Error::from(
             std::io::ErrorKind::NotFound,
         ));
@@ -2199,8 +2198,10 @@ mod tests {
             visibility: VisibilityMode::PublishedOnly,
             freshness_policy: FreshnessPolicy::Strict,
             degraded_sources: Arc::new(std::sync::Mutex::new(Vec::new())),
-            query_telemetry: telemetry_owner
-                .start_query(VisibilityMode::PublishedOnly, QueryClass::Interactive),
+            query_telemetry: OracleTelemetry::start_query(
+                VisibilityMode::PublishedOnly,
+                QueryClass::Interactive,
+            ),
             scan_stats: OracleQueryScanStats::default(),
             gate_lifecycle: None,
             running_query: None,
@@ -2223,7 +2224,6 @@ mod tests {
     #[tokio::test]
     async fn request_cancellation_interrupts_production_stream() {
         let (admitted, shared, request_cancellation) = admitted_guard_for_test();
-        let telemetry_owner = Arc::new(OracleTelemetry::new());
         let (ipc, schema_frame) = empty_schema_ipc("request-cancel");
         let mut stream = OracleQueryStream::new(QueryStreamInput {
             execution_path: QueryExecutionPath::Interactive,
@@ -2240,8 +2240,10 @@ mod tests {
             visibility: VisibilityMode::PublishedOnly,
             freshness_policy: FreshnessPolicy::Strict,
             degraded_sources: Arc::new(std::sync::Mutex::new(Vec::new())),
-            query_telemetry: telemetry_owner
-                .start_query(VisibilityMode::PublishedOnly, QueryClass::Interactive),
+            query_telemetry: OracleTelemetry::start_query(
+                VisibilityMode::PublishedOnly,
+                QueryClass::Interactive,
+            ),
             scan_stats: OracleQueryScanStats::default(),
             gate_lifecycle: None,
             running_query: None,

@@ -133,12 +133,11 @@ pub use running::{RunningQueryEntry, RunningQueryRegistry, RunningQuerySettlemen
 /// Builds one test stream through the production telemetry terminal owner.
 #[cfg(test)]
 fn test_query_stream_from_physical(
-    telemetry: &Arc<OracleTelemetry>,
     schema: &SchemaRef,
     batches: SendableRecordBatchStream,
     scan_stats: OracleQueryScanStats,
 ) -> OracleQueryStream {
-    query_stream::OracleQueryStream::test_from_physical(telemetry, schema, batches, scan_stats)
+    query_stream::OracleQueryStream::test_from_physical(schema, batches, scan_stats)
 }
 
 pub use tail_fence::{DiscoveredTailRoute, TailStreamDiscovery};
@@ -530,12 +529,12 @@ impl OracleTelemetry {
     }
 
     /// Starts production accounting for one classified logical query.
+    ///
+    /// Nothing on the telemetry owner is read: a query's counters live on the
+    /// returned guard, so this is an associated constructor rather than a
+    /// method that pretends to consult shared state.
     #[must_use]
-    fn start_query(
-        self: &Arc<Self>,
-        _visibility: VisibilityMode,
-        query_class: QueryClass,
-    ) -> QueryTelemetryGuard {
+    fn start_query(_visibility: VisibilityMode, query_class: QueryClass) -> QueryTelemetryGuard {
         metrics::gauge!(
             "oracle_queries_active",
             "class" => query_class_label(query_class)
@@ -1443,9 +1442,9 @@ pub struct OracleConfig {
     pub default_deadline: Duration,
     /// Maximum concurrent sealed planning operations.
     pub planning_permits: usize,
-    /// Tenant ceiling for interactive slot units.
+    /// Fixed pod-local per-tenant Interactive slot-unit cap.
     pub tenant_interactive_slots: u32,
-    /// Tenant ceiling for analytical slot units.
+    /// Fixed pod-local per-tenant Analytical slot-unit cap; zero disables the class.
     pub tenant_analytical_slots: u32,
     /// Maximum remote workers selected per query; leader is additional.
     pub max_workers_per_query: usize,
@@ -1455,14 +1454,10 @@ pub struct OracleConfig {
     pub attempt_max_bytes: usize,
     /// In-memory attempt threshold before permission-restricted spill.
     pub attempt_memory_bytes: usize,
-    /// Interactive class capacity.
+    /// Protected Interactive slot units; also the local Interactive floor.
     pub interactive_slots: u32,
-    /// Analytical class capacity.
+    /// Maximum Analytical slot units; zero is a valid disabled class.
     pub analytical_slots: u32,
-    /// Single-tenant local ceiling.
-    pub single_tenant_ceiling: u32,
-    /// Multi-tenant local ceiling.
-    pub multi_tenant_ceiling: u32,
     /// Maximum queued waiters.
     pub queue_capacity: u32,
     /// Absolute queue wait cap.
@@ -1477,7 +1472,7 @@ impl Default for OracleConfig {
             max_sql_bytes: DEFAULT_MAX_SQL_BYTES,
             default_deadline: Duration::from_secs(30),
             planning_permits: 16,
-            tenant_interactive_slots: 8,
+            tenant_interactive_slots: 12,
             tenant_analytical_slots: 4,
             max_workers_per_query: 2,
             fragment_max_files: 16,
@@ -1485,8 +1480,6 @@ impl Default for OracleConfig {
             attempt_memory_bytes: 8 * 1024 * 1024,
             interactive_slots: 8,
             analytical_slots: 4,
-            single_tenant_ceiling: 8,
-            multi_tenant_ceiling: 4,
             queue_capacity: 64,
             max_queue_wait: Duration::from_millis(250),
             analytical_scratch_bytes: 64 * 1024 * 1024,
@@ -1876,12 +1869,49 @@ fn validate_oracle_config(config: OracleConfig) -> Result<(), BifrostError> {
             detail: "Oracle SQL byte limit must be positive".to_owned(),
         });
     }
-    if config.planning_permits == 0
-        || config.tenant_interactive_slots == 0
-        || config.tenant_analytical_slots == 0
-    {
+    if config.planning_permits == 0 {
         return Err(BifrostError::Internal {
-            detail: "Oracle planning and tenant limits must be positive".to_owned(),
+            detail: "Oracle planning permits must be positive".to_owned(),
+        });
+    }
+    validate_oracle_tenant_slots(config)
+}
+
+/// Validates the fixed pod-local per-tenant slot-unit caps against their classes.
+///
+/// The Interactive cap must admit at least one query and may borrow up to the
+/// whole local total, which is the Interactive class maximum. The Analytical cap
+/// is either zero — the disabled class, where the raw units could not cover one
+/// two-unit query — or a value from one Analytical query's cost through the
+/// class maximum. A cap of one is rejected because it can never admit a query
+/// while still presenting the class as available.
+///
+/// # Errors
+///
+/// Returns [`BifrostError::Internal`] when either cap cannot admit work in its
+/// class or exceeds that class's local maximum.
+fn validate_oracle_tenant_slots(config: OracleConfig) -> Result<(), BifrostError> {
+    let total_slot_units = config
+        .interactive_slots
+        .saturating_add(config.analytical_slots);
+    if config.tenant_interactive_slots == 0 || config.tenant_interactive_slots > total_slot_units {
+        return Err(BifrostError::Internal {
+            detail: "Oracle interactive tenant slot limit must admit work within its class"
+                .to_owned(),
+        });
+    }
+    let analytical_valid =
+        if config.analytical_slots < crate::resources::ANALYTICAL_QUERY_SLOT_UNITS {
+            config.analytical_slots == 0 && config.tenant_analytical_slots == 0
+        } else {
+            (crate::resources::ANALYTICAL_QUERY_SLOT_UNITS..=config.analytical_slots)
+                .contains(&config.tenant_analytical_slots)
+        };
+    if !analytical_valid {
+        return Err(BifrostError::Internal {
+            detail:
+                "Oracle analytical tenant slot limit must be zero or admit one analytical query"
+                    .to_owned(),
         });
     }
     Ok(())
@@ -2764,16 +2794,6 @@ impl Oracle {
         })
     }
 
-    /// Starts one query telemetry owner once across a possible stale retry.
-    fn ensure_query_telemetry(
-        &self,
-        telemetry: &mut Option<QueryTelemetryGuard>,
-        visibility: VisibilityMode,
-        class: QueryClass,
-    ) {
-        telemetry.get_or_insert_with(|| self.telemetry.start_query(visibility, class));
-    }
-
     /// Acquires every owner one built plan needs before it may execute.
     ///
     /// Admission, the retained physical projections, and the running-query
@@ -2913,7 +2933,9 @@ impl Oracle {
         let participant_cut = roster
             .finalize(query_class)
             .map_err(|_| BifrostError::OracleRoleUnavailable)?;
-        self.ensure_query_telemetry(query_telemetry, request.visibility, query_class);
+        // Started once across a possible stale retry.
+        query_telemetry
+            .get_or_insert_with(|| OracleTelemetry::start_query(request.visibility, query_class));
         let attempt = match analytical {
             Some(attempt) => Some(attempt.clone()),
             None if query_class == QueryClass::Analytical && self.analytical.is_some() => Some(
@@ -3515,7 +3537,7 @@ impl Oracle {
             return Err(BifrostError::OracleRoleUnavailable);
         }
         let class = QueryClass::Analytical;
-        let query_telemetry = self.telemetry.start_query(options.visibility, class);
+        let query_telemetry = OracleTelemetry::start_query(options.visibility, class);
         let admitted = self
             .admission
             .admit(admission::PreparedAdmission {
@@ -5345,6 +5367,96 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use std::sync::atomic::AtomicUsize;
 
+    /// Analytical worker selection is bounded by configuration and stable per query.
+    ///
+    /// The cut is the only place fan-out is decided, so this pins three facts at
+    /// once: the leader plus at most the leader's advertised
+    /// `max_workers_per_query` remotes survive, the same query identity always
+    /// selects the same remotes, and a zero bound leaves the leader alone for
+    /// local execution.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a fixture snapshot does not freeze into a cut.
+    #[test]
+    fn analytical_worker_selection_is_bounded_and_stable() {
+        use super::participant_cut::tests::lease;
+        use chrono::Utc;
+        use wyrd_spec::vala::api::{ClusterCapabilities, ClusterRole};
+        let now = Utc::now();
+        let deadline = now + chrono::Duration::seconds(5);
+        let leader = NodeId::new(uuid::Uuid::from_u128(1));
+        let snapshot = |max_workers: u32| {
+            ClusterSnapshot::observed(
+                (1..=5u64)
+                    .map(|node| {
+                        let mut role = lease(u128::from(node), ClusterRole::Oracle, node);
+                        if let ClusterCapabilities::OracleV1(capabilities) = &mut role.capabilities
+                        {
+                            capabilities.supported_classes = vec![QueryClass::Analytical];
+                            capabilities.max_workers_per_query = max_workers;
+                        }
+                        role
+                    })
+                    .collect(),
+                now,
+            )
+        };
+        let freeze = |query: u128, max_workers: u32| {
+            OracleQueryAttemptCut::try_from_snapshot(
+                &snapshot(max_workers),
+                QueryId::new(uuid::Uuid::from_u128(query)),
+                leader,
+                QueryClass::Analytical,
+                deadline,
+                now,
+                Duration::from_secs(15),
+            )
+            .expect("the five-Oracle fixture freezes one cut")
+        };
+        let selected = |cut: &OracleQueryAttemptCut| {
+            cut.oracles()
+                .iter()
+                .map(|participant| participant.node_id)
+                .collect::<Vec<_>>()
+        };
+
+        let bounded = freeze(7, 2);
+        assert_eq!(
+            bounded.oracles().len(),
+            3,
+            "the bound covers remotes only; the leader is always retained"
+        );
+        assert!(
+            selected(&bounded).contains(&leader),
+            "the leader must survive its own selection"
+        );
+        assert_eq!(
+            selected(&bounded),
+            selected(&freeze(7, 2)),
+            "one query identity must select one remote set on every node"
+        );
+        assert!(
+            selected(&bounded).windows(2).all(|pair| pair[0] < pair[1]),
+            "selection must preserve the canonical node-identity order"
+        );
+
+        let local_only = freeze(7, 0);
+        assert_eq!(
+            selected(&local_only),
+            vec![leader],
+            "a zero bound means local execution only"
+        );
+
+        let rotated = (0..5u128)
+            .map(|query| selected(&freeze(query, 1)))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(
+            rotated.len() > 1,
+            "attempt identity must rotate the starting position across replicas"
+        );
+    }
+
     /// Planning input errors carry one safe repair action through dependency wrappers.
     #[test]
     fn datafusion_query_rejections_are_safe_and_actionable() {
@@ -5713,9 +5825,8 @@ mod tests {
     fn oracle_terminal_metric_records_closed_label_delta() {
         let recorder = wyrd_bench::BenchmarkRecorder::new();
         metrics::with_local_recorder(&recorder, || {
-            let telemetry = Arc::new(OracleTelemetry::new());
             let mut query =
-                telemetry.start_query(VisibilityMode::PublishedOnly, QueryClass::Analytical);
+                OracleTelemetry::start_query(VisibilityMode::PublishedOnly, QueryClass::Analytical);
             query.start_stream();
             query.finish("failed", "complete");
         });
@@ -5740,7 +5851,8 @@ mod tests {
     fn oracle_telemetry_registers_closed_idle_gauges() {
         let recorder = wyrd_bench::BenchmarkRecorder::new();
         let _guard = metrics::set_default_local_recorder(&recorder);
-        let telemetry = Arc::new(OracleTelemetry::new());
+        // Constructing the owner is what registers the idle series this covers.
+        let _telemetry = OracleTelemetry::new();
         let expected = [
             "oracle_queries_active{class=\"interactive\"}",
             "oracle_queries_active{class=\"analytical\"}",
@@ -5760,7 +5872,7 @@ mod tests {
         {
             for query_class in [QueryClass::Interactive, QueryClass::Analytical] {
                 for visibility in [VisibilityMode::PublishedOnly, VisibilityMode::Fused] {
-                    let query = telemetry.start_query(visibility, query_class);
+                    let query = OracleTelemetry::start_query(visibility, query_class);
                     drop(query);
                 }
                 let _ = query_class;
@@ -5791,18 +5903,18 @@ mod tests {
         let recorder = wyrd_bench::BenchmarkRecorder::new();
         metrics::with_local_recorder(&recorder, || {
             for outcome in ["success", "failed"] {
-                let telemetry = Arc::new(OracleTelemetry::new());
-                let mut query =
-                    telemetry.start_query(VisibilityMode::PublishedOnly, QueryClass::Analytical);
+                let mut query = OracleTelemetry::start_query(
+                    VisibilityMode::PublishedOnly,
+                    QueryClass::Analytical,
+                );
                 query.start_stream();
                 query.record_payload(0, 7);
                 query.record_payload(3, 11);
                 query.finish(outcome, "complete");
             }
 
-            let telemetry = Arc::new(OracleTelemetry::new());
             let mut cancelled =
-                telemetry.start_query(VisibilityMode::PublishedOnly, QueryClass::Analytical);
+                OracleTelemetry::start_query(VisibilityMode::PublishedOnly, QueryClass::Analytical);
             cancelled.start_stream();
             cancelled.record_payload(3, 18);
             cancelled
@@ -5810,9 +5922,8 @@ mod tests {
                 .store(true, Ordering::Release);
             drop(cancelled);
 
-            let telemetry = Arc::new(OracleTelemetry::new());
             let mut dropped =
-                telemetry.start_query(VisibilityMode::PublishedOnly, QueryClass::Analytical);
+                OracleTelemetry::start_query(VisibilityMode::PublishedOnly, QueryClass::Analytical);
             dropped.start_stream();
             dropped.record_payload(3, 18);
             drop(dropped);

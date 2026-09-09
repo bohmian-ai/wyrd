@@ -93,6 +93,50 @@ pub struct OracleQueryAttemptRoster {
     deadline: DateTime<Utc>,
 }
 
+/// Reduces the eligible remote roster to a bounded, deterministic selection.
+///
+/// `oracles` arrives sorted and deduplicated by stable node identity. The
+/// starting position rotates by the attempt identity, so two concurrent queries
+/// on the same cut spread across different replicas while one query always
+/// selects the same replicas on every node that recomputes the cut. The leader
+/// is always retained; the leader's own advertised `max_workers_per_query`
+/// bounds only the remotes, and zero means local execution.
+///
+/// The result stays in the original node-identity order so every downstream
+/// digest, exchange assignment, and dispatch sees one canonical sequence.
+fn select_bounded_workers(
+    oracles: &mut Vec<OracleQueryParticipant>,
+    leader: &OracleQueryParticipant,
+    attempt_id: QueryId,
+) {
+    let ClusterCapabilities::OracleV1(capabilities) = &leader.capabilities else {
+        return;
+    };
+    let max_workers = usize::try_from(capabilities.max_workers_per_query).unwrap_or(usize::MAX);
+    let eligible = oracles.len().saturating_sub(1);
+    let selected = max_workers.min(eligible);
+    if selected == eligible {
+        return;
+    }
+    let remotes: Vec<usize> = (0..oracles.len())
+        .filter(|index| oracles[*index].node_id != leader.node_id)
+        .collect();
+    let mut keep = vec![false; oracles.len()];
+    if !remotes.is_empty() {
+        let rotation =
+            usize::try_from(attempt_id.as_uuid().as_u128() % remotes.len() as u128).unwrap_or(0);
+        for step in 0..selected {
+            keep[remotes[(rotation + step) % remotes.len()]] = true;
+        }
+    }
+    let mut index = 0;
+    oracles.retain(|participant| {
+        let retained = participant.node_id == leader.node_id || keep[index];
+        index += 1;
+        retained
+    });
+}
+
 impl OracleQueryAttemptRoster {
     /// Freezes one fresh snapshot into class-neutral attempt membership.
     ///
@@ -141,6 +185,11 @@ impl OracleQueryAttemptRoster {
             .find(|participant| participant.node_id == leader_node_id)
             .cloned()
             .ok_or(OracleQueryAttemptCutError::LeaderUnavailable)?;
+        // Bound the fan-out here, once, before the roster is observed by
+        // planning, dispatch, reservation, or the signed digest. An unselected
+        // replica is therefore absent from the cut entirely and cannot receive
+        // a request or affect the result.
+        select_bounded_workers(&mut oracles, &leader, attempt_id);
         Ok(Self {
             observed_at: snapshot.observed_at(),
             attempt_id,
@@ -187,7 +236,7 @@ impl OracleQueryAttemptRoster {
         })
     }
 
-    /// Returns the frozen ready Oracle participants, leader included.
+    /// Returns the selected Oracle participants, leader included.
     #[must_use]
     pub fn oracles(&self) -> &[OracleQueryParticipant] {
         &self.oracles
@@ -540,7 +589,7 @@ pub(super) mod tests {
     use wyrd_spec::vala::api::{ClusterNodeKey, OracleCapabilitiesV1, ScribeCapabilitiesV1};
 
     /// Builds one ready role lease with a valid capability document.
-    fn lease(node: u128, role: ClusterRole, fence: u64) -> ClusterRoleLease {
+    pub(crate) fn lease(node: u128, role: ClusterRole, fence: u64) -> ClusterRoleLease {
         let now = Utc::now();
         ClusterRoleLease {
             key: ClusterNodeKey {

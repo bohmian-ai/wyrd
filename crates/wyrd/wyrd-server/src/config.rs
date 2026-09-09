@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
+use vala_bifrost_redux::resources::ANALYTICAL_QUERY_SLOT_UNITS;
 use vala_bifrost_redux::scribe::geometry::{ScribeGeometry, ScribeGeometryError};
 use wyrd_spec::TenantSlug;
 use wyrd_spec::auth::IssuerTokenPolicy;
@@ -708,10 +709,10 @@ pub(crate) struct OracleAdmissionTranslation {
     pub interactive_slots: u32,
     /// Analytical class slots after headroom and share allocation.
     pub analytical_slots: u32,
-    /// Single-tenant concurrent ceiling.
-    pub single_tenant_ceiling: u32,
-    /// Multi-tenant concurrent ceiling.
-    pub multi_tenant_ceiling: u32,
+    /// Fixed pod-local per-tenant Interactive slot-unit cap.
+    pub tenant_interactive_slots: u32,
+    /// Fixed pod-local per-tenant Analytical slot-unit cap; zero disables the class.
+    pub tenant_analytical_slots: u32,
     /// Queue capacity copied from runtime configuration.
     pub queue_capacity: u32,
     /// Absolute queue wait cap.
@@ -757,28 +758,43 @@ fn translate_oracle_calibration(
     )?
     .max(interactive_minimum)
     .max(1);
-    let analytical = checked_floor_u32(
+    let analytical_allocation = checked_floor_u32(
         f64::from(usable) * profile.class.analytical.share,
         "analytical class allocation",
     )?
-    .max(analytical_minimum)
-    .max(1);
-    let allocation_sum = interactive
-        .checked_add(analytical)
+    .max(analytical_minimum);
+    // An Analytical maximum below one query's cost can never admit a query, so
+    // it is not a small class — it is no class. Fold the remainder into the
+    // Interactive floor rather than advertising capacity that always refuses.
+    let analytical_slots = if analytical_allocation < ANALYTICAL_QUERY_SLOT_UNITS {
+        0
+    } else {
+        analytical_allocation
+    };
+    let interactive_slots = interactive
+        .checked_add(analytical_allocation - analytical_slots)
+        .ok_or_else(|| "Oracle interactive allocation exceeds u32".to_owned())?;
+    let allocation_sum = interactive_slots
+        .checked_add(analytical_slots)
         .ok_or_else(|| "Oracle class allocation sum exceeds u32".to_owned())?;
     if allocation_sum > usable {
         return Err(format!(
             "Oracle class allocation sum {allocation_sum} exceeds usable slots {usable}"
         ));
     }
-    let (interactive_slots, analytical_slots) = (interactive, analytical);
-    let single = proposal_u32(&profile.proposal, "tenant.single_tenant_limit")?;
-    let multi = proposal_u32(&profile.proposal, "tenant.multi_tenant_default_limit")?;
+    let interactive_limit = proposal_u32(&profile.proposal, "tenant.interactive_slot_limit")?;
+    let analytical_limit = proposal_u32(&profile.proposal, "tenant.analytical_slot_limit")?;
     Ok(OracleAdmissionTranslation {
         interactive_slots,
         analytical_slots,
-        single_tenant_ceiling: single.min(interactive_slots.max(analytical_slots)),
-        multi_tenant_ceiling: multi.min(interactive_slots.max(analytical_slots)),
+        // Interactive may borrow the whole local total, so its tenant cap is
+        // clamped to that total rather than to the protected floor.
+        tenant_interactive_slots: interactive_limit.clamp(1, allocation_sum),
+        tenant_analytical_slots: if analytical_slots == 0 {
+            0
+        } else {
+            analytical_limit.clamp(ANALYTICAL_QUERY_SLOT_UNITS, analytical_slots)
+        },
         queue_capacity: u32::try_from(runtime.admission_waiters)
             .map_err(|_| "queue capacity exceeds u32".to_owned())?,
         max_queue_wait: Duration::from_millis(runtime.max_queue_wait_ms),
@@ -864,6 +880,14 @@ enum OracleCalibrationStatus {
 }
 
 /// Proposal leaves required by the schema-v1 Oracle calibration contract.
+/// Calibration schema revision this server accepts, with no aliases.
+///
+/// Revision 2 renamed the tenant proposal leaves to the fixed pod-local
+/// slot-unit caps that replaced the contention-dependent ceilings. A revision-1
+/// profile names limits that no longer exist, so it is rejected rather than
+/// migrated.
+const ORACLE_CALIBRATION_SCHEMA_VERSION: u16 = 2;
+
 const ORACLE_CALIBRATION_PROPOSALS: &[&str] = &[
     "slot.cpu_cores_per_slot",
     "slot.memory_bytes_per_slot",
@@ -872,8 +896,8 @@ const ORACLE_CALIBRATION_PROPOSALS: &[&str] = &[
     "class.interactive.minimum_slots",
     "class.analytical.share",
     "class.analytical.minimum_slots",
-    "tenant.single_tenant_limit",
-    "tenant.multi_tenant_default_limit",
+    "tenant.interactive_slot_limit",
+    "tenant.analytical_slot_limit",
     "classification.assumed_scan_bytes_per_second",
     "classification.analytical_threshold_millis",
     "placement.max_attempts",
@@ -927,8 +951,10 @@ impl OracleCalibrationProfile {
     /// Returns a message when identity, workload, matrix, measured slot/class
     /// shape, proposal evidence, or outcome measurements are absent or invalid.
     fn validate_complete(&self) -> Result<(), String> {
-        if self.schema_version != 1 {
-            return Err("schema_version must be 1".to_owned());
+        if self.schema_version != ORACLE_CALIBRATION_SCHEMA_VERSION {
+            return Err(format!(
+                "schema_version must be {ORACLE_CALIBRATION_SCHEMA_VERSION}"
+            ));
         }
         for (name, value) in [
             ("generated_from", self.generated_from.as_str()),
@@ -3358,10 +3384,10 @@ maintenance_interval_secs = 45
         assert!(config.validate().is_err());
     }
 
-    /// Builds one complete schema-v1 profile for activation-policy tests.
+    /// Builds one complete schema-v2 profile for activation-policy tests.
     fn complete_oracle_calibration(status: &str) -> String {
         let mut profile = format!(
-            r#"schema_version = 1
+            r#"schema_version = 2
 status = "{status}"
 generated_from = "sha256:report"
 source_revision = "0123456789abcdef"
@@ -3572,7 +3598,7 @@ minimum_slots = 2
     fn oracle_calibration_rejects_minimal_approved_profile() {
         let directory = tempfile::tempdir().expect("calibration temp directory");
         let path = directory.path().join("oracle-calibration.toml");
-        std::fs::write(&path, "schema_version = 1\nstatus = \"approved\"\n")
+        std::fs::write(&path, "schema_version = 2\nstatus = \"approved\"\n")
             .expect("minimal profile writes");
         let mut config = WyrdServerConfig {
             deployment_profile: DeploymentProfile::Production,
@@ -4508,8 +4534,8 @@ minimum_slots = 2
         };
         let mut proposal = toml::Table::new();
         let mut tenant = toml::Table::new();
-        tenant.insert("single_tenant_limit".to_owned(), leaf(8));
-        tenant.insert("multi_tenant_default_limit".to_owned(), leaf(2));
+        tenant.insert("interactive_slot_limit".to_owned(), leaf(8));
+        tenant.insert("analytical_slot_limit".to_owned(), leaf(2));
         proposal.insert("tenant".to_owned(), toml::Value::Table(tenant));
         let mut memory = toml::Table::new();
         memory.insert("class_limits".to_owned(), leaf(1024));
@@ -4518,7 +4544,7 @@ minimum_slots = 2
         spill.insert("limit_bytes".to_owned(), leaf(4096));
         proposal.insert("spill".to_owned(), toml::Value::Table(spill));
         let mut profile = OracleCalibrationProfile {
-            schema_version: 1,
+            schema_version: 2,
             status: OracleCalibrationStatus::Candidate,
             generated_from: "test".to_owned(),
             source_revision: "test".to_owned(),

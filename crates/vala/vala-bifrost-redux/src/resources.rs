@@ -2479,6 +2479,29 @@ impl OracleResources {
         })
     }
 
+    /// Captures the shared root capacity epoch before an admission attempt.
+    #[must_use]
+    pub fn memory_epoch(&self) -> u64 {
+        self.governor.memory_epoch()
+    }
+
+    /// Waits until a release, resize, or poison advances the root capacity epoch.
+    ///
+    /// Waiting never grants capacity. A queued Oracle leader uses this to learn
+    /// that a follower or sibling query returned slot units or memory, then
+    /// re-runs its own scheduler; it must never treat a wake as an admission.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostResourceError::Poisoned`] when root accounting becomes
+    /// untrustworthy before or during the wait.
+    pub async fn wait_for_memory_change(
+        &self,
+        observed_epoch: u64,
+    ) -> Result<u64, BifrostResourceError> {
+        self.governor.wait_for_memory_change(observed_epoch).await
+    }
+
     /// Returns aggregate slot units currently held across leaders and followers.
     ///
     /// Reports zero when the shared ledger is poisoned, which is the same
@@ -6591,11 +6614,15 @@ mod tests {
             "an analytical worker charges two slot-unit quanta"
         );
         // The budget no longer holds a single worker, so exhaustion has to be
-        // driven rather than assumed. Every acquisition below the budget must
-        // succeed and the first one above it must be refused.
+        // driven rather than assumed. A follower worker charges the same slot
+        // ledger a leader does, so the loop stops at whichever of memory or
+        // slot capacity binds first and the next acquisition must be refused.
+        let capacity = u64::from(oracle.class_split().total_units());
         let mut held = vec![analytical];
         let mut charged = 2 * ORACLE_PARTITION_WORKING_MEMORY_BYTES;
-        while charged + ORACLE_PARTITION_WORKING_MEMORY_BYTES <= budget {
+        while charged + ORACLE_PARTITION_WORKING_MEMORY_BYTES <= budget
+            && oracle.live_slot_units() < capacity
+        {
             held.push(
                 oracle
                     .try_acquire_worker(OracleWorkerClass::Interactive)
@@ -6614,7 +6641,7 @@ mod tests {
             oracle
                 .try_acquire_worker(OracleWorkerClass::Interactive)
                 .is_err(),
-            "a worker that does not fit the remaining budget is refused"
+            "a worker that fits neither the remaining budget nor the slot ledger is refused"
         );
         drop(held);
         assert_eq!(
@@ -6934,15 +6961,18 @@ mod tests {
         assert_eq!(floor_config.batch_size(), floor.batch_size);
     }
 
-    /// Analytical admission preserves one complete interactive query quantum.
+    /// Analytical saturation preserves the derived Interactive slot floor.
+    ///
+    /// The floor is a slot rule, not a memory rule: nothing in the memory
+    /// dimension reserves capacity for Interactive work, so this drives
+    /// Analytical admission to its class maximum and proves an Interactive
+    /// query still fits afterwards.
     #[test]
     fn analytical_capacity_preserves_one_interactive_quantum() {
-        // Scratch and the slot ceiling are both deliberately generous so the
-        // memory dimension is the one that binds; the protected reserve this
-        // test covers is a memory rule, and it cannot be observed through a
-        // refusal that slot capacity issued first.
+        // Scratch and memory are deliberately generous so the slot ledger is the
+        // dimension that binds; a memory refusal would hide the floor this covers.
         let mut policy = policy(&[BifrostRole::Oracle]);
-        policy.oracle_query_slot_limit = Some(1024);
+        policy.oracle_query_slot_limit = Some(5);
         let mut probe = snapshot(1280 * MIB);
         probe.scratch_capacity_bytes = 64 * 1024 * MIB as u64;
         probe.scratch_available_bytes = 64 * 1024 * MIB as u64;
@@ -6951,27 +6981,23 @@ mod tests {
             .compose_roles()
             .expect("analytical reserve composition");
         let oracle = roles.oracle().expect("Oracle capability");
+        let split = oracle.class_split();
+        assert!(
+            split.admits_analytical(),
+            "the fixture must expose an analytical class to saturate"
+        );
         let mut analytical = vec![
             oracle
                 .try_acquire_query(analytical_query(0.0))
-                .expect("analytical query below protected reserve"),
+                .expect("analytical query below the class maximum"),
         ];
         while let Ok(query) = oracle.try_acquire_query(analytical_query(0.0)) {
             analytical.push(query);
         }
-        let occupied = oracle.snapshot().expect("analytical owners at the reserve");
-        let budget = occupied.plan.oracle_floor_bytes + occupied.plan.elastic_memory_bytes;
-        let remaining = budget
-            .checked_sub(occupied.oracle_memory_used_bytes)
-            .expect("ordinary Oracle memory remainder");
+        let occupied = oracle.snapshot().expect("analytical owners at the maximum");
         assert!(
-            remaining >= ORACLE_PARTITION_WORKING_MEMORY_BYTES,
-            "analytical admission stopped while one interactive quantum still fits"
-        );
-        assert!(
-            remaining < 3 * ORACLE_PARTITION_WORKING_MEMORY_BYTES,
-            "analytical admission consumed everything above the protected reserve, \
-             leaving less than one further analytical charge plus that reserve"
+            oracle.live_slot_units() <= u64::from(split.analytical_max_units),
+            "analytical saturation must never consume the interactive floor"
         );
 
         let refused = oracle.try_acquire_query(analytical_query(0.0));
@@ -6979,7 +7005,7 @@ mod tests {
             refused,
             Err(BifrostResourceError::Occupied { .. })
         ));
-        assert_eq!(oracle.snapshot().expect("reserve refusal"), occupied);
+        assert_eq!(oracle.snapshot().expect("class refusal"), occupied);
         let interactive = oracle
             .try_acquire_query(interactive_query(0.0))
             .expect("protected interactive quantum remains available");

@@ -6172,15 +6172,16 @@ mod tests {
         );
     }
 
-    /// Builds the production admission owner with exactly one Analytical slot.
+    /// Builds the production admission owner with exactly one Analytical query.
     ///
-    /// One slot is what makes a second Analytical caller queue rather than
-    /// proceed, which is the only honest way to observe that a retained graph
-    /// is still holding this node's capacity.
+    /// One query's worth of Analytical capacity is what makes a second
+    /// Analytical caller queue rather than proceed, which is the only honest
+    /// way to observe that a retained graph is still holding this node's
+    /// capacity.
     fn single_slot_analytical_admission() -> Arc<super::super::admission::OracleAdmission> {
         super::super::admission::admission_owner_for_test(
             super::super::admission::OracleAdmissionConfig {
-                analytical_slots: 1,
+                analytical_slots: crate::resources::ANALYTICAL_QUERY_SLOT_UNITS,
                 max_queue_wait: Duration::from_secs(30),
                 ..super::super::admission::OracleAdmissionConfig::default()
             },

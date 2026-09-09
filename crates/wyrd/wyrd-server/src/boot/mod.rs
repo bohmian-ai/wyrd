@@ -30,6 +30,7 @@ use vala_bifrost_redux::oracle::{
 };
 use vala_bifrost_redux::resources::{
     BifrostResourcePolicy, BifrostRole, BifrostRoleResources, BifrostRuntimeResources,
+    OracleClassSplit,
 };
 use vala_bifrost_redux::scribe::admission::{AdmissionConfig, EventTimeWindow};
 use vala_bifrost_redux::scribe::stream_identity::{NodeId, StreamIdentity, WriterEpoch};
@@ -1676,24 +1677,34 @@ impl<'a> OracleRoleBuilder<'a> {
         let calibrated =
             crate::config::load_oracle_admission_translation(&config.oracle, raw_slots)
                 .map_err(ServerBootError::OraclePeer)?;
+        // Without an approved calibration profile the split is derived from the
+        // same raw units the capability advertises, so a pod's local capacity is
+        // never a number an operator has to reconcile by hand.
+        let default_split = OracleClassSplit::derive(raw_slots);
         let oracle_config = OracleConfig {
             planning_permits: config.oracle.planning_permits,
             max_workers_per_query: config.oracle.max_workers_per_query,
             attempt_memory_bytes: config.oracle.max_frame_bytes.min(8 * 1024 * 1024),
             interactive_slots: calibrated
                 .as_ref()
-                .map_or((raw_slots / 2).max(1), |value| value.interactive_slots),
+                .map_or(default_split.interactive_floor_units, |value| {
+                    value.interactive_slots
+                }),
             analytical_slots: calibrated
                 .as_ref()
-                .map_or((raw_slots.saturating_sub(raw_slots / 2)).max(1), |value| {
+                .map_or(default_split.analytical_max_units, |value| {
                     value.analytical_slots
                 }),
-            single_tenant_ceiling: calibrated
+            tenant_interactive_slots: calibrated
                 .as_ref()
-                .map_or(raw_slots.max(1), |value| value.single_tenant_ceiling),
-            multi_tenant_ceiling: calibrated
+                .map_or(default_split.total_units(), |value| {
+                    value.tenant_interactive_slots
+                }),
+            tenant_analytical_slots: calibrated
                 .as_ref()
-                .map_or((raw_slots / 2).max(1), |value| value.multi_tenant_ceiling),
+                .map_or(default_split.analytical_max_units, |value| {
+                    value.tenant_analytical_slots
+                }),
             queue_capacity: calibrated.as_ref().map_or(
                 u32::try_from(config.oracle.admission_waiters).map_err(|_| {
                     ServerBootError::OraclePeer("Oracle queue capacity exceeds u32".to_owned())
@@ -1723,7 +1734,14 @@ impl<'a> OracleRoleBuilder<'a> {
             max_workers_per_query: u32::try_from(config.oracle.max_workers_per_query)
                 .map_err(|_| ServerBootError::OraclePeer("worker fanout exceeds u32".to_owned()))?,
         };
-        let running_slots = usize::try_from(raw_slots).map_err(|_| {
+        // Publish the resolved split on the shared process root before any
+        // query or follower can charge it, so leader admission and follower
+        // acquisition enforce one local capacity rather than two derivations.
+        let split = resources.install_class_split(OracleClassSplit {
+            interactive_floor_units: oracle_config.interactive_slots,
+            analytical_max_units: oracle_config.analytical_slots,
+        });
+        let running_slots = usize::try_from(split.total_units()).map_err(|_| {
             ServerBootError::OraclePeer("Oracle slot count exceeds usize".to_owned())
         })?;
         let slots = Arc::new(OracleSlotManager::new(
@@ -1736,6 +1754,8 @@ impl<'a> OracleRoleBuilder<'a> {
         // from a saturation warning under load.
         tracing::info!(
             running_slots,
+            interactive_floor_units = split.interactive_floor_units,
+            analytical_max_units = split.analytical_max_units,
             configured = resource_plan.oracle_query_slot_limit.is_some(),
             admission_waiters = config.oracle.admission_waiters,
             effective_cpu = resource_plan.effective_cpu,

@@ -5130,7 +5130,7 @@ mod tests {
             )
             .expect("hot terminal stream");
         let mut stream =
-            crate::oracle::test_query_stream_from_physical(telemetry, &schema, batches, scan_stats);
+            crate::oracle::test_query_stream_from_physical(&schema, batches, scan_stats);
         let mut terminal_seen = false;
         while let Some(frame) = stream.frames.next().await {
             if matches!(frame, Ok(QueryStreamFrame::Terminal(_))) {
@@ -5207,9 +5207,8 @@ mod tests {
                 ),
             )
             .expect("pending hot stream");
-        let mut pending_stream = crate::oracle::test_query_stream_from_physical(
-            &telemetry, &schema, batches, scan_stats,
-        );
+        let mut pending_stream =
+            crate::oracle::test_query_stream_from_physical(&schema, batches, scan_stats);
         assert!(matches!(
             pending_stream.frames.next().await,
             Some(Ok(QueryStreamFrame::Schema(_)))

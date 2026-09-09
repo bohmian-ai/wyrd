@@ -502,7 +502,7 @@ async fn prepare_oracle_query_fixture(
                 base_url: srv.base_url().unwrap_or_default().to_owned(),
                 ..HttpConfig::default()
             },
-            api_key: Some(api_key.clone()),
+            credential: Some(api_key.clone()),
             ..ClientConfig::default()
         },
         bootstrap

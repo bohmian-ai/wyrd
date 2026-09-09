@@ -1,6 +1,6 @@
 ---
 id: SPEC-bifrost-canonical-otel-signals
-revision: 9
+revision: 10
 status: approved
 ---
 
@@ -60,8 +60,8 @@ behavior.
   tables.
 - Promote the minimum GenAI span scalars required for efficient typed search
   without copying large GenAI payloads.
-- Serve existing trace and GenAI query behavior from the canonical signal
-  tables.
+- Retire the typed observation read surface so that canonical SQL over the
+  signal tables is the only Bifrost read path.
 - Remove superseded table registrations, derived-table assumptions, mapping
   owners, tests, contracts, generated projections, and documentation.
 - Prove exact public ingest, durability, publication, and readback using the
@@ -74,6 +74,8 @@ behavior.
 - A physical `vala.genai.*` table or a second durable copy of a GenAI span,
   prompt, response, instruction, tool definition, event, or metric.
 - A physical `vala.traces.events` or `vala.traces.links` table.
+- A typed per-signal or per-table read route, rpc, SDK method, or MCP tool.
+  Canonical SQL is the only read contract.
 - Synthesizing GenAI metrics from spans or converting span events into log
   records, or log records into span events.
 - Promoting every current or future semantic-convention attribute into a
@@ -379,22 +381,21 @@ resource and scope schema URLs. Unknown or newer attributes remain losslessly
 stored but do not acquire promoted columns or change query classification until
 a later approved specification updates the pinned convention.
 
-#### REQ-017 — GenAI query source
+#### REQ-017 — One canonical read path
 
-The existing typed `QueryGenAi` surface shall read `vala.traces.spans` and
-return only spans whose promoted `gen_ai_operation_name` is exactly `chat`,
-`generate_content`, or `text_completion`. Embedding, retrieval, agent,
-workflow, planning, memory, fetch-response, and tool spans shall not appear in
-this generation result. Its existing conversation, model, and provider
-predicates shall use the corresponding promoted columns. Sensitive canonical
-attributes shall be projected only when an authorized response requires them.
-The query shall not depend on `vala.genai.*` or scan the canonical attributes
-payload merely to classify rows.
+Canonical SQL over the signal tables shall be the only Bifrost read contract.
+There shall be exactly one obvious way to read an observation, and it shall be
+the same way a caller reads any other Bifrost table.
 
-The public GenAI row contract shall replace scalar `prompt` and `completion`
-strings with optional payload-gated structured JSON values sourced from
-`gen_ai.input.messages` and `gen_ai.output.messages`. Their array order, object
-structure, scalar types, and nulls shall be preserved. The speculative
+Generation-only search shall remain expressible as a predicate on the promoted
+columns REQ-015 defines: `gen_ai_operation_name` in exactly `chat`,
+`generate_content`, or `text_completion` selects generation spans without
+scanning the canonical attributes payload. The promoted columns exist to make
+that predicate cheap; they do not justify a dedicated read surface.
+
+Structured GenAI content shall be read from the canonical attributes payload
+sourced from `gen_ai.input.messages` and `gen_ai.output.messages`, preserving
+array order, object structure, scalar types, and nulls. The speculative
 always-absent `cost_usd` field and its `genai.messages` documentation shall be
 removed; no cost field shall exist until a canonical emitted source and query
 requirement are separately approved.
@@ -433,6 +434,26 @@ reused unchanged; this change shall not introduce a replacement outcome type,
 response encoder, or second projection path. Scribe-owned semantic validators
 and parity copies shall be deleted only after the table-owned projector and
 existing public-route tests cover the same behavior.
+
+#### REQ-023 — Remove the typed observation read surface
+
+The current tree shall remove the typed observation read surface in full: the
+`GetTrace`, `QueryTraces`, `QueryRecentTraces`, `QueryGenAi`, `QueryEval`,
+`QueryDrift`, `QueryMetrics`, `QueryLogs`, and `QueryAgentTraces` HTTP routes
+and rpcs, their request and response types, their plan builders and filter
+helpers, their SDK and binding methods, their generated projections and stubs,
+their per-route configuration and body limits, and their documentation and
+route tests.
+
+Each of these is a hardcoded SELECT over one canonical table with a time
+window and a small fixed set of equality predicates, which the canonical query
+contract already serves. Trace-waterfall nesting is a presentation concern for
+whichever client wants it, not a stored shape or a server contract.
+
+Canonical Arrow write, `POST /v1/bifrost/query` and its `Query` rpc, table
+describe, query lifecycle controls, and the OTLP ingest routes are retained
+unchanged. No alias, compatibility route, replacement typed reader, or
+client-side reimplementation of a removed route shall be added.
 
 #### REQ-021 — Pre-release replacement
 
@@ -587,8 +608,8 @@ exercise:
 - OTLP HTTP protobuf and JSON for each exposed trace, log, and metric route;
 - canonical Arrow ingestion through the public Bifrost gRPC contract and the
   Rust, Python, and TypeScript SDK projections;
-- typed trace and GenAI reads through their HTTP and gRPC contracts and the
-  Rust, Python, and TypeScript SDK projections; and
+- canonical SQL reads of the signal tables through their HTTP and gRPC
+  contracts and the Rust, Python, and TypeScript SDK projections; and
 - affected agent-facing MCP reads and writes.
 
 One canonical expected dataset may be reused across these journeys. Each
@@ -627,9 +648,8 @@ through write and readback.
 
 The shared journeys shall prove that representative GenAI inference, embedding,
 agent, workflow, tool, event/log, and metric signals remain complete in their
-canonical signal tables; generation-only search uses promoted columns;
-protected structured content obeys authorization; and no `vala.genai.*`
-payload copy is written.
+canonical signal tables; generation-only search uses promoted columns through
+canonical SQL; and no `vala.genai.*` payload copy is written.
 
 #### AC-006 — Failure and OTLP partial-success behavior
 
@@ -737,6 +757,11 @@ choice.
 
 ## Revision history
 
+- Revision 10 (2026-09-09): retire the typed observation read surface in favor
+  of one canonical SQL read path, replacing REQ-017's typed `QueryGenAi`
+  requirement with the single-read-path rule and adding REQ-023 to remove the
+  nine typed routes, rpcs, types, SDK methods, projections, and docs. The
+  promoted GenAI columns are retained as SQL predicates.
 - Revision 9 (2026-09-07): bind optional OTLP Card and Run correlation to the
   exact record-level `wyrd.card_ref` and `wyrd.run_id` attributes, reuse the
   existing `CardRef` and `RunId` text grammars, retain last-entry lookup

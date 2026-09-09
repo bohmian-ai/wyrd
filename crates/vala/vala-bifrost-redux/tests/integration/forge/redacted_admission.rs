@@ -9,7 +9,7 @@ redacted
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use vala_bifrost_redux::forge::{ForgeClock, ForgeObjectStore};
+use vala_bifrost_redux::forge::{ForgeClock, ForgeLifecycleEvent, ForgeObjectStore};
 
 use super::rewrite_support::PromotedRewriteFixture;
 use super::support::{CountingObjectStore, PromotionCatalogSeam, SupervisedPromotion};
@@ -398,10 +398,11 @@ redacted
     supervisor.run_one_success().await;
 
     // Every plan lands and none of them is answered, so the attempt holds
-    // several operations it cannot account for. Its owner is stopped while they
-    // are still open, and a stopping owner settles none of them: it hands the
-    // Prepared authority on, which is what puts more open rows on this table
-    // than one page holds.
+    // several operations it cannot account for. Its owner is then dropped where
+    // it stands rather than asked to stop, because a stop lets a plan whose
+    // refusal is already definite settle its own operation on the way out. A
+    // killed owner writes nothing, which is what leaves more open rows on this
+    // table than one page holds.
     catalog.stall_next_commit_responses(8);
     supervisor.restart_worker();
     supervisor.schedule_only().await;
@@ -419,7 +420,7 @@ redacted
     })
     .await
     .expect("the stalled plans open more operations than one page holds");
-    supervisor.stop_worker().await;
+    supervisor.kill_worker();
     catalog.stall_next_commit_responses(0);
     assert!(
         supervisor.returned_errors().is_empty(),
@@ -454,6 +455,8 @@ redacted
         .set(settled_at)
         .expect("manual Forge clock advances");
     promoted.fixture.expire_claims().await;
+    // The killed owner released nothing, so its table fence lapses too.
+    promoted.fixture.expire_table_lease().await;
     supervisor.reclaim_expired_claims().await;
     promoted.fixture.clear_task_backoff().await;
     supervisor.restart_worker();
@@ -465,13 +468,16 @@ redacted
     // left the rest Prepared forever — cannot produce this state.
     await_operation_phase(&promoted.fixture, &captured, &["recovered", "reset"]).await;
     supervisor.shutdown().await;
+    // Stated over the captured identities, not over the table: the successor
+    // that took the table over keeps compacting it, and an operation it opened
+    // for its own new work is open because it is in flight, not because the
+    // walk missed it.
+    let settled = operation_phases(&promoted.fixture).await;
     assert!(
-        operation_phases(&promoted.fixture)
-            .await
-            .into_values()
-            .all(|phase| phase != "prepared"),
-        "the takeover leaves no open operation behind: {:?}",
-        operation_phases(&promoted.fixture).await
+        captured
+            .iter()
+            .all(|id| settled.get(id).is_some_and(|phase| phase != "prepared")),
+        "the takeover leaves no operation it inherited behind: {settled:?}"
     );
 }
 
@@ -1049,24 +1055,44 @@ async fn small_files_named(
         .count()
 }
 
+/// The durable tasks this supervisor's workers released unresolved.
+///
+/// A released attempt leaves its task Running with nobody publishing under it,
+/// so a count of what a worker owns must subtract them.
+fn released_tasks(supervisor: &SupervisedPromotion) -> BTreeSet<uuid::Uuid> {
+    supervisor
+        .observer()
+        .released_attempts_for_test()
+        .into_iter()
+        .collect()
+}
+
 /// Counts the tasks these tenants currently owe to a worker, across strategies.
 ///
 /// A pull turn's allowance is spent on tasks, not on tables or strategies, so
 /// the durable evidence of what one turn took is every row in a state only a
-/// claiming worker can hold.
+/// claiming worker can hold — minus the rows of released attempts, which stay
+/// Running with nobody publishing under them until their claim lease lapses and
+/// are therefore no longer part of what this worker owns.
 async fn owned_tasks(
     fixture: &super::support::PromotionIntegrationFixture,
     tenants: &[wyrd_spec::ids::DataTenantId],
-) -> usize {
-    let mut owned = 0;
+    supervisor: &SupervisedPromotion,
+) -> Vec<(uuid::Uuid, String, String, String)> {
+    let mut rows = Vec::new();
     for tenant in tenants {
-        owned += tasks_of(fixture, *tenant)
-            .await
-            .into_iter()
-            .filter(|(_, _, state, _)| matches!(state.as_str(), "claimed" | "running" | "prepared"))
-            .count();
+        rows.extend(tasks_of(fixture, *tenant).await);
     }
-    owned
+    // The release set is read after the rows, never before: a release frees the
+    // worker's parallelism for the next claim, so a set sampled first can miss
+    // the release whose successor the row snapshot already shows.
+    let released = released_tasks(supervisor);
+    rows.into_iter()
+        .filter(|(task_id, _, state, _)| {
+            matches!(state.as_str(), "claimed" | "running" | "prepared")
+                && !released.contains(task_id)
+        })
+        .collect()
 }
 
 /// Counts this tenant's successfully settled Scribe promotions.
@@ -1840,99 +1866,130 @@ redacted
     promoted.fixture.expire_claims_of(other_tenant).await;
     supervisor.reclaim_expired_claims().await;
     promoted.fixture.clear_task_backoff().await;
+    hold_out_earlier_phases(promoted, supervisor, own, other_tenant, &tenants).await;
+    let claims_before = claims_recorded(supervisor);
+    let ended_before = attempts_ended(supervisor);
+    supervisor.restart_worker();
+    supervisor.start_worker();
+    let mut window_claims = claims_before;
+    let mut window_ended = ended_before;
+    let mut saturated = false;
+    let mut still_ready = 0;
+    for _ in 0..60 {
+        let claims = claims_recorded(supervisor);
+        // Read after the claims, never before: an end sampled first can miss
+        // the release whose freed allowance the claim count already shows.
+        let ended = attempts_ended(supervisor);
+        assert!(
+            claims - window_claims <= 4,
+redacted
+            claims - window_claims
+        );
+        if claims - claims_before >= 4 && !saturated {
+            saturated = true;
+            still_ready = small_files_named(&promoted.fixture, own, "pull_bound", &["ready"]).await;
+        }
+        if ended > window_ended {
+            // An attempt gave its allowance back, so the next claims belong to
+            // a turn with room of its own and the bound is measured from here.
+            window_ended = ended;
+            window_claims = claims;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        saturated,
+        "the first pull turn claims its full allowance: {:?} / {:?}",
+        tasks_of(&promoted.fixture, own).await,
+        tasks_of(&promoted.fixture, other_tenant).await
+    );
+    assert!(
+        still_ready >= 1,
+        "the tasks the turn did not claim are still ready for the next one"
+    );
+
+    supervisor.stop_worker().await;
+    catalog.stall_next_commit_responses(0);
+}
+
+/// Holds every earlier phase's table out of the turn under test.
+///
+/// A row an earlier phase left behind that becomes claimable again spends an
+/// allowance this phase is counting, and once claimed it stands as owned across
+/// every later turn, because an attempt that learns nothing leaves its task
+/// Running until the claim lease lapses. Each is held out by name, and the
+/// precondition that nothing is owned when the turn starts is asserted here.
+///
+/// # Panics
+///
+/// Panics when a claim from an earlier phase is still held.
+async fn hold_out_earlier_phases(
+    promoted: &PromotedRewriteFixture,
+    supervisor: &SupervisedPromotion,
+    own: wyrd_spec::ids::DataTenantId,
+    other_tenant: wyrd_spec::ids::DataTenantId,
+    tenants: &[wyrd_spec::ids::DataTenantId],
+) {
     // The tables earlier phases used are not part of the turn under test, and a
     // row of theirs that becomes claimable again would spend an allowance this
-    // phase is counting. Each is held out by name.
-    for table in ["wide_fifo_c", "fifo_cancel_b"] {
-        if let Some((task_id, _)) =
-            newest_small_files_task(&promoted.fixture, other_tenant, table).await
+    // phase is counting — and, once claimed, would stand as owned across every
+    // later turn, because an attempt that learns nothing leaves its task
+    // Running until the claim lease lapses. Each is held out by name.
+    for (tenant, table) in [
+        (other_tenant, "wide_fifo_c"),
+        (other_tenant, "fifo_cancel_b"),
+        (own, "wide_fifo_a"),
+        (own, "wide_fifo_b"),
+    ] {
+        if let Some((task_id, _)) = newest_small_files_task(&promoted.fixture, tenant, table).await
         {
             promoted.fixture.offer_task(task_id, 3_600).await;
         }
     }
     assert_eq!(
-        owned_tasks(&promoted.fixture, &tenants).await,
+        owned_tasks(&promoted.fixture, tenants, supervisor)
+            .await
+            .len(),
         0,
         "no earlier claim is still held when the turn under test starts: {:?} / {:?}",
         tasks_of(&promoted.fixture, own).await,
         tasks_of(&promoted.fixture, other_tenant).await
     );
-    supervisor.restart_worker();
-    supervisor.start_worker();
-    let sample = first_turn_sample(promoted, &tenants).await;
-    let Ok((held, still_ready, rows)) = sample else {
-        let mine = tasks_of(&promoted.fixture, own).await;
-        let theirs = tasks_of(&promoted.fixture, other_tenant).await;
-        panic!("the first pull turn claims its full allowance: {mine:?} / {theirs:?}");
-    };
-    assert_eq!(
-        held, 4,
-redacted
-    );
-    assert!(
-        still_ready >= 1,
-        "the tasks the turn did not claim are still ready for the next one: {rows:?}"
-    );
-
-    // A task whose plans all settle frees its parallelism and lets the next turn
-    // spend it, so the bound is a ceiling on concurrent ownership rather than a
-    // total. Sampling it across the window is what proves no turn ever overran
-    // the allowance, not just the one sampled above.
-    for _ in 0..30 {
-        let held = owned_tasks(&promoted.fixture, &tenants).await;
-        assert!(
-            held <= 4,
-redacted
-            tasks_of(&promoted.fixture, own).await,
-            tasks_of(&promoted.fixture, other_tenant).await
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-    supervisor.stop_worker().await;
-    catalog.stall_next_commit_responses(0);
+    // What one turn claimed is read from the worker's own claim record, not
+    // from durable rows: an attempt that ends without learning its outcome
+    // frees its parallelism for the next turn while its task stays Running
+    // until the claim lease lapses, so standing rows outnumber what any turn
+    // took. Claims taken before the first attempt ends are exactly one turn's.
 }
 
-/// Samples one turn's ownership and its leftovers from a single snapshot.
+/// Counts the task claims this worker has recorded since it started.
 ///
-/// Reading both halves of the bound from one snapshot is what makes "no more
-/// than four" and "the rest stay claimable" describe the same turn rather than
-/// two moments a later turn could sit between.
+/// The claim record is written by the production pull immediately after the
+/// durable claim, which makes it the only account of what one turn took that a
+/// released attempt cannot inflate.
+fn claims_recorded(supervisor: &SupervisedPromotion) -> usize {
+    supervisor
+        .observer()
+        .lifecycle_events()
+        .into_iter()
+        .filter(|event| matches!(event, ForgeLifecycleEvent::Claimed { .. }))
+        .count()
+}
+
+/// Counts the attempts that have given their parallelism back, however they ended.
 ///
-/// Returns the number of tasks a worker owned, the number of `pull_bound`
-/// small-files tasks still ready beside them, and the rows both came from, or
-/// the elapsed error when no turn ever reached its full allowance.
-async fn first_turn_sample(
-    promoted: &PromotedRewriteFixture,
-    tenants: &[wyrd_spec::ids::DataTenantId],
-) -> Result<(usize, usize, Vec<(uuid::Uuid, String, String, String)>), tokio::time::error::Elapsed>
-{
-    tokio::time::timeout(ADMISSION_BOUND, async {
-        loop {
-            let mut rows = Vec::new();
-            for tenant in tenants {
-                rows.extend(tasks_of(&promoted.fixture, *tenant).await);
-            }
-            let held = rows
-                .iter()
-                .filter(|(_, _, state, _)| {
-                    matches!(state.as_str(), "claimed" | "running" | "prepared")
-                })
-                .count();
-            if held >= 4 {
-                let ready = rows
-                    .iter()
-                    .filter(|(_, strategy, state, table)| {
-                        strategy == "small_files"
-                            && state == "ready"
-                            && table.starts_with("pull_bound")
-                    })
-                    .count();
-                return (held, ready, rows);
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-    })
-    .await
+/// An attempt frees its allowance either by completing its durable terminal
+/// transition or by being released with an operation it cannot account for.
+/// Both are what lets a later turn claim again, so a pull-turn bound is only
+/// measurable while this count has not moved.
+fn attempts_ended(supervisor: &SupervisedPromotion) -> usize {
+    let observer = supervisor.observer();
+    observer
+        .lifecycle_events()
+        .into_iter()
+        .filter(|event| matches!(event, ForgeLifecycleEvent::Terminal { .. }))
+        .count()
+        + observer.released_attempts_for_test().len()
 }
 
 /// Reads the commit-submission count once the attempt's own plans stop adding.
@@ -2062,6 +2119,50 @@ async fn acceptance_unknown_recovers_from_durable_state() {
     );
     supervisor.run_one_success().await;
 
+    unresolved_commit_resets_once_absence_is_provable(
+        &promoted,
+        &catalog,
+        &mut supervisor,
+        &control,
+    )
+    .await;
+
+    landed_replacement_recovers_into_success(&promoted, &catalog, &mut supervisor).await;
+    known_success_leaves_its_ambiguous_sibling_open(&promoted, &catalog, &mut supervisor).await;
+    crash_recovery_reconciles_the_exact_operation(
+        &promoted,
+        &catalog,
+        &object_store,
+        &mut supervisor,
+        &control,
+    )
+    .await;
+    supervisor.shutdown().await;
+    assert_eq!(
+        promoted.fixture.live_leases().await,
+        0,
+        "every settled attempt released its table fence"
+    );
+}
+
+/// Proves a commit that never landed is Reset only once absence is provable.
+///
+/// The plan runs out of publication budget while its call is still in flight,
+/// so nothing landed and nothing can say so. The attempt is released, and the
+/// operation it opened is durable state nobody in this process owns: it stays
+/// Prepared until the claim lease lapses, a successor reads it, and the
+/// uncertainty bound has passed so absence is provable.
+///
+/// # Panics
+///
+/// Panics when the released attempt resubmits its operation, settles its task,
+/// changes an identity, or when the operation never reaches `reset`.
+async fn unresolved_commit_resets_once_absence_is_provable(
+    promoted: &PromotedRewriteFixture,
+    catalog: &Arc<PromotionCatalogSeam>,
+    supervisor: &mut SupervisedPromotion,
+    control: &vala_bifrost_redux::forge::ForgeClockControl,
+) {
     // 1. Nothing landed, and nobody can say so yet.
     catalog.park_next_commit();
     supervisor.restart_worker();
@@ -2094,7 +2195,7 @@ async fn acceptance_unknown_recovers_from_durable_state() {
     // The budget lapses, the plan returns with acceptance unknown, and the
     // attempt is released rather than settled: the task stays Running, and the
     // operation it opened is now durable state nobody in this process owns.
-    let submissions = await_settled_submissions(&catalog).await;
+    await_settled_submissions(catalog).await;
     assert_eq!(
         small_files_in_state(&promoted.fixture, &["claimed", "running"]).await,
         1,
@@ -2103,12 +2204,12 @@ async fn acceptance_unknown_recovers_from_durable_state() {
     );
 
     // Nothing changes over a window several reconciliation passes fall inside.
+    // The window is stated in this operation's own durable identity, not in the
+    // seam's commit count: the worker keeps taking other work, and a promotion
+    // of its own commits across the same seam. What proves nothing resubmitted
+    // *this* operation is that the exact ids are still there, still Prepared,
+    // with their task still Running.
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-    assert_eq!(
-        catalog.attempts(),
-        submissions,
-        "reconciliation asks about an operation; it never resubmits one"
-    );
     assert_eq!(
         small_files_in_state(&promoted.fixture, &["claimed", "running"]).await,
         1,
@@ -2136,30 +2237,27 @@ async fn acceptance_unknown_recovers_from_durable_state() {
                 + chrono::Duration::seconds(1),
         )
         .expect("manual Forge clock advances");
+    // The third leg of the durable trio: the released attempt renews nothing,
+    // so its claim lease lapses on its own. Aging it here is that lapse, and it
+    // is what lets a reconciliation owner read the operation at all.
+    promoted
+        .fixture
+        .expire_claims_of(promoted.fixture.tenant)
+        .await;
+    supervisor.reclaim_expired_claims().await;
+    promoted.fixture.clear_task_backoff().await;
     await_operation_phase(&promoted.fixture, &unresolved, &["reset"]).await;
     supervisor.stop_worker().await;
-    assert_eq!(
-        supervisor.returned_errors().len(),
-        1,
-        "the released attempt settles once, with the failure its own plan returned: {:?}",
+    // A release reports nothing, and the successor that recovered the operation
+    // was still working when this worker was stopped, so the stop's own error is
+    // the only one an attempt is allowed to have returned here.
+    assert!(
+        supervisor
+            .returned_errors()
+            .iter()
+            .all(|error| error.contains("shut down")),
+        "a released attempt reports no failure; its operation is settled from durable state: {:?}",
         supervisor.returned_errors()
-    );
-
-    landed_replacement_recovers_into_success(&promoted, &catalog, &mut supervisor).await;
-    known_success_leaves_its_ambiguous_sibling_open(&promoted, &catalog, &mut supervisor).await;
-    crash_recovery_reconciles_the_exact_operation(
-        &promoted,
-        &catalog,
-        &object_store,
-        &mut supervisor,
-        &control,
-    )
-    .await;
-    supervisor.shutdown().await;
-    assert_eq!(
-        promoted.fixture.live_leases().await,
-        0,
-        "every settled attempt released its table fence"
     );
 }
 
@@ -2167,9 +2265,10 @@ async fn acceptance_unknown_recovers_from_durable_state() {
 ///
 /// The seam hands the commit to a task the caller cannot cancel, so the
 /// replacement lands exactly as it would have while the publication budget ends
-/// the call with nothing learned. The retained attempt then proves its own
-/// operation live and settles Succeeded — and the first proof is enough, so a
-/// sibling that is still unresolved is left open for the table-wide owner
+/// the call with nothing learned. The attempt then releases the task, and the
+/// successor that reclaims the lapsed claim proves the operation live from
+/// retained evidence and settles it Succeeded — and the first proof is enough,
+/// so a sibling that is still unresolved is left open for the table-wide owner
 /// rather than failed or reset.
 ///
 /// # Panics
@@ -2183,11 +2282,41 @@ async fn landed_replacement_recovers_into_success(
 ) {
     // 2. The replacement landed and only the answer was lost.
     catalog.reject_next_commits(0);
+    // The previous shape's task was retired by the successor that recovered it,
+    // and nothing it planned ever committed, so the same small files are still
+    // there to compact. Re-offering that task is what gives this shape claimable
+    // work without sealing new objects, whose promotions would race the stalled
+    // seam armed below for the same commit.
+    promoted.fixture.reoffer_settled_small_files_task().await;
     promoted.fixture.clear_task_backoff().await;
     let landed_before = promoted.fixture.rewrite_operations().await.len();
     catalog.stall_next_commit_responses(8);
+    let released_before = supervisor.observer().released_attempts_for_test().len();
     supervisor.restart_worker();
     supervisor.start_worker();
+    // The attempt learns nothing and lets its task go. Only then is the durable
+    // trio complete: Running task, Prepared operation, and a claim lease nobody
+    // renews — which is what a successor recovers from, whether this owner
+    // stopped gracefully or was killed.
+    let released = tokio::time::timeout(ADMISSION_BOUND, async {
+        while supervisor.observer().released_attempts_for_test().len() == released_before {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    assert!(
+        released.is_ok(),
+        "the owner releases the attempt whose answer was lost: {:?} / {:?}",
+        tenant_tasks(&promoted.fixture).await,
+        promoted.fixture.rewrite_operations().await
+    );
+    catalog.stall_next_commit_responses(0);
+    promoted
+        .fixture
+        .expire_claims_of(promoted.fixture.tenant)
+        .await;
+    supervisor.reclaim_expired_claims().await;
+    promoted.fixture.clear_task_backoff().await;
     let recovered_to_success = tokio::time::timeout(ADMISSION_BOUND, async {
         while small_files_in_state(&promoted.fixture, &["succeeded"]).await == 0 {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -2201,7 +2330,6 @@ async fn landed_replacement_recovers_into_success(
         supervisor.returned_errors(),
         promoted.fixture.rewrite_operations().await
     );
-    catalog.stall_next_commit_responses(0);
     supervisor.stop_worker().await;
     let recovered = promoted
         .fixture
@@ -2393,8 +2521,8 @@ async fn release_one_unresolved_attempt(
 /// Panics when the killed owner settled, failed, retried, or reset its
 /// unresolved attempt, when it appended a terminal audit row for one of its own
 /// operations, when it changed an operation identity, when any object was
-/// deleted while an operation was still Prepared, or when it left a table fence
-/// held.
+/// deleted while an operation was still Prepared, or when the fence it left
+/// behind is not the one a killed process leaves.
 async fn crash_recovery_reconciles_the_exact_operation(
     promoted: &PromotedRewriteFixture,
     catalog: &Arc<PromotionCatalogSeam>,
@@ -2407,11 +2535,11 @@ async fn crash_recovery_reconciles_the_exact_operation(
         release_one_unresolved_attempt(promoted, catalog, supervisor).await;
     let unresolved_ids = unresolved.iter().copied().collect::<Vec<_>>();
 
-    // The process is replaced, not asked to stop. Whatever the worker had in
-    // memory about these operations is gone with it, so everything asserted
-    // below was read back out of Postgres — and read after the kill, so no
-    // assertion is racing a worker that is still running.
-    supervisor.restart_worker();
+    // The process is replaced, not asked to stop. The worker task is dropped
+    // where it stands, so no shutdown branch runs and whatever it had in memory
+    // about these operations is gone with it: everything asserted below was
+    // read back out of Postgres.
+    supervisor.kill_worker();
 
     assert_eq!(
         supervisor.returned_errors().len(),
@@ -2440,10 +2568,13 @@ async fn crash_recovery_reconciles_the_exact_operation(
             .all(|id| after.get(id).is_some_and(|phase| phase == "prepared")),
         "every unresolved operation is left exactly as it was: {after:?}"
     );
+    // A killed owner runs no shutdown branch, so the fence it held is still
+    // there. That is the point: the fence lapses on its own, exactly like the
+    // claim lease, and a successor waits it out rather than being handed it.
     assert_eq!(
         promoted.fixture.live_leases().await,
-        0,
-        "a released attempt still releases its table fence"
+        1,
+        "a killed owner leaves its table fence to lapse"
     );
     assert_eq!(
         object_store.deletes(),
@@ -2520,6 +2651,9 @@ async fn successor_reconciles_before_publishing(
         .expect("manual Forge clock advances");
     let promoted_before = promotions_succeeded(&promoted.fixture).await;
     promoted.fixture.expire_claims().await;
+    // The killed owner's fence is the third thing that has to lapse before a
+    // successor can take the table at all.
+    promoted.fixture.expire_table_lease().await;
     promoted.fixture.seal_more(4).await;
     promoted.fixture.clear_task_backoff().await;
     supervisor.restart_worker();

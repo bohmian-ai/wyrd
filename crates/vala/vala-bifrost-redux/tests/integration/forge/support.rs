@@ -2408,6 +2408,23 @@ impl SupervisedPromotion {
         self.join_worker().await;
     }
 
+    /// Drop one worker where it stands, without asking it to stop.
+    ///
+    /// The task is aborted rather than cancelled, so no shutdown branch runs:
+    /// no drain, no handoff, no final durable write. Whatever the worker held
+    /// in memory is gone with it, which is what a killed process leaves and the
+    /// only way a fixture can hand a successor the durable residue alone.
+    ///
+    /// # Panics
+    ///
+    /// Panics when no worker is running.
+    pub(crate) fn kill_worker(&mut self) {
+        self.worker_task
+            .take()
+            .expect("a killed worker is running")
+            .abort();
+    }
+
     /// Cancel and join a worker that is not sitting on the held-attempt barrier.
     ///
     /// Releasing an unheld barrier is not free: the release is a stored

@@ -445,3 +445,185 @@ def test_positive_audit_trail(wyrd_server: WyrdTestServer) -> None:
     # outbox by a background task, so converge the relay before counting.
     assert wyrd_server.wait_oracle_audit_relayed() == 0
     assert wyrd_server.bifrost_read_decision_count() > before
+
+
+# ---------------------------------------------------------------------------
+# Analytical read journeys — the shapes a data scientist actually writes
+# ---------------------------------------------------------------------------
+
+
+class Inference(BaseModel):
+    """One served inference: the fact table the analytical journeys aggregate."""
+
+    call_id: int
+    model: str
+    tokens: int
+    latency_ms: float
+    status: str
+
+
+class ModelInfo(BaseModel):
+    """Model dimension rows, joined against `Inference` by model name."""
+
+    model: str
+    vendor: str
+
+
+INFERENCES = [
+    Inference(call_id=1, model="opus", tokens=100, latency_ms=120.5, status="ok"),
+    Inference(call_id=2, model="opus", tokens=300, latency_ms=240.0, status="ok"),
+    Inference(call_id=3, model="opus", tokens=200, latency_ms=180.25, status="error"),
+    Inference(call_id=4, model="haiku", tokens=50, latency_ms=30.0, status="ok"),
+    Inference(call_id=5, model="haiku", tokens=150, latency_ms=60.75, status="ok"),
+]
+
+MODEL_INFO = [
+    ModelInfo(model="opus", vendor="anthropic"),
+    ModelInfo(model="haiku", vendor="anthropic"),
+]
+
+
+def _publish(server: WyrdTestServer, model: type[BaseModel], rows: list[BaseModel]) -> str:
+    """Register a fresh caller-owned table, write `rows`, and publish them.
+
+    Returns the table's fully qualified name, queryable by the harness key.
+    `vala.datasets` is the caller-owned namespace, so it is the one place a
+    user registers; the write is only readable after both the client drains
+    and the server-owned Scribe publishes.
+    """
+
+    fqn = f"vala.datasets.{model.__name__.lower()}_{uuid.uuid4().hex}"
+    bifrost = Bifrost(
+        TableConfig(model, fqn),
+        server_url=server.base_url,
+        credential=server.api_key,
+    )
+    assert bifrost.register() == "created"
+    for row in rows:
+        bifrost.insert(row, {"card_ref": CARD_REF})
+    bifrost.flush()
+    bifrost.shutdown()
+    server.flush_bifrost()
+    return fqn
+
+
+@pytest.mark.integration
+def test_read_back_as_arrow_pandas_and_polars(wyrd_server: WyrdTestServer) -> None:
+    """One written table, read back through all three dataframe conversions.
+
+    The batches cross the boundary once as an Arrow IPC stream, so the three
+    conversions must agree on rows, column order, and values — a divergence
+    here means a conversion, not the query, lost data.
+    """
+
+    fqn = _publish(wyrd_server, Inference, list(INFERENCES))
+    bifrost = Bifrost(server_url=wyrd_server.base_url, credential=wyrd_server.api_key)
+    result = bifrost.sql(
+        f"SELECT call_id, model, tokens, latency_ms, status FROM {fqn} ORDER BY call_id"
+    )
+
+    arrow = result.to_arrow()
+    assert arrow.num_rows == len(INFERENCES)
+    assert arrow.column_names == ["call_id", "model", "tokens", "latency_ms", "status"]
+    assert arrow.column("call_id").to_pylist() == [row.call_id for row in INFERENCES]
+    assert arrow.column("latency_ms").to_pylist() == [row.latency_ms for row in INFERENCES]
+
+    pandas_frame = result.to_pandas()
+    assert list(pandas_frame.columns) == arrow.column_names
+    assert pandas_frame["call_id"].tolist() == [row.call_id for row in INFERENCES]
+    assert pandas_frame["model"].tolist() == [row.model for row in INFERENCES]
+
+    polars_frame = result.to_polars()
+    assert polars_frame.columns == arrow.column_names
+    assert polars_frame.height == arrow.num_rows
+    assert polars_frame.to_dicts() == pandas_frame.to_dict(orient="records")
+
+
+@pytest.mark.integration
+def test_analytical_sql_over_written_tables(wyrd_server: WyrdTestServer) -> None:
+    """Group-by, window, join, and scalar SQL over caller-registered tables.
+
+    Representative rather than exhaustive: one query per DataFusion family a
+    data scientist reaches for, each asserted on values rather than shape so a
+    silently wrong plan fails.
+    """
+
+    facts = _publish(wyrd_server, Inference, list(INFERENCES))
+    dims = _publish(wyrd_server, ModelInfo, list(MODEL_INFO))
+    bifrost = Bifrost(server_url=wyrd_server.base_url, credential=wyrd_server.api_key)
+
+    # Aggregates with a HAVING filter: the per-group summary table.
+    grouped = bifrost.sql(
+        f"""
+        SELECT model,
+               COUNT(*) AS runs,
+               SUM(tokens) AS total_tokens,
+               AVG(tokens) AS avg_tokens,
+               MIN(latency_ms) AS fastest,
+               MAX(latency_ms) AS slowest
+        FROM {facts}
+        GROUP BY model
+        HAVING COUNT(*) > 1
+        ORDER BY total_tokens DESC
+        """
+    ).to_arrow()
+    assert grouped.column("model").to_pylist() == ["opus", "haiku"]
+    assert grouped.column("runs").to_pylist() == [3, 2]
+    assert grouped.column("total_tokens").to_pylist() == [600, 200]
+    assert grouped.column("avg_tokens").to_pylist() == [200.0, 100.0]
+    assert grouped.column("fastest").to_pylist() == [120.5, 30.0]
+    assert grouped.column("slowest").to_pylist() == [240.0, 60.75]
+
+    # Window functions: rank within a partition, a running total, and a lag.
+    windowed = bifrost.sql(
+        f"""
+        SELECT call_id,
+               model,
+               ROW_NUMBER() OVER (PARTITION BY model ORDER BY tokens DESC) AS rank_in_model,
+               SUM(tokens) OVER (PARTITION BY model ORDER BY call_id) AS running_tokens,
+               LAG(tokens) OVER (PARTITION BY model ORDER BY call_id) AS prev_tokens
+        FROM {facts}
+        ORDER BY call_id
+        """
+    ).to_arrow()
+    assert windowed.column("rank_in_model").to_pylist() == [3, 1, 2, 2, 1]
+    assert windowed.column("running_tokens").to_pylist() == [100, 400, 600, 50, 200]
+    assert windowed.column("prev_tokens").to_pylist() == [None, 100, 300, None, 50]
+
+    # Join to the dimension table, with a filtering aggregate over the fact side.
+    joined = bifrost.sql(
+        f"""
+        SELECT d.vendor,
+               f.model,
+               COUNT(*) FILTER (WHERE f.status = 'ok') AS successes,
+               COUNT(*) AS attempts
+        FROM {facts} AS f
+        INNER JOIN {dims} AS d ON f.model = d.model
+        GROUP BY d.vendor, f.model
+        ORDER BY f.model
+        """
+    ).to_arrow()
+    assert joined.column("vendor").to_pylist() == ["anthropic", "anthropic"]
+    assert joined.column("model").to_pylist() == ["haiku", "opus"]
+    assert joined.column("successes").to_pylist() == [2, 2]
+    assert joined.column("attempts").to_pylist() == [2, 3]
+
+    # Scalar expressions over a CTE: the reshaping step before a chart.
+    scalars = bifrost.sql(
+        f"""
+        WITH labelled AS (
+            SELECT call_id,
+                   UPPER(model) AS model_label,
+                   ROUND(latency_ms) AS latency_whole,
+                   CASE WHEN latency_ms > 100 THEN 'slow' ELSE 'fast' END AS bucket,
+                   CHARACTER_LENGTH(status) AS status_len
+            FROM {facts}
+        )
+        SELECT * FROM labelled ORDER BY call_id LIMIT 3
+        """
+    ).to_arrow()
+    assert scalars.num_rows == 3
+    assert scalars.column("model_label").to_pylist() == ["OPUS", "OPUS", "OPUS"]
+    assert scalars.column("latency_whole").to_pylist() == [121.0, 240.0, 180.0]
+    assert scalars.column("bucket").to_pylist() == ["slow", "slow", "slow"]
+    assert scalars.column("status_len").to_pylist() == [2, 2, 5]

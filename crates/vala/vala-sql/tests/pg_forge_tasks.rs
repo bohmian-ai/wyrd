@@ -3790,6 +3790,85 @@ mod pg_tests {
         })
     }
 
+    /// Unattended work is exactly this owner's pre-terminal rows minus its own.
+    ///
+    /// A running worker's live attempts are ordinary in-flight work, and only
+    /// the caller knows which those are, so the exclusion list is what
+    /// separates them from the residue of an attempt it released without being
+    /// able to account for. Both edges matter: an empty list must ask the
+    /// broader question a caller holding no attempts needs, and a listed task
+    /// must not keep its own owner unready forever.
+    ///
+    /// # Panics
+    /// Panics when PostgreSQL setup or any state assertion fails.
+    #[tokio::test]
+    async fn unattended_work_excludes_the_attempts_its_caller_still_holds() {
+        let (fixture, admin) = setup().await;
+        let tasks = ForgeTasks::new(fixture.operator_pool().clone());
+        let tenant = fixture.data_tenant_id();
+        let owner = Uuid::now_v7();
+        let foreign = Uuid::now_v7();
+
+        assert!(
+            !tasks
+                .has_unattended_work(owner, &[])
+                .await
+                .expect("empty predicate"),
+            "an empty queue leaves nothing unattended"
+        );
+
+        let attended = tasks
+            .enqueue(&task(tenant, "attended", 21))
+            .await
+            .expect("enqueue attended task");
+        force_claim_state(&admin, attended, "running", owner, false).await;
+        assert!(
+            tasks
+                .has_unattended_work(owner, &[])
+                .await
+                .expect("unlisted predicate"),
+            "a caller holding no attempts still owns every pre-terminal row it claimed"
+        );
+        assert!(
+            !tasks
+                .has_unattended_work(owner, &[attended])
+                .await
+                .expect("listed predicate"),
+            "an attempt its caller is still executing is not residue"
+        );
+
+        // The released residue: the same owner, a second pre-terminal row, and
+        // nothing in the caller's hands that accounts for it.
+        let released = tasks
+            .enqueue(&task(tenant, "released", 22))
+            .await
+            .expect("enqueue released task");
+        force_claim_state(&admin, released, "running", owner, false).await;
+        assert!(
+            tasks
+                .has_unattended_work(owner, &[attended])
+                .await
+                .expect("residue predicate"),
+            "a pre-terminal row this owner is not executing keeps it unready"
+        );
+
+        // Another worker's live claim is that worker's problem, never this
+        // one's: gating on it would stop a healthy owner indefinitely.
+        clear_tasks(&admin).await;
+        let elsewhere = tasks
+            .enqueue(&task(tenant, "foreign", 23))
+            .await
+            .expect("enqueue foreign task");
+        force_claim_state(&admin, elsewhere, "running", foreign, true).await;
+        assert!(
+            !tasks
+                .has_unattended_work(owner, &[])
+                .await
+                .expect("foreign predicate"),
+            "an attempt another owner holds is not this owner's unattended work"
+        );
+    }
+
     /// Recovery covers exactly the durable residue a new owner must resolve.
     ///
     /// Worker readiness is gated on this predicate, so both halves of it must

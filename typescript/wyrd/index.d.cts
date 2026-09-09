@@ -144,29 +144,6 @@ export declare class NativeBifrost {
    * Wyrd control failures are returned in [`NativeLifecycleResult`].
    */
   describeTable(namespace: string, name: string): Promise<NativeLifecycleResult>
-  /**
-   * Reads one complete authorized cut of a single trace.
-   *
-   * Trace detail has no continuation token: `since` and `until` bound the
-   * scanned window only, and each span carries its own events and links.
-   *
-   * # Errors
-   *
-   * Returns a napi error only when the native result cannot be projected;
-   * window, authorization, and transport failures are returned in
-   * [`NativeLifecycleResult`].
-   */
-  getTrace(traceId: string, since?: string | undefined | null, until?: string | undefined | null): Promise<NativeLifecycleResult>
-  /**
-   * Reads one page of `GenAI` generation records.
-   *
-   * # Errors
-   *
-   * Returns a napi error only when the native result cannot be projected;
-   * window, authorization, and transport failures are returned in
-   * [`NativeLifecycleResult`].
-   */
-  queryGenai(request: NativeGenAiRequest): Promise<NativeLifecycleResult>
 }
 
 /** Native query stream that retains Rust terminal validation and emits raw IPC. */
@@ -233,29 +210,6 @@ export declare function connectBifrost(table?: NativeTableConfig | undefined | n
  * or cannot describe the table.
  */
 export declare function describeTableConfig(table: string, serverUrl?: string | undefined | null, credential?: string | undefined | null, grpcUrl?: string | undefined | null): Promise<NativeTableConfig>
-
-/**
- * `GenAI` filter request as JavaScript sends it.
- *
- * Window bounds arrive as RFC 3339 text because napi has no native chrono
- * projection; every field is optional so an unfiltered page is the default.
- */
-export interface NativeGenAiRequest {
-  /** Inclusive lower bound on event time, RFC 3339. */
-  since?: string
-  /** Exclusive upper bound on event time, RFC 3339. */
-  until?: string
-  /** Requested page size. */
-  limit?: number
-  /** Continuation token from a prior page. */
-  pageToken?: string
-  /** Conversation-id filter. */
-  conversationId?: string
-  /** Model-name filter. */
-  model?: string
-  /** Provider filter. */
-  provider?: string
-}
 
 /** Structured native result for one live-query lifecycle control. */
 export interface NativeLifecycleResult {

@@ -5,9 +5,7 @@ import {
   BifrostQueryStream,
   IncompleteQueryStreamError,
   WyrdError,
-  type GenAiPage,
   type TableDescription,
-  type TraceDetail,
 } from "@wyrd/sdk";
 
 const REQUEST_ID = "01890f28-7c4a-7cc3-98e7-4f4a3c2d1bff";
@@ -187,55 +185,8 @@ describe("bifrost public typing", () => {
     const item = typeof nested === "string" || !("List" in nested) ? undefined : nested.List;
     const struct = item === undefined || typeof item.data_type === "string" ? undefined : item.data_type;
 
-    const detail: TraceDetail = {
-      trace: {
-        trace_id: "0102",
-        spans: [
-          {
-            span_id: "aabb",
-            trace_state: "",
-            flags: 1,
-            name: "chat",
-            kind: 3,
-            start_time_unix_nano: 1,
-            end_time_unix_nano: 2,
-            duration_nano: 1,
-            dropped_attributes_count: 0,
-            events: [
-              { time_unix_nano: 1, name: "retry", attributes: { attempt: 1 }, dropped_attributes_count: 0 },
-            ],
-            dropped_events_count: 0,
-            links: [
-              {
-                linked_trace_id: "0304",
-                linked_span_id: "ccdd",
-                trace_state: "",
-                flags: 0,
-                dropped_attributes_count: 0,
-              },
-            ],
-            dropped_links_count: 0,
-            resource_dropped_attributes_count: 0,
-            resource_schema_url: "",
-            scope_name: "wyrd",
-            scope_version: "1",
-            scope_dropped_attributes_count: 0,
-            scope_schema_url: "",
-          },
-        ],
-      },
-    };
-    const page: GenAiPage = {
-      rows: [{ start_time_unix_nano: 1, model: "claude", input_messages: [{ role: "user" }] }],
-      next_page_token: "cursor",
-    };
-
     expect(struct !== undefined && "Struct" in struct ? struct.Struct[0].name : undefined).toBe("inner");
     expect(description.physical_layout.sort_keys[0].column).toBe("trace_id");
     expect(description.canonical_physical_fingerprint).toBe("canonical-fp");
-    expect(detail.trace.spans[0].events?.[0].name).toBe("retry");
-    expect(detail.trace.spans[0].links?.[0].linked_span_id).toBe("ccdd");
-    expect(page.rows[0].model).toBe("claude");
-    expect(page.next_page_token).toBe("cursor");
   });
 });

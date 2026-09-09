@@ -1,7 +1,6 @@
 # AUTO-GENERATED STUB FILE. DO NOT EDIT.
 # pylint: disable=redefined-builtin, invalid-name, dangerous-default-value
 from collections.abc import AsyncIterator, Iterator
-from datetime import datetime
 from typing import Any, TypedDict
 
 import pyarrow
@@ -96,114 +95,6 @@ class TableDescription(_TableDescriptionOptional):
     correlation_fields: list[FieldSpec]
     managed_candidates: list[FieldSpec]
     physical_layout: PhysicalLayout
-
-class _SpanEventOptional(TypedDict, total=False):
-    """The event payload omitted without `bifrost_trace_payload:read`."""
-
-    attributes: Any
-
-class SpanEvent(_SpanEventOptional):
-    """One event nested on its owning span, in producer order."""
-
-    time_unix_nano: int
-    name: str
-    dropped_attributes_count: int
-
-class _SpanLinkOptional(TypedDict, total=False):
-    """The link payload omitted without `bifrost_trace_payload:read`."""
-
-    attributes: Any
-
-class SpanLink(_SpanLinkOptional):
-    """One link nested on its owning span, in producer order."""
-
-    linked_trace_id: str
-    linked_span_id: str
-    trace_state: str
-    flags: int
-    dropped_attributes_count: int
-
-class _SpanOptional(TypedDict, total=False):
-    """The span keys the server omits.
-
-    Each is either genuinely absent on the record or payload-gated: without
-    `bifrost_trace_payload:read` the server omits it from the wire rather than
-    returning it empty.
-    """
-
-    parent_span_id: str
-    status_code: int
-    status_message: str
-    attributes: Any
-    events: list[SpanEvent]
-    links: list[SpanLink]
-    service_name: str
-    resource_attributes: Any
-    scope_attributes: Any
-
-class Span(_SpanOptional):
-    """One complete span, carrying its own events and links."""
-
-    span_id: str
-    trace_state: str
-    flags: int
-    name: str
-    kind: int
-    start_time_unix_nano: int
-    end_time_unix_nano: int
-    duration_nano: int
-    dropped_attributes_count: int
-    dropped_events_count: int
-    dropped_links_count: int
-    resource_dropped_attributes_count: int
-    resource_schema_url: str
-    scope_name: str
-    scope_version: str
-    scope_dropped_attributes_count: int
-    scope_schema_url: str
-
-class TraceWaterfall(TypedDict):
-    """Every authorized span of one trace, flat, each carrying its own events and links."""
-
-    trace_id: str
-    spans: list[Span]
-
-class TraceDetail(TypedDict):
-    """One complete authorized cut of a trace, as returned by `get_trace`."""
-
-    trace: TraceWaterfall
-
-class _GenAiRowOptional(TypedDict, total=False):
-    """The generation keys the server omits.
-
-    Each promoted scalar is absent when its source attribute was; the two
-    message payloads are additionally gated on `bifrost_genai_payload:read`.
-    They stay `Any` because a message list is producer-defined JSON, not a
-    fixed wire shape.
-    """
-
-    conversation_id: str
-    model: str
-    provider: str
-    input_tokens: int
-    output_tokens: int
-    input_messages: Any
-    output_messages: Any
-
-class GenAiRow(_GenAiRowOptional):
-    """One GenAI generation read from the canonical span table."""
-
-    start_time_unix_nano: int
-
-class _GenAiPageOptional(TypedDict, total=False):
-    """The continuation token, absent on the last page."""
-
-    next_page_token: str
-
-class GenAiPage(_GenAiPageOptional):
-    """One page of GenAI generation records."""
-
-    rows: list[GenAiRow]
 
 class RunningQueryProgress(TypedDict):
     """Participant progress for one live Oracle query."""
@@ -386,14 +277,6 @@ class Bifrost(_BifrostBase):
     def status(self, request_id: str) -> RunningQuery: ...
     def cancel(self, request_id: str) -> CancelRunningQueryResult: ...
     def describe_table(self, namespace: str, name: str) -> TableDescription: ...
-    def get_trace(
-        self,
-        trace_id: str,
-        *,
-        since: datetime | None = None,
-        until: datetime | None = None,
-    ) -> TraceDetail: ...
-    def query_genai(self, **filters: Any) -> GenAiPage: ...
 
 class AsyncBifrost(_BifrostBase):
     """The ``await`` surface over the same native client."""
@@ -415,14 +298,6 @@ class AsyncBifrost(_BifrostBase):
     async def status(self, request_id: str) -> RunningQuery: ...
     async def cancel(self, request_id: str) -> CancelRunningQueryResult: ...
     async def describe_table(self, namespace: str, name: str) -> TableDescription: ...
-    async def get_trace(
-        self,
-        trace_id: str,
-        *,
-        since: datetime | None = None,
-        until: datetime | None = None,
-    ) -> TraceDetail: ...
-    async def query_genai(self, **filters: Any) -> GenAiPage: ...
 
 __all__ = [
     "AsyncBifrost",
@@ -435,8 +310,6 @@ __all__ = [
     "DataTypeSpec",
     "DataTypeSpecVariants",
     "FieldSpec",
-    "GenAiPage",
-    "GenAiRow",
     "IncompleteQueryStreamError",
     "NoCredentialsError",
     "PhysicalLayout",
@@ -445,12 +318,7 @@ __all__ = [
     "RunningQuery",
     "RunningQueryProgress",
     "SortKey",
-    "Span",
-    "SpanEvent",
-    "SpanLink",
     "TableConfig",
     "TableDescription",
     "TableEntry",
-    "TraceDetail",
-    "TraceWaterfall",
 ]

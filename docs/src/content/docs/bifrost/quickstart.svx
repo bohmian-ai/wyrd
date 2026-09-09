@@ -34,48 +34,34 @@ with vala.observe.trace(ctx, name="inference", service="my-service") as span:
 
 The trace is buffered locally and flushed as an Arrow IPC batch through Gate to a Scribe. Scribe appends to its WAL, fsyncs, and acks (~1-5ms). The row becomes queryable after the next seal to Parquet (~1-5s typical).
 
-## 2. Query it back (HTTP)
+## 2. Query it back (SQL)
 
-A Python SDK client (`ValaQueryClient`) is planned. Use the HTTP API until it ships.
+Canonical SQL over the signal tables is the only read path. `POST /v1/bifrost/query` streams Arrow batches; the SDKs wrap it as `sql` (collect) and `stream` (iterate).
 
-```bash
-curl -X POST https://your-wyrd-server/v1/traces/recent/query \
-  -H "x-wyrd-access-token: Bearer $TOKEN" \
-  -H "content-type: application/json" \
-  -d '{
-    "since": "2026-07-01T00:00:00Z",
-    "service": "my-service",
-    "limit": 50
-  }'
+```python
+result = await bifrost.sql(
+    "SELECT trace_id, name, duration_nano "
+    "FROM vala.traces.spans "
+    "WHERE service_name = 'my-service' "
+    "ORDER BY start_time_unix_nano DESC LIMIT 50"
+)
 ```
 
-Response:
+A whole trace is the same query narrowed to one id — each span row carries its own nested `events` and `links`:
 
-```json
-{
-  "rows": [
-    {
-      "trace_id": "b7f3c1e2a4d5...",
-      "root_name": "inference",
-      "service": "my-service",
-      "started_at": "2026-07-08T12:00:00Z",
-      "duration_ms": 142.5,
-      "span_count": 3,
-      "error": false
-    }
-  ],
-  "next_page_token": null
-}
+```sql
+SELECT * FROM vala.traces.spans WHERE trace_id = 'b7f3c1e2a4d5…'
 ```
 
-## 3. Fetch a full trace waterfall (HTTP)
+GenAI generations are spans, filtered on the promoted columns:
 
-```bash
-curl https://your-wyrd-server/v1/traces/b7f3c1e2a4d5... \
-  -H "x-wyrd-access-token: Bearer $TOKEN"
+```sql
+SELECT gen_ai_request_model, gen_ai_usage_input_tokens, gen_ai_usage_output_tokens
+FROM vala.traces.spans
+WHERE gen_ai_operation_name IN ('chat', 'generate_content', 'text_completion')
 ```
 
-Response includes `spans`, `events`, and `links` nested under `trace`. Note: `events` and `links` are always empty today; event and link extraction is planned.
+Use `bifrost.describe("vala.traces.spans")` for the exact column list.
 
 ## What happens inside
 
@@ -83,6 +69,6 @@ Response includes `spans`, `events`, and `links` nested under `trace`. Note: `ev
 2. **Gate** authenticates, resolves `DataTenantId` + `TableRef` for `vala.traces.spans`, validates the schema fingerprint, stamps `data_tenant_id` and `wyrd_event_time` and `wyrd_batch_id`, and dispatches to any Scribe.
 3. **Scribe** appends the batch to its WAL, fsyncs, acks. The rows accumulate in a memtable keyed by `(data_tenant_id, vala.traces.spans, event_day)` until a seal trigger fires (50k rows, 1s, 128 MiB, or 5s inactivity).
 4. **Scribe** seals: freeze memtable, encode Parquet, PUT to object store, atomic Postgres tx to insert into `vala.file_list` and append audit rows. The row is now visible to Oracle.
-5. `QueryRecentTraces` routes through Gate to Oracle. Oracle builds a DataFusion `LogicalPlan` against `vala.traces.spans`. The `TenantPredicateRule` analyzer injects `data_tenant_id = $tenant` before execution. The route handler runs an in-Rust GROUP-BY over the collected spans to derive `TraceSummaryRow` values.
+5. The SQL query routes through Gate to Oracle. Oracle plans it with DataFusion against `vala.traces.spans`, and the `TenantPredicateRule` analyzer injects `data_tenant_id = $tenant` before execution.
 6. **Forge** runs asynchronously after ingest. It bin-packs small Parquet files from `vala.file_list`, commits an Iceberg snapshot, expires old snapshots, and removes unreferenced objects. Nothing in the read path changes.
-7. The response is paginated at `MAX_QUERY_PAGE_SIZE = 1000` rows. A `next_page_token` is returned when more rows exist; pass it back in `page_token` on the next request.
+7. Results stream back as Arrow batches closed by a validated terminal frame. `sql` collects them; `stream` yields each batch as it arrives.

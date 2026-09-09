@@ -9,7 +9,6 @@ import { createRequire } from "node:module";
 
 import type {
   NativeBifrostQueryStream,
-  NativeGenAiRequest,
   NativeLifecycleResult,
   NativeQueryRequest,
   NativeQueryStep,
@@ -99,109 +98,6 @@ export interface TableDescription {
   readonly managed_candidates: readonly FieldDescription[];
   readonly canonical_physical_fingerprint?: string;
   readonly physical_layout: PhysicalLayout;
-}
-
-/**
- * One event nested on its owning span, in producer order.
- *
- * `attributes` is producer-defined JSON, and the server omits it entirely
- * without `bifrost_trace_payload:read`.
- */
-export interface SpanEvent {
-  readonly time_unix_nano: number;
-  readonly name: string;
-  readonly attributes?: unknown;
-  readonly dropped_attributes_count: number;
-}
-
-/** One link nested on its owning span, in producer order. */
-export interface SpanLink {
-  readonly linked_trace_id: string;
-  readonly linked_span_id: string;
-  readonly trace_state: string;
-  readonly flags: number;
-  readonly attributes?: unknown;
-  readonly dropped_attributes_count: number;
-}
-
-/**
- * One complete span, carrying its own events and links.
- *
- * Every optional member is either genuinely absent on the record or
- * payload-gated: without `bifrost_trace_payload:read` the server omits it from
- * the wire rather than returning it empty.
- */
-export interface Span {
-  readonly span_id: string;
-  readonly parent_span_id?: string;
-  readonly trace_state: string;
-  readonly flags: number;
-  readonly name: string;
-  readonly kind: number;
-  readonly start_time_unix_nano: number;
-  readonly end_time_unix_nano: number;
-  readonly duration_nano: number;
-  readonly status_code?: number;
-  readonly status_message?: string;
-  readonly attributes?: unknown;
-  readonly dropped_attributes_count: number;
-  readonly events?: readonly SpanEvent[];
-  readonly dropped_events_count: number;
-  readonly links?: readonly SpanLink[];
-  readonly dropped_links_count: number;
-  readonly service_name?: string;
-  readonly resource_attributes?: unknown;
-  readonly resource_dropped_attributes_count: number;
-  readonly resource_schema_url: string;
-  readonly scope_name: string;
-  readonly scope_version: string;
-  readonly scope_attributes?: unknown;
-  readonly scope_dropped_attributes_count: number;
-  readonly scope_schema_url: string;
-}
-
-/** One complete authorized cut of a trace, as returned by `getTrace`. */
-export interface TraceDetail {
-  readonly trace: {
-    readonly trace_id: string;
-    readonly spans: readonly Span[];
-  };
-}
-
-/**
- * One GenAI generation read from the canonical span table.
- *
- * Each promoted scalar is absent when its source attribute was; the two message
- * payloads are additionally gated on `bifrost_genai_payload:read`. They stay
- * `unknown` because a message list is producer-defined JSON, not a fixed wire
- * shape.
- */
-export interface GenAiRow {
-  readonly conversation_id?: string;
-  readonly model?: string;
-  readonly provider?: string;
-  readonly start_time_unix_nano: number;
-  readonly input_tokens?: number;
-  readonly output_tokens?: number;
-  readonly input_messages?: unknown;
-  readonly output_messages?: unknown;
-}
-
-/** One page of GenAI generation records. */
-export interface GenAiPage {
-  readonly rows: readonly GenAiRow[];
-  readonly next_page_token?: string;
-}
-
-/** Filters for one page of GenAI generation records. */
-export interface GenAiQuery {
-  readonly since?: string;
-  readonly until?: string;
-  readonly limit?: number;
-  readonly pageToken?: string;
-  readonly conversationId?: string;
-  readonly model?: string;
-  readonly provider?: string;
 }
 
 export interface RunningQueryProgress {
@@ -843,33 +739,5 @@ export class Bifrost {
       await this.#native.describeTable(namespace, name),
     );
   }
-
-  /**
-   * Read one complete authorized cut of a single trace.
-   *
-   * Trace detail has no continuation token: the bounds narrow the scanned
-   * window only, and each span carries its own events and links.
-   */
-  async getTrace(
-    traceId: string,
-    bounds: { readonly since?: string; readonly until?: string } = {},
-  ): Promise<TraceDetail> {
-    return lifecycleValue<TraceDetail>(
-      await this.#native.getTrace(traceId, bounds.since, bounds.until),
-    );
-  }
-
-  /** Read one page of GenAI generation records. */
-  async queryGenAi(query: GenAiQuery = {}): Promise<GenAiPage> {
-    const request: NativeGenAiRequest = {
-      since: query.since,
-      until: query.until,
-      limit: query.limit,
-      pageToken: query.pageToken,
-      conversationId: query.conversationId,
-      model: query.model,
-      provider: query.provider,
-    };
-    return lifecycleValue<GenAiPage>(await this.#native.queryGenai(request));
-  }
 }
+

@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator, Iterator
-from datetime import datetime
 from typing import Any, TypedDict, cast
 
 import pyarrow
@@ -512,29 +511,6 @@ class Bifrost(_BifrostBase):
 
         return cast("TableDescription", self._native.describe_table(namespace, name))
 
-    def get_trace(
-        self,
-        trace_id: str,
-        *,
-        since: datetime | None = None,
-        until: datetime | None = None,
-    ) -> TraceDetail:
-        """Read one complete authorized cut of a single trace."""
-
-        return cast(
-            "TraceDetail",
-            self._native.get_trace(
-                trace_id,
-                since.isoformat() if since is not None else None,
-                until.isoformat() if until is not None else None,
-            ),
-        )
-
-    def query_genai(self, **filters: Any) -> GenAiPage:
-        """Read one page of GenAI generation records."""
-
-        return cast("GenAiPage", self._native.query_genai(_genai_request(filters)))
-
 
 class AsyncBifrost(_BifrostBase):
     """The ``await`` surface over the same native client.
@@ -613,48 +589,6 @@ class AsyncBifrost(_BifrostBase):
             "TableDescription",
             await asyncio.to_thread(self._native.describe_table, namespace, name),
         )
-
-    async def get_trace(
-        self,
-        trace_id: str,
-        *,
-        since: datetime | None = None,
-        until: datetime | None = None,
-    ) -> TraceDetail:
-        """Read one complete authorized cut of a single trace."""
-
-        return cast(
-            "TraceDetail",
-            await asyncio.to_thread(
-                self._native.get_trace,
-                trace_id,
-                since.isoformat() if since is not None else None,
-                until.isoformat() if until is not None else None,
-            ),
-        )
-
-    async def query_genai(self, **filters: Any) -> GenAiPage:
-        """Read one page of GenAI generation records."""
-
-        return cast(
-            "GenAiPage",
-            await asyncio.to_thread(self._native.query_genai, _genai_request(filters)),
-        )
-
-
-def _genai_request(filters: dict[str, Any]) -> str:
-    """Serialize the GenAI page filters, dropping the ones left unset.
-
-    Datetimes become RFC 3339 text here so both facades hand the wire contract
-    exactly the same request body.
-    """
-
-    request: dict[str, Any] = {}
-    for key, value in filters.items():
-        if value is None:
-            continue
-        request[key] = value.isoformat() if isinstance(value, datetime) else value
-    return json.dumps(request)
 
 
 class DataTypeSpecVariants(TypedDict, total=False):
@@ -740,126 +674,6 @@ class TableDescription(_TableDescriptionOptional):
     physical_layout: PhysicalLayout
 
 
-class _SpanEventOptional(TypedDict, total=False):
-    """The event payload omitted without `bifrost_trace_payload:read`."""
-
-    attributes: Any
-
-
-class SpanEvent(_SpanEventOptional):
-    """One event nested on its owning span, in producer order."""
-
-    time_unix_nano: int
-    name: str
-    dropped_attributes_count: int
-
-
-class _SpanLinkOptional(TypedDict, total=False):
-    """The link payload omitted without `bifrost_trace_payload:read`."""
-
-    attributes: Any
-
-
-class SpanLink(_SpanLinkOptional):
-    """One link nested on its owning span, in producer order."""
-
-    linked_trace_id: str
-    linked_span_id: str
-    trace_state: str
-    flags: int
-    dropped_attributes_count: int
-
-
-class _SpanOptional(TypedDict, total=False):
-    """The span keys the server omits.
-
-    Each is either genuinely absent on the record or payload-gated: without
-    `bifrost_trace_payload:read` the server omits it from the wire rather than
-    returning it empty.
-    """
-
-    parent_span_id: str
-    status_code: int
-    status_message: str
-    attributes: Any
-    events: list[SpanEvent]
-    links: list[SpanLink]
-    service_name: str
-    resource_attributes: Any
-    scope_attributes: Any
-
-
-class Span(_SpanOptional):
-    """One complete span, carrying its own events and links."""
-
-    span_id: str
-    trace_state: str
-    flags: int
-    name: str
-    kind: int
-    start_time_unix_nano: int
-    end_time_unix_nano: int
-    duration_nano: int
-    dropped_attributes_count: int
-    dropped_events_count: int
-    dropped_links_count: int
-    resource_dropped_attributes_count: int
-    resource_schema_url: str
-    scope_name: str
-    scope_version: str
-    scope_dropped_attributes_count: int
-    scope_schema_url: str
-
-
-class TraceWaterfall(TypedDict):
-    """Every authorized span of one trace, flat, each carrying its own events and links."""
-
-    trace_id: str
-    spans: list[Span]
-
-
-class TraceDetail(TypedDict):
-    """One complete authorized cut of a trace, as returned by `get_trace`."""
-
-    trace: TraceWaterfall
-
-
-class _GenAiRowOptional(TypedDict, total=False):
-    """The generation keys the server omits.
-
-    Each promoted scalar is absent when its source attribute was; the two
-    message payloads are additionally gated on `bifrost_genai_payload:read`.
-    They stay `Any` because a message list is producer-defined JSON, not a
-    fixed wire shape.
-    """
-
-    conversation_id: str
-    model: str
-    provider: str
-    input_tokens: int
-    output_tokens: int
-    input_messages: Any
-    output_messages: Any
-
-
-class GenAiRow(_GenAiRowOptional):
-    """One GenAI generation read from the canonical span table."""
-
-    start_time_unix_nano: int
-
-
-class _GenAiPageOptional(TypedDict, total=False):
-    """The continuation token, absent on the last page."""
-
-    next_page_token: str
-
-
-class GenAiPage(_GenAiPageOptional):
-    """One page of GenAI generation records."""
-
-    rows: list[GenAiRow]
-
-
 class RunningQueryProgress(TypedDict):
     """Participant progress for one live Oracle query."""
 
@@ -897,8 +711,6 @@ __all__ = [
     "DataTypeSpec",
     "DataTypeSpecVariants",
     "FieldSpec",
-    "GenAiPage",
-    "GenAiRow",
     "IncompleteQueryStreamError",
     "NoCredentialsError",
     "PhysicalLayout",
@@ -907,12 +719,7 @@ __all__ = [
     "RunningQuery",
     "RunningQueryProgress",
     "SortKey",
-    "Span",
-    "SpanEvent",
-    "SpanLink",
     "TableConfig",
     "TableDescription",
     "TableEntry",
-    "TraceDetail",
-    "TraceWaterfall",
 ]

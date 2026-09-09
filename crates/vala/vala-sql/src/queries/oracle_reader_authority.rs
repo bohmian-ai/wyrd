@@ -728,6 +728,14 @@ impl<'conn, 'tx> OracleTableProtections<'conn, 'tx> {
 
     /// Reads and validates one epoch's complete header and members.
     ///
+    /// Header and members are read by one statement. Each statement takes its
+    /// own snapshot, so reading them separately would let a commit that lands
+    /// between the two hand this read one revision's digest over another
+    /// revision's members — a pair that cannot reproduce and is
+    /// indistinguishable from corruption. One statement sees one revision, and
+    /// it does so without locking the header against the reader pins that
+    /// commit it.
+    ///
     /// # Errors
     ///
     /// Returns [`SqlError::InvariantViolation`] when the header or any member
@@ -741,94 +749,7 @@ impl<'conn, 'tx> OracleTableProtections<'conn, 'tx> {
         fencing_token: i64,
     ) -> Result<Option<ProtectionRecord>, SqlError> {
         identity.validate(BIFROST_CATALOG_NAME)?;
-        let header: Option<HeaderDbRow> = sqlx::query_as(
-            r"
-            SELECT catalog_name, namespace_name, table_name, revision,
-                   frontier_encoding_version, frontier_digest, updated_at
-              FROM vala.oracle_table_protections
-             WHERE data_tenant_id = wyrd.current_tenant()
-               AND table_uid = $1
-               AND node_id = $2
-               AND fencing_token = $3
-            ",
-        )
-        .bind(identity.table_uid.as_slice())
-        .bind(node_id)
-        .bind(fencing_token)
-        .fetch_optional(&mut **self.conn.transaction())
-        .await
-        .map_err(SqlError::from)?;
-        let Some(header) = header else {
-            return Ok(None);
-        };
-        if header.catalog_name != identity.catalog_name
-            || header.namespace_name != identity.namespace_name
-            || header.table_name != identity.table_name
-        {
-            return Err(invariant(
-                "stored reader protection names a different table than the caller",
-            ));
-        }
-        let members = self.read_members(identity, node_id, fencing_token).await?;
-        let record = ProtectionRecord {
-            revision: header.revision,
-            frontier_encoding_version: header.frontier_encoding_version,
-            frontier_digest: digest32(header.frontier_digest)?,
-            updated_at: header.updated_at,
-            frontier: ProtectionFrontier {
-                members: sorted_members(members),
-            },
-        };
-        record.validate(identity)?;
-        Ok(Some(record))
-    }
-
-    /// Reads one header's members and decodes each into a validated value.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SqlError::InvariantViolation`] for a malformed digest or path
-    /// and [`SqlError`] when the statement fails.
-    async fn read_members(
-        &mut self,
-        identity: &TableAuthorityIdentity,
-        node_id: uuid::Uuid,
-        fencing_token: i64,
-    ) -> Result<Vec<ProtectionMember>, SqlError> {
-        let rows: Vec<MemberDbRow> = sqlx::query_as(
-            r"
-            SELECT protected_snapshot_id, protected_snapshot_timestamp_ms,
-                   retained_head_snapshot_id, retained_head_timestamp_ms,
-                   ancestry_path, ancestry_digest_version, ancestry_digest
-              FROM vala.oracle_table_protection_members
-             WHERE data_tenant_id = wyrd.current_tenant()
-               AND table_uid = $1
-               AND node_id = $2
-               AND fencing_token = $3
-             ORDER BY protected_snapshot_id
-            ",
-        )
-        .bind(identity.table_uid.as_slice())
-        .bind(node_id)
-        .bind(fencing_token)
-        .fetch_all(&mut **self.conn.transaction())
-        .await
-        .map_err(SqlError::from)?;
-        let mut members = Vec::with_capacity(rows.len());
-        for row in rows {
-            let member = ProtectionMember {
-                protected_snapshot_id: row.protected_snapshot_id,
-                protected_snapshot_timestamp_ms: row.protected_snapshot_timestamp_ms,
-                retained_head_snapshot_id: row.retained_head_snapshot_id,
-                retained_head_timestamp_ms: row.retained_head_timestamp_ms,
-                ancestry_path: row.ancestry_path,
-                ancestry_digest_version: row.ancestry_digest_version,
-                ancestry_digest: digest32(row.ancestry_digest)?,
-            };
-            member.validate(identity)?;
-            members.push(member);
-        }
-        Ok(members)
+        read_protection_record(self.conn.transaction(), identity, node_id, fencing_token).await
     }
 
     /// Commits one next revision of a table's frontier, or reports the winner.
@@ -1072,15 +993,99 @@ impl<'conn, 'tx> OracleTableProtections<'conn, 'tx> {
     }
 }
 
-/// Orders decoded members by digest so a read reproduces the written order.
-pub(crate) fn sorted_members(mut members: Vec<ProtectionMember>) -> Vec<ProtectionMember> {
-    members.sort_by_key(|member| member.ancestry_digest);
-    members
+/// Reads and validates one epoch's complete protection record in one statement.
+///
+/// Header and members live in two tables, and each statement takes its own
+/// snapshot, so reading them separately lets a reader pin that commits between
+/// the two hand the caller one revision's digest over another revision's
+/// members. That pair cannot reproduce, and Forge is required to treat a
+/// digest that does not reproduce as corruption and refuse to delete anything,
+/// so a torn read stalls maintenance over data that is perfectly intact. One
+/// joined statement sees one revision, and it does so without locking the
+/// header against the pins that write it.
+///
+/// Both protection readers — the Oracle owner's tenant connection and Forge's
+/// operator transaction under the table authority lock — call this, so there is
+/// one statement, one ordering, and one validation for the record.
+///
+/// # Errors
+///
+/// Returns [`SqlError::InvariantViolation`] when the stored identity payload
+/// disagrees with the caller's, when a member fails validation, or when the
+/// header digest does not reproduce over the stored members, and [`SqlError`]
+/// when the statement fails.
+pub(crate) async fn read_protection_record(
+    conn: &mut sqlx::PgConnection,
+    identity: &TableAuthorityIdentity,
+    node_id: uuid::Uuid,
+    fencing_token: i64,
+) -> Result<Option<ProtectionRecord>, SqlError> {
+    let rows: Vec<ProtectionJoinDbRow> = sqlx::query_as(
+        r"
+        SELECT h.catalog_name, h.namespace_name, h.table_name, h.revision,
+               h.frontier_encoding_version, h.frontier_digest, h.updated_at,
+               m.protected_snapshot_id, m.protected_snapshot_timestamp_ms,
+               m.retained_head_snapshot_id, m.retained_head_timestamp_ms,
+               m.ancestry_path, m.ancestry_digest_version, m.ancestry_digest
+          FROM vala.oracle_table_protections AS h
+          LEFT JOIN vala.oracle_table_protection_members AS m
+                 ON m.data_tenant_id = h.data_tenant_id
+                AND m.table_uid = h.table_uid
+                AND m.node_id = h.node_id
+                AND m.fencing_token = h.fencing_token
+         WHERE h.data_tenant_id = wyrd.current_tenant()
+           AND h.table_uid = $1
+           AND h.node_id = $2
+           AND h.fencing_token = $3
+         ORDER BY m.protected_snapshot_id
+        ",
+    )
+    .bind(identity.table_uid.as_slice())
+    .bind(node_id)
+    .bind(fencing_token)
+    .fetch_all(conn)
+    .await
+    .map_err(SqlError::from)?;
+    let Some(header) = rows.first() else {
+        return Ok(None);
+    };
+    if header.catalog_name != identity.catalog_name
+        || header.namespace_name != identity.namespace_name
+        || header.table_name != identity.table_name
+    {
+        return Err(invariant(
+            "stored reader protection names a different table than the caller",
+        ));
+    }
+    let mut members = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let Some(member) = row.member()? else {
+            continue;
+        };
+        member.validate(identity)?;
+        members.push(member);
+    }
+    let record = ProtectionRecord {
+        revision: header.revision,
+        frontier_encoding_version: header.frontier_encoding_version,
+        frontier_digest: digest32(header.frontier_digest.clone())?,
+        updated_at: header.updated_at,
+        frontier: ProtectionFrontier {
+            members: sorted_members(members),
+        },
+    };
+    record.validate(identity)?;
+    Ok(Some(record))
 }
 
-/// Raw protection header projection awaiting validation.
+/// One joined protection row: the epoch's header beside at most one member.
+///
+/// The header columns repeat on every row of the join, and the member columns
+/// are null on the single row a header with no members produces. That header
+/// protects nothing, and the record's own digest check is what rejects it — the
+/// decode below simply reports no member.
 #[derive(sqlx::FromRow)]
-pub(crate) struct HeaderDbRow {
+pub(crate) struct ProtectionJoinDbRow {
     /// Persisted catalog payload, checked against the caller's identity.
     pub(crate) catalog_name: String,
     /// Persisted namespace payload, checked against the caller's identity.
@@ -1095,25 +1100,75 @@ pub(crate) struct HeaderDbRow {
     pub(crate) frontier_digest: Vec<u8>,
     /// Database time of the commit that wrote this revision.
     pub(crate) updated_at: DateTime<Utc>,
+    /// Oldest active cut on this chain, absent when the header has no members.
+    pub(crate) protected_snapshot_id: Option<i64>,
+    /// Iceberg timestamp of the protected snapshot.
+    pub(crate) protected_snapshot_timestamp_ms: Option<i64>,
+    /// Newest active cut on this chain.
+    pub(crate) retained_head_snapshot_id: Option<i64>,
+    /// Iceberg timestamp of the retained head.
+    pub(crate) retained_head_timestamp_ms: Option<i64>,
+    /// Inclusive newest-to-oldest parent walk.
+    pub(crate) ancestry_path: Option<Vec<i64>>,
+    /// Stored ancestry digest version.
+    pub(crate) ancestry_digest_version: Option<i32>,
+    /// Stored ancestry digest bytes awaiting length validation.
+    pub(crate) ancestry_digest: Option<Vec<u8>>,
 }
 
-/// Raw protection member projection awaiting validation.
-#[derive(sqlx::FromRow)]
-pub(crate) struct MemberDbRow {
-    /// Oldest active cut on this chain.
-    pub(crate) protected_snapshot_id: i64,
-    /// Iceberg timestamp of the protected snapshot.
-    pub(crate) protected_snapshot_timestamp_ms: i64,
-    /// Newest active cut on this chain.
-    pub(crate) retained_head_snapshot_id: i64,
-    /// Iceberg timestamp of the retained head.
-    pub(crate) retained_head_timestamp_ms: i64,
-    /// Inclusive newest-to-oldest parent walk.
-    pub(crate) ancestry_path: Vec<i64>,
-    /// Stored ancestry digest version.
-    pub(crate) ancestry_digest_version: i32,
-    /// Stored ancestry digest bytes awaiting length validation.
-    pub(crate) ancestry_digest: Vec<u8>,
+impl ProtectionJoinDbRow {
+    /// Decodes this row's member half, if the join matched one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqlError::InvariantViolation`] for a malformed digest, and for
+    /// a row whose member columns are only partly present, which no join over
+    /// this schema can produce and would mean the projection changed.
+    fn member(&self) -> Result<Option<ProtectionMember>, SqlError> {
+        let (
+            Some(protected_snapshot_id),
+            Some(protected_snapshot_timestamp_ms),
+            Some(retained_head_snapshot_id),
+            Some(retained_head_timestamp_ms),
+            Some(ancestry_path),
+            Some(ancestry_digest_version),
+            Some(ancestry_digest),
+        ) = (
+            self.protected_snapshot_id,
+            self.protected_snapshot_timestamp_ms,
+            self.retained_head_snapshot_id,
+            self.retained_head_timestamp_ms,
+            self.ancestry_path.as_ref(),
+            self.ancestry_digest_version,
+            self.ancestry_digest.as_ref(),
+        )
+        else {
+            if self.protected_snapshot_id.is_none()
+                && self.ancestry_digest.is_none()
+                && self.ancestry_path.is_none()
+            {
+                return Ok(None);
+            }
+            return Err(invariant(
+                "reader protection member row is only partly present",
+            ));
+        };
+        Ok(Some(ProtectionMember {
+            protected_snapshot_id,
+            protected_snapshot_timestamp_ms,
+            retained_head_snapshot_id,
+            retained_head_timestamp_ms,
+            ancestry_path: ancestry_path.clone(),
+            ancestry_digest_version,
+            ancestry_digest: digest32(ancestry_digest.clone())?,
+        }))
+    }
+}
+
+/// Orders decoded members by digest so a read reproduces the written order.
+pub(crate) fn sorted_members(mut members: Vec<ProtectionMember>) -> Vec<ProtectionMember> {
+    members.sort_by_key(|member| member.ancestry_digest);
+    members
 }
 
 /// Enumerates the exact protection keys one dead epoch still holds.

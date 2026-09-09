@@ -2537,6 +2537,193 @@ pub(in crate::oracle) mod tests {
         assert_eq!(clean.queued_queries, 0);
     }
 
+    /// One grant pass is fair, floor-first, and work-conserving.
+    ///
+    /// Pins the whole local scheduling rule in a single pass: the protected
+    /// Interactive floor is satisfied before anything else, eligible tenants
+    /// rotate one grant at a time with equal weight, a tenant's own requests
+    /// stay in arrival order, and remaining capacity goes to whichever class
+    /// head carries the older waiter identity. Releasing one grant must then
+    /// immediately hand that capacity to the queued waiter rather than idle.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a grant is misordered, withheld while capacity is free, or
+    /// issued beyond the local class capacity.
+    #[test]
+    fn local_admission_is_fair_and_work_conserving() {
+        // Six slot units of memory must actually exist, or a memory refusal
+        // would masquerade as a scheduling decision.
+        let owner = owner_with_resources(
+            OracleAdmissionConfig {
+                interactive_slots: 2,
+                analytical_slots: 4,
+                tenant_interactive_slots: 6,
+                tenant_analytical_slots: 4,
+                ..Default::default()
+            },
+            crate::resources::BifrostRuntimeResources::composed_for_test(
+                8 * 1024 * 1024 * 1024,
+                8 * 1024 * 1024 * 1024,
+                [crate::resources::BifrostRole::Oracle],
+            )
+            .oracle()
+            .expect("composition must enable the Oracle capability"),
+        );
+        let shared = Arc::clone(&owner.shared);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let analytical_tenant = DataTenantId::new_v7();
+        let tenant_b = DataTenantId::new_v7();
+        let tenant_c = DataTenantId::new_v7();
+
+        // Arrival order is the waiter identity: the two analytical requests are
+        // the oldest work in the queue, so only the Interactive floor may
+        // outrank them.
+        let mut analytical_head = push_waiter(
+            &shared,
+            AdmissionClass::Analytical,
+            analytical_tenant,
+            1,
+            deadline,
+        );
+        let mut analytical_tail = push_waiter(
+            &shared,
+            AdmissionClass::Analytical,
+            analytical_tenant,
+            2,
+            deadline,
+        );
+        let mut first_tenant_head =
+            push_waiter(&shared, AdmissionClass::Interactive, tenant_b, 3, deadline);
+        let mut peer_tenant_head =
+            push_waiter(&shared, AdmissionClass::Interactive, tenant_c, 4, deadline);
+        let mut first_tenant_tail =
+            push_waiter(&shared, AdmissionClass::Interactive, tenant_b, 5, deadline);
+        drain_grants(&shared);
+
+        let first_head_grant = first_tenant_head
+            .try_recv()
+            .expect("the protected interactive floor is satisfied before any other class");
+        let peer_head_grant = peer_tenant_head
+            .try_recv()
+            .expect("the tenant cursor rotates to a peer tenant before it repeats one");
+        assert!(
+            first_tenant_tail.try_recv().is_err(),
+            "a tenant's second request must wait behind its peers, not jump the rotation"
+        );
+        let analytical_head_grant = analytical_head
+            .try_recv()
+            .expect("the older analytical head outranks a younger interactive waiter");
+        let analytical_tail_grant = analytical_tail
+            .try_recv()
+            .expect("remaining capacity keeps going to the oldest eligible class head");
+        {
+            let state = shared.state.lock().expect("state");
+            assert_eq!(state.interactive.used, 2, "the floor is exactly two units");
+            assert_eq!(
+                state.analytical.used,
+                2 * ANALYTICAL_QUERY_SLOT_UNITS,
+                "both analytical grants charge their two-unit cost"
+            );
+            assert_eq!(state.queued, 1, "only the rotation-deferred request waits");
+        }
+
+        // Work conservation: the freed units must reach the queued waiter on the
+        // release itself, without a poll, a timer, or a second arrival.
+        owner.rollback_grant(analytical_tail_grant);
+        let first_tail_grant = first_tenant_tail
+            .try_recv()
+            .expect("released capacity is granted immediately rather than left idle");
+        assert_eq!(shared.state.lock().expect("state").queued, 0);
+
+        owner.rollback_grant(first_head_grant);
+        owner.rollback_grant(peer_head_grant);
+        owner.rollback_grant(first_tail_grant);
+        owner.rollback_grant(analytical_head_grant);
+        let state = shared.state.lock().expect("state");
+        assert_eq!(state.interactive.used, 0);
+        assert_eq!(state.analytical.used, 0);
+        assert_eq!(state.active_queries, 0);
+    }
+
+    /// A follower worker release wakes the queued leader in arrival order.
+    ///
+    /// Leader admission and follower acquisition charge one shared governor
+    /// ledger, so a follower that finishes is the only event that can free the
+    /// leader's capacity. The queued leader must observe that release through
+    /// its existing bounded wait and the queue must keep its arrival order.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the follower charge is not exclusive, when a release fails to
+    /// wake the queue, or when the younger waiter is granted first.
+    #[tokio::test]
+    async fn follower_release_wakes_waiting_leader_without_reordering() {
+        let owner = owner(OracleAdmissionConfig {
+            interactive_slots: 1,
+            analytical_slots: 0,
+            tenant_analytical_slots: 0,
+            max_queue_wait: Duration::from_secs(30),
+            ..Default::default()
+        });
+        let worker = owner
+            .shared
+            .resources
+            .try_acquire_worker(crate::resources::OracleWorkerClass::Interactive)
+            .expect("a follower worker charges the one local slot unit");
+        let request = || PreparedAdmission {
+            tenant: DataTenantId::new_v7(),
+            query_class: QueryClass::Interactive,
+            local_ratio: 0.0,
+            deadline: Instant::now() + Duration::from_secs(30),
+            cancellation: CancellationToken::new(),
+        };
+        let first_owner = Arc::clone(&owner);
+        let first = tokio::spawn(async move { first_owner.admit(request()).await });
+        wait_for_queued(&owner, 1).await;
+        let second_owner = Arc::clone(&owner);
+        let second = tokio::spawn(async move { second_owner.admit(request()).await });
+        wait_for_queued(&owner, 2).await;
+
+        drop(worker);
+        let granted = first
+            .await
+            .expect("first admission task")
+            .expect("the follower release wakes the oldest waiter");
+        assert!(
+            !second.is_finished(),
+            "one freed unit must not grant two queries"
+        );
+        granted.release();
+        let followed = second
+            .await
+            .expect("second admission task")
+            .expect("the younger waiter is granted only after the older one releases");
+        followed.release();
+        let state = owner.shared.state.lock().expect("state");
+        assert_eq!(state.queued, 0);
+        assert_eq!(state.active_queries, 0);
+    }
+
+    /// Yields until the admission queue holds exactly `expected` waiters.
+    ///
+    /// Spawned admission tasks reach their queued state on a later poll, so a
+    /// bounded yield loop replaces a sleep and still fails loudly if the queue
+    /// never converges.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the queue does not reach `expected` within the bound.
+    async fn wait_for_queued(owner: &Arc<OracleAdmission>, expected: u32) {
+        for _ in 0..1_000 {
+            if owner.shared.state.lock().expect("state").queued == expected {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("admission queue never reached {expected} waiters");
+    }
+
     /// Queues one waiter directly so several requests contend in a single pass.
     ///
     /// Production enqueues run a grant pass on every arrival. Tenant rotation and

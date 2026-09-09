@@ -491,7 +491,7 @@ async fn tenant_writer(
                 base_url: server.base_url().expect("bound HTTP URL").to_owned(),
                 ..HttpConfig::default()
             },
-            api_key: Some(api_key),
+            credential: Some(api_key),
             ..ClientConfig::default()
         },
         card_ref,
@@ -567,7 +567,7 @@ async fn scribe_optional_and_scoped_card_correlation_journey() {
             base_url: server.base_url().expect("bound HTTP URL").to_owned(),
             ..HttpConfig::default()
         },
-        api_key: Some(api_key),
+        credential: Some(api_key),
         ..ClientConfig::default()
     })
     .expect("the writer's SDK client");

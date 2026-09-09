@@ -1390,7 +1390,7 @@ impl crate::WyrdTestServer {
                     .to_owned(),
                 ..wyrd_client::transport::HttpConfig::default()
             },
-            api_key: Some(api_key),
+            credential: Some(api_key),
             ..wyrd_client::config::ClientConfig::default()
         })
         .map_err(|error| crate::WyrdTestServerError::Start(error.to_string()))

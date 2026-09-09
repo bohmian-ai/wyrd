@@ -2,8 +2,8 @@
 //!
 //! [`ClientConfig`] is the single entry point for configuring `wyrd-client`.
 //! Build from environment variables with [`ClientConfig::from_env`], optionally
-//! set [`ClientConfig::api_key`] for an explicit key that outranks ambient env
-//! and file credentials, then call [`ClientConfig::resolve_credential`] to
+//! set [`ClientConfig::credential`] for an explicit credential that outranks ambient
+//! env and file credentials, then call [`ClientConfig::resolve_credential`] to
 //! obtain the effective [`ResolvedCredential`].
 
 use secrecy::SecretString;
@@ -45,7 +45,7 @@ pub struct ClientConfig {
     /// `credentials.toml` floor. It may be either a Wyrd API key or an
     /// already-issued access token; [`CredentialSource::explicit`] decides
     /// which grant it belongs to from the key's own prefix.
-    pub api_key: Option<SecretString>,
+    pub credential: Option<SecretString>,
     /// Token cache mode.
     pub token_cache: TokenCacheMode,
 }
@@ -55,7 +55,10 @@ impl std::fmt::Debug for ClientConfig {
         f.debug_struct("ClientConfig")
             .field("grpc", &self.grpc)
             .field("http", &self.http)
-            .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
+            .field(
+                "credential",
+                &self.credential.as_ref().map(|_| "[REDACTED]"),
+            )
             .field("token_cache", &self.token_cache)
             .finish()
     }
@@ -69,8 +72,9 @@ impl ClientConfig {
     /// - `WYRD_SERVER_URL` overrides the HTTP base URL (default:
     ///   `http://localhost:50050`).
     ///
-    /// The [`ClientConfig::api_key`] field is left `None`; set it explicitly
-    /// after construction to make it the highest-priority credential source.
+    /// The [`ClientConfig::credential`] field is left `None`; set it
+    /// explicitly after construction to make it the highest-priority
+    /// credential source.
     #[must_use]
     pub fn from_env() -> Self {
         let grpc_endpoint =
@@ -87,7 +91,7 @@ impl ClientConfig {
                 base_url: http_base_url,
                 ..HttpConfig::default()
             },
-            api_key: None,
+            credential: None,
             token_cache: TokenCacheMode::default(),
         }
     }
@@ -95,7 +99,7 @@ impl ClientConfig {
     /// Resolve the effective credential.
     ///
     /// Precedence (lowest index wins):
-    /// 1. `self.api_key` — explicit key set by caller
+    /// 1. `self.credential` — explicit credential set by caller
     /// 2. `WYRD_ACCESS_TOKEN` — tier 1 env
     /// 3. `WYRD_WORKLOAD_TOKEN` + `WYRD_TENANT` — tier 2 env
     /// 4. `WYRD_API_KEY` — tier 3 env
@@ -106,8 +110,8 @@ impl ClientConfig {
     /// file floor) yields nothing.
     pub fn resolve_credential(&self) -> Result<ResolvedCredential, WyrdClientError> {
         let mut chain = CredentialChain::default();
-        if let Some(key) = &self.api_key {
-            chain.push(CredentialSource::explicit(key.clone()));
+        if let Some(credential) = &self.credential {
+            chain.push(CredentialSource::explicit(credential.clone()));
         }
         chain.extend(CredentialChain::from_env());
         chain.resolve()
@@ -117,6 +121,15 @@ impl ClientConfig {
 #[cfg(test)]
 mod tests {
     use secrecy::ExposeSecret;
+
+    /// A plaintext API key shaped exactly as [`WyrdApiKey::generate`] mints
+    /// one: `wyrd_sk_<simple-uuid tenant>_<8-char visible>_<32-char secret>`.
+    ///
+    /// The precedence tests assert that an explicit credential wins, so the
+    /// fixture must be something the server-side parser would accept; a
+    /// prose placeholder would classify as a bearer token instead.
+    const API_KEY_FIXTURE: &str =
+        "wyrd_sk_4d5e1c3a9b7f4e2d8a6c0b1e2f3a4b5c_1a2b3c4d_9f8e7d6c5b4a39281706f5e4d3c2b1a0";
 
     use super::{ClientConfig, TokenCacheMode};
     use crate::transport::{
@@ -138,7 +151,7 @@ mod tests {
         assert_eq!(cfg.grpc.endpoint, GRPC_DEFAULT_ENDPOINT);
         assert_eq!(cfg.http.base_url, HTTP_DEFAULT_BASE_URL);
         assert_eq!(cfg.token_cache, TokenCacheMode::InMemory);
-        assert!(cfg.api_key.is_none());
+        assert!(cfg.credential.is_none());
     }
 
     #[test]
@@ -224,7 +237,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_api_key_beats_env_wyrd_api_key() {
+    fn explicit_credential_beats_env_wyrd_api_key() {
         let _env = crate::ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
         unsafe {
@@ -234,7 +247,7 @@ mod tests {
         }
 
         let mut cfg = ClientConfig::from_env();
-        cfg.api_key = Some("wyrd_sk_explicit_key_wins".to_owned().into());
+        cfg.credential = Some(API_KEY_FIXTURE.to_owned().into());
 
         let cred = cfg.resolve_credential().expect("explicit key resolves");
 
@@ -247,8 +260,8 @@ mod tests {
             ResolvedCredential::ApiKey(k) => {
                 assert_eq!(
                     k.expose_secret(),
-                    "wyrd_sk_explicit_key_wins",
-                    "explicit api_key must beat ambient WYRD_API_KEY"
+                    API_KEY_FIXTURE,
+                    "an explicit credential must beat ambient WYRD_API_KEY"
                 );
             }
             _ => panic!("expected ApiKey"),
@@ -321,7 +334,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_api_key_beats_workload_token() {
+    fn explicit_credential_beats_workload_token() {
         let _env = crate::ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
         // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
         unsafe {
@@ -332,7 +345,7 @@ mod tests {
         }
 
         let mut cfg = ClientConfig::from_env();
-        cfg.api_key = Some("wyrd_sk_explicit-key-wins".to_owned().into());
+        cfg.credential = Some(API_KEY_FIXTURE.to_owned().into());
         let cred = cfg.resolve_credential().expect("explicit key resolves");
 
         // SAFETY: ENV_MUTEX (held for this test) serializes env mutation in this binary.
@@ -345,8 +358,8 @@ mod tests {
             ResolvedCredential::ApiKey(key) => {
                 assert_eq!(
                     key.expose_secret(),
-                    "wyrd_sk_explicit-key-wins",
-                    "an explicit api_key must outrank WYRD_WORKLOAD_TOKEN"
+                    API_KEY_FIXTURE,
+                    "an explicit credential must outrank WYRD_WORKLOAD_TOKEN"
                 );
             }
             other => panic!("expected ApiKey, got {other:?}"),
@@ -386,9 +399,9 @@ mod tests {
     }
 
     #[test]
-    fn debug_does_not_leak_api_key() {
+    fn debug_does_not_leak_credential() {
         let cfg = ClientConfig {
-            api_key: Some("top-secret".to_owned().into()),
+            credential: Some("top-secret".to_owned().into()),
             ..Default::default()
         };
 
@@ -396,7 +409,7 @@ mod tests {
 
         assert!(
             !debug.contains("top-secret"),
-            "Debug must not expose the raw api_key"
+            "Debug must not expose the raw credential"
         );
         assert!(debug.contains("REDACTED"));
     }

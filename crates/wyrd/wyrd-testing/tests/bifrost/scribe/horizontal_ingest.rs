@@ -346,7 +346,7 @@ async fn endpoint_clients(cluster: &WyrdTestCluster, tenant: DataTenantId) -> Ve
                         base_url: server.base_url().expect("bound HTTP URL").to_owned(),
                         ..wyrd_client::transport::HttpConfig::default()
                     },
-                    api_key: Some(api_key.clone()),
+                    credential: Some(api_key.clone()),
                     ..wyrd_client::config::ClientConfig::default()
                 })
                 .expect("tenant SDK client"),

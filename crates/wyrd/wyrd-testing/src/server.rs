@@ -1103,7 +1103,7 @@ impl WyrdTestServer {
                         .to_owned(),
                     ..HttpConfig::default()
                 },
-                api_key: Some(api_key),
+                credential: Some(api_key),
                 ..ClientConfig::default()
             },
             bootstrap

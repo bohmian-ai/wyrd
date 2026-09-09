@@ -567,7 +567,7 @@ async fn coordinate_public_query(
             base_url: format!("http://{}", node.http_addr()),
             ..HttpConfig::default()
         },
-        api_key: Some(api_key.clone()),
+        credential: Some(api_key.clone()),
         ..ClientConfig::default()
     })?;
     let mut stream = QueryClient::new(&client)

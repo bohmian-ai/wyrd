@@ -119,7 +119,7 @@ pub(crate) async fn client_from_bootstrap(
             base_url: server.base_url().ok_or("missing HTTP URL")?.to_owned(),
             ..HttpConfig::default()
         },
-        api_key: Some(api_key),
+        credential: Some(api_key),
         ..ClientConfig::default()
     })?)
 }
@@ -201,7 +201,7 @@ pub(crate) async fn writer_from_bootstrap(
                 base_url: server.base_url().ok_or("missing HTTP URL")?.to_owned(),
                 ..HttpConfig::default()
             },
-            api_key: Some(api_key),
+            credential: Some(api_key),
             ..ClientConfig::default()
         },
         card_ref,

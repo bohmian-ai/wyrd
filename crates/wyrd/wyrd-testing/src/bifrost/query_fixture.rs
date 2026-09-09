@@ -86,7 +86,7 @@ pub async fn seed_query_fixture(
                     .to_owned(),
                 ..HttpConfig::default()
             },
-            api_key: Some(api_key.clone()),
+            credential: Some(api_key.clone()),
             ..ClientConfig::default()
         },
         bootstrap

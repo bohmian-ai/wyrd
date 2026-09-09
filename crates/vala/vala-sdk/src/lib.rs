@@ -91,7 +91,7 @@ mod sdk {
                 base_url: url.to_owned(),
                 ..HttpConfig::default()
             },
-            api_key: Some(key.to_owned().into()),
+            credential: Some(key.to_owned().into()),
             ..ClientConfig::default()
         }
     }

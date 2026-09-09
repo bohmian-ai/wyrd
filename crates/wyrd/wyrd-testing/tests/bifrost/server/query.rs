@@ -382,7 +382,7 @@ async fn prove_shared_query_surfaces() -> Result<(), ServerJourneyError> {
                 base_url: base.clone(),
                 ..wyrd_client::transport::HttpConfig::default()
             },
-            api_key: Some(api_key.clone()),
+            credential: Some(api_key.clone()),
             ..wyrd_client::config::ClientConfig::default()
         },
         bootstrap
@@ -643,7 +643,7 @@ async fn prove_scheduled_analytical_peer_loss() -> Result<(), ServerJourneyError
                 base_url: ingest.base_url().ok_or("missing HTTP URL")?.to_owned(),
                 ..wyrd_client::transport::HttpConfig::default()
             },
-            api_key: Some(api_key),
+            credential: Some(api_key),
             ..wyrd_client::config::ClientConfig::default()
         },
         bootstrap

@@ -567,7 +567,7 @@ pub fn client_from_options(
         config.grpc.endpoint = grpc_url.to_owned();
     }
     if let Some(credential) = credential {
-        config.api_key = Some(secrecy::SecretString::from(credential.to_owned()));
+        config.credential = Some(secrecy::SecretString::from(credential.to_owned()));
     }
     WyrdClient::with_config(config).map_err(ValaSdkError::from)
 }

@@ -63,7 +63,7 @@ mod pg_tests {
                 base_url: srv.base_url().unwrap_or("").to_owned(),
                 ..HttpConfig::default()
             },
-            api_key: Some(srv.api_key().expose_secret().to_owned().into()),
+            credential: Some(srv.api_key().expose_secret().to_owned().into()),
             ..ClientConfig::default()
         }
     }
@@ -175,7 +175,7 @@ mod pg_tests {
                 base_url: srv.base_url().expect("HTTP URL").to_owned(),
                 ..HttpConfig::default()
             },
-            api_key: Some(bootstrap.api_key().expect("machine API key").clone()),
+            credential: Some(bootstrap.api_key().expect("machine API key").clone()),
             ..ClientConfig::default()
         };
         let client = WyrdClient::with_config(config).expect("lifecycle SDK client");
@@ -200,7 +200,7 @@ mod pg_tests {
                 base_url: srv.base_url().expect("HTTP URL").to_owned(),
                 ..HttpConfig::default()
             },
-            api_key: Some(other.api_key().expect("second machine API key").clone()),
+            credential: Some(other.api_key().expect("second machine API key").clone()),
             ..ClientConfig::default()
         };
         let other_client =
@@ -219,7 +219,7 @@ mod pg_tests {
                 base_url: srv.base_url().expect("HTTP URL").to_owned(),
                 ..HttpConfig::default()
             },
-            api_key: Some(denied.api_key().expect("denied machine API key").clone()),
+            credential: Some(denied.api_key().expect("denied machine API key").clone()),
             ..ClientConfig::default()
         };
         let denied_client =
@@ -787,7 +787,7 @@ mod pg_tests {
                 base_url: srv.base_url().expect("HTTP URL").to_owned(),
                 ..HttpConfig::default()
             },
-            api_key: Some(bootstrap.api_key().expect("machine API key").clone()),
+            credential: Some(bootstrap.api_key().expect("machine API key").clone()),
             ..ClientConfig::default()
         };
         config.grpc.max_message_bytes = 32 * 1024 * 1024;
@@ -871,7 +871,7 @@ mod pg_tests {
                 base_url: srv.base_url().expect("HTTP URL").to_owned(),
                 ..HttpConfig::default()
             },
-            api_key: Some(bootstrap.api_key().expect("machine API key").clone()),
+            credential: Some(bootstrap.api_key().expect("machine API key").clone()),
             ..ClientConfig::default()
         };
         config.grpc.max_message_bytes = 32 * 1024 * 1024;
@@ -1030,7 +1030,7 @@ mod pg_tests {
             .expect("machine principal card ref")
             .clone();
         let mut config = client_config(&srv);
-        config.api_key = Some(api_key);
+        config.credential = Some(api_key);
         config.grpc.endpoint = srv.grpc_url().expect("gRPC URL");
         config.grpc.connect_retries = 0;
         let client = WyrdClient::with_config(config).expect("SDK client");
@@ -1257,7 +1257,7 @@ mod pg_tests {
                 base_url: srv.base_url().expect("HTTP URL").to_owned(),
                 ..HttpConfig::default()
             },
-            api_key: Some(api_key),
+            credential: Some(api_key),
             ..ClientConfig::default()
         };
         config.grpc.connect_retries = 0;
@@ -1365,7 +1365,7 @@ mod pg_tests {
                 base_url: srv.base_url().expect("HTTP URL").to_owned(),
                 ..HttpConfig::default()
             },
-            api_key: Some(bootstrap.api_key().expect("machine API key").clone()),
+            credential: Some(bootstrap.api_key().expect("machine API key").clone()),
             ..ClientConfig::default()
         };
         let client = WyrdClient::with_config(config).expect("public SDK client");

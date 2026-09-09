@@ -1578,7 +1578,7 @@ async fn public_client(
                 .to_owned(),
             ..HttpConfig::default()
         },
-        api_key: Some(key),
+        credential: Some(key),
         ..ClientConfig::default()
     })
     .map_err(|error| ClusterLoadError::Client(error.to_string()))

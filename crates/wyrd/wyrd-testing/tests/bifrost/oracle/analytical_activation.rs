@@ -473,7 +473,7 @@ fn public_client(
                 base_url: format!("http://{}", node.http_addr()),
                 ..wyrd_client::transport::HttpConfig::default()
             },
-            api_key: Some(api_key.clone()),
+            credential: Some(api_key.clone()),
             ..wyrd_client::config::ClientConfig::default()
         },
     )?)

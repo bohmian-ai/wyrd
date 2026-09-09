@@ -134,7 +134,7 @@ pub(super) async fn tenant_client(
             base_url: server.base_url().expect("bound HTTP URL").to_owned(),
             ..wyrd_client::transport::HttpConfig::default()
         },
-        api_key: Some(api_key),
+        credential: Some(api_key),
         ..wyrd_client::config::ClientConfig::default()
     })
     .expect("tenant SDK client")

@@ -2639,7 +2639,7 @@ mod tests {
     /// Builds a query client bound to one base URL with a static credential.
     fn client_for(base_url: &str) -> QueryClient {
         let config = wyrd_client::config::ClientConfig {
-            api_key: Some(secrecy::SecretString::from("test-key")),
+            credential: Some(secrecy::SecretString::from("test-key")),
             http: wyrd_client::transport::config::HttpConfig {
                 base_url: base_url.to_owned(),
                 timeout_ms: 2_000,

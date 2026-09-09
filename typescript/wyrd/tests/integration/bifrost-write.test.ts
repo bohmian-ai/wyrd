@@ -1,4 +1,5 @@
 import type { Table } from "apache-arrow";
+import { z } from "zod";
 import { startTestServer } from "@wyrd/testing";
 import { describe, expect, it } from "vitest";
 
@@ -124,25 +125,27 @@ describe("Bifrost write journey", () => {
   }, 30_000);
 });
 
-const INFERENCE_SCHEMA = {
-  type: "object",
-  properties: {
-    call_id: { type: "integer" },
-    model: { type: "string" },
-    tokens: { type: "integer" },
-    latency_ms: { type: "number" },
-    status: { type: "string" },
-  },
-  required: ["call_id", "model", "tokens", "latency_ms", "status"],
-} as const;
+// The columns a caller declares, written the way a TypeScript user already
+// models data. `TableConfig.fromJsonSchema` takes JSON Schema, so Zod's own
+// `toJSONSchema` is the whole bridge -- the same shape Pydantic's
+// `model_json_schema()` plays on the Python side.
+const Inference = z.object({
+  call_id: z.int(),
+  model: z.string(),
+  tokens: z.int(),
+  latency_ms: z.number(),
+  status: z.string(),
+});
 
-const MODEL_INFO_SCHEMA = {
-  type: "object",
-  properties: { model: { type: "string" }, vendor: { type: "string" } },
-  required: ["model", "vendor"],
-} as const;
+const ModelInfo = z.object({
+  model: z.string(),
+  vendor: z.string(),
+});
 
-const INFERENCES = [
+const INFERENCE_SCHEMA = z.toJSONSchema(Inference);
+const MODEL_INFO_SCHEMA = z.toJSONSchema(ModelInfo);
+
+const INFERENCES: z.infer<typeof Inference>[] = [
   { call_id: 1, model: "opus", tokens: 100, latency_ms: 120.5, status: "ok" },
   { call_id: 2, model: "opus", tokens: 300, latency_ms: 240.0, status: "ok" },
   { call_id: 3, model: "opus", tokens: 200, latency_ms: 180.25, status: "error" },
@@ -150,7 +153,7 @@ const INFERENCES = [
   { call_id: 5, model: "haiku", tokens: 150, latency_ms: 60.75, status: "ok" },
 ];
 
-const MODEL_INFO = [
+const MODEL_INFO: z.infer<typeof ModelInfo>[] = [
   { model: "opus", vendor: "anthropic" },
   { model: "haiku", vendor: "anthropic" },
 ];

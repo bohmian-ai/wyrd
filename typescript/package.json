@@ -4,9 +4,10 @@
   "packageManager": "pnpm@11.4.0",
   "devDependencies": {
     "@napi-rs/cli": "3.4.1",
-    "@wyrd/testing": "workspace:*",
     "@types/node": "24.10.0",
+    "@wyrd/testing": "workspace:*",
     "typescript": "5.9.3",
-    "vitest": "4.0.16"
+    "vitest": "4.0.16",
+    "zod": "^4.5.4"
   }
 }

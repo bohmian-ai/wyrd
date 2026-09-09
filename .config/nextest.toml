@@ -14,6 +14,16 @@
 # at convergence.rs:240 while nextest passes it. Serialization was the old way
 # to avoid that; per-test processes make it correct instead of merely avoided.
 
+# The Forge integration binary boots a Postgres-backed fixture per test, each
+# retaining its own connection pools, so its concurrency is bounded by Postgres
+# connections rather than CPU — the same constraint the journey profile states.
+# The crate lane already runs it under that profile; the family lanes
+# (scripts/run-family-tests.sh) run it under the default profile, where CPU
+# parallelism oversubscribes the fixtures and their deterministic bounds are
+# missed. This group applies the same ceiling wherever that binary runs.
+[test-groups.postgres-fixtures]
+max-threads = 6
+
 [profile.default]
 # nextest reports LEAK when a test's process has not fully quiesced within this
 # window after the test function returns. The test still passes. Fixtures here
@@ -24,6 +34,18 @@ leak-timeout = "2s"
 # Match the old lanes' `--no-fail-fast`: one broken test must not hide the rest
 # of a binary.
 fail-fast = false
+
+[[profile.default.overrides]]
+filter = 'package(vala-bifrost-redux) and binary(integration)'
+test-group = 'postgres-fixtures'
+
+# The router smoke binary's Forge readiness matrix boots one WyrdTestServer per
+# case for the same reason: each case mutates durable scheduler, demand, or
+# quarantine state that a shared server could not isolate. It carries the same
+# per-fixture connection cost, so it takes the same ceiling.
+[[profile.default.overrides]]
+filter = 'package(wyrd-server) and binary(pg_router_smoke)'
+test-group = 'postgres-fixtures'
 
 [profile.journey]
 # Tier-1 journey binaries boot a WyrdTestServer per test, each retaining its own

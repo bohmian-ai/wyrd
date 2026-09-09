@@ -48,8 +48,8 @@ writes, rolls before accepting the following write once the target is crossed,
 and preserves the final residue for each partition. Neither target is a
 universal lower or upper bound on physical object bytes. The managed core owns selection, grouping, delete
 application, sorting, partition fan-out, rolling, and produced `DataFile`
-values. Forge owns leases, Wyrd resources, attempt identity, handoff validation,
-catalog publication, reconciliation, audit, and SQL settlement.
+values. Forge owns leases, pod-local plan admission, attempt identity, handoff
+validation, catalog publication, reconciliation, audit, and SQL settlement.
 
 The rewrite seam is exactly:
 
@@ -71,22 +71,30 @@ data sequence number cannot apply to a surviving unselected data file. Output
 sequence numbers prevent applied deletes from reapplying to replacement rows.
 Reject duplicate identities or unproven delete scope before publication.
 
-Physical writers may execute concurrently inside one attempt. They reserve one
-attempt-global ordinal before each output open and use deterministic
-attempt-bound object identity. One fenced owner constructs the final rewrite
-transaction and calls `commit_once`; the managed core never mutates the
-catalog.
+Physical writers and fitting ordinary plan runners may execute concurrently
+inside one fenced task attempt. Their physical paths retain the managed core's
+recipe segment and use an attempt prefix, per-writer canonical decimal ordinal,
+and writer UUIDv7 for uniqueness. Forge assigns a separate attempt-global
+logical ordinal to each opened output for observer and recovery evidence; that
+logical ordinal is not a filename field. Each admitted plan owns an independent
+operation and rewrite transaction, and may call `commit_once` concurrently with
+siblings under the task's shared lease and fence. The physical rewrite core
+never mutates the catalog.
 
 ## Optimistic commit and reconciliation
 
-Before commit, validate that the freshly acquired table metadata still satisfies the
-rewrite assumptions: branch head, base ancestry, selected input existence,
-schema/spec/sort policy, delete attachments, lease, and fence. A definite
-catalog conflict may make one further `commit_once` call only after reacquiring
-the latest metadata and revalidating those assumptions. It reuses the same
-attempt, operation ID, output generation, and objects. Another conflict,
-deadline, or changed assumption ends that attempt as definitely uncommitted and
-requires a new plan. Never hide revalidation inside a generic retry.
+Before each commit, validate that freshly acquired table metadata still retains
+the planning snapshot, has the planned schema identity, contains every selected
+input, and preserves the lease and fence. A changed branch head alone is not a
+refusal. Concurrent sibling plans may therefore race optimistically and incur
+expected catalog conflicts. After a definite conflict, reacquire metadata and
+repeat the same validation before the same plan operation may retry after fixed
+1s/2s/4s delays, for at most three retries within its original deadline. Reuse
+the same operation ID, output generation, and objects. Exhausted retries,
+deadline, or a changed required condition ends that plan as definitely
+uncommitted; successful siblings remain committed and remaining debt is
+replanned from the current head. Never hide revalidation inside a generic
+retry. Promotion retains its separate one-retry protocol.
 
 Use deterministic operation identity and snapshot properties to distinguish:
 
@@ -112,8 +120,9 @@ separate selection, commit, retention, and audit evidence.
   objects idempotently only after safety validation.
 - Orphan cleanup protects every live snapshot, staged or prepared operation,
   publication attempt, committed Scribe `file_list` object without exact
-  promotion evidence, pinned Oracle cut, live-tail lease, and configured age
-  window. A storage listing alone can never prove an orphan.
+  promotion evidence, pinned Oracle cut, and configured age window.
+  A v1 live-tail lease retains Scribe-local Arrow batches and staged resources for its lifetime but names no Forge-collectable object, so it contributes no independent Forge GC root.
+  A storage listing alone can never prove an orphan.
 
 ## Rejected shapes
 

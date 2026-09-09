@@ -6,15 +6,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-#[cfg(test)]
-use metrics_exporter_prometheus::PrometheusBuilder;
 use metrics_exporter_prometheus::PrometheusHandle;
 use wyrd_telemetry::{CapturedSpan, CapturedSpanStatus, TestTraceCapture};
 
 use crate::bifrost::BifrostTopology;
-#[cfg(test)]
-use crate::server::ForgeDataFileInspection;
-use crate::server::{ForgeRewriteComparison, ForgeWorkflowInspection};
 
 /// Exact Prometheus sample kind retained across family normalization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,6 +116,44 @@ pub(crate) struct TelemetryBinding {
     /// Closed categorical label domains.
     allowed_label_values: &'static [TelemetryLabelValues],
 }
+
+/// Closed `task_type` label values every public Forge family carries.
+///
+/// Mirrors the five durable Forge task strategies owned by the production
+/// telemetry catalog, so a production label this projection cannot name fails
+/// as an unexpected value instead of silently vanishing from the report.
+const FORGE_TASK_TYPES: &[&str] = &[
+    "scribe_promotion",
+    "small_files",
+    "snapshot_expiry",
+    "expired_cleanup",
+    "orphan_cleanup",
+];
+
+/// Closed label domain for the Forge families keyed only by task type.
+const FORGE_TASK_TYPE_LABELS: &[TelemetryLabelValues] = &[TelemetryLabelValues {
+    key: "task_type",
+    values: FORGE_TASK_TYPES,
+}];
+
+/// Closed label domain for the Forge task-attempt counter.
+const FORGE_TASK_ATTEMPT_LABELS: &[TelemetryLabelValues] = &[
+    TelemetryLabelValues {
+        key: "task_type",
+        values: FORGE_TASK_TYPES,
+    },
+    TelemetryLabelValues {
+        key: "result",
+        values: &[
+            "succeeded",
+            "retry",
+            "failed",
+            "cancelled",
+            "refused",
+            "uncertain",
+        ],
+    },
+];
 
 /// Closed production labels emitted by the Oracle admission owner.
 const ORACLE_ADMISSION_LABELS: &[TelemetryLabelValues] = &[
@@ -522,12 +555,12 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
     TelemetryBinding {
         id: TelemetryBindingId("forge.backlog_peak"),
         selected_label_values: &[],
-        family: "bifrost_forge_oldest_backlog_seconds",
+        family: "bifrost_forge_pending_tasks",
         kind: BifrostMetricKind::Gauge,
-        unit: TelemetryUnit::Seconds,
+        unit: TelemetryUnit::Count,
         aggregation: TelemetryAggregation::Peak,
         requirement: TelemetryRequirement::Role("forge"),
-        allowed_label_values: &[],
+        allowed_label_values: FORGE_TASK_TYPE_LABELS,
     },
     TelemetryBinding {
         id: TelemetryBindingId("oracle.admission"),
@@ -598,65 +631,56 @@ const CLUSTER_BINDINGS: &[TelemetryBinding] = &[
     },
     TelemetryBinding {
         id: TelemetryBindingId("forge.publications"),
-        selected_label_values: &[],
-        family: "bifrost_forge_complete_gauge_publications_total",
+        selected_label_values: &[TelemetrySelectedLabel {
+            key: "result",
+            value: "succeeded",
+        }],
+        family: "bifrost_forge_task_attempts_total",
         kind: BifrostMetricKind::Counter,
         unit: TelemetryUnit::Count,
         aggregation: TelemetryAggregation::Delta,
         requirement: TelemetryRequirement::Role("forge"),
-        allowed_label_values: &[],
+        allowed_label_values: FORGE_TASK_ATTEMPT_LABELS,
     },
     TelemetryBinding {
         id: TelemetryBindingId("forge.rewrite_input_files"),
         selected_label_values: &[],
-        family: "bifrost_forge_rewrite_input_files_total",
+        family: "bifrost_forge_input_files_total",
         kind: BifrostMetricKind::Counter,
         unit: TelemetryUnit::Count,
         aggregation: TelemetryAggregation::Delta,
         requirement: TelemetryRequirement::Role("forge"),
-        allowed_label_values: &[TelemetryLabelValues {
-            key: "source",
-            values: &["staging", "iceberg"],
-        }],
+        allowed_label_values: FORGE_TASK_TYPE_LABELS,
     },
     TelemetryBinding {
         id: TelemetryBindingId("forge.rewrite_input_bytes"),
         selected_label_values: &[],
-        family: "bifrost_forge_rewrite_input_bytes_total",
+        family: "bifrost_forge_input_bytes_total",
         kind: BifrostMetricKind::Counter,
         unit: TelemetryUnit::Bytes,
         aggregation: TelemetryAggregation::Delta,
         requirement: TelemetryRequirement::Role("forge"),
-        allowed_label_values: &[TelemetryLabelValues {
-            key: "source",
-            values: &["staging", "iceberg"],
-        }],
+        allowed_label_values: FORGE_TASK_TYPE_LABELS,
     },
     TelemetryBinding {
         id: TelemetryBindingId("forge.rewrite_output_files"),
         selected_label_values: &[],
-        family: "bifrost_forge_rewrite_output_files_total",
+        family: "bifrost_forge_output_files_total",
         kind: BifrostMetricKind::Counter,
         unit: TelemetryUnit::Count,
         aggregation: TelemetryAggregation::Delta,
         requirement: TelemetryRequirement::Role("forge"),
-        allowed_label_values: &[TelemetryLabelValues {
-            key: "source",
-            values: &["staging", "iceberg"],
-        }],
+        allowed_label_values: FORGE_TASK_TYPE_LABELS,
     },
     TelemetryBinding {
         id: TelemetryBindingId("forge.rewrite_output_bytes"),
         selected_label_values: &[],
-        family: "bifrost_forge_rewrite_output_bytes_total",
+        family: "bifrost_forge_output_bytes_total",
         kind: BifrostMetricKind::Counter,
         unit: TelemetryUnit::Bytes,
         aggregation: TelemetryAggregation::Delta,
         requirement: TelemetryRequirement::Role("forge"),
-        allowed_label_values: &[TelemetryLabelValues {
-            key: "source",
-            values: &["staging", "iceberg"],
-        }],
+        allowed_label_values: FORGE_TASK_TYPE_LABELS,
     },
     TelemetryBinding {
         id: TelemetryBindingId("oracle.rows"),
@@ -1211,8 +1235,6 @@ pub(crate) struct ProcessWindow {
 /// Captured production telemetry emitted during one observation window.
 #[derive(Debug, Clone)]
 pub struct BifrostTelemetryDelta {
-    /// Production family inventory declared by the closing Prometheus scrape.
-    pub(crate) families: BTreeSet<String>,
     /// Counter and histogram deltas from the one production render handle.
     pub metrics: Vec<BifrostMetricSample>,
     /// Gauge maxima observed by the production capture while the window ran.
@@ -1560,7 +1582,6 @@ impl BifrostTelemetryCapture {
             }
         }
         Ok(BifrostTelemetryDelta {
-            families: current_types.keys().cloned().collect(),
             metrics,
             gauge_maxima,
             gauge_final,
@@ -2400,1798 +2421,6 @@ fn merge_gauge_maxima(
     Ok(())
 }
 
-/// Forge-only report mapped solely from production capture observations.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
-pub struct ForgeMaintenanceTelemetryReport {
-    /// Production rewrite-byte counter rate converted to MiB/s.
-    pub throughput_mib_per_sec: f64,
-    /// Production task duration p99 in microseconds.
-    pub task_latency_p99_us: f64,
-    /// Maximum complete-pass backlog age in microseconds.
-    pub backlog_age_us: f64,
-    /// Peak Forge memory reservation gauge.
-    pub peak_parent_memory: f64,
-    /// Maximum final spill observation.
-    pub spill_bytes: f64,
-    /// Lease-contention counter delta.
-    pub lease_contention: f64,
-    /// Fence-loss counter delta.
-    pub fence_lost: f64,
-    /// Snapshot-change counter delta.
-    pub snapshot_changed: f64,
-    /// Maximum complete-pass fair-admission lag.
-    pub fairness_lag_tasks: f64,
-    /// Maximum cleanup duration in microseconds.
-    pub cleanup_delay_us: f64,
-    /// Production-observed active concurrency and start history by exact role.
-    pub role_topology: BTreeMap<String, ForgeRoleTopologyReport>,
-}
-
-/// Production topology evidence for one configured process role.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
-pub struct ForgeRoleTopologyReport {
-    /// Maximum active owners sampled during the observation window.
-    pub max_active: u64,
-    /// Active owners in the final pre-shutdown exporter snapshot.
-    pub final_active: u64,
-    /// Starts observed during the window, including replacements.
-    pub starts: u64,
-}
-
-/// Earliest production transition that did not complete in one Forge workflow.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-pub enum ForgeCausalDiagnosis {
-    /// No staging publication entered the Forge hint channel.
-    NoAcceptedHint,
-    /// A hint entered the channel but no durable demand was recorded.
-    AcceptedHintNotPersisted,
-    /// Durable demand exists but no durable task was planned.
-    PersistedDemandNotPlanned,
-    /// A ready task exists but no worker claimed or completed it.
-    ReadyTaskNotClaimed,
-    /// The durable attempt or production terminal metric reports failure.
-    AttemptFailedOrRetryable,
-    /// A commit completed without authoritative evidence that file debt fell.
-    CommitDidNotReduceFileDebt,
-    /// The production workflow committed a replacement with lower file debt.
-    Converged,
-}
-
-/// Closed task strategy projected from production Forge metric labels.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
-pub enum ForgeTelemetryStrategy {
-    /// Fold staged WAL generations into Iceberg.
-    StagingFold,
-    /// Rewrite current-snapshot small files.
-    SmallFiles,
-    /// Rewrite fragmented Iceberg manifests.
-    ManifestRewrite,
-    /// Expire old Iceberg snapshots.
-    SnapshotExpiry,
-}
-
-/// Closed terminal task result projected from production Forge metrics.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
-pub enum ForgeTelemetryTaskResult {
-    /// The attempt completed successfully.
-    Succeeded,
-    /// The attempt remains eligible for retry.
-    Retryable,
-    /// The attempt failed permanently.
-    Failed,
-    /// The attempt was cancelled before completion.
-    Cancelled,
-    /// Production capacity cannot schedule the attempt.
-    Unschedulable,
-}
-
-/// Closed Forge maintenance stage projected from production metrics.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
-pub enum ForgeTelemetryStage {
-    /// Reconcile staged audit operations.
-    ReconcileStaging,
-    /// Reconcile Iceberg replacement operations.
-    ReconcileIceberg,
-    /// Publish staged files into Iceberg.
-    StagingFold,
-    /// Discover current-snapshot rewrite groups.
-    ManifestDiscovery,
-    /// Rewrite an Iceberg data-file group.
-    IcebergRewrite,
-    /// Rewrite a bounded same-spec manifest group.
-    ManifestRewrite,
-    /// Expire retained snapshots.
-    SnapshotExpiry,
-    /// Remove proven orphan objects.
-    OrphanGc,
-}
-
-/// One nonzero terminal task histogram projected into exact count and duration.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
-pub struct ForgeTerminalTaskTelemetry {
-    /// Production task strategy.
-    pub strategy: ForgeTelemetryStrategy,
-    /// Production terminal result.
-    pub result: ForgeTelemetryTaskResult,
-    /// Exact completed histogram observation count.
-    pub count: u64,
-    /// Sum of completed attempt durations in seconds.
-    pub duration_seconds_sum: f64,
-}
-
-/// One nonzero stage failure with its corresponding production duration total.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
-pub struct ForgeStageFailureTelemetry {
-    /// Production maintenance stage.
-    pub stage: ForgeTelemetryStage,
-    /// Exact failed-operation counter delta.
-    pub count: u64,
-    /// Sum of all observed stage durations in seconds.
-    pub duration_seconds_sum: f64,
-}
-
-/// Aggregated current-snapshot candidate observations for one closed strategy.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
-pub struct ForgeDiscoveredCandidateTelemetry {
-    /// Production candidate strategy.
-    pub strategy: ForgeTelemetryStrategy,
-    /// Number of candidate observations in the telemetry window.
-    pub count: u64,
-    /// Sum of files across the observed candidates.
-    pub files_sum: f64,
-    /// Sum of logical candidate bytes across the observed candidates.
-    pub bytes_sum: f64,
-}
-
-/// Closed Forge attempt resource projected from production metric labels.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
-pub enum ForgeTelemetryResource {
-    /// Resident memory owned through the attempt-local pool.
-    Memory,
-    /// Disposable sort and pending-output scratch.
-    Scratch,
-}
-
-/// Planned, acquired, and peak observations for one Forge attempt resource.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
-pub struct ForgeAttemptResourceTelemetry {
-    /// Closed resource represented by this row.
-    pub resource: ForgeTelemetryResource,
-    /// Sum of authoritative planned bytes in the capture window.
-    pub planned_bytes: f64,
-    /// Sum of exact acquired bytes in the capture window.
-    pub acquired_bytes: f64,
-    /// Sum of conservative observed peak bytes in the capture window.
-    pub peak_bytes: f64,
-}
-
-/// Exactly-once release counts for one Forge attempt resource.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub struct ForgeResourceReleaseTelemetry {
-    /// Closed resource represented by this row.
-    pub resource: ForgeTelemetryResource,
-    /// Attempts whose exact lease returned successfully.
-    pub released: u64,
-    /// Attempts whose untrusted lease remained charged after poison.
-    pub poisoned: u64,
-}
-
-/// One exact counter projected for a closed Forge attempt resource.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub struct ForgeResourceCountTelemetry {
-    /// Closed resource represented by this row.
-    pub resource: ForgeTelemetryResource,
-    /// Exact counter delta for this resource.
-    pub count: u64,
-}
-
-/// Closed durable Forge failure class projected from production labels.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
-pub enum ForgeTelemetryFailureClass {
-    /// Deterministic unsafe or incompatible input data.
-    DataRefusal,
-    /// Retryable object-store or catalog transport failure.
-    TransientObjectStore,
-    /// Retryable SQL, lease, fence, or coordination failure.
-    TransientCoordination,
-    /// Unhealthy local scratch volume requiring quarantine.
-    StorageHealth,
-    /// Root admission or persisted execution-envelope refusal.
-    CapacityRefused,
-    /// Internal configuration, schema, or runtime invariant failure.
-    InternalInvariant,
-}
-
-/// One failure-class counter projected from a closed Forge family.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub struct ForgeFailureClassTelemetry {
-    /// Closed durable failure class.
-    pub failure_class: ForgeTelemetryFailureClass,
-    /// Exact counter delta for this class.
-    pub count: u64,
-}
-
-/// Closed Forge span name retained by causal diagnostics.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-pub enum ForgeCausalSpanName {
-    /// Hint persistence boundary.
-    HintPersist,
-    /// Scheduler-pass boundary.
-    SchedulerPass,
-    /// Worker task execution boundary.
-    TaskExecute,
-    /// Iceberg catalog commit boundary.
-    CatalogCommit,
-    /// Snapshot or object cleanup boundary.
-    Cleanup,
-}
-
-/// Validated bounded projection of one captured production Forge span.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub struct ForgeCausalSpan {
-    /// Closed instrumentation name.
-    pub name: ForgeCausalSpanName,
-    /// Span-specific closed terminal result.
-    pub result: String,
-    /// Closed runtime role.
-    pub role: String,
-    /// Scrubbed durable task UUID when permitted by the span schema.
-    pub task_id: Option<String>,
-    /// Scrubbed durable attempt UUID when permitted by the span schema.
-    pub attempt_id: Option<String>,
-}
-
-/// Causal Forge report mapped only from one production telemetry window.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
-pub struct ForgeCausalTelemetryReport {
-    /// Hints accepted by the bounded publication channel.
-    pub accepted_hints: u64,
-    /// Hints refused because the bounded channel was full.
-    pub full_hints: u64,
-    /// Hints refused because the receiver was closed.
-    pub closed_hints: u64,
-    /// Hints durably persisted as planning demand.
-    pub persisted_hints: u64,
-    /// Completed hint persistence failures.
-    pub failed_hint_persistence: u64,
-    /// Scheduler passes that exhausted their current work page.
-    pub scheduler_complete: u64,
-    /// Scheduler passes bounded before exhausting their work page.
-    pub scheduler_incomplete: u64,
-    /// Candidate-free demand acknowledgements.
-    pub demands_drained: u64,
-    /// Successful task terminals that atomically requested successor planning.
-    pub demands_continued: u64,
-    /// Demand acknowledgement attempts fenced by a newer generation.
-    pub demand_generations_changed: u64,
-    /// Completed demand-transition failures.
-    pub demand_transition_failures: u64,
-    /// Durable worker settlements classified as deterministic data refusals.
-    pub data_refusals: u64,
-    /// Durable worker settlements classified as transient object-store faults.
-    pub transient_object_store_failures: u64,
-    /// Durable worker settlements classified as transient coordination faults.
-    pub transient_coordination_failures: u64,
-    /// Durable worker settlements classified as local storage-health faults.
-    pub storage_health_failures: u64,
-    /// Non-consuming worker settlements classified as capacity refusals.
-    pub capacity_refusals: u64,
-    /// Durable worker settlements classified as invariant failures.
-    pub internal_invariant_failures: u64,
-    /// Planned, acquired, and peak observations for memory and scratch.
-    pub attempt_resources: Vec<ForgeAttemptResourceTelemetry>,
-    /// Released and poisoned finalization counts for memory and scratch.
-    pub resource_releases: Vec<ForgeResourceReleaseTelemetry>,
-    /// Execution-envelope failures split by memory and scratch.
-    pub execution_envelope_failures: Vec<ForgeResourceCountTelemetry>,
-    /// Legacy envelopes auditedly superseded and replanned.
-    pub legacy_envelopes_replanned: u64,
-    /// Legacy envelope supersession attempts that failed transactionally.
-    pub legacy_envelope_supersession_failures: u64,
-    /// Retry selections across the complete six-class failure inventory.
-    pub retries: Vec<ForgeFailureClassTelemetry>,
-    /// Terminal poison selections across the complete six-class inventory.
-    pub terminal_poisons: Vec<ForgeFailureClassTelemetry>,
-    /// Capacity refusals before execution or input IO.
-    pub admission_capacity_refusals: u64,
-    /// Persisted execution-envelope capacity failures.
-    pub execution_capacity_refusals: u64,
-    /// Current complete-pass compaction debt measured in candidate files.
-    pub compaction_debt_files: u64,
-    /// Current complete-pass compaction debt measured in candidate bytes.
-    pub compaction_debt_bytes: u64,
-    /// Successful tasks that changed durable state.
-    pub changed_progress_effects: u64,
-    /// Snapshot-expiry tasks that honestly acknowledged no durable change.
-    pub acknowledged_noop_progress_effects: u64,
-    /// Maximum observed number of quarantined local workers in this process.
-    pub quarantined_workers: u64,
-    /// Maximum observed durable planning backlog.
-    pub planning_backlog: u64,
-    /// Maximum observed age of the oldest demand, in seconds.
-    pub oldest_demand_seconds: f64,
-    /// Nonzero candidate observations in stable strategy order.
-    pub discovered_candidates: Vec<ForgeDiscoveredCandidateTelemetry>,
-    /// Nonzero terminal task observations in stable label order.
-    pub terminal_tasks: Vec<ForgeTerminalTaskTelemetry>,
-    /// Nonzero stage failures in stable stage order.
-    pub stage_failures: Vec<ForgeStageFailureTelemetry>,
-    /// Rewrite input-file counter delta across both production sources.
-    pub rewrite_input_files: u64,
-    /// Rewrite input-byte counter delta across both production sources.
-    pub rewrite_input_bytes: u64,
-    /// Rewrite output-file counter delta across both production sources.
-    pub rewrite_output_files: u64,
-    /// Rewrite output-byte counter delta across both production sources.
-    pub rewrite_output_bytes: u64,
-    /// Total bounded production conflict counter delta.
-    pub conflicts: u64,
-    /// Validated Forge spans in capture order.
-    pub spans: Vec<ForgeCausalSpan>,
-}
-
-impl ForgeCausalTelemetryReport {
-    /// Build a causal report from one production exporter and tracing window.
-    ///
-    /// This validates telemetry-internal inventory, values, span schemas, and
-    /// ordering only. Durable SQL and Iceberg facts are intentionally consumed
-    /// later by [`Self::diagnose`].
-    ///
-    /// # Errors
-    ///
-    /// Returns a typed report error for a missing family, open label, invalid
-    /// numeric value, malformed span, or impossible telemetry ordering.
-    pub fn from_production_delta(
-        delta: &BifrostTelemetryDelta,
-    ) -> Result<Self, BifrostTelemetryReportError> {
-        ForgeCausalReportBuilder::new(delta).build()
-    }
-
-    /// Corroborate telemetry against authoritative durable Forge state.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BifrostTelemetryReportError::InvalidBinding`] when captured
-    /// telemetry and SQL/Iceberg state cannot describe the same workflow.
-    pub fn diagnose(
-        &self,
-        workflow: &ForgeWorkflowInspection,
-        rewrite: Option<&ForgeRewriteComparison>,
-    ) -> Result<ForgeCausalDiagnosis, BifrostTelemetryReportError> {
-        let scheduler_span = self
-            .spans
-            .iter()
-            .any(|span| span.name == ForgeCausalSpanName::SchedulerPass);
-        let task_span = self
-            .spans
-            .iter()
-            .any(|span| span.name == ForgeCausalSpanName::TaskExecute);
-        let commit_span = self.spans.iter().any(|span| {
-            span.name == ForgeCausalSpanName::CatalogCommit && span.result == "succeeded"
-        });
-        let has_task = !workflow.tasks.is_empty();
-        let unschedulable_count = workflow
-            .tasks
-            .iter()
-            .filter(|(_, state)| state == "unschedulable")
-            .count() as u64;
-        let unschedulable_metric = self
-            .terminal_tasks
-            .iter()
-            .filter(|task| task.result == ForgeTelemetryTaskResult::Unschedulable)
-            .map(|task| task.count)
-            .sum::<u64>();
-        let executed_state = workflow.tasks.iter().any(|(_, state)| {
-            matches!(
-                state.as_str(),
-                "claimed"
-                    | "running"
-                    | "prepared"
-                    | "succeeded"
-                    | "retryable"
-                    | "failed"
-                    | "cancelled"
-            )
-        });
-        let succeeded_state = workflow.tasks.iter().any(|(_, state)| state == "succeeded");
-        if has_task && !scheduler_span {
-            return Err(causal_binding("durable task has no scheduler-pass span"));
-        }
-        if task_span && !has_task {
-            return Err(causal_binding("task execution span has no durable task"));
-        }
-        if unschedulable_count != unschedulable_metric {
-            return Err(causal_binding(
-                "durable unschedulable tasks and terminal telemetry disagree",
-            ));
-        }
-        if unschedulable_count > 0 {
-            if task_span || workflow.has_demand || self.demands_continued > 0 {
-                return Err(causal_binding(
-                    "terminally blocked unschedulable work has execution or successor evidence",
-                ));
-            }
-            return Ok(ForgeCausalDiagnosis::AttemptFailedOrRetryable);
-        }
-        if executed_state && !task_span {
-            return Err(causal_binding("executed durable task has no task span"));
-        }
-        if commit_span && !succeeded_state {
-            return Err(causal_binding(
-                "catalog commit has no succeeded durable task",
-            ));
-        }
-        if succeeded_state && !commit_span {
-            return Err(causal_binding(
-                "succeeded durable task has no catalog commit",
-            ));
-        }
-        if succeeded_state && self.demands_continued == 0 {
-            return Err(causal_binding(
-                "succeeded durable task has no continued demand transition",
-            ));
-        }
-        if rewrite.is_some() && !(succeeded_state && commit_span) {
-            return Err(causal_binding(
-                "rewrite comparison has no committed durable task",
-            ));
-        }
-
-        if self.accepted_hints == 0 {
-            return Ok(ForgeCausalDiagnosis::NoAcceptedHint);
-        }
-        if self.persisted_hints == 0 {
-            return Ok(ForgeCausalDiagnosis::AcceptedHintNotPersisted);
-        }
-        if workflow.has_demand && !has_task {
-            return Ok(ForgeCausalDiagnosis::PersistedDemandNotPlanned);
-        }
-        let ready = workflow.tasks.iter().any(|(_, state)| state == "ready");
-        let completed_attempt = task_span || self.terminal_tasks.iter().any(|task| task.count > 0);
-        if ready
-            && workflow.active_claims == 0
-            && workflow.active_attempts == 0
-            && !completed_attempt
-        {
-            return Ok(ForgeCausalDiagnosis::ReadyTaskNotClaimed);
-        }
-        let failed_state = workflow
-            .tasks
-            .iter()
-            .any(|(_, state)| matches!(state.as_str(), "retryable" | "failed"));
-        let failed_metric = self.terminal_tasks.iter().any(|task| {
-            matches!(
-                task.result,
-                ForgeTelemetryTaskResult::Retryable | ForgeTelemetryTaskResult::Failed
-            ) && task.count > 0
-        });
-        if failed_state || failed_metric {
-            return Ok(ForgeCausalDiagnosis::AttemptFailedOrRetryable);
-        }
-        if succeeded_state || commit_span {
-            return match rewrite {
-                Some(comparison)
-                    if !comparison.input_files.is_empty()
-                        && !comparison.output_files.is_empty()
-                        && comparison.output_files.len() < comparison.input_files.len()
-                        && workflow.active_claims == 0
-                        && workflow.active_attempts == 0 =>
-                {
-                    Ok(ForgeCausalDiagnosis::Converged)
-                }
-                _ => Ok(ForgeCausalDiagnosis::CommitDidNotReduceFileDebt),
-            };
-        }
-        Ok(ForgeCausalDiagnosis::PersistedDemandNotPlanned)
-    }
-}
-
-/// Stateful mapper that enforces the causal report's closed production schema.
-struct ForgeCausalReportBuilder<'a> {
-    /// Single production telemetry window being projected.
-    delta: &'a BifrostTelemetryDelta,
-}
-
-impl<'a> ForgeCausalReportBuilder<'a> {
-    /// Bind a builder to one immutable telemetry window.
-    fn new(delta: &'a BifrostTelemetryDelta) -> Self {
-        Self { delta }
-    }
-
-    /// Validate and project the complete causal report.
-    ///
-    /// # Errors
-    ///
-    /// Returns a typed report error when any metric or span violates the closed
-    /// production contract.
-    fn build(&self) -> Result<ForgeCausalTelemetryReport, BifrostTelemetryReportError> {
-        validate_causal_metric_contract(self.delta)?;
-        let spans = causal_spans(self.delta)?;
-        validate_causal_span_order(&spans)?;
-        let accepted_hints = causal_count(
-            self.delta,
-            "bifrost_forge_hints_total",
-            &[("result", "accepted")],
-        )?;
-        let persisted_hints = causal_count(
-            self.delta,
-            "bifrost_forge_hint_persistence_total",
-            &[("result", "succeeded")],
-        )?;
-        let failed_hint_persistence = causal_count(
-            self.delta,
-            "bifrost_forge_hint_persistence_total",
-            &[("result", "failed")],
-        )?;
-        let persistence_spans = spans
-            .iter()
-            .filter(|span| span.name == ForgeCausalSpanName::HintPersist)
-            .count() as u64;
-        if persisted_hints + failed_hint_persistence != persistence_spans {
-            return Err(causal_binding(
-                "hint persistence metrics and spans disagree",
-            ));
-        }
-        if persisted_hints + failed_hint_persistence > accepted_hints {
-            return Err(causal_binding(
-                "completed persistence exceeds accepted hints",
-            ));
-        }
-        let scheduler_complete = causal_count(
-            self.delta,
-            "bifrost_forge_scheduling_total",
-            &[("result", "complete")],
-        )?;
-        let scheduler_incomplete = causal_count(
-            self.delta,
-            "bifrost_forge_scheduling_total",
-            &[("result", "incomplete")],
-        )?;
-        let succeeded_scheduler = spans.iter().any(|span| {
-            span.name == ForgeCausalSpanName::SchedulerPass && span.result == "succeeded"
-        });
-        if (scheduler_complete + scheduler_incomplete > 0) != succeeded_scheduler {
-            return Err(causal_binding(
-                "scheduler counters and succeeded span disagree",
-            ));
-        }
-        let attempt_resources = causal_attempt_resources(self.delta)?;
-        for observation in &attempt_resources {
-            if observation.acquired_bytes != observation.planned_bytes
-                || observation.peak_bytes > observation.acquired_bytes
-            {
-                return Err(causal_binding(
-                    "Forge attempt resource telemetry violates peak <= acquired == planned",
-                ));
-            }
-        }
-        let resource_releases = causal_resource_releases(self.delta)?;
-        if resource_releases.len() != 2
-            || resource_releases[0].released != resource_releases[1].released
-            || resource_releases[0].poisoned != resource_releases[1].poisoned
-        {
-            return Err(causal_binding(
-                "Forge memory and scratch release outcomes disagree",
-            ));
-        }
-        Ok(ForgeCausalTelemetryReport {
-            accepted_hints,
-            full_hints: causal_count(
-                self.delta,
-                "bifrost_forge_hints_total",
-                &[("result", "full")],
-            )?,
-            closed_hints: causal_count(
-                self.delta,
-                "bifrost_forge_hints_total",
-                &[("result", "closed")],
-            )?,
-            persisted_hints,
-            failed_hint_persistence,
-            scheduler_complete,
-            scheduler_incomplete,
-            demands_drained: causal_count(
-                self.delta,
-                "bifrost_forge_demand_transitions_total",
-                &[("result", "drained")],
-            )?,
-            demands_continued: causal_count(
-                self.delta,
-                "bifrost_forge_demand_transitions_total",
-                &[("result", "continued")],
-            )?,
-            demand_generations_changed: causal_count(
-                self.delta,
-                "bifrost_forge_demand_transitions_total",
-                &[("result", "generation_changed")],
-            )?,
-            demand_transition_failures: causal_count(
-                self.delta,
-                "bifrost_forge_demand_transitions_total",
-                &[("result", "failed")],
-            )?,
-            data_refusals: causal_count(
-                self.delta,
-                "bifrost_forge_task_failures_total",
-                &[("failure_class", "data_refusal")],
-            )?,
-            transient_object_store_failures: causal_count(
-                self.delta,
-                "bifrost_forge_task_failures_total",
-                &[("failure_class", "transient_object_store")],
-            )?,
-            transient_coordination_failures: causal_count(
-                self.delta,
-                "bifrost_forge_task_failures_total",
-                &[("failure_class", "transient_coordination")],
-            )?,
-            storage_health_failures: causal_count(
-                self.delta,
-                "bifrost_forge_task_failures_total",
-                &[("failure_class", "storage_health")],
-            )?,
-            capacity_refusals: causal_count(
-                self.delta,
-                "bifrost_forge_task_failures_total",
-                &[("failure_class", "capacity_refused")],
-            )?,
-            internal_invariant_failures: causal_count(
-                self.delta,
-                "bifrost_forge_task_failures_total",
-                &[("failure_class", "internal_invariant")],
-            )?,
-            attempt_resources,
-            resource_releases,
-            execution_envelope_failures: causal_resource_counts(
-                self.delta,
-                "bifrost_forge_execution_envelope_failures_total",
-            )?,
-            legacy_envelopes_replanned: causal_count(
-                self.delta,
-                "bifrost_forge_legacy_envelopes_superseded_total",
-                &[("result", "replanned")],
-            )?,
-            legacy_envelope_supersession_failures: causal_count(
-                self.delta,
-                "bifrost_forge_legacy_envelopes_superseded_total",
-                &[("result", "failed")],
-            )?,
-            retries: causal_failure_class_counts(self.delta, "bifrost_forge_retries_total")?,
-            terminal_poisons: causal_failure_class_counts(
-                self.delta,
-                "bifrost_forge_terminal_poisons_total",
-            )?,
-            admission_capacity_refusals: causal_count(
-                self.delta,
-                "bifrost_forge_capacity_refusals_total",
-                &[("phase", "admission")],
-            )?,
-            execution_capacity_refusals: causal_count(
-                self.delta,
-                "bifrost_forge_capacity_refusals_total",
-                &[("phase", "execution")],
-            )?,
-            compaction_debt_files: causal_labeled_gauge_count(
-                self.delta,
-                "bifrost_forge_compaction_debt",
-                "unit",
-                "files",
-            )?,
-            compaction_debt_bytes: causal_labeled_gauge_count(
-                self.delta,
-                "bifrost_forge_compaction_debt",
-                "unit",
-                "bytes",
-            )?,
-            changed_progress_effects: causal_count(
-                self.delta,
-                "bifrost_forge_progress_effects_total",
-                &[("effect", "changed")],
-            )?,
-            acknowledged_noop_progress_effects: causal_count(
-                self.delta,
-                "bifrost_forge_progress_effects_total",
-                &[("effect", "acknowledged_noop")],
-            )?,
-            quarantined_workers: causal_gauge_count(
-                self.delta,
-                "bifrost_forge_worker_quarantined",
-            )?,
-            planning_backlog: causal_gauge_count(self.delta, "bifrost_forge_planning_backlog")?,
-            oldest_demand_seconds: causal_gauge(
-                self.delta,
-                "bifrost_forge_oldest_backlog_seconds",
-            )?,
-            discovered_candidates: causal_discovered_candidates(self.delta)?,
-            terminal_tasks: causal_terminal_tasks(self.delta)?,
-            stage_failures: causal_stage_failures(self.delta)?,
-            rewrite_input_files: causal_source_total(
-                self.delta,
-                "bifrost_forge_rewrite_input_files_total",
-            )?,
-            rewrite_input_bytes: causal_source_total(
-                self.delta,
-                "bifrost_forge_rewrite_input_bytes_total",
-            )?,
-            rewrite_output_files: causal_source_total(
-                self.delta,
-                "bifrost_forge_rewrite_output_files_total",
-            )?,
-            rewrite_output_bytes: causal_source_total(
-                self.delta,
-                "bifrost_forge_rewrite_output_bytes_total",
-            )?,
-            conflicts: ["lease_contention", "fence_lost", "snapshot_changed"]
-                .into_iter()
-                .try_fold(0_u64, |total, kind| {
-                    causal_count(
-                        self.delta,
-                        "bifrost_forge_conflicts_total",
-                        &[("kind", kind)],
-                    )
-                    .and_then(|value| {
-                        total
-                            .checked_add(value)
-                            .ok_or_else(|| causal_binding("conflict count overflow"))
-                    })
-                })?,
-            spans,
-        })
-    }
-}
-
-/// Construct the stable private binding error used by causal corroboration.
-fn causal_binding(detail: &str) -> BifrostTelemetryReportError {
-    BifrostTelemetryReportError::InvalidBinding {
-        id: "forge_causal_workflow".to_owned(),
-        detail: detail.to_owned(),
-    }
-}
-
-/// Validate labels, kinds, and finite non-negative values for causal families.
-///
-/// # Errors
-///
-/// Returns a typed report error when a required family is absent or any sample
-/// violates its closed schema.
-fn validate_causal_metric_contract(
-    delta: &BifrostTelemetryDelta,
-) -> Result<(), BifrostTelemetryReportError> {
-    let required = [
-        "bifrost_forge_hints_total",
-        "bifrost_forge_hint_persistence_total",
-        "bifrost_forge_hint_persistence_seconds",
-        "bifrost_forge_scheduling_total",
-        "bifrost_forge_demand_transitions_total",
-        "bifrost_forge_task_failures_total",
-        "bifrost_forge_attempt_resource_bytes",
-        "bifrost_forge_attempt_resource_releases_total",
-        "bifrost_forge_execution_envelope_failures_total",
-        "bifrost_forge_legacy_envelopes_superseded_total",
-        "bifrost_forge_retries_total",
-        "bifrost_forge_terminal_poisons_total",
-        "bifrost_forge_capacity_refusals_total",
-        "bifrost_forge_compaction_debt",
-        "bifrost_forge_progress_effects_total",
-        "bifrost_forge_worker_quarantined",
-        "bifrost_forge_discovered_candidate_files",
-        "bifrost_forge_discovered_candidate_bytes",
-        "bifrost_forge_planning_demand_total",
-        "bifrost_forge_planning_backlog",
-        "bifrost_forge_oldest_backlog_seconds",
-        "bifrost_forge_task_duration_seconds",
-        "bifrost_forge_stage_failures_total",
-        "bifrost_forge_stage_seconds",
-        "bifrost_forge_rewrite_input_files_total",
-        "bifrost_forge_rewrite_input_bytes_total",
-        "bifrost_forge_rewrite_output_files_total",
-        "bifrost_forge_rewrite_output_bytes_total",
-        "bifrost_forge_conflicts_total",
-    ];
-    for family in required {
-        if !delta.families.contains(family) {
-            return Err(BifrostTelemetryReportError::MissingSeries {
-                family: family.to_owned(),
-            });
-        }
-    }
-    for sample in delta
-        .metrics
-        .iter()
-        .chain(&delta.gauge_maxima)
-        .chain(&delta.gauge_final)
-    {
-        if !required.contains(&sample.family.as_str()) {
-            continue;
-        }
-        if !sample.value.is_finite() || sample.value < 0.0 {
-            return Err(causal_binding(
-                "causal metric value is negative or non-finite",
-            ));
-        }
-        let (allowed, categorical): (&[&str], &[(&str, &[&str])]) = match sample.family.as_str() {
-            "bifrost_forge_hints_total" => {
-                (&["result"], &[("result", &["accepted", "full", "closed"])])
-            }
-            "bifrost_forge_hint_persistence_total" | "bifrost_forge_hint_persistence_seconds" => {
-                (&["result", "le"], &[("result", &["succeeded", "failed"])])
-            }
-            "bifrost_forge_scheduling_total" => {
-                (&["result"], &[("result", &["complete", "incomplete"])])
-            }
-            "bifrost_forge_demand_transitions_total" => (
-                &["result"],
-                &[(
-                    ("result"),
-                    &["drained", "continued", "generation_changed", "failed"],
-                )],
-            ),
-            "bifrost_forge_task_failures_total" => (
-                &["failure_class"],
-                &[(
-                    "failure_class",
-                    &[
-                        "data_refusal",
-                        "transient_object_store",
-                        "transient_coordination",
-                        "storage_health",
-                        "capacity_refused",
-                        "internal_invariant",
-                    ],
-                )],
-            ),
-            "bifrost_forge_attempt_resource_bytes" => (
-                &["resource", "observation", "le"],
-                &[
-                    ("resource", &["memory", "scratch"]),
-                    ("observation", &["planned", "acquired", "peak"]),
-                ],
-            ),
-            "bifrost_forge_attempt_resource_releases_total" => (
-                &["resource", "result"],
-                &[
-                    ("resource", &["memory", "scratch"]),
-                    ("result", &["released", "poisoned"]),
-                ],
-            ),
-            "bifrost_forge_execution_envelope_failures_total" => {
-                (&["resource"], &[("resource", &["memory", "scratch"])])
-            }
-            "bifrost_forge_legacy_envelopes_superseded_total" => {
-                (&["result"], &[("result", &["replanned", "failed"])])
-            }
-            "bifrost_forge_retries_total" | "bifrost_forge_terminal_poisons_total" => (
-                &["failure_class"],
-                &[(
-                    "failure_class",
-                    &[
-                        "data_refusal",
-                        "transient_object_store",
-                        "transient_coordination",
-                        "storage_health",
-                        "capacity_refused",
-                        "internal_invariant",
-                    ],
-                )],
-            ),
-            "bifrost_forge_capacity_refusals_total" => {
-                (&["phase"], &[("phase", &["admission", "execution"])])
-            }
-            "bifrost_forge_compaction_debt" => (&["unit"], &[("unit", &["files", "bytes"])]),
-            "bifrost_forge_progress_effects_total" => (
-                &["effect"],
-                &[("effect", &["changed", "acknowledged_noop"])],
-            ),
-            "bifrost_forge_worker_quarantined" => (&[], &[]),
-            "bifrost_forge_discovered_candidate_files"
-            | "bifrost_forge_discovered_candidate_bytes" => (
-                &["strategy", "le"],
-                &[(
-                    "strategy",
-                    &[
-                        "staging_fold",
-                        "small_files",
-                        "manifest_rewrite",
-                        "snapshot_expiry",
-                    ],
-                )],
-            ),
-            "bifrost_forge_planning_demand_total" => {
-                (&["source"], &[("source", &["hint", "roster_repair"])])
-            }
-            "bifrost_forge_task_duration_seconds" => (
-                &["strategy", "result", "le"],
-                &[
-                    (
-                        "strategy",
-                        &[
-                            "staging_fold",
-                            "small_files",
-                            "manifest_rewrite",
-                            "snapshot_expiry",
-                        ],
-                    ),
-                    (
-                        "result",
-                        &[
-                            "succeeded",
-                            "retryable",
-                            "failed",
-                            "cancelled",
-                            "unschedulable",
-                        ],
-                    ),
-                ],
-            ),
-            "bifrost_forge_stage_failures_total" | "bifrost_forge_stage_seconds" => (
-                &["stage", "le"],
-                &[(
-                    "stage",
-                    &[
-                        "reconcile_staging",
-                        "reconcile_iceberg",
-                        "staging_fold",
-                        "manifest_discovery",
-                        "iceberg_rewrite",
-                        "manifest_rewrite",
-                        "snapshot_expiry",
-                        "orphan_gc",
-                    ],
-                )],
-            ),
-            "bifrost_forge_rewrite_input_files_total"
-            | "bifrost_forge_rewrite_input_bytes_total"
-            | "bifrost_forge_rewrite_output_files_total"
-            | "bifrost_forge_rewrite_output_bytes_total" => {
-                (&["source"], &[("source", &["staging", "iceberg"])])
-            }
-            "bifrost_forge_conflicts_total" => (
-                &["kind"],
-                &[(
-                    "kind",
-                    &["lease_contention", "fence_lost", "snapshot_changed"],
-                )],
-            ),
-            _ => (&[], &[]),
-        };
-        validate_sample_labels(sample, allowed, categorical)?;
-    }
-    Ok(())
-}
-
-/// Project planned, acquired, and peak bytes for both closed attempt resources.
-///
-/// # Errors
-///
-/// Returns a typed report error when a required histogram sum is invalid.
-fn causal_attempt_resources(
-    delta: &BifrostTelemetryDelta,
-) -> Result<Vec<ForgeAttemptResourceTelemetry>, BifrostTelemetryReportError> {
-    [
-        (ForgeTelemetryResource::Memory, "memory"),
-        (ForgeTelemetryResource::Scratch, "scratch"),
-    ]
-    .into_iter()
-    .map(|(resource, label)| {
-        Ok(ForgeAttemptResourceTelemetry {
-            resource,
-            planned_bytes: causal_histogram_sum(
-                delta,
-                "bifrost_forge_attempt_resource_bytes",
-                &[("resource", label), ("observation", "planned")],
-            )?,
-            acquired_bytes: causal_histogram_sum(
-                delta,
-                "bifrost_forge_attempt_resource_bytes",
-                &[("resource", label), ("observation", "acquired")],
-            )?,
-            peak_bytes: causal_histogram_sum(
-                delta,
-                "bifrost_forge_attempt_resource_bytes",
-                &[("resource", label), ("observation", "peak")],
-            )?,
-        })
-    })
-    .collect()
-}
-
-/// Project exactly-once release outcomes for both attempt resources.
-///
-/// # Errors
-///
-/// Returns a typed report error when a release counter is not an exact `u64`.
-fn causal_resource_releases(
-    delta: &BifrostTelemetryDelta,
-) -> Result<Vec<ForgeResourceReleaseTelemetry>, BifrostTelemetryReportError> {
-    [
-        (ForgeTelemetryResource::Memory, "memory"),
-        (ForgeTelemetryResource::Scratch, "scratch"),
-    ]
-    .into_iter()
-    .map(|(resource, label)| {
-        Ok(ForgeResourceReleaseTelemetry {
-            resource,
-            released: causal_count(
-                delta,
-                "bifrost_forge_attempt_resource_releases_total",
-                &[("resource", label), ("result", "released")],
-            )?,
-            poisoned: causal_count(
-                delta,
-                "bifrost_forge_attempt_resource_releases_total",
-                &[("resource", label), ("result", "poisoned")],
-            )?,
-        })
-    })
-    .collect()
-}
-
-/// Project one exact resource counter family in stable resource order.
-///
-/// # Errors
-///
-/// Returns a typed report error when a counter is not an exact `u64`.
-fn causal_resource_counts(
-    delta: &BifrostTelemetryDelta,
-    family: &str,
-) -> Result<Vec<ForgeResourceCountTelemetry>, BifrostTelemetryReportError> {
-    [
-        (ForgeTelemetryResource::Memory, "memory"),
-        (ForgeTelemetryResource::Scratch, "scratch"),
-    ]
-    .into_iter()
-    .map(|(resource, label)| {
-        Ok(ForgeResourceCountTelemetry {
-            resource,
-            count: causal_count(delta, family, &[("resource", label)])?,
-        })
-    })
-    .collect()
-}
-
-/// Project one six-class failure counter family in stable class order.
-///
-/// # Errors
-///
-/// Returns a typed report error when a counter is not an exact `u64`.
-fn causal_failure_class_counts(
-    delta: &BifrostTelemetryDelta,
-    family: &str,
-) -> Result<Vec<ForgeFailureClassTelemetry>, BifrostTelemetryReportError> {
-    [
-        (ForgeTelemetryFailureClass::DataRefusal, "data_refusal"),
-        (
-            ForgeTelemetryFailureClass::TransientObjectStore,
-            "transient_object_store",
-        ),
-        (
-            ForgeTelemetryFailureClass::TransientCoordination,
-            "transient_coordination",
-        ),
-        (ForgeTelemetryFailureClass::StorageHealth, "storage_health"),
-        (
-            ForgeTelemetryFailureClass::CapacityRefused,
-            "capacity_refused",
-        ),
-        (
-            ForgeTelemetryFailureClass::InternalInvariant,
-            "internal_invariant",
-        ),
-    ]
-    .into_iter()
-    .map(|(failure_class, label)| {
-        Ok(ForgeFailureClassTelemetry {
-            failure_class,
-            count: causal_count(delta, family, &[("failure_class", label)])?,
-        })
-    })
-    .collect()
-}
-
-/// Return one labeled final gauge value as an exact count.
-///
-/// # Errors
-///
-/// Returns a typed report error when the labeled gauge is absent or invalid.
-fn causal_labeled_gauge_count(
-    delta: &BifrostTelemetryDelta,
-    family: &str,
-    key: &str,
-    value: &str,
-) -> Result<u64, BifrostTelemetryReportError> {
-    let observed = delta
-        .gauge_final
-        .iter()
-        .filter(|sample| {
-            sample.family == family && sample.labels.get(key).map(String::as_str) == Some(value)
-        })
-        .map(|sample| sample.value)
-        .reduce(f64::max)
-        .ok_or_else(|| BifrostTelemetryReportError::MissingSeries {
-            family: family.to_owned(),
-        })?;
-    checked_causal_u64(observed, family)
-}
-
-/// Return one exact non-negative integer counter or histogram count.
-///
-/// # Errors
-///
-/// Returns a typed report error when the series is absent, non-integral, or
-/// outside `u64`.
-fn causal_count(
-    delta: &BifrostTelemetryDelta,
-    family: &str,
-    labels: &[(&str, &str)],
-) -> Result<u64, BifrostTelemetryReportError> {
-    let value = delta
-        .metrics
-        .iter()
-        .filter(|sample| {
-            sample.family == family
-                && sample.kind != BifrostMetricKind::HistogramBucket
-                && sample.kind != BifrostMetricKind::HistogramSum
-                && labels
-                    .iter()
-                    .all(|(key, value)| sample.labels.get(*key).map(String::as_str) == Some(*value))
-        })
-        .map(|sample| sample.value)
-        .sum::<f64>();
-    checked_causal_u64(value, family)
-}
-
-/// Convert one exact telemetry count to `u64`.
-///
-/// # Errors
-///
-/// Returns a typed binding error for a negative, non-finite, fractional, or
-/// overflowing value.
-fn checked_causal_u64(value: f64, family: &str) -> Result<u64, BifrostTelemetryReportError> {
-    if !value.is_finite() || value < 0.0 || value.fract() != 0.0 || value > u64::MAX as f64 {
-        return Err(causal_binding(&format!("{family} is not an exact u64")));
-    }
-    Ok(value as u64)
-}
-
-/// Return the maximum production gauge as an exact count.
-///
-/// # Errors
-///
-/// Returns a typed report error when the gauge is absent or not an exact count.
-fn causal_gauge_count(
-    delta: &BifrostTelemetryDelta,
-    family: &str,
-) -> Result<u64, BifrostTelemetryReportError> {
-    checked_causal_u64(causal_gauge(delta, family)?, family)
-}
-
-/// Return the maximum finite non-negative production gauge.
-///
-/// # Errors
-///
-/// Returns a typed report error when the required gauge is absent or invalid.
-fn causal_gauge(
-    delta: &BifrostTelemetryDelta,
-    family: &str,
-) -> Result<f64, BifrostTelemetryReportError> {
-    let value = delta
-        .gauge_maxima
-        .iter()
-        .filter(|sample| sample.family == family)
-        .map(|sample| sample.value)
-        .reduce(f64::max)
-        .ok_or_else(|| BifrostTelemetryReportError::MissingSeries {
-            family: family.to_owned(),
-        })?;
-    if !value.is_finite() || value < 0.0 {
-        return Err(causal_binding("causal gauge is negative or non-finite"));
-    }
-    Ok(value)
-}
-
-/// Sum one source-labeled production counter across its closed inventory.
-///
-/// # Errors
-///
-/// Returns a typed report error when either source series is malformed or the
-/// sum overflows.
-fn causal_source_total(
-    delta: &BifrostTelemetryDelta,
-    family: &str,
-) -> Result<u64, BifrostTelemetryReportError> {
-    ["staging", "iceberg"]
-        .into_iter()
-        .try_fold(0_u64, |total, source| {
-            causal_count(delta, family, &[("source", source)]).and_then(|value| {
-                total
-                    .checked_add(value)
-                    .ok_or_else(|| causal_binding("rewrite counter overflow"))
-            })
-        })
-}
-
-/// Project nonzero task terminal histograms in stable label order.
-///
-/// # Errors
-///
-/// Returns a typed report error for malformed histogram count or sum samples.
-fn causal_terminal_tasks(
-    delta: &BifrostTelemetryDelta,
-) -> Result<Vec<ForgeTerminalTaskTelemetry>, BifrostTelemetryReportError> {
-    let strategies = [
-        ("staging_fold", ForgeTelemetryStrategy::StagingFold),
-        ("small_files", ForgeTelemetryStrategy::SmallFiles),
-        ("manifest_rewrite", ForgeTelemetryStrategy::ManifestRewrite),
-        ("snapshot_expiry", ForgeTelemetryStrategy::SnapshotExpiry),
-    ];
-    let results = [
-        ("succeeded", ForgeTelemetryTaskResult::Succeeded),
-        ("retryable", ForgeTelemetryTaskResult::Retryable),
-        ("failed", ForgeTelemetryTaskResult::Failed),
-        ("cancelled", ForgeTelemetryTaskResult::Cancelled),
-        ("unschedulable", ForgeTelemetryTaskResult::Unschedulable),
-    ];
-    let mut rows = Vec::new();
-    for (strategy_label, strategy) in strategies {
-        for (result_label, result) in results {
-            let labels = [("strategy", strategy_label), ("result", result_label)];
-            let count = causal_count(delta, "bifrost_forge_task_duration_seconds", &labels)?;
-            if count > 0 {
-                rows.push(ForgeTerminalTaskTelemetry {
-                    strategy,
-                    result,
-                    count,
-                    duration_seconds_sum: causal_histogram_sum(
-                        delta,
-                        "bifrost_forge_task_duration_seconds",
-                        &labels,
-                    )?,
-                });
-            }
-        }
-    }
-    Ok(rows)
-}
-
-/// Project nonzero candidate discovery histograms in stable strategy order.
-///
-/// # Errors
-///
-/// Returns a typed report error for malformed histogram count or sum samples.
-fn causal_discovered_candidates(
-    delta: &BifrostTelemetryDelta,
-) -> Result<Vec<ForgeDiscoveredCandidateTelemetry>, BifrostTelemetryReportError> {
-    let strategies = [
-        ("staging_fold", ForgeTelemetryStrategy::StagingFold),
-        ("small_files", ForgeTelemetryStrategy::SmallFiles),
-        ("manifest_rewrite", ForgeTelemetryStrategy::ManifestRewrite),
-        ("snapshot_expiry", ForgeTelemetryStrategy::SnapshotExpiry),
-    ];
-    let mut rows = Vec::new();
-    for (label, strategy) in strategies {
-        let labels = [("strategy", label)];
-        let files_count = causal_count(delta, "bifrost_forge_discovered_candidate_files", &labels)?;
-        let bytes_count = causal_count(delta, "bifrost_forge_discovered_candidate_bytes", &labels)?;
-        if files_count != bytes_count {
-            return Err(causal_binding(
-                "candidate file and byte observation counts disagree",
-            ));
-        }
-        if files_count > 0 {
-            rows.push(ForgeDiscoveredCandidateTelemetry {
-                strategy,
-                count: files_count,
-                files_sum: causal_histogram_sum(
-                    delta,
-                    "bifrost_forge_discovered_candidate_files",
-                    &labels,
-                )?,
-                bytes_sum: causal_histogram_sum(
-                    delta,
-                    "bifrost_forge_discovered_candidate_bytes",
-                    &labels,
-                )?,
-            });
-        }
-    }
-    Ok(rows)
-}
-
-/// Project nonzero stage failure counters in stable stage order.
-///
-/// # Errors
-///
-/// Returns a typed report error for malformed failure or duration samples.
-fn causal_stage_failures(
-    delta: &BifrostTelemetryDelta,
-) -> Result<Vec<ForgeStageFailureTelemetry>, BifrostTelemetryReportError> {
-    let stages = [
-        ("reconcile_staging", ForgeTelemetryStage::ReconcileStaging),
-        ("reconcile_iceberg", ForgeTelemetryStage::ReconcileIceberg),
-        ("staging_fold", ForgeTelemetryStage::StagingFold),
-        ("manifest_discovery", ForgeTelemetryStage::ManifestDiscovery),
-        ("iceberg_rewrite", ForgeTelemetryStage::IcebergRewrite),
-        ("manifest_rewrite", ForgeTelemetryStage::ManifestRewrite),
-        ("snapshot_expiry", ForgeTelemetryStage::SnapshotExpiry),
-        ("orphan_gc", ForgeTelemetryStage::OrphanGc),
-    ];
-    let mut rows = Vec::new();
-    for (label, stage) in stages {
-        let labels = [("stage", label)];
-        let count = causal_count(delta, "bifrost_forge_stage_failures_total", &labels)?;
-        if count > 0 {
-            rows.push(ForgeStageFailureTelemetry {
-                stage,
-                count,
-                duration_seconds_sum: causal_histogram_sum(
-                    delta,
-                    "bifrost_forge_stage_seconds",
-                    &labels,
-                )?,
-            });
-        }
-    }
-    Ok(rows)
-}
-
-/// Return a finite non-negative histogram sum for exact labels.
-///
-/// # Errors
-///
-/// Returns a typed report error when the sum is absent or numerically invalid.
-fn causal_histogram_sum(
-    delta: &BifrostTelemetryDelta,
-    family: &str,
-    labels: &[(&str, &str)],
-) -> Result<f64, BifrostTelemetryReportError> {
-    let value = delta
-        .metrics
-        .iter()
-        .filter(|sample| {
-            sample.family == family
-                && sample.kind == BifrostMetricKind::HistogramSum
-                && labels
-                    .iter()
-                    .all(|(key, value)| sample.labels.get(*key).map(String::as_str) == Some(*value))
-        })
-        .map(|sample| sample.value)
-        .sum::<f64>();
-    if !value.is_finite() || value < 0.0 {
-        return Err(causal_binding("histogram sum is negative or non-finite"));
-    }
-    Ok(value)
-}
-
-/// Validate and project captured Forge spans without changing capture order.
-///
-/// # Errors
-///
-/// Returns a typed span error for an unknown name, attribute, closed value, or
-/// malformed UUID.
-fn causal_spans(
-    delta: &BifrostTelemetryDelta,
-) -> Result<Vec<ForgeCausalSpan>, BifrostTelemetryReportError> {
-    let mut projected = Vec::new();
-    for span in &delta.spans {
-        let (name, expected, results, roles, ids) = match span.name.as_str() {
-            "bifrost.forge.hint.persist" => (
-                ForgeCausalSpanName::HintPersist,
-                &["result", "role"][..],
-                &["succeeded", "failed"][..],
-                &["server"][..],
-                false,
-            ),
-            "bifrost.forge.scheduler.pass" => (
-                ForgeCausalSpanName::SchedulerPass,
-                &["result", "role"][..],
-                &["succeeded", "failed", "standby"][..],
-                &["server"][..],
-                false,
-            ),
-            "bifrost.forge.task.execute" => (
-                ForgeCausalSpanName::TaskExecute,
-                &["attempt_id", "result", "role", "strategy", "task_id"][..],
-                &[
-                    "succeeded",
-                    "retryable",
-                    "failed",
-                    "cancelled",
-                    "unschedulable",
-                ][..],
-                &["forge_worker"][..],
-                true,
-            ),
-            "bifrost.forge.catalog.commit" => (
-                ForgeCausalSpanName::CatalogCommit,
-                &["attempt_id", "result", "role", "strategy", "task_id"][..],
-                &["succeeded", "failed", "timed_out", "cancelled"][..],
-                &["forge_worker"][..],
-                true,
-            ),
-            "bifrost.forge.cleanup" => (
-                ForgeCausalSpanName::Cleanup,
-                &[
-                    "attempt_id",
-                    "kind",
-                    "result",
-                    "role",
-                    "strategy",
-                    "task_id",
-                ][..],
-                &["succeeded", "failed"][..],
-                &["forge_worker"][..],
-                true,
-            ),
-            name if name.starts_with("bifrost.forge.") => {
-                return Err(BifrostTelemetryReportError::InvalidSpan {
-                    span: name.to_owned(),
-                    detail: "unexpected Forge instrumentation name".to_owned(),
-                });
-            }
-            _ => continue,
-        };
-        validate_span_attribute_set(span, expected)?;
-        validate_closed_span_attribute(span, "result", results)?;
-        validate_closed_span_attribute(span, "role", roles)?;
-        if matches!(
-            name,
-            ForgeCausalSpanName::TaskExecute | ForgeCausalSpanName::CatalogCommit
-        ) {
-            validate_closed_span_attribute(
-                span,
-                "strategy",
-                if name == ForgeCausalSpanName::CatalogCommit {
-                    &["staging_fold", "small_files", "manifest_rewrite"]
-                } else {
-                    &[
-                        "staging_fold",
-                        "small_files",
-                        "manifest_rewrite",
-                        "snapshot_expiry",
-                    ]
-                },
-            )?;
-        } else if name == ForgeCausalSpanName::Cleanup {
-            validate_closed_span_attribute(span, "strategy", &["snapshot_expiry"])?;
-            validate_closed_span_attribute(span, "kind", &["expired"])?;
-        }
-        let (task_id, attempt_id) = if ids {
-            validate_span_uuid(span, "task_id")?;
-            validate_span_uuid(span, "attempt_id")?;
-            (
-                span.attributes.get("task_id").cloned(),
-                span.attributes.get("attempt_id").cloned(),
-            )
-        } else {
-            (None, None)
-        };
-        projected.push(ForgeCausalSpan {
-            name,
-            result: span.attributes["result"].clone(),
-            role: span.attributes["role"].clone(),
-            task_id,
-            attempt_id,
-        });
-    }
-    Ok(projected)
-}
-
-/// Enforce causal prerequisites among captured production Forge spans.
-///
-/// Exporters may deliver concurrently completed spans in a different vector
-/// order than their start times, so causality is proven by the presence of the
-/// required upstream span rather than the capture vector position.
-///
-/// # Errors
-///
-/// Returns a typed binding error when a downstream span appears before its
-/// required upstream production transition.
-fn validate_causal_span_order(
-    spans: &[ForgeCausalSpan],
-) -> Result<(), BifrostTelemetryReportError> {
-    let scheduler_seen = spans
-        .iter()
-        .any(|span| span.name == ForgeCausalSpanName::SchedulerPass);
-    let succeeded_task_seen = spans
-        .iter()
-        .any(|span| span.name == ForgeCausalSpanName::TaskExecute && span.result == "succeeded");
-    for span in spans {
-        match span.name {
-            ForgeCausalSpanName::TaskExecute => {
-                if !scheduler_seen {
-                    return Err(causal_binding("task span has no scheduler span"));
-                }
-            }
-            ForgeCausalSpanName::CatalogCommit if !succeeded_task_seen => {
-                return Err(causal_binding("catalog commit has no succeeded task span"));
-            }
-            ForgeCausalSpanName::HintPersist
-            | ForgeCausalSpanName::SchedulerPass
-            | ForgeCausalSpanName::CatalogCommit
-            | ForgeCausalSpanName::Cleanup => {}
-        }
-    }
-    Ok(())
-}
-
-impl ForgeMaintenanceTelemetryReport {
-    /// Map every Forge-only R13 field from one production exporter window.
-    ///
-    /// # Errors
-    ///
-    /// Returns a typed error when any required production family, activity
-    /// counter, histogram, or expected active role is absent or stale.
-    pub fn from_production_delta(
-        delta: &BifrostTelemetryDelta,
-        expected_roles: &BTreeMap<String, u64>,
-    ) -> Result<Self, BifrostTelemetryReportError> {
-        validate_forge_span_contract(delta)?;
-        validate_forge_label_contract(delta)?;
-        let role_topology = validate_role_topology(delta, expected_roles)?;
-        require_advanced(delta, "bifrost_forge_complete_gauge_publications_total")?;
-        require_advanced(delta, "bifrost_memory_reservations_total")?;
-        let rewrite_bytes = sum(delta, "bifrost_forge_rewrite_output_bytes_total", &[])?;
-        let task_latency_p99_us = histogram_quantile_for_label(
-            delta,
-            "bifrost_forge_task_duration_seconds",
-            "result",
-            "succeeded",
-            0.99,
-        )? * 1_000_000.0;
-        let spill_bytes = histogram_quantile(delta, "bifrost_forge_task_spill_bytes", 1.0)?;
-        let cleanup_delay_us =
-            histogram_quantile(delta, "bifrost_forge_cleanup_duration_seconds", 1.0)? * 1_000_000.0;
-        let backlog_age_us =
-            gauge(delta, "bifrost_forge_oldest_backlog_seconds", &[])? * 1_000_000.0;
-        let peak_parent_memory = gauge(
-            delta,
-            "bifrost_resource_current_bytes",
-            &[("role", "forge"), ("resource", "memory")],
-        )?;
-        let fairness_lag_tasks = gauge(delta, "bifrost_forge_fairness_lag_tasks", &[])?;
-        Ok(Self {
-            throughput_mib_per_sec: rewrite_bytes / (1024.0 * 1024.0 * delta.interval_seconds),
-            task_latency_p99_us,
-            backlog_age_us,
-            peak_parent_memory,
-            spill_bytes,
-            lease_contention: sum(
-                delta,
-                "bifrost_forge_conflicts_total",
-                &[("kind", "lease_contention")],
-            )?,
-            fence_lost: sum(
-                delta,
-                "bifrost_forge_conflicts_total",
-                &[("kind", "fence_lost")],
-            )?,
-            snapshot_changed: sum(
-                delta,
-                "bifrost_forge_conflicts_total",
-                &[("kind", "snapshot_changed")],
-            )?,
-            fairness_lag_tasks,
-            cleanup_delay_us,
-            role_topology,
-        })
-    }
-}
-
-/// Validate all exact-run Forge spans against their closed production schemas.
-///
-/// Every captured Forge-prefixed span must be one of the four normative names,
-/// and every instance must carry its required owner-authored attributes. Known
-/// tracing-provider semantic attributes are tolerated because they are added
-/// after owner instrumentation; task and attempt UUIDs remain the sole
-/// permitted owner-authored high-cardinality values.
-///
-/// # Errors
-///
-/// Returns [`BifrostTelemetryReportError::MissingSpan`] when a required owner did
-/// not emit, or [`BifrostTelemetryReportError::InvalidSpan`] for renamed spans,
-/// missing/extra attributes, open values, or malformed scrubbed UUIDs.
-fn validate_forge_span_contract(
-    delta: &BifrostTelemetryDelta,
-) -> Result<(), BifrostTelemetryReportError> {
-    let required = [
-        "bifrost.forge.scheduler.pass",
-        "bifrost.forge.task.execute",
-        "bifrost.forge.catalog.commit",
-        "bifrost.forge.cleanup",
-    ];
-    let mut seen = BTreeSet::new();
-    for span in &delta.spans {
-        match span.name.as_str() {
-            "bifrost.forge.scheduler.pass" => {
-                validate_span_attribute_set(span, &["result", "role"])?;
-                validate_closed_span_attribute(span, "result", &["succeeded", "failed"])?;
-                validate_closed_span_attribute(span, "role", &["server"])?;
-            }
-            "bifrost.forge.task.execute" => {
-                validate_span_attribute_set(
-                    span,
-                    &["attempt_id", "result", "role", "strategy", "task_id"],
-                )?;
-                validate_closed_span_attribute(
-                    span,
-                    "strategy",
-                    &[
-                        "staging_fold",
-                        "small_files",
-                        "manifest_rewrite",
-                        "snapshot_expiry",
-                    ],
-                )?;
-                validate_closed_span_attribute(
-                    span,
-                    "result",
-                    &[
-                        "succeeded",
-                        "retryable",
-                        "failed",
-                        "cancelled",
-                        "unschedulable",
-                    ],
-                )?;
-                validate_closed_span_attribute(span, "role", &["forge_worker"])?;
-                validate_span_uuid(span, "task_id")?;
-                validate_span_uuid(span, "attempt_id")?;
-            }
-            "bifrost.forge.catalog.commit" => {
-                validate_span_attribute_set(
-                    span,
-                    &["attempt_id", "result", "role", "strategy", "task_id"],
-                )?;
-                validate_closed_span_attribute(
-                    span,
-                    "strategy",
-                    &["staging_fold", "small_files", "manifest_rewrite"],
-                )?;
-                validate_closed_span_attribute(
-                    span,
-                    "result",
-                    &["succeeded", "failed", "timed_out", "cancelled"],
-                )?;
-                validate_closed_span_attribute(span, "role", &["forge_worker"])?;
-                validate_span_uuid(span, "task_id")?;
-                validate_span_uuid(span, "attempt_id")?;
-            }
-            "bifrost.forge.cleanup" => {
-                validate_span_attribute_set(
-                    span,
-                    &[
-                        "attempt_id",
-                        "kind",
-                        "result",
-                        "role",
-                        "strategy",
-                        "task_id",
-                    ],
-                )?;
-                validate_closed_span_attribute(span, "kind", &["expired"])?;
-                validate_closed_span_attribute(span, "strategy", &["snapshot_expiry"])?;
-                validate_closed_span_attribute(span, "result", &["succeeded", "failed"])?;
-                validate_closed_span_attribute(span, "role", &["forge_worker"])?;
-                validate_span_uuid(span, "task_id")?;
-                validate_span_uuid(span, "attempt_id")?;
-            }
-            name if name.starts_with("bifrost.forge.") => {
-                return Err(BifrostTelemetryReportError::InvalidSpan {
-                    span: name.to_owned(),
-                    detail: "unexpected Forge instrumentation name".to_owned(),
-                });
-            }
-            _ => continue,
-        }
-        seen.insert(span.name.as_str());
-    }
-    for name in required {
-        if !seen.contains(name) {
-            return Err(BifrostTelemetryReportError::MissingSpan {
-                span: name.to_owned(),
-            });
-        }
-    }
-    Ok(())
-}
-
-/// Require one captured span to expose its approved owner-authored attributes.
-///
-/// The tracing provider may append its standard source, thread, and timing
-/// attributes. All other additions remain invalid so owner instrumentation
-/// cannot leak tenant data, object paths, SQL text, or error text.
-///
-/// # Errors
-///
-/// Returns [`BifrostTelemetryReportError::InvalidSpan`] when a required field is
-/// absent or any prohibited, sensitive, or otherwise unapproved field appears.
-fn validate_span_attribute_set(
-    span: &CapturedSpan,
-    expected: &[&str],
-) -> Result<(), BifrostTelemetryReportError> {
-    let actual = span
-        .attributes
-        .keys()
-        .map(String::as_str)
-        .collect::<BTreeSet<_>>();
-    let expected = expected.iter().copied().collect::<BTreeSet<_>>();
-    let provider = [
-        "busy_ns",
-        "code.file.path",
-        "code.filepath",
-        "code.line.number",
-        "code.lineno",
-        "code.module.name",
-        "code.namespace",
-        "idle_ns",
-        "thread.id",
-        "thread.name",
-        "target",
-    ]
-    .into_iter()
-    .collect::<BTreeSet<_>>();
-    let missing = expected.difference(&actual).copied().collect::<Vec<_>>();
-    let unexpected = actual
-        .difference(&expected)
-        .filter(|key| !provider.contains(**key))
-        .copied()
-        .collect::<Vec<_>>();
-    if !missing.is_empty() || !unexpected.is_empty() {
-        return Err(BifrostTelemetryReportError::InvalidSpan {
-            span: span.name.clone(),
-            detail: format!(
-                "closed attribute contract has missing keys {missing:?} and unexpected keys {unexpected:?}"
-            ),
-        });
-    }
-    Ok(())
-}
-
-/// Validate one fixed-cardinality span attribute against its closed values.
-///
-/// # Errors
-///
-/// Returns [`BifrostTelemetryReportError::InvalidSpan`] when the attribute is
-/// absent or its value is outside the approved set.
-fn validate_closed_span_attribute(
-    span: &CapturedSpan,
-    key: &str,
-    allowed: &[&str],
-) -> Result<(), BifrostTelemetryReportError> {
-    let valid = span
-        .attributes
-        .get(key)
-        .is_some_and(|value| allowed.contains(&value.as_str()));
-    if !valid {
-        return Err(BifrostTelemetryReportError::InvalidSpan {
-            span: span.name.clone(),
-            detail: format!("attribute {key} is absent or outside its closed values"),
-        });
-    }
-    Ok(())
-}
-
-/// Validate one permitted high-cardinality field as a scrubbed UUID.
-///
-/// # Errors
-///
-/// Returns [`BifrostTelemetryReportError::InvalidSpan`] when the field is absent
-/// or is not a canonical UUID value.
-fn validate_span_uuid(span: &CapturedSpan, key: &str) -> Result<(), BifrostTelemetryReportError> {
-    let valid = span
-        .attributes
-        .get(key)
-        .and_then(|value| value.parse::<uuid::Uuid>().ok())
-        .is_some();
-    if !valid {
-        return Err(BifrostTelemetryReportError::InvalidSpan {
-            span: span.name.clone(),
-            detail: format!("attribute {key} is not a scrubbed UUID"),
-        });
-    }
-    Ok(())
-}
-
 /// Server-only query report mapped from its production query histogram.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct BifrostQueryTelemetryReport {
@@ -4220,145 +2449,6 @@ impl BifrostQueryTelemetryReport {
             )? * 1_000_000.0,
         })
     }
-}
-
-/// Reject unexpected or open-cardinality labels on the closed Forge report families.
-fn validate_forge_label_contract(
-    delta: &BifrostTelemetryDelta,
-) -> Result<(), BifrostTelemetryReportError> {
-    for sample in delta
-        .metrics
-        .iter()
-        .chain(&delta.gauge_maxima)
-        .chain(&delta.gauge_final)
-    {
-        let (allowed, categorical): (&[&str], &[(&str, &[&str])]) = match sample.family.as_str() {
-            "bifrost_forge_rewrite_output_bytes_total" => {
-                (&["source"], &[("source", &["staging", "iceberg"])])
-            }
-            "bifrost_forge_task_duration_seconds" => (
-                &["strategy", "result", "le"],
-                &[
-                    (
-                        "strategy",
-                        &[
-                            "staging_fold",
-                            "small_files",
-                            "manifest_rewrite",
-                            "snapshot_expiry",
-                        ],
-                    ),
-                    (
-                        "result",
-                        &[
-                            "succeeded",
-                            "retryable",
-                            "failed",
-                            "cancelled",
-                            "unschedulable",
-                        ],
-                    ),
-                ],
-            ),
-            "bifrost_forge_oldest_backlog_seconds"
-            | "bifrost_forge_fairness_lag_tasks"
-            | "bifrost_forge_complete_gauge_publications_total"
-            | "bifrost_forge_worker_quarantined" => (&[], &[]),
-            "bifrost_forge_task_failures_total" => (
-                &["failure_class"],
-                &[(
-                    "failure_class",
-                    &[
-                        "data_refusal",
-                        "transient_object_store",
-                        "transient_coordination",
-                        "storage_health",
-                        "capacity_refused",
-                        "internal_invariant",
-                    ],
-                )],
-            ),
-            "bifrost_forge_attempt_resource_bytes" => (
-                &["resource", "observation", "le"],
-                &[
-                    ("resource", &["memory", "scratch"]),
-                    ("observation", &["planned", "acquired", "peak"]),
-                ],
-            ),
-            "bifrost_forge_attempt_resource_releases_total" => (
-                &["resource", "result"],
-                &[
-                    ("resource", &["memory", "scratch"]),
-                    ("result", &["released", "poisoned"]),
-                ],
-            ),
-            "bifrost_forge_execution_envelope_failures_total" => {
-                (&["resource"], &[("resource", &["memory", "scratch"])])
-            }
-            "bifrost_forge_legacy_envelopes_superseded_total" => {
-                (&["result"], &[("result", &["replanned", "failed"])])
-            }
-            "bifrost_forge_retries_total" | "bifrost_forge_terminal_poisons_total" => (
-                &["failure_class"],
-                &[(
-                    "failure_class",
-                    &[
-                        "data_refusal",
-                        "transient_object_store",
-                        "transient_coordination",
-                        "storage_health",
-                        "capacity_refused",
-                        "internal_invariant",
-                    ],
-                )],
-            ),
-            "bifrost_forge_capacity_refusals_total" => {
-                (&["phase"], &[("phase", &["admission", "execution"])])
-            }
-            "bifrost_forge_compaction_debt" => (&["unit"], &[("unit", &["files", "bytes"])]),
-            "bifrost_forge_progress_effects_total" => (
-                &["effect"],
-                &[("effect", &["changed", "acknowledged_noop"])],
-            ),
-            "bifrost_resource_current_bytes" => (
-                &["resource", "role"],
-                &[("resource", &["memory"]), ("role", &["forge"])],
-            ),
-            "bifrost_memory_reservations_total" => (
-                &["consumer", "outcome"],
-                &[("outcome", &["accepted", "rejected"])],
-            ),
-            "bifrost_forge_task_spill_bytes" => (
-                &["strategy", "le"],
-                &[(
-                    "strategy",
-                    &[
-                        "staging_fold",
-                        "small_files",
-                        "manifest_rewrite",
-                        "snapshot_expiry",
-                    ],
-                )],
-            ),
-            "bifrost_forge_conflicts_total" => (
-                &["kind"],
-                &[(
-                    "kind",
-                    &["lease_contention", "fence_lost", "snapshot_changed"],
-                )],
-            ),
-            "bifrost_forge_cleanup_duration_seconds" => (
-                &["kind", "le"],
-                &[("kind", &["expired", "orphan", "spill"])],
-            ),
-            "bifrost_forge_role_processes" | "bifrost_forge_role_process_started_total" => {
-                (&["role"], &[("role", &["all", "server", "forge_worker"])])
-            }
-            _ => continue,
-        };
-        validate_sample_labels(sample, allowed, categorical)?;
-    }
-    Ok(())
 }
 
 /// Reject unexpected labels or categorical values on the server query histogram.
@@ -4581,76 +2671,6 @@ fn rendered_series(sample: &BifrostMetricSample) -> String {
     format!("{name}{{{labels}}}")
 }
 
-/// Sum one changed production family restricted by exact labels.
-fn sum(
-    delta: &BifrostTelemetryDelta,
-    family: &str,
-    labels: &[(&str, &str)],
-) -> Result<f64, BifrostTelemetryReportError> {
-    let samples = delta
-        .metrics
-        .iter()
-        .filter(|sample| {
-            sample.family == family
-                && labels
-                    .iter()
-                    .all(|(key, value)| sample.labels.get(*key).map(String::as_str) == Some(*value))
-        })
-        .collect::<Vec<_>>();
-    if samples.is_empty() {
-        return Err(BifrostTelemetryReportError::MissingSeries {
-            family: family.to_owned(),
-        });
-    }
-    Ok(samples.into_iter().map(|sample| sample.value).sum())
-}
-
-/// Return an observed production gauge maximum restricted by exact labels.
-fn gauge(
-    delta: &BifrostTelemetryDelta,
-    family: &str,
-    labels: &[(&str, &str)],
-) -> Result<f64, BifrostTelemetryReportError> {
-    delta
-        .gauge_maxima
-        .iter()
-        .filter(|sample| {
-            sample.family == family
-                && labels
-                    .iter()
-                    .all(|(key, value)| sample.labels.get(*key).map(String::as_str) == Some(*value))
-        })
-        .map(|sample| sample.value)
-        .reduce(f64::max)
-        .ok_or_else(|| BifrostTelemetryReportError::MissingSeries {
-            family: family.to_owned(),
-        })
-}
-
-/// Require that one activity counter advanced inside this telemetry window.
-fn require_advanced(
-    delta: &BifrostTelemetryDelta,
-    family: &str,
-) -> Result<(), BifrostTelemetryReportError> {
-    let advanced = sum(delta, family, &[])?;
-    if advanced > 0.0 {
-        Ok(())
-    } else {
-        Err(BifrostTelemetryReportError::StaleSeries {
-            family: family.to_owned(),
-        })
-    }
-}
-
-/// Estimate a histogram quantile from changed Prometheus cumulative buckets.
-pub(crate) fn histogram_quantile(
-    delta: &BifrostTelemetryDelta,
-    family: &str,
-    quantile: f64,
-) -> Result<f64, BifrostTelemetryReportError> {
-    histogram_quantile_for_label(delta, family, "", "", quantile)
-}
-
 /// Convert a finite nonnegative duration in seconds to rounded microseconds.
 ///
 /// # Errors
@@ -4834,105 +2854,19 @@ fn histogram_quantile_state_for_label(
         .ok_or_else(|| invalid("histogram aggregate is overflow-only"))
 }
 
-/// Validate active-role gauges and restart activity against launched topology.
-fn validate_role_topology(
+#[cfg(test)]
+/// Estimate a histogram quantile from changed Prometheus cumulative buckets.
+pub(crate) fn histogram_quantile(
     delta: &BifrostTelemetryDelta,
-    expected: &BTreeMap<String, u64>,
-) -> Result<BTreeMap<String, ForgeRoleTopologyReport>, BifrostTelemetryReportError> {
-    let active_roles = delta
-        .gauge_maxima
-        .iter()
-        .filter(|sample| sample.family == "bifrost_forge_role_processes" && sample.value > 0.0)
-        .filter_map(|sample| sample.labels.get("role").cloned())
-        .collect::<BTreeSet<_>>();
-    let final_roles = delta
-        .gauge_final
-        .iter()
-        .filter(|sample| sample.family == "bifrost_forge_role_processes" && sample.value > 0.0)
-        .filter_map(|sample| sample.labels.get("role").cloned())
-        .collect::<BTreeSet<_>>();
-    let expected_roles = expected.keys().cloned().collect::<BTreeSet<_>>();
-    if active_roles != expected_roles || final_roles != expected_roles {
-        return Err(BifrostTelemetryReportError::TopologyMismatch);
-    }
-    let mut topology = BTreeMap::new();
-    for (role, count) in expected {
-        let active = gauge(delta, "bifrost_forge_role_processes", &[("role", role)])?;
-        let final_active = delta
-            .gauge_final
-            .iter()
-            .find(|sample| {
-                sample.family == "bifrost_forge_role_processes"
-                    && sample.labels.get("role").map(String::as_str) == Some(role)
-            })
-            .map(|sample| sample.value)
-            .ok_or(BifrostTelemetryReportError::TopologyMismatch)?;
-        let starts = sum(
-            delta,
-            "bifrost_forge_role_process_started_total",
-            &[("role", role)],
-        )?;
-        if active != *count as f64 || final_active != *count as f64 || starts < *count as f64 {
-            return Err(BifrostTelemetryReportError::TopologyMismatch);
-        }
-        let max_active = active as u64;
-        let final_active = final_active as u64;
-        let starts = starts as u64;
-        topology.insert(
-            role.clone(),
-            ForgeRoleTopologyReport {
-                max_active,
-                final_active,
-                starts,
-            },
-        );
-    }
-    Ok(topology)
+    family: &str,
+    quantile: f64,
+) -> Result<f64, BifrostTelemetryReportError> {
+    histogram_quantile_for_label(delta, family, "", "", quantile)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use super::*;
-    use vala_bifrost_redux::resources::{
-        BifrostResourcePolicy, BifrostRole, BifrostRuntimeResources, ForgeRewriteRequest,
-        MIN_SCRATCH_FREE_BYTES, ResourceSource, SystemResourceSnapshot,
-    };
-    use vala_sql::row_types::forge_tasks::{FORGE_ENVELOPE_VERSION, ForgeTaskEnvelope};
-
-    /// Construct one normalized production sample for mapper contract tests.
-    fn sample(family: &str, labels: &[(&str, &str)], value: f64) -> BifrostMetricSample {
-        BifrostMetricSample {
-            family: family.to_owned(),
-            labels: labels
-                .iter()
-                .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
-                .collect(),
-            value,
-            kind: if labels.iter().any(|(key, _)| *key == "le") {
-                BifrostMetricKind::HistogramBucket
-            } else if family.ends_with("_total") && family != "oracle_queries_active" {
-                BifrostMetricKind::Counter
-            } else {
-                BifrostMetricKind::Gauge
-            },
-        }
-    }
-
-    /// Construct one normalized histogram count sample for mapper tests.
-    fn histogram_count(family: &str, labels: &[(&str, &str)], value: f64) -> BifrostMetricSample {
-        let mut sample = sample(family, labels, value);
-        sample.kind = BifrostMetricKind::HistogramCount;
-        sample
-    }
-
-    /// Construct one normalized histogram sum sample for mapper tests.
-    fn histogram_sum(family: &str, labels: &[(&str, &str)], value: f64) -> BifrostMetricSample {
-        let mut sample = sample(family, labels, value);
-        sample.kind = BifrostMetricKind::HistogramSum;
-        sample
-    }
 
     /// Construct one normalized captured production span for mapper tests.
     fn captured_span(name: &str, attributes: &[(&str, &str)]) -> CapturedSpan {
@@ -5163,7 +3097,6 @@ mod tests {
             });
         }
         let delta = BifrostTelemetryDelta {
-            families: BTreeSet::new(),
             metrics,
             gauge_maxima: Vec::new(),
             gauge_final: Vec::new(),
@@ -5186,7 +3119,6 @@ mod tests {
     fn histogram_window_rejects_invalid_bucket_shapes() {
         let family = "test_duration_seconds";
         let make = |buckets: &[(&str, f64)], count: f64| BifrostTelemetryDelta {
-            families: BTreeSet::new(),
             metrics: buckets
                 .iter()
                 .map(|(le, value)| BifrostMetricSample {
@@ -5871,11 +3803,20 @@ mod tests {
             EmitterContractFixture {
                 id: "forge.backlog_peak",
                 selectors: &[],
-                family: "bifrost_forge_oldest_backlog_seconds",
+                family: "bifrost_forge_pending_tasks",
                 kind: Gauge,
-                keys: &[],
-                domains: &[],
-                unit: Seconds,
+                keys: &["task_type"],
+                domains: &[(
+                    "task_type",
+                    &[
+                        "scribe_promotion",
+                        "small_files",
+                        "snapshot_expiry",
+                        "expired_cleanup",
+                        "orphan_cleanup",
+                    ],
+                )],
+                unit: Count,
                 aggregation: Peak,
                 requirement: Role("forge"),
                 destination: "binding validation",
@@ -5967,11 +3908,33 @@ mod tests {
             },
             EmitterContractFixture {
                 id: "forge.publications",
-                selectors: &[],
-                family: "bifrost_forge_complete_gauge_publications_total",
+                selectors: &[("result", "succeeded")],
+                family: "bifrost_forge_task_attempts_total",
                 kind: Counter,
-                keys: &[],
-                domains: &[],
+                keys: &["task_type", "result"],
+                domains: &[
+                    (
+                        "task_type",
+                        &[
+                            "scribe_promotion",
+                            "small_files",
+                            "snapshot_expiry",
+                            "expired_cleanup",
+                            "orphan_cleanup",
+                        ],
+                    ),
+                    (
+                        "result",
+                        &[
+                            "succeeded",
+                            "retry",
+                            "failed",
+                            "cancelled",
+                            "refused",
+                            "uncertain",
+                        ],
+                    ),
+                ],
                 unit: Count,
                 aggregation: Delta,
                 requirement: Role("forge"),
@@ -5980,10 +3943,19 @@ mod tests {
             EmitterContractFixture {
                 id: "forge.rewrite_input_files",
                 selectors: &[],
-                family: "bifrost_forge_rewrite_input_files_total",
+                family: "bifrost_forge_input_files_total",
                 kind: Counter,
-                keys: &["source"],
-                domains: &[("source", &["staging", "iceberg"])],
+                keys: &["task_type"],
+                domains: &[(
+                    "task_type",
+                    &[
+                        "scribe_promotion",
+                        "small_files",
+                        "snapshot_expiry",
+                        "expired_cleanup",
+                        "orphan_cleanup",
+                    ],
+                )],
                 unit: Count,
                 aggregation: Delta,
                 requirement: Role("forge"),
@@ -5992,10 +3964,19 @@ mod tests {
             EmitterContractFixture {
                 id: "forge.rewrite_input_bytes",
                 selectors: &[],
-                family: "bifrost_forge_rewrite_input_bytes_total",
+                family: "bifrost_forge_input_bytes_total",
                 kind: Counter,
-                keys: &["source"],
-                domains: &[("source", &["staging", "iceberg"])],
+                keys: &["task_type"],
+                domains: &[(
+                    "task_type",
+                    &[
+                        "scribe_promotion",
+                        "small_files",
+                        "snapshot_expiry",
+                        "expired_cleanup",
+                        "orphan_cleanup",
+                    ],
+                )],
                 unit: Bytes,
                 aggregation: Delta,
                 requirement: Role("forge"),
@@ -6004,10 +3985,19 @@ mod tests {
             EmitterContractFixture {
                 id: "forge.rewrite_output_files",
                 selectors: &[],
-                family: "bifrost_forge_rewrite_output_files_total",
+                family: "bifrost_forge_output_files_total",
                 kind: Counter,
-                keys: &["source"],
-                domains: &[("source", &["staging", "iceberg"])],
+                keys: &["task_type"],
+                domains: &[(
+                    "task_type",
+                    &[
+                        "scribe_promotion",
+                        "small_files",
+                        "snapshot_expiry",
+                        "expired_cleanup",
+                        "orphan_cleanup",
+                    ],
+                )],
                 unit: Count,
                 aggregation: Delta,
                 requirement: Role("forge"),
@@ -6016,10 +4006,19 @@ mod tests {
             EmitterContractFixture {
                 id: "forge.rewrite_output_bytes",
                 selectors: &[],
-                family: "bifrost_forge_rewrite_output_bytes_total",
+                family: "bifrost_forge_output_bytes_total",
                 kind: Counter,
-                keys: &["source"],
-                domains: &[("source", &["staging", "iceberg"])],
+                keys: &["task_type"],
+                domains: &[(
+                    "task_type",
+                    &[
+                        "scribe_promotion",
+                        "small_files",
+                        "snapshot_expiry",
+                        "expired_cleanup",
+                        "orphan_cleanup",
+                    ],
+                )],
                 unit: Bytes,
                 aggregation: Delta,
                 requirement: Role("forge"),
@@ -6476,7 +4475,6 @@ mod tests {
     /// Build one complete exact binding fixture from independent emitter contracts.
     fn canonical_binding_delta() -> BifrostTelemetryDelta {
         let mut delta = BifrostTelemetryDelta {
-            families: BTreeSet::new(),
             metrics: Vec::new(),
             gauge_maxima: Vec::new(),
             gauge_final: Vec::new(),
@@ -6542,274 +4540,6 @@ mod tests {
             }
         }
         delta
-    }
-
-    /// Construct one complete three-worker production delta without a fixture value path.
-    fn complete_delta() -> BifrostTelemetryDelta {
-        BifrostTelemetryDelta {
-            families: BTreeSet::new(),
-            metrics: vec![
-                sample(
-                    "bifrost_forge_rewrite_output_bytes_total",
-                    &[("source", "staging")],
-                    1_048_576.0,
-                ),
-                sample("bifrost_forge_complete_gauge_publications_total", &[], 1.0),
-                sample(
-                    "bifrost_memory_reservations_total",
-                    &[("consumer", "forge"), ("outcome", "accepted")],
-                    1.0,
-                ),
-                sample(
-                    "bifrost_forge_task_duration_seconds",
-                    &[
-                        ("strategy", "staging_fold"),
-                        ("result", "succeeded"),
-                        ("le", "0.1"),
-                    ],
-                    1.0,
-                ),
-                histogram_count(
-                    "bifrost_forge_task_duration_seconds",
-                    &[("strategy", "staging_fold"), ("result", "succeeded")],
-                    1.0,
-                ),
-                sample(
-                    "bifrost_forge_task_duration_seconds",
-                    &[
-                        ("strategy", "staging_fold"),
-                        ("result", "succeeded"),
-                        ("le", "+Inf"),
-                    ],
-                    1.0,
-                ),
-                sample(
-                    "bifrost_forge_task_spill_bytes",
-                    &[("strategy", "staging_fold"), ("le", "65536")],
-                    1.0,
-                ),
-                histogram_count(
-                    "bifrost_forge_task_spill_bytes",
-                    &[("strategy", "staging_fold")],
-                    1.0,
-                ),
-                sample(
-                    "bifrost_forge_task_spill_bytes",
-                    &[("strategy", "staging_fold"), ("le", "+Inf")],
-                    1.0,
-                ),
-                sample(
-                    "bifrost_forge_cleanup_duration_seconds",
-                    &[("kind", "expired"), ("le", "0.025")],
-                    1.0,
-                ),
-                histogram_count(
-                    "bifrost_forge_cleanup_duration_seconds",
-                    &[("kind", "expired")],
-                    1.0,
-                ),
-                sample(
-                    "bifrost_forge_cleanup_duration_seconds",
-                    &[("kind", "expired"), ("le", "+Inf")],
-                    1.0,
-                ),
-                sample(
-                    "bifrost_forge_conflicts_total",
-                    &[("kind", "lease_contention")],
-                    0.0,
-                ),
-                sample(
-                    "bifrost_forge_conflicts_total",
-                    &[("kind", "fence_lost")],
-                    0.0,
-                ),
-                sample(
-                    "bifrost_forge_conflicts_total",
-                    &[("kind", "snapshot_changed")],
-                    0.0,
-                ),
-                sample(
-                    "bifrost_forge_role_process_started_total",
-                    &[("role", "server")],
-                    1.0,
-                ),
-                sample(
-                    "bifrost_forge_role_process_started_total",
-                    &[("role", "forge_worker")],
-                    4.0,
-                ),
-                histogram_sum(
-                    "bifrost_forge_task_duration_seconds",
-                    &[("strategy", "staging_fold"), ("result", "succeeded")],
-                    0.1,
-                ),
-                histogram_sum(
-                    "bifrost_forge_task_spill_bytes",
-                    &[("strategy", "staging_fold")],
-                    65_536.0,
-                ),
-                histogram_sum(
-                    "bifrost_forge_cleanup_duration_seconds",
-                    &[("kind", "expired")],
-                    0.025,
-                ),
-            ],
-            gauge_maxima: vec![
-                sample("bifrost_forge_oldest_backlog_seconds", &[], 0.01),
-                sample(
-                    "bifrost_resource_current_bytes",
-                    &[("role", "forge"), ("resource", "memory")],
-                    1024.0,
-                ),
-                sample("bifrost_forge_fairness_lag_tasks", &[], 1.0),
-                sample("bifrost_forge_role_processes", &[("role", "server")], 1.0),
-                sample(
-                    "bifrost_forge_role_processes",
-                    &[("role", "forge_worker")],
-                    3.0,
-                ),
-            ],
-            gauge_final: vec![
-                sample("bifrost_forge_oldest_backlog_seconds", &[], 0.0),
-                sample(
-                    "bifrost_resource_current_bytes",
-                    &[("role", "forge"), ("resource", "memory")],
-                    0.0,
-                ),
-                sample("bifrost_forge_fairness_lag_tasks", &[], 0.0),
-                sample("bifrost_forge_role_processes", &[("role", "server")], 1.0),
-                sample(
-                    "bifrost_forge_role_processes",
-                    &[("role", "forge_worker")],
-                    3.0,
-                ),
-            ],
-            spans: vec![
-                captured_span(
-                    "bifrost.forge.scheduler.pass",
-                    &[("result", "succeeded"), ("role", "server")],
-                ),
-                captured_span(
-                    "bifrost.forge.task.execute",
-                    &[
-                        ("attempt_id", "01890f28-7c4a-7000-98e7-4f4a3c2d1b02"),
-                        ("result", "succeeded"),
-                        ("role", "forge_worker"),
-                        ("strategy", "staging_fold"),
-                        ("task_id", "01890f28-7c4a-7000-98e7-4f4a3c2d1b01"),
-                    ],
-                ),
-                captured_span(
-                    "bifrost.forge.catalog.commit",
-                    &[
-                        ("attempt_id", "01890f28-7c4a-7000-98e7-4f4a3c2d1b04"),
-                        ("result", "succeeded"),
-                        ("role", "forge_worker"),
-                        ("strategy", "small_files"),
-                        ("task_id", "01890f28-7c4a-7000-98e7-4f4a3c2d1b03"),
-                    ],
-                ),
-                captured_span(
-                    "bifrost.forge.cleanup",
-                    &[
-                        ("attempt_id", "01890f28-7c4a-7000-98e7-4f4a3c2d1b06"),
-                        ("kind", "expired"),
-                        ("result", "succeeded"),
-                        ("role", "forge_worker"),
-                        ("strategy", "snapshot_expiry"),
-                        ("task_id", "01890f28-7c4a-7000-98e7-4f4a3c2d1b05"),
-                    ],
-                ),
-            ],
-            interval_seconds: 2.0,
-            process: test_process_window(),
-        }
-    }
-
-    /// Forge-only reporting consumes the root's event-driven acquire/release gauge.
-    ///
-    /// # Panics
-    ///
-    /// Panics when production-equivalent Forge composition, real rewrite
-    /// acquisition, metric capture, or maintenance-report projection fails.
-    #[test]
-    fn forge_only_report_uses_event_driven_root_metrics() {
-        let recorder = PrometheusBuilder::new().build_recorder();
-        let handle = recorder.handle();
-        let (peak, final_value) = metrics::with_local_recorder(&recorder, || {
-            let scratch_limit = 512 * 1024 * 1024_u64;
-            let runtime = BifrostRuntimeResources::from_snapshot(
-                SystemResourceSnapshot {
-                    memory_limit_bytes: 1024 * 1024 * 1024,
-                    effective_cpu: 4,
-                    scratch_capacity_bytes: scratch_limit + MIN_SCRATCH_FREE_BYTES,
-                    scratch_available_bytes: scratch_limit + MIN_SCRATCH_FREE_BYTES,
-                    memory_source: ResourceSource::Injected,
-                    cpu_source: ResourceSource::Injected,
-                },
-                BifrostResourcePolicy {
-                    roles: [BifrostRole::Forge].into_iter().collect(),
-                    memory_limit_bytes: None,
-                    unmanaged_reserve_bytes: None,
-                    scratch_limit_bytes: Some(scratch_limit),
-                    effective_cpu: None,
-                    oracle_query_slot_limit: None,
-                    scratch_root: PathBuf::new(),
-                    volume_roots: None,
-                },
-            )
-            .expect("Forge-only runtime resources");
-            let forge = runtime
-                .compose_roles()
-                .expect("Forge-only role composition")
-                .forge()
-                .expect("Forge capability");
-            let owner = forge
-                .try_acquire_rewrite(ForgeRewriteRequest {
-                    envelope: ForgeTaskEnvelope {
-                        version: FORGE_ENVELOPE_VERSION,
-                        reader_permits: 1,
-                        decoded_batch_bytes: 1,
-                        decoded_input_bytes: 1,
-                        sort_working_bytes: 1,
-                        sort_merge_reservation_bytes: 1,
-                        encoder_buffer_bytes: 1,
-                        upload_chunk_bytes: 1,
-                        footer_encoded_bytes: 1,
-                        footer_decode_workspace_bytes: 1,
-                        sort_spill_bytes: 1,
-                    },
-                    memory_bytes: 5,
-                    scratch_bytes: 1,
-                    reader_permits: 1,
-                })
-                .expect("real Forge rewrite acquisition");
-            let current = || {
-                rendered_values(&handle.render())
-                    .expect("production Forge metrics parse")
-                    .into_iter()
-                    .find(|(name, _)| {
-                        name.starts_with("bifrost_resource_current_bytes{")
-                            && name.contains("role=\"forge\"")
-                            && name.contains("resource=\"memory\"")
-                    })
-                    .map(|(_, value)| value)
-                    .expect("event-driven Forge root gauge")
-            };
-            let peak = current();
-            drop(owner);
-            (peak, current())
-        });
-        assert!(peak > 0.0);
-        assert_eq!(final_value, 0.0);
-
-        let mut delta = complete_delta();
-        delta.gauge_maxima[1].value = peak;
-        delta.gauge_final[1].value = final_value;
-        let expected = BTreeMap::from([("server".to_owned(), 1), ("forge_worker".to_owned(), 3)]);
-        let report = ForgeMaintenanceTelemetryReport::from_production_delta(&delta, &expected)
-            .expect("Forge maintenance report consumes root lifecycle metrics");
-        assert_eq!(report.peak_parent_memory, peak);
     }
 
     /// Build deterministic process evidence for sampler-only unit fixtures.
@@ -6878,441 +4608,5 @@ mod tests {
         .unwrap();
 
         assert_eq!(maxima, BTreeMap::from([(series.to_owned(), 32.0)]));
-    }
-
-    /// Prove every report projection responds only to its production delta field.
-    #[test]
-    fn forge_telemetry_report_uses_production_delta() {
-        let expected = BTreeMap::from([("server".to_owned(), 1), ("forge_worker".to_owned(), 3)]);
-        let baseline =
-            ForgeMaintenanceTelemetryReport::from_production_delta(&complete_delta(), &expected)
-                .expect("complete production delta maps");
-        macro_rules! assert_projection {
-            ($delta:expr, $field:ident) => {{
-                let changed =
-                    ForgeMaintenanceTelemetryReport::from_production_delta(&$delta, &expected)
-                        .expect("changed production delta maps");
-                assert_ne!(changed.$field, baseline.$field);
-                let mut normalized = changed;
-                normalized.$field = baseline.$field.clone();
-                assert_eq!(normalized, baseline);
-            }};
-        }
-
-        let mut delta = complete_delta();
-        delta.metrics[0].value *= 2.0;
-        assert_projection!(delta, throughput_mib_per_sec);
-
-        let mut delta = complete_delta();
-        delta.metrics[3]
-            .labels
-            .insert("le".to_owned(), "0.2".to_owned());
-        assert_projection!(delta, task_latency_p99_us);
-
-        let mut delta = complete_delta();
-        delta.gauge_maxima[0].value = 0.02;
-        assert_projection!(delta, backlog_age_us);
-
-        let mut delta = complete_delta();
-        delta.gauge_maxima[1].value = 2048.0;
-        assert_projection!(delta, peak_parent_memory);
-
-        let mut delta = complete_delta();
-        delta.metrics[6]
-            .labels
-            .insert("le".to_owned(), "131072".to_owned());
-        assert_projection!(delta, spill_bytes);
-
-        for (index, field) in [
-            (12, "lease_contention"),
-            (13, "fence_lost"),
-            (14, "snapshot_changed"),
-        ] {
-            let mut delta = complete_delta();
-            delta.metrics[index].value = 1.0;
-            let changed = ForgeMaintenanceTelemetryReport::from_production_delta(&delta, &expected)
-                .expect("changed production conflict maps");
-            let mut normalized = changed.clone();
-            match field {
-                "lease_contention" => normalized.lease_contention = baseline.lease_contention,
-                "fence_lost" => normalized.fence_lost = baseline.fence_lost,
-                "snapshot_changed" => normalized.snapshot_changed = baseline.snapshot_changed,
-                _ => unreachable!("closed conflict projection"),
-            }
-            assert_ne!(changed, baseline);
-            assert_eq!(normalized, baseline);
-        }
-
-        let mut delta = complete_delta();
-        delta.gauge_maxima[2].value = 2.0;
-        assert_projection!(delta, fairness_lag_tasks);
-
-        let mut delta = complete_delta();
-        delta.metrics[9]
-            .labels
-            .insert("le".to_owned(), "0.05".to_owned());
-        assert_projection!(delta, cleanup_delay_us);
-
-        let mut delta = complete_delta();
-        delta.metrics[16].value = 5.0;
-        assert_projection!(delta, role_topology);
-    }
-
-    /// Prove replacement starts remain distinct from maximum and final concurrency.
-    #[test]
-    fn forge_role_topology_survives_worker_replacement() {
-        let expected = BTreeMap::from([("server".to_owned(), 1), ("forge_worker".to_owned(), 3)]);
-        let report =
-            ForgeMaintenanceTelemetryReport::from_production_delta(&complete_delta(), &expected)
-                .expect("production replacement topology maps");
-        assert_eq!(report.role_topology["forge_worker"].starts, 4);
-        assert_eq!(report.role_topology["forge_worker"].max_active, 3);
-        assert_eq!(report.role_topology["forge_worker"].final_active, 3);
-    }
-
-    /// Prove throughput uses captured output bytes divided by the capture interval.
-    #[test]
-    fn forge_throughput_uses_production_counter_rate() {
-        let expected = BTreeMap::from([("server".to_owned(), 1), ("forge_worker".to_owned(), 3)]);
-        let report =
-            ForgeMaintenanceTelemetryReport::from_production_delta(&complete_delta(), &expected)
-                .expect("production counter-rate delta maps");
-        assert_eq!(report.throughput_mib_per_sec, 0.5);
-    }
-
-    /// Reject missing, stale, empty, wrong-topology, and open-label report windows.
-    #[test]
-    fn forge_telemetry_report_rejects_incomplete_windows() {
-        let expected = BTreeMap::from([("server".to_owned(), 1), ("forge_worker".to_owned(), 3)]);
-        let mut missing = complete_delta();
-        missing.metrics.remove(0);
-        assert!(matches!(
-            ForgeMaintenanceTelemetryReport::from_production_delta(&missing, &expected),
-            Err(BifrostTelemetryReportError::MissingSeries { .. })
-        ));
-        let mut stale = complete_delta();
-        stale.metrics[1].value = 0.0;
-        assert!(matches!(
-            ForgeMaintenanceTelemetryReport::from_production_delta(&stale, &expected),
-            Err(BifrostTelemetryReportError::StaleSeries { .. })
-        ));
-        let mut stale_memory = complete_delta();
-        stale_memory
-            .metrics
-            .iter_mut()
-            .find(|sample| sample.family == "bifrost_memory_reservations_total")
-            .expect("memory reservation activity series")
-            .value = 0.0;
-        assert!(matches!(
-            ForgeMaintenanceTelemetryReport::from_production_delta(&stale_memory, &expected),
-            Err(BifrostTelemetryReportError::StaleSeries { family })
-                if family == "bifrost_memory_reservations_total"
-        ));
-        let mut empty = complete_delta();
-        empty
-            .metrics
-            .iter_mut()
-            .filter(|sample| sample.family == "bifrost_forge_task_spill_bytes")
-            .for_each(|sample| sample.value = 0.0);
-        assert!(matches!(
-            ForgeMaintenanceTelemetryReport::from_production_delta(&empty, &expected),
-            Err(BifrostTelemetryReportError::EmptyHistogram { .. })
-        ));
-        let wrong = BTreeMap::from([("all".to_owned(), 1)]);
-        assert_eq!(
-            ForgeMaintenanceTelemetryReport::from_production_delta(&complete_delta(), &wrong),
-            Err(BifrostTelemetryReportError::TopologyMismatch)
-        );
-        let mut open_label = complete_delta();
-        open_label.metrics[0]
-            .labels
-            .insert("tenant".to_owned(), "forbidden".to_owned());
-        assert!(matches!(
-            ForgeMaintenanceTelemetryReport::from_production_delta(&open_label, &expected),
-            Err(BifrostTelemetryReportError::Parse { .. })
-        ));
-        let mut missing_span = complete_delta();
-        missing_span
-            .spans
-            .retain(|span| span.name != "bifrost.forge.cleanup");
-        assert_eq!(
-            ForgeMaintenanceTelemetryReport::from_production_delta(&missing_span, &expected),
-            Err(BifrostTelemetryReportError::MissingSpan {
-                span: "bifrost.forge.cleanup".to_owned(),
-            })
-        );
-        let mut renamed_span = complete_delta();
-        renamed_span.spans[1].name = "bifrost.forge.task.renamed".to_owned();
-        assert!(matches!(
-            ForgeMaintenanceTelemetryReport::from_production_delta(&renamed_span, &expected),
-            Err(BifrostTelemetryReportError::InvalidSpan { span, .. })
-                if span == "bifrost.forge.task.renamed"
-        ));
-        let mut missing_attribute = complete_delta();
-        missing_attribute.spans[2].attributes.remove("result");
-        assert!(matches!(
-            ForgeMaintenanceTelemetryReport::from_production_delta(&missing_attribute, &expected),
-            Err(BifrostTelemetryReportError::InvalidSpan { span, .. })
-                if span == "bifrost.forge.catalog.commit"
-        ));
-        let mut prohibited_attribute = complete_delta();
-        prohibited_attribute.spans[3]
-            .attributes
-            .insert("tenant_id".to_owned(), "forbidden".to_owned());
-        assert!(matches!(
-            ForgeMaintenanceTelemetryReport::from_production_delta(
-                &prohibited_attribute,
-                &expected,
-            ),
-            Err(BifrostTelemetryReportError::InvalidSpan { span, .. })
-                if span == "bifrost.forge.cleanup"
-        ));
-        let mut open_attribute = complete_delta();
-        open_attribute.spans[0]
-            .attributes
-            .insert("result".to_owned(), "unknown".to_owned());
-        assert!(matches!(
-            ForgeMaintenanceTelemetryReport::from_production_delta(&open_attribute, &expected),
-            Err(BifrostTelemetryReportError::InvalidSpan { span, .. })
-                if span == "bifrost.forge.scheduler.pass"
-        ));
-    }
-
-    /// Prove causal diagnosis uses earliest-transition precedence and rejects
-    /// every telemetry-to-durable binding mismatch.
-    #[test]
-    fn forge_causal_report_classifies_each_transition() {
-        let report = causal_report_fixture();
-        let empty = ForgeWorkflowInspection {
-            has_demand: false,
-            tasks: Vec::new(),
-            active_claims: 0,
-            active_attempts: 0,
-            uncompacted_staging_files: 0,
-        };
-        let mut no_hint = report.clone();
-        no_hint.accepted_hints = 0;
-        no_hint.persisted_hints = 0;
-        no_hint.spans.clear();
-        assert_eq!(
-            no_hint.diagnose(&empty, None).expect("no-hint diagnosis"),
-            ForgeCausalDiagnosis::NoAcceptedHint
-        );
-        let mut not_persisted = no_hint.clone();
-        not_persisted.accepted_hints = 1;
-        assert_eq!(
-            not_persisted
-                .diagnose(&empty, None)
-                .expect("not-persisted diagnosis"),
-            ForgeCausalDiagnosis::AcceptedHintNotPersisted
-        );
-        let demand = ForgeWorkflowInspection {
-            has_demand: true,
-            ..empty.clone()
-        };
-        assert_eq!(
-            report
-                .diagnose(&demand, None)
-                .expect("unplanned demand diagnosis"),
-            ForgeCausalDiagnosis::PersistedDemandNotPlanned
-        );
-        let ready = ForgeWorkflowInspection {
-            has_demand: false,
-            tasks: vec![("small_files".to_owned(), "ready".to_owned())],
-            active_claims: 0,
-            active_attempts: 0,
-            uncompacted_staging_files: 0,
-        };
-        assert_eq!(
-            report
-                .diagnose(&ready, None)
-                .expect("unclaimed task diagnosis"),
-            ForgeCausalDiagnosis::ReadyTaskNotClaimed
-        );
-        let failed = ForgeWorkflowInspection {
-            tasks: vec![("small_files".to_owned(), "failed".to_owned())],
-            ..ready.clone()
-        };
-        let mut executed = report.clone();
-        executed.spans.push(causal_span(
-            ForgeCausalSpanName::TaskExecute,
-            "failed",
-            "forge_worker",
-        ));
-        assert_eq!(
-            executed
-                .diagnose(&failed, None)
-                .expect("failed attempt diagnosis"),
-            ForgeCausalDiagnosis::AttemptFailedOrRetryable
-        );
-        let succeeded = ForgeWorkflowInspection {
-            tasks: vec![("small_files".to_owned(), "succeeded".to_owned())],
-            ..ready
-        };
-        let mut committed = report.clone();
-        committed.demands_continued = 1;
-        committed.spans.push(causal_span(
-            ForgeCausalSpanName::TaskExecute,
-            "succeeded",
-            "forge_worker",
-        ));
-        committed.spans.push(causal_span(
-            ForgeCausalSpanName::CatalogCommit,
-            "succeeded",
-            "forge_worker",
-        ));
-        assert_eq!(
-            committed
-                .diagnose(&succeeded, None)
-                .expect("unproven commit diagnosis"),
-            ForgeCausalDiagnosis::CommitDidNotReduceFileDebt
-        );
-        let rewrite = ForgeRewriteComparison {
-            input_files: vec![
-                ForgeDataFileInspection {
-                    path: "a".to_owned(),
-                    bytes: 1,
-                },
-                ForgeDataFileInspection {
-                    path: "b".to_owned(),
-                    bytes: 1,
-                },
-            ],
-            input_bytes: 2,
-            output_files: vec![ForgeDataFileInspection {
-                path: "c".to_owned(),
-                bytes: 2,
-            }],
-            output_bytes: 2,
-        };
-        assert_eq!(
-            committed
-                .diagnose(&succeeded, Some(&rewrite))
-                .expect("converged diagnosis"),
-            ForgeCausalDiagnosis::Converged
-        );
-        let unschedulable = ForgeWorkflowInspection {
-            tasks: vec![("staging_fold".to_owned(), "unschedulable".to_owned())],
-            ..empty.clone()
-        };
-        let mut blocked = report.clone();
-        blocked.terminal_tasks.push(ForgeTerminalTaskTelemetry {
-            strategy: ForgeTelemetryStrategy::StagingFold,
-            result: ForgeTelemetryTaskResult::Unschedulable,
-            count: 1,
-            duration_seconds_sum: 0.1,
-        });
-        assert_eq!(
-            blocked
-                .diagnose(&unschedulable, None)
-                .expect("terminally blocked diagnosis"),
-            ForgeCausalDiagnosis::AttemptFailedOrRetryable
-        );
-
-        let durable_without_scheduler = ForgeWorkflowInspection {
-            tasks: vec![("small_files".to_owned(), "ready".to_owned())],
-            ..empty.clone()
-        };
-        let mut no_scheduler = report.clone();
-        no_scheduler.spans.clear();
-        assert!(matches!(
-            no_scheduler.diagnose(&durable_without_scheduler, None),
-            Err(BifrostTelemetryReportError::InvalidBinding { .. })
-        ));
-        assert!(matches!(
-            executed.diagnose(&empty, None),
-            Err(BifrostTelemetryReportError::InvalidBinding { .. })
-        ));
-        assert!(matches!(
-            report.diagnose(&failed, None),
-            Err(BifrostTelemetryReportError::InvalidBinding { .. })
-        ));
-        assert!(matches!(
-            committed.diagnose(&empty, None),
-            Err(BifrostTelemetryReportError::InvalidBinding { .. })
-        ));
-        assert!(matches!(
-            executed.diagnose(&succeeded, None),
-            Err(BifrostTelemetryReportError::InvalidBinding { .. })
-        ));
-        assert!(matches!(
-            committed.diagnose(&empty, Some(&rewrite)),
-            Err(BifrostTelemetryReportError::InvalidBinding { .. })
-        ));
-    }
-
-    /// Construct a valid persisted-demand report before any durable task exists.
-    fn causal_report_fixture() -> ForgeCausalTelemetryReport {
-        ForgeCausalTelemetryReport {
-            accepted_hints: 1,
-            full_hints: 0,
-            closed_hints: 0,
-            persisted_hints: 1,
-            failed_hint_persistence: 0,
-            scheduler_complete: 1,
-            scheduler_incomplete: 0,
-            demands_drained: 0,
-            demands_continued: 0,
-            demand_generations_changed: 0,
-            demand_transition_failures: 0,
-            data_refusals: 0,
-            transient_object_store_failures: 0,
-            transient_coordination_failures: 0,
-            storage_health_failures: 0,
-            capacity_refusals: 0,
-            internal_invariant_failures: 0,
-            attempt_resources: Vec::new(),
-            resource_releases: Vec::new(),
-            execution_envelope_failures: Vec::new(),
-            legacy_envelopes_replanned: 0,
-            legacy_envelope_supersession_failures: 0,
-            retries: Vec::new(),
-            terminal_poisons: Vec::new(),
-            admission_capacity_refusals: 0,
-            execution_capacity_refusals: 0,
-            compaction_debt_files: 0,
-            compaction_debt_bytes: 0,
-            changed_progress_effects: 0,
-            acknowledged_noop_progress_effects: 0,
-            quarantined_workers: 0,
-            planning_backlog: 1,
-            oldest_demand_seconds: 0.1,
-            discovered_candidates: Vec::new(),
-            terminal_tasks: Vec::new(),
-            stage_failures: Vec::new(),
-            rewrite_input_files: 0,
-            rewrite_input_bytes: 0,
-            rewrite_output_files: 0,
-            rewrite_output_bytes: 0,
-            conflicts: 0,
-            spans: vec![causal_span(
-                ForgeCausalSpanName::SchedulerPass,
-                "succeeded",
-                "server",
-            )],
-        }
-    }
-
-    /// Construct one already-validated causal span for diagnosis-only tests.
-    fn causal_span(name: ForgeCausalSpanName, result: &str, role: &str) -> ForgeCausalSpan {
-        ForgeCausalSpan {
-            name,
-            result: result.to_owned(),
-            role: role.to_owned(),
-            task_id: matches!(
-                name,
-                ForgeCausalSpanName::TaskExecute
-                    | ForgeCausalSpanName::CatalogCommit
-                    | ForgeCausalSpanName::Cleanup
-            )
-            .then(|| "00000000-0000-0000-0000-000000000001".to_owned()),
-            attempt_id: matches!(
-                name,
-                ForgeCausalSpanName::TaskExecute
-                    | ForgeCausalSpanName::CatalogCommit
-                    | ForgeCausalSpanName::Cleanup
-            )
-            .then(|| "00000000-0000-0000-0000-000000000002".to_owned()),
-        }
     }
 }

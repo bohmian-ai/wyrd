@@ -5,10 +5,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use arrow::array::{
-    FixedSizeBinaryBuilder, Int32Array, Int64Array, RecordBatch, StringArray,
-    TimestampMicrosecondArray,
-};
+use arrow::array::{Int64Array, RecordBatch, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 use async_trait::async_trait;
 use iceberg::table::Table;
@@ -17,7 +14,6 @@ use iceberg::{Error as IcebergError, ErrorKind as IcebergErrorKind};
 use opendal::{
     Buffer, Entry, Error as ObjectStoreError, ErrorKind as ObjectStoreErrorKind, Metadata, Operator,
 };
-use parquet::arrow::ArrowWriter;
 use vala_bifrost_redux::catalog::{
     BifrostCatalog, CreateTableRequest, TableRef, TenantTableBinding,
 };
@@ -28,18 +24,12 @@ use vala_bifrost_redux::forge::{
 use vala_bifrost_redux::maintenance::StagingFilePublisher;
 use vala_bifrost_redux::maintenance::staging_file_channel;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
-use vala_bifrost_redux::parquet::{
-    BifrostParquetMemoryEnvelope, bifrost_writer_properties_with_metadata,
-};
 use vala_bifrost_redux::resources::{
     BifrostResourcePolicy, BifrostRole, BifrostRuntimeResources, ResourceSource,
     SystemResourceSnapshot,
 };
-use vala_bifrost_redux::schema::with_managed_columns;
 use vala_bifrost_redux::scribe::{NativeIngressTestFrame, ScribeImpl};
-use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_spec::DataTenantId;
-use wyrd_storage::{BackendConfig, StorageHandle, StorageSettings};
 
 use super::super::WyrdTestServer;
 
@@ -71,6 +61,7 @@ fn forge_runtime_resources(
             scratch_limit_bytes: None,
             effective_cpu: None,
             oracle_query_slot_limit: None,
+            forge_compaction_memory_limit_bytes: None,
             scratch_root: scratch_root.to_owned(),
             volume_roots: None,
         },
@@ -105,10 +96,8 @@ pub struct ForgeFixture {
     pub tenant: DataTenantId,
     /// Real Scribe owner every durable fixture append and seal runs through.
     ///
-    /// `None` only for the synthetic owner-level fixture built by
-    /// [`StandaloneForgeFixture`], which stands up no Scribe at all. Every
-    /// journey fixture carries one, and [`ForgeFixture::scribe`] refuses
-    /// rather than silently falling back to a fabricated durable row.
+    /// Every correctness fixture carries one, and [`ForgeFixture::scribe`]
+    /// refuses rather than silently falling back to a fabricated durable row.
     scribe: Option<Arc<ScribeImpl>>,
     /// Catalog owner retained so incremental appends can resolve the live
     /// schema fingerprint Scribe ingress requires.
@@ -118,7 +107,7 @@ pub struct ForgeFixture {
 /// Real dependency graph shared by both Forge fixture seeders.
 ///
 /// Deliberately carries no Scribe handle: the Scribe-backed seeder takes one as
-/// an explicit argument so a journey caller cannot reach the synthetic
+/// an explicit argument so a correctness caller cannot reach the benchmark-only
 /// synthetic seeder by leaving an option unset.
 #[derive(Clone)]
 struct ForgeFixtureResources {
@@ -151,172 +140,6 @@ struct ForgeFixtureSupervision {
     scheduler_trigger: Option<ForgeSchedulerTrigger>,
 }
 
-/// Owns a real Forge fixture without composing an HTTP or gRPC server.
-pub struct StandaloneForgeFixture {
-    /// Database lifetime guard shared by catalog, scheduler, and worker owners.
-    _database: Arc<PgFixture>,
-    /// Object storage lifetime guard shared by setup and Forge.
-    _storage: Arc<StorageHandle>,
-    /// Local backend lifetime guard.
-    _storage_root: Arc<tempfile::TempDir>,
-    /// Seeded Forge owner and durable table state.
-    fixtures: Vec<ForgeFixture>,
-}
-
-impl StandaloneForgeFixture {
-    /// Start real Postgres, catalog, object storage, and Forge owners without a server.
-    ///
-    /// # Errors
-    ///
-    /// Returns fixture, storage, catalog, or Forge construction errors. No HTTP,
-    /// gRPC, `AppState`, or [`WyrdTestServer`] is created by this constructor.
-    pub async fn start(table_name: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        Self::start_topology(table_name, 1).await
-    }
-
-    /// Start one shared standalone Forge graph with the requested tenant count.
-    ///
-    /// # Errors
-    ///
-    /// Returns fixture, tenant, storage, catalog, or Forge construction errors,
-    /// including a zero-tenant topology.
-    pub async fn start_topology(
-        table_name: &str,
-        tenant_count: u32,
-    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        if tenant_count == 0 {
-            return Err("standalone Forge topology needs at least one tenant".into());
-        }
-        let database = Arc::new(PgFixture::start().await?);
-        let storage_root = Arc::new(tempfile::tempdir()?);
-        let storage = StorageHandle::from_settings(StorageSettings {
-            backend: BackendConfig::Local {
-                root: storage_root.path().to_path_buf(),
-            },
-            require_encryption: false,
-            presign_ttl: std::time::Duration::from_secs(600),
-            part_size_bytes: 16 * 1024 * 1024,
-            multipart_threshold_bytes: 100 * 1024 * 1024,
-            public_base_url: Some("https://wyrd.test".to_owned()),
-        })
-        .await?;
-        let catalog =
-            crate::server::test_catalog(&database, crate::server::test_storage_owner(&storage))
-                .await?;
-        let config = ForgeConfig::default();
-        let spill_root = Arc::new(tempfile::tempdir()?);
-        let runtime_resources =
-            forge_runtime_resources(spill_root.path(), 10 * 1024 * 1024 * 1024)?;
-        let roles = runtime_resources
-            .compose_roles()
-            .map_err(|error| crate::server::WyrdTestServerError::Start(error.to_string()))?;
-        let memory = roles.clone();
-        let staging = Arc::new(storage.operator().clone());
-        let object_store: Arc<dyn ForgeObjectStore> =
-            ForgeObjectStoreControl::new(Arc::clone(&staging));
-        let (_, inbox) = staging_file_channel(config.max_hints_per_wake)?;
-        let forge = Arc::new(Forge::new(ForgeBuildConfig {
-            resources: roles.forge().ok_or_else(|| {
-                crate::server::WyrdTestServerError::Start(
-                    "Forge composition must issue a Forge capability".to_owned(),
-                )
-            })?,
-            vala: database.vala_postgres().clone(),
-            operator_pool: database.operator_pool().clone(),
-            catalog: catalog.iceberg_catalog(),
-            staging: Arc::clone(&staging),
-            object_store: Arc::clone(&object_store),
-            rewrite_spill_root: spill_root.path().to_owned(),
-            hints: inbox,
-            config: config.clone(),
-            maintenance_interval: std::time::Duration::from_secs(60),
-            clock: vala_bifrost_redux::forge::ForgeClock::system(),
-            completion_observer: None,
-            scheduler_trigger: None,
-            telemetry: Arc::new(vala_bifrost_redux::forge::ForgeTelemetry::new()),
-        })?);
-        let resources = ForgeFixtureResources {
-            forge,
-            vala: database.vala_postgres().clone(),
-            operator_pool: database.operator_pool().clone(),
-            bifrost_catalog: catalog,
-            staging,
-            object_store,
-            spill_root,
-            memory,
-            config,
-        };
-        let mut tenants = Vec::with_capacity(usize::try_from(tenant_count)?);
-        tenants.push(database.data_tenant_id());
-        for index in 1..tenant_count {
-            tenants.push(
-                database
-                    .seed_additional_tenant(&format!("forge-test-{index}"))
-                    .await?,
-            );
-        }
-        let partition_day = default_fixture_day();
-        let mut fixtures = Vec::with_capacity(tenants.len());
-        for tenant in tenants {
-            fixtures.push(
-                seed_synthetic_forge_group_for_test(
-                    resources.clone(),
-                    tenant,
-                    table_name,
-                    false,
-                    &[partition_day],
-                )
-                .await,
-            );
-        }
-        Ok(Self {
-            _database: database,
-            _storage: storage,
-            _storage_root: storage_root,
-            fixtures,
-        })
-    }
-
-    /// Return the seeded real Forge fixture.
-    ///
-    /// # Panics
-    ///
-    /// Panics only if the constructor invariant requiring at least one tenant
-    /// fixture is violated.
-    #[must_use]
-    pub fn fixture(&self) -> &ForgeFixture {
-        &self.fixtures[0]
-    }
-
-    /// Borrow every tenant-scoped table in the shared standalone Forge graph.
-    #[must_use]
-    pub fn fixtures(&self) -> &[ForgeFixture] {
-        &self.fixtures
-    }
-}
-
-/// Read-only probe for the DataFusion pool owned by one Forge fixture.
-#[derive(Clone)]
-pub struct ForgeMemoryProbe {
-    /// Closure-backed reservation read that avoids exposing DataFusion types.
-    sample: Arc<dyn Fn() -> usize + Send + Sync>,
-}
-
-impl ForgeMemoryProbe {
-    /// Build a probe over the exact pool supplied to Forge.
-    fn new(sample: impl Fn() -> usize + Send + Sync + 'static) -> Self {
-        Self {
-            sample: Arc::new(sample),
-        }
-    }
-
-    /// Return the pool's current reservation in bytes.
-    #[must_use]
-    pub fn current_reserved(&self) -> usize {
-        (self.sample)()
-    }
-}
-
 /// Catalog wrapper used by uncertainty tests.
 ///
 /// `update_table` delegates the real commit first, then returns one retryable
@@ -338,6 +161,10 @@ pub struct CommitUncertaintyCatalog {
 pub(crate) struct CommitUncertaintyControls {
     /// Counts all delegated commit attempts across process-local wrappers.
     update_attempts: AtomicUsize,
+    /// Arms one injected failure before the next delegated table load.
+    fail_next_load_table: AtomicBool,
+    /// Counts delegated table loads reached while the load fault was armed.
+    load_table_calls: AtomicUsize,
     /// One-shot panic mode at the real catalog commit boundary.
     panic_mode: AtomicU8,
     /// Records that an armed catalog panic reached its production boundary.
@@ -366,6 +193,8 @@ pub(crate) struct CommitUncertaintyControls {
     after_commit_drop_ready: tokio::sync::Notify,
     /// Arms a pause before a delegated commit.
     pause_before_commit: AtomicBool,
+    /// Remaining delegated commits to refuse outright as definite conflicts.
+    reject_commit_budget: AtomicUsize,
     /// Records that the pre-commit pause has been reached.
     before_commit_reached: AtomicBool,
     /// Selects a stale-worker response before delegation.
@@ -455,6 +284,8 @@ impl CommitUncertaintyControls {
     pub(crate) fn new() -> Self {
         Self {
             update_attempts: AtomicUsize::new(0),
+            fail_next_load_table: AtomicBool::new(false),
+            load_table_calls: AtomicUsize::new(0),
             panic_mode: AtomicU8::new(0),
             panic_reached: AtomicBool::new(false),
             panic_ready: tokio::sync::Notify::new(),
@@ -469,6 +300,7 @@ impl CommitUncertaintyControls {
             after_commit_dropped: AtomicBool::new(false),
             after_commit_drop_ready: tokio::sync::Notify::new(),
             pause_before_commit: AtomicBool::new(false),
+            reject_commit_budget: AtomicUsize::new(0),
             before_commit_reached: AtomicBool::new(false),
             reject_before_commit: AtomicBool::new(false),
             before_commit_ready: tokio::sync::Notify::new(),
@@ -480,6 +312,26 @@ impl CommitUncertaintyControls {
 }
 
 impl CommitUncertaintyCatalog {
+    /// Fail the next delegated table load exactly once.
+    ///
+    /// Recovery reloads the table a retained `Prepared` attempt named before it
+    /// can reconcile that evidence, so failing exactly one load is how a
+    /// scenario proves recovery stops at its catalog dependency instead of
+    /// settling on stale metadata. The arm is consumed by the call it fails, so
+    /// the next worker respawn recovers without further intervention.
+    pub fn fail_next_load_table(&self) {
+        self.controls.load_table_calls.store(0, Ordering::Release);
+        self.controls
+            .fail_next_load_table
+            .store(true, Ordering::Release);
+    }
+
+    /// Reports how many delegated table loads were reached since arming.
+    #[must_use]
+    pub fn load_table_calls(&self) -> usize {
+        self.controls.load_table_calls.load(Ordering::Acquire)
+    }
+
     /// Panic once immediately before the next delegated catalog commit.
     pub fn panic_before_next_commit(&self) {
         self.controls.panic_reached.store(false, Ordering::Release);
@@ -569,6 +421,28 @@ impl CommitUncertaintyCatalog {
             &self.controls.after_commit_drop_ready,
         )
         .await;
+    }
+
+    /// Refuse the next `count` delegated commits as definite conflicts.
+    ///
+    /// The refusal happens before delegation and is non-retryable, so the
+    /// caller learns the commit certainly did not land. A budget rather than a
+    /// one-shot pause is what makes a retry proof deterministic: the retry
+    /// cannot race the test re-arming the seam between attempts.
+    pub fn reject_next_commits(&self, count: usize) {
+        self.controls.update_attempts.store(0, Ordering::Release);
+        self.controls
+            .reject_commit_budget
+            .store(count, Ordering::Release);
+    }
+
+    /// Release the paused post-acceptance response without injecting a fault.
+    ///
+    /// A visibility proof needs the commit to be held open while it observes
+    /// the catalog-to-SQL window, then to complete normally. Rejecting it
+    /// instead would prove recovery, not the window.
+    pub fn release_paused_commit(&self) {
+        self.controls.commit_release.notify_waiters();
     }
 
     /// Mark the paused caller stale and let it observe the injected response.
@@ -679,6 +553,19 @@ impl Catalog for CommitUncertaintyCatalog {
     }
 
     async fn load_table(&self, table: &TableIdent) -> iceberg::Result<Table> {
+        self.controls
+            .load_table_calls
+            .fetch_add(1, Ordering::AcqRel);
+        if self
+            .controls
+            .fail_next_load_table
+            .swap(false, Ordering::AcqRel)
+        {
+            return Err(iceberg::Error::new(
+                iceberg::ErrorKind::Unexpected,
+                "injected Forge catalog load failure",
+            ));
+        }
         self.inner.load_table(table).await
     }
 
@@ -724,6 +611,20 @@ impl Catalog for CommitUncertaintyCatalog {
                 "injected post-commit uncertainty remains unresolved",
             )
             .with_retryable(true));
+        }
+        if self
+            .controls
+            .reject_commit_budget
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |budget| {
+                budget.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(IcebergError::new(
+                IcebergErrorKind::Unexpected,
+                "injected definite Forge commit conflict",
+            )
+            .with_retryable(false));
         }
         if self
             .controls
@@ -830,14 +731,10 @@ impl Catalog for CommitUncertaintyCatalog {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use std::time::Duration;
 
-    use opendal::Operator;
-
     use super::{
-        AtomicBool, ForgeObjectStore, ForgeObjectStoreControl, Ordering, PausedCatalogCallDropAck,
-        wait_for_paused_catalog_call_drop,
+        AtomicBool, Ordering, PausedCatalogCallDropAck, wait_for_paused_catalog_call_drop,
     };
 
     /// Dropping an armed paused-call guard publishes an acknowledgement even before waiting starts.
@@ -866,49 +763,6 @@ mod tests {
 
         assert!(!dropped.load(Ordering::Acquire));
     }
-
-    /// The post-PUT control pauses one armed call while counting every successful notification.
-    #[tokio::test]
-    async fn output_put_control_is_one_shot_and_records_path() {
-        let operator = Operator::new(opendal::services::Memory::default())
-            .expect("memory operator builder")
-            .finish();
-        let control = ForgeObjectStoreControl::new(Arc::new(operator));
-        control.pause_after_next_output_put();
-        let paused = tokio::spawn({
-            let control = Arc::clone(&control);
-            async move {
-                control
-                    .after_output_put("table/data/forge/first.parquet")
-                    .await;
-            }
-        });
-        tokio::time::timeout(Duration::from_secs(1), control.wait_for_output_put())
-            .await
-            .expect("armed post-PUT notification must become observable");
-        assert_eq!(
-            control.last_output_path().as_deref(),
-            Some("table/data/forge/first.parquet")
-        );
-        assert_eq!(control.output_put_calls(), 1);
-        control.release_output_put();
-        tokio::time::timeout(Duration::from_secs(1), paused)
-            .await
-            .expect("released post-PUT task completion bound")
-            .expect("released post-PUT task");
-
-        tokio::time::timeout(
-            Duration::from_secs(1),
-            control.after_output_put("table/data/forge/second.parquet"),
-        )
-        .await
-        .expect("unarmed notification must return immediately");
-        assert_eq!(control.output_put_calls(), 2);
-        assert_eq!(
-            control.last_output_path().as_deref(),
-            Some("table/data/forge/first.parquet")
-        );
-    }
 }
 
 /// Scoped OpenDAL controls for deterministic list/delete interleavings.
@@ -920,26 +774,12 @@ mod tests {
 pub struct ForgeObjectStoreControl {
     /// Real production-shaped operator used for every delegated operation.
     inner: Arc<Operator>,
-    /// One-shot arm flag consumed by the next successful output notification.
-    pause_next_output_put: AtomicBool,
-    /// Durable-in-process signal that the armed notification reached its pause.
-    output_put_reached: AtomicBool,
-    /// Wakes tasks waiting for the armed successful output notification.
-    output_put_ready: tokio::sync::Notify,
-    /// Releases the armed notification after the test schedules its interleaving.
-    output_put_release: tokio::sync::Notify,
-    /// Counts every successful output PUT notification, armed or unarmed.
-    output_put_calls: AtomicUsize,
-    /// Zero-based output ordinal observed since the selected-output fault was armed.
-    output_put_ordinal: AtomicUsize,
-    /// Zero-based output ordinal selected for the next one-shot failure.
-    fail_output_put_ordinal: AtomicUsize,
-    /// Whether the selected-output fault remains armed.
-    fail_output_put_armed: AtomicBool,
     /// Counts every wrapped object-store call made after fixture construction.
     object_io_calls: AtomicUsize,
-    /// Retains the exact path observed by the most recent armed notification.
-    last_output_path: Mutex<Option<String>>,
+    /// Arms one injected failure before the next delegated read.
+    fail_next_read: AtomicBool,
+    /// Counts delegated reads reached since the read fault was armed.
+    read_calls: AtomicUsize,
     /// One-shot arm flag for the next delegated object listing.
     pause_next_list: AtomicBool,
     /// Signals that the armed listing has returned from the real operator.
@@ -975,21 +815,47 @@ pub struct ForgeObjectStoreControl {
 }
 
 impl ForgeObjectStoreControl {
+    /// Fail the next delegated object read exactly once.
+    ///
+    /// A retained `Prepared` attempt reconciles from metadata it must reread,
+    /// so failing exactly one read is how a scenario proves recovery stops at
+    /// its object-store dependency rather than reconciling from nothing. The
+    /// arm is consumed by the call it fails, so the next respawn recovers.
+    pub fn fail_next_read(&self) {
+        self.read_calls.store(0, Ordering::Release);
+        self.fail_next_read.store(true, Ordering::Release);
+    }
+
+    /// Reports how many delegated reads were reached since arming.
+    #[must_use]
+    pub fn read_calls(&self) -> usize {
+        self.read_calls.load(Ordering::Acquire)
+    }
+
+    /// Consume one armed read failure, if the fixture armed it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an OpenDAL `Unexpected` error exactly once per arming.
+    fn take_read_failure(&self) -> opendal::Result<()> {
+        self.read_calls.fetch_add(1, Ordering::AcqRel);
+        if self.fail_next_read.swap(false, Ordering::AcqRel) {
+            return Err(opendal::Error::new(
+                opendal::ErrorKind::Unexpected,
+                "injected Forge object-store read failure",
+            ));
+        }
+        Ok(())
+    }
+
     /// Wrap the real staging operator used by a Forge context.
     #[must_use]
     pub fn new(inner: Arc<Operator>) -> Arc<Self> {
         Arc::new(Self {
             inner,
-            pause_next_output_put: AtomicBool::new(false),
-            output_put_reached: AtomicBool::new(false),
-            output_put_ready: tokio::sync::Notify::new(),
-            output_put_release: tokio::sync::Notify::new(),
-            output_put_calls: AtomicUsize::new(0),
-            output_put_ordinal: AtomicUsize::new(0),
-            fail_output_put_ordinal: AtomicUsize::new(0),
-            fail_output_put_armed: AtomicBool::new(false),
             object_io_calls: AtomicUsize::new(0),
-            last_output_path: Mutex::new(None),
+            fail_next_read: AtomicBool::new(false),
+            read_calls: AtomicUsize::new(0),
             pause_next_list: AtomicBool::new(false),
             list_returned: AtomicBool::new(false),
             list_ready: tokio::sync::Notify::new(),
@@ -1009,59 +875,10 @@ impl ForgeObjectStoreControl {
         })
     }
 
-    /// Pause the next successful rewrite output after its real PUT completes.
-    pub fn pause_after_next_output_put(&self) {
-        self.output_put_reached.store(false, Ordering::Release);
-        *self
-            .last_output_path
-            .lock()
-            .expect("Forge output-path observation lock must not be poisoned") = None;
-        self.pause_next_output_put.store(true, Ordering::Release);
-    }
-
-    /// Wait until the armed output has crossed the successful real PUT boundary.
-    pub async fn wait_for_output_put(&self) {
-        while !self.output_put_reached.load(Ordering::Acquire) {
-            self.output_put_ready.notified().await;
-        }
-    }
-
-    /// Resume the post-PUT notification without changing output ownership.
-    pub fn release_output_put(&self) {
-        self.output_put_release.notify_one();
-    }
-
-    /// Return the number of successful rewrite PUT notifications observed.
-    #[must_use]
-    pub fn output_put_calls(&self) -> usize {
-        self.output_put_calls.load(Ordering::Acquire)
-    }
-
-    /// Fail one zero-based output ordinal in the next production Forge attempt.
-    ///
-    /// The fault is consumed before the selected object upload begins, so the
-    /// attempt cannot transfer an incomplete multi-output evidence set into a
-    /// Prepared operation or catalog replacement.
-    pub fn fail_output_put_at_ordinal_for_test(&self, ordinal: usize) {
-        self.output_put_ordinal.store(0, Ordering::Release);
-        self.fail_output_put_ordinal
-            .store(ordinal, Ordering::Release);
-        self.fail_output_put_armed.store(true, Ordering::Release);
-    }
-
     /// Return the number of wrapped object-store operations observed.
     #[must_use]
     pub fn object_io_calls(&self) -> usize {
         self.object_io_calls.load(Ordering::Acquire)
-    }
-
-    /// Return the exact path captured by the most recent armed notification.
-    #[must_use]
-    pub fn last_output_path(&self) -> Option<String> {
-        self.last_output_path
-            .lock()
-            .expect("Forge output-path observation lock must not be poisoned")
-            .clone()
     }
 
     /// Pause one list after the real object-store response is available.
@@ -1155,49 +972,6 @@ impl ForgeObjectStoreControl {
 
 #[async_trait]
 impl ForgeObjectStore for ForgeObjectStoreControl {
-    /// Reject the selected output ordinal before its real upload begins.
-    ///
-    /// # Errors
-    ///
-    /// Returns one injected object-store error when the armed ordinal reaches
-    /// the production upload boundary.
-    async fn before_output_put(&self, path: &str) -> opendal::Result<()> {
-        let observed = self.output_put_ordinal.fetch_add(1, Ordering::AcqRel);
-        if observed == self.fail_output_put_ordinal.load(Ordering::Acquire)
-            && self
-                .fail_output_put_armed
-                .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-        {
-            return Err(ObjectStoreError::new(
-                ObjectStoreErrorKind::Unexpected,
-                "test-injected Forge output verification failure",
-            )
-            .with_context("path", path));
-        }
-        Ok(())
-    }
-
-    /// Observe a durable output and optionally pause the one armed call.
-    ///
-    /// The real write has already completed through the production staging
-    /// operator. This infallible notification only records and synchronizes;
-    /// it never performs a write or changes output ownership.
-    async fn after_output_put(&self, path: &str) {
-        self.output_put_calls.fetch_add(1, Ordering::AcqRel);
-        if !self.pause_next_output_put.swap(false, Ordering::AcqRel) {
-            return;
-        }
-        *self
-            .last_output_path
-            .lock()
-            .expect("Forge output-path observation lock must not be poisoned") =
-            Some(path.to_owned());
-        self.output_put_reached.store(true, Ordering::Release);
-        self.output_put_ready.notify_waiters();
-        self.output_put_release.notified().await;
-    }
-
     /// Read exactly the requested byte range through OpenDAL's native reader.
     ///
     /// Forge uses bounded reads for Parquet metadata and row-group admission;
@@ -1209,11 +983,13 @@ impl ForgeObjectStore for ForgeObjectStoreControl {
     /// requested range.
     async fn read_range(&self, path: &str, range: std::ops::Range<u64>) -> opendal::Result<Buffer> {
         self.object_io_calls.fetch_add(1, Ordering::AcqRel);
+        self.take_read_failure()?;
         self.inner.reader(path).await?.read(range).await
     }
 
     async fn read(&self, path: &str) -> opendal::Result<Buffer> {
         self.object_io_calls.fetch_add(1, Ordering::AcqRel);
+        self.take_read_failure()?;
         self.inner.read(path).await
     }
 
@@ -1284,14 +1060,14 @@ impl ForgeFixture {
     ///
     /// # Panics
     ///
-    /// Panics for the synthetic owner-level fixture, which stands up no
+    /// Panics for the benchmark-only synthetic fixture, which stands up no
     /// Scribe. Refusing here is deliberate: a silent fallback to a fabricated
     /// durable row is exactly the failure mode the Scribe-backed seeder exists
     /// to remove.
     fn scribe(&self) -> &Arc<ScribeImpl> {
-        self.scribe.as_ref().expect(
-            "this Forge fixture was built by seed_synthetic_forge_group_for_test, which has no Scribe",
-        )
+        self.scribe
+            .as_ref()
+            .expect("this Forge fixture has no Scribe")
     }
 
     /// Clone the server-owned context with a test-specific validated config.
@@ -1316,7 +1092,7 @@ impl ForgeFixture {
         completion_observer: ForgeWorkerCompletionObserver,
         scheduler_trigger: ForgeSchedulerTrigger,
     ) -> Arc<Forge> {
-        self.build_forge_with_publisher_and_memory_probe_and_supervision(
+        self.build_forge_with_publisher_and_supervision(
             config,
             Arc::clone(&self.catalog),
             Arc::clone(&self.object_store),
@@ -1326,7 +1102,7 @@ impl ForgeFixture {
                 scheduler_trigger: Some(scheduler_trigger),
             },
         )
-        .map(|(forge, _publisher, _probe)| forge)
+        .map(|(forge, _publisher)| forge)
         .expect("validated Forge fixture config")
     }
 
@@ -1344,7 +1120,7 @@ impl ForgeFixture {
         completion_observer: ForgeWorkerCompletionObserver,
         scheduler_trigger: ForgeSchedulerTrigger,
     ) -> (Arc<Forge>, StagingFilePublisher) {
-        self.build_forge_with_publisher_and_memory_probe_and_supervision(
+        self.build_forge_with_publisher_and_supervision(
             config,
             catalog,
             object_store,
@@ -1354,7 +1130,6 @@ impl ForgeFixture {
                 scheduler_trigger: Some(scheduler_trigger),
             },
         )
-        .map(|(forge, publisher, _probe)| (forge, publisher))
         .expect("validated Forge fixture config")
     }
 
@@ -1370,7 +1145,7 @@ impl ForgeFixture {
         scheduler_trigger: ForgeSchedulerTrigger,
         spill_root: &std::path::Path,
     ) -> Arc<Forge> {
-        self.build_forge_with_publisher_and_memory_probe_and_supervision_at(
+        self.build_forge_with_publisher_and_supervision_at(
             config,
             Arc::clone(&self.catalog),
             Arc::clone(&self.object_store),
@@ -1381,7 +1156,7 @@ impl ForgeFixture {
             },
             Some(spill_root),
         )
-        .map(|(forge, _publisher, _probe)| forge)
+        .map(|(forge, _publisher)| forge)
         .expect("validated Forge fixture spill-root config")
     }
 
@@ -1406,24 +1181,7 @@ impl ForgeFixture {
         config: ForgeConfig,
         system_memory_limit_bytes: usize,
     ) -> (Arc<Forge>, StagingFilePublisher) {
-        self.build_forge_with_publisher_and_memory_probe(
-            config,
-            Arc::clone(&self.catalog),
-            Arc::clone(&self.object_store),
-            Some(system_memory_limit_bytes),
-        )
-        .map(|(forge, publisher, _probe)| (forge, publisher))
-        .expect("validated Forge fixture config")
-    }
-
-    /// Build from a constrained process observation and expose root ownership.
-    #[must_use]
-    pub fn context_with_constrained_memory_and_probe(
-        &self,
-        config: ForgeConfig,
-        system_memory_limit_bytes: usize,
-    ) -> (Arc<Forge>, StagingFilePublisher, ForgeMemoryProbe) {
-        self.build_forge_with_publisher_and_memory_probe(
+        self.build_forge_with_publisher_and_memory_limit(
             config,
             Arc::clone(&self.catalog),
             Arc::clone(&self.object_store),
@@ -1521,8 +1279,8 @@ impl ForgeFixture {
         object_store: Arc<dyn ForgeObjectStore>,
         memory_limit_bytes: Option<usize>,
     ) -> (Arc<Forge>, StagingFilePublisher) {
-        let (forge, publisher, _probe) = self
-            .build_forge_with_publisher_and_memory_probe(
+        let (forge, publisher) = self
+            .build_forge_with_publisher_and_memory_limit(
                 config,
                 catalog,
                 object_store,
@@ -1532,19 +1290,19 @@ impl ForgeFixture {
         (forge, publisher)
     }
 
-    /// Construct Forge and a probe over its exact DataFusion pool.
+    /// Construct Forge under an optional constrained memory observation.
     ///
     /// # Errors
     ///
     /// Returns an error when the supplied Forge configuration is invalid.
-    fn build_forge_with_publisher_and_memory_probe(
+    fn build_forge_with_publisher_and_memory_limit(
         &self,
         config: ForgeConfig,
         catalog: Arc<dyn Catalog>,
         object_store: Arc<dyn ForgeObjectStore>,
         memory_limit_bytes: Option<usize>,
-    ) -> Result<(Arc<Forge>, StagingFilePublisher, ForgeMemoryProbe), &'static str> {
-        self.build_forge_with_publisher_and_memory_probe_and_supervision(
+    ) -> Result<(Arc<Forge>, StagingFilePublisher), &'static str> {
+        self.build_forge_with_publisher_and_supervision(
             config,
             catalog,
             object_store,
@@ -1553,20 +1311,20 @@ impl ForgeFixture {
         )
     }
 
-    /// Construct Forge, its memory probe, and optional passive supervisor controls.
+    /// Construct Forge with optional passive supervisor controls.
     ///
     /// # Errors
     ///
     /// Returns an error when the supplied Forge configuration is invalid.
-    fn build_forge_with_publisher_and_memory_probe_and_supervision(
+    fn build_forge_with_publisher_and_supervision(
         &self,
         config: ForgeConfig,
         catalog: Arc<dyn Catalog>,
         object_store: Arc<dyn ForgeObjectStore>,
         memory_limit_bytes: Option<usize>,
         supervision: ForgeFixtureSupervision,
-    ) -> Result<(Arc<Forge>, StagingFilePublisher, ForgeMemoryProbe), &'static str> {
-        self.build_forge_with_publisher_and_memory_probe_and_supervision_at(
+    ) -> Result<(Arc<Forge>, StagingFilePublisher), &'static str> {
+        self.build_forge_with_publisher_and_supervision_at(
             config,
             catalog,
             object_store,
@@ -1577,7 +1335,7 @@ impl ForgeFixture {
     }
 
     /// Constructs Forge with an optional caller-owned scratch root.
-    fn build_forge_with_publisher_and_memory_probe_and_supervision_at(
+    fn build_forge_with_publisher_and_supervision_at(
         &self,
         config: ForgeConfig,
         catalog: Arc<dyn Catalog>,
@@ -1585,7 +1343,7 @@ impl ForgeFixture {
         memory_limit_bytes: Option<usize>,
         supervision: ForgeFixtureSupervision,
         spill_root: Option<&std::path::Path>,
-    ) -> Result<(Arc<Forge>, StagingFilePublisher, ForgeMemoryProbe), &'static str> {
+    ) -> Result<(Arc<Forge>, StagingFilePublisher), &'static str> {
         let (publisher, inbox) =
             staging_file_channel(config.max_hints_per_wake).expect("validated Forge hint capacity");
         let runtime_root = spill_root.map_or_else(
@@ -1604,24 +1362,19 @@ impl ForgeFixture {
         let roles = runtime_resources
             .compose_roles()
             .map_err(|_| "invalid Forge resource composition")?;
-        let forge_resources = roles
-            .forge()
-            .ok_or("Forge composition must issue a Forge capability")?;
-        let probe_resources = forge_resources.clone();
-        let probe = ForgeMemoryProbe::new(move || {
-            probe_resources
-                .snapshot()
-                .map_or(0, |snapshot| snapshot.elastic_memory_used_bytes)
-        });
         let forge = Arc::new(
             Forge::new(ForgeBuildConfig {
-                resources: forge_resources,
+                resource_plan: roles.plan(),
                 vala: self.vala.clone(),
                 operator_pool: self.operator_pool.clone(),
                 catalog,
                 staging: Arc::clone(&self.staging),
+                staging_lists_by_cursor: self
+                    .staging
+                    .info()
+                    .full_capability()
+                    .list_with_start_after,
                 object_store,
-                rewrite_spill_root: runtime_root,
                 hints: inbox,
                 config,
                 maintenance_interval: std::time::Duration::from_secs(60),
@@ -1632,7 +1385,7 @@ impl ForgeFixture {
             })
             .map_err(|_| "invalid Forge fixture config")?,
         );
-        Ok((forge, publisher, probe))
+        Ok((forge, publisher))
     }
 
     /// Append one aged Scribe-shaped Parquet file and its durable file-list row.
@@ -1674,7 +1427,7 @@ impl ForgeFixture {
     /// # Panics
     ///
     /// Panics when `rows` is zero, when this fixture carries no Scribe owner
-    /// (the synthetic owner-level fixture), or when ingest or seal fails.
+    /// (the benchmark-only synthetic fixture), or when ingest or seal fails.
     async fn append_forge_file_for_day_with_rows(
         &self,
         sequence: i64,
@@ -2208,516 +1961,5 @@ async fn seed_forge_group_with_scribe(
         tenant,
         scribe: Some(scribe),
         bifrost_catalog: resources.bifrost_catalog,
-    }
-}
-
-/// Seed a synthetic Forge group for isolated owner-level tests.
-///
-/// **Third documented raw-insert exemption.** [`StandaloneForgeFixture`] stands
-/// up Postgres, storage, a catalog, and Forge without an HTTP server,
-/// `AppState`, or [`WyrdTestServer`], and therefore has no Scribe to append
-/// through. Reaching a real seal from there would mean assembling a full
-/// `ScribeImpl` — WAL directories, execution pools, persistence config, and
-/// tenant setup — inside a fixture whose entire purpose is to exclude that
-/// stack.
-///
-/// Its consumers exercise Forge owner lifecycle behavior without bringing up
-/// Scribe. User journeys use the Scribe-backed fixture instead.
-///
-/// # Panics
-///
-/// Panics when `partition_days` is empty or when table creation, object
-/// encoding, or the durable fixture insert fails.
-async fn seed_synthetic_forge_group_for_test(
-    resources: ForgeFixtureResources,
-    tenant: DataTenantId,
-    table_name: &str,
-    schema_variant: bool,
-    partition_days: &[chrono::NaiveDate],
-) -> ForgeFixture {
-    assert!(
-        !partition_days.is_empty(),
-        "Forge fixture needs one partition day"
-    );
-    let staging = Arc::clone(&resources.staging);
-    let binding = create_fixture_table(
-        &resources.bifrost_catalog,
-        tenant,
-        table_name,
-        schema_variant,
-    )
-    .await;
-    let catalog = resources.bifrost_catalog.iceberg_catalog();
-    let schema = ArrowSchema::new(with_managed_columns(if schema_variant {
-        vec![
-            Field::new("value", DataType::Int64, false),
-            Field::new("schema_variant", DataType::Int64, false),
-        ]
-    } else {
-        vec![Field::new("value", DataType::Int64, false)]
-    }));
-
-    let mut conn = resources
-        .vala
-        .tenant_conn(tenant)
-        .await
-        .expect("Forge fixture tenant connection");
-    for (day_index, partition_day) in partition_days.iter().enumerate() {
-        let base = partition_day
-            .and_hms_opt(12, 0, 0)
-            .expect("Forge fixture timestamp")
-            .and_utc()
-            .timestamp_micros();
-        for file_number in 0..2_i64 {
-            let file_number =
-                i64::try_from(day_index).expect("partition day index") * 2 + file_number;
-            let mut columns = vec![
-                Arc::new(Int64Array::from(vec![file_number, file_number + 10]))
-                    as Arc<dyn arrow::array::Array>,
-            ];
-            if schema_variant {
-                columns
-                    .push(Arc::new(Int64Array::from(vec![1_i64, 1_i64]))
-                        as Arc<dyn arrow::array::Array>);
-            }
-            let mut batch_ids = FixedSizeBinaryBuilder::with_capacity(2, 16);
-            for _ in 0..2 {
-                batch_ids
-                    .append_value([0_u8; 16])
-                    .expect("fixed batch identifier");
-            }
-            columns.extend([
-                Arc::new(StringArray::from(vec![None::<&str>; 2])) as Arc<dyn arrow::array::Array>,
-                Arc::new(StringArray::from(vec![None::<&str>; 2])) as Arc<dyn arrow::array::Array>,
-                Arc::new(StringArray::from(vec!["principal"; 2])) as Arc<dyn arrow::array::Array>,
-                Arc::new(StringArray::from(vec!["request"; 2])) as Arc<dyn arrow::array::Array>,
-                Arc::new(
-                    TimestampMicrosecondArray::from(vec![
-                        base + file_number * 1_000_000,
-                        base + file_number * 1_000_000 + 1_000,
-                    ])
-                    .with_timezone("UTC"),
-                ) as Arc<dyn arrow::array::Array>,
-                Arc::new(
-                    TimestampMicrosecondArray::from(vec![
-                        base + file_number * 1_000_000,
-                        base + file_number * 1_000_000 + 1_000,
-                    ])
-                    .with_timezone("UTC"),
-                ) as Arc<dyn arrow::array::Array>,
-                Arc::new(batch_ids.finish()) as Arc<dyn arrow::array::Array>,
-                Arc::new(Int32Array::from(vec![0_i32, 1_i32])) as Arc<dyn arrow::array::Array>,
-                Arc::new(StringArray::from(vec![tenant.to_string(); 2]))
-                    as Arc<dyn arrow::array::Array>,
-            ]);
-            let batch = RecordBatch::try_new(Arc::new(schema.clone()), columns)
-                .expect("Forge fixture batch");
-            let path = format!("{}/journey-{file_number}.parquet", binding.object_prefix);
-            let metadata = BifrostParquetMemoryEnvelope::metadata_for_batch(&batch, &path)
-                .expect("Forge fixture writer-v2 metadata");
-            let mut bytes = Vec::new();
-            let properties =
-                bifrost_writer_properties_with_metadata(batch.num_rows(), metadata, &[]);
-            let mut writer = ArrowWriter::try_new(&mut bytes, batch.schema(), Some(properties))
-                .expect("Parquet writer");
-            writer.write(&batch).expect("Parquet batch");
-            writer.close().expect("Parquet close");
-            let size = i64::try_from(bytes.len()).expect("Forge fixture file size");
-            staging
-                .write(&path, Buffer::from(bytes))
-                .await
-                .expect("Forge fixture object");
-            let min_time = chrono::DateTime::from_timestamp_micros(base + file_number * 1_000_000)
-                .expect("Forge fixture timestamp");
-            sqlx::query(
-            "INSERT INTO vala.file_list (id, data_tenant_id, namespace, table_name, file_path, file_size, row_count, min_event_time, max_event_time, partition_granularity, partition_start, node_id, writer_epoch, wal_lsn_min, wal_lsn_max, promotion_record) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, '{\"fixture\": \"forge-harness\"}'::jsonb)",
-        )
-        .bind(uuid::Uuid::now_v7())
-        .bind(tenant.as_uuid())
-        .bind(&binding.logical_namespace)
-        .bind(&binding.table_name)
-        .bind(path)
-        .bind(size)
-        .bind(2_i64)
-        .bind(min_time)
-        .bind(min_time + chrono::Duration::milliseconds(1))
-        .bind("day")
-        .bind(day_partition_start(*partition_day))
-        .bind(uuid::Uuid::now_v7())
-        .bind(1_i64)
-        .bind(file_number * 2 + 1)
-        .bind(file_number * 2 + 2)
-        .execute(&mut **conn.transaction())
-        .await
-        .expect("Forge fixture file-list row");
-        }
-    }
-    conn.commit().await.expect("Forge fixture commit");
-    sqlx::query(
-        "UPDATE vala.file_list SET created_at = now() - interval '3 minutes' WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3",
-    )
-    .bind(tenant.as_uuid())
-    .bind(&binding.logical_namespace)
-    .bind(&binding.table_name)
-    .execute(resources.operator_pool.pool())
-    .await
-    .expect("Forge fixture aging");
-
-    ForgeFixture {
-        forge: resources.forge,
-        vala: resources.vala,
-        operator_pool: resources.operator_pool,
-        catalog,
-        staging,
-        object_store: resources.object_store,
-        spill_root: resources.spill_root,
-        memory: resources.memory,
-        config: resources.config,
-        binding,
-        tenant,
-        scribe: None,
-        bifrost_catalog: resources.bifrost_catalog,
-    }
-}
-
-/// Real Forge worker lifecycle proofs over the one production resource root.
-///
-/// Every test drives the production `ForgeWorker` against real Postgres,
-/// catalog, and object storage. The fixture only injects raw observations and
-/// fault seams; it never constructs a governor, a pool, or a runtime.
-#[cfg(test)]
-mod worker_lifecycle_tests {
-    use std::sync::Arc;
-
-    use tokio_util::sync::CancellationToken;
-    use vala_bifrost_redux::forge::{ForgeWorker, ForgeWorkerConfig};
-    use vala_bifrost_redux::resources::ForgeRewriteRequest;
-
-    use super::{
-        CommitUncertaintyCatalog, ForgeFixture, ForgeObjectStoreControl, StandaloneForgeFixture,
-    };
-
-    /// Seeds one compaction-ready standalone fixture with a bounded bin.
-    async fn lifecycle_fixture(table: &str) -> StandaloneForgeFixture {
-        let standalone = StandaloneForgeFixture::start(table)
-            .await
-            .expect("standalone Forge fixture");
-        standalone.fixture().append_forge_file(101).await;
-        standalone.fixture().append_forge_file(102).await;
-        standalone
-    }
-
-    /// Returns a bounded compaction config that plans one small rewrite bin.
-    fn lifecycle_config(fixture: &ForgeFixture) -> vala_bifrost_redux::forge::ForgeConfig {
-        let mut config = fixture.config.clone();
-        config.max_files_per_bin = 2;
-        config.max_files_per_tick = 2;
-        config
-    }
-
-    /// Awaits one fixture signal under a bounded lifecycle deadline.
-    async fn bounded<F: std::future::Future>(label: &str, future: F) -> F::Output {
-        tokio::time::timeout(std::time::Duration::from_secs(60), future)
-            .await
-            .unwrap_or_else(|_| panic!("{label} exceeded its bounded lifecycle deadline"))
-    }
-
-    /// A running rewrite holds its operation lease and returns it on success.
-    #[tokio::test]
-    async fn forge_harness_observes_worker_operation_lease() {
-        let standalone = lifecycle_fixture("lease_observed").await;
-        let fixture = standalone.fixture();
-        let catalog = CommitUncertaintyCatalog::new(Arc::clone(&fixture.catalog));
-        let (forge, _publisher) = fixture.context_with_worker_supervision(
-            lifecycle_config(fixture),
-            Arc::clone(&catalog) as Arc<dyn iceberg::Catalog>,
-            Arc::clone(&fixture.object_store),
-            vala_bifrost_redux::forge::ForgeWorkerCompletionObserver::new(),
-            vala_bifrost_redux::forge::ForgeSchedulerTrigger::with_owner_for_test(
-                uuid::Uuid::now_v7(),
-            ),
-        );
-        assert!(
-            forge.run_once().await.expect("planning pass").groups_seen > 0,
-            "the lifecycle fixture must plan durable rewrite work"
-        );
-        let resources = forge.resources_for_test();
-        let baseline = resources
-            .snapshot()
-            .expect("baseline")
-            .elastic_memory_used_bytes;
-        let worker = ForgeWorker::new(
-            Arc::clone(&forge),
-            ForgeWorkerConfig::default(),
-            uuid::Uuid::now_v7(),
-        )
-        .expect("production worker");
-        catalog.pause_before_commit();
-        let stop = CancellationToken::new();
-        let attempt = tokio::spawn({
-            let stop = stop.clone();
-            async move { worker.execute_one_for_test(&stop).await }
-        });
-        bounded("paused commit", catalog.wait_for_before_commit()).await;
-        let held = resources
-            .snapshot()
-            .expect("held")
-            .elastic_memory_used_bytes;
-        assert!(
-            held > baseline,
-            "a running rewrite must hold its exact operation lease"
-        );
-        catalog.reject_paused_before_commit();
-        let _ = bounded("attempt completion", attempt)
-            .await
-            .expect("attempt joins");
-        let released = resources.snapshot().expect("released");
-        assert_eq!(released.elastic_memory_used_bytes, baseline);
-        assert_eq!(released.scratch_used_bytes, 0);
-    }
-
-    /// Capacity refusal performs no data IO and retains the retryable claim.
-    #[tokio::test]
-    async fn forge_harness_refusal_releases_claim_without_data_io() {
-        let standalone = lifecycle_fixture("refusal_no_io").await;
-        let fixture = standalone.fixture();
-        let object_store = ForgeObjectStoreControl::new(Arc::clone(&fixture.staging));
-        let (forge, _publisher) = fixture.context_with_worker_supervision(
-            lifecycle_config(fixture),
-            Arc::clone(&fixture.catalog),
-            Arc::clone(&object_store) as Arc<dyn vala_bifrost_redux::forge::ForgeObjectStore>,
-            vala_bifrost_redux::forge::ForgeWorkerCompletionObserver::new(),
-            vala_bifrost_redux::forge::ForgeSchedulerTrigger::with_owner_for_test(
-                uuid::Uuid::now_v7(),
-            ),
-        );
-        assert!(
-            forge.run_once().await.expect("planning pass").groups_seen > 0,
-            "the lifecycle fixture must plan durable rewrite work"
-        );
-        let resources = forge.resources_for_test();
-        let plan = resources.snapshot().expect("plan snapshot").plan;
-        let blocker_envelope = vala_bifrost_redux::forge::ForgeEnvelopeSizer::size(
-            1,
-            1,
-            1,
-            vala_bifrost_redux::forge::ForgeCapacity {
-                max_files: 1,
-                max_bytes: u64::MAX,
-                max_parallelism: 1,
-                max_memory_bytes: u64::try_from(plan.elastic_memory_bytes)
-                    .expect("blocker memory capacity"),
-                max_spill_bytes: plan.scratch_limit_bytes,
-                max_large_task_bytes: u64::MAX,
-            },
-        )
-        .expect("blocker envelope");
-        let blocker = resources
-            .try_acquire_rewrite(ForgeRewriteRequest {
-                envelope: blocker_envelope,
-                memory_bytes: plan.elastic_memory_bytes,
-                scratch_bytes: plan.scratch_limit_bytes,
-                reader_permits: 1,
-            })
-            .expect("the test owner occupies all Forge capacity");
-        let blocked = resources.snapshot().expect("blocked snapshot");
-        let object_io_before = object_store.object_io_calls();
-        let worker = ForgeWorker::new(
-            Arc::clone(&forge),
-            ForgeWorkerConfig::default(),
-            uuid::Uuid::now_v7(),
-        )
-        .expect("production worker");
-
-        let error = worker
-            .execute_one_for_test(&CancellationToken::new())
-            .await
-            .expect_err("a refused attempt must surface its typed capacity error");
-        assert!(
-            matches!(
-                error,
-                vala_bifrost_redux::forge::ForgeError::Capacity { .. }
-            ),
-            "capacity refusal must keep its original typed error: {error}"
-        );
-        assert_eq!(
-            object_store.output_put_calls(),
-            0,
-            "a refused attempt must not write any rewrite output"
-        );
-        assert_eq!(
-            object_store.object_io_calls(),
-            object_io_before,
-            "capacity refusal must occur before object IO"
-        );
-        let state: (String, bool, bool, bool, Option<String>, i32) = sqlx::query_as(
-            "SELECT state,attempt_id IS NULL,claimed_by IS NULL,claim_expires_at IS NULL,\
-             failure_class,attempt_count FROM vala.forge_tasks WHERE data_tenant_id = $1 \
-             ORDER BY created_at DESC LIMIT 1",
-        )
-        .bind(fixture.tenant.as_uuid())
-        .fetch_one(fixture.operator_pool.pool())
-        .await
-        .expect("durable task state");
-        assert_eq!(state.0, "retryable");
-        assert!(state.1, "capacity refusal clears the attempt identity");
-        assert!(state.2, "capacity refusal clears the claim owner");
-        assert!(state.3, "capacity refusal clears the claim fence");
-        assert_eq!(state.4.as_deref(), Some("capacity_refused"));
-        assert_eq!(state.5, 0, "capacity refusal consumes no attempt budget");
-        let refused = resources.snapshot().expect("post-refusal snapshot");
-        assert_eq!(
-            refused.elastic_memory_used_bytes,
-            blocked.elastic_memory_used_bytes
-        );
-        assert_eq!(refused.scratch_used_bytes, blocked.scratch_used_bytes);
-        drop(blocker);
-        let released = resources.snapshot().expect("released snapshot");
-        assert_eq!(released.elastic_memory_used_bytes, 0);
-        assert_eq!(released.scratch_used_bytes, 0);
-    }
-
-    /// A failed rewrite returns its original error and restores both baselines.
-    #[tokio::test]
-    async fn forge_worker_error_restores_resource_baselines() {
-        let standalone = lifecycle_fixture("error_baselines").await;
-        let fixture = standalone.fixture();
-        let catalog = CommitUncertaintyCatalog::new(Arc::clone(&fixture.catalog));
-        let (forge, _publisher) = fixture.context_with_worker_supervision(
-            lifecycle_config(fixture),
-            Arc::clone(&catalog) as Arc<dyn iceberg::Catalog>,
-            Arc::clone(&fixture.object_store),
-            vala_bifrost_redux::forge::ForgeWorkerCompletionObserver::new(),
-            vala_bifrost_redux::forge::ForgeSchedulerTrigger::with_owner_for_test(
-                uuid::Uuid::now_v7(),
-            ),
-        );
-        assert!(
-            forge.run_once().await.expect("planning pass").groups_seen > 0,
-            "the lifecycle fixture must plan durable rewrite work"
-        );
-        let resources = forge.resources_for_test();
-        let baseline = resources.snapshot().expect("baseline");
-        catalog.fail_after_next_commit();
-        let worker = ForgeWorker::new(
-            Arc::clone(&forge),
-            ForgeWorkerConfig::default(),
-            uuid::Uuid::now_v7(),
-        )
-        .expect("production worker");
-        let outcome = worker.execute_one_for_test(&CancellationToken::new()).await;
-        assert!(
-            outcome.map_or(true, |executed| executed),
-            "the faulted attempt must have claimed and executed durable work"
-        );
-        let after = resources.snapshot().expect("post-error snapshot");
-        assert_eq!(
-            after.elastic_memory_used_bytes,
-            baseline.elastic_memory_used_bytes
-        );
-        assert_eq!(after.scratch_used_bytes, baseline.scratch_used_bytes);
-    }
-
-    /// Cancellation drops the attempt runtime before the lease returns.
-    #[tokio::test]
-    async fn forge_worker_cancellation_drops_runtime_before_lease_release() {
-        let standalone = lifecycle_fixture("cancel_before_release").await;
-        let fixture = standalone.fixture();
-        let catalog = CommitUncertaintyCatalog::new(Arc::clone(&fixture.catalog));
-        let (forge, _publisher) = fixture.context_with_worker_supervision(
-            lifecycle_config(fixture),
-            Arc::clone(&catalog) as Arc<dyn iceberg::Catalog>,
-            Arc::clone(&fixture.object_store),
-            vala_bifrost_redux::forge::ForgeWorkerCompletionObserver::new(),
-            vala_bifrost_redux::forge::ForgeSchedulerTrigger::with_owner_for_test(
-                uuid::Uuid::now_v7(),
-            ),
-        );
-        assert!(
-            forge.run_once().await.expect("planning pass").groups_seen > 0,
-            "the lifecycle fixture must plan durable rewrite work"
-        );
-        let resources = forge.resources_for_test();
-        let baseline = resources.snapshot().expect("baseline");
-        let worker = ForgeWorker::new(
-            Arc::clone(&forge),
-            ForgeWorkerConfig::default(),
-            uuid::Uuid::now_v7(),
-        )
-        .expect("production worker");
-        catalog.pause_before_commit();
-        let stop = CancellationToken::new();
-        let attempt = tokio::spawn({
-            let stop = stop.clone();
-            async move { worker.execute_one_for_test(&stop).await }
-        });
-        bounded("paused commit", catalog.wait_for_before_commit()).await;
-        stop.cancel();
-        catalog.reject_paused_before_commit();
-        let _ = bounded("cancelled attempt", attempt)
-            .await
-            .expect("attempt joins");
-        let after = resources.snapshot().expect("post-cancellation snapshot");
-        assert_eq!(
-            after.elastic_memory_used_bytes,
-            baseline.elastic_memory_used_bytes
-        );
-        assert_eq!(after.scratch_used_bytes, baseline.scratch_used_bytes);
-    }
-
-    /// An abruptly dropped attempt still returns its exact lease to the root.
-    #[tokio::test]
-    async fn forge_worker_drop_restores_resource_baselines() {
-        let standalone = lifecycle_fixture("drop_baselines").await;
-        let fixture = standalone.fixture();
-        let catalog = CommitUncertaintyCatalog::new(Arc::clone(&fixture.catalog));
-        let (forge, _publisher) = fixture.context_with_worker_supervision(
-            lifecycle_config(fixture),
-            Arc::clone(&catalog) as Arc<dyn iceberg::Catalog>,
-            Arc::clone(&fixture.object_store),
-            vala_bifrost_redux::forge::ForgeWorkerCompletionObserver::new(),
-            vala_bifrost_redux::forge::ForgeSchedulerTrigger::with_owner_for_test(
-                uuid::Uuid::now_v7(),
-            ),
-        );
-        assert!(
-            forge.run_once().await.expect("planning pass").groups_seen > 0,
-            "the lifecycle fixture must plan durable rewrite work"
-        );
-        let resources = forge.resources_for_test();
-        let baseline = resources.snapshot().expect("baseline");
-        let worker = ForgeWorker::new(
-            Arc::clone(&forge),
-            ForgeWorkerConfig::default(),
-            uuid::Uuid::now_v7(),
-        )
-        .expect("production worker");
-        catalog.pause_before_commit();
-        let stop = CancellationToken::new();
-        let attempt = tokio::spawn({
-            let stop = stop.clone();
-            async move { worker.execute_one_for_test(&stop).await }
-        });
-        bounded("paused commit", catalog.wait_for_before_commit()).await;
-        attempt.abort();
-        let _ = attempt.await;
-        catalog.reject_paused_before_commit();
-        for _ in 0..200 {
-            if resources
-                .snapshot()
-                .expect("snapshot")
-                .elastic_memory_used_bytes
-                == baseline.elastic_memory_used_bytes
-            {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
-        let after = resources.snapshot().expect("post-drop snapshot");
-        assert_eq!(
-            after.elastic_memory_used_bytes,
-            baseline.elastic_memory_used_bytes
-        );
-        assert_eq!(after.scratch_used_bytes, baseline.scratch_used_bytes);
     }
 }

@@ -41,9 +41,10 @@ pub mod observation;
 pub mod trace;
 
 pub use audit_detail::{
-    AuditDelegationStep, AuditDetail, AuditDetailValueError, BatchId, ForgeCompactionPhase,
-    ForgeIcebergRewritePhase, ForgeOrphanGcPhase, ForgeSnapshotExpirePhase, ScopeHash, StoragePath,
-    audit_detail_canonical_json,
+    AuditDelegationStep, AuditDetail, AuditDetailValueError, BatchId, ForgeIcebergRewritePhase,
+    ForgeManifestRewritePhase, ForgeOrphanGcPhase, ForgePromotedFile, ForgePromotedFileSetDigest,
+    ForgeScribePromotionPhase, ForgeSnapshotExpirePhase, OracleReaderEpochPhase,
+    OracleTableProtectionPhase, ScopeHash, StoragePath, audit_detail_canonical_json,
 };
 pub use correlation::{CorrelationColumns, CorrelationContext};
 pub use error::{BifrostError, PhysicalLayoutField, PhysicalLayoutViolation};

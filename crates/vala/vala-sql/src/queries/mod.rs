@@ -20,6 +20,7 @@ pub mod maintenance_leases;
 pub mod monitor;
 pub mod olap_catalog;
 pub mod oracle_admission;
+pub mod oracle_reader_authority;
 pub mod profiles;
 pub mod queues;
 pub mod scribe_batch_commits;

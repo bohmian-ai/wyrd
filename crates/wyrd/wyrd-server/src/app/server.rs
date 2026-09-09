@@ -636,13 +636,8 @@ impl BoundServer {
         // The dedicated `ForgeWorker` process is composed by
         // `run_forge_worker_process` and never reaches this serving owner.
         if self.config.role == BifrostTarget::All {
-            let worker = crate::boot::spawn_forge_worker(
-                &self.state,
-                shutdown.clone(),
-                self.config.forge.worker_concurrency,
-                self.config.forge.resolved_per_tenant_active_cap(),
-            )
-            .map_err(|e| BootExit::Other(Box::new(e)))?;
+            let worker = crate::boot::spawn_forge_worker(&self.state, shutdown.clone())
+                .map_err(|e| BootExit::Other(Box::new(e)))?;
             set.spawn(fallible_task(TaskId::Worker("forge_worker"), worker));
         }
 

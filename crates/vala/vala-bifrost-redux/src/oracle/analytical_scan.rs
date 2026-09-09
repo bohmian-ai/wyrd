@@ -51,6 +51,10 @@ enum AnalyticalScanSource {
         role: ClusterRole,
         /// Process resolver that turns an assignment into a role-local provider.
         resolver: Arc<dyn FollowerSourceResolver>,
+        /// This node's reader epoch, which the assignment's cut is protected under.
+        reader_authority: Option<Arc<super::reader_pins::OracleReaderAuthority>>,
+        /// Graph that owns the guard this leaf's protection produces.
+        guard_sink: Option<Arc<GraphReaderGuardSink>>,
     },
 }
 
@@ -77,7 +81,55 @@ pub struct AnalyticalScanExec {
     /// Advertised physical properties derived from the leader's closure.
     properties: Arc<PlanProperties>,
     /// Provider resolved on first execution and shared by every partition.
-    resolved: Arc<tokio::sync::OnceCell<Arc<dyn ExecutionPlan>>>,
+    resolved: Arc<tokio::sync::OnceCell<ResolvedAnalyticalSource>>,
+}
+
+/// One leaf's resolved provider, memoized for every partition of the leaf.
+///
+/// The reader guard the provider was opened under is deliberately not here: it
+/// belongs to the graph, because the decoded plan is dropped from upstream's
+/// task cache asynchronously and could otherwise hold the epoch's claim past
+/// this node's own teardown. What the provider keeps is the clonable permit,
+/// which the graph's guard cancels the moment it is released.
+struct ResolvedAnalyticalSource {
+    /// Provider every partition of this leaf executes.
+    plan: Arc<dyn ExecutionPlan>,
+}
+
+/// The one graph a decoded leaf hands its reader-epoch guard to.
+///
+/// Built per follower session, because the graph identity is only known once a
+/// stage operation's headers have been verified. It exists so the guard's owner
+/// is a thing this node tears down deterministically, rather than a plan whose
+/// drop upstream schedules.
+pub(super) struct GraphReaderGuardSink {
+    /// Graph the retained guards are keyed under.
+    graph: super::analytical::AnalyticalGraphKey,
+    /// Node-local registry that releases them when the graph is invalidated.
+    registry: Arc<super::analytical::AnalyticalRuntimeRegistry>,
+}
+
+impl GraphReaderGuardSink {
+    /// Binds a sink to one authenticated graph on this node.
+    pub(super) const fn new(
+        graph: super::analytical::AnalyticalGraphKey,
+        registry: Arc<super::analytical::AnalyticalRuntimeRegistry>,
+    ) -> Self {
+        Self { graph, registry }
+    }
+
+    /// Hands one leaf's guard to the graph that owns its lifetime.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::QueryExecutionFailed`] when the graph is
+    /// no longer registered, and `Internal` on lock poisoning.
+    fn retain(
+        &self,
+        guard: super::reader_pins::ReaderQueryGuard,
+    ) -> Result<(), wyrd_spec::vala::BifrostError> {
+        self.registry.retain_reader_guard(self.graph, guard)
+    }
 }
 
 impl AnalyticalScanExec {
@@ -86,10 +138,12 @@ impl AnalyticalScanExec {
     /// `schema` and `partitions` come from the leader's placeholder, not from
     /// the eventual provider, so plan shape is fixed before any IO happens.
     #[must_use]
-    pub fn new(
+    pub(super) fn new(
         assignment: FollowerScanAssignment,
         role: ClusterRole,
         resolver: Arc<dyn FollowerSourceResolver>,
+        reader_authority: Option<Arc<super::reader_pins::OracleReaderAuthority>>,
+        guard_sink: Option<Arc<GraphReaderGuardSink>>,
         schema: SchemaRef,
         partitions: usize,
     ) -> Self {
@@ -98,6 +152,8 @@ impl AnalyticalScanExec {
                 assignment: Arc::new(assignment),
                 role,
                 resolver,
+                reader_authority,
+                guard_sink,
             },
             schema,
             partitions,
@@ -165,7 +221,7 @@ impl AnalyticalScanExec {
     /// schema check fails, or when the provider cannot be repartitioned, and a
     /// [`DataFusionError::Execution`] when a local-drained leaf has no bound
     /// source in the executing task.
-    async fn resolve(&self, task: &Arc<TaskContext>) -> Result<Arc<dyn ExecutionPlan>> {
+    async fn resolve(&self, task: &Arc<TaskContext>) -> Result<ResolvedAnalyticalSource> {
         let resolved = match &self.source {
             AnalyticalScanSource::LocalDrained { key } => {
                 let lock = super::bindings::bindings_for_task(task.as_ref())?;
@@ -174,15 +230,19 @@ impl AnalyticalScanExec {
                 })?;
                 bindings.grant().ensure_live()?;
                 let batches = bindings.local_batches(key)?;
-                return super::exec::OracleTableProvider::projected_memory_source(
-                    batches,
-                    &self.schema(),
-                );
+                return Ok(ResolvedAnalyticalSource {
+                    plan: super::exec::OracleTableProvider::projected_memory_source(
+                        batches,
+                        &self.schema(),
+                    )?,
+                });
             }
             AnalyticalScanSource::Assigned {
                 assignment,
                 role,
                 resolver,
+                reader_authority,
+                guard_sink,
             } => {
                 let session = SessionStateBuilder::new()
                     .with_config(task.session_config().clone())
@@ -193,8 +253,14 @@ impl AnalyticalScanExec {
                     )
                     .with_window_functions(task.window_functions().values().cloned().collect())
                     .build();
+                let permit = graph_owned_permit(
+                    reader_authority.as_ref(),
+                    guard_sink.as_ref(),
+                    assignment.as_ref(),
+                )
+                .await?;
                 let resolved = resolver
-                    .resolve(*role, assignment.as_ref(), &session)
+                    .resolve(*role, assignment.as_ref(), &session, permit.as_ref())
                     .await
                     .map_err(|error| {
                         DataFusionError::Plan(format!(
@@ -227,15 +293,60 @@ impl AnalyticalScanExec {
             ));
         }
         let advertised = self.properties.partitioning.partition_count();
-        if resolved.output_partitioning().partition_count() == advertised {
-            return Ok(resolved);
-        }
-        datafusion::physical_plan::repartition::RepartitionExec::try_new(
-            resolved,
-            Partitioning::RoundRobinBatch(advertised),
-        )
-        .map(|plan| Arc::new(plan) as Arc<dyn ExecutionPlan>)
+        let plan = if resolved.output_partitioning().partition_count() == advertised {
+            resolved
+        } else {
+            Arc::new(
+                datafusion::physical_plan::repartition::RepartitionExec::try_new(
+                    resolved,
+                    Partitioning::RoundRobinBatch(advertised),
+                )?,
+            ) as Arc<dyn ExecutionPlan>
+        };
+        Ok(ResolvedAnalyticalSource { plan })
     }
+}
+
+/// Protects one assignment's snapshot and leaves the guard with its graph.
+///
+/// Protection strictly precedes resolution: this node's own epoch must cover
+/// the snapshot the leader signed before any catalog, manifest, or object read
+/// happens. The guard it yields is then handed to the graph rather than kept by
+/// the caller, because the plan the resolved provider lands in is dropped from
+/// upstream's task cache asynchronously and could otherwise still hold this
+/// epoch's claim when it retires. What the caller keeps is the clonable permit,
+/// which the graph's guard cancels the moment it is released.
+///
+/// # Errors
+///
+/// Returns [`DataFusionError::Plan`] when protection is refused, when a
+/// protected leaf has no graph owner to hand its guard to, or when the graph is
+/// no longer registered to accept one.
+async fn graph_owned_permit(
+    reader_authority: Option<&Arc<super::reader_pins::OracleReaderAuthority>>,
+    guard_sink: Option<&Arc<GraphReaderGuardSink>>,
+    assignment: &FollowerScanAssignment,
+) -> Result<Option<super::reader_pins::ReaderIoPermit>> {
+    let protection = super::follower::protect_reader_cuts(reader_authority, [assignment])
+        .await
+        .map_err(|error| {
+            DataFusionError::Plan(format!("analytical source protection failed: {error}"))
+        })?;
+    let Some(protection) = protection else {
+        return Ok(None);
+    };
+    let (guard, permit) = protection.into_parts();
+    let Some(sink) = guard_sink else {
+        return Err(DataFusionError::Plan(
+            "analytical leaf has no graph owner for its reader guard".to_owned(),
+        ));
+    };
+    sink.retain(guard).map_err(|error| {
+        DataFusionError::Plan(format!(
+            "analytical leaf could not retain its reader guard: {error}"
+        ))
+    })?;
+    Ok(Some(permit))
 }
 
 impl std::fmt::Debug for AnalyticalScanExec {
@@ -330,7 +441,7 @@ impl ExecutionPlan for AnalyticalScanExec {
     /// Returns `None` before the first execution resolves a provider, which is
     /// the honest answer: no scan has happened yet.
     fn metrics(&self) -> Option<MetricsSet> {
-        let resolved = self.resolved.get()?;
+        let resolved = &self.resolved.get()?.plan;
         let mut merged = MetricsSet::new();
         let mut collect = |plan: &Arc<dyn ExecutionPlan>| {
             if let Some(metrics) = plan.metrics() {
@@ -379,6 +490,7 @@ impl ExecutionPlan for AnalyticalScanExec {
                 .resolved
                 .get_or_try_init(|| this.resolve(&context))
                 .await?
+                .plan
                 .clone();
             plan.execute(partition, context)
         })

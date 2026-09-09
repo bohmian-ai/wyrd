@@ -2523,6 +2523,7 @@ mod tests {
                 .into_iter()
                 .collect(),
             memory_limit_bytes: None,
+            forge_compaction_memory_limit_bytes: None,
             unmanaged_reserve_bytes: None,
             scratch_limit_bytes: None,
             effective_cpu: None,
@@ -2671,6 +2672,7 @@ mod tests {
                     wyrd_spec::vala::api::ClusterRole::Oracle,
                     Arc::new(crate::oracle::follower::UnresolvableSource),
                     Arc::new(crate::oracle::AcceptingOracleAudit),
+                    None,
                 ),
                 egress: Arc::new(crate::oracle::analytical::AnalyticalStageEgress::new(
                     Arc::new(FixtureAuthority {

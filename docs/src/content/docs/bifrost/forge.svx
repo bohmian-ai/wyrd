@@ -19,10 +19,6 @@ owns query assembly, and Forge owns maintenance after Scribe has sealed a file.
 Forge is the only Bifrost component that commits the maintenance Iceberg
 transactions described here.
 
-> Operator note: the former `bifrost_staging_hint_dropped_total` counter is
-> replaced by `bifrost_forge_hints_total{result}`. Dashboards and alerts must
-> select the closed `result` label instead of querying the retired family.
-
 ## Where Forge fits in Bifrost
 
 <WyrdBifrostSystem />
@@ -126,6 +122,32 @@ These checks are part of the storage boundary. A path that escapes the table
 prefix, a foreign tenant row, a missing field, or a partition mismatch stops
 the operation before the catalog commit.
 
+### Publishing one attempt's plans
+
+One compaction attempt plans every eligible group of its table and publishes
+each plan on its own Iceberg commit and its own operation, against the head the
+plan published before it left. Plans of the same attempt run and commit concurrently: a
+plan that fails costs only itself, and a plan that commits is durable
+immediately.
+
+Each plan's publication runs under one absolute deadline captured when the
+attempt starts. Within that budget a plan submits its commit once, and a
+*definite* conflict — the catalog answered, so nothing landed — buys a
+revalidated retry: the fixed schedule allows three, delayed 1s, 2s, and 4s.
+Each retry reloads the table and re-derives the replacement before resubmitting,
+and it is taken only while the deadline still covers the delay plus a call. The
+schedule is not configurable, and no retry extends the deadline. A plan that
+exhausts its retries is definitely uncommitted and closes its operation. A
+submission whose acceptance is never learned closes nothing: its operation
+stays prepared until proof about that exact operation settles it.
+
+The attempt itself settles on any success. One committed plan makes the task
+successful however its siblings ended, and the groups that did not finish stay
+ordinary compaction debt that a later pass replans against the current head.
+
+Scribe promotion is a different operation with its own protocol and is not
+subject to this rewrite retry schedule.
+
 ### Durable compaction states
 
 Postgres and Iceberg cannot participate in one transaction. Forge makes that
@@ -200,14 +222,164 @@ This is the failure rule to keep in mind when changing Forge: losing the lease
 must stop the operation. A stale worker must never complete a durable state
 transition after a replacement worker has taken over.
 
+## Telemetry
+
+`forge/metrics.rs` is the only Forge metric owner, and it publishes exactly the
+seventeen Prometheus families below. They answer the operational questions
+Forge is accountable for: how much work is demanded, how much is queued and how
+old it is, how much this process is doing right now, how attempts ended, how
+long they took, why they failed, how much physical data moved, and how much
+compaction debt remains.
+
+Everything else stays where it is already authoritative. Lease, fence, catalog,
+reconciliation, cursor, scheduler, and resource mechanics are structured traces
+and durable audit and task rows; unresolved authority or recovery is
+`bifrost_role_ready`. None of it is duplicated as a metric, and no Forge series
+carries a tenant, table, task, attempt, snapshot, path, or request label.
+
+### Label vocabularies
+
+`task_type` names the maintenance route, and every family carries it except the
+two planning gauges and the expired-snapshot counter:
+
+| Value | What it does |
+| --- | --- |
+| `scribe_promotion` | Publishes sealed staged files into the table without rewriting them. |
+| `small_files` | Rewrites many small data files into fewer larger ones. |
+| `snapshot_expiry` | Expires Iceberg snapshots that are older than retention. |
+| `expired_cleanup` | Deletes objects that snapshot expiry left unreferenced. |
+| `orphan_cleanup` | Deletes objects that no live table state references. |
+
+`result` names how one ownership episode ended, after the durable row settled:
+
+| Value | What it means |
+| --- | --- |
+| `succeeded` | The attempt committed its effect. |
+| `retry` | The attempt failed and the task is eligible for another attempt. |
+| `failed` | The attempt failed terminally and will not be retried. |
+| `cancelled` | The attempt was superseded or cancelled before any durable effect. |
+| `refused` | The worker's local compaction queue declined every plan of the attempt. |
+| `uncertain` | Work was externally accepted and Prepared evidence is retained for recovery. |
+
+`reason` names the durable failure class of a retry, refusal, or terminal
+failure:
+
+| Value | What it means |
+| --- | --- |
+| `data_refusal` | The source data is deterministically unusable. |
+| `transient_object_store` | Object storage or the catalog transport failed and may succeed later. |
+| `transient_coordination` | SQL, lease, fence, or reconciliation failed and may succeed later. |
+| `storage_health` | Local durable storage the attempt depends on is unhealthy. |
+| `capacity_refused` | The compaction queue refused every plan for waiting-parallelism capacity or per-plan size. |
+| `internal_invariant` | An internal invariant failed; this is a defect, not a condition. |
+
+### The seventeen families
+
+Process-local families are produced by whichever replica did the work and sum
+across replicas. Coordinator-owned gauges describe one durable, cluster-wide
+fact published by the fenced planning coordinator after a complete pass — they
+must be read with `max`, never summed.
+
+| Family | Type | Labels | Updated when | Zero and absence | Owner |
+| --- | --- | --- | --- | --- | --- |
+| `bifrost_forge_planning_demands` | gauge | — | After a complete fenced planning pass | Always exported; zero means no outstanding demand | Coordinator-owned |
+| `bifrost_forge_oldest_planning_demand_timestamp_seconds` | gauge | — | After a complete fenced planning pass | Always exported; zero means no outstanding demand | Coordinator-owned |
+| `bifrost_forge_tasks_created_total` | counter | `task_type` | After the enqueue transaction commits, once per inserted row | Absent until a task of that type is created; conflicted plans count nothing | Coordinator-owned |
+| `bifrost_forge_pending_tasks` | gauge | `task_type` | After a complete fenced planning pass | All five types always exported; zero means an empty queue | Coordinator-owned |
+| `bifrost_forge_oldest_pending_task_timestamp_seconds` | gauge | `task_type` | After a complete fenced planning pass | All five types always exported; zero means nothing is pending | Coordinator-owned |
+| `bifrost_forge_active_tasks` | gauge | `task_type` | Incremented on a successful claim, decremented when the attempt's guard drops | All five types always exported; a non-zero steady state is a leak | Process-local |
+| `bifrost_forge_task_attempts_total` | counter | `task_type`, `result` | Once the settled durable state is read back | Absent until an attempt of that pair settles | Process-local |
+| `bifrost_forge_task_duration_seconds` | histogram | `task_type`, `result` | With the attempt counter; measures claim through durable result | Absent until an attempt of that pair settles; excludes queue time | Process-local |
+| `bifrost_forge_task_failures_total` | counter | `task_type`, `reason` | After the retry, refusal, or terminal-failure transaction commits | Absent until such a failure settles | Process-local |
+| `bifrost_forge_input_files_total` | counter | `task_type` | After a committed or recovered effect | Absent until an effect consumes files | Process-local |
+| `bifrost_forge_input_bytes_total` | counter | `task_type` | After a committed or recovered effect | Absent until an effect consumes bytes | Process-local |
+| `bifrost_forge_output_files_total` | counter | `task_type` | After a committed or recovered effect | Absent until an effect publishes files | Process-local |
+| `bifrost_forge_output_bytes_total` | counter | `task_type` | After a committed or recovered effect | Absent until an effect publishes bytes | Process-local |
+| `bifrost_forge_deleted_objects_total` | counter | `task_type` | At the delete boundary itself, once per accepted delete of a freshly proven-present, eligible object | Pre-delete-missing, refused, and already-absent recovery paths count nothing | Process-local |
+| `bifrost_forge_snapshots_expired_total` | counter | — | After committed or recovered expiration settlement | Counts individual snapshots, not tasks | Process-local |
+| `bifrost_forge_compaction_debt_files` | gauge | — | After a complete compaction inventory | Always exported; zero means no outstanding debt | Coordinator-owned |
+| `bifrost_forge_compaction_debt_bytes` | gauge | — | After a complete compaction inventory | Always exported; zero means no outstanding debt | Coordinator-owned |
+
+The two timestamp gauges publish the stored Unix second, never an age computed
+at publication time. Query the age with `time() - <gauge>` so it keeps growing
+if the coordinator itself stalls.
+
+### Dashboard examples
+
+```promql
+# Task ingress and completion rate, by route.
+sum by (task_type) (rate(bifrost_forge_tasks_created_total[5m]))
+sum by (task_type) (rate(bifrost_forge_task_attempts_total[5m]))
+
+# Failure ratio of settled attempts.
+sum(rate(bifrost_forge_task_attempts_total{result=~"failed|retry"}[15m]))
+  / sum(rate(bifrost_forge_task_attempts_total[15m]))
+
+# p95 attempt duration, by route.
+histogram_quantile(
+  0.95,
+  sum by (le, task_type) (rate(bifrost_forge_task_duration_seconds_bucket[15m]))
+)
+
+# Age of the oldest pending task, and of the oldest planning demand.
+time() - max by (task_type) (bifrost_forge_oldest_pending_task_timestamp_seconds > 0)
+time() - max(bifrost_forge_oldest_planning_demand_timestamp_seconds > 0)
+
+# Physical throughput and deletion rate.
+sum by (task_type) (rate(bifrost_forge_input_bytes_total[5m]))
+sum by (task_type) (rate(bifrost_forge_output_bytes_total[5m]))
+sum by (task_type) (rate(bifrost_forge_deleted_objects_total[5m]))
+
+# Compaction debt, and orphan-cleanup progress.
+max(bifrost_forge_compaction_debt_files)
+max(bifrost_forge_compaction_debt_bytes)
+sum(rate(bifrost_forge_deleted_objects_total{task_type="orphan_cleanup"}[30m]))
+time() - max(bifrost_forge_oldest_pending_task_timestamp_seconds{task_type="orphan_cleanup"} > 0)
+
+# Role readiness and process liveness.
+min by (role) (bifrost_role_ready)
+up{job="wyrd"}
+```
+
+Process counters, histograms, and the active-task gauge sum across replicas.
+The coordinator-owned gauges describe one fenced durable observation, so
+summing them multiplies the same fact by the number of scrapers; use `max`.
+
+### Why there is no orphan-backlog gauge
+
+An orphan backlog is only knowable by scanning object storage against the live
+table set. That scan is expensive, is not current by the time it finishes, and
+a partial scan produces a number that is not safely comparable to the previous
+one or aggregatable across replicas — publishing it invites alerts on an
+artifact of scan progress. Watch orphan cleanup instead through the age of its
+oldest pending task, its attempt and failure rates, its physical delete rate,
+role readiness, the cleanup traces, and the durable GC cursor rows, all of
+which are exact at the moment they are written.
+
+### Where to scrape
+
+`GET /metrics` is the Prometheus scrape endpoint. It is served by Wyrd's
+separate metrics listener, enabled by default and normally bound to loopback on
+the HTTP port plus one. In a split deployment, scrape every server replica and
+every Forge-worker replica: each publishes the process-local families for the
+work it did, and each publishes the coordinator-owned gauges only while it
+holds the planning fence.
+
+That endpoint is unrelated to OTLP ingestion at `POST /v1/metrics`, which
+accepts metrics from your own instrumented applications, and to stored
+observation queries at `POST /v1/metrics/query`.
+
 ## Code map
 
 The implementation follows the lifecycle described above:
 
 | File | Responsibility |
 | --- | --- |
-| `forge/scheduler.rs` | Tick scheduling, table ordering, stage order, cancellation, and lease release. |
-| `forge/binpack.rs` | Tenant/table/day keys and deterministic rewrite-bin construction. |
+| `forge/scheduler.rs` | Supervised scheduler loop, tick cadence, hint intake, and shutdown. |
+| `forge/planning_scheduler.rs` | Discovery, demand arbitration, and durable task enqueue. |
+| `forge/worker.rs` | Claim, fenced dispatch, settlement, and recovery reconciliation. |
+| `forge/planner.rs` | Candidate selection and durable task identity. |
+| `forge/metrics.rs` | The sole Forge metric owner and its closed label schema. |
 | `forge/compact.rs` | Candidate selection, staged-file validation, Iceberg compaction, audit transitions, and reconciliation. |
 | `forge/expire.rs` | Snapshot selection, expiry commit, and expiry recovery. |
 | `forge/orphan_gc.rs` | Live-set construction, candidate selection, final reference checks, deletion, and GC recovery. |

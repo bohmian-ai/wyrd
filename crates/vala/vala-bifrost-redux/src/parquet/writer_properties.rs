@@ -68,6 +68,46 @@ pub fn bifrost_writer_properties_with_metadata(
     metadata: Vec<KeyValue>,
     bloom_columns: &[String],
 ) -> WriterProperties {
+    let mut builder = recipe_builder(row_count, bloom_columns);
+    if !metadata.is_empty() {
+        builder = builder.set_key_value_metadata(Some(metadata));
+    }
+    builder.build()
+}
+
+/// Parquet properties for a Forge rewrite output, with an encoded row-group cap.
+///
+/// Identical to every other Bifrost producer's recipe except for one added
+/// term: the rewrite writer also honours the table's declared encoded
+/// row-group target. A rewrite is the only producer whose inputs are already
+/// compressed, so its row groups would otherwise be bounded only by the row
+/// count and could grow far past what a reader wants to buffer. The row-count
+/// cap is kept as well; whichever bound is reached first flushes the group.
+///
+/// # Panics
+///
+/// Panics only if the compile-time constant Zstandard level `3` becomes invalid.
+#[must_use]
+pub fn bifrost_rewrite_writer_properties(
+    row_group_target_bytes: u64,
+    bloom_columns: &[String],
+) -> WriterProperties {
+    recipe_builder(MAX_ROW_GROUP_ROWS, bloom_columns)
+        .set_max_row_group_bytes(Some(
+            usize::try_from(row_group_target_bytes).unwrap_or(usize::MAX),
+        ))
+        .build()
+}
+
+/// Builds the one shared Bifrost writer recipe every producer starts from.
+///
+/// Extracted so the rewrite writer cannot drift from the ingest writer: a
+/// producer that encoded differently would make an otherwise-identical file
+/// obsolete on the next selection pass for no semantic reason.
+fn recipe_builder(
+    row_count: usize,
+    bloom_columns: &[String],
+) -> parquet::file::properties::WriterPropertiesBuilder {
     let bloom_ndv = bloom_filter_ndv(row_count);
     let mut builder = WriterProperties::builder()
         .set_compression(Compression::ZSTD(
@@ -84,10 +124,6 @@ pub fn bifrost_writer_properties_with_metadata(
         .set_statistics_enabled(EnabledStatistics::Page)
         .set_offset_index_disabled(false);
 
-    if !metadata.is_empty() {
-        builder = builder.set_key_value_metadata(Some(metadata));
-    }
-
     for column in bloom_columns {
         let path = ColumnPath::from(column.as_str());
         builder = builder
@@ -96,7 +132,7 @@ pub fn bifrost_writer_properties_with_metadata(
             .set_column_bloom_filter_max_ndv(path, bloom_ndv);
     }
 
-    builder.build()
+    builder
 }
 
 #[cfg(test)]

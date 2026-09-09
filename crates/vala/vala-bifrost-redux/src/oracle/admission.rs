@@ -41,6 +41,25 @@ impl Default for OracleAdmissionConfig {
     }
 }
 
+impl From<&OracleConfig> for OracleAdmissionConfig {
+    /// Projects the engine-wide Oracle limits onto the pod-local admission subset.
+    ///
+    /// Admission consumes only the class, tenant, and queue limits; every other
+    /// engine value belongs to planning or execution. Deriving the subset here
+    /// keeps one authoritative projection instead of restating the field list at
+    /// each construction site.
+    fn from(config: &OracleConfig) -> Self {
+        Self {
+            interactive_slots: config.interactive_slots,
+            analytical_slots: config.analytical_slots,
+            single_tenant_ceiling: config.single_tenant_ceiling,
+            multi_tenant_ceiling: config.multi_tenant_ceiling,
+            queue_capacity: config.queue_capacity,
+            max_queue_wait: config.max_queue_wait,
+        }
+    }
+}
+
 /// Aggregate lifecycle report returned by bounded Oracle shutdown.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct OracleShutdownReport {
@@ -1321,7 +1340,7 @@ impl AdmittedQueryGuard {
             )
             .map_err(|_| BifrostError::QueryAdmissionRejected)?;
             let projection = logical
-                .try_project(crate::catalog::PhysicalProjectionRole::Oracle, |facts| {
+                .try_project(|facts| {
                     resources
                         .try_split_memory("oracle_physical_table_projection", facts.material_bytes)
                 })
@@ -1612,6 +1631,7 @@ pub(in crate::oracle) mod tests {
             scratch_limit_bytes: None,
             effective_cpu: None,
             oracle_query_slot_limit: None,
+            forge_compaction_memory_limit_bytes: None,
             scratch_root: std::path::PathBuf::new(),
             volume_roots: None,
         };
@@ -1721,7 +1741,7 @@ pub(in crate::oracle) mod tests {
         let expected_bytes =
             crate::catalog::LogicalTableIdentity::try_new(&tenant, &tenant, &table)
                 .expect("logical identity")
-                .projection_facts(crate::catalog::PhysicalProjectionRole::Oracle)
+                .projection_facts()
                 .expect("checked projection facts")
                 .material_bytes;
         let pool = admitted.memory_pool().expect("admitted query memory pool");

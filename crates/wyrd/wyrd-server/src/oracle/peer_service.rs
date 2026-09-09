@@ -266,7 +266,8 @@ impl OraclePeerGrpc {
             .await
             .map_err(|error| match error {
                 PhysicalPlanFollowerError::Preflight(_)
-                | PhysicalPlanFollowerError::PostResolutionDecode(_) => DispatchError::Terminal,
+                | PhysicalPlanFollowerError::PostResolutionDecode(_)
+                | PhysicalPlanFollowerError::AuthorityAlreadyInstalled => DispatchError::Terminal,
                 PhysicalPlanFollowerError::Resolution(_) => DispatchError::EligibleSourceLoss {
                     cause: vala_bifrost_redux::oracle::dispatcher::EligibleSourceLossCause::ProviderResolution,
                 },
@@ -275,11 +276,14 @@ impl OraclePeerGrpc {
         scribe.record_fragment_execution();
         // Split now, finalize after drain: the scan counters are written during
         // execution, and the leader has no physical scan of its own to report.
-        let (mut batches, scan_evidence) = execution.split();
+        let (mut batches, scan_evidence, reader_protection) = execution.split();
         let plan_fingerprint = request.plan_fingerprint;
         let scribe_owner = Arc::clone(scribe);
         let output = async_stream::stream! {
             let _lease = lease;
+            // Retained through the whole attempt so a Scribe fragment that
+            // happens to name a snapshot keeps it protected until it is done.
+            let _reader_protection = reader_protection;
             let mut encoder = AttemptEncoder::default();
             match start_scribe_attempt(&mut encoder, batches.schema()) {
                 Ok(schema) => yield Ok(schema),

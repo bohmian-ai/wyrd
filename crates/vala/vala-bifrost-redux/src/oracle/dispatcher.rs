@@ -41,6 +41,8 @@ use super::peer::{
     ReservationBinding, ReservationOperationV1, ReservationTicketClaims, ReservationTicketMinter,
     reservation_body_digest,
 };
+#[cfg(feature = "test-support")]
+use super::reader_pins::OracleReaderAuthority;
 use super::telemetry::{
     FragmentLocality, FragmentOutcome, FragmentTelemetry, PeerErrorClass, SecurityEventClass,
     SlotOutcome, record_peer_attempt, record_security, record_slot,
@@ -55,13 +57,10 @@ use crate::cluster::{ClusterRegistry, ClusterSnapshot, ROLE_LIVENESS_CUTOFF};
 /// claim encoding. Both sides read this one constant, so the check cannot
 /// desynchronize within a build.
 ///
-/// Protocol v3 binds the exact-partition assignment-authority digest
-/// ([`crate::oracle::peer::assignment_authority_digest_for`]) into those
-/// claims. It differs from v2 only in the Scribe-cut encoding, whose two day
-/// strings became two typed `(granularity, start)` partitions, and it is a
-/// homogeneous cutover: v2 tickets are rejected outright by
-/// [`validated_claim_identifiers`] rather than accepted through a dual decoder.
-pub const PEER_PROTOCOL_VERSION: u32 = 3;
+/// Protocol v4 signs a separate execution deadline so accepted followers can
+/// outlive ticket acceptance expiry. This homogeneous cutover rejects older
+/// claims through [`validated_claim_identifiers`] without a deadline fallback.
+pub const PEER_PROTOCOL_VERSION: u32 = 4;
 /// Pending reservation time to live.
 ///
 /// Shared with the Analytical leader's retained-release bound so a leader that
@@ -1084,6 +1083,53 @@ impl OraclePeerWorker {
         }
     }
 
+    /// Installs the one process reader authority on this worker's follower.
+    ///
+    /// The worker is constructed before the Oracle engine that owns the
+    /// authority, so boot fills it here after `OracleEngine::new` and before
+    /// startup, cluster activation, snapshot publication, or readiness. A
+    /// snapshot-bearing assignment fails closed until this succeeds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PhysicalPlanFollowerError::AuthorityAlreadyInstalled`] when an
+    /// authority was already installed, so a repeated or late installation
+    /// fails boot instead of permitting source IO under an unexpected epoch.
+    pub fn install_reader_authority(
+        &self,
+        authority: Arc<crate::oracle::reader_pins::OracleReaderAuthority>,
+    ) -> Result<(), PhysicalPlanFollowerError> {
+        self.physical_follower.install_reader_authority(authority)
+    }
+
+    /// Returns the exact installed epoch plus preflight and resolver-entry counts.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn authority_inspection_for_test(
+        &self,
+    ) -> (Option<Arc<OracleReaderAuthority>>, usize, usize) {
+        self.physical_follower.authority_inspection_for_test()
+    }
+
+    /// Reconstructs boot's uninstalled worker while retaining its real dependencies.
+    ///
+    /// The new follower has an empty authority cell and fresh effect counters;
+    /// reservations, security, resources, and the catalog resolver remain shared.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn without_reader_authority_for_test(&self) -> Self {
+        Self {
+            worker_node_id: self.worker_node_id,
+            oracle_fence: self.oracle_fence,
+            verifier: Arc::clone(&self.verifier),
+            security_audit: Arc::clone(&self.security_audit),
+            reservations: Arc::clone(&self.reservations),
+            oracle_resources: self.oracle_resources.clone(),
+            physical_follower: Arc::new(self.physical_follower.without_reader_authority_for_test()),
+            physical_observer: Arc::new(PhysicalWorkerObserver::default()),
+        }
+    }
+
     /// Captures exact production follower and footer activity for journeys.
     #[cfg(feature = "test-support")]
     #[must_use]
@@ -1313,6 +1359,13 @@ impl OraclePeerWorker {
         })
     }
 
+    /// Accepts signed authority and transfers reservation ownership into the timed stream.
+    ///
+    /// Dropping the future or returned stream releases its capacity and reader protection.
+    ///
+    /// # Errors
+    ///
+    /// Refuses invalid or elapsed authority, unavailable capacity, and follower failures.
     async fn execute_with_capacity(
         &self,
         request: ExecuteFragmentRequest,
@@ -1320,15 +1373,19 @@ impl OraclePeerWorker {
         admitted_grant: Option<LeaderAdmittedGrant>,
     ) -> Result<WorkerExecution, DispatchError> {
         let (claims, tenant_id) = self.verify_fragment_authority(&request).await?;
-        let follower_deadline = tokio::time::Instant::now()
-            + std::time::Duration::from_millis(
-                u64::try_from(
-                    claims
-                        .expires_at_ms
-                        .saturating_sub(Utc::now().timestamp_millis()),
-                )
-                .unwrap_or(0),
-            );
+        let monotonic_now = Instant::now();
+        let execution_deadline = claims
+            .execution_deadline()
+            .map_err(|_| DispatchError::Terminal)?;
+        let remaining = (execution_deadline - Utc::now())
+            .to_std()
+            .map_err(|_| DispatchError::Terminal)?;
+        if remaining.is_zero() {
+            return Err(DispatchError::Terminal);
+        }
+        let follower_deadline = monotonic_now
+            .checked_add(remaining)
+            .ok_or(DispatchError::Terminal)?;
         let mut running = self
             .claim_running_reservation(&request, capacity, &claims, tenant_id)
             .await?;
@@ -1375,7 +1432,11 @@ impl OraclePeerWorker {
                             .await?;
                         DispatchError::Terminal
                     }
-                    PhysicalPlanFollowerError::PostResolutionDecode(_) => {
+                    // Boot installs the reader authority before this worker
+                    // can serve, so reaching this arm at execution time means
+                    // the process is misconfigured rather than the peer.
+                    PhysicalPlanFollowerError::PostResolutionDecode(_)
+                    | PhysicalPlanFollowerError::AuthorityAlreadyInstalled => {
                         tracing::error!(?error, "Oracle physical follower rejected the request");
                         DispatchError::Terminal
                     }
@@ -1401,10 +1462,11 @@ impl OraclePeerWorker {
         self.physical_observer
             .oracle_executions
             .fetch_add(1, Ordering::AcqRel);
-        let (stream, scan_evidence) = stream.split();
+        let (stream, scan_evidence, reader_protection) = stream.split();
         let output = encode_attempt_frames(
             stream,
             scan_evidence,
+            reader_protection,
             running,
             follower_deadline,
             request.plan_fingerprint.clone(),
@@ -1647,6 +1709,7 @@ fn peer_ticket_claims(
             .expires_at
             .timestamp_millis()
             .min(fragment.deadline_unix_ms),
+        execution_deadline_unix_ms: fragment.deadline_unix_ms,
         binding: format!("{}.{}", fragment.binding.namespace, fragment.binding.table),
         fragment_digest: fragment.plan_fingerprint.clone(),
         manifest_digest: fragment.plan_fingerprint.clone(),
@@ -1817,6 +1880,7 @@ impl AttemptEncoder {
 fn encode_attempt_frames(
     stream: datafusion::execution::SendableRecordBatchStream,
     scan_evidence: super::follower::FollowerScanEvidence,
+    reader_protection: Option<super::follower::FollowerReaderProtection>,
     running: RunningReservation,
     follower_deadline: tokio::time::Instant,
     plan_fingerprint: String,
@@ -1824,6 +1888,10 @@ fn encode_attempt_frames(
 ) -> WorkerAttemptStream {
     Box::pin(async_stream::stream! {
         let _running = running;
+        // Retained for the whole attempt, footer and error paths included: the
+        // fragment's snapshots stay protected until this stream is finished or
+        // dropped, never merely until its plan was built.
+        let _reader_protection = reader_protection;
         let mut stream = stream;
         let mut encoder = AttemptEncoder::default();
         match encoder.start(stream.schema()) {
@@ -1940,6 +2008,12 @@ mod resource_tests {
                 scratch_limit_bytes: None,
                 effective_cpu: None,
                 oracle_query_slot_limit: None,
+                // The unclamped production default cannot sit beside the
+                // Oracle floor; this topology names one rewrite working set,
+                // exactly as its co-located deployment configures one.
+                forge_compaction_memory_limit_bytes: Some(
+                    crate::resources::FORGE_TEST_BUDGET_BYTES,
+                ),
                 scratch_root: PathBuf::new(),
                 volume_roots: None,
             },
@@ -2015,6 +2089,7 @@ fn validated_claim_identifiers(
         || claims.query_id.len() != 16
         || claims.leader_node_id.len() != 16
         || claims.permission_digest.is_empty()
+        || claims.execution_deadline().is_err()
     {
         return Err(BifrostSecurityViolationKind::PeerFragment);
     }
@@ -3764,6 +3839,7 @@ mod tests {
             _target_role: ClusterRole,
             assignment: &FollowerScanAssignment,
             _session: &datafusion::execution::session_state::SessionState,
+            _reader_io_permit: Option<&crate::oracle::reader_pins::ReaderIoPermit>,
         ) -> Result<super::super::follower::ResolvedFollowerSource, String> {
             let schema = Arc::new(Schema::new(vec![
                 Field::new("value", DataType::Int64, false),
@@ -3955,7 +4031,7 @@ mod tests {
     /// fence stays Oracle either way. The signed
     /// `assignment_authority_digest` is minted over the finished assignment,
     /// so a caller that mutates the request afterwards is exactly the tamper
-    /// case protocol v3 must reject.
+    /// case the current peer protocol must reject.
     ///
     /// # Panics
     ///
@@ -4022,6 +4098,7 @@ mod tests {
                 wyrd_spec::vala::managed_columns::DATA_TENANT_ID.to_owned(),
             ],
             predicates: Vec::new(),
+            reader_cut: wyrd_spec::vala::api::FollowerReaderCut::no_snapshot(uuid::Uuid::nil(), 1),
         }];
         let claims = PeerTicketClaims {
             protocol_version: PEER_PROTOCOL_VERSION,
@@ -4033,6 +4110,7 @@ mod tests {
             tenant_id: tenant.as_uuid().as_bytes().to_vec(),
             nonce: uuid::Uuid::now_v7().as_bytes().to_vec(),
             expires_at_ms: fragment.deadline_unix_ms,
+            execution_deadline_unix_ms: fragment.deadline_unix_ms,
             binding: "vala.bifrost.events".to_owned(),
             fragment_digest: plan_fingerprint.clone(),
             manifest_digest: plan_fingerprint.clone(),
@@ -4123,6 +4201,10 @@ mod tests {
                     wyrd_spec::vala::managed_columns::DATA_TENANT_ID.to_owned(),
                 ],
                 predicates: Vec::new(),
+                reader_cut: wyrd_spec::vala::api::FollowerReaderCut::no_snapshot(
+                    uuid::Uuid::nil(),
+                    1,
+                ),
             }],
             binding,
             target_role: ClusterRole::Oracle,
@@ -4845,10 +4927,11 @@ mod tests {
             target_role: ClusterRole,
             assignment: &FollowerScanAssignment,
             session: &datafusion::execution::session_state::SessionState,
+            reader_io_permit: Option<&crate::oracle::reader_pins::ReaderIoPermit>,
         ) -> Result<super::super::follower::ResolvedFollowerSource, String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             TestFollowerResolver
-                .resolve(target_role, assignment, session)
+                .resolve(target_role, assignment, session, reader_io_permit)
                 .await
         }
     }
@@ -4941,6 +5024,7 @@ mod tests {
                 wyrd_spec::vala::managed_columns::DATA_TENANT_ID.to_owned(),
             ],
             predicates: Vec::new(),
+            reader_cut: wyrd_spec::vala::api::FollowerReaderCut::no_snapshot(uuid::Uuid::nil(), 1),
         };
         let digest_of = |cut: ScribeProviderCut| {
             crate::oracle::peer::assignment_authority_digest_for(&[cut_assignment(cut)])
@@ -5137,6 +5221,76 @@ mod tests {
                 .oracle_memory_used_bytes,
             0
         );
+    }
+
+    /// Signed execution time remains distinct from the pending acceptance window.
+    ///
+    /// # Panics
+    ///
+    /// Panics if minting clips the execution budget or malformed claims are accepted.
+    #[test]
+    fn peer_deadlines_keep_acceptance_and_execution_distinct() {
+        let now = Utc::now();
+        let node = NodeId::new(uuid::Uuid::now_v7());
+        let context = DispatchContext {
+            query_id: QueryId::new(uuid::Uuid::now_v7()),
+            leader_node_id: node,
+            leader_fence: 1,
+            tenant_id: uuid::Uuid::now_v7(),
+            query_class: QueryClass::Interactive,
+            slot_units: 1,
+            permission_digest: "permission".to_owned(),
+            attempt_bytes: 1_024,
+            attempt_memory_bytes: 1_024,
+            query_memory_pool: Arc::new(GreedyMemoryPool::new(1_024)),
+            granted_memory_bytes: 1_024,
+            admitted_target_partitions: 1,
+            cancellation: CancellationToken::new(),
+            deadline: Instant::now() + std::time::Duration::from_secs(30),
+        };
+        let candidate = DispatchCandidate {
+            node_id: node,
+            role: ClusterRole::Oracle,
+            worker_fence: 1,
+            endpoint: None,
+        };
+        let pending = PendingNodeReservation {
+            reservation_id: ReservationId::new(uuid::Uuid::now_v7()),
+            expires_at: now + PENDING_TTL,
+        };
+        let mut fragment = physical_dispatch_fragment("deadline");
+        fragment.deadline_unix_ms = (now + ChronoDuration::seconds(30)).timestamp_millis();
+        let claims =
+            peer_ticket_claims(&candidate, &context, &fragment, &pending).expect("signed claims");
+        assert_eq!(claims.expires_at_ms, pending.expires_at.timestamp_millis());
+        assert_eq!(claims.execution_deadline_unix_ms, fragment.deadline_unix_ms);
+        assert!(validated_claim_identifiers(&claims).is_ok());
+        let mut old = claims.clone();
+        old.protocol_version = 3;
+        assert_eq!(
+            validated_claim_identifiers(&old),
+            Err(BifrostSecurityViolationKind::PeerFragment)
+        );
+        for deadline in [0, -1, i64::MAX, claims.expires_at_ms - 1] {
+            let mut invalid = claims.clone();
+            invalid.execution_deadline_unix_ms = deadline;
+            assert_eq!(
+                validated_claim_identifiers(&invalid),
+                Err(BifrostSecurityViolationKind::PeerFragment)
+            );
+        }
+        let mut invalid_expiry = claims.clone();
+        invalid_expiry.expires_at_ms = i64::MIN;
+        assert_eq!(
+            validated_claim_identifiers(&invalid_expiry),
+            Err(BifrostSecurityViolationKind::PeerFragment)
+        );
+        fragment.deadline_unix_ms = (now + ChronoDuration::milliseconds(500)).timestamp_millis();
+        let short = peer_ticket_claims(&candidate, &context, &fragment, &pending)
+            .expect("short query claims");
+        assert_eq!(short.expires_at_ms, fragment.deadline_unix_ms);
+        assert_eq!(short.execution_deadline_unix_ms, fragment.deadline_unix_ms);
+        assert!(validated_claim_identifiers(&short).is_ok());
     }
 
     /// Remote worker execution retains exactly one root quantum until stream drop.

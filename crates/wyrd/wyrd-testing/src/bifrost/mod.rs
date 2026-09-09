@@ -18,12 +18,12 @@ pub mod write;
 
 pub use cluster::{
     BifrostClusterSpec, BifrostNodeSpec, BifrostTopology, ClusterError, ClusterShutdownInspection,
-    NodeRestartEvidence, RetainedNodeRoots, TestOracleResources, WyrdTestCluster,
-    full_bifrost_topology, shared_process_telemetry_for_test,
+    RetainedNodeRoots, TestOracleResources, WyrdTestCluster, full_bifrost_topology,
+    shared_process_telemetry_for_test,
 };
 pub use forge_harness::{
-    CommitUncertaintyCatalog, ForgeFixture, ForgeObjectStoreControl, StandaloneForgeFixture,
-    seed_forge_group, seed_forge_group_for_tenant, seed_forge_group_for_tenant_with_schema,
+    CommitUncertaintyCatalog, ForgeFixture, ForgeObjectStoreControl, seed_forge_group,
+    seed_forge_group_for_tenant, seed_forge_group_for_tenant_with_schema,
     seed_forge_group_for_tenant_with_schema_and_days,
 };
 pub use query_fixture::{SeededBifrostQuery, seed_query_fixture};
@@ -37,8 +37,6 @@ pub use scribe_workload::{
 };
 pub use telemetry::{
     BifrostQueryTelemetryReport, BifrostTelemetryCapture, BifrostTelemetryCheckpoint,
-    BifrostTelemetryReportError, ForgeCausalDiagnosis, ForgeCausalTelemetryReport,
-    ForgeDiscoveredCandidateTelemetry, ForgeMaintenanceTelemetryReport, ForgeTelemetryFailureClass,
-    ForgeTelemetryResource,
+    BifrostTelemetryReportError,
 };
 pub use write::{BifrostWriter, RawIngest};

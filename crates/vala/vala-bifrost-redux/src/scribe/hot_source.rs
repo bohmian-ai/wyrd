@@ -846,9 +846,18 @@ mod tests {
 
     /// Builds a staged-run authority with a synthetic path.
     fn staged() -> HotAuthority {
+        staged_at(PathBuf::from("/stage/run-1.parquet"))
+    }
+
+    /// Builds a staged-run authority naming one specific run path.
+    ///
+    /// A lease only names run paths, so a test that must prove the run is still
+    /// readable under the lease supplies a real file here instead of the
+    /// synthetic path the ordering fixtures use.
+    fn staged_at(run: PathBuf) -> HotAuthority {
         HotAuthority::StagedRun {
             member: StagedMemberId::new(0, 1),
-            runs: vec![PathBuf::from("/stage/run-1.parquet")],
+            runs: vec![run],
             bytes: 1_024,
             wal: (WalLsn::new(1), WalLsn::new(9)),
         }
@@ -1155,6 +1164,13 @@ mod tests {
     /// lease is what makes "no deletion under a pinned reader" true rather than
     /// merely likely.
     ///
+    /// Two concurrent readers prove the ownership rule the count depends on:
+    /// each lease releases exactly once on drop, so cleanup waits for the last
+    /// reader rather than the first, and a settled generation cannot be
+    /// released a second time by a later drain. The member names a real staged
+    /// run, and both readers open it while cleanup is already blocked, so the
+    /// lease is proven to keep the source readable rather than only counted.
+    ///
     /// # Panics
     ///
     /// Panics when the lease is not counted, when cleanup does not wait for it,
@@ -1164,11 +1180,17 @@ mod tests {
         let registry = std::sync::Arc::new(ScribeHotSourceRegistry::new());
         let key = seal_key();
         let generation = GenerationOrdinal::new(0, 1);
+        // The staged member is a real file on disk, because the readability the
+        // lease protects is the reader's ability to open that run after cleanup
+        // has already decided to delete it.
+        let stage = tempfile::tempdir().expect("a staging directory");
+        let run = stage.path().join("run-1.parquet");
+        std::fs::write(&run, b"staged run bytes").expect("the staged run is written");
         registry
             .register_memtable(&key, generation)
             .expect("generation registers");
         registry
-            .advance(&key, generation, staged())
+            .advance(&key, generation, staged_at(run.clone()))
             .expect("generation stages");
 
         let lease = registry
@@ -1176,6 +1198,15 @@ mod tests {
             .expect("locked");
         assert_eq!(lease.sources().len(), 1);
         assert_eq!(registry.leases(&key, generation).expect("locked"), 1);
+        let second = registry
+            .staged_sources(key.tenant, &key.table, key.partition, key.partition)
+            .expect("locked");
+        assert_eq!(second.sources().len(), 1);
+        assert_eq!(
+            registry.leases(&key, generation).expect("locked"),
+            2,
+            "each pinned reader owns its own staged lease"
+        );
 
         let waiting = registry.drain_leases(&key, generation);
         tokio::pin!(waiting);
@@ -1184,11 +1215,46 @@ mod tests {
             "cleanup must not proceed while a reader holds the member open"
         );
 
+        // Cleanup is now blocked on this lease, which is exactly the moment a
+        // pinned reader opens the run it resolved. The lease is only worth
+        // anything if those bytes are still there.
+        let named = lease.sources()[0].runs[0].clone();
+        assert_eq!(named, run);
+        assert_eq!(
+            std::fs::read(&named).expect("a pinned staged run is still readable"),
+            b"staged run bytes",
+            "the staged source a lease names stays readable while cleanup waits"
+        );
+
         drop(lease);
+        assert_eq!(
+            registry.leases(&key, generation).expect("locked"),
+            1,
+            "one reader's drop releases exactly its own lease"
+        );
+        assert!(
+            futures_util::poll!(waiting.as_mut()).is_pending(),
+            "cleanup waits for the last pinned reader, not the first"
+        );
+        assert!(
+            std::fs::read(&second.sources()[0].runs[0]).is_ok(),
+            "the surviving reader's staged run is still readable after the first drop"
+        );
+
+        drop(second);
         assert_eq!(registry.leases(&key, generation).expect("locked"), 0);
         waiting
             .await
             .expect("cleanup proceeds once the reader is gone");
+        assert_eq!(
+            registry.leases(&key, generation).expect("locked"),
+            0,
+            "a settled staged lease is never released a second time"
+        );
+        registry
+            .drain_leases(&key, generation)
+            .await
+            .expect("a settled generation drains again without waiting");
     }
 
     /// Draining a member no reader holds returns without waiting.

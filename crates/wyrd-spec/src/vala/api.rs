@@ -18,9 +18,10 @@ use crate::reference::CardRef;
 use crate::request_id::RequestId;
 pub use crate::vala::audit_detail::{
     AuditDelegationStep, AuditDetail, AuditDetailValueError, BatchId, BifrostSecurityPhase,
-    BifrostSecurityViolationKind, ForgeCompactionPhase, ForgeIcebergRewritePhase,
-    ForgeOrphanGcPhase, ForgeSnapshotExpirePhase, QueryAuditDigest, QueryExecutionMode, ScopeHash,
-    StoragePath, audit_detail_canonical_json,
+    BifrostSecurityViolationKind, ForgeIcebergRewritePhase, ForgeManifestRewritePhase,
+    ForgeOrphanGcPhase, ForgePromotedFile, ForgePromotedFileSetDigest, ForgeScribePromotionPhase,
+    ForgeSnapshotExpirePhase, OracleReaderEpochPhase, OracleTableProtectionPhase, QueryAuditDigest,
+    QueryExecutionMode, ScopeHash, StoragePath, audit_detail_canonical_json,
 };
 
 /// Bifrost table-identifier newtype.
@@ -2252,10 +2253,76 @@ impl ScribeProviderCut {
     }
 }
 
+/// The exact protected snapshot cut one follower is authorized to read.
+///
+/// A follower never borrows the leader's reader epoch: it must establish its
+/// own durable protection before it opens anything the snapshot names. This is
+/// the signed statement of *which* cut that protection has to cover, so a
+/// follower can prove the snapshot it is about to protect is the one the leader
+/// planned rather than one it inferred from its own catalog.
+///
+/// The ancestry path and its digest travel with the cut because coverage is an
+/// ancestry question, not a numeric one: a follower that only knew the snapshot
+/// identifier could not tell a descendant of the leader's cut from an unrelated
+/// lineage that happens to sort later.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct FollowerReaderCut {
+    /// Durable registered identity of the table this cut belongs to.
+    pub table_uid: uuid::Uuid,
+    /// Exact Iceberg snapshot this follower is authorized to read.
+    pub snapshot_id: i64,
+    /// That snapshot's own recorded commit timestamp in milliseconds.
+    pub snapshot_timestamp_ms: i64,
+    /// Newest snapshot on the chain proving this cut's ancestry.
+    pub retained_head_snapshot_id: i64,
+    /// Ancestry from the retained head down to `snapshot_id`, newest first.
+    pub ancestry_path: Vec<i64>,
+    /// Version of the ancestry digest encoding this cut was signed under.
+    pub ancestry_digest_version: u32,
+    /// Lowercase 64-hex SHA-256 digest binding the path to its table.
+    pub ancestry_digest_hex: String,
+    /// Oracle role fence of the epoch this cut was planned under.
+    pub target_epoch_fence: u64,
+}
+
+impl FollowerReaderCut {
+    /// Builds the cut for a source that reads no Iceberg snapshot.
+    ///
+    /// A live Scribe tail assignment reads memory the writer still owns, so
+    /// there is no snapshot for the follower to protect. The cut is still
+    /// required and still signed: making it explicit means a follower can tell
+    /// "this source needs no protection" apart from "the cut was omitted",
+    /// which is the distinction an optional field would erase.
+    ///
+    /// `snapshot_id` zero is the sentinel; Iceberg never assigns it.
+    #[must_use]
+    pub fn no_snapshot(table_uid: uuid::Uuid, target_epoch_fence: u64) -> Self {
+        Self {
+            table_uid,
+            snapshot_id: 0,
+            snapshot_timestamp_ms: 0,
+            retained_head_snapshot_id: 0,
+            ancestry_path: vec![0],
+            ancestry_digest_version: 1,
+            ancestry_digest_hex: "00".repeat(32),
+            target_epoch_fence,
+        }
+    }
+
+    /// Reports whether this cut names an Iceberg snapshot to protect.
+    #[must_use]
+    pub fn protects_a_snapshot(&self) -> bool {
+        self.snapshot_id != 0
+    }
+}
+
 /// One scan-keyed role-local follower assignment.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct FollowerScanAssignment {
+    /// Exact protected snapshot cut this follower must cover before any read.
+    pub reader_cut: FollowerReaderCut,
     /// Stable identifier encoded in the physical extension node.
     pub scan_id: String,
     /// Authenticated tenant/table binding for this scan.

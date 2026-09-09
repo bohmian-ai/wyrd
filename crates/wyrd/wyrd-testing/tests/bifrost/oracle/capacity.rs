@@ -481,9 +481,12 @@ fn prove_pool_within_grant(
 /// together exceed the memory the plan governs.
 fn prove_roots_within_budget(cluster: &WyrdTestCluster, label: &str) -> Result<(), JourneyError> {
     for snapshot in cluster.oracle_resource_snapshots()? {
+        // Forge holds no live root lease: its compaction budget is reserved
+        // once during plan calculation, so the plan's figure is its whole
+        // standing claim on the managed budget.
         let held = snapshot.scribe_memory_used_bytes
             + snapshot.oracle_memory_used_bytes
-            + snapshot.forge_memory_used_bytes;
+            + snapshot.plan.forge_compaction_memory_limit_bytes;
         if held > snapshot.plan.managed_memory_bytes {
             return Err(format!(
                 "during {label} one Oracle root held {held} bytes against a managed budget of {}",

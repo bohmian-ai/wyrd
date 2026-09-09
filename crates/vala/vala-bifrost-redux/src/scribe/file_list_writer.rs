@@ -395,6 +395,7 @@ fn build_inserts<'a>(
                         object_key: &artifact.object_identity,
                         file_checksum: &artifact.checksum,
                         partition: facts.partition,
+                        schema_fingerprint: artifact.schema_fingerprint.clone(),
                         partition_spec_id: BIFROST_PARTITION_SPEC_ID,
                         sort_order_id: BIFROST_SORT_ORDER_ID,
                     },

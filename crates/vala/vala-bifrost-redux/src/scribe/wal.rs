@@ -5417,7 +5417,6 @@ mod tests {
                 wal: directory.path().to_owned(),
                 scribe_stage: stage,
                 scribe_output_scratch: scribe,
-                forge_scratch: forge,
                 oracle_scratch: oracle,
             },
             64 * 1024 * 1024,
@@ -5521,7 +5520,6 @@ mod tests {
                     wal: directory.path().to_owned(),
                     scribe_stage: stage,
                     scribe_output_scratch: scribe,
-                    forge_scratch: forge,
                     oracle_scratch: oracle,
                 },
                 64 * 1024 * 1024,
@@ -5559,7 +5557,7 @@ mod tests {
                 health.reason(),
                 Some(crate::resources::BifrostResourcePoisonReason::Volume)
             );
-            assert!(governor.capabilities().forge.try_acquire(1).is_err());
+            assert!(governor.capabilities().oracle.try_acquire(1).is_err());
         }
     }
 

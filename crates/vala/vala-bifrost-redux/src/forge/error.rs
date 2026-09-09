@@ -3,58 +3,19 @@
 use thiserror::Error;
 pub use vala_sql::row_types::forge_tasks::ForgeFailureClass;
 
-/// Boundary at which a capacity refusal occurred.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ForgeCapacityFailurePhase {
-    /// Live root capacity was occupied before the attempt began.
-    Admission,
-    /// An admitted attempt exhausted one persisted envelope term.
-    Execution,
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{ForgeCapacityFailurePhase, ForgeError, ForgeFailureClass};
+    use super::{ForgeError, ForgeFailureClass};
 
-    /// Typed execution errors map to the six durable failure classes without text parsing.
+    /// Typed execution errors map to the durable failure classes without text parsing.
     #[test]
-    fn failure_mapping_is_exhaustive_and_capacity_phase_aware() {
-        assert_eq!(
-            ForgeError::DataRefusal {
-                detail: "footer".to_owned()
-            }
-            .failure_class(),
-            ForgeFailureClass::DataRefusal
-        );
-        assert_eq!(
-            ForgeError::ScratchIo {
-                kind: std::io::ErrorKind::PermissionDenied,
-                detail: "scratch".to_owned(),
-            }
-            .failure_class(),
-            ForgeFailureClass::StorageHealth
-        );
-        assert_eq!(
-            ForgeError::Capacity {
-                detail: "envelope".to_owned()
-            }
-            .failure_class(),
-            ForgeFailureClass::CapacityRefused
-        );
+    fn failure_mapping_is_exhaustive() {
         assert_eq!(
             ForgeError::Capacity {
                 detail: "occupied".to_owned()
             }
-            .capacity_failure_phase(),
-            Some(ForgeCapacityFailurePhase::Admission)
-        );
-        assert_eq!(
-            ForgeError::ExecutionEnvelopeExceeded {
-                resource: "memory",
-                detail: "pool".to_owned()
-            }
-            .capacity_failure_phase(),
-            Some(ForgeCapacityFailurePhase::Execution)
+            .failure_class(),
+            ForgeFailureClass::CapacityRefused
         );
         assert_eq!(
             ForgeError::Timeout {
@@ -72,17 +33,9 @@ pub enum ForgeError {
     /// A construction or runtime limit cannot safely execute Forge.
     #[error("invalid Forge configuration: {detail}")]
     InvalidConfig { detail: String },
-    /// Pod-local elastic memory or scratch is temporarily occupied.
+    /// The worker's local compaction admission refused this attempt for now.
     #[error("Forge resources are temporarily unavailable: {detail}")]
     Capacity { detail: String },
-    /// An admitted rewrite exhausted one exact persisted execution term.
-    #[error("Forge execution envelope exceeded for {resource}: {detail}")]
-    ExecutionEnvelopeExceeded {
-        /// Closed resource label identifying the exhausted term family.
-        resource: &'static str,
-        /// Bounded diagnostic detail from the typed refusal boundary.
-        detail: String,
-    },
     /// A lease acquisition, renewal, fence, or release query failed.
     #[error("Forge lease query failed: {0}")]
     Lease(#[source] vala_sql::SqlError),
@@ -95,25 +48,6 @@ pub enum ForgeError {
     /// A staging or rewritten object operation failed.
     #[error("Forge staging object read failed: {0}")]
     ObjectStore(#[source] opendal::Error),
-    /// Deterministic source metadata proves the input cannot fit the decoded allowance.
-    #[error("Forge refused unsafe input data: {detail}")]
-    DataRefusal { detail: String },
-    /// A sealed output row group must be deterministically bisected and retried.
-    #[error("Forge encoded row group {row_group} exceeded 32 MiB for {rows} rows")]
-    EncodedRowGroupOverflow {
-        /// Zero-based row-group position in the attempted physical file.
-        row_group: usize,
-        /// Rows in the offending logical slice.
-        rows: usize,
-    },
-    /// Attempt-local scratch IO failed with its typed operating-system category.
-    #[error("Forge scratch IO failed ({kind:?}): {detail}")]
-    ScratchIo {
-        /// Stable IO category consumed by durable failure classification.
-        kind: std::io::ErrorKind,
-        /// Path-safe diagnostic detail for tracing and operator evidence.
-        detail: String,
-    },
     /// Snapshot-expiry planning or reconciliation failed.
     #[error("Forge snapshot expiry failed: {detail}")]
     SnapshotExpiry { detail: String },
@@ -126,9 +60,6 @@ pub enum ForgeError {
     /// A fenced orphan object could not be deleted.
     #[error("Forge object deletion failed: {0}")]
     ObjectDelete(#[source] opendal::Error),
-    /// Parquet decoding, encoding, or owned spill-path setup failed.
-    #[error("Forge parquet operation failed: {detail}")]
-    Parquet { detail: String },
     /// A staging batch did not match the registered physical schema.
     #[error("Forge schema validation failed: {detail}")]
     Schema { detail: String },
@@ -144,8 +75,8 @@ pub enum ForgeError {
     /// Cancellation stopped work at a bounded stage or batch boundary *before*
     /// any durable side effect, so the claim is safe to release.
     ///
-    /// This is the pre-effect shutdown marker. `run_slot`'s error path drains
-    /// such a claim through `release_cancelled_claim`, whose SQL guard matches
+    /// This is the pre-effect shutdown marker. The event loop's error path
+    /// drains such a claim through `release_cancelled_claim`, whose SQL guard matches
     /// only `claimed`/`running` rows for the owner and attempt; a claim that has
     /// since advanced to `prepared` therefore no-matches and is retained anyway,
     /// so routing every plain `Shutdown` through release is safe.
@@ -156,8 +87,8 @@ pub enum ForgeError {
     /// is conservatively retained for evidence-based or lease-expiry recovery
     /// rather than released.
     ///
-    /// This is the post-effect shutdown marker. It exists so `run_slot` can
-    /// distinguish a committed-but-not-finalized claim, whose row is still
+    /// This is the post-effect shutdown marker. It exists so the event loop
+    /// can distinguish a committed-but-not-finalized claim, whose row is still
     /// `running` and would otherwise be matched and wrongly released by
     /// `release_cancelled_claim`, from the pre-effect [`ForgeError::Shutdown`]
     /// case. It carries the same internal control-flow meaning as `Shutdown`
@@ -170,15 +101,26 @@ pub enum ForgeError {
     /// An internal invariant failed before a durable transition could proceed.
     #[error("Forge invariant failed: {detail}")]
     Invariant { detail: String },
+    /// An admitted managed rewrite failed after it may have produced objects.
+    ///
+    /// Wraps the typed failure rather than replacing it, so classification and
+    /// the capacity phase stay exactly what the underlying boundary declared.
+    /// What the wrapper adds is the attempt-global possible-output set: once any
+    /// object may exist, discarding that set would leave objects nothing can
+    /// name, because the attempt that could have named them has ended. A caller
+    /// must treat an unsettled entry as possibly-existing and tolerate its
+    /// absence when reclaiming it.
+    #[error("{source} (leaving {} possible rewrite output(s) behind)", possible_outputs.len())]
+    RewriteUnsettled {
+        /// The typed failure that ended the attempt.
+        #[source]
+        source: Box<ForgeError>,
+        /// Every object the failed attempt produced or may have produced.
+        possible_outputs: Vec<crate::forge::managed::ForgeUnsettledOutput>,
+    },
     /// A second long-lived scheduler attempted to use the same owner.
     #[error("Forge scheduler is already running")]
     AlreadyRunning,
-    /// `DataFusion` failed while executing the spillable physical rewrite.
-    #[error("Forge DataFusion execution failed: {0}")]
-    DataFusion(#[source] datafusion::error::DataFusionError),
-    /// `DataFusion` exhausted the configured operation spill ceiling.
-    #[error("Forge spill limit of {limit_bytes} bytes was exceeded")]
-    SpillLimitExceeded { limit_bytes: u64 },
 }
 
 impl ForgeError {
@@ -204,22 +146,15 @@ impl ForgeError {
     #[must_use]
     pub fn failure_class(&self) -> ForgeFailureClass {
         match self {
-            Self::DataRefusal { .. } | Self::EncodedRowGroupOverflow { .. } => {
-                ForgeFailureClass::DataRefusal
-            }
-            Self::ScratchIo { .. } => ForgeFailureClass::StorageHealth,
-            Self::Capacity { .. }
-            | Self::ExecutionEnvelopeExceeded { .. }
-            | Self::DataFusion(datafusion::error::DataFusionError::ResourcesExhausted(_))
-            | Self::SpillLimitExceeded { .. } => ForgeFailureClass::CapacityRefused,
+            Self::RewriteUnsettled { source, .. } => source.failure_class(),
+            Self::Capacity { .. } => ForgeFailureClass::CapacityRefused,
             Self::ObjectStore(_)
             | Self::ObjectList(_)
             | Self::ObjectDelete(_)
             | Self::Catalog(_)
             | Self::Timeout { .. }
             | Self::SnapshotExpiry { .. }
-            | Self::LiveSet { .. }
-            | Self::Parquet { .. } => ForgeFailureClass::TransientObjectStore,
+            | Self::LiveSet { .. } => ForgeFailureClass::TransientObjectStore,
             Self::Lease(_)
             | Self::Sql(_)
             | Self::FenceLost { .. }
@@ -229,21 +164,23 @@ impl ForgeError {
             | Self::Invariant { .. }
             | Self::InvalidConfig { .. }
             | Self::AlreadyRunning
-            | Self::DataFusion(_)
             | Self::Shutdown
             | Self::ShutdownRetained => ForgeFailureClass::InternalInvariant,
         }
     }
 
-    /// Returns the capacity phase for typed capacity failures.
+    /// Returns the possible-output set a failed rewrite left behind, if any.
+    ///
+    /// Every other variant returns an empty slice, so a reclaiming caller can
+    /// ask any Forge failure what it may have produced without matching on the
+    /// wrapper first.
     #[must_use]
-    pub const fn capacity_failure_phase(&self) -> Option<ForgeCapacityFailurePhase> {
+    pub fn possible_rewrite_outputs(&self) -> &[crate::forge::managed::ForgeUnsettledOutput] {
         match self {
-            Self::Capacity { .. } => Some(ForgeCapacityFailurePhase::Admission),
-            Self::ExecutionEnvelopeExceeded { .. }
-            | Self::DataFusion(datafusion::error::DataFusionError::ResourcesExhausted(_))
-            | Self::SpillLimitExceeded { .. } => Some(ForgeCapacityFailurePhase::Execution),
-            _ => None,
+            Self::RewriteUnsettled {
+                possible_outputs, ..
+            } => possible_outputs,
+            _ => &[],
         }
     }
 }

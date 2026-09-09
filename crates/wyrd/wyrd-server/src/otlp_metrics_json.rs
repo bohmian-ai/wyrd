@@ -771,7 +771,7 @@ fn object(
 ) -> Result<(), JsonDecodeError> {
     let mut first = true;
     let mut seen = 0u128;
-    cursor.expect(b'{')?;
+    cursor.consume_expected(b'{')?;
     while let Some(field) = next_object_field(cursor, &mut first)? {
         if field_decoder(field, cursor)? {
             mark_seen(&mut seen, field)?;

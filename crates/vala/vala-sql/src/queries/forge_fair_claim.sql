@@ -7,19 +7,15 @@ WITH cursor AS MATERIALIZED (
     SELECT t.*
     FROM vala.forge_tasks t
     WHERE t.state IN ('ready', 'retryable')
-      AND NOT EXISTS (
-          SELECT 1 FROM vala.forge_worker_registry worker
-          WHERE worker.worker_id = $1 AND worker.quarantined
-      )
       AND t.ready_at <= statement_timestamp()
       AND t.next_eligible_at <= statement_timestamp()
-      AND ($11::text[] IS NULL OR t.strategy = ANY($11::text[]))
+      AND ($5::text[] IS NULL OR t.strategy = ANY($5::text[]))
       AND (
-          $12::text IS NULL
-          OR t.failed_volume_identity IS NULL
-          OR t.failed_volume_identity <> $12
-          OR statement_timestamp() >= t.next_eligible_at
-             + LEAST(power(2, t.attempt_count) * interval '30 seconds', interval '15 minutes')
+          NOT $6::bool
+          OR (
+              t.strategy IN ('expired_cleanup', 'orphan_cleanup')
+              AND t.evidence IS NOT NULL
+          )
       )
       AND NOT EXISTS (
           SELECT 1
@@ -30,27 +26,6 @@ WITH cursor AS MATERIALIZED (
             AND active.table_name = t.table_name
             AND active.state IN ('claimed', 'running', 'prepared')
       )
-      AND (
-          t.envelope_version IN (0, 1)
-          OR (t.lane = 'ordinary' AND t.estimated_files <= $5 AND t.estimated_bytes <= $6)
-          OR (
-              t.lane = 'large_singleton'
-              AND t.estimated_files <= $5
-              AND t.estimated_bytes <= LEAST(t.large_task_ceiling_bytes, $10)
-              AND NOT EXISTS (
-                  SELECT 1
-                  FROM vala.forge_tasks held
-                  WHERE held.claimed_by = $1
-                    AND held.lane = 'large_singleton'
-                    AND held.state IN ('claimed', 'running', 'prepared')
-              )
-          )
-      )
-      AND (t.envelope_version IN (0, 1) OR (
-          t.estimated_parallelism <= $7
-          AND t.estimated_memory_bytes <= $8
-          AND t.estimated_spill_bytes <= $9
-      ))
 ), eligible_tenants AS MATERIALIZED (
     SELECT t.data_tenant_id
     FROM claimable t
@@ -67,7 +42,7 @@ WITH cursor AS MATERIALIZED (
     LIMIT 1
 ), candidate AS MATERIALIZED (
     SELECT t.task_id, t.data_tenant_id,
-           e.data_tenant_id AS execution_tenant_id, t.lane
+           e.data_tenant_id AS execution_tenant_id
     FROM vala.forge_tasks t
     JOIN claimable q USING (task_id)
     JOIN eligible_tenants e ON e.data_tenant_id = t.data_tenant_id
@@ -92,17 +67,12 @@ WITH cursor AS MATERIALIZED (
 )
 SELECT c.execution_tenant_id,
        t.task_id, t.data_tenant_id, t.catalog_name, t.namespace_name,
-       t.table_name, t.strategy, t.lane, t.base_snapshot_id, t.plan,
-       t.estimated_files, t.estimated_bytes, t.estimated_parallelism,
-       t.estimated_memory_bytes, t.estimated_spill_bytes,
-       t.large_task_ceiling_bytes, t.envelope_version, t.decoded_batch_bytes,
-       t.decoded_input_bytes, t.sort_working_bytes, t.sort_merge_reservation_bytes,
-       t.encoder_buffer_bytes, t.upload_chunk_bytes, t.footer_encoded_bytes,
-       t.footer_decode_workspace_bytes, t.sort_spill_bytes,
+       t.table_name, t.strategy, t.base_snapshot_id, t.plan,
+       t.estimated_files, t.estimated_bytes,
        t.state, t.attempt_id, t.claimed_by,
        t.claim_expires_at, t.watermark_snapshot_id,
        t.watermark_timestamp_ms, t.evidence, t.attempt_count, t.failure_class,
-       t.next_eligible_at, t.failed_volume_identity, t.ready_at, t.created_at,
+       t.next_eligible_at, t.ready_at, t.created_at,
        t.updated_at
 FROM claimed t
 JOIN candidate c USING (task_id)

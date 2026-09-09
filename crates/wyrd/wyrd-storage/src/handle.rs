@@ -148,8 +148,27 @@ impl StorageHandle {
     /// # Errors
     /// Returns a storage error when signer or operator construction fails.
     pub async fn from_settings(settings: StorageSettings) -> Result<Arc<Self>, StorageError> {
-        let signer = crate::factory::build_signer(&settings.backend).await?;
         let operator = crate::factory::build_operator(&settings.backend)?;
+        Self::from_settings_with_operator(settings, operator).await
+    }
+
+    /// Build a storage handle from boot settings over a supplied operator.
+    ///
+    /// [`Self::from_settings`] constructs the operator from the backend
+    /// configuration and delegates here. A caller supplies its own operator
+    /// only to model a backend capability the locally available service does
+    /// not implement — a test harness layers cursor-resumable listing onto the
+    /// filesystem service so it behaves like the object stores production
+    /// deploys against. The signer, preflight probe, telemetry layer, and every
+    /// tuning value are exactly the ones [`Self::from_settings`] applies.
+    ///
+    /// # Errors
+    /// Returns a storage error when signer construction fails.
+    pub async fn from_settings_with_operator(
+        settings: StorageSettings,
+        operator: Operator,
+    ) -> Result<Arc<Self>, StorageError> {
+        let signer = crate::factory::build_signer(&settings.backend).await?;
         crate::preflight::run(&signer).await;
 
         let operator = operator.layer(crate::telemetry::StorageTelemetryLayer::new(

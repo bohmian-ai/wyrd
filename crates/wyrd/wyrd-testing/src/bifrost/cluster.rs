@@ -118,6 +118,9 @@ pub struct BifrostNodeSpec {
     pub roles: BTreeSet<BifrostRuntimeRole>,
     /// Optional Oracle-local resource placement.
     pub oracle: Option<TestOracleResources>,
+    /// Forge compaction budget this pod admits plans against, when it is not
+    /// the harness default.
+    pub forge_compaction_memory_limit_bytes: Option<usize>,
     /// Optional accelerated role cadence applied only by test-support builders.
     pub role_timing: Option<RoleTiming>,
 }
@@ -333,6 +336,7 @@ impl BifrostClusterSpec {
             node_id: NodeId::new(uuid::Uuid::from_u128(id)),
             roles: roles.into_iter().collect(),
             oracle: None,
+            forge_compaction_memory_limit_bytes: None,
             role_timing: None,
         }
     }
@@ -790,21 +794,6 @@ pub struct RetainedNodeRoots {
     pub previous_writer_epoch: Option<i64>,
 }
 
-/// Identity evidence returned after a terminated node is rebound.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NodeRestartEvidence {
-    /// Stable logical node identity preserved across replacement.
-    pub node_id: NodeId,
-    /// New HTTP listener address.
-    pub http_addr: std::net::SocketAddr,
-    /// New gRPC listener address.
-    pub grpc_addr: std::net::SocketAddr,
-    /// Previous writer epoch, when the node owned Scribe.
-    pub previous_writer_epoch: Option<i64>,
-    /// Replacement writer epoch, strictly greater for Scribe nodes.
-    pub writer_epoch: Option<i64>,
-}
-
 /// A real multi-pod Bifrost test topology with restartable node slots.
 pub struct WyrdTestCluster {
     /// Stable node-keyed server slots; stopped nodes retain `None`.
@@ -997,27 +986,43 @@ impl WyrdTestCluster {
 
     /// Restart an abruptly terminated node on fresh addresses and retained roots.
     ///
+    /// This is the replacement-pod half of an abrupt-termination journey, so it
+    /// proves the two fences a replacement must advance before any assertion
+    /// about replay can mean anything: the node is reachable only at addresses
+    /// the terminated process never held, and a Scribe owner comes back at a
+    /// strictly greater writer epoch. Both addresses are reserved and compared
+    /// before the replacement boots, so a reused address leaves the node stopped
+    /// rather than running behind an error, and a boot failure restores the
+    /// addresses the node was configured with.
+    ///
     /// # Errors
     ///
-    /// Returns an error when the node is running, the retained roots no longer
-    /// match the configured roots, or replacement startup fails.
+    /// Returns [`ClusterError::Resource`] when the node is unknown or still
+    /// running, when `roots` does not match the stopped node's actual retained
+    /// roots and addresses, when either freshly reserved address repeats a
+    /// previous one, or when the replacement's writer epoch does not advance
+    /// exactly as `None -> None` or `Some(old) -> Some(new > old)`. Returns the
+    /// underlying error when address reservation or replacement startup fails.
     pub async fn restart_terminated_node_at_new_address(
         &mut self,
         node_id: NodeId,
         roots: RetainedNodeRoots,
-    ) -> Result<NodeRestartEvidence, ClusterError> {
-        let resources = self
-            .nodes
-            .get(&node_id)
-            .ok_or_else(|| ClusterError::Resource(format!("unknown node {}", node_id.as_uuid())))?;
-        let configured = RetainedNodeRoots {
+    ) -> Result<(), ClusterError> {
+        let unknown = || ClusterError::Resource(format!("unknown node {}", node_id.as_uuid()));
+        if self.servers.get(&node_id).ok_or_else(unknown)?.is_some() {
+            return Err(ClusterError::Resource(format!(
+                "node {} is still running",
+                node_id.as_uuid()
+            )));
+        }
+        let resources = self.nodes.get(&node_id).ok_or_else(unknown)?;
+        let previous_http_addr = resources.http_addr;
+        let previous_grpc_addr = resources.grpc_addr;
+        let observed = RetainedNodeRoots {
             wal_root: resources
                 .wal_root
                 .as_ref()
                 .map(|root| root.path().to_path_buf()),
-            previous_http_addr: roots.previous_http_addr,
-            previous_grpc_addr: roots.previous_grpc_addr,
-            previous_writer_epoch: roots.previous_writer_epoch,
             spill_root: resources
                 .spill_root
                 .as_ref()
@@ -1026,38 +1031,53 @@ impl WyrdTestCluster {
                 .audit_wal_root
                 .as_ref()
                 .map(|root| root.path().to_path_buf()),
-        };
-        if configured != roots {
-            return Err(ClusterError::Resource(
-                "retained node roots do not match configured roots".to_owned(),
-            ));
-        }
-        self.restart_node_at_new_address(node_id).await?;
-        let resources = self
-            .nodes
-            .get(&node_id)
-            .ok_or_else(|| ClusterError::Resource(format!("unknown node {}", node_id.as_uuid())))?;
-        let replacement = self.servers.get(&node_id).and_then(Option::as_ref);
-        let writer_epoch = replacement
-            .and_then(WyrdTestServer::bifrost_scribe)
-            .map(|scribe| scribe.writer_epoch_for_test());
-        if resources.http_addr == roots.previous_http_addr
-            || resources.grpc_addr == roots.previous_grpc_addr
-            || writer_epoch
-                .zip(roots.previous_writer_epoch)
-                .is_some_and(|(new, old)| new <= old)
-        {
-            return Err(ClusterError::Resource(
-                "replacement node did not advance address and writer fences".to_owned(),
-            ));
-        }
-        Ok(NodeRestartEvidence {
-            node_id,
-            http_addr: resources.http_addr,
-            grpc_addr: resources.grpc_addr,
+            previous_http_addr,
+            previous_grpc_addr,
             previous_writer_epoch: roots.previous_writer_epoch,
-            writer_epoch,
-        })
+        };
+        if observed != roots {
+            return Err(ClusterError::Resource(
+                "retained node roots do not match the stopped node".to_owned(),
+            ));
+        }
+
+        // Reserved before anything is mutated: a replacement that reused an
+        // address would prove nothing about the terminated listener, and the
+        // node must stay stopped rather than run behind this error.
+        let http_addr = reserve_loopback_addr()?;
+        let grpc_addr = reserve_loopback_addr()?;
+        if http_addr == previous_http_addr || grpc_addr == previous_grpc_addr {
+            return Err(ClusterError::Resource(
+                "replacement node did not advance its listener addresses".to_owned(),
+            ));
+        }
+        let resources = self.nodes.get_mut(&node_id).ok_or_else(unknown)?;
+        resources.http_addr = http_addr;
+        resources.grpc_addr = grpc_addr;
+        let server = match self.build_node(node_id).await {
+            Ok(server) => server,
+            Err(error) => {
+                let resources = self.nodes.get_mut(&node_id).ok_or_else(unknown)?;
+                resources.http_addr = previous_http_addr;
+                resources.grpc_addr = previous_grpc_addr;
+                return Err(error);
+            }
+        };
+        let writer_epoch = server
+            .bifrost_scribe()
+            .map(|scribe| scribe.writer_epoch_for_test());
+        self.servers.insert(node_id, Some(server));
+        self.abrupt_request_lifetimes
+            .insert(node_id, CancellationToken::new());
+        // The replacement is registered before this check so a cluster shutdown
+        // still drains it; an unadvanced fence is a failed journey, not a leak.
+        match (roots.previous_writer_epoch, writer_epoch) {
+            (None, None) => Ok(()),
+            (Some(previous), Some(replacement)) if replacement > previous => Ok(()),
+            (previous, replacement) => Err(ClusterError::Resource(format!(
+                "replacement node did not advance its writer fence: {previous:?} -> {replacement:?}"
+            ))),
+        }
     }
 
     /// Connect to one real Oracle server through the cluster's configured TLS trust.
@@ -1268,23 +1288,34 @@ impl WyrdTestCluster {
 
     /// Start an explicit descriptor with a selected Forge configuration and observer.
     ///
+    /// When `delay_last_node` is true, retain the highest node identity for later
+    /// startup through `restart_node`, allowing ingestion before maintenance.
+    ///
+    /// When `inject_uncertainty` is true every Forge process wraps its catalog
+    /// in the shared commit seam, which is inert until a journey arms it. That
+    /// is what lets one journey pause or definitively refuse a real publication
+    /// while the sibling journeys on the same topology see the plain catalog.
+    ///
     /// # Errors
     /// Returns the same topology, resource, configuration, and role-supervision
     /// errors as [`Self::start_spec_with_forge_completion_observer`].
     pub async fn start_spec_with_forge_config_and_completion_observer(
         spec: BifrostClusterSpec,
         config: ForgeConfig,
+        delay_last_node: bool,
+        inject_uncertainty: bool,
     ) -> Result<Self, ClusterError> {
         Self::start_spec_with_all_options(
             spec,
             Duration::ZERO,
             None,
             None,
-            false,
+            delay_last_node,
             (
                 ForgeHarnessOptions {
                     completion_observer: Some(ForgeWorkerCompletionObserver::new()),
                     config: Some(config),
+                    inject_uncertainty,
                     ..ForgeHarnessOptions::default()
                 },
                 ClusterResourceSource::Owned {
@@ -1439,6 +1470,41 @@ impl WyrdTestCluster {
         .await
     }
 
+    /// Start one embedded bound `all` pod with uncertainty and no ambient pass.
+    ///
+    /// The interval is explicit and long because a journey that drives the
+    /// server-owned scheduler itself cannot also be racing an ambient tick: a
+    /// pass it did not request could plan or claim the very task it is about to
+    /// observe. Everything else is the production composition — one bound pod
+    /// serving public HTTP and gRPC, with Scribe, Oracle, and the server-owned
+    /// Forge scheduler and worker roles.
+    ///
+    /// # Errors
+    /// Returns a topology, resource, or role-supervision error.
+    pub async fn start_embedded_forge_uncertainty_for_test(
+        interval: Duration,
+    ) -> Result<Self, ClusterError> {
+        Self::start_spec_with_all_options(
+            BifrostClusterSpec::one_mixed(),
+            Duration::ZERO,
+            None,
+            None,
+            false,
+            (
+                ForgeHarnessOptions {
+                    completion_observer: Some(ForgeWorkerCompletionObserver::new()),
+                    config: None,
+                    inject_uncertainty: true,
+                    interval,
+                },
+                ClusterResourceSource::Owned {
+                    dedicated_root: None,
+                },
+            ),
+        )
+        .await
+    }
+
     async fn start_with_dedicated_forge_workers_with_options(
         forge_config: Option<ForgeConfig>,
         forge_interval: Option<Duration>,
@@ -1574,7 +1640,7 @@ impl WyrdTestCluster {
                 tempfile::tempdir().map_err(|error| ClusterError::Resource(error.to_string()))?,
             ),
         });
-        let storage = StorageHandle::from_settings(StorageSettings {
+        let storage_settings = StorageSettings {
             backend: BackendConfig::Local {
                 root: storage_root.path().to_path_buf(),
             },
@@ -1583,9 +1649,23 @@ impl WyrdTestCluster {
             part_size_bytes: 16 * 1024 * 1024,
             multipart_threshold_bytes: 100 * 1024 * 1024,
             public_base_url: Some("https://wyrd.test".to_owned()),
-        })
-        .await
-        .map_err(|error| ClusterError::Resource(error.to_string()))?;
+        };
+        // The filesystem service resumes a listing from `start_after` correctly
+        // but does not advertise the capability, and Forge workers refuse to
+        // start on a staging backend that cannot resume a bounded orphan scan.
+        // This shared cluster root stands in for a production object store, so
+        // it declares the support it actually has.
+        let operator = wyrd_storage::factory::build_operator(&storage_settings.backend)
+            .map_err(|error| ClusterError::Resource(error.to_string()))?
+            .layer(opendal::layers::CapabilityOverrideLayer::new(
+                |mut capability| {
+                    capability.list_with_start_after = true;
+                    capability
+                },
+            ));
+        let storage = StorageHandle::from_settings_with_operator(storage_settings, operator)
+            .await
+            .map_err(|error| ClusterError::Resource(error.to_string()))?;
         // Only the uncertainty wrapper needs a cluster-level catalog handle;
         // every node otherwise builds its own from its own storage owner, so
         // constructing one unconditionally would create a catalog no node uses.
@@ -1745,6 +1825,9 @@ impl WyrdTestCluster {
         {
             builder = builder.with_system_resources_for_test(snapshot);
         }
+        if let Some(bytes) = resources.spec.forge_compaction_memory_limit_bytes {
+            builder = builder.with_forge_compaction_memory_limit_for_test(bytes);
+        }
         builder = builder.with_forge_process_role_for_test(resources.process_role);
         builder = builder.with_forge_interval(self.forge_interval);
         if let Some(observer) = &self.forge_completion_observer {
@@ -1898,7 +1981,7 @@ impl WyrdTestCluster {
                     COUNT(DISTINCT attempt_id) FILTER (WHERE state IN ('claimed', 'running', 'prepared'))::bigint,
                     COUNT(*) FILTER (WHERE state IN ('ready', 'retryable') AND ready_at <= statement_timestamp())::bigint,
                     COUNT(*) FILTER (WHERE attempt_id IS NOT NULL)::bigint,
-                    COUNT(*) FILTER (WHERE state IN ('succeeded', 'failed', 'cancelled', 'unschedulable') AND evidence IS NOT NULL)::bigint
+                    COUNT(*) FILTER (WHERE state IN ('succeeded', 'failed', 'cancelled') AND evidence IS NOT NULL)::bigint
                  FROM vala.forge_tasks",
             )
             .fetch_one(pool)
@@ -2269,24 +2352,6 @@ impl WyrdTestCluster {
         self.abrupt_request_lifetimes
             .insert(node_id, CancellationToken::new());
         Ok(())
-    }
-
-    /// Restarts one stopped node on newly reserved HTTP and gRPC addresses.
-    ///
-    /// # Errors
-    /// Returns the same unknown/running, address-allocation, or boot errors as
-    /// [`Self::restart_node`].
-    pub async fn restart_node_at_new_address(
-        &mut self,
-        node_id: NodeId,
-    ) -> Result<(), ClusterError> {
-        let resources = self
-            .nodes
-            .get_mut(&node_id)
-            .ok_or_else(|| ClusterError::Resource(format!("unknown node {}", node_id.as_uuid())))?;
-        resources.http_addr = reserve_loopback_addr()?;
-        resources.grpc_addr = reserve_loopback_addr()?;
-        self.restart_node(node_id).await
     }
 
     /// Seeds crash residue and an unrelated sibling beneath one node's Oracle spill root.

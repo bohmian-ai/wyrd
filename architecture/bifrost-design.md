@@ -429,16 +429,19 @@ Python, TypeScript, and MCP.
 ### Scheduling, admission, and fences
 
 Forge schedules durable Postgres tasks with tenant-fair admission. At most one
-publication attempt is active per tenant-qualified table, while bounded
-per-tenant and per-worker lanes permit independent tables to progress
-concurrently. Each attempt binds tenant, table, task, plan hash, base snapshot,
-target branch, attempt UUIDv7, operation ID, output generation, lease, and
-fence. Loss of authority cancels and drains physical work before settlement.
+durable task attempt owns the lease and fence for a tenant-qualified table.
+Within that attempt, admitted ordinary compaction plans are independent child
+operations: fitting siblings may rewrite and publish concurrently, while
+bounded per-tenant and per-worker admission also permits independent tables to
+progress concurrently. Each plan binds the owning tenant, table, task, plan
+hash, base snapshot, target branch, attempt UUIDv7, operation ID, output
+generation, lease, and fence. Loss of authority cancels and drains physical
+work before settlement.
 
-Forge owns runtime leases, memory, spill, read streams, writer fanout, upload
-buffers, close futures, SQL state, audit, reconciliation, and garbage
-collection. Resource admission may defer a task but never changes table file
-geometry or creates a second grouping algorithm.
+Forge owns runtime leases, pod-local plan admission, read streams, writer
+fanout, upload buffers, close futures, SQL state, audit, reconciliation, and
+garbage collection. Resource admission may defer a plan but never changes
+table file geometry or creates a second grouping algorithm.
 
 ### Scribe hot promotion
 
@@ -477,11 +480,28 @@ guarantee.
 
 The managed compaction core is the sole owner of candidate selection, grouping,
 bin packing, delete application, sorting, partition fanout, bounded concurrent
-writing, rolling, and output `DataFile` production. It consumes one
-Wyrd-admitted execution context with the attempt runtime, memory pool, spill
-root, cancellation tree, output identity, and closed physical observer. It
-never owns tenant authority, leases, SQL, audit, reconciliation, object GC, or
-catalog commit.
+writing, rolling, and output `DataFile` production. After it produces real
+`CompactionPlan` values, Forge estimates each plan's peak heap use from the
+plan, table schema and format version, batch size, prefetch and sort settings,
+delete files, and recommended parallelism.
+
+Each Forge worker owns one strict FIFO queue of those plans. The queue starts
+only its head when both the pod's aggregate estimated-memory budget and running
+parallelism have room. Waiting plans do not consume the running-memory budget,
+and a later smaller plan cannot bypass a blocked head; pending parallelism
+bounds the queue itself. The memory budget is configured per worker or defaults
+to 80 percent of that worker's declared memory. A plan larger than either total
+budget is refused, while a plan that fits the totals waits for running plans to
+release capacity. The budget is an admission estimate, not a `DataFusion`
+allocation ceiling. `DataFusion` runs Forge plans with its default unbounded
+memory pool and without disk spilling; Forge provisions no local scratch
+storage. An underestimated plan can exhaust the pod, after which the durable
+task, lease, and fence recovery path reclaims the lost work. One plan executes
+within one worker; Forge does not split a compaction plan across pods.
+
+The managed core consumes the attempt cancellation tree, output identity, and
+closed physical observer. It never owns tenant authority, leases, SQL, audit,
+reconciliation, object GC, or catalog commit.
 
 The non-committing boundary returns exactly:
 
@@ -513,28 +533,39 @@ the Iceberg commit so an applied delete does not reapply to replacement rows.
 Missing target evidence, mixed sequence semantics, or an unproven surviving
 scope fails commit validation.
 
-Attempt output paths are flat and table-bound:
+Attempt output paths are table-bound and retain the managed core's recipe
+segment:
 
 ```text
-{table}/data/forge/{attempt_uuidv7}-{ordinal:05}.parquet
+{table}/data/forge/{recipe}/{attempt_uuidv7}-{writer_ordinal:05}-{writer_uuidv7}.parquet
 ```
 
-One attempt-global `u64` ordinal is reserved before each open across all
-concurrent writers. Cancellation drains every writer and retains exact
+The recipe segment is the managed core's canonical writer-recipe identity and
+keeps completed Forge outputs recognizable as current on the next selection
+pass. Each physical writer owns its filename counter and UUIDv7 suffix;
+`writer_ordinal` is minimum-width five-digit canonical decimal and may restart
+for another writer because `writer_uuidv7` provides cross-writer uniqueness.
+Forge separately assigns each opened output one attempt-global
+`OutputIdentity.logical_ordinal` for observer, drain, reconciliation, and
+cleanup evidence. The logical ordinal is not encoded into or reconstructed
+from the object path. Cancellation drains every writer and retains exact
 produced-or-possible output evidence. Forge renews and verifies the lease and
 fence immediately before the initial `commit_once`. The commit adapter removes
 the exact rewritten data files, adds the exact outputs, preserves delete
 correctness, and writes operation and lineage properties in the same snapshot.
 
 Committed, definitely uncommitted, fence-refused, cancelled, and uncertain are
-distinct outcomes. On a definite catalog compare-and-swap conflict, Forge
-refreshes the branch head and revalidates base ancestry, selected inputs,
-delete scope, schema/spec/sort policy, lease, and fence. When all assumptions
-remain true, the same attempt, operation ID, output generation, and objects may
-issue at most one additional `commit_once` within the original deadline. A
-second conflict, expired deadline, or changed assumption settles the attempt as
-definitely uncommitted and returns durable demand for a new plan and attempt.
-No conflict retry creates new output objects.
+distinct per-plan outcomes. Concurrent siblings may optimistically race on the
+same branch head and cause an expected compare-and-swap conflict. On a definite
+conflict, Forge refreshes the branch head and revalidates the retained planning
+snapshot, current schema identity, selected-input existence, lease, and fence.
+When those assumptions remain true, the same plan operation, output generation,
+and objects may make at most three further `commit_once` calls after fixed
+1s/2s/4s delays within the original deadline. Exhausted retries, an expired
+deadline, or a changed assumption settles only that plan as definitely
+uncommitted. Successful sibling snapshots remain visible; the task succeeds
+when any admitted plan publishes, and later discovery replans remaining debt
+from the current head. No conflict retry creates new output objects.
 
 An uncertain attempt protects its outputs and reconciles under the same
 identity; it never retries the catalog call, starts a fresh attempt, or reports
@@ -557,17 +588,21 @@ expiration preserves active refs, unresolved attempts, reconciliation evidence,
 and the lineage snapshot referenced by the branch head. Orphan GC deletes only
 objects proven unreferenced and outside every active or uncertain attempt.
 Committed Scribe hot objects in `file_list` that lack exact promotion evidence,
-and objects retained by any pinned Oracle cut or live-tail lease, are hard GC
-roots even when no Iceberg snapshot references them. No cleanup infers safety
-from age or path shape alone.
+and objects retained by a pinned Oracle cut, are hard GC roots even when no
+Iceberg snapshot references them.
+A v1 live-tail lease retains Scribe-local Arrow batches and staged resources for its lifetime but names no Forge-collectable object, so it contributes no independent Forge GC root.
+No cleanup infers safety from age or path shape alone.
 
 ## Resource and failure invariants
 
-- Every Wyrd-owned queue, mailbox, stream, fanout, task set, buffer, memory
-  pool, scratch root, spill path, staged namespace, and object upload lane is
-  bounded. A pinned dependency-internal queue may instead provide finite byte
-  backpressure when Wyrd cannot configure its item count; architecture must
-  name that exception rather than claim ownership it does not have.
+- Every Wyrd-owned queue, mailbox, stream, fanout, task set, buffer, staged
+  namespace, and object upload lane is bounded. Scribe scratch and Oracle
+  memory pools, scratch roots, and spill paths remain hard-bounded. Forge uses
+  bounded FIFO admission from estimated plan memory instead of a hard
+  `DataFusion` pool or spill path. A pinned dependency-internal queue may
+  instead provide finite byte backpressure when Wyrd cannot configure its item
+  count; architecture must name that exception rather than claim ownership it
+  does not have.
 - Global resource owners account tenant and table attribution without creating
   an independent root pool per tenant.
 - Cancellation is structured: stop admission, cancel descendants, join work,
@@ -585,11 +620,22 @@ from age or path shape alone.
 
 ## Telemetry
 
-Scribe, Oracle, and Forge each own a closed lifecycle telemetry registry used by
-production behavior, verification, and operator documentation. Required
-observations cover admission, queue age, active ownership, WAL fsync, staging,
-merge, object IO, catalog calls, spill, retries, lease and fence decisions,
-reconciliation, cleanup, cancellation, and terminal settlement.
+Scribe, Oracle, and Forge each own one closed telemetry registry used by
+production behavior, verification, and operator documentation. Four surfaces
+carry Bifrost's observability, and each fact belongs to exactly one of them.
+
+The public Prometheus catalog answers what an operator must be able to graph
+and alert on without reading code: demand, queue depth and age, active
+ownership, durable results, latency, failure class, physical data flow, and
+outstanding maintenance debt. It is deliberately small and closed; a subsystem
+does not add a family because a value exists.
+
+Protocol mechanics — lease and fence decisions, catalog calls, reconciliation,
+cursor movement, scheduler passes, and resource envelopes — belong to
+structured traces, where the identities that make them useful are legal.
+Durable audit and task rows remain the authority for what actually happened,
+and no metric is evidence of a durable fact. Unresolved authority or
+in-progress recovery is a readiness signal, not a metric.
 
 Every active gauge decrements on success, refusal, retry, uncertainty,
 cancellation, and failure. Metric labels use only closed, bounded dimensions

@@ -48,6 +48,7 @@ parquet = { workspace = true, features = ["async"] }
 iceberg = { workspace = true }
 iceberg-datafusion = { workspace = true }
 iceberg-catalog-sql = { workspace = true }
+iceberg-compaction-core = { workspace = true }
 typetag = { workspace = true }
 lru = { workspace = true }
 datafusion-distributed = { workspace = true }
@@ -80,11 +81,15 @@ tokio-util = { workspace = true }
 tempfile = { workspace = true }
 
 [dev-dependencies]
+# `time` and `test-util` are test-only: the publication retry schedule is proved
+# with paused time rather than a clock abstraction the production path would
+# then have to carry.
+tokio = { workspace = true, features = ["time", "test-util"] }
 wyrd-dev-fixtures = { workspace = true, features = ["pg"] }
 wyrd-bench = { workspace = true }
+wyrd-telemetry = { workspace = true, features = ["test-support"] }
 iceberg-catalog-sql = { workspace = true }
 datafusion-distributed = { workspace = true }
-tokio = { workspace = true, features = ["test-util"] }
 url = { workspace = true }
 
 [lints]

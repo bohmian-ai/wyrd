@@ -1,7 +1,10 @@
 //! Supervision for the single durable Forge planning scheduler.
 
+#[cfg(feature = "test-support")]
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+#[cfg(feature = "test-support")]
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use tokio_util::sync::CancellationToken;
@@ -9,8 +12,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::error::ForgeError;
-use super::metrics::{ForgeHintPersistenceResult, ForgeLeaseResult};
-use super::{Forge, ForgeScheduler, ForgeTickOutcome};
+use super::{Forge, ForgeScheduler};
 use crate::maintenance::StagingFileCommitted;
 
 /// Test-tier control and observation for a supervised production scheduler loop.
@@ -18,6 +20,7 @@ use crate::maintenance::StagingFileCommitted;
 /// The trigger only wakes the already-running [`Forge::run`] loop. It never
 /// constructs a scheduler, claims work, or executes a planning pass itself.
 #[derive(Clone, Default)]
+#[cfg(feature = "test-support")]
 pub struct ForgeSchedulerTrigger {
     /// Wakeup consumed by the production supervisor select loop.
     requested: Arc<tokio::sync::Notify>,
@@ -30,6 +33,7 @@ pub struct ForgeSchedulerTrigger {
     owner: Arc<std::sync::Mutex<Option<Uuid>>>,
 }
 
+#[cfg(feature = "test-support")]
 impl ForgeSchedulerTrigger {
     /// Construct an idle control for one supervised Forge owner.
     #[must_use]
@@ -98,6 +102,18 @@ impl ForgeSchedulerTrigger {
     }
 }
 
+/// Clears one Forge role's readiness when its supervised loop stops.
+///
+/// Every exit — clean shutdown, construction failure, or an unwind — runs the
+/// same clear, so no path can leave a stopped role advertising itself.
+struct ForgeReadinessGuard(super::ForgeRoleReadiness);
+
+impl Drop for ForgeReadinessGuard {
+    fn drop(&mut self) {
+        self.0.publish(false);
+    }
+}
+
 impl Forge {
     /// Runs durable hint ingestion and periodic planning until cancellation.
     ///
@@ -115,10 +131,17 @@ impl Forge {
     /// scheduling passes. A cancelled hint write remains absent or committed
     /// according to the database transaction boundary and is safe to recreate
     /// from the durable staging-file roster on a later pass.
-    pub async fn run(&self, shutdown: CancellationToken) -> Result<(), ForgeError> {
+    pub async fn run(
+        &self,
+        shutdown: CancellationToken,
+        readiness: super::ForgeRoleReadiness,
+    ) -> Result<(), ForgeError> {
         let _guard = self.acquire_run_guard()?;
+        // Cleared whenever this loop stops for any reason, so routing closes
+        // before the process finishes draining rather than after.
+        let _readiness = ForgeReadinessGuard(readiness.clone());
         #[cfg(feature = "test-support")]
-        let scheduler = match self
+        let mut scheduler = match self
             .core
             .scheduler_trigger
             .as_ref()
@@ -128,7 +151,7 @@ impl Forge {
             None => ForgeScheduler::new(self)?,
         };
         #[cfg(not(feature = "test-support"))]
-        let scheduler = ForgeScheduler::new(self)?;
+        let mut scheduler = ForgeScheduler::new(self)?;
         let interval = self.core.maintenance_interval;
         let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -149,18 +172,12 @@ impl Forge {
                     None => hints_open = false,
                 },
                 _ = ticker.tick() => {
-                    if !self.run_planning_pass(&scheduler, &shutdown, false).await {
+                    if !self.run_planning_pass(&mut scheduler, &shutdown, false, &readiness).await {
                         return Ok(());
                     }
                 },
-                () = async {
-                    if let Some(trigger) = &self.core.scheduler_trigger {
-                        trigger.wait_for_request().await;
-                    } else {
-                        std::future::pending::<()>().await;
-                    }
-                } => {
-                    if !self.run_planning_pass(&scheduler, &shutdown, true).await {
+                () = self.await_triggered_pass() => {
+                    if !self.run_planning_pass(&mut scheduler, &shutdown, true, &readiness).await {
                         return Ok(());
                     }
                 },
@@ -190,15 +207,18 @@ impl Forge {
         );
         let result =
             tracing::Instrument::instrument(scheduler.record_hint(hint), span.clone()).await;
-        let outcome = if result.is_ok() {
-            ForgeHintPersistenceResult::Succeeded
-        } else {
-            ForgeHintPersistenceResult::Failed
-        };
-        span.record("result", outcome.as_str());
-        self.core
-            .telemetry
-            .record_hint_persistence(outcome, started.elapsed());
+        span.record(
+            "result",
+            if result.is_ok() {
+                "succeeded"
+            } else {
+                "failed"
+            },
+        );
+        tracing::debug!(
+            elapsed_seconds = started.elapsed().as_secs_f64(),
+            "Forge maintenance hint persistence completed"
+        );
         result
     }
 
@@ -212,9 +232,10 @@ impl Forge {
     /// must exit, or `true` after recording a completed pass attempt.
     async fn run_planning_pass(
         &self,
-        scheduler: &ForgeScheduler<'_>,
+        scheduler: &mut ForgeScheduler<'_>,
         shutdown: &CancellationToken,
         triggered: bool,
+        readiness: &super::ForgeRoleReadiness,
     ) -> bool {
         let started = Instant::now();
         let pass_span = tracing::info_span!(
@@ -238,23 +259,22 @@ impl Forge {
                         "succeeded"
                     },
                 );
-                self.core
-                    .telemetry
-                    .record_scheduler_pass(&outcome, started.elapsed());
+                // Readiness is authority, not liveness: only a pass that held
+                // the fence and acknowledged everything it was asked to plan
+                // proves this replica is the coordinator work should route to.
+                // A standby replica lost the fence to a live peer, and a pass
+                // that stopped at its per-wake budget left demand unplanned.
+                readiness.publish(!outcome.standby && !outcome.incomplete);
                 if outcome.standby {
-                    self.core
-                        .telemetry
-                        .record_lease(ForgeLeaseResult::Contention);
                     tracing::debug!(triggered, "Forge scheduler remains on standby");
-                    if let Some(trigger) = &self.core.scheduler_trigger {
-                        trigger.record_completed_pass();
-                    }
+                    self.record_completed_pass();
                     return true;
                 }
                 tracing::debug!(
                     demands_seen = outcome.demands_seen,
                     tasks_enqueued = outcome.tasks_enqueued,
                     incomplete = outcome.incomplete,
+                    elapsed_seconds = started.elapsed().as_secs_f64(),
                     triggered,
                     "Forge scheduling pass completed"
                 );
@@ -262,31 +282,34 @@ impl Forge {
             Err(error) => {
                 pass_span.record("result", "failed");
                 tracing::error!(error = %error, triggered, "Forge scheduling pass failed");
+                // Cleared before the next claim or pass, so a coordinator whose
+                // dependency failed stops being routed to immediately.
+                readiness.publish(false);
             }
         }
-        if let Some(trigger) = &self.core.scheduler_trigger {
-            trigger.record_completed_pass();
-        }
+        self.record_completed_pass();
         true
     }
 
-    /// Runs one durable planning pass without executing claimed work.
+    /// Waits for the deterministic test trigger that requests one extra pass.
     ///
-    /// # Errors
-    /// Returns scheduler construction, discovery, catalog-read, or SQL errors.
-    pub async fn run_once(&self) -> Result<ForgeTickOutcome, ForgeError> {
-        let scheduled = ForgeScheduler::new(self)?
-            .schedule_once(&CancellationToken::new())
-            .await?;
-        Ok(ForgeTickOutcome {
-            groups_seen: scheduled.tasks_enqueued,
-            tables_discovered: scheduled.demands_seen,
-            tables_examined: scheduled.demands_seen,
-            tables_succeeded: scheduled.demands_acknowledged,
-            tables_failed: usize::from(scheduled.incomplete),
-            pending_work: scheduled.incomplete,
-            ..ForgeTickOutcome::default()
-        })
+    /// Production has no such trigger, so the future never resolves there and
+    /// the surrounding `select!` is driven only by ticks, hints, and shutdown.
+    async fn await_triggered_pass(&self) {
+        #[cfg(feature = "test-support")]
+        if let Some(trigger) = &self.core.scheduler_trigger {
+            trigger.wait_for_request().await;
+            return;
+        }
+        std::future::pending::<()>().await;
+    }
+
+    /// Reports one completed pass to the deterministic test trigger, if any.
+    fn record_completed_pass(&self) {
+        #[cfg(feature = "test-support")]
+        if let Some(trigger) = &self.core.scheduler_trigger {
+            trigger.record_completed_pass();
+        }
     }
 
     /// Receives one lossy wake-up while holding only the inbox mutex.

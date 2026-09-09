@@ -5,3 +5,6 @@
 //! production invariant, so the target never advertises coverage it does not run.
 
 mod distributed_compat;
+mod forge;
+mod oracle;
+mod scribe;

@@ -426,8 +426,12 @@ mod tests {
         let queries_doc = fs::read_to_string(crate_dir.join("src/queries/mod.rs"))
             .expect("query module doc is readable");
 
-        assert!(sql_foundation.contains("Every tenant-scoped logical operation opens exactly one"));
-        assert!(sql_foundation.contains("Cross-crate transactional coordination is not supported"));
+        assert!(
+            sql_foundation.contains("tenant-scoped logical operation acquires one `TenantConn`")
+        );
+        assert!(sql_foundation.contains(
+            "Cross-crate work does not extend a transaction by importing another crate's"
+        ));
         assert!(tenant_conn.contains("transaction boundary for one tenant-scoped logical"));
         assert!(tenant_conn.contains("operation. Handlers and workers"));
         assert!(queries_doc.contains("future outbox path"));

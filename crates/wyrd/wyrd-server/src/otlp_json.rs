@@ -861,15 +861,15 @@ fn scan_message(
     if kind == MessageKind::AnyValue {
         return scan_any_value(cursor, value_depth, facts);
     }
-    cursor.expect(b'{')?;
+    cursor.consume_expected(b'{')?;
     let mut seen = 0u128;
     let mut oneof_seen = false;
     if cursor.peek() == Some(b'}') {
-        return cursor.expect(b'}');
+        return cursor.consume_expected(b'}');
     }
     loop {
         let field = field_from_token(cursor.string_token()?)?;
-        cursor.expect(b':')?;
+        cursor.consume_expected(b':')?;
         let spec = field_spec(kind, field);
         if !matches!(spec, FieldSpec::Unknown) {
             if is_oneof_field(kind, field) {
@@ -888,9 +888,9 @@ fn scan_message(
         }
         scan_field(cursor, spec, value_depth, facts)?;
         match cursor.peek() {
-            Some(b',') => cursor.expect(b',')?,
+            Some(b',') => cursor.consume_expected(b',')?,
             Some(b'}') => {
-                cursor.expect(b'}')?;
+                cursor.consume_expected(b'}')?;
                 return Ok(());
             }
             _ => return Err(cursor.error("expected OTLP JSON object separator")),
@@ -1038,18 +1038,18 @@ fn scan_message_array(
     value_depth: usize,
     facts: &mut JsonFacts,
 ) -> Result<(), JsonDecodeError> {
-    cursor.expect(b'[')?;
+    cursor.consume_expected(b'[')?;
     if cursor.peek() == Some(b']') {
-        return cursor.expect(b']');
+        return cursor.consume_expected(b']');
     }
     loop {
         facts.count_kind(kind)?;
         facts.add_decode(layout)?;
         scan_message(cursor, kind, value_depth, facts)?;
         match cursor.peek() {
-            Some(b',') => cursor.expect(b',')?,
+            Some(b',') => cursor.consume_expected(b',')?,
             Some(b']') => {
-                cursor.expect(b']')?;
+                cursor.consume_expected(b']')?;
                 return Ok(());
             }
             _ => return Err(cursor.error("expected OTLP JSON array separator")),
@@ -1068,18 +1068,18 @@ fn scan_string_array(
     cursor: &mut JsonCursor<'_>,
     facts: &mut JsonFacts,
 ) -> Result<(), JsonDecodeError> {
-    cursor.expect(b'[')?;
+    cursor.consume_expected(b'[')?;
     if cursor.peek() == Some(b']') {
-        return cursor.expect(b']');
+        return cursor.consume_expected(b']');
     }
     loop {
         facts.add_decode(size_of::<String>())?;
         let token = cursor.string_token()?;
         facts.add_value(token.decoded_len)?;
         match cursor.peek() {
-            Some(b',') => cursor.expect(b',')?,
+            Some(b',') => cursor.consume_expected(b',')?,
             Some(b']') => {
-                cursor.expect(b']')?;
+                cursor.consume_expected(b']')?;
                 return Ok(());
             }
             _ => return Err(cursor.error("expected OTLP JSON string-array separator")),
@@ -1100,9 +1100,9 @@ fn scan_primitive_array(
     quoted: bool,
     facts: &mut JsonFacts,
 ) -> Result<(), JsonDecodeError> {
-    cursor.expect(b'[')?;
+    cursor.consume_expected(b'[')?;
     if cursor.peek() == Some(b']') {
-        return cursor.expect(b']');
+        return cursor.consume_expected(b']');
     }
     loop {
         facts.add_decode(layout)?;
@@ -1112,9 +1112,9 @@ fn scan_primitive_array(
             scan_scalar(cursor)?;
         }
         match cursor.peek() {
-            Some(b',') => cursor.expect(b',')?,
+            Some(b',') => cursor.consume_expected(b',')?,
             Some(b']') => {
-                cursor.expect(b']')?;
+                cursor.consume_expected(b']')?;
                 return Ok(());
             }
             _ => return Err(cursor.error("expected OTLP JSON primitive-array separator")),
@@ -1137,14 +1137,14 @@ fn scan_any_value(
     if value_depth >= facts.limits.value_depth.min(MAX_ANY_VALUE_DEPTH) {
         return Err(cursor.error("OTLP JSON AnyValue nesting exceeds configured depth"));
     }
-    cursor.expect(b'{')?;
+    cursor.consume_expected(b'{')?;
     let mut selected: Option<(Field, usize, usize)> = None;
     if cursor.peek() == Some(b'}') {
         return Err(cursor.error("OTLP JSON AnyValue has no known value"));
     }
     loop {
         let field = field_from_token(cursor.string_token()?)?;
-        cursor.expect(b':')?;
+        cursor.consume_expected(b':')?;
         let start = cursor.offset;
         cursor.skip_value(0)?;
         let end = cursor.offset;
@@ -1161,9 +1161,9 @@ fn scan_any_value(
             selected = Some((field, start, end));
         }
         match cursor.peek() {
-            Some(b',') => cursor.expect(b',')?,
+            Some(b',') => cursor.consume_expected(b',')?,
             Some(b'}') => {
-                cursor.expect(b'}')?;
+                cursor.consume_expected(b'}')?;
                 break;
             }
             _ => return Err(cursor.error("expected AnyValue object separator")),
@@ -1200,14 +1200,14 @@ pub(crate) fn decode_message_array<T>(
 ) -> Result<Vec<T>, JsonDecodeError> {
     let count = cursor.array_len()?;
     let mut values = Vec::with_capacity(count);
-    cursor.expect(b'[')?;
+    cursor.consume_expected(b'[')?;
     for index in 0..count {
         values.push(decode(cursor)?);
         if index + 1 < count {
-            cursor.expect(b',')?;
+            cursor.consume_expected(b',')?;
         }
     }
-    cursor.expect(b']')?;
+    cursor.consume_expected(b']')?;
     debug_assert_eq!(values.len(), values.capacity());
     Ok(values)
 }
@@ -1243,11 +1243,11 @@ pub(crate) fn next_object_field(
     first: &mut bool,
 ) -> Result<Option<Field>, JsonDecodeError> {
     if cursor.peek() == Some(b'}') {
-        cursor.expect(b'}')?;
+        cursor.consume_expected(b'}')?;
         return Ok(None);
     }
     if !*first {
-        cursor.expect(b',')?;
+        cursor.consume_expected(b',')?;
     }
     *first = false;
     cursor.field().map(Some)
@@ -1264,7 +1264,7 @@ pub(crate) fn decode_resource(cursor: &mut JsonCursor<'_>) -> Result<Resource, J
     let mut output = Resource::default();
     let mut first = true;
     let mut seen = 0u128;
-    cursor.expect(b'{')?;
+    cursor.consume_expected(b'{')?;
     while let Some(field) = next_object_field(cursor, &mut first)? {
         if !matches!(
             field,
@@ -1302,7 +1302,7 @@ pub(crate) fn decode_scope(
     let mut output = InstrumentationScope::default();
     let mut first = true;
     let mut seen = 0u128;
-    cursor.expect(b'{')?;
+    cursor.consume_expected(b'{')?;
     while let Some(field) = next_object_field(cursor, &mut first)? {
         if !matches!(
             field,
@@ -1335,7 +1335,7 @@ fn decode_entity_ref(cursor: &mut JsonCursor<'_>) -> Result<EntityRef, JsonDecod
     let mut output = EntityRef::default();
     let mut first = true;
     let mut seen = 0u128;
-    cursor.expect(b'{')?;
+    cursor.consume_expected(b'{')?;
     while let Some(field) = next_object_field(cursor, &mut first)? {
         if !matches!(
             field,
@@ -1381,7 +1381,7 @@ fn decode_key_value_at(
     let mut output = KeyValue::default();
     let mut first = true;
     let mut seen = 0u128;
-    cursor.expect(b'{')?;
+    cursor.consume_expected(b'{')?;
     while let Some(field) = next_object_field(cursor, &mut first)? {
         if !matches!(field, Field::Key | Field::Value) {
             cursor.skip_value(0)?;
@@ -1415,7 +1415,7 @@ pub(crate) fn decode_any_value(
     }
     let mut selected: Option<(Field, usize, usize)> = None;
     let mut first = true;
-    cursor.expect(b'{')?;
+    cursor.consume_expected(b'{')?;
     while let Some(field) = next_object_field(cursor, &mut first)? {
         let start = cursor.offset;
         cursor.skip_value(0)?;
@@ -1472,7 +1472,7 @@ fn decode_array_value(
     let mut output = ArrayValue::default();
     let mut first = true;
     let mut seen = 0u128;
-    cursor.expect(b'{')?;
+    cursor.consume_expected(b'{')?;
     while let Some(field) = next_object_field(cursor, &mut first)? {
         if field != Field::Values {
             cursor.skip_value(0)?;
@@ -1507,7 +1507,7 @@ fn decode_key_value_list(
     let mut output = KeyValueList::default();
     let mut first = true;
     let mut seen = 0u128;
-    cursor.expect(b'{')?;
+    cursor.consume_expected(b'{')?;
     while let Some(field) = next_object_field(cursor, &mut first)? {
         if field != Field::Values {
             cursor.skip_value(0)?;
@@ -1937,7 +1937,7 @@ impl<'de> JsonCursor<'de> {
     ///
     /// Returns [`JsonDecodeError`] when the next non-whitespace byte is not
     /// `expected`.
-    pub(crate) fn expect(&mut self, expected: u8) -> Result<(), JsonDecodeError> {
+    pub(crate) fn consume_expected(&mut self, expected: u8) -> Result<(), JsonDecodeError> {
         self.skip_ws();
         if self.input.get(self.offset) == Some(&expected) {
             self.offset += 1;
@@ -1975,7 +1975,7 @@ impl<'de> JsonCursor<'de> {
     /// unescaped control bytes, invalid UTF-8/Unicode/escapes, or checked string
     /// offset/length overflow.
     fn string_token(&mut self) -> Result<JsonStringToken<'de>, JsonDecodeError> {
-        self.expect(b'"')?;
+        self.consume_expected(b'"')?;
         let start = self.offset;
         let mut scan = self.offset;
         let mut escaped = false;
@@ -2060,7 +2060,7 @@ impl<'de> JsonCursor<'de> {
     /// UTF-8/Unicode/escapes, an oversized escaped key, or a missing colon.
     pub(crate) fn field(&mut self) -> Result<Field, JsonDecodeError> {
         let field = field_from_token(self.string_token()?)?;
-        self.expect(b':')?;
+        self.consume_expected(b':')?;
         Ok(field)
     }
 
@@ -2270,24 +2270,24 @@ impl<'de> JsonCursor<'de> {
                         if stack_len == stack.len() {
                             return Err(self.error("JSON syntax nesting exceeds 128"));
                         }
-                        self.expect(b'{')?;
+                        self.consume_expected(b'{')?;
                         if self.peek() == Some(b'}') {
-                            self.expect(b'}')?;
+                            self.consume_expected(b'}')?;
                             need_value = false;
                         } else {
                             stack[stack_len] = SyntaxFrame::OBJECT_KEY;
                             stack_len += 1;
                             self.string_token()?;
-                            self.expect(b':')?;
+                            self.consume_expected(b':')?;
                         }
                     }
                     Some(b'[') => {
                         if stack_len == stack.len() {
                             return Err(self.error("JSON syntax nesting exceeds 128"));
                         }
-                        self.expect(b'[')?;
+                        self.consume_expected(b'[')?;
                         if self.peek() == Some(b']') {
-                            self.expect(b']')?;
+                            self.consume_expected(b']')?;
                             need_value = false;
                         } else {
                             stack[stack_len] = SyntaxFrame::ARRAY_VALUE;
@@ -2328,22 +2328,22 @@ impl<'de> JsonCursor<'de> {
             let frame = &stack[stack_len - 1];
             match (frame.kind, self.peek()) {
                 (SyntaxKind::Array, Some(b',')) => {
-                    self.expect(b',')?;
+                    self.consume_expected(b',')?;
                     need_value = true;
                 }
                 (SyntaxKind::Array, Some(b']')) => {
-                    self.expect(b']')?;
+                    self.consume_expected(b']')?;
                     stack_len -= 1;
                     need_value = false;
                 }
                 (SyntaxKind::Object, Some(b',')) => {
-                    self.expect(b',')?;
+                    self.consume_expected(b',')?;
                     self.string_token()?;
-                    self.expect(b':')?;
+                    self.consume_expected(b':')?;
                     need_value = true;
                 }
                 (SyntaxKind::Object, Some(b'}')) => {
-                    self.expect(b'}')?;
+                    self.consume_expected(b'}')?;
                     stack_len -= 1;
                     need_value = false;
                 }
@@ -2360,7 +2360,7 @@ impl<'de> JsonCursor<'de> {
     /// nested values, nesting above 128, or checked element-count overflow.
     pub(crate) fn array_len(&self) -> Result<usize, JsonDecodeError> {
         let mut lookahead = self.clone();
-        lookahead.expect(b'[')?;
+        lookahead.consume_expected(b'[')?;
         if lookahead.peek() == Some(b']') {
             return Ok(0);
         }
@@ -2371,7 +2371,7 @@ impl<'de> JsonCursor<'de> {
                 .checked_add(1)
                 .ok_or_else(|| lookahead.error("JSON array length overflow"))?;
             match lookahead.peek() {
-                Some(b',') => lookahead.expect(b',')?,
+                Some(b',') => lookahead.consume_expected(b',')?,
                 Some(b']') => return Ok(count),
                 _ => return Err(lookahead.error("expected array separator")),
             }
@@ -2612,13 +2612,13 @@ impl<'de> SeqAccess<'de> for JsonSeqAccess<'_, 'de> {
         T: DeserializeSeed<'de>,
     {
         if self.remaining == 0 {
-            self.decoder.cursor.expect(b']')?;
+            self.decoder.cursor.consume_expected(b']')?;
             return Ok(None);
         }
         let value = seed.deserialize(&mut *self.decoder)?;
         self.remaining -= 1;
         if self.remaining > 0 {
-            self.decoder.cursor.expect(b',')?;
+            self.decoder.cursor.consume_expected(b',')?;
         }
         Ok(Some(value))
     }
@@ -2658,16 +2658,16 @@ impl<'de> MapAccess<'de> for JsonMapAccess<'_, 'de> {
             return Ok(None);
         }
         if self.decoder.cursor.peek() == Some(b'}') {
-            self.decoder.cursor.expect(b'}')?;
+            self.decoder.cursor.consume_expected(b'}')?;
             self.finished = true;
             return Ok(None);
         }
         if !self.first {
-            self.decoder.cursor.expect(b',')?;
+            self.decoder.cursor.consume_expected(b',')?;
         }
         self.first = false;
         let key = self.decoder.cursor.string()?;
-        self.decoder.cursor.expect(b':')?;
+        self.decoder.cursor.consume_expected(b':')?;
         match key {
             Cow::Borrowed(value) => seed.deserialize(value.into_deserializer()).map(Some),
             Cow::Owned(value) => seed.deserialize(value.into_deserializer()).map(Some),
@@ -2961,7 +2961,7 @@ impl<'de> de::Deserializer<'de> for &mut JsonDeserializer<'de> {
         V: Visitor<'de>,
     {
         let length = self.cursor.array_len()?;
-        self.cursor.expect(b'[')?;
+        self.cursor.consume_expected(b'[')?;
         visitor.visit_seq(JsonSeqAccess {
             decoder: self,
             remaining: length,
@@ -3009,7 +3009,7 @@ impl<'de> de::Deserializer<'de> for &mut JsonDeserializer<'de> {
     where
         V: Visitor<'de>,
     {
-        self.cursor.expect(b'{')?;
+        self.cursor.consume_expected(b'{')?;
         visitor.visit_map(JsonMapAccess {
             decoder: self,
             first: true,

@@ -1293,6 +1293,7 @@ mod tests {
                 object_key,
                 file_checksum: checksum,
                 partition,
+                schema_fingerprint: "00".repeat(32),
                 partition_spec_id: crate::catalog::layout::BIFROST_PARTITION_SPEC_ID,
                 sort_order_id: crate::catalog::layout::BIFROST_SORT_ORDER_ID,
             },
@@ -1917,22 +1918,14 @@ mod tests {
         let wal_root = directory.path().join("wal");
         let scribe_stage = directory.path().join("scribe-stage");
         let scribe_scratch = directory.path().join("scribe-scratch");
-        let forge_scratch = directory.path().join("forge-scratch");
         let oracle_scratch = directory.path().join("oracle-scratch");
-        for path in [
-            &wal_root,
-            &scribe_stage,
-            &scribe_scratch,
-            &forge_scratch,
-            &oracle_scratch,
-        ] {
+        for path in [&wal_root, &scribe_stage, &scribe_scratch, &oracle_scratch] {
             std::fs::create_dir(path).expect("registered volume root");
         }
         let roots = BifrostVolumeRoots {
             wal: wal_root.clone(),
             scribe_stage: scribe_stage.clone(),
             scribe_output_scratch: scribe_scratch.clone(),
-            forge_scratch: forge_scratch.clone(),
             oracle_scratch: oracle_scratch.clone(),
         };
         let governor =
@@ -1999,7 +1992,6 @@ mod tests {
                 wal: wal_root.clone(),
                 scribe_stage,
                 scribe_output_scratch: scribe_scratch,
-                forge_scratch,
                 oracle_scratch,
             },
             &wal_root,

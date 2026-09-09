@@ -473,24 +473,38 @@
           }
         },
         {
-          "description": "A Forge compaction operation and its external Iceberg boundary.\n\nThe ordered `output_paths` list is the sole greenfield output shape; prepared and terminal audit rows preserve writer-rotation order and do not expose a scalar compatibility form.",
+          "description": "A Forge Scribe-promotion operation and its Iceberg catalog boundary.\n\nPromotion appends already-published hot objects unchanged, so the row records exactly which `file_list` rows and object paths moved, the snapshot the append started from, the snapshot it produced when known, and the digest binding that ordered file set to this operation.",
           "type": "object",
           "required": [
+            "base_snapshot_id",
             "group",
             "input_file_ids",
             "input_paths",
             "kind",
             "operation_id",
-            "output_paths",
-            "phase"
+            "phase",
+            "promoted_file_set_digest"
           ],
           "properties": {
+            "base_snapshot_id": {
+              "description": "Snapshot observed before the promotion append.",
+              "type": "integer",
+              "format": "int64"
+            },
+            "committed_snapshot_id": {
+              "description": "Snapshot returned by a proven promotion commit, when known.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64"
+            },
             "group": {
-              "description": "Canonical tenant/table/partition group identity.",
+              "description": "Canonical tenant/table resource identity.",
               "type": "string"
             },
             "input_file_ids": {
-              "description": "Exact staging rows transitioned by the operation.",
+              "description": "Exact ordered `file_list` rows promoted by the operation.",
               "type": "array",
               "items": {
                 "type": "string",
@@ -498,7 +512,7 @@
               }
             },
             "input_paths": {
-              "description": "Exact staging paths consumed by the operation.",
+              "description": "Exact ordered logical object paths promoted by the operation.",
               "type": "array",
               "items": {
                 "type": "string"
@@ -507,7 +521,7 @@
             "kind": {
               "type": "string",
               "enum": [
-                "forge_compaction"
+                "forge_scribe_promotion"
               ]
             },
             "operation_id": {
@@ -515,28 +529,17 @@
               "type": "string",
               "format": "uuid"
             },
-            "output_paths": {
-              "description": "Deterministic compacted output paths in writer-rotation order.\n\nThis ordered collection is the only output representation for greenfield Forge audit rows, shared by prepared and terminal phases without a scalar compatibility field.",
-              "type": "array",
-              "items": {
-                "type": "string"
-              }
-            },
             "phase": {
               "description": "Durable phase represented by this audit row.",
               "allOf": [
                 {
-                  "$ref": "#/definitions/ForgeCompactionPhase"
+                  "$ref": "#/definitions/ForgeScribePromotionPhase"
                 }
               ]
             },
-            "snapshot_id": {
-              "description": "Iceberg snapshot returned by a committed operation, when known.",
-              "type": [
-                "integer",
-                "null"
-              ],
-              "format": "int64"
+            "promoted_file_set_digest": {
+              "description": "Digest binding the ordered promoted file set to this operation.",
+              "type": "string"
             }
           }
         },
@@ -609,6 +612,167 @@
                 "type": "integer",
                 "format": "int64"
               }
+            }
+          }
+        },
+        {
+          "description": "A Forge metadata-only manifest rewrite and its Iceberg boundary.\n\nThe operation regroups manifest entries and nothing else: the data files the table logically contains are identical before and after it. Both path collections are exact and ordered, so a reader can prove which manifests were replaced by which without consulting the catalog.",
+          "type": "object",
+          "required": [
+            "base_metadata_location",
+            "group",
+            "input_manifest_paths",
+            "kind",
+            "operation_id",
+            "output_manifest_paths",
+            "phase"
+          ],
+          "properties": {
+            "base_metadata_location": {
+              "description": "Metadata location observed before the rewrite commit.",
+              "type": "string"
+            },
+            "committed_metadata_location": {
+              "description": "Metadata location returned by a proven commit, when known.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "group": {
+              "description": "Canonical tenant/table resource identity.",
+              "type": "string"
+            },
+            "input_manifest_paths": {
+              "description": "Exact ordered manifests replaced by the rewrite.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "forge_manifest_rewrite"
+              ]
+            },
+            "operation_id": {
+              "description": "Deterministic identifier shared by prepared and terminal rows.",
+              "type": "string",
+              "format": "uuid"
+            },
+            "output_manifest_paths": {
+              "description": "Exact ordered manifests written by the rewrite.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "phase": {
+              "description": "Durable phase represented by this audit row.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ForgeManifestRewritePhase"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "description": "One fenced Oracle reader epoch's durable lifecycle transition.\n\nThe epoch is a process fact rather than a tenant fact, so this event is appended under the system owner. Renewal is deliberately absent: it changes only the lease window and revision, and auditing every five seconds would bury the transitions that actually change what Forge may destroy.",
+          "type": "object",
+          "required": [
+            "fencing_token",
+            "kind",
+            "node_id",
+            "phase",
+            "state_revision"
+          ],
+          "properties": {
+            "fencing_token": {
+              "description": "Exact `cluster_nodes` Oracle fence the epoch was acquired under.",
+              "type": "integer",
+              "format": "int64"
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "oracle_reader_epoch"
+              ]
+            },
+            "node_id": {
+              "description": "Physical node holding the epoch.",
+              "type": "string",
+              "format": "uuid"
+            },
+            "phase": {
+              "description": "Durable transition this row records.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/OracleReaderEpochPhase"
+                }
+              ]
+            },
+            "state_revision": {
+              "description": "Revision the committing statement left behind.",
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        },
+        {
+          "description": "One epoch's durable reader protection change for one table.\n\nAppended in the same tenant transaction as the protection rows it describes, so a protection change and its evidence commit or roll back together. An admission already covered by the confirmed frontier emits nothing, because it changes no durable state.",
+          "type": "object",
+          "required": [
+            "fencing_token",
+            "group",
+            "kind",
+            "node_id",
+            "phase",
+            "protected_snapshot_ids",
+            "revision"
+          ],
+          "properties": {
+            "fencing_token": {
+              "description": "Exact Oracle fence of that epoch.",
+              "type": "integer",
+              "format": "int64"
+            },
+            "group": {
+              "description": "Canonical tenant/table resource identity.",
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "oracle_table_protection"
+              ]
+            },
+            "node_id": {
+              "description": "Physical node whose epoch published the protection.",
+              "type": "string",
+              "format": "uuid"
+            },
+            "phase": {
+              "description": "Durable transition this row records.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/OracleTableProtectionPhase"
+                }
+              ]
+            },
+            "protected_snapshot_ids": {
+              "description": "Oldest protected snapshot of every retained chain, sorted ascending.",
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "format": "int64"
+              }
+            },
+            "revision": {
+              "description": "Table-local revision this transition committed.",
+              "type": "integer",
+              "format": "int64"
             }
           }
         },
@@ -1547,39 +1711,6 @@
       "minLength": 7,
       "pattern": "^[0-9a-f]{7,40}$"
     },
-    "ForgeCompactionPhase": {
-      "description": "Durable phase recorded for a Forge compaction operation.",
-      "oneOf": [
-        {
-          "description": "Inputs were hidden before the external Iceberg commit.",
-          "type": "string",
-          "enum": [
-            "prepared"
-          ]
-        },
-        {
-          "description": "The external Iceberg commit completed.",
-          "type": "string",
-          "enum": [
-            "committed"
-          ]
-        },
-        {
-          "description": "Reconciliation recovered a previously completed external commit.",
-          "type": "string",
-          "enum": [
-            "recovered"
-          ]
-        },
-        {
-          "description": "Reconciliation made the exact inputs visible again after expiry.",
-          "type": "string",
-          "enum": [
-            "reset"
-          ]
-        }
-      ]
-    },
     "ForgeIcebergRewritePhase": {
       "description": "Durable phase recorded for a live Iceberg replacement operation.",
       "oneOf": [
@@ -1613,6 +1744,39 @@
         }
       ]
     },
+    "ForgeManifestRewritePhase": {
+      "description": "Durable phase recorded for a Forge metadata-only manifest rewrite.\n\nThe rewrite writes new manifests and then swaps them in with one catalog commit, so it has the same recoverable external boundary as data rewrite: a prepared operation whose commit outcome is unknown is settled by reconciliation into exactly one of `Recovered` or `Reset`.",
+      "oneOf": [
+        {
+          "description": "The exact input and output manifests were fixed before the commit.",
+          "type": "string",
+          "enum": [
+            "prepared"
+          ]
+        },
+        {
+          "description": "The catalog commit completed and returned a metadata location.",
+          "type": "string",
+          "enum": [
+            "committed"
+          ]
+        },
+        {
+          "description": "Reconciliation proved a previously uncertain commit completed.",
+          "type": "string",
+          "enum": [
+            "recovered"
+          ]
+        },
+        {
+          "description": "Reconciliation proved the prepared commit was not applied.",
+          "type": "string",
+          "enum": [
+            "reset"
+          ]
+        }
+      ]
+    },
     "ForgeOrphanGcPhase": {
       "description": "Durable phase recorded for a Forge orphan-GC operation.",
       "oneOf": [
@@ -1639,6 +1803,39 @@
         }
       ]
     },
+    "ForgeScribePromotionPhase": {
+      "description": "Durable phase recorded for a Forge Scribe-promotion operation.",
+      "oneOf": [
+        {
+          "description": "The exact promoted file set was fixed before the catalog append.",
+          "type": "string",
+          "enum": [
+            "prepared"
+          ]
+        },
+        {
+          "description": "The catalog append completed and returned a promotion snapshot.",
+          "type": "string",
+          "enum": [
+            "committed"
+          ]
+        },
+        {
+          "description": "Reconciliation proved a previously uncertain append had completed.",
+          "type": "string",
+          "enum": [
+            "recovered"
+          ]
+        },
+        {
+          "description": "Reconciliation proved the prepared append was not committed.",
+          "type": "string",
+          "enum": [
+            "reset"
+          ]
+        }
+      ]
+    },
     "ForgeSnapshotExpirePhase": {
       "description": "Durable phase recorded for a Forge snapshot-expiry operation.",
       "oneOf": [
@@ -1661,6 +1858,72 @@
           "type": "string",
           "enum": [
             "recovered"
+          ]
+        }
+      ]
+    },
+    "OracleReaderEpochPhase": {
+      "description": "Durable transition recorded for one Oracle reader epoch.\n\n`Retired` is the deletion of the epoch row after its last protection was released, which is what keeps a safely retired epoch from remaining a permanent maintenance root.",
+      "oneOf": [
+        {
+          "description": "The lease was inserted under the node's exact current Oracle fence.",
+          "type": "string",
+          "enum": [
+            "acquired"
+          ]
+        },
+        {
+          "description": "Every dependency was established and the epoch may admit reads.",
+          "type": "string",
+          "enum": [
+            "activated"
+          ]
+        },
+        {
+          "description": "Admission closed and descendants are being joined.",
+          "type": "string",
+          "enum": [
+            "draining"
+          ]
+        },
+        {
+          "description": "The epoch can never renew or admit again.",
+          "type": "string",
+          "enum": [
+            "invalidated"
+          ]
+        },
+        {
+          "description": "The invalidated epoch released every table and its row was deleted.",
+          "type": "string",
+          "enum": [
+            "retired"
+          ]
+        }
+      ]
+    },
+    "OracleTableProtectionPhase": {
+      "description": "Durable transition recorded for one epoch's per-table reader protection.",
+      "oneOf": [
+        {
+          "description": "First protection for the table, or a conservative widening of it.",
+          "type": "string",
+          "enum": [
+            "expanded"
+          ]
+        },
+        {
+          "description": "A narrowing that still protects every remaining active cut.",
+          "type": "string",
+          "enum": [
+            "narrowed"
+          ]
+        },
+        {
+          "description": "The last active cut ended and the protection header was removed.",
+          "type": "string",
+          "enum": [
+            "released"
           ]
         }
       ]

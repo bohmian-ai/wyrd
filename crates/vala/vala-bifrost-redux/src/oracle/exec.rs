@@ -796,6 +796,15 @@ pub(crate) struct OracleIcebergScanExec {
     limit: Option<usize>,
     /// Exact storage-qualified files authorized for this follower request.
     assigned_files: Option<std::collections::BTreeSet<String>>,
+    /// Alternate spellings of the assigned files, keyed by the form a manifest
+    /// may carry and valued by the storage-qualified location it denotes.
+    ///
+    /// A manifest records whichever path its writer wrote — Forge's promotion
+    /// commit records the table-relative object key that `vala.file_list` also
+    /// carries — while an assignment is signed in storage-qualified form. The
+    /// two are the same object, so drift detection has to compare them in one
+    /// spelling or it refuses every promoted file.
+    assigned_aliases: std::collections::BTreeMap<String, String>,
     /// Cached properties copied from the pinned source plan.
     properties: Arc<PlanProperties>,
     /// Shared terminal metric owner retained by query telemetry.
@@ -916,18 +925,39 @@ impl OracleIcebergScanExec {
             predicates: scan.predicates().cloned(),
             limit: scan.limit(),
             assigned_files: None,
+            assigned_aliases: std::collections::BTreeMap::new(),
             properties: Arc::clone(plan.properties()),
             metrics: Arc::new(OracleScanMetricsHandle::default()),
         })
     }
 
     /// Restricts this pinned scan to one exact authenticated follower assignment.
+    ///
+    /// `assigned_aliases` maps every alternate spelling of an assigned path —
+    /// the canonical tenant-relative key and the table-relative suffix — onto
+    /// the storage-qualified location `assigned_files` names, so a manifest
+    /// that records one spelling still resolves to the file the leader signed.
     pub(crate) fn with_assigned_files(
         mut self,
         assigned_files: std::collections::BTreeSet<String>,
+        assigned_aliases: std::collections::BTreeMap<String, String>,
     ) -> Self {
         self.assigned_files = Some(assigned_files);
+        self.assigned_aliases = assigned_aliases;
         self
+    }
+
+    /// Resolves one planned manifest path to the storage-qualified location an
+    /// assignment would name it by.
+    ///
+    /// A path that is already storage-qualified is its own location; any other
+    /// spelling is resolved through the alias map the follower built from the
+    /// signed assignment.
+    fn assignment_location(&self, planned: &str) -> String {
+        self.assigned_aliases
+            .get(planned)
+            .cloned()
+            .unwrap_or_else(|| planned.to_owned())
     }
 
     /// Binds this scan's predicate to the pinned snapshot's schema, for use as
@@ -1020,9 +1050,28 @@ impl OracleIcebergScanExec {
         let tasks = if let Some(assigned) = &self.assigned_files {
             let planned = tasks
                 .iter()
-                .map(|task| task.data_file_path.clone())
+                .map(|task| self.assignment_location(&task.data_file_path))
                 .collect::<std::collections::BTreeSet<_>>();
             if !assigned.is_subset(&planned) {
+                // Counts and the resolved shape only: which objects a tenant
+                // owns must not reach a log line any more than it may reach the
+                // error that crosses the dispatch boundary. The counts are what
+                // separate "the snapshot lost files the leader signed" from
+                // "the two sides spelled the same files differently", which is
+                // the distinction an operator needs and the one this refusal
+                // was previously unable to report at all.
+                metrics::counter!(
+                    "bifrost_oracle_security_events_total",
+                    "event_class" => "assignment_drift"
+                )
+                .increment(1);
+                tracing::warn!(
+                    assigned = assigned.len(),
+                    planned = planned.len(),
+                    unresolved = assigned.difference(&planned).count(),
+                    aliased = self.assigned_aliases.len(),
+                    "Oracle follower assignment differs from the pinned snapshot's planned files"
+                );
                 return Err(DataFusionError::Plan(
                     "authenticated Oracle assignment differs from planned files".to_owned(),
                 ));
@@ -1030,7 +1079,7 @@ impl OracleIcebergScanExec {
             let row_filter = self.assignment_row_filter()?;
             tasks
                 .into_iter()
-                .filter(|task| assigned.contains(&task.data_file_path))
+                .filter(|task| assigned.contains(&self.assignment_location(&task.data_file_path)))
                 .map(|mut task| {
                     task.predicate.clone_from(&row_filter);
                     task
@@ -3954,6 +4003,7 @@ mod tests {
                 scratch_limit_bytes: Some(1024 * 1024 * 1024),
                 effective_cpu: None,
                 oracle_query_slot_limit: None,
+                forge_compaction_memory_limit_bytes: None,
                 scratch_root: std::env::temp_dir(),
                 volume_roots: None,
             },
@@ -5629,6 +5679,7 @@ mod tests {
     ) -> wyrd_spec::vala::api::FollowerScanAssignment {
         wyrd_spec::vala::api::FollowerScanAssignment {
             scan_id: key.scan_id.clone(),
+            reader_cut: wyrd_spec::vala::api::FollowerReaderCut::no_snapshot(uuid::Uuid::nil(), 1),
             binding: wyrd_spec::vala::api::TenantTableBinding {
                 tenant_id: key.tenant,
                 namespace: "traces".to_owned(),

@@ -296,10 +296,16 @@ The 33 conflicts fall into five resolution groups:
   `app/mod.rs`, `boot/mod.rs`, `components/health/mod.rs`, Oracle
   `forwarding.rs`, `state.rs`, and the two Postgres smoke tests keep destination
   topology and receive only required Forge/readiness seams.
-- **Harness and generated output:** deleted `bench_families.rs` and
-  `calibration.rs` stay deleted. `cluster.rs`, `forge_harness.rs`, `mod.rs`,
-  `telemetry.rs`, `server.rs`, and Oracle `distributed.rs` adapt Forge proof to
-  the destination process harness. `wyrd.v1.bin` is regenerated.
+- **Harness and generated output:** deleted `bench_families.rs`,
+  `calibration.rs`, and the source benchmark-only `harness.rs` stay deleted.
+  Destination `process_cluster.rs` and its child-process Oracle topology stay
+  authoritative. Shared `cluster.rs` preserves destination peer and
+  query-resource behavior while adopting the source Forge production-journey
+  seams. The source versions of `forge_harness.rs` and the Forge journey tree
+  are authoritative in full for Forge behavior; they are not reconciled
+  against destination-era Forge mechanics. `mod.rs`, `telemetry.rs`,
+  `server.rs`, and Oracle `distributed.rs` follow their semantic owners.
+  `wyrd.v1.bin` is regenerated.
 
 ### Merge-task precondition
 

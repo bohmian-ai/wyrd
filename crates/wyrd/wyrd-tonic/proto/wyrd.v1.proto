@@ -188,11 +188,24 @@ message ScanLiteral {
   }
 }
 message ScanPredicate { ScanPredicateOp op = 1; string column = 2; ScanLiteral literal = 3; }
+// Exact protected snapshot cut one follower is authorized to read. Required:
+// a follower establishes its own reader protection over this cut before it
+// opens anything, and never borrows the leader's epoch.
+message FollowerReaderCut {
+  bytes table_uid = 1;              // exactly 16 bytes; registered table identity
+  int64 snapshot_id = 2; int64 snapshot_timestamp_ms = 3;
+  int64 retained_head_snapshot_id = 4;
+  repeated int64 ancestry_path = 5; // newest first, head .. snapshot_id
+  uint32 ancestry_digest_version = 6;
+  bytes ancestry_digest = 7;        // exactly 32 bytes
+  uint64 target_epoch_fence = 8;
+}
 message FollowerScanAssignment {
   string scan_id = 1; TenantTableBinding binding = 2;
   PersistedFileAssignment persisted = 3; ScribeProviderCut scribe_provider_cut = 4;
   string schema_fingerprint = 5;
   repeated string required_columns = 6; repeated ScanPredicate predicates = 7;
+  FollowerReaderCut reader_cut = 8;
 }
 message ExecuteFragmentRequest {
   SignedPeerTicket ticket = 1; bytes physical_plan_bytes = 2; bytes reservation_id = 3;

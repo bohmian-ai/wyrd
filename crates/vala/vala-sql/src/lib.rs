@@ -122,7 +122,11 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     /// Query modules that intentionally coordinate cross-tenant operator state.
-    const MIXED_EXECUTOR_QUERY_MODULES: &[&str] = &["forge_tasks.rs", "oracle_admission.rs"];
+    const MIXED_EXECUTOR_QUERY_MODULES: &[&str] = &[
+        "forge_operations.rs",
+        "forge_tasks.rs",
+        "oracle_admission.rs",
+    ];
 
     /// Returns whether a query module is a sanctioned mixed executor owner.
     fn is_mixed_executor_query_module(path: &Path) -> bool {

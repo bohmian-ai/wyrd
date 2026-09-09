@@ -55,6 +55,10 @@ VALA_OPERATOR_ALLOWLIST = {
     # Oracle admission recovery is a bounded global counter reconciliation
     # performed through the operator pool before readiness.
     "crates/vala/vala-sql/src/queries/oracle_admission_operator.rs",
+    # Oracle admission blocks are a cross-tenant capacity ledger fenced by the
+    # Oracle role incarnation, allocated and renewed before any tenant request
+    # is admitted, so the owner runs on the operator pool.
+    "crates/vala/vala-sql/src/queries/oracle_admission.rs",
 }
 
 # Cohesive owners that intentionally expose both cross-tenant OperatorPool
@@ -62,6 +66,10 @@ VALA_OPERATOR_ALLOWLIST = {
 # use a dependency-owning handle; tenant workflows still take TenantConn.
 VALA_MIXED_EXECUTOR_ALLOWLIST = {
     "crates/vala/vala-sql/src/queries/forge_tasks.rs",
+    # Forge operation state: tenant-scoped state reads take a TenantConn, while
+    # the prepare/settle/reset lifecycle runs as one fenced operator
+    # transaction that must lock the table's maintenance-authority row.
+    "crates/vala/vala-sql/src/queries/forge_operations.rs",
 }
 
 # Cohesive owners that expose a narrow tenant-bound capability through a struct
@@ -78,6 +86,19 @@ VALA_TENANT_BOUND_CAPABILITY_ALLOWLIST = {
     "crates/vala/vala-sql/src/queries/audit_outbox.rs",
 }
 
+# Cohesive owners whose capability structs *hold* the caller's `TenantConn`
+# borrow for the lifetime of a multi-statement workflow, instead of taking one
+# per call. The isolation property is unchanged and in fact tighter: every
+# statement such a method issues runs on a tenant-scoped RLS connection the
+# struct cannot outlive, and the borrow keeps the whole workflow inside one
+# tenant transaction. Entries must satisfy the shape rule below: every public
+# async fn is either a method of a struct owning a `TenantConn` field, or a
+# free function taking `OperatorPool` for the bounded read-only cross-tenant
+# recovery enumeration. Every other tenant-query rule still runs unchanged.
+VALA_TENANT_CONN_OWNER_ALLOWLIST = {
+    "crates/vala/vala-sql/src/queries/oracle_reader_authority.rs",
+}
+
 # Vala tables that are intentionally cross-tenant control-plane surfaces with no
 # tenant column and NO RLS (accessed only via the OperatorPool). They are
 # exempt from the RLS-triple requirement because there is no `data_tenant_id`
@@ -88,7 +109,6 @@ VALA_NON_RLS_CONTROL_TABLES = {
     "vala.cluster_nodes",  # cluster-level node registry, not tenant data
     "vala.forge_scheduler_state",  # singleton cross-tenant scheduler fence
     "vala.forge_worker_claim_state",  # singleton cross-tenant worker fairness cursor
-    "vala.forge_large_lane_lease",  # singleton cluster-wide large-task fence
 }
 
 RAW_QUERY_ALLOWLIST_MARKERS = [
@@ -163,9 +183,10 @@ def check_rls_triples(failures: list[str]) -> None:
                 if policy_block is None:
                     continue
 
+                column = re.escape(tenant_column(normalized_window))
                 policy_patterns = [
-                    r"using\s*\(\s*data_tenant_id\s*=\s*wyrd\.current_tenant\(\)\s*\)",
-                    r"with\s+check\s*\(\s*data_tenant_id\s*=\s*wyrd\.current_tenant\(\)\s*\)",
+                    rf"using\s*\(\s*{column}\s*=\s*wyrd\.current_tenant\(\)\s*\)",
+                    rf"with\s+check\s*\(\s*{column}\s*=\s*wyrd\.current_tenant\(\)\s*\)",
                 ]
                 for pattern in policy_patterns:
                     if not re.search(pattern, policy_block, re.IGNORECASE):
@@ -304,6 +325,21 @@ def check_vala_query_modules(failures: list[str]) -> None:
                     failures.append(
                         f"{relative}: mixed-executor public async fn {fn_name} must use an OperatorPool-owning self or take OperatorPool/TenantConn"
                     )
+            continue
+
+        if relative in VALA_TENANT_CONN_OWNER_ALLOWLIST:
+            for fn_name in tenant_conn_owner_violations(code):
+                failures.append(
+                    f"{relative}: public async fn {fn_name} must take &mut TenantConn<'_>, "
+                    "take an OperatorPool, or be a method of the struct owning a TenantConn"
+                )
+            check_tenant_query_file(
+                relative,
+                body,
+                code,
+                failures,
+                exempt_tenant_conn_param=True,
+            )
             continue
 
         if relative in VALA_TENANT_BOUND_CAPABILITY_ALLOWLIST:
@@ -504,6 +540,30 @@ def tenant_table_windows(sql: str, schema: str) -> list[tuple[str, str]]:
     return windows
 
 
+def tenant_column(normalized_window: str) -> str:
+    """Names the tenant column one table's RLS policy must be written against.
+
+    Nearly every tenant table calls the column `data_tenant_id`, and that name
+    wins whenever it is present. A table whose tenant is an ownership role
+    rather than the row's own data tenant names it accordingly — Oracle reader
+    epochs are owned by `epoch_owner_tenant_id` — and the policy has to match
+    the column that actually exists, so the single `*_tenant_id` column the
+    table declares is used instead. The rule itself is unchanged: both policy
+    directions must equal `wyrd.current_tenant()` on that column.
+    """
+    definition_end = normalized_window.find(");")
+    definition = (
+        normalized_window if definition_end == -1 else normalized_window[:definition_end]
+    )
+    declared = set(re.findall(r"\b([a-z_]*tenant_id)\s+uuid\b", definition))
+    if "data_tenant_id" in declared:
+        return "data_tenant_id"
+    candidates = declared
+    if len(candidates) == 1:
+        return candidates.pop()
+    return "data_tenant_id"
+
+
 def tenant_policy_block(normalized_window: str, qualified_table: str) -> str | None:
     policy_match = re.search(
         rf"create\s+policy\s+tenant_isolation\s+on\s+{re.escape(qualified_table)}\b",
@@ -556,11 +616,148 @@ def has_public_async_fn(code: str) -> bool:
 
 
 def public_async_fns(code: str) -> list[tuple[str, str]]:
-    pattern = re.compile(
-        r"pub\s+async\s+fn\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(([^)]*)\)",
-        re.DOTALL,
-    )
-    return pattern.findall(code)
+    return [(name, params) for name, params, _ in _public_async_fn_sites(code)]
+
+
+PUBLIC_ASYNC_FN_RE = re.compile(
+    r"pub\s+async\s+fn\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(([^)]*)\)",
+    re.DOTALL,
+)
+
+TENANT_CONN_FIELD_RE = re.compile(r"&\s*'\w+\s+mut\s+TenantConn\b")
+
+STRUCT_RE = re.compile(r"\bstruct\s+([A-Za-z_][A-Za-z0-9_]*)")
+
+IMPL_RE = re.compile(r"\bimpl\b")
+
+
+def _public_async_fn_sites(code: str) -> list[tuple[str, str, int]]:
+    """Return every public async fn as `(name, parameter text, offset)`."""
+    return [
+        (match.group(1), match.group(2), match.start())
+        for match in PUBLIC_ASYNC_FN_RE.finditer(code)
+    ]
+
+
+def _matching_brace(code: str, opening: int) -> int | None:
+    """Return the index of the `}` closing the `{` at `opening`, if balanced.
+
+    Only brace depth is tracked. Callers pass comment-stripped Rust, and a
+    brace inside a string literal is rare enough in query modules that the
+    depth scan stays the simplest thing that answers "which block encloses
+    this offset" without adding a parser dependency.
+    """
+    depth = 0
+    for index in range(opening, len(code)):
+        char = code[index]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return index
+    return None
+
+
+def _impl_type_name(header: str) -> str | None:
+    """Reduce one `impl` header to the concrete type the block belongs to.
+
+    `impl<'a> Trait for Owner<'a>` and `impl<'a> Owner<'a>` both resolve to
+    `Owner`, because the receiver's authority comes from the type the methods
+    are attached to, never from the trait they satisfy.
+    """
+    header = re.split(r"\bwhere\b", header, maxsplit=1)[0]
+    if " for " in header:
+        header = header.rsplit(" for ", 1)[1]
+    else:
+        header = re.sub(r"^\s*<[^>]*>", "", header)
+    header = header.strip().lstrip("&").strip()
+    header = re.sub(r"<.*$", "", header).strip()
+    name = header.rsplit("::", 1)[-1].strip()
+    return name or None
+
+
+def _impl_blocks(code: str) -> list[tuple[str, int, int]]:
+    """Return `(type name, body start, body end)` for every `impl` block.
+
+    A `-> impl Trait` return position is skipped: its "header" would run past
+    a parenthesis or semicolon before any block brace, which no real `impl`
+    item does.
+    """
+    blocks: list[tuple[str, int, int]] = []
+    for match in IMPL_RE.finditer(code):
+        opening = code.find("{", match.end())
+        if opening == -1:
+            continue
+        header = code[match.end() : opening]
+        if any(token in header for token in "();="):
+            continue
+        closing = _matching_brace(code, opening)
+        if closing is None:
+            continue
+        name = _impl_type_name(header)
+        if name:
+            blocks.append((name, opening, closing))
+    return blocks
+
+
+def _enclosing_impl_type(blocks: list[tuple[str, int, int]], offset: int) -> str | None:
+    """Return the innermost `impl` type whose body contains `offset`."""
+    best: tuple[str, int] | None = None
+    for name, start, end in blocks:
+        if start < offset < end and (best is None or start > best[1]):
+            best = (name, start)
+    return best[0] if best else None
+
+
+def structs_owning_tenant_conn(code: str) -> set[str]:
+    """Return every concrete struct that owns a borrowed `TenantConn` field.
+
+    Ownership is what makes a `self` receiver proof of tenant scope: every
+    statement such a method issues runs on the caller's RLS-bound connection.
+    Both brace and tuple struct bodies are read, and the body is bounded by
+    the struct's own terminator so an unrelated later struct cannot lend it a
+    field it does not have.
+    """
+    owners: set[str] = set()
+    for match in STRUCT_RE.finditer(code):
+        opening = code.find("{", match.end())
+        semicolon = code.find(";", match.end())
+        if opening != -1 and (semicolon == -1 or opening < semicolon):
+            closing = _matching_brace(code, opening)
+            body = code[opening : closing if closing is not None else len(code)]
+        elif semicolon != -1:
+            body = code[match.end() : semicolon]
+        else:
+            continue
+        if TENANT_CONN_FIELD_RE.search(body):
+            owners.add(match.group(1))
+    return owners
+
+
+def tenant_conn_owner_violations(code: str) -> list[str]:
+    """Return public async fns in `code` that prove no tenant-scoped authority.
+
+    A function passes on one of three exact grounds: it takes a
+    `&mut TenantConn<'_>`, it takes an `OperatorPool` for bounded read-only
+    cross-tenant work, or it is a method of the very struct that owns the
+    connection. The last ground is receiver-exact on purpose — an unrelated
+    struct's `&self` in the same module is not evidence of anything.
+    """
+    owners = structs_owning_tenant_conn(code)
+    blocks = _impl_blocks(code)
+    violations: list[str] = []
+    for name, params, offset in _public_async_fn_sites(code):
+        if (
+            "TenantConn<'_" in params
+            or "TenantConn < '_" in params
+            or "OperatorPool" in params
+        ):
+            continue
+        if "self" in params and _enclosing_impl_type(blocks, offset) in owners:
+            continue
+        violations.append(name)
+    return violations
 
 
 def has_platform_executor(code: str) -> bool:

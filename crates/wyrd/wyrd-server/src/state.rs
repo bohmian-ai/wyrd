@@ -205,6 +205,69 @@ impl Drop for ScribeCoordinationRuntime {
     }
 }
 
+/// Sole owner of the dedicated Tokio runtime that hosts Forge compaction runners.
+///
+/// Only admitted compaction plan runners execute here. Everything else the
+/// Forge worker does — durable claims, maintenance strategies, reconciliation,
+/// settlement — stays on the ambient server runtime, so a saturated rewrite
+/// cannot starve the loop that would otherwise settle it.
+///
+/// Ownership follows [`ScribeCoordinationRuntime`] exactly and for the same
+/// reason: consumers hold a [`tokio::runtime::Handle`], this owner holds the
+/// only [`Runtime`], it is deliberately **not** `Clone`, and it is never stored
+/// on a per-request-cloned graph whose last surviving clone would run blocking
+/// [`Runtime::drop`] glue on an async frame.
+///
+/// [`Runtime`]: tokio::runtime::Runtime
+/// [`Runtime::drop`]: tokio::runtime::Runtime
+pub struct ForgeCompactionRuntime {
+    /// The dedicated executor, present only when this process selected the
+    /// Forge worker role.
+    runtime: Option<tokio::runtime::Runtime>,
+}
+
+impl ForgeCompactionRuntime {
+    /// Takes sole ownership of a composed compaction runtime.
+    ///
+    /// `runtime` is `None` for every process that did not select the Forge
+    /// worker role; those targets never build a dedicated executor and their
+    /// owner is an inert value whose drop does nothing.
+    pub(crate) const fn new(runtime: Option<tokio::runtime::Runtime>) -> Self {
+        Self { runtime }
+    }
+
+    /// Returns the handle admitted compaction runners are spawned on.
+    ///
+    /// `None` for a process without the Forge worker role, which never spawns a
+    /// runner in the first place. The handle is cloned out of the owner rather
+    /// than out of the raw runtime so that composition cannot hand a worker an
+    /// executor this owner does not hold, and therefore does not release.
+    pub(crate) fn handle(&self) -> Option<tokio::runtime::Handle> {
+        self.runtime
+            .as_ref()
+            .map(|runtime| runtime.handle().clone())
+    }
+}
+
+impl Drop for ForgeCompactionRuntime {
+    /// Releases the compaction runtime without blocking the dropping thread.
+    ///
+    /// [`tokio::runtime::Runtime::shutdown_background`] detaches the worker
+    /// threads rather than joining them, so it is legal from the async frame
+    /// that `async fn main` forces on the final drop of the composed server.
+    /// Because it does not wait, drop ordering is load-bearing: this owner must
+    /// outlive Forge worker supervision, otherwise a runner that has already
+    /// written output objects and is about to Prepare its operation is
+    /// abandoned mid-flight and leaves durable ambiguity behind. Both
+    /// production (`app::run` drops it after the supervised worker returns) and
+    /// the test harness satisfy that ordering.
+    fn drop(&mut self) {
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_background();
+        }
+    }
+}
+
 /// One composed Bifrost graph paired with the coordination runtime that hosts it.
 ///
 /// `compose_bifrost` produces two values with different ownership rules: the
@@ -217,6 +280,8 @@ pub struct ComposedBifrost {
     pub bifrost: Arc<Bifrost>,
     /// Sole owner of the executor backing the composed Scribe role.
     pub coordination_runtime: ScribeCoordinationRuntime,
+    /// Sole owner of the executor backing admitted Forge compaction runners.
+    pub compaction_runtime: ForgeCompactionRuntime,
 }
 
 /// Existing concrete production controls injected by server journeys.
@@ -717,16 +782,22 @@ async fn run_delegated_continuity_monitor(
     advertise_ready: Arc<AtomicBool>,
     shutdown: CancellationToken,
 ) {
+    let own_loss = || wyrd_spec::vala::api::OracleAdmissionContinuityLost {
+        holder_node_id: registered_role.key.node_id,
+        holder_fencing_token: registered_role.fencing_token,
+    };
+    // The reader epoch's own loss is a continuity loss for this exact fence,
+    // and it is selected before its audited edge commits, so it must reach
+    // this monitor directly rather than waiting for a delegated report that
+    // an epoch fencing itself never produces.
     let loss = tokio::select! {
         () = shutdown.cancelled() => return,
+        () = engine.reader_authority().loss_selected_notify().cancelled() => Some(own_loss()),
         loss = losses.recv() => loss,
     };
     let loss = loss.unwrap_or_else(|| {
         tracing::error!("delegated Oracle continuity channel closed unexpectedly");
-        wyrd_spec::vala::api::OracleAdmissionContinuityLost {
-            holder_node_id: registered_role.key.node_id,
-            holder_fencing_token: registered_role.fencing_token,
-        }
+        own_loss()
     });
     let exact_signal = crate::oracle::close_local_delegated_continuity(
         registered_role.key.node_id,
@@ -1352,14 +1423,16 @@ pub struct Forge {
     coordinator: Option<Arc<ForgeCoordinator>>,
     /// Selected bounded task worker.
     worker: Option<Arc<ForgeWorker>>,
-    /// Root-derived Forge resource capability.
-    resources: vala_bifrost_redux::resources::ForgeResources,
     /// Process lifecycle signal shared by both selected capabilities.
     shutdown: CancellationToken,
     /// Stable physical node identity retained by the selected Forge owner.
     node_id: wyrd_spec::vala::api::NodeId,
     /// Set only after every supervised Forge task joins before the process deadline.
     supervision_drained: Arc<AtomicBool>,
+    /// Coordinator readiness published by the supervised planning loop.
+    coordinator_ready: vala_bifrost_redux::forge::ForgeRoleReadiness,
+    /// Worker readiness published only after durable recovery completes.
+    worker_ready: vala_bifrost_redux::forge::ForgeRoleReadiness,
 }
 
 impl Forge {
@@ -1368,18 +1441,30 @@ impl Forge {
     pub fn new(
         coordinator: Option<Arc<ForgeCoordinator>>,
         worker: Option<Arc<ForgeWorker>>,
-        resources: vala_bifrost_redux::resources::ForgeResources,
         shutdown: CancellationToken,
         node_id: wyrd_spec::vala::api::NodeId,
     ) -> Self {
         Self {
             coordinator,
             worker,
-            resources,
             shutdown,
             node_id,
             supervision_drained: Arc::new(AtomicBool::new(false)),
+            coordinator_ready: vala_bifrost_redux::forge::ForgeRoleReadiness::detached(),
+            worker_ready: vala_bifrost_redux::forge::ForgeRoleReadiness::detached(),
         }
+    }
+
+    /// Returns the handle the supervised coordinator loop publishes into.
+    #[must_use]
+    pub fn coordinator_readiness(&self) -> vala_bifrost_redux::forge::ForgeRoleReadiness {
+        self.coordinator_ready.clone()
+    }
+
+    /// Returns the handle the supervised worker loop publishes into.
+    #[must_use]
+    pub fn worker_readiness(&self) -> vala_bifrost_redux::forge::ForgeRoleReadiness {
+        self.worker_ready.clone()
     }
 
     /// Borrows the selected coordinator.
@@ -1394,14 +1479,21 @@ impl Forge {
         self.worker.as_ref()
     }
 
-    /// Returns the root-derived Forge resource capability.
+    /// Borrows the token every selected Forge capability stops on.
     #[must_use]
-    pub fn resources(&self) -> vala_bifrost_redux::resources::ForgeResources {
-        self.resources.clone()
+    pub const fn shutdown_token(&self) -> &CancellationToken {
+        &self.shutdown
     }
 
     /// Signals selected Forge capabilities to stop accepting work.
+    ///
+    /// Routing closes before the token is cancelled: a role that is losing its
+    /// authority must stop being advertised on `/readyz` ahead of the loops
+    /// noticing, and the close is terminal so a loop still running cannot
+    /// republish readiness on its way out.
     pub fn begin_shutdown(&self) {
+        self.coordinator_ready.close();
+        self.worker_ready.close();
         self.shutdown.cancel();
     }
 
@@ -1753,13 +1845,15 @@ impl Bifrost {
     }
 
     /// Returns the shared root-health signal through one selected role capability.
+    ///
+    /// Forge is not a source here: it holds no memory or scratch capability, so
+    /// a Forge-only target has no root ledger to report on.
     #[must_use]
     pub fn resource_health(&self) -> Option<vala_bifrost_redux::resources::BifrostResourceHealth> {
         self.scribe
             .as_ref()
             .map(|scribe| scribe.resources.health())
             .or_else(|| self.oracle.as_ref().map(|oracle| oracle.resources.health()))
-            .or_else(|| self.forge.as_ref().map(|forge| forge.resources.health()))
     }
 
     /// Dispatches one authorized SQL request through Gate into the selected Oracle.
@@ -2387,6 +2481,55 @@ mod tests {
 
     use crate::postgres::ServerPostgres;
 
+    /// The compaction runtime is a single non-`Clone` owner with a nonblocking drop.
+    ///
+    /// Both halves are load-bearing. Non-`Clone` is what keeps the executor out
+    /// of the per-request-cloned state graph, where the last surviving clone
+    /// would decide when it dies. A nonblocking drop is what makes that death
+    /// legal from the async frame `async fn main` forces on final teardown,
+    /// where a joining `Runtime::drop` would panic instead.
+    ///
+    /// # Panics
+    ///
+    /// Panics when dropping the owner blocks, or when the inert Forge-absent
+    /// owner is not equally safe to drop.
+    #[test]
+    fn forge_compaction_runtime_shutdowns_background_on_drop() {
+        /// Compile-time proof the owner cannot be cloned into the state graph.
+        const fn assert_not_clone<T>() {}
+        assert_not_clone::<super::ForgeCompactionRuntime>();
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("dedicated compaction runtime builds");
+        let owner = super::ForgeCompactionRuntime::new(Some(runtime));
+        assert!(
+            owner.handle().is_some(),
+            "a composed owner must hand runners a handle"
+        );
+        // A worker thread parked in a long blocking call is exactly the state a
+        // joining drop would wait on, so it is the state this drop must not.
+        owner
+            .handle()
+            .expect("composed handle")
+            .spawn_blocking(|| std::thread::sleep(std::time::Duration::from_secs(30)));
+        let started = std::time::Instant::now();
+        drop(owner);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "dropping the compaction runtime must detach its threads, not join them"
+        );
+
+        let absent = super::ForgeCompactionRuntime::new(None);
+        assert!(
+            absent.handle().is_none(),
+            "a process without the Forge worker role has no executor to hand out"
+        );
+        drop(absent);
+    }
+
     /// Durable registry failure cannot skip local continuity settlement.
     #[tokio::test]
     async fn delegated_continuity_registry_failure_still_settles_local_work() {
@@ -2490,20 +2633,34 @@ mod tests {
         assert!(state.production_validate().is_ok());
     }
 
-    /// A production target that serves no public API keeps its stub defaults.
+    /// The production stub rule applies exactly to processes that serve the API.
     ///
-    /// The dedicated Forge worker composes no Gate, authentication, or Oracle
-    /// peer, so the serving-surface guards below `serves_api` do not describe
-    /// it. The stub policy hook this shell carries is therefore accepted, and
-    /// the refusal it would otherwise produce is proved against a composed,
-    /// API-serving state in `tests/pg_router_smoke.rs`.
+    /// The shell fixture carries the stub policy hook the rule refuses, so the
+    /// only reason it validates on a production profile is the dedicated-worker
+    /// carve-out: a process with no Scribe and no Oracle exposes no public
+    /// surface for a stub hook to decide anything on. Asserting both halves is
+    /// what keeps the carve-out from silently becoming a hole — if `serves_api`
+    /// ever reports true for this shell, the stub hook must start failing it.
+    ///
+    /// The serving half of the rule needs a state with a real Scribe or Oracle
+    /// owner and is proven where such a state exists, not in this unit tier.
     #[tokio::test]
-    async fn production_validate_accepts_a_non_serving_production_target() {
+    async fn production_validate_applies_the_stub_rule_only_to_serving_processes() {
         let state = test_state()
             .await
             .with_deployment_profile(crate::config::DeploymentProfile::Production);
-        assert!(!state.bifrost.serves_api());
-        assert!(state.production_validate().is_ok());
+        assert!(
+            state.authz.policy_hook.is_stub_default(),
+            "the shell fixture carries the stub hook the production rule refuses"
+        );
+        assert!(
+            !state.bifrost.serves_api(),
+            "the shell composes no Scribe and no Oracle, so it serves no public surface"
+        );
+        assert!(
+            state.production_validate().is_ok(),
+            "a process that serves no public surface is not refused for a stub hook"
+        );
     }
 
     #[tokio::test]

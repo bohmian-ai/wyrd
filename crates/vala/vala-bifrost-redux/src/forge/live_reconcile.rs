@@ -8,22 +8,24 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use vala_sql::queries::forge_operations::ForgeOperations;
 use vala_sql::row_types::forge_operations::{ForgeOperationFamily, ForgeOperationStateRow};
+use vala_sql::row_types::forge_tasks::ForgeTaskStrategy;
 use wyrd_spec::vala::api::{AuditDetail, ForgeIcebergRewritePhase, StoragePath};
 
 use super::Forge;
-use super::binpack::ForgeGroupKey;
+use super::compact::ForgeGroupKey;
 use super::compact::ForgeTableKey;
 use super::error::ForgeError;
 use super::lease::ForgeLease;
-use super::metrics::RewritePathContract;
+use super::metrics::ForgeTelemetry;
 use super::path::catalog_path_to_object_key;
 use crate::catalog::TenantTableBinding;
 use crate::catalog::layout::TimePartition;
 
 /// Whether later table stages may perform destructive maintenance.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum DestructiveMaintenance {
     /// All bounded prepared work has terminal proof.
+    #[default]
     Allowed,
     /// Uncertain or incomplete work requires destructive stages to stop.
     Blocked,
@@ -40,7 +42,7 @@ pub(crate) struct IcebergReconciliationOutcome {
     pub pending: usize,
     /// Operations with canonical but inconclusive evidence.
     pub unresolved: usize,
-    /// Whether the open-operation query found a cap sentinel.
+    /// Whether an open operation was still present after the walk.
     ///
     /// Gated to `test-support`: the only reader is the
     /// `LiveReconciliationTestOutcome` projection, which is itself
@@ -99,6 +101,42 @@ struct RetainedSnapshotObservation {
     forge_operation_id: Option<Uuid>,
     /// Canonical Forge group recorded with the operation identity.
     forge_group: Option<String>,
+    /// Exact rewrite volume this snapshot's validated properties declare.
+    ///
+    /// Present only for a snapshot that carries a complete, well-typed Forge
+    /// rewrite property set. Recovery reports throughput from these canonical
+    /// counts rather than restating object storage, so no metric path stats
+    /// objects.
+    rewrite_volume: Option<RecoveredRewriteVolume>,
+}
+
+/// Exact file and byte counts one committed rewrite snapshot declares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct RecoveredRewriteVolume {
+    /// Live data files the commit removed.
+    pub(super) removed_data_files: u64,
+    /// Total bytes of the removed data files.
+    pub(super) removed_bytes: u64,
+    /// Data files the commit added.
+    pub(super) added_data_files: u64,
+    /// Total bytes of the added data files.
+    pub(super) added_bytes: u64,
+}
+
+/// What classifying one Prepared operation settled, for its owning caller.
+///
+/// Classification proves a fact; it does not own what that fact means. The
+/// table-wide walk owns recovered throughput and reports it; a retained
+/// attempt owns its own indexed outcome and reports nothing here. Returning the
+/// settlement instead of emitting it is what lets both callers use the same
+/// classifier without one of them double-counting the other's volume.
+pub(super) enum ForgeLiveSettlement {
+    /// The replacement is live; the value is the volume its snapshot declared.
+    Recovered(Option<RecoveredRewriteVolume>),
+    /// The replacement is provably absent and the operation is closed.
+    Reset,
+    /// Nothing is proven yet; the operation stays open.
+    Prepared,
 }
 
 /// Parsed and normalized fields from one prepared live-rewrite detail.
@@ -197,41 +235,7 @@ impl Forge {
         let resource = ForgeGroupKey::table_audit_resource(key.tenant, &key.table_ref);
         let operations = ForgeOperations::new(&resource, ForgeOperationFamily::IcebergRewrite)
             .map_err(ForgeError::Sql)?;
-        let mut conn = self
-            .core
-            .vala
-            .tenant_conn(key.tenant)
-            .await
-            .map_err(ForgeError::Sql)?;
-        let page = operations
-            .list_open(&mut conn, self.core.config.max_open_operations_per_table)
-            .await
-            .map_err(ForgeError::Sql)?;
-        conn.commit().await.map_err(ForgeError::Sql)?;
-        if page.overflowed {
-            return Ok(IcebergReconciliationOutcome {
-                recovered: 0,
-                reset: 0,
-                pending: 0,
-                unresolved: 0,
-                #[cfg(feature = "test-support")]
-                overflowed: true,
-                protected_output_paths: BTreeSet::new(),
-                destructive_maintenance: DestructiveMaintenance::Blocked,
-            });
-        }
-        if page.operations.is_empty() {
-            return Ok(IcebergReconciliationOutcome {
-                recovered: 0,
-                reset: 0,
-                pending: 0,
-                unresolved: 0,
-                #[cfg(feature = "test-support")]
-                overflowed: false,
-                protected_output_paths: BTreeSet::new(),
-                destructive_maintenance: DestructiveMaintenance::Allowed,
-            });
-        }
+        let cap = self.core.config.max_open_operations_per_table;
         let mut outcome = IcebergReconciliationOutcome {
             recovered: 0,
             reset: 0,
@@ -242,28 +246,119 @@ impl Forge {
             protected_output_paths: BTreeSet::new(),
             destructive_maintenance: DestructiveMaintenance::Allowed,
         };
-        for row in page.operations {
-            let observation_a = self.observe_retained_manifests(binding, stop).await?;
-            let observation_b = self.observe_retained_manifests(binding, stop).await?;
-            self.classify_live_operation(
-                LiveClassificationContext {
-                    lease,
-                    key,
-                    binding,
-                    stop,
-                    now,
-                    observation_a: &observation_a,
-                    observation_b: &observation_b,
-                },
-                &row,
-                &mut outcome,
-            )
+        // Paged rather than capped: one attempt now opens an operation per
+        // published plan, so a table can legitimately hold more open rows than
+        // one page. A keyset walk advances past every row it has classified —
+        // including the ones it could not resolve — so a table with more open
+        // work than a page still gets every operation looked at exactly once.
+        let mut cursor = None;
+        loop {
+            let page = self
+                .open_rewrite_operations(key, &operations, cap, cursor)
+                .await?;
+            let Some(last) = page.operations.last() else {
+                break;
+            };
+            let next = (last.prepared_at, last.operation_id);
+            for row in page.operations {
+                let observation_a = self.observe_retained_manifests(binding, stop).await?;
+                let observation_b = self.observe_retained_manifests(binding, stop).await?;
+                let settled = self
+                    .classify_live_operation(
+                        LiveClassificationContext {
+                            lease,
+                            key,
+                            binding,
+                            stop,
+                            now,
+                            observation_a: &observation_a,
+                            observation_b: &observation_b,
+                        },
+                        &row,
+                        &mut outcome,
+                    )
+                    .await?;
+                // No local attempt owns a table-wide recovery, so this walk is
+                // the one place that recovered volume is reported.
+                Self::record_recovered_volume(&settled);
+            }
+            cursor = Some(next);
+            if !page.overflowed {
+                break;
+            }
+        }
+        // One recheck of the first page closes the walk. Every operation this
+        // pass proved is gone from it, so anything the recheck still returns is
+        // either work this pass could not settle or work a concurrent owner
+        // opened underneath it — both of which must block destructive
+        // maintenance rather than be assumed absent.
+        let remaining = self
+            .open_rewrite_operations(key, &operations, cap, None)
             .await?;
+        if !remaining.operations.is_empty() {
+            #[cfg(feature = "test-support")]
+            {
+                outcome.overflowed = true;
+            }
+            outcome.destructive_maintenance = DestructiveMaintenance::Blocked;
         }
         if outcome.pending > 0 || outcome.unresolved > 0 {
             outcome.destructive_maintenance = DestructiveMaintenance::Blocked;
         }
         Ok(outcome)
+    }
+
+    /// Reports one table-wide recovery's declared volume, if it measured any.
+    ///
+    /// Split out because it is the only emission the reconciliation walk owns:
+    /// a caller that already holds the operation's exact request volume must
+    /// not call it.
+    fn record_recovered_volume(settled: &ForgeLiveSettlement) {
+        let ForgeLiveSettlement::Recovered(Some(volume)) = settled else {
+            return;
+        };
+        ForgeTelemetry::record_input(
+            ForgeTaskStrategy::SmallFiles,
+            volume.removed_data_files,
+            volume.removed_bytes,
+        );
+        ForgeTelemetry::record_output(
+            ForgeTaskStrategy::SmallFiles,
+            volume.added_data_files,
+            volume.added_bytes,
+        );
+    }
+
+    /// Reads one bounded page of this table's open rewrite operations.
+    ///
+    /// Split out because the walk reads the same page twice for different
+    /// reasons — once to classify and once to recheck — and each read owns its
+    /// own short tenant transaction so a long classification never holds one
+    /// open across catalog IO.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Sql`] when the tenant connection, the bounded
+    /// listing, or its commit fails.
+    async fn open_rewrite_operations(
+        &self,
+        key: &ForgeTableKey,
+        operations: &ForgeOperations<'_>,
+        cap: usize,
+        after: Option<(DateTime<Utc>, uuid::Uuid)>,
+    ) -> Result<vala_sql::row_types::forge_operations::OpenForgeOperationPage, ForgeError> {
+        let mut conn = self
+            .core
+            .vala
+            .tenant_conn(key.tenant)
+            .await
+            .map_err(ForgeError::Sql)?;
+        let page = operations
+            .list_open(&mut conn, cap, after)
+            .await
+            .map_err(ForgeError::Sql)?;
+        conn.commit().await.map_err(ForgeError::Sql)?;
+        Ok(page)
     }
 
     /// Reconcile one binding through the production owner for integration tests.
@@ -343,6 +438,8 @@ impl Forge {
                 .map(String::as_str);
             let (forge_operation_id, forge_group) =
                 parse_snapshot_forge_identity(workflow, operation, group)?;
+            let rewrite_volume =
+                forge_operation_id.and_then(|_| recovered_rewrite_volume(snapshot));
             let list = table
                 .manifest_list_reader(snapshot)
                 .load()
@@ -378,6 +475,7 @@ impl Forge {
                         live_data_paths,
                         forge_operation_id,
                         forge_group,
+                        rewrite_volume,
                     },
                 )
                 .is_some()
@@ -429,6 +527,10 @@ impl Forge {
 
     /// Classify and, when proven, terminally transition one Prepared row.
     ///
+    /// Returns the settlement it proved so the caller that owns this operation
+    /// can act on it. Nothing is emitted here: an owning caller that already
+    /// holds the operation's exact volume would otherwise count it twice.
+    ///
     /// # Errors
     ///
     /// Returns malformed evidence, catalog, storage, cancellation, fence, or
@@ -438,7 +540,7 @@ impl Forge {
         context: LiveClassificationContext<'_>,
         row: &ForgeOperationStateRow,
         outcome: &mut IcebergReconciliationOutcome,
-    ) -> Result<(), ForgeError> {
+    ) -> Result<ForgeLiveSettlement, ForgeError> {
         let prepared = parse_prepared(row, context.key)?;
         if prepared.partition_spec_id != context.observation_a.partition_spec_id
             || prepared.partition_spec_id != context.observation_b.partition_spec_id
@@ -462,16 +564,11 @@ impl Forge {
         let young = context.now.signed_duration_since(row.prepared_at) < uncertainty;
         match classify_evidence(&evidence, young) {
             LiveDisposition::Recovered(snapshot_id) => {
-                let volume = self
-                    .measure_rewrite_volume(
-                        RewritePathContract::Catalog {
-                            binding: context.binding,
-                            table_location: &context.observation_b.table_location,
-                        },
-                        &prepared.input_paths,
-                        &prepared.output_paths,
-                    )
-                    .await?;
+                let volume = context
+                    .observation_b
+                    .snapshots
+                    .get(&snapshot_id)
+                    .and_then(|snapshot| snapshot.rewrite_volume);
                 Self::require_running(context.stop)?;
                 context
                     .lease
@@ -496,34 +593,25 @@ impl Forge {
                     )?,
                 )
                 .await?;
-                self.core.telemetry.record_operation(
-                    super::metrics::ForgeMetricSource::Iceberg,
-                    super::metrics::ForgeOperationResult::Recovered,
-                    1,
-                );
-                self.core.telemetry.record_rewrite_volume(
-                    super::metrics::ForgeMetricSource::Iceberg,
-                    volume.input_files,
-                    volume.input_bytes,
-                    volume.output_files,
-                    volume.output_bytes,
-                );
                 outcome.recovered = outcome.recovered.saturating_add(1);
+                Ok(ForgeLiveSettlement::Recovered(volume))
             }
             LiveDisposition::Pending => {
                 protect(outcome, evidence.outputs);
                 outcome.pending = outcome.pending.saturating_add(1);
+                Ok(ForgeLiveSettlement::Prepared)
             }
             LiveDisposition::Reset => {
                 self.apply_live_reset(context, row, &group_key, evidence.outputs, outcome)
                     .await?;
+                Ok(ForgeLiveSettlement::Reset)
             }
             LiveDisposition::Unresolved => {
                 protect(outcome, evidence.outputs);
                 outcome.unresolved = outcome.unresolved.saturating_add(1);
+                Ok(ForgeLiveSettlement::Prepared)
             }
         }
-        Ok(())
     }
 
     /// Terminally reset one proven abandoned operation for delayed orphan GC.
@@ -565,11 +653,6 @@ impl Forge {
             iceberg_terminal_detail(&row.prepared_detail, ForgeIcebergRewritePhase::Reset, None)?,
         )
         .await?;
-        self.core.telemetry.record_operation(
-            super::metrics::ForgeMetricSource::Iceberg,
-            super::metrics::ForgeOperationResult::Reset,
-            1,
-        );
         outcome.reset = outcome.reset.saturating_add(1);
         Ok(())
     }
@@ -864,6 +947,31 @@ fn iceberg_terminal_detail(
     })
 }
 
+/// Reads the canonical rewrite volume a published snapshot recorded, if any.
+///
+/// Recovery must report the same file and byte counts the original commit did,
+/// so the numbers come from the snapshot's own validated rewrite properties
+/// rather than from a fresh scan. A snapshot that carries no valid rewrite
+/// property set reports nothing.
+fn recovered_rewrite_volume(
+    snapshot: &iceberg::spec::SnapshotRef,
+) -> Option<RecoveredRewriteVolume> {
+    let properties: BTreeMap<_, _> = snapshot
+        .summary()
+        .additional_properties
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    super::publication::RewriteSnapshotProperties::validate(&properties)
+        .ok()
+        .map(|properties| RecoveredRewriteVolume {
+            removed_data_files: properties.removed_data_files,
+            removed_bytes: properties.removed_bytes,
+            added_data_files: properties.added_data_files,
+            added_bytes: properties.added_bytes,
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1093,7 +1201,7 @@ mod tests {
             .find("for row in page.operations")
             .expect("operation loop exists");
         let classify_position = source[loop_position..]
-            .find("self.classify_live_operation")
+            .find(".classify_live_operation")
             .expect("classification follows observations");
         let loop_body = &source[loop_position..loop_position + classify_position];
         assert_eq!(loop_body.matches("observe_retained_manifests").count(), 2);

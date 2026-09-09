@@ -30,7 +30,7 @@ pub async fn build_catalog<S: std::hash::BuildHasher>(
     SqlCatalogBuilder::default()
         .with_storage_factory(storage_factory)
         .load(
-            "wyrd-redux",
+            super::BIFROST_CATALOG_NAME,
             [
                 (
                     iceberg_catalog_sql::SQL_CATALOG_PROP_URI.to_owned(),

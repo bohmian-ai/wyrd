@@ -38,8 +38,6 @@ const MIB: usize = 1024 * 1024;
 pub const MIN_UNMANAGED_RESERVE_BYTES: usize = 256 * MIB;
 /// Protected memory floor for each enabled stateful serving role.
 pub const ROLE_MEMORY_FLOOR_BYTES: usize = 256 * MIB;
-/// Minimum elastic memory required for one executable Forge rewrite.
-pub const FORGE_MEMORY_FLOOR_BYTES: usize = 64 * MIB;
 /// Filesystem free space that disposable query spill never consumes.
 pub const MIN_SCRATCH_FREE_BYTES: u64 = 256 * MIB as u64;
 /// Largest `DataFusion` memory ceiling any single Oracle query may be granted.
@@ -183,6 +181,14 @@ pub struct BifrostResourcePolicy {
     pub scratch_limit_bytes: Option<u64>,
     /// Optional effective CPU cap; it may only reduce detection.
     pub effective_cpu: Option<usize>,
+    /// Optional absolute Forge compaction admission budget in bytes.
+    ///
+    /// `None` selects `floor(memory_limit_bytes * 4 / 5)`. Unlike the memory
+    /// and CPU caps this is a deliberate capacity decision by the deployment
+    /// rather than a detected process bound, so it may raise as well as reduce
+    /// the derived value — but never past what the protected Scribe and Oracle
+    /// floors leave free, which refuses boot instead of clamping.
+    pub forge_compaction_memory_limit_bytes: Option<usize>,
     /// Optional explicit Oracle query slot-unit concurrency limit.
     ///
     /// `None` defaults to twice effective CPU, never below
@@ -225,8 +231,6 @@ pub struct BifrostVolumeRoots {
     pub scribe_stage: PathBuf,
     /// Process-owned Scribe output scratch namespace.
     pub scribe_output_scratch: PathBuf,
-    /// Forge attempt scratch root.
-    pub forge_scratch: PathBuf,
     /// Oracle query scratch root.
     pub oracle_scratch: PathBuf,
 }
@@ -240,8 +244,6 @@ pub enum BifrostVolumeClass {
     ScribeStage,
     /// Disposable Scribe persistence output.
     ScribeOutput,
-    /// Disposable Forge rewrite data.
-    Forge,
     /// Disposable Oracle query spill.
     Oracle,
 }
@@ -253,7 +255,6 @@ impl BifrostVolumeClass {
             Self::Wal => "wal",
             Self::ScribeStage => "scribe_stage",
             Self::ScribeOutput => "scribe_output",
-            Self::Forge => "forge",
             Self::Oracle => "oracle",
         }
     }
@@ -271,7 +272,6 @@ impl BifrostVolumeClass {
     const fn role(self) -> &'static str {
         match self {
             Self::Wal | Self::ScribeStage | Self::ScribeOutput => "scribe",
-            Self::Forge => "forge",
             Self::Oracle => "oracle",
         }
     }
@@ -423,7 +423,6 @@ impl BifrostVolumeGovernor {
                 BifrostVolumeClass::ScribeOutput,
                 roots.scribe_output_scratch,
             ),
-            (BifrostVolumeClass::Forge, roots.forge_scratch),
             (BifrostVolumeClass::Oracle, roots.oracle_scratch),
         ];
         let mut registered = BTreeMap::new();
@@ -484,7 +483,6 @@ impl BifrostVolumeGovernor {
             BifrostVolumeClass::Wal,
             BifrostVolumeClass::ScribeStage,
             BifrostVolumeClass::ScribeOutput,
-            BifrostVolumeClass::Forge,
             BifrostVolumeClass::Oracle,
         ] {
             metrics::gauge!(
@@ -516,10 +514,6 @@ impl BifrostVolumeGovernor {
             scribe_output: ScratchVolume {
                 governor: self.clone(),
                 class: BifrostVolumeClass::ScribeOutput,
-            },
-            forge: ScratchVolume {
-                governor: self.clone(),
-                class: BifrostVolumeClass::Forge,
             },
             oracle: ScratchVolume {
                 governor: self.clone(),
@@ -686,8 +680,6 @@ pub struct BifrostVolumeCapabilities {
     pub scribe_stage: StageVolume,
     /// Scribe output-scratch capability.
     pub scribe_output: ScratchVolume,
-    /// Forge scratch capability.
-    pub forge: ScratchVolume,
     /// Oracle scratch capability.
     pub oracle: ScratchVolume,
 }
@@ -1413,9 +1405,14 @@ pub struct ResourcePlan {
     pub scribe_floor_bytes: usize,
     /// Protected Oracle floor, or zero when Oracle is inactive.
     pub oracle_floor_bytes: usize,
-    /// Protected Forge floor, or zero when Forge is inactive.
-    pub forge_floor_bytes: usize,
-    /// Memory available after every enabled role's protected floor.
+    /// Immutable Forge compaction admission budget, zero when Forge is absent.
+    ///
+    /// Reserved once here rather than leased live: the worker-local queue
+    /// charges its running plans against this one figure, so there is no second
+    /// Forge accounting path in the shared governor to disagree with it.
+    pub forge_compaction_memory_limit_bytes: usize,
+    /// Memory available after every enabled role's protected floor and the
+    /// reserved Forge compaction budget.
     pub elastic_memory_bytes: usize,
     /// Disposable scratch bytes available after the filesystem floor.
     pub scratch_limit_bytes: u64,
@@ -1573,14 +1570,10 @@ pub struct ResourceSnapshot {
     pub scribe_memory_used_bytes: usize,
     /// Total live Oracle ownership, including its protected floor.
     pub oracle_memory_used_bytes: usize,
-    /// Total live Forge ownership, including its protected floor.
-    pub forge_memory_used_bytes: usize,
-    /// Elastic memory held by Oracle or Forge.
+    /// Elastic memory held by Oracle.
     pub elastic_memory_used_bytes: usize,
-    /// Disposable scratch held by Oracle or Forge.
+    /// Disposable scratch held by Oracle.
     pub scratch_used_bytes: u64,
-    /// Concurrent Forge input-reader permits held by active rewrites.
-    pub forge_reader_permits_used: usize,
     /// Aggregate number of live Oracle query owners.
     pub oracle_active_queries: u32,
     /// Live interactive Oracle query owners.
@@ -1698,10 +1691,8 @@ impl OracleWorkerClass {
 struct ResourceState {
     scribe_memory_used_bytes: usize,
     oracle_memory_used_bytes: usize,
-    forge_memory_used_bytes: usize,
     elastic_memory_used_bytes: usize,
     scratch_used_bytes: u64,
-    forge_reader_permits_used: usize,
     oracle_active_queries: u32,
     oracle_interactive_queries: u32,
     oracle_analytical_queries: u32,
@@ -1849,6 +1840,8 @@ impl BifrostRuntimeResources {
         scratch_limit_bytes: u64,
         roles: impl IntoIterator<Item = BifrostRole>,
     ) -> BifrostRoleResources {
+        let roles: BTreeSet<BifrostRole> = roles.into_iter().collect();
+        let forge_compaction_memory_limit_bytes = forge_budget_for_test(&roles);
         let scratch_available_bytes = scratch_limit_bytes
             .checked_add(MIN_SCRATCH_FREE_BYTES)
             .expect("injected scratch observation must not overflow");
@@ -1862,12 +1855,13 @@ impl BifrostRuntimeResources {
                 cpu_source: ResourceSource::Injected,
             },
             BifrostResourcePolicy {
-                roles: roles.into_iter().collect(),
+                roles,
                 memory_limit_bytes: None,
                 unmanaged_reserve_bytes: None,
                 scratch_limit_bytes: Some(scratch_limit_bytes),
                 effective_cpu: None,
                 oracle_query_slot_limit: None,
+                forge_compaction_memory_limit_bytes,
                 scratch_root: PathBuf::new(),
                 volume_roots: None,
             },
@@ -1905,13 +1899,6 @@ impl BifrostRuntimeResources {
                 governor: self.governor.clone(),
                 volumes: self.volumes.clone(),
             }),
-            forge: self
-                .governor
-                .is_enabled(BifrostRole::Forge)
-                .then(|| ForgeResources {
-                    governor: self.governor.clone(),
-                    volumes: self.volumes.clone(),
-                }),
             governor: self.governor.clone(),
             transport: self.transport.clone(),
             volumes: self.volumes.clone(),
@@ -1949,7 +1936,6 @@ impl BifrostRuntimeResources {
 pub struct BifrostRoleResources {
     scribe: Option<ScribeResources>,
     oracle: Option<OracleResources>,
-    forge: Option<ForgeResources>,
     governor: BifrostResourceGovernor,
     /// Process-wide encoded body owner shared by HTTP and tonic surfaces.
     transport: crate::gate::limits::BifrostTransportAdmission,
@@ -1985,12 +1971,6 @@ impl BifrostRoleResources {
     #[must_use]
     pub fn oracle(&self) -> Option<OracleResources> {
         self.oracle.clone()
-    }
-
-    /// Returns the Forge capability when the role is enabled.
-    #[must_use]
-    pub fn forge(&self) -> Option<ForgeResources> {
-        self.forge.clone()
     }
 
     /// Returns the immutable checked plan shared by every issued capability.
@@ -2092,8 +2072,7 @@ impl ScribeResources {
             bifrost_limit_bytes: plan.managed_memory_bytes,
             bifrost_total_bytes: state
                 .scribe_memory_used_bytes
-                .saturating_add(state.oracle_memory_used_bytes)
-                .saturating_add(state.forge_memory_used_bytes),
+                .saturating_add(state.oracle_memory_used_bytes),
             scribe_total_bytes: state.scribe_memory_used_bytes,
             scribe_limit_bytes: self.limit_bytes(),
             oracle_total_bytes: state.oracle_memory_used_bytes,
@@ -2462,95 +2441,10 @@ impl OracleResources {
     }
 }
 
-/// Exact bounded Forge rewrite demand derived from validated durable estimates.
-///
-/// A request is only ever formed from estimates that already passed planner
-/// capacity validation. Configuration ceilings bound a request; they are never
-/// themselves the requested demand.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ForgeRewriteRequest {
-    /// Authoritative persisted per-term envelope.
-    pub envelope: vala_sql::row_types::forge_tasks::ForgeTaskEnvelope,
-    /// Exact rewrite working-memory demand in bytes.
-    pub memory_bytes: usize,
-    /// Exact disposable spill demand in bytes.
-    pub scratch_bytes: u64,
-    /// Concurrent input readers reserved before any source object is opened.
-    pub reader_permits: u16,
-}
-
-/// Closed result of finalizing one exact Forge rewrite lease.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ForgeResourceReleaseResult {
-    /// Every leased counter returned to the root governor exactly once.
-    Released,
-    /// Accounting was made fail-closed and the leased counters were retained.
-    Poisoned,
-}
-
-/// Sole issuer of Forge rewrite leases against the shared process root.
-#[derive(Debug, Clone)]
-pub struct ForgeResources {
-    governor: BifrostResourceGovernor,
-    /// Physical Forge scratch authority registered during live boot.
-    volumes: Option<BifrostVolumeGovernor>,
-}
-
-impl ForgeResources {
-    /// Returns the shared process resource-health lifecycle signal.
-    #[must_use]
-    pub fn health(&self) -> BifrostResourceHealth {
-        self.governor.inner.health.clone()
-    }
-    /// Atomically acquires the exact requested rewrite memory and scratch.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BifrostResourceError::Occupied`] without partial ownership
-    /// when either counter does not fit currently free capacity.
-    pub fn try_acquire_rewrite(
-        &self,
-        request: ForgeRewriteRequest,
-    ) -> Result<ForgeRewriteResources, BifrostResourceError> {
-        let mut resources = self.governor.try_acquire_forge(
-            request.memory_bytes,
-            request.scratch_bytes,
-            request.reader_permits,
-        )?;
-        if let Some(volumes) = &self.volumes {
-            let capabilities = volumes.capabilities();
-            resources.volume_scratch = Some(capabilities.forge.try_acquire(request.scratch_bytes)?);
-        }
-        Ok(resources)
-    }
-
-    /// Captures exact live ownership for inspection and cleanup assertions.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BifrostResourceError::Poisoned`] when a trustworthy live
-    /// snapshot is unavailable.
-    pub fn snapshot(&self) -> Result<ResourceSnapshot, BifrostResourceError> {
-        self.governor.snapshot()
-    }
-
-    /// Reports whether `other` was issued from this exact process root.
-    #[must_use]
-    pub fn shares_root_with(&self, other: &BifrostRoleResources) -> bool {
-        Arc::ptr_eq(&self.governor.inner, &other.governor.inner)
-    }
-}
-
 #[derive(Debug)]
 struct ResourceGovernorInner {
     plan: ResourcePlan,
     sources: ResolvedResourceSources,
-    /// Exact roles activated by the checked policy stage.
-    ///
-    /// Forge carries no protected memory floor, so the plan alone cannot report
-    /// whether the role is enabled. Role composition reads this set instead of
-    /// re-deriving activation from floor bytes.
-    roles: BTreeSet<BifrostRole>,
     state: Mutex<ResourceState>,
     /// Lost-wakeup-safe notification paired with `ResourceState::memory_epoch`.
     memory_changed: Notify,
@@ -2570,15 +2464,123 @@ struct ResourceGovernorInner {
 /// the platform's addressable memory range.
 fn role_memory_floors(
     roles: &BTreeSet<BifrostRole>,
-) -> Result<(usize, usize, usize, usize), BifrostResourceError> {
+) -> Result<(usize, usize, usize), BifrostResourceError> {
     let scribe = usize::from(roles.contains(&BifrostRole::Scribe)) * ROLE_MEMORY_FLOOR_BYTES;
     let oracle = usize::from(roles.contains(&BifrostRole::Oracle)) * ROLE_MEMORY_FLOOR_BYTES;
-    let forge = usize::from(roles.contains(&BifrostRole::Forge)) * FORGE_MEMORY_FLOOR_BYTES;
-    let protected = scribe
-        .checked_add(oracle)
-        .and_then(|bytes| bytes.checked_add(forge))
+    let protected = scribe.checked_add(oracle).ok_or_else(accounting_overflow)?;
+    Ok((scribe, oracle, protected))
+}
+
+/// One executable rewrite working set, the budget test observations name.
+///
+/// The production default is four fifths of the memory limit and is
+/// deliberately unclamped, so a node that also protects the Scribe and Oracle
+/// floors cannot afford it and refuses to plan — exactly as a real co-located
+/// deployment does until it configures one. A test observation therefore names
+/// this figure instead, which is the smallest budget on which one rewrite can
+/// execute and is what every constitutional topology floor asserted below is
+/// the sum of.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) const FORGE_TEST_BUDGET_BYTES: usize = 64 * MIB;
+
+/// The Forge budget a test observation must name to plan at all.
+///
+/// `None` when Forge is not enabled, where the production path fixes the budget
+/// at zero. The budget arithmetic itself is pinned by
+/// `forge_compaction_budget_preserves_role_floors` against explicit policies,
+/// never through this helper.
+#[cfg(any(test, feature = "test-support"))]
+fn forge_budget_for_test(roles: &BTreeSet<BifrostRole>) -> Option<usize> {
+    roles
+        .contains(&BifrostRole::Forge)
+        .then_some(FORGE_TEST_BUDGET_BYTES)
+}
+
+/// Resolves the disposable scratch budget and the availability it was cut from.
+///
+/// The configured limit never raises detected capacity, and the filesystem
+/// floor is reserved before anything is offered, so a full disk yields zero
+/// rather than a negative figure. Oracle cannot plan against zero disposable
+/// scratch, so that combination refuses the plan here instead of failing at
+/// the first spill. The second returned figure is the post-floor availability
+/// the caller records as the plan's scratch source evidence.
+///
+/// # Errors
+///
+/// Returns [`BifrostResourceError::InvalidPlan`] when availability cannot
+/// preserve the filesystem floor, or when Oracle is enabled and no disposable
+/// scratch remains after it.
+fn scratch_budget(
+    snapshot: &SystemResourceSnapshot,
+    policy: &BifrostResourcePolicy,
+) -> Result<(u64, u64), BifrostResourceError> {
+    let configured_scratch = policy
+        .scratch_limit_bytes
+        .map_or(snapshot.scratch_capacity_bytes, |limit| {
+            limit.min(snapshot.scratch_capacity_bytes)
+        });
+    let available_after_floor = snapshot
+        .scratch_available_bytes
+        .checked_sub(MIN_SCRATCH_FREE_BYTES)
+        .ok_or_else(|| BifrostResourceError::InvalidPlan {
+            detail: format!(
+                "scratch availability {} cannot preserve filesystem floor {MIN_SCRATCH_FREE_BYTES}",
+                snapshot.scratch_available_bytes
+            ),
+        })?;
+    let scratch_limit_bytes = configured_scratch.min(available_after_floor);
+    if policy.roles.contains(&BifrostRole::Oracle) && scratch_limit_bytes == 0 {
+        return Err(BifrostResourceError::InvalidPlan {
+            detail: "Oracle requires positive disposable scratch after the filesystem floor"
+                .to_owned(),
+        });
+    }
+    Ok((scratch_limit_bytes, available_after_floor))
+}
+
+/// Resolves the immutable Forge compaction budget and the elastic remainder.
+///
+/// The default is four fifths of the resolved process memory, which is the
+redacted
+/// worker. `safe_bytes` is what remains after the protected Scribe and Oracle
+/// floors, so a dedicated Forge pod and a co-located `All` pod use one formula
+/// while `All` still cannot spend either protected floor.
+///
+/// There is deliberately no clamp. A budget that does not fit is a deployment
+/// that asked for something the pod cannot honour, and silently shrinking it
+/// would let an operator believe Forge was admitted memory it never had.
+///
+/// # Errors
+///
+/// Returns [`BifrostResourceError::InvalidPlan`] when the default computation
+/// overflows, or when Forge is enabled and the selected budget is zero or
+/// exceeds `safe_bytes`.
+fn forge_compaction_budget(
+    forge_enabled: bool,
+    memory_limit_bytes: usize,
+    safe_bytes: usize,
+    override_bytes: Option<usize>,
+) -> Result<(usize, usize), BifrostResourceError> {
+    if !forge_enabled {
+        return Ok((0, safe_bytes));
+    }
+    let default_bytes = memory_limit_bytes
+        .checked_mul(4)
+        .ok_or_else(accounting_overflow)?
+        / 5;
+    let selected = override_bytes.unwrap_or(default_bytes);
+    if selected == 0 || selected > safe_bytes {
+        return Err(BifrostResourceError::InvalidPlan {
+            detail: format!(
+                "Forge compaction memory budget {selected} must be positive and at most \
+                 the {safe_bytes} bytes left by the protected Scribe and Oracle floors"
+            ),
+        });
+    }
+    let elastic = safe_bytes
+        .checked_sub(selected)
         .ok_or_else(accounting_overflow)?;
-    Ok((scribe, oracle, forge, protected))
+    Ok((selected, elastic))
 }
 
 impl BifrostResourceGovernor {
@@ -2617,31 +2619,21 @@ impl BifrostResourceGovernor {
                     "memory {memory_limit_bytes} cannot cover reserve {unmanaged_reserve_bytes}"
                 ),
             })?;
-        let (scribe_floor_bytes, oracle_floor_bytes, forge_floor_bytes, protected) =
+        let (scribe_floor_bytes, oracle_floor_bytes, protected) =
             role_memory_floors(&policy.roles)?;
-        let elastic_memory_bytes = managed_memory_bytes.checked_sub(protected).ok_or_else(|| {
-            BifrostResourceError::InvalidPlan {
-                detail: format!("managed memory {managed_memory_bytes} cannot cover enabled role floors {protected}"),
-            }
-        })?;
-        let configured_scratch = policy
-            .scratch_limit_bytes
-            .map_or(snapshot.scratch_capacity_bytes, |limit| {
-                limit.min(snapshot.scratch_capacity_bytes)
-            });
-        let available_after_floor = snapshot
-            .scratch_available_bytes
-            .checked_sub(MIN_SCRATCH_FREE_BYTES)
-            .ok_or_else(|| BifrostResourceError::InvalidPlan {
-                detail: format!("scratch availability {} cannot preserve filesystem floor {MIN_SCRATCH_FREE_BYTES}", snapshot.scratch_available_bytes),
+        let safe_forge_budget_bytes =
+            managed_memory_bytes.checked_sub(protected).ok_or_else(|| {
+                BifrostResourceError::InvalidPlan {
+                    detail: format!("managed memory {managed_memory_bytes} cannot cover enabled role floors {protected}"),
+                }
             })?;
-        let scratch_limit_bytes = configured_scratch.min(available_after_floor);
-        if policy.roles.contains(&BifrostRole::Oracle) && scratch_limit_bytes == 0 {
-            return Err(BifrostResourceError::InvalidPlan {
-                detail: "Oracle requires positive disposable scratch after the filesystem floor"
-                    .to_owned(),
-            });
-        }
+        let (forge_compaction_memory_limit_bytes, elastic_memory_bytes) = forge_compaction_budget(
+            policy.roles.contains(&BifrostRole::Forge),
+            memory_limit_bytes,
+            safe_forge_budget_bytes,
+            policy.forge_compaction_memory_limit_bytes,
+        )?;
+        let (scratch_limit_bytes, available_after_floor) = scratch_budget(&snapshot, &policy)?;
         drop(policy.scratch_root);
         let root = Self {
             inner: Arc::new(ResourceGovernorInner {
@@ -2653,7 +2645,7 @@ impl BifrostResourceGovernor {
                     managed_memory_bytes,
                     scribe_floor_bytes,
                     oracle_floor_bytes,
-                    forge_floor_bytes,
+                    forge_compaction_memory_limit_bytes,
                     elastic_memory_bytes,
                     scratch_limit_bytes,
                 },
@@ -2682,7 +2674,6 @@ impl BifrostResourceGovernor {
                         ResourceSource::Filesystem
                     },
                 },
-                roles: policy.roles,
                 state: Mutex::new(ResourceState::default()),
                 memory_changed: Notify::new(),
                 cgroup_limit_bytes: crate::scribe::memory::read_cgroup_limit(),
@@ -2694,12 +2685,6 @@ impl BifrostResourceGovernor {
         Ok(root)
     }
 
-    /// Reports whether the checked policy stage activated `role`.
-    #[must_use]
-    pub(crate) fn is_enabled(&self, role: BifrostRole) -> bool {
-        self.inner.roles.contains(&role)
-    }
-
     /// Publishes immutable closed-role memory and scratch plan gauges.
     fn record_plan_metrics(&self) {
         let plan = self.plan();
@@ -2707,7 +2692,11 @@ impl BifrostResourceGovernor {
             ("unmanaged", "memory", plan.unmanaged_reserve_bytes),
             ("scribe", "memory", plan.scribe_floor_bytes),
             ("oracle", "memory", plan.oracle_floor_bytes),
-            ("forge", "memory", plan.forge_floor_bytes),
+            (
+                "forge_compaction",
+                "memory",
+                plan.forge_compaction_memory_limit_bytes,
+            ),
             ("elastic", "memory", plan.elastic_memory_bytes),
         ];
         for (role, resource, bytes) in planned {
@@ -2774,10 +2763,8 @@ impl BifrostResourceGovernor {
             plan: self.plan(),
             scribe_memory_used_bytes: state.scribe_memory_used_bytes,
             oracle_memory_used_bytes: state.oracle_memory_used_bytes,
-            forge_memory_used_bytes: state.forge_memory_used_bytes,
             elastic_memory_used_bytes: state.elastic_memory_used_bytes,
             scratch_used_bytes: state.scratch_used_bytes,
-            forge_reader_permits_used: state.forge_reader_permits_used,
             oracle_active_queries: state.oracle_active_queries,
             oracle_interactive_queries: state.oracle_interactive_queries,
             oracle_analytical_queries: state.oracle_analytical_queries,
@@ -2831,7 +2818,6 @@ impl BifrostResourceGovernor {
         let role_total = state
             .scribe_memory_used_bytes
             .checked_add(state.oracle_memory_used_bytes)
-            .and_then(|bytes| bytes.checked_add(state.forge_memory_used_bytes))
             .ok_or_else(accounting_overflow)?;
         let plan = self.plan();
         let expected_elastic = state
@@ -2842,13 +2828,6 @@ impl BifrostResourceGovernor {
                     .oracle_memory_used_bytes
                     .saturating_sub(plan.oracle_floor_bytes),
             )
-            .and_then(|bytes| {
-                bytes.checked_add(
-                    state
-                        .forge_memory_used_bytes
-                        .saturating_sub(plan.forge_floor_bytes),
-                )
-            })
             .ok_or_else(accounting_overflow)?;
         if category_total != state.scribe_memory_used_bytes
             || shard_total > state.scribe_memory_used_bytes
@@ -2903,10 +2882,8 @@ impl BifrostResourceGovernor {
             .set(as_f64(snapshot.plan.oracle_floor_bytes));
         metrics::gauge!("bifrost_resource_memory_bytes", "kind" => "oracle_used")
             .set(as_f64(snapshot.oracle_memory_used_bytes));
-        metrics::gauge!("bifrost_resource_memory_bytes", "kind" => "forge_floor")
-            .set(as_f64(snapshot.plan.forge_floor_bytes));
-        metrics::gauge!("bifrost_resource_memory_bytes", "kind" => "forge_used")
-            .set(as_f64(snapshot.forge_memory_used_bytes));
+        metrics::gauge!("bifrost_resource_memory_bytes", "kind" => "forge_compaction_budget")
+            .set(as_f64(snapshot.plan.forge_compaction_memory_limit_bytes));
         metrics::gauge!("bifrost_resource_scratch_bytes", "kind" => "total").set(
             snapshot
                 .plan
@@ -3266,73 +3243,6 @@ impl BifrostResourceGovernor {
             bytes,
             governor: self.clone(),
             released: false,
-        })
-    }
-
-    /// Atomically acquires exact Forge elastic memory and scratch ownership.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BifrostResourceError::Occupied`] without partial ownership when
-    /// either request exceeds currently free capacity.
-    pub(crate) fn try_acquire_forge(
-        &self,
-        memory_bytes: usize,
-        scratch_bytes: u64,
-        reader_permits: u16,
-    ) -> Result<ForgeRewriteResources, BifrostResourceError> {
-        let mut state = self.lock_state()?;
-        let plan = self.plan();
-        if plan.forge_floor_bytes == 0 {
-            return Err(BifrostResourceError::InvalidPlan {
-                detail: "Forge resources requested while the role is inactive".to_owned(),
-            });
-        }
-        let next_forge = state
-            .forge_memory_used_bytes
-            .checked_add(memory_bytes)
-            .ok_or_else(accounting_overflow)?;
-        let prior_borrow = state
-            .forge_memory_used_bytes
-            .saturating_sub(plan.forge_floor_bytes);
-        let next_borrow = next_forge.saturating_sub(plan.forge_floor_bytes);
-        let added_elastic = next_borrow - prior_borrow;
-        let next_memory = state
-            .elastic_memory_used_bytes
-            .checked_add(added_elastic)
-            .ok_or_else(accounting_overflow)?;
-        let next_scratch = state
-            .scratch_used_bytes
-            .checked_add(scratch_bytes)
-            .ok_or_else(accounting_overflow)?;
-        let next_readers = state
-            .forge_reader_permits_used
-            .checked_add(usize::from(reader_permits))
-            .ok_or_else(accounting_overflow)?;
-        if reader_permits == 0
-            || next_memory > plan.elastic_memory_bytes
-            || next_scratch > plan.scratch_limit_bytes
-            || next_readers > plan.effective_cpu
-        {
-            record_memory_transition("forge", "refused", state.forge_memory_used_bytes);
-            return Err(BifrostResourceError::Occupied {
-                detail: "Forge request exceeds currently free memory, scratch, or reader permits"
-                    .to_owned(),
-            });
-        }
-        state.elastic_memory_used_bytes = next_memory;
-        state.forge_memory_used_bytes = next_forge;
-        state.scratch_used_bytes = next_scratch;
-        state.forge_reader_permits_used = next_readers;
-        record_memory_transition("forge", "acquired", next_forge);
-        Ok(ForgeRewriteResources {
-            memory_bytes,
-            scratch_bytes,
-            reader_permits: usize::from(reader_permits),
-            memory_pool: bounded_memory_pool(memory_bytes),
-            governor: self.clone(),
-            release_result: None,
-            volume_scratch: None,
         })
     }
 
@@ -4443,128 +4353,6 @@ impl Drop for OracleQueryResources {
     }
 }
 
-/// Rewrite-lifetime exact elastic memory and scratch owner.
-#[derive(Debug)]
-pub struct ForgeRewriteResources {
-    memory_bytes: usize,
-    scratch_bytes: u64,
-    /// Reader permits coupled to this exact attempt lease.
-    reader_permits: usize,
-    /// Operation-local pool nested inside this exact root lease.
-    memory_pool: Arc<dyn MemoryPool>,
-    governor: BifrostResourceGovernor,
-    /// First terminal release result, retained for idempotent finalization.
-    release_result: Option<ForgeResourceReleaseResult>,
-    /// Exact physical Forge scratch ownership when live roots are registered.
-    volume_scratch: Option<ScratchLease>,
-}
-
-impl ForgeRewriteResources {
-    /// Returns the operation-local pool backed by this retained root lease.
-    #[must_use]
-    pub fn memory_pool(&self) -> Arc<dyn MemoryPool> {
-        Arc::clone(&self.memory_pool)
-    }
-
-    /// Returns the exact scratch ceiling retained by this operation lease.
-    #[must_use]
-    pub fn scratch_bytes(&self) -> u64 {
-        self.scratch_bytes
-    }
-
-    /// Splits one named memory child from this admitted rewrite pool.
-    ///
-    /// # Errors
-    ///
-    /// Returns `DataFusion` resource exhaustion when existing rewrite children
-    /// leave insufficient capacity. This method never admits root capacity.
-    pub(crate) fn try_split_memory(
-        &self,
-        consumer: &'static str,
-        bytes: usize,
-    ) -> Result<ForgeRewriteMemoryReservation, DataFusionError> {
-        let reservation = MemoryConsumer::new(consumer).register(&self.memory_pool);
-        reservation.try_grow(bytes)?;
-        Ok(ForgeRewriteMemoryReservation {
-            _reservation: reservation,
-        })
-    }
-
-    /// Explicitly releases the complete lease exactly once.
-    ///
-    /// # Errors
-    /// Returns a poisoned-accounting error when counters cannot be returned atomically.
-    pub(crate) fn release(&mut self) -> Result<ForgeResourceReleaseResult, BifrostResourceError> {
-        if let Some(result) = self.release_result {
-            return Ok(result);
-        }
-        let mut state = match self.governor.lock_state() {
-            Ok(state) => state,
-            Err(error) => {
-                self.release_result = Some(ForgeResourceReleaseResult::Poisoned);
-                return Err(error);
-            }
-        };
-        let plan = self.governor.plan();
-        let released_elastic = released_elastic_bytes(
-            state.forge_memory_used_bytes,
-            plan.forge_floor_bytes,
-            self.memory_bytes,
-        );
-        if state.forge_memory_used_bytes < self.memory_bytes
-            || state.elastic_memory_used_bytes < released_elastic
-            || state.scratch_used_bytes < self.scratch_bytes
-            || state.forge_reader_permits_used < self.reader_permits
-        {
-            self.release_result = Some(ForgeResourceReleaseResult::Poisoned);
-            return Err(self
-                .governor
-                .poison_locked(&mut state, "Forge release underflow"));
-        }
-        state.forge_memory_used_bytes -= self.memory_bytes;
-        state.elastic_memory_used_bytes -= released_elastic;
-        state.scratch_used_bytes -= self.scratch_bytes;
-        state.forge_reader_permits_used -= self.reader_permits;
-        state.memory_epoch = state.memory_epoch.wrapping_add(1);
-        record_memory_transition("forge", "released", state.forge_memory_used_bytes);
-        self.volume_scratch.take();
-        self.release_result = Some(ForgeResourceReleaseResult::Released);
-        drop(state);
-        self.governor.inner.memory_changed.notify_waiters();
-        Ok(ForgeResourceReleaseResult::Released)
-    }
-
-    /// Poisons the governor while deliberately retaining all leased counters.
-    pub(crate) fn poison_without_release(&mut self) -> ForgeResourceReleaseResult {
-        if let Some(result) = self.release_result {
-            return result;
-        }
-        self.governor
-            .poison("Forge runtime survived its attempt resource owner");
-        self.release_result = Some(ForgeResourceReleaseResult::Poisoned);
-        ForgeResourceReleaseResult::Poisoned
-    }
-}
-
-/// Rewrite-local memory child split from one already admitted Forge attempt.
-#[derive(Debug)]
-pub(crate) struct ForgeRewriteMemoryReservation {
-    /// Exact child registered in the attempt-local `DataFusion` pool.
-    _reservation: MemoryReservation,
-}
-
-impl Drop for ForgeRewriteResources {
-    /// Releases both Forge counters exactly once and poisons on underflow.
-    fn drop(&mut self) {
-        if self.release_result.is_some() {
-            return;
-        }
-        if let Err(error) = self.release() {
-            tracing::error!(%error, "Forge resource cleanup failed");
-        }
-    }
-}
-
 /// Computes the ceiling on execution partitions an admitted query may use.
 ///
 /// Parallelism is driven by CPU and by how much of the pinned input is remote:
@@ -5178,26 +4966,11 @@ mod tests {
         assert!(parquet_options.enable_page_index);
     }
 
-    /// Returns a valid envelope for resource-ledger tests that do not execute it.
-    fn envelope() -> vala_sql::row_types::forge_tasks::ForgeTaskEnvelope {
-        vala_sql::row_types::forge_tasks::ForgeTaskEnvelope {
-            version: vala_sql::row_types::forge_tasks::FORGE_ENVELOPE_VERSION,
-            reader_permits: 1,
-            decoded_batch_bytes: MIB as u64,
-            decoded_input_bytes: MIB as u64,
-            sort_working_bytes: 3 * MIB as u64,
-            sort_merge_reservation_bytes: MIB as u64,
-            encoder_buffer_bytes: 2 * MIB as u64,
-            upload_chunk_bytes: MIB as u64,
-            footer_encoded_bytes: 8 * MIB as u64,
-            footer_decode_workspace_bytes: 32 * MIB as u64,
-            sort_spill_bytes: MIB as u64,
-        }
-    }
-
     fn policy(roles: &[BifrostRole]) -> BifrostResourcePolicy {
+        let roles: BTreeSet<BifrostRole> = roles.iter().copied().collect();
         BifrostResourcePolicy {
-            roles: roles.iter().copied().collect(),
+            forge_compaction_memory_limit_bytes: forge_budget_for_test(&roles),
+            roles,
             memory_limit_bytes: None,
             unmanaged_reserve_bytes: None,
             scratch_limit_bytes: None,
@@ -5318,7 +5091,6 @@ mod tests {
             "the role capability projects the sole root plan"
         );
         assert!(roles.oracle().is_some());
-        assert!(roles.forge().is_none());
         assert_eq!(runtime.sources().memory, ResourceSource::Injected);
     }
 
@@ -5705,9 +5477,8 @@ mod tests {
         let wal = temp.path().join("wal");
         let stage_root = temp.path().join("scribe-stage");
         let scribe = temp.path().join("scribe-output-scratch");
-        let forge = temp.path().join("forge");
         let oracle = temp.path().join("oracle");
-        for path in [&wal, &stage_root, &scribe, &forge, &oracle] {
+        for path in [&wal, &stage_root, &scribe, &oracle] {
             fs::create_dir(path).expect("registered volume root");
         }
         fs::write(wal.join("retained.wal"), [0_u8; 16]).expect("retained WAL fixture");
@@ -5717,7 +5488,6 @@ mod tests {
                 wal,
                 scribe_stage: stage_root,
                 scribe_output_scratch: scribe,
-                forge_scratch: forge,
                 oracle_scratch: oracle,
             },
             80,
@@ -5730,11 +5500,11 @@ mod tests {
                 .wal
                 .try_reserve_growth(32)
                 .expect("provisional WAL growth");
-            assert!(capabilities.forge.try_acquire(33).is_err());
+            assert!(capabilities.oracle.try_acquire(33).is_err());
             drop(provisional);
         }
         let scratch = capabilities
-            .forge
+            .oracle
             .try_acquire(64)
             .expect("retained WAL plus exact-limit scratch succeeds");
         assert!(capabilities.oracle.try_acquire(1).is_err());
@@ -5759,9 +5529,8 @@ mod tests {
         let wal = temp.path().join("wal");
         let stage_root = temp.path().join("scribe-stage");
         let scribe = temp.path().join("scribe-output-scratch");
-        let forge = temp.path().join("forge");
         let oracle = temp.path().join("oracle");
-        for path in [&wal, &stage_root, &scribe, &forge, &oracle] {
+        for path in [&wal, &stage_root, &scribe, &oracle] {
             fs::create_dir(path).expect("registered volume root");
         }
         let governor = BifrostVolumeGovernor::register(
@@ -5769,7 +5538,6 @@ mod tests {
                 wal,
                 scribe_stage: stage_root,
                 scribe_output_scratch: scribe,
-                forge_scratch: forge,
                 oracle_scratch: oracle,
             },
             64,
@@ -5796,7 +5564,7 @@ mod tests {
                 } else {
                     governor
                         .capabilities()
-                        .forge
+                        .oracle
                         .try_acquire(64)
                         .map(|owner| Box::new(owner) as Box<dyn std::any::Any>)
                 };
@@ -5829,9 +5597,8 @@ mod tests {
         let wal = temp.path().join("wal");
         let stage_root = wal.join("scribe-stage");
         let scribe = wal.join("scribe-output-scratch");
-        let forge = wal.join("forge");
         let oracle = wal.join("oracle");
-        for path in [&wal, &stage_root, &scribe, &forge, &oracle] {
+        for path in [&wal, &stage_root, &scribe, &oracle] {
             fs::create_dir_all(path).expect("registered volume root");
         }
         let retained_wal = wal.join("retained.wal");
@@ -5847,7 +5614,6 @@ mod tests {
                 wal,
                 scribe_stage: stage_root,
                 scribe_output_scratch: scribe.clone(),
-                forge_scratch: forge,
                 oracle_scratch: oracle,
             },
             1024,
@@ -5889,9 +5655,8 @@ mod tests {
         let wal = temp.path().join("wal");
         let stage_root = wal.join("scribe-stage");
         let scribe = wal.join("scribe-output-scratch");
-        let forge = wal.join("forge");
         let oracle = wal.join("oracle");
-        for path in [&wal, &stage_root, &scribe, &forge, &oracle] {
+        for path in [&wal, &stage_root, &scribe, &oracle] {
             fs::create_dir_all(path).expect("registered volume root");
         }
         let health = BifrostResourceHealth::default();
@@ -5900,7 +5665,6 @@ mod tests {
                 wal,
                 scribe_stage: stage_root,
                 scribe_output_scratch: scribe,
-                forge_scratch: forge,
                 oracle_scratch: oracle,
             },
             1024,
@@ -6004,9 +5768,8 @@ mod tests {
             let wal = temp.path().join("wal");
             let stage_root = temp.path().join("scribe-stage");
             let scribe = temp.path().join("scribe-output-scratch");
-            let forge = temp.path().join("forge");
             let oracle_root = temp.path().join("oracle");
-            for path in [&wal, &stage_root, &scribe, &forge, &oracle_root] {
+            for path in [&wal, &stage_root, &scribe, &oracle_root] {
                 fs::create_dir(path).expect("registered volume root");
             }
             let volumes = BifrostVolumeGovernor::register(
@@ -6014,14 +5777,13 @@ mod tests {
                     wal,
                     scribe_stage: stage_root,
                     scribe_output_scratch: scribe,
-                    forge_scratch: forge,
                     oracle_scratch: oracle_root,
                 },
                 64,
                 BifrostResourceHealth::default(),
             )
             .expect("volume plan");
-            let capability = volumes.capabilities().forge;
+            let capability = volumes.capabilities().oracle;
             let scratch = capability.try_acquire(64).expect("volume grant");
             assert!(capability.try_acquire(1).is_err());
             drop(scratch);
@@ -6040,7 +5802,7 @@ mod tests {
             "result=\"acquired\"",
             "result=\"refused\"",
             "result=\"released\"",
-            "volume_class=\"forge\"",
+            "volume_class=\"oracle\"",
             "bifrost_resource_current_bytes",
         ] {
             assert!(
@@ -6065,12 +5827,11 @@ mod tests {
         let wal = disk.path().join("wal");
         let stage_root = disk.path().join("scribe-stage");
         let scribe = disk.path().join("scribe-output-scratch");
-        let forge = disk.path().join("forge");
         let oracle = memory.path().join("oracle");
-        for path in [&wal, &stage_root, &scribe, &forge, &oracle] {
+        for path in [&wal, &stage_root, &scribe, &oracle] {
             fs::create_dir(path).expect("registered volume root");
         }
-        if fs::metadata(&forge).expect("Forge metadata").dev()
+        if fs::metadata(&scribe).expect("Scribe metadata").dev()
             == fs::metadata(&oracle).expect("Oracle metadata").dev()
             || filesystem_available_bytes(&oracle)
                 .map_or(true, |available| available < MIN_SCRATCH_FREE_BYTES + 64)
@@ -6082,7 +5843,6 @@ mod tests {
                 wal,
                 scribe_stage: stage_root,
                 scribe_output_scratch: scribe,
-                forge_scratch: forge,
                 oracle_scratch: oracle,
             },
             64,
@@ -6090,17 +5850,17 @@ mod tests {
         )
         .expect("distinct roots register");
         let capabilities = governor.capabilities();
-        let forge_lease = capabilities
-            .forge
+        let scribe_lease = capabilities
+            .scribe_output
             .try_acquire(64)
-            .expect("Forge consumes its device boundary");
+            .expect("Scribe output consumes its device boundary");
         let oracle_lease = capabilities
             .oracle
             .try_acquire(64)
             .expect("Oracle independently consumes its device boundary");
-        assert!(capabilities.forge.try_acquire(1).is_err());
+        assert!(capabilities.scribe_output.try_acquire(1).is_err());
         assert!(capabilities.oracle.try_acquire(1).is_err());
-        drop((forge_lease, oracle_lease));
+        drop((scribe_lease, oracle_lease));
     }
 
     /// Enabled roles alone receive protected floors and elastic arithmetic is exact.
@@ -6108,25 +5868,31 @@ mod tests {
     fn resource_plan_reserves_only_enabled_role_floors() {
         let gib = 1024 * MIB;
         let cases = [
-            (&[BifrostRole::Oracle][..], 0, 256 * MIB, 0, 512 * MIB),
-            (&[BifrostRole::Scribe][..], 256 * MIB, 0, 0, 512 * MIB),
-            (&[BifrostRole::Forge][..], 0, 0, 64 * MIB, 704 * MIB),
+            (&[BifrostRole::Oracle][..], 0, 256 * MIB, 512 * MIB),
+            (&[BifrostRole::Scribe][..], 256 * MIB, 0, 512 * MIB),
+            // Forge protects no floor, but its budget is reserved out of the
+            // same managed memory, so the elastic remainder is what the
+            // observation's budget leaves rather than the whole of it.
+            (
+                &[BifrostRole::Forge][..],
+                0,
+                0,
+                768 * MIB - FORGE_TEST_BUDGET_BYTES,
+            ),
             (
                 &[BifrostRole::Scribe, BifrostRole::Oracle][..],
                 256 * MIB,
                 256 * MIB,
-                0,
                 256 * MIB,
             ),
         ];
-        for (roles, scribe, oracle, forge, elastic) in cases {
+        for (roles, scribe, oracle, elastic) in cases {
             let runtime = BifrostRuntimeResources::from_snapshot(snapshot(gib), policy(roles))
                 .expect("resource plan must fit");
             let plan = runtime.plan();
             assert_eq!(plan.managed_memory_bytes, 768 * MIB);
             assert_eq!(plan.scribe_floor_bytes, scribe);
             assert_eq!(plan.oracle_floor_bytes, oracle);
-            assert_eq!(plan.forge_floor_bytes, forge);
             assert_eq!(plan.elastic_memory_bytes, elastic);
         }
     }
@@ -6164,10 +5930,8 @@ mod tests {
                 plan: roles.plan(),
                 scribe_memory_used_bytes: 0,
                 oracle_memory_used_bytes: 0,
-                forge_memory_used_bytes: 0,
                 elastic_memory_used_bytes: 0,
                 scratch_used_bytes: 0,
-                forge_reader_permits_used: 0,
                 oracle_active_queries: 0,
                 oracle_interactive_queries: 0,
                 oracle_analytical_queries: 0,
@@ -6364,36 +6128,6 @@ mod tests {
         assert!(!roles.snapshot().expect("snapshot").oracle_query_active);
     }
 
-    /// Forge's runtime pool remains nested in and bounded by its retained lease.
-    #[test]
-    fn forge_harness_pool_is_issued_by_operation_lease() {
-        let roles = BifrostRuntimeResources::composed_for_test(
-            1024 * MIB,
-            512 * MIB as u64,
-            [BifrostRole::Forge],
-        );
-        let forge = roles.forge().expect("Forge capability");
-        let lease = forge
-            .try_acquire_rewrite(ForgeRewriteRequest {
-                envelope: envelope(),
-                memory_bytes: 128 * MIB,
-                scratch_bytes: 64 * MIB as u64,
-                reader_permits: 1,
-            })
-            .expect("Forge operation lease");
-        let pool = lease.memory_pool();
-        let reservation = MemoryConsumer::new("forge-operation-test").register(&pool);
-        reservation
-            .try_grow(128 * MIB)
-            .expect("lease pool accepts exact capacity");
-        assert!(reservation.try_grow(1).is_err());
-        reservation.shrink(128 * MIB);
-        drop(lease);
-        let released = forge.snapshot().expect("released Forge snapshot");
-        assert_eq!(released.elastic_memory_used_bytes, 0);
-        assert_eq!(released.scratch_used_bytes, 0);
-    }
-
     /// Live detection reaches the same checked constructor as an injection.
     ///
     /// `detect` may legitimately fail on a constrained CI host. Scratch free
@@ -6425,7 +6159,6 @@ mod tests {
                         replayed_plan.managed_memory_bytes,
                         replayed_plan.scribe_floor_bytes,
                         replayed_plan.oracle_floor_bytes,
-                        replayed_plan.forge_floor_bytes,
                         replayed_plan.elastic_memory_bytes,
                     ),
                     (
@@ -6435,7 +6168,6 @@ mod tests {
                         live_plan.managed_memory_bytes,
                         live_plan.scribe_floor_bytes,
                         live_plan.oracle_floor_bytes,
-                        live_plan.forge_floor_bytes,
                         live_plan.elastic_memory_bytes,
                     ),
                     "detection must resolve deterministic fields through one constructor"
@@ -6464,22 +6196,20 @@ mod tests {
         .expect("all-role plan must fit");
         let roles = runtime.compose_roles().expect("composition");
         let oracle = roles.oracle().expect("Oracle capability");
-        let forge = roles.forge().expect("Forge capability");
         assert!(oracle.shares_root_with(&roles));
-        assert!(forge.shares_root_with(&roles));
         assert!(runtime.shares_root_with(&roles));
 
-        let lease = forge
-            .try_acquire_rewrite(ForgeRewriteRequest {
-                envelope: envelope(),
-                memory_bytes: 64 * MIB,
-                scratch_bytes: 64 * MIB as u64,
-                reader_permits: 1,
-            })
-            .expect("Forge lease");
-        let occupied = oracle.snapshot().expect("Oracle observes the shared root");
-        assert_eq!(occupied.forge_memory_used_bytes, 64 * MIB);
-        assert_eq!(occupied.elastic_memory_used_bytes, 0);
+        let request = interactive_query(0.0);
+        let lease = oracle
+            .try_acquire_query(request)
+            .expect("Oracle query lease");
+        let occupied = roles.snapshot().expect("the root observes its own lease");
+        // The root's charge is what the request reserved, not the grant the
+        // plan sizes the query's pool at: the grant is a ceiling derived from
+        // the plan's own elastic memory and moves when any other role's budget
+        // does, so equating the two would make this a plan-arithmetic test.
+        assert_eq!(occupied.oracle_memory_used_bytes, request.memory_bytes);
+        assert!(lease.granted_memory_bytes >= request.memory_bytes);
         drop(lease);
         assert_eq!(
             oracle
@@ -7025,6 +6755,168 @@ mod tests {
         drop((analytical, interactive));
     }
 
+    /// Plans one node from an injected observation and an explicit policy.
+    fn plan_for(
+        memory_limit_bytes: usize,
+        roles: &[BifrostRole],
+        override_bytes: Option<usize>,
+    ) -> Result<ResourcePlan, BifrostResourceError> {
+        let scratch_limit_bytes = 1024 * MIB as u64;
+        let scratch_available_bytes = scratch_limit_bytes + MIN_SCRATCH_FREE_BYTES;
+        BifrostRuntimeResources::from_snapshot(
+            SystemResourceSnapshot {
+                memory_limit_bytes,
+                effective_cpu: 4,
+                scratch_capacity_bytes: scratch_available_bytes,
+                scratch_available_bytes,
+                memory_source: ResourceSource::Injected,
+                cpu_source: ResourceSource::Injected,
+            },
+            BifrostResourcePolicy {
+                roles: roles.iter().copied().collect(),
+                memory_limit_bytes: None,
+                unmanaged_reserve_bytes: None,
+                scratch_limit_bytes: Some(scratch_limit_bytes),
+                effective_cpu: None,
+                oracle_query_slot_limit: None,
+                forge_compaction_memory_limit_bytes: override_bytes,
+                scratch_root: PathBuf::new(),
+                volume_roots: None,
+            },
+        )
+        .map(|resources| resources.plan())
+    }
+
+    /// The Forge compaction budget is derived once and never crosses a floor.
+    ///
+    /// This is the whole of Forge's root memory ownership: one immutable figure
+    /// on the plan, reserved at planning time, that the worker's admission queue
+    /// charges running plans against. There is no live Forge root lease, so if
+    /// this arithmetic is wrong nothing later corrects it — which is why the
+    /// dedicated, co-located, absent, and rounding cases are pinned here on
+    /// their owner rather than inferred from a worker test. Overrides and
+    /// refusals are pinned by
+    /// [`forge_compaction_budget_refuses_rather_than_clamping`].
+    ///
+    /// # Panics
+    ///
+    /// Panics when any case selects a different budget, leaves different
+    /// elastic memory, or weakens a protected role floor.
+    #[test]
+    fn forge_compaction_budget_preserves_role_floors() {
+        // Dedicated Forge: no protected floor competes, so the whole managed
+        // pool less the derived budget stays elastic.
+        let memory = 4096 * MIB;
+        let dedicated = plan_for(memory, &[BifrostRole::Forge], None).expect("dedicated Forge");
+        assert_eq!(dedicated.scribe_floor_bytes, 0);
+        assert_eq!(dedicated.oracle_floor_bytes, 0);
+        let expected_default = memory * 4 / 5;
+        assert_eq!(
+            dedicated.forge_compaction_memory_limit_bytes, expected_default,
+            "the default budget is four fifths of the resolved memory limit"
+        );
+        assert_eq!(
+            dedicated.elastic_memory_bytes,
+            dedicated.managed_memory_bytes - expected_default
+        );
+
+        // Co-located `All`: the same formula, but both protected floors are
+        // still deducted before anything is elastic.
+        let colocated = plan_for(
+            memory,
+            &[BifrostRole::Scribe, BifrostRole::Oracle, BifrostRole::Forge],
+            None,
+        )
+        .expect("co-located All");
+        assert_eq!(colocated.scribe_floor_bytes, ROLE_MEMORY_FLOOR_BYTES);
+        assert_eq!(colocated.oracle_floor_bytes, ROLE_MEMORY_FLOOR_BYTES);
+        assert_eq!(
+            colocated.forge_compaction_memory_limit_bytes, expected_default,
+            "the budget formula does not change with co-location"
+        );
+        let safe = colocated.managed_memory_bytes
+            - colocated.scribe_floor_bytes
+            - colocated.oracle_floor_bytes;
+        assert_eq!(colocated.elastic_memory_bytes, safe - expected_default);
+
+        // Forge absent: zero budget, and today's elastic result is preserved.
+        let without = plan_for(memory, &[BifrostRole::Scribe, BifrostRole::Oracle], None)
+            .expect("Forge-absent node");
+        assert_eq!(without.forge_compaction_memory_limit_bytes, 0);
+        assert_eq!(
+            without.elastic_memory_bytes,
+            without.managed_memory_bytes - without.scribe_floor_bytes - without.oracle_floor_bytes
+        );
+
+        // Rounding floors rather than rounds: a limit that is not a multiple of
+        // five loses the remainder to elastic instead of over-committing.
+        let odd = plan_for(memory + 3, &[BifrostRole::Forge], None).expect("odd memory limit");
+        assert_eq!(
+            odd.forge_compaction_memory_limit_bytes,
+            (memory + 3) * 4 / 5
+        );
+    }
+
+    /// An override wins outright, and a budget that does not fit refuses.
+    ///
+    /// The refusals are the point: silently shrinking an over-large budget
+    /// would let an operator believe Forge was admitted memory it never had,
+    /// and accepting a zero one would admit a worker that can run no plan.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an override is not honoured exactly, or when a zero,
+    /// above-safe, or overflowing budget is clamped instead of refused.
+    #[test]
+    fn forge_compaction_budget_refuses_rather_than_clamping() {
+        let memory = 4096 * MIB;
+        let expected_default = memory * 4 / 5;
+        let colocated = plan_for(
+            memory,
+            &[BifrostRole::Scribe, BifrostRole::Oracle, BifrostRole::Forge],
+            None,
+        )
+        .expect("co-located All");
+
+        // An explicit positive override wins outright, in either direction.
+        for override_bytes in [64 * MIB, expected_default + MIB] {
+            let overridden = plan_for(memory, &[BifrostRole::Forge], Some(override_bytes))
+                .expect("an override inside the safe budget is accepted");
+            assert_eq!(
+                overridden.forge_compaction_memory_limit_bytes,
+                override_bytes
+            );
+            assert_eq!(
+                overridden.elastic_memory_bytes,
+                overridden.managed_memory_bytes - override_bytes
+            );
+        }
+
+        // Zero and above-safe both refuse; neither is clamped into range.
+        assert!(
+            plan_for(memory, &[BifrostRole::Forge], Some(0)).is_err(),
+            "a zero Forge budget admits no plan and must refuse boot"
+        );
+        let colocated_safe = colocated.managed_memory_bytes
+            - colocated.scribe_floor_bytes
+            - colocated.oracle_floor_bytes;
+        assert!(
+            plan_for(
+                memory,
+                &[BifrostRole::Scribe, BifrostRole::Oracle, BifrostRole::Forge],
+                Some(colocated_safe + 1),
+            )
+            .is_err(),
+            "a budget past the protected floors must refuse boot, never clamp"
+        );
+
+        // The overflow guard is checked arithmetic, not a wrapping multiply.
+        assert!(
+            plan_for(usize::MAX, &[BifrostRole::Forge], None).is_err(),
+            "a memory limit whose four-fifths derivation overflows must refuse"
+        );
+    }
+
     /// Every role retains multiple exact owners in the same checked root ledger.
     #[test]
     fn role_leases_share_one_root_without_crossing_floors_or_elastic() {
@@ -7035,7 +6927,6 @@ mod tests {
         );
         let oracle = roles.oracle().expect("Oracle capability");
         let scribe = roles.scribe().expect("Scribe capability");
-        let forge = roles.forge().expect("Forge capability");
         let queries = [
             oracle
                 .try_acquire_query(interactive_query(0.0))
@@ -7060,29 +6951,9 @@ mod tests {
                 })
                 .expect("Scribe lease two"),
         ];
-        let forge_leases = [
-            forge
-                .try_acquire_rewrite(ForgeRewriteRequest {
-                    envelope: envelope(),
-                    memory_bytes: 32 * MIB,
-                    scratch_bytes: 32 * MIB as u64,
-                    reader_permits: 1,
-                })
-                .expect("Forge lease one"),
-            forge
-                .try_acquire_rewrite(ForgeRewriteRequest {
-                    envelope: envelope(),
-                    memory_bytes: 32 * MIB,
-                    scratch_bytes: 32 * MIB as u64,
-                    reader_permits: 1,
-                })
-                .expect("Forge lease two"),
-        ];
         let snapshot = roles.snapshot().expect("shared-root snapshot");
         assert!(
-            snapshot.scribe_memory_used_bytes
-                + snapshot.oracle_memory_used_bytes
-                + snapshot.forge_memory_used_bytes
+            snapshot.scribe_memory_used_bytes + snapshot.oracle_memory_used_bytes
                 <= snapshot.plan.managed_memory_bytes
         );
         // Stated as the floor-first invariant rather than a fixed number: elastic
@@ -7094,16 +6965,12 @@ mod tests {
             .saturating_sub(snapshot.plan.scribe_floor_bytes)
             + snapshot
                 .oracle_memory_used_bytes
-                .saturating_sub(snapshot.plan.oracle_floor_bytes)
-            + snapshot
-                .forge_memory_used_bytes
-                .saturating_sub(snapshot.plan.forge_floor_bytes);
+                .saturating_sub(snapshot.plan.oracle_floor_bytes);
         assert_eq!(snapshot.elastic_memory_used_bytes, expected_elastic);
-        drop((queries, scribe_leases, forge_leases));
+        drop((queries, scribe_leases));
         let released = roles.snapshot().expect("shared-root release");
         assert_eq!(released.scribe_memory_used_bytes, 0);
         assert_eq!(released.oracle_memory_used_bytes, 0);
-        assert_eq!(released.forge_memory_used_bytes, 0);
         assert_eq!(released.scratch_used_bytes, 0);
     }
 
@@ -7215,99 +7082,6 @@ mod tests {
         );
     }
 
-    /// A refused Forge rewrite leaves both counters exactly as it found them.
-    #[test]
-    fn forge_capability_refusal_is_atomic() {
-        let roles = BifrostRuntimeResources::composed_for_test(
-            1024 * MIB,
-            512 * MIB as u64,
-            [BifrostRole::Forge],
-        );
-        let forge = roles.forge().expect("Forge capability");
-        let plan = roles.plan();
-        let baseline = forge.snapshot().expect("baseline");
-
-        assert!(
-            forge
-                .try_acquire_rewrite(ForgeRewriteRequest {
-                    envelope: envelope(),
-                    memory_bytes: plan.forge_floor_bytes + plan.elastic_memory_bytes + 1,
-                    scratch_bytes: 1,
-                    reader_permits: 1,
-                })
-                .is_err(),
-            "memory beyond the elastic pool must be refused"
-        );
-        assert_eq!(forge.snapshot().expect("after memory refusal"), baseline);
-
-        assert!(
-            forge
-                .try_acquire_rewrite(ForgeRewriteRequest {
-                    envelope: envelope(),
-                    memory_bytes: 1,
-                    scratch_bytes: plan.scratch_limit_bytes + 1,
-                    reader_permits: 1,
-                })
-                .is_err(),
-            "scratch beyond the disposable ceiling must be refused"
-        );
-        assert_eq!(forge.snapshot().expect("after scratch refusal"), baseline);
-
-        assert!(
-            forge
-                .try_acquire_rewrite(ForgeRewriteRequest {
-                    envelope: envelope(),
-                    memory_bytes: 1,
-                    scratch_bytes: 1,
-                    reader_permits: u16::try_from(plan.effective_cpu + 1).unwrap_or(u16::MAX),
-                })
-                .is_err(),
-            "reader permits beyond live CPU capacity must be refused atomically"
-        );
-        assert_eq!(forge.snapshot().expect("after reader refusal"), baseline);
-    }
-
-    /// Concurrent Forge grants contend on reader permits in the same atomic ledger.
-    #[test]
-    fn forge_reader_permits_are_atomic_under_contention() {
-        let roles = BifrostRuntimeResources::composed_for_test(
-            1024 * MIB,
-            512 * MIB as u64,
-            [BifrostRole::Forge],
-        );
-        let forge = roles.forge().expect("Forge capability");
-        let permits = u16::try_from(roles.plan().effective_cpu).unwrap_or(u16::MAX);
-        let lease = forge
-            .try_acquire_rewrite(ForgeRewriteRequest {
-                envelope: envelope(),
-                memory_bytes: 1,
-                scratch_bytes: 1,
-                reader_permits: permits,
-            })
-            .expect("first lease owns every reader permit");
-        let held = forge.snapshot().expect("held snapshot");
-        assert_eq!(held.forge_reader_permits_used, usize::from(permits));
-        assert!(
-            forge
-                .try_acquire_rewrite(ForgeRewriteRequest {
-                    envelope: envelope(),
-                    memory_bytes: 1,
-                    scratch_bytes: 1,
-                    reader_permits: 1,
-                })
-                .is_err()
-        );
-        assert_eq!(forge.snapshot().expect("refusal snapshot"), held);
-        drop(lease);
-        assert_eq!(
-            forge
-                .snapshot()
-                .expect("released")
-                .forge_reader_permits_used,
-            0
-        );
-    }
-
     /// The Oracle runtime pool is the lease's own, and drop restores baselines.
     #[test]
     fn oracle_lease_pool_identity_and_drop_cleanup() {
@@ -7337,44 +7111,6 @@ mod tests {
             oracle.snapshot().expect("released"),
             baseline,
             "dropping the query lease must restore every baseline"
-        );
-    }
-
-    /// The Forge runtime pool is the lease's own, and drop restores baselines.
-    #[test]
-    fn forge_lease_pool_identity_and_drop_cleanup() {
-        let roles = BifrostRuntimeResources::composed_for_test(
-            1024 * MIB,
-            512 * MIB as u64,
-            [BifrostRole::Forge],
-        );
-        let forge = roles.forge().expect("Forge capability");
-        let baseline = forge.snapshot().expect("baseline");
-        let lease = forge
-            .try_acquire_rewrite(ForgeRewriteRequest {
-                envelope: envelope(),
-                memory_bytes: 128 * MIB,
-                scratch_bytes: 64 * MIB as u64,
-                reader_permits: 1,
-            })
-            .expect("Forge operation lease");
-        let pool = lease.memory_pool();
-        assert!(
-            Arc::ptr_eq(&pool, &lease.memory_pool()),
-            "the lease must issue one stable pool"
-        );
-        let reservation = MemoryConsumer::new("forge-lease-identity").register(&pool);
-        reservation
-            .try_grow(128 * MIB)
-            .expect("the lease pool admits exactly its grant");
-        assert!(reservation.try_grow(1).is_err());
-        reservation.shrink(128 * MIB);
-        assert_eq!(lease.scratch_bytes(), 64 * MIB as u64);
-        drop(lease);
-        assert_eq!(
-            forge.snapshot().expect("released"),
-            baseline,
-            "dropping the operation lease must restore every baseline"
         );
     }
 
@@ -7434,7 +7170,7 @@ mod tests {
     }
 
     #[test]
-    fn scribe_floor_survives_oracle_and_forge_elastic_pressure() {
+    fn scribe_floor_survives_oracle_elastic_pressure() {
         let roles = BifrostRuntimeResources::composed_for_test(
             1024 * MIB,
             512 * MIB as u64,
@@ -7444,7 +7180,6 @@ mod tests {
         assert_eq!(plan.scribe_floor_bytes, ROLE_MEMORY_FLOOR_BYTES);
         let scribe = roles.scribe().expect("Scribe capability");
         let oracle = roles.oracle().expect("Oracle capability");
-        let forge = roles.forge().expect("Forge capability");
         let scribe_owner = scribe
             .try_acquire_memory(ScribeMemoryRequest {
                 bytes: 300 * MIB,
@@ -7462,28 +7197,9 @@ mod tests {
             query.memory_bytes, ORACLE_PARTITION_WORKING_MEMORY_BYTES,
             "an interactive query charges one slot-unit quantum against the budget"
         );
-        let concurrent_forge = forge
-            .try_acquire_rewrite(ForgeRewriteRequest {
-                envelope: envelope(),
-                memory_bytes: 1,
-                scratch_bytes: 1,
-                reader_permits: 1,
-            })
-            .expect("Forge retains its floor while Oracle owns an exact query");
         assert_eq!(roles.plan().scribe_floor_bytes, ROLE_MEMORY_FLOOR_BYTES);
-        drop(concurrent_forge);
         drop(query);
         drop(scribe_owner);
-        let forge_owner = forge
-            .try_acquire_rewrite(ForgeRewriteRequest {
-                envelope: envelope(),
-                memory_bytes: plan.forge_floor_bytes + plan.elastic_memory_bytes,
-                scratch_bytes: plan.scratch_limit_bytes,
-                reader_permits: 1,
-            })
-            .expect("Forge may own all elastic resources after Oracle releases");
-        assert_eq!(roles.plan().scribe_floor_bytes, ROLE_MEMORY_FLOOR_BYTES);
-        drop(forge_owner);
         let snapshot = roles.snapshot().expect("released resource snapshot");
         assert_eq!(snapshot.elastic_memory_used_bytes, 0);
         assert_eq!(snapshot.scratch_used_bytes, 0);

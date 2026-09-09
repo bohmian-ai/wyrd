@@ -356,6 +356,16 @@ impl AnalyticalGraphRuntime {
 pub struct AnalyticalRuntimeRegistry {
     /// Live graphs and the query-owned material each one installs.
     entries: Mutex<HashMap<AnalyticalGraphKey, AnalyticalGraphRuntime>>,
+    /// Reader-epoch guards the graphs' decoded leaves acquired, by graph.
+    ///
+    /// A guard cannot live in the decoded plan: upstream drops a follower's
+    /// stage plan from its own task cache asynchronously, after the coordinator
+    /// channel ends, so a plan-owned guard would outlive every owner this node
+    /// controls and could still be held when the reader epoch retires. Keying
+    /// the guards by graph puts them under the one owner whose teardown this
+    /// node does drive, and the clonable permit the plan keeps is cancelled the
+    /// instant its guard drops.
+    reader_guards: Mutex<HashMap<AnalyticalGraphKey, Vec<super::reader_pins::ReaderQueryGuard>>>,
 }
 
 impl AnalyticalRuntimeRegistry {
@@ -409,8 +419,45 @@ impl AnalyticalRuntimeRegistry {
     ///
     /// Returns [`BifrostError::Internal`] on lock poisoning.
     pub fn invalidate(&self, key: AnalyticalGraphKey) -> Result<bool, BifrostError> {
-        let mut entries = self.entries.lock().map_err(|_| poisoned_registry())?;
-        Ok(entries.remove(&key).is_some())
+        // Dropped outside the entries lock: releasing a guard enqueues its
+        // narrowing command, and no registry caller should run that under a
+        // lock every other stage operation contends on.
+        let guards = {
+            let mut reader_guards = self.reader_guards.lock().map_err(|_| poisoned_registry())?;
+            reader_guards.remove(&key)
+        };
+        let removed = {
+            let mut entries = self.entries.lock().map_err(|_| poisoned_registry())?;
+            entries.remove(&key).is_some()
+        };
+        drop(guards);
+        Ok(removed)
+    }
+
+    /// Retains one decoded leaf's reader-epoch guard under its graph.
+    ///
+    /// Called after the leaf has committed its protection and before it opens
+    /// any provider, so the epoch's claim on the signed snapshot is owned by the
+    /// graph for the whole time the plan can read. A graph that is no longer
+    /// registered refuses: its work is invalidated, and retaining a guard for it
+    /// would leave a claim nothing releases.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostError::QueryExecutionFailed`] when the graph holds no
+    /// registered material, and [`BifrostError::Internal`] on lock poisoning.
+    pub fn retain_reader_guard(
+        &self,
+        key: AnalyticalGraphKey,
+        guard: super::reader_pins::ReaderQueryGuard,
+    ) -> Result<(), BifrostError> {
+        let mut reader_guards = self.reader_guards.lock().map_err(|_| poisoned_registry())?;
+        let entries = self.entries.lock().map_err(|_| poisoned_registry())?;
+        if !entries.contains_key(&key) {
+            return Err(BifrostError::QueryExecutionFailed);
+        }
+        reader_guards.entry(key).or_default().push(guard);
+        Ok(())
     }
 
     /// Returns the number of graphs currently holding query-owned material.
@@ -552,7 +599,7 @@ impl WorkerSessionBuilder for AnalyticalSessionBuilder {
             .shape()
             .apply(builder.config().clone().unwrap_or_default());
         config.set_distributed_user_codec(super::codec::OraclePhysicalExtensionCodec::analytical(
-            self.leaf.clone(),
+            self.leaf.clone().for_graph(key, Arc::clone(&self.registry)),
         ));
         // A stage that only feeds the leader never opens a channel of its own.
         // A stage in the middle of a deeper graph does: it pulls from another
@@ -3755,6 +3802,7 @@ mod tests {
             wyrd_spec::vala::api::ClusterRole::Oracle,
             Arc::new(super::super::follower::UnresolvableSource),
             Arc::new(crate::oracle::AcceptingOracleAudit),
+            None,
         )
     }
 
@@ -3975,6 +4023,7 @@ mod tests {
             _target_role: wyrd_spec::vala::api::ClusterRole,
             _assignment: &wyrd_spec::vala::api::FollowerScanAssignment,
             _session: &SessionState,
+            _reader_io_permit: Option<&super::super::reader_pins::ReaderIoPermit>,
         ) -> Result<super::super::follower::ResolvedFollowerSource, String> {
             self.resolutions.fetch_add(1, Ordering::SeqCst);
             Err("counting fixture resolver refuses every assignment".to_owned())
@@ -4057,6 +4106,7 @@ mod tests {
                 .into_iter()
                 .collect(),
             memory_limit_bytes: None,
+            forge_compaction_memory_limit_bytes: None,
             unmanaged_reserve_bytes: None,
             scratch_limit_bytes: None,
             effective_cpu: None,
@@ -4225,6 +4275,7 @@ mod tests {
                         resolutions: Arc::clone(&resolutions),
                     }),
                     Arc::new(crate::oracle::AcceptingOracleAudit),
+                    None,
                 ),
                 egress: fixture_egress(),
             });
@@ -7277,6 +7328,7 @@ mod tests {
     ) -> wyrd_spec::vala::api::FollowerScanAssignment {
         wyrd_spec::vala::api::FollowerScanAssignment {
             scan_id: scan_id.to_owned(),
+            reader_cut: wyrd_spec::vala::api::FollowerReaderCut::no_snapshot(uuid::Uuid::nil(), 1),
             binding: wyrd_spec::vala::api::TenantTableBinding {
                 tenant_id: wyrd_spec::DataTenantId::new_v7(),
                 namespace: "traces".to_owned(),

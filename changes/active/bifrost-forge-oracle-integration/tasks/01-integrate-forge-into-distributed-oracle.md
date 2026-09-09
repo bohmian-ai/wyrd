@@ -45,6 +45,12 @@ Required execution skill: `$wyrd-implement`.
 - Keep destination-deleted benchmark, calibration, obsolete MCP, workflow, and
   unrelated planning machinery deleted. Do not weaken tests, lane definitions,
   feature selections, assertions, or timeouts to obtain a pass.
+- Preserve the destination's rewritten `BifrostProcessCluster`, child-process,
+  and peer-authority harness. The source versions of `forge_harness.rs` and the
+  Forge journey tree are authoritative for all Forge behavior. Reconcile only
+  genuinely shared `WyrdTestCluster` seams with destination peer and
+  query-resource behavior; do not migrate Forge journeys to the Oracle process
+  harness or import the source's benchmark-only `BifrostHarness` stack.
 - Do not fix or redesign Oracle admission in this merge. Its known pre-existing
   failure or Forge closeout workaround may remain when evidence ties it to
   `changes/active/oracle-local-admission`; any unrelated failure blocks
@@ -74,6 +80,12 @@ Paths are guidance, not an implementation allowlist.
   consumers.
 - `wyrd-testing` harnesses and the existing Bifrost unit, integration, and
   user-journey owners across Rust, Python, TypeScript, SDK, MCP, and OTLP.
+- The mixed harness seam: destination-owned `process_cluster.rs` and its child
+  process owners; semantic-hunk reconciliation in shared `cluster.rs`;
+  source-owned Forge behavior in `forge_harness.rs`; and the source Forge
+  `production_closeout`, `scribe_promotion`, and rewrite journeys. The
+  source-only `harness.rs` serves removed benchmark consumers and is not
+  retained.
 - Generated schema, OpenAPI, SDK, and protobuf outputs owned by reconciled
   source contracts.
 
@@ -88,8 +100,10 @@ Paths are guidance, not an implementation allowlist.
    contracts, and SQL state with the destination owners, preserving historical
    migrations and adding only required forward state transitions.
 4. Adapt the minimum shared Scribe, Oracle, server, readiness, resource,
-   shutdown, audit, and test seams so the retained Forge implementation runs
-   within the destination topology and authority model.
+   shutdown, audit, and test seams. Keep Forge journeys on the reconciled
+   `WyrdTestCluster`, keep Oracle process journeys on `BifrostProcessCluster`,
+   and retain the source Forge-specific fixture and fault behavior without a
+   second generic harness.
 5. Regenerate owned artifacts, remove stale branch residue and duplicate
    implementations, then exercise only the focused Forge, Oracle, Scribe, and
    Gate test surfaces plus applicable non-test formatting and contract checks.
@@ -106,6 +120,11 @@ Paths are guidance, not an implementation allowlist.
 - The integrated tree contains one destination-owned Gate, Scribe, Oracle,
   public-query, server, SDK, and test architecture and one source-owned Forge
   implementation.
+- The destination Oracle process harness and peer-security topology remain
+  intact. Forge harness code and Forge journeys match the source branch's
+  authoritative behavior and use one `WyrdTestCluster` reconciled only at its
+  shared Oracle, peer, and resource seams. No benchmark-only harness or
+  duplicate cluster lifecycle returns.
 - Locked Forge behavior survives integration: real-plan FIFO admission without
   a Forge DataFusion ceiling or spill path; independent per-plan publication;
   bounded 1s/2s/4s definite-conflict retries; exact-operation uncertain
@@ -159,3 +178,80 @@ test:bifrost:integration:redux`, `mise run test:bifrost:integration:server`,
 `mise run test:bifrost:journey`, `mise run verify:bifrost`, or `mise run gate`
 for this merge. If Oracle admission surfaces as a focused-test failure, record
 its test name and failure signature as the sole permitted known failure.
+
+## Implementation Evidence
+
+Candidate: working tree on `oracle-distributed`, merge of locked Forge source
+`b35ebb5e76b7a63fc7e9549329a5c90101400002` into destination `b51eb8361`
+(merge base `24b8349e3e`).
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| AC-001 Overlap resolved, no unexplained residue | Semantic-hunk resolution across the source/destination write set; duplicate merge artifacts removed (`tests/bifrost/oracle/support.rs` orphaned doc block, duplicate `COMPACTION_PASS_BUDGET` in `tests/bifrost/oracle/distributed.rs`, unused `BifrostGrpcTransport` import in `wyrd-testing/src/server.rs`) | `mise run lints` (clean, `--all-features --all-targets -D warnings`); `git diff --check` | PASS |
+| AC-002 One destination Gate/Scribe/Oracle/server/SDK architecture, one source Forge | Destination Oracle retained whole; source Forge implementation retained whole; source Oracle fragment-route test machinery removed (`AcceptedFollower`, `FollowerBatchGate`, `batch_gate`, `pause_next_batch_for_test`, `clear_batch_pause_for_test`, `gated_batches_for_test`, `OracleFollowerPauses` and its re-export) | `mise run test:bifrost:journey:oracle` 23/23; `mise run test:bifrost:journey:forge` 13/13 | PASS |
+| AC-003 Process harness and peer security intact; Forge journeys on `WyrdTestCluster`; no second harness | `BifrostProcessCluster`, child-process execution and peer security untouched; Forge journeys remain on `WyrdTestCluster`; source benchmark-only `BifrostHarness` not restored | `mise run test:bifrost:journey:oracle` 23/23 | PASS |
+| AC-004 Locked Forge behavior survives | Source Forge production modules taken unmodified | `mise run test:bifrost:journey:forge` 13/13 | PASS |
+| AC-005 Compaction pin in one analytical dependency universe | `iceberg-compaction-core` pinned at `3709a1d9f7b8b6f2c0ed886c105fb557f1aaadab`; single object_store/datafusion/arrow/parquet | `mise run check:object-store-pin` — "single object_store (v0.13.2) + single datafusion/arrow/parquet across the iceberg cone" | PASS |
+| AC-005 Destination Oracle/Scribe semantics intact | No change to Oracle planning, routing, admission, terminal, peer, or resource behavior; reader-epoch guard ownership moved from the plan memo cell to `AnalyticalRuntimeRegistry` (`oracle/analytical.rs`, `oracle/analytical_scan.rs`, `oracle/codec.rs`, `oracle/follower.rs`) so a follower guard cannot outlive retirement | `mise run test:bifrost:journey:scribe` 20/20; `mise run test:bifrost:journey:oracle` 23/23 | PASS |
+| AC-006 Migration history unchanged, forward-only | Source-only redundant `20260910000016_forge_large_lane_removal.sql` dropped; destination `20260910000022` and `20260910000025_oracle_reader_authority.sql` retained and sequenced last | `mise run test:bifrost:journey:*` (all lanes run `db:migrate:inner` first) | PASS |
+| AC-007 Generated artifacts match owning contracts | No hand-edited generated artifact | `mise run codegen:check` | PASS |
+| AC-008 Existing coverage not weakened | No assertion, timeout, lane, or feature selection weakened; the two `production_closeout` protection assertions are byte-identical in what they require | `mise run test:bifrost:journey:forge` 13/13 | PASS |
+| AC-009 No failure other than the known admission defect | All four focused lanes green; the known defect did not re-appear (its Forge closeout `TestOracleResources` workaround is retained, per spec) | Lane summaries below | PASS |
+| AC-010/011 Diff auditable | See "Deviation" below | — | PASS |
+
+### Deviation: source Oracle first-batch gate
+
+Three tests arrived from the source branch coupled to the **source** Oracle's
+routing, in which every read — including leader-to-self — executes as a ticketed
+`ExecuteFragmentRequest` on `OraclePeerWorker`. The destination Oracle does not
+route reads that way: `AnalyticalHandle::frozen_destinations` excludes the
+leader, and a delegated cut executes on the destination's analytical graph path
+(`Oracle graph lease activated from its reservation`), never through
+`OraclePeerWorker::execute_with_capacity`. Instrumented control run of the
+*passing* destination-native `distributed::pg_bifrost_selective_predicate_and_projection_prune_distributed_reads`
+confirms this: `destinations=2 delegated=true` with zero `fragment admitted to
+execute` events. The failures were therefore Oracle-path, not Forge-caused —
+the Forge half of both closeout journeys passed every assertion up to the gate.
+
+Resolution, under the specification's `DROP` classification for source Oracle
+planning/routing/peer changes:
+
+- `distributed::accepted_follower_outlives_ticket_expiry_and_honors_query_deadline`
+  and its private `DeadlineJourney` helpers deleted — source-Oracle ticket
+  semantics, no Forge content, and its local leg (leader dispatching a ticketed
+  fragment to itself) is unrepresentable on the destination.
+- The two `production_closeout` journeys keep their assertions and now hold the
+  lazy reader at the destination's existing `StorageOperationBarrier`
+  (`StorageOperation::ReadRange`), the same seam `oracle/published.rs` uses. The
+  destination analytical path acquires durable reader protection before it opens
+  any object, so reaching the ranged read is sufficient proof. New test-local
+  helpers `OracleReadBarriers` and `oracle_fence` in
+  `tests/bifrost/forge/production_closeout.rs`; no production behavior changed
+  and no new harness abstraction added.
+
+### Commands
+
+```
+mise run test:bifrost:journey:forge     13 tests run: 13 passed, 0 skipped
+mise run test:bifrost:journey:scribe    20 tests run: 20 passed (5 slow), 0 skipped
+mise run test:bifrost:journey:oracle    23 tests run: 23 passed, 0 skipped
+mise exec -- cargo nextest run --locked -p vala-bifrost-redux \
+  --features "test-support,bench-support" --lib -E 'test(/^gate::/)'
+                                        30 tests run: 30 passed, 892 skipped
+mise run fmt                            clean
+mise run lints                          clean
+mise run codegen:check                  clean
+mise run check:object-store-pin         OK
+git diff --check                        clean
+```
+
+The gate command in "Verification" above does not compile as written:
+`gate::tests::graph_leases_activated_total` and `runtime_inspection` are
+`test-support`-gated. The corrected command adds the canonical
+`WYRD_REDUX_TEST_FEATURES` union `--features "test-support,bench-support"`; no
+proof was weakened.
+
+Non-goals confirmed excluded: no `check:tenant-isolation`,
+`test:bifrost:integration:redux`, `test:bifrost:integration:server`,
+`test:bifrost:journey`, `verify:bifrost`, or `gate` run; Oracle admission not
+altered; no compatibility route, alias, or legacy name added.

@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use base64::Engine;
-use futures_util::StreamExt;
+use futures_util::{StreamExt, TryStreamExt};
 use secrecy::{ExposeSecret, SecretString};
 use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::catalog::BifrostCatalog;
@@ -64,7 +64,8 @@ use crate::oracle::{
 };
 use crate::postgres::ServerPostgres;
 use crate::state::{
-    AppState, Forge, Oracle, ProductionValidationError, Scribe, ScribeCoordinationRuntime,
+    AppState, Forge, ForgeCompactionRuntime, Oracle, ProductionValidationError, Scribe,
+    ScribeCoordinationRuntime,
 };
 
 const DEFAULT_MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
@@ -135,18 +136,44 @@ impl ForgeObjectStore for OpenDalForgeObjectStore {
     /// so a mid-walk backend error surfaces as a failed page rather than being
     /// silently truncated.
     ///
+    /// Listing is gated on the backend advertising `list_with_start_after`.
+    /// The bounded scan resumes by cursor, and emulating that cursor by
+    /// filtering would relist every earlier page on every attempt — exactly the
+    /// unbounded listing the page cap exists to prevent — so an incapable
+    /// backend is refused before any listing rather than served an
+    /// anti-starvation guarantee this adapter cannot keep.
+    ///
     /// # Errors
     ///
-    /// Returns the underlying OpenDAL error when the lister cannot be opened.
-    /// Errors encountered after the walk begins surface as a failed page in the
-    /// returned stream.
-    async fn list_pages(&self, prefix: &str) -> opendal::Result<ForgeObjectPages> {
-        let lister = self.operator.lister_with(prefix).recursive(true).await?;
-        let pages = lister.chunks(FORGE_OBJECT_LIST_PAGE_ENTRIES).map(|chunk| {
-            chunk
-                .into_iter()
-                .collect::<opendal::Result<Vec<opendal::Entry>>>()
-        });
+    /// Returns [`opendal::ErrorKind::Unsupported`] when the backend cannot
+    /// resume from a cursor, and the underlying OpenDAL error when the lister
+    /// cannot be opened. Errors encountered after the walk begins surface as a
+    /// failed page in the returned stream.
+    async fn list_pages(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+    ) -> opendal::Result<ForgeObjectPages> {
+        if !self.operator.info().full_capability().list_with_start_after {
+            return Err(opendal::Error::new(
+                opendal::ErrorKind::Unsupported,
+                "Forge orphan listing requires backend list_with_start_after support",
+            ));
+        }
+        let mut listing = self.operator.lister_with(prefix).recursive(true);
+        if let Some(cursor) = start_after {
+            listing = listing.start_after(cursor);
+        }
+        let lister = listing.await?;
+        // A resumable scan advances its cursor over objects only: a directory
+        // key ends in a separator and is not an addressable object, so it must
+        // not consume the page bound either — a chunk of only directories would
+        // yield an empty page and leave the frontier standing still, starving
+        // the objects behind it.
+        let objects = lister.try_filter(|entry| std::future::ready(entry.metadata().is_file()));
+        let pages = objects
+            .chunks(FORGE_OBJECT_LIST_PAGE_ENTRIES)
+            .map(|chunk| chunk.into_iter().collect::<opendal::Result<Vec<_>>>());
         Ok(Box::pin(pages))
     }
 
@@ -328,12 +355,6 @@ fn resolve_forge_config(
 ) -> (ForgeConfig, std::time::Duration) {
     let base = ForgeConfig::default();
     let config = ForgeConfig {
-        max_files_per_tick: forge_runtime
-            .max_files_per_tick
-            .unwrap_or(base.max_files_per_tick),
-        max_bytes_per_tick: forge_runtime
-            .max_bytes_per_tick
-            .unwrap_or(base.max_bytes_per_tick),
         snapshot_retention: forge_runtime
             .snapshot_retention_secs
             .map(std::time::Duration::from_secs)
@@ -463,13 +484,7 @@ async fn build_bifrost_external_dependencies(
     let oracle_scratch = prepare_oracle_spill_root(Some(wal_dir.clone()))?;
     let scribe_stage = wal_dir.join("scribe-stage");
     let scribe_output_scratch = wal_dir.join("scribe-output-scratch");
-    let forge_scratch = wal_dir.join("forge-spill");
-    for root in [
-        &wal_dir,
-        &scribe_stage,
-        &scribe_output_scratch,
-        &forge_scratch,
-    ] {
+    for root in [&wal_dir, &scribe_stage, &scribe_output_scratch] {
         std::fs::create_dir_all(root).map_err(|error| {
             ServerBootError::Scribe(format!("Bifrost volume root creation failed: {error}"))
         })?;
@@ -493,12 +508,14 @@ async fn build_bifrost_external_dependencies(
             scratch_limit_bytes: config.resources.scratch_limit_bytes,
             effective_cpu: config.resources.effective_cpu,
             oracle_query_slot_limit: config.resources.oracle_query_slot_limit,
+            forge_compaction_memory_limit_bytes: config
+                .resources
+                .forge_compaction_memory_limit_bytes,
             scratch_root: oracle_scratch.clone(),
             volume_roots: Some(vala_bifrost_redux::resources::BifrostVolumeRoots {
                 wal: wal_dir.clone(),
                 scribe_stage,
                 scribe_output_scratch,
-                forge_scratch,
                 oracle_scratch,
             }),
         },
@@ -593,13 +610,7 @@ pub async fn compose_bifrost(
     let scribe_config = bifrost_config.scribe;
     let scribe_stage = wal_dir.join("scribe-stage");
     let scribe_output_scratch = wal_dir.join("scribe-output-scratch");
-    let forge_scratch = wal_dir.join("forge-spill");
-    for root in [
-        &wal_dir,
-        &scribe_stage,
-        &scribe_output_scratch,
-        &forge_scratch,
-    ] {
+    for root in [&wal_dir, &scribe_stage, &scribe_output_scratch] {
         std::fs::create_dir_all(root).map_err(|error| {
             ServerBootError::Scribe(format!("Bifrost volume root creation failed: {error}"))
         })?;
@@ -628,6 +639,9 @@ pub async fn compose_bifrost(
     // same non-blocking path, instead of running blocking `Runtime` drop glue on
     // this async frame.
     let mut coordination_runtime = ScribeCoordinationRuntime::new(None);
+    // Same ownership rule as the coordination runtime above: declared here so an
+    // early error from any later stage releases the executor without blocking.
+    let mut compaction_runtime = ForgeCompactionRuntime::new(None);
     let scribe = if roles.contains(&BifrostRuntimeRole::Scribe) {
         let scribe_role = cluster_registry
             .reserve_scribe(
@@ -863,8 +877,11 @@ pub async fn compose_bifrost(
         {
             forge_config = config;
         }
-        let rewrite_spill_root = wal_dir.join("forge-spill");
         let staging = Arc::new(storage.operator().clone());
+        // Read from the concrete operator before it is erased behind
+        // `ForgeObjectStore`: only the backend itself can answer whether a
+        // bounded orphan listing can resume from a cursor.
+        let staging_lists_by_cursor = staging.info().full_capability().list_with_start_after;
         #[cfg(feature = "test-support")]
         let object_store: Arc<dyn ForgeObjectStore> = test_controls
             .as_ref()
@@ -873,13 +890,8 @@ pub async fn compose_bifrost(
         #[cfg(not(feature = "test-support"))]
         let object_store: Arc<dyn ForgeObjectStore> =
             Arc::new(OpenDalForgeObjectStore::new(Arc::clone(&staging)));
-        let forge_resources = bifrost_resources.forge().ok_or_else(|| {
-            ServerBootError::Scribe(
-                "Forge role selected without a composed Forge capability".to_owned(),
-            )
-        })?;
         let coordinator = Arc::new(ForgeCoordinator::new(ForgeBuildConfig {
-            resources: forge_resources.clone(),
+            resource_plan,
             vala: postgres.vala().clone(),
             operator_pool: operator_pool.clone(),
             catalog: {
@@ -896,8 +908,8 @@ pub async fn compose_bifrost(
                 }
             },
             staging,
+            staging_lists_by_cursor,
             object_store,
-            rewrite_spill_root,
             hints: staging_file_inbox,
             config: forge_config,
             maintenance_interval,
@@ -913,53 +925,59 @@ pub async fn compose_bifrost(
                     ForgeClock::system()
                 }
             },
-            completion_observer: {
-                #[cfg(feature = "test-support")]
-                {
-                    test_controls
-                        .as_ref()
-                        .and_then(|controls| controls.forge_completion_observer.clone())
-                }
-                #[cfg(not(feature = "test-support"))]
-                {
-                    None
-                }
-            },
-            scheduler_trigger: {
-                #[cfg(feature = "test-support")]
-                {
-                    test_controls
-                        .as_ref()
-                        .map(|controls| controls.forge_scheduler_trigger.clone())
-                }
-                #[cfg(not(feature = "test-support"))]
-                {
-                    None
-                }
-            },
+            #[cfg(feature = "test-support")]
+            completion_observer: test_controls
+                .as_ref()
+                .and_then(|controls| controls.forge_completion_observer.clone()),
+            #[cfg(feature = "test-support")]
+            scheduler_trigger: test_controls
+                .as_ref()
+                .map(|controls| controls.forge_scheduler_trigger.clone()),
             telemetry: Arc::new(ForgeTelemetry::new()),
         })?);
-        let worker = roles
-            .contains(&BifrostRuntimeRole::ForgeWorker)
-            .then(|| {
+        // Only the Forge worker role runs admitted compaction plans, so only it
+        // builds the dedicated executor. Its thread count is the resolved
+        // effective CPU the same plan derived the memory budget from, rather
+        // than a second CPU knob that could disagree with it.
+        let worker = if roles.contains(&BifrostRuntimeRole::ForgeWorker) {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(resource_plan.effective_cpu)
+                .thread_name_fn(|| {
+                    static THREAD_INDEX: std::sync::atomic::AtomicUsize =
+                        std::sync::atomic::AtomicUsize::new(0);
+                    format!(
+                        "wyrd-forge-compaction-{}",
+                        THREAD_INDEX.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    )
+                })
+                .enable_all()
+                .build()
+                .map_err(|error| {
+                    ServerBootError::Forge(vala_bifrost_redux::forge::ForgeError::InvalidConfig {
+                        detail: format!("Forge compaction runtime failed: {error}"),
+                    })
+                })?;
+            compaction_runtime = ForgeCompactionRuntime::new(Some(runtime));
+            let handle = compaction_runtime
+                .handle()
+                .expect("the owner was just constructed around a live runtime");
+            Some(Arc::new(
                 ForgeWorker::new(
                     Arc::clone(&coordinator),
-                    ForgeWorkerConfig {
-                        worker_concurrency: forge_runtime.worker_concurrency,
-                        per_tenant_active_cap: forge_runtime.resolved_per_tenant_active_cap(),
-                    },
+                    forge_compaction_worker_config(&resource_plan, &forge_runtime),
                     node_id.as_uuid(),
                 )
-                .map(Arc::new)
-            })
-            .transpose()
-            .map_err(ServerBootError::Forge)?;
+                .map_err(ServerBootError::Forge)?
+                .on_compaction_runtime(handle),
+            ))
+        } else {
+            None
+        };
         Some(Arc::new(Forge::new(
             roles
                 .contains(&BifrostRuntimeRole::ForgeCoordinator)
                 .then_some(coordinator),
             worker,
-            forge_resources,
             shutdown.clone(),
             node_id,
         )))
@@ -1142,15 +1160,42 @@ pub async fn compose_bifrost(
             resources: Some(bifrost_resources.clone()),
         }),
         coordination_runtime,
+        compaction_runtime,
     })
+}
+
+/// Derives one Forge worker's local compaction-admission bounds.
+///
+/// Every bound comes from values the immutable [`ResourcePlan`] already
+/// resolved, so a node cannot admit compaction work its own resource plan did
+/// not reserve. The memory budget is the plan's selected Forge budget verbatim.
+/// Running parallelism is three units per effective CPU, matching upstream's
+/// task multiplier over its detected worker threads, and waiting parallelism is
+/// four times that, so a burst of planned work queues rather than being refused
+/// while earlier plans still run. Tenant fairness is unrelated to either and
+/// stays with the SQL fair claim.
+///
+/// [`ResourcePlan`]: vala_bifrost_redux::resources::ResourcePlan
+fn forge_compaction_worker_config(
+    plan: &vala_bifrost_redux::resources::ResourcePlan,
+    forge_runtime: &crate::config::ForgeRuntimeConfig,
+) -> ForgeWorkerConfig {
+    let max_task_parallelism = u32::try_from(plan.effective_cpu.saturating_mul(3))
+        .unwrap_or(u32::MAX)
+        .max(1);
+    ForgeWorkerConfig {
+        per_tenant_active_cap: forge_runtime.resolved_per_tenant_active_cap(),
+        compaction_memory_budget_bytes: plan.forge_compaction_memory_limit_bytes,
+        max_task_parallelism,
+        pending_task_parallelism: max_task_parallelism.saturating_mul(4),
+    }
 }
 
 /// Build the bounded Forge worker future shared by embedded and worker roles.
 ///
-/// `worker_concurrency` sizes the executor pool; `per_tenant_active_cap` is the
-/// resolved per-tenant admission bound (see
-/// [`crate::config::ForgeRuntimeConfig::resolved_per_tenant_active_cap`]).
-/// Passing them separately keeps tenant fairness decoupled from parallelism.
+/// The bounded worker's local compaction parallelism comes from its own
+/// admission queue, sized once at composition from the immutable resource plan.
+/// This entry point only supervises the resulting single event loop.
 ///
 /// # Errors
 /// Returns [`ServerBootError::ForgeSchedulerRequired`] when Forge is absent or
@@ -1159,23 +1204,29 @@ pub async fn compose_bifrost(
 pub fn spawn_forge_worker(
     state: &AppState,
     shutdown: CancellationToken,
-    _worker_concurrency: usize,
-    _per_tenant_active_cap: usize,
 ) -> Result<
     impl std::future::Future<Output = Result<(), vala_bifrost_redux::forge::ForgeError>>
     + Send
     + 'static,
     ServerBootError,
 > {
-    let worker = state
+    let forge = state
         .bifrost
         .forge()
-        .and_then(Forge::worker)
-        .cloned()
         .ok_or_else(|| ServerBootError::ForgeSchedulerRequired {
             detail: "Bifrost target has no retained Forge worker".to_owned(),
         })?;
-    Ok(async move { worker.as_ref().clone().run(shutdown).await })
+    let worker =
+        forge
+            .worker()
+            .cloned()
+            .ok_or_else(|| ServerBootError::ForgeSchedulerRequired {
+                detail: "Bifrost target has no retained Forge worker".to_owned(),
+            })?;
+    // The readiness handle is the state's, so `/readyz` observes the loop's
+    // current bit rather than a value copied at boot.
+    let readiness = forge.worker_readiness();
+    Ok(async move { worker.as_ref().clone().run(shutdown, readiness).await })
 }
 
 /// One booted server state paired with the coordination-runtime owner it needs.
@@ -1193,6 +1244,12 @@ pub struct BootedServer {
     /// Must be dropped only after the Bifrost graph has drained — in the server
     /// process that is after `BoundServer::run` returns.
     pub coordination_runtime: ScribeCoordinationRuntime,
+    /// Sole owner of the dedicated Forge compaction runtime.
+    ///
+    /// Must be dropped only after Forge worker supervision drains, so an
+    /// admitted plan runner is never abandoned between writing its outputs and
+    /// Preparing its operation.
+    pub compaction_runtime: ForgeCompactionRuntime,
 }
 
 /// Emit pre-telemetry warnings for relaxed config that is still safe to run.
@@ -1260,6 +1317,7 @@ pub async fn build_state(
     let crate::state::ComposedBifrost {
         bifrost,
         coordination_runtime,
+        compaction_runtime,
     } = compose_bifrost(crate::state::BifrostBuildInputs {
         target: config.role,
         deployment_profile: config.deployment_profile,
@@ -1318,6 +1376,7 @@ pub async fn build_state(
     Ok(BootedServer {
         state,
         coordination_runtime,
+        compaction_runtime,
     })
 }
 
@@ -1816,7 +1875,7 @@ impl<'a> OracleRoleBuilder<'a> {
             lifecycle_transport,
             Arc::clone(&authority),
         ));
-        let local_transport = Arc::new(LocalOraclePeerTransport::new(worker));
+        let local_transport = Arc::new(LocalOraclePeerTransport::new(Arc::clone(&worker)));
         let peer_transports = Arc::new(OraclePeerTransportDirectory::new(
             node_id,
             local_transport,
@@ -1856,13 +1915,25 @@ impl<'a> OracleRoleBuilder<'a> {
             peer_transports: Some(peer_transports),
             delegated_admission_config,
             config: oracle_config,
-        }) {
+        })
+        .await
+        {
             Ok(oracle) => Arc::new(oracle),
             Err(error) => {
                 release_failed_oracle_role(&cluster, &role, "construction").await;
                 return Err(ServerBootError::OraclePeer(error.to_string()));
             }
         };
+        // The engine owns the one process reader authority and is built after
+        // this worker, so the follower's single-assignment cell is filled here
+        // — before startup reconciliation, activation, snapshot publication, or
+        // readiness. Until it succeeds a snapshot-bearing assignment fails
+        // closed, and a repeated or late installation fails boot outright.
+        if let Err(error) = worker.install_reader_authority(Arc::clone(oracle.reader_authority())) {
+            oracle.shutdown(std::time::Instant::now()).await;
+            release_failed_oracle_role(&cluster, &role, "reader authority installation").await;
+            return Err(ServerBootError::OraclePeer(error.to_string()));
+        }
         Ok(BuiltOracleRole {
             catalog,
             oracle,
@@ -2228,7 +2299,12 @@ pub fn spawn_maintenance_scheduler(
     let Some(forge) = state.forge_handle().cloned() else {
         return Ok(None);
     };
-    Ok(Some(async move { forge.run(shutdown).await }))
+    let readiness = state
+        .bifrost
+        .forge()
+        .map(Forge::coordinator_readiness)
+        .unwrap_or_default();
+    Ok(Some(async move { forge.run(shutdown, readiness).await }))
 }
 
 /// Loads the one role-neutral Bifrost peer identity for this process.
@@ -2300,6 +2376,245 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    /// The compaction runtime is role-scoped and its budget refuses invalid boot.
+    ///
+    /// Two facts sit on the same owner because composition decides both at the
+    /// same moment. Only a process that actually runs admitted plans builds a
+    /// dedicated executor, and it sizes that executor from the resolved
+    /// effective CPU the memory budget came from rather than from a second CPU
+    /// knob that could disagree. A budget the protected floors cannot cover is
+    /// refused outright, because a clamped budget would silently admit plans
+    /// against memory another role is guaranteed.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a non-worker role builds an executor, when the derived
+    /// admission bounds do not follow effective CPU, or when an invalid budget
+    /// is accepted.
+    #[test]
+    fn forge_runtime_is_role_scoped_and_budget_refuses_invalid_boot() {
+        use vala_bifrost_redux::resources::{
+            BifrostResourcePolicy, BifrostRole, BifrostRuntimeResources, ResourceSource,
+            SystemResourceSnapshot,
+        };
+
+        /// Plans one node exactly as `compose_bifrost` does for these roles.
+        fn plan_for(
+            roles: &[BifrostRole],
+            override_bytes: Option<usize>,
+        ) -> Result<vala_bifrost_redux::resources::ResourcePlan, String> {
+            let scratch = 1024 * 1024 * 1024_u64;
+            BifrostRuntimeResources::from_snapshot(
+                SystemResourceSnapshot {
+                    memory_limit_bytes: 4 * 1024 * 1024 * 1024,
+                    effective_cpu: 6,
+                    scratch_capacity_bytes: scratch * 2,
+                    scratch_available_bytes: scratch * 2,
+                    memory_source: ResourceSource::Injected,
+                    cpu_source: ResourceSource::Injected,
+                },
+                BifrostResourcePolicy {
+                    roles: roles.iter().copied().collect(),
+                    memory_limit_bytes: None,
+                    unmanaged_reserve_bytes: None,
+                    scratch_limit_bytes: Some(scratch),
+                    effective_cpu: None,
+                    oracle_query_slot_limit: None,
+                    forge_compaction_memory_limit_bytes: override_bytes,
+                    scratch_root: std::path::PathBuf::new(),
+                    volume_roots: None,
+                },
+            )
+            .map(|resources| resources.plan())
+            .map_err(|error| error.to_string())
+        }
+
+        // Admission bounds follow the plan's effective CPU, not a new knob.
+        let plan = plan_for(&[BifrostRole::Forge], None).expect("dedicated Forge plans");
+        let forge_runtime = crate::config::ForgeRuntimeConfig::default();
+        let worker = super::forge_compaction_worker_config(&plan, &forge_runtime);
+        assert_eq!(
+            worker.compaction_memory_budget_bytes, plan.forge_compaction_memory_limit_bytes,
+            "the worker charges plans against exactly the reserved budget"
+        );
+        assert_eq!(worker.max_task_parallelism, 18, "three per effective CPU");
+        assert_eq!(
+            worker.pending_task_parallelism, 72,
+            "four times running parallelism may wait"
+        );
+        assert_eq!(worker.per_tenant_active_cap, 1);
+        worker
+            .validate()
+            .expect("composition-derived bounds are usable");
+
+        // The same derivation holds for co-located `All`, which additionally
+        // preserves both protected floors.
+        let all = plan_for(
+            &[BifrostRole::Scribe, BifrostRole::Oracle, BifrostRole::Forge],
+            None,
+        )
+        .expect("co-located All plans");
+        assert!(all.scribe_floor_bytes > 0 && all.oracle_floor_bytes > 0);
+        super::forge_compaction_worker_config(&all, &forge_runtime)
+            .validate()
+            .expect("co-located bounds are usable");
+
+        // Forge absent: nothing is reserved, so nothing may be admitted, which
+        // is what makes the executor role-scoped rather than always-composed.
+        let absent =
+            plan_for(&[BifrostRole::Scribe, BifrostRole::Oracle], None).expect("Forge-absent plan");
+        assert_eq!(absent.forge_compaction_memory_limit_bytes, 0);
+        assert!(
+            super::forge_compaction_worker_config(&absent, &forge_runtime)
+                .validate()
+                .is_err(),
+            "a node that reserved nothing must not compose an admitting worker"
+        );
+
+        // Invalid budgets refuse at planning, before any executor is built.
+        assert!(
+            plan_for(&[BifrostRole::Forge], Some(0)).is_err(),
+            "a zero budget refuses boot"
+        );
+        let safe = all.managed_memory_bytes - all.scribe_floor_bytes - all.oracle_floor_bytes;
+        assert!(
+            plan_for(
+                &[BifrostRole::Scribe, BifrostRole::Oracle, BifrostRole::Forge],
+                Some(safe + 1),
+            )
+            .is_err(),
+            "a budget past the protected floors refuses boot, never clamps"
+        );
+
+        // Only the Forge worker role reaches the executor construction at all.
+        let production = include_str!("mod.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("boot module has production source before tests");
+        assert_eq!(
+            production
+                .matches("compaction_runtime = ForgeCompactionRuntime::new(Some(runtime))")
+                .count(),
+            1,
+            "exactly one composition site installs the dedicated executor"
+        );
+        let installed = production
+            .split("compaction_runtime = ForgeCompactionRuntime::new(Some(runtime))")
+            .next()
+            .expect("source before the install site");
+        assert!(
+            installed
+                .rsplit("if roles.contains(")
+                .next()
+                .is_some_and(|guard| guard.starts_with("&BifrostRuntimeRole::ForgeWorker)")),
+            "the executor must be built only under the Forge worker role guard"
+        );
+    }
+
+    /// Orphan listing refuses a backend that cannot resume from a cursor.
+    ///
+    /// The bounded orphan scan's only anti-starvation mechanism is an exclusive
+    /// `start_after` cursor: without native support a leading page of protected
+    /// objects would be relisted forever and the later pages behind it would
+    /// never be reached. Emulating the cursor by filtering would reintroduce the
+    /// unbounded listing the cap exists to prevent, so the production adapter
+    /// fails closed instead. The filesystem service is the already-installed
+    /// backend that advertises the capability as absent, which makes it the
+    /// exact case this refusal exists for.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the filesystem operator cannot be built, when it starts
+    /// advertising cursor support, or when listing is permitted anyway.
+    #[tokio::test]
+    async fn open_dal_forge_listing_refuses_backend_without_start_after() {
+        let root = tempfile::tempdir().expect("listing root");
+        let operator = opendal::Operator::new(
+            opendal::services::Fs::default().root(&root.path().to_string_lossy()),
+        )
+        .expect("filesystem operator builds")
+        .finish();
+        assert!(
+            !operator.info().full_capability().list_with_start_after,
+            "the filesystem service is the backend this refusal exists for"
+        );
+        let store = OpenDalForgeObjectStore::new(Arc::new(operator));
+        for cursor in [None, Some("tenants/t/table/data/forge/v1/a.parquet")] {
+            let error = store
+                .list_pages("tenants/t/table/data/forge/v1/", cursor)
+                .await
+                .err()
+                .expect("a backend without cursor support cannot be listed");
+            assert_eq!(error.kind(), opendal::ErrorKind::Unsupported);
+        }
+    }
+
+    /// A capable lister's directory entries never consume the page bound.
+    ///
+    /// The production page bound counts addressable objects, because the task
+    /// cursor advances over objects only. A chunk of leading directory markers
+    /// would otherwise yield an empty page and leave the frontier stationary,
+    /// starving the later object behind it. The filesystem service plus the
+    /// installed capability override is the smallest backend that both yields
+    /// directory entries and advertises cursor support.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the operator cannot be built, when the override does not
+    /// advertise cursor support, when the single page is not exactly the one
+    /// object, or when the stream yields another page.
+    #[tokio::test]
+    async fn open_dal_forge_listing_filters_directories_before_page_boundary() {
+        let root = tempfile::tempdir().expect("listing root");
+        let operator = opendal::Operator::new(
+            opendal::services::Fs::default().root(&root.path().to_string_lossy()),
+        )
+        .expect("filesystem operator builds")
+        .layer(opendal::layers::CapabilityOverrideLayer::new(
+            |mut capability| {
+                capability.list_with_start_after = true;
+                capability
+            },
+        ))
+        .finish();
+        assert!(
+            operator.info().full_capability().list_with_start_after,
+            "the overridden operator must advertise cursor support"
+        );
+        let prefix = "tenants/t/table/data/forge/v1/";
+        for index in 0..FORGE_OBJECT_LIST_PAGE_ENTRIES {
+            operator
+                .create_dir(&format!("{prefix}{index:06}/"))
+                .await
+                .expect("leading directory marker is created");
+        }
+        let object = format!("{prefix}zzzzzz.parquet");
+        operator
+            .write(&object, "orphan")
+            .await
+            .expect("trailing object is written");
+
+        let store = OpenDalForgeObjectStore::new(Arc::new(operator));
+        let mut pages = store
+            .list_pages(prefix, None)
+            .await
+            .expect("a cursor-capable backend is listable");
+        let page = pages
+            .next()
+            .await
+            .expect("one object-only page is yielded")
+            .expect("the page lists successfully");
+        let paths = page
+            .iter()
+            .map(|entry| entry.path().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(paths, vec![object], "the page holds only the object");
+        assert!(
+            pages.next().await.is_none(),
+            "the object-only page is the whole listing"
+        );
+    }
+
     /// Boot rejects an intrinsic replay envelope while accepting its exact boundary.
     ///
     /// # Panics
@@ -2365,8 +2680,6 @@ mod tests {
             orphan_gc_max_list_pages: Some(64),
             orphan_gc_run_budget_secs: Some(30),
             maintenance_interval_secs: Some(45),
-            max_files_per_tick: Some(512),
-            max_bytes_per_tick: Some(256 * 1024 * 1024),
             ..crate::config::ForgeRuntimeConfig::default()
         };
         let (config, maintenance_interval) = resolve_forge_config(&runtime);
@@ -2386,14 +2699,11 @@ mod tests {
             config.orphan_gc_run_budget,
             std::time::Duration::from_secs(30)
         );
-        assert_eq!(config.max_files_per_tick, 512);
-        assert_eq!(config.max_bytes_per_tick, 256 * 1024 * 1024);
         assert_eq!(maintenance_interval, std::time::Duration::from_secs(45));
         config
             .validate()
             .expect("resolved override config must validate");
         // Fields outside the promoted set retain their compiled defaults.
-        assert_eq!(config.min_files, ForgeConfig::default().min_files);
         assert_eq!(config.lease_ttl, ForgeConfig::default().lease_ttl);
     }
 

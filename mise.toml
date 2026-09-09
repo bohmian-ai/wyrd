@@ -227,6 +227,15 @@ hide = true
 description = "wyrd-testing `forge` binary, whole"
 run = "cargo nextest run --locked -p wyrd-testing --test forge -P journey --run-ignored=all"
 
+[tasks."test:bifrost:journey:forge:production-geometry"]
+description = "The compaction-geometry journey at standard 512 MiB/1 GiB production sizes"
+run = """
+scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && \
+  WYRD_FORGE_PRODUCTION_GEOMETRY=1 cargo nextest run --locked -p wyrd-testing --test forge \
+  -P journey --run-ignored=all \
+  -E "test(=production_closeout::compaction_geometry_exact_rows_and_non_destructive_second_pass)"'
+"""
+
 [tasks."test:bifrost:journey:scribe"]
 description = "Tier-1 journeys: write, ack, seal, WAL replay, admission window, source boundary"
 run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run test:bifrost:journey:scribe:inner'"
@@ -674,6 +683,11 @@ run = "python scripts/tests/test_check_unwrap_audit.py"
 hide = true
 description = "Audit `#[allow(clippy::...)]` attributes outside tests and examples (requires a `// justification:` comment on the previous line)"
 run = "python scripts/check_clippy_allow.py"
+
+[tasks."check:tenant-isolation:self"]
+hide = true
+description = "Self-tests for the tenant isolation check script"
+run = "python scripts/tests/test_check_tenant_isolation.py"
 
 [tasks."check:clippy-allow-audit:self"]
 hide = true
@@ -1184,6 +1198,7 @@ depends = [
   "check:audit-script",
   "check:clippy-allow-audit",
   "check:clippy-allow-audit:self",
+  "check:tenant-isolation:self",
   "check:test-coverage:self",
   "check:storage:drift",
   "check:registry-tx-coupling",

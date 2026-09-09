@@ -257,7 +257,7 @@ fn decode_logs_request(
     let mut output = ExportLogsServiceRequest::default();
     let mut first = true;
     let mut seen = 0_u128;
-    cursor.expect(b'{')?;
+    cursor.consume_expected(b'{')?;
     while let Some(field) = next_object_field(cursor, &mut first)? {
         match field {
             Field::ResourceLogs => {
@@ -280,7 +280,7 @@ fn decode_resource_logs(cursor: &mut JsonCursor<'_>) -> Result<ResourceLogs, Jso
     let mut output = ResourceLogs::default();
     let mut first = true;
     let mut seen = 0_u128;
-    cursor.expect(b'{')?;
+    cursor.consume_expected(b'{')?;
     while let Some(field) = next_object_field(cursor, &mut first)? {
         match field {
             Field::Resource => {
@@ -311,7 +311,7 @@ fn decode_scope_logs(cursor: &mut JsonCursor<'_>) -> Result<ScopeLogs, JsonDecod
     let mut output = ScopeLogs::default();
     let mut first = true;
     let mut seen = 0_u128;
-    cursor.expect(b'{')?;
+    cursor.consume_expected(b'{')?;
     while let Some(field) = next_object_field(cursor, &mut first)? {
         match field {
             Field::Scope => {
@@ -342,7 +342,7 @@ fn decode_log_record(cursor: &mut JsonCursor<'_>) -> Result<LogRecord, JsonDecod
     let mut output = LogRecord::default();
     let mut first = true;
     let mut seen = 0_u128;
-    cursor.expect(b'{')?;
+    cursor.consume_expected(b'{')?;
     while let Some(field) = next_object_field(cursor, &mut first)? {
         match field {
             Field::TimeUnixNano => {

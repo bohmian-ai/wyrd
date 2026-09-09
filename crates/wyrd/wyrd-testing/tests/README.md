@@ -39,7 +39,7 @@ mistake unrepresentable.
 
 | Binary | Modules | Proves | Setup |
 |---|---|---|---|
-| `forge` | `ownership`, `expiry`, `convergence`, `orphan_gc`, `dedicated_roles`, `live_rewrite`, `live_replacement`, `lease_theft`, `commit_windows`, `maintenance_interleaving` | compaction, maintenance, publication recovery, worker lifecycle, lease reclaim, commit-window reconciliation | Postgres |
+| `forge` | `scribe_promotion`, `live_rewrite`, `production_closeout` | compaction, maintenance, publication recovery, worker lifecycle, lease reclaim, commit-window reconciliation | Postgres |
 | `scribe` | `write_read`, `telemetry`, `lifecycle`, `event_time_window`, `source_boundary`, `source_boundary_recovery` | write, ack, seal, WAL replay, exactly-once restart, admission window, OTLP source-boundary durability | Postgres + server |
 | `oracle` | `published`, `distributed`, `convergence`, `spill`, `capacity`, `grpc_surface`, `observability`, `recovery`, `layout`, `peer` | query execution, distributed follower dispatch, peer security, tail fencing, cancellation, telemetry | Postgres + server |
 | `otlp` | `logs_export`, `metrics_export`, `trace_export`, `trace_export_http`, `mixed_batch`, `negative` | OTLP logs, metrics, traces, mixed batch, negative protocol surface | Postgres + server |

@@ -1037,7 +1037,6 @@ mod tests {
                 wal,
                 scribe_stage: stage_root.to_owned(),
                 scribe_output_scratch: scribe_output,
-                forge_scratch: forge,
                 oracle_scratch: oracle,
             },
             1024 * 1024 * 1024,

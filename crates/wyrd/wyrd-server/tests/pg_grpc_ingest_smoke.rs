@@ -407,19 +407,21 @@ async fn connect_grpc(addr: SocketAddr) -> BifrostIngestServiceClient<Channel> {
     BifrostIngestServiceClient::new(connect_channel(addr).await)
 }
 
-/// Builds a valid resource whose encoded body approaches the admitted ceiling.
+/// Builds a valid resource whose encoded body is bulky but transport-admissible.
 ///
-/// Transport admission acquires the declared frame length before any codec
-/// runs, so a body over `BIFROST_INGEST_REQUEST_LIMIT_BYTES` is refused as
-/// `ResourceExhausted` and never reaches authentication. Sizing just under that
-/// limit keeps the body expensive enough to prove the codec never ran while
-/// leaving authentication as the operative refusal.
-fn near_cap_resource() -> Resource {
+/// The size must clear two independent ceilings for this fixture to prove what
+/// it claims. Byte-weighted transport admission runs at the server edge, ahead
+/// of authentication, and refuses an encoded body larger than the composed
+/// aggregate reserve with `ResourceExhausted` — a refusal that would mask the
+/// authentication decision under test. Sizing the payload from the live
+/// admission bounds keeps the body large enough that decoding it would be
+/// visible work, while guaranteeing the request reaches the authenticator.
+fn near_cap_resource(payload_bytes: usize) -> Resource {
     Resource {
         attributes: vec![KeyValue {
             key: "payload".to_owned(),
             value: Some(AnyValue {
-                value: Some(any_value::Value::StringValue("x".repeat(15 * 1024 * 1024))),
+                value: Some(any_value::Value::StringValue("x".repeat(payload_bytes))),
             }),
         }],
         dropped_attributes_count: 0,
@@ -450,10 +452,16 @@ async fn otlp_unauthenticated_precedes_decode() {
     tokio::spawn(async move { serve_grpc(router, bind, token).await });
     let channel = connect_channel(bind).await;
     wyrd_server::grpc::reset_otlp_codec_activity();
+    let admission = state.bifrost.transport_admission();
+    let payload_bytes = admission.limit_bytes().min(admission.message_limit_bytes()) / 2;
+    assert!(
+        payload_bytes > 0,
+        "the composed transport reserve must admit a non-empty encoded body"
+    );
 
     let trace = ExportTraceServiceRequest {
         resource_spans: vec![ResourceSpans {
-            resource: Some(near_cap_resource()),
+            resource: Some(near_cap_resource(payload_bytes)),
             ..ResourceSpans::default()
         }],
     };
@@ -465,7 +473,7 @@ async fn otlp_unauthenticated_precedes_decode() {
 
     let metrics = ExportMetricsServiceRequest {
         resource_metrics: vec![ResourceMetrics {
-            resource: Some(near_cap_resource()),
+            resource: Some(near_cap_resource(payload_bytes)),
             ..ResourceMetrics::default()
         }],
     };
@@ -484,7 +492,7 @@ async fn otlp_unauthenticated_precedes_decode() {
 
     let logs = ExportLogsServiceRequest {
         resource_logs: vec![ResourceLogs {
-            resource: Some(near_cap_resource()),
+            resource: Some(near_cap_resource(payload_bytes)),
             ..ResourceLogs::default()
         }],
     };
@@ -674,7 +682,15 @@ async fn embedded_ingest_resolves_catalog_and_durably_acknowledges_arrow() {
     let accepted = replayed
         .values()
         .find(|stream| stream.seal_key.table.name == TABLE_NAME)
-        .expect("catalog-resolved logical table has durable WAL state");
+        .unwrap_or_else(|| {
+            let replayed_tables = replayed
+                .values()
+                .map(|stream| stream.seal_key.table.fqn())
+                .collect::<Vec<_>>();
+            panic!(
+                "catalog-resolved logical table has durable WAL state; replayed: {replayed_tables:?}"
+            )
+        });
     assert_eq!(accepted.data_records.len(), 1);
 
     state

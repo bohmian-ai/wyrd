@@ -114,9 +114,9 @@ transaction-pooled path.
 - Oracle has a persistent local volume for its read-audit acceptance WAL and a
   bounded, encrypted scratch volume for spill. Spill is disposable after query
   termination; the audit WAL is not.
-- Forge scratch is bounded and disposable only after its durable task,
-  attempt, object, catalog, and reconciliation state prove that deletion is
-  safe.
+- Forge requires no local scratch volume: managed compaction does not enable
+  DataFusion disk spilling. Its pod memory limit remains the final physical
+  boundary behind estimated-memory admission.
 - Volume purpose, tenant/table path grammar, encryption, capacity, inode
   budget, cleanup owner, and alert thresholds are explicit. A volume cannot be
   shared across incompatible purposes merely to increase apparent free space.

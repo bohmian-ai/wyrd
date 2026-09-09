@@ -63,6 +63,11 @@ impl ClusterNodes {
 
     /// Registers one role and atomically advances only its composite fence.
     ///
+    /// The existing role row is taken `FOR UPDATE` before the UPSERT so that
+    /// registration of a replacement and renewal of the incumbent's Oracle
+    /// reader lease serialize on one row, in the one lock order every epoch
+    /// statement uses.
+    ///
     /// # Errors
     /// Returns [`SqlError`] for invalid capabilities/address, overflow, JSON,
     /// or database failures.
@@ -79,6 +84,22 @@ impl ClusterNodes {
         let role = role_name(registration.key.role);
         let capabilities = serde_json::to_value(&registration.capabilities)
             .map_err(|error| invariant(&error.to_string()))?;
+        // Registration and Oracle lease renewal share one lock order: the role
+        // row first, then the epoch. Taking the row here means a replacement
+        // selecting a new fence and an incumbent renewing its lease serialize,
+        // so an epoch whose fence has already been superseded cannot renew for
+        // one more round. A first registration has no row to lock and the
+        // UPSERT below creates it.
+        sqlx::query(
+            "SELECT 1 FROM vala.cluster_nodes \
+             WHERE data_tenant_id=$1 AND node_id=$2 AND role=$3 FOR UPDATE",
+        )
+        .bind(uuid::Uuid::from(conn.data_tenant_id()))
+        .bind(registration.key.node_id.as_uuid())
+        .bind(role)
+        .fetch_optional(&mut **conn.transaction())
+        .await
+        .map_err(SqlError::from)?;
         let row = sqlx::query_as::<_, ClusterNodeDbRow>(
             r#"INSERT INTO vala.cluster_nodes
                (data_tenant_id, node_id, role, advertise_addr, fencing_token, started_at, heartbeat_at,

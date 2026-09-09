@@ -15,6 +15,7 @@
 
 use std::ops::Range;
 use std::sync::Arc;
+use std::task::Poll;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -94,10 +95,19 @@ impl BifrostIcebergStorage {
     /// reconstruction is exactly how a foreign path becomes a legitimate-looking
     /// read.
     ///
+    /// Two spellings reach this boundary and both are already warehouse-local.
+    /// Iceberg metadata carries absolute locations, which must live under the
+    /// active warehouse. Scribe registers a promoted object by its operator key,
+    /// which names no authority at all: it has no scheme and no leading `/`, so
+    /// it cannot denote a different backend, and it is passed through unchanged
+    /// rather than re-prefixed. Everything else — a foreign scheme, a
+    /// filesystem-absolute path, a traversing segment — is refused.
+    ///
     /// # Errors
     /// Returns [`IcebergErrorKind::DataInvalid`] when the location carries a
-    /// query or fragment, does not live under the active warehouse, is the
-    /// warehouse root itself, or contains an empty or `.`/`..` path segment.
+    /// query or fragment, names an authority outside the active warehouse, is
+    /// filesystem-absolute, is the warehouse root itself, or contains an empty
+    /// or `.`/`..` path segment.
     fn relativize(&self, location: &str) -> IcebergResult<String> {
         let refuse = |reason: &str| {
             Err(IcebergError::new(
@@ -111,11 +121,18 @@ impl BifrostIcebergStorage {
         if location.contains('?') || location.contains('#') {
             return refuse("a location carries a query or fragment");
         }
-        let Some(relative) = location.strip_prefix(&*self.warehouse) else {
-            return refuse("the location is outside the active warehouse");
-        };
-        let Some(relative) = relative.strip_prefix('/') else {
-            return refuse("the location is the warehouse root itself");
+        let relative = match location.strip_prefix(&*self.warehouse) {
+            Some(under_warehouse) => match under_warehouse.strip_prefix('/') {
+                Some(relative) => relative,
+                None => return refuse("the location is the warehouse root itself"),
+            },
+            None if location.contains("://") => {
+                return refuse("the location is outside the active warehouse");
+            }
+            None if location.starts_with('/') => {
+                return refuse("the location is outside the active warehouse");
+            }
+            None => location,
         };
         if relative.is_empty() {
             return refuse("the location names no object");
@@ -421,9 +438,218 @@ impl StorageFactory for BifrostIcebergStorageFactory {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use futures_util::Stream as _;
+
+    use tokio_util::sync::CancellationToken;
 
     use super::*;
     use crate::storage::{BifrostStorageConfig, BifrostStoragePolicy};
+
+    /// Builds one list entry the gated wrapper is asked to expose.
+    fn entry(path: &str) -> ListEntry {
+        ListEntry {
+            path: path.to_owned(),
+            size: 1,
+            last_modified_ms: None,
+            is_dir: false,
+        }
+    }
+
+    /// Counts every poll a wrapped backend listing actually receives.
+    ///
+    /// The count is the whole point: a wrapper that collects eagerly, or that
+    /// keeps polling after a permit refusal, is indistinguishable from a
+    /// correct one by its yielded items alone.
+    fn counting_backend(
+        entries: Vec<ListEntry>,
+        polls: Arc<AtomicUsize>,
+    ) -> BoxStream<'static, IcebergResult<ListEntry>> {
+        let mut remaining = entries.into_iter();
+        stream::poll_fn(move |_| {
+            polls.fetch_add(1, Ordering::SeqCst);
+            std::task::Poll::Ready(remaining.next().map(Ok))
+        })
+        .boxed()
+    }
+
+    /// Proves a lazy listing gates every backend poll and every exposed item.
+    ///
+    /// Three fences are exercised because they refuse at different boundaries:
+    /// a fence taken before the first poll must stop the backend from being
+    /// polled at all, a fence taken while an item is already in hand must stop
+    /// that item from reaching the caller, and a fence landing while the
+    /// backend is parked on `Pending` must stop the resumed poll that a
+    /// retained `next()` future would otherwise perform ungated. All three
+    /// must terminate the wrapper after exactly one error rather than resuming
+    /// on the next poll.
+    #[tokio::test]
+    async fn gated_list_stops_polling_and_yielding_after_fence() {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_mins(1);
+        live_permit_exposes_every_entry(deadline).await;
+        fence_before_the_first_poll_reaches_no_backend(deadline).await;
+        fence_with_an_item_in_hand_refuses_that_item(deadline).await;
+        fence_while_the_backend_is_parked_refuses_the_resumed_poll(deadline);
+    }
+
+    /// A live permit exposes every entry and polls the backend once per item
+    /// plus the final exhaustion poll.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an entry is refused or the backend poll count differs.
+    async fn live_permit_exposes_every_entry(deadline: tokio::time::Instant) {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let live = crate::oracle::reader_pins::ReaderIoPermit::new(
+            CancellationToken::new(),
+            CancellationToken::new(),
+            deadline,
+        );
+        let mut stream = gate_list_stream(
+            counting_backend(vec![entry("a"), entry("b")], Arc::clone(&polls)),
+            live,
+        );
+        let mut exposed = Vec::new();
+        while let Some(item) = stream.next().await {
+            exposed.push(item.expect("a live permit exposes every entry").path);
+        }
+        assert_eq!(exposed, vec!["a".to_owned(), "b".to_owned()]);
+        assert_eq!(polls.load(Ordering::SeqCst), 3);
+    }
+
+    /// A fence taken after the stream exists but before it is polled must
+    /// reach the backend zero times.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the listing is not refused, when the wrapper resumes, or
+    /// when the backend is polled at all.
+    async fn fence_before_the_first_poll_reaches_no_backend(deadline: tokio::time::Instant) {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let epoch = CancellationToken::new();
+        let mut stream = gate_list_stream(
+            counting_backend(vec![entry("a"), entry("b")], Arc::clone(&polls)),
+            crate::oracle::reader_pins::ReaderIoPermit::new(
+                epoch.clone(),
+                CancellationToken::new(),
+                deadline,
+            ),
+        );
+        epoch.cancel();
+        assert!(
+            stream
+                .next()
+                .await
+                .expect("one permit error is yielded")
+                .is_err(),
+            "a fenced epoch refuses the listing rather than returning entries"
+        );
+        assert!(
+            stream.next().await.is_none(),
+            "the wrapper terminates after its one permit error"
+        );
+        assert_eq!(
+            polls.load(Ordering::SeqCst),
+            0,
+            "no backend poll happens after the fence"
+        );
+    }
+
+    /// A fence that lands while a backend item is already in hand must stop
+    /// that item from reaching the caller, and must not poll again after.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the entry is exposed, when the wrapper resumes, or when the
+    /// backend is polled a second time.
+    async fn fence_with_an_item_in_hand_refuses_that_item(deadline: tokio::time::Instant) {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let epoch = CancellationToken::new();
+        let fencing = epoch.clone();
+        let counted = Arc::clone(&polls);
+        let backend = stream::poll_fn(move |_| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            fencing.cancel();
+            std::task::Poll::Ready(Some(Ok(entry("a"))))
+        })
+        .boxed();
+        let mut stream = gate_list_stream(
+            backend,
+            crate::oracle::reader_pins::ReaderIoPermit::new(
+                epoch,
+                CancellationToken::new(),
+                deadline,
+            ),
+        );
+        assert!(
+            stream
+                .next()
+                .await
+                .expect("one permit error is yielded")
+                .is_err(),
+            "an entry read legally but fenced before exposure is refused, not returned"
+        );
+        assert!(stream.next().await.is_none());
+        assert_eq!(
+            polls.load(Ordering::SeqCst),
+            1,
+            "the fenced wrapper never polls the backend again"
+        );
+    }
+
+    /// A backend parked on `Pending` must not be resumed after a fence.
+    ///
+    /// Polls are driven by hand because the property is about which poll
+    /// reaches the backend, and an executor would hide that ordering behind
+    /// wakeups. This is also why the case is synchronous.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the resumed poll reaches the backend, when the fence is not
+    /// reported as one permit error, or when the wrapper does not terminate.
+    fn fence_while_the_backend_is_parked_refuses_the_resumed_poll(deadline: tokio::time::Instant) {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let epoch = CancellationToken::new();
+        let counted = Arc::clone(&polls);
+        let backend = stream::poll_fn(move |_| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            std::task::Poll::<Option<IcebergResult<ListEntry>>>::Pending
+        })
+        .boxed();
+        let mut stream = gate_list_stream(
+            backend,
+            crate::oracle::reader_pins::ReaderIoPermit::new(
+                epoch.clone(),
+                CancellationToken::new(),
+                deadline,
+            ),
+        );
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(
+            std::pin::Pin::new(&mut stream)
+                .poll_next(&mut cx)
+                .is_pending(),
+            "a parked backend leaves the wrapper pending"
+        );
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+        epoch.cancel();
+        let refused = std::pin::Pin::new(&mut stream).poll_next(&mut cx);
+        assert!(
+            matches!(refused, std::task::Poll::Ready(Some(Err(_)))),
+            "a fence landing while the backend is parked refuses the resumed poll"
+        );
+        assert_eq!(
+            polls.load(Ordering::SeqCst),
+            1,
+            "the resumed poll never reaches the backend"
+        );
+        assert!(matches!(
+            std::pin::Pin::new(&mut stream).poll_next(&mut cx),
+            std::task::Poll::Ready(None)
+        ));
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+    }
 
     /// Builds an adapter over a real local backend rooted at `root`.
     ///
@@ -681,5 +907,307 @@ mod tests {
         let boxed: Box<dyn StorageFactory> = Box::new(factory);
         assert!(serde_json::to_string(&boxed).is_err());
         assert!(warehouse.starts_with("file://"));
+    }
+}
+
+/// The one message every refused write on the read-only query adapter reports.
+///
+/// Query-scoped storage exists to read a pinned snapshot. A write reaching it
+/// is a construction mistake, not a permission failure, so it names the adapter
+/// rather than suggesting the caller retry with different authority.
+const READ_ONLY_QUERY_STORAGE: &str =
+    "epoch-gated query storage is read-only and cannot write, delete, or open an output";
+
+/// Maps a refused permit onto Iceberg's error type.
+///
+/// `FeatureUnsupported` is deliberate: the object is reachable and the request
+/// is well formed, but this process no longer holds the authority that made
+/// reading it safe, and Iceberg must not retry that at its own layer the way it
+/// retries `Unexpected`.
+fn permit_error(error: &wyrd_spec::vala::BifrostError) -> IcebergError {
+    IcebergError::new(IcebergErrorKind::FeatureUnsupported, error.to_string())
+}
+
+/// Wraps one lazy listing so the permit gates every poll and every item.
+///
+/// A listing is the one storage operation whose work outlives the call that
+/// created it: the backend stream is returned unread and polled later, by
+/// whatever consumes it. Checking the permit only at construction would
+/// therefore leave the entire enumeration ungated, so the permit is checked
+/// immediately before each backend poll and again before each item — backend
+/// errors included — is handed on.
+///
+/// A refusal yields exactly one error and then terminates: `done` latches, so
+/// every later poll reports exhaustion without touching the backend. The
+/// wrapper adds no buffering and collects nothing, so laziness and the
+/// backend's own backpressure are unchanged.
+///
+/// The backend is polled directly rather than through a retained `next()`
+/// future, because such a future outlives a `Pending` return: a fence landing
+/// while the backend is parked would then be followed by a resumed backend
+/// poll that no `begin_io` ever authorized. Polling the inner stream here
+/// means every single backend poll is preceded by its own permit check.
+fn gate_list_stream(
+    entries: BoxStream<'static, IcebergResult<ListEntry>>,
+    permit: crate::oracle::reader_pins::ReaderIoPermit,
+) -> BoxStream<'static, IcebergResult<ListEntry>> {
+    let mut entries = entries;
+    let mut done = false;
+    stream::poll_fn(move |cx| {
+        if done {
+            return Poll::Ready(None);
+        }
+        if let Err(error) = permit.begin_io() {
+            done = true;
+            return Poll::Ready(Some(Err(permit_error(&error))));
+        }
+        match entries.as_mut().poll_next(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(None) => {
+                done = true;
+                Poll::Ready(None)
+            }
+            Poll::Ready(Some(item)) => {
+                if let Err(error) = permit.expose_result() {
+                    done = true;
+                    return Poll::Ready(Some(Err(permit_error(&error))));
+                }
+                Poll::Ready(Some(item))
+            }
+        }
+    })
+    .boxed()
+}
+
+/// Read-only Iceberg storage that no operation escapes without a live permit.
+///
+/// Every reachable read checks the permit immediately before the backend call
+/// and again after it completes, before anything is returned. The second check
+/// is the one that matters for correctness: without it, a read that started
+/// legally could still hand bytes from a snapshot to a query whose epoch lost
+/// authority while the read was in flight, and Forge may already have deleted
+/// what those bytes describe.
+///
+/// Writes are not gated, they are refused. This adapter is built per query from
+/// a pinned immutable cut; there is no correct write through it, so admitting
+/// one under a valid permit would be worse than rejecting it.
+#[derive(Debug, Clone)]
+pub struct EpochGatedIcebergStorage {
+    /// Ungated adapter every authorized operation delegates to.
+    inner: BifrostIcebergStorage,
+    /// Proof that this query's epoch still authorizes snapshot-dependent IO.
+    permit: crate::oracle::reader_pins::ReaderIoPermit,
+}
+
+impl EpochGatedIcebergStorage {
+    /// Binds one query's permit to this node's storage adapter.
+    #[must_use]
+    pub fn new(
+        inner: BifrostIcebergStorage,
+        permit: crate::oracle::reader_pins::ReaderIoPermit,
+    ) -> Self {
+        Self { inner, permit }
+    }
+}
+
+impl Serialize for EpochGatedIcebergStorage {
+    /// Always refuses: the permit is authority local to this process and epoch.
+    ///
+    /// # Errors
+    /// Always returns a serializer error carrying [`NOT_PORTABLE`].
+    fn serialize<S: Serializer>(&self, _serializer: S) -> Result<S::Ok, S::Error> {
+        Err(S::Error::custom(NOT_PORTABLE))
+    }
+}
+
+impl<'de> Deserialize<'de> for EpochGatedIcebergStorage {
+    /// Always refuses: a reconstructed permit would authorize nothing real.
+    ///
+    /// # Errors
+    /// Always returns a deserializer error carrying [`NOT_PORTABLE`].
+    fn deserialize<D: Deserializer<'de>>(_deserializer: D) -> Result<Self, D::Error> {
+        Err(D::Error::custom(NOT_PORTABLE))
+    }
+}
+
+#[async_trait]
+#[typetag::serde]
+impl Storage for EpochGatedIcebergStorage {
+    async fn exists(&self, path: &str) -> IcebergResult<bool> {
+        self.permit.begin_io().map_err(|e| permit_error(&e))?;
+        let found = self.inner.exists(path).await?;
+        self.permit.expose_result().map_err(|e| permit_error(&e))?;
+        Ok(found)
+    }
+
+    async fn metadata(&self, path: &str) -> IcebergResult<FileMetadata> {
+        self.permit.begin_io().map_err(|e| permit_error(&e))?;
+        let metadata = self.inner.metadata(path).await?;
+        self.permit.expose_result().map_err(|e| permit_error(&e))?;
+        Ok(metadata)
+    }
+
+    async fn read(&self, path: &str) -> IcebergResult<Bytes> {
+        self.permit.begin_io().map_err(|e| permit_error(&e))?;
+        let bytes = self.inner.read(path).await?;
+        self.permit.expose_result().map_err(|e| permit_error(&e))?;
+        Ok(bytes)
+    }
+
+    async fn reader(&self, path: &str) -> IcebergResult<Box<dyn FileRead>> {
+        self.permit.begin_io().map_err(|e| permit_error(&e))?;
+        let inner = self.inner.reader(path).await?;
+        self.permit.expose_result().map_err(|e| permit_error(&e))?;
+        Ok(Box::new(EpochGatedFileRead {
+            inner,
+            permit: self.permit.clone(),
+        }))
+    }
+
+    async fn write(&self, _path: &str, _bs: Bytes) -> IcebergResult<()> {
+        Err(IcebergError::new(
+            IcebergErrorKind::FeatureUnsupported,
+            READ_ONLY_QUERY_STORAGE,
+        ))
+    }
+
+    async fn writer(&self, _path: &str) -> IcebergResult<Box<dyn FileWrite>> {
+        Err(IcebergError::new(
+            IcebergErrorKind::FeatureUnsupported,
+            READ_ONLY_QUERY_STORAGE,
+        ))
+    }
+
+    async fn delete(&self, _path: &str) -> IcebergResult<()> {
+        Err(IcebergError::new(
+            IcebergErrorKind::FeatureUnsupported,
+            READ_ONLY_QUERY_STORAGE,
+        ))
+    }
+
+    async fn delete_prefix(&self, _path: &str) -> IcebergResult<()> {
+        Err(IcebergError::new(
+            IcebergErrorKind::FeatureUnsupported,
+            READ_ONLY_QUERY_STORAGE,
+        ))
+    }
+
+    async fn delete_stream(&self, _paths: BoxStream<'static, String>) -> IcebergResult<()> {
+        Err(IcebergError::new(
+            IcebergErrorKind::FeatureUnsupported,
+            READ_ONLY_QUERY_STORAGE,
+        ))
+    }
+
+    async fn list(
+        &self,
+        path: &str,
+        recursive: bool,
+    ) -> IcebergResult<BoxStream<'static, IcebergResult<ListEntry>>> {
+        self.permit.begin_io().map_err(|e| permit_error(&e))?;
+        let entries = self.inner.list(path, recursive).await?;
+        self.permit.expose_result().map_err(|e| permit_error(&e))?;
+        Ok(gate_list_stream(entries, self.permit.clone()))
+    }
+
+    fn new_input(&self, path: &str) -> IcebergResult<InputFile> {
+        self.permit.begin_io().map_err(|e| permit_error(&e))?;
+        self.inner.new_input(path)?;
+        Ok(InputFile::new(Arc::new(self.clone()), path.to_owned()))
+    }
+
+    fn new_output(&self, _path: &str) -> IcebergResult<OutputFile> {
+        Err(IcebergError::new(
+            IcebergErrorKind::FeatureUnsupported,
+            READ_ONLY_QUERY_STORAGE,
+        ))
+    }
+}
+
+/// A ranged reader that re-checks the permit around every range.
+///
+/// A Parquet scan opens one reader and then issues many ranged reads over the
+/// life of a query, so checking only at open would leave the longest-lived
+/// route to object bytes ungated for the rest of the query.
+pub struct EpochGatedFileRead {
+    /// Ungated reader every authorized range delegates to.
+    inner: Box<dyn FileRead>,
+    /// Proof that this query's epoch still authorizes snapshot-dependent IO.
+    permit: crate::oracle::reader_pins::ReaderIoPermit,
+}
+
+impl std::fmt::Debug for EpochGatedFileRead {
+    /// Prints the wrapper without the object identity the reader holds.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EpochGatedFileRead")
+            .field("permit", &self.permit)
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl FileRead for EpochGatedFileRead {
+    async fn read(&self, range: Range<u64>) -> IcebergResult<Bytes> {
+        self.permit.begin_io().map_err(|e| permit_error(&e))?;
+        let bytes = self.inner.read(range).await?;
+        self.permit.expose_result().map_err(|e| permit_error(&e))?;
+        Ok(bytes)
+    }
+}
+
+/// Builds epoch-gated storage for exactly one query.
+///
+/// Iceberg asks the factory per catalog configuration and ignores it here for
+/// the same reason [`BifrostIcebergStorageFactory`] does: the backend is
+/// already decided. What this factory adds is that every instance it hands out
+/// carries the same query's permit, so a table built through it cannot acquire
+/// an ungated route to storage partway down its own metadata tree.
+#[derive(Debug, Clone)]
+pub struct EpochGatedIcebergStorageFactory {
+    /// The gated storage every built instance shares.
+    storage: EpochGatedIcebergStorage,
+}
+
+impl EpochGatedIcebergStorageFactory {
+    /// Binds a factory to one owner, one warehouse root, and one permit.
+    #[must_use]
+    pub fn new(
+        storage: Arc<BifrostStorage>,
+        warehouse: &str,
+        permit: crate::oracle::reader_pins::ReaderIoPermit,
+    ) -> Self {
+        Self {
+            storage: EpochGatedIcebergStorage::new(
+                BifrostIcebergStorage::new(storage, warehouse),
+                permit,
+            ),
+        }
+    }
+}
+
+impl Serialize for EpochGatedIcebergStorageFactory {
+    /// Always refuses: the permit is authority local to this process and epoch.
+    ///
+    /// # Errors
+    /// Always returns a serializer error carrying [`NOT_PORTABLE`].
+    fn serialize<S: Serializer>(&self, _serializer: S) -> Result<S::Ok, S::Error> {
+        Err(S::Error::custom(NOT_PORTABLE))
+    }
+}
+
+impl<'de> Deserialize<'de> for EpochGatedIcebergStorageFactory {
+    /// Always refuses: a reconstructed permit would authorize nothing real.
+    ///
+    /// # Errors
+    /// Always returns a deserializer error carrying [`NOT_PORTABLE`].
+    fn deserialize<D: Deserializer<'de>>(_deserializer: D) -> Result<Self, D::Error> {
+        Err(D::Error::custom(NOT_PORTABLE))
+    }
+}
+
+#[typetag::serde]
+impl StorageFactory for EpochGatedIcebergStorageFactory {
+    fn build(&self, _config: &StorageConfig) -> IcebergResult<Arc<dyn Storage>> {
+        Ok(Arc::new(self.storage.clone()))
     }
 }

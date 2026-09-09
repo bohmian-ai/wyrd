@@ -90,6 +90,13 @@ pub struct CreateTableRequest {
 pub struct PinnedSealedTable {
     /// Authenticated tenant/table binding.
     pub binding: TenantTableBinding,
+    /// Durable registered table UID, which is this table's protection identity.
+    ///
+    /// Reader protection is keyed by the registered UID rather than by the
+    /// namespace and name it happens to be reachable under, so the cut carries
+    /// the UID it was resolved from instead of letting a later consumer
+    /// reconstruct one.
+    pub table_uid: TableUid,
     /// Iceberg table metadata loaded once for this cut.
     pub iceberg_table: iceberg::table::Table,
     /// Exact current snapshot identity selected from the immutable table metadata.
@@ -211,16 +218,62 @@ struct PinnedIcebergState {
     estimated_bytes: u64,
 }
 
-impl PinnedIcebergState {
-    /// Returns the canonical identity digest used to stabilize a cross-system cut.
-    fn digest(&self) -> String {
-        digest_strings(
-            self.snapshot_id
-                .map(|id| id.to_string())
-                .into_iter()
-                .chain(self.file_paths.iter().cloned()),
-        )
+/// Everything one reader needs to protect a cut before it opens anything.
+///
+/// Produced by [`BifrostCatalog::prepare_reader_identity`] and consumed by
+/// [`BifrostCatalog::materialize_reader_cut`]. It is deliberately inert: it
+/// names a snapshot and carries the immutable metadata that names it, and holds
+/// no `FileIO`, provider, or open object of its own.
+#[derive(Debug, Clone)]
+pub struct PreparedReaderIdentity {
+    /// Authenticated tenant the cut belongs to.
+    pub tenant: DataTenantId,
+    /// Resolved tenant/table binding for the physical table.
+    pub binding: TenantTableBinding,
+    /// Durable registered identity protection is keyed by.
+    pub table_uid: TableUid,
+    /// Physical Iceberg identifier the table was loaded under.
+    pub identifier: iceberg::TableIdent,
+    /// Immutable metadata document naming this cut.
+    pub metadata: iceberg::spec::TableMetadataRef,
+    /// Location the metadata document was loaded from, when the catalog has one.
+    pub metadata_location: Option<String>,
+    /// Current snapshot, or `None` for a table that has never committed.
+    pub snapshot_id: Option<i64>,
+    /// That snapshot's own recorded commit timestamp in milliseconds.
+    pub snapshot_timestamp_ms: Option<i64>,
+    /// Ancestry from the current snapshot to the oldest reachable parent.
+    pub ancestry_path: Vec<i64>,
+}
+
+/// Walks one snapshot's parent ancestry from the immutable metadata document.
+///
+/// Bounded by the retained snapshot count: an ancestry longer than the
+/// metadata's own snapshot list is a cycle, not deep history, and following it
+/// would not terminate.
+///
+/// # Errors
+/// Returns [`BifrostCatalogError::MetadataMismatch`] when the ancestry does not
+/// terminate.
+fn ancestry_path(
+    metadata: &iceberg::spec::TableMetadataRef,
+    snapshot: &iceberg::spec::Snapshot,
+) -> Result<Vec<i64>, BifrostCatalogError> {
+    let mut path = vec![snapshot.snapshot_id()];
+    let mut cursor = snapshot.parent_snapshot_id();
+    let bound = metadata.snapshots().count().saturating_add(1);
+    while let Some(parent) = cursor {
+        if path.len() > bound || path.contains(&parent) {
+            return Err(BifrostCatalogError::MetadataMismatch(
+                "pinned snapshot ancestry does not terminate".to_owned(),
+            ));
+        }
+        path.push(parent);
+        cursor = metadata
+            .snapshot_by_id(parent)
+            .and_then(|snapshot| snapshot.parent_snapshot_id());
     }
+    Ok(path)
 }
 
 /// Redux catalog shared by Gate, Forge, Oracle, and server catalog routes.
@@ -230,8 +283,11 @@ pub struct BifrostCatalog {
     postgres: ValaPostgres,
     warehouse: String,
     file_io: FileIO,
-    /// The node's one storage owner every catalog and hot read runs through.
+    /// The node's storage owner, retained so a query can build its own
+    /// epoch-gated `FileIO` instead of borrowing this catalog's ungated one.
     storage: Arc<BifrostStorage>,
+    /// Backend properties every built `FileIO` must share with the catalog.
+    storage_properties: std::collections::HashMap<String, String>,
 }
 
 /// Catalog pins observed by production code paths during serialized tests.
@@ -256,26 +312,191 @@ pub fn sealed_pin_count_for_test() -> usize {
     TEST_SEALED_PIN_COUNT.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+/// Reader identities prepared by production code paths in serialized tests.
+///
+/// A restart after catalog promotion has to re-prepare every table, not only
+/// the one that drifted, so the count is what distinguishes a complete restart
+/// from a partial one.
+#[cfg(any(test, feature = "test-support"))]
+static TEST_PREPARED_IDENTITY_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Revalidations still to be failed before the next one is allowed to succeed.
+#[cfg(any(test, feature = "test-support"))]
+static TEST_REVALIDATION_FAULTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Resets and returns the observed prepared-identity count for one test.
+#[cfg(any(test, feature = "test-support"))]
+pub fn reset_prepared_identity_count_for_test() -> usize {
+    TEST_PREPARED_IDENTITY_COUNT.swap(0, std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Returns prepared reader identities observed since the last reset.
+#[must_use]
+#[cfg(any(test, feature = "test-support"))]
+pub fn prepared_identity_count_for_test() -> usize {
+    TEST_PREPARED_IDENTITY_COUNT.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Makes the next `count` revalidations report authoritative metadata drift.
+///
+/// A real promotion between preparation and materialization is what this
+/// stands in for. Committing one at that exact point from outside the call is
+/// not reachable, because preparation, protection, revalidation, and
+/// materialization are one operation by construction.
+#[cfg(any(test, feature = "test-support"))]
+pub fn inject_revalidation_faults_for_test(count: usize) {
+    TEST_REVALIDATION_FAULTS.store(count, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Returns how many injected revalidation faults remain unconsumed.
+#[must_use]
+#[cfg(any(test, feature = "test-support"))]
+pub fn pending_revalidation_faults_for_test() -> usize {
+    TEST_REVALIDATION_FAULTS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 impl BifrostCatalog {
-    /// Pins one Iceberg table and its tenant-scoped hot manifest without reading rows.
+    /// Resolves only the identity of the cut a reader is about to protect.
+    ///
+    /// This is deliberately the whole of what may happen before protection: a
+    /// registration lookup, one `load_table`, and the facts derived from the
+    /// metadata document it returns. Reading that document is the allowed
+    /// identity step because there is no other way to name the snapshot that
+    /// protection has to cover. Nothing here loads a manifest list, enumerates
+    /// data files, queries the hot manifest, builds a provider, or opens any
+    /// object the snapshot names — all of that is snapshot-dependent IO, and it
+    /// belongs after [`BifrostCatalog::materialize_reader_cut`] takes a permit.
     ///
     /// # Errors
-    /// Returns a catalog or SQL error when the binding, Iceberg metadata, or
-    /// tenant-scoped manifest cannot be loaded.
-    pub async fn pin_sealed_table(
+    /// Returns [`BifrostCatalogError::TableNotFound`] when the table is not
+    /// registered for this tenant, an invalid-binding error when the tenant and
+    /// table cannot be bound, and a catalog error when the Iceberg metadata
+    /// cannot be loaded.
+    pub async fn prepare_reader_identity(
         &self,
         table: &TableRef,
         tenant: DataTenantId,
+    ) -> Result<PreparedReaderIdentity, BifrostCatalogError> {
+        #[cfg(any(test, feature = "test-support"))]
+        TEST_PREPARED_IDENTITY_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let fqn = table.fqn();
+        let Some(row) = self.lookup_table_row(&fqn, tenant).await? else {
+            return Err(BifrostCatalogError::TableNotFound(fqn));
+        };
+        let table_uid = TableUid::from_row(&row.table_uid, &fqn)?;
+        let binding = TenantTableBinding::resolve((tenant, table.clone()))
+            .map_err(|error| BifrostCatalogError::InvalidBinding(error.to_string()))?;
+        let identifier = binding.table_ident();
+        let loaded = self.catalog.load_table(&identifier).await?;
+        let metadata = loaded.metadata_ref();
+        let snapshot = metadata.current_snapshot();
+        Ok(PreparedReaderIdentity {
+            tenant,
+            binding,
+            table_uid,
+            identifier,
+            metadata_location: loaded.metadata_location().map(ToOwned::to_owned),
+            snapshot_id: snapshot.map(|snapshot| snapshot.snapshot_id()),
+            snapshot_timestamp_ms: snapshot.map(|snapshot| snapshot.timestamp_ms()),
+            ancestry_path: snapshot
+                .map(|snapshot| ancestry_path(&metadata, snapshot))
+                .transpose()?
+                .unwrap_or_default(),
+            metadata,
+        })
+    }
+
+    /// Proves the authoritative catalog still holds the prepared identity.
+    ///
+    /// Protection is taken against the metadata document preparation read, and
+    /// that document is then reused for the whole cut, so nothing downstream
+    /// can notice that the table was promoted in between. This is the one place
+    /// that asks the catalog again: one authoritative `load_table` per prepared
+    /// identifier, compared on both the metadata location and the metadata
+    /// document itself, because a promotion that reuses a location still
+    /// changes the document.
+    ///
+    /// The reloaded table is discarded. It carries the catalog's own ungated
+    /// `FileIO`, and retaining it would put an unpermitted route to this cut's
+    /// objects back into a path that exists to keep them out.
+    ///
+    /// # Errors
+    /// Returns [`BifrostCatalogError::MetadataMismatch`] when the authoritative
+    /// metadata location or document differs from the prepared one, and a
+    /// catalog error when the table cannot be loaded at all.
+    pub async fn revalidate_reader_identity(
+        &self,
+        prepared: &PreparedReaderIdentity,
+    ) -> Result<(), BifrostCatalogError> {
+        #[cfg(any(test, feature = "test-support"))]
+        if TEST_REVALIDATION_FAULTS
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |remaining| remaining.checked_sub(1),
+            )
+            .is_ok()
+        {
+            return Err(BifrostCatalogError::MetadataMismatch(
+                "injected authoritative reader-identity drift".to_owned(),
+            ));
+        }
+        let loaded = self.catalog.load_table(&prepared.identifier).await?;
+        if loaded.metadata_location() != prepared.metadata_location.as_deref() {
+            return Err(BifrostCatalogError::MetadataMismatch(
+                "the authoritative table metadata location moved under the prepared identity"
+                    .to_owned(),
+            ));
+        }
+        if *loaded.metadata_ref() != *prepared.metadata {
+            return Err(BifrostCatalogError::MetadataMismatch(
+                "the authoritative table metadata changed under the prepared identity".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Materializes the pinned cut through storage gated by one reader permit.
+    ///
+    /// The table is rebuilt here rather than reused from
+    /// [`BifrostCatalog::prepare_reader_identity`] for one reason: the catalog's
+    /// table carries the catalog's own ungated `FileIO`, and every manifest,
+    /// data, and delete object this cut opens must go through the permit
+    /// instead. Reusing the loaded table would leave an ungated route to
+    /// exactly the objects the protection was taken for.
+    ///
+    /// Drift between preparation and this call is not detectable here: this
+    /// method builds its table from the prepared metadata, so comparing the
+    /// result against that same document proves nothing. The authoritative
+    /// check is [`BifrostCatalog::revalidate_reader_identity`], which the
+    /// caller runs for every prepared table before materializing any.
+    ///
+    /// # Errors
+    /// Returns [`BifrostCatalogError::MetadataMismatch`] when the table moved
+    /// under the prepared identity, [`BifrostCatalogError::AmbiguousPublication`]
+    /// or [`BifrostCatalogError::UnstableCut`] from the underlying cut, and a
+    /// catalog or SQL error when the manifest or hot cut cannot be read.
+    pub async fn materialize_reader_cut(
+        &self,
+        prepared: PreparedReaderIdentity,
+        permit: &crate::oracle::reader_pins::ReaderIoPermit,
     ) -> Result<PinnedSealedTable, BifrostCatalogError> {
         #[cfg(any(test, feature = "test-support"))]
         TEST_SEALED_PIN_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let fqn = table.fqn();
-        let Some(_row) = self.lookup_table_row(&fqn, tenant).await? else {
-            return Err(BifrostCatalogError::TableNotFound(fqn));
-        };
-        let binding = TenantTableBinding::resolve((tenant, table.clone()))
-            .map_err(|error| BifrostCatalogError::InvalidBinding(error.to_string()))?;
-        let (iceberg_table, pinned, cut) = self.acquire_stable_cut(&binding, tenant).await?;
+        let tenant = prepared.tenant;
+        let binding = prepared.binding;
+        let table_uid = prepared.table_uid;
+        let gated = self.permit_scoped_table(
+            &prepared.identifier,
+            prepared.metadata.clone(),
+            prepared.metadata_location.clone(),
+            permit,
+        )?;
+        let (iceberg_table, pinned, cut) = self
+            .acquire_stable_cut_from(gated, &binding, tenant)
+            .await?;
         let snapshot_id = pinned.snapshot_id;
         let iceberg_file_paths = pinned.file_paths;
         let iceberg_files = pinned.files;
@@ -335,6 +556,7 @@ impl BifrostCatalog {
         }));
         Ok(PinnedSealedTable {
             binding,
+            table_uid,
             iceberg_table,
             snapshot_id,
             snapshot_digest,
@@ -347,15 +569,72 @@ impl BifrostCatalog {
         })
     }
 
+    /// Builds a `FileIO` whose every read is gated by one reader permit.
+    ///
+    /// This is the only place Oracle constructs read storage for a protected
+    /// cut. Writes and deletes are refused by the storage itself rather than by
+    /// convention, so a query path cannot mutate warehouse objects even if it
+    /// reaches an Iceberg API that would.
+    #[must_use]
+    pub fn gated_file_io(
+        &self,
+        permit: &crate::oracle::reader_pins::ReaderIoPermit,
+    ) -> iceberg::io::FileIO {
+        let factory = Arc::new(
+            crate::catalog::iceberg_storage::EpochGatedIcebergStorageFactory::new(
+                Arc::clone(&self.storage),
+                &self.warehouse,
+                permit.clone(),
+            ),
+        ) as Arc<dyn StorageFactory>;
+        FileIOBuilder::new(factory)
+            .with_props(self.storage_properties.clone())
+            .build()
+    }
+
+    /// Rebuilds one immutable table over storage gated by a reader permit.
+    ///
+    /// Uses the prepared metadata document rather than reloading it, so this
+    /// step opens nothing: the table it returns is the same immutable metadata
+    /// with a `FileIO` that refuses every object read the permit no longer
+    /// authorizes.
+    ///
+    /// # Errors
+    /// Returns [`BifrostCatalogError::Iceberg`] when the table cannot be built
+    /// from the prepared identity and metadata.
+    fn permit_scoped_table(
+        &self,
+        identifier: &iceberg::TableIdent,
+        metadata: iceberg::spec::TableMetadataRef,
+        metadata_location: Option<String>,
+        permit: &crate::oracle::reader_pins::ReaderIoPermit,
+    ) -> Result<iceberg::table::Table, BifrostCatalogError> {
+        let file_io = self.gated_file_io(permit);
+        let mut builder = iceberg::table::Table::builder()
+            .file_io(file_io)
+            .metadata(metadata)
+            .identifier(identifier.clone())
+            .runtime(iceberg::Runtime::current());
+        if let Some(location) = metadata_location {
+            builder = builder.metadata_location(location);
+        }
+        builder.build().map_err(BifrostCatalogError::from)
+    }
+
     /// Acquires one stable Iceberg/SQL/Iceberg cut for a tenant table.
+    ///
+    /// Every reload uses the same permit-scoped table the caller supplied, so
+    /// the stability retry can never fall back to the catalog's ungated
+    /// storage part-way through.
     ///
     /// # Errors
     ///
     /// Returns a catalog or SQL error for one failed read, or `UnstableCut`
     /// after three complete snapshot identity mismatches. Cancellation drops
     /// the in-flight attempt without exposing partial state.
-    async fn acquire_stable_cut(
+    async fn acquire_stable_cut_from(
         &self,
+        gated: iceberg::table::Table,
         binding: &TenantTableBinding,
         tenant: DataTenantId,
     ) -> Result<
@@ -366,29 +645,18 @@ impl BifrostCatalog {
         ),
         BifrostCatalogError,
     > {
-        for _attempt in 1..=3_u8 {
-            let iceberg_a = self.catalog.load_table(&binding.table_ident()).await?;
-            let pinned_a = self.pin_iceberg_snapshot(&iceberg_a, binding).await?;
-            let hot_file_catalog =
-                HotFileCatalog::new(&binding.logical_namespace, &binding.table_name);
-            let mut conn = self.postgres.tenant_conn(tenant).await?;
-            let cut = hot_file_catalog
-                .unresolved_for_cut(
-                    &mut conn,
-                    &pinned_a.file_paths,
-                    pinned_a.forge_publication_operation_id,
-                )
-                .await?;
-            conn.commit().await?;
-            let iceberg_b = self.catalog.load_table(&binding.table_ident()).await?;
-            let pinned_b = self.pin_iceberg_snapshot(&iceberg_b, binding).await?;
-            if pinned_a.snapshot_id == pinned_b.snapshot_id
-                && pinned_a.digest() == pinned_b.digest()
-            {
-                return Ok((iceberg_b, pinned_b, cut));
-            }
-        }
-        Err(BifrostCatalogError::UnstableCut { attempts: 3 })
+        let pinned = self.pin_iceberg_snapshot(&gated, binding).await?;
+        let hot_file_catalog = HotFileCatalog::new(&binding.logical_namespace, &binding.table_name);
+        let mut conn = self.postgres.tenant_conn(tenant).await?;
+        let cut = hot_file_catalog
+            .unresolved_for_cut(
+                &mut conn,
+                &pinned.file_paths,
+                pinned.forge_publication_operation_id,
+            )
+            .await?;
+        conn.commit().await?;
+        Ok((gated, pinned, cut))
     }
 
     /// Collects and validates the immutable files of one current Iceberg snapshot.
@@ -530,7 +798,7 @@ impl BifrostCatalog {
             catalog_uri,
             &warehouse,
             storage_factory,
-            storage_properties,
+            storage_properties.clone(),
         )
         .await?;
         Ok(Self {
@@ -539,6 +807,7 @@ impl BifrostCatalog {
             warehouse,
             file_io,
             storage,
+            storage_properties,
         })
     }
 
@@ -730,32 +999,7 @@ impl BifrostCatalog {
             let physical = self.catalog.load_table(&table_ident).await?;
             self.validate_physical_table(&physical, &binding, &arrow_schema, &layout)?;
         } else {
-            let iceberg_schema = crate::tables::iceberg_schema_for(&arrow_schema)?;
-            let partition_spec = layout
-                .iceberg_partition_spec(&iceberg_schema)
-                .map_err(BifrostCatalogError::MetadataMismatch)?;
-            let sort_order = layout
-                .iceberg_sort_order(&iceberg_schema)
-                .map_err(BifrostCatalogError::MetadataMismatch)?;
-            let location = format!(
-                "{}/{}",
-                self.warehouse.trim_end_matches('/'),
-                binding.object_prefix
-            );
-            let creation = TableCreation::builder()
-                .name(binding.table_name.clone())
-                .location(location)
-                .schema(iceberg_schema)
-                .format_version(FormatVersion::V2)
-                .partition_spec(partition_spec)
-                .sort_order(sort_order)
-                .properties(std::collections::HashMap::from([(
-                    crate::catalog::layout::BLOOM_COLUMNS_PROPERTY.to_owned(),
-                    layout.bloom_columns_property(),
-                )]))
-                .build();
-            self.catalog
-                .create_table(binding.physical_namespace(), creation)
+            self.create_physical_table(&binding, &arrow_schema, &layout)
                 .await?;
         }
 
@@ -780,6 +1024,64 @@ impl BifrostCatalog {
         }
         conn.commit().await?;
         Ok(table_uid)
+    }
+
+    /// Create the physical Iceberg table for one canonical layout.
+    ///
+    /// Called only when registration has established that no physical table
+    /// exists yet. Every physical decision — schema ids, partition spec, sort
+    /// order, location, and the Bloom and Forge data-path properties — is
+    /// derived from `layout` and `binding`, so the canonical layout stays the
+    /// single authority for the table's shape. The Forge data path is written
+    /// as `write.data.path` so the managed rewrite core roots its outputs under
+    /// the recipe segment instead of the default data root.
+    ///
+    /// # Errors
+    ///
+    /// Returns a metadata mismatch when the layout cannot produce a partition
+    /// spec or sort order, and an Iceberg error when schema conversion or the
+    /// catalog create fails.
+    async fn create_physical_table(
+        &self,
+        binding: &TenantTableBinding,
+        arrow_schema: &Schema,
+        layout: &PhysicalLayout,
+    ) -> Result<(), BifrostCatalogError> {
+        let iceberg_schema = crate::tables::iceberg_schema_for(arrow_schema)?;
+        let partition_spec = layout
+            .iceberg_partition_spec(&iceberg_schema)
+            .map_err(BifrostCatalogError::MetadataMismatch)?;
+        let sort_order = layout
+            .iceberg_sort_order(&iceberg_schema)
+            .map_err(BifrostCatalogError::MetadataMismatch)?;
+        let location = format!(
+            "{}/{}",
+            self.warehouse.trim_end_matches('/'),
+            binding.object_prefix
+        );
+        let forge_data_location = crate::catalog::layout::forge_data_location(&location);
+        let creation = TableCreation::builder()
+            .name(binding.table_name.clone())
+            .location(location)
+            .schema(iceberg_schema)
+            .format_version(FormatVersion::V2)
+            .partition_spec(partition_spec)
+            .sort_order(sort_order)
+            .properties(std::collections::HashMap::from([
+                (
+                    crate::catalog::layout::BLOOM_COLUMNS_PROPERTY.to_owned(),
+                    layout.bloom_columns_property(),
+                ),
+                (
+                    crate::catalog::layout::WRITE_DATA_PATH_PROPERTY.to_owned(),
+                    forge_data_location,
+                ),
+            ]))
+            .build();
+        self.catalog
+            .create_table(binding.physical_namespace(), creation)
+            .await?;
+        Ok(())
     }
 
     /// Verify that a registered table still carries Bifrost's complete physical recipe.
@@ -945,7 +1247,19 @@ impl BifrostCatalog {
         table: &TableRef,
         tenant: DataTenantId,
     ) -> Result<arrow::datatypes::SchemaRef, BifrostCatalogError> {
-        let provider = self.provider(table, tenant).await?;
+        // Schema only: the provider is built from the loaded metadata document
+        // and dropped here, so this path opens no snapshot object and needs no
+        // reader permit to gate one.
+        let fqn = table.fqn();
+        let Some(_row) = self.lookup_table_row(&fqn, tenant).await? else {
+            return Err(BifrostCatalogError::TableNotFound(fqn));
+        };
+        let binding = TenantTableBinding::resolve((tenant, table.clone()))
+            .map_err(|error| BifrostCatalogError::InvalidBinding(error.to_string()))?;
+        let iceberg_table = self.catalog.load_table(&binding.table_ident()).await?;
+        let provider = ReduxTableProvider::try_new(iceberg_table, tenant)
+            .await
+            .map_err(BifrostCatalogError::DataFusion)?;
         Ok(datafusion::datasource::TableProvider::schema(&provider))
     }
 
@@ -1031,6 +1345,7 @@ impl BifrostCatalog {
         &self,
         table: &TableRef,
         tenant: DataTenantId,
+        permit: &crate::oracle::reader_pins::ReaderIoPermit,
     ) -> Result<ReduxTableProvider, BifrostCatalogError> {
         let fqn = table.fqn();
         let Some(_row) = self.lookup_table_row(&fqn, tenant).await? else {
@@ -1038,7 +1353,14 @@ impl BifrostCatalog {
         };
         let binding = TenantTableBinding::resolve((tenant, table.clone()))
             .map_err(|error| BifrostCatalogError::InvalidBinding(error.to_string()))?;
-        let iceberg_table = self.catalog.load_table(&binding.table_ident()).await?;
+        let identifier = binding.table_ident();
+        let loaded = self.catalog.load_table(&identifier).await?;
+        let iceberg_table = self.permit_scoped_table(
+            &identifier,
+            loaded.metadata_ref(),
+            loaded.metadata_location().map(ToOwned::to_owned),
+            permit,
+        )?;
         ReduxTableProvider::try_new(iceberg_table, tenant)
             .await
             .map_err(BifrostCatalogError::DataFusion)
@@ -1063,6 +1385,7 @@ impl BifrostCatalog {
         table: &TableRef,
         tenant: DataTenantId,
         snapshot_id: i64,
+        permit: &crate::oracle::reader_pins::ReaderIoPermit,
     ) -> Result<ReduxTableProvider, BifrostCatalogError> {
         let fqn = table.fqn();
         let Some(_row) = self.lookup_table_row(&fqn, tenant).await? else {
@@ -1070,7 +1393,14 @@ impl BifrostCatalog {
         };
         let binding = TenantTableBinding::resolve((tenant, table.clone()))
             .map_err(|error| BifrostCatalogError::InvalidBinding(error.to_string()))?;
-        let iceberg_table = self.catalog.load_table(&binding.table_ident()).await?;
+        let identifier = binding.table_ident();
+        let loaded = self.catalog.load_table(&identifier).await?;
+        let iceberg_table = self.permit_scoped_table(
+            &identifier,
+            loaded.metadata_ref(),
+            loaded.metadata_location().map(ToOwned::to_owned),
+            permit,
+        )?;
         ReduxTableProvider::try_new_pinned(iceberg_table, tenant, snapshot_id)
             .await
             .map_err(BifrostCatalogError::DataFusion)
@@ -1229,7 +1559,12 @@ mod schema_shape_tests {
         /// Accepts only a catalog lookup taking exactly a table reference and tenant.
         fn accepts_direct_catalog_provider<T, F>(_provider: F)
         where
-            F: Fn(&'static BifrostCatalog, &'static TableRef, DataTenantId) -> T,
+            F: Fn(
+                &'static BifrostCatalog,
+                &'static TableRef,
+                DataTenantId,
+                &'static crate::oracle::reader_pins::ReaderIoPermit,
+            ) -> T,
         {
         }
 
@@ -1607,20 +1942,25 @@ mod production_pin_tests {
                 .await
                 .expect("fast append commits");
 
+            let permit = crate::oracle::reader_pins::ReaderIoPermit::unfenced_for_test();
+            let prepared = catalog
+                .prepare_reader_identity(&table, tenant)
+                .await
+                .expect("the registered table prepares");
             let pinned = catalog
-                .pin_sealed_table(&table, tenant)
+                .materialize_reader_cut(prepared, &permit)
                 .await
                 .expect("the committed snapshot pins");
             let snapshot_id = pinned
                 .snapshot_id
                 .expect("a committed table has a snapshot");
             catalog
-                .pinned_provider(&table, tenant, snapshot_id)
+                .pinned_provider(&table, tenant, snapshot_id, &permit)
                 .await
                 .expect("the published snapshot resolves");
             assert!(
                 catalog
-                    .pinned_provider(&table, tenant, snapshot_id.wrapping_add(1))
+                    .pinned_provider(&table, tenant, snapshot_id.wrapping_add(1), &permit)
                     .await
                     .is_err(),
                 "an unpublished snapshot must fail to resolve rather than serve the current one"
@@ -1707,8 +2047,13 @@ mod production_pin_tests {
                 .await
                 .expect("fast append commits");
 
+            let permit = crate::oracle::reader_pins::ReaderIoPermit::unfenced_for_test();
+            let prepared = catalog
+                .prepare_reader_identity(&table, tenant)
+                .await
+                .expect("the registered table prepares");
             let pinned = catalog
-                .pin_sealed_table(&table, tenant)
+                .materialize_reader_cut(prepared, &permit)
                 .await
                 .expect("the committed snapshot pins");
             assert_eq!(

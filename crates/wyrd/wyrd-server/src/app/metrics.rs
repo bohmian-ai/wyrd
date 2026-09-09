@@ -15,8 +15,6 @@ use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use wyrd_telemetry::{TelemetryConfig, TelemetryGuard};
 
-use crate::config::BifrostTarget;
-
 /// Histogram buckets (seconds) for request-duration metrics.
 const REQUEST_DURATION_BUCKETS: &[f64] = &[
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
@@ -29,19 +27,6 @@ const BIFROST_DURATION_BUCKETS: &[f64] = &[
     600.0, 1800.0,
 ];
 
-/// Forge spill-size buckets shared by deployed processes and capture.
-const FORGE_SPILL_BUCKETS: &[f64] = &[
-    65_536.0,
-    1_048_576.0,
-    16_777_216.0,
-    67_108_864.0,
-    268_435_456.0,
-    1_073_741_824.0,
-    2_147_483_648.0,
-    4_294_967_296.0,
-    8_589_934_592.0,
-];
-
 /// Wyrd metric names. Keep these stable — dashboards depend on them.
 pub const HTTP_REQUESTS_TOTAL: &str = "wyrd_http_requests_total";
 pub const HTTP_REQUEST_DURATION_SECONDS: &str = "wyrd_http_request_duration_seconds";
@@ -50,13 +35,6 @@ pub const HTTP_REQUEST_DURATION_SECONDS: &str = "wyrd_http_request_duration_seco
 pub const BIFROST_QUERY_DURATION_SECONDS: &str = "bifrost_query_duration_seconds";
 /// Production-facing Forge task duration metric.
 pub const BIFROST_FORGE_TASK_DURATION_SECONDS: &str = "bifrost_forge_task_duration_seconds";
-/// Production-facing Forge cleanup duration metric.
-pub const BIFROST_FORGE_CLEANUP_DURATION_SECONDS: &str = "bifrost_forge_cleanup_duration_seconds";
-/// Production-facing Forge spill metric.
-pub const BIFROST_FORGE_TASK_SPILL_BYTES: &str = "bifrost_forge_task_spill_bytes";
-/// Production-facing Forge attempt resource-envelope observation metric.
-pub const BIFROST_FORGE_ATTEMPT_RESOURCE_BYTES: &str = "bifrost_forge_attempt_resource_bytes";
-
 /// Gate request latency observed at the public write/query boundary.
 pub const BIFROST_GATE_REQUEST_DURATION_SECONDS: &str = "bifrost_gate_request_duration_seconds";
 /// Gate query-stream lifetime from dispatch through terminal consumption.
@@ -77,14 +55,6 @@ pub const BIFROST_SCRIBE_SEAL_STAGE_SECONDS: &str = "bifrost_scribe_seal_stage_s
 pub const BIFROST_SCRIBE_WAL_APPEND_SECONDS: &str = "bifrost_scribe_wal_append_seconds";
 /// Scribe physical WAL fsync latency.
 pub const BIFROST_SCRIBE_WAL_FSYNC_SECONDS: &str = "bifrost_scribe_wal_fsync_seconds";
-/// Forge planning-scheduler pass latency.
-pub const BIFROST_FORGE_SCHEDULING_DURATION_SECONDS: &str =
-    "bifrost_forge_scheduling_duration_seconds";
-/// Forge scheduler orchestration latency.
-pub const BIFROST_FORGE_SCHEDULER_DURATION_SECONDS: &str =
-    "bifrost_forge_scheduler_duration_seconds";
-/// Forge stage latency, including its typed publication stage.
-pub const BIFROST_FORGE_STAGE_SECONDS: &str = "bifrost_forge_stage_seconds";
 /// Wyrd PostgreSQL tenant-pool acquisition latency.
 pub const WYRD_POSTGRES_POOL_ACQUIRE_SECONDS: &str = "wyrd_postgres_pool_acquire_seconds";
 /// Vala PostgreSQL tenant-pool acquisition latency.
@@ -104,11 +74,7 @@ const BIFROST_P99_DURATION_FAMILIES: &[&str] = &[
     BIFROST_SCRIBE_SEAL_STAGE_SECONDS,
     BIFROST_SCRIBE_WAL_APPEND_SECONDS,
     BIFROST_SCRIBE_WAL_FSYNC_SECONDS,
-    BIFROST_FORGE_SCHEDULING_DURATION_SECONDS,
-    BIFROST_FORGE_SCHEDULER_DURATION_SECONDS,
-    BIFROST_FORGE_STAGE_SECONDS,
     BIFROST_FORGE_TASK_DURATION_SECONDS,
-    BIFROST_FORGE_CLEANUP_DURATION_SECONDS,
     "oracle_admission_queue_duration_seconds",
     "oracle_query_duration_seconds",
     "oracle_query_time_to_first_batch_seconds",
@@ -202,69 +168,6 @@ pub fn install_capture_runtime(
     ))
 }
 
-/// Lifecycle guard for one successfully composed Forge process role.
-///
-/// The active gauge describes live role concurrency, while the companion
-/// counter retains replacement history without inflating that gauge.
-pub(crate) struct ForgeRoleTelemetryGuard {
-    /// Active-role gauge decremented only when this owner drops after drain.
-    active: metrics::Gauge,
-}
-
-/// Opaque test-support owner for one production role-lifecycle observation.
-#[cfg(feature = "test-support")]
-pub struct TestForgeRoleTelemetryGuard {
-    /// Production lifecycle guard retained until the test role drains.
-    _inner: ForgeRoleTelemetryGuard,
-}
-
-impl ForgeRoleTelemetryGuard {
-    /// Record that one configured Forge role completed process composition.
-    #[must_use]
-    pub(crate) fn started(role: BifrostTarget, node_id: uuid::Uuid) -> Self {
-        let role = match role {
-            BifrostTarget::All => "all",
-            BifrostTarget::Server => "server",
-            BifrostTarget::Oracle => "oracle",
-            BifrostTarget::Scribe => "scribe",
-            BifrostTarget::ForgeWorker => "forge_worker",
-        };
-        let active = metrics::gauge!("bifrost_forge_role_processes", "role" => role);
-        active.increment(1.0);
-        metrics::counter!("bifrost_forge_role_process_started_total", "role" => role).increment(1);
-        metrics::counter!(
-            "bifrost_forge_role_node_started_total",
-            "role" => role,
-            "node_id" => node_id.to_string(),
-        )
-        .increment(1);
-        Self { active }
-    }
-}
-
-/// Start one test/benchmark role against the production lifecycle instruments.
-///
-/// The returned guard must be retained until the represented scheduler or
-/// worker role has drained. Dropping it records the same active-role shutdown
-/// transition used by [`crate::app::BoundServer`].
-#[cfg(feature = "test-support")]
-#[must_use]
-pub fn start_capture_forge_role(
-    role: BifrostTarget,
-    node_id: uuid::Uuid,
-) -> TestForgeRoleTelemetryGuard {
-    TestForgeRoleTelemetryGuard {
-        _inner: ForgeRoleTelemetryGuard::started(role, node_id),
-    }
-}
-
-impl Drop for ForgeRoleTelemetryGuard {
-    /// Remove this process from active topology after its role has drained.
-    fn drop(&mut self) {
-        self.active.decrement(1.0);
-    }
-}
-
 /// Install the process-global Prometheus recorder and return its render handle.
 ///
 /// Call exactly once per process. Returns an error if a recorder is already
@@ -287,19 +190,7 @@ pub fn install_recorder() -> Result<PrometheusHandle, MetricsError> {
             )
             .map_err(MetricsError::Buckets)?;
     }
-    let handle = builder
-        .set_buckets_for_metric(
-            Matcher::Full(BIFROST_FORGE_TASK_SPILL_BYTES.to_owned()),
-            FORGE_SPILL_BUCKETS,
-        )
-        .map_err(MetricsError::Buckets)?
-        .set_buckets_for_metric(
-            Matcher::Full(BIFROST_FORGE_ATTEMPT_RESOURCE_BYTES.to_owned()),
-            FORGE_SPILL_BUCKETS,
-        )
-        .map_err(MetricsError::Buckets)?
-        .install_recorder()
-        .map_err(MetricsError::Install)?;
+    let handle = builder.install_recorder().map_err(MetricsError::Install)?;
     vala_bifrost_redux::gate::initialize_gate_metrics();
     Ok(handle)
 }

@@ -101,7 +101,6 @@ impl<'a> LogicalTableIdentity<'a> {
     /// arithmetic overflows.
     pub(crate) fn projection_facts(
         &self,
-        role: PhysicalProjectionRole,
     ) -> Result<PhysicalProjectionFacts, LogicalTableIdentityError<()>> {
         let namespace_bytes = checked_sum(&[
             "vala".len(),
@@ -125,7 +124,6 @@ impl<'a> LogicalTableIdentity<'a> {
             .checked_add(object_prefix_bytes)
             .ok_or(LogicalTableIdentityError::Overflow)?;
         Ok(PhysicalProjectionFacts {
-            role,
             material_bytes,
             component_count: PHYSICAL_COMPONENTS,
             namespace_bytes,
@@ -133,7 +131,7 @@ impl<'a> LogicalTableIdentity<'a> {
         })
     }
 
-    /// Reserves and constructs one fixed physical projection for this role.
+    /// Reserves and constructs one fixed physical projection.
     ///
     /// The reservation closure must split the exact bytes from the calling
     /// role's already admitted owner. It runs before either physical string is
@@ -146,11 +144,10 @@ impl<'a> LogicalTableIdentity<'a> {
     /// role owner refuses the exact child before allocation.
     pub(crate) fn try_project<G, E>(
         self,
-        role: PhysicalProjectionRole,
         reserve: impl FnOnce(PhysicalProjectionFacts) -> Result<G, E>,
     ) -> Result<PhysicalTableProjection<G>, LogicalTableIdentityError<E>> {
         let facts = self
-            .projection_facts(role)
+            .projection_facts()
             .map_err(|_| LogicalTableIdentityError::Overflow)?;
         let guard = reserve(facts).map_err(LogicalTableIdentityError::Reservation)?;
 
@@ -185,8 +182,6 @@ impl<'a> LogicalTableIdentity<'a> {
 /// Checked material and cardinality facts presented to one role authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct PhysicalProjectionFacts {
-    /// Runtime role whose existing authority must reserve this projection.
-    pub(crate) role: PhysicalProjectionRole,
     /// Exact bytes across the fixed namespace and object-prefix strings.
     pub(crate) material_bytes: usize,
     /// Exact number of independently allocated physical string components.
@@ -195,15 +190,6 @@ pub(crate) struct PhysicalProjectionFacts {
     namespace_bytes: usize,
     /// Exact tenant-qualified object-prefix bytes.
     object_prefix_bytes: usize,
-}
-
-/// Closed physical roles established by this task.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum PhysicalProjectionRole {
-    /// Forge maintenance and publication.
-    Forge,
-    /// Oracle planning and query execution.
-    Oracle,
 }
 
 /// Fixed physical projection retaining one role's admitted child guard.
@@ -351,31 +337,25 @@ mod tests {
         assert!(std::ptr::eq(logical.table(), &raw const table));
     }
 
-    /// Both physical roles receive exact facts and release only at terminal drop.
+    /// A projection receives exact facts and releases only at terminal drop.
     #[test]
     fn logical_table_identity_role_transfer_cancellation_and_release() {
-        for role in [
-            PhysicalProjectionRole::Forge,
-            PhysicalProjectionRole::Oracle,
-        ] {
-            let tenant = DataTenantId::new_v7();
-            let table = table();
-            let releases = Arc::new(AtomicUsize::new(0));
-            let logical =
-                LogicalTableIdentity::try_new(&tenant, &tenant, &table).expect("logical identity");
-            let projection = logical
-                .try_project(role, |facts| {
-                    assert_eq!(facts.role, role);
-                    assert_eq!(facts.component_count, 2);
-                    assert!(facts.material_bytes > table.name.len());
-                    Ok::<_, ()>(RoleGuard(Arc::clone(&releases)))
-                })
-                .expect("role projection");
-            let transferred = transfer(projection);
-            assert_eq!(releases.load(Ordering::SeqCst), 0, "{role:?}");
-            drop(transferred);
-            assert_eq!(releases.load(Ordering::SeqCst), 1, "{role:?}");
-        }
+        let tenant = DataTenantId::new_v7();
+        let table = table();
+        let releases = Arc::new(AtomicUsize::new(0));
+        let logical =
+            LogicalTableIdentity::try_new(&tenant, &tenant, &table).expect("logical identity");
+        let projection = logical
+            .try_project(|facts| {
+                assert_eq!(facts.component_count, 2);
+                assert!(facts.material_bytes > table.name.len());
+                Ok::<_, ()>(RoleGuard(Arc::clone(&releases)))
+            })
+            .expect("role projection");
+        let transferred = transfer(projection);
+        assert_eq!(releases.load(Ordering::SeqCst), 0);
+        drop(transferred);
+        assert_eq!(releases.load(Ordering::SeqCst), 1);
     }
 
     /// Moves the complete projection and opaque guard through a role boundary.
@@ -389,8 +369,7 @@ mod tests {
         let tenant = DataTenantId::new_v7();
         let table = table();
         let logical = LogicalTableIdentity::try_new(&tenant, &tenant, &table).expect("valid");
-        let error =
-            logical.try_project(PhysicalProjectionRole::Forge, |_| Err::<(), _>("role full"));
+        let error = logical.try_project(|_| Err::<(), _>("role full"));
         assert!(matches!(
             error,
             Err(LogicalTableIdentityError::Reservation("role full"))
@@ -444,9 +423,7 @@ mod tests {
             logical.validate_persisted(&DataTenantId::new_v7(), &table),
             Err(LogicalTableIdentityError::PersistedIdentityMismatch)
         ));
-        let projection = logical
-            .try_project(PhysicalProjectionRole::Forge, |_| Ok::<_, ()>(()))
-            .expect("projected");
+        let projection = logical.try_project(|_| Ok::<_, ()>(())).expect("projected");
         let valid = format!("{}/data/part.parquet", projection.object_prefix());
         assert_eq!(projection.validate_object_path(&valid), Ok(valid.as_str()));
         assert!(

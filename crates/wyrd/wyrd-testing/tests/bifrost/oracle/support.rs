@@ -516,9 +516,6 @@ pub(crate) fn unused_payload(id: i64) -> String {
 /// fail the journey rather than hang it.
 const COMPACTION_PASS_BUDGET: usize = 32;
 
-/// Number of rows written before compaction. Every one of them is sealed as
-/// its own Parquet file, so the Forge pass has `min_files` worth of real
-/// inputs to rewrite into a single published data file.
 /// Compacts every sealed file already written for `table`, so that a later
 /// query reads them through the Iceberg snapshot rather than the hot manifest.
 ///

@@ -6,19 +6,13 @@ CREATE TABLE vala.forge_tasks (
     catalog_name text NOT NULL CHECK (catalog_name = 'wyrd-redux'),
     namespace_name text NOT NULL CHECK (namespace_name IN ('vala.system','vala.bifrost','vala.traces','vala.metrics','vala.logs','vala.eval','vala.drift','vala.dev','vala.datasets')),
     table_name text NOT NULL CHECK (table_name <> '' AND length(table_name) <= 63 AND table_name ~ '^[A-Za-z0-9_.-]+$' AND table_name NOT LIKE '%..%' AND table_name !~ '^\\.|\\.$'),
-    strategy text NOT NULL CHECK (strategy IN ('staging_fold','small_files','full_identity','manifest_rewrite','snapshot_expiry','expired_cleanup','orphan_cleanup')),
-    lane text NOT NULL CHECK (lane IN ('ordinary','large_singleton')),
+    strategy text NOT NULL CHECK (strategy IN ('scribe_promotion','small_files','snapshot_expiry','expired_cleanup','orphan_cleanup')),
     base_snapshot_id bigint NOT NULL,
     plan jsonb NOT NULL,
     plan_hash bytea NOT NULL CHECK (octet_length(plan_hash) = 32),
     estimated_files bigint NOT NULL CHECK (estimated_files > 0),
-    CHECK (lane <> 'large_singleton' OR estimated_files = 1),
     estimated_bytes bigint NOT NULL CHECK (estimated_bytes > 0),
-    estimated_parallelism integer NOT NULL CHECK (estimated_parallelism > 0),
-    estimated_memory_bytes bigint NOT NULL CHECK (estimated_memory_bytes > 0),
-    estimated_spill_bytes bigint NOT NULL CHECK (estimated_spill_bytes > 0),
-    large_task_ceiling_bytes bigint NOT NULL CHECK (large_task_ceiling_bytes > 0),
-    state text NOT NULL CHECK (state IN ('ready','claimed','running','prepared','succeeded','retryable','unschedulable','failed','cancelled')),
+    state text NOT NULL CHECK (state IN ('ready','claimed','running','prepared','succeeded','retryable','failed','cancelled')),
     attempt_id uuid,
     claimed_by uuid,
     claim_expires_at timestamptz,
@@ -58,7 +52,7 @@ CREATE INDEX forge_tasks_watermark ON vala.forge_tasks
  WHERE state IN ('running','prepared');
 CREATE INDEX forge_tasks_terminal ON vala.forge_tasks
  (data_tenant_id, updated_at, task_id)
- WHERE state IN ('succeeded','unschedulable','failed','cancelled');
+ WHERE state IN ('succeeded','failed','cancelled');
 CREATE INDEX forge_tasks_status ON vala.forge_tasks
  (data_tenant_id, updated_at DESC, task_id);
 
@@ -72,39 +66,6 @@ CREATE TABLE vala.forge_scheduler_state (
 );
 INSERT INTO vala.forge_scheduler_state (singleton) VALUES (true);
 
-CREATE TABLE vala.forge_large_lane_lease (
-    singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
-    task_id uuid,
-    owner uuid,
-    attempt_id uuid,
-    fencing_token bigint NOT NULL DEFAULT 0 CHECK (fencing_token >= 0),
-    expires_at timestamptz,
-    updated_at timestamptz NOT NULL DEFAULT now(),
-    CHECK ((task_id IS NULL) = (owner IS NULL)),
-    CHECK ((task_id IS NULL) = (attempt_id IS NULL)),
-    CHECK ((task_id IS NULL) = (expires_at IS NULL))
-);
-INSERT INTO vala.forge_large_lane_lease (singleton) VALUES (true);
-
-CREATE FUNCTION vala.release_forge_large_lane(p_task_id uuid, p_attempt_id uuid, p_owner uuid)
-RETURNS boolean
-LANGUAGE sql
-SECURITY DEFINER
-SET search_path = pg_catalog
-AS $$
-  WITH released AS (
-    UPDATE vala.forge_large_lane_lease
-       SET task_id = NULL, owner = NULL, attempt_id = NULL,
-           expires_at = NULL, updated_at = statement_timestamp()
-     WHERE singleton AND task_id = p_task_id
-       AND attempt_id = p_attempt_id AND owner = p_owner
-     RETURNING singleton
-  )
-  SELECT EXISTS (SELECT 1 FROM released)
-$$;
-REVOKE ALL ON FUNCTION vala.release_forge_large_lane(uuid, uuid, uuid) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION vala.release_forge_large_lane(uuid, uuid, uuid) TO wyrd_app, wyrd_platform_admin;
-
 GRANT SELECT, INSERT, UPDATE, DELETE ON vala.forge_tasks TO wyrd_platform_admin;
 GRANT SELECT, UPDATE, DELETE ON vala.forge_tasks TO wyrd_app;
-GRANT SELECT, UPDATE ON vala.forge_scheduler_state, vala.forge_large_lane_lease TO wyrd_platform_admin;
+GRANT SELECT, UPDATE ON vala.forge_scheduler_state TO wyrd_platform_admin;

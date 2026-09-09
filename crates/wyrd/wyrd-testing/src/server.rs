@@ -18,7 +18,9 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 use uuid::Uuid;
-use vala_bifrost_redux::catalog::{BifrostCatalog, TableRef, TenantTableBinding};
+use vala_bifrost_redux::catalog::{
+    BIFROST_CATALOG_NAME, BifrostCatalog, TableRef, TenantTableBinding,
+};
 use vala_bifrost_redux::cluster::{ClusterRegistry, RoleTiming};
 use vala_bifrost_redux::forge::{
     ForgeClock, ForgeClockControl, ForgeConfig, ForgeSchedulerTrigger, ForgeWorker,
@@ -30,10 +32,12 @@ use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::oracle::dispatcher::{DispatchError, OraclePeerCredentials};
 use vala_bifrost_redux::resources::{
     BifrostResourcePolicy, BifrostRole, BifrostRuntimeResources, BifrostVolumeRoots,
-    ForgeRewriteRequest, ForgeRewriteResources, ResourceSource, SystemResourceSnapshot,
+    MIN_UNMANAGED_RESERVE_BYTES, ROLE_MEMORY_FLOOR_BYTES, ResourceSource, SystemResourceSnapshot,
 };
 use vala_bifrost_redux::scribe::ScribeImpl;
 use vala_bifrost_redux::scribe::admission::AdmissionConfig;
+use vala_sql::queries::oracle_reader_authority::OracleTableProtections;
+use vala_sql::row_types::oracle_reader_authority::{ProtectionRecord, TableAuthorityIdentity};
 use wyrd_auth::exchange_api_key::{ExchangeApiKey, TokenExchangeSettings};
 use wyrd_auth::issue_api_key::WyrdApiKey;
 use wyrd_auth::permission_resolver::SqlPermissionResolver;
@@ -68,7 +72,7 @@ use wyrd_server::state::{
 };
 use wyrd_server::{AppState, WyrdServer, WyrdServerConfig, build_router};
 use wyrd_spec::DataTenantId;
-use wyrd_spec::vala::api::NodeId;
+use wyrd_spec::vala::api::{FencingToken, NodeId};
 use wyrd_telemetry::TelemetryGuard;
 
 use crate::bifrost::ForgeObjectStoreControl;
@@ -89,8 +93,10 @@ struct TestOraclePeerCredentials {
     api_key: SecretString,
     /// Production exchange service used for each access-token acquisition.
     exchange: ExchangeApiKey,
-    /// Cached short-lived service bearer shared by every peer RPC in the cluster.
-    bearer: tokio::sync::Mutex<Option<String>>,
+    /// Cached short-lived service bearer shared by every peer RPC in the
+    /// cluster, retained with its own expiry so a journey that outlives one
+    /// access TTL re-exchanges instead of presenting an expired token.
+    bearer: tokio::sync::Mutex<Option<(String, chrono::DateTime<chrono::Utc>)>>,
 }
 
 impl std::fmt::Debug for TestOraclePeerCredentials {
@@ -106,7 +112,11 @@ impl OraclePeerCredentials for TestOraclePeerCredentials {
     /// Exchange the retained API key through the production auth service.
     async fn bearer(&self, force_refresh: bool) -> Result<String, DispatchError> {
         let mut cached = self.bearer.lock().await;
-        if !force_refresh && let Some(bearer) = cached.as_ref() {
+        let fresh_until = chrono::Utc::now() + chrono::Duration::seconds(60);
+        if !force_refresh
+            && let Some((bearer, expires_at)) = cached.as_ref()
+            && *expires_at > fresh_until
+        {
             return Ok(bearer.clone());
         }
         let mut conn = self
@@ -125,7 +135,7 @@ impl OraclePeerCredentials for TestOraclePeerCredentials {
             .map_err(|_| DispatchError::Terminal)?;
         conn.commit().await.map_err(|_| DispatchError::Terminal)?;
         let bearer = exchanged.access_token.expose_secret().to_owned();
-        *cached = Some(bearer.clone());
+        *cached = Some((bearer.clone(), exchanged.expires_at));
         Ok(bearer)
     }
 }
@@ -150,6 +160,24 @@ use crate::time::ClockHandle;
 
 /// Dedicated least-privilege role assigned to the test Oracle Service.
 const BIFROST_PEER_ROLE: &str = "bifrost_peer";
+
+/// Default Forge compaction budget a harness node carrying a Forge role names.
+///
+/// The production default is four fifths of the memory limit and deliberately
+/// does not clamp, so a co-located harness whose Scribe and Oracle floors are
+/// also protected must name a budget that fits the remainder — exactly as a
+/// co-located deployment configures one. The constant is public because a test
+/// that pins two Oracle replicas to one durable admission ceiling has to
+/// subtract the same reservation the Forge-carrying replica takes.
+pub const HARNESS_FORGE_COMPACTION_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+
+/// Memory limit a harness node observes when a test injects no snapshot.
+///
+/// Every node in a test cluster is carved from the same fixed observation, so
+/// role placement is the only thing that moves a node's derived plan. The
+/// constant is public because a test that pins two Oracle replicas to one
+/// durable admission ceiling has to name the limit it sheds role floors from.
+pub const HARNESS_NODE_MEMORY_LIMIT_BYTES: usize = 3 * 1024 * 1024 * 1024;
 
 /// Separates a serve-task join failure from the server's own terminal outcome.
 ///
@@ -235,8 +263,6 @@ struct WyrdTestServerInner {
     forge_process_role: BifrostTarget,
     /// Stable identity assigned to this server process.
     node_id: NodeId,
-    /// Optional lifecycle telemetry owner retained until shutdown.
-    _forge_role_telemetry: Option<wyrd_server::app::metrics::TestForgeRoleTelemetryGuard>,
     /// Atomic one-shot query truncation controls for language journeys.
     query_stream_fault: QueryStreamFaultController,
     /// Atomic lifecycle-audit fault controls for causal query tests.
@@ -250,6 +276,12 @@ struct WyrdTestServerInner {
     /// same single owner. Declared last so struct drop order releases it after
     /// `state`, which is the order production teardown also takes.
     _coordination_runtime: ScribeCoordinationRuntime,
+    /// Sole owner of the dedicated Forge compaction runtime this server composed.
+    ///
+    /// Retained for the same reason as the coordination runtime above, and
+    /// released in the same struct drop order: an admitted plan runner must not
+    /// be abandoned between writing its outputs and Preparing its operation.
+    _compaction_runtime: wyrd_server::state::ForgeCompactionRuntime,
 }
 
 /// Concrete lifecycle evidence returned after one test server stops.
@@ -318,29 +350,6 @@ pub struct ForgeDataFileInspection {
     pub path: String,
     /// Compressed Parquet bytes recorded in the manifest.
     pub bytes: u64,
-}
-
-/// Authoritative current-snapshot and durable Forge state for one table.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ForgeTableInspection {
-    /// Current Iceberg snapshot identity.
-    pub snapshot_id: i64,
-    /// Sorted, duplicate-free live data files.
-    pub live_data_files: Vec<ForgeDataFileInspection>,
-    /// Production Iceberg target file size.
-    pub target_file_size_bytes: u64,
-    /// Inclusive production lower healthy bound.
-    pub minimum_healthy_file_bytes: u64,
-    /// Inclusive production upper healthy bound.
-    pub maximum_healthy_file_bytes: u64,
-    /// Whether a durable planning demand remains for this table.
-    pub has_demand: bool,
-    /// Durable task states and strategies in creation order.
-    pub tasks: Vec<(String, String)>,
-    /// Tasks retaining an active claim.
-    pub active_claims: u64,
-    /// Distinct active attempt identities.
-    pub active_attempts: u64,
 }
 
 /// One `vala.file_list` row exactly as the publication columns store it.
@@ -416,27 +425,6 @@ pub struct ForgeWorkflowInspection {
     pub uncompacted_staging_files: u64,
 }
 
-impl ForgeTableInspection {
-    /// Return the exact current live-file count.
-    #[must_use]
-    pub fn data_file_count(&self) -> usize {
-        self.live_data_files.len()
-    }
-
-    /// Return the checked sum of current compressed file bytes.
-    ///
-    /// # Errors
-    ///
-    /// Returns an overflow error when manifest byte totals exceed `u64`.
-    pub fn total_data_file_bytes(&self) -> Result<u64, WyrdTestServerError> {
-        self.live_data_files.iter().try_fold(0_u64, |total, file| {
-            total.checked_add(file.bytes).ok_or_else(|| {
-                WyrdTestServerError::Start("Forge data-file bytes overflow".to_owned())
-            })
-        })
-    }
-}
-
 /// Exact baseline-derived files consumed and produced by one Forge rewrite.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForgeRewriteComparison {
@@ -482,8 +470,7 @@ pub struct WyrdTestServerBuilder {
     trusted_issuer_configs: Vec<IssuerEntry>,
     workload_binding_configs: Vec<WorkloadBindingEntry>,
     forge_interval: Duration,
-    /// Test-tier bin width makes three-file current-day journeys deterministic.
-    forge_max_files_per_bin: usize,
+    /// Executor slots composed into the production Forge worker.
     wal_sync_delay: Duration,
     scribe_admission: Option<AdmissionConfig>,
     /// One immutable lowerable limits snapshot shared by the test server's ingest owners.
@@ -518,6 +505,8 @@ pub struct WyrdTestServerBuilder {
     /// capacity to be a stated number rather than whatever the injected memory
     /// envelope happens to divide into.
     oracle_query_slot_limit: Option<usize>,
+    /// Forge compaction budget replacing the harness default on this node.
+    forge_compaction_memory_limit_bytes: Option<usize>,
     /// Cluster-retained Oracle audit WAL root reused across restarts.
     oracle_audit_wal_root: Option<Arc<tempfile::TempDir>>,
     /// Process-installed production telemetry guard shared by every node.
@@ -596,7 +585,6 @@ impl Default for WyrdTestServerBuilder {
             trusted_issuer_configs: Vec::new(),
             workload_binding_configs: Vec::new(),
             forge_interval: Duration::from_secs(60),
-            forge_max_files_per_bin: 3,
             wal_sync_delay: Duration::ZERO,
             scribe_admission: None,
             scribe_ingest_limits: IngestLimits::default(),
@@ -618,6 +606,7 @@ impl Default for WyrdTestServerBuilder {
             oracle_spill_path: None,
             system_resources: None,
             oracle_query_slot_limit: None,
+            forge_compaction_memory_limit_bytes: None,
             oracle_audit_wal_root: None,
             telemetry: None,
             bind_addrs: None,
@@ -1912,73 +1901,47 @@ impl WyrdTestServer {
         self.inner.forge_object_store.as_ref().map(Arc::clone)
     }
 
-    /// Return deterministic maintenance gates from the supervised Forge owner.
-    #[must_use]
-    pub fn forge_maintenance_controls_for_test(
+    /// Classifies one object through this node's production orphan predicate.
+    ///
+    /// The verdict is produced by the retained production protection loader and
+    /// its single eligibility truth, not by a harness reimplementation, so a
+    /// journey can observe what a collection pass on this node would decide
+    /// about a named object without driving a destructive pass to find out.
+    /// That matters while another process holds a catalog commit open: the
+    /// node executing the rewrite cannot answer, and this one can.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WyrdTestServerError::Start`] when this node composes no Forge
+    /// coordinator, and the production catalog, SQL, object-metadata, or
+    /// path-validation failure when the proof cannot be assembled.
+    pub async fn forge_gc_eligibility_for_test(
         &self,
-    ) -> Option<vala_bifrost_redux::forge::MaintenanceTestControls> {
+        binding: &TenantTableBinding,
+        path: &str,
+    ) -> Result<String, WyrdTestServerError> {
         self.inner
             .state
             .forge()
             .and_then(|forge| forge.coordinator())
-            .map(|forge| forge.maintenance_controls_for_test())
+            .ok_or_else(|| {
+                WyrdTestServerError::Start("Forge coordinator is not composed".to_owned())
+            })?
+            .gc_eligibility_for_test(binding, path)
+            .await
+            .map_err(|error| WyrdTestServerError::Start(error.to_string()))
     }
 
-    /// Hold the live process root's available Forge capacity through one RAII lease.
-    ///
-    /// The returned production lease is opaque to the harness. Dropping it
-    /// releases memory, scratch, and reader counters through the root-owned
-    /// finalizer used by real rewrites.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when Forge is absent or its live root cannot admit the
-    /// exact remaining memory and reader capacity atomically.
-    pub fn hold_forge_root_capacity_for_test(
+    /// Return deterministic expiration gates from the supervised Forge owner.
+    #[must_use]
+    pub fn forge_expiry_controls_for_test(
         &self,
-    ) -> Result<ForgeRewriteResources, WyrdTestServerError> {
-        let resources = self
-            .inner
+    ) -> Option<vala_bifrost_redux::forge::ExpiryTestControls> {
+        self.inner
             .state
             .forge()
-            .ok_or_else(|| WyrdTestServerError::Start("Forge is not composed".to_owned()))?
-            .resources();
-        let snapshot = resources
-            .snapshot()
-            .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-        let memory_bytes = snapshot
-            .plan
-            .elastic_memory_bytes
-            .checked_sub(snapshot.elastic_memory_used_bytes)
-            .ok_or_else(|| {
-                WyrdTestServerError::Start("Forge root memory accounting diverged".to_owned())
-            })?;
-        let reader_permits = u16::try_from(snapshot.plan.effective_cpu).map_err(|_| {
-            WyrdTestServerError::Start("Forge reader capacity exceeds u16".to_owned())
-        })?;
-        let envelope = vala_sql::row_types::forge_tasks::ForgeTaskEnvelope {
-            version: vala_sql::row_types::forge_tasks::FORGE_ENVELOPE_VERSION,
-            reader_permits,
-            decoded_batch_bytes: 0,
-            decoded_input_bytes: u64::try_from(memory_bytes).map_err(|_| {
-                WyrdTestServerError::Start("Forge memory capacity exceeds u64".to_owned())
-            })?,
-            sort_working_bytes: 0,
-            sort_merge_reservation_bytes: 0,
-            encoder_buffer_bytes: 0,
-            upload_chunk_bytes: 0,
-            footer_encoded_bytes: 0,
-            footer_decode_workspace_bytes: 0,
-            sort_spill_bytes: 0,
-        };
-        resources
-            .try_acquire_rewrite(ForgeRewriteRequest {
-                envelope,
-                memory_bytes,
-                scratch_bytes: 1,
-                reader_permits,
-            })
-            .map_err(|error| WyrdTestServerError::Start(error.to_string()))
+            .and_then(|forge| forge.coordinator())
+            .map(|forge| forge.expiry_controls_for_test())
     }
 
     /// Arm the canonical one-shot Prepared audit failure on the composed Forge owner.
@@ -2074,79 +2037,6 @@ impl WyrdTestServer {
         self.inner.forge_publisher.clone()
     }
 
-    /// Inspect one table through the production Forge discovery and durable state owners.
-    ///
-    /// # Errors
-    ///
-    /// Returns binding, catalog, manifest, metadata, or SQL inspection errors.
-    pub async fn inspect_forge_table_for_test(
-        &self,
-        tenant: DataTenantId,
-        table: &str,
-    ) -> Result<ForgeTableInspection, WyrdTestServerError> {
-        self.inspect_forge_table_ref_for_test(
-            tenant,
-            &TableRef::new(BifrostNamespace::Bifrost, table),
-        )
-        .await
-    }
-
-    /// Inspect one namespace-qualified table through the same production Forge
-    /// discovery and durable state owners.
-    ///
-    /// Journeys that register through the caller-owned HTTP route land in
-    /// `vala.datasets`, so the namespace cannot be assumed. This is the
-    /// authoritative body; the `&str` form above is the `vala.bifrost` shorthand.
-    ///
-    /// # Errors
-    ///
-    /// Returns binding, catalog, manifest, metadata, or SQL inspection errors.
-    pub async fn inspect_forge_table_ref_for_test(
-        &self,
-        tenant: DataTenantId,
-        table: &TableRef,
-    ) -> Result<ForgeTableInspection, WyrdTestServerError> {
-        let binding = TenantTableBinding::resolve((tenant, table.clone()))
-            .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-        let physical = self
-            .inner
-            .bifrost_catalog
-            .iceberg_catalog()
-            .load_table(&binding.table_ident())
-            .await
-            .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-        let forge = self
-            .inner
-            .state
-            .forge_coordinator()
-            .ok_or_else(|| WyrdTestServerError::Start("Forge is not composed".to_owned()))?;
-        let (snapshot_id, policy, candidates) = forge
-            .inspect_live_files_for_test(&binding, &physical)
-            .await
-            .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-        let live_data_files = candidates
-            .into_iter()
-            .map(|file| ForgeDataFileInspection {
-                path: file.catalog_path_for_test().to_owned(),
-                bytes: file.file_size_bytes_for_test(),
-            })
-            .collect();
-        let workflow = self
-            .inspect_forge_workflow_ref_for_test(tenant, table)
-            .await?;
-        Ok(ForgeTableInspection {
-            snapshot_id,
-            live_data_files,
-            target_file_size_bytes: policy.target_file_size_bytes(),
-            minimum_healthy_file_bytes: policy.minimum_file_size_bytes_for_test(),
-            maximum_healthy_file_bytes: policy.maximum_file_size_bytes_for_test(),
-            has_demand: workflow.has_demand,
-            tasks: workflow.tasks,
-            active_claims: workflow.active_claims,
-            active_attempts: workflow.active_attempts,
-        })
-    }
-
     /// Inspect durable Forge demand and task state without requiring an Iceberg snapshot.
     ///
     /// # Errors
@@ -2232,76 +2122,15 @@ impl WyrdTestServer {
         })
     }
 
-    /// Compare exact pre/post snapshot file identities for one planned rewrite.
+    /// Return the Bifrost catalog this server's production surfaces read through.
     ///
-    /// # Errors
-    ///
-    /// Returns an invariant error for duplicate identities, retained inputs,
-    /// reused outputs, an unchanged snapshot, or an empty replacement.
-    pub fn compare_forge_rewrite_for_test(
-        before: &ForgeTableInspection,
-        after: &ForgeTableInspection,
-        planned_inputs: &[String],
-    ) -> Result<ForgeRewriteComparison, WyrdTestServerError> {
-        if before.snapshot_id == after.snapshot_id {
-            return Err(WyrdTestServerError::Start(
-                "Forge rewrite did not advance the snapshot".to_owned(),
-            ));
-        }
-        let before_by_path = before
-            .live_data_files
-            .iter()
-            .map(|file| (file.path.as_str(), file))
-            .collect::<std::collections::BTreeMap<_, _>>();
-        let after_paths = after
-            .live_data_files
-            .iter()
-            .map(|file| file.path.as_str())
-            .collect::<BTreeSet<_>>();
-        if before_by_path.len() != before.live_data_files.len()
-            || after_paths.len() != after.live_data_files.len()
-        {
-            return Err(WyrdTestServerError::Start(
-                "Forge inspection contains duplicate live paths".to_owned(),
-            ));
-        }
-        let mut input_files = Vec::with_capacity(planned_inputs.len());
-        for input in planned_inputs {
-            let file = before_by_path.get(input.as_str()).ok_or_else(|| {
-                WyrdTestServerError::Start("Forge planned input is absent from baseline".to_owned())
-            })?;
-            if after_paths.contains(input.as_str()) {
-                return Err(WyrdTestServerError::Start(
-                    "Forge planned input remains live after commit".to_owned(),
-                ));
-            }
-            input_files.push((*file).clone());
-        }
-        let before_paths = before_by_path.keys().copied().collect::<BTreeSet<_>>();
-        let output_files = after
-            .live_data_files
-            .iter()
-            .filter(|file| !before_paths.contains(file.path.as_str()))
-            .cloned()
-            .collect::<Vec<_>>();
-        if output_files.is_empty() {
-            return Err(WyrdTestServerError::Start(
-                "Forge rewrite produced no replacement file".to_owned(),
-            ));
-        }
-        let sum = |files: &[ForgeDataFileInspection]| {
-            files.iter().try_fold(0_u64, |total, file| {
-                total.checked_add(file.bytes).ok_or_else(|| {
-                    WyrdTestServerError::Start("Forge comparison bytes overflow".to_owned())
-                })
-            })
-        };
-        Ok(ForgeRewriteComparison {
-            input_bytes: sum(&input_files)?,
-            output_bytes: sum(&output_files)?,
-            input_files,
-            output_files,
-        })
+    /// Exposing the owner rather than a projection is deliberate: a visibility
+    /// proof has to call the same `pin_sealed_table` an Oracle read calls, so
+    /// what it observes is the production cut and not a test reconstruction of
+    /// one.
+    #[must_use]
+    pub fn bifrost_catalog(&self) -> Arc<BifrostCatalog> {
+        Arc::clone(&self.inner.bifrost_catalog)
     }
 
     /// Return the Scribe retained by this server's production ingest runtime.
@@ -2896,6 +2725,46 @@ impl WyrdTestServer {
             .await
             .map_err(sql)
     }
+
+    /// Reads one accepted Oracle epoch's validated durable table protection.
+    ///
+    /// Resolves the registered table UID under tenant RLS and ends the read
+    /// transaction before returning, so inspection holds no maintenance lock.
+    ///
+    /// # Errors
+    /// Returns a harness SQL error for missing or invalid identity, a malformed
+    /// frontier, an unrepresentable fence, or a failed read transaction.
+    pub async fn oracle_table_protection_for_test(
+        &self,
+        binding: &TenantTableBinding,
+        node: NodeId,
+        fence: FencingToken,
+    ) -> Result<Option<ProtectionRecord>, WyrdTestServerError> {
+        let mut conn = self.tenant_conn_for(binding.tenant).await?;
+        let stored: Vec<u8> =
+            sqlx::query_scalar("SELECT table_uid FROM vala.bifrost_tables WHERE fqn = $1")
+                .bind(binding.table_ref.fqn())
+                .fetch_one(&mut **conn.transaction())
+                .await
+                .map_err(sql)?;
+        let identity = TableAuthorityIdentity {
+            tenant: binding.tenant,
+            table_uid: <[u8; 16]>::try_from(stored.as_slice()).map_err(sql)?,
+            catalog_name: BIFROST_CATALOG_NAME.to_owned(),
+            namespace_name: binding.table_ref.namespace.as_str().to_owned(),
+            table_name: binding.table_ref.name.clone(),
+        };
+        let record = OracleTableProtections::new(&mut conn)
+            .read(
+                &identity,
+                node.as_uuid(),
+                i64::try_from(fence).map_err(sql)?,
+            )
+            .await
+            .map_err(sql)?;
+        conn.commit().await.map_err(sql)?;
+        Ok(record)
+    }
     /// Return the durable Scribe WAL root this fixture composed the server with.
     ///
     /// Durability assertions replay the WAL directly rather than trusting an
@@ -2997,9 +2866,8 @@ impl WyrdTestServer {
         let shutdown_token = state.shutdown_token.clone();
 
         if self.forge_process_role() == BifrostTarget::ForgeWorker {
-            let worker =
-                wyrd_server::boot::spawn_forge_worker(&state, shutdown_token.clone(), 1, 1)
-                    .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+            let worker = wyrd_server::boot::spawn_forge_worker(&state, shutdown_token.clone())
+                .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
             // A dedicated Forge worker never runs the bounded Bifrost drain, so
             // its serve task reports that nothing drained rather than claiming a
             // drain outcome it did not produce.
@@ -3554,6 +3422,17 @@ impl WyrdTestServerBuilder {
         self
     }
 
+    /// Names the Forge compaction budget this node admits plans against.
+    ///
+    /// The harness default is sized for the small tables most fixtures compact.
+    /// A journey that compacts production-sized inputs states the budget its
+    /// pod was sized for here, exactly as a deployment configures one.
+    #[must_use]
+    pub(crate) fn with_forge_compaction_memory_limit_for_test(mut self, bytes: usize) -> Self {
+        self.forge_compaction_memory_limit_bytes = Some(bytes);
+        self
+    }
+
     /// Attach the process-installed production telemetry pipeline.
     #[must_use]
     pub(crate) fn with_telemetry(mut self, telemetry: Arc<TelemetryGuard>) -> Self {
@@ -3661,7 +3540,7 @@ impl WyrdTestServerBuilder {
         } else {
             let root = tempfile::tempdir()
                 .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-            let handle = wyrd_storage::StorageHandle::from_settings(StorageSettings {
+            let settings = StorageSettings {
                 backend: BackendConfig::Local {
                     root: root.path().to_path_buf(),
                 },
@@ -3670,9 +3549,26 @@ impl WyrdTestServerBuilder {
                 part_size_bytes: 16 * 1024 * 1024,
                 multipart_threshold_bytes: 100 * 1024 * 1024,
                 public_base_url: Some("https://wyrd.test".to_owned()),
-            })
-            .await
-            .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+            };
+            // The filesystem service resumes a listing from `start_after`
+            // correctly but does not advertise the capability, and Forge
+            // workers refuse to start on a staging backend that cannot resume
+            // a bounded orphan scan. The default fixture stands in for a
+            // production object store, so it declares the support it actually
+            // has; a caller wanting the incapable backend supplies plain
+            // storage settings instead.
+            let operator = wyrd_storage::factory::build_operator(&settings.backend)
+                .map_err(|error| WyrdTestServerError::Start(error.to_string()))?
+                .layer(opendal::layers::CapabilityOverrideLayer::new(
+                    |mut capability| {
+                        capability.list_with_start_after = true;
+                        capability
+                    },
+                ));
+            let handle =
+                wyrd_storage::StorageHandle::from_settings_with_operator(settings, operator)
+                    .await
+                    .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
             (Some(Arc::new(root)), handle)
         };
         if self.bifrost_roles.contains(&BifrostRuntimeRole::Oracle)
@@ -3824,13 +3720,11 @@ impl WyrdTestServerBuilder {
             let wal_volume_root = durable_wal_root.clone();
             let scribe_stage = wal_volume_root.join("scribe-stage");
             let scribe_output = scratch_root.join("scribe-output");
-            let forge_scratch = scratch_root.join("forge");
             let oracle_scratch = scratch_root.join("oracle");
             for root in [
                 &wal_volume_root,
                 &scribe_stage,
                 &scribe_output,
-                &forge_scratch,
                 &oracle_scratch,
             ] {
                 std::fs::create_dir_all(root)
@@ -3840,18 +3734,54 @@ impl WyrdTestServerBuilder {
                 wal: wal_volume_root,
                 scribe_stage,
                 scribe_output_scratch: scribe_output,
-                forge_scratch,
                 oracle_scratch,
             })
         };
         let snapshot = self.system_resources.unwrap_or(SystemResourceSnapshot {
-            memory_limit_bytes: 3 * 1024 * 1024 * 1024,
+            memory_limit_bytes: HARNESS_NODE_MEMORY_LIMIT_BYTES,
             effective_cpu: 4,
             scratch_capacity_bytes: 4 * 1024 * 1024 * 1024,
             scratch_available_bytes: 4 * 1024 * 1024 * 1024,
             memory_source: ResourceSource::Injected,
             cpu_source: ResourceSource::Injected,
         });
+        // The formula's default (four fifths of the memory limit) deliberately
+        // does not clamp, so a co-located harness whose Scribe and Oracle floors
+        // are also protected must name a budget that fits the remainder —
+        // exactly as a co-located deployment configures one.
+        let forge_budget_bytes = self
+            .bifrost_roles
+            .iter()
+            .any(|role| {
+                matches!(
+                    role,
+                    BifrostRuntimeRole::ForgeCoordinator | BifrostRuntimeRole::ForgeWorker
+                )
+            })
+            .then(|| {
+                self.forge_compaction_memory_limit_bytes.unwrap_or_else(|| {
+                    // The default is sized for the tables most fixtures
+                    // compact, but a small pod still has to leave elastic
+                    // memory for the Scribe and Oracle work beside it, so the
+                    // remainder left by the protected floors halves it.
+                    let protected = self
+                        .bifrost_roles
+                        .iter()
+                        .filter(|role| {
+                            matches!(
+                                role,
+                                BifrostRuntimeRole::Scribe | BifrostRuntimeRole::Oracle
+                            )
+                        })
+                        .count()
+                        * ROLE_MEMORY_FLOOR_BYTES;
+                    let safe = snapshot
+                        .memory_limit_bytes
+                        .saturating_sub(MIN_UNMANAGED_RESERVE_BYTES)
+                        .saturating_sub(protected);
+                    HARNESS_FORGE_COMPACTION_BUDGET_BYTES.min(safe / 2)
+                })
+            });
         let runtime_resources =
             BifrostRuntimeResources::from_snapshot_with_transport_message_limit(
                 snapshot,
@@ -3862,6 +3792,12 @@ impl WyrdTestServerBuilder {
                     scratch_limit_bytes: None,
                     effective_cpu: None,
                     oracle_query_slot_limit: self.oracle_query_slot_limit,
+                    // The formula's default (four fifths of the memory limit)
+                    // deliberately does not clamp, so a co-located harness whose
+                    // Scribe and Oracle floors are also protected must name a
+                    // budget that fits the remainder — exactly as a co-located
+                    // deployment configures one.
+                    forge_compaction_memory_limit_bytes: forge_budget_bytes,
                     scratch_root,
                     volume_roots,
                 },
@@ -3905,10 +3841,7 @@ impl WyrdTestServerBuilder {
         } else {
             ClusterRegistry::new(postgres.vala().clone(), node_id)
         });
-        let forge_config = self.forge_config.unwrap_or_else(|| ForgeConfig {
-            max_files_per_bin: self.forge_max_files_per_bin,
-            ..ForgeConfig::default()
-        });
+        let forge_config = self.forge_config.unwrap_or_default();
         let (forge_clock, forge_clock_control) = ForgeClock::manual(Utc::now());
         let forge_scheduler_trigger = ForgeSchedulerTrigger::new();
         let forge_object_store = (self
@@ -4037,6 +3970,7 @@ impl WyrdTestServerBuilder {
         let ComposedBifrost {
             bifrost: bifrost_runtime,
             coordination_runtime,
+            compaction_runtime,
         } = wyrd_server::boot::compose_bifrost(BifrostBuildInputs {
             target,
             deployment_profile: DeploymentProfile::Development,
@@ -4103,10 +4037,6 @@ impl WyrdTestServerBuilder {
         let (forge_publisher, _forge_inbox) = staging_file_channel(16)
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
         let router = build_router(state.clone());
-        let forge_role_telemetry = Some(wyrd_server::start_capture_forge_role(
-            self.forge_process_role,
-            node_id.as_uuid(),
-        ));
 
         Ok(WyrdTestServer {
             inner: WyrdTestServerInner {
@@ -4127,11 +4057,11 @@ impl WyrdTestServerBuilder {
                 forge_object_store,
                 forge_process_role: self.forge_process_role,
                 node_id,
-                _forge_role_telemetry: forge_role_telemetry,
                 query_stream_fault,
                 query_control_audit_fault,
                 query_stream_stall: std::sync::Mutex::new(None),
                 _coordination_runtime: coordination_runtime,
+                _compaction_runtime: compaction_runtime,
             },
             mode: Mode::InProcess,
             shutdown_token: None,
@@ -4918,6 +4848,7 @@ mod production_composition_tests {
                 scratch_limit_bytes: None,
                 effective_cpu: None,
                 oracle_query_slot_limit: None,
+                forge_compaction_memory_limit_bytes: None,
                 scratch_root: scratch.path().to_owned(),
                 volume_roots: None,
             },
@@ -4931,7 +4862,7 @@ mod production_composition_tests {
             "an Oracle node must receive its narrow Oracle capability"
         );
         assert!(
-            composed.forge().is_none(),
+            composed.scribe().is_none(),
             "composition must not issue capabilities for unselected roles"
         );
         let sources = composed.sources();

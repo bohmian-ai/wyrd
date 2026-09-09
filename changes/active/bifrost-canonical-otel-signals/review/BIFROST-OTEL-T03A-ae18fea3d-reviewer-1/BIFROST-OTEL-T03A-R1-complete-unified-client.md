@@ -126,6 +126,8 @@ Record baseline-identical unrelated failures separately; do not weaken, suppress
 | `mise exec -- cargo nextest run --locked -p wyrd-client --lib` | PASS |
 | `mise run check:unwrap-audit` | FAIL — pre-existing, `crates/wyrd/wyrd-testing/src/bifrost/process_cluster.rs`, outside this write set and excluded by this remediation's constraints |
 | `git diff --check` | PASS |
+| `mise run verify:bifrost` | FAIL at `check:tenant-isolation` only — pre-existing, `crates/vala/vala-sql/migrations/*` and `queries/oracle_admission.rs`, outside this write set and excluded by this remediation's constraints. Every other leg passed. |
+| `mise run gate` | NOT RUN — the repository aggregate was skipped at the caller's direction. A partial run before that skip reached `test:bifrost:unit:rust` and reproduced the same 6 pre-existing `wyrd-testing` failures (`bifrost::forge_harness::worker_lifecycle_tests::*`, `bifrost::scribe_workload::tests::scribe_workload_read_boundaries_may_not_reuse_an_earlier_read`) the original task recorded against a clean `HEAD` worktree; no other lane in that partial run failed. |
 
 ### Non-goals
 

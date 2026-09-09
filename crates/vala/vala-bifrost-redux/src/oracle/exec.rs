@@ -3717,11 +3717,11 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::oracle::BifrostQueryReadDecision;
     use crate::oracle::bindings::{
         FollowerSourceKey, OracleExecutionBindingInputs, OracleExecutionBindings, OracleSourceKey,
     };
     use crate::oracle::codec::RemoteSourcePlaceholderExec;
-    use crate::oracle::{BifrostQueryReadDecision, OracleSlotManager};
     use arrow::array::{ArrayRef, Int32Array, Int64Array, StringArray};
     use async_trait::async_trait;
     use datafusion::logical_expr::{col, lit};
@@ -4630,7 +4630,7 @@ mod tests {
             .expect("composition must enable the Oracle capability"),
             reconciliation_limit_bytes: 1024 * 1024,
         };
-        let telemetry = Arc::new(OracleTelemetry::new(Arc::new(OracleSlotManager::new(1, 1))));
+        let telemetry = Arc::new(OracleTelemetry::new());
         let make_exec = |size_bytes| {
             let metrics = Arc::new(OracleScanMetricsHandle::default());
             let exec = HotParquetExec::new(
@@ -4787,7 +4787,7 @@ mod tests {
                     reconciliation_limit_bytes: 1024 * 1024,
                 },
                 memory_pool: Arc::clone(&pool),
-                telemetry: Arc::new(OracleTelemetry::new(Arc::new(OracleSlotManager::new(1, 1)))),
+                telemetry: Arc::new(OracleTelemetry::new()),
                 query_class: QueryClass::Interactive,
             },
             Arc::new(OracleScanMetricsHandle::default()),
@@ -4836,7 +4836,7 @@ mod tests {
         let fixture = build_hot_causal_fixture();
         let budget = fixture.bytes.len().saturating_sub(1);
         let governor = oracle_test_roles(4 * 1024 * 1024 * 1024);
-        let telemetry = Arc::new(OracleTelemetry::new(Arc::new(OracleSlotManager::new(1, 1))));
+        let telemetry = Arc::new(OracleTelemetry::new());
         let metrics = Arc::new(OracleScanMetricsHandle::default());
         let ranges = Arc::new(Mutex::new(Vec::new()));
         let recorded = Arc::clone(&ranges);
@@ -5040,7 +5040,7 @@ mod tests {
     async fn hot_parquet_drop_stops_io_and_releases_memory() {
         let fixture = build_hot_causal_fixture();
         let governor = oracle_test_roles(4 * 1024 * 1024 * 1024);
-        let telemetry = Arc::new(OracleTelemetry::new(Arc::new(OracleSlotManager::new(1, 1))));
+        let telemetry = Arc::new(OracleTelemetry::new());
         let attempts = Arc::new(AtomicU64::new(0));
         let observed = Arc::clone(&attempts);
         let source = fixture.bytes.clone();
@@ -5147,7 +5147,7 @@ mod tests {
         let requested = fixture.bytes.len();
         let roles = oracle_test_roles(4 * 1024 * 1024 * 1024);
         let memory = oracle_memory_resources(&roles, 1024 * 1024);
-        let telemetry = Arc::new(OracleTelemetry::new(Arc::new(OracleSlotManager::new(1, 1))));
+        let telemetry = Arc::new(OracleTelemetry::new());
         let recorder = wyrd_bench::BenchmarkRecorder::default();
         let _guard = metrics::set_default_local_recorder(&recorder);
         let requested_bytes = Arc::new(AtomicU64::new(0));
@@ -5771,7 +5771,7 @@ mod tests {
             ])
         };
         let governor = oracle_test_roles(4 * 1024 * 1024 * 1024);
-        let telemetry = Arc::new(OracleTelemetry::new(Arc::new(OracleSlotManager::new(1, 1))));
+        let telemetry = Arc::new(OracleTelemetry::new());
         let pool = crate::resources::bounded_memory_pool(1024 * 1024 * 1024);
         let inputs = |assignments: HashMap<OracleSourceKey, FollowerScanAssignment>| {
             OracleExecutionBindingInputs {
@@ -6158,7 +6158,7 @@ mod tests {
         let size = fixture.bytes.len();
         let rows = usize::try_from(HOT_BATCH_FIXTURE_ROWS).expect("fixture rows fit usize");
         let governor = oracle_test_roles(4 * 1024 * 1024 * 1024);
-        let telemetry = Arc::new(OracleTelemetry::new(Arc::new(OracleSlotManager::new(1, 1))));
+        let telemetry = Arc::new(OracleTelemetry::new());
 
         for (batch_size, expected_batches) in [(8_usize, 8_usize), (8_192, 1)] {
             let leader_pool = crate::resources::bounded_memory_pool(1024 * 1024 * 1024);
@@ -6845,7 +6845,7 @@ mod tests {
                 crate::oracle::bindings::OracleExecutionGrant::for_test(
                     QueryClass::Interactive,
                     oracle_memory_resources(&oracle_test_roles(1024 * 1024 * 1024), 1024 * 1024),
-                    Arc::new(OracleTelemetry::new(Arc::new(OracleSlotManager::new(1, 1)))),
+                    Arc::new(OracleTelemetry::new()),
                 ),
                 std::collections::HashMap::from([("vala.traces.spans".to_owned(), vec![live])]),
             ),

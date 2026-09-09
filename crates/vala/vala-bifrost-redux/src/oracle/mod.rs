@@ -346,8 +346,8 @@ pub struct OracleReadinessSnapshot {
     pub startup_reconciled: bool,
     /// Number of live Oracle memberships in the local immutable cluster snapshot.
     pub live_oracles: usize,
-    /// Configured local running slot capacity available to query admission.
-    pub running_capacity: usize,
+    /// Immutable local slot-unit total available to query admission.
+    pub total_slot_units: usize,
 }
 
 /// Read-only aggregate owned by local Oracle admission and peer reservations.
@@ -368,17 +368,23 @@ pub struct OracleRuntimeInspection {
     pub peer_running: u64,
 }
 
-/// Bounded local admission slots for one Oracle process.
+/// Bounded local peer-waiter slots for one Oracle process.
+///
+/// Running capacity is not owned here. `BifrostResourceGovernor` is the one
+/// class-aware slot-unit ledger charged by both leader admission and follower
+/// acquisition, so a second local semaphore could only disagree with it.
 #[derive(Debug)]
 pub struct OracleSlotManager {
     /// Semaphore bounding requests waiting to enter pod-local admission.
     pending: Arc<Semaphore>,
-    /// Semaphore representing local running slot units.
-    running: Arc<Semaphore>,
     /// Immutable configured pending capacity used for readiness diagnostics.
     pending_limit: usize,
-    /// Immutable configured running capacity used for placement calculations.
-    running_limit: usize,
+    /// Immutable local slot-unit total used only for placement calculations.
+    ///
+    /// This is a capacity figure, never a gate: the governor decides whether
+    /// units are available, while placement needs to know how many this pod
+    /// could ever have.
+    total_slot_units: usize,
 }
 
 /// Per-phase stopwatch for one SQL attempt after planning completes.
@@ -447,8 +453,6 @@ impl AttemptPhaseTimer {
 /// installed by the server and never installs an exporter or subscriber.
 #[derive(Debug)]
 struct OracleTelemetry {
-    /// Immutable local slot capacity reported alongside query activity.
-    slots: Arc<OracleSlotManager>,
     /// Oracle-owned parent-memory bytes retained by live reservations.
     memory_bytes: AtomicU64,
 }
@@ -463,9 +467,9 @@ impl OracleTelemetry {
         let _ = (total, query_class, memory_kind);
     }
 
-    /// Creates telemetry around the same slot owner used by admission.
+    /// Creates the process-local Oracle metric owner with zeroed gauges.
     #[must_use]
-    fn new(slots: Arc<OracleSlotManager>) -> Self {
+    fn new() -> Self {
         let _ = (OracleAdmissionReason::ALL, OracleCancellationReason::ALL);
         for query_class in [QueryClass::Interactive, QueryClass::Analytical] {
             let class = query_class_label(query_class);
@@ -521,7 +525,6 @@ impl OracleTelemetry {
         }
         telemetry::register_analytical_series();
         Self {
-            slots,
             memory_bytes: AtomicU64::new(0),
         }
     }
@@ -533,7 +536,6 @@ impl OracleTelemetry {
         _visibility: VisibilityMode,
         query_class: QueryClass,
     ) -> QueryTelemetryGuard {
-        let _ = self.slots.running_capacity();
         metrics::gauge!(
             "oracle_queries_active",
             "class" => query_class_label(query_class)
@@ -904,15 +906,20 @@ impl Drop for AccountedMemoryReservation {
 }
 
 impl OracleSlotManager {
-    /// Creates bounded pending and running slot guards.
+    /// Creates the bounded peer-waiter guard for one Oracle process.
     #[must_use]
-    pub fn new(pending: usize, running: usize) -> Self {
+    pub fn new(pending: usize, total_slot_units: usize) -> Self {
         Self {
             pending: Arc::new(Semaphore::new(pending)),
-            running: Arc::new(Semaphore::new(running)),
             pending_limit: pending,
-            running_limit: running,
+            total_slot_units,
         }
+    }
+
+    /// Returns the immutable local slot-unit total for placement calculations.
+    #[must_use]
+    pub fn total_slot_units(&self) -> usize {
+        self.total_slot_units
     }
 
     /// Returns the currently configured pending capacity.
@@ -926,19 +933,6 @@ impl OracleSlotManager {
     pub(crate) fn pending_in_use(&self) -> u64 {
         self.pending_limit
             .saturating_sub(self.pending.available_permits()) as u64
-    }
-
-    /// Returns the currently configured running capacity.
-    #[must_use]
-    pub fn running_capacity(&self) -> usize {
-        self.running_limit
-    }
-
-    /// Returns the number of running worker units currently reserved locally.
-    #[must_use]
-    pub(crate) fn running_in_use(&self) -> u64 {
-        self.running_limit
-            .saturating_sub(self.running.available_permits()) as u64
     }
 
     /// Tries to reserve one bounded reservation-waiter slot.
@@ -956,17 +950,6 @@ impl OracleSlotManager {
     pub(crate) fn try_pending(&self) -> Result<OwnedSemaphorePermit, BifrostError> {
         Arc::clone(&self.pending)
             .try_acquire_owned()
-            .map_err(|_| BifrostError::QueryAdmissionRejected)
-    }
-
-    /// Tries to reserve the local running units required by one admitted query.
-    ///
-    /// # Errors
-    ///
-    /// Returns admission rejection when local running capacity changed since placement.
-    pub(crate) fn try_running(&self, demand: u32) -> Result<OwnedSemaphorePermit, BifrostError> {
-        Arc::clone(&self.running)
-            .try_acquire_many_owned(demand)
             .map_err(|_| BifrostError::QueryAdmissionRejected)
     }
 }
@@ -2155,7 +2138,7 @@ impl Oracle {
         validate_oracle_config(config.config)?;
         let operator_pool = config.operator_pool;
         let planner = OraclePlanner::new(config.config);
-        let telemetry = Arc::new(OracleTelemetry::new(Arc::clone(&config.local_slots)));
+        let telemetry = Arc::new(OracleTelemetry::new());
         let cluster = Arc::clone(&config.cluster);
         let running_queries = Arc::new(RunningQueryRegistry::new());
         let admission = Arc::new(OracleAdmission::with_config(
@@ -3807,7 +3790,7 @@ impl Oracle {
         OracleReadinessSnapshot {
             startup_reconciled: self.startup_reconciled(),
             live_oracles: self.cluster.snapshot().live_oracles().len(),
-            running_capacity: self.admission.slots.running_capacity(),
+            total_slot_units: self.admission.slots.total_slot_units(),
         }
     }
 
@@ -5730,7 +5713,7 @@ mod tests {
     fn oracle_terminal_metric_records_closed_label_delta() {
         let recorder = wyrd_bench::BenchmarkRecorder::new();
         metrics::with_local_recorder(&recorder, || {
-            let telemetry = Arc::new(OracleTelemetry::new(Arc::new(OracleSlotManager::new(1, 2))));
+            let telemetry = Arc::new(OracleTelemetry::new());
             let mut query =
                 telemetry.start_query(VisibilityMode::PublishedOnly, QueryClass::Analytical);
             query.start_stream();
@@ -5757,7 +5740,7 @@ mod tests {
     fn oracle_telemetry_registers_closed_idle_gauges() {
         let recorder = wyrd_bench::BenchmarkRecorder::new();
         let _guard = metrics::set_default_local_recorder(&recorder);
-        let telemetry = Arc::new(OracleTelemetry::new(Arc::new(OracleSlotManager::new(1, 2))));
+        let telemetry = Arc::new(OracleTelemetry::new());
         let expected = [
             "oracle_queries_active{class=\"interactive\"}",
             "oracle_queries_active{class=\"analytical\"}",
@@ -5808,8 +5791,7 @@ mod tests {
         let recorder = wyrd_bench::BenchmarkRecorder::new();
         metrics::with_local_recorder(&recorder, || {
             for outcome in ["success", "failed"] {
-                let telemetry =
-                    Arc::new(OracleTelemetry::new(Arc::new(OracleSlotManager::new(1, 2))));
+                let telemetry = Arc::new(OracleTelemetry::new());
                 let mut query =
                     telemetry.start_query(VisibilityMode::PublishedOnly, QueryClass::Analytical);
                 query.start_stream();
@@ -5818,7 +5800,7 @@ mod tests {
                 query.finish(outcome, "complete");
             }
 
-            let telemetry = Arc::new(OracleTelemetry::new(Arc::new(OracleSlotManager::new(1, 2))));
+            let telemetry = Arc::new(OracleTelemetry::new());
             let mut cancelled =
                 telemetry.start_query(VisibilityMode::PublishedOnly, QueryClass::Analytical);
             cancelled.start_stream();
@@ -5828,7 +5810,7 @@ mod tests {
                 .store(true, Ordering::Release);
             drop(cancelled);
 
-            let telemetry = Arc::new(OracleTelemetry::new(Arc::new(OracleSlotManager::new(1, 2))));
+            let telemetry = Arc::new(OracleTelemetry::new());
             let mut dropped =
                 telemetry.start_query(VisibilityMode::PublishedOnly, QueryClass::Analytical);
             dropped.start_stream();

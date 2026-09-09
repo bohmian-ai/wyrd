@@ -13,7 +13,6 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use futures_util::{Stream, StreamExt};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
-use tokio::sync::OwnedSemaphorePermit;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use wyrd_spec::DataTenantId;
@@ -189,28 +188,15 @@ struct PendingReservation {
     query_class: QueryClass,
     /// Pending expiry used for eager reclamation.
     expires_at: DateTime<Utc>,
-    /// Remote running-slot permit granted at reservation and held until execute
-    /// or release.
+    /// Resources this node charged when it accepted the reservation, and the
+    /// purpose it charged them for.
     ///
-    /// Reservation is the capacity gate. Granting the running permit here means
-    /// a reserved fragment can always execute: a leader never dispatches to a
-    /// node that has not already seated it. Charging a separate, looser pending
-    /// pool and then acquiring the running slot at execute admitted far more
-    /// fragments than could run, so the binding refusal landed after the leader
-    /// had already committed to the fan-out.
-    ///
-    /// Leader-local work reuses the already-admitted query capacity and keeps
-    /// this empty.
-    permit: Option<OwnedSemaphorePermit>,
-    /// Memory this node charged when it accepted the reservation, and the
-    /// purpose it charged it for.
-    ///
-    /// The running-slot semaphore alone is not a sufficient capacity answer: it
-    /// counts peer work and is blind to the leader-side query envelopes
-    /// competing for the same node's Oracle memory budget. Charging the memory
-    /// governor here is what makes an accepted reservation a real guarantee on a
-    /// node that is simultaneously serving its own queries. Leader-local work
-    /// reuses the admitted query's pool and keeps this empty.
+    /// Reservation is the whole capacity gate. The charged envelope or worker
+    /// quantum holds this node's aggregate slot units in the shared governor
+    /// ledger and its Oracle memory, so a reserved fragment can always execute:
+    /// a leader never dispatches to a node that has not already seated it.
+    /// Leader-local work reuses the admitted query's own envelope and keeps this
+    /// empty.
     capacity: Option<ReservedCapacity>,
     /// Graph this reservation may only ever be leased to, when it names one.
     graph: Option<AnalyticalGraphRef>,
@@ -259,7 +245,7 @@ pub struct GraphLeaseRequest {
 /// One follower's reservation held across a fallible graph activation.
 ///
 /// This is the transaction that replaced a destructive transfer. The pending
-/// entry — permit, envelope, reserving leader and fence, and above all its
+/// entry — envelope, reserving leader and fence, and above all its
 /// *original* expiry — is removed from the registry and retained here
 /// unchanged while the activator does the fallible work: building the query
 /// runtime and registering the graph with its supervisor. Exactly one of
@@ -358,9 +344,8 @@ impl PendingGraphActivation {
     /// fails must hand the resources back, because the reservation this
     /// activation restores is only usable again if it is restored complete.
     ///
-    /// On success the residue — the running permit and the admission class — is
-    /// returned for the lease to own, and the activation's cumulative counter is
-    /// advanced exactly once.
+    /// On success the residue — the admission class — is returned for the lease
+    /// to own, and the activation's cumulative counter is advanced exactly once.
     ///
     /// # Errors
     ///
@@ -386,7 +371,6 @@ impl PendingGraphActivation {
                     reservation_id: self.reservation_id,
                     graph: self.graph,
                     query_class: entry.query_class,
-                    permit: entry.permit.take(),
                 };
                 #[cfg(feature = "test-support")]
                 self.registry
@@ -412,7 +396,7 @@ impl PendingGraphActivation {
     /// Restoration is conditional on the reservation's *own* original expiry,
     /// never on a fresh one: a failed activation may not buy the leader more
     /// time than it was granted. An expired or displaced reservation releases
-    /// its exact permit and envelope instead, which returns this follower to
+    /// its exact envelope instead, which returns this follower to
     /// baseline rather than stranding capacity for a graph that never existed.
     pub(crate) fn rollback(mut self, now: DateTime<Utc>) {
         let Some(entry) = self.entry.take() else {
@@ -426,8 +410,8 @@ impl Drop for PendingGraphActivation {
     /// Rolls back an activation abandoned by cancellation, panic, or early return.
     ///
     /// The settled paths clear the entry and leave nothing to do here. This
-    /// covers the activator that simply went away, where the alternative is a
-    /// permit and envelope no owner can ever return.
+    /// covers the activator that simply went away, where the alternative is an
+    /// envelope no owner can ever return.
     fn drop(&mut self) {
         let Some(entry) = self.entry.take() else {
             return;
@@ -439,11 +423,10 @@ impl Drop for PendingGraphActivation {
 
 /// The reservation residue one activated graph lease owns for the graph's life.
 ///
-/// Everything else the reservation held has changed owner: the envelope moved
-/// into the supervisor's graph state, and the pending entry is gone. What
-/// remains is the running permit this node charged when it accepted the
-/// reservation, which the graph must keep until it settles, and the class it was
-/// charged under. Dropping this is the release.
+/// Everything else the reservation held has changed owner: the envelope — and
+/// with it this node's aggregate slot units — moved into the supervisor's graph
+/// state, and the pending entry is gone. What remains is the class the graph was
+/// charged under, which its telemetry and settlement still name.
 #[derive(Debug)]
 pub struct CommittedGraphActivation {
     /// Reservation this graph was activated from.
@@ -452,8 +435,6 @@ pub struct CommittedGraphActivation {
     graph: AnalyticalGraphRef,
     /// Admission class the graph's envelope was charged under.
     query_class: QueryClass,
-    /// Running permit charged at reservation and held for the graph's life.
-    permit: Option<OwnedSemaphorePermit>,
 }
 
 impl CommittedGraphActivation {
@@ -476,37 +457,19 @@ impl CommittedGraphActivation {
     }
 }
 
-impl Drop for CommittedGraphActivation {
-    /// Returns the graph's running permit when its last owner goes away.
-    fn drop(&mut self) {
-        drop(self.permit.take());
-    }
-}
-
 /// Running worker reservation retained through attempt-stream completion.
 #[derive(Debug)]
 pub struct RunningReservation {
     /// Authenticated query class carried into worker-owned scan telemetry.
     pub(crate) query_class: QueryClass,
-    /// Remote-worker slot permit released on stream completion, failure, or drop.
-    ///
-    /// Leader-local execution leaves this empty because the admitted query guard
-    /// already retains that node's running permit for the complete query stream.
-    permit: Option<OwnedSemaphorePermit>,
-    /// Remote-worker memory lease transferred from the reservation.
+    /// Remote-worker resources transferred from the reservation.
     ///
     /// Retained for the whole attempt stream so the bounded `DataFusion` pool
     /// this fragment executes under stays charged until the stream completes,
     /// fails, or is dropped. Leader-local execution leaves this empty and uses
-    /// the admitted query's own pool.
+    /// the admitted query's own pool. Dropping it returns this node's slot
+    /// units to the shared governor ledger and wakes queued leaders.
     pub(crate) worker_resources: Option<FollowerWorkerResources>,
-}
-
-impl Drop for RunningReservation {
-    /// Releases the retained worker permit when an attempt stream completes or is dropped.
-    fn drop(&mut self) {
-        drop(self.permit.take());
-    }
 }
 
 /// In-memory worker reservation owner; entries are never durable.
@@ -586,35 +549,17 @@ impl ReservationRegistry {
         if request.slot_units == 0 || request.expires_at <= now {
             return Err(DispatchError::Terminal);
         }
-        // Clamp leader-supplied demand to this node's own usable capacity before
-        // charging. `slot_units` arrives leader-supplied as a fixed per-class
-        // constant (`admission_limits(u32::MAX, class).1`, always 2 for
-        // Analytical) and would be structurally unschedulable on a node whose own
-        // running capacity is smaller. The clamp upholds
-        // `demand <= running_capacity.max(1)` without ever loosening the
-        // semaphore, so a refusal after it is genuine transient saturation.
-        let running_capacity = self.slots.running_capacity();
-        let capacity_slots = u32::try_from(running_capacity.max(1)).unwrap_or(u32::MAX);
-        let demand = request.slot_units.min(capacity_slots);
-        let Ok(permit) = self.slots.try_running(demand) else {
-            tracing::warn!(
-                stage = "slot_reservation",
-                query_class = ?request.query_class,
-                demand,
-                running_capacity,
-                running_in_use = self.slots.running_in_use(),
-                "oracle peer slot rejection"
-            );
-            return Err(DispatchError::Capacity);
-        };
-        self.insert(request, now, Some(permit), capacity)
+        // Slot units were already charged against the shared governor ledger by
+        // whichever capability produced `capacity`, so there is no second local
+        // semaphore to clamp leader-supplied demand against here.
+        self.insert(request, now, capacity)
     }
 
     /// Reserves tuple-bound leader-local work under admitted query capacity.
     ///
     /// The local query already owns this process's admission budget. The
     /// reservation retains expiry, registry-capacity, and ownership checks
-    /// without charging the shared pending semaphore a second time.
+    /// without charging the shared governor slot ledger a second time.
     ///
     /// # Errors
     /// Returns terminal for invalid demand or expiry and retryable when the
@@ -624,7 +569,7 @@ impl ReservationRegistry {
         request: &ReserveNodeSlotsRequest,
         now: DateTime<Utc>,
     ) -> Result<PendingNodeReservation, DispatchError> {
-        self.insert(request, now, None, None)
+        self.insert(request, now, None)
     }
 
     /// Inserts one validated reservation with its explicit capacity owner.
@@ -636,7 +581,6 @@ impl ReservationRegistry {
         &self,
         request: &ReserveNodeSlotsRequest,
         now: DateTime<Utc>,
-        permit: Option<OwnedSemaphorePermit>,
         capacity: Option<ReservedCapacity>,
     ) -> Result<PendingNodeReservation, DispatchError> {
         if request.slot_units == 0 || request.expires_at <= now {
@@ -659,7 +603,7 @@ impl ReservationRegistry {
         let expires_at = request.expires_at.min(now + PENDING_TTL);
         entries.insert(
             reservation_id,
-            pending_reservation(request, expires_at, permit, capacity),
+            pending_reservation(request, expires_at, capacity),
         );
         Ok(PendingNodeReservation {
             reservation_id,
@@ -688,9 +632,9 @@ impl ReservationRegistry {
     /// The ownership tuple is checked before removal, so a forged execute cannot
     /// destroy another query's pending reservation.
     ///
-    /// This transition cannot fail on capacity. The running permit was charged
-    /// and stored when the reservation was accepted, so it is transferred here
-    /// rather than acquired: a peer that answered `Pending` has already
+    /// This transition cannot fail on capacity. The slot units were charged
+    /// and stored when the reservation was accepted, so they are transferred
+    /// here rather than acquired: a peer that answered `Pending` has already
     /// committed the capacity this fragment executes under, and the leader can
     /// treat a completed fan-out reservation as a guarantee that every
     /// participant will run.
@@ -718,7 +662,7 @@ impl ReservationRegistry {
             return Err(DispatchError::Terminal);
         }
         let query_class = entry.query_class;
-        // Transfer, do not acquire. The running permit was granted when this
+        // Transfer, do not acquire. The slot units were charged when this
         // reservation was accepted, so a reserved fragment can always execute and
         // this transition cannot fail on capacity.
         let mut entry = entries
@@ -734,7 +678,6 @@ impl ReservationRegistry {
         };
         let result = Ok(RunningReservation {
             query_class,
-            permit: entry.permit.take(),
             worker_resources,
         });
         #[cfg(feature = "test-support")]
@@ -787,7 +730,6 @@ impl ReservationRegistry {
         record_slot(query_class, SlotOutcome::Running);
         Ok(RunningReservation {
             query_class,
-            permit: None,
             worker_resources: None,
         })
     }
@@ -849,7 +791,7 @@ impl ReservationRegistry {
     /// Centralized here rather than in the activator because collision and
     /// expiry are the registry's own invariants: an entry may only return to a
     /// slot that is still vacant, and only while its own original expiry has
-    /// not passed. Everything else drops the exact permit and envelope, which is
+    /// not passed. Everything else drops the exact envelope, which is
     /// the honest outcome — the reservation the leader was promised is simply
     /// over.
     fn restore(
@@ -873,15 +815,13 @@ impl ReservationRegistry {
 
     /// Returns the greatest number of graphs this node may own at one time.
     ///
-    /// Derived from the one capacity root that already governs graph
-    /// admission — the running semaphore, against the per-graph slot demand
-    /// clamped exactly as [`ReservationRegistry::reserve`] clamps it — so a
-    /// bounded queue sized from this cannot disagree with what the registry
-    /// will actually admit. Never zero: a node that can admit one graph must be
-    /// able to settle it.
+    /// Derived from this pod's immutable local slot-unit total against the
+    /// per-graph slot demand, so a bounded queue sized from this cannot exceed
+    /// what the shared governor ledger could ever admit. Never zero: a node
+    /// that can admit one graph must be able to settle it.
     #[must_use]
     pub(crate) fn max_concurrent_graphs(&self) -> usize {
-        let running = self.slots.running_capacity().max(1);
+        let running = self.slots.total_slot_units().max(1);
         let units = usize::try_from(super::analytical::ANALYTICAL_GRAPH_SLOT_UNITS)
             .unwrap_or(1)
             .max(1)
@@ -910,11 +850,10 @@ impl ReservationRegistry {
     }
 }
 
-/// Converts a validated wire reservation into its permit-owning registry entry.
+/// Converts a validated wire reservation into its capacity-owning registry entry.
 fn pending_reservation(
     request: &ReserveNodeSlotsRequest,
     expires_at: DateTime<Utc>,
-    permit: Option<OwnedSemaphorePermit>,
     capacity: Option<ReservedCapacity>,
 ) -> PendingReservation {
     PendingReservation {
@@ -923,13 +862,12 @@ fn pending_reservation(
         leader_fencing_token: request.leader_fencing_token,
         query_class: request.query_class,
         expires_at,
-        permit,
         capacity,
         graph: request.graph,
     }
 }
 
-/// Retains only unexpired pending entries, dropping their permits immediately.
+/// Retains only unexpired pending entries, releasing their capacity immediately.
 fn retain_live(entries: &mut HashMap<ReservationId, PendingReservation>, now: DateTime<Utc>) {
     entries.retain(|_, entry| entry.expires_at > now);
 }
@@ -1151,7 +1089,7 @@ impl OraclePeerWorker {
     /// Reserves bounded running capacity for one fenced leader.
     ///
     /// Reservation is the single admission gate: accepting here grants the
-    /// running permit the fragment will later execute under, so a leader that
+    /// slot units the fragment will later execute under, so a leader that
     /// completes its fan-out reservation knows every participant can run.
     /// A saturated pool is waited out for at most [`PEER_SLOT_WAIT`] before
     /// refusing, which converts a momentary instant of contention into a
@@ -1174,7 +1112,7 @@ impl OraclePeerWorker {
         };
         let deadline = std::time::Instant::now() + PEER_SLOT_WAIT;
         loop {
-            // Charge the memory governor here, alongside the running slot, so a
+            // Charge the governor here — memory and slot units together — so a
             // node already saturated by its own leader-side queries refuses
             // before the leader commits to this participant rather than after.
             let attempt = match self.acquire_reserved_capacity(request) {
@@ -1182,14 +1120,10 @@ impl OraclePeerWorker {
                     .reservations
                     .reserve(request, Utc::now(), Some(capacity)),
                 Err(error) => {
-                    // The slot path emits its own structured rejection; without
-                    // this arm a memory-bound refusal would be invisible, and the
-                    // two causes need different operator responses (raise the
-                    // Oracle memory budget vs. raise slot capacity).
                     tracing::warn!(
                         stage = "slot_reservation",
                         query_class = ?request.query_class,
-                        "oracle peer worker memory rejection"
+                        "oracle peer capacity rejection"
                     );
                     Err(error)
                 }
@@ -1250,7 +1184,7 @@ impl OraclePeerWorker {
     ///
     /// The in-process dispatcher retains the admitted query guard while this
     /// operation runs, so this path validates and consumes the pending
-    /// reservation without acquiring a duplicate local running permit.
+    /// reservation without charging duplicate local slot units.
     ///
     /// # Errors
     /// Returns terminal security/contract failures or retryable storage failures.
@@ -1481,7 +1415,7 @@ impl OraclePeerWorker {
     ///
     /// The transition is tuple-bound: the reservation must already be held for
     /// exactly this query, leader, and leader fence. A remote worker consumes a
-    /// running permit; the leader-local path reuses the query's own admitted
+    /// slot units; the leader-local path reuses the query's own admitted
     /// slot instead of taking a duplicate. A tuple mismatch is a fence violation
     /// rather than an ordinary refusal, so it is audited before it is returned.
     ///
@@ -2072,9 +2006,9 @@ mod resource_tests {
 /// Source of the running capacity retained while one worker attempt streams.
 #[derive(Clone, Copy)]
 enum WorkerCapacity {
-    /// A remote worker acquires its own local running permit.
+    /// A remote worker charges its own local slot units.
     ReserveRunning,
-    /// The in-process leader reuses the permit retained by query admission.
+    /// The in-process leader reuses the units retained by query admission.
     LeaderAdmitted,
 }
 
@@ -4538,247 +4472,6 @@ mod tests {
         }
     }
 
-    /// Creates one leader-supplied Analytical reservation request.
-    ///
-    /// The `slot_units` value is the real production wire value
-    /// (`admission_limits(u32::MAX, Analytical).1 == 2`), never a hand-set 1.
-    /// This is the entry that exercises the peer-side schedulability clamp: on a
-    /// capacity-1 peer, demand 2 must clamp to 1 rather than reject permanently.
-    fn reserve_request_analytical(
-        query_id: QueryId,
-        leader: NodeId,
-        fence: FencingToken,
-        expires_at: DateTime<Utc>,
-    ) -> ReserveNodeSlotsRequest {
-        ReserveNodeSlotsRequest {
-            query_id,
-            leader_node_id: leader,
-            leader_fencing_token: fence,
-            query_class: QueryClass::Analytical,
-            slot_units: 2,
-            expires_at,
-            graph: None,
-        }
-    }
-
-    /// One captured `tracing` event: its rendered message and scalar fields.
-    type CapturedEvent = (String, HashMap<String, String>);
-
-    /// Minimal in-process subscriber retaining `tracing` events by message.
-    ///
-    /// The crate carries no `tracing-subscriber` dev-dependency, so this probe
-    /// captures the structured slot-rejection warning using only `tracing`
-    /// itself. It records each event's message and its scalar fields so the
-    /// AC3 assertion can prove the rejection path is observable in production.
-    #[derive(Clone, Default)]
-    struct RejectionWarnProbe {
-        /// Captured `(message, fields)` pairs for every observed event.
-        events: Arc<Mutex<Vec<CapturedEvent>>>,
-    }
-
-    impl RejectionWarnProbe {
-        /// Returns the captured fields for the first event whose message matches.
-        ///
-        /// # Panics
-        ///
-        /// Panics when the probe lock was poisoned by a prior failing test.
-        fn fields_for(&self, message: &str) -> Option<HashMap<String, String>> {
-            self.events
-                .lock()
-                .expect("rejection warn probe")
-                .iter()
-                .find(|(recorded, _)| recorded == message)
-                .map(|(_, fields)| fields.clone())
-        }
-    }
-
-    /// Captures the message and scalar fields of one `tracing` event.
-    struct RejectionFieldVisitor<'a> {
-        /// The message extracted from the reserved `message` field.
-        message: &'a mut String,
-        /// The remaining recorded scalar fields.
-        fields: &'a mut HashMap<String, String>,
-    }
-
-    impl tracing::field::Visit for RejectionFieldVisitor<'_> {
-        /// Records debug-only fields such as closed enums and the message.
-        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-            if field.name() == "message" {
-                *self.message = format!("{value:?}");
-                // Strip the debug quotes the message value carries.
-                *self.message = self.message.trim_matches('"').to_owned();
-            } else {
-                self.fields
-                    .insert(field.name().to_owned(), format!("{value:?}"));
-            }
-        }
-
-        /// Records string fields without debug quoting.
-        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-            if field.name() == "message" {
-                *self.message = value.to_owned();
-            } else {
-                self.fields
-                    .insert(field.name().to_owned(), value.to_owned());
-            }
-        }
-
-        /// Records unsigned count fields such as demand and capacity.
-        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
-            self.fields
-                .insert(field.name().to_owned(), value.to_string());
-        }
-
-        /// Records signed count fields for completeness.
-        fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
-            self.fields
-                .insert(field.name().to_owned(), value.to_string());
-        }
-    }
-
-    impl tracing::Subscriber for RejectionWarnProbe {
-        /// Enables every callsite so the focused rejection event is captured.
-        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
-            true
-        }
-
-        /// Spans are irrelevant to the event-field proof; assign a stub identity.
-        fn new_span(&self, _attributes: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-            tracing::span::Id::from_u64(1)
-        }
-
-        /// No span field updates are retained by this event-only probe.
-        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
-
-        /// Follows-from edges are irrelevant to the field-contract proof.
-        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
-
-        /// Captures one event's message and scalar fields.
-        fn event(&self, event: &tracing::Event<'_>) {
-            let mut message = String::new();
-            let mut fields = HashMap::new();
-            event.record(&mut RejectionFieldVisitor {
-                message: &mut message,
-                fields: &mut fields,
-            });
-            self.events
-                .lock()
-                .expect("rejection warn probe")
-                .push((message, fields));
-        }
-
-        /// Span entry carries no retained state for this probe.
-        fn enter(&self, _span: &tracing::span::Id) {}
-
-        /// Span exit carries no retained state for this probe.
-        fn exit(&self, _span: &tracing::span::Id) {}
-    }
-
-    /// `take_for_execute` clamps leader-supplied Analytical demand to peer capacity.
-    ///
-    /// AC2: a leader-supplied Analytical entry (`slot_units = 2`, the real
-    /// producer value) succeeds on a capacity-1 dispatcher because the peer
-    /// clamps demand to 1. This is the exact defect condition (256 MiB Oracle
-    /// child derives running capacity 1) that previously rejected permanently.
-    #[test]
-    fn take_for_execute_clamps_analytical_demand_to_capacity_one() {
-        let slots = Arc::new(OracleSlotManager::new(1, 1));
-        let registry = ReservationRegistry::new(Arc::clone(&slots), 1);
-        let now = Utc::now();
-        let query = QueryId::new(uuid::Uuid::now_v7());
-        let leader = NodeId::new(uuid::Uuid::now_v7());
-        let pending = registry
-            .reserve(
-                &reserve_request_analytical(query, leader, 17, now + ChronoDuration::seconds(2)),
-                now,
-                None,
-            )
-            .expect("pending analytical reservation");
-        let running = registry
-            .take_for_execute(pending.reservation_id, query, leader, 17, now)
-            .expect("clamped analytical demand admits on a capacity-1 peer");
-        assert_eq!(running.query_class, QueryClass::Analytical);
-        // The clamp charged exactly one running unit; none remain.
-        assert!(slots.try_running(1).is_err());
-        drop(running);
-        assert!(slots.try_running(1).is_ok());
-    }
-
-    /// `take_for_execute` never over-clamps on a peer with capacity for full demand.
-    ///
-    /// Negative control for AC2: a capacity-2 peer charges the full leader
-    /// demand of 2, proving the clamp only lowers demand that exceeds capacity.
-    #[test]
-    fn take_for_execute_charges_full_analytical_demand_on_capacity_two() {
-        let slots = Arc::new(OracleSlotManager::new(2, 2));
-        let registry = ReservationRegistry::new(Arc::clone(&slots), 2);
-        let now = Utc::now();
-        let query = QueryId::new(uuid::Uuid::now_v7());
-        let leader = NodeId::new(uuid::Uuid::now_v7());
-        let pending = registry
-            .reserve(
-                &reserve_request_analytical(query, leader, 19, now + ChronoDuration::seconds(2)),
-                now,
-                None,
-            )
-            .expect("pending analytical reservation");
-        let running = registry
-            .take_for_execute(pending.reservation_id, query, leader, 19, now)
-            .expect("full analytical demand admits on a capacity-2 peer");
-        // Both units were charged; no running capacity remains.
-        assert!(slots.try_running(1).is_err());
-        drop(running);
-    }
-
-    /// `reserve` emits a structured warning when the clamped demand is rejected.
-    ///
-    /// AC3: on a capacity-1 peer already saturated by an in-flight query, the
-    /// clamped Analytical demand of 1 still cannot be admitted, so the path
-    /// emits the observable structured warning (stage, class, demand, running
-    /// capacity, running in use) before the unchanged retryable mapping. The
-    /// warning is captured with a minimal `tracing`-only probe. Reservation is
-    /// the site under test because it is now the single admission gate.
-    #[test]
-    fn reserve_rejection_emits_structured_warning() {
-        let slots = Arc::new(OracleSlotManager::new(1, 1));
-        let held = slots.try_running(1).expect("saturating running unit");
-        let registry = ReservationRegistry::new(Arc::clone(&slots), 1);
-        let now = Utc::now();
-        let query = QueryId::new(uuid::Uuid::now_v7());
-        let leader = NodeId::new(uuid::Uuid::now_v7());
-
-        let probe = RejectionWarnProbe::default();
-        let result = tracing::subscriber::with_default(probe.clone(), || {
-            registry.reserve(
-                &reserve_request_analytical(query, leader, 23, now + ChronoDuration::seconds(2)),
-                now,
-                None,
-            )
-        });
-
-        // The wire mapping is byte-unchanged: a saturated peer stays retryable.
-        assert!(matches!(result, Err(DispatchError::Capacity)));
-
-        let fields = probe
-            .fields_for("oracle peer slot rejection")
-            .expect("rejection path emits the structured warning");
-        assert_eq!(
-            fields.get("stage").map(String::as_str),
-            Some("slot_reservation")
-        );
-        assert_eq!(
-            fields.get("query_class").map(String::as_str),
-            Some("Analytical")
-        );
-        assert_eq!(fields.get("demand").map(String::as_str), Some("1"));
-        assert_eq!(
-            fields.get("running_capacity").map(String::as_str),
-            Some("1")
-        );
-        assert_eq!(fields.get("running_in_use").map(String::as_str), Some("1"));
-        drop(held);
-    }
-
     /// A mismatched execute cannot remove another leader's pending reservation.
     #[test]
     fn oracle_peer_reservation_transition_is_tuple_bound() {
@@ -4810,12 +4503,17 @@ mod tests {
         drop(running);
     }
 
-    /// Leader-local execution reuses admitted pending and running capacity.
+    /// Leader-local execution reuses admitted waiter and slot capacity.
+    ///
+    /// The leader's own query envelope already holds its slot units in the
+    /// shared governor ledger, so the leader-local transition must charge
+    /// neither a second follower quantum nor a peer-waiter slot.
     #[test]
     fn oracle_peer_local_transition_does_not_double_charge_leader_slot() {
+        let oracle = slot_limited_oracle(1);
         let slots = Arc::new(OracleSlotManager::new(1, 1));
         let pending_slot = slots.try_pending().expect("admitted leader pending slot");
-        let leader_slot = slots.try_running(1).expect("admitted leader slot");
+        let leader_slot = worker_capacity(&oracle);
         let registry = ReservationRegistry::new(Arc::clone(&slots), 1);
         let now = Utc::now();
         let query = QueryId::new(uuid::Uuid::now_v7());
@@ -4832,13 +4530,16 @@ mod tests {
             .expect("leader-local transition");
 
         assert_eq!(running.query_class, QueryClass::Interactive);
-        assert!(running.permit.is_none());
+        assert!(
+            running.worker_resources.is_none(),
+            "the leader-local transition charges no follower quantum"
+        );
         assert!(slots.try_pending().is_err());
-        assert!(slots.try_running(1).is_err());
+        assert_eq!(oracle.live_slot_units(), 1);
         drop(pending_slot);
         drop(leader_slot);
         assert!(slots.try_pending().is_ok());
-        assert!(slots.try_running(1).is_ok());
+        assert_eq!(oracle.live_slot_units(), 0);
     }
 
     /// A follower whose received assignment was tampered with after the
@@ -5410,41 +5111,98 @@ mod tests {
         assert_ne!(pending.reservation_id, replacement.reservation_id);
     }
 
+    /// Builds an Oracle capability whose shared slot ledger holds `units` units.
+    ///
+    /// The dispatcher's follower path no longer owns a running semaphore, so a
+    /// saturation test must saturate the one authority that decides: the shared
+    /// governor slot ledger. An explicit slot limit is what makes that ledger a
+    /// known size.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the deterministic plan or role composition fails.
+    fn slot_limited_oracle(units: usize) -> crate::resources::OracleResources {
+        crate::resources::BifrostRuntimeResources::from_snapshot(
+            crate::resources::SystemResourceSnapshot {
+                memory_limit_bytes: 1024 * 1024 * 1024,
+                effective_cpu: 8,
+                scratch_capacity_bytes: 1024 * 1024 * 1024,
+                scratch_available_bytes: 1024 * 1024 * 1024,
+                memory_source: crate::resources::ResourceSource::Injected,
+                cpu_source: crate::resources::ResourceSource::Injected,
+            },
+            crate::resources::BifrostResourcePolicy {
+                roles: std::collections::BTreeSet::from([crate::resources::BifrostRole::Oracle]),
+                memory_limit_bytes: None,
+                unmanaged_reserve_bytes: None,
+                scratch_limit_bytes: None,
+                effective_cpu: None,
+                oracle_query_slot_limit: Some(units),
+                forge_compaction_memory_limit_bytes: None,
+                scratch_root: std::path::PathBuf::new(),
+                volume_roots: None,
+            },
+        )
+        .expect("slot-limited Oracle plan")
+        .compose_roles()
+        .expect("slot-limited Oracle composition")
+        .oracle()
+        .expect("composition must enable the Oracle capability")
+    }
+
+    /// Acquires one Interactive follower quantum as a reservation's capacity.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the shared ledger refuses the quantum.
+    fn worker_capacity(oracle: &crate::resources::OracleResources) -> ReservedCapacity {
+        ReservedCapacity::Fragment(FollowerWorkerResources::Oracle(
+            oracle
+                .try_acquire_worker(crate::resources::OracleWorkerClass::Interactive)
+                .expect("one follower quantum"),
+        ))
+    }
+
     /// A reservation is a guarantee: once accepted, execution cannot be refused.
     ///
-    /// Capacity is decided once, at reservation. A saturated peer refuses the
-    /// reservation outright — before the leader has committed to dispatching
-    /// this participant — and an accepted reservation carries the running permit
-    /// its fragment will execute under, so `take_for_execute` cannot turn a
-    /// negotiated fan-out into a failed query. Releasing the reservation returns
-    /// the permit, which is what lets the next reservation through.
+    /// Capacity is decided once, when the follower quantum is charged against
+    /// the shared governor ledger. A saturated peer refuses there — before the
+    /// leader has committed to dispatching this participant — and an accepted
+    /// reservation carries the charged quantum its fragment will execute under,
+    /// so `take_for_execute` cannot turn a negotiated fan-out into a failed
+    /// query. Releasing the reservation returns the units, which is what lets
+    /// the next reservation through.
     #[test]
     fn accepted_reservation_guarantees_execution_and_saturation_refuses_up_front() {
-        let slots = Arc::new(OracleSlotManager::new(1, 1));
-        let registry = ReservationRegistry::new(Arc::clone(&slots), 2);
+        let oracle = slot_limited_oracle(1);
+        let registry = ReservationRegistry::new(Arc::new(OracleSlotManager::new(1, 1)), 2);
         let now = Utc::now();
         let query = QueryId::new(uuid::Uuid::now_v7());
         let leader = NodeId::new(uuid::Uuid::now_v7());
         let expires = now + ChronoDuration::seconds(2);
         let pending = registry
-            .reserve(&reserve_request(query, leader, 13, expires), now, None)
+            .reserve(
+                &reserve_request(query, leader, 13, expires),
+                now,
+                Some(worker_capacity(&oracle)),
+            )
             .expect("pending reservation");
-        // The single running unit is committed by the reservation itself, so a
-        // second concurrent reservation is refused here rather than at execute.
-        // Capacity, not Unavailable: a saturated slot pool is backpressure, and
-        // Unavailable is reserved for a fail-closed outage.
-        let contender = QueryId::new(uuid::Uuid::now_v7());
-        assert!(matches!(
-            registry.reserve(&reserve_request(contender, leader, 13, expires), now, None),
-            Err(DispatchError::Capacity)
-        ));
+        // The single slot unit is committed by the reservation itself, so a
+        // second concurrent follower quantum is refused before any reservation
+        // is attempted rather than at execute.
+        assert!(
+            oracle
+                .try_acquire_worker(crate::resources::OracleWorkerClass::Interactive)
+                .is_err(),
+            "the shared ledger refuses a second quantum up front"
+        );
         let running = registry
             .take_for_execute(pending.reservation_id, query, leader, 13, now)
             .expect("an accepted reservation always executes");
         assert_eq!(running.query_class, QueryClass::Interactive);
         assert!(
-            running.permit.is_some(),
-            "the reserved permit is transferred"
+            running.worker_resources.is_some(),
+            "the charged quantum is transferred"
         );
         assert_eq!(
             registry.cleanup_expired(now),
@@ -5452,19 +5210,18 @@ mod tests {
             "the claimed reservation left the registry"
         );
         drop(running);
-        registry
-            .reserve(&reserve_request(contender, leader, 13, expires), now, None)
-            .expect("released running capacity admits the next reservation");
+        drop(worker_capacity(&oracle));
     }
 
-    /// An unclaimed reservation returns its committed running permit at expiry.
+    /// An unclaimed reservation returns its charged slot units at expiry.
     ///
-    /// Because reservation now charges the running slot, a leader that abandons
-    /// a fan-out mid-negotiation would strand capacity without expiry reclaim.
+    /// Because reservation charges the shared governor ledger, a leader that
+    /// abandons a fan-out mid-negotiation would strand capacity without expiry
+    /// reclaim.
     #[test]
     fn expired_reservation_returns_its_running_permit() {
-        let slots = Arc::new(OracleSlotManager::new(1, 1));
-        let registry = ReservationRegistry::new(Arc::clone(&slots), 2);
+        let oracle = slot_limited_oracle(1);
+        let registry = ReservationRegistry::new(Arc::new(OracleSlotManager::new(1, 1)), 2);
         let now = Utc::now();
         let query = QueryId::new(uuid::Uuid::now_v7());
         let leader = NodeId::new(uuid::Uuid::now_v7());
@@ -5472,10 +5229,10 @@ mod tests {
             .reserve(
                 &reserve_request(query, leader, 13, now + ChronoDuration::seconds(2)),
                 now,
-                None,
+                Some(worker_capacity(&oracle)),
             )
             .expect("pending reservation");
-        assert_eq!(slots.running_in_use(), 1);
+        assert_eq!(oracle.live_slot_units(), 1);
         let expired = now + ChronoDuration::seconds(3);
         assert_eq!(
             registry.cleanup_expired(expired),
@@ -5483,26 +5240,31 @@ mod tests {
             "expiry reclaims the abandoned reservation"
         );
         assert_eq!(
-            slots.running_in_use(),
+            oracle.live_slot_units(),
             0,
-            "expiry returns the committed running permit"
+            "expiry returns the charged slot units"
         );
-        registry
-            .reserve(
-                &reserve_request(query, leader, 13, expired + ChronoDuration::seconds(2)),
-                expired,
-                None,
-            )
-            .expect("running permit released once the reservation expired");
+        drop(worker_capacity(&oracle));
     }
 
-    /// Worker execution streams release running capacity on completion, cancel, and drop.
+    /// Worker execution streams release slot units on completion, cancel, and drop.
     #[tokio::test]
     async fn worker_execution_stream_releases_running_capacity() {
-        let slots = Arc::new(OracleSlotManager::new(1, 1));
-        let permit = slots.try_running(1).expect("completion permit");
+        let oracle = slot_limited_oracle(1);
+        let quantum = |oracle: &crate::resources::OracleResources| {
+            FollowerWorkerResources::Oracle(
+                oracle
+                    .try_acquire_worker(crate::resources::OracleWorkerClass::Interactive)
+                    .expect("one follower quantum"),
+            )
+        };
+
+        let completion_quantum = quantum(&oracle);
         let completion_stream = async_stream::stream! {
-            let _running = RunningReservation { query_class: QueryClass::Interactive, permit: Some(permit), worker_resources: None };
+            let _running = RunningReservation {
+                query_class: QueryClass::Interactive,
+                worker_resources: Some(completion_quantum),
+            };
             if false {
                 yield Err(DispatchError::Unavailable);
             }
@@ -5510,41 +5272,49 @@ mod tests {
         let mut completion = WorkerExecution {
             stream: Box::pin(completion_stream),
         };
-        assert_eq!(slots.running_in_use(), 1);
+        assert_eq!(oracle.live_slot_units(), 1);
         assert!(completion.stream.next().await.is_none());
-        assert_eq!(slots.running_in_use(), 0);
-        assert!(slots.try_running(1).is_ok());
+        assert_eq!(oracle.live_slot_units(), 0);
 
         let cancellation = CancellationToken::new();
-        let permit = slots.try_running(1).expect("cancellation permit");
+        let cancellation_quantum = quantum(&oracle);
         let observed = cancellation.clone();
         let cancellation_stream = async_stream::stream! {
-            let _running = RunningReservation { query_class: QueryClass::Interactive, permit: Some(permit), worker_resources: None };
+            let _running = RunningReservation {
+                query_class: QueryClass::Interactive,
+                worker_resources: Some(cancellation_quantum),
+            };
             observed.cancelled().await;
         };
         let mut cancellation_stream = Box::pin(cancellation_stream);
         let waiter = tokio::spawn(async move { cancellation_stream.next().await });
         tokio::task::yield_now().await;
-        assert_eq!(slots.running_in_use(), 1);
+        assert_eq!(oracle.live_slot_units(), 1);
         cancellation.cancel();
         assert!(waiter.await.expect("cancellation stream joins").is_none());
-        assert_eq!(slots.running_in_use(), 0);
-        assert!(slots.try_running(1).is_ok());
+        assert_eq!(oracle.live_slot_units(), 0);
 
-        let permit = slots.try_running(1).expect("drop permit");
+        let drop_quantum = quantum(&oracle);
         let drop_stream = async_stream::stream! {
-            let _running = RunningReservation { query_class: QueryClass::Interactive, permit: Some(permit), worker_resources: None };
+            let _running = RunningReservation {
+                query_class: QueryClass::Interactive,
+                worker_resources: Some(drop_quantum),
+            };
             futures_util::future::pending::<()>().await;
             yield Err(DispatchError::Unavailable);
         };
         let execution = WorkerExecution {
             stream: Box::pin(drop_stream),
         };
-        assert_eq!(slots.running_in_use(), 1);
-        assert!(slots.try_running(1).is_err());
+        assert_eq!(oracle.live_slot_units(), 1);
+        assert!(
+            oracle
+                .try_acquire_worker(crate::resources::OracleWorkerClass::Interactive)
+                .is_err()
+        );
         drop(execution);
-        assert_eq!(slots.running_in_use(), 0);
-        assert!(slots.try_running(1).is_ok());
+        assert_eq!(oracle.live_slot_units(), 0);
+        drop(quantum(&oracle));
     }
 
     /// An ambiguous reserve failure is terminal to the selected candidate sequence.

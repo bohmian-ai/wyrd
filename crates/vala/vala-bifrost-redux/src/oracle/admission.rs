@@ -619,7 +619,7 @@ impl OracleAdmission {
             reserved_memory_bytes: state.interactive.memory_used + state.analytical.memory_used,
             reserved_spill_bytes: state.spill_used,
             peer_pending: self.slots.pending_in_use(),
-            peer_running: self.slots.running_in_use(),
+            peer_running: self.shared.resources.live_slot_units(),
         }
     }
 
@@ -637,7 +637,7 @@ impl OracleAdmission {
             reserved_memory_bytes: state.interactive.memory_used + state.analytical.memory_used,
             reserved_spill_bytes: state.spill_used,
             peer_pending: self.slots.pending_in_use(),
-            peer_running: self.slots.running_in_use(),
+            peer_running: self.shared.resources.live_slot_units(),
         }
     }
 

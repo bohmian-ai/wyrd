@@ -12,6 +12,7 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 #[cfg(any(test, feature = "test-support"))]
 use std::sync::LazyLock;
+use std::sync::OnceLock;
 #[cfg(any(test, feature = "test-support"))]
 use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering as AtomicOrdering};
@@ -66,15 +67,6 @@ pub const ORACLE_PARTITION_MEMORY_BYTES: usize = 256 * MIB;
 /// and by available work; memory only clamps it downward once a query envelope
 /// can no longer give each partition room to run.
 pub const ORACLE_PARTITION_WORKING_MEMORY_BYTES: usize = 32 * MIB;
-/// Fewest Oracle slot units a node admits concurrently regardless of core count.
-///
-/// A slot unit is an admission unit, not a core: Vertica's `PLANNEDCONCURRENCY`
-/// and Doris's query slots are both configured independently of CPU for the same
-/// reason. The floor exists so a small-core node still absorbs the accepted
-/// production workload — four Interactive units plus two Analytical queries at
-/// two units each — on one node instead of refusing reads that callers then see
-/// as failed queries rather than as backpressure.
-pub const ORACLE_MIN_QUERY_SLOT_UNITS: usize = 8;
 /// Fewest execution partitions any admitted Oracle query receives.
 ///
 /// A single partition removes intra-query parallelism entirely, so even the
@@ -91,54 +83,126 @@ const SCRATCH_CLEANUP_BACKOFFS: [Duration; 3] = [
 
 /// Resolves how many Oracle slot units this node admits concurrently.
 ///
-/// Concurrency is an explicit capacity decision. It is taken from
+/// Concurrency is an explicit local capacity decision. It is taken from
 /// [`ResourcePlan::oracle_query_slot_limit`] when the deployment configured one,
-/// and otherwise defaults to the Oracle budget divided by what a slot unit
-/// charges, floored at [`ORACLE_MIN_QUERY_SLOT_UNITS`].
+/// and otherwise from the tighter of this pod's memory and CPU bounds:
 ///
-/// The divisor is [`ORACLE_PARTITION_WORKING_MEMORY_BYTES`] — what a slot unit
-/// actually *charges* — not [`ORACLE_PARTITION_MEMORY_BYTES`], which is the
-/// ceiling a query may grow into. That distinction is the whole point. Dividing
-/// by the ceiling made concurrency a side effect of per-query generosity: raising
-/// the ceiling so one query could use more memory silently reduced how many
-/// queries the node would accept at all. Dividing by the charge asks the only
-/// question admission cares about — how many queries fit — and leaves how much
-/// memory each one may use to
-/// [`BifrostResourceGovernor::oracle_memory_grant`], which shrinks the ceiling as
-/// concurrency rises instead of refusing work.
+/// ```text
+/// memory units = max(1, oracle budget / ORACLE_PARTITION_WORKING_MEMORY_BYTES)
+/// CPU units    = max(1, 2 * effective CPU)
+/// raw units    = min(memory units, CPU units)
+/// ```
 ///
-/// There is deliberately no CPU term. An earlier draft clamped this to a
-/// multiple of [`ResourcePlan::effective_cpu`], reasoning that a node cannot
-/// schedule unbounded concurrent work. Measurement refuted it: on the
-/// four-core R0 rung a `cpu * 4` clamp resolved to 16 units and still shed peer
-/// work, while the unclamped divisor resolved to 78 and completed the same
-/// workload with zero reservation refusals and zero read retries. A slot unit is
-/// an admission unit, not a thread — intra-query parallelism is already bounded
-/// by [`OracleSessionShape::target_partitions`], so bounding admission by cores
-/// double-counts a limit the session config already applies. Nodes that need a
-/// narrower ceiling configure one explicitly.
+/// The memory divisor is [`ORACLE_PARTITION_WORKING_MEMORY_BYTES`] — what a slot
+/// unit actually *charges* — not [`ORACLE_PARTITION_MEMORY_BYTES`], which is the
+/// ceiling a query may grow into. Dividing by the ceiling made concurrency a
+/// side effect of per-query generosity: raising the ceiling so one query could
+/// use more memory silently reduced how many queries the node would accept.
 ///
-/// This value sizes both leader admission and the peer slot manager, which
+/// The CPU term restores the documented two-units-per-core default. A slot unit
+/// is an admission unit rather than a thread, but a pod that admits far more
+/// concurrent queries than it has cores to run them converts latency into queue
+/// time inside execution, where no admission signal can see it. Deployments that
+/// want a different ratio set an explicit limit.
+///
+/// Effective CPU is the sole CPU source; there is no separate configured core
+/// count to disagree with it.
+///
+/// This value sizes both leader admission and follower participation, which
 /// matters because one node is usually both: it leads its own queries while
-/// serving fragments for queries other nodes lead. Whether those two roles want
-/// separate ceilings is unproven — R0's refusals are equally explained by a
-/// single ceiling set too low, and the unclamped default clears them — so the
-/// counter stays shared until a measurement distinguishes the two.
+/// serving fragments for queries other nodes lead.
 ///
 /// # Errors
 ///
-/// Returns an invalid-plan error when checked Oracle capacity arithmetic cannot
-/// produce a positive platform-sized slot count.
+/// Returns an invalid-plan error when effective CPU is zero, and an overflow
+/// error when checked Oracle capacity arithmetic cannot complete.
 pub fn oracle_worker_slots(plan: ResourcePlan) -> Result<usize, BifrostResourceError> {
     if let Some(configured) = plan.oracle_query_slot_limit {
         return Ok(configured.max(1));
+    }
+    if plan.effective_cpu == 0 {
+        return Err(BifrostResourceError::InvalidPlan {
+            detail: "Oracle slot derivation requires positive effective CPU".to_owned(),
+        });
     }
     let budget = plan
         .oracle_floor_bytes
         .checked_add(plan.elastic_memory_bytes)
         .ok_or_else(accounting_overflow)?;
-    Ok((budget / ORACLE_PARTITION_WORKING_MEMORY_BYTES).max(ORACLE_MIN_QUERY_SLOT_UNITS))
+    let memory_units = (budget / ORACLE_PARTITION_WORKING_MEMORY_BYTES).max(1);
+    let cpu_units = plan
+        .effective_cpu
+        .checked_mul(ORACLE_SLOT_UNITS_PER_CPU)
+        .ok_or_else(accounting_overflow)?
+        .max(1);
+    Ok(memory_units.min(cpu_units))
 }
+
+/// Slot units one effective CPU contributes to derived Oracle concurrency.
+const ORACLE_SLOT_UNITS_PER_CPU: usize = 2;
+
+/// Immutable pod-local split of Oracle slot units between the two classes.
+///
+/// The split is the whole local capacity contract:
+///
+/// ```text
+/// total units             = interactive_floor_units + analytical_max_units
+/// protected Interactive   = interactive_floor_units
+/// maximum Analytical      = analytical_max_units
+/// maximum Interactive     = total units
+/// ```
+///
+/// Analytical work can never enter the protected floor, while Interactive work
+/// may borrow whatever Analytical is not using. `analytical_max_units` of zero
+/// is a valid state on a pod too small to run one two-unit Analytical query; its
+/// Analytical admission is refused immediately rather than queued forever.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OracleClassSplit {
+    /// Slot units reserved for Interactive work alone.
+    pub interactive_floor_units: u32,
+    /// Largest number of slot units Analytical work may hold at once.
+    pub analytical_max_units: u32,
+}
+
+impl OracleClassSplit {
+    /// Derives the default split from a pod's raw local slot units.
+    ///
+    /// One unit is preserved for Interactive and the remainder becomes the
+    /// Analytical maximum. A remainder below one Analytical query's two-unit
+    /// cost is folded back into the Interactive floor, because exposing a class
+    /// that can never admit a single query is worse than not exposing it.
+    #[must_use]
+    pub fn derive(raw_units: u32) -> Self {
+        let raw_units = raw_units.max(1);
+        let analytical = raw_units.saturating_sub(1);
+        if analytical < ANALYTICAL_QUERY_SLOT_UNITS {
+            return Self {
+                interactive_floor_units: raw_units,
+                analytical_max_units: 0,
+            };
+        }
+        Self {
+            interactive_floor_units: 1,
+            analytical_max_units: analytical,
+        }
+    }
+
+    /// Returns the total slot units this pod admits across both classes.
+    #[must_use]
+    pub const fn total_units(self) -> u32 {
+        self.interactive_floor_units
+            .saturating_add(self.analytical_max_units)
+    }
+
+    /// Reports whether this pod can ever admit one Analytical query.
+    #[must_use]
+    pub const fn admits_analytical(self) -> bool {
+        self.analytical_max_units >= ANALYTICAL_QUERY_SLOT_UNITS
+    }
+}
+
+/// Slot units one Analytical query or worker occupies.
+pub const ANALYTICAL_QUERY_SLOT_UNITS: u32 = 2;
 
 /// Bifrost roles that affect protected resource planning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -191,10 +255,10 @@ pub struct BifrostResourcePolicy {
     pub forge_compaction_memory_limit_bytes: Option<usize>,
     /// Optional explicit Oracle query slot-unit concurrency limit.
     ///
-    /// `None` defaults to twice effective CPU, never below
-    /// [`ORACLE_MIN_QUERY_SLOT_UNITS`]. Unlike the memory and CPU caps this one
-    /// may raise as well as reduce the derived value: it is a deliberate
-    /// capacity decision by the deployment, not a detected process bound.
+    /// `None` derives the limit from this pod's own memory and CPU through
+    /// [`oracle_worker_slots`]. Unlike the memory and CPU caps this one may
+    /// raise as well as reduce the derived value: it is a deliberate capacity
+    /// decision by the deployment, not a detected process bound.
     pub oracle_query_slot_limit: Option<usize>,
     /// Existing server-composed Oracle scratch root.
     pub scratch_root: PathBuf,
@@ -1678,6 +1742,14 @@ impl OracleWorkerClass {
         ORACLE_PARTITION_WORKING_MEMORY_BYTES * self.slot_units() as usize
     }
 
+    /// Returns the scheduling class this worker charges the shared slot ledger under.
+    const fn query_class(self) -> QueryClass {
+        match self {
+            Self::Interactive => QueryClass::Interactive,
+            Self::Analytical => QueryClass::Analytical,
+        }
+    }
+
     /// Returns the slot units one worker of this class occupies.
     fn slot_units(self) -> u32 {
         match self {
@@ -1697,6 +1769,7 @@ struct ResourceState {
     oracle_interactive_queries: u32,
     oracle_analytical_queries: u32,
     oracle_query_slot_units: u32,
+    oracle_analytical_slot_units: u32,
     oracle_query_memory_used_bytes: usize,
     oracle_query_scratch_used_bytes: u64,
     scribe_category_bytes: [usize; crate::scribe::memory::MEMORY_CATEGORY_COUNT],
@@ -2364,16 +2437,33 @@ impl OracleResources {
         &self,
         class: OracleWorkerClass,
     ) -> Result<OracleWorkerResources, BifrostResourceError> {
+        let plan = self.governor.plan();
+        let query_class = class.query_class();
+        let slot_units = class.slot_units();
+        // Charge the one aggregate slot ledger before any memory moves. A
+        // follower fragment competes for the same local units a queued leader
+        // is waiting on, so admitting it without charging here is exactly how
+        // the Interactive floor would be spent by remote Analytical work.
+        let next_slots = {
+            let mut state = self.governor.lock_state()?;
+            let (next_slots, next_analytical) =
+                self.governor
+                    .charge_oracle_slots(&state, query_class, slot_units)?;
+            state.oracle_query_slot_units = next_slots;
+            state.oracle_analytical_slot_units = next_analytical;
+            next_slots
+        };
+        let slots = OracleSlotCharge {
+            query_class,
+            slot_units,
+            governor: self.governor.clone(),
+            released: false,
+        };
         let lease = self
             .governor
             .try_acquire_oracle_memory(class.memory_bytes())?;
-        let plan = self.governor.plan();
-        let running_slot_units = self.governor.oracle_query_slot_units();
-        let granted_memory_bytes = BifrostResourceGovernor::oracle_memory_grant(
-            plan,
-            class.slot_units(),
-            running_slot_units.saturating_add(class.slot_units()),
-        );
+        let granted_memory_bytes =
+            BifrostResourceGovernor::oracle_memory_grant(plan, slot_units, next_slots);
         let memory_pool = bounded_memory_pool(granted_memory_bytes);
         // Locality is zero here: a remote worker reads the files the leader
         // dispatched to it, so its partition ceiling comes from the grant it
@@ -2382,10 +2472,39 @@ impl OracleResources {
             oracle_target_partitions(plan.effective_cpu, 0.0, granted_memory_bytes)?;
         Ok(OracleWorkerResources {
             lease,
+            _slots: slots,
             memory_pool,
             granted_memory_bytes,
             admitted_target_partitions,
         })
+    }
+
+    /// Returns aggregate slot units currently held across leaders and followers.
+    ///
+    /// Reports zero when the shared ledger is poisoned, which is the same
+    /// degradation admission already applies: a poisoned ledger refuses every
+    /// acquisition, so an optimistic reading cannot admit work.
+    #[must_use]
+    pub fn live_slot_units(&self) -> u64 {
+        self.governor
+            .lock_state()
+            .map_or(0, |state| u64::from(state.oracle_query_slot_units))
+    }
+
+    /// Returns the immutable pod-local class split this capability admits under.
+    #[must_use]
+    pub fn class_split(&self) -> OracleClassSplit {
+        self.governor.oracle_class_split()
+    }
+
+    /// Publishes the boot-derived class split for every capability on this root.
+    ///
+    /// Boot calls this once after local configuration and any approved
+    /// calibration profile have resolved. A second call is a no-op and returns
+    /// the already published split, so composition can never install two
+    /// competing local capacities.
+    pub fn install_class_split(&self, split: OracleClassSplit) -> OracleClassSplit {
+        self.governor.install_oracle_class_split(split)
     }
 
     /// Returns the fixed-purpose Oracle metadata admission capability.
@@ -2444,6 +2563,13 @@ impl OracleResources {
 #[derive(Debug)]
 struct ResourceGovernorInner {
     plan: ResourcePlan,
+    /// Immutable pod-local Oracle class split, installed once during boot.
+    ///
+    /// Boot installs the split derived from configuration or an approved
+    /// calibration profile; every capability cloned from this root therefore
+    /// reads one value. Callers that never install fall back to the plan's own
+    /// derivation so focused tests and inspection paths stay consistent.
+    oracle_class_split: OnceLock<OracleClassSplit>,
     sources: ResolvedResourceSources,
     state: Mutex<ResourceState>,
     /// Lost-wakeup-safe notification paired with `ResourceState::memory_epoch`.
@@ -2674,6 +2800,7 @@ impl BifrostResourceGovernor {
                         ResourceSource::Filesystem
                     },
                 },
+                oracle_class_split: OnceLock::new(),
                 state: Mutex::new(ResourceState::default()),
                 memory_changed: Notify::new(),
                 cgroup_limit_bytes: crate::scribe::memory::read_cgroup_limit(),
@@ -3033,15 +3160,83 @@ impl BifrostResourceGovernor {
         Ok(())
     }
 
-    /// Returns Oracle slot units currently held by live query owners.
+    /// Returns the immutable pod-local Oracle class split for this root.
     ///
-    /// Returns zero when the shared ledger is poisoned. A grant sized from a
-    /// zero denominator is the cap, which is the correct degradation: a poisoned
-    /// ledger already fails admission, and a ceiling that is too generous cannot
-    /// admit work that slot capacity has not already allowed.
-    fn oracle_query_slot_units(&self) -> u32 {
-        self.lock_state()
-            .map_or(0, |state| state.oracle_query_slot_units)
+    /// Falls back to the plan's own derivation when boot never installed one,
+    /// so focused tests and inspection paths observe the same total and
+    /// Analytical maxima production admission enforces.
+    fn oracle_class_split(&self) -> OracleClassSplit {
+        *self.inner.oracle_class_split.get_or_init(|| {
+            let raw = oracle_worker_slots(self.plan()).unwrap_or(1);
+            OracleClassSplit::derive(u32::try_from(raw).unwrap_or(u32::MAX))
+        })
+    }
+
+    /// Installs the boot-derived class split exactly once for this process root.
+    ///
+    /// Returns the installed split, which is the previously installed value
+    /// when boot composition already published one.
+    fn install_oracle_class_split(&self, split: OracleClassSplit) -> OracleClassSplit {
+        *self.inner.oracle_class_split.get_or_init(|| split)
+    }
+
+    /// Charges `units` of the requested class against the aggregate slot ledger.
+    ///
+    /// Leaders admitted through `OracleAdmission` and followers admitted through
+    /// [`OracleResources::try_acquire_worker`] share this one ledger, so the
+    /// Interactive floor is preserved across both. The returned pair is the new
+    /// aggregate and Analytical totals, already written to `state`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostResourceError::Occupied`] when the aggregate would
+    /// exceed the local total or Analytical would exceed its class maximum, and
+    /// an overflow [`BifrostResourceError::InvalidPlan`] on checked-arithmetic
+    /// failure. Nothing is written; the caller commits both totals once every
+    /// other fallible step of its admission has succeeded.
+    fn charge_oracle_slots(
+        &self,
+        state: &ResourceState,
+        query_class: QueryClass,
+        units: u32,
+    ) -> Result<(u32, u32), BifrostResourceError> {
+        let split = self.oracle_class_split();
+        let next_total = state
+            .oracle_query_slot_units
+            .checked_add(units)
+            .ok_or_else(accounting_overflow)?;
+        let next_analytical = state
+            .oracle_analytical_slot_units
+            .checked_add(units * u32::from(query_class == QueryClass::Analytical))
+            .ok_or_else(accounting_overflow)?;
+        if next_total > split.total_units() || next_analytical > split.analytical_max_units {
+            return Err(BifrostResourceError::Occupied {
+                detail: "Oracle slot units exceed local class capacity".to_owned(),
+            });
+        }
+        Ok((next_total, next_analytical))
+    }
+
+    /// Returns `units` of the requested class to the aggregate slot ledger.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostResourceError::Poisoned`] after poisoning the shared
+    /// root when either counter would underflow.
+    fn release_oracle_slots(
+        &self,
+        state: &mut ResourceState,
+        query_class: QueryClass,
+        units: u32,
+    ) -> Result<(), BifrostResourceError> {
+        let analytical = units * u32::from(query_class == QueryClass::Analytical);
+        if state.oracle_query_slot_units < units || state.oracle_analytical_slot_units < analytical
+        {
+            return Err(self.poison_locked(state, "Oracle slot release underflow"));
+        }
+        state.oracle_query_slot_units -= units;
+        state.oracle_analytical_slot_units -= analytical;
+        Ok(())
     }
 
     /// Derives the memory ceiling one admitted query may grow into.
@@ -3120,36 +3315,24 @@ impl BifrostResourceGovernor {
             .scratch_used_bytes
             .checked_add(request.scratch_bytes)
             .ok_or_else(accounting_overflow)?;
-        let next_slots = state
-            .oracle_query_slot_units
-            .checked_add(request.slot_units)
-            .ok_or_else(accounting_overflow)?;
-        let slot_limit =
-            u32::try_from(oracle_worker_slots(plan)?).map_err(|_| accounting_overflow())?;
-        let role_ceiling = plan
-            .oracle_floor_bytes
-            .checked_add(
-                plan.elastic_memory_bytes
-                    .checked_sub(state.elastic_memory_used_bytes)
-                    .ok_or_else(|| self.poison_locked(&mut state, "elastic memory underflow"))?,
-            )
-            .and_then(|free| free.checked_add(prior_borrow))
-            .ok_or_else(accounting_overflow)?;
-        // The reserve protects one *admission* of an interactive query, not one
-        // grant cap. Holding back a whole cap would reserve eight slot-unit
-        // quanta to protect a query that charges one, which is the same
-        // reservation-versus-ceiling conflation this admission path removed.
-        let analytical_ceiling = role_ceiling.saturating_sub(ORACLE_PARTITION_WORKING_MEMORY_BYTES);
-        if next_elastic > plan.elastic_memory_bytes
-            || next_scratch > plan.scratch_limit_bytes
-            || next_slots > slot_limit
-            || (request.query_class == QueryClass::Analytical && next_memory > analytical_ceiling)
-        {
+        if next_elastic > plan.elastic_memory_bytes || next_scratch > plan.scratch_limit_bytes {
             record_memory_transition("oracle", "refused", state.oracle_memory_used_bytes);
             return Err(BifrostResourceError::Occupied {
-                detail: "Oracle query exceeds aggregate memory, scratch, slot, or protected interactive capacity".to_owned(),
+                detail: "Oracle query exceeds aggregate memory or scratch capacity".to_owned(),
             });
         }
+        // Slot units are the sole concurrency authority and the sole protector
+        // of the Interactive floor. The ledger is shared with follower
+        // acquisition, so an Analytical leader and a remote Analytical fragment
+        // cannot together spend the units Interactive work is guaranteed.
+        let (next_slots, next_analytical_slots) =
+            match self.charge_oracle_slots(&state, request.query_class, request.slot_units) {
+                Ok(charged) => charged,
+                Err(error) => {
+                    record_memory_transition("oracle", "refused", state.oracle_memory_used_bytes);
+                    return Err(error);
+                }
+            };
         let granted_memory_bytes = Self::oracle_memory_grant(plan, request.slot_units, next_slots);
         let target_partitions = oracle_target_partitions(
             plan.effective_cpu,
@@ -3180,6 +3363,7 @@ impl BifrostResourceGovernor {
         state.oracle_memory_used_bytes = next_memory;
         state.scratch_used_bytes = next_scratch;
         state.oracle_query_slot_units = next_slots;
+        state.oracle_analytical_slot_units = next_analytical_slots;
         state.oracle_active_queries = next_active;
         state.oracle_interactive_queries = next_interactive;
         state.oracle_analytical_queries = next_analytical;
@@ -3814,11 +3998,63 @@ impl Drop for ScribeMemoryLease {
     }
 }
 
+/// Move-only owner of aggregate Oracle slot units held outside a query envelope.
+///
+/// Follower fragments admitted through
+/// [`OracleResources::try_acquire_worker`] charge the same class-aware ledger a
+/// leader query charges, so releasing on every terminal path — including panic
+/// unwind — is what keeps the local Interactive floor honest. Release advances
+/// the resource-change epoch and wakes queued leaders.
+#[derive(Debug)]
+struct OracleSlotCharge {
+    /// Scheduling class the units were charged under.
+    query_class: QueryClass,
+    /// Exact aggregate units owned until release.
+    slot_units: u32,
+    /// Shared root the units were charged against.
+    governor: BifrostResourceGovernor,
+    /// Whether the exactly-once release already ran.
+    released: bool,
+}
+
+impl OracleSlotCharge {
+    /// Returns the charged units to the shared ledger exactly once.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostResourceError::Poisoned`] when the shared ledger is
+    /// unavailable or either slot counter would underflow.
+    fn release(&mut self) -> Result<(), BifrostResourceError> {
+        if self.released {
+            return Ok(());
+        }
+        let mut state = self.governor.lock_state()?;
+        self.governor
+            .release_oracle_slots(&mut state, self.query_class, self.slot_units)?;
+        state.memory_epoch = state.memory_epoch.wrapping_add(1);
+        self.released = true;
+        drop(state);
+        self.governor.inner.memory_changed.notify_waiters();
+        Ok(())
+    }
+}
+
+impl Drop for OracleSlotCharge {
+    /// Returns the exact slot ownership and poisons on divergence.
+    fn drop(&mut self) {
+        if let Err(error) = self.release() {
+            tracing::error!(%error, "Oracle worker slot cleanup failed");
+        }
+    }
+}
+
 /// Non-cloneable owner of one advertised remote Oracle worker quantum.
 #[derive(Debug)]
 pub struct OracleWorkerResources {
     /// Exact floor-first root-memory ownership for this remote execution.
     lease: OracleMemoryLease,
+    /// Aggregate slot-ledger units this follower holds until it is dropped.
+    _slots: OracleSlotCharge,
     /// Exact bounded `DataFusion` pool nested under the retained root lease.
     memory_pool: Arc<dyn MemoryPool>,
     /// Trusted grant the bounded pool was sized from.
@@ -4230,7 +4466,8 @@ impl OracleQueryResources {
             QueryClass::Interactive => state.oracle_interactive_queries -= 1,
             QueryClass::Analytical => state.oracle_analytical_queries -= 1,
         }
-        state.oracle_query_slot_units -= self.slot_units;
+        self.governor
+            .release_oracle_slots(&mut state, self.query_class, self.slot_units)?;
         state.oracle_query_memory_used_bytes -= self.memory_bytes;
         state.oracle_query_scratch_used_bytes -= self.scratch_bytes;
         state.memory_epoch = state.memory_epoch.wrapping_add(1);

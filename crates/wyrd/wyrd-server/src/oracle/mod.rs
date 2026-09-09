@@ -46,10 +46,7 @@ pub use tail_discovery::RegistryTailStreamDiscovery;
 ///
 /// The latch closes and the shared Oracle cancellation token fires together, so
 /// no request path can select this node after its own epoch selected loss.
-pub(crate) fn close_local_reader_epoch(
-    advertise_ready: &AtomicBool,
-    shutdown: &CancellationToken,
-) {
+pub(crate) fn close_local_reader_epoch(advertise_ready: &AtomicBool, shutdown: &CancellationToken) {
     advertise_ready.store(false, Ordering::Release);
     shutdown.cancel();
 }

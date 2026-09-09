@@ -790,7 +790,8 @@ async fn run_reader_epoch_loss_monitor(
     lifecycle.begin_draining();
     metrics::gauge!("bifrost_role_ready", "role" => "oracle").set(0.0);
     engine.begin_shutdown();
-    let deactivation = crate::oracle::deactivate_lost_reader_epoch(&cluster, &registered_role).await;
+    let deactivation =
+        crate::oracle::deactivate_lost_reader_epoch(&cluster, &registered_role).await;
     let report = await_reader_epoch_loss_settlement(
         deactivation,
         engine.shutdown(Instant::now() + Duration::from_secs(5)),

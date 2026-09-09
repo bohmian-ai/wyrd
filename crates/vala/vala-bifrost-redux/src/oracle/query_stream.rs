@@ -1650,9 +1650,9 @@ mod tests {
     use crate::oracle::exec::OracleQueryScanStats;
     use crate::oracle::failed_terminal_for_visibility;
     use crate::oracle::{
-        BifrostError, OracleSlotManager, OracleTelemetry, QueryClass, QueryFreshness,
-        QuerySchemaFrame, QuerySource, QueryStreamFrame, QueryTerminalErrorCode,
-        QueryTerminalFrame, QueryTerminalOutcome, VisibilityMode,
+        BifrostError, OracleTelemetry, QueryClass, QueryFreshness, QuerySchemaFrame, QuerySource,
+        QueryStreamFrame, QueryTerminalErrorCode, QueryTerminalFrame, QueryTerminalOutcome,
+        VisibilityMode,
     };
     use crate::test_support::{SpanCaptureSubscriber, has_span_outcome};
 
@@ -2139,8 +2139,7 @@ mod tests {
     #[tokio::test]
     async fn success_terminal_requires_completed_local_release() {
         let (admitted, shared, _request_cancellation) = admitted_guard_for_test();
-        let telemetry_owner =
-            Arc::new(OracleTelemetry::new(Arc::new(OracleSlotManager::new(1, 1))));
+        let telemetry_owner = Arc::new(OracleTelemetry::new());
         let telemetry =
             telemetry_owner.start_query(VisibilityMode::PublishedOnly, QueryClass::Interactive);
         let (ipc, schema_frame) = empty_schema_ipc("production");
@@ -2180,8 +2179,7 @@ mod tests {
     #[tokio::test]
     async fn post_output_typed_stale_object_is_terminal_without_replan() {
         let (admitted, shared, _request_cancellation) = admitted_guard_for_test();
-        let telemetry_owner =
-            Arc::new(OracleTelemetry::new(Arc::new(OracleSlotManager::new(1, 1))));
+        let telemetry_owner = Arc::new(OracleTelemetry::new());
         let stale = crate::oracle::exec::iceberg_datafusion_error(std::io::Error::from(
             std::io::ErrorKind::NotFound,
         ));
@@ -2225,8 +2223,7 @@ mod tests {
     #[tokio::test]
     async fn request_cancellation_interrupts_production_stream() {
         let (admitted, shared, request_cancellation) = admitted_guard_for_test();
-        let telemetry_owner =
-            Arc::new(OracleTelemetry::new(Arc::new(OracleSlotManager::new(1, 1))));
+        let telemetry_owner = Arc::new(OracleTelemetry::new());
         let (ipc, schema_frame) = empty_schema_ipc("request-cancel");
         let mut stream = OracleQueryStream::new(QueryStreamInput {
             execution_path: QueryExecutionPath::Interactive,

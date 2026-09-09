@@ -1205,7 +1205,7 @@ mod tests {
             tails,
             memory,
             TailFenceDrainerConfig {
-                telemetry: Arc::new(OracleTelemetry::new(Arc::new(OracleSlotManager::new(1, 1)))),
+                telemetry: Arc::new(OracleTelemetry::new()),
                 query_pool: crate::resources::bounded_memory_pool(1024 * 1024 * 1024),
                 query_class: QueryClass::Interactive,
                 deadline: Instant::now() + Duration::from_secs(1),

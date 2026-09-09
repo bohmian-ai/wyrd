@@ -119,3 +119,23 @@ git diff --check 63ad8cbb8..<new-candidate>
 DO NOT run full repo level tests. Just run the focused tests above. The candidate is a SQL-only observation change; no other test targets are affected.
 
 Record baseline-identical unrelated failures separately. Do not weaken or suppress a gate or test to obtain a pass.
+
+## Implementation evidence
+
+Candidate: `697fbd359` (cumulative range `63ad8cbb8..697fbd359`).
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| `FIND-BIFROST-OTEL-T03A-1` | `crates/bindings/wyrd-node/src/lib.rs` retains the stream's schema as a schema-only IPC stream (`encode_schema`, `NativeStreamOwner::schema`, `NativeBifrostQueryStream::schema_ipc`); `typescript/wyrd/src/index.ts` reads it through `BifrostQueryStream.schema`, stores it on `QueryResult`, and builds `toArrow()` as `new Table(schema, batches)` | `mise run test:bifrost:journey:typescript` — "keeps the server's schema on an empty result and parses typed rows" asserts the selected field names and types survive `toArrow()` and a `toBytes()` round trip at zero rows | PASS |
+| `FIND-BIFROST-OTEL-T03A-8` | `crates/vala/vala-sdk/src/bifrost.rs::Bifrost::query_client` rustdoc now names running/status/cancel/describe and the raw request form only | `mise run lints`, `mise run fmt` | PASS |
+| `FIND-BIFROST-OTEL-T03A-9` | Blank EOF lines removed from the R1 verdict and `typescript/wyrd/src/index.ts` | `git diff --check 63ad8cbb8..697fbd359` exits 0 | PASS |
+| `FIND-BIFROST-OTEL-T03A-10` | Rust `Bifrost::sql_as` + `blocking::Bifrost::sql_as` over a private `QueryResult::deserialize` (Arrow JSON → serde), new `ValaSdkError::RowDeserialization` (`WYRD_CLIENT_422_ROW_DESERIALIZATION`, 422); Python `Bifrost.sql`/`AsyncBifrost.sql` optional `model` with a structural `RowModel` protocol; TypeScript `Bifrost.sql` overload taking a structural `RowSchema` | `mise run test:bifrost:journey:sdk` (15/15, incl. `typed_sql_projects_rows_and_refuses_a_mismatch` and the blocking journey's typed read); `mise run test:bifrost:journey:python` (30/30, incl. `test_sql_returns_model_instances_when_a_model_is_supplied`); `mise run test:bifrost:journey:typescript` (11/11) | PASS |
+
+Also run clean: `mise run py:format`, `py:lints`, `py:typecheck`, `ts:typecheck`, `ts:napi:check`, `codegen:check`, `check:client-tier`, `check:pyo3-scope`, `fmt`, `lints`.
+
+Notes and limits:
+
+- Non-goals held: no streaming typed iterator, no SQL generated from a result model, no coercion around Pydantic/Zod/Serde, no persistence or fingerprint meaning for result schemas, and no restored typed observation reader. Raw `sql(query)` still returns `QueryResult` in all three languages.
+- `changes/active/bifrost-forge-oracle-integration/spec.md` was left untouched; it remains the only unrelated modified worktree file.
+- First run of `test:bifrost:journey:python` showed one unrelated failure, `test_negative_empty_permissions_denied_rbac_on_write`; it passes in isolation and the full lane passed on re-run, so it is a pre-existing order/timing flake on a write-RBAC path this change does not touch.
+- `cargo nextest run -p wyrd-node --lib` cannot link outside the Node runtime (missing `napi_*` symbols) and no lane runs it; per AGENTS §11 that crate's behavior is proven through the TypeScript journey, which passes.

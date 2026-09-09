@@ -13,6 +13,7 @@ mod pg_tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
+    use arrow::array::Array;
     use arrow::ipc::writer::StreamWriter;
     use arrow::record_batch::RecordBatch;
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -1959,6 +1960,265 @@ mod pg_tests {
         assert_ne!(
             inflight_identity.table_uid, bound_identity.table_uid,
             "two tables must not share one server-minted uid"
+        );
+
+        srv.shutdown().await.expect("server shutdown");
+    }
+    /// The served-inference fact table the analytical journey aggregates.
+    ///
+    /// `call_id` rather than `run_id` because the write path owns `run_id`; a
+    /// declaration that restates a server-owned column cannot be registered.
+    fn inference_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("call_id", DataType::Int64, false),
+            Field::new("model", DataType::Utf8, false),
+            Field::new("tokens", DataType::Int64, false),
+            Field::new("latency_ms", DataType::Float64, false),
+            Field::new("status", DataType::Utf8, false),
+        ]))
+    }
+
+    /// The model dimension the analytical journey joins against by model name.
+    fn model_info_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("model", DataType::Utf8, false),
+            Field::new("vendor", DataType::Utf8, false),
+        ]))
+    }
+
+    /// Register `fqn`, write `rows`, and publish them so a reader can see them.
+    ///
+    /// Rows are only queryable after the client drains its producers and the
+    /// server-owned Scribe publishes, so both halves belong to one helper
+    /// rather than to each caller.
+    ///
+    /// # Panics
+    ///
+    /// Panics when connecting, registering, inserting, draining, or publishing
+    /// fails; each is a harness failure rather than a behavior under test.
+    async fn publish_rows(
+        srv: &WyrdTestServer,
+        client: &WyrdClient,
+        fqn: &str,
+        schema: SchemaRef,
+        rows: &[String],
+    ) {
+        let config = TableConfig::from_arrow(fqn, schema).expect("declared analytical table");
+        let bifrost = Bifrost::connect_with_table(client, config)
+            .await
+            .expect("analytical writer connects");
+        assert_eq!(
+            bifrost.register().await.expect("register the table"),
+            RegisterOutcome::Created
+        );
+        for row in rows {
+            bifrost
+                .insert(row.clone().into_bytes(), Correlation::default())
+                .expect("insert an analytical row");
+        }
+        bifrost.flush().await.expect("flush every pooled producer");
+        bifrost.shutdown().await.expect("shutdown drains and stops");
+        srv.flush_bifrost()
+            .await
+            .expect("publish the server-owned Scribe");
+    }
+
+    /// Flatten one primitive column across every batch, preserving nulls.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the column is absent or is not the requested Arrow type.
+    fn primitive_col<T: arrow::datatypes::ArrowPrimitiveType>(
+        batches: &[RecordBatch],
+        name: &str,
+    ) -> Vec<Option<T::Native>> {
+        let mut values = Vec::new();
+        for batch in batches {
+            let column = batch
+                .column_by_name(name)
+                .unwrap_or_else(|| panic!("column `{name}`"));
+            let array = column
+                .as_any()
+                .downcast_ref::<arrow::array::PrimitiveArray<T>>()
+                .unwrap_or_else(|| panic!("column `{name}` is not the expected primitive type"));
+            for index in 0..array.len() {
+                values.push(array.is_valid(index).then(|| array.value(index)));
+            }
+        }
+        values
+    }
+
+    /// Flatten one non-null string column across every batch.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the column is absent or is not `Utf8`.
+    fn string_col(batches: &[RecordBatch], name: &str) -> Vec<String> {
+        let mut values = Vec::new();
+        for batch in batches {
+            let column = batch
+                .column_by_name(name)
+                .unwrap_or_else(|| panic!("column `{name}`"));
+            let array = column
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .unwrap_or_else(|| panic!("column `{name}` is not Utf8"));
+            for index in 0..array.len() {
+                values.push(array.value(index).to_owned());
+            }
+        }
+        values
+    }
+
+    /// Group-by, window, join, and scalar SQL over caller-registered tables.
+    ///
+    /// Representative rather than exhaustive: one query per DataFusion family a
+    /// data scientist reaches for, each asserted on values rather than shape so
+    /// a silently wrong plan fails. Aggregate and window results are cast to
+    /// stable SQL types so the assertions pin values, not the engine's choice
+    /// of accumulator width.
+    #[tokio::test]
+    async fn analytical_sql_over_written_tables() {
+        let srv = WyrdTestServer::start_bound()
+            .await
+            .expect("test server start");
+        let client = admin_client(&srv, "sdk-analytical-journey").await;
+
+        let facts = owned_fqn("inference");
+        let dims = owned_fqn("model_info");
+        let inferences: Vec<String> = [
+            (1i64, "opus", 100i64, 120.5f64, "ok"),
+            (2, "opus", 300, 240.0, "ok"),
+            (3, "opus", 200, 180.25, "error"),
+            (4, "haiku", 50, 30.0, "ok"),
+            (5, "haiku", 150, 60.75, "ok"),
+        ]
+        .iter()
+        .map(|(call_id, model, tokens, latency_ms, status)| {
+            format!(
+                r#"{{"call_id": {call_id}, "model": "{model}", "tokens": {tokens}, "latency_ms": {latency_ms}, "status": "{status}"}}"#
+            )
+        })
+        .collect();
+        let model_info = [
+            r#"{"model": "opus", "vendor": "anthropic"}"#.to_owned(),
+            r#"{"model": "haiku", "vendor": "anthropic"}"#.to_owned(),
+        ];
+
+        publish_rows(&srv, &client, &facts, inference_schema(), &inferences).await;
+        publish_rows(&srv, &client, &dims, model_info_schema(), &model_info).await;
+
+        let reader = Bifrost::connect(&client).await.expect("reader connects");
+
+        // Aggregates with a HAVING filter: the per-group summary table.
+        let grouped = reader
+            .sql(&format!(
+                "SELECT model, \
+                        CAST(COUNT(*) AS BIGINT) AS runs, \
+                        CAST(SUM(tokens) AS BIGINT) AS total_tokens, \
+                        CAST(AVG(tokens) AS DOUBLE) AS avg_tokens, \
+                        CAST(MIN(latency_ms) AS DOUBLE) AS fastest, \
+                        CAST(MAX(latency_ms) AS DOUBLE) AS slowest \
+                 FROM {facts} \
+                 GROUP BY model HAVING COUNT(*) > 1 ORDER BY total_tokens DESC"
+            ))
+            .await
+            .expect("grouped aggregate");
+        assert_eq!(grouped.terminal().outcome, QueryTerminalOutcome::Success);
+        let grouped = grouped.batches();
+        assert_eq!(string_col(grouped, "model"), vec!["opus", "haiku"]);
+        assert_eq!(
+            primitive_col::<arrow::datatypes::Int64Type>(grouped, "runs"),
+            vec![Some(3), Some(2)]
+        );
+        assert_eq!(
+            primitive_col::<arrow::datatypes::Int64Type>(grouped, "total_tokens"),
+            vec![Some(600), Some(200)]
+        );
+        assert_eq!(
+            primitive_col::<arrow::datatypes::Float64Type>(grouped, "avg_tokens"),
+            vec![Some(200.0), Some(100.0)]
+        );
+        assert_eq!(
+            primitive_col::<arrow::datatypes::Float64Type>(grouped, "fastest"),
+            vec![Some(120.5), Some(30.0)]
+        );
+        assert_eq!(
+            primitive_col::<arrow::datatypes::Float64Type>(grouped, "slowest"),
+            vec![Some(240.0), Some(60.75)]
+        );
+
+        // Window functions: rank within a partition, a running total, and a lag.
+        let windowed = reader
+            .sql(&format!(
+                "SELECT call_id, model, \
+                        CAST(ROW_NUMBER() OVER (PARTITION BY model ORDER BY tokens DESC) AS BIGINT) AS rank_in_model, \
+                        CAST(SUM(tokens) OVER (PARTITION BY model ORDER BY call_id) AS BIGINT) AS running_tokens, \
+                        CAST(LAG(tokens) OVER (PARTITION BY model ORDER BY call_id) AS BIGINT) AS prev_tokens \
+                 FROM {facts} ORDER BY call_id"
+            ))
+            .await
+            .expect("windowed projection");
+        let windowed = windowed.batches();
+        assert_eq!(
+            primitive_col::<arrow::datatypes::Int64Type>(windowed, "rank_in_model"),
+            vec![Some(3), Some(1), Some(2), Some(2), Some(1)]
+        );
+        assert_eq!(
+            primitive_col::<arrow::datatypes::Int64Type>(windowed, "running_tokens"),
+            vec![Some(100), Some(400), Some(600), Some(50), Some(200)]
+        );
+        assert_eq!(
+            primitive_col::<arrow::datatypes::Int64Type>(windowed, "prev_tokens"),
+            vec![None, Some(100), Some(300), None, Some(50)]
+        );
+
+        // Join to the dimension table, with a filtering aggregate on the facts.
+        let joined = reader
+            .sql(&format!(
+                "SELECT d.vendor, f.model, \
+                        CAST(COUNT(*) FILTER (WHERE f.status = 'ok') AS BIGINT) AS successes, \
+                        CAST(COUNT(*) AS BIGINT) AS attempts \
+                 FROM {facts} AS f INNER JOIN {dims} AS d ON f.model = d.model \
+                 GROUP BY d.vendor, f.model ORDER BY f.model"
+            ))
+            .await
+            .expect("joined aggregate");
+        let joined = joined.batches();
+        assert_eq!(string_col(joined, "vendor"), vec!["anthropic", "anthropic"]);
+        assert_eq!(string_col(joined, "model"), vec!["haiku", "opus"]);
+        assert_eq!(
+            primitive_col::<arrow::datatypes::Int64Type>(joined, "successes"),
+            vec![Some(2), Some(2)]
+        );
+        assert_eq!(
+            primitive_col::<arrow::datatypes::Int64Type>(joined, "attempts"),
+            vec![Some(2), Some(3)]
+        );
+
+        // Scalar expressions over a CTE: the reshaping step before a chart.
+        let scalars = reader
+            .sql(&format!(
+                "WITH labelled AS ( \
+                     SELECT call_id, UPPER(model) AS model_label, \
+                            CAST(ROUND(latency_ms) AS DOUBLE) AS latency_whole, \
+                            CASE WHEN latency_ms > 100 THEN 'slow' ELSE 'fast' END AS bucket, \
+                            CAST(CHARACTER_LENGTH(status) AS BIGINT) AS status_len \
+                     FROM {facts} \
+                 ) SELECT * FROM labelled ORDER BY call_id LIMIT 3"
+            ))
+            .await
+            .expect("scalar projection");
+        let scalars = scalars.batches();
+        assert_eq!(string_col(scalars, "model_label"), vec!["OPUS"; 3]);
+        assert_eq!(
+            primitive_col::<arrow::datatypes::Float64Type>(scalars, "latency_whole"),
+            vec![Some(121.0), Some(240.0), Some(180.0)]
+        );
+        assert_eq!(string_col(scalars, "bucket"), vec!["slow"; 3]);
+        assert_eq!(
+            primitive_col::<arrow::datatypes::Int64Type>(scalars, "status_len"),
+            vec![Some(2), Some(2), Some(5)]
         );
 
         srv.shutdown().await.expect("server shutdown");

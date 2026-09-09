@@ -161,6 +161,18 @@ export declare class NativeBifrostQueryStream {
   next(): Promise<NativeQueryStep>
   /** Drops the response stream so Rust transport cancellation propagates. */
   close(): Promise<void>
+  /**
+   * Returns the result's authoritative schema as a schema-only IPC stream.
+   *
+   * Retained when the stream completes, so a query that produced no batch
+   * still carries the server's schema and JavaScript never has to infer one
+   * from the batches it happened to receive.
+   *
+   * # Errors
+   *
+   * Returns a napi error when the retaining lock is poisoned.
+   */
+  get schemaIpc(): Buffer | null
   /** Returns serialized terminal metadata after validated completion. */
   get terminalJson(): string | null
 }

@@ -31,6 +31,7 @@ describe("BifrostQueryStream", () => {
           : { ipc: undefined, terminalJson: JSON.stringify(terminal) };
       },
       async close() {},
+      schemaIpc: null,
       terminalJson: null,
     };
     const stream = new BifrostQueryStream(native);
@@ -54,6 +55,7 @@ describe("BifrostQueryStream", () => {
       async close() {
         closed = true;
       },
+      schemaIpc: null,
       terminalJson: null,
     };
     const stream = new BifrostQueryStream(native);
@@ -77,6 +79,7 @@ describe("BifrostQueryStream", () => {
         };
       },
       async close() {},
+      schemaIpc: null,
       terminalJson: null,
     };
     const stream = new BifrostQueryStream(native);
@@ -110,6 +113,7 @@ describe("BifrostQueryStream", () => {
         };
       },
       async close() {},
+      schemaIpc: null,
       terminalJson: JSON.stringify(terminal),
     };
     const stream = new BifrostQueryStream(native);
@@ -132,6 +136,7 @@ describe("BifrostQueryStream", () => {
         closed = true;
         throw new Error("cleanup failed");
       },
+      schemaIpc: null,
       terminalJson: null,
     };
     const stream = new BifrostQueryStream(native);

@@ -2518,30 +2518,6 @@ async fn successor_reconciles_before_publishing(
     supervisor.stop_worker().await;
 }
 
-/// Reads this tenant's durable planning demand, table by table.
-///
-/// Demand is the durable request for another planning pass, so it is the one
-/// field a shutdown could plausibly write for an attempt it is giving up on —
-/// asking someone to replan work whose effect nobody has accounted for yet.
-/// The generation and source are read beside the table name because an
-/// unchanged row count would hide a bumped generation.
-///
-/// # Panics
-///
-/// Panics when the read-only diagnostic query fails.
-async fn planning_demand(
-    fixture: &super::support::PromotionIntegrationFixture,
-) -> Vec<(String, i64, String)> {
-    sqlx::query_as(
-        "SELECT table_name, generation, last_source FROM vala.forge_planning_demands \
-         WHERE data_tenant_id = $1 ORDER BY table_name",
-    )
-    .bind(fixture.tenant.as_uuid())
-    .fetch_all(fixture.operator_pool.pool())
-    .await
-    .expect("Forge planning demand is readable")
-}
-
 /// Asserts no plan completion released a reservation the queue had already freed.
 ///
 /// The worker treats a second release of one `(task_id, plan_index)` as an

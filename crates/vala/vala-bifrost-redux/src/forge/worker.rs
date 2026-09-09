@@ -760,6 +760,15 @@ pub struct ForgeWorkerCompletionObserver {
     /// does not carry them.
     #[cfg(feature = "test-support")]
     rewrite_evidence: Arc<Mutex<Vec<ForgeRewriteEvidenceRecord>>>,
+    /// Durable task identities whose attempt was released unresolved, in order.
+    ///
+    /// Compiled only under `test-support`. An attempt that cannot account for
+    /// one of its operations writes nothing durable, so a journey that must
+    /// sequence itself after that release — before lapsing the claim lease the
+    /// successor recovers from — has no durable row to poll. This is that
+    /// signal, appended after the release has already completed.
+    #[cfg(feature = "test-support")]
+    released_attempts: Arc<Mutex<Vec<Uuid>>>,
     /// Number of successful task executions observed after their durable path returned.
     completed: Arc<AtomicUsize>,
     /// Stable production worker identities that completed each observed task.
@@ -1135,6 +1144,32 @@ impl ForgeWorkerCompletionObserver {
     #[must_use]
     pub fn rewrite_evidence_for_test(&self) -> Vec<ForgeRewriteEvidenceRecord> {
         self.rewrite_evidence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Record that one attempt was released to durable recovery unresolved.
+    ///
+    /// Passive: appended once the release has finished closing its local
+    /// heartbeat and fence, and never read by any durable path.
+    #[cfg(feature = "test-support")]
+    pub(crate) fn record_released_attempt_for_test(&self, task_id: Uuid) {
+        self.released_attempts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(task_id);
+        self.ready.notify_waiters();
+    }
+
+    /// Return the durable tasks whose attempt was released unresolved.
+    ///
+    /// Ordered by observation, and repeated when the same task is released by
+    /// more than one attempt.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn released_attempts_for_test(&self) -> Vec<Uuid> {
+        self.released_attempts
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
@@ -2465,6 +2500,10 @@ redacted
         );
         drop(shared);
         drop(open);
+        #[cfg(feature = "test-support")]
+        if let Some(observer) = &self.completion_observer {
+            observer.record_released_attempt_for_test(task_id);
+        }
     }
 
     /// Publishes this loop's readiness, when it is running under a role handle.

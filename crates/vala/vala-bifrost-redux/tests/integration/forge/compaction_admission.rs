@@ -34,7 +34,7 @@ use super::support::{CountingObjectStore, PromotionCatalogSeam, SupervisedPromot
 /// an input the attempt rewrote is still live.
 #[tokio::test]
 async fn independent_plan_publications_compose_on_current_head() {
-redacted
+    let promoted = PromotedRewriteFixture::start_unpromoted("compaction_admission").await;
     let object_store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
     let mut supervisor = SupervisedPromotion::start(
         &promoted.fixture,
@@ -155,8 +155,8 @@ redacted
 /// refused plan leaves its operation open, or when an attempt that planned
 /// nothing consumes the task's attempt budget or writes an operation.
 #[tokio::test]
-redacted
-redacted
+async fn admitted_batch_reports_partial_progress_semantics() {
+    let promoted = PromotedRewriteFixture::start_unpromoted("compaction_reduction").await;
     let object_store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
     let catalog = PromotionCatalogSeam::new(
         promoted.fixture.catalog.iceberg_catalog(),
@@ -376,7 +376,7 @@ async fn latest_small_files_task(
 /// or when the takeover leaves any of them open.
 #[tokio::test]
 async fn reconciliation_walks_every_open_operation_a_page_cannot_hold() {
-redacted
+    let mut promoted = PromotedRewriteFixture::start_unpromoted("compaction_reconcile").await;
     promoted.fixture.config.max_open_operations_per_table = 1;
     // A stalled commit has to run out of publication budget while the scenario
     // is still watching, so the budget is the seconds a test can wait rather
@@ -776,7 +776,7 @@ fn consumed_paths(before: &BTreeSet<String>, after: &BTreeSet<String>) -> usize 
 /// than once.
 #[tokio::test]
 async fn stale_planned_input_cannot_be_republished() {
-redacted
+    let promoted = PromotedRewriteFixture::start_unpromoted("compaction_stale_input").await;
     let object_store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
     let catalog = PromotionCatalogSeam::new(
         promoted.fixture.catalog.iceberg_catalog(),
@@ -1352,7 +1352,7 @@ redacted
     cancelling_one_waiting_task_keeps_the_other_tenant(&promoted, &mut supervisor, other_tenant)
         .await;
 
-redacted
+    pull_turn_stops_at_the_tenant_allowance(&promoted, &catalog, &mut supervisor, other_tenant)
         .await;
 
     // A clean shutdown drains every join before the worker returns; the helper
@@ -1419,7 +1419,14 @@ async fn released_authority_gates_readiness_and_new_claims() {
     let released_task = ready[0];
     let blocked_task = ready[1];
 
-    release_one_unresolvable_attempt(&promoted, &catalog, &mut supervisor, released_task).await;
+    release_one_unresolvable_attempt(
+        &promoted,
+        &catalog,
+        &mut supervisor,
+        own_tenant,
+        released_task,
+    )
+    .await;
     let unresolved = assert_unready_takes_no_new_authority(
         &promoted,
         &supervisor,
@@ -1449,21 +1456,62 @@ async fn released_authority_gates_readiness_and_new_claims() {
 /// own operations and is released: `Running` task, `Prepared` operations, and a
 /// claim owned until its lease lapses.
 ///
+/// The release is held at its table-lease boundary before it is allowed to
+/// finish, because that hold is the one place the unresolved interval is
+/// observable from outside: the attempt is already classified unresolved and
+/// the release is doing local work that can block. Readiness must already be
+/// false there, with the exact task still `Running` and its operation still
+/// `Prepared`.
+///
 /// # Panics
 ///
-/// Panics when the attempt settles instead of being released inside
-/// [`ADMISSION_BOUND`].
+/// Panics when the release does not reach its lease boundary, when readiness
+/// is still advertised there, when the durable identities are not the ones the
+/// release left behind, or when the attempt settles instead of being released
+/// inside [`ADMISSION_BOUND`].
 async fn release_one_unresolvable_attempt(
     promoted: &PromotedRewriteFixture,
     catalog: &Arc<PromotionCatalogSeam>,
     supervisor: &mut SupervisedPromotion,
+    own_tenant: wyrd_spec::ids::DataTenantId,
     released_task: uuid::Uuid,
 ) {
     let released_before = supervisor.observer().released_attempts_for_test().len();
     catalog.stall_next_commit_responses(8);
     supervisor.restart_worker();
     supervisor.start_worker();
+    supervisor
+        .observer()
+        .hold_before_next_lease_release_for_test();
     promoted.fixture.offer_task(released_task, 0).await;
+    let held = tokio::time::timeout(
+        ADMISSION_BOUND,
+        supervisor.observer().wait_for_held_lease_release_for_test(),
+    )
+    .await;
+    assert!(
+        held.is_ok(),
+        "the unresolvable attempt reaches its lease release: {:?} / {:?}",
+        tenant_tasks(&promoted.fixture).await,
+        promoted.fixture.rewrite_operations().await
+    );
+    assert!(
+        !supervisor.is_ready(),
+        "readiness is retracted before the unresolved release does blocking work: {:?}",
+        promoted.fixture.rewrite_operations().await
+    );
+    assert_eq!(
+        task_state(&promoted.fixture, own_tenant, released_task).await,
+        Some("running".to_owned()),
+        "the exact task is still Running at that boundary: {:?}",
+        tenant_tasks(&promoted.fixture).await
+    );
+    assert!(
+        !prepared_operations(promoted).await.is_empty(),
+        "the exact operation is still Prepared at that boundary: {:?}",
+        promoted.fixture.rewrite_operations().await
+    );
+    supervisor.observer().release_held_lease_release_for_test();
     let released = tokio::time::timeout(ADMISSION_BOUND, async {
         while supervisor.observer().released_attempts_for_test().len() == released_before {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -2085,7 +2133,7 @@ redacted
 /// Panics when the tables do not owe compaction together, when an earlier
 /// phase's claim is still held as the turn begins, when a turn claims more than
 /// four tasks, or when it leaves nothing claimable behind.
-redacted
+async fn pull_turn_stops_at_the_tenant_allowance(
     promoted: &PromotedRewriteFixture,
     catalog: &Arc<PromotionCatalogSeam>,
     supervisor: &mut SupervisedPromotion,

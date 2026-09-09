@@ -5,6 +5,7 @@
 //! and stay unlisted until their tests are restored against a current
 //! production invariant.
 
+mod compaction_admission;
 mod expired_cleanup;
 mod managed_rewrite;
 mod orphan_cleanup;
@@ -13,6 +14,5 @@ mod promotion;
 mod publication;
 mod reader_expiry_ordering;
 mod rewrite_support;
-redacted
 pub(crate) mod snapshot_expiration;
 pub(crate) mod support;

@@ -2628,6 +2628,11 @@ redacted
     /// republish an effect that may already be live — so it is released
     /// instead, leaving exactly the durable residue a lost process leaves.
     ///
+    /// Readiness is retracted the moment an attempt is classified unresolved,
+    /// before the release does any local work that can block, so no interval
+    /// exists in which this owner advertises ready while knowing its own
+    /// publication needs reconciliation.
+    ///
     /// # Errors
     ///
     /// Returns the settlement, audit, SQL, or lease-release failure that makes
@@ -2647,6 +2652,13 @@ redacted
             unresolved = Self::unknown_operations(&state).len(),
             "Forge task released: an operation's acceptance is unknown and no plan is known to have published"
         );
+        // The bit is retracted here rather than at the loop's durable gate,
+        // because the release below cancels a heartbeat and awaits a lease
+        // release that can block: an owner that already knows its own
+        // publication is unreconciled must not stay externally ready for that
+        // interval. The durable gate then keeps it false until exact recovery
+        // closes or hands on the authority.
+        self.publish_readiness(false);
         self.release_unresolved_attempt(state).await;
         Ok(())
     }

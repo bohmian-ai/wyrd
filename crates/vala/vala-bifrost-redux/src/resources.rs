@@ -11,16 +11,13 @@ use std::fs;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 #[cfg(any(test, feature = "test-support"))]
-use std::sync::LazyLock;
 use std::sync::OnceLock;
 #[cfg(any(test, feature = "test-support"))]
-use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use datafusion::error::DataFusionError;
-#[cfg(any(test, feature = "test-support"))]
 use datafusion::execution::memory_pool::MemoryLimit;
 use datafusion::execution::memory_pool::{
     FairSpillPool, GreedyMemoryPool, MemoryConsumer, MemoryPool, MemoryReservation,
@@ -1648,6 +1645,12 @@ pub struct ResourceSnapshot {
     pub oracle_query_slot_units: u32,
     /// Aggregate memory retained specifically by Oracle query owners.
     pub oracle_query_memory_used_bytes: usize,
+    /// Bytes `DataFusion`'s infallible growth path holds above the governed root.
+    ///
+    /// These are real, retained bytes charged to the process headroom reserve
+    /// rather than to governed free capacity, so they suppress later fallible
+    /// growth without ever being offered as available memory.
+    pub oracle_infallible_bytes: usize,
     /// Aggregate scratch retained specifically by Oracle query owners.
     pub oracle_query_scratch_used_bytes: u64,
     /// Whether at least one Oracle query owner is active.
@@ -1771,6 +1774,7 @@ struct ResourceState {
     oracle_query_slot_units: u32,
     oracle_analytical_slot_units: u32,
     oracle_query_memory_used_bytes: usize,
+    oracle_infallible_bytes: usize,
     oracle_query_scratch_used_bytes: u64,
     scribe_category_bytes: [usize; crate::scribe::memory::MEMORY_CATEGORY_COUNT],
     scribe_shard_bytes: BTreeMap<usize, usize>,
@@ -1971,6 +1975,11 @@ impl BifrostRuntimeResources {
             oracle: (plan.oracle_floor_bytes > 0).then(|| OracleResources {
                 governor: self.governor.clone(),
                 volumes: self.volumes.clone(),
+                memory_root: Arc::new(OracleMemoryRoot::new(
+                    self.governor.clone(),
+                    plan.oracle_floor_bytes
+                        .saturating_add(plan.elastic_memory_bytes),
+                )),
             }),
             governor: self.governor.clone(),
             transport: self.transport.clone(),
@@ -2397,6 +2406,11 @@ pub struct OracleResources {
     governor: BifrostResourceGovernor,
     /// Physical Oracle scratch authority registered during live boot.
     volumes: Option<BifrostVolumeGovernor>,
+    /// The one governed `DataFusion` root every query on this pod shares.
+    ///
+    /// Cloning this capability shares the same root, which is the point: two
+    /// clones must not be able to hand out two independent memory envelopes.
+    memory_root: Arc<OracleMemoryRoot>,
 }
 
 impl OracleResources {
@@ -2464,7 +2478,12 @@ impl OracleResources {
             .try_acquire_oracle_memory(class.memory_bytes())?;
         let granted_memory_bytes =
             BifrostResourceGovernor::oracle_memory_grant(plan, slot_units, next_slots);
-        let memory_pool = bounded_memory_pool(granted_memory_bytes);
+        // A follower is a query too: it takes a private view over the same
+        // shared root the leader queries use, never an independent pool whose
+        // ceiling could sum above what the pod owns.
+        let memory_pool = self
+            .memory_root
+            .query_view(granted_memory_bytes, &Arc::new(AtomicUsize::new(0)));
         // Locality is zero here: a remote worker reads the files the leader
         // dispatched to it, so its partition ceiling comes from the grant it
         // was admitted with rather than from any caller-supplied hint.
@@ -2477,6 +2496,21 @@ impl OracleResources {
             granted_memory_bytes,
             admitted_target_partitions,
         })
+    }
+
+    /// Returns the aggregate bytes every live Oracle query holds at the root.
+    ///
+    /// This is the shared figure, not one query's: it is what proves two
+    /// concurrent queries compete beneath one envelope rather than beside it.
+    #[must_use]
+    pub fn shared_memory_reserved(&self) -> usize {
+        self.memory_root.reserved()
+    }
+
+    /// Returns the cooperative maximum the shared Oracle root arbitrates.
+    #[must_use]
+    pub fn shared_memory_limit(&self) -> usize {
+        self.memory_root.limit_bytes()
     }
 
     /// Captures the shared root capacity epoch before an admission attempt.
@@ -2557,7 +2591,9 @@ impl OracleResources {
         &self,
         request: OracleResourceRequest,
     ) -> Result<OracleQueryResources, BifrostResourceError> {
-        let mut resources = self.governor.try_acquire_oracle(request)?;
+        let mut resources = self
+            .governor
+            .try_acquire_oracle(request, &self.memory_root)?;
         if let Some(volumes) = &self.volumes {
             let capabilities = volumes.capabilities();
             resources.volume_scratch =
@@ -2920,6 +2956,7 @@ impl BifrostResourceGovernor {
             oracle_analytical_queries: state.oracle_analytical_queries,
             oracle_query_slot_units: state.oracle_query_slot_units,
             oracle_query_memory_used_bytes: state.oracle_query_memory_used_bytes,
+            oracle_infallible_bytes: state.oracle_infallible_bytes,
             oracle_query_scratch_used_bytes: state.oracle_query_scratch_used_bytes,
             oracle_query_active: state.oracle_active_queries > 0,
         })
@@ -3315,33 +3352,23 @@ impl BifrostResourceGovernor {
     pub(crate) fn try_acquire_oracle(
         &self,
         request: OracleResourceRequest,
+        memory_root: &Arc<OracleMemoryRoot>,
     ) -> Result<OracleQueryResources, BifrostResourceError> {
         let mut state = self.lock_state()?;
         let plan = self.plan();
         Self::validate_oracle_request(plan, request)?;
-        let next_memory = state
-            .oracle_memory_used_bytes
-            .checked_add(request.memory_bytes)
-            .ok_or_else(accounting_overflow)?;
-        let prior_borrow = state
-            .oracle_memory_used_bytes
-            .saturating_sub(plan.oracle_floor_bytes);
-        let next_borrow = next_memory.saturating_sub(plan.oracle_floor_bytes);
-        let added_elastic = next_borrow
-            .checked_sub(prior_borrow)
-            .ok_or_else(accounting_overflow)?;
-        let next_elastic = state
-            .elastic_memory_used_bytes
-            .checked_add(added_elastic)
-            .ok_or_else(accounting_overflow)?;
+        // The class quantum is a ceiling and a partition-planning input, not
+        // resident memory: what a query actually reserves is charged as its
+        // `DataFusion` consumers grow through the shared Oracle root. Slots are
+        // the concurrency authority; scratch remains an admitted lease.
         let next_scratch = state
             .scratch_used_bytes
             .checked_add(request.scratch_bytes)
             .ok_or_else(accounting_overflow)?;
-        if next_elastic > plan.elastic_memory_bytes || next_scratch > plan.scratch_limit_bytes {
+        if next_scratch > plan.scratch_limit_bytes {
             record_memory_transition("oracle", "refused", state.oracle_memory_used_bytes);
             return Err(BifrostResourceError::Occupied {
-                detail: "Oracle query exceeds aggregate memory or scratch capacity".to_owned(),
+                detail: "Oracle query exceeds aggregate scratch capacity".to_owned(),
             });
         }
         // Slot units are the sole concurrency authority and the sole protector
@@ -3374,27 +3401,20 @@ impl BifrostResourceGovernor {
             .oracle_analytical_queries
             .checked_add(u32::from(request.query_class == QueryClass::Analytical))
             .ok_or_else(accounting_overflow)?;
-        let next_query_memory = state
-            .oracle_query_memory_used_bytes
-            .checked_add(request.memory_bytes)
-            .ok_or_else(accounting_overflow)?;
         let next_query_scratch = state
             .oracle_query_scratch_used_bytes
             .checked_add(request.scratch_bytes)
             .ok_or_else(accounting_overflow)?;
-        state.elastic_memory_used_bytes = next_elastic;
-        state.oracle_memory_used_bytes = next_memory;
         state.scratch_used_bytes = next_scratch;
         state.oracle_query_slot_units = next_slots;
         state.oracle_analytical_slot_units = next_analytical_slots;
         state.oracle_active_queries = next_active;
         state.oracle_interactive_queries = next_interactive;
         state.oracle_analytical_queries = next_analytical;
-        state.oracle_query_memory_used_bytes = next_query_memory;
         state.oracle_query_scratch_used_bytes = next_query_scratch;
-        record_memory_transition("oracle", "acquired", next_memory);
+        record_memory_transition("oracle", "acquired", state.oracle_memory_used_bytes);
         let memory_peak_bytes = Arc::new(AtomicUsize::new(0));
-        let memory_pool = observed_query_memory_pool(granted_memory_bytes, &memory_peak_bytes);
+        let memory_pool = memory_root.query_view(granted_memory_bytes, &memory_peak_bytes);
         Ok(OracleQueryResources {
             query_class: request.query_class,
             memory_bytes: request.memory_bytes,
@@ -3451,6 +3471,151 @@ impl BifrostResourceGovernor {
             governor: self.clone(),
             released: false,
         })
+    }
+
+    /// Reserves governed Oracle query memory or refuses without mutation.
+    ///
+    /// Spends Oracle's protected floor before borrowing, so only the
+    /// incremental elastic borrow is charged against the shared elastic pool
+    /// that Scribe and Forge also draw from. This is the fallible safety
+    /// boundary behind every `MemoryPool::try_grow` an Oracle query issues.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostResourceError::Occupied`] when the floor plus currently
+    /// free elastic bytes cannot cover `bytes`, and a poison error when the
+    /// ledger is untrustworthy or the addition overflows. Refusal changes no
+    /// counter.
+    fn try_reserve_oracle_query_memory(
+        &self,
+        bytes: usize,
+    ) -> Result<OracleMemoryCharge, BifrostResourceError> {
+        let mut state = self.lock_state()?;
+        let plan = self.plan();
+        let next = state
+            .oracle_memory_used_bytes
+            .checked_add(bytes)
+            .ok_or_else(accounting_overflow)?;
+        let added_elastic = next.saturating_sub(plan.oracle_floor_bytes)
+            - state
+                .oracle_memory_used_bytes
+                .saturating_sub(plan.oracle_floor_bytes);
+        let next_elastic = state
+            .elastic_memory_used_bytes
+            .checked_add(added_elastic)
+            .ok_or_else(accounting_overflow)?;
+        if next_elastic > plan.elastic_memory_bytes {
+            record_memory_transition("oracle", "refused", state.oracle_memory_used_bytes);
+            return Err(BifrostResourceError::Occupied {
+                detail: "Oracle query memory exceeds the governed process root".to_owned(),
+            });
+        }
+        let next_query = state
+            .oracle_query_memory_used_bytes
+            .checked_add(bytes)
+            .ok_or_else(accounting_overflow)?;
+        state.oracle_memory_used_bytes = next;
+        state.elastic_memory_used_bytes = next_elastic;
+        state.oracle_query_memory_used_bytes = next_query;
+        Ok(OracleMemoryCharge {
+            governed_bytes: bytes,
+            headroom_bytes: 0,
+        })
+    }
+
+    /// Charges `DataFusion`'s mandatory infallible growth without refusing.
+    ///
+    /// The portion that still fits the governed root is charged exactly as a
+    /// fallible reservation would be. The remainder is real memory the process
+    /// now holds, so it is charged to the explicit headroom counter instead of
+    /// being silently ignored; it never becomes governed free capacity and it
+    /// makes later fallible growth refuse sooner.
+    ///
+    /// # Errors
+    ///
+    /// Returns a poison error when the ledger is untrustworthy or the checked
+    /// addition overflows.
+    fn reserve_oracle_query_memory_infallible(
+        &self,
+        bytes: usize,
+    ) -> Result<OracleMemoryCharge, BifrostResourceError> {
+        let mut state = self.lock_state()?;
+        let plan = self.plan();
+        let free_elastic = plan
+            .elastic_memory_bytes
+            .saturating_sub(state.elastic_memory_used_bytes);
+        let free_floor = plan
+            .oracle_floor_bytes
+            .saturating_sub(state.oracle_memory_used_bytes);
+        let governed = bytes.min(free_floor.saturating_add(free_elastic));
+        let headroom = bytes - governed;
+        let next = state
+            .oracle_memory_used_bytes
+            .checked_add(governed)
+            .ok_or_else(accounting_overflow)?;
+        let added_elastic = next.saturating_sub(plan.oracle_floor_bytes)
+            - state
+                .oracle_memory_used_bytes
+                .saturating_sub(plan.oracle_floor_bytes);
+        state.elastic_memory_used_bytes = state
+            .elastic_memory_used_bytes
+            .checked_add(added_elastic)
+            .ok_or_else(accounting_overflow)?;
+        state.oracle_query_memory_used_bytes = state
+            .oracle_query_memory_used_bytes
+            .checked_add(governed)
+            .ok_or_else(accounting_overflow)?;
+        state.oracle_infallible_bytes = state
+            .oracle_infallible_bytes
+            .checked_add(headroom)
+            .ok_or_else(accounting_overflow)?;
+        state.oracle_memory_used_bytes = next;
+        Ok(OracleMemoryCharge {
+            governed_bytes: governed,
+            headroom_bytes: headroom,
+        })
+    }
+
+    /// Returns one exact query-memory charge and wakes capacity waiters.
+    ///
+    /// Headroom is released before governed bytes so a consumer that overshot
+    /// the root gives that overshoot back first; only then does governed
+    /// capacity reappear for the next fallible reservation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BifrostResourceError::Poisoned`] and poisons process resource
+    /// health when any component of the charge exceeds the retained counters,
+    /// because that means two owners believe they hold the same bytes.
+    fn release_oracle_query_memory(
+        &self,
+        charge: OracleMemoryCharge,
+    ) -> Result<(), BifrostResourceError> {
+        if charge.governed_bytes == 0 && charge.headroom_bytes == 0 {
+            return Ok(());
+        }
+        let mut state = self.lock_state()?;
+        let plan = self.plan();
+        let released_elastic = released_elastic_bytes(
+            state.oracle_memory_used_bytes,
+            plan.oracle_floor_bytes,
+            charge.governed_bytes,
+        );
+        if state.oracle_infallible_bytes < charge.headroom_bytes
+            || state.oracle_memory_used_bytes < charge.governed_bytes
+            || state.oracle_query_memory_used_bytes < charge.governed_bytes
+            || state.elastic_memory_used_bytes < released_elastic
+        {
+            return Err(self.poison_locked(&mut state, "Oracle query memory release underflow"));
+        }
+        state.oracle_infallible_bytes -= charge.headroom_bytes;
+        state.elastic_memory_used_bytes -= released_elastic;
+        state.oracle_memory_used_bytes -= charge.governed_bytes;
+        state.oracle_query_memory_used_bytes -= charge.governed_bytes;
+        state.memory_epoch = state.memory_epoch.wrapping_add(1);
+        drop(state);
+        self.inner.memory_changed.notify_waiters();
+        Ok(())
     }
 
     fn lock_state(&self) -> Result<std::sync::MutexGuard<'_, ResourceState>, BifrostResourceError> {
@@ -4232,6 +4397,346 @@ impl OracleFooterSlotResources {
     }
 }
 
+/// One query reservation split into governed root bytes and process headroom.
+///
+/// `DataFusion` requires an infallible growth path, so a consumer can hold
+/// bytes the governed root did not have room for. Keeping the split on the
+/// charge is what makes every byte releasable exactly once: governed bytes
+/// return to Oracle's floor/elastic ledger, headroom bytes return to the
+/// explicit overshoot counter.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct OracleMemoryCharge {
+    /// Bytes charged against Oracle's governed floor-plus-elastic capacity.
+    governed_bytes: usize,
+    /// Bytes held above that capacity through the infallible path.
+    headroom_bytes: usize,
+}
+
+impl OracleMemoryCharge {
+    /// Returns every byte this charge holds, governed or not.
+    const fn total(self) -> usize {
+        self.governed_bytes.saturating_add(self.headroom_bytes)
+    }
+}
+
+/// The one governed `DataFusion` memory root every Oracle query shares.
+///
+/// Concurrent queries used to receive independent finite pools, so their
+/// ceilings could sum above the memory the pod actually owns. Every leader,
+/// follower, operator, and exchange reservation now competes beneath this
+/// single tracked [`FairSpillPool`] while the governor keeps the process
+/// ledger, and a per-query view above it enforces that query's own ceiling.
+#[derive(Debug)]
+pub(crate) struct OracleMemoryRoot {
+    /// Shared spill-fair pool that arbitrates every Oracle consumer.
+    pool: Arc<dyn MemoryPool>,
+    /// Process ledger charged in lockstep with that pool.
+    governor: BifrostResourceGovernor,
+    /// Cooperative maximum: Oracle's floor plus the elastic borrow.
+    limit_bytes: usize,
+    /// Serializes whole operations so the two ledgers cannot interleave.
+    ///
+    /// Held first and for the duration of one operation. The governor's and the
+    /// pool's own locks are taken and released inside it, never together, so no
+    /// lock order exists to invert.
+    operation: Mutex<()>,
+}
+
+impl OracleMemoryRoot {
+    /// Builds the shared root at the pod's cooperative Oracle maximum.
+    fn new(governor: BifrostResourceGovernor, limit_bytes: usize) -> Self {
+        Self {
+            pool: finite_pool(limit_bytes),
+            governor,
+            limit_bytes,
+            operation: Mutex::new(()),
+        }
+    }
+
+    /// Returns the immutable cooperative maximum this root arbitrates.
+    pub(crate) const fn limit_bytes(&self) -> usize {
+        self.limit_bytes
+    }
+
+    /// Returns the aggregate bytes every live Oracle consumer holds.
+    pub(crate) fn reserved(&self) -> usize {
+        self.pool.reserved()
+    }
+
+    /// Issues one query's private view over this shared root.
+    ///
+    /// The view owns only a ceiling and its own consumer ledger; it allocates
+    /// nothing of its own, so two views can never sum above the root.
+    fn query_view(
+        self: &Arc<Self>,
+        ceiling_bytes: usize,
+        peak_bytes: &Arc<AtomicUsize>,
+    ) -> Arc<dyn MemoryPool> {
+        Arc::new(OracleQueryMemoryView {
+            root: Arc::clone(self),
+            ceiling_bytes,
+            ledger: Mutex::new(OracleQueryMemoryLedger::default()),
+            peak_bytes: Arc::clone(peak_bytes),
+        })
+    }
+
+    /// Locks one whole operation, refusing rather than panicking on poison.
+    fn lock_operation(&self) -> Result<std::sync::MutexGuard<'_, ()>, DataFusionError> {
+        self.operation.lock().map_err(|_| {
+            DataFusionError::ResourcesExhausted(
+                "Oracle shared memory root lock is poisoned".to_owned(),
+            )
+        })
+    }
+
+    /// Grows one consumer fallibly through query, governor, and pool in order.
+    ///
+    /// Refusal happens before any mutation when the query ceiling cannot cover
+    /// the request; a later refusal from the governor or the shared pool rolls
+    /// the completed steps back in reverse order, so a refused growth retains
+    /// no bytes anywhere.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DataFusion` resource exhaustion when the query ceiling, the
+    /// governed process root, or the shared pool cannot cover `additional`.
+    fn try_grow(
+        &self,
+        view: &OracleQueryMemoryView,
+        reservation: &MemoryReservation,
+        additional: usize,
+    ) -> Result<(), DataFusionError> {
+        let _operation = self.lock_operation()?;
+        let mut ledger = view.lock_ledger()?;
+        let next_total = ledger.total.checked_add(additional).ok_or_else(|| {
+            DataFusionError::ResourcesExhausted("Oracle query memory overflowed".to_owned())
+        })?;
+        if next_total > view.ceiling_bytes {
+            return Err(DataFusionError::ResourcesExhausted(format!(
+                "Oracle query memory ceiling of {} bytes exhausted",
+                view.ceiling_bytes
+            )));
+        }
+        let charge = self
+            .governor
+            .try_reserve_oracle_query_memory(additional)
+            .map_err(|error| root_growth_refusal(&error))?;
+        if let Err(error) = self.pool.try_grow(reservation, additional) {
+            // Reverse order: the governor charge is the only completed step.
+            let _ = self.governor.release_oracle_query_memory(charge);
+            return Err(error);
+        }
+        ledger.charge(reservation.consumer().id(), charge);
+        ledger.total = next_total;
+        view.observe(ledger.total);
+        Ok(())
+    }
+
+    /// Grows one consumer through the path `DataFusion` does not let fail.
+    ///
+    /// Bytes above the governed root are still resident, so the governor
+    /// records them as this consumer's headroom charge rather than dropping
+    /// them. The ledger keeps the same split, so a query that overshoots its
+    /// own ceiling here is refused any further fallible growth and gives its
+    /// headroom back first on shrink.
+    fn grow(
+        &self,
+        view: &OracleQueryMemoryView,
+        reservation: &MemoryReservation,
+        additional: usize,
+    ) {
+        let Ok(_operation) = self.lock_operation() else {
+            return;
+        };
+        let Ok(mut ledger) = view.lock_ledger() else {
+            return;
+        };
+        let charge = match self
+            .governor
+            .reserve_oracle_query_memory_infallible(additional)
+        {
+            Ok(charge) => charge,
+            Err(error) => {
+                tracing::error!(%error, "Oracle infallible growth could not be accounted");
+                return;
+            }
+        };
+        self.pool.grow(reservation, additional);
+        ledger.charge(reservation.consumer().id(), charge);
+        ledger.total = ledger.total.saturating_add(additional);
+        view.observe(ledger.total);
+    }
+
+    /// Releases bytes from the shared pool, the governor, and the query ledger.
+    ///
+    /// This is the only callback that returns successful bytes. Headroom is
+    /// released before governed bytes so an overshooting consumer gives back
+    /// its overshoot first.
+    fn shrink(&self, view: &OracleQueryMemoryView, reservation: &MemoryReservation, shrink: usize) {
+        let Ok(_operation) = self.lock_operation() else {
+            return;
+        };
+        let Ok(mut ledger) = view.lock_ledger() else {
+            return;
+        };
+        self.pool.shrink(reservation, shrink);
+        let released = ledger.release(reservation.consumer().id(), shrink);
+        if let Err(error) = self.governor.release_oracle_query_memory(released) {
+            tracing::error!(%error, "Oracle memory release could not be reconciled");
+        }
+        ledger.total = ledger.total.saturating_sub(shrink);
+    }
+}
+
+/// Per-consumer and aggregate bytes one query view currently holds.
+#[derive(Debug, Default)]
+struct OracleQueryMemoryLedger {
+    /// Aggregate bytes held by this query, checked against its ceiling.
+    total: usize,
+    /// Governed/headroom split per process-unique `MemoryConsumer::id()`.
+    consumers: BTreeMap<usize, OracleMemoryCharge>,
+}
+
+impl OracleQueryMemoryLedger {
+    /// Adds one accepted charge to a consumer's retained split.
+    fn charge(&mut self, consumer: usize, charge: OracleMemoryCharge) {
+        let entry = self.consumers.entry(consumer).or_default();
+        entry.governed_bytes = entry.governed_bytes.saturating_add(charge.governed_bytes);
+        entry.headroom_bytes = entry.headroom_bytes.saturating_add(charge.headroom_bytes);
+    }
+
+    /// Removes `bytes` from one consumer, headroom first, and reports the split.
+    fn release(&mut self, consumer: usize, bytes: usize) -> OracleMemoryCharge {
+        let Some(entry) = self.consumers.get_mut(&consumer) else {
+            return OracleMemoryCharge::default();
+        };
+        let headroom = entry.headroom_bytes.min(bytes);
+        let governed = entry.governed_bytes.min(bytes - headroom);
+        entry.headroom_bytes -= headroom;
+        entry.governed_bytes -= governed;
+        if entry.total() == 0 {
+            self.consumers.remove(&consumer);
+        }
+        OracleMemoryCharge {
+            governed_bytes: governed,
+            headroom_bytes: headroom,
+        }
+    }
+}
+
+/// One query's private view over the shared Oracle memory root.
+///
+/// It owns a ceiling and a ledger, never capacity: every registration and
+/// reservation is forwarded to the root so the shared pool can arbitrate
+/// fairly across all live queries while this view refuses anything past this
+/// query's own grant.
+#[derive(Debug)]
+struct OracleQueryMemoryView {
+    /// Shared root that owns the pool and the process ledger.
+    root: Arc<OracleMemoryRoot>,
+    /// Immutable maximum governed bytes this query may hold.
+    ceiling_bytes: usize,
+    /// This query's consumer split and aggregate counter.
+    ledger: Mutex<OracleQueryMemoryLedger>,
+    /// Query-local observed peak, read by capacity journeys.
+    peak_bytes: Arc<AtomicUsize>,
+}
+
+impl OracleQueryMemoryView {
+    /// Locks this view's ledger, refusing rather than panicking on poison.
+    fn lock_ledger(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, OracleQueryMemoryLedger>, DataFusionError> {
+        self.ledger.lock().map_err(|_| {
+            DataFusionError::ResourcesExhausted("Oracle query memory ledger is poisoned".to_owned())
+        })
+    }
+
+    /// Records the query-local peak after a successful growth operation.
+    fn observe(&self, total: usize) {
+        self.peak_bytes
+            .fetch_max(total, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+impl std::fmt::Display for OracleQueryMemoryView {
+    /// Renders the pool name `DataFusion` reports in exhaustion errors.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("oracle_shared_root")
+    }
+}
+
+impl MemoryPool for OracleQueryMemoryView {
+    /// Returns the stable pool name `DataFusion` attributes reservations to.
+    fn name(&self) -> &'static str {
+        "oracle_shared_root"
+    }
+
+    /// Registers this query's consumer with the shared root unchanged.
+    fn register(&self, consumer: &MemoryConsumer) {
+        self.root.pool.register(consumer);
+    }
+
+    /// Forwards removal; sibling consumers may still hold bytes.
+    fn unregister(&self, consumer: &MemoryConsumer) {
+        self.root.pool.unregister(consumer);
+        if let Ok(mut ledger) = self.lock_ledger()
+            && ledger
+                .consumers
+                .get(&consumer.id())
+                .is_none_or(|charge| charge.total() == 0)
+        {
+            ledger.consumers.remove(&consumer.id());
+        }
+    }
+
+    /// Charges infallible growth to the query, governor, and shared pool.
+    fn grow(&self, reservation: &MemoryReservation, additional: usize) {
+        self.root.grow(self, reservation, additional);
+    }
+
+    /// Returns bytes to the shared pool, the governor, and this query.
+    fn shrink(&self, reservation: &MemoryReservation, shrink: usize) {
+        self.root.shrink(self, reservation, shrink);
+    }
+
+    /// Refuses at this query's ceiling or at the governed process root.
+    fn try_grow(
+        &self,
+        reservation: &MemoryReservation,
+        additional: usize,
+    ) -> datafusion::error::Result<()> {
+        self.root.try_grow(self, reservation, additional)
+    }
+
+    /// Returns every byte this query holds, governed or headroom.
+    fn reserved(&self) -> usize {
+        self.lock_ledger().map_or(0, |ledger| ledger.total)
+    }
+
+    /// Reports the immutable maximum governed allocation for this query.
+    fn memory_limit(&self) -> MemoryLimit {
+        MemoryLimit::Finite(self.ceiling_bytes)
+    }
+}
+
+impl Drop for OracleQueryMemoryView {
+    /// Fails the process closed when a query view is dropped holding bytes.
+    fn drop(&mut self) {
+        let held = self.ledger.lock().map_or(0, |ledger| ledger.total);
+        if held != 0 {
+            self.root
+                .governor
+                .poison("Oracle query memory view dropped while holding bytes");
+        }
+    }
+}
+
+/// Projects a governed-root refusal onto `DataFusion`'s typed exhaustion error.
+fn root_growth_refusal(error: &BifrostResourceError) -> DataFusionError {
+    DataFusionError::ResourcesExhausted(error.to_string())
+}
+
 /// Internal exact Oracle floor/elastic lease shared by the two public shapes.
 #[derive(Debug)]
 struct OracleMemoryLease {
@@ -4462,27 +4967,19 @@ impl OracleQueryResources {
             QueryClass::Interactive => state.oracle_interactive_queries,
             QueryClass::Analytical => state.oracle_analytical_queries,
         };
-        let plan = self.governor.plan();
-        let released_elastic = released_elastic_bytes(
-            state.oracle_memory_used_bytes,
-            plan.oracle_floor_bytes,
-            self.memory_bytes,
-        );
+        // Query memory is released by the shared root as each consumer shrinks,
+        // so this owner returns only what it actually charged: slots, scratch,
+        // and the class counters.
         if state.oracle_active_queries == 0
             || class_count == 0
             || state.oracle_query_slot_units < self.slot_units
-            || state.oracle_query_memory_used_bytes < self.memory_bytes
             || state.oracle_query_scratch_used_bytes < self.scratch_bytes
-            || state.oracle_memory_used_bytes < self.memory_bytes
-            || state.elastic_memory_used_bytes < released_elastic
             || state.scratch_used_bytes < self.scratch_bytes
         {
             return Err(self
                 .governor
                 .poison_locked(&mut state, "Oracle query release underflow"));
         }
-        state.elastic_memory_used_bytes -= released_elastic;
-        state.oracle_memory_used_bytes -= self.memory_bytes;
         state.scratch_used_bytes -= self.scratch_bytes;
         state.oracle_active_queries -= 1;
         match self.query_class {
@@ -4491,7 +4988,6 @@ impl OracleQueryResources {
         }
         self.governor
             .release_oracle_slots(&mut state, self.query_class, self.slot_units)?;
-        state.oracle_query_memory_used_bytes -= self.memory_bytes;
         state.oracle_query_scratch_used_bytes -= self.scratch_bytes;
         state.memory_epoch = state.memory_epoch.wrapping_add(1);
         record_memory_transition("oracle", "released", state.oracle_memory_used_bytes);
@@ -4822,15 +5318,13 @@ pub fn oracle_partitions_for_work(admitted_ceiling: usize, work_units: usize) ->
 /// least as long as this pool can be referenced. A zero limit is normalized to
 /// one byte only for defensive construction; production admission never grants
 /// a zero-byte envelope.
+///
+/// Oracle queries no longer use this: they share one governed root instead.
+/// It remains for the fixtures that still need a standalone finite envelope.
+#[cfg(test)]
 #[must_use]
 pub(crate) fn bounded_memory_pool(limit_bytes: usize) -> Arc<dyn MemoryPool> {
-    let pool = finite_pool(limit_bytes);
-    #[cfg(any(test, feature = "test-support"))]
-    {
-        Arc::new(PeakTrackingMemoryPool::new(pool, None))
-    }
-    #[cfg(not(any(test, feature = "test-support")))]
-    pool
+    finite_pool(limit_bytes)
 }
 
 /// Builds the production finite pool every Bifrost owner allocates from.
@@ -4839,171 +5333,6 @@ fn finite_pool(limit_bytes: usize) -> Arc<dyn MemoryPool> {
         FairSpillPool::new(limit_bytes.max(1)),
         NonZeroUsize::new(16).unwrap_or(NonZeroUsize::MIN),
     ))
-}
-
-/// Builds one admitted query's pool, recording its peak into `peak`.
-///
-/// The pool itself is [`bounded_memory_pool`]'s: admission, fairness, and
-/// spilling behavior are identical. Only a `test-support` build attaches the
-/// observing wrapper, so on a production build `peak` is never written and the
-/// allocation path gains nothing.
-pub(crate) fn observed_query_memory_pool(
-    limit_bytes: usize,
-    peak: &Arc<AtomicUsize>,
-) -> Arc<dyn MemoryPool> {
-    #[cfg(any(test, feature = "test-support"))]
-    {
-        Arc::new(PeakTrackingMemoryPool::new(
-            finite_pool(limit_bytes),
-            Some(Arc::clone(peak)),
-        ))
-    }
-    #[cfg(not(any(test, feature = "test-support")))]
-    {
-        let _ = peak;
-        bounded_memory_pool(limit_bytes)
-    }
-}
-
-#[cfg(any(test, feature = "test-support"))]
-static TEST_MEMORY_PEAK_BYTES: AtomicUsize = AtomicUsize::new(0);
-/// Named reservation peaks observed by production pool callbacks in serialized tests.
-#[cfg(any(test, feature = "test-support"))]
-static TEST_MEMORY_CONSUMER_PEAKS: LazyLock<Mutex<std::collections::BTreeMap<String, usize>>> =
-    LazyLock::new(|| Mutex::new(std::collections::BTreeMap::new()));
-
-/// Resets the process-wide peak observation used by serialized Forge tests.
-///
-/// # Panics
-///
-/// Panics when another test poisoned the shared observation ledger lock.
-#[cfg(feature = "test-support")]
-pub fn reset_memory_peak_for_test() {
-    TEST_MEMORY_PEAK_BYTES.store(0, Ordering::Release);
-    TEST_MEMORY_CONSUMER_PEAKS
-        .lock()
-        .expect("test memory peak ledger lock remains available")
-        .clear();
-}
-
-/// Returns the largest leased-pool reservation observed since the last reset.
-#[cfg(feature = "test-support")]
-#[must_use]
-pub fn memory_peak_for_test() -> usize {
-    TEST_MEMORY_PEAK_BYTES.load(Ordering::Acquire)
-}
-
-/// Returns the largest reservation observed for consumer names containing `fragment`.
-///
-/// # Panics
-///
-/// Panics when another test poisoned the shared observation ledger lock.
-#[cfg(feature = "test-support")]
-#[must_use]
-pub fn memory_consumer_peak_for_test(fragment: &str) -> usize {
-    TEST_MEMORY_CONSUMER_PEAKS
-        .lock()
-        .expect("test memory peak ledger lock remains available")
-        .iter()
-        .filter(|(name, _)| name.contains(fragment))
-        .map(|(_, peak)| *peak)
-        .max()
-        .unwrap_or(0)
-}
-
-/// Test-only wrapper that records peak reservations without changing admission.
-#[cfg(any(test, feature = "test-support"))]
-#[derive(Debug)]
-struct PeakTrackingMemoryPool {
-    /// Production finite pool receiving every accounting operation unchanged.
-    inner: Arc<dyn MemoryPool>,
-    /// Optional pool-local peak, present when one query owns this pool.
-    ///
-    /// The process-global ledger below cannot answer "did *this* query stay
-    /// within *its* grant" once two queries run at once, which is exactly the
-    /// question a contention journey asks.
-    query_peak: Option<Arc<AtomicUsize>>,
-}
-
-#[cfg(any(test, feature = "test-support"))]
-impl PeakTrackingMemoryPool {
-    /// Wraps one production pool for observation only.
-    fn new(inner: Arc<dyn MemoryPool>, query_peak: Option<Arc<AtomicUsize>>) -> Self {
-        Self { inner, query_peak }
-    }
-
-    /// Records the current reservation after a successful growth operation.
-    fn observe(&self, reservation: &MemoryReservation) {
-        let reserved = self.inner.reserved();
-        if let Some(peak) = &self.query_peak {
-            peak.fetch_max(reserved, Ordering::AcqRel);
-        }
-        TEST_MEMORY_PEAK_BYTES.fetch_max(reserved, Ordering::AcqRel);
-        TEST_MEMORY_CONSUMER_PEAKS
-            .lock()
-            .expect("test memory peak ledger lock remains available")
-            .entry(reservation.consumer().name().to_owned())
-            .and_modify(|peak| *peak = (*peak).max(reservation.size()))
-            .or_insert_with(|| reservation.size());
-    }
-}
-
-#[cfg(any(test, feature = "test-support"))]
-impl std::fmt::Display for PeakTrackingMemoryPool {
-    /// Renders the pool name `DataFusion` reports in resource-exhaustion errors.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("peak_tracking")
-    }
-}
-
-#[cfg(any(test, feature = "test-support"))]
-impl MemoryPool for PeakTrackingMemoryPool {
-    /// Returns the stable pool name `DataFusion` attributes reservations to.
-    fn name(&self) -> &'static str {
-        "peak_tracking"
-    }
-
-    /// Delegates consumer registration without changing ordering.
-    fn register(&self, consumer: &MemoryConsumer) {
-        self.inner.register(consumer);
-    }
-
-    /// Delegates consumer removal without changing accounting.
-    fn unregister(&self, consumer: &MemoryConsumer) {
-        self.inner.unregister(consumer);
-    }
-
-    /// Delegates infallible growth and records the resulting peak.
-    fn grow(&self, reservation: &MemoryReservation, additional: usize) {
-        self.inner.grow(reservation, additional);
-        self.observe(reservation);
-    }
-
-    /// Delegates release exactly to the production pool.
-    fn shrink(&self, reservation: &MemoryReservation, shrink: usize) {
-        self.inner.shrink(reservation, shrink);
-    }
-
-    /// Delegates fallible growth and records only successful reservations.
-    fn try_grow(
-        &self,
-        reservation: &MemoryReservation,
-        additional: usize,
-    ) -> datafusion::error::Result<()> {
-        self.inner.try_grow(reservation, additional)?;
-        self.observe(reservation);
-        Ok(())
-    }
-
-    /// Returns the production pool's live reservation.
-    fn reserved(&self) -> usize {
-        self.inner.reserved()
-    }
-
-    /// Returns the production pool's unchanged finite-memory contract.
-    fn memory_limit(&self) -> MemoryLimit {
-        self.inner.memory_limit()
-    }
 }
 
 fn cap_positive(
@@ -5322,6 +5651,223 @@ mod tests {
             charged += ORACLE_PARTITION_WORKING_MEMORY_BYTES;
         }
         held
+    }
+
+    /// Concurrent Oracle queries compete beneath exactly one governed root.
+    ///
+    /// Independent per-query pools let three admitted ceilings sum above the
+    /// memory the pod owns. This admits an Interactive query, an Analytical
+    /// leader, and an Analytical follower whose ceilings do exactly that, then
+    /// grows spillable and non-spillable consumers on all three concurrently.
+    /// Aggregate fallible growth must stop at the shared root, a refused
+    /// reservation must retain nothing, release must restore both the query and
+    /// the process baselines without poisoning, and the next query must be
+    /// admitted on the same healthy owner.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture does not oversubscribe the root, when aggregate
+    /// growth exceeds it, when a refusal retains bytes, when a spilling
+    /// operator fails untyped, or when teardown leaves the process ledger or
+    /// health changed.
+    #[tokio::test]
+    async fn oracle_queries_share_one_governed_memory_root() {
+        // Scratch is deliberately generous: this covers the memory root, and a
+        // scratch refusal would stop the fixture before it ever contends.
+        let roles = BifrostRuntimeResources::composed_for_test(
+            768 * MIB,
+            8 * 1024 * MIB as u64,
+            [BifrostRole::Oracle],
+        );
+        let oracle = roles.oracle().expect("Oracle capability");
+        let baseline = oracle.snapshot().expect("idle baseline");
+        let interactive = oracle
+            .try_acquire_query(interactive_query(0.0))
+            .expect("interactive leader");
+        let analytical = oracle
+            .try_acquire_query(analytical_query(0.0))
+            .expect("analytical leader");
+        let worker = oracle
+            .try_acquire_worker(OracleWorkerClass::Analytical)
+            .expect("analytical follower");
+        let root_limit = oracle.shared_memory_limit();
+        assert!(
+            interactive.granted_memory_bytes
+                + analytical.granted_memory_bytes
+                + worker.granted_memory_bytes()
+                > root_limit,
+            "the fixture must oversubscribe the shared root for this to prove anything"
+        );
+
+        let pools = [
+            interactive.memory_pool(),
+            analytical.memory_pool(),
+            worker.memory_pool(),
+        ];
+        let step = root_limit / 4;
+        let admitted = contend_for_shared_root(&pools, step);
+        assert!(admitted > 0, "the shared root must admit some growth");
+        assert!(
+            admitted <= root_limit,
+            "aggregate fallible growth must stop at the shared root"
+        );
+        assert!(
+            admitted < pools.len() * 3 * step,
+            "the root must have refused growth the independent ceilings would have allowed"
+        );
+
+        // A real spilling operator meets the same root. Pinning the whole root
+        // through one query leaves the sort no memory, and a query that also
+        // has no scratch cannot spill its runs, so it must fail typed rather
+        // than exceed the pod.
+        let pin = MemoryConsumer::new("shared-root-pin").register(&pools[1]);
+        pin.grow(root_limit);
+        assert_eq!(oracle.shared_memory_reserved(), root_limit);
+        let failure = sort_over_pool(&pools[0])
+            .await
+            .expect_err("a sort with neither memory nor scratch cannot succeed");
+        assert!(
+            matches!(failure.find_root(), DataFusionError::ResourcesExhausted(_)),
+            "exhaustion must surface as the typed DataFusion resource error, got {failure:?}"
+        );
+        assert_eq!(pin.free(), root_limit);
+        assert_eq!(
+            oracle.shared_memory_reserved(),
+            0,
+            "every released byte returns to the shared root"
+        );
+        assert_eq!(
+            oracle
+                .snapshot()
+                .expect("post-growth snapshot")
+                .oracle_query_memory_used_bytes,
+            0,
+            "release restores the query baseline"
+        );
+        assert!(oracle.health().reason().is_none());
+
+        drop((interactive, analytical, worker));
+        assert_eq!(
+            oracle.snapshot().expect("released snapshot"),
+            baseline,
+            "release restores the process baseline exactly"
+        );
+        drop(
+            oracle
+                .try_acquire_query(interactive_query(0.0))
+                .expect("the next query is admitted on the same healthy owner"),
+        );
+    }
+
+    /// Grows every supplied query pool concurrently and reports what stuck.
+    ///
+    /// Each pool registers one consumer, alternating spillable and
+    /// non-spillable, and attempts three `step` growths once every thread is
+    /// contending. Returns the aggregate bytes the shared root actually
+    /// admitted, after every consumer has released again.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a refused reservation retains bytes, when release does not
+    /// return exactly what was granted, or when a grower thread panics.
+    fn contend_for_shared_root(pools: &[Arc<dyn MemoryPool>], step: usize) -> usize {
+        // Both barriers are load-bearing: the first makes the three growers
+        // contend, the second holds every accepted byte until all of them have
+        // finished, so the sum below really is the aggregate peak.
+        let barrier = Arc::new(std::sync::Barrier::new(pools.len()));
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = pools
+                .iter()
+                .enumerate()
+                .map(|(index, pool)| {
+                    let barrier = Arc::clone(&barrier);
+                    scope.spawn(move || {
+                        let reservation = MemoryConsumer::new(format!("shared-root-{index}"))
+                            .with_can_spill(index % 2 == 0)
+                            .register(pool);
+                        barrier.wait();
+                        let mut granted = 0;
+                        for _ in 0..3 {
+                            if reservation.try_grow(step).is_ok() {
+                                granted += step;
+                            }
+                            assert_eq!(
+                                reservation.size(),
+                                granted,
+                                "a refused reservation must retain no bytes"
+                            );
+                        }
+                        barrier.wait();
+                        assert_eq!(reservation.free(), granted);
+                        assert_eq!(reservation.size(), 0);
+                        granted
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("one grower thread"))
+                .sum()
+        })
+    }
+
+    /// Runs one real spilling `SortExec` against the supplied query pool.
+    ///
+    /// The runtime is deliberately scratch-free: with the disk manager disabled
+    /// the sort cannot convert a memory refusal into a spill, so the pool's own
+    /// refusal is what the caller observes.
+    ///
+    /// # Errors
+    ///
+    /// Returns the `DataFusion` error the sort fails with, which is the typed
+    /// resource exhaustion when neither memory nor scratch is available.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture batch, ordering, or runtime cannot be built.
+    async fn sort_over_pool(pool: &Arc<dyn MemoryPool>) -> Result<(), DataFusionError> {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
+        use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+        use datafusion::physical_expr::expressions::Column;
+        use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
+        use datafusion::physical_plan::sorts::sort::SortExec;
+        use datafusion::prelude::{SessionConfig, SessionContext};
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from_iter_values((0..8_192_i64).rev()))],
+        )
+        .expect("the fixture batch matches its own schema");
+        let source = datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
+            &[vec![batch]],
+            schema,
+            None,
+        )
+        .expect("a single-partition memory source accepts one matching batch");
+        let ordering = LexOrdering::new(vec![PhysicalSortExpr::new(
+            Arc::new(Column::new("value", 0)),
+            arrow::compute::SortOptions::default(),
+        )])
+        .expect("a one-column ordering is non-empty");
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_pool(Arc::clone(pool))
+            .with_disk_manager_builder(
+                DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled),
+            )
+            .build_arc()
+            .expect("a bounded scratch-free runtime is constructible");
+        let context = SessionContext::new_with_config_rt(SessionConfig::new(), runtime).task_ctx();
+        datafusion::physical_plan::collect(Arc::new(SortExec::new(ordering, source)), context)
+            .await
+            .map(|_| ())
     }
 
     /// Builds one exact interactive query quantum for root-ledger tests.
@@ -6197,6 +6743,7 @@ mod tests {
                 oracle_analytical_queries: 0,
                 oracle_query_slot_units: 0,
                 oracle_query_memory_used_bytes: 0,
+                oracle_infallible_bytes: 0,
                 oracle_query_scratch_used_bytes: 0,
                 oracle_query_active: false,
             }
@@ -6464,12 +7011,24 @@ mod tests {
             .try_acquire_query(request)
             .expect("Oracle query lease");
         let occupied = roles.snapshot().expect("the root observes its own lease");
-        // The root's charge is what the request reserved, not the grant the
-        // plan sizes the query's pool at: the grant is a ceiling derived from
-        // the plan's own elastic memory and moves when any other role's budget
-        // does, so equating the two would make this a plan-arithmetic test.
-        assert_eq!(occupied.oracle_memory_used_bytes, request.memory_bytes);
+        // Admission itself reserves no memory: the class quantum is a ceiling
+        // and a partition-planning input, and the root is charged only as this
+        // query's `DataFusion` consumers actually grow.
+        assert_eq!(occupied.oracle_memory_used_bytes, 0);
+        assert_eq!(occupied.oracle_query_slot_units, request.slot_units);
         assert!(lease.granted_memory_bytes >= request.memory_bytes);
+        let child = lease
+            .try_split_memory("root-composition-test", MIB)
+            .expect("one named child of the shared root");
+        assert_eq!(
+            roles
+                .snapshot()
+                .expect("the root observes a live child")
+                .oracle_memory_used_bytes,
+            MIB,
+            "a query child competes beneath the shared process root"
+        );
+        drop(child);
         drop(lease);
         assert_eq!(
             oracle
@@ -6674,7 +7233,18 @@ mod tests {
             .expect("nested scratch child");
         assert_eq!(memory.bytes(), 32 * MIB);
         assert_eq!(scratch.bytes(), 64 * MIB as u64);
-        assert_eq!(oracle.snapshot().expect("nested snapshot"), root_snapshot);
+        // Scratch was reserved at admission, so a scratch child only splits
+        // already-owned bytes. Memory is not reserved at admission, so a memory
+        // child is a real charge against the shared process root.
+        let nested = oracle.snapshot().expect("nested snapshot");
+        assert_eq!(
+            nested.oracle_memory_used_bytes,
+            root_snapshot.oracle_memory_used_bytes + 32 * MIB
+        );
+        assert_eq!(
+            nested.oracle_query_scratch_used_bytes,
+            root_snapshot.oracle_query_scratch_used_bytes
+        );
         drop(memory);
         drop(scratch);
         drop(query);
@@ -6699,9 +7269,8 @@ mod tests {
         let occupied = oracle.snapshot().expect("aggregate snapshot");
         assert_eq!(occupied.oracle_active_queries, 2);
         assert_eq!(
-            occupied.oracle_query_memory_used_bytes,
-            2 * ORACLE_PARTITION_WORKING_MEMORY_BYTES,
-            "two interactive queries charge two slot-unit quanta between them"
+            occupied.oracle_query_memory_used_bytes, 0,
+            "admission reserves no memory; the shared root is charged as consumers grow"
         );
         // Scratch is still reserved at the grant cap because it is consumed disk
         // rather than a ceiling, so scratch — not memory — is the dimension that

@@ -1,7 +1,7 @@
 ---
 id: SPEC-bifrost-forge-oracle-integration
-revision: 4
-status: draft
+revision: 5
+status: approved
 ---
 
 # Integrate Forge compaction into distributed Oracle
@@ -39,12 +39,13 @@ covered by the repository's tier 1-3 tests and journeys.
 
 The source implementation candidate is locked at
 `b35ebb5e76b7a63fc7e9549329a5c90101400002`, based on approved
-`SPEC-forge-task-5-production-closeout` revision 10. A different source commit
-requires a refreshed overlap assessment and explicit approval of this
-specification.
+`SPEC-forge-task-5-production-closeout` revision 10. The merge-source tip is
+`351902b0855c69849a88e7a76c9e596a666f716d`, whose only additional change is
+the candidate-bound `PASS` verdict. A different implementation commit requires
+a refreshed overlap assessment and explicit approval of this specification.
 
 The destination was assessed at
-`5f4d1ea180762299ac20797cfbf9122bca5bc9d7`. The implementation task shall
+`b51eb83619defe14a11813e1e35e8f0fd666f77a`. The implementation task shall
 record the exact clean destination commit used and rerun the overlap inventory
 if that commit changes before integration begins.
 
@@ -204,7 +205,7 @@ still-required Forge end-state delta through the next forward-only migration.
 The source-only `20260910000025_oracle_reader_authority.sql` may be retained
 only after it is reconciled with the destination schema and migration order.
 
-### REQ-008 - Preserve the existing test hierarchy
+### REQ-008 - Preserve the test hierarchy and verify only affected capabilities
 
 The destination's Bifrost test organization, process harness, tier definitions,
 and `mise` lane meanings remain authoritative.
@@ -212,6 +213,18 @@ and `mise` lane meanings remain authoritative.
 Source Forge coverage shall be retained within the existing Forge unit,
 integration, and journey owners. Existing destination Scribe, Oracle, server,
 SDK, MCP, Python, TypeScript, OTLP, and public-query coverage shall remain.
+
+Merge acceptance requires only the focused Bifrost Forge, Oracle, Scribe, and
+Gate test surfaces. It does not require the complete Redux or server integration
+suites, the aggregate Bifrost journey lane, `mise run verify:bifrost`, or
+`mise run gate`.
+
+The known pre-existing Oracle admission failure is outside this merge and is
+tracked by `changes/active/oracle-local-admission`. Its existing failure or
+Forge closeout workaround may remain and does not block this integration. All
+four focused lanes shall still run to completion; any failure not attributable
+to that exact known defect blocks acceptance. This merge shall not alter Oracle
+admission to make the known defect green.
 
 A test may be removed only when it exclusively covers behavior removed under
 this specification and a stronger surviving test proves every still-required
@@ -227,10 +240,11 @@ weakened to make the integration pass.
 | Input | Commit |
 |---|---|
 | Merge base | `24b8349e3eae96a8901ac29aac93acf2a20705ff` |
-| Destination | `5f4d1ea180762299ac20797cfbf9122bca5bc9d7` |
-| Locked Forge source | `b35ebb5e76b7a63fc7e9549329a5c90101400002` |
+| Destination | `b51eb83619defe14a11813e1e35e8f0fd666f77a` |
+| Locked Forge implementation | `b35ebb5e76b7a63fc7e9549329a5c90101400002` |
+| Forge merge-source tip | `351902b0855c69849a88e7a76c9e596a666f716d` |
 
-The source changes 274 files from the merge base, the destination changes 420,
+The source changes 275 files from the merge base, the destination changes 422,
 and 102 files are shared. `git merge-tree --write-tree --name-only --messages`
 predicts 33 textual conflicts. A clean textual merge is therefore not credible
 evidence of semantic correctness for the remaining 69 shared files.
@@ -291,10 +305,8 @@ The 33 conflicts fall into five resolution groups:
 
 The source change packet remains immutable evidence for the locked Forge
 candidate; the integration change records its own evidence under this packet.
-The source worktree currently has an untracked candidate-bound
-`TASK-061-R4-review-04/verdict.md` with a `PASS` verdict for `b35ebb5e7`. It
-must be committed on the source branch before the merge task is written because
-an untracked verdict is not part of the locked merge input.
+The candidate-bound `TASK-061-R4-review-04/verdict.md` is committed at the
+merge-source tip and records `PASS` for `b35ebb5e7`.
 
 ## Constraints
 
@@ -362,33 +374,38 @@ The source Forge unit, integration, recovery, publication, expiration,
 cleanup, reader-safety, and production-journey obligations pass through the
 integrated destination.
 
-### AC-005 - Tier 1 journeys
+### AC-005 - Focused capability verification
 
-The complete existing Bifrost journey lane passes, including the dedicated:
+The dedicated Forge, Scribe, and Oracle journey lanes and the Gate module tests
+run to completion. They pass except for the bounded known Oracle admission
+failure allowed by AC-006.
 
-- Scribe journey lane;
-- Forge journey lane;
-- Oracle journey lane; and
-- server, SDK, MCP, OTLP, Python, and TypeScript lanes.
+No complete Redux, server, aggregate journey, SDK, MCP, OTLP, Python, or
+TypeScript lane is required for this merge.
 
-Journeys exercise their existing production-shaped public paths.
+The selected journeys continue to exercise their existing production-shaped
+public paths.
 
-### AC-006 - Tier 2 integration
+### AC-006 - Known Oracle admission failure is bounded
 
-The complete Bifrost Redux, SQL, and server integration lanes pass on the same
-integrated candidate.
+If the defect surfaces as a selected-test failure, the implementation evidence
+names the exact test and failure signature, demonstrates that it matches the
+pre-merge Oracle admission defect, and links it to
+`changes/active/oracle-local-admission`. Retaining its existing Forge closeout
+workaround is also permitted. Any different or additional failure blocks
+acceptance.
 
-### AC-007 - Tier 3 units
+### AC-007 - Existing coverage is not weakened
 
-The complete Bifrost Rust, Python, and TypeScript unit surfaces pass on the
-same integrated candidate.
+No existing test, assertion, lane, feature selection, timeout, or public path
+is weakened, deleted, or bypassed to accommodate the merge or the known Oracle
+admission failure.
 
-### AC-008 - Complete Bifrost verification
+### AC-008 - Scoped merge verification
 
-`mise run verify:bifrost` passes on the immutable integrated candidate.
-
-Any broader repository gate required by the final changed surface under
-`AGENTS.md` also passes.
+The focused Forge, Oracle, Scribe, and Gate commands in the merge task are the
+required test proof on the immutable integrated candidate. `mise run
+verify:bifrost` and `mise run gate` are explicitly not required.
 
 ### AC-009 - Independent acceptance review
 
@@ -420,27 +437,31 @@ source contracts rather than a selected branch artifact.
 
 ## Open material decisions
 
-Approve revision 4's explicit resolution of the architecture conflict: locked
-Forge revision 10 semantics govern Forge and its reader-protection seam, while
-the assessed destination remains authoritative for Gate, Scribe, Oracle,
-public-query, server-topology, workflow, and test-harness semantics.
+None. The human owner approved revision 5's narrowed verification contract and
+known Oracle admission exception on 2026-09-09.
 
 Any overlap that requires changing approved destination behavior becomes a new
 material decision and requires a draft spec revision before implementation
 continues.
 
-The untracked source review verdict is an operational precondition, not a
-product decision. It must be committed to the locked source branch before
-`$wyrd-plan` writes the merge task.
+The source review-evidence precondition is satisfied by merge-source tip
+`351902b08`.
 
 ## Revision history
 
-- **Revision 4 - 2026-09-09 - draft.** Locks the Forge source candidate at
-  `b35ebb5e7`, records the 274/420-file branch deltas, 102 shared files, and 33
+- **Revision 5 - 2026-09-09 - approved.** Explicitly approved by the human
+  owner. Requires only focused Forge, Oracle, Scribe, and Gate tests; removes
+  the complete Redux, server, aggregate journey, `verify:bifrost`, and
+  repository `gate` requirements; and bounds the known pre-existing Oracle
+  admission failure for later work under `oracle-local-admission`.
+- **Revision 4 - 2026-09-09 - approved.** Explicitly approved by the human
+  owner. Locks the Forge implementation candidate at `b35ebb5e7` and its
+  evidence-only merge-source tip at `351902b08`, records the refreshed
+  275/422-file branch deltas, 102 shared files, and 33
   predicted conflicts, resolves mixed authority by semantic hunk, makes locked
   Forge revision 10 behavior explicit, requires forward-only migration
-  reconciliation, and records the untracked source `PASS` verdict as a
-  pre-task blocker.
+  reconciliation, and records the committed source `PASS` verdict as satisfied
+  pre-task evidence.
 - **Revision 3 - 2026-09-08 - approved.** Reframes the change as branch
   integration, makes `oracle-distributed` authoritative outside Forge,
   requires explicit overlap classification, and makes the complete Bifrost

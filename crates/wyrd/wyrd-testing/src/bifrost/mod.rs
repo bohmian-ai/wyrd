@@ -13,6 +13,8 @@ pub mod process_cluster;
 pub mod query_fixture;
 pub mod scribe_workload;
 pub mod telemetry;
+/// The two Bifrost write doors tests are allowed to use.
+pub mod write;
 
 pub use cluster::{
     BifrostClusterSpec, BifrostNodeSpec, BifrostTopology, ClusterError, ClusterShutdownInspection,
@@ -39,3 +41,4 @@ pub use telemetry::{
     ForgeDiscoveredCandidateTelemetry, ForgeMaintenanceTelemetryReport, ForgeTelemetryFailureClass,
     ForgeTelemetryResource,
 };
+pub use write::{BifrostWriter, RawIngest};

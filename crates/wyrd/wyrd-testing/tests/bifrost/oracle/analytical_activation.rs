@@ -11,9 +11,7 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Int32Array, Int64Array, StringArray};
-use arrow::datatypes::{DataType, Field, Schema};
-use arrow::ipc::writer::StreamWriter;
+use arrow::array::{Int32Array, Int64Array};
 use arrow::record_batch::RecordBatch;
 use futures_util::StreamExt as _;
 use vala_bifrost_redux::oracle::Oracle;
@@ -21,7 +19,7 @@ use vala_bifrost_redux::oracle::QueryIpcDecoder;
 use vala_bifrost_redux::oracle::analytical::{
     AnalyticalCleanupPause, AnalyticalLiveInspection, analytical_cleanup_pause_for_test,
 };
-use vala_sdk::{BifrostGrpcTransport, QueryClient};
+use vala_sdk::QueryClient;
 use wyrd_client::WyrdClient;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::request_id::RequestId;
@@ -74,46 +72,6 @@ fn request(sql: &str) -> BifrostQueryRequest {
     }
 }
 
-/// Sends one Arrow IPC batch carrying a single fixture row.
-///
-/// # Errors
-/// Returns transport/authentication failures or a server refusal of the append.
-async fn ingest_row(
-    client: &WyrdClient,
-    table: &str,
-    id: i64,
-    filter_key: &str,
-) -> Result<(), JourneyError> {
-    BifrostGrpcTransport::connect(client)
-        .await?
-        .insert_batch(table, ipc_row(id, filter_key))
-        .await?;
-    Ok(())
-}
-
-/// Encodes one deterministic `(id, filter_key, unused_payload)` row as Arrow IPC.
-fn ipc_row(id: i64, filter_key: &str) -> Vec<u8> {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int64, false),
-        Field::new("filter_key", DataType::Utf8, false),
-        Field::new("unused_payload", DataType::Utf8, false),
-    ]));
-    let batch = RecordBatch::try_new(
-        Arc::clone(&schema),
-        vec![
-            Arc::new(Int64Array::from(vec![id])),
-            Arc::new(StringArray::from(vec![filter_key])),
-            Arc::new(StringArray::from(vec![unused_payload(id)])),
-        ],
-    )
-    .expect("fixed journey arrays share a length");
-    let mut bytes = Vec::new();
-    let mut writer = StreamWriter::try_new(&mut bytes, schema.as_ref()).expect("valid schema");
-    writer.write(&batch).expect("in-memory IPC write");
-    writer.finish().expect("in-memory IPC finish");
-    bytes
-}
-
 /// Writes and publishes one fixture table on the cluster's ingest node.
 ///
 /// # Errors
@@ -127,11 +85,15 @@ async fn seed_table(cluster: &WyrdTestCluster, prefix: &str) -> Result<String, J
     let tenant = cluster.data_tenant_id();
     let table = unique_table(prefix);
     register_table(ingest, tenant, &table).await?;
-    let writer = client(ingest, &format!("{prefix}-writer")).await?;
-    for id in 0..FIXTURE_ROWS {
-        let group = format!("group_{}", id % FIXTURE_GROUPS);
-        ingest_row(&writer, &format!("vala.bifrost.{table}"), id, &group).await?;
-    }
+    let rows = writer(ingest, &format!("{prefix}-writer")).await?;
+    rows.write(
+        &format!("vala.bifrost.{table}"),
+        &journey_schema(),
+        (0..FIXTURE_ROWS)
+            .map(|id| journey_row(id, &format!("group_{}", id % FIXTURE_GROUPS)))
+            .collect::<Vec<_>>(),
+    )
+    .await?;
     ingest.flush_bifrost().await?;
     cluster.refresh_oracle_snapshots().await?;
     Ok(table)

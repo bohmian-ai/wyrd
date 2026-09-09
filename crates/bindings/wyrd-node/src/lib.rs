@@ -9,11 +9,16 @@ use napi::bindgen_prelude::Buffer;
 use napi_derive::napi;
 use secrecy::SecretString;
 use tokio::sync::Mutex as AsyncMutex;
-use vala_sdk::{BifrostGrpcTransport, QueryClient, QueryResultStream, ValaSdkError};
+use vala_sdk::grpc::BifrostGrpcTransport;
+use vala_sdk::{
+    BifrostIngestSink, ClientScope, QueryClient, QueryResultStream, SinkKind, ValaSdkError,
+    schema_from_json_schema,
+};
 use wyrd_client::WyrdClient;
 use wyrd_client::auth::AuthMiddleware;
 use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::{HttpConfig, HttpTransport, ResolvedCredential};
+use wyrd_queue::QueueConfig;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{BifrostQueryRequest, FreshnessPolicy, VisibilityMode};
@@ -149,25 +154,6 @@ pub struct NativeQueryStep {
     pub error_details_json: Option<String>,
 }
 
-/// Structured result of one public Bifrost ingest acknowledgement.
-#[napi(object)]
-pub struct NativeInsertResult {
-    /// Echo of the durably acknowledged `UUIDv7` batch identity.
-    pub batch_id: Option<Buffer>,
-    /// Stable Wyrd error code when the ingest was rejected.
-    pub error_code: Option<String>,
-    /// HTTP-equivalent status when the ingest was rejected.
-    pub error_status: Option<u32>,
-    /// Stable title when the ingest was rejected.
-    pub error_title: Option<String>,
-    /// Scrubbed detail when the ingest was rejected.
-    pub error_detail: Option<String>,
-    /// Operator remediation when the ingest was rejected.
-    pub error_remediation: Option<String>,
-    /// JSON-safe structured details when the ingest was rejected.
-    pub error_details_json: Option<String>,
-}
-
 /// Structured native result for one live-query lifecycle control.
 #[napi(object)]
 pub struct NativeLifecycleResult {
@@ -217,43 +203,6 @@ impl NativeLifecycleResult {
             error_details_json: error
                 .safe_details()
                 .and_then(|value| serde_json::to_string(&value).ok()),
-        }
-    }
-}
-
-impl NativeInsertResult {
-    /// Build the successful acknowledgement projection.
-    fn success(batch_id: [u8; 16]) -> Self {
-        Self {
-            batch_id: Some(Buffer::from(batch_id.to_vec())),
-            error_code: None,
-            error_status: None,
-            error_title: None,
-            error_detail: None,
-            error_remediation: None,
-            error_details_json: None,
-        }
-    }
-
-    /// Build a stable structured rejection projection.
-    fn failure(error: &wyrd_spec::error::WyrdError) -> Self {
-        let problem = error.as_problem_json();
-        Self {
-            batch_id: None,
-            error_code: Some(error.code().to_owned()),
-            error_status: Some(u32::from(error.status())),
-            error_title: Some(error.title().to_owned()),
-            error_detail: problem
-                .get("detail")
-                .and_then(serde_json::Value::as_str)
-                .map(ToOwned::to_owned),
-            error_remediation: problem
-                .get("remediation")
-                .and_then(serde_json::Value::as_str)
-                .map(ToOwned::to_owned),
-            error_details_json: problem
-                .get("details")
-                .and_then(|value| serde_json::to_string(value).ok()),
         }
     }
 }
@@ -357,8 +306,6 @@ impl NativeQueryStart {
 pub struct NativeBifrostQueryClient {
     /// Rust-owned Oracle query client.
     client: QueryClient,
-    /// Wyrd client retained for the existing authenticated ingest transport.
-    transport_client: WyrdClient,
 }
 
 #[napi]
@@ -396,7 +343,6 @@ impl NativeBifrostQueryClient {
         let client = WyrdClient::from_parts(auth, http, config.grpc);
         Ok(Self {
             client: QueryClient::new(&client),
-            transport_client: client,
         })
     }
 
@@ -647,36 +593,6 @@ impl NativeBifrostQueryClient {
         }
         Ok(Buffer::from(buffer))
     }
-
-    /// Sends one Arrow IPC batch through the existing Bifrost ingest wire.
-    ///
-    /// The Rust client-tier transport owns batch identity, authentication,
-    /// retries, and stable error projection; this napi method only converts the
-    /// JavaScript buffer into the transport's call and projects its result.
-    ///
-    /// # Errors
-    ///
-    /// Returns a structured [`NativeInsertResult`] for Wyrd validation,
-    /// authentication, transport, or server rejection. A napi error is
-    /// returned only when the bridge cannot construct that result.
-    #[napi]
-    pub async fn insert_batch(
-        &self,
-        table: String,
-        ipc: Buffer,
-    ) -> napi::Result<NativeInsertResult> {
-        let transport = match BifrostGrpcTransport::connect(&self.transport_client).await {
-            Ok(transport) => transport,
-            Err(_error) => {
-                let error = grpc_connection_error();
-                return Ok(NativeInsertResult::failure(&error));
-            }
-        };
-        match transport.insert_batch(&table, ipc.as_ref().to_vec()).await {
-            Ok(batch_id) => Ok(NativeInsertResult::success(batch_id.into_bytes())),
-            Err(error) => Ok(NativeInsertResult::failure(&error)),
-        }
-    }
 }
 
 /// `GenAI` filter request as JavaScript sends it.
@@ -720,14 +636,6 @@ fn parse_window_bound(
                 })
         })
         .transpose()
-}
-
-/// Build the stable scrubbed projection for a failed gRPC connection.
-fn grpc_connection_error() -> wyrd_spec::error::WyrdError {
-    wyrd_spec::error::WyrdError::ServiceUnavailable {
-        message: "Bifrost ingest transport is unavailable".to_owned(),
-        details: serde_json::json!({"transport": "grpc"}),
-    }
 }
 
 impl NativeBifrostQueryStream {
@@ -877,6 +785,225 @@ impl NativeBifrostQueryStream {
     }
 }
 
+/// Authenticated native write handle over Vala's pooled producer path.
+///
+/// Mirrors the Python `Bifrost` binding: both are thin conversions over the one
+/// [`vala_sdk::Bifrost`] handle, so the durable batching, backpressure, and
+/// ingest contract have exactly one owner. The handle is shared through an
+/// [`Arc`] so a blocking drain can move it onto a blocking worker without
+/// stalling the Node event loop.
+#[napi]
+pub struct NativeBifrost {
+    /// Rust-owned pooled write handle shared with the observe projection.
+    handle: Arc<vala_sdk::Bifrost>,
+}
+
+/// Connects one authenticated write handle to the configured gRPC ingest plane.
+///
+/// This is a free function rather than a constructor because connecting is
+/// asynchronous and a napi constructor cannot be. The Python binding blocks
+/// inside `__new__` instead; both reach the same handle.
+///
+/// `serverUrl` selects the HTTP authentication plane and `grpcUrl` overrides
+/// the ingest endpoint for split-plane and local test deployments.
+///
+/// # Errors
+///
+/// Returns a napi error for empty configuration, an unresolvable credential, or
+/// a gRPC transport that cannot connect.
+#[napi]
+pub async fn connect_bifrost(
+    mut server_url: String,
+    api_key: String,
+    grpc_url: Option<String>,
+) -> napi::Result<NativeBifrost> {
+    if server_url.trim().is_empty() || api_key.is_empty() {
+        return Err(napi::Error::from_reason(
+            "serverUrl and apiKey must not be empty".to_owned(),
+        ));
+    }
+    let base_url_len = server_url.trim_end_matches('/').len();
+    server_url.truncate(base_url_len);
+    let mut config = ClientConfig {
+        http: HttpConfig {
+            base_url: server_url,
+            ..HttpConfig::default()
+        },
+        api_key: Some(SecretString::from(api_key)),
+        ..ClientConfig::default()
+    };
+    if let Some(grpc_url) = grpc_url.filter(|value| !value.trim().is_empty()) {
+        config.grpc.endpoint = grpc_url;
+    }
+    let scope = ClientScope::from_config(&config).map_err(napi_error)?;
+    let client = WyrdClient::with_config(config).map_err(napi_error)?;
+    let transport = BifrostGrpcTransport::connect(&client)
+        .await
+        .map_err(napi_error)?;
+    Ok(NativeBifrost {
+        handle: Arc::new(vala_sdk::Bifrost::new(
+            scope,
+            Arc::new(BifrostIngestSink::new(Arc::new(transport))),
+            QueueConfig::default(),
+        )),
+    })
+}
+
+#[napi]
+impl NativeBifrost {
+    /// Explicit write path: enqueue one JSON row and propagate backpressure.
+    ///
+    /// Stays synchronous because the producer push is a bounded, non-blocking
+    /// queue operation; only the drain needs a worker thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error for a malformed JSON schema, an unsupported schema
+    /// node, an invalid card reference, or a full or draining producer queue.
+    // justification: napi boundary; a JavaScript string is primitive and cannot
+    // be passed by reference, so the generated binding requires an owned String
+    #[allow(clippy::needless_pass_by_value)]
+    #[napi]
+    pub fn insert(
+        &self,
+        table: String,
+        schema: String,
+        row: String,
+        card_ref: String,
+        run_id: Option<String>,
+    ) -> napi::Result<()> {
+        let inputs = WriteInputs::parse(&schema, &card_ref, run_id)?;
+        self.handle
+            .insert(
+                SinkKind::Record,
+                &table,
+                &inputs.schema,
+                row.into_bytes(),
+                inputs.card_ref,
+                inputs.run_id,
+            )
+            .map_err(napi_error)
+    }
+
+    /// Fire-and-forget observe path: enqueue one row, counting saturation.
+    ///
+    /// Queue saturation is deliberately swallowed and surfaced through
+    /// [`Self::dropped`] rather than raised, so telemetry never fails a caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error only for a malformed JSON schema or card reference,
+    /// which are caller mistakes rather than backpressure.
+    // justification: napi boundary; a JavaScript string is primitive and cannot
+    // be passed by reference, so the generated binding requires an owned String
+    #[allow(clippy::needless_pass_by_value)]
+    #[napi]
+    pub fn record(
+        &self,
+        table: String,
+        schema: String,
+        row: String,
+        card_ref: String,
+        run_id: Option<String>,
+    ) -> napi::Result<()> {
+        let inputs = WriteInputs::parse(&schema, &card_ref, run_id)?;
+        vala_sdk::observe::record(
+            &self.handle,
+            SinkKind::Record,
+            &table,
+            &inputs.schema,
+            row.into_bytes(),
+            inputs.card_ref,
+            inputs.run_id,
+        );
+        Ok(())
+    }
+
+    /// Flush every pooled producer and await each durable acknowledgement.
+    ///
+    /// The native drain blocks, so it runs on a blocking worker; awaiting it
+    /// keeps the Node event loop free. The Python binding releases the GIL for
+    /// the same reason.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error when a batch cannot be sealed or the server refuses
+    /// it, preserving the stable error text at the boundary.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the blocking drain task cannot be joined.
+    #[napi]
+    pub async fn flush(&self) -> napi::Result<()> {
+        let handle = Arc::clone(&self.handle);
+        tokio::task::spawn_blocking(move || handle.flush())
+            .await
+            .expect("bifrost flush task joins")
+            .map_err(napi_error)
+    }
+
+    /// Drain queued rows and stop every producer background task.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error when the terminal drain cannot complete or a
+    /// server acknowledgement reports a write failure.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the blocking drain task cannot be joined.
+    #[napi]
+    pub async fn shutdown(&self) -> napi::Result<()> {
+        let handle = Arc::clone(&self.handle);
+        tokio::task::spawn_blocking(move || handle.shutdown())
+            .await
+            .expect("bifrost shutdown task joins")
+            .map_err(napi_error)
+    }
+
+    /// Rows dropped by the fire-and-forget observe path under backpressure.
+    #[napi(getter)]
+    pub fn dropped(&self) -> i64 {
+        i64::try_from(self.handle.dropped()).unwrap_or(i64::MAX)
+    }
+
+    /// Number of distinct producers currently pooled.
+    #[napi(getter)]
+    pub fn producer_count(&self) -> u32 {
+        u32::try_from(self.handle.producer_count()).unwrap_or(u32::MAX)
+    }
+}
+
+/// The parsed contract values both write paths need before enqueueing a row.
+struct WriteInputs {
+    /// Arrow schema resolved from the caller's JSON Schema document.
+    schema: arrow::datatypes::SchemaRef,
+    /// Card the row is correlated to at the ingest Gate.
+    card_ref: wyrd_spec::reference::CardRef,
+    /// Optional run correlation carried alongside the card.
+    run_id: Option<wyrd_spec::vala::ids::RunId>,
+}
+
+impl WriteInputs {
+    /// Converts the boundary's JSON strings into native contract values.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error when the schema is not JSON, describes an
+    /// unsupported node, or the card reference does not parse.
+    fn parse(schema: &str, card_ref: &str, run_id: Option<String>) -> napi::Result<Self> {
+        let schema_value: serde_json::Value = serde_json::from_str(schema)
+            .map_err(|error| napi::Error::from_reason(format!("invalid JSON schema: {error}")))?;
+        Ok(Self {
+            schema: schema_from_json_schema(&schema_value).map_err(napi_error)?,
+            card_ref: card_ref
+                .parse()
+                .map_err(|error| napi::Error::from_reason(format!("invalid cardRef: {error}")))?,
+            run_id: run_id.map(wyrd_spec::vala::ids::RunId::from_string),
+        })
+    }
+}
+
 /// Parses the native visibility spelling.
 ///
 /// # Errors
@@ -1016,33 +1143,6 @@ mod tests {
                 detail: "query request failed validation".to_owned(),
             },
         )));
-    }
-
-    /// gRPC connection diagnostics never cross the native JavaScript boundary.
-    #[test]
-    fn bifrost_insert_connection_failure_is_stable_and_scrubbed() {
-        let result = NativeInsertResult::failure(&grpc_connection_error());
-
-        assert_eq!(
-            result.error_code.as_deref(),
-            Some("WYRD_SERVER_503_SERVICE_UNAVAILABLE")
-        );
-        assert_eq!(result.error_status, Some(503));
-        assert_eq!(
-            result.error_detail.as_deref(),
-            Some("Bifrost ingest transport is unavailable")
-        );
-        assert_eq!(
-            result.error_details_json.as_deref(),
-            Some(r#"{"transport":"grpc"}"#)
-        );
-        assert!(
-            !result
-                .error_detail
-                .as_deref()
-                .unwrap_or_default()
-                .contains("http")
-        );
     }
 
     /// Failed terminals retain diagnostics and drop their native owner before return.

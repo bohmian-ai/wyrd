@@ -6,7 +6,7 @@ mode: DECOMPOSE
 status: proposed
 spec: SPEC-bifrost-canonical-otel-signals
 spec_revision: 7
-depends_on: [BIFROST-OTEL-T02, BIFROST-OTEL-T03]
+depends_on: [BIFROST-OTEL-T02, BIFROST-OTEL-T03, BIFROST-OTEL-T03A]
 requirements: [REQ-002, REQ-004, REQ-005, REQ-006, REQ-007, REQ-008, REQ-009, REQ-010, REQ-011, REQ-012, REQ-013, REQ-014, REQ-015, REQ-016, REQ-017, REQ-018, REQ-019, REQ-020, REQ-021]
 acceptance: [AC-001, AC-002, AC-003, AC-004, AC-005, AC-006, AC-007, AC-008, AC-009, AC-010, AC-011]
 ---

@@ -53,17 +53,6 @@ impl BifrostTransportConfig {
     }
 }
 
-/// One immutable batch submitted to the unary ingest RPC.
-#[derive(Debug, Clone)]
-pub struct BifrostFrame {
-    /// Logical table FQN.
-    pub table: String,
-    /// UUIDv7 batch identity retained across retries.
-    pub batch_id: [u8; 16],
-    /// Arrow IPC payload for the sealed batch.
-    pub arrow_ipc: Bytes,
-}
-
 /// Authenticated unary gRPC producer for Bifrost batches.
 #[derive(Clone)]
 pub struct BifrostGrpcTransport {
@@ -105,65 +94,6 @@ impl BifrostGrpcTransport {
     #[must_use]
     pub fn config(&self) -> BifrostTransportConfig {
         self.config
-    }
-
-    /// Copies a borrowed external frame into the owned Rust transport boundary.
-    ///
-    /// This is the only ordinary-Rust borrowed-byte copy boundary. Queue-owned
-    /// [`Bytes`] frames bypass it and are sent by reference-counted ownership.
-    ///
-    /// # Errors
-    ///
-    /// Returns a stable payload error when the borrowed frame exceeds the
-    /// accepted Bifrost frame ceiling.
-    pub fn copy_external_frame(&self, frame: &[u8]) -> Result<Bytes, WyrdError> {
-        if frame.len() > MAX_FRAME_BYTES {
-            return Err(WyrdError::PayloadTooLarge {
-                message: format!("bifrost batch exceeds {MAX_FRAME_BYTES} Arrow IPC bytes"),
-                details: serde_json::json!({ "field": "arrow_ipc", "actual_bytes": frame.len(), "limit_bytes": MAX_FRAME_BYTES }),
-            });
-        }
-        Ok(Bytes::copy_from_slice(frame))
-    }
-
-    /// Sends one externally supplied batch through the unary ingest RPC.
-    ///
-    /// External callers cross [`Self::copy_external_frame`] before the internal
-    /// owned-byte path; queue-owned frames use [`IngestTransport`] directly.
-    ///
-    /// The batch identity is minted here rather than supplied. It is the
-    /// server's idempotency key, and the only retries that can observe it are
-    /// the ones [`Self::send_owned_bytes`] performs against this single call,
-    /// which already reuse one identity. Returning it lets a caller correlate
-    /// the durable batch without having to mint a `UUIDv7` of its own.
-    ///
-    /// # Errors
-    ///
-    /// Returns transport, validation, or terminal server errors. A retryable
-    /// call retries its stable identity inside this transport.
-    pub async fn insert_batch(&self, table: &str, arrow_ipc: Vec<u8>) -> Result<Uuid, WyrdError> {
-        let batch_id = Uuid::now_v7();
-        validate_frame(table, arrow_ipc.len())?;
-        let bytes = self.copy_external_frame(&arrow_ipc)?;
-        self.send_owned_bytes(table, batch_id.into_bytes(), bytes)
-            .await?;
-        Ok(batch_id)
-    }
-
-    /// Sends one sealed batch through the unary ingest RPC.
-    pub async fn send_frame(&self, frame: BifrostFrame) -> Result<(), WyrdError> {
-        validate_frame(&frame.table, frame.arrow_ipc.len())?;
-        validate_batch_id(frame.batch_id)?;
-        self.send_owned_bytes(&frame.table, frame.batch_id, frame.arrow_ipc)
-            .await
-    }
-
-    /// Send batches sequentially, preserving each batch identity.
-    pub async fn send_frames(&self, frames: Vec<BifrostFrame>) -> Result<(), WyrdError> {
-        for frame in frames {
-            self.send_frame(frame).await?;
-        }
-        Ok(())
     }
 
     async fn send_once(&self, request: InsertBatchRequest) -> Result<(), AttemptError> {
@@ -351,9 +281,8 @@ fn validate_frame(table: &str, arrow_bytes: usize) -> Result<(), WyrdError> {
 
 /// Refuses a queue-owned frame identity that is not a `UUIDv7`.
 ///
-/// Only [`GrpcBifrostTransport::send_frame`] needs this: its identity is
-/// supplied by the producer that sealed the frame, while
-/// [`GrpcBifrostTransport::insert_batch`] mints its own and cannot be wrong.
+/// The identity is supplied by the producer that sealed the frame, so the
+/// transport verifies it rather than trusting the queue's caller.
 ///
 /// # Errors
 ///
@@ -407,6 +336,8 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use wyrd_queue::{ClientByteBudget, OwnedIpcBytes, QueueConfig};
 
     use secrecy::SecretString;
     use tokio::sync::Mutex;
@@ -483,6 +414,23 @@ mod tests {
         }
     }
 
+    /// Seals one queue-owned batch so the test drives the real transport door.
+    ///
+    /// The transport only accepts a [`SealedBatch`]; minting the identity and
+    /// the byte guard here is what a producer does before it hands the batch to
+    /// the sink.
+    fn sealed_batch(budget: &ClientByteBudget, bytes: Vec<u8>) -> SealedBatch<ClientByteGuard> {
+        let guard = budget
+            .reserve(bytes.len())
+            .expect("test frame fits the budget");
+        SealedBatch {
+            table: "events".to_owned(),
+            batch_id: Uuid::now_v7().into_bytes(),
+            frame: OwnedIpcBytes::new(bytes, guard),
+            rows: 1,
+        }
+    }
+
     #[test]
     fn frame_limit_is_enforced() {
         assert!(validate_frame("events", MAX_FRAME_BYTES).is_ok());
@@ -543,19 +491,25 @@ mod tests {
         )
         .await
         .expect("real test gRPC transport connects");
-        let batch_id = transport
-            .insert_batch("events", vec![1, 2, 3])
+        let budget = ClientByteBudget::new(QueueConfig::MAX_CLIENT_BYTE_LIMIT);
+        let retried = sealed_batch(&budget, vec![1, 2, 3]);
+        let batch_id = retried.batch_id;
+        transport
+            .insert_batch(&retried)
             .await
-            .expect("stable busy retries to concrete ACK")
-            .into_bytes();
+            .expect("stable busy retries to concrete ACK");
         let observed = service.batch_ids.lock().await.clone();
         assert_eq!(observed, vec![batch_id.to_vec(), batch_id.to_vec()]);
 
         let terminal = transport
-            .insert_batch("events", vec![4])
+            .insert_batch(&sealed_batch(&budget, vec![4]))
             .await
             .expect_err("permanent capacity terminalizes without retry");
-        assert_ne!(terminal.code(), "WYRD_VALA_429_INGEST_BUSY");
+        assert_ne!(terminal.error().code(), "WYRD_VALA_429_INGEST_BUSY");
+        assert!(
+            matches!(terminal, SinkError::Terminal(_)),
+            "permanent capacity must not ask the queue to retry: {terminal:?}"
+        );
         assert_eq!(service.attempts.load(Ordering::Acquire), 3);
         server.abort();
 

@@ -2,15 +2,11 @@
 
 use std::sync::Arc;
 
+use crate::bifrost::write::BifrostWriter;
 use crate::server::{WyrdTestServer, WyrdTestServerError};
-use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
-use arrow::ipc::writer::StreamWriter;
-use arrow::record_batch::RecordBatch;
 use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
-use vala_sdk::BifrostGrpcTransport;
-use wyrd_client::WyrdClient;
 use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::{GrpcConfig, HttpConfig};
 
@@ -74,46 +70,43 @@ pub async fn seed_query_fixture(
         .await
         .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
 
-    let batch = RecordBatch::try_new(
-        Arc::clone(&schema),
-        vec![
-            Arc::new(Int64Array::from(vec![1, 2])),
-            Arc::new(StringArray::from(vec!["first", "second"])),
-        ],
+    let writer = BifrostWriter::connect(
+        ClientConfig {
+            grpc: GrpcConfig {
+                endpoint: server
+                    .grpc_url()
+                    .ok_or_else(|| WyrdTestServerError::Start("missing gRPC URL".into()))?,
+                connect_retries: 0,
+                ..GrpcConfig::default()
+            },
+            http: HttpConfig {
+                base_url: server
+                    .base_url()
+                    .ok_or_else(|| WyrdTestServerError::Start("missing HTTP URL".into()))?
+                    .to_owned(),
+                ..HttpConfig::default()
+            },
+            api_key: Some(api_key.clone()),
+            ..ClientConfig::default()
+        },
+        bootstrap
+            .card_ref()
+            .ok_or_else(|| {
+                WyrdTestServerError::Auth("query fixture requires a machine principal".into())
+            })?
+            .clone(),
     )
+    .await
     .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-    let mut ipc = Vec::new();
-    {
-        let mut writer = StreamWriter::try_new(&mut ipc, schema.as_ref())
-            .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-        writer
-            .write(&batch)
-            .and_then(|()| writer.finish())
-            .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-    }
-    let client = WyrdClient::with_config(ClientConfig {
-        grpc: GrpcConfig {
-            endpoint: server
-                .grpc_url()
-                .ok_or_else(|| WyrdTestServerError::Start("missing gRPC URL".into()))?,
-            connect_retries: 0,
-            ..GrpcConfig::default()
-        },
-        http: HttpConfig {
-            base_url: server
-                .base_url()
-                .ok_or_else(|| WyrdTestServerError::Start("missing HTTP URL".into()))?
-                .to_owned(),
-            ..HttpConfig::default()
-        },
-        api_key: Some(api_key.clone()),
-        ..ClientConfig::default()
-    })
-    .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-    BifrostGrpcTransport::connect(&client)
-        .await
-        .map_err(|error| WyrdTestServerError::Start(error.to_string()))?
-        .insert_batch(&table, ipc)
+    writer
+        .write(
+            &table,
+            &schema,
+            [
+                br#"{"id": 1, "value": "first"}"#.to_vec(),
+                br#"{"id": 2, "value": "second"}"#.to_vec(),
+            ],
+        )
         .await
         .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
     server.flush_bifrost().await?;

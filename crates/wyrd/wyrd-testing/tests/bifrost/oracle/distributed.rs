@@ -4,13 +4,9 @@
 //! Module of the `oracle` binary; see `main.rs` for the capability it proves
 //! and `support.rs` for the fixtures it shares.
 
-use arrow::array::{Array, Int64Array, StringArray};
-use arrow::datatypes::{DataType, Field, Schema};
-use arrow::ipc::writer::StreamWriter;
-use arrow::record_batch::RecordBatch;
-use std::sync::Arc;
+use arrow::array::{Array, Int64Array};
 use vala_bifrost_redux::oracle::iceberg_projection_probe;
-use vala_sdk::{BifrostGrpcTransport, QueryClient, ValaSdkError};
+use vala_sdk::{QueryClient, ValaSdkError};
 use wyrd_client::WyrdClient;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{
@@ -93,9 +89,14 @@ async fn prove_selective_predicate_pruning(
     let tenant = cluster.data_tenant_id();
     let table = unique_table("oracle_predicate");
     register_table(ingest_server, tenant, &table).await?;
-    let writer = client(ingest_server, "predicate-writer").await?;
+    let rows = writer(ingest_server, "predicate-writer").await?;
     for (id, value) in [(1_i64, "alpha"), (2_i64, "target"), (3_i64, "zulu")] {
-        ingest_marked(&writer, &format!("vala.bifrost.{table}"), id, value).await?;
+        rows.write(
+            &format!("vala.bifrost.{table}"),
+            &journey_schema(),
+            [journey_row(id, value)],
+        )
+        .await?;
         ingest_server.flush_bifrost().await?;
     }
     cluster.refresh_oracle_snapshots().await?;
@@ -410,49 +411,6 @@ fn bifrost_terminal_code(error: &BifrostError) -> Option<QueryTerminalErrorCode>
     })
 }
 
-/// Send one Arrow IPC batch carrying a single row with an explicit
-/// `filter_key`, used to build multiple statistically distinguishable
-/// published files.
-async fn ingest_marked(
-    client: &WyrdClient,
-    table: &str,
-    id: i64,
-    filter_key: &str,
-) -> Result<(), JourneyError> {
-    BifrostGrpcTransport::connect(client)
-        .await?
-        .insert_batch(table, ipc_marked(id, filter_key))
-        .await?;
-    Ok(())
-}
-
-/// Encode one deterministic `(id, filter_key, unused_payload)` journey row as
-/// one Arrow stream.
-///
-/// `unused_payload` is the wide column no narrow query requests; it exists so
-/// a projection that reaches the physical reader is visible in scanned bytes.
-fn ipc_marked(id: i64, filter_key: &str) -> Vec<u8> {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int64, false),
-        Field::new("filter_key", DataType::Utf8, false),
-        Field::new("unused_payload", DataType::Utf8, false),
-    ]));
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(Int64Array::from(vec![id])),
-            Arc::new(StringArray::from(vec![filter_key])),
-            Arc::new(StringArray::from(vec![unused_payload(id)])),
-        ],
-    )
-    .expect("fixed marked journey arrays share a length");
-    let mut bytes = Vec::new();
-    let mut writer = StreamWriter::try_new(&mut bytes, schema.as_ref()).expect("valid schema");
-    writer.write(&batch).expect("in-memory IPC write");
-    writer.finish().expect("in-memory IPC finish");
-    bytes
-}
-
 const COMPACTED_BATCH_ROWS: i64 = 20;
 
 /// Number of rows written after compaction. These stay in the hot manifest for
@@ -526,11 +484,16 @@ async fn prove_hot_and_compacted_pruning() -> Result<(), JourneyError> {
     let tenant = cluster.data_tenant_id();
     let table = unique_table("oracle_two_tier");
     register_table(ingest_server, tenant, &table).await?;
-    let writer = client(ingest_server, "two-tier-writer").await?;
+    let rows = writer(ingest_server, "two-tier-writer").await?;
     let table_fqn = format!("vala.bifrost.{table}");
 
     for id in 1..=COMPACTED_BATCH_ROWS {
-        ingest_marked(&writer, &table_fqn, id, marker_value(id)).await?;
+        rows.write(
+            &table_fqn,
+            &journey_schema(),
+            [journey_row(id, marker_value(id))],
+        )
+        .await?;
         ingest_server.flush_bifrost().await?;
     }
     compact_sealed_batch(&cluster, tenant, &table, COMPACTED_BATCH_ROWS).await?;
@@ -538,7 +501,12 @@ async fn prove_hot_and_compacted_pruning() -> Result<(), JourneyError> {
 
     for offset in 0..HOT_BATCH_ROWS {
         let id = HOT_BATCH_ID_BASE + offset;
-        ingest_marked(&writer, &table_fqn, id, marker_value(id)).await?;
+        rows.write(
+            &table_fqn,
+            &journey_schema(),
+            [journey_row(id, marker_value(id))],
+        )
+        .await?;
         ingest_server.flush_bifrost().await?;
     }
     cluster.refresh_oracle_snapshots().await?;

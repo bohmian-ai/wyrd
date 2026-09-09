@@ -2,18 +2,13 @@
 
 use std::sync::{Mutex, OnceLock};
 
-use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
-use arrow::ipc::writer::StreamWriter;
-use arrow::record_batch::RecordBatch;
 use pyo3::prelude::*;
 use pyo3::types::PyAny;
 use secrecy::ExposeSecret;
 use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::scribe::tail_rpc::{LocalTailReadTransport, TailReadTransport};
-use vala_sdk::BifrostGrpcTransport;
-use wyrd_client::WyrdClient;
 use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::{GrpcConfig, HttpConfig};
 use wyrd_utils::py::wyrd_error_to_py_err;
@@ -473,43 +468,36 @@ async fn prepare_oracle_query_fixture(
         })
         .await
         .map_err(harness_error)?;
-    let batch = RecordBatch::try_new(
-        std::sync::Arc::clone(&schema),
-        vec![
-            std::sync::Arc::new(Int64Array::from(vec![1, 2])),
-            std::sync::Arc::new(StringArray::from(vec!["first", "second"])),
-        ],
+    let writer = crate::bifrost::write::BifrostWriter::connect(
+        ClientConfig {
+            grpc: GrpcConfig {
+                endpoint: srv.grpc_url().unwrap_or_default(),
+                connect_retries: 0,
+                ..GrpcConfig::default()
+            },
+            http: HttpConfig {
+                base_url: srv.base_url().unwrap_or_default().to_owned(),
+                ..HttpConfig::default()
+            },
+            api_key: Some(api_key.clone()),
+            ..ClientConfig::default()
+        },
+        bootstrap
+            .card_ref()
+            .ok_or_else(|| harness_error("Oracle fixture bootstrap is not a machine principal"))?
+            .clone(),
     )
-    .map_err(harness_error)?;
-    let mut ipc = Vec::new();
-    {
-        let mut writer = StreamWriter::try_new(&mut ipc, schema.as_ref()).map_err(harness_error)?;
-        writer
-            .write(&batch)
-            .and_then(|()| writer.finish())
-            .map_err(harness_error)?;
-    }
-    let client = WyrdClient::with_config(ClientConfig {
-        grpc: GrpcConfig {
-            endpoint: srv.grpc_url().unwrap_or_default(),
-            connect_retries: 0,
-            ..GrpcConfig::default()
-        },
-        http: HttpConfig {
-            base_url: srv.base_url().unwrap_or_default().to_owned(),
-            ..HttpConfig::default()
-        },
-        api_key: Some(api_key.clone()),
-        ..ClientConfig::default()
-    })
-    .map_err(harness_error)?;
-    let transport = BifrostGrpcTransport::connect(&client)
-        .await
-        .map_err(harness_error)?;
-    transport
-        .insert_batch(&table_fqn, ipc)
-        .await
-        .map_err(harness_error)?;
+    .await?;
+    writer
+        .write(
+            &table_fqn,
+            &schema,
+            [
+                br#"{"id": 1, "value": "first"}"#.to_vec(),
+                br#"{"id": 2, "value": "second"}"#.to_vec(),
+            ],
+        )
+        .await?;
     let ingest = srv
         .state()
         .bifrost_ingest()
@@ -547,27 +535,13 @@ async fn prepare_oracle_query_fixture(
             .await
             .map_err(wyrd_spec::error::WyrdError::from)?;
     }
-    let live_batch = RecordBatch::try_new(
-        schema,
-        vec![
-            std::sync::Arc::new(Int64Array::from(vec![3])),
-            std::sync::Arc::new(StringArray::from(vec!["live"])),
-        ],
-    )
-    .map_err(harness_error)?;
-    let mut live_ipc = Vec::new();
-    {
-        let mut writer = StreamWriter::try_new(&mut live_ipc, live_batch.schema().as_ref())
-            .map_err(harness_error)?;
-        writer
-            .write(&live_batch)
-            .and_then(|()| writer.finish())
-            .map_err(harness_error)?;
-    }
-    transport
-        .insert_batch(&table_fqn, live_ipc)
-        .await
-        .map_err(harness_error)?;
+    writer
+        .write(
+            &table_fqn,
+            &schema,
+            [br#"{"id": 3, "value": "live"}"#.to_vec()],
+        )
+        .await?;
     let token = srv
         .exchange_api_key(api_key)
         .await

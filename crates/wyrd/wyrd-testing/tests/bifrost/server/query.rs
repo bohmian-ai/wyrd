@@ -371,25 +371,33 @@ async fn prove_shared_query_surfaces() -> Result<(), ServerJourneyError> {
         .api_key()
         .ok_or("machine bootstrap returned no key")?
         .clone();
-    let writer = wyrd_client::WyrdClient::with_config(wyrd_client::config::ClientConfig {
-        grpc: wyrd_client::transport::GrpcConfig {
-            endpoint: server.grpc_url().ok_or("missing gRPC URL")?,
-            connect_retries: 0,
-            ..wyrd_client::transport::GrpcConfig::default()
+    let writer = wyrd_testing::bifrost::write::BifrostWriter::connect(
+        wyrd_client::config::ClientConfig {
+            grpc: wyrd_client::transport::GrpcConfig {
+                endpoint: server.grpc_url().ok_or("missing gRPC URL")?,
+                connect_retries: 0,
+                ..wyrd_client::transport::GrpcConfig::default()
+            },
+            http: wyrd_client::transport::HttpConfig {
+                base_url: base.clone(),
+                ..wyrd_client::transport::HttpConfig::default()
+            },
+            api_key: Some(api_key.clone()),
+            ..wyrd_client::config::ClientConfig::default()
         },
-        http: wyrd_client::transport::HttpConfig {
-            base_url: base.clone(),
-            ..wyrd_client::transport::HttpConfig::default()
-        },
-        api_key: Some(api_key.clone()),
-        ..wyrd_client::config::ClientConfig::default()
-    })?;
-    let transport = vala_sdk::BifrostGrpcTransport::connect(&writer).await?;
-    for value in FIXTURE_VALUES {
-        transport
-            .insert_batch(&format!("vala.bifrost.{table}"), ipc_value(value))
-            .await?;
-    }
+        bootstrap
+            .card_ref()
+            .ok_or("machine bootstrap returned no Card scope")?
+            .clone(),
+    )
+    .await?;
+    writer
+        .write(
+            &format!("vala.bifrost.{table}"),
+            &value_schema(),
+            FIXTURE_VALUES.map(value_row),
+        )
+        .await?;
     server.flush_bifrost().await?;
     let channel = wyrd_tonic::tonic::transport::Endpoint::from_shared(
         server.grpc_url().ok_or("missing gRPC URL")?,
@@ -420,7 +428,7 @@ async fn prove_shared_query_surfaces() -> Result<(), ServerJourneyError> {
         wyrd_tonic::tonic::Request::new(proto::BifrostQueryRequest::from(request(&sql)));
     authenticated.metadata_mut().insert(
         "x-wyrd-access-token",
-        format!("Bearer {}", writer.auth().bearer().await?.expose()).parse()?,
+        format!("Bearer {}", writer.client().auth().bearer().await?.expose()).parse()?,
     );
     let response = grpc.query(authenticated).await?;
     let deadline_ms: i64 = response
@@ -498,7 +506,7 @@ async fn prove_shared_query_surfaces() -> Result<(), ServerJourneyError> {
     )));
     unknown.metadata_mut().insert(
         "x-wyrd-access-token",
-        format!("Bearer {}", writer.auth().bearer().await?.expose()).parse()?,
+        format!("Bearer {}", writer.client().auth().bearer().await?.expose()).parse()?,
     );
     let refused = grpc
         .query(unknown)
@@ -567,25 +575,17 @@ async fn drain_grpc(
 }
 
 /// Encodes one deterministic `(value)` row as an Arrow IPC stream.
-fn ipc_value(value: i64) -> Vec<u8> {
-    let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(vec![Field::new(
+fn value_schema() -> arrow::datatypes::SchemaRef {
+    std::sync::Arc::new(arrow::datatypes::Schema::new(vec![Field::new(
         "value",
         DataType::Int64,
         false,
-    )]));
-    let batch = arrow::record_batch::RecordBatch::try_new(
-        std::sync::Arc::clone(&schema),
-        vec![std::sync::Arc::new(arrow::array::Int64Array::from(vec![
-            value,
-        ]))],
-    )
-    .expect("one column of one row");
-    let mut bytes = Vec::new();
-    let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut bytes, schema.as_ref())
-        .expect("valid schema");
-    writer.write(&batch).expect("in-memory IPC write");
-    writer.finish().expect("in-memory IPC finish");
-    bytes
+    )]))
+}
+
+/// Encodes one fixture row as the JSON the client write door buffers.
+fn value_row(value: i64) -> Vec<u8> {
+    format!(r#"{{"value": {value}}}"#).into_bytes()
 }
 
 /// Bounded polls the peer-loss phase waits on an Analytical lifecycle change.
@@ -632,28 +632,36 @@ async fn prove_scheduled_analytical_peer_loss() -> Result<(), ServerJourneyError
         .api_key()
         .ok_or("machine bootstrap returned no key")?
         .clone();
-    let writer = wyrd_client::WyrdClient::with_config(wyrd_client::config::ClientConfig {
-        grpc: wyrd_client::transport::GrpcConfig {
-            endpoint: ingest.grpc_url().ok_or("missing gRPC URL")?,
-            connect_retries: 0,
-            ..wyrd_client::transport::GrpcConfig::default()
+    let writer = wyrd_testing::bifrost::write::BifrostWriter::connect(
+        wyrd_client::config::ClientConfig {
+            grpc: wyrd_client::transport::GrpcConfig {
+                endpoint: ingest.grpc_url().ok_or("missing gRPC URL")?,
+                connect_retries: 0,
+                ..wyrd_client::transport::GrpcConfig::default()
+            },
+            http: wyrd_client::transport::HttpConfig {
+                base_url: ingest.base_url().ok_or("missing HTTP URL")?.to_owned(),
+                ..wyrd_client::transport::HttpConfig::default()
+            },
+            api_key: Some(api_key),
+            ..wyrd_client::config::ClientConfig::default()
         },
-        http: wyrd_client::transport::HttpConfig {
-            base_url: ingest.base_url().ok_or("missing HTTP URL")?.to_owned(),
-            ..wyrd_client::transport::HttpConfig::default()
-        },
-        api_key: Some(api_key),
-        ..wyrd_client::config::ClientConfig::default()
-    })?;
-    let transport = vala_sdk::BifrostGrpcTransport::connect(&writer).await?;
+        bootstrap
+            .card_ref()
+            .ok_or("machine bootstrap returned no Card scope")?
+            .clone(),
+    )
+    .await?;
     // Two published objects rather than one: a single-partition leaf is
     // leader-executable, and this phase needs a root the planner distributes.
     for _ in 0..2 {
-        for value in FIXTURE_VALUES {
-            transport
-                .insert_batch(&format!("vala.bifrost.{table}"), ipc_value(value))
-                .await?;
-        }
+        writer
+            .write(
+                &format!("vala.bifrost.{table}"),
+                &value_schema(),
+                FIXTURE_VALUES.map(value_row),
+            )
+            .await?;
         ingest.flush_bifrost().await?;
     }
     cluster.refresh_oracle_snapshots().await?;

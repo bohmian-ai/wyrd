@@ -14,17 +14,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use arrow::array::StringArray;
 use arrow::array::{Array, Int64Array};
-use arrow::datatypes::{DataType, Field, Schema};
-use arrow::ipc::writer::StreamWriter;
-use arrow::record_batch::RecordBatch;
 use chrono::{DateTime, Utc};
 use vala_bifrost_redux::storage::{
     BifrostStorage, BifrostStorageError, CacheEffect, MetadataCacheSnapshot, StorageLifecycle,
     StorageOperation, StorageOperationBarrier, StorageRequestOutcome,
 };
-use vala_sdk::{BifrostGrpcTransport, QueryClient};
+use vala_sdk::QueryClient;
 use wyrd_client::WyrdClient;
 use wyrd_spec::vala::api::{BifrostQueryRequest, FreshnessPolicy, VisibilityMode};
 use wyrd_testing::WyrdTestServer;
@@ -96,17 +92,21 @@ async fn prove_published_governance() -> Result<(), JourneyError> {
     let fqn = format!("vala.bifrost.{table}");
     register_table(server, owner_tenant, &table).await?;
     register_table(server, neighbour_tenant, &table).await?;
-    let owner = client_for_tenant(server, owner_tenant, "published-owner").await?;
-    let neighbour = client_for_tenant(server, neighbour_tenant, "published-neighbour").await?;
+    let owner = writer_for_tenant(server, owner_tenant, "published-owner").await?;
+    let neighbour = writer_for_tenant(server, neighbour_tenant, "published-neighbour").await?;
 
     // 1. Tenant isolation. Two tenants publish under one logical table name;
     //    each public query must return its own rows and only its own rows.
-    ingest_row(&owner, &fqn, 1).await?;
-    ingest_row(&neighbour, &fqn, 2).await?;
+    owner
+        .write(&fqn, &journey_schema(), [journey_row(1, "row-1")])
+        .await?;
+    neighbour
+        .write(&fqn, &journey_schema(), [journey_row(2, "row-2")])
+        .await?;
     server.flush_bifrost().await?;
     cluster.refresh_oracle_snapshots().await?;
-    let owner_rows = query_ids(&owner, &fqn, None).await?;
-    let neighbour_rows = query_ids(&neighbour, &fqn, None).await?;
+    let owner_rows = query_ids(owner.client(), &fqn, None).await?;
+    let neighbour_rows = query_ids(neighbour.client(), &fqn, None).await?;
     assert_eq!(owner_rows, vec![1], "the owning tenant reads only its row");
     assert_eq!(
         neighbour_rows,
@@ -121,7 +121,9 @@ async fn prove_published_governance() -> Result<(), JourneyError> {
     //    phase-1 object before its footer, so the stalled range belongs to the
     //    identity under test and to nothing else.
     let since_phase_one = Utc::now();
-    ingest_row(&owner, &fqn, 3).await?;
+    owner
+        .write(&fqn, &journey_schema(), [journey_row(3, "row-3")])
+        .await?;
     server.flush_bifrost().await?;
     cluster.refresh_oracle_snapshots().await?;
 
@@ -129,7 +131,7 @@ async fn prove_published_governance() -> Result<(), JourneyError> {
     let barrier = StorageOperationBarrier::new(StorageOperation::ReadRange);
     storage.install_operation_barrier_for_test(Arc::clone(&barrier));
     let first = tokio::spawn({
-        let client = owner.clone();
+        let client = owner.client().clone();
         let fqn = fqn.clone();
         async move { query_ids(&client, &fqn, Some(since_phase_one)).await }
     });
@@ -137,7 +139,7 @@ async fn prove_published_governance() -> Result<(), JourneyError> {
         .await
         .map_err(|_| "the first read never reached the storage barrier")?;
     let second = tokio::spawn({
-        let client = owner.clone();
+        let client = owner.client().clone();
         let fqn = fqn.clone();
         async move { query_ids(&client, &fqn, Some(since_phase_one)).await }
     });
@@ -156,7 +158,7 @@ async fn prove_published_governance() -> Result<(), JourneyError> {
     );
     // Repeated once, unstalled: the identity is now resident, so this caller
     // must be served from the cache rather than decode the object again.
-    let repeated = query_ids(&owner, &fqn, Some(since_phase_one)).await?;
+    let repeated = query_ids(owner.client(), &fqn, Some(since_phase_one)).await?;
     assert_eq!(
         repeated, first_rows,
         "a cached read returns the same exact rows as the decode that filled it"
@@ -183,10 +185,12 @@ async fn prove_published_governance() -> Result<(), JourneyError> {
     // 3. Immutable identity miss. A third object is a different identity, so it
     //    must produce its own load rather than a hit on the retained one.
     let before = storage.telemetry_snapshot();
-    ingest_row(&owner, &fqn, 4).await?;
+    owner
+        .write(&fqn, &journey_schema(), [journey_row(4, "row-4")])
+        .await?;
     server.flush_bifrost().await?;
     cluster.refresh_oracle_snapshots().await?;
-    let combined = query_ids(&owner, &fqn, Some(since_phase_one)).await?;
+    let combined = query_ids(owner.client(), &fqn, Some(since_phase_one)).await?;
     assert_eq!(
         combined,
         vec![3, 4],
@@ -209,10 +213,10 @@ async fn prove_published_governance() -> Result<(), JourneyError> {
 
     // 4. Hot to Iceberg authority transition. The same rows must survive the
     //    move to snapshot authority exactly: no duplicate, no omission.
-    let before_promotion = query_ids(&owner, &fqn, None).await?;
+    let before_promotion = query_ids(owner.client(), &fqn, None).await?;
     compact_sealed_batch(&cluster, owner_tenant, &table, 3).await?;
     cluster.refresh_oracle_snapshots().await?;
-    let after_promotion = query_ids(&owner, &fqn, None).await?;
+    let after_promotion = query_ids(owner.client(), &fqn, None).await?;
     assert_eq!(
         after_promotion, before_promotion,
         "promotion changes which leaf serves a row, never which rows exist"
@@ -221,7 +225,9 @@ async fn prove_published_governance() -> Result<(), JourneyError> {
     // 5. Pre-footer pruning. One hot object and one current-snapshot object
     //    both declare bounds disjoint from the queried interval, so both are
     //    excluded before any footer is opened.
-    ingest_row(&owner, &fqn, 5).await?;
+    owner
+        .write(&fqn, &journey_schema(), [journey_row(5, "row-5")])
+        .await?;
     server.flush_bifrost().await?;
     cluster.refresh_oracle_snapshots().await?;
     let (compacted, hot) = file_tier_counts(&cluster, owner_tenant, &table).await?;
@@ -232,8 +238,13 @@ async fn prove_published_governance() -> Result<(), JourneyError> {
     );
     let before = storage.telemetry_snapshot();
     let checkpoint = cluster.telemetry().checkpoint()?;
-    let empty =
-        query_ids_between(&owner, &fqn, "1970-01-01T00:00:00Z", "1970-01-02T00:00:00Z").await?;
+    let empty = query_ids_between(
+        owner.client(),
+        &fqn,
+        "1970-01-01T00:00:00Z",
+        "1970-01-02T00:00:00Z",
+    )
+    .await?;
     assert!(
         empty.is_empty(),
         "an interval no object overlaps returns exactly no rows, got {empty:?}"
@@ -364,15 +375,17 @@ async fn prove_cancelled_read_terminates() -> Result<(), JourneyError> {
     let table = unique_table("oracle_cancelled");
     let fqn = format!("vala.bifrost.{table}");
     register_table(&server, tenant, &table).await?;
-    let reader = client(&server, "cancelled-reader").await?;
-    ingest_row(&reader, &fqn, 1).await?;
+    let reader = writer(&server, "cancelled-reader").await?;
+    reader
+        .write(&fqn, &journey_schema(), [journey_row(1, "row-1")])
+        .await?;
     server.flush_bifrost().await?;
 
     let barrier = StorageOperationBarrier::new(StorageOperation::ReadRange);
     storage.install_operation_barrier_for_test(Arc::clone(&barrier));
     let before_cancellation = storage.telemetry_snapshot();
     let stalled = tokio::spawn({
-        let client = reader.clone();
+        let client = reader.client().clone();
         let fqn = fqn.clone();
         async move { query_ids(&client, &fqn, None).await }
     });
@@ -555,41 +568,6 @@ fn pruning_exclusions(
         })
         .map(|sample| sample.value)
         .sum()
-}
-
-/// Sends one deterministic journey row through the public ingest path.
-///
-/// # Errors
-/// Returns the transport error when the batch is refused.
-async fn ingest_row(client: &WyrdClient, table: &str, id: i64) -> Result<(), JourneyError> {
-    BifrostGrpcTransport::connect(client)
-        .await?
-        .insert_batch(table, ipc_row(id))
-        .await?;
-    Ok(())
-}
-
-/// Encodes one `(id, filter_key, unused_payload)` row as an Arrow IPC stream.
-fn ipc_row(id: i64) -> Vec<u8> {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int64, false),
-        Field::new("filter_key", DataType::Utf8, false),
-        Field::new("unused_payload", DataType::Utf8, false),
-    ]));
-    let batch = RecordBatch::try_new(
-        Arc::clone(&schema),
-        vec![
-            Arc::new(Int64Array::from(vec![id])) as arrow::array::ArrayRef,
-            Arc::new(StringArray::from(vec![format!("row-{id}")])),
-            Arc::new(StringArray::from(vec![unused_payload(id)])),
-        ],
-    )
-    .expect("the journey row's arrays share one length");
-    let mut bytes = Vec::new();
-    let mut writer = StreamWriter::try_new(&mut bytes, schema.as_ref()).expect("valid schema");
-    writer.write(&batch).expect("in-memory IPC write");
-    writer.finish().expect("in-memory IPC finish");
-    bytes
 }
 
 /// Reads one table's `id` column, optionally floored on event time.

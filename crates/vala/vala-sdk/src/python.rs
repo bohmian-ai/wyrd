@@ -181,22 +181,15 @@ impl Bifrost {
 pub struct PyBifrostQueryClient {
     /// Rust owner sharing one authenticated HTTP connection pool.
     client: QueryClient,
-    /// The same authenticated client, retained for the Bifrost ingest wire.
-    ///
-    /// A canonical Arrow insert is a write on the gRPC transport rather than a
-    /// query, so this class keeps the client the transport connects from
-    /// instead of standing up a second authenticated owner.
-    transport_client: WyrdClient,
 }
 
 #[pymethods]
 impl PyBifrostQueryClient {
     /// Constructs a token-authenticated query client without performing IO.
     ///
-    /// `server_url` selects the HTTP plane explicitly. Everything else — the
-    /// gRPC endpoint a canonical Arrow insert writes to included — comes from
-    /// [`ClientConfig::from_env`], the same owner the Python write handle uses,
-    /// so `WYRD_GRPC_URL` reaches a split-plane or remote deployment instead of
+    /// `server_url` selects the HTTP plane explicitly; everything else comes
+    /// from [`ClientConfig::from_env`], the same owner the Python write handle
+    /// uses, so a split-plane or remote deployment is reachable instead of
     /// silently staying on the default localhost port.
     ///
     /// # Errors
@@ -224,7 +217,6 @@ impl PyBifrostQueryClient {
         let client = WyrdClient::from_parts(auth, http, config.grpc);
         Ok(Self {
             client: QueryClient::new(&client),
-            transport_client: client,
         })
     }
 
@@ -412,41 +404,6 @@ impl PyBifrostQueryClient {
                 .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
         }
         Ok(buffer)
-    }
-
-    /// Sends one Arrow IPC batch through the existing Bifrost ingest wire.
-    ///
-    /// This is the direct canonical write path: the caller already built a
-    /// batch on the described physical schema, so the bytes travel as-is rather
-    /// than through the buffered JSON row API, which would rebuild a schema of
-    /// its own. The transport mints the durable batch identity and returns it,
-    /// so no caller has to construct a `UUIDv7`.
-    ///
-    /// # Errors
-    ///
-    /// Raises a typed Bifrost query error when the transport cannot connect or
-    /// the server rejects the frame.
-    #[pyo3(signature = (table, arrow_ipc))]
-    fn insert_batch(&self, py: Python<'_>, table: &str, arrow_ipc: Vec<u8>) -> PyResult<Vec<u8>> {
-        let batch_id = py
-            .detach(|| {
-                wyrd_runtime::runtime().block_on(async {
-                    let transport = BifrostGrpcTransport::connect(&self.transport_client)
-                        .await
-                        .map_err(|_| {
-                            ValaSdkError::Transport(WyrdError::ServiceUnavailable {
-                                message: "Bifrost ingest transport is unavailable".to_owned(),
-                                details: serde_json::json!({"transport": "grpc"}),
-                            })
-                        })?;
-                    transport
-                        .insert_batch(table, arrow_ipc)
-                        .await
-                        .map_err(ValaSdkError::Transport)
-                })
-            })
-            .map_err(query_error_to_py)?;
-        Ok(batch_id.into_bytes().to_vec())
     }
 }
 

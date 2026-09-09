@@ -17,10 +17,7 @@ use thiserror::Error;
 use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::scribe::admission::{AdmissionConfig, EventTimeWindow};
-use vala_sdk::{
-    BifrostFrame, BifrostGrpcTransport, CollectedQueryLimits, CollectedQueryResult, QueryClient,
-    ValaSdkError,
-};
+use vala_sdk::{CollectedQueryLimits, CollectedQueryResult, QueryClient, ValaSdkError};
 use wyrd_client::WyrdClient;
 use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::{GrpcConfig, HttpConfig};
@@ -636,7 +633,7 @@ async fn exercise_query_cancellation(
 ) -> Result<crate::server::BifrostQueryResourceSnapshot, ClusterLoadError> {
     let lifecycle_observer = vala_bifrost_redux::oracle::query_lifecycle_observer_for_test();
     let lifecycle_target = lifecycle_observer.cancelled().saturating_add(1);
-    let writer = BifrostGrpcTransport::connect(client)
+    let writer = crate::bifrost::write::RawIngest::connect(client)
         .await
         .map_err(|error| ClusterLoadError::Client(error.to_string()))?;
     let write_payload = ipc_payload(server.data_tenant_id(), 0, u32::MAX, 64)?;
@@ -650,11 +647,11 @@ async fn exercise_query_cancellation(
         .map_err(|error| ClusterLoadError::Client(error.to_string()))?;
     let write_task = tokio::spawn(async move {
         writer
-            .send_frame(BifrostFrame {
-                table: write_table,
-                batch_id: deterministic_batch_id(0xCA11_CE11, 0, u32::MAX),
-                arrow_ipc: write_payload.into(),
-            })
+            .insert(
+                &write_table,
+                uuid::Uuid::from_bytes(deterministic_batch_id(0xCA11_CE11, 0, u32::MAX)),
+                write_payload,
+            )
             .await
     });
     write_stall.wait_entered().await;
@@ -869,7 +866,7 @@ async fn run_public_matrix(
                     public_client(writer, tenant, &format!("load-writer-{tenant_index}")).await?;
                 let reader_client =
                     public_client(reader, tenant, &format!("load-reader-{tenant_index}")).await?;
-                let writer_transport = BifrostGrpcTransport::connect(&writer_client)
+                let writer_transport = crate::bifrost::write::RawIngest::connect(&writer_client)
                     .await
                     .map_err(|error| ClusterLoadError::Client(error.to_string()))?;
                 let query = QueryClient::new(&reader_client);
@@ -1598,7 +1595,7 @@ struct TenantRunContext {
     /// Fully qualified public table name.
     table: String,
     /// Public ingest transport bound to the tenant's writer server.
-    writer: BifrostGrpcTransport,
+    writer: crate::bifrost::write::RawIngest,
     /// Public query client bound to the tenant's reader server.
     query: QueryClient,
     /// Phase barriers shared by every tenant task in this run.
@@ -1869,11 +1866,11 @@ async fn run_tenant(context: TenantRunContext) -> Result<TenantLoadResult, Clust
     for batch in 0..profile.warmup_batches_per_tenant {
         let payload = ipc_payload(tenant, tenant_index, batch, profile.rows_per_batch)?;
         writer
-            .send_frame(BifrostFrame {
-                table: table.clone(),
-                batch_id: deterministic_batch_id(profile.seed, tenant_index, batch),
-                arrow_ipc: payload.clone().into(),
-            })
+            .insert(
+                &table,
+                uuid::Uuid::from_bytes(deterministic_batch_id(profile.seed, tenant_index, batch)),
+                payload.clone(),
+            )
             .await
             .map_err(|error| ClusterLoadError::Client(error.to_string()))?;
         report.warmup_acknowledged_bytes = report
@@ -1897,11 +1894,15 @@ async fn run_tenant(context: TenantRunContext) -> Result<TenantLoadResult, Clust
                 let payload = ipc_payload(tenant, tenant_index, batch + 2, profile.rows_per_batch)?;
                 result.submitted_batches += 1;
                 match writer
-                    .send_frame(BifrostFrame {
-                        table: table.clone(),
-                        batch_id: deterministic_batch_id(profile.seed, tenant_index, batch + 2),
-                        arrow_ipc: payload.clone().into(),
-                    })
+                    .insert(
+                        &table,
+                        uuid::Uuid::from_bytes(deterministic_batch_id(
+                            profile.seed,
+                            tenant_index,
+                            batch + 2,
+                        )),
+                        payload.clone(),
+                    )
                     .await
                 {
                     Ok(()) => {

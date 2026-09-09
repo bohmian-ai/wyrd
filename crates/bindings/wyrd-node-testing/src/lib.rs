@@ -24,6 +24,10 @@ pub struct NativeWyrdTestServer {
     token: String,
     /// Registered table reached by the public query journey.
     table_fqn: String,
+    /// API key of the bootstrapped writer principal, for the write journey.
+    api_key: String,
+    /// Card the writer principal is scoped to, which its rows correlate to.
+    card_ref: String,
 }
 
 #[napi]
@@ -50,6 +54,25 @@ impl NativeWyrdTestServer {
     #[napi(getter)]
     pub fn table_fqn(&self) -> String {
         self.table_fqn.clone()
+    }
+
+    /// Returns the writer principal's API key, which `Bifrost` authenticates with.
+    ///
+    /// The query journeys exchange this for a bearer through
+    /// [`Self::token`]; the write journey needs the key itself because the
+    /// write handle resolves its own credential.
+    #[napi(getter)]
+    pub fn api_key(&self) -> String {
+        self.api_key.clone()
+    }
+
+    /// Returns the Card the writer principal is scoped to.
+    ///
+    /// Every row written with [`Self::api_key`] must correlate to this Card, so
+    /// the harness publishes it rather than making each test restate it.
+    #[napi(getter)]
+    pub fn card_ref(&self) -> String {
+        self.card_ref.clone()
     }
 
     /// Seed rows through the real gRPC ingest and Scribe flush paths.
@@ -102,6 +125,29 @@ impl NativeWyrdTestServer {
             .ok_or_else(|| napi::Error::from_reason("test server is shut down".to_owned()))?;
         wyrd_runtime::runtime()
             .block_on(server.seed_bifrost_rows(table, rows))
+            .map_err(|error| napi::Error::from_reason(error.to_string()))
+    }
+
+    /// Flush Scribe so rows written through the public SDK become queryable.
+    ///
+    /// A client `flush` only proves the server accepted the batch; the rows
+    /// reach a readable source after Scribe drains, which a test must wait for
+    /// rather than sleep on.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error when the harness is closed or the flush fails.
+    #[napi]
+    pub fn flush_bifrost(&self) -> napi::Result<()> {
+        let guard = self
+            .server
+            .lock()
+            .map_err(|_| napi::Error::from_reason("test server lock poisoned".to_owned()))?;
+        let server = guard
+            .as_ref()
+            .ok_or_else(|| napi::Error::from_reason("test server is shut down".to_owned()))?;
+        wyrd_runtime::runtime()
+            .block_on(server.flush_bifrost())
             .map_err(|error| napi::Error::from_reason(error.to_string()))
     }
 
@@ -230,6 +276,12 @@ async fn start_test_server_async() -> napi::Result<NativeWyrdTestServer> {
         .bootstrap_service("typescript-oracle-query", &["admin"])
         .await
         .map_err(|error| napi::Error::from_reason(error.to_string()))?;
+    let card_ref = bootstrap
+        .card_ref()
+        .ok_or_else(|| {
+            napi::Error::from_reason("service bootstrap returned a user principal".to_owned())
+        })?
+        .to_string();
     let api_key = match bootstrap {
         Bootstrap::Machine { api_key, .. } => api_key,
         Bootstrap::User { .. } => {
@@ -256,5 +308,7 @@ async fn start_test_server_async() -> napi::Result<NativeWyrdTestServer> {
         grpc_url,
         token,
         table_fqn: format!("vala.bifrost.{table_name}"),
+        api_key: secrecy::ExposeSecret::expose_secret(&api_key).to_owned(),
+        card_ref,
     })
 }

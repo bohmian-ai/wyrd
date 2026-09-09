@@ -6,10 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use arrow::array::Int64Array;
 use arrow::datatypes::{DataType, Field, Schema};
-use arrow::ipc::writer::StreamWriter;
-use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use axum::body::{Body, to_bytes};
 use axum::http::{HeaderValue, Request, Response, StatusCode, header};
@@ -37,7 +34,6 @@ use vala_bifrost_redux::resources::{
 };
 use vala_bifrost_redux::scribe::ScribeImpl;
 use vala_bifrost_redux::scribe::admission::AdmissionConfig;
-use vala_sdk::BifrostGrpcTransport;
 use wyrd_auth::exchange_api_key::{ExchangeApiKey, TokenExchangeSettings};
 use wyrd_auth::issue_api_key::WyrdApiKey;
 use wyrd_auth::permission_resolver::SqlPermissionResolver;
@@ -50,7 +46,6 @@ use wyrd_auth_oidc::JwksCache;
 use wyrd_auth_verify::{
     Kid, TokenPrincipalRef, TokenVerifier, WyrdAuthVerifySettings, public_key_from_pem,
 };
-use wyrd_client::WyrdClient;
 use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::{GrpcConfig, HttpConfig};
 use wyrd_crypt::SecretKey;
@@ -1092,41 +1087,41 @@ impl WyrdTestServer {
             DataType::Int64,
             false,
         )]));
-        let batch = RecordBatch::try_new(
-            std::sync::Arc::clone(&schema),
-            vec![std::sync::Arc::new(Int64Array::from(rows.to_vec()))],
+        let writer = crate::bifrost::write::BifrostWriter::connect(
+            ClientConfig {
+                grpc: GrpcConfig {
+                    endpoint: self
+                        .grpc_url()
+                        .ok_or_else(|| WyrdTestServerError::Start("missing gRPC URL".to_owned()))?,
+                    connect_retries: 0,
+                    ..GrpcConfig::default()
+                },
+                http: HttpConfig {
+                    base_url: self
+                        .base_url()
+                        .ok_or_else(|| WyrdTestServerError::Start("missing HTTP URL".to_owned()))?
+                        .to_owned(),
+                    ..HttpConfig::default()
+                },
+                api_key: Some(api_key),
+                ..ClientConfig::default()
+            },
+            bootstrap
+                .card_ref()
+                .ok_or_else(|| {
+                    WyrdTestServerError::Auth("seed requires a machine principal".to_owned())
+                })?
+                .clone(),
         )
+        .await
         .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-        let mut ipc = Vec::new();
-        let mut writer = StreamWriter::try_new(&mut ipc, schema.as_ref())
-            .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
         writer
-            .write(&batch)
-            .and_then(|()| writer.finish())
-            .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-        let client = WyrdClient::with_config(ClientConfig {
-            grpc: GrpcConfig {
-                endpoint: self
-                    .grpc_url()
-                    .ok_or_else(|| WyrdTestServerError::Start("missing gRPC URL".to_owned()))?,
-                connect_retries: 0,
-                ..GrpcConfig::default()
-            },
-            http: HttpConfig {
-                base_url: self
-                    .base_url()
-                    .ok_or_else(|| WyrdTestServerError::Start("missing HTTP URL".to_owned()))?
-                    .to_owned(),
-                ..HttpConfig::default()
-            },
-            api_key: Some(api_key),
-            ..ClientConfig::default()
-        })
-        .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-        BifrostGrpcTransport::connect(&client)
-            .await
-            .map_err(|error| WyrdTestServerError::Start(error.to_string()))?
-            .insert_batch(table, ipc)
+            .write(
+                table,
+                &schema,
+                rows.iter()
+                    .map(|value| format!(r#"{{"value": {value}}}"#).into_bytes()),
+            )
             .await
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
         self.flush_bifrost().await?;

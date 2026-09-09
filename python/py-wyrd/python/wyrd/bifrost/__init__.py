@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import uuid
 from collections.abc import AsyncIterator
 from datetime import datetime
 from typing import Any, TypedDict
@@ -215,25 +214,6 @@ class BifrostQueryClient:
         if provider is not None:
             request["provider"] = provider
         return await asyncio.to_thread(self._native.query_genai, json.dumps(request))
-
-    async def insert_batch(self, table: str, batch: pyarrow.RecordBatch) -> uuid.UUID:
-        """Send one Arrow batch built on a described schema, returning its durable identity.
-
-        The batch travels as written — this is not the buffered JSON row path
-        and rebuilds no schema. The transport mints the batch identity and
-        retries that one identity itself, so the caller neither supplies nor
-        reconciles it.
-        """
-
-        sink = pyarrow.BufferOutputStream()
-        with pyarrow.ipc.new_stream(sink, batch.schema) as writer:
-            writer.write_batch(batch)
-        acked = await asyncio.to_thread(
-            self._native.insert_batch,
-            table,
-            sink.getvalue().to_pybytes(),
-        )
-        return uuid.UUID(bytes=bytes(acked))
 
 
 class DataTypeSpecVariants(TypedDict, total=False):

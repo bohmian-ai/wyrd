@@ -374,14 +374,10 @@ async fn append_values(client: &WyrdClient, table: &str, batch_id: uuid::Uuid, v
         vec![Arc::new(Int64Array::from(values.to_vec()))],
     )
     .expect("value batch");
-    vala_sdk::grpc::BifrostGrpcTransport::connect(client)
+    wyrd_testing::bifrost::write::RawIngest::connect(client)
         .await
         .expect("public ingest transport connects")
-        .send_frame(vala_sdk::BifrostFrame {
-            table: table.to_owned(),
-            batch_id: batch_id.into_bytes(),
-            arrow_ipc: encode_ipc(&batch).into(),
-        })
+        .insert(table, batch_id, encode_ipc(&batch))
         .await
         .unwrap_or_else(|error| panic!("append to `{table}` must be acknowledged: {error:?}"));
 }

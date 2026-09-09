@@ -112,11 +112,25 @@ For `FIX_REQUIRED`, also write one self-contained remediation task named
 `<task-id>-R<n>-<name>.md` in the same review directory. It must contain:
 
 1. the approved spec path, original task path, and candidate identities;
-2. the material finding IDs and evidence;
-3. the correction outcome;
-4. constraints, preserved behavior, and explicit non-goals;
-5. acceptance criteria proving each finding closed; and
-6. focused and broader verification.
+2. an issue diagnosis for each material finding: the violated obligation,
+   current behavior, exact evidence, observable consequence, and why the
+   candidate or its existing proof falls short;
+3. the intended correction outcome;
+4. a decision-complete recommendation within the approved behavior: select the
+   minimal correction approach, name the existing owner or mechanism to reuse,
+   resolve alternatives that would change scope or proof, and explain why that
+   approach closes the diagnosed gap;
+5. constraints, preserved behavior, and explicit non-goals;
+6. acceptance criteria mapped to every finding; and
+7. focused proof that directly exercises the gap plus broader verification.
+
+Do not write an outcome checklist or merely restate the acceptance matrix. The
+diagnosis and recommendation are the substance of the remediation task;
+acceptance criteria only prove that correction. An implementer must not need to
+rediscover the defect or choose the correction boundary. If that recommendation
+requires a new product, public API, architecture, security, compatibility,
+cross-service, concurrency-semantics, or persistent-data decision, return
+`SPEC_REVISION_REQUIRED` instead.
 
 The remediation task packages validated findings for a fresh implementation
 agent; it is not another design plan. Do not specify helpers, private methods,

@@ -1,6 +1,5 @@
 # AUTO-GENERATED STUB FILE. DO NOT EDIT.
 # pylint: disable=redefined-builtin, invalid-name, dangerous-default-value
-import uuid
 from collections.abc import AsyncIterator
 from datetime import datetime
 from typing import Any, TypedDict
@@ -338,9 +337,6 @@ class BifrostQueryClient:
         provider: str | None = None,
     ) -> GenAiPage:
         """Read one page of GenAI generation records."""
-        ...
-    async def insert_batch(self, table: str, batch: pyarrow.RecordBatch) -> uuid.UUID:
-        """Send one Arrow batch built on a described schema."""
         ...
 
 __all__ = [

@@ -13,7 +13,6 @@ mod pg_tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
-    use arrow::array::{Int64Array, StringArray};
     use arrow::ipc::writer::StreamWriter;
     use arrow::record_batch::RecordBatch;
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -38,6 +37,7 @@ mod pg_tests {
     use wyrd_spec::reference::CardRef;
     use wyrd_spec::request_id::RequestId;
     use wyrd_spec::vala::api::{BifrostQueryRequest, FreshnessPolicy, VisibilityMode};
+    use wyrd_testing::bifrost::write::{BifrostWriter, RawIngest};
     use wyrd_testing::server::WyrdTestServer;
 
     fn schema() -> SchemaRef {
@@ -662,26 +662,6 @@ mod pg_tests {
         }
     }
 
-    fn native_ipc() -> Vec<u8> {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("value", DataType::Utf8, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(Int64Array::from(vec![7, 8])),
-                Arc::new(StringArray::from(vec!["first", "second"])),
-            ],
-        )
-        .expect("valid native SDK batch");
-        let mut bytes = Vec::new();
-        let mut writer = StreamWriter::try_new(&mut bytes, schema.as_ref()).expect("IPC writer");
-        writer.write(&batch).expect("write IPC batch");
-        writer.finish().expect("finish IPC stream");
-        bytes
-    }
-
     /// Real gRPC transport wrapper that records the batch identity at the SDK sink seam.
     ///
     /// The wrapper performs no retry or payload transformation: it forwards the
@@ -783,13 +763,20 @@ mod pg_tests {
             ..ClientConfig::default()
         };
         config.grpc.max_message_bytes = 32 * 1024 * 1024;
-        let client = WyrdClient::with_config(config).expect("public SDK client");
-        BifrostGrpcTransport::connect(&client)
-            .await
-            .expect("connect ingest")
-            .insert_batch(&table_fqn, native_ipc())
+        let writer = BifrostWriter::connect(
+            config,
+            bootstrap
+                .card_ref()
+                .expect("service bootstrap has a Card scope")
+                .clone(),
+        )
+        .await
+        .expect("public SDK write door");
+        writer
+            .write(&table_fqn, &schema(), [row(7), row(8)])
             .await
             .expect("durable ingest ACK");
+        let client = writer.client();
         srv.flush_bifrost().await.expect("flush Scribe");
 
         let request = BifrostQueryRequest {
@@ -798,7 +785,7 @@ mod pg_tests {
             freshness: FreshnessPolicy::Strict,
             deadline_ms: None,
         };
-        let mut stream = QueryClient::new(&client)
+        let mut stream = QueryClient::new(client)
             .query(&request)
             .await
             .expect("Oracle query starts");
@@ -809,32 +796,6 @@ mod pg_tests {
         assert_eq!(rows, 2);
         assert_eq!(stream.terminal().expect("validated terminal").row_count, 2);
         srv.shutdown().await.expect("server shutdown");
-    }
-
-    /// Encodes one native Arrow IPC ingest payload for the multi-batch journey.
-    ///
-    /// Each row's `value` is derived from its `id` so one call describes a whole
-    /// chunk, letting the journey seed more rows than the widest admitted
-    /// `DataFusion` batch size across several requests.
-    fn native_ipc_ids(ids: &[i64]) -> Vec<u8> {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("value", DataType::Utf8, false),
-        ]));
-        let values: Vec<String> = ids.iter().map(|id| format!("row-{id}")).collect();
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![
-                Arc::new(Int64Array::from(ids.to_vec())),
-                Arc::new(StringArray::from(values)),
-            ],
-        )
-        .expect("valid native SDK batch");
-        let mut bytes = Vec::new();
-        let mut writer = StreamWriter::try_new(&mut bytes, schema.as_ref()).expect("IPC writer");
-        writer.write(&batch).expect("write IPC batch");
-        writer.finish().expect("finish IPC stream");
-        bytes
     }
 
     /// A multi-batch query carries one schema and closes with one explicit EOS.
@@ -886,7 +847,16 @@ mod pg_tests {
             ..ClientConfig::default()
         };
         config.grpc.max_message_bytes = 32 * 1024 * 1024;
-        let client = WyrdClient::with_config(config).expect("public SDK client");
+        let writer = BifrostWriter::connect(
+            config,
+            bootstrap
+                .card_ref()
+                .expect("service bootstrap has a Card scope")
+                .clone(),
+        )
+        .await
+        .expect("public SDK write door");
+        let client = writer.client();
         // One ingest larger than the widest admitted DataFusion batch size
         // guarantees the result spans several batches on one shared IPC stream,
         // independent of how many files or partitions the scan happens to use.
@@ -898,10 +868,12 @@ mod pg_tests {
         // server's canonical ingest ceiling; one flush seals them all before the
         // query runs.
         for chunk in ids.chunks(512) {
-            BifrostGrpcTransport::connect(&client)
-                .await
-                .expect("connect ingest")
-                .insert_batch(&table_fqn, native_ipc_ids(chunk))
+            writer
+                .write(
+                    &table_fqn,
+                    &schema(),
+                    chunk.iter().map(|id| row(*id)).collect::<Vec<_>>(),
+                )
                 .await
                 .expect("durable ingest ACK");
             srv.flush_bifrost().await.expect("flush Scribe");
@@ -913,7 +885,7 @@ mod pg_tests {
             freshness: FreshnessPolicy::Strict,
             deadline_ms: None,
         };
-        let mut stream = QueryClient::new(&client)
+        let mut stream = QueryClient::new(client)
             .query(&request)
             .await
             .expect("Oracle query starts");
@@ -1150,11 +1122,14 @@ mod pg_tests {
             .expect("a described row without Card correlation is accepted");
         let ipc = builder.finish_ipc().expect("seal the described batch");
 
-        let transport = BifrostGrpcTransport::connect(&client)
+        RawIngest::connect(&client)
             .await
-            .expect("connect the public SDK transport");
-        transport
-            .insert_batch(&format!("vala.bifrost.{table_name}"), ipc)
+            .expect("connect the public ingest wire")
+            .insert(
+                &format!("vala.bifrost.{table_name}"),
+                uuid::Uuid::now_v7(),
+                ipc,
+            )
             .await
             .expect("the described batch is accepted by the real wire");
         srv.flush_bifrost()
@@ -1253,14 +1228,22 @@ mod pg_tests {
             ..ClientConfig::default()
         };
         config.grpc.connect_retries = 0;
-        let client = WyrdClient::with_config(config).expect("SDK client");
-        let transport = BifrostGrpcTransport::connect(&client)
-            .await
-            .expect("connect public SDK transport");
-        transport
-            .insert_batch(&format!("vala.bifrost.{table_name}"), native_ipc())
-            .await
-            .expect("durable batch ACK");
+        BifrostWriter::connect(
+            config,
+            bootstrap
+                .card_ref()
+                .expect("service bootstrap has a Card scope")
+                .clone(),
+        )
+        .await
+        .expect("public SDK write door")
+        .write(
+            &format!("vala.bifrost.{table_name}"),
+            &schema(),
+            [row(7), row(8)],
+        )
+        .await
+        .expect("durable batch ACK");
 
         srv.flush_bifrost()
             .await

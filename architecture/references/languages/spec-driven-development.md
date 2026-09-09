@@ -159,9 +159,17 @@ Write the acceptance matrix and verdict to
 Review does not trigger another planning cycle. For `FIX_REQUIRED`, the reviewer
 writes one self-contained remediation task beside `verdict.md` in the same
 review directory. It carries the original task and candidate identities,
-validated findings, correction outcome, preserved behavior and non-goals,
-acceptance criteria, and verification. It does not prescribe reversible private
-mechanics.
+an evidence-backed diagnosis of each issue and why the candidate falls short,
+the intended outcome, and a decision-complete recommendation that selects the
+minimal correction boundary and existing mechanism to reuse. It also records
+preserved behavior and non-goals, finding-mapped acceptance criteria, and
+verification that directly exercises the gap. A checklist or restated
+acceptance matrix is not a remediation task: the implementer must not need to
+rediscover the defect or choose among scope-affecting approaches. The task does
+not prescribe reversible private mechanics. If the recommendation needs a new
+product, public API, architecture, security, compatibility, cross-service,
+concurrency-semantics, or persistent-data decision, review returns to
+`$wyrd-spec` instead.
 
 A fresh agent receives the approved spec, original task, verdict, and
 remediation task and executes it with `$wyrd-implement`. Re-review covers the

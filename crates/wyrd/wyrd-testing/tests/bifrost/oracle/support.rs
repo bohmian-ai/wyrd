@@ -38,6 +38,7 @@ use wyrd_spec::vala::api::{
 };
 use wyrd_testing::Bootstrap;
 use wyrd_testing::bifrost::WyrdTestCluster;
+use wyrd_testing::bifrost::write::BifrostWriter;
 
 /// Boxed error carried by every journey helper that can fail.
 pub(crate) type JourneyError = Box<dyn std::error::Error + Send + Sync>;
@@ -122,6 +123,92 @@ pub(crate) async fn client_from_bootstrap(
         ..ClientConfig::default()
     })?)
 }
+/// The three-column user schema every Oracle journey table registers.
+///
+/// `unused_payload` is the wide column no narrow query requests; it exists so
+/// a projection that reaches the physical reader is visible in scanned bytes.
+pub(crate) fn journey_schema() -> arrow::datatypes::SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("filter_key", DataType::Utf8, false),
+        Field::new("unused_payload", DataType::Utf8, false),
+    ]))
+}
+
+/// Encodes one deterministic journey row as the JSON the write door buffers.
+pub(crate) fn journey_row(id: i64, filter_key: &str) -> Vec<u8> {
+    serde_json::json!({
+        "id": id,
+        "filter_key": filter_key,
+        "unused_payload": unused_payload(id),
+    })
+    .to_string()
+    .into_bytes()
+}
+
+/// Build one authenticated write door for the fixture tenant.
+pub(crate) async fn writer(
+    server: &wyrd_testing::WyrdTestServer,
+    name: &str,
+) -> Result<BifrostWriter, JourneyError> {
+    writer_for_tenant(server, server.data_tenant_id(), name).await
+}
+
+/// Build one authenticated write door for an explicit tenant.
+///
+/// The returned handle owns the client the journey also reads with, so the
+/// write and the read provably share one credential.
+pub(crate) async fn writer_for_tenant(
+    server: &wyrd_testing::WyrdTestServer,
+    tenant: DataTenantId,
+    name: &str,
+) -> Result<BifrostWriter, JourneyError> {
+    writer_from_bootstrap(
+        server,
+        server
+            .bootstrap_service_in_tenant(tenant, name, &["admin"])
+            .await?,
+    )
+    .await
+}
+
+/// Build a write door while retaining the bootstrap principal's Card scope.
+///
+/// # Errors
+///
+/// Returns a journey error when the bootstrap is not a machine principal or
+/// the authenticated ingest transport cannot connect.
+pub(crate) async fn writer_from_bootstrap(
+    server: &wyrd_testing::WyrdTestServer,
+    bootstrap: Bootstrap,
+) -> Result<BifrostWriter, JourneyError> {
+    let card_ref = bootstrap
+        .card_ref()
+        .ok_or("machine bootstrap returned no Card scope")?
+        .clone();
+    let Bootstrap::Machine { api_key, .. } = bootstrap else {
+        return Err("machine bootstrap returned user".into());
+    };
+    Ok(BifrostWriter::connect(
+        ClientConfig {
+            grpc: GrpcConfig {
+                endpoint: server.grpc_url().ok_or("missing gRPC URL")?,
+                connect_retries: 0,
+                max_message_bytes: 32 * 1024 * 1024,
+                ..GrpcConfig::default()
+            },
+            http: HttpConfig {
+                base_url: server.base_url().ok_or("missing HTTP URL")?.to_owned(),
+                ..HttpConfig::default()
+            },
+            api_key: Some(api_key),
+            ..ClientConfig::default()
+        },
+        card_ref,
+    )
+    .await?)
+}
+
 /// Persist one foreign-tenant physical row beneath the production provider union.
 ///
 /// The row is well formed in every respect except its tenancy, including the

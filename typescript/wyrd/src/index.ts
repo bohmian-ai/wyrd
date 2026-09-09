@@ -4,7 +4,6 @@ import { createRequire } from "node:module";
 import type {
   NativeBifrostQueryStream,
   NativeGenAiRequest,
-  NativeInsertResult,
   NativeLifecycleResult,
   NativeQueryRequest,
   NativeQueryStep,
@@ -12,8 +11,9 @@ import type {
 
 const require = createRequire(import.meta.url);
 const nativeBinding = require("../index.cjs") as typeof import("../index.cjs");
-const { NativeBifrostQueryClient } = nativeBinding;
+const { NativeBifrostQueryClient, connectBifrost } = nativeBinding;
 type NativeBifrostQueryClient = import("../index.cjs").NativeBifrostQueryClient;
+type NativeBifrost = import("../index.cjs").NativeBifrost;
 
 export type VisibilityMode = "published_only" | "fused";
 export type FreshnessPolicy = "strict" | "allow_degraded";
@@ -23,10 +23,6 @@ export interface BifrostQueryRequest {
   visibility?: VisibilityMode;
   freshness?: FreshnessPolicy;
   deadlineMs?: number;
-}
-
-export interface BifrostInsertAck {
-  readonly batchId: Uint8Array;
 }
 
 /**
@@ -583,25 +579,99 @@ export class BifrostClient {
     };
     return lifecycleValue<GenAiPage>(await this.#native.queryGenai(request));
   }
+}
 
-  async insertBatch(table: string, ipc: Uint8Array): Promise<BifrostInsertAck> {
-    const result: NativeInsertResult = await this.#native.insertBatch(
-      table,
-      Buffer.from(ipc),
+/**
+ * One row's write correlation and payload, as a caller supplies it.
+ *
+ * `schema` is a JSON Schema document describing the row's user columns; it is
+ * the same cross-language contract the Python SDK takes, so the same table can
+ * be written from either language. `row` is the row itself. Both are sent to
+ * the server as JSON text — this SDK stringifies them so a caller never has to.
+ */
+export interface BifrostWrite {
+  table: string;
+  schema: Readonly<Record<string, unknown>>;
+  row: Readonly<Record<string, unknown>>;
+  cardRef: string;
+  runId?: string;
+}
+
+/**
+ * The Bifrost write handle: a pooled producer per table behind one gRPC sink.
+ *
+ * Rows are batched, so a write is durable only once {@link Bifrost.flush} or
+ * {@link Bifrost.shutdown} resolves. `insert` is synchronous because enqueueing
+ * is a bounded, non-blocking operation that propagates queue-full to the
+ * caller; the drains are async because they block on server acknowledgement.
+ */
+export class Bifrost {
+  readonly #native: NativeBifrost;
+
+  private constructor(native: NativeBifrost) {
+    this.#native = native;
+  }
+
+  /**
+   * Connect one authenticated write handle.
+   *
+   * Connecting performs IO, so this is a static factory rather than a
+   * constructor. `grpcUrl` overrides the ingest endpoint for split-plane and
+   * local test deployments.
+   */
+  static async connect(
+    serverUrl: string,
+    apiKey: string,
+    grpcUrl?: string,
+  ): Promise<Bifrost> {
+    return new Bifrost(await connectBifrost(serverUrl, apiKey, grpcUrl));
+  }
+
+  /** Enqueue one row, throwing on a full or draining queue. */
+  insert(write: BifrostWrite): void {
+    this.#native.insert(
+      write.table,
+      JSON.stringify(write.schema),
+      JSON.stringify(write.row),
+      write.cardRef,
+      write.runId,
     );
-    const error = projectedError(result);
-    if (error !== undefined) {
-      throw error;
-    }
-    if (result.batchId === null || result.batchId === undefined) {
-      throw new WyrdError(
-        "WYRD_VALA_502_INGEST_ACK_INCOMPLETE",
-        502,
-        "Bifrost ingest acknowledgement incomplete",
-        "ingest returned without a durable batch acknowledgement",
-      );
-    }
-    return { batchId: new Uint8Array(result.batchId) };
+  }
+
+  /**
+   * Enqueue one row fire-and-forget, counting rather than throwing saturation.
+   *
+   * Use this for telemetry, where losing a row under backpressure is preferable
+   * to failing the caller. Losses are visible through {@link Bifrost.dropped}.
+   */
+  record(write: BifrostWrite): void {
+    this.#native.record(
+      write.table,
+      JSON.stringify(write.schema),
+      JSON.stringify(write.row),
+      write.cardRef,
+      write.runId,
+    );
+  }
+
+  /** Flush every pooled producer and await each durable acknowledgement. */
+  async flush(): Promise<void> {
+    await this.#native.flush();
+  }
+
+  /** Drain every producer and stop its background task. */
+  async shutdown(): Promise<void> {
+    await this.#native.shutdown();
+  }
+
+  /** Rows dropped by {@link Bifrost.record} under backpressure. */
+  get dropped(): number {
+    return this.#native.dropped;
+  }
+
+  /** Number of distinct producers currently pooled. */
+  get producerCount(): number {
+    return this.#native.producerCount;
   }
 }
 

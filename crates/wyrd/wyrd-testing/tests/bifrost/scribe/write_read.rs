@@ -316,8 +316,8 @@ async fn assert_empty_table_reads_cleanly(server: &wyrd_testing::WyrdTestServer)
         &unique_table("empty_query"),
     )
     .await;
-    let client = tenant_client(server, tenant).await;
-    let mut empty = vala_sdk::query::QueryClient::new(&client)
+    let reader = tenant_writer(server, tenant).await;
+    let mut empty = vala_sdk::query::QueryClient::new(reader.client())
         .query(&BifrostQueryRequest {
             sql: format!("SELECT value FROM {table}"),
             visibility: VisibilityMode::Fused,
@@ -360,8 +360,8 @@ async fn scribe_undialable_private_peer_returns_typed_visibility_failure() {
         &unique_table("undialable_peer"),
     )
     .await;
-    let client = tenant_client(&server, tenant).await;
-    append_active_row(&client, &table).await;
+    let writer = tenant_writer(&server, tenant).await;
+    append_active_row(&writer, &table).await;
 
     let cluster = server
         .state()
@@ -424,7 +424,7 @@ async fn scribe_undialable_private_peer_returns_typed_visibility_failure() {
         .await
         .expect("Oracle observes the undialable membership");
 
-    let started = vala_sdk::query::QueryClient::new(&client)
+    let started = vala_sdk::query::QueryClient::new(writer.client())
         .query(&BifrostQueryRequest {
             sql: format!("SELECT value FROM {table}"),
             visibility: VisibilityMode::Fused,
@@ -467,52 +467,48 @@ async fn scribe_undialable_private_peer_returns_typed_visibility_failure() {
 }
 
 /// Builds one public SDK client scoped to the supplied workload tenant.
-async fn tenant_client(
+async fn tenant_writer(
     server: &wyrd_testing::WyrdTestServer,
     tenant: wyrd_spec::DataTenantId,
-) -> wyrd_client::WyrdClient {
+) -> wyrd_testing::bifrost::write::BifrostWriter {
     let bootstrap = server
         .bootstrap_service_in_tenant(tenant, &unique_table("peer_client"), &["admin"])
         .await
         .expect("tenant service bootstrap");
-    let api_key = bootstrap.api_key().expect("service API key");
-    wyrd_client::WyrdClient::with_config(ClientConfig {
-        grpc: GrpcConfig {
-            endpoint: server.grpc_url().expect("bound gRPC URL"),
-            connect_retries: 0,
-            ..GrpcConfig::default()
+    let api_key = bootstrap.api_key().expect("service API key").clone();
+    let card_ref = bootstrap
+        .card_ref()
+        .expect("service bootstrap has a Card scope")
+        .clone();
+    wyrd_testing::bifrost::write::BifrostWriter::connect(
+        ClientConfig {
+            grpc: GrpcConfig {
+                endpoint: server.grpc_url().expect("bound gRPC URL"),
+                connect_retries: 0,
+                ..GrpcConfig::default()
+            },
+            http: HttpConfig {
+                base_url: server.base_url().expect("bound HTTP URL").to_owned(),
+                ..HttpConfig::default()
+            },
+            api_key: Some(api_key),
+            ..ClientConfig::default()
         },
-        http: HttpConfig {
-            base_url: server.base_url().expect("bound HTTP URL").to_owned(),
-            ..HttpConfig::default()
-        },
-        api_key: Some(api_key.clone()),
-        ..ClientConfig::default()
-    })
-    .expect("tenant SDK client")
+        card_ref,
+    )
+    .await
+    .expect("tenant SDK write door")
 }
 
 /// Appends one row without flushing so strict fused visibility requires Scribe.
-async fn append_active_row(client: &wyrd_client::WyrdClient, table: &str) {
+async fn append_active_row(writer: &wyrd_testing::bifrost::write::BifrostWriter, table: &str) {
     let schema = Arc::new(Schema::new(vec![Field::new(
         "value",
         DataType::Int64,
         false,
     )]));
-    let batch = RecordBatch::try_new(
-        Arc::clone(&schema),
-        vec![Arc::new(Int64Array::from(vec![7_i64]))],
-    )
-    .expect("active row batch");
-    let mut ipc = Vec::new();
-    let mut writer =
-        arrow::ipc::writer::StreamWriter::try_new(&mut ipc, schema.as_ref()).expect("IPC writer");
-    writer.write(&batch).expect("IPC batch");
-    writer.finish().expect("IPC terminal");
-    vala_sdk::grpc::BifrostGrpcTransport::connect(client)
-        .await
-        .expect("public ingest transport")
-        .insert_batch(table, ipc)
+    writer
+        .write(table, &schema, [br#"{"value": 7}"#.to_vec()])
         .await
         .expect("active row append");
 }
@@ -811,12 +807,11 @@ async fn append_correlated(
         arrow::ipc::writer::StreamWriter::try_new(&mut ipc, schema.as_ref()).expect("IPC writer");
     writer.write(&batch).expect("IPC batch");
     writer.finish().expect("IPC terminal");
-    vala_sdk::grpc::BifrostGrpcTransport::connect(client)
+    wyrd_testing::bifrost::write::RawIngest::connect(client)
         .await
         .expect("public ingest transport")
-        .insert_batch(table, ipc)
+        .insert(table, uuid::Uuid::now_v7(), ipc)
         .await
-        .map(|_| ())
 }
 
 /// Read every row's value, stamped Card UID, and publishing principal.

@@ -11,6 +11,21 @@ export declare class NativeWyrdTestServer {
   /** Returns the registered table used by the TypeScript Oracle journey. */
   get tableFqn(): string
   /**
+   * Returns the writer principal's API key, which `Bifrost` authenticates with.
+   *
+   * The query journeys exchange this for a bearer through
+   * [`Self::token`]; the write journey needs the key itself because the
+   * write handle resolves its own credential.
+   */
+  get apiKey(): string
+  /**
+   * Returns the Card the writer principal is scoped to.
+   *
+   * Every row written with [`Self::api_key`] must correlate to this Card, so
+   * the harness publishes it rather than making each test restate it.
+   */
+  get cardRef(): string
+  /**
    * Seed rows through the real gRPC ingest and Scribe flush paths.
    *
    * # Errors
@@ -27,6 +42,18 @@ export declare class NativeWyrdTestServer {
    * reads the acknowledged batch.
    */
   waitForBifrostPublication(): void
+  /**
+   * Flush Scribe so rows written through the public SDK become queryable.
+   *
+   * A client `flush` only proves the server accepted the batch; the rows
+   * reach a readable source after Scribe drains, which a test must wait for
+   * rather than sleep on.
+   *
+   * # Errors
+   *
+   * Returns a napi error when the harness is closed or the flush fails.
+   */
+  flushBifrost(): void
   /**
    * Mint an authenticated token without `bifrost_query:read`.
    *

@@ -95,6 +95,7 @@ wyrd-auth-oidc = { workspace = true }
 wyrd-auth-verify = { workspace = true }
 wyrd-crypt = { path = "../../shared/wyrd-crypt", version = "0.0.1" }
 wyrd-client = { workspace = true }
+wyrd-queue = { workspace = true }
 wyrd-dev-fixtures = { workspace = true, features = ["pg"] }
 wyrd-runtime = { workspace = true }
 wyrd-semver = { workspace = true }

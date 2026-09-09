@@ -15,6 +15,7 @@ crate-type = ["cdylib"]
 arrow = { workspace = true }
 napi = { workspace = true }
 napi-derive = { workspace = true }
+secrecy = { workspace = true }
 vala-bifrost-redux = { workspace = true }
 wyrd-runtime = { workspace = true }
 wyrd-testing = { workspace = true }

@@ -4,7 +4,6 @@ import asyncio
 import inspect
 import json
 import threading
-import uuid
 from datetime import datetime, timezone
 
 import pyarrow
@@ -331,64 +330,3 @@ def test_typed_trace_and_genai_client_contracts() -> None:
     assert row["input_messages"] == [{"role": "user", "parts": [1, None]}]
     assert "output_messages" not in row, "an omitted payload stays absent"
     assert "prompt" not in row and "cost_usd" not in row
-
-
-def test_canonical_arrow_insert_uses_described_schema() -> None:
-    described = {
-        "entry": {"namespace": "vala.traces", "name": "spans"},
-        "user_fields": [{"name": "trace_id"}],
-        "correlation_fields": [{"name": "card_ref"}, {"name": "run_id"}],
-        "managed_candidates": [{"name": "wyrd_event_time"}],
-        "physical_layout": {"partition_granularity": "hour"},
-    }
-    schema = pyarrow.schema(
-        [
-            pyarrow.field("trace_id", pyarrow.binary(), nullable=False),
-            pyarrow.field("card_ref", pyarrow.string(), nullable=False),
-            pyarrow.field("run_id", pyarrow.string(), nullable=True),
-        ]
-    )
-    sink = pyarrow.BufferOutputStream()
-    with pyarrow.ipc.new_stream(sink, schema):
-        pass
-    schema_only_ipc = sink.getvalue().to_pybytes()
-    sent: list[tuple[str, bytes, bytes]] = []
-    requested: list[tuple[str, bool]] = []
-
-    class NativeClient:
-        def writable_schema_ipc(self, description_json: str, include_event_time: bool) -> bytes:
-            requested.append((description_json, include_event_time))
-            return schema_only_ipc
-
-        def insert_batch(self, table: str, arrow_ipc: bytes) -> bytes:
-            sent.append((table, ACKED_ID.bytes, arrow_ipc))
-            return ACKED_ID.bytes
-
-    client = object.__new__(BifrostQueryClient)
-    client._native = NativeClient()
-    ACKED_ID = uuid.uuid4()
-
-    async def run() -> tuple[pyarrow.Schema, uuid.UUID]:
-        writable = await client.writable_schema(described)
-        batch = pyarrow.record_batch(
-            [
-                pyarrow.array([b"\x01"], type=pyarrow.binary()),
-                pyarrow.array(["space/Data/spans@1"]),
-                pyarrow.array([None], type=pyarrow.string()),
-            ],
-            schema=writable,
-        )
-        return writable, await client.insert_batch("vala.traces.spans", batch)
-
-    writable, acked = asyncio.run(run())
-
-    assert json.loads(requested[0][0])["user_fields"] == [{"name": "trace_id"}]
-    assert requested[0][1] is False, "a writer supplies event time only when it asks to"
-    assert writable.names == ["trace_id", "card_ref", "run_id"]
-    assert acked == ACKED_ID
-    table, sent_id, ipc = sent[0]
-    assert table == "vala.traces.spans"
-    assert sent_id == ACKED_ID.bytes
-    assert pyarrow.ipc.open_stream(ipc).schema == writable, (
-        "the batch travels on the described schema, not a rebuilt one"
-    )

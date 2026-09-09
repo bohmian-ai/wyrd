@@ -1360,6 +1360,211 @@ redacted
     supervisor.shutdown().await;
 }
 
+/// Unresolved durable authority keeps its owner unready and takes no new work.
+///
+/// A worker that released an attempt it could not account for is still the
+/// durable owner of that task: it is `Running` under this worker's name, its
+/// operation is `Prepared`, and its claim is owned until the lease lapses.
+/// Nothing in memory records that ambiguity, so the only thing that can gate
+/// the loop is the durable row itself. Until that authority is reconciled or
+/// handed on, this worker must not advertise itself and must not take new task
+/// or maintenance authority — otherwise an operator and a routing gateway are
+/// told that a worker whose own publication is unreconciled is fit for more
+/// work.
+///
+/// The gate is stated in exact identities on both sides. The task that goes
+/// unclaimed is named before the window opens, so "took no new authority" is a
+/// fact about that row rather than about a count; and the operations the
+/// release left Prepared are compared before and after, so nothing inside the
+/// window republished or closed them. The window then ends the only way it may:
+/// the claim lapses, the ordinary reclaim hands the authority on, and both
+/// readiness and the demand the gate held back resume.
+///
+/// # Panics
+///
+/// Panics when the released owner stays ready, when it claims the task offered
+/// during the unready window, when the unresolved operations stop being
+/// `Prepared`, or when readiness and queued demand do not resume once the
+/// claim lapses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn released_authority_gates_readiness_and_new_claims() {
+    let mut promoted = PromotedRewriteFixture::start_unpromoted("gated_readiness").await;
+    // The withheld answers have to run out of publication budget inside a
+    // test's patience rather than the production minutes: the release under
+    // test happens exactly when this budget expires with the commits still in
+    // flight.
+    promoted.fixture.config.iceberg_total_retry_timeout = std::time::Duration::from_secs(2);
+    let object_store = CountingObjectStore::new(Arc::clone(&promoted.fixture.staging));
+    let catalog = PromotionCatalogSeam::new(
+        promoted.fixture.catalog.iceberg_catalog(),
+        object_store.read_counter(),
+    );
+    let mut supervisor = SupervisedPromotion::start(
+        &promoted.fixture,
+        Arc::clone(&catalog) as Arc<dyn iceberg::Catalog>,
+        Arc::clone(&object_store) as Arc<dyn ForgeObjectStore>,
+        ForgeClock::system(),
+    );
+    let own_tenant = promoted.fixture.tenant;
+    plan_two_ready_rewrites(&promoted, &mut supervisor).await;
+    // Setup leaves both tables owing a rewrite and neither offered, so each of
+    // the two moments below — the release, and the demand that arrives during
+    // the unready window — is a moment this scenario chose.
+    promoted.fixture.offer_tasks_of(own_tenant, 3_600).await;
+    let ready = ready_small_files_tasks(&promoted, own_tenant).await;
+    assert!(
+        ready.len() >= 2,
+        "the window needs one task to release and one to offer inside it: {ready:?}"
+    );
+    let released_task = ready[0];
+    let blocked_task = ready[1];
+
+    // 1. Every plan of one attempt has its commit answer withheld past the
+    //    publication budget. Every plan, because one that published ordinarily
+    //    would settle the task by the any-success rule, which is the opposite
+    //    of the state under test. The attempt therefore drains with nothing it
+    //    can say about its own operations and is released: Running task,
+    //    Prepared operations, claim owned until its lease lapses.
+    let released_before = supervisor.observer().released_attempts_for_test().len();
+    catalog.stall_next_commit_responses(8);
+    supervisor.restart_worker();
+    supervisor.start_worker();
+    promoted.fixture.offer_task(released_task, 0).await;
+    let released = tokio::time::timeout(ADMISSION_BOUND, async {
+        while supervisor.observer().released_attempts_for_test().len() == released_before {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    assert!(
+        released.is_ok(),
+        "the owner releases the attempt whose answers were lost: {:?} / {:?}",
+        tenant_tasks(&promoted.fixture).await,
+        promoted.fixture.rewrite_operations().await
+    );
+    catalog.stall_next_commit_responses(0);
+
+    // 2. Readiness is retracted from the durable row alone, and the exact
+    //    identities the release left behind are the ones it is retracted for.
+    await_readiness(
+        &supervisor,
+        false,
+        "an owner whose own operations are unreconciled retracts readiness",
+    )
+    .await;
+    let unresolved = prepared_operations(&promoted).await;
+    assert!(
+        !unresolved.is_empty(),
+        "the released attempt left its operations Prepared: {:?}",
+        promoted.fixture.rewrite_operations().await
+    );
+    assert_eq!(
+        task_state(&promoted.fixture, own_tenant, released_task).await,
+        Some("running".to_owned()),
+        "the released task stays Running under its owner: {:?}",
+        tenant_tasks(&promoted.fixture).await
+    );
+
+    // 3. A named task made eligible inside that window is not claimed. Three
+    //    seconds is many turns of the loop's idle interval, so a worker that
+    //    was going to take it has had every opportunity to.
+    promoted.fixture.offer_task(blocked_task, 0).await;
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    assert_eq!(
+        task_state(&promoted.fixture, own_tenant, blocked_task).await,
+        Some("ready".to_owned()),
+        "an unready owner takes no new task authority: {:?}",
+        tenant_tasks(&promoted.fixture).await
+    );
+    assert!(
+        !supervisor.is_ready(),
+        "readiness stays retracted while the operations are unreconciled: {:?}",
+        promoted.fixture.rewrite_operations().await
+    );
+    assert_eq!(
+        prepared_operations(&promoted).await,
+        unresolved,
+        "nothing inside the unready window republished or closed the exact operations"
+    );
+
+    // 4. The claim lapses, the ordinary reclaim hands the task on, and the
+    //    authority this owner could not explain is no longer its own. Readiness
+    //    returns and the demand held back in step 3 progresses.
+    promoted.fixture.expire_claims_of(own_tenant).await;
+    await_readiness(
+        &supervisor,
+        true,
+        "readiness returns once the unresolved authority is handed on",
+    )
+    .await;
+    let progressed = tokio::time::timeout(ADMISSION_BOUND, async {
+        loop {
+            promoted.fixture.clear_task_backoff().await;
+            if task_state(&promoted.fixture, own_tenant, blocked_task).await
+                != Some("ready".to_owned())
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    assert!(
+        progressed.is_ok(),
+        "the demand the gate held back is claimable again: {:?}",
+        tenant_tasks(&promoted.fixture).await
+    );
+    supervisor.stop_worker().await;
+    supervisor.shutdown().await;
+}
+
+/// Lists one tenant's ready small-files task ids, in durable creation order.
+///
+/// A scenario that must offer exactly one task at a time names them, because
+/// offering by tenant releases every unrelated row that tenant owns.
+async fn ready_small_files_tasks(
+    promoted: &PromotedRewriteFixture,
+    tenant: wyrd_spec::ids::DataTenantId,
+) -> Vec<uuid::Uuid> {
+    tasks_of(&promoted.fixture, tenant)
+        .await
+        .into_iter()
+        .filter(|(_, strategy, state, _)| strategy == "small_files" && state == "ready")
+        .map(|(task_id, _, _, _)| task_id)
+        .collect()
+}
+
+/// Returns every operation identity this tenant currently holds Prepared.
+async fn prepared_operations(promoted: &PromotedRewriteFixture) -> BTreeSet<uuid::Uuid> {
+    promoted
+        .fixture
+        .rewrite_operations()
+        .await
+        .into_iter()
+        .filter(|(_, phase)| phase == "prepared")
+        .map(|(id, _)| id)
+        .collect()
+}
+
+/// Polls the production readiness handle until it reports `expected`.
+///
+/// The loop republishes the bit every turn, so a scenario reads the settled
+/// answer rather than whichever turn it happened to sample.
+///
+/// # Panics
+///
+/// Panics with `context` when the bit does not reach `expected` inside
+/// [`ADMISSION_BOUND`].
+async fn await_readiness(supervisor: &SupervisedPromotion, expected: bool, context: &str) {
+    let reached = tokio::time::timeout(ADMISSION_BOUND, async {
+        while supervisor.is_ready() != expected {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(reached.is_ok(), "{context}");
+}
+
 /// Leaves a second tenant owing one ready rewrite on a table only it owns.
 ///
 /// Both tenants are held out of the claim window while it is planned, because

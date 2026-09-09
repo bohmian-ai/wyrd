@@ -1941,6 +1941,15 @@ impl SupervisedPromotion {
         }
     }
 
+    /// Reads the readiness bit this supervisor's worker generations publish.
+    ///
+    /// This is the same handle a server's `/readyz` projects, so a scenario
+    /// about a worker that must not advertise itself observes the production
+    /// signal rather than inferring readiness from what was claimed.
+    pub(crate) fn is_ready(&self) -> bool {
+        self.readiness.is_ready()
+    }
+
     /// Borrows the retained Forge graph so a scenario can drive one production
     /// owner directly instead of through a claimed worker attempt.
     pub(crate) fn forge(&self) -> Arc<Forge> {

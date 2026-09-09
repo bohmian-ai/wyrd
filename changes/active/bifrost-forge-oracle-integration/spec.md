@@ -1,16 +1,18 @@
 ---
 id: SPEC-bifrost-forge-oracle-integration
-revision: 3
-status: approved
+revision: 4
+status: draft
 ---
 
 # Integrate Forge compaction into distributed Oracle
 
 ## Objective
 
-Merge `forge-compaction-refactor` into `oracle-distributed` so the destination
-retains its authoritative Gate, Scribe, Oracle, public-query, server, and test
-architecture while incorporating the source branch's Forge implementation.
+Merge the locked `forge-compaction-refactor` candidate
+`b35ebb5e76b7a63fc7e9549329a5c90101400002` into `oracle-distributed` so the
+destination retains its authoritative Gate, Scribe, Oracle, public-query,
+server, and test architecture while incorporating the source branch's Forge
+implementation and its required reader-protection seams.
 
 This is an integration and reconciliation change. It does not authorize a new
 Oracle, Scribe, Gate, telemetry, testing, or public-contract design.
@@ -35,8 +37,16 @@ covered by the repository's tier 1-3 tests and journeys.
 `oracle-distributed` is the integration destination.
 `forge-compaction-refactor` is the merge source.
 
-The implementation task shall record the exact clean commit used for each
-input before integration begins.
+The source implementation candidate is locked at
+`b35ebb5e76b7a63fc7e9549329a5c90101400002`, based on approved
+`SPEC-forge-task-5-production-closeout` revision 10. A different source commit
+requires a refreshed overlap assessment and explicit approval of this
+specification.
+
+The destination was assessed at
+`5f4d1ea180762299ac20797cfbf9122bca5bc9d7`. The implementation task shall
+record the exact clean destination commit used and rerun the overlap inventory
+if that commit changes before integration begins.
 
 ### REQ-002 - Component authority
 
@@ -56,6 +66,12 @@ Conflict resolution shall use this authority order:
 
 A source-branch change outside Forge is not authoritative merely because it
 exists on the source branch.
+
+Authority applies by semantic hunk, not by whole-file selection. Mixed files
+such as `architecture/bifrost-design.md`, `wyrd-spec::vala::api`, server boot,
+and the Bifrost harness must preserve destination-owned behavior while
+incorporating only the Forge-owned or Forge-required source semantics defined
+by this revision.
 
 ### REQ-003 - Surface overlapping changes
 
@@ -84,6 +100,10 @@ The reconciliation evidence shall identify:
 `DECISION_REQUIRED` stops the affected integration work and returns to
 `$wyrd-spec`. The merge shall not silently select or combine competing
 semantics.
+
+The revision 4 assessment below is the baseline reconciliation evidence. The
+implementation task must refresh it only if either recorded input commit
+changes.
 
 ### REQ-004 - Destination behavior wins outside Forge
 
@@ -114,6 +134,28 @@ architecture, including its required:
 - production instrumentation; and
 - Forge tests and journeys.
 
+The locked Forge behavior specifically includes:
+
+- one process-global Oracle reader-authority context per fenced role epoch,
+  table-scoped durable protection, and serialization against snapshot
+  expiration before source IO;
+- real managed-core plans before admission, strict worker-local FIFO admission
+  against aggregate estimated running memory, and no hard Forge DataFusion
+  allocation ceiling, spill path, or scratch requirement;
+- the source branch's exact pinned `iceberg-compaction-core` dependency at
+  `3709a1d9f7b8b6f2c0ed886c105fb557f1aaadab`, resolved in the destination's
+  single DataFusion 55, Arrow/Parquet 59, and Iceberg dependency universe;
+- independent execution and publication of ordinary compaction plans, with
+  committed sibling progress preserved and remaining debt replanned from the
+  current table head;
+- per-plan definite-conflict retries after 1s, 2s, and 4s, bounded by the
+  existing deadline and authority, while unknown acceptance reconciles the
+  exact existing operation without retrying the ambiguous catalog call;
+- independent promotion, compaction, snapshot-expiration, expired-cleanup, and
+  orphan-cleanup protocols; and
+- readiness retraction before unresolved durable authority can block release,
+  followed by fail-closed recovery.
+
 This requirement incorporates the completed Forge implementation. It does not
 authorize reimplementing or redesigning it during the merge.
 
@@ -126,6 +168,13 @@ Shared catalog, storage, SQL, resource, server-composition, readiness,
 shutdown, audit, reader-protection, contract, and test-harness seams shall be
 changed only as much as required to compose the retained Forge implementation
 with the destination architecture.
+
+Source Oracle code is authoritative only for the reader-protection capability
+Forge requires. It must be adapted to the destination's single-planner,
+root-derived Interactive/Analytical selection, one-attempt terminal behavior,
+peer authority, query-owned resources, and current server topology. Source
+query routing, fallback, retry, EXPLAIN, admission, resource, or terminal
+semantics must not replace the destination implementation.
 
 The integrated result shall not contain:
 
@@ -148,6 +197,13 @@ OpenAPI, SDK projections, and protobuf descriptors shall be regenerated from
 the reconciled owning sources; generated conflicts shall not be resolved by
 choosing one branch's generated file.
 
+The source edits existing migration files `20260910000009`, `00010`, `00019`,
+`00020`, and `00022`, and deletes `00016`. Those edits shall not replace the
+destination migration history. Preserve the destination files and express any
+still-required Forge end-state delta through the next forward-only migration.
+The source-only `20260910000025_oracle_reader_authority.sql` may be retained
+only after it is reconciled with the destination schema and migration order.
+
 ### REQ-008 - Preserve the existing test hierarchy
 
 The destination's Bifrost test organization, process harness, tier definitions,
@@ -164,11 +220,90 @@ behavior.
 No test, assertion, lane, feature selection, timeout, or public path may be
 weakened to make the integration pass.
 
+## Verified pre-merge assessment
+
+### Assessed graph
+
+| Input | Commit |
+|---|---|
+| Merge base | `24b8349e3eae96a8901ac29aac93acf2a20705ff` |
+| Destination | `5f4d1ea180762299ac20797cfbf9122bca5bc9d7` |
+| Locked Forge source | `b35ebb5e76b7a63fc7e9549329a5c90101400002` |
+
+The source changes 274 files from the merge base, the destination changes 420,
+and 102 files are shared. `git merge-tree --write-tree --name-only --messages`
+predicts 33 textual conflicts. A clean textual merge is therefore not credible
+evidence of semantic correctness for the remaining 69 shared files.
+
+### Reconciliation ledger
+
+| Surface | Source reason | Forge required | Classification | Resolution |
+|---|---|---:|---|---|
+| `vala-bifrost-redux/src/forge/**`, Forge SQL/query owners, Forge integration tests, and Forge journeys | Locked Forge implementation | Yes | `RETAIN` | Incorporate the source behavior, adapting only its destination-facing seams. |
+| Oracle reader epoch, reader pins, protection frontier, follower cut, and expiration serialization | Prevent deletion while admitted readers may perform source IO | Yes | `ADAPT` | Port the capability into destination Oracle without importing source routing, fallback, retry, EXPLAIN, resource, or terminal semantics. |
+| Scribe hot-object promotion and live-tail lifetime seams | Supply Forge promotion inputs and cleanup roots safely | Yes | `ADAPT` | Preserve destination Scribe ownership, acknowledgement, replay, live-tail, and shutdown behavior. |
+| Catalog, Parquet, storage, resources, audit, readiness, and server composition | Compose Forge production ownership | Yes | `ADAPT` | Use destination owners and topology; add only the locked Forge capability. |
+| Workspace and crate manifests | Forge introduces the pinned managed compaction core while the destination adds Oracle, MCP, TLS, and harness dependencies | Partly | `ADAPT` | Retain the exact Forge core pin and every destination dependency still used; regenerate one lockfile without a duplicate native analytical universe. |
+| Public Bifrost query/table contracts in `wyrd-spec::vala::api`, HTTP, MCP, SDK, and docs | Source branch predates destination public-query work | No | `DROP` | Keep destination contracts and regenerate projections. Retain only Forge audit types and private reader-assignment data required by the locked source. |
+| Source Oracle planning, routing, retry/fallback, EXPLAIN, admission, peer, resource, and terminal changes | Older Oracle architecture on the Forge branch | No | `DROP` | Keep destination Oracle exactly. |
+| Shared architecture documents | One file contains both newer Forge text and older Oracle/Gate/Scribe text | Partly | `ADAPT` | Preserve destination non-Forge sections and reconcile only Forge, reader-protection, maintenance, and Forge reliability statements to revision 10. |
+| Source-only Iceberg, security, deployment, and operations authority updates | Record Forge compaction, reader safety, readiness, and recovery | Yes in Forge-specific hunks | `ADAPT` | Retain Forge-specific authority without importing unrelated source-era behavior. |
+| Existing migrations `00009`, `00010`, `00016`, `00019`, `00020`, `00022` | Source reshaped unshipped Forge and reader state in place | End state only | `ADAPT` | Keep destination history; add a forward-only reconciliation migration for required final state. |
+| `00025_oracle_reader_authority.sql` and its SQL owners | Durable reader/expiration mutual exclusion | Yes | `ADAPT` | Retain after schema, RLS, role, and destination Oracle integration review. |
+| Deleted destination MCP module and benchmark/calibration machinery | Source modified owners the destination superseded or removed | No | `DROP` | Keep deletions; do not add compatibility owners. |
+| Generated JSON schemas, schema goldens, OpenAPI projections, and `wyrd.v1.bin` | Derived output changed on both branches | Derived | `ADAPT` | Regenerate from reconciled sources; never hand-merge. |
+| Workflow skills, Claude mirrors, `AGENTS.md`, `changes/README.md`, and spec-development references | Both branches independently advanced repository workflow | No Forge runtime need | `DROP` | Keep destination authority. The Forge packet remains evidence but does not roll repository workflow backward. |
+| `changes/active/server-topology-readiness/spec.md` | Separate source-side change packet | No | `DROP` | Do not import an unrelated active change. |
+| Source OTLP adapters, generic SQL/storage exports, check scripts, and nextest settings | Exhaustive-match, boundary, or test-support consequences of Forge work | Sometimes | `ADAPT` | Retain only compile-, security-, or Forge-test-required changes after comparison with destination owners. |
+
+This ledger exhausts the source-only non-Forge surfaces and the 102 shared
+files by owner family. No assessed surface requires a new product or public API
+decision after revision 4 is approved.
+
+### Predicted textual conflicts
+
+The 33 conflicts fall into five resolution groups:
+
+- **Destination repository authority:** `.agents/skills/wyrd-task-review/SKILL.md`,
+  `.claude/skills/wyrd-task-review/SKILL.md`, `AGENTS.md`,
+  `architecture/references/languages/spec-driven-development.md`, and
+  `changes/README.md` retain the destination versions.
+- **Mixed architecture:** `architecture/bifrost-design.md`,
+  `architecture/operations/reliability-and-recovery.md`,
+  `architecture/references/domain/analytical-operations-reliability.md`, and
+  `architecture/references/domain/datafusion.md` keep destination Oracle,
+  Gate, Scribe, and public-query semantics while adopting locked Forge and
+  reader-protection semantics.
+- **Engine and contracts:** `catalog/bifrost_catalog.rs`, Oracle `follower.rs`,
+  `mod.rs`, `planner.rs`, and `query_stream.rs`, plus `wyrd-spec` `vala/api.rs`
+  and `vala/mod.rs`, require semantic adaptation. Destination Oracle and public
+  contracts win; locked reader protection and Forge audit detail are retained.
+- **Server:** the deleted `wyrd-mcp/src/bifrost/mod.rs` stays deleted. Server
+  `app/mod.rs`, `boot/mod.rs`, `components/health/mod.rs`, Oracle
+  `forwarding.rs`, `state.rs`, and the two Postgres smoke tests keep destination
+  topology and receive only required Forge/readiness seams.
+- **Harness and generated output:** deleted `bench_families.rs` and
+  `calibration.rs` stay deleted. `cluster.rs`, `forge_harness.rs`, `mod.rs`,
+  `telemetry.rs`, `server.rs`, and Oracle `distributed.rs` adapt Forge proof to
+  the destination process harness. `wyrd.v1.bin` is regenerated.
+
+### Merge-task precondition
+
+The source change packet remains immutable evidence for the locked Forge
+candidate; the integration change records its own evidence under this packet.
+The source worktree currently has an untracked candidate-bound
+`TASK-061-R4-review-04/verdict.md` with a `PASS` verdict for `b35ebb5e7`. It
+must be committed on the source branch before the merge task is written because
+an untracked verdict is not part of the locked merge input.
+
 ## Constraints
 
-- Preserve `architecture/bifrost-design.md`.
-- Preserve the destination Oracle architecture exactly unless a later approved
-  revision explicitly changes it.
+- Reconcile `architecture/bifrost-design.md` at the semantic-hunk level: keep
+  destination Gate, Scribe, Oracle, and public-query authority and adopt the
+  locked Forge and reader-protection authority described by revision 4.
+- Preserve the destination Oracle planning, routing, execution, admission,
+  peer, resource, retry, terminal, and public behavior; add only the locked
+  reader-protection seam required to make Forge cleanup safe.
 - Preserve the source Forge architecture rather than recreating it.
 - Reuse the existing Bifrost process and test harnesses.
 - Do not add a dependency, Cargo feature, compatibility layer, public API, or
@@ -266,16 +401,46 @@ Independent review confirms that the final diff:
 - weakened no required test or lane; and
 - contains no avoidable compatibility or duplicate implementation.
 
+### AC-010 - Locked Forge semantics survive integration
+
+Focused and journey evidence proves real-plan FIFO admission, no Forge
+DataFusion ceiling or spill path, independent per-plan publication, bounded
+1s/2s/4s definite-conflict retries, exact-operation uncertain reconciliation,
+reader-safe expiration and cleanup, and readiness retraction before unresolved
+release. Dependency evidence proves the locked managed core resolves in the
+destination's one native analytical universe. No destination Oracle execution
+behavior is replaced to obtain that proof.
+
+### AC-011 - Durable and generated state is reconciled from owners
+
+Migration review proves the destination history is unchanged and any required
+Forge schema transition is forward-only. Code generation proves schemas,
+OpenAPI, SDK projections, and protobuf descriptors derive from the reconciled
+source contracts rather than a selected branch artifact.
+
 ## Open material decisions
 
-None before overlap analysis.
+Approve revision 4's explicit resolution of the architecture conflict: locked
+Forge revision 10 semantics govern Forge and its reader-protection seam, while
+the assessed destination remains authoritative for Gate, Scribe, Oracle,
+public-query, server-topology, workflow, and test-harness semantics.
 
 Any overlap that requires changing approved destination behavior becomes a new
 material decision and requires a draft spec revision before implementation
 continues.
 
+The untracked source review verdict is an operational precondition, not a
+product decision. It must be committed to the locked source branch before
+`$wyrd-plan` writes the merge task.
+
 ## Revision history
 
+- **Revision 4 - 2026-09-09 - draft.** Locks the Forge source candidate at
+  `b35ebb5e7`, records the 274/420-file branch deltas, 102 shared files, and 33
+  predicted conflicts, resolves mixed authority by semantic hunk, makes locked
+  Forge revision 10 behavior explicit, requires forward-only migration
+  reconciliation, and records the untracked source `PASS` verdict as a
+  pre-task blocker.
 - **Revision 3 - 2026-09-08 - approved.** Reframes the change as branch
   integration, makes `oracle-distributed` authoritative outside Forge,
   requires explicit overlap classification, and makes the complete Bifrost

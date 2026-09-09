@@ -9,7 +9,7 @@ import uuid
 from typing import TYPE_CHECKING
 
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 from wyrd.bifrost import (
     AsyncBifrost,
     Bifrost,
@@ -537,6 +537,48 @@ def test_read_back_as_arrow_pandas_and_polars(wyrd_server: WyrdTestServer) -> No
     assert polars_frame.columns == arrow.column_names
     assert polars_frame.height == arrow.num_rows
     assert polars_frame.to_dicts() == pandas_frame.to_dict(orient="records")
+
+
+class MistypedInference(BaseModel):
+    """`call_id` declared as a string, so every real row fails validation."""
+
+    call_id: str
+
+
+@pytest.mark.integration
+def test_sql_returns_model_instances_when_a_model_is_supplied(
+    wyrd_server: WyrdTestServer,
+) -> None:
+    """Sync and async SQL project onto a Pydantic model, or refuse the read.
+
+    The projection is local and post-query: `sql(query)` still returns the
+    Arrow-backed result, `sql(query, Model)` returns validated instances, a
+    query matching nothing returns an empty list, and one row that does not fit
+    the model fails the whole read rather than returning the rows that did.
+    """
+
+    fqn = _publish(wyrd_server, Inference, list(INFERENCES))
+    bifrost = Bifrost(server_url=wyrd_server.base_url, credential=wyrd_server.api_key)
+    select = f"SELECT call_id, model, tokens, latency_ms, status FROM {fqn} ORDER BY call_id"
+
+    raw = bifrost.sql(select)
+    assert raw.terminal["outcome"] == "success"
+    assert len(raw) == len(INFERENCES)
+
+    typed = bifrost.sql(select, Inference)
+    assert typed == INFERENCES
+    assert all(isinstance(row, Inference) for row in typed)
+
+    assert bifrost.sql(f"SELECT * FROM {fqn} WHERE call_id = 9999", Inference) == []
+
+    with pytest.raises(ValidationError):
+        bifrost.sql(f"SELECT call_id FROM {fqn}", MistypedInference)
+
+    async def read_typed() -> list[Inference]:
+        client = AsyncBifrost(server_url=wyrd_server.base_url, credential=wyrd_server.api_key)
+        return await client.sql(select, Inference)
+
+    assert asyncio.run(read_typed()) == INFERENCES
 
 
 @pytest.mark.integration

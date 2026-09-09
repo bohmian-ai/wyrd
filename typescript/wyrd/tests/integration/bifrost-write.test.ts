@@ -1,4 +1,4 @@
-import type { Table } from "apache-arrow";
+import { tableFromIPC, type Table } from "apache-arrow";
 import { z } from "zod";
 import { startTestServer } from "@wyrd/testing";
 import { describe, expect, it } from "vitest";
@@ -263,6 +263,62 @@ describe("Bifrost analytical read journey", () => {
       expect(col(scalars, "latency_whole")).toEqual([121, 240, 180]);
       expect(col(scalars, "bucket")).toEqual(["slow", "slow", "slow"]);
       expect(col(scalars, "status_len")).toEqual([2n, 2n, 5n]);
+    } finally {
+      server.shutdown();
+    }
+  }, 60_000);
+
+  it("keeps the server's schema on an empty result and parses typed rows", async () => {
+    const server = startTestServer();
+    try {
+      const facts = `vala.datasets.typed_${Date.now().toString(36)}`;
+      await publishRows(server, facts, Inference, INFERENCES);
+
+      const reader = await Bifrost.connect({
+        serverUrl: server.baseUrl,
+        credential: server.apiKey,
+        grpcUrl: server.grpcUrl,
+      });
+
+      // A query that matches nothing still reports the fields it selected.
+      const empty = await reader.sql(
+        `SELECT model, latency_ms FROM ${facts} WHERE call_id = 9999`,
+      );
+      expect(empty.numRows).toBe(0);
+      const emptyArrow = empty.toArrow();
+      expect(emptyArrow.numRows).toBe(0);
+      expect(emptyArrow.schema.fields.map((field) => field.name)).toEqual([
+        "model",
+        "latency_ms",
+      ]);
+      expect(emptyArrow.schema.fields.map((field) => String(field.type))).toEqual([
+        "Utf8",
+        "Float64",
+      ]);
+      const decoded = tableFromIPC(empty.toBytes());
+      expect(decoded.numRows).toBe(0);
+      expect(decoded.schema.fields.map((field) => field.name)).toEqual([
+        "model",
+        "latency_ms",
+      ]);
+
+      // Supplying a schema returns parsed rows; omitting it is unchanged.
+      const Row = z.object({
+        model: z.string(),
+        latency_ms: z.number(),
+      });
+      const select = `SELECT model, latency_ms FROM ${facts} ORDER BY call_id`;
+      const raw = await reader.sql(select);
+      expect(raw.numRows).toBe(INFERENCES.length);
+      const rows = await reader.sql(select, Row);
+      expect(rows).toEqual(
+        INFERENCES.map(({ model, latency_ms }) => ({ model, latency_ms })),
+      );
+
+      // A row that does not fit fails the whole read.
+      await expect(
+        reader.sql(select, z.object({ model: z.number() })),
+      ).rejects.toThrow();
     } finally {
       server.shutdown();
     }

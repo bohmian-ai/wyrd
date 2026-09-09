@@ -1819,6 +1819,15 @@ mod pg_tests {
         srv.shutdown().await.expect("server shutdown");
     }
 
+    /// One row of the blocking journey's table, as a caller would declare it.
+    #[derive(Debug, PartialEq, serde::Deserialize)]
+    struct IdValueRow {
+        /// The declared `id` column.
+        id: i64,
+        /// The declared `value` column.
+        value: String,
+    }
+
     /// The blocking facade's own journey: register, write, drain, read back.
     ///
     /// A plain `#[test]` rather than a `#[tokio::test]`, because the facade
@@ -1876,6 +1885,19 @@ mod pg_tests {
             .collect::<Result<Vec<_>, _>>()
             .expect("every streamed batch");
         assert_eq!(id_value_rows(&streamed), rows);
+
+        let typed: Vec<IdValueRow> = bifrost
+            .sql_as(&format!("SELECT id, value FROM {fqn} ORDER BY id"))
+            .expect("deserialize through the blocking door");
+        assert_eq!(
+            typed,
+            rows.iter()
+                .map(|(id, value)| IdValueRow {
+                    id: *id,
+                    value: value.clone(),
+                })
+                .collect::<Vec<_>>()
+        );
 
         let described = bifrost
             .describe(&fqn)
@@ -2068,6 +2090,106 @@ mod pg_tests {
             }
         }
         values
+    }
+
+    /// One served inference as a caller declares it for a typed read.
+    #[derive(Debug, PartialEq, serde::Deserialize)]
+    struct InferenceRow {
+        /// The fact table's caller-owned call identity.
+        call_id: i64,
+        /// The served model name.
+        model: String,
+        /// Tokens the call consumed.
+        tokens: i64,
+        /// Observed latency in milliseconds.
+        latency_ms: f64,
+        /// Terminal call status.
+        status: String,
+    }
+
+    /// A row type whose `model` field cannot hold the column's `Utf8` value.
+    #[derive(Debug, serde::Deserialize)]
+    struct MistypedRow {
+        /// Declared as an integer against a string column, so every row fails.
+        #[expect(dead_code, reason = "the field exists to force a deserialization failure")]
+        model: i64,
+    }
+
+    /// Typed SQL over a written table: rows, the empty result, and a mismatch.
+    ///
+    /// The projection is local and post-query, so this asserts the three things
+    /// a caller can observe about it: a complete result becomes typed rows, a
+    /// query matching nothing becomes an empty list rather than an error, and a
+    /// row that does not fit the declared type fails the whole read instead of
+    /// returning the rows that happened to convert.
+    #[tokio::test]
+    async fn typed_sql_projects_rows_and_refuses_a_mismatch() {
+        let srv = WyrdTestServer::start_bound()
+            .await
+            .expect("test server start");
+        let client = admin_client(&srv, "sdk-typed-journey").await;
+
+        let facts = owned_fqn("typed_inference");
+        let inferences: Vec<String> = [
+            (1i64, "opus", 100i64, 120.5f64, "ok"),
+            (2, "haiku", 50, 30.0, "error"),
+        ]
+        .iter()
+        .map(|(call_id, model, tokens, latency_ms, status)| {
+            format!(
+                r#"{{"call_id": {call_id}, "model": "{model}", "tokens": {tokens}, "latency_ms": {latency_ms}, "status": "{status}"}}"#
+            )
+        })
+        .collect();
+        publish_rows(&srv, &client, &facts, inference_schema(), &inferences).await;
+
+        let reader = Bifrost::connect(&client).await.expect("reader connects");
+        let select = format!(
+            "SELECT call_id, model, tokens, latency_ms, status FROM {facts} ORDER BY call_id"
+        );
+
+        // Raw `sql` is unchanged: the same query still collects Arrow batches.
+        let raw = reader.sql(&select).await.expect("raw Arrow result");
+        assert_eq!(raw.terminal().outcome, QueryTerminalOutcome::Success);
+        assert_eq!(raw.num_rows(), 2);
+
+        let typed: Vec<InferenceRow> = reader.sql_as(&select).await.expect("typed rows");
+        assert_eq!(
+            typed,
+            vec![
+                InferenceRow {
+                    call_id: 1,
+                    model: "opus".to_owned(),
+                    tokens: 100,
+                    latency_ms: 120.5,
+                    status: "ok".to_owned(),
+                },
+                InferenceRow {
+                    call_id: 2,
+                    model: "haiku".to_owned(),
+                    tokens: 50,
+                    latency_ms: 30.0,
+                    status: "error".to_owned(),
+                },
+            ]
+        );
+
+        let empty: Vec<InferenceRow> = reader
+            .sql_as(&format!(
+                "SELECT call_id, model, tokens, latency_ms, status FROM {facts} WHERE call_id = 9999"
+            ))
+            .await
+            .expect("a query matching nothing is an empty typed result");
+        assert!(empty.is_empty());
+
+        let mismatch = reader
+            .sql_as::<MistypedRow>(&format!("SELECT model FROM {facts}"))
+            .await
+            .expect_err("a row that does not fit the declared type fails the read");
+        assert_eq!(mismatch.code(), "WYRD_CLIENT_422_ROW_DESERIALIZATION");
+        assert_eq!(mismatch.status(), 422);
+
+        srv.shutdown().await.expect("server shutdown");
     }
 
     /// Group-by, window, join, and scalar SQL over caller-registered tables.

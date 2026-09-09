@@ -1,7 +1,7 @@
 # AUTO-GENERATED STUB FILE. DO NOT EDIT.
 # pylint: disable=redefined-builtin, invalid-name, dangerous-default-value
 from collections.abc import AsyncIterator, Iterator
-from typing import Any, TypedDict
+from typing import Any, Protocol, TypedDict, TypeVar, overload
 
 import pyarrow
 
@@ -209,6 +209,14 @@ class QueryResult:
         ...
     def __len__(self) -> int: ...
 
+_Row = TypeVar("_Row", bound="RowModel")
+
+class RowModel(Protocol):
+    """Anything that validates one row mapping and returns itself typed."""
+
+    @classmethod
+    def model_validate(cls: type[_Row], obj: Any, /) -> _Row: ...
+
 class BifrostBatchIterator(Iterator[pyarrow.RecordBatch]):
     """Synchronously yields Arrow batches from one terminal-safe query."""
 
@@ -264,7 +272,10 @@ class Bifrost(_BifrostBase):
     def use_table_by_name(self, table: str) -> None: ...
     def flush(self) -> None: ...
     def shutdown(self) -> None: ...
+    @overload
     def sql(self, query: str) -> QueryResult: ...
+    @overload
+    def sql(self, query: str, model: type[_Row]) -> list[_Row]: ...
     def stream(
         self,
         query: str,
@@ -285,7 +296,10 @@ class AsyncBifrost(_BifrostBase):
     async def use_table_by_name(self, table: str) -> None: ...
     async def flush(self) -> None: ...
     async def shutdown(self) -> None: ...
+    @overload
     async def sql(self, query: str) -> QueryResult: ...
+    @overload
+    async def sql(self, query: str, model: type[_Row]) -> list[_Row]: ...
     async def stream(
         self,
         query: str,
@@ -315,6 +329,7 @@ __all__ = [
     "PhysicalLayout",
     "QueryResult",
     "ResolvedTable",
+    "RowModel",
     "RunningQuery",
     "RunningQueryProgress",
     "SortKey",

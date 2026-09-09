@@ -4,6 +4,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::public_support::{
+    JourneyTable, ManagedRow, append_values, canonical_order, read_managed_rows, register_table,
+    tenant_client, unique_table,
+};
 use arrow::array::{BinaryBuilder, Int64Array, RecordBatch, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use iceberg::spec::DataFile;
@@ -24,10 +28,6 @@ use wyrd_testing::WyrdTestServer;
 use wyrd_testing::bifrost::write::RawIngest;
 use wyrd_testing::bifrost::{
     BifrostClusterSpec, CommitUncertaintyCatalog, TestOracleResources, WyrdTestCluster,
-};
-use crate::public_support::{
-    JourneyTable, ManagedRow, append_values, canonical_order, read_managed_rows, register_table,
-    tenant_client, unique_table,
 };
 
 /// Reads one node's live Oracle reader-authority fence.

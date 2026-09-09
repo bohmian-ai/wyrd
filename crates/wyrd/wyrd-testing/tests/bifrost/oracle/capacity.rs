@@ -29,7 +29,9 @@ use wyrd_spec::vala::api::{
 };
 use wyrd_testing::WyrdTestServer;
 use wyrd_testing::bifrost::telemetry::BifrostMetricSample;
-use wyrd_testing::bifrost::{BifrostClusterSpec, WyrdTestCluster};
+use wyrd_testing::bifrost::{
+    BifrostClusterSpec, BifrostNodeSpec, TestOracleResources, WyrdTestCluster,
+};
 
 use crate::support::*;
 
@@ -932,4 +934,296 @@ fn fixture_rows_ipc(start_id: i64, rows: i64, groups: i64) -> Result<bytes::Byte
         writer.finish()?;
     }
     Ok(bytes::Bytes::from(ipc))
+}
+
+/// Memory observation injected on the smaller of the two heterogeneous Oracles.
+///
+/// Above the combined Scribe and Oracle role floors a mixed pod must satisfy,
+/// and far enough below its sibling that the two derived plans cannot coincide.
+const SMALL_ORACLE_MEMORY_BYTES: usize = 2 * 1024 * 1024 * 1024;
+
+/// Memory observation injected on the larger of the two heterogeneous Oracles.
+const LARGE_ORACLE_MEMORY_BYTES: usize = 4 * 1024 * 1024 * 1024;
+
+/// Effective CPU injected on the smaller heterogeneous Oracle.
+const SMALL_ORACLE_CPU: usize = 2;
+
+/// Effective CPU injected on the larger heterogeneous Oracle.
+const LARGE_ORACLE_CPU: usize = 6;
+
+/// Rows written to the fixture table both heterogeneous Oracles read.
+///
+/// Small enough that the query is a flat Interactive scan; the journey is about
+/// which capacity admitted it, not about how much work it did.
+const HETEROGENEOUS_ROWS: i64 = 3;
+
+/// Metric family fragments that would prove a durable admission ledger survived.
+///
+/// Every one of them named a step in the deleted allocation protocol. A pod
+/// that still emitted any of them would be renewing or overdrawing a
+/// cluster-wide grant rather than scheduling against its own observation.
+const DURABLE_ADMISSION_FRAGMENTS: [&str; 5] =
+    ["allocation", "renewal", "overdraft", "delegated", "_lease"];
+
+/// Two Oracles observing different local resources each keep their own derived
+/// capacity across a restart, while the historical durable admission tables
+/// take no part in admitting their queries.
+///
+/// # Panics
+///
+/// Panics when any capacity, restart, query, or historical-row claim fails.
+// Two pods, two public clients, and a restart share this runtime; on the
+// single-threaded default the executing query starves the pods' own heartbeats
+// and their role leases expire for a reason no deployment would produce.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn heterogeneous_oracles_ignore_historical_admission_rows() {
+    prove_heterogeneous_local_capacity()
+        .await
+        .expect("heterogeneous local Oracle capacity journey");
+}
+
+/// Drives the complete heterogeneous-capacity journey over one live cluster.
+///
+/// # Errors
+///
+/// Returns the first claim that broke.
+async fn prove_heterogeneous_local_capacity() -> Result<(), JourneyError> {
+    // The cluster-wide `with_system_resources` helper would give both pods the
+    // same observation, which is the exact thing under test. Each node's entry
+    // is rewritten individually instead, preserving the generated identities
+    // and roles so the restart below rebuilds the same two pods.
+    let mut spec = BifrostClusterSpec::two_mixed();
+    let observations = [
+        heterogeneous_observation(SMALL_ORACLE_MEMORY_BYTES, SMALL_ORACLE_CPU),
+        heterogeneous_observation(LARGE_ORACLE_MEMORY_BYTES, LARGE_ORACLE_CPU),
+    ];
+    spec.nodes = spec
+        .nodes
+        .iter()
+        .zip(observations)
+        .map(|(node, snapshot)| BifrostNodeSpec {
+            node_id: node.node_id,
+            roles: node.roles.clone(),
+            oracle: Some(TestOracleResources {
+                system_resources: Some(snapshot),
+                ..TestOracleResources::default()
+            }),
+            forge_compaction_memory_limit_bytes: node.forge_compaction_memory_limit_bytes,
+            role_timing: node.role_timing,
+        })
+        .collect();
+    let node_ids: Vec<_> = spec.nodes.iter().map(|node| node.node_id).collect();
+    let mut cluster = WyrdTestCluster::start_spec(spec).await?;
+    let tenant = cluster.data_tenant_id();
+
+    // Rows the deleted protocol would have consulted: a canonical tenant-default
+    // ceiling far below what either pod derives locally, and an open block
+    // already holding the whole of it under a foreign holder fence.
+    seed_historical_admission_rows(&cluster, tenant, node_ids[0]).await?;
+    let seeded = historical_admission_state(&cluster).await?;
+
+    let table = unique_table("oracle_heterogeneous");
+    let ingest = cluster.server(0).ok_or("missing ingest node")?;
+    register_table(ingest, tenant, &table).await?;
+    let rows = writer(ingest, "heterogeneous-writer").await?;
+    for id in 1..=HETEROGENEOUS_ROWS {
+        rows.write(
+            &format!("vala.bifrost.{table}"),
+            &journey_schema(),
+            [journey_row(id, "heterogeneous")],
+        )
+        .await?;
+    }
+    ingest.flush_bifrost().await?;
+    cluster.refresh_oracle_snapshots().await?;
+
+    let before = derived_capacities(&cluster, &node_ids)?;
+    if before[0] == before[1] {
+        return Err(format!(
+            "two differently observed Oracles derived the same capacity: {before:?}"
+        )
+        .into());
+    }
+    query_each_node(&cluster, &node_ids, &table, "first").await?;
+
+    // Reverse order so the pod that restarts first is not the one that booted
+    // first: a plan recovered from boot ordering rather than from the node's
+    // own retained observation would survive one order and not the other.
+    for node_id in node_ids.iter().rev() {
+        cluster.terminate_node_abruptly_for_test(*node_id).await?;
+        cluster.restart_node(*node_id).await?;
+    }
+    cluster.refresh_oracle_snapshots().await?;
+
+    let after = derived_capacities(&cluster, &node_ids)?;
+    if after != before {
+        return Err(
+            format!("restart changed derived Oracle capacity: {before:?} -> {after:?}").into(),
+        );
+    }
+    query_each_node(&cluster, &node_ids, &table, "restarted").await?;
+
+    let settled = historical_admission_state(&cluster).await?;
+    if settled != seeded {
+        return Err(format!(
+            "historical admission rows changed under live queries: {seeded:?} -> {settled:?}"
+        )
+        .into());
+    }
+    prove_no_durable_admission_telemetry(&cluster)?;
+
+    cluster.shutdown().await?;
+    Ok(())
+}
+
+/// Builds one injected process observation for a heterogeneous Oracle pod.
+fn heterogeneous_observation(
+    memory_limit_bytes: usize,
+    effective_cpu: usize,
+) -> SystemResourceSnapshot {
+    SystemResourceSnapshot {
+        memory_limit_bytes,
+        effective_cpu,
+        scratch_capacity_bytes: ORACLE_SCRATCH_BYTES,
+        scratch_available_bytes: ORACLE_SCRATCH_BYTES,
+        memory_source: ResourceSource::Injected,
+        cpu_source: ResourceSource::Injected,
+    }
+}
+
+/// The capacity each named node derived from its own observation.
+///
+/// Only the boot calculation is projected. Live occupancy moves with whatever
+/// query is running, so comparing it across a restart would prove nothing about
+/// the derivation under test.
+///
+/// # Errors
+///
+/// Returns an error when a node is absent, is not running an Oracle, or cannot
+/// report its resource snapshot.
+fn derived_capacities(
+    cluster: &WyrdTestCluster,
+    node_ids: &[wyrd_spec::vala::api::NodeId],
+) -> Result<Vec<(usize, usize, usize, usize)>, JourneyError> {
+    node_ids
+        .iter()
+        .map(|node_id| {
+            let plan = cluster
+                .server_by_node(*node_id)
+                .ok_or_else(|| format!("node {} is not running", node_id.as_uuid()))?
+                .state()
+                .bifrost_resources()
+                .ok_or_else(|| format!("node {} composed no Bifrost resources", node_id.as_uuid()))?
+                .plan();
+            Ok((
+                plan.oracle_floor_bytes,
+                plan.elastic_memory_bytes,
+                plan.effective_cpu,
+                vala_bifrost_redux::resources::oracle_worker_slots(plan)
+                    .map_err(|error| error.to_string())?,
+            ))
+        })
+        .collect()
+}
+
+/// Runs one bounded Interactive query through each node's own public client.
+///
+/// # Errors
+///
+/// Returns an error when a client cannot be built, a query fails, or a node
+/// returns a row count the fixture did not write.
+async fn query_each_node(
+    cluster: &WyrdTestCluster,
+    node_ids: &[wyrd_spec::vala::api::NodeId],
+    table: &str,
+    label: &str,
+) -> Result<(), JourneyError> {
+    for (index, node_id) in node_ids.iter().enumerate() {
+        let server = cluster
+            .server_by_node(*node_id)
+            .ok_or_else(|| format!("node {} is not running", node_id.as_uuid()))?;
+        // One machine principal per pod and per pass: a bootstrap name is a
+        // Card identity, so reusing it would collide rather than authenticate.
+        let reader = client(server, &format!("heterogeneous-reader-{label}-{index}")).await?;
+        let rows = query_rows(&reader, table, VisibilityMode::PublishedOnly).await?;
+        if rows != u64::try_from(HETEROGENEOUS_ROWS)? {
+            return Err(format!(
+                "during {label} node {} returned {rows} rows",
+                node_id.as_uuid()
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+/// Seeds the historical policy ceiling and open block the deleted protocol used.
+///
+/// # Errors
+///
+/// Returns the database error unchanged.
+async fn seed_historical_admission_rows(
+    cluster: &WyrdTestCluster,
+    tenant: DataTenantId,
+    holder: wyrd_spec::vala::api::NodeId,
+) -> Result<(), JourneyError> {
+    let pool = cluster.pg_fixture().operator_pool().pool();
+    sqlx::query(
+        "INSERT INTO vala.oracle_admission_policies (scope_kind,data_tenant_id,query_class,capacity) VALUES ('tenant_default',NULL,'interactive',1)",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO vala.oracle_admission_blocks (block_id,allocation_id,scope_kind,data_tenant_id,principal_id,query_class,units,holder_node_id,holder_fencing_token,valid_from,expires_at,closed_at) \
+         VALUES ($1,$2,'tenant',$3,NULL,'interactive',1,$4,1,now() - interval '1 hour',now() + interval '1 hour',NULL)",
+    )
+    .bind(uuid::Uuid::now_v7())
+    .bind(uuid::Uuid::now_v7())
+    .bind(uuid::Uuid::from(tenant))
+    .bind(uuid::Uuid::from(holder))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Projects every mutable fact the deleted allocation protocol would have changed.
+///
+/// # Errors
+///
+/// Returns the database error unchanged.
+async fn historical_admission_state(
+    cluster: &WyrdTestCluster,
+) -> Result<(i64, i64, i64, Option<i64>), JourneyError> {
+    let pool = cluster.pg_fixture().operator_pool().pool();
+    let state: (i64, i64, i64, Option<i64>) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM vala.oracle_admission_policies), \
+         (SELECT count(*) FROM vala.oracle_admission_blocks), \
+         (SELECT count(*) FROM vala.oracle_admission_blocks WHERE closed_at IS NOT NULL), \
+         (SELECT sum(units)::bigint FROM vala.oracle_admission_blocks)",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(state)
+}
+
+/// Asserts no pod published a metric family from the deleted allocation protocol.
+///
+/// # Errors
+///
+/// Returns an error naming the first surviving family.
+fn prove_no_durable_admission_telemetry(cluster: &WyrdTestCluster) -> Result<(), JourneyError> {
+    for sample in cluster.telemetry().snapshot().map_err(|e| e.to_string())? {
+        if let Some(fragment) = DURABLE_ADMISSION_FRAGMENTS
+            .iter()
+            .find(|fragment| sample.family.contains(*fragment))
+        {
+            return Err(format!(
+                "{} still reports durable admission activity ({fragment})",
+                sample.family
+            )
+            .into());
+        }
+    }
+    Ok(())
 }

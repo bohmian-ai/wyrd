@@ -5,7 +5,7 @@
 //! client startup (from env vars, explicit config, or workload metadata) and
 //! resolved before each outbound request.
 
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 
 use crate::error::WyrdClientError;
 
@@ -91,8 +91,6 @@ impl CredentialSource {
     /// credential is.
     #[must_use]
     pub fn explicit(credential: SecretString) -> Self {
-        use secrecy::ExposeSecret;
-
         if credential.expose_secret().starts_with(API_KEY_PREFIX) {
             Self::ApiKey { key: credential }
         } else {

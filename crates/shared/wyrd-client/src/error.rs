@@ -54,12 +54,16 @@ pub enum WyrdClientError {
 
     /// The credential chain produced no usable credential. Configure at least
     /// one source: `WYRD_ACCESS_TOKEN`, `WYRD_WORKLOAD_TOKEN`+`WYRD_TENANT`,
-    /// `WYRD_API_KEY`, an explicit `ClientConfig::api_key`, or the
+    /// `WYRD_API_KEY`, an explicit `ClientConfig::credential`, or the
     /// `~/.config/wyrd/credentials.toml` `[default].api_key` floor. Maps to
     /// `WYRD_CLIENT_401_NO_CREDENTIALS` at the public boundary.
+    ///
+    /// `ClientConfig::credential` is the only credential field a caller sets by
+    /// hand — one string classified by its own prefix — so this guidance must
+    /// never name a per-grant field the config no longer has.
     #[error(
         "no credentials available; set WYRD_ACCESS_TOKEN, WYRD_WORKLOAD_TOKEN+WYRD_TENANT, \
-         or WYRD_API_KEY, pass ClientConfig::api_key, or add [default].api_key to \
+         or WYRD_API_KEY, pass ClientConfig::credential, or add [default].api_key to \
          ~/.config/wyrd/credentials.toml"
     )]
     NoCredentials,
@@ -484,6 +488,25 @@ mod tests {
             }
             .code(),
             "WYRD_CLIENT_503_TRANSPORT_DOWN"
+        );
+    }
+
+    /// The actionable half of the no-credentials error names the field that
+    /// still exists.
+    ///
+    /// `ClientConfig` carries one `credential`; the former per-grant `api_key`
+    /// field is gone, so telling a caller to pass it would send them to an API
+    /// that no longer compiles.
+    #[test]
+    fn no_credentials_guidance_names_the_credential_field() {
+        let message = WyrdClientError::NoCredentials.to_string();
+        assert!(
+            message.contains("ClientConfig::credential"),
+            "guidance must name the field a caller can actually set: {message}"
+        );
+        assert!(
+            !message.contains("ClientConfig::api_key"),
+            "guidance must not name the removed per-grant field: {message}"
         );
     }
 

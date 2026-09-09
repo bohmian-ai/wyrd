@@ -471,9 +471,6 @@ impl BifrostRoles {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OracleRuntimeConfig {
-    /// CPU budget used for admission calibration.
-    #[serde(default = "default_oracle_cpu_cores")]
-    pub cpu_cores: f64,
     /// Concurrent planning permits.
     #[serde(default = "default_oracle_planning_permits")]
     pub planning_permits: usize,
@@ -483,15 +480,6 @@ pub struct OracleRuntimeConfig {
     /// Maximum absolute time a query may wait in the local admission queues.
     #[serde(default = "default_oracle_max_queue_wait_ms")]
     pub max_queue_wait_ms: u64,
-    /// Exact delegated units requested after a complete local miss.
-    #[serde(default = "default_oracle_delegated_allocation_units")]
-    pub delegated_allocation_units: u32,
-    /// Background delegated-block renewal cadence in milliseconds.
-    #[serde(default = "default_oracle_delegated_renewal_ms")]
-    pub delegated_renewal_ms: u64,
-    /// Maximum delegated-block validity in milliseconds.
-    #[serde(default = "default_oracle_delegated_validity_ms")]
-    pub delegated_validity_ms: u64,
     /// Maximum remote workers, excluding the leader.
     #[serde(default = "default_oracle_max_workers_per_query")]
     pub max_workers_per_query: usize,
@@ -535,9 +523,6 @@ pub struct OracleRuntimeConfig {
     pub audit_relay_shutdown_timeout_ms: u64,
 }
 
-fn default_oracle_cpu_cores() -> f64 {
-    1.0
-}
 fn default_oracle_planning_permits() -> usize {
     2
 }
@@ -547,24 +532,6 @@ fn default_oracle_admission_waiters() -> usize {
 /// Default maximum absolute Oracle admission queue wait in milliseconds.
 fn default_oracle_max_queue_wait_ms() -> u64 {
     250
-}
-/// Default exact demand amount; allocation is still bounded by durable availability.
-///
-/// Each allocation costs one `PostgreSQL` round trip regardless of how many
-/// units it returns, so a single-unit block forces one round trip per query and
-/// cannot keep pace with concurrent readers. A batch amortizes that cost.
-fn default_oracle_delegated_allocation_units() -> u32 {
-    vala_bifrost_redux::oracle::DEFAULT_DELEGATED_ALLOCATION_UNITS
-}
-/// Default renewal cadence inherited from role heartbeat membership.
-fn default_oracle_delegated_renewal_ms() -> u64 {
-    u64::try_from(vala_bifrost_redux::cluster::ROLE_HEARTBEAT_INTERVAL.as_millis())
-        .expect("role heartbeat interval fits u64 milliseconds")
-}
-/// Default maximum validity inherited from role liveness membership.
-fn default_oracle_delegated_validity_ms() -> u64 {
-    u64::try_from(vala_bifrost_redux::cluster::ROLE_LIVENESS_CUTOFF.as_millis())
-        .expect("role liveness cutoff fits u64 milliseconds")
 }
 fn default_oracle_max_workers_per_query() -> usize {
     2
@@ -608,13 +575,9 @@ fn default_audit_relay_shutdown_timeout_ms() -> u64 {
 impl Default for OracleRuntimeConfig {
     fn default() -> Self {
         Self {
-            cpu_cores: default_oracle_cpu_cores(),
             planning_permits: default_oracle_planning_permits(),
             admission_waiters: default_oracle_admission_waiters(),
             max_queue_wait_ms: default_oracle_max_queue_wait_ms(),
-            delegated_allocation_units: default_oracle_delegated_allocation_units(),
-            delegated_renewal_ms: default_oracle_delegated_renewal_ms(),
-            delegated_validity_ms: default_oracle_delegated_validity_ms(),
             max_workers_per_query: default_oracle_max_workers_per_query(),
             max_frame_bytes: default_oracle_max_frame_bytes(),
             calibration_profile: PathBuf::new(),
@@ -629,27 +592,6 @@ impl Default for OracleRuntimeConfig {
             audit_relay_backoff_max_ms: default_audit_relay_backoff_max_ms(),
             audit_relay_shutdown_timeout_ms: default_audit_relay_shutdown_timeout_ms(),
         }
-    }
-}
-
-impl OracleRuntimeConfig {
-    /// Translates and validates the delegated-capacity lifecycle configuration.
-    ///
-    /// # Errors
-    ///
-    /// Returns a message when allocation is zero, renewal is not shorter than
-    /// validity, or validity exceeds the Oracle role-liveness cutoff.
-    pub(crate) fn delegated_admission_config(
-        &self,
-    ) -> Result<vala_bifrost_redux::oracle::DelegatedOracleAdmissionConfig, String> {
-        vala_bifrost_redux::oracle::DelegatedOracleAdmissionConfig {
-            allocation_units: self.delegated_allocation_units,
-            renewal_interval: Duration::from_millis(self.delegated_renewal_ms),
-            validity: Duration::from_millis(self.delegated_validity_ms),
-            queue_capacity: self.admission_waiters,
-        }
-        .validate()
-        .map_err(|error| error.to_string())
     }
 }
 
@@ -2615,8 +2557,6 @@ impl WyrdServerConfig {
                 || self.bifrost.oracle.audit_relay_shutdown_timeout_ms == 0
                 || self.bifrost.oracle.audit_relay_backoff_initial_ms
                     > self.bifrost.oracle.audit_relay_backoff_max_ms
-                || !self.bifrost.oracle.cpu_cores.is_finite()
-                || self.bifrost.oracle.cpu_cores <= 0.0
             {
                 return Err(ConfigError::Invalid {
                     message: "bifrost.oracle bounds must be positive and finite".to_owned(),
@@ -4650,44 +4590,4 @@ minimum_slots = 2
         );
     }
 
-    /// Delegated admission defaults remain tied to role membership timing.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the production defaults violate their locked relationship.
-    #[test]
-    fn delegated_admission_defaults_follow_role_liveness() {
-        let runtime = OracleRuntimeConfig::default();
-        let delegated = runtime
-            .delegated_admission_config()
-            .expect("default delegated admission is valid");
-        assert_eq!(
-            delegated.renewal_interval,
-            vala_bifrost_redux::cluster::ROLE_HEARTBEAT_INTERVAL
-        );
-        assert_eq!(
-            delegated.validity,
-            vala_bifrost_redux::cluster::ROLE_LIVENESS_CUTOFF
-        );
-    }
-
-    /// Zero, inverted, and over-liveness timing configurations fail closed.
-    ///
-    /// # Panics
-    ///
-    /// Panics when any invalid configuration is accepted.
-    #[test]
-    fn delegated_admission_rejects_invalid_timing() {
-        let mut runtime = OracleRuntimeConfig {
-            delegated_allocation_units: 0,
-            ..OracleRuntimeConfig::default()
-        };
-        assert!(runtime.delegated_admission_config().is_err());
-        runtime.delegated_allocation_units = 1;
-        runtime.delegated_renewal_ms = runtime.delegated_validity_ms;
-        assert!(runtime.delegated_admission_config().is_err());
-        runtime.delegated_renewal_ms = 1;
-        runtime.delegated_validity_ms = default_oracle_delegated_validity_ms() + 1;
-        assert!(runtime.delegated_admission_config().is_err());
-    }
 }

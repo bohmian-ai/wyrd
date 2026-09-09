@@ -54,7 +54,4 @@ name = "pg_migration"
 name = "pg_oracle_membership"
 
 [[test]]
-name = "oracle_admission"
-
-[[test]]
 name = "pg_schema_usage"

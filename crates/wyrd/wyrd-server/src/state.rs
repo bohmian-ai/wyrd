@@ -509,12 +509,12 @@ impl Oracle {
         self.continuity_monitor_abort.abort();
         self.engine.begin_shutdown();
     }
-    /// Creates the retained query lifecycle and its exact-fence continuity monitor.
+    /// Creates the retained query lifecycle and its reader-epoch loss monitor.
     ///
     /// # Errors
     ///
-    /// Returns [`wyrd_spec::vala::error::BifrostError`] when the engine's sole
-    /// delegated-continuity receiver was already transferred or is unavailable.
+    /// Returns [`wyrd_spec::vala::error::BifrostError`] when the retained role
+    /// composition cannot be completed.
     pub fn new(inputs: OracleBuildInputs) -> Result<Self, wyrd_spec::vala::error::BifrostError> {
         let OracleBuildInputs {
             engine,
@@ -527,7 +527,6 @@ impl Oracle {
             peer,
             role_shutdown,
         } = inputs;
-        let delegated_loss = engine.take_delegated_continuity_loss()?;
         let advertise_ready = Arc::new(AtomicBool::new(true));
         let lifecycle = RoleLifecycle::serving();
         let heartbeat = Arc::clone(&cluster).start_readiness_heartbeat(
@@ -538,8 +537,7 @@ impl Oracle {
         let snapshot_poller = Arc::clone(&cluster).start_snapshot_poller(role_shutdown.clone());
         let heartbeat_abort = heartbeat.abort_handle();
         let snapshot_poller_abort = snapshot_poller.abort_handle();
-        let continuity_monitor = tokio::spawn(run_delegated_continuity_monitor(
-            delegated_loss,
+        let continuity_monitor = tokio::spawn(run_reader_epoch_loss_monitor(
             Arc::clone(&engine),
             Arc::clone(&cluster),
             registered_role.clone(),
@@ -766,15 +764,14 @@ impl Oracle {
     }
 }
 
-/// Consumes the sole delegated-admission continuity signal for one Oracle fence.
+/// Closes this Oracle fence once its reader epoch selects its own loss.
 ///
 /// The local readiness bit and engine cancellation close synchronously before
 /// the exact durable role row is marked unready. Refreshing the local immutable
 /// snapshot then prevents both local Gate dispatch and remote forwarding from
 /// selecting the dead owner. Query streams observe engine cancellation and
 /// retain their existing terminal-settlement guards.
-async fn run_delegated_continuity_monitor(
-    mut losses: tokio::sync::mpsc::Receiver<wyrd_spec::vala::api::OracleAdmissionContinuityLost>,
+async fn run_reader_epoch_loss_monitor(
     engine: Arc<OracleEngine>,
     cluster: Arc<ClusterRegistry>,
     registered_role: RegisteredRole,
@@ -782,45 +779,19 @@ async fn run_delegated_continuity_monitor(
     advertise_ready: Arc<AtomicBool>,
     shutdown: CancellationToken,
 ) {
-    let own_loss = || wyrd_spec::vala::api::OracleAdmissionContinuityLost {
-        holder_node_id: registered_role.key.node_id,
-        holder_fencing_token: registered_role.fencing_token,
-    };
-    // The reader epoch's own loss is a continuity loss for this exact fence,
-    // and it is selected before its audited edge commits, so it must reach
-    // this monitor directly rather than waiting for a delegated report that
-    // an epoch fencing itself never produces.
-    let loss = tokio::select! {
+    // The reader epoch's own loss is selected before its audited edge commits,
+    // so this monitor observes the epoch directly rather than waiting for a
+    // report an epoch fencing itself never produces.
+    tokio::select! {
         () = shutdown.cancelled() => return,
-        () = engine.reader_authority().loss_selected_notify().cancelled() => Some(own_loss()),
-        loss = losses.recv() => loss,
-    };
-    let loss = loss.unwrap_or_else(|| {
-        tracing::error!("delegated Oracle continuity channel closed unexpectedly");
-        own_loss()
-    });
-    let exact_signal = crate::oracle::close_local_delegated_continuity(
-        registered_role.key.node_id,
-        registered_role.fencing_token,
-        loss,
-        advertise_ready.as_ref(),
-        &shutdown,
-    );
+        () = engine.reader_authority().loss_selected_notify().cancelled() => {}
+    }
+    crate::oracle::close_local_reader_epoch(advertise_ready.as_ref(), &shutdown);
     lifecycle.begin_draining();
     metrics::gauge!("bifrost_role_ready", "role" => "oracle").set(0.0);
     engine.begin_shutdown();
-    if !exact_signal {
-        tracing::error!(
-            expected_node = ?registered_role.key.node_id,
-            expected_fence = registered_role.fencing_token,
-            actual_node = ?loss.holder_node_id,
-            actual_fence = loss.holder_fencing_token,
-            "delegated Oracle continuity signal did not match its retained fence; deactivating the retained exact role"
-        );
-    };
-    let deactivation =
-        crate::oracle::deactivate_delegated_continuity(&cluster, &registered_role).await;
-    let report = await_delegated_continuity_settlement(
+    let deactivation = crate::oracle::deactivate_lost_reader_epoch(&cluster, &registered_role).await;
+    let report = await_reader_epoch_loss_settlement(
         deactivation,
         engine.shutdown(Instant::now() + Duration::from_secs(5)),
     )
@@ -829,13 +800,13 @@ async fn run_delegated_continuity_monitor(
         tracing::error!(
             active_queries = report.active_queries,
             queued_queries = report.queued_queries,
-            "Oracle continuity shutdown retained unsettled query admission"
+            "Oracle reader-epoch shutdown retained unsettled query admission"
         );
     }
 }
 
 /// Reports durable routing failure without skipping local query settlement.
-async fn await_delegated_continuity_settlement<F, T>(
+async fn await_reader_epoch_loss_settlement<F, T>(
     deactivation: Result<(), vala_bifrost_redux::cluster::ClusterError>,
     settlement: F,
 ) -> T
@@ -843,7 +814,7 @@ where
     F: std::future::Future<Output = T>,
 {
     if let Err(error) = deactivation {
-        tracing::error!(%error, "failed to deactivate Oracle after admission continuity loss");
+        tracing::error!(%error, "failed to deactivate Oracle after reader-epoch loss");
     }
     settlement.await
 }
@@ -2530,12 +2501,12 @@ mod tests {
         drop(absent);
     }
 
-    /// Durable registry failure cannot skip local continuity settlement.
+    /// Durable registry failure cannot skip local reader-epoch settlement.
     #[tokio::test]
-    async fn delegated_continuity_registry_failure_still_settles_local_work() {
+    async fn reader_epoch_loss_registry_failure_still_settles_local_work() {
         let settled = Arc::new(AtomicBool::new(false));
         let observed = Arc::clone(&settled);
-        super::await_delegated_continuity_settlement(
+        super::await_reader_epoch_loss_settlement(
             Err(vala_bifrost_redux::cluster::ClusterError::StaleFence),
             async move {
                 observed.store(true, Ordering::Release);

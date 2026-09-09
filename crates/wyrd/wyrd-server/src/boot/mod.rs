@@ -1676,10 +1676,6 @@ impl<'a> OracleRoleBuilder<'a> {
         let calibrated =
             crate::config::load_oracle_admission_translation(&config.oracle, raw_slots)
                 .map_err(ServerBootError::OraclePeer)?;
-        let delegated_admission_config = config
-            .oracle
-            .delegated_admission_config()
-            .map_err(ServerBootError::OraclePeer)?;
         let oracle_config = OracleConfig {
             planning_permits: config.oracle.planning_permits,
             max_workers_per_query: config.oracle.max_workers_per_query,
@@ -1712,10 +1708,9 @@ impl<'a> OracleRoleBuilder<'a> {
         };
         let operator_pool = postgres.operator_pool().ok_or_else(|| {
             ServerBootError::OraclePeer(
-                "Oracle delegated admission requires the operator pool".to_owned(),
+                "Oracle reader-epoch authority requires the operator pool".to_owned(),
             )
         })?;
-        ensure_oracle_admission_policies(&operator_pool, oracle_config).await?;
         let capabilities = OracleCapabilitiesV1 {
             storage_protocol_version: 1,
             cpu_cores: configured_cpu,
@@ -1913,7 +1908,6 @@ impl<'a> OracleRoleBuilder<'a> {
             tail_ticket_minter: Some(tail_authority),
             tail_discovery: Some(tail_discovery),
             peer_transports: Some(peer_transports),
-            delegated_admission_config,
             config: oracle_config,
         })
         .await
@@ -1945,30 +1939,6 @@ impl<'a> OracleRoleBuilder<'a> {
             shutdown,
         })
     }
-}
-
-/// Initializes every canonical Oracle admission ceiling before role readiness.
-///
-/// Repeated pods validate the same four global and tenant-default rows. Oracle
-/// startup never enumerates tenants or materializes tenant-specific defaults.
-///
-/// # Errors
-///
-/// Returns [`ServerBootError::OraclePeer`] when a durable policy conflicts,
-/// non-canonical policy state exists, or PostgreSQL cannot commit initialization.
-async fn ensure_oracle_admission_policies(
-    operator_pool: &vala_sql::OperatorPool,
-    config: OracleConfig,
-) -> Result<(), ServerBootError> {
-    vala_sql::queries::oracle_admission::OracleAdmissionBlocks::new(operator_pool)
-        .ensure_canonical_policies(
-            config.interactive_slots,
-            config.analytical_slots,
-            config.tenant_interactive_slots,
-            config.tenant_analytical_slots,
-        )
-        .await
-        .map_err(|error| ServerBootError::OraclePeer(error.to_string()))
 }
 
 /// Rejects plaintext live remote Oracle membership before runtime publication.

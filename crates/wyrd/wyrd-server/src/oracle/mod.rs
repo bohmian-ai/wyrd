@@ -5,7 +5,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::cluster::{ClusterError, ClusterRegistry, RegisteredRole};
 use vala_bifrost_redux::oracle::dispatcher::OraclePeerWorker;
-use wyrd_spec::vala::api::{NodeId, OracleAdmissionContinuityLost};
 
 mod audit_wal;
 mod forwarding;
@@ -43,22 +42,16 @@ pub use tail_audit::PostgresTailSecurityAudit;
 pub use tail_authority::ScribeTailAuthority;
 pub use tail_discovery::RegistryTailStreamDiscovery;
 
-/// Closes the local serving latch for one delegated-continuity notification.
+/// Closes the local serving latch once this Oracle's reader epoch is lost.
 ///
-/// The latch closes and the shared Oracle cancellation token fires even when a
-/// malformed signal does not match the expected fence. The boolean reports the
-/// exact match so the lifecycle owner can diagnose corruption while remaining
-/// fail-closed.
-pub(crate) fn close_local_delegated_continuity(
-    expected_node: NodeId,
-    expected_fence: u64,
-    loss: OracleAdmissionContinuityLost,
+/// The latch closes and the shared Oracle cancellation token fires together, so
+/// no request path can select this node after its own epoch selected loss.
+pub(crate) fn close_local_reader_epoch(
     advertise_ready: &AtomicBool,
     shutdown: &CancellationToken,
-) -> bool {
+) {
     advertise_ready.store(false, Ordering::Release);
     shutdown.cancel();
-    loss.holder_node_id == expected_node && loss.holder_fencing_token == expected_fence
 }
 
 /// Removes one retained Oracle fence from durable and local routing discovery.
@@ -67,7 +60,7 @@ pub(crate) fn close_local_delegated_continuity(
 ///
 /// Returns [`ClusterError`] when the exact fenced readiness mutation or the
 /// following immutable snapshot refresh cannot complete.
-pub(crate) async fn deactivate_delegated_continuity(
+pub(crate) async fn deactivate_lost_reader_epoch(
     cluster: &ClusterRegistry,
     registered_role: &RegisteredRole,
 ) -> Result<(), ClusterError> {
@@ -137,16 +130,16 @@ impl OraclePeerRuntime {
 mod tests {
     use super::*;
     use wyrd_dev_fixtures::pg::PgFixture;
-    use wyrd_spec::vala::api::{OracleCapabilitiesV1, QueryClass, ScribeCapabilitiesV1};
+    use wyrd_spec::vala::api::{NodeId, OracleCapabilitiesV1, QueryClass, ScribeCapabilitiesV1};
 
-    /// Delegated continuity loss closes readiness and settles cancellation work.
+    /// Reader-epoch loss closes readiness and settles cancellation work.
     ///
     /// # Panics
     ///
-    /// Panics when the exact fence is not recognized, local readiness remains
-    /// open, or an affected task does not observe cancellation and settle.
+    /// Panics when local readiness remains open, the exact durable role row is
+    /// still ready, or an affected task does not observe cancellation and settle.
     #[tokio::test]
-    async fn delegated_continuity_loss_deactivates_exact_oracle_fence_and_settles_queries() {
+    async fn reader_epoch_loss_deactivates_exact_oracle_fence_and_settles_queries() {
         let fixture = PgFixture::start().await.expect("PostgreSQL fixture starts");
         let node_id = NodeId::new(uuid::Uuid::from_u128(41));
         let cluster = ClusterRegistry::new(fixture.vala_postgres().clone(), node_id);
@@ -186,20 +179,10 @@ mod tests {
             task_settled.store(true, Ordering::Release);
         });
         let ready = AtomicBool::new(true);
-        let loss = OracleAdmissionContinuityLost {
-            holder_node_id: node_id,
-            holder_fencing_token: oracle.fencing_token,
-        };
-        assert!(close_local_delegated_continuity(
-            oracle.key.node_id,
-            oracle.fencing_token,
-            loss,
-            &ready,
-            &shutdown,
-        ));
-        deactivate_delegated_continuity(&cluster, &oracle)
+        close_local_reader_epoch(&ready, &shutdown);
+        deactivate_lost_reader_epoch(&cluster, &oracle)
             .await
-            .expect("continuity event deactivates exact role");
+            .expect("reader-epoch loss deactivates exact role");
         task.await.expect("affected query settles");
         assert!(!ready.load(Ordering::Acquire));
         assert!(settled.load(Ordering::Acquire));
@@ -225,20 +208,5 @@ mod tests {
         .await
         .expect("durable Oracle readiness");
         assert!(!durable_ready);
-
-        let mismatch_shutdown = CancellationToken::new();
-        let mismatch_ready = AtomicBool::new(true);
-        assert!(!close_local_delegated_continuity(
-            node_id,
-            oracle.fencing_token,
-            OracleAdmissionContinuityLost {
-                holder_node_id: node_id,
-                holder_fencing_token: oracle.fencing_token + 1,
-            },
-            &mismatch_ready,
-            &mismatch_shutdown,
-        ));
-        assert!(!mismatch_ready.load(Ordering::Acquire));
-        assert!(mismatch_shutdown.is_cancelled());
     }
 }

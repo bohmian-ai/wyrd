@@ -877,7 +877,6 @@ impl OracleAdmission {
             },
             physical_projections: Vec::new(),
             local_permit: Some(permit),
-            delegated_grant: None,
             live_reservations: Vec::new(),
             cancellation: self.shared.root_cancel.child_token(),
             request_cancellation: cancellation,
@@ -1114,8 +1113,6 @@ pub(super) struct AdmittedQueryGuard {
     >,
     /// Aggregate leader-local class, tenant, memory, and spill permit.
     local_permit: Option<LocalPermit>,
-    /// Delegated global, tenant, and principal policy unit retained for the attempt.
-    delegated_grant: Option<super::DelegatedOracleAdmissionGrant>,
     /// Canonical local slot-use gauge retained with the running permit.
     /// Parent reservations retaining drained live batches through stream cleanup.
     pub(super) live_reservations: Vec<AccountedMemoryReservation>,
@@ -1191,7 +1188,6 @@ impl Drop for AdmittedQueryGuard {
         if let Some(permit) = self.local_permit.take() {
             permit.release_inner();
         }
-        self.delegated_grant.take();
         #[cfg(feature = "test-support")]
         if let Some(probe) = &self.resource_probe {
             probe.release_local();
@@ -1282,11 +1278,6 @@ impl AdmittedQueryGuard {
         if let Some(ownership) = self.analytical.as_ref() {
             ownership.record_egress();
         }
-    }
-
-    /// Retains the already-acquired delegated policy unit through stream settlement.
-    pub(super) fn retain_delegated_grant(&mut self, grant: super::DelegatedOracleAdmissionGrant) {
-        self.delegated_grant = Some(grant);
     }
 
     /// Materializes every pinned physical table under this admitted query owner.
@@ -1432,7 +1423,6 @@ impl AdmittedQueryGuard {
         if let Some(permit) = self.local_permit.take() {
             permit.release_inner();
         }
-        self.delegated_grant.take();
         #[cfg(feature = "test-support")]
         if let Some(probe) = &self.resource_probe {
             probe.release_local();
@@ -1496,7 +1486,6 @@ pub(super) fn admitted_guard_for_test()
                 shape: None,
                 released: AtomicBool::new(false),
             }),
-            delegated_grant: None,
             live_reservations: Vec::new(),
             cancellation: cancellation.clone(),
             request_cancellation: request_cancellation.clone(),

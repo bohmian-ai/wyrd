@@ -706,47 +706,6 @@ pub struct CancelOracleLifecycleResponse {
     pub cancellation_started: bool,
 }
 
-/// One durable accounting level used by delegated Oracle query admission.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(rename_all = "snake_case")]
-pub enum OracleAdmissionScopeKind {
-    /// Cluster-wide class ceiling.
-    Global,
-    /// Tenant-local class ceiling.
-    Tenant,
-    /// Principal accounting that inherits the tenant ceiling.
-    Principal,
-}
-
-/// A holder demand submitted to the background delegated-capacity allocator.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-pub struct OracleAdmissionDemand {
-    /// Tenant whose canonical policy applies.
-    pub tenant_id: DataTenantId,
-    /// Authenticated principal accounted within the tenant.
-    pub principal_id: PrincipalId,
-    /// Query class requested by local waiters.
-    pub query_class: QueryClass,
-    /// Exact configured number of units requested from each scope.
-    pub requested_units: u32,
-    /// Physical Oracle role holder.
-    pub holder_node_id: NodeId,
-    /// Exact Oracle role incarnation.
-    pub holder_fencing_token: FencingToken,
-}
-
-/// Typed signal emitted once when delegated admission continuity is lost.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-pub struct OracleAdmissionContinuityLost {
-    /// Physical Oracle role whose cached blocks are closed.
-    pub holder_node_id: NodeId,
-    /// Exact role incarnation that lost continuity.
-    pub holder_fencing_token: FencingToken,
-}
-
 /// One logical frame in the public query stream.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]

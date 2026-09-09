@@ -72,7 +72,6 @@ pub use exec::iceberg_projection_probe;
 #[cfg(feature = "test-support")]
 pub use exec::{remote_partition_attempts_for_test, reset_remote_partition_attempts_for_test};
 pub mod follower;
-mod ownership;
 mod participant_cut;
 pub mod peer;
 pub mod planner;
@@ -116,11 +115,6 @@ pub use admission::OracleAdmission;
 pub use admission::{QueryResourceProbe, QueryResourceSnapshot};
 pub use exec::TenantTripwireExec;
 use exec::{HotFileSource, OracleQueryScanStats, OracleTableInputs, OracleTableProvider};
-pub use ownership::{
-    DEFAULT_DELEGATED_ALLOCATION_UNITS, DelegatedAdmissionBlock, DelegatedAdmissionRequest,
-    DelegatedOracleAdmission, DelegatedOracleAdmissionConfig, DelegatedOracleAdmissionError,
-    DelegatedOracleAdmissionGrant, DelegatedOracleAdmissionWorker,
-};
 pub use participant_cut::{
     OracleQueryAttemptCut, OracleQueryAttemptCutError, OracleQueryAttemptRoster,
     OracleQueryParticipant,
@@ -1402,7 +1396,7 @@ pub struct OracleBuildConfig {
     pub catalog: Arc<BifrostCatalog>,
     /// Tenant-scoped SQL owner.
     pub vala: ValaPostgres,
-    /// Cross-tenant operator pool used only by delegated admission background work.
+    /// Cross-tenant operator pool used by Oracle reader-epoch authority work.
     pub operator_pool: vala_sql::OperatorPool,
     /// Immutable membership registry.
     pub cluster: Arc<ClusterRegistry>,
@@ -1455,8 +1449,6 @@ pub struct OracleBuildConfig {
     pub peer_transports: Option<Arc<dispatcher::OraclePeerTransportDirectory>>,
     /// Engine limits and lifecycle values.
     pub config: OracleConfig,
-    /// Validated delegated policy-capacity lifecycle settings.
-    pub delegated_admission_config: DelegatedOracleAdmissionConfig,
 }
 
 /// Local Oracle limits and bounded lifecycle settings.
@@ -1709,12 +1701,6 @@ pub struct Oracle {
     planner: OraclePlanner,
     /// Admission state and local guards.
     admission: Arc<OracleAdmission>,
-    /// Cached-only policy admission owner bound to the exact local role fence.
-    delegated_admission: Arc<DelegatedOracleAdmission>,
-    /// Typed continuity-loss handoff retained for the distributed query consumer.
-    delegated_loss: Mutex<
-        Option<tokio::sync::mpsc::Receiver<wyrd_spec::vala::api::OracleAdmissionContinuityLost>>,
-    >,
     /// Immutable membership registry retained for planning and worker selection.
     cluster: Arc<ClusterRegistry>,
     /// Reservation owner this node's fragment and graph paths both charge against.
@@ -1776,8 +1762,6 @@ pub struct Oracle {
     startup_result: Mutex<Option<StartupResultReceiver>>,
     /// Cancellation-bound local admission lifecycle task.
     maintenance: Mutex<Option<JoinHandle<()>>>,
-    /// Background-only `PostgreSQL` allocator and renewal task.
-    delegated_maintenance: Mutex<Option<JoinHandle<()>>>,
     /// Test-tier one-shot pause after immutable worker selection.
     #[cfg(feature = "test-support")]
     topology_probe: Mutex<Option<Arc<OracleTopologyProbe>>>,
@@ -1918,72 +1902,6 @@ fn validate_oracle_config(config: OracleConfig) -> Result<(), BifrostError> {
         });
     }
     Ok(())
-}
-
-/// One node's composed delegated-admission owner and its maintenance task.
-///
-/// Returned together because the worker only means anything alongside the
-/// admission owner it drains for, and the loss receiver only alongside the
-/// channel that owner was built with.
-struct ComposedDelegatedAdmission {
-    /// Delegated admission owner shared with the rest of Oracle.
-    delegated_admission: Arc<DelegatedOracleAdmission>,
-    /// Background worker draining this node's delegated demand.
-    delegated_maintenance: tokio::task::JoinHandle<()>,
-    /// Receiver signalling that delegated leadership was lost.
-    loss_rx: tokio::sync::mpsc::Receiver<wyrd_spec::vala::api::OracleAdmissionContinuityLost>,
-}
-
-/// Builds this node's delegated-admission owner and starts its worker.
-///
-/// The demand channel is sized from the queue capacity so a node cannot buffer
-/// more delegated demand than it would ever admit, and the worker is spawned on
-/// the caller's runtime rather than an ad hoc one so it shuts down with the
-/// process that composed it.
-///
-/// # Errors
-///
-/// Returns [`BifrostError::Internal`] when the delegated owner rejects its
-/// configuration, or when Oracle is being constructed outside a Tokio runtime.
-fn compose_delegated_admission(
-    admission: &Arc<OracleAdmission>,
-    delegated_config: DelegatedOracleAdmissionConfig,
-    operator_pool: vala_sql::OperatorPool,
-    queue_capacity: u32,
-    shutdown: &CancellationToken,
-) -> Result<ComposedDelegatedAdmission, BifrostError> {
-    let (demand_tx, demand_rx) = tokio::sync::mpsc::channel(queue_capacity.max(1) as usize);
-    let (loss_tx, loss_rx) = tokio::sync::mpsc::channel(1);
-    let delegated_admission = Arc::new(
-        DelegatedOracleAdmission::new(
-            admission.local_role.key.node_id,
-            admission.local_role.fencing_token,
-            delegated_config,
-            demand_tx,
-            loss_tx,
-        )
-        .map_err(|error| BifrostError::Internal {
-            detail: error.to_string(),
-        })?,
-    );
-    let delegated_maintenance = tokio::runtime::Handle::try_current()
-        .map_err(|_| BifrostError::Internal {
-            detail: "Oracle construction requires an active Tokio runtime".to_owned(),
-        })?
-        .spawn(
-            DelegatedOracleAdmissionWorker::new(
-                operator_pool,
-                Arc::clone(&delegated_admission),
-                demand_rx,
-                shutdown.clone(),
-            )
-            .run(),
-        );
-    Ok(ComposedDelegatedAdmission {
-        delegated_admission,
-        delegated_maintenance,
-        loss_rx,
-    })
 }
 
 /// Everything one node needs to compose its Analytical execution handle.
@@ -2249,17 +2167,6 @@ impl Oracle {
         ));
         admission.refresh(&cluster.snapshot());
         let shutdown = config.shutdown;
-        let ComposedDelegatedAdmission {
-            delegated_admission,
-            delegated_maintenance,
-            loss_rx,
-        } = compose_delegated_admission(
-            &admission,
-            config.delegated_admission_config,
-            operator_pool.clone(),
-            config.config.queue_capacity,
-            &shutdown,
-        )?;
         let ready = Arc::new(AtomicBool::new(false));
         let (maintenance, startup_result) =
             OracleAdmission::start_maintenance(shutdown.clone(), Arc::clone(&ready))?;
@@ -2305,8 +2212,6 @@ impl Oracle {
         Ok(Self {
             planner,
             admission,
-            delegated_admission,
-            delegated_loss: Mutex::new(Some(loss_rx)),
             cluster,
             reservations: Arc::clone(&config.reservations),
             running_queries,
@@ -2331,7 +2236,6 @@ impl Oracle {
             ready,
             startup_result: Mutex::new(Some(startup_result)),
             maintenance: Mutex::new(Some(maintenance)),
-            delegated_maintenance: Mutex::new(Some(delegated_maintenance)),
             #[cfg(feature = "test-support")]
             topology_probe: Mutex::new(None),
             #[cfg(feature = "test-support")]
@@ -3457,8 +3361,7 @@ impl Oracle {
         deadline: Instant,
         attempt_id: QueryId,
     ) -> Result<AdmittedQueryGuard, BifrostError> {
-        let delegated = self.acquire_delegated_admission(context, query_class)?;
-        let mut admitted = self
+        let admitted = self
             .admission
             .admit_for_attempt(
                 admission::PreparedAdmission {
@@ -3471,46 +3374,7 @@ impl Oracle {
                 attempt_id,
             )
             .await?;
-        admitted.retain_delegated_grant(delegated);
         Ok(admitted)
-    }
-
-    /// Charges one dynamic-tenant delegated unit before local query admission.
-    ///
-    /// Both generic SQL and typed analytical plans use this exact background-
-    /// backed gate, preserving admission-before-execution without giving either
-    /// request path a `PostgreSQL` capability.
-    ///
-    /// This is synchronous and never waits. Durable capacity is refilled by a
-    /// background worker; a query that arrives ahead of a refill is covered by
-    /// bounded overdraft and proceeds under the local per-tenant ceilings. There
-    /// is therefore no deadline to observe here — the operation cannot block, so
-    /// it cannot consume the caller's remaining query budget.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BifrostError::QueryAdmissionRejected`] when overdraft is
-    /// exhausted, and [`BifrostError::OracleRoleUnavailable`] when delegated
-    /// continuity is closed or local state cannot be read.
-    fn acquire_delegated_admission(
-        &self,
-        context: &AuthorizedQueryContext,
-        query_class: QueryClass,
-    ) -> Result<DelegatedOracleAdmissionGrant, BifrostError> {
-        self.delegated_admission
-            .acquire(DelegatedAdmissionRequest {
-                tenant_id: context.data_tenant_id,
-                principal_id: context.principal.id,
-                query_class,
-            })
-            .map_err(|error| match error {
-                DelegatedOracleAdmissionError::QueueFull => BifrostError::QueryAdmissionRejected,
-                DelegatedOracleAdmissionError::InvalidConfig
-                | DelegatedOracleAdmissionError::ContinuityLost
-                | DelegatedOracleAdmissionError::StateUnavailable => {
-                    BifrostError::OracleRoleUnavailable
-                }
-            })
     }
 
     async fn plan_sql_attempt(
@@ -3669,8 +3533,7 @@ impl Oracle {
         }
         let class = QueryClass::Analytical;
         let query_telemetry = self.telemetry.start_query(options.visibility, class);
-        let delegated = self.acquire_delegated_admission(&context, class)?;
-        let mut admitted = self
+        let admitted = self
             .admission
             .admit(admission::PreparedAdmission {
                 tenant: context.data_tenant_id,
@@ -3680,7 +3543,6 @@ impl Oracle {
                 cancellation: self.shutdown.child_token(),
             })
             .await?;
-        admitted.retain_delegated_grant(delegated);
         self.execute_typed_plan(&context, plan, options, class, query_telemetry, admitted)
             .await
     }
@@ -4008,35 +3870,6 @@ impl Oracle {
         &self.vala
     }
 
-    /// Returns the exact-role local delegated policy admission owner.
-    #[must_use]
-    pub fn delegated_admission(&self) -> &Arc<DelegatedOracleAdmission> {
-        &self.delegated_admission
-    }
-
-    /// Transfers the typed continuity-loss receiver to the distributed query owner.
-    ///
-    /// # Errors
-    ///
-    /// Returns an internal error when the receiver was already transferred or
-    /// its ownership lock is poisoned.
-    pub fn take_delegated_continuity_loss(
-        &self,
-    ) -> Result<
-        tokio::sync::mpsc::Receiver<wyrd_spec::vala::api::OracleAdmissionContinuityLost>,
-        BifrostError,
-    > {
-        self.delegated_loss
-            .lock()
-            .map_err(|_| BifrostError::Internal {
-                detail: "delegated continuity receiver lock is poisoned".to_owned(),
-            })?
-            .take()
-            .ok_or_else(|| BifrostError::Internal {
-                detail: "delegated continuity receiver was already transferred".to_owned(),
-            })
-    }
-
     /// Cancels lifecycle maintenance and drains owned cleanup until `deadline`.
     ///
     /// The lifecycle task is aborted at expiry. Dropping this future can leave
@@ -4087,22 +3920,6 @@ impl Oracle {
                 .is_err()
             {
                 maintenance.abort();
-            }
-        }
-        let delegated = self
-            .delegated_maintenance
-            .lock()
-            .ok()
-            .and_then(|mut handle| handle.take());
-        if let Some(mut delegated) = delegated {
-            let remaining = deadline
-                .checked_duration_since(Instant::now())
-                .unwrap_or(Duration::ZERO);
-            if tokio::time::timeout(remaining, &mut delegated)
-                .await
-                .is_err()
-            {
-                delegated.abort();
             }
         }
         // Retirement owns its own ordering end to end: it closes admission,

@@ -125,7 +125,6 @@ mod tests {
     const MIXED_EXECUTOR_QUERY_MODULES: &[&str] = &[
         "forge_operations.rs",
         "forge_tasks.rs",
-        "oracle_admission.rs",
     ];
 
     /// Returns whether a query module is a sanctioned mixed executor owner.

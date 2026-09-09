@@ -104,6 +104,29 @@ impl TableConfig {
         Self::from_arrow(fqn, Arc::new(arrow))
     }
 
+    /// Build a config from a Rust type that derives [`schemars::JsonSchema`].
+    ///
+    /// The Rust twin of the Pydantic and Zod doors: `from_model::<Prediction>`
+    /// is [`TableConfig::from_json_schema`] over `schemars::schema_for!(T)`, so
+    /// a Rust struct, a Pydantic model, and a Zod object that describe the same
+    /// columns reach the same Arrow schema through the same single mapper.
+    ///
+    /// The declared type must be a struct of supported scalar, list, or nested
+    /// struct fields; `schemars` emits a `$ref` for a nested type, which the
+    /// shared mapper resolves only from a `$defs` section.
+    ///
+    /// # Errors
+    ///
+    /// As [`TableConfig::from_json_schema`].
+    pub fn from_model<T: schemars::JsonSchema>(fqn: &str) -> Result<Self, ValaSdkError> {
+        let schema = serde_json::to_value(schemars::schema_for!(T)).map_err(|error| {
+            wyrd_queue::WyrdQueueError::SchemaParse(format!(
+                "model schema is not representable as JSON: {error}"
+            ))
+        })?;
+        Self::from_json_schema(fqn, &schema)
+    }
+
     /// Fetch an already-registered table's config by name.
     ///
     /// Reads `GET /v1/bifrost/tables/{namespace}/{name}` and takes the schema

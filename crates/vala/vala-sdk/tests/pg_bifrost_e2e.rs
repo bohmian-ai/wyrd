@@ -36,7 +36,9 @@ mod pg_tests {
     use wyrd_spec::DataTenantId;
     use wyrd_spec::reference::CardRef;
     use wyrd_spec::request_id::RequestId;
-    use wyrd_spec::vala::api::{BifrostQueryRequest, FreshnessPolicy, VisibilityMode};
+    use wyrd_spec::vala::api::{
+        BifrostQueryRequest, FreshnessPolicy, QueryTerminalOutcome, RegisterOutcome, VisibilityMode,
+    };
     use wyrd_testing::bifrost::write::{BifrostWriter, RawIngest};
     use wyrd_testing::server::WyrdTestServer;
 
@@ -1658,6 +1660,262 @@ mod pg_tests {
         assert_eq!(sink.sent_rows.load(Ordering::SeqCst), accepted + 1);
 
         drop(bifrost);
+        srv.shutdown().await.expect("server shutdown");
+    }
+
+    /// A `WyrdClient` for one freshly bootstrapped admin service on `srv`.
+    ///
+    /// Both planes are configured from the live harness: HTTP for register,
+    /// describe, and query; gRPC for ingest. `connect_retries: 0` keeps a
+    /// journey failure immediate instead of retried.
+    async fn admin_client(srv: &WyrdTestServer, service: &str) -> WyrdClient {
+        let bootstrap = srv
+            .bootstrap_service(service, &["admin"])
+            .await
+            .expect("bootstrap journey service");
+        WyrdClient::with_config(ClientConfig {
+            grpc: GrpcConfig {
+                endpoint: srv.grpc_url().expect("gRPC URL"),
+                connect_retries: 0,
+                ..GrpcConfig::default()
+            },
+            http: HttpConfig {
+                base_url: srv.base_url().expect("HTTP URL").to_owned(),
+                ..HttpConfig::default()
+            },
+            credential: Some(bootstrap.api_key().expect("machine API key").clone()),
+            ..ClientConfig::default()
+        })
+        .expect("journey SDK client")
+    }
+
+    /// A caller-owned table name in the namespace users may register into.
+    fn owned_fqn(prefix: &str) -> String {
+        format!("vala.datasets.{prefix}_{}", uuid::Uuid::now_v7().simple())
+    }
+
+    /// Flatten one collected result's `(id, value)` pairs in row order.
+    fn id_value_rows(batches: &[RecordBatch]) -> Vec<(i64, String)> {
+        let mut rows = Vec::new();
+        for batch in batches {
+            let ids = batch
+                .column_by_name("id")
+                .expect("id column")
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .expect("id is Int64");
+            let values = batch
+                .column_by_name("value")
+                .expect("value column")
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .expect("value is Utf8");
+            for index in 0..batch.num_rows() {
+                rows.push((ids.value(index), values.value(index).to_owned()));
+            }
+        }
+        rows
+    }
+
+    /// The whole Rust unified-client journey against one real server.
+    ///
+    /// Register, insert, swap the active table before flushing, insert again,
+    /// drain, then read both tables back — one through `sql` and one through
+    /// `stream`, so the collected and streamed doors are both exercised on the
+    /// rows this journey actually wrote. The blocking facade's advanced query
+    /// escape hatch is reached on the same client, off the runtime's worker
+    /// threads, because that surface has no async twin to stand in for it.
+    #[tokio::test]
+    async fn unified_client_registers_writes_swaps_and_reads_both_tables() {
+        let srv = WyrdTestServer::start_bound()
+            .await
+            .expect("test server start");
+        let client = admin_client(&srv, "sdk-unified-journey").await;
+
+        let first_fqn = owned_fqn("journey_first");
+        let second_fqn = owned_fqn("journey_second");
+        let bifrost = Bifrost::connect_with_table(&client, table(&first_fqn))
+            .await
+            .expect("unified client connects");
+
+        assert_eq!(
+            bifrost.register().await.expect("register the first table"),
+            RegisterOutcome::Created
+        );
+        assert_eq!(
+            bifrost
+                .register()
+                .await
+                .expect("re-register an equal declaration"),
+            RegisterOutcome::AlreadyExists,
+            "an equal schema is idempotent, not a conflict"
+        );
+        let resolved = bifrost
+            .table()
+            .expect("the first table stays bound")
+            .resolved()
+            .cloned()
+            .expect("register resolves the server identity");
+        assert!(!resolved.table_uid.is_empty() && !resolved.fingerprint.is_empty());
+
+        let first_rows = vec![(4i64, "fourth".to_owned()), (5, "fifth".to_owned())];
+        for (id, value) in &first_rows {
+            bifrost
+                .insert(
+                    format!(r#"{{"id": {id}, "value": "{value}"}}"#).into_bytes(),
+                    Correlation::default(),
+                )
+                .expect("insert into the first table");
+        }
+
+        // Swap before flushing: the swapped-away producer must still drain, so
+        // the rows above are not stranded by the rebinding.
+        bifrost.use_table(table(&second_fqn));
+        assert_eq!(
+            bifrost.register().await.expect("register the second table"),
+            RegisterOutcome::Created
+        );
+        bifrost
+            .insert(
+                br#"{"id": 7, "value": "second-table"}"#.to_vec(),
+                Correlation::default(),
+            )
+            .expect("insert into the second table");
+        assert_eq!(
+            bifrost.producer_count(),
+            2,
+            "the swapped-away producer is still pooled"
+        );
+
+        bifrost.flush().await.expect("flush every pooled producer");
+        bifrost.shutdown().await.expect("shutdown drains and stops");
+        srv.flush_bifrost()
+            .await
+            .expect("publish the server-owned Scribe");
+
+        let collected = bifrost
+            .sql(&format!("SELECT id, value FROM {first_fqn} ORDER BY id"))
+            .await
+            .expect("collect the first table");
+        assert_eq!(collected.terminal().outcome, QueryTerminalOutcome::Success);
+        assert_eq!(id_value_rows(collected.batches()), first_rows);
+
+        let mut stream = bifrost
+            .stream(&format!("SELECT id, value FROM {second_fqn} ORDER BY id"))
+            .await
+            .expect("stream the second table");
+        let mut streamed = Vec::new();
+        while let Some(batch) = stream.next_batch().await.expect("stream the next batch") {
+            streamed.push(batch);
+        }
+        assert_eq!(
+            id_value_rows(&streamed),
+            vec![(7, "second-table".to_owned())]
+        );
+        assert!(
+            stream.terminal().is_some(),
+            "a complete stream carries its validated terminal"
+        );
+
+        // The blocking facade's escape hatch is the async client's own
+        // `QueryClient`, so describing the registered table through it must
+        // answer the same identity register minted.
+        let blocking_client = client.clone();
+        let described_fqn = first_fqn.clone();
+        let described = tokio::task::spawn_blocking(move || {
+            let blocking =
+                vala_sdk::blocking::Bifrost::connect(&blocking_client).expect("blocking facade");
+            let (namespace, name) = described_fqn
+                .rsplit_once('.')
+                .expect("the journey table is `<namespace>.<name>`");
+            wyrd_runtime::runtime()
+                .block_on(blocking.query().describe_table(namespace, name))
+                .expect("describe through the blocking escape hatch")
+        })
+        .await
+        .expect("blocking describe task joins");
+        assert_eq!(described.entry.table_uid, resolved.table_uid);
+        assert_eq!(described.entry.fingerprint, resolved.fingerprint);
+
+        srv.shutdown().await.expect("server shutdown");
+    }
+
+    /// A table swapped in while registration is in flight keeps its own identity.
+    ///
+    /// `register` releases the active-table lock for its network round trip, so
+    /// the response can arrive after `use_table` has rebound the client. The
+    /// swap here is deterministic rather than timed: the register future is
+    /// polled exactly once, which runs its synchronous request-building section
+    /// and parks on the HTTP response, and only then is the binding replaced.
+    #[tokio::test]
+    async fn register_never_stamps_one_tables_identity_onto_another() {
+        let srv = WyrdTestServer::start_bound()
+            .await
+            .expect("test server start");
+        let client = admin_client(&srv, "sdk-register-race").await;
+
+        let bound_fqn = owned_fqn("race_bound");
+        let inflight_fqn = owned_fqn("race_inflight");
+        let bifrost = Bifrost::connect_with_table(&client, table(&bound_fqn))
+            .await
+            .expect("unified client connects");
+        assert_eq!(
+            bifrost.register().await.expect("register the bound table"),
+            RegisterOutcome::Created
+        );
+        let bound = bifrost.table().expect("the bound table stays bound");
+        let bound_identity = bound
+            .resolved()
+            .cloned()
+            .expect("the bound table is resolved");
+
+        // Bind the second declaration, start its registration, and let it reach
+        // its first await before rebinding to the already-resolved first table.
+        bifrost.use_table(table(&inflight_fqn));
+        let register = bifrost.register();
+        tokio::pin!(register);
+        tokio::select! {
+            biased;
+            _ = &mut register => panic!("register cannot settle before the server answers"),
+            () = std::future::ready(()) => {}
+        }
+        bifrost.use_table(bound);
+        assert_eq!(
+            register
+                .await
+                .expect("the in-flight registration completes"),
+            RegisterOutcome::Created
+        );
+
+        let active = bifrost.table().expect("the rebound table stays bound");
+        assert_eq!(active.fqn(), bound_fqn);
+        assert_eq!(
+            active.resolved(),
+            Some(&bound_identity),
+            "a response must never overwrite the identity of a different table"
+        );
+
+        // The in-flight declaration was genuinely created server-side, and
+        // re-registering it resolves its own distinct identity.
+        bifrost.use_table(table(&inflight_fqn));
+        assert_eq!(
+            bifrost
+                .register()
+                .await
+                .expect("re-register the in-flight table"),
+            RegisterOutcome::AlreadyExists
+        );
+        let inflight_identity = bifrost
+            .table()
+            .expect("the in-flight table is bound")
+            .resolved()
+            .cloned()
+            .expect("re-registering resolves it");
+        assert_ne!(
+            inflight_identity.table_uid, bound_identity.table_uid,
+            "two tables must not share one server-minted uid"
+        );
+
         srv.shutdown().await.expect("server shutdown");
     }
 }

@@ -13,7 +13,7 @@ use wyrd_queue::QueueConfig;
 use wyrd_spec::vala::api::RegisterOutcome;
 
 use crate::bifrost::QueryResult;
-use crate::query::{QueryResultStream, ValaSdkError};
+use crate::query::{QueryClient, QueryResultStream, ValaSdkError};
 use crate::table::{Correlation, TableConfig};
 
 /// The synchronous [`crate::Bifrost`].
@@ -157,6 +157,17 @@ impl Bifrost {
         Ok(BlockingQueryStream {
             inner: block_on(self.inner.stream(query))?,
         })
+    }
+
+    /// Escape hatch to the full query surface: lifecycle controls, typed trace
+    /// and GenAI reads, describe.
+    ///
+    /// The async client's own [`QueryClient`], not a second implementation: its
+    /// methods are futures a caller drives on whatever runtime it already has,
+    /// so the blocking facade adds no advanced-query behavior of its own.
+    #[must_use]
+    pub fn query(&self) -> &QueryClient {
+        self.inner.query()
     }
 
     /// The async client underneath, for a caller that acquires a runtime later.

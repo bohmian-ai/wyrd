@@ -388,6 +388,52 @@ mod sdk {
         );
     }
 
+    /// The Rust model door reaches exactly the columns the shared JSON-Schema
+    /// mapper produces.
+    ///
+    /// `from_model` is the Rust twin of the Pydantic and Zod paths, so the
+    /// proof that matters is that a `schemars`-derived type and the same
+    /// document handed to `from_json_schema` land on one Arrow schema rather
+    /// than two mappings that agree only today.
+    #[test]
+    fn table_config_from_a_schemars_model_matches_its_json_schema() {
+        /// The user columns a Rust writer declares through `schemars`.
+        #[derive(schemars::JsonSchema)]
+        #[allow(dead_code, reason = "fields exist to be reflected, never read")]
+        struct Prediction {
+            /// The model that produced the row.
+            model: String,
+            /// The scored value.
+            score: f64,
+            /// Billed tokens.
+            tokens: i64,
+        }
+
+        let from_model = TableConfig::from_model::<Prediction>("genai.predictions")
+            .expect("a flat schemars model declares a table");
+        let document =
+            serde_json::to_value(schemars::schema_for!(Prediction)).expect("model schema is JSON");
+        let from_document = TableConfig::from_json_schema("genai.predictions", &document)
+            .expect("the same document declares the same table");
+
+        assert_eq!(from_model.fqn(), "genai.predictions");
+        assert_eq!(from_model.user_schema(), from_document.user_schema());
+        assert_eq!(
+            from_model
+                .user_schema()
+                .fields()
+                .iter()
+                .map(|field| (field.name().as_str(), field.data_type().clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("model", DataType::Utf8),
+                ("score", DataType::Float64),
+                ("tokens", DataType::Int64),
+            ],
+            "the model door maps through the one shared JSON-Schema table"
+        );
+    }
+
     /// A write with nothing bound refuses instead of guessing a destination.
     #[test]
     fn insert_without_an_active_table_refuses() {
@@ -398,6 +444,24 @@ mod sdk {
             .expect_err("an unbound write must refuse");
         assert_eq!(error.code(), "WYRD_VALA_412_NO_ACTIVE_TABLE");
         assert_eq!(error.status(), 412);
+        // One catalog owner: the SDK reports the derive-backed metadata rather
+        // than a second hand-written copy that could drift from it.
+        let catalog = wyrd_spec::vala::error::BifrostError::NoActiveTable;
+        assert_eq!(
+            (
+                error.code(),
+                error.status(),
+                error.title(),
+                error.remediation()
+            ),
+            (
+                catalog.code(),
+                catalog.status(),
+                catalog.title(),
+                catalog.remediation()
+            ),
+            "no-active-table metadata must come from the wyrd-spec catalog"
+        );
         assert_eq!(
             bifrost.producer_count(),
             0,

@@ -174,6 +174,10 @@ impl Bifrost {
     /// Abandoning the future may leave the table created server-side with the
     /// local config still unresolved; re-registering is idempotent and
     /// resolves it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the active-table lock is poisoned.
     pub async fn register(&self) -> Result<RegisterOutcome, ValaSdkError> {
         let request = {
             let active = self.active.lock().expect("active table lock poisoned");
@@ -187,8 +191,16 @@ impl Bifrost {
             .client()
             .request_json(reqwest::Method::POST, "/v1/bifrost/tables", Some(&request))
             .await?;
+        // The lock is released for the network round trip, so `use_table` may
+        // have replaced the binding meanwhile. An identity is only ever the
+        // answer to the declaration that asked for it: apply it when the still-
+        // active table would send this exact request, and otherwise leave the
+        // new binding with its own resolution state rather than stamping one
+        // table's uid and fingerprint onto another.
         let mut active = self.active.lock().expect("active table lock poisoned");
-        if let Some(table) = active.as_mut() {
+        if let Some(table) = active.as_mut()
+            && table.register_request() == request
+        {
             table.resolve(&response);
         }
         Ok(response.outcome)
@@ -510,15 +522,6 @@ impl QueryResult {
     }
 }
 
-/// Assemble the ambient [`WyrdClient`] every no-argument constructor uses.
-///
-/// One place so `Bifrost::from_env` and `TableConfig::describe_from_env` cannot
-/// resolve differently.
-///
-/// # Errors
-///
-/// Returns the stable no-credentials error when the chain yields nothing, or a
-/// transport error when the HTTP client cannot be built.
 /// The SDK-facing spelling of one register outcome.
 ///
 /// The wire enum serializes as `Created`/`AlreadyExists`; every language
@@ -533,6 +536,17 @@ pub fn register_outcome_name(outcome: RegisterOutcome) -> &'static str {
     }
 }
 
+/// Assemble the ambient [`WyrdClient`] every no-argument constructor uses.
+///
+/// Delegates to [`client_from_options`] with nothing overridden, so
+/// [`Bifrost::from_env`] and [`crate::TableConfig::describe_from_env`] cannot
+/// resolve their endpoints or credential differently from each other or from an
+/// explicitly-configured client.
+///
+/// # Errors
+///
+/// Returns the stable no-credentials error when the chain yields nothing, or a
+/// transport error when the HTTP client cannot be built.
 pub(crate) fn client_from_env() -> Result<WyrdClient, ValaSdkError> {
     client_from_options(None, None, None)
 }

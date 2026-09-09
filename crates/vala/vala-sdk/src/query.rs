@@ -10,6 +10,8 @@ use arrow::record_batch::RecordBatch;
 use chrono::SecondsFormat;
 use futures_util::{Stream, StreamExt};
 use wyrd_client::WyrdClient;
+use wyrd_client::error::WyrdClientError;
+use wyrd_queue::WyrdQueueError;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
@@ -62,7 +64,7 @@ pub enum ValaSdkError {
     /// catalog variant, and collapsing them would report saturation as an
     /// internal error to every language SDK.
     #[error("bifrost write failed: {0}")]
-    Queue(#[from] wyrd_queue::WyrdQueueError),
+    Queue(#[from] WyrdQueueError),
     /// A client-tier configuration, credential, or transport failure.
     ///
     /// Carried verbatim for the same reason [`ValaSdkError::Queue`] is: the
@@ -70,7 +72,7 @@ pub enum ValaSdkError {
     /// variant, and collapsing them would report an unresolvable credential
     /// chain as an internal error in every language SDK.
     #[error("{0}")]
-    Client(#[from] wyrd_client::error::WyrdClientError),
+    Client(#[from] WyrdClientError),
 }
 
 impl ValaSdkError {
@@ -128,7 +130,7 @@ impl ValaSdkError {
             Self::IncompleteQueryStream => "WYRD_VALA_502_QUERY_STREAM_INCOMPLETE",
             Self::FailedTerminal { terminal } => terminal_bifrost_error(terminal).code(),
             Self::ResultTooLarge => "WYRD_VALA_413_QUERY_RESULT_TOO_LARGE",
-            Self::NoActiveTable => "WYRD_VALA_412_NO_ACTIVE_TABLE",
+            Self::NoActiveTable => BifrostError::NoActiveTable.code(),
             Self::Queue(error) => error.code(),
             Self::Client(error) => error.code(),
         }
@@ -142,7 +144,7 @@ impl ValaSdkError {
             Self::Protocol(_) | Self::Arrow(_) | Self::IncompleteQueryStream => 502,
             Self::FailedTerminal { terminal } => terminal_bifrost_error(terminal).status(),
             Self::ResultTooLarge => 413,
-            Self::NoActiveTable => 412,
+            Self::NoActiveTable => BifrostError::NoActiveTable.status(),
             Self::Queue(error) => queue_status(error),
             Self::Client(error) => client_status(error),
         }
@@ -157,7 +159,7 @@ impl ValaSdkError {
             Self::IncompleteQueryStream => "Query stream incomplete",
             Self::FailedTerminal { terminal } => terminal_bifrost_error(terminal).title(),
             Self::ResultTooLarge => "Query result too large",
-            Self::NoActiveTable => "No active Bifrost table",
+            Self::NoActiveTable => BifrostError::NoActiveTable.title(),
             Self::Queue(error) => queue_title(error),
             Self::Client(error) => client_title(error),
         }
@@ -178,9 +180,7 @@ impl ValaSdkError {
             Self::ResultTooLarge => {
                 "Reduce the query result or raise the caller's explicit collection limit within its hard ceiling."
             }
-            Self::NoActiveTable => {
-                "Bind a table with use_table or use_table_by_name before inserting rows."
-            }
+            Self::NoActiveTable => BifrostError::NoActiveTable.remediation(),
             Self::Queue(error) => queue_remediation(error),
             Self::Client(error) => client_remediation(error),
         }
@@ -235,36 +235,33 @@ impl From<ValaSdkError> for WyrdError {
 ///
 /// The `WYRD_CLIENT_*` codes are client-boundary projections with no catalog
 /// variant, so this is the single place their numeric half is stated.
-fn client_status(error: &wyrd_client::error::WyrdClientError) -> u16 {
-    use wyrd_client::error::WyrdClientError as Client;
+fn client_status(error: &WyrdClientError) -> u16 {
     match error {
-        Client::Config { .. } => 400,
-        Client::NoCredentials => 401,
-        Client::TransportDown { .. } => 503,
+        WyrdClientError::Config { .. } => 400,
+        WyrdClientError::NoCredentials => 401,
+        WyrdClientError::TransportDown { .. } => 503,
     }
 }
 
 /// The stable title of one client-tier transport failure.
-fn client_title(error: &wyrd_client::error::WyrdClientError) -> &'static str {
-    use wyrd_client::error::WyrdClientError as Client;
+fn client_title(error: &WyrdClientError) -> &'static str {
     match error {
-        Client::Config { .. } => "Client configuration invalid",
-        Client::NoCredentials => "No credentials available",
-        Client::TransportDown { .. } => "Transport unavailable",
+        WyrdClientError::Config { .. } => "Client configuration invalid",
+        WyrdClientError::NoCredentials => "No credentials available",
+        WyrdClientError::TransportDown { .. } => "Transport unavailable",
     }
 }
 
 /// Operator-facing remediation for one client-tier transport failure.
-fn client_remediation(error: &wyrd_client::error::WyrdClientError) -> &'static str {
-    use wyrd_client::error::WyrdClientError as Client;
+fn client_remediation(error: &WyrdClientError) -> &'static str {
     match error {
-        Client::Config { .. } => {
+        WyrdClientError::Config { .. } => {
             "Correct the supplied server URL, gRPC endpoint, or credential before constructing the client."
         }
-        Client::NoCredentials => {
+        WyrdClientError::NoCredentials => {
             "Set WYRD_ACCESS_TOKEN, WYRD_WORKLOAD_TOKEN with WYRD_TENANT, or WYRD_API_KEY, pass an explicit credential, or add [default].api_key to ~/.config/wyrd/credentials.toml."
         }
-        Client::TransportDown { .. } => {
+        WyrdClientError::TransportDown { .. } => {
             "Confirm the Wyrd server is reachable at the resolved endpoint and retry."
         }
     }
@@ -275,50 +272,47 @@ fn client_remediation(error: &wyrd_client::error::WyrdClientError) -> &'static s
 /// The queue owns its own stable codes; this is the single place their numeric
 /// half is stated, so every language SDK reports the same status for the same
 /// refusal.
-fn queue_status(error: &wyrd_queue::WyrdQueueError) -> u16 {
-    use wyrd_queue::WyrdQueueError as Queue;
+fn queue_status(error: &WyrdQueueError) -> u16 {
     match error {
-        Queue::QueueFull | Queue::Backpressure => 429,
-        Queue::FlushTimeout => 504,
-        Queue::PayloadTooLarge => 413,
-        Queue::SchemaParse(_) | Queue::ReservedColumn(_) => 400,
-        Queue::Sink(inner) => inner.status(),
+        WyrdQueueError::QueueFull | WyrdQueueError::Backpressure => 429,
+        WyrdQueueError::FlushTimeout => 504,
+        WyrdQueueError::PayloadTooLarge => 413,
+        WyrdQueueError::SchemaParse(_) | WyrdQueueError::ReservedColumn(_) => 400,
+        WyrdQueueError::Sink(inner) => inner.status(),
     }
 }
 
 /// The stable title of one client-tier queue refusal.
-fn queue_title(error: &wyrd_queue::WyrdQueueError) -> &'static str {
-    use wyrd_queue::WyrdQueueError as Queue;
+fn queue_title(error: &WyrdQueueError) -> &'static str {
     match error {
-        Queue::QueueFull | Queue::Backpressure => "Write queue saturated",
-        Queue::FlushTimeout => "Write flush timed out",
-        Queue::PayloadTooLarge => "Write payload too large",
-        Queue::SchemaParse(_) => "Schema parse failed",
-        Queue::ReservedColumn(_) => "Reserved column name",
-        Queue::Sink(inner) => inner.title(),
+        WyrdQueueError::QueueFull | WyrdQueueError::Backpressure => "Write queue saturated",
+        WyrdQueueError::FlushTimeout => "Write flush timed out",
+        WyrdQueueError::PayloadTooLarge => "Write payload too large",
+        WyrdQueueError::SchemaParse(_) => "Schema parse failed",
+        WyrdQueueError::ReservedColumn(_) => "Reserved column name",
+        WyrdQueueError::Sink(inner) => inner.title(),
     }
 }
 
 /// Operator-facing remediation for one client-tier queue refusal.
-fn queue_remediation(error: &wyrd_queue::WyrdQueueError) -> &'static str {
-    use wyrd_queue::WyrdQueueError as Queue;
+fn queue_remediation(error: &WyrdQueueError) -> &'static str {
     match error {
-        Queue::QueueFull | Queue::Backpressure => {
+        WyrdQueueError::QueueFull | WyrdQueueError::Backpressure => {
             "Slow the write rate or flush more often; the producer channel, staging ring, and byte budget are all occupied."
         }
-        Queue::FlushTimeout => {
+        WyrdQueueError::FlushTimeout => {
             "Retry the flush; the in-flight batch did not acknowledge before the drain deadline."
         }
-        Queue::PayloadTooLarge => {
+        WyrdQueueError::PayloadTooLarge => {
             "Reduce the row size; a single sealed row exceeds the configured max_message_bytes."
         }
-        Queue::SchemaParse(_) => {
+        WyrdQueueError::SchemaParse(_) => {
             "Correct the declared column types so every field maps onto a supported Bifrost type."
         }
-        Queue::ReservedColumn(_) => {
+        WyrdQueueError::ReservedColumn(_) => {
             "Rename the column; wyrd_*, card_ref, and run_id are server-owned names."
         }
-        Queue::Sink(inner) => inner.remediation(),
+        WyrdQueueError::Sink(inner) => inner.remediation(),
     }
 }
 

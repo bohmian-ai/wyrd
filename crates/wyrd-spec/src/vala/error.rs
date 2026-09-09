@@ -434,6 +434,21 @@ pub enum BifrostError {
     )]
     QueryResultTooLarge,
 
+    /// A client attempted a Bifrost write with no table bound as its target.
+    ///
+    /// Client-raised rather than server-raised: the SDK refuses the row before
+    /// it can be routed anywhere. The metadata still lives in this catalog
+    /// because it crosses the Rust, Python, and TypeScript boundaries, and a
+    /// second hand-written copy per SDK is how the four fields drift apart.
+    #[error("no active Bifrost table")]
+    #[wyrd_error(
+        code = "WYRD_VALA_412_NO_ACTIVE_TABLE",
+        status = 412,
+        title = "No active Bifrost table",
+        remediation = "Bind a table with use_table or use_table_by_name before inserting rows."
+    )]
+    NoActiveTable,
+
     /// The decompressed canonical ingest payload exceeded the Scribe limit.
     ///
     /// Both bounds are public data: `bytes` is what the server measured and

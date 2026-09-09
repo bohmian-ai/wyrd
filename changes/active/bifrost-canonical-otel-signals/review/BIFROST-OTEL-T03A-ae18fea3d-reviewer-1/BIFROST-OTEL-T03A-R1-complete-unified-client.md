@@ -98,3 +98,41 @@ git diff --check
 ```
 
 Record baseline-identical unrelated failures separately; do not weaken, suppress, ignore, or delete any gate or test to obtain a pass.
+
+## Implementation Evidence
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| `FIND-BIFROST-OTEL-T03A-1` | `crates/vala/vala-sdk/src/table.rs::TableConfig::from_model` (workspace `schemars`, delegating to the existing `from_json_schema` path); `crates/vala/vala-sdk/src/blocking.rs::Bifrost::query` returning the async client's own `QueryClient`; `typescript/wyrd/src/index.ts::QueryResult.{toArrow,toBytes}` over the already-installed `apache-arrow` | `mise exec -- cargo nextest run --offline -p vala-sdk --lib -E 'test(=sdk::table_config_from_a_schemars_model_matches_its_json_schema)'` (1 passed); `pg_tests::unified_client_registers_writes_swaps_and_reads_both_tables` describes through `blocking::Bifrost::query()`; `mise run test:bifrost:journey:typescript` → `converts a collected result to Arrow and to IPC bytes`; `mise run ts:typecheck` | PASS |
+| `FIND-BIFROST-OTEL-T03A-2` | `crates/vala/vala-sdk/tests/pg_bifrost_e2e.rs::unified_client_registers_writes_swaps_and_reads_both_tables`; `python/py-wyrd/tests/integration/test_bifrost_e2e.py::{test_registering_a_different_schema_on_one_name_conflicts,test_negative_non_select_query_is_refused,test_negative_oversized_query_is_refused}` | `mise run test:bifrost:journey:sdk` (12 passed); `mise run test:bifrost:journey:python` (27 passed) | PASS |
+| `FIND-BIFROST-OTEL-T03A-3` | `crates/vala/vala-sdk/src/bifrost.rs::Bifrost::register` applies the response only when the still-active table would send that exact `RegisterTableRequest` | `pg_tests::register_never_stamps_one_tables_identity_onto_another` (deterministic: the register future is polled once through `tokio::select!` before the rebinding). Reverting the guard reproduces the defect — the rebound table takes the in-flight table's `table_uid`. | PASS |
+| `FIND-BIFROST-OTEL-T03A-4` | `crates/wyrd-spec/src/vala/error.rs::BifrostError::NoActiveTable` owns code/status/title/remediation; `crates/vala/vala-sdk/src/query.rs::ValaSdkError` delegates all four | `mise exec -- cargo nextest run --offline -p vala-sdk --lib -E 'test(=sdk::insert_without_an_active_table_refuses)'` asserts the four fields equal the catalog variant's; `mise run codegen:check` (All checks passed); Python `test_insert_without_an_active_table_refuses` and TypeScript `refuses a write with no active table…` still report `WYRD_VALA_412_NO_ACTIVE_TABLE`/412 | PASS |
+| `FIND-BIFROST-OTEL-T03A-5` | `crates/shared/wyrd-client/src/transport/credential.rs` hoists `ExposeSecret` to the module block; `crates/vala/vala-sdk/src/query.rs` hoists `WyrdClientError`/`WyrdQueueError`; the stray `client_from_env` rustdoc moved off `register_outcome_name` onto `client_from_env` | `mise run fmt`; `mise run lints` (clean, no suppressions); the base→HEAD Rust diff contains no function-scoped `use` in production code | PASS |
+| `FIND-BIFROST-OTEL-T03A-6` | `crates/shared/wyrd-client/src/error.rs::WyrdClientError::NoCredentials` names `ClientConfig::credential` in both its rustdoc and its `#[error]` text | `mise exec -- cargo nextest run --locked -p wyrd-client --lib -E 'test(=error::tests::no_credentials_guidance_names_the_credential_field)'` — fails if `ClientConfig::api_key` guidance returns | PASS |
+
+### Verification commands
+
+| Command | Result |
+|---|---|
+| `mise run test:bifrost:journey:sdk` | PASS (12 tests) |
+| `mise run test:bifrost:journey:python` | PASS (27 tests) |
+| `mise run test:bifrost:journey:typescript` | PASS (9 tests) |
+| `mise run py:format` / `py:lints` / `py:typecheck` | PASS |
+| `mise run ts:typecheck` / `ts:napi:check` / `ts:test:unit` | PASS |
+| `mise run codegen:check` | PASS (no drift) |
+| `mise run check:client-tier` / `check:pyo3-scope` | PASS |
+| `mise run fmt` / `mise run lints` | PASS |
+| `mise run py:test:unit` | PASS (432 passed) |
+| `mise exec -- cargo nextest run --locked -p wyrd-client --lib` | PASS |
+| `mise run check:unwrap-audit` | FAIL — pre-existing, `crates/wyrd/wyrd-testing/src/bifrost/process_cluster.rs`, outside this write set and excluded by this remediation's constraints |
+| `git diff --check` | PASS |
+
+### Non-goals
+
+Confirmed excluded: no root multi-service client, multi-table insert, client-side
+fingerprint, context manager, global config file, compatibility alias, migration,
+backfill, or legacy reader; no new harness, test target, runtime, framework,
+schema mapper, or Arrow dependency; no redesign of query streaming, producer
+lifecycle, authentication grants, or the client-local queue error taxonomy. The
+reported pre-existing Forge/Scribe, OTLP-placeholder, tenant-isolation, and
+unwrap-audit failures were left untouched.

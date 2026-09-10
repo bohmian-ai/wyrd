@@ -163,6 +163,20 @@ impl NativeWyrdTestServer {
     /// Returns a napi error when the harness is closed or provisioning fails.
     #[napi]
     pub fn ensure_builtin_table(&self, namespace: String, name: String) -> napi::Result<()> {
+        let result = self.ensure_builtin_table_borrowed(&namespace, &name);
+        drop(namespace);
+        drop(name);
+        result
+    }
+
+    /// Delegates the N-API-owned names without extending their ownership into
+    /// the Rust harness call.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error when the harness lock is poisoned, the server is
+    /// already closed, or provisioning fails.
+    fn ensure_builtin_table_borrowed(&self, namespace: &str, name: &str) -> napi::Result<()> {
         let guard = self
             .server
             .lock()
@@ -173,8 +187,8 @@ impl NativeWyrdTestServer {
         wyrd_runtime::runtime()
             .block_on(server.ensure_builtin_table_for_test(
                 server.data_tenant_id(),
-                &namespace,
-                &name,
+                namespace,
+                name,
             ))
             .map_err(|error| napi::Error::from_reason(error.to_string()))
     }
@@ -191,6 +205,21 @@ impl NativeWyrdTestServer {
     /// is closed or role seeding or bootstrapping fails.
     #[napi]
     pub fn scoped_api_key(&self, role: String, permissions: Vec<String>) -> napi::Result<String> {
+        let result = self.scoped_api_key_borrowed(&role, &permissions);
+        drop(role);
+        drop(permissions);
+        result
+    }
+
+    /// Delegates the N-API-owned role and permissions without extending their
+    /// ownership into the Rust harness call.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error for an unparsable permission, or when the harness
+    /// lock is poisoned, the server is closed, or seeding or bootstrapping
+    /// fails.
+    fn scoped_api_key_borrowed(&self, role: &str, permissions: &[String]) -> napi::Result<String> {
         let guard = self
             .server
             .lock()
@@ -210,8 +239,8 @@ impl NativeWyrdTestServer {
             .collect::<napi::Result<Vec<_>>>()?;
         let bootstrap = wyrd_runtime::runtime()
             .block_on(async {
-                server.seed_role(&role, &parsed).await?;
-                server.bootstrap_service(&role, &[role.as_str()]).await
+                server.seed_role(role, &parsed).await?;
+                server.bootstrap_service(role, &[role]).await
             })
             .map_err(|error| napi::Error::from_reason(error.to_string()))?;
         match bootstrap {

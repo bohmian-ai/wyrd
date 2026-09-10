@@ -125,15 +125,6 @@ pub fn hourly_layout(sort_keys: Vec<SortKeyWire>, bloom_columns: &[&str]) -> Phy
     }
 }
 
-/// Entity mapping used by time-bound acceleration.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EntityBoundsMapping {
-    /// Entity kind.
-    pub entity_kind: String,
-    /// Physical identifier column.
-    pub entity_id_column: String,
-}
-
 /// A table-owned canonical value validator.
 ///
 /// A canonical signal table supplies one of these so the registry can enforce
@@ -175,8 +166,6 @@ pub struct BuiltinTableDefinition {
     /// row, the Parquet Bloom recipe, and every partition identity — is derived
     /// from that one canonical layout.
     pub physical_layout: fn() -> PhysicalLayoutWire,
-    /// Optional entity mapping.
-    pub entity_bounds_mapping: fn() -> Option<EntityBoundsMapping>,
 }
 
 /// A table definition implemented by the canonical registry.
@@ -262,10 +251,6 @@ pub trait DomainTable: Send + Sync + 'static {
     /// Bloom floor.
     fn physical_layout() -> PhysicalLayoutWire {
         hourly_layout(vec![sort_desc(WYRD_EVENT_TIME)], &[])
-    }
-    /// Optional entity bounds mapping.
-    fn entity_bounds_mapping() -> Option<EntityBoundsMapping> {
-        None
     }
 }
 
@@ -680,7 +665,6 @@ const fn definition<T: DomainTable>() -> BuiltinTableDefinition {
         canonical_physical_fingerprint: T::canonical_physical_fingerprint,
         canonical_validator: T::CANONICAL_VALIDATOR,
         physical_layout: T::physical_layout,
-        entity_bounds_mapping: T::entity_bounds_mapping,
     }
 }
 

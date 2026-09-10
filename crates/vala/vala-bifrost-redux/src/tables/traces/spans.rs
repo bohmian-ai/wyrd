@@ -13,8 +13,7 @@ use arrow::datatypes::Field;
 
 use crate::tables::fields::{CanonicalField as F, CanonicalType as T, canonical_arrow_fields};
 use crate::tables::{
-    CorrelationPolicy, DomainTable, EntityBoundsMapping, PayloadClass, hourly_layout, sort_asc,
-    sort_desc,
+    CorrelationPolicy, DomainTable, PayloadClass, hourly_layout, sort_asc, sort_desc,
 };
 use wyrd_spec::vala::api::PhysicalLayoutWire;
 use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
@@ -139,13 +138,6 @@ impl DomainTable for SpansTable {
             vec![sort_desc(WYRD_EVENT_TIME), sort_asc("trace_id")],
             &["trace_id", "span_id", "service_name"],
         )
-    }
-
-    fn entity_bounds_mapping() -> Option<EntityBoundsMapping> {
-        Some(EntityBoundsMapping {
-            entity_kind: "trace".into(),
-            entity_id_column: "trace_id".into(),
-        })
     }
 }
 

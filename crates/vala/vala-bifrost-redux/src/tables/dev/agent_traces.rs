@@ -2,8 +2,7 @@ use arrow::datatypes::Field;
 
 use crate::tables::fields::{fixed_binary, ts_us_utc, utf8};
 use crate::tables::{
-    CorrelationPolicy, DomainTable, EntityBoundsMapping, PayloadClass, hourly_layout, sort_asc,
-    sort_desc,
+    CorrelationPolicy, DomainTable, PayloadClass, hourly_layout, sort_asc, sort_desc,
 };
 use wyrd_spec::vala::api::PhysicalLayoutWire;
 
@@ -40,12 +39,5 @@ impl DomainTable for AgentTracesTable {
             vec![sort_desc("started_at"), sort_asc("dev_session_id")],
             &["dev_session_id", "repo"],
         )
-    }
-
-    fn entity_bounds_mapping() -> Option<EntityBoundsMapping> {
-        Some(EntityBoundsMapping {
-            entity_kind: "agent_run".into(),
-            entity_id_column: "dev_session_id".into(),
-        })
     }
 }

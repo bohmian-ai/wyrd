@@ -1769,7 +1769,7 @@ mod tests {
             RequestId::now_v7(),
             None,
             wyrd_spec::vala::api::AuthMethod::Internal,
-            permission.to_string(),
+            permission,
         )
         .expect("tenant-bound query context");
         ForwardQueryClaims {

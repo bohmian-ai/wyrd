@@ -1,7 +1,7 @@
 //! Auth-bound adapters from Gate transports and typed plans into retained Oracle.
 
 use vala_bifrost_redux::oracle::{AuthorizedQueryContext, OracleQueryStream, QueryIpcDecodeError};
-use wyrd_runtime::{Permission, PermissionVerdict};
+use wyrd_runtime::{Action, Permission, PermissionDenyReason, PermissionVerdict, Resource};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
@@ -37,24 +37,79 @@ pub(crate) async fn authorize_audited(
     match verdict {
         PermissionVerdict::Allow => Ok(()),
         PermissionVerdict::Deny { reason } => {
-            let event = audit::audit_event(
-                &caller,
-                operation,
-                resource,
-                &required.to_string(),
-                AuditDecision::Deny,
-                AuditResult::Failure,
-                "rbac permission denied",
-            );
-            audit::record_audit_owned(
-                state.postgres.vala_pool().clone(),
-                caller.data_tenant_id,
-                event,
-            )
-            .await?;
-            Err(permission_deny_reason_to_wyrd(reason))
+            record_denial(state, caller, &required, operation, resource, reason).await
         }
     }
+}
+
+/// Admits one query request that holds the Bifrost read capability at all.
+///
+/// This is deliberately coarse. A schema- or table-scoped grant cannot satisfy
+/// an object-wide requirement, so the old exact-global prerequisite would have
+/// rejected every scoped principal at the route before Oracle ever resolved
+/// which tables the SQL touches. The route therefore admits any principal
+/// holding `bifrost_query:read` under *some* scope, and the authoritative
+/// per-object decision is taken inside Oracle against the resolved scan set.
+///
+/// # Errors
+///
+/// Returns the stable authorization denial, or audit-unavailable when the
+/// denial cannot be durably recorded.
+async fn admit_query_capability(
+    state: AppState,
+    caller: Caller,
+    operation: &'static str,
+    resource: &str,
+) -> Result<(), WyrdError> {
+    if caller
+        .principal
+        .effective_permissions
+        .covers_operation(&Resource::BifrostQuery, &Action::Read)
+    {
+        return Ok(());
+    }
+    let required = Permission::bifrost_query_read();
+    let reason = PermissionDenyReason::Rbac {
+        required: required.clone(),
+        principal: caller.principal.id,
+    };
+    record_denial(state, caller, &required, operation, resource, reason).await
+}
+
+/// Durably records one authorization denial before it reaches the caller.
+///
+/// Every refusal on this path fails closed on the audit append: a denial that
+/// cannot be recorded is returned as audit-unavailable rather than as a plain
+/// rejection, so no refusal is silently unlogged.
+///
+/// # Errors
+///
+/// Returns audit-unavailable when the tenant outbox append fails, and otherwise
+/// the stable authorization denial built from `reason`.
+async fn record_denial(
+    state: AppState,
+    caller: Caller,
+    required: &Permission,
+    operation: &'static str,
+    resource: &str,
+    reason: PermissionDenyReason,
+) -> Result<(), WyrdError> {
+    let event = audit::audit_event(
+        &caller,
+        operation,
+        resource,
+        &required.to_string(),
+        AuditDecision::Deny,
+        AuditResult::Failure,
+        "rbac permission denied",
+    );
+    audit::record_audit_owned(
+        state.postgres.vala_pool().clone(),
+        caller.data_tenant_id,
+        event,
+    )
+    .await?;
+    Err(permission_deny_reason_to_wyrd(reason))
 }
 
 /// Converts the authenticated server caller into Oracle's exact context.
@@ -73,7 +128,7 @@ fn oracle_context(caller: &Caller) -> Result<AuthorizedQueryContext, WyrdError> 
         caller.request_id.clone(),
         None,
         AuthMethod::Jwt,
-        Permission::bifrost_query_read().to_string(),
+        Permission::bifrost_query_read(),
     )
     .map(|context| context.with_delegation_chain(caller.delegation_chain.clone()))
     .map_err(Into::into)
@@ -94,10 +149,9 @@ pub async fn stream_query(
     caller: Caller,
     request: BifrostQueryRequest,
 ) -> Result<OracleQueryStream, WyrdError> {
-    authorize_audited(
+    admit_query_capability(
         state.clone(),
         caller.clone(),
-        Permission::bifrost_query_read(),
         "vala.query.sync",
         "vala.query",
     )

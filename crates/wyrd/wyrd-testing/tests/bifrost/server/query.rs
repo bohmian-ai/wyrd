@@ -53,7 +53,7 @@ fn scheduled_context(tenant: DataTenantId) -> Result<AuthorizedQueryContext, Ser
         RequestId::now_v7(),
         None,
         AuthMethod::Internal,
-        permission.to_string(),
+        permission,
     )?)
 }
 

@@ -606,7 +606,7 @@ fn build_event(
         context.principal.id,
         context.principal.kind.tag(),
         context.auth_method,
-        context.permission.clone(),
+        context.permission.to_string(),
         AuditDecision::Allow,
         result,
         "scrubbed Bifrost query decision".to_owned(),
@@ -667,7 +667,7 @@ mod pg_tests {
             RequestId::now_v7(),
             None,
             AuthMethod::Internal,
-            Permission::bifrost_query_read().to_string(),
+            Permission::bifrost_query_read(),
         )
         .expect("matching tenant context")
     }

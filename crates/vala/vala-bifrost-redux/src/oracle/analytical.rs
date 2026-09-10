@@ -4560,7 +4560,7 @@ mod tests {
             wyrd_spec::request_id::RequestId::now_v7(),
             None,
             wyrd_spec::vala::api::AuthMethod::Internal,
-            "bifrost_query:read",
+            wyrd_runtime::Permission::bifrost_query_read(),
         )
         .expect("the fixture principal authorizes one analytical read")
     }

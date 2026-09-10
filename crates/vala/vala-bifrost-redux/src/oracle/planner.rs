@@ -388,6 +388,11 @@ impl OraclePlanner {
             authority,
         )
         .await?;
+        // The complete resolved scan set is the first trustworthy object list a
+        // decision can be taken on, and it exists here before any provider is
+        // registered, any physical plan is built, any admission is charged, any
+        // read acceptance is audited, and any source byte is read.
+        super::authorize_resolved_tables(context, &cuts)?;
         let hot_files = cuts.iter().map(|cut| cut.hot_files.len()).sum::<usize>();
         let iceberg_files = cuts
             .iter()

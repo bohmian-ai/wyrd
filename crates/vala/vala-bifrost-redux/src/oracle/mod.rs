@@ -31,7 +31,10 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 use vala_sql::ValaPostgres;
-use wyrd_runtime::{DelegationStep, Permission, Principal};
+use wyrd_runtime::{
+    BifrostPermissionScope, BifrostTableScope, DelegationStep, Permission, PermissionScope,
+    Principal,
+};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::BifrostError;
@@ -159,8 +162,15 @@ pub struct AuthorizedQueryContext {
     pub trace_id: Option<String>,
     /// Verified authentication method retained by the mandatory audit event.
     pub auth_method: AuthMethod,
-    /// Effective permission checked before the query entered Oracle.
-    pub permission: String,
+    /// Typed operation permission admitted before the query entered Oracle.
+    ///
+    /// Coarse route admission only. The authoritative object decision is taken
+    /// inside Oracle against the *resolved* table set, because parsed SQL names
+    /// are not an authorization boundary. This field therefore travels as the
+    /// typed [`Permission`] rather than as an object-free `resource:action`
+    /// string, and the scoped decision reaches distributed peers through the
+    /// permission digest built from the resolved tables.
+    pub permission: Permission,
     /// Verified initiator-first delegation chain, empty when the caller
     /// presented no `act` claim.
     ///
@@ -289,7 +299,7 @@ impl AuthorizedQueryContext {
         request_id: RequestId,
         trace_id: Option<String>,
         auth_method: AuthMethod,
-        permission: impl Into<String>,
+        permission: Permission,
     ) -> Result<Self, BifrostError> {
         if principal.tenant_id != data_tenant_id {
             return Err(BifrostError::QueryTenantInvariant);
@@ -300,7 +310,7 @@ impl AuthorizedQueryContext {
             request_id,
             trace_id,
             auth_method,
-            permission: permission.into(),
+            permission,
             delegation_chain: Vec::new(),
         })
     }
@@ -1183,7 +1193,7 @@ impl TestPostgresOracleAudit {
             context.principal.id,
             context.principal.kind.tag(),
             context.auth_method,
-            context.permission.clone(),
+            context.permission.to_string(),
             AuditDecision::Allow,
             result,
             "scrubbed Bifrost query decision".to_owned(),
@@ -2672,7 +2682,9 @@ impl Oracle {
             )?
             .as_str()
             .to_owned(),
-            permission_digest: audit_digest(&context.permission)?.as_str().to_owned(),
+            permission_digest: scoped_permission_digest(context, &planned.cuts)?
+                .as_str()
+                .to_owned(),
         })
     }
 
@@ -4657,7 +4669,7 @@ fn read_decision(
             cuts.iter().map(|cut| cut.hot_manifest_digest.as_str()),
         )?,
         projection_digest: audit_digest(sql)?,
-        permission_digest: audit_digest(&context.permission)?,
+        permission_digest: scoped_permission_digest(context, cuts)?,
         execution: QueryExecutionMode::Local,
         selected_node_count: 1,
         worker_count: 0,
@@ -4714,7 +4726,7 @@ fn plan_read_decision(
         snapshot_digest,
         manifest_digest,
         projection_digest: audit_digest(&plan_text)?,
-        permission_digest: audit_digest(&context.permission)?,
+        permission_digest: scoped_permission_digest(context, cuts)?,
         execution: QueryExecutionMode::Local,
         selected_node_count: 1,
         worker_count: 0,
@@ -4749,7 +4761,7 @@ fn authorize_payload_projection(
     let mut protected: Vec<(String, &'static [&'static str], Permission)> = Vec::new();
     for cut in cuts {
         let table_ref = &cut.binding.table_ref;
-        let Some(permission) = payload_permission(table_ref) else {
+        let Some(permission) = payload_permission(table_ref, resolved_table_scope(cut)?) else {
             continue;
         };
         let Some(definition) = table_ref
@@ -4823,7 +4835,10 @@ fn refuse_protected_scan(
 /// the doctrine names no metric payload permission, so it is deliberately not
 /// gated here: inventing a fifth permission would be a contract change rather
 /// than an implementation decision.
-fn payload_permission(table: &crate::catalog::TableRef) -> Option<Permission> {
+fn payload_permission(
+    table: &crate::catalog::TableRef,
+    scope: PermissionScope,
+) -> Option<Permission> {
     let resource = match (table.namespace.as_str(), table.name.as_str()) {
         ("vala.traces", "spans") => wyrd_runtime::Resource::BifrostTracePayload,
         ("vala.logs", "records") => wyrd_runtime::Resource::BifrostLogPayload,
@@ -4833,7 +4848,104 @@ fn payload_permission(table: &crate::catalog::TableRef) -> Option<Permission> {
     Some(Permission {
         resource,
         action: wyrd_runtime::Action::Read,
+        scope,
     })
+}
+
+/// Projects one pinned table's catalog-resolved identity into RBAC object scope.
+///
+/// The scope is built from the *cut*, never from SQL text: the flattened
+/// internal namespace `vala.<schema>` is split back into the logical catalog and
+/// schema a grant names, and the object identity is the registered
+/// [`TableUid`](crate::catalog::TableUid) the pin resolved. An alias, a view
+/// expansion, or a second spelling of the same table therefore cannot present a
+/// different object to the checker.
+///
+/// # Errors
+///
+/// Returns [`BifrostError::QueryForbidden`] when a pinned namespace does not
+/// split into a logical catalog and schema, which would leave the table with no
+/// nameable object identity and must fail closed.
+pub(super) fn resolved_table_scope(
+    cut: &PinnedSealedTable,
+) -> Result<PermissionScope, BifrostError> {
+    let table_ref = &cut.binding.table_ref;
+    let (catalog, schema) = table_ref
+        .namespace
+        .as_str()
+        .split_once('.')
+        .ok_or(BifrostError::QueryForbidden)?;
+    Ok(PermissionScope::Bifrost(BifrostPermissionScope::Table(
+        BifrostTableScope {
+            catalog: catalog.to_owned(),
+            schema: schema.to_owned(),
+            table_uid: uuid::Uuid::from_bytes(*cut.table_uid.as_bytes()),
+        },
+    )))
+}
+
+/// Refuses the whole query unless every resolved table is individually granted.
+///
+/// This runs on the complete pinned scan set — direct tables, join inputs, and
+/// view expansions alike — and before provider registration, physical planning,
+/// admission, read-audit acceptance, peer dispatch, or any source IO. One
+/// uncovered table denies the query outright: there is no partial plan and no
+/// silently narrowed result.
+///
+/// # Errors
+///
+/// Returns [`BifrostError::QueryForbidden`] for the first resolved table the
+/// principal's effective permissions do not cover, and for any table whose
+/// catalog-resolved identity cannot be named.
+pub(super) fn authorize_resolved_tables(
+    context: &AuthorizedQueryContext,
+    cuts: &[PinnedSealedTable],
+) -> Result<(), BifrostError> {
+    for cut in cuts {
+        let required = Permission {
+            resource: wyrd_runtime::Resource::BifrostQuery,
+            action: wyrd_runtime::Action::Read,
+            scope: resolved_table_scope(cut)?,
+        };
+        if !context.principal.effective_permissions.contains(&required) {
+            tracing::warn!(
+                request_id = %context.request_id,
+                table = %cut.binding.table_ref,
+                "Oracle refused a query over a table this principal is not granted"
+            );
+            return Err(BifrostError::QueryForbidden);
+        }
+    }
+    Ok(())
+}
+
+/// Digests the coordinator's scoped decision and the exact tables it approved.
+///
+/// The digest binds the object axis, not just the operation: a peer that
+/// received this attempt can only reproduce the value from the same permission
+/// *and* the same ordered authorized table identities, so a worker cannot widen
+/// the approved table set without failing the existing digest comparison.
+///
+/// # Errors
+///
+/// Returns [`BifrostError::QueryAuditUnavailable`] when the decision cannot be
+/// canonicalized or the digest falls outside the bounded audit contract, and
+/// [`BifrostError::QueryForbidden`] when a table carries no nameable identity.
+pub(super) fn scoped_permission_digest(
+    context: &AuthorizedQueryContext,
+    cuts: &[PinnedSealedTable],
+) -> Result<QueryAuditDigest, BifrostError> {
+    let mut scopes = cuts
+        .iter()
+        .map(|cut| {
+            serde_json::to_string(&resolved_table_scope(cut)?)
+                .map_err(|_| BifrostError::QueryAuditUnavailable)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    scopes.sort_unstable();
+    let permission = serde_json::to_string(&context.permission)
+        .map_err(|_| BifrostError::QueryAuditUnavailable)?;
+    audit_digest(&format!("{permission}\n{}", scopes.join("\n")))
 }
 
 /// Collects scrubbed table-binding digests from a validated typed plan.

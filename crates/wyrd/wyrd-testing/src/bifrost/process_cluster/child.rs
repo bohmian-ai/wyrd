@@ -1251,7 +1251,7 @@ async fn drive_inactive_sql(
             wyrd_spec::request_id::RequestId::now_v7(),
             None,
             wyrd_spec::vala::api::AuthMethod::Internal,
-            permission.to_string(),
+            permission,
         )
         .map_err(|error| child(error.to_string()))?;
         // Both query identities are allocated independently on purpose: a

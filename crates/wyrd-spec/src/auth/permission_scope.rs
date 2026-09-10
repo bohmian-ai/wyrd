@@ -183,9 +183,9 @@ impl BifrostPermissionScope {
 fn validate_identifier(field: &'static str, value: &str) -> Result<(), PermissionScopeError> {
     let valid = !value.is_empty()
         && value.len() <= MAX_IDENTIFIER_LEN
-        && value
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || character == '_' || character == '-');
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || character == '_' || character == '-'
+        });
     if valid {
         Ok(())
     } else {

@@ -351,7 +351,7 @@ pub(crate) fn query_context(
         RequestId::now_v7(),
         None,
         AuthMethod::Internal,
-        permission.to_string(),
+        permission,
     )?)
 }
 

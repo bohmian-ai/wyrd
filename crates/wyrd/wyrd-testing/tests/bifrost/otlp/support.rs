@@ -876,6 +876,46 @@ impl OtlpJourney {
         metadata
     }
 
+    /// Mints a bearer whose principal holds exactly `permissions`.
+    ///
+    /// The journey's own principal is an admin, so proving that ingest is
+    /// permission-gated needs a caller that is authenticated and permitted to
+    /// do something but deliberately not permitted to write records. No
+    /// builtin role has that shape, so the role is seeded for the fixture.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the role cannot be seeded, the service cannot be
+    /// bootstrapped, or its API key cannot be exchanged for a bearer.
+    pub(super) async fn token_with_permissions(
+        &self,
+        name: &str,
+        permissions: &[wyrd_runtime::Permission],
+    ) -> String {
+        self.server
+            .seed_role(name, permissions)
+            .await
+            .expect("the fixture role is seeded");
+        let bootstrap = self
+            .server
+            .bootstrap_service(name, &[name])
+            .await
+            .expect("the fixture service is bootstrapped onto its role");
+        let api_key = bootstrap
+            .api_key()
+            .expect("the bootstrapped service carries an API key")
+            .clone();
+        self.server
+            .exchange_api_key(&api_key)
+            .await
+            .expect("the fixture exchanges its API key for a bearer")
+    }
+
+    /// The running harness, for the cases that inject a durable fault.
+    pub(super) fn server(&self) -> &WyrdTestServer {
+        &self.server
+    }
+
     /// The bound HTTP base URL an OTLP/HTTP exporter posts to.
     ///
     /// # Panics
@@ -1011,6 +1051,48 @@ impl OtlpJourney {
             batches.push(batch);
         }
         batches
+    }
+
+    /// Runs one strict fused public query, returning its stable refusal code.
+    ///
+    /// A negative journey has to distinguish "the table holds no matching row"
+    /// from "no accepted record ever materialized this table"; both are proof
+    /// that nothing was committed, so the caller needs the refusal rather than
+    /// a panic.
+    ///
+    /// # Errors
+    ///
+    /// Returns the stable error code when the query is refused before its
+    /// stream opens.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an accepted query does not stream to completion.
+    pub(super) async fn try_query(&self, sql: &str) -> Result<Vec<RecordBatch>, String> {
+        let mut stream = match vala_sdk::query::QueryClient::new(&self.client)
+            .query(&wyrd_spec::vala::api::BifrostQueryRequest {
+                sql: sql.to_owned(),
+                visibility: wyrd_spec::vala::api::VisibilityMode::Fused,
+                freshness: wyrd_spec::vala::api::FreshnessPolicy::Strict,
+                deadline_ms: Some(120_000),
+            })
+            .await
+        {
+            Ok(stream) => stream,
+            Err(vala_sdk::query::ValaSdkError::Transport(error)) => {
+                return Err(error.code().to_owned());
+            }
+            Err(other) => panic!("public query `{sql}` fails outside the stable contract: {other}"),
+        };
+        let mut batches = Vec::new();
+        while let Some(batch) = stream
+            .next_batch()
+            .await
+            .unwrap_or_else(|error| panic!("public query `{sql}` streams: {}", error.detail()))
+        {
+            batches.push(batch);
+        }
+        Ok(batches)
     }
 
     /// Runs one strict fused public query and returns its single row.

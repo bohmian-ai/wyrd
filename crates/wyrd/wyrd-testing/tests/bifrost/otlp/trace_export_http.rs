@@ -79,11 +79,40 @@ pub(super) async fn post_otlp(
     encoding: HttpEncoding,
     body: Vec<u8>,
 ) -> Vec<u8> {
-    let response = reqwest::Client::new()
+    let (status, body) = post_otlp_raw(journey, path, encoding, body, Some(journey.token())).await;
+    assert!(
+        status.is_success(),
+        "the collector accepts the {} export ({status}): {}",
+        encoding.content_type(),
+        String::from_utf8_lossy(&body)
+    );
+    body
+}
+
+/// Posts one encoded OTLP body and returns the status and body verbatim.
+///
+/// A refusal is an outcome the negative journeys assert rather than a defect,
+/// so this form judges nothing: it sends `token` when the case supplies one
+/// and hands back exactly what the collector answered.
+///
+/// # Panics
+///
+/// Panics when the route cannot be reached or its body cannot be read.
+pub(super) async fn post_otlp_raw(
+    journey: &OtlpJourney,
+    path: &str,
+    encoding: HttpEncoding,
+    body: Vec<u8>,
+    token: Option<&str>,
+) -> (reqwest::StatusCode, Vec<u8>) {
+    let mut request = reqwest::Client::new()
         .post(format!("{}{path}", journey.base_url()))
-        .header("x-wyrd-access-token", format!("Bearer {}", journey.token()))
         .header("content-type", encoding.content_type())
-        .body(body)
+        .body(body);
+    if let Some(token) = token {
+        request = request.header("x-wyrd-access-token", format!("Bearer {token}"));
+    }
+    let response = request
         .send()
         .await
         .expect("the OTLP exporter reaches the bound HTTP collector");
@@ -93,13 +122,7 @@ pub(super) async fn post_otlp(
         .await
         .expect("the collector response body is readable")
         .to_vec();
-    assert!(
-        status.is_success(),
-        "the collector accepts the {} export ({status}): {}",
-        encoding.content_type(),
-        String::from_utf8_lossy(&body)
-    );
-    body
+    (status, body)
 }
 
 /// Posts one trace export in the requested HTTP encoding.

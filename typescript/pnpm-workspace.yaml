@@ -8,3 +8,6 @@ packages:
   - wyrd-win32-x64-msvc
 allowBuilds:
   esbuild: true
+  # `@grpc/grpc-js`, which the upstream OTLP/gRPC exporters dial through,
+  # pulls in protobufjs; its postinstall generates the CommonJS wrappers.
+  protobufjs: true

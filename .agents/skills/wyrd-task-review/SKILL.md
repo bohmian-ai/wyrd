@@ -1,6 +1,6 @@
 ---
 name: wyrd-task-review
-description: Adversarially audit one immutable cumulative Wyrd task implementation for exact acceptance and Ponytail minimalism, then write a verdict and any remediation task.
+description: Independently audit one immutable cumulative Wyrd task implementation for exact acceptance, repository-standard compliance, and Ponytail minimalism, then write a verdict and any remediation task.
 ---
 
 # Wyrd Task Review
@@ -31,9 +31,42 @@ The reviewer must be fresh relative to implementation. If the current context
 implemented the change, delegate this audit to one fresh reviewer; otherwise
 review directly. The reviewer receives the original specification and task,
 actual diff, relevant repository rules, and verification results—not the
-implementation agent's completion summary or an intended verdict. Add a
-separate specialist only when a changed high-risk security, tenancy,
+implementation agent's completion summary or an intended verdict.
+
+Always delegate repository-standard compliance to a separate fresh specialist.
+This specialist is independent of both implementation and the primary acceptance
+reviewer. Add another specialist when a changed high-risk security, tenancy,
 concurrency, durability, or persistent-data boundary needs expert review.
+
+## Audit repository standards independently
+
+Give the repository-standards specialist the immutable subject, complete diff,
+repository root, and available verification results. Do not provide the primary
+reviewer's conclusions or an intended verdict.
+
+The specialist reads `AGENTS.md`, [agent rules](../../../architecture/agent-rules.md),
+and the complete applicable authority selected through the
+[reference router](../../../architecture/references/README.md). It maps every
+changed surface to its governing rules and inspects enough surrounding source,
+tests, manifests, generated artifacts, and consumers to determine compliance.
+It audits all touched languages and layers; one surface cannot stand in for
+Rust, Python, TypeScript, server, contract, test, documentation, or tooling
+rules that independently apply.
+
+The specialist returns:
+
+1. an authority-coverage table mapping each changed surface to every applicable
+   repository authority;
+2. a pass or fail result for each applicable rule, with exact rule and source
+   evidence; and
+3. material repository-rule findings with the violated rule, location,
+   consequence, and testable correction.
+
+The specialist does not review task acceptance, propose optional improvements,
+or repeat the Ponytail audit. Missing authority, incomplete coverage, or an
+unavailable independent specialist blocks the review. Preserve its report as
+`standards-review.md` in the review directory and include every material
+standards finding in the primary verdict and remediation task.
 
 ## Apply adversarial Ponytail review
 
@@ -96,12 +129,14 @@ several equally minimal corrections remain.
 ## Verdict and remediation task
 
 Create a new `changes/active/<slug>/review/<review-name>/` directory without
-overwriting a prior attempt. Write `verdict.md` containing the immutable subject,
-acceptance matrix, verification limits, material findings, prior-finding
-closure, and one verdict:
+overwriting a prior attempt. Write the specialist's `standards-review.md`, then
+write `verdict.md` containing the immutable subject, acceptance matrix,
+repository-standards result, verification limits, material findings,
+prior-finding closure, and one verdict:
 
-- `PASS` — every obligation passes, non-goals remain excluded, verification is
-  credible, and no unrelated change entered the diff;
+- `PASS` — every obligation and the independent repository-standards audit
+  passes, non-goals remain excluded, verification is credible, and no unrelated
+  change entered the diff;
 - `FIX_REQUIRED` — one or more bounded implementation findings remain;
 - `SPEC_REVISION_REQUIRED` — correction requires changing approved behavior or
   an expensive-to-reverse decision; or

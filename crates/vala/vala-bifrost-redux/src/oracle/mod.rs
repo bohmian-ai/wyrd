@@ -5335,33 +5335,43 @@ mod tests {
             rotated.len() > 1,
             "attempt identity must rotate the starting position across replicas"
         );
+    }
 
-        // A mixed-capability roster: only nodes 1 and 2 can admit Analytical
-        // work. Every rotation must land inside that pair rather than on a
-        // replica whose local split disabled the class.
-        let mixed = |max_workers: u32| {
-            ClusterSnapshot::observed(
-                (1..=5u64)
-                    .map(|node| {
-                        let mut role = lease(u128::from(node), ClusterRole::Oracle, node);
-                        if let ClusterCapabilities::OracleV1(capabilities) = &mut role.capabilities
-                        {
-                            capabilities.supported_classes = if node <= 2 {
-                                vec![QueryClass::Interactive, QueryClass::Analytical]
-                            } else {
-                                vec![QueryClass::Interactive]
-                            };
-                            capabilities.max_workers_per_query = max_workers;
-                        }
-                        role
-                    })
-                    .collect(),
-                now,
-            )
-        };
+    /// Bounded selection never lands on a replica that cannot admit Analytical.
+    ///
+    /// A remote only ever runs an Analytical fragment, so a rotation that landed
+    /// on a replica whose local split disabled the class would fail a query a
+    /// capable replica could have served.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an incapable replica is selected.
+    #[test]
+    fn analytical_worker_selection_skips_class_incapable_replicas() {
+        let now = Utc::now();
+        let deadline = now + chrono::Duration::seconds(5);
+        let leader = NodeId::new(uuid::Uuid::from_u128(1));
+        // Only nodes 1 and 2 can admit Analytical work.
+        let mixed = ClusterSnapshot::observed(
+            (1..=5u64)
+                .map(|node| {
+                    let mut role = lease(u128::from(node), ClusterRole::Oracle, node);
+                    if let ClusterCapabilities::OracleV1(capabilities) = &mut role.capabilities {
+                        capabilities.supported_classes = if node <= 2 {
+                            vec![QueryClass::Interactive, QueryClass::Analytical]
+                        } else {
+                            vec![QueryClass::Interactive]
+                        };
+                        capabilities.max_workers_per_query = 1;
+                    }
+                    role
+                })
+                .collect(),
+            now,
+        );
         for query in 0..8u128 {
             let cut = OracleQueryAttemptCut::try_from_snapshot(
-                &mixed(1),
+                &mixed,
                 QueryId::new(uuid::Uuid::from_u128(query)),
                 leader,
                 QueryClass::Analytical,
@@ -5371,7 +5381,10 @@ mod tests {
             )
             .expect("the mixed-capability fixture freezes one cut");
             assert_eq!(
-                selected(&cut),
+                cut.oracles()
+                    .iter()
+                    .map(|participant| participant.node_id)
+                    .collect::<Vec<_>>(),
                 vec![leader, NodeId::new(uuid::Uuid::from_u128(2))],
                 "only the one Analytical-capable remote is ever selected"
             );

@@ -3530,7 +3530,7 @@ impl Oracle {
             .planner
             .prepare_typed_cuts(
                 &plan,
-                context.data_tenant_id,
+                context,
                 options.deadline,
                 &self.catalog,
                 &self.reader_authority,
@@ -4770,7 +4770,9 @@ fn authorize_payload_projection(
     let mut protected: Vec<(String, &'static [&'static str], Permission)> = Vec::new();
     for cut in cuts {
         let table_ref = &cut.binding.table_ref;
-        let Some(permission) = payload_permission(table_ref, resolved_table_scope(cut)?) else {
+        let Some(permission) =
+            payload_permission(table_ref, resolved_table_scope(&cut.binding, &cut.table_uid)?)
+        else {
             continue;
         };
         let Some(definition) = table_ref
@@ -4861,25 +4863,29 @@ fn payload_permission(
     })
 }
 
-/// Projects one pinned table's catalog-resolved identity into RBAC object scope.
+/// Projects one catalog-resolved table binding into its RBAC object scope.
 ///
-/// The scope is built from the *cut*, never from SQL text: the flattened
-/// internal namespace `vala.<schema>` is split back into the logical catalog and
-/// schema a grant names, and the object identity is the registered
-/// [`TableUid`](crate::catalog::TableUid) the pin resolved. An alias, a view
+/// The scope is built from the *catalog identity*, never from SQL text: the
+/// flattened internal namespace `vala.<schema>` is split back into the logical
+/// catalog and schema a grant names, and the object identity is the registered
+/// [`TableUid`](crate::catalog::TableUid) the catalog resolved. An alias, a view
 /// expansion, or a second spelling of the same table therefore cannot present a
 /// different object to the checker.
 ///
+/// A prepared identity and the sealed cut it later materializes into carry the
+/// same binding and UID, so both authorization stages name the same object.
+///
 /// # Errors
 ///
-/// Returns [`BifrostError::QueryForbidden`] when a pinned namespace does not
+/// Returns [`BifrostError::QueryForbidden`] when a resolved namespace does not
 /// split into a logical catalog and schema, which would leave the table with no
 /// nameable object identity and must fail closed.
 pub(super) fn resolved_table_scope(
-    cut: &PinnedSealedTable,
+    binding: &crate::catalog::TenantTableBinding,
+    table_uid: &crate::catalog::TableUid,
 ) -> Result<PermissionScope, BifrostError> {
-    let table_ref = &cut.binding.table_ref;
-    let (catalog, schema) = table_ref
+    let (catalog, schema) = binding
+        .table_ref
         .namespace
         .as_str()
         .split_once('.')
@@ -4888,18 +4894,22 @@ pub(super) fn resolved_table_scope(
         BifrostTableScope {
             catalog: catalog.to_owned(),
             schema: schema.to_owned(),
-            table_uid: uuid::Uuid::from_bytes(*cut.table_uid.as_bytes()),
+            table_uid: uuid::Uuid::from_bytes(*table_uid.as_bytes()),
         },
     )))
 }
 
 /// Refuses the whole query unless every resolved table is individually granted.
 ///
-/// This runs on the complete pinned scan set — direct tables, join inputs, and
-/// view expansions alike — and before provider registration, physical planning,
-/// admission, read-audit acceptance, peer dispatch, or any source IO. One
-/// uncovered table denies the query outright: there is no partial plan and no
-/// silently narrowed result.
+/// This runs on the complete *prepared* scan set — direct tables, join inputs,
+/// and view expansions alike — which is the earliest point at which every
+/// requested table has a tenant-bound canonical binding and a stable UID. It
+/// therefore precedes reader-guard acquisition, catalog revalidation, cut
+/// materialization, provider registration, physical planning, admission,
+/// read-audit acceptance, peer dispatch, and any source IO. One uncovered
+/// table denies the query outright: there is no partial plan, no silently
+/// narrowed result, and no materialization work an out-of-scope caller can
+/// observe.
 ///
 /// # Errors
 ///
@@ -4908,18 +4918,18 @@ pub(super) fn resolved_table_scope(
 /// catalog-resolved identity cannot be named.
 pub(super) fn authorize_resolved_tables(
     context: &AuthorizedQueryContext,
-    cuts: &[PinnedSealedTable],
+    prepared: &[crate::catalog::PreparedReaderIdentity],
 ) -> Result<(), BifrostError> {
-    for cut in cuts {
+    for identity in prepared {
         let required = Permission {
             resource: wyrd_runtime::Resource::BifrostQuery,
             action: wyrd_runtime::Action::Read,
-            scope: resolved_table_scope(cut)?,
+            scope: resolved_table_scope(&identity.binding, &identity.table_uid)?,
         };
         if !context.principal.effective_permissions.contains(&required) {
             tracing::warn!(
                 request_id = %context.request_id,
-                table = %cut.binding.table_ref,
+                table = %identity.binding.table_ref,
                 "Oracle refused a query over a table this principal is not granted"
             );
             return Err(BifrostError::QueryForbidden);
@@ -4962,7 +4972,9 @@ pub(super) fn scoped_permission_digest(
 pub(super) fn resolved_table_scopes(
     cuts: &[PinnedSealedTable],
 ) -> Result<Vec<PermissionScope>, BifrostError> {
-    cuts.iter().map(resolved_table_scope).collect()
+    cuts.iter()
+        .map(|cut| resolved_table_scope(&cut.binding, &cut.table_uid))
+        .collect()
 }
 
 /// Collects scrubbed table-binding digests from a validated typed plan.

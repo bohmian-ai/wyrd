@@ -3656,11 +3656,16 @@ impl BifrostResourceGovernor {
 
     /// Charges `DataFusion`'s mandatory infallible growth without refusing.
     ///
-    /// The portion that still fits the governed root is charged exactly as a
-    /// fallible reservation would be. The remainder is real memory the process
-    /// now holds, so it is charged to the explicit headroom counter instead of
-    /// being silently ignored; it never becomes governed free capacity and it
-    /// makes later fallible growth refuse sooner.
+    /// The portion that fits both the governed root and `governed_ceiling` is
+    /// charged exactly as a fallible reservation would be. The remainder is real
+    /// memory the process now holds, so it is charged to the explicit headroom
+    /// counter instead of being silently ignored; it never becomes governed free
+    /// capacity and it makes later fallible growth refuse sooner.
+    ///
+    /// `governed_ceiling` is the calling query's remaining immutable grant. A
+    /// pod with free capacity must not let one query's infallible path govern
+    /// bytes above that grant, because the grant — not the pod root alone — is
+    /// what keeps sibling queries fundable.
     ///
     /// # Errors
     ///
@@ -3669,6 +3674,7 @@ impl BifrostResourceGovernor {
     fn reserve_oracle_query_memory_infallible(
         &self,
         bytes: usize,
+        governed_ceiling: usize,
     ) -> Result<OracleMemoryCharge, BifrostResourceError> {
         let mut state = self.lock_state()?;
         let plan = self.plan();
@@ -3678,7 +3684,9 @@ impl BifrostResourceGovernor {
         let free_floor = plan
             .oracle_floor_bytes
             .saturating_sub(state.oracle_memory_used_bytes);
-        let governed = bytes.min(free_floor.saturating_add(free_elastic));
+        let governed = bytes
+            .min(free_floor.saturating_add(free_elastic))
+            .min(governed_ceiling);
         let headroom = bytes - governed;
         let next = state
             .oracle_memory_used_bytes
@@ -4665,11 +4673,13 @@ impl OracleMemoryRoot {
 
     /// Grows one consumer through the path `DataFusion` does not let fail.
     ///
-    /// Bytes above the governed root are still resident, so the governor
-    /// records them as this consumer's headroom charge rather than dropping
-    /// them. The ledger keeps the same split, so a query that overshoots its
-    /// own ceiling here is refused any further fallible growth and gives its
-    /// headroom back first on shrink.
+    /// Bytes above the governed root, or above this query's remaining ceiling,
+    /// are still resident, so the governor records them as this consumer's
+    /// headroom charge rather than dropping them. The ceiling bound is what
+    /// keeps an idle pod from letting one query govern more than its immutable
+    /// grant. The ledger keeps the same split, so a query that overshoots here
+    /// is refused any further fallible growth and gives its headroom back first
+    /// on shrink.
     fn grow(
         &self,
         view: &OracleQueryMemoryView,
@@ -4682,9 +4692,10 @@ impl OracleMemoryRoot {
         let Ok(mut ledger) = view.lock_ledger() else {
             return;
         };
+        let remaining_ceiling = view.ceiling_bytes.saturating_sub(ledger.governed);
         let charge = match self
             .governor
-            .reserve_oracle_query_memory_infallible(additional)
+            .reserve_oracle_query_memory_infallible(additional, remaining_ceiling)
         {
             Ok(charge) => charge,
             Err(error) => {
@@ -4724,6 +4735,11 @@ impl OracleMemoryRoot {
 struct OracleQueryMemoryLedger {
     /// Aggregate bytes held by this query, checked against its ceiling.
     total: usize,
+    /// Bytes of `total` charged against the governed Oracle root.
+    ///
+    /// Infallible growth bounds its governed component by the ceiling this
+    /// counter has left, so the remainder becomes explicit process headroom.
+    governed: usize,
     /// Governed/headroom split per process-unique `MemoryConsumer::id()`.
     consumers: BTreeMap<usize, OracleMemoryCharge>,
 }
@@ -4731,6 +4747,7 @@ struct OracleQueryMemoryLedger {
 impl OracleQueryMemoryLedger {
     /// Adds one accepted charge to a consumer's retained split.
     fn charge(&mut self, consumer: usize, charge: OracleMemoryCharge) {
+        self.governed = self.governed.saturating_add(charge.governed_bytes);
         let entry = self.consumers.entry(consumer).or_default();
         entry.governed_bytes = entry.governed_bytes.saturating_add(charge.governed_bytes);
         entry.headroom_bytes = entry.headroom_bytes.saturating_add(charge.headroom_bytes);
@@ -4745,6 +4762,7 @@ impl OracleQueryMemoryLedger {
         let governed = entry.governed_bytes.min(bytes - headroom);
         entry.headroom_bytes -= headroom;
         entry.governed_bytes -= governed;
+        self.governed = self.governed.saturating_sub(governed);
         if entry.total() == 0 {
             self.consumers.remove(&consumer);
         }
@@ -5890,6 +5908,36 @@ mod tests {
             0,
             "release restores the query baseline"
         );
+        assert!(oracle.health().reason().is_none());
+
+        // DataFusion's infallible path cannot refuse, so the ceiling is the only
+        // thing that stops one query governing an idle pod's whole root. Grow
+        // past this query's grant while the root is empty and the excess must
+        // land in explicit headroom, not in governed capacity a sibling query
+        // could otherwise have used.
+        let ceiling = interactive.granted_memory_bytes;
+        let overshoot = ceiling / 2;
+        assert!(
+            ceiling + overshoot < root_limit,
+            "the pod root must still have free bytes for this to prove the ceiling bound"
+        );
+        let past_ceiling = MemoryConsumer::new("past-ceiling").register(&pools[0]);
+        past_ceiling.grow(ceiling + overshoot);
+        let overshot = oracle.snapshot().expect("infallible growth snapshot");
+        assert_eq!(
+            overshot.oracle_query_memory_used_bytes, ceiling,
+            "governed bytes stop at the query's immutable grant"
+        );
+        assert_eq!(
+            overshot.oracle_infallible_bytes, overshoot,
+            "every byte above the grant is retained as explicit process headroom"
+        );
+        assert_eq!(oracle.shared_memory_reserved(), ceiling + overshoot);
+        assert_eq!(past_ceiling.free(), ceiling + overshoot);
+        let released = oracle.snapshot().expect("post-release snapshot");
+        assert_eq!(released.oracle_query_memory_used_bytes, 0);
+        assert_eq!(released.oracle_infallible_bytes, 0);
+        assert_eq!(oracle.shared_memory_reserved(), 0);
         assert!(oracle.health().reason().is_none());
 
         drop((interactive, analytical, worker));

@@ -709,7 +709,15 @@ pub fn validate_canonical_user_batch(
         validate_field_identity(field, supplied)?;
         let column = batch.column(index);
         validate_column_values(field, column.as_ref())?;
-        columns.push(std::sync::Arc::clone(column));
+        columns.push(
+            crate::tables::restamp_field_identity(column.as_ref(), field.to_arrow().data_type())
+                .map_err(|error| {
+                    format!(
+                        "canonical field {} does not carry its declared identity: {error}",
+                        field.name
+                    )
+                })?,
+        );
     }
 
     let canonical = Schema::new(

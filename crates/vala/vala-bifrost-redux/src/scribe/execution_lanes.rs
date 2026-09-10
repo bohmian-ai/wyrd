@@ -626,8 +626,15 @@ fn enforce_canonical_source_contract(
     let user = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
         .map_err(|_| ScribeError::InvalidFrame)?;
     if let Some(validate) = definition.canonical_validator {
-        validate(&user).map_err(|_| ScribeError::FingerprintMismatch {
-            table: format!("{}.{}", definition.namespace, definition.name),
+        validate(&user).map_err(|reason| {
+            tracing::warn!(
+                table = %format!("{}.{}", definition.namespace, definition.name),
+                %reason,
+                "canonical user block was refused by the table's value validator"
+            );
+            ScribeError::FingerprintMismatch {
+                table: format!("{}.{}", definition.namespace, definition.name),
+            }
         })?;
     }
     Ok(())
@@ -868,20 +875,34 @@ fn stamp_correlation_columns(
             .map_err(|_| ScribeError::InvalidFrame);
     };
     let physical = (definition.schema)();
-    let shape = |field: &Field| {
-        (
-            field.name().clone(),
-            field.data_type().clone(),
-            field.is_nullable(),
-        )
-    };
-    let owned: Vec<_> = physical.fields().iter().map(|field| shape(field)).collect();
-    let assembled: Vec<_> = fields.iter().map(shape).collect();
-    if owned != assembled {
+    let aligned = physical.fields().len() == fields.len()
+        && physical
+            .fields()
+            .iter()
+            .zip(&fields)
+            .all(|(owned, assembled)| {
+                owned.name() == assembled.name()
+                    && owned.is_nullable() == assembled.is_nullable()
+                    && owned.data_type().equals_datatype(assembled.data_type())
+            });
+    if !aligned {
         return Err(ScribeError::FingerprintMismatch {
             table: format!("{}.{}", definition.namespace, definition.name),
         });
     }
+    // The arrays are the writer's; the identity on them is the table's. Every
+    // column is re-typed onto the physical field it fills, so the stamped
+    // batch carries the table layer's stable ids and sensitivity tags whether
+    // or not the writer echoed them.
+    let columns = physical
+        .fields()
+        .iter()
+        .zip(columns)
+        .map(|(field, column)| {
+            crate::tables::restamp_field_identity(column.as_ref(), field.data_type())
+                .map_err(|_| ScribeError::InvalidFrame)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let stamped = RecordBatch::try_new(physical, columns).map_err(|_| ScribeError::InvalidFrame)?;
     enforce_canonical_physical_identity(&stamped, definition)?;
     Ok(stamped)

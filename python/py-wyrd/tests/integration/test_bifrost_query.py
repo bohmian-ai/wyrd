@@ -156,3 +156,334 @@ def test_bifrost_query_cancellation_releases_all_resources(
     # The live tail is drained into query-owned memory before schema emission.
     assert active["tail_fences"] == baseline["tail_fences"]
     assert released == baseline
+
+
+TRACE_ID = bytes.fromhex("c1a0112233445566778899aabbccddee")
+PARENT_SPAN_ID = bytes.fromhex("a1a2a3a4a5a6a7a8")
+CHILD_SPAN_ID = bytes.fromhex("b1b2b3b4b5b6b7b8")
+MODEL = "claude-opus-5"
+INPUT_TOKENS = 1280
+OUTPUT_TOKENS = 320
+INPUT_MESSAGES = '[{"role":"user","parts":[{"type":"text","content":"summarize the incident"}]}]'
+OUTPUT_MESSAGES = '[{"role":"assistant","parts":[{"type":"text","content":"the writer stalled"}]}]'
+LOG_BODY = "tool call exhausted its retry budget"
+COUNTER_VALUE = 7
+GAUGE_VALUE = 0.75
+HISTOGRAM_COUNT = 4
+HISTOGRAM_SUM = 12.5
+SERVICE = "wyrd.fixture.service"
+
+
+def _attributes(pairs: dict[str, str]) -> bytes:
+    """Encode string attributes as the canonical ``KeyValueList`` bytes.
+
+    Ingress decodes and re-encodes every canonical binary payload, so a
+    fixture cannot substitute a JSON blob here.
+    """
+
+    from opentelemetry.proto.common.v1.common_pb2 import AnyValue, KeyValue, KeyValueList
+
+    return KeyValueList(
+        values=[
+            KeyValue(key=key, value=AnyValue(string_value=value)) for key, value in pairs.items()
+        ]
+    ).SerializeToString()
+
+
+def _any_value(text: str) -> bytes:
+    """Encode one string as the canonical ``AnyValue`` bytes a log body carries."""
+
+    from opentelemetry.proto.common.v1.common_pb2 import AnyValue
+
+    return AnyValue(string_value=text).SerializeToString()
+
+
+def _default(field: pyarrow.Field) -> object:
+    """The value an unnamed column takes, decided by its described type."""
+
+    if field.nullable:
+        return None
+    if pyarrow.types.is_string(field.type):
+        return ""
+    if pyarrow.types.is_boolean(field.type):
+        return False
+    if pyarrow.types.is_floating(field.type):
+        return 0.0
+    if pyarrow.types.is_binary(field.type) or pyarrow.types.is_fixed_size_binary(field.type):
+        return b""
+    if pyarrow.types.is_list(field.type):
+        return []
+    return 0
+
+
+def _batch(schema: pyarrow.Schema, rows: list[dict[str, object]]) -> pyarrow.RecordBatch:
+    """Build one batch over ``schema`` from rows that name only some columns.
+
+    The schema comes from the server's own description, so the fixture never
+    restates the canonical ledger: it supplies the handful of values its
+    assertions depend on and lets every other described column take the
+    canonical empty value for its type.
+    """
+
+    columns = [
+        pyarrow.array(
+            [row.get(field.name, _default(field)) for row in rows],
+            type=field.type,
+        )
+        for field in schema
+    ]
+    return pyarrow.RecordBatch.from_arrays(columns, schema=schema)
+
+
+def _spans(schema: pyarrow.Schema, scope: str, anchor: int) -> pyarrow.RecordBatch:
+    """The parent GenAI chat span and the failing tool span it made."""
+
+    envelope = {
+        "resource_present": True,
+        "resource_attributes": _attributes({"service.name": SERVICE}),
+        "scope_present": True,
+        "scope_name": scope,
+        "scope_version": "1.0.0",
+        "service_name": SERVICE,
+        "gen_ai_provider_name": "anthropic",
+        "gen_ai_request_model": MODEL,
+        "gen_ai_conversation_id": "conversation-fixture",
+        "trace_id": TRACE_ID,
+        "status_present": True,
+    }
+    parent = envelope | {
+        "span_id": PARENT_SPAN_ID,
+        "name": "chat claude-opus-5",
+        "kind": 3,
+        "start_time_unix_nano": anchor,
+        "end_time_unix_nano": anchor + 2_000_000,
+        "duration_nano": 2_000_000,
+        "status_code": 1,
+        "status_message": "ok",
+        "attributes": _attributes(
+            {
+                "gen_ai.input.messages": INPUT_MESSAGES,
+                "gen_ai.output.messages": OUTPUT_MESSAGES,
+            }
+        ),
+        "gen_ai_operation_name": "chat",
+        "gen_ai_usage_input_tokens": INPUT_TOKENS,
+        "gen_ai_usage_output_tokens": OUTPUT_TOKENS,
+    }
+    child = envelope | {
+        "span_id": CHILD_SPAN_ID,
+        "parent_span_id": PARENT_SPAN_ID,
+        "name": "execute_tool search",
+        "kind": 1,
+        "start_time_unix_nano": anchor + 100_000,
+        "end_time_unix_nano": anchor + 900_000,
+        "duration_nano": 800_000,
+        "status_code": 2,
+        "status_message": LOG_BODY,
+        "attributes": _attributes({"gen_ai.tool.name": "search"}),
+        "gen_ai_operation_name": "execute_tool",
+        "gen_ai_usage_input_tokens": 64,
+        "gen_ai_usage_output_tokens": 16,
+    }
+    return _batch(schema, [parent, child])
+
+
+def _logs(schema: pyarrow.Schema, scope: str, anchor: int) -> pyarrow.RecordBatch:
+    """The error log correlated to the tool span that failed."""
+
+    return _batch(
+        schema,
+        [
+            {
+                "time_unix_nano": anchor + 800_000,
+                "observed_time_unix_nano": anchor + 850_000,
+                "severity_number": 17,
+                "severity_text": "ERROR",
+                "event_name": "tool.retry.exhausted",
+                "body": _any_value(LOG_BODY),
+                "trace_id": TRACE_ID,
+                "span_id": CHILD_SPAN_ID,
+                "attributes": _attributes({"gen_ai.tool.name": "search"}),
+                "resource_present": True,
+                "resource_attributes": _attributes({"service.name": SERVICE}),
+                "scope_present": True,
+                "scope_name": scope,
+                "scope_version": "1.0.0",
+            }
+        ],
+    )
+
+
+def _points(schema: pyarrow.Schema, scope: str, anchor: int) -> pyarrow.RecordBatch:
+    """One counter, one gauge and one histogram point."""
+
+    def common(name: str, kind: str) -> dict[str, object]:
+        return {
+            "metric_name": name,
+            "description": f"fixture {kind}",
+            "unit": "1",
+            "metric_type": kind,
+            "time_unix_nano": anchor,
+            "start_time_unix_nano": anchor,
+            "attributes": _attributes({"gen_ai.request.model": MODEL}),
+            "resource_present": True,
+            "resource_attributes": _attributes({"service.name": SERVICE}),
+            "scope_present": True,
+            "scope_name": scope,
+            "scope_version": "1.0.0",
+        }
+
+    counter = common("wyrd.fixture.requests", "sum") | {
+        "int_value": COUNTER_VALUE,
+        "aggregation_temporality": 2,
+        "is_monotonic": True,
+    }
+    gauge = common("wyrd.fixture.saturation", "gauge") | {"double_value": GAUGE_VALUE}
+    histogram = common("wyrd.fixture.latency", "histogram") | {
+        "aggregation_temporality": 2,
+        "histogram_count": HISTOGRAM_COUNT,
+        "histogram_sum": HISTOGRAM_SUM,
+        "histogram_min": 1.0,
+        "histogram_max": 6.0,
+    }
+    return _batch(schema, [counter, gauge, histogram])
+
+
+@pytest.mark.integration
+def test_canonical_signal_arrow_write_and_sql_read_round_trip(
+    wyrd_server: WyrdTestServer,
+) -> None:
+    """Python builds canonical Arrow signals, writes them, and reads them back.
+
+    Every batch is built against the schema the server publishes for that
+    table, so this is the journey a Python caller actually has: bind the table
+    by name, read its Arrow schema, write, publish, and answer questions
+    through canonical SQL. The payload gate is proved from the caller's side
+    with two differently scoped principals.
+    """
+
+    import uuid
+
+    from wyrd.bifrost import Bifrost
+
+    for namespace, name in (("traces", "spans"), ("logs", "records"), ("metrics", "points")):
+        wyrd_server.ensure_builtin_table(namespace, name)
+
+    scope = f"wyrd.python.canonical.{uuid.uuid4().hex}"
+    anchor = 1_760_000_000_000_000_000
+    writer = Bifrost(
+        server_url=wyrd_server.base_url,
+        credential=wyrd_server.bootstrap_service(["admin"], "python-canonical-writer"),
+    )
+    for fqn, build in (
+        ("vala.traces.spans", _spans),
+        ("vala.logs.records", _logs),
+        ("vala.metrics.points", _points),
+    ):
+        writer.use_table_by_name(fqn)
+        bound = writer.table
+        assert bound is not None
+        writer.write_batch(fqn, build(bound.arrow_schema, scope, anchor))
+    wyrd_server.flush_bifrost()
+
+    hierarchy = (
+        writer.sql(
+            "SELECT name, gen_ai_operation_name, status_code, "
+            "CAST(CASE WHEN parent_span_id IS NULL THEN 1 ELSE 0 END AS BIGINT) AS is_root "
+            f"FROM vala.traces.spans WHERE scope_name = '{scope}' "
+            "ORDER BY start_time_unix_nano"
+        )
+        .to_arrow()
+        .to_pylist()
+    )
+    assert [row["gen_ai_operation_name"] for row in hierarchy] == ["chat", "execute_tool"]
+    assert [row["is_root"] for row in hierarchy] == [1, 0]
+    assert [row["status_code"] for row in hierarchy] == [1, 2]
+
+    tokens = (
+        writer.sql(
+            "SELECT CAST(SUM(gen_ai_usage_input_tokens) AS BIGINT) AS input_tokens, "
+            "CAST(SUM(gen_ai_usage_output_tokens) AS BIGINT) AS output_tokens, "
+            "CAST(COUNT(*) AS BIGINT) AS spans FROM vala.traces.spans "
+            f"WHERE scope_name = '{scope}' AND gen_ai_request_model = '{MODEL}'"
+        )
+        .to_arrow()
+        .to_pylist()
+    )
+    assert tokens == [
+        {
+            "input_tokens": INPUT_TOKENS + 64,
+            "output_tokens": OUTPUT_TOKENS + 16,
+            "spans": 2,
+        }
+    ]
+
+    correlated = (
+        writer.sql(
+            "SELECT l.severity_text, l.event_name, s.name AS span_name "
+            "FROM vala.logs.records l JOIN vala.traces.spans s "
+            "ON l.trace_id = s.trace_id AND l.span_id = s.span_id "
+            f"WHERE l.scope_name = '{scope}'"
+        )
+        .to_arrow()
+        .to_pylist()
+    )
+    assert correlated == [
+        {
+            "severity_text": "ERROR",
+            "event_name": "tool.retry.exhausted",
+            "span_name": "execute_tool search",
+        }
+    ]
+
+    metrics = (
+        writer.sql(
+            "SELECT metric_type, "
+            "CAST(SUM(COALESCE(int_value, 0)) AS BIGINT) AS ints, "
+            "CAST(SUM(COALESCE(double_value, 0.0)) AS DOUBLE) AS doubles, "
+            "CAST(SUM(COALESCE(histogram_count, 0)) AS BIGINT) AS observations "
+            f"FROM vala.metrics.points WHERE scope_name = '{scope}' "
+            "GROUP BY metric_type ORDER BY metric_type"
+        )
+        .to_arrow()
+        .to_pylist()
+    )
+    assert metrics == [
+        {"metric_type": "gauge", "ints": 0, "doubles": GAUGE_VALUE, "observations": 0},
+        {
+            "metric_type": "histogram",
+            "ints": 0,
+            "doubles": 0.0,
+            "observations": HISTOGRAM_COUNT,
+        },
+        {"metric_type": "sum", "ints": COUNTER_VALUE, "doubles": 0.0, "observations": 0},
+    ]
+
+    metadata_only = Bifrost(
+        server_url=wyrd_server.base_url,
+        credential=wyrd_server.scoped_api_key(
+            f"py_canonical_metadata_{uuid.uuid4().hex[:8]}", ["bifrost_query:read"]
+        ),
+    )
+    with pytest.raises(BifrostQueryError) as refused:
+        metadata_only.sql(f"SELECT attributes FROM vala.traces.spans WHERE scope_name = '{scope}'")
+    assert refused.value.code == "WYRD_VALA_403_PAYLOAD_FORBIDDEN"
+
+    payload_reader = Bifrost(
+        server_url=wyrd_server.base_url,
+        credential=wyrd_server.scoped_api_key(
+            f"py_canonical_payload_{uuid.uuid4().hex[:8]}",
+            ["bifrost_query:read", "bifrost_trace_payload:read"],
+        ),
+    )
+    messages = (
+        payload_reader.sql(
+            "SELECT CAST(attributes AS VARCHAR) AS attributes FROM vala.traces.spans "
+            f"WHERE scope_name = '{scope}' AND parent_span_id IS NULL"
+        )
+        .to_arrow()
+        .to_pylist()
+    )
+    assert len(messages) == 1
+    assert INPUT_MESSAGES in messages[0]["attributes"]
+    assert OUTPUT_MESSAGES in messages[0]["attributes"]

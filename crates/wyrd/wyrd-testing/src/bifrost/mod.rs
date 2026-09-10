@@ -1,5 +1,7 @@
 //! Multi-pod Bifrost test harness.
 
+/// One fixed canonical trace/log/metric dataset as public Arrow batches.
+pub mod canonical_signals;
 pub mod cluster;
 #[cfg(test)]
 mod deployment_contract;

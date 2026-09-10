@@ -387,6 +387,53 @@ fn declares_stable_field_ids(schema: &Schema) -> bool {
             .all(|field| field.metadata().contains_key(fields::PARQUET_FIELD_ID))
 }
 
+/// Re-stamp one column's declared type with the table's own field identity.
+///
+/// A writer supplies buffers; nested element names and the `PARQUET:field_id`
+/// and `wyrd:sensitive` tags are the table layer's, assigned at registration
+/// and re-derived on every stamp. When the two agree in shape, this replaces
+/// the array's declared type - recursively, because a list or struct array's
+/// child data carries its own declared type - so the assembled batch is
+/// identical to one the server built itself. No buffer is copied.
+///
+/// # Errors
+///
+/// Returns the Arrow validation error when the retyped data does not describe
+/// its own buffers, which a preceding shape check should have prevented.
+pub fn restamp_field_identity(
+    column: &dyn arrow::array::Array,
+    target: &arrow::datatypes::DataType,
+) -> Result<arrow::array::ArrayRef, arrow::error::ArrowError> {
+    Ok(arrow::array::make_array(retype(column.to_data(), target)?))
+}
+
+/// Recursively retype one array's data to `target`, children included.
+fn retype(
+    data: arrow::array::ArrayData,
+    target: &arrow::datatypes::DataType,
+) -> Result<arrow::array::ArrayData, arrow::error::ArrowError> {
+    use arrow::datatypes::DataType;
+
+    let children = match target {
+        DataType::List(element) => data
+            .child_data()
+            .iter()
+            .map(|child| retype(child.clone(), element.data_type()))
+            .collect::<Result<Vec<_>, _>>()?,
+        DataType::Struct(fields) => data
+            .child_data()
+            .iter()
+            .zip(fields)
+            .map(|(child, field)| retype(child.clone(), field.data_type()))
+            .collect::<Result<Vec<_>, _>>()?,
+        _ => return data.into_builder().data_type(target.clone()).build(),
+    };
+    data.into_builder()
+        .data_type(target.clone())
+        .child_data(children)
+        .build()
+}
+
 /// Report whether an actual Arrow type is the expected one after a storage
 /// round trip.
 ///

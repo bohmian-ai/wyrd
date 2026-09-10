@@ -284,6 +284,73 @@ impl WyrdTestServer {
         }
     }
 
+    /// Materialize one canonical built-in table for the fixture tenant.
+    ///
+    /// A canonical signal table is created on first use. An OTLP export
+    /// provisions it on ingest, but a journey that writes it through the public
+    /// Arrow batch door must ask for it first.
+    ///
+    /// # Errors
+    ///
+    /// Raises a Wyrd Python error when the context manager is inactive, no
+    /// built-in owns `namespace.name`, or the catalog cannot materialize it.
+    fn ensure_builtin_table(&self, namespace: &str, name: &str) -> PyResult<()> {
+        let srv = self.server.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "WyrdTestServer not started (use as context manager)",
+            )
+        })?;
+        wyrd_runtime::runtime()
+            .block_on(srv.ensure_builtin_table_for_test(srv.data_tenant_id(), namespace, name))
+            .map_err(|error| wyrd_error_to_py_err(error.into()))
+    }
+
+    /// Mint an API key for a principal holding exactly `permissions`.
+    ///
+    /// `permissions` are `resource:action` strings. This is the door a journey
+    /// uses to prove an access gate from the caller's side: it seeds one role
+    /// carrying only those grants and bootstraps a service onto it.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ValueError` for an unparsable permission, and a Wyrd Python
+    /// error when the context manager is inactive or role seeding or
+    /// bootstrapping fails.
+    fn scoped_api_key(&self, role: &str, permissions: Vec<String>) -> PyResult<String> {
+        let srv = self.server.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "WyrdTestServer not started (use as context manager)",
+            )
+        })?;
+        let parsed = permissions
+            .iter()
+            .map(|value| {
+                value.parse::<wyrd_runtime::Permission>().map_err(|_| {
+                    pyo3::exceptions::PyValueError::new_err(format!(
+                        "`{value}` is not a resource:action permission"
+                    ))
+                })
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        let result: Result<crate::server::Bootstrap, wyrd_spec::error::WyrdError> =
+            wyrd_runtime::runtime().block_on(async {
+                srv.seed_role(role, &parsed)
+                    .await
+                    .map_err(wyrd_spec::error::WyrdError::from)?;
+                srv.bootstrap_service(role, &[role])
+                    .await
+                    .map_err(wyrd_spec::error::WyrdError::from)
+            });
+        match result.map_err(wyrd_error_to_py_err)? {
+            crate::server::Bootstrap::Machine { api_key, .. } => {
+                Ok(api_key.expose_secret().to_owned())
+            }
+            crate::server::Bootstrap::User { .. } => Err(
+                pyo3::exceptions::PyRuntimeError::new_err("expected a machine bootstrap"),
+            ),
+        }
+    }
+
     /// Creates a real sealed Oracle fixture and returns its table and access token.
     ///
     /// The setup uses the public gRPC ingest transport, flushes Scribe, and

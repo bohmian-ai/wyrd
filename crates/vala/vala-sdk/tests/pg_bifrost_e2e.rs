@@ -2350,6 +2350,268 @@ mod pg_tests {
 
         srv.shutdown().await.expect("server shutdown");
     }
+    /// Every canonical signal reaches durable SQL through the public Arrow door.
+    ///
+    /// The batches are built from the schemas `describe_table` publishes, never
+    /// from a second hard-coded ledger, so this is exactly the journey a caller
+    /// has: describe, build, write, publish, read. The reads answer the
+    /// questions the tables exist to answer - trace hierarchy, GenAI model and
+    /// token aggregation, the correlated error log, one metric aggregate - and
+    /// then prove the payload gate stands over the structured GenAI messages
+    /// regardless of who wrote them.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a canonical batch is refused, when a published row does not
+    /// read back with its written value, or when the payload gate admits or
+    /// refuses the wrong caller.
+    #[tokio::test]
+    async fn canonical_signal_arrow_write_and_sql_read_round_trip() {
+        use wyrd_testing::bifrost::canonical_signals as fixture;
+
+        let srv = WyrdTestServer::start_bound()
+            .await
+            .expect("test server start");
+        for (namespace, name) in [
+            ("traces", "spans"),
+            ("logs", "records"),
+            ("metrics", "points"),
+        ] {
+            srv.ensure_builtin_table_for_test(srv.data_tenant_id(), namespace, name)
+                .await
+                .expect("provision the canonical signal table");
+        }
+
+        let bootstrap = srv
+            .bootstrap_service("sdk-canonical-writer", &["admin"])
+            .await
+            .expect("bootstrap the canonical writer");
+        let mut config = client_config(&srv);
+        config.credential = Some(bootstrap.api_key().expect("machine API key").clone());
+        config.grpc.endpoint = srv.grpc_url().expect("gRPC URL");
+        config.grpc.connect_retries = 0;
+        let client = WyrdClient::with_config(config).expect("SDK client");
+        let bifrost = Bifrost::connect(&client).await.expect("writer connects");
+
+        let scope = format!("wyrd.sdk.canonical.{}", uuid::Uuid::now_v7().simple());
+        let anchor = 1_760_000_000_000_000_000_i64;
+
+        for (fqn, build) in [
+            (
+                "vala.traces.spans",
+                fixture::spans as fn(&arrow_schema::SchemaRef, &str, i64) -> RecordBatch,
+            ),
+            ("vala.logs.records", fixture::logs),
+            ("vala.metrics.points", fixture::points),
+        ] {
+            // The table's own published contract, projected onto Arrow by the
+            // SDK's describe path: the ledger columns and nothing else, so the
+            // fixture never restates a second copy of the canonical schema.
+            let described = TableConfig::describe(&client, fqn)
+                .await
+                .expect("describe the canonical table");
+            let built = build(described.user_schema(), &scope, anchor);
+            bifrost
+                .write_batch(fqn, &built)
+                .await
+                .expect("the canonical batch is accepted");
+        }
+        srv.flush_bifrost()
+            .await
+            .expect("publish the server-owned Scribe");
+
+        // The trace hierarchy: one root and one child, both in one trace.
+        let hierarchy = bifrost
+            .sql(&format!(
+                "SELECT name, gen_ai_operation_name, status_code, \
+                        CAST(CASE WHEN parent_span_id IS NULL THEN 1 ELSE 0 END AS BIGINT) \
+                          AS is_root \
+                 FROM vala.traces.spans WHERE scope_name = '{scope}' \
+                 ORDER BY start_time_unix_nano"
+            ))
+            .await
+            .expect("read the trace hierarchy");
+        assert_eq!(hierarchy.terminal().outcome, QueryTerminalOutcome::Success);
+        let hierarchy = hierarchy.batches();
+        assert_eq!(
+            string_col(hierarchy, "gen_ai_operation_name"),
+            vec!["chat", "execute_tool"],
+            "the parent chat span and the tool span it made both land"
+        );
+        assert_eq!(
+            primitive_col::<arrow::datatypes::Int64Type>(hierarchy, "is_root"),
+            vec![Some(1), Some(0)],
+            "exactly the parent is a root; the tool span carries its parent id"
+        );
+        assert_eq!(
+            primitive_col::<arrow::datatypes::Int32Type>(hierarchy, "status_code"),
+            vec![Some(1), Some(2)],
+            "the tool span records the error status the fixture wrote"
+        );
+
+        // GenAI model filtering and token aggregation over the same spans.
+        let tokens = bifrost
+            .sql(&format!(
+                "SELECT CAST(SUM(gen_ai_usage_input_tokens) AS BIGINT) AS input_tokens, \
+                        CAST(SUM(gen_ai_usage_output_tokens) AS BIGINT) AS output_tokens, \
+                        CAST(COUNT(*) AS BIGINT) AS spans \
+                 FROM vala.traces.spans \
+                 WHERE scope_name = '{scope}' AND gen_ai_request_model = '{model}'",
+                model = fixture::MODEL
+            ))
+            .await
+            .expect("aggregate GenAI tokens");
+        let tokens = tokens.batches();
+        assert_eq!(
+            primitive_col::<arrow::datatypes::Int64Type>(tokens, "input_tokens"),
+            vec![Some(fixture::INPUT_TOKENS + 64)]
+        );
+        assert_eq!(
+            primitive_col::<arrow::datatypes::Int64Type>(tokens, "output_tokens"),
+            vec![Some(fixture::OUTPUT_TOKENS + 16)]
+        );
+        assert_eq!(
+            primitive_col::<arrow::datatypes::Int64Type>(tokens, "spans"),
+            vec![Some(2)],
+            "the model filter selects both spans of the fixture trace"
+        );
+
+        // The correlated error log, joined to the span it belongs to by id.
+        let correlated = bifrost
+            .sql(&format!(
+                "SELECT l.severity_text, l.event_name, s.name AS span_name \
+                 FROM vala.logs.records l JOIN vala.traces.spans s \
+                   ON l.trace_id = s.trace_id AND l.span_id = s.span_id \
+                 WHERE l.scope_name = '{scope}'"
+            ))
+            .await
+            .expect("read the correlated error log");
+        let correlated = correlated.batches();
+        assert_eq!(string_col(correlated, "severity_text"), vec!["ERROR"]);
+        assert_eq!(
+            string_col(correlated, "event_name"),
+            vec!["tool.retry.exhausted"]
+        );
+        assert_eq!(
+            string_col(correlated, "span_name"),
+            vec!["execute_tool search"],
+            "the log correlates to the tool span that failed, not to the root"
+        );
+
+        // One metric aggregate across the three representative kinds.
+        let metrics = bifrost
+            .sql(&format!(
+                "SELECT metric_type, \
+                        CAST(SUM(COALESCE(int_value, 0)) AS BIGINT) AS ints, \
+                        CAST(SUM(COALESCE(double_value, 0.0)) AS DOUBLE) AS doubles, \
+                        CAST(SUM(COALESCE(histogram_count, 0)) AS BIGINT) AS observations \
+                 FROM vala.metrics.points WHERE scope_name = '{scope}' \
+                 GROUP BY metric_type ORDER BY metric_type"
+            ))
+            .await
+            .expect("aggregate the metric points");
+        let metrics = metrics.batches();
+        assert_eq!(
+            string_col(metrics, "metric_type"),
+            vec!["gauge", "histogram", "sum"]
+        );
+        assert_eq!(
+            primitive_col::<arrow::datatypes::Int64Type>(metrics, "ints"),
+            vec![Some(0), Some(0), Some(fixture::COUNTER_VALUE)]
+        );
+        assert_eq!(
+            primitive_col::<arrow::datatypes::Float64Type>(metrics, "doubles"),
+            vec![Some(fixture::GAUGE_VALUE), Some(0.0), Some(0.0)]
+        );
+        assert_eq!(
+            primitive_col::<arrow::datatypes::Int64Type>(metrics, "observations"),
+            vec![Some(0), Some(fixture::HISTOGRAM_COUNT), Some(0)]
+        );
+
+        // The payload gate stands over the structured GenAI messages.
+        let metadata_only =
+            reader_with_permissions(&srv, "sdk_canonical_metadata", &["bifrost_query:read"]).await;
+        let refusal = metadata_only
+            .sql(&format!(
+                "SELECT attributes FROM vala.traces.spans WHERE scope_name = '{scope}'"
+            ))
+            .await
+            .expect_err("a caller without trace payload permission is refused");
+        assert_eq!(refusal.code(), "WYRD_VALA_403_PAYLOAD_FORBIDDEN");
+
+        let payload_reader = reader_with_permissions(
+            &srv,
+            "sdk_canonical_payload",
+            &["bifrost_query:read", "bifrost_trace_payload:read"],
+        )
+        .await;
+        let messages = payload_reader
+            .sql(&format!(
+                "SELECT attributes FROM vala.traces.spans \
+                 WHERE scope_name = '{scope}' AND parent_span_id IS NULL"
+            ))
+            .await
+            .expect("an authorized caller reads the structured GenAI messages");
+        let batches = messages.batches();
+        assert_eq!(
+            batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            1,
+            "the authorized projection returns the one parent span"
+        );
+        let stored = batches[0]
+            .column_by_name("attributes")
+            .expect("column `attributes`");
+        let stored = arrow::compute::cast(stored, &arrow_schema::DataType::Binary)
+            .expect("the canonical attribute payload reads back as bytes");
+        let payload = stored
+            .as_any()
+            .downcast_ref::<arrow::array::BinaryArray>()
+            .expect("the cast payload is Binary")
+            .value(0)
+            .to_vec();
+        let payload = String::from_utf8_lossy(&payload);
+        assert!(
+            payload.contains(fixture::INPUT_MESSAGES),
+            "the structured GenAI input messages survive the round trip verbatim"
+        );
+        assert!(
+            payload.contains(fixture::OUTPUT_MESSAGES),
+            "the structured GenAI output messages survive the round trip verbatim"
+        );
+
+        srv.shutdown().await.expect("server shutdown");
+    }
+
+    /// A public reader holding exactly `permissions`, as its own principal.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the role cannot be seeded or the reader cannot connect.
+    async fn reader_with_permissions(
+        srv: &WyrdTestServer,
+        role: &str,
+        permissions: &[&str],
+    ) -> Bifrost {
+        let parsed: Vec<wyrd_runtime::Permission> = permissions
+            .iter()
+            .map(|value| value.parse().expect("a declared fixture permission"))
+            .collect();
+        srv.seed_role(role, &parsed)
+            .await
+            .expect("the fixture role is seeded");
+        let bootstrap = srv
+            .bootstrap_service(role, &[role])
+            .await
+            .expect("the fixture service is bootstrapped onto its role");
+        let mut config = client_config(srv);
+        config.credential = Some(bootstrap.api_key().expect("machine API key").clone());
+        config.grpc.endpoint = srv.grpc_url().expect("gRPC URL");
+        config.grpc.connect_retries = 0;
+        let client = WyrdClient::with_config(config).expect("scoped SDK client");
+        Bifrost::connect(&client)
+            .await
+            .expect("the scoped reader connects")
+    }
 }
 
 /// Real HTTP list/status/cancel controls preserve tenant-scoped lifecycle identity.

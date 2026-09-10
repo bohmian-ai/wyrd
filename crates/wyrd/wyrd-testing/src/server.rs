@@ -2078,9 +2078,28 @@ impl WyrdTestServer {
         &self,
         tenant: DataTenantId,
     ) -> Result<(), WyrdTestServerError> {
+        self.ensure_builtin_table_for_test(tenant, "traces", "spans")
+            .await
+    }
+
+    /// Provision one canonical built-in table for a test tenant.
+    ///
+    /// A canonical signal table is materialized on first use, so a journey
+    /// that writes it through the public Arrow door - rather than through an
+    /// OTLP export, which provisions on ingest - must ask for it first.
+    ///
+    /// # Errors
+    /// Returns an error when no built-in owns `namespace.name` or the catalog
+    /// cannot materialize it.
+    pub async fn ensure_builtin_table_for_test(
+        &self,
+        tenant: DataTenantId,
+        namespace: &str,
+        name: &str,
+    ) -> Result<(), WyrdTestServerError> {
         let definition =
-            vala_bifrost_redux::tables::builtin_table("traces", "spans").ok_or_else(|| {
-                WyrdTestServerError::Start("missing traces spans built-in".to_owned())
+            vala_bifrost_redux::tables::builtin_table(namespace, name).ok_or_else(|| {
+                WyrdTestServerError::Start(format!("missing {namespace} {name} built-in"))
             })?;
         self.inner
             .bifrost_catalog

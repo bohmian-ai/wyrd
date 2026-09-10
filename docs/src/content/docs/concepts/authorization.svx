@@ -18,9 +18,42 @@ For how a caller obtains a token in the first place, see
 
 ## RBAC
 
-A `Permission` is `resource:action`. Roles carry a JSONB set of permissions;
-role claims are embedded in the token at issuance and resolved against the
-database at verify time.
+A `Permission` is `{ resource, action, scope }`: `resource` and `action` name
+the operation, and the typed `scope` names the objects the grant reaches. Scope
+is either `all` (every object of that resource) or a domain-tagged object
+identity — today `bifrost`, as a `{ catalog, schema }` schema scope or a
+`{ catalog, schema, table_uid }` table scope. Scope is required on every stored
+permission; a scope-less entry is rejected at decode, and there is no
+compatibility decoder. A grant subsumes a request only when all three axes
+cover it.
+
+Roles carry a JSONB set of permissions; role claims are embedded in the token at
+issuance and resolved against the database at verify time.
+
+```json
+[
+  { "resource": "cards", "action": "read", "scope": "all" },
+  {
+    "resource": "bifrost_query",
+    "action": "read",
+    "scope": { "bifrost": { "schema": { "catalog": "vala", "schema": "logs" } } }
+  }
+]
+```
+
+Object scope stays inside RBAC. It is a static role grant over named objects,
+not an attribute or context rule — those belong to the `PolicyHook` below.
+
+### Routes whose objects are not known until planning
+
+A Bifrost SQL query does not name its tables until the statement is planned, so
+the route admits on the coarse operation capability (does this principal hold
+*any* `bifrost_query:read` grant?) and the authoritative decision runs inside
+the Oracle against the fully resolved table set — before admission, read-audit
+acceptance, peer dispatch, or any source read. One uncovered table denies the
+whole query with `WYRD_VALA_403_QUERY_FORBIDDEN` and returns no rows. The
+approved scoped decision is bound into the distributed permission digest, so a
+peer worker cannot widen it.
 
 The resolution path:
 1. Token carries a list of role names in its claims.
@@ -124,7 +157,7 @@ pass.**
 A hook `Allow` does not bypass RBAC. It means "my policy permits this; now apply
 the principal's role permissions." Use the hook for attribute- and context-based
 rules (this caller, this target, this time, this delegation chain); leave coarse
-`resource:action` grants to RBAC.
+role-based grants — including object scope — to RBAC.
 
 <WyrdSequenceDiagram
   title="authz/check evaluation"
@@ -177,7 +210,7 @@ Body:
   ]}
   rows={[
     ['target', 'CardRef', 'Yes', 'The card the action targets: { kind, name, version, space }.'],
-    ['action', 'string', 'Yes', 'The well-known value "card_write", or any valid resource:action permission identifier. Drives the RBAC layer.'],
+    ['action', 'string', 'Yes', 'The well-known value "card_write", or any valid resource:action operation identifier. Drives the RBAC layer.'],
     ['context', 'object', 'No', 'Arbitrary JSON, passed verbatim to your hook as ctx.request.context. Defaults to null when omitted. Unknown top-level fields on the body itself are rejected.']
   ]}
 />

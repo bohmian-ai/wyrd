@@ -125,9 +125,18 @@ selected key URLs are rejected.
 
 ## Authorization and policy
 
-Every route declares one typed `Permission { resource, action }`. Verification
-constructs the runtime principal, and permission resolution is scoped to that
-principal's verified tenant.
+Every route declares one typed `Permission { resource, action, scope }`.
+Verification constructs the runtime principal, and permission resolution is
+scoped to that principal's verified tenant. Scope never selects or widens
+tenancy: tenant identity comes only from the verified principal.
+
+A route whose objects are not known until the request is planned — a Bifrost
+SQL query — admits on the coarse operation capability and then takes the
+authoritative object decision inside the owning service against the resolved
+objects, before admission, audit acceptance, peer dispatch, or source IO. One
+uncovered object denies the whole request without returning rows, and the
+approved scoped decision is bound into the distributed permission digest so a
+worker cannot widen it.
 
 `POST /v1/authz/check` is the policy decision point for cross-service invokes.
 It requires a valid delegated Wyrd token and denies when the policy engine,

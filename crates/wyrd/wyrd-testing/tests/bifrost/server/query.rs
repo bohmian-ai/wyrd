@@ -957,10 +957,15 @@ async fn await_clean_analytical(
 /// complete scan set from the catalog, and the object decision is taken against
 /// the resolved tables before any row is read.
 ///
+/// The journey also proves the denial is durable: one refusal writes exactly one
+/// tenant-bound denial event and no accepted-read event, and a refusal whose own
+/// audit append fails is reported as audit-unavailable rather than as a plain
+/// rejection.
+///
 /// # Panics
 ///
 /// Panics when a scoped role reaches a table it was not granted, is refused one
-/// it was granted, or a refusal returns rows.
+/// it was granted, a refusal returns rows, or a refusal is not durably audited.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires the serialized Postgres-backed journey lane"]
 async fn tenant_scoped_roles_reach_only_their_granted_bifrost_tables() {
@@ -971,6 +976,12 @@ async fn tenant_scoped_roles_reach_only_their_granted_bifrost_tables() {
 
 /// Stable code a principal receives for a table its grants do not cover.
 const QUERY_FORBIDDEN: &str = "WYRD_VALA_403_QUERY_FORBIDDEN";
+/// Stable code substituted when a refusal's own audit append cannot commit.
+const AUDIT_UNAVAILABLE: &str = "WYRD_VALA_500_AUDIT_UNAVAILABLE";
+/// Audited operation name the public query route decides under.
+const QUERY_OPERATION: &str = "vala.query.sync";
+/// Audited operation name Oracle commits one accepted read decision under.
+const READ_DECISION_OPERATION: &str = "bifrost.query.read_decision";
 
 /// Non-sensitive projection of `vala.logs.records`.
 const LOGS_SQL: &str = "SELECT severity_text FROM vala.logs.records";
@@ -1054,6 +1065,37 @@ async fn prove_object_scoped_role_matrix() -> Result<(), ServerJourneyError> {
     refuses(&data_scientist, LOGS_SQL).await?;
     refuses(&data_scientist, MIXED_SQL).await?;
 
+    // One public scoped-object denial is a durable, tenant-bound audit event.
+    // The principal passed coarse route admission, so without this the tenant's
+    // chain would hold no record that it repeatedly probed tables it does not
+    // hold. A denial must also never look like an accepted read.
+    let denials_before = audit_rows(&server, tenant, QUERY_OPERATION).await?;
+    let reads_before = audit_rows(&server, tenant, READ_DECISION_OPERATION).await?;
+    refuses(&analyst, TRACES_SQL).await?;
+    let denials_after = audit_rows(&server, tenant, QUERY_OPERATION).await?;
+    let reads_after = audit_rows(&server, tenant, READ_DECISION_OPERATION).await?;
+    if denials_after != denials_before + 1 {
+        return Err(format!(
+            "one scoped-object denial must write exactly one durable denial event, \
+             got {denials_before} -> {denials_after}"
+        )
+        .into());
+    }
+    if reads_after != reads_before {
+        return Err(format!(
+            "a denied object decision must write no accepted-read event, \
+             got {reads_before} -> {reads_after}"
+        )
+        .into());
+    }
+
+    // The denial fails closed on its own append: an unrecordable refusal is
+    // reported as audit-unavailable, never as a plain rejection.
+    server.fail_query_object_denial_audit();
+    refuses_with(&analyst, TRACES_SQL, AUDIT_UNAVAILABLE).await?;
+    server.restore_query_object_denial_audit();
+    refuses(&analyst, TRACES_SQL).await?;
+
     server.shutdown().await?;
     Ok(())
 }
@@ -1131,6 +1173,20 @@ async fn accepts(client: &wyrd_client::WyrdClient, sql: &str) -> Result<(), Serv
 /// Returns a failure when the query is accepted, or when it fails with anything
 /// other than the stable query-forbidden refusal.
 async fn refuses(client: &wyrd_client::WyrdClient, sql: &str) -> Result<(), ServerJourneyError> {
+    refuses_with(client, sql, QUERY_FORBIDDEN).await
+}
+
+/// Asserts one query is refused before its stream opens with the exact `code`.
+///
+/// # Errors
+///
+/// Returns a failure when the query is accepted, or when it fails with anything
+/// other than `code`.
+async fn refuses_with(
+    client: &wyrd_client::WyrdClient,
+    sql: &str,
+    code: &str,
+) -> Result<(), ServerJourneyError> {
     match vala_sdk::query::QueryClient::new(client)
         .query(&request(sql))
         .await
@@ -1145,11 +1201,7 @@ async fn refuses(client: &wyrd_client::WyrdClient, sql: &str) -> Result<(), Serv
                     .into(),
             )
         }
-        Err(vala_sdk::query::ValaSdkError::Transport(error)) if error.code() == QUERY_FORBIDDEN => {
-            Ok(())
-        }
-        Err(other) => {
-            Err(format!("`{sql}` must be refused with {QUERY_FORBIDDEN}, got {other}").into())
-        }
+        Err(vala_sdk::query::ValaSdkError::Transport(error)) if error.code() == code => Ok(()),
+        Err(other) => Err(format!("`{sql}` must be refused with {code}, got {other}").into()),
     }
 }

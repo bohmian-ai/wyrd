@@ -18,12 +18,11 @@ use rmcp::RoleServer;
 use rmcp::model::{CallToolRequestParams, CallToolResult, Tool};
 use rmcp::service::RequestContext;
 use serde::Deserialize;
-use wyrd_runtime::Permission;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
 
 use crate::components::auth::{AuthenticatedPrincipal, Caller};
-use crate::query::service::authorize_audited;
+use crate::query::service::QueryAuthority;
 use crate::state::AppState;
 
 /// Wire name of the probe capability.
@@ -181,9 +180,9 @@ pub fn descriptor() -> Tool {
 /// Authorize, run, and report one probe invocation.
 ///
 /// Authorization runs first and always: the probe requires
-/// [`Permission::bifrost_query_read`] through the same
-/// [`authorize_audited`] path every Bifrost read uses, so an under-scoped
-/// principal is denied and audited before any context is disclosed.
+/// [`wyrd_runtime::Permission::bifrost_query_read`] through the same [`QueryAuthority`] owner
+/// every Bifrost read uses, so an under-scoped principal is denied and audited
+/// before any context is disclosed.
 ///
 /// The pending path takes an RAII token from the process MCP
 /// [`tokio_util::task::TaskTracker`] and holds it across cancellation cleanup
@@ -192,7 +191,7 @@ pub fn descriptor() -> Tool {
 ///
 /// # Errors
 ///
-/// Returns the permission denial from [`authorize_audited`], or
+/// Returns the permission denial from [`QueryAuthority::authorize`], or
 /// [`WyrdError::Validation`] when the arguments do not match the input schema.
 ///
 /// # Cancellation
@@ -218,14 +217,9 @@ pub async fn invoke(
         None => ProbeArguments::default(),
     };
 
-    authorize_audited(
-        state.clone(),
-        caller.clone(),
-        Permission::bifrost_query_read(),
-        OPERATION,
-        RESOURCE,
-    )
-    .await?;
+    QueryAuthority::new(state, &caller, OPERATION, RESOURCE)
+        .authorize()
+        .await?;
 
     // Held for the whole invocation, including cancellation cleanup and result
     // construction, so process shutdown cannot report a clean drain while this

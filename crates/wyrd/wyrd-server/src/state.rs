@@ -1296,6 +1296,8 @@ pub struct QueryStreamFaultController {
 #[derive(Debug, Default, Clone)]
 pub struct QueryControlAuditFaultController {
     fail_cancel_attempts: Arc<AtomicBool>,
+    /// Forces the authoritative object-denial audit append to fail.
+    fail_object_denials: Arc<AtomicBool>,
 }
 
 #[cfg(feature = "test-support")]
@@ -1314,6 +1316,22 @@ impl QueryControlAuditFaultController {
     #[must_use]
     pub fn cancel_attempts_fail(&self) -> bool {
         self.fail_cancel_attempts.load(Ordering::Acquire)
+    }
+
+    /// Enables failure of the authoritative object-denial audit append.
+    pub fn fail_object_denials(&self) {
+        self.fail_object_denials.store(true, Ordering::Release);
+    }
+
+    /// Restores the authoritative object-denial audit append.
+    pub fn restore_object_denials(&self) {
+        self.fail_object_denials.store(false, Ordering::Release);
+    }
+
+    /// Reports whether object-denial audit appends must fail.
+    #[must_use]
+    pub fn object_denials_fail(&self) -> bool {
+        self.fail_object_denials.load(Ordering::Acquire)
     }
 }
 

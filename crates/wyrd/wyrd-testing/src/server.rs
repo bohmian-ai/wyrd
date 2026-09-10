@@ -1162,6 +1162,18 @@ impl WyrdTestServer {
             .restore_cancel_attempts();
     }
 
+    /// Fails the authoritative object-denial audit append until restored.
+    pub fn fail_query_object_denial_audit(&self) {
+        self.inner.query_control_audit_fault.fail_object_denials();
+    }
+
+    /// Restores the authoritative object-denial audit append.
+    pub fn restore_query_object_denial_audit(&self) {
+        self.inner
+            .query_control_audit_fault
+            .restore_object_denials();
+    }
+
     /// Stall the next query after its schema frame using test-tier notifications.
     pub fn stall_next_query_after_schema(&self) {
         let stall = self.inner.query_stream_fault.stall_next_after_schema();

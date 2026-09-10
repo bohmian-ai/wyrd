@@ -965,8 +965,6 @@ mod tests {
         }
     }
 
-    /// Proves a structurally valid but empty object identity is not an object:
-    /// malformed identities fail at decode, never at check time.
     /// Proves Bifrost object scope is valid only for the exact `read` action.
     ///
     /// Without this, persisted or signed JSON could carry a Bifrost scope on
@@ -1005,6 +1003,8 @@ mod tests {
         }
     }
 
+    /// Proves a structurally valid but empty object identity is not an object:
+    /// malformed identities fail at decode, never at check time.
     #[test]
     fn malformed_scope_identity_is_rejected_at_decode() {
         assert!(

@@ -115,3 +115,124 @@ git diff --check d3888ddae83c833c3eb85edc0ce226eb6debadce..<new-candidate>
 ```
 
 Record the exact focused commands, selected test names, exit status, and direct behavioral evidence in the original task before requesting cumulative re-review.
+
+## Remediation evidence
+
+Cumulative candidate `d3888ddae..648e152e7`; remediation commits
+`617155857..648e152e7`.
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| AC-R1-001 / FIND-1 — infallible growth bounded by the query ceiling | `fa76783ab`: `OracleMemoryRoot::grow` passes `view.ceiling_bytes - ledger.governed` into `reserve_oracle_query_memory_infallible`, which now takes an explicit `governed_ceiling`; `OracleQueryMemoryLedger` tracks `governed` so the split survives release, headroom-first | `resources::tests::oracle_queries_share_one_governed_memory_root` — extended with a ceiling-bound block. RED before the fix: governed rose to 402653184 against a 268435456 grant; GREEN after: excess is headroom | PASS |
+| AC-R1-002 / FIND-2 — no class quantum masquerading as resident memory | `c6e55b1f5`: deleted `Grant.memory`, `ClassState.memory_used`, `LocalPermit.memory`, `OracleWorkerResources::lease`/`memory_bytes()`, `OracleQueryResources::memory_bytes`, and `OracleWorkerClass::memory_bytes()`; `try_acquire_worker` no longer takes a memory lease; both report constructors read `self.shared.resources.shared_memory_reserved()` | `resources::tests::oracle_leader_and_follower_govern_no_memory_until_their_pools_grow` (new); `oracle::dispatcher::resource_tests::remote_worker_stream_retains_slot_units_until_terminal_drop` and `oracle::dispatcher::resource_tests::oracle_peer_remote_execution_owns_one_worker_slot_quantum` — both converted from memory-byte to slot-unit observables plus a zero-governed-bytes assertion | PASS |
+| AC-R1-003 / FIND-3 — calibrated tenant caps rejected, not clamped | `75e8320f7`: `wyrd-server/src/config.rs` rejects an Interactive cap outside `1..=allocation_sum` and an Analytical cap outside `ANALYTICAL_QUERY_SLOT_UNITS..=analytical_slots` (exactly `0` when the class is disabled); new `proposal_u32_allowing_zero` makes the disabled-class rule expressible | `config::tests::oracle_admission_config_translates_calibration` — four rejection cases plus the disabled-class pair; `config::tests::oracle_capacity_is_local_cpu_and_memory_bounded` | PASS |
+| AC-R1-004 / FIND-4 — selection is class-eligible and the metric is class-correct | `80182aa89`: `select_bounded_workers` retains only the leader and replicas advertising `QueryClass::Analytical`; `bifrost_oracle_selected_workers` moved from class-neutral `freeze` to `finalize`, recording `0` for Interactive. Selection stays in `freeze` because `build_physical_root` consumes the roster before the class exists | `oracle::tests::analytical_worker_selection_is_bounded_and_stable`; `oracle::tests::analytical_worker_selection_skips_class_incapable_replicas` (new, `954898f4e`); `analytical_activation::analytical_reserves_only_configured_workers`; `analytical_activation::selected_peer_failure_is_terminal`; `boot::tests::oracle_advertises_only_locally_admissible_classes` (new) proves a pod advertises Analytical only when it can admit it | PASS |
+| AC-R1-005 / FIND-5 — deterministic FIFO and rotation; driven metric signals | `75d0e0caf`: `record_oracle_capacity` now runs wherever governed memory actually moves (`try_reserve_oracle_query_memory`, `reserve_oracle_query_memory_infallible`, `release_oracle_query_memory`), not only at admit/release — the headroom and used gauges were otherwise stale between those points. `99d0089c7`: new journey saturates one pod's slot units, enqueues three identified requests in a known order, confirms each enqueue through the node's own inspection, and releases one unit so completion order is grant order | `capacity::queued_tenants_are_granted_fifo_and_rotated` (new) — observed exactly `["first-older", "second", "first-newer"]`; falsified by inverting the expectation, which failed with the real observed order. `oracle::tests::oracle_metrics_describe_only_local_capacity` — now asserts a `result="refused"` acquisition counter, a nonzero `bifrost_oracle_local_bytes{kind="memory_headroom"}` peak, and `bifrost_oracle_selected_workers` count/max `(1, 2)` from a real Analytical cut. `capacity::two_tenants_make_bounded_progress_across_query_classes` still covers borrowing, overload, floor, and both-class progress | PASS |
+| AC-R1-006 / FIND-6 — default-feature unit tests compile | `617155857`: widened the instrumentation gates from `cfg(feature = "test-support")` to the repository's `cfg(any(test, feature = "test-support"))` boundary for `graph_leases_activated_total`, its backing `AtomicU64` field, initializer, and increment site, and for `runtime_inspection`/`OracleRuntimeInspection`. No feature added; no approved command changed | Every exact named `-p vala-bifrost-redux --lib` command below runs without `--features`; RED was 11× `E0599`, then `E0615` on the backing field | PASS |
+| AC-R1-007 / FIND-7 — imports in module manifests | `8d846fc91`: hoisted the task-added function-scoped imports into the owning test modules' import blocks (`super::participant_cut::tests::lease`, `chrono::Utc`, `wyrd_spec::vala::api::{ClusterCapabilities, ClusterRole}`) | `mise run lints` clean; `mise run fmt` clean | PASS |
+
+### Exact named commands re-run (all GREEN)
+
+```bash
+mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib \
+  -E 'test(=resources::tests::oracle_queries_share_one_governed_memory_root)'
+mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib \
+  -E 'test(=oracle::admission::tests::local_admission_is_fair_and_work_conserving)'
+mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib \
+  -E 'test(=oracle::admission::tests::follower_release_wakes_waiting_leader_without_reordering)'
+mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib \
+  -E 'test(=oracle::tests::analytical_worker_selection_is_bounded_and_stable)'
+mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib \
+  -E 'test(=oracle::tests::oracle_metrics_describe_only_local_capacity)'
+mise exec -- cargo nextest run --locked -p wyrd-server --lib \
+  -E 'test(=config::tests::oracle_capacity_is_local_cpu_and_memory_bounded)'
+scripts/postgres/with-test-postgres.sh -- bash -lc \
+  "mise run db:migrate:inner && mise exec -- cargo nextest run --locked \
+  -p wyrd-testing --test oracle -P journey --run-ignored=all \
+  -E 'test(=capacity::heterogeneous_oracles_ignore_historical_admission_rows)'"
+scripts/postgres/with-test-postgres.sh -- bash -lc \
+  "mise run db:migrate:inner && mise exec -- cargo nextest run --locked \
+  -p wyrd-testing --test oracle -P journey --run-ignored=all \
+  -E 'test(=capacity::memory_refusal_preserves_oracle_health_and_next_query)'"
+scripts/postgres/with-test-postgres.sh -- bash -lc \
+  "mise run db:migrate:inner && mise exec -- cargo nextest run --locked \
+  -p wyrd-testing --test oracle -P journey --run-ignored=all \
+  -E 'test(=capacity::two_tenants_make_bounded_progress_across_query_classes)'"
+scripts/postgres/with-test-postgres.sh -- bash -lc \
+  "mise run db:migrate:inner && mise exec -- cargo nextest run --locked \
+  -p wyrd-testing --test oracle -P journey --run-ignored=all \
+  -E 'test(=analytical_activation::analytical_reserves_only_configured_workers)'"
+scripts/postgres/with-test-postgres.sh -- bash -lc \
+  "mise run db:migrate:inner && mise exec -- cargo nextest run --locked \
+  -p wyrd-testing --test oracle -P journey --run-ignored=all \
+  -E 'test(=analytical_activation::selected_peer_failure_is_terminal)'"
+```
+
+Tests added or renamed by this remediation, each run the same way:
+
+```bash
+mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib \
+  -E 'test(=oracle::tests::analytical_worker_selection_skips_class_incapable_replicas)'
+mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib \
+  -E 'test(=resources::tests::oracle_leader_and_follower_govern_no_memory_until_their_pools_grow)'
+mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib \
+  -E 'test(=resources::tests::resource_plan_oracle_metadata_leases_spend_floor_first)'
+mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib \
+  -E 'test(=oracle::dispatcher::resource_tests::remote_worker_stream_retains_slot_units_until_terminal_drop)'
+mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib \
+  -E 'test(=oracle::dispatcher::resource_tests::oracle_peer_remote_execution_owns_one_worker_slot_quantum)'
+mise exec -- cargo nextest run --locked -p wyrd-server --lib \
+  -E 'test(=config::tests::oracle_admission_config_translates_calibration)'
+mise exec -- cargo nextest run --locked -p wyrd-server --lib \
+  -E 'test(=boot::tests::oracle_advertises_only_locally_admissible_classes)'
+scripts/postgres/with-test-postgres.sh -- bash -lc \
+  "mise run db:migrate:inner && mise exec -- cargo nextest run --locked \
+  -p wyrd-testing --test oracle -P journey --run-ignored=all \
+  -E 'test(=capacity::queued_tenants_are_granted_fifo_and_rotated)'"
+```
+
+The original task named
+`oracle::dispatcher::tests::remote_worker_stream_retains_root_quantum_until_terminal_drop`;
+its module is `resource_tests` and its observable is now slot units, so the
+corrected path above is the one that runs.
+
+### Lane verification
+
+| Lane | Result |
+|---|---|
+| `mise run check:bifrost-resource-governance` | PASS (fixture coverage + check) |
+| `mise run test:bifrost:integration:redux` | PASS — 972/972 |
+| `mise run test:bifrost:integration:sql` | PASS — 107/107 |
+| `mise run test:bifrost:integration:server` | PASS — 67/67 |
+| `mise run test:bifrost:journey:oracle` | PASS — 28/28 |
+| `mise run codegen:check` | PASS — no drift |
+| `mise run verify:bifrost` | PASS — 9/9 lanes, 1494.96s |
+| `mise run fmt` | PASS |
+| `mise run lints` | PASS |
+| `git diff --check d3888ddae83c833c3eb85edc0ce226eb6debadce..648e152e7` | clean |
+
+### Scope
+
+No non-goal was implemented: no specification revision, public API, SDK, Card,
+migration, compatibility alias, deployment topology, or distributed admission
+mechanism, and no unrelated Forge readiness or test-inventory work. The write
+set stayed inside the original task's owners: `vala-bifrost-redux`
+(`resources.rs`, `oracle/{mod,admission,dispatcher,participant_cut}.rs`),
+`wyrd-server` (`config.rs`, `boot/mod.rs`), and the Oracle journey suite
+(`wyrd-testing/tests/bifrost/oracle/capacity.rs`).
+
+One earlier claim in the original task is now superseded: AC-003 recorded that
+`max_queue_wait = 250 ms` made queue order unobservable through the public
+path. It is observable — the whole enqueue-confirm-release choreography fits
+inside the first waiter's bounded wait, and
+`capacity::queued_tenants_are_granted_fifo_and_rotated` proves per-tenant FIFO
+and equal-weight tenant rotation through real authenticated requests.
+
+### Material risk
+
+The queue journey depends on three grants completing inside the first waiter's
+250 ms bounded wait. It warms both clients' query paths first and polls the
+node's own inspection at 1 ms, and it passed on every run here (4.2–17.0 s
+wall), but a heavily loaded runner could turn it into a timeout rather than an
+ordering failure. The failure would read as "a queued waiter was never
+granted", which is distinguishable from an ordering violation.

@@ -37,6 +37,11 @@ pub const CHILD_SPAN_ID: [u8; 8] = [0xb1, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7, 0x
 /// The span the parent links to, standing in for a prior turn.
 pub const LINKED_SPAN_ID: [u8; 8] = [0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7, 0xc8];
 
+/// The name of the one event the parent span carries.
+pub const EVENT_NAME: &str = "gen_ai.choice";
+/// The trace state of the one link the parent span carries.
+pub const LINK_TRACE_STATE: &str = "wyrd=fixture";
+
 /// The GenAI model both spans report, and the SQL filter selects on.
 pub const MODEL: &str = "claude-opus-5";
 /// Input tokens the parent span reports.
@@ -80,6 +85,8 @@ pub enum Cell {
     Bytes(Vec<u8>),
     /// A present but empty collection.
     Empty,
+    /// A present collection of nested rows, for a `List<Struct<..>>` column.
+    Rows(Vec<Row>),
     /// An explicit null, for a nullable column the fixture leaves absent.
     Null,
 }
@@ -219,7 +226,13 @@ fn column(field: &Field, rows: &[Row]) -> ArrayRef {
             }
             Arc::new(builder.finish())
         }
-        DataType::List(element) => empty_lists(element, &cells),
+        DataType::List(element) => {
+            if cells.iter().any(|cell| matches!(cell, Cell::Rows(_))) {
+                nested_rows(element, &cells)
+            } else {
+                empty_lists(element, &cells)
+            }
+        }
         DataType::Struct(children) => {
             assert!(
                 cells.iter().all(|cell| matches!(cell, Cell::Null)),
@@ -234,6 +247,51 @@ fn column(field: &Field, rows: &[Row]) -> ArrayRef {
         }
         other => panic!("column {} has unsupported type {other}", field.name()),
     }
+}
+
+/// Build a `List<Struct<..>>` column from the nested rows each cell names.
+///
+/// The element struct's own children are produced by the same column builder
+/// as a top-level column, so a nested row names only the fields its assertion
+/// depends on and the rest take their canonical empty value.
+///
+/// # Panics
+///
+/// Panics when the element is not a struct, or when a cell carries a scalar
+/// where the described column declares a nested collection.
+fn nested_rows(element: &Arc<Field>, cells: &[Cell]) -> ArrayRef {
+    let DataType::Struct(children) = element.data_type() else {
+        panic!(
+            "nested rows require a struct element, not {}",
+            element.data_type()
+        )
+    };
+    let mut offsets: Vec<i32> = Vec::with_capacity(cells.len() + 1);
+    let mut flat: Vec<Row> = Vec::new();
+    offsets.push(0);
+    for cell in cells {
+        match cell {
+            Cell::Rows(rows) => flat.extend(rows.iter().cloned()),
+            Cell::Empty | Cell::Null => {}
+            other => panic!("a nested collection cannot take {other:?}"),
+        }
+        offsets.push(i32::try_from(flat.len()).expect("a fixture holds few nested rows"));
+    }
+    let values = Arc::new(StructArray::new(
+        children.clone(),
+        children.iter().map(|child| column(child, &flat)).collect(),
+        None,
+    ));
+    let nulls: Vec<bool> = cells
+        .iter()
+        .map(|cell| !matches!(cell, Cell::Null))
+        .collect();
+    Arc::new(ListArray::new(
+        Arc::clone(element),
+        OffsetBuffer::new(offsets.into()),
+        values,
+        Some(arrow::buffer::NullBuffer::from(nulls.as_slice())),
+    ))
 }
 
 /// Build an all-empty list column, the canonical absent-collection value.
@@ -325,6 +383,30 @@ pub fn spans(schema: &SchemaRef, scope: &str, anchor_nanos: i64) -> RecordBatch 
         ),
         ("gen_ai_usage_input_tokens", Cell::Int64(INPUT_TOKENS)),
         ("gen_ai_usage_output_tokens", Cell::Int64(OUTPUT_TOKENS)),
+        (
+            "events",
+            Cell::Rows(vec![BTreeMap::from([
+                ("time_unix_nano", Cell::Int64(anchor_nanos + 1_000_000)),
+                ("name", Cell::Text(EVENT_NAME.to_owned())),
+                (
+                    "attributes",
+                    Cell::Bytes(attributes(&[("gen_ai.finish_reason", "stop")])),
+                ),
+            ])]),
+        ),
+        (
+            "links",
+            Cell::Rows(vec![BTreeMap::from([
+                ("trace_id", Cell::Bytes(TRACE_ID.to_vec())),
+                ("span_id", Cell::Bytes(LINKED_SPAN_ID.to_vec())),
+                ("trace_state", Cell::Text(LINK_TRACE_STATE.to_owned())),
+                ("flags", Cell::Int64(1)),
+                (
+                    "attributes",
+                    Cell::Bytes(attributes(&[("link.kind", "follows_from")])),
+                ),
+            ])]),
+        ),
     ]);
     let child: Row = BTreeMap::from([
         ("trace_id", Cell::Bytes(TRACE_ID.to_vec())),

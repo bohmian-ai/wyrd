@@ -192,6 +192,9 @@ const INPUT_MESSAGES =
 const OUTPUT_MESSAGES =
   '[{"role":"assistant","parts":[{"type":"text","content":"the writer stalled"}]}]';
 const LOG_BODY = "tool call exhausted its retry budget";
+const EVENT_NAME = "gen_ai.choice";
+const LINK_TRACE_STATE = "wyrd=fixture";
+const LINKED_SPAN_ID = Uint8Array.from(Buffer.from("c1c2c3c4c5c6c7c8", "hex"));
 const COUNTER_VALUE = 7n;
 const GAUGE_VALUE = 0.75;
 const HISTOGRAM_COUNT = 4n;
@@ -356,6 +359,24 @@ function spans(schema: Schema, scope: string, anchor: bigint): RecordBatch {
       gen_ai_operation_name: "chat",
       gen_ai_usage_input_tokens: INPUT_TOKENS,
       gen_ai_usage_output_tokens: OUTPUT_TOKENS,
+      events: [
+        {
+          time_unix_nano: anchor + 1_000_000n,
+          name: EVENT_NAME,
+          attributes: attributes({ "gen_ai.finish_reason": "stop" }),
+          dropped_attributes_count: 0n,
+        },
+      ],
+      links: [
+        {
+          trace_id: TRACE_ID,
+          span_id: LINKED_SPAN_ID,
+          trace_state: LINK_TRACE_STATE,
+          flags: 1n,
+          attributes: attributes({ "link.kind": "follows_from" }),
+          dropped_attributes_count: 0n,
+        },
+      ],
     },
     {
       ...envelope,
@@ -554,6 +575,22 @@ describe("Canonical signal journey", () => {
           "bifrost_trace_payload:read",
         ]),
       });
+      const nested = (
+        await payloadReader.sql(
+          `SELECT CAST(array_length(events) AS BIGINT) AS events, ` +
+            `CAST(array_length(links) AS BIGINT) AS links, ` +
+            `events[1]['name'] AS event_name, links[1]['trace_state'] AS link_state ` +
+            `FROM vala.traces.spans ` +
+            `WHERE scope_name = '${scope}' AND parent_span_id IS NULL`,
+        )
+      ).toArrow();
+      expect(nested.get(0)?.toJSON()).toEqual({
+        events: 1n,
+        links: 1n,
+        event_name: EVENT_NAME,
+        link_state: LINK_TRACE_STATE,
+      });
+
       const messages = (
         await payloadReader.sql(
           `SELECT attributes FROM vala.traces.spans ` +

@@ -148,7 +148,7 @@ Python, and TypeScript client surfaces where appropriate.
 - Use `thiserror` for crate-local library error enums. Use `anyhow` only in
   binaries.
 - Use the derive-backed `wyrd_spec::error::WyrdError` catalog for public errors
-  that cross HTTP, Python, MCP, CLI, or generated-documentation boundaries.
+  that cross HTTP, Python, Rust, TypeScript, MCP, CLI, or generated-documentation boundaries.
 - Register public error metadata with
   `#[wyrd_error(code = "...", status = N, title = "...", remediation = "...")]`.
   Never hand-write parallel `code()`, `status()`, `remediation()`, or

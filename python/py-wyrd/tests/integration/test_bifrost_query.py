@@ -167,6 +167,9 @@ OUTPUT_TOKENS = 320
 INPUT_MESSAGES = '[{"role":"user","parts":[{"type":"text","content":"summarize the incident"}]}]'
 OUTPUT_MESSAGES = '[{"role":"assistant","parts":[{"type":"text","content":"the writer stalled"}]}]'
 LOG_BODY = "tool call exhausted its retry budget"
+EVENT_NAME = "gen_ai.choice"
+LINK_TRACE_STATE = "wyrd=fixture"
+LINKED_SPAN_ID = bytes.fromhex("c1c2c3c4c5c6c7c8")
 COUNTER_VALUE = 7
 GAUGE_VALUE = 0.75
 HISTOGRAM_COUNT = 4
@@ -269,6 +272,24 @@ def _spans(schema: pyarrow.Schema, scope: str, anchor: int) -> pyarrow.RecordBat
         "gen_ai_operation_name": "chat",
         "gen_ai_usage_input_tokens": INPUT_TOKENS,
         "gen_ai_usage_output_tokens": OUTPUT_TOKENS,
+        "events": [
+            {
+                "time_unix_nano": anchor + 1_000_000,
+                "name": EVENT_NAME,
+                "attributes": _attributes({"gen_ai.finish_reason": "stop"}),
+                "dropped_attributes_count": 0,
+            }
+        ],
+        "links": [
+            {
+                "trace_id": TRACE_ID,
+                "span_id": LINKED_SPAN_ID,
+                "trace_state": LINK_TRACE_STATE,
+                "flags": 1,
+                "attributes": _attributes({"link.kind": "follows_from"}),
+                "dropped_attributes_count": 0,
+            }
+        ],
     }
     child = envelope | {
         "span_id": CHILD_SPAN_ID,
@@ -476,6 +497,26 @@ def test_canonical_signal_arrow_write_and_sql_read_round_trip(
             ["bifrost_query:read", "bifrost_trace_payload:read"],
         ),
     )
+    nested = (
+        payload_reader.sql(
+            "SELECT CAST(array_length(events) AS BIGINT) AS events, "
+            "CAST(array_length(links) AS BIGINT) AS links, "
+            "events[1]['name'] AS event_name, links[1]['trace_state'] AS link_state "
+            "FROM vala.traces.spans "
+            f"WHERE scope_name = '{scope}' AND parent_span_id IS NULL"
+        )
+        .to_arrow()
+        .to_pylist()
+    )
+    assert nested == [
+        {
+            "events": 1,
+            "links": 1,
+            "event_name": EVENT_NAME,
+            "link_state": LINK_TRACE_STATE,
+        }
+    ]
+
     messages = (
         payload_reader.sql(
             "SELECT CAST(attributes AS VARCHAR) AS attributes FROM vala.traces.spans "

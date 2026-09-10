@@ -2545,6 +2545,35 @@ mod pg_tests {
             &["bifrost_query:read", "bifrost_trace_payload:read"],
         )
         .await;
+        let nested = payload_reader
+            .sql(&format!(
+                "SELECT CAST(array_length(events) AS BIGINT) AS events, \
+                 CAST(array_length(links) AS BIGINT) AS links, \
+                 events[1]['name'] AS event_name, links[1]['trace_state'] AS link_state \
+                 FROM vala.traces.spans \
+                 WHERE scope_name = '{scope}' AND parent_span_id IS NULL"
+            ))
+            .await
+            .expect("an authorized caller reads the nested event and link");
+        assert_eq!(
+            primitive_col::<arrow::datatypes::Int64Type>(nested.batches(), "events"),
+            vec![Some(1)],
+            "the parent span keeps the one event it was written with"
+        );
+        assert_eq!(
+            primitive_col::<arrow::datatypes::Int64Type>(nested.batches(), "links"),
+            vec![Some(1)],
+            "the parent span keeps the one link it was written with"
+        );
+        assert_eq!(
+            string_col(nested.batches(), "event_name"),
+            vec![fixture::EVENT_NAME.to_owned()]
+        );
+        assert_eq!(
+            string_col(nested.batches(), "link_state"),
+            vec![fixture::LINK_TRACE_STATE.to_owned()]
+        );
+
         let messages = payload_reader
             .sql(&format!(
                 "SELECT attributes FROM vala.traces.spans \

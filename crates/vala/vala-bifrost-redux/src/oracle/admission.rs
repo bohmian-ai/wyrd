@@ -715,7 +715,7 @@ impl OracleAdmission {
     }
 
     /// Captures current local admission and peer reservations without waiting.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn runtime_inspection(&self) -> OracleRuntimeInspection {
         let state = self
             .shared

@@ -372,7 +372,7 @@ impl PendingGraphActivation {
                     graph: self.graph,
                     query_class: entry.query_class,
                 };
-                #[cfg(feature = "test-support")]
+                #[cfg(any(test, feature = "test-support"))]
                 self.registry
                     .graph_leases_activated_total
                     .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -500,7 +500,7 @@ pub struct ReservationRegistry {
     /// distributed plan charges one envelope on each follower regardless of how
     /// many stage messages, tasks, or retries address it. `test-support`-gated;
     /// no field, cost, or behavior exists on the production path.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     graph_leases_activated_total: core::sync::atomic::AtomicU64,
 }
 
@@ -514,7 +514,7 @@ impl ReservationRegistry {
             slots,
             #[cfg(feature = "test-support")]
             admitted_running_total: core::sync::atomic::AtomicU64::new(0),
-            #[cfg(feature = "test-support")]
+            #[cfg(any(test, feature = "test-support"))]
             graph_leases_activated_total: core::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -833,7 +833,7 @@ impl ReservationRegistry {
     ///
     /// Integration-only observable. Counts activations, never reuse, so a test
     /// can assert that one distributed plan charged one envelope per follower.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn graph_leases_activated_total(&self) -> u64 {
         self.graph_leases_activated_total

@@ -350,7 +350,7 @@ pub struct OracleReadinessSnapshot {
 }
 
 /// Read-only aggregate owned by local Oracle admission and peer reservations.
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct OracleRuntimeInspection {
     /// Queries currently holding local class and tenant grants.
@@ -3674,7 +3674,7 @@ impl Oracle {
     }
 
     /// Captures local admission and peer reservations without external IO.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn runtime_inspection(&self) -> OracleRuntimeInspection {
         self.admission.runtime_inspection()

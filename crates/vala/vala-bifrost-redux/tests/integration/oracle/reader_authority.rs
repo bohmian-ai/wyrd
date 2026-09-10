@@ -2174,6 +2174,14 @@ fn query_context(
     .expect("the principal and the extractor agree on the tenant")
 }
 
+/// Builds one authorized query context that covers every object.
+///
+/// Used by scenarios whose subject is protection or promotion rather than
+/// authorization, so the object axis cannot silently change what they prove.
+fn granted_context(tenant: DataTenantId) -> vala_bifrost_redux::oracle::AuthorizedQueryContext {
+    query_context(tenant, [wyrd_runtime::Permission::wildcard()])
+}
+
 /// Proves an uncovered table is refused before any reader guard or source IO.
 ///
 /// The object decision has to happen on the prepared catalog identities, not on
@@ -2233,7 +2241,7 @@ async fn object_denial_precedes_reader_guard_and_materialization() {
     let materialized =
         vala_bifrost_redux::oracle::planner::OraclePlanner::protect_and_materialize_for_test(
             &tables,
-            &query_context(fixture.tenant, [wyrd_runtime::Permission::wildcard()]),
+            &granted_context(fixture.tenant),
             std::time::Instant::now() + Duration::from_secs(30),
             &fixture.catalog,
             &authority,
@@ -2317,11 +2325,10 @@ async fn catalog_promotion_between_prepare_and_materialize_restarts_all_tables()
     vala_bifrost_redux::catalog::reset_prepared_identity_count_for_test();
     vala_bifrost_redux::catalog::reset_sealed_pin_count_for_test();
     vala_bifrost_redux::catalog::inject_revalidation_faults_for_test(1);
-    let granted = query_context(fixture.tenant, [wyrd_runtime::Permission::wildcard()]);
     let materialized =
         vala_bifrost_redux::oracle::planner::OraclePlanner::protect_and_materialize_for_test(
             &tables,
-            &granted,
+            &granted_context(fixture.tenant),
             std::time::Instant::now() + Duration::from_secs(30),
             &fixture.catalog,
             &authority,
@@ -2352,7 +2359,7 @@ async fn catalog_promotion_between_prepare_and_materialize_restarts_all_tables()
     let error =
         vala_bifrost_redux::oracle::planner::OraclePlanner::protect_and_materialize_for_test(
             &tables,
-            &granted,
+            &granted_context(fixture.tenant),
             std::time::Instant::now() + Duration::from_secs(30),
             &fixture.catalog,
             &authority,

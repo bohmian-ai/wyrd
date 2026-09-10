@@ -13,6 +13,12 @@ use wyrd_tonic::otlp::common::v1::{
     AnyValue, ArrayValue, InstrumentationScope, KeyValue, KeyValueList, any_value,
 };
 use wyrd_tonic::otlp::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+use wyrd_tonic::otlp::metrics::v1::{
+    Exemplar, ExponentialHistogram, ExponentialHistogramDataPoint, Gauge, Histogram,
+    HistogramDataPoint, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, Sum, Summary,
+    SummaryDataPoint, exemplar, exponential_histogram_data_point, metric, number_data_point,
+    summary_data_point,
+};
 use wyrd_tonic::otlp::resource::v1::Resource;
 use wyrd_tonic::otlp::trace::v1::span::{Event, Link};
 use wyrd_tonic::otlp::trace::v1::{ResourceSpans, ScopeSpans, Span, Status};
@@ -429,6 +435,314 @@ pub(super) fn maximal_resource_logs(time: i64) -> Vec<ResourceLogs> {
     }]
 }
 
+/// The canonical metric ledger every metric case reads.
+pub(super) const METRICS_TABLE: &str = "vala.metrics.points";
+/// Instrumentation scope name carried by the metric envelope.
+pub(super) const METRIC_SCOPE_NAME: &str = "wyrd.tests.otlp.metric";
+/// Distance the metric points' start instant precedes their observation.
+pub(super) const METRIC_START_OFFSET_NANOS: i64 = 1_000_000;
+/// Offset of the exemplar observation from its owning point.
+pub(super) const METRIC_EXEMPLAR_OFFSET_NANOS: i64 = 500_000;
+/// Data-point flags carried by every fixture point.
+pub(super) const METRIC_FLAGS: i64 = 1;
+/// Description shared by every fixture metric.
+pub(super) const METRIC_DESCRIPTION: &str = "canonical journey metric";
+/// Unit shared by every fixture metric.
+pub(super) const METRIC_UNIT: &str = "ms";
+/// Aggregation temporality every kind that owns one declares (cumulative).
+pub(super) const METRIC_TEMPORALITY: i32 = 2;
+
+/// Name of the integer gauge point.
+pub(super) const GAUGE_INT_METRIC: &str = "canonical.gauge.int";
+/// Name of the double gauge point.
+pub(super) const GAUGE_DOUBLE_METRIC: &str = "canonical.gauge.double";
+/// Name of the integer sum point.
+pub(super) const SUM_INT_METRIC: &str = "canonical.sum.int";
+/// Name of the double sum point.
+pub(super) const SUM_DOUBLE_METRIC: &str = "canonical.sum.double";
+/// Name of the explicit-bucket histogram point.
+pub(super) const HISTOGRAM_METRIC: &str = "canonical.histogram";
+/// Name of the exponential histogram point.
+pub(super) const EXPONENTIAL_HISTOGRAM_METRIC: &str = "canonical.exponential_histogram";
+/// Name of the summary point.
+pub(super) const SUMMARY_METRIC: &str = "canonical.summary";
+
+/// Value of the integer gauge point, distinct from every double alternative.
+pub(super) const GAUGE_INT_VALUE: i64 = 42;
+/// Value of the double gauge point, carrying a fraction an integer cannot hold.
+pub(super) const GAUGE_DOUBLE_VALUE: f64 = 1.5;
+/// Value of the integer sum point.
+pub(super) const SUM_INT_VALUE: i64 = 7;
+/// Value of the double sum point.
+pub(super) const SUM_DOUBLE_VALUE: f64 = 2.25;
+/// Monotonicity both sum points declare.
+pub(super) const SUM_IS_MONOTONIC: bool = true;
+
+/// Total observations in the explicit-bucket histogram point.
+pub(super) const HISTOGRAM_COUNT: i64 = 6;
+/// Sum of the explicit-bucket histogram point.
+pub(super) const HISTOGRAM_SUM: f64 = 12.5;
+/// Smallest observation in the explicit-bucket histogram point.
+pub(super) const HISTOGRAM_MIN: f64 = 0.5;
+/// Largest observation in the explicit-bucket histogram point.
+pub(super) const HISTOGRAM_MAX: f64 = 9.0;
+/// Bucket populations of the explicit-bucket histogram, summing to its count.
+pub(super) const HISTOGRAM_BUCKET_COUNTS: [i64; 3] = [1, 2, 3];
+/// Strictly increasing bounds of the explicit-bucket histogram.
+pub(super) const HISTOGRAM_EXPLICIT_BOUNDS: [f64; 2] = [1.0, 5.0];
+
+/// Total observations in the exponential histogram point.
+pub(super) const EXPONENTIAL_COUNT: i64 = 4;
+/// Sum of the exponential histogram point.
+pub(super) const EXPONENTIAL_SUM: f64 = 8.0;
+/// Smallest observation in the exponential histogram point.
+pub(super) const EXPONENTIAL_MIN: f64 = 0.25;
+/// Largest observation in the exponential histogram point.
+pub(super) const EXPONENTIAL_MAX: f64 = 4.0;
+/// Resolution scale of the exponential histogram point.
+pub(super) const EXPONENTIAL_SCALE: i32 = 2;
+/// Zero-bucket population of the exponential histogram point.
+pub(super) const EXPONENTIAL_ZERO_COUNT: i64 = 1;
+/// Zero-bucket width of the exponential histogram point.
+pub(super) const EXPONENTIAL_ZERO_THRESHOLD: f64 = 0.5;
+/// Signed index of the first populated positive exponential bucket.
+pub(super) const EXPONENTIAL_POSITIVE_OFFSET: i32 = -1;
+/// Populations of the positive exponential buckets.
+pub(super) const EXPONENTIAL_POSITIVE_COUNTS: [i64; 2] = [1, 2];
+/// Signed index of the first populated negative exponential bucket.
+pub(super) const EXPONENTIAL_NEGATIVE_OFFSET: i32 = 3;
+/// Populations of the negative exponential buckets.
+pub(super) const EXPONENTIAL_NEGATIVE_COUNTS: [i64; 1] = [1];
+
+/// Total observations in the summary point.
+pub(super) const SUMMARY_COUNT: i64 = 3;
+/// Sum of the summary point.
+pub(super) const SUMMARY_SUM: f64 = 6.0;
+/// Ordered quantiles of the summary point, spanning the unit interval.
+pub(super) const SUMMARY_QUANTILES: [(f64, f64); 2] = [(0.5, 1.0), (0.99, 5.0)];
+
+/// Integer value carried by the fixture exemplar.
+pub(super) const EXEMPLAR_INT_VALUE: i64 = 3;
+
+/// Metric-level metadata, kept distinct from the point attributes.
+pub(super) fn metric_metadata() -> Vec<KeyValue> {
+    vec![string_attribute("wyrd.metric.metadata", "canonical")]
+}
+
+/// Attributes every fixture data point carries.
+pub(super) fn point_attributes() -> Vec<KeyValue> {
+    vec![
+        string_attribute("wyrd.point.kind", "canonical"),
+        int_attribute("wyrd.point.cardinality", 3),
+        bool_attribute("wyrd.point.sampled", true),
+        double_attribute("wyrd.point.ratio", 0.25),
+    ]
+}
+
+/// Attributes the fixture exemplar retains after filtering.
+pub(super) fn exemplar_attributes() -> Vec<KeyValue> {
+    vec![string_attribute("wyrd.exemplar.origin", "canonical")]
+}
+
+/// The single exemplar the integer gauge point carries.
+///
+/// Exemplars correlate a point back to a span, so the fixture points at the
+/// same span the trace and log cases store: a stored exemplar that names no
+/// real span proves the column survived without proving the correlation did.
+pub(super) fn maximal_exemplar(time: i64) -> Exemplar {
+    Exemplar {
+        filtered_attributes: exemplar_attributes(),
+        time_unix_nano: u64::try_from(time + METRIC_EXEMPLAR_OFFSET_NANOS)
+            .expect("the anchor instant is positive"),
+        span_id: GRPC_SPAN.span_id.to_vec(),
+        trace_id: GRPC_SPAN.trace_id.to_vec(),
+        value: Some(exemplar::Value::AsInt(EXEMPLAR_INT_VALUE)),
+    }
+}
+
+/// Builds one numeric data point, optionally carrying the fixture exemplar.
+fn number_point(
+    time: i64,
+    value: number_data_point::Value,
+    exemplars: Vec<Exemplar>,
+) -> NumberDataPoint {
+    NumberDataPoint {
+        attributes: point_attributes(),
+        start_time_unix_nano: u64::try_from(time - METRIC_START_OFFSET_NANOS)
+            .expect("the anchor instant is positive"),
+        time_unix_nano: u64::try_from(time).expect("the anchor instant is positive"),
+        exemplars,
+        flags: u32::try_from(METRIC_FLAGS).expect("the fixture flags fit u32"),
+        value: Some(value),
+    }
+}
+
+/// Builds one fixture metric from its descriptor fields and data collection.
+fn fixture_metric(name: &str, data: metric::Data) -> Metric {
+    Metric {
+        name: name.to_owned(),
+        description: METRIC_DESCRIPTION.to_owned(),
+        unit: METRIC_UNIT.to_owned(),
+        metadata: metric_metadata(),
+        data: Some(data),
+    }
+}
+
+/// Every supported point kind, each as one metric carrying one point.
+///
+/// Integer and double alternatives are separate metrics rather than one metric
+/// with two points, so a projector that collapsed the two numeric columns onto
+/// one would be visible as a single row's wrong column rather than hidden in a
+/// pair of rows that happen to differ.
+pub(super) fn maximal_metrics(time: i64) -> Vec<Metric> {
+    let start =
+        u64::try_from(time - METRIC_START_OFFSET_NANOS).expect("the anchor instant is positive");
+    let observed = u64::try_from(time).expect("the anchor instant is positive");
+    let flags = u32::try_from(METRIC_FLAGS).expect("the fixture flags fit u32");
+    vec![
+        fixture_metric(
+            GAUGE_INT_METRIC,
+            metric::Data::Gauge(Gauge {
+                data_points: vec![number_point(
+                    time,
+                    number_data_point::Value::AsInt(GAUGE_INT_VALUE),
+                    vec![maximal_exemplar(time)],
+                )],
+            }),
+        ),
+        fixture_metric(
+            GAUGE_DOUBLE_METRIC,
+            metric::Data::Gauge(Gauge {
+                data_points: vec![number_point(
+                    time,
+                    number_data_point::Value::AsDouble(GAUGE_DOUBLE_VALUE),
+                    Vec::new(),
+                )],
+            }),
+        ),
+        fixture_metric(
+            SUM_INT_METRIC,
+            metric::Data::Sum(Sum {
+                data_points: vec![number_point(
+                    time,
+                    number_data_point::Value::AsInt(SUM_INT_VALUE),
+                    Vec::new(),
+                )],
+                aggregation_temporality: METRIC_TEMPORALITY,
+                is_monotonic: SUM_IS_MONOTONIC,
+            }),
+        ),
+        fixture_metric(
+            SUM_DOUBLE_METRIC,
+            metric::Data::Sum(Sum {
+                data_points: vec![number_point(
+                    time,
+                    number_data_point::Value::AsDouble(SUM_DOUBLE_VALUE),
+                    Vec::new(),
+                )],
+                aggregation_temporality: METRIC_TEMPORALITY,
+                is_monotonic: SUM_IS_MONOTONIC,
+            }),
+        ),
+        fixture_metric(
+            HISTOGRAM_METRIC,
+            metric::Data::Histogram(Histogram {
+                data_points: vec![HistogramDataPoint {
+                    attributes: point_attributes(),
+                    start_time_unix_nano: start,
+                    time_unix_nano: observed,
+                    count: u64::try_from(HISTOGRAM_COUNT).expect("the fixture count is positive"),
+                    sum: Some(HISTOGRAM_SUM),
+                    bucket_counts: HISTOGRAM_BUCKET_COUNTS
+                        .iter()
+                        .map(|count| {
+                            u64::try_from(*count).expect("the fixture counts are positive")
+                        })
+                        .collect(),
+                    explicit_bounds: HISTOGRAM_EXPLICIT_BOUNDS.to_vec(),
+                    exemplars: Vec::new(),
+                    flags,
+                    min: Some(HISTOGRAM_MIN),
+                    max: Some(HISTOGRAM_MAX),
+                }],
+                aggregation_temporality: METRIC_TEMPORALITY,
+            }),
+        ),
+        fixture_metric(
+            EXPONENTIAL_HISTOGRAM_METRIC,
+            metric::Data::ExponentialHistogram(ExponentialHistogram {
+                data_points: vec![ExponentialHistogramDataPoint {
+                    attributes: point_attributes(),
+                    start_time_unix_nano: start,
+                    time_unix_nano: observed,
+                    count: u64::try_from(EXPONENTIAL_COUNT).expect("the fixture count is positive"),
+                    sum: Some(EXPONENTIAL_SUM),
+                    scale: EXPONENTIAL_SCALE,
+                    zero_count: u64::try_from(EXPONENTIAL_ZERO_COUNT)
+                        .expect("the fixture count is positive"),
+                    positive: Some(exponential_histogram_data_point::Buckets {
+                        offset: EXPONENTIAL_POSITIVE_OFFSET,
+                        bucket_counts: EXPONENTIAL_POSITIVE_COUNTS
+                            .iter()
+                            .map(|count| {
+                                u64::try_from(*count).expect("the fixture counts are positive")
+                            })
+                            .collect(),
+                    }),
+                    negative: Some(exponential_histogram_data_point::Buckets {
+                        offset: EXPONENTIAL_NEGATIVE_OFFSET,
+                        bucket_counts: EXPONENTIAL_NEGATIVE_COUNTS
+                            .iter()
+                            .map(|count| {
+                                u64::try_from(*count).expect("the fixture counts are positive")
+                            })
+                            .collect(),
+                    }),
+                    flags,
+                    exemplars: Vec::new(),
+                    min: Some(EXPONENTIAL_MIN),
+                    max: Some(EXPONENTIAL_MAX),
+                    zero_threshold: EXPONENTIAL_ZERO_THRESHOLD,
+                }],
+                aggregation_temporality: METRIC_TEMPORALITY,
+            }),
+        ),
+        fixture_metric(
+            SUMMARY_METRIC,
+            metric::Data::Summary(Summary {
+                data_points: vec![SummaryDataPoint {
+                    attributes: point_attributes(),
+                    start_time_unix_nano: start,
+                    time_unix_nano: observed,
+                    count: u64::try_from(SUMMARY_COUNT).expect("the fixture count is positive"),
+                    sum: SUMMARY_SUM,
+                    quantile_values: SUMMARY_QUANTILES
+                        .iter()
+                        .map(|(quantile, value)| summary_data_point::ValueAtQuantile {
+                            quantile: *quantile,
+                            value: *value,
+                        })
+                        .collect(),
+                    flags,
+                }],
+            }),
+        ),
+    ]
+}
+
+/// Wraps every supported point kind in the shared resource and scope envelope.
+pub(super) fn maximal_resource_metrics(time: i64) -> Vec<ResourceMetrics> {
+    vec![ResourceMetrics {
+        resource: Some(resource()),
+        scope_metrics: vec![ScopeMetrics {
+            scope: Some(signal_scope(METRIC_SCOPE_NAME)),
+            metrics: maximal_metrics(time),
+            schema_url: SCOPE_SCHEMA_URL.to_owned(),
+        }],
+        schema_url: RESOURCE_SCHEMA_URL.to_owned(),
+    }]
+}
+
 /// One bound public journey: a real server, an admin bearer, and a real client.
 ///
 /// Bound rather than in-process because every case drives a real OTLP
@@ -692,6 +1006,25 @@ pub(super) fn row_by_span_id(batches: &[RecordBatch], span_id: [u8; 8]) -> Recor
         }
     }
     found.unwrap_or_else(|| panic!("span {span_id:02x?} is stored"))
+}
+
+/// Finds the single stored row whose `column` holds `value`.
+///
+/// # Panics
+///
+/// Panics when no row or more than one row carries the requested value.
+pub(super) fn row_by_string(batches: &[RecordBatch], name: &str, value: &str) -> RecordBatch {
+    let mut found: Option<RecordBatch> = None;
+    for batch in batches {
+        let values = column::<arrow::array::StringArray>(batch, name);
+        for index in 0..batch.num_rows() {
+            if values.value(index) == value {
+                assert!(found.is_none(), "`{name} = {value}` is stored exactly once");
+                found = Some(batch.slice(index, 1));
+            }
+        }
+    }
+    found.unwrap_or_else(|| panic!("`{name} = {value}` is stored"))
 }
 
 /// Reads one non-null column value out of a single-row batch.

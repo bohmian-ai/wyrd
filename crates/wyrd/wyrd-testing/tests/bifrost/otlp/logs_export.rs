@@ -1,8 +1,8 @@
 //! The OTLP log journey: body, context and payload authorization.
 
 use wyrd_tonic::otlp::logs::v1::ResourceLogs;
-use wyrd_tonic::otlp::logs_service::ExportLogsServiceRequest;
 use wyrd_tonic::otlp::logs_service::logs_service_client::LogsServiceClient;
+use wyrd_tonic::otlp::logs_service::{ExportLogsServiceRequest, ExportLogsServiceResponse};
 use wyrd_tonic::tonic::Request;
 use wyrd_tonic::tonic::transport::Channel;
 
@@ -50,7 +50,17 @@ pub(super) async fn export_logs_over_http(
     resource_logs: Vec<ResourceLogs>,
 ) {
     let request = ExportLogsServiceRequest { resource_logs };
-    post_otlp(journey, "/v1/logs", encoding, encoding.encode(&request)).await;
+    let body = post_otlp(journey, "/v1/logs", encoding, encoding.encode(&request)).await;
+    let response: ExportLogsServiceResponse = encoding.decode(&body);
+    if let Some(partial) = response.partial_success {
+        assert_eq!(
+            partial.rejected_log_records,
+            0,
+            "a wholly valid {} export reports no rejected log record: {}",
+            encoding.content_type(),
+            partial.error_message
+        );
+    }
 }
 
 /// Tests that need Postgres, a bound server, and the publication boundary.

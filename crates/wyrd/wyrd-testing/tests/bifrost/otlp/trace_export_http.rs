@@ -42,6 +42,26 @@ impl HttpEncoding {
             }
         }
     }
+
+    /// Decodes one collector response encoded the same way the export was.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the collector's response does not decode in the encoding it
+    /// was asked to answer in, which is a protocol defect rather than a
+    /// fidelity outcome.
+    pub(super) fn decode<M: Message + Default + serde::de::DeserializeOwned>(
+        self,
+        body: &[u8],
+    ) -> M {
+        match self {
+            Self::Protobuf => {
+                M::decode(body).expect("the collector answers in the declared encoding")
+            }
+            Self::Json => serde_json::from_slice(body)
+                .expect("the collector answers in the declared encoding"),
+        }
+    }
 }
 
 /// Posts one encoded OTLP body to a signal's HTTP collector route.

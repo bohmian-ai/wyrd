@@ -16,6 +16,7 @@
 //! and TypeScript journey suites, and `wyrd-mcp`'s `mcp` binary.
 
 mod logs_export;
+mod metrics_export;
 mod support;
 mod trace_export;
 mod trace_export_http;

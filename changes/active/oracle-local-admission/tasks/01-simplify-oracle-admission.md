@@ -620,3 +620,43 @@ codegen lanes cover this bounded cross-owner removal.
 - `architecture/references/languages/implementation-execution.md`
 - `architecture/references/languages/testing-workflows.md`
 - `changes/active/oracle-local-admission/spec.md`
+
+## Implementation evidence
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| AC-001 — PostgreSQL-free admission | `194b37c73`: deleted `DelegatedOracleAdmission`, its maintenance worker, demand/continuity channels, allocation cache, renewal, overdraft, boot policy initialization, and continuity monitor across `oracle/mod.rs`, `oracle/ownership.rs`, `wyrd-server/src/{config.rs,boot/mod.rs,state.rs,oracle/mod.rs}`, `vala-sql/src/queries/oracle_admission.rs`, and `wyrd-spec/src/vala/api.rs`; migrations and `AuditDetail::OracleAdmissionRecovery` retained for historical decoding only | `capacity::heterogeneous_oracles_ignore_historical_admission_rows` (`0d0bcb985`) — seeds conflicting historical policy/allocation rows, queries and restarts two differently sized replicas, asserts per-node snapshots stay distinct with no allocation, renewal, or overdraft activity | PASS |
+| AC-002 — Hard aggregate memory qualification | `c218ff967` + `c561f4fca`: `resources.rs` owns one shared tracked pool, per-query views over it, actual reservation accounting, and the sole class-aware aggregate slot ledger; explicit non-DataFusion process headroom stays outside the root | `resources::tests::oracle_queries_share_one_governed_memory_root` (`c218ff967`); `capacity::memory_refusal_preserves_oracle_health_and_next_query` (`b27956d89`) | PASS |
+| AC-003 — Local multi-tenant fairness and overload | `c561f4fca` + `5e0651d7c`: `oracle/admission.rs` is one pod-local leader scheduler with fixed equal-weight tenant caps, bounded queueing, retryable overload, and Interactive-floor protection | `oracle::admission::tests::local_admission_is_fair_and_work_conserving` and `oracle::admission::tests::follower_release_wakes_waiting_leader_without_reordering` (`5e0651d7c`); `capacity::two_tenants_make_bounded_progress_across_query_classes` (`4efc5fa92`). Exact per-tenant FIFO ordering stays with the admission unit tests: `max_queue_wait = 250 ms` makes queue order unobservable through the public path, so the journey proves bounded progress for both classes instead | PASS |
+| AC-004 — Bounded Analytical participants | `612feefbe`: the participant cut selects the bounded deterministic worker subset before reservation and every consumer takes that one list | `oracle::tests::analytical_worker_selection_is_bounded_and_stable` (`612feefbe`); `analytical_activation::analytical_reserves_only_configured_workers` (`f4f7e7275`); `analytical_activation::selected_peer_failure_is_terminal` (`fe2fb5f8b`) | PASS |
+| AC-005 — Operational and architecture closure | `e30e78a07`: CPU/memory-aware local sizing in `wyrd-server/src/config.rs`, bounded-label local saturation metrics, calibration `schema_version` 2 with v1 rejected and no aliases, delegated/lease/overdraft configuration and metrics deleted, and `architecture/bifrost-design.md` plus the DataFusion, analytical-reliability, deployment, and recovery references updated to the local model | `config::tests::oracle_capacity_is_local_cpu_and_memory_bounded`; `oracle::tests::oracle_metrics_describe_only_local_capacity`; `mise run verify:bifrost` — 9/9 lanes passed; `mise run fmt`, `mise run lints`, `mise run codegen:check`, `git diff --check`, and `mise run check:bifrost-resource-governance` all clean | PASS |
+
+### Verification commands
+
+```bash
+mise run fmt
+mise run lints
+mise run codegen:check
+mise run verify:bifrost
+mise run check:bifrost-resource-governance
+git diff --check
+```
+
+### Scope
+
+No non-goal was implemented and no unrelated file was changed by the task
+commits (`194b37c73`..`fe2fb5f8b`).
+
+Two follow-on commits were required to make `verify:bifrost` green and are
+recorded separately because they are not part of the task's write set:
+
+- `bdbaee4c0` deletes three lanes that selected no tests
+  (`test:bifrost:journey:otlp` over an emptied binary, `test:sql:forge-scale`
+  whose only test was erased with the legacy Forge compaction route, and a
+  `wyrd-mcp` selector in `unit:rust` that matched nothing). Each exited 4 on
+  every run.
+- `c3db2fc9b` fixes a pre-existing production defect the task's shared query
+  journey exposed: the Forge scheduler deferred its first tick a whole
+  maintenance interval while `/readyz` gates the coordinator bit on a completed
+  planning pass, so a freshly started pod advertised itself unready for a
+  minute after every restart.

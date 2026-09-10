@@ -675,6 +675,22 @@ def test_analytical_sql_over_written_tables(wyrd_server: WyrdTestServer) -> None
 # Stock OpenTelemetry SDK exporters over OTLP/gRPC
 
 
+# The GenAI values every canonical write path in this change converges on.
+GEN_AI_OPERATION_NAME = "chat"
+GEN_AI_PROVIDER_NAME = "anthropic"
+GEN_AI_REQUEST_MODEL = "claude-opus-5"
+GEN_AI_CONVERSATION_ID = "conv-canonical-0001"
+GEN_AI_INPUT_TOKENS = 4096
+GEN_AI_OUTPUT_TOKENS = 512
+GEN_AI_INPUT_MESSAGES = (
+    '[{"role":"user","parts":[{"type":"text","content":"summarize the canonical ledger"}]}]'
+)
+GEN_AI_OUTPUT_MESSAGES = (
+    '[{"role":"assistant","parts":[{"type":"text","content":"the ledger is canonical"}],'
+    '"finish_reason":"stop"}]'
+)
+
+
 def _otlp_headers(server: WyrdTestServer) -> tuple[tuple[str, str], ...]:
     """The exporter headers a stock OTLP/gRPC exporter authenticates with."""
 
@@ -744,6 +760,14 @@ def test_standard_otel_tracer_exports_to_bifrost(wyrd_server: WyrdTestServer) ->
     with tracer.start_as_current_span("python-parent", links=[Link(linked)]) as parent:
         parent.set_attribute("wyrd.test.marker", "python-trace")
         parent.set_attribute("test.values", [1, 2, 3])
+        parent.set_attribute("gen_ai.operation.name", GEN_AI_OPERATION_NAME)
+        parent.set_attribute("gen_ai.provider.name", GEN_AI_PROVIDER_NAME)
+        parent.set_attribute("gen_ai.request.model", GEN_AI_REQUEST_MODEL)
+        parent.set_attribute("gen_ai.conversation.id", GEN_AI_CONVERSATION_ID)
+        parent.set_attribute("gen_ai.usage.input_tokens", GEN_AI_INPUT_TOKENS)
+        parent.set_attribute("gen_ai.usage.output_tokens", GEN_AI_OUTPUT_TOKENS)
+        parent.set_attribute("gen_ai.input.messages", GEN_AI_INPUT_MESSAGES)
+        parent.set_attribute("gen_ai.output.messages", GEN_AI_OUTPUT_MESSAGES)
         parent.add_event("checkpoint", {"step": 1})
         parent.set_status(Status(StatusCode.ERROR, "expected test status"))
         with tracer.start_as_current_span("python-child") as child:
@@ -756,9 +780,7 @@ def test_standard_otel_tracer_exports_to_bifrost(wyrd_server: WyrdTestServer) ->
         f"SELECT * FROM vala.traces.spans WHERE scope_name = '{scope}'",
     )
     assert rows.num_rows == 2
-    by_name = {
-        name: index for index, name in enumerate(rows.column("name").to_pylist())
-    }
+    by_name = {name: index for index, name in enumerate(rows.column("name").to_pylist())}
     assert set(by_name) == {"python-parent", "python-child"}
     parent_index = by_name["python-parent"]
     child_index = by_name["python-child"]
@@ -776,9 +798,7 @@ def test_standard_otel_tracer_exports_to_bifrost(wyrd_server: WyrdTestServer) ->
     assert rows.column("status_code").to_pylist()[parent_index] == 2
     assert rows.column("status_message").to_pylist()[parent_index] == "expected test status"
     assert rows.column("scope_version").to_pylist()[parent_index] == "1.0.0"
-    resource_attributes = _attributes(
-        rows.column("resource_attributes").to_pylist()[parent_index]
-    )
+    resource_attributes = _attributes(rows.column("resource_attributes").to_pylist()[parent_index])
     assert resource_attributes["service.name"] == "wyrd-python-journey"
 
     events = rows.column("events").to_pylist()[parent_index]
@@ -789,6 +809,21 @@ def test_standard_otel_tracer_exports_to_bifrost(wyrd_server: WyrdTestServer) ->
     assert len(links) == 1
     assert links[0]["trace_id"] == (1).to_bytes(16, "big")
     assert links[0]["span_id"] == (2).to_bytes(8, "big")
+
+    assert rows.column("gen_ai_operation_name").to_pylist()[parent_index] == GEN_AI_OPERATION_NAME
+    assert rows.column("gen_ai_provider_name").to_pylist()[parent_index] == GEN_AI_PROVIDER_NAME
+    assert rows.column("gen_ai_request_model").to_pylist()[parent_index] == GEN_AI_REQUEST_MODEL
+    assert rows.column("gen_ai_conversation_id").to_pylist()[parent_index] == (
+        GEN_AI_CONVERSATION_ID
+    )
+    assert rows.column("gen_ai_usage_input_tokens").to_pylist()[parent_index] == (
+        GEN_AI_INPUT_TOKENS
+    )
+    assert rows.column("gen_ai_usage_output_tokens").to_pylist()[parent_index] == (
+        GEN_AI_OUTPUT_TOKENS
+    )
+    assert attributes["gen_ai.input.messages"] == GEN_AI_INPUT_MESSAGES
+    assert attributes["gen_ai.output.messages"] == GEN_AI_OUTPUT_MESSAGES
 
 
 @pytest.mark.integration

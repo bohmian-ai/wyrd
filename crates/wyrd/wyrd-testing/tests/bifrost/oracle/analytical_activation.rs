@@ -1562,3 +1562,247 @@ async fn await_released_lease(
     let (activated, live) = cluster.nodes_mut()[index].graph_leases()?;
     Err(format!("pod {index} activated {activated} leases and still holds {live}").into())
 }
+
+/// Eligible remote Oracles this journey offers one bounded Analytical attempt.
+///
+/// Three, against a worker limit of two, is the smallest roster where a
+/// selection that reserved the whole eligible set is distinguishable from one
+/// that reserved only its configured subset.
+const BOUNDED_REMOTES: [usize; 3] = [1, 2, 3];
+
+/// Scribe pod index in this journey's five-process topology.
+const BOUNDED_SCRIBE: usize = 4;
+
+/// Remote Oracles one Analytical attempt may reserve.
+///
+/// This is `wyrd_server`'s shipped `max_workers_per_query` default, so the
+/// journey observes the bound a deployment actually runs under rather than one
+/// the harness installed for it.
+const BOUNDED_WORKERS: usize = 2;
+
+/// One Analytical attempt reserves and dispatches only its configured subset.
+///
+/// Covers the bounded-selection half of the Analytical worker contract: with
+/// three eligible remotes and a worker limit of two, exactly two remotes
+/// activate a graph, the third stays at its baseline and its injected planning
+/// refusal cannot reach the query, the Interactive floor survives the live
+/// attempt, and a cancelled logical query returns every confirmed owner to
+/// baseline.
+///
+/// # Panics
+///
+/// Panics when any selection, isolation, floor, or cleanup claim fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn analytical_reserves_only_configured_workers() {
+    prove_bounded_worker_reservation()
+        .await
+        .expect("bounded Analytical worker reservation journey");
+}
+
+/// Drives the bounded-selection journey over one live five-process topology.
+///
+/// # Errors
+///
+/// Returns the first selection, isolation, floor, or cleanup claim that broke.
+async fn prove_bounded_worker_reservation() -> Result<(), JourneyError> {
+    use wyrd_testing::bifrost::process_cluster::ProcessNodeTarget;
+
+    let mut cluster = BifrostProcessCluster::start(
+        NODE_BINARY,
+        &[
+            ProcessNodeTarget::Oracle,
+            ProcessNodeTarget::Oracle,
+            ProcessNodeTarget::Oracle,
+            ProcessNodeTarget::Oracle,
+            ProcessNodeTarget::Scribe,
+        ],
+    )
+    .await?;
+    let api_key = cluster
+        .provision_public_api_key("bounded-workers-caller")
+        .await?;
+    let suffix = uuid::Uuid::now_v7().simple();
+    let table = format!("bounded_workers_{suffix}");
+    cluster.nodes_mut()[BOUNDED_SCRIBE].register_table(&table)?;
+    cluster.nodes_mut()[BOUNDED_SCRIBE].ingest_rows(&table, 0, FIXTURE_ROWS, FIXTURE_GROUPS)?;
+    cluster.nodes_mut()[BOUNDED_SCRIBE].ingest_rows(&table, 0, FIXTURE_ROWS, FIXTURE_GROUPS)?;
+    // The UI table publishes one object, so its scan stays a leader-executable
+    // leaf and its root stays Interactive while the Analytical graph is held.
+    let ui_table = format!("bounded_workers_ui_{suffix}");
+    cluster.nodes_mut()[BOUNDED_SCRIBE].register_table(&ui_table)?;
+    cluster.nodes_mut()[BOUNDED_SCRIBE].ingest_rows(&ui_table, 0, FIXTURE_ROWS, FIXTURE_GROUPS)?;
+    for index in [COORDINATOR, 1, 2, 3, BOUNDED_SCRIBE] {
+        cluster.nodes_mut()[index].refresh_snapshot()?;
+    }
+
+    let mut baseline = Vec::new();
+    for index in [COORDINATOR, 1, 2, 3] {
+        baseline.push((index, cluster.nodes_mut()[index].ownership_snapshot()?));
+    }
+    let mut activations_before = Vec::new();
+    for index in BOUNDED_REMOTES {
+        activations_before.push(cluster.nodes_mut()[index].graph_leases()?.0);
+    }
+
+    let analytical_sql = format!(
+        "SELECT filter_key, COUNT(*) AS matched FROM vala.bifrost.{table} \
+         GROUP BY filter_key ORDER BY filter_key"
+    );
+    let ui_sql = format!("SELECT id FROM vala.bifrost.{ui_table} WHERE filter_key = 'group_0'");
+
+    // Every eligible remote is armed, so whichever two the attempt selects are
+    // held at their own execute seam and the third is left to prove it was
+    // never addressed at all.
+    for index in BOUNDED_REMOTES {
+        cluster.nodes_mut()[index].arm_execute_pause()?;
+    }
+    let attempt = {
+        let client = public_client(&cluster.nodes()[COORDINATOR], &api_key)?;
+        let sql = analytical_sql.clone();
+        tokio::spawn(async move { run_public(&client, &sql).await })
+    };
+    let selected = await_selected_remotes(&mut cluster).await?;
+    let unselected = BOUNDED_REMOTES
+        .into_iter()
+        .find(|index| !selected.contains(index))
+        .ok_or("every eligible remote was selected")?;
+
+    // The unselected pod is not merely unused: it holds no slot units, no
+    // reserved memory, and no graph lease, which is what makes the reservation
+    // bounded rather than merely the dispatch bounded.
+    let idle = baseline
+        .iter()
+        .find(|(index, _)| *index == unselected)
+        .map(|(_, snapshot)| *snapshot)
+        .ok_or("the unselected pod has no baseline")?;
+    let held = cluster.nodes_mut()[unselected].ownership_snapshot()?;
+    if held != idle {
+        return Err(format!(
+            "unselected pod {unselected} holds {held:?} while a bounded attempt runs"
+        )
+        .into());
+    }
+
+    // A refusal the query never asks for cannot be a refusal the query
+    // suffers: the unselected pod is armed to refuse the next distributed plan
+    // it is asked to build, and the live attempt below still settles.
+    cluster.nodes_mut()[unselected].arm_analytical_plan_failure()?;
+
+    // Served while the Analytical graph holds its envelope on every selected
+    // pod: the combined leader-plus-follower Analytical units never reach into
+    // the units Interactive work is owed.
+    let client = public_client(&cluster.nodes()[COORDINATOR], &api_key)?;
+    let ui = run_public(&client, &ui_sql).await?;
+    if ui.path != QueryExecutionPath::Interactive {
+        return Err(format!(
+            "a UI query alongside a held Analytical graph must stay Interactive, settled {:?}",
+            ui.path
+        )
+        .into());
+    }
+    if ui.rows != usize::try_from(FIXTURE_ROWS / FIXTURE_GROUPS)? {
+        return Err(format!("the floor query returned {} rows", ui.rows).into());
+    }
+
+    for index in BOUNDED_REMOTES {
+        cluster.nodes_mut()[index].release_execute_pause()?;
+    }
+    let settled = attempt.await??;
+    if settled.path != QueryExecutionPath::Analytical {
+        return Err(format!(
+            "the bounded attempt settled {:?}, not Analytical",
+            settled.path
+        )
+        .into());
+    }
+    if settled.rows != usize::try_from(FIXTURE_GROUPS)? {
+        return Err(format!("the bounded attempt returned {} rows", settled.rows).into());
+    }
+
+    // Cleanup is owned by the pods that reserved, and only by them: the
+    // selected pair activated and released, the third never activated.
+    for (offset, index) in BOUNDED_REMOTES.into_iter().enumerate() {
+        let (activated, live) = await_released_lease(&mut cluster, index).await?;
+        let activated = activated - activations_before[offset];
+        let expected = u64::from(selected.contains(&index));
+        if activated != expected {
+            return Err(format!(
+                "pod {index} activated {activated} graphs for one bounded attempt, not {expected}"
+            )
+            .into());
+        }
+        if live != 0 {
+            return Err(format!("pod {index} still holds {live} graph leases").into());
+        }
+    }
+
+    prove_cancelled_query_returns_owners(&mut cluster, &analytical_sql, &baseline).await?;
+
+    drop(client);
+    cluster.shutdown()?;
+    Ok(())
+}
+
+/// Waits, bounded, until exactly the configured worker count holds a lease.
+///
+/// Selection is not announced anywhere a caller can read, so the pods that
+/// hold a live graph lease while the attempt is paused are what identifies it.
+/// Waiting for exactly [`BOUNDED_WORKERS`] rather than for at least that many
+/// is deliberate: a reservation that took the whole eligible roster would
+/// otherwise pass on its way through the bound.
+///
+/// # Errors
+///
+/// Returns the control-protocol error, or the observed lease distribution when
+/// the attempt never settles on exactly its configured subset.
+async fn await_selected_remotes(
+    cluster: &mut BifrostProcessCluster,
+) -> Result<Vec<usize>, JourneyError> {
+    let mut live = Vec::new();
+    for _ in 0..BASELINE_POLLS {
+        live.clear();
+        for index in BOUNDED_REMOTES {
+            if cluster.nodes_mut()[index].graph_leases()?.1 > 0 {
+                live.push(index);
+            }
+        }
+        if live.len() == BOUNDED_WORKERS {
+            return Ok(live);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    Err(format!(
+        "a bounded attempt held leases on {live:?}, not on exactly {BOUNDED_WORKERS} remotes"
+    )
+    .into())
+}
+
+/// Proves a cancelled logical query returns every confirmed owner to baseline.
+///
+/// The cancellation is driven on the coordinator's own logical-query slot, so
+/// the query is abandoned by its owner rather than by a lost peer, and the
+/// claim is about ordinary cleanup rather than about failure handling.
+///
+/// # Errors
+///
+/// Returns the control-protocol error, an unexpectedly successful
+/// cancellation, or the first pod that did not return to its baseline.
+async fn prove_cancelled_query_returns_owners(
+    cluster: &mut BifrostProcessCluster,
+    sql: &str,
+    baseline: &[(
+        usize,
+        wyrd_testing::bifrost::process_cluster::OracleOwnershipSnapshot,
+    )],
+) -> Result<(), JourneyError> {
+    cluster.nodes_mut()[COORDINATOR].start_inactive_sql(sql)?;
+    cluster.nodes_mut()[COORDINATOR].cancel_inactive_sql()?;
+    if let Ok(rows) = cluster.nodes_mut()[COORDINATOR].await_inactive_sql()? {
+        return Err(format!("a cancelled logical query still returned {rows} rows").into());
+    }
+    for (index, before) in baseline {
+        await_baseline(cluster, *index, *before).await?;
+    }
+    Ok(())
+}

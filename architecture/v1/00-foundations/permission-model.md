@@ -112,8 +112,9 @@ Examples:
   `{ BifrostQuery, Read, Bifrost(Table(vala, logs, <any uid>)) }`, but not a
   table in `vala.traces` and not the object-wide
   `{ BifrostQuery, Read, All }`.
-- A wildcard grant reaches objects only because its scope is `All`; a wildcard
-  paired with a narrow scope stays narrow.
+- A wildcard grant reaches objects only because its scope is `All`. A wildcard
+  or multi-resource grant cannot carry a Bifrost object scope at all: decode
+  rejects it, so no narrow wildcard grant exists.
 
 Grants are additive and absence is denial. There is no explicit-deny
 precedence, no ownership, and no grant-option semantics.
@@ -171,9 +172,10 @@ Object-scoped Bifrost grants use the same array:
 
 `scope` is required on every permission. A two-field object is rejected rather
 than promoted to `all`; there is no compatibility decoder, because this
-contract has not shipped. Malformed catalog, schema, or table identities and
-Bifrost scope on a non-Bifrost resource are rejected at decode, so a corrupt
-role row surfaces by name instead of resolving into effective authority.
+contract has not shipped. Malformed catalog, schema, or table identities,
+Bifrost scope on a non-Bifrost resource, and Bifrost scope on any action other
+than exactly `read` are rejected at decode, so a corrupt role row surfaces by
+name instead of resolving into effective authority.
 
 The decode path reads this JSONB value into `Vec<Permission>` and builds a
 `PermissionSet` for runtime checks. Role permissions remain the sole static
@@ -188,7 +190,7 @@ change.
 caller needs:
 
 ```rust
-Permission { resource: Delegation, action: Issue }
+Permission { resource: Delegation, action: Issue, scope: All }
 ```
 
 to call `POST /auth/token` with
@@ -196,4 +198,4 @@ to call `POST /auth/token` with
 
 This keeps delegated-token issuance inside the same typed RBAC model as every
 other Wyrd API call. The `runtime_admin` builtin role carries this permission;
-broader admin roles may cover it through `{ Wildcard, Wildcard }`.
+broader admin roles may cover it through `{ Wildcard, Wildcard, All }`.

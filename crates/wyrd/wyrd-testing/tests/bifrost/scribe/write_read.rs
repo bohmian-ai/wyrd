@@ -77,6 +77,10 @@ async fn scribe_write_flush_read_user_journey() {
     .await
     .expect("the one-pod mixed cluster starts with the cache disabled");
     assert_empty_table_reads_cleanly(cluster.server(0).expect("the mixed pod is running")).await;
+    assert_canonical_genai_span_is_tenant_isolated(
+        cluster.server(0).expect("the mixed pod is running"),
+    )
+    .await;
 
     let uncached_run = cluster
         .run_scribe_production_workload(&workload, ScribeCacheMode::Disabled)
@@ -120,6 +124,186 @@ async fn scribe_write_flush_read_user_journey() {
         (0, 0, 0),
         "a disabled composition must record no hit, miss, or join, observed {uncached_storage:?}"
     );
+}
+
+/// One complete GenAI span survives this pod's write/flush/read path, and is
+/// visible only inside the tenant that wrote it.
+///
+/// The canonical span ledger is a server-owned built-in, so the pod provisions
+/// it and the fixture then uses the only door a caller has: the table's own
+/// published description, one public Arrow batch write, the pod's own Scribe
+/// publication, and a strict fused public read. A second active tenant
+/// provisions the same ledger and reads the same scope, which must return
+/// nothing — the ledger is shared by name, never by content.
+///
+/// # Panics
+///
+/// Panics when provisioning, describe, the write, the publication, or either
+/// read fails, or when the readback is not exactly the span that was written.
+async fn assert_canonical_genai_span_is_tenant_isolated(server: &wyrd_testing::WyrdTestServer) {
+    use wyrd_testing::bifrost::canonical_signals as fixture;
+
+    /// The fixed event-time anchor every canonical fixture row is written at.
+    const ANCHOR: i64 = 1_760_000_000_000_000_000;
+    /// The canonical span ledger both tenants provision and read.
+    const SPANS: &str = "vala.traces.spans";
+
+    let tenant = server.data_tenant_id();
+    server
+        .ensure_builtin_table_for_test(tenant, "traces", "spans")
+        .await
+        .expect("the canonical span ledger is provisioned for the writing tenant");
+    let writer = tenant_writer(server, tenant).await;
+    let described = vala_sdk::TableConfig::describe(writer.client(), SPANS)
+        .await
+        .expect("the canonical span ledger describes itself");
+    let scope = unique_table("scribe_canonical");
+    writer
+        .write_batch(
+            SPANS,
+            &fixture::spans(described.user_schema(), &scope, ANCHOR),
+        )
+        .await
+        .expect("the canonical span batch is accepted");
+    server
+        .flush_bifrost()
+        .await
+        .expect("this pod publishes what it accepted");
+
+    let flat = query_rows(
+        &writer,
+        &format!(
+            "SELECT name, CAST(gen_ai_usage_input_tokens AS BIGINT) AS input_tokens, \
+             CAST(status_code AS BIGINT) AS status_code FROM {SPANS} \
+             WHERE scope_name = '{scope}' AND service_name = 'wyrd.fixture.service' \
+             AND gen_ai_request_model = '{model}' AND resource_present AND scope_present \
+             ORDER BY start_time_unix_nano",
+            model = fixture::MODEL
+        ),
+    )
+    .await;
+    assert_eq!(
+        text_values(&flat, "name"),
+        vec![
+            "chat claude-opus-5".to_owned(),
+            "execute_tool search".to_owned()
+        ],
+        "the parent GenAI span and the tool span it made both read back"
+    );
+    assert_eq!(
+        int_values(&flat, "input_tokens"),
+        vec![fixture::INPUT_TOKENS, 64],
+        "the promoted GenAI token columns read back exactly"
+    );
+    assert_eq!(
+        int_values(&flat, "status_code"),
+        vec![1, 2],
+        "the child span keeps the error status it was written with"
+    );
+
+    let nested = query_rows(
+        &writer,
+        &format!(
+            "SELECT CAST(array_length(events) AS BIGINT) AS events, \
+             CAST(array_length(links) AS BIGINT) AS links FROM {SPANS} \
+             WHERE scope_name = '{scope}' AND parent_span_id IS NULL"
+        ),
+    )
+    .await;
+    assert_eq!(
+        (int_values(&nested, "events"), int_values(&nested, "links")),
+        (vec![1], vec![1]),
+        "the parent span keeps the one event and one link it was written with"
+    );
+
+    let other = server
+        .seed_tenant(&unique_table("canonical_isolation"))
+        .await
+        .expect("a second active tenant is seeded");
+    server
+        .ensure_builtin_table_for_test(other, "traces", "spans")
+        .await
+        .expect("the canonical span ledger is provisioned for the second tenant");
+    let stranger = tenant_writer(server, other).await;
+    assert!(
+        query_rows(
+            &stranger,
+            &format!("SELECT name FROM {SPANS} WHERE scope_name = '{scope}'"),
+        )
+        .await
+        .is_empty(),
+        "a second tenant reading the same canonical ledger sees no row of the first"
+    );
+}
+
+/// Drain one strict fused public read into its batches.
+///
+/// # Panics
+///
+/// Panics when the query cannot start or does not reach a successful terminal.
+async fn query_rows(
+    writer: &wyrd_testing::bifrost::write::BifrostWriter,
+    sql: &str,
+) -> Vec<RecordBatch> {
+    let mut stream = vala_sdk::query::QueryClient::new(writer.client())
+        .query(&BifrostQueryRequest {
+            sql: sql.to_owned(),
+            visibility: VisibilityMode::Fused,
+            freshness: wyrd_spec::vala::api::FreshnessPolicy::Strict,
+            deadline_ms: Some(60_000),
+        })
+        .await
+        .expect("the public query starts");
+    let mut batches = Vec::new();
+    while let Some(batch) = stream
+        .next_batch()
+        .await
+        .expect("the public query reaches its successful terminal")
+    {
+        batches.push(batch);
+    }
+    batches
+}
+
+/// Collect one `Utf8` column's values across every batch, in order.
+///
+/// # Panics
+///
+/// Panics when the column is absent or is not `Utf8`.
+fn text_values(batches: &[RecordBatch], name: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    for batch in batches {
+        let array = batch
+            .column_by_name(name)
+            .unwrap_or_else(|| panic!("column `{name}`"))
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap_or_else(|| panic!("column `{name}` is not Utf8"));
+        values.extend((0..array.len()).map(|index| array.value(index).to_owned()));
+    }
+    values
+}
+
+/// Collect one `Int64` column's values across every batch, in order.
+///
+/// # Panics
+///
+/// Panics when the column is absent, is not `Int64`, or carries a null.
+fn int_values(batches: &[RecordBatch], name: &str) -> Vec<i64> {
+    let mut values = Vec::new();
+    for batch in batches {
+        let array = batch
+            .column_by_name(name)
+            .unwrap_or_else(|| panic!("column `{name}`"))
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap_or_else(|| panic!("column `{name}` is not Int64"));
+        for index in 0..array.len() {
+            assert!(array.is_valid(index), "column `{name}` carries no null");
+            values.push(array.value(index));
+        }
+    }
+    values
 }
 
 /// Returns the terminal boundary's storage-owner observation.

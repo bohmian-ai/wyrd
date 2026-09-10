@@ -1155,6 +1155,29 @@ async fn drive_scheduler_pass(server: &WyrdTestServer, label: &str) {
     });
 }
 
+/// Waits for the planning pass the coordinator runs as soon as it starts.
+///
+/// The scheduler's first tick is immediate, so a test that drives its own
+/// passes must observe the boot pass first; otherwise the next pass it drives
+/// is the boot pass still in flight, and its assertions describe a pass that
+/// ran before the test finished arranging the world.
+///
+/// # Panics
+///
+/// Panics when the boot pass does not complete within the readiness budget.
+#[cfg(feature = "test-support")]
+async fn await_boot_scheduler_pass(server: &WyrdTestServer, label: &str) {
+    tokio::time::timeout(
+        FORGE_READINESS_CEILING,
+        server.wait_for_forge_scheduler_passes_for_test(1),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        server.state().shutdown_token.cancel();
+        panic!("{label}: the coordinator's boot planning pass never completed");
+    });
+}
+
 /// Polls one Forge role bit until it reaches `expected`.
 ///
 /// The composed in-process server does not run the background readiness loop,
@@ -1632,7 +1655,7 @@ async fn coordinator_partial_pass_is_not_ready() {
         .expect("the default target selects a coordinator");
     let handle = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(scheduler));
 
-    drive_scheduler_pass(&server, "overflowed partial pass").await;
+    await_boot_scheduler_pass(&server, "overflowed partial pass").await;
     assert!(
         !readiness.is_ready(),
         "a pass that stopped at its hint budget left demand unplanned"
@@ -3383,6 +3406,7 @@ async fn coordinator_preseeded_demand_requires_roster_discovery() {
         .expect("fail roster read");
     let stop = server.state().shutdown_token.child_token();
     let handle = spawn_coordinator(&server, &stop);
+    await_boot_scheduler_pass(&server, "boot pass with unavailable roster").await;
     drive_scheduler_pass(&server, "preseeded demand with unavailable roster").await;
     assert!(
         !readiness.is_ready(),

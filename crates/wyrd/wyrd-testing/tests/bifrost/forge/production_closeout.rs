@@ -732,6 +732,25 @@ impl CloseoutJourney {
         .expect("the abandoned rewrite and its retry both settle");
     }
 
+    /// Settles the planning pass the coordinator runs as soon as it starts.
+    ///
+    /// A coordinator plans immediately on start, so a fixture that drives its
+    /// own passes must settle that boot pass before arranging the world.
+    /// Otherwise the boot pass plans concurrently with the first driven pass
+    /// and the run observes tasks neither pass alone accounts for.
+    ///
+    /// # Panics
+    /// Panics if the boot pass does not complete in 15 seconds.
+    async fn await_boot_pass(&self) {
+        tokio::time::timeout(
+            PASS_BOUND,
+            self.coordinator()
+                .wait_for_forge_scheduler_passes_for_test(1),
+        )
+        .await
+        .expect("a freshly started coordinator completes its boot planning pass");
+    }
+
     /// Requests and observes one real scheduler pass before inspecting SQL.
     ///
     /// # Panics
@@ -1236,6 +1255,7 @@ async fn compaction_geometry_exact_rows_and_non_destructive_second_pass() {
         .restart_node(journey.coordinator_node)
         .await
         .expect("coordinator starts after complete ingestion");
+    journey.await_boot_pass().await;
     for server in journey.cluster.servers().iter() {
         server
             .forge_clock()
@@ -1470,6 +1490,7 @@ impl ReaderCleanupJourney {
             .restart_node(roles.coordinator_node)
             .await
             .expect("coordinator starts");
+        roles.await_boot_pass().await;
         roles.advance_maintenance(chrono::Duration::hours(2));
         roles.scheduler_pass().await;
         roles.drain_tasks().await;
@@ -1751,6 +1772,7 @@ impl OrphanJourney {
             .restart_node(roles.coordinator_node)
             .await
             .expect("coordinator starts");
+        roles.await_boot_pass().await;
         // No maintenance-clock advance here. This journey's terminal age floor
         // is a real interval measured by the production planning demand, so a
         // manual clock running ahead of storage would report every object as

@@ -153,7 +153,28 @@ impl Forge {
         #[cfg(not(feature = "test-support"))]
         let mut scheduler = ForgeScheduler::new(self)?;
         let interval = self.core.maintenance_interval;
-        let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+        // A coordinator plans as soon as it starts. Readiness follows a
+        // completed planning pass, so deferring the first pass by a whole
+        // interval left a freshly started coordinator advertising `/readyz`
+        // unready for that interval — a minute on the default configuration —
+        // while planning nothing it had already been asked to plan.
+        #[cfg(feature = "test-support")]
+        let first_tick = if self
+            .core
+            .scheduler_trigger
+            .as_ref()
+            .and_then(ForgeSchedulerTrigger::owner_for_test)
+            .is_some()
+        {
+            // A test that owns this scheduler drives every pass itself, so its
+            // loop stays quiet until asked rather than racing the arrangement.
+            tokio::time::Instant::now() + interval
+        } else {
+            tokio::time::Instant::now()
+        };
+        #[cfg(not(feature = "test-support"))]
+        let first_tick = tokio::time::Instant::now();
+        let mut ticker = tokio::time::interval_at(first_tick, interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut hints_open = true;
         loop {

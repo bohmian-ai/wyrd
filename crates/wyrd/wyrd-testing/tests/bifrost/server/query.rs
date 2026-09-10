@@ -101,6 +101,9 @@ async fn read_decision_detail(
 /// Bounded budget for the read-audit relay to drain before a durable count.
 const AUDIT_RELAY_CONVERGENCE_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Bounded budget for every selected role to publish its readiness bit.
+const READINESS_CEILING: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Waits until the Oracle read-audit WAL residual reaches zero.
 ///
 /// A query's read decision is durable at its local WAL fsync and reaches
@@ -333,6 +336,33 @@ async fn generated_grpc_and_scheduled_queries_share_audit_terminal_and_cleanup()
         .expect("scheduled Analytical peer-loss journey");
 }
 
+/// Waits for a bound server to publish readiness on `/readyz`.
+///
+/// `WyrdTestServer::start_bound` returns once the process answers `/healthz`,
+/// which is liveness. Readiness additionally requires each selected role to
+/// publish its own bit, and the Forge coordinator publishes only after its
+/// first planning pass completes. Polling is therefore the claim: a single
+/// probe races roles that are still converging and proves nothing about a
+/// server that would have been ready a moment later.
+///
+/// # Errors
+///
+/// Returns the last `/readyz` body when readiness does not arrive within the
+/// bounded window, so the failing probe and its reason code are visible.
+async fn await_server_ready(base: &str) -> Result<(), ServerJourneyError> {
+    let deadline = std::time::Instant::now() + READINESS_CEILING;
+    let mut last = String::new();
+    while std::time::Instant::now() < deadline {
+        let response = reqwest::get(format!("{base}/readyz")).await?;
+        if response.status().is_success() {
+            return Ok(());
+        }
+        last = response.text().await.unwrap_or_default();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    Err(format!("the server never reported ready on /readyz: {last}").into())
+}
+
 /// Drives both server-side query entries against one real bound server.
 ///
 /// # Errors
@@ -359,10 +389,7 @@ async fn prove_shared_query_surfaces() -> Result<(), ServerJourneyError> {
     // Readiness first: every claim below is about a node that is actually
     // serving, not one that answered before its dependencies resolved.
     let base = server.base_url().ok_or("missing HTTP URL")?.to_owned();
-    let ready = reqwest::get(format!("{base}/readyz")).await?;
-    if !ready.status().is_success() {
-        return Err(format!("the server reported {} on /readyz", ready.status()).into());
-    }
+    await_server_ready(&base).await?;
 
     let bootstrap = server
         .bootstrap_service_in_tenant(tenant, "server-query-caller", &["admin"])

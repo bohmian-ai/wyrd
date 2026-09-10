@@ -56,3 +56,14 @@ test-group = 'postgres-fixtures'
 test-threads = 6
 leak-timeout = "5s"
 fail-fast = false
+
+# The sustained journey asserts that a pod lending one vector to four
+# concurrent tenants refuses at least once. That refusal only happens when the
+# four tenants are genuinely in flight together, which is why the test runs its
+# own multi-threaded runtime. Five sibling journeys competing for the same cores
+# serialize those tenants instead, and the run then observes no refusal at all
+# and fails. Reserving every slot keeps the contention it measures a property of
+# the pod rather than of the host.
+[[profile.journey.overrides]]
+filter = 'test(=sustained::scribe_sustained_ingest_oracle_hot_read_journey)'
+threads-required = 'num-test-threads'

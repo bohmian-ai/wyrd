@@ -1,3 +1,8 @@
+use vala_sdk::QueryClient;
+use wyrd_client::WyrdClient;
+use wyrd_client::config::ClientConfig;
+use wyrd_client::transport::{GrpcConfig, HttpConfig};
+use wyrd_spec::vala::api::{BifrostQueryRequest, FreshnessPolicy, VisibilityMode};
 use wyrd_testing::bifrost::process_cluster::{BifrostProcessCluster, ProcessNodeTarget};
 
 use super::support::PeerJourneyError;
@@ -704,6 +709,8 @@ async fn prove_representative_query_styles() -> Result<(), PeerJourneyError> {
         execute_style(&mut cluster, &style).await?;
     }
 
+    prove_canonical_genai_span(&mut cluster).await?;
+
     cluster.shutdown()?;
     Ok(())
 }
@@ -893,4 +900,323 @@ async fn execute_style(
         }
     }
     Ok(())
+}
+
+/// Carries one complete GenAI span through this live topology, end to end.
+///
+/// The distributed styles above prove operator families over fixture rows. This
+/// proves that the same topology carries the signal the product exists to
+/// store: one parent/child GenAI trace with an event, a link, an error status,
+/// resource and scope metadata, promoted GenAI fields, and the structured
+/// input/output messages the payload gate protects. Nothing here reaches into a
+/// pod: the span arrives through the Scribe's public OTLP route with a
+/// provisioned credential, and it is read back through the leader's public
+/// query listener over the same stage graph the styles used.
+///
+/// A second data tenant then runs the identical statement against the identical
+/// listener. It must see none of it, which is the tenant tripwire stated as a
+/// read rather than as a configuration.
+///
+/// # Errors
+///
+/// Returns the first claim that broke: the OTLP export, the publication, the
+/// readback, or the foreign tenant reaching another tenant's span.
+async fn prove_canonical_genai_span(
+    cluster: &mut BifrostProcessCluster,
+) -> Result<(), PeerJourneyError> {
+    use wyrd_testing::bifrost::canonical_signals as fixture;
+
+    let api_key = cluster
+        .provision_public_api_key("canonical-signal-caller")
+        .await?;
+    let scope = format!("wyrd.peer.canonical.{}", uuid::Uuid::now_v7().simple());
+    export_canonical_trace(&cluster.nodes()[SCRIBE], &api_key, &scope).await?;
+    cluster.nodes_mut()[SCRIBE].flush()?;
+    for index in [LEADER, FOLLOWERS[0], FOLLOWERS[1], SCRIBE] {
+        cluster.nodes_mut()[index].refresh_snapshot()?;
+    }
+
+    let sql = format!(
+        "SELECT name, gen_ai_operation_name, gen_ai_provider_name, gen_ai_request_model, \
+                status_code, \
+                CAST(gen_ai_usage_input_tokens AS BIGINT) AS input_tokens, \
+                CAST(gen_ai_usage_output_tokens AS BIGINT) AS output_tokens, \
+                CAST(array_length(events) AS BIGINT) AS events, \
+                CAST(array_length(links) AS BIGINT) AS links, \
+                events[1]['name'] AS event_name, links[1]['trace_state'] AS link_state, \
+                service_name \
+         FROM vala.traces.spans \
+         WHERE scope_name = '{scope}' AND parent_span_id IS NULL"
+    );
+    let leader = public_client(&cluster.nodes()[LEADER], &api_key)?;
+    let parent = public_query(&leader, &sql).await?;
+    if parent.len() != 1 {
+        return Err(format!(
+            "the canonical parent span read back as {} rows, not one",
+            parent.len()
+        )
+        .into());
+    }
+    let parent = &parent[0];
+    for (column, expected) in [
+        ("gen_ai_operation_name", "chat".to_owned()),
+        ("gen_ai_provider_name", "anthropic".to_owned()),
+        ("gen_ai_request_model", fixture::MODEL.to_owned()),
+        ("event_name", fixture::EVENT_NAME.to_owned()),
+        ("link_state", fixture::LINK_TRACE_STATE.to_owned()),
+        ("service_name", CANONICAL_SERVICE.to_owned()),
+    ] {
+        let actual = parent.get(column).cloned().unwrap_or_default();
+        if actual != expected {
+            return Err(
+                format!("the parent span reports {column} as {actual}, not {expected}").into(),
+            );
+        }
+    }
+    for (column, expected) in [
+        ("input_tokens", fixture::INPUT_TOKENS.to_string()),
+        ("output_tokens", fixture::OUTPUT_TOKENS.to_string()),
+        ("status_code", "1".to_owned()),
+        ("events", "1".to_owned()),
+        ("links", "1".to_owned()),
+    ] {
+        let actual = parent.get(column).cloned().unwrap_or_default();
+        if actual != expected {
+            return Err(
+                format!("the parent span reports {column} as {actual}, not {expected}").into(),
+            );
+        }
+    }
+
+    // The child is the same trace's tool call: it carries the parent's id and
+    // the error status, so the hierarchy survived the round trip intact.
+    let child = public_query(
+        &leader,
+        &format!(
+            "SELECT name, gen_ai_operation_name, status_code \
+             FROM vala.traces.spans \
+             WHERE scope_name = '{scope}' AND parent_span_id IS NOT NULL"
+        ),
+    )
+    .await?;
+    if child.len() != 1 {
+        return Err(format!("the trace carries {} child spans, not one", child.len()).into());
+    }
+    if child[0].get("gen_ai_operation_name").map(String::as_str) != Some("execute_tool")
+        || child[0].get("status_code").map(String::as_str) != Some("2")
+    {
+        return Err(format!("the child span read back as {:?}", child[0]).into());
+    }
+
+    // The structured GenAI messages stay in the sensitive payload, which this
+    // credential is entitled to read.
+    let payload = public_query(
+        &leader,
+        &format!(
+            "SELECT attributes FROM vala.traces.spans \
+             WHERE scope_name = '{scope}' AND parent_span_id IS NULL"
+        ),
+    )
+    .await?;
+    let rendered = payload
+        .first()
+        .and_then(|row| row.get("attributes"))
+        .cloned()
+        .unwrap_or_default();
+    for messages in [fixture::INPUT_MESSAGES, fixture::OUTPUT_MESSAGES] {
+        if !rendered.contains(&hex::encode(messages)) {
+            return Err("the structured GenAI messages did not survive the round trip".into());
+        }
+    }
+
+    // The tripwire: another tenant on the same listener reaches none of it.
+    let foreign_key = cluster
+        .provision_foreign_public_api_key("canonical-foreign")
+        .await?;
+    let foreign = public_client(&cluster.nodes()[LEADER], &foreign_key)?;
+    if let Ok(rows) = public_query(&foreign, &sql).await
+        && !rows.is_empty()
+    {
+        return Err(format!(
+            "a foreign tenant read {} rows of another tenant's canonical span",
+            rows.len()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// The `service.name` the canonical export declares on its resource.
+const CANONICAL_SERVICE: &str = "wyrd.peer.canonical";
+
+/// Sends the canonical parent/child GenAI trace to one pod's public OTLP route.
+///
+/// The export is the door a real tracer arrives through, so it also provisions
+/// the canonical built-in table: no journey-side registration precedes it.
+///
+/// # Errors
+///
+/// Returns a failure when the credential cannot be exchanged, the request
+/// cannot be sent, or the pod refuses the export.
+async fn export_canonical_trace(
+    node: &wyrd_testing::bifrost::process_cluster::ProcessNode,
+    api_key: &secrecy::SecretString,
+    scope: &str,
+) -> Result<(), PeerJourneyError> {
+    use wyrd_testing::bifrost::canonical_signals as fixture;
+
+    let anchor = 1_760_000_000_000_000_000_i64;
+    let string_attribute =
+        |key: &str, value: &str| serde_json::json!({"key": key, "value": {"stringValue": value}});
+    let int_attribute = |key: &str, value: i64| serde_json::json!({"key": key, "value": {"intValue": value.to_string()}});
+    let parent = serde_json::json!({
+        "traceId": hex::encode(fixture::TRACE_ID),
+        "spanId": hex::encode(fixture::PARENT_SPAN_ID),
+        "name": "chat claude-opus-5",
+        "kind": 3,
+        "startTimeUnixNano": anchor.to_string(),
+        "endTimeUnixNano": (anchor + 2_000_000).to_string(),
+        "status": {"code": 1, "message": "ok"},
+        "attributes": [
+            string_attribute("gen_ai.operation.name", "chat"),
+            string_attribute("gen_ai.provider.name", "anthropic"),
+            string_attribute("gen_ai.request.model", fixture::MODEL),
+            string_attribute("gen_ai.conversation.id", "conversation-fixture"),
+            int_attribute("gen_ai.usage.input_tokens", fixture::INPUT_TOKENS),
+            int_attribute("gen_ai.usage.output_tokens", fixture::OUTPUT_TOKENS),
+            string_attribute("gen_ai.input.messages", fixture::INPUT_MESSAGES),
+            string_attribute("gen_ai.output.messages", fixture::OUTPUT_MESSAGES),
+        ],
+        "events": [{
+            "timeUnixNano": (anchor + 1_000_000).to_string(),
+            "name": fixture::EVENT_NAME,
+            "attributes": [string_attribute("gen_ai.finish_reason", "stop")],
+        }],
+        "links": [{
+            "traceId": hex::encode(fixture::TRACE_ID),
+            "spanId": hex::encode(fixture::LINKED_SPAN_ID),
+            "traceState": fixture::LINK_TRACE_STATE,
+            "attributes": [string_attribute("link.kind", "follows_from")],
+        }],
+    });
+    let child = serde_json::json!({
+        "traceId": hex::encode(fixture::TRACE_ID),
+        "spanId": hex::encode(fixture::CHILD_SPAN_ID),
+        "parentSpanId": hex::encode(fixture::PARENT_SPAN_ID),
+        "name": "execute_tool search",
+        "kind": 1,
+        "startTimeUnixNano": (anchor + 100_000).to_string(),
+        "endTimeUnixNano": (anchor + 900_000).to_string(),
+        "status": {"code": 2, "message": "tool call exhausted its retry budget"},
+        "attributes": [
+            string_attribute("gen_ai.operation.name", "execute_tool"),
+            string_attribute("gen_ai.provider.name", "anthropic"),
+            string_attribute("gen_ai.request.model", fixture::MODEL),
+            string_attribute("gen_ai.tool.name", "search"),
+        ],
+    });
+
+    let client = public_client(node, api_key)?;
+    let bearer = client
+        .auth()
+        .bearer()
+        .await
+        .map_err(|error| PeerJourneyError::from(error.to_string()))?;
+    let response = reqwest::Client::new()
+        .post(format!("http://{}/v1/traces", node.http_addr()))
+        .header("x-wyrd-access-token", format!("Bearer {}", bearer.expose()))
+        .json(&serde_json::json!({"resourceSpans": [{
+            "resource": {
+                "attributes": [string_attribute("service.name", CANONICAL_SERVICE)],
+            },
+            "scopeSpans": [{
+                "scope": {"name": scope, "version": "1.0.0"},
+                "spans": [parent, child],
+            }],
+        }]}))
+        .send()
+        .await
+        .map_err(|error| PeerJourneyError::from(error.to_string()))?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("the canonical OTLP export was refused ({status}): {body}").into());
+    }
+    Ok(())
+}
+
+/// Builds one ordinary external client against a pod's public listeners.
+///
+/// # Errors
+///
+/// Returns a failure when the endpoints do not form a client.
+fn public_client(
+    node: &wyrd_testing::bifrost::process_cluster::ProcessNode,
+    api_key: &secrecy::SecretString,
+) -> Result<WyrdClient, PeerJourneyError> {
+    WyrdClient::with_config(ClientConfig {
+        grpc: GrpcConfig {
+            endpoint: format!("http://{}", node.grpc_addr()),
+            connect_retries: 0,
+            ..GrpcConfig::default()
+        },
+        http: HttpConfig {
+            base_url: format!("http://{}", node.http_addr()),
+            ..HttpConfig::default()
+        },
+        credential: Some(api_key.clone()),
+        ..ClientConfig::default()
+    })
+    .map_err(|error| PeerJourneyError::from(error.to_string()))
+}
+
+/// Runs one public query and renders every returned row as displayed text.
+///
+/// The journey asserts on fixed literal values rather than on Arrow layout, so
+/// rendering each column with its own `Display` keeps the assertions readable
+/// and type-independent; a binary payload renders as hex, which is what the
+/// structured-message claim matches against.
+///
+/// # Errors
+///
+/// Returns a failure when the query is refused, a batch does not arrive, or the
+/// stream carries no terminal frame.
+async fn public_query(
+    client: &WyrdClient,
+    sql: &str,
+) -> Result<Vec<std::collections::BTreeMap<String, String>>, PeerJourneyError> {
+    let mut stream = QueryClient::new(client)
+        .query(&BifrostQueryRequest {
+            sql: sql.to_owned(),
+            visibility: VisibilityMode::PublishedOnly,
+            freshness: FreshnessPolicy::Strict,
+            deadline_ms: None,
+        })
+        .await
+        .map_err(|error| PeerJourneyError::from(error.to_string()))?;
+    let mut rows = Vec::new();
+    while let Some(batch) = stream
+        .next_batch()
+        .await
+        .map_err(|error| PeerJourneyError::from(error.to_string()))?
+    {
+        for index in 0..batch.num_rows() {
+            let mut row = std::collections::BTreeMap::new();
+            for (position, field) in batch.schema().fields().iter().enumerate() {
+                let column = batch.column(position);
+                let rendered = if column.is_null(index) {
+                    String::new()
+                } else {
+                    arrow::util::display::array_value_to_string(column, index)
+                        .map_err(|error| PeerJourneyError::from(error.to_string()))?
+                };
+                row.insert(field.name().clone(), rendered);
+            }
+            rows.push(row);
+        }
+    }
+    stream
+        .terminal()
+        .ok_or("the canonical readback produced no terminal frame")?;
+    Ok(rows)
 }

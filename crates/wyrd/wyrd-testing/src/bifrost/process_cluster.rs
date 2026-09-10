@@ -223,6 +223,12 @@ pub enum ControlRequest {
         /// Distinct `filter_key` groups the rows fall into.
         groups: i64,
     },
+    /// Freeze and publish everything this child's Scribe currently holds.
+    ///
+    /// The publication trigger a deployment runs on its own timer. A journey
+    /// that wrote through a public ingest door needs it as an explicit step so
+    /// the rows it just sent are readable without waiting on that timer.
+    Flush,
     /// Re-read the shared membership snapshot into this child's Oracle.
     RefreshSnapshot,
     /// Report this child's graph-lease activations and the leases it still holds.
@@ -475,6 +481,8 @@ pub enum ControlResponse {
     Registered,
     /// Answer to [`ControlRequest::IngestRows`].
     Ingested,
+    /// This child froze and published everything its Scribe held.
+    Flushed,
     /// Answer to [`ControlRequest::RefreshSnapshot`].
     Refreshed,
     /// Answer to [`ControlRequest::GraphLeases`].
@@ -1140,6 +1148,29 @@ impl ProcessNode {
             ControlResponse::Failed { detail } => Err(ProcessClusterError::Child(detail)),
             other => Err(ProcessClusterError::Protocol(format!(
                 "expected an ingest, received {other:?}"
+            ))),
+        }
+    }
+
+    /// Asks this child to freeze and publish everything its Scribe holds.
+    ///
+    /// A journey that wrote through a public ingest door — an OTLP export, an
+    /// SDK batch — owns no in-pod handle to the writer it just fed. This is the
+    /// publication step a deployment reaches on its own interval, taken
+    /// explicitly so the readback that follows is deterministic rather than
+    /// timed.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::request`], and
+    /// [`ProcessClusterError::Child`] when this target composes no Scribe or a
+    /// shard could not publish.
+    pub fn flush(&mut self) -> Result<(), ProcessClusterError> {
+        match self.request(&ControlRequest::Flush)? {
+            ControlResponse::Flushed => Ok(()),
+            ControlResponse::Failed { detail } => Err(ProcessClusterError::Child(detail)),
+            other => Err(ProcessClusterError::Protocol(format!(
+                "expected a flush, received {other:?}"
             ))),
         }
     }
@@ -2086,6 +2117,38 @@ impl BifrostProcessCluster {
         crate::server::provision_tenant_service_principal(
             &self.shared.fixture,
             self.shared.fixture.data_tenant_id(),
+            name,
+            &["admin"],
+        )
+        .await
+        .map_err(|error| ProcessClusterError::Resource(error.to_string()))
+    }
+
+    /// Seeds one public Service principal in a second, foreign data tenant.
+    ///
+    /// The tripwire half of a tenant-isolation claim: the returned key
+    /// authenticates against the same pods as
+    /// [`Self::provision_public_api_key`], so a journey can prove that the rows
+    /// one tenant published are unreachable to another through the very same
+    /// public listener rather than through a separate deployment.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProcessClusterError::Resource`] when the tenant or its
+    /// principal cannot be provisioned.
+    pub async fn provision_foreign_public_api_key(
+        &self,
+        name: &str,
+    ) -> Result<secrecy::SecretString, ProcessClusterError> {
+        let tenant = self
+            .shared
+            .fixture
+            .seed_additional_tenant(name)
+            .await
+            .map_err(|error| ProcessClusterError::Resource(error.to_string()))?;
+        crate::server::provision_tenant_service_principal(
+            &self.shared.fixture,
+            tenant,
             name,
             &["admin"],
         )

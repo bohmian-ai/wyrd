@@ -191,6 +191,12 @@ async fn serve() -> Result<(), ProcessClusterError> {
                     detail: error.to_string(),
                 })?,
             },
+            ControlRequest::Flush => match server.flush_bifrost().await {
+                Ok(()) => emit(&ControlResponse::Flushed)?,
+                Err(error) => emit(&ControlResponse::Failed {
+                    detail: error.to_string(),
+                })?,
+            },
             ControlRequest::ExecuteAnalyticalBaseline { sql } => {
                 match config.execute_analytical_baseline(&server, &sql).await {
                     Ok(evidence) => {

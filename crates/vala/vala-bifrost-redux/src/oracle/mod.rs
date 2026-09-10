@@ -4770,9 +4770,10 @@ fn authorize_payload_projection(
     let mut protected: Vec<(String, &'static [&'static str], Permission)> = Vec::new();
     for cut in cuts {
         let table_ref = &cut.binding.table_ref;
-        let Some(permission) =
-            payload_permission(table_ref, resolved_table_scope(&cut.binding, &cut.table_uid)?)
-        else {
+        let Some(permission) = payload_permission(
+            table_ref,
+            resolved_table_scope(&cut.binding, &cut.table_uid)?,
+        ) else {
             continue;
         };
         let Some(definition) = table_ref

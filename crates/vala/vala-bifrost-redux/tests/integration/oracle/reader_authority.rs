@@ -2199,13 +2199,13 @@ async fn object_denial_precedes_reader_guard_and_materialization() {
     let elsewhere = wyrd_runtime::Permission {
         resource: wyrd_runtime::Resource::BifrostQuery,
         action: wyrd_runtime::Action::Read,
-        scope: wyrd_runtime::PermissionScope::Bifrost(
-            wyrd_runtime::BifrostPermissionScope::Table(wyrd_runtime::BifrostTableScope {
+        scope: wyrd_runtime::PermissionScope::Bifrost(wyrd_runtime::BifrostPermissionScope::Table(
+            wyrd_runtime::BifrostTableScope {
                 catalog: "vala".to_owned(),
                 schema: "logs".to_owned(),
                 table_uid: Uuid::now_v7(),
-            }),
-        ),
+            },
+        )),
     };
     vala_bifrost_redux::catalog::reset_sealed_pin_count_for_test();
     let denied =
@@ -2219,10 +2219,7 @@ async fn object_denial_precedes_reader_guard_and_materialization() {
         .await
         .expect_err("a table this principal does not hold is refused");
     assert!(
-        matches!(
-            denied,
-            wyrd_spec::vala::error::BifrostError::QueryForbidden
-        ),
+        matches!(denied, wyrd_spec::vala::error::BifrostError::QueryForbidden),
         "the object refusal is the stable query-forbidden error: {denied:?}"
     );
     assert_eq!(

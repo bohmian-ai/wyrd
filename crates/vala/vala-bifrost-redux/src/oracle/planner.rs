@@ -200,8 +200,8 @@ impl OraclePlanner {
                     catalog.prepare_reader_identity(table, context.data_tenant_id),
                 )
                 .await
-                    .map_err(|_| AttemptFailure::Fatal(BifrostError::QueryTimeout))?
-                    .map_err(|error| AttemptFailure::Fatal(error.into_public()))?,
+                .map_err(|_| AttemptFailure::Fatal(BifrostError::QueryTimeout))?
+                .map_err(|error| AttemptFailure::Fatal(error.into_public()))?,
             );
         }
         // The complete prepared set is the first trustworthy object list a

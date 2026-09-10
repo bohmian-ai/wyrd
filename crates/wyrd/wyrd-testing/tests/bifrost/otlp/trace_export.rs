@@ -16,8 +16,8 @@ use super::support::{
     GEN_AI_REQUEST_MODEL, LINK_DROPPED_ATTRIBUTES, LINK_FLAGS, LINK_SPAN_ID, LINK_TRACE_ID,
     LINK_TRACE_STATE, OtlpJourney, PARENT_SPAN_ID, RESOURCE_DROPPED_ATTRIBUTES,
     RESOURCE_SCHEMA_URL, SCOPE_DROPPED_ATTRIBUTES, SCOPE_NAME, SCOPE_SCHEMA_URL, SCOPE_VERSION,
-    SERVICE_NAME, SPAN_DURATION_NANOS, SPAN_FLAGS, SPAN_ID, SPAN_KIND, SPAN_NAME, SPANS_TABLE,
-    STATUS_CODE, STATUS_MESSAGE, TRACE_ID, TRACE_STATE, column,
+    SERVICE_NAME, SPAN_DURATION_NANOS, SPAN_FLAGS, SPAN_KIND, SPAN_NAME, STATUS_CODE,
+    STATUS_MESSAGE, SpanIdentity, TRACE_STATE, column,
 };
 
 /// Sends one OTLP trace export through the bound gRPC collector route.
@@ -61,15 +61,15 @@ pub(super) async fn export_traces_over_grpc(
 /// # Panics
 ///
 /// Panics when any canonical column differs from the value the fixture sent.
-pub(super) fn assert_maximal_span_row(row: &RecordBatch, start: i64) {
+pub(super) fn assert_maximal_span_row(row: &RecordBatch, start: i64, identity: SpanIdentity) {
     assert_eq!(
         column::<FixedSizeBinaryArray>(row, "trace_id").value(0),
-        TRACE_ID,
-        "the span keeps its trace identity"
+        identity.trace_id,
+        "the span keeps the trace identity its exporter sent"
     );
     assert_eq!(
         column::<FixedSizeBinaryArray>(row, "span_id").value(0),
-        SPAN_ID
+        identity.span_id
     );
     assert_eq!(
         column::<FixedSizeBinaryArray>(row, "parent_span_id").value(0),
@@ -285,8 +285,8 @@ fn child<'struct_array, A: Array + 'static>(
 /// Tests that need Postgres, a bound server, and the publication boundary.
 mod pg_tests {
     use super::{
-        OtlpJourney, SPAN_NAME, SPANS_TABLE, assert_maximal_span_row, export_traces_over_grpc,
-        support,
+        OtlpJourney, assert_maximal_span_row, export_traces_over_grpc, support,
+        support::{GRPC_SPAN, SPANS_TABLE},
     };
 
     /// One maximal span exported over OTLP/gRPC reads back with every field.
@@ -314,7 +314,8 @@ mod pg_tests {
         let start = support::anchor_nanos();
 
         let partial =
-            export_traces_over_grpc(&journey, support::maximal_resource_spans(start)).await;
+            export_traces_over_grpc(&journey, support::maximal_resource_spans(start, GRPC_SPAN))
+                .await;
         assert!(
             partial.is_none_or(|partial| partial.rejected_spans == 0),
             "a wholly valid export reports no rejected span"
@@ -323,10 +324,10 @@ mod pg_tests {
         journey.publish().await;
         let row = journey
             .query_one_row(&format!(
-                "SELECT * FROM {SPANS_TABLE} WHERE name = '{SPAN_NAME}'"
+                "SELECT * FROM {SPANS_TABLE} WHERE start_time_unix_nano = {start}"
             ))
             .await;
-        assert_maximal_span_row(&row, start);
+        assert_maximal_span_row(&row, start, GRPC_SPAN);
 
         journey.shutdown().await;
     }

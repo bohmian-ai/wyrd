@@ -19,12 +19,47 @@ use wyrd_tonic::otlp::trace::v1::{ResourceSpans, ScopeSpans, Span, Status};
 /// The canonical span ledger every trace case reads.
 pub(super) const SPANS_TABLE: &str = "vala.traces.spans";
 
-/// Trace identity of the maximal span.
-pub(super) const TRACE_ID: [u8; 16] = [
-    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
-];
-/// Span identity of the maximal span.
-pub(super) const SPAN_ID: [u8; 8] = [0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28];
+/// Identity one copy of the maximal span is exported under.
+///
+/// The dataset is shared by every transport, so each transport sends it under
+/// its own trace and span identity. That keeps the rows distinguishable in one
+/// table without changing a single signal value between them, which is what
+/// makes "protobuf, JSON and gRPC agree" a comparison of transports rather
+/// than of three different payloads.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct SpanIdentity {
+    /// The exported trace identity.
+    pub(super) trace_id: [u8; 16],
+    /// The exported span identity.
+    pub(super) span_id: [u8; 8],
+}
+
+/// Identity the OTLP/gRPC copy of the maximal span is exported under.
+pub(super) const GRPC_SPAN: SpanIdentity = SpanIdentity {
+    trace_id: [
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+        0x10,
+    ],
+    span_id: [0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28],
+};
+
+/// Identity the OTLP/HTTP protobuf copy of the maximal span is exported under.
+pub(super) const HTTP_PROTOBUF_SPAN: SpanIdentity = SpanIdentity {
+    trace_id: [
+        0x02, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+        0x10,
+    ],
+    span_id: [0x22, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28],
+};
+
+/// Identity the OTLP/HTTP protobuf-JSON copy of the maximal span uses.
+pub(super) const HTTP_JSON_SPAN: SpanIdentity = SpanIdentity {
+    trace_id: [
+        0x03, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+        0x10,
+    ],
+    span_id: [0x23, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28],
+};
 /// Parent of the maximal span, proving a non-null `parent_span_id`.
 pub(super) const PARENT_SPAN_ID: [u8; 8] = [0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38];
 /// Trace identity the maximal span links to.
@@ -258,15 +293,15 @@ pub(super) fn trace_scope() -> InstrumentationScope {
     }
 }
 
-/// Builds the one maximal span anchored at `start`.
+/// Builds the one maximal span anchored at `start` under `identity`.
 ///
 /// Every optional OTLP field the canonical ledger declares is populated, so a
 /// column that silently stops being written fails a comparison rather than
 /// matching an absent fixture value.
-pub(super) fn maximal_span(start: i64) -> Span {
+pub(super) fn maximal_span(start: i64, identity: SpanIdentity) -> Span {
     Span {
-        trace_id: TRACE_ID.to_vec(),
-        span_id: SPAN_ID.to_vec(),
+        trace_id: identity.trace_id.to_vec(),
+        span_id: identity.span_id.to_vec(),
         trace_state: TRACE_STATE.to_owned(),
         parent_span_id: PARENT_SPAN_ID.to_vec(),
         flags: u32::try_from(SPAN_FLAGS).expect("the fixture flags fit u32"),
@@ -306,13 +341,13 @@ pub(super) fn maximal_span(start: i64) -> Span {
     }
 }
 
-/// Wraps the maximal span in its shared resource and scope envelope.
-pub(super) fn maximal_resource_spans(start: i64) -> Vec<ResourceSpans> {
+/// Wraps one identity's maximal span in the shared resource and scope envelope.
+pub(super) fn maximal_resource_spans(start: i64, identity: SpanIdentity) -> Vec<ResourceSpans> {
     vec![ResourceSpans {
         resource: Some(resource()),
         scope_spans: vec![ScopeSpans {
             scope: Some(trace_scope()),
-            spans: vec![maximal_span(start)],
+            spans: vec![maximal_span(start, identity)],
             schema_url: SCOPE_SCHEMA_URL.to_owned(),
         }],
         schema_url: RESOURCE_SCHEMA_URL.to_owned(),
@@ -391,6 +426,15 @@ impl OtlpJourney {
     /// Panics when the harness did not bind a gRPC listener.
     pub(super) fn grpc_url(&self) -> String {
         self.server.grpc_url().expect("the harness binds gRPC")
+    }
+
+    /// The bound HTTP base URL an OTLP/HTTP exporter posts to.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the harness did not bind an HTTP listener.
+    pub(super) fn base_url(&self) -> &str {
+        self.server.base_url().expect("the harness binds HTTP")
     }
 
     /// Crosses the publication boundary so published readers see the rows.
@@ -475,6 +519,32 @@ impl OtlpJourney {
             .await
             .expect("the OTLP journey harness drains cleanly");
     }
+}
+
+/// Finds the single stored row carrying `span_id` among the queried batches.
+///
+/// The shared dataset is exported once per transport under its own identity
+/// and every other value — the anchor instant included — is deliberately the
+/// same, so identity is the only thing a reader can select on.
+///
+/// # Panics
+///
+/// Panics when no row or more than one row carries the requested identity.
+pub(super) fn row_by_span_id(batches: &[RecordBatch], span_id: [u8; 8]) -> RecordBatch {
+    let mut found: Option<RecordBatch> = None;
+    for batch in batches {
+        let ids = column::<arrow::array::FixedSizeBinaryArray>(batch, "span_id");
+        for index in 0..batch.num_rows() {
+            if ids.value(index) == span_id {
+                assert!(
+                    found.is_none(),
+                    "span {span_id:02x?} is stored exactly once"
+                );
+                found = Some(batch.slice(index, 1));
+            }
+        }
+    }
+    found.unwrap_or_else(|| panic!("span {span_id:02x?} is stored"))
 }
 
 /// Reads one non-null column value out of a single-row batch.

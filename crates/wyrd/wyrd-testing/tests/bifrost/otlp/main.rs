@@ -17,3 +17,4 @@
 
 mod support;
 mod trace_export;
+mod trace_export_http;

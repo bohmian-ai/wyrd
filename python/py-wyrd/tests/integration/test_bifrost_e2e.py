@@ -669,3 +669,253 @@ def test_analytical_sql_over_written_tables(wyrd_server: WyrdTestServer) -> None
     assert scalars.column("latency_whole").to_pylist() == [121.0, 240.0, 180.0]
     assert scalars.column("bucket").to_pylist() == ["slow", "slow", "slow"]
     assert scalars.column("status_len").to_pylist() == [2, 2, 5]
+
+
+# ---------------------------------------------------------------------------
+# Stock OpenTelemetry SDK exporters over OTLP/gRPC
+
+
+def _otlp_headers(server: WyrdTestServer) -> tuple[tuple[str, str], ...]:
+    """The exporter headers a stock OTLP/gRPC exporter authenticates with."""
+
+    return (("x-wyrd-access-token", f"Bearer {server.access_token()}"),)
+
+
+def _signal_rows(server: WyrdTestServer, sql: str):
+    """Publish, then read one canonical signal query back as an Arrow table."""
+
+    server.flush_bifrost()
+
+    async def readback():
+        client = AsyncBifrost(server_url=server.base_url, credential=server.api_key)
+        result = await client.sql(sql)
+        return result.to_arrow()
+
+    return asyncio.run(readback())
+
+
+def _any_value(value):
+    """Unwrap one decoded upstream `AnyValue` into a plain Python value."""
+
+    field = value.WhichOneof("value")
+    if field == "array_value":
+        return [_any_value(item) for item in value.array_value.values]
+    if field == "kvlist_value":
+        return {entry.key: _any_value(entry.value) for entry in value.kvlist_value.values}
+    return getattr(value, field) if field else None
+
+
+def _attributes(raw: bytes) -> dict:
+    """Decode one canonical attribute column with the upstream OTLP types."""
+
+    from opentelemetry.proto.common.v1.common_pb2 import KeyValueList
+
+    decoded = KeyValueList()
+    decoded.ParseFromString(raw)
+    return {entry.key: _any_value(entry.value) for entry in decoded.values}
+
+
+@pytest.mark.integration
+def test_standard_otel_tracer_exports_to_bifrost(wyrd_server: WyrdTestServer) -> None:
+    from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+    from opentelemetry.sdk.resources import Resource
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import BatchSpanProcessor
+    from opentelemetry.trace import Link, SpanContext, Status, StatusCode, TraceFlags
+
+    scope = "wyrd.tests.otel.trace"
+    traces = TracerProvider(resource=Resource.create({"service.name": "wyrd-python-journey"}))
+    traces.add_span_processor(
+        BatchSpanProcessor(
+            OTLPSpanExporter(
+                endpoint=os.environ["WYRD_GRPC_URL"],
+                insecure=True,
+                headers=_otlp_headers(wyrd_server),
+            )
+        )
+    )
+    tracer = traces.get_tracer(scope, "1.0.0")
+    linked = SpanContext(
+        trace_id=1,
+        span_id=2,
+        is_remote=True,
+        trace_flags=TraceFlags(TraceFlags.SAMPLED),
+    )
+    with tracer.start_as_current_span("python-parent", links=[Link(linked)]) as parent:
+        parent.set_attribute("wyrd.test.marker", "python-trace")
+        parent.set_attribute("test.values", [1, 2, 3])
+        parent.add_event("checkpoint", {"step": 1})
+        parent.set_status(Status(StatusCode.ERROR, "expected test status"))
+        with tracer.start_as_current_span("python-child") as child:
+            child.set_attribute("answer", 42)
+    assert traces.force_flush()
+    traces.shutdown()
+
+    rows = _signal_rows(
+        wyrd_server,
+        f"SELECT * FROM vala.traces.spans WHERE scope_name = '{scope}'",
+    )
+    assert rows.num_rows == 2
+    by_name = {
+        name: index for index, name in enumerate(rows.column("name").to_pylist())
+    }
+    assert set(by_name) == {"python-parent", "python-child"}
+    parent_index = by_name["python-parent"]
+    child_index = by_name["python-child"]
+
+    trace_ids = rows.column("trace_id").to_pylist()
+    span_ids = rows.column("span_id").to_pylist()
+    assert trace_ids[parent_index] == trace_ids[child_index]
+    assert rows.column("parent_span_id").to_pylist()[child_index] == span_ids[parent_index]
+
+    attributes = _attributes(rows.column("attributes").to_pylist()[parent_index])
+    assert attributes["wyrd.test.marker"] == "python-trace"
+    assert attributes["test.values"] == [1, 2, 3]
+    assert _attributes(rows.column("attributes").to_pylist()[child_index])["answer"] == 42
+
+    assert rows.column("status_code").to_pylist()[parent_index] == 2
+    assert rows.column("status_message").to_pylist()[parent_index] == "expected test status"
+    assert rows.column("scope_version").to_pylist()[parent_index] == "1.0.0"
+    resource_attributes = _attributes(
+        rows.column("resource_attributes").to_pylist()[parent_index]
+    )
+    assert resource_attributes["service.name"] == "wyrd-python-journey"
+
+    events = rows.column("events").to_pylist()[parent_index]
+    assert [event["name"] for event in events] == ["checkpoint"]
+    assert _attributes(events[0]["attributes"])["step"] == 1
+
+    links = rows.column("links").to_pylist()[parent_index]
+    assert len(links) == 1
+    assert links[0]["trace_id"] == (1).to_bytes(16, "big")
+    assert links[0]["span_id"] == (2).to_bytes(8, "big")
+
+
+@pytest.mark.integration
+def test_stdlib_logging_exports_to_bifrost(wyrd_server: WyrdTestServer) -> None:
+    import logging
+
+    from opentelemetry.exporter.otlp.proto.grpc._log_exporter import OTLPLogExporter
+    from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
+    from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
+    from opentelemetry.sdk.resources import Resource
+    from opentelemetry.sdk.trace import TracerProvider
+
+    scope = "wyrd.tests.otel.log"
+    logs = LoggerProvider(resource=Resource.create({"service.name": "wyrd-python-journey"}))
+    logs.add_log_record_processor(
+        BatchLogRecordProcessor(
+            OTLPLogExporter(
+                endpoint=os.environ["WYRD_GRPC_URL"],
+                insecure=True,
+                headers=_otlp_headers(wyrd_server),
+            )
+        )
+    )
+    logger = logging.getLogger(scope)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    handler = LoggingHandler(logger_provider=logs)
+    logger.addHandler(handler)
+    context_tracer = TracerProvider().get_tracer("wyrd.tests.otel.log-context", "1.0.0")
+    try:
+        with context_tracer.start_as_current_span("python-log-context") as current:
+            expected_context = current.get_span_context()
+            logger.warning("order delayed", extra={"wyrd.test.marker": "python-log"})
+        assert logs.force_flush()
+    finally:
+        logger.removeHandler(handler)
+        logs.shutdown()
+
+    rows = _signal_rows(
+        wyrd_server,
+        f"SELECT * FROM vala.logs.records WHERE scope_name = '{scope}'",
+    )
+    assert rows.num_rows == 1
+
+    from opentelemetry.proto.common.v1.common_pb2 import AnyValue
+
+    body = AnyValue()
+    body.ParseFromString(rows.column("body").to_pylist()[0])
+    assert _any_value(body) == "order delayed"
+
+    assert rows.column("severity_text").to_pylist()[0] == "WARN"
+    assert rows.column("severity_number").to_pylist()[0] == 13
+    assert _attributes(rows.column("attributes").to_pylist()[0])["wyrd.test.marker"] == (
+        "python-log"
+    )
+    assert _attributes(rows.column("resource_attributes").to_pylist()[0])["service.name"] == (
+        "wyrd-python-journey"
+    )
+    assert rows.column("trace_id").to_pylist()[0] == expected_context.trace_id.to_bytes(16, "big")
+    assert rows.column("span_id").to_pylist()[0] == expected_context.span_id.to_bytes(8, "big")
+
+
+@pytest.mark.integration
+def test_standard_otel_metrics_export_to_bifrost(wyrd_server: WyrdTestServer) -> None:
+    from math import inf
+
+    from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExporter
+    from opentelemetry.sdk.metrics import MeterProvider
+    from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
+    from opentelemetry.sdk.resources import Resource
+
+    scope = "wyrd.tests.otel.metric"
+    reader = PeriodicExportingMetricReader(
+        OTLPMetricExporter(
+            endpoint=os.environ["WYRD_GRPC_URL"],
+            insecure=True,
+            headers=_otlp_headers(wyrd_server),
+        ),
+        export_interval_millis=inf,
+    )
+    metrics = MeterProvider(
+        resource=Resource.create({"service.name": "wyrd-python-journey"}),
+        metric_readers=[reader],
+    )
+    meter = metrics.get_meter(scope, "1.0.0")
+    attributes = {"wyrd.test.marker": "python-metric"}
+    meter.create_counter("orders.created").add(7, attributes)
+    meter.create_up_down_counter("orders.active").add(-2, attributes)
+    meter.create_gauge("queue.depth").set(3.5, attributes)
+    meter.create_histogram("request.duration", unit="ms").record(12.5, attributes)
+    assert metrics.force_flush()
+    metrics.shutdown()
+
+    rows = _signal_rows(
+        wyrd_server,
+        f"SELECT * FROM vala.metrics.points WHERE scope_name = '{scope}'",
+    )
+    by_name = {name: index for index, name in enumerate(rows.column("metric_name").to_pylist())}
+    assert set(by_name) == {
+        "orders.created",
+        "orders.active",
+        "queue.depth",
+        "request.duration",
+    }
+    for index in by_name.values():
+        assert _attributes(rows.column("attributes").to_pylist()[index]) == attributes
+
+    created = by_name["orders.created"]
+    assert rows.column("metric_type").to_pylist()[created] == "sum"
+    assert rows.column("int_value").to_pylist()[created] == 7
+    assert rows.column("is_monotonic").to_pylist()[created] is True
+
+    active = by_name["orders.active"]
+    assert rows.column("metric_type").to_pylist()[active] == "sum"
+    assert rows.column("int_value").to_pylist()[active] == -2
+    assert rows.column("is_monotonic").to_pylist()[active] is False
+
+    depth = by_name["queue.depth"]
+    assert rows.column("metric_type").to_pylist()[depth] == "gauge"
+    assert rows.column("double_value").to_pylist()[depth] == 3.5
+
+    duration = by_name["request.duration"]
+    assert rows.column("metric_type").to_pylist()[duration] == "histogram"
+    assert rows.column("unit").to_pylist()[duration] == "ms"
+    assert rows.column("histogram_count").to_pylist()[duration] == 1
+    assert rows.column("histogram_sum").to_pylist()[duration] == 12.5
+    bounds = rows.column("explicit_bounds").to_pylist()[duration]
+    counts = rows.column("bucket_counts").to_pylist()[duration]
+    assert len(counts) == len(bounds) + 1
+    assert sum(counts) == 1

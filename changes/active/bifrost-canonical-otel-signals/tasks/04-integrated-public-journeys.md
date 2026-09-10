@@ -15,13 +15,11 @@ acceptance: [AC-001, AC-002, AC-003, AC-004, AC-005, AC-006, AC-007, AC-008, AC-
 
 ## Outcome and value
 
-Real clients write one shared maximal dataset through OTLP HTTP protobuf/JSON
-and canonical Arrow, while stock OpenTelemetry Python SDK exporters send
-traces, standard-library logs, and metrics through OTLP/gRPC. Every path
-crosses Scribe ACK, publication, and Oracle before exact canonical readback
-through its owning public client. Existing topology owners prove recovery and
-the representative distributed paths; no parallel harness or duplicate
-exhaustive suite is created.
+Real Rust, Python, and TypeScript applications write trace/GenAI, log, and
+metric data through stock OpenTelemetry exporters and through canonical Arrow.
+Every path crosses Scribe ACK, publication, and Oracle before canonical SQL
+readback. The raw OTLP suite separately pins protobuf, JSON, and gRPC fidelity;
+MCP and existing topology owners prove the agent and distributed boundaries.
 
 Required execution skill: `$wyrd-implement`.
 
@@ -40,11 +38,11 @@ Required execution skill: `$wyrd-implement`.
   distributed, single-tenant, and multi-tenant owners only for the boundary
   each uniquely proves.
 - Extend the existing Python `WyrdTestServer` projection with only the
-  access-token exchange needed by an unmodified OTLP exporter; reuse the bound
-  gRPC URL it already publishes as `WYRD_GRPC_URL`. Add the already-used
-  OpenTelemetry gRPC exporter package to the Python development group and
-  lockfile; do not add a Wyrd telemetry wrapper, exporter adapter, collector
-  process, or second server fixture.
+  access-token exchange needed by unmodified OTLP exporters; reuse the bound
+  gRPC URL it already publishes as `WYRD_GRPC_URL`. Add upstream OpenTelemetry
+  packages only as Rust, Python, or TypeScript test/development dependencies;
+  do not add a Wyrd telemetry wrapper, exporter adapter, collector process, or
+  second server fixture.
 - One canonical expected dataset in OTLP `support.rs` supplies all signal
   values. Matching Arrow batches are built from the public describe response
   and T03A's Rust/Python/TypeScript `writable_schema` helpers, then sent through
@@ -65,27 +63,120 @@ specification or task files.
 BIFROST-OTEL-T02, BIFROST-OTEL-T03, and BIFROST-OTEL-T03A are accepted
 prerequisites. Their historical review packets do not block this task.
 
+## Restart checkpoint — read before editing
+
+This task is mid-implementation. Preserve the committed work and the current
+Python worktree edits; do not restart Scenario 1 or discard the Python exporter
+work.
+
+### Completed and committed
+
+- `a79a231d0` restored the `wyrd-testing` `otlp` target and
+  `test:bifrost:journey:otlp` lane with a real maximal gRPC trace test.
+- `969df61a0` added trace parity across OTLP gRPC, HTTP protobuf, and HTTP JSON.
+- `18eaf9b04` added the raw OTLP log and all-kind metric route tests. All four
+  Scenario 1 tests are green.
+- `02e953b8e` enforced declared sensitive payload columns on Oracle's optimized
+  canonical SQL plan and reconstructed `WYRD_VALA_403_PAYLOAD_FORBIDDEN` in
+  clients instead of exposing it as a retryable 502.
+
+`vala.metrics.points` declares sensitive columns, but the approved doctrine
+defines no metric-payload permission. Keep metrics ungated; this task must not
+invent a permission.
+
+### In progress — preserve these worktree files
+
+- `crates/wyrd/wyrd-testing/src/python.rs`
+- `python/py-wyrd/pyproject.toml`
+- `python/py-wyrd/uv.lock`
+- `python/py-wyrd/tests/integration/test_bifrost_e2e.py`
+
+These edits add `WyrdTestServer.access_token()` plus stock Python trace, stdlib
+log, and metric exporters. Finish them in place. The trace still needs the
+required GenAI attributes and structured messages.
+
+### Required journey matrix
+
+| Boundary | Exact owner/test | Signals | Restart status |
+|---|---|---|---|
+| Raw OTLP gRPC | `trace_export::pg_tests::otlp_grpc_maximal_trace_round_trips_every_field` | trace/GenAI | Done; extend structured GenAI messages only |
+| Raw OTLP HTTP | `trace_export_http::pg_tests::otlp_http_protobuf_and_json_match_grpc_trace_rows` | trace/GenAI | Done; inherits the shared GenAI fixture extension |
+| Raw OTLP logs | `logs_export::pg_tests::otlp_log_routes_round_trip_body_context_and_redaction` | logs | Done |
+| Raw OTLP metrics | `metrics_export::pg_tests::otlp_metric_routes_round_trip_every_supported_point_kind` | every supported metric kind | Done |
+| Stock Python OTel | `test_standard_otel_tracer_exports_to_bifrost`; `test_stdlib_logging_exports_to_bifrost`; `test_standard_otel_metrics_export_to_bifrost` | trace/GenAI, stdlib log, representative metrics | In progress in the four files above |
+| Stock Rust OTel | `stock_rust_otel_tracer_exports_genai_span_to_bifrost`; `stock_rust_otel_logger_exports_correlated_log_to_bifrost`; `stock_rust_otel_meter_exports_representative_metrics_to_bifrost` | trace/GenAI, log, representative metrics | Not started |
+| Stock TypeScript OTel | `stock OpenTelemetry tracer exports GenAI span to Bifrost`; `stock OpenTelemetry logger exports correlated log to Bifrost`; `stock OpenTelemetry meter exports representative metrics to Bifrost` | trace/GenAI, log, representative metrics | Not started |
+| Canonical Arrow Rust | `pg_tests::canonical_signal_arrow_write_and_sql_read_round_trip` | trace/GenAI, log, representative metrics | Not started |
+| Canonical Arrow Python | `test_canonical_signal_arrow_write_and_sql_read_round_trip` | trace/GenAI, log, representative metrics | Not started |
+| Canonical Arrow TypeScript | `canonical signal Arrow write and SQL read round-trip` | trace/GenAI, log, representative metrics | Not started |
+| Public API reads | every stock-exporter and Arrow journey above through `Bifrost.sql`/the public query client | all three canonical tables | Not started except raw-suite readback |
+| MCP reads | `query::pg_tests::agent_reads_canonical_trace_genai_logs_and_metrics_through_sql` | trace/GenAI, log, metric | Not started |
+| Public failures | `mixed_otlp_requests_commit_only_complete_siblings_and_exact_partial_success`; `all_invalid_and_request_wide_failures_leave_no_queryable_rows` | mixed-validity and request-wide failure | Not started |
+| Existing topology | `scribe_write_flush_read_user_journey`; `stage_graph_executes_representative_query_styles` | one complete GenAI span | Not started |
+
+The matrix is complete when every non-done row is green or records a verified
+limitation in the pinned upstream OpenTelemetry SDK. Hand-built OTLP does not
+substitute for a missing stock-exporter journey.
+
+### Concrete data and read questions
+
+All stock-exporter tests use IDs generated by the upstream SDK rather than
+injecting fixed IDs. Canonical Arrow tests create fresh valid IDs with the
+language's existing public authoring/ID facilities. Every test uses fixed
+service, scope, span, log, metric, and marker values so SQL assertions are
+deterministic. Every trace-capable journey must include:
+
+- a parent and child span, one event, one link, error status, resource, and
+  instrumentation scope;
+- `gen_ai.operation.name`, `gen_ai.provider.name`, `gen_ai.request.model`,
+  `gen_ai.conversation.id`, `gen_ai.usage.input_tokens`, and
+  `gen_ai.usage.output_tokens`;
+- structured `gen_ai.input.messages` and `gen_ai.output.messages` payloads.
+
+Every all-signal journey writes and then reads:
+
+- `vala.traces.spans`: reconstruct the generated parent/child trace, filter by
+  service/model, and calculate or select input/output token usage;
+- `vala.logs.records`: find the error log and prove its trace/span correlation;
+- `vala.metrics.points`: aggregate at least one counter and inspect one gauge
+  or histogram point.
+
+The raw metric protocol test remains the only exhaustive all-kind metric test.
+If a pinned stock SDK cannot author a supported signal or instrument, record
+the exact upstream limitation and leave its exhaustive proof in Scenario 1;
+never replace the stock SDK call with hand-built OTLP.
+
 ## Ordered implementation scenarios
 
-### Scenario 1 — OTLP protobuf and JSON retain complete signals
+### Scenario 1 — COMPLETED: raw OTLP protocol fidelity
 
 **Behavior.** Each exposed HTTP protobuf/JSON and gRPC route accepts the shared
 maximal trace, log, and all-kind metrics dataset, acknowledges only after the
 Scribe boundary, flushes/publishes, and reads every value exactly. Maps
 REQ-002, REQ-004, REQ-006–REQ-018, INV-001–INV-009, AC-001, AC-003–AC-005.
 
-**RED.** Populate the existing modules with these named tests:
+**Implemented.** These four named tests exist and are green:
 
 - `trace_export::pg_tests::otlp_grpc_maximal_trace_round_trips_every_field`
 - `trace_export_http::pg_tests::otlp_http_protobuf_and_json_match_grpc_trace_rows`
 - `logs_export::pg_tests::otlp_log_routes_round_trip_body_context_and_redaction`
 - `metrics_export::pg_tests::otlp_metric_routes_round_trip_every_supported_point_kind`
 
-Each uses the same support dataset, real server and public reads; trace asserts
-ordered events/links and structured GenAI content, log asserts authorized and
-unauthorized payload behavior, and metrics asserts integer/double distinction,
-all kind-specific values, metadata and exemplars. They fail because the files
-do not yet exist and canonical signal storage is incomplete.
+Each uses the same support dataset, real server and public reads. Logs assert
+authorized and unauthorized payload behavior. Metrics assert integer/double
+distinction, all kind-specific values, metadata, and exemplars.
+
+**Remaining amendment.** Extend the shared maximal trace fixture and its two
+trace-route assertions with both structured GenAI attributes:
+
+- `gen_ai.input.messages`
+- `gen_ai.output.messages`
+
+Keep the already-covered promoted GenAI operation, provider, model,
+conversation, input-token, and output-token fields. Assert the structured
+message JSON is queryable when payload access is authorized and rejected by
+`WYRD_VALA_403_PAYLOAD_FORBIDDEN` when it is projected without payload access.
+Do not create another raw OTLP test.
 
 ```bash
 mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-testing --test otlp -P journey -E 'test(=trace_export::pg_tests::otlp_grpc_maximal_trace_round_trips_every_field)' --run-ignored=all"
@@ -94,25 +185,28 @@ mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:mig
 mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-testing --test otlp -P journey -E 'test(=metrics_export::pg_tests::otlp_metric_routes_round_trip_every_supported_point_kind)' --run-ignored=all"
 ```
 
-**GREEN.** Add only fixture/client assertions and any missing production wiring
-revealed across the T01–T03 owners. Use explicit flush/publication and Oracle
-terminal success; HTTP JSON/protobuf fixtures encode the same pinned request.
+**GREEN.** Preserve the completed implementation. Add only the shared GenAI
+fixture values/assertions and any production fix those assertions expose. Use
+explicit flush/publication and Oracle terminal success; HTTP JSON/protobuf
+fixtures encode the same pinned request.
 
 **REFACTOR.** Shared support constructs data; each test owns its boundary and
 assertions. No test calls another test or reproduces table projection logic.
 
-### Scenario 2 — Stock Python OpenTelemetry emitters reach Bifrost over gRPC
+### Scenario 2 — Stock OpenTelemetry emitters reach Bifrost from every language
 
-**Behavior.** An ordinary Python application can configure the upstream
-OpenTelemetry SDK and gRPC exporters, emit traces, standard-library logs, and
+**Behavior.** Ordinary Rust, Python, and TypeScript applications configure the
+pinned upstream OpenTelemetry SDKs and OTLP exporters, emit traces, logs, and
 metrics to the bound Wyrd server, force exporter completion, and read the exact
-emitted values from the canonical Bifrost tables. This interoperability proof
-is additive to Scenario 1's exhaustive pinned-wire coverage and Scenario 5's
-canonical Arrow SDK coverage. Maps REQ-002, REQ-004, REQ-006–REQ-012,
+emitted values from the canonical Bifrost tables through their public Wyrd
+query clients. This is the primary OTLP user journey; Scenario 1 is its
+protocol-fidelity support. Maps REQ-002, REQ-004, REQ-006–REQ-012,
 REQ-015–REQ-018, INV-003, INV-006–INV-009, AC-001, AC-003–AC-005, AC-008,
 AC-011.
 
-**RED.** Add these three integration tests to the existing gated Python journey
+#### Python — in progress
+
+Finish these three integration tests already present in the existing gated Python journey
 owner `python/py-wyrd/tests/integration/test_bifrost_e2e.py`:
 
 - `test_standard_otel_tracer_exports_to_bifrost`
@@ -128,13 +222,16 @@ marker attribute whose decoded value must survive readback. After the provider's
 `force_flush()` succeeds, call the existing `wyrd_server.flush_bifrost()`
 publication boundary, query through `BifrostQueryClient`, require its success
 terminal, and compare the emitted values without fixture-side normalization.
-Do not use sleeps, random data, private extension imports, hand-built OTLP
-requests, or an OpenTelemetry Collector.
+Do not use sleeps, caller-supplied random fixture values, private extension
+imports, hand-built OTLP requests, or an OpenTelemetry Collector. The upstream
+SDK still generates the trace/span IDs.
 
-The trace emits fixed-name parent and child spans, captures their generated
+The trace emits fixed-name parent and child spans, captures their SDK-generated
 identifiers and asserts their relationship, and includes scalar/array
-attributes, an event, a link, status, resource attributes, and an explicit
-instrumentation scope. The stdlib log uses a dedicated `logging.Logger` with OTel's
+attributes, an event, a link, status, resource attributes, an explicit
+instrumentation scope, the promoted GenAI operation/provider/model/conversation
+and input/output-token attributes, and structured `gen_ai.input.messages` and
+`gen_ai.output.messages`. The stdlib log uses a dedicated `logging.Logger` with OTel's
 `LoggingHandler` while the trace span is current, then asserts body, severity,
 custom attributes, resource/scope, and trace/span correlation. Metrics emit a
 counter, up/down counter, gauge, and histogram with integer and floating-point
@@ -256,14 +353,64 @@ mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:mig
 mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && cd python/py-wyrd && mise run py:setup:testing && uv run pytest -q -m integration tests/integration/test_bifrost_e2e.py::test_standard_otel_metrics_export_to_bifrost"
 ```
 
-**GREEN.** Add `opentelemetry-exporter-otlp-proto-grpc` beside the existing
+#### Rust — not started
+
+Add these tests to the existing `wyrd-testing` OTLP modules; do not create a
+second Rust target:
+
+- `trace_export::pg_tests::stock_rust_otel_tracer_exports_genai_span_to_bifrost`
+- `logs_export::pg_tests::stock_rust_otel_logger_exports_correlated_log_to_bifrost`
+- `metrics_export::pg_tests::stock_rust_otel_meter_exports_representative_metrics_to_bifrost`
+
+Use the pinned upstream Rust OpenTelemetry SDK/exporter APIs, not `prost`
+request construction. The trace test emits a parent/child trace with an event,
+link, error status, resource/scope metadata, promoted GenAI fields, and
+structured input/output messages. Capture the SDK-generated IDs and query the
+same trace through the public Rust query client. The log test emits one
+trace-correlated error log with body, severity, resource/scope, and a marker.
+The metric test emits the representative instruments supported by the pinned
+SDK—counter, up/down counter, gauge, and histogram—and asserts their canonical
+points and aggregation metadata. Add upstream crates only as test/dev
+dependencies in `crates/wyrd/wyrd-testing/Cargo.toml`.
+
+```bash
+mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-testing --test otlp -P journey -E 'test(=trace_export::pg_tests::stock_rust_otel_tracer_exports_genai_span_to_bifrost)' --run-ignored=all"
+mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-testing --test otlp -P journey -E 'test(=logs_export::pg_tests::stock_rust_otel_logger_exports_correlated_log_to_bifrost)' --run-ignored=all"
+mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-testing --test otlp -P journey -E 'test(=metrics_export::pg_tests::stock_rust_otel_meter_exports_representative_metrics_to_bifrost)' --run-ignored=all"
+```
+
+#### TypeScript — not started
+
+Add `typescript/wyrd/tests/integration/otel-export.test.ts` with exactly these
+gated tests and register that file in the existing TypeScript Bifrost journey
+lane:
+
+- `stock OpenTelemetry tracer exports GenAI span to Bifrost`
+- `stock OpenTelemetry logger exports correlated log to Bifrost`
+- `stock OpenTelemetry meter exports representative metrics to Bifrost`
+
+Use the pinned upstream OpenTelemetry Node SDK and OTLP gRPC exporters. Apply
+the same observable requirements as Rust: SDK-generated trace/span IDs,
+parent/child relationship, event/link/status/resource/scope, promoted and
+structured GenAI attributes, one correlated error log, and representative
+counter/up-down-counter/gauge/histogram metrics. Query all results through the
+public TypeScript Bifrost client. Add only upstream test/dev dependencies and
+the owning lockfile update; do not introduce a Wyrd exporter wrapper.
+
+```bash
+mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && cd typescript/wyrd && mise run ts:build && mise run ts:build:testing && pnpm exec vitest run tests/integration/otel-export.test.ts"
+```
+
+**GREEN.** For Python, add `opentelemetry-exporter-otlp-proto-grpc` beside the existing
 OpenTelemetry Python development dependencies and regenerate `uv.lock`. On the
 existing Python `WyrdTestServer`, add one `access_token()` method that exchanges
 its retained API key through the Rust harness's existing `exchange_api_key`
 owner; continue reading its already-published `WYRD_GRPC_URL` rather than
 adding another endpoint projection. Fix only production OTLP, table projection,
 publication, or public-query owners exposed by the failing end-to-end
-assertions.
+assertions. For Rust and TypeScript, add only the upstream test/dev packages
+needed by the three tests above and use the existing OTLP target, test server,
+auth exchange, flush/publication boundary, and public query clients.
 
 **REFACTOR.** Keep all telemetry construction on upstream OpenTelemetry types,
 keep credentials out of assertion output, remove logging handlers and shut down
@@ -273,76 +420,101 @@ and share only small Python setup/read helpers in `test_bifrost_e2e.py` when
 endpoint/header/query code actually repeats. The exhaustive raw OTLP dataset
 and canonical Arrow journeys remain separate owners.
 
-### Scenario 3 — OTLP and Arrow produce equivalent accepted rows
+### Scenario 3 — RETIRED: separate OTLP/Arrow comparison test
 
-**Behavior.** Equivalent logical records written through OTLP and public Arrow
-produce equal user columns and canonical SQL results, excluding trusted batch/
-request/ingest identities. Maps REQ-004, INV-003, AC-002, AC-008.
+Do not implement the formerly planned
+`mixed_batch::pg_tests::otlp_and_canonical_arrow_share_user_rows_and_public_results`
+test or a `mixed_batch.rs` module. It duplicated the real user journeys while
+adding a fixture-side row comparison.
 
-**RED.** Add
-`mixed_batch::pg_tests::otlp_and_canonical_arrow_share_user_rows_and_public_results` to
-the current OTLP binary, using the public Rust SDK Arrow writer for the derived
-canonical batches. Query both disjoint batch IDs after publication and compare
-every user field by stable field name/ID through canonical SQL.
-
-```bash
-mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-testing --test otlp -P journey -E 'test(=mixed_batch::pg_tests::otlp_and_canonical_arrow_share_user_rows_and_public_results)' --run-ignored=all"
-```
-
-**GREEN.** Fix only convergence/SDK schema generation defects in their owning
-modules. Do not normalize results in the fixture.
-
-**REFACTOR.** The comparison ignores only enumerated server-managed identity
-and receipt-time fields, never a signal field.
+Instead, Scenario 2's stock exporters and Scenario 5's canonical Arrow writers
+use the same fixed logical values for each signal and assert those values by
+canonical field name through public SQL. Those independently prove that both
+write paths converge on the same public schema. They need not compare
+server-managed batch, request, or ingest identities. Maps REQ-004, INV-003,
+AC-002, AC-008.
 
 ### Scenario 4 — Partial success and whole-request failures keep exact authority
 
-**Behavior.** Mixed trace/log/metric requests return exact standard partial
-success after one accepted-subset fence; all-invalid creates none; request-wide
-failures commit none. Maps REQ-005, INV-007–INV-009, AC-006–AC-007.
+**Behavior.** From the caller's boundary, a mixed-validity trace/log/metric
+request reports exactly which records were rejected, leaves every accepted
+record queryable, and leaves every rejected record absent. Retrying the same
+request does not double-write accepted records. An all-invalid request or a
+request-wide auth/size/schema/tenant/admission/durability failure makes no data
+queryable. Maps REQ-005, INV-007–INV-009, AC-006–AC-007.
 
 **RED.** Populate `negative.rs` with
 `pg_tests::mixed_otlp_requests_commit_only_complete_siblings_and_exact_partial_success`
 and
-`pg_tests::all_invalid_and_request_wide_failures_leave_no_wal_or_fence` across protobuf,
+`pg_tests::all_invalid_and_request_wide_failures_leave_no_queryable_rows` across protobuf,
 JSON, and gRPC. Use current fault injection for durability failure and current
-auth/size/schema/tenant/admission fixtures. Assert accepted relative order,
-contiguous ordinals, stable first reason, invalid-row absence, exact fence and
-payload digest, recovery/retry duplicate suppression, and no partial_success
-for whole-request errors.
+auth/size/schema/tenant/admission fixtures. Assert the standard partial-success
+response's rejected count and stable first reason; query the accepted siblings
+and prove rejected siblings absent; retry and prove no duplicate rows. For
+whole-request errors, assert the public error, no `partial_success`, and no
+queryable rows.
 
 ```bash
 mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-testing --test otlp -P journey -E 'test(=negative::pg_tests::mixed_otlp_requests_commit_only_complete_siblings_and_exact_partial_success)' --run-ignored=all"
-mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-testing --test otlp -P journey -E 'test(=negative::pg_tests::all_invalid_and_request_wide_failures_leave_no_wal_or_fence)' --run-ignored=all"
+mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-testing --test otlp -P journey -E 'test(=negative::pg_tests::all_invalid_and_request_wide_failures_leave_no_queryable_rows)' --run-ignored=all"
 ```
 
 **GREEN.** Correct only the production Gate/Scribe/outcome owner implicated by
 the failing assertion. Reuse the existing signal encoders and recovery probes.
+WAL fences, payload digests, and contiguous ordinals belong in existing
+lower-tier integration tests; add or extend one only if inspection shows that
+mechanical invariant is otherwise uncovered. They are not journey assertions.
 
 **REFACTOR.** No sleeps, best-effort observation, test-only projection oracle,
 or durability bypass.
 
-### Scenario 5 — Existing language and agent surfaces close their own boundary
+### Scenario 5 — Canonical Arrow writes and public SQL reads in every language
 
-**Behavior.** Canonical Arrow writes and canonical SQL trace/GenAI reads work
-through the first-class SDK projections and MCP with the same payload gates. Maps
-REQ-004, REQ-009, REQ-017, REQ-023, INV-006–INV-007, AC-002, AC-005, AC-011.
+**Behavior.** Rust, Python, and TypeScript each build canonical Arrow batches
+from the public table contract, write trace/GenAI, log, and representative
+metric records through their public SDK, flush/publish, and answer useful
+questions through canonical SQL. MCP reads the same three canonical tables and
+observes the same payload gate. Maps REQ-004, REQ-009, REQ-017, REQ-023,
+INV-006–INV-007, AC-002, AC-005, AC-011.
 
 **RED.** Extend existing owners with:
 
 - Rust `pg_tests::canonical_signal_arrow_write_and_sql_read_round_trip`
 - Python `test_canonical_signal_arrow_write_and_sql_read_round_trip`
 - TypeScript `canonical signal Arrow write and SQL read round-trip`
-- MCP `query::pg_tests::agent_reads_canonical_trace_and_genai_through_sql`
+- MCP `query::pg_tests::agent_reads_canonical_trace_genai_logs_and_metrics_through_sql`
 
-Each asserts its native public values and unauthorized payload behavior; it
-does not repeat every metric kind already proved in Scenario 1.
+Each language test performs one complete public journey:
+
+1. Obtain the three public canonical table descriptions and use their
+   `writable_schema` projections; do not hard-code a second Arrow schema.
+2. Write a parent/child trace containing an event, a link, error status,
+   resource/scope metadata, promoted GenAI operation/provider/model/
+   conversation/input-token/output-token fields, and structured
+   `gen_ai.input.messages` / `gen_ai.output.messages`.
+3. Write a trace-correlated error log with body, severity, attributes,
+   resource, and scope.
+4. Write representative counter, gauge, and histogram points. Scenario 1—not
+   these tests—owns exhaustive metric-kind fidelity.
+5. Flush/publish and run public SQL that proves: trace hierarchy; GenAI model
+   and token filtering/aggregation; the correlated error log; and one metric
+   aggregate. Require successful terminal metadata and literal expected values.
+6. Query a structured GenAI payload column without payload permission and
+   assert `WYRD_VALA_403_PAYLOAD_FORBIDDEN`; repeat with authorized access and
+   assert the structured messages.
+
+The SDK SQL calls are the required public API read proof. Do not add a separate
+direct-HTTP read suite that repeats them. The MCP test uses the public MCP query
+tool after seeding the shared canonical dataset through the existing public
+Rust Arrow writer. It reads all three tables, asks at least one GenAI/token
+question, and asserts both authorized payload readback and the same forbidden
+projection.
 
 ```bash
 mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p vala-sdk --test pg_bifrost_e2e -P journey -E 'test(=pg_tests::canonical_signal_arrow_write_and_sql_read_round_trip)' --run-ignored=all"
 mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && cd python/py-wyrd && mise run py:setup:testing && uv run pytest -q -m integration tests/integration/test_bifrost_query.py::test_canonical_signal_arrow_write_and_sql_read_round_trip"
 mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && cd typescript/wyrd && mise run ts:build && mise run ts:build:testing && pnpm exec vitest run tests/integration/oracle-query.test.ts -t 'canonical signal Arrow write and SQL read round-trip'"
-mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-mcp --test mcp -P journey -E 'test(=query::pg_tests::agent_reads_canonical_trace_and_genai_through_sql)' --run-ignored=all"
+mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-mcp --test mcp -P journey -E 'test(=query::pg_tests::agent_reads_canonical_trace_genai_logs_and_metrics_through_sql)' --run-ignored=all"
 ```
 
 **GREEN.** Update the existing language/MCP conversions and fixtures only where
@@ -353,14 +525,16 @@ is embedded in Rust and no SDK reimplements server mapping.
 
 ### Scenario 6 — Existing topology owners retain representative complete signals
 
-**Behavior.** Standalone/distributed and single-/multi-tenant paths each write
-and read at least one complete canonical signal while existing Forge/Oracle
-authority and tenant tripwires remain. Maps INV-007, INV-010, AC-007, AC-009,
-AC-011.
+**Behavior.** The existing standalone Scribe and distributed Oracle journeys
+each carry one complete GenAI span through their existing topology while their
+Forge/Oracle authority and tenant tripwires remain. Maps INV-007, INV-010,
+AC-007, AC-009, AC-011.
 
 **RED.** Extend the existing Scribe `write_read` and Oracle peer-network
-journeys, not the exhaustive OTLP dataset, with one representative maximal span
-fixture and exact tenant-isolated readback. Keep their existing assertions and
+journeys, not the exhaustive OTLP dataset, with one representative complete
+GenAI span: parent/child identity, event, link, error status, resource/scope,
+promoted GenAI fields, and structured input/output messages. Assert exact
+tenant-isolated readback. Keep their existing assertions and
 names; add the canonical signal assertion inside
 `write_read::scribe_write_flush_read_user_journey` and
 `peer_network::analytical::stage_graph_executes_representative_query_styles`.
@@ -374,20 +548,33 @@ mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:mig
 **GREEN.** Adapt only shared fixtures/schema consumers exposed by the new
 built-ins. Do not change planner selection, Forge publication, or topology.
 
-**REFACTOR.** One representative signal per topology is enough; exhaustive
-fidelity remains in Scenario 1.
+**REFACTOR.** One GenAI span per topology is enough; logs and metrics are
+already proven through the public ingest/read journeys and do not need to be
+copied into topology tests.
 
 ## Expected write set and consumer closure
 
-- Restored `wyrd-testing` OTLP capability target, real journey modules, owning
-  lane, and test inventory documentation
-- Existing `vala-sdk` `pg_bifrost_e2e` target
-- Existing Python and TypeScript Bifrost integration files
-- Existing Python `WyrdTestServer` binding, Python development dependency
-  group, and `uv.lock`
-- Existing `wyrd-mcp/tests/bifrost/mcp/query.rs`
-- Existing Scribe/Oracle journey fixtures and only production owners found
-  defective by these RED proofs
+- Preserve the restored `crates/wyrd/wyrd-testing/tests/bifrost/otlp/` target,
+  its lane, and its four completed raw tests. Extend its shared trace fixture;
+  add the three stock Rust exporter tests to the existing trace/log/metric
+  modules and test/dev dependencies to `crates/wyrd/wyrd-testing/Cargo.toml`.
+- Finish the existing edits in
+  `crates/wyrd/wyrd-testing/src/python.rs`,
+  `python/py-wyrd/pyproject.toml`, `python/py-wyrd/uv.lock`, and
+  `python/py-wyrd/tests/integration/test_bifrost_e2e.py`.
+- Add `typescript/wyrd/tests/integration/otel-export.test.ts`, the upstream
+  test/dev dependencies and lockfile update, and include the file in the
+  existing `test:bifrost:journey:typescript` enumeration.
+- Add canonical Arrow all-signal journeys to the existing
+  `crates/vala/vala-sdk/tests/pg_bifrost_e2e.rs`,
+  `python/py-wyrd/tests/integration/test_bifrost_query.py`, and
+  `typescript/wyrd/tests/integration/oracle-query.test.ts` owners.
+- Extend `crates/wyrd/wyrd-mcp/tests/bifrost/mcp/query.rs` with the named
+  all-signal SQL read journey.
+- Extend the existing Scribe `write_read` and Oracle
+  `peer_network::analytical` tests named in Scenario 6.
+- Touch production owners only when one of these public journeys exposes a
+  defect; record that defect and fix in the implementation report.
 
 Other than the earned OTLP journey target and lane, no new Rust target, harness,
 topology abstraction, production dependency, migration, branch controller,
@@ -405,18 +592,25 @@ mise run test:bifrost:journey:sdk
 mise run test:bifrost:journey:mcp
 mise run test:bifrost:journey:python
 mise run test:bifrost:journey:typescript
+mise run test:bifrost:journey:scribe
+mise run test:bifrost:journey:oracle
 mise run codegen:check
 mise run fmt
 mise run lints
+mise run py:format
+mise run py:lints
+mise run py:typecheck
+mise run ts:typecheck
 mise run verify:bifrost
 mise run gate
 git diff --check
 ```
 
 The implementation report must map each AC to the existing owner above, record
-every RED/GREEN result, exact ACK/fence/recovery evidence, authorized/redacted
-results, public language results, topology results, generated drift result, and
-the final aggregate gates.
+the four completed Scenario 1 tests/commits separately from new evidence, and
+record every remaining named test result, partial-success/retry result,
+authorized/redacted result, public language result, topology result, upstream
+SDK limitation, generated drift result, and final aggregate gate.
 
 ## Material stop conditions
 
@@ -424,6 +618,10 @@ the final aggregate gates.
   than the earned OTLP target and declared existing owners.
 - A public language cannot construct the canonical Arrow schema from the
   generated/table-owned contract without copying server semantics.
+- A pinned upstream OpenTelemetry SDK cannot export one of its supported
+  trace, log, or metric paths directly to the Wyrd OTLP endpoint. Stop and
+  report the exact package/API limitation; do not silently substitute a raw
+  request or Wyrd wrapper.
 - A later change materially alters the reconciled Forge, Scribe, or Oracle
   owners before this task begins.
 - A required failure cannot be induced through an existing production fault

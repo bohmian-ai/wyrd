@@ -34,18 +34,45 @@ impl EnvSnapshot {
         }
     }
 
-    fn restore(self) {
-        match self.server_url {
-            Some(v) => unsafe { std::env::set_var("WYRD_SERVER_URL", &v) },
-            None => unsafe { std::env::remove_var("WYRD_SERVER_URL") },
+    fn restore(self, py: Python<'_>) -> PyResult<()> {
+        for (key, value) in [
+            ("WYRD_SERVER_URL", self.server_url),
+            ("WYRD_GRPC_URL", self.grpc_url),
+            ("WYRD_API_KEY", self.api_key),
+        ] {
+            publish_env(py, key, value.as_deref())?;
         }
-        match self.grpc_url {
-            Some(v) => unsafe { std::env::set_var("WYRD_GRPC_URL", &v) },
-            None => unsafe { std::env::remove_var("WYRD_GRPC_URL") },
+        Ok(())
+    }
+}
+
+/// Publishes one harness endpoint variable to both environment views.
+///
+/// The process environment is what the Rust client tier resolves from, but
+/// Python builds `os.environ` once at interpreter start and never re-reads
+/// `environ`, so a `setenv` alone is invisible to the Python side of a test.
+/// Both are written here so a Python caller and a Rust client agree on what
+/// the harness published.
+///
+/// # Errors
+///
+/// Returns a Python error when `os.environ` cannot be reached; deleting an
+/// absent key is not an error.
+fn publish_env(py: Python<'_>, key: &str, value: Option<&str>) -> PyResult<()> {
+    match value {
+        Some(value) => {
+            // SAFETY: every harness mutation holds `env_mutex`, and the
+            // published values are owned `String`s with no interior nul.
+            unsafe { std::env::set_var(key, value) };
+            py.import("os")?.getattr("environ")?.set_item(key, value)
         }
-        match self.api_key {
-            Some(v) => unsafe { std::env::set_var("WYRD_API_KEY", &v) },
-            None => unsafe { std::env::remove_var("WYRD_API_KEY") },
+        None => {
+            unsafe { std::env::remove_var(key) };
+            let environ = py.import("os")?.getattr("environ")?;
+            if environ.call_method1("__contains__", (key,))?.is_truthy()? {
+                environ.del_item(key)?;
+            }
+            Ok(())
         }
     }
 }
@@ -127,11 +154,10 @@ impl WyrdTestServer {
         if mutate_env {
             let _guard = env_mutex().lock().unwrap_or_else(|p| p.into_inner());
             let snapshot = EnvSnapshot::capture();
-            unsafe {
-                std::env::set_var("WYRD_SERVER_URL", &base_url);
-                std::env::set_var("WYRD_GRPC_URL", &grpc_url);
-                std::env::set_var("WYRD_API_KEY", &api_key);
-            }
+            let py = slf.py();
+            publish_env(py, "WYRD_SERVER_URL", Some(&base_url))?;
+            publish_env(py, "WYRD_GRPC_URL", Some(&grpc_url))?;
+            publish_env(py, "WYRD_API_KEY", Some(&api_key))?;
             slf.env_snapshot = Some(snapshot);
         }
 
@@ -144,13 +170,14 @@ impl WyrdTestServer {
 
     fn __exit__(
         &mut self,
+        py: Python<'_>,
         _exc_type: Option<Bound<'_, PyAny>>,
         _exc_value: Option<Bound<'_, PyAny>>,
         _traceback: Option<Bound<'_, PyAny>>,
     ) -> PyResult<bool> {
         if let Some(snapshot) = self.env_snapshot.take() {
             let _guard = env_mutex().lock().unwrap_or_else(|p| p.into_inner());
-            snapshot.restore();
+            snapshot.restore(py)?;
         }
         if !self.cleanup {
             tracing::warn!(
@@ -191,6 +218,37 @@ impl WyrdTestServer {
                 "WyrdTestServer not started (use as context manager)",
             )
         })
+    }
+
+    /// Exchanges the harness's retained API key for a bearer access token.
+    ///
+    /// Wraps [`crate::server::WyrdTestServer::exchange_api_key`] so a Python
+    /// test can hand an unmodified OTLP exporter the `x-wyrd-access-token`
+    /// header it needs. The key itself never leaves the harness.
+    ///
+    /// # Errors
+    ///
+    /// Raises a Python runtime error when the context manager is inactive, and
+    /// a Wyrd Python error when the exchange route refuses the key.
+    fn access_token(&self) -> PyResult<String> {
+        let srv = self.server.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "WyrdTestServer not started (use as context manager)",
+            )
+        })?;
+        let api_key = self.api_key.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "WyrdTestServer not started (use as context manager)",
+            )
+        })?;
+        let key = secrecy::SecretString::from(api_key.clone());
+        let result: Result<String, wyrd_spec::error::WyrdError> =
+            wyrd_runtime::runtime().block_on(async {
+                srv.exchange_api_key(&key)
+                    .await
+                    .map_err(wyrd_spec::error::WyrdError::from)
+            });
+        result.map_err(wyrd_error_to_py_err)
     }
 
     /// Bootstrap a service principal, returning its scoped API key string.

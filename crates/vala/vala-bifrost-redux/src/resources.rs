@@ -2016,6 +2016,8 @@ impl BifrostRuntimeResources {
                     plan.oracle_floor_bytes
                         .saturating_add(plan.elastic_memory_bytes),
                 )),
+                #[cfg(feature = "test-support")]
+                memory_hold: Arc::new(OracleQueryMemoryHold::default()),
             }),
             governor: self.governor.clone(),
             transport: self.transport.clone(),
@@ -2447,6 +2449,88 @@ pub struct OracleResources {
     /// Cloning this capability shares the same root, which is the point: two
     /// clones must not be able to hand out two independent memory envelopes.
     memory_root: Arc<OracleMemoryRoot>,
+    /// Test-tier controller that makes one real query hold governed memory.
+    ///
+    /// It lives beside the root rather than inside it because it is not part of
+    /// the governed accounting: it only borrows the next query's own view, so
+    /// the bytes it holds are charged exactly as that query's own consumers
+    /// would be.
+    #[cfg(feature = "test-support")]
+    memory_hold: Arc<OracleQueryMemoryHold>,
+}
+
+/// Test-tier controller that parks governed memory inside one real query view.
+///
+/// Journeys need a pod whose shared Oracle root is genuinely occupied while a
+/// second query arrives. Faking that with a counter would prove nothing about
+/// the root, so this arms a byte count, and the next admitted query grows a
+/// named reservation for it through the query view `DataFusion` itself would
+/// use. Nothing here bypasses the governor.
+#[cfg(feature = "test-support")]
+#[derive(Debug, Default)]
+pub struct OracleQueryMemoryHold {
+    /// Bytes the next admitted query must reserve, taken when it engages.
+    armed: Mutex<Option<usize>>,
+    /// The live reservation, retained until the journey releases it.
+    held: Mutex<Option<MemoryReservation>>,
+    /// Wakes a waiter once the reservation is live.
+    reached: Notify,
+    /// Set with `reached` so a waiter arriving afterwards still observes it.
+    engaged: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(feature = "test-support")]
+impl OracleQueryMemoryHold {
+    /// Arms the next admitted query to hold exactly `bytes` of governed memory.
+    pub fn arm(&self, bytes: usize) {
+        self.engaged
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        if let Ok(mut armed) = self.armed.lock() {
+            *armed = Some(bytes);
+        }
+    }
+
+    /// Grows and retains the armed reservation through one query's own view.
+    ///
+    /// Called once from admission with the view that query will execute
+    /// against. A refusal leaves the hold disarmed and unsignalled, so a
+    /// journey that armed more than the root can cover fails at its wait rather
+    /// than silently proceeding against an unoccupied root.
+    fn engage(&self, pool: &Arc<dyn MemoryPool>) {
+        let Ok(mut armed) = self.armed.lock() else {
+            return;
+        };
+        let Some(bytes) = armed.take() else {
+            return;
+        };
+        drop(armed);
+        let reservation = MemoryConsumer::new("oracle-test-memory-hold").register(pool);
+        if reservation.try_grow(bytes).is_err() {
+            return;
+        }
+        if let Ok(mut held) = self.held.lock() {
+            *held = Some(reservation);
+        }
+        self.engaged
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.reached.notify_waiters();
+    }
+
+    /// Waits until an admitted query is holding the armed reservation.
+    pub async fn wait_engaged(&self) {
+        while !self.engaged.load(std::sync::atomic::Ordering::SeqCst) {
+            self.reached.notified().await;
+        }
+    }
+
+    /// Drops the retained reservation, returning its bytes to the shared root.
+    pub fn release(&self) {
+        if let Ok(mut held) = self.held.lock() {
+            held.take();
+        }
+        self.engaged
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 impl OracleResources {
@@ -2635,7 +2719,16 @@ impl OracleResources {
             resources.volume_scratch =
                 Some(capabilities.oracle.try_acquire(resources.scratch_bytes)?);
         }
+        #[cfg(feature = "test-support")]
+        self.memory_hold.engage(&resources.memory_pool);
         Ok(resources)
+    }
+
+    /// Returns the test-tier controller that parks memory in one query view.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn memory_hold(&self) -> Arc<OracleQueryMemoryHold> {
+        Arc::clone(&self.memory_hold)
     }
 
     /// Captures exact live ownership for inspection and cleanup assertions.

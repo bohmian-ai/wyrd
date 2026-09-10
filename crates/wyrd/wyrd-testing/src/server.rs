@@ -1170,6 +1170,65 @@ impl WyrdTestServer {
         }
     }
 
+    /// Arms the next admitted Oracle query to hold `bytes` of governed memory.
+    ///
+    /// Forwards to the controller `OracleResources` owns beside its shared
+    /// root; the reservation is grown through the admitted query's own view, so
+    /// the occupancy a journey observes is real governed memory rather than a
+    /// harness counter.
+    ///
+    /// # Errors
+    ///
+    /// Returns a start error when this server does not host an Oracle role.
+    pub fn hold_next_query_memory(&self, bytes: usize) -> Result<(), WyrdTestServerError> {
+        self.oracle_memory_hold()?.arm(bytes);
+        Ok(())
+    }
+
+    /// Waits until an admitted query is holding the armed reservation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a start error when this server does not host an Oracle role, or
+    /// when no query engages the hold before the server drain deadline.
+    pub async fn wait_query_memory_hold(&self) -> Result<(), WyrdTestServerError> {
+        let hold = self.oracle_memory_hold()?;
+        let deadline = Duration::from_millis(WyrdServerConfig::default().shutdown.drain_ms);
+        tokio::time::timeout(deadline, hold.wait_engaged())
+            .await
+            .map_err(|_| {
+                WyrdTestServerError::Start("query memory hold deadline elapsed".to_owned())
+            })
+    }
+
+    /// Releases the retained reservation back to the shared Oracle root.
+    ///
+    /// # Errors
+    ///
+    /// Returns a start error when this server does not host an Oracle role.
+    pub fn release_query_memory_hold(&self) -> Result<(), WyrdTestServerError> {
+        self.oracle_memory_hold()?.release();
+        Ok(())
+    }
+
+    /// Borrows this server's Oracle memory-hold controller.
+    ///
+    /// # Errors
+    ///
+    /// Returns a start error when this server composed no Oracle capability.
+    fn oracle_memory_hold(
+        &self,
+    ) -> Result<Arc<vala_bifrost_redux::resources::OracleQueryMemoryHold>, WyrdTestServerError>
+    {
+        Ok(self
+            .inner
+            .state
+            .bifrost_resources()
+            .and_then(|resources| resources.oracle())
+            .ok_or_else(|| WyrdTestServerError::Start("Oracle role is not hosted".to_owned()))?
+            .memory_hold())
+    }
+
     /// Arms one passive capture of the next query's resource probe.
     ///
     /// The returned observer is the caller's to hold and await; unlike the

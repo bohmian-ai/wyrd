@@ -1227,3 +1227,208 @@ fn prove_no_durable_admission_telemetry(cluster: &WyrdTestCluster) -> Result<(),
     }
     Ok(())
 }
+
+/// Rows written to the fixture table the refusal journey reads.
+const REFUSAL_ROWS: i64 = 24;
+
+/// Deadline the stalled memory holder is submitted with, in milliseconds.
+///
+/// Long enough that the refusal, the release, and the cancel below all happen
+/// inside one query's own lifetime rather than racing its deadline.
+const REFUSAL_HOLDER_DEADLINE_MS: u64 = 60_000;
+
+/// Deadline the refused query is submitted with, in milliseconds.
+const REFUSAL_QUERY_DEADLINE_MS: u64 = 30_000;
+
+/// Governed bytes the hold deliberately leaves the stalled holder.
+///
+/// One partition working set: exactly what the plan calls the minimum a query
+/// needs to produce a batch. Holding the whole root instead would refuse the
+/// holder itself before it could reach its schema frame, and there would be no
+/// occupied root for the refusal below to meet.
+const REFUSAL_HOLDER_HEADROOM_BYTES: usize = 64 * 1024 * 1024;
+
+/// Bytes of filler each row of the refused query's sort key carries.
+///
+/// Three rows of this width exceed the headroom above, and a sort must reserve
+/// a whole batch before it can spill any of it, so the refusal is a property of
+/// the arithmetic rather than of how `DataFusion` chose to schedule the work.
+const REFUSAL_SORT_KEY_BYTES: usize = 15_000_000;
+
+/// Stable error code a query refused for capacity must carry.
+const QUERY_ADMISSION_REJECTED_CODE: &str = "WYRD_VALA_429_QUERY_ADMISSION_REJECTED";
+
+/// A memory refusal under a fully occupied Oracle root leaves the pod healthy
+/// and its next query serviceable.
+///
+/// # Panics
+///
+/// Panics when any hold, refusal, release, health, or follow-up claim fails.
+// The stalled holder, the refused query, and the follow-up query are three
+// concurrent server-side lifecycles; on the single-threaded default the stalled
+// holder's own task starves the ones observing it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn memory_refusal_preserves_oracle_health_and_next_query() {
+    prove_memory_refusal_preserves_health()
+        .await
+        .expect("Oracle memory refusal journey");
+}
+
+/// Drives the complete memory-refusal journey over one live cluster.
+///
+/// # Errors
+///
+/// Returns the first claim that broke.
+async fn prove_memory_refusal_preserves_health() -> Result<(), JourneyError> {
+    // The lowest supported Oracle rung is the only one where a single query can
+    // occupy the whole governed root: at 512 MiB an Oracle-only pod has no
+    // elastic memory, so its root equals the ceiling one query is granted.
+    // Above that rung no single query can fill the root, by design.
+    let cluster = WyrdTestCluster::start_spec(
+        BifrostClusterSpec::three_oracles_one_scribe()
+            .with_system_resources(oracle_floor_observation()),
+    )
+    .await?;
+    let tenant = cluster.data_tenant_id();
+    let ingest = cluster.server(3).ok_or("missing Scribe node")?;
+    let table = unique_table("oracle_memory_refusal");
+    register_table(ingest, tenant, &table).await?;
+    let rows = writer(ingest, "memory-refusal-writer").await?;
+    for id in 1..=REFUSAL_ROWS {
+        rows.write(
+            &format!("vala.bifrost.{table}"),
+            &journey_schema(),
+            [journey_row(id, "refusal")],
+        )
+        .await?;
+    }
+    ingest.flush_bifrost().await?;
+    cluster.refresh_oracle_snapshots().await?;
+
+    let server = cluster.server(0).ok_or("missing Oracle node")?;
+    let resources = server
+        .state()
+        .bifrost_resources()
+        .ok_or("node composed no Bifrost resources")?;
+    let plan = resources.plan();
+    let root_limit = plan
+        .oracle_floor_bytes
+        .saturating_add(plan.elastic_memory_bytes);
+    let health = resources.oracle().ok_or("node hosts no Oracle")?.health();
+
+    // Both controls arm the same next query: it takes the whole governed root
+    // and then parks after its schema frame, so the occupancy the refusal below
+    // meets is one real query's own reservation rather than a harness counter.
+    server.stall_next_query_after_schema();
+    server.hold_next_query_memory(root_limit.saturating_sub(REFUSAL_HOLDER_HEADROOM_BYTES))?;
+    let holder = client(server, "memory-refusal-holder").await?;
+    let holder_query = QueryClient::new(&holder);
+    let stream = holder_query
+        .query(&BifrostQueryRequest {
+            sql: format!("SELECT id FROM vala.bifrost.{table}"),
+            visibility: VisibilityMode::PublishedOnly,
+            freshness: FreshnessPolicy::Strict,
+            deadline_ms: Some(REFUSAL_HOLDER_DEADLINE_MS),
+        })
+        .await
+        .map_err(|error| format!("holder query: {error}"))?;
+    let held_request_id = stream.request_id().clone();
+    let holder_task = tokio::spawn(async move {
+        let mut stream = stream;
+        let _ = stream.next_batch().await;
+    });
+    server.wait_query_schema_stall().await?;
+    server.wait_query_memory_hold().await?;
+
+    let occupied = resources.snapshot().map_err(|error| error.to_string())?;
+    let held_floor = root_limit.saturating_sub(REFUSAL_HOLDER_HEADROOM_BYTES);
+    if occupied.oracle_query_memory_used_bytes < held_floor {
+        return Err(format!(
+            "the held reservation occupied {} of a {root_limit} byte root",
+            occupied.oracle_query_memory_used_bytes
+        )
+        .into());
+    }
+
+    let refused = client(server, "memory-refusal-reader").await?;
+    let refusal = drain_query(
+        &QueryClient::new(&refused),
+        &format!(
+            "SELECT REPEAT('x', {REFUSAL_SORT_KEY_BYTES}) || CAST(id AS VARCHAR) AS wide_key \
+             FROM vala.bifrost.{table} ORDER BY wide_key"
+        ),
+    )
+    .await
+    .err()
+    .ok_or("a query against a fully occupied root was not refused")?;
+    if !refusal.contains(QUERY_ADMISSION_REJECTED_CODE) {
+        return Err(
+            format!("refusal carried {refusal} rather than the typed capacity code").into(),
+        );
+    }
+
+    server.release_query_memory_hold()?;
+    holder_query.cancel(&held_request_id).await?;
+    holder_task.abort();
+    let _ = holder_task.await;
+    let released = server
+        .wait_bifrost_query_resources_released(
+            held_request_id.as_str(),
+            wyrd_testing::server::BifrostQueryResourceSnapshot::default(),
+        )
+        .await?;
+    if released != wyrd_testing::server::BifrostQueryResourceSnapshot::default() {
+        return Err(format!("the cancelled holder retained {released:?}").into());
+    }
+
+    if let Some(reason) = health.reason() {
+        return Err(
+            format!("a bounded memory refusal poisoned the process root: {reason:?}").into(),
+        );
+    }
+    let next = client(server, "memory-refusal-next").await?;
+    let served = query_rows(&next, &table, VisibilityMode::PublishedOnly).await?;
+    if served != u64::try_from(REFUSAL_ROWS)? {
+        return Err(format!("the next query returned {served} rows after the refusal").into());
+    }
+
+    cluster.shutdown().await?;
+    Ok(())
+}
+
+/// Drains one statement to its terminal, rendering any refusal as its code.
+///
+/// A capacity refusal surfaces either as a rejected request or as a terminal
+/// failure once the stream is already open, depending on how far planning
+/// progressed before the root refused. Both are the same refusal to this
+/// journey, so both are rendered to one string the caller matches a code in.
+///
+/// # Errors
+///
+/// Returns the rendered refusal when the statement does not complete.
+async fn drain_query(query: &QueryClient, sql: &str) -> Result<u64, String> {
+    let mut stream = query
+        .query(&BifrostQueryRequest {
+            sql: sql.to_owned(),
+            visibility: VisibilityMode::PublishedOnly,
+            freshness: FreshnessPolicy::Strict,
+            deadline_ms: Some(REFUSAL_QUERY_DEADLINE_MS),
+        })
+        .await
+        .map_err(|error| format!("{}: {error}", error.code()))?;
+    let mut rows = 0_u64;
+    loop {
+        match stream.next_batch().await {
+            Ok(Some(batch)) => {
+                rows = rows.saturating_add(u64::try_from(batch.num_rows()).unwrap_or(u64::MAX))
+            }
+            Ok(None) => break,
+            Err(error) => return Err(format!("{}: {error}", error.code())),
+        }
+    }
+    match stream.terminal().map(|terminal| terminal.outcome) {
+        Some(QueryTerminalOutcome::Success | QueryTerminalOutcome::Degraded) => Ok(rows),
+        other => Err(format!("terminal {other:?}")),
+    }
+}

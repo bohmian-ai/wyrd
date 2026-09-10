@@ -281,8 +281,9 @@ Do not run the repository gate or a complete Bifrost/platform test suite.
 ### Commands run
 
 ```bash
-mise exec -- cargo nextest run --locked -p wyrd-spec --lib -E 'test(/auth::permission_scope/)'
-mise exec -- cargo nextest run --locked -p wyrd-runtime --lib -E 'test(/permission/)'
+# Superseded by the exact expressions recorded in
+# changes/active/object-scoped-rbac/review/task-001-codex/TASK-001-R1-close-rbac-contract-gaps.md
+# (these two regex module selectors could pass after selecting the wrong set).
 mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib \
   -E 'test(=oracle::tests::payload_permission_requires_the_resolved_table_scope) | test(=oracle::tests::payload_permission_is_absent_for_ungated_tables) | test(=oracle::tests::scoped_permission_digest_binds_the_authorized_table_set)'
 mise exec -- cargo nextest run --locked -p wyrd-server --lib --features test-support \

@@ -411,6 +411,41 @@ mod tests {
         );
     }
 
+    /// Joins a prose source into one whitespace-normalized line.
+    ///
+    /// The documentation assertions below look for whole sentences, but every
+    /// source they read is hard-wrapped Markdown or rustdoc. Matching the raw
+    /// text makes the assertion depend on where the wrap happens to fall, so a
+    /// pure reflow that changes no words breaks the test. Each line therefore
+    /// sheds its rustdoc marker — a wrap inside a `//!` block would otherwise
+    /// leave the marker sitting mid-sentence — and every run of whitespace
+    /// collapses to a single space, so the comparison sees the sentence rather
+    /// than its line breaks.
+    fn unwrapped(source: &str) -> String {
+        source
+            .lines()
+            .map(|line| {
+                line.trim_start()
+                    .trim_start_matches("//!")
+                    .trim_start_matches("///")
+            })
+            .flat_map(str::split_whitespace)
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// Verifies the transaction invariants stay stated where callers read them.
+    ///
+    /// The rule these guard is architectural, not compilable: one `TenantConn`
+    /// per tenant-scoped logical operation, and no cross-crate transaction
+    /// built by importing another crate's query modules. The sibling tests
+    /// enforce the code side; this one keeps the architecture doc, the
+    /// `TenantConn` rustdoc, and the query-module doc from quietly dropping the
+    /// statement a reader relies on.
+    ///
+    /// # Panics
+    /// Panics when any of the three sources is unreadable, or when one of them
+    /// no longer states its invariant.
     #[test]
     fn transaction_discipline_is_documented() {
         let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -418,23 +453,42 @@ mod tests {
             .ancestors()
             .nth(3)
             .expect("crate lives three levels below repo root");
-        let sql_foundation =
-            fs::read_to_string(repo_dir.join("architecture/v1/00-foundations/sql-foundation.md"))
-                .expect("SQL foundation architecture doc is readable");
-        let tenant_conn = fs::read_to_string(crate_dir.join("src/tenant_conn.rs"))
-            .expect("TenantConn is readable");
-        let queries_doc = fs::read_to_string(crate_dir.join("src/queries/mod.rs"))
-            .expect("query module doc is readable");
-
-        assert!(
-            sql_foundation.contains("tenant-scoped logical operation acquires one `TenantConn`")
+        let sql_foundation = unwrapped(
+            &fs::read_to_string(repo_dir.join("architecture/v1/00-foundations/sql-foundation.md"))
+                .expect("SQL foundation architecture doc is readable"),
         );
-        assert!(sql_foundation.contains(
-            "Cross-crate work does not extend a transaction by importing another crate's"
-        ));
-        assert!(tenant_conn.contains("transaction boundary for one tenant-scoped logical"));
-        assert!(tenant_conn.contains("operation. Handlers and workers"));
-        assert!(queries_doc.contains("future outbox path"));
+        let tenant_conn = unwrapped(
+            &fs::read_to_string(crate_dir.join("src/tenant_conn.rs"))
+                .expect("TenantConn is readable"),
+        );
+        let queries_doc = unwrapped(
+            &fs::read_to_string(crate_dir.join("src/queries/mod.rs"))
+                .expect("query module doc is readable"),
+        );
+
+        for (source, label, sentence) in [
+            (
+                &sql_foundation,
+                "sql-foundation.md",
+                "tenant-scoped logical operation acquires one `TenantConn`",
+            ),
+            (
+                &sql_foundation,
+                "sql-foundation.md",
+                "Cross-crate work does not extend a transaction by importing another crate's",
+            ),
+            (
+                &tenant_conn,
+                "tenant_conn.rs",
+                "transaction boundary for one tenant-scoped logical operation. Handlers and workers",
+            ),
+            (&queries_doc, "queries/mod.rs", "future outbox path"),
+        ] {
+            assert!(
+                source.contains(sentence),
+                "{label} must still state: {sentence}"
+            );
+        }
     }
 
     #[test]

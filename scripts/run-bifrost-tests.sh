@@ -12,7 +12,6 @@ lanes=(
   journey
   journey:python
   journey:typescript
-  forge-scale
 )
 
 declare -a failed=()
@@ -20,9 +19,6 @@ declare -a failed=()
 for lane in "${lanes[@]}"; do
   printf '\n=== bifrost: %s ===\n' "$lane"
   task="test:bifrost:${lane}:inner"
-  if [[ $lane == forge-scale ]]; then
-    task="test:sql:forge-scale:inner"
-  fi
   if mise run "$task"; then
     printf '=== bifrost: %s PASSED ===\n' "$lane"
   else

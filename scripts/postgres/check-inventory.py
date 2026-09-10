@@ -20,7 +20,7 @@ if "55432" in compose or '"55432:5432"' in compose:
 if "docker ps" in (root / "mise.toml").read_text() or "docker rm" in (root / "mise.toml").read_text():
     raise SystemExit("global Docker enumeration/deletion remains")
 empty = {
-    "db:migrate", "db:migrate:all", "test:sql", "test:sql:forge-scale",
+    "db:migrate", "db:migrate:all", "test:sql",
     "test:bifrost:integration:redux", "test:bifrost:integration:sql",
 }
 migrated = {"test:bifrost", "test:vala", "test:wyrd", "test:shared"}

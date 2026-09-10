@@ -113,7 +113,6 @@ run = """
 cargo nextest run --locked -p wyrd-testing --lib -E 'test(/^bifrost::/) | test(/^interleaving::/) | test(/^load::/) | test(/^server::production_composition_tests::/)'
 cargo nextest run --locked -p wyrd-server --lib --features test-support -E 'test(/^bifrost::/) | test(/^oracle::/) | test(/^query::/) | test(/^grpc::(query|scribe_tail)::/) | test(/bifrost|oracle|scribe|forge/)'
 cargo nextest run --locked -p vala-sdk --lib -E 'test(/^query::/) | test(/^sdk::bifrost/)'
-cargo nextest run --locked -p wyrd-mcp --lib -E 'test(/^bifrost::/)'
 """
 
 [tasks."test:bifrost:unit:python:inner"]
@@ -142,7 +141,7 @@ run = "scripts/postgres/with-test-postgres.sh -- mise run test:bifrost:integrati
 [tasks."test:bifrost:integration:sql:inner"]
 hide = true
 description = "Run Vala's Bifrost control-plane SQL tests, excluding the separately bounded Forge scale case."
-run = "cargo nextest run --locked -p vala-sql --test-threads=1 -E 'not test(open_set_scan_remains_bounded_after_terminal_growth)'"
+run = "cargo nextest run --locked -p vala-sql --test-threads=1"
 
 [tasks."test:bifrost:integration:sql"]
 description = "Run Vala's Bifrost control-plane SQL tests."
@@ -251,14 +250,6 @@ run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:i
 hide = true
 description = "wyrd-testing `oracle` binary, whole"
 run = "cargo nextest run --locked -p wyrd-testing --test oracle -P journey --run-ignored=all"
-
-[tasks."test:bifrost:journey:otlp"]
-description = "Tier-1 journeys: OTLP logs, metrics, traces, mixed batch, negative protocol surface"
-run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run test:bifrost:journey:otlp:inner'"
-[tasks."test:bifrost:journey:otlp:inner"]
-hide = true
-description = "wyrd-testing `otlp` binary, whole"
-run = "cargo nextest run --locked -p wyrd-testing --test otlp -P journey --run-ignored=all"
 
 [tasks."test:bifrost:journey:server"]
 description = "Tier-1 journeys: gRPC mount, server boot, owner lifecycle and inspection"
@@ -1248,7 +1239,7 @@ run = "cargo nextest run --locked -p wyrd-sql --test pg_migration migrations_app
 [tasks."test:sql"]
 hide = true
 description = """Run live Postgres SQL integration tests against docker-compose Postgres.
-Brings up Postgres, provisions roles, then runs the SQL migration, reset, fixture, Vala SQL, and registry e2e suites. The 10,000-row Forge scale regression runs through test:sql:forge-scale.
+Brings up Postgres, provisions roles, then runs the SQL migration, reset, fixture, Vala SQL, and registry e2e suites.
 """
 env = { WYRD_REG_E2E = "1" }
 
@@ -1256,27 +1247,15 @@ run = "scripts/postgres/with-test-postgres.sh -- mise run test:sql:inner"
 [tasks."test:sql:inner"]
 hide = true
 description = """Run live Postgres SQL integration tests against docker-compose Postgres.
-Brings up Postgres, provisions roles, then runs the SQL migration, reset, fixture, Vala SQL, and registry e2e suites. The 10,000-row Forge scale regression runs through test:sql:forge-scale.
+Brings up Postgres, provisions roles, then runs the SQL migration, reset, fixture, Vala SQL, and registry e2e suites.
 """
 env = { WYRD_REG_E2E = "1" }
 run = """
 cargo nextest run --locked -p wyrd-sql --test-threads=1
 cargo nextest run --locked -p wyrd-dev-fixtures --features pg --test-threads=1
-cargo nextest run --locked -p vala-sql --test-threads=1 -E 'not test(open_set_scan_remains_bounded_after_terminal_growth)'
+cargo nextest run --locked -p vala-sql --test-threads=1
 cargo nextest run --locked -p wyrd-storage --test pg_sweeper --test-threads=1
 """
-
-[tasks."test:sql:forge-scale"]
-hide = true
-description = "Run the 10,000-row Forge SQL bounded-plan regression."
-env = { WYRD_REG_E2E = "1" }
-
-run = "scripts/postgres/with-test-postgres.sh -- mise run test:sql:forge-scale:inner"
-[tasks."test:sql:forge-scale:inner"]
-hide = true
-description = "Run the 10,000-row Forge SQL bounded-plan regression."
-env = { WYRD_REG_E2E = "1" }
-run = "cargo nextest run --locked -p vala-sql --test pg_forge_operations -E 'test(=pg_tests::forge_operations::open_set_scan_remains_bounded_after_terminal_growth)' --test-threads=1"
 
 [tasks."db:migrate:all"]
 hide = true

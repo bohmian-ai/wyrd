@@ -62,6 +62,21 @@ export declare class NativeBifrost {
    */
   insert(row: string, cardRef?: string | undefined | null, runId?: string | undefined | null): NativeLifecycleResult
   /**
+   * Writes one already-built Arrow batch to `table` and awaits durability.
+   *
+   * The batch crosses as a single-batch Arrow IPC stream, the same framing
+   * [`NativeTableConfig::schema_ipc`] uses in the other direction, so the
+   * field metadata a canonical table declares survives the boundary. Unlike
+   * [`NativeBifrost::insert`] nothing is buffered, so no flush follows.
+   *
+   * # Errors
+   *
+   * Returns a napi error when the bytes are not one single-batch Arrow IPC
+   * stream; server and envelope refusals are returned in
+   * [`NativeLifecycleResult`].
+   */
+  writeBatch(table: string, batchIpc: Buffer): Promise<NativeLifecycleResult>
+  /**
    * Flushes every pooled producer and awaits each durable acknowledgement.
    *
    * # Errors

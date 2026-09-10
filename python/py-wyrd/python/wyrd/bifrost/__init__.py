@@ -120,6 +120,20 @@ class BifrostQueryStream(AsyncIterator[pyarrow.RecordBatch]):
         await asyncio.to_thread(self._native.close)
 
 
+def _batch_ipc(batch: pyarrow.RecordBatch) -> bytes:
+    """Frame one batch as the single-batch Arrow IPC stream the native call takes.
+
+    The stream carries the batch's own schema, so the field metadata a
+    canonical table declares - stable field id, sensitivity - reaches the
+    server exactly as ``describe_table`` handed it out.
+    """
+
+    sink = pyarrow.BufferOutputStream()
+    with pyarrow.ipc.new_stream(sink, batch.schema) as writer:
+        writer.write_batch(batch)
+    return bytes(sink.getvalue().to_pybytes())
+
+
 def _row_json(row: Any) -> str:
     """Serialize one row the three ways a caller supplies it.
 
@@ -482,6 +496,24 @@ class Bifrost(_BifrostBase):
 
         self._native.use_table_by_name(table)
 
+    def write_batch(self, table: str, batch: pyarrow.RecordBatch) -> None:
+        """Write one already-built Arrow batch to ``table`` and await durability.
+
+        The precision write door, beside ``insert``: it names its destination
+        instead of using the active binding, carries correlation as ordinary
+        columns, and is durable when it returns, so no ``flush`` follows it.
+        Build the batch against ``describe_table(...).arrow_schema`` - a
+        canonical table compares an incoming block against its declared fields
+        exactly, metadata included.
+
+        Raises:
+            BifrostQueryError: the batch exceeded the byte envelope, or the
+                server refused it.
+
+        """
+
+        self._native.write_batch(table, _batch_ipc(batch))
+
     def flush(self) -> None:
         """Flush every pooled producer and await each durable acknowledgement."""
 
@@ -565,6 +597,20 @@ class AsyncBifrost(_BifrostBase):
         """Bind an already-registered table by name, describing it first."""
 
         await asyncio.to_thread(self._native.use_table_by_name, table)
+
+    async def write_batch(self, table: str, batch: pyarrow.RecordBatch) -> None:
+        """Write one already-built Arrow batch to ``table`` and await durability.
+
+        The ``await`` form of :meth:`Bifrost.write_batch`; the encode and the
+        blocking native write both run in a worker thread.
+
+        Raises:
+            BifrostQueryError: the batch exceeded the byte envelope, or the
+                server refused it.
+
+        """
+
+        await asyncio.to_thread(self._native.write_batch, table, _batch_ipc(batch))
 
     async def flush(self) -> None:
         """Flush every pooled producer and await each durable acknowledgement."""

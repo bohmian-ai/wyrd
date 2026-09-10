@@ -322,6 +322,27 @@ impl Bifrost {
             .map_err(query_error_to_py)
     }
 
+    /// Writes one already-built Arrow batch to `table` and awaits durability.
+    ///
+    /// The batch arrives as an Arrow IPC stream because that is the boundary
+    /// `pyarrow` and this crate already share; the Python wrapper encodes the
+    /// caller's `pyarrow.RecordBatch` and this decodes it once. Unlike
+    /// [`PyBifrost::insert`] the batch is not buffered, so no later flush is
+    /// needed, and the destination is named rather than taken from the active
+    /// binding.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ValueError` when the bytes are not one Arrow IPC batch, and a
+    /// typed Bifrost query error carrying the encode, byte-envelope, or stable
+    /// server refusal reported by the write.
+    #[pyo3(signature = (table, batch_ipc))]
+    fn write_batch(&self, py: Python<'_>, table: &str, batch_ipc: &[u8]) -> PyResult<()> {
+        let batch = decode_batch_ipc(batch_ipc)?;
+        py.detach(|| wyrd_runtime::runtime().block_on(self.handle.write_batch(table, &batch)))
+            .map_err(query_error_to_py)
+    }
+
     /// Flushes every pooled producer and awaits each durable acknowledgement.
     ///
     /// # Errors
@@ -516,6 +537,27 @@ fn decode_schema_ipc(bytes: &[u8]) -> PyResult<arrow_schema::SchemaRef> {
     let reader = StreamReader::try_new(Cursor::new(bytes), None)
         .map_err(|error| PyValueError::new_err(format!("invalid Arrow IPC schema: {error}")))?;
     Ok(reader.schema())
+}
+
+/// Decodes one single-batch Arrow IPC stream into a native record batch.
+///
+/// # Errors
+///
+/// Returns `ValueError` when the bytes are not one Arrow IPC stream carrying
+/// exactly one batch, which is what one logical write is.
+fn decode_batch_ipc(bytes: &[u8]) -> PyResult<arrow::record_batch::RecordBatch> {
+    let mut reader = StreamReader::try_new(Cursor::new(bytes), None)
+        .map_err(|error| PyValueError::new_err(format!("invalid Arrow IPC batch: {error}")))?;
+    let batch = reader
+        .next()
+        .ok_or_else(|| PyValueError::new_err("Arrow IPC stream carries no batch"))?
+        .map_err(|error| PyValueError::new_err(format!("invalid Arrow IPC batch: {error}")))?;
+    if reader.next().is_some() {
+        return Err(PyValueError::new_err(
+            "one write carries exactly one Arrow batch",
+        ));
+    }
+    Ok(batch)
 }
 
 /// Encodes one native schema as a schema-only Arrow IPC stream.

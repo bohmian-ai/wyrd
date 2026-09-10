@@ -251,6 +251,27 @@ impl NativeTableConfig {
     }
 }
 
+/// Decodes one single-batch Arrow IPC stream into a native record batch.
+///
+/// # Errors
+///
+/// Returns a napi error when the bytes are not one Arrow IPC stream carrying
+/// exactly one batch, which is what one logical write is.
+fn decode_batch_ipc(bytes: &[u8]) -> napi::Result<arrow::record_batch::RecordBatch> {
+    let mut reader = arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(bytes), None)
+        .map_err(napi_error)?;
+    let batch = reader
+        .next()
+        .ok_or_else(|| napi::Error::from_reason("Arrow IPC stream carries no batch"))?
+        .map_err(napi_error)?;
+    if reader.next().is_some() {
+        return Err(napi::Error::from_reason(
+            "one write carries exactly one Arrow batch",
+        ));
+    }
+    Ok(batch)
+}
+
 /// Builds one table config from a JSON Schema document.
 ///
 /// This is the Zod (`z.toJSONSchema()`) door; the mapping is the same
@@ -469,6 +490,33 @@ impl NativeBifrost {
     ) -> napi::Result<NativeLifecycleResult> {
         let correlation = correlation(card_ref.as_deref(), run_id)?;
         match self.client.insert(row.into_bytes(), correlation) {
+            Ok(()) => NativeLifecycleResult::success(&serde_json::Value::Null),
+            Err(error) => Ok(NativeLifecycleResult::failure(&error)),
+        }
+    }
+
+    /// Writes one already-built Arrow batch to `table` and awaits durability.
+    ///
+    /// The batch crosses as a single-batch Arrow IPC stream, the same framing
+    /// [`NativeTableConfig::schema_ipc`] uses in the other direction, so the
+    /// field metadata a canonical table declares survives the boundary. Unlike
+    /// [`NativeBifrost::insert`] nothing is buffered, so no flush follows.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error when the bytes are not one single-batch Arrow IPC
+    /// stream; server and envelope refusals are returned in
+    /// [`NativeLifecycleResult`].
+    // justification: napi boundary; the generated binding requires owned values
+    #[allow(clippy::needless_pass_by_value)]
+    #[napi]
+    pub async fn write_batch(
+        &self,
+        table: String,
+        batch_ipc: Buffer,
+    ) -> napi::Result<NativeLifecycleResult> {
+        let batch = decode_batch_ipc(&batch_ipc)?;
+        match self.client.write_batch(&table, &batch).await {
             Ok(()) => NativeLifecycleResult::success(&serde_json::Value::Null),
             Err(error) => Ok(NativeLifecycleResult::failure(&error)),
         }

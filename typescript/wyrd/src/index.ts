@@ -706,6 +706,21 @@ export class Bifrost {
     );
   }
 
+  /**
+   * Write one already-built Arrow batch to `table` and await durability.
+   *
+   * The precision write door, beside {@link Bifrost.insert}: it names its
+   * destination instead of using the active binding, carries correlation as
+   * ordinary columns, and is durable when it resolves, so no flush follows it.
+   * Build the batch against {@link TableConfig.schema} from
+   * `describeTableConfig` - a canonical table compares an incoming block
+   * against its declared fields exactly, metadata included.
+   */
+  async writeBatch(table: string, batch: RecordBatch): Promise<void> {
+    const ipc = tableToIPC(new Table(batch), "stream");
+    lifecycleValue<null>(await this.#native.writeBatch(table, Buffer.from(ipc)));
+  }
+
   /** Flush every pooled producer and await each durable acknowledgement. */
   async flush(): Promise<void> {
     lifecycleValue<null>(await this.#native.flush());

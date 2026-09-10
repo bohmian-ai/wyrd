@@ -3633,6 +3633,7 @@ impl BifrostResourceGovernor {
         state.oracle_memory_used_bytes = next;
         state.elastic_memory_used_bytes = next_elastic;
         state.oracle_query_memory_used_bytes = next_query;
+        record_oracle_capacity(&state, &plan, self.oracle_class_split());
         Ok(OracleMemoryCharge {
             governed_bytes: bytes,
             headroom_bytes: 0,
@@ -3694,6 +3695,7 @@ impl BifrostResourceGovernor {
             .checked_add(headroom)
             .ok_or_else(accounting_overflow)?;
         state.oracle_memory_used_bytes = next;
+        record_oracle_capacity(&state, &plan, self.oracle_class_split());
         Ok(OracleMemoryCharge {
             governed_bytes: governed,
             headroom_bytes: headroom,
@@ -3737,6 +3739,7 @@ impl BifrostResourceGovernor {
         state.oracle_memory_used_bytes -= charge.governed_bytes;
         state.oracle_query_memory_used_bytes -= charge.governed_bytes;
         state.memory_epoch = state.memory_epoch.wrapping_add(1);
+        record_oracle_capacity(&state, &plan, self.oracle_class_split());
         drop(state);
         self.inner.memory_changed.notify_waiters();
         Ok(())

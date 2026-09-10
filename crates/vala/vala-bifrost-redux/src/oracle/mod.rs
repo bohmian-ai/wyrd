@@ -5783,6 +5783,12 @@ mod tests {
     /// no series claims a cluster-wide quota or a delegated, leased, renewed, or
     /// overdrawn allocation.
     ///
+    /// The three signals an operator diagnosing saturation actually needs are
+    /// driven rather than assumed: a governed refusal, nonzero process headroom
+    /// from the infallible path, and the selected-worker count of a real
+    /// Analytical cut. A registered-but-never-exercised series would look
+    /// identical to one that can no longer be produced.
+    ///
     /// # Panics
     ///
     /// Panics when the fixture cannot admit a query or a series is missing,
@@ -5803,6 +5809,88 @@ mod tests {
                     0.0,
                 ))
                 .expect("one interactive query is admitted");
+
+            let pool = admitted.memory_pool();
+            let mut consumer =
+                datafusion::execution::memory_pool::MemoryConsumer::new("metrics-governed")
+                    .register(&pool);
+            consumer
+                .try_grow(admitted.granted_memory_bytes)
+                .expect("the first query's full grant is fundable");
+
+            // A second query fills the remaining governed root exactly, so the
+            // third query's growth is refused by the pod root rather than by
+            // its own ceiling. That is the counter an operator alerts on.
+            let filler = oracle
+                .try_acquire_query(crate::resources::OracleResourceRequest::for_class(
+                    QueryClass::Interactive,
+                    0.0,
+                ))
+                .expect("a second query is admitted beneath the slot ledger");
+            let filler_pool = filler.memory_pool();
+            let mut filler_consumer =
+                datafusion::execution::memory_pool::MemoryConsumer::new("metrics-filler")
+                    .register(&filler_pool);
+            filler_consumer
+                .try_grow(filler.granted_memory_bytes)
+                .expect("the second query's full grant is still fundable");
+
+            let refused = oracle
+                .try_acquire_query(crate::resources::OracleResourceRequest::for_class(
+                    QueryClass::Interactive,
+                    0.0,
+                ))
+                .expect("a third query is admitted beneath the slot ledger");
+            let refused_pool = refused.memory_pool();
+            let mut refused_consumer =
+                datafusion::execution::memory_pool::MemoryConsumer::new("metrics-refusal")
+                    .register(&refused_pool);
+            assert!(
+                refused_consumer.try_grow(1).is_err(),
+                "growth beyond the governed root must be refused"
+            );
+            drop(refused_consumer);
+            drop(refused);
+            drop(filler_consumer);
+            drop(filler);
+
+            // The first query has already governed its whole grant, so the path
+            // DataFusion does not let fail can only record the excess as real
+            // process headroom.
+            consumer.grow(admitted.granted_memory_bytes);
+
+            // One real Analytical cut is what records the selected-worker count.
+            let now = Utc::now();
+            let leader = NodeId::new(uuid::Uuid::from_u128(1));
+            let analytical = ClusterSnapshot::observed(
+                (1..=3u64)
+                    .map(|node| {
+                        let mut role = participant_cut::tests::lease(
+                            u128::from(node),
+                            ClusterRole::Oracle,
+                            node,
+                        );
+                        if let ClusterCapabilities::OracleV1(capabilities) = &mut role.capabilities
+                        {
+                            capabilities.max_workers_per_query = 2;
+                        }
+                        role
+                    })
+                    .collect(),
+                now,
+            );
+            OracleQueryAttemptCut::try_from_snapshot(
+                &analytical,
+                QueryId::new(uuid::Uuid::from_u128(7)),
+                leader,
+                QueryClass::Analytical,
+                now + chrono::Duration::seconds(5),
+                now,
+                Duration::from_secs(15),
+            )
+            .expect("the fixture freezes one analytical cut");
+
+            drop(consumer);
             drop(admitted);
         });
         let snapshot = recorder.snapshot();
@@ -5822,6 +5910,30 @@ mod tests {
                 "missing local capacity series {series}: {snapshot:?}"
             );
         }
+        assert!(
+            snapshot.counters.keys().any(|series| {
+                series.starts_with("bifrost_resource_acquisitions_total{")
+                    && series.contains("role=\"oracle\"")
+                    && series.contains("result=\"refused\"")
+            }),
+            "a governed memory refusal must be counted: {snapshot:?}"
+        );
+        assert!(
+            snapshot
+                .gauge_peaks
+                .get("bifrost_oracle_local_bytes{kind=\"memory_headroom\"}")
+                .is_some_and(|peak| *peak > 0.0),
+            "infallible growth above the grant must publish process headroom: {snapshot:?}"
+        );
+        let workers = snapshot
+            .histograms
+            .get("bifrost_oracle_selected_workers")
+            .expect("an Analytical cut records its selected-worker count");
+        assert_eq!(
+            (workers.count, workers.max),
+            (1, 2),
+            "the cut selects exactly its two remote workers: {snapshot:?}"
+        );
         // The released query returns every local unit it charged, so a stale
         // gauge would be indistinguishable from a leaked one.
         assert_eq!(

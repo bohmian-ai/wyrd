@@ -220,32 +220,16 @@ Run Cargo-backed commands sequentially. For each new focused test, record its
 exact fully qualified `mise exec -- cargo nextest run --locked` command in the
 implementation report after the implementer chooses the smallest existing
 target. Never use a positional filter that can pass after selecting zero
-tests. The following existing tests are regression anchors, not substitutes
-for the new scoped cases.
+tests.
 
 The new focused proof must cover the permission contract and invalid input,
 tenant role decoding, Oracle's complete resolved table set and payload check,
 peer-authority non-widening, and the single real-server role matrix. Keep each
 case in its nearest existing test target and run each by exact nextest
-expression.
+expression. The Postgres-backed resolver and server journey commands must use
+the repository-managed Postgres wrapper and migrations.
 
 ```bash
-# Existing permission serialization and subsumption anchors.
-mise exec -- cargo nextest run --locked -p wyrd-runtime --lib \
-  -E 'test(=permission::tests::permission_set_jsonb_round_trip) | test(=permission::tests::permission_set_subsumption_drops_redundant)'
-
-# Existing tenant-backed role resolution anchor.
-scripts/postgres/with-test-postgres.sh -- bash -lc \
-  'mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-auth --lib -E '\''test(=permission_resolver::pg_tests::resolved_set_matches_constant)'\'''
-
-# Existing verifier cache and authorization-epoch anchors.
-mise exec -- cargo nextest run --locked -p wyrd-auth-verify --lib \
-  -E 'test(=tests::invalidate_principal_removes_matching_entries_and_forces_re_resolve) | test(=tests::revocation_epoch_rejects_cache_hit_when_iat_predates_epoch)'
-
-# Existing signed peer-binding tamper anchor.
-mise exec -- cargo nextest run --locked -p wyrd-server --lib --features test-support \
-  -E 'test(=oracle::peer_authority::tests::prove_forward_query_claims_bind_every_field)'
-
 mise run fmt
 mise run lints
 mise run codegen:check

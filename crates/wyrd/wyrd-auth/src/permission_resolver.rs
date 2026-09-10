@@ -77,7 +77,9 @@ mod pg_tests {
     use serde_json::json;
     use wyrd_auth_verify::PermissionResolver;
     use wyrd_dev_fixtures::pg::PgFixture;
-    use wyrd_runtime::{Permission, RoleRef};
+    use wyrd_runtime::{
+        BifrostPermissionScope, BifrostTableScope, Permission, PermissionScope, RoleRef,
+    };
     use wyrd_sql::queries::auth::RoleRow;
 
     use crate::seed::seed_builtin_roles_for_tenant;
@@ -92,14 +94,16 @@ mod pg_tests {
                 id: uuid::Uuid::nil(),
                 name: "reader".to_owned(),
                 permissions: json!([
-                    { "resource": "cards", "action": "read" },
-                    { "resource": "artifacts", "action": "read" }
+                    { "resource": "cards", "action": "read", "scope": "all" },
+                    { "resource": "artifacts", "action": "read", "scope": "all" }
                 ]),
             },
             RoleRow {
                 id: uuid::Uuid::nil(),
                 name: "admin".to_owned(),
-                permissions: json!([{ "resource": "wildcard", "action": "wildcard" }]),
+                permissions: json!([
+                    { "resource": "wildcard", "action": "wildcard", "scope": "all" }
+                ]),
             },
         ];
 
@@ -115,7 +119,7 @@ mod pg_tests {
         let rows = vec![RoleRow {
             id: uuid::Uuid::nil(),
             name: "bad_role".to_owned(),
-            permissions: json!([{ "resource": "cards", "action": "unknown" }]),
+            permissions: json!([{ "resource": "cards", "action": "unknown", "scope": "all" }]),
         }];
 
         let error = permission_set_from_rows(rows).expect_err("permissions should fail");
@@ -124,6 +128,68 @@ mod pg_tests {
             error.to_string().contains("bad_role"),
             "error should identify the corrupt role: {error}"
         );
+    }
+
+    #[test]
+    fn decodes_scoped_bifrost_grants_and_rejects_unscoped_rows() {
+        let uid = uuid::Uuid::now_v7();
+        let rows = vec![RoleRow {
+            id: uuid::Uuid::nil(),
+            name: "analyst".to_owned(),
+            permissions: json!([
+                {
+                    "resource": "bifrost_query",
+                    "action": "read",
+                    "scope": {"bifrost": {"schema": {"catalog": "vala", "schema": "logs"}}}
+                },
+                {
+                    "resource": "bifrost_query",
+                    "action": "read",
+                    "scope": {"bifrost": {"table": {
+                        "catalog": "vala",
+                        "schema": "traces",
+                        "table_uid": uid.to_string(),
+                    }}}
+                }
+            ]),
+        }];
+
+        let set = permission_set_from_rows(rows).expect("scoped role permissions decode");
+
+        assert_eq!(set.len(), 2);
+        assert!(set.contains(&scoped_query_read(PermissionScope::Bifrost(
+            BifrostPermissionScope::Table(BifrostTableScope {
+                catalog: "vala".to_owned(),
+                schema: "logs".to_owned(),
+                table_uid: uuid::Uuid::now_v7(),
+            })
+        ))));
+        assert!(set.contains(&scoped_query_read(PermissionScope::Bifrost(
+            BifrostPermissionScope::Table(BifrostTableScope {
+                catalog: "vala".to_owned(),
+                schema: "traces".to_owned(),
+                table_uid: uid,
+            })
+        ))));
+        assert!(!set.contains(&Permission::bifrost_query_read()));
+
+        let error = permission_set_from_rows(vec![RoleRow {
+            id: uuid::Uuid::nil(),
+            name: "unscoped".to_owned(),
+            permissions: json!([{ "resource": "bifrost_query", "action": "read" }]),
+        }])
+        .expect_err("a scope-less grant is not decoded");
+
+        assert!(error.to_string().contains("unscoped"), "{error}");
+    }
+
+    /// Builds one Bifrost query-read permission at the supplied object scope.
+    fn scoped_query_read(scope: PermissionScope) -> Permission {
+        Permission {
+            resource: wyrd_runtime::Resource::BifrostQuery,
+            action: wyrd_runtime::Action::Read,
+            scope,
+        }
     }
 
     #[tokio::test]

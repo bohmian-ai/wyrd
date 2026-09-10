@@ -798,7 +798,7 @@ async fn open_requires_eval_run_permission() {
         fixture.app_pool(),
         tenant,
         "card_only",
-        json!([{ "resource": "cards", "action": "write" }]),
+        json!([{ "resource": "cards", "action": "write", "scope": "all" }]),
     )
     .await;
 

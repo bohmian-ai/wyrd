@@ -223,8 +223,12 @@ impl ClassState {
     /// Drops every FIFO head whose absolute deadline already passed.
     ///
     /// Returns the number removed so the caller can decrement the shared queued
-    /// counter once. Only heads are examined: a waiter behind a live head keeps
-    /// its place, and its own bounded wait rejects it if it expires there.
+    /// counter once. Only heads are examined, which keeps one call proportional
+    /// to the tenants it actually clears rather than to the whole queue; an
+    /// entry behind a live head keeps its place until that head leaves. The
+    /// grant loop therefore calls this before every grant decision, so an
+    /// expired entry exposed by a prior pop is removed on the next iteration
+    /// instead of being granted.
     fn prune_expired(&mut self, now: Instant) -> u32 {
         let mut removed = 0;
         for (_, queue) in &mut self.tenants {
@@ -1070,8 +1074,10 @@ impl OracleAdmission {
 /// One grant is decided per iteration so tenant rotation and the class
 /// comparison stay honest as capacity changes underneath them:
 ///
-/// 1. expired FIFO heads are dropped, because a dead head must never block a
-///    live tenant behind it;
+/// 1. every FIFO head whose absolute deadline passed is dropped, because a dead
+///    head must never block a live tenant behind it and an expired entry must
+///    never be granted; this runs on each iteration so an entry uncovered by a
+///    prior grant is still checked;
 /// 2. ready Interactive work is granted until the protected floor is satisfied;
 /// 3. otherwise the older of the two eligible class heads wins, compared by the
 ///    monotonic waiter identity, so neither a continuously ready class starves
@@ -1087,10 +1093,17 @@ fn grant_waiters(
     let _ = state.generation;
     let mut notifications = Vec::new();
     let now = Instant::now();
-    let expired = state.interactive.prune_expired(now) + state.analytical.prune_expired(now);
-    state.queued = state.queued.saturating_sub(expired);
     let mut refused = [false; 2];
     loop {
+        // Deadline eligibility is re-established before every grant decision,
+        // not once per pass. A request's absolute deadline is
+        // `min(caller deadline, enqueue + max_queue_wait)`, so deadlines are
+        // not monotonic inside one tenant FIFO: popping a live head can expose
+        // an entry behind it that already expired. Re-pruning here removes that
+        // entry before it can be selected, acquire slot and scratch ownership,
+        // or be notified.
+        let expired = state.interactive.prune_expired(now) + state.analytical.prune_expired(now);
+        state.queued = state.queued.saturating_sub(expired);
         let interactive = (!refused[0])
             .then(|| {
                 state
@@ -1169,12 +1182,16 @@ fn grant_waiters(
     notifications
 }
 
-/// Acquires the exact root resource quantum for one queued admission class.
+/// Acquires the root ownership one queued admission class must hold to run.
+///
+/// What is acquired is slot units and a scratch lease; the class memory quantum
+/// is validated for shape but reserves nothing. Governed memory is charged later,
+/// as the query's shared-pool consumers actually grow.
 ///
 /// # Errors
 ///
 /// Returns [`crate::resources::BifrostResourceError`] when the root governor
-/// cannot cover the class quantum without violating Task 01 accounting.
+/// cannot seat the class's slot units or its scratch lease.
 fn acquire_waiter_resources(
     shared: &AdmissionShared,
     kind: AdmissionClass,
@@ -2740,6 +2757,98 @@ pub(in crate::oracle) mod tests {
             grant_waiters(shared, &mut state)
         };
         notify_grants(shared, notifications);
+    }
+
+    /// A waiter that expired behind a live FIFO head is never granted, even when
+    /// the same pass has capacity left after granting that head.
+    ///
+    /// Each request's absolute deadline is `min(caller deadline, enqueue +
+    /// max_queue_wait)`, so deadlines are not monotonic inside one tenant FIFO.
+    /// This seeds an older live head in front of a later already-expired entry,
+    /// leaves two Interactive units free so one pass can issue two grants, and
+    /// proves the exposed expired entry is dropped rather than given slot and
+    /// scratch ownership. Live work queued afterwards still progresses.
+    #[test]
+    fn expired_waiter_behind_a_live_head_is_never_granted() {
+        let resources = test_resources();
+        let config = OracleAdmissionConfig {
+            interactive_slots: 2,
+            tenant_interactive_slots: 2,
+            ..Default::default()
+        };
+        let owner = owner_with_resources(config, resources.clone());
+        let shared = Arc::clone(&owner.shared);
+        let baseline = resources.snapshot().expect("root baseline");
+        let tenant = DataTenantId::new_v7();
+
+        let mut live_head = push_waiter(
+            &shared,
+            AdmissionClass::Interactive,
+            tenant,
+            1,
+            Instant::now() + Duration::from_secs(30),
+        );
+        // An instant read before the grant pass reads its own is already in the
+        // past by the time the pass compares them, so this waiter is
+        // deterministically expired without any clock arithmetic.
+        let mut expired_tail = push_waiter(
+            &shared,
+            AdmissionClass::Interactive,
+            tenant,
+            2,
+            Instant::now(),
+        );
+        drain_grants(&shared);
+
+        let head_grant = live_head.try_recv().expect("the live head must be granted");
+        assert!(
+            expired_tail.try_recv().is_err(),
+            "an expired waiter must never receive a grant"
+        );
+        {
+            let state = shared.state.lock().expect("state");
+            assert_eq!(state.queued, 0, "both waiters left the queue");
+            assert_eq!(state.active_queries, 1, "only the live head is active");
+            assert_eq!(state.interactive.used, 1, "only one slot unit is charged");
+            assert_eq!(
+                state.interactive.tenants[0].1.active, 1,
+                "the tenant owns exactly the live head's units"
+            );
+            assert!(
+                state.interactive.tenants[0].1.waiters.is_empty(),
+                "the expired entry is removed from the FIFO"
+            );
+        }
+        let after = resources
+            .snapshot()
+            .expect("root while the head owns its grant");
+        assert_eq!(
+            after.oracle_query_scratch_used_bytes - baseline.oracle_query_scratch_used_bytes,
+            crate::resources::ORACLE_PARTITION_MEMORY_BYTES as u64,
+            "exactly one Interactive scratch lease is outstanding"
+        );
+        drop(head_grant);
+        assert_eq!(
+            resources
+                .snapshot()
+                .expect("root after the head releases")
+                .oracle_query_scratch_used_bytes,
+            baseline.oracle_query_scratch_used_bytes,
+            "no scratch is stranded by the rejected expired waiter"
+        );
+
+        let mut next_live = push_waiter(
+            &shared,
+            AdmissionClass::Interactive,
+            tenant,
+            3,
+            Instant::now() + Duration::from_secs(30),
+        );
+        drain_grants(&shared);
+        assert!(
+            next_live.try_recv().is_ok(),
+            "live work queued after the expired entry still progresses"
+        );
     }
 
     /// A saturated Analytical class never consumes Interactive capacity, per-tenant

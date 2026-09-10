@@ -38,22 +38,30 @@ pub const ROLE_MEMORY_FLOOR_BYTES: usize = 256 * MIB;
 pub const MIN_SCRATCH_FREE_BYTES: u64 = 256 * MIB as u64;
 /// Largest `DataFusion` memory ceiling any single Oracle query may be granted.
 ///
-/// This is a *cap on a derived grant*, not a reservation. Admission never debits
-/// this amount from the shared elastic budget; see
-/// [`ORACLE_PARTITION_WORKING_MEMORY_BYTES`] for what a query actually costs to
-/// admit. Conflating the two pinned node concurrency at `budget / ceiling`,
-/// which let a single analytical query reserve 1.25 GiB to scan a handful of
-/// 5 KiB Parquet files and shed load at the lowest production rung.
+/// This is a *cap on a derived grant*, not a reservation. Admission debits no
+/// memory at all; governed bytes are charged only as the query's `DataFusion`
+/// consumers actually grow through the shared Oracle root, and this value bounds
+/// how far one query may grow. Treating it as a reservation pinned node
+/// concurrency at `budget / ceiling`, which let a single analytical query hold
+/// 1.25 GiB to scan a handful of 5 KiB Parquet files and shed load at the lowest
+/// production rung. See [`ORACLE_PARTITION_WORKING_MEMORY_BYTES`] for the
+/// smaller quantum that sizes concurrency and partitions.
 pub const ORACLE_PARTITION_MEMORY_BYTES: usize = 256 * MIB;
-/// Memory one Oracle slot unit charges against the shared elastic budget.
+/// Memory one Oracle slot unit is *sized* against, in bytes.
 ///
-/// This serves two distinct jobs that happen to want the same number.
+/// This is a planning quantum, never a charge: no admission path debits it from
+/// the shared elastic budget. It serves three distinct jobs that happen to want
+/// the same number.
 ///
-/// As an *admission charge* it is the working set one `DataFusion` execution
-/// partition needs to make progress, so admitting a query reserves only what the
-/// query genuinely needs to start rather than the largest envelope it might grow
-/// into. As the *floor* of [`BifrostResourceGovernor::oracle_memory_grant`] it is
-/// the smallest grant that still lets a partition run at all.
+/// As a *sizing* input it is the working set one `DataFusion` execution
+/// partition needs to make progress, so dividing the Oracle budget by it yields
+/// how many slot units this pod can realistically run at once. As the *floor* of
+/// [`BifrostResourceGovernor::oracle_memory_grant`] it is the smallest grant
+/// that still lets a partition run at all. As a *partition-planning* input it
+/// bounds how many partitions a granted envelope can feed.
+///
+/// The first governed memory charge happens later and elsewhere: when a query's
+/// shared-pool consumer grows through [`OracleMemoryRoot`].
 ///
 /// It is deliberately far smaller than [`ORACLE_PARTITION_MEMORY_BYTES`], which
 /// caps a whole query's memory envelope. Dividing a query envelope by the
@@ -88,11 +96,13 @@ const SCRATCH_CLEANUP_BACKOFFS: [Duration; 3] = [
 /// raw units    = min(memory units, CPU units)
 /// ```
 ///
-/// The memory divisor is [`ORACLE_PARTITION_WORKING_MEMORY_BYTES`] — what a slot
-/// unit actually *charges* — not [`ORACLE_PARTITION_MEMORY_BYTES`], which is the
-/// ceiling a query may grow into. Dividing by the ceiling made concurrency a
-/// side effect of per-query generosity: raising the ceiling so one query could
-/// use more memory silently reduced how many queries the node would accept.
+/// The memory divisor is [`ORACLE_PARTITION_WORKING_MEMORY_BYTES`] — the working
+/// set one slot unit is sized for — not [`ORACLE_PARTITION_MEMORY_BYTES`], which
+/// is the ceiling a query may grow into. Dividing by the ceiling made
+/// concurrency a side effect of per-query generosity: raising the ceiling so one
+/// query could use more memory silently reduced how many queries the node would
+/// accept. Neither value is debited at admission; a slot unit is concurrency
+/// ownership, and governed memory is charged only as a query's pools grow.
 ///
 /// The CPU term restores the documented two-units-per-core default. A slot unit
 /// is an admission unit rather than a thread, but a pod that admits far more
@@ -1720,7 +1730,11 @@ pub struct ResourceAttributionSnapshot {
 pub struct OracleResourceRequest {
     /// Scheduling class whose protected-capacity rules apply to the query.
     pub query_class: QueryClass,
-    /// Exact positive root memory demand.
+    /// Exact positive class memory quantum, validated but never debited.
+    ///
+    /// Admission checks this against the class definition so a hand-built
+    /// request cannot disagree with it; it reserves no bytes. Governed memory is
+    /// charged only when the query's shared-pool consumers grow.
     pub memory_bytes: usize,
     /// Exact positive root scratch demand.
     pub scratch_bytes: u64,
@@ -1738,11 +1752,12 @@ impl OracleResourceRequest {
     /// and a later change to the charge cannot silently disagree — the request is
     /// simply refused. Every production caller builds its request here.
     ///
-    /// The memory term is the *admission charge*, not the ceiling the query may
-    /// reach; that ceiling is derived per query at admission and is generally
-    /// much larger. Scratch stays sized to the grant cap because it is genuinely
-    /// consumed disk rather than a ceiling, so a query that spills must have
-    /// reserved the space it spills into.
+    /// The memory term is a validated sizing quantum, not a reservation: no
+    /// admission path debits it, and the ceiling the query may actually grow
+    /// into is derived per query and is generally much larger. Scratch is the
+    /// one term that is genuinely leased here, because spill is consumed disk
+    /// rather than a ceiling, so a query that spills must already own the space
+    /// it spills into.
     #[must_use]
     pub fn for_class(query_class: QueryClass, local_ratio: f64) -> Self {
         let slot_units = match query_class {
@@ -5757,8 +5772,8 @@ mod tests {
 
     /// Fills the Oracle budget with workers, leaving room for `spare` more.
     ///
-    /// Admission charges one slot-unit quantum rather than a whole grant cap, so
-    /// a fixture box that once held exactly one worker now holds several. Tests
+    /// Admission charges slot units rather than a whole memory grant cap, so a
+    /// fixture box that once held exactly one worker now holds several. Tests
     /// that need a refusal — races for a last slot, refusal telemetry, floor
     /// protection — must drive the budget to that edge instead of assuming it.
     /// The returned owners must stay alive for the budget to remain full.

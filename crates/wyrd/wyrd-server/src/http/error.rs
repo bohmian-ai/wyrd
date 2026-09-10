@@ -542,7 +542,7 @@ mod error_mapper_tests {
     fn permission_deny_reason_maps_to_rbac_problem_details() {
         let principal = PrincipalId::new(uuid::Uuid::now_v7());
         let error = permission_deny_reason_to_wyrd(PermissionDenyReason::Rbac {
-            required: Permission::card_write(),
+            required: Box::new(Permission::card_write()),
             principal,
         });
         let problem = error.as_problem_json();

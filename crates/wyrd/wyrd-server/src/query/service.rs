@@ -70,7 +70,7 @@ async fn admit_query_capability(
     }
     let required = Permission::bifrost_query_read();
     let reason = PermissionDenyReason::Rbac {
-        required: required.clone(),
+        required: Box::new(required.clone()),
         principal: caller.principal.id,
     };
     record_denial(state, caller, &required, operation, resource, reason).await

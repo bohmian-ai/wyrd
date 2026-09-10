@@ -151,6 +151,79 @@ impl NativeWyrdTestServer {
             .map_err(|error| napi::Error::from_reason(error.to_string()))
     }
 
+    /// Provision one canonical built-in table for the fixture tenant.
+    ///
+    /// A canonical signal ledger is server-owned, so a journey cannot register
+    /// it through the public write path. This is the harness door that makes
+    /// `vala.traces.spans`, `vala.logs.records` and `vala.metrics.points`
+    /// exist before a public Arrow write reaches them.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error when the harness is closed or provisioning fails.
+    #[napi]
+    pub fn ensure_builtin_table(&self, namespace: String, name: String) -> napi::Result<()> {
+        let guard = self
+            .server
+            .lock()
+            .map_err(|_| napi::Error::from_reason("test server lock poisoned".to_owned()))?;
+        let server = guard
+            .as_ref()
+            .ok_or_else(|| napi::Error::from_reason("test server is shut down".to_owned()))?;
+        wyrd_runtime::runtime()
+            .block_on(server.ensure_builtin_table_for_test(
+                server.data_tenant_id(),
+                &namespace,
+                &name,
+            ))
+            .map_err(|error| napi::Error::from_reason(error.to_string()))
+    }
+
+    /// Mint an API key for a principal holding exactly `permissions`.
+    ///
+    /// `permissions` are `resource:action` strings. This is the door a journey
+    /// uses to prove an access gate from the caller's side: it seeds one role
+    /// carrying only those grants and bootstraps a service onto it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a napi error for an unparsable permission, or when the harness
+    /// is closed or role seeding or bootstrapping fails.
+    #[napi]
+    pub fn scoped_api_key(&self, role: String, permissions: Vec<String>) -> napi::Result<String> {
+        let guard = self
+            .server
+            .lock()
+            .map_err(|_| napi::Error::from_reason("test server lock poisoned".to_owned()))?;
+        let server = guard
+            .as_ref()
+            .ok_or_else(|| napi::Error::from_reason("test server is shut down".to_owned()))?;
+        let parsed = permissions
+            .iter()
+            .map(|value| {
+                value.parse::<wyrd_runtime::Permission>().map_err(|_| {
+                    napi::Error::from_reason(format!(
+                        "`{value}` is not a resource:action permission"
+                    ))
+                })
+            })
+            .collect::<napi::Result<Vec<_>>>()?;
+        let bootstrap = wyrd_runtime::runtime()
+            .block_on(async {
+                server.seed_role(&role, &parsed).await?;
+                server.bootstrap_service(&role, &[role.as_str()]).await
+            })
+            .map_err(|error| napi::Error::from_reason(error.to_string()))?;
+        match bootstrap {
+            Bootstrap::Machine { api_key, .. } => {
+                Ok(secrecy::ExposeSecret::expose_secret(&api_key).to_owned())
+            }
+            Bootstrap::User { .. } => Err(napi::Error::from_reason(
+                "expected a machine bootstrap".to_owned(),
+            )),
+        }
+    }
+
     /// Mint an authenticated token without `bifrost_query:read`.
     ///
     /// # Errors

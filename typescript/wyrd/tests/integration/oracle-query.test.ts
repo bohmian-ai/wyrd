@@ -1,8 +1,25 @@
-import { tableFromIPC } from "apache-arrow";
+import {
+  Data,
+  DataType,
+  Field,
+  Int as Int_,
+  RecordBatch,
+  Schema,
+  Struct,
+  Type,
+  makeBuilder,
+  makeData,
+  tableFromIPC,
+} from "apache-arrow";
 import { startTestServer } from "@wyrd/testing";
 import { describe, expect, it } from "vitest";
 
-import { Bifrost, IncompleteQueryStreamError, WyrdError } from "@wyrd/sdk";
+import {
+  Bifrost,
+  IncompleteQueryStreamError,
+  TableConfig,
+  WyrdError,
+} from "@wyrd/sdk";
 
 describe("Oracle query journey", () => {
   it("uses the public SDK against an in-process Wyrd server", async () => {
@@ -159,4 +176,398 @@ describe("Oracle query journey", () => {
       server.shutdown();
     }
   });
+});
+
+/** Hex-decoded canonical trace and span identifiers the fixture writes. */
+const TRACE_ID = Uint8Array.from(
+  Buffer.from("c1a0112233445566778899aabbccddee", "hex"),
+);
+const PARENT_SPAN_ID = Uint8Array.from(Buffer.from("a1a2a3a4a5a6a7a8", "hex"));
+const CHILD_SPAN_ID = Uint8Array.from(Buffer.from("b1b2b3b4b5b6b7b8", "hex"));
+const MODEL = "claude-opus-5";
+const INPUT_TOKENS = 1280n;
+const OUTPUT_TOKENS = 320n;
+const INPUT_MESSAGES =
+  '[{"role":"user","parts":[{"type":"text","content":"summarize the incident"}]}]';
+const OUTPUT_MESSAGES =
+  '[{"role":"assistant","parts":[{"type":"text","content":"the writer stalled"}]}]';
+const LOG_BODY = "tool call exhausted its retry budget";
+const COUNTER_VALUE = 7n;
+const GAUGE_VALUE = 0.75;
+const HISTOGRAM_COUNT = 4n;
+const HISTOGRAM_SUM = 12.5;
+const SERVICE = "wyrd.fixture.service";
+
+/** Concatenate protobuf fragments into one message body. */
+function concat(...parts: Uint8Array[]): Uint8Array {
+  const total = parts.reduce((sum, part) => sum + part.length, 0);
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const part of parts) {
+    out.set(part, offset);
+    offset += part.length;
+  }
+  return out;
+}
+
+/** Encode one base-128 varint, the protobuf tag and length primitive. */
+function varint(value: number): Uint8Array {
+  const bytes: number[] = [];
+  let rest = value;
+  do {
+    const byte = rest & 0x7f;
+    rest >>>= 7;
+    bytes.push(rest > 0 ? byte | 0x80 : byte);
+  } while (rest > 0);
+  return Uint8Array.from(bytes);
+}
+
+/** Encode one length-delimited protobuf field. */
+function delimited(number: number, payload: Uint8Array): Uint8Array {
+  return concat(varint((number << 3) | 2), varint(payload.length), payload);
+}
+
+/** Encode one string `AnyValue`, which a log body carries verbatim. */
+function anyValue(text: string): Uint8Array {
+  return delimited(1, new TextEncoder().encode(text));
+}
+
+/**
+ * Encode string attributes as the canonical `KeyValueList` bytes.
+ *
+ * Ingress decodes and re-encodes every canonical binary payload, so a fixture
+ * cannot substitute a JSON blob here.
+ */
+function attributes(pairs: Record<string, string>): Uint8Array {
+  return concat(
+    ...Object.entries(pairs).map(([key, value]) =>
+      delimited(
+        1,
+        concat(
+          delimited(1, new TextEncoder().encode(key)),
+          delimited(2, anyValue(value)),
+        ),
+      ),
+    ),
+  );
+}
+
+/** The value an unnamed column takes, decided by its described type. */
+function defaultFor(field: Field): unknown {
+  if (field.nullable) {
+    return null;
+  }
+  switch (field.typeId) {
+    case Type.Utf8:
+      return "";
+    case Type.Bool:
+      return false;
+    case Type.Float:
+      return 0;
+    case Type.Int:
+      return (field.type as Int_).bitWidth === 64 ? 0n : 0;
+    case Type.Binary:
+    case Type.FixedSizeBinary:
+      return new Uint8Array(0);
+    case Type.List:
+      return [];
+    default:
+      throw new Error(`column ${field.name} has unsupported type ${field.type}`);
+  }
+}
+
+/**
+ * Build one described column across every fixture row.
+ *
+ * A nested struct is the one shape a builder cannot express here: the ledger
+ * declares its children non-nullable, so an absent struct is a null parent
+ * over present children rather than nulls all the way down.
+ */
+function columnData(field: Field, rows: Row[]): Data {
+  if (DataType.isStruct(field.type)) {
+    return makeData({
+      type: field.type,
+      length: rows.length,
+      nullCount: rows.length,
+      nullBitmap: new Uint8Array(Math.ceil(rows.length / 8) + 8),
+      children: field.type.children.map((child) =>
+        columnData(child, rows.map(() => ({}))),
+      ),
+    });
+  }
+  const builder = makeBuilder({ type: field.type, nullValues: [null] });
+  for (const row of rows) {
+    builder.append(field.name in row ? row[field.name] : defaultFor(field));
+  }
+  builder.finish();
+  return builder.flush();
+}
+
+/** A fixture row naming only the columns its assertions depend on. */
+type Row = Record<string, unknown>;
+
+/**
+ * Build one Arrow batch over `schema` from rows that name only some columns.
+ *
+ * The schema is the server's own published description, so the fixture never
+ * restates a second copy of the canonical ledger.
+ */
+function batch(schema: Schema, rows: Row[]): RecordBatch {
+  return new RecordBatch(
+    schema,
+    makeData({
+      type: new Struct(schema.fields),
+      length: rows.length,
+      children: schema.fields.map((field) => columnData(field, rows)),
+    }),
+  );
+}
+
+/** The parent GenAI chat span and the failing tool span it made. */
+function spans(schema: Schema, scope: string, anchor: bigint): RecordBatch {
+  const envelope: Row = {
+    resource_present: true,
+    resource_attributes: attributes({ "service.name": SERVICE }),
+    scope_present: true,
+    scope_name: scope,
+    scope_version: "1.0.0",
+    service_name: SERVICE,
+    gen_ai_provider_name: "anthropic",
+    gen_ai_request_model: MODEL,
+    gen_ai_conversation_id: "conversation-fixture",
+    trace_id: TRACE_ID,
+    status_present: true,
+  };
+  return batch(schema, [
+    {
+      ...envelope,
+      span_id: PARENT_SPAN_ID,
+      name: "chat claude-opus-5",
+      kind: 3,
+      start_time_unix_nano: anchor,
+      end_time_unix_nano: anchor + 2_000_000n,
+      duration_nano: 2_000_000n,
+      status_code: 1,
+      status_message: "ok",
+      attributes: attributes({
+        "gen_ai.input.messages": INPUT_MESSAGES,
+        "gen_ai.output.messages": OUTPUT_MESSAGES,
+      }),
+      gen_ai_operation_name: "chat",
+      gen_ai_usage_input_tokens: INPUT_TOKENS,
+      gen_ai_usage_output_tokens: OUTPUT_TOKENS,
+    },
+    {
+      ...envelope,
+      span_id: CHILD_SPAN_ID,
+      parent_span_id: PARENT_SPAN_ID,
+      name: "execute_tool search",
+      kind: 1,
+      start_time_unix_nano: anchor + 100_000n,
+      end_time_unix_nano: anchor + 900_000n,
+      duration_nano: 800_000n,
+      status_code: 2,
+      status_message: LOG_BODY,
+      attributes: attributes({ "gen_ai.tool.name": "search" }),
+      gen_ai_operation_name: "execute_tool",
+      gen_ai_usage_input_tokens: 64n,
+      gen_ai_usage_output_tokens: 16n,
+    },
+  ]);
+}
+
+/** The error log correlated to the tool span that failed. */
+function logs(schema: Schema, scope: string, anchor: bigint): RecordBatch {
+  return batch(schema, [
+    {
+      time_unix_nano: anchor + 800_000n,
+      observed_time_unix_nano: anchor + 850_000n,
+      severity_number: 17,
+      severity_text: "ERROR",
+      event_name: "tool.retry.exhausted",
+      body: anyValue(LOG_BODY),
+      trace_id: TRACE_ID,
+      span_id: CHILD_SPAN_ID,
+      attributes: attributes({ "gen_ai.tool.name": "search" }),
+      resource_present: true,
+      resource_attributes: attributes({ "service.name": SERVICE }),
+      scope_present: true,
+      scope_name: scope,
+      scope_version: "1.0.0",
+    },
+  ]);
+}
+
+/** One counter, one gauge and one histogram point. */
+function points(schema: Schema, scope: string, anchor: bigint): RecordBatch {
+  const common = (name: string, kind: string): Row => ({
+    metric_name: name,
+    description: `fixture ${kind}`,
+    unit: "1",
+    metric_type: kind,
+    time_unix_nano: anchor,
+    start_time_unix_nano: anchor,
+    attributes: attributes({ "gen_ai.request.model": MODEL }),
+    resource_present: true,
+    resource_attributes: attributes({ "service.name": SERVICE }),
+    scope_present: true,
+    scope_name: scope,
+    scope_version: "1.0.0",
+  });
+  return batch(schema, [
+    {
+      ...common("wyrd.fixture.requests", "sum"),
+      int_value: COUNTER_VALUE,
+      aggregation_temporality: 2,
+      is_monotonic: true,
+    },
+    { ...common("wyrd.fixture.saturation", "gauge"), double_value: GAUGE_VALUE },
+    {
+      ...common("wyrd.fixture.latency", "histogram"),
+      aggregation_temporality: 2,
+      histogram_count: HISTOGRAM_COUNT,
+      histogram_sum: HISTOGRAM_SUM,
+      histogram_min: 1.0,
+      histogram_max: 6.0,
+    },
+  ]);
+}
+
+describe("Canonical signal journey", () => {
+  it("canonical signal Arrow write and SQL read round-trip", async () => {
+    const server = startTestServer();
+    try {
+      for (const [namespace, name] of [
+        ["traces", "spans"],
+        ["logs", "records"],
+        ["metrics", "points"],
+      ] as const) {
+        server.ensureBuiltinTable(namespace, name);
+      }
+      const transport = {
+        serverUrl: server.baseUrl,
+        credential: server.apiKey,
+        grpcUrl: server.grpcUrl,
+      };
+      const writer = await Bifrost.connect(transport);
+      const scope = `wyrd.ts.canonical.${Date.now()}`;
+      const anchor = 1_760_000_000_000_000_000n;
+
+      for (const [fqn, build] of [
+        ["vala.traces.spans", spans],
+        ["vala.logs.records", logs],
+        ["vala.metrics.points", points],
+      ] as const) {
+        const described = await TableConfig.describe(fqn, transport);
+        await writer.writeBatch(fqn, build(described.arrowSchema, scope, anchor));
+      }
+      server.flushBifrost();
+
+      const hierarchy = (
+        await writer.sql(
+          `SELECT name, gen_ai_operation_name, status_code, ` +
+            `CAST(CASE WHEN parent_span_id IS NULL THEN 1 ELSE 0 END AS BIGINT) AS is_root ` +
+            `FROM vala.traces.spans WHERE scope_name = '${scope}' ` +
+            `ORDER BY start_time_unix_nano`,
+        )
+      ).toArrow();
+      expect(
+        Array.from(hierarchy.getChild("gen_ai_operation_name")?.toArray() ?? []),
+      ).toEqual(["chat", "execute_tool"]);
+      expect(Array.from(hierarchy.getChild("is_root")?.toArray() ?? [])).toEqual([
+        1n,
+        0n,
+      ]);
+
+      const tokens = (
+        await writer.sql(
+          `SELECT CAST(SUM(gen_ai_usage_input_tokens) AS BIGINT) AS input_tokens, ` +
+            `CAST(SUM(gen_ai_usage_output_tokens) AS BIGINT) AS output_tokens, ` +
+            `CAST(COUNT(*) AS BIGINT) AS spans FROM vala.traces.spans ` +
+            `WHERE scope_name = '${scope}' AND gen_ai_request_model = '${MODEL}'`,
+        )
+      ).toArrow();
+      expect(tokens.get(0)?.toJSON()).toEqual({
+        input_tokens: INPUT_TOKENS + 64n,
+        output_tokens: OUTPUT_TOKENS + 16n,
+        spans: 2n,
+      });
+
+      const correlated = (
+        await writer.sql(
+          `SELECT l.severity_text, l.event_name, s.name AS span_name ` +
+            `FROM vala.logs.records l JOIN vala.traces.spans s ` +
+            `ON l.trace_id = s.trace_id AND l.span_id = s.span_id ` +
+            `WHERE l.scope_name = '${scope}'`,
+        )
+      ).toArrow();
+      expect(correlated.numRows).toBe(1);
+      expect(correlated.get(0)?.toJSON()).toEqual({
+        severity_text: "ERROR",
+        event_name: "tool.retry.exhausted",
+        span_name: "execute_tool search",
+      });
+
+      const metrics = (
+        await writer.sql(
+          `SELECT metric_type, ` +
+            `CAST(SUM(COALESCE(int_value, 0)) AS BIGINT) AS ints, ` +
+            `CAST(SUM(COALESCE(double_value, 0.0)) AS DOUBLE) AS doubles, ` +
+            `CAST(SUM(COALESCE(histogram_count, 0)) AS BIGINT) AS observations ` +
+            `FROM vala.metrics.points WHERE scope_name = '${scope}' ` +
+            `GROUP BY metric_type ORDER BY metric_type`,
+        )
+      ).toArrow();
+      expect(metrics.toArray().map((row) => row.toJSON())).toEqual([
+        { metric_type: "gauge", ints: 0n, doubles: GAUGE_VALUE, observations: 0n },
+        {
+          metric_type: "histogram",
+          ints: 0n,
+          doubles: 0,
+          observations: HISTOGRAM_COUNT,
+        },
+        {
+          metric_type: "sum",
+          ints: COUNTER_VALUE,
+          doubles: 0,
+          observations: 0n,
+        },
+      ]);
+      expect(HISTOGRAM_SUM).toBe(12.5);
+
+      const metadataOnly = await Bifrost.connect({
+        ...transport,
+        credential: server.scopedApiKey("ts_canonical_metadata", [
+          "bifrost_query:read",
+        ]),
+      });
+      await expect(
+        metadataOnly.sql(
+          `SELECT attributes FROM vala.traces.spans WHERE scope_name = '${scope}'`,
+        ),
+      ).rejects.toMatchObject({ code: "WYRD_VALA_403_PAYLOAD_FORBIDDEN" });
+
+      const payloadReader = await Bifrost.connect({
+        ...transport,
+        credential: server.scopedApiKey("ts_canonical_payload", [
+          "bifrost_query:read",
+          "bifrost_trace_payload:read",
+        ]),
+      });
+      const messages = (
+        await payloadReader.sql(
+          `SELECT attributes FROM vala.traces.spans ` +
+            `WHERE scope_name = '${scope}' AND parent_span_id IS NULL`,
+        )
+      ).toArrow();
+      expect(messages.numRows).toBe(1);
+      const payload = new TextDecoder().decode(
+        messages.getChild("attributes")?.get(0) as Uint8Array,
+      );
+      expect(payload).toContain(INPUT_MESSAGES);
+      expect(payload).toContain(OUTPUT_MESSAGES);
+    } finally {
+      server.shutdown();
+    }
+  }, 60_000);
 });

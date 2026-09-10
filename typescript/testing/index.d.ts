@@ -55,6 +55,32 @@ export declare class NativeWyrdTestServer {
    */
   flushBifrost(): void
   /**
+   * Provision one canonical built-in table for the fixture tenant.
+   *
+   * A canonical signal ledger is server-owned, so a journey cannot register
+   * it through the public write path. This is the harness door that makes
+   * `vala.traces.spans`, `vala.logs.records` and `vala.metrics.points`
+   * exist before a public Arrow write reaches them.
+   *
+   * # Errors
+   *
+   * Returns a napi error when the harness is closed or provisioning fails.
+   */
+  ensureBuiltinTable(namespace: string, name: string): void
+  /**
+   * Mint an API key for a principal holding exactly `permissions`.
+   *
+   * `permissions` are `resource:action` strings. This is the door a journey
+   * uses to prove an access gate from the caller's side: it seeds one role
+   * carrying only those grants and bootstraps a service onto it.
+   *
+   * # Errors
+   *
+   * Returns a napi error for an unparsable permission, or when the harness
+   * is closed or role seeding or bootstrapping fails.
+   */
+  scopedApiKey(role: string, permissions: Array<string>): string
+  /**
    * Mint an authenticated token without `bifrost_query:read`.
    *
    * # Errors

@@ -1,6 +1,6 @@
 ---
 id: SPEC-bifrost-canonical-otel-signals
-revision: 10
+revision: 11
 status: approved
 ---
 
@@ -281,10 +281,10 @@ dropped-attribute count.
 
 #### REQ-009 — Trace readback
 
-The existing typed trace-detail surface shall read one canonical trace cut and
-return its spans with complete events, links, status, resource, scope, and
-attribute content. It shall not return literal empty child collections as a
-stub or reinterpret incomplete storage as "none recorded."
+Canonical SQL shall read one trace cut from `vala.traces.spans` with complete
+events, links, status, resource, scope, and attribute content. It shall not
+return literal empty child collections as a stub or reinterpret incomplete
+storage as "none recorded."
 
 ### Canonical logs and OTel events
 
@@ -540,9 +540,9 @@ Postgres or a new cache to the ingest hot path.
   durable boundary, and read equivalent values after flush and publication.
 - An authorized canonical Arrow client can write the equivalent logical rows
   and observe the same query results and durability behavior.
-- Trace detail returns actual nested events and links with their parent spans.
-- GenAI search continues through its existing public typed surface but reads
-  canonical spans and does not require duplicated payload storage.
+- Canonical SQL returns actual nested events and links with their parent spans.
+- GenAI search uses promoted-column predicates through canonical SQL, reads
+  canonical spans, and does not require duplicated payload storage.
 - A caller without sensitive-payload permission can query permitted metadata
   but cannot receive protected bodies, attributes, messages, instructions, or
   tool content.
@@ -748,8 +748,8 @@ this specification:
   owners, and exact named-test commands; new test owners require the evidence
   gap fixed by AC-011;
   and
-- the integration order with the active Forge/Oracle merge change so neither
-  change reintroduces deleted table or mapping authority.
+- reconciliation with the integrated Forge/Oracle owners so the journeys do
+  not reintroduce deleted table or mapping authority.
 
 These decisions may not add another durable signal copy, table-specific Scribe
 mapping, positional schema authority, new harness, or unresolved product
@@ -757,6 +757,11 @@ choice.
 
 ## Revision history
 
+- Revision 11 (2026-09-10): reconcile the remaining trace and GenAI readback
+  prose with revision 10's canonical-SQL-only contract, align the Bifrost
+  authority, and treat the integrated Forge/Oracle change as the implementation
+  baseline. This revision also permits the focused OTLP journey target to be
+  earned back with its first real tests; empty scaffolding remains prohibited.
 - Revision 10 (2026-09-09): retire the typed observation read surface in favor
   of one canonical SQL read path, replacing REQ-017's typed `QueryGenAi`
   requirement with the single-read-path rule and adding REQ-023 to remove the

@@ -1,13 +1,13 @@
 ---
 id: BIFROST-OTEL-T04
-title: Prove canonical signals through every existing public journey owner
+title: Prove canonical signals through every public journey owner
 kind: implementation
 mode: DECOMPOSE
 status: proposed
 spec: SPEC-bifrost-canonical-otel-signals
-spec_revision: 7
+spec_revision: 11
 depends_on: [BIFROST-OTEL-T02, BIFROST-OTEL-T03, BIFROST-OTEL-T03A]
-requirements: [REQ-002, REQ-004, REQ-005, REQ-006, REQ-007, REQ-008, REQ-009, REQ-010, REQ-011, REQ-012, REQ-013, REQ-014, REQ-015, REQ-016, REQ-017, REQ-018, REQ-019, REQ-020, REQ-021]
+requirements: [REQ-002, REQ-004, REQ-005, REQ-006, REQ-007, REQ-008, REQ-009, REQ-010, REQ-011, REQ-012, REQ-013, REQ-014, REQ-015, REQ-016, REQ-017, REQ-018, REQ-019, REQ-020, REQ-021, REQ-023]
 acceptance: [AC-001, AC-002, AC-003, AC-004, AC-005, AC-006, AC-007, AC-008, AC-009, AC-010, AC-011]
 ---
 
@@ -27,11 +27,12 @@ Required execution skill: `$wyrd-implement`.
 
 ## Owners, scope, consumers, and prohibited changes
 
-- Populate the existing empty `wyrd-testing` `otlp` files. Add plain module
-  declarations for `logs_export`, `metrics_export`, `mixed_batch`, `negative`,
-  `support`, `trace_export`, and `trace_export_http` to its existing empty
-  `main.rs`; do not create another target or topology fixture. Each test module
-  uses the documented inner `mod pg_tests` organization.
+- Earn back the focused `wyrd-testing` `otlp` target and
+  `test:bifrost:journey:otlp` lane with their first real tests. The target owns
+  the cohesive public OTLP trace, log, metric, mixed-batch, and negative
+  protocol journeys across HTTP protobuf, HTTP JSON, and gRPC; it is not empty
+  scaffolding. Reuse the ordinary capability-directory layout and documented
+  inner `mod pg_tests` organization; do not create another topology fixture.
 - Reuse `WyrdTestServer`, current Postgres lifecycle, public SDKs, Scribe flush,
   Oracle query, publication/restart controls, auth fixtures, and telemetry
   checkpoints.
@@ -46,22 +47,23 @@ Required execution skill: `$wyrd-implement`.
   process, or second server fixture.
 - One canonical expected dataset in OTLP `support.rs` supplies all signal
   values. Matching Arrow batches are built from the public describe response
-  and T03's Rust/Python/TypeScript `writable_schema` helpers, then sent through
+  and T03A's Rust/Python/TypeScript `writable_schema` helpers, then sent through
   existing insert APIs. Expected DTOs are literal assertions over those fixture
   values, not another projector. Tests must not contain a second semantic
   mapper or column-order oracle.
 - Do not weaken test sizes, durability assertions, permissions, terminal
   frames, timeouts, topology, or ignored-test policy to make the lane pass.
 
-## Fixed integration order
+## Integrated baseline
 
-Complete and integrate BIFROST-OTEL-T01 through T04 on `oracle-distributed`
-before the separate draft `bifrost-forge-oracle-integration` change is merged.
-That later change must rebase/merge onto this canonical target and treat the
-three-table registry and signal-neutral Scribe boundary as retained authority;
-it may not restore deleted tables, direct projectors, or old query DTOs. This
-packet does not depend on the unapproved draft change and does not edit its
-spec/task files.
+The Forge/Oracle integration is already present on `oracle-distributed` and is
+the baseline for this task. Extend its current Forge publication, Scribe, and
+distributed Oracle owners without restoring deleted tables, direct projectors,
+or retired query DTOs. This packet does not edit the separate change's
+specification or task files.
+
+BIFROST-OTEL-T02, BIFROST-OTEL-T03, and BIFROST-OTEL-T03A are accepted
+prerequisites. Their historical review packets do not block this task.
 
 ## Ordered implementation scenarios
 
@@ -83,7 +85,7 @@ Each uses the same support dataset, real server and public reads; trace asserts
 ordered events/links and structured GenAI content, log asserts authorized and
 unauthorized payload behavior, and metrics asserts integer/double distinction,
 all kind-specific values, metadata and exemplars. They fail because the files
-are empty and storage is incomplete.
+do not yet exist and canonical signal storage is incomplete.
 
 ```bash
 mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-testing --test otlp -P journey -E 'test(=trace_export::pg_tests::otlp_grpc_maximal_trace_round_trips_every_field)' --run-ignored=all"
@@ -274,14 +276,14 @@ and canonical Arrow journeys remain separate owners.
 ### Scenario 3 — OTLP and Arrow produce equivalent accepted rows
 
 **Behavior.** Equivalent logical records written through OTLP and public Arrow
-produce equal user columns and typed results, excluding trusted batch/request/
-ingest identities. Maps REQ-004, INV-003, AC-002, AC-008.
+produce equal user columns and canonical SQL results, excluding trusted batch/
+request/ingest identities. Maps REQ-004, INV-003, AC-002, AC-008.
 
 **RED.** Add
 `mixed_batch::pg_tests::otlp_and_canonical_arrow_share_user_rows_and_public_results` to
 the current OTLP binary, using the public Rust SDK Arrow writer for the derived
 canonical batches. Query both disjoint batch IDs after publication and compare
-every user field by stable field name/ID plus typed trace/log/metric results.
+every user field by stable field name/ID through canonical SQL.
 
 ```bash
 mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-testing --test otlp -P journey -E 'test(=mixed_batch::pg_tests::otlp_and_canonical_arrow_share_user_rows_and_public_results)' --run-ignored=all"
@@ -322,29 +324,29 @@ or durability bypass.
 
 ### Scenario 5 — Existing language and agent surfaces close their own boundary
 
-**Behavior.** Canonical Arrow write and typed trace/GenAI reads work through
-the first-class SDK projections and MCP with the same payload gates. Maps
-REQ-004, REQ-009, REQ-017, INV-006–INV-007, AC-002, AC-005, AC-011.
+**Behavior.** Canonical Arrow writes and canonical SQL trace/GenAI reads work
+through the first-class SDK projections and MCP with the same payload gates. Maps
+REQ-004, REQ-009, REQ-017, REQ-023, INV-006–INV-007, AC-002, AC-005, AC-011.
 
 **RED.** Extend existing owners with:
 
-- Rust `pg_tests::canonical_signal_arrow_write_and_typed_reads_round_trip`
-- Python `test_canonical_signal_arrow_write_and_typed_reads_round_trip`
-- TypeScript `canonical signal Arrow write and typed reads round-trip`
-- MCP `query::pg_tests::agent_reads_canonical_trace_and_genai_without_stale_tables`
+- Rust `pg_tests::canonical_signal_arrow_write_and_sql_read_round_trip`
+- Python `test_canonical_signal_arrow_write_and_sql_read_round_trip`
+- TypeScript `canonical signal Arrow write and SQL read round-trip`
+- MCP `query::pg_tests::agent_reads_canonical_trace_and_genai_through_sql`
 
 Each asserts its native public values and unauthorized payload behavior; it
 does not repeat every metric kind already proved in Scenario 1.
 
 ```bash
-mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p vala-sdk --test pg_bifrost_e2e -P journey -E 'test(=pg_tests::canonical_signal_arrow_write_and_typed_reads_round_trip)' --run-ignored=all"
-mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && cd python/py-wyrd && mise run py:setup:testing && uv run pytest -q -m integration tests/integration/test_bifrost_query.py::test_canonical_signal_arrow_write_and_typed_reads_round_trip"
-mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && cd typescript/wyrd && mise run ts:build && mise run ts:build:testing && pnpm exec vitest run tests/integration/oracle-query.test.ts -t 'canonical signal Arrow write and typed reads round-trip'"
-mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-mcp --test mcp -P journey -E 'test(=query::pg_tests::agent_reads_canonical_trace_and_genai_without_stale_tables)' --run-ignored=all"
+mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p vala-sdk --test pg_bifrost_e2e -P journey -E 'test(=pg_tests::canonical_signal_arrow_write_and_sql_read_round_trip)' --run-ignored=all"
+mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && cd python/py-wyrd && mise run py:setup:testing && uv run pytest -q -m integration tests/integration/test_bifrost_query.py::test_canonical_signal_arrow_write_and_sql_read_round_trip"
+mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:all:inner && cd typescript/wyrd && mise run ts:build && mise run ts:build:testing && pnpm exec vitest run tests/integration/oracle-query.test.ts -t 'canonical signal Arrow write and SQL read round-trip'"
+mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-mcp --test mcp -P journey -E 'test(=query::pg_tests::agent_reads_canonical_trace_and_genai_through_sql)' --run-ignored=all"
 ```
 
 **GREEN.** Update the existing language/MCP conversions and fixtures only where
-T03's generated/public contract does not already close them.
+T03A's generated/public contract does not already close them.
 
 **REFACTOR.** Language runtimes test their own lifetime; no Python/Node runtime
 is embedded in Rust and no SDK reimplements server mapping.
@@ -377,7 +379,8 @@ fidelity remains in Scenario 1.
 
 ## Expected write set and consumer closure
 
-- Existing empty `crates/wyrd/wyrd-testing/tests/bifrost/otlp/*.rs` files
+- Restored `wyrd-testing` OTLP capability target, real journey modules, owning
+  lane, and test inventory documentation
 - Existing `vala-sdk` `pg_bifrost_e2e` target
 - Existing Python and TypeScript Bifrost integration files
 - Existing Python `WyrdTestServer` binding, Python development dependency
@@ -386,14 +389,15 @@ fidelity remains in Scenario 1.
 - Existing Scribe/Oracle journey fixtures and only production owners found
   defective by these RED proofs
 
-No new Rust target, harness, topology abstraction, production dependency,
-migration, branch controller, collector process, telemetry wrapper, or
-duplicated exhaustive dataset belongs here.
+Other than the earned OTLP journey target and lane, no new Rust target, harness,
+topology abstraction, production dependency, migration, branch controller,
+collector process, telemetry wrapper, or duplicated exhaustive dataset belongs
+here.
 
 ## Complete verification and evidence
 
 Run every named scenario command, then the canonical lanes required by revision
-7:
+11:
 
 ```bash
 mise run test:bifrost:journey:otlp
@@ -416,13 +420,12 @@ the final aggregate gates.
 
 ## Material stop conditions
 
-- Any acceptance obligation requires a new test target or topology rather than
-  the declared existing owners.
+- Any acceptance obligation requires another new test target or topology rather
+  than the earned OTLP target and declared existing owners.
 - A public language cannot construct the canonical Arrow schema from the
   generated/table-owned contract without copying server semantics.
-- The separate Forge/Oracle integration lands first and restores or materially
-  changes a shared table/Scribe/query owner; re-run `$wyrd-plan` reconciliation
-  before implementation rather than merging both designs ad hoc.
+- A later change materially alters the reconciled Forge, Scribe, or Oracle
+  owners before this task begins.
 - A required failure cannot be induced through an existing production fault
   seam without weakening or adding test-only durable behavior.
 

@@ -686,24 +686,23 @@ The surface includes:
   is the closed `AppendDurability::Acknowledged` value; the synchronous append
   response never reports staged, published, promoted, or rewritten state;
 - terminal-safe query streaming at `POST /v1/query`;
-- typed Vala observation queries with mandatory bounded time windows and cursor
-  pagination;
+- canonical SQL observation reads through the ordinary Bifrost query contract;
 - gRPC ingestion through `wyrd.v1.BifrostIngestService`;
 - gRPC query projection through `wyrd.v1.BifrostQueryService`;
 - the `wyrd.bifrost` Python projection and matching TypeScript SDK;
 - agent-facing read and write operations governed by explicit permissions.
 
-Typed observation queries cover `vala.traces`, `vala.metrics`, `vala.logs`,
-`vala.eval`, `vala.drift`, `vala.dev`, and `vala.system`. The
-corresponding physical tables remain tenant-qualified Bifrost tables; the
-namespace does not create another storage or authorization model.
+Observation namespaces such as `vala.traces`, `vala.metrics`, `vala.logs`,
+`vala.eval`, `vala.drift`, `vala.dev`, and `vala.system` remain
+tenant-qualified Bifrost tables. Canonical SQL is their only read contract;
+the namespace does not create another storage or authorization model.
 
 Permissions are scoped through `BifrostTable`, `BifrostRecord`, and
 `BifrostQuery`. Generic writes cannot target reserved or system-managed tables.
 Sensitive trace, log, GenAI, and agent-trace payload columns require their
 respective `BifrostTracePayload`, `BifrostLogPayload`,
 `BifrostGenAiPayload`, or `BifrostAgentTracePayload` read permission through
-typed and generic SQL paths alike.
+the canonical SQL path.
 
 There is no `WarehouseCard`, `wyrd.warehouse` compatibility surface,
 asynchronous query-job API, result polling/redirect protocol, or client-selected

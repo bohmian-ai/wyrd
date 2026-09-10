@@ -31,7 +31,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 use vala_sql::ValaPostgres;
-use wyrd_runtime::{DelegationStep, Principal};
+use wyrd_runtime::{DelegationStep, Permission, Principal};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::BifrostError;
@@ -4030,7 +4030,7 @@ impl Oracle {
         if self.take_analytical_plan_failure() {
             return Err(BifrostError::QueryExecutionFailed);
         }
-        let root = Self::plan_physical(&planning, sql)
+        let root = Self::plan_physical(&planning, sql, context, cuts)
             .await
             .map_err(|OracleExecutionError::Public(error)| error)?;
         Ok(RetainedPhysicalPlan {
@@ -4049,13 +4049,24 @@ impl Oracle {
     async fn plan_physical(
         session: &SessionContext,
         sql: &str,
+        context: &AuthorizedQueryContext,
+        cuts: &[PinnedSealedTable],
     ) -> Result<Arc<dyn ExecutionPlan>, OracleExecutionError> {
         let frame = session
             .sql(sql)
             .await
             .map_err(|error| map_query_planning_error(&error))?;
-        frame
-            .create_physical_plan()
+        // Optimized rather than the planner's raw output: projection pushdown
+        // is what turns `SELECT *` and `SELECT body AS b` alike into the exact
+        // set of columns this query will read. The raw scan carries no
+        // projection at all, so gating on it would refuse a metadata-only read.
+        let plan = frame
+            .into_optimized_plan()
+            .map_err(|error| map_query_planning_error(&error))?;
+        authorize_payload_projection(context, cuts, &plan)?;
+        session
+            .state()
+            .create_physical_plan(&plan)
             .await
             .map_err(|error| map_query_planning_error(&error))
             .map_err(OracleExecutionError::from)
@@ -4711,6 +4722,117 @@ fn plan_read_decision(
         retry_ordinal: 0,
         deadline_ms,
         delegation_chain: wyrd_runtime::audit_delegation_chain(&context.delegation_chain),
+    })
+}
+
+/// Refuses a plan that would read a sensitive payload column the caller lacks.
+///
+/// Enforced on the optimized logical plan, before any physical plan exists and
+/// therefore before any row can be read, so the caller is told the projection
+/// is forbidden rather than handed an open stream that later fails or, worse,
+/// a silently narrowed result they could mistake for "nothing was recorded".
+///
+/// Only the scanned tables named by `cuts` are consulted: those are the exact
+/// bindings this query pinned, so an alias, a subquery, or a join cannot
+/// smuggle a protected column past the check by renaming it downstream.
+///
+/// # Errors
+///
+/// Returns [`BifrostError::PayloadForbidden`] when the plan scans a canonical
+/// sensitive column and the principal's effective permissions do not cover
+/// that table's payload read permission.
+fn authorize_payload_projection(
+    context: &AuthorizedQueryContext,
+    cuts: &[PinnedSealedTable],
+    plan: &datafusion::logical_expr::LogicalPlan,
+) -> Result<(), BifrostError> {
+    let mut protected: Vec<(String, &'static [&'static str], Permission)> = Vec::new();
+    for cut in cuts {
+        let table_ref = &cut.binding.table_ref;
+        let Some(permission) = payload_permission(table_ref) else {
+            continue;
+        };
+        let Some(definition) = table_ref
+            .namespace
+            .as_str()
+            .strip_prefix("vala.")
+            .and_then(|namespace| crate::tables::builtin_table(namespace, &table_ref.name))
+        else {
+            continue;
+        };
+        if definition.sensitive_payload_columns.is_empty() {
+            continue;
+        }
+        protected.push((
+            table_ref.fqn(),
+            definition.sensitive_payload_columns,
+            permission,
+        ));
+    }
+    if protected.is_empty() {
+        return Ok(());
+    }
+    refuse_protected_scan(context, &protected, plan)
+}
+
+/// Walks one optimized plan and refuses the first unauthorized protected scan.
+///
+/// # Errors
+///
+/// Returns [`BifrostError::PayloadForbidden`] for the first table scan that
+/// projects a protected column without the matching payload permission.
+fn refuse_protected_scan(
+    context: &AuthorizedQueryContext,
+    protected: &[(String, &'static [&'static str], Permission)],
+    plan: &datafusion::logical_expr::LogicalPlan,
+) -> Result<(), BifrostError> {
+    if let datafusion::logical_expr::LogicalPlan::TableScan(scan) = plan {
+        let scanned = scan.table_name.to_string();
+        for (table, columns, permission) in protected {
+            // The same provider is registered both as `vala.<schema>.<name>`
+            // and as one flat quoted alias, so a scan is matched on either the
+            // qualified path or the alias rather than on one spelling.
+            let matches = scanned == *table
+                || scanned.ends_with(&format!(
+                    ".{}",
+                    table.rsplit('.').next().unwrap_or(table.as_str())
+                ));
+            if !matches {
+                continue;
+            }
+            let reads_protected = scan
+                .projected_schema
+                .fields()
+                .iter()
+                .any(|field| columns.contains(&field.name().as_str()));
+            if reads_protected && !context.principal.effective_permissions.contains(permission) {
+                return Err(BifrostError::PayloadForbidden);
+            }
+        }
+    }
+    for input in plan.inputs() {
+        refuse_protected_scan(context, protected, input)?;
+    }
+    Ok(())
+}
+
+/// Maps one canonical table to the payload permission its sensitive columns need.
+///
+/// The four permissions the Bifrost doctrine defines are trace, log, `GenAI` and
+/// agent-trace payload. `vala.metrics.points` declares sensitive columns but
+/// the doctrine names no metric payload permission, so it is deliberately not
+/// gated here: inventing a fifth permission would be a contract change rather
+/// than an implementation decision.
+fn payload_permission(table: &crate::catalog::TableRef) -> Option<Permission> {
+    let resource = match (table.namespace.as_str(), table.name.as_str()) {
+        ("vala.traces", "spans") => wyrd_runtime::Resource::BifrostTracePayload,
+        ("vala.logs", "records") => wyrd_runtime::Resource::BifrostLogPayload,
+        ("vala.dev", "agent_traces") => wyrd_runtime::Resource::BifrostAgentTracePayload,
+        _ => return None,
+    };
+    Some(Permission {
+        resource,
+        action: wyrd_runtime::Action::Read,
     })
 }
 

@@ -227,6 +227,7 @@ fn bifrost_error_from_code(
         }
         "WYRD_VALA_403_QUERY_PEER_SECURITY" => BifrostError::QueryPeerSecurity,
         "WYRD_VALA_403_QUERY_FORBIDDEN" => BifrostError::QueryForbidden,
+        "WYRD_VALA_403_PAYLOAD_FORBIDDEN" => BifrostError::PayloadForbidden,
         "WYRD_VALA_502_QUERY_STREAM_PROTOCOL" => BifrostError::QueryStreamProtocol,
         "WYRD_VALA_502_QUERY_STREAM_INCOMPLETE" => BifrostError::QueryStreamIncomplete,
         "WYRD_VALA_503_QUERY_AUDIT_UNAVAILABLE" => BifrostError::QueryAuditUnavailable,

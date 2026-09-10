@@ -2425,6 +2425,42 @@ impl WyrdTestServer {
             .await
     }
 
+    /// Seed one non-builtin role carrying exactly the requested permissions.
+    ///
+    /// The builtin roles are coarse — `admin` holds the wildcard and no other
+    /// builtin grants `bifrost_query:read` at all — so a case that needs an
+    /// authenticated caller holding one permission and deliberately lacking
+    /// another cannot express that with a builtin name. This seeds the role
+    /// the same way tenant seeding does, through the shared upsert, so a
+    /// principal granted it resolves the exact permission set at verify time.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the permissions cannot be serialized, when the
+    /// name collides with a builtin role, or when the tenant write fails.
+    pub async fn seed_role(
+        &self,
+        name: &str,
+        permissions: &[Permission],
+    ) -> Result<(), WyrdTestServerError> {
+        let payload = serde_json::to_value(permissions)
+            .map_err(|error| WyrdTestServerError::Io(error.to_string()))?;
+        let mut conn = self.tenant_conn().await?;
+        wyrd_sql::queries::auth::insert_role(
+            &mut conn,
+            Uuid::new_v5(
+                &wyrd_runtime::builtin_roles::NS_BUILTIN_ROLE,
+                format!("{}:{name}", self.data_tenant_id()).as_bytes(),
+            ),
+            name,
+            &payload,
+            false,
+        )
+        .await
+        .map_err(sql)?;
+        conn.commit().await.map_err(sql)
+    }
+
     /// Grant a role to a bootstrapped principal.
     ///
     /// # Errors

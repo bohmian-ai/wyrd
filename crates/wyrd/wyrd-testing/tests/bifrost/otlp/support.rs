@@ -12,12 +12,15 @@ use wyrd_testing::WyrdTestServer;
 use wyrd_tonic::otlp::common::v1::{
     AnyValue, ArrayValue, InstrumentationScope, KeyValue, KeyValueList, any_value,
 };
+use wyrd_tonic::otlp::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
 use wyrd_tonic::otlp::resource::v1::Resource;
 use wyrd_tonic::otlp::trace::v1::span::{Event, Link};
 use wyrd_tonic::otlp::trace::v1::{ResourceSpans, ScopeSpans, Span, Status};
 
 /// The canonical span ledger every trace case reads.
 pub(super) const SPANS_TABLE: &str = "vala.traces.spans";
+/// The canonical log ledger every log case reads.
+pub(super) const LOGS_TABLE: &str = "vala.logs.records";
 
 /// Identity one copy of the maximal span is exported under.
 ///
@@ -107,6 +110,8 @@ pub(super) const RESOURCE_DROPPED_ATTRIBUTES: i64 = 16;
 pub(super) const RESOURCE_SCHEMA_URL: &str = "https://wyrd.test/schemas/resource/1.0.0";
 /// Instrumentation scope name the maximal span was recorded under.
 pub(super) const SCOPE_NAME: &str = "wyrd.tests.otlp.trace";
+/// Instrumentation scope name the maximal log record was recorded under.
+pub(super) const LOG_SCOPE_NAME: &str = "wyrd.tests.otlp.log";
 /// Instrumentation scope version.
 pub(super) const SCOPE_VERSION: &str = "1.2.3";
 /// Attributes the sender dropped from the scope.
@@ -282,10 +287,13 @@ pub(super) fn resource() -> Resource {
     }
 }
 
-/// The shared instrumentation scope the trace signal is exported under.
-pub(super) fn trace_scope() -> InstrumentationScope {
+/// The instrumentation scope one signal is exported under.
+///
+/// Every signal shares the version, attributes and dropped count so a scope
+/// column can only differ between signals by the name the emitter declared.
+pub(super) fn signal_scope(name: &str) -> InstrumentationScope {
     InstrumentationScope {
-        name: SCOPE_NAME.to_owned(),
+        name: name.to_owned(),
         version: SCOPE_VERSION.to_owned(),
         attributes: scope_attributes(),
         dropped_attributes_count: u32::try_from(SCOPE_DROPPED_ATTRIBUTES)
@@ -346,8 +354,75 @@ pub(super) fn maximal_resource_spans(start: i64, identity: SpanIdentity) -> Vec<
     vec![ResourceSpans {
         resource: Some(resource()),
         scope_spans: vec![ScopeSpans {
-            scope: Some(trace_scope()),
+            scope: Some(signal_scope(SCOPE_NAME)),
             spans: vec![maximal_span(start, identity)],
+            schema_url: SCOPE_SCHEMA_URL.to_owned(),
+        }],
+        schema_url: RESOURCE_SCHEMA_URL.to_owned(),
+    }]
+}
+
+/// Nanoseconds after the anchor at which the maximal log record was observed.
+pub(super) const LOG_OBSERVED_OFFSET_NANOS: i64 = 2_000_000;
+/// OTLP severity number of the maximal log record (`WARN`).
+pub(super) const LOG_SEVERITY_NUMBER: i32 = 13;
+/// OTLP severity text of the maximal log record.
+pub(super) const LOG_SEVERITY_TEXT: &str = "WARN";
+/// `OTel` event name the maximal log record declares.
+pub(super) const LOG_EVENT_NAME: &str = "canonical.order.delayed";
+/// Body text of the maximal log record.
+pub(super) const LOG_BODY_TEXT: &str = "order delayed by canonical journey";
+/// W3C trace flags carried by the maximal log record.
+pub(super) const LOG_FLAGS: i64 = 1;
+/// Attributes the sender dropped from the maximal log record.
+pub(super) const LOG_DROPPED_ATTRIBUTES: i64 = 18;
+
+/// Attributes the maximal log record carries.
+pub(super) fn log_attributes() -> Vec<KeyValue> {
+    vec![
+        string_attribute("wyrd.test.marker", "canonical-log"),
+        int_attribute("order.id", 4_242),
+        bool_attribute("order.expedited", false),
+    ]
+}
+
+/// The body of the maximal log record, as the exporter sends it.
+pub(super) fn log_body() -> AnyValue {
+    AnyValue {
+        value: Some(any_value::Value::StringValue(LOG_BODY_TEXT.to_owned())),
+    }
+}
+
+/// Builds the one maximal log record anchored at `time`.
+///
+/// The record correlates with the trace dataset's gRPC span so the canonical
+/// log columns carry a real trace/span context rather than the protocol's
+/// permitted absent one.
+pub(super) fn maximal_log_record(time: i64) -> LogRecord {
+    LogRecord {
+        time_unix_nano: u64::try_from(time).expect("the anchor instant is positive"),
+        observed_time_unix_nano: u64::try_from(time + LOG_OBSERVED_OFFSET_NANOS)
+            .expect("the anchor instant is positive"),
+        severity_number: LOG_SEVERITY_NUMBER,
+        severity_text: LOG_SEVERITY_TEXT.to_owned(),
+        event_name: LOG_EVENT_NAME.to_owned(),
+        body: Some(log_body()),
+        attributes: log_attributes(),
+        dropped_attributes_count: u32::try_from(LOG_DROPPED_ATTRIBUTES)
+            .expect("the fixture dropped count fits u32"),
+        flags: u32::try_from(LOG_FLAGS).expect("the fixture flags fit u32"),
+        trace_id: GRPC_SPAN.trace_id.to_vec(),
+        span_id: GRPC_SPAN.span_id.to_vec(),
+    }
+}
+
+/// Wraps the maximal log record in the shared resource and scope envelope.
+pub(super) fn maximal_resource_logs(time: i64) -> Vec<ResourceLogs> {
+    vec![ResourceLogs {
+        resource: Some(resource()),
+        scope_logs: vec![ScopeLogs {
+            scope: Some(signal_scope(LOG_SCOPE_NAME)),
+            log_records: vec![maximal_log_record(time)],
             schema_url: SCOPE_SCHEMA_URL.to_owned(),
         }],
         schema_url: RESOURCE_SCHEMA_URL.to_owned(),
@@ -437,6 +512,79 @@ impl OtlpJourney {
         self.server.base_url().expect("the harness binds HTTP")
     }
 
+    /// Builds a second public client whose principal holds exactly `permissions`.
+    ///
+    /// The journey's own principal is an admin, so it can read everything; a
+    /// payload-authorization assertion needs a caller that is authenticated
+    /// and permitted to query but deliberately not permitted to read a
+    /// sensitive column. No builtin role has that shape, so the role is seeded
+    /// for this fixture and the service is bootstrapped onto it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the role cannot be seeded, the service cannot be
+    /// bootstrapped, or the client cannot be built.
+    pub(super) async fn client_with_permissions(
+        &self,
+        name: &str,
+        permissions: &[wyrd_runtime::Permission],
+    ) -> wyrd_client::WyrdClient {
+        self.server
+            .seed_role(name, permissions)
+            .await
+            .expect("the fixture role is seeded");
+        let bootstrap = self
+            .server
+            .bootstrap_service(name, &[name])
+            .await
+            .expect("the fixture service is bootstrapped onto its role");
+        let api_key = bootstrap
+            .api_key()
+            .expect("the bootstrapped service carries an API key")
+            .clone();
+        wyrd_client::WyrdClient::with_config(wyrd_client::config::ClientConfig {
+            grpc: wyrd_client::transport::GrpcConfig {
+                endpoint: self.grpc_url(),
+                connect_retries: 0,
+                ..wyrd_client::transport::GrpcConfig::default()
+            },
+            http: wyrd_client::transport::HttpConfig {
+                base_url: self.base_url().to_owned(),
+                ..wyrd_client::transport::HttpConfig::default()
+            },
+            credential: Some(api_key),
+            ..wyrd_client::config::ClientConfig::default()
+        })
+        .expect("the fixture builds its restricted SDK client")
+    }
+
+    /// Runs one public query expected to be refused and returns its error code.
+    ///
+    /// The refusal must arrive before the stream opens, as a transport-level
+    /// stable error: a caller that is handed an open stream and then a failed
+    /// terminal has already been told the query was accepted, and the closed
+    /// terminal code vocabulary cannot name a payload refusal.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the query is accepted, or fails in any shape other than a
+    /// pre-stream stable refusal.
+    pub(super) async fn query_error(&self, client: &wyrd_client::WyrdClient, sql: &str) -> String {
+        let outcome = vala_sdk::query::QueryClient::new(client)
+            .query(&wyrd_spec::vala::api::BifrostQueryRequest {
+                sql: sql.to_owned(),
+                visibility: wyrd_spec::vala::api::VisibilityMode::Fused,
+                freshness: wyrd_spec::vala::api::FreshnessPolicy::Strict,
+                deadline_ms: Some(120_000),
+            })
+            .await;
+        match outcome {
+            Ok(_) => panic!("`{sql}` must be refused before its stream opens"),
+            Err(vala_sdk::query::ValaSdkError::Transport(error)) => error.code().to_owned(),
+            Err(other) => panic!("`{sql}` is refused pre-stream, got {other}"),
+        }
+    }
+
     /// Crosses the publication boundary so published readers see the rows.
     ///
     /// # Panics
@@ -501,11 +649,10 @@ impl OtlpJourney {
         let batches = self.query(sql).await;
         let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
         assert_eq!(rows, 1, "`{sql}` must return exactly one row, got {rows}");
-        let batch = batches
+        batches
             .into_iter()
             .find(|batch| batch.num_rows() == 1)
-            .expect("the single row is carried by one batch");
-        batch
+            .expect("the single row is carried by one batch")
     }
 
     /// Shuts the harness down and fails the case when it does not drain.

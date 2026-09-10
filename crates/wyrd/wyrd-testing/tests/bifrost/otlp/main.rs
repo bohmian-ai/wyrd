@@ -15,6 +15,7 @@
 //! the same canonical rows belong to `vala-sdk`'s `pg_bifrost_e2e`, the Python
 //! and TypeScript journey suites, and `wyrd-mcp`'s `mcp` binary.
 
+mod logs_export;
 mod support;
 mod trace_export;
 mod trace_export_http;

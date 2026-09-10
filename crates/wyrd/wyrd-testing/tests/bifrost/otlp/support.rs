@@ -22,6 +22,7 @@ use wyrd_tonic::otlp::metrics::v1::{
 use wyrd_tonic::otlp::resource::v1::Resource;
 use wyrd_tonic::otlp::trace::v1::span::{Event, Link};
 use wyrd_tonic::otlp::trace::v1::{ResourceSpans, ScopeSpans, Span, Status};
+use wyrd_tonic::prost::Message as _;
 
 /// The canonical span ledger every trace case reads.
 pub(super) const SPANS_TABLE: &str = "vala.traces.spans";
@@ -151,6 +152,32 @@ pub(super) const GEN_AI_OUTPUT_MESSAGES: &str = r#"[{"role":"assistant","parts":
 pub(super) const SPAN_DURATION_NANOS: i64 = 5_000_000;
 /// How long after its span's start the single event was recorded.
 pub(super) const EVENT_OFFSET_NANOS: i64 = 1_000_000;
+
+/// `service.name` every stock upstream exporter in this suite declares.
+///
+/// Distinct from [`SERVICE_NAME`] so a stock-exporter journey and the
+/// hand-built protocol dataset can never read each other's rows.
+pub(super) const STOCK_SERVICE_NAME: &str = "wyrd-rust-journey";
+/// Instrumentation scope the stock upstream tracer records under.
+pub(super) const STOCK_TRACE_SCOPE: &str = "wyrd.tests.stock.trace";
+/// Instrumentation scope the stock upstream logger records under.
+pub(super) const STOCK_LOG_SCOPE: &str = "wyrd.tests.stock.log";
+/// Instrumentation scope the stock upstream meter records under.
+pub(super) const STOCK_METRIC_SCOPE: &str = "wyrd.tests.stock.metric";
+
+/// The process resource every stock upstream exporter is configured with.
+///
+/// `builder_empty` rather than `builder` so the resource carries exactly the
+/// one attribute the assertions name, instead of whatever the SDK's default
+/// detectors happen to find on the machine running the lane.
+pub(super) fn stock_resource() -> opentelemetry_sdk::Resource {
+    opentelemetry_sdk::Resource::builder_empty()
+        .with_attributes([opentelemetry::KeyValue::new(
+            "service.name",
+            STOCK_SERVICE_NAME,
+        )])
+        .build()
+}
 
 /// The instant the fixture anchors every signal timestamp to.
 ///
@@ -829,6 +856,26 @@ impl OtlpJourney {
         self.server.grpc_url().expect("the harness binds gRPC")
     }
 
+    /// The gRPC metadata a stock upstream OTLP exporter authenticates with.
+    ///
+    /// Upstream exporters take arbitrary metadata, which is the whole reason
+    /// an unmodified SDK can talk to Wyrd: the bearer rides in the same
+    /// `x-wyrd-access-token` header every other Wyrd caller uses.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the minted bearer is not valid ASCII metadata.
+    pub(super) fn stock_metadata(&self) -> wyrd_tonic::tonic::metadata::MetadataMap {
+        let mut metadata = wyrd_tonic::tonic::metadata::MetadataMap::new();
+        metadata.insert(
+            "x-wyrd-access-token",
+            format!("Bearer {}", self.token)
+                .parse()
+                .expect("the minted bearer is valid ASCII metadata"),
+        );
+        metadata
+    }
+
     /// The bound HTTP base URL an OTLP/HTTP exporter posts to.
     ///
     /// # Panics
@@ -1067,4 +1114,29 @@ pub(super) fn column<'batch, A: arrow::array::Array + 'static>(
 /// encoder in the fixture would prove only that two encoders agree.
 pub(super) fn canonical_attribute_bytes(attributes: &[KeyValue]) -> Vec<u8> {
     vala_bifrost_redux::tables::signal::encode_attributes(attributes)
+}
+
+/// Decodes a stored attribute blob's string-valued entries by key.
+///
+/// A stock-exporter journey cannot compare the blob byte-for-byte the way the
+/// pinned dataset does, because the SDK — not the test — decides which
+/// attributes it emits and in what order. Reading the blob back as a map lets
+/// those cases name the attributes they set without asserting anything about
+/// the ones the SDK added on its own.
+///
+/// # Panics
+///
+/// Panics when the column does not hold a canonical `KeyValueList` encoding.
+pub(super) fn decode_attributes(bytes: &[u8]) -> std::collections::HashMap<String, String> {
+    use wyrd_tonic::otlp::common::v1::{KeyValueList, any_value};
+    KeyValueList::decode(bytes)
+        .expect("a stored attribute column is a canonical KeyValueList encoding")
+        .values
+        .into_iter()
+        .filter_map(|entry| match entry.value.and_then(|value| value.value) {
+            Some(any_value::Value::StringValue(text)) => Some((entry.key, text)),
+            Some(any_value::Value::IntValue(number)) => Some((entry.key, number.to_string())),
+            _ => None,
+        })
+        .collect()
 }

@@ -486,4 +486,168 @@ mod pg_tests {
 
         journey.shutdown().await;
     }
+
+    /// An ordinary Rust application's OpenTelemetry meter reaches Bifrost.
+    ///
+    /// The upstream `SdkMeterProvider` and OTLP/gRPC `MetricExporter` are
+    /// configured the way an application configures them and record through
+    /// the four instruments the pinned SDK exposes directly — a counter, an
+    /// up/down counter, a gauge and a histogram. The SDK owns aggregation, so
+    /// the readback requires the aggregate it produced rather than the
+    /// measurements that went in. The exhaustive per-kind fidelity contract,
+    /// including the `Summary` and exponential-histogram shapes no upstream
+    /// instrument authors, stays with the raw protocol case above.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the exporter cannot be built, the provider does not flush,
+    /// or any produced aggregate differs from what canonical SQL returns.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the Postgres-backed Bifrost journey lane"]
+    async fn stock_rust_otel_meter_exports_representative_metrics_to_bifrost() {
+        use opentelemetry::KeyValue;
+        use opentelemetry::metrics::MeterProvider as _;
+        use opentelemetry_otlp::{MetricExporter, WithExportConfig, WithTonicConfig};
+        use opentelemetry_sdk::metrics::SdkMeterProvider;
+
+        let journey = OtlpJourney::start().await;
+        let exporter = MetricExporter::builder()
+            .with_tonic()
+            .with_endpoint(journey.grpc_url())
+            .with_metadata(journey.stock_metadata())
+            .build()
+            .expect("the upstream OTLP metric exporter builds against the bound collector");
+        let metrics = SdkMeterProvider::builder()
+            .with_resource(support::stock_resource())
+            .with_periodic_exporter(exporter)
+            .build();
+        let meter = metrics.meter_with_scope(
+            opentelemetry::InstrumentationScope::builder(support::STOCK_METRIC_SCOPE)
+                .with_version(support::SCOPE_VERSION)
+                .build(),
+        );
+        let attributes = [KeyValue::new("wyrd.test.marker", "rust-metric")];
+        meter
+            .u64_counter("orders.created")
+            .build()
+            .add(7, &attributes);
+        meter
+            .i64_up_down_counter("orders.active")
+            .build()
+            .add(-2, &attributes);
+        meter
+            .f64_gauge("queue.depth")
+            .build()
+            .record(3.5, &attributes);
+        meter
+            .f64_histogram("request.duration")
+            .with_unit("ms")
+            .build()
+            .record(12.5, &attributes);
+        // Shutdown is the single export boundary here rather than a flush
+        // followed by a shutdown: the pinned SDK aggregates cumulatively, so
+        // both would export the same running totals and the table would carry
+        // two indistinguishable points per instrument.
+        metrics
+            .shutdown()
+            .expect("the upstream meter provider collects, exports and shuts down");
+
+        journey.publish().await;
+        let rows = journey
+            .query(&format!(
+                "SELECT * FROM {METRICS_TABLE} WHERE scope_name = '{}'",
+                support::STOCK_METRIC_SCOPE
+            ))
+            .await;
+
+        for name in [
+            "orders.created",
+            "orders.active",
+            "queue.depth",
+            "request.duration",
+        ] {
+            let row = row_by_string(&rows, "metric_name", name);
+            assert_eq!(
+                support::decode_attributes(column::<LargeBinaryArray>(&row, "attributes").value(0))
+                    .get("wyrd.test.marker")
+                    .map(String::as_str),
+                Some("rust-metric"),
+                "`{name}` keeps the point attribute the application recorded with"
+            );
+            assert_eq!(
+                support::decode_attributes(
+                    column::<LargeBinaryArray>(&row, "resource_attributes").value(0)
+                )
+                .get("service.name")
+                .map(String::as_str),
+                Some(support::STOCK_SERVICE_NAME)
+            );
+        }
+
+        let created = row_by_string(&rows, "metric_name", "orders.created");
+        assert_eq!(
+            column::<StringArray>(&created, "metric_type").value(0),
+            "sum"
+        );
+        assert_eq!(column::<Int64Array>(&created, "int_value").value(0), 7);
+        assert!(
+            column::<BooleanArray>(&created, "is_monotonic").value(0),
+            "a counter aggregates to a monotonic sum"
+        );
+
+        let active = row_by_string(&rows, "metric_name", "orders.active");
+        assert_eq!(
+            column::<StringArray>(&active, "metric_type").value(0),
+            "sum"
+        );
+        assert_eq!(column::<Int64Array>(&active, "int_value").value(0), -2);
+        assert!(
+            !column::<BooleanArray>(&active, "is_monotonic").value(0),
+            "an up/down counter aggregates to a non-monotonic sum"
+        );
+
+        let depth = row_by_string(&rows, "metric_name", "queue.depth");
+        assert_eq!(
+            column::<StringArray>(&depth, "metric_type").value(0),
+            "gauge"
+        );
+        assert!(
+            (column::<Float64Array>(&depth, "double_value").value(0) - 3.5).abs() < f64::EPSILON
+        );
+
+        let duration = row_by_string(&rows, "metric_name", "request.duration");
+        assert_eq!(
+            column::<StringArray>(&duration, "metric_type").value(0),
+            "histogram"
+        );
+        assert_eq!(column::<StringArray>(&duration, "unit").value(0), "ms");
+        assert_eq!(
+            column::<Int64Array>(&duration, "histogram_count").value(0),
+            1
+        );
+        assert!(
+            (column::<Float64Array>(&duration, "histogram_sum").value(0) - 12.5).abs()
+                < f64::EPSILON
+        );
+        let bounds = column::<ListArray>(&duration, "explicit_bounds").value(0);
+        let counts = column::<ListArray>(&duration, "bucket_counts").value(0);
+        assert_eq!(
+            counts.len(),
+            bounds.len() + 1,
+            "the SDK's default bucket layout keeps one more count than bound"
+        );
+        assert_eq!(
+            counts
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("a bucket count is an int64")
+                .iter()
+                .flatten()
+                .sum::<i64>(),
+            1,
+            "the one recorded measurement lands in exactly one bucket"
+        );
+
+        journey.shutdown().await;
+    }
 }

@@ -392,4 +392,221 @@ mod pg_tests {
 
         journey.shutdown().await;
     }
+
+    /// An ordinary Rust application's OpenTelemetry tracer reaches Bifrost.
+    ///
+    /// Nothing here is Wyrd-shaped: the upstream `SdkTracerProvider`, the
+    /// upstream OTLP/gRPC `SpanExporter`, and the upstream `Tracer` are
+    /// configured exactly as an application configures them, pointed at the
+    /// bound collector, and given a bearer through the ordinary metadata hook.
+    /// The SDK — not the fixture — generates the trace and span identities, so
+    /// the assertions recover them from the emitted spans and require the same
+    /// hierarchy, event, link, status, resource, scope, promoted `GenAI`
+    /// fields and structured `GenAI` messages to come back out of canonical
+    /// SQL. That is the user journey Scenario 1 only supports at the protocol
+    /// layer.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the exporter cannot be built, the provider does not flush,
+    /// or any emitted value differs from what canonical SQL returns.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the Postgres-backed Bifrost journey lane"]
+    async fn stock_rust_otel_tracer_exports_genai_span_to_bifrost() {
+        use opentelemetry::KeyValue;
+        use opentelemetry::trace::{
+            SpanContext, Status, TraceContextExt, TraceFlags, TraceState, Tracer,
+            TracerProvider as _,
+        };
+        use opentelemetry_otlp::{SpanExporter, WithExportConfig, WithTonicConfig};
+        use opentelemetry_sdk::trace::SdkTracerProvider;
+
+        let journey = OtlpJourney::start().await;
+        let exporter = SpanExporter::builder()
+            .with_tonic()
+            .with_endpoint(journey.grpc_url())
+            .with_metadata(journey.stock_metadata())
+            .build()
+            .expect("the upstream OTLP span exporter builds against the bound collector");
+        let provider = SdkTracerProvider::builder()
+            .with_resource(support::stock_resource())
+            .with_batch_exporter(exporter)
+            .build();
+        let tracer = provider.tracer_with_scope(
+            opentelemetry::InstrumentationScope::builder(support::STOCK_TRACE_SCOPE)
+                .with_version(support::SCOPE_VERSION)
+                .build(),
+        );
+
+        let linked = SpanContext::new(
+            opentelemetry::trace::TraceId::from_bytes(support::LINK_TRACE_ID),
+            opentelemetry::trace::SpanId::from_bytes(support::LINK_SPAN_ID),
+            TraceFlags::SAMPLED,
+            true,
+            TraceState::default(),
+        );
+        let emitted = tracer.in_span("stock-rust-parent", |cx| {
+            let parent = cx.span();
+            parent.set_attribute(KeyValue::new("wyrd.test.marker", "rust-trace"));
+            parent.set_attribute(KeyValue::new(
+                "gen_ai.operation.name",
+                support::GEN_AI_OPERATION_NAME,
+            ));
+            parent.set_attribute(KeyValue::new(
+                "gen_ai.provider.name",
+                support::GEN_AI_PROVIDER_NAME,
+            ));
+            parent.set_attribute(KeyValue::new(
+                "gen_ai.request.model",
+                support::GEN_AI_REQUEST_MODEL,
+            ));
+            parent.set_attribute(KeyValue::new(
+                "gen_ai.conversation.id",
+                support::GEN_AI_CONVERSATION_ID,
+            ));
+            parent.set_attribute(KeyValue::new(
+                "gen_ai.usage.input_tokens",
+                support::GEN_AI_INPUT_TOKENS,
+            ));
+            parent.set_attribute(KeyValue::new(
+                "gen_ai.usage.output_tokens",
+                support::GEN_AI_OUTPUT_TOKENS,
+            ));
+            parent.set_attribute(KeyValue::new(
+                "gen_ai.input.messages",
+                support::GEN_AI_INPUT_MESSAGES,
+            ));
+            parent.set_attribute(KeyValue::new(
+                "gen_ai.output.messages",
+                support::GEN_AI_OUTPUT_MESSAGES,
+            ));
+            parent.add_event("checkpoint", vec![KeyValue::new("step", 1_i64)]);
+            parent.add_link(linked.clone(), Vec::new());
+            parent.set_status(Status::error("expected test status"));
+            let context = parent.span_context().clone();
+            let child = tracer.in_span("stock-rust-child", |child_cx| {
+                child_cx
+                    .span()
+                    .set_attribute(KeyValue::new("answer", 42_i64));
+                child_cx.span().span_context().span_id()
+            });
+            (context, child)
+        });
+        provider
+            .force_flush()
+            .expect("the upstream batch processor exports every emitted span");
+        provider
+            .shutdown()
+            .expect("the upstream tracer provider shuts down");
+
+        journey.publish().await;
+        let batches = journey
+            .query(&format!(
+                "SELECT * FROM {SPANS_TABLE} WHERE scope_name = '{}'",
+                support::STOCK_TRACE_SCOPE
+            ))
+            .await;
+        let parent = support::row_by_span_id(&batches, emitted.0.span_id().to_bytes());
+        let child = support::row_by_span_id(&batches, emitted.1.to_bytes());
+
+        assert_eq!(
+            support::column::<arrow::array::FixedSizeBinaryArray>(&parent, "trace_id").value(0),
+            emitted.0.trace_id().to_bytes(),
+            "the trace identity the SDK generated is the one Bifrost stores"
+        );
+        assert_eq!(
+            support::column::<arrow::array::FixedSizeBinaryArray>(&child, "trace_id").value(0),
+            emitted.0.trace_id().to_bytes(),
+            "the child shares its parent's trace"
+        );
+        assert_eq!(
+            support::column::<arrow::array::FixedSizeBinaryArray>(&child, "parent_span_id")
+                .value(0),
+            emitted.0.span_id().to_bytes(),
+            "the parent/child relationship the SDK recorded survives readback"
+        );
+        assert_eq!(
+            support::column::<arrow::array::StringArray>(&parent, "name").value(0),
+            "stock-rust-parent"
+        );
+        assert_eq!(
+            support::column::<arrow::array::StringArray>(&parent, "service_name").value(0),
+            support::STOCK_SERVICE_NAME
+        );
+        assert_eq!(
+            support::column::<arrow::array::StringArray>(&parent, "scope_version").value(0),
+            support::SCOPE_VERSION
+        );
+        assert_eq!(
+            support::column::<arrow::array::Int32Array>(&parent, "status_code").value(0),
+            support::STATUS_CODE,
+            "an upstream error status is stored as the canonical error code"
+        );
+        assert_eq!(
+            support::column::<arrow::array::StringArray>(&parent, "status_message").value(0),
+            "expected test status"
+        );
+
+        let attributes = support::decode_attributes(
+            support::column::<arrow::array::LargeBinaryArray>(&parent, "attributes").value(0),
+        );
+        for (key, expected) in [
+            ("wyrd.test.marker", "rust-trace"),
+            ("gen_ai.input.messages", support::GEN_AI_INPUT_MESSAGES),
+            ("gen_ai.output.messages", support::GEN_AI_OUTPUT_MESSAGES),
+        ] {
+            assert_eq!(
+                attributes.get(key).map(String::as_str),
+                Some(expected),
+                "`{key}` survives the stock exporter unchanged"
+            );
+        }
+        for (name, expected) in [
+            ("gen_ai_operation_name", support::GEN_AI_OPERATION_NAME),
+            ("gen_ai_provider_name", support::GEN_AI_PROVIDER_NAME),
+            ("gen_ai_request_model", support::GEN_AI_REQUEST_MODEL),
+            ("gen_ai_conversation_id", support::GEN_AI_CONVERSATION_ID),
+        ] {
+            assert_eq!(
+                support::column::<arrow::array::StringArray>(&parent, name).value(0),
+                expected,
+                "the stock exporter's `{name}` is promoted"
+            );
+        }
+        assert_eq!(
+            support::column::<arrow::array::Int64Array>(&parent, "gen_ai_usage_input_tokens")
+                .value(0),
+            support::GEN_AI_INPUT_TOKENS
+        );
+        assert_eq!(
+            support::column::<arrow::array::Int64Array>(&parent, "gen_ai_usage_output_tokens")
+                .value(0),
+            support::GEN_AI_OUTPUT_TOKENS
+        );
+
+        let events = support::column::<arrow::array::ListArray>(&parent, "events").value(0);
+        assert_eq!(events.len(), 1, "the one emitted event is stored once");
+        let links = support::column::<arrow::array::ListArray>(&parent, "links").value(0);
+        assert_eq!(links.len(), 1, "the one emitted link is stored once");
+        let links = links
+            .as_any()
+            .downcast_ref::<arrow::array::StructArray>()
+            .expect("a link element is a struct");
+        assert_eq!(
+            super::child::<arrow::array::FixedSizeBinaryArray>(links, "trace_id").value(0),
+            support::LINK_TRACE_ID,
+            "the linked trace the application named is the one stored"
+        );
+
+        let resource = support::decode_attributes(
+            support::column::<arrow::array::LargeBinaryArray>(&parent, "resource_attributes")
+                .value(0),
+        );
+        assert_eq!(
+            resource.get("service.name").map(String::as_str),
+            Some(support::STOCK_SERVICE_NAME)
+        );
+
+        journey.shutdown().await;
+    }
 }

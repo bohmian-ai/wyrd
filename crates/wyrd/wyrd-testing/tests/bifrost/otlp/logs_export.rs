@@ -258,4 +258,127 @@ mod pg_tests {
 
         journey.shutdown().await;
     }
+
+    /// An ordinary Rust application's OpenTelemetry logger reaches Bifrost.
+    ///
+    /// The upstream `SdkLoggerProvider` and OTLP/gRPC `LogExporter` are
+    /// configured the way an application configures them and the record is
+    /// emitted inside an active span, which is how the upstream SDK — not the
+    /// fixture — attaches the trace correlation. The readback requires that
+    /// correlation, the body, the severity pair, the marker attribute, and the
+    /// resource and scope envelope to survive the round trip.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the exporter cannot be built, the provider does not flush,
+    /// or any emitted value differs from what canonical SQL returns.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the Postgres-backed Bifrost journey lane"]
+    async fn stock_rust_otel_logger_exports_correlated_log_to_bifrost() {
+        use opentelemetry::logs::{LogRecord as _, Logger as _, LoggerProvider as _, Severity};
+        use opentelemetry::trace::{TraceContextExt, Tracer, TracerProvider as _};
+        use opentelemetry_otlp::{LogExporter, WithExportConfig, WithTonicConfig};
+        use opentelemetry_sdk::logs::SdkLoggerProvider;
+        use opentelemetry_sdk::trace::SdkTracerProvider;
+
+        let journey = OtlpJourney::start().await;
+        let exporter = LogExporter::builder()
+            .with_tonic()
+            .with_endpoint(journey.grpc_url())
+            .with_metadata(journey.stock_metadata())
+            .build()
+            .expect("the upstream OTLP log exporter builds against the bound collector");
+        let logs = SdkLoggerProvider::builder()
+            .with_resource(support::stock_resource())
+            .with_batch_exporter(exporter)
+            .build();
+        let logger = logs.logger_with_scope(
+            opentelemetry::InstrumentationScope::builder(support::STOCK_LOG_SCOPE)
+                .with_version(support::SCOPE_VERSION)
+                .build(),
+        );
+
+        // The correlation this case proves is the SDK's, so the span it
+        // correlates to is produced by an ordinary tracer. That tracer has no
+        // exporter on purpose: this case owns log transport, and a second
+        // exporting trace pipeline would write rows nothing here asserts.
+        let context_traces = SdkTracerProvider::builder().build();
+        let context_tracer = context_traces.tracer("wyrd.tests.stock.log-context");
+        let correlated = context_tracer.in_span("stock-rust-log-context", |cx| {
+            let mut record = logger.create_log_record();
+            record.set_body("order delayed".into());
+            record.set_severity_number(Severity::Error);
+            record.set_severity_text("ERROR");
+            record.add_attribute("wyrd.test.marker", "rust-log");
+            logger.emit(record);
+            cx.span().span_context().clone()
+        });
+        logs.force_flush()
+            .expect("the upstream batch processor exports every emitted record");
+        logs.shutdown()
+            .expect("the upstream logger provider shuts down");
+
+        journey.publish().await;
+        let row = journey
+            .query_one_row(&format!(
+                "SELECT * FROM {LOGS_TABLE} WHERE scope_name = '{}'",
+                support::STOCK_LOG_SCOPE
+            ))
+            .await;
+
+        assert_eq!(
+            column::<LargeBinaryArray>(&row, "body").value(0),
+            wyrd_tonic::otlp::common::v1::AnyValue {
+                value: Some(wyrd_tonic::otlp::common::v1::any_value::Value::StringValue(
+                    "order delayed".to_owned()
+                )),
+            }
+            .encode_to_vec(),
+            "the emitted body is stored as its canonical AnyValue encoding"
+        );
+        assert_eq!(
+            column::<Int32Array>(&row, "severity_number").value(0),
+            Severity::Error as i32
+        );
+        assert_eq!(
+            column::<StringArray>(&row, "severity_text").value(0),
+            "ERROR"
+        );
+        assert_eq!(
+            support::decode_attributes(column::<LargeBinaryArray>(&row, "attributes").value(0))
+                .get("wyrd.test.marker")
+                .map(String::as_str),
+            Some("rust-log")
+        );
+        assert_eq!(
+            support::decode_attributes(
+                column::<LargeBinaryArray>(&row, "resource_attributes").value(0)
+            )
+            .get("service.name")
+            .map(String::as_str),
+            Some(support::STOCK_SERVICE_NAME)
+        );
+        assert_eq!(
+            column::<StringArray>(&row, "scope_name").value(0),
+            support::STOCK_LOG_SCOPE,
+            "the instrumentation scope the application declared is what Bifrost stores"
+        );
+        // The scope version is deliberately not asserted here. In the pinned
+        // `opentelemetry-proto` 0.31 log transform, `ScopeLogs` is built from
+        // `InstrumentationScope::from((scope, Some(key)))`, and that `Some`
+        // arm hard-codes an empty version and drops the scope attributes. No
+        // upstream logger API can populate it, so scope-version fidelity stays
+        // proven by the raw protocol case above.
+        assert_eq!(
+            column::<FixedSizeBinaryArray>(&row, "trace_id").value(0),
+            correlated.trace_id().to_bytes(),
+            "the SDK's own trace correlation is what Bifrost stores"
+        );
+        assert_eq!(
+            column::<FixedSizeBinaryArray>(&row, "span_id").value(0),
+            correlated.span_id().to_bytes()
+        );
+
+        journey.shutdown().await;
+    }
 }

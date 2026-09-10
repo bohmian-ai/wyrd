@@ -109,6 +109,13 @@ wyrd-tls = { workspace = true }
 
 [dev-dependencies]
 metrics = { workspace = true }
+# Stock upstream OpenTelemetry, used only by the OTLP journey target: those
+# tests must configure the exporters an ordinary application configures rather
+# than hand-build protocol requests. The `logs` and `metrics` features are the
+# two signals beyond the workspace default that those journeys export.
+opentelemetry = { workspace = true, features = ["logs", "metrics"] }
+opentelemetry_sdk = { workspace = true, features = ["logs", "metrics"] }
+opentelemetry-otlp = { workspace = true, features = ["logs", "metrics"] }
 # Journey plumbing only: the Oracle MCP journey drives a real MCP client against
 # a process-cluster pod's `/mcp` endpoint, so it needs the protocol client the
 # way an agent would use it. No `wyrd-testing` library code speaks MCP.

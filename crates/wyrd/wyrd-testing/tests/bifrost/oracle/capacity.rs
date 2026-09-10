@@ -1826,3 +1826,191 @@ async fn prove_both_classes_progress(
     }
     Ok(())
 }
+
+/// Scratch capacity that keeps slot units, not scratch, the binding admission
+/// resource.
+///
+/// A queue only forms when a request is refused a slot while its other demands
+/// are still fundable: a scratch refusal is immediate and never enqueues. Eight
+/// gibibytes is well past the four concurrent 256 MiB query leases this rung's
+/// slot units allow, so every refusal in this journey is a slot refusal.
+const QUEUE_SCRATCH_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+/// Concurrent Interactive queries that consume every slot unit on the rung.
+///
+/// Two effective CPUs derive four slot units, and an Interactive query costs
+/// one, so four parked queries leave the fifth request nothing but the queue.
+const QUEUE_HOLDS: usize = 4;
+
+/// Polls spent waiting for one enqueue to become visible to inspection.
+///
+/// Every waiter's bounded queue wait starts at its own enqueue, so this loop is
+/// deliberately tight: the whole choreography has to fit inside the first
+/// waiter's wait.
+const QUEUE_ENQUEUE_POLLS: usize = 2000;
+
+/// Interval between enqueue-visibility polls.
+const QUEUE_ENQUEUE_INTERVAL: Duration = Duration::from_millis(1);
+
+/// The raw observation the queue journey's pods boot from.
+fn oracle_queue_observation() -> SystemResourceSnapshot {
+    SystemResourceSnapshot {
+        memory_limit_bytes: ORACLE_MEMORY_FLOOR_BYTES,
+        effective_cpu: ORACLE_EFFECTIVE_CPU,
+        scratch_capacity_bytes: QUEUE_SCRATCH_BYTES,
+        scratch_available_bytes: QUEUE_SCRATCH_BYTES,
+        memory_source: ResourceSource::Injected,
+        cpu_source: ResourceSource::Injected,
+    }
+}
+
+/// Queued tenants are granted in per-tenant FIFO order with equal tenant weight.
+///
+/// # Panics
+///
+/// Panics when the queue grants out of order or a queued waiter is never
+/// granted inside its bounded wait.
+// The parked holders, the queued waiters, and the pods' own heartbeats all need
+// to run at once; the single-threaded default would starve the leases.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn queued_tenants_are_granted_fifo_and_rotated() {
+    prove_queue_is_fifo_and_tenant_rotated()
+        .await
+        .expect("tenant-fair Oracle queue journey");
+}
+
+/// Drives the complete queue-ordering journey over one live cluster.
+///
+/// The pod is saturated by parked queries, three identified requests are
+/// enqueued in a known order behind them, each enqueue is confirmed through the
+/// node's own inspection, and exactly one parked query is then released. From
+/// there a single free slot unit passes down the queue, so completion order is
+/// grant order: the first tenant's older request precedes the second tenant's,
+/// which precedes the first tenant's newer one.
+///
+/// # Errors
+///
+/// Returns the first enqueue, grant, or ordering claim that broke.
+async fn prove_queue_is_fifo_and_tenant_rotated() -> Result<(), JourneyError> {
+    let cluster = WyrdTestCluster::start_spec(
+        BifrostClusterSpec::three_oracles_one_scribe()
+            .with_system_resources(oracle_queue_observation()),
+    )
+    .await?;
+    let tenants = [
+        cluster.data_tenant_id(),
+        cluster.add_tenant("queue-peer").await?,
+    ];
+    let ingest = cluster
+        .servers()
+        .find(|server| server.bifrost_scribe().is_some())
+        .ok_or("missing ingest node")?;
+    let server = cluster.server(0).ok_or("missing query node")?;
+    let suffix = uuid::Uuid::now_v7().simple();
+    let mut tables = Vec::new();
+    let mut clients = Vec::new();
+    for (index, tenant) in tenants.iter().enumerate() {
+        let table = format!("queue_{index}_{suffix}");
+        seed_fixture_table(ingest, *tenant, &table, SCHEDULING_ROWS, SCHEDULING_GROUPS).await?;
+        clients.push(client_for_tenant(server, *tenant, &format!("queue-{index}-{suffix}")).await?);
+        tables.push(table);
+    }
+    cluster.refresh_oracle_snapshots().await?;
+
+    // Warm both clients' query paths before anything is timed: the first
+    // request through a client pays catalog and plan costs that would otherwise
+    // land inside the first waiter's bounded queue wait.
+    for (index, client) in clients.iter().enumerate() {
+        drain_query(
+            &QueryClient::new(client),
+            &scheduling_interactive_sql(&tables[index]),
+        )
+        .await
+        .map_err(|refusal| format!("tenant {index}'s warm-up query was refused: {refusal}"))?;
+    }
+
+    let mut held = Vec::new();
+    for index in 0..QUEUE_HOLDS {
+        held.push(
+            hold_envelope(
+                server,
+                &clients[index % clients.len()],
+                &scheduling_interactive_sql(&tables[index % tables.len()]),
+            )
+            .await
+            .map_err(|error| format!("queue hold {index}: {error}"))?,
+        );
+    }
+
+    let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut waiters = Vec::new();
+    for (label, tenant) in [("first-older", 0), ("second", 1), ("first-newer", 0)] {
+        // The ring visits tenants in first-enqueue order, so the first tenant's
+        // older request must be enqueued before the second tenant appears.
+        let query = QueryClient::new(&clients[tenant]);
+        let sql = scheduling_interactive_sql(&tables[tenant]);
+        let order = Arc::clone(&order);
+        waiters.push(tokio::spawn(async move {
+            let outcome = drain_query(&query, &sql).await;
+            if outcome.is_ok()
+                && let Ok(mut order) = order.lock()
+            {
+                order.push(label);
+            }
+            outcome.map(|_| label)
+        }));
+        wait_for_queued(server, waiters.len()).await?;
+    }
+
+    // One released unit is enough: each granted waiter returns it on completion,
+    // so the queue drains one grant at a time and completion order is grant
+    // order.
+    let released = held.pop().ok_or("no held envelope to release")?;
+    released.abort();
+    let _ = released.await;
+
+    for waiter in waiters {
+        waiter
+            .await
+            .map_err(|error| format!("a queued waiter panicked: {error}"))?
+            .map_err(|refusal| format!("a queued waiter was never granted: {refusal}"))?;
+    }
+    let granted = order
+        .lock()
+        .map_err(|_| "queue order lock poisoned")?
+        .clone();
+    if granted != ["first-older", "second", "first-newer"] {
+        return Err(format!(
+            "the queue granted {granted:?}, which is not per-tenant FIFO with equal tenant weight"
+        )
+        .into());
+    }
+
+    for envelope in held {
+        envelope.abort();
+        let _ = envelope.await;
+    }
+    cluster.shutdown().await?;
+    Ok(())
+}
+
+/// Waits until the node's own inspection counts `expected` queued waiters.
+///
+/// # Errors
+///
+/// Returns an error when the enqueue never becomes visible.
+async fn wait_for_queued(server: &WyrdTestServer, expected: usize) -> Result<(), JourneyError> {
+    let expected = u64::try_from(expected)?;
+    for _ in 0..QUEUE_ENQUEUE_POLLS {
+        if server.oracle_runtime_inspection()?.queued_queries >= expected {
+            return Ok(());
+        }
+        tokio::time::sleep(QUEUE_ENQUEUE_INTERVAL).await;
+    }
+    Err(format!(
+        "only {} waiters ever enqueued, not {expected}",
+        server.oracle_runtime_inspection()?.queued_queries
+    )
+    .into())
+}

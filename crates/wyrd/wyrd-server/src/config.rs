@@ -722,7 +722,8 @@ pub(crate) struct OracleAdmissionTranslation {
 /// Translate validated calibration evidence into private Redux primitives.
 ///
 /// # Errors
-/// Returns a message when headroom, class shares, or derived capacities are invalid.
+/// Returns a message when headroom, class shares, derived capacities, or the
+/// proposed per-tenant slot caps fall outside their resolved class bounds.
 fn translate_oracle_calibration(
     profile: &OracleCalibrationProfile,
     runtime: &OracleRuntimeConfig,
@@ -783,18 +784,34 @@ fn translate_oracle_calibration(
         ));
     }
     let interactive_limit = proposal_u32(&profile.proposal, "tenant.interactive_slot_limit")?;
-    let analytical_limit = proposal_u32(&profile.proposal, "tenant.analytical_slot_limit")?;
+    let analytical_limit =
+        proposal_u32_allowing_zero(&profile.proposal, "tenant.analytical_slot_limit")?;
+    // Interactive may borrow the whole local total, so its tenant cap is bounded
+    // by that total rather than by the protected floor. A cap outside its class
+    // bounds is rejected: silently rewriting it would run a capacity contract
+    // the approved profile does not declare.
+    if !(1..=allocation_sum).contains(&interactive_limit) {
+        return Err(format!(
+            "tenant.interactive_slot_limit {interactive_limit} must be between 1 and {allocation_sum}"
+        ));
+    }
+    if analytical_slots == 0 {
+        if analytical_limit != 0 {
+            return Err(format!(
+                "tenant.analytical_slot_limit {analytical_limit} must be 0 when Analytical is disabled"
+            ));
+        }
+    } else if !(ANALYTICAL_QUERY_SLOT_UNITS..=analytical_slots).contains(&analytical_limit) {
+        return Err(format!(
+            "tenant.analytical_slot_limit {analytical_limit} must be between \
+             {ANALYTICAL_QUERY_SLOT_UNITS} and {analytical_slots}"
+        ));
+    }
     Ok(OracleAdmissionTranslation {
         interactive_slots,
         analytical_slots,
-        // Interactive may borrow the whole local total, so its tenant cap is
-        // clamped to that total rather than to the protected floor.
-        tenant_interactive_slots: interactive_limit.clamp(1, allocation_sum),
-        tenant_analytical_slots: if analytical_slots == 0 {
-            0
-        } else {
-            analytical_limit.clamp(ANALYTICAL_QUERY_SLOT_UNITS, analytical_slots)
-        },
+        tenant_interactive_slots: interactive_limit,
+        tenant_analytical_slots: analytical_limit,
         queue_capacity: u32::try_from(runtime.admission_waiters)
             .map_err(|_| "queue capacity exceeds u32".to_owned())?,
         max_queue_wait: Duration::from_millis(runtime.max_queue_wait_ms),
@@ -867,6 +884,25 @@ fn proposal_u64(table: &toml::Table, path: &str) -> Result<u64, String> {
 fn proposal_u32(table: &toml::Table, path: &str) -> Result<u32, String> {
     u32::try_from(proposal_u64(table, path)?)
         .map_err(|_| format!("proposal.{path}.value exceeds u32"))
+}
+
+/// Reads one calibration proposal capacity leaf that may legitimately be zero.
+///
+/// The Analytical per-tenant slot cap is zero exactly when the local split
+/// disables the class, so it cannot share the positive-only reader every other
+/// capacity leaf uses.
+///
+/// # Errors
+/// Returns an error when the leaf is missing, non-numeric, negative, or exceeds
+/// `u32`.
+fn proposal_u32_allowing_zero(table: &toml::Table, path: &str) -> Result<u32, String> {
+    let value = calibration_evidence_value(table, path)?;
+    let raw = value
+        .as_integer()
+        .or_else(|| value.as_float().map(|value| value as i64))
+        .filter(|value| *value >= 0)
+        .ok_or_else(|| format!("proposal.{path}.value must be non-negative"))?;
+    u32::try_from(raw).map_err(|_| format!("proposal.{path}.value exceeds u32"))
 }
 
 /// Closed activation status accepted from an Oracle calibration profile.
@@ -3430,7 +3466,11 @@ minimum_slots = 2
         for path in ORACLE_CALIBRATION_PROPOSALS {
             profile.push_str(&format!(
                 "\n[proposal.{path}]\nvalue = {}\nevidence_case_id = \"case-{path}\"\n",
-                if *path == "distribution.max_workers_per_query" {
+                // The Analytical per-tenant cap is one Analytical query's slot
+                // cost, which is the smallest value the class can grant.
+                if *path == "distribution.max_workers_per_query"
+                    || *path == "tenant.analytical_slot_limit"
+                {
                     2
                 } else {
                     1
@@ -4585,9 +4625,9 @@ minimum_slots = 2
         let translated = load_oracle_admission_translation(&runtime, 24)
             .expect("an approved schema-v2 profile translates")
             .expect("a configured profile yields a translation");
-        // Tenant caps come from the profile's own leaves and are clamped to the
-        // local class capacities they schedule against, never to a cluster-wide
-        // figure.
+        // Tenant caps come from the profile's own leaves and must already sit
+        // inside the local class capacities they schedule against, never a
+        // cluster-wide figure; an out-of-bounds leaf fails boot instead.
         assert!(translated.tenant_interactive_slots >= 1);
         assert!(
             translated.tenant_interactive_slots
@@ -4652,7 +4692,7 @@ minimum_slots = 2
         };
         let mut proposal = toml::Table::new();
         let mut tenant = toml::Table::new();
-        tenant.insert("interactive_slot_limit".to_owned(), leaf(8));
+        tenant.insert("interactive_slot_limit".to_owned(), leaf(6));
         tenant.insert("analytical_slot_limit".to_owned(), leaf(2));
         proposal.insert("tenant".to_owned(), toml::Value::Table(tenant));
         let mut memory = toml::Table::new();
@@ -4706,6 +4746,59 @@ minimum_slots = 2
         let translated = translate_oracle_calibration(&profile, &runtime, 8).expect("translation");
         assert_eq!(translated.interactive_slots, 3);
         assert_eq!(translated.analytical_slots, 3);
+        assert_eq!(translated.tenant_interactive_slots, 6);
+        assert_eq!(translated.tenant_analytical_slots, 2);
+
+        // An out-of-bounds tenant cap is rejected, never rewritten: a clamped
+        // boot would run a capacity contract the approved profile never
+        // declared.
+        let tenant_caps = |interactive: i64, analytical: i64| {
+            let mut tenant = toml::Table::new();
+            tenant.insert("interactive_slot_limit".to_owned(), leaf(interactive));
+            tenant.insert("analytical_slot_limit".to_owned(), leaf(analytical));
+            toml::Value::Table(tenant)
+        };
+        for (interactive, analytical, expected) in [
+            (0, 2, "tenant.interactive_slot_limit.value must be positive"),
+            (7, 2, "tenant.interactive_slot_limit 7"),
+            (6, 1, "tenant.analytical_slot_limit 1"),
+            (6, 4, "tenant.analytical_slot_limit 4"),
+        ] {
+            profile
+                .proposal
+                .insert("tenant".to_owned(), tenant_caps(interactive, analytical));
+            assert!(
+                translate_oracle_calibration(&profile, &runtime, 8)
+                    .expect_err("an out-of-bounds tenant cap must fail closed")
+                    .contains(expected),
+                "tenant caps {interactive}/{analytical} must be rejected"
+            );
+        }
+
+        // Analytical below one query's cost disables the class, so its tenant
+        // cap must be zero rather than a value the class can never grant.
+        profile.class.analytical.share = 0.0;
+        profile
+            .proposal
+            .insert("tenant".to_owned(), tenant_caps(4, 2));
+        assert!(
+            translate_oracle_calibration(&profile, &runtime, 8)
+                .expect_err("a nonzero cap on a disabled class must fail closed")
+                .contains("must be 0 when Analytical is disabled")
+        );
+        profile
+            .proposal
+            .insert("tenant".to_owned(), tenant_caps(4, 0));
+        let disabled = translate_oracle_calibration(&profile, &runtime, 8)
+            .expect("a zero cap matches the disabled class");
+        assert_eq!(disabled.analytical_slots, 0);
+        assert_eq!(disabled.tenant_analytical_slots, 0);
+        assert_eq!(disabled.tenant_interactive_slots, 4);
+        profile.class.analytical.share = 0.5;
+        profile
+            .proposal
+            .insert("tenant".to_owned(), tenant_caps(6, 2));
+
         assert!(
             translate_oracle_calibration(&profile, &runtime, 1)
                 .expect_err("one usable slot must fail closed")

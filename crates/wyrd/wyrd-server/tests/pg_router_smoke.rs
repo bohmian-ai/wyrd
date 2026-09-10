@@ -3092,12 +3092,13 @@ async fn oracle_authority_request(
             target_epoch_fence: fence,
         },
     }];
-    let signer = wyrd_server::oracle::OraclePeerAuthority::from_pem(
-        &wyrd_testing::keys::oracle_peer_signing_key_pem(),
-        oracle.peer().security_audit(),
-    )
-    .expect("production peer signer");
-    let ticket = signer
+    // Signed by this server's own peer authority, which is the only signer its
+    // verifier publishes a key for: the harness generates a fresh peer keyring
+    // per topology, so a ticket minted from any other key material is refused
+    // as an unknown key before the authority gate this journey observes.
+    let ticket = oracle
+        .peer()
+        .authority()
         .mint_peer_ticket(&PeerTicketClaims {
             protocol_version: PEER_PROTOCOL_VERSION,
             audience: node.as_uuid().as_bytes().to_vec(),

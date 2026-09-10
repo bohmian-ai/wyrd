@@ -221,6 +221,8 @@ mod tests {
         }))
     }
 
+    /// Proves `All` is the top of the object lattice: it covers every scope and
+    /// no narrower scope can ever satisfy an object-wide requirement.
     #[test]
     fn all_covers_every_object_and_is_covered_by_nothing_narrower() {
         let uid = Uuid::from_u128(1);
@@ -232,6 +234,8 @@ mod tests {
         assert!(!table("logs", uid).covers(&PermissionScope::All));
     }
 
+    /// Proves a schema grant reaches current and future tables beneath exactly
+    /// that catalog/schema pair, and never another schema.
     #[test]
     fn schema_scope_covers_every_table_in_that_exact_schema() {
         let one = Uuid::from_u128(1);
@@ -243,6 +247,8 @@ mod tests {
         assert!(!schema("logs").covers(&schema("traces")));
     }
 
+    /// Proves a table grant follows the stable UID alone: it covers no sibling
+    /// table and never widens back to its own schema.
     #[test]
     fn table_scope_covers_only_the_exact_uid() {
         let one = Uuid::from_u128(1);
@@ -253,6 +259,8 @@ mod tests {
         assert!(!table("traces", one).covers(&schema("traces")));
     }
 
+    /// Proves the persisted scope JSON is exactly the approved domain-tagged
+    /// projection, so the wire form cannot drift from the spec.
     #[test]
     fn scope_json_matches_the_approved_projection() {
         let uid = Uuid::from_u128(0x1234);
@@ -277,6 +285,8 @@ mod tests {
         );
     }
 
+    /// Proves object identities are validated, not merely parsed: an empty or
+    /// over-long segment and a flattened namespace are all refused.
     #[test]
     fn malformed_identities_are_rejected() {
         assert!(PermissionScope::All.validate().is_ok());
@@ -303,6 +313,8 @@ mod tests {
         );
     }
 
+    /// Proves a non-UUID table identity fails at decode, so no unresolvable
+    /// object identity can reach the synchronous checker.
     #[test]
     fn malformed_table_identity_is_rejected_at_decode() {
         let error = serde_json::from_value::<PermissionScope>(serde_json::json!({

@@ -244,21 +244,33 @@ impl Permission {
     /// Rejects a permission whose object scope cannot apply to its operation.
     ///
     /// Bifrost object scope is meaningful only for the Bifrost query and
-    /// sensitive-payload read resources. A wildcard or multi-resource grant
-    /// keeps object-wide reach only with [`PermissionScope::All`], which is
-    /// what stops a wildcard from inheriting one table's narrow authority.
+    /// sensitive-payload read resources, and only for the exact `read` action.
+    /// A wildcard or multi-resource grant on either axis keeps object-wide
+    /// reach only with [`PermissionScope::All`], which is what stops a
+    /// wildcard from inheriting one table's narrow authority.
     ///
     /// # Errors
     ///
     /// Returns the scope's own identity failure, or
     /// [`PermissionScopeError::InvalidIdentifier`] with field `resource` when a
-    /// Bifrost scope is attached to a resource that owns no Bifrost object.
+    /// Bifrost scope is attached to a resource that owns no Bifrost object, or
+    /// with field `action` when it is attached to any action other than
+    /// [`Action::Read`].
     pub fn validate(&self) -> Result<(), PermissionScopeError> {
         self.scope.validate()?;
-        if self.scope.is_bifrost() && !self.resource.accepts_bifrost_scope() {
+        if !self.scope.is_bifrost() {
+            return Ok(());
+        }
+        if !self.resource.accepts_bifrost_scope() {
             return Err(PermissionScopeError::InvalidIdentifier {
                 field: "resource",
                 value: self.resource.as_str().unwrap_or("any_of").to_owned(),
+            });
+        }
+        if self.action != Action::Read {
+            return Err(PermissionScopeError::InvalidIdentifier {
+                field: "action",
+                value: self.action.as_str().unwrap_or("any_of").to_owned(),
             });
         }
         Ok(())
@@ -880,6 +892,8 @@ mod tests {
         }
     }
 
+    /// Proves the persisted permission JSON is exactly the approved three-field
+    /// projection for `all`, schema, and table scope, in both directions.
     #[test]
     fn scoped_permission_json_matches_the_approved_projection() {
         let uid = uuid::Uuid::from_u128(0x99);
@@ -922,6 +936,8 @@ mod tests {
         }
     }
 
+    /// Proves `scope` is mandatory: the pre-scope two-field form is rejected
+    /// rather than defaulted, so no compatibility decoder exists.
     #[test]
     fn scope_is_required_and_has_no_compatibility_decoder() {
         let error = serde_json::from_value::<Permission>(json!({
@@ -933,6 +949,8 @@ mod tests {
         assert!(error.to_string().contains("scope"), "{error}");
     }
 
+    /// Proves a Bifrost object scope only attaches to a resource that owns a
+    /// Bifrost object; `cards` and `wildcard` both fail closed at decode.
     #[test]
     fn bifrost_scope_is_rejected_on_an_unrelated_resource() {
         for resource in ["cards", "wildcard"] {
@@ -944,6 +962,46 @@ mod tests {
             .expect_err("a Bifrost object scope needs a Bifrost object resource");
 
             assert!(error.to_string().contains("resource"), "{error}");
+        }
+    }
+
+    /// Proves a structurally valid but empty object identity is not an object:
+    /// malformed identities fail at decode, never at check time.
+    /// Proves Bifrost object scope is valid only for the exact `read` action.
+    ///
+    /// Without this, persisted or signed JSON could carry a Bifrost scope on
+    /// `wildcard`, which then covers the required read and turns corrupt role
+    /// JSON into effective read authority instead of a decode failure.
+    #[test]
+    fn bifrost_scope_is_rejected_on_a_non_read_action() {
+        for action in [
+            json!("write"),
+            json!("wildcard"),
+            json!({"any_of": ["read", "write"]}),
+        ] {
+            let error = serde_json::from_value::<Permission>(json!({
+                "resource": "bifrost_query",
+                "action": action,
+                "scope": {"bifrost": {"schema": {"catalog": "vala", "schema": "logs"}}}
+            }))
+            .expect_err("a Bifrost object scope only applies to an exact read");
+
+            assert!(error.to_string().contains("action"), "{error}");
+        }
+
+        for resource in [
+            "bifrost_query",
+            "bifrost_trace_payload",
+            "bifrost_log_payload",
+            "bifrost_gen_ai_payload",
+            "bifrost_agent_trace_payload",
+        ] {
+            serde_json::from_value::<Permission>(json!({
+                "resource": resource,
+                "action": "read",
+                "scope": {"bifrost": {"schema": {"catalog": "vala", "schema": "logs"}}}
+            }))
+            .expect("exact read stays valid for every scoped Bifrost resource");
         }
     }
 
@@ -960,6 +1018,8 @@ mod tests {
         );
     }
 
+    /// Proves coverage requires resource, action, and scope together, and that
+    /// wildcard authority stays object-wide only because its scope is `All`.
     #[test]
     fn coverage_is_three_axis() {
         let logs = uuid::Uuid::from_u128(1);
@@ -986,6 +1046,8 @@ mod tests {
         assert!(!logs_schema_grant().covers(&Permission::bifrost_query_read()));
     }
 
+    /// Proves coarse operation admission and authoritative object coverage are
+    /// distinct: a scoped grant admits the operation but authorizes only its object.
     #[test]
     fn covers_operation_admits_a_scoped_grant_without_authorizing_an_object() {
         let set = PermissionSet::from_iter([logs_schema_grant()]);
@@ -997,6 +1059,8 @@ mod tests {
         assert!(!set.contains(&table_requirement("traces", uuid::Uuid::from_u128(7))));
     }
 
+    /// Proves set subsumption runs on all three axes: disjoint scopes are both
+    /// retained, and an `All`-scoped grant absorbs every narrower scope.
     #[test]
     fn permission_set_keeps_scopes_that_do_not_subsume_each_other() {
         let mut set = PermissionSet::from_iter([logs_schema_grant()]);

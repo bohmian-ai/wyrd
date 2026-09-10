@@ -130,6 +130,8 @@ mod pg_tests {
         );
     }
 
+    /// Proves stored role JSONB resolves scoped grants through the existing
+    /// decode path, and that a scope-less row is surfaced as a corrupt role.
     #[test]
     fn decodes_scoped_bifrost_grants_and_rejects_unscoped_rows() {
         let uid = uuid::Uuid::now_v7();
@@ -181,6 +183,33 @@ mod pg_tests {
         .expect_err("a scope-less grant is not decoded");
 
         assert!(error.to_string().contains("unscoped"), "{error}");
+    }
+
+    /// Proves stored role JSONB carrying a Bifrost scope on a non-read action is
+    /// rejected as a corrupt role rather than resolved into read authority.
+    ///
+    /// `wildcard` is the dangerous case: it would otherwise cover the required
+    /// read while inheriting one schema's narrow object scope.
+    #[test]
+    fn rejects_bifrost_scope_on_a_non_read_action() {
+        for action in [
+            json!("write"),
+            json!("wildcard"),
+            json!({"any_of": ["read", "write"]}),
+        ] {
+            let error = permission_set_from_rows(vec![RoleRow {
+                id: uuid::Uuid::nil(),
+                name: "corrupt_analyst".to_owned(),
+                permissions: json!([{
+                    "resource": "bifrost_query",
+                    "action": action,
+                    "scope": {"bifrost": {"schema": {"catalog": "vala", "schema": "logs"}}}
+                }]),
+            }])
+            .expect_err("a Bifrost object scope only applies to an exact read");
+
+            assert!(error.to_string().contains("corrupt_analyst"), "{error}");
+        }
     }
 
     /// Builds one Bifrost query-read permission at the supplied object scope.

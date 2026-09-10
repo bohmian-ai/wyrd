@@ -5503,6 +5503,8 @@ mod tests {
         }))
     }
 
+    /// Proves the sensitive-payload requirement carries the same resolved-table
+    /// object scope, and that the query grant for that table is a separate authority.
     #[test]
     fn payload_permission_requires_the_resolved_table_scope() {
         let uid = uuid::Uuid::from_u128(5);
@@ -5538,6 +5540,8 @@ mod tests {
         assert!(!other.covers(&permission));
     }
 
+    /// Proves scope does not invent a payload gate: a table the doctrine names
+    /// no payload resource for still requires no payload permission.
     #[test]
     fn payload_permission_is_absent_for_ungated_tables() {
         assert!(
@@ -5553,6 +5557,8 @@ mod tests {
         );
     }
 
+    /// Proves the peer-verified digest binds both axes of the coordinator's
+    /// decision: the operation and the exact, order-independent approved table set.
     #[test]
     fn scoped_permission_digest_binds_the_authorized_table_set() {
         let permission = Permission::bifrost_query_read();

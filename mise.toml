@@ -251,6 +251,14 @@ hide = true
 description = "wyrd-testing `oracle` binary, whole"
 run = "cargo nextest run --locked -p wyrd-testing --test oracle -P journey --run-ignored=all"
 
+[tasks."test:bifrost:journey:otlp"]
+description = "Tier-1 journeys: OTLP trace, log, metric, mixed-batch and negative protocol surfaces"
+run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run test:bifrost:journey:otlp:inner'"
+[tasks."test:bifrost:journey:otlp:inner"]
+hide = true
+description = "wyrd-testing `otlp` binary, whole"
+run = "cargo nextest run --locked -p wyrd-testing --test otlp -P journey --run-ignored=all"
+
 [tasks."test:bifrost:journey:server"]
 description = "Tier-1 journeys: gRPC mount, server boot, owner lifecycle and inspection"
 run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:inner && mise run test:bifrost:journey:server:inner'"

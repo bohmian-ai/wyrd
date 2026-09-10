@@ -37,6 +37,10 @@ name = "oracle"
 path = "tests/bifrost/oracle/main.rs"
 
 [[test]]
+name = "otlp"
+path = "tests/bifrost/otlp/main.rs"
+
+[[test]]
 name = "server"
 path = "tests/bifrost/server/main.rs"
 

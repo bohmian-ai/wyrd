@@ -18,6 +18,7 @@ capabilities=(
   forge
   scribe
   oracle
+  otlp
   server
   mcp
 )

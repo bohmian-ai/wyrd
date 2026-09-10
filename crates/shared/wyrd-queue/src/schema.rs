@@ -270,6 +270,12 @@ fn spec_to_field(spec: &FieldSpec) -> Field {
         data_type_to_arrow(&spec.data_type),
         spec.nullable,
     )
+    .with_metadata(
+        spec.metadata
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    )
 }
 
 fn dtspec_from_arrow(dt: &DataType) -> DataTypeSpec {

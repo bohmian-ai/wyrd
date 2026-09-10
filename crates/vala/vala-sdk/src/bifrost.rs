@@ -281,6 +281,40 @@ impl Bifrost {
             .map_err(Into::into)
     }
 
+    /// Write one already-built Arrow batch to `table` and await its durability.
+    ///
+    /// This is the write door for data whose columns the JSON row path cannot
+    /// express — binary payloads, fixed-size identities, and nested list or
+    /// struct columns — which is what the canonical signal tables are made of.
+    /// Build the batch from the table's own published contract
+    /// ([`Self::describe`] plus `wyrd_queue::schema::writable_schema`) rather
+    /// than from a restated schema.
+    ///
+    /// The table is named explicitly instead of taken from the bound active
+    /// table: a batch of this kind targets one specific existing table, and
+    /// binding one would invite a registration this caller does not want.
+    ///
+    /// The batch is sent verbatim. Whether its columns satisfy the destination
+    /// table's canonical contract is the server's judgement, and it answers
+    /// with its own stable whole-batch refusal; this client does not pre-check
+    /// it, because a second implementation of that contract is exactly what
+    /// would drift.
+    ///
+    /// Unlike [`Self::insert`], durability is complete when this resolves — the
+    /// batch is not buffered and needs no [`Self::flush`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValaSdkError::Queue`] when the batch cannot be encoded,
+    /// exceeds the accepted frame ceiling, or cannot fit this client's byte
+    /// envelope, and the server's stable refusal when the batch is rejected.
+    pub async fn write_batch(&self, table: &str, batch: &RecordBatch) -> Result<(), ValaSdkError> {
+        self.writer
+            .write_batch(table, batch)
+            .await
+            .map_err(Into::into)
+    }
+
     /// Flush every pooled producer and await each durable acknowledgement.
     ///
     /// Every table this client has written is drained, not only the active one,

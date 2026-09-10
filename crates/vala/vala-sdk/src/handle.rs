@@ -6,10 +6,11 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use arrow::record_batch::RecordBatch;
 use arrow_schema::SchemaRef;
 use wyrd_queue::{
     BatchSink, ClientByteBudget, ClientByteGuard, ClientByteMetrics, Producer, QueueConfig,
-    WyrdQueueError,
+    SealedBatchSender, WyrdQueueError,
 };
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::vala::ids::RunId;
@@ -179,6 +180,37 @@ impl WriterPool {
         }
         self.producer_for(table, schema)?
             .enqueue(json, card_ref, run_id)
+    }
+
+    /// Send one caller-built Arrow batch as its own durable batch.
+    ///
+    /// This deliberately bypasses the producer pool. A producer exists to
+    /// accumulate and seal JSON rows; an Arrow batch arrives already sealed, so
+    /// routing it through a producer would only delay it and risk coalescing it
+    /// with buffered rows under a different identity. It is still charged
+    /// against this handle's one byte budget and settles through this handle's
+    /// one sink, so the accounting and transport contract are unchanged.
+    ///
+    /// Durability is complete when this resolves; unlike [`Self::insert`] there
+    /// is nothing left for a later flush to do.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WyrdQueueError::QueueFull`] once the pool has closed, and
+    /// otherwise the encode, byte-envelope, or stable server refusal reported
+    /// by [`SealedBatchSender::send`].
+    pub(crate) async fn write_batch(
+        &self,
+        table: &str,
+        batch: &RecordBatch,
+    ) -> Result<(), WyrdQueueError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(WyrdQueueError::QueueFull);
+        }
+        SealedBatchSender::new(Arc::clone(&self.sink), self.budget.clone(), self.config)
+            .send(table, batch)
+            .await
+            .map(|_| ())
     }
 
     /// Flush every pooled producer and wait for each sink acknowledgement.

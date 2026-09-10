@@ -25,6 +25,7 @@ pub mod error;
 pub mod producer;
 pub mod queue;
 pub mod schema;
+pub mod sealed_sender;
 pub mod sink;
 
 pub use batch_builder::{BatchBuilder, is_reserved_column};
@@ -41,6 +42,7 @@ pub use queue::{Flushable, RecordQueue, Row};
 pub use schema::{
     arrow_schema_to_fieldspec, fieldspec_to_arrow, json_schema_to_arrow, json_schema_to_fieldspec,
 };
+pub use sealed_sender::SealedBatchSender;
 pub use sink::{
     BatchSink, DurableBatchAck, MockSink, OwnedIpcBytes, SealedBatch, SharedIpcBytes, SinkError,
 };

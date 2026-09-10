@@ -1092,10 +1092,14 @@ mod pg_tests {
                 "`{}` keeps its stored nullability",
                 stored.name()
             );
-            assert!(
-                described.metadata().is_empty(),
-                "`{}` sends no field id: the id is the server's physical \
-                 identity, which it assigns and ignores on an incoming batch",
+            assert_eq!(
+                described.metadata(),
+                stored.metadata(),
+                "`{}` republishes the table layer's own field identity: a \
+                 canonical built-in's ingress compares an incoming user block \
+                 against its declared fields exactly, so a writer that cannot \
+                 read the stable id and sensitivity from the description \
+                 cannot build an acceptable batch without restating them",
                 stored.name()
             );
         }

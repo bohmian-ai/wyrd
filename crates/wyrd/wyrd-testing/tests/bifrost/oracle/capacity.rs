@@ -23,6 +23,7 @@ use sha2::{Digest as _, Sha256};
 use vala_bifrost_redux::oracle::{QueryIpcDecoder, QueryResourceProbe, QueryResourceSnapshot};
 use vala_bifrost_redux::resources::{ResourceSource, SystemResourceSnapshot};
 use vala_sdk::QueryClient;
+use wyrd_client::WyrdClient;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::{
     BifrostQueryRequest, FreshnessPolicy, QueryStreamFrame, QueryTerminalOutcome, VisibilityMode,
@@ -1431,4 +1432,397 @@ async fn drain_query(query: &QueryClient, sql: &str) -> Result<u64, String> {
         Some(QueryTerminalOutcome::Success | QueryTerminalOutcome::Degraded) => Ok(rows),
         other => Err(format!("terminal {other:?}")),
     }
+}
+
+/// Rows seeded into each tenant's table for the bounded-scheduling journey.
+const SCHEDULING_ROWS: i64 = 24;
+
+/// Distinct `filter_key` groups the scheduling fixture rows fall into.
+///
+/// Also the row count the grouped Analytical statement must return.
+const SCHEDULING_GROUPS: i64 = 4;
+
+/// Concurrent Interactive queries the lowest supported Oracle rung seats.
+///
+/// The rung derives four slot units from two effective CPUs and protects one
+/// of them for Interactive work. Slot units are not what binds here: every
+/// admitted query leases 256 MiB of scratch per unit against this rung's
+/// 768 MiB scratch capacity, so the fourth concurrent Interactive query is
+/// refused for scratch while a slot unit is still free. Three is still three
+/// times the one unit the rung protects, so seating them is only possible by
+/// borrowing idle Analytical capacity.
+const SCHEDULING_HOLDS: usize = 3;
+
+/// Contention rounds run while exactly one slot unit remains free.
+///
+/// Each round submits both tenants concurrently against a single free unit, so
+/// one tenant is served and the other is refused. Four rounds is enough for a
+/// rotation that ignored a tenant to show as that tenant never being served.
+const SCHEDULING_ROTATION_ROUNDS: usize = 4;
+
+/// Two tenants make bounded progress across both query classes on one pod.
+///
+/// Covers, through real authenticated requests against a live server: idle
+/// Analytical capacity borrowed by Interactive work, retryable overload once
+/// the pod is saturated, tenant rotation that serves both tenants from a
+/// single free slot unit, the Interactive floor an Analytical query cannot
+/// cross, and eventual progress for both classes once the pod drains.
+///
+/// # Panics
+///
+/// Panics when any admission, refusal, rotation, floor, or progress claim
+/// fails.
+// Four pods and several concurrent client streams share this runtime; on the
+// single-threaded default the parked streams starve the pods' own heartbeats
+// and the Oracle role leases expire for a reason no deployment would produce.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn two_tenants_make_bounded_progress_across_query_classes() {
+    prove_two_tenant_bounded_progress()
+        .await
+        .expect("two-tenant bounded Oracle scheduling journey");
+}
+
+/// Drives the complete two-tenant scheduling journey over one live cluster.
+///
+/// # Errors
+///
+/// Returns the first scheduling claim that broke.
+async fn prove_two_tenant_bounded_progress() -> Result<(), JourneyError> {
+    let cluster = WyrdTestCluster::start_spec(
+        BifrostClusterSpec::three_oracles_one_scribe()
+            .with_system_resources(oracle_floor_observation()),
+    )
+    .await?;
+    let tenants = [
+        cluster.data_tenant_id(),
+        cluster.add_tenant("scheduling-peer").await?,
+    ];
+    let ingest = cluster
+        .servers()
+        .find(|server| server.bifrost_scribe().is_some())
+        .ok_or("missing ingest node")?;
+    let suffix = uuid::Uuid::now_v7().simple();
+    let mut tables = Vec::new();
+    let mut clients = Vec::new();
+    let server = cluster.server(0).ok_or("missing query node")?;
+    for (index, tenant) in tenants.iter().enumerate() {
+        let table = format!("scheduling_{index}_{suffix}");
+        seed_fixture_table(ingest, *tenant, &table, SCHEDULING_ROWS, SCHEDULING_GROUPS).await?;
+        clients.push(
+            client_for_tenant(server, *tenant, &format!("scheduling-{index}-{suffix}")).await?,
+        );
+        tables.push(table);
+    }
+    cluster.refresh_oracle_snapshots().await?;
+
+    // Idle-capacity borrowing: the rung protects one Interactive unit and
+    // offers three to Analytical, so seating four concurrent Interactive
+    // queries is only possible by borrowing every idle Analytical unit.
+    let mut held = Vec::new();
+    for index in 0..SCHEDULING_HOLDS {
+        let slot = index % clients.len();
+        held.push(
+            hold_envelope(
+                server,
+                &clients[slot],
+                &scheduling_interactive_sql(&tables[slot]),
+            )
+            .await
+            .map_err(|error| format!("hold {index}: {error}"))?,
+        );
+    }
+    let borrowed = class_gauge(&cluster, "interactive")?;
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "three concurrent queries is exact in f64"
+    )]
+    let expected = SCHEDULING_HOLDS as f64;
+    if (borrowed - expected).abs() > f64::EPSILON {
+        return Err(format!(
+            "the saturated pod reported {borrowed} active Interactive queries, not {expected}"
+        )
+        .into());
+    }
+
+    prove_saturated_pod_refuses_retryably(&clients, &tables).await?;
+
+    // Rotation: exactly one unit is free from here, so each round can serve
+    // exactly one of the two tenants that ask for it at the same moment.
+    release_envelope(
+        &cluster,
+        held.pop().ok_or("no held envelope to release")?,
+        "interactive",
+        expected - 1.0,
+    )
+    .await?;
+    prove_rotation_serves_both_tenants(&clients, &tables).await?;
+
+    for (index, envelope) in held.into_iter().enumerate() {
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "at most three concurrent queries is exact in f64"
+        )]
+        let remaining = (SCHEDULING_HOLDS - 2 - index) as f64;
+        release_envelope(&cluster, envelope, "interactive", remaining).await?;
+    }
+
+    prove_analytical_cannot_cross_the_interactive_floor(&cluster, server, &clients, &tables)
+        .await?;
+    prove_both_classes_progress(&clients, &tables).await?;
+
+    cluster.shutdown().await?;
+    Ok(())
+}
+
+/// Builds the flat bounded projection the planner keeps Interactive.
+///
+/// Any global operator would make the plan distributed, and therefore
+/// Analytical, however few rows it reads.
+fn scheduling_interactive_sql(table: &str) -> String {
+    format!("SELECT id, filter_key FROM vala.bifrost.{table}")
+}
+
+/// Builds the grouped aggregate the planner distributes as Analytical.
+fn scheduling_analytical_sql(table: &str) -> String {
+    format!("SELECT filter_key, COUNT(*) AS matched FROM vala.bifrost.{table} GROUP BY filter_key")
+}
+
+/// Admits one query through the public path and parks it holding its envelope.
+///
+/// The stall is the repository's existing schema-frame control: the query is a
+/// real admitted query that owns real slot units and a real grant, and it is
+/// released by dropping its stream exactly as an abandoned client would.
+///
+/// # Errors
+///
+/// Returns an error when the request is refused rather than admitted, or when
+/// the admitted query never reaches its schema stall.
+async fn hold_envelope(
+    server: &WyrdTestServer,
+    client: &WyrdClient,
+    sql: &str,
+) -> Result<tokio::task::JoinHandle<()>, JourneyError> {
+    server.stall_next_query_after_schema();
+    let stream = QueryClient::new(client)
+        .query(&BifrostQueryRequest {
+            sql: sql.to_owned(),
+            visibility: VisibilityMode::PublishedOnly,
+            freshness: FreshnessPolicy::Strict,
+            deadline_ms: Some(REFUSAL_HOLDER_DEADLINE_MS),
+        })
+        .await
+        .map_err(|error| format!("parked query was not admitted: {error}"))?;
+    let task = tokio::spawn(async move {
+        let mut stream = stream;
+        let _ = stream.next_batch().await;
+    });
+    server.wait_query_schema_stall().await?;
+    Ok(task)
+}
+
+/// Drops one parked stream and waits for its class gauge to fall to `expected`.
+///
+/// # Errors
+///
+/// Returns an error when the abandoned query never returns its slot units.
+async fn release_envelope(
+    cluster: &WyrdTestCluster,
+    task: tokio::task::JoinHandle<()>,
+    class: &str,
+    expected: f64,
+) -> Result<(), JourneyError> {
+    task.abort();
+    let _ = task.await;
+    for _ in 0..PHYSICAL_EVIDENCE_POLLS {
+        if (class_gauge(cluster, class)? - expected).abs() < f64::EPSILON {
+            return Ok(());
+        }
+        tokio::time::sleep(PHYSICAL_EVIDENCE_INTERVAL).await;
+    }
+    Err(format!(
+        "a released {class} envelope left the gauge at {}, not {expected}",
+        class_gauge(cluster, class)?
+    )
+    .into())
+}
+
+/// Proves a saturated pod refuses both classes with the retryable typed code.
+///
+/// The refusal is bounded by the pod-local queue wait, so a caller is told to
+/// retry within it rather than being held for its whole request deadline.
+///
+/// # Errors
+///
+/// Returns an error when a saturated pod admits a query, refuses it with some
+/// other error, or holds the caller past the bounded refusal deadline.
+async fn prove_saturated_pod_refuses_retryably(
+    clients: &[WyrdClient],
+    tables: &[String],
+) -> Result<(), JourneyError> {
+    for (index, client) in clients.iter().enumerate() {
+        for (label, sql) in [
+            ("interactive", scheduling_interactive_sql(&tables[index])),
+            ("analytical", scheduling_analytical_sql(&tables[index])),
+        ] {
+            let started = std::time::Instant::now();
+            let refusal = drain_query(&QueryClient::new(client), &sql)
+                .await
+                .err()
+                .ok_or_else(|| format!("the saturated pod admitted another {label} query"))?;
+            if !refusal.contains(QUERY_ADMISSION_REJECTED_CODE) {
+                return Err(format!(
+                    "the saturated pod refused a {label} query with {refusal}, not the retryable \
+                     capacity code"
+                )
+                .into());
+            }
+            if started.elapsed() > OBSERVATION_DEADLINE {
+                return Err(format!(
+                    "a {label} refusal took {:?}, so it was not bounded by the queue wait",
+                    started.elapsed()
+                )
+                .into());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Proves one free slot unit is rotated between two concurrently asking tenants.
+///
+/// Every round both tenants submit at the same moment against a single free
+/// unit, so exactly one is served and the other receives the retryable code.
+/// A rotation that ignored a tenant would show as that tenant never being
+/// served across every round.
+///
+/// # Errors
+///
+/// Returns an error when a served query returns the wrong rows, when a refusal
+/// carries some other error, or when either tenant was never served.
+async fn prove_rotation_serves_both_tenants(
+    clients: &[WyrdClient],
+    tables: &[String],
+) -> Result<(), JourneyError> {
+    let mut served = vec![0_usize; clients.len()];
+    for _ in 0..SCHEDULING_ROTATION_ROUNDS {
+        let first_query = QueryClient::new(&clients[0]);
+        let second_query = QueryClient::new(&clients[1]);
+        let first_sql = scheduling_interactive_sql(&tables[0]);
+        let second_sql = scheduling_interactive_sql(&tables[1]);
+        let (first, second) = tokio::join!(
+            drain_query(&first_query, &first_sql),
+            drain_query(&second_query, &second_sql),
+        );
+        for (index, outcome) in [first, second].into_iter().enumerate() {
+            match outcome {
+                Ok(rows) if rows == u64::try_from(SCHEDULING_ROWS)? => served[index] += 1,
+                Ok(rows) => {
+                    return Err(format!(
+                        "tenant {index} was served {rows} rows, not {SCHEDULING_ROWS}"
+                    )
+                    .into());
+                }
+                Err(refusal) if refusal.contains(QUERY_ADMISSION_REJECTED_CODE) => {}
+                Err(refusal) => {
+                    return Err(format!(
+                        "tenant {index} was refused with {refusal}, not retryably"
+                    )
+                    .into());
+                }
+            }
+        }
+    }
+    if let Some(index) = served.iter().position(|count| *count == 0) {
+        return Err(format!(
+            "rotation never served tenant {index} across {SCHEDULING_ROTATION_ROUNDS} rounds: \
+             {served:?}"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Proves a live Analytical query cannot take the units Interactive is owed.
+///
+/// One Analytical query costs two of this rung's four units and the Analytical
+/// maximum cannot seat a second, so two units always remain for Interactive
+/// work no matter how much Analytical work is offered.
+///
+/// # Errors
+///
+/// Returns an error when a second Analytical query is admitted, when either
+/// tenant's Interactive query is refused, or when the parked Analytical query
+/// does not release its envelope.
+async fn prove_analytical_cannot_cross_the_interactive_floor(
+    cluster: &WyrdTestCluster,
+    server: &WyrdTestServer,
+    clients: &[WyrdClient],
+    tables: &[String],
+) -> Result<(), JourneyError> {
+    let parked = hold_envelope(server, &clients[0], &scheduling_analytical_sql(&tables[0])).await?;
+    let refusal = drain_query(
+        &QueryClient::new(&clients[1]),
+        &scheduling_analytical_sql(&tables[1]),
+    )
+    .await
+    .err()
+    .ok_or("the rung seated a second Analytical query")?;
+    if !refusal.contains(QUERY_ADMISSION_REJECTED_CODE) {
+        return Err(format!(
+            "the second Analytical query failed with {refusal}, not the capacity code"
+        )
+        .into());
+    }
+    for (index, client) in clients.iter().enumerate() {
+        let rows = drain_query(
+            &QueryClient::new(client),
+            &scheduling_interactive_sql(&tables[index]),
+        )
+        .await
+        .map_err(|refusal| {
+            format!("live Analytical work refused tenant {index}'s floor query: {refusal}")
+        })?;
+        if rows != u64::try_from(SCHEDULING_ROWS)? {
+            return Err(format!("tenant {index}'s floor query returned {rows} rows").into());
+        }
+    }
+    release_envelope(cluster, parked, "analytical", 0.0).await
+}
+
+/// Proves both tenants complete both classes once the pod has drained.
+///
+/// # Errors
+///
+/// Returns an error when either class is refused or returns the wrong rows.
+async fn prove_both_classes_progress(
+    clients: &[WyrdClient],
+    tables: &[String],
+) -> Result<(), JourneyError> {
+    for (index, client) in clients.iter().enumerate() {
+        let query = QueryClient::new(client);
+        for (label, sql, expected) in [
+            (
+                "interactive",
+                scheduling_interactive_sql(&tables[index]),
+                u64::try_from(SCHEDULING_ROWS)?,
+            ),
+            (
+                "analytical",
+                scheduling_analytical_sql(&tables[index]),
+                u64::try_from(SCHEDULING_GROUPS)?,
+            ),
+        ] {
+            let rows = drain_query(&query, &sql).await.map_err(|refusal| {
+                format!("the drained pod refused tenant {index}'s {label} query: {refusal}")
+            })?;
+            if rows != expected {
+                return Err(format!(
+                    "tenant {index}'s {label} query returned {rows} rows, not {expected}"
+                )
+                .into());
+            }
+        }
+    }
+    Ok(())
 }

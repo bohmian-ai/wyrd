@@ -577,9 +577,13 @@ fn decode_rows(
 /// ledger plus the permitted correlation columns (`card_ref`, `run_id`, and an
 /// optional `wyrd_event_time`). This rejects any unknown `wyrd_*` field, runs
 /// the table's own registered value validator over
-/// the remaining user block, and then requires that block to equal
-/// `(definition.arrow_fields)()` exactly, so no normalized-but-different Arrow
-/// spelling reaches the physical schema.
+/// the remaining user block, and then requires that block to match
+/// `(definition.arrow_fields)()` in order, name, nullability, and type shape,
+/// so no structurally different Arrow spelling reaches the physical schema.
+/// Field metadata is not compared: the stable id and sensitivity tag are the
+/// server's own physical identity, stamped downstream from the definition, so
+/// a writer building from the published description neither supplies them nor
+/// can be wrong about them.
 ///
 /// # Errors
 ///
@@ -608,7 +612,13 @@ fn enforce_canonical_source_contract(
         columns.push(Arc::clone(rows.column(index)));
     }
     let declared = (definition.arrow_fields)();
-    if fields != declared {
+    let shape_matches = fields.len() == declared.len()
+        && fields.iter().zip(&declared).all(|(supplied, expected)| {
+            supplied.name() == expected.name()
+                && supplied.is_nullable() == expected.is_nullable()
+                && supplied.data_type().equals_datatype(expected.data_type())
+        });
+    if !shape_matches {
         return Err(ScribeError::FingerprintMismatch {
             table: format!("{}.{}", definition.namespace, definition.name),
         });

@@ -673,8 +673,12 @@ pub fn required_binary(array: &BinaryArray, row: usize) -> Result<&[u8], &'stati
 /// canonical columns in any order and still be accepted, and the returned batch
 /// is that input projected back into declared ledger order so every downstream
 /// authority sees one canonical column order. For each declared field the
-/// supplied field must agree on stable id, Arrow type, nullability, and
-/// sensitivity metadata, recursively through every nested child. Canonical
+/// supplied field must agree on Arrow type shape and nullability, recursively
+/// through every nested child. Field metadata is deliberately not compared:
+/// the stable id and sensitivity tag are the server's own physical identity,
+/// re-derived here when the validated columns are reassembled under the
+/// declared schema, so a writer neither supplies nor can be wrong about them.
+/// Canonical
 /// binary payloads are additionally decoded and re-encoded so a malformed or
 /// non-canonical protobuf value is refused before any row is accepted.
 ///
@@ -722,8 +726,8 @@ pub fn validate_canonical_user_batch(
 ///
 /// # Errors
 ///
-/// Returns a stable reason naming the first disagreement in name, stable id,
-/// type, nullability, sensitivity, or any nested child.
+/// Returns a stable reason naming the first disagreement in name, type shape,
+/// nullability, or any nested child.
 fn validate_field_identity(declared: &CanonicalField, supplied: &Field) -> Result<(), String> {
     if supplied.name() != declared.name {
         return Err(format!(
@@ -733,7 +737,7 @@ fn validate_field_identity(declared: &CanonicalField, supplied: &Field) -> Resul
         ));
     }
     let expected = declared.to_arrow();
-    if supplied.data_type() != expected.data_type() {
+    if !supplied.data_type().equals_datatype(expected.data_type()) {
         return Err(format!(
             "canonical field {} has type {}, expected {}",
             declared.name,
@@ -748,14 +752,6 @@ fn validate_field_identity(declared: &CanonicalField, supplied: &Field) -> Resul
             supplied.is_nullable(),
             declared.nullable
         ));
-    }
-    for key in [fields::PARQUET_FIELD_ID, fields::WYRD_SENSITIVE] {
-        if supplied.metadata().get(key) != expected.metadata().get(key) {
-            return Err(format!(
-                "canonical field {} carries the wrong {key}",
-                declared.name
-            ));
-        }
     }
     Ok(())
 }

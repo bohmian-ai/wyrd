@@ -1092,14 +1092,12 @@ mod pg_tests {
                 "`{}` keeps its stored nullability",
                 stored.name()
             );
-            assert_eq!(
-                described.metadata(),
-                stored.metadata(),
-                "`{}` republishes the table layer's own field identity: a \
-                 canonical built-in's ingress compares an incoming user block \
-                 against its declared fields exactly, so a writer that cannot \
-                 read the stable id and sensitivity from the description \
-                 cannot build an acceptable batch without restating them",
+            assert!(
+                described.metadata().is_empty(),
+                "`{}` sends no field identity: the stable id and sensitivity \
+                 tag are the server's own, re-derived on every stamp, so \
+                 ingress compares an incoming block by shape and never asks a \
+                 writer to restate them",
                 stored.name()
             );
         }

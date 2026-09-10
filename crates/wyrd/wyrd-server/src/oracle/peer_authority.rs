@@ -1755,13 +1755,16 @@ mod tests {
         use wyrd_spec::request_id::RequestId;
         use wyrd_spec::vala::api::{FreshnessPolicy, VisibilityMode};
 
+        // The route admits on the coarse capability while the principal holds
+        // only a schema-scoped grant, which is exactly the shape a worker would
+        // have to widen to read a table the coordinator never approved.
         let permission = Permission::bifrost_query_read();
         let principal = Principal::new(
             PrincipalId::new(uuid::Uuid::now_v7()),
             PrincipalKind::User,
             tenant_id,
             Vec::new(),
-            PermissionSet::from_iter([permission.clone()]),
+            PermissionSet::from_iter([scoped_logs_grant()]),
         );
         let context = vala_bifrost_redux::oracle::AuthorizedQueryContext::try_new(
             principal,
@@ -1786,6 +1789,20 @@ mod tests {
                 deadline_ms: Some(5_000),
             },
             absolute_deadline_ms: (now + chrono::Duration::seconds(30)).timestamp_millis(),
+        }
+    }
+
+    /// Builds the schema-scoped `vala.logs` query-read grant the fixture carries.
+    fn scoped_logs_grant() -> wyrd_runtime::Permission {
+        wyrd_runtime::Permission {
+            resource: wyrd_runtime::Resource::BifrostQuery,
+            action: wyrd_runtime::Action::Read,
+            scope: wyrd_runtime::PermissionScope::Bifrost(
+                wyrd_runtime::BifrostPermissionScope::Schema(wyrd_runtime::BifrostSchemaScope {
+                    catalog: "vala".to_owned(),
+                    schema: "logs".to_owned(),
+                }),
+            ),
         }
     }
 
@@ -1922,6 +1939,20 @@ mod tests {
             },
             ForwardQueryClaims {
                 nonce: uuid::Uuid::now_v7().as_bytes().to_vec(),
+                ..base.clone()
+            },
+            // Widening the signed principal's object authority is the exact
+            // move a compromised worker would make to reach a table the
+            // coordinator never approved; the detached signature refuses it.
+            ForwardQueryClaims {
+                context: {
+                    let mut widened = base.context.clone();
+                    widened.principal.effective_permissions =
+                        wyrd_runtime::permission::PermissionSet::from_iter([
+                            wyrd_runtime::Permission::wildcard(),
+                        ]);
+                    widened
+                },
                 ..base.clone()
             },
         ];

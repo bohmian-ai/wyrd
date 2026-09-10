@@ -111,6 +111,27 @@ impl BifrostWriter {
         self.handle.flush().await.map_err(WyrdError::from)
     }
 
+    /// Write one already-built Arrow batch and await its durability.
+    ///
+    /// This is the public batch door a canonical-signal caller uses: the batch
+    /// already carries the table's own writable schema, so nothing here
+    /// re-derives a row shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns the stable client error when the batch is refused or the
+    /// durable acknowledgement fails.
+    pub async fn write_batch(
+        &self,
+        table: &str,
+        batch: &arrow::record_batch::RecordBatch,
+    ) -> Result<(), WyrdError> {
+        self.handle
+            .write_batch(table, batch)
+            .await
+            .map_err(WyrdError::from)
+    }
+
     /// Enqueue every row for one table and flush them as one durable write.
     ///
     /// # Errors

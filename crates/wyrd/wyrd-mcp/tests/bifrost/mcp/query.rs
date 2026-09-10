@@ -666,4 +666,209 @@ mod pg_tests {
         server.shutdown().await?;
         Ok(())
     }
+
+    /// An agent answers a complete GenAI incident question over the three
+    /// canonical signal ledgers, and the payload gate holds against it.
+    ///
+    /// This is the agent-surface half of the canonical journey: nothing is
+    /// seeded through a private seam, the dataset arrives through the public
+    /// Arrow batch door, and every answer is read back through `bifrost.query`
+    /// SQL — the trace hierarchy, the promoted GenAI token aggregate, the log
+    /// correlated to the span that failed, and one metric aggregate. A caller
+    /// holding only `bifrost_query:read` is then refused the structured GenAI
+    /// messages, and the same call succeeds once its principal also holds
+    /// `bifrost_trace_payload:read`.
+    ///
+    /// # Errors
+    ///
+    /// Returns fixture, transport, tool-call, or shutdown failures.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires the Postgres-backed Bifrost journey lane"]
+    async fn agent_reads_canonical_trace_genai_logs_and_metrics_through_sql()
+    -> Result<(), McpJourneyError> {
+        use wyrd_testing::bifrost::canonical_signals as fixture;
+
+        let server = WyrdTestServer::start_bound().await?;
+        let seeded = fixture::seed_canonical_signals(&server, "mcp-canonical-signals").await?;
+        let scope = seeded.scope.as_str();
+        let client = ()
+            .serve_with_lifecycle(
+                transport(
+                    &server,
+                    ResolvedCredential::BearerToken(seeded.token.clone().into()),
+                    None,
+                )?,
+                discover(),
+            )
+            .await?;
+
+        let hierarchy = structured(
+            client
+                .call_tool(query(serde_json::json!({
+                    "sql": format!(
+                        "SELECT name, gen_ai_operation_name, status_code, \
+                         CAST(CASE WHEN parent_span_id IS NULL THEN 1 ELSE 0 END AS BIGINT) \
+                         AS is_root FROM vala.traces.spans WHERE scope_name = '{scope}' \
+                         ORDER BY start_time_unix_nano"
+                    ),
+                    "max_rows": 10,
+                })))
+                .await?,
+        )?;
+        assert_eq!(
+            hierarchy["rows"],
+            serde_json::json!([
+                ["chat claude-opus-5", "chat", 1, 1],
+                ["execute_tool search", "execute_tool", 2, 0],
+            ]),
+            "the agent reads the parent GenAI span and the tool span it made"
+        );
+
+        let tokens = structured(
+            client
+                .call_tool(query(serde_json::json!({
+                    "sql": format!(
+                        "SELECT CAST(SUM(gen_ai_usage_input_tokens) AS BIGINT) AS input_tokens, \
+                         CAST(SUM(gen_ai_usage_output_tokens) AS BIGINT) AS output_tokens, \
+                         CAST(COUNT(*) AS BIGINT) AS spans FROM vala.traces.spans \
+                         WHERE scope_name = '{scope}' AND gen_ai_request_model = '{model}'",
+                        model = fixture::MODEL,
+                    ),
+                    "max_rows": 10,
+                })))
+                .await?,
+        )?;
+        assert_eq!(
+            tokens["rows"],
+            serde_json::json!([[fixture::INPUT_TOKENS + 64, fixture::OUTPUT_TOKENS + 16, 2]]),
+            "promoted GenAI token columns aggregate for one model"
+        );
+
+        let correlated = structured(
+            client
+                .call_tool(query(serde_json::json!({
+                    "sql": format!(
+                        "SELECT l.severity_text, l.event_name, s.name AS span_name \
+                         FROM vala.logs.records l JOIN vala.traces.spans s \
+                         ON l.trace_id = s.trace_id AND l.span_id = s.span_id \
+                         WHERE l.scope_name = '{scope}'"
+                    ),
+                    "max_rows": 10,
+                })))
+                .await?,
+        )?;
+        assert_eq!(
+            correlated["rows"],
+            serde_json::json!([["ERROR", "tool.retry.exhausted", "execute_tool search"]]),
+            "the error log correlates to the span that failed"
+        );
+
+        let metrics = structured(
+            client
+                .call_tool(query(serde_json::json!({
+                    "sql": format!(
+                        "SELECT metric_type, \
+                         CAST(SUM(COALESCE(int_value, 0)) AS BIGINT) AS ints, \
+                         CAST(SUM(COALESCE(histogram_count, 0)) AS BIGINT) AS observations \
+                         FROM vala.metrics.points WHERE scope_name = '{scope}' \
+                         GROUP BY metric_type ORDER BY metric_type"
+                    ),
+                    "max_rows": 10,
+                })))
+                .await?,
+        )?;
+        assert_eq!(
+            metrics["rows"],
+            serde_json::json!([
+                ["gauge", 0, 0],
+                ["histogram", 0, fixture::HISTOGRAM_COUNT],
+                ["sum", fixture::COUNTER_VALUE, 0],
+            ]),
+            "each metric kind aggregates over its own value column"
+        );
+        assert_eq!(metrics["terminal"]["outcome"], serde_json::json!("success"));
+
+        // The payload gate, proved from the agent's side with two principals.
+        let payload_sql = format!(
+            "SELECT attributes FROM vala.traces.spans \
+             WHERE scope_name = '{scope}' AND parent_span_id IS NULL"
+        );
+        let metadata_only = agent_with_permissions(
+            &server,
+            "mcp_canonical_metadata",
+            &[wyrd_runtime::Permission::bifrost_query_read()],
+        )
+        .await?;
+        let refusal = problem(
+            metadata_only
+                .call_tool(query(serde_json::json!({"sql": payload_sql.clone()})))
+                .await?,
+        )?;
+        assert_eq!(
+            refusal["code"],
+            serde_json::json!("WYRD_VALA_403_PAYLOAD_FORBIDDEN"),
+            "an agent without payload permission cannot read the GenAI messages"
+        );
+        metadata_only.cancel().await?;
+
+        let authorized = agent_with_permissions(
+            &server,
+            "mcp_canonical_payload",
+            &[
+                wyrd_runtime::Permission::bifrost_query_read(),
+                "bifrost_trace_payload:read"
+                    .parse()
+                    .map_err(|_| "the payload permission parses")?,
+            ],
+        )
+        .await?;
+        let messages = structured(
+            authorized
+                .call_tool(query(serde_json::json!({"sql": payload_sql})))
+                .await?,
+        )?;
+        // The tool renders a binary column as hex, so the expected structured
+        // messages are compared in the same encoding the agent receives.
+        let payload = messages["rows"][0][0]
+            .as_str()
+            .ok_or("the attribute payload is a JSON string")?;
+        let hex_of = |text: &str| {
+            text.bytes()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        };
+        assert!(
+            payload.contains(&hex_of(fixture::INPUT_MESSAGES))
+                && payload.contains(&hex_of(fixture::OUTPUT_MESSAGES)),
+            "an authorized agent reads the structured GenAI messages: {payload}"
+        );
+        authorized.cancel().await?;
+
+        client.cancel().await?;
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    /// Connect one MCP client whose principal holds exactly `permissions`.
+    ///
+    /// # Errors
+    ///
+    /// Returns role-seeding, bootstrap, token-exchange, or transport failures.
+    async fn agent_with_permissions(
+        server: &WyrdTestServer,
+        role: &str,
+        permissions: &[wyrd_runtime::Permission],
+    ) -> Result<rmcp::service::RunningService<rmcp::service::RoleClient, ()>, McpJourneyError> {
+        server.seed_role(role, permissions).await?;
+        let bootstrap = server.bootstrap_service(role, &[role]).await?;
+        let token = server
+            .exchange_api_key(bootstrap.api_key().ok_or("a service carries a key")?)
+            .await?;
+        Ok(()
+            .serve_with_lifecycle(
+                transport(server, ResolvedCredential::BearerToken(token.into()), None)?,
+                discover(),
+            )
+            .await?)
+    }
 }

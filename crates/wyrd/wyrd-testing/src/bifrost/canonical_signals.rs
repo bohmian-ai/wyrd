@@ -464,3 +464,111 @@ pub fn points(schema: &SchemaRef, scope: &str, anchor_nanos: i64) -> RecordBatch
 
     batch(schema, &[counter, gauge, histogram])
 }
+
+/// A seeded canonical dataset plus the credentials an agent surface reads it
+/// with.
+#[derive(Debug, Clone)]
+pub struct SeededCanonicalSignals {
+    /// Bound Wyrd HTTP endpoint an MCP or CLI client connects to.
+    pub endpoint: String,
+    /// Short-lived bearer exchanged through the real auth route.
+    pub token: String,
+    /// Instrumentation scope every seeded row carries, which isolates this
+    /// dataset from anything else the server holds.
+    pub scope: String,
+}
+
+/// Provision the canonical ledgers and write one complete signal dataset.
+///
+/// The three tables are server-owned, so the harness provisions them, then
+/// writes through the same public Arrow batch door a caller has: each batch is
+/// built over the schema the table's own description publishes. After the
+/// Scribe flush the rows are readable through public SQL, which is what an
+/// agent surface journey needs in front of it.
+///
+/// # Errors
+///
+/// Returns a [`WyrdTestServerError`] when provisioning, bootstrap, describe,
+/// the batch write, the flush, endpoint discovery, or token exchange fails.
+pub async fn seed_canonical_signals(
+    server: &crate::server::WyrdTestServer,
+    name: &str,
+) -> Result<SeededCanonicalSignals, crate::server::WyrdTestServerError> {
+    use crate::server::WyrdTestServerError;
+
+    for (namespace, table) in [
+        ("traces", "spans"),
+        ("logs", "records"),
+        ("metrics", "points"),
+    ] {
+        server
+            .ensure_builtin_table_for_test(server.data_tenant_id(), namespace, table)
+            .await?;
+    }
+    let bootstrap = server.bootstrap_service(name, &["admin"]).await?;
+    let api_key = bootstrap
+        .api_key()
+        .ok_or_else(|| {
+            WyrdTestServerError::Auth("the canonical fixture requires a service key".into())
+        })?
+        .clone();
+    let card_ref = bootstrap
+        .card_ref()
+        .ok_or_else(|| {
+            WyrdTestServerError::Auth("the canonical fixture requires a machine principal".into())
+        })?
+        .clone();
+    let writer = crate::bifrost::write::BifrostWriter::connect(
+        wyrd_client::config::ClientConfig {
+            grpc: wyrd_client::transport::GrpcConfig {
+                endpoint: server
+                    .grpc_url()
+                    .ok_or_else(|| WyrdTestServerError::Start("missing gRPC URL".into()))?,
+                connect_retries: 0,
+                ..wyrd_client::transport::GrpcConfig::default()
+            },
+            http: wyrd_client::transport::HttpConfig {
+                base_url: server
+                    .base_url()
+                    .ok_or_else(|| WyrdTestServerError::Start("missing HTTP URL".into()))?
+                    .to_owned(),
+                ..wyrd_client::transport::HttpConfig::default()
+            },
+            credential: Some(api_key.clone()),
+            ..wyrd_client::config::ClientConfig::default()
+        },
+        card_ref,
+    )
+    .await
+    .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+
+    let scope = format!("wyrd.canonical.{}", uuid::Uuid::now_v7().simple());
+    let anchor = 1_760_000_000_000_000_000_i64;
+    for (fqn, build) in [
+        (
+            "vala.traces.spans",
+            spans as fn(&SchemaRef, &str, i64) -> RecordBatch,
+        ),
+        ("vala.logs.records", logs),
+        ("vala.metrics.points", points),
+    ] {
+        let described = vala_sdk::TableConfig::describe(writer.client(), fqn)
+            .await
+            .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+        writer
+            .write_batch(fqn, &build(described.user_schema(), &scope, anchor))
+            .await
+            .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+    }
+    server.flush_bifrost().await?;
+    let token = server.exchange_api_key(&api_key).await?;
+    let endpoint = server
+        .base_url()
+        .ok_or_else(|| WyrdTestServerError::Start("missing HTTP URL".into()))?
+        .to_owned();
+    Ok(SeededCanonicalSignals {
+        endpoint,
+        token,
+        scope,
+    })
+}

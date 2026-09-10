@@ -1730,7 +1730,7 @@ impl<'a> OracleRoleBuilder<'a> {
             memory_bytes_per_slot,
             raw_slots,
             usable_slots: raw_slots,
-            supported_classes: vec![QueryClass::Interactive, QueryClass::Analytical],
+            supported_classes: oracle_supported_classes(oracle_config.analytical_slots),
             max_workers_per_query: u32::try_from(config.oracle.max_workers_per_query)
                 .map_err(|_| ServerBootError::OraclePeer("worker fanout exceeds u32".to_owned()))?,
         };
@@ -2361,10 +2361,42 @@ fn build_bifrost_peer_tls(
     )))
 }
 
+/// Returns the query classes this pod's own local split can actually admit.
+///
+/// Interactive is always served. Analytical is advertised only when the local
+/// split can cover one Analytical query's slot cost, because a leader that
+/// deterministically selects a replica advertising a class it always refuses
+/// would fail a query a capable replica could have served.
+fn oracle_supported_classes(analytical_slots: u32) -> Vec<QueryClass> {
+    if analytical_slots >= vala_bifrost_redux::resources::ANALYTICAL_QUERY_SLOT_UNITS {
+        vec![QueryClass::Interactive, QueryClass::Analytical]
+    } else {
+        vec![QueryClass::Interactive]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    /// A pod advertises Analytical only when its own split can admit one.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a disabled split still advertises the class.
+    #[test]
+    fn oracle_advertises_only_locally_admissible_classes() {
+        assert_eq!(
+            oracle_supported_classes(0),
+            vec![QueryClass::Interactive],
+            "a split that disables Analytical must not advertise it"
+        );
+        assert_eq!(
+            oracle_supported_classes(vala_bifrost_redux::resources::ANALYTICAL_QUERY_SLOT_UNITS),
+            vec![QueryClass::Interactive, QueryClass::Analytical]
+        );
+    }
 
     /// The compaction runtime is role-scoped and its budget refuses invalid boot.
     ///

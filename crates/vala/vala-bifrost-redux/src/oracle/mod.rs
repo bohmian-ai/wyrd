@@ -5254,7 +5254,9 @@ mod tests {
     /// once: the leader plus at most the leader's advertised
     /// `max_workers_per_query` remotes survive, the same query identity always
     /// selects the same remotes, and a zero bound leaves the leader alone for
-    /// local execution.
+    /// local execution. It also pins class eligibility — a replica that does not
+    /// advertise Analytical is never selected, because rotating onto one would
+    /// fail a query a capable replica could have served.
     ///
     /// # Panics
     ///
@@ -5333,6 +5335,47 @@ mod tests {
             rotated.len() > 1,
             "attempt identity must rotate the starting position across replicas"
         );
+
+        // A mixed-capability roster: only nodes 1 and 2 can admit Analytical
+        // work. Every rotation must land inside that pair rather than on a
+        // replica whose local split disabled the class.
+        let mixed = |max_workers: u32| {
+            ClusterSnapshot::observed(
+                (1..=5u64)
+                    .map(|node| {
+                        let mut role = lease(u128::from(node), ClusterRole::Oracle, node);
+                        if let ClusterCapabilities::OracleV1(capabilities) = &mut role.capabilities
+                        {
+                            capabilities.supported_classes = if node <= 2 {
+                                vec![QueryClass::Interactive, QueryClass::Analytical]
+                            } else {
+                                vec![QueryClass::Interactive]
+                            };
+                            capabilities.max_workers_per_query = max_workers;
+                        }
+                        role
+                    })
+                    .collect(),
+                now,
+            )
+        };
+        for query in 0..8u128 {
+            let cut = OracleQueryAttemptCut::try_from_snapshot(
+                &mixed(1),
+                QueryId::new(uuid::Uuid::from_u128(query)),
+                leader,
+                QueryClass::Analytical,
+                deadline,
+                now,
+                Duration::from_secs(15),
+            )
+            .expect("the mixed-capability fixture freezes one cut");
+            assert_eq!(
+                selected(&cut),
+                vec![leader, NodeId::new(uuid::Uuid::from_u128(2))],
+                "only the one Analytical-capable remote is ever selected"
+            );
+        }
     }
 
     /// Planning input errors carry one safe repair action through dependency wrappers.

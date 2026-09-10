@@ -96,12 +96,18 @@ pub struct OracleQueryAttemptRoster {
 
 /// Reduces the eligible remote roster to a bounded, deterministic selection.
 ///
-/// `oracles` arrives sorted and deduplicated by stable node identity. The
-/// starting position rotates by the attempt identity, so two concurrent queries
-/// on the same cut spread across different replicas while one query always
-/// selects the same replicas on every node that recomputes the cut. The leader
-/// is always retained; the leader's own advertised `max_workers_per_query`
-/// bounds only the remotes, and zero means local execution.
+/// `oracles` arrives sorted and deduplicated by stable node identity. A remote
+/// only ever runs an Analytical fragment, so one that does not advertise
+/// [`QueryClass::Analytical`] is dropped before selection: rotating onto a
+/// replica that cannot admit the work would fail a query a capable replica
+/// could have served. The leader is exempt — it is the pod deciding, not a
+/// participant being chosen.
+///
+/// The starting position rotates by the attempt identity, so two concurrent
+/// queries on the same cut spread across different replicas while one query
+/// always selects the same replicas on every node that recomputes the cut. The
+/// leader's own advertised `max_workers_per_query` bounds only the remotes, and
+/// zero means local execution.
 ///
 /// The result stays in the original node-identity order so every downstream
 /// digest, exchange assignment, and dispatch sees one canonical sequence.
@@ -110,6 +116,9 @@ fn select_bounded_workers(
     leader: &OracleQueryParticipant,
     attempt_id: QueryId,
 ) {
+    oracles.retain(|participant| {
+        participant.node_id == leader.node_id || supports_class(participant, QueryClass::Analytical)
+    });
     let ClusterCapabilities::OracleV1(capabilities) = &leader.capabilities else {
         return;
     };
@@ -187,15 +196,12 @@ impl OracleQueryAttemptRoster {
             .cloned()
             .ok_or(OracleQueryAttemptCutError::LeaderUnavailable)?;
         // Bound the fan-out here, once, before the roster is observed by
-        // planning, dispatch, reservation, or the signed digest. An unselected
-        // replica is therefore absent from the cut entirely and cannot receive
-        // a request or affect the result.
+        // planning, dispatch, reservation, or the signed digest — planning is
+        // what decides whether the root distributes, so a replica selected
+        // later could never have been planned against. An unselected replica is
+        // therefore absent from the cut entirely and cannot receive a request or
+        // affect the result.
         select_bounded_workers(&mut oracles, &leader, attempt_id);
-        // The selected count is the fan-out an operator can actually act on:
-        // it is what reserves remote slots and memory, and it is bounded by
-        // this node's own advertised limit rather than by roster size.
-        metrics::histogram!("bifrost_oracle_selected_workers")
-            .record(oracles.len().saturating_sub(1).to_f64().unwrap_or(f64::MAX));
         Ok(Self {
             observed_at: snapshot.observed_at(),
             attempt_id,
@@ -232,6 +238,17 @@ impl OracleQueryAttemptRoster {
                 return Err(OracleQueryAttemptCutError::IncompatibleCapability);
             }
         }
+        // Recorded here rather than at the class-neutral freeze: only Analytical
+        // work dispatches to a remote, so an Interactive attempt must report the
+        // zero workers it actually selected.
+        metrics::histogram!("bifrost_oracle_selected_workers").record(
+            match query_class {
+                QueryClass::Analytical => oracles.len().saturating_sub(1),
+                QueryClass::Interactive => 0,
+            }
+            .to_f64()
+            .unwrap_or(f64::MAX),
+        );
         Ok(OracleQueryAttemptCut {
             observed_at,
             attempt_id,
@@ -614,7 +631,7 @@ pub(super) mod tests {
                     memory_bytes_per_slot: 1024,
                     raw_slots: 1,
                     usable_slots: 1,
-                    supported_classes: vec![QueryClass::Interactive],
+                    supported_classes: vec![QueryClass::Interactive, QueryClass::Analytical],
                     max_workers_per_query: 1,
                 }),
                 ClusterRole::Scribe => ClusterCapabilities::ScribeV1(ScribeCapabilitiesV1 {

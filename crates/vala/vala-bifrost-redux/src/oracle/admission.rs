@@ -1076,8 +1076,9 @@ impl OracleAdmission {
 ///
 /// 1. every FIFO head whose absolute deadline passed is dropped, because a dead
 ///    head must never block a live tenant behind it and an expired entry must
-///    never be granted; this runs on each iteration so an entry uncovered by a
-///    prior grant is still checked;
+///    never be granted; this runs on each iteration against a freshly read
+///    instant, so both an entry uncovered by a prior grant and an entry that
+///    expired while an earlier grant in the same pass was decided are checked;
 /// 2. ready Interactive work is granted until the protected floor is satisfied;
 /// 3. otherwise the older of the two eligible class heads wins, compared by the
 ///    monotonic waiter identity, so neither a continuously ready class starves
@@ -1090,18 +1091,36 @@ fn grant_waiters(
     shared: &Arc<AdmissionShared>,
     state: &mut AdmissionState,
 ) -> Vec<GrantNotification> {
+    grant_waiters_with_clock(shared, state, Instant::now)
+}
+
+/// Runs one grant pass, reading the decision clock through `now`.
+///
+/// This is the whole body of [`grant_waiters`]; the only reason it is separate
+/// is that `now` must be a real source rather than a single captured instant,
+/// so a test can script a clock that advances between two decisions in one
+/// pass. Production always passes [`Instant::now`], and nothing else about the
+/// pass changes.
+fn grant_waiters_with_clock(
+    shared: &Arc<AdmissionShared>,
+    state: &mut AdmissionState,
+    mut now: impl FnMut() -> Instant,
+) -> Vec<GrantNotification> {
     let _ = state.generation;
     let mut notifications = Vec::new();
-    let now = Instant::now();
     let mut refused = [false; 2];
     loop {
         // Deadline eligibility is re-established before every grant decision,
-        // not once per pass. A request's absolute deadline is
+        // not once per pass, and against current monotonic time rather than the
+        // instant the pass began. A request's absolute deadline is
         // `min(caller deadline, enqueue + max_queue_wait)`, so deadlines are
-        // not monotonic inside one tenant FIFO: popping a live head can expose
-        // an entry behind it that already expired. Re-pruning here removes that
-        // entry before it can be selected, acquire slot and scratch ownership,
-        // or be notified.
+        // neither monotonic inside one tenant FIFO nor guaranteed to outlive the
+        // grants decided ahead of them: popping a live head can expose an entry
+        // that already expired, and an entry can expire while an earlier grant
+        // in this same pass is being decided. Re-reading the clock and pruning
+        // here removes both before they can be selected, acquire slot and
+        // scratch ownership, or be notified.
+        let now = now();
         let expired = state.interactive.prune_expired(now) + state.analytical.prune_expired(now);
         state.queued = state.queued.saturating_sub(expired);
         let interactive = (!refused[0])
@@ -2848,6 +2867,116 @@ pub(in crate::oracle) mod tests {
         assert!(
             next_live.try_recv().is_ok(),
             "live work queued after the expired entry still progresses"
+        );
+    }
+
+    /// A waiter that is still live when a pass begins but expires before its own
+    /// grant decision is rejected rather than granted.
+    ///
+    /// This is the case a single pass-start instant cannot see: the head is live
+    /// at both reads, while the tail is live at the first decision and dead at
+    /// the second. The clock is scripted rather than measured, so the two
+    /// decision times are fixed and the test never depends on how long the
+    /// intervening grant actually takes. It proves the expired tail acquires no
+    /// slot, scratch, active-query, or tenant ownership and receives no
+    /// notification, and that live work queued afterwards still progresses.
+    #[test]
+    fn waiter_expiring_between_grant_decisions_is_never_granted() {
+        let resources = test_resources();
+        let config = OracleAdmissionConfig {
+            interactive_slots: 2,
+            tenant_interactive_slots: 2,
+            ..Default::default()
+        };
+        let owner = owner_with_resources(config, resources.clone());
+        let shared = Arc::clone(&owner.shared);
+        let baseline = resources.snapshot().expect("root baseline");
+        let tenant = DataTenantId::new_v7();
+        let start = Instant::now();
+
+        let mut live_head = push_waiter(
+            &shared,
+            AdmissionClass::Interactive,
+            tenant,
+            1,
+            start + Duration::from_secs(30),
+        );
+        let mut expiring_tail = push_waiter(
+            &shared,
+            AdmissionClass::Interactive,
+            tenant,
+            2,
+            start + Duration::from_secs(1),
+        );
+
+        // Decision one sees `start`, where both waiters are live; decision two
+        // sees `start + 2s`, by which the tail's absolute deadline has passed.
+        let mut decisions = 0_u32;
+        let notifications = {
+            let mut state = shared.state.lock().expect("state");
+            grant_waiters_with_clock(&shared, &mut state, || {
+                decisions += 1;
+                if decisions == 1 {
+                    start
+                } else {
+                    start + Duration::from_secs(2)
+                }
+            })
+        };
+        notify_grants(&shared, notifications);
+
+        let head_grant = live_head.try_recv().expect("the live head must be granted");
+        assert!(
+            expiring_tail.try_recv().is_err(),
+            "a waiter that expired mid-pass must never receive a grant"
+        );
+        {
+            let state = shared.state.lock().expect("state");
+            assert_eq!(state.queued, 0, "both waiters left the queue");
+            assert_eq!(state.active_queries, 1, "only the live head is active");
+            assert_eq!(state.interactive.used, 1, "only one slot unit is charged");
+            assert_eq!(
+                state.interactive.tenants[0].1.active, 1,
+                "the tenant owns exactly the live head's units"
+            );
+            assert!(
+                state.interactive.tenants[0].1.waiters.is_empty(),
+                "the expired entry is removed from the FIFO"
+            );
+        }
+        let after = resources
+            .snapshot()
+            .expect("root while the head owns its grant");
+        assert_eq!(
+            after.oracle_query_scratch_used_bytes - baseline.oracle_query_scratch_used_bytes,
+            crate::resources::ORACLE_PARTITION_MEMORY_BYTES as u64,
+            "exactly one Interactive scratch lease is outstanding"
+        );
+        drop(head_grant);
+        assert_eq!(
+            resources
+                .snapshot()
+                .expect("root after the head releases")
+                .oracle_query_scratch_used_bytes,
+            baseline.oracle_query_scratch_used_bytes,
+            "no scratch is stranded by the rejected waiter"
+        );
+
+        let mut next_live = push_waiter(
+            &shared,
+            AdmissionClass::Interactive,
+            tenant,
+            3,
+            Instant::now() + Duration::from_secs(30),
+        );
+        drain_grants(&shared);
+        assert!(
+            next_live.try_recv().is_ok(),
+            "live work queued after the rejected waiter still progresses"
+        );
+        assert_eq!(
+            decisions, 2,
+            "the pass read the clock once per grant decision, not once per pass"
         );
     }
 

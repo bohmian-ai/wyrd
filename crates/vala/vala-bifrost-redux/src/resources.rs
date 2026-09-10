@@ -6872,7 +6872,7 @@ mod tests {
         }
     }
 
-    /// Memory and scratch ownership is one atomic Oracle grant and exact release.
+    /// Slot and scratch ownership is one atomic Oracle grant and exact release.
     #[test]
     fn resource_grant_is_atomic_across_memory_and_scratch() {
         let roles = BifrostRuntimeResources::composed_for_test(
@@ -6884,9 +6884,9 @@ mod tests {
         let first = oracle
             .try_acquire_query(interactive_query(0.0))
             .expect("first query owns one exact grant");
-        // Scratch, not memory, is the dimension that saturates this fixture: a
-        // query charges one slot-unit quantum of memory but reserves a full
-        // grant cap of consumable disk.
+        // Scratch, not memory, is the dimension that saturates this fixture:
+        // admission debits no resident memory at all, so each query takes slot
+        // units plus a full grant cap of consumable disk.
         let mut held = Vec::new();
         while let Ok(query) = oracle.try_acquire_query(interactive_query(1.0)) {
             held.push(query);

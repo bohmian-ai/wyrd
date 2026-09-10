@@ -1112,9 +1112,10 @@ impl OraclePeerWorker {
         };
         let deadline = std::time::Instant::now() + PEER_SLOT_WAIT;
         loop {
-            // Charge the governor here — memory and slot units together — so a
-            // node already saturated by its own leader-side queries refuses
-            // before the leader commits to this participant rather than after.
+            // Charge the governor's slot ledger here, and derive the fragment's
+            // memory ceiling from that charge rather than debiting it, so a node
+            // already saturated by its own leader-side queries refuses before the
+            // leader commits to this participant rather than after.
             let attempt = match self.acquire_reserved_capacity(request) {
                 Ok(capacity) => self
                     .reservations

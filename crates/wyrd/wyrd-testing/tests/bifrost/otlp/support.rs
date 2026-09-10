@@ -137,6 +137,15 @@ pub(super) const GEN_AI_CONVERSATION_ID: &str = "conv-canonical-0001";
 pub(super) const GEN_AI_INPUT_TOKENS: i64 = 4_096;
 /// `gen_ai.usage.output_tokens`, promoted to its own canonical column.
 pub(super) const GEN_AI_OUTPUT_TOKENS: i64 = 512;
+/// Structured `gen_ai.input.messages` the caller sent, as its JSON encoding.
+///
+/// The semantic convention carries the message list as one structured value
+/// and the canonical ledger declares no promoted column for it, so it stays
+/// inside the sensitive `attributes` blob and is gated with it.
+pub(super) const GEN_AI_INPUT_MESSAGES: &str =
+    r#"[{"role":"user","parts":[{"type":"text","content":"summarize the canonical ledger"}]}]"#;
+/// Structured `gen_ai.output.messages` the caller sent, as its JSON encoding.
+pub(super) const GEN_AI_OUTPUT_MESSAGES: &str = r#"[{"role":"assistant","parts":[{"type":"text","content":"the ledger is canonical"}],"finish_reason":"stop"}]"#;
 
 /// How long after its start the maximal span ends, in nanoseconds.
 pub(super) const SPAN_DURATION_NANOS: i64 = 5_000_000;
@@ -232,8 +241,9 @@ pub(super) fn map_attribute(key: &str, entries: Vec<KeyValue>) -> KeyValue {
 /// The maximal span's own attributes, in the order the exporter sends them.
 ///
 /// The collection deliberately mixes every `AnyValue` shape the canonical
-/// encoding must retain with the six pinned `GenAI` promotions, so one span
-/// exercises both the opaque attribute blob and every promoted column.
+/// encoding must retain with the six pinned `GenAI` promotions and the two
+/// structured `GenAI` message payloads, so one span exercises the opaque
+/// attribute blob, every promoted column, and the payload gate together.
 pub(super) fn span_attributes() -> Vec<KeyValue> {
     vec![
         string_attribute("wyrd.test.marker", "canonical-trace"),
@@ -254,6 +264,8 @@ pub(super) fn span_attributes() -> Vec<KeyValue> {
         string_attribute("gen_ai.conversation.id", GEN_AI_CONVERSATION_ID),
         int_attribute("gen_ai.usage.input_tokens", GEN_AI_INPUT_TOKENS),
         int_attribute("gen_ai.usage.output_tokens", GEN_AI_OUTPUT_TOKENS),
+        string_attribute("gen_ai.input.messages", GEN_AI_INPUT_MESSAGES),
+        string_attribute("gen_ai.output.messages", GEN_AI_OUTPUT_MESSAGES),
     ]
 }
 

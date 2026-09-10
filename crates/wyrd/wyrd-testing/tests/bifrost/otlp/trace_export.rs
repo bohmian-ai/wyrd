@@ -284,10 +284,27 @@ fn child<'struct_array, A: Array + 'static>(
 
 /// Tests that need Postgres, a bound server, and the publication boundary.
 mod pg_tests {
+    use wyrd_runtime::Permission;
+
     use super::{
         OtlpJourney, assert_maximal_span_row, export_traces_over_grpc, support,
         support::{GRPC_SPAN, SPANS_TABLE},
     };
+
+    /// Every canonical span column that carries caller content.
+    ///
+    /// These are exactly `vala.traces.spans`'s declared sensitive payload
+    /// columns. `attributes` is the one that carries the structured `GenAI`
+    /// input and output messages, so gating it is what keeps a conversation
+    /// payload from reaching a caller holding query access alone.
+    const PAYLOAD_COLUMNS: [&str; 6] = [
+        "attributes",
+        "events",
+        "links",
+        "resource_attributes",
+        "resource_entity_refs",
+        "scope_attributes",
+    ];
 
     /// One maximal span exported over OTLP/gRPC reads back with every field.
     ///
@@ -295,8 +312,12 @@ mod pg_tests {
     /// optional OTLP trace field the canonical ledger declares — a parent, a
     /// trace state, flags, every `AnyValue` attribute shape, an ordered event,
     /// an ordered link, a present status, a full resource and scope envelope,
-    /// and all six pinned `GenAI` promotions — through the real collector, the
-    /// real Scribe acknowledgment, and the real publication boundary. The
+    /// all six pinned `GenAI` promotions, and the structured
+    /// `gen_ai.input.messages` / `gen_ai.output.messages` payloads — through
+    /// the real collector, the real Scribe acknowledgment, and the real
+    /// publication boundary. A second principal holding query access without
+    /// payload access then proves those structured messages are refused
+    /// rather than served. The
     /// readback compares each stored column against the same fixture constant
     /// the exporter sent, so a column that stops being written, is written
     /// with a default, or is written from the wrong source fails here rather
@@ -328,6 +349,46 @@ mod pg_tests {
             ))
             .await;
         assert_maximal_span_row(&row, start, GRPC_SPAN);
+
+        let metadata_only = journey
+            .client_with_permissions("otlp_span_metadata", &[Permission::bifrost_query_read()])
+            .await;
+        let permitted = journey
+            .query_as(
+                &metadata_only,
+                &format!(
+                    "SELECT name, gen_ai_request_model, gen_ai_usage_input_tokens \
+                     FROM {SPANS_TABLE} WHERE start_time_unix_nano = {start}"
+                ),
+            )
+            .await;
+        assert_eq!(
+            permitted
+                .iter()
+                .map(arrow::array::RecordBatch::num_rows)
+                .sum::<usize>(),
+            1,
+            "a caller without payload permission still reads promoted GenAI metadata"
+        );
+        for column_name in PAYLOAD_COLUMNS {
+            let refusal = journey
+                .query_error(
+                    &metadata_only,
+                    &format!("SELECT {column_name} FROM {SPANS_TABLE}"),
+                )
+                .await;
+            assert_eq!(
+                refusal, "WYRD_VALA_403_PAYLOAD_FORBIDDEN",
+                "projecting `{column_name}` without payload permission is refused"
+            );
+        }
+        let star = journey
+            .query_error(&metadata_only, &format!("SELECT * FROM {SPANS_TABLE}"))
+            .await;
+        assert_eq!(
+            star, "WYRD_VALA_403_PAYLOAD_FORBIDDEN",
+            "`SELECT *` cannot smuggle the structured GenAI messages past the gate"
+        );
 
         journey.shutdown().await;
     }

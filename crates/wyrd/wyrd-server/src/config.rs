@@ -3120,6 +3120,9 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+    use vala_bifrost_redux::resources::{
+        ORACLE_PARTITION_WORKING_MEMORY_BYTES, ResourcePlan, oracle_worker_slots,
+    };
 
     /// Serialize env-var tests so concurrent test threads cannot interfere.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -4533,10 +4536,6 @@ minimum_slots = 2
     /// acceptance does not match the local model.
     #[test]
     fn oracle_capacity_is_local_cpu_and_memory_bounded() {
-        use vala_bifrost_redux::resources::{
-            ORACLE_PARTITION_WORKING_MEMORY_BYTES, ResourcePlan, oracle_worker_slots,
-        };
-
         let plan = |effective_cpu: usize, oracle_bytes: usize, limit: Option<usize>| ResourcePlan {
             memory_limit_bytes: oracle_bytes * 2,
             effective_cpu,

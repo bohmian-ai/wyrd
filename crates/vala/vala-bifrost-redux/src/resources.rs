@@ -5673,7 +5673,16 @@ fn parse_cpuset(value: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
     use datafusion::execution::memory_pool::MemoryConsumer;
+    use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+    use datafusion::physical_expr::expressions::Column;
+    use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
+    use datafusion::physical_plan::sorts::sort::SortExec;
+    use datafusion::prelude::{SessionConfig, SessionContext};
     #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
 
@@ -5963,16 +5972,6 @@ mod tests {
     ///
     /// Panics when the fixture batch, ordering, or runtime cannot be built.
     async fn sort_over_pool(pool: &Arc<dyn MemoryPool>) -> Result<(), DataFusionError> {
-        use arrow::array::Int64Array;
-        use arrow::datatypes::{DataType, Field, Schema};
-        use arrow::record_batch::RecordBatch;
-        use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
-        use datafusion::execution::runtime_env::RuntimeEnvBuilder;
-        use datafusion::physical_expr::expressions::Column;
-        use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
-        use datafusion::physical_plan::sorts::sort::SortExec;
-        use datafusion::prelude::{SessionConfig, SessionContext};
-
         let schema = Arc::new(Schema::new(vec![Field::new(
             "value",
             DataType::Int64,

@@ -5237,10 +5237,13 @@ where
 
 #[cfg(test)]
 mod tests {
+    use super::participant_cut::tests::lease;
     use super::*;
     use arrow::array::{StringArray, UInt64Array};
     use arrow::datatypes::{DataType, Field, Schema};
+    use chrono::Utc;
     use std::sync::atomic::AtomicUsize;
+    use wyrd_spec::vala::api::{ClusterCapabilities, ClusterRole};
 
     /// Analytical worker selection is bounded by configuration and stable per query.
     ///
@@ -5255,9 +5258,6 @@ mod tests {
     /// Panics when a fixture snapshot does not freeze into a cut.
     #[test]
     fn analytical_worker_selection_is_bounded_and_stable() {
-        use super::participant_cut::tests::lease;
-        use chrono::Utc;
-        use wyrd_spec::vala::api::{ClusterCapabilities, ClusterRole};
         let now = Utc::now();
         let deadline = now + chrono::Duration::seconds(5);
         let leader = NodeId::new(uuid::Uuid::from_u128(1));

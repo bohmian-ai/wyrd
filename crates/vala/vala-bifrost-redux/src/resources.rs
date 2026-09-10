@@ -1771,16 +1771,6 @@ pub enum OracleWorkerClass {
 }
 
 impl OracleWorkerClass {
-    /// Returns the exact atomic root-memory charge for this worker class.
-    ///
-    /// This is the same per-slot-unit admission charge the leader envelope pays,
-    /// deliberately so. The leader gate and the peer gate must agree on what one
-    /// slot costs; when they disagreed, a query the leader had already committed
-    /// to dispatching could still be refused by its own peers.
-    fn memory_bytes(self) -> usize {
-        ORACLE_PARTITION_WORKING_MEMORY_BYTES * self.slot_units() as usize
-    }
-
     /// Returns the scheduling class this worker charges the shared slot ledger under.
     const fn query_class(self) -> QueryClass {
         match self {
@@ -2554,19 +2544,19 @@ impl OracleResources {
         OracleQueryMemoryReservation::try_new(pool, self.governor.clone(), consumer, bytes)
     }
 
-    /// Acquires one exact remote-worker quantum alongside other Oracle owners.
+    /// Acquires one remote-worker slot quantum alongside other Oracle owners.
     ///
-    /// The worker spends the shared Oracle floor first and borrows only the
-    /// incremental elastic bytes required by its closed class quantum. Query,
-    /// metadata, and sibling worker owners remain independently attributable in
-    /// the same root ledger.
+    /// A follower holds concurrency, not resident memory: its bytes are charged
+    /// only as its `DataFusion` consumers grow through the shared Oracle root,
+    /// exactly as a leader's are. Query, metadata, and sibling worker owners
+    /// remain independently attributable in that same root ledger.
     ///
     /// # Errors
     ///
-    /// Returns [`BifrostResourceError::Occupied`] when the Oracle floor plus
-    /// currently free elastic memory cannot cover the class quantum, or a
-    /// poison/invalid-plan error when root accounting or role configuration is
-    /// not trustworthy. Refusal changes no counters.
+    /// Returns [`BifrostResourceError::Occupied`] when the aggregate slot ledger
+    /// cannot cover this class's units without spending the Interactive floor,
+    /// or a poison/invalid-plan error when root accounting or role configuration
+    /// is not trustworthy. Refusal changes no counters.
     pub fn try_acquire_worker(
         &self,
         class: OracleWorkerClass,
@@ -2593,9 +2583,6 @@ impl OracleResources {
             governor: self.governor.clone(),
             released: false,
         };
-        let lease = self
-            .governor
-            .try_acquire_oracle_memory(class.memory_bytes())?;
         let granted_memory_bytes =
             BifrostResourceGovernor::oracle_memory_grant(plan, slot_units, next_slots);
         // A follower is a query too: it takes a private view over the same
@@ -2610,7 +2597,6 @@ impl OracleResources {
         let admitted_target_partitions =
             oracle_target_partitions(plan.effective_cpu, 0.0, granted_memory_bytes)?;
         Ok(OracleWorkerResources {
-            lease,
             _slots: slots,
             memory_pool,
             granted_memory_bytes,
@@ -3547,7 +3533,6 @@ impl BifrostResourceGovernor {
         let memory_pool = memory_root.query_view(granted_memory_bytes, &memory_peak_bytes);
         Ok(OracleQueryResources {
             query_class: request.query_class,
-            memory_bytes: request.memory_bytes,
             granted_memory_bytes,
             scratch_bytes: request.scratch_bytes,
             slot_units: request.slot_units,
@@ -4378,11 +4363,9 @@ impl Drop for OracleSlotCharge {
 /// Non-cloneable owner of one advertised remote Oracle worker quantum.
 #[derive(Debug)]
 pub struct OracleWorkerResources {
-    /// Exact floor-first root-memory ownership for this remote execution.
-    lease: OracleMemoryLease,
     /// Aggregate slot-ledger units this follower holds until it is dropped.
     _slots: OracleSlotCharge,
-    /// Exact bounded `DataFusion` pool nested under the retained root lease.
+    /// Private view over the shared Oracle root this follower allocates from.
     memory_pool: Arc<dyn MemoryPool>,
     /// Trusted grant the bounded pool was sized from.
     granted_memory_bytes: usize,
@@ -4424,13 +4407,7 @@ impl ScribeFollowerLease {
 }
 
 impl OracleWorkerResources {
-    /// Returns the fixed worker quantum owned until this value is dropped.
-    #[must_use]
-    pub fn memory_bytes(&self) -> usize {
-        self.lease.bytes
-    }
-
-    /// Returns the exact bounded pool retained by this worker lease.
+    /// Returns the shared-root view retained by this worker.
     #[must_use]
     pub fn memory_pool(&self) -> Arc<dyn MemoryPool> {
         Arc::clone(&self.memory_pool)
@@ -4948,17 +4925,12 @@ impl Drop for OracleMemoryLease {
 pub struct OracleQueryResources {
     /// Scheduling class charged by this query owner.
     query_class: QueryClass,
-    /// Exact memory this query charges against the shared elastic budget.
-    ///
-    /// This is the admission charge, not the ceiling the query may reach; see
-    /// [`OracleQueryResources::granted_memory_bytes`].
-    pub memory_bytes: usize,
-    /// Ceiling this query's `DataFusion` pool may grow to.
+    /// Ceiling this query's view of the shared Oracle root may grow to.
     ///
     /// Derived once at admission by
     /// [`BifrostResourceGovernor::oracle_memory_grant`] and held for the query's
-    /// life. Always at least [`memory_bytes`](Self::memory_bytes) and never above
-    /// [`ORACLE_PARTITION_MEMORY_BYTES`].
+    /// life. Admission charges no memory of its own: this is the maximum the
+    /// query's actual consumer growth may govern, never a resident reservation.
     pub granted_memory_bytes: usize,
     /// Exact bounded disposable scratch capacity.
     pub scratch_bytes: u64,
@@ -5798,22 +5770,11 @@ mod tests {
         oracle: &OracleResources,
         spare: usize,
     ) -> Vec<OracleWorkerResources> {
-        let plan = oracle.snapshot().expect("planned budget").plan;
-        let budget = plan.oracle_floor_bytes + plan.elastic_memory_bytes;
-        let reserved = ORACLE_PARTITION_WORKING_MEMORY_BYTES * spare;
         let mut held = Vec::new();
-        let mut charged = oracle
-            .snapshot()
-            .expect("current charge")
-            .oracle_memory_used_bytes;
-        while charged + ORACLE_PARTITION_WORKING_MEMORY_BYTES + reserved <= budget {
-            held.push(
-                oracle
-                    .try_acquire_worker(OracleWorkerClass::Interactive)
-                    .expect("a worker fitting inside the remaining budget is admitted"),
-            );
-            charged += ORACLE_PARTITION_WORKING_MEMORY_BYTES;
+        while let Ok(worker) = oracle.try_acquire_worker(OracleWorkerClass::Interactive) {
+            held.push(worker);
         }
+        held.truncate(held.len().saturating_sub(spare));
         held
     }
 
@@ -5923,13 +5884,13 @@ mod tests {
         );
         let past_ceiling = MemoryConsumer::new("past-ceiling").register(&pools[0]);
         past_ceiling.grow(ceiling + overshoot);
-        let overshot = oracle.snapshot().expect("infallible growth snapshot");
+        let past_grant = oracle.snapshot().expect("infallible growth snapshot");
         assert_eq!(
-            overshot.oracle_query_memory_used_bytes, ceiling,
+            past_grant.oracle_query_memory_used_bytes, ceiling,
             "governed bytes stop at the query's immutable grant"
         );
         assert_eq!(
-            overshot.oracle_infallible_bytes, overshoot,
+            past_grant.oracle_infallible_bytes, overshoot,
             "every byte above the grant is retained as explicit process headroom"
         );
         assert_eq!(oracle.shared_memory_reserved(), ceiling + overshoot);
@@ -6336,13 +6297,17 @@ mod tests {
         );
     }
 
-    /// Oracle worker and metadata leases spend their floor before shared elastic memory.
+    /// Oracle metadata leases spend their floor before shared elastic memory.
+    ///
+    /// Fixed non-query allocations are the remaining root-lease owner — a
+    /// follower holds slot units instead — so this is where floor-first
+    /// accounting and budget refusal are still observable.
     ///
     /// # Panics
     ///
     /// Panics when deterministic resource acquisition or inspection fails.
     #[test]
-    fn resource_plan_oracle_worker_and_metadata_leases_share_floor_first_accounting() {
+    fn resource_plan_oracle_metadata_leases_spend_floor_first() {
         let roles = BifrostRuntimeResources::composed_for_test(
             576 * MIB,
             512 * MIB as u64,
@@ -6353,36 +6318,36 @@ mod tests {
             .try_acquire_worker(OracleWorkerClass::Interactive)
             .expect("one worker spends only the Oracle floor");
         assert_eq!(
-            worker.memory_bytes(),
-            ORACLE_PARTITION_WORKING_MEMORY_BYTES,
-            "a worker charges the slot-unit admission quantum, not the grant cap"
-        );
-        assert_eq!(
             oracle
                 .snapshot()
                 .expect("worker snapshot")
-                .elastic_memory_used_bytes,
-            0
+                .oracle_memory_used_bytes,
+            0,
+            "an admitted follower governs no bytes until one of its consumers grows"
         );
-        let filled = saturate_oracle_workers(&oracle, 0);
-        assert!(
-            oracle.metadata().try_acquire_footer_slot().is_err(),
-            "a footer slot is refused once workers hold the whole Oracle budget"
-        );
-        drop(filled);
-        drop(worker);
         let footer = oracle
             .metadata()
             .try_acquire_footer_slot()
-            .expect("footer slot fits the released Oracle floor");
+            .expect("footer slot fits the Oracle floor");
         assert_eq!(footer.memory_bytes(), ORACLE_METADATA_MEMORY_BYTES);
         assert_eq!(
             oracle
                 .snapshot()
                 .expect("footer snapshot")
                 .elastic_memory_used_bytes,
-            0
+            0,
+            "the fixed slot spends the protected Oracle floor before elastic memory"
         );
+        let mut filled = Vec::new();
+        while let Ok(slot) = oracle.metadata().try_acquire_footer_slot() {
+            filled.push(slot);
+        }
+        assert!(
+            oracle.metadata().try_acquire_footer_slot().is_err(),
+            "a fixed slot is refused once the leases hold the whole Oracle budget"
+        );
+        drop(filled);
+        drop(worker);
         drop(footer);
         assert_eq!(
             oracle
@@ -6410,7 +6375,7 @@ mod tests {
         let charged_before = oracle
             .snapshot()
             .expect("saturated to one spare slot")
-            .oracle_memory_used_bytes;
+            .oracle_query_slot_units;
         let start = Arc::new(std::sync::Barrier::new(3));
         let finish = Arc::new(std::sync::Barrier::new(3));
         let (sender, receiver) = std::sync::mpsc::channel();
@@ -6438,8 +6403,8 @@ mod tests {
             oracle
                 .snapshot()
                 .expect("held owner")
-                .oracle_memory_used_bytes,
-            charged_before + ORACLE_PARTITION_WORKING_MEMORY_BYTES,
+                .oracle_query_slot_units,
+            charged_before + 1,
             "exactly one racer charged the last remaining slot unit"
         );
         finish.wait();
@@ -6741,17 +6706,21 @@ mod tests {
                 [BifrostRole::Oracle, BifrostRole::Forge],
             );
             let oracle = roles.oracle().expect("Oracle capability");
-            let filled = saturate_oracle_workers(&oracle, 1);
-            let owner = oracle
-                .try_acquire_worker(OracleWorkerClass::Interactive)
-                .expect("Oracle grant");
+            // Followers hold slot units rather than root memory now, so the
+            // fixed metadata slot is the owner whose refusal the memory metrics
+            // report.
+            let mut filled = Vec::new();
+            while let Ok(slot) = oracle.metadata().try_acquire_footer_slot() {
+                filled.push(slot);
+            }
             assert!(
-                oracle
-                    .try_acquire_worker(OracleWorkerClass::Interactive)
-                    .is_err(),
+                !filled.is_empty(),
+                "the Oracle budget admits at least one fixed slot"
+            );
+            assert!(
+                oracle.metadata().try_acquire_footer_slot().is_err(),
                 "a saturated budget refuses and records the refusal"
             );
-            drop(owner);
             drop(filled);
 
             let temp = tempfile::tempdir().expect("temporary volume root");
@@ -7100,18 +7069,18 @@ mod tests {
             .try_acquire_query(interactive_query(0.0))
             .expect("complete query grant");
         assert_eq!(
-            query.memory_bytes, ORACLE_PARTITION_WORKING_MEMORY_BYTES,
-            "an interactive query charges one slot-unit quantum against the budget"
+            oracle
+                .snapshot()
+                .expect("admitted snapshot")
+                .oracle_query_memory_used_bytes,
+            0,
+            "admission grants a ceiling and charges no memory of its own"
         );
         let pool = query.memory_pool();
         let reservation = MemoryConsumer::new("oracle-test").register(&pool);
-        assert!(
-            query.granted_memory_bytes > query.memory_bytes,
-            "an otherwise idle node grants far more ceiling than the query charges"
-        );
         reservation
             .try_grow(query.granted_memory_bytes)
-            .expect("the pool is sized by the grant, not by the admission charge");
+            .expect("the view is sized by the grant this query was admitted with");
         assert!(reservation.try_grow(1).is_err());
         reservation.shrink(query.granted_memory_bytes);
         assert_eq!(pool.reserved(), 0);
@@ -7337,63 +7306,73 @@ mod tests {
         );
     }
 
-    /// Oracle worker classes acquire exactly one or two quanta atomically.
+    /// An admitted leader and follower govern no memory until their pools grow.
+    ///
+    /// Slot units are the whole admission cost on both paths: a class quantum is
+    /// a ceiling and a partition-planning input, never resident memory. This
+    /// pins both halves — zero governed bytes while idle, and exact shared-root
+    /// reconciliation once each side actually reserves — because reintroducing a
+    /// synthetic charge would make the pod refuse work it can still serve.
+    ///
+    /// # Panics
+    ///
+    /// Panics when admission, growth, or release does not reconcile exactly.
     #[test]
-    fn oracle_worker_classes_use_exact_root_quanta() {
+    fn oracle_leader_and_follower_govern_no_memory_until_their_pools_grow() {
         let roles = BifrostRuntimeResources::composed_for_test(
             768 * MIB,
             512 * MIB as u64,
             [BifrostRole::Oracle],
         );
         let oracle = roles.oracle().expect("Oracle capability");
-        let plan = oracle.snapshot().expect("planned budget").plan;
-        let budget = plan.oracle_floor_bytes + plan.elastic_memory_bytes;
-        let analytical = oracle
+        let baseline = oracle.snapshot().expect("idle baseline");
+        let leader = oracle
+            .try_acquire_query(analytical_query(0.0))
+            .expect("analytical leader");
+        let follower = oracle
             .try_acquire_worker(OracleWorkerClass::Analytical)
-            .expect("two-quanta worker");
+            .expect("analytical follower");
+        let admitted = oracle.snapshot().expect("admitted snapshot");
         assert_eq!(
-            analytical.memory_bytes(),
-            2 * ORACLE_PARTITION_WORKING_MEMORY_BYTES,
-            "an analytical worker charges two slot-unit quanta"
+            admitted.oracle_query_memory_used_bytes, 0,
+            "neither an admitted leader nor an admitted follower holds governed bytes"
         );
-        // The budget no longer holds a single worker, so exhaustion has to be
-        // driven rather than assumed. A follower worker charges the same slot
-        // ledger a leader does, so the loop stops at whichever of memory or
-        // slot capacity binds first and the next acquisition must be refused.
-        let capacity = u64::from(oracle.class_split().total_units());
-        let mut held = vec![analytical];
-        let mut charged = 2 * ORACLE_PARTITION_WORKING_MEMORY_BYTES;
-        while charged + ORACLE_PARTITION_WORKING_MEMORY_BYTES <= budget
-            && oracle.live_slot_units() < capacity
-        {
-            held.push(
-                oracle
-                    .try_acquire_worker(OracleWorkerClass::Interactive)
-                    .expect("a worker fitting inside the remaining budget is admitted"),
-            );
-            charged += ORACLE_PARTITION_WORKING_MEMORY_BYTES;
-        }
+        assert_eq!(admitted.oracle_memory_used_bytes, 0);
         assert_eq!(
-            oracle
-                .snapshot()
-                .expect("saturated")
-                .oracle_memory_used_bytes,
-            charged
+            admitted.oracle_query_slot_units,
+            2 * ANALYTICAL_QUERY_SLOT_UNITS,
+            "both sides charge the one aggregate slot ledger"
         );
         assert!(
-            oracle
-                .try_acquire_worker(OracleWorkerClass::Interactive)
-                .is_err(),
-            "a worker that fits neither the remaining budget nor the slot ledger is refused"
+            admitted.oracle_query_scratch_used_bytes > 0,
+            "scratch remains an independently retained admission lease"
         );
-        drop(held);
+
+        // The first actual consumer growth is the first memory charge, and it is
+        // the only figure the shared root reports.
+        let leader_pool = leader.memory_pool();
+        let follower_pool = follower.memory_pool();
+        let leader_bytes = MemoryConsumer::new("leader-growth").register(&leader_pool);
+        let follower_bytes = MemoryConsumer::new("follower-growth").register(&follower_pool);
+        leader_bytes
+            .try_grow(8 * MIB)
+            .expect("the leader view funds its own growth");
+        follower_bytes
+            .try_grow(4 * MIB)
+            .expect("the follower view funds its own growth");
+        let grown = oracle.snapshot().expect("grown snapshot");
+        assert_eq!(grown.oracle_query_memory_used_bytes, 12 * MIB);
+        assert_eq!(oracle.shared_memory_reserved(), 12 * MIB);
+
+        drop((leader_bytes, follower_bytes));
+        assert_eq!(oracle.shared_memory_reserved(), 0);
+        drop((leader, follower));
         assert_eq!(
-            oracle
-                .snapshot()
-                .expect("released")
-                .oracle_memory_used_bytes,
-            0
+            oracle.snapshot().expect("released snapshot"),
+            baseline,
+            "release restores every counter exactly"
         );
+        assert!(oracle.health().reason().is_none());
     }
 
     /// Query memory and scratch children split admitted ownership without root charge.
@@ -8210,8 +8189,12 @@ mod tests {
             .try_acquire_query(interactive_query(0.0))
             .expect("Oracle owns only its floor and shared elastic memory");
         assert_eq!(
-            query.memory_bytes, ORACLE_PARTITION_WORKING_MEMORY_BYTES,
-            "an interactive query charges one slot-unit quantum against the budget"
+            oracle
+                .snapshot()
+                .expect("Oracle admission snapshot")
+                .oracle_query_memory_used_bytes,
+            0,
+            "Oracle admission takes slots and scratch, never resident memory"
         );
         assert_eq!(roles.plan().scribe_floor_bytes, ROLE_MEMORY_FLOOR_BYTES);
         drop(query);

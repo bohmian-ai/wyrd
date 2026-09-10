@@ -357,7 +357,10 @@ pub struct OracleRuntimeInspection {
     pub active_queries: u64,
     /// Waiters currently queued for a local grant.
     pub queued_queries: u64,
-    /// Memory bytes reserved by active queries.
+    /// Aggregate governed bytes the shared Oracle memory root currently holds.
+    ///
+    /// Actual `DataFusion` reservation, not an admission quantum: an admitted
+    /// query that never grew a consumer contributes nothing here.
     pub reserved_memory_bytes: u64,
     /// Spill bytes reserved by active queries.
     pub reserved_spill_bytes: u64,

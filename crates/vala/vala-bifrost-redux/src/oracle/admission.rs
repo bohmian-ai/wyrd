@@ -67,7 +67,10 @@ pub struct OracleShutdownReport {
     pub active_queries: u64,
     /// Waiters that remained queued at the deadline.
     pub queued_queries: u64,
-    /// Memory bytes still reserved at the deadline.
+    /// Aggregate governed bytes the shared Oracle memory root still holds.
+    ///
+    /// Actual `DataFusion` reservation, not an admission quantum: an admitted
+    /// query that never grew a consumer contributes nothing here.
     pub reserved_memory_bytes: u64,
     /// Spill bytes still reserved at the deadline.
     pub reserved_spill_bytes: u64,
@@ -127,8 +130,6 @@ struct Grant {
     class: AdmissionClass,
     /// Tenant counter charged by the grant.
     tenant: DataTenantId,
-    /// Memory bytes reserved by the grant.
-    memory: u64,
     /// Spill bytes reserved by the grant.
     spill: u64,
     /// Complete memory and scratch envelope transferred to the stream guard.
@@ -154,8 +155,6 @@ struct ClassState {
     used: u32,
     /// Fixed pod-local per-tenant slot-unit cap inside this class.
     tenant_slot_limit: u32,
-    /// Memory bytes currently reserved.
-    memory_used: u64,
     /// Stable first-enqueue tenant ring.
     tenants: Vec<(DataTenantId, TenantQueue)>,
     /// Next tenant index visited by round-robin grants.
@@ -173,7 +172,6 @@ impl ClassState {
             capacity,
             used: 0,
             tenant_slot_limit: tenant_slot_limit.min(capacity),
-            memory_used: 0,
             tenants: Vec::new(),
             cursor: 0,
         }
@@ -348,8 +346,6 @@ struct LocalPermit {
     class: AdmissionClass,
     /// Tenant counter charged by this permit.
     tenant: DataTenantId,
-    /// Memory bytes charged by this permit.
-    memory: u64,
     /// Spill bytes charged by this permit.
     spill: u64,
     /// Complete resource envelope released before queued work is reconsidered.
@@ -393,7 +389,6 @@ impl LocalPermit {
         let release = Grant {
             class: self.class,
             tenant: self.tenant,
-            memory: self.memory,
             spill: self.spill,
             resources: None,
         };
@@ -707,7 +702,8 @@ impl OracleAdmission {
         OracleShutdownReport {
             active_queries: state.active_queries,
             queued_queries: u64::from(state.queued),
-            reserved_memory_bytes: state.interactive.memory_used + state.analytical.memory_used,
+            reserved_memory_bytes: u64::try_from(self.shared.resources.shared_memory_reserved())
+                .unwrap_or(u64::MAX),
             reserved_spill_bytes: state.spill_used,
             peer_pending: self.slots.pending_in_use(),
             peer_running: self.shared.resources.live_slot_units(),
@@ -725,7 +721,8 @@ impl OracleAdmission {
         OracleRuntimeInspection {
             active_queries: state.active_queries,
             queued_queries: u64::from(state.queued),
-            reserved_memory_bytes: state.interactive.memory_used + state.analytical.memory_used,
+            reserved_memory_bytes: u64::try_from(self.shared.resources.shared_memory_reserved())
+                .unwrap_or(u64::MAX),
             reserved_spill_bytes: state.spill_used,
             peer_pending: self.slots.pending_in_use(),
             peer_running: self.shared.resources.live_slot_units(),
@@ -980,7 +977,6 @@ impl OracleAdmission {
             shared: Arc::clone(&self.shared),
             class: grant.class,
             tenant: grant.tenant,
-            memory: grant.memory,
             spill: grant.spill,
             shape: grant
                 .resources
@@ -1149,7 +1145,6 @@ fn grant_waiters(
             refused[usize::from(kind == AdmissionClass::Analytical)] = true;
             continue;
         };
-        let memory = u64::try_from(resources.memory_bytes).unwrap_or(u64::MAX);
         let spill = resources.scratch_bytes;
         state.spill_used += spill;
         state.queued = state.queued.saturating_sub(1);
@@ -1157,7 +1152,6 @@ fn grant_waiters(
         let class = state.class_mut(kind);
         let tenant = class.tenants[index].0;
         class.used += cost;
-        class.memory_used += memory;
         class.tenants[index].1.active += cost;
         // Advance past the tenant that just took a grant, never past the whole
         // ring, so the next grant goes to the following eligible tenant.
@@ -1167,7 +1161,6 @@ fn grant_waiters(
             Grant {
                 class: kind,
                 tenant,
-                memory,
                 spill,
                 resources: Some(resources),
             },
@@ -1221,7 +1214,7 @@ fn notify_grants(shared: &Arc<AdmissionShared>, mut notifications: Vec<GrantNoti
     }
 }
 
-/// Reverses one grant's class, tenant, memory, spill, and active counters.
+/// Reverses one grant's class, tenant, spill, and active counters.
 fn rollback_counts(state: &mut AdmissionState, grant: &Grant) -> Result<(), BifrostError> {
     state.spill_used =
         state
@@ -1234,13 +1227,6 @@ fn rollback_counts(state: &mut AdmissionState, grant: &Grant) -> Result<(), Bifr
         AdmissionClass::Interactive => &mut state.interactive,
         AdmissionClass::Analytical => &mut state.analytical,
     };
-    class.memory_used =
-        class
-            .memory_used
-            .checked_sub(grant.memory)
-            .ok_or_else(|| BifrostError::Internal {
-                detail: "Oracle admission memory rollback underflow".to_owned(),
-            })?;
     let cost = grant.class.slot_units();
     if let Some((_, tenant)) = class.tenants.iter_mut().find(|(id, _)| *id == grant.tenant) {
         tenant.active = tenant
@@ -1631,7 +1617,6 @@ pub(super) fn admitted_guard_for_test()
     let mut state = shared.state.lock().expect("state");
     let index = state.interactive.tenant_index(tenant);
     state.interactive.used = 1;
-    state.interactive.memory_used = 1024;
     state.interactive.tenants[index].1.active = 1;
     drop(state);
     let cancellation = shared.root_cancel.child_token();
@@ -1649,7 +1634,6 @@ pub(super) fn admitted_guard_for_test()
                 shared: Arc::clone(&shared),
                 class: AdmissionClass::Interactive,
                 tenant,
-                memory: 1024,
                 spill: 0,
                 resources: Mutex::new(None),
                 shape: None,
@@ -2085,7 +2069,6 @@ pub(in crate::oracle) mod tests {
         let state = shared.state.lock().expect("state");
         assert_eq!(state.interactive.used, 1);
         assert_eq!(state.active_queries, 1);
-        assert!(state.interactive.memory_used > 0);
         assert!(state.spill_used > 0);
     }
 
@@ -2446,7 +2429,6 @@ pub(in crate::oracle) mod tests {
         let mut state = shared.state.lock().expect("state");
         let index = state.interactive.tenant_index(tenant);
         state.interactive.used = 1;
-        state.interactive.memory_used = 1;
         state.interactive.tenants[index].1.active = 1;
         state.active_queries = 1;
         rollback_counts(
@@ -2454,14 +2436,12 @@ pub(in crate::oracle) mod tests {
             &Grant {
                 class: AdmissionClass::Interactive,
                 tenant,
-                memory: 1,
                 spill: 0,
                 resources: None,
             },
         )
         .expect("seeded grant counters must roll back exactly");
         assert_eq!(state.interactive.used, 0);
-        assert_eq!(state.interactive.memory_used, 0);
         assert_eq!(state.interactive.tenants[index].1.active, 0);
         assert_eq!(state.active_queries, 0);
     }
@@ -2486,7 +2466,6 @@ pub(in crate::oracle) mod tests {
         guard.release();
         let state = owner.shared.state.lock().expect("state");
         assert_eq!(state.analytical.used, 0);
-        assert_eq!(state.analytical.memory_used, 0);
         assert_eq!(state.spill_used, 0);
         assert_eq!(state.active_queries, 0);
     }
@@ -2830,8 +2809,6 @@ pub(in crate::oracle) mod tests {
             let state = shared.state.lock().expect("state");
             assert_eq!(state.interactive.used, 0);
             assert_eq!(state.analytical.used, 0);
-            assert_eq!(state.interactive.memory_used, 0);
-            assert_eq!(state.analytical.memory_used, 0);
             assert_eq!(state.spill_used, 0);
             assert_eq!(state.active_queries, 0);
             assert!(

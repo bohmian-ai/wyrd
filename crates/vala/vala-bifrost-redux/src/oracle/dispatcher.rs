@@ -1913,19 +1913,24 @@ fn retain_worker_resources(
 mod resource_tests {
     use super::*;
     use crate::resources::{
-        BifrostResourcePolicy, BifrostRole, BifrostRuntimeResources,
-        ORACLE_PARTITION_WORKING_MEMORY_BYTES, ResourceSource, SystemResourceSnapshot,
+        BifrostResourcePolicy, BifrostRole, BifrostRuntimeResources, ResourceSource,
+        SystemResourceSnapshot,
     };
     use std::collections::BTreeSet;
     use std::path::PathBuf;
 
-    /// Production stream ownership retains and releases the advertised root quantum.
+    /// Production stream ownership retains and releases the follower's slot units.
+    ///
+    /// A follower's admission cost is concurrency, not resident memory, so this
+    /// pins both halves of that separation: an admitted worker governs zero
+    /// bytes until a consumer grows, while the slot units it does hold stay held
+    /// for exactly as long as its attempt stream lives.
     ///
     /// # Panics
     ///
     /// Panics when the deterministic resource topology or assertions fail.
     #[test]
-    fn remote_worker_stream_retains_root_quantum_until_terminal_drop() {
+    fn remote_worker_stream_retains_slot_units_until_terminal_drop() {
         let roles = BifrostRuntimeResources::from_snapshot(
             SystemResourceSnapshot {
                 memory_limit_bytes: 576 * 1024 * 1024,
@@ -1960,9 +1965,12 @@ mod resource_tests {
             .try_acquire_worker(crate::resources::OracleWorkerClass::Interactive)
             .expect("advertised worker quantum");
         assert_eq!(
-            resources.memory_bytes(),
-            ORACLE_PARTITION_WORKING_MEMORY_BYTES,
-            "a worker charges the slot-unit admission quantum, not the grant cap"
+            oracle
+                .snapshot()
+                .expect("admitted snapshot")
+                .oracle_memory_used_bytes,
+            0,
+            "an admitted follower governs no bytes until one of its consumers grows"
         );
         let stream: WorkerAttemptStream = Box::pin(futures_util::stream::pending());
         let retained =
@@ -1971,12 +1979,12 @@ mod resource_tests {
             oracle
                 .snapshot()
                 .expect("retained snapshot")
-                .oracle_memory_used_bytes,
-            ORACLE_PARTITION_WORKING_MEMORY_BYTES
+                .oracle_query_slot_units,
+            1
         );
-        // Admission charges one slot-unit quantum rather than a whole grant cap,
-        // so the budget holds several workers. Drain it to prove the retained
-        // stream's quantum is genuinely held rather than merely accounted.
+        // Slot units are the follower's whole admission cost, so drain the local
+        // ledger to prove the retained stream's unit is genuinely held rather
+        // than merely accounted.
         let mut drained = Vec::new();
         while let Ok(worker) =
             oracle.try_acquire_worker(crate::resources::OracleWorkerClass::Interactive)
@@ -1994,7 +2002,7 @@ mod resource_tests {
             oracle
                 .snapshot()
                 .expect("released snapshot")
-                .oracle_memory_used_bytes,
+                .oracle_query_slot_units,
             0
         );
         oracle
@@ -4994,9 +5002,13 @@ mod tests {
         assert!(validated_claim_identifiers(&short).is_ok());
     }
 
-    /// Remote worker execution retains exactly one root quantum until stream drop.
+    /// Remote worker execution retains its slot quantum until stream drop.
+    ///
+    /// A follower's admission cost is concurrency, so the reservation charges
+    /// slot units and no governed memory; the units stay held for exactly as
+    /// long as the attempt stream lives.
     #[tokio::test]
-    async fn oracle_peer_remote_execution_owns_one_worker_quantum() {
+    async fn oracle_peer_remote_execution_owns_one_worker_slot_quantum() {
         let roles = crate::resources::BifrostRuntimeResources::composed_for_test(
             1024 * 1024 * 1024,
             1024 * 1024 * 1024,
@@ -5023,9 +5035,10 @@ mod tests {
             audit: Arc::new(TestOracleAudit),
         });
         let now = Utc::now();
-        // Drive the production reservation path: the worker quantum is charged
-        // at reservation, so a test that inserted a registry entry directly
-        // would exercise an admission state the server can never produce.
+        // Drive the production reservation path: the worker's slot quantum is
+        // charged at reservation, so a test that inserted a registry entry
+        // directly would exercise an admission state the server can never
+        // produce.
         let ReserveNodeSlotsResponse::Pending(pending) = worker
             .reserve(&reserve_request(
                 query_id,
@@ -5037,13 +5050,16 @@ mod tests {
         else {
             panic!("remote pending reservation");
         };
+        let reserved = oracle
+            .snapshot()
+            .expect("healthy snapshot after reservation");
+        assert!(
+            reserved.oracle_query_slot_units > 0,
+            "reservation charges the worker's slot quantum up front"
+        );
         assert_eq!(
-            oracle
-                .snapshot()
-                .expect("healthy snapshot after reservation")
-                .oracle_memory_used_bytes,
-            crate::resources::ORACLE_PARTITION_WORKING_MEMORY_BYTES,
-            "reservation charges the worker quantum up front"
+            reserved.oracle_memory_used_bytes, 0,
+            "a reserved follower governs no bytes until one of its consumers grows"
         );
         let request = worker_request(
             &fragment,
@@ -5059,8 +5075,8 @@ mod tests {
             oracle
                 .snapshot()
                 .expect("healthy remote worker snapshot")
-                .oracle_memory_used_bytes,
-            crate::resources::ORACLE_PARTITION_WORKING_MEMORY_BYTES
+                .oracle_query_slot_units,
+            reserved.oracle_query_slot_units
         );
         while let Some(frame) = execution.stream.next().await {
             frame.expect("remote worker frame");
@@ -5070,7 +5086,7 @@ mod tests {
             oracle
                 .snapshot()
                 .expect("healthy root after remote stream completion")
-                .oracle_memory_used_bytes,
+                .oracle_query_slot_units,
             0
         );
     }

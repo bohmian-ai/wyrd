@@ -7,7 +7,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyList, PyModule, PyString};
 use skald_prompt::{Prompt, PyProviderRequest};
@@ -801,12 +800,12 @@ fn invoke_callback<T>(
     replacement: fn(&Bound<'_, PyAny>) -> PyResult<T>,
 ) -> CallbackOutcome<T> {
     Python::attach(|py| {
-        if let Err(error) = cb
-            .bind(py)
-            .is_callable()
-            .then_some(())
-            .ok_or_else(|| PyTypeError::new_err("agent callback must be callable"))
-        {
+        if let Err(error) = cb.bind(py).is_callable().then_some(()).ok_or_else(|| {
+            PyErr::from(invalid_argument(
+                "callback",
+                "agent callback must be callable",
+            ))
+        }) {
             return CallbackOutcome::Abort(wyrd_utils::py::py_err_to_wyrd_error(py, error));
         }
         let result = match call(py) {
@@ -942,7 +941,7 @@ fn extract_provider_request_replacement(value: &Bound<'_, PyAny>) -> PyResult<Pr
         return Ok(request.native().clone());
     }
     serde_json::from_value(wyrd_utils::py::pyobject_to_json(value)?)
-        .map_err(|error| PyTypeError::new_err(error.to_string()))
+        .map_err(|error| PyErr::from(structured_decode_error(&error)))
 }
 
 fn extract_provider_response_replacement(value: &Bound<'_, PyAny>) -> PyResult<ProviderResponse> {
@@ -950,7 +949,7 @@ fn extract_provider_response_replacement(value: &Bound<'_, PyAny>) -> PyResult<P
         return Ok(py_resp.native().clone());
     }
     serde_json::from_value(wyrd_utils::py::pyobject_to_json(value)?)
-        .map_err(|error| PyTypeError::new_err(error.to_string()))
+        .map_err(|error| PyErr::from(structured_decode_error(&error)))
 }
 
 fn extract_json_replacement(value: &Bound<'_, PyAny>) -> PyResult<serde_json::Value> {
@@ -965,7 +964,7 @@ fn extract_tool_result_replacement(
 
 fn extract_agent_run_replacement(value: &Bound<'_, PyAny>) -> PyResult<AgentRun> {
     serde_json::from_value(wyrd_utils::py::pyobject_to_json(value)?)
-        .map_err(|error| PyTypeError::new_err(error.to_string()))
+        .map_err(|error| PyErr::from(structured_decode_error(&error)))
 }
 
 /// Extract and retain a Python class reference from an `output_type=` kwarg.

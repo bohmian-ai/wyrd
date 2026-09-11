@@ -1,5 +1,5 @@
 import pytest
-from wyrd import Agent, Prompt, Role, SessionTurn
+from wyrd import Agent, AgentError, Prompt, Role, SessionTurn
 
 
 class RecordingMemory:
@@ -70,11 +70,12 @@ def test_python_session_recent_can_return_dicts() -> None:
 
 
 def test_invalid_session_object_is_rejected() -> None:
-    with pytest.raises(TypeError, match="recent"):
+    with pytest.raises(AgentError, match="recent") as exc:
         Agent(
             prompt=Prompt(["hello"], "mock-model", provider="mock"),
             session=object(),
         )
+    assert exc.value.code == "WYRD_AGENT_422_INVALID_ARGUMENT"
 
 
 def test_python_journal_surface_is_not_public() -> None:

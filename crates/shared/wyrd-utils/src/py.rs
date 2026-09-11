@@ -122,7 +122,10 @@ pub fn json_to_pyobject(py: Python<'_>, value: &Value) -> PyResult<Py<PyAny>> {
             } else if let Some(value) = value.as_f64() {
                 value.into_py_any(py)
             } else {
-                Err(PyRuntimeError::new_err("invalid JSON number"))
+                Err(wyrd_error_to_py_err(SpecWyrdError::Internal {
+                    message: "invalid JSON number".to_owned(),
+                    details: Value::Null,
+                }))
             }
         }
         Value::String(value) => value.into_py_any(py),

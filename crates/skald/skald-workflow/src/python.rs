@@ -6,66 +6,40 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyList, PyModule, PyString};
 use skald_agent::{Agent, Observer};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::metadata::{AnnotationKey, AnnotationValue, LabelKey, LabelValue, Labels};
+use wyrd_utils::py::{WyrdPyError, WyrdPyResult};
 
 use crate::error::WorkflowError;
 use crate::run::{TaskEvent, TaskOutcome, WorkflowRun};
 use crate::task::TaskStatus;
 use crate::workflow_surface::{Workflow, WorkflowInput};
 
-fn workflow_error_to_py(error: WorkflowError) -> PyErr {
-    let wyrd: WyrdError = match error {
-        WorkflowError::Spec(spec) => spec.into(),
-        WorkflowError::Other(message) => WyrdError::Validation {
-            message,
-            details: serde_json::json!({}),
-        },
-        other => return skald_workflow_error_to_py(other),
-    };
-    wyrd_utils::py::wyrd_error_to_py_err(wyrd)
+impl From<WorkflowError> for WyrdPyError {
+    /// Widen a workflow failure into the shared Python boundary error.
+    ///
+    /// The catalog projection in [`crate::error`] owns every public metadata
+    /// field, so `?` on a [`WorkflowError`] inside a `#[pymethods]` body raises
+    /// the shared `wyrd.WyrdError` with its canonical code and status.
+    fn from(error: WorkflowError) -> Self {
+        Self::from(WyrdError::from(error))
+    }
 }
 
-fn skald_workflow_error_to_py(error: WorkflowError) -> PyErr {
-    Python::attach(|py| {
-        let message = error.to_string();
-        let code = error.code();
-        let exception = match py
-            .get_type::<wyrd_utils::py::WyrdError>()
-            .call1((message.clone(),))
-        {
-            Ok(exception) => exception,
-            Err(source) => return source,
-        };
-        if let Err(source) = exception.setattr("code", code) {
-            return source;
-        }
-        if let Err(source) = exception.setattr("message", message) {
-            return source;
-        }
-        let details = match wyrd_utils::py::json_to_pyobject(py, &serde_json::json!({})) {
-            Ok(details) => details,
-            Err(source) => return source,
-        };
-        if let Err(source) = exception.setattr("details", details.bind(py)) {
-            return source;
-        }
-        if let Err(source) = exception.setattr("status", 422u16) {
-            return source;
-        }
-        if let Err(source) = exception.setattr("title", "Workflow execution failed") {
-            return source;
-        }
-        PyErr::from_value(exception)
+/// Reject a caller-supplied argument the workflow surface cannot accept.
+fn invalid_argument(name: &str, detail: impl std::fmt::Display) -> WyrdPyError {
+    WyrdPyError::from(WyrdError::WorkflowValidation {
+        message: format!("{name} is invalid: {detail}"),
+        details: serde_json::json!({ "argument": name, "reason": detail.to_string() }),
     })
 }
 
-fn wyrd_error_to_py(error: WyrdError) -> PyErr {
-    wyrd_utils::py::wyrd_error_to_py_err(error)
+/// Re-enter the catalog from a PyO3-originated failure at this boundary.
+fn from_py_err(error: PyErr) -> WyrdPyError {
+    Python::attach(|py| WyrdPyError::from(wyrd_utils::py::py_err_to_wyrd_error(py, error)))
 }
 
 fn workflow_input_from_py(value: &Bound<'_, PyAny>) -> Result<WorkflowInput, WorkflowError> {
@@ -77,14 +51,13 @@ fn workflow_input_from_py(value: &Bound<'_, PyAny>) -> Result<WorkflowInput, Wor
     Ok(WorkflowInput::from(json))
 }
 
-fn coerce_labels(labels: Option<HashMap<String, String>>) -> Result<Labels, PyErr> {
+fn coerce_labels(labels: Option<HashMap<String, String>>) -> WyrdPyResult<Labels> {
     let mut out = Labels::default();
     if let Some(labels) = labels {
         for (key, value) in labels {
-            let key = LabelKey::new(&key)
-                .map_err(|error| PyTypeError::new_err(format!("invalid label key: {error}")))?;
-            let value = LabelValue::new(&value)
-                .map_err(|error| PyTypeError::new_err(format!("invalid label value: {error}")))?;
+            let key = LabelKey::new(&key).map_err(|error| invalid_argument("labels", error))?;
+            let value =
+                LabelValue::new(&value).map_err(|error| invalid_argument("labels", error))?;
             out.insert(key, value);
         }
     }
@@ -93,28 +66,29 @@ fn coerce_labels(labels: Option<HashMap<String, String>>) -> Result<Labels, PyEr
 
 fn coerce_annotations(
     annotations: Option<HashMap<String, String>>,
-) -> Result<wyrd_spec::metadata::Annotations, PyErr> {
+) -> WyrdPyResult<wyrd_spec::metadata::Annotations> {
     let mut out = wyrd_spec::metadata::Annotations::default();
     if let Some(annotations) = annotations {
         for (key, value) in annotations {
-            let key = AnnotationKey::new(&key).map_err(|error| {
-                PyTypeError::new_err(format!("invalid annotation key: {error}"))
-            })?;
-            let value = AnnotationValue::new(&value).map_err(|error| {
-                PyTypeError::new_err(format!("invalid annotation value: {error}"))
-            })?;
+            let key =
+                AnnotationKey::new(&key).map_err(|error| invalid_argument("annotations", error))?;
+            let value = AnnotationValue::new(&value)
+                .map_err(|error| invalid_argument("annotations", error))?;
             out.insert(key, value);
         }
     }
     Ok(out)
 }
 
-fn extract_agents(py: Python<'_>, agents: Vec<Py<PyAny>>) -> PyResult<Vec<Agent>> {
+fn extract_agents(py: Python<'_>, agents: Vec<Py<PyAny>>) -> WyrdPyResult<Vec<Agent>> {
     let mut out = Vec::with_capacity(agents.len());
     for value in agents {
         let bound = value.bind(py);
         let py_agent: Py<Agent> = bound.extract().map_err(|_| {
-            PyTypeError::new_err("expected an Agent value; pass Agent objects positionally")
+            invalid_argument(
+                "agents",
+                "expected an Agent value; pass Agent objects positionally",
+            )
         })?;
         out.push(py_agent.borrow(py).clone());
     }
@@ -124,19 +98,23 @@ fn extract_agents(py: Python<'_>, agents: Vec<Py<PyAny>>) -> PyResult<Vec<Agent>
 fn extract_observers(
     py: Python<'_>,
     observers: Option<Vec<Py<PyAny>>>,
-) -> PyResult<Vec<Arc<dyn Observer>>> {
+) -> WyrdPyResult<Vec<Arc<dyn Observer>>> {
     let Some(observers) = observers else {
         return Ok(Vec::new());
     };
-    let observer_cls = py.import("wyrd.observer")?.getattr("Observer")?;
+    let observer_cls = py
+        .import("wyrd.observer")
+        .and_then(|module| module.getattr("Observer"))
+        .map_err(from_py_err)?;
     let mut out: Vec<Arc<dyn Observer>> = Vec::with_capacity(observers.len());
     for observer in observers {
         let bound = observer.bind(py);
-        if !bound.is_instance(&observer_cls)? {
-            let type_name = bound.get_type().name()?;
-            return Err(PyTypeError::new_err(format!(
-                "expected Observer subclass, got {type_name}"
-            )));
+        if !bound.is_instance(&observer_cls).map_err(from_py_err)? {
+            let type_name = bound.get_type().name().map_err(from_py_err)?;
+            return Err(invalid_argument(
+                "observers",
+                format!("expected Observer subclass, got {type_name}"),
+            ));
         }
         out.push(
             Arc::new(skald_observer::python::PythonObserver::new(observer)) as Arc<dyn Observer>,
@@ -145,9 +123,9 @@ fn extract_observers(
     Ok(out)
 }
 
-fn coerce_after<'py>(py: Python<'py>, after: &Bound<'py, PyAny>) -> PyResult<Vec<String>> {
+fn coerce_after<'py>(py: Python<'py>, after: &Bound<'py, PyAny>) -> WyrdPyResult<Vec<String>> {
     if let Ok(text) = after.cast::<PyString>() {
-        return Ok(vec![text.to_str()?.to_owned()]);
+        return Ok(vec![text.to_str().map_err(from_py_err)?.to_owned()]);
     }
     if let Ok(py_agent) = after.extract::<Py<Agent>>() {
         return Ok(vec![step_id_from_agent(&py_agent.borrow(py))]);
@@ -156,19 +134,21 @@ fn coerce_after<'py>(py: Python<'py>, after: &Bound<'py, PyAny>) -> PyResult<Vec
         let mut out = Vec::with_capacity(list.len());
         for item in list.iter() {
             if let Ok(text) = item.cast::<PyString>() {
-                out.push(text.to_str()?.to_owned());
+                out.push(text.to_str().map_err(from_py_err)?.to_owned());
             } else if let Ok(py_agent) = item.extract::<Py<Agent>>() {
                 out.push(step_id_from_agent(&py_agent.borrow(py)));
             } else {
-                return Err(PyTypeError::new_err(
-                    "after entries must be Agent or str values",
+                return Err(invalid_argument(
+                    "after",
+                    "entries must be Agent or str values",
                 ));
             }
         }
         return Ok(out);
     }
-    Err(PyTypeError::new_err(
-        "after must be Agent, str, or a sequence of Agent | str",
+    Err(invalid_argument(
+        "after",
+        "must be Agent, str, or a sequence of Agent | str",
     ))
 }
 
@@ -210,7 +190,7 @@ impl Workflow {
         labels: Option<HashMap<String, String>>,
         annotations: Option<HashMap<String, String>>,
         observers: Option<Vec<Py<PyAny>>>,
-    ) -> PyResult<Self> {
+    ) -> WyrdPyResult<Self> {
         let labels = coerce_labels(labels)?;
         let annotations = coerce_annotations(annotations)?;
         let observers = extract_observers(py, observers)?;
@@ -246,12 +226,12 @@ impl Workflow {
         name: String,
         agents: Vec<Py<PyAny>>,
         observers: Option<Vec<Py<PyAny>>>,
-    ) -> PyResult<Self> {
+    ) -> WyrdPyResult<Self> {
         let agents = extract_agents(py, agents)?;
         let observers = extract_observers(py, observers)?;
         Workflow::sequential(name, agents)
             .map(|workflow| workflow.with_observers(observers))
-            .map_err(workflow_error_to_py)
+            .map_err(WyrdPyError::from)
     }
 
     /// Build a workflow whose steps run in parallel with no dependencies.
@@ -273,12 +253,12 @@ impl Workflow {
         name: String,
         agents: Vec<Py<PyAny>>,
         observers: Option<Vec<Py<PyAny>>>,
-    ) -> PyResult<Self> {
+    ) -> WyrdPyResult<Self> {
         let agents = extract_agents(py, agents)?;
         let observers = extract_observers(py, observers)?;
         Workflow::parallel(name, agents)
             .map(|workflow| workflow.with_observers(observers))
-            .map_err(workflow_error_to_py)
+            .map_err(WyrdPyError::from)
     }
 
     /// Append `agent` as a new step with no dependencies.
@@ -296,9 +276,9 @@ impl Workflow {
         mut slf: PyRefMut<'py, Self>,
         py: Python<'py>,
         agent: Py<Agent>,
-    ) -> PyResult<PyRefMut<'py, Self>> {
+    ) -> WyrdPyResult<PyRefMut<'py, Self>> {
         let agent = agent.borrow(py).clone();
-        let next = slf.clone().add(agent).map_err(workflow_error_to_py)?;
+        let next = slf.clone().add(agent).map_err(WyrdPyError::from)?;
         *slf = next;
         Ok(slf)
     }
@@ -321,13 +301,13 @@ impl Workflow {
         py: Python<'py>,
         agent: Py<Agent>,
         after: &Bound<'py, PyAny>,
-    ) -> PyResult<PyRefMut<'py, Self>> {
+    ) -> WyrdPyResult<PyRefMut<'py, Self>> {
         let agent = agent.borrow(py).clone();
         let deps = coerce_after(py, after)?;
         let next = slf
             .clone()
             .add_after(agent, deps)
-            .map_err(workflow_error_to_py)?;
+            .map_err(WyrdPyError::from)?;
         *slf = next;
         Ok(slf)
     }
@@ -373,8 +353,8 @@ impl Workflow {
     /// Raises:
     ///     WyrdError: When identity or codec fails.
     #[pyo3(name = "to_yaml")]
-    pub fn py_to_yaml(&self) -> PyResult<String> {
-        self.to_yaml_string().map_err(wyrd_error_to_py)
+    pub fn py_to_yaml(&self) -> WyrdPyResult<String> {
+        self.to_yaml_string().map_err(WyrdPyError::from)
     }
 
     /// Save this workflow to disk as canonical envelope YAML.
@@ -385,8 +365,8 @@ impl Workflow {
     /// Raises:
     ///     WyrdError: When identity, IO, or codec fails.
     #[pyo3(name = "save")]
-    pub fn py_save(&self, path: PathBuf) -> PyResult<()> {
-        self.save(path).map_err(wyrd_error_to_py)
+    pub fn py_save(&self, path: PathBuf) -> WyrdPyResult<()> {
+        self.save(path).map_err(WyrdPyError::from)
     }
 
     /// Load a workflow from disk.
@@ -401,10 +381,10 @@ impl Workflow {
     ///     WyrdError: When IO, codec, or resolution fails.
     #[staticmethod]
     #[pyo3(name = "load")]
-    pub fn py_load(path: PathBuf) -> PyResult<Self> {
+    pub fn py_load(path: PathBuf) -> WyrdPyResult<Self> {
         let tool_resolver = skald_tool::default_registry();
         let prompt_resolver = skald_agent::default_prompt_resolver();
-        Workflow::load(path, tool_resolver, prompt_resolver).map_err(wyrd_error_to_py)
+        Workflow::load(path, tool_resolver, prompt_resolver).map_err(WyrdPyError::from)
     }
 
     /// Parse a workflow from a canonical envelope YAML string.
@@ -419,10 +399,10 @@ impl Workflow {
     ///     WyrdError: When parse or resolution fails.
     #[staticmethod]
     #[pyo3(name = "from_yaml")]
-    pub fn py_from_yaml(yaml: String) -> PyResult<Self> {
+    pub fn py_from_yaml(yaml: String) -> WyrdPyResult<Self> {
         let tool_resolver = skald_tool::default_registry();
         let prompt_resolver = skald_agent::default_prompt_resolver();
-        Workflow::from_yaml_str(&yaml, tool_resolver, prompt_resolver).map_err(wyrd_error_to_py)
+        Workflow::from_yaml_str(&yaml, tool_resolver, prompt_resolver).map_err(WyrdPyError::from)
     }
 
     /// Run this workflow against the process-local provider registry.
@@ -438,14 +418,14 @@ impl Workflow {
     ///     WyrdError: When a provider call fails, retries exhaust, or any
     ///         step's output validation fails.
     #[pyo3(name = "run", signature = (input))]
-    pub fn py_run(&self, py: Python<'_>, input: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
-        let input = workflow_input_from_py(input).map_err(workflow_error_to_py)?;
+    pub fn py_run(&self, py: Python<'_>, input: &Bound<'_, PyAny>) -> WyrdPyResult<Py<PyAny>> {
+        let input = workflow_input_from_py(input).map_err(WyrdPyError::from)?;
         let providers = skald_runtime::default_registry();
         let run = py.detach(|| {
             wyrd_runtime::runtime().block_on(Workflow::run_with(self, providers.as_ref(), input))
         });
-        let run = run.map_err(workflow_error_to_py)?;
-        Ok(Py::new(py, run)?.into_any())
+        let run = run.map_err(WyrdPyError::from)?;
+        Ok(Py::new(py, run).map_err(from_py_err)?.into_any())
     }
 }
 
@@ -459,29 +439,30 @@ impl WorkflowRun {
 
     /// Return per-step outcomes as a `dict[str, StepOutcome]`.
     #[getter]
-    pub fn outcomes(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+    pub fn outcomes(&self, py: Python<'_>) -> WyrdPyResult<Py<PyDict>> {
         let dict = PyDict::new(py);
         for (id, outcome) in &self.tasks {
-            dict.set_item(id, Py::new(py, outcome.clone())?)?;
+            let outcome = Py::new(py, outcome.clone()).map_err(from_py_err)?;
+            dict.set_item(id, outcome).map_err(from_py_err)?;
         }
         Ok(dict.into())
     }
 
     /// Return per-step events as a `list[StepEvent]`.
     #[getter]
-    pub fn events(&self, py: Python<'_>) -> PyResult<Py<PyList>> {
+    pub fn events(&self, py: Python<'_>) -> WyrdPyResult<Py<PyList>> {
         let mut items: Vec<Py<TaskEvent>> = Vec::with_capacity(self.events.len());
         for event in &self.events {
-            items.push(Py::new(py, event.clone())?);
+            items.push(Py::new(py, event.clone()).map_err(from_py_err)?);
         }
-        Ok(PyList::new(py, items)?.into())
+        Ok(PyList::new(py, items).map_err(from_py_err)?.into())
     }
 
     /// Return accumulated structured-output parameters.
     #[getter]
-    pub fn parameters(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+    pub fn parameters(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
         let value = serde_json::Value::Object(self.parameters.clone());
-        wyrd_utils::py::json_to_pyobject(py, &value)
+        wyrd_utils::py::json_to_pyobject(py, &value).map_err(from_py_err)
     }
 
     /// Return terminal assistant output, when present.

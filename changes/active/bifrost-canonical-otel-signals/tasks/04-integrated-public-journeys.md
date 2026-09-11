@@ -705,10 +705,37 @@ they are not restated per topology.
 
 - Scenario 4's retry-dedup leg asserts the accepted canonical subset through the
   batch fence and payload digest rather than through a second identical OTLP
-  export: the OTLP transport mints a fresh batch id per export, so a replayed
-  request is a new batch by contract and cannot express the duplicate the
-  assertion needs. Recorded as a deviation, not a gap: duplicate-source
-  suppression remains proven in the Scribe recovery owner.
+  export, because the OTLP ingress cannot express a repeated batch. That is a
+  product gap, not only a test limitation — see the finding below.
+
+### Finding — the OTLP ingress has no client-retry idempotency
+
+The durable batch fence (`vala.scribe_batch_commits`, keyed
+`(data_tenant_id, logical_table_fqn, batch_id)`) is consulted on the live commit
+path in `scribe/shards.rs::commit_batch_control_fence`, not only during WAL
+replay. A second arrival of the same `batch_id` with a matching logical digest
+resolves to `AlreadyCommitted` and writes nothing, so batch identity is
+genuinely idempotent.
+
+The SDK gRPC path supplies that identity: `vala-sdk/src/grpc.rs::send_owned_bytes`
+reuses one client-minted `wyrd_batch_id` across every retry attempt, so a
+commit-then-lost-response cannot double-write.
+
+The OTLP path does not. `gate/mod.rs` sets `batch_id: uuid::Uuid::now_v7()`
+server-side per request, so a retried OTLP export is a new batch the fence
+cannot match, and its spans are written a second time. The duplicate window is
+ordinary exporter behavior: the server commits, the response is lost or times
+out, the upstream OTel SDK retries. Nothing downstream closes it — the canonical
+tables are append-only and there is no dedup on `(trace_id, span_id)`.
+
+This is outside SPEC revision 11's acceptance criteria: AC-006 and AC-007 ask
+for recovery/replay evidence over exact batch identity, which the fence and the
+Scribe recovery owner provide. It is recorded here because the gap is reachable
+from the primary public OTLP journey this task proves, and duplicated spans
+corrupt exactly the GenAI token aggregates these tables exist to serve. A fix
+would derive the fence key at the OTLP ingress rather than minting one — a
+digest over the decoded request, or the `Idempotency-Key` the HTTP client
+already sends — and needs its own spec revision and task.
 - Scenario 6 adds a `Flush` control request and a foreign-tenant public
   credential to `BifrostProcessCluster`. Neither carries data: the first is the
   publication step a deployment reaches on its own timer, taken explicitly so a

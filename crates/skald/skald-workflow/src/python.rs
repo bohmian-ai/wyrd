@@ -37,11 +37,6 @@ fn invalid_argument(name: &str, detail: impl std::fmt::Display) -> WyrdPyError {
     })
 }
 
-/// Re-enter the catalog from a PyO3-originated failure at this boundary.
-fn from_py_err(error: PyErr) -> WyrdPyError {
-    Python::attach(|py| WyrdPyError::from(wyrd_utils::py::py_err_to_wyrd_error(py, error)))
-}
-
 fn workflow_input_from_py(value: &Bound<'_, PyAny>) -> Result<WorkflowInput, WorkflowError> {
     if let Ok(text) = value.extract::<String>() {
         return Ok(WorkflowInput::Text(text));
@@ -104,13 +99,12 @@ fn extract_observers(
     };
     let observer_cls = py
         .import("wyrd.observer")
-        .and_then(|module| module.getattr("Observer"))
-        .map_err(from_py_err)?;
+        .and_then(|module| module.getattr("Observer"))?;
     let mut out: Vec<Arc<dyn Observer>> = Vec::with_capacity(observers.len());
     for observer in observers {
         let bound = observer.bind(py);
-        if !bound.is_instance(&observer_cls).map_err(from_py_err)? {
-            let type_name = bound.get_type().name().map_err(from_py_err)?;
+        if !bound.is_instance(&observer_cls)? {
+            let type_name = bound.get_type().name()?;
             return Err(invalid_argument(
                 "observers",
                 format!("expected Observer subclass, got {type_name}"),
@@ -125,7 +119,7 @@ fn extract_observers(
 
 fn coerce_after<'py>(py: Python<'py>, after: &Bound<'py, PyAny>) -> WyrdPyResult<Vec<String>> {
     if let Ok(text) = after.cast::<PyString>() {
-        return Ok(vec![text.to_str().map_err(from_py_err)?.to_owned()]);
+        return Ok(vec![text.to_str()?.to_owned()]);
     }
     if let Ok(py_agent) = after.extract::<Py<Agent>>() {
         return Ok(vec![step_id_from_agent(&py_agent.borrow(py))]);
@@ -134,7 +128,7 @@ fn coerce_after<'py>(py: Python<'py>, after: &Bound<'py, PyAny>) -> WyrdPyResult
         let mut out = Vec::with_capacity(list.len());
         for item in list.iter() {
             if let Ok(text) = item.cast::<PyString>() {
-                out.push(text.to_str().map_err(from_py_err)?.to_owned());
+                out.push(text.to_str()?.to_owned());
             } else if let Ok(py_agent) = item.extract::<Py<Agent>>() {
                 out.push(step_id_from_agent(&py_agent.borrow(py)));
             } else {
@@ -425,7 +419,7 @@ impl Workflow {
             wyrd_runtime::runtime().block_on(Workflow::run_with(self, providers.as_ref(), input))
         });
         let run = run.map_err(WyrdPyError::from)?;
-        Ok(Py::new(py, run).map_err(from_py_err)?.into_any())
+        Ok(Py::new(py, run)?.into_any())
     }
 }
 
@@ -442,8 +436,8 @@ impl WorkflowRun {
     pub fn outcomes(&self, py: Python<'_>) -> WyrdPyResult<Py<PyDict>> {
         let dict = PyDict::new(py);
         for (id, outcome) in &self.tasks {
-            let outcome = Py::new(py, outcome.clone()).map_err(from_py_err)?;
-            dict.set_item(id, outcome).map_err(from_py_err)?;
+            let outcome = Py::new(py, outcome.clone())?;
+            dict.set_item(id, outcome)?;
         }
         Ok(dict.into())
     }
@@ -453,16 +447,16 @@ impl WorkflowRun {
     pub fn events(&self, py: Python<'_>) -> WyrdPyResult<Py<PyList>> {
         let mut items: Vec<Py<TaskEvent>> = Vec::with_capacity(self.events.len());
         for event in &self.events {
-            items.push(Py::new(py, event.clone()).map_err(from_py_err)?);
+            items.push(Py::new(py, event.clone())?);
         }
-        Ok(PyList::new(py, items).map_err(from_py_err)?.into())
+        Ok(PyList::new(py, items)?.into())
     }
 
     /// Return accumulated structured-output parameters.
     #[getter]
     pub fn parameters(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
         let value = serde_json::Value::Object(self.parameters.clone());
-        wyrd_utils::py::json_to_pyobject(py, &value).map_err(from_py_err)
+        wyrd_utils::py::json_to_pyobject(py, &value).map_err(WyrdPyError::from)
     }
 
     /// Return terminal assistant output, when present.

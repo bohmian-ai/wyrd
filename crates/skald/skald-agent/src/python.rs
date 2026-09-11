@@ -15,7 +15,7 @@ use skald_spec::{ProviderRequest, ProviderResponse};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::metadata::{AnnotationKey, AnnotationValue, LabelKey, LabelValue};
 use wyrd_spec::reference::PromptRef;
-use wyrd_utils::py::{WyrdPyError, WyrdPyResult, py_err_to_wyrd_error};
+use wyrd_utils::py::{WyrdPyError, WyrdPyResult};
 
 use crate::error::AgentError;
 use crate::{
@@ -68,15 +68,6 @@ fn boundary_internal(detail: &impl std::fmt::Display) -> WyrdPyError {
         message: detail.to_string(),
         details: serde_json::json!({ "boundary": "skald_agent_python" }),
     })
-}
-
-/// Re-enter the catalog from a PyO3-originated failure.
-///
-/// Used where an interpreter call inside a Wyrd-owned operation fails; the
-/// shared converter preserves an already-structured Wyrd exception and
-/// classifies anything else as agent validation.
-fn from_py_err(error: PyErr) -> WyrdPyError {
-    Python::attach(|py| WyrdPyError::from(py_err_to_wyrd_error(py, error)))
 }
 
 #[pymethods]
@@ -308,7 +299,7 @@ impl Agent {
     pub fn py_to_card(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
         let card = Agent::to_card(self)?;
         let value = serde_json::to_value(card).map_err(|error| boundary_internal(&error))?;
-        wyrd_utils::py::json_to_pyobject(py, &value).map_err(from_py_err)
+        wyrd_utils::py::json_to_pyobject(py, &value).map_err(WyrdPyError::from)
     }
 
     /// Return this Agent Card envelope as JSON.
@@ -370,7 +361,7 @@ impl Agent {
             run.parsed = Some(Arc::new(instantiate_parsed(py, &cls, &run.output, map)?));
         }
 
-        Ok(Py::new(py, run).map_err(from_py_err)?.into_any())
+        Ok(Py::new(py, run)?.into_any())
     }
 
     /// Add one runtime-local tool in place.
@@ -757,7 +748,7 @@ fn prompt_ref_from_py(value: &Bound<'_, PyAny>) -> WyrdPyResult<PromptRef> {
             .map_err(|error| invalid_argument("prompt", error))?;
         return serde_json::from_str(&data).map_err(|error| json_decode_error(&error));
     }
-    let json = wyrd_utils::py::pyobject_to_json(value).map_err(from_py_err)?;
+    let json = wyrd_utils::py::pyobject_to_json(value)?;
     serde_json::from_value(json).map_err(|error| json_decode_error(&error))
 }
 
@@ -800,7 +791,7 @@ fn input_to_string(value: &Bound<'_, PyAny>) -> WyrdPyResult<String> {
             .extract()
             .map_err(|error| invalid_argument("input", error));
     }
-    let json = wyrd_utils::py::pyobject_to_json(value).map_err(from_py_err)?;
+    let json = wyrd_utils::py::pyobject_to_json(value)?;
     serde_json::to_string(&json).map_err(|error| boundary_internal(&error))
 }
 
@@ -916,12 +907,9 @@ fn role_from_py(value: &Bound<'_, PyAny>) -> WyrdPyResult<Role> {
 
 fn session_turn_to_py_dict(py: Python<'_>, turn: &SessionTurn) -> WyrdPyResult<Py<PyAny>> {
     let dict = PyDict::new(py);
-    dict.set_item("role", role_as_str(turn.role))
-        .map_err(from_py_err)?;
-    dict.set_item("content", &turn.content)
-        .map_err(from_py_err)?;
-    dict.set_item("call_id", &turn.call_id)
-        .map_err(from_py_err)?;
+    dict.set_item("role", role_as_str(turn.role))?;
+    dict.set_item("content", &turn.content)?;
+    dict.set_item("call_id", &turn.call_id)?;
     Ok(dict.into_any().unbind())
 }
 
@@ -929,7 +917,7 @@ fn session_turn_from_py(value: &Bound<'_, PyAny>) -> WyrdPyResult<SessionTurn> {
     if let Ok(turn) = value.extract::<PyRef<'_, SessionTurn>>() {
         return Ok(turn.clone());
     }
-    let json = wyrd_utils::py::pyobject_to_json(value).map_err(from_py_err)?;
+    let json = wyrd_utils::py::pyobject_to_json(value)?;
     serde_json::from_value(json).map_err(|error| json_decode_error(&error))
 }
 
@@ -941,7 +929,7 @@ fn session_turns_from_py(value: &Bound<'_, PyAny>) -> WyrdPyResult<Vec<SessionTu
         }
         return Ok(turns);
     }
-    let json = wyrd_utils::py::pyobject_to_json(value).map_err(from_py_err)?;
+    let json = wyrd_utils::py::pyobject_to_json(value)?;
     serde_json::from_value(json).map_err(|error| json_decode_error(&error))
 }
 

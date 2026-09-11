@@ -265,7 +265,7 @@ impl AgentRun {
         py: pyo3::Python<'_>,
     ) -> wyrd_utils::py::WyrdPyResult<pyo3::Py<pyo3::PyAny>> {
         let value = serde_json::to_value(&self.conversation).map_err(run_boundary_error)?;
-        wyrd_utils::py::json_to_pyobject(py, &value).map_err(|error| run_py_error(py, error))
+        wyrd_utils::py::json_to_pyobject(py, &value).map_err(wyrd_utils::py::WyrdPyError::from)
     }
 
     /// Return the structured terminal error.
@@ -288,7 +288,7 @@ impl AgentRun {
         };
         wyrd_utils::py::wyrd_error_to_py_object(py, error)
             .map(Some)
-            .map_err(|error| run_py_error(py, error))
+            .map_err(wyrd_utils::py::WyrdPyError::from)
     }
 
     /// Return parsed structured output, when the prompt declared an output schema.
@@ -306,7 +306,7 @@ impl AgentRun {
         let value = serde_json::Value::Object(map.clone());
         wyrd_utils::py::json_to_pyobject(py, &value)
             .map(Some)
-            .map_err(|error| run_py_error(py, error))
+            .map_err(wyrd_utils::py::WyrdPyError::from)
     }
 
     /// Return the typed model instance when the prompt declared an output class.
@@ -333,8 +333,7 @@ impl AgentRun {
         let py_response = pyo3::Py::new(
             py,
             skald_prompt::python::PyProviderResponse::from_arc(Arc::clone(arc)),
-        )
-        .map_err(|error| run_py_error(py, error))?
+        )?
         .into_any();
         Ok(Some(py_response))
     }
@@ -349,12 +348,6 @@ impl AgentRun {
             self.finish_reason, self.output, self.iterations
         )
     }
-}
-
-/// Project a PyO3-originated failure in a run getter onto the Wyrd catalog.
-#[cfg(feature = "python")]
-fn run_py_error(py: pyo3::Python<'_>, error: pyo3::PyErr) -> wyrd_utils::py::WyrdPyError {
-    wyrd_utils::py::WyrdPyError::from(wyrd_utils::py::py_err_to_wyrd_error(py, error))
 }
 
 /// Project a run-projection serialization failure onto the Wyrd catalog.

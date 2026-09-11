@@ -2,7 +2,7 @@
 //!
 //! Computed projection of a [`crate::vala::trace::SpanRecord`] whose
 //! attributes carry `gen_ai.*` semantic-convention keys. The projector
-//! lives in `vala-bifrost`: it scans the source span's attribute bag,
+//! lives in `vala-bifrost-redux`: it scans the source span's attribute bag,
 //! lifts every key in [`crate::vala::trace::attributes::GEN_AI_KEYS`] into
 //! a typed column on this record, stores remaining `gen_ai.*` keys in
 //! [`GenAiSpanRecord::extra`], and reads `gen_ai.evaluation.result` events

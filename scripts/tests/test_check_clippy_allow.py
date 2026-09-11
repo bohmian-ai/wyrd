@@ -164,7 +164,7 @@ def test_is_ignored_path_skips_benches_dir() -> None:
 
 
 def test_is_ignored_path_skips_pg_tests_file() -> None:
-    p = ROOT / "crates" / "vala" / "vala-bifrost" / "src" / "writer" / "commit" / "pg_tests.rs"
+    p = ROOT / "crates" / "foo" / "src" / "writer" / "commit" / "pg_tests.rs"
     assert is_ignored_path(p)
 
 

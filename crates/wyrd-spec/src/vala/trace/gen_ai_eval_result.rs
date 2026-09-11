@@ -20,7 +20,7 @@
 //! [`GEN_AI_EVALUATION_EXPLANATION`](crate::vala::trace::attributes::GEN_AI_EVALUATION_EXPLANATION).
 //!
 //! Extraction from `SpanEvent` to `GenAiEvalResult` happens in the GenAI
-//! projector. Wyrd-side, that is `vala-bifrost` or the OTLP receiver
+//! projector. Wyrd-side, that is `vala-bifrost-redux` or the OTLP receiver
 //! (`vala-ingest`). This crate just publishes the shape.
 
 use serde::{Deserialize, Serialize};

@@ -1,8 +1,8 @@
 //! Per-trace rollup record.
 //!
-//! Computed by `vala-bifrost` once a trace's spans are assembled. One row
+//! Computed by `vala-bifrost-redux` once a trace's spans are assembled. One row
 //! per `(data_tenant_id, trace_id, bucket_time)`. Wyrd lifts `bucket_time`
-//! (the `trace_bounds_lookup` index column) into the record so `vala-bifrost`
+//! (the `trace_bounds_lookup` index column) into the record so `vala-bifrost-redux`
 //! does not recompute it at SQL time; predecessor implementations computed it
 //! inline against `start_time`.
 //!

@@ -4,7 +4,7 @@
 //! `wyrd-telemetry` (PR4.1) and `vala-ingest` (PR4.2).
 //!
 //! Span attributes are stored as opaque `serde_json::Map<String,
-//! serde_json::Value>` on every record. Downstream (`vala-bifrost`)
+//! serde_json::Value>` on every record. Downstream (`vala-bifrost-redux`)
 //! projects them to `Utf8` Iceberg/Parquet columns and keeps them
 //! opaque: DataFusion 54.0.0 reads a requested key from the projected
 //! `Utf8` column, with no pre-extraction or JSON shredding into typed

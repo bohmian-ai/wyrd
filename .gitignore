@@ -46,7 +46,7 @@ postgres-data/
 
 # Git worktrees
 .worktrees/
-crates/vala/vala-bifrost/benches/reports/*.json
+crates/vala/vala-bifrost-redux/benches/reports/*.json
 
 # Agent tools
 .codegraph

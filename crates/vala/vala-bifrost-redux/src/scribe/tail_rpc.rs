@@ -2956,21 +2956,6 @@ mod tests {
         let table = TableRef::new(crate::namespaces::BifrostNamespace::Bifrost, "events");
         let key = SealKey::new(tenant, table.clone(), day);
         let memtable = Arc::new(Memtable::new());
-        let event = || wyrd_spec::vala::api::AuditEvent {
-            request_id: wyrd_spec::request_id::RequestId::now_v7(),
-            trace_id: None,
-            operation: "test".to_owned(),
-            resource: "vala.bifrost.events".to_owned(),
-            card_ref: None,
-            principal_id: wyrd_spec::auth::PrincipalId::new(uuid::Uuid::now_v7()),
-            principal_kind: wyrd_spec::auth::PrincipalKindTag::User,
-            auth_method: wyrd_spec::vala::api::AuthMethod::Jwt,
-            permission: "test".to_owned(),
-            decision: wyrd_spec::vala::api::AuditDecision::Allow,
-            result: wyrd_spec::vala::api::AuditResult::Success,
-            payload_summary: "test".to_owned(),
-            detail: None,
-        };
         let meta = |lsn: u64, rows: usize| ScribeAppendMeta {
             batch_id: *uuid::Uuid::now_v7().as_bytes(),
             schema_fingerprint: [0; 32],
@@ -2986,7 +2971,7 @@ mod tests {
             seal_key: key.to_string(),
         };
         memtable
-            .insert(&key, event(), meta(1, 3), batch(vec![1, 2, 3]))
+            .insert(&key, meta(1, 3), batch(vec![1, 2, 3]))
             .expect("first fixture batch inserts");
         // Freezing between the appends is what makes this fixture cover both
         // source states a live tail must keep readable for its lease: the first
@@ -2996,7 +2981,7 @@ mod tests {
             .freeze(&key)
             .expect("first fixture generation freezes");
         memtable
-            .insert(&key, event(), meta(2, 2), batch(vec![4, 5]))
+            .insert(&key, meta(2, 2), batch(vec![4, 5]))
             .expect("second fixture batch inserts");
         let binding =
             super::TenantTableBinding::resolve((tenant, table)).expect("fixture binding resolves");

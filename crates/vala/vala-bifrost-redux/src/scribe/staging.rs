@@ -1297,9 +1297,6 @@ mod tests {
         )
     }
     use sha2::{Digest as _, Sha256};
-    use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
-    use wyrd_spec::request_id::RequestId;
-    use wyrd_spec::vala::api::{AuditDecision, AuditResult, AuthMethod};
 
     use super::*;
     use crate::resources::{
@@ -1555,7 +1552,7 @@ mod tests {
 
     /// Proves restart loads a typed publication transaction without Arrow replay.
     #[tokio::test]
-    async fn publication_manifest_recovers_rows_audit_and_source_fence_fail_closed() {
+    async fn publication_manifest_recovers_rows_and_source_fence_fail_closed() {
         let directory = tempfile::tempdir().expect("stage root");
         let source = directory.path().join("source.parquet");
         let content = b"durable publication candidate";
@@ -1618,22 +1615,8 @@ mod tests {
                 row_id,
             ),
         }];
-        let events = vec![AuditEvent::new(
-            RequestId::now_v7(),
-            None,
-            "bifrost.scribe.publish".to_owned(),
-            "vala.traces.spans".to_owned(),
-            None,
-            PrincipalId::new(Uuid::now_v7()),
-            PrincipalKindTag::User,
-            AuthMethod::Internal,
-            "bifrost.scribe".to_owned(),
-            AuditDecision::Allow,
-            AuditResult::Success,
-            "redacted".to_owned(),
-        )];
         staging
-            .persist_publication("generation-7", actor, &rows, &events, &[claim])
+            .persist_publication("generation-7", actor, &rows, &[claim])
             .await
             .expect("publication manifest");
 
@@ -1644,7 +1627,6 @@ mod tests {
         assert_eq!(recovered.len(), 1);
         assert_eq!(recovered[0].actor_stream, actor);
         assert_eq!(recovered[0].rows[0].file_path, object_key);
-        assert_eq!(recovered[0].audit_events, events);
     }
 
     /// Publishes the elected artifact and returns its manifest's durable bytes.
@@ -1703,28 +1685,8 @@ mod tests {
                 row_id,
             ),
         }];
-        let events = vec![AuditEvent::new(
-            RequestId::now_v7(),
-            None,
-            "bifrost.scribe.publish".to_owned(),
-            "vala.traces.spans".to_owned(),
-            None,
-            PrincipalId::new(Uuid::now_v7()),
-            PrincipalKindTag::User,
-            AuthMethod::Internal,
-            "bifrost.scribe".to_owned(),
-            AuditDecision::Allow,
-            AuditResult::Success,
-            "redacted".to_owned(),
-        )];
         staging
-            .persist_publication(
-                "generation-9",
-                actor,
-                &rows,
-                &events,
-                std::slice::from_ref(claim),
-            )
+            .persist_publication("generation-9", actor, &rows, std::slice::from_ref(claim))
             .await
             .expect("publication manifest");
         let publication_path = staging.root.join("generation-9.publication.json");

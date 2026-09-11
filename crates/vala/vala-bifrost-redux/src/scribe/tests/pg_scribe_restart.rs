@@ -3,7 +3,6 @@
 use crate::catalog::TableRef;
 use crate::namespaces::BifrostNamespace;
 use crate::scribe::ScribeImpl;
-use crate::scribe::audit_envelope::encode_audit_event;
 use crate::scribe::seal_key::SealKey;
 use crate::scribe::stream_identity::NodeId;
 use crate::scribe::wal::{WalConfig, WalWriter};
@@ -15,10 +14,7 @@ use opendal::services::Memory;
 use std::sync::Arc;
 use tempfile::TempDir;
 use uuid::Uuid;
-use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
 use wyrd_spec::ids::DataTenantId;
-use wyrd_spec::request_id::RequestId;
-use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
 
 /// Encode a one-row replay payload with the required persisted row identity.
 fn batch_bytes(value: i64) -> Vec<u8> {
@@ -62,25 +58,6 @@ fn large_batch_bytes(value: i64) -> Vec<u8> {
     bytes
 }
 
-/// Build one tenant-bound replay audit event.
-fn audit_event(operation: &str, tenant: DataTenantId) -> AuditEvent {
-    AuditEvent {
-        request_id: RequestId::now_v7(),
-        trace_id: None,
-        operation: operation.to_owned(),
-        resource: "vala.bifrost.scribe_persistence".to_owned(),
-        card_ref: None,
-        principal_id: PrincipalId::new(Uuid::now_v7()),
-        principal_kind: PrincipalKindTag::User,
-        auth_method: AuthMethod::Jwt,
-        permission: "bifrost:write".to_owned(),
-        decision: AuditDecision::Allow,
-        result: AuditResult::Success,
-        payload_summary: format!("tenant {tenant} rows"),
-        detail: None,
-    }
-}
-
 /// Build one deterministic tenant/table replay scope.
 fn seal_key(tenant: DataTenantId, table: &str) -> SealKey {
     SealKey::new(
@@ -103,18 +80,12 @@ async fn replay_memory_is_bounded_by_owner_backpressure() {
     let key_b = seal_key(tenant_b, "scribe_restart_b");
     let data = batch_bytes(7);
 
-    let audit_a = encode_audit_event(&audit_event("tenant-a", tenant_a)).expect("audit");
-    let audit_b = encode_audit_event(&audit_event("tenant-b", tenant_b)).expect("audit");
     for index in 0_u16..130 {
         let mut batch_id = [0_u8; 16];
         batch_id[..2].copy_from_slice(&index.to_le_bytes());
-        let (key, audit) = if index % 2 == 0 {
-            (&key_a, &audit_a)
-        } else {
-            (&key_b, &audit_b)
-        };
+        let key = if index % 2 == 0 { &key_a } else { &key_b };
         writer
-            .append_and_commit_for_replay_test(key, batch_id, audit, &data)
+            .append_and_commit_for_replay_test(key, batch_id, &data)
             .expect("tenant append");
     }
     drop(writer);
@@ -154,11 +125,10 @@ async fn replay_splits_three_same_key_generations_in_wal_order() {
         .expect("WAL writer");
     let tenant = DataTenantId::new_v7();
     let key = seal_key(tenant, "replay_three_generations");
-    let audit = encode_audit_event(&audit_event("replay-three", tenant)).expect("audit");
     let data = large_batch_bytes(7);
     for index in 0_u8..3 {
         writer
-            .append_and_commit_for_replay_test(&key, [index; 16], &audit, &data)
+            .append_and_commit_for_replay_test(&key, [index; 16], &data)
             .expect("same-key replay append");
     }
     drop(writer);
@@ -199,9 +169,8 @@ async fn replay_failure_keeps_scribe_unready() {
         .expect("WAL writer");
     let tenant = DataTenantId::new_v7();
     let key = seal_key(tenant, "scribe_replay_failure");
-    let audit = encode_audit_event(&audit_event("replay-failure", tenant)).expect("audit");
     writer
-        .append_and_commit_for_replay_test(&key, *Uuid::now_v7().as_bytes(), &audit, &[1, 2, 3])
+        .append_and_commit_for_replay_test(&key, *Uuid::now_v7().as_bytes(), &[1, 2, 3])
         .expect("invalid replay fixture append");
     drop(writer);
 

@@ -4483,8 +4483,10 @@ redacted
             operation_stop,
             authority_stop: _,
             heartbeat,
-            maintenance_recovery: _,
+            maintenance_recovery,
         } = fenced;
+        #[cfg(not(feature = "test-support"))]
+        let _ = maintenance_recovery;
         // Test-only barrier: a durably settled snapshot expiration is held
         // here, after its atomic task and operation settlement committed and
         // before this worker reads shutdown or joins the heartbeat.
@@ -7797,7 +7799,7 @@ impl ForgeWorker {
     ///
     /// # Errors
     ///
-    /// Returns tenant connection, exact lifecycle, audit, fence, or commit errors.
+    /// Returns tenant connection, exact lifecycle, fence, or commit errors.
     async fn persist_terminal_success(
         &self,
         transition: ForgeTaskTransition,
@@ -7806,7 +7808,6 @@ impl ForgeWorker {
         lease: &ForgeLease,
         progress_effect: TaskProgressEffect,
     ) -> Result<(), ForgeError> {
-        let _task_id = transition.task_id;
         let mut terminal = self
             .forge
             .core

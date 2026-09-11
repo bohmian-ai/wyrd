@@ -68,7 +68,7 @@ impl Forge {
         lease.require_fence(&self.core.operator_pool).await?;
         #[cfg(feature = "test-support")]
         if operation == "forge.iceberg_rewrite.prepared"
-            && FAIL_NEXT_PREPARED_LIVE_AUDIT.swap(false, Ordering::AcqRel)
+            && FAIL_NEXT_PREPARED_LIVE_TRANSITION.swap(false, Ordering::AcqRel)
         {
             return Err(ForgeError::Invariant {
                 detail: "injected Prepared live-replacement transition failure".to_owned(),
@@ -76,7 +76,7 @@ impl Forge {
         }
         #[cfg(feature = "test-support")]
         if operation != "forge.iceberg_rewrite.prepared"
-            && FAIL_NEXT_TERMINAL_LIVE_AUDIT.swap(false, Ordering::AcqRel)
+            && FAIL_NEXT_TERMINAL_LIVE_TRANSITION.swap(false, Ordering::AcqRel)
         {
             return Err(ForgeError::Invariant {
                 detail: "injected live terminal transition failure".to_owned(),

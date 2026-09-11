@@ -4459,8 +4459,6 @@ mod tests {
     use arrow::record_batch::RecordBatch;
     use chrono::NaiveDate;
     use std::sync::Arc;
-    use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
-    use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
 
     /// Every projected writer threshold independently triggers the same atomic
     /// whole-shard rotation decision, while a projection below all bounds does not.
@@ -4517,7 +4515,7 @@ mod tests {
             let key = owner_key();
             let memtable = Memtable::new();
             memtable
-                .insert(&key, owner_event(), owner_meta(&key), owner_batch())
+                .insert(&key, owner_meta(&key), owner_batch())
                 .expect("seed threshold member");
             let active_bytes = memtable.stats().expect("active statistics").writable_bytes;
             let wal_root = tempfile::tempdir().expect("WAL directory");
@@ -4534,7 +4532,7 @@ mod tests {
                 .expect("WAL writer"),
             );
             let batch_id = batch_id_for_owner(&key, 0);
-            wal.append_and_commit_for_replay_test(&key, *batch_id.as_bytes(), b"audit", b"data")
+            wal.append_and_commit_for_replay_test(&key, *batch_id.as_bytes(), b"data")
                 .expect("owner WAL append");
             let wal_handle = wal.handle_for_shard(0).expect("WAL handle");
             let (mut owner, _budget) =
@@ -4679,7 +4677,7 @@ mod tests {
         let memtable = Memtable::new();
         for key in [&first, &second] {
             memtable
-                .insert(key, owner_event(), owner_meta(key), owner_batch())
+                .insert(key, owner_meta(key), owner_batch())
                 .expect("seed active cohort member");
         }
         let active_bytes = memtable.stats().expect("active statistics").writable_bytes;
@@ -4727,7 +4725,7 @@ mod tests {
         assert_eq!(owner.pending_generations.len(), 2);
         owner
             .memtable
-            .insert(&first, owner_event(), owner_meta(&first), owner_batch())
+            .insert(&first, owner_meta(&first), owner_batch())
             .expect("incoming unit enters fresh generation");
         assert_eq!(owner.memtable.row_count(&first).expect("fresh rows"), 1);
         assert_eq!(owner.memtable.row_count(&second).expect("frozen rows"), 0);
@@ -4763,7 +4761,7 @@ mod tests {
         let memtable = Memtable::new();
         for key in [&first, &second] {
             memtable
-                .insert(key, owner_event(), owner_meta(key), owner_batch())
+                .insert(key, owner_meta(key), owner_batch())
                 .expect("seed owner member");
         }
         let active_bytes = memtable.stats().expect("active stats").writable_bytes;
@@ -4781,7 +4779,7 @@ mod tests {
         );
         for key in [&first, &second] {
             let batch_id = batch_id_for_owner(key, 0);
-            wal.append_and_commit_for_replay_test(key, *batch_id.as_bytes(), b"audit", b"data")
+            wal.append_and_commit_for_replay_test(key, *batch_id.as_bytes(), b"data")
                 .expect("owner WAL append");
         }
         let wal_handle = wal.handle_for_shard(0).expect("WAL handle");
@@ -4831,7 +4829,7 @@ mod tests {
         assert!(owner.generation_started_at > expired_at);
         owner
             .memtable
-            .insert(&first, owner_event(), owner_meta(&first), owner_batch())
+            .insert(&first, owner_meta(&first), owner_batch())
             .expect("incoming unit enters fresh owner generation");
         assert_eq!(owner.memtable.row_count(&first).expect("fresh row"), 1);
         assert_eq!(owner.memtable.row_count(&second).expect("frozen peer"), 0);
@@ -4855,7 +4853,7 @@ mod tests {
         let memtable = Memtable::new();
         for key in [&first, &second] {
             memtable
-                .insert(key, owner_event(), owner_meta(key), owner_batch())
+                .insert(key, owner_meta(key), owner_batch())
                 .expect("seed owner member");
         }
         let active_bytes = memtable.stats().expect("active stats").writable_bytes;
@@ -4873,7 +4871,7 @@ mod tests {
         );
         for key in [&first, &second] {
             let batch_id = batch_id_for_owner(key, 0);
-            wal.append_and_commit_for_replay_test(key, *batch_id.as_bytes(), b"audit", b"data")
+            wal.append_and_commit_for_replay_test(key, *batch_id.as_bytes(), b"data")
                 .expect("owner WAL append");
         }
         let wal_handle = wal.handle_for_shard(0).expect("WAL handle");
@@ -5150,7 +5148,6 @@ mod tests {
             stream,
             seal_key: owner_bad_binding_key(),
             shard_id: 0,
-            audit_events: Vec::new(),
             data_records: Vec::new(),
             append_metas: Vec::new(),
             wal_segments: Vec::new(),
@@ -5293,7 +5290,6 @@ mod tests {
                     stream,
                     seal_key,
                     shard_id: 0,
-                    audit_events: Vec::new(),
                     data_records: Vec::new(),
                     append_metas: Vec::new(),
                     wal_segments: Vec::new(),
@@ -5336,7 +5332,7 @@ mod tests {
         let key = owner_key();
         let memtable = Memtable::new();
         memtable
-            .insert(&key, owner_event(), owner_meta(&key), owner_batch())
+            .insert(&key, owner_meta(&key), owner_batch())
             .expect("owner insert");
         let frozen = memtable.freeze(&key).expect("owner freeze");
         let wal_root = tempfile::tempdir().expect("WAL directory");
@@ -5615,12 +5611,7 @@ mod tests {
         );
         owner
             .memtable
-            .insert(
-                &lock_key,
-                owner_event(),
-                owner_meta(&lock_key),
-                owner_batch(),
-            )
+            .insert(&lock_key, owner_meta(&lock_key), owner_batch())
             .expect("lock-failure replay insert");
         let lock_frozen = owner
             .memtable
@@ -5707,23 +5698,13 @@ mod tests {
         );
         let memtable = Memtable::new();
         memtable
-            .insert(
-                &current_key,
-                owner_event(),
-                owner_meta(&current_key),
-                owner_batch(),
-            )
+            .insert(&current_key, owner_meta(&current_key), owner_batch())
             .expect("current replay insert");
         let current_frozen = memtable
             .freeze(&current_key)
             .expect("current replay freeze");
         memtable
-            .insert(
-                &next_key,
-                owner_event(),
-                owner_meta(&next_key),
-                owner_batch(),
-            )
+            .insert(&next_key, owner_meta(&next_key), owner_batch())
             .expect("next replay insert");
         let next_frozen = memtable.freeze(&next_key).expect("next replay freeze");
         let wal_root = tempfile::tempdir().expect("advance-failure WAL directory");
@@ -5864,12 +5845,7 @@ mod tests {
         let retirement_key = owner_key();
         let retirement_memtable = Memtable::new();
         retirement_memtable
-            .insert(
-                &retirement_key,
-                owner_event(),
-                owner_meta(&retirement_key),
-                owner_batch(),
-            )
+            .insert(&retirement_key, owner_meta(&retirement_key), owner_batch())
             .expect("retirement replay insert");
         let retirement_frozen = retirement_memtable
             .freeze(&retirement_key)
@@ -6114,24 +6090,6 @@ mod tests {
         )
     }
 
-    fn owner_event() -> AuditEvent {
-        AuditEvent {
-            request_id: wyrd_spec::request_id::RequestId::now_v7(),
-            trace_id: None,
-            operation: "owner-test".to_owned(),
-            resource: "owner-test".to_owned(),
-            card_ref: None,
-            principal_id: PrincipalId::new(uuid::Uuid::now_v7()),
-            principal_kind: PrincipalKindTag::User,
-            auth_method: AuthMethod::Jwt,
-            permission: "bifrost:write".to_owned(),
-            decision: AuditDecision::Allow,
-            result: AuditResult::Success,
-            payload_summary: "owner-test".to_owned(),
-            detail: None,
-        }
-    }
-
     /// Exact retries are removed batch-wise without dropping canonical siblings.
     #[test]
     fn replay_fence_filters_only_suppressed_batches_in_same_seal() {
@@ -6168,7 +6126,6 @@ mod tests {
             ),
             seal_key: key.clone(),
             shard_id: 0,
-            audit_events: vec![owner_event(), owner_event()],
             data_records: vec![vec![1], vec![2]],
             append_metas: vec![meta(canonical, 1), meta(retry, 3)],
             wal_segments: Vec::new(),
@@ -6179,7 +6136,6 @@ mod tests {
 
         assert_eq!(replayed.append_metas.len(), 1);
         assert_eq!(replayed.append_metas[0].batch_id, canonical);
-        assert_eq!(replayed.audit_events.len(), 1);
         assert_eq!(replayed.data_records, vec![vec![1]]);
         assert_eq!(replayed.commits.len(), 1);
         assert_eq!(replayed.commits[0].batch_id, canonical);
@@ -6396,7 +6352,7 @@ mod tests {
         let rotation_bytes = crate::scribe::memory::retained_arrow_bytes(&first);
         let memtable = Memtable::new_with_rotation(rotation_bytes);
         memtable
-            .insert(&key, owner_event(), owner_meta(&key), first)
+            .insert(&key, owner_meta(&key), first)
             .expect("seed full bucket");
         let wal_root = tempfile::tempdir().expect("WAL directory");
         let node = crate::scribe::stream_identity::NodeId::generate();
@@ -6427,7 +6383,7 @@ mod tests {
             .insert_group(
                 vec![DurableSlice {
                     seal_key: key.clone(),
-                    audit_event: owner_event(),
+                    request_id: uuid::Uuid::now_v7(),
                     rows: Some(next_batch),
                     memtable_bytes: rotation_bytes,
                     active_reserved: true,
@@ -6484,7 +6440,7 @@ mod tests {
     ) -> (ShardOwner, Arc<WalWriter>, tempfile::TempDir) {
         let memtable = Memtable::new();
         memtable
-            .insert(key, owner_event(), owner_meta(key), owner_batch())
+            .insert(key, owner_meta(key), owner_batch())
             .expect("seed writable bucket");
         let wal_root = tempfile::tempdir().expect("WAL directory");
         let node = crate::scribe::stream_identity::NodeId::generate();
@@ -6530,7 +6486,7 @@ mod tests {
         let key = owner_key();
         let memtable = Memtable::new();
         memtable
-            .insert(&key, owner_event(), owner_meta(&key), owner_batch())
+            .insert(&key, owner_meta(&key), owner_batch())
             .expect("owner insert");
         let frozen = memtable.freeze(&key).expect("owner freeze");
         memtable
@@ -6600,11 +6556,10 @@ mod tests {
         let key = owner_key();
         crate::scribe::preprocess::prepare_append(crate::scribe::preprocess::AdmittedAppend {
             batch_id: uuid::Uuid::now_v7(),
-            audit_event: owner_event(),
+            request_id: uuid::Uuid::now_v7(),
             rows: crate::scribe::preprocess::AdmittedRows::Projected(owner_prepared_batch()),
             measured_wire_bytes: initial_bytes,
             admitted_bytes: initial_bytes,
-            wal_workspace_bytes: crate::gate::limits::BIFROST_WAL_WORKSPACE_LIMIT_BYTES,
             maximum_scribe_envelope_bytes: budget.ingress_limit_bytes(),
             reservation,
             memory,
@@ -6820,7 +6775,6 @@ mod tests {
             wal,
             rows: frozen.batches.clone(),
             schema: Arc::clone(&frozen.schema),
-            audit_events: frozen.events.clone(),
             append_metas: frozen.metas.clone(),
             row_count: frozen.row_count(),
             arrow_bytes: frozen.arrow_bytes,
@@ -6837,7 +6791,7 @@ mod tests {
         let key = owner_key();
         let memtable = Memtable::new();
         memtable
-            .insert(&key, owner_event(), owner_meta(&key), owner_batch())
+            .insert(&key, owner_meta(&key), owner_batch())
             .expect("owner insert");
         let frozen = memtable.freeze(&key).expect("owner freeze");
         let wal_root = tempfile::tempdir().expect("WAL directory");
@@ -7153,7 +7107,7 @@ mod tests {
         let key = owner_key();
         let memtable = Memtable::new();
         memtable
-            .insert(&key, owner_event(), owner_meta(&key), owner_batch())
+            .insert(&key, owner_meta(&key), owner_batch())
             .expect("owner insert");
         let active_bytes = memtable.stats().expect("owner stats").writable_bytes;
         let wal_root = tempfile::tempdir().expect("WAL directory");
@@ -7169,7 +7123,7 @@ mod tests {
             .expect("WAL writer"),
         );
         let batch_id = batch_id_for_owner(&key, 0);
-        wal.append_and_commit_for_replay_test(&key, *batch_id.as_bytes(), b"audit", b"data")
+        wal.append_and_commit_for_replay_test(&key, *batch_id.as_bytes(), b"data")
             .expect("owner WAL append");
         let wal_handle = wal.handle_for_shard(0).expect("owner WAL handle");
         let (mut owner, budget, command_tx, completion_tx, _pressure_tx) =
@@ -7242,7 +7196,7 @@ mod tests {
         let key = owner_key();
         let owner = Memtable::new();
         owner
-            .insert(&key, owner_event(), owner_meta(&key), owner_batch())
+            .insert(&key, owner_meta(&key), owner_batch())
             .expect("owner insert");
         let frozen = owner.freeze(&key).expect("owner freeze");
         owner
@@ -7263,7 +7217,7 @@ mod tests {
         let key = owner_key();
         let owner = Memtable::new();
         owner
-            .insert(&key, owner_event(), owner_meta(&key), owner_batch())
+            .insert(&key, owner_meta(&key), owner_batch())
             .expect("owner insert");
         let frozen = owner.freeze(&key).expect("owner freeze");
         owner
@@ -7593,7 +7547,7 @@ mod tests {
         // Shard 0 holds one batch for `key`.
         let memtable_a = Memtable::new();
         memtable_a
-            .insert(&key, owner_event(), owner_meta(&key), owner_batch())
+            .insert(&key, owner_meta(&key), owner_batch())
             .expect("shard 0 insert");
         let wal_handle_a = wal.handle_for_shard(0).expect("WAL handle shard 0");
         let owner_a = owner_for_completion_test(memtable_a, &wal, wal_handle_a, stream);
@@ -7601,7 +7555,7 @@ mod tests {
         // Shard 7 holds one batch for the same `key` (simulating a different batch_id route).
         let memtable_b = Memtable::new();
         memtable_b
-            .insert(&key, owner_event(), owner_meta(&key), owner_batch())
+            .insert(&key, owner_meta(&key), owner_batch())
             .expect("shard 7 insert");
         let wal_handle_b = wal.handle_for_shard(7).expect("WAL handle shard 7");
         let owner_b = owner_for_completion_test(memtable_b, &wal, wal_handle_b, stream);
@@ -7719,7 +7673,7 @@ mod tests {
         let key = owner_key();
         let memtable = Memtable::new();
         memtable
-            .insert(&key, owner_event(), owner_meta(&key), owner_batch())
+            .insert(&key, owner_meta(&key), owner_batch())
             .expect("owner insert");
         let frozen = memtable.freeze(&key).expect("owner freeze");
         memtable

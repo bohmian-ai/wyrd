@@ -1358,7 +1358,6 @@ mod tests {
             shard_id: 0,
             schema: Arc::clone(&schema),
             batches: vec![batch],
-            events: vec![],
             metas: vec![],
             opened_at: std::time::Instant::now(),
             closed_at: std::time::Instant::now(),
@@ -1437,7 +1436,6 @@ mod tests {
                 whole_member_batch(&tenant_string, 0, 60 * 1024),
                 whole_member_batch(&tenant_string, 60 * 1024, 50 * 1024),
             ],
-            events: vec![],
             metas: vec![],
             opened_at: std::time::Instant::now(),
             closed_at: std::time::Instant::now(),
@@ -1513,7 +1511,6 @@ mod tests {
             shard_id: 1,
             schema,
             batches: vec![batch],
-            events: vec![],
             metas: vec![],
             opened_at: std::time::Instant::now(),
             closed_at: std::time::Instant::now(),
@@ -2050,7 +2047,6 @@ mod tests {
             shard_id: 0,
             schema: Arc::clone(&schema),
             batches: vec![batch],
-            events: vec![],
             metas: vec![],
             opened_at: std::time::Instant::now(),
             closed_at: std::time::Instant::now(),
@@ -2163,7 +2159,6 @@ mod tests {
             shard_id: 4,
             schema: Arc::clone(&schema),
             batches: vec![stored_batch(vec![40, 10]), stored_batch(vec![30, 20])],
-            events: vec![],
             metas: vec![],
             opened_at: std::time::Instant::now(),
             closed_at: std::time::Instant::now(),
@@ -2329,7 +2324,7 @@ mod tests {
 
     #[test]
     fn parquet_writer_returns_envelopes_unmodified() {
-        // Encoding does not touch either the `AuditEvent` list or `ScribeAppendMeta` list
+        // Encoding does not touch the `ScribeAppendMeta` list
         let tenant = DataTenantId::new_v7();
         let tenant_string = tenant.to_string();
         let frozen = build_test_frozen(
@@ -2338,22 +2333,6 @@ mod tests {
             vec![tenant_string.as_str()],
             vec![1_000_000],
         );
-
-        let event = AuditEvent {
-            request_id: wyrd_spec::request_id::RequestId::now_v7(),
-            trace_id: None,
-            operation: "test".to_string(),
-            resource: "test".to_string(),
-            card_ref: None,
-            principal_id: wyrd_spec::auth::PrincipalId::new(uuid::Uuid::now_v7()),
-            principal_kind: wyrd_spec::auth::PrincipalKindTag::Service,
-            auth_method: wyrd_spec::vala::api::AuthMethod::Jwt,
-            permission: "test".to_string(),
-            decision: wyrd_spec::vala::api::AuditDecision::Allow,
-            result: wyrd_spec::vala::api::AuditResult::Success,
-            payload_summary: "test".to_string(),
-            detail: None,
-        };
 
         let meta = crate::scribe::wal::ScribeAppendMeta {
             batch_id: [0u8; 16],
@@ -2371,7 +2350,6 @@ mod tests {
         };
 
         let mut frozen_with_envelopes = frozen;
-        frozen_with_envelopes.events = vec![event.clone()];
         frozen_with_envelopes.metas = vec![meta.clone()];
 
         let binding = TenantTableBinding::resolve((
@@ -2385,11 +2363,7 @@ mod tests {
             frozen_with_envelopes.seal_key.tenant,
         );
 
-        assert_eq!(encoded.audit_events.len(), 1);
         assert_eq!(encoded.append_metas.len(), 1);
-
-        // Verify pairing preserved (index i ↔ index i)
-        assert_eq!(encoded.audit_events[0].request_id, event.request_id);
         assert_eq!(encoded.append_metas[0].batch_id, meta.batch_id);
     }
 
@@ -2454,7 +2428,6 @@ mod tests {
             shard_id: 0,
             schema,
             batches: vec![batch],
-            events: vec![],
             metas: vec![],
             opened_at: std::time::Instant::now(),
             closed_at: std::time::Instant::now(),

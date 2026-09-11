@@ -9,7 +9,6 @@ use crate::contracts::{
 };
 use crate::namespaces::BifrostNamespace;
 use crate::scribe::admission::EventTimeWindow;
-use crate::scribe::audit_envelope::encode_audit_event;
 use crate::scribe::memory::MemoryCategory;
 use crate::scribe::replay::replay_wal_directory;
 use crate::scribe::seal_key::SealKey;
@@ -23,10 +22,9 @@ use opendal::services::Memory;
 use tempfile::TempDir;
 use uuid::Uuid;
 use wyrd_runtime::{PermissionSet, Principal, PrincipalKind};
-use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
+use wyrd_spec::auth::PrincipalId;
 use wyrd_spec::ids::DataTenantId;
 use wyrd_spec::request_id::RequestId;
-use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
 
 /// Build one deterministic WAL closeout scope.
 fn key(tenant: DataTenantId, table: &str) -> SealKey {
@@ -61,52 +59,6 @@ fn fixture_event_partition() -> crate::catalog::layout::TimePartition {
         .expect("derived event time must be representable")
         .date_naive();
     crate::partition_fixtures::day_partition(date.year(), date.month(), date.day())
-}
-
-/// Encode the fixed closeout audit payload.
-///
-/// # Panics
-/// Panics when the static audit event cannot be encoded.
-fn audit() -> Vec<u8> {
-    encode_audit_event(&AuditEvent {
-        request_id: RequestId::now_v7(),
-        trace_id: None,
-        operation: "scribe.wal".to_owned(),
-        resource: "vala.bifrost.scribe_wal".to_owned(),
-        card_ref: None,
-        principal_id: PrincipalId::new(Uuid::now_v7()),
-        principal_kind: PrincipalKindTag::User,
-        auth_method: AuthMethod::Jwt,
-        permission: "bifrost:write".to_owned(),
-        decision: AuditDecision::Allow,
-        result: AuditResult::Success,
-        payload_summary: "1 rows".to_owned(),
-        detail: None,
-    })
-    .expect("audit")
-}
-
-/// Build the server-created audit event that Gate owns for a production frame.
-///
-/// Closeout fixtures pass through `Scribe::ingest_frame`, which never mints its
-/// own audit record, so each fixture supplies the allow/success event a real
-/// authenticated write would carry.
-fn frame_audit_event(principal: &Principal, table: &str, request_id: &RequestId) -> AuditEvent {
-    AuditEvent {
-        request_id: request_id.clone(),
-        trace_id: None,
-        operation: "bifrost.append".to_owned(),
-        resource: format!("vala.bifrost.{table}"),
-        card_ref: principal.card_ref().cloned(),
-        principal_id: principal.id,
-        principal_kind: principal.kind.tag(),
-        auth_method: AuthMethod::Jwt,
-        permission: "bifrost:append".to_owned(),
-        decision: AuditDecision::Allow,
-        result: AuditResult::Success,
-        payload_summary: "1 rows".to_owned(),
-        detail: None,
-    }
 }
 
 /// Build the fixed one-row closeout batch.
@@ -202,7 +154,6 @@ async fn ingest_as(
         scribe,
         ScribeIngressFrame {
             authenticated_tenant: principal.tenant_id,
-            audit_event: frame_audit_event(&principal, table, &request_id),
             principal,
             table: TableRef::new(BifrostNamespace::Bifrost, table),
             expected_schema_fingerprint: Some(projected_source_schema_fingerprint(
@@ -237,7 +188,6 @@ async fn ingest_value(
         scribe,
         ScribeIngressFrame {
             authenticated_tenant: tenant,
-            audit_event: frame_audit_event(&principal, table, &request_id),
             principal,
             table: TableRef::new(BifrostNamespace::Bifrost, table),
             expected_schema_fingerprint: Some(projected_source_schema_fingerprint(
@@ -272,7 +222,6 @@ async fn ingest_measured(
         scribe,
         ScribeIngressFrame {
             authenticated_tenant: tenant,
-            audit_event: frame_audit_event(&principal, table, &request_id),
             principal,
             table: TableRef::new(BifrostNamespace::Bifrost, table),
             expected_schema_fingerprint: Some(projected_source_schema_fingerprint(
@@ -686,11 +635,10 @@ fn multi_segment_replay_preserves_order_and_deduplicates() {
     .expect("WAL writer");
     let tenant = DataTenantId::new_v7();
     let seal_key = key(tenant, "multi_segment_replay");
-    let stable_audit = audit();
     for index in 0_u8..20 {
         let stable = index % 10;
         writer
-            .append_and_commit_for_replay_test(&seal_key, [stable; 16], &stable_audit, &[stable])
+            .append_and_commit_for_replay_test(&seal_key, [stable; 16], &[stable])
             .expect("append");
     }
 
@@ -729,7 +677,6 @@ fn scribe_root_and_wal_hard_limits_reject_before_append() {
         .append_and_fsync_for_test(
             &key(DataTenantId::new_v7(), "hard_limit"),
             [1_u8; 16],
-            b"audit",
             b"data",
         )
         .expect_err("WAL hard limit");

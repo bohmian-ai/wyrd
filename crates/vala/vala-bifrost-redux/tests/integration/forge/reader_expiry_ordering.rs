@@ -15,12 +15,7 @@ use vala_sql::row_types::forge_operations::{
 use vala_sql::row_types::forge_tasks::ForgeTaskEvidence;
 use vala_sql::row_types::oracle_reader_authority::TableAuthorityIdentity;
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
-use wyrd_spec::request_id::RequestId;
-use wyrd_spec::vala::api::{
-    AuditDecision, AuditDetail, AuditEvent, AuditResult, AuthMethod, ForgeSnapshotExpirePhase,
-    StoragePath,
-};
+use wyrd_spec::vala::api::{AuditDetail, ForgeSnapshotExpirePhase, StoragePath};
 
 use crate::oracle::reader_authority::{AuthorityFixture, cut};
 
@@ -30,28 +25,6 @@ fn resource_for(identity: &TableAuthorityIdentity) -> String {
         "bifrost://{}/{}/{}",
         identity.tenant, identity.namespace_name, identity.table_name
     )
-}
-
-/// Builds one Forge audit event with the supplied operation and detail.
-fn event(operation: &str, resource: &str, detail: Option<AuditDetail>) -> AuditEvent {
-    let event = AuditEvent::new(
-        RequestId::now_v7(),
-        None,
-        operation.to_owned(),
-        resource.to_owned(),
-        None,
-        PrincipalId::new(Uuid::now_v7()),
-        PrincipalKindTag::User,
-        AuthMethod::Internal,
-        "bifrost.forge".to_owned(),
-        AuditDecision::Allow,
-        AuditResult::Success,
-        "redacted".to_owned(),
-    );
-    match detail {
-        Some(detail) => event.with_detail(detail),
-        None => event,
-    }
 }
 
 /// Seeds one live Forge lease and one running snapshot-expiry task.
@@ -125,12 +98,6 @@ async fn prepare_expiration(
         cutoff_ms: 1_700_000_000_000,
         selected_snapshot_ids: selected.to_vec(),
     };
-    let operation_event = event("forge.snapshot_expire.prepared", &resource, Some(detail));
-    let task_event = event(
-        "forge.task.prepared",
-        &format!("forge-task:{}", authority.task_id),
-        None,
-    );
     let table = ForgeClaimTable {
         table_uid: identity.table_uid,
         catalog_name: identity.catalog_name.clone(),
@@ -156,8 +123,8 @@ async fn prepare_expiration(
                 authority,
                 table: &table,
                 evidence: &evidence,
-                operation_event: &operation_event,
-                task_event: &task_event,
+                operation: "forge.snapshot_expire.prepared",
+                detail: &detail,
             },
         )
         .await

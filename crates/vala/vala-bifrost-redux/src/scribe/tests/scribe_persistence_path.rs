@@ -20,34 +20,6 @@ use wyrd_runtime::{PermissionSet, Principal, PrincipalKind};
 use wyrd_spec::auth::PrincipalId;
 use wyrd_spec::ids::DataTenantId;
 use wyrd_spec::request_id::RequestId;
-use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
-
-/// Build the server-created audit event Gate owns for one production frame.
-///
-/// These fixtures call `Scribe::ingest_frame` directly, which never mints an
-/// audit record of its own, so each frame carries the allow/success event an
-/// authenticated write would have produced at the transport boundary.
-fn frame_audit_event(
-    principal: &Principal,
-    table: &TableRef,
-    request_id: &RequestId,
-) -> AuditEvent {
-    AuditEvent {
-        request_id: request_id.clone(),
-        trace_id: None,
-        operation: "bifrost.append".to_owned(),
-        resource: table.fqn(),
-        card_ref: principal.card_ref().cloned(),
-        principal_id: principal.id,
-        principal_kind: principal.kind.tag(),
-        auth_method: AuthMethod::Jwt,
-        permission: "bifrost:append".to_owned(),
-        decision: AuditDecision::Allow,
-        result: AuditResult::Success,
-        payload_summary: "projected persistence fixture rows".to_owned(),
-        detail: None,
-    }
-}
 
 /// Returns an event partition the production admission window still admits,
 /// `days_before_receipt` days below the current receipt instant.
@@ -407,7 +379,6 @@ async fn canonical_nested_batches_share_one_managed_wal_path() {
         let request_id = RequestId::now_v7();
         ScribeIngressFrame {
             authenticated_tenant: tenant,
-            audit_event: frame_audit_event(&principal, &table, &request_id),
             principal,
             table: table.clone(),
             expected_schema_fingerprint: Some(fingerprint),
@@ -511,7 +482,6 @@ async fn production_shard_snapshot_serves_exact_projection_and_lsn_range() {
         &scribe,
         ScribeIngressFrame {
             authenticated_tenant: tenant,
-            audit_event: frame_audit_event(&principal, &table, &request_id),
             principal,
             table: table.clone(),
             expected_schema_fingerprint: Some(projected_source_schema_fingerprint(
@@ -612,7 +582,6 @@ async fn oracle_hot_snapshot_preserves_pointer_identity_and_day_isolation() {
         &scribe,
         ScribeIngressFrame {
             authenticated_tenant: tenant,
-            audit_event: frame_audit_event(&pointer_principal, &pointer_table, &pointer_request_id),
             principal: pointer_principal,
             table: pointer_table.clone(),
             expected_schema_fingerprint: Some(projected_source_schema_fingerprint(
@@ -647,7 +616,6 @@ async fn oracle_hot_snapshot_preserves_pointer_identity_and_day_isolation() {
         &scribe,
         ScribeIngressFrame {
             authenticated_tenant: tenant,
-            audit_event: frame_audit_event(&cross_day_principal, &day_table, &cross_day_request_id),
             principal: cross_day_principal,
             table: day_table.clone(),
             expected_schema_fingerprint: Some(projected_source_schema_fingerprint(
@@ -820,7 +788,7 @@ fn concrete_wal_disk_failure_rejects_before_file_mutation() {
     );
 
     let error = writer
-        .append_and_fsync_for_test(&seal_key, [7_u8; 16], b"audit", b"data")
+        .append_and_fsync_for_test(&seal_key, [7_u8; 16], b"data")
         .expect_err("injected WAL disk failure");
     assert!(matches!(error, ScribeError::WalDiskFull));
     assert_eq!(writer.bytes_on_disk(), 0);
@@ -861,7 +829,6 @@ async fn shard_wal_failure_reaches_the_durable_completion() {
         &scribe,
         ScribeIngressFrame {
             authenticated_tenant: tenant,
-            audit_event: frame_audit_event(&principal, &table, &request_id),
             principal,
             table,
             expected_schema_fingerprint: Some(projected_source_schema_fingerprint(

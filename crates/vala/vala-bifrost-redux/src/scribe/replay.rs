@@ -1160,10 +1160,9 @@ mod tests {
 
     use std::path::PathBuf;
     use tempfile::TempDir;
-    use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
+    use wyrd_spec::auth::PrincipalId;
     use wyrd_spec::ids::DataTenantId;
     use wyrd_spec::request_id::RequestId;
-    use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
 
     /// Every ungoverned WAL collector stays behind the test boundary.
     ///
@@ -1326,7 +1325,7 @@ mod tests {
     }
 
     #[test]
-    fn wal_replay_rebuilds_memtable_and_audit_events() {
+    fn wal_replay_rebuilds_memtable_records() {
         let temp_dir = TempDir::new().expect("temp dir");
         let node_id = NodeId::generate();
         let tenant_id = crate::test_support::tenant();
@@ -1342,28 +1341,10 @@ mod tests {
 
         // Write 2 appends
         for i in 0u8..2 {
-            let audit_event = AuditEvent {
-                request_id: RequestId::now_v7(),
-                trace_id: None,
-                operation: format!("append-{i}"),
-                resource: "test".to_string(),
-                card_ref: None,
-                principal_id: PrincipalId::new(uuid::Uuid::new_v4()),
-                principal_kind: PrincipalKindTag::User,
-                auth_method: AuthMethod::Jwt,
-                permission: "test".to_string(),
-                decision: AuditDecision::Allow,
-                result: AuditResult::Success,
-                payload_summary: "test".to_string(),
-                detail: None,
-            };
-
-            let audit_bytes =
-                crate::scribe::audit_envelope::encode_audit_event(&audit_event).expect("encode");
             let data_bytes = format!("data-{i}").into_bytes();
             let batch_id = [i; 16];
 
-            wal.append_and_commit_for_replay_test(&seal_key, batch_id, &audit_bytes, &data_bytes)
+            wal.append_and_commit_for_replay_test(&seal_key, batch_id, &data_bytes)
                 .expect("append");
         }
 
@@ -1371,7 +1352,6 @@ mod tests {
 
         let state = replayed.values().next().expect("replayed state");
         assert_eq!(state.seal_key, replay_key(tenant_id));
-        assert_eq!(state.audit_events.len(), 2);
     }
 
     #[test]
@@ -1392,28 +1372,9 @@ mod tests {
             TableRef::new(crate::namespaces::BifrostNamespace::Bifrost, "events"),
             crate::test_support::day_partition(2026, 7, 15),
         );
-        let event = |resource: &str| AuditEvent {
-            request_id: RequestId::now_v7(),
-            trace_id: None,
-            operation: "append".to_owned(),
-            resource: resource.to_owned(),
-            card_ref: None,
-            principal_id: PrincipalId::new(uuid::Uuid::new_v4()),
-            principal_kind: PrincipalKindTag::User,
-            auth_method: AuthMethod::Jwt,
-            permission: "test".to_owned(),
-            decision: AuditDecision::Allow,
-            result: AuditResult::Success,
-            payload_summary: "1 rows".to_owned(),
-            detail: None,
-        };
-        let first_audit = crate::scribe::audit_envelope::encode_audit_event(&event("first"))
-            .expect("first audit");
-        let second_audit = crate::scribe::audit_envelope::encode_audit_event(&event("second"))
-            .expect("second audit");
-        wal.append_and_commit_for_replay_test(&first_key, [1; 16], &first_audit, b"first")
+        wal.append_and_commit_for_replay_test(&first_key, [1; 16], b"first")
             .expect("first append");
-        wal.append_and_commit_for_replay_test(&second_key, [2; 16], &second_audit, b"second")
+        wal.append_and_commit_for_replay_test(&second_key, [2; 16], b"second")
             .expect("second append");
         let stream = crate::scribe::stream_identity::StreamIdentity::new(
             node_id,
@@ -1431,13 +1392,11 @@ mod tests {
         assert!(!replayed.contains_key(&first_key.as_path_components()));
         assert_eq!(
             replayed[&second_key.as_path_components()]
-                .audit_events
+                .data_records
                 .len(),
-            1
+            1,
+            "the unsealed seal key keeps its replayed record"
         );
-
-        // Regression test for C1: per-seal-key sealed_lsn watermark
-        //
     }
 
     /// Existing v6 headers, slice/commit identities, and the manifest cursor
@@ -1461,22 +1420,6 @@ mod tests {
                 crate::test_support::day_partition(2026, 7, day),
             )
         });
-        let event = AuditEvent {
-            request_id: RequestId::now_v7(),
-            trace_id: None,
-            operation: "append".to_owned(),
-            resource: "bifrost.events".to_owned(),
-            card_ref: None,
-            principal_id: PrincipalId::new(uuid::Uuid::new_v4()),
-            principal_kind: PrincipalKindTag::User,
-            auth_method: AuthMethod::Jwt,
-            permission: "test".to_owned(),
-            decision: AuditDecision::Allow,
-            result: AuditResult::Success,
-            payload_summary: "1 rows".to_owned(),
-            detail: None,
-        };
-        let audit = crate::scribe::audit_envelope::encode_audit_event(&event).expect("audit");
         let mut batch_ids = Vec::new();
         let target_shard = crate::scribe::routing::shard_for(
             tenant,
@@ -1494,13 +1437,13 @@ mod tests {
         }
         assert_eq!(batch_ids.len(), keys.len());
         let first_lsn = writer
-            .append_and_commit_for_replay_test(&keys[0], batch_ids[0], &audit, b"committed-a")
+            .append_and_commit_for_replay_test(&keys[0], batch_ids[0], b"committed-a")
             .expect("committed A");
         writer
-            .append_and_commit_for_replay_test(&keys[1], batch_ids[1], &audit, b"pending-b")
+            .append_and_commit_for_replay_test(&keys[1], batch_ids[1], b"pending-b")
             .expect("pending B");
         writer
-            .append_and_commit_for_replay_test(&keys[2], batch_ids[2], &audit, b"active-c")
+            .append_and_commit_for_replay_test(&keys[2], batch_ids[2], b"active-c")
             .expect("active C");
         let stream = crate::scribe::stream_identity::StreamIdentity::new(
             node_id,
@@ -1537,22 +1480,6 @@ mod tests {
         let foreign = NodeId::generate();
         let tenant = crate::test_support::tenant();
         let seal_key = replay_key(tenant);
-        let event = AuditEvent {
-            request_id: RequestId::now_v7(),
-            trace_id: None,
-            operation: "append".to_owned(),
-            resource: "recovery-filter".to_owned(),
-            card_ref: None,
-            principal_id: PrincipalId::new(uuid::Uuid::new_v4()),
-            principal_kind: PrincipalKindTag::User,
-            auth_method: AuthMethod::Jwt,
-            permission: "test".to_owned(),
-            decision: AuditDecision::Allow,
-            result: AuditResult::Success,
-            payload_summary: "1 rows".to_owned(),
-            detail: None,
-        };
-        let audit = crate::scribe::audit_envelope::encode_audit_event(&event).expect("audit");
         for (stream_node, epoch, batch) in [(node, 1, 1_u8), (node, 2, 2), (foreign, 1, 9)] {
             let writer = WalWriter::new(
                 temp_dir.path(),
@@ -1562,7 +1489,7 @@ mod tests {
             )
             .expect("writer");
             writer
-                .append_and_commit_for_replay_test(&seal_key, [batch; 16], &audit, &[batch])
+                .append_and_commit_for_replay_test(&seal_key, [batch; 16], &[batch])
                 .expect("append");
         }
 
@@ -1606,26 +1533,9 @@ mod tests {
         )
         .expect("writer");
         let seal_key = replay_key(tenant_id);
-        let audit_event = AuditEvent {
-            request_id: RequestId::now_v7(),
-            trace_id: None,
-            operation: "append".to_owned(),
-            resource: "test".to_owned(),
-            card_ref: None,
-            principal_id: PrincipalId::new(uuid::Uuid::new_v4()),
-            principal_kind: PrincipalKindTag::User,
-            auth_method: AuthMethod::Jwt,
-            permission: "test".to_owned(),
-            decision: AuditDecision::Allow,
-            result: AuditResult::Success,
-            payload_summary: "1 rows".to_owned(),
-            detail: None,
-        };
-        let audit_bytes =
-            crate::scribe::audit_envelope::encode_audit_event(&audit_event).expect("encode audit");
 
         for value in 0_u8..12 {
-            wal.append_and_commit_for_replay_test(&seal_key, [value; 16], &audit_bytes, &[value])
+            wal.append_and_commit_for_replay_test(&seal_key, [value; 16], &[value])
                 .expect("append");
         }
 
@@ -1654,24 +1564,8 @@ mod tests {
         )
         .expect("writer");
         let seal_key = replay_key(tenant);
-        let event = AuditEvent {
-            request_id: RequestId::now_v7(),
-            trace_id: None,
-            operation: "append".to_owned(),
-            resource: "multi-batch-replay".to_owned(),
-            card_ref: None,
-            principal_id: PrincipalId::new(uuid::Uuid::new_v4()),
-            principal_kind: PrincipalKindTag::User,
-            auth_method: AuthMethod::Jwt,
-            permission: "test".to_owned(),
-            decision: AuditDecision::Allow,
-            result: AuditResult::Success,
-            payload_summary: "1 row".to_owned(),
-            detail: None,
-        };
-        let audit = crate::scribe::audit_envelope::encode_audit_event(&event).expect("audit");
         for batch in [[1_u8; 16], [2_u8; 16]] {
-            wal.append_and_commit_for_replay_test(&seal_key, batch, &audit, &[7; 128])
+            wal.append_and_commit_for_replay_test(&seal_key, batch, &[7; 128])
                 .expect("append");
         }
 
@@ -1703,39 +1597,20 @@ mod tests {
         )
         .expect("writer");
         let seal_key = replay_key(tenant_id);
-        let audit_event = AuditEvent {
-            request_id: RequestId::now_v7(),
-            trace_id: None,
-            operation: "append".to_owned(),
-            resource: "test".to_owned(),
-            card_ref: None,
-            principal_id: PrincipalId::new(uuid::Uuid::new_v4()),
-            principal_kind: PrincipalKindTag::User,
-            auth_method: AuthMethod::Jwt,
-            permission: "test".to_owned(),
-            decision: AuditDecision::Allow,
-            result: AuditResult::Success,
-            payload_summary: "1 rows".to_owned(),
-            detail: None,
-        };
-        let audit_bytes =
-            crate::scribe::audit_envelope::encode_audit_event(&audit_event).expect("audit");
 
         let payload = vec![7_u8; 2 * 1024 * 1024];
         for value in 0_u16..5 {
             let batch_id = value.to_le_bytes();
             let mut id = [0_u8; 16];
             id[..2].copy_from_slice(&batch_id);
-            let frame =
-                crate::scribe::wal::encode_append_frame(id, &audit_bytes, &payload).expect("frame");
+            let frame = crate::scribe::wal::encode_append_frame(id, &payload).expect("frame");
             wal.append_frame_and_commit_for_replay_test(&frame, &seal_key)
                 .expect("append");
         }
         let mut duplicate_id = [0_u8; 16];
         duplicate_id[..2].copy_from_slice(&2_u16.to_le_bytes());
-        let duplicate =
-            crate::scribe::wal::encode_append_frame(duplicate_id, &audit_bytes, &payload)
-                .expect("duplicate frame");
+        let duplicate = crate::scribe::wal::encode_append_frame(duplicate_id, &payload)
+            .expect("duplicate frame");
         wal.append_frame_and_commit_for_replay_test(&duplicate, &seal_key)
             .expect("duplicate append");
         wal.sync_data_for_test(&seal_key).expect("sync");
@@ -1793,26 +1668,10 @@ mod tests {
         )
         .expect("writer");
         let seal_key = replay_key(tenant);
-        let event = AuditEvent {
-            request_id: RequestId::now_v7(),
-            trace_id: None,
-            operation: "append".to_owned(),
-            resource: "replay-cap".to_owned(),
-            card_ref: None,
-            principal_id: PrincipalId::new(uuid::Uuid::new_v4()),
-            principal_kind: PrincipalKindTag::User,
-            auth_method: AuthMethod::Jwt,
-            permission: "test".to_owned(),
-            decision: AuditDecision::Allow,
-            result: AuditResult::Success,
-            payload_summary: "1 row".to_owned(),
-            detail: None,
-        };
-        let audit = crate::scribe::audit_envelope::encode_audit_event(&event).expect("audit");
         for value in 0_u64..4_097 {
             let mut batch = [0_u8; 16];
             batch[..8].copy_from_slice(&value.to_le_bytes());
-            wal.append_and_commit_for_replay_test(&seal_key, batch, &audit, &[1])
+            wal.append_and_commit_for_replay_test(&seal_key, batch, &[1])
                 .expect("append");
         }
 
@@ -1850,7 +1709,7 @@ mod tests {
         let wal = WalWriter::new(temp_dir.path(), *node.as_bytes(), 1, WalConfig::default())
             .expect("writer");
         let seal_key = replay_key(tenant);
-        wal.append_and_commit_for_replay_test(&seal_key, [7; 16], b"audit", &[9; 1024])
+        wal.append_and_commit_for_replay_test(&seal_key, [7; 16], &[9; 1024])
             .expect("append");
         let budget = crate::scribe::embedded_scribe_resources(&crate::scribe::AdmissionConfig {
             memory_limit_bytes: 1,
@@ -1896,24 +1755,8 @@ mod tests {
         let wal = WalWriter::new(temp_dir.path(), *node.as_bytes(), 1, WalConfig::default())
             .expect("writer");
         let seal_key = replay_key(tenant);
-        let event = AuditEvent {
-            request_id: RequestId::now_v7(),
-            trace_id: None,
-            operation: "cancel".to_owned(),
-            resource: "replay".to_owned(),
-            card_ref: None,
-            principal_id: PrincipalId::new(uuid::Uuid::new_v4()),
-            principal_kind: PrincipalKindTag::User,
-            auth_method: AuthMethod::Jwt,
-            permission: "test".to_owned(),
-            decision: AuditDecision::Allow,
-            result: AuditResult::Success,
-            payload_summary: "1 row".to_owned(),
-            detail: None,
-        };
-        let audit = crate::scribe::audit_envelope::encode_audit_event(&event).expect("audit");
         for batch in [[1; 16], [2; 16]] {
-            wal.append_and_commit_for_replay_test(&seal_key, batch, &audit, &[1])
+            wal.append_and_commit_for_replay_test(&seal_key, batch, &[1])
                 .expect("append");
         }
         let cancelled = AtomicBool::new(false);
@@ -1957,28 +1800,10 @@ mod tests {
 
         // Write 5 records
         for i in 0u8..5 {
-            let audit_event = AuditEvent {
-                request_id: RequestId::now_v7(),
-                trace_id: None,
-                operation: format!("append-{i}"),
-                resource: "test".to_string(),
-                card_ref: None,
-                principal_id: PrincipalId::new(uuid::Uuid::new_v4()),
-                principal_kind: PrincipalKindTag::User,
-                auth_method: AuthMethod::Jwt,
-                permission: "test".to_string(),
-                decision: AuditDecision::Allow,
-                result: AuditResult::Success,
-                payload_summary: "test".to_string(),
-                detail: None,
-            };
-
-            let audit_bytes =
-                crate::scribe::audit_envelope::encode_audit_event(&audit_event).expect("encode");
             let data_bytes = format!("data-{i}").into_bytes();
             let batch_id = [i; 16];
 
-            wal.append_and_commit_for_replay_test(&seal_key, batch_id, &audit_bytes, &data_bytes)
+            wal.append_and_commit_for_replay_test(&seal_key, batch_id, &data_bytes)
                 .expect("append");
         }
 
@@ -1991,7 +1816,7 @@ mod tests {
 
         // With no corruption, all 5 appends should be present
         let state = replayed.values().next().expect("state");
-        assert_eq!(state.audit_events.len(), 5, "all records replayed cleanly");
+        assert_eq!(state.data_records.len(), 5, "all records replayed cleanly");
     }
 
     /// Proves a repeated batch identity cannot authorize different payload facts.
@@ -2013,47 +1838,13 @@ mod tests {
         let shared_batch_id = [42u8; 16];
 
         // Write first append with batch_id=42
-        let audit_event1 = AuditEvent {
-            request_id: RequestId::now_v7(),
-            trace_id: None,
-            operation: "append-1".to_string(),
-            resource: "test".to_string(),
-            card_ref: None,
-            principal_id: PrincipalId::new(uuid::Uuid::new_v4()),
-            principal_kind: PrincipalKindTag::User,
-            auth_method: AuthMethod::Jwt,
-            permission: "test".to_string(),
-            decision: AuditDecision::Allow,
-            result: AuditResult::Success,
-            payload_summary: "first".to_string(),
-            detail: None,
-        };
 
-        let audit_bytes1 =
-            crate::scribe::audit_envelope::encode_audit_event(&audit_event1).expect("encode");
-        wal.append_and_commit_for_replay_test(&seal_key, shared_batch_id, &audit_bytes1, b"data-1")
+        wal.append_and_commit_for_replay_test(&seal_key, shared_batch_id, b"data-1")
             .expect("append 1");
 
         // Write second append with same batch_id=42 (duplicate)
-        let audit_event2 = AuditEvent {
-            request_id: RequestId::now_v7(),
-            trace_id: None,
-            operation: "append-2".to_string(),
-            resource: "test".to_string(),
-            card_ref: None,
-            principal_id: PrincipalId::new(uuid::Uuid::new_v4()),
-            principal_kind: PrincipalKindTag::User,
-            auth_method: AuthMethod::Jwt,
-            permission: "test".to_string(),
-            decision: AuditDecision::Allow,
-            result: AuditResult::Success,
-            payload_summary: "second".to_string(),
-            detail: None,
-        };
 
-        let audit_bytes2 =
-            crate::scribe::audit_envelope::encode_audit_event(&audit_event2).expect("encode");
-        wal.append_and_commit_for_replay_test(&seal_key, shared_batch_id, &audit_bytes2, b"data-2")
+        wal.append_and_commit_for_replay_test(&seal_key, shared_batch_id, b"data-2")
             .expect("append 2");
 
         let error = replay_wal_directory(temp_dir.path())
@@ -2082,13 +1873,9 @@ mod tests {
         let batch_id = [43_u8; 16];
 
         for data in [b"first".as_slice(), b"second".as_slice()] {
-            let append = PreparedWalAppend::new(
-                WalLsn::ZERO,
-                batch_id,
-                Bytes::new(),
-                Bytes::copy_from_slice(data),
-            )
-            .for_slice(seal_key.clone(), [7_u8; 32]);
+            let append =
+                PreparedWalAppend::new(WalLsn::ZERO, batch_id, Bytes::copy_from_slice(data))
+                    .for_slice(seal_key.clone(), [7_u8; 32]);
             let result = wal.append_prepared(append).expect("append slice fixture");
             WalWriter::sync_segments(&result.touched_segments).expect("sync slice fixture");
         }
@@ -2117,35 +1904,15 @@ mod tests {
         .expect("writer");
         let seal_key = replay_key(tenant_id);
         let batch_id = [44_u8; 16];
-        let event = AuditEvent {
-            request_id: RequestId::now_v7(),
-            trace_id: None,
-            operation: "same-day-slices".to_owned(),
-            resource: "test".to_owned(),
-            card_ref: None,
-            principal_id: PrincipalId::new(uuid::Uuid::new_v4()),
-            principal_kind: PrincipalKindTag::User,
-            auth_method: AuthMethod::Jwt,
-            permission: "test".to_owned(),
-            decision: AuditDecision::Allow,
-            result: AuditResult::Success,
-            payload_summary: "2 slices".to_owned(),
-            detail: None,
-        };
-        let audit = crate::scribe::audit_envelope::encode_audit_event(&event).expect("audit");
         let mut touched = Vec::new();
         let mut slice_set_digest = Sha256::new();
         for (slice_index, data) in [b"first".as_slice(), b"second".as_slice()]
             .into_iter()
             .enumerate()
         {
-            let mut append = PreparedWalAppend::new(
-                WalLsn::ZERO,
-                batch_id,
-                Bytes::copy_from_slice(&audit),
-                Bytes::copy_from_slice(data),
-            )
-            .for_slice(seal_key.clone(), [7_u8; 32]);
+            let mut append =
+                PreparedWalAppend::new(WalLsn::ZERO, batch_id, Bytes::copy_from_slice(data))
+                    .for_slice(seal_key.clone(), [7_u8; 32]);
             append.assign_slice_ordinal(u32::try_from(slice_index).expect("ordinal"), 2);
             let result = wal.append_prepared(append).expect("append slice");
             slice_set_digest.update(u32::try_from(slice_index).expect("ordinal").to_le_bytes());
@@ -2163,6 +1930,7 @@ mod tests {
                     (0, [7_u8; 32], b"first"),
                     (1, [7_u8; 32], b"second"),
                 ]),
+                request_id: *uuid::Uuid::now_v7().as_bytes(),
             },
         );
         touched.extend(
@@ -2198,7 +1966,6 @@ mod tests {
     fn write_writer_ordered_group(
         wal: &WalWriter,
         seal_key: &SealKey,
-        audit: &[u8],
         shard_id: u8,
         tenant: DataTenantId,
     ) -> usize {
@@ -2209,13 +1976,9 @@ mod tests {
         let mut touched = Vec::new();
 
         for batch_id in complete_batches {
-            let mut append = PreparedWalAppend::new(
-                WalLsn::ZERO,
-                batch_id,
-                Bytes::copy_from_slice(audit),
-                Bytes::copy_from_slice(&payload),
-            )
-            .for_slice(seal_key.clone(), [3; 32]);
+            let mut append =
+                PreparedWalAppend::new(WalLsn::ZERO, batch_id, Bytes::copy_from_slice(&payload))
+                    .for_slice(seal_key.clone(), [3; 32]);
             append.shard_id = Some(shard_id);
             let result = wal.append_prepared(append).expect("writer slice");
             let mut digest = Sha256::new();
@@ -2225,6 +1988,7 @@ mod tests {
             digests.push(WalCommitIdentity {
                 wal_digest: digest.finalize().into(),
                 logical_digest: fixture_logical_digest(&[(0, [3_u8; 32], &payload)]),
+                request_id: *uuid::Uuid::now_v7().as_bytes(),
             });
             touched.extend(result.touched_segments);
         }
@@ -2233,7 +1997,6 @@ mod tests {
             let mut append = PreparedWalAppend::new(
                 WalLsn::ZERO,
                 pending_batch,
-                Bytes::copy_from_slice(audit),
                 Bytes::copy_from_slice(&payload),
             )
             .for_slice(seal_key.clone(), [3; 32]);
@@ -2307,10 +2070,6 @@ mod tests {
     }
 
     /// Builds the Gate-shaped frame carrying one accepted canonical subset.
-    ///
-    /// The audit event mirrors the allow/success record Gate mints for an
-    /// authenticated OTLP export, since `Scribe::ingest_frame` never creates
-    /// one of its own.
     fn accepted_subset_frame(
         tenant: DataTenantId,
         table: TableRef,
@@ -2321,21 +2080,6 @@ mod tests {
     ) -> crate::contracts::ScribeIngressFrame {
         crate::contracts::ScribeIngressFrame {
             authenticated_tenant: tenant,
-            audit_event: AuditEvent {
-                request_id: request_id.clone(),
-                trace_id: None,
-                operation: "bifrost.otlp".to_owned(),
-                resource: table.fqn(),
-                card_ref: None,
-                principal_id: principal.id,
-                principal_kind: principal.kind.tag(),
-                auth_method: AuthMethod::Jwt,
-                permission: "bifrost:record:write".to_owned(),
-                decision: AuditDecision::Allow,
-                result: AuditResult::Success,
-                payload_summary: "one accepted nested subset".to_owned(),
-                detail: None,
-            },
             principal,
             table,
             expected_schema_fingerprint: Some(
@@ -2641,23 +2385,7 @@ mod tests {
         )
         .expect("writer");
         let seal_key = replay_key(tenant);
-        let audit = crate::scribe::audit_envelope::encode_audit_event(&AuditEvent {
-            request_id: RequestId::now_v7(),
-            trace_id: None,
-            operation: "bifrost.otlp".to_owned(),
-            resource: "vala.traces.spans".to_owned(),
-            card_ref: None,
-            principal_id: PrincipalId::new(uuid::Uuid::now_v7()),
-            principal_kind: PrincipalKindTag::User,
-            auth_method: AuthMethod::Jwt,
-            permission: "bifrost:record:write".to_owned(),
-            decision: AuditDecision::Allow,
-            result: AuditResult::Success,
-            payload_summary: "truncated Arrow body".to_owned(),
-            detail: None,
-        })
-        .expect("audit");
-        wal.append_and_commit_for_replay_test(&seal_key, [7; 16], &audit, truncated)
+        wal.append_and_commit_for_replay_test(&seal_key, [7; 16], truncated)
             .expect("a valid WAL frame carrying an invalid Arrow body");
 
         let replayed = replay_wal_directory(temp_dir.path()).expect("replay");
@@ -2692,30 +2420,13 @@ mod tests {
         )
         .expect("writer");
         let seal_key = replay_key(tenant);
-        let audit = crate::scribe::audit_envelope::encode_audit_event(&AuditEvent {
-            request_id: RequestId::now_v7(),
-            trace_id: None,
-            operation: "writer-ordered-group".to_owned(),
-            resource: "bifrost.events".to_owned(),
-            card_ref: None,
-            principal_id: PrincipalId::new(uuid::Uuid::new_v4()),
-            principal_kind: PrincipalKindTag::User,
-            auth_method: AuthMethod::Jwt,
-            permission: "test".to_owned(),
-            decision: AuditDecision::Allow,
-            result: AuditResult::Success,
-            payload_summary: "writer group".to_owned(),
-            detail: None,
-        })
-        .expect("audit");
         let shard_id = u8::try_from(crate::scribe::routing::shard_for(
             tenant,
             &seal_key.table,
             uuid::Uuid::nil(),
         ))
         .expect("fixed shard count fits u8");
-        let complete_batches =
-            write_writer_ordered_group(&wal, &seal_key, &audit, shard_id, tenant);
+        let complete_batches = write_writer_ordered_group(&wal, &seal_key, shard_id, tenant);
 
         let resources =
             crate::scribe::embedded_scribe_resources(&crate::scribe::AdmissionConfig::default());
@@ -2775,24 +2486,7 @@ mod tests {
         let seal_key = replay_key(tenant_id);
         let batch_id = [42u8; 16];
 
-        let event = AuditEvent {
-            request_id: RequestId::now_v7(),
-            trace_id: None,
-            operation: "same-frame".to_owned(),
-            resource: "test".to_string(),
-            card_ref: None,
-            principal_id: PrincipalId::new(uuid::Uuid::new_v4()),
-            principal_kind: PrincipalKindTag::User,
-            auth_method: AuthMethod::Jwt,
-            permission: "test".to_string(),
-            decision: AuditDecision::Allow,
-            result: AuditResult::Success,
-            payload_summary: "1 rows".to_string(),
-            detail: None,
-        };
-        let audit = crate::scribe::audit_envelope::encode_audit_event(&event).expect("audit");
-        let frame =
-            crate::scribe::wal::encode_append_frame(batch_id, &audit, b"same-data").expect("frame");
+        let frame = crate::scribe::wal::encode_append_frame(batch_id, b"same-data").expect("frame");
         for _ in 0..2 {
             wal.append_frame_and_commit_for_replay_test(&frame, &seal_key)
                 .expect("append");
@@ -2833,26 +2527,8 @@ mod tests {
         .expect("writer");
         let seal_key = replay_key(tenant_id);
 
-        let audit_event = AuditEvent {
-            request_id: RequestId::now_v7(),
-            trace_id: None,
-            operation: "append".to_string(),
-            resource: "test".to_string(),
-            card_ref: None,
-            principal_id: PrincipalId::new(uuid::Uuid::new_v4()),
-            principal_kind: PrincipalKindTag::User,
-            auth_method: AuthMethod::Jwt,
-            permission: "test".to_string(),
-            decision: AuditDecision::Allow,
-            result: AuditResult::Success,
-            payload_summary: "test".to_string(),
-            detail: None,
-        };
-
-        let audit_bytes =
-            crate::scribe::audit_envelope::encode_audit_event(&audit_event).expect("encode");
         let batch_id = [1u8; 16];
-        wal.append_and_commit_for_replay_test(&seal_key, batch_id, &audit_bytes, b"data")
+        wal.append_and_commit_for_replay_test(&seal_key, batch_id, b"data")
             .expect("append");
 
         // Replay doesn't directly expose writer_epoch in ReplayedAppendMeta yet,
@@ -2863,7 +2539,7 @@ mod tests {
         let state = replayed.values().next().expect("state");
 
         // Verify replay succeeded with epoch=3 segments
-        assert_eq!(state.audit_events.len(), 1);
+        assert_eq!(state.data_records.len(), 1);
 
         // In , ReplayedAppendMeta will carry writer_epoch from segment header.
         // For , the test structure is correct even though epoch isn't yet
@@ -2879,24 +2555,7 @@ mod tests {
         let seal_key = SealKey::new(tenant, table, day);
         let writer = WalWriter::new(temp_dir.path(), [9_u8; 16], 1, WalConfig::default())
             .expect("wal writer");
-        let event = AuditEvent {
-            request_id: RequestId::now_v7(),
-            trace_id: None,
-            operation: "bifrost.append".to_string(),
-            resource: seal_key.table.fqn(),
-            card_ref: None,
-            principal_id: PrincipalId::new(uuid::Uuid::new_v4()),
-            principal_kind: PrincipalKindTag::User,
-            auth_method: AuthMethod::Jwt,
-            permission: "bifrost:append".to_string(),
-            decision: AuditDecision::Allow,
-            result: AuditResult::Success,
-            payload_summary: "1 rows".to_string(),
-            detail: None,
-        };
-        let audit = crate::scribe::audit_envelope::encode_audit_event(&event).expect("audit");
-        let frame =
-            crate::scribe::wal::encode_append_frame([4_u8; 16], &audit, b"data").expect("frame");
+        let frame = crate::scribe::wal::encode_append_frame([4_u8; 16], b"data").expect("frame");
         writer
             .append_frame_and_commit_for_replay_test(&frame, &seal_key)
             .expect("append");

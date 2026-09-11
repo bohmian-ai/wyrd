@@ -2698,6 +2698,7 @@ impl WalWriter {
             WalCommitIdentity {
                 wal_digest: digest.finalize().into(),
                 logical_digest,
+                request_id: *uuid::Uuid::now_v7().as_bytes(),
             },
         );
         commit.shard_id = shard_id;
@@ -3964,9 +3965,6 @@ mod tests {
     use super::*;
 
     use tempfile::TempDir;
-    use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
-    use wyrd_spec::request_id::RequestId;
-    use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
 
     fn test_seal_key(tenant: DataTenantId) -> SealKey {
         SealKey::new(
@@ -4080,13 +4078,8 @@ mod tests {
             (&shard_five, [2_u8; 16], b"one".as_slice()),
             (&shard_zero, [3_u8; 16], b"two".as_slice()),
         ] {
-            let append = PreparedWalAppend::new(
-                WalLsn::ZERO,
-                batch,
-                Bytes::new(),
-                Bytes::copy_from_slice(data),
-            )
-            .for_slice(seal_key.clone(), [7_u8; 32]);
+            let append = PreparedWalAppend::new(WalLsn::ZERO, batch, Bytes::copy_from_slice(data))
+                .for_slice(seal_key.clone(), [7_u8; 32]);
             let result = handle.append_prepared(append).expect("append shard record");
             handle
                 .sync_segments(&result.touched_segments)
@@ -4277,6 +4270,7 @@ mod tests {
         let identity = WalCommitIdentity {
             wal_digest: [9; 32],
             logical_digest: [11; 32],
+            request_id: [13; 16],
         };
         let record = WalRecord::commit(WalLsn::new(9), [7; 16], [8; 16], 3, identity);
         let encoded = record.encode();
@@ -4307,6 +4301,7 @@ mod tests {
         let identity = WalCommitIdentity {
             wal_digest: [1; 32],
             logical_digest: [2; 32],
+            request_id: [3; 16],
         };
         let encoded = identity.encode();
 
@@ -4479,12 +4474,7 @@ mod tests {
         for i in 0u8..10 {
             let payload = format!("data-{i:03}").repeat(20); // ~100 bytes per payload
             writer
-                .append_and_fsync_for_test(
-                    &test_seal_key(tenant_id),
-                    batch_id,
-                    payload.as_bytes(),
-                    payload.as_bytes(),
-                )
+                .append_and_fsync_for_test(&test_seal_key(tenant_id), batch_id, payload.as_bytes())
                 .expect("append");
         }
 
@@ -5114,13 +5104,9 @@ mod tests {
     fn prepared_encoded_len_matches_actual_for_payload_boundaries() {
         let key = test_seal_key(crate::test_support::tenant());
         for size in [0, 1, 255, 256, 4096] {
-            let prepared = PreparedWalAppend::new(
-                WalLsn::ZERO,
-                [7; 16],
-                Bytes::from(vec![1; size]),
-                Bytes::from(vec![2; size]),
-            )
-            .for_slice(key.clone(), [3; 32]);
+            let prepared =
+                PreparedWalAppend::new(WalLsn::ZERO, [7; 16], Bytes::from(vec![2; size]))
+                    .for_slice(key.clone(), [3; 32]);
             let actual = prepared.record().expect("record").encode().len();
             assert_eq!(prepared.encoded_len().expect("encoded len"), actual);
         }

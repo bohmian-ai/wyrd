@@ -1060,7 +1060,6 @@ mod tests {
             StagedLsnRange { min: 10, max: 42 },
             vec![run],
             ready_at(),
-            None,
         );
         stage
             .publish_record(&key, &record)
@@ -1150,7 +1149,6 @@ mod tests {
             StagedLsnRange { min: 1, max: 2 },
             vec![run],
             ready_at(),
-            None,
         );
         let mut encoded: serde_json::Value =
             serde_json::to_value(&record).expect("the record encodes");
@@ -1201,7 +1199,6 @@ mod tests {
             StagedLsnRange { min: 3, max: 9 },
             vec![run],
             ready_at(),
-            None,
         );
         stage
             .publish_record(&key, &record)
@@ -1263,7 +1260,6 @@ mod tests {
             StagedLsnRange { min: 4, max: 4 },
             vec![run],
             ready_at(),
-            None,
         );
         stage
             .publish_record(&key, &record)
@@ -1340,7 +1336,6 @@ mod tests {
             StagedLsnRange { min: 4, max: 4 },
             vec![run],
             ready_at(),
-            None,
         );
         stage
             .publish_record(&key, &record)
@@ -1452,7 +1447,6 @@ mod tests {
             StagedLsnRange { min: 8, max: 8 },
             vec![run],
             ready_at(),
-            None,
         );
         stage
             .publish_record(&key, &record)
@@ -1559,7 +1553,6 @@ mod tests {
             StagedLsnRange { min: 2, max: 2 },
             vec![run],
             ready_at(),
-            None,
         );
         stage
             .publish_record(&key, &record)

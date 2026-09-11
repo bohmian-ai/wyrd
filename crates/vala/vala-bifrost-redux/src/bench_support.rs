@@ -88,12 +88,10 @@ pub struct PreparedWalAppendFixture {
 }
 
 impl PreparedWalAppendFixture {
-    /// Compute payload checksums without touching the filesystem.
+    /// Compute the data payload checksum without touching the filesystem.
     #[must_use]
-    pub fn crc32(&self) -> (u32, u32) {
-        let audit = crc32c::crc32c(&self.append.audit);
-        let data = crc32c::crc32c(&self.append.data);
-        (audit, data)
+    pub fn crc32(&self) -> u32 {
+        crc32c::crc32c(&self.append.data)
     }
 }
 
@@ -133,11 +131,10 @@ impl WalBenchSupport {
         })
     }
 
-    /// Prepare a v3 audit/data record without filesystem work.
+    /// Prepare a v6 data record without filesystem work.
     pub fn prepare(
         &self,
         batch_id: [u8; 16],
-        audit: &[u8],
         data: &[u8],
     ) -> Result<PreparedWalAppendFixture, ScribeError> {
         let seal_key = SealKey::new(
@@ -153,7 +150,6 @@ impl WalBenchSupport {
             append: PreparedWalAppend::new(
                 crate::scribe::wal::WalLsn::ZERO,
                 batch_id,
-                Bytes::copy_from_slice(audit),
                 Bytes::copy_from_slice(data),
             )
             .for_slice(seal_key, [0; 32]),

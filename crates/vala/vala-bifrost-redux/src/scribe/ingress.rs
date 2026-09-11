@@ -478,15 +478,12 @@ impl ScribeImpl {
         };
         let tenant = frame.principal.tenant_id;
         let canonical_definition = Self::canonical_definition(&frame.table);
-        let request_id = match uuid::Uuid::parse_str(frame.request_id.as_str()) {
-            Ok(request_id) => request_id,
-            Err(error) => {
-                lifecycle.refuse();
-                return Err(ScribeError::Internal {
-                    detail: format!("Scribe request identity is not a UUID: {error}"),
-                });
+        let request_id = uuid::Uuid::parse_str(frame.request_id.as_str()).map_err(|error| {
+            lifecycle.refuse();
+            ScribeError::Internal {
+                detail: format!("Scribe request identity is not a UUID: {error}"),
             }
-        };
+        })?;
         let rows = match self
             .prepare_admitted_rows(
                 frame.payload,

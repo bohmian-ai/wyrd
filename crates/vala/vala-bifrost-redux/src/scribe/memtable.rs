@@ -1896,24 +1896,6 @@ mod tests {
         RecordBatch::try_new(schema, vec![Arc::new(array)]).expect("batch")
     }
 
-    fn make_test_event() -> AuditEvent {
-        AuditEvent {
-            request_id: wyrd_spec::request_id::RequestId::now_v7(),
-            trace_id: None,
-            operation: "test".to_string(),
-            resource: "test.table".to_string(),
-            card_ref: None,
-            principal_id: wyrd_spec::auth::PrincipalId::new(uuid::Uuid::new_v4()),
-            principal_kind: wyrd_spec::auth::PrincipalKindTag::User,
-            auth_method: wyrd_spec::vala::api::AuthMethod::Jwt,
-            permission: "test".to_string(),
-            decision: wyrd_spec::vala::api::AuditDecision::Allow,
-            result: wyrd_spec::vala::api::AuditResult::Success,
-            payload_summary: "test".to_string(),
-            detail: None,
-        }
-    }
-
     fn make_test_meta(lsn: u64) -> ScribeAppendMeta {
         ScribeAppendMeta {
             batch_id: [0u8; 16],
@@ -1951,20 +1933,10 @@ mod tests {
             first.partition,
         );
         memtable
-            .insert(
-                &first,
-                make_test_event(),
-                make_test_meta(1),
-                make_test_batch(1),
-            )
+            .insert(&first, make_test_meta(1), make_test_batch(1))
             .expect("first active member");
         memtable
-            .insert(
-                &second,
-                make_test_event(),
-                make_test_meta(2),
-                make_test_batch(1),
-            )
+            .insert(&second, make_test_meta(2), make_test_batch(1))
             .expect("second active member");
 
         let frozen = memtable
@@ -1985,12 +1957,7 @@ mod tests {
             2
         );
         memtable
-            .insert(
-                &first,
-                make_test_event(),
-                make_test_meta(3),
-                make_test_batch(1),
-            )
+            .insert(&first, make_test_meta(3), make_test_batch(1))
             .expect("incoming unit enters fresh generation");
         assert_eq!(memtable.row_count(&first).expect("fresh active rows"), 1);
         assert_eq!(
@@ -2019,12 +1986,7 @@ mod tests {
         );
         for (key, lsn) in [(&first, 1), (&second, 2)] {
             memtable
-                .insert(
-                    key,
-                    make_test_event(),
-                    make_test_meta(lsn),
-                    make_test_batch(1),
-                )
+                .insert(key, make_test_meta(lsn), make_test_batch(1))
                 .expect("populate cohort member");
         }
         memtable.writable.lock().expect("writable lock").insert(
@@ -2067,33 +2029,18 @@ mod tests {
         let key = make_test_seal_key();
         for lsn in [1_u64, 30] {
             memtable
-                .insert(
-                    &key,
-                    make_test_event(),
-                    make_test_meta(lsn),
-                    make_test_batch(1),
-                )
+                .insert(&key, make_test_meta(lsn), make_test_batch(1))
                 .expect("enclosing generation insert");
         }
         let enclosing = memtable.freeze(&key).expect("enclosing generation");
         for lsn in [12_u64, 20] {
             memtable
-                .insert(
-                    &key,
-                    make_test_event(),
-                    make_test_meta(lsn),
-                    make_test_batch(1),
-                )
+                .insert(&key, make_test_meta(lsn), make_test_batch(1))
                 .expect("enclosed generation insert");
         }
         memtable.freeze(&key).expect("enclosed generation");
         memtable
-            .insert(
-                &key,
-                make_test_event(),
-                make_test_meta(31),
-                make_test_batch(1),
-            )
+            .insert(&key, make_test_meta(31), make_test_batch(1))
             .expect("active insert");
         let limits = ReadableBatchLimits {
             max_batches: 8,
@@ -2164,7 +2111,6 @@ mod tests {
             ),
             seal_key: seal_key.clone(),
             shard_id: 0,
-            audit_events: vec![make_test_event()],
             data_records: vec![bytes],
             append_metas: vec![ReplayedAppendMeta {
                 batch_id: *batch_id.as_bytes(),
@@ -2216,12 +2162,7 @@ mod tests {
         let memtable = Memtable::new();
         let seal_key = make_test_seal_key();
         memtable
-            .insert(
-                &seal_key,
-                make_test_event(),
-                make_test_meta(10),
-                make_test_batch(2),
-            )
+            .insert(&seal_key, make_test_meta(10), make_test_batch(2))
             .expect("insert");
 
         let frozen = memtable.freeze(&seal_key).expect("freeze");
@@ -2255,7 +2196,7 @@ mod tests {
             slice_count: meta.slice_count,
         };
         memtable
-            .insert(&seal_key, make_test_event(), meta, make_test_batch(2))
+            .insert(&seal_key, meta, make_test_batch(2))
             .expect("insert");
         assert_eq!(
             memtable
@@ -2300,12 +2241,7 @@ mod tests {
         let memtable = Memtable::new();
         let seal_key = make_test_seal_key();
         memtable
-            .insert(
-                &seal_key,
-                make_test_event(),
-                make_test_meta(10),
-                make_test_batch(1),
-            )
+            .insert(&seal_key, make_test_meta(10), make_test_batch(1))
             .expect("first insert");
         let first = memtable.freeze(&seal_key).expect("first freeze");
         memtable
@@ -2313,12 +2249,7 @@ mod tests {
             .expect("first complete");
 
         memtable
-            .insert(
-                &seal_key,
-                make_test_event(),
-                make_test_meta(20),
-                make_test_batch(1),
-            )
+            .insert(&seal_key, make_test_meta(20), make_test_batch(1))
             .expect("second insert");
         let second = memtable.freeze(&seal_key).expect("second freeze");
 
@@ -2344,12 +2275,7 @@ mod tests {
         let seal_key = make_test_seal_key();
         for lsn in [10, 20] {
             memtable
-                .insert(
-                    &seal_key,
-                    make_test_event(),
-                    make_test_meta(lsn),
-                    make_test_batch(1),
-                )
+                .insert(&seal_key, make_test_meta(lsn), make_test_batch(1))
                 .expect("bounded fixture insert");
         }
         let tenant = crate::test_support::tenant();
@@ -2410,12 +2336,7 @@ mod tests {
         let memtable = Memtable::new();
         let seal_key = make_test_seal_key();
         memtable
-            .insert(
-                &seal_key,
-                make_test_event(),
-                make_test_meta(10),
-                make_test_batch(1),
-            )
+            .insert(&seal_key, make_test_meta(10), make_test_batch(1))
             .expect("insert");
         let frozen = memtable.freeze(&seal_key).expect("freeze");
         memtable
@@ -2442,12 +2363,7 @@ mod tests {
         let memtable = Memtable::new();
         let seal_key = make_test_seal_key();
         memtable
-            .insert(
-                &seal_key,
-                make_test_event(),
-                make_test_meta(10),
-                make_test_batch(1),
-            )
+            .insert(&seal_key, make_test_meta(10), make_test_batch(1))
             .expect("insert");
         memtable.freeze(&seal_key).expect("freeze");
         assert!(
@@ -2466,7 +2382,7 @@ mod tests {
         for i in 0..6 {
             let batch = make_test_batch(10_000);
             memtable
-                .insert(&seal_key, make_test_event(), make_test_meta(i), batch)
+                .insert(&seal_key, make_test_meta(i), batch)
                 .expect("insert");
         }
 
@@ -2488,12 +2404,7 @@ mod tests {
                 .expect("absent bucket")
         );
         memtable
-            .insert(
-                &seal_key,
-                make_test_event(),
-                make_test_meta(1),
-                make_test_batch(1),
-            )
+            .insert(&seal_key, make_test_meta(1), make_test_batch(1))
             .expect("seed bucket");
         {
             let mut buckets = memtable.writable.lock().expect("writable lock");
@@ -2537,7 +2448,7 @@ mod tests {
 
         let batch = make_test_batch(1);
         memtable
-            .insert(&seal_key, make_test_event(), make_test_meta(0), batch)
+            .insert(&seal_key, make_test_meta(0), batch)
             .expect("insert");
 
         let mut buckets = memtable.writable.lock().expect("writable lock");
@@ -2556,12 +2467,7 @@ mod tests {
             seal_key.partition,
         );
         memtable
-            .insert(
-                &second,
-                make_test_event(),
-                make_test_meta(1),
-                make_test_batch(1),
-            )
+            .insert(&second, make_test_meta(1), make_test_batch(1))
             .expect("younger peer");
         let frozen = memtable
             .freeze_all_nonempty()
@@ -2584,12 +2490,7 @@ mod tests {
 
         // First generation: committed and immediately retirement-eligible.
         memtable
-            .insert(
-                &seal_key,
-                make_test_event(),
-                make_test_meta(10),
-                make_test_batch(1),
-            )
+            .insert(&seal_key, make_test_meta(10), make_test_batch(1))
             .expect("first insert");
         let first = memtable.freeze(&seal_key).expect("first freeze");
         memtable
@@ -2599,12 +2500,7 @@ mod tests {
 
         // Second generation: still in PendingCommit — must not be retired.
         memtable
-            .insert(
-                &seal_key,
-                make_test_event(),
-                make_test_meta(20),
-                make_test_batch(1),
-            )
+            .insert(&seal_key, make_test_meta(20), make_test_batch(1))
             .expect("second insert");
         memtable.freeze(&seal_key).expect("second freeze");
         let total_bytes = memtable.stats().expect("combined stats").immutable_bytes;
@@ -2635,12 +2531,7 @@ mod tests {
         let seal_key = make_test_seal_key();
 
         memtable
-            .insert(
-                &seal_key,
-                make_test_event(),
-                make_test_meta(0),
-                make_test_batch(1),
-            )
+            .insert(&seal_key, make_test_meta(0), make_test_batch(1))
             .expect("insert");
 
         assert!(!memtable.should_seal(&seal_key).expect("should_seal"));
@@ -2653,7 +2544,7 @@ mod tests {
 
         let batch = make_test_batch(1);
         memtable
-            .insert(&seal_key, make_test_event(), make_test_meta(0), batch)
+            .insert(&seal_key, make_test_meta(0), batch)
             .expect("insert");
 
         assert!(!memtable.should_seal(&seal_key).expect("should_seal"));
@@ -2669,20 +2560,10 @@ mod tests {
             crate::test_support::day_partition(2026, 7, 15),
         );
         memtable
-            .insert(
-                &first,
-                make_test_event(),
-                make_test_meta(1),
-                make_test_batch(1),
-            )
+            .insert(&first, make_test_meta(1), make_test_batch(1))
             .expect("first insert");
         memtable
-            .insert(
-                &second,
-                make_test_event(),
-                make_test_meta(2),
-                make_test_batch(1),
-            )
+            .insert(&second, make_test_meta(2), make_test_batch(1))
             .expect("second insert");
         {
             let mut buckets = memtable.writable.lock().expect("writable lock");
@@ -2756,12 +2637,7 @@ mod tests {
         let memtable = Memtable::new_with_config(1_000_000, Duration::from_secs(0));
         let key = make_test_seal_key();
         memtable
-            .insert(
-                &key,
-                make_test_event(),
-                make_test_meta(1),
-                make_test_batch(1),
-            )
+            .insert(&key, make_test_meta(1), make_test_batch(1))
             .expect("insert");
         assert!(memtable.should_seal(&key).expect("should_seal"));
     }
@@ -2784,13 +2660,8 @@ mod tests {
         let key = make_test_seal_key();
 
         let (size_registry, size) = exercise(1, Duration::from_mins(1));
-        size.insert(
-            &key,
-            make_test_event(),
-            make_test_meta(1),
-            make_test_batch(1),
-        )
-        .expect("size member inserts");
+        size.insert(&key, make_test_meta(1), make_test_batch(1))
+            .expect("size member inserts");
         assert!(size.should_seal(&key).expect("size predicate"));
         let size_frozen = size.freeze(&key).expect("size member freezes");
         assert_eq!(size_frozen.shard_id, SHARD);
@@ -2808,13 +2679,8 @@ mod tests {
         );
 
         let (_, age) = exercise(usize::MAX, Duration::ZERO);
-        age.insert(
-            &key,
-            make_test_event(),
-            make_test_meta(2),
-            make_test_batch(1),
-        )
-        .expect("age member inserts");
+        age.insert(&key, make_test_meta(2), make_test_batch(1))
+            .expect("age member inserts");
         assert!(age.should_seal(&key).expect("age predicate"));
         assert_eq!(
             age.freeze(&key).expect("age member freezes").shard_id,
@@ -2823,12 +2689,7 @@ mod tests {
 
         let (_, pressure) = exercise(usize::MAX, Duration::from_mins(1));
         pressure
-            .insert(
-                &key,
-                make_test_event(),
-                make_test_meta(3),
-                make_test_batch(1),
-            )
+            .insert(&key, make_test_meta(3), make_test_batch(1))
             .expect("pressure member inserts");
         let victim = Memtable::select_pressure_victims(
             pressure.pressure_candidates().expect("pressure candidates"),
@@ -2852,12 +2713,7 @@ mod tests {
         );
         for (candidate, lsn) in [(&key, 4), (&peer, 5)] {
             rotation
-                .insert(
-                    candidate,
-                    make_test_event(),
-                    make_test_meta(lsn),
-                    make_test_batch(1),
-                )
+                .insert(candidate, make_test_meta(lsn), make_test_batch(1))
                 .expect("rotation member inserts");
         }
         let cohort = rotation.freeze_all_nonempty().expect("full rotation");
@@ -2876,12 +2732,7 @@ mod tests {
         let memtable = Memtable::new_with_config(1_000_000, seal_max_age);
         let key = make_test_seal_key();
         memtable
-            .insert(
-                &key,
-                make_test_event(),
-                make_test_meta(1),
-                make_test_batch(1),
-            )
+            .insert(&key, make_test_meta(1), make_test_batch(1))
             .expect("insert");
         let buckets = memtable.writable.lock().expect("writable lock");
         let bucket = buckets.get(&key).expect("bucket");
@@ -2964,16 +2815,15 @@ mod tests {
     }
 
     #[test]
-    fn memtable_freeze_produces_immutable_snapshot_with_envelopes() {
+    fn memtable_freeze_produces_immutable_snapshot() {
         let memtable = Memtable::new();
         let seal_key = make_test_seal_key();
 
         // Insert 3 appends
         for i in 0..3 {
             let batch = make_test_batch(100);
-            let event = make_test_event();
             memtable
-                .insert(&seal_key, event.clone(), make_test_meta(i), batch)
+                .insert(&seal_key, make_test_meta(i), batch)
                 .expect("insert");
         }
 
@@ -2982,14 +2832,13 @@ mod tests {
 
         assert_eq!(frozen.row_count(), 300, "3 batches × 100 rows retained");
         assert_eq!(frozen.batches.len(), 3);
-        assert_eq!(frozen.events.len(), 3);
         assert_eq!(frozen.metas.len(), 3);
         assert_eq!(frozen.seal_key, seal_key);
 
         // Insert after freeze should go to a new bucket
         let batch = make_test_batch(50);
         memtable
-            .insert(&seal_key, make_test_event(), make_test_meta(10), batch)
+            .insert(&seal_key, make_test_meta(10), batch)
             .expect("insert after freeze");
 
         assert_eq!(
@@ -3004,12 +2853,7 @@ mod tests {
         let memtable = Arc::new(Memtable::new());
         let seal_key = make_test_seal_key();
         memtable
-            .insert(
-                &seal_key,
-                make_test_event(),
-                make_test_meta(1),
-                make_test_batch(1),
-            )
+            .insert(&seal_key, make_test_meta(1), make_test_batch(1))
             .expect("initial insert");
         let barrier = Arc::new(Barrier::new(2));
         let freezer_memtable = Arc::clone(&memtable);
@@ -3024,12 +2868,7 @@ mod tests {
         let inserter_barrier = Arc::clone(&barrier);
         let inserter = std::thread::spawn(move || {
             inserter_barrier.wait();
-            inserter_memtable.insert(
-                &inserter_key,
-                make_test_event(),
-                make_test_meta(2),
-                make_test_batch(1),
-            )
+            inserter_memtable.insert(&inserter_key, make_test_meta(2), make_test_batch(1))
         });
 
         freezer.join().expect("freeze thread").expect("freeze");
@@ -3059,24 +2898,14 @@ mod tests {
         // Insert to key1
         for i in 0..3 {
             memtable
-                .insert(
-                    &key1,
-                    make_test_event(),
-                    make_test_meta(i),
-                    make_test_batch(100),
-                )
+                .insert(&key1, make_test_meta(i), make_test_batch(100))
                 .expect("insert key1");
         }
 
         // Insert to key2
         for i in 0..2 {
             memtable
-                .insert(
-                    &key2,
-                    make_test_event(),
-                    make_test_meta(i),
-                    make_test_batch(50),
-                )
+                .insert(&key2, make_test_meta(i), make_test_batch(50))
                 .expect("insert key2");
         }
 

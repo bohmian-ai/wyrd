@@ -2592,21 +2592,6 @@ pub(crate) mod tests {
         let table = TableRef::parse_fqn("vala.logs.records").expect("canonical table");
         let key = SealKey::new(tenant_id, table, day);
         let memtable = Arc::new(Memtable::new());
-        let event = || wyrd_spec::vala::api::AuditEvent {
-            request_id: wyrd_spec::request_id::RequestId::now_v7(),
-            trace_id: None,
-            operation: "test".to_owned(),
-            resource: "vala.logs.records".to_owned(),
-            card_ref: None,
-            principal_id: wyrd_spec::auth::PrincipalId::new(uuid::Uuid::now_v7()),
-            principal_kind: wyrd_spec::auth::PrincipalKindTag::User,
-            auth_method: wyrd_spec::vala::api::AuthMethod::Jwt,
-            permission: "test".to_owned(),
-            decision: wyrd_spec::vala::api::AuditDecision::Allow,
-            result: wyrd_spec::vala::api::AuditResult::Success,
-            payload_summary: "test".to_owned(),
-            detail: None,
-        };
         let meta = |lsn| ScribeAppendMeta {
             batch_id: *uuid::Uuid::now_v7().as_bytes(),
             schema_fingerprint: [0; 32],
@@ -2622,19 +2607,19 @@ pub(crate) mod tests {
             seal_key: key.to_string(),
         };
         memtable
-            .insert(&key, event(), meta(7), batch("immutable-one"))
+            .insert(&key, meta(7), batch("immutable-one"))
             .expect("first immutable row inserts");
         memtable
             .freeze(&key)
             .expect("first immutable generation freezes");
         memtable
-            .insert(&key, event(), meta(8), batch("immutable-two"))
+            .insert(&key, meta(8), batch("immutable-two"))
             .expect("second immutable row inserts");
         memtable
             .freeze(&key)
             .expect("second immutable generation freezes");
         memtable
-            .insert(&key, event(), meta(9), batch("active"))
+            .insert(&key, meta(9), batch("active"))
             .expect("active row inserts");
         (key, memtable)
     }
@@ -2772,21 +2757,6 @@ pub(crate) mod tests {
             ],
         )
         .expect("closure fixture batch");
-        let event = wyrd_spec::vala::api::AuditEvent {
-            request_id: wyrd_spec::request_id::RequestId::now_v7(),
-            trace_id: None,
-            operation: "test".to_owned(),
-            resource: "vala.traces.spans".to_owned(),
-            card_ref: None,
-            principal_id: wyrd_spec::auth::PrincipalId::new(uuid::Uuid::now_v7()),
-            principal_kind: wyrd_spec::auth::PrincipalKindTag::User,
-            auth_method: wyrd_spec::vala::api::AuthMethod::Jwt,
-            permission: "test".to_owned(),
-            decision: wyrd_spec::vala::api::AuditDecision::Allow,
-            result: wyrd_spec::vala::api::AuditResult::Success,
-            payload_summary: "test".to_owned(),
-            detail: None,
-        };
         let meta = ScribeAppendMeta {
             batch_id: *uuid::Uuid::now_v7().as_bytes(),
             schema_fingerprint: [0; 32],
@@ -2802,7 +2772,7 @@ pub(crate) mod tests {
             seal_key: key.to_string(),
         };
         memtable
-            .insert(&key, event, meta, batch)
+            .insert(&key, meta, batch)
             .expect("closure fixture rows insert");
         (key, memtable)
     }

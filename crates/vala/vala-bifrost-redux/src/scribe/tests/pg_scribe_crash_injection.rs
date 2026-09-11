@@ -2,7 +2,6 @@
 
 use crate::catalog::TableRef;
 use crate::namespaces::BifrostNamespace;
-use crate::scribe::audit_envelope::encode_audit_event;
 use crate::scribe::manifest::{Manifest, read_manifest, write_atomic};
 use crate::scribe::replay::{replay_wal_directory, replay_wal_directory_stream};
 use crate::scribe::routing::shard_for;
@@ -18,10 +17,7 @@ use std::io::Write;
 use std::sync::Arc;
 use tempfile::TempDir;
 use uuid::Uuid;
-use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
 use wyrd_spec::ids::DataTenantId;
-use wyrd_spec::request_id::RequestId;
-use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
 
 /// Encode one deterministic WAL replay batch.
 ///
@@ -45,29 +41,6 @@ fn data_bytes(value: i64) -> Vec<u8> {
     bytes
 }
 
-/// Encode the fixed audit envelope persisted beside a crash fixture.
-///
-/// # Panics
-/// Panics when the static audit fixture cannot be encoded.
-fn audit() -> Vec<u8> {
-    encode_audit_event(&AuditEvent {
-        request_id: RequestId::now_v7(),
-        trace_id: None,
-        operation: "scribe.crash-seam".to_owned(),
-        resource: "vala.bifrost.scribe_persistence".to_owned(),
-        card_ref: None,
-        principal_id: PrincipalId::new(Uuid::now_v7()),
-        principal_kind: PrincipalKindTag::User,
-        auth_method: AuthMethod::Jwt,
-        permission: "bifrost:write".to_owned(),
-        decision: AuditDecision::Allow,
-        result: AuditResult::Success,
-        payload_summary: "1 rows".to_owned(),
-        detail: None,
-    })
-    .expect("audit")
-}
-
 /// Build the stable seal scope shared by crash-recovery cases.
 fn key() -> SealKey {
     SealKey::new(
@@ -86,7 +59,7 @@ fn torn_wal_tail_is_truncated_and_prior_records_replay() {
         .expect("WAL writer");
     let key = key();
     writer
-        .append_and_commit_for_replay_test(&key, [1_u8; 16], &audit(), &data_bytes(1))
+        .append_and_commit_for_replay_test(&key, [1_u8; 16], &data_bytes(1))
         .expect("append");
     // The shard for this WAL path is determined by the batch_id [1u8; 16]
     // used in the append above.
@@ -128,7 +101,7 @@ fn partial_frame_leaves_only_the_prior_acknowledged_prefix() {
         .expect("WAL writer");
     let key = key();
     writer
-        .append_and_commit_for_replay_test(&key, [1_u8; 16], &audit(), &data_bytes(1))
+        .append_and_commit_for_replay_test(&key, [1_u8; 16], &data_bytes(1))
         .expect("acknowledged prefix append");
     // The shard for this WAL path is determined by the batch_id [1u8; 16]
     // used in the append above.
@@ -179,12 +152,7 @@ fn segment_roll_keeps_all_complete_records_replayable() {
     let key = key();
     for value in 0_u8..4 {
         writer
-            .append_and_commit_for_replay_test(
-                &key,
-                [value; 16],
-                &audit(),
-                &data_bytes(i64::from(value)),
-            )
+            .append_and_commit_for_replay_test(&key, [value; 16], &data_bytes(i64::from(value)))
             .expect("append");
     }
     let replayed = replay_wal_directory(temp_dir.path()).expect("replay rolled segments");
@@ -234,12 +202,7 @@ fn replay_restores_multi_shard_seal_key_to_recorded_lanes() {
     for byte in 0_u8..=15_u8 {
         let batch_id = [byte; 16];
         writer
-            .append_and_commit_for_replay_test(
-                &key,
-                batch_id,
-                &audit(),
-                &data_bytes(i64::from(byte)),
-            )
+            .append_and_commit_for_replay_test(&key, batch_id, &data_bytes(i64::from(byte)))
             .expect("append");
         let shard = u8::try_from(shard_for(
             key.tenant,

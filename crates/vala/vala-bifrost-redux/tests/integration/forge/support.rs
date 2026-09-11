@@ -2809,23 +2809,6 @@ async fn append_only(
         roles: Vec::new(),
         effective_permissions: wyrd_runtime::PermissionSet::new(),
     };
-    let audit_event = wyrd_spec::vala::api::AuditEvent::new(
-        wyrd_spec::request_id::RequestId::now_v7(),
-        None,
-        "bifrost.write".to_owned(),
-        format!(
-            "bifrost://{}/{}",
-            binding.logical_namespace, binding.table_name
-        ),
-        None,
-        principal.id,
-        wyrd_spec::auth::PrincipalKindTag::User,
-        wyrd_spec::vala::api::AuthMethod::Internal,
-        "bifrost_write:write".to_owned(),
-        wyrd_spec::vala::api::AuditDecision::Allow,
-        wyrd_spec::vala::api::AuditResult::Success,
-        "promotion fixture ingest".to_owned(),
-    );
     scribe
         .ingest_native_for_test(NativeIngressTestFrame {
             principal,
@@ -2833,7 +2816,6 @@ async fn append_only(
             expected_schema_fingerprint: fingerprint,
             request_id: wyrd_spec::request_id::RequestId::now_v7(),
             batch_id: uuid::Uuid::now_v7(),
-            audit_event,
             payload: ingress_ipc(batch),
         })
         .await

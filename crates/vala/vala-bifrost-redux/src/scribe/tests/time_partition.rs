@@ -10,9 +10,6 @@
 //! collide on one key.
 
 use tempfile::TempDir;
-use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
-use wyrd_spec::request_id::RequestId;
-use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
 
 use crate::catalog::TableRef;
 use crate::catalog::layout::{TimeGranularity, TimePartition};
@@ -21,26 +18,6 @@ use crate::scribe::replay::replay_wal_directory;
 use crate::scribe::seal_key::{MAX_TIME_PARTITIONS, SealKey, plan_time_partitions};
 use crate::scribe::stream_identity::NodeId;
 use crate::scribe::wal::{WalConfig, WalWriter};
-
-/// Builds one deterministic audit envelope for a replayed append.
-fn replay_audit(operation: &str) -> Vec<u8> {
-    let event = AuditEvent {
-        request_id: RequestId::now_v7(),
-        trace_id: None,
-        operation: operation.to_owned(),
-        resource: "vala.bifrost.events".to_owned(),
-        card_ref: None,
-        principal_id: PrincipalId::new(uuid::Uuid::new_v4()),
-        principal_kind: PrincipalKindTag::User,
-        auth_method: AuthMethod::Jwt,
-        permission: "bifrost.write".to_owned(),
-        decision: AuditDecision::Allow,
-        result: AuditResult::Success,
-        payload_summary: "1 rows".to_owned(),
-        detail: None,
-    };
-    crate::scribe::audit_envelope::encode_audit_event(&event).expect("audit envelope encodes")
-}
 
 /// Builds one Arrow source whose `wyrd_event_time` values are the given
 /// epoch-microsecond instants.
@@ -143,7 +120,6 @@ fn time_partition_wal_tail_exact_once() {
         wal.append_and_commit_for_replay_test(
             &seal_key,
             batch_id,
-            &replay_audit(&format!("append-{index}")),
             &[u8::try_from(index).expect("fixture index fits u8")],
         )
         .expect("append and commit");
@@ -165,7 +141,7 @@ fn time_partition_wal_tail_exact_once() {
             "replay must recover the exact partition identity, not a truncated one"
         );
         assert_eq!(
-            state.audit_events.len(),
+            state.data_records.len(),
             1,
             "each committed batch replays exactly once"
         );

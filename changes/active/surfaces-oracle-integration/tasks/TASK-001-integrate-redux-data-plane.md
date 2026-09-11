@@ -1,10 +1,10 @@
 ---
 id: TASK-001
 kind: implementation
-status: proposed
+status: in_progress
 spec: SPEC-surfaces-oracle-integration
-spec_revision: 5
-requirements: [REQ-001, REQ-002, REQ-003, REQ-010, REQ-011, REQ-012, REQ-013, REQ-014, REQ-015, REQ-026, REQ-026A, REQ-026B, REQ-027, REQ-027A, REQ-028, REQ-029, REQ-030, REQ-030A, REQ-048, REQ-049, REQ-050, REQ-051, REQ-052, REQ-053, REQ-053A, REQ-054, REQ-062, REQ-063, INV-002, INV-003, INV-007, INV-008, INV-008A, INV-008B, INV-009, INV-017, INV-018, INV-019, INV-020, INV-021, INV-023, AC-005, AC-006, AC-011, AC-012, AC-013, AC-014, AC-015, AC-016, AC-017, AC-020]
+spec_revision: 6
+requirements: [REQ-001, REQ-002, REQ-003, REQ-010, REQ-011, REQ-012, REQ-013, REQ-014, REQ-015, REQ-026, REQ-026A, REQ-026B, REQ-027, REQ-027A, REQ-027B, REQ-028, REQ-029, REQ-030, REQ-030A, REQ-048, REQ-049, REQ-050, REQ-051, REQ-052, REQ-053, REQ-053A, REQ-054, REQ-062, REQ-063, INV-002, INV-003, INV-007, INV-008, INV-008A, INV-008B, INV-008C, INV-009, INV-017, INV-018, INV-019, INV-020, INV-021, INV-023, AC-005, AC-006, AC-011, AC-012, AC-013, AC-014, AC-015, AC-016, AC-017, AC-020]
 depends_on: []
 parent_task:
 remediates: []
@@ -18,6 +18,10 @@ outcome has one Redux engine owning Gate, Scribe, Oracle, incorporated Forge,
 canonical telemetry, query execution, maintenance, recovery, and retained
 audit publication; legacy `vala-bifrost` is gone in full.
 
+This task is paused during closeout, not awaiting a fresh implementation start.
+When resumed, continue from the existing integrated work, implement child
+TASK-005, and only then finish TASK-001 closeout.
+
 ## Constraints
 
 - Use the completed revision-4 conflict ledger and only the pinned Oracle
@@ -29,6 +33,9 @@ audit publication; legacy `vala-bifrost` is gone in full.
   reader-protection, WAL, resource, cancellation, and fail-closed boundaries.
 - Complete audit publication directly against Redux. Do not port legacy
   sealing, derivation, typed-read, or direct-Iceberg relay machinery.
+- TASK-005 owns the revised authorization-boundary audit flow. It MUST be
+  implemented on this task's existing integration branch before TASK-001 may
+  enter review or closeout.
 - Do not add compatibility crates, routes, aliases, a second scheduler,
   cluster-wide Oracle quotas, or alternate durable formats.
 - Live UI integration, SDK package convergence, repository-wide CI closeout,
@@ -65,9 +72,9 @@ Paths are ownership guidance, not a private implementation allowlist.
    fail-closed readiness behavior.
 6. Converge OTLP and canonical Arrow writes on the three canonical signal
    tables with trusted attribution and SQL-only reads.
-7. Complete bounded, idempotent outbox publication into
-   `vala.system.audit_log`, guarded retirement, and crash recovery while
-   retaining transactional audit and Oracle's WAL-first read exception.
+7. Resume the paused closeout by implementing TASK-005's authorization-only
+   audit flow, staging watermark publication, and garbage collection before
+   completing the remaining integration evidence.
 
 ## Acceptance Criteria
 
@@ -90,13 +97,14 @@ Paths are ownership guidance, not a private implementation allowlist.
 - Stock OTLP and canonical Arrow writes produce equivalent rows in only
   `vala.traces.spans`, `vala.logs.records`, and `vala.metrics.points`, with
   trusted principal/correlation attribution and exact partial-success rules.
-- Same-transaction mutations and WAL-accepted reads reach the canonical tenant
-  outbox. Publication into `vala.system.audit_log` is bounded and idempotent;
-  rows retire only after durable publication and recover safely from ambiguous
-  publication or retirement.
+- Allowed and denied permission decisions reach the canonical tenant staging
+  chain before the operation proceeds or refuses; Oracle reads retain their
+  WAL-first exception. Publication into `vala.system.audit_log` is bounded and
+  idempotent, and watermark advancement plus garbage collection occur only
+  after durable publication.
 - Scoped-role, cross-tenant, audit-unavailable, replay, backpressure,
   cancellation, peer-failure, restart, and cleanup journeys fail or recover
-  exactly as revision 5 requires.
+  exactly as revision 6 requires.
 
 ## Verification
 
@@ -197,7 +205,7 @@ Scribe also accepts published audit history.
 3. **Forge lane stability.** Two `production_closeout` scenarios intermittently
    fail under the lane's parallelism since publication began running — once on
    an empty orphan set, twice on a public query hitting the handler timeout. A
-   pending edit makes the retained-history fallback fire only when the outbox
+   pending edit makes the retained-history fallback fire only when the staging
    answer is empty, keeping the fused query off the hot path.
 4. `mise run codegen:check` and regeneration (the `audit_log` schema change
    moves generated contracts and its fingerprint).
@@ -221,7 +229,7 @@ supersedes the audit portions of the status amendment above: the interim
 withdrawn, and the remaining audit work in this task is defined by TASK-005
 rather than by items 1 and 2 of Remaining.
 
-TASK-005 is itself gated on the `architecture/bifrost-design.md:454-463`
-revision being human-approved. Until that approval lands, TASK-001 closeout is
-blocked rather than proceeding around it — finishing the other lanes first
-would re-verify a schema and an audit path that TASK-005 then changes.
+Revision 6 and the required architecture direction are approved. Resume from
+the existing in-progress work; do not restart TASK-001 or repeat completed
+integration steps. Implement and verify TASK-005 first, then continue items
+3–6 under Remaining and finish TASK-001 closeout.

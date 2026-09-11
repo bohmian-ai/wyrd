@@ -1,6 +1,6 @@
 ---
 id: SPEC-surfaces-oracle-integration
-revision: 5
+revision: 6
 status: approved
 ---
 
@@ -114,7 +114,8 @@ architecture rather than as parallel implementations.
   SDK-facing Wyrd client API and owner of the composed client capabilities.
 - **Language SDKs:** `sdks/wyrd-sdk-rust`, `sdks/wyrd-sdk-python`, and
   `sdks/wyrd-sdk-ts`.
-- **Outbox:** `vala.audit_outbox`, transient transactional delivery state.
+- **Audit staging:** `vala.audit_staging`, transient transactional write-ahead
+  state awaiting retained publication; it is not an external-consumer outbox.
 - **Retained audit history:** tenant-qualified
   `vala.system.audit_log` in Bifrost.
 - **Semantic overlap:** behavior changed by both branches, including changes
@@ -419,10 +420,15 @@ architecture rather than as parallel implementations.
 
 ### Audit history
 
-- **REQ-026:** Every auditable Postgres transition MUST append its canonical
-  audit event in the same transaction as the transition. Oracle query reads
-  are the sole WAL-first exception and MUST relay accepted events into the
-  same tenant outbox at least once.
+- **REQ-026:** Every authorization decision that evaluates a principal's
+  permission MUST append exactly one canonical audit event at that receiving
+  boundary before an allowed operation proceeds or a denial is returned. Both
+  allowed and denied decisions are audited, and audit unavailability fails the
+  operation closed. Engine-internal Scribe, Forge, Oracle reader-protection,
+  and retained-publication transitions evaluate no permission and MUST remain
+  lineage rather than audit. Oracle query reads are the sole WAL-first
+  exception and MUST relay accepted events into the same tenant staging chain
+  at least once.
 - **REQ-026A:** One logical Oracle query MUST produce one read-audit event and
   distributed stages MUST produce none. The relay MUST checkpoint only after
   its Postgres commit. Commit-before-checkpoint replay MAY produce one valid
@@ -434,26 +440,39 @@ architecture rather than as parallel implementations.
   unavailability. Peer-ticket rejection before verified tenant decoding MUST
   use the system audit tenant, while a verified signed-ticket violation MUST
   use its authenticated tenant chain. Query cancellation MUST preserve its
-  pre-dispatch audit gate and truthful post-dispatch outcome.
+  pre-dispatch authorization audit and MUST NOT create or rewrite an operation-
+  result audit outcome.
 - **REQ-027:** A bounded publisher MUST move tenant audit events idempotently
-  from `vala.audit_outbox` into `vala.system.audit_log`.
-- **REQ-027A:** Preserve Oracle's existing per-tenant `prev_hash` and
-  `entry_hash` event fields from outbox append through retained audit-log
-  publication. They MUST NOT introduce another table, service, key, or
-  publication stage.
-- **REQ-028:** An outbox row MUST be retired only after its corresponding audit
-  event is durably published in `vala.system.audit_log`.
-- **REQ-029:** Audit recovery MUST safely retry events whose publication or
-  retirement outcome is uncertain without duplicating retained audit history.
+  from `vala.audit_staging` into `vala.system.audit_log` through the existing
+  Scribe and Forge path without generating another audit event.
+- **REQ-027A:** The per-tenant `entry_hash` MUST be reproducible from the
+  retained event content, sequence, and preceding retained `entry_hash`.
+  Staging-only or deleted fields MUST NOT be part of its canonical preimage.
+  The chain MUST NOT introduce another table, service, key, or publication
+  stage.
+- **REQ-027B:** Retained audit history MUST preserve the effective dynamic
+  permission alongside principal, operation, resource, `allowed | denied`
+  outcome, request and trace correlation, redacted detail, sequence, and chain
+  hash. The original server-stamped decision time MUST become
+  `wyrd_event_time`; audit backlog publication is exempt from the ordinary past
+  event-time admission window; and `vala.system.audit_log` partitions daily.
+  No migration or compatibility path is required for audit tables or files
+  that have never shipped.
+- **REQ-028:** After a range is durably published, one tenant-scoped Postgres
+  transaction MUST advance its monotonic watermark and garbage-collect every
+  staged row through that watermark. No grace tail remains; an idle tenant's
+  staging rows drain to zero.
+- **REQ-029:** Audit recovery MUST safely retry events whose publication,
+  watermark, or garbage-collection outcome is uncertain without duplicating
+  retained audit history or losing staged rows.
 - **REQ-030:** Neither a legacy direct-Iceberg relay nor a second audit table
   may survive. The unused Postgres `platform.audit_log` table MUST be removed
   from the greenfield migration baseline.
 - **REQ-030A:** `vala.forge_operation_state` MUST be Forge's self-contained
-  operational recovery authority. Forge MUST NOT require the duplicated audit
-  payload in `vala.audit_outbox` when listing open or reset operations or when
-  rereading locked transition state. Existing audit sequence fields remain
-  traceability references; no additional recovery digest, identity column, or
-  recovery table is introduced.
+  operational recovery and lineage authority. Forge MUST NOT require an audit
+  payload or audit sequence when listing open or reset operations or when
+  rereading locked transition state. No additional recovery digest, identity
+  column, or recovery table is introduced.
 
 ### Postgres harness and CI
 
@@ -555,12 +574,14 @@ architecture rather than as parallel implementations.
   Delta Lake, Iceberg, or server implementation crates.
 - **INV-007:** No operation derives effective tenant identity from an
   untrusted request field, path, object key, query predicate, or peer payload.
-- **INV-008:** No outbox row is deleted before its corresponding audit-log event
-  is durably published.
-- **INV-008B:** Audit hash fields remain attributes of the event moving through
-  the approved two-table flow, not authority for a parallel audit lifecycle.
-- **INV-008A:** Retiring an outbox row never removes information required for
-  Forge recovery, reconciliation, or idempotent state transitions.
+- **INV-008:** No staging row is deleted before its corresponding audit-log
+  event is durably published and the tenant watermark advances through it.
+- **INV-008B:** The retained audit event and its predecessor contain everything
+  required to reproduce its hash; staging is not a second audit authority.
+- **INV-008A:** Garbage-collecting staging never removes information required
+  for Forge recovery, reconciliation, or idempotent state transitions.
+- **INV-008C:** Retained audit publication cannot append an audit event, and a
+  successfully drained idle tenant retains no staging tail.
 - **INV-009:** No failed or partial analytical result is represented as a
   successful query.
 - **INV-010:** No compatibility shim preserves a rejected contract or stale
@@ -628,8 +649,8 @@ architecture rather than as parallel implementations.
 - Public query deadlines use the architecture-defined `1..=u32::MAX`
   millisecond range across Rust, HTTP, gRPC, Python, TypeScript, and MCP. No
   public distributed-plan or execution-path `EXPLAIN` surface is introduced.
-- Retained audit queries read `vala.system.audit_log`; transient outbox state is
-  not presented as the retained historical ledger.
+- Retained audit queries read `vala.system.audit_log`; transient audit staging
+  is not presented as the retained historical ledger.
 - Pull-request feedback is limited to affected lanes, while nightly `main`
   qualification detects whole-repository regressions.
 
@@ -688,10 +709,10 @@ Forge expiration preparation serializes with protection widening
 The audit-history flow is:
 
 ```text
-auditable transition or accepted Oracle read
-  -> vala.audit_outbox
+authorization decision or accepted Oracle read
+  -> vala.audit_staging
   -> vala.system.audit_log
-  -> outbox row retirement after durable publication
+  -> atomic watermark advance and staging garbage collection after durable publication
 ```
 
 ## Acceptance obligations
@@ -717,11 +738,13 @@ auditable transition or accepted Oracle read
   ingestion, flush/shutdown durability, replay idempotency, SQL-only reads,
   typed collection, streaming, lifecycle operations, description, and the
   absence of sibling public engine clients.
-- **AC-005:** SQL and audit evidence demonstrates same-transaction audit,
-  Oracle WAL-first read acceptance, idempotent outbox publication, and guarded
-  retirement across partial failures. A real-server retained-history journey
-  proves outbox-to-`vala.system.audit_log` publication; existing WAL-to-outbox
-  tests alone are insufficient.
+- **AC-005:** SQL and audit evidence demonstrates fail-closed audit of allowed
+  and denied authorization decisions, Oracle WAL-first read acceptance,
+  idempotent staging publication, reproducible retained hashes, and atomic
+  watermark advancement plus garbage collection across partial failures.
+  Existing real-server retained-history evidence proves publication into
+  `vala.system.audit_log`, including replay without duplication and an idle
+  staging table that drains to zero.
 - **AC-006:** Tenant and authorization evidence demonstrates isolation across
   registry, SQL, Bifrost physical tables, object paths, query plans, and every
   public client surface.
@@ -817,10 +840,13 @@ credentialed cloud tests run and pass in GitHub Actions; the single Bifrost
 data-root outcome is a required completion-blocking follow-up task; and live UI
 integration remains outside this change because that work is ongoing.
 
-The user approved revision 5 on 2026-09-11. It changes provenance only: it
-records the committed destination baseline and rewritten Surfaces ancestry
-after removal of generated UI evidence images. Task decomposition and merge
-execution remain subject to REQ-039 and REQ-047.
+The user approved revision 6 on 2026-09-11. It makes audit an authorization-
+decision record, replaces outbox retirement with staging watermark garbage
+collection, fixes the retained audit schema and event-time behavior, and
+requires no compatibility migration because no audit table or file has shipped.
+TASK-005 executes when the in-progress TASK-001 resumes and MUST complete before
+TASK-001 closeout. Task decomposition and merge execution remain subject to
+REQ-039 and REQ-047.
 
 ## Revision history
 
@@ -856,6 +882,15 @@ execution remain subject to REQ-039 and REQ-047.
   authority pins after the user-directed history purge of 97 generated UI
   evidence images. Regenerates the conflict inventory against the committed
   destination baseline without changing behavior, scope, or task outcomes.
+- Revision 6 (`approved`, 2026-09-11): Records the user-approved audit boundary
+  revision. Audit records allowed and denied permission decisions rather than
+  engine mechanics; Oracle reads retain their WAL-first exception;
+  `vala.audit_staging` publishes by watermark without a grace tail; retained
+  hashes use retained fields; original decision time survives publication; and
+  audit history partitions daily. No migration compatibility is required for
+  unshipped audit state. TASK-005 is implemented when the paused, in-progress
+  TASK-001 resumes and blocks its closeout. Existing verification is reused
+  without adding tests.
 
 ## Material authority
 

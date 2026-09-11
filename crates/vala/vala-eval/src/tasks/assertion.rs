@@ -655,7 +655,10 @@ mod assertion_stage {
                 started_at: chrono::Utc::now(),
                 duration_ms: 0,
             };
-            Ok(TaskOutput::Judge { result, outcome })
+            Ok(TaskOutput::Judge {
+                result,
+                outcome: Box::new(outcome),
+            })
         }
     }
 
@@ -697,7 +700,10 @@ mod assertion_stage {
                 started_at: chrono::Utc::now(),
                 duration_ms: 0,
             };
-            Ok(TaskOutput::Judge { result, outcome })
+            Ok(TaskOutput::Judge {
+                result,
+                outcome: Box::new(outcome),
+            })
         }
     }
 

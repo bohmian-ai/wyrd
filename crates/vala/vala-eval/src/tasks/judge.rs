@@ -90,7 +90,10 @@ impl TaskExecutor for JudgeTaskExecutor {
             parsed,
             judge_ref: judge.judge_ref.as_card_ref().cloned(),
         };
-        Ok(TaskOutput::Judge { result, outcome })
+        Ok(TaskOutput::Judge {
+            result,
+            outcome: Box::new(outcome),
+        })
     }
 }
 

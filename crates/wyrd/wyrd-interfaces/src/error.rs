@@ -27,7 +27,10 @@ pub enum WyrdPyError {
     #[error("{error}")]
     SpecWithCause {
         /// Stable public error preserved across the boundary.
-        error: WyrdError,
+        ///
+        /// Boxed so the cause-bearing variant does not widen every
+        /// `CardPyResult` beyond the large-error budget.
+        error: Box<WyrdError>,
         /// Redacted source text attached as Python `__cause__`.
         cause: String,
     },
@@ -205,7 +208,7 @@ impl WyrdPyError {
     /// Attach a redacted Python cause while preserving a stable Wyrd error.
     pub fn spec_with_cause(error: WyrdError, cause: impl Into<String>) -> Self {
         Self::SpecWithCause {
-            error,
+            error: Box::new(error),
             cause: cause.into(),
         }
     }
@@ -213,7 +216,8 @@ impl WyrdPyError {
     #[cfg(feature = "python")]
     fn into_wyrd_error(self) -> WyrdError {
         match self {
-            Self::Spec(error) | Self::SpecWithCause { error, .. } => error,
+            Self::Spec(error) => error,
+            Self::SpecWithCause { error, .. } => *error,
             Self::Python(source) => internal_from_source("Python boundary failed", &source),
             Self::PythonWithCause { message, cause } => internal_from_source(&message, &cause),
             Self::Downcast(source) => {
@@ -489,7 +493,10 @@ mod catalog {
     }
 
     /// Build a `ModelCard` unknown-model-type error.
-    pub fn unknown_model_type(module: impl Into<String>, type_name: impl Into<String>) -> WyrdError {
+    pub fn unknown_model_type(
+        module: impl Into<String>,
+        type_name: impl Into<String>,
+    ) -> WyrdError {
         let module = module.into();
         let type_name = type_name.into();
         WyrdError::ModelUnknownModelType {
@@ -538,7 +545,6 @@ mod catalog {
     pub fn card_error(error: impl Into<WyrdError>) -> WyrdError {
         error.into()
     }
-
 }
 
 pub use catalog::*;

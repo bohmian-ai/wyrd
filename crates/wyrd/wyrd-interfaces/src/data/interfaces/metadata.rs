@@ -9,11 +9,11 @@ use crate::data::interfaces::options::{
     parse_image_format, parse_jsonl_compression, parse_numpy_format, parse_parquet_compression,
     parse_torch_save_format, torch_save_format_token,
 };
-use wyrd_spec::reference::Ref;
 use wyrd_spec::card::data::{
     ArrowMeta, DataInterface as RustDataInterface, HuggingfaceMeta, ImageMeta, JsonlMeta,
     NumpyMeta, PandasMeta, ParquetMeta, PolarsMeta, SqlMeta, TextMeta, TorchMeta,
 };
+use wyrd_spec::reference::Ref;
 #[cfg(feature = "python")]
 use wyrd_utils::py::WyrdPyResult;
 

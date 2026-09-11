@@ -41,8 +41,12 @@ impl Cli {
             Command::Load(args) => crate::card::dispatch_load(args).await.map_err(Into::into),
             Command::Delete(args) => crate::card::dispatch_delete(args).await.map_err(Into::into),
             Command::Auth(command) => crate::auth::dispatch(command).await.map_err(Into::into),
-            Command::Eval(command) => crate::eval::run::dispatch(command).await.map_err(Into::into),
-            Command::Principal(command) => crate::principal::dispatch(command).await.map_err(Into::into),
+            Command::Eval(command) => crate::eval::run::dispatch(command)
+                .await
+                .map_err(Into::into),
+            Command::Principal(command) => crate::principal::dispatch(command)
+                .await
+                .map_err(Into::into),
             Command::Query(command) => crate::query::dispatch(command).await,
         }
     }

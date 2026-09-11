@@ -50,7 +50,9 @@ pub enum TaskOutput {
         /// Persisted assertion-result row.
         result: AssertionResult,
         /// Judge raw / parsed payload retained on the snapshot.
-        outcome: JudgeOutcome,
+        ///
+        /// Boxed so the judge variant does not dominate every `TaskOutput`.
+        outcome: Box<JudgeOutcome>,
     },
     /// An [`crate::tasks::TraceTaskExecutor`] result.
     Trace(AssertionResult),

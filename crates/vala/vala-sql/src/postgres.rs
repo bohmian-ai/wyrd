@@ -176,19 +176,12 @@ mod telemetry_tests {
     use std::future::Future;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
-    use std::task::{Context, Poll, Wake, Waker};
+    use std::task::{Context, Poll};
 
     use metrics::{Counter, Gauge, Histogram, HistogramFn, Key, Metadata, Recorder};
     use sqlx::postgres::PgPoolOptions;
 
     use super::ValaPostgres;
-
-    /// No-op wake target for the pending-owner poll.
-    struct NoopWake;
-    impl Wake for NoopWake {
-        /// Ignore the wake because the pending future is deliberately dropped.
-        fn wake(self: Arc<Self>) {}
-    }
 
     /// Isolated recorder for exact Vala pool owner assertions.
     #[derive(Default)]
@@ -326,9 +319,10 @@ mod telemetry_tests {
         let held = pending_pool.acquire().await.expect("held connection");
         let owner = ValaPostgres::from_pool(pending_pool);
         let mut pending = Box::pin(owner.tenant_conn(wyrd_spec::DataTenantId::SYSTEM_OWNER));
-        let waker = Waker::from(Arc::new(NoopWake));
         assert!(matches!(
-            pending.as_mut().poll(&mut Context::from_waker(&waker)),
+            pending
+                .as_mut()
+                .poll(&mut Context::from_waker(std::task::Waker::noop())),
             Poll::Pending
         ));
         drop(pending);

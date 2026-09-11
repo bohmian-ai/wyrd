@@ -13,10 +13,10 @@ pub mod error;
 mod eval;
 pub mod load;
 mod principal;
-pub mod query;
 #[cfg(feature = "python")]
 /// Optional PyO3 adapter for the shared numeric CLI entrypoint.
 pub mod python;
+pub mod query;
 pub mod registration;
 
 use clap::{Parser, error::ErrorKind};

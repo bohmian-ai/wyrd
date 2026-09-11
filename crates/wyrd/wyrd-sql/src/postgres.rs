@@ -153,20 +153,11 @@ mod telemetry_tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll};
-    use std::task::{Wake, Waker};
 
     use metrics::{Counter, Gauge, Histogram, HistogramFn, Key, Metadata, Recorder};
     use sqlx::postgres::PgPoolOptions;
 
     use super::WyrdPostgres;
-
-    /// No-op wake target for one deterministic first poll.
-    struct NoopWake;
-
-    impl Wake for NoopWake {
-        /// Ignore wake notifications because the test drops after its first poll.
-        fn wake(self: Arc<Self>) {}
-    }
 
     /// Isolated exact recorder for the SQL owner lifecycle.
     #[derive(Default)]
@@ -315,9 +306,10 @@ mod telemetry_tests {
         let held = pending_pool.acquire().await.expect("held connection");
         let owner = WyrdPostgres::from_pools(pending_pool, None);
         let mut pending = Box::pin(owner.tenant_conn(wyrd_spec::DataTenantId::SYSTEM_OWNER));
-        let waker = Waker::from(Arc::new(NoopWake));
         assert!(matches!(
-            pending.as_mut().poll(&mut Context::from_waker(&waker)),
+            pending
+                .as_mut()
+                .poll(&mut Context::from_waker(std::task::Waker::noop())),
             Poll::Pending
         ));
         drop(pending);

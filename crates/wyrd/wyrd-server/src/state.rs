@@ -37,9 +37,9 @@ use crate::components::eval::{EvalAuditWriter, EvalRuns, TracingEvalAuditWriter,
 use crate::components::health::ReadinessSnapshot;
 use crate::config::{BifrostRuntimeConfig, BifrostTarget, DeploymentProfile, ForgeRuntimeConfig};
 use crate::postgres::ServerPostgres;
-use wyrd_spec::vala::api::BifrostQueryRequest;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::error::WyrdError;
+use wyrd_spec::vala::api::BifrostQueryRequest;
 
 /// Redact database failures at the public registry boundary.
 ///

@@ -373,9 +373,11 @@ impl WyrdTestServer {
         name: &str,
     ) -> WyrdPyResult<String> {
         let srv = self.server.as_ref().ok_or_else(not_started)?;
-        let tenant_id = tenant_id.parse::<wyrd_spec::DataTenantId>().map_err(|error| {
-            WyrdPyError::from(harness_error(format!("invalid tenant id: {error}")))
-        })?;
+        let tenant_id = tenant_id
+            .parse::<wyrd_spec::DataTenantId>()
+            .map_err(|error| {
+                WyrdPyError::from(harness_error(format!("invalid tenant id: {error}")))
+            })?;
         let roles: Vec<&str> = roles.iter().map(String::as_str).collect();
         let bootstrap = wyrd_runtime::runtime()
             .block_on(srv.bootstrap_service_in_tenant(tenant_id, name, &roles))

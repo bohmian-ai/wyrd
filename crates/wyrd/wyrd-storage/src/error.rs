@@ -320,32 +320,13 @@ impl From<StorageError> for WyrdStorageError {
             StorageError::PresignExpired(detail) => Self::PresignExpired { detail },
             StorageError::ObjectNotFound { storage_path } => Self::ObjectNotFound { storage_path },
             StorageError::BackendCapabilityMismatch { signer, op } => {
-                tracing::error!(
-                    ?signer,
-                    op,
-                    error_class = "capability_mismatch",
-                    "backend signer does not support requested operation"
-                );
-                Self::Backend {
-                    detail: format!("capability mismatch: {signer:?} does not support {op}"),
-                }
+                map_capability_mismatch(signer, op)
             }
             StorageError::Backend {
                 backend,
                 op,
                 message,
-            } => {
-                tracing::error!(
-                    ?backend,
-                    op,
-                    message,
-                    error_class = "backend",
-                    "storage backend operation failed"
-                );
-                Self::Backend {
-                    detail: format!("{backend:?} {op}: {message}"),
-                }
-            }
+            } => map_backend_failure(backend, op, &message),
             StorageError::AdminPool { source } => {
                 tracing::warn!(
                     error = ?source,
@@ -355,17 +336,7 @@ impl From<StorageError> for WyrdStorageError {
                 Self::BackendUnavailable { status: 503 }
             }
             StorageError::Sql(error) => map_sql_error(error),
-            StorageError::ConfigParse { var, source } => {
-                tracing::error!(
-                    var,
-                    error = ?source,
-                    error_class = "config_parse",
-                    "storage configuration parse failed"
-                );
-                Self::ConfigInvalid {
-                    detail: format!("{var}: {source}"),
-                }
-            }
+            StorageError::ConfigParse { var, source } => map_config_parse(var, &source),
             StorageError::InvalidUri(detail) => Self::InvalidUri { detail },
             StorageError::TenantPrefixInvalid(detail) => Self::TenantPrefixInvalid { detail },
             StorageError::TenantPrefixForeign { prefix, caller } => {
@@ -389,6 +360,50 @@ impl From<StorageError> for WyrdStorageError {
             }
             StorageError::Reqwest(error) => map_reqwest_error(&error),
         }
+    }
+}
+
+/// Project a signer capability mismatch, recording the unsupported pairing.
+fn map_capability_mismatch(signer: StorageBackendKind, op: &'static str) -> WyrdStorageError {
+    tracing::error!(
+        ?signer,
+        op,
+        error_class = "capability_mismatch",
+        "backend signer does not support requested operation"
+    );
+    WyrdStorageError::Backend {
+        detail: format!("capability mismatch: {signer:?} does not support {op}"),
+    }
+}
+
+/// Project a failed backend call, recording the backend, operation, and cause.
+fn map_backend_failure(
+    backend: StorageBackendKind,
+    op: &'static str,
+    message: &str,
+) -> WyrdStorageError {
+    tracing::error!(
+        ?backend,
+        op,
+        message,
+        error_class = "backend",
+        "storage backend operation failed"
+    );
+    WyrdStorageError::Backend {
+        detail: format!("{backend:?} {op}: {message}"),
+    }
+}
+
+/// Project a storage configuration parse failure, naming the offending variable.
+fn map_config_parse(var: &'static str, source: &ConfigParseError) -> WyrdStorageError {
+    tracing::error!(
+        var,
+        error = ?source,
+        error_class = "config_parse",
+        "storage configuration parse failed"
+    );
+    WyrdStorageError::ConfigInvalid {
+        detail: format!("{var}: {source}"),
     }
 }
 

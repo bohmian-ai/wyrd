@@ -918,8 +918,7 @@ async fn declare_component_card(
     .bind(root.uid.as_ref().expect("root uid is set").as_uuid())
     .bind(CardKind::Service.wire_name())
     .bind(
-        root
-            .space
+        root.space
             .as_ref()
             .expect("fixture card ref carries a space")
             .as_str(),
@@ -962,8 +961,7 @@ async fn registry_card_uid(
     )
     .bind(card.kind.wire_name())
     .bind(
-        card
-            .space
+        card.space
             .as_ref()
             .expect("fixture card ref carries a space")
             .as_str(),

@@ -3404,15 +3404,9 @@ impl Oracle {
 
     /// Accepts a typed lowered plan after validating its deadline.
     ///
-    /// The plan's complete catalog-resolved scan set is object-authorized
-    /// before Oracle admission is requested, so a caller without authority over
-    /// every scanned table consumes no admitted capacity.
-    ///
     /// # Errors
     /// Returns a stable query error for elapsed deadlines, non-read-only plans,
-    /// unavailable roles, the query-forbidden refusal when the caller does not
-    /// hold every resolved table, admission failure, audit failure, or physical
-    /// planning.
+    /// unavailable roles, admission failure, audit failure, or physical planning.
     #[tracing::instrument(
         name = "bifrost.oracle.query",
         skip_all,
@@ -3439,20 +3433,6 @@ impl Oracle {
         }
         let class = QueryClass::Analytical;
         let query_telemetry = OracleTelemetry::start_query(options.visibility, class);
-        // The typed cut is prepared and object-authorized here, ahead of
-        // admission, so an uncovered plan is refused without ever entering or
-        // waiting in the protected capacity boundary. This mirrors the raw-SQL
-        // ordering, where `prepare_query_attempt` pins before `admit_sql_query`.
-        let protected = self
-            .planner
-            .prepare_typed_cuts(
-                &plan,
-                &context,
-                options.deadline,
-                &self.catalog,
-                &self.reader_authority,
-            )
-            .await?;
         let admitted = self
             .admission
             .admit(admission::PreparedAdmission {
@@ -3463,16 +3443,8 @@ impl Oracle {
                 cancellation: self.shutdown.child_token(),
             })
             .await?;
-        self.execute_typed_plan(
-            &context,
-            plan,
-            options,
-            class,
-            query_telemetry,
-            admitted,
-            protected,
-        )
-        .await
+        self.execute_typed_plan(&context, plan, options, class, query_telemetry, admitted)
+            .await
     }
 
     /// Fences the live tails a typed plan reads, audits the decision, then drains them.
@@ -3536,10 +3508,6 @@ impl Oracle {
 
     /// Installs immutable-cut providers and executes one typed plan.
     ///
-    /// The protected cut arrives already prepared and object-authorized by
-    /// [`Self::query_plan`]; execution consumes it rather than repeating
-    /// catalog preparation, authorization, or materialization.
-    ///
     /// # Errors
     /// Returns typed capacity, timeout, audit, visibility, reconciliation, or
     /// execution failures and releases admission state through the returned
@@ -3553,13 +3521,21 @@ impl Oracle {
         class: QueryClass,
         query_telemetry: QueryTelemetryGuard,
         mut admitted: AdmittedQueryGuard,
-        protected: ProtectedPlannedSqlCut,
     ) -> Result<OracleQueryStream, BifrostError> {
         let ProtectedPlannedSqlCut {
             guard: reader_pin,
             permit: reader_io_permit,
             cuts,
-        } = protected;
+        } = self
+            .planner
+            .prepare_typed_cuts(
+                &plan,
+                context,
+                options.deadline,
+                &self.catalog,
+                &self.reader_authority,
+            )
+            .await?;
         let session = match self.typed_execution_session(&admitted, &cuts) {
             Ok(session) => session,
             Err(error) => {

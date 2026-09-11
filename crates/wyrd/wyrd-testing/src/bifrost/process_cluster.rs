@@ -1486,7 +1486,7 @@ impl ProcessNode {
     /// Returns the same errors as [`Self::request`], and
     /// [`ProcessClusterError::Child`] when this child composes no Oracle.
     pub fn arm_execute_pause(&mut self) -> Result<(), ProcessClusterError> {
-        self.expect(&ControlRequest::ArmExecutePause, |response| {
+        self.require(&ControlRequest::ArmExecutePause, |response| {
             matches!(response, ControlResponse::PauseArmed)
         })
     }
@@ -1499,7 +1499,7 @@ impl ProcessNode {
         &mut self,
         request_id: &RequestId,
     ) -> Result<(), ProcessClusterError> {
-        self.expect(
+        self.require(
             &ControlRequest::ArmPreparationPause {
                 request_id: request_id.clone(),
             },
@@ -1527,7 +1527,7 @@ impl ProcessNode {
     /// # Errors
     /// Returns control transport, child, or unexpected-response failures.
     pub fn release_preparation_pause(&mut self) -> Result<(), ProcessClusterError> {
-        self.expect(&ControlRequest::ReleasePreparationPause, |response| {
+        self.require(&ControlRequest::ReleasePreparationPause, |response| {
             matches!(response, ControlResponse::PauseReleased)
         })
     }
@@ -1537,7 +1537,7 @@ impl ProcessNode {
     /// # Errors
     /// Returns control transport, child or protocol failures.
     pub fn arm_cleanup_pause(&mut self) -> Result<(), ProcessClusterError> {
-        self.expect(&ControlRequest::ArmCleanupPause, |response| {
+        self.require(&ControlRequest::ArmCleanupPause, |response| {
             matches!(response, ControlResponse::PauseArmed)
         })
     }
@@ -1547,7 +1547,7 @@ impl ProcessNode {
     /// # Errors
     /// Returns control failures or a bounded wait timeout.
     pub fn await_cleanup_paused(&mut self) -> Result<(), ProcessClusterError> {
-        self.expect(&ControlRequest::AwaitCleanupPaused, |response| {
+        self.require(&ControlRequest::AwaitCleanupPaused, |response| {
             matches!(response, ControlResponse::ExecutePaused)
         })
     }
@@ -1557,7 +1557,7 @@ impl ProcessNode {
     /// # Errors
     /// Returns control transport, child or protocol failures.
     pub fn release_cleanup_pause(&mut self) -> Result<(), ProcessClusterError> {
-        self.expect(&ControlRequest::ReleaseCleanupPause, |response| {
+        self.require(&ControlRequest::ReleaseCleanupPause, |response| {
             matches!(response, ControlResponse::PauseReleased)
         })
     }
@@ -1568,7 +1568,7 @@ impl ProcessNode {
     ///
     /// Returns the same errors as [`Self::request`].
     pub fn await_execute_paused(&mut self) -> Result<(), ProcessClusterError> {
-        self.expect(&ControlRequest::AwaitExecutePaused, |response| {
+        self.require(&ControlRequest::AwaitExecutePaused, |response| {
             matches!(response, ControlResponse::ExecutePaused)
         })
     }
@@ -1579,7 +1579,7 @@ impl ProcessNode {
     ///
     /// Returns the same errors as [`Self::request`].
     pub fn release_execute_pause(&mut self) -> Result<(), ProcessClusterError> {
-        self.expect(&ControlRequest::ReleaseExecutePause, |response| {
+        self.require(&ControlRequest::ReleaseExecutePause, |response| {
             matches!(response, ControlResponse::PauseReleased)
         })
     }
@@ -1591,7 +1591,7 @@ impl ProcessNode {
     /// Returns the same errors as [`Self::request`], and
     /// [`ProcessClusterError::Child`] when the slot is already occupied.
     pub fn start_inactive_sql(&mut self, sql: &str) -> Result<(), ProcessClusterError> {
-        self.expect(
+        self.require(
             &ControlRequest::StartInactiveSql {
                 sql: sql.to_owned(),
             },
@@ -1606,7 +1606,7 @@ impl ProcessNode {
     /// Returns the same errors as [`Self::request`], and
     /// [`ProcessClusterError::Child`] when the slot is empty.
     pub fn cancel_inactive_sql(&mut self) -> Result<(), ProcessClusterError> {
-        self.expect(&ControlRequest::CancelInactiveSql, |response| {
+        self.require(&ControlRequest::CancelInactiveSql, |response| {
             matches!(response, ControlResponse::CancelRequested)
         })
     }
@@ -1685,7 +1685,7 @@ impl ProcessNode {
     ///
     /// Returns the same errors as [`Self::request`], and
     /// [`ProcessClusterError::Child`] when the child reported a failure.
-    fn expect(
+    fn require(
         &mut self,
         request: &ControlRequest,
         accept: impl Fn(&ControlResponse) -> bool,

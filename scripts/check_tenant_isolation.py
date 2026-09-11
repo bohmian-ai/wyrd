@@ -388,9 +388,11 @@ def check_tenant_query_file(
     guarantees (see `VALA_TENANT_BOUND_CAPABILITY_ALLOWLIST`): a capability that
     holds the caller's operator transaction is permitted a `Transaction<'_>`
     parameter, and its public async fns are methods of a tenant-owning struct
-    rather than `TenantConn` takers. Every other rule — the raw-`PgPool`
-    prohibition, the self-opened-transaction prohibition, the tenant-predicate
-    requirement, and the raw-query justification — still runs unchanged.
+    rather than `TenantConn` takers; such a module proves its RLS boundary with
+    an explicit tenant predicate on every statement instead. Every other rule —
+    the raw-`PgPool` prohibition, the self-opened-transaction prohibition, the
+    tenant-predicate requirement, and the raw-query justification — still runs
+    unchanged.
     """
     pool_pattern = (
         r"&\s*PgPool\b|\bPgPool\s*,"
@@ -404,16 +406,33 @@ def check_tenant_query_file(
     if re.search(r"\.begin\s*\(", code):
         failures.append(f"{relative}: tenant query module must not open transactions")
 
-    for fn_name, params in public_async_fns(code):
-        if "TenantConn<'_" not in params and "TenantConn < '_" not in params:
-            if has_tenant_query_exception(body, fn_name) and re.search(
-                r"&\s*OperatorPool\b", params
-            ):
-                continue
-            failures.append(f"{relative}: public async fn {fn_name} must take &mut TenantConn<'_>")
+    if exempt_tenant_conn_param:
+        # The capability's own shape rule already proved every public async fn
+        # is a method of a tenant-owning or TenantConn-owning struct, so the
+        # RLS boundary is re-established by an explicit tenant predicate on
+        # every statement instead of by a threaded TenantConn parameter.
+        if references_tenant_schema(code) and not (
+            re.search(r"data_tenant_id\s*=\s*\$", code)
+            or re.search(r"wyrd\.current_tenant\(\)", code)
+        ):
+            failures.append(
+                f"{relative}: tenant table query is missing data_tenant_id predicate"
+            )
+    else:
+        for fn_name, params in public_async_fns(code):
+            if "TenantConn<'_" not in params and "TenantConn < '_" not in params:
+                if has_tenant_query_exception(body, fn_name) and re.search(
+                    r"&\s*OperatorPool\b", params
+                ):
+                    continue
+                failures.append(
+                    f"{relative}: public async fn {fn_name} must take &mut TenantConn<'_>"
+                )
 
-    if references_tenant_schema(code) and not re.search(r"TenantConn\s*<'_", code):
-        failures.append(f"{relative}: tenant table query must use TenantConn under FORCE RLS")
+        if references_tenant_schema(code) and not re.search(r"TenantConn\s*<'_", code):
+            failures.append(
+                f"{relative}: tenant table query must use TenantConn under FORCE RLS"
+            )
 
     if re.search(
         r"sqlx::query(?:_as|_scalar)?\s*\(", code

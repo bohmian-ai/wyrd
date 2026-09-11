@@ -121,8 +121,30 @@ class SessionError(WyrdError):
         """
         ...
 
+def build_wyrd_error(
+    code: str,
+    message: str,
+    details: dict[str, Any] | None = None,
+) -> WyrdError:
+    """Build a fully populated Wyrd error from a stable catalog code.
+
+    Pure Python helpers use this instead of constructing an exception and
+    assigning a subset of its attributes, so every raised error carries the
+    catalog's status, title, type, and remediation.
+
+    Args:
+        code (str): Stable Wyrd error code.
+        message (str): Human-readable failure message.
+        details (dict[str, Any] | None): Optional structured context.
+
+    Returns:
+        WyrdError: Exception instance carrying complete Wyrd metadata.
+    """
+    ...
+
 __all__ = [
     "AgentError",
+    "build_wyrd_error",
     "SessionError",
     "ToolError",
     "WyrdError",

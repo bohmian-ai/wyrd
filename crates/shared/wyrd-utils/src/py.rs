@@ -249,7 +249,33 @@ pub fn register_wyrd_error_exception(module: &Bound<'_, PyModule>) -> PyResult<(
     module.add("WyrdError", py.get_type::<WyrdError>())?;
     module.add("AgentError", py.get_type::<AgentError>())?;
     module.add("ToolError", py.get_type::<ToolError>())?;
-    module.add("SessionError", py.get_type::<SessionError>())
+    module.add("SessionError", py.get_type::<SessionError>())?;
+    module.add_function(pyo3::wrap_pyfunction!(build_wyrd_error, module)?)
+}
+
+/// Build a fully populated Wyrd exception instance from a catalog code.
+///
+/// Pure Python surfaces cannot reach the derive-backed catalog, so they call
+/// this instead of instantiating an exception and assigning a subset of its
+/// attributes. An unknown code still yields a structured exception, because the
+/// catalog reconstruction falls back to agent validation.
+///
+/// # Errors
+/// Returns a Python error when `details` is not JSON-convertible or exception
+/// construction fails.
+#[pyfunction]
+#[pyo3(name = "build_wyrd_error", signature = (code, message, details = None))]
+fn build_wyrd_error(
+    py: Python<'_>,
+    code: &str,
+    message: String,
+    details: Option<&Bound<'_, PyAny>>,
+) -> PyResult<Py<PyAny>> {
+    let details = match details {
+        Some(details) if !details.is_none() => pyobject_to_json(details)?,
+        _ => Value::Null,
+    };
+    wyrd_error_to_py_object(py, wyrd_error_from_python_code(code, message, details))
 }
 
 /// Convert a public Wyrd error into a structured Python Wyrd error.

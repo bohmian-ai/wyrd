@@ -511,6 +511,42 @@ pub async fn mark_aborted(
     ensure_one_row(result.rows_affected(), "mark upload aborted")
 }
 
+/// Mark an upload aborted when it is still open, reporting what changed.
+///
+/// This is the sweeper's counterpart to [`mark_aborted`]: the sweeper races a
+/// tenant that may complete or abort the same upload, so zero rows is the
+/// expected concurrent outcome rather than a conflict.
+///
+/// Returns the number of rows updated. Zero indicates the upload was already
+/// in a terminal state (e.g., completed concurrently), which the caller should
+/// treat as a best-effort no-op rather than an error.
+///
+/// # Errors
+/// Returns [`SqlError`] when Postgres rejects the update.
+pub async fn mark_aborted_if_open(
+    conn: &mut TenantConn<'_>,
+    id: Uuid,
+    reason: &str,
+) -> Result<u64, SqlError> {
+    let result = sqlx::query(
+        r#"
+        UPDATE wyrd.storage_multipart_uploads
+        SET status = 'aborted',
+            terminal_at = now(),
+            failure_reason = $2
+        WHERE id = $1
+          AND status IN ('pending', 'initiating')
+        "#,
+    )
+    .bind(id)
+    .bind(reason)
+    .execute(&mut **conn.transaction())
+    .await
+    .map_err(SqlError::from)?;
+
+    Ok(result.rows_affected())
+}
+
 /// Mark an upload as failed.
 ///
 /// # Errors

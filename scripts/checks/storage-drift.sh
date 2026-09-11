@@ -97,7 +97,6 @@ fi
 if rg_optional '&PgPool' \
   crates/wyrd/wyrd-sql/src/queries/storage/multipart_uploads.rs \
   crates/wyrd/wyrd-sql/src/queries/storage/artifact_metadata.rs \
-  crates/wyrd/wyrd-sql/src/queries/storage/access_ledger.rs \
   crates/wyrd/wyrd-sql/src/queries/storage/idempotency.rs; then
   echo 'tenant-scoped storage queries must use TenantConn, not PgPool'
   exit 1

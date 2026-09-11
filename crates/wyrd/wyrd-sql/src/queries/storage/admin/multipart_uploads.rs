@@ -1,7 +1,8 @@
 //! Cross-tenant sweeper queries for storage uploads.
 // raw-query grep allowlist: storage tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
-use crate::TenantConn;
+use std::time::Duration;
+
 use crate::error::SqlError;
 use serde::Serialize;
 use sqlx::PgPool;
@@ -30,13 +31,19 @@ pub struct ExpiredUpload {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
-/// Fetch upload sessions whose persisted expiration has passed.
+/// Fetch expired pending uploads and orphaned `initiating` rows.
+///
+/// A `pending` row is reclaimable once its persisted expiration passes. An
+/// `initiating` row has no meaningful expiration yet: it is orphaned when the
+/// initiating request died before recording a backend upload, so it becomes
+/// reclaimable once it is older than `init_grace`.
 ///
 /// # Errors
 /// Returns [`SqlError`] when Postgres rejects the query.
 pub async fn expired_uploads_batch(
     admin_pool: &PgPool,
     limit: i64,
+    init_grace: Duration,
 ) -> Result<Vec<ExpiredUpload>, SqlError> {
     let rows = sqlx::query_as::<_, ExpiredUpload>(
         r#"
@@ -51,50 +58,23 @@ pub async fn expired_uploads_batch(
             expires_at,
             created_at
         FROM wyrd.storage_multipart_uploads
-        WHERE status IN ('pending', 'initiating')
-          AND expires_at < now()
-        ORDER BY expires_at ASC
+        WHERE (status = 'pending' AND expires_at < now())
+           OR (status = 'initiating' AND created_at < now() - ($2::text || ' seconds')::interval)
+        ORDER BY
+            CASE
+                WHEN status = 'pending' THEN expires_at
+                ELSE created_at + ($2::text || ' seconds')::interval
+            END ASC
         LIMIT $1
         "#,
     )
     .bind(limit)
+    .bind(init_grace.as_secs().cast_signed())
     .fetch_all(admin_pool)
     .await
     .map_err(SqlError::from)?;
 
     Ok(rows)
-}
-
-/// Mark an upload aborted from a tenant-scoped admin operation.
-///
-/// Returns the number of rows updated. Zero indicates the upload was already
-/// in a terminal state (e.g., completed concurrently), which the caller should
-/// treat as a best-effort no-op rather than an error.
-///
-/// # Errors
-/// Returns [`SqlError`] when Postgres rejects the update.
-pub async fn mark_aborted_admin(
-    conn: &mut TenantConn<'_>,
-    id: Uuid,
-    reason: &str,
-) -> Result<u64, SqlError> {
-    let result = sqlx::query(
-        r#"
-        UPDATE wyrd.storage_multipart_uploads
-        SET status = 'aborted',
-            terminal_at = now(),
-            failure_reason = $2
-        WHERE id = $1
-          AND status IN ('pending', 'initiating')
-        "#,
-    )
-    .bind(id)
-    .bind(reason)
-    .execute(&mut **conn.transaction())
-    .await
-    .map_err(SqlError::from)?;
-
-    Ok(result.rows_affected())
 }
 
 /// Try to acquire the storage sweeper leader advisory lock.

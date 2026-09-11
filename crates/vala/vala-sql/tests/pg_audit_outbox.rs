@@ -100,23 +100,14 @@ mod pg_tests {
             );
         }
 
+        /// A written audit row can be retired, but never rewritten.
         #[tokio::test]
-        async fn append_only_trigger_rejects_delete_and_content_update() {
+        async fn immutability_trigger_rejects_content_update() {
             let (fixture, superuser, tenant) = setup().await;
             append(fixture.app_pool(), tenant, "op.a").await;
 
             // Probe via the BYPASSRLS migrator pool so the statement reaches the row
-            // and the append-only trigger — not RLS — is what rejects it.
-            let deleted =
-                sqlx::query("DELETE FROM vala.audit_outbox WHERE data_tenant_id = $1 AND seq = 1")
-                    .bind(tenant.as_uuid())
-                    .execute(&superuser)
-                    .await;
-            assert!(
-                deleted.is_err(),
-                "DELETE must be rejected by the append-only trigger"
-            );
-
+            // and the immutability trigger — not RLS — is what rejects it.
             let tampered = sqlx::query(
                 "UPDATE vala.audit_outbox SET operation = 'tampered'
               WHERE data_tenant_id = $1 AND seq = 1",
@@ -125,6 +116,88 @@ mod pg_tests {
             .execute(&superuser)
             .await;
             assert!(tampered.is_err(), "content UPDATE must be rejected");
+        }
+
+        /// The publisher reads the oldest bounded run and retires exactly it.
+        ///
+        /// Retirement is the only removal path, and repeating it after an
+        /// uncertain outcome removes nothing more — the property audit
+        /// recovery depends on.
+        #[tokio::test]
+        async fn publication_batch_is_bounded_and_retirement_is_idempotent() {
+            let (fixture, _superuser, tenant) = setup().await;
+            append(fixture.app_pool(), tenant, "op.a").await;
+            append(fixture.app_pool(), tenant, "op.b").await;
+            append(fixture.app_pool(), tenant, "op.c").await;
+
+            let mut conn = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant)
+                .await
+                .unwrap();
+            let batch = vala_sql::queries::audit_outbox::list_publication_batch(&mut conn, 2)
+                .await
+                .unwrap();
+            assert_eq!(
+                batch.iter().map(|row| row.seq).collect::<Vec<_>>(),
+                vec![1, 2],
+                "the batch is the oldest contiguous run, bounded by the limit"
+            );
+
+            let retired = vala_sql::queries::audit_outbox::retire_published(&mut conn, 1, 2)
+                .await
+                .unwrap();
+            assert_eq!(retired, 2);
+            let replayed = vala_sql::queries::audit_outbox::retire_published(&mut conn, 1, 2)
+                .await
+                .unwrap();
+            assert_eq!(replayed, 0, "a replayed retirement removes nothing more");
+
+            let remaining = vala_sql::queries::audit_outbox::list_publication_batch(&mut conn, 10)
+                .await
+                .unwrap();
+            conn.commit().await.unwrap();
+            assert_eq!(
+                remaining.iter().map(|row| row.seq).collect::<Vec<_>>(),
+                vec![3],
+                "unpublished events survive retirement of the published prefix"
+            );
+        }
+
+        /// Retirement never reaches another tenant's rows.
+        #[tokio::test]
+        async fn retirement_is_tenant_scoped() {
+            let (fixture, _superuser, tenant_a) = setup().await;
+            let tenant_b = DataTenantId::new_v7();
+            fixture
+                .seed_additional_tenant_with_uuid(
+                    tenant_b,
+                    &format!("test-{}", tenant_b.as_uuid().simple()),
+                )
+                .await
+                .unwrap();
+            append(fixture.app_pool(), tenant_a, "a.1").await;
+            append(fixture.app_pool(), tenant_b, "b.1").await;
+
+            let mut conn = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant_a)
+                .await
+                .unwrap();
+            let retired = vala_sql::queries::audit_outbox::retire_published(&mut conn, 1, 1)
+                .await
+                .unwrap();
+            conn.commit().await.unwrap();
+            assert_eq!(retired, 1);
+
+            let mut other = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant_b)
+                .await
+                .unwrap();
+            let surviving = vala_sql::queries::audit_outbox::list_publication_batch(&mut other, 10)
+                .await
+                .unwrap();
+            other.commit().await.unwrap();
+            assert_eq!(
+                surviving.len(),
+                1,
+                "one tenant's retirement leaves another tenant's chain intact"
+            );
         }
 
         #[tokio::test]

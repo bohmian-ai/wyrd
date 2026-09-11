@@ -307,7 +307,6 @@ mod tests {
             "src/queries/storage/mod.rs",
             "src/queries/storage/multipart_uploads.rs",
             "src/queries/storage/artifact_metadata.rs",
-            "src/queries/storage/access_ledger.rs",
             "src/queries/storage/idempotency.rs",
             "src/queries/storage/admin/mod.rs",
             "src/queries/storage/admin/multipart_uploads.rs",
@@ -611,7 +610,6 @@ mod tests {
         let tenant_modules = [
             "multipart_uploads.rs",
             "artifact_metadata.rs",
-            "access_ledger.rs",
             "idempotency.rs",
         ];
 

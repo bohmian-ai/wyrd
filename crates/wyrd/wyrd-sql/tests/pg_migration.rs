@@ -28,7 +28,7 @@ mod pg_tests {
     use wyrd_sql::queries::storage;
     use wyrd_sql::{SqlError, SqlStore, TenantConn};
 
-    const SYSTEM_TENANT_MIGRATION_VERSION: i64 = 20260601000014;
+    const SYSTEM_TENANT_MIGRATION_VERSION: i64 = 20260601000015;
 
     /// The system-owner seed is exact, repeatable, and rejects ambiguous ownership.
     #[tokio::test]
@@ -782,9 +782,13 @@ mod pg_tests {
         .await
         .expect("expired upload row inserts");
 
-        let rows = storage::admin::multipart_uploads::expired_uploads_batch(store.pool(), 10)
-            .await
-            .expect("expired upload query succeeds");
+        let rows = storage::admin::multipart_uploads::expired_uploads_batch(
+            store.pool(),
+            10,
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        .expect("expired upload query succeeds");
         assert!(
             rows.iter().any(|row| row.id == upload_id),
             "expired upload must be selected for sweeping"
@@ -793,7 +797,7 @@ mod pg_tests {
         let mut conn = TenantConn::acquire(store.pool(), tenant)
             .await
             .expect("tenant connection opens");
-        storage::admin::multipart_uploads::mark_aborted_admin(&mut conn, upload_id, "test-sweeper")
+        storage::multipart_uploads::mark_aborted_if_open(&mut conn, upload_id, "test-sweeper")
             .await
             .expect("admin abort update succeeds");
         conn.commit().await.expect("admin abort commits");

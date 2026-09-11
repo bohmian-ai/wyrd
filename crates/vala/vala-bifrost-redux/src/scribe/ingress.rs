@@ -102,10 +102,10 @@ struct AdmittedRowContext {
         crate::scribe::material_plan::MAX_SOURCE_PLANS],
     /// Live prefix length within `native_sources`.
     native_source_count: usize,
-    /// Canonical built-in whose physical identity the decode must preserve.
+    /// Server-owned built-in whose declared physical contract the decode must
+    /// preserve, including its correlation policy.
     ///
-    /// `None` for a dynamic table or a pre-declared built-in, which keep the
-    /// existing catalog-fingerprint and managed-field policy.
+    /// `None` for a dynamic table, which keeps the default envelope.
     definition: Option<&'static crate::tables::BuiltinTableDefinition>,
 }
 
@@ -418,13 +418,17 @@ impl ScribeImpl {
         memory.transfer_category(MemoryCategory::Prepared)
     }
 
-    /// Resolve the canonical built-in one logical table names, when it has one.
+    /// Resolve the server-owned built-in one logical table names, when it is one.
     ///
-    /// Only a canonical signal table carries a value validator, so this is also
-    /// the single test for "does this write owe the canonical physical
-    /// contract". A dynamic or pre-declared table resolves to `None` and keeps
-    /// the existing catalog-fingerprint and managed-field policy.
-    fn canonical_definition(
+    /// Every built-in resolves here, not only the canonical signal tables: the
+    /// definition is what carries the table's declared correlation policy and
+    /// past-event-time exemption, and a table that appends no correlation
+    /// envelope must be stamped as such or its physical object would carry
+    /// columns its registered schema does not. The narrower canonical contract
+    /// — the value validator and the canonical physical fingerprint — is keyed
+    /// off `canonical_validator` at its own sites. A dynamic table resolves to
+    /// `None` and keeps the default envelope.
+    fn builtin_definition(
         table: &crate::catalog::TableRef,
     ) -> Option<&'static crate::tables::BuiltinTableDefinition> {
         crate::tables::builtin_table(
@@ -435,7 +439,6 @@ impl ScribeImpl {
                 .unwrap_or_default(),
             &table.name,
         )
-        .filter(|definition| definition.canonical_validator.is_some())
     }
 
     /// Prepares one request and dispatches its owned packet to its fixed shard.
@@ -477,7 +480,7 @@ impl ScribeImpl {
             }
         };
         let tenant = frame.principal.tenant_id;
-        let canonical_definition = Self::canonical_definition(&frame.table);
+        let builtin_definition = Self::builtin_definition(&frame.table);
         let request_id = uuid::Uuid::parse_str(frame.request_id.as_str()).map_err(|error| {
             lifecycle.refuse();
             ScribeError::Internal {
@@ -499,7 +502,7 @@ impl ScribeImpl {
                     native_schema_end: material_plan.native_schema_end,
                     native_sources: material_plan.sources,
                     native_source_count: material_plan.source_count,
-                    definition: canonical_definition,
+                    definition: builtin_definition,
                 },
             )
             .await

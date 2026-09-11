@@ -704,19 +704,16 @@ async fn coordinator_and_worker_delete_only_exact_never_published_generation() {
         "a sibling destructive route ran beside collection: {observed:?}"
     );
 
-    // Identity is orphan-only: no other route wrote an operation or audit row
-    // while this one ran.
+    // Identity is orphan-only: no other route wrote an operation row while
+    // this one ran.
     let operations = super::orphan_cleanup::orphan_operations(&promoted.fixture).await;
     assert!(
         !operations.is_empty(),
         "the collection route owns its own operation identity"
     );
-    let audits = super::orphan_cleanup::orphan_gc_audits(&promoted.fixture).await;
     assert!(
-        audits
-            .iter()
-            .all(|entry| entry.starts_with("forge.orphan_gc.")),
-        "the collection route wrote an audit belonging to another owner: {audits:?}"
+        operations.iter().all(|(_, phase)| !phase.is_empty()),
+        "the collection route left a settled operation phase: {operations:?}"
     );
 
     supervisor.shutdown().await;

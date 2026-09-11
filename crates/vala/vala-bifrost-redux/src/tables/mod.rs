@@ -842,9 +842,19 @@ mod tests {
             let schema = (definition.schema)();
             assert!(schema.field_with_name(WYRD_EVENT_TIME).is_ok());
             assert!(schema.field_with_name(DATA_TENANT_ID).is_ok());
+            // Signal tables partition hourly; retained audit history is a
+            // low-volume decision ledger and declares a daily partition.
+            let expected = if definition.correlation_policy == CorrelationPolicy::None {
+                TimeGranularityWire::Day
+            } else {
+                TimeGranularityWire::Hour
+            };
             assert_eq!(
                 (definition.physical_layout)().partition_granularity,
-                TimeGranularityWire::Hour
+                expected,
+                "{}.{}",
+                definition.namespace,
+                definition.name
             );
         }
     }
@@ -903,10 +913,15 @@ mod tests {
                 crate::catalog::layout::PhysicalLayout::resolve(&fqn, &schema, Some(&declared))
                     .unwrap_or_else(|error| panic!("{fqn} declares a canonical layout: {error}"));
 
+            let expected = if definition.correlation_policy == CorrelationPolicy::None {
+                crate::catalog::layout::TimeGranularity::Day
+            } else {
+                crate::catalog::layout::TimeGranularity::Hour
+            };
             assert_eq!(
                 canonical.granularity(),
-                crate::catalog::layout::TimeGranularity::Hour,
-                "{fqn} partitions hourly"
+                expected,
+                "{fqn} partitions at its declared granularity"
             );
             // Nothing is injected: the canonical order is exactly what the
             // built-in declared, in its declared order.

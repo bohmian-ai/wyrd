@@ -1070,7 +1070,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::limits::IngestLimits;
-    use super::{AuthContext, Gate, IngestError};
+    use super::{AuthContext, Gate, GateAudit, IngestError};
     use crate::contracts::DecodedOtlp;
     use arrow::array::Array as _;
     use arrow::record_batch::RecordBatch;
@@ -1349,6 +1349,49 @@ mod tests {
         }
     }
 
+    /// Recording [`GateAudit`] double standing in for the tenant-scoped writer.
+    ///
+    /// Gate refuses every write it cannot record, so a Gate under test needs a
+    /// sink before any authorization path is reachable at all. This keeps the
+    /// decisions in memory so a test can assert what was recorded.
+    struct RecordingAudit {
+        /// Every recorded decision as `(resource, outcome)`, in append order.
+        decisions: Mutex<Vec<(String, wyrd_spec::vala::api::AuditOutcome)>>,
+    }
+
+    impl RecordingAudit {
+        /// Builds one empty sink.
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                decisions: Mutex::new(Vec::new()),
+            })
+        }
+
+        /// Copies the recorded decisions out for assertion.
+        fn decisions(&self) -> Vec<(String, wyrd_spec::vala::api::AuditOutcome)> {
+            self.decisions
+                .lock()
+                .expect("recording audit lock is uncontended")
+                .clone()
+        }
+    }
+
+    #[wyrd_tonic::tonic::async_trait]
+    impl GateAudit for RecordingAudit {
+        async fn append_write_decision(
+            &self,
+            _auth: &AuthContext,
+            resource: &str,
+            outcome: wyrd_spec::vala::api::AuditOutcome,
+        ) -> Result<(), IngestError> {
+            self.decisions
+                .lock()
+                .expect("recording audit lock is uncontended")
+                .push((resource.to_owned(), outcome));
+            Ok(())
+        }
+    }
+
     struct CountingScribe {
         calls: Arc<AtomicUsize>,
         /// Row count of every canonical batch Gate handed to Scribe, in order.
@@ -1548,11 +1591,30 @@ mod tests {
     #[tokio::test]
     async fn gate_enforces_bifrost_record_write() {
         let scribe_calls = Arc::new(AtomicUsize::new(0));
-        let gate = Gate::with_test_scribe(
+        // A Gate that cannot record its decision refuses before evaluating one,
+        // so an unrecorded write never reaches Scribe.
+        let unrecorded = Gate::with_test_scribe(
             Arc::new(CountingScribe::new(Arc::clone(&scribe_calls))),
             test_interceptor(),
             IngestLimits::default(),
         );
+        let error = unrecorded
+            .ingest_decoded_resource_spans(
+                &auth_context(true),
+                decoded_trace(ExportTraceServiceRequest::default()),
+            )
+            .await
+            .expect_err("a Gate with no audit sink must fail closed");
+        assert!(matches!(error, IngestError::AuditUnavailable(_)));
+        assert_eq!(scribe_calls.load(Ordering::Relaxed), 0);
+
+        let audit = RecordingAudit::new();
+        let gate = Gate::with_test_scribe(
+            Arc::new(CountingScribe::new(Arc::clone(&scribe_calls))),
+            test_interceptor(),
+            IngestLimits::default(),
+        )
+        .with_audit(Arc::clone(&audit) as Arc<dyn GateAudit>);
 
         let error = gate
             .ingest_decoded_resource_spans(
@@ -1563,6 +1625,15 @@ mod tests {
             .expect_err("permission must be denied");
         assert!(matches!(error, IngestError::RbacDenied { .. }));
         assert_eq!(scribe_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            audit
+                .decisions()
+                .iter()
+                .map(|decision| decision.1)
+                .collect::<Vec<_>>(),
+            vec![wyrd_spec::vala::api::AuditOutcome::Denied],
+            "the refusal is recorded before it is returned"
+        );
     }
 
     #[tokio::test]
@@ -1619,7 +1690,8 @@ mod tests {
         let scribe = Arc::new(CountingScribe::new(Arc::clone(&scribe_calls)));
         let rows = Arc::clone(&scribe.rows);
         let card_refs = Arc::clone(&scribe.card_refs);
-        let gate = Gate::with_test_scribe(scribe, test_interceptor(), IngestLimits::default());
+        let gate = Gate::with_test_scribe(scribe, test_interceptor(), IngestLimits::default())
+            .with_audit(RecordingAudit::new() as Arc<dyn GateAudit>);
 
         let outcome = gate
             .ingest_decoded_resource_spans(
@@ -1664,7 +1736,8 @@ mod tests {
             Arc::new(CountingScribe::new(Arc::clone(&scribe_calls))),
             test_interceptor(),
             IngestLimits::default(),
-        );
+        )
+        .with_audit(RecordingAudit::new() as Arc<dyn GateAudit>);
 
         let outcome = gate
             .ingest_decoded_resource_spans(

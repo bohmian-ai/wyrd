@@ -564,7 +564,10 @@ fn decode_rows(
             table: "resolved ingress table".to_owned(),
         });
     }
-    if let Some(definition) = context.definition {
+    if let Some(definition) = context
+        .definition
+        .filter(|definition| definition.canonical_validator.is_some())
+    {
         enforce_canonical_source_contract(rows, definition)?;
     }
     validate_card_scope(rows, context.principal)?;
@@ -854,24 +857,29 @@ fn stamp_correlation_columns(
         .map(|index| Arc::clone(rows.column(index)));
     let caller_run_id = caller_run_id_column(rows)?;
     let server_owned = server_owned_columns();
-    let card_uids = resolve_card_uids(rows, principal, row_count)?;
     let mut fields = user_fields(rows, &server_owned);
     let mut columns = user_columns(rows, &server_owned);
-    fields.push(Field::new(RUN_ID, DataType::Utf8, true));
-    columns.push(
-        caller_run_id.unwrap_or_else(|| {
+    // A table whose rows carry their own identity declares
+    // `CorrelationPolicy::None`, and its registered physical schema has no
+    // envelope slots at all. Stamping one anyway would seal an object with more
+    // columns than the table it is promoted into.
+    let appends_envelope = correlation_envelope_applies(context);
+    if appends_envelope {
+        let card_uids = resolve_card_uids(rows, principal, row_count)?;
+        fields.push(Field::new(RUN_ID, DataType::Utf8, true));
+        columns.push(caller_run_id.unwrap_or_else(|| {
             Arc::new(StringArray::from(vec![None::<&str>; row_count])) as ArrayRef
-        }),
-    );
-    columns.push(Arc::new(StringArray::from(card_uids)) as ArrayRef);
-    columns.push(Arc::new(StringArray::from(vec![
-        principal.id.to_string();
-        row_count
-    ])));
-    columns.push(Arc::new(StringArray::from(vec![
-        request_id.as_str();
-        row_count
-    ])));
+        }));
+        columns.push(Arc::new(StringArray::from(card_uids)) as ArrayRef);
+        columns.push(Arc::new(StringArray::from(vec![
+            principal.id.to_string();
+            row_count
+        ])));
+        columns.push(Arc::new(StringArray::from(vec![
+            request_id.as_str();
+            row_count
+        ])));
+    }
     append_managed_columns(
         &mut fields,
         &mut columns,
@@ -919,7 +927,9 @@ fn stamp_correlation_columns(
         })
         .collect::<Result<Vec<_>, _>>()?;
     let stamped = RecordBatch::try_new(physical, columns).map_err(|_| ScribeError::InvalidFrame)?;
-    enforce_canonical_physical_identity(&stamped, definition)?;
+    if definition.canonical_validator.is_some() {
+        enforce_canonical_physical_identity(&stamped, definition)?;
+    }
     Ok(stamped)
 }
 
@@ -1173,6 +1183,19 @@ fn resolve_card_uids(
     Ok(resolved)
 }
 
+/// Reports whether this write appends the universal correlation envelope.
+///
+/// The envelope is the default: a dynamic table has no declaration to consult
+/// and keeps it. A built-in that declares [`CorrelationPolicy::None`] carries
+/// its own identity columns instead, and its registered physical schema has no
+/// envelope slots — so stamping one would seal an object wider than the table
+/// it is promoted into.
+fn correlation_envelope_applies(context: &DecodeContext<'_>) -> bool {
+    context.definition.is_none_or(|definition| {
+        definition.correlation_policy != crate::tables::CorrelationPolicy::None
+    })
+}
+
 /// Appends the always-server-owned managed columns to a partially-stamped batch.
 ///
 /// The receipt timestamp, batch id, row ordinal, tenant, card uid, principal,
@@ -1206,10 +1229,14 @@ fn append_managed_columns(
 ) -> Result<(), ScribeError> {
     let batch_id = context.batch_id;
     let start_row_ordinal = context.start_row_ordinal;
+    if correlation_envelope_applies(context) {
+        fields.extend([
+            Field::new(CARD_UID, DataType::Utf8, true),
+            Field::new(PRINCIPAL_ID, DataType::Utf8, false),
+            Field::new(WYRD_REQUEST_ID, DataType::Utf8, false),
+        ]);
+    }
     fields.extend([
-        Field::new(CARD_UID, DataType::Utf8, true),
-        Field::new(PRINCIPAL_ID, DataType::Utf8, false),
-        Field::new(WYRD_REQUEST_ID, DataType::Utf8, false),
         Field::new(
             WYRD_EVENT_TIME,
             DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),

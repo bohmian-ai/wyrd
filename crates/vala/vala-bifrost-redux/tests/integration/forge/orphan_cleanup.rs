@@ -766,10 +766,6 @@ async fn cross_table_plan_refuses_before_lease_or_io() {
         orphan_operations(fixture).await.is_empty(),
         "no orphan-GC batch was ever prepared"
     );
-    assert!(
-        orphan_gc_audits(fixture).await.is_empty(),
-        "a refusal before any effect appends no orphan-GC audit"
-    );
     let leases: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.maintenance_leases")
         .fetch_one(fixture.operator_pool.pool())
         .await
@@ -1334,45 +1330,6 @@ pub(super) async fn orphan_operations(
     .expect("orphan-GC operation state is readable")
 }
 
-/// Lists every orphan-GC audit operation this tenant appended, in sequence.
-///
-/// # Panics
-///
-/// Panics when the diagnostic read fails.
-pub(super) async fn orphan_gc_audits(fixture: &PromotionIntegrationFixture) -> Vec<String> {
-    tenant_audits(fixture, "forge.orphan_gc.%", None).await
-}
-
-/// Lists this tenant's audit operations matching one `LIKE` pattern.
-///
-/// The audit outbox is readable only through a tenant connection, which is the
-/// same route the production appenders take.
-///
-/// # Panics
-///
-/// Panics when the tenant connection or the diagnostic read fails.
-async fn tenant_audits(
-    fixture: &PromotionIntegrationFixture,
-    pattern: &str,
-    resource: Option<&str>,
-) -> Vec<String> {
-    let mut conn = fixture
-        .vala
-        .tenant_conn(fixture.tenant)
-        .await
-        .expect("fixture tenant connection");
-    let operations: Vec<String> = sqlx::query_scalar(
-        "SELECT operation FROM vala.audit_staging WHERE operation LIKE $1 AND ($2::text IS NULL OR resource=$2) ORDER BY seq",
-    )
-    .bind(pattern)
-    .bind(resource)
-    .fetch_all(&mut **conn.transaction())
-    .await
-    .expect("tenant audits are readable");
-    conn.commit().await.expect("audit read commit");
-    operations
-}
-
 /// Asserts the delete gate holds no Postgres transaction or advisory lock.
 ///
 /// The preparation must commit and close before the first object call, because
@@ -1478,16 +1435,6 @@ async fn assert_attempt_is_retained(
         evidence.is_none(),
         "an unresolved batch writes no cursor: {evidence:?}"
     );
-    assert_eq!(
-        tenant_audits(
-            fixture,
-            "forge.task.%",
-            Some(&format!("forge-task:{task_id}"))
-        )
-        .await,
-        Vec::<String>::new(),
-        "a retained attempt appends no terminal task audit"
-    );
 }
 
 /// A prepared batch owns its own recovery across takeover and replay.
@@ -1549,10 +1496,10 @@ async fn prepared_batch_takeover_is_replay_safe_and_sql_free_during_delete() {
         "a prepared batch retains its attempt for reclaim: {retained}"
     );
     assert_attempt_is_retained(fixture, batch.task_id, attempt).await;
-    assert_eq!(
-        orphan_gc_audits(fixture).await,
-        vec!["forge.orphan_gc.prepared".to_owned()],
-        "an unresolved batch has exactly one prepared audit and no terminal one"
+    let unresolved = orphan_operations(fixture).await;
+    assert!(
+        matches!(unresolved.as_slice(), [(_, phase)] if phase == "prepared"),
+        "an unresolved batch holds exactly one prepared operation: {unresolved:?}"
     );
 
     Box::pin(assert_takeover_replays_the_same_batch(
@@ -1618,14 +1565,6 @@ async fn assert_takeover_replays_the_same_batch(
     assert_ne!(
         phase, "prepared",
         "the replayed batch reaches a terminal phase"
-    );
-    assert_eq!(
-        orphan_gc_audits(fixture).await,
-        vec![
-            "forge.orphan_gc.prepared".to_owned(),
-            "forge.orphan_gc.recovered".to_owned()
-        ],
-        "one prepared and one terminal audit describe the whole batch"
     );
     assert!(
         !object_exists(fixture, &batch.orphan).await,

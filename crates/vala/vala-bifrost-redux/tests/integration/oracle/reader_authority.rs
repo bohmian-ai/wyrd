@@ -338,14 +338,15 @@ impl AuthorityFixture {
         (headers, members)
     }
 
-    /// Waits until one backend is queued behind this epoch's exact row.
+    /// Waits until one backend is queued behind this epoch's retirement.
     ///
-    /// A writer that must wait for a row first takes a `tuple` lock naming the
-    /// relation, page, and tuple it wants, so this is direct evidence that the
-    /// retiring delete reached *this* row and cannot return. The probe is
-    /// narrowed to the current database and the exact `ctid` because other
-    /// epoch writers elsewhere in the cluster would otherwise make a
-    /// relation-only signal ambiguous.
+    /// A backend that reached the epoch row and cannot return holds a granted
+    /// write lock on `vala.oracle_reader_epochs` while waiting ungranted on the
+    /// transaction that owns the row it needs. Pairing the two in one backend
+    /// is what makes this direct evidence about *this* relation rather than any
+    /// blocked query in the cluster: Postgres only escalates to a `tuple` lock
+    /// when a second waiter queues behind the first, so waiting on that shape
+    /// alone would depend on how many writers happened to contend.
     ///
     /// # Panics
     ///
@@ -357,9 +358,8 @@ impl AuthorityFixture {
             .superuser_pool()
             .await
             .expect("superuser pool");
-        let (page, tuple): (i32, i32) = sqlx::query_as(
-            "SELECT (ctid::text::point)[0]::int, (ctid::text::point)[1]::int \
-               FROM vala.oracle_reader_epochs \
+        sqlx::query_scalar::<_, i32>(
+            "SELECT 1 FROM vala.oracle_reader_epochs \
               WHERE node_id = $1 AND fencing_token = $2",
         )
         .bind(self.node_id)
@@ -367,19 +367,19 @@ impl AuthorityFixture {
         .fetch_one(&pool)
         .await
         .expect("the invalidated epoch row is still addressable");
-        let tuple = i16::try_from(tuple).expect("tuple ordinal fits");
         let deadline = tokio::time::Instant::now() + SETTLE_BUDGET;
         loop {
             let waiters: i64 = sqlx::query_scalar(
-                "SELECT count(*) FROM pg_locks \
-                  WHERE locktype = 'tuple' \
-                    AND database = (SELECT oid FROM pg_database \
-                                     WHERE datname = current_database()) \
-                    AND relation = 'vala.oracle_reader_epochs'::regclass \
-                    AND page = $1 AND tuple = $2",
+                "SELECT count(*) FROM pg_locks AS waiting \
+                   JOIN pg_locks AS held ON held.pid = waiting.pid \
+                  WHERE NOT waiting.granted \
+                    AND waiting.locktype IN ('tuple', 'transactionid') \
+                    AND held.granted \
+                    AND held.locktype = 'relation' \
+                    AND held.database = (SELECT oid FROM pg_database \
+                                          WHERE datname = current_database()) \
+                    AND held.relation = 'vala.oracle_reader_epochs'::regclass",
             )
-            .bind(page)
-            .bind(tuple)
             .fetch_one(&pool)
             .await
             .expect("epoch row waiters counted");

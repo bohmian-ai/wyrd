@@ -4,10 +4,10 @@ title: Migrate every public Python owner to the shared Wyrd error boundary
 kind: implementation
 status: proposed
 spec: SPEC-py-error-refactor
-spec_revision: 2
+spec_revision: 3
 depends_on: [PYERR-T01]
-requirements: [REQ-001, REQ-004, REQ-005, REQ-006]
-acceptance: [AC-003, AC-004, AC-005]
+requirements: [REQ-001, REQ-002, REQ-004, REQ-005, REQ-006]
+acceptance: [AC-001, AC-003, AC-004, AC-005]
 ---
 
 # Public Python error migration
@@ -25,6 +25,9 @@ Required execution skill: `$wyrd-implement`.
 
 - A user-callable operation's Wyrd-owned failure must become a catalog-backed
   `WyrdError` before crossing the shared adapter.
+- Before migrating owners, remove the aggregate Python `problem` attribute
+  added by PYERR-T01 while retaining `WyrdError::as_problem_json()` as the
+  canonical RFC 9457 payload generator.
 - Raw `PyResult` and `PyErr` remain only for the intrinsic PyO3/interpreter
   cases fixed by REQ-005. Do not attempt to replace automatic extraction,
   registration, garbage-collection, import, or deliberately preserved callback
@@ -52,6 +55,8 @@ Required execution skill: `$wyrd-implement`.
   `wyrd-interfaces`, `wyrd-cards`, `wyrd-config`, and `wyrd-testing`
 - Public package projections and exception construction under
   `python/py-wyrd/python/wyrd`, including Bifrost and schema helpers
+- Python-boundary guidance in
+  `architecture/references/languages/pyo3-boundaries.md`
 - Native registration under `python/py-wyrd/src`
 - Generated Python stubs and the focused negative tests for each touched owner
   family
@@ -67,6 +72,13 @@ Python method changes to `WyrdPyResult<T>`, imports the shared adapter from
 `WyrdError`, and lets the shared adapter perform the final `PyErr` projection.
 Delete the replaced adapter or projector in the same edit; do not leave a
 forwarder or compatibility alias.
+
+First remove the aggregate `problem` attribute from the shared Python
+exception, generated stubs, focused tests, and Python-boundary documentation.
+Keep the eight direct attributes `code`, `message`, `detail`, `details`,
+`remediation`, `status`, `title`, and `type`, with values projected from the
+canonical problem payload. Do not change the HTTP problem payload or
+`WyrdError::as_problem_json()`.
 
 Apply that replacement across the previously identified owner slices:
 
@@ -119,29 +131,33 @@ is incomplete implementation.
 
 ## Approach
 
-1. Classify existing raw Python error sites as Wyrd-owned public failures or
+1. Remove the aggregate Python `problem` attribute and align its focused tests,
+   generated stubs, and Python-boundary documentation with the eight-field
+   direct exception contract.
+2. Classify existing raw Python error sites as Wyrd-owned public failures or
    intrinsic PyO3/interpreter plumbing according to REQ-005.
-2. Convert each owner-local failure explicitly into the derive-backed catalog,
+3. Convert each owner-local failure explicitly into the derive-backed catalog,
    change user-callable operations to `WyrdPyResult<T>`, and rely on the shared
    `WyrdPyError -> PyErr` conversion.
-3. Remove superseded result aliases, handwritten metadata accessors,
+4. Remove superseded result aliases, handwritten metadata accessors,
    owner-local exception builders, generic Wyrd-owned `ValueError` or
    `RuntimeError` construction, silent error swallowing, and the Bifrost
    exception hierarchy.
-4. Route pure-Python Wyrd error construction through catalog-backed native
+5. Route pure-Python Wyrd error construction through catalog-backed native
    behavior and align public exports with the single catch boundary.
-5. Regenerate stubs and update only focused negative tests that assert the
+6. Regenerate stubs and update only focused negative tests that assert the
    affected error contract, including representative Vala, Skald, Wyrd-owner,
    and test-harness paths.
-6. Inspect the final production-source inventory to prove remaining raw
+7. Inspect the final production-source inventory to prove remaining raw
    `PyResult`, `PyErr`, and native Python exception construction is confined to
    the approved intrinsic cases.
 
 ## Acceptance Criteria
 
 - Every Wyrd-owned failure from every user-callable production Python owner is
-  catchable as the shared `WyrdError` and exposes the complete canonical
-  problem shape.
+  catchable as the shared `WyrdError` and exposes `code`, `message`, `detail`,
+  `details`, `remediation`, `status`, `title`, and `type`, but no aggregate
+  `problem` attribute.
 - `WyrdTestServer` uses the same contract for its Wyrd-owned failures while
   remaining absent from production wheels.
 - No reachable owner-local public metadata projector, partial Python
@@ -154,11 +170,12 @@ is incomplete implementation.
   `IncompleteQueryStreamError`, or `NoCredentialsError`; callers distinguish
   their catalog-backed failures by stable code through `WyrdError`.
 - Existing centrally selected domain subclasses, if retained, remain
-  `WyrdError` subclasses and contain the same complete shared projection.
+  `WyrdError` subclasses and contain the same eight-field shared projection.
 - Automatic Python argument/type failures and deliberately preserved user
   callback exceptions retain their established Python behavior.
 - Public imports and generated stubs match runtime behavior, including the
-  complete shared error fields and removal of the Bifrost hierarchy.
+  eight shared error fields, absence of `problem`, and removal of the Bifrost
+  hierarchy.
 - Successful Python behavior, values, GIL release, async wrappers, callbacks,
   and production-wheel composition do not regress.
 - A post-implementation broad source audit accounts for every remaining raw

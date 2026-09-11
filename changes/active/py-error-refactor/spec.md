@@ -1,6 +1,6 @@
 ---
 id: SPEC-py-error-refactor
-revision: 2
+revision: 3
 status: approved
 ---
 
@@ -10,7 +10,7 @@ status: approved
 
 Every Wyrd-owned failure exposed by a public Python operation shall raise the
 same structured Wyrd error contract. Python callers shall be able to catch the
-shared `WyrdError`, inspect one complete machine-readable problem shape, and
+shared `WyrdError`, inspect one coherent machine-readable error shape, and
 act on a stable catalog code regardless of which Wyrd, Skald, or Vala owner
 produced the failure.
 
@@ -81,10 +81,11 @@ of the shared Python `WyrdError` and exposes values derived from
 - `status`
 - `title`
 - `type`
-- `problem`
 
-The direct attributes and the full problem payload shall agree. Public callers
-shall distinguish durable failures by stable `code`, not error text.
+The direct attributes shall agree with their corresponding members in
+`WyrdError::as_problem_json()`. The Python exception shall not expose a separate
+`problem` attribute containing the aggregate payload. Public callers shall
+distinguish durable failures by stable `code`, not error text.
 
 ### REQ-003 — Catalog ownership is complete
 
@@ -98,9 +99,10 @@ was absent from the catalog.
 ### REQ-004 — No parallel public projection
 
 Approved Python owner crates and pure-Python package code shall not hand-write
-public `code`, `status`, `title`, `remediation`, `type`, `problem`, or exception
-selection logic. They shall not directly construct `PyValueError`,
-`PyRuntimeError`, or another generic Python exception for a Wyrd-owned failure.
+public `code`, `status`, `title`, `remediation`, `type`, aggregate problem
+payload, or exception selection logic. They shall not directly construct
+`PyValueError`, `PyRuntimeError`, or another generic Python exception for a
+Wyrd-owned failure.
 
 Existing owner-local converters, result wrappers, and partial pure-Python
 constructors shall be removed once their callers use the shared adapter.
@@ -169,7 +171,9 @@ their attributes through the shared projection.
 ## Expensive-to-reverse decisions and ownership
 
 1. `wyrd-spec` is the sole owner of stable Wyrd error metadata and problem
-   semantics while remaining PyO3-free.
+   semantics while remaining PyO3-free. `WyrdError::as_problem_json()` remains
+   the canonical RFC 9457 payload generator, but the Python exception does not
+   expose that aggregate payload as a `problem` attribute.
 2. `wyrd-utils` owns the sole generic Rust-to-Python Wyrd error adapter and
    exception construction. Its shared cross-crate names are `WyrdPyError` and
    `WyrdPyResult<T>`, and its existing `wyrd_error_to_py_err` remains the sole
@@ -187,7 +191,8 @@ their attributes through the shared projection.
 ### AC-001 — Shared adapter and complete shape
 
 Focused Rust and Python tests prove the shared adapter raises `WyrdError` with
-all nine required attributes and an agreeing RFC 9457 problem payload.
+the eight required direct attributes, without a `problem` attribute, and that
+their values agree with the canonical RFC 9457 payload projection.
 
 ### AC-002 — Catalog preservation
 
@@ -221,6 +226,11 @@ None.
 
 ## Revision history
 
+- **Revision 3 — 2026-09-11 — approved.** The user removed the Python
+  exception's aggregate `problem` convenience attribute. Task 01 remains the
+  completed revision-2 foundation; Task 02 first removes that attribute before
+  continuing migration. `WyrdError::as_problem_json()` remains the canonical
+  RFC 9457 payload generator.
 - **Revision 2 — 2026-09-10 — approved.** The user fixed the exact shared
   cross-crate adapter shape, required reuse and expansion of the existing
   `wyrd-utils` converter, and required deletion or replacement of stale

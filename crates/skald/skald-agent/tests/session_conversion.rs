@@ -355,8 +355,8 @@ fn session_turn_tool_role_none_call_id_produces_empty_string() {
 }
 
 /// Every agent failure must project onto a distinct, non-degraded catalog
-/// variant: the public Python, HTTP, and MCP boundaries read their metadata
-/// from that projection alone.
+/// variant: every public Wyrd boundary reads its metadata from that
+/// projection alone.
 #[test]
 fn agent_errors_project_onto_the_catalog() {
     let cases: Vec<(AgentError, &str)> = vec![

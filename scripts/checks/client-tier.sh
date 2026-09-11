@@ -94,7 +94,7 @@ if rg -n 'wyrd_spec|wyrd-' crates/skald \
   --glob '!crates/skald/skald-observer/**' \
   --glob '!crates/skald/skald-agent/**' \
   --glob '!crates/skald/skald-agent/Cargo.toml' \
-  --glob '!crates/skald/skald-tool/Cargo.toml' \
+  --glob '!crates/skald/skald-tool/**' \
   --glob '!crates/skald/skald-providers/Cargo.toml' \
   --glob '!crates/skald/skald-workflow/**'; then
   echo 'Skald engine crates must remain free of Wyrd references outside locked boundary crates'

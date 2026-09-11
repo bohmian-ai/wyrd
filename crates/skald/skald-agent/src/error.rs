@@ -186,7 +186,7 @@ impl From<&AgentError> for WyrdError {
     /// Project an agent failure onto the derive-backed Wyrd catalog.
     ///
     /// This is the single source of public metadata for every agent failure
-    /// that crosses the Python, HTTP, CLI, or MCP boundary: the catalog owns
+    /// that crosses a public Wyrd boundary: the catalog owns
     /// `code`, `status`, `title`, and `remediation`, while this projection
     /// supplies the human-readable message and the structured `details`
     /// payload carrying the variant's own fields.

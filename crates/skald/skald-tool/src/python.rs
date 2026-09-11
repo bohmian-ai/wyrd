@@ -6,12 +6,30 @@ use std::cell::RefCell;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyModule};
 use serde_json::Value;
+use wyrd_spec::error::WyrdError;
+use wyrd_utils::py::{WyrdPyError, WyrdPyResult, py_err_to_wyrd_error};
 
 use crate::{AgentTool, ToolError, ToolRegistry, default_registry};
+
+/// Re-enter the catalog from a PyO3-originated failure at this boundary.
+///
+/// Extraction and conversion failures on caller-supplied tool declarations are
+/// classified by the shared converter, which preserves an already-structured
+/// Wyrd exception and otherwise records the Python type.
+fn from_py_err(error: PyErr) -> WyrdPyError {
+    Python::attach(|py| WyrdPyError::from(py_err_to_wyrd_error(py, error)))
+}
+
+/// Reject a caller-supplied tool declaration the registry cannot accept.
+fn invalid_declaration(detail: impl std::fmt::Display) -> WyrdPyError {
+    WyrdPyError::from(WyrdError::ToolInvalidSchema {
+        message: detail.to_string(),
+        details: serde_json::json!({ "boundary": "skald_tool_python" }),
+    })
+}
 
 enum ActiveRegistry {
     Scoped(Arc<ToolRegistry>),
@@ -133,9 +151,11 @@ pub fn _register_tool(
     input_schema: Py<PyAny>,
     output_schema: Py<PyAny>,
     callable: Py<PyAny>,
-) -> PyResult<()> {
-    let input_schema = wyrd_utils::py::pyobject_to_json(input_schema.bind(py))?;
-    let output_schema = wyrd_utils::py::pyobject_to_json(output_schema.bind(py))?;
+) -> WyrdPyResult<()> {
+    let input_schema =
+        wyrd_utils::py::pyobject_to_json(input_schema.bind(py)).map_err(from_py_err)?;
+    let output_schema =
+        wyrd_utils::py::pyobject_to_json(output_schema.bind(py)).map_err(from_py_err)?;
     let tool = Arc::new(PythonTool::new(
         name,
         description,
@@ -143,9 +163,7 @@ pub fn _register_tool(
         output_schema,
         callable,
     ));
-    active_registry()
-        .register(tool)
-        .map_err(|error| tool_error_to_py_err(py, error))
+    Ok(active_registry().register(tool)?)
 }
 
 /// Push a fresh Python tool registry scope.
@@ -167,14 +185,21 @@ pub fn _pop_tool_registry_scope() {
 /// Convert a pure-Python `_ToolCallable` wrapper into an executable tool.
 ///
 /// # Errors
-/// Returns Python extraction or JSON conversion failures.
-pub fn wrap_callable(py: Python<'_>, callable: Py<PyAny>) -> PyResult<Arc<dyn AgentTool>> {
+/// Returns `WYRD_TOOL_400_INVALID_SCHEMA` when the wrapper does not expose the
+/// `name`, `description`, `input_schema`, `output_schema`, and `fn` attributes
+/// the executable tool needs.
+pub fn wrap_callable(py: Python<'_>, callable: Py<PyAny>) -> WyrdPyResult<Arc<dyn AgentTool>> {
     let bound = callable.bind(py);
-    let name: String = bound.getattr("name")?.extract()?;
-    let description: String = bound.getattr("description")?.extract()?;
-    let input_schema = wyrd_utils::py::pyobject_to_json(&bound.getattr("input_schema")?)?;
-    let output_schema = wyrd_utils::py::pyobject_to_json(&bound.getattr("output_schema")?)?;
-    let fn_obj: Py<PyAny> = bound.getattr("fn")?.unbind();
+    let attribute = |name: &str| bound.getattr(name).map_err(invalid_declaration);
+    let name: String = attribute("name")?.extract().map_err(invalid_declaration)?;
+    let description: String = attribute("description")?
+        .extract()
+        .map_err(invalid_declaration)?;
+    let input_schema =
+        wyrd_utils::py::pyobject_to_json(&attribute("input_schema")?).map_err(from_py_err)?;
+    let output_schema =
+        wyrd_utils::py::pyobject_to_json(&attribute("output_schema")?).map_err(from_py_err)?;
+    let fn_obj: Py<PyAny> = attribute("fn")?.unbind();
     Ok(Arc::new(PythonTool::new(
         name,
         description,
@@ -187,24 +212,28 @@ pub fn wrap_callable(py: Python<'_>, callable: Py<PyAny>) -> PyResult<Arc<dyn Ag
 /// Build a Python `_ToolCallable` wrapper from a Rust tool.
 ///
 /// # Errors
-/// Returns Python object construction errors.
-pub fn tool_callable_py(py: Python<'_>, tool: Arc<dyn AgentTool>) -> PyResult<Py<PyAny>> {
-    let module = py.import("wyrd.agent.tool")?;
-    let cls = module.getattr("_ToolCallable")?;
-    let kwargs = PyDict::new(py);
-    let callable = Py::new(py, PyToolInvoker { tool: tool.clone() })?;
-    kwargs.set_item("fn", callable)?;
-    kwargs.set_item("name", tool.name())?;
-    kwargs.set_item("description", tool.description())?;
-    kwargs.set_item(
-        "input_schema",
-        wyrd_utils::py::json_to_pyobject(py, &tool.input_schema())?,
-    )?;
-    kwargs.set_item(
-        "output_schema",
-        wyrd_utils::py::json_to_pyobject(py, &tool.output_schema())?,
-    )?;
-    Ok(cls.call((), Some(&kwargs))?.unbind())
+/// Returns a catalog error when the interpreter refuses to import
+/// `wyrd.agent.tool` or to build the wrapper object.
+pub fn tool_callable_py(py: Python<'_>, tool: Arc<dyn AgentTool>) -> WyrdPyResult<Py<PyAny>> {
+    let build = || -> PyResult<Py<PyAny>> {
+        let module = py.import("wyrd.agent.tool")?;
+        let cls = module.getattr("_ToolCallable")?;
+        let kwargs = PyDict::new(py);
+        let callable = Py::new(py, PyToolInvoker { tool: tool.clone() })?;
+        kwargs.set_item("fn", callable)?;
+        kwargs.set_item("name", tool.name())?;
+        kwargs.set_item("description", tool.description())?;
+        kwargs.set_item(
+            "input_schema",
+            wyrd_utils::py::json_to_pyobject(py, &tool.input_schema())?,
+        )?;
+        kwargs.set_item(
+            "output_schema",
+            wyrd_utils::py::json_to_pyobject(py, &tool.output_schema())?,
+        )?;
+        Ok(cls.call((), Some(&kwargs))?.unbind())
+    };
+    build().map_err(from_py_err)
 }
 
 /// Register tool Python helpers.
@@ -226,17 +255,25 @@ struct PyToolInvoker {
 
 #[pymethods]
 impl PyToolInvoker {
-    fn __call__(&self, py: Python<'_>, kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<Py<PyAny>> {
+    fn __call__(
+        &self,
+        py: Python<'_>,
+        kwargs: Option<&Bound<'_, PyDict>>,
+    ) -> WyrdPyResult<Py<PyAny>> {
         let args = match kwargs {
-            Some(kwargs) => wyrd_utils::py::pydict_to_json_value(kwargs)?,
+            Some(kwargs) => wyrd_utils::py::pydict_to_json_value(kwargs).map_err(from_py_err)?,
             None => serde_json::json!({}),
         };
         let tool = self.tool.clone();
-        let result = py.detach(|| wyrd_runtime::runtime().block_on(tool.invoke(args)));
-        match result {
-            Ok(value) => wyrd_utils::py::json_to_pyobject(py, &value),
-            Err(error) => Err(tool_error_to_py_err(py, error)),
-        }
+        let value = py.detach(|| wyrd_runtime::runtime().block_on(tool.invoke(args)))?;
+        wyrd_utils::py::json_to_pyobject(py, &value).map_err(from_py_err)
+    }
+}
+
+impl From<ToolError> for WyrdPyError {
+    /// Widen an executable-tool failure into the shared Python boundary error.
+    fn from(error: ToolError) -> Self {
+        Self::from(WyrdError::from(error))
     }
 }
 
@@ -248,23 +285,4 @@ fn active_registry() -> ActiveRegistry {
             .cloned()
             .map_or(ActiveRegistry::Default, ActiveRegistry::Scoped)
     })
-}
-
-fn tool_error_to_py_err(py: Python<'_>, error: ToolError) -> PyErr {
-    let detail = error.to_string();
-    match py
-        .get_type::<wyrd_utils::py::WyrdError>()
-        .call1((detail.clone(),))
-    {
-        Ok(exception) => {
-            let _ = exception.setattr("code", error.code());
-            let _ = exception.setattr("message", detail);
-            let _ = exception.setattr("status", error.status());
-            let _ = exception.setattr("http_status", error.status());
-            let _ = exception.setattr("title", error.title());
-            let _ = exception.setattr("remediation", error.remediation());
-            PyErr::from_value(exception)
-        }
-        Err(source) => PyRuntimeError::new_err(source.to_string()),
-    }
 }

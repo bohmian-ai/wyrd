@@ -174,8 +174,7 @@ impl Agent {
             agent = agent.with_session(wrap_session(py, session)?);
         }
         for tool in tools.unwrap_or_default() {
-            agent =
-                agent.with_tool(skald_tool::python::wrap_callable(py, tool).map_err(from_py_err)?);
+            agent = agent.with_tool(skald_tool::python::wrap_callable(py, tool)?);
         }
 
         if let Some(name) = name {
@@ -379,7 +378,7 @@ impl Agent {
     pub fn py_add_tool(&mut self, py: Python<'_>, tool: Py<PyAny>) -> WyrdPyResult<()> {
         let next = self
             .clone()
-            .with_tool(skald_tool::python::wrap_callable(py, tool).map_err(from_py_err)?);
+            .with_tool(skald_tool::python::wrap_callable(py, tool)?);
         *self = next;
         Ok(())
     }
@@ -389,7 +388,7 @@ impl Agent {
     pub fn py_set_tools(&mut self, py: Python<'_>, tools: Vec<Py<PyAny>>) -> WyrdPyResult<()> {
         let mut resolved = Vec::with_capacity(tools.len());
         for tool in tools {
-            resolved.push(skald_tool::python::wrap_callable(py, tool).map_err(from_py_err)?);
+            resolved.push(skald_tool::python::wrap_callable(py, tool)?);
         }
         *self = self.clone().with_tools(resolved);
         Ok(())
@@ -437,7 +436,7 @@ impl Agent {
             Some(description) => delegate.with_description(description).into_tool(),
             None => delegate.into_tool(),
         };
-        skald_tool::python::tool_callable_py(py, tool).map_err(from_py_err)
+        skald_tool::python::tool_callable_py(py, tool)
     }
 
     /// Register a before-agent callback in place.

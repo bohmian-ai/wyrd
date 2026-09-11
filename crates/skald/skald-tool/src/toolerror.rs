@@ -1,3 +1,5 @@
+use wyrd_spec::error::WyrdError;
+
 /// Owned metadata for a structured invocation failure.
 #[derive(Debug, thiserror::Error)]
 #[error("{detail}")]
@@ -71,55 +73,6 @@ impl ToolError {
         }
     }
 
-    /// Suggested HTTP status for this failure.
-    pub fn status(&self) -> u16 {
-        match self {
-            Self::NameTaken { .. } => 409,
-            Self::NotRegistered { .. } => 404,
-            Self::InvalidInput(_) => 422,
-            Self::StructuredInvocation(error) => error.status,
-            Self::Invocation { .. } | Self::OutputSerialization(_) => 500,
-        }
-    }
-
-    /// Stable problem-title text.
-    pub fn title(&self) -> String {
-        match self {
-            Self::NameTaken { .. } => "Tool name already registered".to_owned(),
-            Self::NotRegistered { .. } => "Tool name not registered".to_owned(),
-            Self::InvalidInput(_) => {
-                "Tool invocation input did not match the declared input schema".to_owned()
-            }
-            Self::Invocation { .. } => "Tool invocation failed during execution".to_owned(),
-            Self::StructuredInvocation(error) => error.title.clone(),
-            Self::OutputSerialization(_) => {
-                "Tool output could not be serialized to JSON".to_owned()
-            }
-        }
-    }
-
-    /// Operator-facing remediation hint.
-    pub fn remediation(&self) -> String {
-        match self {
-            Self::NameTaken { .. } => {
-                "Pick a unique tool name or clear the registry before registering the replacement.".to_owned()
-            }
-            Self::NotRegistered { .. } => {
-                "Register the tool (Tool::function + registry.register) before loading the agent, or call default_registry() before resolving agent tools.".to_owned()
-            }
-            Self::InvalidInput(_) => {
-                "Adjust the tool call arguments to match the schema returned by tool.input_schema().".to_owned()
-            }
-            Self::Invocation { .. } => {
-                "Check the tool's underlying error (cause); fix the tool implementation or its inputs.".to_owned()
-            }
-            Self::StructuredInvocation(error) => error.remediation.clone(),
-            Self::OutputSerialization(_) => {
-                "Ensure the Out type implements Serialize and produces a JSON-compatible value.".to_owned()
-            }
-        }
-    }
-
     /// Returns structured invocation detail when this failure carries it.
     #[must_use]
     pub fn detail(&self) -> Option<&str> {
@@ -143,9 +96,65 @@ impl ToolError {
 /// Result alias for executable tool operations.
 pub type ToolResult<T> = Result<T, ToolError>;
 
+impl From<ToolError> for WyrdError {
+    /// Project an owned tool failure onto the derive-backed Wyrd catalog.
+    fn from(error: ToolError) -> Self {
+        Self::from(&error)
+    }
+}
+
+impl From<&ToolError> for WyrdError {
+    /// Project a tool failure onto the derive-backed Wyrd catalog.
+    ///
+    /// The catalog owns every public metadata field, so this projection only
+    /// chooses the variant and supplies the message plus structured details.
+    /// A [`ToolError::StructuredInvocation`] already carries a stable code from
+    /// its owner, so it is reconstructed from that code where the catalog knows
+    /// it and otherwise preserved under `details.original_code`.
+    fn from(error: &ToolError) -> Self {
+        let message = error.to_string();
+        match error {
+            ToolError::InvalidInput(detail) => Self::ToolInvalidInput {
+                message,
+                details: serde_json::json!({ "reason": detail }),
+            },
+            ToolError::Invocation { detail, .. } => Self::ToolInvocationFailed {
+                message,
+                details: serde_json::json!({ "reason": detail }),
+            },
+            ToolError::StructuredInvocation(structured) => {
+                let details = structured
+                    .safe_details
+                    .clone()
+                    .unwrap_or_else(|| serde_json::json!({}));
+                Self::from_code(&structured.code, structured.detail.clone(), details.clone())
+                    .unwrap_or(Self::ToolInvocationFailed {
+                        message,
+                        details: serde_json::json!({
+                            "original_code": structured.code,
+                            "original_details": details,
+                        }),
+                    })
+            }
+            ToolError::OutputSerialization(detail) => Self::ToolOutputSerialization {
+                message,
+                details: serde_json::json!({ "reason": detail }),
+            },
+            ToolError::NameTaken { name } => Self::ToolNameTaken {
+                message,
+                details: serde_json::json!({ "tool": name }),
+            },
+            ToolError::NotRegistered { name, available } => Self::ToolNotRegistered {
+                message,
+                details: serde_json::json!({ "tool": name, "available": available }),
+            },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{StructuredInvocationError, ToolError};
+    use super::{StructuredInvocationError, ToolError, WyrdError};
 
     /// Structured invocation metadata remains available without parsing text.
     #[test]
@@ -159,10 +168,7 @@ mod tests {
             safe_details: Some(serde_json::json!({"permission": "bifrost_query:read"})),
         }));
         assert_eq!(error.code(), "WYRD_TEST_403_DENIED");
-        assert_eq!(error.status(), 403);
-        assert_eq!(error.title(), "Permission denied");
         assert_eq!(error.detail(), Some("missing query permission"));
-        assert_eq!(error.remediation(), "request the query role");
         let expected = serde_json::json!({"permission": "bifrost_query:read"});
         assert_eq!(error.safe_details(), Some(&expected));
     }
@@ -175,7 +181,9 @@ mod tests {
             cause: None,
         };
         assert_eq!(error.code(), "SKALD_TOOL_500_CALL");
-        assert_eq!(error.status(), 500);
+        let projected = WyrdError::from(&error);
+        assert_eq!(projected.code(), "WYRD_TOOL_500_CALL");
+        assert_eq!(projected.status(), 500);
     }
 
     /// Structured failures preserve their typed source for error-chain consumers.
@@ -193,6 +201,71 @@ mod tests {
         assert_eq!(source.to_string(), "terminal detail");
         assert!(error.to_string().contains("terminal detail"));
         assert_eq!(error.code(), "WYRD_TEST_500_STRUCTURED");
-        assert_eq!(error.status(), 500);
+    }
+
+    /// Every tool failure reaches a catalog variant, and a structured failure
+    /// whose code the catalog does not know keeps that code in `details`
+    /// instead of losing it.
+    #[test]
+    fn tool_errors_project_onto_the_catalog() {
+        let cases: Vec<(ToolError, &str)> = vec![
+            (
+                ToolError::InvalidInput("bad".to_owned()),
+                "WYRD_TOOL_422_INPUT",
+            ),
+            (
+                ToolError::Invocation {
+                    detail: "boom".to_owned(),
+                    cause: None,
+                },
+                "WYRD_TOOL_500_CALL",
+            ),
+            (
+                ToolError::OutputSerialization("bad".to_owned()),
+                "WYRD_TOOL_500_OUTPUT",
+            ),
+            (
+                ToolError::NameTaken {
+                    name: "echo".to_owned(),
+                },
+                "WYRD_TOOL_409_NAME_TAKEN",
+            ),
+            (
+                ToolError::NotRegistered {
+                    name: "echo".to_owned(),
+                    available: Vec::new(),
+                },
+                "WYRD_TOOL_404_NOT_REGISTERED",
+            ),
+            (
+                ToolError::StructuredInvocation(Box::new(StructuredInvocationError {
+                    code: "WYRD_AGENT_412_DELEGATION_DEPTH".to_owned(),
+                    status: 412,
+                    title: "Agent delegation depth exceeded".to_owned(),
+                    detail: "too deep".to_owned(),
+                    remediation: "reduce nesting".to_owned(),
+                    safe_details: None,
+                })),
+                "WYRD_AGENT_412_DELEGATION_DEPTH",
+            ),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(WyrdError::from(&error).code(), expected, "for {error:?}");
+        }
+
+        let unknown = ToolError::StructuredInvocation(Box::new(StructuredInvocationError {
+            code: "WYRD_TEST_403_DENIED".to_owned(),
+            status: 403,
+            title: "Permission denied".to_owned(),
+            detail: "missing query permission".to_owned(),
+            remediation: "request the query role".to_owned(),
+            safe_details: None,
+        }));
+        let projected = WyrdError::from(&unknown);
+        assert_eq!(projected.code(), "WYRD_TOOL_500_CALL");
+        assert_eq!(
+            projected.as_problem_json()["details"]["original_code"],
+            serde_json::Value::String("WYRD_TEST_403_DENIED".to_owned())
+        );
     }
 }

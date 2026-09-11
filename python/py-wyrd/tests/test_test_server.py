@@ -21,8 +21,9 @@ def test_construct_no_env_mutation():
 
 def test_bootstrap_service_raises_without_context_manager():
     srv = WyrdTestServer()
-    with pytest.raises(RuntimeError, match="not started"):
+    with pytest.raises(WyrdError, match="not started") as exc:
         srv.bootstrap_service([])
+    assert exc.value.code == "WYRD_TESTING_500_HARNESS_START"
 
 
 def test_enter_fails_without_db():

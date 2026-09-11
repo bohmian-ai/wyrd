@@ -5,7 +5,7 @@ import type { PageServerLoad } from './$types';
 export const load: PageServerLoad = ({ locals, url }) => {
   if (!locals.wyrd) reject('unauthenticated');
   const filters = Object.fromEntries(
-    ['q', 'folder', 'tag', 'selected'].map((key) => [key, url.searchParams.get(key) ?? ''])
+    ['q', 'folder', 'tag'].map((key) => [key, url.searchParams.get(key) ?? ''])
   );
   try {
     return { view: locals.wyrd.observeDashboards(filters), filters, problem: null };

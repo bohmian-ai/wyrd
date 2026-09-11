@@ -1,217 +1,77 @@
 ---
 name: wyrd-implement
-description: Execute or resume exactly one active, decision-complete non-UI Wyrd implementation task through verified completion or a genuine material-authority blocker in Rust, Python, TypeScript, PyO3, contracts, SDKs, server, CLI, MCP, registry, storage, Skald, Vala/Bifrost, codegen, or cross-language tests. Use when a current user instruction or approved task assigns one bounded change. Persist through compile, lint, test, fixture, command, and repository-managed local-environment failures. Do not use to plan, decompose, close an entire implementation plan, or implement Svelte UI work.
+description: Implement and verify one bounded Wyrd task or review-produced remediation task, owning reversible local decisions and making the smallest sufficient change.
 ---
 
 # Wyrd Implement
 
-Execute exactly one approved task through `COMPLETE` or a genuine material
-`BLOCKED` condition. Own reversible implementation mechanics. Do not redesign
-requirements or material boundaries.
+Implement one task, prove it, and inspect the final diff. Own reversible local
+technical decisions. Do not expand the task into another implementation plan.
 
-Use one fixed loop:
+## Establish the contract
 
-```text
-orient -> localize -> implement -> validate -> refine
-             ^                                  |
-             +----------------------------------+
-```
+Read the approved spec, the original task, and applicable repository authority.
+For remediation, also read the review verdict and the remediation task under
+`changes/active/<slug>/review/<review-name>/`. Treat the original task plus the
+validated findings as the contract; preserve portions already satisfying it.
 
-Test, compiler, formatter, Clippy, rustdoc, command, fixture, and local
-environment failures are refinement inputs. They are not terminal conditions
-by themselves.
+Read `AGENTS.md`, [agent rules](../../../architecture/agent-rules.md),
+[spec-driven development](../../../architecture/references/languages/spec-driven-development.md),
+[implementation execution](../../../architecture/references/languages/implementation-execution.md),
+and [testing workflows](../../../architecture/references/languages/testing-workflows.md).
+Load only references applicable to the changed surface. Follow CodeGraph
+instructions and inspect the nearest owner, callers, consumers, tests,
+manifests, generated projections, and `mise.toml`.
 
-`$name` denotes a Wyrd skill; load it with the `Skill` tool. `Luna`, `Terra`,
-and `Sol` in a task packet are risk tiers, not model names.
+A bounded direct instruction may be implemented without a change packet when
+the caller explicitly requests it and no expensive-to-reverse decision remains.
+Never use that exception to bypass an active approved spec.
 
-## When dispatched by $wyrd-implement-plan
+## Implement
 
-The orchestrator supplies the worktree path, execution branch, active task, and
-diff base. Work only inside that worktree and commit nothing — the orchestrator
-owns every commit, task-status change, and acceptance decision.
+Implement the smallest cohesive change satisfying the acceptance criteria. Make
+local decisions yourself, including helper decomposition, private signatures,
+module placement inside the established owner, local control flow, use of
+already-approved dependencies, and test or fixture structure. Reuse the nearest
+repository behavior before adding code, abstractions, configuration, features,
+or dependencies.
 
-Return a terminal `COMPLETE` or `BLOCKED` report. If you return a nonterminal
-progress report, the orchestrator will resume **this same agent** with your
-context intact rather than replacing you, so do not restate prior work or
-re-derive what you already established. Route material questions to the
-orchestrator, never to the user.
+For non-trivial behavior, work one observable scenario at a time:
 
-## Load the task and repository
+1. add or select the smallest test that fails for the missing behavior;
+2. implement enough production behavior to pass it;
+3. refactor only when needed for the task or repository rules; and
+4. continue until the acceptance criteria are covered.
 
-Before editing:
+Do not implement speculative requirements, optional improvements, or non-goals.
+Do not weaken tests, hide gate failures, add sleeps for synchronization, mock
+away required behavior, or hand-edit generated artifacts.
 
-1. Read the active task, referenced approved-plan context, and applicable
-   `AGENTS.md` files completely.
-2. For a standardized Wyrd task, read
-   `.claude/skills/wyrd-plan/references/task-packet-format.md` and validate its
-   parent plan directory. The task must be `Ready`.
-3. Read `architecture/agent-rules.md` and `architecture/wyrd-design.md`. Read
-   `architecture/wyrd-doctrine.mdx` before changing Wyrd contracts, APIs,
-   SDKs, CLI, MCP, docs, generated artifacts, or behavior.
-4. Read
-   `architecture/references/languages/implementation-execution.md`; it defines
-   material boundaries, verification equivalence, local-environment recovery,
-   living-task updates, test integrity, and completion evidence.
-5. Read `architecture/references/README.md`, then load only the other
-   architecture references required by the affected surface using the routing
-   table below. Read every selected reference completely and state the
-   decision it governs before editing.
-6. Inspect Git status and preserve unrelated user changes.
-7. Inspect `mise.toml`, manifests, package configuration, and lockfiles before
-   relying on commands, features, dependencies, or environment.
-8. When `.codegraph/` exists, use CodeGraph before grep, find, or manual source
-   discovery.
+Stop with `SPEC_REVISION_REQUIRED` only when correctness requires changing an
+approved outcome, public or persisted contract, architectural boundary,
+cross-service or concurrency semantics, security or tenancy rule,
+compatibility requirement, or another expensive-to-reverse decision. Otherwise
+resolve repository-local details and continue.
 
-Build a checklist from required changes, acceptance criteria, required tests,
-focused commands, and completion evidence. Continue until every item is
-checked or a material boundary prevents it.
+## Verify and record evidence
 
-### Architecture reference routing
+Run the smallest complete verification set required by `AGENTS.md`: focused
+tests, applicable owner or capability lanes, required journey or boundary
+checks, format and lint checks, `git diff --check`, and a final tracked and
+untracked diff audit. Derive corrected commands when task text is stale, without
+substituting weaker proof.
 
-| Reference | Load when the task touches |
-|---|---|
-| `architecture/references/languages/implementation-execution.md` | Every task: authority boundaries, verification recovery, test integrity, diff audit, and completion evidence |
-| `architecture/references/doctrine/positioning-and-vocabulary.md` | Card vocabulary, `CardRef`, v1 kinds, or removed concepts |
-| `architecture/references/doctrine/architecture-constraints.md` | Tier boundaries, deployment, or observation identity |
-| `architecture/references/architecture/patterns.md` | Crate placement and server/client/storage/provider/audit patterns |
-| `architecture/references/languages/rust-core.md` | Rust ownership, traits, async, allocation, and idioms |
-| `architecture/references/languages/pyo3-boundaries.md` | PyO3 classes, GIL, lifetimes, conversions, and registration |
-| `architecture/references/languages/errors.md` | Stable errors and boundary mappings |
-| `architecture/references/languages/python-api-and-stubs.md` | Python exports, stubs, package layout, and tests |
-| `architecture/references/languages/testing-workflows.md` | Test tiers, verification levels, and boundary checks |
-| `architecture/references/languages/agent-harness.md` | MCP and other agent-facing contracts |
-| `architecture/references/languages/typescript-guide.md` | `@wyrd/sdk` and napi conventions |
-| `architecture/references/domain/iceberg-bifrost.md` | Bifrost, Iceberg, DataFusion, and object storage |
+Append compact evidence to the task or remediation task:
 
-When an approved task explicitly supersedes a Wyrd design decision, update the
-named design authority with the implementation and update doctrine when the
-principle changes. Otherwise follow current design and classify an implicit
-conflict as material.
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| `<criterion>` | `<location>` | `<test or check>` | `PASS | FAIL` |
 
-## Enforce the material boundary
+Also confirm that every non-goal remained excluded and no unrelated file was
+changed. Record commands and material limits without narrating implementation.
 
-Classify every mismatch before deciding whether to continue:
-
-| Class | Examples | Authority |
-|---|---|---|
-| Local and reversible | Private helpers, rustdoc, formatting, diff-caused Clippy, mechanical callers, existing fixtures | Implement, fix, and rerun |
-| Bounded correction | Equivalent command/filter, current private symbol, adjacent fixture inside the owner, repository-managed local environment, small touched-file lint | Proceed, record in the task, and continue |
-| Material | Public/wire/persisted contract, migration or destructive behavior, dependency or Cargo feature, auth/tenancy/policy/audit semantics, ownership redesign, changed acceptance outcome | Stop before the change and request authority |
-
-Expected paths and private symbol names are not a strict whitelist. Add an
-adjacent private implementation or test-support file inside the established
-owner when it is the smallest way to satisfy acceptance. Do not cross a
-prohibited material boundary.
-
-Exact verification commands are recipes unless the task explicitly makes the
-exact lane, feature set, or environment normative. A defective recipe may be
-replaced with equivalent non-weaker proof.
-
-## Execute the loop
-
-### Orient
-
-- Confirm objective, requirements, non-goals, allowed and prohibited scope,
-  material contracts, acceptance criteria, tests, features, and commands.
-- Reconstruct prior progress from the task, current diff, and verification
-  evidence after any interruption or context compaction.
-
-### Localize
-
-- Locate current owners, callers, consumers, dispatch, fixtures, and tests.
-- Prefer current repository reality over stale private paths or helper names.
-- Reuse existing owners, abstractions, errors, fixtures, and support exports.
-
-Before editing Rust, identify the owning concrete struct or domain type,
-earned async boundaries, nearest structural precedent, and rustdoc obligations
-for every touched item.
-
-### Implement
-
-- Make the smallest cohesive in-scope change for the task at hand.
-- Preserve normative behavior, operation order, transactions, concurrency,
-  cancellation, side effects, error mapping, and invariants.
-- Follow `AGENTS.md`; do not duplicate its language, ownership, or test rules
-  here.
-- Write required tests with the implementation.
-- Do not implement later tasks, speculative cleanup, new architecture, or
-  unapproved material changes.
-
-### Validate
-
-Run focused verification sequentially over the smallest complete affected
-surface. Inspect `mise` tasks before using them. Prefer the repository task
-that owns setup; use direct Cargo only for a narrow pure test or exact focused
-filter that needs no missing repository setup.
-
-### Refine
-
-Route every failure:
-
-1. **Caused by the diff:** diagnose, fix, and rerun.
-2. **Small defect in touched code:** fix and report as incidental.
-3. **Defective command, filter, feature, or lane:** derive equivalent
-   non-weaker proof, update the task evidence, and rerun.
-4. **Missing private plumbing or fixture:** add the smallest adjacent support
-   inside the established owner and continue.
-5. **Missing repository-managed local setup:** inspect `mise.toml` and setup
-   scripts, start services, run migrations, use checked-in local test values,
-   and rerun.
-6. **Proven unrelated baseline failure:** record the proof and continue every
-   unaffected implementation and verification item. Fix if instructed.
-7. **Material change required:** stop before it and return `BLOCKED` with
-   repository evidence and the authority needed.
-8. **Uncertain classification:** gather more source and command evidence; do
-   not stop merely because diagnosis is incomplete.
-
-Do not create a remediation plan for classes 1–6.
-
-## Recover repository-managed test environments
-
-Missing local test variables or services are mechanical when the repository
-defines them.
-
-1. Inspect the relevant `mise` task, its `depends`, `env`, and invoked scripts.
-2. Run canonical setup and migration tasks.
-3. Invoke the owning `mise` task, or apply its checked-in local-only test
-   values to an equivalent focused command.
-4. Retry the intended test.
-
-Never invent, print, or persist production credentials. A genuinely
-unavailable external credential or protected service may block its mandatory
-proof only after all remaining work and verification complete.
-
-## Update the living task
-
-Record bounded corrections in the active task:
-
-- corrected repository facts, private paths, or symbol names;
-- existing or added private fixtures and support files;
-- equivalent commands and why their proof is not weaker;
-- progress, diagnoses, and verification evidence.
-
-Do not edit requirements, public or persisted contracts, security semantics,
-material architecture, data-loss behavior, or acceptance outcomes. A required
-change to those fields is `BLOCKED`, not a task rewrite.
-
-## Protect test integrity
-
-Never pass a gate by weakening assertions, adding sleeps for synchronization,
-ignoring tests, adding unjustified lint allowances, mocking away required
-behavior, swallowing errors, or changing production semantics to satisfy an
-incorrect test. Fix the cause or identify a material conflict.
-
-## Finish only at a terminal outcome
-
-Elapsed time, difficulty, partial progress, context length, recoverable tool
-failure, missing local setup, an invalid command, or remaining in-scope work
-are not terminal.
-
-- `COMPLETE`: every acceptance criterion and required proof is satisfied.
-- `BLOCKED`: no in-scope solution remains without a material change or
-  genuinely unavailable authority.
-
-Before reporting, inspect tracked and untracked changes, map every changed file
-to acceptance, remove accidental artifacts, and run `git diff --check`.
-Use the structured completion report in
-`architecture/references/languages/implementation-execution.md`.
+Return `IMPLEMENTED`, `SPEC_REVISION_REQUIRED`, or `BLOCKED` with the task path,
+verification status, material risk, and diff or commit reference. Create a
+commit only when requested. `IMPLEMENTED` routes the immutable cumulative
+candidate to `$wyrd-task-review`; only that independent review can complete the
+task. Implementation does not approve, merge, push, or deploy it.

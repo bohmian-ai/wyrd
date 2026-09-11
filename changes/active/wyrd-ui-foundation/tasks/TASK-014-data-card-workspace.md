@@ -31,6 +31,21 @@ distributions, splits, targets, lineage, and direct analytical investigation.
 - No data preview unless explicitly present and authorized, upload/editor,
   profiling computation, SQL generation, or browser-derived lineage.
 
+# Locked visual implementation authority
+
+- Implement `C-03-light` and `C-03-dark` from
+  [`cards.svg`](../../../../crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/cards.svg)
+  using the exact schema-first hierarchy, profile/distribution treatment,
+  split/target separation, sample/freshness context, absent figures state, and
+  lineage/Drift/Query links in the
+  [C-03 ledger entry](../../../../crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/README.md#c-03--data-card).
+- Narrow behavior follows `R-CARD`: primary schema and data meaning come first;
+  wide schema/profile regions scroll within their panels; metadata and
+  relationships stack without dropping fields. Do not substitute a generic
+  metadata Card or data-preview table.
+- Completion evidence must compare both desktop themes and a 390 × 844 capture
+  against `R-CARD`, including the truthful unavailable states.
+
 # Ordered test scenarios
 
 1. Schema preserves names, types, nullability, roles, and exact Data version.

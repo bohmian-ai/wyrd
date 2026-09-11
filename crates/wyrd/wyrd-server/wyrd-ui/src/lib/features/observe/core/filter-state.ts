@@ -11,6 +11,16 @@
 /** Time ranges the Observe scope accepts, shortest first. */
 export const RANGES = ['15m', '1h', '6h', '24h', '7d', '30d'] as const;
 
+/** Milliseconds each accepted range spans — shared by projections and charts. */
+export const RANGE_MS: Record<string, number> = {
+  '15m': 15 * 60_000,
+  '1h': 3_600_000,
+  '6h': 6 * 3_600_000,
+  '24h': 24 * 3_600_000,
+  '7d': 7 * 24 * 3_600_000,
+  '30d': 30 * 24 * 3_600_000
+};
+
 /** One removable filter rendered as a chip: remove keeps every other filter. */
 export type ScopeChip = { label: string; value: string; removeHref: string };
 

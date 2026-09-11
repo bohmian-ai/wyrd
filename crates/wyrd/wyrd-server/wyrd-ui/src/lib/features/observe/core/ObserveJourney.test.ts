@@ -84,9 +84,13 @@ test('traces search facets, render trend plus table, and keep return context thr
   ).text();
   expect(html).toContain('trace_01');
   expect(html).toContain('POST /checkout/capture');
-  expect(html).toContain('error traces per minute');
-  // The filter bar is real controls, and a row opens the trace carrying the search.
-  expect(html).toContain('all services');
+  expect(html).toContain('error traces per bucket');
+  // The RED strip renders all three panels, and the fields panel offers facet
+  // values with counts; a row opens the trace carrying the search.
+  expect(html).toContain('traces per bucket');
+  expect(html).toContain('p95 ms per bucket');
+  expect(html).toContain('FIELDS');
+  expect(html).toContain('checkout-api');
   expect(html).toContain(
     '/t/acme/observe/traces/trace_04?service=checkout-api&amp;status=error&amp;range=1h'
   );
@@ -98,13 +102,85 @@ test('traces search facets, render trend plus table, and keep return context thr
   expect(detail).toContain('service=checkout-api&amp;range=1h&amp;status=error');
   expect(detail).toContain('ledger.capture');
   expect(detail).toContain('error edge: checkout-agent → ledger-api (504)');
-  expect(detail).toContain('absent, not hidden');
-  // Span selection is URL state on the same route.
+  // The selected error span exposes its traces.events / traces.links rows.
+  expect(detail).toContain('Events · 3');
+  expect(detail).toContain('Links · 1');
+  // The header count is the drawn span count, and the trace pivots to its logs.
+  expect(detail).toContain('42 spans · 1 error');
+  expect(detail).toContain('all 42 spans');
+  expect(detail).toContain('/t/acme/observe/logs?service=checkout-api&amp;range=1h&amp;trace=trace_01');
+  // Span detail tabs are URL state: events carry the exception stacktrace.
+  const events = await (
+    await get('/t/acme/observe/traces/trace_01?service=checkout-api&range=1h&tab=events')
+  ).text();
+  expect(events).toContain('GatewayTimeout');
+  // Span selection is URL state on the same route; the GenAI tab renders the
+  // extracted genai.messages record.
   const span = await (
-    await get('/t/acme/observe/traces/trace_01?service=checkout-api&range=1h&span=span_rank')
+    await get('/t/acme/observe/traces/trace_01?service=checkout-api&range=1h&span=span_rank&tab=genai')
   ).text();
   expect(span).toContain('rank.candidates');
   expect(span).toContain('capture candidates');
+  expect(span).toContain('412 in · 96 out');
+  // The trace-level GenAI view rolls up the conversation.
+  const genaiView = await (
+    await get('/t/acme/observe/traces/trace_01?service=checkout-api&range=1h&view=genai')
+  ).text();
+  expect(genaiView).toContain('3 genai spans');
+  expect(genaiView).toContain('claude-sonnet-5');
+  expect(genaiView).toContain('GatewayTimeout');
+  // Every listed trace opens a drawn detail — no dead-end rows.
+  const sibling = await get('/t/acme/observe/traces/trace_04?service=checkout-api&range=1h');
+  expect(sibling.status).toBe(200);
+  const siblingHtml = await sibling.text();
+  expect(siblingHtml).toContain('span_1a02');
+  expect(siblingHtml).not.toContain('WYRD_SPEC_404_NOT_FOUND');
+});
+
+test('logs paginate and traces load more — no page pretends the matching set fits', async () => {
+  // Logs: page-based pagination with a rows-per-page contract.
+  const first = await (await get('/t/acme/observe/logs?range=24h')).text();
+  expect(first).toContain('page 1 of');
+  expect(first).toMatch(/scanned [\d.]+ MB in \d+ms/);
+  expect(first).toContain('page=2');
+  const second = await (await get('/t/acme/observe/logs?range=24h&page=2')).text();
+  expect(second).toContain('page 2 of');
+  const wide = await (await get('/t/acme/observe/logs?range=24h&per=250')).text();
+  expect(wide).toContain('250 rows');
+  // Traces: load-more appends; the header states first-N-of-M honestly.
+  const traces = await (await get('/t/acme/observe/traces?range=24h')).text();
+  expect(traces).toContain('first 50 of');
+  expect(traces).toContain('Load 50 more');
+  expect(traces).toContain('limit=100');
+  const more = await (await get('/t/acme/observe/traces?range=24h&limit=100')).text();
+  expect(more).toContain('first 100 of');
+});
+
+test('GenAI search lists extracted calls, facets, and pivots into the trace GenAI view', async () => {
+  const html = await (await get('/t/acme/observe/genai?range=24h')).text();
+  expect(html).toContain('FIELDS');
+  expect(html).toContain('WHERE');
+  expect(html).toContain('rank-v9');
+  expect(html).toContain('claude-sonnet-5');
+  expect(html).toContain('ledger.capture');
+  expect(html).toContain('conv_cart_88f1');
+  // Load-more matches the traces contract and rows pivot to the trace GenAI view.
+  expect(html).toContain('Load 50 more');
+  expect(html).toContain('view=genai');
+  // Model facet narrows the set; free text finds a conversation.
+  const filtered = await (
+    await get('/t/acme/observe/genai?range=24h&model=claude-sonnet-5')
+  ).text();
+  expect(filtered).toContain("request_model = 'claude-sonnet-5'");
+  const byConv = await (await get('/t/acme/observe/genai?range=24h&q=conv_cart_88f1')).text();
+  expect(byConv).toContain('conv_cart_88f1');
+});
+
+test('logs filter by trace id, completing the trace → logs pivot', async () => {
+  const html = await (await get('/t/acme/observe/logs?trace=trace_01&range=1h')).text();
+  expect(html).toContain("trace_id = 'trace_01'");
+  expect(html).toContain('retry budget exhausted (3/3)');
+  expect(html).not.toContain('cart lock contention');
 });
 
 test('metrics discover and filter a measure, then render chart plus underlying values', async () => {
@@ -124,14 +200,24 @@ test('logs search and inspect a structured record and hand equivalent context to
     await get('/t/acme/observe/logs?service=checkout-api&level=error&range=1h&q=gateway')
   ).text();
   expect(html).toContain('capture declined: gateway timeout');
-  expect(html).toContain('http.status');
   expect(html).toContain('Open in Query');
   expect(html).toMatch(/\/t\/acme\/query\?[^"]*sql=/);
   expect(html).toContain('trace_01');
+  // No record param → no drawer; the detail renders only on an explicit click.
+  expect(html).not.toContain('observed_time');
   const selected = await (
     await get('/t/acme/observe/logs?service=checkout-api&level=error&range=1h&record=log_03')
   ).text();
+  // The drawer shows the full OTel record: body, severity pair, attributes,
+  // trace correlation, scope and both timestamps.
   expect(selected).toContain('upstream 504 from ledger-api during capture');
+  expect(selected).toContain('ERROR · 17');
+  expect(selected).toContain('checkout.capture.upstream_error');
+  expect(selected).toContain('http.response.status_code');
+  expect(selected).toContain('span_1a02');
+  expect(selected).toContain('1 · sampled');
+  expect(selected).toContain('wyrd.instrumentation.checkout @ 1.4.2');
+  expect(selected).toContain('observed_time');
 });
 
 test('dashboards stay read-only in inventory and detail, reusing shared chart framing', async () => {

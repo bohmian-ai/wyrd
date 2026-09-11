@@ -38,6 +38,28 @@ shared correlation filters, and direct investigation paths.
 - No Eval/Drift implementation here, alerting, scheduled search, dashboard edit,
   raw SQL editor, direct Bifrost call, or Service-owned observation route.
 
+# Locked visual implementation authority
+
+- Implement `O-01` through `O-07` from
+  [`observe.svg`](../../../../crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/observe.svg):
+  overview, Logs, Metrics, Traces, trace detail, dashboard inventory, and
+  dashboard detail. The [ledger entries](../../../../crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/README.md#observesvg)
+  lock each route, URL scope, material state, link, selected-detail treatment,
+  and responsive pattern.
+- [`golden-O-04.svg`](../../../../crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/golden-O-04.svg)
+  is the immutable Gate A reference for operational Workbench composition:
+  filters, trend, records, selected row, raised detail, density, and hierarchy.
+  Apply that grammar across `O-01`–`O-07`; do not flatten the pages into a
+  repeated table-and-rail template.
+- Implement `M-05` from
+  [`mobile.svg`](../../../../crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/mobile.svg)
+  for trace detail. Other Observe pages follow their exact `R-SIGNAL`, `R-LIST`,
+  or `R-DETAIL` rules in the ledger: filters remain visible, dense content
+  scrolls within its panel, and selected detail stacks after the dominant work.
+- Completion evidence must compare `O-01`–`O-07` in both themes and `M-05` at
+  390 × 844. It must demonstrate every alternate state named in the ledger at
+  the same semantic page position rather than in a component-demo strip.
+
 # Ordered test scenarios
 
 1. Overview and local navigation restore shared URL scope and preserve it in

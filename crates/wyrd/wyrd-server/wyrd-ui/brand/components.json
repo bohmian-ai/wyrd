@@ -511,7 +511,8 @@
         "series": "Array<{ label: string, points: number[] }>",
         "labels": "Array<{ label: string, at: string }>?",
         "unit": "string?",
-        "threshold": "{ value: number, label: string }?"
+        "threshold": "{ value: number, label: string }?",
+        "min": "number?"
       },
       "variants": [],
       "anatomy": [

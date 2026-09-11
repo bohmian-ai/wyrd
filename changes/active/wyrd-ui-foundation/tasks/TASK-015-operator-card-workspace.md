@@ -34,6 +34,20 @@ projected recent outcome.
 - No action execution/test button, secret value, editor, multi-action workflow,
   credential manager, or inferred success.
 
+# Locked visual implementation authority
+
+- Implement `C-14-light` and `C-14-dark` from
+  [`cards.svg`](../../../../crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/cards.svg)
+  using the exact one-action hierarchy, readable input template, raw JSON
+  disclosure, execution budget, inbound chain, redacted credential reference,
+  target links, and separately projected recent outcome in the
+  [C-14 ledger entry](../../../../crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/README.md#c-14--operator-card).
+- Notify and HTTP are typed alternate fixture variants, not extra panels on the
+  Workflow fixture. Narrow behavior follows `R-CARD`, with long templates
+  contained inside their region. Do not substitute a generic action builder.
+- Completion evidence must compare both desktop themes and a 390 × 844 capture,
+  including proof that no secret value or execution control appears.
+
 # Ordered test scenarios
 
 1. A Workflow action shows readable input/template, raw disclosure, budget,

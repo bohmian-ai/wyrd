@@ -146,6 +146,28 @@ test('four series have four distinct dash and marker identities in plot and lege
   expect(legendShapes).toEqual(plotShapes);
 });
 
+test('a banded y-domain draws at its own resolution instead of a flat line from zero', () => {
+  const manifest = JSON.parse(readFileSync('brand/components.json', 'utf8'));
+  expect(manifest.components.Line.props.min).toBe('number?');
+  const { container } = render(Line, {
+    props: {
+      series: [{ label: 'availability', points: [99.94, 99.98, 99.96] }],
+      threshold: { value: 99.9, label: 'slo 99.9%' },
+      min: 99.9
+    }
+  });
+  // The axis states the band's real values, not 0…100 rounded to '100'.
+  const labels = [...container.querySelectorAll('.yl')].map((l) => l.textContent);
+  expect(labels[0]).toBe('99.98');
+  expect(labels[3]).toBe('99.90');
+  // The threshold sits on the axis floor, positionally distinct from the series.
+  const thr = Number(container.querySelector('.thr')?.getAttribute('y1'));
+  const points = [...container.querySelectorAll('.plot > svg > path.node')].map((p) =>
+    Number((p.getAttribute('d') ?? '').match(/M [\d.]+ ([\d.]+)/)?.[1])
+  );
+  expect(points.every((y) => y < thr)).toBe(true);
+});
+
 test('rejects a fifth series rather than repeating a non-colour identity', () => {
   const five = Array.from({ length: 5 }, (_, i) => ({ label: `series ${i}`, points: [1, 2, 3] }));
   expect(() => render(Line, { props: { series: five } })).toThrow('Line supports at most four series');

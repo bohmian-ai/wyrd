@@ -14,35 +14,28 @@ this repository. Reproduce useful patterns under Wyrd vocabulary and Wyrd paths.
 2. Follow all agent rules listed in `architecture/agent-rules.md`.
 3. Read `architecture/wyrd-design.md`; it is the active design authority and
    wins over generated artifacts, older planning files, and implementation
-   drift. It is current authority, not immutable history: an approved feature
-   may revise it when the existing boundary is no longer the best design.
+   drift.
 4. Read `architecture/wyrd-doctrine.mdx` before changing
    Wyrd contracts, public or internal APIs, SDK surfaces, CLI, MCP, UI, docs,
    generated schemas, or implementation behavior.
-5. Identify the owning crate or Python package (see §3 Ownership Boundaries).
-6. Inspect the nearest existing Wyrd implementation and tests.
-7. Check `mise.toml` for the canonical verification command.
-8. Check `Cargo.toml`, crate manifests, `pyproject.toml`, and lockfiles before
+5. Read `architecture/bifrost-design.md` before changing Bifrost ingest,
+   query, admission, distributed execution, Iceberg publication, compaction,
+   maintenance, or analytical reliability behavior.
+6. Identify the owning crate or Python package (see §3 Ownership Boundaries).
+7. Inspect the nearest existing Wyrd implementation and tests.
+8. Check `mise.toml` for the canonical verification command.
+9. Check `Cargo.toml`, crate manifests, `pyproject.toml`, and lockfiles before
    relying on version-specific behavior.
 
 Do not invent a new architecture until the current Wyrd boundary proves wrong
-for the user workflow. When an approved feature intentionally replaces a
-design decision, name the superseded decision and update
-`architecture/wyrd-design.md` before or in the same cohesive change as the code
-that relies on the replacement. Update `architecture/wyrd-doctrine.mdx` too
-when the underlying principle changes. A silent conflict is a blocker; an
-explicit, better design change is normal product evolution.
+for the user workflow.
 
 
 ## 2. Current Decisions
 
-Design dialogue, predecessor research, and older session history live in the
-[`wyrd-plan`](https://github.com/wyrd-ai/wyrd-plan) repo (private,
-org-internal). Active implementation authority now lives in this repo.
-`PLAN.md` remains the pointer back to planning history.
+Active design, planning, and implementation authority lives in this repository.
 
-Current cross-cutting decisions that any contributor must honor until an
-approved design change updates the owning authority:
+Locked cross-cutting decisions that any contributor must honor:
 
 - The protocol doctrine in `architecture/wyrd-design.md`
   is the first design filter for Wyrd nouns, layers, services, and public
@@ -58,8 +51,8 @@ approved design change updates the owning authority:
   codes so any language can implement a Wyrd client.
 - Rust, Python, and TypeScript are first-class client languages. Wyrd ships
   idiomatic SDKs, generated types, examples, and user-journey coverage for all
-  three. Go is a planned client language, but it is not first-class until its
-  SDK and the same contract and journey gates ship. These SDKs may add local
+  three. Go is planned but is not first-class until its SDK and the same
+  contract and journey gates ship. These SDKs may add local
   authoring helpers, OTEL integration, agent workflow integration, and test
   tooling, but they must not move server-owned durable behavior out of the
   server or create language-specific durable contracts.
@@ -74,34 +67,36 @@ approved design change updates the owning authority:
 - Every registered AI system component is a `Card` with the shared envelope:
   `apiVersion: wyrd/v1`, top-level `metadata`, `kind`, `spec`,
   server-derived `relationships`, and server-managed `status`. There is no
-  outer `kind: Card` wrapper. The target v1 doctrine is 16 native kinds plus
-  `External`: `Data`, `Model`, `Artifact`, `Experiment`, `Prompt`, `Agent`,
+  outer `kind: Card` wrapper. The v1 doctrine has 16 registrable native kinds:
+  `Data`, `Model`, `Artifact`, `Experiment`, `Prompt`, `Agent`,
   `Workflow`, `Mcp`, `Service`, `Policy`, `Audit`, `Drift`, `Eval`, `Source`,
-  `Trigger`, and `Operator`.
+  `Trigger`, and `Operator`. `CardKind::External` is a non-registrable
+  discriminator for foreign schema descriptors; it has no `ExternalSpec`.
 - `Tool` is a Skald/runtime registry concept, not a Card kind.
 - Sub-agency is an Agent-to-Agent relationship, not a `SubAgent` Card kind.
-- `Skill` is not a v1 Card kind unless a future architecture decision adds it.
-- Current `wyrd-spec` code still exposes stale `Tool`, `Skill`, and
-  `SubAgent` specs and lacks `SourceSpec`. Treat that as implementation drift
-  to remove, not as contract precedent.
+- `Skill` is not a v1 Card kind unless the architecture explicitly adds it.
+- `wyrd-spec` exposes `SourceSpec` and does not expose `Tool`, `Skill`, or
+  `SubAgent` specs. Reintroducing those removed kinds is contract drift.
 - `CardRef` carries `kind`, `name`, one `version` field, optional `space`, and
   optional `uid`. Do not introduce a separate version requirement field.
 - `wyrd-spec` is IO-free, async-free, and foundational. It is strictly
   PyO3-free. Specs, schemas, validators, the error catalog, and identity
   newtypes stay PyO3-free.
-- Python-visible behavior lives behind optional `python` features in approved
-  owner crates. `python/py-wyrd` is the thin PyO3 module aggregator and Python
-  package surface, not the place for duplicated business logic.
-- Current approved Python owner crates are `wyrd-interfaces`, `wyrd-cards`,
-  `wyrd-utils`, `vala-sdk`, `wyrd-sdk`, `skald-observer`, `skald-prompt`,
-  `skald-runtime`, `skald-agent`, `skald-tool`, `skald-workflow`, and
-  `wyrd-testing`, and `wyrd-cli` for its optional embedded CLI adapter.
-  `wyrd-sdk` owns the `WyrdState` runtime handle (hydrated-tree
-  load, CardRef context, observation tying); its PyO3 surface lives behind an
-  optional `python` feature, and `python/py-wyrd` stays a thin aggregator that
-  registers the submodule without duplicating runtime logic.
-  `wyrd-testing`'s `python` feature exposes the `WyrdTestServer` harness only;
-  it is a test-tier crate and is never enabled on production Python wheels.
+- `crates/shared/wyrd-client` owns the shared Rust client implementations and
+  is the sole Wyrd client surface consumed by language SDKs. First-class
+  language packages live under `sdks/wyrd-sdk-rust`,
+  `sdks/wyrd-sdk-python`, and `sdks/wyrd-sdk-ts`. Language-specific
+  implementations must be earned by a
+  foreign-runtime boundary and must not duplicate transport, validation,
+  registry, storage, lifecycle, or other durable behavior.
+- Python-visible behavior is wrapped and aggregated by `sdks/wyrd-sdk-python`.
+  Existing owner crates may retain optional `python` features during the
+  integration, but only the Python SDK enables and aggregates them. Rust and
+  TypeScript SDKs never enable those features. New or materially relocated
+  Python logic belongs in `wyrd-sdk-python`; the long-term direction is to
+  consolidate all Python logic there without forcing unrelated migration
+  churn. PyO3 stays out of `wyrd-spec`, and the production Python wheel never
+  enables test-only harness behavior.
 - Client-tier crates do not depend on `sqlx`, cloud SDKs, `datafusion`, or
   `deltalake`.
 - Skald owns reusable agent primitives. Vala may depend on Skald to implement
@@ -115,6 +110,17 @@ approved design change updates the owning authority:
   explicit scopes.
 - Audit is foundational across CLI, UI, MCP, Python SDK, `wyrd-server`, and
   Vala surfaces.
+- Oracle query reads are the narrow exception to synchronous Postgres audit:
+  the server must fsync a versioned, CRC-framed local WAL acceptance before
+  permitting rows, then relay at least once into the canonical tenant
+  hash-chained outbox. Every Postgres mutation and other durable transition
+  remains transactionally audited at its commit boundary.
+- Bifrost clients use `wyrd_client::Bifrost` over the crate's shared HTTP and
+  gRPC transport. Rust, Python, and TypeScript project that same facade. Gate, Scribe,
+  Oracle, and Forge remain server owners and never become client types.
+- `vala.audit_outbox` is transient delivery state. Retained audit history lives
+  in `vala.system.audit_log`; outbox rows may retire only after their audit-log
+  publication is durable.
 
 ## 3. Ownership Boundaries
 
@@ -125,15 +131,25 @@ approved design change updates the owning authority:
 - `crates/skald/*`: model/provider runtime, prompt/cache abstractions,
   orchestration, provider-specific wire handling.
 - `crates/vala/*`: observability, evaluation, drift, tracing, archival query,
-  OLAP, and background data-plane behavior. Python-visible Vala client
-  behavior lives in `vala-sdk` behind its optional `python` feature.
+  OLAP, and background data-plane behavior. Rust-native Vala client mechanics
+  may live in `vala-sdk`, but `wyrd-client` owns their SDK-facing composition
+  and public re-exports.
 - `crates/wyrd/*`: server, CLI, MCP, application integration, UI host.
-- `crates/bindings/*`: thin native bindings and package roots for first-class
-  SDKs that need them, including the TypeScript/Node surface. Shared client
-  behavior stays in client-tier Rust crates; bindings do not reimplement HTTP,
+- `crates/shared/wyrd-client`: shared client implementations and the sole
+  SDK-facing Rust client surface, including composition of Cards, WyrdState,
+  Bifrost, transport, and authentication capabilities.
+- `crates/wyrd/wyrd-interfaces`: existing Python-only framework adapters. It
+  may remain as an optional-feature migration boundary during this integration;
+  only `wyrd-sdk-python` enables it. Its long-term home is the Python SDK.
+- `crates/bindings/*`: migration-state or internal native-binding mechanics
+  only. They are not public package roots. First-class SDK package and native
+  binding roots live under `sdks/*`; bindings do not reimplement HTTP,
   validation, registry, storage, or lifecycle logic.
-- `python/py-wyrd`: PyO3 module root, Python package exports, generated stubs,
-  Python-facing tests, and submodule aggregation.
+- `sdks/wyrd-sdk-rust`: thin first-class Rust package over `wyrd-client`.
+- `sdks/wyrd-sdk-python`: Python package, PyO3 aggregation, generated stubs,
+  and Python-facing tests over `wyrd-client`.
+- `sdks/wyrd-sdk-ts`: TypeScript package, declarations, Node binding root, and
+  TypeScript-facing tests over `wyrd-client`.
 
 When behavior crosses boundaries, put the durable contract in `wyrd-spec`, keep
 durable server behavior in Rust-owned server/service crates, and expose the
@@ -166,13 +182,11 @@ Python, and TypeScript client surfaces where appropriate.
   input, database, storage, or external-service behavior in non-test code.
 - Use `expect()` only for true invariants, with a message naming the invariant.
 - Do not add wildcard dependency versions or per-crate profile blocks.
-- Task, milestone, and phase checks use default features or the exact optional
-  features exercised by the change. Whole-plan closeout, `pre-pr`, release,
-  and explicitly requested aggregate checks use `--all-features` so every code
-  path is verified once after integration. Test and build tasks declare only
-  the minimal feature set they need — `--all-features` in a test task forces
-  the heavy cone to recompile at a different feature-union and defeats artifact
-  reuse.
+- Workspace Clippy and type-check lanes use `--all-features` so every code path
+  is verified; formatting is feature-independent. Test and build tasks declare
+  only the minimal feature set they need — `--all-features` in a test task
+  forces the heavy cone to recompile at a different feature-union and defeats
+  artifact reuse.
 
 ## 5. Abstraction Rules
 
@@ -224,9 +238,9 @@ behavior with the wrong structural shape is incomplete.
 - Wyrd Card envelopes and specs remain declarative. They MUST NOT acquire
   registry clients, storage clients, server behavior, or hidden IO merely to
   satisfy this style. Put those workflows on the owning service or handle.
-- `crates/shared/wyrd-registry/src/handle.rs::Cards` is the canonical Wyrd
-  pattern: a public, dependency-owning handle with discoverable methods,
-  composed from a focused engine and narrow private helper modules.
+- `crates/shared/wyrd-registry/src/handle.rs::Cards` is the canonical
+  Wyrd pattern: a public, dependency-owning handle with discoverable methods,
+  composed from a focused engine and narrow private helpers.
 
 ## 6. Async And Runtime Rules
 
@@ -250,13 +264,14 @@ behavior with the wrong structural shape is incomplete.
 
 - `wyrd-spec` stays PyO3-free. Do not add a `python` feature or PyO3 imports
   to `wyrd-spec`.
-- PyO3 belongs in crates that own Python-visible behavior, behind an optional
-  `python` feature with `pyo3 = { workspace = true, optional = true }`.
-- `python/py-wyrd` depends on approved owner crates with `features =
-  ["python"]` and registers their submodules. It must stay a thin aggregator:
-  no duplicated validation, lifecycle, registry, storage, or runtime logic.
-- Generic Python boundary helpers belong in `crates/shared/wyrd-utils` behind
-  its `python` feature.
+- New and materially relocated PyO3 belongs in `sdks/wyrd-sdk-python`, behind
+  its boundary feature with `pyo3 = { workspace = true, optional = true }`.
+  Existing owner-crate `python` features may remain temporarily as migration
+  state. Only `wyrd-sdk-python` enables them; Rust and TypeScript SDKs do not.
+- `sdks/wyrd-sdk-python` owns the thin PyO3 wrappers, aggregation, boundary helpers,
+  and public Python package. It wraps Rust-native owner APIs and must not
+  duplicate validation, lifecycle, registry, storage, transport, or runtime
+  logic.
 - Keep `Python<'py>`, `Bound<'py, T>`, `Py<T>`, and `PyErr` out of crates that
   did not opt into a `python` feature.
 - Name the `#[new]` method `fn __new__` (not `fn new`) and give it an explicit
@@ -282,11 +297,14 @@ behavior with the wrong structural shape is incomplete.
 
 For any Python-visible change, verify all layers:
 
-1. Rust type/function exists in the owning crate.
-2. PyO3 wrapper or registration exists under `python/py-wyrd/src`.
-3. Python package exports exist under `python/py-wyrd/python/wyrd`.
-4. Generated stubs (`.pyi`) regenerate cleanly via `mise run codegen:check`.
-5. Python tests import from public `wyrd` modules, not private extension
+1. Rust type/function exists in its Rust-native owning crate.
+2. New or materially relocated PyO3 wrappers live under
+   `sdks/wyrd-sdk-python/src`; an existing owner-crate wrapper may remain only
+   as approved migration state.
+3. Native submodule registration exists under `sdks/wyrd-sdk-python/src`.
+4. Python package exports exist under `sdks/wyrd-sdk-python/python/wyrd`.
+5. Generated stubs (`.pyi`) regenerate cleanly via `mise run codegen:check`.
+6. Python tests import from public `wyrd` modules, not private extension
    paths, unless the private path is the intended contract.
 
 Do not hand-edit generated stubs. Update source annotations or the generator,
@@ -326,6 +344,10 @@ then run codegen.
 
 ## 11. Testing Workflow
 
+This section is normative. `TESTING.md` is its practical map: tier homes,
+directory layout, every `mise` lane, benches, and the two prohibitions on what a
+test may not do.
+
 ### Test Taxonomy (priority order)
 
 Wyrd has three test tiers. They are ranked — higher tiers prove the product
@@ -333,7 +355,8 @@ works; lower tiers prove a part works. A lower tier never substitutes for a
 missing higher one.
 
 1. **User-journey tests — the primary contract, highest priority.** Drive the
-   real SDK against a real server (`WyrdTestServer` + embedded Postgres) along a
+   real SDK against a real server (`WyrdTestServer` + repository-managed
+   Postgres) along a
    complete user/agent path, client → server → client, no in-process engine
    fixtures. For a data surface the journey is instantiate → write →
    shutdown/flush → read; for an agent surface it is discover → act → observe.
@@ -362,50 +385,67 @@ a user-observable behavior — especially a negative flow — down to a unit tes
 may stay unit-only when driving it end-to-end is materially harder and the
 behavior has no cross-boundary state (record the reason).
 
+### Runtime Ownership Of Tests
+
+- Rust tests cover functions, structs, and workflows whose execution requires
+  only the Rust runtime.
+- Behavior that requires a Python interpreter lifetime belongs in Python tests.
+  Do not initialize or emulate a Python lifetime inside Rust tests.
+- Behavior that requires a TypeScript or Node.js lifetime belongs in
+  TypeScript tests. Do not link, initialize, or emulate a Node/N-API lifetime
+  inside Rust tests.
+- Native binding crates may receive Rust-only compile and static checks, but
+  lifetime-dependent behavior must be loaded and exercised through the owning
+  language runtime.
+
 ### Verification Scope
 
-Run verification for the code you changed. Verification has three explicit
-levels:
-
-1. **Bounded-task verification.** Run only the task-defined focused test,
-   boundary-check, format, and lint surface with default features or the exact
-   optional features required by the behavior. Do not silently expand to
-   workspace validation.
-2. **Milestone and phase integration.** After related tasks integrate, run
-   their integration coverage and `mise run check:default`.
-3. **Whole-plan closeout.** After all tasks are integrated, run the all-feature
-   workspace gate and every final gate required by the plan.
-
-`mise run pre-pr` is the aggregate CI gate; it is intentionally broad and slow,
-so do not make it the default requirement for every task, milestone, phase, or
-implementation slice.
+Run verification for the code you changed. Pull requests run only lanes selected
+by the affected code and dependency closure. The full non-credentialed
+correctness suite runs nightly on `main`; live-cloud and performance suites run
+on separate schedules. `mise run gate` is intentionally broad and slow, and it
+is not the default local or pull-request bar.
 
 ```bash
-# Bounded task: use only commands required by its affected surface.
-mise run fmt           # if Rust changed
+# Always run the relevant format and lint checks.
+mise run fmt           # Rust formatting
+mise run lints         # Rust clippy, workspace-wide
 mise run py:format     # if Python files changed
 mise run py:lints      # if Python files changed
-
-# Milestone or phase integration.
-mise run check:default # fmt check + workspace Clippy, default features
-
-# Whole-plan closeout.
-mise run check         # fmt check + workspace Clippy, all features
 ```
 
-Then run the narrowest `mise` test/check tasks that cover the touched surface:
+Then run the narrowest `mise` test/check tasks that cover the touched surface.
+`mise run <task>` is for module-, crate-, family-, environment-, or
+aggregate-level coverage. Every specifically named Rust, Python, or TypeScript
+test in a task artifact or implementation report must also include and run its
+exact focused command via `mise exec --`. Rust normally uses
+`cargo nextest run` with an explicit package, target, and exact test expression:
+
+```bash
+mise exec -- cargo nextest run --locked -p <crate> --lib \
+  -E 'test(=module::tests::test_name)'
+mise exec -- cargo nextest run --locked -p <crate> --test <target> \
+  -E 'test(=test_name)'
+```
+
+Inspect source and `mise exec -- cargo nextest list` when needed to confirm the
+exact name.
+Tests requiring Postgres or another repository-managed environment include the
+owning setup wrapper or use the narrowest environment-owning `mise` task. Do
+not use a positional filter that can pass after selecting no test.
 
 - Rust crate change: prefer the nearest crate-specific `mise run ...` task
   (`test:wyrd`, `test:skald`, `test:vala`, `test:shared`, `test:sql`,
-  `test:storage:matrix`, etc.). Whole-crate tests should use `mise` when a task exists because some
+  `test:bifrost`, `test:storage:matrix`, etc.). Whole-crate tests should use `mise` when a task exists because some
   crates need external dependencies, migrations, generated artifacts, or
-  environment variables that the mise task sets up. Use raw `cargo test` only
-  when no relevant mise task exists or when narrowing to a single pure unit
-  test that does not need repository setup.
+  environment variables that the mise task sets up. Specifically named Rust
+  tests use the exact `mise exec -- cargo nextest run` form above; include the
+  repository-managed setup wrapper when the test needs it.
 - Python package change: run `mise run py:test:unit`; add
   `mise run py:typecheck` when stubs, exports, or public Python typing changed.
-- Contract, schema, MCP, or stub generation change: run
-  `mise run codegen:check`.
+- Contract, schema, OpenAPI, or stub generation change: run
+  `mise run codegen:check`. MCP behavior changes also run the owning MCP tests;
+  the codegen lane does not independently prove the runtime MCP tool catalog.
 - Boundary-sensitive change: run the matching boundary check, such as
   `mise run check:client-tier`, `mise run check:pyo3-scope`, or
   `mise run check:unwrap-audit`.
@@ -413,16 +453,10 @@ Then run the narrowest `mise` test/check tasks that cover the touched surface:
 - Example change: run the touched example task, or `mise run check:examples`
   when the change affects shared example behavior.
 
-Run `mise run pre-pr` at whole-plan closeout when the plan requires the
-aggregate lane, or when the change modifies shared CI/build/test
-infrastructure, prepares a release, or the user explicitly asks for the full
-gate. It remains useful as a final confidence sweep; it is not the normal bar
-for every local task or phase.
-
-Run all Cargo-backed commands sequentially, including commands launched by
-multiple agents sharing one checkout or target directory. Parallel code
-inspection and independent edits are allowed; overlapping Cargo builds, tests,
-lints, docs, or codegen are not.
+Run `mise run gate` locally only when the change is intentionally broad, crosses
+several ownership boundaries, changes shared CI/build/test infrastructure,
+prepares a release, or when the user explicitly asks for it. Otherwise let CI
+run it.
 
 Real cloud storage integration tests (`test:storage:*:cloud`) run against live
 infrastructure separately.
@@ -435,8 +469,9 @@ While working on a specific area:
 ```bash
 # Rust only
 # Whole-crate tests should use a crate-specific mise task when one exists.
-# Raw cargo is acceptable for a narrow pure unit test that needs no repo setup.
-mise exec -- cargo test --locked -p <crate> <test_name> -- --nocapture --test-threads=1
+# Named Rust tests use exact nextest expressions through the mise toolchain.
+mise exec -- cargo nextest run --locked -p <crate> --lib \
+  -E 'test(=module::tests::test_name)'
 mise run test:sql      # runs all SQL-backed integration tests across wyrd-sql, wyrd-dev-fixtures, and vala-sql
 mise run test:unit     # all Rust tests including SQL and storage emulators
 
@@ -465,13 +500,41 @@ A change is not done until:
 - No legacy names, routes, package names, or compatibility aliases were added.
 - Format, lints, and the targeted tests/checks for the touched surface pass.
   Prefer the smallest `mise` task set that proves the change. Do not require
-  `mise run pre-pr` unless the verification scope in §11 calls for the aggregate
-  gate.
+  `mise run gate` unless the verification scope in §11 calls for the CI
+  aggregate.
 - Do not circumvent a gate to make it pass: never weaken or disable a check,
   add `#[allow]`, delete or `#[ignore]` a failing test, or broaden a boundary
   glob to hide a real violation. Fix the underlying cause. Only use a check's
   own sanctioned mechanism (e.g. the documented per-file allowlist) when the
   usage is legitimately test-only and matches an existing in-pattern precedent.
+
+### Adding And Retiring Checks
+
+A repository check is a permanent cost paid on every run by every contributor.
+It must earn that cost by protecting a property that is still reachable.
+
+Before adding a check, state the property it protects and why the compiler,
+type system, or an ordinary test cannot protect it. A check that restates a
+rule already enforced somewhere else is not free; it is a second place to
+update and a second way to be confusing. Do not add a check that verifies
+another check.
+
+A check is a candidate for deletion when the failure it prevents is no longer
+reachable from the current tree. The common case is a name-ban: a check that
+greps for identifiers, crates, directories, or prose that a completed change
+removed. Once the thing is gone and its owner is gone, the ban protects
+nothing and only constrains future naming. Delete it.
+
+Distinguish this from a check that enforces a live boundary — tier and
+dependency direction, PyO3 scope, tenant isolation, single authoritative
+impl, generated-artifact drift, ownership of a durable resource. Those
+describe an invariant that can be violated by code someone could write
+tomorrow, so they stay regardless of age.
+
+Removing a check is a material decision: say which check, which property it
+claimed, and why that property is now unreachable or enforced elsewhere. This
+is not a licence to delete a check that is merely inconvenient or currently
+failing — that is circumventing a gate, which the previous rule prohibits.
 
 ## 13. Git Identity Rules
 
@@ -485,54 +548,77 @@ A change is not done until:
 
 ## 14. Planning
 
-Planning lives in the [`wyrd`](https://github.com/wyrd-ai/wyrd) repo. Additional/older planning files live in the [`wyrd-plan`](https://github.com/wyrd-ai/wyrd-plan) repo.
-Code in this repo lands one session at a time, via dialogue-locked decisions.
+Planning for every Wyrd change lives in this repository. Active changes follow
+the human-approved spec-driven workflow in
+`architecture/references/languages/spec-driven-development.md`.
 
-Sol planning must compile ambiguous intent into implementation-ready task
-packets sized for Terra/Luna. Each task packet names its objective,
-requirements, non-goals, allowed and prohibited scope, target paths and
-symbols, required code structure, interfaces and invariants, consequential
-control flow, dependencies and feature requirements, acceptance criteria,
-required tests, focused verification, escalation conditions, and expected
-completion evidence. Typed stubs and pseudocode carry the implementation
-decisions; they state whether semantics are normative or structure is
-illustrative. An implementation task is incomplete when its assigned model
-must choose architecture, public behavior, persistence, failure semantics,
-scope, or verification. Task authors and implementors follow
-`architecture/references/languages/implementation-execution.md` as the
-canonical bounded-execution contract.
+### Agent skill bindings
 
-When a plan intentionally changes Wyrd design, the task packet names the
-superseded decision and includes the owning design and doctrine updates in its
-write set. Implementors update those authorities instead of treating current
-design as immutable or allowing code and docs to disagree.
+Skills are referenced by name; each harness resolves a named skill from its
+own skill directory. Do not hard-code harness-specific skill paths in plans,
+task packets, or documentation.
 
-### Codex agent skill bindings
+The shared workflow skill source is `.agents/skills`; `.claude/skills` is its
+generated Claude discovery mirror. Run `mise run skills:sync` after editing a
+shared workflow skill and `mise run check:skills-sync` to detect drift. Codex
+`agents/openai.yaml` metadata remains only in the canonical source.
 
-- Wyrd planning agents use `.codex/skills/wyrd-plan/SKILL.md` to investigate,
-  resolve decisions, design verification, and produce the canonical
-  `.dev/plan/<slug>/implementation-plan.md` plus one or more executable task
-  packets under `.dev/plan/<slug>/tasks/`.
-- The plan orchestrator reads this file, `architecture/wyrd-design.md`,
-  `architecture/wyrd-doctrine.mdx`, and the applicable repo-local
-  implementation skill before decomposing work.
+- `$wyrd-spec` turns human intent into a decision-complete behavioral
+  specification. Only explicit human approval makes a revision authoritative.
+- `$wyrd-plan` decomposes an approved specification into cohesive TDD tasks or
+  creates bounded remediation tasks from validated `$wyrd-task-review`
+  findings. It never rewrites an approved spec to fit implementation.
+- `$wyrd-task-readiness` reviews one or more proposed tasks before
+  implementation. It is distinct from post-implementation task review.
 - Wyrd Rust, Python, TypeScript, server, CLI, MCP, storage, Vala, and contract
-  implementors execute those packets with `.codex/skills/wyrd-implement/SKILL.md`,
-  which owns implementation and validation.
-- Wyrd UI implementors additionally receive
-  `.codex/skills/wyrd-ui/SKILL.md` when their write set enters the UI tree.
-- The complete integration review runs the global `review-and-plan` skill; its
-  repo-specific review binding is `.codex/skills/review/SKILL.md`.
+  implementors must receive the `$wyrd-implement` skill in their task packet.
+  It executes one ready task through scenario-by-scenario Red-Green-Refactor
+  cycles, then runs the broader focused verification required here.
+- Wyrd UI implementors additionally receive the `wyrd-ui` skill when their
+  write set enters the UI tree.
+- `$wyrd-task-review` performs read-only review of one immutable cumulative
+  task candidate. `REMEDIATE` findings return to `$wyrd-plan`;
+  behavior-changing conflicts return to `$wyrd-spec` and require renewed human
+  approval.
+- `$wyrd-change-review` performs the final immutable integrated review and maps
+  every required specification obligation to credible evidence, including
+  cross-task seams and user journeys. Its review phase remains read-only. An
+  `APPROVE` verdict automatically invokes `$wyrd-complete` in the same workflow
+  turn.
+- `$wyrd-complete` requires that approved review, writes one compact durable
+  record under `changes/completed/<year>/<slug>.md`, and removes the full
+  `changes/active/<slug>` packet. It does not merge, push, deploy, modify
+  production code, or invent missing architecture updates.
+- There is no repo-local complete-plan controller. The calling agent or
+  active execution harness owns transient scheduling, worktree choice, task
+  sequencing, commits, integration, and resource management. Those mechanics
+  must not become Wyrd `Change` lifecycle state, skill protocol metadata, or a
+  renamed controller. Plans declare real dependencies and integrated evidence;
+  the caller chooses how to execute them.
+- Active specifications, tasks, and verification live in the normally tracked
+  `changes/active/<slug>` packet on the change/integration branch. Task branches
+  inherit that packet and merge back into the change branch. Final review reads
+  the complete active packet from its immutable candidate. On approval,
+  automatic completion condenses it to one historical record under
+  `changes/completed/<year>/<slug>.md` and deletes the active packet. Current
+  architecture documents remain authoritative; completed records preserve
+  context rather than competing with them. No workflow step force-stages
+  ignored files or depends on a particular merge strategy.
+- Skills and task packets reference architecture authorities and focused
+  references by repository-relative path. They never substitute skill prose
+  for `architecture/wyrd-design.md`, `architecture/bifrost-design.md`,
+  `architecture/agent-rules.md`, security/operations authorities, or the
+  canonical `architecture/references/` router.
 
 ## 15. Implementation Rules
 
 - `wyrd-spec` is foundational but it not a dumping grounds for all contracts. If it's not spec-related, it doesn't go in `wyrd-spec`. Find another place for it.
 - `wyrd-sql` is the durable Postgres layer.
 - `wyrd-storage` is the durable storage layer that provides storage functionality for wyrd and vala.
-- Deployment: Wyrd is meant to be deployed as self-hosted, cloud SaaS (single-server multi-tenant), and enterprise cloud (single-server single-tenant). Plan work and implementation accordingly.
+- Deployment: Wyrd is meant to be deployed as self-hosted, cloud SaaS (single-server multi-tenant), and enterprise cloud (single-server single-tenant). Plan work and implementation accordingly. "Single-server" means one logical serving surface, not a single process or pod: a topology may horizontally scale `wyrd-server` into multiple replicas and targeted pods (selected by `WYRD_TARGET`) behind one gateway, each activating a subset of subsystems. `wyrd-server` remains the only serving surface.
 - Wyrd is open source and independently publishable. It contains no private
   enterprise licensing keys, feature gates, startup hooks, or product contracts.
-  A future private `wyrd-enterprise` repository may depend on and extend public
+  A separate private `wyrd-enterprise` repository may depend on and extend public
   Wyrd crates; Wyrd never depends on that private repository. "Enterprise cloud"
   describes a deployment topology and tenant-isolation requirement, not an
   in-tree commercial edition.
@@ -575,7 +661,7 @@ If there is no `.codegraph/` directory, skip CodeGraph entirely.
 
 **Who you are working with:** Steven Forrester — AI Platform engineer and TPM at Shipt. Builds developer tooling, ML infrastructure, and agentic systems. Deep Rust/Python/SvelteKit expertise. Moves fast, generates lots of ideas, thinks in systems.
 
-Primary stack: Rust (tokio, axum, tonic, DataFusion, Delta Lake, PyO3), Python (pytest, Pydantic, uv, maturin), SvelteKit 2 / Svelte 5 / Tailwind CSS v4.
+Primary stack: Rust (tokio, axum, tonic, DataFusion, Iceberg, Arrow, PyO3), Python (pytest, Pydantic, uv, maturin), SvelteKit 2 / Svelte 5 / Tailwind CSS v4.
 
 **Working style:**
 
@@ -584,11 +670,9 @@ Primary stack: Rust (tokio, axum, tonic, DataFusion, Delta Lake, PyO3), Python (
 - Always consider: **Ergonomics** (does the API/UX/CLI feel natural?), **Value** (does this solve a real problem?), **Simplicity** (is there a simpler version that gets 90% of the value?), **Blindspots** (what will break, scale badly, or get misused?).
 - Be a pragmatic architect. Prefer long-term stability and performance over cleverness. Push back on over-engineering.
 
-**Communication:**
-
-- Direct and concise. No preamble, no trailing summaries.
-- Lead with the answer or the opinion, then the reasoning.
-- Don't ask multiple questions. If clarification is needed, ask the single most important one.
-- Match energy — short answers for simple things, depth when the problem deserves it.
+**Communication:** Tone and response shape are owned by the active output
+style, not this file. The one repo-specific addition: don't ask multiple
+questions at once — if clarification is needed, ask the single most
+important one.
 
 **Target user persona:** ML engineers, data scientists, AI platform teams, and AI agents. These users run compute-heavy workloads, deploy to Kubernetes, and are sophisticated enough to read a stack trace, inspect a schema, and form an opinion on an API design. Design as if your primary consumer is a careful, literal interpreter that has no ability to ask for clarification.

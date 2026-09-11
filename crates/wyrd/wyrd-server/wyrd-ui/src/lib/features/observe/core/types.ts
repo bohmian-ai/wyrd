@@ -45,30 +45,73 @@ export type ObserveOverview = {
   noDataNote: { signal: string; detail: string } | null;
 };
 
-/** One structured log record; `fields` is the ordered structured detail. */
+/**
+ * One OTel log record, shaped by the Bifrost `logs.records` table: severity
+ * pair, event name, opaque `body` payload (string or structured JSON), the
+ * `attributes` map, trace correlation, and resource/scope identity. `level`
+ * mirrors `severityText` lowercased for filters and badges; `message` is the
+ * one-line display form of `body` for the results table.
+ */
 export type LogRecord = {
   id: string;
   time: string;
+  /** OTel `time` — when the event occurred, ISO. */
   at: string;
+  /** OTel `observed_time` — when the collector saw it, ISO. */
+  observedAt: string;
   level: string;
+  /** OTel severity_number, 1–24 (9 INFO, 13 WARN, 17 ERROR). */
+  severityNumber: number;
+  severityText: string;
+  /** OTel event_name identifying the event class, when the emitter sets one. */
+  eventName: string | null;
+  /** Resource `service.name`. */
   service: string;
   message: string;
+  /** OTel body — string or structured JSON, rendered verbatim in the drawer. */
+  body: unknown;
   traceId: string | null;
-  fields: [string, string][];
-  detail: string;
+  spanId: string | null;
+  /** W3C trace flags; bit 0 = sampled. */
+  traceFlags: number;
+  scopeName: string;
+  scopeVersion: string;
+  attributes: Record<string, string | number | boolean>;
+  droppedAttributesCount: number;
 };
 
+/** One facet value with its match count in the current search context. */
+export type FacetValue = { value: string; count: number; active: boolean };
+
+/** One filterable field in the fields side panel, with its top values. */
+export type FieldFacet = { name: string; values: FacetValue[] };
+
 /** O-02 — guided log search: trend, records, one selected structured record. */
+/**
+ * Truthful result-set size for a search. `exact: false` renders as `≥ count`
+ * while a partitioned backend is still counting — the UI never invents totals.
+ */
+export type Matching = { count: number; exact: boolean };
+
+/** What one search cost — surfaced on every result set, OLAP-style. */
+export type SearchCost = { scanned: string; tookMs: number };
+
 export type LogsView = {
-  matching: number;
-  loaded: number;
+  matching: Matching;
+  cost: SearchCost;
+  /** 1-based page of `perPage` rows currently loaded; `pageCount` is derived from `matching`. */
+  page: number;
+  perPage: number;
+  pageCount: number;
   trend: number[];
-  /** Distinct service facet for the filter bar — server-projected, never guessed. */
-  services: string[];
-  /** Distinct level facet for the filter bar. */
-  levels: string[];
+  /** Epoch ms the trend window ends at — charts derive bucket clock labels from it. */
+  trendEnd: number;
+  /** Field facets for the side panel — server-projected values and counts. */
+  fields: FieldFacet[];
   records: LogRecord[];
   selected: LogRecord | null;
+  /** The WHERE clause the current filters express — shown, never authored here. */
+  queryWhere: string;
   /** Equivalent context handed to Query as one SELECT — no SQL authoring here. */
   querySql: string;
 };
@@ -97,6 +140,8 @@ export type MetricsView = {
 /** One trace search result row. */
 export type TraceRow = {
   id: string;
+  /** ISO instant of the trace root, so range filters derive from real time. */
+  at: string;
   rootOperation: string;
   service: string;
   start: string;
@@ -106,33 +151,119 @@ export type TraceRow = {
   status: { label: string; tone: Tone };
 };
 
-/** O-04 — trace search: trend plus result rows; a row opens the trace directly. */
+/** O-04 — trace search: RED trend strip plus result rows; a row opens the trace directly. */
 export type TracesView = {
-  matching: number;
-  loaded: number;
+  matching: Matching;
+  cost: SearchCost;
+  /** Rows currently loaded (load-more appends in steps of 50). */
+  limit: number;
+  /** True when more matching traces exist beyond `rows`. */
+  hasMore: boolean;
   errorRate: string;
   p95: string;
+  /** Error traces per minute — the Errors panel of the RED strip. */
   trend: number[];
-  /** Distinct service facet for the filter bar. */
-  services: string[];
+  /** All traces per minute — the Rate panel. */
+  rateTrend: number[];
+  /** p95 duration in ms per bucket — the Duration panel. */
+  durationTrend: number[];
+  /** Epoch ms the trend window ends at — charts derive bucket clock labels from it. */
+  trendEnd: number;
+  /** Field facets for the side panel — server-projected values and counts. */
+  fields: FieldFacet[];
+  /** The WHERE clause the current filters express. */
+  queryWhere: string;
   rows: TraceRow[];
 };
 
-/** One span in the trace waterfall. */
+/** One `traces.events` row on a span: name, offset from span start, attributes. */
+export type SpanEvent = {
+  name: string;
+  /** Offset from the span start, e.g. `+0.44s`. */
+  offset: string;
+  attributes: Record<string, string | number | boolean>;
+  droppedAttributesCount: number;
+};
+
+/** One `traces.links` row on a span — navigates to the linked trace/span. */
+export type SpanLink = {
+  linkedTraceId: string;
+  linkedSpanId: string;
+  traceState: string | null;
+  attributes: Record<string, string | number | boolean>;
+};
+
+/** One chat message extracted into `genai.messages` payload columns. */
+export type GenAiMessage = { role: string; content: string };
+
+/**
+ * The extracted GenAI record joined to a span, when one exists. Bifrost
+ * extracts GenAI spans into `genai.messages` / `genai.tool_calls`; a span
+ * either has such a record or it simply is not a GenAI span — absence is
+ * normal, never an error state.
+ */
+export type GenAiSpan =
+  | {
+      table: 'messages';
+      provider: string;
+      operation: string;
+      requestModel: string;
+      responseModel: string | null;
+      conversationId: string | null;
+      /** Request parameters actually set, e.g. temperature, max_tokens. */
+      params: [string, string][];
+      usage: { input: number; output: number; cacheRead: number; cacheCreate: number };
+      finishReasons: string[];
+      /** Sensitive payload columns — null means withheld, see `withheldReason`. */
+      systemInstructions: string | null;
+      inputMessages: GenAiMessage[] | null;
+      outputMessages: GenAiMessage[] | null;
+      withheldReason: string | null;
+      errorType: string | null;
+    }
+  | {
+      table: 'tool_calls';
+      provider: string;
+      operation: string;
+      toolName: string;
+      toolType: string;
+      conversationId: string | null;
+      /** Sensitive payload columns — null means withheld or absent. */
+      args: string | null;
+      result: string | null;
+      withheldReason: string | null;
+      errorType: string | null;
+    };
+
+/**
+ * One span in the trace waterfall, shaped by the Bifrost `traces.spans`
+ * contract: status, scope identity, the attributes map, and the per-span
+ * `traces.events` / `traces.links` collections. `genai` is the extracted
+ * `genai.*` record when this span is a GenAI span.
+ */
 export type Span = {
   id: string;
   name: string;
   kind: string;
+  /** Owning service — drives the waterfall's per-service colour. */
+  service: string;
+  /** Nesting depth under the root span — drives the hierarchy connectors. */
+  depth: number;
   startPct: number;
   widthPct: number;
   durationLabel: string;
   error: boolean;
-  /** Ordered structured attributes for the selected-span rail. */
-  fields: [string, string][];
-  /** Optional AI content; absent sections are stated, never hidden. */
-  aiContent: { prompt: string; completion: string } | null;
-  aiAbsentReason: string | null;
-  link: { label: string; href: string } | null;
+  /** OTel span status code: OK, ERROR or UNSET. */
+  status: string;
+  /** Parent span id, null on the root — assigned from waterfall order. */
+  parentSpanId: string | null;
+  scopeName: string;
+  scopeVersion: string;
+  attributes: Record<string, string | number | boolean>;
+  droppedAttributesCount: number;
+  events: SpanEvent[];
+  links: SpanLink[];
+  genai: GenAiSpan | null;
 };
 
 /** O-05 — one trace: waterfall, service graph and the selected span's detail. */
@@ -152,6 +283,41 @@ export type TraceDetail = {
   };
 };
 
+/** One GenAI call row — a `genai.messages` or `genai.tool_calls` record. */
+export type GenAiRow = {
+  /** Span id of the extracted record. */
+  id: string;
+  /** ISO instant of the call start, so range filters derive from real time. */
+  at: string;
+  start: string;
+  table: 'messages' | 'tool_calls';
+  service: string;
+  provider: string;
+  operation: string;
+  /** request_model for messages rows; tool_name for tool_calls rows. */
+  model: string;
+  conversationId: string | null;
+  tokensIn: number | null;
+  tokensOut: number | null;
+  durationMs: number;
+  status: { label: string; tone: Tone };
+  traceId: string;
+};
+
+/** O-09 — GenAI call search over the extracted `genai.*` records. */
+export type GenAiView = {
+  matching: Matching;
+  cost: SearchCost;
+  /** Rows currently loaded (load-more appends in steps of 50). */
+  limit: number;
+  hasMore: boolean;
+  /** Field facets for the side panel — server-projected values and counts. */
+  fields: FieldFacet[];
+  /** The WHERE clause the current filters express. */
+  queryWhere: string;
+  rows: GenAiRow[];
+};
+
 /** One dashboard inventory row. */
 export type DashboardRow = {
   id: string;
@@ -162,10 +328,9 @@ export type DashboardRow = {
   updated: string;
 };
 
-/** O-06 — read-only dashboard inventory with a selected preview. */
+/** O-06 — read-only dashboard inventory; rows link straight to detail. */
 export type DashboardsView = {
   rows: DashboardRow[];
-  selected: (DashboardRow & { panels: number; variables: number; defaultRange: string }) | null;
 };
 
 /** One read-only dashboard panel; per-panel states render in place, at size. */

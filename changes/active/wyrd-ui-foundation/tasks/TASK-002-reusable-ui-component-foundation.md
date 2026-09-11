@@ -43,6 +43,25 @@ views without building that future renderer.
 - Keep specialized composition in feature workspaces; do not add a universal
   page, Card, table, or mega-chart component.
 
+# Locked visual implementation authority
+
+- The complete [product render ledger](../../../../crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/README.md)
+  is the consumer authority. Every shared component must name at least two
+  exact accepted artboard IDs from that ledger; a product area name or
+  hypothetical future consumer is insufficient.
+- [`golden-CR-04.svg`](../../../../crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/golden-CR-04.svg),
+  [`golden-O-04.svg`](../../../../crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/golden-O-04.svg),
+  and [`golden-O-09.svg`](../../../../crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/golden-O-09.svg)
+  lock the Gate A shell, hierarchy, density, panel altitude, selection, status,
+  and typography grammar. Keep those files unchanged.
+- `brand/DESIGN.md`, `brand/palette.json`, `brand/components.json`, and the
+  ledger's approved visual grammar jointly define component appearance and
+  semantics. Components must enable the named renders without encoding an
+  entire page composition or weakening a workspace's distinct hierarchy.
+- Evidence must map every component to exact render IDs and show its actual
+  light/dark and narrow-container use. A style-guide-only example does not
+  establish a consumer or prove conformance to an accepted product surface.
+
 # Ordered test scenarios
 
 1. Catalog validation rejects undocumented variants, missing implementations,

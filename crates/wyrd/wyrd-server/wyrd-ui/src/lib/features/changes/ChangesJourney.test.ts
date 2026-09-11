@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { spawn, type ChildProcess } from 'node:child_process';
 import { once } from 'node:events';
-import { fixtureChange, summaries } from '$lib/server/changes/fixtures';
+import { fixtureChange, summaries } from '$lib/server/mock/changes/fixtures';
 import { beforeAll, afterAll, expect, test } from 'vitest';
 
 let server: ChildProcess;

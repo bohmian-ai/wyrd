@@ -110,7 +110,7 @@
             {#each data.view.tasks as task (task.name)}
               <a
                 class="task"
-                href={taskHref(task.name)}
+                href={taskHref(task.name)} data-sveltekit-noscroll
                 aria-current={data.view.selected.name === task.name ? 'true' : undefined}
               >
                 <span><strong>{task.name}</strong></span>

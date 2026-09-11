@@ -33,7 +33,7 @@
   <p class="muted">Calculated drift reports against a declared Drift Card.</p>
   <ObserveNav base={`${base}/observe`} current="Drift" scope={data.scope} />
   <div class="stack">
-    <form class="filters row" method="GET">
+    <form class="filters row" method="GET" data-sveltekit-noscroll data-sveltekit-keepfocus>
       <input type="hidden" name="driftCard" value={data.filters.driftCard} />
       <input type="hidden" name="service" value={data.filters.service} />
       <input type="hidden" name="feature" value={data.filters.feature} />
@@ -97,7 +97,7 @@
                   <tbody>
                     {#each report.features as feature (feature.name)}
                       <tr class={report.selectedFeature.name === feature.name ? 'sel' : ''}>
-                        <td class="mono"><a href={featureHref(feature.name)}><strong>{feature.name}</strong></a></td>
+                        <td class="mono"><a href={featureHref(feature.name)} data-sveltekit-noscroll><strong>{feature.name}</strong></a></td>
                         <td class="mono">{feature.method}</td>
                         <td class={`mono ${feature.verdict.tone === 'danger' ? 'error' : ''}`}><strong>{feature.score.toFixed(2)}</strong></td>
                         <td class="mono">{feature.threshold.toFixed(2)}</td>

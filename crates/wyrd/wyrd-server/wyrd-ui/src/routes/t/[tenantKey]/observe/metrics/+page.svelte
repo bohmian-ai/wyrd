@@ -29,7 +29,7 @@
   <p class="muted">Find a metric, filter its labels, then read the series and its values.</p>
   <ObserveNav base={`${base}/observe`} current="Metrics" scope={data.scope} />
   <div class="stack">
-    <form class="filters row" method="GET">
+    <form class="filters row" method="GET" data-sveltekit-noscroll data-sveltekit-keepfocus>
       <input type="hidden" name="metric" value={data.filters.metric} />
       <Select label="service" name="service" options={serviceOptions} value={data.filters.service} />
       <Select label="range" name="range" options={rangeOptions} value={data.filters.range} />
@@ -56,7 +56,7 @@
                   <li>
                     <a
                       class="mono"
-                      href={metricHref(metric.name)}
+                      href={metricHref(metric.name)} data-sveltekit-noscroll
                       aria-current={data.view.selected?.name === metric.name ? 'true' : undefined}
                       >{metric.name}</a
                     >

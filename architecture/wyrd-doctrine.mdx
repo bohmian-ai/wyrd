@@ -14,17 +14,20 @@ the public doctrine summary for developers and agents.
 |---|---|---|
 | `wyrd-doctrine.mdx` | Design doctrine — the "why" | Stable guidance |
 | `wyrd-design.md` | Protocol spec — the "what" | Wins on conflict |
-| `wyrd-protocol.md` | Older draft — historical reference | Partially superseded |
+| `bifrost-design.md` | Scribe, Oracle, Forge, and analytical storage | Bifrost authority |
+| `wyrd-security-posture.md` | Identity, authorization, tenant security, audit, and external trust | Security authority |
+| `operations/` | Deployment, release, recovery, and incident behavior | Operations authority |
 
 ## Purpose
 
 Wyrd is the AI layer for human and agentic work. It does not become the user's
 application runtime, training framework, workflow engine, or cloud platform.
 
-Wyrd makes AI work declarative, connectable, inspectable, auditable, reproducible, and operable. Users/Agents
+Wyrd makes AI work declarative, connectable, inspectable, auditable,
+reproducible, and operable. Users and agents
 describe the things that matter. Wyrd records those descriptions, validates
 them, links them, observes what happens, governs decisions, and exposes the
-result through human and agent-facing surfaces and an enterprise intelligence layer called Fathom. 
+result through human- and agent-facing surfaces.
 Wyrd is the platform users and agents love to build on, not the platform that builds for them.
 
 ## Object model
@@ -70,7 +73,8 @@ express the concept without lying.
 
 ## Card kinds
 
-The v1 doctrine has 16 native kinds plus `External` for forward compatibility.
+The v1 doctrine has 16 registrable native kinds. `CardKind::External` is a
+non-registrable discriminator for foreign schema descriptors, not a Card spec.
 
 | Domain | Kinds |
 |---|---|
@@ -118,10 +122,17 @@ classification field.
 `tags` are not Wyrd's public metadata contract. Public Card metadata uses
 `labels` and `annotations`.
 
-Authors write `Ref` or `InlineableRef<T>` values inside specs. A `Path` is
-loader-only and is rewritten to a durable `Ref` before the request reaches the
-server. The server derives relationships from durable refs. Lineage reads
-those relationships; users do not author a parallel lineage graph.
+Authors use `Ref` for durable references and `InlineableRef<T>` only where an
+embedded child is part of the declared contract. `Path` is loader-only
+authoring syntax. Composite registration may use `Sibling` to distinguish a
+same-request target, but the server rewrites it to a UID-bearing `Ref` before
+durable persistence. `CardRef` carries `kind`, `name`, one `version` field,
+optional `space`, and optional `uid`. The server derives relationships from
+these references; users do not author a parallel lineage graph.
+
+Drift and Eval are reusable, subject-less peers. Deployment composition binds
+them through versioned `publishes_to`, while runtime observations carry the
+subject identity used for evaluation and filtering.
 
 ## Service boundaries
 
@@ -141,7 +152,10 @@ Services compose foundations instead of inventing private shapes:
 - **Registry** stores and validates cards; derives relationships from `CardRef`s; manages version and space isolation.
 - **Lineage** reads derived relationships to answer provenance queries.
 - **Policy** evaluates CEL rules at register-time (classify), deploy-time (gate), and runtime (invoke).
-- **Bifrost / Observability** records runs and observations in Wyrd's internal OLAP store; reads external data through `Source` cards.
+- **Bifrost / Observability** records runs and observations through Scribe,
+  serves interactive and streamed distributed reads through Oracle, promotes
+  and rewrites Iceberg data through Forge, and reads external data through
+  `Source` cards.
 
 ## Runtime boundary
 
@@ -163,8 +177,24 @@ server-internal state. All contracts live on the API wire, making Wyrd language-
 
 Rust, Python, and TypeScript are first-class SDK languages. Each SDK provides
 idiomatic authoring and client ergonomics over the same server contract, with
-generated types, examples, and user-journey coverage. Go is planned, but it is
-not first-class until those same SDK and verification surfaces ship.
+generated types, examples, and user-journey coverage. Their packages live under
+`sdks/wyrd-sdk-rust`, `sdks/wyrd-sdk-python`, and `sdks/wyrd-sdk-ts`, and all
+consume the shared implementations exposed by `wyrd-client`. Language-specific code must be earned by a
+foreign-runtime boundary and cannot duplicate HTTP, gRPC, validation, or
+durable behavior. Go is planned but does not become first-class until its SDK
+and equivalent contract and journey coverage ship.
+
+Existing Rust owner crates may temporarily retain optional Python features.
+Only `wyrd-sdk-python` activates and aggregates them; Rust and TypeScript SDKs
+do not. New or materially relocated Python logic belongs in the Python SDK,
+which is the long-term home for all Python code. This migration direction does
+not justify moving otherwise untouched code.
+
+Bifrost follows one client path: each language SDK wraps
+`wyrd_client::Bifrost`, which uses the shared `wyrd-client` HTTP and gRPC
+transport to call `wyrd-server`.
+Scribe, Oracle, and Forge remain server-owned subsystems; Gate is their server
+dispatcher, not a role or client type.
 
 The public protocol remains open to every language. A client needs only the
 HTTP and MCP contracts, generated schemas, machine-readable documentation, and
@@ -216,9 +246,7 @@ Every implementation should preserve the doctrine:
 
 If an approved feature exposes a better principle, update this doctrine and
 the active design explicitly; do not preserve stale guidance through a
-permanent exception. If a plan intentionally departs from a rule without
-replacing it, the plan still needs a named exception and a reason strong enough
-to survive review.
+permanent exception. An unexplained conflict remains a blocker.
 
 ---
 
@@ -226,9 +254,9 @@ to survive review.
 
 | Topic | Location |
 |---|---|
-| Full doctrine (19 numbered principles) | `architecture/wyrd-design.md §Doctrine` |
+| Full doctrine (21 numbered principles) | `architecture/wyrd-design.md §Doctrine` |
 | Per-kind spec reference | `architecture/wyrd-design.md §Per-kind specs` |
-| Spec-file authoring, `path:` / `inline` / `ref:` | `architecture/wyrd-design.md §Spec-file authoring` |
+| Spec-file authoring, `path:` / `inline:` / `ref:` | `architecture/wyrd-design.md §Spec-file authoring` |
 | Workspace config (`wyrd.toml`) | `architecture/wyrd-design.md §Workspace config` |
 | Reference-direction quick reference | `architecture/wyrd-design.md §Reference-direction quick reference` |
 | Auth, principal model, delegation | `architecture/wyrd-design.md §Runtime identity` |

@@ -1,0 +1,293 @@
+/* Cards workspace styles: same neobrutalist grammar as Changes and Observe,
+   scoped to `.cards` so the features stay independently owned. */
+.cards {
+  color: var(--text);
+  font: 13px var(--font-sans);
+  min-width: 0;
+  --sep: color-mix(in srgb, var(--border) 30%, var(--surface));
+}
+.cards h1 {
+  font: 700 26px var(--font-display);
+  margin: 0 0 10px;
+}
+.cards h2 {
+  font: 700 16px var(--font-display);
+  margin: 0 0 12px;
+}
+.cards p {
+  margin: 8px 0;
+  line-height: 1.55;
+}
+.cards a {
+  color: var(--brand-strong);
+}
+.cards .muted,
+.cards small {
+  color: var(--muted);
+}
+.cards .mono {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+.cards .row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.cards .between {
+  justify-content: space-between;
+}
+.cards .stack {
+  display: grid;
+  gap: 16px;
+  min-width: 0;
+}
+.cards .columns {
+  display: grid;
+  grid-template-columns: minmax(0, 2.05fr) minmax(240px, 1fr);
+  gap: 20px;
+  align-items: start;
+}
+.cards .control {
+  border: 2px solid var(--border);
+  border-radius: var(--r);
+  background: var(--surface);
+  color: var(--text);
+  font: 700 11px var(--font-mono);
+  padding: 7px 11px;
+  cursor: pointer;
+  text-decoration: none;
+  display: inline-block;
+}
+.cards .primary {
+  background: var(--brand-btn);
+  color: var(--brand-btn-ink);
+  box-shadow: 3px 3px 0 var(--shadow);
+}
+.cards tbody tr,
+.cards .control {
+  transition:
+    background 120ms ease,
+    box-shadow 120ms ease,
+    transform 120ms ease,
+    color 120ms ease;
+}
+.cards tbody tr:hover {
+  background: var(--brand-soft);
+}
+.cards .control:hover {
+  background: var(--brand-soft);
+}
+.cards .primary:hover {
+  background: var(--brand-btn);
+  box-shadow: 4px 4px 0 var(--shadow);
+}
+@media (prefers-reduced-motion: reduce) {
+  .cards tbody tr,
+  .cards .control {
+    transition: none;
+  }
+}
+.cards :is(button, a, input, select, textarea, summary):focus-visible {
+  outline: 2px solid var(--brand-strong);
+  outline-offset: 3px;
+}
+.cards input:not([type='hidden']) {
+  border: 2px solid var(--border);
+  border-radius: var(--r);
+  background: var(--surface);
+  color: var(--text);
+  padding: 8px;
+  font: 12px var(--font-sans);
+  min-width: 0;
+  max-width: 100%;
+}
+.cards .filters {
+  margin-bottom: 18px;
+}
+.cards .filters input[name='q'] {
+  flex: 1;
+  min-width: 160px;
+}
+.cards .chips {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.cards .chips .clear {
+  font: 700 10px var(--font-mono);
+  color: var(--muted);
+  text-decoration: none;
+}
+.cards .chips .clear:hover,
+.cards .chips .clear:focus-visible {
+  color: var(--text);
+  text-decoration: underline;
+}
+.cards .kv {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 4px 14px;
+  align-items: baseline;
+  font-size: 12px;
+}
+.cards .kv > .k {
+  font: 10px var(--font-mono);
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.cards .notice {
+  padding: 10px;
+  border: 2px dashed var(--border);
+  border-radius: var(--r);
+}
+
+/* C-01 — inventory: kind rail beside the results column. */
+.cards .inv-layout {
+  display: flex;
+  gap: 20px;
+  align-items: flex-start;
+  min-width: 0;
+}
+.cards .inv-rail {
+  flex: 0 0 210px;
+  display: grid;
+  gap: 16px;
+  min-width: 0;
+}
+.cards .inv-main {
+  flex: 1;
+  min-width: 0;
+  display: grid;
+  gap: 16px;
+}
+.cards .kind-list {
+  display: grid;
+  font: 11px var(--font-mono);
+}
+.cards .kind-list a {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 5px 7px;
+  border-radius: var(--r);
+  color: var(--text);
+  text-decoration: none;
+  border: 2px solid transparent;
+}
+.cards .kind-list a:hover {
+  background: var(--surface-2);
+}
+.cards .kind-list a[aria-current] {
+  background: var(--brand-soft);
+  border-color: var(--border);
+}
+.cards .kind-list .n {
+  color: var(--muted);
+}
+.cards .recent-list {
+  display: grid;
+  gap: 8px;
+  font-size: 12px;
+}
+.cards .recent-list a {
+  text-decoration: none;
+  color: var(--text);
+  font-weight: 700;
+}
+.cards .recent-list a:hover {
+  text-decoration: underline;
+}
+
+/* C-02 — detail: identity header before the work region and rail. */
+.cards .card-head {
+  display: grid;
+  gap: 6px;
+  margin-bottom: 20px;
+}
+.cards .card-head h1 {
+  margin: 0;
+}
+.cards .kind-pill {
+  font: 700 8.5px var(--font-mono);
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  padding: 3px 7px;
+  border: 2px solid var(--brand-strong);
+  border-radius: 4px;
+  color: var(--brand-strong);
+  background: color-mix(in srgb, var(--brand-strong) 12%, var(--surface));
+}
+/* C-08 — the workflow stage flow strip. */
+.cards .stages {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.cards .stages .stage {
+  border: 2px solid var(--border);
+  border-radius: var(--r);
+  padding: 7px 12px;
+  background: var(--surface-2);
+  font: 700 11px var(--font-mono);
+}
+.cards .stages .arrow {
+  color: var(--muted);
+}
+
+/* M-01 — below 600px the inventory table becomes labeled stacked rows and
+   the kind rail and chips scroll horizontally; nothing is dropped. */
+@media (max-width: 767px) {
+  .cards .inv-layout {
+    flex-direction: column;
+  }
+  .cards .inv-rail {
+    flex: none;
+    width: 100%;
+  }
+}
+@media (max-width: 600px) {
+  .cards h1 {
+    font-size: 20px;
+  }
+  .cards .chips {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+  }
+  .cards .inv-main .wy-table table,
+  .cards .inv-main .wy-table tbody,
+  .cards .inv-main .wy-table tr,
+  .cards .inv-main .wy-table td {
+    display: block;
+  }
+  .cards .inv-main .wy-table thead {
+    display: none;
+  }
+  .cards .inv-main .wy-table tr {
+    padding: 8px 0;
+    border-bottom: 2px solid var(--border);
+  }
+  .cards .inv-main .wy-table tbody tr:last-child {
+    border-bottom: 0;
+  }
+  .cards .inv-main .wy-table td {
+    display: grid;
+    grid-template-columns: 72px minmax(0, 1fr);
+    gap: 10px;
+    padding: 2px 9px;
+    border-bottom: 0;
+    white-space: normal;
+  }
+  .cards .inv-main .wy-table td::before {
+    content: attr(data-l);
+    font: 700 9px var(--font-mono);
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+}

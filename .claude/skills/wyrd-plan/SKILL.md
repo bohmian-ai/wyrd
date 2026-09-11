@@ -1,229 +1,90 @@
 ---
 name: wyrd-plan
-description: Plan Wyrd feature, refactor, migration, API, SDK, CLI, MCP, UI, Skald, Vala/Bifrost, storage, testing, and architecture work as a decision-complete, execution-grounded specification with rehearsed, risk-tiered Luna/Terra/Sol task packets. Use when asked to investigate, design, scope, sequence, decompose, or prepare Wyrd coding work before execution by wyrd-implement or wyrd-implement-plan. Do not use to implement the plan or review completed code.
+description: Turn an approved Wyrd specification into a small set of outcome-complete implementation tasks without prescribing reversible implementation details.
 ---
 
 # Wyrd Plan
 
-Convert user intent and live repository evidence into the smallest
-decision-complete plan that an implementation agent can execute without
-redesign. Lock material behavior and boundaries. Leave reversible mechanics to
-`$wyrd-implement`.
+Produce the minimum task set an implementation agent needs to begin without
+making a product, public API, architecture, security, compatibility,
+cross-service, concurrency-semantics, or persistent-data decision. Stop planning
+at that point.
 
-Planning is complete only when the proposed implementation is executable, not
-when the document merely looks complete.
-
-## Conventions
-
-`$name` denotes a Wyrd skill. Load it with the `Skill` tool. The sigil is also a
-validated token inside the `Execution skill:` metadata field, so it is written
-the same way in prose and in artifacts.
-
-`Luna`, `Terra`, and `Sol` are **risk tiers**, not model names. They set task
-scope, reviewer rigor, and escalation order. They do not select a model:
-implementation agents run on Sonnet and reviewers run on Opus regardless of
-tier. See `.claude/skills/wyrd-implement-plan/references/model-routing.md`.
+Do not use this skill for review remediation. Validated implementation findings
+go directly to `$wyrd-implement`; a finding that changes approved behavior goes
+to `$wyrd-spec`.
 
 ## Establish authority
 
-Before planning:
+Require an explicitly approved `changes/active/<slug>/spec.md`. Read `AGENTS.md`,
+[agent rules](../../../architecture/agent-rules.md),
+[spec-driven development](../../../architecture/references/languages/spec-driven-development.md),
+[implementation execution](../../../architecture/references/languages/implementation-execution.md),
+and [testing workflows](../../../architecture/references/languages/testing-workflows.md).
+Load only applicable architecture references. Follow CodeGraph instructions and
+inspect the owners, consumers, tests, manifests, and `mise.toml` tasks needed to
+identify real boundaries and credible verification.
 
-1. Read `AGENTS.md`, `architecture/agent-rules.md`,
-   `architecture/wyrd-design.md`, and `architecture/wyrd-doctrine.mdx`.
-2. Read the applicable repo-local execution skills:
-   `.claude/skills/wyrd-implement/SKILL.md` and, for UI scope,
-   `.claude/skills/wyrd-ui/SKILL.md`.
-3. Read `architecture/references/README.md`, then only the references relevant
-   to the affected surfaces.
-4. Inspect `mise.toml`, affected manifests, `pyproject.toml`, and lockfiles
-   before naming commands, dependencies, or features.
-5. When `.codegraph/` exists, use CodeGraph before grep, find, or manual
-   source-reading loops.
+If required behavior or an expensive-to-reverse decision remains ambiguous or
+conflicts with repository authority, return `SPEC_REVISION_REQUIRED` instead of
+inventing it.
 
-Current design is authority, not immutable history. A requested change may
-replace an existing decision only when the plan names the superseded authority
-and includes its update. Otherwise treat the conflict as unresolved.
+## Decompose by outcome
 
-## Load planning references progressively
+Each task owns one small observable outcome and its necessary consumer and test
+closure. Split only for a real dependency, a distinct behavioral owner, or an
+independently deliverable outcome. Do not create tasks for files, agents,
+phases, mechanical updates, or arbitrary size targets.
 
-Read each selected reference completely when its stage begins:
+Collectively map every required `REQ-*`, `INV-*`, and `AC-*` obligation. Preserve
+the user journeys and language surfaces required by `AGENTS.md`, but do not
+pre-design test fixtures or private production structure.
 
-| Reference | Load when |
-|---|---|
-| `references/decision-completeness.md` | Resolving requirements, contracts, material boundaries, or allowed adaptation |
-| `references/verification-planning.md` | Inspecting commands, features, fixtures, setup, and proof |
-| `references/task-decomposition.md` | Creating tasks and running implementation rehearsal |
-| `references/plan-format.md` | Drafting, auditing, presenting, or saving the plan |
-| `references/task-packet-format.md` | Drafting or updating task packets |
+## Write tasks
 
-Examples establish density and structure, not repository facts.
+Write tasks under `changes/active/<slug>/tasks/`. Use proportionate Markdown:
 
-## Investigate the repository
+```markdown
+## Objective
 
-Trace the primary workflow and nearest precedent. Establish:
+The observable outcome and mapped spec obligations.
 
-- user or agent outcome and entry point;
-- current behavior, owners, source seams, callers, and tests;
-- public, internal, generated, persisted, and language-projected surfaces;
-- crate, package, service, store, and dependency ownership;
-- security, tenancy, audit, lifecycle, deployment, concurrency, and recovery;
-- manifests, features, explicit targets, fixtures, support exports, and setup;
-- verification commands affected by the dependency cone.
+## Constraints
 
-Separate verified facts, assumptions, unknowns, and unresolved choices.
-Discover repository facts before asking the user.
+Required boundaries, invariants, and explicit non-goals.
 
-## Build the change-impact graph
+## Relevant Surface
 
-Every implementation plan includes a repository-specific Mermaid graph under
-`Current state and evidence`. Start at each seed change and trace labelled
-edges through:
+Likely owners, consumers, contracts, and systems involved. Paths are guidance,
+not a private implementation allowlist.
 
-- owners, callers, consumers, traits, implementations, and dispatch;
-- manifests, Cargo features, explicit test targets, fixtures, and support
-  exports;
-- generated contracts and Rust, Python, TypeScript, HTTP, CLI, MCP, and UI
-  projections;
-- persistence, audit, tenancy, lifecycle, deployment, and recovery;
-- verification commands and their environment or service dependencies.
+## Approach
 
-Use concrete repository nodes. A prose checklist may explain evidence but does
-not replace the graph. Mark a category `no impact` when repository evidence
-shows it is inapplicable.
+Three to seven high-level implementation steps.
 
-## Resolve material decisions
+## Acceptance Criteria
 
-Lock objective, requirements, non-goals, constraints, compatibility, rollout,
-owners, interfaces, state transitions, failure behavior, and proof.
+Concrete success, failure, edge, and regression behavior.
 
-A choice is material when alternatives change public or durable behavior,
-cross-owner contracts, dependencies or features, security or tenancy,
-persistence or migration, data-loss behavior, acceptance outcomes, or required
-verification. Resolve it in the plan.
+## Verification
 
-Leave local, reversible mechanics adaptable: private helper extraction,
-repository-aligned private names and paths, incidental local structure,
-mechanical caller changes, existing fixture use, and equivalent non-weaker
-verification commands.
-
-Define typed stubs for new or materially changed interfaces. Provide normative
-pseudocode when ordering, transactions, state transitions, side effects,
-concurrency, cancellation, or error mapping affect correctness.
-
-## Prove task executability
-
-Before marking a task `Ready`:
-
-1. Inspect every proposed `mise`, Cargo, package, or script command.
-2. Confirm the named task, package, feature, target, filter, fixture, support
-   export, and repository setup exist.
-3. Run the narrow command when feasible. At minimum compile the exact target
-   and feature selection and prove the filter selects the intended tests.
-4. Identify repository-provided services, migrations, environment, and
-   checked-in local test configuration required at execution time.
-5. Record unavailable external infrastructure without presenting runtime proof
-   as passed.
-
-Do not substitute a nearby command without recording the corrected command in
-the task. See `references/verification-planning.md`.
-
-## Rehearse implementation cold
-
-After drafting a task, run a read-only cold rehearsal using only the task
-packet, repository, and normal repository authorities.
-
-Delegate the rehearsal to a fresh read-only agent:
-
-```text
-Agent({
-  subagent_type: 'Explore',
-  description: 'Cold rehearsal <task-id>',
-  prompt: <task packet path only, plus the rehearsal checklist below>
-})
+The focused and broader repository-native checks that can prove completion.
 ```
 
-`Explore` is read-only, so the rehearsal cannot mutate the repository. Give it
-the task packet path and nothing else — no planning conclusions, no intended
-answer, no rationale for the decisions it is meant to independently reach. If
-delegation is unavailable, perform and document the same cold pass yourself
-rather than blocking task readiness.
+Add compact metadata for task ID, approved spec revision, mapped obligations,
+and real dependencies. Include exact commands only for an existing specifically
+named test or a repository-owned verification lane; the implementer may choose
+the smallest suitable new test and fixture structure.
 
-The rehearsal must:
+Do not specify helper functions, private methods, variable names, exact loops,
+local control flow, private module structure, test fixture structure, or exact
+code shape. Do not create subtasks for obvious mechanical work. A reversible
+choice that tests can validate belongs to `$wyrd-implement`.
 
-- locate every target owner and symbol;
-- trace callers, consumers, dispatch, and test seams;
-- inspect every verification command and its setup;
-- walk the first implementation and test steps;
-- identify missing dependencies, unreachable fixtures, or material decisions.
+Before handoff, confirm that every acceptance criterion has an owner and a
+credible proof, every non-goal remains excluded, dependencies are real, and no
+expensive-to-reverse decision is unresolved. Planning does not implement,
+approve, merge, or issue a separate readiness verdict.
 
-Do not give a fresh rehearsal agent the intended answer or planning
-conclusions. Revise and repeat until the rehearsal can begin implementation
-without making a material decision. Document-only architecture review does not
-replace this gate.
-
-## Compile decisions into tasks
-
-Treat task generation as compilation:
-
-```text
-intent + repository evidence + impact graph + decisions + executable proof
-    -> rehearsed risk-tiered implementation task packets
-```
-
-Every plan has at least one separate task. Prefer two through five
-dependency-ordered vertical tasks for medium work. Split on cohesive outcomes,
-stable prerequisites, ownership, risk, or useful context boundaries—not files
-or layers. Assign the Luna risk tier to mechanical tasks, Terra to ordinary
-implementation, and Sol to security, public/persisted contracts, migrations,
-concurrency, cross-owner work, and other materially high-risk tasks. Keep
-plan-level integration and closeout in the parent plan.
-
-The tier sets scope, reviewer rigor, and escalation order — not the model. A
-Sol task is not handed to a stronger implementor; it is scoped tighter, gets a
-stricter review bar, and escalates to controller takeover sooner.
-
-## Hand off a controlled living plan
-
-Requirements, public or persisted contracts, security and tenancy semantics,
-data-loss behavior, material architecture, and acceptance outcomes remain
-immutable without user or planning authority.
-
-During execution, `$wyrd-implement` may append or correct:
-
-- discovered repository facts;
-- internal paths and private symbol names;
-- equivalent non-weaker verification commands;
-- incidental private implementation structure;
-- progress, failures, and evidence.
-
-Record these updates in the active task using
-`references/task-packet-format.md`. A bounded correction does not require a new
-remediation plan. A material conflict sets the task to `Blocked` and returns it
-for authority.
-
-## Audit and emit artifacts
-
-Load both format references and confirm:
-
-- every requirement maps to implementation and objective proof;
-- the impact graph covers the affected dependency cone;
-- all material choices have one answer;
-- every command and setup requirement was execution-checked;
-- every task passed a documented cold rehearsal, fresh-agent when available;
-- task dependencies leave coherent repository states;
-- required independent review passed for risk-gated changes.
-
-Run the structural validator for materialized plans:
-
-```bash
-python .claude/skills/wyrd-plan/scripts/validate_plan_artifacts.py \
-  .dev/plan/<slug>
-```
-
-The validator proves structure, not semantic readiness.
-
-In non-mutating contexts, return one `<proposed_plan>` block with complete
-artifact markers. When authorized, save the plan under
-`.dev/plan/<slug>/implementation-plan.md` and each task under `tasks/`.
-Use `Approved` only after readiness and required review; use `Ready` only for
-tasks in an approved plan that passed executable preflight and cold rehearsal.
+Return `TASKS_PROPOSED`, `PLAN_BLOCKED`, or `SPEC_REVISION_REQUIRED`, followed
+only by task paths and any material blocker.

@@ -9,7 +9,8 @@ export const load: PageServerLoad = ({ locals, url }) => {
   const filters = {
     ...scope,
     status: url.searchParams.get('status') ?? '',
-    q: url.searchParams.get('q') ?? ''
+    q: url.searchParams.get('q') ?? '',
+    limit: url.searchParams.get('limit') ?? ''
   };
   try {
     return { view: locals.wyrd.observeTraces(filters), scope, filters, problem: null };

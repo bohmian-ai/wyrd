@@ -7,12 +7,8 @@
   type Series = { label: string; points: number[] };
   type Stamp = { label: string; at: string };
   type Threshold = { value: number; label: string };
-  let {
-    series,
-    labels = [],
-    unit,
-    threshold
-  }: { series: Series[]; labels?: Stamp[]; unit?: string; threshold?: Threshold } = $props();
+  type Props = { series: Series[]; labels?: Stamp[]; unit?: string; threshold?: Threshold; min?: number };
+  let { series, labels = [], unit, threshold, min = 0 }: Props = $props();
 
   // The plot renders at the container's real pixel width: the viewBox tracks the measured
   // width so a 1.5px stroke is 1.5px on screen. A fixed small viewBox stretched to the
@@ -20,7 +16,9 @@
   let width = $state(0);
   const W = $derived(Math.max(width, 280));
   const H = 168;
-  const x0 = 8;
+  // Y-axis labels live in a reserved left gutter so they never collide with
+  // the series, the threshold dash, or the plot's left edge.
+  const x0 = 36;
   const x1 = $derived(W - 8);
   const yTop = 12;
   const yBot = 138;
@@ -73,10 +71,17 @@
     Math.max(...series.flatMap((s) => s.points), threshold?.value ?? 0) || 1
   );
 
-  const scale = $derived((v: number) => yBot - (v / maxValue) * (yBot - yTop));
+  // The drawn y-domain: `min` lets a banded operational value (availability
+  // around an SLO, a rate inside its band) use the resolution the reading
+  // needs instead of a flat line from zero. Values below min clamp to the axis.
+  const span = $derived(Math.max(maxValue - min, Number.MIN_VALUE));
 
-  /** Compact y tick value, so the axis states real magnitudes ("2.1k", "0.8"). */
+  const scale = $derived((v: number) => yBot - (Math.max(v - min, 0) / span) * (yBot - yTop));
+
+  /** Compact y tick value at the axis's own resolution ("2.1k", "99.96"). */
   function fmt(v: number): string {
+    if (span < 0.5) return v.toFixed(2);
+    if (span < 10) return v.toFixed(1);
     if (v >= 10_000) return `${Math.round(v / 1000)}k`;
     if (v >= 1000) return `${(v / 1000).toFixed(1)}k`;
     if (v >= 10) return `${Math.round(v)}`;
@@ -85,7 +90,7 @@
 
   /** Value labels at the gridlines — a chart must say what its scale is. */
   const ylabels = $derived(
-    grid.map((gy, i) => ({ y: gy, label: fmt(maxValue * (1 - i / 3)) }))
+    grid.map((gy, i) => ({ y: gy, label: fmt(min + span * (1 - i / 3)) }))
   );
 
   const plotted = $derived.by(() => {
@@ -170,7 +175,7 @@
       <line class="grid" x1={x0} y1={gy.toFixed(1)} x2={x1} y2={gy.toFixed(1)} stroke-width="1" stroke-dasharray="2 4" />
     {/each}
     {#each ylabels as l (l.y)}
-      <text aria-hidden="true" class="yl" x={x0} y={(l.y - 3).toFixed(1)}>{l.label}{unit && l.y === grid[0] ? ` ${unit}` : ''}</text>
+      <text aria-hidden="true" class="yl" x="2" y={(l.y - 3).toFixed(1)}>{l.label}{unit && l.y === grid[0] ? ` ${unit}` : ''}</text>
     {/each}
     <line class="axis" x1={x0} y1={yBot} x2={x1} y2={yBot} stroke-width="1" />
     {#if threshold}

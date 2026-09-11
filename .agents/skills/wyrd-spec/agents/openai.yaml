@@ -1,0 +1,4 @@
+interface:
+  display_name: "Wyrd Spec"
+  short_description: "Define a Wyrd behavioral specification"
+  default_prompt: "Use $wyrd-spec to define this Wyrd change's behavior, constraints, and expensive-to-reverse decisions for my approval."

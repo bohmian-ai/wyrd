@@ -36,6 +36,31 @@ outputs, and immutable Card versions.
 - No run launcher, run persistence/query contract, notebook, experiment tracker,
   browser aggregation, or claim that current servers already implement fixtures.
 
+# Locked visual implementation authority
+
+- `C-06` in
+  [`cards.svg`](../../../../crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/cards.svg)
+  locks the concise Experiment workspace entry and its links into the five
+  URL-restorable local destinations.
+- The complete [`cards/experiment/`](../../../../crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/cards/experiment/)
+  package is mandatory: `E-01`–`E-18` cover active/empty Overview, run inventory
+  and lifecycle inspection, compatible comparison, each output meaning,
+  system/provenance/agentic inspection, and versions. The exact URL parameters,
+  states, semantics, and links are locked by the
+  [Experiment ledger](../../../../crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/README.md#cardsexperiment--detailed-experiment-workspace-package).
+- `EM-01`, `EM-02`, and `EM-03` in
+  [`cards/experiment/mobile.svg`](../../../../crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/cards/experiment/mobile.svg)
+  lock run filtering, selected-run inspection, and output inspection at
+  390 × 844. Tables may scroll within their panels; information may not be
+  dropped or moved into an unreachable hover state.
+- Implement the accepted hierarchy and fixture meaning exactly: authored Card
+  summary is distinct from runtime projections; ranking remains a URL-backed
+  viewer act; run lifecycle stays distinct; Metrics, Tables, Visuals, Files,
+  and Artifact Cards keep their separate meanings. Do not substitute a generic
+  experiment tracker or file list.
+- Completion evidence must compare `C-06`, every `E-*`, and every `EM-*`
+  artboard in both themes and retain the ledger's deferred-contract labels.
+
 # Ordered test scenarios
 
 1. Overview and zero-run state preserve the declaration without inventing zero

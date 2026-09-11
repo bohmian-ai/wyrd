@@ -36,6 +36,23 @@ results, execution details, and local session history.
 - No mutations, data loading, destination writes, admin, saved worksheets,
   editor tabs, charts, sharing, collaboration, profiles, or direct Oracle call.
 
+# Locked visual implementation authority
+
+- Implement `Q-01-light` and `Q-01-dark` from
+  [`query.svg`](../../../../crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/query.svg)
+  using the exact catalog → schema → table → column explorer, one editor,
+  Run/Cancel placement, safety panel, Results/Query details/History panes, and
+  empty/running/succeeded/cancelled/failed states in the
+  [Q-01 ledger entry](../../../../crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/README.md#q-01--query-workbench).
+- Implement `M-08-light` and `M-08-dark` from
+  [`mobile.svg`](../../../../crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/mobile.svg):
+  the catalog drawer precedes editor/results, Run and Cancel remain page
+  actions, all three result panes remain reachable, and two-axis results scroll
+  inside their panel.
+- Do not substitute a generic textarea/table, notebook, or Observe subpage.
+  Completion evidence must compare `Q-01` and `M-08` in both themes at their
+  declared viewports and exercise every recorded execution state in place.
+
 # Ordered test scenarios
 
 1. Catalog search selects schema/table/columns and respects tenant/Space scope.

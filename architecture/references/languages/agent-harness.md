@@ -32,6 +32,17 @@ MCP and CLI tools should have:
 MCP tool reads are always available; writes require explicit scopes. Do
 not make agents parse prose when a typed field can carry the same meaning.
 
+Authentication and authorization are server-owned. Tool input never supplies
+trusted tenant or principal identity, and a write scope never bypasses the
+owning domain authorization check. Bound request sizes, result sizes,
+pagination, concurrency, deadlines, and cancellation so an authenticated tool
+cannot become an unbounded resource path.
+
+Before a tool causes the server to fetch a user- or tenant-supplied URL,
+resolve it once, reject every forbidden effective address, and pin the
+connection to the screened address. String-only validation followed by client
+re-resolution is vulnerable to DNS rebinding.
+
 ## Validation
 
 Validation lives where the durable contract lives. If multiple surfaces
@@ -48,36 +59,54 @@ Agent-friendly validation failures include:
 
 Public error catalogs are generated from derive-backed `WyrdError`
 metadata. Do not maintain a hand-written error-code list beside the Rust
-enum — the enum attributes are the source for JSON catalogs, Python typed
-exceptions, TypeScript union members, docs, OpenAPI fragments, and MCP
-error descriptions.
+enum. The enum attributes are the source for catalogs and public problem
+metadata; each boundary projects that metadata without inventing another error
+contract.
 
 ## Generated Artifacts
 
 Generated artifacts are part of the harness. Keep generation commands
 stable and fail on drift:
 
-- `mise run codegen:check` — fail on drift for openapi / schemas / MCP /
-  pyi
-- `mise run codegen:regen` — regenerate everything from source
+- `mise run codegen:check` — fail on drift for OpenAPI, JSON schemas, and
+  public Python stubs
+- `mise run codegen:regen` — regenerate every artifact owned by the
+  code-generation lane from source
 - `mise run codegen:stubs` — regenerate Python stubs
 - `mise run codegen:openapi` — emit `openapi.yaml` from `WyrdApiDoc`
 
-If a schema, stub, OpenAPI file, or MCP artifact is wrong, fix the source
-or generator instead of editing the artifact.
+If a schema, stub, or OpenAPI artifact is wrong, fix the source or generator
+instead of editing the artifact. Runtime MCP catalogs are verified by their
+owning MCP contract and behavior tests; do not infer MCP coverage from the
+code-generation lane.
 
 ## Audit
 
 Audit is foundational across CLI, UI, MCP, Python SDK, TypeScript SDK,
-`wyrd-server`, and Vala surfaces. Every durable read and write appends an
-`vala.audit_outbox` row in the same transaction as the mutation (see
-`architecture/wyrd-design.md` §Audit). The single writer lives at
-`crates/vala/vala-sql/src/queries/audit_outbox.rs::append_audit`; do not
-create parallel writers.
+`wyrd-server`, and Vala surfaces. Audit cardinality follows independently
+durable domain and security transitions, not endpoint invocations. Every
+auditable Postgres transition appends its audit row in the same transaction as
+that transition. A workflow spanning several transactions or an external
+effect audits each significant commit boundary rather than claiming
+whole-workflow atomicity.
 
-## Prompts And Local Guidance
+Oracle query admission is the narrow read exception: a versioned, CRC-framed
+local WAL record must be fsynced before any row can be returned, and the bounded
+relay appends the canonical tenant outbox row at least once. Forge may append a
+tenant-owned event only through its crate-private, tenant-bound
+`OperatorAudit` capability after its scheduler fence and tenant checks pass.
+Do not create alternative audit writers or generic operator escape hatches.
 
-Repo-local skills and `AGENTS.md` are executable guidance for agents. Keep
-them Wyrd-native, concise, and free of stale names. If a convention
-becomes important enough to enforce, add a `mise` task or test instead of
-relying only on prose.
+The outbox is transient delivery state. Retained history is the
+tenant-qualified Bifrost `vala.system.audit_log` projection, published through
+Scribe and Forge. An outbox row retires only after its corresponding retained
+event is durably published. Agent-facing audit reads never treat the outbox or
+a legacy direct-Iceberg projection as a second historical authority.
+
+## Repository Guidance
+
+`AGENTS.md`, `architecture/agent-rules.md`, and the routed architecture
+references are executable repository authority. Keep them Wyrd-native,
+concise, and free of historical names. Protect high-value invariants with the
+compiler, a focused test, or a `mise` check when prose alone cannot prevent
+drift.

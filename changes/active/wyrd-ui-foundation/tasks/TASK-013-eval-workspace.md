@@ -36,6 +36,27 @@ without turning tasks into resources or mixing definition with result.
 - No Eval execution, durable event query contract, task route, or result stored
   on the Card.
 
+# Locked visual implementation authority
+
+- Implement `C-10-light` and `C-10-dark` from
+  [`cards.svg`](../../../../crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/cards.svg)
+  for definition inspection, and `O-08`/`O-09` from
+  [`observe.svg`](../../../../crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/observe.svg)
+  for event inventory and event/workflow/task inspection. The
+  [ledger](../../../../crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/README.md#observesvg)
+  locks URL-restored selection, lifecycle and verdict states, authorization
+  redaction, selected-task detail, links, and missing/error states.
+- [`golden-O-09.svg`](../../../../crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/golden-O-09.svg)
+  is the immutable Gate A reference for the large workflow drawer, stage/task
+  navigation, dominant selected-task inspection, scrim, spacing, and hierarchy.
+- Implement `M-06-light` and `M-06-dark` from
+  [`mobile.svg`](../../../../crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/mobile.svg):
+  Workflow and Task remain two views of one event, selected task remains in the
+  URL, and correlation/technical detail stacks after the result summary.
+- Do not substitute a narrow detail rail, standalone task routes, or a generic
+  table/detail page. Completion evidence must compare `C-10`, `O-08`, `O-09`,
+  and `M-06` in both themes at their declared viewports.
+
 # Ordered test scenarios
 
 1. Card workflow/task declaration inspection retains the surrounding Eval Card

@@ -1,11 +1,9 @@
 # Testing Workflows
 
 Use this reference with
-`architecture/references/languages/implementation-execution.md`. A bounded
-task runs task-defined focused verification with default or exact features. A
-milestone or phase may add the default-feature workspace gate. Treat
-all-feature workspace checks and `mise run pre-pr` as whole-plan closeout
-gates, not per-task defaults.
+`architecture/references/languages/implementation-execution.md`. Run the
+narrowest complete verification set for the changed surface. `mise run gate`
+is the broad CI aggregate; it is not the default local bar.
 
 ## Three Tiers (Priority Order)
 
@@ -14,7 +12,7 @@ lower tiers prove a part works. **A lower tier never substitutes for a
 missing higher one.**
 
 1. **User-journey tests — the primary contract.** Drive the real SDK
-   against a real server (`WyrdTestServer` + embedded Postgres) along a
+   against a real server (`WyrdTestServer` + repository-managed Postgres) along a
    complete user/agent path, client → server → client, no in-process
    engine fixtures. Cover the happy path **and** the edge and negative
    flows a real caller hits (lazy vs eager instantiation, schema
@@ -40,35 +38,60 @@ a unit test *only* is a coverage gap to flag in review.
 
 ## Verification Scope
 
-Run verification for the code you changed. Use the narrowest `mise` task
-that covers the touched surface:
+Verification has three levels:
+
+1. **Bounded task:** run only focused commands for the affected behavior and
+   exact optional features.
+2. **Milestone integration:** run the combined lanes for the integrated
+   dependency closure.
+3. **Whole-plan closeout:** run the repository aggregate required by the
+   approved plan.
+
+Pull requests select only the lanes associated with affected code and its
+dependency closure. The complete non-credentialed correctness suite runs
+nightly on `main`, including Rust, SQL, Python, TypeScript, integration,
+user-journey, Bifrost cluster, identity, and storage-emulator lanes. Live-cloud
+and performance/qualification suites run on separate schedules.
+
+Use the narrowest `mise` task that covers the touched surface:
+
+## Repository-managed Postgres and production-shaped harnesses
+
+`wyrd-dev-fixtures::PgFixture` owns one isolated ephemeral database per test.
+The least-privilege `wyrd_test_admin` role alone creates and drops databases;
+`wyrd_migrator` owns and migrates schemas but cannot create or drop databases.
+`PgFixture::attach` lets child processes reuse the parent-created database
+without remigration, reseeding, or cleanup authority. Attached fixtures are
+non-owning and cannot destroy the parent database.
+
+`wyrd-testing` is the authority for `WyrdTestCluster`, production-shaped server
+and multi-process fixtures, Forge fixtures, Bifrost telemetry capture, and the
+capability-target Bifrost journey suite. Do not replace those paths with
+globally serialized shared-container fixtures or in-process engine substitutes.
+The retired Bifrost benchmark/qualification harness layer and its removed
+public testing APIs, fixtures, scripts, docs, and `mise` tasks are not part of
+the current testing architecture and must not be restored from an older branch.
 
 ### Format and lint
 
 ```bash
-# Bounded task: run only commands required by its affected surface.
 mise run fmt            # when Rust changed
+mise run lints          # workspace Clippy with repository feature policy
 mise run py:format      # when Python changed
 mise run py:lints       # when Python changed
 mise run py:typecheck   # when Python public typing changed
-
-# Milestone or phase integration:
-mise run check:default  # fmt check + workspace Clippy, default features
-
-# Whole-plan closeout:
-mise run check          # fmt check + workspace Clippy, --all-features
 ```
 
-Use the focused lint command named by the active task. Do not substitute
-`check:default` for missing task-level lint scope; return an under-specified
-task for correction when choosing a broader gate would materially expand
-verification.
+`mise run check` is the format-check plus workspace Clippy aggregate. Use it
+when the affected scope calls for that combined check. There is no separate
+aggregate for a default-feature-only workspace pass.
 
 ### Rust crate changes
 
-Prefer crate-family `mise` tasks (they set up env, migrations, and
-fixtures). Use raw `cargo test` only for narrow pure unit tests with no
-repo setup.
+Use crate-family `mise run` tasks for crate-, module-, family-, environment-,
+and aggregate-level coverage; they set up required env, migrations, and
+fixtures. Every specifically named Rust test uses an exact task-recorded
+`mise exec -- cargo nextest run` command.
 
 ```bash
 mise run test:wyrd            # wyrd/* family (no DB)
@@ -78,17 +101,29 @@ mise run test:shared          # shared/* family (no DB)
 mise run test:sql             # live Postgres SQL integration tests
 mise run test:bifrost         # vala-bifrost integration tests
 mise run test:bifrost:journey # Rust bifrost user-journey tests/multi-pod distributed tests
+                              # (capability binaries + registration rule:
+                              #  crates/wyrd/wyrd-testing/tests/README.md)
 mise run test:e2e             # server-level e2e (wyrd-auth, wyrd-server, wyrd-testing, wyrd-client, vala-sdk)
 mise run test:storage:matrix  # storage emulator matrix (S3/GCS/Azure)
 
-# Narrow single-test iteration:
-mise exec -- cargo test --locked -p <crate> <test_name> -- --nocapture --test-threads=1
+# Narrow named lib test:
+mise exec -- cargo nextest run --locked -p <crate> --lib \
+  -E 'test(=module::tests::test_name)'
+
+# Narrow named integration-test target:
+mise exec -- cargo nextest run --locked -p <crate> --test <target> \
+  -E 'test(=test_name)'
 ```
 
-`--all-features` in bounded-task, milestone, or phase commands forces the heavy
-feature union to recompile and defeats artifact reuse. Prefer default features
-or the exact feature set the changed behavior needs. The integrated whole-plan
-`check` verifies the workspace feature union once at closeout.
+Confirm exact target and test names from source and, when needed,
+`mise exec -- cargo nextest list`. Include repository-managed setup in the
+command for tests that require Postgres, storage emulators, or a live server.
+Do not use a positional filter that can pass after selecting no test.
+
+`--all-features` in test commands forces the heavy feature union to recompile
+and defeats artifact reuse. Prefer default features or the exact feature set
+the changed behavior needs. Repository lint/type-check tasks own their declared
+feature policy.
 
 ### Python changes
 
@@ -110,12 +145,15 @@ mise run ts:test:integration  # in-process WyrdTestServer client→server journe
 mise run ts:napi:check        # napi-generated index.d.ts committed
 ```
 
-### Contract / schema / MCP / stub changes
+### Contract, schema, OpenAPI, or stub changes
 
 ```bash
-mise run codegen:check   # fail if openapi / schemas / MCP / pyi drift
+mise run codegen:check   # fail if OpenAPI / JSON schema / public pyi drift
 mise run codegen:regen   # regenerate everything from source
 ```
+
+Runtime MCP catalogs are verified through their owning MCP tests, not through
+the code-generation snapshot.
 
 ## Boundary Checks
 
@@ -134,7 +172,7 @@ a specific change will trip:
 | `check:registry-immutable-spec-hash` | `wyrd.cards` trigger raises `P0001` |
 | `check:registry-single-table` | Single `wyrd.cards` table; no per-kind shadow tables |
 | `check:object-store-pin` | Single versions of `object_store`/`datafusion`/`arrow`/`parquet` |
-| `check:from-pools-allowlist` | `from_pools` called only at 16 allowlisted sites |
+| `check:from-pools-allowlist` | Pool construction remains limited to sanctioned production and fixture boundaries |
 | `check:fixtures-no-server` | `wyrd-dev-fixtures` does not import `wyrd-server` |
 | `check:no-legacy-server-vocab` | Reject legacy vocabulary + orphan-rule violations |
 | `check:no-tonic-outside-wyrd-tonic` | Reject tonic-family deps outside `wyrd-tonic` + workspace pins |
@@ -148,15 +186,13 @@ a specific change will trip:
 
 ## Aggregate CI Gate
 
-`mise run pre-pr` runs the full battery: the all-feature `check`, `test:unit`,
-`test:bifrost`, `codegen:check`, `cardkind:check`, `check:design-sync`,
-every boundary gate above, `py:setup`, `py:format:check`, `py:lints`,
-`py:typecheck`, `py:test:unit`, plus example / docs / vocab gates.
-
-Run `pre-pr` after a complete integrated plan when the plan requires it, or
-when the change modifies shared CI/build/test infrastructure, prepares a
-release, or the user explicitly asks for it. It is a final confidence sweep,
-**not** the normal bar for a task, milestone, or phase.
+`mise run gate` runs the broad repository battery: workspace checks, unit and
+Bifrost tests, code generation, boundary invariants, Python and TypeScript
+checks, examples, and documentation checks. Run it locally for intentionally
+broad cross-boundary changes, shared CI/build/test infrastructure, release
+qualification, or an explicit request. Otherwise run focused proof and let CI
+or nightly qualification own the aggregate. Pull requests do not run the full
+aggregate merely because Rust changed.
 
 Run all Cargo-backed commands sequentially across agents sharing a checkout or
 target directory. Parallel source work must not create overlapping Cargo

@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { expect, test } from 'vitest';
-import { fixtureChange } from '$lib/server/changes/fixtures';
+import { fixtureChange } from '$lib/server/mock/changes/fixtures';
 test('server fixtures separate judgment, execution, provenance and authorization', () => {
   const change = fixtureChange();
   const checks = change.claims.flatMap((claim) => claim.checks);

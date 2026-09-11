@@ -6,116 +6,40 @@ logic in Rust. Contracts live on the API wire through typed schemas,
 HTTP/MCP payloads, generated docs, and stable errors so any language can
 implement a client.
 
-First-class SDKs ship for Python, Rust, and TypeScript. Go is planned but
-not first-class until its SDK ships. First-class SDKs may add local
-authoring helpers, OTEL hooks, and agent workflow integration; they must
-not duplicate durable server behavior or make Wyrd language-exclusive.
+First-class SDKs ship for Python, Rust, and TypeScript. First-class SDKs may add
+local authoring helpers, OTEL hooks, and agent workflow integration; they must
+not duplicate durable server behavior or make Wyrd language-exclusive. Other
+languages implement the same protocol through the public wire contracts.
+
+The packages live under `sdks/wyrd-sdk-rust`, `sdks/wyrd-sdk-python`, and
+`sdks/wyrd-sdk-ts`. All three consume `wyrd-client`, the sole shared Rust
+client implementation and SDK-facing surface; bindings and language packages
+do not reach through to server owners or independently assemble transports.
 
 Wyrd is agent-first and headless: MCP, CLI, HTTP, generated schemas,
 stable errors, and machine-readable docs are primary surfaces. The
 developer UI is supported, but not the source of truth.
 
-## Crate Ownership (Actual Inventory)
+## Ownership boundaries
 
-### `crates/wyrd-spec`
+Keep ownership at the narrowest Wyrd layer that has the behavior and its
+dependency cost. `wyrd-spec` owns pure wire contracts and validation;
+`wyrd-server` owns serving, tenancy, policy, audit, and durable orchestration;
+Vala owns observations, evaluation, drift, and analytical engines; Skald owns
+provider, prompt, tool, agent, and workflow primitives. `wyrd-client` composes
+the shared client implementations; language SDKs project it without creating
+parallel durable state.
 
-Pure contracts, IDs, cards/specs, schema generation, request/response
-shapes, validation, stable error catalog. PyO3-free, IO-free, async-free.
+Vala and Bifrost crates are engines/data-plane libraries, never network
+servers. The server remains the only listener. Client-tier crates stay free of
+analytical dependencies such as SQL, cloud SDKs, DataFusion, Iceberg, and
+object-store engines. When a behavior crosses a boundary, put the shared
+contract in `wyrd-spec`, durable behavior in its owner, and expose it through
+typed HTTP/MCP/SDK projections.
 
-### `crates/wyrd/*` — control plane
-
-- `wyrd` — public umbrella / sanctioned re-exports.
-- `wyrd-auth` — server-tier auth domain logic.
-- `wyrd-cards` — Card storage + Card type definitions (Python owner).
-- `wyrd-cli` — human-facing CLI.
-- `wyrd-config` — configuration management (Python owner).
-- `wyrd-interfaces` — serialization, compression, Card IO (Python owner).
-- `wyrd-mcp` — agent-facing MCP tool surface.
-- `wyrd-server` — HTTP server and application state; **the only serving
-  surface**.
-- `wyrd-sql` — durable Postgres schema, migrations, query compilation for
-  Wyrd artifacts. No `axum`/`hyper`/`tower` (enforced).
-- `wyrd-storage` — server-tier storage handles, cloud backend signers
-  (S3/GCS/Azure), OpenDAL operator.
-- `wyrd-testing` — `WyrdTestServer` fixtures + HTTP testing utilities
-  (Python owner, dev-only wheel).
-- `wyrd-tonic` — gRPC server/client bindings (single owner of tonic-family
-  deps; enforced by `check:no-tonic-outside-wyrd-tonic`).
-
-### `crates/shared/*` — cross-cutting foundation
-
-- Auth: `wyrd-auth-check`, `wyrd-auth-issue`, `wyrd-auth-oidc`,
-  `wyrd-auth-verify`.
-- Runtime: `wyrd-runtime` (async runtime + PyO3 sync/async bridge),
-  `wyrd-queue` (bounded producer + BatchSink seam).
-- Domain primitives: `wyrd-semver`, `wyrd-version`.
-- Observability: `wyrd-telemetry`.
-- Transport / client: `wyrd-client`.
-- Security / crypto: `wyrd-crypt`.
-- Test infra: `wyrd-dev-fixtures`, `wyrd-test-contract-macros`.
-- Utilities: `wyrd-utils` (Python owner), `wyrd-error-derive`.
-
-Client-tier crates do not depend on `sqlx`, cloud SDKs, `datafusion`, or
-`deltalake` (enforced by `check:client-tier`).
-
-### `crates/skald/*` — LLM runtime plane
-
-- `skald-spec` — Skald contracts (no PyO3, no server deps).
-- `skald-observer` — Observer trait + implementations for agent/workflow
-  events (Python owner).
-- `skald-providers` — provider registry + driver interface.
-- `skald-runtime` — native provider runtime dispatch + mock provider seam
-  (Python owner).
-- `skald-cache` — agent result caching.
-- `skald-prompt` — prompt generation + templating (Python owner).
-- `skald-tool` — tool definition + execution (Python owner).
-- `skald-agent` — live agent: identity, provider, tools, tool loop
-  (Python owner).
-- `skald-workflow` — DAG scheduler, tasks, cross-provider handoff (Python
-  owner).
-
-Skald does not depend on Vala.
-
-### `crates/vala/*` — observability + analytical plane
-
-- `vala-core` — server-internal analytical + alert-routing core.
-- `vala-sdk` — client SDK: Bifrost ingest sink, pooled producers, observe
-  surface (Python owner).
-- `vala-sql` — Vala Postgres schema and migrations (`vala.file_list`,
-  `vala.cluster_nodes`, `vala.audit_outbox`, `vala.maintenance_leases`,
-  etc.). Outlives individual Bifrost engine implementations.
-- `vala-ingest` — data ingestion pipeline.
-- `vala-bifrost` — OLAP write/read engine on Apache Iceberg + DataFusion.
-- `vala-drift` — in-memory PSI/SPC/Custom drift baseline fit + scoring.
-- `vala-eval` — DAG-stage execution, operators, scoring, aggregation,
-  comparison.
-
-Vala may depend on Skald for reusable agent evaluation. `vala-*` crates
-are engines/libraries — they do **not** own HTTP/gRPC serving.
-
-### `python/py-wyrd` — Python extension aggregator
-
-Thin PyO3 module root. Registers approved owner-crate submodules; does
-not duplicate validation, lifecycle, registry, storage, or runtime logic.
-
-### Planned But Not Yet Present
-
-- **`wyrd-sdk`** — approved Python owner per `AGENTS.md` §2; not yet in
-  tree.
-- **`crates/bindings/*`** — TypeScript/napi and future native SDK
-  bindings; not yet in tree. TypeScript SDK today talks to `wyrd-server`
-  over HTTP + gRPC.
-
-Do not assume these paths exist when writing code today.
-
-## Approved Python Owner Crates
-
-Twelve crates enable a `python` feature (enforced by
-`check:pyo3-scope`):
-
-`wyrd-cards`, `wyrd-config`, `wyrd-interfaces`, `wyrd-observe`,
-`wyrd-testing` (dev-only), `wyrd-utils`, `skald-agent`, `skald-prompt`,
-`skald-runtime`, `skald-tool`, `skald-workflow`, `vala-sdk`.
+For exact owner paths and approved Python features, consult `AGENTS.md` and the
+focused language references; this file documents structural patterns rather
+than a package inventory.
 
 ## Contract Placement
 
@@ -134,9 +58,11 @@ Keep `wyrd-spec` free of:
 - cloud SDKs
 - telemetry SDK implementation dependencies
 
-Python-visible wrappers around `wyrd-spec` contracts live in owner crates
-(e.g. `wyrd-interfaces`, `wyrd-cards`) behind optional `python` features.
-`python/py-wyrd` registers those wrappers; it does not reimplement logic.
+Python-visible wrappers around Rust-native contracts are aggregated by
+`sdks/wyrd-sdk-python`; the package does not reimplement `wyrd-client` logic.
+Existing owner-crate `python` features may remain as migration state, enabled
+only by the Python SDK. New or materially relocated Python code belongs in the
+Python SDK; Rust and TypeScript SDKs never enable the retained features.
 
 `wyrd-spec` is foundational but not a dumping ground for all contracts.
 If it is not spec-related, find another place for it.
@@ -153,18 +79,18 @@ Wyrd Rust code uses the required struct-centered hybrid style from
 | Pure helper | Stateless deterministic calculation or narrow conversion | Small module function |
 
 `crates/shared/wyrd-registry/src/handle.rs::Cards` is the canonical service
-pattern. `Cards` owns a shared `RegistryEngine`; callers discover registry
-workflows through methods such as `register`, `get`, `load`, and `delete`.
-Focused internal modules implement narrow stages, while the public handle owns
-the capability and workflow boundary.
+pattern. `Cards` owns the client and focused registry engine; callers discover
+registration, resolution, listing, loading, and deletion through typed methods
+instead of receiving those dependencies separately. Narrow private modules own
+mechanics while the public handle owns the capability boundary.
 
 ```text
 Cards
-└── RegistryEngine
-    ├── WyrdClient
-    └── storage client
+├── WyrdClient
+├── registry engine
+└── focused private helpers
 
-Cards methods             public and internal workflows
+StorageHandle methods     public and internal workflows
 Focused private methods   stateful workflow stages
 Module helper functions   pure validation and transformation only
 ```
@@ -201,6 +127,8 @@ Server handlers:
 - Carry trace instrumentation (`#[tracing::instrument]` with scrubbed
   args).
 - Attach request and audit context for durable writes.
+- Derive tenant and actor identity from verified authentication state, never
+  from an untrusted request field.
 - Avoid cloning heavy state.
 - Avoid constructing clients or pools inside handlers.
 
@@ -219,6 +147,21 @@ Clients (Rust, Python, TypeScript SDKs):
 - Do not bypass registry, storage, policy, audit, tenancy, relationship,
   or status ownership from a convenience path.
 
+Bifrost has one client composition:
+
+```text
+language SDK
+  -> wyrd_client::Bifrost
+  -> shared wyrd-client HTTP and gRPC transport
+  -> wyrd-server
+  -> server-owned Scribe, Oracle, and Forge
+```
+
+The facade owns table management, buffered ingestion, query streaming, and
+query lifecycle operations. Gate is the server dispatcher, not a deployment
+role or client. `QueryClient` and `BifrostGrpcTransport` may exist as private
+facade mechanics; bindings must not publish or assemble them as sibling clients.
+
 ## Storage And Registry Pattern
 
 - Keep durable metadata contracts typed.
@@ -226,7 +169,14 @@ Clients (Rust, Python, TypeScript SDKs):
 - Keep encryption and key handling centralized.
 - Do not bypass registry, storage, or audit invariants from convenience
   paths.
-- Card registry writes stay inside the caller's `TenantConn` tx
+- Tenant-scoped SQL accepts `&mut TenantConn<'_>` and relies on Postgres RLS;
+  it does not accept a raw pool, connection, or transaction and does not add a
+  parallel hand-written tenant predicate.
+- The caller owns commit and rollback. Callees compose work inside the supplied
+  transaction without ending it.
+- Cross-tenant operator work uses `OperatorPool` under explicit administrative
+  authority and preserves tenant-qualified identities at every durable seam.
+- Card registry writes stay inside the caller's `TenantConn` transaction
   (enforced by `check:registry-tx-coupling`).
 - Single `wyrd.cards` table; no per-kind shadow tables (enforced by
   `check:registry-single-table`).
@@ -244,6 +194,33 @@ Provider code separates:
 
 Do not scatter provider string checks across unrelated crates. Add typed
 capability or provider metadata instead.
+
+## External Network Pattern
+
+`Source` adapters are read-only and server-owned. Operator HTTP actions are
+also server-owned. Cards carry typed non-secret coordinates and secret-store or
+environment references, never credential values.
+
+For every tenant-controlled URL:
+
+1. Resolve DNS once.
+2. Reject the request if any resolved address violates the deployment's network
+   policy.
+3. Connect to the screened address without re-resolution.
+4. Repeat resolution, screening, and pinning for every redirect.
+
+Cloud metadata and link-local ranges are always blocked. Production also
+blocks loopback, private, carrier-grade NAT, and unique-local ranges. Validating
+the input string and resolving again at connection time is not sufficient; it
+permits DNS rebinding.
+
+## Agent Surface Pattern
+
+HTTP, MCP, CLI, and SDK surfaces project the same typed request, response,
+permission, error, and audit contracts. MCP read tools are always available;
+write tools require explicit scopes. An agent-facing convenience path must not
+weaken tenant isolation, policy, input validation, audit, or error stability,
+and the UI cannot be its only surface.
 
 ## Observability And Evaluation Pattern
 
@@ -265,8 +242,45 @@ provider responses.
 
 ## Audit Pattern
 
-Audit is foundational across every surface. Every durable read and write
-appends an `vala.audit_outbox` row in the same transaction as the
-mutation. The single writer is
-`crates/vala/vala-sql/src/queries/audit_outbox.rs::append_audit`. Do not
-create parallel writers.
+Audit is foundational across every surface. Audit cardinality follows
+auditable domain operations and independently durable transitions, not handler
+or request count. One request can produce several audit records; supporting
+bookkeeping does not receive its own record unless it is independently
+meaningful.
+
+Every auditable Postgres transition appends through the canonical audit writer
+in the same transaction as that transition. A workflow spanning transactions
+or an external effect records each security- or lifecycle-significant commit
+boundary independently; it does not claim whole-workflow atomicity. Do not
+create parallel audit writers.
+
+The one narrow exception is Oracle query-read admission: it first fsyncs a
+versioned CRC-framed local WAL record, then a single bounded background relay
+calls the same `append_audit` writer at least once. This exception does not
+apply to Postgres mutations or any other durable transition.
+
+`vala.audit_outbox` is transient transactional delivery state. Contiguous,
+tenant-scoped ranges are projected idempotently through the current Scribe and
+Forge publication path into retained `vala.system.audit_log` history. A range
+may be removed from the outbox only after its corresponding audit-log
+publication is durable. Publication, retirement, and partial-boundary recovery
+form one explicit lifecycle; the outbox and retained log are not competing
+historical authorities.
+
+Forge may append tenant-owned audit only through the crate-private,
+tenant-bound `OperatorAudit` capability after scheduler fencing and tenant
+equality checks succeed. The capability performs canonical audit append inside
+the same fenced operator transaction and exposes no generic executor escape
+hatch.
+
+## Verification Pattern
+
+Every user- or agent-facing capability is proven through a real client → server
+→ client journey on each public surface it ships. The journey covers its happy
+path and applicable negative and edge paths, including permission denial,
+conflict, replay, backpressure, and rejection behavior. Integration and unit
+tests isolate supporting seams; they do not replace the journey.
+
+Generated schemas, stubs, OpenAPI, and golden contracts are derived from their
+owning sources and checked for drift. Runtime MCP catalogs are verified by
+their owning MCP tests. Never edit a generated artifact directly.

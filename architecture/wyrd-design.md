@@ -6,9 +6,9 @@ This document is the current design of the Wyrd protocol. It is **stateless**:
 it reflects the shape as it stands now. Decision history lives in git
 (`git log architecture/wyrd-design.md`).
 
-When this disagrees with `wyrd-protocol.openapi.yaml`, `wyrd-protocol.md`,
-`specs/*.yaml`, or the Rust code in `crates/wyrd-spec`, **this file wins**.
-Downstream artifacts are brought up to this version in a sync pass.
+When this disagrees with generated contracts, examples, or the Rust code in
+`crates/wyrd-spec`, **this file wins**. Downstream artifacts are brought up to
+this version in a sync pass.
 
 Current authority is not immutable design. An approved feature may replace a
 decision here when the new design better serves the user workflow. Such a
@@ -31,7 +31,7 @@ drift, not permission for code and documentation to diverge.
   - [Drift](#drift) · [Eval](#eval) · [Source](#source) · [Bifrost](#bifrost--wyrds-olap-warehouse)
   - [Trigger](#trigger) · [Operator](#operator)
 - [Registry lifecycle](#registry-lifecycle) — composite registration, card blob, idempotency
-- [Spec-file authoring](#spec-file-authoring) — `ref` / `select` / `path` / `inline`, pre-registration matrix
+- [Spec-file authoring](#spec-file-authoring) — `ref` / `path` / `inline`, pre-registration matrix
 - [Workspace config](#workspace-config-wyrdtoml) — `wyrd.toml` defaults and merge rules
 - [Reference-direction quick reference](#reference-direction-quick-reference) — who refs whom
 - [Worked directory layout](#worked-directory-layout) — example deployment tree
@@ -176,17 +176,18 @@ drift, not permission for code and documentation to diverge.
     The server, registry, and evaluator reject unresolved paths at their
     boundaries.
 
-    `select` and `path` resolve to a typed registration reference before send;
-    only `ref`, registration-only `sibling`, and `inline` cross a composite
-    registration wire. Heavy cards (Model, Data, Experiment, Artifact) accept
-    `ref` or `select` only — `inline` is rejected because identity anchors
-    lineage. Environment/stage is target-card metadata (`labels` /
+    `path` resolves to a typed registration reference before send; only `ref`,
+    registration-only `sibling`, and `inline` cross a composite registration
+    wire. Heavy cards (Model, Data, Experiment, Artifact) accept `ref` only —
+    `inline` is rejected because identity anchors lineage. Environment/stage is
+    target-card metadata (`labels` /
     `annotations`), never `space`; `space` is team/workspace scope only, and
     one server may hold development, staging, and production cards side by side.
     See §"Light-card reference forms" for loader rules and the slot inventory.
 20. **User journeys are the primary test contract.** A capability is not done
     until a real user/agent path proves it end-to-end — client → server →
-    client, against a real server (`WyrdTestServer` + embedded Postgres), not a
+    client, against a real server (`WyrdTestServer` + repository-managed
+    Postgres), not a
     mock. The journey is the unit of correctness: for a data surface,
     instantiate → write → shutdown/flush → read; for an agent/MCP surface,
     discover → act → observe. Unit and integration tests support journeys by
@@ -235,11 +236,43 @@ schemas, stable errors, and machine-readable documentation are sufficient to
 implement a complete client without depending on Rust, Python, or TypeScript
 internals.
 
+`wyrd-client` is the one shared Rust client implementation and SDK-facing
+surface. The first-class language packages live under `sdks/wyrd-sdk-rust`,
+`sdks/wyrd-sdk-python`, and `sdks/wyrd-sdk-ts`; all three consume
+`wyrd-client` rather than reaching through to server or domain implementation
+crates. Language-specific code is limited to behavior earned by a
+foreign-runtime boundary, such as Python async integration, Node loading,
+generated declarations, or idiomatic local authoring helpers. It does not
+duplicate transport or durable behavior.
+
+Existing Rust owner crates may retain their optional `python` features during
+this integration. Only `wyrd-sdk-python` enables and aggregates those features;
+the Rust and TypeScript SDKs do not. New or materially relocated Python logic
+belongs in `wyrd-sdk-python`. Consolidating all existing Python logic there is
+the target direction, not a reason for unrelated code movement during this
+merge.
+
+Bifrost follows the same rule:
+
+```text
+Rust / Python / TypeScript SDK
+  -> wyrd_client::Bifrost
+  -> shared wyrd-client HTTP and gRPC transport
+  -> wyrd-server public edge
+  -> server-owned Scribe, Oracle, and Forge
+```
+
+Gate is the server dispatcher, not a deployment role or client type. Language
+bindings wrap `wyrd_client::Bifrost`; they do not assemble independent query
+and ingest clients or implement their own HTTP or gRPC transports.
+
 ---
 
 ## Kind catalog
 
-16 native kinds + `External { name, schema_hash }` for forward-compat.
+Wyrd registers 16 native Card kinds. `External { name, schema_hash }` is a
+non-registerable forward-compatible wire discriminator for unknown future
+kinds. There is no `ExternalSpec` and no External Card registration path.
 
 | Domain        | Kinds |
 |---------------|-------|
@@ -1114,128 +1147,35 @@ query, HTTP query) are different drivers behind one read trait; the Card schema
 never declares strategy — `vala` chooses it from the bucket and vendor, the same
 way it chooses the Drift/Eval evaluation strategy.
 
-### Bifrost — Wyrd's OLAP warehouse
+### Bifrost
 
-`Source` is the external read side ("Wyrd reads, never writes" — Doctrine #7).
-**Bifrost** is its Wyrd-owned counterpart: the public OLAP warehouse surface and
-analytical storage substrate `vala` uses to record Wyrd's **own** observations
-(drift events, eval records, OTel / GenAI traces, audit projections, and future
-analytical tables). It is Wyrd server state, not an external system and not a
-vendor.
+Bifrost is Wyrd's public OLAP warehouse surface and the analytical substrate
+used by Vala. It is server state, not a Card kind, external Source, deployment
+role, or client-side runtime. Its physical analytical identity is
+`(tenant, logical table)`; there are no shared physical analytical tables.
 
-**Bifrost is not a Card kind, and there is no `WarehouseCard`.** It is the
-general-case storage *shape*, not a registry entry. Per Doctrine #2 (one fact,
-one owning Kind) and Doctrine #7, internal observation storage is owned wholly by
-`vala`; nothing an author writes points at it, so it has no card identity. The
-external read-shape buckets above (`object_store`, `sql_warehouse`, …) describe
-data Wyrd *reads*; `sql_warehouse` is an external `SourceKind` and is unrelated
-to Bifrost. Use `Bifrost` for Wyrd's OLAP warehouse. Do not introduce a
-`warehouse` noun on public API paths, Python modules, Card kinds, resources, or
-internal surfaces — it would collide with the external `sql_warehouse` Source
-semantics.
+The complete Bifrost architecture—including Scribe ingestion and recovery,
+Oracle admission and query execution, Forge publication and maintenance,
+resource limits, WALs, tenancy, and audit acceptance—lives in
+[`bifrost-design.md`](./bifrost-design.md), which is authoritative for the
+subsystem.
 
-**Everything is a Bifrost table.** One table shape underlies every internal
-analytical table, with four reserved system columns: `wyrd_event_time`,
-`wyrd_ingested_at`, `wyrd_batch_id`, and `data_tenant_id`. Each table carries a
-`scope`:
+The public client path is singular:
 
-- **TenantOwned** — one physical table per tenant; isolation is structural
-  (per-tenant Iceberg namespace / path). No `data_tenant_id` column.
-- **SystemShared** — one physical table shared across tenants (used for
-  high-tenant-count, low-per-tenant-volume data where one table per tenant would
-  fragment into millions of small files); rows carry `data_tenant_id` and tenant
-  isolation is enforced on read from the authenticated principal's tenant.
+```text
+Rust / Python / TypeScript SDK
+  -> wyrd_client::Bifrost
+  -> shared wyrd-client HTTP and gRPC transport
+  -> wyrd-server public edge
+  -> server-owned Scribe, Oracle, and Forge
+```
 
-The substrate is Apache Iceberg-managed Parquet in object storage, with Postgres
-as the Iceberg catalog and control plane and DataFusion as the query engine —
-consistent with Doctrine #4 (Postgres is control-plane only; analytical data
-lives in object store). Runtime ownership stays in `vala`: the `vala-bifrost`
-engine crate owns the Iceberg/DataFusion warehouse engine, `vala-ingest` owns
-gRPC ingest _(under revision — serving ownership moving to wyrd-server, reconciled in a follow-up design pass)_, and `wyrd-spec::vala::api` owns the
-public wire contracts. HTTP serving for these routes now belongs to `wyrd-server`:
-the eval consolidation dissolved the former `vala-http` crate, per the principle
-below. Python-visible Bifrost behavior lives in `vala-sdk` (the
-approved Vala Python owner crate) behind its optional `python` feature.
-
-**Principle — wyrd-server is the only serving surface.** `vala-*` crates are
-engine and data-plane libraries; they are never HTTP or gRPC serving crates.
-`wyrd-server` is the single process that binds ports and owns all HTTP/gRPC
-serving. The eval consolidation (commits 01–05) is the first realization of
-this principle; Bifrost/ingest serving reconciliation follows in a separate
-design pass. The eval pull-protocol session-run (`/v1/eval/runs/{run_id}`) is an
-ephemeral server-side session entry for concurrency and ownership tracking; it
-is distinct from the doctrinal `RunRef` — the Card→Run→Observation run is a
-client-side execution record (see the "There is no run registry" note under
-_Observation identity — `Card → Run → Observation`_), never server-persisted.
-
-**Public surface.** Bifrost is a stable Wyrd public surface across HTTP, gRPC,
-Python, generated schemas, MCP/agent documentation, and stable error codes.
-The public contract includes:
-
-- HTTP table management under `/v1/bifrost/tables`, served by `wyrd-server`.
-- HTTP query surfaces served by `wyrd-server` under the `/v1` nest: `POST /v1/query`
-  (synchronous, Arrow IPC stream), the async query-job family `POST /v1/query/async`,
-  `GET /v1/query/async/{job_uid}`, and `GET /v1/query/async/{job_uid}/result` (302
-  presigned redirect), and `GET /v1/derivations/{namespace}/{name}/freshness`. The
-  typed observation query routes under `/v1` (see `ValaQueryService` below) are the
-  companion projection surface. `wyrd-spec::vala::api` owns all query/result/freshness
-  wire types; the Arrow result media type is `application/vnd.apache.arrow.stream` with
-  `x-wyrd-schema-fingerprint` and `x-wyrd-row-count` headers.
-- gRPC ingest through `wyrd.v1.BifrostIngestService` _(under revision — serving ownership moving to wyrd-server, reconciled in a follow-up design pass)_.
-- The `wyrd.bifrost` Python SDK submodule.
-- Generated `wyrd-spec::vala::api` wire types such as `BifrostTableEntry`,
-  register-table types, query request/response types, and table scope/status
-  enums.
-- The `WYRD_VALA_*_BIFROST_*` error catalog crossing HTTP, MCP, Python, and
-  generated documentation boundaries.
-
-Bifrost permissions are resource-scoped through `BifrostTable`, `BifrostRecord`,
-and `BifrostQuery`. Caller-selected `SystemShared` tables require explicit
-administrative install permission, and generic record writes must not write
-reserved or system-managed Bifrost tables. There is no `wyrd.warehouse` submodule
-and no `WarehouseCard`.
-
-**`ValaQueryService` — typed observability query surface (accepted, Stage 4).** `wyrd-server`
-exposes `wyrd.v1.ValaQueryService` (gRPC-first) with an axum HTTP projection as the
-**query-only** typed surface for the observability domain namespaces. There is no
-`vala-http` crate — `wyrd-server` is the only serving surface. The gRPC service and
-its HTTP projection are backed by `wyrd-spec::vala::api` request/response contracts with
-cursor pagination, mandatory time windows, and stable `WYRD_VALA_*` error codes.
-
-The accepted domain namespaces and tables:
-
-| Namespace | Tables | Notes |
-|---|---|---|
-| `vala.traces` | `spans`, `events`, `links` | Raw OTel spans — source of truth |
-| `vala.metrics` | `points` | OTel metric data points with exemplars |
-| `vala.logs` | `records` | OTel LogRecord signal |
-| `vala.genai` | `messages`, `embeddings`, `tool_calls` | Derived from `vala.traces` spans carrying `gen_ai.*` attributes |
-| `vala.eval` | `runs`, `assertions` | Agent/LLM evaluation records |
-| `vala.drift` | `*` | Traditional ML drift records |
-| `vala.dev` | `agent_traces` | High-fidelity coding-harness traces; carries the code axis |
-| `vala.system` | `audit_log` | Transactional audit log (relay-written) |
-
-All domain tables are `SystemShared` scope — server-stamped `data_tenant_id` isolation via
-provider `FilterExec` (primary) and scoped analyzer predicate (secondary). Typed query
-routes build bound DataFusion `LogicalPlan`s (never `ctx.sql`); a query-admission gate
-rejects plans missing the tenant predicate or a bounded time window before execution.
-
-**Elevated payload-read permissions.** Four payload-bearing table families are
-`PayloadClass::Sensitive` and gate their sensitive columns on an elevated read permission
-beyond the base `BifrostQuery:Read`:
-
-| Permission resource | Gates |
-|---|---|
-| `BifrostTracePayload` | `vala.traces.*` `attributes` column on `GetTrace` / `QueryTraces` |
-| `BifrostLogPayload` | `vala.logs.records` `body` / `attributes` on log-query methods |
-| `BifrostGenAiPayload` | `vala.genai.*` message and tool I/O columns |
-| `BifrostAgentTracePayload` | `vala.dev.agent_traces` message/tool payload columns |
-
-These four permissions extend the existing `Permission`/`Resource` model in
-`crates/shared/wyrd-runtime/src/permission.rs`. The generic-SQL analyzer enforces the
-same payload gate so `SELECT vala.traces.spans.attributes` without
-`BifrostTracePayload:Read` is denied through both the typed and the generic-SQL path.
-
+`wyrd_client::Bifrost` owns table registration, listing and description,
+buffered ingestion, query streaming and lifecycle operations over shared
+authentication, HTTP, and gRPC. `QueryClient` and
+`BifrostGrpcTransport` are facade implementation mechanics, not sibling public
+clients. Gate is the server dispatcher; it is neither a client type nor a
+deployment target.
 ### Trigger
 Fires an Operator. A Trigger declares when (`schedule`), what to evaluate
 (`source`, optional), and what to fire (`operator_ref`). On each schedule
@@ -1338,8 +1278,9 @@ Exact field schema for each context lives in OpenAPI.
 
 How authored specs become durable cards. This section pins the wire
 shape of composite registration, the card blob state machine, and the
-idempotency contract. Implementation lives in `wyrd-registry` and its
-task packet under `.dev/plan/ongoing/07-card-lifecycle/CONTRACTS.md`.
+idempotency contract. Implementation lives in `wyrd-registry`; active change
+specifications and task packets follow the repository specification-first
+workflow and do not override this contract.
 
 ### Composite registration
 
@@ -1491,8 +1432,9 @@ A reference slot accepts `ref` or `path`; an inlineable slot also accepts
 locally; only `ref` and inline child bodies cross the wire.
 
 ```yaml
-# 1. ref — points at a registered card by exact identity.
-#    kind, name, version, space, optional uid. No labels/annotations here.
+# 1. ref — points at a registered card by identity.
+#    kind, name, one version field, optional space, optional uid.
+#    No labels/annotations here.
 ref: { kind: Policy, name: pii-redaction, version: "1.0.0", space: prod }
 
 # 2. path — authoring sugar. Targets a FULL card envelope on disk
@@ -1510,12 +1452,10 @@ inline:
   scope: service_local
 ```
 
-The wire `CardRef` requires `space`. Omitting `space` in an authored `ref:` is
-a loader-time convenience: the YAML loader splices the enclosing card's
-`metadata.space` into each child `ref:` before deserialization. A `CardRef`
-that has crossed an API boundary always carries `space` verbatim. `CardRef` is
-exact identity only — it never carries `labels` or `annotations`. Metadata
-matching is the job of `select`, not `ref`.
+`CardRef` carries `kind`, `name`, one `version` field, optional `space`, and
+optional `uid`. It never carries labels, annotations, or a separate version
+requirement. When `space` is omitted, resolution uses the enclosing authored
+context; when present, it is preserved verbatim.
 
 In context — `Service.components[]` mixing durable and loader-local forms plus a heavy-card ref:
 
@@ -1584,30 +1524,27 @@ relationship derivation, or durable persistence. The server, registry, and
   ahead of the parent that references them. A heavy-card envelope reached by
   `path:` still follows the normal pre-registration + blob-upload flow before
   the parent registers.
-- Transitive: a `path:`-loaded envelope may itself contain `ref`/`select`/
-  `path`/`inline` slots. The loader resolves transitively with a hard depth
+- Transitive: a `path:`-loaded envelope may itself contain `ref`/`path`/`inline`
+  slots. The loader resolves transitively with a hard depth
   limit (≤8) to catch cycles.
-- `ref`, `select`, `path`, and `inline` are mutually exclusive on any single
-  slot. Any combination is a validation error.
+- `ref`, `path`, and `inline` are mutually exclusive on any single slot. Any
+  combination is a validation error.
 
 This keeps the wire contract typed (`ref | inline`, with an explicit
 registration-only sibling projection where a composite write needs it), keeps
-`select`/`path` resolution client-side, prevents filesystem-on-server, and
-gives authors both the file-splitting ergonomic they expect from JSON-Schema
-`$ref` / OpenAPI external-file imports (`path`) and metadata-driven binding
-(`select`). Durable and read contracts remain the simpler direct `ref` /
-`inline` forms.
+`path` resolution client-side, prevents filesystem-on-server, and gives authors
+the file-splitting ergonomic they expect from JSON-Schema `$ref` / OpenAPI
+external-file imports. Durable and read contracts remain the simpler direct
+`ref` / `inline` forms.
 
 ---
 
 ## Workspace config (`wyrd.toml`)
 
-Wyrd's wire contract pins every card to a full `(kind, name, version,
-space)` identity. Authors writing many cards in one bundle pay a
-verbosity tax for that strictness — `space: prod` and
-`version: "1.4.2"` repeat across every doc in a file. This section
-formalizes the loader-side ergonomic that resolves it without
-touching the wire.
+Wyrd's wire contract identifies every card by `kind`, `name`, and one version
+field, with optional `space` and `uid`. Authors writing many cards in one bundle
+still benefit from consistent metadata defaults. This section formalizes the
+loader-side ergonomic without changing the wire identity shape.
 
 ### File and discovery
 
@@ -1801,8 +1738,8 @@ services/ops-copilot/
   bucket nests a `vendor`-keyed `*Connection` union, and secrets are server-side
   env-var names (`SourceAuth`), never card values. Adding a vendor is a new
   `*Connection` variant plus a `vala` read adapter — no bucket or consumer churn.
-  Remaining runtime work: the `vala` read trait keyed on `(kind, vendor)`, and a
-  connectivity preflight (`wyrd source check <ref>`).
+  Runtime uses the `vala` read trait keyed on `(kind, vendor)` and exposes the
+  connectivity preflight as `wyrd source check <ref>`.
 
 - **Eval signal decomposition.** `Eval` does not carry its own `signal`
   decomposition. Eval IS the signal — its per-task pass/fail aggregates into a
@@ -1810,36 +1747,3 @@ services/ops-copilot/
   input edges (`dataset` vs `source_ref`) are optional refs, not a tagged enum:
   presence is the mode (offline driver, online sink, both, or neither → vala
   default archive).
-
----
-
-## Appendix: Implementation status
-
-This section tracks reconciliation work in progress. It is internal bookkeeping
-and does not affect the protocol contract above.
-
-**Active reconciliation (as of v1):**
-- The active doctrine is the 16 native kind catalog plus `External`. Current
-  `wyrd-spec` code and generated schemas no longer expose stale `Tool`, `Skill`,
-  or `SubAgent` specs; they now expose `SourceSpec` (the bucket-keyed `SourceKind`
-  union). New work must follow this document: tools are runtime registry entries,
-  sub-agency is an Agent relationship, skills are not a v1 Card kind, and external
-  observations are read through `Source` cards.
-- Do not expand stale card kinds or cite generated schema presence as doctrine.
-- Remaining `Source` follow-up: the runtime read adapter in `vala` keyed on
-  `(kind, vendor)` and the `wyrd source check` preflight.
-
-**Governance token removal (doctrine #18):**
-- Emit is an Auth-plane route, not a third plane. The JWT (`principal.card_ref`)
-  plus `run_id` carry everything an emission needs.
-- The following scaffolding has been deleted: the `wyrd.auth_governance_tokens`
-  table (migration `20260601000001_auth.sql`), its `GovernanceTokenRow` row mirror
-  and query slot, the `migration_pg.rs` table assertion, and `Scope::TokenIssue`
-  (`token:issue`).
-- Wyrd is open source and independently publishable. It contains no enterprise
-  licensing keys, feature gates, startup hooks, or private-product contracts.
-  A future private `wyrd-enterprise` repository may depend on and extend public
-  Wyrd crates; Wyrd never depends on that private repository. Enterprise
-  deployment language in this document describes topology, tenant isolation,
-  and operational requirements rather than an in-tree commercial edition.
-- No `WYRD_GOV_TOKEN` env var. No `wyrd gov-token` CLI.

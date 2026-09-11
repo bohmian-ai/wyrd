@@ -9,14 +9,25 @@
     tenant,
     session,
     pathname,
+    navCollapsed = false,
     children
   }: {
     tenant: Tenant;
     session: SessionMetadata;
     pathname: string;
+    navCollapsed?: boolean;
     children: Snippet;
   } = $props();
   let navOpen = $state(false);
+  // Sidebar collapse is a viewer preference persisted in a cookie so SSR renders
+  // the chosen width on first byte — same mechanism as the theme mode. The prop
+  // is deliberately only the initial value: after hydration the toggle owns it.
+  // svelte-ignore state_referenced_locally
+  let collapsed = $state(navCollapsed);
+  function toggleCollapsed() {
+    collapsed = !collapsed;
+    document.cookie = `wyrd-nav=${collapsed ? 'collapsed' : 'open'}; path=/; max-age=31536000; samesite=lax`;
+  }
   let menuButton: HTMLButtonElement;
   function closeMenu() {
     navOpen = false;
@@ -51,18 +62,19 @@
 
 <svelte:window onkeydown={(event) => { if (event.key === 'Escape' && navOpen) closeMenu(); }} />
 <a class="skip" href="#main">Skip to content</a>
-<div class="app-shell">
+<div class="app-shell" class:rail={collapsed}>
   <aside>
-    <a class="wordmark" href={base}><img src={logo} alt="" width="28" height="28" />bohmian</a>
+    <a class="wordmark" href={base}><img src={logo} alt="" width="28" height="28" />{#if !collapsed}bohmian{/if}</a>
     <button class="app-control mobile-menu" type="button" bind:this={menuButton} aria-controls="menu-disclosure" aria-expanded={navOpen} onclick={() => navOpen = !navOpen}>Menu</button>
     <div id="menu-disclosure" class="menu-panel" class:collapsed={!navOpen} role="region" aria-label="Menu">
       <div class="menu-context mobile-menu"><span>Current area: {current}</span><span>{tenant.name}</span><button class="app-control" type="button" onclick={closeMenu}>Close menu</button></div>
     <nav id="primary-navigation" aria-label="Primary">
       {#each entries as [label, suffix] (label)}
-        <a href={base + suffix} aria-current={current === label ? 'page' : undefined}>{label}</a>
+        <a href={base + suffix} aria-current={current === label ? 'page' : undefined} title={collapsed ? label : undefined}><span class="nav-full">{label}</span><span class="nav-mini" aria-hidden="true">{label.slice(0, 2)}</span></a>
       {/each}
     </nav>
     </div>
+    <button class="collapse-toggle" type="button" onclick={toggleCollapsed} aria-expanded={!collapsed} aria-label={collapsed ? 'Expand navigation' : 'Collapse navigation'}>{collapsed ? '»' : '« Collapse'}</button>
   </aside>
   <div class="workspace">
     <header>
@@ -96,10 +108,49 @@
     display: grid;
     grid-template-columns: 212px minmax(0, 1fr);
   }
+  .app-shell.rail {
+    grid-template-columns: 60px minmax(0, 1fr);
+  }
   aside {
     background: var(--surface);
     border-right: 2px solid var(--border);
     padding: 16px 14px;
+    display: flex;
+    flex-direction: column;
+  }
+  .rail aside {
+    padding: 16px 10px;
+    align-items: center;
+  }
+  .rail nav a {
+    padding: 7px 0;
+    text-align: center;
+  }
+  .nav-mini {
+    display: none;
+  }
+  @media (min-width: 768px) {
+    .rail .nav-full {
+      display: none;
+    }
+    .rail .nav-mini {
+      display: inline;
+    }
+  }
+  .collapse-toggle {
+    margin-top: auto;
+    padding: 5px 8px;
+    border: 2px solid transparent;
+    border-radius: var(--r);
+    background: none;
+    color: var(--muted);
+    font: 700 10px var(--font-mono);
+    cursor: pointer;
+    text-align: left;
+  }
+  .collapse-toggle:hover {
+    background: var(--surface-2);
+    color: var(--text);
   }
   .wordmark {
     display: flex;
@@ -208,8 +259,12 @@
     top: 12px;
   }
   @media (max-width: 767px) {
-    .app-shell {
+    .app-shell,
+    .app-shell.rail {
       grid-template-columns: minmax(0, 1fr);
+    }
+    .collapse-toggle {
+      display: none;
     }
     aside {
       border-right: 0;

@@ -32,6 +32,20 @@ separately projected firing history.
 - No scheduler/editor, manual fire action, alert product, inferred reachability,
   timezone conversion that obscures the authored timezone, or Operator copy.
 
+# Locked visual implementation authority
+
+- Implement `C-13-light` and `C-13-dark` from
+  [`cards.svg`](../../../../crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/cards.svg)
+  using the exact plain-language-first hierarchy, schedule/timezone, optional
+  observation source and subject filter, linked Operator, source → Trigger →
+  Operator flow, reachable publishing context, and separately labeled firing
+  history in the [C-13 ledger entry](../../../../crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/README.md#c-13--trigger-card).
+- Narrow behavior follows `R-CARD`: wiring and exact configuration remain
+  readable before projected history, with direct links preserved. Do not
+  substitute a scheduler form, generic relationship graph, or alert page.
+- Completion evidence must compare both desktop themes and a 390 × 844 capture,
+  including scheduled and observation-driven fixture states.
+
 # Ordered test scenarios
 
 1. Scheduled and observation-driven fixtures produce accurate plain-language

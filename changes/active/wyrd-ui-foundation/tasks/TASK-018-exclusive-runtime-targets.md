@@ -43,6 +43,13 @@ the core server pod.
 - No new role, Gate target, client type, compatibility alias, gateway, manifest,
   or Bifrost redesign. New/material Rust follows struct-centered style.
 
+# Product-render applicability
+
+This task owns no browser surface and must not reimplement or reinterpret any
+product render. Its only UI obligation is to leave the server/runtime boundary
+required by TASK-003 and TASK-019 intact. Visual acceptance belongs to the UI
+tasks and the [product render ledger](../../../../crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/README.md).
+
 # Ordered test scenarios
 
 1. Default/valid/unknown parsing proves the closed vocabulary.

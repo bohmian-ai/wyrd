@@ -37,6 +37,39 @@ data, and one server-only Wyrd client seam.
 - No production OIDC, durable domain connection, global Inbox/Connections,
   browser-held Wyrd token, auth dependency, or alternate error vocabulary.
 
+# Locked visual implementation authority — user correction
+
+The original task omitted the accepted product-render links. That omission is a
+task defect: the renders below are a visual contract, not optional inspiration.
+
+- Implement [`home.svg`](../../../../crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/home.svg)
+  artboards `H-01-light`, `H-01-dark`, `H-02-light`, and `H-02-dark`, using the
+  exact routes, states, links, fixture meaning, and `R-ENTRY`/`R-HOME`
+  responsive rules in the [product render ledger](../../../../crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/README.md#homesvg).
+- `/` and the local-development sign-in state use H-01's centered identity/choice
+  composition with no tenant shell. Render one real current state at a time;
+  the artboard's simultaneous outcome panels and annotation strip document the
+  state matrix and are not product UI.
+- `/t/[tenantKey]` must reproduce H-02's information hierarchy and composition:
+  compact trusted shell and search topbar; raised attention work region; Recent
+  changes and Recently viewed Cards tables; stacked Cards, Observe, Changes,
+  and Recent work summaries; and the exact destination links recorded in the
+  ledger. Do not replace it with a generic dashboard, hero, or tile grid.
+- Desktop chrome follows the [approved Gate A grammar](../../../../crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/README.md#approved-visual-grammar-gate-a).
+  Narrow chrome follows `M-01` in
+  [`mobile.svg`](../../../../crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/mobile.svg):
+  a labeled Menu disclosure containing the same five navigation entries,
+  current-area state, tenant identity, and close affordance. Page actions never
+  move into that menu.
+- `brand/DESIGN.md`, `brand/palette.json`, and the TASK-002 components govern
+  tokens and reusable controls. Current architecture wins over stale fixture
+  vocabulary, but every deviation from a referenced artboard must be named in
+  evidence and must not change its composition or workflow.
+- Completion evidence must include side-by-side implementation/render captures
+  at 1440 × 1024 and 390 × 844 in both themes for entry/sign-in and Home. A
+  missing region, moved primary action, changed hierarchy, or substituted page
+  composition blocks completion even when functional tests pass.
+
 # Ordered test scenarios
 
 1. Unauthenticated and expired sessions yield safe access states.

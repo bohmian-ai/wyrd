@@ -13,7 +13,7 @@ state
 
 Handlers should not add `Principal::require_permission` or other shortcut
 helpers. Routing all checks through the checker keeps audit, tracing, and
-future handler-boundary behavior at one call site.
+handler-boundary policy at one call site.
 
 ## Contract
 
@@ -33,7 +33,7 @@ role-derived `effective_permissions`.
 
 ## RbacCheck
 
-`RbacCheck` is the stage's only `PermissionCheck` implementation. It is
+`RbacCheck` is the RBAC `PermissionCheck` implementation. It is
 stateless and returns `Allow` when:
 
 ```rust

@@ -4,11 +4,12 @@ Wyrd is the AI layer for human and agentic work — **the platform agents
 and users love to build on**. It makes AI work declarative, inspectable,
 reproducible, governed, observable, and operable.
 
-Wyrd is **language-agnostic**. First-class SDKs ship for Python, Rust,
-and TypeScript today. Go is planned and becomes first-class only when its
-SDK and the same contract/journey gates ship. Language agnosticism is the
-doctrine; first-class SDK support is how we deliver ergonomics on top of
-it without moving durable behavior out of the server.
+Wyrd is **language-agnostic**. Python, Rust, and TypeScript are first-class SDK
+languages. Language agnosticism is the doctrine; first-class SDK support adds
+ergonomics without moving durable behavior out of the server. Every other
+language can implement a client from the same HTTP, MCP, schema, documentation,
+and stable-error contracts. Go is planned but is not first-class until its SDK
+and equivalent contract and journey coverage ship.
 
 Wyrd does not try to become the user's application runtime, training
 framework, workflow engine, arbitrary code executor, or cloud platform.
@@ -54,11 +55,14 @@ Rules:
 
 ## v1 Card Kinds
 
-Sixteen native kinds plus `External`:
+Sixteen registrable native kinds:
 
 `Data`, `Model`, `Artifact`, `Experiment`, `Prompt`, `Agent`, `Workflow`,
 `Mcp`, `Service`, `Policy`, `Audit`, `Drift`, `Eval`, `Source`, `Trigger`,
-`Operator`, `External`.
+`Operator`.
+
+`CardKind::External` is a non-registrable discriminator for foreign schema
+descriptors. It has no `ExternalSpec` and is never accepted as a Card payload.
 
 Not Card kinds:
 
@@ -68,24 +72,25 @@ Not Card kinds:
   external system.
 - **`SubAgent`** — sub-agency is an Agent-to-Agent relationship, not a
   Card kind.
-- **`Skill`** — not a v1 Card kind unless a future architecture decision
-  adds it.
+- **`Skill`** — not a v1 Card kind.
 
-Current `wyrd-spec` code may still expose stale `Tool`, `Skill`, or
-`SubAgent` specs and lack `SourceSpec`. Treat that as implementation drift
-to remove, not as contract precedent.
+`SourceSpec` is the typed contract for read-only access to external data.
+`Tool`, `Skill`, and `SubAgent` specs are not part of the Card contract.
 
 ## CardRef Shape
 
-`CardRef` carries `kind`, `name`, one `version` field, optional `space`,
-and optional `uid`.
+`CardRef` carries `kind`, `name`, one `version` field, optional `space`, and
+optional `uid`. When present, `uid` strengthens the pin to the registered
+identity. Do not introduce a separate version-requirement field.
 
 ```yaml
-ref: { kind: Model, name: churn-rf, version: "~1" }
-ref: { kind: Prompt, name: judge, version: "^1", space: shared }
+ref: { kind: Model, name: churn-rf, version: "1.4.2", space: ml-prod }
+ref: { kind: Prompt, name: judge, version: "1.0.0", space: shared }
 ```
 
-Do not introduce a separate `version_req` field.
+The one version field carries the reference's version intent. `space` may be
+omitted and resolved from authored context; when present, it is preserved
+verbatim.
 
 ## Vocabulary Rules
 
@@ -94,19 +99,24 @@ Do not introduce a separate `version_req` field.
 - Card kinds are not separate top-level ontologies.
 - `Policy` is a card kind when users declare a governable rule; policy
   decisions are service behavior.
-- `Audit` is a card kind when users declare audit scope or evidence;
-  audit history is service-owned accountability.
+- `Audit` is the immutable Card produced when an authorized investigator pins
+  a case file; it is not a user-authored audit-scope declaration. Audit-event
+  history remains service-owned accountability.
 - `Artifact` is a card kind; storage owns bytes; other cards link to
   artifacts with `CardRef`.
+- `Source` is a read-only declaration for external data. Wyrd never writes to
+  the external system through a Source adapter.
+- `Bifrost` is Wyrd-owned analytical infrastructure, not an external Source,
+  Card kind, or public warehouse noun.
 - Predecessor names are allowed only in audit, source-map, or comparison
   context. Do not import legacy names, package names, route prefixes, or
   compatibility shims into implementation code.
 
-## Deleted Concepts (Do Not Reintroduce)
+## Prohibited Concepts
 
 - **Governance tokens.** `WYRD_GOV_TOKEN`,
   `wyrd.auth_governance_tokens`, `GovernanceTokenRow`, and
-  `Scope::TokenIssue` are gone. Auth is a single plane. Emit is an
+  `Scope::TokenIssue` must not exist. Auth is a single plane. Emit is an
   Auth-plane route, not a third plane. The JWT (`principal.card_ref`)
   plus opaque client-generated `run_id` carry everything.
 - **Legacy server vocab** (former project names, `_delta_log`, Delta

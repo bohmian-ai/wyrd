@@ -1,54 +1,36 @@
 # SQL Foundation
 
-Tenant-scoped `wyrd.*` and `vala.*` rows use `data_tenant_id UUID NOT NULL` as
-the leading tenant key. The Rust contract is `wyrd_spec::ids::DataTenantId`, a
-UUIDv7-backed newtype. Human-facing tenant URLs use `TenantSlug`; the server
-resolves that slug to `DataTenantId` at the auth/API boundary and does not
-thread slugs through durable tenant-scoped rows.
+Wyrd uses one PostgreSQL control-plane database. `wyrd-sql` owns the
+`platform` and `wyrd` schemas; `vala-sql` owns the `vala` schema. Analytical
+payload bytes remain in Bifrost object storage rather than Postgres.
 
-`space` is not the tenant key. It remains a user namespace within a tenant,
-primarily for registry card identity. Tenant isolation is keyed by
-`data_tenant_id`.
+Tenant-scoped `wyrd.*` and `vala.*` rows use
+`data_tenant_id UUID NOT NULL` as the leading tenant key. The Rust contract is
+`wyrd_spec::ids::DataTenantId`. Human-facing `TenantSlug` values resolve to a
+`DataTenantId` at the authenticated API boundary and do not enter durable
+tenant-scoped rows. `space` is a registry namespace inside a tenant and is
+never a tenancy boundary.
 
-Every tenant-scoped parent table should expose a composite foreign-key target
-such as `(data_tenant_id, id)` or `(data_tenant_id, uid)`, and tenant-scoped
-children should reference parents through the same composite key. This keeps
-same-schema and cross-schema references from crossing tenant boundaries at the
-database layer.
+Tenant-scoped parents expose composite foreign-key targets such as
+`(data_tenant_id, id)` or `(data_tenant_id, uid)`. Children carry the same
+tenant key in their foreign keys, including cross-schema references.
+`platform.*` is the explicitly privileged plane above tenant scope;
+`platform.tenants` owns the tenant catalog.
 
-`platform.*` is above the tenant boundary and does not carry `data_tenant_id` on
-every row. `platform.tenants` is the tenant catalog whose primary key is
-`data_tenant_id`.
+## Runtime tenant binding
 
-## Runtime Tenant Binding
-
-Row-level security is the primary tenant boundary for tenant-scoped `wyrd.*`
-and `vala.*` tables. Runtime request paths use the `wyrd_app` database role,
-which does not bypass RLS. Migration paths use the boot-only `wyrd_migrator`
-role, and audited cross-tenant support paths use `wyrd_platform_admin` when
-that credential is provisioned.
-
-Tenant-scoped query modules run inside `wyrd_sql::TenantConn`. Acquiring a
-`TenantConn` opens a transaction on the runtime pool and binds
-`app.current_tenant` with:
+Postgres row-level security is the authoritative tenant boundary. Runtime
+tenant traffic uses the `wyrd_app` login role without `BYPASSRLS`. Every
+tenant-scoped logical operation acquires one `TenantConn`, which opens a
+transaction and binds the verified `DataTenantId` through transaction-local
+configuration:
 
 ```sql
 SELECT set_config('app.current_tenant', $1, true)
 ```
 
-The tenant value is always parameter-bound from `DataTenantId`; callers do not
-compose tenant SQL strings. The third `set_config` argument keeps the setting
-local to the transaction, so commit or rollback clears the tenant before the
-connection returns to the pool.
-
-RLS policies call the shared SQL helper `wyrd.current_tenant()`, which reads
-`app.current_tenant` and casts it to `uuid`. Policies use the strict
-`current_setting` form so a missing tenant binding fails loudly instead of
-returning an empty result set.
-
-Every tenant-scoped table in `wyrd.*` and `vala.*` follows this policy shape.
-The `wyrd-sql` `0002_auth.sql` migration applies it inline for every
-`wyrd.auth_*` table:
+RLS policies use the strict `wyrd.current_tenant()` helper and apply both
+`USING` and `WITH CHECK` predicates:
 
 ```sql
 ALTER TABLE wyrd.example ENABLE ROW LEVEL SECURITY;
@@ -58,108 +40,90 @@ CREATE POLICY tenant_isolation ON wyrd.example
     WITH CHECK (data_tenant_id = wyrd.current_tenant());
 ```
 
-Live verification of policy behavior depends on a Postgres database whose
-cluster roles have already been bootstrapped. The `wyrd-sql` migration tests
-skip when `DATABASE_URL` is unset; when run against a live database they assert
-role metadata, `platform.tenants`, `wyrd.current_tenant()`, tenant-scoped auth
-tables, and RLS catalog state.
+A missing tenant binding fails rather than returning an empty cross-tenant
+result. Tenant identity is parameter-bound; callers do not build tenant SQL
+strings or add a second hand-written tenant predicate.
 
-## Transaction Discipline
+## Transaction discipline
 
-Every tenant-scoped logical operation opens exactly one `TenantConn` from the
-runtime `wyrd_app` pool. Reads, writes, audit rows, relationship updates, and
-same-crate cross-domain work for that operation share the transaction opened by
-that wrapper. Even read-only handlers commit the `TenantConn` at the end so the
-shape stays uniform; dropping it without commit rolls back through SQLx.
+The caller owns the `TenantConn` transaction and its final commit or rollback.
+Tenant-scoped query and service functions accept `&mut TenantConn<'_>` and
+never accept a raw `PgPool`, `PgConnection`, or SQLx transaction. Callees do
+not commit, roll back, open a nested transaction, or issue raw transaction
+control. Related writes, relationships, and canonical audit rows compose in the
+same caller-owned transaction.
 
-Tenant-scoped query functions take `&mut TenantConn<'_>`. They do not take a
-raw `PgPool`, open their own SQLx transaction, or issue raw transaction-control
-SQL. Wyrd v1 does not use nested transactions or savepoints. If a sub-operation
-appears to need a savepoint, split or refactor the operation boundary instead
-of hiding partial rollback inside the query layer.
+Cross-tenant work uses only a named `OperatorPool` capability under explicit
+platform authority. Each operator capability validates the target tenant,
+lease generation, fence, operation identity, and audit before mutation. It
+does not expose a raw pool, connection, transaction, or generic query method.
+`SECURITY DEFINER` functions are narrow, reviewed bridges and never become a
+general RLS bypass.
 
-Platform operations are the exception because `platform.*` is above the tenant
-boundary. Audited platform-admin reads and writes run on the platform-admin
-pool and may use a bare SQLx transaction for one platform-scoped operation.
-Runtime tenant resolution remains the narrow `SECURITY DEFINER` bridge exposed
-to `wyrd_app`; it is not a tenant-scoped data operation.
+Cross-crate work does not extend a transaction by importing another crate's
+private query modules. A cross-owner durable effect uses its declared committed
+handoff and idempotent consumer semantics.
 
-Cross-crate transactional coordination is not supported. `wyrd-sql` must not
-import `vala-sql` query modules, and `vala-sql` must not call Wyrd query write
-functions to extend a Wyrd transaction. Downstream Vala effects are propagated
-after the Wyrd commit through the future outbox/event fanout path and are
-handled idempotently by Vala.
+## Roles, pools, and boot
 
-## Connection Pools
+| Role | Lifetime | Capability |
+|---|---|---|
+| `wyrd_app` | Runtime | Tenant-scoped RLS traffic through `TenantConn` |
+| `wyrd_migrator` | Boot migration gate only | Ordered DDL for Wyrd and Vala schemas |
+| `wyrd_platform_admin` | Runtime only where an operator capability requires it | Fenced, audited cross-tenant work through `OperatorPool` |
 
-Wyrd server boot uses three Postgres login roles but only runtime-safe pools
-survive into `AppState`.
+Boot performs these steps in order:
 
-| Role | Pool lifetime | Default max | Statement cache | Purpose |
-|---|---:|---:|---:|---|
-| `wyrd_app` | runtime | 32 | 256 | Tenant-scoped HTTP, MCP, worker, and Vala query traffic. RLS applies. |
-| `wyrd_migrator` | boot only | 2 | 0 | DDL and migrations for Wyrd and Vala schemas. Has `BYPASSRLS` and is closed before runtime state exists. |
-| `wyrd_platform_admin` | optional runtime | 2 | 64 | Audited cross-tenant platform operations. Dedicated deployments may omit it. |
+1. Resolve role-separated credentials and validate the typed pool
+   configuration.
+2. Build the short-lived migrator pool.
+3. Acquire the deployment migration lease and verify migration checksums.
+4. Apply `wyrd_sql::migrate` and then `vala_sql::migrate`.
+5. Verify required schemas, roles, grants, RLS policies, and sentinels.
+6. Close every migrator connection.
+7. Construct runtime `TenantConn` and approved `OperatorPool` owners and make
+   only those capabilities available to services.
 
-The server boot sequence is:
+Embedded Postgres is a local development convenience only. The canonical test
+harness uses repository-managed, lane-isolated Postgres databases. A production
+profile without its required external DSN and role credentials fails startup;
+it never falls back to an embedded database.
 
-1. Resolve role DSNs from `WYRD_DATABASE_URL` (canonical app DSN) plus
-   `WYRD_DATABASE_MIGRATOR_PASSWORD` and optional
-   `WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD`. The migrator and platform-admin
-   DSNs are synthesized at boot by swapping the userinfo of the canonical
-   URL to the matching role name and password. All three unset starts
-   embedded Postgres and derives the role DSNs from the managed instance.
-2. Build the `wyrd_migrator` pool with migrator defaults.
-3. Run `wyrd-sql` migrations and `vala-sql` migrations against that same
-   migrator pool.
-4. Close the migrator pool.
-5. Build the runtime `wyrd_app` pool and optional `wyrd_platform_admin` pool.
-6. Assemble `AppState { pool, platform_admin_pool }`.
+Pool configuration has one canonical typed model. Unsuffixed `WYRD_DB_*`
+settings tune the application pool; `_MIGRATOR` and `_PLATFORM_ADMIN` suffixes
+tune the corresponding role pools. Missing suffixed settings use that role's
+typed defaults and never inherit the application value.
 
-`AppState` carries only `pool: PgPool` for runtime tenant-scoped traffic and
-`platform_admin_pool: Option<PgPool>` for audited platform routes. The migrator
-pool is never stored on `AppState`; keeping a long-lived `BYPASSRLS` migrator
-connection available to handlers would bypass the tenancy model. `PgPool`
-clones are cheap handles over shared pool state, so axum `State<AppState>`
-threads those pools into request handlers.
-
-Vala consumes the shared Wyrd runtime pool by reference through
-`TenantConn<'_>` for tenant-scoped work. It does not build a fourth pool or own
-a separate runtime connection budget. Vala migrations consume the same
-boot-only migrator pool before it is closed.
-
-Pool tuning lives in `wyrd-sql` `PoolConfig`. Unsuffixed `WYRD_DB_*` variables
-tune the runtime `wyrd_app` pool. The same names suffixed with `_MIGRATOR` or
-`_PLATFORM_ADMIN` tune the boot migrator and platform-admin pools
-respectively. Missing suffixed variables fall back to that role's defaults, not
-to the unsuffixed app value.
-
-| Variable | Runtime default | Notes |
-|---|---:|---|
-| `WYRD_DB_MAX_CONNECTIONS` | 32 | Per server pod. |
-| `WYRD_DB_MIN_CONNECTIONS` | 2 | Warm runtime connections. |
-| `WYRD_DB_ACQUIRE_TIMEOUT_SECS` | 5 | Fail fast when the pool is exhausted. |
-| `WYRD_DB_IDLE_TIMEOUT_SECS` | 300 | Use `off` to disable idle reaping. |
-| `WYRD_DB_MAX_LIFETIME_SECS` | 1800 | Use `off` to disable lifetime recycling. |
-| `WYRD_DB_STATEMENT_CACHE_CAPACITY` | 256 | Set to `0` behind transaction-mode PgBouncer. |
-| `WYRD_DB_TEST_BEFORE_ACQUIRE` | true | Checks stale connections before reuse. |
-
-The connection budget formula is:
+The deployment proves this connection budget against the maximum replica and
+rollout-surge count:
 
 ```text
-pods * (app_max + platform_admin_max) + migrator_max <= pg.max_connections - reserved
+replicas * (app_max + platform_admin_max)
+  + concurrent_migrator_max
+  + database_reserved
+  <= postgres_max_connections
 ```
 
-Reserve at least ten server-side connections for Postgres administration and
-extension roles. The migrator budget is short-lived at boot; steady-state
-runtime capacity is dominated by `app_max`.
+`database_reserved` is an explicit deployment decision covering
+administration, replication, monitoring, failover, and extensions. No
+universal numeric reserve substitutes for that calculation.
 
-For transaction-mode PgBouncer, set
-`WYRD_DB_STATEMENT_CACHE_CAPACITY=0`. SQLx prepared statement caches live on a
-physical upstream Postgres connection, while transaction pooling can reassign
-that upstream connection between client transactions. Tenant binding remains
-valid because Wyrd uses `set_config('app.current_tenant', $1, true)`, which is
-transaction-scoped rather than session-scoped. Future worker code must avoid
-session-scoped advisory locks and prefer transaction-scoped locking patterns.
-`LISTEN`/`NOTIFY` is not compatible with transaction pooling and is not part of
-the current SQL foundation.
+Transaction-mode PgBouncer requires statement-cache capacity `0` on each pool
+routed through it. Tenant state remains transaction-local. Session-scoped
+state, session advisory locks, and `LISTEN`/`NOTIFY` are not supported on a
+transaction-pooled path.
+
+## Migration and verification contract
+
+Migration files are immutable, ordered, checksum-verified, and owned by their
+schema crate. Architecture does not duplicate their filename or count. Restore
+and release tooling derives the required set from the registered migration
+sources and rejects missing, reordered, modified, or partially applied
+migrations.
+
+Verification covers role attributes, grants, schema ownership, migration
+checksums, the system-tenant sentinel, tenant binding, RLS catalog state,
+same-tenant success, cross-tenant denial, operator fencing, and transactional
+audit behavior. Canonical repository `mise` tasks provision Postgres and run
+these checks; tests do not silently skip required SQL proof because an
+environment variable is absent.

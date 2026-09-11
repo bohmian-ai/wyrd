@@ -34,6 +34,23 @@ direct links to its consumers.
 - No playground, prompt execution, editor, provider call, copied consumer data,
   or provider-specific page fork.
 
+# Locked visual implementation authority
+
+- Implement `C-05-light` and `C-05-dark` from
+  [`cards.svg`](../../../../crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/cards.svg)
+  using the exact dominant prompt-definition region, ordered roles and content
+  treatments, variables/media variables, provider/model/settings, response
+  schema, raw-definition disclosure, consumer links, and absent/excluded states
+  in the [C-05 ledger entry](../../../../crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/README.md#c-05--prompt-card).
+- `M-09` in
+  [`mobile.svg`](../../../../crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/mobile.svg)
+  is also binding for the shared Prompt inspection content at narrow width:
+  roles, content types, variables, provider/model, raw definition, and direct
+  Prompt link remain reachable without page-level horizontal overflow.
+- Do not replace the authored-content hierarchy with metadata cards or a raw
+  JSON page. Completion evidence must compare `C-05` in both themes and prove
+  the same content remains usable at 390 × 844.
+
 # Ordered test scenarios
 
 1. System and ordered role content are unambiguous for every supported part.

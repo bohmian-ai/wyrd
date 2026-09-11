@@ -32,6 +32,21 @@ its observation, evaluation, and drift evidence.
 - No model training/serving, artifact download pipeline, registry mutation,
   inferred lineage, generic ML experiment product, or placeholder Prompt block.
 
+# Locked visual implementation authority
+
+- Implement `C-04-light` and `C-04-dark` from
+  [`cards.svg`](../../../../crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/cards.svg)
+  using the exact route, fixture, hierarchy, material states, and Card/Observe
+  links in the [C-04 ledger entry](../../../../crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/README.md#c-04--model-card).
+- Preserve the shared Card header and make purpose/task/interface, signature,
+  artifacts, deployment relationships, and linked verification the accepted
+  dominant-to-subordinate sequence. Keep the absent Prompt relationship
+  explicit; do not invent a model dashboard or execution surface.
+- Narrow behavior follows `R-CARD`: primary Model content precedes stacked
+  metadata and relationships, with wide signatures contained inside their
+  panel. Completion evidence must compare both desktop themes and a 390 × 844
+  implementation capture to that rule.
+
 # Ordered test scenarios
 
 1. Model task/interface/signature and exact version identity lead the page.

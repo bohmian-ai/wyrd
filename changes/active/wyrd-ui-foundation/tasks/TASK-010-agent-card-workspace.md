@@ -33,6 +33,22 @@ Services, and observation paths remain understandable in context.
 - No agent playground, execution, tool registry editor, secret values, inferred
   runtime activity, or separate Agent route tree.
 
+# Locked visual implementation authority
+
+- Implement `C-07-light` and `C-07-dark` from
+  [`cards.svg`](../../../../crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/cards.svg),
+  including the Prompt-first hierarchy, raised read-only Prompt inspection,
+  Prompt → Agent → runtime-tool composition strip, run limits, publication and
+  Service relationships, and explicit absent artifacts recorded in the
+  [C-07 ledger entry](../../../../crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/README.md#c-07--agent-card).
+- Implement `M-09-light` and `M-09-dark` from
+  [`mobile.svg`](../../../../crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/mobile.svg):
+  Prompt inspection becomes a full-width raised sheet with explicit Close and
+  Back, direct Prompt navigation, and internally scrolling raw definition.
+- Do not substitute inline copied Prompt content, a narrow desktop rail on
+  mobile, or a generic relationship table. Completion evidence must compare
+  `C-07` and `M-09` in both themes at their declared viewports.
+
 # Ordered test scenarios
 
 1. Prompt is the primary dependency and its inspection sheet retains Agent

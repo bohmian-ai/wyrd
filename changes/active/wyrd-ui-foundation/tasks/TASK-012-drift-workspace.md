@@ -38,6 +38,25 @@ raw observations, calculated reports, or alerts.
 - No drift calculation, inference, persistence, alert configuration, or
   method-specific route.
 
+# Locked visual implementation authority
+
+- Implement `C-11-light` and `C-11-dark` from
+  [`cards.svg`](../../../../crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/cards.svg)
+  for Drift declaration plus contextual results, and `O-10-light` and
+  `O-10-dark` from
+  [`observe.svg`](../../../../crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/observe.svg)
+  for canonical calculated-result exploration. Their exact route, filters,
+  fixture semantics, thresholds, material states, and cross-links are locked
+  by the [C-11/O-10 ledger](../../../../crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/README.md#material-states-index).
+- Implement `M-07-light` and `M-07-dark` from
+  [`mobile.svg`](../../../../crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/mobile.svg),
+  retaining all visible filter chips, pass/fail feature rows, threshold breach,
+  no-report gap, calculated/raw distinction, and internally scrolling dense rows.
+- Preserve the accepted Definition-versus-Results hierarchy and canonical
+  Observe ownership. Do not merge declaration and observation into a generic
+  metric dashboard. Completion evidence must compare `C-11`, `O-10`, and
+  `M-07` in both themes at their declared viewports.
+
 # Ordered test scenarios
 
 1. Card declaration renders exact method/signal/baseline/threshold/publisher

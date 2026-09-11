@@ -1,0 +1,381 @@
+/* Service Card operational workspace (TASK-007) — shared layout classes for
+   the Overview/Composition/Definition views, scoped under `.svc` inside the
+   Cards feature. Same neobrutalist grammar; quiet altitude throughout. */
+.svc {
+  display: grid;
+  gap: 16px;
+  min-width: 0;
+}
+.svc .subnav {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  border: 2px solid var(--border);
+  border-radius: var(--r);
+  background: var(--surface);
+  padding: 6px 10px;
+}
+.svc .subnav a.view {
+  font: 700 11px var(--font-mono);
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  color: var(--muted);
+  text-decoration: none;
+  padding: 5px 9px;
+  border: 2px solid transparent;
+  border-radius: var(--r);
+}
+.svc .subnav a.view[aria-current='true'] {
+  color: var(--text);
+  border-color: var(--border);
+  background: var(--surface-2);
+}
+.svc .subnav a.view:hover {
+  color: var(--text);
+}
+.svc .scopebar {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  font: 700 10px var(--font-mono);
+  color: var(--muted);
+}
+.svc .scopebar a {
+  color: var(--muted);
+  text-decoration: none;
+  padding: 3px 5px;
+  border-radius: var(--r);
+}
+.svc .scopebar a[aria-current='true'] {
+  color: var(--text);
+  outline: 2px solid var(--border);
+  background: var(--surface-2);
+}
+.svc .scopebar a:hover {
+  color: var(--text);
+}
+
+/* Overview — assessment strip, four state channels, dominant chart grid. */
+.svc .assess {
+  border: 2px solid var(--border);
+  border-radius: var(--r);
+  background: var(--surface);
+  box-shadow: 3px 3px 0 0 var(--shadow);
+  padding: 12px 14px;
+  display: grid;
+  gap: 10px;
+}
+.svc .assess .headline {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.svc .assess .title {
+  font: 700 15px var(--font-display);
+}
+.svc .assess[data-tone='warn'] .title {
+  color: var(--warn-text);
+}
+.svc .assess[data-tone='danger'] .title {
+  color: var(--danger-text);
+}
+.svc .assess[data-tone='ok'] .title {
+  color: var(--ok-text, var(--text));
+}
+.svc .assess .meta {
+  margin-left: auto;
+}
+.svc .channels {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+.svc .channel {
+  border: 2px dashed var(--border);
+  border-radius: var(--r);
+  padding: 6px 9px;
+  display: grid;
+  gap: 3px;
+}
+.svc .channel .k {
+  font: 700 8.5px var(--font-mono);
+  letter-spacing: 0.5px;
+  color: var(--muted);
+}
+.svc .channel .v {
+  font: 700 11px var(--font-mono);
+}
+.svc .dashboard {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px;
+  align-items: start;
+}
+.svc .signals {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+  align-items: start;
+}
+.svc .sigverdict {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin: 0 0 6px;
+}
+.svc .siglatest {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  margin: 6px 0 0;
+}
+.svc .siglatest .lv {
+  font: 700 18px var(--font-display);
+}
+.svc .sigaxis {
+  display: flex;
+  justify-content: space-between;
+  margin: 2px 0 0;
+}
+.svc .investigate {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.svc .investigate a {
+  font: 700 11px var(--font-mono);
+  border: 2px solid var(--border);
+  border-radius: var(--r);
+  background: var(--surface);
+  color: var(--text);
+  padding: 5px 9px;
+  text-decoration: none;
+}
+.svc .investigate a:hover {
+  box-shadow: 3px 3px 0 0 var(--shadow);
+}
+.svc .attention-item {
+  border: 2px solid var(--warn-text);
+  border-radius: var(--r);
+  padding: 9px 11px;
+  display: grid;
+  gap: 4px;
+}
+
+/* Composition — the drawn deterministic graph plus the selected-node drawer.
+   Wires live in an absolutely positioned SVG measured from the node cards;
+   the lanes stay ordinary grid content above it. */
+.svc .graph {
+  position: relative;
+}
+.svc .wires {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  pointer-events: none;
+  /* Above the node cards so edge labels stay legible in the narrow lane
+     gaps; routes never cross a node, so nothing is drawn over content. */
+  z-index: 1;
+}
+.svc .wires path {
+  fill: none;
+  stroke: var(--muted);
+  stroke-width: 2;
+}
+.svc .wires marker path {
+  fill: var(--muted);
+  stroke: none;
+}
+.svc .wires text {
+  font: 400 8.5px var(--font-mono);
+  fill: var(--muted);
+  /* Surface-colored halo keeps a label readable where it overhangs a node. */
+  paint-order: stroke;
+  stroke: var(--surface);
+  stroke-width: 3px;
+}
+.svc .lanes {
+  position: relative;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  /* Wide gutters — the wires, arrowheads and edge labels live here. */
+  gap: 52px;
+  align-items: start;
+}
+.svc .lane {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+}
+.svc .lane .lane-h {
+  font: 700 10px var(--font-mono);
+  letter-spacing: 0.5px;
+  color: var(--muted);
+  border-bottom: 2px dashed var(--border);
+  padding-bottom: 4px;
+}
+.svc .svcbox {
+  justify-self: start;
+  font-weight: 700;
+  font-size: 10.5px;
+  color: var(--brand-strong);
+  border: 2px solid var(--brand-strong);
+  border-radius: var(--r);
+  background: color-mix(in srgb, var(--brand-strong) 8%, var(--surface));
+  padding: 5px 10px;
+}
+.svc .node {
+  display: grid;
+  gap: 3px;
+  border: 2px solid var(--border);
+  border-radius: var(--r);
+  background: var(--surface);
+  padding: 8px 10px;
+  text-decoration: none;
+  color: var(--text);
+}
+.svc .node:hover {
+  box-shadow: 3px 3px 0 0 var(--shadow);
+}
+.svc .node[aria-current='true'] {
+  border-color: var(--brand-strong);
+  outline: 2px solid var(--brand-strong);
+  outline-offset: -1px;
+  background: color-mix(in srgb, var(--brand-strong) 7%, var(--surface));
+  box-shadow: 4px 4px 0 0 var(--shadow);
+}
+.svc .node .nrow {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+/* Kind pill — shared by Composition nodes and the Definition components
+   table: declarative brand color, never an operational tone. */
+.svc .pill {
+  font: 700 8px var(--font-mono);
+  letter-spacing: 0.5px;
+  color: var(--brand-strong);
+  background: color-mix(in srgb, var(--brand-strong) 11%, var(--surface));
+  border-radius: 4px;
+  padding: 2px 6px;
+  white-space: nowrap;
+}
+.svc .node .nn {
+  font: 700 12px var(--font-mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.svc .node .st {
+  font-size: 10px;
+}
+.svc .node .st[data-tone='ok'] {
+  color: var(--ok-text);
+}
+.svc .node .st[data-tone='danger'] {
+  color: var(--danger-text);
+}
+.svc .node .st[data-tone='neutral'] {
+  color: var(--muted);
+}
+.svc .drawer {
+  border: 2px solid var(--border);
+  border-top-width: 4px;
+  border-radius: var(--r);
+  background: var(--surface);
+  box-shadow: 6px 6px 0 0 var(--shadow);
+  padding: 12px 14px;
+  display: grid;
+  gap: 8px;
+}
+.svc .drawer[data-tone='danger'] {
+  border-top-color: var(--danger-text);
+}
+.svc .drawer[data-tone='ok'] {
+  border-top-color: var(--ok-text);
+}
+.svc .drawer[data-tone='danger'] .headline {
+  color: var(--danger-text);
+  font-weight: 700;
+}
+.svc .drawer[data-tone='ok'] .headline {
+  color: var(--ok-text);
+  font-weight: 700;
+}
+.svc .drawer-cols {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 8px 24px;
+  align-items: start;
+}
+.svc .drawer-cols .stack {
+  display: grid;
+  gap: 6px;
+}
+.svc .drawer .links {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+/* Definition — declaration-first left column with the governance rail. */
+/* Component refs are Card references, not row destinations — they read as
+   links (S-03 render), unlike the inventory table's text-colored rows. */
+.svc .def-columns .wy-table td a {
+  color: var(--brand-strong);
+}
+/* Lime is the second voice — the client/runtime plane. Aliases are runtime
+   names (not registry identity), so they carry lime text; the runtime
+   principal carries the full lime chip. */
+.svc .def-columns .alias {
+  color: var(--lime-text);
+  font-weight: 700;
+}
+.svc .def-columns .principal-chip {
+  font: 700 10px var(--font-mono);
+  letter-spacing: 0.4px;
+  background: var(--lime);
+  color: var(--lime-ink);
+  border-radius: var(--r);
+  padding: 2px 7px;
+}
+/* The selected/current version reads as a brand chip in the governance rail. */
+.svc .def-columns .kv a[aria-current='true'] {
+  color: var(--brand-strong);
+  background: color-mix(in srgb, var(--brand-strong) 11%, var(--surface));
+  outline: 2px solid var(--brand-strong);
+  border-radius: var(--r);
+  padding: 1px 5px;
+}
+.svc .def-columns {
+  display: grid;
+  grid-template-columns: minmax(0, 2.05fr) minmax(240px, 1fr);
+  gap: 20px;
+  align-items: start;
+}
+
+@media (max-width: 900px) {
+  .svc .dashboard,
+  .svc .signals,
+  .svc .channels,
+  .svc .lanes {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .svc .def-columns,
+  .svc .drawer-cols {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .svc .wires {
+    display: none;
+  }
+  .svc .scopebar {
+    margin-left: 0;
+  }
+}

@@ -36,6 +36,23 @@ internal topology.
 - No Helm/operator/service mesh/certificate issuer/cloud ingress, new gateway,
   `/api` alias, browser proxy tree, or public Forge-worker route.
 
+# Locked product-surface preservation
+
+- This task does not design another UI. The production container must serve the
+  already accepted surfaces identified by the complete
+  [product render ledger](../../../../crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/README.md)
+  through the same canonical routes, assets, themes, loads, and actions proven
+  by TASK-003 through TASK-017.
+- Gateway smoke evidence must load `H-01` `/`, `H-02` `/t/acme`, and one route
+  from each of `C-*`, `O-*`, `CRW-*`, and `Q-01` through the public origin. It
+  must prove that nested direct links, SVG/font/logo assets, cookies, actions,
+  and error responses survive the Nginx boundary without route fallback
+  replacing a real page.
+- Compare the gateway-served H-01/H-02 pages in both themes to
+  [`home.svg`](../../../../crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/home.svg).
+  Packaging or routing may not change composition, hide assets, or introduce a
+  gateway-specific shell.
+
 # Ordered test scenarios
 
 1. All-in-one config contains only loopback upstreams and target `all`.

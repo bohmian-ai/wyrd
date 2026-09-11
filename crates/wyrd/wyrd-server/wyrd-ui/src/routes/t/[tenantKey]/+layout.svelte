@@ -5,4 +5,4 @@
   let { data, children }: LayoutProps = $props();
 </script>
 
-<Shell tenant={data.tenant} session={data.session} pathname={page.url.pathname} {children} />
+<Shell tenant={data.tenant} session={data.session} pathname={page.url.pathname} navCollapsed={data.navCollapsed} {children} />

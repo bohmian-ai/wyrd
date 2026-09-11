@@ -47,3 +47,7 @@ crates/vala/vala-bifrost/benches/reports/*.json
 
 # Agent tools
 .codegraph
+
+
+**/evidence/
+**/.vitest/

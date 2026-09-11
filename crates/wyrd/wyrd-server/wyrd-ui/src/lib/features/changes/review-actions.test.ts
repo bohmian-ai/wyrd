@@ -1,6 +1,6 @@
 import { expect, test } from 'vitest';
-import { MockChanges } from '$lib/server/changes/store';
-import { mentions } from '$lib/server/changes/fixtures';
+import { MockChanges } from '$lib/server/mock/changes/store';
+import { mentions } from '$lib/server/mock/changes/fixtures';
 import type { ReviewInput } from './types';
 import { WyrdClient } from '$lib/server/wyrd';
 import { render } from '@testing-library/svelte';

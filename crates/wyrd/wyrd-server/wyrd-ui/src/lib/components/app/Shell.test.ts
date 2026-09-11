@@ -15,7 +15,11 @@ const children = createRawSnippet(() => ({ render: () => '<h1>Workspace</h1>' })
 test('exactly five tenant-relative destinations and static single-tenant identity', () => {
   const view = render(Shell, { tenant, session, pathname: '/t/acme/cards/item', children });
   const nav = within(view.getByRole('navigation', { name: 'Primary' }));
-  expect(nav.getAllByRole('link').map((link) => link.textContent?.trim())).toEqual([
+  // Each entry renders its full label plus the two-letter rail abbreviation;
+  // only one is visible at a time (CSS), so assert on the full-label span.
+  expect(
+    nav.getAllByRole('link').map((link) => link.querySelector('.nav-full')?.textContent?.trim())
+  ).toEqual([
     'Home',
     'Cards',
     'Observe',

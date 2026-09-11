@@ -21,6 +21,7 @@
     ['Logs', '/logs'],
     ['Metrics', '/metrics'],
     ['Traces', '/traces'],
+    ['GenAI', '/genai'],
     ['Dashboards', '/dashboards'],
     ['Evaluations', '/evaluations'],
     ['Drift', '/drift']

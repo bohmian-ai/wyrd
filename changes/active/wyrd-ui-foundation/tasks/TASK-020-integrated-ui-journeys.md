@@ -29,6 +29,32 @@ session, component-reuse, and deployment evidence.
 - Produce the final component-to-consumer/catalog-boundary evidence required by
   AC-010 and the distinct-workspace evidence required by AC-011.
 
+# Locked visual acceptance matrix
+
+- The complete [product render ledger](../../../../crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/README.md)
+  is the route/state/link/responsive acceptance matrix. Audit all 83 named pages
+  and all 166 light/dark artboards; omission of a route, state, link, dominant
+  region, or responsive rule is a failed journey, not a documentation gap.
+- Compare implemented Home `H-01`–`H-02`; Cards `C-01`–`C-14`; Observe
+  `O-01`–`O-10`; Changes `CR-01`–`CR-07` and `CRW-01`–`CRW-07`; Query `Q-01`;
+  Experiment `E-01`–`E-18`; Service `S-01`–`S-07`; and mobile `M-01`–`M-09`,
+  `EM-01`–`EM-03`, `SM-01`–`SM-02`, and `CRWM-01`–`CRWM-03` to their exact
+  SVG files and ledger entries.
+- The immutable Gate A references
+  [`golden-CR-04.svg`](../../../../crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/golden-CR-04.svg),
+  [`golden-O-04.svg`](../../../../crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/golden-O-04.svg),
+  and [`golden-O-09.svg`](../../../../crates/wyrd/wyrd-server/wyrd-ui/brand/renders/product/golden-O-09.svg)
+  must retain their approved shell, hierarchy, panel altitude, selection,
+  density, and interaction grammar in the running product.
+- Evidence must contain a route-to-artboard ledger with pass/fail status and
+  direct captures at 1440 × 1024 and every named 390 × 844 mobile realization
+  in both themes. Alternate loading, empty, partial, unauthorized, safe-error,
+  and selected-detail states must appear at the position named by the render
+  ledger; a component gallery does not count.
+- A mismatch may be corrected only at the owning task's approved seam. If the
+  implementation cannot reproduce a render without changing approved behavior,
+  stop for specification authority; do not silently reinterpret the mock.
+
 # Integrated journeys
 
 1. Authenticate, resolve/switch tenant safely, and use Home with no credential

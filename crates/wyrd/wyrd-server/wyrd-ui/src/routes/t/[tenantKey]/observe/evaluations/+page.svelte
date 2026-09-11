@@ -34,7 +34,7 @@
   <p class="muted">Evaluation events, keyed by record_id — run_id is correlation, not identity.</p>
   <ObserveNav base={`${base}/observe`} current="Evaluations" scope={data.scope} />
   <div class="stack">
-    <form class="filters row" method="GET">
+    <form class="filters row" method="GET" data-sveltekit-noscroll data-sveltekit-keepfocus>
       <input aria-label="Search evaluation events" name="q" value={data.filters.q} placeholder="Search record_id…" />
       <button class="control">Search</button>
       <Select label="subject" name="service" options={subjectOptions} value={data.filters.service} />

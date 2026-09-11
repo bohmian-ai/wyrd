@@ -228,27 +228,69 @@
 }
 
 /* Volume/trend bars: an inline mini histogram, error-toned by context. */
-.observe .trendbars {
-  display: flex;
-  align-items: flex-end;
-  gap: 2px;
-  height: 52px;
-}
-.observe .trendbars > span {
-  flex: 1;
-  min-width: 2px;
-  border-radius: 1px;
-  background: color-mix(in srgb, var(--danger) 72%, var(--surface));
-}
-.observe .trend-axis {
-  display: flex;
-  justify-content: space-between;
-  margin-top: 4px;
-  font-size: 10px;
-}
 .observe .filters .reset {
   align-self: center;
   font-size: 11px;
+}
+
+/* Signal layout: collapsible fields facet panel beside the results column. */
+.observe .signal-layout {
+  display: flex;
+  gap: 16px;
+  align-items: flex-start;
+  min-width: 0;
+}
+.observe .signal-main {
+  flex: 1;
+  min-width: 0;
+  display: grid;
+  gap: 16px;
+}
+/* The WHERE readout under the search bar: what the current filters express. */
+.observe .where-line {
+  font: 11px var(--font-mono);
+  color: var(--muted);
+  overflow-x: auto;
+  white-space: nowrap;
+  padding: 2px 0;
+}
+.observe .where-line strong {
+  color: var(--text);
+}
+
+/* RED strip: three compact side-by-side panels above the trace table. */
+.observe .red-strip {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px;
+}
+
+/* One status spine per row, colored by severity; first cell carries it. */
+.observe tr.lvl-error td:first-child {
+  box-shadow: inset 3px 0 0 0 var(--danger);
+}
+.observe tr.lvl-warn td:first-child {
+  box-shadow: inset 3px 0 0 0 var(--server-bar);
+}
+
+/* Inline duration bar inside a table cell, proportional to the visible max. */
+.observe .durbar {
+  display: inline-block;
+  width: 72px;
+  height: 8px;
+  border-radius: 1px;
+  background: var(--surface-2);
+  margin-right: 7px;
+  vertical-align: baseline;
+}
+.observe .durbar > i {
+  display: block;
+  height: 100%;
+  border-radius: 1px;
+  background: var(--brand-strong);
+}
+.observe tr .durbar.err > i {
+  background: var(--danger);
 }
 
 /* Trace waterfall rows: label column + proportional bar lane. */
@@ -521,5 +563,14 @@
   .observe .drawer {
     width: 100vw;
     border-left: 0;
+  }
+  .observe .signal-layout {
+    flex-direction: column;
+  }
+  .observe .signal-layout > .wy-fields {
+    width: 100%;
+  }
+  .observe .red-strip {
+    grid-template-columns: minmax(0, 1fr);
   }
 }

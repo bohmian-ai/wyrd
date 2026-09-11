@@ -9,8 +9,11 @@ export const load: PageServerLoad = ({ locals, url }) => {
   const filters = {
     ...scope,
     level: url.searchParams.get('level') ?? '',
+    trace: url.searchParams.get('trace') ?? '',
     q: url.searchParams.get('q') ?? '',
-    record: url.searchParams.get('record') ?? ''
+    record: url.searchParams.get('record') ?? '',
+    page: url.searchParams.get('page') ?? '',
+    per: url.searchParams.get('per') ?? ''
   };
   try {
     return { view: locals.wyrd.observeLogs(filters), scope, filters, problem: null };

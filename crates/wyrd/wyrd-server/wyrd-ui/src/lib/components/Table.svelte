@@ -8,13 +8,24 @@
   // region with tabindex="0": a keyboard-only reader can focus it and pan with the arrow
   // keys, which a plain overflow container does not allow.
   let { label, children }: { label: string; children?: Snippet } = $props();
+
+  // Whole-row click: a row whose cell carries a link is one target, not a
+  // one-word hotspot. Delegated so consumers keep writing plain <tr><td><a>.
+  // Clicks on real interactive elements (a nested link, button, input) pass through.
+  function rowClick(event: MouseEvent) {
+    const target = event.target as HTMLElement;
+    if (target.closest('a, button, input, select, label, details')) return;
+    const row = target.closest('tbody tr');
+    const link = row?.querySelector('a');
+    if (link) link.click();
+  }
 </script>
 
 <!-- A scrollable region is the one WCAG-sanctioned nonnegative tabindex on a non-widget:
      without it the horizontal scroller is unreachable by keyboard. role=region +
      aria-label make it a named landmark, which is exactly what the rule presumes absent. -->
-<!-- svelte-ignore a11y_no_noninteractive_tabindex -->
-<div class="wy-table" role="region" aria-label={label} tabindex="0">{@render children?.()}</div>
+<!-- svelte-ignore a11y_no_noninteractive_tabindex, a11y_click_events_have_key_events, a11y_no_noninteractive_element_interactions -->
+<div class="wy-table" role="region" aria-label={label} tabindex="0" onclick={rowClick}>{@render children?.()}</div>
 
 <style>
   .wy-table {
@@ -67,15 +78,24 @@
   }
   /* A row is only interactive when it actually carries a link — a version readout is a
      static table, and a blanket row hover would promise a click that is not there. */
+  .wy-table :global(tbody tr:has(a)) {
+    cursor: pointer;
+  }
   .wy-table :global(tbody tr:has(a):hover td) {
     background: var(--surface-2);
   }
+  /* One spine per row, on the first cell only — an inset shadow on every td draws a
+     bar at each cell edge, which reads as broken vertical rules across the table. */
   .wy-table :global(tbody tr:has(a:focus-visible) td) {
     background: var(--surface-2);
-    box-shadow: inset 4px 0 0 0 var(--brand-strong);
+  }
+  .wy-table :global(tbody tr:has(a:focus-visible) td:first-child) {
+    box-shadow: inset 3px 0 0 0 var(--brand-strong);
   }
   .wy-table :global(tr.sel td) {
     background: var(--brand-soft);
-    box-shadow: inset 4px 0 0 0 var(--brand-strong);
+  }
+  .wy-table :global(tr.sel td:first-child) {
+    box-shadow: inset 3px 0 0 0 var(--brand-strong);
   }
 </style>

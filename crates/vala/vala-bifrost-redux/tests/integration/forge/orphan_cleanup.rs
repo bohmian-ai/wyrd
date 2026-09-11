@@ -57,7 +57,7 @@ async fn seed_object(fixture: &PromotionIntegrationFixture, path: String) -> Str
 async fn assert_no_durable_owner_names(
     fixture: &PromotionIntegrationFixture,
     forge: &Arc<vala_bifrost_redux::forge::Forge>,
-    audit_before: i64,
+    audit_before: &[String],
 ) {
     assert_eq!(
         fixture.rewrite_phases().await,
@@ -65,7 +65,7 @@ async fn assert_no_durable_owner_names(
         "the refusal arrived before any Prepared operation row"
     );
     assert_eq!(
-        fixture.forge_audit_count().await,
+        fixture.forge_audit_operations().await,
         audit_before,
         "a refused publication appends no Forge audit transition"
     );
@@ -174,7 +174,7 @@ async fn rowless_output_uses_canonical_identity_and_full_protection() {
     // One real managed rewrite produces its outputs and is then refused by its
     // own cancellation token, which is the last authority checked before the
     // Prepared operation row would commit.
-    let audit_before = promoted.fixture.forge_audit_count().await;
+    let audit_before = promoted.fixture.forge_audit_operations().await;
     supervisor.restart_worker();
     let worker_stop = supervisor.worker_stop();
     let error = supervisor
@@ -213,7 +213,7 @@ async fn rowless_output_uses_canonical_identity_and_full_protection() {
         );
     }
 
-    assert_no_durable_owner_names(&promoted.fixture, &forge, audit_before).await;
+    assert_no_durable_owner_names(&promoted.fixture, &forge, &audit_before).await;
     let lookalikes = seed_lookalikes(&promoted.fixture).await;
 
     // Before the age floor elapses, even a genuinely rowless output is retained.

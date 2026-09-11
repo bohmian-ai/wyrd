@@ -1428,31 +1428,43 @@ impl PromotionIntegrationFixture {
         .expect("fixture operation-state inspection")
     }
 
-    /// Counts the Forge audit rows this tenant's hash-chained outbox holds.
+    /// Lists the durable Forge protocol transitions this tenant's outbox holds.
     ///
     /// Every durable Forge transition appends exactly one row, so an unchanged
-    /// count across a held attempt is the direct evidence that the attempt
+    /// list across a held attempt is the direct evidence that the attempt
     /// recorded no Prepared, Reset, Committed, or Recovered transition — a
     /// stronger statement than the absence of an operation-state row, which a
-    /// transition could in principle write without.
+    /// transition could in principle write without. The operations are
+    /// returned rather than counted so a failure names the transition that
+    /// appeared instead of reporting only that one did.
+    ///
+    /// `forge.task.*` rows are excluded. Those record the worker's own attempt
+    /// lifecycle, so a refused attempt legitimately appends `forge.task.failed`
+    /// and its arrival relative to worker shutdown is not ordered against this
+    /// read. Including it would make a scenario about the publication protocol
+    /// assert on worker bookkeeping instead.
     ///
     /// # Panics
     ///
     /// Panics when the read-only diagnostic query fails.
-    pub(crate) async fn forge_audit_count(&self) -> i64 {
+    pub(crate) async fn forge_audit_operations(&self) -> Vec<String> {
         let mut conn = self
             .vala
             .tenant_conn(self.tenant)
             .await
             .expect("fixture tenant connection");
-        let count = sqlx::query_scalar::<_, i64>(
-            "SELECT count(*) FROM vala.audit_outbox WHERE operation LIKE 'forge.%'",
+        let operations = sqlx::query_scalar::<_, String>(
+            "SELECT operation
+               FROM vala.audit_outbox
+              WHERE operation LIKE 'forge.%'
+                AND operation NOT LIKE 'forge.task.%'
+              ORDER BY seq",
         )
-        .fetch_one(&mut **conn.transaction())
+        .fetch_all(&mut **conn.transaction())
         .await
         .expect("fixture Forge audit inspection");
         conn.commit().await.expect("fixture audit read commit");
-        count
+        operations
     }
 
     /// Counts terminal rewrite transitions recorded for `operation_ids`.

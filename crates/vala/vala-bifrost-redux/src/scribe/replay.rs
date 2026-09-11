@@ -1,9 +1,9 @@
-//! WAL replay — boot-time reconstruction of memtable and audit envelopes.
+//! WAL replay — boot-time reconstruction of memtable state.
 //!
 //! On Scribe restart, replay scans the WAL directory past `manifest.sealed_lsn[K]`
 //! for each seal-key K, validates CRC/length/monotonicity, truncates torn tails,
 //! dedupes by `AppendSliceId`, and reconstructs both the memtable state and the
-//! staged `AuditEvent` list per key.
+//! per-key append metadata.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::Cursor;
@@ -13,11 +13,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(test)]
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
-use wyrd_spec::vala::api::AuditEvent;
 
 use crate::contracts::ScribeError;
 use crate::resources::{ScribeMemoryLease, ScribeResources};
-use crate::scribe::audit_envelope::decode_audit_event;
 use crate::scribe::manifest::read_manifest;
 use crate::scribe::memory::MemoryCategory;
 use crate::scribe::preprocess::AppendSliceId;
@@ -49,8 +47,6 @@ pub struct ReplayedSealKey {
     /// `synced_not_inserted` and pending-FIFO dedup state rebuild exactly
     /// where the original writes lived.
     pub shard_id: u8,
-    /// Ordered list of `AuditEvent`s staged for the seal transaction.
-    pub audit_events: Vec<AuditEvent>,
     /// Ordered list of data record payloads (Arrow IPC bytes).
     pub data_records: Vec<Vec<u8>>,
     /// Per-append metadata derived from WAL record headers.
@@ -78,7 +74,7 @@ pub struct ReplayedCommitIdentity {
     pub wal_lsn_min: WalLsn,
     /// Terminal commit LSN.
     pub wal_lsn_max: WalLsn,
-    /// Audit request identity persisted with the fence.
+    /// Request correlation persisted with the fence.
     pub request_id: uuid::Uuid,
 }
 
@@ -149,7 +145,6 @@ pub struct ReplayedAppendMeta {
 /// Returns [`ScribeError::Internal`] if:
 /// - WAL segments cannot be read
 /// - Record CRC validation fails (after truncating the torn tail)
-/// - Audit envelope decoding fails
 ///
 /// Gated to `cfg(test)` and the `test-support` feature: it collects an entire
 /// WAL without the governor, stream filter, WAL pinning, or cancellation that
@@ -467,7 +462,7 @@ impl<'a> ReplayAccumulator<'a> {
     /// # Errors
     ///
     /// Returns [`ScribeError`] when decode accounting, the WAL record shape,
-    /// audit decoding, or Arrow row inspection fails.
+    /// or Arrow row inspection fails.
     fn append(
         &mut self,
         segment_path: std::path::PathBuf,
@@ -723,14 +718,13 @@ impl<'a> ReplayAccumulator<'a> {
     ///
     /// # Errors
     ///
-    /// Returns [`ScribeError`] when the durable audit envelope cannot be decoded.
+    /// Returns [`ScribeError`] when the replayed Arrow payload cannot be read.
     fn release_slice(
         &mut self,
         slice: PendingSlice,
         commit: ReplayedCommitIdentity,
         commit_segment_path: &Path,
     ) -> Result<(), ScribeError> {
-        let audit_event = decode_audit_event(&slice.decoded.audit)?;
         let seal_key = slice.decoded.seal_key;
         let state = self
             .states
@@ -739,7 +733,6 @@ impl<'a> ReplayAccumulator<'a> {
                 stream: self.stream,
                 seal_key: seal_key.clone(),
                 shard_id: self.shard_id,
-                audit_events: Vec::new(),
                 data_records: Vec::new(),
                 append_metas: Vec::new(),
                 wal_segments: Vec::new(),
@@ -765,7 +758,6 @@ impl<'a> ReplayAccumulator<'a> {
             state.commits.push(commit);
         }
         let rows_accepted = count_rows(&slice.decoded.data);
-        state.audit_events.push(audit_event);
         state.data_records.push(slice.decoded.data);
         state.append_metas.push(ReplayedAppendMeta {
             batch_id: slice.record.batch_id,
@@ -876,9 +868,9 @@ struct CommittedBatchIdentity {
     /// This is the digest the durable SQL fence stores. It is carried by the
     /// terminal record itself alongside the WAL digest: the WAL digest binds
     /// exact frame bytes, and every slice payload embeds its own attempt's
-    /// audit envelope, so a second honest attempt at the same batch
-    /// legitimately carries a different WAL digest. Only the logical identity
-    /// can answer whether two terminal records closed the same rows.
+    /// managed correlation columns, so a second honest attempt at the same
+    /// batch legitimately carries a different WAL digest. Only the logical
+    /// identity can answer whether two terminal records closed the same rows.
     logical_digest: [u8; 32],
 }
 
@@ -1003,8 +995,8 @@ fn slice_set_digest<'a>(slices: impl Iterator<Item = &'a PendingSlice>) -> [u8; 
 ///
 /// # Errors
 ///
-/// Returns [`ScribeError`] when the segment sequence, first LSN, or audit
-/// request UUID cannot be reconstructed from validated WAL state.
+/// Returns [`ScribeError`] when the segment sequence or first LSN cannot be
+/// reconstructed from validated WAL state.
 fn replayed_commit_identity(
     segment_path: &Path,
     pending: &PendingBatch,
@@ -1018,12 +1010,7 @@ fn replayed_commit_identity(
         .ok_or_else(|| ScribeError::Internal {
             detail: "WAL v6 COMMIT has no first slice identity".to_owned(),
         })?;
-    let event = decode_audit_event(&first.decoded.audit)?;
-    let request_id = uuid::Uuid::parse_str(event.request_id.as_str()).map_err(|error| {
-        ScribeError::Internal {
-            detail: format!("WAL replay audit request identity is invalid: {error}"),
-        }
-    })?;
+    let request_id = uuid::Uuid::from_bytes(commit.commit_identity()?.request_id);
     let segment_sequence = segment_path
         .file_stem()
         .and_then(|value| value.to_str())
@@ -1111,9 +1098,9 @@ fn count_rows(data: &[u8]) -> usize {
 ///
 /// When the same seal key was written across multiple shards (as is normal
 /// under batch-spread routing), this function is called once per contributing
-/// shard. After merging, the three parallel append vectors (`audit_events`,
-/// `data_records`, `append_metas`) are sorted by [`WalLsn`] so that the
-/// caller always observes appends in their original temporal order. Pod-global
+/// shard. After merging, the two parallel append vectors (`data_records`,
+/// `append_metas`) are sorted by [`WalLsn`] so that the caller always
+/// observes appends in their original temporal order. Pod-global
 /// LSNs are monotonic across shards, so this sort is always correct.
 ///
 /// Records from a different stream identity are stored under a compound key
@@ -1131,7 +1118,6 @@ fn merge_replayed_state(
         replayed.insert(format!("{key}/stream={}", incoming.stream), incoming);
         return;
     }
-    existing.audit_events.extend(incoming.audit_events);
     existing.data_records.extend(incoming.data_records);
     existing.append_metas.extend(incoming.append_metas);
     for segment in incoming.wal_segments {
@@ -1150,20 +1136,17 @@ fn merge_replayed_state(
     }
     // Re-sort the parallel append vectors by LSN so cross-shard merges produce
     // a temporally ordered result. Build a sort key over append_metas indices,
-    // then permute all three parallel vectors together.
+    // then permute both parallel vectors together.
     let n = existing.append_metas.len();
     let mut indices: Vec<usize> = (0..n).collect();
     indices.sort_by_key(|&i| existing.append_metas[i].wal_lsn);
     let mut sorted_metas = Vec::with_capacity(n);
-    let mut sorted_audit = Vec::with_capacity(n);
     let mut sorted_data = Vec::with_capacity(n);
     for i in &indices {
         sorted_metas.push(existing.append_metas[*i].clone());
-        sorted_audit.push(existing.audit_events[*i].clone());
         sorted_data.push(existing.data_records[*i].clone());
     }
     existing.append_metas = sorted_metas;
-    existing.audit_events = sorted_audit;
     existing.data_records = sorted_data;
 }
 

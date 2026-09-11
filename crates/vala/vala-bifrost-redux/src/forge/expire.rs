@@ -19,15 +19,10 @@ use vala_sql::row_types::forge_operations::{
 };
 use vala_sql::row_types::forge_tasks::{
     ForgeCleanupCandidate, ForgeCleanupCategory, ForgeCleanupPath, ForgeTaskEvidence,
-    ForgeTaskState, ForgeTaskTableIdentity, SnapshotWatermark,
+    ForgeTaskTableIdentity, SnapshotWatermark,
 };
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
-use wyrd_spec::request_id::RequestId;
-use wyrd_spec::vala::api::{
-    AuditDecision, AuditDetail, AuditEvent, AuditResult, AuthMethod, ForgeSnapshotExpirePhase,
-    StoragePath,
-};
+use wyrd_spec::vala::api::{AuditDetail, ForgeSnapshotExpirePhase, StoragePath};
 
 use crate::catalog::{BIFROST_CATALOG_NAME, TableRef, TenantTableBinding};
 #[cfg(test)]
@@ -41,8 +36,6 @@ use super::lease::ForgeLease;
 #[cfg(feature = "test-support")]
 use super::lease::forge_lease_key;
 use super::metrics::ForgeTelemetry;
-
-const SYSTEM_PRINCIPAL: PrincipalId = PrincipalId::new(uuid::Uuid::nil());
 
 /// The minimum information needed to select snapshots without relying on
 /// Iceberg's numeric snapshot identifiers for ordering.
@@ -1212,34 +1205,22 @@ impl Forge {
         table: &ForgeClaimTable,
         detail: &AuditDetail,
     ) -> Result<(), ForgeError> {
-        let operation_event = expiry_operation_event(
-            detail,
-            "forge.snapshot_expire.prepared",
-            AuditResult::Success,
-        )?;
-        let task_event = super::worker::task_event(
-            authority.task,
-            ForgeTaskState::Prepared,
-            "snapshot expiration claims prepared before the Iceberg gate",
-        );
-        ForgeOperations::new(
-            &operation_event.resource,
-            ForgeOperationFamily::SnapshotExpire,
-        )
-        .map_err(ForgeError::Sql)?
-        .prepare_snapshot_expiration(
-            &self.core.operator_pool,
-            key.tenant,
-            &ForgeExpirationPreparation {
-                authority: &expiration_authority(authority, lease),
-                table,
-                evidence: &prepared_expiry_evidence(),
-                operation_event: &operation_event,
-                task_event: &task_event,
-            },
-        )
-        .await
-        .map_err(ForgeError::Sql)?;
+        let resource = expiry_resource(detail)?;
+        ForgeOperations::new(resource, ForgeOperationFamily::SnapshotExpire)
+            .map_err(ForgeError::Sql)?
+            .prepare_snapshot_expiration(
+                &self.core.operator_pool,
+                key.tenant,
+                &ForgeExpirationPreparation {
+                    authority: &expiration_authority(authority, lease),
+                    table,
+                    evidence: &prepared_expiry_evidence(),
+                    operation: "forge.snapshot_expire.prepared",
+                    detail,
+                },
+            )
+            .await
+            .map_err(ForgeError::Sql)?;
         Ok(())
     }
 
@@ -1259,30 +1240,20 @@ impl Forge {
         detail: &AuditDetail,
         cause: &ForgeError,
     ) -> Result<(), ForgeError> {
-        let operation_event =
-            expiry_operation_event(detail, "forge.snapshot_expire.reset", AuditResult::Failure)?;
-        let task_event = super::worker::task_event(
-            authority.task,
-            ForgeTaskState::Cancelled,
-            &format!("snapshot expiration released without an Iceberg mutation: {cause}"),
-        );
-        ForgeOperations::new(
-            &operation_event.resource,
-            ForgeOperationFamily::SnapshotExpire,
-        )
-        .map_err(ForgeError::Sql)?
-        .reset_snapshot_expiration(
-            &self.core.operator_pool,
-            key.tenant,
-            &ForgeExpirationResetRequest {
-                authority: &expiration_authority(authority, lease),
-                table,
-                operation_event: &operation_event,
-                task_event: &task_event,
-            },
-        )
-        .await
-        .map_err(ForgeError::Sql)?;
+        let resource = expiry_resource(detail)?;
+        ForgeOperations::new(resource, ForgeOperationFamily::SnapshotExpire)
+            .map_err(ForgeError::Sql)?
+            .reset_snapshot_expiration(
+                &self.core.operator_pool,
+                key.tenant,
+                &ForgeExpirationResetRequest {
+                    authority: &expiration_authority(authority, lease),
+                    table,
+                    detail,
+                },
+            )
+            .await
+            .map_err(ForgeError::Sql)?;
         tracing::warn!(
             task_id = %authority.task,
             cause = %cause,
@@ -1339,35 +1310,24 @@ impl Forge {
             ForgeExpirationSettlement::Committed => ForgeSnapshotExpirePhase::Committed,
             ForgeExpirationSettlement::Recovered => ForgeSnapshotExpirePhase::Recovered,
         };
-        let operation_event = expiry_operation_event(
-            &terminal_expiry_detail(detail, phase),
-            operation,
-            AuditResult::Success,
-        )?;
-        let task_event = super::worker::task_event(
-            authority.task_id,
-            ForgeTaskState::Succeeded,
-            "snapshot expiration settled with exact cleanup candidates",
-        );
-        ForgeOperations::new(
-            &operation_event.resource,
-            ForgeOperationFamily::SnapshotExpire,
-        )
-        .map_err(ForgeError::Sql)?
-        .settle_snapshot_expiration(
-            &self.core.operator_pool,
-            binding.tenant,
-            &ForgeExpirationSettlementRequest {
-                authority,
-                table,
-                settlement,
-                evidence: &evidence,
-                operation_event: &operation_event,
-                task_event: &task_event,
-            },
-        )
-        .await
-        .map_err(ForgeError::Sql)?;
+        let terminal_detail = terminal_expiry_detail(detail, phase);
+        let resource = expiry_resource(&terminal_detail)?;
+        ForgeOperations::new(resource, ForgeOperationFamily::SnapshotExpire)
+            .map_err(ForgeError::Sql)?
+            .settle_snapshot_expiration(
+                &self.core.operator_pool,
+                binding.tenant,
+                &ForgeExpirationSettlementRequest {
+                    authority,
+                    table,
+                    settlement,
+                    evidence: &evidence,
+                    operation,
+                    detail: &terminal_detail,
+                },
+            )
+            .await
+            .map_err(ForgeError::Sql)?;
         Ok(evidence)
     }
 }
@@ -1399,37 +1359,19 @@ fn prepared_expiry_evidence() -> ForgeTaskEvidence {
     }
 }
 
-/// Builds one fenced snapshot-expiry operation audit event.
+/// Returns the operation resource named by snapshot-expiry evidence.
 ///
 /// # Errors
 ///
 /// Returns [`ForgeError::SnapshotExpiry`] when `detail` is not snapshot-expiry
 /// evidence and therefore names no operation resource.
-fn expiry_operation_event(
-    detail: &AuditDetail,
-    operation: &str,
-    result: AuditResult,
-) -> Result<AuditEvent, ForgeError> {
+fn expiry_resource(detail: &AuditDetail) -> Result<&str, ForgeError> {
     let AuditDetail::ForgeSnapshotExpire { group, .. } = detail else {
         return Err(ForgeError::SnapshotExpiry {
-            detail: "snapshot-expiry audit detail has the wrong kind".to_owned(),
+            detail: "snapshot-expiry transition detail has the wrong kind".to_owned(),
         });
     };
-    Ok(AuditEvent {
-        request_id: RequestId::now_v7(),
-        trace_id: None,
-        operation: operation.to_owned(),
-        resource: group.clone(),
-        card_ref: None,
-        principal_id: SYSTEM_PRINCIPAL,
-        principal_kind: PrincipalKindTag::Service,
-        auth_method: AuthMethod::Internal,
-        permission: "bifrost:forge".to_owned(),
-        decision: AuditDecision::Allow,
-        result,
-        payload_summary: operation.to_owned(),
-        detail: Some(detail.clone()),
-    })
+    Ok(group)
 }
 
 /// Proves the corroborating catalog read matches every pinned field.

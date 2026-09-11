@@ -20,11 +20,8 @@ use vala_sql::row_types::forge_operations::{
     ForgeOperationFamily, ForgeOperationPhase, ForgeOperationStateRow, ForgeOperationTransition,
 };
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
-use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
-    AuditDecision, AuditDetail, AuditEvent, AuditResult, AuthMethod, ForgeOrphanGcPhase,
-    StoragePath, audit_detail_canonical_json,
+    AuditDetail, ForgeOrphanGcPhase, StoragePath, audit_detail_canonical_json,
 };
 
 use vala_sql::row_types::forge_tasks::{ForgeCleanupCandidate, ForgeTaskStrategy};
@@ -44,8 +41,6 @@ use super::managed::identity::ForgeOutputIdentity;
 use super::metrics::ForgeTelemetry;
 use super::path::{catalog_path_to_object_key, validate_table_location};
 use super::protection_roots::OrphanProtectionRoots;
-
-const SYSTEM_PRINCIPAL: PrincipalId = PrincipalId::new(uuid::Uuid::nil());
 
 /// Fails closed when the table-scoped maintenance token has been cancelled.
 ///
@@ -894,7 +889,7 @@ impl Forge {
             return Ok(outcome);
         }
         let detail = Self::gc_detail(table.task_id, table.key, scan.candidates)?;
-        self.append_gc_audit(lease, table.key.tenant, &detail, "forge.orphan_gc.prepared")
+        self.append_gc_transition(lease, table.key.tenant, &detail, "forge.orphan_gc.prepared")
             .await?;
         // Past the prepared audit the operation row owns this batch. A caller
         // driving a durable task must not settle its attempt on any exit from
@@ -1501,7 +1496,7 @@ impl Forge {
         } = detail
         else {
             return Err(ForgeError::Reconciliation {
-                detail: "orphan-GC audit detail has the wrong kind".to_owned(),
+                detail: "orphan-GC transition detail has the wrong kind".to_owned(),
             });
         };
         if group != &table_resource_for_key(table.key)
@@ -1511,7 +1506,7 @@ impl Forge {
                 .any(|pair| pair[0].as_str() >= pair[1].as_str())
         {
             return Err(ForgeError::Reconciliation {
-                detail: "orphan-GC audit detail is not canonical".to_owned(),
+                detail: "orphan-GC transition detail is not canonical".to_owned(),
             });
         }
         let protection = self
@@ -1542,7 +1537,7 @@ impl Forge {
                 ForgeOrphanGcPhase::Committed
             },
         );
-        self.append_gc_audit(
+        self.append_gc_transition(
             lease,
             table.key.tenant,
             &terminal,
@@ -1604,7 +1599,7 @@ impl Forge {
             } = &detail
             else {
                 return Err(ForgeError::Reconciliation {
-                    detail: "orphan-GC prepared audit has the wrong kind".to_owned(),
+                    detail: "orphan-GC prepared detail has the wrong kind".to_owned(),
                 });
             };
             let batch = self
@@ -1689,13 +1684,12 @@ impl Forge {
             .collect()
     }
 
-    /// Appends one fenced orphan-GC audit and projection transition atomically.
+    /// Records one fenced orphan-GC operation-state transition atomically.
     ///
     /// # Errors
-    /// Returns detail-validation, lease, SQL, operation-state, audit, fence, or
-    /// commit failures. The caller-owned transaction rolls back both durable
-    /// rows.
-    async fn append_gc_audit(
+    /// Returns detail-validation, lease, SQL, operation-state, fence, or commit
+    /// failures. The caller-owned transaction rolls back the durable row.
+    async fn append_gc_transition(
         &self,
         lease: &mut ForgeLease,
         tenant: DataTenantId,
@@ -1706,24 +1700,9 @@ impl Forge {
             AuditDetail::ForgeOrphanGc { group, .. } => group.clone(),
             _ => {
                 return Err(ForgeError::Reconciliation {
-                    detail: "orphan-GC audit detail has the wrong kind".to_owned(),
+                    detail: "orphan-GC transition detail has the wrong kind".to_owned(),
                 });
             }
-        };
-        let event = AuditEvent {
-            request_id: RequestId::now_v7(),
-            trace_id: None,
-            operation: operation.to_owned(),
-            resource,
-            card_ref: None,
-            principal_id: SYSTEM_PRINCIPAL,
-            principal_kind: PrincipalKindTag::Service,
-            auth_method: AuthMethod::Internal,
-            permission: "bifrost:forge".to_owned(),
-            decision: AuditDecision::Allow,
-            result: AuditResult::Success,
-            payload_summary: operation.to_owned(),
-            detail: Some(detail.clone()),
         };
         lease.require_fence(&self.core.operator_pool).await?;
         let mut conn = self
@@ -1732,17 +1711,20 @@ impl Forge {
             .tenant_conn(tenant)
             .await
             .map_err(ForgeError::Sql)?;
-        let operations = ForgeOperations::new(&event.resource, ForgeOperationFamily::OrphanGc)
+        let operations = ForgeOperations::new(&resource, ForgeOperationFamily::OrphanGc)
             .map_err(ForgeError::Sql)?;
         let transition = if operation == "forge.orphan_gc.prepared" {
-            operations.append_prepared(&mut conn, &event).await
+            operations
+                .append_prepared(&mut conn, operation, detail)
+                .await
         } else {
-            operations.append_terminal(&mut conn, &event).await
+            operations
+                .append_terminal(&mut conn, operation, detail)
+                .await
         }
         .map_err(ForgeError::Sql)?;
         match transition {
-            ForgeOperationTransition::Applied { .. }
-            | ForgeOperationTransition::AlreadyApplied { .. } => {}
+            ForgeOperationTransition::Applied | ForgeOperationTransition::AlreadyApplied => {}
         }
         lease.assert_transaction_fence(&mut conn).await?;
         conn.commit().await.map_err(ForgeError::Sql)
@@ -1762,7 +1744,8 @@ impl Forge {
         detail: &AuditDetail,
         operation: &str,
     ) -> Result<(), ForgeError> {
-        self.append_gc_audit(lease, tenant, detail, operation).await
+        self.append_gc_transition(lease, tenant, detail, operation)
+            .await
     }
 
     /// Insert one catalog-owned reference after converting it through Forge's

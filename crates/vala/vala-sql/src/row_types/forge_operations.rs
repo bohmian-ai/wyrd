@@ -2,19 +2,19 @@
 //!
 //! The private [`ForgeOperationStateSqlRow`] mirrors the exact column layout of
 //! that table and nothing else — the projection is the sole Forge recovery
-//! authority, so no read joins the `vala.audit_outbox` delivery table. The
-//! public [`ForgeOperationStateRow`] is produced by explicit, fallible
-//! conversion that validates every stored value: closed enum strings,
-//! JSONB-to-detail decoding, phase/nullability invariants, and tenant/resource/
-//! detail identity.
+//! authority, and a Forge transition evaluates no principal permission, so no
+//! read here joins audit state. The public [`ForgeOperationStateRow`] is
+//! produced by explicit, fallible conversion that validates every stored value:
+//! closed enum strings, JSONB-to-detail decoding, and tenant/resource/detail
+//! identity.
 
 use chrono::{DateTime, Utc};
 use std::str::FromStr;
 
 use sqlx::types::Uuid;
 use wyrd_spec::vala::api::{
-    AuditDetail, AuditEvent, ForgeIcebergRewritePhase, ForgeOrphanGcPhase,
-    ForgeScribePromotionPhase, ForgeSnapshotExpirePhase,
+    AuditDetail, ForgeIcebergRewritePhase, ForgeOrphanGcPhase, ForgeScribePromotionPhase,
+    ForgeSnapshotExpirePhase,
 };
 
 use crate::SqlError;
@@ -142,20 +142,16 @@ pub struct ForgeOperationStateRow {
     pub resource: String,
     /// Closed operation family.
     pub family: ForgeOperationFamily,
-    /// Deterministic operation identifier shared with the audit detail.
+    /// Deterministic operation identifier shared with the typed detail.
     pub operation_id: Uuid,
     /// Current phase of the operation.
     pub phase: ForgeOperationPhase,
-    /// Original prepared detail from the first Prepared audit row.
+    /// Original prepared detail recorded by the first Prepared transition.
     pub prepared_detail: AuditDetail,
     /// Current detail — matches `prepared_detail` for Prepared rows, or
     /// carries the terminal detail for terminal rows.
     pub current_detail: AuditDetail,
-    /// Audit sequence of the prepared event that opened this operation.
-    pub prepared_audit_seq: i64,
-    /// Audit sequence of the terminal event that closed this operation, if any.
-    pub terminal_audit_seq: Option<i64>,
-    /// Wall-clock time of the prepared event.
+    /// Wall-clock time of the prepared transition.
     pub prepared_at: DateTime<Utc>,
     /// Wall-clock time of the most recent update.
     pub updated_at: DateTime<Utc>,
@@ -172,21 +168,14 @@ pub struct OpenForgeOperationPage {
 }
 
 /// Outcome of attempting to apply a transition to the operation state.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForgeOperationTransition {
     /// The transition was applied and the caller should consider it the
-    /// authoritative result.
-    Applied {
-        /// The audit sequence that was (or will be) committed in the same
-        /// transaction.
-        audit_seq: i64,
-    },
-    /// The transition was already applied by a previous attempt; no audit or
-    /// state change occurred.
-    AlreadyApplied {
-        /// The existing audit sequence that recorded this transition.
-        audit_seq: i64,
-    },
+    /// authoritative result. It becomes durable when the caller commits.
+    Applied,
+    /// The transition was already applied by a previous attempt; no state
+    /// change occurred.
+    AlreadyApplied,
 }
 
 // ---------------------------------------------------------------------------
@@ -196,11 +185,9 @@ pub enum ForgeOperationTransition {
 /// Raw SQL row mirror for the `forge_operation_state` projection.
 ///
 /// The projection is the sole Forge operation and recovery authority: it stores
-/// the complete typed prepared and current details alongside the audit
-/// sequences the transitions that wrote them produced. `vala.audit_outbox` is a
-/// delivery table with its own retention lifecycle, so no read here joins it —
-/// a delivered audit row that later ages out must not remove a worker's ability
-/// to recover its own prepared operation.
+/// the complete typed prepared and current details that every transition wrote.
+/// A Forge maintenance transition evaluates no principal permission, so it is
+/// lineage rather than audit and this projection joins no audit state at all.
 ///
 /// This is the sole `sqlx::FromRow` decoder. Every decoded row goes through
 /// an explicit [`TryInto<ForgeOperationStateRow>`] that validates stored
@@ -221,11 +208,7 @@ pub(crate) struct ForgeOperationStateSqlRow {
     pub(crate) prepared_detail: serde_json::Value,
     /// JSONB value of the current detail.
     pub(crate) current_detail: serde_json::Value,
-    /// Audit sequence of the prepared event.
-    pub(crate) prepared_audit_seq: i64,
-    /// Audit sequence of the terminal event, if any.
-    pub(crate) terminal_audit_seq: Option<i64>,
-    /// Wall-clock time of the prepared event.
+    /// Wall-clock time of the prepared transition.
     pub(crate) prepared_at: DateTime<Utc>,
     /// Wall-clock time of the most recent update.
     pub(crate) updated_at: DateTime<Utc>,
@@ -242,7 +225,6 @@ impl TryFrom<ForgeOperationStateSqlRow> for ForgeOperationStateRow {
     /// 2. Decode both JSONB columns to typed `AuditDetail`.
     /// 3. Validate tenant/resource/family/operation/phase identity in both
     ///    state details.
-    /// 4. Enforce the terminal-sequence nullability check.
     ///
     /// # Errors
     /// Returns [`SqlError::InvariantViolation`] when any stored value fails
@@ -286,24 +268,6 @@ impl TryFrom<ForgeOperationStateSqlRow> for ForgeOperationStateRow {
             current_phase,
         )?;
 
-        // Enforce nullability invariant.
-        match phase {
-            ForgeOperationPhase::Prepared => {
-                if row.terminal_audit_seq.is_some() {
-                    return Err(SqlError::InvariantViolation {
-                        detail: "Prepared row has non-null terminal_audit_seq".to_owned(),
-                    });
-                }
-            }
-            _ => {
-                if row.terminal_audit_seq.is_none() {
-                    return Err(SqlError::InvariantViolation {
-                        detail: format!("{:?} row has null terminal_audit_seq", phase),
-                    });
-                }
-            }
-        }
-
         Ok(Self {
             resource: row.resource,
             family,
@@ -311,8 +275,6 @@ impl TryFrom<ForgeOperationStateSqlRow> for ForgeOperationStateRow {
             phase,
             prepared_detail,
             current_detail,
-            prepared_audit_seq: row.prepared_audit_seq,
-            terminal_audit_seq: row.terminal_audit_seq,
             prepared_at: row.prepared_at,
             updated_at: row.updated_at,
         })
@@ -544,8 +506,9 @@ pub enum ForgeExpirationResetOutcome {
 /// Everything one atomic snapshot-expiration preparation needs.
 ///
 /// The request bundles the mutation authority, the table the claims bind to,
-/// the Prepared task evidence, and both audit events so the caller cannot
-/// present a partial preparation to the single transaction that applies it.
+/// the Prepared task evidence, and the typed operation transition so the caller
+/// cannot present a partial preparation to the single transaction that applies
+/// it.
 pub struct ForgeExpirationPreparation<'request> {
     /// Live task/attempt/worker/lease identity preparing the selection.
     pub authority: &'request ForgeExpirationAuthority,
@@ -553,10 +516,10 @@ pub struct ForgeExpirationPreparation<'request> {
     pub table: &'request ForgeClaimTable,
     /// Prepared attempt evidence recorded on the task in the same transaction.
     pub evidence: &'request ForgeTaskEvidence,
-    /// Prepared `forge.snapshot_expire.prepared` operation audit event.
-    pub operation_event: &'request AuditEvent,
-    /// Matching `forge.task.prepared` task audit event.
-    pub task_event: &'request AuditEvent,
+    /// Prepared `forge.snapshot_expire.prepared` operation name.
+    pub operation: &'request str,
+    /// Typed Prepared selection detail recorded as the operation's lineage.
+    pub detail: &'request AuditDetail,
 }
 
 /// Everything one atomic snapshot-expiration settlement needs.
@@ -569,10 +532,10 @@ pub struct ForgeExpirationSettlementRequest<'request> {
     pub settlement: ForgeExpirationSettlement,
     /// Final attempt evidence, including the exact cleanup candidate names.
     pub evidence: &'request ForgeTaskEvidence,
-    /// Terminal `forge.snapshot_expire.{committed,recovered}` audit event.
-    pub operation_event: &'request AuditEvent,
-    /// Matching `forge.task.succeeded` task audit event.
-    pub task_event: &'request AuditEvent,
+    /// Terminal `forge.snapshot_expire.{committed,recovered}` operation name.
+    pub operation: &'request str,
+    /// Typed terminal detail recorded as the operation's lineage.
+    pub detail: &'request AuditDetail,
 }
 
 /// Everything one atomic snapshot-expiration reset needs.
@@ -581,12 +544,11 @@ pub struct ForgeExpirationResetRequest<'request> {
     pub authority: &'request ForgeExpirationAuthority,
     /// Registered table whose claims are released.
     pub table: &'request ForgeClaimTable,
-    /// Failed `forge.snapshot_expire.reset` operation audit event, which
-    /// carries the immutable Prepared detail because the public snapshot-expiry
-    /// phase enum has no Reset variant.
-    pub operation_event: &'request AuditEvent,
-    /// Matching `forge.task.cancelled` task audit event.
-    pub task_event: &'request AuditEvent,
+    /// Immutable Prepared detail the released operation was opened with. The
+    /// public snapshot-expiry phase enum has no Reset variant, so the reset
+    /// carries the Prepared detail unchanged and records the release only in
+    /// the state row's `reset` phase.
+    pub detail: &'request AuditDetail,
 }
 
 /// Exact column mirror of one `vala.forge_snapshot_expiration_claims` row.

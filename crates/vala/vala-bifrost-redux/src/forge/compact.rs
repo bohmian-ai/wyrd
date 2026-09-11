@@ -14,9 +14,6 @@ use futures_util::future::ready;
 use futures_util::stream::{self, BoxStream};
 use opendal::{Buffer, Entry, Metadata};
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
-use wyrd_spec::request_id::RequestId;
-use wyrd_spec::vala::api::{AuditDecision, AuditDetail, AuditEvent, AuditResult, AuthMethod};
 
 use super::Forge;
 use super::error::ForgeError;
@@ -53,7 +50,6 @@ const DEFAULT_ORPHAN_GC_MAX_LIST_PAGES: usize = 1_024;
 /// remainder to a successor run that resumes from the committed-deletion
 /// frontier.
 const DEFAULT_ORPHAN_GC_RUN_BUDGET: Duration = Duration::from_mins(2);
-const SYSTEM_PRINCIPAL: PrincipalId = PrincipalId::new(uuid::Uuid::nil());
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Limits and durability windows for one Forge maintenance loop.
@@ -427,32 +423,6 @@ impl Forge {
             operation: "catalog table load",
         })?
         .map_err(ForgeError::Catalog)
-    }
-}
-
-/// Construct system-owned metadata for one Forge transition event.
-///
-/// Family and phase validation remain owned by [`ForgeOperations`]; this pure
-/// helper only preserves the established event envelope.
-pub(super) fn forge_transition_event(
-    operation: &str,
-    resource: String,
-    detail: AuditDetail,
-) -> AuditEvent {
-    AuditEvent {
-        request_id: RequestId::now_v7(),
-        trace_id: None,
-        operation: operation.to_owned(),
-        resource,
-        card_ref: None,
-        principal_id: SYSTEM_PRINCIPAL,
-        principal_kind: PrincipalKindTag::Service,
-        auth_method: AuthMethod::Internal,
-        permission: "bifrost:forge".to_owned(),
-        decision: AuditDecision::Allow,
-        result: AuditResult::Success,
-        payload_summary: operation.to_owned(),
-        detail: Some(detail),
     }
 }
 

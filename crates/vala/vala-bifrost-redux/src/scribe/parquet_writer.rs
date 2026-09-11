@@ -20,7 +20,6 @@ use parquet::arrow::ArrowWriter;
 use parquet::file::metadata::RowGroupMetaData;
 use sha2::{Digest, Sha256};
 use wyrd_spec::DataTenantId;
-use wyrd_spec::vala::api::AuditEvent;
 use wyrd_spec::vala::managed_columns::DATA_TENANT_ID;
 
 use crate::catalog::TenantTableBinding;
@@ -128,8 +127,6 @@ pub struct ParquetEncoded {
     pub row_group_stats: Vec<RowGroupStats>,
     /// Partition day (from seal-key, not row min/max).
     pub partition: TimePartition,
-    /// `AuditEvent` list threaded forward for 's seal transaction.
-    pub audit_events: Vec<AuditEvent>,
     /// `ScribeAppendMeta` list threaded forward for 's `file_list` INSERT.
     pub append_metas: Vec<ScribeAppendMeta>,
 }
@@ -282,7 +279,7 @@ pub struct RowGroupStats {
 /// Encode a frozen memtable snapshot to ordered scratch-backed Parquet artifacts.
 ///
 /// Returns encoded bytes, row-group stats, `partition` (from seal-key), and the paired
-/// `AuditEvent` + `ScribeAppendMeta` lists unmodified (threaded forward for 's seal
+/// `ScribeAppendMeta` list unmodified (threaded forward for 's seal
 /// transaction).
 ///
 /// # Errors
@@ -428,7 +425,6 @@ impl<'a> ParquetBatchEncoder<'a> {
             artifacts: BoundedParquetArtifactSet::encoded(artifacts)?,
             row_group_stats,
             partition: self.frozen.seal_key.partition,
-            audit_events: self.frozen.events.clone(),
             append_metas: self.frozen.metas.clone(),
         })
     }

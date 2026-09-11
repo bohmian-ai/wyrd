@@ -3,7 +3,7 @@
 //! Assembly produces sealed local objects; this module is what turns them into
 //! the rows Oracle reads. The order is the only order that keeps both durable
 //! boundaries: the objects are staged and uploaded first, then the fenced
-//! `file_list` and audit transaction commits, and only after that commit do the
+//! `file_list` transaction commits, and only after that commit do the
 //! contributing members stop being the live-tail authority for their rows.
 //!
 //! Nothing here decides *which* members publish. The assembler chose them and
@@ -31,7 +31,7 @@ use crate::scribe::stream_identity::StreamIdentity;
 pub struct PublishClaimRequest<'a> {
     /// The claim whose members produced the objects.
     pub claim: &'a StagingClaim,
-    /// Runs gathered for the claim, carrying its WAL span and audit envelope.
+    /// Runs gathered for the claim, carrying its WAL span.
     pub runs: &'a ClaimRuns,
     /// Sealed objects the claim produced, in publication order.
     pub assembled: &'a AssembledClaim,
@@ -73,7 +73,7 @@ pub struct ClaimPublisher {
     stage: Arc<ScribeHotStage>,
     /// Local election, publication manifest, and verified upload owner.
     mover: ScribeStageMover,
-    /// Fenced `file_list` and audit transaction owner.
+    /// Fenced `file_list` transaction owner.
     reconciler: ScribePublicationReconciler,
     /// Pod authority registry whose leases cleanup waits on, when one is owned.
     hot_sources: Option<Arc<crate::scribe::hot_source::ScribeHotSourceRegistry>>,
@@ -289,13 +289,6 @@ impl ClaimPublisher {
             request.binding,
             request.runs.wal(),
         )?;
-        let events = request
-            .runs
-            .publication_audit()
-            .map(|event| {
-                crate::scribe::audit_envelope::publication_audit_events(std::slice::from_ref(event))
-            })
-            .unwrap_or_default();
         let operation_id = uuid::Uuid::new_v4();
         self.move_members(
             request.claim,
@@ -329,11 +322,10 @@ impl ClaimPublisher {
                     request.claim.key().writer_epoch(),
                 ),
                 &rows,
-                &events,
                 &claims,
             )
             .await?;
-        let (outcome, ambiguity) = match self.reconciler.publish(&rows, &events).await {
+        let (outcome, ambiguity) = match self.reconciler.publish(&rows).await {
             ScribePublicationOutcome::Committed(outcome) => (outcome, None),
             ScribePublicationOutcome::KnownNotCommitted(error) => return Err(error),
             ScribePublicationOutcome::UnknownCommitOutcome(error) => {
@@ -346,7 +338,7 @@ impl ClaimPublisher {
                 // rows, so running it once more settles the fact rather than
                 // guessing it. The caller still learns the publication was
                 // uncertain; only the pod's own state stops being uncertain.
-                match self.reconciler.publish(&rows, &events).await {
+                match self.reconciler.publish(&rows).await {
                     ScribePublicationOutcome::Committed(outcome) => {
                         (outcome, Some(error.to_string()))
                     }

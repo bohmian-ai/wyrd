@@ -6,14 +6,14 @@
 //! handle never issues transaction-control SQL.
 //!
 //! Every transition path acquires a transaction-scoped advisory lock on
-//! `(tenant, resource, family, operation_id)` before reading state or appending
-//! audit. The lock releases only when the caller's transaction commits or rolls
-//! back, serializing concurrent first-Prepared calls for the same operation.
+//! `(tenant, resource, family, operation_id)` before reading or writing state.
+//! The lock releases only when the caller's transaction commits or rolls back,
+//! serializing concurrent first-Prepared calls for the same operation.
 //!
-//! This module co-writes audit and projection inside the caller's transaction:
-//! the audit row commits atomically with the state mutation. Identical replay
-//! is idempotent (no duplicate audit), while identity or timing mismatches fail
-//! closed with [`SqlError::Conflict`].
+//! A Forge transition evaluates no principal permission, so it records lineage
+//! in this projection and appends no audit event. Identical replay is
+//! idempotent, while identity or timing mismatches fail closed with
+//! [`SqlError::Conflict`].
 
 // raw-query grep allowlist: forge internal tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
@@ -24,11 +24,10 @@ use sqlx::types::Uuid;
 use sqlx::{PgConnection, Postgres, Transaction};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::{
-    AuditDetail, AuditEvent, AuditResult, ForgeIcebergRewritePhase, ForgeOrphanGcPhase,
-    ForgeScribePromotionPhase, ForgeSnapshotExpirePhase, audit_detail_canonical_json,
+    AuditDetail, ForgeIcebergRewritePhase, ForgeOrphanGcPhase, ForgeScribePromotionPhase,
+    ForgeSnapshotExpirePhase, audit_detail_canonical_json,
 };
 
-use crate::queries::audit_outbox::{OperatorAudit, append_audit};
 use crate::queries::oracle_reader_authority::{
     BIFROST_CATALOG_NAME, invariant, read_protection_record,
 };
@@ -50,8 +49,8 @@ use crate::{OperatorPool, SqlError, TenantConn};
 /// operations. Callers borrow a [`TenantConn`] for each method call; the
 /// handle itself is stateless beyond its identity.
 ///
-/// Every method validates that the supplied event's detail matches the retained
-/// resource and family before touching the database.
+/// Every method validates that the supplied transition detail matches the
+/// retained resource and family before touching the database.
 pub struct ForgeOperations<'resource> {
     /// Canonical tenant/table resource identity validated at construction.
     resource: &'resource str,
@@ -78,48 +77,46 @@ impl<'resource> ForgeOperations<'resource> {
         Ok(Self { resource, family })
     }
 
-    /// Appends one Prepared audit event and inserts or reopens the operation
-    /// state row.
+    /// Inserts or reopens the Prepared operation state row.
     ///
-    /// The method validates the event against the handle's resource and family,
-    /// acquires the advisory lock for `(resource, family, operation_id)`,
-    /// selects the current state row under the lock, and applies the Prepared
-    /// transition matrix:
+    /// The method validates `operation` and `detail` against the handle's
+    /// resource and family, acquires the advisory lock for
+    /// `(resource, family, operation_id)`, selects the current state row under
+    /// the lock, and applies the Prepared transition matrix:
     ///
     /// | Current row | Incoming Prepared | Result |
     /// |---|---|---|
-    /// | Absent | Valid identity/detail | Append audit; insert Prepared; `Applied(seq)` |
+    /// | Absent | Valid identity/detail | Insert Prepared; `Applied` |
     /// | Prepared | Canonical detail matches stored | No write; `AlreadyApplied` |
     /// | Reset | Any replay | `Conflict`; retry requires a new generation/operation |
-    /// | Committed / Recovered | Canonical detail matches stored | No write; `AlreadyApplied(terminal_seq)` |
+    /// | Committed / Recovered | Canonical detail matches stored | No write; `AlreadyApplied` |
     /// | Any row | Conflicting detail/identity | `Conflict`; no durable change |
     ///
     /// The caller owns the transaction. On success the caller must commit to
-    /// make the audit and state durable.
+    /// make the state durable.
     ///
     /// # Errors
     ///
-    /// Returns [`SqlError::Conflict`] on invalid event identity, transition
-    /// collision, or detail mismatch.
+    /// Returns [`SqlError::Conflict`] on invalid transition identity,
+    /// transition collision, or detail mismatch.
     /// Returns [`SqlError::InvariantViolation`] when stored data is malformed.
-    /// Returns [`SqlError::Query`] when locking, audit append, or projection IO
-    /// fails.
+    /// Returns [`SqlError::Query`] when locking or projection IO fails.
     ///
     /// # Cancellation
     ///
     /// The caller owns the transaction and its transaction-scoped advisory
     /// lock. Cancellation drops this future without committing; dropping the
-    /// caller transaction rolls back any audit append or projection mutation
-    /// and releases the lock. Retrying the same canonical event is idempotent,
-    /// returning the existing sequence after a prior commit or applying the
-    /// transition after a rollback.
+    /// caller transaction rolls back the projection mutation and releases the
+    /// lock. Retrying the same canonical transition is idempotent.
     pub async fn append_prepared(
         &self,
         conn: &mut TenantConn<'_>,
-        event: &AuditEvent,
+        operation: &str,
+        detail: &AuditDetail,
     ) -> Result<ForgeOperationTransition, SqlError> {
-        let (detail, _phase, operation_id) = validate_event(
-            event,
+        let (detail, _phase, operation_id) = validate_transition(
+            operation,
+            detail,
             self.resource,
             self.family,
             ForgeOperationPhase::Prepared,
@@ -135,46 +132,32 @@ impl<'resource> ForgeOperations<'resource> {
         match row {
             None => {
                 // Absent row: first Prepared for this operation.
-                let seq = append_audit(conn, event).await?;
-                self.insert_prepared(conn.transaction(), operation_id, &detail, seq)
+                self.insert_prepared(conn.transaction(), operation_id, &detail)
                     .await?;
-                Ok(ForgeOperationTransition::Applied { audit_seq: seq })
+                Ok(ForgeOperationTransition::Applied)
             }
             Some(sql_row) => {
                 let state_row: ForgeOperationStateRow = sql_row.try_into()?;
-                let event_canonical = audit_detail_canonical_json(&detail);
+                let incoming_canonical = audit_detail_canonical_json(&detail);
                 let stored_canonical = audit_detail_canonical_json(&state_row.prepared_detail);
 
-                if event_canonical != stored_canonical {
+                if incoming_canonical != stored_canonical {
                     return Err(SqlError::Conflict {
                         detail: "prepared detail does not match stored prepared detail".to_owned(),
                     });
                 }
 
                 match state_row.phase {
-                    ForgeOperationPhase::Prepared => {
-                        // Idempotent replay: same operation already prepared.
-                        Ok(ForgeOperationTransition::AlreadyApplied {
-                            audit_seq: state_row.prepared_audit_seq,
-                        })
+                    // Idempotent replay: the operation is already prepared, or
+                    // has already settled into its terminal phase.
+                    ForgeOperationPhase::Prepared
+                    | ForgeOperationPhase::Committed
+                    | ForgeOperationPhase::Recovered => {
+                        Ok(ForgeOperationTransition::AlreadyApplied)
                     }
                     ForgeOperationPhase::Reset => {
                         Err(SqlError::Conflict {
                             detail: "Reset Forge generation cannot be reopened; retry requires a new operation and output generation".to_owned(),
-                        })
-                    }
-                    ForgeOperationPhase::Committed | ForgeOperationPhase::Recovered => {
-                        // Terminal state: return the terminal sequence.
-                        let terminal_seq = state_row.terminal_audit_seq.ok_or_else(|| {
-                            SqlError::InvariantViolation {
-                                detail: format!(
-                                    "{:?} row missing terminal_audit_seq",
-                                    state_row.phase
-                                ),
-                            }
-                        })?;
-                        Ok(ForgeOperationTransition::AlreadyApplied {
-                            audit_seq: terminal_seq,
                         })
                     }
                 }
@@ -182,15 +165,15 @@ impl<'resource> ForgeOperations<'resource> {
         }
     }
 
-    /// Appends one terminal audit event and transitions the operation state
-    /// from Prepared to the terminal phase.
+    /// Transitions the operation state from Prepared to the terminal phase.
     ///
-    /// The method validates the event, acquires the advisory lock, selects the
-    /// existing state row (must be Prepared), applies the terminal transition:
+    /// The method validates the transition, acquires the advisory lock, selects
+    /// the existing state row (must be Prepared), applies the terminal
+    /// transition:
     ///
     /// | Current row | Incoming terminal | Result |
     /// |---|---|---|
-    /// | Prepared | Valid family terminal | Append audit; update projection; `Applied(seq)` |
+    /// | Prepared | Valid family terminal | Update projection; `Applied` |
     /// | Same terminal phase | Identical canonical detail | No write; `AlreadyApplied` |
     /// | Absent, Reset, different terminal, or conflict | Any | `Conflict` |
     ///
@@ -199,38 +182,36 @@ impl<'resource> ForgeOperations<'resource> {
     /// Returns [`SqlError::Conflict`] when the state row is absent, not
     /// Prepared, or the detail mismatches.
     /// Returns [`SqlError::InvariantViolation`] when stored data is malformed.
-    /// Returns [`SqlError::Query`] when locking, audit append, or projection IO
-    /// fails.
+    /// Returns [`SqlError::Query`] when locking or projection IO fails.
     ///
     /// # Cancellation
     ///
     /// The caller owns the transaction and its transaction-scoped advisory
     /// lock. Cancellation cannot commit partial progress: dropping the caller
-    /// transaction rolls back both the terminal audit append and state update
-    /// and releases the lock. Retrying an identical committed transition is
-    /// idempotent and returns its existing terminal sequence.
+    /// transaction rolls back the terminal state update and releases the lock.
+    /// Retrying an identical committed transition is idempotent.
     pub async fn append_terminal(
         &self,
         conn: &mut TenantConn<'_>,
-        event: &AuditEvent,
+        operation: &str,
+        detail: &AuditDetail,
     ) -> Result<ForgeOperationTransition, SqlError> {
-        let phase_suffix = extract_phase_suffix(&event.operation, self.family.operation_prefix())
+        let phase_suffix = extract_phase_suffix(operation, self.family.operation_prefix())
             .ok_or_else(|| SqlError::Conflict {
-            detail: format!(
-                "operation {} does not match family prefix {}",
-                event.operation,
-                self.family.operation_prefix()
-            ),
-        })?;
+                detail: format!(
+                    "operation {operation} does not match family prefix {}",
+                    self.family.operation_prefix()
+                ),
+            })?;
 
         let terminal_phase =
             ForgeOperationPhase::from_str(phase_suffix).map_err(|_| SqlError::Conflict {
-                detail: format!("unknown terminal phase in operation {}", event.operation),
+                detail: format!("unknown terminal phase in operation {operation}"),
             })?;
 
         if terminal_phase == ForgeOperationPhase::Prepared {
             return Err(SqlError::Conflict {
-                detail: "append_terminal called with Prepared event; use append_prepared"
+                detail: "append_terminal called with a Prepared transition; use append_prepared"
                     .to_owned(),
             });
         }
@@ -252,8 +233,13 @@ impl<'resource> ForgeOperations<'resource> {
             });
         }
 
-        let (detail, _, operation_id) =
-            validate_event(event, self.resource, self.family, terminal_phase)?;
+        let (detail, _, operation_id) = validate_transition(
+            operation,
+            detail,
+            self.resource,
+            self.family,
+            terminal_phase,
+        )?;
 
         self.acquire_operation_lock(conn.transaction(), operation_id)
             .await?;
@@ -270,21 +256,10 @@ impl<'resource> ForgeOperations<'resource> {
         // If the operation is already in the same terminal phase with identical
         // canonical detail, it is an idempotent replay.
         if state_row.phase == terminal_phase {
-            let event_canonical = audit_detail_canonical_json(&detail);
+            let incoming_canonical = audit_detail_canonical_json(&detail);
             let stored_canonical = audit_detail_canonical_json(&state_row.current_detail);
-            if event_canonical == stored_canonical {
-                let terminal_seq =
-                    state_row
-                        .terminal_audit_seq
-                        .ok_or_else(|| SqlError::InvariantViolation {
-                            detail: format!(
-                                "{:?} state row missing terminal_audit_seq",
-                                state_row.phase
-                            ),
-                        })?;
-                return Ok(ForgeOperationTransition::AlreadyApplied {
-                    audit_seq: terminal_seq,
-                });
+            if incoming_canonical == stored_canonical {
+                return Ok(ForgeOperationTransition::AlreadyApplied);
             }
         }
 
@@ -298,17 +273,10 @@ impl<'resource> ForgeOperations<'resource> {
             });
         }
 
-        let seq = append_audit(conn, event).await?;
-        self.apply_terminal(
-            conn.transaction(),
-            operation_id,
-            &detail,
-            terminal_phase,
-            seq,
-        )
-        .await?;
+        self.apply_terminal(conn.transaction(), operation_id, &detail, terminal_phase)
+            .await?;
 
-        Ok(ForgeOperationTransition::Applied { audit_seq: seq })
+        Ok(ForgeOperationTransition::Applied)
     }
 
     /// Returns at most `cap` fully validated open (Prepared) operations.
@@ -317,8 +285,7 @@ impl<'resource> ForgeOperations<'resource> {
     /// `forge_operation_state_open` index and validates every row (including
     /// the overflow sentinel). An `overflowed = true` page means more open
     /// operations exist past this page. The read touches only the state
-    /// projection: `vala.audit_outbox` is a delivery table with its own
-    /// retention, and Forge recovery must not depend on it.
+    /// projection, which is the sole Forge recovery authority.
     ///
     /// `after` continues an earlier page from the last row it returned, as
     /// `(prepared_at, operation_id)` — the exact index order this query already
@@ -582,8 +549,7 @@ impl<'resource> ForgeOperations<'resource> {
     /// reopens only a `reset` row; `committed` and `recovered` rows stay
     /// terminal and are refused by the caller's replay gate before this runs.
     ///
-    /// Caller must hold the advisory lock and have committed the audit append
-    /// in the same transaction.
+    /// Caller must hold the advisory lock in the same transaction.
     ///
     /// # Errors
     ///
@@ -591,15 +557,14 @@ impl<'resource> ForgeOperations<'resource> {
     ///
     /// # Cancellation
     ///
-    /// The insert participates in the caller's transaction. Cancellation
-    /// cannot commit the preceding audit append; dropping the transaction
-    /// rolls back both, and an identical retry can safely start again.
+    /// The insert participates in the caller's transaction. Dropping the
+    /// transaction rolls it back, and an identical retry can safely start
+    /// again.
     async fn insert_prepared(
         &self,
         conn: &mut PgConnection,
         operation_id: Uuid,
         detail: &AuditDetail,
-        prepared_seq: i64,
     ) -> Result<(), SqlError> {
         let now = Utc::now();
         let detail_json =
@@ -612,17 +577,13 @@ impl<'resource> ForgeOperations<'resource> {
         INSERT INTO vala.forge_operation_state
             (data_tenant_id, resource, family, operation_id, phase,
              prepared_detail, current_detail,
-             prepared_audit_seq, terminal_audit_seq,
              prepared_at, updated_at)
         VALUES (wyrd.current_tenant(), $1, $2, $3, 'prepared',
                 $4::jsonb, $4::jsonb,
-                $5, NULL,
-                $6, $6)
+                $5, $5)
         ON CONFLICT (data_tenant_id, resource, family, operation_id) DO UPDATE
             SET phase = 'prepared',
                 current_detail = EXCLUDED.prepared_detail,
-                prepared_audit_seq = EXCLUDED.prepared_audit_seq,
-                terminal_audit_seq = NULL,
                 prepared_at = EXCLUDED.prepared_at,
                 updated_at = EXCLUDED.updated_at
             WHERE vala.forge_operation_state.phase = 'reset'
@@ -632,7 +593,6 @@ impl<'resource> ForgeOperations<'resource> {
         .bind(self.family.as_str())
         .bind(operation_id)
         .bind(detail_json.to_string())
-        .bind(prepared_seq)
         .bind(now)
         .execute(&mut *conn)
         .await
@@ -643,9 +603,8 @@ impl<'resource> ForgeOperations<'resource> {
 
     /// Applies a terminal transition to a Prepared operation.
     ///
-    /// Updates `phase`, `current_detail`, `terminal_audit_seq`, and `updated_at`.
-    /// The `prepared_detail`, `prepared_audit_seq`, and `prepared_at` remain
-    /// unchanged.
+    /// Updates `phase`, `current_detail`, and `updated_at`. The
+    /// `prepared_detail` and `prepared_at` remain unchanged.
     ///
     /// # Errors
     ///
@@ -653,16 +612,14 @@ impl<'resource> ForgeOperations<'resource> {
     ///
     /// # Cancellation
     ///
-    /// The update participates in the caller's transaction. Cancellation
-    /// cannot commit only the terminal audit; dropping the transaction rolls
-    /// back audit and terminal projection state together.
+    /// The update participates in the caller's transaction. Dropping the
+    /// transaction rolls the terminal projection state back.
     async fn apply_terminal(
         &self,
         conn: &mut PgConnection,
         operation_id: Uuid,
         detail: &AuditDetail,
         terminal_phase: ForgeOperationPhase,
-        terminal_seq: i64,
     ) -> Result<(), SqlError> {
         let now = Utc::now();
         let detail_json =
@@ -675,8 +632,7 @@ impl<'resource> ForgeOperations<'resource> {
         UPDATE vala.forge_operation_state
            SET phase = $4,
                current_detail = $5::jsonb,
-               terminal_audit_seq = $6,
-               updated_at = $7
+               updated_at = $6
          WHERE data_tenant_id = wyrd.current_tenant()
            AND resource = $1
            AND family = $2
@@ -688,7 +644,6 @@ impl<'resource> ForgeOperations<'resource> {
         .bind(operation_id)
         .bind(terminal_phase.as_str())
         .bind(detail_json.to_string())
-        .bind(terminal_seq)
         .bind(now)
         .execute(&mut *conn)
         .await
@@ -699,17 +654,18 @@ impl<'resource> ForgeOperations<'resource> {
 }
 
 // ---------------------------------------------------------------------------
-// Event validation
+// Transition validation
 // ---------------------------------------------------------------------------
 
-/// Validates that an audit event matches the expected family, resource, and
+/// Validates that a transition matches the expected family, resource, and
 /// phase, and returns the typed detail and the operation ID.
 ///
 /// # Errors
-/// Returns [`SqlError::Conflict`] when the event operation, detail variant, or
+/// Returns [`SqlError::Conflict`] when the operation name, detail variant, or
 /// resource does not match the expected forge family and phase.
-fn validate_event(
-    event: &AuditEvent,
+fn validate_transition(
+    operation: &str,
+    detail: &AuditDetail,
     expected_resource: &str,
     family: ForgeOperationFamily,
     expected_phase: ForgeOperationPhase,
@@ -717,41 +673,28 @@ fn validate_event(
     let prefix = family.operation_prefix();
 
     // Validate the operation string has the correct prefix.
-    if !event.operation.starts_with(prefix) {
+    if !operation.starts_with(prefix) {
         return Err(SqlError::Conflict {
-            detail: format!(
-                "operation {} does not match family prefix {}",
-                event.operation, prefix
-            ),
+            detail: format!("operation {operation} does not match family prefix {prefix}"),
         });
     }
 
     // Extract and validate the phase suffix.
-    let phase_str =
-        extract_phase_suffix(&event.operation, prefix).ok_or_else(|| SqlError::Conflict {
-            detail: format!(
-                "cannot extract phase suffix from operation {}",
-                event.operation
-            ),
-        })?;
+    let phase_str = extract_phase_suffix(operation, prefix).ok_or_else(|| SqlError::Conflict {
+        detail: format!("cannot extract phase suffix from operation {operation}"),
+    })?;
     let phase = ForgeOperationPhase::from_str(phase_str).map_err(|_| SqlError::Conflict {
-        detail: format!("unknown phase {phase_str} in operation {}", event.operation),
+        detail: format!("unknown phase {phase_str} in operation {operation}"),
     })?;
 
     // Validate the phase matches what the method expects.
     if phase != expected_phase {
         return Err(SqlError::Conflict {
             detail: format!(
-                "event phase {phase_str} does not match expected {:?}",
-                expected_phase
+                "transition phase {phase_str} does not match expected {expected_phase:?}"
             ),
         });
     }
-
-    // Extract and validate the detail from the event.
-    let detail = event.detail.as_ref().ok_or_else(|| SqlError::Conflict {
-        detail: "event must carry a typed audit detail".to_owned(),
-    })?;
 
     let (actual_op_id, actual_group) =
         extract_detail_identity(detail, family.expected_detail_kind())?;
@@ -881,43 +824,40 @@ fn extract_detail_phase(detail: &AuditDetail) -> Result<ForgeOperationPhase, Sql
 /// 3. the table maintenance-authority row that serializes reader widening
 ///    against destructive maintenance for one tenant-qualified table,
 /// 4. the operation state row (advisory lock, then `FOR UPDATE`),
-/// 5. the claim rows for that operation, and
-/// 6. the tenant audit chain head.
+/// 5. the claim rows for that operation.
 ///
 /// Every method here runs on the operator pool because the claim table grants
 /// `INSERT`/`DELETE` to `wyrd_platform_admin` only; the transaction binds
-/// `wyrd.current_tenant()` first so RLS-shaped predicates and the tenant audit
-/// chain behave exactly as they do on a tenant connection.
+/// `wyrd.current_tenant()` first so RLS-shaped predicates behave exactly as
+/// they do on a tenant connection.
 impl ForgeOperations<'_> {
     /// Atomically prepares one snapshot-expiration selection.
     ///
     /// In one operator transaction this asserts the caller's live lease fence,
     /// pins the exact running attempt, takes the table's maintenance-authority
     /// row, refuses when any surviving reader protection frontier still covers
-    /// a selected snapshot, appends the Prepared operation audit, inserts the
-    /// Prepared operation state, claims every selected snapshot, and moves the
-    /// task to Prepared with its evidence and audit.
+    /// a selected snapshot, inserts the Prepared operation state, claims every
+    /// selected snapshot, and moves the task to Prepared with its evidence.
     ///
-    /// Replaying the identical preparation writes nothing and returns the
-    /// existing prepared sequence. An identical selection whose previous pass
-    /// was reset is prepared again, reopening that released operation; a
-    /// committed or recovered operation is refused.
+    /// Replaying the identical preparation writes nothing. An identical
+    /// selection whose previous pass was reset is prepared again, reopening
+    /// that released operation; a committed or recovered operation is refused.
     ///
     /// # Errors
     ///
     /// Returns [`SqlError::Conflict`] when the family is not
-    /// `snapshot_expire`, either audit event does not name this operation or
-    /// task, the lease fence is lost, the task/attempt/owner/table identity
-    /// does not match, a surviving protection frontier covers a selected
-    /// snapshot, or the operation is already resolved.
+    /// `snapshot_expire`, the transition does not name this operation, the
+    /// lease fence is lost, the task/attempt/owner/table identity does not
+    /// match, a surviving protection frontier covers a selected snapshot, or
+    /// the operation is already resolved.
     /// Returns [`SqlError::InvariantViolation`] when stored state is malformed.
     /// Returns [`SqlError::Query`] for statement failures.
     ///
     /// # Cancellation
     ///
     /// Cancellation drops the uncommitted operator transaction, releasing every
-    /// lock and discarding audit, state, claims, and the task transition
-    /// together. An identical retry is safe.
+    /// lock and discarding state, claims, and the task transition together.
+    /// An identical retry is safe.
     pub async fn prepare_snapshot_expiration(
         &self,
         operator: &OperatorPool,
@@ -925,14 +865,14 @@ impl ForgeOperations<'_> {
         request: &ForgeExpirationPreparation<'_>,
     ) -> Result<ForgeOperationTransition, SqlError> {
         self.require_snapshot_expire()?;
-        let (detail, _, operation_id) = validate_event(
-            request.operation_event,
+        let (detail, _, operation_id) = validate_transition(
+            request.operation,
+            request.detail,
             self.resource,
             self.family,
             ForgeOperationPhase::Prepared,
         )?;
         let selected = selected_snapshot_ids(&detail)?;
-        validate_task_event(request.task_event, request.authority.task_id, "prepared")?;
         request.evidence.validate(false)?;
 
         let mut tx = operator.pool().begin().await.map_err(SqlError::from)?;
@@ -964,17 +904,11 @@ impl ForgeOperations<'_> {
                 });
             }
             if state_row.phase == ForgeOperationPhase::Prepared {
-                return Ok(ForgeOperationTransition::AlreadyApplied {
-                    audit_seq: state_row.prepared_audit_seq,
-                });
+                return Ok(ForgeOperationTransition::AlreadyApplied);
             }
         }
 
-        let seq = OperatorAudit::new(tenant, &mut tx)
-            .append(request.operation_event)
-            .await?;
-        self.insert_prepared(&mut tx, operation_id, &detail, seq)
-            .await?;
+        self.insert_prepared(&mut tx, operation_id, &detail).await?;
         self.insert_claims(&mut tx, operation_id, &selected, request)
             .await?;
         let changed = sqlx::query(
@@ -989,12 +923,9 @@ impl ForgeOperations<'_> {
         .map_err(SqlError::from)?
         .rows_affected();
         exact_one(changed, "snapshot expiration prepared task transition")?;
-        OperatorAudit::new(tenant, &mut tx)
-            .append(request.task_event)
-            .await?;
 
         tx.commit().await.map_err(SqlError::from)?;
-        Ok(ForgeOperationTransition::Applied { audit_seq: seq })
+        Ok(ForgeOperationTransition::Applied)
     }
 
     /// Atomically settles one prepared snapshot expiration as Committed or
@@ -1003,16 +934,15 @@ impl ForgeOperations<'_> {
     /// The settling worker need not be the preparing one: the claim rows carry
     /// the preparation identity as historical evidence, while the fence, task
     /// attempt, and owner are revalidated against the caller's *current*
-    /// authority. Settlement appends the terminal operation audit, resolves the
-    /// operation state, deletes every claim, moves the task to Succeeded with
-    /// its final cleanup evidence, appends the task audit, and advances the
-    /// table's planning demand — all in one transaction.
+    /// authority. Settlement resolves the operation state, deletes every claim,
+    /// moves the task to Succeeded with its final cleanup evidence, and
+    /// advances the table's planning demand — all in one transaction.
     ///
     /// # Errors
     ///
-    /// Returns [`SqlError::Conflict`] when the family, audit identity, lease
-    /// fence, task identity, table identity, operation phase, or the claim set
-    /// does not exactly match the prepared selection.
+    /// Returns [`SqlError::Conflict`] when the family, transition identity,
+    /// lease fence, task identity, table identity, operation phase, or the
+    /// claim set does not exactly match the prepared selection.
     /// Returns [`SqlError::InvariantViolation`] when stored state is malformed.
     /// Returns [`SqlError::Query`] for statement failures.
     ///
@@ -1028,13 +958,13 @@ impl ForgeOperations<'_> {
     ) -> Result<ForgeOperationTransition, SqlError> {
         self.require_snapshot_expire()?;
         let terminal_phase = request.settlement.phase();
-        let (detail, _, operation_id) = validate_event(
-            request.operation_event,
+        let (detail, _, operation_id) = validate_transition(
+            request.operation,
+            request.detail,
             self.resource,
             self.family,
             terminal_phase,
         )?;
-        validate_task_event(request.task_event, request.authority.task_id, "succeeded")?;
         request.evidence.validate(false)?;
 
         let mut tx = operator.pool().begin().await.map_err(SqlError::from)?;
@@ -1058,16 +988,7 @@ impl ForgeOperations<'_> {
             && task_state == "succeeded"
             && claims.is_empty()
         {
-            let terminal_seq =
-                state_row
-                    .terminal_audit_seq
-                    .ok_or_else(|| SqlError::InvariantViolation {
-                        detail: "settled snapshot expiration is missing its terminal audit seq"
-                            .to_owned(),
-                    })?;
-            return Ok(ForgeOperationTransition::AlreadyApplied {
-                audit_seq: terminal_seq,
-            });
+            return Ok(ForgeOperationTransition::AlreadyApplied);
         }
 
         self.require_resolvable_prepared(&state_row, task_state.as_str())?;
@@ -1080,25 +1001,20 @@ impl ForgeOperations<'_> {
         )?;
         lock_expiration_task(&mut tx, request.authority, request.table, &["prepared"]).await?;
 
-        let seq = OperatorAudit::new(tenant, &mut tx)
-            .append(request.operation_event)
-            .await?;
-        self.apply_terminal(&mut tx, operation_id, &detail, terminal_phase, seq)
+        self.apply_terminal(&mut tx, operation_id, &detail, terminal_phase)
             .await?;
         self.delete_claims(&mut tx, operation_id).await?;
         self.resolve_task(
             &mut tx,
-            tenant,
             "succeeded",
             request.authority,
-            request.task_event,
             Some(request.evidence),
         )
         .await?;
         advance_planning_demand(&mut tx, tenant, request.table).await?;
 
         tx.commit().await.map_err(SqlError::from)?;
-        Ok(ForgeOperationTransition::Applied { audit_seq: seq })
+        Ok(ForgeOperationTransition::Applied)
     }
 
     /// Atomically releases one prepared snapshot expiration that never
@@ -1107,15 +1023,15 @@ impl ForgeOperations<'_> {
     /// The reset is internal: `ForgeSnapshotExpirePhase` has no public Reset
     /// variant, so the state row keeps its immutable Prepared detail as
     /// `current_detail` and records the release only through the `reset` column
-    /// phase and its terminal audit sequence. The same transaction deletes every
-    /// claim, cancels the task, and advances the table's planning demand so the
-    /// selection can be recomputed against fresh reader protection.
+    /// phase. The same transaction deletes every claim, cancels the task, and
+    /// advances the table's planning demand so the selection can be recomputed
+    /// against fresh reader protection.
     ///
     /// # Errors
     ///
-    /// Returns [`SqlError::Conflict`] when the family, audit identity, lease
-    /// fence, task identity, table identity, operation phase, or claim set does
-    /// not exactly match the prepared selection.
+    /// Returns [`SqlError::Conflict`] when the family, transition identity,
+    /// lease fence, task identity, table identity, operation phase, or claim
+    /// set does not exactly match the prepared selection.
     /// Returns [`SqlError::InvariantViolation`] when stored state is malformed.
     /// Returns [`SqlError::Query`] for statement failures.
     ///
@@ -1130,8 +1046,7 @@ impl ForgeOperations<'_> {
         request: &ForgeExpirationResetRequest<'_>,
     ) -> Result<ForgeExpirationResetOutcome, SqlError> {
         self.require_snapshot_expire()?;
-        let operation_id = validate_reset_event(request.operation_event, self.resource)?;
-        validate_task_event(request.task_event, request.authority.task_id, "cancelled")?;
+        let operation_id = validate_reset_detail(request.detail, self.resource)?;
 
         let mut tx = operator.pool().begin().await.map_err(SqlError::from)?;
         bind_tenant(&mut tx, tenant).await?;
@@ -1149,7 +1064,6 @@ impl ForgeOperations<'_> {
         let claims = self.claims_for_operation(&mut tx, operation_id).await?;
 
         if state_row.phase == ForgeOperationPhase::Reset
-            && state_row.terminal_audit_seq.is_some()
             && task_state == "cancelled"
             && claims.is_empty()
         {
@@ -1164,11 +1078,8 @@ impl ForgeOperations<'_> {
             request.table,
             &state_row.prepared_detail,
         )?;
-        if audit_detail_canonical_json(request.operation_event.detail.as_ref().ok_or_else(
-            || SqlError::Conflict {
-                detail: "reset event must carry the prepared detail".to_owned(),
-            },
-        )?) != audit_detail_canonical_json(&state_row.prepared_detail)
+        if audit_detail_canonical_json(request.detail)
+            != audit_detail_canonical_json(&state_row.prepared_detail)
         {
             return Err(SqlError::Conflict {
                 detail: "snapshot expiration reset must carry the immutable prepared detail"
@@ -1177,27 +1088,16 @@ impl ForgeOperations<'_> {
         }
         lock_expiration_task(&mut tx, request.authority, request.table, &["prepared"]).await?;
 
-        let seq = OperatorAudit::new(tenant, &mut tx)
-            .append(request.operation_event)
-            .await?;
         self.apply_terminal(
             &mut tx,
             operation_id,
             &state_row.prepared_detail,
             ForgeOperationPhase::Reset,
-            seq,
         )
         .await?;
         self.delete_claims(&mut tx, operation_id).await?;
-        self.resolve_task(
-            &mut tx,
-            tenant,
-            "cancelled",
-            request.authority,
-            request.task_event,
-            None,
-        )
-        .await?;
+        self.resolve_task(&mut tx, "cancelled", request.authority, None)
+            .await?;
         let demand_generation = advance_planning_demand(&mut tx, tenant, request.table).await?;
 
         tx.commit().await.map_err(SqlError::from)?;
@@ -1444,18 +1344,16 @@ impl ForgeOperations<'_> {
         Ok(())
     }
 
-    /// Applies the exact Prepared-to-terminal task transition and its audit.
+    /// Applies the exact Prepared-to-terminal task transition.
     ///
     /// # Errors
     /// Returns [`SqlError::Conflict`] unless exactly one row matched the exact
-    /// task, attempt, and current owner, and [`SqlError`] for audit failures.
+    /// task, attempt, and current owner.
     async fn resolve_task(
         &self,
         conn: &mut Transaction<'_, Postgres>,
-        tenant: DataTenantId,
         next: &str,
         authority: &ForgeExpirationAuthority,
-        event: &AuditEvent,
         evidence: Option<&ForgeTaskEvidence>,
     ) -> Result<(), SqlError> {
         let encoded = evidence.map(|value| evidence_to_value(value).to_string());
@@ -1472,14 +1370,13 @@ impl ForgeOperations<'_> {
         .map_err(SqlError::from)?
         .rows_affected();
         exact_one(changed, "snapshot expiration task resolution")?;
-        OperatorAudit::new(tenant, conn).append(event).await?;
         Ok(())
     }
 }
 
 /// Binds `wyrd.current_tenant()` on an operator transaction so tenant-shaped
-/// predicates, the audit chain, and RLS `WITH CHECK` clauses behave exactly as
-/// they do on a [`TenantConn`].
+/// predicates and RLS `WITH CHECK` clauses behave exactly as they do on a
+/// [`TenantConn`].
 ///
 /// # Errors
 /// Returns [`SqlError::Query`] when the binding statement fails.
@@ -1757,42 +1654,16 @@ fn selected_snapshot_ids(detail: &AuditDetail) -> Result<Vec<i64>, SqlError> {
     Ok(selected_snapshot_ids.clone())
 }
 
-/// Validates that a task lifecycle audit event names this exact task and next
-/// state, mirroring the tenant-connection task workflows.
-///
-/// # Errors
-/// Returns [`SqlError::Conflict`] for mismatched audit identity.
-fn validate_task_event(event: &AuditEvent, task_id: Uuid, next: &str) -> Result<(), SqlError> {
-    if event.resource != format!("forge-task:{task_id}")
-        || event.operation != format!("forge.task.{next}")
-    {
-        return Err(SqlError::Conflict {
-            detail: "Forge task audit event does not match task identity and transition".to_owned(),
-        });
-    }
-    Ok(())
-}
-
-/// Validates the internal snapshot-expiry reset event and returns its
+/// Validates the internal snapshot-expiry reset detail and returns its
 /// operation ID.
 ///
-/// The event carries the immutable Prepared detail because the public
-/// `ForgeSnapshotExpirePhase` has no Reset variant; only the operation string
-/// and the failed result distinguish it.
+/// The reset carries the immutable Prepared detail because the public
+/// `ForgeSnapshotExpirePhase` has no Reset variant.
 ///
 /// # Errors
-/// Returns [`SqlError::Conflict`] when the operation string, result, or detail
-/// identity does not name this resource's reset.
-fn validate_reset_event(event: &AuditEvent, expected_resource: &str) -> Result<Uuid, SqlError> {
-    if event.operation != "forge.snapshot_expire.reset" || event.result != AuditResult::Failure {
-        return Err(SqlError::Conflict {
-            detail: "snapshot expiration reset requires a failed forge.snapshot_expire.reset event"
-                .to_owned(),
-        });
-    }
-    let detail = event.detail.as_ref().ok_or_else(|| SqlError::Conflict {
-        detail: "reset event must carry the prepared detail".to_owned(),
-    })?;
+/// Returns [`SqlError::Conflict`] when the detail identity does not name this
+/// resource's prepared selection.
+fn validate_reset_detail(detail: &AuditDetail, expected_resource: &str) -> Result<Uuid, SqlError> {
     let (operation_id, group) = extract_detail_identity(detail, "forge_snapshot_expire")?;
     if group != expected_resource {
         return Err(SqlError::Conflict {

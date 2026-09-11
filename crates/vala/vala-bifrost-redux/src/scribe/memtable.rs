@@ -1,6 +1,6 @@
 //! In-memory row buffer keyed by seal-key with seal predicate.
 //!
-//! The memtable holds Arrow buffers + paired `AuditEvent` lists per
+//! The memtable holds Arrow buffers + paired append metadata per
 //! `SealKey = (DataTenantId, TableRef, TimePartition)`. Rotation is driven by
 //! retained Arrow size, active-generation age, and global pressure. Automatic
 //! writer rotation swaps every non-empty bucket as one shard cohort; selective
@@ -15,7 +15,6 @@ use std::time::{Duration, Instant};
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use wyrd_spec::DataTenantId;
-use wyrd_spec::vala::api::AuditEvent;
 
 use crate::contracts::ScribeError;
 use crate::scribe::seal_key::SealKey;
@@ -68,12 +67,12 @@ impl SealTriggerReason {
 
 /// Memtable — in-memory row buffer keyed by seal-key.
 ///
-/// Each seal-key holds an Arrow buffer, paired `AuditEvent` list, and
-/// `ScribeAppendMeta` list. Freezing a seal-key detaches an immutable snapshot.
+/// Each seal-key holds an Arrow buffer and its paired `ScribeAppendMeta`
+/// list. Freezing a seal-key detaches an immutable snapshot.
 ///
 /// Retirement is immediate: a generation is eligible the moment it enters
 /// [`ImmutableState::Durable`], which is only reached after the fenced
-/// `vala.file_list` + audit transaction commits. Retired Arrow memory is
+/// `vala.file_list` transaction commits. Retired Arrow memory is
 /// released before WAL segment retirement is submitted, preserving the
 /// ordering contract in `ShardOwner::retire_committed`.
 #[derive(Debug)]
@@ -311,7 +310,7 @@ impl Memtable {
         }
     }
 
-    /// Insert an append (audit event, metadata, Arrow batch) into the memtable.
+    /// Insert an append (metadata, Arrow batch) into the memtable.
     ///
     /// # Errors
     /// Returns [`ScribeError::Internal`] if the bucket lock is poisoned or if
@@ -319,7 +318,6 @@ impl Memtable {
     pub fn insert(
         &self,
         seal_key: &SealKey,
-        event: AuditEvent,
         meta: ScribeAppendMeta,
         batch: RecordBatch,
     ) -> Result<(), ScribeError> {
@@ -331,7 +329,7 @@ impl Memtable {
             .entry(seal_key.clone())
             .or_insert_with(|| MemtableBucket::new(seal_key.clone(), batch.schema()));
 
-        bucket.append(event, meta, batch);
+        bucket.append(meta, batch);
         Ok(())
     }
 
@@ -459,15 +457,6 @@ impl Memtable {
                 ),
             });
         }
-        if replayed.audit_events.len() != replayed.data_records.len() {
-            return Err(ScribeError::Internal {
-                detail: format!(
-                    "replayed audit/data count mismatch: {} audit events, {} data records",
-                    replayed.audit_events.len(),
-                    replayed.data_records.len()
-                ),
-            });
-        }
 
         let mut batches = Vec::with_capacity(replayed.data_records.len());
         let mut metas = Vec::with_capacity(replayed.append_metas.len());
@@ -537,7 +526,6 @@ impl Memtable {
             seal_key: replayed.seal_key.clone(),
             schema,
             batches,
-            events: replayed.audit_events.clone(),
             metas,
             opened_at: Instant::now(),
             closed_at: Instant::now(),
@@ -1119,7 +1107,7 @@ impl Memtable {
     ///
     /// A generation is retirement-eligible the moment its state is
     /// [`ImmutableState::Durable`]. `Committed` is only reached after the
-    /// fenced `vala.file_list` + audit transaction commits, so retired data is
+    /// fenced `vala.file_list` transaction commits, so retired data is
     /// always readable from published parquet. The returned WAL ranges are the
     /// only ranges eligible for WAL retirement on this sweep.
     ///
@@ -1154,7 +1142,7 @@ impl Memtable {
             let mut kept = Vec::with_capacity(entries.len());
             for entry in entries.drain(..) {
                 // A committed generation is immediately retirement-eligible:
-                // `Committed` is only entered after the fenced file-list/audit
+                // `Committed` is only entered after the fenced file-list
                 // transaction commits, so parquet is already readable.
                 if matches!(entry.state, ImmutableState::Durable { .. }) {
                     retired.push((
@@ -1414,13 +1402,12 @@ impl Default for Memtable {
     }
 }
 
-/// Per-seal-key bucket holding Arrow buffers + audit events + metadata.
+/// Per-seal-key bucket holding Arrow buffers + metadata.
 #[derive(Debug)]
 pub(crate) struct MemtableBucket {
     seal_key: SealKey,
     schema: SchemaRef,
     batches: Vec<RecordBatch>,
-    events: Vec<AuditEvent>,
     metas: Vec<ScribeAppendMeta>,
     row_count: usize,
     bytes_accumulated: usize,
@@ -1435,7 +1422,6 @@ impl MemtableBucket {
             seal_key,
             schema,
             batches: Vec::new(),
-            events: Vec::new(),
             metas: Vec::new(),
             row_count: 0,
             bytes_accumulated: 0,
@@ -1444,11 +1430,10 @@ impl MemtableBucket {
         }
     }
 
-    fn append(&mut self, event: AuditEvent, meta: ScribeAppendMeta, batch: RecordBatch) {
+    fn append(&mut self, meta: ScribeAppendMeta, batch: RecordBatch) {
         self.row_count += batch.num_rows();
         self.bytes_accumulated += estimate_batch_bytes(&batch);
         self.batches.push(batch);
-        self.events.push(event);
         self.metas.push(meta);
         self.last_insert_at = Instant::now();
     }
@@ -1500,7 +1485,6 @@ impl MemtableBucket {
             seal_key: self.seal_key,
             schema: self.schema,
             batches,
-            events: self.events,
             metas: self.metas,
             opened_at,
             closed_at,
@@ -1723,8 +1707,6 @@ pub struct FrozenMemtable {
     pub schema: SchemaRef,
     /// Original append batches, preserved for LSN-granular live tail reads.
     pub batches: Vec<RecordBatch>,
-    /// Ordered list of `AuditEvent`s staged for the seal transaction.
-    pub events: Vec<AuditEvent>,
     /// Per-append metadata derived from WAL record headers.
     pub metas: Vec<ScribeAppendMeta>,
     /// Monotonic time at which the active generation first received a row.

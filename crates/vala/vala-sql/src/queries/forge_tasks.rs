@@ -13,9 +13,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use sqlx::{AssertSqlSafe, types::Uuid};
 use wyrd_spec::DataTenantId;
-use wyrd_spec::vala::api::AuditEvent;
 
-use crate::queries::audit_outbox::{OperatorAudit, append_audit};
 use crate::queries::forge_operations::{assert_lease_fence, bind_tenant, lock_table_authority};
 use crate::row_types::forge_operations::{ForgeClaimTable, ForgeExpirationAuthority};
 use crate::row_types::forge_tasks::{
@@ -896,13 +894,13 @@ impl ForgeTasks {
         exact_one(changed, "capacity refusal release")
     }
 
-    /// Atomically records Prepared evidence and the supplied tenant audit event.
+    /// Atomically records Prepared evidence on the exact claimed attempt.
     ///
     /// # Errors
-    /// Returns conflict for stale identity/state, malformed evidence, or SQL/audit errors.
+    /// Returns conflict for stale identity/state, malformed evidence, or SQL errors.
     ///
     /// # Cancellation
-    /// Caller-owned transaction rollback removes both state and audit writes.
+    /// Caller-owned transaction rollback removes the state write.
     pub async fn prepared(
         &self,
         conn: &mut TenantConn<'_>,
@@ -910,9 +908,7 @@ impl ForgeTasks {
         attempt: Uuid,
         owner: Uuid,
         evidence: &ForgeTaskEvidence,
-        event: &AuditEvent,
     ) -> Result<ForgeTaskTransitionOutcome, SqlError> {
-        validate_audit_event(event, task_id, ForgeTaskState::Prepared)?;
         evidence.validate(false)?;
         let identity=sqlx::query_as::<_,(String,String,String)>("SELECT catalog_name,namespace_name,table_name FROM vala.forge_tasks WHERE task_id=$1 AND state IN ('running','prepared') AND attempt_id=$2 AND claimed_by=$3 FOR UPDATE").bind(task_id).bind(attempt).bind(owner).fetch_optional(&mut **conn.transaction()).await.map_err(SqlError::from)?.ok_or_else(||SqlError::Conflict{detail:"Forge Prepared transition did not match exact state, attempt, and owner".to_owned()})?;
         let identity =
@@ -923,7 +919,7 @@ impl ForgeTasks {
             })?;
         evidence.validate_for_table(&identity)?;
         let encoded = crate::row_types::forge_tasks::evidence_to_value(evidence);
-        self.audited_transition(
+        self.apply_transition(
             conn,
             ForgeTaskTransition {
                 task_id,
@@ -933,31 +929,28 @@ impl ForgeTasks {
                 next: ForgeTaskState::Prepared,
             },
             Some(encoded),
-            event,
         )
         .await
     }
 
-    /// Atomically applies a lifecycle-significant terminal state and audit row.
+    /// Atomically applies a lifecycle-significant terminal state.
     ///
     /// # Errors
     /// Returns conflict unless terminal is Succeeded, Failed, or Cancelled and exact expected identity/state matches.
     ///
     /// # Cancellation
-    /// Caller-owned transaction rollback removes both state and audit writes.
+    /// Caller-owned transaction rollback removes the state write.
     pub async fn terminal(
         &self,
         conn: &mut TenantConn<'_>,
         transition: ForgeTaskTransition,
-        event: &AuditEvent,
     ) -> Result<ForgeTaskTransitionOutcome, SqlError> {
         if !transition.next.is_terminal() {
             return Err(SqlError::Conflict {
                 detail: "requested Forge terminal state is nonterminal".to_owned(),
             });
         }
-        validate_audit_event(event, transition.task_id, transition.next)?;
-        self.audited_transition(conn, transition, None, event).await
+        self.apply_transition(conn, transition, None).await
     }
 
     /// Atomically marks exact Prepared work successful and requests fresh planning.
@@ -970,7 +963,7 @@ impl ForgeTasks {
     /// # Errors
     ///
     /// Returns conflict unless the transition is an exact Prepared-to-Succeeded
-    /// transition for the supplied tenant/table, or returns audit/SQL errors.
+    /// transition for the supplied tenant/table, or returns SQL errors.
     /// Caller rollback removes both the terminal state and successor demand.
     ///
     /// # Cancellation
@@ -982,7 +975,6 @@ impl ForgeTasks {
         transition: ForgeTaskTransition,
         table: &ForgeTaskTableIdentity,
         progress_effect: TaskProgressEffect,
-        event: &AuditEvent,
     ) -> Result<ForgeTaskTransitionOutcome, SqlError> {
         if transition.expected != ForgeTaskState::Prepared
             || transition.next != ForgeTaskState::Succeeded
@@ -1008,7 +1000,7 @@ impl ForgeTasks {
                     .to_owned(),
             });
         }
-        let outcome = self.terminal(conn, transition, event).await?;
+        let outcome = self.terminal(conn, transition).await?;
         sqlx::query("UPDATE vala.forge_tasks SET failure_class=NULL,next_eligible_at=statement_timestamp() WHERE task_id=$1 AND state='succeeded'")
             .bind(transition.task_id)
             .execute(&mut **conn.transaction()).await.map_err(SqlError::from)?;
@@ -1035,22 +1027,20 @@ impl ForgeTasks {
 
     /// Atomically cancels a superseded claimed attempt and requests a fresh plan.
     ///
-    /// The audited terminal transition clears the exact attempt ownership
-    /// before the same tenant transaction advances the periodic demand
-    /// generation.
+    /// The terminal transition clears the exact attempt ownership before the
+    /// same tenant transaction advances the periodic demand generation.
     ///
     /// # Errors
     /// Returns conflict unless the transition is an exact Claimed-to-Cancelled
-    /// transition for the supplied tenant/table, or returns SQL/audit errors.
+    /// transition for the supplied tenant/table, or returns SQL errors.
     ///
     /// # Cancellation
-    /// Caller-owned rollback removes the cancellation, audit, and successor
-    /// demand together.
+    /// Caller-owned rollback removes the cancellation and successor demand
+    /// together.
     pub async fn cancel_superseded(
         &self,
         conn: &mut TenantConn<'_>,
         task: &ForgeTaskClaim,
-        event: &AuditEvent,
     ) -> Result<ForgeTaskTransitionOutcome, SqlError> {
         if task.data_tenant_id != conn.data_tenant_id()
             || task.state != ForgeTaskState::Claimed
@@ -1068,10 +1058,7 @@ impl ForgeTasks {
             expected: ForgeTaskState::Claimed,
             next: ForgeTaskState::Cancelled,
         };
-        validate_audit_event(event, task.task_id, ForgeTaskState::Cancelled)?;
-        let outcome = self
-            .audited_transition(conn, transition, None, event)
-            .await?;
+        let outcome = self.apply_transition(conn, transition, None).await?;
         sqlx::query_scalar::<_, i64>("INSERT INTO vala.forge_planning_demands (data_tenant_id,catalog_name,namespace_name,table_name,last_source) VALUES ($1,$2,$3,$4,'periodic') ON CONFLICT (data_tenant_id,catalog_name,namespace_name,table_name) DO UPDATE SET last_requested_at=statement_timestamp(),last_source='periodic',generation=vala.forge_planning_demands.generation+1 RETURNING generation")
             .bind(task.data_tenant_id.as_uuid())
             .bind(&task.table_ref.catalog)
@@ -1431,11 +1418,6 @@ impl ForgeTasks {
         tenant: DataTenantId,
         request: ExpiredCleanupCandidateRequest<'_>,
     ) -> Result<ForgeTaskTransitionOutcome, SqlError> {
-        validate_cleanup_event(
-            request.event,
-            request.authority.task_id,
-            "forge.expired_cleanup.candidate_prepared",
-        )?;
         let mut tx = self
             .operator_pool
             .pool()
@@ -1498,9 +1480,6 @@ impl ForgeTasks {
             .map_err(SqlError::from)?
             .rows_affected();
         exact_one(changed, "expired cleanup candidate preparation")?;
-        OperatorAudit::new(tenant, &mut tx)
-            .append(request.event)
-            .await?;
         tx.commit().await.map_err(SqlError::from)?;
         Ok(ForgeTaskTransitionOutcome::Applied)
     }
@@ -1509,11 +1488,10 @@ impl ForgeTasks {
     ///
     /// A proven outcome ([`ExpiredCleanupOutcome::Deleted`] or
     /// [`ExpiredCleanupOutcome::Missing`]) clears the prepared index and
-    /// advances the cursor by exactly one in the same commit as its terminal
-    /// candidate audit. A refusal or an uncertain acceptance appends only its
-    /// audit and leaves the prepared candidate intact, so the same identity
-    /// replays it and no blind second delete can precede a fresh stat and
-    /// safety proof. A stale owner cannot settle at all.
+    /// advances the cursor by exactly one. A refusal or an uncertain acceptance
+    /// changes no durable state and leaves the prepared candidate intact, so
+    /// the same identity replays it and no blind second delete can precede a
+    /// fresh stat and safety proof. A stale owner cannot settle at all.
     ///
     /// # Errors
     ///
@@ -1534,11 +1512,6 @@ impl ForgeTasks {
         request: ExpiredCleanupCandidateRequest<'_>,
         outcome: ExpiredCleanupOutcome,
     ) -> Result<ForgeTaskTransitionOutcome, SqlError> {
-        validate_cleanup_event(
-            request.event,
-            request.authority.task_id,
-            outcome.audit_operation(),
-        )?;
         let mut tx = self
             .operator_pool
             .pool()
@@ -1581,10 +1554,14 @@ impl ForgeTasks {
                 .map_err(SqlError::from)?
                 .rows_affected();
             exact_one(changed, "expired cleanup candidate settlement")?;
+        } else {
+            tracing::warn!(
+                task_id = %request.authority.task_id,
+                index = request.index,
+                outcome = outcome.transition_name(),
+                "expired cleanup candidate retained for same-identity replay"
+            );
         }
-        OperatorAudit::new(tenant, &mut tx)
-            .append(request.event)
-            .await?;
         tx.commit().await.map_err(SqlError::from)?;
         Ok(ForgeTaskTransitionOutcome::Applied)
     }
@@ -1646,19 +1623,18 @@ impl ForgeTasks {
 
     /// Atomically completes one orphan-cleanup task whose prefix is exhausted.
     ///
-    /// Clearing the cursor, the exact `Running -> Succeeded` transition, and
-    /// the task-success audit commit or roll back together, so a crash can
-    /// never expose a succeeded task whose traversal evidence still claims
-    /// unfinished work. Completion requests no planning demand: orphan cleanup
+    /// Clearing the cursor and the exact `Running -> Succeeded` transition
+    /// commit or roll back together, so a crash can never expose a succeeded
+    /// task whose traversal evidence still claims unfinished work. Completion
+    /// requests no planning demand: orphan cleanup
     /// changes no snapshot and its successor is the next periodic task, which
     /// carries its own fresh cutoff and reconsiders every object again.
     ///
     /// # Errors
     ///
-    /// Returns [`SqlError::Conflict`] when the lease fence is lost, when the
-    /// audit event does not name this task and transition, or when no row
-    /// matches the exact live `Running` task, attempt, owner, and table.
-    /// Returns [`SqlError`] for statement or audit failures.
+    /// Returns [`SqlError::Conflict`] when the lease fence is lost or when no
+    /// row matches the exact live `Running` task, attempt, owner, and table.
+    /// Returns [`SqlError`] for statement failures.
     ///
     /// # Cancellation
     ///
@@ -1669,9 +1645,7 @@ impl ForgeTasks {
         tenant: DataTenantId,
         authority: &ForgeExpirationAuthority,
         table: &ForgeClaimTable,
-        event: &AuditEvent,
     ) -> Result<ForgeTaskTransitionOutcome, SqlError> {
-        validate_audit_event(event, authority.task_id, ForgeTaskState::Succeeded)?;
         let mut tx = self
             .operator_pool
             .pool()
@@ -1691,25 +1665,22 @@ impl ForgeTasks {
             .map_err(SqlError::from)?
             .rows_affected();
         exact_one(changed, "orphan cleanup completion")?;
-        OperatorAudit::new(tenant, &mut tx).append(event).await?;
         tx.commit().await.map_err(SqlError::from)?;
         Ok(ForgeTaskTransitionOutcome::Applied)
     }
 
-    /// Applies an exact tenant mutation and audit append inside the caller transaction.
+    /// Applies an exact tenant state mutation inside the caller transaction.
     ///
     /// # Errors
-    /// Returns conflicts for stale transitions and SQL errors for state or audit
-    /// writes.
+    /// Returns conflicts for stale transitions and SQL errors for state writes.
     ///
     /// # Cancellation
-    /// The caller transaction rolls back both state and audit.
-    async fn audited_transition(
+    /// The caller transaction rolls the state write back.
+    async fn apply_transition(
         &self,
         conn: &mut TenantConn<'_>,
         transition: ForgeTaskTransition,
         evidence: Option<serde_json::Value>,
-        event: &AuditEvent,
     ) -> Result<ForgeTaskTransitionOutcome, SqlError> {
         let changed=sqlx::query("UPDATE vala.forge_tasks SET state=$5,evidence=COALESCE($6,evidence),attempt_id=CASE WHEN $5='prepared' THEN attempt_id ELSE NULL END,claimed_by=CASE WHEN $5='prepared' THEN claimed_by ELSE NULL END,claim_expires_at=CASE WHEN $5='prepared' THEN claim_expires_at ELSE NULL END,watermark_snapshot_id=CASE WHEN $5='prepared' THEN watermark_snapshot_id ELSE NULL END,watermark_timestamp_ms=CASE WHEN $5='prepared' THEN watermark_timestamp_ms ELSE NULL END,updated_at=statement_timestamp() WHERE task_id=$1 AND state=$4 AND attempt_id=$2 AND claimed_by=$3").bind(transition.task_id).bind(transition.attempt_id).bind(transition.owner).bind(transition.expected.as_str()).bind(transition.next.as_str()).bind(&evidence).execute(&mut **conn.transaction()).await.map_err(SqlError::from)?.rows_affected();
         if changed == 0 && transition.next == ForgeTaskState::Prepared {
@@ -1723,8 +1694,7 @@ impl ForgeTasks {
                 return Ok(ForgeTaskTransitionOutcome::AlreadyApplied);
             }
         }
-        exact_one(changed, "audited transition")?;
-        append_audit(conn, event).await?;
+        exact_one(changed, "state transition")?;
         Ok(ForgeTaskTransitionOutcome::Applied)
     }
 }
@@ -1946,24 +1916,6 @@ fn require_handoff_source(evidence: &ForgeTaskEvidence) -> Result<(), SqlError> 
     Ok(())
 }
 
-/// Validates that a per-candidate audit event names this task and boundary.
-///
-/// # Errors
-/// Returns [`SqlError::Conflict`] for mismatched audit identity.
-fn validate_cleanup_event(
-    event: &AuditEvent,
-    task_id: Uuid,
-    operation: &str,
-) -> Result<(), SqlError> {
-    if event.resource != format!("forge-task:{task_id}") || event.operation != operation {
-        return Err(SqlError::Conflict {
-            detail: "Forge expired-cleanup audit event does not match its task and boundary"
-                .to_owned(),
-        });
-    }
-    Ok(())
-}
-
 /// Requires an exact single-row transition.
 ///
 /// # Errors
@@ -1976,25 +1928,6 @@ fn exact_one(changed: u64, operation: &str) -> Result<(), SqlError> {
             detail: format!("Forge task {operation} did not match exact state, attempt, and owner"),
         })
     }
-}
-
-/// Validates that lifecycle audit identity names the exact task and next state.
-///
-/// # Errors
-/// Returns [`SqlError::Conflict`] for mismatched audit identity.
-fn validate_audit_event(
-    event: &AuditEvent,
-    task_id: Uuid,
-    next: ForgeTaskState,
-) -> Result<(), SqlError> {
-    let expected_resource = format!("forge-task:{task_id}");
-    let expected_operation = format!("forge.task.{}", next.as_str());
-    if event.resource != expected_resource || event.operation != expected_operation {
-        return Err(SqlError::Conflict {
-            detail: "Forge task audit event does not match task identity and transition".to_owned(),
-        });
-    }
-    Ok(())
 }
 
 /// One expired-cleanup candidate whose deletion has been prepared but not

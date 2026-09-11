@@ -5,7 +5,6 @@ use std::str::FromStr;
 use chrono::{DateTime, Utc};
 use sqlx::types::Uuid;
 use wyrd_spec::DataTenantId;
-use wyrd_spec::vala::api::AuditEvent;
 
 use crate::SqlError;
 use crate::row_types::forge_operations::{ForgeClaimTable, ForgeExpirationAuthority};
@@ -1714,9 +1713,9 @@ pub enum ExpiredCleanupOutcome {
 }
 
 impl ExpiredCleanupOutcome {
-    /// Returns the exact audit operation this outcome appends.
+    /// Returns the stable transition name this outcome is traced under.
     #[must_use]
-    pub const fn audit_operation(self) -> &'static str {
+    pub const fn transition_name(self) -> &'static str {
         match self {
             Self::Deleted => "forge.expired_cleanup.candidate_deleted",
             Self::Missing => "forge.expired_cleanup.candidate_missing",
@@ -1747,8 +1746,6 @@ pub struct ExpiredCleanupCandidateRequest<'request> {
     pub index: u32,
     /// The exact candidate at `index`, compared against the immutable plan.
     pub candidate: &'request ForgeCleanupCandidate,
-    /// Audit event appended in the same commit as the state change.
-    pub event: &'request AuditEvent,
 }
 
 /// Bounded task status page.

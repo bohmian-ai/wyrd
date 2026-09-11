@@ -28,7 +28,7 @@ use wyrd_spec::vala::api::{
 };
 
 use super::Forge;
-use super::compact::{ForgeGroupKey, forge_transition_event};
+use super::compact::ForgeGroupKey;
 use super::error::ForgeError;
 use super::lease::ForgeLease;
 use crate::catalog::TenantTableBinding;
@@ -800,18 +800,20 @@ impl Forge {
             .await
             .map_err(ForgeError::Sql)?;
         lease.require_fence(&self.core.operator_pool).await?;
-        let event = forge_transition_event(&operation, resource.clone(), detail);
         let operations = ForgeOperations::new(&resource, ForgeOperationFamily::ScribePromotion)
             .map_err(ForgeError::Sql)?;
         let transition = if phase == ForgeScribePromotionPhase::Prepared {
-            operations.append_prepared(&mut conn, &event).await
+            operations
+                .append_prepared(&mut conn, &operation, &detail)
+                .await
         } else {
-            operations.append_terminal(&mut conn, &event).await
+            operations
+                .append_terminal(&mut conn, &operation, &detail)
+                .await
         }
         .map_err(ForgeError::Sql)?;
         match transition {
-            ForgeOperationTransition::Applied { .. }
-            | ForgeOperationTransition::AlreadyApplied { .. } => {}
+            ForgeOperationTransition::Applied | ForgeOperationTransition::AlreadyApplied => {}
         }
         if let Some(snapshot_id) = committed_snapshot_id {
             HotFileCatalog::new(

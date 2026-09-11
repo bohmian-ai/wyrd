@@ -582,7 +582,7 @@ impl Forge {
                         lease_key: context.lease.lease_key.clone(),
                     });
                 }
-                self.append_live_audit(
+                self.append_live_transition(
                     context.lease,
                     &group_key,
                     "forge.iceberg_rewrite.recovered",
@@ -646,7 +646,7 @@ impl Forge {
                 lease_key: context.lease.lease_key.clone(),
             });
         }
-        self.append_live_audit(
+        self.append_live_transition(
             context.lease,
             group_key,
             "forge.iceberg_rewrite.reset",

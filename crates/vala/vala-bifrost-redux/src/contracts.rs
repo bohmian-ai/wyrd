@@ -21,7 +21,6 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use wyrd_runtime::principal::Principal;
 use wyrd_spec::request_id::RequestId;
-use wyrd_spec::vala::api::AuditEvent;
 
 use wyrd_spec::vala::api::BifrostQueryRequest;
 use wyrd_spec::vala::error::BifrostError;
@@ -77,8 +76,6 @@ pub struct ScribeIngressFrame {
     pub request_id: RequestId,
     /// The client idempotency identifier for this batch.
     pub batch_id: uuid::Uuid,
-    /// The server-created audit event for this batch.
-    pub audit_event: AuditEvent,
     /// Server-measured bytes after transport decompression.
     pub measured_wire_bytes: usize,
     /// Native Arrow IPC, engine-only projected Arrow, or a fixed-capacity

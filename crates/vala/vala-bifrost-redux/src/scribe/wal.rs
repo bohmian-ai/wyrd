@@ -169,11 +169,11 @@ const RECORD_MAGIC: [u8; 8] = *b"WYRDWAL6";
 const COMMIT_PAYLOAD_MAGIC: [u8; 4] = *b"S6CM";
 /// Exact encoded width of a v6 COMMIT payload.
 ///
-/// The layout is fixed and total: magic, WAL digest, logical digest. A COMMIT
-/// record whose declared payload is any other length is refused rather than
-/// interpreted, so a record written by a different format can never be read as
-/// a truncated or extended identity.
-const COMMIT_PAYLOAD_BYTES: usize = COMMIT_PAYLOAD_MAGIC.len() + 32 + 32;
+/// The layout is fixed and total: magic, WAL digest, logical digest, request
+/// identity. A COMMIT record whose declared payload is any other length is
+/// refused rather than interpreted, so a record written by a different format
+/// can never be read as a truncated or extended identity.
+const COMMIT_PAYLOAD_BYTES: usize = COMMIT_PAYLOAD_MAGIC.len() + 32 + 32 + 16;
 
 /// Complete batch identity carried by one terminal v6 COMMIT record.
 ///
@@ -182,22 +182,27 @@ const COMMIT_PAYLOAD_BYTES: usize = COMMIT_PAYLOAD_MAGIC.len() + 32 + 32;
 ///
 /// `wal_digest` binds the exact ordered WAL slice frames this attempt wrote. It
 /// is what proves a replayed slice set is the one the commit closed, and it is
-/// deliberately attempt-specific: every slice payload embeds that attempt's
-/// audit envelope, so an honest client retry of the same rows produces a
-/// different `wal_digest`.
+/// framing-specific: it covers this attempt's exact slice boundaries and
+/// managed correlation columns.
 ///
-/// `logical_digest` identifies the rows independently of that envelope. It is
+/// `logical_digest` identifies the rows independently of that framing. It is
 /// the value the durable SQL fence stores, so replay must present it verbatim
 /// rather than derive something else. Persisting it here is what removes the
 /// need for recovery to decode Arrow payloads purely to reconstruct a
 /// deduplication key: the live path computes it once, during preprocessing, and
 /// replay reads the same durable field.
+///
+/// `request_id` is the lineage correlation the durable Scribe batch fence
+/// stores. It is carried here because replay must reproduce the fence row
+/// verbatim without consulting any other durable state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WalCommitIdentity {
     /// SHA-256 over this attempt's ordered slice frames.
     pub wal_digest: [u8; 32],
     /// SHA-256 over the batch's attempt-independent logical row identity.
     pub logical_digest: [u8; 32],
+    /// Request correlation recorded by the durable batch-commit fence.
+    pub request_id: [u8; 16],
 }
 
 impl WalCommitIdentity {
@@ -208,6 +213,7 @@ impl WalCommitIdentity {
         encoded[0..4].copy_from_slice(&COMMIT_PAYLOAD_MAGIC);
         encoded[4..36].copy_from_slice(&self.wal_digest);
         encoded[36..68].copy_from_slice(&self.logical_digest);
+        encoded[68..84].copy_from_slice(&self.request_id);
         encoded
     }
 
@@ -235,9 +241,12 @@ impl WalCommitIdentity {
         wal_digest.copy_from_slice(&payload[4..36]);
         let mut logical_digest = [0_u8; 32];
         logical_digest.copy_from_slice(&payload[36..68]);
+        let mut request_id = [0_u8; 16];
+        request_id.copy_from_slice(&payload[68..84]);
         Ok(Self {
             wal_digest,
             logical_digest,
+            request_id,
         })
     }
 }
@@ -381,7 +390,7 @@ pub struct WalRecord {
     pub flags: u32,
     /// Authenticated tenant owning the record.
     pub tenant_id: [u8; 16],
-    /// Batch ID for deduplication of the complete audit-plus-data record.
+    /// Batch ID for deduplication of the complete slice-set record.
     pub batch_id: [u8; 16],
     /// Zero-based slice ordinal, or the closing slice count for a commit.
     pub slice_index: u32,
@@ -474,7 +483,6 @@ impl Default for WalConfig {
 pub(crate) struct PreparedWalAppend {
     pub(crate) lsn: WalLsn,
     pub(crate) batch_id: [u8; 16],
-    pub(crate) audit: Bytes,
     pub(crate) data: Bytes,
     pub(crate) seal_key: Option<SealKey>,
     pub(crate) schema_fingerprint: [u8; 32],
@@ -507,11 +515,10 @@ pub(crate) struct WalAppendResult {
 }
 
 impl PreparedWalAppend {
-    pub(crate) fn new(lsn: WalLsn, batch_id: [u8; 16], audit: Bytes, data: Bytes) -> Self {
+    pub(crate) fn new(lsn: WalLsn, batch_id: [u8; 16], data: Bytes) -> Self {
         Self {
             lsn,
             batch_id,
-            audit,
             data,
             seal_key: None,
             schema_fingerprint: [0; 32],
@@ -539,7 +546,6 @@ impl PreparedWalAppend {
         Self {
             lsn: WalLsn::ZERO,
             batch_id,
-            audit: Bytes::new(),
             data: Bytes::new(),
             seal_key: None,
             schema_fingerprint: [0; 32],
@@ -634,8 +640,7 @@ impl PreparedWalAppend {
             .ok_or_else(|| ScribeError::Internal {
                 detail: "prepared WAL append is missing its self-describing seal key".to_owned(),
             })?;
-        let payload =
-            encode_slice_payload(seal_key, self.schema_fingerprint, &self.audit, &self.data)?;
+        let payload = encode_slice_payload(seal_key, self.schema_fingerprint, &self.data)?;
         Ok(WalRecord::slice(
             self.lsn,
             *seal_key.tenant.as_uuid().as_bytes(),
@@ -662,10 +667,10 @@ impl PreparedWalAppend {
 
     /// Returns the exact uncompressed v6 packet payload length.
     ///
-    /// This includes the self-describing seal-key, schema, audit, and Arrow
-    /// fields that are part of the durable packet. Rotation must use this
-    /// value rather than a JSON or audit-plus-Arrow proxy so live projection
-    /// and replay apply identical packet semantics.
+    /// This includes the self-describing seal-key, schema, and Arrow fields
+    /// that are part of the durable packet. Rotation must use this value
+    /// rather than a JSON proxy so live projection and replay apply identical
+    /// packet semantics.
     ///
     /// # Errors
     ///
@@ -696,16 +701,12 @@ impl PreparedWalAppend {
                 .map_err(|_| ScribeError::Internal {
                     detail: "WAL table FQN exceeds v6 payload limits".to_owned(),
                 })?;
-        let audit_len = u32::try_from(self.audit.len()).map_err(|_| ScribeError::Internal {
-            detail: "WAL audit payload exceeds v6 payload limits".to_owned(),
-        })?;
         let data_len = u32::try_from(self.data.len()).map_err(|_| ScribeError::Internal {
             detail: "WAL Arrow payload exceeds v6 payload limits".to_owned(),
         })?;
-        let payload_len = 62usize
+        let payload_len = 58usize
             .saturating_add(usize::from(table_len))
             .saturating_add(SLICE_PARTITION_BYTES)
-            .saturating_add(usize::try_from(audit_len).expect("invariant: u32 fits usize"))
             .saturating_add(usize::try_from(data_len).expect("invariant: u32 fits usize"));
         Ok(payload_len)
     }
@@ -782,17 +783,12 @@ fn append_prepared_borrowed(
             .to_le_bytes();
         let granularity_tag = [seal_key.partition.granularity_tag()];
         let partition_start = seal_key.partition.start_unix_micros().to_be_bytes();
-        let audit_len = u32::try_from(prepared.audit.len())
-            .map_err(|_| ScribeError::Internal {
-                detail: "WAL audit payload exceeds v6 payload limits".to_owned(),
-            })?
-            .to_le_bytes();
         let data_len = u32::try_from(prepared.data.len())
             .map_err(|_| ScribeError::Internal {
                 detail: "WAL Arrow payload exceeds v6 payload limits".to_owned(),
             })?
             .to_le_bytes();
-        let parts: [&[u8]; 13] = [
+        let parts: [&[u8]; 11] = [
             &SLICE_PAYLOAD_MAGIC,
             &tenant_id,
             &table_len,
@@ -802,8 +798,6 @@ fn append_prepared_borrowed(
             &granularity_tag,
             &partition_start,
             &prepared.schema_fingerprint,
-            &audit_len,
-            &prepared.audit,
             &data_len,
             &prepared.data,
         ];
@@ -821,7 +815,6 @@ const SLICE_PARTITION_BYTES: usize = 9;
 fn encode_slice_payload(
     seal_key: &SealKey,
     schema_fingerprint: [u8; 32],
-    audit: &[u8],
     data: &[u8],
 ) -> Result<Vec<u8>, ScribeError> {
     encode_slice_payload_parts(
@@ -829,7 +822,6 @@ fn encode_slice_payload(
         &seal_key.table.fqn(),
         seal_key.partition,
         &schema_fingerprint,
-        audit,
         data,
     )
 }
@@ -840,14 +832,10 @@ fn encode_slice_payload_parts(
     table_fqn: &str,
     partition: TimePartition,
     schema_fingerprint: &[u8; 32],
-    audit: &[u8],
     data: &[u8],
 ) -> Result<Vec<u8>, ScribeError> {
     let table_len = u16::try_from(table_fqn.len()).map_err(|_| ScribeError::Internal {
         detail: "WAL table FQN exceeds v6 payload limits".to_owned(),
-    })?;
-    let audit_len = u32::try_from(audit.len()).map_err(|_| ScribeError::Internal {
-        detail: "WAL audit payload exceeds v6 payload limits".to_owned(),
     })?;
     let data_len = u32::try_from(data.len()).map_err(|_| ScribeError::Internal {
         detail: "WAL Arrow payload exceeds v6 payload limits".to_owned(),
@@ -859,8 +847,6 @@ fn encode_slice_payload_parts(
         .saturating_add(SLICE_PARTITION_BYTES)
         .saturating_add(32)
         .saturating_add(4)
-        .saturating_add(audit.len())
-        .saturating_add(4)
         .saturating_add(data.len());
     let mut payload = Vec::with_capacity(capacity);
     payload.extend_from_slice(&SLICE_PAYLOAD_MAGIC);
@@ -870,8 +856,6 @@ fn encode_slice_payload_parts(
     payload.push(partition.granularity_tag());
     payload.extend_from_slice(&partition.start_unix_micros().to_be_bytes());
     payload.extend_from_slice(schema_fingerprint);
-    payload.extend_from_slice(&audit_len.to_le_bytes());
-    payload.extend_from_slice(audit);
     payload.extend_from_slice(&data_len.to_le_bytes());
     payload.extend_from_slice(data);
     Ok(payload)
@@ -882,7 +866,6 @@ fn encode_slice_payload_parts(
 pub(crate) struct DecodedSlicePayload {
     pub(crate) seal_key: SealKey,
     pub(crate) schema_fingerprint: [u8; 32],
-    pub(crate) audit: Vec<u8>,
     pub(crate) data: Vec<u8>,
 }
 
@@ -1009,7 +992,7 @@ fn decode_slice_partition(encoded: &[u8]) -> Result<TimePartition, ScribeError> 
     })
 }
 
-/// Metadata decoded before the variable-size audit and Arrow fields.
+/// Metadata decoded before the variable-size Arrow field.
 struct DecodedSliceMetadata {
     seal_key: SealKey,
     schema_fingerprint: [u8; 32],
@@ -1037,22 +1020,17 @@ fn decode_slice_metadata(
     })
 }
 
-/// Decode the audit envelope and Arrow IPC byte fields after metadata.
-fn decode_slice_bodies(
-    reader: &mut SlicePayloadReader<'_>,
-) -> Result<(Vec<u8>, Vec<u8>), ScribeError> {
-    let audit = reader.read_bytes_u32("WAL audit length decode failed")?;
-    let data = reader.read_bytes_u32("WAL Arrow length decode failed")?;
-    Ok((audit, data))
+/// Decode the Arrow IPC byte field after metadata.
+fn decode_slice_bodies(reader: &mut SlicePayloadReader<'_>) -> Result<Vec<u8>, ScribeError> {
+    reader.read_bytes_u32("WAL Arrow length decode failed")
 }
 
 /// Decode one self-describing v3 WAL slice payload.
 ///
 /// The payload contains the authenticated tenant, canonical table FQN,
-/// partition day, schema fingerprint, canonical audit bytes, and Arrow IPC
-/// bytes. Structural decoding is kept separate from replay's deduplication
-/// and audit/Arrow reconstruction so this function only validates and returns
-/// the one-record representation.
+/// partition day, schema fingerprint, and Arrow IPC bytes. Structural decoding
+/// is kept separate from replay's deduplication and Arrow reconstruction so
+/// this function only validates and returns the one-record representation.
 ///
 /// # Errors
 ///
@@ -1061,12 +1039,11 @@ fn decode_slice_bodies(
 pub(crate) fn decode_slice_payload(payload: &[u8]) -> Result<DecodedSlicePayload, ScribeError> {
     let mut reader = SlicePayloadReader::new(payload);
     let metadata = decode_slice_metadata(&mut reader)?;
-    let (audit, data) = decode_slice_bodies(&mut reader)?;
+    let data = decode_slice_bodies(&mut reader)?;
     reader.finish()?;
     Ok(DecodedSlicePayload {
         seal_key: metadata.seal_key,
         schema_fingerprint: metadata.schema_fingerprint,
-        audit,
         data,
     })
 }
@@ -1374,23 +1351,14 @@ fn encode_record_header(
 
 /// Encode a compact test fixture that is decoded into a normal v3 slice append.
 #[cfg(test)]
-pub(crate) fn encode_append_frame(
-    batch_id: [u8; 16],
-    audit: &[u8],
-    data: &[u8],
-) -> Result<Bytes, ScribeError> {
-    let audit_len = u32::try_from(audit.len()).map_err(|_| ScribeError::Internal {
-        detail: "audit envelope exceeds WAL frame length".to_string(),
-    })?;
+pub(crate) fn encode_append_frame(batch_id: [u8; 16], data: &[u8]) -> Result<Bytes, ScribeError> {
     let data_len = u32::try_from(data.len()).map_err(|_| ScribeError::Internal {
         detail: "Arrow payload exceeds WAL frame length".to_string(),
     })?;
-    let mut frame = Vec::with_capacity(28 + audit.len() + data.len());
+    let mut frame = Vec::with_capacity(24 + data.len());
     frame.extend_from_slice(&APPEND_FRAME_MAGIC_V3);
     frame.extend_from_slice(&batch_id);
-    frame.extend_from_slice(&audit_len.to_le_bytes());
     frame.extend_from_slice(&data_len.to_le_bytes());
-    frame.extend_from_slice(audit);
     frame.extend_from_slice(data);
     Ok(Bytes::from(frame))
 }
@@ -1398,13 +1366,12 @@ pub(crate) fn encode_append_frame(
 #[cfg(test)]
 struct DecodedAppendFrame<'a> {
     batch_id: [u8; 16],
-    audit: &'a [u8],
     data: &'a [u8],
 }
 
 #[cfg(test)]
 fn decode_append_frame(frame: &[u8]) -> Result<DecodedAppendFrame<'_>, ScribeError> {
-    if frame.len() < 28 || frame[0..4] != APPEND_FRAME_MAGIC_V3 {
+    if frame.len() < 24 || frame[0..4] != APPEND_FRAME_MAGIC_V3 {
         return Err(ScribeError::Internal {
             detail: "invalid Scribe WAL append frame".to_string(),
         });
@@ -1412,26 +1379,15 @@ fn decode_append_frame(frame: &[u8]) -> Result<DecodedAppendFrame<'_>, ScribeErr
     let mut batch_id = [0_u8; 16];
     batch_id.copy_from_slice(&frame[4..20]);
     let lengths_start = 20;
-    let audit_len = u32::from_le_bytes([
+    let data_len = u32::from_le_bytes([
         frame[lengths_start],
         frame[lengths_start + 1],
         frame[lengths_start + 2],
         frame[lengths_start + 3],
     ]) as usize;
-    let data_len = u32::from_le_bytes([
-        frame[lengths_start + 4],
-        frame[lengths_start + 5],
-        frame[lengths_start + 6],
-        frame[lengths_start + 7],
-    ]) as usize;
-    let payload_len = audit_len
-        .checked_add(data_len)
-        .ok_or_else(|| ScribeError::Internal {
-            detail: "Scribe WAL append frame length overflow".to_string(),
-        })?;
-    let payload_start = lengths_start + 8;
+    let payload_start = lengths_start + 4;
     let end = payload_start
-        .checked_add(payload_len)
+        .checked_add(data_len)
         .ok_or_else(|| ScribeError::Internal {
             detail: "Scribe WAL append frame offset overflow".to_string(),
         })?;
@@ -1442,8 +1398,7 @@ fn decode_append_frame(frame: &[u8]) -> Result<DecodedAppendFrame<'_>, ScribeErr
     }
     Ok(DecodedAppendFrame {
         batch_id,
-        audit: &frame[payload_start..payload_start + audit_len],
-        data: &frame[payload_start + audit_len..end],
+        data: &frame[payload_start..end],
     })
 }
 
@@ -2676,10 +2631,9 @@ impl WalWriter {
         &self,
         seal_key: &SealKey,
         batch_id: [u8; 16],
-        audit_payload: &[u8],
         data_payload: &[u8],
     ) -> Result<WalLsn, ScribeError> {
-        self.append_and_fsync_for_key(seal_key, batch_id, audit_payload, data_payload)
+        self.append_and_fsync_for_key(seal_key, batch_id, data_payload)
     }
 
     /// Append, commit, and fsync one one-slice v6 batch for replay tests.
@@ -2700,16 +2654,11 @@ impl WalWriter {
         &self,
         seal_key: &SealKey,
         batch_id: [u8; 16],
-        audit_payload: &[u8],
         data_payload: &[u8],
     ) -> Result<WalLsn, ScribeError> {
-        let mut prepared = PreparedWalAppend::new(
-            WalLsn::ZERO,
-            batch_id,
-            Bytes::copy_from_slice(audit_payload),
-            Bytes::copy_from_slice(data_payload),
-        )
-        .for_slice(seal_key.clone(), [0; 32]);
+        let mut prepared =
+            PreparedWalAppend::new(WalLsn::ZERO, batch_id, Bytes::copy_from_slice(data_payload))
+                .for_slice(seal_key.clone(), [0; 32]);
         // Framing tests write opaque payloads, so the logical identity is taken
         // over the payload bytes themselves. The production path substitutes the
         // Arrow logical identity here; the WAL format is indifferent to which,
@@ -2771,12 +2720,7 @@ impl WalWriter {
         seal_key: &SealKey,
     ) -> Result<WalLsn, ScribeError> {
         let decoded = decode_append_frame(frame)?;
-        self.append_and_commit_for_replay_test(
-            seal_key,
-            decoded.batch_id,
-            decoded.audit,
-            decoded.data,
-        )
+        self.append_and_commit_for_replay_test(seal_key, decoded.batch_id, decoded.data)
     }
 
     /// Append one prepared v6 record without syncing it.
@@ -2969,7 +2913,6 @@ impl WalWriter {
         let mut prepared = PreparedWalAppend::new(
             WalLsn::ZERO,
             decoded.batch_id,
-            Bytes::copy_from_slice(decoded.audit),
             Bytes::copy_from_slice(decoded.data),
         )
         .for_slice(seal_key.clone(), [0; 32]);
@@ -3014,16 +2957,11 @@ impl WalWriter {
         &self,
         seal_key: &SealKey,
         batch_id: [u8; 16],
-        audit_payload: &[u8],
         data_payload: &[u8],
     ) -> Result<WalLsn, ScribeError> {
-        let mut prepared = PreparedWalAppend::new(
-            WalLsn::ZERO,
-            batch_id,
-            Bytes::copy_from_slice(audit_payload),
-            Bytes::copy_from_slice(data_payload),
-        )
-        .for_slice(seal_key.clone(), [0; 32]);
+        let mut prepared =
+            PreparedWalAppend::new(WalLsn::ZERO, batch_id, Bytes::copy_from_slice(data_payload))
+                .for_slice(seal_key.clone(), [0; 32]);
         // Route using the batch_id to match the production dispatch path.
         prepared.shard_id = Some(
             u8::try_from(crate::scribe::routing::shard_for(
@@ -3965,9 +3903,9 @@ pub struct ScribeAppendMeta {
     pub batch_id: [u8; 16],
     /// Stable Arrow schema identity for logical retry comparison.
     pub schema_fingerprint: [u8; 32],
-    /// SHA-256 digest of canonical Arrow data, excluding volatile audit bytes.
+    /// SHA-256 digest of canonical Arrow data, excluding managed correlation columns.
     pub data_digest: [u8; 32],
-    /// Canonical Arrow data length, excluding volatile audit bytes.
+    /// Canonical Arrow data length, excluding managed correlation columns.
     pub data_len: u32,
     /// SHA-256 digest of the exact WAL-v6 slice payload.
     pub payload_digest: [u8; 32],
@@ -4053,7 +3991,6 @@ mod tests {
             .append_and_commit_for_replay_test(
                 &test_seal_key(crate::test_support::tenant()),
                 [7; 16],
-                b"audit",
                 b"payload",
             )
             .expect("complete replay batch");
@@ -4119,26 +4056,6 @@ mod tests {
                 .scribe_memory_used_bytes,
             baseline.scribe_memory_used_bytes
         );
-    }
-
-    /// Encodes one valid audit envelope for replay identity reconstruction.
-    fn replay_audit() -> Vec<u8> {
-        crate::scribe::audit_envelope::encode_audit_event(&AuditEvent {
-            request_id: RequestId::now_v7(),
-            trace_id: None,
-            operation: "scribe.replay".to_owned(),
-            resource: "vala.bifrost.replay".to_owned(),
-            card_ref: None,
-            principal_id: PrincipalId::new(uuid::Uuid::now_v7()),
-            principal_kind: PrincipalKindTag::User,
-            auth_method: AuthMethod::Jwt,
-            permission: "bifrost:write".to_owned(),
-            decision: AuditDecision::Allow,
-            result: AuditResult::Success,
-            payload_summary: "1 row".to_owned(),
-            detail: None,
-        })
-        .expect("audit envelope")
     }
 
     #[test]
@@ -4406,8 +4323,8 @@ mod tests {
     #[test]
     fn slice_payload_decoder_rejects_trailing_bytes() {
         let seal_key = test_seal_key(crate::test_support::tenant());
-        let mut payload = encode_slice_payload(&seal_key, [7_u8; 32], b"audit", b"data")
-            .expect("encode slice payload");
+        let mut payload =
+            encode_slice_payload(&seal_key, [7_u8; 32], b"data").expect("encode slice payload");
         payload.push(0xff);
 
         let error = decode_slice_payload(&payload).expect_err("trailing bytes must fail closed");
@@ -4422,7 +4339,6 @@ mod tests {
             "vala.bifrost.invalid/table",
             crate::test_support::day_partition(2026, 1, 1),
             &[0_u8; 32],
-            b"audit",
             b"data",
         )
         .expect("encode malformed identity fixture");
@@ -4445,7 +4361,7 @@ mod tests {
 
         let batch_id = [1u8; 16];
         let lsn = writer
-            .append_and_fsync_for_test(&test_seal_key(tenant_id), batch_id, b"audit", b"data")
+            .append_and_fsync_for_test(&test_seal_key(tenant_id), batch_id, b"data")
             .expect("append");
 
         assert_eq!(lsn, WalLsn::new(0));
@@ -4456,7 +4372,6 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert!(records[0].is_slice());
         let decoded = decode_slice_payload(&records[0].payload).expect("slice");
-        assert_eq!(decoded.audit, b"audit");
         assert_eq!(decoded.data, b"data");
     }
 
@@ -4477,7 +4392,6 @@ mod tests {
                 .append_and_fsync_for_test(
                     &test_seal_key(crate::test_support::tenant()),
                     [3; 16],
-                    b"audit",
                     b"data",
                 )
                 .expect("durable append");
@@ -4526,7 +4440,7 @@ mod tests {
             table,
             crate::test_support::day_partition(2026, 1, 2),
         );
-        let frame = encode_append_frame([1u8; 16], b"audit", b"data").expect("frame");
+        let frame = encode_append_frame([1u8; 16], b"data").expect("frame");
 
         let first_lsn = writer
             .append_frame_for_test(&frame, &first)
@@ -4606,7 +4520,7 @@ mod tests {
         let first_lsn = {
             let writer = WalWriter::new(temp_dir.path(), node_id, 1, config).expect("writer");
             writer
-                .append_and_fsync_for_test(&key, [1_u8; 16], b"audit", &data)
+                .append_and_fsync_for_test(&key, [1_u8; 16], &data)
                 .expect("first append")
         };
 
@@ -4616,7 +4530,7 @@ mod tests {
         // first segment fills.  The WAL itself does not deduplicate; only replay
         // does.
         let second_lsn = writer
-            .append_and_fsync_for_test(&key, [1_u8; 16], b"audit", &data)
+            .append_and_fsync_for_test(&key, [1_u8; 16], &data)
             .expect("second append");
 
         assert_eq!(first_lsn, WalLsn::new(0));
@@ -4652,7 +4566,6 @@ mod tests {
                 .append_and_fsync_for_test(
                     &test_seal_key(crate::test_support::tenant()),
                     batch_id,
-                    b"audit",
                     &[index; 120],
                 )
                 .expect("append");
@@ -4675,7 +4588,7 @@ mod tests {
             WalWriter::new(temp_dir.path(), [12_u8; 16], 1, WalConfig::default()).expect("writer");
         let seal_key = test_seal_key(crate::test_support::tenant());
         writer
-            .append_and_fsync_for_test(&seal_key, [1_u8; 16], b"audit", b"data")
+            .append_and_fsync_for_test(&seal_key, [1_u8; 16], b"data")
             .expect("append");
 
         let reader = WalReader::open_directory_unfiltered(temp_dir.path()).expect("reader");
@@ -4694,7 +4607,7 @@ mod tests {
         assert!(current.path.exists(), "grace retirement owns deletion");
 
         writer
-            .append_and_fsync_for_test(&seal_key, [2_u8; 16], b"audit", b"data")
+            .append_and_fsync_for_test(&seal_key, [2_u8; 16], b"data")
             .expect("append after close");
         let reopened = WalReader::open_directory_unfiltered(temp_dir.path()).expect("reader");
         assert_eq!(reopened.read_all_records().expect("records").len(), 2);
@@ -4735,7 +4648,6 @@ mod tests {
             .append_and_fsync_for_test(
                 &test_seal_key(crate::test_support::tenant()),
                 [1u8; 16],
-                b"audit",
                 b"data",
             )
             .expect_err("disk hard limit");
@@ -4764,7 +4676,6 @@ mod tests {
                 .append_and_fsync_for_test(
                     &test_seal_key(crate::test_support::tenant()),
                     batch_id,
-                    b"audit",
                     &[index; 120],
                 )
                 .expect("append");
@@ -4837,7 +4748,7 @@ mod tests {
         let (first_batch, second_batch, shard) = co_sharded_batch_pair(&seal_key, 1);
         for batch_id in [first_batch, second_batch] {
             writer
-                .append_and_commit_for_replay_test(&seal_key, batch_id, b"audit", b"payload")
+                .append_and_commit_for_replay_test(&seal_key, batch_id, b"payload")
                 .expect("append replay group");
         }
         let reader = WalReader::open_directory_unfiltered(temp_dir.path()).expect("reader");
@@ -4932,10 +4843,9 @@ mod tests {
         )
         .expect("first writer");
         let (first_batch, second_batch, _shard) = co_sharded_batch_pair(&seal_key, 3);
-        let audit = replay_audit();
         for batch_id in [first_batch, second_batch] {
             writer
-                .append_and_commit_for_replay_test(&seal_key, batch_id, &audit, b"payload")
+                .append_and_commit_for_replay_test(&seal_key, batch_id, b"payload")
                 .expect("append replay group");
         }
         let reader = WalReader::open_directory_unfiltered(temp_dir.path()).expect("reader");
@@ -5050,10 +4960,10 @@ mod tests {
         // not deduplicate; both records are stored.
         let batch_id = [1u8; 16];
         writer
-            .append_and_fsync_for_test(&test_seal_key(tenant_id), batch_id, b"audit1", b"data1")
+            .append_and_fsync_for_test(&test_seal_key(tenant_id), batch_id, b"data1")
             .expect("append 1");
         writer
-            .append_and_fsync_for_test(&test_seal_key(tenant_id), batch_id, b"audit2", b"data2")
+            .append_and_fsync_for_test(&test_seal_key(tenant_id), batch_id, b"data2")
             .expect("append 2");
 
         // Manually create a .tmp file to simulate crash during segment creation
@@ -5094,7 +5004,6 @@ mod tests {
             .append_and_fsync_for_test(
                 &test_seal_key(crate::test_support::tenant()),
                 [1u8; 16],
-                b"audit",
                 b"data",
             )
             .expect("expected append");
@@ -5119,7 +5028,7 @@ mod tests {
         assert_eq!(
             reader.read_all_records().expect("filtered records").len(),
             1,
-            "the expected stream's audit and data records remain readable"
+            "the expected stream's data records remain readable"
         );
 
         let unfiltered =
@@ -5224,7 +5133,7 @@ mod tests {
         let writer =
             WalWriter::new(temp_dir.path(), [21; 16], 1, WalConfig::default()).expect("writer");
         writer
-            .append_and_fsync_for_test(&key, [2; 16], b"audit", b"data")
+            .append_and_fsync_for_test(&key, [2; 16], b"data")
             .expect("append");
         let actual = directory_bytes(temp_dir.path());
         assert_eq!(writer.bytes_on_disk(), actual);
@@ -5269,7 +5178,7 @@ mod tests {
         WAL_WALK_COUNT.with(|count| count.set(0));
         WAL_COUNT_ACTIVE.store(true, Ordering::Relaxed);
         writer
-            .append_and_fsync_for_test(&key, [2; 16], b"audit", b"data")
+            .append_and_fsync_for_test(&key, [2; 16], b"data")
             .expect("append");
         assert_eq!(WAL_ENCODE_COUNT.with(std::cell::Cell::get), 0);
         assert_eq!(WAL_WALK_COUNT.with(std::cell::Cell::get), 0);
@@ -5287,7 +5196,7 @@ mod tests {
             WalWriter::new(temp_dir.path(), [23; 16], 1, WalConfig::default()).expect("writer");
         let key = test_seal_key(crate::test_support::tenant());
         writer
-            .append_and_fsync_for_test(&key, [3; 16], b"audit", b"data")
+            .append_and_fsync_for_test(&key, [3; 16], b"data")
             .expect("append");
         let measured = directory_bytes(temp_dir.path());
         writer.disk.accounted_bytes.store(0, Ordering::Release);
@@ -5310,7 +5219,7 @@ mod tests {
             .collect::<Vec<_>>();
         writer.disk.force_sample(None);
         let error = writer
-            .append_and_fsync_for_test(&key, [4; 16], b"audit", b"data")
+            .append_and_fsync_for_test(&key, [4; 16], b"data")
             .expect_err("forced zero sample must reject");
         assert!(matches!(error, ScribeError::WalDiskFull));
         assert_eq!(writer.bytes_on_disk(), before);
@@ -5330,7 +5239,7 @@ mod tests {
         writer.disk.force_sample(Some((u64::MAX, u64::MAX)));
         assert!(!writer.disk_pressure().hard);
         writer
-            .append_and_fsync_for_test(&key, [5; 16], b"audit", b"data")
+            .append_and_fsync_for_test(&key, [5; 16], b"data")
             .expect("successful sample recovers");
     }
 
@@ -5344,12 +5253,12 @@ mod tests {
         let key = test_seal_key(crate::test_support::tenant());
         WAL_PARTIAL_WRITE.with(|flag| flag.set(true));
         let error = writer
-            .append_and_fsync_for_test(&key, [6; 16], b"audit", b"data")
+            .append_and_fsync_for_test(&key, [6; 16], b"data")
             .expect_err("partial write must fail");
         assert!(matches!(error, ScribeError::Internal { .. }));
         assert!(writer.bytes_on_disk() >= directory_bytes(temp_dir.path()));
         writer
-            .append_and_fsync_for_test(&key, [7; 16], b"audit", b"data")
+            .append_and_fsync_for_test(&key, [7; 16], b"data")
             .expect("state lock and later append remain usable");
     }
 
@@ -5365,7 +5274,7 @@ mod tests {
             let key = test_seal_key(crate::test_support::tenant());
             WAL_PARTIAL_WRITE.with(|flag| flag.set(true));
             let append_error = writer
-                .append_and_fsync_for_test(&key, [1; 16], b"audit", b"data")
+                .append_and_fsync_for_test(&key, [1; 16], b"data")
                 .expect_err("injected append failure");
             assert!(matches!(append_error, ScribeError::Internal { .. }));
             let after_append_failure = recorder.snapshot();
@@ -5377,7 +5286,7 @@ mod tests {
             );
             writer.trip_sync_failure_for_test();
             let sync_error = writer
-                .append_and_fsync_for_test(&key, [2; 16], b"audit", b"data")
+                .append_and_fsync_for_test(&key, [2; 16], b"data")
                 .expect_err("injected sync failure");
             assert!(matches!(sync_error, ScribeError::Internal { .. }));
         });
@@ -5433,7 +5342,7 @@ mod tests {
         .expect("volume-backed writer");
         let key = test_seal_key(crate::test_support::tenant());
         writer
-            .append_and_fsync_for_test(&key, [1; 16], b"audit", b"data")
+            .append_and_fsync_for_test(&key, [1; 16], b"data")
             .expect("durable append");
         let durable = directory_bytes(directory.path());
         assert_eq!(
@@ -5445,7 +5354,7 @@ mod tests {
 
         WAL_PARTIAL_WRITE.with(|flag| flag.set(true));
         writer
-            .append_and_fsync_for_test(&key, [1; 16], b"audit", b"data")
+            .append_and_fsync_for_test(&key, [1; 16], b"data")
             .expect_err("write failure rolls provisional growth back");
         assert_eq!(directory_bytes(directory.path()), durable);
         assert_eq!(
@@ -5457,7 +5366,7 @@ mod tests {
 
         writer.trip_sync_failure_for_test();
         writer
-            .append_and_fsync_for_test(&key, [1; 16], b"audit", b"data")
+            .append_and_fsync_for_test(&key, [1; 16], b"data")
             .expect_err("sync failure remains provisional");
         let after_failed_sync = directory_bytes(directory.path());
         assert_eq!(
@@ -5467,7 +5376,7 @@ mod tests {
             (durable, after_failed_sync - durable, 0)
         );
         writer
-            .append_and_fsync_for_test(&key, [1; 16], b"audit", b"data")
+            .append_and_fsync_for_test(&key, [1; 16], b"data")
             .expect("later fsync commits all pending growth");
         let committed = directory_bytes(directory.path());
         assert_eq!(
@@ -5543,7 +5452,6 @@ mod tests {
                 .append_and_fsync_for_test(
                     &test_seal_key(crate::test_support::tenant()),
                     [1; 16],
-                    b"audit",
                     b"data",
                 )
                 .expect_err("injected ownership transfer failure");
@@ -5572,7 +5480,6 @@ mod tests {
             .append_and_fsync_for_test(
                 &test_seal_key(crate::test_support::tenant()),
                 [1; 16],
-                b"audit",
                 b"data",
             )
             .expect("durable fixture");

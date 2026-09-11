@@ -111,7 +111,6 @@ mise run fmt
 mise run lints
 mise run codegen:check
 mise run test:sql
-mise run verify:bifrost
 ```
 
 Completion evidence records the existing audit, SQL, projection, publication,

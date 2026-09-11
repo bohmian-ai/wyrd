@@ -1,11 +1,11 @@
 //! Tenant-scoped durable Scribe batch-commit control state.
 //!
-//! The owner records the fsynced v4 WAL identity and appends the canonical
-//! ingest audit event in the same caller-owned [`TenantConn`] transaction.
+//! The owner records the fsynced v4 WAL identity in the caller-owned
+//! [`TenantConn`] transaction. A batch commit evaluates no principal
+//! permission, so it is lineage only and appends no audit event.
 // raw-query grep allowlist: both statements are fixed and tenant-bound; `vala.scribe_batch_commits` post-dates the sqlx offline cache, so run `mise run sqlx:prepare` to promote them to macros.
 
 use wyrd_spec::DataTenantId;
-use wyrd_spec::vala::api::AuditEvent;
 
 use crate::{SqlError, TenantConn};
 
@@ -22,8 +22,8 @@ pub struct ScribeBatchCommit {
     ///
     /// This is a client-reproducible fact: it binds slice ordinals, the Arrow
     /// schema fingerprint, and the logical row identity, and deliberately not
-    /// the WAL payload bytes, whose audit envelope carries a fresh request
-    /// identity on every attempt. An honest retry of the same batch therefore
+    /// the WAL payload bytes, which carry a fresh request identity on every
+    /// attempt. An honest retry of the same batch therefore
     /// produces this same digest, which is what makes idempotent acknowledgement
     /// distinguishable from a genuine identity contradiction.
     pub slice_set_digest: [u8; 32],
@@ -236,37 +236,27 @@ pub async fn resolve(
     }
 }
 
-/// Records a Scribe commit and its audit event, or classifies the conflict.
+/// Records a Scribe commit, or classifies the conflict.
 ///
 /// The caller commits the supplied tenant transaction. A first observation
-/// inserts the fence, appends the audit event, and reports
-/// [`ScribeBatchCommitResolution::Committed`]. A primary-key conflict never
-/// emits a second audit event and is classified by logical identity: the same
-/// attempt is `Committed`, the same rows from a different attempt are
+/// inserts the fence and reports [`ScribeBatchCommitResolution::Committed`].
+/// A primary-key conflict is classified by logical identity: the same attempt
+/// is `Committed`, the same rows from a different attempt are
 /// [`ScribeBatchCommitResolution::AlreadyCommitted`] and the caller must not
 /// make them visible again, and different rows under the same batch identity
 /// are a contradiction. `Absent` is never returned.
 ///
 /// # Errors
 ///
-/// Returns [`SqlError`] when the tenant does not match `conn`, the insert or
-/// audit write fails, the audit request identity differs from the durable
-/// fence, or an existing commit holds different rows under the same identity.
+/// Returns [`SqlError`] when the tenant does not match `conn`, the insert
+/// fails, or an existing commit holds different rows under the same identity.
 pub async fn record(
     conn: &mut TenantConn<'_>,
     commit: &ScribeBatchCommit,
-    audit_event: &AuditEvent,
 ) -> Result<ScribeBatchCommitResolution, SqlError> {
     if conn.data_tenant_id() != commit.tenant {
         return Err(invariant(
             "scribe batch commit tenant does not match TenantConn",
-        ));
-    }
-    let audit_request_id = uuid::Uuid::parse_str(audit_event.request_id.as_str())
-        .map_err(|_| invariant("scribe ingest audit request identity is not a UUID"))?;
-    if audit_request_id != commit.request_id {
-        return Err(invariant(
-            "scribe ingest audit request identity does not match its control fence",
         ));
     }
     let inserted: Option<bool> = sqlx::query_scalar(
@@ -293,7 +283,6 @@ pub async fn record(
     .await
     .map_err(SqlError::from)?;
     if inserted.is_some() {
-        super::audit_outbox::append_audit(conn, audit_event).await?;
         return Ok(ScribeBatchCommitResolution::Committed);
     }
 

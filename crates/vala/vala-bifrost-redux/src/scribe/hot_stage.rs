@@ -38,7 +38,6 @@ use sha2::{Digest as _, Sha256};
 use tokio::io::AsyncReadExt as _;
 use uuid::Uuid;
 use wyrd_spec::ids::DataTenantId;
-use wyrd_spec::vala::api::AuditEvent;
 use wyrd_spec::vala::api::TimePartitionWire;
 
 use crate::catalog::TableRef;
@@ -325,15 +324,6 @@ pub struct StagedHotSourceRecordV1 {
     ready_at: DateTime<Utc>,
     /// Current lifecycle position.
     state: StagedMemberState,
-    /// Seal audit event the member's publication event is derived from.
-    ///
-    /// The member outlives the memtable that carried its audit envelope, and a
-    /// claim publishes rows from several members in one fenced transaction, so
-    /// the one event that transaction records has to survive here. A member
-    /// sealed without an audit envelope carries `None` and contributes no
-    /// publication event, exactly as an empty envelope does today.
-    #[serde(default)]
-    publication_audit: Option<AuditEvent>,
 }
 
 impl StagedHotSourceRecordV1 {
@@ -348,7 +338,6 @@ impl StagedHotSourceRecordV1 {
         wal_range: StagedLsnRange,
         runs: Vec<StagedRunFile>,
         ready_at: DateTime<Utc>,
-        publication_audit: Option<AuditEvent>,
     ) -> Self {
         Self {
             version: STAGED_RECORD_VERSION,
@@ -365,7 +354,6 @@ impl StagedHotSourceRecordV1 {
             runs,
             ready_at,
             state: StagedMemberState::Ready,
-            publication_audit,
         }
     }
 
@@ -391,12 +379,6 @@ impl StagedHotSourceRecordV1 {
     #[must_use]
     pub fn runs(&self) -> &[StagedRunFile] {
         &self.runs
-    }
-
-    /// Returns the seal audit event a claim's publication event derives from.
-    #[must_use]
-    pub const fn publication_audit(&self) -> Option<&AuditEvent> {
-        self.publication_audit.as_ref()
     }
 
     /// Returns the summed encoded bytes across every run.

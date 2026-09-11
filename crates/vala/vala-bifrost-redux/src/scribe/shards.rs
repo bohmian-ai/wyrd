@@ -129,12 +129,10 @@ fn retain_replayed_batches(
     suppressed: &HashSet<[u8; 16]>,
 ) {
     let metas = std::mem::take(&mut replayed.append_metas);
-    let audits = std::mem::take(&mut replayed.audit_events);
     let data = std::mem::take(&mut replayed.data_records);
-    for ((meta, audit), payload) in metas.into_iter().zip(audits).zip(data) {
+    for (meta, payload) in metas.into_iter().zip(data) {
         if !suppressed.contains(&meta.batch_id) {
             replayed.append_metas.push(meta);
-            replayed.audit_events.push(audit);
             replayed.data_records.push(payload);
         }
     }
@@ -1894,7 +1892,7 @@ impl ShardOwner {
     /// Resolves one replay commit against the tenant-scoped durable batch fence.
     ///
     /// The canonical WAL location restores. A later exact logical retry is
-    /// suppressed before Arrow reconstruction, publication, or audit. Without
+    /// suppressed before Arrow reconstruction or publication. Without
     /// configured Postgres (isolated unit mode), replay uses its in-memory WAL
     /// identity checks only.
     ///
@@ -2456,7 +2454,7 @@ impl ShardOwner {
     ///
     /// A generation is eligible the moment its state is
     /// `ImmutableState::Committed`, which is only reached after the fenced
-    /// `vala.file_list` + audit transaction commits. Retirement ordering is
+    /// `vala.file_list` transaction commits. Retirement ordering is
     /// preserved: `admission.release_immutable` and `memory_ownership.release_immutable`
     /// are called before `ScribeWalIoOp::RetireWal` is submitted, so WAL
     /// segment refcounts are released last.
@@ -2987,8 +2985,8 @@ impl ShardOwner {
 struct DurableSlice {
     /// Seal bucket receiving the rows.
     seal_key: crate::scribe::seal_key::SealKey,
-    /// Audit event paired with the data rows.
-    audit_event: wyrd_spec::vala::api::AuditEvent,
+    /// Request correlation the terminal COMMIT record and SQL fence persist.
+    request_id: uuid::Uuid,
     /// Arrow rows awaiting memtable insertion.
     rows: Option<arrow::record_batch::RecordBatch>,
     /// Active-memory bytes reserved for this slice.
@@ -3060,7 +3058,7 @@ struct BatchCommitIdentity {
     ///
     /// This is a client-visible idempotency fact: it must be reproducible by an
     /// honest retry of the same batch, so it binds only the rows and their
-    /// schema and never the per-attempt audit envelope or WAL coordinates.
+    /// schema and never the per-attempt managed columns or WAL coordinates.
     logical_digest: [u8; 32],
 }
 
@@ -3647,6 +3645,7 @@ impl ShardOwner {
                         crate::scribe::wal::WalCommitIdentity {
                             wal_digest,
                             logical_digest,
+                            request_id: *state.durable[first_index].request_id.as_bytes(),
                         },
                     ),
                 })
@@ -3671,12 +3670,6 @@ impl ShardOwner {
             }
             self.sync_group(&state.touched).await?;
             if let Some(postgres) = &self.control_postgres {
-                let request_id = uuid::Uuid::parse_str(
-                    state.durable[first_index].audit_event.request_id.as_str(),
-                )
-                .map_err(|error| ScribeError::Internal {
-                    detail: format!("Scribe audit request id is not a UUID: {error}"),
-                })?;
                 let commit = vala_sql::queries::scribe_batch_commits::ScribeBatchCommit {
                     tenant: append.tenant,
                     logical_table_fqn: append.table.fqn(),
@@ -3703,16 +3696,9 @@ impl ShardOwner {
                             detail: "WAL commit LSN exceeds SQL bigint range".to_owned(),
                         }
                     })?,
-                    request_id,
+                    request_id: state.durable[first_index].request_id,
                 };
-                if self
-                    .commit_batch_control_fence(
-                        postgres,
-                        &commit,
-                        &state.durable[first_index].audit_event,
-                    )
-                    .await?
-                {
+                if self.commit_batch_control_fence(postgres, &commit).await? {
                     tracing::info!(
                         tenant = %append.tenant,
                         table = %append.table.fqn(),
@@ -3730,8 +3716,7 @@ impl ShardOwner {
     ///
     /// A `PostgreSQL` COMMIT error is always ambiguous. The method opens a fresh
     /// tenant transaction and compares every durable identity field. An exact
-    /// row completes once; an absent row retries the identical insert and audit
-    /// transaction. An unavailable or contradictory lookup poisons the shared
+    /// row completes once; an absent row retries the identical insert. An unavailable or contradictory lookup poisons the shared
     /// governor so [`Self::process_group`] retains the complete admitted owner
     /// without ACK or cleanup.
     ///
@@ -3744,13 +3729,11 @@ impl ShardOwner {
         &self,
         postgres: &vala_sql::ValaPostgres,
         commit: &vala_sql::queries::scribe_batch_commits::ScribeBatchCommit,
-        audit_event: &wyrd_spec::vala::api::AuditEvent,
     ) -> Result<bool, ScribeError> {
         loop {
             let mut conn = postgres.tenant_conn(commit.tenant).await?;
             let recorded =
-                vala_sql::queries::scribe_batch_commits::record(&mut conn, commit, audit_event)
-                    .await?;
+                vala_sql::queries::scribe_batch_commits::record(&mut conn, commit).await?;
             if conn.commit().await.is_ok() {
                 return Ok(matches!(
                     recorded,
@@ -3834,7 +3817,6 @@ impl ShardOwner {
                         *entry = entry.saturating_add(rows);
                         let materialized_bytes = slice
                             .memtable_bytes
-                            .saturating_add(slice.wal_append.audit.len())
                             .saturating_add(slice.wal_append.data.len());
                         append
                             .lifecycle
@@ -3947,7 +3929,7 @@ impl ShardOwner {
         let retain_rows = true;
         let PreparedSlice {
             seal_key,
-            audit_event,
+            request_id,
             rows,
             wal_append,
             memtable_bytes,
@@ -3958,9 +3940,7 @@ impl ShardOwner {
         let schema_fingerprint = wal_append.schema_fingerprint;
         let data_digest = wal_append.logical_data_digest;
         let data_len = wal_append.logical_data_len;
-        let materialized_bytes = memtable_bytes
-            .saturating_add(wal_append.audit.len())
-            .saturating_add(wal_append.data.len());
+        let materialized_bytes = memtable_bytes.saturating_add(wal_append.data.len());
         if retain_rows {
             self.reserve_slice_active(append, &seal_key, memtable_bytes)?;
         }
@@ -4014,7 +3994,7 @@ impl ShardOwner {
         Ok((
             DurableSlice {
                 seal_key,
-                audit_event,
+                request_id,
                 rows: retain_rows.then_some(rows),
                 memtable_bytes,
                 active_reserved: retain_rows,
@@ -4050,15 +4030,13 @@ impl ShardOwner {
         let retain_rows = true;
         let PreparedSlice {
             seal_key,
-            audit_event,
+            request_id,
             rows,
             wal_append,
             memtable_bytes,
             ..
         } = slice;
-        let materialized_bytes = memtable_bytes
-            .saturating_add(wal_append.audit.len())
-            .saturating_add(wal_append.data.len());
+        let materialized_bytes = memtable_bytes.saturating_add(wal_append.data.len());
         if retain_rows {
             self.reserve_slice_active(append, &seal_key, memtable_bytes)?;
         }
@@ -4072,7 +4050,7 @@ impl ShardOwner {
         Ok((
             DurableSlice {
                 seal_key,
-                audit_event,
+                request_id,
                 rows: retain_rows.then_some(rows),
                 memtable_bytes,
                 active_reserved: retain_rows,
@@ -4208,7 +4186,6 @@ impl ShardOwner {
         self.memtable
             .insert(
                 &slice.seal_key,
-                slice.audit_event,
                 crate::scribe::wal::ScribeAppendMeta {
                     batch_id: slice.batch_id,
                     schema_fingerprint: slice.schema_fingerprint,

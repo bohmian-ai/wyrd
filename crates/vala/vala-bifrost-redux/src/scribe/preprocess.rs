@@ -10,7 +10,6 @@ use tokio::sync::oneshot;
 use uuid::Uuid;
 use wyrd_runtime::Principal;
 use wyrd_spec::request_id::RequestId;
-use wyrd_spec::vala::api::AuditEvent;
 use wyrd_spec::vala::managed_columns::{WYRD_EVENT_TIME, WYRD_INGESTED_AT, WYRD_REQUEST_ID};
 
 use crate::catalog::TableRef;
@@ -22,7 +21,6 @@ use crate::schema::SchemaFingerprint;
 use crate::scribe::admission::EventTimeWindow;
 use crate::scribe::admission::InflightFrameReservation;
 use crate::scribe::admission::REQUEST_OVERHEAD_BYTES;
-use crate::scribe::audit_envelope::encode_audit_event_bounded;
 use crate::scribe::memory::MemoryCategory;
 use crate::scribe::seal_key::{
     SealKey, TimePartitionPlan, plan_time_partitions, split_batch_by_time_partition,
@@ -34,12 +32,11 @@ use wyrd_spec::ids::DataTenantId;
 #[derive(Debug)]
 pub(crate) struct AdmittedAppend {
     pub batch_id: Uuid,
-    pub audit_event: AuditEvent,
+    /// Request correlation retained for the durable batch-commit fence.
+    pub request_id: Uuid,
     pub rows: AdmittedRows,
     pub measured_wire_bytes: usize,
     pub admitted_bytes: usize,
-    /// Admitted exact-capacity ceiling for one current audit JSON payload.
-    pub wal_workspace_bytes: usize,
     /// Maximum root envelope that must later replay this accepted unit.
     pub maximum_scribe_envelope_bytes: usize,
     pub reservation: InflightFrameReservation,
@@ -143,22 +140,20 @@ pub(crate) struct NativeSliceProducer {
     source_index: usize,
     /// Current decoded source retained only across its partition slices.
     current: Option<NativeCurrentSource>,
+    /// Request correlation stamped on every produced slice.
+    request_id: Uuid,
     /// Zero-based ordinal assigned to the next slice.
     slice_index: u32,
     /// Request-wide physical row ordinal assigned to the next decoded row.
     next_row_ordinal: i32,
     /// Exact count established by the non-retaining first pass.
     slice_count: u32,
-    /// Canonical batch audit cloned only into the current durable slice.
-    audit_event: AuditEvent,
     /// Authenticated tenant used by every produced seal key.
     tenant: DataTenantId,
     /// Logical table used by every produced seal key.
     table: TableRef,
     /// Registered partition granularity used to bucket every produced slice.
     partition_granularity: TimeGranularity,
-    /// Exact-capacity audit JSON ceiling retained from the root plan.
-    wal_workspace_bytes: usize,
 }
 
 /// One decoded native source and its fixed time-partition cursor.
@@ -181,11 +176,10 @@ impl NativeSliceProducer {
     /// slice-count arithmetic fails during the first pass.
     fn new(
         source: NativeAdmittedRows,
-        audit_event: AuditEvent,
+        request_id: Uuid,
         tenant: DataTenantId,
         table: TableRef,
         partition_granularity: TimeGranularity,
-        wal_workspace_bytes: usize,
     ) -> Result<Self, ScribeError> {
         let mut decoder = arrow::ipc::reader::StreamDecoder::new().with_require_alignment(true);
         feed_native_schema(&mut decoder, &source)?;
@@ -194,14 +188,13 @@ impl NativeSliceProducer {
             decoder,
             source_index: 0,
             current: None,
+            request_id,
             slice_index: 0,
             next_row_ordinal: 0,
             slice_count: 0,
-            audit_event,
             tenant,
             table,
             partition_granularity,
-            wal_workspace_bytes,
         })
     }
 
@@ -222,10 +215,9 @@ impl NativeSliceProducer {
                     let mut slice = prepare_slice(
                         SliceContext {
                             batch_id: self.source.batch_id,
-                            audit_event: &self.audit_event,
+                            request_id: self.request_id,
                             tenant: self.tenant,
                             table: &self.table,
-                            wal_workspace_bytes: self.wal_workspace_bytes,
                         },
                         partition,
                         rows,
@@ -404,7 +396,8 @@ fn stamp_native_source(
 pub(crate) struct PreparedSlice {
     pub id: AppendSliceId,
     pub seal_key: SealKey,
-    pub audit_event: AuditEvent,
+    /// Request correlation the terminal COMMIT record persists.
+    pub request_id: Uuid,
     pub rows: RecordBatch,
     pub wal_append: PreparedWalAppend,
     pub memtable_bytes: usize,
@@ -546,16 +539,14 @@ pub struct AppendSliceId {
 struct PreparedRowsContext {
     /// Stable logical batch identity.
     batch_id: Uuid,
-    /// Canonical audit envelope retained by each produced slice.
-    audit_event: AuditEvent,
+    /// Request correlation stamped on every produced slice.
+    request_id: Uuid,
     /// Authenticated tenant used by every seal key.
     tenant: DataTenantId,
     /// Logical table used by every seal key.
     table: TableRef,
     /// Registered partition granularity used to bucket every slice.
     partition_granularity: TimeGranularity,
-    /// Exact-capacity audit JSON ceiling.
-    wal_workspace_bytes: usize,
     /// Root bytes retained while the prepared source is live.
     memory_bytes: usize,
 }
@@ -567,7 +558,7 @@ struct PreparedRowsContext {
 ///
 /// # Errors
 ///
-/// Returns a stable day-planning, native decode, IPC, audit, or checked-size
+/// Returns a stable day-planning, native decode, IPC, or checked-size
 /// refusal while the caller still owns the root lease.
 fn prepare_rows(
     rows: AdmittedRows,
@@ -575,11 +566,10 @@ fn prepare_rows(
 ) -> Result<(PreparedSliceSet, usize), ScribeError> {
     let PreparedRowsContext {
         batch_id,
-        audit_event,
+        request_id,
         tenant,
         table,
         partition_granularity,
-        wal_workspace_bytes,
         memory_bytes,
     } = context;
     match rows {
@@ -589,10 +579,9 @@ fn prepare_rows(
                 &mut slices,
                 SliceContext {
                     batch_id,
-                    audit_event: &audit_event,
+                    request_id,
                     tenant,
                     table: &table,
-                    wal_workspace_bytes,
                 },
                 partition_granularity,
                 &rows,
@@ -616,11 +605,10 @@ fn prepare_rows(
         AdmittedRows::Native(native) => {
             let mut producer = NativeSliceProducer::new(
                 *native,
-                audit_event,
+                request_id,
                 tenant,
                 table,
                 partition_granularity,
-                wal_workspace_bytes,
             )?;
             let mut slices = Vec::new();
             while let Some(slice) = producer.next_slice()? {
@@ -661,11 +649,10 @@ fn assign_slice_ordinals(slices: &mut [PreparedSlice]) -> Result<(), ScribeError
 pub(crate) fn prepare_append(admitted: AdmittedAppend) -> Result<PreparedAppend, ScribeError> {
     let AdmittedAppend {
         batch_id,
-        audit_event,
+        request_id,
         rows,
         measured_wire_bytes: _measured_wire_bytes,
         admitted_bytes: _admitted_bytes,
-        wal_workspace_bytes,
         maximum_scribe_envelope_bytes,
         reservation,
         mut memory,
@@ -684,11 +671,10 @@ pub(crate) fn prepare_append(admitted: AdmittedAppend) -> Result<PreparedAppend,
         rows,
         PreparedRowsContext {
             batch_id,
-            audit_event,
+            request_id,
             tenant,
             table: table.clone(),
             partition_granularity,
-            wal_workspace_bytes,
             memory_bytes: memory.bytes(),
         },
     );
@@ -704,7 +690,6 @@ pub(crate) fn prepare_append(admitted: AdmittedAppend) -> Result<PreparedAppend,
     for slice in materialized {
         let bytes = slice
             .memtable_bytes
-            .saturating_add(slice.wal_append.audit.len())
             .saturating_add(slice.wal_append.data.len());
         lifecycle.materialized(bytes);
     }
@@ -810,7 +795,6 @@ fn prepared_slice_bytes(slices: &[PreparedSlice], limit: usize) -> Result<usize,
         |total, slice| -> Result<usize, ScribeError> {
             total
                 .checked_add(slice.memtable_bytes)
-                .and_then(|value| value.checked_add(slice.wal_append.audit.len()))
                 .and_then(|value| value.checked_add(slice.wal_append.data.len()))
                 .ok_or(ScribeError::DecodedPayloadTooLarge {
                     bytes: usize::MAX,
@@ -824,8 +808,8 @@ fn prepared_slice_bytes(slices: &[PreparedSlice], limit: usize) -> Result<usize,
 ///
 /// # Errors
 ///
-/// Returns [`ScribeError`] when time-partition validation, audit encoding,
-/// Arrow IPC serialization, or checked slice construction fails. Completed
+/// Returns [`ScribeError`] when time-partition validation, Arrow IPC
+/// serialization, or checked slice construction fails. Completed
 /// earlier slices remain owned by `slices` and are dropped by the caller on
 /// refusal.
 fn append_prepared_slices(
@@ -846,21 +830,19 @@ fn append_prepared_slices(
 struct SliceContext<'a> {
     /// Stable logical batch identity.
     batch_id: Uuid,
-    /// Canonical logical-batch audit envelope.
-    audit_event: &'a AuditEvent,
+    /// Request correlation stamped on the produced slice.
+    request_id: Uuid,
     /// Authenticated tenant used by the seal key.
     tenant: DataTenantId,
     /// Logical table used by the seal key.
     table: &'a TableRef,
-    /// Exact-capacity audit JSON ceiling.
-    wal_workspace_bytes: usize,
 }
 
 /// Builds one fixed-capacity WAL slice from the current materialized day.
 ///
 /// # Errors
 ///
-/// Returns [`ScribeError`] when audit encoding or fixed IPC encoding fails.
+/// Returns [`ScribeError`] when fixed IPC encoding fails.
 fn prepare_slice(
     context: SliceContext<'_>,
     partition: TimePartition,
@@ -868,9 +850,6 @@ fn prepare_slice(
     ipc_plan: Option<crate::scribe::fixed_ipc::FixedIpcPlan>,
 ) -> Result<PreparedSlice, ScribeError> {
     let seal_key = SealKey::new(context.tenant, context.table.clone(), partition);
-    let mut slice_audit = context.audit_event.clone();
-    slice_audit.payload_summary = format!("{} rows", rows.num_rows());
-    let audit_payload = encode_audit_event_bounded(&slice_audit, context.wal_workspace_bytes)?;
     let data_payload = encode_ipc_fixed(&rows, ipc_plan)?;
     let identity_span = tracing::debug_span!(
         "scribe_logical_batch_identity",
@@ -882,7 +861,6 @@ fn prepare_slice(
     let wal_append = PreparedWalAppend::new(
         crate::scribe::wal::WalLsn::ZERO,
         *context.batch_id.as_bytes(),
-        Bytes::from(audit_payload),
         data_payload,
     )
     .for_slice(
@@ -898,7 +876,7 @@ fn prepare_slice(
             slice_index: 0,
         },
         seal_key,
-        audit_event: slice_audit,
+        request_id: context.request_id,
         rows,
         wal_append,
         memtable_bytes,
@@ -962,9 +940,9 @@ fn hex_digest(digest: &[u8; 32]) -> String {
 /// this digest binds only stable logical facts: the slice ordinal, the approved
 /// Arrow schema fingerprint, and the logical data identity from
 /// [`logical_data_identity`], which deliberately omits the per-request managed
-/// columns. It must never bind the WAL slice payload, whose audit envelope
-/// carries a fresh request identity and timestamps on every attempt and would
-/// therefore make an honest client retry look like a contradiction.
+/// columns. It must never bind the WAL slice payload, whose managed columns
+/// carry fresh per-request timestamps on every attempt and would therefore
+/// make an honest client retry look like a contradiction.
 ///
 /// This is not the WAL v6 `wal_digest`. That digest binds exact payload bytes so
 /// a substituted slice cannot be authorized by a valid terminal record. The two

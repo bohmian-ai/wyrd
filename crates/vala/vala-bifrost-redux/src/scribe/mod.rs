@@ -2,7 +2,6 @@
 
 pub mod admission;
 pub mod assembly;
-pub mod audit_envelope;
 pub mod claim_assembly;
 pub mod claim_merge;
 pub mod claim_publication;
@@ -575,8 +574,6 @@ pub struct NativeIngressTestFrame {
     pub request_id: wyrd_spec::request_id::RequestId,
     /// Stable idempotency identifier for this test batch.
     pub batch_id: uuid::Uuid,
-    /// Server-shaped audit event committed with the fixture batch.
-    pub audit_event: wyrd_spec::vala::api::AuditEvent,
     /// Exact native IPC bytes supplied to the private decoder.
     pub payload: bytes::Bytes,
 }
@@ -724,7 +721,6 @@ impl ScribeImpl {
                 expected_schema_fingerprint: Some(frame.expected_schema_fingerprint),
                 request_id: frame.request_id,
                 batch_id: frame.batch_id,
-                audit_event: frame.audit_event,
                 measured_wire_bytes,
                 payload: crate::contracts::IngressPayload::ArrowIpc(frame.payload),
             },

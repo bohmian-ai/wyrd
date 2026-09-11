@@ -371,7 +371,8 @@ pub(crate) async fn retained_rewrite_audit(
             rows.push((
                 seqs.value(row),
                 operations.value(row).to_owned(),
-                (!arrow::array::Array::is_null(details, row)).then(|| details.value(row).to_owned()),
+                (!arrow::array::Array::is_null(details, row))
+                    .then(|| details.value(row).to_owned()),
             ));
         }
     }

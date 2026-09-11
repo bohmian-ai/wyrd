@@ -16,7 +16,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
-use wyrd_spec::vala::api::AuditEvent;
 
 use crate::catalog::layout::PhysicalLayout;
 use crate::contracts::ScribeError;
@@ -45,8 +44,6 @@ pub struct ClaimRuns {
     rows: u64,
     /// Union of the members' WAL ranges, which the objects make retirable.
     wal: StagedLsnRange,
-    /// Seal audit event the claim's publication event derives from.
-    publication_audit: Option<AuditEvent>,
 }
 
 impl ClaimRuns {
@@ -66,12 +63,6 @@ impl ClaimRuns {
     #[must_use]
     pub const fn wal(&self) -> StagedLsnRange {
         self.wal
-    }
-
-    /// Returns the seal audit event the publication event derives from.
-    #[must_use]
-    pub const fn publication_audit(&self) -> Option<&AuditEvent> {
-        self.publication_audit.as_ref()
     }
 }
 
@@ -135,7 +126,6 @@ impl ClaimAssembler {
     pub async fn gather(&self, claim: &StagingClaim) -> Result<ClaimRuns, ScribeError> {
         let mut runs = Vec::new();
         let mut wal: Option<StagedLsnRange> = None;
-        let mut publication_audit = None;
         for member in claim.members() {
             let staged = self
                 .stage
@@ -165,9 +155,6 @@ impl ClaimAssembler {
                     max: span.max.max(member_wal.max),
                 }),
             );
-            if publication_audit.is_none() {
-                publication_audit = staged.record().publication_audit().cloned();
-            }
             runs.extend(staged.run_paths());
         }
         if runs.is_empty() {
@@ -183,7 +170,6 @@ impl ClaimAssembler {
             runs,
             rows: claim.rows(),
             wal,
-            publication_audit,
         })
     }
 

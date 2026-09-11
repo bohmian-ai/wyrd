@@ -12,7 +12,6 @@ use sha2::{Digest, Sha256};
 use tokio::runtime::Handle;
 use tokio::sync::{Notify, mpsc, oneshot};
 use vala_sql::ValaPostgres;
-use wyrd_spec::vala::api::AuditEvent;
 
 use crate::catalog::{TenantTableBinding, TenantTableKey};
 use crate::contracts::ScribeError;
@@ -83,7 +82,7 @@ async fn discard_claim_scratch(scratch: crate::resources::ScribeClaimScratch) {
 /// This extends — never replaces — that histogram with a per-stage split under
 /// `bifrost_scribe_persist_stage_seconds{stage}`, where `stage` is closed to
 /// `{parquet, put, sql_commit}`: the Parquet encode, the object-store put, and
-/// the SQL file-list/audit commit. Each is recorded only after its stage
+/// the SQL file-list commit. Each is recorded only after its stage
 /// completes successfully, so a stage that errors and returns early contributes
 /// no sample. The label carries no tenant, table, or object-path identity.
 fn record_persist_stage(stage: &'static str, started: std::time::Instant) {
@@ -156,7 +155,7 @@ impl PersistenceFaults {
             .store(attempt, Ordering::Release);
     }
 
-    /// Fail the next SQL commit after the file-list/audit transaction is staged.
+    /// Fail the next SQL commit after the file-list transaction is staged.
     pub fn fail_next_sql_commit(&self) {
         self.sql_commit.store(true, Ordering::Release);
     }
@@ -359,8 +358,6 @@ pub struct ImmutableGeneration {
     pub rows: Vec<arrow::record_batch::RecordBatch>,
     /// Arrow schema shared by the original append batches.
     pub schema: SchemaRef,
-    /// Canonical audit events paired with the rows.
-    pub audit_events: Vec<AuditEvent>,
     /// WAL-derived append metadata paired with the batches.
     pub append_metas: Vec<ScribeAppendMeta>,
     /// Number of rows in the generation.
@@ -409,7 +406,6 @@ impl ImmutableGeneration {
             wal,
             rows: frozen.batches.clone(),
             schema: frozen.schema.clone(),
-            audit_events: frozen.events.clone(),
             append_metas: frozen.metas.clone(),
             row_count: frozen.row_count(),
             arrow_bytes: frozen.arrow_bytes,
@@ -426,7 +422,6 @@ impl ImmutableGeneration {
             seal_key: self.seal_key.clone(),
             schema: self.schema.clone(),
             batches: self.rows.clone(),
-            events: self.audit_events.clone(),
             metas: self.append_metas.clone(),
             opened_at: self.opened_at,
             closed_at: self.closed_at,
@@ -1342,14 +1337,13 @@ impl ScribeStageMover {
     ///
     /// # Errors
     ///
-    /// Returns an internal error when the complete rows, audit transition, or
-    /// durable stage claims contradict their deterministic generation identity.
+    /// Returns an internal error when the complete rows or durable stage
+    /// claims contradict their deterministic generation identity.
     pub(crate) async fn persist_publication(
         &self,
         object_base: &str,
         actor_stream: StreamIdentity,
         rows: &[file_list_writer::FileListArtifactInsert],
-        audit_events: &[AuditEvent],
         claims: &[StagedArtifactClaim],
     ) -> Result<(), ScribeError> {
         self.staging
@@ -1357,7 +1351,6 @@ impl ScribeStageMover {
                 &Self::publication_identity(object_base),
                 actor_stream,
                 rows,
-                audit_events,
                 claims,
             )
             .await
@@ -1408,7 +1401,7 @@ impl ScribeStageMover {
     /// # Errors
     ///
     /// Returns an internal error when manifest validation, remote verification,
-    /// fenced SQL/audit convergence, or local post-publication cleanup fails.
+    /// fenced SQL convergence, or local post-publication cleanup fails.
     ///
     /// # Cancellation
     ///
@@ -1450,7 +1443,7 @@ impl ScribeStageMover {
     /// # Errors
     ///
     /// Returns an internal error when object identity or verified upload fails,
-    /// when fenced SQL/audit publication is not known committed, or when exact
+    /// when fenced SQL publication is not known committed, or when exact
     /// post-commit cleanup cannot complete.
     ///
     /// # Cancellation
@@ -1491,10 +1484,7 @@ impl ScribeStageMover {
                     detail: format!("recovered staged upload failed: {error}"),
                 })?;
         }
-        match reconciler
-            .publish(&publication.rows, &publication.audit_events)
-            .await
-        {
+        match reconciler.publish(&publication.rows).await {
             ScribePublicationOutcome::Committed(_) => {
                 self.cleanup_published(&publication.claims).await
             }
@@ -1981,7 +1971,7 @@ impl Drop for ProducerWaiterGuard {
 /// Closed publication classification controlling cleanup and WAL authority.
 #[derive(Debug)]
 pub enum ScribePublicationOutcome {
-    /// The complete artifact set and audit transition committed or replayed exactly.
+    /// The complete artifact set committed or replayed exactly.
     Committed(file_list_writer::FileListArtifactSetOutcome),
     /// Failure occurred before the first COMMIT attempt and exact uploads may be removed.
     KnownNotCommitted(ScribeError),
@@ -2024,7 +2014,6 @@ impl ScribePublicationReconciler {
     pub(crate) async fn publish(
         &self,
         rows: &[file_list_writer::FileListArtifactInsert],
-        events: &[AuditEvent],
     ) -> ScribePublicationOutcome {
         #[cfg(any(test, feature = "test-support"))]
         let publication_barrier = self.faults.take_publication_barrier(rows);
@@ -2032,11 +2021,10 @@ impl ScribePublicationReconciler {
         if let Some(barrier) = &publication_barrier {
             barrier.pause_before_publication().await;
         }
-        match file_list_writer::insert_artifact_set_and_audit_fenced(
+        match file_list_writer::insert_artifact_set_fenced(
             &self.operator_pool,
             self.actor_stream,
             rows,
-            events,
         )
         .await
         {

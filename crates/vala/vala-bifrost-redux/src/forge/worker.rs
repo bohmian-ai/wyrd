@@ -33,11 +33,8 @@ use vala_sql::row_types::forge_tasks::{
     SnapshotWatermark, TaskProgressEffect,
 };
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
-use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
-    AuditDecision, AuditDetail, AuditEvent, AuditResult, AuthMethod, ForgeIcebergRewritePhase,
-    ForgeScribePromotionPhase, StoragePath,
+    AuditDetail, ForgeIcebergRewritePhase, ForgeScribePromotionPhase, StoragePath,
 };
 
 use super::compact::ForgeGroupKey;
@@ -4486,7 +4483,7 @@ redacted
             operation_stop,
             authority_stop: _,
             heartbeat,
-            maintenance_recovery,
+            maintenance_recovery: _,
         } = fenced;
         // Test-only barrier: a durably settled snapshot expiration is held
         // here, after its atomic task and operation settlement committed and
@@ -5963,7 +5960,7 @@ impl ForgeCompactionPlanRunner {
         };
         if prepared.is_none() {
             self.forge
-                .append_live_audit(
+                .append_live_transition(
                     lease,
                     &context.key,
                     &rewrite_operation(ForgeIcebergRewritePhase::Prepared),
@@ -6297,7 +6294,7 @@ impl ForgeCompactionPlanRunner {
             };
             if let Err(error) = self
                 .forge
-                .append_live_audit(
+                .append_live_transition(
                     lease,
                     &context.key,
                     &rewrite_operation(ForgeIcebergRewritePhase::Reset),
@@ -6367,7 +6364,7 @@ impl ForgeCompactionPlanRunner {
             .current_snapshot()
             .map(|snapshot| snapshot.snapshot_id());
         self.forge
-            .append_live_audit(
+            .append_live_transition(
                 lease,
                 &context.key,
                 &rewrite_operation(ForgeIcebergRewritePhase::Committed),
@@ -6913,18 +6910,7 @@ impl ForgeWorker {
             .await
             .map_err(ForgeError::Sql)?;
         self.tasks
-            .prepared(
-                &mut prepared,
-                claim.task_id,
-                attempt,
-                self.owner,
-                &evidence,
-                &task_event(
-                    claim.task_id,
-                    ForgeTaskState::Prepared,
-                    "exact expired-file cleanup evidence persisted",
-                ),
-            )
+            .prepared(&mut prepared, claim.task_id, attempt, self.owner, &evidence)
             .await
             .map_err(ForgeError::Sql)?;
         lease.assert_transaction_fence(&mut prepared).await?;
@@ -7084,16 +7070,7 @@ impl ForgeWorker {
                 .map_err(ForgeError::Sql)?;
         } else {
             self.tasks
-                .complete_orphan_cleanup(
-                    claim.data_tenant_id,
-                    &authority,
-                    &claim_table,
-                    &task_event(
-                        claim.task_id,
-                        ForgeTaskState::Succeeded,
-                        "orphan cleanup prefix exhausted",
-                    ),
-                )
+                .complete_orphan_cleanup(claim.data_tenant_id, &authority, &claim_table)
                 .await
                 .map_err(ForgeError::Sql)?;
         }
@@ -7191,8 +7168,6 @@ impl ForgeWorker {
             if !prepared {
                 require_running(stop)?;
                 lease.require_fence(&self.forge.core.operator_pool).await?;
-                let event =
-                    cleanup_event(attempt.task_id, "forge.expired_cleanup.candidate_prepared");
                 self.tasks
                     .prepare_expired_cleanup_candidate(
                         attempt.tenant,
@@ -7201,7 +7176,6 @@ impl ForgeWorker {
                             table: &table,
                             index,
                             candidate,
-                            event: &event,
                         },
                     )
                     .await
@@ -7211,7 +7185,6 @@ impl ForgeWorker {
             let outcome = self
                 .attempt_cleanup_delete(attempt, lease, index, candidate, stop)
                 .await?;
-            let event = cleanup_event(attempt.task_id, outcome.audit_operation());
             self.tasks
                 .settle_expired_cleanup_candidate(
                     attempt.tenant,
@@ -7220,7 +7193,6 @@ impl ForgeWorker {
                         table: &table,
                         index,
                         candidate,
-                        event: &event,
                     },
                     outcome,
                 )
@@ -7230,7 +7202,7 @@ impl ForgeWorker {
                 return Err(ForgeError::Reconciliation {
                     detail: format!(
                         "expired cleanup retained candidate {index} for replay after {}",
-                        outcome.audit_operation()
+                        outcome.transition_name()
                     ),
                 });
             }
@@ -7777,18 +7749,7 @@ impl ForgeWorker {
             .await
             .map_err(ForgeError::Sql)?;
         self.tasks
-            .prepared(
-                &mut prepared,
-                claim.task_id,
-                attempt,
-                self.owner,
-                evidence,
-                &task_event(
-                    claim.task_id,
-                    ForgeTaskState::Prepared,
-                    "exact committed Iceberg metadata evidence persisted",
-                ),
-            )
+            .prepared(&mut prepared, claim.task_id, attempt, self.owner, evidence)
             .await
             .map_err(ForgeError::Sql)?;
         lease.assert_transaction_fence(&mut prepared).await?;
@@ -7820,11 +7781,6 @@ impl ForgeWorker {
                 },
                 &claim.table_ref,
                 progress_effect,
-                &task_event(
-                    claim.task_id,
-                    ForgeTaskState::Succeeded,
-                    "exact Forge task completed",
-                ),
             )
             .await
             .map_err(ForgeError::Sql)?;
@@ -7850,7 +7806,7 @@ impl ForgeWorker {
         lease: &ForgeLease,
         progress_effect: TaskProgressEffect,
     ) -> Result<(), ForgeError> {
-        let task_id = transition.task_id;
+        let _task_id = transition.task_id;
         let mut terminal = self
             .forge
             .core
@@ -7859,17 +7815,7 @@ impl ForgeWorker {
             .await
             .map_err(ForgeError::Sql)?;
         self.tasks
-            .terminal_and_request_replan(
-                &mut terminal,
-                transition,
-                table_ref,
-                progress_effect,
-                &task_event(
-                    task_id,
-                    ForgeTaskState::Succeeded,
-                    "exact Prepared Forge evidence reconciled",
-                ),
-            )
+            .terminal_and_request_replan(&mut terminal, transition, table_ref, progress_effect)
             .await
             .map_err(ForgeError::Sql)?;
         lease.assert_transaction_fence(&mut terminal).await?;
@@ -7893,7 +7839,7 @@ impl ForgeWorker {
         &self,
         claim: &ForgeTaskClaim,
         attempt: Uuid,
-        detail: String,
+        _detail: String,
     ) -> Result<(), ForgeError> {
         let mut conn = self
             .forge
@@ -7912,7 +7858,6 @@ impl ForgeWorker {
                     expected: ForgeTaskState::Claimed,
                     next: ForgeTaskState::Failed,
                 },
-                &task_event(claim.task_id, ForgeTaskState::Failed, &detail),
             )
             .await
             .map_err(ForgeError::Sql)?;
@@ -8011,7 +7956,7 @@ impl ForgeWorker {
         claim: &ForgeTaskClaim,
         attempt: Uuid,
         class: ForgeFailureClass,
-        detail: String,
+        _detail: String,
     ) -> Result<(), ForgeError> {
         let mut conn = self
             .forge
@@ -8034,7 +7979,6 @@ impl ForgeWorker {
                     expected: ForgeTaskState::Running,
                     next: ForgeTaskState::Failed,
                 },
-                &task_event(claim.task_id, ForgeTaskState::Failed, &detail),
             )
             .await
             .map_err(ForgeError::Sql)?;
@@ -8056,15 +8000,7 @@ impl ForgeWorker {
             .await
             .map_err(ForgeError::Sql)?;
         self.tasks
-            .cancel_superseded(
-                &mut conn,
-                claim,
-                &task_event(
-                    claim.task_id,
-                    ForgeTaskState::Cancelled,
-                    "base_snapshot_superseded",
-                ),
-            )
+            .cancel_superseded(&mut conn, claim)
             .await
             .map_err(ForgeError::Sql)?;
         conn.commit().await.map_err(ForgeError::Sql)
@@ -8184,46 +8120,6 @@ fn require_running(stop: &CancellationToken) -> Result<(), ForgeError> {
     } else {
         Ok(())
     }
-}
-
-/// Builds one internal task lifecycle audit envelope.
-/// Builds the tenant-outbox event for one expired-cleanup candidate transition.
-///
-/// The operation string is the only thing that varies, and the durable owner
-/// re-validates it against the transition it is about to perform, so a
-/// mislabelled event is refused rather than recorded.
-pub(super) fn cleanup_event(task_id: Uuid, operation: &str) -> AuditEvent {
-    AuditEvent::new(
-        RequestId::now_v7(),
-        None,
-        operation.to_owned(),
-        format!("forge-task:{task_id}"),
-        None,
-        PrincipalId::new(Uuid::nil()),
-        PrincipalKindTag::Service,
-        AuthMethod::Internal,
-        "bifrost:forge".to_owned(),
-        AuditDecision::Allow,
-        AuditResult::Success,
-        "expired cleanup candidate transition".to_owned(),
-    )
-}
-
-pub(super) fn task_event(task_id: Uuid, state: ForgeTaskState, reason: &str) -> AuditEvent {
-    AuditEvent::new(
-        RequestId::now_v7(),
-        None,
-        format!("forge.task.{}", state.as_str()),
-        format!("forge-task:{task_id}"),
-        None,
-        PrincipalId::new(Uuid::nil()),
-        PrincipalKindTag::Service,
-        AuthMethod::Internal,
-        "bifrost:forge".to_owned(),
-        AuditDecision::Allow,
-        AuditResult::Success,
-        reason.to_owned(),
-    )
 }
 
 /// Maps execution evidence onto the durable planning consequence for settlement.

@@ -1798,7 +1798,8 @@ async fn forge_promoted_files_rewrite_and_remain_exact_across_recovery() {
         Some(&audit_resource),
         "the landed snapshot is audited under this table's own resource: {landed:?}"
     );
-    let audit = rewrite_audit_facts(&cluster, &owner_client, owner, &audit_resource, uncertain).await;
+    let audit =
+        rewrite_audit_facts(&cluster, &owner_client, owner, &audit_resource, uncertain).await;
     assert_eq!(
         audit.phase, "recovered",
         "the successor settles its predecessor's own operation as recovered"

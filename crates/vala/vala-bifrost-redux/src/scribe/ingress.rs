@@ -478,6 +478,15 @@ impl ScribeImpl {
         };
         let tenant = frame.principal.tenant_id;
         let canonical_definition = Self::canonical_definition(&frame.table);
+        let request_id = match uuid::Uuid::parse_str(frame.request_id.as_str()) {
+            Ok(request_id) => request_id,
+            Err(error) => {
+                lifecycle.refuse();
+                return Err(ScribeError::Internal {
+                    detail: format!("Scribe request identity is not a UUID: {error}"),
+                });
+            }
+        };
         let rows = match self
             .prepare_admitted_rows(
                 frame.payload,
@@ -512,11 +521,10 @@ impl ScribeImpl {
         let (durable_tx, durable_rx) = tokio::sync::oneshot::channel();
         let admitted = AdmittedAppend {
             batch_id: frame.batch_id,
-            audit_event: frame.audit_event,
+            request_id,
             rows,
             measured_wire_bytes: frame.measured_wire_bytes,
             admitted_bytes: material_plan.root_bytes,
-            wal_workspace_bytes: material_plan.wal_workspace_bytes,
             maximum_scribe_envelope_bytes: self.memory.ingress_limit_bytes(),
             reservation,
             memory,
@@ -808,21 +816,6 @@ mod tests {
             expected_schema_fingerprint: Some(projected_source_schema_fingerprint(schema.as_ref())),
             request_id: request_id.clone(),
             batch_id: uuid::Uuid::now_v7(),
-            audit_event: wyrd_spec::vala::api::AuditEvent {
-                request_id,
-                trace_id: None,
-                operation: "bifrost.append".to_owned(),
-                resource: "vala.bifrost.decoded_size_bound".to_owned(),
-                card_ref: None,
-                principal_id: principal.id,
-                principal_kind: principal.kind.tag(),
-                auth_method: wyrd_spec::vala::api::AuthMethod::Jwt,
-                permission: "bifrost:append".to_owned(),
-                decision: wyrd_spec::vala::api::AuditDecision::Allow,
-                result: wyrd_spec::vala::api::AuditResult::Success,
-                payload_summary: "one projected decoded-size fixture row".to_owned(),
-                detail: None,
-            },
             measured_wire_bytes: 0,
             payload: IngressPayload::Canonical(CanonicalIngress::unreserved(vec![rows])),
         }

@@ -4,14 +4,14 @@ use vala_sql::row_types::audit_outbox::AuditOutboxRow;
 use wyrd_runtime::permission::PermissionSet;
 use wyrd_runtime::{Principal, PrincipalKind};
 use wyrd_spec::DataTenantId;
-use wyrd_spec::error::WyrdError;
-use wyrd_spec::vala::error::BifrostError;
 use wyrd_spec::auth::{PLATFORM_AUDIT_PRINCIPAL, PrincipalId, PrincipalKindTag};
+use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
     AuditDecision, AuditEvent, AuditResult, AuthMethod, BifrostQueryRequest, FreshnessPolicy,
     VisibilityMode,
 };
+use wyrd_spec::vala::error::BifrostError;
 use wyrd_testing::WyrdTestServer;
 
 use super::query::{ServerJourneyError, scheduled_context};
@@ -147,7 +147,10 @@ fn synthetic_row(tenant: DataTenantId, seq: i64, operation: &str) -> AuditOutbox
 async fn replayed_audit_publication_retains_each_event_once() -> Result<(), ServerJourneyError> {
     let server = WyrdTestServer::start_bound().await?;
     let tenant = server.data_tenant_id();
-    let operation = format!("wyrd.journey.audit_replay.{}", uuid::Uuid::now_v7().simple());
+    let operation = format!(
+        "wyrd.journey.audit_replay.{}",
+        uuid::Uuid::now_v7().simple()
+    );
 
     let rows: Vec<AuditOutboxRow> = (0..3)
         .map(|offset| synthetic_row(tenant, 9_000_000_000 + offset, &operation))

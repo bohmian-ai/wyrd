@@ -1,4 +1,4 @@
-//! `file_list` writer — atomic INSERT + audit fan-out per CONTRACTS §11.
+//! `file_list` writer — atomic artifact-set INSERT per CONTRACTS §11.
 
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -7,7 +7,6 @@ use vala_sql::SqlError;
 
 use crate::scribe::stream_identity::StreamIdentity;
 use wyrd_spec::DataTenantId;
-use wyrd_spec::vala::api::AuditEvent;
 
 use crate::catalog::TenantTableBinding;
 use crate::catalog::layout::{BIFROST_PARTITION_SPEC_ID, BIFROST_SORT_ORDER_ID, TimePartition};
@@ -452,17 +451,18 @@ fn extract_lsn_range(encoded: &ParquetEncoded) -> Result<(i64, i64), ScribeError
 
 /// Atomically publishes a complete writer-v2 artifact set under one actor fence.
 ///
-/// Either every contiguous row plus the generation's audit fan-out commits, or
-/// none do. Replays succeed only when every ordered identity matches exactly.
+/// Either every contiguous row commits, or none do. Replays succeed only when
+/// every ordered identity matches exactly. Publication is an engine-internal
+/// generation transition that evaluates no principal permission, so `vala.file_list`
+/// is its whole lineage record and no audit event is appended.
 ///
 /// # Errors
 /// Returns a SQL invariant error for an empty/noncontiguous/mixed replay set,
-/// a stale actor fence, identity mismatch, audit failure, or commit failure.
-pub async fn insert_artifact_set_and_audit_fenced(
+/// a stale actor fence, identity mismatch, or commit failure.
+pub async fn insert_artifact_set_fenced(
     operator_pool: &OperatorPool,
     actor: StreamIdentity,
     rows: &[FileListArtifactInsert],
-    events: &[AuditEvent],
 ) -> Result<FileListArtifactSetOutcome, SqlError> {
     let first = validate_artifact_set(
         rows,
@@ -542,15 +542,6 @@ pub async fn insert_artifact_set_and_audit_fenced(
             detail: "writer-v2 replay identity does not match the complete artifact set".to_owned(),
         });
     }
-    if inserted > 0 {
-        let mut audit = vala_sql::queries::audit_outbox::OperatorAudit::new(
-            first.data_tenant_id,
-            &mut transaction,
-        );
-        for event in events {
-            audit.append(event).await?;
-        }
-    }
     transaction.commit().await.map_err(SqlError::from)?;
     artifact_set_outcome(first, rows, inserted)
 }
@@ -571,7 +562,7 @@ pub struct PublicationFenceBarrier {
     before_publication: std::sync::Arc<tokio::sync::Notify>,
     /// Releases the reconciler to enter the fenced SQL transaction.
     release_before_publication: std::sync::Arc<tokio::sync::Notify>,
-    /// Signals that file-list and audit publication are durably visible.
+    /// Signals that file-list publication is durably visible.
     after_publication: std::sync::Arc<tokio::sync::Notify>,
     /// Releases post-publication manifest advancement and local cleanup.
     release_after_publication: std::sync::Arc<tokio::sync::Notify>,

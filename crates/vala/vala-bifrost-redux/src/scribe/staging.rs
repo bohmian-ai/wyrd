@@ -14,7 +14,6 @@ use crate::scribe::file_list_writer::FileListArtifactInsert;
 use crate::scribe::promotion::ScribePublishedHotFileV1;
 use crate::scribe::stream_identity::StreamIdentity;
 use wyrd_spec::DataTenantId;
-use wyrd_spec::vala::api::AuditEvent;
 
 /// Version of the durable Scribe publication-manifest contract.
 const PUBLICATION_MANIFEST_VERSION: u8 = 2;
@@ -68,8 +67,6 @@ struct PublicationManifest {
     actor_writer_epoch: i64,
     /// Deterministically ordered file-list rows published as one transaction.
     rows: Vec<DurableFileListRow>,
-    /// Exact canonical audit events appended in the same fenced transaction.
-    audit_events: Vec<AuditEvent>,
     /// Elected local artifacts retained until catalog convergence.
     claims: Vec<StagedArtifactClaim>,
 }
@@ -186,8 +183,6 @@ pub(crate) struct RecoveredPublication {
     pub(crate) actor_stream: StreamIdentity,
     /// Exact deterministic file-list rows.
     pub(crate) rows: Vec<FileListArtifactInsert>,
-    /// Exact audit fan-out paired with the rows.
-    pub(crate) audit_events: Vec<AuditEvent>,
     /// Finalized local winners retained through publication.
     pub(crate) claims: Vec<StagedArtifactClaim>,
 }
@@ -643,17 +638,15 @@ impl ScribeStaging {
         logical_identity: &str,
         actor_stream: StreamIdentity,
         rows: &[FileListArtifactInsert],
-        audit_events: &[AuditEvent],
         claims: &[StagedArtifactClaim],
     ) -> Result<(), ScribeError> {
-        validate_publication(logical_identity, actor_stream, rows, audit_events, claims)?;
+        validate_publication(logical_identity, actor_stream, rows, claims)?;
         let manifest = PublicationManifest {
             version: PUBLICATION_MANIFEST_VERSION,
             logical_identity: logical_identity.to_owned(),
             actor_node_id: actor_stream.node_id.as_uuid(),
             actor_writer_epoch: actor_stream.writer_epoch.as_i64(),
             rows: rows.iter().map(DurableFileListRow::from).collect(),
-            audit_events: audit_events.to_vec(),
             claims: claims.to_vec(),
         };
         let final_path = self
@@ -715,8 +708,8 @@ impl ScribeStaging {
     ///
     /// Returns an internal error for a missing caller-owned governed buffer, an
     /// unknown version, malformed JSON, unsafe identity, missing finalized
-    /// artifact, or contradictory row, digest, length, ordinal, actor-fence,
-    /// or audit facts.
+    /// artifact, or contradictory row, digest, length, ordinal, or
+    /// actor-fence facts.
     ///
     /// # Cancellation
     ///
@@ -781,7 +774,6 @@ impl ScribeStaging {
                     .cloned()
                     .map(FileListArtifactInsert::from)
                     .collect::<Vec<_>>(),
-                &manifest.audit_events,
                 &manifest.claims,
             )?;
             for claim in &manifest.claims {
@@ -796,7 +788,6 @@ impl ScribeStaging {
                     .into_iter()
                     .map(FileListArtifactInsert::from)
                     .collect(),
-                audit_events: manifest.audit_events,
                 claims: manifest.claims,
             });
         }
@@ -986,14 +977,9 @@ fn validate_publication(
     logical_identity: &str,
     actor_stream: StreamIdentity,
     rows: &[FileListArtifactInsert],
-    audit_events: &[AuditEvent],
     claims: &[StagedArtifactClaim],
 ) -> Result<(), ScribeError> {
-    if !safe_component(logical_identity)
-        || rows.is_empty()
-        || audit_events.is_empty()
-        || rows.len() != claims.len()
-    {
+    if !safe_component(logical_identity) || rows.is_empty() || rows.len() != claims.len() {
         return Err(ScribeError::Internal {
             detail: "incomplete Scribe generation publication manifest".to_owned(),
         });

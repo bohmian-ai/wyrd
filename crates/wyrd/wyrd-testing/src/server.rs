@@ -2029,7 +2029,7 @@ impl WyrdTestServer {
             .ok_or_else(|| {
                 WyrdTestServerError::Start("Forge coordinator is not composed".to_owned())
             })?;
-        forge.fail_next_prepared_live_audit_for_test();
+        forge.fail_next_prepared_live_transition_for_test();
         Ok(())
     }
 

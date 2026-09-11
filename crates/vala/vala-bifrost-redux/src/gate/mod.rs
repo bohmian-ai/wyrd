@@ -691,21 +691,6 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> Gate<R,
                 limit: u64::try_from(self.limits.max_frame_bytes).unwrap_or(u64::MAX),
             });
         }
-        let audit_event = wyrd_spec::vala::api::AuditEvent {
-            request_id: auth.request_id.clone(),
-            trace_id: None,
-            operation: "bifrost.otlp".to_owned(),
-            resource: table.fqn(),
-            card_ref: auth.principal.card_ref().cloned(),
-            principal_id: auth.principal.id,
-            principal_kind: auth.principal.kind.tag(),
-            auth_method: wyrd_spec::vala::api::AuthMethod::Jwt,
-            permission: "bifrost:record:write".to_owned(),
-            decision: wyrd_spec::vala::api::AuditDecision::Allow,
-            result: wyrd_spec::vala::api::AuditResult::Success,
-            payload_summary: "one bounded OTLP frame".to_owned(),
-            detail: None,
-        };
         if batch.num_rows() == 0 {
             return Ok(());
         }
@@ -723,7 +708,6 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> Gate<R,
                 expected_schema_fingerprint: None,
                 request_id: auth.request_id.clone(),
                 batch_id,
-                audit_event,
                 measured_wire_bytes,
                 payload,
             })
@@ -769,24 +753,6 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> Gate<R,
                 limit: u64::try_from(self.limits.max_frame_bytes).unwrap_or(u64::MAX),
             });
         }
-        let audit_event = wyrd_spec::vala::api::AuditEvent {
-            request_id: request_id.clone(),
-            trace_id: None,
-            operation: "bifrost.audit.publish".to_owned(),
-            resource: table.fqn(),
-            card_ref: principal.card_ref().cloned(),
-            principal_id: principal.id,
-            principal_kind: principal.kind.tag(),
-            auth_method: wyrd_spec::vala::api::AuthMethod::Internal,
-            permission: "bifrost:record:write".to_owned(),
-            decision: wyrd_spec::vala::api::AuditDecision::Allow,
-            result: wyrd_spec::vala::api::AuditResult::Success,
-            payload_summary: format!(
-                "audit sequences {}..={}",
-                projection.seq_lo, projection.seq_hi
-            ),
-            detail: None,
-        };
         let scribe = self.scribe.as_ref().ok_or(IngestError::IngressClosed)?;
         scribe
             .ingest_frame(ScribeIngressFrame {
@@ -796,7 +762,6 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> Gate<R,
                 expected_schema_fingerprint: None,
                 request_id,
                 batch_id: audit_batch_id(projection.batch_id),
-                audit_event,
                 measured_wire_bytes,
                 payload: IngressPayload::Canonical(CanonicalIngress::unreserved(vec![
                     projection.rows,
@@ -865,21 +830,6 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> Gate<R,
             return Err(IngestError::ReservedBuiltinWriteDenied { table: frame.table });
         }
         let table = TableRef::new(namespace, name);
-        let audit_event = wyrd_spec::vala::api::AuditEvent {
-            request_id: auth.request_id.clone(),
-            trace_id: None,
-            operation: "bifrost.ingest_batch".to_owned(),
-            resource: table.fqn(),
-            card_ref: auth.principal.card_ref().cloned(),
-            principal_id: auth.principal.id,
-            principal_kind: auth.principal.kind.tag(),
-            auth_method: wyrd_spec::vala::api::AuthMethod::Jwt,
-            permission: "bifrost:record:write".to_owned(),
-            decision: wyrd_spec::vala::api::AuditDecision::Allow,
-            result: wyrd_spec::vala::api::AuditResult::Success,
-            payload_summary: "one bounded native batch".to_owned(),
-            detail: None,
-        };
         let scribe = self.scribe.as_ref().ok_or(IngestError::IngressClosed)?;
         let ingress = ScribeIngressFrame {
             principal: auth.principal.clone(),
@@ -888,7 +838,6 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> Gate<R,
             expected_schema_fingerprint: None,
             request_id: auth.request_id.clone(),
             batch_id,
-            audit_event,
             measured_wire_bytes: frame.arrow_ipc.len(),
             payload: IngressPayload::ArrowIpc(frame.arrow_ipc),
         };

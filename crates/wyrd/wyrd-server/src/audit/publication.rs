@@ -16,7 +16,6 @@
 use std::time::Duration;
 
 use sqlx::PgPool;
-use wyrd_sql::OperatorPool;
 use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::tables::audit::projection::project_audit_rows;
 use vala_sql::TenantConn;
@@ -26,6 +25,7 @@ use wyrd_runtime::{PermissionSet, Principal, PrincipalKind};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::PLATFORM_AUDIT_PRINCIPAL;
 use wyrd_spec::request_id::RequestId;
+use wyrd_sql::OperatorPool;
 
 use crate::state::{AppState, ServerGate};
 
@@ -119,18 +119,17 @@ impl AuditPublisher {
 
     /// Publish one bounded batch for every live tenant.
     async fn sweep(&self) {
-        let tenants =
-            match wyrd_sql::queries::platform::tenants::list_active_tenant_ids(
-                self.directory.pool(),
-            )
-            .await
-            {
-                Ok(tenants) => tenants,
-                Err(error) => {
-                    tracing::warn!(error = %error, "audit publisher could not list tenants");
-                    return;
-                }
-            };
+        let tenants = match wyrd_sql::queries::platform::tenants::list_active_tenant_ids(
+            self.directory.pool(),
+        )
+        .await
+        {
+            Ok(tenants) => tenants,
+            Err(error) => {
+                tracing::warn!(error = %error, "audit publisher could not list tenants");
+                return;
+            }
+        };
         for tenant in tenants {
             if let Err(error) = self.publish_tenant(tenant).await {
                 tracing::warn!(

@@ -16,6 +16,11 @@ use crate::SqlError;
 /// so a sweeper must not open work against them. The order is stable by tenant
 /// id so repeated sweeps visit tenants in the same sequence.
 ///
+/// The directory always holds the nil-UUID system tenant, which owns Wyrd's
+/// system-shared tables and their audited transitions. It is not a UUIDv7, so
+/// it is mapped to [`DataTenantId::SYSTEM_OWNER`] rather than validated: a
+/// sweeper that failed the whole read on it would service no tenant at all.
+///
 /// # Errors
 /// Returns [`SqlError::Query`] when Postgres rejects the directory read, and
 /// [`SqlError::InvalidDataTenantId`] when a stored id violates the Wyrd
@@ -33,7 +38,13 @@ pub async fn list_active_tenant_ids(pool: &PgPool) -> Result<Vec<DataTenantId>, 
     .map_err(SqlError::from)?;
 
     rows.into_iter()
-        .map(DataTenantId::new)
+        .map(|id| {
+            if id.is_nil() {
+                Ok(DataTenantId::SYSTEM_OWNER)
+            } else {
+                DataTenantId::new(id)
+            }
+        })
         .collect::<Result<Vec<_>, _>>()
         .map_err(SqlError::InvalidDataTenantId)
 }

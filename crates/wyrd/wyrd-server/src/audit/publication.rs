@@ -16,6 +16,7 @@
 use std::time::Duration;
 
 use sqlx::PgPool;
+use wyrd_sql::OperatorPool;
 use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::tables::audit::projection::project_audit_rows;
 use vala_sql::TenantConn;
@@ -62,8 +63,14 @@ pub enum PublishOutcome {
 /// It owns the pools and the Gate seam it publishes through, so a cycle is a
 /// method on the owner rather than a function threading four dependencies.
 pub struct AuditPublisher {
-    /// Application pool used for the tenant directory and tenant connections.
+    /// RLS-enforced application pool used for tenant-scoped work.
     pool: PgPool,
+    /// Cross-tenant pool the admin-owned tenant directory is read through.
+    ///
+    /// `platform.tenants` is not tenant data and grants no read to the
+    /// application role, so a sweep that listed tenants on `pool` would be
+    /// refused by Postgres and service nobody.
+    directory: OperatorPool,
     /// Ingest seam that stamps and durably appends the shipment.
     gate: ServerGate,
     /// Maximum events moved by one tenant cycle.
@@ -76,12 +83,19 @@ impl AuditPublisher {
     /// Build the publisher for a serving state that owns a Scribe.
     ///
     /// Returns `None` for a role with no ingest owner: such a process has no
-    /// durable seam to publish through and must not claim the work.
+    /// durable seam to publish through and must not claim the work. It also
+    /// returns `None` without a cross-tenant operator pool, since the tenant
+    /// directory is unreadable from the application role.
     #[must_use]
     pub fn from_state(state: &AppState) -> Option<Self> {
         state.bifrost_ingest()?;
+        let directory = state.postgres.operator_pool().or_else(|| {
+            tracing::warn!("audit publication skipped because operator pool is unavailable");
+            None
+        })?;
         Some(Self {
             pool: state.postgres.wyrd().app_pool().clone(),
+            directory,
             gate: state.bifrost.gate().clone(),
             batch_records: PUBLICATION_BATCH_RECORDS,
             interval: PUBLICATION_INTERVAL,
@@ -106,7 +120,11 @@ impl AuditPublisher {
     /// Publish one bounded batch for every live tenant.
     async fn sweep(&self) {
         let tenants =
-            match wyrd_sql::queries::platform::tenants::list_active_tenant_ids(&self.pool).await {
+            match wyrd_sql::queries::platform::tenants::list_active_tenant_ids(
+                self.directory.pool(),
+            )
+            .await
+            {
                 Ok(tenants) => tenants,
                 Err(error) => {
                     tracing::warn!(error = %error, "audit publisher could not list tenants");

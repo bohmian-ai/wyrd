@@ -1,21 +1,26 @@
-use arrow::datatypes::{DataType, Field};
-use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef};
-use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::tables::audit::projection::project_audit_rows;
-use vala_sql::queries::audit_outbox::list_publication_batch;
+use vala_sql::queries::audit_outbox::{append_audit, list_publication_batch};
+use vala_sql::row_types::audit_outbox::AuditOutboxRow;
 use wyrd_runtime::permission::PermissionSet;
 use wyrd_runtime::{Principal, PrincipalKind};
-use wyrd_server::audit::publication::{AuditPublisher, PublishOutcome};
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::PLATFORM_AUDIT_PRINCIPAL;
+use wyrd_spec::error::WyrdError;
+use wyrd_spec::vala::error::BifrostError;
+use wyrd_spec::auth::{PLATFORM_AUDIT_PRINCIPAL, PrincipalId, PrincipalKindTag};
 use wyrd_spec::request_id::RequestId;
-use wyrd_spec::vala::api::{BifrostQueryRequest, FreshnessPolicy, VisibilityMode};
+use wyrd_spec::vala::api::{
+    AuditDecision, AuditEvent, AuditResult, AuthMethod, BifrostQueryRequest, FreshnessPolicy,
+    VisibilityMode,
+};
 use wyrd_testing::WyrdTestServer;
 
 use super::query::{ServerJourneyError, scheduled_context};
 
 /// Retained history this journey reads back.
 const AUDIT_LOG: &str = "vala.system.audit_log";
+
+/// Bound on every wait for the server-owned publisher to make progress.
+const PUBLICATION_BUDGET: std::time::Duration = std::time::Duration::from_secs(90);
 
 /// Builds the internal principal one tenant's publication runs as.
 fn publisher_principal(tenant: DataTenantId) -> Principal {
@@ -28,20 +33,22 @@ fn publisher_principal(tenant: DataTenantId) -> Principal {
     )
 }
 
-/// Counts retained audit rows inside one inclusive outbox sequence range.
+/// Counts retained audit rows recorded under one operation name.
 ///
 /// The read goes through the server's own scheduled caller so the count is the
 /// one a caller of the public query surface would see, fused across the rows
 /// Scribe still holds and anything already published.
 ///
-/// # Errors
+/// Retained history is registered by its first publication, so a tenant that
+/// has never published owns no such table yet. That is an honest zero rather
+/// than a failure: the caller is polling for a move the server has not made.
 ///
+/// # Errors
 /// Returns the authorization, query, or terminal failure the caller raised.
 async fn retained_rows(
     server: &WyrdTestServer,
     tenant: DataTenantId,
-    seq_lo: i64,
-    seq_hi: i64,
+    operation: &str,
 ) -> Result<u64, ServerJourneyError> {
     let outcome = wyrd_server::query::scheduled::ScheduledQueryCaller::new(
         server.state().clone(),
@@ -49,131 +56,189 @@ async fn retained_rows(
         tokio_util::sync::CancellationToken::new(),
     )
     .run(BifrostQueryRequest {
-        sql: format!("SELECT seq FROM {AUDIT_LOG} WHERE seq BETWEEN {seq_lo} AND {seq_hi}"),
+        sql: format!("SELECT seq FROM {AUDIT_LOG} WHERE operation = '{operation}'"),
         visibility: VisibilityMode::Fused,
         freshness: FreshnessPolicy::Strict,
         deadline_ms: Some(60_000),
     })
-    .await?;
-    Ok(outcome.rows)
-}
-
-/// Bounded wait for the tenant to owe at least one audit event.
-///
-/// The server runs its own publisher, so a range this journey produced can be
-/// shipped and retired before the journey claims it. Polling the same
-/// production read the publisher uses — rather than sleeping past the worker —
-/// keeps the claim a real one without racing it.
-///
-/// # Errors
-///
-/// Returns the Postgres failure, or a timeout naming the empty outbox.
-async fn claim_owed(
-    server: &WyrdTestServer,
-    tenant: DataTenantId,
-) -> Result<Vec<vala_sql::row_types::audit_outbox::AuditOutboxRow>, ServerJourneyError> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    loop {
-        let mut conn = server.tenant_conn_for(tenant).await?;
-        let rows = list_publication_batch(&mut conn, 64).await?;
-        conn.commit().await?;
-        if !rows.is_empty() {
-            return Ok(rows);
-        }
-        if std::time::Instant::now() >= deadline {
-            return Err("the tenant owed no audit event within the bounded wait".into());
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    .await;
+    match outcome {
+        Ok(outcome) => Ok(outcome.rows),
+        Err(WyrdError::Vala {
+            error: BifrostError::TableNotFound { .. },
+        }) => Ok(0),
+        Err(error) => Err(error.into()),
     }
 }
 
-/// Audited transitions reach retained history exactly once and retire after it.
+/// Waits until one operation is retained exactly `expected` times.
 ///
-/// `vala.audit_outbox` is the transactional authority and `vala.system.audit_log`
-/// is the retained one, so the only thing that can go wrong at that boundary is
-/// a count: a lost range, or a duplicated one. Both failures are invisible to a
-/// test that publishes once and looks once, which is why this journey publishes
-/// the *same* range twice before it reads. The second publication is exactly
-/// what a crash between a durable append and its retirement produces, and the
-/// deterministic batch id derived from the tenant and sequence range is what
-/// must make it a no-op inside Scribe's dedup fence.
-///
-/// Retirement is then asserted against the same range: the rows leave the
-/// outbox only once a publisher has moved them, and exactly the shipped range
-/// leaves. The server runs its own publisher, so the range may already be
-/// retired when this journey's publisher looks — that is the same observable
-/// outcome and not a second contract.
+/// Publication is a server-owned background move, so a read taken immediately
+/// after an append can honestly precede it. This polls the public read rather
+/// than sleeping past the worker, and fails naming the count it last observed.
 ///
 /// # Errors
+/// Returns the query failure, or a timeout naming the last observed count.
+async fn await_retained(
+    server: &WyrdTestServer,
+    tenant: DataTenantId,
+    operation: &str,
+    expected: u64,
+) -> Result<(), ServerJourneyError> {
+    let deadline = std::time::Instant::now() + PUBLICATION_BUDGET;
+    loop {
+        let observed = retained_rows(server, tenant, operation).await?;
+        if observed == expected {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "`{operation}` was retained {observed} times within the bounded wait, expected {expected}"
+            )
+            .into());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+/// Builds one synthetic outbox row outside every real sequence range.
 ///
-/// Returns the server, Postgres, projection, publication, or query failure.
+/// A synthetic range lets the replay scenario publish the *identical* batch
+/// twice without racing the server's own publisher for a real one. Everything
+/// the deduplication decision depends on is real: the tenant and the inclusive
+/// sequence range the deterministic batch id is derived from.
+fn synthetic_row(tenant: DataTenantId, seq: i64, operation: &str) -> AuditOutboxRow {
+    AuditOutboxRow {
+        data_tenant_id: tenant.as_uuid(),
+        seq,
+        entry_hash: vec![0; 32],
+        prev_hash: vec![0; 32],
+        request_id: RequestId::now_v7().to_string(),
+        trace_id: None,
+        operation: operation.to_owned(),
+        resource: "vala.datasets.journey".to_owned(),
+        card_ref: None,
+        principal_id: uuid::Uuid::nil(),
+        principal_kind: "user".to_owned(),
+        auth_method: "internal".to_owned(),
+        permission: "bifrost:record:write".to_owned(),
+        decision: "allow".to_owned(),
+        result: "success".to_owned(),
+        payload_summary: "journey replay".to_owned(),
+        detail: None,
+        created_at: chrono::Utc::now(),
+    }
+}
+
+/// A replayed publication retains each audit event exactly once.
 ///
-/// # Panics
+/// A publication that is durable but not yet retired is republished by the next
+/// cycle, so the boundary's real hazard is a count: the same range arriving
+/// twice in retained history. That failure is invisible to a test that
+/// publishes once and looks once, which is why this journey publishes the
+/// *same* range twice before it reads. The deterministic batch id derived from
+/// the tenant and its inclusive sequence range is what must make the second
+/// publication a no-op inside Scribe's durable dedup fence.
 ///
-/// Panics when a replayed publication duplicates retained rows, when a shipped
-/// batch retires nothing, or when the published range survives retirement.
+/// # Errors
+/// Returns the server, projection, publication, or query failure.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires the serialized Postgres-backed journey lane"]
 async fn replayed_audit_publication_retains_each_event_once() -> Result<(), ServerJourneyError> {
     let server = WyrdTestServer::start_bound().await?;
     let tenant = server.data_tenant_id();
+    let operation = format!("wyrd.journey.audit_replay.{}", uuid::Uuid::now_v7().simple());
 
-    // A real audited transition, so the range this journey publishes is one a
-    // caller produced rather than one the fixture synthesized.
-    for ordinal in 0..2 {
-        server
-            .create_bifrost_table_for_test(CreateTableRequest {
-                table: TableRef::new(
-                    BifrostNamespace::Datasets,
-                    format!(
-                        "audit_publication_{ordinal}_{}",
-                        uuid::Uuid::now_v7().simple()
-                    ),
-                ),
-                user_fields: vec![Field::new("value", DataType::Int64, false)],
-                tenant,
-                physical_layout: None,
-                audit: None,
-            })
-            .await?;
-    }
-    let rows = claim_owed(&server, tenant).await?;
-    let projection = project_audit_rows(tenant, &rows)?;
-    let (seq_lo, seq_hi) = (projection.seq_lo, projection.seq_hi);
-    let expected = rows.len() as u64;
+    let rows: Vec<AuditOutboxRow> = (0..3)
+        .map(|offset| synthetic_row(tenant, 9_000_000_000 + offset, &operation))
+        .collect();
 
-    // Publish the identical range twice: the second is the ambiguous replay.
     let gate = server.state().bifrost.gate().clone();
     let principal = publisher_principal(tenant);
-    gate.publish_audit_projection(&principal, RequestId::now_v7(), projection)
+    for _ in 0..2 {
+        gate.publish_audit_projection(
+            &principal,
+            RequestId::now_v7(),
+            project_audit_rows(tenant, &rows)?,
+        )
         .await?;
-    let replay = project_audit_rows(tenant, &rows)?;
-    gate.publish_audit_projection(&principal, RequestId::now_v7(), replay)
-        .await?;
-
-    assert_eq!(
-        retained_rows(&server, tenant, seq_lo, seq_hi).await?,
-        expected,
-        "a replayed publication of one range must retain each event exactly once"
-    );
-
-    // The production publisher then moves and retires its own bounded batch.
-    // It may find the range already retired by the server's own worker, which
-    // is the same outcome from the caller's side: the range is owed to nobody.
-    let publisher = AuditPublisher::from_state(server.state())
-        .ok_or("a Scribe-owning server composes an audit publisher")?;
-    if let PublishOutcome::Published { retired, .. } = publisher.publish_tenant(tenant).await? {
-        assert!(retired > 0, "a published batch retires the rows it carried");
     }
+
+    await_retained(&server, tenant, &operation, rows.len() as u64).await?;
+
+    server.shutdown().await?;
+    Ok(())
+}
+
+/// An audited transition reaches retained history and only then leaves the outbox.
+///
+/// `vala.audit_outbox` is transient delivery state and `vala.system.audit_log`
+/// is the retained authority, so a row may retire only once its content is
+/// durable in the Bifrost table. This appends one distinctive event through the
+/// production writer, runs the production publisher, and asserts both halves of
+/// that contract: the event readable exactly once through the public query
+/// surface, and the row gone from the outbox. A publisher that retired a range
+/// it had not shipped loses the first assertion; one that never retires loses
+/// the second.
+///
+/// The wait is on the server's own publication worker rather than on a
+/// publisher this test drives: a booted server owes retained history without
+/// anyone asking it to, and a worker that cannot read the tenant directory
+/// fails exactly here while a directly driven cycle would still pass.
+///
+/// # Errors
+/// Returns the server, Postgres, publication, or query failure.
+///
+/// # Panics
+/// Panics when the appended event stays owed to the outbox after it reached
+/// retained history.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the serialized Postgres-backed journey lane"]
+async fn audited_transitions_retire_only_into_retained_history() -> Result<(), ServerJourneyError> {
+    let server = WyrdTestServer::start_bound().await?;
+    let tenant = server.data_tenant_id();
+    let operation = format!("wyrd.journey.audit_owed.{}", uuid::Uuid::now_v7().simple());
+
     let mut conn = server.tenant_conn_for(tenant).await?;
-    let after = list_publication_batch(&mut conn, 64).await?;
+    append_audit(
+        &mut conn,
+        &AuditEvent::new(
+            RequestId::now_v7(),
+            None,
+            operation.clone(),
+            "vala.datasets.journey".to_owned(),
+            None,
+            PrincipalId::new(uuid::Uuid::now_v7()),
+            PrincipalKindTag::User,
+            AuthMethod::Internal,
+            "bifrost:record:write".to_owned(),
+            AuditDecision::Allow,
+            AuditResult::Success,
+            "journey owed event".to_owned(),
+        ),
+    )
+    .await?;
     conn.commit().await?;
-    assert!(
-        !after
-            .iter()
-            .any(|row| row.seq >= seq_lo && row.seq <= seq_hi),
-        "retirement removes exactly the range the publisher shipped"
-    );
+
+    // The server's own publisher moves the event; this waits on that worker
+    // rather than driving a cycle, so a publisher that never services the
+    // tenant fails here instead of passing on a cycle the test performed.
+    await_retained(&server, tenant, &operation, 1).await?;
+
+    let deadline = std::time::Instant::now() + PUBLICATION_BUDGET;
+    loop {
+        let mut conn = server.tenant_conn_for(tenant).await?;
+        let owed = list_publication_batch(&mut conn, 512).await?;
+        conn.commit().await?;
+        if !owed.iter().any(|row| row.operation == operation) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "`{operation}` stayed owed to the outbox after it reached retained history"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 
     server.shutdown().await?;
     Ok(())

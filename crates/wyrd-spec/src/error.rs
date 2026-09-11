@@ -3448,6 +3448,122 @@ impl From<skald_spec::SkaldError> for WyrdError {
 mod tests {
     use super::WyrdError;
 
+    /// Every stable code a public Python owner emits today, in the order the
+    /// owning crate lists it. Each entry pairs the catalog code with the HTTP
+    /// status its owner already reports, so a silent status change is a test
+    /// failure rather than a wire-visible regression.
+    const PYTHON_BOUNDARY_CODES: &[(&str, u16)] = &[
+        ("WYRD_AGENT_404_TOOL", 404),
+        ("WYRD_AGENT_404_TOOL_NOT_IN_AGENT", 404),
+        ("WYRD_AGENT_409_PROVIDER_MISMATCH", 409),
+        ("WYRD_AGENT_412_DELEGATION_DEPTH", 412),
+        ("WYRD_AGENT_422_INVALID_ARGUMENT", 422),
+        ("WYRD_AGENT_422_LOOP_MESSAGE_TYPE", 422),
+        ("WYRD_AGENT_422_PROMPT", 422),
+        ("WYRD_AGENT_422_STRUCTURED_DECODE", 422),
+        ("WYRD_AGENT_422_TOOL_ARGS", 422),
+        ("WYRD_AGENT_500_CALLBACK_PANIC", 500),
+        ("WYRD_AGENT_500_JOURNAL", 500),
+        ("WYRD_AGENT_500_MAX_ITERATIONS", 500),
+        ("WYRD_AGENT_502_PROVIDER", 502),
+        ("WYRD_AGENT_504_TIMEOUT", 504),
+        ("WYRD_SESSION_500_APPEND", 500),
+        ("WYRD_SESSION_500_RECENT", 500),
+        ("WYRD_TOOL_400_INVALID_SCHEMA", 400),
+        ("WYRD_TOOL_404_NOT_REGISTERED", 404),
+        ("WYRD_TOOL_409_NAME_TAKEN", 409),
+        ("WYRD_TOOL_422_INPUT", 422),
+        ("WYRD_TOOL_500_CALL", 500),
+        ("WYRD_TOOL_500_OUTPUT", 500),
+        ("WYRD_RUNTIME_404_PROVIDER", 404),
+        ("WYRD_RUNTIME_422_RESPONSE_DECODE", 422),
+        ("WYRD_WORKFLOW_404_AGENT", 404),
+        ("WYRD_WORKFLOW_404_TASK", 404),
+        ("WYRD_WORKFLOW_422_CYCLE", 422),
+        ("WYRD_WORKFLOW_422_DUPLICATE_STEP_ID", 422),
+        ("WYRD_WORKFLOW_422_MISSING_DEPENDENCY", 422),
+        ("WYRD_WORKFLOW_422_MISSING_PARAMETER", 422),
+        ("WYRD_WORKFLOW_422_OUTPUT_SCHEMA", 422),
+        ("WYRD_WORKFLOW_500_AGENT_RESPONSE_MISSING", 500),
+        ("WYRD_WORKFLOW_500_INTERNAL", 500),
+        ("WYRD_WORKFLOW_500_LOCK", 500),
+        ("WYRD_WORKFLOW_500_MAX_RETRIES", 500),
+        ("WYRD_WORKFLOW_500_STALLED", 500),
+        ("WYRD_WORKFLOW_501_UNSUPPORTED_HANDOFF", 501),
+        ("WYRD_CLIENT_400_CONFIG_INVALID", 400),
+        ("WYRD_CLIENT_401_NO_CREDENTIALS", 401),
+        ("WYRD_CLIENT_413_PAYLOAD_TOO_LARGE", 413),
+        ("WYRD_CLIENT_422_ROW_DESERIALIZATION", 422),
+        ("WYRD_CLIENT_429_QUEUE_FULL", 429),
+        ("WYRD_CLIENT_503_TRANSPORT_DOWN", 503),
+        ("WYRD_CLIENT_504_FLUSH_TIMEOUT", 504),
+    ];
+
+    /// Proves every code a public Python owner emits is owned by the catalog.
+    ///
+    /// `from_code` is the reconstruction the client, queue, and Python
+    /// boundaries all route through. A code with no catalog variant returns
+    /// `None` there and its caller degrades the failure to an opaque internal
+    /// error, which is exactly the loss of actionable metadata this change
+    /// exists to prevent.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a listed code has no catalog variant, reconstructs onto a
+    /// different code, reports a status that disagrees with its own code
+    /// segment, or carries placeholder title or remediation text.
+    #[test]
+    fn python_boundary_codes_resolve_through_the_catalog() {
+        for (code, status) in PYTHON_BOUNDARY_CODES {
+            let error = WyrdError::from_code(
+                code,
+                "boundary failure".to_owned(),
+                serde_json::json!({ "field": "value" }),
+            )
+            .unwrap_or_else(|| panic!("{code} has no derive-backed catalog variant"));
+
+            assert_eq!(error.code(), *code, "reconstruction changed the code");
+            assert_eq!(error.status(), *status, "{code} status regressed");
+            assert!(!error.title().is_empty(), "{code} has no title");
+            assert!(
+                error.remediation().len() > 20,
+                "{code} remediation is not actionable: {}",
+                error.remediation()
+            );
+
+            let problem = error.as_problem_json();
+            assert_eq!(problem["code"], *code);
+            assert_eq!(problem["status"], *status);
+            assert_eq!(problem["detail"], "boundary failure");
+            assert_eq!(problem["details"]["field"], "value");
+        }
+    }
+
+    /// The Bifrost serialization code the queue emits is catalog-owned too.
+    ///
+    /// `BifrostError` variants are not `{ message, details }` shaped, so they
+    /// never reconstruct through `from_code`; the guard here is that the code
+    /// exists with its real 400 status instead of being absent entirely.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the schema-parse code or status drifts.
+    #[test]
+    fn bifrost_schema_parse_is_catalog_owned() {
+        let error = WyrdError::Vala {
+            error: crate::vala::error::BifrostError::SchemaParse {
+                detail: "column 'age' is not an i64".to_owned(),
+            },
+        };
+
+        assert_eq!(error.code(), "WYRD_VALA_400_SCHEMA_PARSE");
+        assert_eq!(error.status(), 400);
+        assert_eq!(
+            error.as_problem_json()["details"]["data"]["detail"],
+            "column 'age' is not an i64"
+        );
+    }
+
     #[test]
     fn auth_codes_match_status() {
         for error in auth_errors() {

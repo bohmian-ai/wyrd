@@ -143,3 +143,46 @@ git diff --check
 Do not run `mise run gate`, `mise run test:rust`, `mise run test:shared`,
 `mise run test:wyrd`, `mise run test:skald`, `mise run test:vala`, or any full
 Python test lane.
+
+## Implementation Evidence
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| `WyrdPyResult<T>` / `WyrdPyError` exist with the approved shape and delegate to `wyrd_error_to_py_err` | `crates/shared/wyrd-utils/src/py.rs` (`WyrdPyResult`, `WyrdPyError`, `From<WyrdPyError> for PyErr`) | `mise exec -- cargo check --locked -p wyrd-utils --features python`; `mise run lints` | PASS |
+| Python exception is a shared `WyrdError` exposing all nine mutually consistent fields | `crates/shared/wyrd-utils/src/py.rs::build_wyrd_py_exception` (added the missing `detail` attribute) | `mise exec -- uv run pytest tests/test_error_contract.py` (3 passed) | PASS |
+| Every stable public Python code migrating in PYERR-T02 resolves through the derive-backed catalog with actionable metadata | `crates/wyrd-spec/src/error.rs` (+40 `WYRD_AGENT_*`, `WYRD_SESSION_*`, `WYRD_TOOL_*`, `WYRD_RUNTIME_*`, `WYRD_WORKFLOW_*`, `WYRD_CLIENT_*` variants); `crates/wyrd-spec/src/vala/error.rs::BifrostError::SchemaParse` | `mise exec -- cargo nextest run --locked -p wyrd-spec --lib -E 'test(=error::tests::python_boundary_codes_resolve_through_the_catalog) + test(=error::tests::bifrost_schema_parse_is_catalog_owned)'` (2 passed) | PASS |
+| Unknown or internal sources fail safely without panicking or swallowing a construction error | Unchanged `wyrd_error_to_py_err` `PyRuntimeError` fallback and `WyrdError::from_code` `None` contract | `crates/shared/wyrd-client/src/error.rs::tests::unknown_code_preserved_in_catch_all` (existing) | PASS |
+| `wyrd-spec` stays PyO3-free; no new dependency or Cargo feature | No manifest changes in the diff | `mise run check:pyo3-scope`; `git diff --stat` shows no `Cargo.toml` change | PASS |
+| Generated stubs describe the runtime shared exception shape | `python/py-wyrd/python/wyrd/stubs/error.pyi` (source), `_wyrd.pyi` (regenerated) | `mise run codegen:check`; `mise run py:typecheck` | PASS |
+| No duplicate converter, exception registration, problem builder, or parallel metadata accessor added | Only `wyrd-utils/src/py.rs` gained types; no new `create_exception!` or metadata table | `mise run lints`; `git diff --stat` | PASS |
+
+### Commands
+
+```
+mise run fmt
+mise run lints
+mise run py:format
+mise run py:lints
+mise run py:typecheck
+mise run check:pyo3-scope
+mise run check:error-coverage
+mise run codegen:check
+git diff --check
+mise exec -- cargo nextest run --locked -p wyrd-spec --lib \
+  -E 'test(=error::tests::python_boundary_codes_resolve_through_the_catalog) + test(=error::tests::bifrost_schema_parse_is_catalog_owned)'
+mise run py:setup
+cd python/py-wyrd && mise exec -- uv run pytest tests/test_error_contract.py
+```
+
+### Material limits
+
+- The derive rejects any code that does not start with `WYRD_`
+  (`crates/shared/wyrd-error-derive/src/lib.rs::validate_code`). Catalog
+  ownership of the Skald-emitted codes therefore lands under the canonical
+  `WYRD_*` domain names the existing `skald-observer` projection already maps
+  `SKALD_*` onto. PYERR-T02 performs the caller-side switch.
+- `BifrostError::SchemaParse` is not `{ message, details }` shaped, so it does
+  not reconstruct through `WyrdError::from_code`. PYERR-T02 converts the queue's
+  schema-parse failure explicitly rather than through code reconstruction.
+- Non-goals stayed excluded: no owner crate, server, CLI, MCP, or TypeScript
+  behavior changed; no aggregate test lane was run.

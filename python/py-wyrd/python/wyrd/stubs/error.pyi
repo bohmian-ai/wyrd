@@ -8,9 +8,12 @@ class WyrdError(Exception):
     """Python-facing Wyrd error with stable metadata.
 
     Wyrd raises this exception for validation and boundary failures that have a
-    durable Wyrd error code. The attributes are intended for both humans and
-    agents: `code` is stable, `message` explains the failure, `details` carries
-    structured context, and `remediation` tells the caller what to change next.
+    durable Wyrd error code. Every attribute is projected from one RFC 9457
+    problem document, so `problem` and the direct attributes always agree:
+    `code` is stable, `message` and `detail` carry the same human-readable
+    failure text, `details` carries structured context, `status`, `title`, and
+    `type` mirror the problem document, and `remediation` tells the caller what
+    to change next.
     """
 
     code: str
@@ -18,6 +21,10 @@ class WyrdError(Exception):
     detail: str
     details: dict[str, Any] | None
     remediation: str
+    status: int
+    title: str
+    type: str
+    problem: dict[str, Any]
 
     def __init__(
         self,

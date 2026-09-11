@@ -195,6 +195,19 @@ pub enum BifrostError {
         message: String,
     },
 
+    /// A Bifrost schema, or a row value measured against it, failed to map.
+    #[error("schema parse failed: {detail}")]
+    #[wyrd_error(
+        code = "WYRD_VALA_400_SCHEMA_PARSE",
+        status = 400,
+        title = "Bifrost schema parse failed",
+        remediation = "Correct the column type or the row value so it satisfies the table's declared DataTypeSpec."
+    )]
+    SchemaParse {
+        /// Human-readable schema or value validation detail.
+        detail: String,
+    },
+
     /// A user-supplied schema field uses a reserved system column name.
     #[error("reserved system column: {column}")]
     #[wyrd_error(

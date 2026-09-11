@@ -20,6 +20,30 @@ create_exception!(wyrd._wyrd, AgentError, WyrdError, "Agent Wyrd error.");
 create_exception!(wyrd._wyrd, ToolError, WyrdError, "Tool Wyrd error.");
 create_exception!(wyrd._wyrd, SessionError, WyrdError, "Session Wyrd error.");
 
+/// Result alias for every Wyrd-owned public Python operation.
+///
+/// A Wyrd-owned failure crosses the Python boundary only as a catalog-backed
+/// [`SpecWyrdError`]; `?` on a [`WyrdPyError`] therefore always projects
+/// through [`wyrd_error_to_py_err`], which is the sole final projector.
+pub type WyrdPyResult<T> = Result<T, WyrdPyError>;
+
+/// Shared cross-crate Python boundary error for Wyrd-owned failures.
+///
+/// Owner crates convert their internal error into a derive-backed
+/// [`SpecWyrdError`] first, then let `?` widen it here. The newtype carries no
+/// metadata of its own, so there is exactly one public projection of code,
+/// status, title, detail, details, and remediation.
+#[derive(Debug, thiserror::Error)]
+#[error(transparent)]
+pub struct WyrdPyError(#[from] SpecWyrdError);
+
+impl From<WyrdPyError> for PyErr {
+    /// Project the wrapped catalog error through the shared converter.
+    fn from(error: WyrdPyError) -> Self {
+        wyrd_error_to_py_err(error.0)
+    }
+}
+
 /// Convert a JSON value to a Python object.
 ///
 /// # Errors
@@ -269,7 +293,8 @@ fn build_wyrd_py_exception(py: Python<'_>, error: SpecWyrdError) -> PyResult<Bou
 
     let exception = exception_type_for_code(py, &code).call1((message.clone(),))?;
     exception.setattr("code", code)?;
-    exception.setattr("message", message)?;
+    exception.setattr("message", message.clone())?;
+    exception.setattr("detail", message)?;
     exception.setattr("details", json_to_pyobject(py, &details)?.bind(py))?;
     exception.setattr("remediation", remediation)?;
     exception.setattr("status", status)?;

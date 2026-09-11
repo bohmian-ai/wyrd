@@ -437,15 +437,35 @@ impl CloseoutJourney {
             .tenant_conn_for(binding.tenant)
             .await
             .expect("tenant audit");
+        let resource = format!("forge-task:{task}");
         let deleted: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM vala.audit_outbox \
              WHERE resource=$1 AND operation='forge.expired_cleanup.candidate_deleted'",
         )
-        .bind(format!("forge-task:{task}"))
+        .bind(&resource)
         .fetch_one(&mut **conn.transaction())
         .await
         .expect("audited physical deletion");
         conn.commit().await.expect("audit inspection releases SQL");
+        // The row is owed to retained history the moment it is written, so the
+        // server's publisher may already have moved it out of the outbox. Only
+        // an empty outbox answer needs the retained half; asking for it every
+        // time would put a fused query on a path that has nothing to learn.
+        let deleted = if deleted > 0 {
+            deleted
+        } else {
+            i64::try_from(
+                self.retained_audit_rows(
+                    binding.tenant,
+                    &format!(
+                        "resource = '{resource}' \
+                         AND operation = 'forge.expired_cleanup.candidate_deleted'"
+                    ),
+                )
+                .await,
+            )
+            .expect("retained audit count is representable")
+        };
         assert!(deleted > 0);
         eprintln!(
             "expired cleanup task={task}, worker={}, physically deleted={path}",
@@ -879,29 +899,16 @@ impl CloseoutJourney {
             .count()
     }
 
-    /// Proves one audited sequence carries the expected operation name.
+    /// Counts retained audit rows matching one SQL predicate.
     ///
-    /// A settlement is audited exactly once, but it lives in one of two places
-    /// depending on whether the server's publisher has run: the transactional
-    /// outbox until it ships, retained history afterwards. Retained history is
-    /// read through the same authorized query path a caller uses, and a
-    /// sequence present in neither place is a lost audit event, not a timing
-    /// difference.
+    /// Retained history is read through the same authorized query path a caller
+    /// uses. A tenant whose history has never been published owns no such table
+    /// yet, which is an honest zero rather than a failure.
     ///
     /// # Panics
-    /// Panics when the sequence carries another operation, or when it is absent
-    /// from both the outbox and retained history.
-    async fn assert_audited(
-        &self,
-        tenant: DataTenantId,
-        owed: &std::collections::BTreeMap<i64, String>,
-        seq: i64,
-        expected: &str,
-    ) {
-        if let Some(operation) = owed.get(&seq) {
-            assert_eq!(operation, expected, "owed audit event {seq}");
-            return;
-        }
+    /// Panics when the retained read fails for any reason other than the table
+    /// not existing yet.
+    async fn retained_audit_rows(&self, tenant: DataTenantId, predicate: &str) -> u64 {
         let permission = wyrd_runtime::Permission::bifrost_query_read();
         let principal = wyrd_runtime::Principal::new(
             wyrd_spec::auth::PrincipalId::new(Uuid::now_v7()),
@@ -925,18 +932,49 @@ impl CloseoutJourney {
             tokio_util::sync::CancellationToken::new(),
         )
         .run(wyrd_spec::vala::api::BifrostQueryRequest {
-            sql: format!(
-                "SELECT seq FROM vala.system.audit_log \
-                 WHERE seq = {seq} AND operation = '{expected}'"
-            ),
+            sql: format!("SELECT seq FROM vala.system.audit_log WHERE {predicate}"),
             visibility: wyrd_spec::vala::api::VisibilityMode::Fused,
             freshness: wyrd_spec::vala::api::FreshnessPolicy::Strict,
             deadline_ms: Some(60_000),
         })
-        .await
-        .expect("retained audit history is readable");
+        .await;
+        match outcome {
+            Ok(outcome) => outcome.rows,
+            Err(wyrd_spec::error::WyrdError::Vala {
+                error: wyrd_spec::vala::error::BifrostError::TableNotFound { .. },
+            }) => 0,
+            Err(error) => panic!("retained audit history is readable: {error:?}"),
+        }
+    }
+
+    /// Proves one audited sequence carries the expected operation name.
+    ///
+    /// A settlement is audited exactly once, but it lives in one of two places
+    /// depending on whether the server's publisher has run: the transactional
+    /// outbox until it ships, retained history afterwards. Retained history is
+    /// read through the same authorized query path a caller uses, and a
+    /// sequence present in neither place is a lost audit event, not a timing
+    /// difference.
+    ///
+    /// # Panics
+    /// Panics when the sequence carries another operation, or when it is absent
+    /// from both the outbox and retained history.
+    async fn assert_audited(
+        &self,
+        tenant: DataTenantId,
+        owed: &std::collections::BTreeMap<i64, String>,
+        seq: i64,
+        expected: &str,
+    ) {
+        if let Some(operation) = owed.get(&seq) {
+            assert_eq!(operation, expected, "owed audit event {seq}");
+            return;
+        }
+        let retained = self
+            .retained_audit_rows(tenant, &format!("seq = {seq} AND operation = '{expected}'"))
+            .await;
         assert_eq!(
-            outcome.rows, 1,
+            retained, 1,
             "audit sequence {seq} left the outbox without reaching retained history as {expected}"
         );
     }

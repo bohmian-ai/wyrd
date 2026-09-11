@@ -1511,7 +1511,7 @@ impl ForgeFixture {
             .await
             .expect("Forge fixture audit tenant connection");
         sqlx::query_scalar(
-            "SELECT count(*) FROM vala.audit_outbox WHERE data_tenant_id = wyrd.current_tenant() AND resource = $1 AND operation = $2",
+            "SELECT count(*) FROM vala.audit_staging WHERE data_tenant_id = wyrd.current_tenant() AND resource = $1 AND operation = $2",
         )
         .bind(format!(
             "bifrost://{}/{}/{}",
@@ -1690,32 +1690,6 @@ fn fixture_ingress_ipc(batch: &RecordBatch) -> bytes::Bytes {
     bytes::Bytes::from(ipc)
 }
 
-/// Build the server-shaped audit event committed with one fixture ingest.
-fn fixture_ingest_audit_event(
-    tenant: DataTenantId,
-    principal: &wyrd_runtime::principal::Principal,
-    binding: &TenantTableBinding,
-) -> wyrd_spec::vala::api::AuditEvent {
-    let _ = tenant;
-    wyrd_spec::vala::api::AuditEvent::new(
-        wyrd_spec::request_id::RequestId::now_v7(),
-        None,
-        "bifrost.write".to_owned(),
-        format!(
-            "bifrost://{}/{}",
-            binding.logical_namespace, binding.table_name
-        ),
-        None,
-        principal.id,
-        wyrd_spec::auth::PrincipalKindTag::User,
-        wyrd_spec::vala::api::AuthMethod::Internal,
-        "bifrost_write:write".to_owned(),
-        wyrd_spec::vala::api::AuditDecision::Allow,
-        wyrd_spec::vala::api::AuditResult::Success,
-        "Forge fixture ingest".to_owned(),
-    )
-}
-
 /// Drive one real Scribe append and seal, committing the `file_list` rows
 /// Scribe's own file-list writer produced.
 ///
@@ -1746,7 +1720,6 @@ async fn scribe_append_and_seal(
         roles: Vec::new(),
         effective_permissions: wyrd_runtime::PermissionSet::new(),
     };
-    let audit_event = fixture_ingest_audit_event(tenant, &principal, binding);
     scribe
         .ingest_native_for_test(NativeIngressTestFrame {
             principal,
@@ -1754,7 +1727,6 @@ async fn scribe_append_and_seal(
             expected_schema_fingerprint: fingerprint,
             request_id: wyrd_spec::request_id::RequestId::now_v7(),
             batch_id: uuid::Uuid::now_v7(),
-            audit_event,
             payload: fixture_ingress_ipc(batch),
         })
         .await

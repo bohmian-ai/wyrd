@@ -7,7 +7,7 @@ use arrow::datatypes::Schema;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
-use vala_sql::row_types::audit_outbox::AuditOutboxRow;
+use vala_sql::row_types::audit_staging::AuditStagingRow;
 use wyrd_spec::DataTenantId;
 
 use super::AuditLogTable;
@@ -72,7 +72,7 @@ pub enum AuditProjectionError {
 /// Project one authenticated tenant's ordered audit rows without IO.
 pub fn project_audit_rows(
     authenticated_tenant: DataTenantId,
-    rows: &[AuditOutboxRow],
+    rows: &[AuditStagingRow],
 ) -> Result<AuditProjection, AuditProjectionError> {
     let range = validate_range(authenticated_tenant, rows)?;
     Ok(AuditProjection {
@@ -91,7 +91,7 @@ struct ValidatedAuditRange {
 
 fn validate_range(
     authenticated_tenant: DataTenantId,
-    rows: &[AuditOutboxRow],
+    rows: &[AuditStagingRow],
 ) -> Result<ValidatedAuditRange, AuditProjectionError> {
     if rows.is_empty() {
         return Err(AuditProjectionError::Empty);
@@ -143,7 +143,7 @@ fn validate_range(
     Ok(ValidatedAuditRange { seq_lo, seq_hi })
 }
 
-fn project_record_batch(rows: &[AuditOutboxRow]) -> Result<RecordBatch, AuditProjectionError> {
+fn project_record_batch(rows: &[AuditStagingRow]) -> Result<RecordBatch, AuditProjectionError> {
     let seq_values = rows.iter().map(|row| row.seq).collect::<Vec<_>>();
     let entry_hash_values = rows
         .iter()
@@ -294,8 +294,8 @@ mod tests {
         DataTenantId::new(Uuid::from_bytes(bytes)).expect("UUIDv7 test tenant")
     }
 
-    fn row(tenant: DataTenantId, seq: i64) -> AuditOutboxRow {
-        AuditOutboxRow {
+    fn row(tenant: DataTenantId, seq: i64) -> AuditStagingRow {
+        AuditStagingRow {
             data_tenant_id: tenant.as_uuid(),
             seq,
             entry_hash: vec![0xab; 32],

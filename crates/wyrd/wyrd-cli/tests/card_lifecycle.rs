@@ -1931,7 +1931,7 @@ mod pg_tests {
         .expect("failure function installs");
         sqlx::query(
             r#"CREATE TRIGGER test_fail_cli_card_completion_audit
-               BEFORE INSERT ON vala.audit_outbox
+               BEFORE INSERT ON vala.audit_staging
                FOR EACH ROW EXECUTE FUNCTION vala.test_fail_cli_card_completion_audit()"#,
         )
         .execute(&superuser)

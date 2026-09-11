@@ -1013,7 +1013,7 @@ impl BifrostCatalog {
         )
         .await?;
         if let Some(event) = request.audit.as_ref() {
-            vala_sql::queries::audit_outbox::append_audit(&mut conn, event)
+            vala_sql::queries::audit_staging::append_audit(&mut conn, event)
                 .await
                 .map_err(|error| {
                     tracing::error!(error = %error, table = %fqn, "Redux catalog audit append failed");

@@ -803,7 +803,7 @@ async fn rewrite_audit_facts(
     .await
     .expect("Forge settlement inspection");
     let appended = sqlx::query_as::<_, (i64, String, Option<String>)>(
-        "SELECT seq, operation, detail FROM vala.audit_outbox \
+        "SELECT seq, operation, detail FROM vala.audit_staging \
          WHERE data_tenant_id = $1 AND resource = $2 \
            AND operation LIKE 'forge.iceberg_rewrite.%' \
          ORDER BY seq",

@@ -1,7 +1,7 @@
 //! Transactional storage lifecycle audit helpers.
 
 use sqlx::types::Uuid;
-use vala_sql::queries::audit_outbox::append_audit;
+use vala_sql::queries::audit_staging::append_audit;
 use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::storage::StorageBackendKind;

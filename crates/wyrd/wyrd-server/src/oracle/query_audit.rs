@@ -617,7 +617,7 @@ fn build_event(
 /// Appends and commits one tenant event through the canonical SQL writer.
 async fn relay_record(vala: &ValaPostgres, record: &AuditWalRecord) -> Result<(), ()> {
     let mut conn = vala.tenant_conn(record.tenant).await.map_err(|_| ())?;
-    vala_sql::queries::audit_outbox::append_audit(&mut conn, &record.event)
+    vala_sql::queries::audit_staging::append_audit(&mut conn, &record.event)
         .await
         .map_err(|_| ())?;
     conn.commit().await.map_err(|_| ())
@@ -743,7 +743,7 @@ mod pg_tests {
                 .expect("local acceptance");
             tokio::time::sleep(Duration::from_millis(250)).await;
             let mut conn = vala.tenant_conn(tenant).await.expect("tenant connection");
-            let count: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.audit_outbox WHERE operation = 'bifrost.query.read_decision'").fetch_one(&mut **conn.transaction()).await.expect("audit count");
+            let count: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.audit_staging WHERE operation = 'bifrost.query.read_decision'").fetch_one(&mut **conn.transaction()).await.expect("audit count");
             assert_eq!(count, 1);
             publisher
                 .shutdown(Instant::now() + Duration::from_secs(1))
@@ -779,7 +779,7 @@ mod pg_tests {
             let restarted = OracleAuditPublisher::new(vala.clone(), config).expect("restart");
             tokio::time::sleep(Duration::from_millis(250)).await;
             let mut conn = vala.tenant_conn(tenant).await.expect("tenant connection");
-            let count: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.audit_outbox WHERE operation = 'bifrost.query.read_decision'").fetch_one(&mut **conn.transaction()).await.expect("audit count");
+            let count: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.audit_staging WHERE operation = 'bifrost.query.read_decision'").fetch_one(&mut **conn.transaction()).await.expect("audit count");
             assert!(
                 count >= 2,
                 "commit/checkpoint window replays a valid duplicate"
@@ -841,7 +841,7 @@ mod pg_tests {
 
             let mut conn = vala.tenant_conn(tenant).await.expect("tenant connection");
             let delegated_detail: String = sqlx::query_scalar(
-                "SELECT detail FROM vala.audit_outbox \
+                "SELECT detail FROM vala.audit_staging \
                  WHERE operation = 'bifrost.query.read_decision' AND request_id = $1 \
                  ORDER BY seq DESC LIMIT 1",
             )
@@ -850,7 +850,7 @@ mod pg_tests {
             .await
             .expect("replayed delegated detail");
             let plain_detail: String = sqlx::query_scalar(
-                "SELECT detail FROM vala.audit_outbox \
+                "SELECT detail FROM vala.audit_staging \
                  WHERE operation = 'bifrost.query.read_decision' AND request_id = $1 \
                  ORDER BY seq DESC LIMIT 1",
             )
@@ -908,7 +908,7 @@ mod pg_tests {
                 .expect("second acceptance");
             tokio::time::sleep(Duration::from_millis(300)).await;
             let mut conn = vala.tenant_conn(tenant).await.expect("tenant connection");
-            let rows: Vec<(i64, Vec<u8>, Vec<u8>)> = sqlx::query_as("SELECT seq, prev_hash, entry_hash FROM vala.audit_outbox WHERE operation = 'bifrost.query.read_decision' ORDER BY seq DESC LIMIT 2").fetch_all(&mut **conn.transaction()).await.expect("chain rows");
+            let rows: Vec<(i64, Vec<u8>, Vec<u8>)> = sqlx::query_as("SELECT seq, prev_hash, entry_hash FROM vala.audit_staging WHERE operation = 'bifrost.query.read_decision' ORDER BY seq DESC LIMIT 2").fetch_all(&mut **conn.transaction()).await.expect("chain rows");
             assert!(rows.len() >= 2);
             assert_eq!(rows[0].1, rows[1].2, "newest prev hash links prior entry");
             publisher
@@ -939,7 +939,7 @@ mod pg_tests {
             };
             let count_before: i64 = {
                 let mut conn = vala.tenant_conn(tenant).await.expect("tenant connection");
-                sqlx::query_scalar("SELECT count(*) FROM vala.audit_outbox WHERE operation = 'bifrost.query.read_decision'").fetch_one(&mut **conn.transaction()).await.expect("baseline audit count")
+                sqlx::query_scalar("SELECT count(*) FROM vala.audit_staging WHERE operation = 'bifrost.query.read_decision'").fetch_one(&mut **conn.transaction()).await.expect("baseline audit count")
             };
             let publisher = OracleAuditPublisher::new(vala.clone(), config).expect("publisher");
             let pause = publisher.pause_relay_before_postgres();
@@ -974,7 +974,7 @@ mod pg_tests {
             );
             let count_after: i64 = {
                 let mut conn = vala.tenant_conn(tenant).await.expect("tenant connection");
-                sqlx::query_scalar("SELECT count(*) FROM vala.audit_outbox WHERE operation = 'bifrost.query.read_decision'").fetch_one(&mut **conn.transaction()).await.expect("audit count")
+                sqlx::query_scalar("SELECT count(*) FROM vala.audit_staging WHERE operation = 'bifrost.query.read_decision'").fetch_one(&mut **conn.transaction()).await.expect("audit count")
             };
             assert_eq!(
                 count_after - count_before,

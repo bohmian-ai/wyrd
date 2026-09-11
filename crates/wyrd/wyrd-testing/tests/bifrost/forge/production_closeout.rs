@@ -439,7 +439,7 @@ impl CloseoutJourney {
             .expect("tenant audit");
         let resource = format!("forge-task:{task}");
         let deleted: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM vala.audit_outbox \
+            "SELECT count(*) FROM vala.audit_staging \
              WHERE resource=$1 AND operation='forge.expired_cleanup.candidate_deleted'",
         )
         .bind(&resource)
@@ -536,8 +536,8 @@ impl CloseoutJourney {
         let rows: Vec<(Uuid, String, String)> = sqlx::query_as(
             "SELECT o.operation_id, p.operation, t.operation \
              FROM vala.forge_operation_state o \
-             JOIN vala.audit_outbox p ON p.data_tenant_id=o.data_tenant_id AND p.seq=o.prepared_audit_seq \
-             JOIN vala.audit_outbox t ON t.data_tenant_id=o.data_tenant_id AND t.seq=o.terminal_audit_seq \
+             JOIN vala.audit_staging p ON p.data_tenant_id=o.data_tenant_id AND p.seq=o.prepared_audit_seq \
+             JOIN vala.audit_staging t ON t.data_tenant_id=o.data_tenant_id AND t.seq=o.terminal_audit_seq \
              WHERE o.family='orphan_gc'",
         )
         .fetch_all(&mut **conn.transaction())
@@ -1013,7 +1013,7 @@ impl CloseoutJourney {
         // audited minutes ago is legitimately gone from here. Both sides are
         // read, and a sequence found in neither is a lost audit event.
         let owed: Vec<(i64, String)> =
-            sqlx::query_as("SELECT seq, operation FROM vala.audit_outbox")
+            sqlx::query_as("SELECT seq, operation FROM vala.audit_staging")
                 .fetch_all(&mut **conn.transaction())
                 .await
                 .expect("owed audit evidence");

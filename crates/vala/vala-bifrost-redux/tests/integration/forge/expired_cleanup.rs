@@ -62,7 +62,7 @@ async fn audits(fixture: &PromotionIntegrationFixture, task_id: Uuid) -> Vec<Str
         .await
         .expect("fixture tenant connection");
     let operations: Vec<String> = sqlx::query_scalar(
-        "SELECT operation FROM vala.audit_outbox WHERE resource = $1 ORDER BY seq",
+        "SELECT operation FROM vala.audit_staging WHERE resource = $1 ORDER BY seq",
     )
     .bind(format!("forge-task:{task_id}"))
     .fetch_all(&mut **conn.transaction())

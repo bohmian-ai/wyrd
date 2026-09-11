@@ -219,7 +219,7 @@ mod pg_tests {
 
         let mut conn = server.tenant_conn_for(tenant).await?;
         let denial: Vec<(uuid::Uuid, String, Option<String>)> = sqlx::query_as(
-            "SELECT principal_id, decision, detail FROM vala.audit_outbox \
+            "SELECT principal_id, decision, detail FROM vala.audit_staging \
              WHERE operation = 'vala.query.sync' AND request_id = $1",
         )
         .bind(denied_request_id.as_str())
@@ -262,7 +262,7 @@ mod pg_tests {
     ) -> Result<serde_json::Value, McpJourneyError> {
         let mut conn = server.tenant_conn_for(tenant).await?;
         let detail: String = sqlx::query_scalar(
-            "SELECT detail FROM vala.audit_outbox \
+            "SELECT detail FROM vala.audit_staging \
              WHERE operation = 'bifrost.query.read_decision' AND request_id = $1 \
              ORDER BY seq DESC LIMIT 1",
         )

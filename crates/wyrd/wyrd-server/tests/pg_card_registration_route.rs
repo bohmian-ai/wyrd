@@ -517,7 +517,7 @@ async fn registration_replays_through_public_authenticated_route() {
         .await
         .expect("tenant connection opens");
     let audit_count: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM vala.audit_outbox \
+        "SELECT count(*) FROM vala.audit_staging \
          WHERE operation = 'card.registration.create' AND principal_id = $1",
     )
     .bind(id.as_uuid())
@@ -1021,7 +1021,7 @@ async fn composite_registration_returns_leaf_first_outcomes_and_root() {
         .await
         .expect("tenant connection opens");
     let audit_count: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM vala.audit_outbox \
+        "SELECT count(*) FROM vala.audit_staging \
          WHERE operation = 'card.registration.create' AND principal_id = $1",
     )
     .bind(id.as_uuid())
@@ -1354,7 +1354,7 @@ async fn card_reconciler_dead_letters_after_three_failures() {
     let metadata: (String, String, Option<String>, Option<String>, i64) = sqlx::query_as(
         "SELECT reconcile_status, reconcile_kind, reconcile_last_error_code, \
                 reconcile_last_error_message, \
-                (SELECT count(*) FROM vala.audit_outbox \
+                (SELECT count(*) FROM vala.audit_staging \
                   WHERE operation = 'card.reconciliation.dead_letter' \
                     AND resource = $2) \
            FROM wyrd.cards WHERE card_uid = $1",
@@ -1421,7 +1421,7 @@ async fn completion_audit_failure_keeps_card_pending() {
     .expect("failure function installs");
     sqlx::query(
         r#"CREATE TRIGGER test_fail_card_completion_audit
-           BEFORE INSERT ON vala.audit_outbox
+           BEFORE INSERT ON vala.audit_staging
            FOR EACH ROW EXECUTE FUNCTION vala.test_fail_card_completion_audit()"#,
     )
     .execute(&superuser)
@@ -1485,7 +1485,7 @@ async fn completion_audit_failure_keeps_card_pending() {
     assert_eq!(card_state.0, "pending");
     assert!(card_state.1.is_none());
     let complete_audits: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM vala.audit_outbox WHERE operation = 'card.registration.complete'",
+        "SELECT count(*) FROM vala.audit_staging WHERE operation = 'card.registration.complete'",
     )
     .fetch_one(&mut **conn.transaction())
     .await
@@ -1540,7 +1540,7 @@ async fn delete_audit_failure_keeps_card_active() {
     .expect("failure function installs");
     sqlx::query(
         r#"CREATE TRIGGER test_fail_card_delete_audit
-           BEFORE INSERT ON vala.audit_outbox
+           BEFORE INSERT ON vala.audit_staging
            FOR EACH ROW EXECUTE FUNCTION vala.test_fail_card_delete_audit()"#,
     )
     .execute(&superuser)
@@ -1572,7 +1572,7 @@ async fn delete_audit_failure_keeps_card_active() {
             .await
             .expect("card state reads");
     let delete_audits: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM vala.audit_outbox \
+        "SELECT count(*) FROM vala.audit_staging \
          WHERE operation = 'card.registration' AND resource = $1",
     )
     .bind(format!("card:{card_uid}"))
@@ -1725,7 +1725,7 @@ async fn blob_storage_failure_is_audited_without_leaking_sql() {
     assert!(failure_state.1.is_none());
     assert!(failure_state.2.is_some());
     let blob_failure_audits: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM vala.audit_outbox \
+        "SELECT count(*) FROM vala.audit_staging \
          WHERE operation = 'card.registration.blob_write.failed'",
     )
     .fetch_one(&mut **conn.transaction())
@@ -1763,7 +1763,7 @@ async fn audit_append_failure_rolls_back_composite_transaction() {
            RETURNS trigger LANGUAGE plpgsql AS $$
            BEGIN
              IF NEW.operation = 'card.registration.create'
-                AND (SELECT count(*) FROM vala.audit_outbox
+                AND (SELECT count(*) FROM vala.audit_staging
                      WHERE data_tenant_id = NEW.data_tenant_id
                        AND request_id = NEW.request_id
                        AND operation = 'card.registration.create') >= 1 THEN
@@ -1778,7 +1778,7 @@ async fn audit_append_failure_rolls_back_composite_transaction() {
     .expect("failure function installs");
     sqlx::query(
         r#"CREATE TRIGGER test_fail_second_registration_audit
-           BEFORE INSERT ON vala.audit_outbox
+           BEFORE INSERT ON vala.audit_staging
            FOR EACH ROW EXECUTE FUNCTION vala.test_fail_second_registration_audit()"#,
     )
     .execute(&superuser)

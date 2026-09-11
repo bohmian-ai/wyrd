@@ -307,7 +307,7 @@ fn decode_managed_rows(batch: &arrow::record_batch::RecordBatch) -> Vec<ManagedR
 
 /// Reads the rewrite audit rows one table's retained history already holds.
 ///
-/// `vala.audit_outbox` is delivery state: the server's own publisher moves a
+/// `vala.audit_staging` is delivery state: the server's own publisher moves a
 /// settled range into `vala.system.audit_log` and retires it, so an audit row
 /// written minutes ago is legitimately no longer in the outbox. A journey that
 /// inspects Forge's audit cardinality must therefore look in both places, and

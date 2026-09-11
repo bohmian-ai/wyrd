@@ -1,6 +1,6 @@
 use vala_bifrost_redux::tables::audit::projection::project_audit_rows;
-use vala_sql::queries::audit_outbox::{append_audit, list_publication_batch};
-use vala_sql::row_types::audit_outbox::AuditOutboxRow;
+use vala_sql::queries::audit_staging::{append_audit, list_publication_batch};
+use vala_sql::row_types::audit_staging::AuditStagingRow;
 use wyrd_runtime::permission::PermissionSet;
 use wyrd_runtime::{Principal, PrincipalKind};
 use wyrd_spec::DataTenantId;
@@ -107,8 +107,8 @@ async fn await_retained(
 /// twice without racing the server's own publisher for a real one. Everything
 /// the deduplication decision depends on is real: the tenant and the inclusive
 /// sequence range the deterministic batch id is derived from.
-fn synthetic_row(tenant: DataTenantId, seq: i64, operation: &str) -> AuditOutboxRow {
-    AuditOutboxRow {
+fn synthetic_row(tenant: DataTenantId, seq: i64, operation: &str) -> AuditStagingRow {
+    AuditStagingRow {
         data_tenant_id: tenant.as_uuid(),
         seq,
         entry_hash: vec![0; 32],
@@ -152,7 +152,7 @@ async fn replayed_audit_publication_retains_each_event_once() -> Result<(), Serv
         uuid::Uuid::now_v7().simple()
     );
 
-    let rows: Vec<AuditOutboxRow> = (0..3)
+    let rows: Vec<AuditStagingRow> = (0..3)
         .map(|offset| synthetic_row(tenant, 9_000_000_000 + offset, &operation))
         .collect();
 
@@ -175,7 +175,7 @@ async fn replayed_audit_publication_retains_each_event_once() -> Result<(), Serv
 
 /// An audited transition reaches retained history and only then leaves the outbox.
 ///
-/// `vala.audit_outbox` is transient delivery state and `vala.system.audit_log`
+/// `vala.audit_staging` is transient delivery state and `vala.system.audit_log`
 /// is the retained authority, so a row may retire only once its content is
 /// durable in the Bifrost table. This appends one distinctive event through the
 /// production writer, runs the production publisher, and asserts both halves of

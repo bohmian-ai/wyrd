@@ -1,5 +1,5 @@
 //! Tenant-scoped writes and reads for the audit outbox:
-//! `vala.audit_chain_head` and `vala.audit_outbox`.
+//! `vala.audit_chain_head` and `vala.audit_staging`.
 //!
 //! `append_audit` runs in the audited operation's own [`TenantConn`]
 //! transaction: it advances the per-tenant chain head under a `FOR UPDATE`
@@ -11,20 +11,19 @@
 use sha2::{Digest, Sha256};
 use sqlx::{PgConnection, Postgres, Transaction};
 use wyrd_spec::DataTenantId;
-use wyrd_spec::vala::api::{
-    AuditDecision, AuditEvent, AuditResult, AuthMethod, audit_detail_canonical_json,
-};
+use wyrd_spec::vala::api::{AuditEvent, AuditOutcome, audit_detail_canonical_json};
 use wyrd_sql::TenantConn;
 
 use crate::SqlError;
-use crate::row_types::audit_outbox::AuditOutboxRow;
+use crate::row_types::audit_staging::AuditStagingRow;
 
 /// Append one hash-chained audit row for the current tenant, returning its `seq`.
 ///
 /// Advances `vala.audit_chain_head` under `FOR UPDATE` so concurrent appends for
 /// the same tenant serialize into a gapless sequence, then inserts the row into
-/// `vala.audit_outbox`. Runs inside the caller's transaction so the audit row is
-/// durable exactly when — and only when — the audited operation commits.
+/// `vala.audit_staging`. Runs inside the caller's transaction so the decision
+/// record is durable exactly when — and only when — the authorization decision
+/// that produced it is.
 ///
 /// # Errors
 /// Returns [`SqlError`] when any statement fails or an RLS policy rejects a row.
@@ -122,12 +121,12 @@ async fn append_audit_connection(
 
     sqlx::query(
         r#"
-        INSERT INTO vala.audit_outbox
+        INSERT INTO vala.audit_staging
             (data_tenant_id, seq, prev_hash, entry_hash, request_id, trace_id,
              operation, resource, card_ref, principal_id, principal_kind,
-             auth_method, permission, decision, result, payload_summary, detail)
+             permission, outcome, detail)
         VALUES (wyrd.current_tenant(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                $11, $12, $13, $14, $15, $16)
+                $11, $12, $13)
         "#,
     )
     .bind(seq)
@@ -140,11 +139,8 @@ async fn append_audit_connection(
     .bind(card_ref.as_deref())
     .bind(event.principal_id.as_uuid())
     .bind(event.principal_kind.as_str())
-    .bind(auth_method_str(event.auth_method))
     .bind(event.permission.as_str())
-    .bind(decision_str(event.decision))
-    .bind(result_str(event.result))
-    .bind(event.payload_summary.as_str())
+    .bind(outcome_str(event.outcome))
     .bind(detail.as_deref())
     .execute(&mut *conn)
     .await
@@ -190,13 +186,13 @@ pub async fn list_audit_events_for_resource(
     resource: &str,
     after_seq: i64,
     limit: i64,
-) -> Result<Vec<AuditOutboxRow>, SqlError> {
-    sqlx::query_as::<_, AuditOutboxRow>(
+) -> Result<Vec<AuditStagingRow>, SqlError> {
+    sqlx::query_as::<_, AuditStagingRow>(
         r#"
         SELECT data_tenant_id, seq, entry_hash, prev_hash, request_id, trace_id,
                operation, resource, card_ref, principal_id, principal_kind,
-               auth_method, permission, decision, result, payload_summary, detail, created_at
-          FROM vala.audit_outbox
+               permission, outcome, detail, created_at
+          FROM vala.audit_staging
          WHERE data_tenant_id = wyrd.current_tenant()
            AND resource = $1
            AND seq > $2
@@ -224,13 +220,13 @@ pub async fn list_audit_events_for_resource(
 pub async fn list_publication_batch(
     conn: &mut TenantConn<'_>,
     limit: i64,
-) -> Result<Vec<AuditOutboxRow>, SqlError> {
-    sqlx::query_as::<_, AuditOutboxRow>(
+) -> Result<Vec<AuditStagingRow>, SqlError> {
+    sqlx::query_as::<_, AuditStagingRow>(
         r#"
         SELECT data_tenant_id, seq, entry_hash, prev_hash, request_id, trace_id,
                operation, resource, card_ref, principal_id, principal_kind,
-               auth_method, permission, decision, result, payload_summary, detail, created_at
-          FROM vala.audit_outbox
+               permission, outcome, detail, created_at
+          FROM vala.audit_staging
          WHERE data_tenant_id = wyrd.current_tenant()
          ORDER BY seq
          LIMIT $1
@@ -242,30 +238,46 @@ pub async fn list_publication_batch(
     .map_err(SqlError::from)
 }
 
-/// Retire the inclusive `seq` range whose audit events are durably published.
+/// Advance the tenant watermark to `seq_hi` and delete every staged row through
+/// it, returning the rows actually drained.
 ///
 /// The caller MUST have observed a durable `vala.system.audit_log` publication
-/// for the whole range first. Retirement is idempotent: a repeated call after
-/// an uncertain outcome removes whatever survives and reports the rows it
-/// actually retired, so a lost acknowledgement costs one replayed shipment
-/// rather than a lost or duplicated audit event.
+/// for the whole range first. Both statements run in the caller's tenant
+/// transaction, so the watermark never advances without the deletion and the
+/// deletion never outruns the watermark. The watermark only ever moves forward,
+/// which makes the call idempotent: a replay after an uncertain outcome removes
+/// whatever survives and reports it, so a lost acknowledgement costs one
+/// replayed shipment rather than a lost or duplicated audit event.
 ///
 /// # Errors
-/// Returns [`SqlError`] when the delete fails or RLS rejects the range.
-pub async fn retire_published(
+/// Returns [`SqlError`] when the watermark update or the delete fails, or RLS
+/// rejects the range.
+pub async fn drain_through_watermark(
     conn: &mut TenantConn<'_>,
-    seq_lo: i64,
     seq_hi: i64,
 ) -> Result<u64, SqlError> {
-    let result = sqlx::query(
+    sqlx::query(
         r#"
-        DELETE FROM vala.audit_outbox
+        UPDATE vala.audit_chain_head
+           SET published_seq = GREATEST(published_seq, $1), updated_at = now()
          WHERE data_tenant_id = wyrd.current_tenant()
-           AND seq BETWEEN $1 AND $2
         "#,
     )
-    .bind(seq_lo)
     .bind(seq_hi)
+    .execute(&mut **conn.transaction())
+    .await
+    .map_err(SqlError::from)?;
+    let result = sqlx::query(
+        r#"
+        DELETE FROM vala.audit_staging
+         WHERE data_tenant_id = wyrd.current_tenant()
+           AND seq <= (
+               SELECT published_seq
+                 FROM vala.audit_chain_head
+                WHERE data_tenant_id = wyrd.current_tenant()
+           )
+        "#,
+    )
     .execute(&mut **conn.transaction())
     .await
     .map_err(SqlError::from)?;
@@ -294,11 +306,8 @@ fn entry_hash(
     push_opt(&mut buf, card_ref);
     buf.extend_from_slice(event.principal_id.as_uuid().as_bytes());
     push_str(&mut buf, event.principal_kind.as_str());
-    push_str(&mut buf, auth_method_str(event.auth_method));
     push_str(&mut buf, &event.permission);
-    push_str(&mut buf, decision_str(event.decision));
-    push_str(&mut buf, result_str(event.result));
-    push_str(&mut buf, &event.payload_summary);
+    push_str(&mut buf, outcome_str(event.outcome));
     push_opt(&mut buf, detail);
     Sha256::digest(&buf).into()
 }
@@ -318,98 +327,13 @@ fn push_opt(buf: &mut Vec<u8>, value: Option<&str>) {
     }
 }
 
-fn auth_method_str(method: AuthMethod) -> &'static str {
-    match method {
-        AuthMethod::Jwt => "jwt",
-        AuthMethod::Internal => "internal",
-    }
-}
-
-fn decision_str(decision: AuditDecision) -> &'static str {
-    match decision {
-        AuditDecision::Allow => "allow",
-        AuditDecision::Deny => "deny",
-    }
-}
-
-fn result_str(result: AuditResult) -> &'static str {
-    match result {
-        AuditResult::Success => "success",
-        AuditResult::Failure => "failure",
-    }
-}
-
-#[cfg(test)]
-mod pg_tests {
-    //! Database parity proof for the execute-only recovery audit encoder.
-
-    use wyrd_dev_fixtures::pg::PgFixture;
-    use wyrd_spec::{
-        auth::{PrincipalId, PrincipalKindTag},
-        request_id::RequestId,
-        vala::api::{AuditDecision, AuditDetail, AuditEvent, AuditResult, AuthMethod},
-    };
-
-    use super::entry_hash;
-
-    /// The SQL definer function produces the exact canonical Rust detail and hash bytes.
-    #[tokio::test]
-    async fn oracle_recovery_sql_hash_matches_canonical_rust_encoder() {
-        let fixture = PgFixture::start().await.expect("fixture starts");
-        let request_id = RequestId::now_v7();
-        let seq: i64 = sqlx::query_scalar(
-            "SELECT vala.append_oracle_admission_recovery_audit($1,$2,$3,$4,$5,$6)",
-        )
-        .bind(request_id.as_str())
-        .bind(2_i64)
-        .bind(3_i64)
-        .bind(5_i64)
-        .bind(8_i64)
-        .bind(13_i64)
-        .fetch_one(fixture.operator_pool().pool())
-        .await
-        .expect("recovery append executes");
-        let (stored_detail, stored_prev_hash, stored_entry_hash): (String, Vec<u8>, Vec<u8>) =
-            sqlx::query_as(
-                "SELECT detail,prev_hash,entry_hash FROM vala.audit_outbox \
-                 WHERE data_tenant_id=$1 AND seq=$2",
-            )
-            .bind(uuid::Uuid::nil())
-            .bind(seq)
-            .fetch_one(&fixture.superuser_pool().await.expect("superuser pool"))
-            .await
-            .expect("recovery audit reads");
-        let detail = AuditDetail::OracleAdmissionRecovery {
-            expired_lease_count: 2,
-            active_lease_count: 3,
-            interactive_slots: 5,
-            analytical_slots: 8,
-            total_slots: 13,
-        };
-        let canonical_detail = wyrd_spec::vala::api::audit_detail_canonical_json(&detail);
-        let event = AuditEvent::new(
-            request_id,
-            None,
-            "bifrost.oracle.admission_recovery".to_owned(),
-            "bifrost.oracle.admission".to_owned(),
-            None,
-            PrincipalId::new(uuid::Uuid::nil()),
-            PrincipalKindTag::Service,
-            AuthMethod::Internal,
-            "bifrost:oracle".to_owned(),
-            AuditDecision::Allow,
-            AuditResult::Success,
-            "recovered Oracle admission aggregates".to_owned(),
-        )
-        .with_detail(detail);
-        let expected_hash = entry_hash(
-            &stored_prev_hash,
-            seq,
-            &event,
-            None,
-            Some(&canonical_detail),
-        );
-        assert_eq!(stored_detail, canonical_detail);
-        assert_eq!(stored_entry_hash, expected_hash);
+/// Canonical durable spelling of one authorization outcome.
+///
+/// Used identically by the stored `outcome` column and the hash preimage, so a
+/// retained row reproduces its own `entry_hash` from what it stores.
+fn outcome_str(outcome: AuditOutcome) -> &'static str {
+    match outcome {
+        AuditOutcome::Allowed => "allowed",
+        AuditOutcome::Denied => "denied",
     }
 }

@@ -1,10 +1,10 @@
 -- Forge bounded operation state: one row per (tenant, resource, family, operation_id).
 --
--- Forge transitions append immutable evidence to vala.audit_outbox and
--- transactionally maintain this current-state projection. Bifrost has not been
--- deployed, so this first projection migration intentionally starts empty; new
--- Forge writers populate it from their first Prepared transition. Runtime code
--- never reduces audit history to reconstruct projection state.
+-- Forge transitions evaluate no principal permission, so this projection is
+-- their own self-contained lineage and recovery authority rather than audit
+-- history. Bifrost has not been deployed, so this first projection migration
+-- intentionally starts empty; new Forge writers populate it from their first
+-- Prepared transition.
 
 CREATE TABLE vala.forge_operation_state (
     data_tenant_id    uuid        NOT NULL,
@@ -18,15 +18,9 @@ CREATE TABLE vala.forge_operation_state (
     )),
     prepared_detail   jsonb       NOT NULL,
     current_detail    jsonb       NOT NULL,
-    prepared_audit_seq bigint     NOT NULL,
-    terminal_audit_seq bigint,
     prepared_at       timestamptz NOT NULL,
     updated_at        timestamptz NOT NULL,
-    PRIMARY KEY (data_tenant_id, resource, family, operation_id),
-    CHECK (
-        (phase = 'prepared' AND terminal_audit_seq IS NULL)
-        OR (phase <> 'prepared' AND terminal_audit_seq IS NOT NULL)
-    )
+    PRIMARY KEY (data_tenant_id, resource, family, operation_id)
 );
 
 ALTER TABLE vala.forge_operation_state ENABLE ROW LEVEL SECURITY;

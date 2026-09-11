@@ -356,7 +356,7 @@ mod pg_tests {
         let mut conn = server.tenant_conn_for(tenant).await?;
         let denial_rows: Vec<(String, uuid::Uuid, String, String, String)> = sqlx::query_as(
             "SELECT permission, principal_id, request_id, decision, result \
-             FROM vala.audit_outbox \
+             FROM vala.audit_staging \
              WHERE operation = $1 \
                AND request_id = $2",
         )

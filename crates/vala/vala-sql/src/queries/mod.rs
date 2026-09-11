@@ -9,7 +9,7 @@
 
 pub mod alerts;
 pub mod anchors;
-pub mod audit_outbox;
+pub mod audit_staging;
 pub mod cluster_nodes;
 pub mod drift_alerts;
 pub mod file_list;

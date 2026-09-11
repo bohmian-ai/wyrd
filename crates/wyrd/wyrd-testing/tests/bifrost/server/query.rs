@@ -89,7 +89,7 @@ async fn read_decision_detail(
 ) -> Result<serde_json::Value, ServerJourneyError> {
     let mut conn = server.tenant_conn_for(tenant).await?;
     let detail: String = sqlx::query_scalar(
-        "SELECT detail FROM vala.audit_outbox \
+        "SELECT detail FROM vala.audit_staging \
          WHERE operation = 'bifrost.query.read_decision' AND request_id = $1 \
          ORDER BY seq DESC LIMIT 1",
     )
@@ -109,7 +109,7 @@ const READINESS_CEILING: std::time::Duration = std::time::Duration::from_secs(30
 /// Waits until the Oracle read-audit WAL residual reaches zero.
 ///
 /// A query's read decision is durable at its local WAL fsync and reaches
-/// `vala.audit_outbox` through the production relay, so a count taken the
+/// `vala.audit_staging` through the production relay, so a count taken the
 /// instant a query settles can precede the relay. This polls the production
 /// residual counter — not a sleep, and not a retry over the assertion itself —
 /// so the asserted row counts observe a fully relayed server.
@@ -157,7 +157,7 @@ async fn audit_rows(
     await_audit_relay_convergence(server).await?;
     let mut conn = server.tenant_conn_for(tenant).await?;
     let count: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM vala.audit_outbox WHERE operation LIKE $1")
+        sqlx::query_scalar("SELECT count(*) FROM vala.audit_staging WHERE operation LIKE $1")
             .bind(operation)
             .fetch_one(&mut **conn.transaction())
             .await?;

@@ -757,7 +757,7 @@ async fn exact_delete_enforces_inbound_references_and_is_idempotent() {
         .await
         .expect("deleted card reads");
     let audits: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM vala.audit_outbox \
+        "SELECT count(*) FROM vala.audit_staging \
          WHERE operation = 'card.registration' AND resource = $1",
     )
     .bind(format!("card:{target_uid}"))

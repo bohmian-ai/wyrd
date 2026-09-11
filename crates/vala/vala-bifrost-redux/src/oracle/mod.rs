@@ -1202,7 +1202,7 @@ impl TestPostgresOracleAudit {
             .tenant_conn(context.data_tenant_id)
             .await
             .map_err(|_| BifrostError::QueryAuditUnavailable)?;
-        vala_sql::queries::audit_outbox::append_audit(&mut conn, &event)
+        vala_sql::queries::audit_staging::append_audit(&mut conn, &event)
             .await
             .map_err(|_| BifrostError::QueryAuditUnavailable)?;
         conn.commit()

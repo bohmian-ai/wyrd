@@ -2,7 +2,7 @@
 //!
 //! Every audited HTTP data-plane operation (register/install, query, RBAC deny)
 //! appends one hash-chained `AuditEvent` row into the
-//! transactional `vala.audit_outbox`. The attribution is derived from the
+//! transactional `vala.audit_staging`. The attribution is derived from the
 //! resolved [`Caller`]: `principal_id`/`principal_kind`/`card_ref` come straight
 //! off the `Principal`, `request_id` off the caller, and `auth_method` is `Jwt`
 //! because this surface is reached only through the HTTP JWT-bearer flow
@@ -18,7 +18,7 @@ pub mod publication;
 
 use sqlx::PgPool;
 use vala_sql::TenantConn;
-use vala_sql::queries::audit_outbox::append_audit;
+use vala_sql::queries::audit_staging::append_audit;
 use wyrd_spec::auth::{PLATFORM_AUDIT_PRINCIPAL, PrincipalKindTag};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::DataTenantId;

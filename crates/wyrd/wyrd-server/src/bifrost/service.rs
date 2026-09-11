@@ -340,12 +340,12 @@ mod pg_tests {
         state: &AppState,
         caller: &Caller,
         resource: &str,
-    ) -> Vec<vala_sql::row_types::audit_outbox::AuditOutboxRow> {
+    ) -> Vec<vala_sql::row_types::audit_staging::AuditStagingRow> {
         let mut conn =
             vala_sql::TenantConn::acquire(state.postgres.vala_pool(), caller.data_tenant_id)
                 .await
                 .expect("tenant connection");
-        let rows = vala_sql::queries::audit_outbox::list_audit_events_for_resource(
+        let rows = vala_sql::queries::audit_staging::list_audit_events_for_resource(
             &mut conn, resource, 0, 100,
         )
         .await
@@ -358,7 +358,7 @@ mod pg_tests {
 
     /// Assert one row carries the canonical RBAC-denial attribution.
     fn assert_read_denial_row(
-        row: &vala_sql::row_types::audit_outbox::AuditOutboxRow,
+        row: &vala_sql::row_types::audit_staging::AuditStagingRow,
         operation: &str,
         resource: &str,
         caller: &Caller,

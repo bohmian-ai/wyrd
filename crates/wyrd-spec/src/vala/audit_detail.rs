@@ -8,7 +8,7 @@ use crate::envelope::{CardKind, SpecHash};
 use crate::ids::CardUid;
 use crate::origin::Origin;
 use crate::reference::CardRef;
-use crate::vala::api::AuditDecision;
+use crate::vala::api::AuditOutcome;
 use crate::vala::api::{QueryClass, TimePartitionWire, VisibilityMode};
 
 /// Error returned when an audit-detail identifier is empty, malformed, or
@@ -767,8 +767,8 @@ pub enum AuditDetail {
         callee_principal_id: PrincipalId,
         /// Typed delegation chain.
         delegation_chain: Vec<CardRef>,
-        /// Authorization result.
-        decision: AuditDecision,
+        /// Authorization outcome.
+        outcome: AuditOutcome,
         /// Stable denial reason, present only for a denial.
         deny_reason: Option<AuditErrorCode>,
     },
@@ -838,8 +838,8 @@ pub enum AuditDetail {
         table: crate::vala::api::BifrostTableName,
         /// Number of records in the batch.
         record_count: u64,
-        /// Ingest authorization decision.
-        decision: AuditDecision,
+        /// Ingest authorization outcome.
+        outcome: AuditOutcome,
     },
 }
 
@@ -1041,7 +1041,7 @@ mod tests {
     use crate::auth::{PrincipalId, PrincipalKindTag};
     use crate::origin::{CommitSha, Origin};
     use crate::request_id::RequestId;
-    use crate::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod, BifrostTableName};
+    use crate::vala::api::{AuditEvent, AuditOutcome, BifrostTableName};
     use crate::vala::api::{QueryClass, VisibilityMode};
 
     #[test]
@@ -1131,7 +1131,7 @@ mod tests {
             batch_id: BatchId::new("batch-1").expect("valid batch id"),
             table: BifrostTableName::new("vala.events"),
             record_count: 2,
-            decision: AuditDecision::Allow,
+            outcome: AuditOutcome::Allowed,
         };
         let value = serde_json::to_value(&detail).expect("serialize");
         let back: AuditDetail = serde_json::from_value(value).expect("deserialize");
@@ -1415,11 +1415,8 @@ mod tests {
             None,
             PrincipalId::new(uuid::Uuid::nil()),
             PrincipalKindTag::User,
-            AuthMethod::Internal,
             "bifrost:write".to_owned(),
-            AuditDecision::Allow,
-            AuditResult::Success,
-            "accepted".to_owned(),
+            AuditOutcome::Allowed,
         );
         let absent = serde_json::to_value(&event).expect("serialize absent detail");
         assert!(absent.get("detail").is_none());

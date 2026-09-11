@@ -605,7 +605,7 @@ mod tests {
             ("expire.rs", include_str!("expire.rs")),
             ("orphan_gc.rs", include_str!("orphan_gc.rs")),
         ];
-        let forbidden_call = ["audit_outbox::append_", "audit"].concat();
+        let forbidden_call = ["audit_staging::append_", "audit"].concat();
 
         for (module, source) in modules {
             assert!(

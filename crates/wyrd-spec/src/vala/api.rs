@@ -2688,35 +2688,28 @@ pub enum AuthMethod {
     Internal,
 }
 
-/// The RBAC authorization outcome recorded on an audit row.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(rename_all = "snake_case")]
-pub enum AuditDecision {
-    /// The operation was authorized.
-    Allow,
-    /// The operation was refused by RBAC.
-    Deny,
-}
-
-/// Whether the audited operation completed successfully.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(rename_all = "snake_case")]
-pub enum AuditResult {
-    /// The operation succeeded.
-    Success,
-    /// The operation failed.
-    Failure,
-}
-
-/// One audited data-plane operation.
+/// The authorization outcome recorded on an audit row.
 ///
-/// Every audited op (register/install, sync query, async submit/status, ingest
-/// commit, RBAC deny) appends exactly one hash-chained `AuditEvent` row in the
-/// operation's own Postgres transaction. The hash-chain canonical encoding and
-/// per-tenant `seq` are owned by `vala-sql`; this type is the Arrow-free,
-/// PyO3-free wire/codegen shape.
+/// An audit row states what the authorization boundary decided about a
+/// principal's permission, never whether the operation it admitted later
+/// succeeded. Engine outcomes are lineage in their own operational tables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum AuditOutcome {
+    /// The evaluated permission authorized the operation.
+    Allowed,
+    /// The evaluated permission refused the operation.
+    Denied,
+}
+
+/// One audited authorization decision.
+///
+/// Every boundary that evaluates a principal's permission appends exactly one
+/// hash-chained `AuditEvent` row, in the same transaction as the decision,
+/// before the operation proceeds or is refused. The hash-chain canonical
+/// encoding and per-tenant `seq` are owned by `vala-sql`; this type is the
+/// Arrow-free, PyO3-free wire/codegen shape.
 ///
 /// `card_ref` is the **writer-identity card** (who performed the op), derived
 /// from the resolved `Principal`; it is `None` only for a `User` principal.
@@ -2741,16 +2734,10 @@ pub struct AuditEvent {
     /// Kind of the acting principal (tag encoding; card payload is not the audit
     /// subject — `card_ref` is its own field).
     pub principal_kind: PrincipalKindTag,
-    /// How the principal authenticated.
-    pub auth_method: AuthMethod,
-    /// Effective RBAC permission checked for the op.
+    /// Effective dynamic permission the boundary evaluated.
     pub permission: String,
-    /// The authorization decision.
-    pub decision: AuditDecision,
-    /// Whether the op completed successfully.
-    pub result: AuditResult,
-    /// Redacted summary of the operation payload.
-    pub payload_summary: String,
+    /// The authorization outcome this boundary decided.
+    pub outcome: AuditOutcome,
     /// Optional typed, redacted operation detail used as the canonical hash preimage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<AuditDetail>,
@@ -2771,11 +2758,8 @@ impl AuditEvent {
         card_ref: Option<CardRef>,
         principal_id: PrincipalId,
         principal_kind: PrincipalKindTag,
-        auth_method: AuthMethod,
         permission: String,
-        decision: AuditDecision,
-        result: AuditResult,
-        payload_summary: String,
+        outcome: AuditOutcome,
     ) -> Self {
         Self {
             request_id,
@@ -2785,11 +2769,8 @@ impl AuditEvent {
             card_ref,
             principal_id,
             principal_kind,
-            auth_method,
             permission,
-            decision,
-            result,
-            payload_summary,
+            outcome,
             detail: None,
         }
     }

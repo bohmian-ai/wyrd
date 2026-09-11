@@ -1609,7 +1609,7 @@ impl WyrdTestServer {
     ) -> Result<i64, WyrdTestServerError> {
         let pool = self.inner.fixture.superuser_pool().await.map_err(sql)?;
         let count = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM vala.audit_outbox WHERE data_tenant_id = $1 AND operation = 'bifrost.query.read_decision'",
+            "SELECT COUNT(*) FROM vala.audit_staging WHERE data_tenant_id = $1 AND operation = 'bifrost.query.read_decision'",
         )
         .bind(tenant.as_uuid())
         .fetch_one(&pool)
@@ -1630,7 +1630,7 @@ impl WyrdTestServer {
     ) -> Result<i64, WyrdTestServerError> {
         let pool = self.inner.fixture.superuser_pool().await.map_err(sql)?;
         sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM vala.audit_outbox WHERE data_tenant_id = $1 AND request_id = $2 AND operation = 'bifrost.query.read_decision'",
+            "SELECT COUNT(*) FROM vala.audit_staging WHERE data_tenant_id = $1 AND request_id = $2 AND operation = 'bifrost.query.read_decision'",
         )
         .bind(tenant.as_uuid())
         .bind(request_id)
@@ -1653,7 +1653,7 @@ impl WyrdTestServer {
     ) -> Result<Option<String>, WyrdTestServerError> {
         let pool = self.inner.fixture.superuser_pool().await.map_err(sql)?;
         sqlx::query_scalar::<_, String>(
-            "SELECT request_id FROM vala.audit_outbox WHERE data_tenant_id = $1 AND operation = 'bifrost.query.read_decision' ORDER BY seq DESC LIMIT 1",
+            "SELECT request_id FROM vala.audit_staging WHERE data_tenant_id = $1 AND operation = 'bifrost.query.read_decision' ORDER BY seq DESC LIMIT 1",
         )
         .bind(tenant.as_uuid())
         .fetch_optional(&pool)
@@ -1752,7 +1752,7 @@ impl WyrdTestServer {
     ) -> Result<i64, WyrdTestServerError> {
         let pool = self.inner.fixture.superuser_pool().await.map_err(sql)?;
         sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM vala.audit_outbox \
+            "SELECT COUNT(*) FROM vala.audit_staging \
              WHERE data_tenant_id = $1 AND resource = $2 \
                AND operation = 'bifrost.scribe.visibility.publish'",
         )

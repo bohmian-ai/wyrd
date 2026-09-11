@@ -211,7 +211,7 @@ impl AuthorityFixture {
             .await
             .expect("superuser pool");
         sqlx::query_scalar(
-            "SELECT operation FROM vala.audit_outbox \
+            "SELECT operation FROM vala.audit_staging \
               WHERE data_tenant_id = $1 AND resource = $2 ORDER BY seq",
         )
         .bind(identity.tenant.as_uuid())
@@ -265,7 +265,7 @@ impl AuthorityFixture {
             .await
             .expect("superuser pool");
         sqlx::query_scalar(
-            "SELECT operation FROM vala.audit_outbox \
+            "SELECT operation FROM vala.audit_staging \
               WHERE data_tenant_id = $1 AND resource = $2 ORDER BY seq",
         )
         .bind(uuid::Uuid::from(DataTenantId::SYSTEM_OWNER))
@@ -560,7 +560,7 @@ async fn append_expanded_audit(
             protected_snapshot_ids: vec![10],
         }),
     };
-    vala_sql::queries::audit_outbox::append_audit(conn, &event)
+    vala_sql::queries::audit_staging::append_audit(conn, &event)
         .await
         .expect("protection audit appends");
 }
@@ -604,7 +604,7 @@ async fn append_invalidation_audit(
             state_revision,
         }),
     };
-    vala_sql::queries::audit_outbox::append_audit(&mut conn, &event)
+    vala_sql::queries::audit_staging::append_audit(&mut conn, &event)
         .await
         .expect("epoch audit appends");
     conn.commit().await.expect("epoch audit commits");

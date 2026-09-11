@@ -133,7 +133,7 @@ mod pg_tests {
             .expect("tenant lifecycle audit connection");
         let rows = sqlx::query_as(
             "SELECT resource, decision, result, payload_summary \
-             FROM vala.audit_outbox WHERE operation = $1 ORDER BY seq",
+             FROM vala.audit_staging WHERE operation = $1 ORDER BY seq",
         )
         .bind(operation)
         .fetch_all(&mut **conn.transaction())

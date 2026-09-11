@@ -161,7 +161,7 @@ mod tests {
         )> = sqlx::query_as(
             "SELECT data_tenant_id, principal_id, principal_kind, auth_method, \
                         decision, result, detail \
-                   FROM vala.audit_outbox \
+                   FROM vala.audit_staging \
                   WHERE operation = 'bifrost.query.security_violation' \
                   ORDER BY data_tenant_id",
         )

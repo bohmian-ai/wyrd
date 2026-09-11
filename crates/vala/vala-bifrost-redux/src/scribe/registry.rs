@@ -6,7 +6,7 @@
 //! the `live_scribes()` reader Oracle discovery consumes.
 //!
 //! Heartbeats never touch `fencing_token` (epochs only advance on boot) and
-//! do not emit `audit_outbox` rows — ordinary uptime signal, not a
+//! do not emit `audit_staging` rows — ordinary uptime signal, not a
 //! security/lifecycle transition.
 
 use std::time::Duration;

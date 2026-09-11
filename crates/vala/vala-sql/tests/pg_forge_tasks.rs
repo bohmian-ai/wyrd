@@ -19,9 +19,6 @@ mod pg_tests {
     };
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_spec::DataTenantId;
-    use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
-    use wyrd_spec::request_id::RequestId;
-    use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
 
     /// Starts one isolated migrated database and returns its administrative pool.
     ///
@@ -75,24 +72,6 @@ mod pg_tests {
             },
             ..task(tenant, table, hash)
         }
-    }
-
-    /// Builds one internal lifecycle audit event.
-    fn event(operation: &str, task_id: Uuid) -> AuditEvent {
-        AuditEvent::new(
-            RequestId::now_v7(),
-            None,
-            operation.to_owned(),
-            format!("forge-task:{task_id}"),
-            None,
-            PrincipalId::new(Uuid::now_v7()),
-            PrincipalKindTag::User,
-            AuthMethod::Internal,
-            "bifrost.forge".to_owned(),
-            AuditDecision::Allow,
-            AuditResult::Success,
-            "redacted".to_owned(),
-        )
     }
 
     /// Returns permissive positive claim limits for lifecycle tests.
@@ -292,7 +271,7 @@ mod pg_tests {
             .execute(&admin)
             .await
             .expect("expire attempt");
-        let audit_before: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.audit_outbox")
+        let audit_before: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.audit_staging")
             .fetch_one(&admin)
             .await
             .expect("audit count before reclaim");
@@ -313,7 +292,7 @@ mod pg_tests {
         assert_eq!(reclaimed.0, "retryable");
         assert_eq!(reclaimed.1, 1);
         assert!(reclaimed.2);
-        let audit_after: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.audit_outbox")
+        let audit_after: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.audit_staging")
             .fetch_one(&admin)
             .await
             .expect("audit count after reclaim");
@@ -418,16 +397,12 @@ mod pg_tests {
                 .await
                 .expect("rollback tenant connection");
             tasks
-                .cancel_superseded(
-                    &mut rollback,
-                    &claim,
-                    &event("forge.task.cancelled", task_id),
-                )
+                .cancel_superseded(&mut rollback, &claim)
                 .await
                 .expect("rollback cancellation");
         }
         let rolled_back: (String, i64, i64) = sqlx::query_as(
-            "SELECT t.state,(SELECT count(*) FROM vala.forge_planning_demands),(SELECT count(*) FROM vala.audit_outbox) FROM vala.forge_tasks t WHERE t.task_id=$1",
+            "SELECT t.state,(SELECT count(*) FROM vala.forge_planning_demands),(SELECT count(*) FROM vala.audit_staging) FROM vala.forge_tasks t WHERE t.task_id=$1",
         )
         .bind(task_id)
         .fetch_one(&admin)
@@ -440,7 +415,7 @@ mod pg_tests {
             .await
             .expect("commit tenant connection");
         tasks
-            .cancel_superseded(&mut commit, &claim, &event("forge.task.cancelled", task_id))
+            .cancel_superseded(&mut commit, &claim)
             .await
             .expect("commit cancellation");
         commit
@@ -448,7 +423,7 @@ mod pg_tests {
             .await
             .expect("commit superseded cancellation");
         let terminal: (String, Option<Uuid>, Option<Uuid>, i64, i64) = sqlx::query_as(
-            "SELECT t.state,t.attempt_id,t.claimed_by,(SELECT count(*) FROM vala.forge_planning_demands),(SELECT count(*) FROM vala.audit_outbox WHERE operation='forge.task.cancelled') FROM vala.forge_tasks t WHERE t.task_id=$1",
+            "SELECT t.state,t.attempt_id,t.claimed_by,(SELECT count(*) FROM vala.forge_planning_demands),(SELECT count(*) FROM vala.audit_staging WHERE operation='forge.task.cancelled') FROM vala.forge_tasks t WHERE t.task_id=$1",
         )
         .bind(task_id)
         .fetch_one(&admin)
@@ -785,7 +760,6 @@ mod pg_tests {
             }],
             deleted_candidate_count: 0,
         };
-        let prepared_event = event("forge.task.prepared", id);
         let wrong_table_evidence = ForgeTaskEvidence {
             cleanup_candidates: vec![ForgeCleanupCandidate {
                 category: ForgeCleanupCategory::Data,
@@ -806,8 +780,7 @@ mod pg_tests {
                     id,
                     attempt,
                     owner,
-                    &wrong_table_evidence,
-                    &prepared_event
+                    &wrong_table_evidence
                 )
                 .await
                 .is_err(),
@@ -820,7 +793,7 @@ mod pg_tests {
                 .expect("rollback conn");
             assert_eq!(
                 tasks
-                    .prepared(&mut conn, id, attempt, owner, &evidence, &prepared_event)
+                    .prepared(&mut conn, id, attempt, owner, &evidence)
                     .await
                     .expect("prepared"),
                 ForgeTaskTransitionOutcome::Applied
@@ -833,7 +806,7 @@ mod pg_tests {
             tasks.status(&mut verify, 10).await.expect("status").tasks[0].state,
             ForgeTaskState::Running
         );
-        let audit_count: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.audit_outbox")
+        let audit_count: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.audit_staging")
             .fetch_one(&mut **verify.transaction())
             .await
             .expect("audit count");
@@ -844,28 +817,14 @@ mod pg_tests {
             .expect("prepared conn");
         assert_eq!(
             tasks
-                .prepared(
-                    &mut prepared_conn,
-                    id,
-                    attempt,
-                    owner,
-                    &evidence,
-                    &prepared_event
-                )
+                .prepared(&mut prepared_conn, id, attempt, owner, &evidence)
                 .await
                 .expect("prepared"),
             ForgeTaskTransitionOutcome::Applied
         );
         assert_eq!(
             tasks
-                .prepared(
-                    &mut prepared_conn,
-                    id,
-                    attempt,
-                    owner,
-                    &evidence,
-                    &prepared_event
-                )
+                .prepared(&mut prepared_conn, id, attempt, owner, &evidence)
                 .await
                 .expect("replay"),
             ForgeTaskTransitionOutcome::AlreadyApplied
@@ -882,17 +841,14 @@ mod pg_tests {
             let mut conn = TenantConn::acquire(fixture.app_pool(), tenant)
                 .await
                 .expect("terminal rollback");
-            tasks
-                .terminal(&mut conn, terminal, &event("forge.task.succeeded", id))
-                .await
-                .expect("terminal");
+            tasks.terminal(&mut conn, terminal).await.expect("terminal");
         }
         let mut after = TenantConn::acquire(fixture.app_pool(), tenant)
             .await
             .expect("after rollback");
         let page = tasks.status(&mut after, 10).await.expect("status");
         assert_eq!(page.tasks[0].state, ForgeTaskState::Prepared);
-        let audit_count: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.audit_outbox")
+        let audit_count: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.audit_staging")
             .fetch_one(&mut **after.transaction())
             .await
             .expect("audit count");
@@ -904,8 +860,7 @@ mod pg_tests {
                     ForgeTaskTransition {
                         expected: ForgeTaskState::Running,
                         ..terminal
-                    },
-                    &event("forge.task.succeeded", id)
+                    }
                 )
                 .await
                 .is_err()
@@ -916,11 +871,7 @@ mod pg_tests {
             .expect("terminal commit");
         assert_eq!(
             tasks
-                .terminal(
-                    &mut commit_terminal,
-                    terminal,
-                    &event("forge.task.succeeded", id),
-                )
+                .terminal(&mut commit_terminal, terminal)
                 .await
                 .expect("terminal commit"),
             ForgeTaskTransitionOutcome::Applied
@@ -932,11 +883,7 @@ mod pg_tests {
             .expect("terminal replay");
         assert!(
             tasks
-                .terminal(
-                    &mut terminal_replay,
-                    terminal,
-                    &event("forge.task.succeeded", id),
-                )
+                .terminal(&mut terminal_replay, terminal)
                 .await
                 .is_err(),
             "terminal task cannot reopen or terminalize twice"
@@ -990,14 +937,7 @@ mod pg_tests {
             .await
             .expect("tenant connection");
         tasks
-            .prepared(
-                &mut conn,
-                task_id,
-                attempt,
-                original_owner,
-                &evidence,
-                &event("forge.task.prepared", task_id),
-            )
+            .prepared(&mut conn, task_id, attempt, original_owner, &evidence)
             .await
             .expect("Prepared transition");
         conn.commit().await.expect("commit Prepared");
@@ -1086,14 +1026,7 @@ mod pg_tests {
             .await
             .expect("tenant connection");
         tasks
-            .prepared(
-                &mut conn,
-                task_id,
-                attempt,
-                original_owner,
-                &evidence,
-                &event("forge.task.prepared", task_id),
-            )
+            .prepared(&mut conn, task_id, attempt, original_owner, &evidence)
             .await
             .expect("Prepared transition");
         conn.commit().await.expect("commit Prepared");
@@ -1168,14 +1101,7 @@ mod pg_tests {
             .await
             .expect("prepared tenant");
         tasks
-            .prepared(
-                &mut prepared,
-                task_id,
-                attempt,
-                owner,
-                &evidence,
-                &event("forge.task.prepared", task_id),
-            )
+            .prepared(&mut prepared, task_id, attempt, owner, &evidence)
             .await
             .expect("prepared");
         prepared.commit().await.expect("commit prepared");
@@ -1196,7 +1122,6 @@ mod pg_tests {
                 transition,
                 &table,
                 vala_sql::row_types::forge_tasks::TaskProgressEffect::Progressed,
-                &event("forge.task.succeeded", task_id),
             )
             .await
             .expect("stage terminal and demand");
@@ -1216,7 +1141,7 @@ mod pg_tests {
             .expect("demand after rollback");
         assert_eq!(demand_count, 0);
 
-        let audit_before: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.audit_outbox")
+        let audit_before: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.audit_staging")
             .fetch_one(&admin)
             .await
             .expect("audit before");
@@ -1229,7 +1154,6 @@ mod pg_tests {
                 transition,
                 &table,
                 vala_sql::row_types::forge_tasks::TaskProgressEffect::Progressed,
-                &event("forge.task.succeeded", task_id),
             )
             .await
             .expect("commit terminal and demand");
@@ -1248,7 +1172,7 @@ mod pg_tests {
             .await
             .expect("successor demand");
         assert_eq!(demand_generation, 1);
-        let audit_after: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.audit_outbox")
+        let audit_after: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.audit_staging")
             .fetch_one(&admin)
             .await
             .expect("audit after");
@@ -1300,7 +1224,6 @@ mod pg_tests {
                     cleanup_candidates: Vec::new(),
                     deleted_candidate_count: 0,
                 },
-                &event("forge.task.prepared", noop_id),
             )
             .await
             .expect("prepare no-op");
@@ -1323,7 +1246,6 @@ mod pg_tests {
                     snapshot_id: 93,
                     commit_count: 7,
                 },
-                &event("forge.task.succeeded", noop_id),
             )
             .await
             .expect("terminal no-op");
@@ -1554,7 +1476,7 @@ mod pg_tests {
         let tenant = fixture.data_tenant_id();
         let identity =
             ForgeTaskTableIdentity::new("wyrd-redux", "vala.bifrost", "demand").expect("identity");
-        let audit_before: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.audit_outbox")
+        let audit_before: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.audit_staging")
             .fetch_one(&admin)
             .await
             .expect("audit before");
@@ -1621,7 +1543,7 @@ mod pg_tests {
                     fence,
                     &captured,
                     ForgeEnqueueBatch {
-                        executable: std::slice::from_ref(&mismatched),
+                        executable: std::slice::from_ref(&mismatched)
                     }
                 )
                 .await
@@ -1649,7 +1571,7 @@ mod pg_tests {
         .fetch_one(&admin)
         .await
         .expect("stale cursor before");
-        let stale_audit_before: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.audit_outbox")
+        let stale_audit_before: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.audit_staging")
             .fetch_one(&admin)
             .await
             .expect("stale audit before");
@@ -1660,7 +1582,7 @@ mod pg_tests {
                     fence,
                     &captured,
                     ForgeEnqueueBatch {
-                        executable: std::slice::from_ref(&exact),
+                        executable: std::slice::from_ref(&exact)
                     }
                 )
                 .await
@@ -1674,7 +1596,7 @@ mod pg_tests {
                 .await
                 .expect("stale task rollback");
         assert_eq!(stale_task_count, 0);
-        let stale_audit_after: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.audit_outbox")
+        let stale_audit_after: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.audit_staging")
             .fetch_one(&admin)
             .await
             .expect("stale audit after");
@@ -1706,7 +1628,7 @@ mod pg_tests {
                     fence,
                     &retryable[0],
                     ForgeEnqueueBatch {
-                        executable: std::slice::from_ref(&stale_terminal),
+                        executable: std::slice::from_ref(&stale_terminal)
                     }
                 )
                 .await
@@ -1729,7 +1651,7 @@ mod pg_tests {
                     successor_fence,
                     &retryable[0],
                     ForgeEnqueueBatch {
-                        executable: std::slice::from_ref(&exact),
+                        executable: std::slice::from_ref(&exact)
                     }
                 )
                 .await
@@ -1744,7 +1666,7 @@ mod pg_tests {
                     successor_fence,
                     &retryable[0],
                     ForgeEnqueueBatch {
-                        executable: std::slice::from_ref(&exact),
+                        executable: std::slice::from_ref(&exact)
                     }
                 )
                 .await
@@ -1784,7 +1706,7 @@ mod pg_tests {
                     successor_fence,
                     &terminal_demand,
                     ForgeEnqueueBatch {
-                        executable: std::slice::from_ref(&terminal),
+                        executable: std::slice::from_ref(&terminal)
                     }
                 )
                 .await
@@ -1794,7 +1716,7 @@ mod pg_tests {
         );
         let terminal_count: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.forge_tasks WHERE data_tenant_id=$1 AND table_name='demand' AND state='ready'").bind(tenant.as_uuid()).fetch_one(&admin).await.expect("enqueued count");
         assert_eq!(terminal_count, 2);
-        let audit_after: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.audit_outbox")
+        let audit_after: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.audit_staging")
             .fetch_one(&admin)
             .await
             .expect("audit after");
@@ -1815,7 +1737,7 @@ mod pg_tests {
                 .iter()
                 .any(|value| value.0 == "wyrd_app" && value.1 == "DELETE")
         );
-        let audit_grants: Vec<(String, String, String)> = sqlx::query_as("SELECT table_name,grantee,privilege_type FROM information_schema.role_table_grants WHERE table_schema='vala' AND table_name IN ('audit_chain_head','audit_outbox')").fetch_all(&admin).await.expect("audit grants");
+        let audit_grants: Vec<(String, String, String)> = sqlx::query_as("SELECT table_name,grantee,privilege_type FROM information_schema.role_table_grants WHERE table_schema='vala' AND table_name IN ('audit_chain_head','audit_staging')").fetch_all(&admin).await.expect("audit grants");
         let mut operator_audit_grants = audit_grants
             .iter()
             .filter(|value| value.1 == "wyrd_platform_admin")
@@ -1828,7 +1750,7 @@ mod pg_tests {
                 ("audit_chain_head".to_owned(), "INSERT".to_owned()),
                 ("audit_chain_head".to_owned(), "SELECT".to_owned()),
                 ("audit_chain_head".to_owned(), "UPDATE".to_owned()),
-                ("audit_outbox".to_owned(), "INSERT".to_owned()),
+                ("audit_staging".to_owned(), "INSERT".to_owned()),
             ],
             "operator audit authority is append-only and exact"
         );
@@ -1839,28 +1761,28 @@ mod pg_tests {
                     && value.1 == "wyrd_platform_admin"
                     && value.2 == "UPDATE")
         );
-        assert!(audit_grants.iter().any(|value| value.0 == "audit_outbox"
+        assert!(audit_grants.iter().any(|value| value.0 == "audit_staging"
             && value.1 == "wyrd_platform_admin"
             && value.2 == "INSERT"));
-        assert!(!audit_grants.iter().any(|value| value.0 == "audit_outbox"
+        assert!(!audit_grants.iter().any(|value| value.0 == "audit_staging"
             && value.1 == "wyrd_platform_admin"
             && matches!(value.2.as_str(), "SELECT" | "UPDATE" | "DELETE")));
         assert!(
-            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM vala.audit_outbox")
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM vala.audit_staging")
                 .fetch_one(op.pool())
                 .await
                 .is_err(),
             "operator cannot directly read tenant audit rows"
         );
         assert!(
-            sqlx::query("UPDATE vala.audit_outbox SET result=result")
+            sqlx::query("UPDATE vala.audit_staging SET result=result")
                 .execute(op.pool())
                 .await
                 .is_err(),
             "operator cannot directly update tenant audit rows"
         );
         assert!(
-            sqlx::query("DELETE FROM vala.audit_outbox")
+            sqlx::query("DELETE FROM vala.audit_staging")
                 .execute(op.pool())
                 .await
                 .is_err(),
@@ -1931,7 +1853,7 @@ mod pg_tests {
             .fetch_one(&admin)
             .await
             .expect("cursor before");
-            let audit_before: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.audit_outbox")
+            let audit_before: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.audit_staging")
                 .fetch_one(&admin)
                 .await
                 .expect("audit before");
@@ -1967,7 +1889,7 @@ mod pg_tests {
                     .await
                     .expect("task count");
             assert_eq!(task_count, 0, "task stage {index}");
-            let audit_after: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.audit_outbox")
+            let audit_after: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.audit_staging")
                 .fetch_one(&admin)
                 .await
                 .expect("audit after");
@@ -2348,8 +2270,7 @@ mod pg_tests {
                 .map(|file| file.checksum().to_owned())
                 .collect::<Vec<_>>(),
             "promoted_file_set_digest":
-                wyrd_spec::vala::api::ForgePromotedFileSetDigest::compute(files).as_str(),
-        })
+                wyrd_spec::vala::api::ForgePromotedFileSetDigest::compute(files).as_str()})
     }
 
     /// A `scribe_promotion` task survives enqueue, fair claim, and projection
@@ -2611,7 +2532,7 @@ mod pg_tests {
     /// # Panics
     /// Panics when the count query fails.
     async fn count_operation(superuser: &PgPool, operation: &str) -> i64 {
-        sqlx::query_scalar("SELECT count(*) FROM vala.audit_outbox WHERE operation=$1")
+        sqlx::query_scalar("SELECT count(*) FROM vala.audit_staging WHERE operation=$1")
             .bind(operation)
             .fetch_one(superuser)
             .await
@@ -2632,24 +2553,6 @@ mod pg_tests {
         raw.map(|value| {
             vala_sql::row_types::forge_tasks::evidence_from_json(value).expect("decode")
         })
-    }
-
-    /// Builds one candidate-transition audit event for the cleanup task.
-    fn cleanup_event(operation: &str, task_id: Uuid) -> AuditEvent {
-        AuditEvent::new(
-            RequestId::now_v7(),
-            None,
-            operation.to_owned(),
-            format!("forge-task:{task_id}"),
-            None,
-            PrincipalId::new(Uuid::nil()),
-            PrincipalKindTag::Service,
-            AuthMethod::Internal,
-            "bifrost:forge".to_owned(),
-            AuditDecision::Allow,
-            AuditResult::Success,
-            "expired cleanup candidate transition".to_owned(),
-        )
     }
 
     /// Asserts both cleanup admission paths refuse one malformed durable source.
@@ -2726,7 +2629,7 @@ mod pg_tests {
             .expect("cleanup row count")
         };
         let audit_rows = || async {
-            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM vala.audit_outbox")
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM vala.audit_staging")
                 .fetch_one(admin)
                 .await
                 .expect("audit row count")
@@ -2740,7 +2643,7 @@ mod pg_tests {
                     fence,
                     &demand,
                     ForgeEnqueueBatch {
-                        executable: std::slice::from_ref(&cleanup),
+                        executable: std::slice::from_ref(&cleanup)
                     }
                 )
                 .await
@@ -2896,7 +2799,7 @@ mod pg_tests {
                     fence,
                     &demand,
                     ForgeEnqueueBatch {
-                        executable: std::slice::from_ref(&divergent),
+                        executable: std::slice::from_ref(&divergent)
                     }
                 )
                 .await
@@ -2911,7 +2814,7 @@ mod pg_tests {
                     fence,
                     &demand,
                     ForgeEnqueueBatch {
-                        executable: std::slice::from_ref(&cleanup),
+                        executable: std::slice::from_ref(&cleanup)
                     }
                 )
                 .await
@@ -2996,9 +2899,7 @@ mod pg_tests {
             .await
             .expect("claim cleanup task");
 
-        let request =
-            |index: u32, operation: &'static str| (index, cleanup_event(operation, cleanup_id));
-        let (index, prepared_event) = request(0, "forge.expired_cleanup.candidate_prepared");
+        let index = 0_u32;
         assert_eq!(
             tasks
                 .prepare_expired_cleanup_candidate(
@@ -3007,8 +2908,7 @@ mod pg_tests {
                         authority: &authority,
                         table: &table,
                         index,
-                        candidate: &candidates[0],
-                        event: &prepared_event,
+                        candidate: &candidates[0]
                     },
                 )
                 .await
@@ -3025,7 +2925,6 @@ mod pg_tests {
         );
 
         // The exact already-prepared tuple replays read-only.
-        let replay = cleanup_event("forge.expired_cleanup.candidate_prepared", cleanup_id);
         assert_eq!(
             tasks
                 .prepare_expired_cleanup_candidate(
@@ -3034,8 +2933,7 @@ mod pg_tests {
                         authority: &authority,
                         table: &table,
                         index: 0,
-                        candidate: &candidates[0],
-                        event: &replay,
+                        candidate: &candidates[0]
                     },
                 )
                 .await
@@ -3053,7 +2951,6 @@ mod pg_tests {
             worker_id: Uuid::now_v7(),
             ..authority.clone()
         };
-        let stale_event = cleanup_event("forge.expired_cleanup.candidate_deleted", cleanup_id);
         assert!(
             tasks
                 .settle_expired_cleanup_candidate(
@@ -3062,8 +2959,7 @@ mod pg_tests {
                         authority: &stale,
                         table: &table,
                         index: 0,
-                        candidate: &candidates[0],
-                        event: &stale_event,
+                        candidate: &candidates[0]
                     },
                     ExpiredCleanupOutcome::Deleted,
                 )
@@ -3073,7 +2969,6 @@ mod pg_tests {
         );
 
         // Confirmed deletion is the only thing that advances candidate zero.
-        let deleted_event = cleanup_event("forge.expired_cleanup.candidate_deleted", cleanup_id);
         tasks
             .settle_expired_cleanup_candidate(
                 tenant,
@@ -3082,7 +2977,6 @@ mod pg_tests {
                     table: &table,
                     index: 0,
                     candidate: &candidates[0],
-                    event: &deleted_event,
                 },
                 ExpiredCleanupOutcome::Deleted,
             )
@@ -3093,7 +2987,6 @@ mod pg_tests {
         assert_eq!(advanced.prepared_candidate_index, None);
 
         // Refusal and uncertainty audit without moving the frontier.
-        let one_prepared = cleanup_event("forge.expired_cleanup.candidate_prepared", cleanup_id);
         tasks
             .prepare_expired_cleanup_candidate(
                 tenant,
@@ -3102,7 +2995,6 @@ mod pg_tests {
                     table: &table,
                     index: 1,
                     candidate: &candidates[1],
-                    event: &one_prepared,
                 },
             )
             .await
@@ -3117,7 +3009,6 @@ mod pg_tests {
                 "forge.expired_cleanup.candidate_uncertain",
             ),
         ] {
-            let retained = cleanup_event(operation, cleanup_id);
             tasks
                 .settle_expired_cleanup_candidate(
                     tenant,
@@ -3126,7 +3017,6 @@ mod pg_tests {
                         table: &table,
                         index: 1,
                         candidate: &candidates[1],
-                        event: &retained,
                     },
                     outcome,
                 )
@@ -3140,7 +3030,6 @@ mod pg_tests {
         }
 
         // Proven absence advances to the terminal frontier.
-        let missing_event = cleanup_event("forge.expired_cleanup.candidate_missing", cleanup_id);
         tasks
             .settle_expired_cleanup_candidate(
                 tenant,
@@ -3149,7 +3038,6 @@ mod pg_tests {
                     table: &table,
                     index: 1,
                     candidate: &candidates[1],
-                    event: &missing_event,
                 },
                 ExpiredCleanupOutcome::Missing,
             )
@@ -3173,7 +3061,6 @@ mod pg_tests {
                     expected: ForgeTaskState::Prepared,
                     next: ForgeTaskState::Succeeded,
                 },
-                &event("forge.task.succeeded", cleanup_id),
             )
             .await
             .expect("terminal success");
@@ -3309,8 +3196,7 @@ mod pg_tests {
                         "version": 1,
                         "kind": "orphan_cleanup",
                         "age_cutoff_ms": cutoff_ms,
-                        "source_operation_id": Uuid::now_v7().to_string(),
-                    }),
+                        "source_operation_id": Uuid::now_v7().to_string()}),
                     ..orphan_plan(&prefix, cutoff_ms)
                 },
                 "a source-operation identity is not part of this contract",
@@ -3383,7 +3269,7 @@ mod pg_tests {
                 .expect("payload round-trips"),
             OrphanCleanupPayload {
                 version: ORPHAN_CLEANUP_PAYLOAD_VERSION,
-                age_cutoff_ms: cutoff_ms,
+                age_cutoff_ms: cutoff_ms
             },
             "the immutable cutoff survives enqueue and claim unchanged"
         );
@@ -3587,13 +3473,13 @@ mod pg_tests {
         // sequence forces the append to fail after the state update, and the
         // whole transaction rolls back: the task stays Running with its cursor.
         let head_seq: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(MAX(seq),0) FROM vala.audit_outbox WHERE data_tenant_id=$1",
+            "SELECT COALESCE(MAX(seq),0) FROM vala.audit_staging WHERE data_tenant_id=$1",
         )
         .bind(tenant.as_uuid())
         .fetch_one(&admin)
         .await
         .expect("chain head");
-        sqlx::query("INSERT INTO vala.audit_outbox (data_tenant_id,seq,prev_hash,entry_hash,request_id,operation,resource,principal_id,principal_kind,auth_method,permission,decision,result,payload_summary) VALUES ($1,$2,decode(repeat('00',32),'hex'),decode(repeat('00',32),'hex'),'poison','test.poison','forge-task:poison',$3,'service','internal','bifrost:forge','allow','success','poison')")
+        sqlx::query("INSERT INTO vala.audit_staging (data_tenant_id,seq,prev_hash,entry_hash,request_id,operation,resource,principal_id,principal_kind,auth_method,permission,decision,result,payload_summary) VALUES ($1,$2,decode(repeat('00',32),'hex'),decode(repeat('00',32),'hex'),'poison','test.poison','forge-task:poison',$3,'service','internal','bifrost:forge','allow','success','poison')")
             .bind(tenant.as_uuid())
             .bind(head_seq + 1)
             .bind(Uuid::nil())
@@ -3602,12 +3488,7 @@ mod pg_tests {
             .expect("occupy the next audit sequence");
         assert!(
             tasks
-                .complete_orphan_cleanup(
-                    tenant,
-                    &resumed_authority,
-                    &table,
-                    &event("forge.task.succeeded", id)
-                )
+                .complete_orphan_cleanup(tenant, &resumed_authority, &table)
                 .await
                 .is_err(),
             "a failed audit append must take the terminal transition with it"
@@ -3629,12 +3510,7 @@ mod pg_tests {
 
         assert_eq!(
             tasks
-                .complete_orphan_cleanup(
-                    tenant,
-                    &resumed_authority,
-                    &table,
-                    &event("forge.task.succeeded", id)
-                )
+                .complete_orphan_cleanup(tenant, &resumed_authority, &table)
                 .await
                 .expect("exhaustion completes the task"),
             ForgeTaskTransitionOutcome::Applied
@@ -3651,12 +3527,7 @@ mod pg_tests {
         );
         assert!(
             tasks
-                .complete_orphan_cleanup(
-                    tenant,
-                    &resumed_authority,
-                    &table,
-                    &event("forge.task.succeeded", id)
-                )
+                .complete_orphan_cleanup(tenant, &resumed_authority, &table)
                 .await
                 .is_err(),
             "a completed orphan task cannot complete twice"
@@ -3786,8 +3657,7 @@ mod pg_tests {
         serde_json::json!({
             "version": plan.version,
             "inputs": plan.inputs,
-            "parameters": plan.parameters,
-        })
+            "parameters": plan.parameters})
     }
 
     /// Unattended work is exactly this owner's pre-terminal rows minus its own.
@@ -3942,8 +3812,7 @@ mod pg_tests {
         let prefix = format!("tenants/{tenant}/bifrost/orphan/data/forge/v1");
         let cursor = serde_json::json!({
             "version": 1,
-            "start_after": format!("{prefix}/aaa/object.parquet"),
-        });
+            "start_after": format!("{prefix}/aaa/object.parquet")});
         let expired_plan = ForgeTaskPlan {
             version: FORGE_TASK_PAYLOAD_VERSION,
             inputs: Vec::new(),

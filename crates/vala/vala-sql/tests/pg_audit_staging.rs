@@ -5,14 +5,14 @@ mod pg_tests {
     //! isolation, and tenant-scoped reads.
     //! Run via `mise run test:sql`.
 
-    mod audit_outbox {
+    mod audit_staging {
         use sqlx::PgPool;
         use sqlx::types::Uuid;
         use wyrd_dev_fixtures::pg::PgFixture;
         use wyrd_spec::DataTenantId;
         use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
         use wyrd_spec::request_id::RequestId;
-        use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
+        use wyrd_spec::vala::api::{AuditEvent, AuditOutcome};
 
         const ZERO_HASH: [u8; 32] = [0u8; 32];
 
@@ -39,18 +39,15 @@ mod pg_tests {
                 card_ref: None,
                 principal_id: PrincipalId::new(Uuid::now_v7()),
                 principal_kind: PrincipalKindTag::User,
-                auth_method: AuthMethod::Internal,
                 permission: "bifrost.write".to_string(),
-                decision: AuditDecision::Allow,
-                result: AuditResult::Success,
-                payload_summary: "redacted".to_string(),
+                outcome: AuditOutcome::Allowed,
                 detail: None,
             }
         }
 
         async fn append(pool: &PgPool, tenant: DataTenantId, operation: &str) -> i64 {
             let mut conn = vala_sql::TenantConn::acquire(pool, tenant).await.unwrap();
-            let seq = vala_sql::queries::audit_outbox::append_audit(&mut conn, &event(operation))
+            let seq = vala_sql::queries::audit_staging::append_audit(&mut conn, &event(operation))
                 .await
                 .unwrap();
             conn.commit().await.unwrap();
@@ -66,7 +63,7 @@ mod pg_tests {
             assert_eq!(append(fixture.app_pool(), tenant, "op.c").await, 3);
 
             let rows: Vec<(i64, Vec<u8>, Vec<u8>)> = sqlx::query_as(
-                "SELECT seq, prev_hash, entry_hash FROM vala.audit_outbox
+                "SELECT seq, prev_hash, entry_hash FROM vala.audit_staging
               WHERE data_tenant_id = $1 ORDER BY seq",
             )
             .bind(tenant.as_uuid())
@@ -109,7 +106,7 @@ mod pg_tests {
             // Probe via the BYPASSRLS migrator pool so the statement reaches the row
             // and the immutability trigger — not RLS — is what rejects it.
             let tampered = sqlx::query(
-                "UPDATE vala.audit_outbox SET operation = 'tampered'
+                "UPDATE vala.audit_staging SET operation = 'tampered'
               WHERE data_tenant_id = $1 AND seq = 1",
             )
             .bind(tenant.as_uuid())
@@ -133,7 +130,7 @@ mod pg_tests {
             let mut conn = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant)
                 .await
                 .unwrap();
-            let batch = vala_sql::queries::audit_outbox::list_publication_batch(&mut conn, 2)
+            let batch = vala_sql::queries::audit_staging::list_publication_batch(&mut conn, 2)
                 .await
                 .unwrap();
             assert_eq!(
@@ -142,29 +139,29 @@ mod pg_tests {
                 "the batch is the oldest contiguous run, bounded by the limit"
             );
 
-            let retired = vala_sql::queries::audit_outbox::retire_published(&mut conn, 1, 2)
+            let drained = vala_sql::queries::audit_staging::drain_through_watermark(&mut conn, 2)
                 .await
                 .unwrap();
-            assert_eq!(retired, 2);
-            let replayed = vala_sql::queries::audit_outbox::retire_published(&mut conn, 1, 2)
+            assert_eq!(drained, 2);
+            let replayed = vala_sql::queries::audit_staging::drain_through_watermark(&mut conn, 2)
                 .await
                 .unwrap();
-            assert_eq!(replayed, 0, "a replayed retirement removes nothing more");
+            assert_eq!(replayed, 0, "a replayed drain removes nothing more");
 
-            let remaining = vala_sql::queries::audit_outbox::list_publication_batch(&mut conn, 10)
+            let remaining = vala_sql::queries::audit_staging::list_publication_batch(&mut conn, 10)
                 .await
                 .unwrap();
             conn.commit().await.unwrap();
             assert_eq!(
                 remaining.iter().map(|row| row.seq).collect::<Vec<_>>(),
                 vec![3],
-                "unpublished events survive retirement of the published prefix"
+                "unpublished events survive the drain of the published prefix"
             );
         }
 
-        /// Retirement never reaches another tenant's rows.
+        /// Draining never reaches another tenant's rows.
         #[tokio::test]
-        async fn retirement_is_tenant_scoped() {
+        async fn drain_is_tenant_scoped() {
             let (fixture, _superuser, tenant_a) = setup().await;
             let tenant_b = DataTenantId::new_v7();
             fixture
@@ -180,23 +177,24 @@ mod pg_tests {
             let mut conn = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant_a)
                 .await
                 .unwrap();
-            let retired = vala_sql::queries::audit_outbox::retire_published(&mut conn, 1, 1)
+            let drained = vala_sql::queries::audit_staging::drain_through_watermark(&mut conn, 1)
                 .await
                 .unwrap();
             conn.commit().await.unwrap();
-            assert_eq!(retired, 1);
+            assert_eq!(drained, 1);
 
             let mut other = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant_b)
                 .await
                 .unwrap();
-            let surviving = vala_sql::queries::audit_outbox::list_publication_batch(&mut other, 10)
-                .await
-                .unwrap();
+            let surviving =
+                vala_sql::queries::audit_staging::list_publication_batch(&mut other, 10)
+                    .await
+                    .unwrap();
             other.commit().await.unwrap();
             assert_eq!(
                 surviving.len(),
                 1,
-                "one tenant's retirement leaves another tenant's chain intact"
+                "one tenant's drain leaves another tenant's chain intact"
             );
         }
 
@@ -219,7 +217,7 @@ mod pg_tests {
             let mut conn = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant_a)
                 .await
                 .unwrap();
-            let first = vala_sql::queries::audit_outbox::list_audit_events_for_resource(
+            let first = vala_sql::queries::audit_staging::list_audit_events_for_resource(
                 &mut conn, "ns.tbl", 0, 1,
             )
             .await
@@ -227,7 +225,7 @@ mod pg_tests {
             assert_eq!(first.len(), 1);
             assert_eq!(first[0].seq, 1);
 
-            let second = vala_sql::queries::audit_outbox::list_audit_events_for_resource(
+            let second = vala_sql::queries::audit_staging::list_audit_events_for_resource(
                 &mut conn,
                 "ns.tbl",
                 first[0].seq,
@@ -266,7 +264,7 @@ mod pg_tests {
                 .await
                 .expect("tenant connection");
             assert_eq!(
-                vala_sql::queries::scribe_batch_commits::record(&mut conn, &canonical, &audit)
+                vala_sql::queries::scribe_batch_commits::record(&mut conn, &canonical)
                     .await
                     .expect("canonical fence"),
                 vala_sql::queries::scribe_batch_commits::ScribeBatchCommitResolution::Committed,
@@ -293,15 +291,12 @@ mod pg_tests {
             // A client re-sending the same rows under a fresh request lands on
             // new WAL coordinates and a new correlation id. That is the same
             // batch, so it must be acknowledged as already committed rather
-            // than refused as a contradiction, and it must not audit twice.
-            let resend_audit = event("bifrost.append");
             let resend = vala_sql::queries::scribe_batch_commits::ScribeBatchCommit {
-                request_id: Uuid::parse_str(resend_audit.request_id.as_str())
-                    .expect("re-sent request UUID"),
+                request_id: Uuid::now_v7(),
                 ..retry.clone()
             };
             assert_eq!(
-                vala_sql::queries::scribe_batch_commits::record(&mut conn, &resend, &resend_audit)
+                vala_sql::queries::scribe_batch_commits::record(&mut conn, &resend)
                     .await
                     .expect("re-sent identical batch resolves"),
                 vala_sql::queries::scribe_batch_commits::ScribeBatchCommitResolution::AlreadyCommitted,
@@ -321,7 +316,7 @@ mod pg_tests {
             conn.commit().await.expect("commit read-only replay checks");
 
             let audit_rows: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM vala.audit_outbox WHERE data_tenant_id = $1",
+                "SELECT COUNT(*) FROM vala.audit_staging WHERE data_tenant_id = $1",
             )
             .bind(tenant.as_uuid())
             .fetch_one(&superuser)

@@ -70,7 +70,7 @@ async fn expiry_state(fixture: &PromotionIntegrationFixture, task_id: Uuid) -> E
         .await
         .expect("fixture tenant connection");
     let audits: Vec<String> = sqlx::query_scalar(
-        "SELECT operation FROM vala.audit_outbox \
+        "SELECT operation FROM vala.audit_staging \
          WHERE operation LIKE 'forge.snapshot_expire.%' OR resource = $1 \
          ORDER BY seq",
     )

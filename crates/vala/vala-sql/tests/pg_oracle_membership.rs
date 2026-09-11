@@ -309,7 +309,7 @@ mod pg_tests {
     use chrono::Utc;
     use sqlx::PgPool;
     use uuid::Uuid;
-    use vala_sql::queries::audit_outbox::append_audit;
+    use vala_sql::queries::audit_staging::append_audit;
     use vala_sql::queries::cluster_nodes::ClusterNodes;
     use vala_sql::queries::olap_catalog::upsert_table;
     use vala_sql::queries::oracle_reader_authority::{
@@ -328,9 +328,8 @@ mod pg_tests {
     use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
     use wyrd_spec::request_id::RequestId;
     use wyrd_spec::vala::api::{
-        AuditDecision, AuditDetail, AuditEvent, AuditResult, AuthMethod, ClusterCapabilities,
-        ClusterNodeKey, ClusterRole, OracleCapabilitiesV1, OracleReaderEpochPhase,
-        OracleTableProtectionPhase, QueryClass,
+        AuditDetail, AuditEvent, AuditOutcome, ClusterCapabilities, ClusterNodeKey, ClusterRole,
+        OracleCapabilitiesV1, OracleReaderEpochPhase, OracleTableProtectionPhase, QueryClass,
     };
 
     /// Namespace segment every table in this module is registered under.
@@ -578,11 +577,8 @@ mod pg_tests {
             card_ref: None,
             principal_id: PrincipalId::new(Uuid::nil()),
             principal_kind: PrincipalKindTag::Service,
-            auth_method: AuthMethod::Internal,
             permission: "bifrost:oracle".to_owned(),
-            decision: AuditDecision::Allow,
-            result: AuditResult::Success,
-            payload_summary: operation.to_owned(),
+            outcome: AuditOutcome::Allowed,
             detail: Some(AuditDetail::OracleReaderEpoch {
                 node_id,
                 fencing_token,
@@ -612,11 +608,8 @@ mod pg_tests {
             card_ref: None,
             principal_id: PrincipalId::new(Uuid::nil()),
             principal_kind: PrincipalKindTag::Service,
-            auth_method: AuthMethod::Internal,
             permission: "bifrost:oracle".to_owned(),
-            decision: AuditDecision::Allow,
-            result: AuditResult::Success,
-            payload_summary: operation.to_owned(),
+            outcome: AuditOutcome::Allowed,
             detail: Some(AuditDetail::OracleTableProtection {
                 node_id,
                 fencing_token,
@@ -631,7 +624,7 @@ mod pg_tests {
     /// Reads one tenant's audit operations in durable sequence order.
     async fn audit_operations(pool: &PgPool, tenant: DataTenantId) -> Vec<String> {
         sqlx::query_scalar(
-            "SELECT operation FROM vala.audit_outbox WHERE data_tenant_id = $1 ORDER BY seq",
+            "SELECT operation FROM vala.audit_staging WHERE data_tenant_id = $1 ORDER BY seq",
         )
         .bind(tenant.as_uuid())
         .fetch_all(pool)
@@ -1253,7 +1246,7 @@ mod pg_tests {
                 tenant: harness.tenant,
                 table_uid: harness.identity.table_uid,
                 node_id: node,
-                fencing_token: fence,
+                fencing_token: fence
             }]
         );
         assert!(

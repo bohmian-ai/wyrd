@@ -1370,7 +1370,7 @@ async fn tenant_audits(
         .await
         .expect("fixture tenant connection");
     let operations: Vec<String> = sqlx::query_scalar(
-        "SELECT operation FROM vala.audit_outbox WHERE operation LIKE $1 AND ($2::text IS NULL OR resource=$2) ORDER BY seq",
+        "SELECT operation FROM vala.audit_staging WHERE operation LIKE $1 AND ($2::text IS NULL OR resource=$2) ORDER BY seq",
     )
     .bind(pattern)
     .bind(resource)

@@ -1,6 +1,6 @@
 //! Bounded publication of tenant audit events into `vala.system.audit_log`.
 //!
-//! `vala.audit_outbox` is the transactional authority: an audited transition
+//! `vala.audit_staging` is the transactional authority: an audited transition
 //! and its canonical event commit together. Retained history lives in the
 //! Bifrost table, so one server-owned publisher moves each tenant's oldest
 //! contiguous run of events across that boundary and retires the rows only
@@ -19,8 +19,8 @@ use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::tables::audit::projection::project_audit_rows;
 use vala_sql::TenantConn;
-use vala_sql::queries::audit_outbox::{list_publication_batch, retire_published};
-use vala_sql::row_types::audit_outbox::AuditOutboxRow;
+use vala_sql::queries::audit_staging::{list_publication_batch, retire_published};
+use vala_sql::row_types::audit_staging::AuditStagingRow;
 use wyrd_runtime::{PermissionSet, Principal, PrincipalKind};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::PLATFORM_AUDIT_PRINCIPAL;
@@ -183,7 +183,7 @@ impl AuditPublisher {
     async fn claim(
         &self,
         tenant: DataTenantId,
-    ) -> Result<Vec<AuditOutboxRow>, AuditPublicationError> {
+    ) -> Result<Vec<AuditStagingRow>, AuditPublicationError> {
         let mut conn = TenantConn::acquire(&self.pool, tenant)
             .await
             .map_err(|error| AuditPublicationError::Outbox(error.to_string()))?;
@@ -240,7 +240,7 @@ pub enum AuditPublicationError {
 /// mint the next one forever, so the tail waits until a real event arrives to
 /// travel with it. No event is dropped — retained history simply lags by its
 /// own marker until the tenant records something else.
-fn is_publication_tail(rows: &[AuditOutboxRow]) -> bool {
+fn is_publication_tail(rows: &[AuditStagingRow]) -> bool {
     rows.iter().all(|row| row.resource == AUDIT_LOG_FQN)
 }
 
@@ -260,8 +260,8 @@ mod tests {
     use super::*;
 
     /// Build one outbox row for the given resource.
-    fn row(seq: i64, resource: &str) -> AuditOutboxRow {
-        AuditOutboxRow {
+    fn row(seq: i64, resource: &str) -> AuditStagingRow {
+        AuditStagingRow {
             data_tenant_id: uuid::Uuid::now_v7(),
             seq,
             entry_hash: vec![0; 32],

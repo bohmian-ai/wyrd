@@ -1958,12 +1958,12 @@ impl WyrdTestCluster {
                 })
             })
             .collect::<Result<Vec<_>, ClusterError>>()?;
-        let audit_rows: i64 = sqlx::query_scalar("SELECT COUNT(*)::bigint FROM vala.audit_outbox")
+        let audit_rows: i64 = sqlx::query_scalar("SELECT COUNT(*)::bigint FROM vala.audit_staging")
             .fetch_one(pool)
             .await
             .map_err(|error| ClusterError::Resource(error.to_string()))?;
         let read_audit_rows: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*)::bigint FROM vala.audit_outbox WHERE operation = 'bifrost.query.read_decision'",
+            "SELECT COUNT(*)::bigint FROM vala.audit_staging WHERE operation = 'bifrost.query.read_decision'",
         )
         .fetch_one(pool)
         .await
@@ -2290,13 +2290,13 @@ impl WyrdTestCluster {
     ///
     /// Returns a fixture or SQL error when the privileged assertion connection
     /// cannot read the canonical outbox.
-    pub async fn audit_outbox_count_for_test(&self) -> Result<i64, ClusterError> {
+    pub async fn audit_staging_count_for_test(&self) -> Result<i64, ClusterError> {
         let pool = self
             .fixture
             .superuser_pool()
             .await
             .map_err(|error| ClusterError::Resource(error.to_string()))?;
-        sqlx::query_scalar("SELECT count(*) FROM vala.audit_outbox")
+        sqlx::query_scalar("SELECT count(*) FROM vala.audit_staging")
             .fetch_one(&pool)
             .await
             .map_err(|error| ClusterError::Resource(error.to_string()))

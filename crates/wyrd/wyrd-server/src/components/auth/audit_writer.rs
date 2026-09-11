@@ -1,7 +1,7 @@
 //! Authz-check audit writer seam.
 
 use async_trait::async_trait;
-use vala_sql::queries::audit_outbox::append_audit;
+use vala_sql::queries::audit_staging::append_audit;
 use wyrd_auth_check::AuthzCheckContext;
 use wyrd_spec::card::policy::PolicyDecision;
 use wyrd_spec::error::WyrdError;
@@ -25,7 +25,7 @@ pub trait AuthzAuditWriter: Send + Sync {
     }
 }
 
-/// Production authz-check audit writer that appends to `vala.audit_outbox`.
+/// Production authz-check audit writer that appends to `vala.audit_staging`.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct RealAuthzAuditWriter;
 

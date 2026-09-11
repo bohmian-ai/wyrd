@@ -298,7 +298,7 @@ pub(crate) async fn seed_foreign_hot_row(
     .bind(hex::encode(Sha256::digest(&parquet)))
     .execute(&mut **conn.transaction())
     .await?;
-    vala_sql::queries::audit_outbox::append_audit(&mut conn, &event).await?;
+    vala_sql::queries::audit_staging::append_audit(&mut conn, &event).await?;
     conn.commit().await?;
     Ok(())
 }

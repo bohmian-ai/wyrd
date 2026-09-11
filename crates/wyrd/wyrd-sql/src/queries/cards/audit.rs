@@ -94,7 +94,7 @@ pub(crate) async fn record_card_registration_audit(
     );
 
     sqlx::query(
-        r#"INSERT INTO vala.audit_outbox
+        r#"INSERT INTO vala.audit_staging
            (data_tenant_id, seq, prev_hash, entry_hash, request_id, trace_id,
             operation, resource, card_ref, principal_id, principal_kind,
             auth_method, permission, decision, result, payload_summary, detail)

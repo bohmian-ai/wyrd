@@ -275,7 +275,7 @@ mod pg_tests {
         let count = sqlx::query_scalar::<_, i64>(
             r"
         SELECT count(*)
-        FROM vala.audit_outbox
+        FROM vala.audit_staging
         WHERE data_tenant_id = wyrd.current_tenant()
           AND operation = 'storage.reclaimed'
         ",

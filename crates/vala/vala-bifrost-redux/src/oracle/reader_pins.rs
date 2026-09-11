@@ -1150,7 +1150,7 @@ async fn append_epoch_audit(
             state_revision,
         }),
     };
-    vala_sql::queries::audit_outbox::append_audit(conn, &event)
+    vala_sql::queries::audit_staging::append_audit(conn, &event)
         .await
         .map(|_| ())
         .map_err(|error| internal(error.to_string()))
@@ -1208,7 +1208,7 @@ async fn append_protection_audit(
             protected_snapshot_ids,
         }),
     };
-    vala_sql::queries::audit_outbox::append_audit(conn, &event)
+    vala_sql::queries::audit_staging::append_audit(conn, &event)
         .await
         .map(|_| ())
         .map_err(|error| internal(error.to_string()))

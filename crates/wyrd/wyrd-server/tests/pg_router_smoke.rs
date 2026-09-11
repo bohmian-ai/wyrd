@@ -581,7 +581,7 @@ async fn epoch_audit_operations(
     fencing_token: i64,
 ) -> Vec<String> {
     sqlx::query_scalar(
-        "SELECT operation FROM vala.audit_outbox \
+        "SELECT operation FROM vala.audit_staging \
           WHERE data_tenant_id = $1 AND resource = $2 ORDER BY seq",
     )
     .bind(uuid::Uuid::from(wyrd_spec::DataTenantId::SYSTEM_OWNER))
@@ -668,7 +668,7 @@ async fn supervisor_first_loss_closes_readiness_before_its_audit() {
     // this gates exactly the loss edge's transaction and nothing the epoch
     // needs in order to reach its cutoff.
     let mut gate = pool.begin().await.expect("audit gate transaction begins");
-    sqlx::query("LOCK TABLE vala.audit_outbox IN EXCLUSIVE MODE")
+    sqlx::query("LOCK TABLE vala.audit_staging IN EXCLUSIVE MODE")
         .execute(&mut *gate)
         .await
         .expect("the audit outbox is held");
@@ -3186,7 +3186,7 @@ async fn oracle_authority_is_installed_before_source_io() {
         .await
         .expect("superuser pool");
     let mut audit_gate = pool.begin().await.expect("audit gate");
-    sqlx::query("LOCK TABLE vala.audit_outbox IN EXCLUSIVE MODE")
+    sqlx::query("LOCK TABLE vala.audit_staging IN EXCLUSIVE MODE")
         .execute(&mut *audit_gate)
         .await
         .expect("hold audit commit");
@@ -3202,7 +3202,7 @@ async fn oracle_authority_is_installed_before_source_io() {
     let mut blocked: i64 = 0;
     let reached = tokio::time::timeout(FORGE_READINESS_CEILING, async {
         loop {
-            blocked = sqlx::query_scalar("SELECT count(*) FROM pg_locks WHERE relation='vala.audit_outbox'::regclass AND NOT granted")
+            blocked = sqlx::query_scalar("SELECT count(*) FROM pg_locks WHERE relation='vala.audit_staging'::regclass AND NOT granted")
                 .fetch_one(&mut *source_gate).await.expect("audit waiters");
             if blocked > 0 || handle.is_finished() { break; }
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
@@ -3248,7 +3248,7 @@ async fn oracle_authority_is_installed_before_source_io() {
     }
     let committed: (i64, i64) = sqlx::query_as(
         "SELECT (SELECT count(*) FROM vala.oracle_table_protections WHERE node_id=$1 AND fencing_token=$2), \
-        (SELECT count(*) FROM vala.audit_outbox WHERE data_tenant_id=$3 AND operation='oracle.table_protection.expanded')",
+        (SELECT count(*) FROM vala.audit_staging WHERE data_tenant_id=$3 AND operation='oracle.table_protection.expanded')",
     ).bind(installed.node_id()).bind(installed.fencing_token()).bind(uuid::Uuid::from(server.data_tenant_id()))
         .fetch_one(&mut *source_gate).await.expect("independently committed protection and audit");
     assert_eq!(committed, (1, 1));

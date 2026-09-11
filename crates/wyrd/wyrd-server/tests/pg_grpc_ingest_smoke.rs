@@ -904,7 +904,7 @@ async fn scribe_tail_cross_tenant_read_and_release_are_denied() {
         .expect("fixture exposes a migrator assertion pool");
 
     let (owner_seq_before, owner_count_before): (i64, i64) = sqlx::query_as(
-        "SELECT COALESCE(MAX(seq), 0), COUNT(*) FROM vala.audit_outbox \
+        "SELECT COALESCE(MAX(seq), 0), COUNT(*) FROM vala.audit_staging \
          WHERE data_tenant_id = $1 AND operation = 'bifrost.scribe.tail_security'",
     )
     .bind(owner_tenant.as_uuid())
@@ -912,7 +912,7 @@ async fn scribe_tail_cross_tenant_read_and_release_are_denied() {
     .await
     .expect("owner tail-security audit baseline");
     let (other_seq_before, other_count_before): (i64, i64) = sqlx::query_as(
-        "SELECT COALESCE(MAX(seq), 0), COUNT(*) FROM vala.audit_outbox \
+        "SELECT COALESCE(MAX(seq), 0), COUNT(*) FROM vala.audit_staging \
          WHERE data_tenant_id = $1 AND operation = 'bifrost.scribe.tail_security'",
     )
     .bind(other_tenant.as_uuid())
@@ -920,7 +920,7 @@ async fn scribe_tail_cross_tenant_read_and_release_are_denied() {
     .await
     .expect("foreign tail-security audit baseline");
     let system_seq_before: i64 = sqlx::query_scalar(
-        "SELECT COALESCE(MAX(seq), 0) FROM vala.audit_outbox \
+        "SELECT COALESCE(MAX(seq), 0) FROM vala.audit_staging \
          WHERE data_tenant_id = $1",
     )
     .bind(DataTenantId::SYSTEM_OWNER.as_uuid())
@@ -1026,7 +1026,7 @@ async fn scribe_tail_cross_tenant_read_and_release_are_denied() {
     assert_eq!(wrong_query_release_status.code(), Code::PermissionDenied);
 
     /// One `bifrost.scribe.tail_security` audit row projected from
-    /// `vala.audit_outbox`: `(data_tenant_id, principal_id, principal_kind,
+    /// `vala.audit_staging`: `(data_tenant_id, principal_id, principal_kind,
     /// auth_method, permission, decision, result, detail)`.
     type SecurityAuditRow = (
         uuid::Uuid,
@@ -1049,7 +1049,7 @@ async fn scribe_tail_cross_tenant_read_and_release_are_denied() {
         let security_rows: Vec<SecurityAuditRow> = sqlx::query_as(
             "SELECT data_tenant_id, principal_id, principal_kind, auth_method, permission, \
                     decision, result, detail::text \
-             FROM vala.audit_outbox \
+             FROM vala.audit_staging \
              WHERE data_tenant_id = $1 AND operation = 'bifrost.scribe.tail_security' AND seq > $2 \
              ORDER BY seq",
         )
@@ -1064,7 +1064,7 @@ async fn scribe_tail_cross_tenant_read_and_release_are_denied() {
             "one committed TailBinding row per denied page/release request"
         );
         let count_after: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM vala.audit_outbox \
+            "SELECT COUNT(*) FROM vala.audit_staging \
              WHERE data_tenant_id = $1 AND operation = 'bifrost.scribe.tail_security'",
         )
         .bind(tenant.as_uuid())
@@ -1100,7 +1100,7 @@ async fn scribe_tail_cross_tenant_read_and_release_are_denied() {
         }
     }
     let system_seq_after: i64 = sqlx::query_scalar(
-        "SELECT COALESCE(MAX(seq), 0) FROM vala.audit_outbox \
+        "SELECT COALESCE(MAX(seq), 0) FROM vala.audit_staging \
          WHERE data_tenant_id = $1",
     )
     .bind(DataTenantId::SYSTEM_OWNER.as_uuid())

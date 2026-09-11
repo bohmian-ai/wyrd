@@ -1172,7 +1172,7 @@ const AUDIT_RELAY_CONVERGENCE_BUDGET: Duration = Duration::from_secs(30);
 ///
 /// Before reading the counts, this waits on a production durability signal: it
 /// polls every pod's pending read-audit WAL residual (`audit_wal_records`, an
-/// exact counter) until it reaches zero, so the subsequent `vala.audit_outbox`
+/// exact counter) until it reaches zero, so the subsequent `vala.audit_staging`
 /// row counts reflect a fully relayed cluster. This is a convergence wait, not a
 /// masking retry — the asserted counts are unchanged and the wait errors loudly
 /// with the residual and oldest-record age if the relay fails to drain.

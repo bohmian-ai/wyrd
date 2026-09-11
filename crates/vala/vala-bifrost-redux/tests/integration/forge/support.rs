@@ -1455,7 +1455,7 @@ impl PromotionIntegrationFixture {
             .expect("fixture tenant connection");
         let operations = sqlx::query_scalar::<_, String>(
             "SELECT operation
-               FROM vala.audit_outbox
+               FROM vala.audit_staging
               WHERE operation LIKE 'forge.%'
                 AND operation NOT LIKE 'forge.task.%'
               ORDER BY seq",
@@ -1487,7 +1487,7 @@ impl PromotionIntegrationFixture {
             .await
             .expect("fixture tenant connection");
         let count = sqlx::query_scalar::<_, i64>(
-            "SELECT count(*) FROM vala.audit_outbox \
+            "SELECT count(*) FROM vala.audit_staging \
              WHERE operation IN ('forge.iceberg_rewrite.recovered', \
              'forge.iceberg_rewrite.reset') AND detail LIKE ANY($1)",
         )

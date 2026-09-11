@@ -21,8 +21,8 @@ mod pg_tests {
         use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
         use wyrd_spec::request_id::RequestId;
         use wyrd_spec::vala::api::{
-            AuditDecision, AuditDetail, AuditEvent, AuditResult, AuthMethod,
-            ForgeIcebergRewritePhase, ForgeOrphanGcPhase, ForgeSnapshotExpirePhase, StoragePath,
+            AuditDetail, AuditEvent, AuditOutcome, ForgeIcebergRewritePhase, ForgeOrphanGcPhase,
+            ForgeSnapshotExpirePhase, StoragePath,
         };
 
         use vala_sql::queries::forge_operations::ForgeOperations;
@@ -72,11 +72,8 @@ mod pg_tests {
                 None,
                 PrincipalId::new(Uuid::now_v7()),
                 PrincipalKindTag::User,
-                AuthMethod::Internal,
                 "bifrost.forge".to_owned(),
-                AuditDecision::Allow,
-                AuditResult::Success,
-                "redacted".to_owned(),
+                AuditOutcome::Allowed,
             );
             if let Some(d) = detail {
                 event = event.with_detail(d);
@@ -106,7 +103,15 @@ mod pg_tests {
                 .await
                 .expect("tenant connection for prepared transition");
             let ops = ForgeOperations::new(resource, family).expect("valid Forge resource");
-            let result = ops.append_prepared(&mut conn, event).await;
+            let result = match event.detail.as_ref() {
+                Some(detail) => {
+                    ops.append_prepared(&mut conn, &event.operation, detail)
+                        .await
+                }
+                None => Err(SqlError::Conflict {
+                    detail: "Forge transitions require typed detail".to_owned(),
+                }),
+            };
             if result.is_ok() {
                 conn.commit().await.expect("prepared transition commit");
             }
@@ -135,7 +140,15 @@ mod pg_tests {
                 .await
                 .expect("tenant connection for terminal transition");
             let ops = ForgeOperations::new(resource, family).expect("valid Forge resource");
-            let result = ops.append_terminal(&mut conn, event).await;
+            let result = match event.detail.as_ref() {
+                Some(detail) => {
+                    ops.append_terminal(&mut conn, &event.operation, detail)
+                        .await
+                }
+                None => Err(SqlError::Conflict {
+                    detail: "Forge transitions require typed detail".to_owned(),
+                }),
+            };
             if result.is_ok() {
                 conn.commit().await.expect("terminal transition commit");
             }
@@ -174,7 +187,7 @@ mod pg_tests {
                 .await
                 .expect("tenant connection for audit count");
             let row: (i64,) =
-                sqlx::query_as("SELECT count(*) FROM vala.audit_outbox WHERE data_tenant_id = $1")
+                sqlx::query_as("SELECT count(*) FROM vala.audit_staging WHERE data_tenant_id = $1")
                     .bind(tenant.as_uuid())
                     .fetch_one(&mut **conn.transaction())
                     .await
@@ -188,13 +201,9 @@ mod pg_tests {
         struct StateSnapshot {
             /// Current closed phase stored by the projection.
             phase: String,
-            /// Prepared evidence sequence retained by the projection.
-            prepared_audit_seq: i64,
-            /// Terminal evidence sequence retained after a closing transition.
-            terminal_audit_seq: Option<i64>,
         }
 
-        /// Reads one operation's persisted phase and evidence sequences.
+        /// Reads one operation's persisted phase.
         ///
         /// # Panics
         ///
@@ -208,9 +217,9 @@ mod pg_tests {
             let mut conn = TenantConn::acquire(pool, tenant)
                 .await
                 .expect("tenant connection for state snapshot");
-            let row: (String, i64, Option<i64>) = sqlx::query_as(
+            let row: (String,) = sqlx::query_as(
                 r#"
-                SELECT phase, prepared_audit_seq, terminal_audit_seq
+                SELECT phase
                   FROM vala.forge_operation_state
                  WHERE data_tenant_id = wyrd.current_tenant()
                    AND resource = $1
@@ -225,11 +234,7 @@ mod pg_tests {
             .await
             .expect("state snapshot query");
             conn.commit().await.expect("state snapshot commit");
-            StateSnapshot {
-                phase: row.0,
-                prepared_audit_seq: row.1,
-                terminal_audit_seq: row.2,
-            }
+            StateSnapshot { phase: row.0 }
         }
 
         /// Extracts the deterministic operation identity from a Forge detail.
@@ -284,8 +289,6 @@ mod pg_tests {
                 ("phase", "text", "NO"),
                 ("prepared_detail", "jsonb", "NO"),
                 ("current_detail", "jsonb", "NO"),
-                ("prepared_audit_seq", "bigint", "NO"),
-                ("terminal_audit_seq", "bigint", "YES"),
                 ("prepared_at", "timestamp with time zone", "NO"),
                 ("updated_at", "timestamp with time zone", "NO"),
             ];
@@ -349,10 +352,6 @@ mod pg_tests {
             assert_eq!(
                 checks,
                 vec![
-                    (
-                        "forge_operation_state_check".to_owned(),
-                        "CHECK ((((phase = 'prepared'::text) AND (terminal_audit_seq IS NULL)) OR ((phase <> 'prepared'::text) AND (terminal_audit_seq IS NOT NULL))))".to_owned(),
-                    ),
                     (
                         "forge_operation_state_family_check".to_owned(),
                         "CHECK ((family = ANY (ARRAY['scribe_promotion'::text, 'iceberg_rewrite'::text, 'snapshot_expire'::text, 'orphan_gc'::text])))".to_owned(),
@@ -547,14 +546,13 @@ mod pg_tests {
                         &output,
                     )),
                 );
-                let prepared_seq =
-                    match append_prepared(pool, tenant, resource(), family, &prepared_event)
-                        .await
-                        .expect("iceberg prepared")
-                    {
-                        ForgeOperationTransition::Applied { audit_seq } => audit_seq,
-                        other => panic!("expected prepared application, got {other:?}"),
-                    };
+                let () = match append_prepared(pool, tenant, resource(), family, &prepared_event)
+                    .await
+                    .expect("iceberg prepared")
+                {
+                    ForgeOperationTransition::Applied => (),
+                    other => panic!("expected prepared application, got {other:?}"),
+                };
                 assert_eq!(
                     forge_operation_id(prepared_event.detail.as_ref().expect("prepared detail")),
                     operation_id,
@@ -571,21 +569,18 @@ mod pg_tests {
                         &output,
                     )),
                 );
-                let terminal_seq =
-                    match append_terminal(pool, tenant, resource(), family, &terminal_event)
-                        .await
-                        .expect("iceberg terminal")
-                    {
-                        ForgeOperationTransition::Applied { audit_seq } => audit_seq,
-                        other => panic!("expected terminal application, got {other:?}"),
-                    };
+                let () = match append_terminal(pool, tenant, resource(), family, &terminal_event)
+                    .await
+                    .expect("iceberg terminal")
+                {
+                    ForgeOperationTransition::Applied => (),
+                    other => panic!("expected terminal application, got {other:?}"),
+                };
 
                 assert_eq!(
                     state_snapshot(pool, tenant, family, operation_id).await,
                     StateSnapshot {
-                        phase: persisted.to_owned(),
-                        prepared_audit_seq: prepared_seq,
-                        terminal_audit_seq: Some(terminal_seq),
+                        phase: persisted.to_owned()
                     }
                 );
             }
@@ -628,14 +623,13 @@ mod pg_tests {
             };
             let prepared_event = event("forge.snapshot_expire.prepared", resource(), Some(detail));
 
-            let prepared_seq =
-                match append_prepared(pool, tenant, resource(), family, &prepared_event)
-                    .await
-                    .expect("snapshot_expire prepared")
-                {
-                    ForgeOperationTransition::Applied { audit_seq } => audit_seq,
-                    other => panic!("expected prepared application, got {other:?}"),
-                };
+            let () = match append_prepared(pool, tenant, resource(), family, &prepared_event)
+                .await
+                .expect("snapshot_expire prepared")
+            {
+                ForgeOperationTransition::Applied => (),
+                other => panic!("expected prepared application, got {other:?}"),
+            };
             let prepared_detail = prepared_event.detail.as_ref().expect("prepared detail");
             let operation_id = forge_operation_id(prepared_detail);
             let committed_detail = match prepared_detail {
@@ -663,21 +657,18 @@ mod pg_tests {
                 resource(),
                 Some(committed_detail),
             );
-            let terminal_seq =
-                match append_terminal(pool, tenant, resource(), family, &committed_event)
-                    .await
-                    .expect("snapshot_expire committed")
-                {
-                    ForgeOperationTransition::Applied { audit_seq } => audit_seq,
-                    other => panic!("expected terminal application, got {other:?}"),
-                };
+            let () = match append_terminal(pool, tenant, resource(), family, &committed_event)
+                .await
+                .expect("snapshot_expire committed")
+            {
+                ForgeOperationTransition::Applied => (),
+                other => panic!("expected terminal application, got {other:?}"),
+            };
 
             assert_eq!(
                 state_snapshot(pool, tenant, family, operation_id).await,
                 StateSnapshot {
-                    phase: "committed".to_owned(),
-                    prepared_audit_seq: prepared_seq,
-                    terminal_audit_seq: Some(terminal_seq),
+                    phase: "committed".to_owned()
                 }
             );
             assert_eq!(count_state(pool, tenant).await, 1);
@@ -713,14 +704,13 @@ mod pg_tests {
             };
             let prepared_event = event("forge.orphan_gc.prepared", resource(), Some(detail));
 
-            let prepared_seq =
-                match append_prepared(pool, tenant, resource(), family, &prepared_event)
-                    .await
-                    .expect("orphan_gc prepared")
-                {
-                    ForgeOperationTransition::Applied { audit_seq } => audit_seq,
-                    other => panic!("expected prepared application, got {other:?}"),
-                };
+            let () = match append_prepared(pool, tenant, resource(), family, &prepared_event)
+                .await
+                .expect("orphan_gc prepared")
+            {
+                ForgeOperationTransition::Applied => (),
+                other => panic!("expected prepared application, got {other:?}"),
+            };
             let prepared_detail = prepared_event.detail.as_ref().expect("prepared detail");
             let operation_id = forge_operation_id(prepared_detail);
             let committed_detail = match prepared_detail {
@@ -741,21 +731,18 @@ mod pg_tests {
                 resource(),
                 Some(committed_detail),
             );
-            let terminal_seq =
-                match append_terminal(pool, tenant, resource(), family, &committed_event)
-                    .await
-                    .expect("orphan_gc committed")
-                {
-                    ForgeOperationTransition::Applied { audit_seq } => audit_seq,
-                    other => panic!("expected terminal application, got {other:?}"),
-                };
+            let () = match append_terminal(pool, tenant, resource(), family, &committed_event)
+                .await
+                .expect("orphan_gc committed")
+            {
+                ForgeOperationTransition::Applied => (),
+                other => panic!("expected terminal application, got {other:?}"),
+            };
 
             assert_eq!(
                 state_snapshot(pool, tenant, family, operation_id).await,
                 StateSnapshot {
-                    phase: "committed".to_owned(),
-                    prepared_audit_seq: prepared_seq,
-                    terminal_audit_seq: Some(terminal_seq),
+                    phase: "committed".to_owned()
                 }
             );
             assert_eq!(count_state(pool, tenant).await, 1);
@@ -906,14 +893,13 @@ mod pg_tests {
                 resource(),
                 Some(prepared_detail.clone()),
             );
-            let prepared_seq =
-                match append_prepared(pool, tenant, resource(), family, &prepared_event)
-                    .await
-                    .expect("promotion prepared")
-                {
-                    ForgeOperationTransition::Applied { audit_seq } => audit_seq,
-                    other => panic!("expected prepared application, got {other:?}"),
-                };
+            let () = match append_prepared(pool, tenant, resource(), family, &prepared_event)
+                .await
+                .expect("promotion prepared")
+            {
+                ForgeOperationTransition::Applied => (),
+                other => panic!("expected prepared application, got {other:?}"),
+            };
             assert_eq!(forge_operation_id(&prepared_detail), operation_id);
 
             // A promotion detail presented under another family is refused
@@ -951,21 +937,18 @@ mod pg_tests {
                     "aa11",
                 )),
             );
-            let terminal_seq =
-                match append_terminal(pool, tenant, resource(), family, &committed_event)
-                    .await
-                    .expect("promotion committed")
-                {
-                    ForgeOperationTransition::Applied { audit_seq } => audit_seq,
-                    other => panic!("expected terminal application, got {other:?}"),
-                };
+            let () = match append_terminal(pool, tenant, resource(), family, &committed_event)
+                .await
+                .expect("promotion committed")
+            {
+                ForgeOperationTransition::Applied => (),
+                other => panic!("expected terminal application, got {other:?}"),
+            };
 
             assert_eq!(
                 state_snapshot(pool, tenant, family, operation_id).await,
                 StateSnapshot {
-                    phase: "committed".to_owned(),
-                    prepared_audit_seq: prepared_seq,
-                    terminal_audit_seq: Some(terminal_seq),
+                    phase: "committed".to_owned()
                 }
             );
 
@@ -998,7 +981,7 @@ mod pg_tests {
         // -----------------------------------------------------------------------
 
         /// Seeds one `vala.forge_operation_state` row directly, with no
-        /// `vala.audit_outbox` row at either referenced sequence.
+        /// `vala.audit_staging` row at either referenced sequence.
         ///
         /// Production always appends the audit event in the same transaction as
         /// the transition, but audit delivery rows are subject to their own
@@ -1010,10 +993,6 @@ mod pg_tests {
         ///
         /// Panics when the tenant transaction, insert, or commit fails, or when
         /// either detail cannot be serialized.
-        #[expect(
-            clippy::too_many_arguments,
-            reason = "one seeded projection row is exactly these columns"
-        )]
         async fn seed_state_row(
             pool: &PgPool,
             tenant: DataTenantId,
@@ -1022,8 +1001,6 @@ mod pg_tests {
             phase: &str,
             prepared_detail: &AuditDetail,
             current_detail: &AuditDetail,
-            prepared_audit_seq: i64,
-            terminal_audit_seq: Option<i64>,
         ) {
             let mut conn = TenantConn::acquire(pool, tenant)
                 .await
@@ -1033,10 +1010,9 @@ mod pg_tests {
                 INSERT INTO vala.forge_operation_state
                     (data_tenant_id, resource, family, operation_id, phase,
                      prepared_detail, current_detail,
-                     prepared_audit_seq, terminal_audit_seq,
                      prepared_at, updated_at)
                 VALUES (wyrd.current_tenant(), $1, $2, $3, $4,
-                        $5::jsonb, $6::jsonb, $7, $8, now(), now())
+                        $5::jsonb, $6::jsonb, now(), now())
                 "#,
             )
             .bind(resource())
@@ -1045,8 +1021,6 @@ mod pg_tests {
             .bind(phase)
             .bind(serde_json::to_string(prepared_detail).expect("serialize seeded prepared detail"))
             .bind(serde_json::to_string(current_detail).expect("serialize seeded current detail"))
-            .bind(prepared_audit_seq)
-            .bind(terminal_audit_seq)
             .execute(&mut **conn.transaction())
             .await
             .expect("seeded projection insert");
@@ -1073,7 +1047,6 @@ mod pg_tests {
             audits_before: i64,
         ) {
             let operation_id = Uuid::now_v7();
-            let prepared_seq = 6_360_i64;
             let candidate_paths =
                 vec![StoragePath::new("table/orphans/outbox-free.parquet").expect("valid path")];
             let prepared_detail = AuditDetail::ForgeOrphanGc {
@@ -1092,8 +1065,6 @@ mod pg_tests {
                 "prepared",
                 &prepared_detail,
                 &prepared_detail,
-                prepared_seq,
-                None,
             )
             .await;
 
@@ -1103,8 +1074,6 @@ mod pg_tests {
             assert!(!open.overflowed, "single seeded open orphan-GC operation");
             assert_eq!(open.operations.len(), 1, "exactly one open orphan-GC batch");
             assert_eq!(open.operations[0].operation_id, operation_id);
-            assert_eq!(open.operations[0].prepared_audit_seq, prepared_seq);
-            assert_eq!(open.operations[0].terminal_audit_seq, None);
             assert_eq!(open.operations[0].prepared_detail, prepared_detail);
 
             let recovered_event = event(
@@ -1119,7 +1088,7 @@ mod pg_tests {
                     skipped_paths: vec![],
                 }),
             );
-            let terminal_seq = match append_terminal(
+            let () = match append_terminal(
                 pool,
                 tenant,
                 resource(),
@@ -1129,7 +1098,7 @@ mod pg_tests {
             .await
             .expect("orphan-GC settlement must not require an audit delivery row")
             {
-                ForgeOperationTransition::Applied { audit_seq } => audit_seq,
+                ForgeOperationTransition::Applied => (),
                 other => panic!("expected terminal application, got {other:?}"),
             };
             assert_eq!(
@@ -1140,9 +1109,7 @@ mod pg_tests {
             assert_eq!(
                 state_snapshot(pool, tenant, ForgeOperationFamily::OrphanGc, operation_id).await,
                 StateSnapshot {
-                    phase: "recovered".to_owned(),
-                    prepared_audit_seq: prepared_seq,
-                    terminal_audit_seq: Some(terminal_seq),
+                    phase: "recovered".to_owned()
                 }
             );
             assert!(
@@ -1182,7 +1149,6 @@ mod pg_tests {
                 pool: &PgPool,
                 tenant: DataTenantId,
                 family: ForgeOperationFamily,
-                seq: i64,
             ) -> Uuid {
                 let operation_id = Uuid::now_v7();
                 let detail = match family {
@@ -1208,18 +1174,16 @@ mod pg_tests {
                     "prepared",
                     &detail,
                     &detail,
-                    seq,
-                    None,
                 )
                 .await;
                 operation_id
             }
 
-            for seq in 0..5_i64 {
-                seed_open(pool, tenant, ForgeOperationFamily::OrphanGc, 100 + seq).await;
+            for _ in 0..5 {
+                seed_open(pool, tenant, ForgeOperationFamily::OrphanGc).await;
             }
             // A different family on the same resource must be invisible here.
-            let foreign = seed_open(pool, tenant, ForgeOperationFamily::SnapshotExpire, 200).await;
+            let foreign = seed_open(pool, tenant, ForgeOperationFamily::SnapshotExpire).await;
 
             // Two rows share one `prepared_at`, so the cursor must carry the
             // operation id to make progress across that boundary.
@@ -1398,7 +1362,7 @@ mod pg_tests {
         ///
         /// `vala.forge_operation_state` is the sole Forge recovery authority:
         /// it stores the complete typed prepared and current details plus the
-        /// audit sequences those transitions produced. `vala.audit_outbox` is a
+        /// audit sequences those transitions produced. `vala.audit_staging` is a
         /// delivery table with its own retention, so requiring one of its rows
         /// to still be present before a worker may read back its own prepared
         /// operation would make recovery depend on audit delivery rather than
@@ -1423,7 +1387,6 @@ mod pg_tests {
             // A Prepared snapshot-expiry operation whose prepared audit row is
             // no longer in the outbox.
             let expire_id = Uuid::now_v7();
-            let prepared_seq = 4_242_i64;
             let prepared_detail =
                 expire_detail(expire_id, ForgeSnapshotExpirePhase::Prepared, resource());
             seed_state_row(
@@ -1434,16 +1397,12 @@ mod pg_tests {
                 "prepared",
                 &prepared_detail,
                 &prepared_detail,
-                prepared_seq,
-                None,
             )
             .await;
 
             // A terminal Reset rewrite operation whose audit rows are likewise
             // absent.
             let reset_id = Uuid::now_v7();
-            let reset_prepared_seq = 5_150_i64;
-            let reset_terminal_seq = 5_151_i64;
             let reset_prepared_detail = rewrite_detail(
                 reset_id,
                 ForgeIcebergRewritePhase::Prepared,
@@ -1464,8 +1423,6 @@ mod pg_tests {
                 "reset",
                 &reset_prepared_detail,
                 &reset_current_detail,
-                reset_prepared_seq,
-                Some(reset_terminal_seq),
             )
             .await;
 
@@ -1485,8 +1442,6 @@ mod pg_tests {
                 open.operations[0].phase,
                 vala_sql::row_types::forge_operations::ForgeOperationPhase::Prepared
             );
-            assert_eq!(open.operations[0].prepared_audit_seq, prepared_seq);
-            assert_eq!(open.operations[0].terminal_audit_seq, None);
             assert_eq!(open.operations[0].prepared_detail, prepared_detail);
 
             let reset = list_reset(pool, tenant, ForgeOperationFamily::IcebergRewrite)
@@ -1498,11 +1453,6 @@ mod pg_tests {
             assert_eq!(
                 reset.operations[0].phase,
                 vala_sql::row_types::forge_operations::ForgeOperationPhase::Reset
-            );
-            assert_eq!(reset.operations[0].prepared_audit_seq, reset_prepared_seq);
-            assert_eq!(
-                reset.operations[0].terminal_audit_seq,
-                Some(reset_terminal_seq)
             );
 
             // Identical Prepared replay returns the stored sequence and writes
@@ -1521,10 +1471,7 @@ mod pg_tests {
             .await
             .expect("Prepared replay must not require an audit delivery row");
             assert!(
-                matches!(
-                    replay,
-                    ForgeOperationTransition::AlreadyApplied { audit_seq } if audit_seq == prepared_seq
-                ),
+                matches!(replay, ForgeOperationTransition::AlreadyApplied),
                 "Prepared replay returns the stored prepared sequence, got {replay:?}"
             );
             assert_eq!(
@@ -1543,7 +1490,7 @@ mod pg_tests {
                     resource(),
                 )),
             );
-            let terminal_seq = match append_terminal(
+            let () = match append_terminal(
                 pool,
                 tenant,
                 resource(),
@@ -1553,7 +1500,7 @@ mod pg_tests {
             .await
             .expect("terminal settlement must not require an audit delivery row")
             {
-                ForgeOperationTransition::Applied { audit_seq } => audit_seq,
+                ForgeOperationTransition::Applied => (),
                 other => panic!("expected terminal application, got {other:?}"),
             };
             assert_eq!(
@@ -1570,9 +1517,7 @@ mod pg_tests {
                 )
                 .await,
                 StateSnapshot {
-                    phase: "committed".to_owned(),
-                    prepared_audit_seq: prepared_seq,
-                    terminal_audit_seq: Some(terminal_seq),
+                    phase: "committed".to_owned()
                 }
             );
 
@@ -1587,10 +1532,7 @@ mod pg_tests {
             .await
             .expect("idempotent terminal replay");
             assert!(
-                matches!(
-                    terminal_replay,
-                    ForgeOperationTransition::AlreadyApplied { audit_seq } if audit_seq == terminal_seq
-                ),
+                matches!(terminal_replay, ForgeOperationTransition::AlreadyApplied),
                 "terminal replay returns the stored terminal sequence, got {terminal_replay:?}"
             );
             assert_eq!(
@@ -1617,8 +1559,6 @@ mod pg_tests {
                 "prepared",
                 &mismatched_detail,
                 &mismatched_detail,
-                9_001,
-                None,
             )
             .await;
             assert!(
@@ -1894,16 +1834,6 @@ mod pg_tests {
             let operation_id = Uuid::now_v7();
             let detail =
                 expire_detail(operation_id, ForgeSnapshotExpirePhase::Prepared, resource());
-            let prepared_event = event(
-                "forge.snapshot_expire.prepared",
-                resource(),
-                Some(detail.clone()),
-            );
-            let task_prepared = event(
-                "forge.task.prepared",
-                &format!("forge-task:{}", authority.task_id),
-                None,
-            );
             let evidence = prepared_evidence();
             let ops = ForgeOperations::new(resource(), ForgeOperationFamily::SnapshotExpire)
                 .expect("valid Forge resource");
@@ -1911,8 +1841,8 @@ mod pg_tests {
                 authority: &authority,
                 table: &table,
                 evidence: &evidence,
-                operation_event: &prepared_event,
-                task_event: &task_prepared,
+                operation: "forge.snapshot_expire.prepared",
+                detail: &detail,
             };
 
             let applied = ops
@@ -1958,17 +1888,12 @@ mod pg_tests {
             let rival_id = Uuid::now_v7();
             let rival_detail =
                 expire_detail(rival_id, ForgeSnapshotExpirePhase::Prepared, resource());
-            let rival_event = event(
-                "forge.snapshot_expire.prepared",
-                resource(),
-                Some(rival_detail),
-            );
             let rival = ForgeExpirationPreparation {
                 authority: &authority,
                 table: &table,
                 evidence: &evidence,
-                operation_event: &rival_event,
-                task_event: &task_prepared,
+                operation: "forge.snapshot_expire.prepared",
+                detail: &rival_detail,
             };
             assert!(
                 ops.prepare_snapshot_expiration(operator, tenant, &rival)
@@ -1983,25 +1908,10 @@ mod pg_tests {
             );
 
             // --- reset releases the selection without a public phase -------
-            let reset_event = event(
-                "forge.snapshot_expire.reset",
-                resource(),
-                Some(detail.clone()),
-            );
-            let reset_event = AuditEvent {
-                result: AuditResult::Failure,
-                ..reset_event
-            };
-            let task_cancelled = event(
-                "forge.task.cancelled",
-                &format!("forge-task:{}", authority.task_id),
-                None,
-            );
             let reset_request = ForgeExpirationResetRequest {
                 authority: &authority,
                 table: &table,
-                operation_event: &reset_event,
-                task_event: &task_cancelled,
+                detail: &detail,
             };
             let reset = ops
                 .reset_snapshot_expiration(operator, tenant, &reset_request)
@@ -2081,16 +1991,6 @@ mod pg_tests {
                 ForgeSnapshotExpirePhase::Prepared,
                 resource(),
             );
-            let settle_prepared = event(
-                "forge.snapshot_expire.prepared",
-                resource(),
-                Some(settle_detail.clone()),
-            );
-            let settle_task_prepared = event(
-                "forge.task.prepared",
-                &format!("forge-task:{}", settle_authority.task_id),
-                None,
-            );
             ops.prepare_snapshot_expiration(
                 operator,
                 tenant,
@@ -2098,8 +1998,8 @@ mod pg_tests {
                     authority: &settle_authority,
                     table: &table,
                     evidence: &evidence,
-                    operation_event: &settle_prepared,
-                    task_event: &settle_task_prepared,
+                    operation: "forge.snapshot_expire.prepared",
+                    detail: &settle_detail,
                 },
             )
             .await
@@ -2110,24 +2010,14 @@ mod pg_tests {
                 ForgeSnapshotExpirePhase::Committed,
                 resource(),
             );
-            let committed_event = event(
-                "forge.snapshot_expire.committed",
-                resource(),
-                Some(committed_detail),
-            );
-            let task_succeeded = event(
-                "forge.task.succeeded",
-                &format!("forge-task:{}", settle_authority.task_id),
-                None,
-            );
             let final_evidence = settled_evidence();
             let settlement = ForgeExpirationSettlementRequest {
                 authority: &settle_authority,
                 table: &table,
                 settlement: ForgeExpirationSettlement::Committed,
                 evidence: &final_evidence,
-                operation_event: &committed_event,
-                task_event: &task_succeeded,
+                operation: "forge.snapshot_expire.committed",
+                detail: &committed_detail,
             };
             // --- every claim row must exactly reproduce the preparation ----
             // Claim rows are immutable historical evidence. A takeover changes
@@ -2135,31 +2025,17 @@ mod pg_tests {
             // divergence must refuse reconciliation input, reset, and
             // settlement without touching claims, operation state, the task,
             // planning demand, or the audit chain.
-            let settle_reset_event = AuditEvent {
-                result: AuditResult::Failure,
-                ..event(
-                    "forge.snapshot_expire.reset",
-                    resource(),
-                    Some(settle_detail.clone()),
-                )
-            };
-            let settle_task_cancelled = event(
-                "forge.task.cancelled",
-                &format!("forge-task:{}", settle_authority.task_id),
-                None,
-            );
             let settle_reset_request = ForgeExpirationResetRequest {
                 authority: &settle_authority,
                 table: &table,
-                operation_event: &settle_reset_event,
-                task_event: &settle_task_cancelled,
+                detail: &settle_detail,
             };
 
             // The claim table's foreign keys mean a corrupted row must still
             // reference real state, so each identity case gets a decoy the
             // validator is required to reject anyway.
             let stranger = Uuid::now_v7();
-            let decoy_state = "INSERT INTO vala.forge_operation_state (data_tenant_id,resource,family,operation_id,phase,prepared_detail,current_detail,prepared_audit_seq,terminal_audit_seq,prepared_at,updated_at) VALUES ($1,$2,'snapshot_expire',$3,'prepared',$4::jsonb,$4::jsonb,9100,NULL,now(),now())";
+            let decoy_state = "INSERT INTO vala.forge_operation_state (data_tenant_id,resource,family,operation_id,phase,prepared_detail,current_detail,prepared_at,updated_at) VALUES ($1,$2,'snapshot_expire',$3,'prepared',$4::jsonb,$4::jsonb,now(),now())";
             for (decoy_resource, decoy_operation) in [
                 ("tenant_a.ns.other", settle_operation),
                 (resource(), stranger),

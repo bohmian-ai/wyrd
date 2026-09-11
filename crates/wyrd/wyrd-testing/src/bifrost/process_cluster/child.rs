@@ -894,20 +894,6 @@ impl ChildConfig {
             roles: Vec::new(),
             effective_permissions: wyrd_runtime::PermissionSet::new(),
         };
-        let audit_event = wyrd_spec::vala::api::AuditEvent::new(
-            wyrd_spec::request_id::RequestId::now_v7(),
-            None,
-            "bifrost.write".to_owned(),
-            format!("bifrost://vala.bifrost/{table}"),
-            None,
-            principal.id,
-            wyrd_spec::auth::PrincipalKindTag::User,
-            wyrd_spec::vala::api::AuthMethod::Internal,
-            "bifrost_write:write".to_owned(),
-            wyrd_spec::vala::api::AuditDecision::Allow,
-            wyrd_spec::vala::api::AuditResult::Success,
-            "peer network fixture ingest".to_owned(),
-        );
         scribe
             .ingest_native_for_test(vala_bifrost_redux::scribe::NativeIngressTestFrame {
                 principal,
@@ -915,7 +901,6 @@ impl ChildConfig {
                 expected_schema_fingerprint: fingerprint,
                 request_id: wyrd_spec::request_id::RequestId::now_v7(),
                 batch_id: uuid::Uuid::now_v7(),
-                audit_event,
                 payload: fixture_rows_ipc(start_id, rows, groups)?,
             })
             .await

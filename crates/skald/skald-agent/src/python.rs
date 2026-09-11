@@ -7,20 +7,77 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use pyo3::exceptions::{PyRuntimeError, PyTypeError};
+use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyList, PyModule, PyString};
 use skald_prompt::{Prompt, PyProviderRequest};
 use skald_spec::{ProviderRequest, ProviderResponse};
+use wyrd_spec::error::WyrdError;
 use wyrd_spec::metadata::{AnnotationKey, AnnotationValue, LabelKey, LabelValue};
 use wyrd_spec::reference::PromptRef;
+use wyrd_utils::py::{WyrdPyError, WyrdPyResult, py_err_to_wyrd_error};
 
-use crate::py_error::{AgentPyError, AgentPyResult};
+use crate::error::AgentError;
 use crate::{
     AfterAgentFn, AfterModelFn, AfterToolFn, Agent, AgentContext, AgentRun, BeforeAgentFn,
     BeforeModelFn, BeforeToolFn, CallbackOutcome, FinishReason, Role, RunConfig, SessionError,
     SessionId, SessionMemory, SessionTurn, default_prompt_resolver,
 };
+
+impl From<AgentError> for WyrdPyError {
+    /// Widen an agent failure into the shared Python boundary error.
+    ///
+    /// The catalog projection in [`crate::error`] owns every public metadata
+    /// field, so `?` on an [`AgentError`] inside a `#[pymethods]` body raises
+    /// the shared `wyrd.WyrdError` with its canonical code and status.
+    fn from(error: AgentError) -> Self {
+        Self::from(WyrdError::from(error))
+    }
+}
+
+/// Reject a caller-supplied argument that the agent surface cannot accept.
+fn invalid_argument(name: &str, detail: impl std::fmt::Display) -> WyrdPyError {
+    AgentError::InvalidArgument {
+        name: name.to_owned(),
+        detail: detail.to_string(),
+    }
+    .into()
+}
+
+/// Project a failure to decode caller-supplied JSON into the agent surface.
+fn json_decode_error(error: &serde_json::Error) -> WyrdPyError {
+    invalid_argument("json", error)
+}
+
+/// Project a failure to instantiate the caller's declared output class.
+fn structured_decode_error(error: &impl std::fmt::Display) -> WyrdPyError {
+    AgentError::StructuredOutputDecode {
+        agent: "<python>".to_owned(),
+        detail: error.to_string(),
+    }
+    .into()
+}
+
+/// Project an interpreter-side or self-serialization failure at this boundary.
+///
+/// These paths are unreachable for well-formed agent state; surfacing them as
+/// catalog `WYRD_SPEC_500_INTERNAL` keeps the boundary from raising a bare
+/// Python exception when the interpreter refuses an allocation or conversion.
+fn boundary_internal(detail: &impl std::fmt::Display) -> WyrdPyError {
+    WyrdPyError::from(WyrdError::Internal {
+        message: detail.to_string(),
+        details: serde_json::json!({ "boundary": "skald_agent_python" }),
+    })
+}
+
+/// Re-enter the catalog from a PyO3-originated failure.
+///
+/// Used where an interpreter call inside a Wyrd-owned operation fails; the
+/// shared converter preserves an already-structured Wyrd exception and
+/// classifies anything else as agent validation.
+fn from_py_err(error: PyErr) -> WyrdPyError {
+    Python::attach(|py| WyrdPyError::from(py_err_to_wyrd_error(py, error)))
+}
 
 #[pymethods]
 impl Agent {
@@ -104,7 +161,7 @@ impl Agent {
         provider_base_url: Option<String>,
         provider_api_key: Option<String>,
         output_type: Option<&Bound<'_, PyAny>>,
-    ) -> AgentPyResult<Self> {
+    ) -> WyrdPyResult<Self> {
         let mut agent = agent_from_prompt_py(prompt)?;
 
         if let Some(id) = id {
@@ -117,7 +174,8 @@ impl Agent {
             agent = agent.with_session(wrap_session(py, session)?);
         }
         for tool in tools.unwrap_or_default() {
-            agent = agent.with_tool(skald_tool::python::wrap_callable(py, tool)?);
+            agent =
+                agent.with_tool(skald_tool::python::wrap_callable(py, tool).map_err(from_py_err)?);
         }
 
         if let Some(name) = name {
@@ -137,22 +195,22 @@ impl Agent {
         }
 
         if let Some(callback) = before_agent_callback {
-            agent = agent.before_agent(wrap_before_agent(py, callback)?);
+            agent = agent.before_agent(wrap_before_agent(py, callback));
         }
         if let Some(callback) = after_agent_callback {
-            agent = agent.after_agent(wrap_after_agent(py, callback)?);
+            agent = agent.after_agent(wrap_after_agent(py, callback));
         }
         if let Some(callback) = before_model_callback {
-            agent = agent.before_model(wrap_before_model(py, callback)?);
+            agent = agent.before_model(wrap_before_model(py, callback));
         }
         if let Some(callback) = after_model_callback {
-            agent = agent.after_model(wrap_after_model(py, callback)?);
+            agent = agent.after_model(wrap_after_model(py, callback));
         }
         if let Some(callback) = before_tool_callback {
-            agent = agent.before_tool(wrap_before_tool(py, callback)?);
+            agent = agent.before_tool(wrap_before_tool(py, callback));
         }
         if let Some(callback) = after_tool_callback {
-            agent = agent.after_tool(wrap_after_tool(py, callback)?);
+            agent = agent.after_tool(wrap_after_tool(py, callback));
         }
 
         if let Some(base_url) = provider_base_url {
@@ -162,7 +220,12 @@ impl Agent {
                 base_url,
                 provider_api_key,
             )
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            .map_err(|error| {
+                AgentError::Provider(skald_runtime::SkaldRuntimeError::from_provider(
+                    provider_name.clone(),
+                    error,
+                ))
+            })?;
             agent = agent.with_provider_registry(Arc::new(registry));
         }
 
@@ -221,13 +284,13 @@ impl Agent {
 
     /// Save this Agent as a YAML Agent Card on local disk.
     #[pyo3(name = "save")]
-    pub fn py_save(&self, path: PathBuf) -> AgentPyResult<()> {
+    pub fn py_save(&self, path: PathBuf) -> WyrdPyResult<()> {
         Ok(Agent::save(self, path)?)
     }
 
     /// Load an Agent from a YAML Agent Card on local disk.
     #[staticmethod]
-    pub fn from_yaml(path: PathBuf) -> AgentPyResult<Self> {
+    pub fn from_yaml(path: PathBuf) -> WyrdPyResult<Self> {
         Ok(Self::from_yaml_path(
             path,
             skald_tool::default_registry(),
@@ -237,28 +300,28 @@ impl Agent {
 
     /// Return this Agent Card envelope as a YAML string.
     #[pyo3(name = "to_yaml_string")]
-    pub fn py_to_yaml_string(&self) -> AgentPyResult<String> {
+    pub fn py_to_yaml_string(&self) -> WyrdPyResult<String> {
         Ok(Agent::to_yaml_string(self)?)
     }
 
     /// Return this Agent Card as a JSON-serializable Python mapping.
     #[pyo3(name = "to_card")]
-    pub fn py_to_card(&self, py: Python<'_>) -> AgentPyResult<Py<PyAny>> {
+    pub fn py_to_card(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
         let card = Agent::to_card(self)?;
-        let value = serde_json::to_value(card)?;
-        Ok(wyrd_utils::py::json_to_pyobject(py, &value)?)
+        let value = serde_json::to_value(card).map_err(|error| boundary_internal(&error))?;
+        wyrd_utils::py::json_to_pyobject(py, &value).map_err(from_py_err)
     }
 
     /// Return this Agent Card envelope as JSON.
     #[pyo3(name = "model_dump_json")]
-    pub fn py_model_dump_json(&self) -> AgentPyResult<String> {
-        Ok(serde_json::to_string(&Agent::to_card(self)?)?)
+    pub fn py_model_dump_json(&self) -> WyrdPyResult<String> {
+        serde_json::to_string(&Agent::to_card(self)?).map_err(|error| boundary_internal(&error))
     }
 
     /// Validate an Agent Card envelope JSON payload into an Agent.
     #[staticmethod]
-    pub fn model_validate_json(data: &str) -> AgentPyResult<Self> {
-        let card = serde_json::from_str(data)?;
+    pub fn model_validate_json(data: &str) -> WyrdPyResult<Self> {
+        let card = serde_json::from_str(data).map_err(|error| json_decode_error(&error))?;
         Ok(Self::from_card(
             card,
             skald_tool::default_registry(),
@@ -268,7 +331,7 @@ impl Agent {
 
     /// Validate whether this local Agent can be durably registered.
     #[pyo3(name = "validate_registrable")]
-    pub fn py_validate_registrable(&self) -> AgentPyResult<()> {
+    pub fn py_validate_registrable(&self) -> WyrdPyResult<()> {
         Ok(Agent::validate_registrable(self)?)
     }
 
@@ -281,7 +344,7 @@ impl Agent {
         input: &Bound<'_, PyAny>,
         session_id: Option<String>,
         output_type: Option<&Bound<'_, PyAny>>,
-    ) -> AgentPyResult<Py<PyAny>> {
+    ) -> WyrdPyResult<Py<PyAny>> {
         let input_str = input_to_string(input)?;
         let providers = skald_runtime::default_registry();
         let session_id = session_id.map(SessionId::new);
@@ -308,25 +371,25 @@ impl Agent {
             run.parsed = Some(Arc::new(instantiate_parsed(py, &cls, &run.output, map)?));
         }
 
-        Ok(Py::new(py, run)?.into_any())
+        Ok(Py::new(py, run).map_err(from_py_err)?.into_any())
     }
 
     /// Add one runtime-local tool in place.
     #[pyo3(name = "add_tool")]
-    pub fn py_add_tool(&mut self, py: Python<'_>, tool: Py<PyAny>) -> AgentPyResult<()> {
+    pub fn py_add_tool(&mut self, py: Python<'_>, tool: Py<PyAny>) -> WyrdPyResult<()> {
         let next = self
             .clone()
-            .with_tool(skald_tool::python::wrap_callable(py, tool)?);
+            .with_tool(skald_tool::python::wrap_callable(py, tool).map_err(from_py_err)?);
         *self = next;
         Ok(())
     }
 
     /// Replace runtime-local tools in place.
     #[pyo3(name = "set_tools")]
-    pub fn py_set_tools(&mut self, py: Python<'_>, tools: Vec<Py<PyAny>>) -> AgentPyResult<()> {
+    pub fn py_set_tools(&mut self, py: Python<'_>, tools: Vec<Py<PyAny>>) -> WyrdPyResult<()> {
         let mut resolved = Vec::with_capacity(tools.len());
         for tool in tools {
-            resolved.push(skald_tool::python::wrap_callable(py, tool)?);
+            resolved.push(skald_tool::python::wrap_callable(py, tool).map_err(from_py_err)?);
         }
         *self = self.clone().with_tools(resolved);
         Ok(())
@@ -334,7 +397,7 @@ impl Agent {
 
     /// Replace the resolved Prompt in place.
     #[pyo3(name = "with_prompt")]
-    pub fn py_with_prompt(&mut self, prompt: &Bound<'_, PyAny>) -> AgentPyResult<()> {
+    pub fn py_with_prompt(&mut self, prompt: &Bound<'_, PyAny>) -> WyrdPyResult<()> {
         let next = self.clone().with_prompt(prompt_from_py(prompt)?);
         *self = next;
         Ok(())
@@ -342,7 +405,7 @@ impl Agent {
 
     /// Replace the session memory backend in place.
     #[pyo3(name = "with_session")]
-    pub fn py_with_session(&mut self, py: Python<'_>, session: Py<PyAny>) -> AgentPyResult<()> {
+    pub fn py_with_session(&mut self, py: Python<'_>, session: Py<PyAny>) -> WyrdPyResult<()> {
         let next = self.clone().with_session(wrap_session(py, session)?);
         *self = next;
         Ok(())
@@ -354,7 +417,7 @@ impl Agent {
         &mut self,
         py: Python<'_>,
         run_config: Py<RunConfig>,
-    ) -> AgentPyResult<()> {
+    ) -> WyrdPyResult<()> {
         let next = self.clone().with_run_config(run_config.borrow(py).clone());
         *self = next;
         Ok(())
@@ -367,49 +430,49 @@ impl Agent {
         &self,
         py: Python<'_>,
         description: Option<String>,
-    ) -> AgentPyResult<Py<PyAny>> {
+    ) -> WyrdPyResult<Py<PyAny>> {
         let providers = skald_runtime::default_registry();
         let delegate = crate::AgentDelegateTool::new(Arc::new(self.clone()), providers);
         let tool = match description {
             Some(description) => delegate.with_description(description).into_tool(),
             None => delegate.into_tool(),
         };
-        Ok(skald_tool::python::tool_callable_py(py, tool)?)
+        skald_tool::python::tool_callable_py(py, tool).map_err(from_py_err)
     }
 
     /// Register a before-agent callback in place.
-    pub fn add_before_agent(&mut self, py: Python<'_>, callback: Py<PyAny>) -> AgentPyResult<()> {
-        *self = self.clone().before_agent(wrap_before_agent(py, callback)?);
+    pub fn add_before_agent(&mut self, py: Python<'_>, callback: Py<PyAny>) -> WyrdPyResult<()> {
+        *self = self.clone().before_agent(wrap_before_agent(py, callback));
         Ok(())
     }
 
     /// Register an after-agent callback in place.
-    pub fn add_after_agent(&mut self, py: Python<'_>, callback: Py<PyAny>) -> AgentPyResult<()> {
-        *self = self.clone().after_agent(wrap_after_agent(py, callback)?);
+    pub fn add_after_agent(&mut self, py: Python<'_>, callback: Py<PyAny>) -> WyrdPyResult<()> {
+        *self = self.clone().after_agent(wrap_after_agent(py, callback));
         Ok(())
     }
 
     /// Register a before-model callback in place.
-    pub fn add_before_model(&mut self, py: Python<'_>, callback: Py<PyAny>) -> AgentPyResult<()> {
-        *self = self.clone().before_model(wrap_before_model(py, callback)?);
+    pub fn add_before_model(&mut self, py: Python<'_>, callback: Py<PyAny>) -> WyrdPyResult<()> {
+        *self = self.clone().before_model(wrap_before_model(py, callback));
         Ok(())
     }
 
     /// Register an after-model callback in place.
-    pub fn add_after_model(&mut self, py: Python<'_>, callback: Py<PyAny>) -> AgentPyResult<()> {
-        *self = self.clone().after_model(wrap_after_model(py, callback)?);
+    pub fn add_after_model(&mut self, py: Python<'_>, callback: Py<PyAny>) -> WyrdPyResult<()> {
+        *self = self.clone().after_model(wrap_after_model(py, callback));
         Ok(())
     }
 
     /// Register a before-tool callback in place.
-    pub fn add_before_tool(&mut self, py: Python<'_>, callback: Py<PyAny>) -> AgentPyResult<()> {
-        *self = self.clone().before_tool(wrap_before_tool(py, callback)?);
+    pub fn add_before_tool(&mut self, py: Python<'_>, callback: Py<PyAny>) -> WyrdPyResult<()> {
+        *self = self.clone().before_tool(wrap_before_tool(py, callback));
         Ok(())
     }
 
     /// Register an after-tool callback in place.
-    pub fn add_after_tool(&mut self, py: Python<'_>, callback: Py<PyAny>) -> AgentPyResult<()> {
-        *self = self.clone().after_tool(wrap_after_tool(py, callback)?);
+    pub fn add_after_tool(&mut self, py: Python<'_>, callback: Py<PyAny>) -> WyrdPyResult<()> {
+        *self = self.clone().after_tool(wrap_after_tool(py, callback));
         Ok(())
     }
 
@@ -447,7 +510,7 @@ impl SessionTurn {
         role: Py<PyAny>,
         content: String,
         call_id: Option<String>,
-    ) -> PyResult<Self> {
+    ) -> WyrdPyResult<Self> {
         Ok(Self {
             role: role_from_py(role.bind(py))?,
             content,
@@ -474,25 +537,25 @@ impl SessionTurn {
     }
 
     /// Return this turn as a Python dictionary.
-    pub fn model_dump(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+    pub fn model_dump(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
         session_turn_to_py_dict(py, self)
     }
 
     /// Return this turn as JSON.
-    pub fn model_dump_json(&self) -> PyResult<String> {
-        serde_json::to_string(self).map_err(|error| PyRuntimeError::new_err(error.to_string()))
+    pub fn model_dump_json(&self) -> WyrdPyResult<String> {
+        serde_json::to_string(self).map_err(|error| boundary_internal(&error))
     }
 
     /// Validate a Python mapping or `SessionTurn` instance.
     #[staticmethod]
-    pub fn model_validate(value: &Bound<'_, PyAny>) -> PyResult<Self> {
+    pub fn model_validate(value: &Bound<'_, PyAny>) -> WyrdPyResult<Self> {
         session_turn_from_py(value)
     }
 
     /// Validate JSON into a `SessionTurn`.
     #[staticmethod]
-    pub fn model_validate_json(data: &str) -> PyResult<Self> {
-        serde_json::from_str(data).map_err(|error| PyTypeError::new_err(error.to_string()))
+    pub fn model_validate_json(data: &str) -> WyrdPyResult<Self> {
+        serde_json::from_str(data).map_err(|error| json_decode_error(&error))
     }
 
     /// Return a concise Python representation.
@@ -507,11 +570,8 @@ impl SessionTurn {
 }
 
 /// Wrap a callable as a before-agent callback.
-///
-/// # Errors
-/// Returns Python conversion failures.
-pub fn wrap_before_agent(_py: Python<'_>, cb: Py<PyAny>) -> PyResult<BeforeAgentFn> {
-    Ok(Arc::new(move |ctx, input| {
+pub fn wrap_before_agent(_py: Python<'_>, cb: Py<PyAny>) -> BeforeAgentFn {
+    Arc::new(move |ctx, input| {
         invoke_callback(
             &cb,
             |py| {
@@ -520,15 +580,12 @@ pub fn wrap_before_agent(_py: Python<'_>, cb: Py<PyAny>) -> PyResult<BeforeAgent
             },
             extract_string_replacement,
         )
-    }))
+    })
 }
 
 /// Wrap a callable as an after-agent callback.
-///
-/// # Errors
-/// Returns Python conversion failures.
-pub fn wrap_after_agent(_py: Python<'_>, cb: Py<PyAny>) -> PyResult<AfterAgentFn> {
-    Ok(Arc::new(move |ctx, run| {
+pub fn wrap_after_agent(_py: Python<'_>, cb: Py<PyAny>) -> AfterAgentFn {
+    Arc::new(move |ctx, run| {
         invoke_callback(
             &cb,
             |py| {
@@ -537,15 +594,12 @@ pub fn wrap_after_agent(_py: Python<'_>, cb: Py<PyAny>) -> PyResult<AfterAgentFn
             },
             extract_agent_run_replacement,
         )
-    }))
+    })
 }
 
 /// Wrap a callable as a before-model callback.
-///
-/// # Errors
-/// Returns Python conversion failures.
-pub fn wrap_before_model(_py: Python<'_>, cb: Py<PyAny>) -> PyResult<BeforeModelFn> {
-    Ok(Arc::new(move |ctx, request| {
+pub fn wrap_before_model(_py: Python<'_>, cb: Py<PyAny>) -> BeforeModelFn {
+    Arc::new(move |ctx, request| {
         invoke_callback(
             &cb,
             |py| {
@@ -558,15 +612,12 @@ pub fn wrap_before_model(_py: Python<'_>, cb: Py<PyAny>) -> PyResult<BeforeModel
             },
             extract_provider_request_replacement,
         )
-    }))
+    })
 }
 
 /// Wrap a callable as an after-model callback.
-///
-/// # Errors
-/// Returns Python conversion failures.
-pub fn wrap_after_model(_py: Python<'_>, cb: Py<PyAny>) -> PyResult<AfterModelFn> {
-    Ok(Arc::new(move |ctx, response| {
+pub fn wrap_after_model(_py: Python<'_>, cb: Py<PyAny>) -> AfterModelFn {
+    Arc::new(move |ctx, response| {
         invoke_callback(
             &cb,
             |py| {
@@ -579,15 +630,12 @@ pub fn wrap_after_model(_py: Python<'_>, cb: Py<PyAny>) -> PyResult<AfterModelFn
             },
             extract_provider_response_replacement,
         )
-    }))
+    })
 }
 
 /// Wrap a callable as a before-tool callback.
-///
-/// # Errors
-/// Returns Python conversion failures.
-pub fn wrap_before_tool(_py: Python<'_>, cb: Py<PyAny>) -> PyResult<BeforeToolFn> {
-    Ok(Arc::new(move |ctx, tool, args| {
+pub fn wrap_before_tool(_py: Python<'_>, cb: Py<PyAny>) -> BeforeToolFn {
+    Arc::new(move |ctx, tool, args| {
         invoke_callback(
             &cb,
             |py| {
@@ -600,15 +648,12 @@ pub fn wrap_before_tool(_py: Python<'_>, cb: Py<PyAny>) -> PyResult<BeforeToolFn
             },
             extract_json_replacement,
         )
-    }))
+    })
 }
 
 /// Wrap a callable as an after-tool callback.
-///
-/// # Errors
-/// Returns Python conversion failures.
-pub fn wrap_after_tool(_py: Python<'_>, cb: Py<PyAny>) -> PyResult<AfterToolFn> {
-    Ok(Arc::new(move |ctx, tool, result| {
+pub fn wrap_after_tool(_py: Python<'_>, cb: Py<PyAny>) -> AfterToolFn {
+    Arc::new(move |ctx, tool, result| {
         invoke_callback(
             &cb,
             |py| {
@@ -627,11 +672,15 @@ pub fn wrap_after_tool(_py: Python<'_>, cb: Py<PyAny>) -> PyResult<AfterToolFn> 
             },
             extract_tool_result_replacement,
         )
-    }))
+    })
 }
 
 /// Wrap a Python session object.
-pub fn wrap_session(py: Python<'_>, session: Py<PyAny>) -> PyResult<Arc<dyn SessionMemory>> {
+///
+/// # Errors
+/// Returns `WYRD_AGENT_422_INVALID_ARGUMENT` when the object does not expose
+/// callable `recent()` and `append()` methods.
+pub fn wrap_session(py: Python<'_>, session: Py<PyAny>) -> WyrdPyResult<Arc<dyn SessionMemory>> {
     validate_callable_method(py, &session, "recent")?;
     validate_callable_method(py, &session, "append")?;
     Ok(Arc::new(PySessionMemory { inner: session }))
@@ -687,7 +736,7 @@ pub fn python_register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
-fn agent_from_prompt_py(value: &Bound<'_, PyAny>) -> AgentPyResult<Agent> {
+fn agent_from_prompt_py(value: &Bound<'_, PyAny>) -> WyrdPyResult<Agent> {
     if let Ok(prompt) = value.extract::<PyRef<'_, Prompt>>() {
         return Ok(Agent::new(prompt.clone()));
     }
@@ -695,25 +744,25 @@ fn agent_from_prompt_py(value: &Bound<'_, PyAny>) -> AgentPyResult<Agent> {
     Ok(Agent::try_from_ref(prompt_ref, default_prompt_resolver())?)
 }
 
-fn prompt_from_py(value: &Bound<'_, PyAny>) -> AgentPyResult<Prompt> {
+fn prompt_from_py(value: &Bound<'_, PyAny>) -> WyrdPyResult<Prompt> {
     Ok(value
         .extract::<PyRef<'_, Prompt>>()
-        .map_err(|error| PyTypeError::new_err(error.to_string()))?
+        .map_err(|error| invalid_argument("prompt", error))?
         .clone())
 }
 
-fn prompt_ref_from_py(value: &Bound<'_, PyAny>) -> AgentPyResult<PromptRef> {
+fn prompt_ref_from_py(value: &Bound<'_, PyAny>) -> WyrdPyResult<PromptRef> {
     if let Ok(json) = value.call_method0("model_dump_json") {
-        let data = json.extract::<String>()?;
-        return Ok(serde_json::from_str(&data)?);
+        let data = json
+            .extract::<String>()
+            .map_err(|error| invalid_argument("prompt", error))?;
+        return serde_json::from_str(&data).map_err(|error| json_decode_error(&error));
     }
-    let json = wyrd_utils::py::pyobject_to_json(value)?;
-    Ok(serde_json::from_value(json)?)
+    let json = wyrd_utils::py::pyobject_to_json(value).map_err(from_py_err)?;
+    serde_json::from_value(json).map_err(|error| json_decode_error(&error))
 }
 
-fn labels_from_py(
-    values: HashMap<String, String>,
-) -> AgentPyResult<BTreeMap<LabelKey, LabelValue>> {
+fn labels_from_py(values: HashMap<String, String>) -> WyrdPyResult<BTreeMap<LabelKey, LabelValue>> {
     values
         .into_iter()
         .map(|(key, value)| {
@@ -727,7 +776,7 @@ fn labels_from_py(
 
 fn annotations_from_py(
     values: HashMap<String, String>,
-) -> AgentPyResult<BTreeMap<AnnotationKey, AnnotationValue>> {
+) -> WyrdPyResult<BTreeMap<AnnotationKey, AnnotationValue>> {
     values
         .into_iter()
         .map(|(key, value)| {
@@ -739,19 +788,21 @@ fn annotations_from_py(
         .collect()
 }
 
-fn metadata_py_error(error: wyrd_spec::metadata::MetadataError) -> AgentPyError {
-    PyTypeError::new_err(error.to_string()).into()
+fn metadata_py_error(error: wyrd_spec::metadata::MetadataError) -> WyrdPyError {
+    invalid_argument("metadata", error)
 }
 
-fn input_to_string(value: &Bound<'_, PyAny>) -> PyResult<String> {
+fn input_to_string(value: &Bound<'_, PyAny>) -> WyrdPyResult<String> {
     if let Ok(value) = value.extract::<String>() {
         return Ok(value);
     }
     if value.is_instance_of::<PyString>() {
-        return value.extract();
+        return value
+            .extract()
+            .map_err(|error| invalid_argument("input", error));
     }
-    serde_json::to_string(&wyrd_utils::py::pyobject_to_json(value)?)
-        .map_err(|error| PyRuntimeError::new_err(error.to_string()))
+    let json = wyrd_utils::py::pyobject_to_json(value).map_err(from_py_err)?;
+    serde_json::to_string(&json).map_err(|error| boundary_internal(&error))
 }
 
 fn invoke_callback<T>(
@@ -806,22 +857,24 @@ fn ctx_to_py(py: Python<'_>, ctx: &AgentContext) -> PyResult<Py<PyAny>> {
         wyrd_utils::py::json_to_pyobject(
             py,
             &serde_json::to_value(ctx.conversation.as_ref())
-                .map_err(|error| PyRuntimeError::new_err(error.to_string()))?,
+                .map_err(|error| PyErr::from(boundary_internal(&error)))?,
         )?,
     )?;
     Ok(dict.into_any().unbind())
 }
 
-fn validate_callable_method(py: Python<'_>, obj: &Py<PyAny>, method: &str) -> PyResult<()> {
-    let method_obj = obj.bind(py).getattr(method).map_err(|_| {
-        PyTypeError::new_err(format!("session object must define callable {method}()"))
-    })?;
+fn validate_callable_method(py: Python<'_>, obj: &Py<PyAny>, method: &str) -> WyrdPyResult<()> {
+    let method_obj = obj
+        .bind(py)
+        .getattr(method)
+        .map_err(|_| invalid_argument("session", format!("must define callable {method}()")))?;
     if method_obj.is_callable() {
         Ok(())
     } else {
-        Err(PyTypeError::new_err(format!(
-            "session object attribute {method:?} must be callable"
-        )))
+        Err(invalid_argument(
+            "session",
+            format!("attribute {method:?} must be callable"),
+        ))
     }
 }
 
@@ -843,38 +896,45 @@ fn role_variant_name(role: Role) -> &'static str {
     }
 }
 
-fn role_from_py(value: &Bound<'_, PyAny>) -> PyResult<Role> {
+fn role_from_py(value: &Bound<'_, PyAny>) -> WyrdPyResult<Role> {
     if let Ok(role) = value.extract::<Role>() {
         return Ok(role);
     }
-    match value.extract::<String>()?.as_str() {
+    let name = value
+        .extract::<String>()
+        .map_err(|error| invalid_argument("role", error))?;
+    match name.as_str() {
         "system" | "System" => Ok(Role::System),
         "user" | "User" => Ok(Role::User),
         "assistant" | "Assistant" => Ok(Role::Assistant),
         "tool" | "Tool" => Ok(Role::Tool),
-        other => Err(PyTypeError::new_err(format!(
-            "unsupported session role {other:?}"
-        ))),
+        other => Err(invalid_argument(
+            "role",
+            format!("unsupported session role {other:?}"),
+        )),
     }
 }
 
-fn session_turn_to_py_dict(py: Python<'_>, turn: &SessionTurn) -> PyResult<Py<PyAny>> {
+fn session_turn_to_py_dict(py: Python<'_>, turn: &SessionTurn) -> WyrdPyResult<Py<PyAny>> {
     let dict = PyDict::new(py);
-    dict.set_item("role", role_as_str(turn.role))?;
-    dict.set_item("content", &turn.content)?;
-    dict.set_item("call_id", &turn.call_id)?;
+    dict.set_item("role", role_as_str(turn.role))
+        .map_err(from_py_err)?;
+    dict.set_item("content", &turn.content)
+        .map_err(from_py_err)?;
+    dict.set_item("call_id", &turn.call_id)
+        .map_err(from_py_err)?;
     Ok(dict.into_any().unbind())
 }
 
-fn session_turn_from_py(value: &Bound<'_, PyAny>) -> PyResult<SessionTurn> {
+fn session_turn_from_py(value: &Bound<'_, PyAny>) -> WyrdPyResult<SessionTurn> {
     if let Ok(turn) = value.extract::<PyRef<'_, SessionTurn>>() {
         return Ok(turn.clone());
     }
-    let json = wyrd_utils::py::pyobject_to_json(value)?;
-    serde_json::from_value(json).map_err(|error| PyTypeError::new_err(error.to_string()))
+    let json = wyrd_utils::py::pyobject_to_json(value).map_err(from_py_err)?;
+    serde_json::from_value(json).map_err(|error| json_decode_error(&error))
 }
 
-fn session_turns_from_py(value: &Bound<'_, PyAny>) -> PyResult<Vec<SessionTurn>> {
+fn session_turns_from_py(value: &Bound<'_, PyAny>) -> WyrdPyResult<Vec<SessionTurn>> {
     if let Ok(list) = value.cast::<PyList>() {
         let mut turns = Vec::with_capacity(list.len());
         for item in list.iter() {
@@ -882,8 +942,8 @@ fn session_turns_from_py(value: &Bound<'_, PyAny>) -> PyResult<Vec<SessionTurn>>
         }
         return Ok(turns);
     }
-    let json = wyrd_utils::py::pyobject_to_json(value)?;
-    serde_json::from_value(json).map_err(|error| PyTypeError::new_err(error.to_string()))
+    let json = wyrd_utils::py::pyobject_to_json(value).map_err(from_py_err)?;
+    serde_json::from_value(json).map_err(|error| json_decode_error(&error))
 }
 
 fn extract_string_replacement(value: &Bound<'_, PyAny>) -> PyResult<String> {
@@ -928,16 +988,14 @@ fn extract_agent_run_replacement(value: &Bound<'_, PyAny>) -> PyResult<AgentRun>
 ///
 /// Does NOT extract a schema from the class. Schema must already be set on
 /// the Prompt via `Prompt(output=...)` or in the YAML card spec.
-fn output_cls_from_py(value: Option<&Bound<'_, PyAny>>) -> AgentPyResult<Option<Arc<Py<PyAny>>>> {
+fn output_cls_from_py(value: Option<&Bound<'_, PyAny>>) -> WyrdPyResult<Option<Arc<Py<PyAny>>>> {
     let Some(value) = value.filter(|v| !v.is_none()) else {
         return Ok(None);
     };
     if !value.is_callable() {
-        return Err(AgentPyError::from(
-            crate::error::AgentError::InvalidArgument {
-                name: "output_type".to_owned(),
-                detail: "must be a callable class (e.g. a pydantic.BaseModel subclass)".to_owned(),
-            },
+        return Err(invalid_argument(
+            "output_type",
+            "must be a callable class (e.g. a pydantic.BaseModel subclass)",
         ));
     }
     Ok(Some(Arc::new(value.clone().unbind())))
@@ -948,48 +1006,30 @@ fn output_cls_from_py(value: Option<&Bound<'_, PyAny>>) -> AgentPyResult<Option<
 /// Pydantic path: calls `cls.model_validate_json(output_text)`.
 /// Generic callable path: calls `cls(**structured_output_dict)`.
 ///
-/// Returns `AgentPyError` on instantiation failure, surfaced as
-/// `SKALD_AGENT_422_STRUCTURED_DECODE`.
+/// Returns `WYRD_AGENT_422_STRUCTURED_DECODE` on instantiation failure.
 fn instantiate_parsed<'py>(
     py: Python<'py>,
     cls: &Py<PyAny>,
     output_text: &str,
     map: &serde_json::Map<String, serde_json::Value>,
-) -> AgentPyResult<Py<PyAny>> {
+) -> WyrdPyResult<Py<PyAny>> {
     let bound = cls.bind(py);
 
     if bound.hasattr("model_validate_json").unwrap_or(false) {
         return bound
             .call_method1("model_validate_json", (output_text,))
             .map(|r| r.unbind())
-            .map_err(|e| {
-                AgentPyError::from(crate::error::AgentError::StructuredOutputDecode {
-                    agent: "<python>".to_owned(),
-                    detail: e.to_string(),
-                })
-            });
+            .map_err(|e| structured_decode_error(&e));
     }
 
     let val = serde_json::Value::Object(map.clone());
-    let py_val = wyrd_utils::py::json_to_pyobject(py, &val).map_err(|e| {
-        AgentPyError::from(crate::error::AgentError::StructuredOutputDecode {
-            agent: "<python>".to_owned(),
-            detail: e.to_string(),
-        })
-    })?;
-    let kwargs = py_val.cast_bound::<PyDict>(py).map_err(|e| {
-        AgentPyError::from(crate::error::AgentError::StructuredOutputDecode {
-            agent: "<python>".to_owned(),
-            detail: e.to_string(),
-        })
-    })?;
+    let py_val =
+        wyrd_utils::py::json_to_pyobject(py, &val).map_err(|e| structured_decode_error(&e))?;
+    let kwargs = py_val
+        .cast_bound::<PyDict>(py)
+        .map_err(|e| structured_decode_error(&e))?;
     bound
         .call((), Some(kwargs))
         .map(|r| r.unbind())
-        .map_err(|e| {
-            AgentPyError::from(crate::error::AgentError::StructuredOutputDecode {
-                agent: "<python>".to_owned(),
-                detail: e.to_string(),
-            })
-        })
+        .map_err(|e| structured_decode_error(&e))
 }

@@ -63,4 +63,4 @@ def test_structured_output_decode_failure_raises() -> None:
     with pytest.raises(WyrdError) as exc:
         agent.run("ignored")
 
-    assert exc.value.code == "SKALD_AGENT_422_STRUCTURED_DECODE"
+    assert exc.value.code == "WYRD_AGENT_422_STRUCTURED_DECODE"

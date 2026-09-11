@@ -46,6 +46,8 @@ pub enum CorrelationPolicy {
     Observation,
     /// Agent traces own their `run_id` content column.
     CodeAxis,
+    /// Audit content has its own identity columns.
+    None,
 }
 
 impl CorrelationPolicy {
@@ -59,6 +61,7 @@ impl CorrelationPolicy {
                 wyrd_spec::vala::PRINCIPAL_ID,
             ],
             Self::CodeAxis => &[wyrd_spec::vala::CARD_UID, wyrd_spec::vala::PRINCIPAL_ID],
+            Self::None => &[],
         }
     }
 }
@@ -1124,6 +1127,11 @@ mod tests {
 
     #[test]
     fn correlation_policies_are_explicit() {
+        assert!(
+            !CorrelationPolicy::None
+                .appended_correlation_columns()
+                .contains(&CARD_UID)
+        );
         assert!(
             CorrelationPolicy::Observation
                 .appended_correlation_columns()

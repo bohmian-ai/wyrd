@@ -301,7 +301,7 @@ Every domain table appends system columns that are not part of the user-declared
 | `card_uid` | `Utf8` (nullable) | `CorrelationPolicy::Observation` or `CodeAxis` |
 | `principal_id` | `Utf8` (nullable) | `CorrelationPolicy::Observation` or `CodeAxis` |
 
-`CorrelationPolicy::CodeAxis` tables (e.g., `dev.agent_traces`) own `run_id` as a content column and do not receive the universal correlation `run_id`. Every table carries the correlation envelope in one of these two shapes: ingest stamps it on every batch, so a registered table that omitted it could never agree with the object Scribe writes. A table whose content has its own identity columns (e.g., `system.audit_log`) names them out of the reserved set instead — `audit_principal_id`, `audit_card_ref`.
+`CorrelationPolicy::None` tables (e.g., `system.audit_log`) receive no correlation columns: ingest honours the registered policy and appends nothing, so the row carries exactly the identity its own content declares. Such a table still names its identity columns out of the reserved set — `audit_principal_id`, `audit_card_ref`. `CorrelationPolicy::CodeAxis` tables (e.g., `dev.agent_traces`) own `run_id` as a content column and do not receive the universal correlation `run_id`.
 
 ## Tenant isolation: TenantPredicateRule
 

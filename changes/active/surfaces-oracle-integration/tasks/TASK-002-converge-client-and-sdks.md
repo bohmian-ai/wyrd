@@ -3,7 +3,7 @@ id: TASK-002
 kind: implementation
 status: proposed
 spec: SPEC-surfaces-oracle-integration
-spec_revision: 4
+spec_revision: 5
 requirements: [REQ-004, REQ-005, REQ-006, REQ-007, REQ-008, REQ-009, REQ-016, REQ-017, REQ-018, REQ-019, REQ-019A, REQ-020, REQ-021, REQ-022, REQ-023, REQ-024, REQ-024A, REQ-024B, REQ-025, REQ-040, REQ-041, REQ-043, REQ-044, REQ-056, REQ-057, REQ-058, REQ-059, REQ-060, REQ-061, INV-001, INV-004, INV-005, INV-006, INV-010, INV-013, INV-019, INV-024, AC-002, AC-003, AC-004, AC-010, AC-019, AC-021]
 depends_on: [TASK-001]
 parent_task:

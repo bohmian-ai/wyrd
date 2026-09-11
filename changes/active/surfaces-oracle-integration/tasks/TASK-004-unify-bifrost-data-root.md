@@ -3,7 +3,7 @@ id: TASK-004
 kind: implementation
 status: proposed
 spec: SPEC-surfaces-oracle-integration
-spec_revision: 4
+spec_revision: 5
 requirements: [REQ-055, REQ-055A, INV-022, AC-018]
 depends_on: [TASK-001]
 parent_task:

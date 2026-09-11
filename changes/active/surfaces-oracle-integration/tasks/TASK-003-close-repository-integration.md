@@ -3,7 +3,7 @@ id: TASK-003
 kind: implementation
 status: proposed
 spec: SPEC-surfaces-oracle-integration
-spec_revision: 4
+spec_revision: 5
 requirements: [REQ-031, REQ-032, REQ-033, REQ-034, REQ-035, REQ-035A, REQ-036, REQ-037, REQ-038, REQ-039, REQ-042, REQ-043, REQ-044, REQ-045, REQ-046, REQ-047, REQ-064, INV-003, INV-011, INV-012, INV-014, INV-015, INV-016, INV-025, AC-001, AC-007, AC-007A, AC-008, AC-009, AC-020, AC-022]
 depends_on: [TASK-001, TASK-002, TASK-004]
 parent_task:
@@ -15,7 +15,7 @@ remediates: []
 Close the integrated repository around the completed data plane, clients, and
 single data root: reconcile the greenfield migration baseline, production-
 shaped fixtures, generated artifacts, documentation, verification inventory,
-and GitHub Actions so the complete revision-4 candidate is demonstrably green.
+and GitHub Actions so the complete revision-5 candidate is demonstrably green.
 
 ## Constraints
 
@@ -94,7 +94,7 @@ Paths are ownership guidance, not a private implementation allowlist.
 - `mise run gate`, all focused capability lanes, and every gated local journey
   pass without waiver or zero-test selection. The owning GitHub Actions
   live-cloud workflows pass with credentials.
-- Final static review maps every revision-4 requirement and invariant to
+- Final static review maps every revision-5 requirement and invariant to
   credible evidence, confirms every acceptance criterion has passed, and
   records remaining risks and readiness for a separately authorized merge.
 

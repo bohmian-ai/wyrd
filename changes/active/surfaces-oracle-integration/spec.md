@@ -1,6 +1,6 @@
 ---
 id: SPEC-surfaces-oracle-integration
-revision: 4
+revision: 5
 status: approved
 ---
 
@@ -22,11 +22,11 @@ architecture rather than as parallel implementations.
 - Integration worktree:
   `/Users/stevenforrester/Documents/GitHub/wyrd-bifrost-surfaces`
 - Integration branch: `change/surfaces-oracle-integration`
-- Original Surfaces parent and non-Bifrost authority:
-  `surfaces-python@8094655ad4c1930b150c209fb8dca341be5ee9ab`
-- Revision 4 destination checkpoint:
-  `change/surfaces-oracle-integration@8650ae167b3e6b678aef0568157b62e924b97048`
-- Revision 4 Oracle audit checkpoint:
+- Rewritten Surfaces parent and non-Bifrost authority:
+  `surfaces-python@fde37011ad056cfca5b0039b3716fb9e1b7f8c62`
+- Revision 5 destination checkpoint:
+  `change/surfaces-oracle-integration@2c5f107ff1613d201686b0cead9bf0ab4c900a26`
+- Revision 5 Oracle audit checkpoint:
   `oracle-distributed@b088ca91af4c98ee66458d76988d1b21006b5c36`
 - Incorporated Forge source tip:
   `forge-compaction-refactor@351902b0855c69849a88e7a76c9e596a666f716d`
@@ -38,7 +38,7 @@ architecture rather than as parallel implementations.
   `merge-input/oracle-distributed-20260901@25a3aa94e7bb782c21d41e7c5da3c0e97f8ea77a`
   (historical comparison evidence only)
 - The archived first merge attempt is reference evidence only.
-- The Oracle checkpoint is the immutable input audited for revision 4.
+- The Oracle checkpoint is the immutable input audited for revision 5.
 - If `oracle-distributed` advances before task decomposition or merge
   execution, a later draft revision MUST name one new clean committed
   checkpoint and audit only the delta from this checkpoint. Perpetually moving
@@ -535,7 +535,7 @@ architecture rather than as parallel implementations.
   inventory affected commits, refs, and active worktrees before any history
   rewrite or force-push.
 - **REQ-047:** Task decomposition and merge execution MUST use the immutable
-  revision 4 Oracle checkpoint. If the source advances, the spec returns to
+  revision 5 Oracle checkpoint. If the source advances, the spec returns to
   draft, names one replacement clean commit, audits the delta, and resolves
   every new material conflict before proceeding.
 
@@ -702,7 +702,7 @@ auditable transition or accepted Oracle read
   coupling to its branch intent, owning authority, resolution, disposition,
   and surviving consumer evidence; `merge-inventory.md` summarizes the same
   audited input set with no pending material entry, and `decision-summary.md`
-  is refreshed to revision 4 or explicitly marked historical so stale pins
+  is refreshed to revision 5 or explicitly marked historical so stale pins
   cannot compete with this specification.
 - **AC-002:** Contract and generated-artifact evidence shows one coherent Card,
   reference, error, HTTP/gRPC, MCP, Python, and TypeScript surface with no stale
@@ -817,7 +817,9 @@ credentialed cloud tests run and pass in GitHub Actions; the single Bifrost
 data-root outcome is a required completion-blocking follow-up task; and live UI
 integration remains outside this change because that work is ongoing.
 
-The user approved revision 4 on 2026-09-11. Task decomposition and merge
+The user approved revision 5 on 2026-09-11. It changes provenance only: it
+records the committed destination baseline and rewritten Surfaces ancestry
+after removal of generated UI evidence images. Task decomposition and merge
 execution remain subject to REQ-039 and REQ-047.
 
 ## Revision history
@@ -850,6 +852,10 @@ execution remain subject to REQ-039 and REQ-047.
   the single Bifrost data-root outcome is a required follow-up task that blocks
   integration completion; and live UI integration remains out of scope while
   its separate work continues.
+- Revision 5 (`approved`, 2026-09-11): Refreshes the destination and Surfaces
+  authority pins after the user-directed history purge of 97 generated UI
+  evidence images. Regenerates the conflict inventory against the committed
+  destination baseline without changing behavior, scope, or task outcomes.
 
 ## Material authority
 

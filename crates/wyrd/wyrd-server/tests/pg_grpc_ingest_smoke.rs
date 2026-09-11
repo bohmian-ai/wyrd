@@ -1010,12 +1010,10 @@ async fn scribe_tail_cross_tenant_read_and_release_are_denied() {
 
     /// One `bifrost.scribe.tail_security` audit row projected from
     /// `vala.audit_staging`: `(data_tenant_id, principal_id, principal_kind,
-    /// auth_method, permission, decision, result, detail)`.
+    /// permission, outcome, detail)`.
     type SecurityAuditRow = (
         uuid::Uuid,
         uuid::Uuid,
-        String,
-        String,
         String,
         String,
         String,
@@ -1030,8 +1028,8 @@ async fn scribe_tail_cross_tenant_read_and_release_are_denied() {
         (other_tenant, other_seq_before, other_count_before),
     ] {
         let security_rows: Vec<SecurityAuditRow> = sqlx::query_as(
-            "SELECT data_tenant_id, principal_id, principal_kind, auth_method, permission, \
-                    decision, result, detail::text \
+            "SELECT data_tenant_id, principal_id, principal_kind, permission, \
+                    outcome, detail::text \
              FROM vala.audit_staging \
              WHERE data_tenant_id = $1 AND operation = 'bifrost.scribe.tail_security' AND seq > $2 \
              ORDER BY seq",
@@ -1055,24 +1053,14 @@ async fn scribe_tail_cross_tenant_read_and_release_are_denied() {
         .await
         .expect("tail-security audit observation");
         assert_eq!(count_after - count_before, 2);
-        for (
-            data_tenant_id,
-            principal_id,
-            principal_kind,
-            auth_method,
-            permission,
-            decision,
-            result,
-            detail,
-        ) in security_rows
+        for (data_tenant_id, principal_id, principal_kind, permission, outcome, detail) in
+            security_rows
         {
             assert_eq!(data_tenant_id, tenant.as_uuid());
             assert_eq!(principal_id, PLATFORM_AUDIT_PRINCIPAL.as_uuid());
             assert_eq!(principal_kind, "service");
-            assert_eq!(auth_method, "internal");
             assert_eq!(permission, "bifrost:query:tail");
-            assert_eq!(decision, "deny");
-            assert_eq!(result, "failure");
+            assert_eq!(outcome, "denied");
             let detail: serde_json::Value =
                 serde_json::from_str(&detail.expect("security detail is present"))
                     .expect("security detail is valid JSON");

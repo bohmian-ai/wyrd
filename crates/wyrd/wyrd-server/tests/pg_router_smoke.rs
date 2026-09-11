@@ -569,26 +569,30 @@ async fn await_oracle_ready(server: &WyrdTestServer, expected: bool) {
     }
 }
 
-/// Lists this node's Oracle reader-epoch lifecycle audit operations, in order.
+/// Reads this node's durable Oracle reader-epoch state, if the row survives.
+///
+/// An epoch lifecycle transition evaluates no principal permission, so the
+/// epoch row is its own lineage authority: the state column names how far the
+/// lifecycle has advanced, and retirement removes the row entirely.
 ///
 /// # Panics
 ///
-/// Panics when the audit rows cannot be read.
+/// Panics when the epoch row cannot be read.
 #[cfg(feature = "test-support")]
-async fn epoch_audit_operations(
+async fn epoch_state(
     pool: &sqlx::PgPool,
     node_id: uuid::Uuid,
     fencing_token: i64,
-) -> Vec<String> {
+) -> Option<String> {
     sqlx::query_scalar(
-        "SELECT operation FROM vala.audit_staging \
-          WHERE data_tenant_id = $1 AND resource = $2 ORDER BY seq",
+        "SELECT state FROM vala.oracle_reader_epochs \
+          WHERE node_id = $1 AND fencing_token = $2",
     )
-    .bind(uuid::Uuid::from(wyrd_spec::DataTenantId::SYSTEM_OWNER))
-    .bind(format!("oracle/reader_epoch/{node_id}/{fencing_token}"))
-    .fetch_all(pool)
+    .bind(node_id)
+    .bind(fencing_token)
+    .fetch_optional(pool)
     .await
-    .expect("epoch audit rows read")
+    .expect("epoch state read")
 }
 
 /// Reports whether this node's durable Oracle role row still advertises ready.
@@ -607,29 +611,29 @@ async fn role_advertises_ready(pool: &sqlx::PgPool, node_id: uuid::Uuid) -> bool
     .expect("oracle role row read")
 }
 
-/// Proves epoch loss closes readiness before its audit, and that retirement
+/// Proves epoch loss closes readiness before it settles, and that retirement
 /// joins whichever owner selected that loss.
 ///
 /// Two properties are inseparable here and are therefore proved together.
 /// Reaching the admission cutoff must remove readiness — the authority's own
 /// admission, the engine, `/readyz`, and the durable role advertisement — at
-/// the instant loss is selected, which is strictly before the audited loss
+/// the instant loss is selected, which is strictly before the durable loss
 /// edge commits, while liveness stays true because the process is healthy and
 /// merely no longer authorized. And retirement must resolve who owns that
 /// loss before it releases anything: whether the lease supervisor selected it
 /// first or retirement did, the epoch ends with exactly one durable loss edge
-/// and one complete audit sequence. A renewal already stalled inside Postgres
-/// is the third case, because it is the one state in which the supervisor has
-/// no local reason to look at the clock at all.
+/// and no surviving row. A renewal already stalled inside Postgres is the
+/// third case, because it is the one state in which the supervisor has no
+/// local reason to look at the clock at all.
 ///
 /// # Panics
 ///
-/// Panics when readiness, liveness, durable advertisement, the audit
-/// sequence, or the retired epoch row differs from that contract.
+/// Panics when readiness, liveness, durable advertisement, epoch state, or
+/// the retired epoch row differs from that contract.
 #[cfg(feature = "test-support")]
 #[tokio::test]
 async fn oracle_epoch_cutoff_removes_readiness_and_retirement_joins_loss_owner() {
-    supervisor_first_loss_closes_readiness_before_its_audit().await;
+    supervisor_first_loss_closes_readiness_and_retires().await;
     blocked_renewal_cannot_suppress_cutoff_or_bounded_settlement().await;
     retirement_first_loss_commits_its_own_edge().await;
 }
@@ -638,10 +642,10 @@ async fn oracle_epoch_cutoff_removes_readiness_and_retirement_joins_loss_owner()
 ///
 /// # Panics
 ///
-/// Panics when readiness, liveness, advertisement, or the audit sequence
+/// Panics when readiness, liveness, advertisement, or the retired epoch row
 /// differs from the contract.
 #[cfg(feature = "test-support")]
-async fn supervisor_first_loss_closes_readiness_before_its_audit() {
+async fn supervisor_first_loss_closes_readiness_and_retires() {
     let server = WyrdTestServer::start_in_process()
         .await
         .expect("test server starts");
@@ -663,15 +667,6 @@ async fn supervisor_first_loss_closes_readiness_before_its_audit() {
 
     await_oracle_ready(&server, true).await;
     assert!(role_advertises_ready(&pool, node_id).await);
-
-    // Hold every audit append. Renewal deliberately writes no audit row, so
-    // this gates exactly the loss edge's transaction and nothing the epoch
-    // needs in order to reach its cutoff.
-    let mut gate = pool.begin().await.expect("audit gate transaction begins");
-    sqlx::query("LOCK TABLE vala.audit_staging IN EXCLUSIVE MODE")
-        .execute(&mut *gate)
-        .await
-        .expect("the audit outbox is held");
 
     // Reach the cutoff through the production supervisor. A renewal that lands
     // first re-derives the deadlines from its fresh lease, so the collapse is
@@ -698,8 +693,9 @@ async fn supervisor_first_loss_closes_readiness_before_its_audit() {
         );
     }
 
-    // Loss is selected and the audited edge is still blocked behind the gate.
-    // Readiness must already be gone everywhere it is published.
+    // Loss is selected. Readiness must already be gone everywhere it is
+    // published; the blocked-settlement ordering is proved by the stalled
+    // renewal case, which is the only one that can hold the edge open.
     assert!(
         !server
             .state()
@@ -723,18 +719,6 @@ async fn supervisor_first_loss_closes_readiness_before_its_audit() {
         StatusCode::OK,
         "a fenced epoch is unready, not unhealthy"
     );
-    assert_eq!(
-        epoch_audit_operations(&pool, node_id, fencing_token).await,
-        vec![
-            "oracle.reader_epoch.acquired".to_owned(),
-            "oracle.reader_epoch.activated".to_owned(),
-        ],
-        "readiness closes before the loss edge is audited, not after"
-    );
-
-    // Releasing the gate lets the supervisor finish its audited loss edge, and
-    // lets the continuity monitor's own audited deactivation land.
-    gate.rollback().await.expect("the audit gate releases");
     let mut advertised = true;
     if tokio::time::timeout(FORGE_READINESS_CEILING, async {
         loop {
@@ -780,10 +764,13 @@ async fn supervisor_first_loss_closes_readiness_before_its_audit() {
     server.shutdown().await.expect("server shuts down");
 }
 
-/// Waits for the supervisor's exact committed retirement audit sequence.
+/// Waits until the supervisor has committed the epoch's retirement.
+///
+/// Retirement removes the epoch row, so its absence is the durable settlement
+/// this waits on.
 ///
 /// # Panics
-/// Panics after fifteen seconds with the last sequence and authority readiness.
+/// Panics after fifteen seconds with the last state and authority readiness.
 #[cfg(feature = "test-support")]
 async fn await_epoch_retirement(
     server: &WyrdTestServer,
@@ -791,18 +778,11 @@ async fn await_epoch_retirement(
     node_id: uuid::Uuid,
     fencing_token: i64,
 ) {
-    let expected = vec![
-        "oracle.reader_epoch.acquired".to_owned(),
-        "oracle.reader_epoch.activated".to_owned(),
-        "oracle.reader_epoch.draining".to_owned(),
-        "oracle.reader_epoch.invalidated".to_owned(),
-        "oracle.reader_epoch.retired".to_owned(),
-    ];
-    let mut observed = Vec::new();
+    let mut observed = None;
     if tokio::time::timeout(FORGE_READINESS_CEILING, async {
         loop {
-            observed = epoch_audit_operations(pool, node_id, fencing_token).await;
-            if observed == expected {
+            observed = epoch_state(pool, node_id, fencing_token).await;
+            if observed.is_none() {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -813,7 +793,7 @@ async fn await_epoch_retirement(
     {
         server.state().shutdown_token.cancel();
         panic!(
-            "retirement did not join the loss owner; operations={observed:?}, admits={}",
+            "retirement did not join the loss owner; state={observed:?}, admits={}",
             server
                 .state()
                 .bifrost_query()
@@ -958,12 +938,9 @@ async fn blocked_renewal_cannot_suppress_cutoff_or_bounded_settlement() {
         "an epoch past its admission cutoff is not a ready Oracle"
     );
     assert_eq!(
-        epoch_audit_operations(&pool, node_id, fencing_token).await,
-        vec![
-            "oracle.reader_epoch.acquired".to_owned(),
-            "oracle.reader_epoch.activated".to_owned(),
-        ],
-        "the loss edge is not audited while its transaction is still blocked"
+        epoch_state(&pool, node_id, fencing_token).await.as_deref(),
+        Some("active"),
+        "the loss edge does not settle while its transaction is still blocked"
     );
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
@@ -3158,13 +3135,15 @@ async fn oracle_authority_request(
     }
 }
 
-/// Boot installs the engine's exact epoch; committed protection and audit precede resolution.
+/// Boot installs the engine's exact epoch; committed protection precedes resolution.
 ///
-/// Existing Postgres lock gates stop the protection audit and the catalog read
-/// independently. The worker is aborted before any diagnostic timeout panics.
+/// Reader protection is an engine-internal transition, so the protection row is
+/// its own durable authority. Existing Postgres lock gates stop that commit and
+/// the catalog read independently. The worker is aborted before any diagnostic
+/// timeout panics.
 ///
 /// # Panics
-/// Panics if source resolution starts before durable protection and its audit commit.
+/// Panics if source resolution starts before durable protection commits.
 #[cfg(feature = "test-support")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn oracle_authority_is_installed_before_source_io() {
@@ -3185,11 +3164,11 @@ async fn oracle_authority_is_installed_before_source_io() {
         .superuser_pool()
         .await
         .expect("superuser pool");
-    let mut audit_gate = pool.begin().await.expect("audit gate");
-    sqlx::query("LOCK TABLE vala.audit_staging IN EXCLUSIVE MODE")
-        .execute(&mut *audit_gate)
+    let mut protection_gate = pool.begin().await.expect("protection gate");
+    sqlx::query("LOCK TABLE vala.oracle_table_protections IN EXCLUSIVE MODE")
+        .execute(&mut *protection_gate)
         .await
-        .expect("hold audit commit");
+        .expect("hold protection commit");
     let mut source_gate = pool.begin().await.expect("source gate");
     sqlx::query("LOCK TABLE iceberg_catalog.iceberg_tables IN ACCESS EXCLUSIVE MODE")
         .execute(&mut *source_gate)
@@ -3202,8 +3181,8 @@ async fn oracle_authority_is_installed_before_source_io() {
     let mut blocked: i64 = 0;
     let reached = tokio::time::timeout(FORGE_READINESS_CEILING, async {
         loop {
-            blocked = sqlx::query_scalar("SELECT count(*) FROM pg_locks WHERE relation='vala.audit_staging'::regclass AND NOT granted")
-                .fetch_one(&mut *source_gate).await.expect("audit waiters");
+            blocked = sqlx::query_scalar("SELECT count(*) FROM pg_locks WHERE relation='vala.oracle_table_protections'::regclass AND NOT granted")
+                .fetch_one(&mut *source_gate).await.expect("protection waiters");
             if blocked > 0 || handle.is_finished() { break; }
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
@@ -3211,7 +3190,7 @@ async fn oracle_authority_is_installed_before_source_io() {
     if reached.is_err() || handle.is_finished() {
         handle.abort();
         panic!(
-            "protection did not reach audit: ready={}, inspection={:?}, audit_waiters={blocked}",
+            "protection did not reach its commit: ready={}, inspection={:?}, waiters={blocked}",
             oracle.engine().is_ready(),
             worker.authority_inspection_for_test()
         );
@@ -3219,7 +3198,7 @@ async fn oracle_authority_is_installed_before_source_io() {
     assert_eq!(
         worker.authority_inspection_for_test().2,
         0,
-        "audit must commit before resolver entry"
+        "protection must commit before resolver entry"
     );
     let uncommitted: i64 =
         sqlx::query_scalar("SELECT count(*) FROM vala.oracle_table_protections WHERE node_id=$1")
@@ -3227,11 +3206,11 @@ async fn oracle_authority_is_installed_before_source_io() {
             .fetch_one(&mut *source_gate)
             .await
             .expect("protection visibility");
-    assert_eq!(
-        uncommitted, 0,
-        "protection cannot commit separately from audit"
-    );
-    audit_gate.rollback().await.expect("release audit gate");
+    assert_eq!(uncommitted, 0, "protection is not visible while it is held");
+    protection_gate
+        .rollback()
+        .await
+        .expect("release protection gate");
     let reached = tokio::time::timeout(FORGE_READINESS_CEILING, async {
         while worker.authority_inspection_for_test().2 == 0 && !handle.is_finished() {
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
@@ -3246,14 +3225,17 @@ async fn oracle_authority_is_installed_before_source_io() {
             worker.authority_inspection_for_test()
         );
     }
-    let committed: (i64, i64) = sqlx::query_as(
-        "SELECT (SELECT count(*) FROM vala.oracle_table_protections WHERE node_id=$1 AND fencing_token=$2), \
-        (SELECT count(*) FROM vala.audit_staging WHERE data_tenant_id=$3 AND operation='oracle.table_protection.expanded')",
-    ).bind(installed.node_id()).bind(installed.fencing_token()).bind(uuid::Uuid::from(server.data_tenant_id()))
-        .fetch_one(&mut *source_gate).await.expect("independently committed protection and audit");
-    assert_eq!(committed, (1, 1));
+    let committed: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM vala.oracle_table_protections WHERE node_id=$1 AND fencing_token=$2",
+    )
+    .bind(installed.node_id())
+    .bind(installed.fencing_token())
+    .fetch_one(&mut *source_gate)
+    .await
+    .expect("independently committed protection");
+    assert_eq!(committed, 1);
     eprintln!(
-        "Oracle authority: node={}, fence={}; before audit commit: resolver=0, protection=0; resolver entry: protection/audit={committed:?}",
+        "Oracle authority: node={}, fence={}; before protection commit: resolver=0, protection=0; resolver entry: protection={committed}",
         installed.node_id(),
         installed.fencing_token()
     );

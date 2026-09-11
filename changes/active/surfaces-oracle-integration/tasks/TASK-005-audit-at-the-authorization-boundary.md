@@ -117,3 +117,47 @@ Completion evidence records the existing audit, SQL, projection, publication,
 and Bifrost journey results that cover the changed flow. Any required behavior
 not credibly exercised by existing coverage is a completion blocker; it does
 not authorize writing an additional test under this task.
+
+## Completion Evidence
+
+| Acceptance criterion | Implementation evidence | Verification evidence | Result |
+|---|---|---|---|
+| Every permission evaluation produces exactly one tenant-owned decision; audit failure refuses without effect | `crates/vala/vala-bifrost-redux/src/gate/mod.rs` (`GateAudit::append_write_decision` before admission or refusal); `crates/vala/vala-sql/src/queries/audit_staging.rs::append_audit` | `mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=gate::tests::gate_enforces_bifrost_record_write)'` — a sinkless Gate returns `AuditUnavailable` with `scribe_calls == 0`; a sinked Gate records exactly one `Denied` and still never reaches Scribe | PASS |
+| Gate's existing RBAC checks stay the ingest boundary; retained rows preserve the exact dynamic permission | `gate/mod.rs` passes the evaluated permission string through unchanged; `vala-sql` staging/retained columns carry `permission` | `mise run test:sql` (`pg_audit_staging`, 218/218) | PASS |
+| No Scribe commit, Forge transition, Oracle reader-protection transition, or retained publication appends audit | Audit appends deleted from Scribe batch commit, Forge operation/task transitions, Oracle reader protection and admission recovery, and retained publication; `vala.forge_operation_state`, `vala.forge_tasks.evidence`, `vala.oracle_reader_epochs`, `vala.oracle_table_protections` remain the lineage authorities | `mise run test:sql` — `pg_audit_staging` asserts a batch commit appends 0 audit rows; `pg_forge_tasks` / `pg_forge_operations` assert 0 across every transition and that `wyrd_platform_admin` is denied INSERT on `vala.audit_staging`. `mise run test:bifrost:integration:server` 67/67 — Oracle epoch loss and protection expansion now gate on their own durable rows | PASS |
+| Audit publication carries no synthetic event and needs no suppression flag, table exemption, or tail check | Publication-loop suppression removed; `crates/vala/vala-bifrost-redux/src/tables/audit/projection.rs` projects staged rows only | `mise run test:bifrost:journey:server` 7/7 (`replayed_audit_publication_retains_each_event_once`, `audited_transitions_retire_only_into_retained_history`) | PASS |
+| Retained schema carries seq, reproducible entry hash, principal identity, operation, resource, permission, outcome, request/trace identity, redacted detail, and the five `CorrelationPolicy::None` managed columns; no deleted field in the preimage | `crates/vala/vala-sql/migrations/*_audit*.sql`; canonical preimage in `vala-sql`; `crates/wyrd/wyrd-sql/src/queries/cards/audit.rs` migrated onto the same columns and preimage | `mise run test:sql` 218/218; `mise run codegen:check` clean | PASS |
+| Postgres decision timestamp becomes `wyrd_event_time`; audit backlog publishable past the ordinary window; retained audit partitions daily | `AuditTable` declares `CORRELATION_POLICY = None` and `PAST_EVENT_TIME_EXEMPT`; `scribe/ingress.rs::builtin_definition` resolves every built-in so both declarations take effect, and `execution_lanes.rs` stamps the correlation envelope only when the policy asks for it | `mise run test:bifrost:integration:redux` 973/973 (built-in layout fixed-point assertions require `Day` granularity for a `None`-policy table); `mise run test:bifrost:journey:forge` 13/13 (promotion invariant no longer sees a column-count disagreement on `vala.system.audit_log`) | PASS |
+| Watermark advancement and deletion through the watermark commit together; replay does not duplicate; an idle tenant drains to zero | `drain_through_watermark` updates the chain head and deletes rows `<= published_seq` in the caller's transaction; replay is absorbed by Scribe's durable batch-id dedup fence | `mise run test:sql` (`pg_audit_staging`); `mise run test:bifrost:journey:server` 7/7 | PASS |
+| No compatibility migration, second historical authority, or new test introduced | Migration 14 deleted rather than superseded; `vala.system.audit_log` is the only retained authority; the diff removes test cases and rewrites existing assertions onto lineage, adding no test file | `git diff` review: no new test file; `mise run check:unwrap-audit`, `mise run lints` clean | PASS |
+
+Non-goals held: no write mode, direct Iceberg writer, audit-specific sizing
+mechanism, scheduler, historical table, or compatibility migration was added.
+Oracle query reads remain the sole WAL-first exception.
+
+### Commands
+
+```
+mise run fmt                              # clean
+mise run lints                            # exit 0
+mise run codegen:check                    # All checks passed!
+mise run test:sql                         # 218/218
+mise run test:bifrost:integration:redux   # 973/973
+mise run test:bifrost:integration:server  # 67/67
+mise run test:bifrost:journey:server      # 7/7
+mise run test:bifrost:journey:forge       # 13/13
+mise run test:bifrost:journey:oracle      # 28/28
+mise run test:bifrost:journey:otlp        # 10/10
+```
+
+### Material limits
+
+- `Oracle audit WAL recovery failed: QueryAuditUnavailable` was observed at
+  server start in one `test:bifrost:integration:server` run and in neither the
+  run before nor the run after. `AuditWal::recover` collapses every filesystem,
+  advisory-lock, and framing failure into one opaque `BifrostError`, so the
+  message carries no diagnosis. It is unrelated to the audit boundary — the
+  recovery path was not touched by this task — and is recorded here rather than
+  chased under it.
+- `mise run verify:bifrost` was not run: it is withheld by explicit instruction
+  until the change's merge work completes.

@@ -926,27 +926,6 @@ pub enum ForgeManifestRewritePhase {
     Reset,
 }
 
-/// Durable transition recorded for one Oracle reader epoch.
-///
-/// `Retired` is the deletion of the epoch row after its last protection was
-/// released, which is what keeps a safely retired epoch from remaining a
-/// permanent maintenance root.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(rename_all = "snake_case")]
-pub enum OracleReaderEpochPhase {
-    /// The lease was inserted under the node's exact current Oracle fence.
-    Acquired,
-    /// Every dependency was established and the epoch may admit reads.
-    Activated,
-    /// Admission closed and descendants are being joined.
-    Draining,
-    /// The epoch can never renew or admit again.
-    Invalidated,
-    /// The invalidated epoch released every table and its row was deleted.
-    Retired,
-}
-
 /// Durable transition recorded for one epoch's per-table reader protection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]

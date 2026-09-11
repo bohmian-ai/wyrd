@@ -1134,7 +1134,10 @@ pub async fn compose_bifrost(
     }
     .with_query_dispatch(
         Arc::clone(&query_forwarder) as Arc<dyn vala_bifrost_redux::contracts::OracleQueryDispatch>
-    );
+    )
+    .with_audit(Arc::new(
+        crate::bifrost::gate_audit::PostgresGateAudit::new(postgres.as_ref().clone()),
+    ));
     // Resolved from the process's own credential, so the identity a replica
     // presents on the peer plane and the identity it admits are the same
     // principal. A peer-serving target that cannot prove it fails to boot.

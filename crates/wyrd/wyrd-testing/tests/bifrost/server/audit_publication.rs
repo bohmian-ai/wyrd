@@ -8,7 +8,7 @@ use wyrd_spec::auth::{PLATFORM_AUDIT_PRINCIPAL, PrincipalId, PrincipalKindTag};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
-    AuditEvent, AuditOutcome, AuthMethod, BifrostQueryRequest, FreshnessPolicy, VisibilityMode,
+    AuditEvent, AuditOutcome, BifrostQueryRequest, FreshnessPolicy, VisibilityMode,
 };
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_testing::WyrdTestServer;
@@ -100,7 +100,7 @@ async fn await_retained(
     }
 }
 
-/// Builds one synthetic outbox row outside every real sequence range.
+/// Builds one synthetic staging row outside every real sequence range.
 ///
 /// A synthetic range lets the replay scenario publish the *identical* batch
 /// twice without racing the server's own publisher for a real one. Everything
@@ -119,11 +119,8 @@ fn synthetic_row(tenant: DataTenantId, seq: i64, operation: &str) -> AuditStagin
         card_ref: None,
         principal_id: uuid::Uuid::nil(),
         principal_kind: "user".to_owned(),
-        auth_method: "internal".to_owned(),
         permission: "bifrost:record:write".to_owned(),
-        decision: "allow".to_owned(),
-        result: "success".to_owned(),
-        payload_summary: "journey replay".to_owned(),
+        outcome: "allowed".to_owned(),
         detail: None,
         created_at: chrono::Utc::now(),
     }
@@ -212,11 +209,8 @@ async fn audited_transitions_retire_only_into_retained_history() -> Result<(), S
             None,
             PrincipalId::new(uuid::Uuid::now_v7()),
             PrincipalKindTag::User,
-            AuthMethod::Internal,
             "bifrost:record:write".to_owned(),
             AuditOutcome::Allowed,
-            AuditOutcome::Allowed,
-            "journey owed event".to_owned(),
         ),
     )
     .await?;

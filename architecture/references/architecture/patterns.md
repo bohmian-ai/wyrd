@@ -242,36 +242,32 @@ provider responses.
 
 ## Audit Pattern
 
-Audit is foundational across every surface. Audit cardinality follows
-auditable domain operations and independently durable transitions, not handler
-or request count. One request can produce several audit records; supporting
-bookkeeping does not receive its own record unless it is independently
-meaningful.
+Audit is foundational across every surface, and it records authorization
+decisions rather than engine mechanics. Every decision that evaluates a
+principal's permission appends one record — allowed and denied alike — naming
+the principal, the permission, the resource, and the outcome. Engine-internal
+transitions that evaluate no permission (Scribe batch commits, Forge
+maintenance, Oracle reader protection) are lineage in their own operational
+tables and are never audit.
 
-Every auditable Postgres transition appends through the canonical audit writer
-in the same transaction as that transition. A workflow spanning transactions
-or an external effect records each security- or lifecycle-significant commit
-boundary independently; it does not claim whole-workflow atomicity. Do not
-create parallel audit writers.
+Every audited decision appends through the canonical audit writer in the same
+transaction as the decision, before the operation proceeds or refuses, so both
+commit or roll back together. A decision that cannot be recorded fails closed.
+A workflow that evaluates permission more than once records each evaluation at
+its own commit boundary. Do not create parallel audit writers.
 
-The one narrow exception is Oracle query-read admission: it first fsyncs a
-versioned CRC-framed local WAL record, then a single bounded background relay
-calls the same `append_audit` writer at least once. This exception does not
-apply to Postgres mutations or any other durable transition.
+The one narrow exception is Oracle query reads: they first fsync a versioned
+CRC-framed local WAL record, then a single bounded background relay calls the
+same `append_audit` writer at least once. This exception does not apply to
+Postgres decisions.
 
-`vala.audit_outbox` is transient transactional delivery state. Contiguous,
-tenant-scoped ranges are projected idempotently through the current Scribe and
-Forge publication path into retained `vala.system.audit_log` history. A range
-may be removed from the outbox only after its corresponding audit-log
-publication is durable. Publication, retirement, and partial-boundary recovery
-form one explicit lifecycle; the outbox and retained log are not competing
+`vala.audit_staging` is transient write-ahead state with no external consumer.
+Contiguous, tenant-scoped ranges are projected idempotently into retained
+`vala.system.audit_log` history. Ranges are read by a per-tenant watermark
+rather than claimed, and staged rows are garbage-collected once the watermark
+has advanced past them; a replayed range is absorbed by Scribe's durable
+batch-id dedup fence. Staging and the retained log are not competing
 historical authorities.
-
-Forge may append tenant-owned audit only through the crate-private,
-tenant-bound `OperatorAudit` capability after scheduler fencing and tenant
-equality checks succeed. The capability performs canonical audit append inside
-the same fenced operator transaction and exposes no generic executor escape
-hatch.
 
 ## Verification Pattern
 

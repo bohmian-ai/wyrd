@@ -62,7 +62,7 @@ accepts the identified exposure window. Otherwise remain fenced.
    grants, RLS policies, system tenant, role separation, and audit hash chains.
 2. Walk every retained Iceberg ref and prove that referenced metadata,
    manifests, data files, and delete files exist with the expected identity.
-3. Reconcile `vala.audit_outbox` with retained `vala.system.audit_log` rows.
+3. Reconcile `vala.audit_staging` with retained `vala.system.audit_log` rows.
 4. Attach Scribe volumes to their recorded node identities; replay WAL and
    staged manifests and reconcile publication operations without admission.
 5. Reconcile Forge tasks, attempts, operation IDs, uncertain commits,

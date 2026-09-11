@@ -40,7 +40,6 @@ use wyrd_spec::vala::api::{
     SchemaFingerprint as WireSchemaFingerprint, TailCursor,
     TailPageRequest as DomainTailPageRequest, TenantTableBinding,
 };
-use wyrd_spec::vala::api::{AuditEvent, AuditOutcome, AuthMethod};
 use wyrd_testing::WyrdTestServer;
 use wyrd_tonic::otlp::common::v1::{AnyValue, KeyValue, any_value};
 use wyrd_tonic::otlp::logs::v1::ResourceLogs;
@@ -234,21 +233,6 @@ async fn seed_tail_rows(state: &AppState, tenant: DataTenantId) {
         .expect("tail fixture dataset registers for the authenticated tenant");
     let request_id = RequestId::now_v7();
     let measured_wire_bytes = rows.get_array_memory_size();
-    let audit_event = AuditEvent {
-        request_id: request_id.clone(),
-        trace_id: None,
-        operation: "bifrost.append".to_owned(),
-        resource: table.fqn(),
-        card_ref: principal.card_ref().cloned(),
-        principal_id: principal.id,
-        principal_kind: principal.kind.tag(),
-        auth_method: AuthMethod::Jwt,
-        permission: "bifrost:append".to_owned(),
-        decision: AuditOutcome::Allowed,
-        result: AuditOutcome::Allowed,
-        payload_summary: format!("{} rows", rows.num_rows()),
-        detail: None,
-    };
     let admission = Scribe::ingest_frame(
         state
             .bifrost_ingest()
@@ -264,7 +248,6 @@ async fn seed_tail_rows(state: &AppState, tenant: DataTenantId) {
             )),
             request_id,
             batch_id: uuid::Uuid::now_v7(),
-            audit_event,
             measured_wire_bytes,
             payload: IngressPayload::Canonical(
                 vala_bifrost_redux::contracts::CanonicalIngress::unreserved(vec![rows]),

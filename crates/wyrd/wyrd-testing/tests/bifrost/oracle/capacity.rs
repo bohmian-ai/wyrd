@@ -862,7 +862,6 @@ async fn seed_fixture_table(
                 expected_schema_fingerprint: fingerprint,
                 request_id: wyrd_spec::request_id::RequestId::now_v7(),
                 batch_id: uuid::Uuid::now_v7(),
-                audit_event: fixture_audit_event(tenant, table),
                 payload: fixture_rows_ipc(start_id, chunk, groups)?,
             })
             .await?;
@@ -881,25 +880,6 @@ fn fixture_principal(tenant: DataTenantId) -> wyrd_runtime::principal::Principal
         roles: Vec::new(),
         effective_permissions: wyrd_runtime::PermissionSet::new(),
     }
-}
-
-/// Builds the server-shaped audit event committed with one fixture batch.
-fn fixture_audit_event(tenant: DataTenantId, table: &str) -> wyrd_spec::vala::api::AuditEvent {
-    let _ = tenant;
-    wyrd_spec::vala::api::AuditEvent::new(
-        wyrd_spec::request_id::RequestId::now_v7(),
-        None,
-        "bifrost.write".to_owned(),
-        format!("bifrost://vala.bifrost/{table}"),
-        None,
-        wyrd_spec::auth::PrincipalId::new(uuid::Uuid::now_v7()),
-        wyrd_spec::auth::PrincipalKindTag::User,
-        wyrd_spec::vala::api::AuthMethod::Internal,
-        "bifrost_write:write".to_owned(),
-        wyrd_spec::vala::api::AuditOutcome::Allowed,
-        wyrd_spec::vala::api::AuditOutcome::Allowed,
-        "oracle contention fixture ingest".to_owned(),
-    )
 }
 
 /// Encodes `rows` deterministic `(id, filter_key)` rows as one Arrow IPC stream.

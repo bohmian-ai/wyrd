@@ -105,21 +105,20 @@ Enforced by `check:client-tier`:
 
 ## Audit Boundaries
 
-- Audit cardinality follows auditable domain operations and independently
-  durable transitions, not endpoint or request count. Correlate related rows
-  with request and typed domain identifiers.
-- Every auditable Postgres transition appends its audit record in the same
-  transaction as the transition. Workflows spanning transactions or external
-  effects audit each meaningful commit boundary independently.
-- Oracle read admission is the sole durability exception: a versioned,
+- Audit records authorization decisions, not engine mechanics. Every decision
+  that evaluates a principal's permission is recorded — allowed and denied
+  alike — with the principal, permission, resource, and outcome. Correlate
+  related rows with request and typed domain identifiers.
+- Every audited decision appends its record in the same transaction as the
+  decision, before the operation proceeds or refuses. A decision that cannot be
+  recorded fails closed. Engine-internal transitions that evaluate no
+  permission are lineage, not audit.
+- Oracle query reads are the sole durability exception: a versioned,
   CRC-framed local WAL record is fsynced before rows are permitted, then relayed
-  at least once into the canonical tenant audit outbox.
-- Forge may write tenant-owned audit only through the tenant-bound,
-  fence-checked `OperatorAudit` capability in the same operator transaction.
-  It is not a general SQL or audit escape hatch.
-- `vala.audit_outbox` is transient delivery state; retained history is
-  `vala.system.audit_log`. Outbox retirement requires durable publication of
-  the corresponding retained audit event.
+  at least once into the canonical tenant hash-chained staging table.
+- `vala.audit_staging` is transient write-ahead state; retained history is
+  `vala.system.audit_log`. Staged rows are garbage-collected once the per-tenant
+  watermark has advanced past them.
 
 ## External Network Safety
 

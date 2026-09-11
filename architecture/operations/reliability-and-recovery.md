@@ -110,7 +110,7 @@ Restore proceeds under write isolation:
    task/lease state, and catalog pointers.
 4. Restore or select the object-store version set and verify every referenced
    Iceberg metadata, manifest, and data object.
-5. Reconcile `vala.audit_outbox` with retained `vala.system.audit_log` history.
+5. Reconcile `vala.audit_staging` with retained `vala.system.audit_log` history.
 6. Attach each Scribe volume to its stable node identity; replay WAL and staged
    runs without accepting traffic.
 7. Reconcile Scribe publications, Forge attempts and uncertain commits,
@@ -172,9 +172,11 @@ fabricate task completion to make health checks pass.
 
 ## Audit history projection and retirement
 
-`vala.audit_outbox` is transient delivery authority. Retained audit history is
-the tenant-qualified Bifrost `vala.system.audit_log` table. Projection claims
-immutable contiguous tenant ranges and preserves their identity across retry.
+`vala.audit_staging` is transient write-ahead state. Retained audit history is
+the tenant-qualified Bifrost `vala.system.audit_log` table. Projection reads
+immutable contiguous tenant ranges by a per-tenant watermark rather than
+claiming them, and garbage-collects staged rows once the watermark has advanced
+past them; a replayed range is absorbed by Scribe's durable batch-id fence.
 The current Scribe and Forge publication path publishes those ranges
 idempotently; a legacy direct-Iceberg relay is not a recovery mechanism.
 

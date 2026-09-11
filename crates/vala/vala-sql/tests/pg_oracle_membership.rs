@@ -309,7 +309,6 @@ mod pg_tests {
     use chrono::Utc;
     use sqlx::PgPool;
     use uuid::Uuid;
-    use vala_sql::queries::audit_staging::append_audit;
     use vala_sql::queries::cluster_nodes::ClusterNodes;
     use vala_sql::queries::olap_catalog::upsert_table;
     use vala_sql::queries::oracle_reader_authority::{
@@ -325,11 +324,8 @@ mod pg_tests {
     use vala_sql::{SqlError, TenantConn};
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_spec::DataTenantId;
-    use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
-    use wyrd_spec::request_id::RequestId;
     use wyrd_spec::vala::api::{
-        AuditDetail, AuditEvent, AuditOutcome, ClusterCapabilities, ClusterNodeKey, ClusterRole,
-        OracleCapabilitiesV1, OracleReaderEpochPhase, OracleTableProtectionPhase, QueryClass,
+        ClusterCapabilities, ClusterNodeKey, ClusterRole, OracleCapabilitiesV1, QueryClass,
     };
 
     /// Namespace segment every table in this module is registered under.
@@ -515,17 +511,16 @@ mod pg_tests {
             ProtectionFrontier::new(&self.identity, vec![member]).expect("well-formed frontier")
         }
 
-        /// Commits one protection revision with its canonical tenant audit row.
+        /// Commits one protection revision.
         ///
         /// # Panics
         ///
-        /// Panics when the lock, commit, audit append, or transaction commit fails.
+        /// Panics when the lock, commit, or transaction commit fails.
         async fn commit_protection(
             &self,
             fencing_token: i64,
             expected_revision: Option<i64>,
             frontier: &ProtectionFrontier,
-            phase: OracleTableProtectionPhase,
         ) -> ProtectionCas {
             let mut conn = self.tenant_conn().await;
             BifrostTableMaintenanceAuthority::new(&mut conn)
@@ -542,94 +537,9 @@ mod pg_tests {
                 )
                 .await
                 .expect("protection commit runs");
-            if let ProtectionCas::Committed(record) = &outcome {
-                append_audit(
-                    &mut conn,
-                    &protection_event(self.node_id, fencing_token, phase, record.revision),
-                )
-                .await
-                .expect("protection audit appends");
-            }
             conn.commit().await.expect("protection transaction commits");
             outcome
         }
-    }
-
-    /// Builds one canonical epoch lifecycle audit event.
-    fn epoch_event(
-        node_id: Uuid,
-        fencing_token: i64,
-        phase: OracleReaderEpochPhase,
-        state_revision: i64,
-    ) -> AuditEvent {
-        let operation = match phase {
-            OracleReaderEpochPhase::Acquired => "oracle.reader_epoch.acquired",
-            OracleReaderEpochPhase::Activated => "oracle.reader_epoch.activated",
-            OracleReaderEpochPhase::Draining => "oracle.reader_epoch.draining",
-            OracleReaderEpochPhase::Invalidated => "oracle.reader_epoch.invalidated",
-            OracleReaderEpochPhase::Retired => "oracle.reader_epoch.retired",
-        };
-        AuditEvent {
-            request_id: RequestId::now_v7(),
-            trace_id: None,
-            operation: operation.to_owned(),
-            resource: format!("oracle/reader_epoch/{node_id}/{fencing_token}"),
-            card_ref: None,
-            principal_id: PrincipalId::new(Uuid::nil()),
-            principal_kind: PrincipalKindTag::Service,
-            permission: "bifrost:oracle".to_owned(),
-            outcome: AuditOutcome::Allowed,
-            detail: Some(AuditDetail::OracleReaderEpoch {
-                node_id,
-                fencing_token,
-                phase,
-                state_revision,
-            }),
-        }
-    }
-
-    /// Builds one canonical table protection audit event.
-    fn protection_event(
-        node_id: Uuid,
-        fencing_token: i64,
-        phase: OracleTableProtectionPhase,
-        revision: i64,
-    ) -> AuditEvent {
-        let operation = match phase {
-            OracleTableProtectionPhase::Expanded => "oracle.table_protection.expanded",
-            OracleTableProtectionPhase::Narrowed => "oracle.table_protection.narrowed",
-            OracleTableProtectionPhase::Released => "oracle.table_protection.released",
-        };
-        AuditEvent {
-            request_id: RequestId::now_v7(),
-            trace_id: None,
-            operation: operation.to_owned(),
-            resource: format!("{NAMESPACE}.{TABLE}"),
-            card_ref: None,
-            principal_id: PrincipalId::new(Uuid::nil()),
-            principal_kind: PrincipalKindTag::Service,
-            permission: "bifrost:oracle".to_owned(),
-            outcome: AuditOutcome::Allowed,
-            detail: Some(AuditDetail::OracleTableProtection {
-                node_id,
-                fencing_token,
-                phase,
-                group: format!("{NAMESPACE}.{TABLE}"),
-                revision,
-                protected_snapshot_ids: Vec::new(),
-            }),
-        }
-    }
-
-    /// Reads one tenant's audit operations in durable sequence order.
-    async fn audit_operations(pool: &PgPool, tenant: DataTenantId) -> Vec<String> {
-        sqlx::query_scalar(
-            "SELECT operation FROM vala.audit_staging WHERE data_tenant_id = $1 ORDER BY seq",
-        )
-        .bind(tenant.as_uuid())
-        .fetch_all(pool)
-        .await
-        .expect("audit rows read")
     }
 
     /// Projects one table's columns as `(name, type, nullability)` in order.
@@ -1054,12 +964,6 @@ mod pg_tests {
             acquired.lease_expires_at > acquired.database_now,
             "the database itself dates the lease window"
         );
-        append_audit(
-            &mut conn,
-            &epoch_event(node, fence, OracleReaderEpochPhase::Acquired, 1),
-        )
-        .await
-        .expect("acquisition audit appends");
         conn.commit().await.expect("acquisition commits");
 
         let mut conn = harness.system_conn().await;
@@ -1070,12 +974,6 @@ mod pg_tests {
             .expect("epoch activates");
         assert_eq!(activated.state_revision, 2);
         assert!(activated.database_now >= acquired.database_now);
-        append_audit(
-            &mut conn,
-            &epoch_event(node, fence, OracleReaderEpochPhase::Activated, 2),
-        )
-        .await
-        .expect("activation audit appends");
         conn.commit().await.expect("activation commits");
 
         // Renewal advances the revision and the window and audits nothing.
@@ -1120,12 +1018,6 @@ mod pg_tests {
                 .await
                 .expect("protection commit runs");
             assert!(matches!(outcome, ProtectionCas::Committed(_)));
-            append_audit(
-                &mut conn,
-                &protection_event(node, fence, OracleTableProtectionPhase::Expanded, 1),
-            )
-            .await
-            .expect("protection audit appends");
         }
         let pool = harness.superuser().await;
         let uncommitted: i64 = sqlx::query_scalar(
@@ -1136,18 +1028,8 @@ mod pg_tests {
         .await
         .expect("protection count read");
         assert_eq!(uncommitted, 0, "a dropped transaction leaves no protection");
-        assert!(
-            audit_operations(&pool, harness.tenant).await.is_empty(),
-            "a dropped transaction leaves no evidence either"
-        );
-
         let committed = harness
-            .commit_protection(
-                fence,
-                None,
-                &harness.frontier(vec![30, 20, 10], 300, 100),
-                OracleTableProtectionPhase::Expanded,
-            )
+            .commit_protection(fence, None, &harness.frontier(vec![30, 20, 10], 300, 100))
             .await;
         let ProtectionCas::Committed(record) = committed else {
             panic!("a first protection commits at revision one");
@@ -1166,12 +1048,6 @@ mod pg_tests {
             .await
             .expect("epoch drains");
         assert_eq!(draining, 4);
-        append_audit(
-            &mut conn,
-            &epoch_event(node, fence, OracleReaderEpochPhase::Draining, draining),
-        )
-        .await
-        .expect("draining audit appends");
         conn.commit().await.expect("draining commits");
 
         let mut conn = harness.system_conn().await;
@@ -1181,17 +1057,6 @@ mod pg_tests {
             .await
             .expect("epoch invalidates");
         assert_eq!(invalidated, 5);
-        append_audit(
-            &mut conn,
-            &epoch_event(
-                node,
-                fence,
-                OracleReaderEpochPhase::Invalidated,
-                invalidated,
-            ),
-        )
-        .await
-        .expect("invalidation audit appends");
         conn.commit().await.expect("invalidation commits");
 
         let mut conn = harness.system_conn().await;
@@ -1219,22 +1084,6 @@ mod pg_tests {
             "a replaced fence cannot renew: {refused:?}"
         );
         drop(conn);
-
-        assert_eq!(
-            audit_operations(&pool, DataTenantId::SYSTEM_OWNER).await,
-            vec![
-                "oracle.reader_epoch.acquired".to_owned(),
-                "oracle.reader_epoch.activated".to_owned(),
-                "oracle.reader_epoch.draining".to_owned(),
-                "oracle.reader_epoch.invalidated".to_owned(),
-            ],
-            "renewal is deliberately unaudited"
-        );
-        assert_eq!(
-            audit_operations(&pool, harness.tenant).await,
-            vec!["oracle.table_protection.expanded".to_owned()],
-            "protection audit is bound to the actual data tenant"
-        );
 
         // Recovery enumeration is cross-tenant, read-only, and key-shaped.
         let operator = harness.fixture.operator_pool();
@@ -1282,9 +1131,8 @@ mod pg_tests {
         let fence = harness.register_oracle_role().await;
         harness.acquire_epoch(fence).await;
         let frontier = harness.frontier(vec![30, 20, 10], 300, 100);
-        let ProtectionCas::Committed(record) = harness
-            .commit_protection(fence, None, &frontier, OracleTableProtectionPhase::Expanded)
-            .await
+        let ProtectionCas::Committed(record) =
+            harness.commit_protection(fence, None, &frontier).await
         else {
             panic!("a first protection commits");
         };
@@ -1369,14 +1217,7 @@ mod pg_tests {
         // A stale expectation is a conflict carrying the winner, and it commits
         // nothing: no revision advance, no member change, no partial write.
         let widened = harness.frontier(vec![40, 30, 20, 10], 400, 100);
-        let conflict = harness
-            .commit_protection(
-                fence,
-                Some(7),
-                &widened,
-                OracleTableProtectionPhase::Expanded,
-            )
-            .await;
+        let conflict = harness.commit_protection(fence, Some(7), &widened).await;
         let ProtectionCas::Conflict(Some(winner)) = conflict else {
             panic!("a lost compare-and-set reports the winning record");
         };
@@ -1393,12 +1234,6 @@ mod pg_tests {
         .await
         .expect("post-conflict state reads");
         assert_eq!((revision, members), (1, 1), "a lost CAS writes nothing");
-        assert_eq!(
-            audit_operations(&pool, harness.tenant).await,
-            vec!["oracle.table_protection.expanded".to_owned()],
-            "a lost CAS leaves no evidence behind"
-        );
-
         // Protection is tenant-private: another tenant sees nothing at all.
         let other = DataTenantId::new_v7();
         harness
@@ -1454,12 +1289,7 @@ mod pg_tests {
             .expect("epoch activates");
         conn.commit().await.expect("epoch startup commits");
         harness
-            .commit_protection(
-                fence,
-                None,
-                &harness.frontier(vec![30, 20, 10], 300, 100),
-                OracleTableProtectionPhase::Expanded,
-            )
+            .commit_protection(fence, None, &harness.frontier(vec![30, 20, 10], 300, 100))
             .await;
         let pool = harness.superuser().await;
         let before: (i64, i64) = sqlx::query_as(
@@ -1506,11 +1336,6 @@ mod pg_tests {
         .await
         .expect("protection state re-reads");
         assert_eq!(after, before, "protection survives liveness alone");
-        assert_eq!(
-            audit_operations(&pool, harness.tenant).await,
-            vec!["oracle.table_protection.expanded".to_owned()]
-        );
-
         // Once Postgres itself proves the lease is past, invalidation and the
         // per-tenant release may proceed, in that order.
         sqlx::query(
@@ -1541,17 +1366,6 @@ mod pg_tests {
             .expect("expiry check runs")
             .expect("a provably expired lease invalidates");
         assert_eq!(invalidated, activated.state_revision + 1);
-        append_audit(
-            &mut conn,
-            &epoch_event(
-                node,
-                fence,
-                OracleReaderEpochPhase::Invalidated,
-                invalidated,
-            ),
-        )
-        .await
-        .expect("invalidation audit appends");
         // Retirement before release is refused: the header is still protection.
         let premature = OracleReaderEpochs::new(&mut conn)
             .expect("epochs are system owned")
@@ -1570,26 +1384,10 @@ mod pg_tests {
             .await
             .expect("expiry check runs")
             .expect("a provably expired lease invalidates");
-        append_audit(
-            &mut conn,
-            &epoch_event(
-                node,
-                fence,
-                OracleReaderEpochPhase::Invalidated,
-                invalidated,
-            ),
-        )
-        .await
-        .expect("invalidation audit appends");
         conn.commit().await.expect("invalidation commits");
 
         let released = harness
-            .commit_protection(
-                fence,
-                Some(1),
-                &ProtectionFrontier::default(),
-                OracleTableProtectionPhase::Released,
-            )
+            .commit_protection(fence, Some(1), &ProtectionFrontier::default())
             .await;
         assert!(matches!(released, ProtectionCas::Committed(_)));
         let mut conn = harness.system_conn().await;
@@ -1598,12 +1396,6 @@ mod pg_tests {
             .retire(node, fence, invalidated)
             .await
             .expect("a released epoch retires");
-        append_audit(
-            &mut conn,
-            &epoch_event(node, fence, OracleReaderEpochPhase::Retired, invalidated),
-        )
-        .await
-        .expect("retirement audit appends");
         conn.commit().await.expect("retirement commits");
 
         let remaining: (i64, i64) = sqlx::query_as(
@@ -1617,12 +1409,5 @@ mod pg_tests {
         .await
         .expect("final state reads");
         assert_eq!(remaining, (0, 0), "a safely retired epoch leaves nothing");
-        assert_eq!(
-            audit_operations(&pool, harness.tenant).await,
-            vec![
-                "oracle.table_protection.expanded".to_owned(),
-                "oracle.table_protection.released".to_owned(),
-            ]
-        );
     }
 }

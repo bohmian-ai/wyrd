@@ -23,6 +23,7 @@ impl DomainTable for AuditLogTable {
     const NAME: &'static str = "audit_log";
     const CORRELATION_POLICY: CorrelationPolicy = CorrelationPolicy::None;
     const PAYLOAD_CLASS: PayloadClass = PayloadClass::Standard;
+    const PAST_EVENT_TIME_EXEMPT: bool = true;
 
     fn arrow_fields() -> Vec<Field> {
         vec![

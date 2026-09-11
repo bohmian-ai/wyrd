@@ -146,6 +146,8 @@ pub struct BuiltinTableDefinition {
     pub payload_class: PayloadClass,
     /// Sensitive payload columns.
     pub sensitive_payload_columns: &'static [&'static str],
+    /// Whether a row may carry an event time older than the ordinary window.
+    pub past_event_time_exempt: bool,
     /// User schema constructor.
     pub arrow_fields: fn() -> Vec<Field>,
     /// User schema fingerprint constructor.
@@ -180,6 +182,14 @@ pub trait DomainTable: Send + Sync + 'static {
     const PAYLOAD_CLASS: PayloadClass = PayloadClass::Standard;
     /// Sensitive payload fields.
     const SENSITIVE_PAYLOAD_COLUMNS: &'static [&'static str] = &[];
+    /// Whether this table accepts event times below the ordinary past window.
+    ///
+    /// A caller-facing signal is refused a stale event time so a
+    /// misconfigured clock cannot backfill history. A server-owned backlog
+    /// that carries its own original decision time sets this instead, because
+    /// the alternative is a backlog that becomes permanently unpublishable
+    /// once it ages past the window.
+    const PAST_EVENT_TIME_EXEMPT: bool = false;
 
     /// The canonical signal ledger, when this table owns an `OTel` signal.
     ///
@@ -705,6 +715,7 @@ const fn definition<T: DomainTable>() -> BuiltinTableDefinition {
         correlation_policy: T::CORRELATION_POLICY,
         payload_class: T::PAYLOAD_CLASS,
         sensitive_payload_columns: T::SENSITIVE_PAYLOAD_COLUMNS,
+        past_event_time_exempt: T::PAST_EVENT_TIME_EXEMPT,
         arrow_fields: T::arrow_fields,
         schema_fingerprint: T::schema_fingerprint,
         schema: T::schema,

@@ -271,11 +271,8 @@ pub(crate) async fn seed_foreign_hot_row(
         None,
         PrincipalId::new(uuid::Uuid::now_v7()),
         PrincipalKindTag::User,
-        AuthMethod::Internal,
         "bifrost_query:read".to_owned(),
         AuditOutcome::Allowed,
-        AuditOutcome::Allowed,
-        "foreign tripwire fixture".to_owned(),
     );
     let mut conn = cluster.pg_fixture().tenant_conn_for(owner).await?;
     sqlx::query(

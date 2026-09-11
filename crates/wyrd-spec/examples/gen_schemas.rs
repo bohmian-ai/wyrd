@@ -225,8 +225,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write::<SyncQueryRequest>(out, golden, "bifrost_sync_query_request")?;
     write::<AuditEvent>(out, golden, "bifrost_audit_event")?;
     write::<AuthMethod>(out, golden, "bifrost_audit_auth_method")?;
-    write::<AuditDecision>(out, golden, "bifrost_audit_decision")?;
-    write::<AuditResult>(out, golden, "bifrost_audit_result")?;
+    write::<AuditOutcome>(out, golden, "bifrost_audit_outcome")?;
     // Stage 3 C7: Bifrost capability catalog — error descriptors + permission descriptors.
     // One source (these types in vala::api), two consumers: gen_schemas (snapshot) +
     // bifrost.list_errors / bifrost.list_permissions MCP tools. Schema drift detected here.

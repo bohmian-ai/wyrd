@@ -2,13 +2,14 @@
 
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray};
-use arrow::datatypes::Schema;
+use arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 use vala_sql::row_types::audit_staging::AuditStagingRow;
 use wyrd_spec::DataTenantId;
+use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 
 use super::AuditLogTable;
 use crate::tables::DomainTable;
@@ -26,7 +27,8 @@ pub struct AuditProjection {
     pub seq_hi: i64,
     /// Stable idempotency key for the projected shipment.
     pub batch_id: [u8; 16],
-    /// Exactly the 13 content fields declared by [`AuditLogTable`].
+    /// The 13 content fields declared by [`AuditLogTable`], plus the
+    /// `wyrd_event_time` the decision was stamped with in Postgres.
     pub rows: RecordBatch,
 }
 
@@ -193,7 +195,20 @@ fn project_record_batch(rows: &[AuditStagingRow]) -> Result<RecordBatch, AuditPr
         .iter()
         .map(|row| row.detail.clone())
         .collect::<Vec<_>>();
-    let schema = Arc::new(Schema::new(AuditLogTable::arrow_fields()));
+    // The decision instant travels as the event time rather than as content, so
+    // a retained row partitions by when the boundary decided, not by when the
+    // publisher happened to ship it.
+    let event_time_values = rows
+        .iter()
+        .map(|row| row.created_at.timestamp_micros())
+        .collect::<Vec<_>>();
+    let mut fields = AuditLogTable::arrow_fields();
+    fields.push(Field::new(
+        WYRD_EVENT_TIME,
+        DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+        false,
+    ));
+    let schema = Arc::new(Schema::new(fields));
     let columns: Vec<ArrayRef> = vec![
         Arc::new(Int64Array::from(seq_values)),
         Arc::new(StringArray::from(entry_hash_values)),
@@ -208,6 +223,9 @@ fn project_record_batch(rows: &[AuditStagingRow]) -> Result<RecordBatch, AuditPr
         Arc::new(StringArray::from(permission_values)),
         Arc::new(StringArray::from(outcome_values)),
         Arc::new(StringArray::from(detail_values)),
+        Arc::new(
+            TimestampMicrosecondArray::from(event_time_values).with_timezone(Arc::from("UTC")),
+        ),
     ];
     let rows = RecordBatch::try_new(schema, columns)
         .map_err(|error| AuditProjectionError::Schema(error.to_string()))?;
@@ -304,10 +322,11 @@ mod tests {
         assert_eq!(projection.tenant, authenticated);
         assert_eq!((projection.seq_lo, projection.seq_hi), (7, 8));
         assert_eq!(projection.batch_id, derive_batch_id(authenticated, 7, 8));
-        assert_eq!(projection.rows.num_columns(), 13);
+        assert_eq!(projection.rows.num_columns(), 14);
         assert_eq!(
-            projection.rows.schema(),
-            Arc::new(Schema::new(AuditLogTable::arrow_fields()))
+            projection.rows.schema().field(13).name(),
+            WYRD_EVENT_TIME,
+            "the decision instant travels as the managed event time"
         );
 
         let hashes = projection

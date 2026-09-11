@@ -83,25 +83,23 @@ code-generation lane.
 ## Audit
 
 Audit is foundational across CLI, UI, MCP, Python SDK, TypeScript SDK,
-`wyrd-server`, and Vala surfaces. Audit cardinality follows independently
-durable domain and security transitions, not endpoint invocations. Every
-auditable Postgres transition appends its audit row in the same transaction as
-that transition. A workflow spanning several transactions or an external
-effect audits each significant commit boundary rather than claiming
-whole-workflow atomicity.
+`wyrd-server`, and Vala surfaces, and it records authorization decisions rather
+than engine mechanics. Every decision that evaluates a principal's permission
+appends one row — allowed and denied alike — in the same transaction as the
+decision, before the operation proceeds or refuses; a decision that cannot be
+recorded fails closed. Engine-internal transitions that evaluate no permission
+are lineage in their own operational tables, never audit.
 
-Oracle query admission is the narrow read exception: a versioned, CRC-framed
-local WAL record must be fsynced before any row can be returned, and the bounded
-relay appends the canonical tenant outbox row at least once. Forge may append a
-tenant-owned event only through its crate-private, tenant-bound
-`OperatorAudit` capability after its scheduler fence and tenant checks pass.
-Do not create alternative audit writers or generic operator escape hatches.
+Oracle query reads are the narrow exception: a versioned, CRC-framed local WAL
+record must be fsynced before any row can be returned, and the bounded relay
+appends the canonical tenant staging row at least once. Do not create
+alternative audit writers.
 
-The outbox is transient delivery state. Retained history is the
+`vala.audit_staging` is transient write-ahead state. Retained history is the
 tenant-qualified Bifrost `vala.system.audit_log` projection, published through
-Scribe and Forge. An outbox row retires only after its corresponding retained
-event is durably published. Agent-facing audit reads never treat the outbox or
-a legacy direct-Iceberg projection as a second historical authority.
+Scribe and Forge. Staged rows are garbage-collected once the per-tenant
+watermark has advanced past them. Agent-facing audit reads never treat staging
+or a legacy direct-Iceberg projection as a second historical authority.
 
 ## Repository Guidance
 

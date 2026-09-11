@@ -260,6 +260,27 @@ pub fn initialize_gate_metrics() {
     metrics::gauge!("bifrost_gate_active_streams", "operation" => "query").set(0.0);
 }
 
+/// Durable sink for the write-authorization decisions Gate reaches.
+///
+/// Gate evaluates the RBAC permission but owns no database, so the composition
+/// root supplies the tenant-scoped writer. The append is mandatory: a decision
+/// that cannot be recorded refuses the write rather than admitting it unaudited.
+#[wyrd_tonic::tonic::async_trait]
+pub trait GateAudit: Send + Sync {
+    /// Records one `bifrost_record:write` decision for `auth` on `resource`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngestError::AuditUnavailable`] when the row cannot be
+    /// committed; the caller must then refuse the write.
+    async fn append_write_decision(
+        &self,
+        auth: &AuthContext,
+        resource: &str,
+        outcome: wyrd_spec::vala::api::AuditOutcome,
+    ) -> Result<(), IngestError>;
+}
+
 /// The concrete Bifrost write boundary.
 ///
 /// Gate owns authentication, request bounds, and transport response ordering.
@@ -270,6 +291,11 @@ pub struct Gate<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'stat
     scribe: Option<Arc<dyn Scribe>>,
     /// Optional SQL dispatch seam reaching an Oracle this Gate does not own.
     query: Option<Arc<dyn OracleQueryDispatch>>,
+    /// Durable sink for write-authorization decisions.
+    ///
+    /// Absent only where no Scribe is attached: a Gate that cannot write also
+    /// reaches no write decision. Every ingest path refuses when it is missing.
+    audit: Option<Arc<dyn GateAudit>>,
     /// Immutable transport and typed-ingress bounds.
     limits: IngestLimits,
     /// Shared bearer-token verification adapter for every public transport.
@@ -323,6 +349,7 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> Gate<R,
         Self {
             scribe: Some(scribe),
             query: None,
+            audit: None,
             limits,
             auth,
             closed: Arc::new(AtomicBool::new(false)),
@@ -340,6 +367,7 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> Gate<R,
         Self {
             scribe: Some(scribe),
             query: None,
+            audit: None,
             limits,
             auth,
             closed: Arc::new(AtomicBool::new(false)),
@@ -357,6 +385,7 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> Gate<R,
         Self {
             scribe: None,
             query: None,
+            audit: None,
             limits,
             auth,
             closed: Arc::new(AtomicBool::new(false)),
@@ -372,6 +401,51 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> Gate<R,
     pub fn with_query_dispatch(mut self, query: Arc<dyn OracleQueryDispatch>) -> Self {
         self.query = Some(query);
         self
+    }
+
+    /// Attaches the durable sink every write decision is recorded through.
+    ///
+    /// A Gate with a Scribe but no sink refuses every write, because it cannot
+    /// record the decision that would admit it.
+    #[must_use]
+    pub fn with_audit(mut self, audit: Arc<dyn GateAudit>) -> Self {
+        self.audit = Some(audit);
+        self
+    }
+
+    /// Evaluates the write permission and durably records the decision.
+    ///
+    /// Both outcomes are recorded, and the row commits before the write is
+    /// admitted or refused, so no admitted write and no refusal is unlogged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IngestError::RbacDenied`] when the principal lacks the
+    /// permission, and [`IngestError::AuditUnavailable`] when either decision
+    /// cannot be recorded.
+    async fn authorize_record_write(
+        &self,
+        auth: &AuthContext,
+        resource: &str,
+    ) -> Result<(), IngestError> {
+        let audit = self
+            .audit
+            .as_ref()
+            .ok_or_else(|| IngestError::AuditUnavailable("gate has no audit sink".to_owned()))?;
+        let decision = wyrd_runtime::RbacCheck
+            .check(
+                &auth.principal,
+                &wyrd_runtime::Permission::bifrost_record_write(),
+            )
+            .into_result()
+            .map_err(IngestError::from_rbac);
+        let outcome = if decision.is_ok() {
+            wyrd_spec::vala::api::AuditOutcome::Allowed
+        } else {
+            wyrd_spec::vala::api::AuditOutcome::Denied
+        };
+        audit.append_write_decision(auth, resource, outcome).await?;
+        decision
     }
 
     /// Stop accepting new ingest requests.
@@ -553,7 +627,13 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> Gate<R,
     ) -> Result<IngestOutcome, IngestError> {
         self.ensure_open()?;
         record_gate_event("otlp_export");
-        if let Err(error) = authorize_record_write(auth) {
+        if let Err(error) = self
+            .authorize_record_write(
+                auth,
+                &TableRef::new(BifrostNamespace::Traces, "spans").fqn(),
+            )
+            .await
+        {
             record_gate_event("otlp_rejection");
             return Err(error);
         }
@@ -589,7 +669,13 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> Gate<R,
     ) -> Result<MetricsOutcome, IngestError> {
         self.ensure_open()?;
         record_gate_event("otlp_export");
-        if let Err(error) = authorize_record_write(auth) {
+        if let Err(error) = self
+            .authorize_record_write(
+                auth,
+                &TableRef::new(BifrostNamespace::Metrics, "points").fqn(),
+            )
+            .await
+        {
             record_gate_event("otlp_rejection");
             return Err(error);
         }
@@ -629,7 +715,13 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> Gate<R,
     ) -> Result<LogsOutcome, IngestError> {
         self.ensure_open()?;
         record_gate_event("otlp_export");
-        if let Err(error) = authorize_record_write(auth) {
+        if let Err(error) = self
+            .authorize_record_write(
+                auth,
+                &TableRef::new(BifrostNamespace::Logs, "records").fqn(),
+            )
+            .await
+        {
             record_gate_event("otlp_rejection");
             return Err(error);
         }
@@ -818,18 +910,12 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> Gate<R,
                 "wyrd_batch_id must be UUIDv7".to_owned(),
             ));
         }
-        wyrd_runtime::RbacCheck
-            .check(
-                &auth.principal,
-                &wyrd_runtime::Permission::bifrost_record_write(),
-            )
-            .into_result()
-            .map_err(IngestError::from_rbac)?;
         let (namespace, name) = resolve_fqn(&frame.table)?;
         if namespace == BifrostNamespace::Audit {
             return Err(IngestError::ReservedBuiltinWriteDenied { table: frame.table });
         }
         let table = TableRef::new(namespace, name);
+        self.authorize_record_write(auth, &table.fqn()).await?;
         let scribe = self.scribe.as_ref().ok_or(IngestError::IngressClosed)?;
         let ingress = ScribeIngressFrame {
             principal: auth.principal.clone(),
@@ -860,16 +946,6 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> Gate<R,
             .record(resolution_started.elapsed().as_secs_f64());
         Ok(admission.rows_accepted)
     }
-}
-
-fn authorize_record_write(auth: &AuthContext) -> Result<(), IngestError> {
-    wyrd_runtime::RbacCheck
-        .check(
-            &auth.principal,
-            &wyrd_runtime::Permission::bifrost_record_write(),
-        )
-        .into_result()
-        .map_err(IngestError::from_rbac)
 }
 
 /// Resolves one validated public table name into its closed namespace and local name.

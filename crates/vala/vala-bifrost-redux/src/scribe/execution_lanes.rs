@@ -804,7 +804,10 @@ fn stamp_correlation_columns(
     validate_native_event_time(rows)?;
     // Enforce the acceptance window for a present caller column.
     if rows.schema().index_of(WYRD_EVENT_TIME).is_ok() {
-        enforce_event_time_window(rows, window, receipt_micros)?;
+        let past_exempt = context
+            .definition
+            .is_some_and(|definition| definition.past_event_time_exempt);
+        enforce_event_time_window(rows, window, receipt_micros, past_exempt)?;
     }
     // A present `wyrd_event_time` (validated above for native payloads and
     // window-checked above for both modes) is always lifted out of the user
@@ -968,7 +971,9 @@ fn validate_native_event_time(rows: &RecordBatch) -> Result<(), ScribeError> {
 /// # Errors
 /// Returns [`ScribeError::EventTimeOutOfRange`] when any non-null element of
 /// the `wyrd_event_time` column falls outside the inclusive window
-/// `[receipt_micros − past, receipt_micros + future]`. Returns
+/// `[receipt_micros − past, receipt_micros + future]`. A `past_exempt` table
+/// drops the lower bound and keeps the future bound, so an aged backlog stays
+/// publishable while a forward clock skew is still refused. Returns
 /// [`ScribeError::Internal`] when the column cannot be downcast to
 /// `TimestampMicrosecondArray` (which would imply a caller error on the
 /// projected path that bypassed type validation).
@@ -976,6 +981,7 @@ fn enforce_event_time_window(
     rows: &RecordBatch,
     window: EventTimeWindow,
     receipt_micros: i64,
+    past_exempt: bool,
 ) -> Result<(), ScribeError> {
     let index = rows
         .schema()
@@ -993,7 +999,11 @@ fn enforce_event_time_window(
     // Compute bounds once for the whole batch.
     let past_micros = i64::try_from(window.past.as_micros()).unwrap_or(i64::MAX);
     let future_micros = i64::try_from(window.future.as_micros()).unwrap_or(i64::MAX);
-    let lo = receipt_micros.saturating_sub(past_micros);
+    let lo = if past_exempt {
+        i64::MIN
+    } else {
+        receipt_micros.saturating_sub(past_micros)
+    };
     let hi = receipt_micros.saturating_add(future_micros);
     for idx in 0..array.len() {
         if array.is_null(idx) {

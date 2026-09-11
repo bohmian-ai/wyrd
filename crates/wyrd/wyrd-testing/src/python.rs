@@ -11,7 +11,7 @@ use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::scribe::tail_rpc::{LocalTailReadTransport, TailReadTransport};
 use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::{GrpcConfig, HttpConfig};
-use wyrd_utils::py::wyrd_error_to_py_err;
+use wyrd_utils::py::{WyrdPyError, WyrdPyResult};
 
 static ENV_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -34,7 +34,7 @@ impl EnvSnapshot {
         }
     }
 
-    fn restore(self, py: Python<'_>) -> PyResult<()> {
+    fn restore(self, py: Python<'_>) -> WyrdPyResult<()> {
         for (key, value) in [
             ("WYRD_SERVER_URL", self.server_url),
             ("WYRD_GRPC_URL", self.grpc_url),
@@ -58,13 +58,13 @@ impl EnvSnapshot {
 ///
 /// Returns a Python error when `os.environ` cannot be reached; deleting an
 /// absent key is not an error.
-fn publish_env(py: Python<'_>, key: &str, value: Option<&str>) -> PyResult<()> {
+fn publish_env(py: Python<'_>, key: &str, value: Option<&str>) -> WyrdPyResult<()> {
     match value {
         Some(value) => {
             // SAFETY: every harness mutation holds `env_mutex`, and the
             // published values are owned `String`s with no interior nul.
             unsafe { std::env::set_var(key, value) };
-            py.import("os")?.getattr("environ")?.set_item(key, value)
+            Ok(py.import("os")?.getattr("environ")?.set_item(key, value)?)
         }
         None => {
             unsafe { std::env::remove_var(key) };
@@ -112,7 +112,7 @@ impl WyrdTestServer {
     /// # Errors
     /// Returns a Python error when server startup, service bootstrap, or
     /// environment setup cannot complete.
-    fn __enter__(mut slf: PyRefMut<'_, Self>) -> PyResult<PyRefMut<'_, Self>> {
+    fn __enter__(mut slf: PyRefMut<'_, Self>) -> WyrdPyResult<PyRefMut<'_, Self>> {
         let mutate_env = slf.mutate_env;
 
         let result: Result<
@@ -149,7 +149,7 @@ impl WyrdTestServer {
             Ok((srv, base_url, grpc_url, api_key, tenant_id))
         });
 
-        let (srv, base_url, grpc_url, api_key, tenant_id) = result.map_err(wyrd_error_to_py_err)?;
+        let (srv, base_url, grpc_url, api_key, tenant_id) = result.map_err(WyrdPyError::from)?;
 
         if mutate_env {
             let _guard = env_mutex().lock().unwrap_or_else(|p| p.into_inner());
@@ -174,7 +174,7 @@ impl WyrdTestServer {
         _exc_type: Option<Bound<'_, PyAny>>,
         _exc_value: Option<Bound<'_, PyAny>>,
         _traceback: Option<Bound<'_, PyAny>>,
-    ) -> PyResult<bool> {
+    ) -> WyrdPyResult<bool> {
         if let Some(snapshot) = self.env_snapshot.take() {
             let _guard = env_mutex().lock().unwrap_or_else(|p| p.into_inner());
             snapshot.restore(py)?;
@@ -194,30 +194,18 @@ impl WyrdTestServer {
     }
 
     #[getter]
-    fn base_url(&self) -> PyResult<String> {
-        self.base_url.clone().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err(
-                "WyrdTestServer not started (use as context manager)",
-            )
-        })
+    fn base_url(&self) -> WyrdPyResult<String> {
+        self.base_url.clone().ok_or_else(not_started)
     }
 
     #[getter]
-    fn api_key(&self) -> PyResult<String> {
-        self.api_key.clone().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err(
-                "WyrdTestServer not started (use as context manager)",
-            )
-        })
+    fn api_key(&self) -> WyrdPyResult<String> {
+        self.api_key.clone().ok_or_else(not_started)
     }
 
     #[getter]
-    fn tenant_id(&self) -> PyResult<String> {
-        self.tenant_id.clone().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err(
-                "WyrdTestServer not started (use as context manager)",
-            )
-        })
+    fn tenant_id(&self) -> WyrdPyResult<String> {
+        self.tenant_id.clone().ok_or_else(not_started)
     }
 
     /// Exchanges the harness's retained API key for a bearer access token.
@@ -230,17 +218,9 @@ impl WyrdTestServer {
     ///
     /// Raises a Python runtime error when the context manager is inactive, and
     /// a Wyrd Python error when the exchange route refuses the key.
-    fn access_token(&self) -> PyResult<String> {
-        let srv = self.server.as_ref().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err(
-                "WyrdTestServer not started (use as context manager)",
-            )
-        })?;
-        let api_key = self.api_key.as_ref().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err(
-                "WyrdTestServer not started (use as context manager)",
-            )
-        })?;
+    fn access_token(&self) -> WyrdPyResult<String> {
+        let srv = self.server.as_ref().ok_or_else(not_started)?;
+        let api_key = self.api_key.as_ref().ok_or_else(not_started)?;
         let key = secrecy::SecretString::from(api_key.clone());
         let result: Result<String, wyrd_spec::error::WyrdError> =
             wyrd_runtime::runtime().block_on(async {
@@ -248,7 +228,7 @@ impl WyrdTestServer {
                     .await
                     .map_err(wyrd_spec::error::WyrdError::from)
             });
-        result.map_err(wyrd_error_to_py_err)
+        result.map_err(WyrdPyError::from)
     }
 
     /// Bootstrap a service principal, returning its scoped API key string.
@@ -258,12 +238,8 @@ impl WyrdTestServer {
     /// grants (useful for negative RBAC journeys). Must be called inside the context
     /// manager.
     #[pyo3(signature = (roles, name = "svc"))]
-    fn bootstrap_service(&self, roles: Vec<String>, name: &str) -> PyResult<String> {
-        let srv = self.server.as_ref().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err(
-                "WyrdTestServer not started (use as context manager)",
-            )
-        })?;
+    fn bootstrap_service(&self, roles: Vec<String>, name: &str) -> WyrdPyResult<String> {
+        let srv = self.server.as_ref().ok_or_else(not_started)?;
         let roles: Vec<&str> = roles.iter().map(String::as_str).collect();
         let result: Result<crate::server::Bootstrap, wyrd_spec::error::WyrdError> =
             wyrd_runtime::runtime().block_on(async {
@@ -271,16 +247,14 @@ impl WyrdTestServer {
                     .await
                     .map_err(wyrd_spec::error::WyrdError::from)
             });
-        let bootstrap = result.map_err(wyrd_error_to_py_err)?;
+        let bootstrap = result.map_err(WyrdPyError::from)?;
         match bootstrap {
             crate::server::Bootstrap::Machine { api_key, .. } => {
                 Ok(api_key.expose_secret().to_owned())
             }
-            crate::server::Bootstrap::User { .. } => {
-                Err(pyo3::exceptions::PyRuntimeError::new_err(
-                    "expected Machine bootstrap from bootstrap_service",
-                ))
-            }
+            crate::server::Bootstrap::User { .. } => Err(WyrdPyError::from(harness_error(
+                "expected Machine bootstrap from bootstrap_service",
+            ))),
         }
     }
 
@@ -294,15 +268,11 @@ impl WyrdTestServer {
     ///
     /// Raises a Wyrd Python error when the context manager is inactive, no
     /// built-in owns `namespace.name`, or the catalog cannot materialize it.
-    fn ensure_builtin_table(&self, namespace: &str, name: &str) -> PyResult<()> {
-        let srv = self.server.as_ref().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err(
-                "WyrdTestServer not started (use as context manager)",
-            )
-        })?;
+    fn ensure_builtin_table(&self, namespace: &str, name: &str) -> WyrdPyResult<()> {
+        let srv = self.server.as_ref().ok_or_else(not_started)?;
         wyrd_runtime::runtime()
             .block_on(srv.ensure_builtin_table_for_test(srv.data_tenant_id(), namespace, name))
-            .map_err(|error| wyrd_error_to_py_err(error.into()))
+            .map_err(WyrdPyError::from)
     }
 
     /// Mint an API key for a principal holding exactly `permissions`.
@@ -316,22 +286,18 @@ impl WyrdTestServer {
     /// Raises `ValueError` for an unparsable permission, and a Wyrd Python
     /// error when the context manager is inactive or role seeding or
     /// bootstrapping fails.
-    fn scoped_api_key(&self, role: &str, permissions: Vec<String>) -> PyResult<String> {
-        let srv = self.server.as_ref().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err(
-                "WyrdTestServer not started (use as context manager)",
-            )
-        })?;
+    fn scoped_api_key(&self, role: &str, permissions: Vec<String>) -> WyrdPyResult<String> {
+        let srv = self.server.as_ref().ok_or_else(not_started)?;
         let parsed = permissions
             .iter()
             .map(|value| {
                 value.parse::<wyrd_runtime::Permission>().map_err(|_| {
-                    pyo3::exceptions::PyValueError::new_err(format!(
+                    WyrdPyError::from(harness_error(format!(
                         "`{value}` is not a resource:action permission"
-                    ))
+                    )))
                 })
             })
-            .collect::<PyResult<Vec<_>>>()?;
+            .collect::<WyrdPyResult<Vec<_>>>()?;
         let result: Result<crate::server::Bootstrap, wyrd_spec::error::WyrdError> =
             wyrd_runtime::runtime().block_on(async {
                 srv.seed_role(role, &parsed)
@@ -341,13 +307,13 @@ impl WyrdTestServer {
                     .await
                     .map_err(wyrd_spec::error::WyrdError::from)
             });
-        match result.map_err(wyrd_error_to_py_err)? {
+        match result.map_err(WyrdPyError::from)? {
             crate::server::Bootstrap::Machine { api_key, .. } => {
                 Ok(api_key.expose_secret().to_owned())
             }
-            crate::server::Bootstrap::User { .. } => Err(
-                pyo3::exceptions::PyRuntimeError::new_err("expected a machine bootstrap"),
-            ),
+            crate::server::Bootstrap::User { .. } => Err(WyrdPyError::from(harness_error(
+                "expected a machine bootstrap",
+            ))),
         }
     }
 
@@ -362,15 +328,11 @@ impl WyrdTestServer {
     /// Raises a Wyrd Python error when the context manager is inactive or table
     /// registration, ingest, flush, token exchange, or Arrow encoding fails.
     #[pyo3(signature = (fused = false))]
-    fn prepare_oracle_query_fixture(&self, fused: bool) -> PyResult<(String, String)> {
-        let srv = self.server.as_ref().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err(
-                "WyrdTestServer not started (use as context manager)",
-            )
-        })?;
+    fn prepare_oracle_query_fixture(&self, fused: bool) -> WyrdPyResult<(String, String)> {
+        let srv = self.server.as_ref().ok_or_else(not_started)?;
         wyrd_runtime::runtime()
             .block_on(prepare_oracle_query_fixture(srv, fused))
-            .map_err(wyrd_error_to_py_err)
+            .map_err(WyrdPyError::from)
     }
 
     /// Flush the server-owned Scribe after a public client drain.
@@ -378,13 +340,11 @@ impl WyrdTestServer {
     /// # Errors
     /// Raises a Wyrd Python error when the context manager is inactive or the
     /// production Scribe seal path cannot commit its buffered rows.
-    fn flush_bifrost(&self) -> PyResult<()> {
-        let server = self.server.as_ref().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("WyrdTestServer not started")
-        })?;
+    fn flush_bifrost(&self) -> WyrdPyResult<()> {
+        let server = self.server.as_ref().ok_or_else(not_started)?;
         wyrd_runtime::runtime()
             .block_on(server.flush_bifrost())
-            .map_err(|error| wyrd_error_to_py_err(error.into()))
+            .map_err(WyrdPyError::from)
     }
 
     /// Truncate the next query after its schema frame in the real server.
@@ -392,10 +352,10 @@ impl WyrdTestServer {
     /// # Errors
     ///
     /// Raises `RuntimeError` when the context manager is inactive.
-    fn fail_next_query_after_schema(&self) -> PyResult<()> {
+    fn fail_next_query_after_schema(&self) -> WyrdPyResult<()> {
         self.server
             .as_ref()
-            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("WyrdTestServer not started"))?
+            .ok_or_else(not_started)?
             .fail_next_query_after_schema();
         Ok(())
     }
@@ -405,10 +365,10 @@ impl WyrdTestServer {
     /// # Errors
     ///
     /// Raises `RuntimeError` when the context manager is inactive.
-    fn fail_next_query_after_batch(&self) -> PyResult<()> {
+    fn fail_next_query_after_batch(&self) -> WyrdPyResult<()> {
         self.server
             .as_ref()
-            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("WyrdTestServer not started"))?
+            .ok_or_else(not_started)?
             .fail_next_query_after_batch();
         Ok(())
     }
@@ -418,10 +378,10 @@ impl WyrdTestServer {
     /// # Errors
     ///
     /// Raises `RuntimeError` when the context manager is inactive.
-    fn stall_next_query_after_schema(&self) -> PyResult<()> {
+    fn stall_next_query_after_schema(&self) -> WyrdPyResult<()> {
         self.server
             .as_ref()
-            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("WyrdTestServer not started"))?
+            .ok_or_else(not_started)?
             .stall_next_query_after_schema();
         Ok(())
     }
@@ -432,12 +392,10 @@ impl WyrdTestServer {
     ///
     /// Raises a Wyrd Python error when no stall is scheduled or the configured
     /// server drain deadline expires.
-    fn wait_query_schema_stall(&self, py: Python<'_>) -> PyResult<String> {
-        let server = self.server.as_ref().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("WyrdTestServer not started")
-        })?;
+    fn wait_query_schema_stall(&self, py: Python<'_>) -> WyrdPyResult<String> {
+        let server = self.server.as_ref().ok_or_else(not_started)?;
         py.detach(|| wyrd_runtime::runtime().block_on(server.wait_query_schema_stall()))
-            .map_err(|error| wyrd_error_to_py_err(error.into()))
+            .map_err(WyrdPyError::from)
     }
 
     /// Return exact admission, memory, peer-slot, and tail-fence counts.
@@ -449,13 +407,11 @@ impl WyrdTestServer {
     fn bifrost_query_resource_snapshot(
         &self,
         query_id: &str,
-    ) -> PyResult<std::collections::BTreeMap<String, u64>> {
-        let server = self.server.as_ref().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("WyrdTestServer not started")
-        })?;
+    ) -> WyrdPyResult<std::collections::BTreeMap<String, u64>> {
+        let server = self.server.as_ref().ok_or_else(not_started)?;
         let snapshot = server
             .bifrost_query_resource_snapshot(query_id)
-            .map_err(|error| wyrd_error_to_py_err(error.into()))?;
+            .map_err(WyrdPyError::from)?;
         Ok(query_resource_snapshot_to_map(snapshot))
     }
 
@@ -470,17 +426,15 @@ impl WyrdTestServer {
         py: Python<'_>,
         query_id: &str,
         baseline: std::collections::BTreeMap<String, u64>,
-    ) -> PyResult<std::collections::BTreeMap<String, u64>> {
-        let server = self.server.as_ref().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("WyrdTestServer not started")
-        })?;
+    ) -> WyrdPyResult<std::collections::BTreeMap<String, u64>> {
+        let server = self.server.as_ref().ok_or_else(not_started)?;
         let baseline = query_resource_snapshot_from_map(&baseline)?;
         let snapshot = py
             .detach(|| {
                 wyrd_runtime::runtime()
                     .block_on(server.wait_bifrost_query_resources_released(query_id, baseline))
             })
-            .map_err(|error| wyrd_error_to_py_err(error.into()))?;
+            .map_err(WyrdPyError::from)?;
         Ok(query_resource_snapshot_to_map(snapshot))
     }
 
@@ -490,13 +444,11 @@ impl WyrdTestServer {
     ///
     /// Raises a Wyrd error when the context manager is inactive or token
     /// issuance fails.
-    fn query_denied_token(&self) -> PyResult<String> {
-        let server = self.server.as_ref().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("WyrdTestServer not started")
-        })?;
+    fn query_denied_token(&self) -> WyrdPyResult<String> {
+        let server = self.server.as_ref().ok_or_else(not_started)?;
         wyrd_runtime::runtime()
             .block_on(server.query_denied_token())
-            .map_err(|error| wyrd_error_to_py_err(error.into()))
+            .map_err(WyrdPyError::from)
     }
 
     /// Return the fixture tenant's durable Oracle read-decision count.
@@ -505,13 +457,11 @@ impl WyrdTestServer {
     ///
     /// Raises a Wyrd error when the context manager is inactive or the audit
     /// query fails.
-    fn bifrost_read_decision_count(&self) -> PyResult<i64> {
-        let server = self.server.as_ref().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("WyrdTestServer not started")
-        })?;
+    fn bifrost_read_decision_count(&self) -> WyrdPyResult<i64> {
+        let server = self.server.as_ref().ok_or_else(not_started)?;
         wyrd_runtime::runtime()
             .block_on(server.bifrost_read_decision_count())
-            .map_err(|error| wyrd_error_to_py_err(error.into()))
+            .map_err(WyrdPyError::from)
     }
 
     /// Wait until every accepted Oracle audit record has relayed to Postgres.
@@ -525,16 +475,14 @@ impl WyrdTestServer {
     /// Raises a Wyrd error when the context manager is inactive or this server
     /// does not host an Oracle role.
     #[pyo3(signature = (budget_ms=5000))]
-    fn wait_oracle_audit_relayed(&self, py: Python<'_>, budget_ms: u64) -> PyResult<u64> {
-        let server = self.server.as_ref().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("WyrdTestServer not started")
-        })?;
+    fn wait_oracle_audit_relayed(&self, py: Python<'_>, budget_ms: u64) -> WyrdPyResult<u64> {
+        let server = self.server.as_ref().ok_or_else(not_started)?;
         py.detach(|| {
             wyrd_runtime::runtime().block_on(
                 server.wait_oracle_audit_relayed(std::time::Duration::from_millis(budget_ms)),
             )
         })
-        .map_err(|error| wyrd_error_to_py_err(error.into()))
+        .map_err(WyrdPyError::from)
     }
 }
 
@@ -554,16 +502,16 @@ fn query_resource_snapshot_to_map(
 ///
 /// # Errors
 ///
-/// Raises `ValueError` when a required counter is absent or does not fit the
-/// platform's native count width.
+/// Raises `WYRD_TESTING_500_HARNESS_START` when a required counter is absent or
+/// does not fit the platform's native count width.
 fn query_resource_snapshot_from_map(
     baseline: &std::collections::BTreeMap<String, u64>,
-) -> PyResult<crate::server::BifrostQueryResourceSnapshot> {
+) -> WyrdPyResult<crate::server::BifrostQueryResourceSnapshot> {
     let value = |name: &str| {
         baseline.get(name).copied().ok_or_else(|| {
-            pyo3::exceptions::PyValueError::new_err(format!(
+            WyrdPyError::from(harness_error(format!(
                 "query resource baseline is missing {name}"
-            ))
+            )))
         })
     };
     Ok(crate::server::BifrostQueryResourceSnapshot {
@@ -698,6 +646,13 @@ async fn prepare_oracle_query_fixture(
 }
 
 /// Converts one fixture setup failure into the stable test-harness catalog.
+impl From<crate::server::WyrdTestServerError> for WyrdPyError {
+    /// Project a harness failure onto the shared Wyrd boundary adapter.
+    fn from(error: crate::server::WyrdTestServerError) -> Self {
+        Self::from(wyrd_spec::error::WyrdError::from(error))
+    }
+}
+
 fn harness_error(error: impl std::fmt::Display) -> wyrd_spec::error::WyrdError {
     wyrd_spec::error::WyrdError::HarnessStart {
         message: error.to_string(),
@@ -707,4 +662,15 @@ fn harness_error(error: impl std::fmt::Display) -> wyrd_spec::error::WyrdError {
 
 pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<WyrdTestServer>()
+}
+
+/// Build the harness failure raised when the server has not been started.
+///
+/// Every accessor on [`WyrdTestServerPy`] requires the context manager to be
+/// entered first, so they share one catalog-backed failure instead of raising a
+/// bare Python exception.
+fn not_started() -> WyrdPyError {
+    WyrdPyError::from(harness_error(
+        "WyrdTestServer not started (use as context manager)",
+    ))
 }

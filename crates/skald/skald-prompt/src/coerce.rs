@@ -34,14 +34,15 @@ pub fn checked_model(model: impl Into<String>) -> PromptBuilderResult<String> {
 }
 
 #[cfg(feature = "python")]
-use pyo3::{
-    prelude::*,
-    types::{PyString, PyTuple},
+use {
+    pyo3::prelude::*,
+    pyo3::types::{PyString, PyTuple},
+    wyrd_utils::py::WyrdPyResult,
 };
 
 /// Converts a Python provider spelling into a native provider name.
 #[cfg(feature = "python")]
-pub fn provider_name_from_py(value: &Bound<'_, PyAny>) -> PyResult<ProviderName> {
+pub fn provider_name_from_py(value: &Bound<'_, PyAny>) -> WyrdPyResult<ProviderName> {
     if value.is_instance_of::<PyString>() {
         return Ok(provider_name_from_str(&value.extract::<String>()?));
     }
@@ -56,28 +57,23 @@ pub fn provider_name_from_py(value: &Bound<'_, PyAny>) -> PyResult<ProviderName>
         }
     }
 
-    Err(
-        wyrd_utils::py::WyrdPyError::from(PromptBuilderError::InvalidProvider(
-            value.str()?.extract::<String>()?,
-        ))
-        .into(),
-    )
+    Err(PromptBuilderError::InvalidProvider(value.str()?.extract::<String>()?).into())
 }
 
 /// Reads Pydantic `model_json_schema()` explicitly or falls back to JSON coercion.
 #[cfg(feature = "python")]
-pub fn schema_from_py(value: &Bound<'_, PyAny>) -> PyResult<Value> {
+pub fn schema_from_py(value: &Bound<'_, PyAny>) -> WyrdPyResult<Value> {
     if let Ok(method) = value.getattr("model_json_schema")
         && method.is_callable()
     {
-        return wyrd_utils::py::pyobject_to_json(&method.call0()?);
+        return Ok(wyrd_utils::py::pyobject_to_json(&method.call0()?)?);
     }
-    wyrd_utils::py::pyobject_to_json(value)
+    Ok(wyrd_utils::py::pyobject_to_json(value)?)
 }
 
 /// Extracts a string list from a Python object.
 #[cfg(feature = "python")]
-pub fn strings_from_py(value: Option<&Bound<'_, PyAny>>) -> PyResult<Vec<String>> {
+pub fn strings_from_py(value: Option<&Bound<'_, PyAny>>) -> WyrdPyResult<Vec<String>> {
     let Some(value) = value.filter(|value| !value.is_none()) else {
         return Ok(Vec::new());
     };

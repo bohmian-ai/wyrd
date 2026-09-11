@@ -191,13 +191,13 @@ mod pg_tests {
     /// order, with `wyrd_row_ordinal` contiguous from zero over the accepted
     /// subset alone.
     ///
-    /// The request is then replayed byte-identically. OTLP carries no batch
-    /// identity, so a replay is a new logical batch by protocol design; what
-    /// the replay must prove — and does here — is that the projection decision
-    /// is deterministic: the same rejected count and the same reason come back,
-    /// and no rejected sibling ever becomes queryable. Durable duplicate-source
-    /// suppression is the native frame path's contract and is proven by the
-    /// Scribe recovery lane.
+    /// The request is then replayed byte-identically, which is what an
+    /// at-least-once OTLP exporter does after a lost acknowledgement. The
+    /// replay must report the same rejected count and the same reason, and it
+    /// must not duplicate anything: the Gate derives one `wyrd_batch_id` from
+    /// the accepted canonical rows, so Scribe's durable fence recognizes the
+    /// repeat and every accepted sibling stays queryable exactly once while
+    /// every rejected sibling stays absent.
     ///
     /// # Panics
     ///
@@ -312,18 +312,20 @@ mod pg_tests {
         journey.shutdown().await;
     }
 
-    /// Asserts the stored rows are exactly `accepted`, twice, in order.
+    /// Asserts the stored rows are exactly `accepted`, once each, in order.
     ///
-    /// The two replayed exports are two logical batches, so each accepted
-    /// sibling appears twice under the one ordinal its position in the request
-    /// earns; a rejected sibling must never appear and must never consume an
-    /// ordinal, which is what makes the run contiguous from zero over the
-    /// accepted subset alone.
+    /// The replayed export carries the same accepted canonical rows, so the
+    /// Gate derives the same batch identity and the durable fence suppresses
+    /// the repeat: each accepted sibling appears exactly once under the one
+    /// ordinal its position in the request earns. A rejected sibling must
+    /// never appear and must never consume an ordinal, which is what makes the
+    /// run contiguous from zero over the accepted subset alone.
     ///
     /// # Panics
     ///
-    /// Panics when a rejected marker is present or when the stored markers and
-    /// ordinals are not exactly the accepted subset's.
+    /// Panics when a rejected marker is present, when an accepted sibling is
+    /// duplicated, or when the stored markers and ordinals are not exactly the
+    /// accepted subset's.
     fn assert_accepted_subset(rows: &[(String, i32)], accepted: &[&str], rejected: &str) {
         assert!(
             !rows.iter().any(|(marker, _)| marker == rejected),
@@ -332,18 +334,15 @@ mod pg_tests {
         let expected: Vec<(String, i32)> = accepted
             .iter()
             .enumerate()
-            .flat_map(|(index, marker)| {
+            .map(|(index, marker)| {
                 let ordinal = i32::try_from(index).expect("the fixture position fits i32");
-                [
-                    ((*marker).to_owned(), ordinal),
-                    ((*marker).to_owned(), ordinal),
-                ]
+                ((*marker).to_owned(), ordinal)
             })
             .collect();
         assert_eq!(
             rows, expected,
-            "each export stores exactly its accepted siblings, in request order, \
-             with `wyrd_row_ordinal` contiguous from zero over that subset alone"
+            "a replayed export stores its accepted siblings exactly once, in request \
+             order, with `wyrd_row_ordinal` contiguous from zero over that subset alone"
         );
     }
 

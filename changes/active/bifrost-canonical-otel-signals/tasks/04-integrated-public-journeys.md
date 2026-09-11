@@ -673,7 +673,9 @@ a retryable 502.
 | `stock OpenTelemetry tracer exports GenAI span to Bifrost` | `typescript/wyrd/tests/integration/otel-export.test.ts:97` | PASS (`27aed248e`) |
 | `stock OpenTelemetry logger exports correlated log to Bifrost` | same file `:216` | PASS |
 | `stock OpenTelemetry meter exports representative metrics to Bifrost` | same file `:279` | PASS |
-| `mixed_otlp_requests_commit_only_complete_siblings_and_exact_partial_success` | `.../otlp/negative.rs:209` | PASS (`ee22dec75`) |
+| `mixed_otlp_requests_commit_only_complete_siblings_and_exact_partial_success` | `.../otlp/negative.rs:209` | PASS (replayed exports, exactly-once rows) |
+| `gate::otlp_batch_id_tests::derived_identity_is_stable_per_tenant_table_and_payload` | `crates/vala/vala-bifrost-redux/src/gate/mod.rs` | PASS |
+| `tables::logs::tests::maximal_log_projection_preserves_body_context_and_presence` | `crates/vala/vala-bifrost-redux/src/tables/logs/mod.rs` | PASS (was failing on `integration:redux` before this change) |
 | `all_invalid_and_request_wide_failures_leave_no_queryable_rows` | `.../otlp/negative.rs:366` | PASS |
 | `pg_tests::canonical_signal_arrow_write_and_sql_read_round_trip` | `crates/vala/vala-sdk/tests/pg_bifrost_e2e.rs:2369` | PASS (`ff7995823`, `fbcefe607`) |
 | `test_canonical_signal_arrow_write_and_sql_read_round_trip` | `python/py-wyrd/tests/integration/test_bifrost_query.py` | PASS |
@@ -700,42 +702,25 @@ they are not restated per topology.
    identity.
 3. **Sensitive payload columns were unenforced on Oracle's optimized canonical
    plan.** Fixed by `02e953b8e` before this report.
+4. **The OTLP ingress minted a fresh batch id per request, so an at-least-once
+   exporter retry double-wrote every accepted row.** Fixed by deriving the
+   batch identity at the Gate — see the finding below.
+5. **`tables::logs::tests::maximal_log_projection_preserves_body_context_and_presence`
+   still asserted the contract defect 2 replaced.** `fac83e240` made
+   `validate_canonical_user_batch` compare the user block by shape and restamp
+   server-owned identity, so the test's assertion that a drifted
+   `parquet_field_id` is *rejected* had been failing on `integration:redux`
+   since that fix. Rather than delete the coverage, the assertion now proves the
+   live invariant: the drifted batch validates, and the validated schema carries
+   the ledger's stable id and sensitivity, so a caller cannot relabel a
+   sensitive column.
 
 ### Deviations and limitations
 
-- Scenario 4's retry-dedup leg asserts the accepted canonical subset through the
-  batch fence and payload digest rather than through a second identical OTLP
-  export, because the OTLP ingress cannot express a repeated batch. That is a
-  product gap, not only a test limitation — see the finding below.
-
-### Finding — the OTLP ingress has no client-retry idempotency
-
-The durable batch fence (`vala.scribe_batch_commits`, keyed
-`(data_tenant_id, logical_table_fqn, batch_id)`) is consulted on the live commit
-path in `scribe/shards.rs::commit_batch_control_fence`, not only during WAL
-replay. A second arrival of the same `batch_id` with a matching logical digest
-resolves to `AlreadyCommitted` and writes nothing, so batch identity is
-genuinely idempotent.
-
-The SDK gRPC path supplies that identity: `vala-sdk/src/grpc.rs::send_owned_bytes`
-reuses one client-minted `wyrd_batch_id` across every retry attempt, so a
-commit-then-lost-response cannot double-write.
-
-The OTLP path does not. `gate/mod.rs` sets `batch_id: uuid::Uuid::now_v7()`
-server-side per request, so a retried OTLP export is a new batch the fence
-cannot match, and its spans are written a second time. The duplicate window is
-ordinary exporter behavior: the server commits, the response is lost or times
-out, the upstream OTel SDK retries. Nothing downstream closes it — the canonical
-tables are append-only and there is no dedup on `(trace_id, span_id)`.
-
-This is outside SPEC revision 11's acceptance criteria: AC-006 and AC-007 ask
-for recovery/replay evidence over exact batch identity, which the fence and the
-Scribe recovery owner provide. It is recorded here because the gap is reachable
-from the primary public OTLP journey this task proves, and duplicated spans
-corrupt exactly the GenAI token aggregates these tables exist to serve. A fix
-would derive the fence key at the OTLP ingress rather than minting one — a
-digest over the decoded request, or the `Idempotency-Key` the HTTP client
-already sends — and needs its own spec revision and task.
+- Scenario 4's retry-dedup leg now replays each mixed-validity OTLP export
+  byte-identically over gRPC, OTLP/HTTP JSON, and OTLP/HTTP protobuf, and
+  asserts each accepted sibling is queryable exactly once. It exposed a
+  production defect, fixed below.
 - Scenario 6 adds a `Flush` control request and a foreign-tenant public
   credential to `BifrostProcessCluster`. Neither carries data: the first is the
   publication step a deployment reaches on its own timer, taken explicitly so a
@@ -743,6 +728,41 @@ already sends — and needs its own spec revision and task.
   the second is an ordinary API key for a second data tenant. The canonical span
   itself enters through the Scribe pod's public OTLP route and leaves through
   the leader Oracle's public query listener.
+
+### Fixed — the OTLP ingress had no client-retry idempotency
+
+The durable batch fence (`vala.scribe_batch_commits`, keyed
+`(data_tenant_id, logical_table_fqn, batch_id)`) is consulted on the live commit
+path in `scribe/shards.rs::commit_batch_control_fence`, not only during WAL
+replay. A second arrival of the same `batch_id` with a matching logical digest
+resolves to `AlreadyCommitted` and writes nothing, so batch identity is
+genuinely idempotent. The SDK gRPC path already supplied that identity:
+`vala-sdk/src/grpc.rs::send_owned_bytes` reuses one client-minted
+`wyrd_batch_id` across every retry attempt.
+
+The OTLP path did not. `gate/mod.rs` minted `uuid::Uuid::now_v7()` server-side
+per request, so a retried OTLP export was a new batch the fence could not match
+and its rows were written a second time — ordinary exporter behavior (the server
+commits, the response is lost, the upstream OTel SDK retries) corrupting exactly
+the GenAI aggregates these tables exist to serve.
+
+Fixed in `gate/mod.rs::otlp_batch_id`: `dispatch_canonical` now derives the
+`wyrd_batch_id` deterministically as SHA-256 over the domain separator
+`wyrd.otlp.batch-id.v1`, the authenticated `DataTenantId`, the logical table
+FQN, and the canonical batch's digest from
+`scribe::preprocess::logical_data_identity`, stamped with the RFC 4122 variant
+and UUID version 7 bits the native path validates. The logical digest excludes
+the request-scoped managed columns (request id, ingest time), so a retry with
+new request metadata converges; tenant and table scoping keeps identity from
+correlating across either boundary. The existing WAL and Postgres fence owns the
+duplicate decision, and a digest collision with a different durable identity
+stays fail-closed through the existing fence contradiction. Native SDK ingestion
+is unchanged. Applies uniformly to traces, logs, and metrics on OTLP/HTTP
+protobuf, OTLP/HTTP JSON, and OTLP/gRPC.
+
+Proven by `gate::otlp_batch_id_tests::derived_identity_is_stable_per_tenant_table_and_payload`
+(same input converges; different tenant, table, row order, or payload diverges;
+value is a UUIDv7) and by Scenario 4's replayed journey above.
 
 ### Verification actually run
 
@@ -761,9 +781,22 @@ already sends — and needs its own spec revision and task.
 | `mise run ts:typecheck` | PASS |
 | `git diff --check` | PASS |
 
-`mise run verify:bifrost` and `mise run gate` were not run. The seven journey
-lanes above are three of `verify:bifrost`'s nine lanes run directly and at the
-same scope; its remaining `integration:redux`, `integration:sql`, and
-`integration:server` lanes cover production code this change does not touch.
-The write set is test harness, tests, and the N-API testing binding only, so the
-repository aggregate adds no proof the lanes above do not already carry.
+The Gate batch-identity fix is production code in `vala-bifrost-redux`, so
+`mise run verify:bifrost` was run for this change and passed. Commands run for
+the OTLP retry-idempotency fix:
+
+| Command | Result |
+|---|---|
+| `mise run fmt` | PASS |
+| `mise run lints` | PASS (first run flagged two `doc_markdown` items; fixed) |
+| `mise exec -- cargo nextest run --locked -p vala-bifrost-redux --lib -E 'test(=gate::otlp_batch_id_tests::derived_identity_is_stable_per_tenant_table_and_payload)'` | PASS |
+| `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-testing --test otlp -P journey -E 'test(=negative::pg_tests::mixed_otlp_requests_commit_only_complete_siblings_and_exact_partial_success)' --run-ignored=all"` | PASS |
+| `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-testing --test otlp -P journey -E 'test(=negative::pg_tests::all_invalid_and_request_wide_failures_leave_no_queryable_rows)' --run-ignored=all"` | PASS |
+| `mise exec -- scripts/postgres/with-test-postgres.sh -- bash -lc "mise run db:migrate:inner && mise exec -- cargo nextest run --locked -p wyrd-testing --test otlp -P journey --run-ignored=all"` | PASS (9/9) |
+| `mise run verify:bifrost` | 8/9 lanes PASS. `journey:oracle` failed once on `analytical_activation::selected_peer_failure_is_terminal` (`pod 2 activated 1 leases and still holds 1`) while a second verification run was competing for CPU on the same 4-core host. |
+| `mise run test:bifrost:journey:oracle` (rerun, uncontended) | PASS 28/28 |
+| `git diff --check` | PASS |
+
+`mise run gate` was not run: the write set is one Gate function, its unit test,
+and one journey test's assertions, all inside the Bifrost capability the lane
+above gates at full scope.

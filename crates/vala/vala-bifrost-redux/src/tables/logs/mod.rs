@@ -149,8 +149,9 @@ mod tests {
     ///
     /// Panics when any canonical body byte, event name, raw flag word,
     /// nanosecond timestamp, optional correlation id, presence distinction,
-    /// stable field id, or sensitivity marker differs, or when a malformed
-    /// canonical payload or a drifted schema identity is accepted.
+    /// stable field id, or sensitivity marker differs, when a malformed
+    /// canonical payload is accepted, or when caller-supplied schema identity
+    /// survives validation instead of being restamped from the ledger.
     #[test]
     fn maximal_log_projection_preserves_body_context_and_presence() {
         let request = maximal_resource_logs();
@@ -307,12 +308,13 @@ mod tests {
             .expect("the projected batch validates against its own ledger");
     }
 
-    /// Assert malformed payloads and drifted identity are rejected outright.
+    /// Assert malformed payloads are rejected and caller identity is restamped.
     ///
     /// # Panics
     ///
-    /// Panics when non-canonical attribute bytes or a drifted stable field id
-    /// validate successfully.
+    /// Panics when non-canonical attribute bytes validate successfully, or when
+    /// a caller-supplied stable field id or sensitivity marker survives
+    /// validation instead of being replaced by the ledger's.
     fn assert_non_canonical_inputs_are_rejected(batch: &RecordBatch) {
         let malformed = RecordBatch::try_new(
             canonical_log_schema(),
@@ -339,11 +341,18 @@ mod tests {
             "non-canonical attribute bytes are rejected without a row"
         );
 
+        let declared_body = LOG_FIELDS
+            .iter()
+            .find(|field| field.name == "body")
+            .expect("the ledger declares the body column");
         let drifted_field =
             arrow::datatypes::Field::new("body", arrow::datatypes::DataType::Binary, true)
                 .with_metadata(std::collections::HashMap::from([
                     (PARQUET_FIELD_ID.to_owned(), "999".to_owned()),
-                    (WYRD_SENSITIVE.to_owned(), "true".to_owned()),
+                    (
+                        WYRD_SENSITIVE.to_owned(),
+                        (!declared_body.class.is_sensitive()).to_string(),
+                    ),
                 ]));
         let drifted_fields: Vec<_> = batch
             .schema()
@@ -362,9 +371,22 @@ mod tests {
             batch.columns().to_vec(),
         )
         .expect("the drifted batch still assembles");
-        assert!(
-            validate_canonical_user_batch(LOG_FIELDS, &drifted).is_err(),
-            "a drifted stable field id is rejected without a row"
+        let validated = validate_canonical_user_batch(LOG_FIELDS, &drifted)
+            .expect("a batch is compared by shape, so caller metadata does not refuse it");
+        let body = validated
+            .schema()
+            .field_with_name("body")
+            .expect("the validated batch keeps its body column")
+            .clone();
+        assert_eq!(
+            body.metadata().get(PARQUET_FIELD_ID),
+            Some(&declared_body.id.to_string()),
+            "the server restamps the ledger's stable id over the caller's"
+        );
+        assert_eq!(
+            body.metadata().get(WYRD_SENSITIVE),
+            Some(&declared_body.class.is_sensitive().to_string()),
+            "a caller cannot relabel a column's sensitivity"
         );
     }
 

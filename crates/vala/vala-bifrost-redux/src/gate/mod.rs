@@ -77,6 +77,48 @@ fn record_write_rejection(error: &IngestError) {
     }
 }
 
+/// Derives the deterministic OTLP batch identity used for retry suppression.
+///
+/// OTLP is at-least-once and carries no request idempotency key, so a retried
+/// export must be recognized by what it accepted rather than by transport
+/// metadata. The identity is the SHA-256 of a domain separator, the
+/// authenticated tenant, the logical table FQN, and the canonical batch's
+/// logical Arrow digest from [`crate::scribe::preprocess::logical_data_identity`],
+/// which deliberately excludes the per-request managed columns (request id,
+/// ingest time) that change across a legitimate retry. Scoping by tenant and
+/// table keeps identity from correlating across either boundary.
+///
+/// The first sixteen digest bytes are stamped with the RFC 4122 variant and
+/// UUID version 7 so the value satisfies the same `wyrd_batch_id` contract the
+/// native ingest path enforces. Scribe's WAL and Postgres commit fence then own
+/// the actual duplicate decision: a repeat returns `AlreadyCommitted` and a
+/// digest collision carrying a different durable identity stays fail-closed.
+///
+/// # Errors
+///
+/// Returns the mapped Scribe failure when the canonical batch has no
+/// representable logical identity.
+fn otlp_batch_id(
+    tenant: wyrd_spec::ids::DataTenantId,
+    table: &TableRef,
+    batch: &arrow::record_batch::RecordBatch,
+) -> Result<uuid::Uuid, IngestError> {
+    use sha2::{Digest as _, Sha256};
+
+    let (logical_digest, _) = crate::scribe::preprocess::logical_data_identity(batch)
+        .map_err(IngestError::from_scribe)?;
+    let mut digest = Sha256::new();
+    digest.update(b"wyrd.otlp.batch-id.v1");
+    digest.update(tenant.as_uuid().as_bytes());
+    digest.update(table.fqn().as_bytes());
+    digest.update(logical_digest);
+    let digest: [u8; 32] = digest.finalize().into();
+    let mut bytes: [u8; 16] = digest[..16].try_into().expect("sixteen digest bytes");
+    bytes[6] = (bytes[6] & 0x0f) | 0x70;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Ok(uuid::Uuid::from_bytes(bytes))
+}
+
 /// Owns exactly one terminal Gate request metric across return or cancellation.
 struct GateRequestLifecycle {
     /// Closed D24 operation label for this request.
@@ -615,6 +657,7 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> Gate<R,
         if batch.num_rows() == 0 {
             return Ok(());
         }
+        let batch_id = otlp_batch_id(auth.tenant, &table, &batch)?;
         let payload = IngressPayload::Canonical(match owner {
             Some(owner) => CanonicalIngress::new(vec![batch], owner),
             None => CanonicalIngress::unreserved(vec![batch]),
@@ -627,7 +670,7 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> Gate<R,
                 table,
                 expected_schema_fingerprint: None,
                 request_id: auth.request_id.clone(),
-                batch_id: uuid::Uuid::now_v7(),
+                batch_id,
                 audit_event,
                 measured_wire_bytes,
                 payload,
@@ -1913,5 +1956,71 @@ mod tests {
                 .get("bifrost_gate_active_requests{operation=\"query\"}"),
             Some(&0.0)
         );
+    }
+}
+
+#[cfg(test)]
+mod otlp_batch_id_tests {
+    use std::sync::Arc;
+
+    use arrow::array::Int32Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use wyrd_spec::ids::DataTenantId;
+
+    use super::{TableRef, otlp_batch_id};
+    use crate::namespaces::BifrostNamespace;
+
+    /// Builds one canonical-shaped batch carrying `values` in order.
+    fn batch(values: &[i32]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
+        RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(values.to_vec()))])
+            .expect("the fixture batch matches its schema")
+    }
+
+    /// The derived OTLP identity is stable per tenant, table, and payload.
+    ///
+    /// Retry suppression depends on a repeated export converging on one
+    /// `wyrd_batch_id`, and on any other tenant, table, row order, or payload
+    /// diverging so identity never correlates across those boundaries. The
+    /// value must also remain a `UUIDv7`, which is the contract the native
+    /// ingest path validates.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a repeat diverges, when a distinct input converges, or when
+    /// the derived value is not a `UUIDv7`.
+    #[test]
+    fn derived_identity_is_stable_per_tenant_table_and_payload() {
+        let tenant = DataTenantId::new_v7();
+        let other_tenant = DataTenantId::new_v7();
+        let spans = TableRef::new(BifrostNamespace::Traces, "spans");
+        let records = TableRef::new(BifrostNamespace::Logs, "records");
+        let id = |tenant, table: &TableRef, values: &[i32]| {
+            otlp_batch_id(tenant, table, &batch(values)).expect("the fixture batch has an identity")
+        };
+
+        let baseline = id(tenant, &spans, &[1, 2, 3]);
+        assert_eq!(
+            baseline,
+            id(tenant, &spans, &[1, 2, 3]),
+            "a replayed logical batch keeps one identity"
+        );
+        assert_eq!(
+            baseline.get_version(),
+            Some(uuid::Version::SortRand),
+            "the derived identity satisfies the UUIDv7 batch contract"
+        );
+        for divergent in [
+            id(other_tenant, &spans, &[1, 2, 3]),
+            id(tenant, &records, &[1, 2, 3]),
+            id(tenant, &spans, &[3, 2, 1]),
+            id(tenant, &spans, &[1, 2, 4]),
+        ] {
+            assert_ne!(
+                baseline, divergent,
+                "a different tenant, table, row order, or payload is a different batch"
+            );
+        }
     }
 }

@@ -180,7 +180,7 @@ fn ordered_rows(batches: &[RecordBatch], discriminator: &str) -> Vec<(String, i3
 mod pg_tests {
     use std::collections::{BTreeMap, BTreeSet};
 
-    use arrow::array::StringArray;
+    use arrow::array::{Array as _, StringArray};
     use arrow::record_batch::RecordBatch;
     use reqwest::StatusCode;
     use wyrd_runtime::Permission;

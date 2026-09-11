@@ -36,7 +36,7 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{PLATFORM_AUDIT_PRINCIPAL, PrincipalKindTag};
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
-    AcquireTailFenceRequest as DomainAcquireTailFenceRequest, AuditOutcome,
+    AcquireTailFenceRequest as DomainAcquireTailFenceRequest,
     SchemaFingerprint as WireSchemaFingerprint, TailCursor,
     TailPageRequest as DomainTailPageRequest, TenantTableBinding,
 };

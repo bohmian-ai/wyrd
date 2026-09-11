@@ -267,7 +267,7 @@ mod pg_tests {
 
     use wyrd_runtime::{PermissionSet, Principal, PrincipalId, PrincipalKind};
     use wyrd_spec::request_id::RequestId;
-    use wyrd_spec::vala::api::{AuditOutcome, DataTypeSpec, FieldSpec};
+    use wyrd_spec::vala::api::{DataTypeSpec, FieldSpec};
     use wyrd_storage::{BackendConfig, StorageHandle, StorageSettings};
 
     async fn test_state() -> AppState {

@@ -749,6 +749,37 @@ fn validate_card_scope(rows: &RecordBatch, principal: &Principal) -> Result<(), 
     Ok(())
 }
 
+/// Lifts a caller-supplied `run_id` column out of a payload, if it carries one.
+///
+/// `run_id` is a correlation name the caller may echo, so the column is taken
+/// verbatim rather than re-stamped. Uniqueness is checked here because a
+/// duplicated correlation name would make the batch's logical identity
+/// ambiguous once the managed block is appended.
+///
+/// # Errors
+/// Returns [`ScribeError::InvalidFrame`] when the payload carries more than one
+/// `run_id` column or when its type is not `Utf8`.
+fn caller_run_id_column(rows: &RecordBatch) -> Result<Option<ArrayRef>, ScribeError> {
+    let schema = rows.schema();
+    let mut matched = None;
+    for (index, field) in schema.fields().iter().enumerate() {
+        if field.name() != RUN_ID {
+            continue;
+        }
+        if matched.replace((index, field)).is_some() {
+            return Err(ScribeError::InvalidFrame);
+        }
+    }
+    matched
+        .map(|(index, field)| {
+            if field.data_type() != &DataType::Utf8 {
+                return Err(ScribeError::InvalidFrame);
+            }
+            Ok(Arc::clone(rows.column(index)))
+        })
+        .transpose()
+}
+
 /// Stamps server-owned correlation and managed columns onto one admitted batch.
 ///
 /// Native Arrow payloads may supply one valid nullable `run_id` correlation
@@ -821,26 +852,7 @@ fn stamp_correlation_columns(
         .index_of(WYRD_EVENT_TIME)
         .ok()
         .map(|index| Arc::clone(rows.column(index)));
-    let caller_run_id = {
-        let schema = rows.schema();
-        let mut matched = None;
-        for (index, field) in schema.fields().iter().enumerate() {
-            if field.name() != RUN_ID {
-                continue;
-            }
-            if matched.replace((index, field)).is_some() {
-                return Err(ScribeError::InvalidFrame);
-            }
-        }
-        matched
-            .map(|(index, field)| {
-                if field.data_type() != &DataType::Utf8 {
-                    return Err(ScribeError::InvalidFrame);
-                }
-                Ok(Arc::clone(rows.column(index)))
-            })
-            .transpose()?
-    };
+    let caller_run_id = caller_run_id_column(rows)?;
     let server_owned = server_owned_columns();
     let card_uids = resolve_card_uids(rows, principal, row_count)?;
     let mut fields = user_fields(rows, &server_owned);

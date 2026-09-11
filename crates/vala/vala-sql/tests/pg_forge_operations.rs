@@ -1061,7 +1061,6 @@ mod pg_tests {
         async fn assert_orphan_gc_recovery_is_outbox_independent(
             pool: &PgPool,
             tenant: DataTenantId,
-            audits_before: i64,
         ) {
             let operation_id = Uuid::now_v7();
             let candidate_paths =
@@ -1555,7 +1554,7 @@ mod pg_tests {
                 "Forge transitions append no audit"
             );
 
-            assert_orphan_gc_recovery_is_outbox_independent(pool, tenant, 1).await;
+            assert_orphan_gc_recovery_is_outbox_independent(pool, tenant).await;
 
             // Contradictory stored state still fails closed before any caller
             // receives recovery authority.
@@ -1864,7 +1863,7 @@ mod pg_tests {
                 .await
                 .expect("preparation applies");
             assert!(
-                matches!(applied, ForgeOperationTransition::Applied { .. }),
+                matches!(applied, ForgeOperationTransition::Applied),
                 "first preparation applies: {applied:?}"
             );
             assert_eq!(
@@ -1889,7 +1888,7 @@ mod pg_tests {
                 .await
                 .expect("preparation replay");
             assert!(
-                matches!(replay, ForgeOperationTransition::AlreadyApplied { .. }),
+                matches!(replay, ForgeOperationTransition::AlreadyApplied),
                 "identical preparation replay is idempotent: {replay:?}"
             );
             assert_eq!(
@@ -2300,7 +2299,7 @@ mod pg_tests {
                 .await
                 .expect("settlement applies");
             assert!(
-                matches!(settled, ForgeOperationTransition::Applied { .. }),
+                matches!(settled, ForgeOperationTransition::Applied),
                 "first settlement applies: {settled:?}"
             );
             assert_eq!(
@@ -2319,10 +2318,7 @@ mod pg_tests {
                 .await
                 .expect("settlement replay");
             assert!(
-                matches!(
-                    settle_replay,
-                    ForgeOperationTransition::AlreadyApplied { .. }
-                ),
+                matches!(settle_replay, ForgeOperationTransition::AlreadyApplied),
                 "identical settlement replay writes nothing: {settle_replay:?}"
             );
 

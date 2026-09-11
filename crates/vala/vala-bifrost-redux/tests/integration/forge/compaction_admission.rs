@@ -2859,7 +2859,6 @@ async fn crash_recovery_reconciles_the_exact_operation(
     let deletes_before = object_store.deletes();
     let (unresolved, errors_before) =
         release_one_unresolved_attempt(promoted, catalog, supervisor).await;
-    let unresolved_ids = unresolved.iter().copied().collect::<Vec<_>>();
 
     // The process is replaced, not asked to stop. The worker task is dropped
     // where it stands, so no shutdown branch runs and whatever it had in memory

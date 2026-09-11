@@ -631,8 +631,7 @@ mod pg_tests {
     use wyrd_spec::auth::PrincipalId;
     use wyrd_spec::request_id::RequestId;
     use wyrd_spec::vala::api::{
-        AuditDetail, AuditOutcome, AuthMethod, QueryAuditDigest, QueryClass, QueryExecutionMode,
-        VisibilityMode,
+        AuditDetail, AuthMethod, QueryAuditDigest, QueryClass, QueryExecutionMode, VisibilityMode,
     };
 
     use super::*;

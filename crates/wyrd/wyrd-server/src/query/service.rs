@@ -388,7 +388,7 @@ mod tests {
     use wyrd_runtime::{Principal, PrincipalKind};
     use wyrd_spec::auth::PrincipalId;
     use wyrd_spec::request_id::RequestId;
-    use wyrd_spec::vala::api::{AuditOutcome, FreshnessPolicy, VisibilityMode};
+    use wyrd_spec::vala::api::{FreshnessPolicy, VisibilityMode};
 
     use super::*;
 

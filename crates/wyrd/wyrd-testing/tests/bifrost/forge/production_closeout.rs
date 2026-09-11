@@ -369,7 +369,7 @@ impl CloseoutJourney {
     ///
     /// # Panics
     /// Panics if deletion stalls, has the wrong owner/route, loses a protected
-    /// object, or lacks its audited terminal settlement.
+    /// object, or lacks its terminal settlement.
     async fn collect_exact(
         &self,
         binding: &TenantTableBinding,
@@ -436,36 +436,20 @@ impl CloseoutJourney {
             .coordinator()
             .tenant_conn_for(binding.tenant)
             .await
-            .expect("tenant audit");
-        let resource = format!("forge-task:{task}");
+            .expect("tenant lineage");
+        // Cleanup evaluates no principal permission, so its own task evidence —
+        // not audit — counts the deletions it made.
         let deleted: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM vala.audit_staging \
-             WHERE resource=$1 AND operation='forge.expired_cleanup.candidate_deleted'",
+            "SELECT COALESCE((evidence->>'deleted_candidate_count')::bigint, 0) \
+             FROM vala.forge_tasks WHERE task_id=$1",
         )
-        .bind(&resource)
+        .bind(task)
         .fetch_one(&mut **conn.transaction())
         .await
-        .expect("audited physical deletion");
-        conn.commit().await.expect("audit inspection releases SQL");
-        // The row is owed to retained history the moment it is written, so the
-        // server's publisher may already have moved it out of the outbox. Only
-        // an empty outbox answer needs the retained half; asking for it every
-        // time would put a fused query on a path that has nothing to learn.
-        let deleted = if deleted > 0 {
-            deleted
-        } else {
-            i64::try_from(
-                self.retained_audit_rows(
-                    binding.tenant,
-                    &format!(
-                        "resource = '{resource}' \
-                         AND operation = 'forge.expired_cleanup.candidate_deleted'"
-                    ),
-                )
-                .await,
-            )
-            .expect("retained audit count is representable")
-        };
+        .expect("cleanup deletion lineage");
+        conn.commit()
+            .await
+            .expect("lineage inspection releases SQL");
         assert!(deleted > 0);
         eprintln!(
             "expired cleanup task={task}, worker={}, physically deleted={path}",
@@ -522,27 +506,29 @@ impl CloseoutJourney {
         }
     }
 
-    /// Corroborates collection with its own audited operation identity.
+    /// Corroborates collection with its own lineage operation identity.
+    ///
+    /// Forge evaluates no principal permission, so `vala.forge_operation_state`
+    /// — not audit — is the authority this reads: the route owns an
+    /// `orphan_gc` operation that reached a terminal phase.
     ///
     /// # Panics
-    /// Panics when the route wrote no operation, its audits belong to another
-    /// owner, or a destructive sibling route ran beside it.
+    /// Panics when the route wrote no operation, its operation never settled,
+    /// or a destructive sibling route ran beside it.
     async fn assert_orphan_evidence(&self, tenant: DataTenantId) {
         let mut conn = self
             .coordinator()
             .tenant_conn_for(tenant)
             .await
-            .expect("tenant-scoped audit inspection");
-        let rows: Vec<(Uuid, String, String)> = sqlx::query_as(
-            "SELECT o.operation_id, p.operation, t.operation \
-             FROM vala.forge_operation_state o \
-             JOIN vala.audit_staging p ON p.data_tenant_id=o.data_tenant_id AND p.seq=o.prepared_audit_seq \
-             JOIN vala.audit_staging t ON t.data_tenant_id=o.data_tenant_id AND t.seq=o.terminal_audit_seq \
-             WHERE o.family='orphan_gc'",
+            .expect("tenant-scoped lineage inspection");
+        let rows: Vec<(Uuid, String)> = sqlx::query_as(
+            "SELECT operation_id, phase \
+             FROM vala.forge_operation_state \
+             WHERE family='orphan_gc'",
         )
         .fetch_all(&mut **conn.transaction())
         .await
-        .expect("orphan collection audit evidence");
+        .expect("orphan collection lineage evidence");
         let strategies: Vec<String> = sqlx::query_scalar(
             "SELECT DISTINCT strategy FROM vala.forge_tasks WHERE data_tenant_id=wyrd.current_tenant()",
         )
@@ -551,18 +537,17 @@ impl CloseoutJourney {
         .expect("durable strategy inventory");
         conn.commit()
             .await
-            .expect("read-only audit inspection completes");
+            .expect("read-only lineage inspection completes");
         assert!(
             !rows.is_empty(),
-            "the collection route owns its own audited operation identity"
+            "the collection route owns its own lineage operation identity"
         );
-        for (operation, prepared, terminal) in &rows {
-            assert_eq!(prepared, "forge.orphan_gc.prepared");
+        for (operation, phase) in &rows {
             assert!(
-                terminal == "forge.orphan_gc.committed" || terminal == "forge.orphan_gc.recovered",
-                "collection settled through another owner: {terminal}"
+                phase == "committed" || phase == "recovered",
+                "collection left operation {operation} in phase {phase}"
             );
-            eprintln!("orphan collection operation {operation}: {prepared} -> {terminal}");
+            eprintln!("orphan collection operation {operation}: {phase}");
         }
         assert!(
             strategies
@@ -899,131 +884,43 @@ impl CloseoutJourney {
             .count()
     }
 
-    /// Counts retained audit rows matching one SQL predicate.
-    ///
-    /// Retained history is read through the same authorized query path a caller
-    /// uses. A tenant whose history has never been published owns no such table
-    /// yet, which is an honest zero rather than a failure.
-    ///
-    /// # Panics
-    /// Panics when the retained read fails for any reason other than the table
-    /// not existing yet.
-    async fn retained_audit_rows(&self, tenant: DataTenantId, predicate: &str) -> u64 {
-        let permission = wyrd_runtime::Permission::bifrost_query_read();
-        let principal = wyrd_runtime::Principal::new(
-            wyrd_spec::auth::PrincipalId::new(Uuid::now_v7()),
-            wyrd_runtime::PrincipalKind::User,
-            tenant,
-            Vec::new(),
-            wyrd_runtime::permission::PermissionSet::from_iter([permission.clone()]),
-        );
-        let context = vala_bifrost_redux::oracle::AuthorizedQueryContext::try_new(
-            principal,
-            tenant,
-            wyrd_spec::request_id::RequestId::now_v7(),
-            None,
-            wyrd_spec::vala::api::AuthMethod::Internal,
-            permission,
-        )
-        .expect("the scheduled principal owns the tenant it reads");
-        let outcome = wyrd_server::query::scheduled::ScheduledQueryCaller::new(
-            self.oracle().state().clone(),
-            context,
-            tokio_util::sync::CancellationToken::new(),
-        )
-        .run(wyrd_spec::vala::api::BifrostQueryRequest {
-            sql: format!("SELECT seq FROM vala.system.audit_log WHERE {predicate}"),
-            visibility: wyrd_spec::vala::api::VisibilityMode::Fused,
-            freshness: wyrd_spec::vala::api::FreshnessPolicy::Strict,
-            deadline_ms: Some(60_000),
-        })
-        .await;
-        match outcome {
-            Ok(outcome) => outcome.rows,
-            Err(wyrd_spec::error::WyrdError::Vala {
-                error: wyrd_spec::vala::error::BifrostError::TableNotFound { .. },
-            }) => 0,
-            Err(error) => panic!("retained audit history is readable: {error:?}"),
-        }
-    }
-
-    /// Proves one audited sequence carries the expected operation name.
-    ///
-    /// A settlement is audited exactly once, but it lives in one of two places
-    /// depending on whether the server's publisher has run: the transactional
-    /// outbox until it ships, retained history afterwards. Retained history is
-    /// read through the same authorized query path a caller uses, and a
-    /// sequence present in neither place is a lost audit event, not a timing
-    /// difference.
-    ///
-    /// # Panics
-    /// Panics when the sequence carries another operation, or when it is absent
-    /// from both the outbox and retained history.
-    async fn assert_audited(
-        &self,
-        tenant: DataTenantId,
-        owed: &std::collections::BTreeMap<i64, String>,
-        seq: i64,
-        expected: &str,
-    ) {
-        if let Some(operation) = owed.get(&seq) {
-            assert_eq!(operation, expected, "owed audit event {seq}");
-            return;
-        }
-        let retained = self
-            .retained_audit_rows(tenant, &format!("seq = {seq} AND operation = '{expected}'"))
-            .await;
-        assert_eq!(
-            retained, 1,
-            "audit sequence {seq} left the outbox without reaching retained history as {expected}"
-        );
-    }
-
-    /// Corroborates every completed rewrite with transactional audit and metrics.
+    /// Corroborates every completed rewrite with its lineage and metrics.
     ///
     /// An attempt publishes each of its admitted plans independently, so a
     /// completed rewrite settles *one operation per plan*, not one per task.
     /// The count is therefore a floor rather than an equality, and the
-    /// identities carry the real evidence: each plan holds its own operation,
-    /// its own Prepared audit, and its own committed terminal after it.
+    /// identities carry the real evidence: each plan holds its own operation in
+    /// `vala.forge_operation_state`, settled into a terminal phase. Forge
+    /// evaluates no principal permission, so that projection — not audit — is
+    /// the authority read here.
     ///
     /// Returns how many operations that evidence covers, so the caller can hold
     /// it against the snapshots the same passes published.
     ///
     /// # Panics
-    /// Panics on absent or contradictory operation/audit evidence, on two plans
-    /// sharing one operation identity, on an unfinished ownership gauge, or on
-    /// missing physical data-flow counters.
+    /// Panics on absent or unsettled operation evidence, on two plans sharing
+    /// one operation identity, on an unfinished ownership gauge, or on missing
+    /// physical data-flow counters.
     async fn assert_rewrite_evidence(&self, tenant: DataTenantId, expected: usize) -> usize {
         let mut conn = self
             .coordinator()
             .tenant_conn_for(tenant)
             .await
-            .expect("tenant-scoped audit inspection");
-        let rows: Vec<(Uuid, i64, i64, serde_json::Value)> = sqlx::query_as(
-            "SELECT operation_id, prepared_audit_seq, terminal_audit_seq, prepared_detail \
+            .expect("tenant-scoped lineage inspection");
+        let rows: Vec<(Uuid, String, serde_json::Value)> = sqlx::query_as(
+            "SELECT operation_id, phase, prepared_detail \
              FROM vala.forge_operation_state \
              WHERE family='iceberg_rewrite'",
         )
         .fetch_all(&mut **conn.transaction())
         .await
-        .expect("rewrite audit evidence");
-        // The outbox is delivery state: the server's own publisher moves a
-        // settled range into retained history and retires it, so a settlement
-        // audited minutes ago is legitimately gone from here. Both sides are
-        // read, and a sequence found in neither is a lost audit event.
-        let owed: Vec<(i64, String)> =
-            sqlx::query_as("SELECT seq, operation FROM vala.audit_staging")
-                .fetch_all(&mut **conn.transaction())
-                .await
-                .expect("owed audit evidence");
-        let owed: std::collections::BTreeMap<i64, String> = owed.into_iter().collect();
+        .expect("rewrite lineage evidence");
         conn.commit()
             .await
-            .expect("read-only audit inspection completes");
+            .expect("read-only lineage inspection completes");
         assert!(
             rows.len() >= expected,
-            "every completed rewrite audits at least one plan's terminal settlement: \
+            "every completed rewrite settles at least one plan's operation: \
              {} operations for {expected} rewrites",
             rows.len()
         );
@@ -1036,15 +933,12 @@ impl CloseoutJourney {
             "no two published plans settled under one operation identity"
         );
         let operations = rows.len();
-        for (operation, prepared, terminal, detail) in rows {
-            assert!(prepared < terminal);
-            self.assert_audited(tenant, &owed, prepared, "forge.iceberg_rewrite.prepared")
-                .await;
-            self.assert_audited(tenant, &owed, terminal, "forge.iceberg_rewrite.committed")
-                .await;
-            eprintln!(
-                "rewrite {operation}, audit {prepared}->{terminal}, fenced preparation {detail}"
+        for (operation, phase, detail) in rows {
+            assert_eq!(
+                phase, "committed",
+                "rewrite operation {operation} did not settle"
             );
+            eprintln!("rewrite {operation}, phase {phase}, fenced preparation {detail}");
         }
         let metrics = self
             .cluster
@@ -1515,7 +1409,7 @@ async fn compaction_geometry_exact_rows_and_non_destructive_second_pass() {
     );
     journey.assert_objects(&inputs).await;
     // Each admitted plan publishes on its own, so the rewrite passes owe one
-    // audited operation per snapshot they added — not one per completed task.
+    // operation per snapshot they added — not one per completed task.
     let operations = journey.assert_rewrite_evidence(tenant, rewrites).await;
     assert_eq!(
         operations,
@@ -2001,7 +1895,7 @@ impl OrphanJourney {
     /// managed execution is finished and its publication has not yet reacquired
     /// authoritative metadata, and that reacquisition is then made to fail. The
     /// objects the attempt already closed are therefore named by no snapshot,
-    /// no operation row, and no audit transition, and the retry runs under a
+    /// no operation row, and the retry runs under a
     /// new attempt identity that cannot reuse them. While the attempt is still
     /// open those same objects must still be retained, but the age floor is the
     /// only authority that can retain them: a protection root requires the

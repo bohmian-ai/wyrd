@@ -47,7 +47,11 @@ impl DomainTable for AuditLogTable {
         PhysicalLayoutWire {
             partition_granularity: TimeGranularityWire::Day,
             sort_keys: vec![sort_desc(WYRD_EVENT_TIME), sort_asc("seq")],
-            bloom_columns: vec!["seq".to_owned(), "operation".to_owned()],
+            bloom_columns: vec![
+                "audit_principal_id".to_owned(),
+                "resource".to_owned(),
+                "operation".to_owned(),
+            ],
         }
     }
 }

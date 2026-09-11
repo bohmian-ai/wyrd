@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AuditOutcome",
+  "description": "The authorization outcome recorded on an audit row.\n\nAn audit row states what the authorization boundary decided about a principal's permission, never whether the operation it admitted later succeeded. Engine outcomes are lineage in their own operational tables.",
+  "oneOf": [
+    {
+      "description": "The evaluated permission authorized the operation.",
+      "type": "string",
+      "enum": [
+        "allowed"
+      ]
+    },
+    {
+      "description": "The evaluated permission refused the operation.",
+      "type": "string",
+      "enum": [
+        "denied"
+      ]
+    }
+  ]
+}

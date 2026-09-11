@@ -50,28 +50,6 @@ struct DrainedExpiration {
     payload: ExpiredCleanupPayload,
 }
 
-/// Lists one task's audit operations in durable sequence order.
-///
-/// # Panics
-///
-/// Panics when the diagnostic read fails.
-async fn audits(fixture: &PromotionIntegrationFixture, task_id: Uuid) -> Vec<String> {
-    let mut conn = fixture
-        .vala
-        .tenant_conn(fixture.tenant)
-        .await
-        .expect("fixture tenant connection");
-    let operations: Vec<String> = sqlx::query_scalar(
-        "SELECT operation FROM vala.audit_staging WHERE resource = $1 ORDER BY seq",
-    )
-    .bind(format!("forge-task:{task_id}"))
-    .fetch_all(&mut **conn.transaction())
-    .await
-    .expect("task audits are readable");
-    conn.commit().await.expect("audit read commit");
-    operations
-}
-
 /// Reads one cleanup task's durable state and cursor position.
 ///
 /// # Panics
@@ -725,33 +703,17 @@ async fn candidate_preparation_releases_sql_and_blocks_oracle_and_competing_forg
         );
     }
 
-    let sequence = audits(&table.fixture, cleanup_id).await;
+    // Cleanup evaluates no principal permission, so the task's own evidence is
+    // its lineage: every candidate advanced the cursor exactly once and none
+    // stayed prepared.
+    let (state, advanced, prepared) = cursor(&table.fixture, cleanup_id).await;
+    assert_eq!(state, "succeeded");
     assert_eq!(
-        sequence
-            .iter()
-            .filter(|entry| *entry == "forge.expired_cleanup.candidate_prepared")
-            .count(),
+        usize::try_from(advanced).expect("advanced count is representable"),
         payload.cleanup_candidates.len(),
-        "one preparation audit per candidate: {sequence:?}"
+        "the cursor advanced exactly once per candidate"
     );
-    assert_eq!(
-        sequence
-            .iter()
-            .filter(
-                |entry| entry.starts_with("forge.expired_cleanup.candidate_deleted")
-                    || entry.starts_with("forge.expired_cleanup.candidate_missing")
-            )
-            .count(),
-        payload.cleanup_candidates.len(),
-        "one advancing settlement audit per candidate: {sequence:?}"
-    );
-    assert_eq!(
-        sequence
-            .iter()
-            .filter(|entry| *entry == "forge.task.succeeded")
-            .count(),
-        1
-    );
+    assert_eq!(prepared, None, "no candidate stayed prepared");
 
     table.supervised.shutdown().await;
 }
@@ -848,22 +810,6 @@ async fn expire_claim(pool: &sqlx::PgPool, task_id: Uuid) {
         .expect("the claim lease lapses");
 }
 
-/// Counts how many audits for one task carry the given operation.
-///
-/// # Panics
-///
-/// Panics when the audit read fails.
-async fn audit_count(
-    fixture: &PromotionIntegrationFixture,
-    task_id: Uuid,
-    operation: &str,
-) -> usize {
-    audits(fixture, task_id)
-        .await
-        .iter()
-        .filter(|entry| entry.as_str() == operation)
-        .count()
-}
 
 /// Reads one task's current attempt generation.
 ///
@@ -921,7 +867,7 @@ async fn assert_cancellation_before_preparation_is_inert(
 /// # Panics
 ///
 /// Panics when the failure propagates instead of settling, a delete is
-/// submitted, the cursor advances, or the refusal audit is not exactly one.
+/// submitted, or the cursor advances.
 async fn assert_stat_failure_settles_as_refusal(
     table: &ExpirableTable,
     worker: &ForgeWorker,
@@ -930,8 +876,8 @@ async fn assert_stat_failure_settles_as_refusal(
     deletes_before: usize,
 ) {
     // A stat failure lands after the preparation committed, so it is a
-    // definitive pre-submission failure: it settles as a refusal, appends one
-    // refusal audit, and retains candidate zero for exact replay.
+    // definitive pre-submission failure: it settles as a refusal and retains
+    // candidate zero for exact replay.
     let stats_before = table.store.stats();
     table.store.fail_next_stats(1);
     let retained = worker
@@ -955,16 +901,6 @@ async fn assert_stat_failure_settles_as_refusal(
         table.store.deletes(),
         deletes_before,
         "a pre-submission refusal submits no delete"
-    );
-    assert_eq!(
-        audit_count(
-            &table.fixture,
-            cleanup_id,
-            "forge.expired_cleanup.candidate_refused"
-        )
-        .await,
-        1,
-        "one authoritative refusal appends exactly one candidate audit"
     );
 }
 
@@ -1014,46 +950,29 @@ async fn assert_cancelled_stat_settles_as_refusal(
         "cancellation before submission submits no delete"
     );
     assert_eq!(
-        audit_count(
-            &table.fixture,
-            cleanup_id,
-            "forge.expired_cleanup.candidate_refused"
-        )
-        .await,
-        2,
-        "each observed authoritative refusal appends exactly one audit"
-    );
-    assert_eq!(
         attempt_of(pool, cleanup_id).await,
         Some(attempt),
         "takeover resumes the same task and attempt"
     );
 }
 
-/// Asserts the displaced owner can neither mutate the prepared row nor audit.
+/// Asserts the displaced owner cannot mutate the prepared row.
 ///
 /// # Panics
 ///
-/// Panics when the stale drain succeeds, appends an audit, or moves the cursor.
+/// Panics when the stale drain succeeds or moves the cursor.
 async fn assert_stale_owner_is_inert(
     table: &ExpirableTable,
     worker: &ForgeWorker,
     claim: ForgeTaskClaim,
     cleanup_id: Uuid,
 ) {
-    // The displaced owner is stale: it can neither mutate the row nor audit.
-    let sequence_before = audits(&table.fixture, cleanup_id).await.len();
     assert!(
         worker
             .execute_expired_cleanup_claim_for_test(claim, &CancellationToken::new())
             .await
             .is_err(),
         "a displaced owner cannot drain the task it lost"
-    );
-    assert_eq!(
-        audits(&table.fixture, cleanup_id).await.len(),
-        sequence_before,
-        "a stale owner appends no audit"
     );
     assert_eq!(
         cursor(&table.fixture, cleanup_id).await,
@@ -1067,7 +986,7 @@ async fn assert_stale_owner_is_inert(
 /// # Panics
 ///
 /// Panics when the cursor advances past an object whose fate was unknown, the
-/// delete count is wrong, or the uncertain audit is not exactly one.
+/// or the delete count is wrong.
 async fn assert_lost_acknowledgement_is_uncertain(
     table: &ExpirableTable,
     taker: &ForgeWorker,
@@ -1102,16 +1021,6 @@ async fn assert_lost_acknowledgement_is_uncertain(
         cursor(&table.fixture, cleanup_id).await,
         ("prepared".to_owned(), 0, Some(0)),
         "an uncertain acceptance advances nothing"
-    );
-    assert_eq!(
-        audit_count(
-            &table.fixture,
-            cleanup_id,
-            "forge.expired_cleanup.candidate_uncertain"
-        )
-        .await,
-        2,
-        "each observed uncertain settlement appends exactly one candidate audit"
     );
 }
 
@@ -1159,16 +1068,6 @@ async fn assert_polled_delete_cancellation_is_uncertain(
         cursor(&table.fixture, cleanup_id).await,
         ("prepared".to_owned(), 0, Some(0)),
         "an unknown acceptance advances nothing"
-    );
-    assert_eq!(
-        audit_count(
-            &table.fixture,
-            cleanup_id,
-            "forge.expired_cleanup.candidate_uncertain"
-        )
-        .await,
-        1,
-        "one uncertain settlement appends exactly one candidate audit"
     );
 }
 
@@ -1219,25 +1118,15 @@ async fn assert_partial_frontier_is_left_for_the_successor(
         object_exists(&table.fixture, second).await,
         "the cancelled deletion never reached the real object store"
     );
-    assert_eq!(
-        audit_count(
-            &table.fixture,
-            cleanup_id,
-            "forge.expired_cleanup.candidate_missing"
-        )
-        .await,
-        1,
-        "the stat-proven absence appends exactly one advancing audit"
-    );
 }
 
-/// Asserts the finished cleanup task's terminal cursor, effects, and audits.
+/// Asserts the finished cleanup task's terminal cursor and effects.
 ///
 /// # Panics
 ///
 /// Panics when the task did not succeed from its partial frontier, an object
-/// survived, a candidate was deleted twice, the audit cardinality differs, or
-/// another destructive maintenance strategy ran.
+/// survived, a candidate was deleted twice, or another destructive maintenance
+/// strategy ran.
 async fn assert_cleanup_finished_exactly(
     table: &ExpirableTable,
     cleanup_id: Uuid,
@@ -1261,24 +1150,6 @@ async fn assert_cleanup_finished_exactly(
         );
     }
 
-    let sequence = audits(&table.fixture, cleanup_id).await;
-    for (operation, expected) in [
-        ("forge.expired_cleanup.candidate_prepared", 3),
-        ("forge.expired_cleanup.candidate_refused", 2),
-        ("forge.expired_cleanup.candidate_uncertain", 3),
-        ("forge.expired_cleanup.candidate_missing", 2),
-        ("forge.expired_cleanup.candidate_deleted", 1),
-        ("forge.task.succeeded", 1),
-    ] {
-        assert_eq!(
-            sequence
-                .iter()
-                .filter(|entry| entry.as_str() == operation)
-                .count(),
-            expected,
-            "exact audit cardinality for {operation}: {sequence:?}"
-        );
-    }
 
     // No destructive maintenance other than the handoff pair ran: scribe
     // promotion is ingest publication, not a maintenance effect.

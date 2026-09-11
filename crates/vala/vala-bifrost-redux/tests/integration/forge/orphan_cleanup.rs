@@ -996,8 +996,8 @@ async fn seed_open_operation(
     sqlx::query(
         "INSERT INTO vala.forge_operation_state \
          (data_tenant_id,resource,family,operation_id,phase,prepared_detail,current_detail,\
-          prepared_audit_seq,prepared_at,updated_at) \
-         VALUES ($1,$2,$3,$4,'prepared',$5,$5,1,statement_timestamp(),statement_timestamp())",
+          prepared_at,updated_at) \
+         VALUES ($1,$2,$3,$4,'prepared',$5,$5,statement_timestamp(),statement_timestamp())",
     )
     .bind(fixture.tenant.as_uuid())
     .bind(table_resource(fixture))

@@ -211,3 +211,17 @@ Scribe also accepts published audit history.
 - Card MCP tools have no server-side equivalent: HEAD's dead
   `register_card_tools` was deleted along with the old `wyrd-mcp` surface.
 - `CardPyResult` → `WyrdPyResult` (REQ-024) stays deferred to TASK-002.
+
+### Closeout order — TASK-005 first
+
+No further TASK-001 closeout work proceeds until TASK-005
+(`TASK-005-audit-at-the-authorization-boundary.md`) is implemented. It
+supersedes the audit portions of the status amendment above: the interim
+`CorrelationPolicy::Observation` change and the `audit_principal_id` rename are
+withdrawn, and the remaining audit work in this task is defined by TASK-005
+rather than by items 1 and 2 of Remaining.
+
+TASK-005 is itself gated on the `architecture/bifrost-design.md:454-463`
+revision being human-approved. Until that approval lands, TASK-001 closeout is
+blocked rather than proceeding around it — finishing the other lanes first
+would re-verify a schema and an audit path that TASK-005 then changes.

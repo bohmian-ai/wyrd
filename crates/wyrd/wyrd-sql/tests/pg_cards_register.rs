@@ -12,7 +12,6 @@ use wyrd_spec::envelope::Card;
 use wyrd_spec::ids::{CardName, CardUid, SpaceName};
 use wyrd_spec::reference::{CardRef, scope_child_card_refs};
 use wyrd_spec::registry::{ArtifactManifestEntry, RegistrationOperationId};
-use wyrd_sql::OperatorPool;
 use wyrd_sql::queries::cards::{
     NewCardRow, NewRegistrationOperation, RECONCILE_KIND_REGISTRATION, claim_card_reconciliation,
     insert_artifact_manifest_rows, insert_card_row, insert_registration_operation,

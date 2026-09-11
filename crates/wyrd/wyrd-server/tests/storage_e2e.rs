@@ -137,15 +137,6 @@ fn s3_cloud_settings() -> StorageSettings {
     }))
 }
 
-fn emulator_catalog_backend() -> BackendConfig {
-    BackendConfig::S3(S3Config {
-        bucket: env_or("WYRD_STORAGE_S3_BUCKET", "wyrd-storage-test"),
-        region: Some(env_or("WYRD_STORAGE_S3_REGION", "us-east-1")),
-        endpoint_url: Some(env_or("WYRD_S3_EMULATOR_ENDPOINT", "http://localhost:9000")),
-        force_path_style: true,
-    })
-}
-
 fn gcs_emu_handle() -> Arc<StorageHandle> {
     let bucket = env_or("WYRD_STORAGE_GCS_BUCKET", "wyrd-storage-test");
     let endpoint = env_or("WYRD_GCS_EMULATOR_HOST", "http://localhost:4443");
@@ -198,16 +189,9 @@ fn azure_cloud_settings() -> StorageSettings {
     }))
 }
 
-async fn server_from_handle(
-    handle: Arc<StorageHandle>,
-    catalog_backend: Option<BackendConfig>,
-) -> WyrdTestServer {
-    let builder = WyrdTestServer::builder().with_storage_handle(handle);
-    let builder = match catalog_backend {
-        Some(backend) => builder.with_catalog_backend(backend),
-        None => builder,
-    };
-    builder
+async fn server_from_handle(handle: Arc<StorageHandle>) -> WyrdTestServer {
+    WyrdTestServer::builder()
+        .with_storage_handle(handle)
         .start_bound()
         .await
         .expect("start bound storage server")
@@ -415,7 +399,7 @@ async fn gcs_multipart_e2e_emu() {
         return;
     }
     run_client_server_journey(
-        server_from_handle(gcs_emu_handle(), Some(emulator_catalog_backend())).await,
+        server_from_handle(gcs_emu_handle()).await,
         "gcs-multipart/weights.bin",
         true,
     )
@@ -441,7 +425,7 @@ async fn azure_multipart_e2e_emu() {
         return;
     }
     run_client_server_journey(
-        server_from_handle(azure_emu_handle(), Some(emulator_catalog_backend())).await,
+        server_from_handle(azure_emu_handle()).await,
         "azure-multipart/weights.bin",
         false,
     )

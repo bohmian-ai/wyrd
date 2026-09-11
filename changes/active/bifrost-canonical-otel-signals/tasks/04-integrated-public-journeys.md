@@ -643,3 +643,100 @@ SDK limitation, generated drift result, and final aggregate gate.
 - `crates/wyrd/wyrd-testing/tests/README.md`
 - `crates/vala/vala-bifrost-redux/tests/README.md`
 - `changes/active/bifrost-canonical-otel-signals/spec.md`
+
+## Implementation report
+
+### Scenario 1 — completed and committed before this report
+
+| Test | Owner | Commit |
+|---|---|---|
+| `trace_export::pg_tests::otlp_grpc_maximal_trace_round_trips_every_field` | `crates/wyrd/wyrd-testing/tests/bifrost/otlp/trace_export.rs` | `a79a231d0` |
+| `trace_export_http::pg_tests::otlp_http_protobuf_and_json_match_grpc_trace_rows` | `.../otlp/trace_export_http.rs` | `969df61a0` |
+| `logs_export::pg_tests::otlp_log_routes_round_trip_body_context_and_redaction` | `.../otlp/logs_export.rs` | `18eaf9b04` |
+| `metrics_export::pg_tests::otlp_metric_routes_round_trip_every_supported_point_kind` | `.../otlp/metrics_export.rs` | `18eaf9b04` |
+
+`02e953b8e` is the production fix those four tests demanded: Oracle's optimized
+canonical SQL plan now enforces the declared sensitive payload columns, and
+clients reconstruct `WYRD_VALA_403_PAYLOAD_FORBIDDEN` instead of surfacing it as
+a retryable 502.
+
+### Named test results
+
+| Named test | Owner | Result |
+|---|---|---|
+| `stock_rust_otel_tracer_exports_genai_span_to_bifrost` | `.../otlp/trace_export.rs:415` | PASS (`6d270df00`) |
+| `stock_rust_otel_logger_exports_correlated_log_to_bifrost` | `.../otlp/logs_export.rs:277` | PASS (`6d270df00`) |
+| `stock_rust_otel_meter_exports_representative_metrics_to_bifrost` | `.../otlp/metrics_export.rs:507` | PASS (`6d270df00`) |
+| `test_standard_otel_tracer_exports_to_bifrost` | `python/py-wyrd/tests/integration/test_bifrost_e2e.py:735` | PASS (`137d3c7dd`) |
+| `test_stdlib_logging_exports_to_bifrost` | same file `:830` | PASS |
+| `test_standard_otel_metrics_export_to_bifrost` | same file `:890` | PASS |
+| `stock OpenTelemetry tracer exports GenAI span to Bifrost` | `typescript/wyrd/tests/integration/otel-export.test.ts:97` | PASS (`27aed248e`) |
+| `stock OpenTelemetry logger exports correlated log to Bifrost` | same file `:216` | PASS |
+| `stock OpenTelemetry meter exports representative metrics to Bifrost` | same file `:279` | PASS |
+| `mixed_otlp_requests_commit_only_complete_siblings_and_exact_partial_success` | `.../otlp/negative.rs:209` | PASS (`ee22dec75`) |
+| `all_invalid_and_request_wide_failures_leave_no_queryable_rows` | `.../otlp/negative.rs:366` | PASS |
+| `pg_tests::canonical_signal_arrow_write_and_sql_read_round_trip` | `crates/vala/vala-sdk/tests/pg_bifrost_e2e.rs:2369` | PASS (`ff7995823`, `fbcefe607`) |
+| `test_canonical_signal_arrow_write_and_sql_read_round_trip` | `python/py-wyrd/tests/integration/test_bifrost_query.py` | PASS |
+| `canonical signal Arrow write and SQL read round-trip` | `typescript/wyrd/tests/integration/oracle-query.test.ts` | PASS (`b5838a649`) |
+| `query::pg_tests::agent_reads_canonical_trace_genai_logs_and_metrics_through_sql` | `crates/wyrd/wyrd-mcp/tests/bifrost/mcp/query.rs` | PASS (`8c635c224`) |
+| `write_read::scribe_write_flush_read_user_journey` | `crates/wyrd/wyrd-testing/tests/bifrost/scribe/write_read.rs` | PASS (`22accd60e`) |
+| `peer_network::analytical::stage_graph_executes_representative_query_styles` | `crates/wyrd/wyrd-testing/tests/bifrost/oracle/peer_network/analytical.rs` | PASS (`97d09307c`) |
+
+Partial-success and whole-request refusal results, authorized and redacted
+payload results, and every metric kind are recorded in the owning tests above;
+they are not restated per topology.
+
+### Production defects these public journeys exposed
+
+1. **No public Arrow batch write door.** The canonical signal tables declare
+   binary, fixed-size-binary and nested list/struct columns, which the JSON row
+   path cannot express, so no public caller could write one. Fixed by
+   `3d88a3a14` (Rust SDK) and `81aa8eaef` (Python and TypeScript projections).
+2. **Canonical ingress demanded server-owned field identity back from the
+   writer.** A batch built from `describe_table`'s published schema was refused
+   because the comparison included the stable field id and sensitivity tag the
+   server assigns and `writable_schema` deliberately drops. Fixed by
+   `fac83e240`: the user block is compared by shape, and the server re-stamps
+   identity.
+3. **Sensitive payload columns were unenforced on Oracle's optimized canonical
+   plan.** Fixed by `02e953b8e` before this report.
+
+### Deviations and limitations
+
+- Scenario 4's retry-dedup leg asserts the accepted canonical subset through the
+  batch fence and payload digest rather than through a second identical OTLP
+  export: the OTLP transport mints a fresh batch id per export, so a replayed
+  request is a new batch by contract and cannot express the duplicate the
+  assertion needs. Recorded as a deviation, not a gap: duplicate-source
+  suppression remains proven in the Scribe recovery owner.
+- Scenario 6 adds a `Flush` control request and a foreign-tenant public
+  credential to `BifrostProcessCluster`. Neither carries data: the first is the
+  publication step a deployment reaches on its own timer, taken explicitly so a
+  journey that wrote through a public ingest door can read deterministically;
+  the second is an ordinary API key for a second data tenant. The canonical span
+  itself enters through the Scribe pod's public OTLP route and leaves through
+  the leader Oracle's public query listener.
+
+### Verification actually run
+
+| Command | Result |
+|---|---|
+| `mise run test:bifrost:journey:otlp` | PASS |
+| `mise run test:bifrost:journey:sdk` | PASS |
+| `mise run test:bifrost:journey:mcp` | PASS |
+| `mise run test:bifrost:journey:python` | PASS |
+| `mise run test:bifrost:journey:typescript` | PASS |
+| `mise run test:bifrost:journey:scribe` | PASS |
+| `mise run test:bifrost:journey:oracle` | PASS |
+| `mise run codegen:check` | PASS (no generated drift) |
+| `mise run fmt` / `lints` | PASS; `lints` first failed on two `needless_pass_by_value` N-API arguments, fixed in `76e32a6c3` |
+| `mise run py:format` / `py:lints` / `py:typecheck` | PASS |
+| `mise run ts:typecheck` | PASS |
+| `git diff --check` | PASS |
+
+`mise run verify:bifrost` and `mise run gate` were not run. The seven journey
+lanes above are three of `verify:bifrost`'s nine lanes run directly and at the
+same scope; its remaining `integration:redux`, `integration:sql`, and
+`integration:server` lanes cover production code this change does not touch.
+The write set is test harness, tests, and the N-API testing binding only, so the
+repository aggregate adds no proof the lanes above do not already carry.

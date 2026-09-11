@@ -3,7 +3,6 @@ use wyrd_spec::card::model::{HuggingFaceTask, TfSaveFormat, TorchSaveFormat};
 
 #[cfg(feature = "python")]
 use {
-    crate::error::CardPyResult,
     crate::model::interfaces::options::{
         huggingface_task_token, parse_huggingface_task, parse_tf_save_format,
         parse_torch_save_format, tf_save_format_token, torch_save_format_token,
@@ -12,6 +11,7 @@ use {
     pyo3::types::PyDict,
     std::path::PathBuf,
     std::sync::Arc,
+    wyrd_utils::py::WyrdPyResult,
     wyrd_utils::py::module_version,
 };
 
@@ -174,7 +174,7 @@ macro_rules! impl_model_interface_methods {
                 py: Python<'_>,
                 path: PathBuf,
                 save_kwargs: Option<&Bound<'_, PyDict>>,
-            ) -> CardPyResult<()> {
+            ) -> WyrdPyResult<()> {
                 self.save_inner(py, &path, save_kwargs)
             }
 
@@ -185,7 +185,7 @@ macro_rules! impl_model_interface_methods {
                 py: Python<'_>,
                 path: PathBuf,
                 load_kwargs: Option<&Bound<'_, PyDict>>,
-            ) -> CardPyResult<()> {
+            ) -> WyrdPyResult<()> {
                 self.load_inner(py, &path, load_kwargs)
             }
         }
@@ -201,7 +201,7 @@ impl_model_interface_methods!(SklearnInterface {
         py: Python<'_>,
         model: Option<Py<PyAny>>,
         preprocessor: Option<Py<PyAny>>,
-    ) -> CardPyResult<(Self, ModelInterface)> {
+    ) -> WyrdPyResult<(Self, ModelInterface)> {
         Ok((
             Self {
                 model_subtype: model_subtype(py, model.as_ref())?,
@@ -223,7 +223,7 @@ impl_model_interface_methods!(XgboostInterface {
         py: Python<'_>,
         model: Option<Py<PyAny>>,
         preprocessor: Option<Py<PyAny>>,
-    ) -> CardPyResult<(Self, ModelInterface)> {
+    ) -> WyrdPyResult<(Self, ModelInterface)> {
         Ok((
             Self {
                 model_subtype: model_subtype(py, model.as_ref())?,
@@ -245,7 +245,7 @@ impl_model_interface_methods!(LightgbmInterface {
         py: Python<'_>,
         model: Option<Py<PyAny>>,
         preprocessor: Option<Py<PyAny>>,
-    ) -> CardPyResult<(Self, ModelInterface)> {
+    ) -> WyrdPyResult<(Self, ModelInterface)> {
         Ok((
             Self {
                 model_subtype: model_subtype(py, model.as_ref())?,
@@ -267,7 +267,7 @@ impl_model_interface_methods!(CatboostInterface {
         py: Python<'_>,
         model: Option<Py<PyAny>>,
         preprocessor: Option<Py<PyAny>>,
-    ) -> CardPyResult<(Self, ModelInterface)> {
+    ) -> WyrdPyResult<(Self, ModelInterface)> {
         Ok((
             Self {
                 model_subtype: model_subtype(py, model.as_ref())?,
@@ -290,7 +290,7 @@ impl_model_interface_methods!(TorchInterface {
         model: Option<Py<PyAny>>,
         preprocessor: Option<Py<PyAny>>,
         save_format: &str,
-    ) -> CardPyResult<(Self, ModelInterface)> {
+    ) -> WyrdPyResult<(Self, ModelInterface)> {
         Ok((
             Self {
                 model_subtype: model_subtype(py, model.as_ref())?,
@@ -320,7 +320,7 @@ impl_model_interface_methods!(LightningInterface {
         model: Option<Py<PyAny>>,
         trainer: Option<Py<PyAny>>,
         preprocessor: Option<Py<PyAny>>,
-    ) -> CardPyResult<(Self, ModelInterface)> {
+    ) -> WyrdPyResult<(Self, ModelInterface)> {
         Ok((
             Self {
                 model_subtype: model_subtype(py, model.as_ref())?,
@@ -344,7 +344,7 @@ impl_model_interface_methods!(TensorflowInterface {
         model: Option<Py<PyAny>>,
         preprocessor: Option<Py<PyAny>>,
         save_format: &str,
-    ) -> CardPyResult<(Self, ModelInterface)> {
+    ) -> WyrdPyResult<(Self, ModelInterface)> {
         Ok((
             Self {
                 model_subtype: model_subtype(py, model.as_ref())?,
@@ -376,7 +376,7 @@ impl_model_interface_methods!(HuggingfaceInterface {
         processor: Option<Py<PyAny>>,
         repo_id: Option<String>,
         revision: Option<String>,
-    ) -> CardPyResult<(Self, ModelInterface)> {
+    ) -> WyrdPyResult<(Self, ModelInterface)> {
         Ok((
             Self {
                 model_subtype: model_subtype(py, model.as_ref())?,
@@ -411,12 +411,12 @@ impl_model_interface_methods!(HuggingfaceInterface {
 });
 
 #[cfg(feature = "python")]
-fn package_version(py: Python<'_>, package: &str) -> CardPyResult<String> {
+fn package_version(py: Python<'_>, package: &str) -> WyrdPyResult<String> {
     Ok(module_version(py, package)?.unwrap_or_else(|| "unknown".to_string()))
 }
 
 #[cfg(feature = "python")]
-fn model_subtype(py: Python<'_>, model: Option<&Py<PyAny>>) -> CardPyResult<Option<String>> {
+fn model_subtype(py: Python<'_>, model: Option<&Py<PyAny>>) -> WyrdPyResult<Option<String>> {
     model
         .map(|model| crate::model::interfaces::helpers::qualname_of(py, model.bind(py)))
         .transpose()

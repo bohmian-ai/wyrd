@@ -6,7 +6,6 @@ use std::path::Path;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use wyrd_interfaces::error::CardPyResult;
 use wyrd_spec::api_version::ApiVersion;
 use wyrd_spec::card::model::{
     CustomMeta as CustomModelMeta, ModelInterface as RustModelInterface,
@@ -16,6 +15,8 @@ use wyrd_spec::envelope::{CardKind, Spec};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::metadata::{Annotations, Labels};
 use wyrd_spec::reference::CardRef;
+#[cfg(feature = "python")]
+use wyrd_utils::py::WyrdPyResult;
 
 #[cfg(feature = "python")]
 use {
@@ -25,7 +26,6 @@ use {
     pyo3::types::{PyAny, PyDict, PyType, PyTypeMethods},
     std::path::PathBuf,
     wyrd_interfaces::data::dtype::{extract_pathbuf, is_path_like},
-    wyrd_interfaces::error::WyrdPyError,
     wyrd_interfaces::model::interfaces::{
         CatboostInterface as ModelCatboostInterface,
         HuggingfaceInterface as ModelHuggingfaceInterface,
@@ -42,6 +42,7 @@ use {
     },
     wyrd_spec::envelope::Metadata as EnvelopeMetadata,
     wyrd_spec::metadata::{AnnotationKey, AnnotationValue, LabelKey, LabelValue, MetadataError},
+    wyrd_utils::py::WyrdPyError,
     wyrd_utils::py::pyobject_to_json,
 };
 
@@ -133,7 +134,7 @@ impl ModelCard {
     /// Returns a Wyrd error when local filesystem writes or JSON serialization
     /// fail.
     #[cfg(feature = "python")]
-    fn write_card_json(&self, path: &Path) -> CardPyResult<()> {
+    fn write_card_json(&self, path: &Path) -> WyrdPyResult<()> {
         write_model_card_json_file(self, path)
     }
 
@@ -141,8 +142,9 @@ impl ModelCard {
     ///
     /// # Errors
     /// Returns a Wyrd error when serialization fails.
-    pub fn model_dump_json(&self) -> CardPyResult<String> {
-        Ok(serde_json::to_string(&self.to_card_envelope())?)
+    pub fn model_dump_json(&self) -> Result<String, WyrdError> {
+        serde_json::to_string(&self.to_card_envelope())
+            .map_err(|error| wyrd_interfaces::error::json_error(&error))
     }
 
     /// Convert serialized holder metadata into the Rust card spec body.
@@ -245,7 +247,7 @@ impl ModelCardMetadata {
         signature: Option<&Bound<'_, PyAny>>,
         sample_input: Option<&Bound<'_, PyAny>>,
         card_refs: Option<&Bound<'_, PyAny>>,
-    ) -> CardPyResult<Self> {
+    ) -> WyrdPyResult<Self> {
         Ok(Self {
             interface: parse_metadata_interface(py, interface)?,
             task_type: parse_task_type(task_type)?,
@@ -259,10 +261,10 @@ impl ModelCardMetadata {
     ///
     /// # Errors
     /// Returns a Wyrd error when JSON conversion fails.
-    pub fn to_dict(&self, py: Python<'_>) -> CardPyResult<Py<PyAny>> {
+    pub fn to_dict(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
         wyrd_utils::py::json_to_pyobject(
             py,
-            &serde_json::to_value(self).map_err(|e| WyrdPyError::Io(e.to_string()))?,
+            &serde_json::to_value(self).map_err(|e| wyrd_interfaces::error::io_error(&e))?,
         )
         .map_err(Into::into)
     }
@@ -289,7 +291,7 @@ impl ModelCard {
         labels: Option<BTreeMap<String, String>>,
         annotations: Option<BTreeMap<String, String>>,
         metadata: Option<ModelCardMetadata>,
-    ) -> CardPyResult<Self> {
+    ) -> WyrdPyResult<Self> {
         let py = model_or_interface.py();
         let mut metadata = metadata.unwrap_or_default();
         let handle =
@@ -308,7 +310,9 @@ impl ModelCard {
             is_card: true,
             interface: Some(handle.into_py_any(py)?),
         };
-        card.to_model_spec_from_metadata().validate()?;
+        card.to_model_spec_from_metadata()
+            .validate()
+            .map_err(wyrd_interfaces::error::card_error)?;
         Ok(card)
     }
 
@@ -330,12 +334,14 @@ impl ModelCard {
         &mut self,
         py: Python<'_>,
         interface: &Bound<'_, PyAny>,
-    ) -> CardPyResult<()> {
+    ) -> WyrdPyResult<()> {
         let handle =
             ModelCardInput::extract_bound(interface, false)?.into_handle(py, &self.metadata)?;
         self.metadata.interface = handle.to_spec_interface(py)?;
         self.interface = Some(handle.into_py_any(py)?);
-        self.to_model_spec_from_metadata().validate()?;
+        self.to_model_spec_from_metadata()
+            .validate()
+            .map_err(wyrd_interfaces::error::card_error)?;
         Ok(())
     }
 
@@ -387,7 +393,7 @@ impl ModelCard {
     /// Returns a Wyrd validation error when identity fields fail newtype
     /// invariants.
     #[pyo3(name = "as_card_ref")]
-    pub fn as_card_ref_py(&self) -> CardPyResult<CardRefPy> {
+    pub fn as_card_ref_py(&self) -> WyrdPyResult<CardRefPy> {
         self.as_card_ref().map(CardRefPy).map_err(Into::into)
     }
 
@@ -409,7 +415,7 @@ impl ModelCard {
     /// Returns a Wyrd error when a key or value is invalid for user-authored
     /// labels.
     #[setter]
-    pub fn set_labels(&mut self, value: BTreeMap<String, String>) -> CardPyResult<()> {
+    pub fn set_labels(&mut self, value: BTreeMap<String, String>) -> WyrdPyResult<()> {
         self.labels = labels_from_user(value)?;
         Ok(())
     }
@@ -426,7 +432,7 @@ impl ModelCard {
     /// Returns a Wyrd error when a key or value is invalid for user-authored
     /// annotations.
     #[setter]
-    pub fn set_annotations(&mut self, value: BTreeMap<String, String>) -> CardPyResult<()> {
+    pub fn set_annotations(&mut self, value: BTreeMap<String, String>) -> WyrdPyResult<()> {
         self.annotations = annotations_from_user(value)?;
         Ok(())
     }
@@ -449,9 +455,11 @@ impl ModelCard {
     /// Returns a Wyrd error when the replacement metadata is not a valid
     /// `ModelSpec`.
     #[setter]
-    pub fn set_metadata(&mut self, value: ModelCardMetadata) -> CardPyResult<()> {
+    pub fn set_metadata(&mut self, value: ModelCardMetadata) -> WyrdPyResult<()> {
         self.metadata = value;
-        self.to_model_spec_from_metadata().validate()?;
+        self.to_model_spec_from_metadata()
+            .validate()
+            .map_err(wyrd_interfaces::error::card_error)?;
         Ok(())
     }
 
@@ -460,7 +468,7 @@ impl ModelCard {
     /// # Errors
     /// Returns a Python allocation error if the wrapper cannot be created.
     #[getter]
-    pub fn signature(&self, py: Python<'_>) -> CardPyResult<Py<ModelSignature>> {
+    pub fn signature(&self, py: Python<'_>) -> WyrdPyResult<Py<ModelSignature>> {
         Ok(Py::new(
             py,
             ModelSignature::from_inner(self.metadata.signature.clone()),
@@ -472,7 +480,7 @@ impl ModelCard {
     /// # Errors
     /// Returns a Python allocation error if the wrapper cannot be created.
     #[getter]
-    pub fn sample_input(&self, py: Python<'_>) -> CardPyResult<Option<Py<SampleInput>>> {
+    pub fn sample_input(&self, py: Python<'_>) -> WyrdPyResult<Option<Py<SampleInput>>> {
         self.metadata
             .sample_input
             .as_ref()
@@ -494,14 +502,18 @@ impl ModelCard {
         py: Python<'_>,
         path: PathBuf,
         save_kwargs: Option<&Bound<'_, PyDict>>,
-    ) -> CardPyResult<()> {
+    ) -> WyrdPyResult<()> {
         let interface = self.interface.as_ref().ok_or_else(|| {
-            WyrdPyError::model_validation("ModelCard interface is required for local save")
+            wyrd_interfaces::error::model_validation(
+                "ModelCard interface is required for local save",
+            )
         })?;
         let bound = interface.bind(py);
         self.metadata.interface =
             ModelInterfaceHandle::from_interface(bound)?.to_spec_interface(py)?;
-        self.to_model_spec_from_metadata().validate()?;
+        self.to_model_spec_from_metadata()
+            .validate()
+            .map_err(wyrd_interfaces::error::card_error)?;
         save_model(bound, &path, save_kwargs)?;
         self.write_card_json(&path)
     }
@@ -520,9 +532,11 @@ impl ModelCard {
         py: Python<'_>,
         path: Option<PathBuf>,
         load_kwargs: Option<&Bound<'_, PyDict>>,
-    ) -> CardPyResult<()> {
+    ) -> WyrdPyResult<()> {
         let interface = self.interface.as_ref().ok_or_else(|| {
-            WyrdPyError::model_validation("ModelCard interface is required for local load")
+            wyrd_interfaces::error::model_validation(
+                "ModelCard interface is required for local load",
+            )
         })?;
         load_model(interface.bind(py), path, load_kwargs)
     }
@@ -533,8 +547,8 @@ impl ModelCard {
     /// Returns a Wyrd error when serialization fails.
     #[wyrd_test_contract_macros::critical("python:ModelCard.model_dump_json")]
     #[pyo3(name = "model_dump_json")]
-    pub fn model_dump_json_py(&self) -> CardPyResult<String> {
-        self.model_dump_json()
+    pub fn model_dump_json_py(&self) -> WyrdPyResult<String> {
+        self.model_dump_json().map_err(Into::into)
     }
 
     /// Return a pretty JSON representation for interactive inspection.
@@ -554,7 +568,7 @@ impl ModelCard {
         py: Python<'_>,
         json_string: &str,
         interface: Option<&Bound<'_, PyAny>>,
-    ) -> CardPyResult<Self> {
+    ) -> WyrdPyResult<Self> {
         let mut card = Self::from_card_json(json_string)?;
         card.attach_model(py, interface)?;
         Ok(card)
@@ -581,7 +595,7 @@ impl ModelCard {
     /// # Errors
     /// Returns a Wyrd error when interface conversion or `ModelSpec` validation
     /// fails.
-    pub fn to_rust_card_body(&self, py: Python<'_>) -> CardPyResult<Spec> {
+    pub fn to_rust_card_body(&self, py: Python<'_>) -> WyrdPyResult<Spec> {
         Ok(Spec::Model(self.to_model_spec(py)?))
     }
 
@@ -590,7 +604,7 @@ impl ModelCard {
     /// # Errors
     /// Returns a Wyrd error when interface conversion or `ModelSpec` validation
     /// fails.
-    pub fn to_model_spec(&self, py: Python<'_>) -> CardPyResult<ModelSpec> {
+    pub fn to_model_spec(&self, py: Python<'_>) -> WyrdPyResult<ModelSpec> {
         let interface = self
             .interface
             .as_ref()
@@ -602,7 +616,8 @@ impl ModelCard {
             .unwrap_or_else(|| self.metadata.interface.clone());
 
         let spec = model_spec_from_metadata(&self.metadata, interface);
-        spec.validate()?;
+        spec.validate()
+            .map_err(wyrd_interfaces::error::card_error)?;
         Ok(spec)
     }
 
@@ -610,27 +625,32 @@ impl ModelCard {
         &mut self,
         py: Python<'_>,
         interface: Option<&Bound<'_, PyAny>>,
-    ) -> CardPyResult<()> {
+    ) -> WyrdPyResult<()> {
         if let Some(interface) = interface {
             let handle =
                 ModelCardInput::extract_bound(interface, true)?.into_handle(py, &self.metadata)?;
             self.metadata.interface = handle.to_spec_interface(py)?;
             self.interface = Some(handle.into_py_any(py)?);
-            self.to_model_spec_from_metadata().validate()?;
+            self.to_model_spec_from_metadata()
+                .validate()
+                .map_err(wyrd_interfaces::error::card_error)?;
             return Ok(());
         }
 
-        self.to_model_spec_from_metadata().validate()?;
+        self.to_model_spec_from_metadata()
+            .validate()
+            .map_err(wyrd_interfaces::error::card_error)?;
         self.interface = Some(interface_from_model_spec(py, &self.metadata.interface)?);
         Ok(())
     }
 
-    fn from_card_json(json_string: &str) -> CardPyResult<Self> {
+    fn from_card_json(json_string: &str) -> WyrdPyResult<Self> {
         if let Ok(envelope) = serde_json::from_str::<SerializedModelCardEnvelope>(json_string) {
             if envelope.api_version.as_str() != ApiVersion::V1 || envelope.kind != CardKind::Model {
-                return Err(WyrdPyError::model_validation(
+                return Err(wyrd_interfaces::error::model_validation(
                     "ModelCard JSON must use apiVersion wyrd/v1 and kind Model",
-                ));
+                )
+                .into());
             }
             return Ok(Self {
                 space: envelope
@@ -644,7 +664,7 @@ impl ModelCard {
                     .resolved_pin()
                     .map(ToString::to_string)
                     .ok_or_else(|| {
-                        WyrdPyError::model_validation(
+                        wyrd_interfaces::error::model_validation(
                             "ModelCard envelope missing resolved version pin",
                         )
                     })?,
@@ -669,9 +689,9 @@ impl ModelCard {
             });
         }
 
-        Err(WyrdPyError::model_validation(
+        Err(wyrd_interfaces::error::model_validation(
             "ModelCard JSON must use the Wyrd envelope: apiVersion wyrd/v1, kind Model, metadata, spec",
-        ))
+        ).into())
     }
 }
 
@@ -692,7 +712,7 @@ impl ModelCardInput {
     fn extract_bound(
         model_or_interface: &Bound<'_, PyAny>,
         allow_interface_class: bool,
-    ) -> CardPyResult<Self> {
+    ) -> WyrdPyResult<Self> {
         if is_path_like(model_or_interface.py(), model_or_interface)? {
             return Ok(Self::ArtifactPath(extract_pathbuf(model_or_interface)?));
         }
@@ -707,9 +727,9 @@ impl ModelCardInput {
             && interface_type.is_subclass_of::<ModelInterface>()?
         {
             if !allow_interface_class {
-                return Err(WyrdPyError::model_validation(
+                return Err(wyrd_interfaces::error::model_validation(
                     "ModelCard construction requires a raw model or initialized ModelInterface instance; pass interface classes to retrieval surfaces such as cards.get(..., interface=YourInterface)",
-                ));
+                ).into());
             }
             return Ok(Self::InterfaceClass(model_or_interface.clone().unbind()));
         }
@@ -721,7 +741,7 @@ impl ModelCardInput {
         self,
         py: Python<'_>,
         metadata: &ModelCardMetadata,
-    ) -> CardPyResult<ModelInterfaceHandle> {
+    ) -> WyrdPyResult<ModelInterfaceHandle> {
         match self {
             Self::ArtifactPath(path) => load_handle_from_artifact_path(py, &path, metadata),
             Self::Raw(model) => ModelInterfaceHandle::from_raw(py, model.bind(py)),
@@ -751,7 +771,7 @@ fn load_handle_from_artifact_path(
     py: Python<'_>,
     path: &Path,
     metadata: &ModelCardMetadata,
-) -> CardPyResult<ModelInterfaceHandle> {
+) -> WyrdPyResult<ModelInterfaceHandle> {
     let root = model_artifact_root(path);
     let interface = model_interface_for_artifact_path(py, path, metadata)?;
     let py_interface = interface_from_model_spec(py, &interface)?;
@@ -775,7 +795,7 @@ fn model_interface_for_artifact_path(
     py: Python<'_>,
     path: &Path,
     metadata: &ModelCardMetadata,
-) -> CardPyResult<RustModelInterface> {
+) -> WyrdPyResult<RustModelInterface> {
     if !is_default_custom_interface(&metadata.interface) {
         return Ok(metadata.interface.clone());
     }
@@ -813,25 +833,22 @@ fn model_interface_for_artifact_path(
     }
 
     if path.ends_with("model.joblib") || root.join("model.joblib").is_file() {
-        return Err(WyrdPyError::model_validation(
+        return Err(wyrd_interfaces::error::model_validation(
             "ModelCard path input for model.joblib requires metadata.interface because joblib artifacts are shared by Sklearn, Xgboost, Lightgbm, and Catboost",
-        ));
+        ).into());
     }
     if path.ends_with("model.safetensors") || root.join("model.safetensors").is_file() {
-        return Err(WyrdPyError::model_validation(
+        return Err(wyrd_interfaces::error::model_validation(
             "ModelCard path input for model.safetensors requires an explicit TorchInterface with an attached nn.Module; construct the interface and call load(path)",
-        ));
+        ).into());
     }
     if path.ends_with("model.ckpt") || root.join("model.ckpt").is_file() {
-        return Err(WyrdPyError::model_validation(
+        return Err(wyrd_interfaces::error::model_validation(
             "ModelCard path input for model.ckpt requires an explicit LightningInterface with an attached LightningModule class or instance; construct the interface and call load(path)",
-        ));
+        ).into());
     }
 
-    Err(WyrdPyError::unknown_model_type(
-        "path",
-        safe_path_label(path),
-    ))
+    Err(wyrd_interfaces::error::unknown_model_type("path", safe_path_label(path)).into())
 }
 
 #[cfg(feature = "python")]
@@ -908,7 +925,7 @@ fn module_version_or_unknown(py: Python<'_>, package: &str) -> String {
 fn interface_from_model_spec(
     py: Python<'_>,
     interface: &RustModelInterface,
-) -> CardPyResult<Py<PyAny>> {
+) -> WyrdPyResult<Py<PyAny>> {
     let handle = match interface {
         RustModelInterface::Sklearn(_) => {
             ModelInterfaceHandle::Sklearn(ModelSklearnInterface::from_spec_inner(interface)?)
@@ -935,16 +952,16 @@ fn interface_from_model_spec(
             ModelHuggingfaceInterface::from_spec_inner(interface)?,
         ),
         RustModelInterface::Custom(_) => {
-            return Err(WyrdPyError::model_validation(
+            return Err(wyrd_interfaces::error::model_validation(
                 "custom Python ModelInterface cannot be rebuilt from JSON without a class; pass interface=YourInterface to ModelCard.model_validate_json or cards.get",
-            ));
+            ).into());
         }
     };
     handle.into_py_any(py)
 }
 
 #[cfg(feature = "python")]
-fn labels_from_user(values: BTreeMap<String, String>) -> CardPyResult<Labels> {
+fn labels_from_user(values: BTreeMap<String, String>) -> WyrdPyResult<Labels> {
     values
         .into_iter()
         .map(|(key, value)| {
@@ -957,7 +974,7 @@ fn labels_from_user(values: BTreeMap<String, String>) -> CardPyResult<Labels> {
 }
 
 #[cfg(feature = "python")]
-fn annotations_from_user(values: BTreeMap<String, String>) -> CardPyResult<Annotations> {
+fn annotations_from_user(values: BTreeMap<String, String>) -> WyrdPyResult<Annotations> {
     values
         .into_iter()
         .map(|(key, value)| {
@@ -987,15 +1004,17 @@ fn annotations_to_strings(values: &Annotations) -> BTreeMap<String, String> {
 
 #[cfg(feature = "python")]
 fn metadata_error(error: MetadataError) -> WyrdPyError {
-    WyrdPyError::model_validation(format!(
+    wyrd_interfaces::error::model_validation(format!(
         "invalid ModelCard metadata label or annotation: {error}"
     ))
+    .into()
 }
 
 #[cfg(feature = "python")]
-fn write_model_card_json_file(card: &ModelCard, path: &std::path::Path) -> CardPyResult<()> {
+fn write_model_card_json_file(card: &ModelCard, path: &std::path::Path) -> WyrdPyResult<()> {
     wyrd_utils::json::write_json_sorted(path.join("card.json"), &card.to_card_envelope())
-        .map_err(|error| WyrdPyError::Io(error.to_string()))
+        .map_err(|error| wyrd_interfaces::error::io_error(&error))
+        .map_err(Into::into)
 }
 
 fn model_spec_from_metadata(
@@ -1029,7 +1048,7 @@ fn task_type_token(value: TaskType) -> &'static str {
 fn parse_metadata_interface(
     py: Python<'_>,
     value: Option<&Bound<'_, PyAny>>,
-) -> CardPyResult<RustModelInterface> {
+) -> WyrdPyResult<RustModelInterface> {
     let Some(value) = value else {
         return Ok(ModelCardMetadata::default().interface);
     };
@@ -1043,7 +1062,7 @@ fn parse_metadata_interface(
 }
 
 #[cfg(feature = "python")]
-fn parse_metadata_signature(value: Option<&Bound<'_, PyAny>>) -> CardPyResult<RustModelSignature> {
+fn parse_metadata_signature(value: Option<&Bound<'_, PyAny>>) -> WyrdPyResult<RustModelSignature> {
     let Some(value) = value else {
         return Ok(ModelCardMetadata::default().signature);
     };
@@ -1059,7 +1078,7 @@ fn parse_metadata_signature(value: Option<&Bound<'_, PyAny>>) -> CardPyResult<Ru
 #[cfg(feature = "python")]
 fn parse_metadata_sample_input(
     value: Option<&Bound<'_, PyAny>>,
-) -> CardPyResult<Option<RustSampleInput>> {
+) -> WyrdPyResult<Option<RustSampleInput>> {
     let Some(value) = value else {
         return Ok(None);
     };
@@ -1073,7 +1092,7 @@ fn parse_metadata_sample_input(
 }
 
 #[cfg(feature = "python")]
-fn parse_metadata_card_refs(value: Option<&Bound<'_, PyAny>>) -> CardPyResult<Vec<CardRef>> {
+fn parse_metadata_card_refs(value: Option<&Bound<'_, PyAny>>) -> WyrdPyResult<Vec<CardRef>> {
     let Some(value) = value else {
         return Ok(Vec::new());
     };

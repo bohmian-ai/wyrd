@@ -104,7 +104,7 @@ impl ResponseFormat {
     pub fn json_schema_py(
         name: String,
         schema: &pyo3::Bound<'_, pyo3::types::PyAny>,
-    ) -> wyrd_interfaces::error::CardPyResult<Self> {
+    ) -> wyrd_utils::py::WyrdPyResult<Self> {
         let value = crate::coerce::schema_from_py(schema)?;
         Ok(Self::json_schema(name, value)?)
     }
@@ -113,7 +113,7 @@ impl ResponseFormat {
     pub fn to_dict(
         &self,
         py: pyo3::Python<'_>,
-    ) -> wyrd_interfaces::error::CardPyResult<pyo3::Py<pyo3::PyAny>> {
+    ) -> wyrd_utils::py::WyrdPyResult<pyo3::Py<pyo3::PyAny>> {
         let value = match &self.kind {
             ResponseFormatKind::Text => serde_json::json!({ "type": "text" }),
             ResponseFormatKind::JsonObject => serde_json::json!({ "type": "json_object" }),

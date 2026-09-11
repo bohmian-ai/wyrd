@@ -7,11 +7,11 @@ use wyrd_spec::card::model::{
 #[cfg(feature = "python")]
 use {
     crate::data::dtype::is_framework_class,
-    crate::error::{CardPyResult, WyrdPyError},
     crate::model::interfaces::options::{parse_sample_input_kind, sample_input_kind_token},
     pyo3::prelude::*,
     pyo3::types::{PyAny, PyDict, PyList, PyModule, PyString, PyTuple, PyType},
     std::{fs, path::Path, path::PathBuf},
+    wyrd_utils::py::WyrdPyResult,
     wyrd_utils::py::{json_to_pyobject, pyobject_to_json},
 };
 
@@ -61,7 +61,7 @@ impl SampleInput {
     /// Returns a Wyrd Python-boundary error when the object shape is not a
     /// supported sample input kind.
     #[cfg(feature = "python")]
-    pub fn from_python_object(py: Python<'_>, obj: &Bound<'_, PyAny>) -> CardPyResult<Self> {
+    pub fn from_python_object(py: Python<'_>, obj: &Bound<'_, PyAny>) -> WyrdPyResult<Self> {
         if obj.is_none() {
             return Ok(Self {
                 kind: SampleInputKindSpec::None,
@@ -81,7 +81,7 @@ impl SampleInput {
     /// Create a sample input shell from an explicit kind token.
     #[new]
     #[pyo3(signature = (*, kind="none", value=None))]
-    fn __new__(kind: &str, value: Option<Py<PyAny>>) -> CardPyResult<Self> {
+    fn __new__(kind: &str, value: Option<Py<PyAny>>) -> WyrdPyResult<Self> {
         Ok(Self {
             kind: parse_sample_input_kind(kind)?,
             py_obj: value,
@@ -101,7 +101,7 @@ impl SampleInput {
     }
 
     /// Return the Rust metadata representation as a Python dictionary.
-    fn to_dict(&self, py: Python<'_>) -> CardPyResult<Py<PyAny>> {
+    fn to_dict(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
         Ok(json_to_pyobject(
             py,
             &serde_json::to_value(self.to_rust())?,
@@ -115,7 +115,7 @@ impl SampleInput {
         _cls: &Bound<'_, PyType>,
         py: Python<'_>,
         value: &Bound<'_, PyAny>,
-    ) -> CardPyResult<Self> {
+    ) -> WyrdPyResult<Self> {
         Self::from_python_object(py, value)
     }
 
@@ -128,7 +128,7 @@ impl SampleInput {
         py: Python<'_>,
         path: PathBuf,
         save_kwargs: Option<&Bound<'_, PyDict>>,
-    ) -> CardPyResult<()> {
+    ) -> WyrdPyResult<()> {
         let _ = save_kwargs;
         let value = self.py_obj.as_ref().map(|obj| obj.bind(py));
         write_to(py, &path, self.kind, value)
@@ -143,7 +143,7 @@ impl SampleInput {
         py: Python<'_>,
         path: PathBuf,
         load_kwargs: Option<&Bound<'_, PyDict>>,
-    ) -> CardPyResult<()> {
+    ) -> WyrdPyResult<()> {
         let _ = load_kwargs;
         self.py_obj = read_from(py, &path, self.kind)?;
         Ok(())
@@ -158,7 +158,7 @@ pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
 }
 
 #[cfg(feature = "python")]
-fn classify(py: Python<'_>, obj: &Bound<'_, PyAny>) -> CardPyResult<SampleInputKindSpec> {
+fn classify(py: Python<'_>, obj: &Bound<'_, PyAny>) -> WyrdPyResult<SampleInputKindSpec> {
     if is_framework_class(py, obj, "pandas", "DataFrame")? {
         return Ok(SampleInputKindSpec::Pandas);
     }
@@ -190,10 +190,10 @@ fn classify(py: Python<'_>, obj: &Bound<'_, PyAny>) -> CardPyResult<SampleInputK
         return Ok(SampleInputKindSpec::Str);
     }
     let type_name: String = obj.get_type().getattr("__qualname__")?.extract()?;
-    Err(WyrdPyError::model_validation_with_details(
+    Err(crate::error::model_validation_with_details(
         "unsupported sample input shape; pass a DataFrame, Table, ndarray, tensor, dict, list, tuple, str, or None",
         serde_json::json!({ "kind": type_name }),
-    ))
+    ).into())
 }
 
 #[cfg(feature = "python")]
@@ -202,12 +202,13 @@ fn write_to(
     path: &Path,
     kind: SampleInputKindSpec,
     py_obj: Option<&Bound<'_, PyAny>>,
-) -> CardPyResult<()> {
+) -> WyrdPyResult<()> {
     match (kind, py_obj) {
         (SampleInputKindSpec::None, _) => Ok(()),
-        (_, None) => Err(WyrdPyError::model_validation(format!(
+        (_, None) => Err(crate::error::model_validation(format!(
             "SampleInput kind {kind:?} requires a Python object at save time"
-        ))),
+        ))
+        .into()),
         (SampleInputKindSpec::Pandas, Some(obj)) => write_pandas(py, path, obj),
         (SampleInputKindSpec::Polars, Some(obj)) => write_polars(path, obj),
         (SampleInputKindSpec::Arrow, Some(obj)) => write_arrow(py, path, obj),
@@ -223,7 +224,7 @@ fn write_to(
 }
 
 #[cfg(feature = "python")]
-fn write_pandas(py: Python<'_>, path: &Path, obj: &Bound<'_, PyAny>) -> CardPyResult<()> {
+fn write_pandas(py: Python<'_>, path: &Path, obj: &Bound<'_, PyAny>) -> WyrdPyResult<()> {
     let target = sample_path(path, SampleInputKindSpec::Pandas)?;
     let kwargs = PyDict::new(py);
     kwargs.set_item("compression", "snappy")?;
@@ -232,28 +233,28 @@ fn write_pandas(py: Python<'_>, path: &Path, obj: &Bound<'_, PyAny>) -> CardPyRe
 }
 
 #[cfg(feature = "python")]
-fn write_polars(path: &Path, obj: &Bound<'_, PyAny>) -> CardPyResult<()> {
+fn write_polars(path: &Path, obj: &Bound<'_, PyAny>) -> WyrdPyResult<()> {
     let target = sample_path(path, SampleInputKindSpec::Polars)?;
     obj.call_method1("write_parquet", (target_path_str(&target)?,))?;
     Ok(())
 }
 
 #[cfg(feature = "python")]
-fn write_arrow(py: Python<'_>, path: &Path, obj: &Bound<'_, PyAny>) -> CardPyResult<()> {
+fn write_arrow(py: Python<'_>, path: &Path, obj: &Bound<'_, PyAny>) -> WyrdPyResult<()> {
     let target = sample_path(path, SampleInputKindSpec::Arrow)?;
     let parquet = py
         .import("pyarrow.parquet")
-        .map_err(|error| WyrdPyError::serializer_unavailable(&format!("wyrd[arrow]: {error}")))?;
+        .map_err(|error| crate::error::serializer_unavailable(&format!("wyrd[arrow]: {error}")))?;
     parquet.call_method1("write_table", (obj.clone(), target_path_str(&target)?))?;
     Ok(())
 }
 
 #[cfg(feature = "python")]
-fn write_numpy(py: Python<'_>, path: &Path, obj: &Bound<'_, PyAny>) -> CardPyResult<()> {
+fn write_numpy(py: Python<'_>, path: &Path, obj: &Bound<'_, PyAny>) -> WyrdPyResult<()> {
     let target = sample_path(path, SampleInputKindSpec::Numpy)?;
     let numpy = py
         .import("numpy")
-        .map_err(|error| WyrdPyError::serializer_unavailable(&format!("wyrd[numpy]: {error}")))?;
+        .map_err(|error| crate::error::serializer_unavailable(&format!("wyrd[numpy]: {error}")))?;
     let kwargs = PyDict::new(py);
     kwargs.set_item("allow_pickle", false)?;
     numpy
@@ -263,11 +264,11 @@ fn write_numpy(py: Python<'_>, path: &Path, obj: &Bound<'_, PyAny>) -> CardPyRes
 }
 
 #[cfg(feature = "python")]
-fn write_torch(py: Python<'_>, path: &Path, obj: &Bound<'_, PyAny>) -> CardPyResult<()> {
+fn write_torch(py: Python<'_>, path: &Path, obj: &Bound<'_, PyAny>) -> WyrdPyResult<()> {
     let target = sample_path(path, SampleInputKindSpec::Torch)?;
     let safetensors = py
         .import("safetensors.torch")
-        .map_err(|error| WyrdPyError::serializer_unavailable(&format!("wyrd[torch]: {error}")))?;
+        .map_err(|error| crate::error::serializer_unavailable(&format!("wyrd[torch]: {error}")))?;
     let tensors = PyDict::new(py);
     tensors.set_item("sample", obj.clone())?;
     safetensors
@@ -277,10 +278,10 @@ fn write_torch(py: Python<'_>, path: &Path, obj: &Bound<'_, PyAny>) -> CardPyRes
 }
 
 #[cfg(feature = "python")]
-fn write_tf(py: Python<'_>, path: &Path, obj: &Bound<'_, PyAny>) -> CardPyResult<()> {
+fn write_tf(py: Python<'_>, path: &Path, obj: &Bound<'_, PyAny>) -> WyrdPyResult<()> {
     let target = sample_path(path, SampleInputKindSpec::Tf)?;
     let numpy = py.import("numpy").map_err(|error| {
-        WyrdPyError::serializer_unavailable(&format!("wyrd[tensorflow]: {error}"))
+        crate::error::serializer_unavailable(&format!("wyrd[tensorflow]: {error}"))
     })?;
     let value = obj.call_method0("numpy")?;
     let kwargs = PyDict::new(py);
@@ -292,7 +293,7 @@ fn write_tf(py: Python<'_>, path: &Path, obj: &Bound<'_, PyAny>) -> CardPyResult
 }
 
 #[cfg(feature = "python")]
-fn write_json(path: &Path, obj: &Bound<'_, PyAny>) -> CardPyResult<()> {
+fn write_json(path: &Path, obj: &Bound<'_, PyAny>) -> WyrdPyResult<()> {
     let target = sample_path(path, SampleInputKindSpec::Dict)?;
     let value = pyobject_to_json(obj)?;
     fs::write(target, serde_json::to_vec_pretty(&value)?)?;
@@ -300,7 +301,7 @@ fn write_json(path: &Path, obj: &Bound<'_, PyAny>) -> CardPyResult<()> {
 }
 
 #[cfg(feature = "python")]
-fn write_str(path: &Path, obj: &Bound<'_, PyAny>) -> CardPyResult<()> {
+fn write_str(path: &Path, obj: &Bound<'_, PyAny>) -> WyrdPyResult<()> {
     let target = sample_path(path, SampleInputKindSpec::Str)?;
     fs::write(target, obj.extract::<String>()?)?;
     Ok(())
@@ -311,7 +312,7 @@ fn read_from(
     py: Python<'_>,
     path: &Path,
     kind: SampleInputKindSpec,
-) -> CardPyResult<Option<Py<PyAny>>> {
+) -> WyrdPyResult<Option<Py<PyAny>>> {
     let value = match kind {
         SampleInputKindSpec::None => return Ok(None),
         SampleInputKindSpec::Pandas => read_pandas(py, path)?,
@@ -327,10 +328,10 @@ fn read_from(
 }
 
 #[cfg(feature = "python")]
-fn read_pandas<'py>(py: Python<'py>, path: &Path) -> CardPyResult<Bound<'py, PyAny>> {
+fn read_pandas<'py>(py: Python<'py>, path: &Path) -> WyrdPyResult<Bound<'py, PyAny>> {
     let pandas = py
         .import("pandas")
-        .map_err(|error| WyrdPyError::serializer_unavailable(&format!("wyrd[pandas]: {error}")))?;
+        .map_err(|error| crate::error::serializer_unavailable(&format!("wyrd[pandas]: {error}")))?;
     let target = sample_path(path, SampleInputKindSpec::Pandas)?;
     Ok(pandas
         .getattr("read_parquet")?
@@ -338,10 +339,10 @@ fn read_pandas<'py>(py: Python<'py>, path: &Path) -> CardPyResult<Bound<'py, PyA
 }
 
 #[cfg(feature = "python")]
-fn read_polars<'py>(py: Python<'py>, path: &Path) -> CardPyResult<Bound<'py, PyAny>> {
+fn read_polars<'py>(py: Python<'py>, path: &Path) -> WyrdPyResult<Bound<'py, PyAny>> {
     let polars = py
         .import("polars")
-        .map_err(|error| WyrdPyError::serializer_unavailable(&format!("wyrd[polars]: {error}")))?;
+        .map_err(|error| crate::error::serializer_unavailable(&format!("wyrd[polars]: {error}")))?;
     let target = sample_path(path, SampleInputKindSpec::Polars)?;
     Ok(polars
         .getattr("read_parquet")?
@@ -349,10 +350,10 @@ fn read_polars<'py>(py: Python<'py>, path: &Path) -> CardPyResult<Bound<'py, PyA
 }
 
 #[cfg(feature = "python")]
-fn read_arrow<'py>(py: Python<'py>, path: &Path) -> CardPyResult<Bound<'py, PyAny>> {
+fn read_arrow<'py>(py: Python<'py>, path: &Path) -> WyrdPyResult<Bound<'py, PyAny>> {
     let parquet = py
         .import("pyarrow.parquet")
-        .map_err(|error| WyrdPyError::serializer_unavailable(&format!("wyrd[arrow]: {error}")))?;
+        .map_err(|error| crate::error::serializer_unavailable(&format!("wyrd[arrow]: {error}")))?;
     let target = sample_path(path, SampleInputKindSpec::Arrow)?;
     Ok(parquet
         .getattr("read_table")?
@@ -360,10 +361,10 @@ fn read_arrow<'py>(py: Python<'py>, path: &Path) -> CardPyResult<Bound<'py, PyAn
 }
 
 #[cfg(feature = "python")]
-fn read_numpy<'py>(py: Python<'py>, path: &Path) -> CardPyResult<Bound<'py, PyAny>> {
+fn read_numpy<'py>(py: Python<'py>, path: &Path) -> WyrdPyResult<Bound<'py, PyAny>> {
     let numpy = py
         .import("numpy")
-        .map_err(|error| WyrdPyError::serializer_unavailable(&format!("wyrd[numpy]: {error}")))?;
+        .map_err(|error| crate::error::serializer_unavailable(&format!("wyrd[numpy]: {error}")))?;
     let target = sample_path(path, SampleInputKindSpec::Numpy)?;
     let kwargs = PyDict::new(py);
     kwargs.set_item("allow_pickle", false)?;
@@ -373,10 +374,10 @@ fn read_numpy<'py>(py: Python<'py>, path: &Path) -> CardPyResult<Bound<'py, PyAn
 }
 
 #[cfg(feature = "python")]
-fn read_torch<'py>(py: Python<'py>, path: &Path) -> CardPyResult<Bound<'py, PyAny>> {
+fn read_torch<'py>(py: Python<'py>, path: &Path) -> WyrdPyResult<Bound<'py, PyAny>> {
     let safetensors = py
         .import("safetensors.torch")
-        .map_err(|error| WyrdPyError::serializer_unavailable(&format!("wyrd[torch]: {error}")))?;
+        .map_err(|error| crate::error::serializer_unavailable(&format!("wyrd[torch]: {error}")))?;
     let target = sample_path(path, SampleInputKindSpec::Torch)?;
     let values = safetensors
         .getattr("load_file")?
@@ -385,35 +386,36 @@ fn read_torch<'py>(py: Python<'py>, path: &Path) -> CardPyResult<Bound<'py, PyAn
 }
 
 #[cfg(feature = "python")]
-fn read_json<'py>(py: Python<'py>, path: &Path) -> CardPyResult<Bound<'py, PyAny>> {
+fn read_json<'py>(py: Python<'py>, path: &Path) -> WyrdPyResult<Bound<'py, PyAny>> {
     let target = sample_path(path, SampleInputKindSpec::Dict)?;
     let value = serde_json::from_slice(&fs::read(target)?)?;
     Ok(json_to_pyobject(py, &value)?.into_bound(py))
 }
 
 #[cfg(feature = "python")]
-fn read_tuple<'py>(py: Python<'py>, path: &Path) -> CardPyResult<Bound<'py, PyAny>> {
+fn read_tuple<'py>(py: Python<'py>, path: &Path) -> WyrdPyResult<Bound<'py, PyAny>> {
     let value = read_json(py, path)?;
     Ok(py.import("builtins")?.getattr("tuple")?.call1((value,))?)
 }
 
 #[cfg(feature = "python")]
-fn read_str<'py>(py: Python<'py>, path: &Path) -> CardPyResult<Bound<'py, PyAny>> {
+fn read_str<'py>(py: Python<'py>, path: &Path) -> WyrdPyResult<Bound<'py, PyAny>> {
     let target = sample_path(path, SampleInputKindSpec::Str)?;
     Ok(PyString::new(py, &fs::read_to_string(target)?).into_any())
 }
 
 #[cfg(feature = "python")]
-fn sample_path(path: &Path, kind: SampleInputKindSpec) -> CardPyResult<PathBuf> {
+fn sample_path(path: &Path, kind: SampleInputKindSpec) -> WyrdPyResult<PathBuf> {
     fs::create_dir_all(path)?;
     Ok(path.join(sample_input_filename(kind)))
 }
 
 #[cfg(feature = "python")]
-fn target_path_str(path: &Path) -> CardPyResult<String> {
+fn target_path_str(path: &Path) -> WyrdPyResult<String> {
     path.to_str()
         .map(str::to_string)
-        .ok_or_else(|| WyrdPyError::model_validation("sample input path is not valid UTF-8"))
+        .ok_or_else(|| crate::error::model_validation("sample input path is not valid UTF-8"))
+        .map_err(Into::into)
 }
 
 #[cfg(feature = "python")]

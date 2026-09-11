@@ -125,7 +125,7 @@ impl PyMediaRef {
 
     /// Construct an image reference by eagerly reading a local path.
     #[staticmethod]
-    pub fn image_path(path: std::path::PathBuf) -> wyrd_interfaces::error::CardPyResult<Self> {
+    pub fn image_path(path: std::path::PathBuf) -> wyrd_utils::py::WyrdPyResult<Self> {
         Ok(Self::from_native(
             image_path(path).map_err(crate::error::PromptBuilderError::from)?,
         ))
@@ -162,7 +162,7 @@ impl PyMediaRef {
 
     /// Construct a document reference by eagerly reading a local path.
     #[staticmethod]
-    pub fn document_path(path: std::path::PathBuf) -> wyrd_interfaces::error::CardPyResult<Self> {
+    pub fn document_path(path: std::path::PathBuf) -> wyrd_utils::py::WyrdPyResult<Self> {
         Ok(Self::from_native(
             document_path(path).map_err(crate::error::PromptBuilderError::from)?,
         ))

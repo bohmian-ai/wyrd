@@ -4,9 +4,9 @@ use wyrd_spec::card::data::DataStats;
 
 #[cfg(feature = "python")]
 use {
-    crate::error::CardPyResult,
     pyo3::prelude::*,
     pyo3::types::{PyAny, PyModule},
+    wyrd_utils::py::WyrdPyResult,
     wyrd_utils::py::json_to_pyobject,
 };
 
@@ -91,7 +91,7 @@ impl PyDataStats {
         self.inner.sha256.clone()
     }
 
-    fn to_dict(&self, py: Python<'_>) -> CardPyResult<Py<PyAny>> {
+    fn to_dict(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
         Ok(json_to_pyobject(py, &serde_json::to_value(&self.inner)?)?)
     }
 }

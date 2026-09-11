@@ -1,6 +1,7 @@
 use crate::data::interfaces::DataInterface;
-use crate::error::CardPyResult;
 use wyrd_spec::reference::CardRef;
+#[cfg(feature = "python")]
+use wyrd_utils::py::WyrdPyResult;
 
 #[cfg(feature = "python")]
 use {
@@ -193,7 +194,7 @@ macro_rules! impl_interface_methods {
             ///
             /// Returns a Wyrd data validation error when interface options such
             /// as compression, serialization format, or color mode are invalid.
-            fn to_dict<'py>(&self, py: Python<'py>) -> CardPyResult<Bound<'py, PyDict>> {
+            fn to_dict<'py>(&self, py: Python<'py>) -> WyrdPyResult<Bound<'py, PyDict>> {
                 interface_to_dict(py, self.to_spec_interface(py)?)
             }
 
@@ -230,7 +231,7 @@ macro_rules! impl_interface_methods {
                 py: Python<'_>,
                 path: PathBuf,
                 save_kwargs: Option<&Bound<'_, PyDict>>,
-            ) -> CardPyResult<PyDataStats> {
+            ) -> WyrdPyResult<PyDataStats> {
                 self.save_inner(py, &path, save_kwargs).map(PyDataStats::from)
             }
 
@@ -260,7 +261,7 @@ macro_rules! impl_interface_methods {
                 py: Python<'_>,
                 path: PathBuf,
                 load_kwargs: Option<&Bound<'_, PyDict>>,
-            ) -> CardPyResult<()> {
+            ) -> WyrdPyResult<()> {
                 self.load_inner(py, &path, load_kwargs)
             }
         }
@@ -282,7 +283,7 @@ impl_interface_methods!(PandasInterface {
     /// A pandas interface with kind `Pandas`.
     #[new]
     #[pyo3(signature = (*, data=None, compression="snappy"))]
-    fn __new__(data: Option<Py<PyAny>>, compression: &str) -> CardPyResult<(Self, DataInterface)> {
+    fn __new__(data: Option<Py<PyAny>>, compression: &str) -> WyrdPyResult<(Self, DataInterface)> {
         parse_parquet_compression(compression)?;
         Ok((
             Self {
@@ -309,7 +310,7 @@ impl_interface_methods!(PolarsInterface {
     /// A polars interface with kind `Polars`.
     #[new]
     #[pyo3(signature = (*, data=None, compression="snappy"))]
-    fn __new__(data: Option<Py<PyAny>>, compression: &str) -> CardPyResult<(Self, DataInterface)> {
+    fn __new__(data: Option<Py<PyAny>>, compression: &str) -> WyrdPyResult<(Self, DataInterface)> {
         parse_parquet_compression(compression)?;
         Ok((
             Self {
@@ -336,7 +337,7 @@ impl_interface_methods!(ArrowInterface {
     /// An Arrow interface with kind `Arrow`.
     #[new]
     #[pyo3(signature = (*, data=None, format="parquet"))]
-    fn __new__(data: Option<Py<PyAny>>, format: &str) -> CardPyResult<(Self, DataInterface)> {
+    fn __new__(data: Option<Py<PyAny>>, format: &str) -> WyrdPyResult<(Self, DataInterface)> {
         parse_arrow_format(format)?;
         Ok((
             Self {
@@ -368,7 +369,7 @@ impl_interface_methods!(ParquetInterface {
         data: Option<Py<PyAny>>,
         compression: &str,
         row_group_size: Option<u32>,
-    ) -> CardPyResult<(Self, DataInterface)> {
+    ) -> WyrdPyResult<(Self, DataInterface)> {
         parse_parquet_compression(compression)?;
         Ok((
             Self {
@@ -404,7 +405,7 @@ impl_interface_methods!(NumpyInterface {
         dtype: Option<String>,
         shape: Option<Vec<i64>>,
         format: &str,
-    ) -> CardPyResult<(Self, DataInterface)> {
+    ) -> WyrdPyResult<(Self, DataInterface)> {
         parse_numpy_format(format)?;
         Ok((
             Self {
@@ -434,7 +435,7 @@ impl_interface_methods!(TorchInterface {
     /// A Torch interface with kind `Torch`.
     #[new]
     #[pyo3(signature = (*, data=None, save_format="safetensors"))]
-    fn __new__(data: Option<Py<PyAny>>, save_format: &str) -> CardPyResult<(Self, DataInterface)> {
+    fn __new__(data: Option<Py<PyAny>>, save_format: &str) -> WyrdPyResult<(Self, DataInterface)> {
         parse_torch_save_format(save_format)?;
         Ok((
             Self {
@@ -465,7 +466,7 @@ impl_interface_methods!(SqlInterface {
         data: Option<Py<PyAny>>,
         dialect: &str,
         connection_hint: Option<String>,
-    ) -> CardPyResult<(Self, DataInterface)> {
+    ) -> WyrdPyResult<(Self, DataInterface)> {
         let dialect = parse_sql_dialect(dialect)?;
         Ok((
             Self {
@@ -498,7 +499,7 @@ impl_interface_methods!(JsonlInterface {
         data: Option<Py<PyAny>>,
         compression: &str,
         lines_per_file: Option<u64>,
-    ) -> CardPyResult<(Self, DataInterface)> {
+    ) -> WyrdPyResult<(Self, DataInterface)> {
         parse_jsonl_compression(compression)?;
         Ok((
             Self {
@@ -539,7 +540,7 @@ impl_interface_methods!(ImageInterface {
         format: &str,
         color_mode: &str,
         manifest_ref: Option<&Bound<'_, PyAny>>,
-    ) -> CardPyResult<(Self, DataInterface)> {
+    ) -> WyrdPyResult<(Self, DataInterface)> {
         parse_image_format(format)?;
         parse_color_mode(color_mode)?;
         Ok((
@@ -578,7 +579,7 @@ impl_interface_methods!(TextInterface {
         data: Option<Py<PyAny>>,
         encoding: &str,
         manifest_ref: Option<&Bound<'_, PyAny>>,
-    ) -> CardPyResult<(Self, DataInterface)> {
+    ) -> WyrdPyResult<(Self, DataInterface)> {
         Ok((
             Self {
                 data: shared_py(data),
@@ -615,17 +616,17 @@ impl_interface_methods!(HuggingfaceInterface {
         revision: Option<String>,
         split: Option<String>,
         config: Option<String>,
-    ) -> CardPyResult<(Self, DataInterface)> {
+    ) -> WyrdPyResult<(Self, DataInterface)> {
         if let Some(revision) = revision.as_deref()
             && (!(7..=40).contains(&revision.len())
                 || !revision
                     .chars()
                     .all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase()))
         {
-            return Err(crate::error::WyrdPyError::validation_with_details(
+            return Err(crate::error::validation_with_details(
                 "Huggingface revision must be a lowercase hex string between 7 and 40 characters",
                 serde_json::json!({ "revision": revision }),
-            ));
+            ).into());
         }
         Ok((
             Self {

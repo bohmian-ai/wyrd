@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use wyrd_spec::error::WyrdError;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -9,7 +10,8 @@ use wyrd_spec::card::data::{ColorMode, DataSchema, ImageFormat, JsonlCompression
 use wyrd_spec::card::field::FieldSpec;
 use wyrd_spec::ids::ColumnName;
 
-use crate::error::{CardPyResult, WyrdPyError};
+#[cfg(feature = "python")]
+use wyrd_utils::py::WyrdPyResult;
 
 #[cfg(feature = "python")]
 use {
@@ -101,14 +103,14 @@ pub fn huggingface_pointer(
 ///
 /// # Errors
 /// Returns an error when the file cannot be read or does not match the pointer shape.
-pub fn read_huggingface_pointer(path: &Path) -> CardPyResult<HuggingfacePointer> {
-    wyrd_utils::fs::require_local_file(path).map_err(|error| WyrdPyError::Io(error.to_string()))?;
-    let contents = fs::read_to_string(path)?;
-    Ok(serde_json::from_str(&contents)?)
+pub fn read_huggingface_pointer(path: &Path) -> Result<HuggingfacePointer, WyrdError> {
+    wyrd_utils::fs::require_local_file(path).map_err(|error| crate::error::io_error(&error))?;
+    let contents = fs::read_to_string(path).map_err(|error| crate::error::io_error(&error))?;
+    serde_json::from_str(&contents).map_err(|error| crate::error::json_error(&error))
 }
 
 /// Return the fixed image manifest schema.
-pub fn image_manifest_schema() -> CardPyResult<DataSchema> {
+pub fn image_manifest_schema() -> Result<DataSchema, WyrdError> {
     Ok(DataSchema::new(vec![
         field("path", "utf8")?,
         field("format", "utf8")?,
@@ -117,7 +119,7 @@ pub fn image_manifest_schema() -> CardPyResult<DataSchema> {
 }
 
 /// Return the fixed text manifest schema.
-pub fn text_manifest_schema() -> CardPyResult<DataSchema> {
+pub fn text_manifest_schema() -> Result<DataSchema, WyrdError> {
     Ok(DataSchema::new(vec![
         field("path", "utf8")?,
         field("encoding", "utf8")?,
@@ -134,11 +136,11 @@ pub fn write_jsonl_normalized(
     data: &Bound<'_, PyAny>,
     path: &Path,
     compression: JsonlCompression,
-) -> CardPyResult<()> {
+) -> WyrdPyResult<()> {
     let bytes = if crate::data::dtype::is_path_like(py, data)? {
         let source = crate::data::dtype::extract_pathbuf(data)?;
         wyrd_utils::fs::require_local_file(&source)
-            .map_err(|error| WyrdPyError::Io(error.to_string()))?;
+            .map_err(|error| crate::error::io_error(&error))?;
         // BLOCKING: synchronous filesystem I/O; do not call from an async executor
         // without tokio::task::spawn_blocking.
         let source_bytes = fs::read(&source)?;
@@ -176,8 +178,8 @@ pub fn read_jsonl_to_py<'py>(
     path: &Path,
     compression: Option<&str>,
     _load_kwargs: Option<&Bound<'_, PyDict>>,
-) -> CardPyResult<Bound<'py, PyAny>> {
-    wyrd_utils::fs::require_local_file(path).map_err(|error| WyrdPyError::Io(error.to_string()))?;
+) -> WyrdPyResult<Bound<'py, PyAny>> {
+    wyrd_utils::fs::require_local_file(path).map_err(|error| crate::error::io_error(&error))?;
     // BLOCKING: synchronous filesystem I/O; do not call from an async executor
     // without tokio::task::spawn_blocking.
     let bytes = fs::read(path)?;
@@ -187,8 +189,7 @@ pub fn read_jsonl_to_py<'py>(
         .or_else(|| compression_from_path(path))
         .unwrap_or(JsonlCompression::None);
     let decoded = decode_jsonl_bytes(&bytes, compression)?;
-    let contents =
-        String::from_utf8(decoded).map_err(|error| WyrdPyError::Json(error.to_string()))?;
+    let contents = String::from_utf8(decoded).map_err(|error| crate::error::json_error(&error))?;
     let mut values = Vec::new();
     for line in contents.lines().filter(|line| !line.trim().is_empty()) {
         values.push(serde_json::from_str::<Value>(line)?);
@@ -206,7 +207,7 @@ pub fn image_manifest_from_data(
     data: &Bound<'_, PyAny>,
     format: ImageFormat,
     color_mode: ColorMode,
-) -> CardPyResult<ImageManifest> {
+) -> WyrdPyResult<ImageManifest> {
     Ok(ImageManifest {
         files: manifest_entries_from_data(py, data)?,
         format,
@@ -223,7 +224,7 @@ pub fn text_manifest_from_data(
     py: Python<'_>,
     data: &Bound<'_, PyAny>,
     encoding: &str,
-) -> CardPyResult<TextManifest> {
+) -> WyrdPyResult<TextManifest> {
     Ok(TextManifest {
         files: manifest_entries_from_data(py, data)?,
         encoding: encoding.to_string(),
@@ -235,7 +236,7 @@ pub fn text_manifest_from_data(
 ///
 /// # Errors
 /// Returns an error when the file cannot be read or parsed as JSON.
-pub fn manifest_json_to_py<'py>(py: Python<'py>, path: &Path) -> CardPyResult<Bound<'py, PyAny>> {
+pub fn manifest_json_to_py<'py>(py: Python<'py>, path: &Path) -> WyrdPyResult<Bound<'py, PyAny>> {
     serde_json_file_to_py(py, path)
 }
 
@@ -244,7 +245,7 @@ pub fn manifest_json_to_py<'py>(py: Python<'py>, path: &Path) -> CardPyResult<Bo
 ///
 /// # Errors
 /// Returns a validation error when query keys or values are invalid.
-pub fn sql_logic_from_data(py: Python<'_>, data: Option<&Py<PyAny>>) -> CardPyResult<SqlLogic> {
+pub fn sql_logic_from_data(py: Python<'_>, data: Option<&Py<PyAny>>) -> WyrdPyResult<SqlLogic> {
     let Some(data) = data else {
         return Ok(SqlLogic {
             queries: HashMap::new(),
@@ -261,8 +262,8 @@ pub fn sql_logic_from_data(py: Python<'_>, data: Option<&Py<PyAny>>) -> CardPyRe
 ///
 /// # Errors
 /// Returns an error when the file cannot be read or parsed as JSON.
-pub fn serde_json_file_to_py<'py>(py: Python<'py>, path: &Path) -> CardPyResult<Bound<'py, PyAny>> {
-    wyrd_utils::fs::require_local_file(path).map_err(|error| WyrdPyError::Io(error.to_string()))?;
+pub fn serde_json_file_to_py<'py>(py: Python<'py>, path: &Path) -> WyrdPyResult<Bound<'py, PyAny>> {
+    wyrd_utils::fs::require_local_file(path).map_err(|error| crate::error::io_error(&error))?;
     let contents = fs::read_to_string(path)?;
     let value = serde_json::from_str::<Value>(&contents)?;
     Ok(wyrd_utils::py::json_to_pyobject(py, &value)?.into_bound(py))
@@ -276,7 +277,7 @@ pub fn serde_json_file_to_py<'py>(py: Python<'py>, path: &Path) -> CardPyResult<
 pub fn pointer_to_kwargs(
     py: Python<'_>,
     pointer: HuggingfacePointer,
-) -> CardPyResult<Bound<'_, PyDict>> {
+) -> WyrdPyResult<Bound<'_, PyDict>> {
     let kwargs = PyDict::new(py);
     kwargs.set_item("path", pointer.dataset_id)?;
     kwargs.set_item("revision", pointer.revision)?;
@@ -294,12 +295,10 @@ pub fn pointer_to_kwargs(
 ///
 /// # Errors
 /// Returns a validation error when the value is not a JSON object.
-pub fn py_json_to_value_map(value: &Bound<'_, PyAny>) -> CardPyResult<BTreeMap<String, Value>> {
+pub fn py_json_to_value_map(value: &Bound<'_, PyAny>) -> WyrdPyResult<BTreeMap<String, Value>> {
     match wyrd_utils::py::pyobject_to_json(value)? {
         Value::Object(values) => Ok(values.into_iter().collect()),
-        _ => Err(WyrdPyError::validation(
-            "expected a JSON object with string keys",
-        )),
+        _ => Err(crate::error::validation("expected a JSON object with string keys").into()),
     }
 }
 
@@ -312,7 +311,7 @@ pub fn save_data(
     interface: &Bound<'_, PyAny>,
     path: &Path,
     save_kwargs: Option<&Bound<'_, PyDict>>,
-) -> CardPyResult<DataStats> {
+) -> WyrdPyResult<DataStats> {
     let stats = interface.call_method("save", (path.to_path_buf(), save_kwargs), None)?;
     Ok(stats
         .extract::<PyRef<'_, PyDataStats>>()?
@@ -329,15 +328,15 @@ pub fn load_data(
     interface: &Bound<'_, PyAny>,
     path: Option<PathBuf>,
     load_kwargs: Option<&Bound<'_, PyDict>>,
-) -> CardPyResult<()> {
-    let path = path.ok_or_else(|| WyrdPyError::validation("local artifact path is required"))?;
+) -> WyrdPyResult<()> {
+    let path = path.ok_or_else(|| crate::error::validation("local artifact path is required"))?;
     interface.call_method("load", (path, load_kwargs), None)?;
     Ok(())
 }
 
-fn field(name: &str, dtype: &str) -> CardPyResult<FieldSpec> {
+fn field(name: &str, dtype: &str) -> Result<FieldSpec, WyrdError> {
     let name = ColumnName::new(name).map_err(|error| {
-        WyrdPyError::validation_with_details(
+        crate::error::validation_with_details(
             "invalid static manifest schema field name",
             serde_json::json!({
                 "field": name,
@@ -349,24 +348,24 @@ fn field(name: &str, dtype: &str) -> CardPyResult<FieldSpec> {
 }
 
 #[cfg(feature = "python")]
-fn encode_jsonl_bytes(bytes: &[u8], compression: JsonlCompression) -> CardPyResult<Vec<u8>> {
+fn encode_jsonl_bytes(bytes: &[u8], compression: JsonlCompression) -> WyrdPyResult<Vec<u8>> {
     match compression {
         JsonlCompression::None => Ok(bytes.to_vec()),
         JsonlCompression::Gzip => Ok(wyrd_utils::codec::gzip_encode(bytes)
-            .map_err(|error| WyrdPyError::Io(error.to_string()))?),
+            .map_err(|error| crate::error::io_error(&error))?),
         JsonlCompression::Zstd => Ok(wyrd_utils::codec::zstd_encode(bytes)
-            .map_err(|error| WyrdPyError::Io(error.to_string()))?),
+            .map_err(|error| crate::error::io_error(&error))?),
     }
 }
 
 #[cfg(feature = "python")]
-fn decode_jsonl_bytes(bytes: &[u8], compression: JsonlCompression) -> CardPyResult<Vec<u8>> {
+fn decode_jsonl_bytes(bytes: &[u8], compression: JsonlCompression) -> WyrdPyResult<Vec<u8>> {
     match compression {
         JsonlCompression::None => Ok(bytes.to_vec()),
         JsonlCompression::Gzip => Ok(wyrd_utils::codec::gzip_decode(bytes)
-            .map_err(|error| WyrdPyError::Io(error.to_string()))?),
+            .map_err(|error| crate::error::io_error(&error))?),
         JsonlCompression::Zstd => Ok(wyrd_utils::codec::zstd_decode(bytes)
-            .map_err(|error| WyrdPyError::Io(error.to_string()))?),
+            .map_err(|error| crate::error::io_error(&error))?),
     }
 }
 
@@ -380,16 +379,17 @@ fn compression_from_path(path: &Path) -> Option<JsonlCompression> {
 }
 
 #[cfg(feature = "python")]
-fn parse_jsonl_compression_label(value: &str) -> CardPyResult<JsonlCompression> {
+fn parse_jsonl_compression_label(value: &str) -> WyrdPyResult<JsonlCompression> {
     match value.trim().to_ascii_lowercase().replace('-', "_").as_str() {
         "none" => Ok(JsonlCompression::None),
         "gzip" => Ok(JsonlCompression::Gzip),
         "zstd" => Ok(JsonlCompression::Zstd),
-        got => Err(WyrdPyError::invalid_interface_option(
+        got => Err(crate::error::invalid_interface_option(
             "compression",
             got,
             ["none", "gzip", "zstd"],
-        )),
+        )
+        .into()),
     }
 }
 
@@ -397,7 +397,7 @@ fn parse_jsonl_compression_label(value: &str) -> CardPyResult<JsonlCompression> 
 fn manifest_entries_from_data(
     py: Python<'_>,
     data: &Bound<'_, PyAny>,
-) -> CardPyResult<Vec<ManifestEntry>> {
+) -> WyrdPyResult<Vec<ManifestEntry>> {
     if crate::data::dtype::is_path_like(py, data)? {
         return manifest_entries_from_path(&crate::data::dtype::extract_pathbuf(data)?);
     }
@@ -410,22 +410,21 @@ fn manifest_entries_from_data(
             } else if let Some(path) = object.get("path").and_then(Value::as_str) {
                 manifest_entries_from_path(Path::new(path))
             } else {
-                Err(WyrdPyError::validation(
-                    "manifest object must contain files or path",
-                ))
+                Err(crate::error::validation("manifest object must contain files or path").into())
             }
         }
         Value::Array(_) => entries_from_json(&value),
         Value::String(path) => manifest_entries_from_path(Path::new(&path)),
-        _ => Err(WyrdPyError::validation(
+        _ => Err(crate::error::validation(
             "manifest data must be a path, sequence of paths, or manifest object",
-        )),
+        )
+        .into()),
     }
 }
 
 #[cfg(feature = "python")]
-fn manifest_entries_from_path(path: &Path) -> CardPyResult<Vec<ManifestEntry>> {
-    wyrd_utils::fs::require_local_path(path).map_err(|error| WyrdPyError::Io(error.to_string()))?;
+fn manifest_entries_from_path(path: &Path) -> WyrdPyResult<Vec<ManifestEntry>> {
+    wyrd_utils::fs::require_local_path(path).map_err(|error| crate::error::io_error(&error))?;
 
     if path.is_file() {
         return Ok(vec![entry_for_path(path)]);
@@ -438,7 +437,7 @@ fn manifest_entries_from_path(path: &Path) -> CardPyResult<Vec<ManifestEntry>> {
 }
 
 #[cfg(feature = "python")]
-fn collect_files(path: &Path, files: &mut Vec<PathBuf>) -> CardPyResult<()> {
+fn collect_files(path: &Path, files: &mut Vec<PathBuf>) -> WyrdPyResult<()> {
     for entry in fs::read_dir(path)? {
         let entry = entry?;
         let path = entry.path();
@@ -452,9 +451,9 @@ fn collect_files(path: &Path, files: &mut Vec<PathBuf>) -> CardPyResult<()> {
 }
 
 #[cfg(feature = "python")]
-fn entries_from_json(value: &Value) -> CardPyResult<Vec<ManifestEntry>> {
+fn entries_from_json(value: &Value) -> WyrdPyResult<Vec<ManifestEntry>> {
     let values = value.as_array().ok_or_else(|| {
-        WyrdPyError::validation("manifest files must be a JSON array of paths or objects")
+        crate::error::validation("manifest files must be a JSON array of paths or objects")
     })?;
     let mut entries = Vec::with_capacity(values.len());
     for value in values {
@@ -462,16 +461,17 @@ fn entries_from_json(value: &Value) -> CardPyResult<Vec<ManifestEntry>> {
             Value::String(path) => entries.push(ManifestEntry { path: path.clone() }),
             Value::Object(object) => {
                 let path = object.get("path").and_then(Value::as_str).ok_or_else(|| {
-                    WyrdPyError::validation("manifest file objects must contain a path string")
+                    crate::error::validation("manifest file objects must contain a path string")
                 })?;
                 entries.push(ManifestEntry {
                     path: path.to_string(),
                 });
             }
             _ => {
-                return Err(WyrdPyError::validation(
+                return Err(crate::error::validation(
                     "manifest file entries must be paths or objects",
-                ));
+                )
+                .into());
             }
         }
     }
@@ -487,14 +487,14 @@ fn entry_for_path(path: &Path) -> ManifestEntry {
 }
 
 #[cfg(feature = "python")]
-fn sql_logic_from_value(value: &Value) -> CardPyResult<SqlLogic> {
+fn sql_logic_from_value(value: &Value) -> WyrdPyResult<SqlLogic> {
     let object = value
         .as_object()
-        .ok_or_else(|| WyrdPyError::validation("SQL data must be a JSON object"))?;
+        .ok_or_else(|| crate::error::validation("SQL data must be a JSON object"))?;
     let queries_value = object.get("queries").unwrap_or(value);
     let query_object = queries_value
         .as_object()
-        .ok_or_else(|| WyrdPyError::validation("SQL queries must be a JSON object"))?;
+        .ok_or_else(|| crate::error::validation("SQL queries must be a JSON object"))?;
 
     let mut queries = HashMap::new();
     for (name, query) in query_object {
@@ -502,13 +502,13 @@ fn sql_logic_from_value(value: &Value) -> CardPyResult<SqlLogic> {
             continue;
         }
         let query = query.as_str().ok_or_else(|| {
-            WyrdPyError::validation_with_details(
+            crate::error::validation_with_details(
                 "SQL query values must be strings",
                 json!({ "query": name }),
             )
         })?;
         let name = QueryName::new(name).map_err(|error| {
-            WyrdPyError::validation_with_details(
+            crate::error::validation_with_details(
                 "invalid SQL query name",
                 json!({ "query": name, "source": error.to_string() }),
             )
@@ -522,7 +522,7 @@ fn sql_logic_from_value(value: &Value) -> CardPyResult<SqlLogic> {
         .map(QueryName::new)
         .transpose()
         .map_err(|error| {
-            WyrdPyError::validation_with_details(
+            crate::error::validation_with_details(
                 "invalid default SQL query name",
                 json!({ "source": error.to_string() }),
             )

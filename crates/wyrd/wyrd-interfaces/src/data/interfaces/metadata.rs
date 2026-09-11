@@ -9,11 +9,12 @@ use crate::data::interfaces::options::{
     parse_image_format, parse_jsonl_compression, parse_numpy_format, parse_parquet_compression,
     parse_torch_save_format, torch_save_format_token,
 };
-use crate::error::{CardPyResult, WyrdPyError};
 use wyrd_spec::card::data::{
     ArrowMeta, DataInterface as RustDataInterface, HuggingfaceMeta, ImageMeta, JsonlMeta,
     NumpyMeta, PandasMeta, ParquetMeta, PolarsMeta, SqlMeta, TextMeta, TorchMeta,
 };
+#[cfg(feature = "python")]
+use wyrd_utils::py::WyrdPyResult;
 
 #[cfg(feature = "python")]
 use {crate::data::dtype, pyo3::prelude::*, wyrd_utils::py::module_version};
@@ -23,21 +24,21 @@ macro_rules! impl_to_spec {
         impl $type {
             /// Convert this local Python holder into Rust-only metadata.
             #[cfg(feature = "python")]
-            pub fn to_rust(&self, py: Python<'_>) -> CardPyResult<$meta> {
+            pub fn to_rust(&self, py: Python<'_>) -> WyrdPyResult<$meta> {
                 $body(self, py)
             }
 
             /// Convert this local Python holder into a Rust-only interface enum.
             #[cfg(feature = "python")]
-            pub fn to_spec_interface(&self, py: Python<'_>) -> CardPyResult<RustDataInterface> {
+            pub fn to_spec_interface(&self, py: Python<'_>) -> WyrdPyResult<RustDataInterface> {
                 Ok(RustDataInterface::$variant(self.to_rust(py)?))
             }
 
             /// Rebuild a sourceless Python holder from Rust-only metadata.
-            pub fn from_spec_inner(interface: &RustDataInterface) -> CardPyResult<Self> {
+            pub fn from_spec_inner(interface: &RustDataInterface) -> WyrdPyResult<Self> {
                 match interface {
                     RustDataInterface::$variant(meta) => Ok(Self::from_meta(meta)),
-                    _ => Err(WyrdPyError::validation($message)),
+                    _ => Err(crate::error::validation($message).into()),
                 }
             }
         }

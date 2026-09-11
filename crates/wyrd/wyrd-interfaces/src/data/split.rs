@@ -1,9 +1,11 @@
 //! Python/Rust wrappers for Wyrd data split declarations.
 
 use serde_json::json;
+use wyrd_spec::error::WyrdError;
 
-use crate::error::{CardPyResult, WyrdPyError};
 use wyrd_spec::card::data::{Inequality, SplitStrategy};
+#[cfg(feature = "python")]
+use wyrd_utils::py::WyrdPyResult;
 
 #[cfg(feature = "python")]
 use {
@@ -63,7 +65,7 @@ impl From<PySplit> for SplitStrategy {
 ///
 /// # Errors
 /// Returns `WYRD_DATA_400_INVALID_SPLIT_RULE` when `op` is not supported.
-pub fn parse_inequality(op: &str) -> CardPyResult<Inequality> {
+pub fn parse_inequality(op: &str) -> Result<Inequality, WyrdError> {
     match op {
         "==" => Ok(Inequality::Eq),
         "!=" => Ok(Inequality::Ne),
@@ -88,7 +90,7 @@ pub fn parse_inequality(op: &str) -> CardPyResult<Inequality> {
 /// # Errors
 /// Returns `WYRD_DATA_400_INVALID_SPLIT_RULE` when either bound is negative or
 /// when `start > stop`.
-pub fn validate_index_range(start: i64, stop: i64) -> CardPyResult<()> {
+pub fn validate_index_range(start: i64, stop: i64) -> Result<(), WyrdError> {
     if start < 0 || stop < 0 || start > stop {
         return Err(invalid_split_rule(
             "index range splits require non-negative start <= stop",
@@ -106,7 +108,7 @@ pub fn validate_index_range(start: i64, stop: i64) -> CardPyResult<()> {
 /// # Errors
 /// Returns `WYRD_DATA_400_INVALID_SPLIT_RULE` when the split is empty or any
 /// index is negative. Duplicate values are preserved for `DataSpec` validation.
-pub fn validate_indices(values: &[i64]) -> CardPyResult<()> {
+pub fn validate_indices(values: &[i64]) -> Result<(), WyrdError> {
     let mut seen = std::collections::HashSet::new();
     if values.is_empty() {
         return Err(invalid_split_rule(
@@ -130,7 +132,7 @@ pub fn validate_indices(values: &[i64]) -> CardPyResult<()> {
 #[pymethods]
 impl PySplit {
     #[staticmethod]
-    fn column(col: &str, op: &str, value: &Bound<'_, PyAny>) -> CardPyResult<Self> {
+    fn column(col: &str, op: &str, value: &Bound<'_, PyAny>) -> WyrdPyResult<Self> {
         let name = ColumnName::new(col).map_err(|error| {
             invalid_split_rule(
                 format!("invalid split column name {col:?}"),
@@ -149,30 +151,30 @@ impl PySplit {
     }
 
     #[staticmethod]
-    fn materialized(card_ref: &Bound<'_, PyAny>) -> CardPyResult<Self> {
+    fn materialized(card_ref: &Bound<'_, PyAny>) -> WyrdPyResult<Self> {
         Ok(Self::from_inner(SplitStrategy::Materialized(
             card_ref_from_py(card_ref)?,
         )))
     }
 
     #[staticmethod]
-    fn index_range(start: i64, stop: i64) -> CardPyResult<Self> {
+    fn index_range(start: i64, stop: i64) -> WyrdPyResult<Self> {
         validate_index_range(start, stop)?;
         Ok(Self::from_inner(SplitStrategy::IndexRange { start, stop }))
     }
 
     #[staticmethod]
-    fn indices(values: Vec<i64>) -> CardPyResult<Self> {
+    fn indices(values: Vec<i64>) -> WyrdPyResult<Self> {
         validate_indices(&values)?;
         Ok(Self::from_inner(SplitStrategy::Indices(values)))
     }
 
     #[getter]
-    fn strategy(&self, py: Python<'_>) -> CardPyResult<Py<PyAny>> {
+    fn strategy(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
         Ok(json_to_pyobject(py, &serde_json::to_value(&self.inner)?)?)
     }
 
-    fn to_dict(&self, py: Python<'_>) -> CardPyResult<Py<PyAny>> {
+    fn to_dict(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
         Ok(json_to_pyobject(py, &serde_json::to_value(&self.inner)?)?)
     }
 }
@@ -184,12 +186,12 @@ pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
-fn invalid_split_rule(message: impl Into<String>, details: serde_json::Value) -> WyrdPyError {
-    WyrdPyError::invalid_split_rule(message, details)
+fn invalid_split_rule(message: impl Into<String>, details: serde_json::Value) -> WyrdError {
+    crate::error::invalid_split_rule(message, details)
 }
 
 #[cfg(feature = "python")]
-fn col_value_from_py(value: &Bound<'_, PyAny>) -> CardPyResult<ColValue> {
+fn col_value_from_py(value: &Bound<'_, PyAny>) -> WyrdPyResult<ColValue> {
     if value.is_instance_of::<PyBool>() {
         return Ok(ColValue::Bool(value.extract()?));
     }
@@ -215,7 +217,7 @@ fn col_value_from_py(value: &Bound<'_, PyAny>) -> CardPyResult<ColValue> {
         return list
             .iter()
             .map(|item| col_value_from_py(&item))
-            .collect::<CardPyResult<Vec<_>>>()
+            .collect::<WyrdPyResult<Vec<_>>>()
             .map(ColValue::List);
     }
     let python_type = match value.get_type().name() {
@@ -228,11 +230,12 @@ fn col_value_from_py(value: &Bound<'_, PyAny>) -> CardPyResult<ColValue> {
             "python_type": python_type,
             "accepted": ["bool", "int", "float", "str", "datetime", "list"],
         }),
-    ))
+    )
+    .into())
 }
 
 #[cfg(feature = "python")]
-fn card_ref_from_py(value: &Bound<'_, PyAny>) -> CardPyResult<CardRef> {
+fn card_ref_from_py(value: &Bound<'_, PyAny>) -> WyrdPyResult<CardRef> {
     let raw = pyobject_to_json(value).map_err(|error| {
         invalid_split_rule(
             "materialized split card_ref must be a CardRef mapping",
@@ -254,7 +257,8 @@ fn card_ref_from_py(value: &Bound<'_, PyAny>) -> CardPyResult<CardRef> {
             json!({
                 "kind": card_ref.kind.wire_name(),
             }),
-        ));
+        )
+        .into());
     }
     Ok(card_ref)
 }
@@ -262,8 +266,8 @@ fn card_ref_from_py(value: &Bound<'_, PyAny>) -> CardPyResult<CardRef> {
 #[cfg(test)]
 mod tests {
     use super::{parse_inequality, validate_index_range, validate_indices};
-    use crate::error::WyrdPyError;
     use wyrd_spec::card::data::Inequality;
+    use wyrd_spec::error::WyrdError;
 
     #[test]
     fn parse_inequality_maps_locked_ops() {
@@ -284,7 +288,7 @@ mod tests {
 
     #[test]
     fn parse_inequality_rejects_invalid_op_with_wyrd_code() {
-        assert_invalid_split_rule(parse_inequality("contains").expect_err("invalid op"));
+        assert_invalid_split_rule(&parse_inequality("contains").expect_err("invalid op"));
     }
 
     #[test]
@@ -294,24 +298,19 @@ mod tests {
 
     #[test]
     fn validate_index_range_rejects_invalid_bounds() {
-        assert_invalid_split_rule(validate_index_range(4, 3).expect_err("start > stop"));
-        assert_invalid_split_rule(validate_index_range(-1, 3).expect_err("negative start"));
-        assert_invalid_split_rule(validate_index_range(0, -1).expect_err("negative stop"));
+        assert_invalid_split_rule(&validate_index_range(4, 3).expect_err("start > stop"));
+        assert_invalid_split_rule(&validate_index_range(-1, 3).expect_err("negative start"));
+        assert_invalid_split_rule(&validate_index_range(0, -1).expect_err("negative stop"));
     }
 
     #[test]
     fn validate_indices_rejects_empty_negative_and_duplicate_values() {
-        assert_invalid_split_rule(validate_indices(&[]).expect_err("empty indices"));
-        assert_invalid_split_rule(validate_indices(&[0, -1]).expect_err("negative index"));
-        assert_invalid_split_rule(validate_indices(&[1, 1]).expect_err("duplicate index"));
+        assert_invalid_split_rule(&validate_indices(&[]).expect_err("empty indices"));
+        assert_invalid_split_rule(&validate_indices(&[0, -1]).expect_err("negative index"));
+        assert_invalid_split_rule(&validate_indices(&[1, 1]).expect_err("duplicate index"));
     }
 
-    fn assert_invalid_split_rule(error: WyrdPyError) {
-        match error {
-            WyrdPyError::Spec(error) => {
-                assert_eq!(error.code(), "WYRD_DATA_400_INVALID_SPLIT_RULE");
-            }
-            other => panic!("expected Wyrd spec error, got {other:?}"),
-        }
+    fn assert_invalid_split_rule(error: &WyrdError) {
+        assert_eq!(error.code(), "WYRD_DATA_400_INVALID_SPLIT_RULE");
     }
 }

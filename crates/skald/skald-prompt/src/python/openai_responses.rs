@@ -23,7 +23,7 @@ use skald_spec::wire::openai_responses::{
     OpenAiResponsesToolChoiceMode, OpenAiResponsesUsage, OpenAiTextResponseFormat,
 };
 use skald_spec::{ProviderRequest, ProviderResponse};
-use wyrd_interfaces::error::CardPyResult;
+use wyrd_utils::py::WyrdPyResult;
 
 use crate::prompt::wrong_variant;
 
@@ -151,7 +151,7 @@ impl PyOpenAiResponsesSettings {
         self.s().store
     }
     #[getter]
-    fn metadata(&self, py: Python<'_>) -> CardPyResult<Option<Py<PyAny>>> {
+    fn metadata(&self, py: Python<'_>) -> WyrdPyResult<Option<Py<PyAny>>> {
         self.s()
             .metadata
             .as_ref()
@@ -162,7 +162,7 @@ impl PyOpenAiResponsesSettings {
             .transpose()
     }
     #[getter]
-    fn extra(&self, py: Python<'_>) -> CardPyResult<Py<PyAny>> {
+    fn extra(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
         wyrd_utils::py::json_to_pyobject(py, &serde_json::Value::Object(self.s().extra.clone()))
             .map_err(Into::into)
     }
@@ -264,7 +264,7 @@ impl PyOpenAiResponsesToolChoice {
             OpenAiResponsesToolChoice::Shell(_) => "shell",
         }
     }
-    fn as_mode(&self) -> CardPyResult<&'static str> {
+    fn as_mode(&self) -> WyrdPyResult<&'static str> {
         match self.c() {
             OpenAiResponsesToolChoice::Mode(m) => Ok(match m {
                 OpenAiResponsesToolChoiceMode::None => "none",
@@ -274,7 +274,7 @@ impl PyOpenAiResponsesToolChoice {
             _ => Err(wrong_variant("mode", self.kind()).into()),
         }
     }
-    fn as_hosted(&self) -> CardPyResult<PyOpenAiResponsesHostedToolChoice> {
+    fn as_hosted(&self) -> WyrdPyResult<PyOpenAiResponsesHostedToolChoice> {
         match self.c() {
             OpenAiResponsesToolChoice::Hosted(_) => Ok(PyOpenAiResponsesHostedToolChoice {
                 inner: Arc::clone(&self.inner),
@@ -282,7 +282,7 @@ impl PyOpenAiResponsesToolChoice {
             _ => Err(wrong_variant("hosted", self.kind()).into()),
         }
     }
-    fn as_function_choice(&self) -> CardPyResult<PyOpenAiResponsesFunctionToolChoice> {
+    fn as_function_choice(&self) -> WyrdPyResult<PyOpenAiResponsesFunctionToolChoice> {
         match self.c() {
             OpenAiResponsesToolChoice::Function(_) => Ok(PyOpenAiResponsesFunctionToolChoice {
                 inner: Arc::clone(&self.inner),
@@ -290,7 +290,7 @@ impl PyOpenAiResponsesToolChoice {
             _ => Err(wrong_variant("function", self.kind()).into()),
         }
     }
-    fn as_allowed(&self) -> CardPyResult<PyOpenAiResponsesAllowedToolsChoice> {
+    fn as_allowed(&self) -> WyrdPyResult<PyOpenAiResponsesAllowedToolsChoice> {
         match self.c() {
             OpenAiResponsesToolChoice::Allowed(_) => Ok(PyOpenAiResponsesAllowedToolsChoice {
                 inner: Arc::clone(&self.inner),
@@ -298,7 +298,7 @@ impl PyOpenAiResponsesToolChoice {
             _ => Err(wrong_variant("allowed", self.kind()).into()),
         }
     }
-    fn as_mcp(&self) -> CardPyResult<PyOpenAiResponsesMcpToolChoice> {
+    fn as_mcp(&self) -> WyrdPyResult<PyOpenAiResponsesMcpToolChoice> {
         match self.c() {
             OpenAiResponsesToolChoice::Mcp(_) => Ok(PyOpenAiResponsesMcpToolChoice {
                 inner: Arc::clone(&self.inner),
@@ -306,7 +306,7 @@ impl PyOpenAiResponsesToolChoice {
             _ => Err(wrong_variant("mcp", self.kind()).into()),
         }
     }
-    fn as_custom_choice(&self) -> CardPyResult<PyOpenAiResponsesCustomToolChoice> {
+    fn as_custom_choice(&self) -> WyrdPyResult<PyOpenAiResponsesCustomToolChoice> {
         match self.c() {
             OpenAiResponsesToolChoice::Custom(_) => Ok(PyOpenAiResponsesCustomToolChoice {
                 inner: Arc::clone(&self.inner),
@@ -314,7 +314,7 @@ impl PyOpenAiResponsesToolChoice {
             _ => Err(wrong_variant("custom", self.kind()).into()),
         }
     }
-    fn as_apply_patch(&self) -> CardPyResult<PyOpenAiResponsesApplyPatchToolChoice> {
+    fn as_apply_patch(&self) -> WyrdPyResult<PyOpenAiResponsesApplyPatchToolChoice> {
         match self.c() {
             OpenAiResponsesToolChoice::ApplyPatch(_) => Ok(PyOpenAiResponsesApplyPatchToolChoice {
                 inner: Arc::clone(&self.inner),
@@ -322,7 +322,7 @@ impl PyOpenAiResponsesToolChoice {
             _ => Err(wrong_variant("apply_patch", self.kind()).into()),
         }
     }
-    fn as_shell(&self) -> CardPyResult<PyOpenAiResponsesShellToolChoice> {
+    fn as_shell(&self) -> WyrdPyResult<PyOpenAiResponsesShellToolChoice> {
         match self.c() {
             OpenAiResponsesToolChoice::Shell(_) => Ok(PyOpenAiResponsesShellToolChoice {
                 inner: Arc::clone(&self.inner),
@@ -550,25 +550,25 @@ impl PyOpenAiResponseItem {
             OpenAiResponseItem::InputImage { .. } => "input_image",
         }
     }
-    fn as_message_role(&self) -> CardPyResult<String> {
+    fn as_message_role(&self) -> WyrdPyResult<String> {
         match self.i() {
             OpenAiResponseItem::Message { role, .. } => Ok(role.clone()),
             _ => Err(wrong_variant("message", self.kind()).into()),
         }
     }
-    fn as_function_call_name(&self) -> CardPyResult<String> {
+    fn as_function_call_name(&self) -> WyrdPyResult<String> {
         match self.i() {
             OpenAiResponseItem::FunctionCall { name, .. } => Ok(name.clone()),
             _ => Err(wrong_variant("function_call", self.kind()).into()),
         }
     }
-    fn as_function_call_arguments(&self) -> CardPyResult<String> {
+    fn as_function_call_arguments(&self) -> WyrdPyResult<String> {
         match self.i() {
             OpenAiResponseItem::FunctionCall { arguments, .. } => Ok(arguments.clone()),
             _ => Err(wrong_variant("function_call", self.kind()).into()),
         }
     }
-    fn as_function_call_output(&self) -> CardPyResult<String> {
+    fn as_function_call_output(&self) -> WyrdPyResult<String> {
         match self.i() {
             OpenAiResponseItem::FunctionCallOutput { output, .. } => Ok(output.clone()),
             _ => Err(wrong_variant("function_call_output", self.kind()).into()),
@@ -594,7 +594,7 @@ impl PyOpenAiResponseContentPart {
             OpenAiResponseContentPart::InputFile { .. } => "input_file",
         }
     }
-    fn as_text(&self) -> CardPyResult<String> {
+    fn as_text(&self) -> WyrdPyResult<String> {
         match &self.value {
             OpenAiResponseContentPart::InputText { text }
             | OpenAiResponseContentPart::OutputText { text } => Ok(text.clone()),
@@ -633,19 +633,19 @@ impl PyOpenAiResponsesTool {
             OpenAiResponsesTool::Custom { .. } => "custom",
         }
     }
-    fn as_function_name(&self) -> CardPyResult<String> {
+    fn as_function_name(&self) -> WyrdPyResult<String> {
         match self.t() {
             OpenAiResponsesTool::Function { name, .. } => Ok(name.clone()),
             _ => Err(wrong_variant("function", self.kind()).into()),
         }
     }
-    fn as_mcp_server_label(&self) -> CardPyResult<String> {
+    fn as_mcp_server_label(&self) -> WyrdPyResult<String> {
         match self.t() {
             OpenAiResponsesTool::Mcp { server_label, .. } => Ok(server_label.clone()),
             _ => Err(wrong_variant("mcp", self.kind()).into()),
         }
     }
-    fn as_custom_name(&self) -> CardPyResult<String> {
+    fn as_custom_name(&self) -> WyrdPyResult<String> {
         match self.t() {
             OpenAiResponsesTool::Custom { name, .. } => Ok(name.clone()),
             _ => Err(wrong_variant("custom", self.kind()).into()),

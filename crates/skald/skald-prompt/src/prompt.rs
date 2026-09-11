@@ -331,7 +331,7 @@ use {
         types::{PyAny, PyBytes, PyDict, PyList, PyString, PyTuple},
     },
     serde::de::DeserializeOwned,
-    wyrd_interfaces::error::CardPyResult,
+    wyrd_utils::py::WyrdPyResult,
 };
 
 #[cfg(feature = "python")]
@@ -356,7 +356,7 @@ impl Prompt {
         model_settings: Option<&Bound<'_, PyAny>>,
         variables: Option<Vec<String>>,
         version: Option<String>,
-    ) -> CardPyResult<Self> {
+    ) -> WyrdPyResult<Self> {
         let provider = provider_name_from_py(provider)?;
         let response_format = response_format_from_py(response_format)?;
         let (output, py_output_cls) = output_from_py(output)?;
@@ -482,7 +482,7 @@ impl Prompt {
         model_settings: Option<&Bound<'_, PyAny>>,
         variables: Option<Vec<String>>,
         version: Option<String>,
-    ) -> CardPyResult<Self> {
+    ) -> WyrdPyResult<Self> {
         let explicit_variables = variables.clone();
         let (output, py_output_cls) = output_from_py(output)?;
         let prompt = crate::builder::openai_chat(
@@ -517,7 +517,7 @@ impl Prompt {
         model_settings: Option<&Bound<'_, PyAny>>,
         variables: Option<Vec<String>>,
         version: Option<String>,
-    ) -> CardPyResult<Self> {
+    ) -> WyrdPyResult<Self> {
         let explicit_variables = variables.clone();
         let (output, py_output_cls) = output_from_py(output)?;
         let prompt = crate::builder::openai_responses(
@@ -551,7 +551,7 @@ impl Prompt {
         model_settings: Option<&Bound<'_, PyAny>>,
         variables: Option<Vec<String>>,
         version: Option<String>,
-    ) -> CardPyResult<Self> {
+    ) -> WyrdPyResult<Self> {
         let explicit_variables = variables.clone();
         let (output, py_output_cls) = output_from_py(output)?;
         let prompt = crate::builder::anthropic(
@@ -585,7 +585,7 @@ impl Prompt {
         model_settings: Option<&Bound<'_, PyAny>>,
         variables: Option<Vec<String>>,
         version: Option<String>,
-    ) -> CardPyResult<Self> {
+    ) -> WyrdPyResult<Self> {
         let explicit_variables = variables.clone();
         let (output, py_output_cls) = output_from_py(output)?;
         let options = GeminiOptions {
@@ -617,7 +617,7 @@ impl Prompt {
         model_settings: Option<&Bound<'_, PyAny>>,
         variables: Option<Vec<String>>,
         version: Option<String>,
-    ) -> CardPyResult<Self> {
+    ) -> WyrdPyResult<Self> {
         let explicit_variables = variables.clone();
         let (output, py_output_cls) = output_from_py(output)?;
         let options = GeminiOptions {
@@ -641,7 +641,7 @@ impl Prompt {
         provider: &Bound<'_, PyAny>,
         model: String,
         body: &Bound<'_, PyBytes>,
-    ) -> CardPyResult<Self> {
+    ) -> WyrdPyResult<Self> {
         Ok(crate::builder::raw(
             provider_name_from_py(provider)?,
             model,
@@ -650,17 +650,17 @@ impl Prompt {
     }
 
     /// Return a copy with a system message applied.
-    pub fn system(&self, text: String) -> CardPyResult<Self> {
+    pub fn system(&self, text: String) -> WyrdPyResult<Self> {
         Ok(self.with_system(text)?)
     }
 
     /// Return a copy with a user message appended.
-    pub fn user(&self, content: &Bound<'_, PyAny>) -> CardPyResult<Self> {
+    pub fn user(&self, content: &Bound<'_, PyAny>) -> WyrdPyResult<Self> {
         append_py_content(self, "user", content)
     }
 
     /// Return a copy with an assistant message appended.
-    pub fn assistant(&self, content: &Bound<'_, PyAny>) -> CardPyResult<Self> {
+    pub fn assistant(&self, content: &Bound<'_, PyAny>) -> WyrdPyResult<Self> {
         append_py_content(self, "assistant", content)
     }
 
@@ -671,7 +671,7 @@ impl Prompt {
         tool_use_id: String,
         content: String,
         is_error: bool,
-    ) -> CardPyResult<Self> {
+    ) -> WyrdPyResult<Self> {
         Ok(self.with_tool_result(tool_use_id, content, is_error)?)
     }
 
@@ -682,19 +682,19 @@ impl Prompt {
         py: Python<'_>,
         url: String,
         detail: Option<String>,
-    ) -> CardPyResult<Py<PyAny>> {
+    ) -> WyrdPyResult<Py<PyAny>> {
         py_value(py, &crate::messages::openai_image_url_part(url, detail))
     }
 
     /// Return an `OpenAI` Chat audio content part as a native JSON shape.
     #[staticmethod]
-    pub fn openai_audio(py: Python<'_>, data: String, format: String) -> CardPyResult<Py<PyAny>> {
+    pub fn openai_audio(py: Python<'_>, data: String, format: String) -> WyrdPyResult<Py<PyAny>> {
         py_value(py, &crate::messages::openai_audio_part(data, format))
     }
 
     /// Return an `OpenAI` Chat file-id content part as a native JSON shape.
     #[staticmethod]
-    pub fn openai_file_id(py: Python<'_>, file_id: String) -> CardPyResult<Py<PyAny>> {
+    pub fn openai_file_id(py: Python<'_>, file_id: String) -> WyrdPyResult<Py<PyAny>> {
         py_value(py, &crate::messages::openai_file_id_part(file_id))
     }
 
@@ -705,7 +705,7 @@ impl Prompt {
         py: Python<'_>,
         file_data: String,
         filename: Option<String>,
-    ) -> CardPyResult<Py<PyAny>> {
+    ) -> WyrdPyResult<Py<PyAny>> {
         py_value(
             py,
             &crate::messages::openai_file_data_part(file_data, filename),
@@ -714,7 +714,7 @@ impl Prompt {
 
     /// Return an Anthropic image URL content block as a native JSON shape.
     #[staticmethod]
-    pub fn anthropic_image_url(py: Python<'_>, url: String) -> CardPyResult<Py<PyAny>> {
+    pub fn anthropic_image_url(py: Python<'_>, url: String) -> WyrdPyResult<Py<PyAny>> {
         py_value(py, &crate::messages::anthropic_image_url_block(url))
     }
 
@@ -724,7 +724,7 @@ impl Prompt {
         py: Python<'_>,
         media_type: String,
         data: String,
-    ) -> CardPyResult<Py<PyAny>> {
+    ) -> WyrdPyResult<Py<PyAny>> {
         py_value(
             py,
             &crate::messages::anthropic_image_base64_block(media_type, data),
@@ -733,7 +733,7 @@ impl Prompt {
 
     /// Return an Anthropic image file-id content block as a native JSON shape.
     #[staticmethod]
-    pub fn anthropic_image_file_id(py: Python<'_>, file_id: String) -> CardPyResult<Py<PyAny>> {
+    pub fn anthropic_image_file_id(py: Python<'_>, file_id: String) -> WyrdPyResult<Py<PyAny>> {
         py_value(py, &crate::messages::anthropic_image_file_id_block(file_id))
     }
 
@@ -745,7 +745,7 @@ impl Prompt {
         media_type: String,
         data: String,
         title: Option<String>,
-    ) -> CardPyResult<Py<PyAny>> {
+    ) -> WyrdPyResult<Py<PyAny>> {
         py_value(
             py,
             &crate::messages::anthropic_document_text_block(media_type, data, title),
@@ -759,7 +759,7 @@ impl Prompt {
         py: Python<'_>,
         file_id: String,
         title: Option<String>,
-    ) -> CardPyResult<Py<PyAny>> {
+    ) -> WyrdPyResult<Py<PyAny>> {
         py_value(
             py,
             &crate::messages::anthropic_document_file_id_block(file_id, title),
@@ -772,7 +772,7 @@ impl Prompt {
         py: Python<'_>,
         mime_type: String,
         data: String,
-    ) -> CardPyResult<Py<PyAny>> {
+    ) -> WyrdPyResult<Py<PyAny>> {
         py_value(
             py,
             &crate::messages::google_inline_data_part(mime_type, data),
@@ -785,7 +785,7 @@ impl Prompt {
         py: Python<'_>,
         mime_type: String,
         file_uri: String,
-    ) -> CardPyResult<Py<PyAny>> {
+    ) -> WyrdPyResult<Py<PyAny>> {
         py_value(
             py,
             &crate::messages::google_file_data_part(mime_type, file_uri),
@@ -800,7 +800,7 @@ impl Prompt {
         url: String,
         detail: Option<String>,
         provider: &str,
-    ) -> CardPyResult<Py<PyAny>> {
+    ) -> WyrdPyResult<Py<PyAny>> {
         match provider_name_from_str(provider) {
             skald_spec::ProviderName::OpenAi => {
                 py_value(py, &crate::messages::openai_image_url_part(url, detail))
@@ -822,7 +822,7 @@ impl Prompt {
         py: Python<'_>,
         media_type: String,
         data: String,
-    ) -> CardPyResult<Py<PyAny>> {
+    ) -> WyrdPyResult<Py<PyAny>> {
         py_value(
             py,
             &crate::messages::anthropic_image_base64_block(media_type, data),
@@ -835,7 +835,7 @@ impl Prompt {
         py: Python<'_>,
         mime_type: String,
         file_uri: String,
-    ) -> CardPyResult<Py<PyAny>> {
+    ) -> WyrdPyResult<Py<PyAny>> {
         py_value(
             py,
             &crate::messages::google_file_data_part(mime_type, file_uri),
@@ -844,7 +844,7 @@ impl Prompt {
 
     /// Return an `OpenAI` file-id content part as a native JSON shape.
     #[staticmethod]
-    pub fn file_id(py: Python<'_>, file_id: String) -> CardPyResult<Py<PyAny>> {
+    pub fn file_id(py: Python<'_>, file_id: String) -> WyrdPyResult<Py<PyAny>> {
         py_value(py, &crate::messages::openai_file_id_part(file_id))
     }
 
@@ -856,7 +856,7 @@ impl Prompt {
         media_type: String,
         data: String,
         title: Option<String>,
-    ) -> CardPyResult<Py<PyAny>> {
+    ) -> WyrdPyResult<Py<PyAny>> {
         py_value(
             py,
             &crate::messages::anthropic_document_text_block(media_type, data, title),
@@ -865,7 +865,7 @@ impl Prompt {
 
     /// Render declared variables and return an opaque provider request.
     #[pyo3(signature = (**kwargs))]
-    pub fn render(&self, kwargs: Option<&Bound<'_, PyDict>>) -> CardPyResult<PyProviderRequest> {
+    pub fn render(&self, kwargs: Option<&Bound<'_, PyDict>>) -> WyrdPyResult<PyProviderRequest> {
         let owned = binding_pairs(None, None, kwargs)?;
         let borrowed = borrowed_pairs(&owned);
         Ok(PyProviderRequest::from_native(
@@ -880,7 +880,7 @@ impl Prompt {
         name: Option<&str>,
         value: Option<&Bound<'_, PyAny>>,
         kwargs: Option<&Bound<'_, PyDict>>,
-    ) -> CardPyResult<Self> {
+    ) -> WyrdPyResult<Self> {
         let owned = binding_pairs(name, value, kwargs)?;
         require_binding_args(&owned)?;
         let borrowed = borrowed_pairs(&owned);
@@ -898,7 +898,7 @@ impl Prompt {
         name: Option<&str>,
         value: Option<&Bound<'_, PyAny>>,
         kwargs: Option<&Bound<'_, PyDict>>,
-    ) -> CardPyResult<()> {
+    ) -> WyrdPyResult<()> {
         let owned = binding_pairs(name, value, kwargs)?;
         require_binding_args(&owned)?;
         let borrowed = borrowed_pairs(&owned);
@@ -911,7 +911,7 @@ impl Prompt {
     /// Return a copy with a media placeholder bound to a provider-native value.
     // justification: pyo3 boundary; the extractor produces an owned value (PathBuf/PyRef/newtype), taking it by reference would require a caller-side clone
     #[allow(clippy::needless_pass_by_value)]
-    pub fn bind_media(&self, name: &str, media: PyRef<'_, PyMediaRef>) -> CardPyResult<Self> {
+    pub fn bind_media(&self, name: &str, media: PyRef<'_, PyMediaRef>) -> WyrdPyResult<Self> {
         Ok(Self::from_native(
             self.inner
                 .bind_media(name, media.native())
@@ -922,7 +922,7 @@ impl Prompt {
     /// Bind a media placeholder in place.
     // justification: pyo3 boundary; the extractor produces an owned value (PathBuf/PyRef/newtype), taking it by reference would require a caller-side clone
     #[allow(clippy::needless_pass_by_value)]
-    pub fn bind_media_mut(&mut self, name: &str, media: PyRef<'_, PyMediaRef>) -> CardPyResult<()> {
+    pub fn bind_media_mut(&mut self, name: &str, media: PyRef<'_, PyMediaRef>) -> WyrdPyResult<()> {
         Ok(self
             .inner
             .bind_media_mut(name, media.native())
@@ -943,7 +943,7 @@ impl Prompt {
 
     /// Return typed provider generation settings, or `None` for raw prompts.
     #[getter]
-    pub fn model_settings(&self, py: Python<'_>) -> CardPyResult<Option<Py<PyAny>>> {
+    pub fn model_settings(&self, py: Python<'_>) -> WyrdPyResult<Option<Py<PyAny>>> {
         Ok(match self.inner.settings_ref() {
             Some(skald_spec::ProviderSettingsRef::OpenAiChat(settings)) => {
                 Some(PyOpenAiChatSettings::from_native(settings.clone()).into_py_any(py)?)
@@ -963,14 +963,14 @@ impl Prompt {
 
     /// Return native request messages or content turns as Python objects.
     #[getter]
-    pub fn messages(&self, py: Python<'_>) -> CardPyResult<Py<PyAny>> {
+    pub fn messages(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
         wyrd_utils::py::json_to_pyobject(py, &request_messages_value(&self.inner.request))
             .map_err(Into::into)
     }
 
     /// Return the last native request message or content turn.
     #[getter]
-    pub fn message(&self, py: Python<'_>) -> CardPyResult<Py<PyAny>> {
+    pub fn message(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
         let messages = request_messages_value(&self.inner.request);
         let value = messages
             .as_array()
@@ -982,14 +982,14 @@ impl Prompt {
 
     /// Return native system instructions when the provider has that field.
     #[getter]
-    pub fn system_messages(&self, py: Python<'_>) -> CardPyResult<Py<PyAny>> {
+    pub fn system_messages(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
         wyrd_utils::py::json_to_pyobject(py, &request_system_value(&self.inner.request))
             .map_err(Into::into)
     }
 
     /// Replace the native provider request from a wrapper or JSON-like object.
     #[setter]
-    pub fn set_request(&mut self, value: &Bound<'_, PyAny>) -> CardPyResult<()> {
+    pub fn set_request(&mut self, value: &Bound<'_, PyAny>) -> WyrdPyResult<()> {
         self.inner.request = provider_request_from_py(value)?;
         if let Some(model) = request_model(&self.inner.request) {
             self.inner.model = model.to_owned();
@@ -1005,7 +1005,7 @@ impl Prompt {
 
     /// Set the prompt model string and any native request model field.
     #[setter]
-    pub fn set_model(&mut self, model: String) -> CardPyResult<()> {
+    pub fn set_model(&mut self, model: String) -> WyrdPyResult<()> {
         crate::coerce::checked_model(model.as_str())?;
         self.inner.model.clone_from(&model);
         set_request_model(&mut self.inner.request, model);
@@ -1043,29 +1043,29 @@ impl Prompt {
     }
 
     /// Return native prompt JSON as a Python dictionary.
-    pub fn model_dump(&self, py: Python<'_>) -> CardPyResult<Py<PyAny>> {
+    pub fn model_dump(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
         py_value(py, &self.inner)
     }
 
     /// Return this prompt as a JSON string.
-    pub fn model_dump_json(&self) -> CardPyResult<String> {
+    pub fn model_dump_json(&self) -> WyrdPyResult<String> {
         Ok(serde_json::to_string(&self.inner)?)
     }
 
     /// Build a prompt from serialized native prompt JSON.
     #[staticmethod]
-    pub fn model_validate_json(data: &str) -> CardPyResult<Self> {
+    pub fn model_validate_json(data: &str) -> WyrdPyResult<Self> {
         Ok(Self::from_native(serde_json::from_str(data)?))
     }
 
     /// Load a bare prompt spec from JSON or YAML.
     #[staticmethod]
-    pub fn load(path: std::path::PathBuf) -> CardPyResult<Self> {
+    pub fn load(path: std::path::PathBuf) -> WyrdPyResult<Self> {
         Ok(crate::loader::load_prompt(path)?)
     }
 
     /// Dump a bare prompt spec to JSON or YAML.
-    pub fn dump(&self, path: std::path::PathBuf) -> CardPyResult<()> {
+    pub fn dump(&self, path: std::path::PathBuf) -> WyrdPyResult<()> {
         Ok(crate::loader::dump_prompt(self, path)?)
     }
 
@@ -1089,13 +1089,13 @@ impl Prompt {
 impl PyProviderRequest {
     /// Return the native provider request as a Python dictionary.
     /// Escape hatch for `RawV1` and any provider variant without a typed projection.
-    pub fn model_dump(&self, py: Python<'_>) -> CardPyResult<Py<PyAny>> {
+    pub fn model_dump(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
         py_value(py, self.inner.as_ref())
     }
 
     /// Return the native provider request as a JSON string.
     /// Escape hatch for `RawV1` and any provider variant without a typed projection.
-    pub fn model_dump_json(&self) -> CardPyResult<String> {
+    pub fn model_dump_json(&self) -> WyrdPyResult<String> {
         Ok(serde_json::to_string(self.inner.as_ref())?)
     }
 
@@ -1107,7 +1107,7 @@ impl PyProviderRequest {
 
     /// Return a typed `OpenAI` Chat Completions request accessor.
     /// Raises `WyrdError` when the provider is not openai chat.
-    pub fn openai(&self) -> CardPyResult<python::PyOpenAiChatRequest> {
+    pub fn openai(&self) -> WyrdPyResult<python::PyOpenAiChatRequest> {
         match self.inner.as_ref() {
             skald_spec::ProviderRequest::OpenAiChatCompletion(_)
             | skald_spec::ProviderRequest::OpenAiChatCompatible { .. } => {
@@ -1119,7 +1119,7 @@ impl PyProviderRequest {
 
     /// Return a typed `OpenAI` Responses API request accessor.
     /// Raises `WyrdError` when the provider is not openai responses.
-    pub fn openai_responses(&self) -> CardPyResult<python::PyOpenAiResponsesRequest> {
+    pub fn openai_responses(&self) -> WyrdPyResult<python::PyOpenAiResponsesRequest> {
         match self.inner.as_ref() {
             skald_spec::ProviderRequest::OpenAiResponses(_) => Ok(
                 python::PyOpenAiResponsesRequest::new(Arc::clone(&self.inner)),
@@ -1130,7 +1130,7 @@ impl PyProviderRequest {
 
     /// Return a typed Anthropic Messages request accessor.
     /// Raises `WyrdError` when the provider is not anthropic.
-    pub fn anthropic(&self) -> CardPyResult<python::PyAnthropicMessagesRequest> {
+    pub fn anthropic(&self) -> WyrdPyResult<python::PyAnthropicMessagesRequest> {
         match self.inner.as_ref() {
             skald_spec::ProviderRequest::AnthropicMessage(_) => Ok(
                 python::PyAnthropicMessagesRequest::new(Arc::clone(&self.inner)),
@@ -1141,7 +1141,7 @@ impl PyProviderRequest {
 
     /// Return a typed Google Gemini request accessor.
     /// Raises `WyrdError` when the provider is not google/gemini.
-    pub fn gemini(&self) -> CardPyResult<python::PyGeminiRequest> {
+    pub fn gemini(&self) -> WyrdPyResult<python::PyGeminiRequest> {
         match self.inner.as_ref() {
             skald_spec::ProviderRequest::GeminiGenerateContent(_) => {
                 Ok(python::PyGeminiRequest::new(Arc::clone(&self.inner)))
@@ -1152,7 +1152,7 @@ impl PyProviderRequest {
 
     /// Return a typed Vertex AI request accessor.
     /// Raises `WyrdError` when the provider is not vertex.
-    pub fn vertex(&self) -> CardPyResult<python::PyVertexRequest> {
+    pub fn vertex(&self) -> WyrdPyResult<python::PyVertexRequest> {
         match self.inner.as_ref() {
             skald_spec::ProviderRequest::Vertex(_) => {
                 Ok(python::PyVertexRequest::new(Arc::clone(&self.inner)))
@@ -1163,14 +1163,14 @@ impl PyProviderRequest {
 
     /// Return native request messages or content turns as Python objects.
     #[getter]
-    pub fn messages(&self, py: Python<'_>) -> CardPyResult<Py<PyAny>> {
+    pub fn messages(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
         wyrd_utils::py::json_to_pyobject(py, &request_messages_value(self.inner.as_ref()))
             .map_err(Into::into)
     }
 
     /// Return the last native request message or content turn.
     #[getter]
-    pub fn message(&self, py: Python<'_>) -> CardPyResult<Py<PyAny>> {
+    pub fn message(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
         let messages = request_messages_value(self.inner.as_ref());
         let value = messages
             .as_array()
@@ -1182,7 +1182,7 @@ impl PyProviderRequest {
 
     /// Return native system instructions when the provider has that field.
     #[getter]
-    pub fn system(&self, py: Python<'_>) -> CardPyResult<Py<PyAny>> {
+    pub fn system(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
         wyrd_utils::py::json_to_pyobject(py, &request_system_value(self.inner.as_ref()))
             .map_err(Into::into)
     }
@@ -1202,7 +1202,7 @@ impl PyProviderRequest {
 fn assign_variables(
     mut prompt: Prompt,
     explicit_variables: Option<Vec<String>>,
-) -> CardPyResult<Prompt> {
+) -> WyrdPyResult<Prompt> {
     prompt.inner.variables = match explicit_variables {
         Some(variables) => variables,
         None => extract_prompt_variables(&prompt)?,
@@ -1211,7 +1211,7 @@ fn assign_variables(
 }
 
 #[cfg(feature = "python")]
-fn extract_prompt_variables(prompt: &Prompt) -> CardPyResult<Vec<String>> {
+fn extract_prompt_variables(prompt: &Prompt) -> WyrdPyResult<Vec<String>> {
     let spec = wyrd_spec::PromptSpec {
         prompt: prompt.inner.clone(),
     };
@@ -1219,7 +1219,7 @@ fn extract_prompt_variables(prompt: &Prompt) -> CardPyResult<Vec<String>> {
 }
 
 #[cfg(feature = "python")]
-fn append_py_messages(mut prompt: Prompt, messages: &Bound<'_, PyAny>) -> CardPyResult<Prompt> {
+fn append_py_messages(mut prompt: Prompt, messages: &Bound<'_, PyAny>) -> WyrdPyResult<Prompt> {
     if messages.is_instance_of::<PyString>() {
         return Ok(prompt.with_user(messages.extract::<String>()?)?);
     }
@@ -1243,7 +1243,7 @@ fn binding_pairs(
     name: Option<&str>,
     value: Option<&Bound<'_, PyAny>>,
     kwargs: Option<&Bound<'_, PyDict>>,
-) -> CardPyResult<Vec<(String, String)>> {
+) -> WyrdPyResult<Vec<(String, String)>> {
     let mut owned = Vec::new();
     if let (Some(name), Some(value)) = (name, value) {
         owned.push((name.to_owned(), value.str()?.extract::<String>()?));
@@ -1265,7 +1265,7 @@ fn borrowed_pairs(owned: &[(String, String)]) -> Vec<(&str, &str)> {
 }
 
 #[cfg(feature = "python")]
-fn require_binding_args(owned: &[(String, String)]) -> CardPyResult<()> {
+fn require_binding_args(owned: &[(String, String)]) -> WyrdPyResult<()> {
     if owned.is_empty() {
         return Err(PromptBuilderError::Validation(
             "must provide either (name, value) or keyword arguments for binding".to_owned(),
@@ -1276,7 +1276,7 @@ fn require_binding_args(owned: &[(String, String)]) -> CardPyResult<()> {
 }
 
 #[cfg(feature = "python")]
-fn provider_request_from_py(value: &Bound<'_, PyAny>) -> CardPyResult<ProviderRequest> {
+fn provider_request_from_py(value: &Bound<'_, PyAny>) -> WyrdPyResult<ProviderRequest> {
     if let Ok(request) = value.extract::<PyRef<'_, PyProviderRequest>>() {
         return Ok((*request.inner).clone());
     }
@@ -1359,7 +1359,7 @@ fn request_system_value(request: &ProviderRequest) -> serde_json::Value {
 #[cfg(feature = "python")]
 fn response_format_from_py(
     value: Option<&Bound<'_, PyAny>>,
-) -> CardPyResult<Option<ResponseFormat>> {
+) -> WyrdPyResult<Option<ResponseFormat>> {
     let Some(value) = value.filter(|value| !value.is_none()) else {
         return Ok(None);
     };
@@ -1380,7 +1380,7 @@ fn response_format_from_py(
 type OutputFromPy = (Option<ResponseFormat>, Option<Arc<pyo3::Py<pyo3::PyAny>>>);
 
 #[cfg(feature = "python")]
-fn output_from_py(value: Option<&Bound<'_, PyAny>>) -> CardPyResult<OutputFromPy> {
+fn output_from_py(value: Option<&Bound<'_, PyAny>>) -> WyrdPyResult<OutputFromPy> {
     let Some(value) = value.filter(|v| !v.is_none()) else {
         return Ok((None, None));
     };
@@ -1465,7 +1465,7 @@ fn normalize_output_schema(schema: &mut serde_json::Value) {
 fn annotation_dict_to_schema<'py>(
     py: pyo3::Python<'py>,
     dict: &Bound<'py, pyo3::types::PyDict>,
-) -> CardPyResult<serde_json::Value> {
+) -> WyrdPyResult<serde_json::Value> {
     let mut properties = serde_json::Map::new();
     let mut required = Vec::new();
     for (k, v) in dict.iter() {
@@ -1488,7 +1488,7 @@ fn annotation_dict_to_schema<'py>(
 fn py_annotation_to_schema<'py>(
     py: pyo3::Python<'py>,
     ann: &Bound<'py, PyAny>,
-) -> CardPyResult<serde_json::Value> {
+) -> WyrdPyResult<serde_json::Value> {
     let builtins = py
         .import("builtins")
         .map_err(|e| PromptBuilderError::Validation(e.to_string()))?;
@@ -1574,7 +1574,7 @@ fn py_annotation_to_schema<'py>(
 }
 
 #[cfg(feature = "python")]
-fn cache_prompt_key(value: Option<&Bound<'_, PyAny>>) -> CardPyResult<Option<String>> {
+fn cache_prompt_key(value: Option<&Bound<'_, PyAny>>) -> WyrdPyResult<Option<String>> {
     let Some(value) = value.filter(|value| !value.is_none()) else {
         return Ok(None);
     };
@@ -1597,7 +1597,7 @@ fn append_py_content(
     prompt: &Prompt,
     role: &str,
     content: &Bound<'_, PyAny>,
-) -> CardPyResult<Prompt> {
+) -> WyrdPyResult<Prompt> {
     if let Ok(text) = content.extract::<String>() {
         return match role {
             "assistant" => Ok(prompt.with_assistant(text)?),
@@ -1614,7 +1614,7 @@ fn append_native_json_content(
     prompt: &Prompt,
     role: &str,
     value: serde_json::Value,
-) -> CardPyResult<Prompt> {
+) -> WyrdPyResult<Prompt> {
     let mut out = prompt.clone();
     match &mut out.inner.request {
         ProviderRequest::OpenAiChatCompletion(request)
@@ -1680,7 +1680,7 @@ fn append_native_json_content(
 }
 
 #[cfg(feature = "python")]
-fn json_parts<T>(value: serde_json::Value) -> CardPyResult<Vec<T>>
+fn json_parts<T>(value: serde_json::Value) -> WyrdPyResult<Vec<T>>
 where
     T: DeserializeOwned,
 {
@@ -1692,7 +1692,7 @@ where
 }
 
 #[cfg(feature = "python")]
-fn py_value<T>(py: Python<'_>, value: &T) -> CardPyResult<Py<PyAny>>
+fn py_value<T>(py: Python<'_>, value: &T) -> WyrdPyResult<Py<PyAny>>
 where
     T: serde::Serialize,
 {

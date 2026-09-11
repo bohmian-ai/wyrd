@@ -8,12 +8,13 @@ use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyType};
 use wyrd_spec::card::model::{HuggingFaceTask, TfSaveFormat, TorchSaveFormat};
 
-use crate::error::{CardPyResult, WyrdPyError};
 use crate::model::interfaces::helpers::{ensure_extras, qualname_of, required};
 use crate::model::interfaces::kinds::{
     CatboostInterface, HuggingfaceInterface, LightgbmInterface, LightningInterface,
     SklearnInterface, TensorflowInterface, TorchInterface, XgboostInterface,
 };
+#[cfg(feature = "python")]
+use wyrd_utils::py::WyrdPyResult;
 
 impl SklearnInterface {
     /// Save the held sklearn model and optional preprocessor with joblib.
@@ -26,7 +27,7 @@ impl SklearnInterface {
         py: Python<'_>,
         path: &Path,
         save_kwargs: Option<&Bound<'_, PyDict>>,
-    ) -> CardPyResult<()> {
+    ) -> WyrdPyResult<()> {
         let _ = save_kwargs;
         save_joblib_model(
             py,
@@ -48,7 +49,7 @@ impl SklearnInterface {
         py: Python<'_>,
         path: &Path,
         load_kwargs: Option<&Bound<'_, PyDict>>,
-    ) -> CardPyResult<()> {
+    ) -> WyrdPyResult<()> {
         let _ = load_kwargs;
         load_joblib_model(
             py,
@@ -71,7 +72,7 @@ impl XgboostInterface {
         py: Python<'_>,
         path: &Path,
         save_kwargs: Option<&Bound<'_, PyDict>>,
-    ) -> CardPyResult<()> {
+    ) -> WyrdPyResult<()> {
         let _ = save_kwargs;
         save_joblib_model(
             py,
@@ -93,7 +94,7 @@ impl XgboostInterface {
         py: Python<'_>,
         path: &Path,
         load_kwargs: Option<&Bound<'_, PyDict>>,
-    ) -> CardPyResult<()> {
+    ) -> WyrdPyResult<()> {
         let _ = load_kwargs;
         load_joblib_model(
             py,
@@ -116,7 +117,7 @@ impl LightgbmInterface {
         py: Python<'_>,
         path: &Path,
         save_kwargs: Option<&Bound<'_, PyDict>>,
-    ) -> CardPyResult<()> {
+    ) -> WyrdPyResult<()> {
         let _ = save_kwargs;
         save_joblib_model(
             py,
@@ -138,7 +139,7 @@ impl LightgbmInterface {
         py: Python<'_>,
         path: &Path,
         load_kwargs: Option<&Bound<'_, PyDict>>,
-    ) -> CardPyResult<()> {
+    ) -> WyrdPyResult<()> {
         let _ = load_kwargs;
         load_joblib_model(
             py,
@@ -161,7 +162,7 @@ impl CatboostInterface {
         py: Python<'_>,
         path: &Path,
         save_kwargs: Option<&Bound<'_, PyDict>>,
-    ) -> CardPyResult<()> {
+    ) -> WyrdPyResult<()> {
         let _ = save_kwargs;
         save_joblib_model(
             py,
@@ -183,7 +184,7 @@ impl CatboostInterface {
         py: Python<'_>,
         path: &Path,
         load_kwargs: Option<&Bound<'_, PyDict>>,
-    ) -> CardPyResult<()> {
+    ) -> WyrdPyResult<()> {
         let _ = load_kwargs;
         load_joblib_model(
             py,
@@ -206,7 +207,7 @@ impl TorchInterface {
         py: Python<'_>,
         path: &Path,
         save_kwargs: Option<&Bound<'_, PyDict>>,
-    ) -> CardPyResult<()> {
+    ) -> WyrdPyResult<()> {
         let _ = save_kwargs;
         let model = require_model(self.model.as_deref(), "TorchInterface")?;
         fs::create_dir_all(path)?;
@@ -238,13 +239,13 @@ impl TorchInterface {
         py: Python<'_>,
         path: &Path,
         load_kwargs: Option<&Bound<'_, PyDict>>,
-    ) -> CardPyResult<()> {
+    ) -> WyrdPyResult<()> {
         let _ = load_kwargs;
         match self.save_format {
             TorchSaveFormat::Safetensors => {
                 ensure_extras_pair(py, required::TORCH_SAFETENSORS)?;
                 let model = self.model.as_deref().ok_or_else(|| {
-                    WyrdPyError::model_validation(
+                    crate::error::model_validation(
                         "TorchInterface.load with safetensors requires an attached torch module instance",
                     )
                 })?;
@@ -284,7 +285,7 @@ impl LightningInterface {
         py: Python<'_>,
         path: &Path,
         save_kwargs: Option<&Bound<'_, PyDict>>,
-    ) -> CardPyResult<()> {
+    ) -> WyrdPyResult<()> {
         let _ = save_kwargs;
         let model = require_model(self.model.as_deref(), "LightningInterface")?;
         ensure_extras_pair(py, required::LIGHTNING)?;
@@ -314,12 +315,12 @@ impl LightningInterface {
         py: Python<'_>,
         path: &Path,
         load_kwargs: Option<&Bound<'_, PyDict>>,
-    ) -> CardPyResult<()> {
+    ) -> WyrdPyResult<()> {
         let _ = load_kwargs;
         ensure_extras_pair(py, required::LIGHTNING)?;
         let checkpoint_path = path.join("model.ckpt");
         let model = self.model.as_deref().ok_or_else(|| {
-            WyrdPyError::model_validation(
+            crate::error::model_validation(
                 "LightningInterface.load requires an attached LightningModule class or instance",
             )
         })?;
@@ -352,7 +353,7 @@ impl TensorflowInterface {
         py: Python<'_>,
         path: &Path,
         save_kwargs: Option<&Bound<'_, PyDict>>,
-    ) -> CardPyResult<()> {
+    ) -> WyrdPyResult<()> {
         let _ = save_kwargs;
         let model = require_model(self.model.as_deref(), "TensorflowInterface")?;
         ensure_extras_pair(py, required::TENSORFLOW)?;
@@ -382,7 +383,7 @@ impl TensorflowInterface {
         py: Python<'_>,
         path: &Path,
         load_kwargs: Option<&Bound<'_, PyDict>>,
-    ) -> CardPyResult<()> {
+    ) -> WyrdPyResult<()> {
         let _ = load_kwargs;
         ensure_extras_pair(py, required::TENSORFLOW)?;
         let tf = py.import("tensorflow")?;
@@ -412,7 +413,7 @@ impl HuggingfaceInterface {
         py: Python<'_>,
         path: &Path,
         save_kwargs: Option<&Bound<'_, PyDict>>,
-    ) -> CardPyResult<()> {
+    ) -> WyrdPyResult<()> {
         let _ = save_kwargs;
         let model = require_model(self.model.as_deref(), "HuggingfaceInterface")?;
         ensure_extras_pair(py, required::HUGGINGFACE)?;
@@ -439,7 +440,7 @@ impl HuggingfaceInterface {
         py: Python<'_>,
         path: &Path,
         load_kwargs: Option<&Bound<'_, PyDict>>,
-    ) -> CardPyResult<()> {
+    ) -> WyrdPyResult<()> {
         let _ = load_kwargs;
         ensure_extras_pair(py, required::HUGGINGFACE)?;
         let transformers = py.import("transformers")?;
@@ -448,7 +449,7 @@ impl HuggingfaceInterface {
         let model = transformers
             .getattr(auto_model_class)
             .map_err(|_| {
-                WyrdPyError::model_validation(format!(
+                crate::error::model_validation(format!(
                     "transformers.{auto_model_class} is not available for this Hugging Face task"
                 ))
             })?
@@ -467,7 +468,7 @@ fn save_joblib_model(
     preprocessor: Option<&Py<PyAny>>,
     required: (&str, &[&str]),
     interface_name: &str,
-) -> CardPyResult<()> {
+) -> WyrdPyResult<()> {
     let model = require_model(model, interface_name)?;
     ensure_extras_pair(py, required)?;
     fs::create_dir_all(path)?;
@@ -488,14 +489,12 @@ fn load_joblib_model(
     model: &mut Option<Arc<Py<PyAny>>>,
     preprocessor: &mut Option<Arc<Py<PyAny>>>,
     required: (&str, &[&str]),
-) -> CardPyResult<()> {
+) -> WyrdPyResult<()> {
     ensure_extras_pair(py, required)?;
     let joblib = py.import("joblib")?;
     let loaded = joblib.call_method1("load", (&path.join("model.joblib"),))?;
     if loaded.is_none() {
-        return Err(WyrdPyError::model_validation(
-            "joblib model artifact loaded as None",
-        ));
+        return Err(crate::error::model_validation("joblib model artifact loaded as None").into());
     }
     *model = Some(Arc::new(loaded.unbind()));
     *preprocessor = load_preprocessor_joblib(py, path, required.0)?;
@@ -507,7 +506,7 @@ fn save_preprocessor_joblib(
     path: &Path,
     preprocessor: Option<&Py<PyAny>>,
     extras: &str,
-) -> CardPyResult<()> {
+) -> WyrdPyResult<()> {
     if let Some(preprocessor) = preprocessor {
         ensure_extras(py, extras, &["joblib"])?;
         py.import("joblib")?.call_method1(
@@ -522,7 +521,7 @@ fn load_preprocessor_joblib(
     py: Python<'_>,
     path: &Path,
     extras: &str,
-) -> CardPyResult<Option<Arc<Py<PyAny>>>> {
+) -> WyrdPyResult<Option<Arc<Py<PyAny>>>> {
     let preprocessor_path = path.join("preprocessor.joblib");
     if !preprocessor_path.exists() {
         return Ok(None);
@@ -538,13 +537,17 @@ fn load_preprocessor_joblib(
 fn require_model<'a>(
     model: Option<&'a Py<PyAny>>,
     interface_name: &str,
-) -> CardPyResult<&'a Py<PyAny>> {
-    model.ok_or_else(|| {
-        WyrdPyError::model_validation(format!("{interface_name}.save requires `model` to be set"))
-    })
+) -> WyrdPyResult<&'a Py<PyAny>> {
+    model
+        .ok_or_else(|| {
+            crate::error::model_validation(format!(
+                "{interface_name}.save requires `model` to be set"
+            ))
+        })
+        .map_err(Into::into)
 }
 
-fn ensure_extras_pair(py: Python<'_>, required: (&str, &[&str])) -> CardPyResult<()> {
+fn ensure_extras_pair(py: Python<'_>, required: (&str, &[&str])) -> WyrdPyResult<()> {
     ensure_extras(py, required.0, required.1)
 }
 

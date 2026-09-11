@@ -4,7 +4,6 @@ use std::sync::Arc;
 use pyo3::prelude::*;
 use pyo3::types::PyAny;
 
-use crate::error::{CardPyResult, WyrdPyError};
 use crate::model::detect::{ModelInterfaceKind, detect_interface_variant};
 use crate::model::interfaces::ModelInterface;
 use crate::model::interfaces::kinds::{
@@ -15,6 +14,8 @@ use wyrd_spec::card::model::{
     CustomMeta, HuggingFaceTask, ModelInterface as RustModelInterface, TfSaveFormat,
     TorchSaveFormat,
 };
+#[cfg(feature = "python")]
+use wyrd_utils::py::WyrdPyResult;
 
 /// Python-compatible dispatch wrapper for local model interface holders.
 pub enum ModelInterfaceHandle {
@@ -44,7 +45,7 @@ impl ModelInterfaceHandle {
     /// # Errors
     /// Returns a validation error when the object is not a supported model
     /// interface.
-    pub fn from_interface(interface: &Bound<'_, PyAny>) -> CardPyResult<Self> {
+    pub fn from_interface(interface: &Bound<'_, PyAny>) -> WyrdPyResult<Self> {
         macro_rules! extract_interface {
             ($type:ty, $variant:ident) => {
                 if interface.is_instance_of::<$type>() {
@@ -66,9 +67,7 @@ impl ModelInterfaceHandle {
             return Ok(Self::Subclass(interface.clone().unbind()));
         }
 
-        Err(WyrdPyError::model_validation(
-            "ModelCard requires a supported model interface",
-        ))
+        Err(crate::error::model_validation("ModelCard requires a supported model interface").into())
     }
 
     /// Detect and build a default interface holder from a raw Python model.
@@ -76,7 +75,7 @@ impl ModelInterfaceHandle {
     /// # Errors
     /// Returns a public Wyrd error when the model object is not supported or
     /// type metadata cannot be inspected.
-    pub fn from_raw(py: Python<'_>, model: &Bound<'_, PyAny>) -> CardPyResult<Self> {
+    pub fn from_raw(py: Python<'_>, model: &Bound<'_, PyAny>) -> WyrdPyResult<Self> {
         let model_py = Arc::new(model.clone().unbind());
         let model_subtype = Some(crate::model::interfaces::helpers::qualname_of(py, model)?);
         match detect_interface_variant(py, model)? {
@@ -142,7 +141,7 @@ impl ModelInterfaceHandle {
     /// # Errors
     /// Returns a Python-boundary error when the held configuration cannot be
     /// converted.
-    pub fn to_spec_interface(&self, py: Python<'_>) -> CardPyResult<RustModelInterface> {
+    pub fn to_spec_interface(&self, py: Python<'_>) -> WyrdPyResult<RustModelInterface> {
         match self {
             Self::Sklearn(value) => value.to_spec_interface(py),
             Self::Xgboost(value) => value.to_spec_interface(py),
@@ -172,7 +171,7 @@ impl ModelInterfaceHandle {
     /// # Errors
     /// Returns a Python-boundary error when the interface object cannot be
     /// allocated.
-    pub fn into_py_any(self, py: Python<'_>) -> CardPyResult<Py<PyAny>> {
+    pub fn into_py_any(self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
         macro_rules! into_py {
             ($value:expr, $kind:literal) => {
                 Ok(Py::new(py, ($value, ModelInterface::marker($kind)))?.into_any())

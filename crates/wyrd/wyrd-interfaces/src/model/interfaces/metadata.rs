@@ -1,4 +1,3 @@
-use crate::error::{CardPyResult, WyrdPyError};
 use crate::model::interfaces::kinds::{
     CatboostInterface, HuggingfaceInterface, LightgbmInterface, LightningInterface,
     SklearnInterface, TensorflowInterface, TorchInterface, XgboostInterface,
@@ -7,6 +6,8 @@ use wyrd_spec::card::model::{
     CatboostMeta, HuggingfaceMeta, LightgbmMeta, LightningMeta,
     ModelInterface as RustModelInterface, SklearnMeta, TensorflowMeta, TorchMeta, XgboostMeta,
 };
+#[cfg(feature = "python")]
+use wyrd_utils::py::WyrdPyResult;
 
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
@@ -16,21 +17,21 @@ macro_rules! impl_to_spec {
         impl $type {
             /// Convert this local Python holder into Rust-only metadata.
             #[cfg(feature = "python")]
-            pub fn to_rust(&self, py: Python<'_>) -> CardPyResult<$meta> {
+            pub fn to_rust(&self, py: Python<'_>) -> WyrdPyResult<$meta> {
                 $body(self, py)
             }
 
             /// Convert this local Python holder into a Rust-only interface enum.
             #[cfg(feature = "python")]
-            pub fn to_spec_interface(&self, py: Python<'_>) -> CardPyResult<RustModelInterface> {
+            pub fn to_spec_interface(&self, py: Python<'_>) -> WyrdPyResult<RustModelInterface> {
                 Ok(RustModelInterface::$variant(self.to_rust(py)?))
             }
 
             /// Rebuild a sourceless Python holder from Rust-only metadata.
-            pub fn from_spec_inner(interface: &RustModelInterface) -> CardPyResult<Self> {
+            pub fn from_spec_inner(interface: &RustModelInterface) -> WyrdPyResult<Self> {
                 match interface {
                     RustModelInterface::$variant(meta) => Ok(Self::from_meta(meta)),
-                    _ => Err(WyrdPyError::model_validation($message)),
+                    _ => Err(crate::error::model_validation($message).into()),
                 }
             }
         }

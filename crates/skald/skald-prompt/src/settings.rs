@@ -9,7 +9,7 @@ use {
     pyo3::IntoPyObjectExt,
     pyo3::{prelude::*, types::PyDict},
     skald_spec::{ProviderName, ProviderRequest, SkaldError},
-    wyrd_interfaces::error::{CardPyResult, WyrdPyError},
+    wyrd_utils::py::{WyrdPyError, WyrdPyResult},
 };
 
 #[cfg(feature = "python")]
@@ -100,7 +100,7 @@ macro_rules! impl_settings_wrapper {
             /// Build provider settings from keyword arguments.
             #[new]
             #[pyo3(signature = (**kwargs))]
-            pub fn __new__(kwargs: Option<&Bound<'_, PyDict>>) -> CardPyResult<Self> {
+            pub fn __new__(kwargs: Option<&Bound<'_, PyDict>>) -> WyrdPyResult<Self> {
                 let value = kwargs
                     .map(wyrd_utils::py::pydict_to_json_value)
                     .transpose()?
@@ -110,13 +110,13 @@ macro_rules! impl_settings_wrapper {
 
             /// Build provider settings from a Python dictionary.
             #[staticmethod]
-            pub fn from_dict(value: &Bound<'_, PyAny>) -> CardPyResult<Self> {
+            pub fn from_dict(value: &Bound<'_, PyAny>) -> WyrdPyResult<Self> {
                 let value = wyrd_utils::py::pyobject_to_json(value)?;
                 decode_settings::<$native>(value, $provider).map(Self::from_native)
             }
 
             /// Return settings as a Python dictionary.
-            pub fn to_dict(&self, py: Python<'_>) -> CardPyResult<Py<PyAny>> {
+            pub fn to_dict(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
                 Ok(wyrd_utils::py::json_to_pyobject(
                     py,
                     &serde_json::to_value(&self.inner)?,
@@ -124,7 +124,7 @@ macro_rules! impl_settings_wrapper {
             }
 
             /// Return settings as JSON.
-            pub fn model_dump_json(&self) -> CardPyResult<String> {
+            pub fn model_dump_json(&self) -> WyrdPyResult<String> {
                 Ok(serde_json::to_string(&self.inner)?)
             }
 
@@ -163,7 +163,7 @@ impl_settings_wrapper!(
 );
 
 #[cfg(feature = "python")]
-fn decode_settings<T>(value: serde_json::Value, provider: ProviderName) -> CardPyResult<T>
+fn decode_settings<T>(value: serde_json::Value, provider: ProviderName) -> WyrdPyResult<T>
 where
     T: serde::de::DeserializeOwned,
 {
@@ -198,7 +198,7 @@ fn settings_mismatch(expected: ProviderName, got: ProviderName) -> WyrdPyError {
 fn json_object_from_py(
     value: &Bound<'_, PyAny>,
     provider: ProviderName,
-) -> CardPyResult<serde_json::Value> {
+) -> WyrdPyResult<serde_json::Value> {
     let value = wyrd_utils::py::pyobject_to_json(value)?;
     if value.is_object() {
         Ok(value)
@@ -214,7 +214,7 @@ fn json_object_from_py(
 #[cfg(feature = "python")]
 pub(crate) fn resolve_openai_chat_settings(
     value: Option<&Bound<'_, PyAny>>,
-) -> CardPyResult<OpenAiChatSettings> {
+) -> WyrdPyResult<OpenAiChatSettings> {
     let Some(value) = value.filter(|value| !value.is_none()) else {
         return Ok(OpenAiChatSettings::default());
     };
@@ -255,7 +255,7 @@ pub(crate) fn resolve_openai_chat_settings(
 #[cfg(feature = "python")]
 pub(crate) fn resolve_openai_responses_settings(
     value: Option<&Bound<'_, PyAny>>,
-) -> CardPyResult<OpenAiResponsesSettings> {
+) -> WyrdPyResult<OpenAiResponsesSettings> {
     let Some(value) = value.filter(|value| !value.is_none()) else {
         return Ok(OpenAiResponsesSettings::default());
     };
@@ -293,7 +293,7 @@ pub(crate) fn resolve_openai_responses_settings(
 #[cfg(feature = "python")]
 pub(crate) fn resolve_anthropic_settings(
     value: Option<&Bound<'_, PyAny>>,
-) -> CardPyResult<AnthropicMessagesSettings> {
+) -> WyrdPyResult<AnthropicMessagesSettings> {
     let Some(value) = value.filter(|value| !value.is_none()) else {
         return Ok(AnthropicMessagesSettings::default());
     };
@@ -329,7 +329,7 @@ pub(crate) fn resolve_anthropic_settings(
 #[cfg(feature = "python")]
 pub(crate) fn resolve_google_settings(
     value: Option<&Bound<'_, PyAny>>,
-) -> CardPyResult<GoogleGenerateSettings> {
+) -> WyrdPyResult<GoogleGenerateSettings> {
     let Some(value) = value.filter(|value| !value.is_none()) else {
         return Ok(GoogleGenerateSettings::default());
     };
@@ -363,7 +363,7 @@ pub(crate) fn resolve_google_settings(
 pub fn apply_model_settings(
     prompt: &skald_spec::Prompt,
     value: Option<&Bound<'_, PyAny>>,
-) -> CardPyResult<skald_spec::Prompt> {
+) -> WyrdPyResult<skald_spec::Prompt> {
     let Some(value) = value.filter(|value| !value.is_none()) else {
         return Ok(prompt.clone());
     };
@@ -400,7 +400,7 @@ pub fn apply_model_settings(
 pub fn model_settings_py(
     prompt: &skald_spec::Prompt,
     py: Python<'_>,
-) -> CardPyResult<Option<Py<PyAny>>> {
+) -> WyrdPyResult<Option<Py<PyAny>>> {
     Ok(match prompt.settings_ref() {
         Some(skald_spec::ProviderSettingsRef::OpenAiChat(settings)) => {
             Some(PyOpenAiChatSettings::from_native(settings.clone()).into_py_any(py)?)
@@ -420,6 +420,6 @@ pub fn model_settings_py(
 
 /// Return a Python `Prompt` for native prompt metadata.
 #[cfg(feature = "python")]
-pub fn prompt_py(prompt: skald_spec::Prompt, py: Python<'_>) -> CardPyResult<Py<PyAny>> {
+pub fn prompt_py(prompt: skald_spec::Prompt, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
     Ok(Py::new(py, Prompt::from_native(prompt))?.into_any())
 }

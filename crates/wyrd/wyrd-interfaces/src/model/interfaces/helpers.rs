@@ -1,4 +1,5 @@
-use crate::error::{CardPyResult, WyrdPyError};
+#[cfg(feature = "python")]
+use wyrd_utils::py::WyrdPyResult;
 
 #[cfg(feature = "python")]
 use {
@@ -15,7 +16,7 @@ use {
 /// # Errors
 /// Returns a Python-boundary error when the type metadata cannot be read.
 #[cfg(feature = "python")]
-pub(crate) fn qualname_of(_py: Python<'_>, obj: &Bound<'_, PyAny>) -> CardPyResult<String> {
+pub(crate) fn qualname_of(_py: Python<'_>, obj: &Bound<'_, PyAny>) -> WyrdPyResult<String> {
     Ok(obj
         .get_type()
         .getattr("__qualname__")?
@@ -28,12 +29,13 @@ pub(crate) fn qualname_of(_py: Python<'_>, obj: &Bound<'_, PyAny>) -> CardPyResu
 /// Returns `WYRD_MODEL_501_SERIALIZER_UNAVAILABLE` when a required Python
 /// import is unavailable in the active interpreter.
 #[cfg(feature = "python")]
-pub(crate) fn ensure_extras(py: Python<'_>, extras: &str, required: &[&str]) -> CardPyResult<()> {
+pub(crate) fn ensure_extras(py: Python<'_>, extras: &str, required: &[&str]) -> WyrdPyResult<()> {
     for package in required {
         if py.import(package).is_err() {
-            return Err(WyrdPyError::serializer_unavailable(&format!(
+            return Err(crate::error::serializer_unavailable(&format!(
                 "wyrd[{extras}] (missing import: {package})"
-            )));
+            ))
+            .into());
         }
     }
     Ok(())

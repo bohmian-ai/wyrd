@@ -37,6 +37,17 @@ pub type WyrdPyResult<T> = Result<T, WyrdPyError>;
 #[error(transparent)]
 pub struct WyrdPyError(#[from] SpecWyrdError);
 
+impl WyrdPyError {
+    /// Stable catalog code this boundary failure raises into Python.
+    ///
+    /// Callers use it to assert boundary behavior without constructing a
+    /// Python interpreter, since the inner catalog error stays private.
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        self.0.code()
+    }
+}
+
 impl From<PyErr> for WyrdPyError {
     /// Re-enter the catalog from a Python-raised exception.
     ///

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
 use skald_spec::ProviderResponse;
-use wyrd_interfaces::error::CardPyResult;
+use wyrd_utils::py::WyrdPyResult;
 
 use super::anthropic::PyAnthropicMessagesResponse;
 use super::google::{PyGeminiResponse, PyVertexResponse};
@@ -40,7 +40,7 @@ impl PyProviderResponse {
         provider_name_to_string(&self.inner.provider())
     }
 
-    pub fn openai(&self) -> CardPyResult<PyOpenAiChatResponse> {
+    pub fn openai(&self) -> WyrdPyResult<PyOpenAiChatResponse> {
         match self.inner.as_ref() {
             ProviderResponse::OpenAiChatCompletion(_) => {
                 Ok(PyOpenAiChatResponse::new(Arc::clone(&self.inner)))
@@ -49,7 +49,7 @@ impl PyProviderResponse {
         }
     }
 
-    pub fn openai_responses(&self) -> CardPyResult<PyOpenAiResponsesResponse> {
+    pub fn openai_responses(&self) -> WyrdPyResult<PyOpenAiResponsesResponse> {
         match self.inner.as_ref() {
             ProviderResponse::OpenAiResponses(_) => {
                 Ok(PyOpenAiResponsesResponse::new(Arc::clone(&self.inner)))
@@ -58,7 +58,7 @@ impl PyProviderResponse {
         }
     }
 
-    pub fn anthropic(&self) -> CardPyResult<PyAnthropicMessagesResponse> {
+    pub fn anthropic(&self) -> WyrdPyResult<PyAnthropicMessagesResponse> {
         match self.inner.as_ref() {
             ProviderResponse::AnthropicMessage(_) => {
                 Ok(PyAnthropicMessagesResponse::new(Arc::clone(&self.inner)))
@@ -67,7 +67,7 @@ impl PyProviderResponse {
         }
     }
 
-    pub fn gemini(&self) -> CardPyResult<PyGeminiResponse> {
+    pub fn gemini(&self) -> WyrdPyResult<PyGeminiResponse> {
         match self.inner.as_ref() {
             ProviderResponse::GeminiGenerateContent(_) => {
                 Ok(PyGeminiResponse::new(Arc::clone(&self.inner)))
@@ -76,7 +76,7 @@ impl PyProviderResponse {
         }
     }
 
-    pub fn vertex(&self) -> CardPyResult<PyVertexResponse> {
+    pub fn vertex(&self) -> WyrdPyResult<PyVertexResponse> {
         match self.inner.as_ref() {
             ProviderResponse::VertexGenerateContent(_) => {
                 Ok(PyVertexResponse::new(Arc::clone(&self.inner)))
@@ -85,12 +85,12 @@ impl PyProviderResponse {
         }
     }
 
-    pub fn model_dump(&self, py: Python<'_>) -> CardPyResult<Py<PyAny>> {
+    pub fn model_dump(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
         wyrd_utils::py::json_to_pyobject(py, &serde_json::to_value(self.inner.as_ref())?)
             .map_err(Into::into)
     }
 
-    pub fn model_dump_json(&self) -> CardPyResult<String> {
+    pub fn model_dump_json(&self) -> WyrdPyResult<String> {
         serde_json::to_string(self.inner.as_ref()).map_err(Into::into)
     }
 

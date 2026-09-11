@@ -18,7 +18,7 @@ use skald_spec::wire::anthropic_messages::{
     AnthropicToolResultContent, AnthropicUsage,
 };
 use skald_spec::{ProviderRequest, ProviderResponse};
-use wyrd_interfaces::error::CardPyResult;
+use wyrd_utils::py::WyrdPyResult;
 
 use crate::prompt::wrong_variant;
 
@@ -140,7 +140,7 @@ impl PyAnthropicMessagesSettings {
             })
     }
     #[getter]
-    fn extra(&self, py: Python<'_>) -> CardPyResult<Py<PyAny>> {
+    fn extra(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
         wyrd_utils::py::json_to_pyobject(py, &serde_json::Value::Object(self.s().extra.clone()))
             .map_err(Into::into)
     }
@@ -170,13 +170,13 @@ impl PyAnthropicSystem {
             AnthropicSystem::Blocks(_) => "blocks",
         }
     }
-    fn as_text(&self) -> CardPyResult<String> {
+    fn as_text(&self) -> WyrdPyResult<String> {
         match self.s() {
             AnthropicSystem::Text(s) => Ok(s.clone()),
             _ => Err(wrong_variant("text", self.kind()).into()),
         }
     }
-    fn as_blocks(&self) -> CardPyResult<Vec<PyAnthropicSystemBlock>> {
+    fn as_blocks(&self) -> WyrdPyResult<Vec<PyAnthropicSystemBlock>> {
         match self.s() {
             AnthropicSystem::Blocks(bs) => Ok((0..bs.len())
                 .map(|i| PyAnthropicSystemBlock {
@@ -216,7 +216,7 @@ impl PyAnthropicSystemBlock {
             AnthropicSystemBlock::Text { .. } => "text",
         }
     }
-    fn as_text(&self) -> CardPyResult<String> {
+    fn as_text(&self) -> WyrdPyResult<String> {
         match self.b() {
             AnthropicSystemBlock::Text { text, .. } => Ok(text.clone()),
         }
@@ -380,25 +380,25 @@ impl PyAnthropicContentBlock {
             AnthropicContentBlock::ToolResult { .. } => "tool_result",
         }
     }
-    fn as_text(&self) -> CardPyResult<String> {
+    fn as_text(&self) -> WyrdPyResult<String> {
         match self.b() {
             AnthropicContentBlock::Text { text, .. } => Ok(text.clone()),
             _ => Err(wrong_variant("text", self.kind()).into()),
         }
     }
-    fn as_tool_use_id(&self) -> CardPyResult<String> {
+    fn as_tool_use_id(&self) -> WyrdPyResult<String> {
         match self.b() {
             AnthropicContentBlock::ToolUse { id, .. } => Ok(id.clone()),
             _ => Err(wrong_variant("tool_use", self.kind()).into()),
         }
     }
-    fn as_tool_use_name(&self) -> CardPyResult<String> {
+    fn as_tool_use_name(&self) -> WyrdPyResult<String> {
         match self.b() {
             AnthropicContentBlock::ToolUse { name, .. } => Ok(name.clone()),
             _ => Err(wrong_variant("tool_use", self.kind()).into()),
         }
     }
-    fn as_tool_use_input(&self, py: Python<'_>) -> CardPyResult<Py<PyAny>> {
+    fn as_tool_use_input(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
         match self.b() {
             AnthropicContentBlock::ToolUse { input, .. } => {
                 wyrd_utils::py::json_to_pyobject(py, input).map_err(Into::into)
@@ -406,7 +406,7 @@ impl PyAnthropicContentBlock {
             _ => Err(wrong_variant("tool_use", self.kind()).into()),
         }
     }
-    fn as_thinking(&self) -> CardPyResult<String> {
+    fn as_thinking(&self) -> WyrdPyResult<String> {
         match self.b() {
             AnthropicContentBlock::Thinking { thinking, .. } => Ok(thinking.clone()),
             _ => Err(wrong_variant("thinking", self.kind()).into()),
@@ -470,7 +470,7 @@ impl PyAnthropicToolResultContent {
             AnthropicToolResultContent::Blocks(_) => "blocks",
         }
     }
-    fn as_text(&self) -> CardPyResult<String> {
+    fn as_text(&self) -> WyrdPyResult<String> {
         match &self.value {
             AnthropicToolResultContent::Text(s) => Ok(s.clone()),
             AnthropicToolResultContent::Blocks(_) => Err(wrong_variant("text", self.kind()).into()),
@@ -505,7 +505,7 @@ impl PyAnthropicTool {
         self.t().description.as_deref()
     }
     #[getter]
-    fn input_schema(&self, py: Python<'_>) -> CardPyResult<Py<PyAny>> {
+    fn input_schema(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
         wyrd_utils::py::json_to_pyobject(py, &self.t().input_schema).map_err(Into::into)
     }
     #[getter]
@@ -550,7 +550,7 @@ impl PyAnthropicOutputConfig {
         }
     }
     #[getter]
-    fn schema(&self, py: Python<'_>) -> CardPyResult<Py<PyAny>> {
+    fn schema(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
         match &self.c().format {
             AnthropicOutputFormat::JsonSchema { schema } => {
                 wyrd_utils::py::json_to_pyobject(py, schema).map_err(Into::into)

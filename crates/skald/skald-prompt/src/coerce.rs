@@ -57,7 +57,7 @@ pub fn provider_name_from_py(value: &Bound<'_, PyAny>) -> PyResult<ProviderName>
     }
 
     Err(
-        wyrd_interfaces::error::WyrdPyError::from(PromptBuilderError::InvalidProvider(
+        wyrd_utils::py::WyrdPyError::from(PromptBuilderError::InvalidProvider(
             value.str()?.extract::<String>()?,
         ))
         .into(),

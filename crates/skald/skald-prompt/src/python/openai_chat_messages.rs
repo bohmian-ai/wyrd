@@ -13,7 +13,7 @@ use skald_spec::wire::openai_chat::{
     OpenAiMessageAnnotation, OpenAiMessageAudio, OpenAiMessageContent, OpenAiToolCall,
     OpenAiToolFunctionCall, OpenAiUrlCitation,
 };
-use wyrd_interfaces::error::CardPyResult;
+use wyrd_utils::py::WyrdPyResult;
 
 use super::shared::ChatMessageSource;
 use crate::prompt::wrong_variant;
@@ -104,13 +104,13 @@ impl PyOpenAiMessageContent {
             OpenAiMessageContent::Parts(_) => "parts",
         }
     }
-    fn as_text(&self) -> CardPyResult<String> {
+    fn as_text(&self) -> WyrdPyResult<String> {
         match self.c() {
             OpenAiMessageContent::Text(s) => Ok(s.clone()),
             OpenAiMessageContent::Parts(_) => Err(wrong_variant("text", self.kind()).into()),
         }
     }
-    fn as_parts(&self) -> CardPyResult<Vec<PyOpenAiContentPart>> {
+    fn as_parts(&self) -> WyrdPyResult<Vec<PyOpenAiContentPart>> {
         match self.c() {
             OpenAiMessageContent::Parts(ps) => Ok((0..ps.len())
                 .map(|i| PyOpenAiContentPart {
@@ -150,13 +150,13 @@ impl PyOpenAiContentPart {
             OpenAiContentPart::File { .. } => "file",
         }
     }
-    fn as_text(&self) -> CardPyResult<String> {
+    fn as_text(&self) -> WyrdPyResult<String> {
         match self.p() {
             OpenAiContentPart::Text { text } => Ok(text.clone()),
             _ => Err(wrong_variant("text", self.kind()).into()),
         }
     }
-    fn as_image_url(&self) -> CardPyResult<PyOpenAiImageUrl> {
+    fn as_image_url(&self) -> WyrdPyResult<PyOpenAiImageUrl> {
         match self.p() {
             OpenAiContentPart::ImageUrl { .. } => Ok(PyOpenAiImageUrl {
                 src: self.src.clone(),
@@ -165,7 +165,7 @@ impl PyOpenAiContentPart {
             _ => Err(wrong_variant("image_url", self.kind()).into()),
         }
     }
-    fn as_input_audio(&self) -> CardPyResult<PyOpenAiInputAudio> {
+    fn as_input_audio(&self) -> WyrdPyResult<PyOpenAiInputAudio> {
         match self.p() {
             OpenAiContentPart::InputAudio { .. } => Ok(PyOpenAiInputAudio {
                 src: self.src.clone(),
@@ -174,7 +174,7 @@ impl PyOpenAiContentPart {
             _ => Err(wrong_variant("input_audio", self.kind()).into()),
         }
     }
-    fn as_file(&self) -> CardPyResult<PyOpenAiFilePart> {
+    fn as_file(&self) -> WyrdPyResult<PyOpenAiFilePart> {
         match self.p() {
             OpenAiContentPart::File { .. } => Ok(PyOpenAiFilePart {
                 src: self.src.clone(),

@@ -1,17 +1,17 @@
-use crate::error::{CardPyResult, WyrdPyError};
 use wyrd_spec::card::model::{
     HuggingFaceTask, SampleInputKind, TaskType, TfSaveFormat, TorchSaveFormat,
 };
+use wyrd_spec::error::WyrdError;
 
 /// Parse the `save_format` string option for `TorchInterface`.
 ///
 /// # Errors
 /// Returns an invalid-interface-option error for unknown tokens.
-pub fn parse_torch_save_format(value: &str) -> CardPyResult<TorchSaveFormat> {
+pub fn parse_torch_save_format(value: &str) -> Result<TorchSaveFormat, WyrdError> {
     match normalize_option(value).as_str() {
         "safetensors" => Ok(TorchSaveFormat::Safetensors),
         "pickle" => Ok(TorchSaveFormat::Pickle),
-        got => Err(WyrdPyError::invalid_interface_option(
+        got => Err(crate::error::invalid_interface_option(
             "save_format",
             got,
             ["safetensors", "pickle"],
@@ -23,11 +23,11 @@ pub fn parse_torch_save_format(value: &str) -> CardPyResult<TorchSaveFormat> {
 ///
 /// # Errors
 /// Returns an invalid-interface-option error for unknown tokens.
-pub fn parse_tf_save_format(value: &str) -> CardPyResult<TfSaveFormat> {
+pub fn parse_tf_save_format(value: &str) -> Result<TfSaveFormat, WyrdError> {
     match normalize_option(value).as_str() {
         "keras" => Ok(TfSaveFormat::Keras),
         "savedmodel" | "saved_model" => Ok(TfSaveFormat::SavedModel),
-        got => Err(WyrdPyError::invalid_interface_option(
+        got => Err(crate::error::invalid_interface_option(
             "save_format",
             got,
             ["keras", "savedmodel"],
@@ -39,7 +39,7 @@ pub fn parse_tf_save_format(value: &str) -> CardPyResult<TfSaveFormat> {
 ///
 /// # Errors
 /// Returns an invalid-interface-option error for unknown tokens.
-pub fn parse_huggingface_task(value: &str) -> CardPyResult<HuggingFaceTask> {
+pub fn parse_huggingface_task(value: &str) -> Result<HuggingFaceTask, WyrdError> {
     match normalize_option(value).as_str() {
         "text_classification" => Ok(HuggingFaceTask::TextClassification),
         "token_classification" => Ok(HuggingFaceTask::TokenClassification),
@@ -71,7 +71,7 @@ pub fn parse_huggingface_task(value: &str) -> CardPyResult<HuggingFaceTask> {
         "embedding" => Ok(HuggingFaceTask::Embedding),
         "multiple_choice" => Ok(HuggingFaceTask::MultipleChoice),
         "other" => Ok(HuggingFaceTask::Other),
-        got => Err(WyrdPyError::invalid_interface_option(
+        got => Err(crate::error::invalid_interface_option(
             "hf_task",
             got,
             HUGGINGFACE_TASK_TOKENS,
@@ -83,7 +83,7 @@ pub fn parse_huggingface_task(value: &str) -> CardPyResult<HuggingFaceTask> {
 ///
 /// # Errors
 /// Returns an invalid-interface-option error for unknown tokens.
-pub fn parse_sample_input_kind(value: &str) -> CardPyResult<SampleInputKind> {
+pub fn parse_sample_input_kind(value: &str) -> Result<SampleInputKind, WyrdError> {
     match normalize_option(value).as_str() {
         "pandas" => Ok(SampleInputKind::Pandas),
         "polars" => Ok(SampleInputKind::Polars),
@@ -96,7 +96,7 @@ pub fn parse_sample_input_kind(value: &str) -> CardPyResult<SampleInputKind> {
         "tuple" => Ok(SampleInputKind::Tuple),
         "str" | "string" => Ok(SampleInputKind::Str),
         "none" => Ok(SampleInputKind::None),
-        got => Err(WyrdPyError::invalid_interface_option(
+        got => Err(crate::error::invalid_interface_option(
             "kind",
             got,
             [
@@ -111,7 +111,7 @@ pub fn parse_sample_input_kind(value: &str) -> CardPyResult<SampleInputKind> {
 ///
 /// # Errors
 /// Returns an invalid-interface-option error for unknown tokens.
-pub fn parse_task_type(value: &str) -> CardPyResult<TaskType> {
+pub fn parse_task_type(value: &str) -> Result<TaskType, WyrdError> {
     match normalize_option(value).as_str() {
         "binary_classification" => Ok(TaskType::BinaryClassification),
         "multi_class_classification" | "multiclass_classification" => {
@@ -123,7 +123,7 @@ pub fn parse_task_type(value: &str) -> CardPyResult<TaskType> {
         "forecasting" => Ok(TaskType::Forecasting),
         "generation" => Ok(TaskType::Generation),
         "other" => Ok(TaskType::Other),
-        got => Err(WyrdPyError::invalid_interface_option(
+        got => Err(crate::error::invalid_interface_option(
             "task_type",
             got,
             [
@@ -252,10 +252,10 @@ mod tests {
         parse_huggingface_task, parse_sample_input_kind, parse_task_type, parse_tf_save_format,
         parse_torch_save_format,
     };
-    use crate::error::WyrdPyError;
     use wyrd_spec::card::model::{
         HuggingFaceTask, SampleInputKind, TaskType, TfSaveFormat, TorchSaveFormat,
     };
+    use wyrd_spec::error::WyrdError;
 
     #[test]
     fn parses_locked_model_options() {
@@ -284,24 +284,23 @@ mod tests {
     #[test]
     fn rejects_unknown_model_options_with_wyrd_code() {
         assert_invalid_interface_option(
-            parse_torch_save_format("zip").expect_err("invalid torch format"),
-        );
-        assert_invalid_interface_option(parse_tf_save_format("pb").expect_err("invalid tf format"));
-        assert_invalid_interface_option(
-            parse_huggingface_task("ranking").expect_err("invalid hf task"),
+            &parse_torch_save_format("zip").expect_err("invalid torch format"),
         );
         assert_invalid_interface_option(
-            parse_sample_input_kind("bytes").expect_err("invalid sample kind"),
+            &parse_tf_save_format("pb").expect_err("invalid tf format"),
         );
-        assert_invalid_interface_option(parse_task_type("ranking").expect_err("invalid task type"));
+        assert_invalid_interface_option(
+            &parse_huggingface_task("ranking").expect_err("invalid hf task"),
+        );
+        assert_invalid_interface_option(
+            &parse_sample_input_kind("bytes").expect_err("invalid sample kind"),
+        );
+        assert_invalid_interface_option(
+            &parse_task_type("ranking").expect_err("invalid task type"),
+        );
     }
 
-    fn assert_invalid_interface_option(error: WyrdPyError) {
-        match error {
-            WyrdPyError::Spec(error) => {
-                assert_eq!(error.code(), "WYRD_DATA_400_INVALID_INTERFACE_OPTION");
-            }
-            other => panic!("expected Wyrd spec error, got {other:?}"),
-        }
+    fn assert_invalid_interface_option(error: &WyrdError) {
+        assert_eq!(error.code(), "WYRD_DATA_400_INVALID_INTERFACE_OPTION");
     }
 }

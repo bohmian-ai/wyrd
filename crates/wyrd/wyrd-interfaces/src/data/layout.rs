@@ -1,11 +1,11 @@
 //! Local artifact layout conventions for data interface metadata.
 
 use std::path::{Path, PathBuf};
+use wyrd_spec::error::WyrdError;
 
 use wyrd_spec::card::data::{ArrowFormat, DataInterface, NumpyFormat, TorchSaveFormat};
 
 use crate::data::io::jsonl_relative_path_for;
-use crate::error::CardPyResult;
 
 /// Local artifact path capability for reconstructable Rust interface metadata.
 pub trait LocalArtifactLayout {
@@ -14,11 +14,11 @@ pub trait LocalArtifactLayout {
     /// # Errors
     /// Returns an error only when a concrete implementation cannot derive a
     /// valid path from its metadata.
-    fn artifact_path(&self, base: &Path) -> CardPyResult<PathBuf>;
+    fn artifact_path(&self, base: &Path) -> Result<PathBuf, WyrdError>;
 }
 
 impl LocalArtifactLayout for DataInterface {
-    fn artifact_path(&self, base: &Path) -> CardPyResult<PathBuf> {
+    fn artifact_path(&self, base: &Path) -> Result<PathBuf, WyrdError> {
         let relative = match self {
             Self::Pandas(_) | Self::Polars(_) | Self::Parquet(_) => {
                 PathBuf::from("data/data.parquet")

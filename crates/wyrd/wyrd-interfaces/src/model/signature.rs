@@ -6,12 +6,12 @@ use wyrd_spec::card::model::ModelSignature as ModelSignatureSpec;
 use {
     crate::data::dtype::{dtype_string_from_py, fields_from_py, is_framework_class},
     crate::data::schema::PyFieldSpec,
-    crate::error::{CardPyResult, WyrdPyError},
     pyo3::prelude::*,
     pyo3::types::{PyAny, PyDict, PyList, PyModule, PyString, PyType},
     std::collections::BTreeMap,
     wyrd_spec::card::field::{Dim, FieldSpec},
     wyrd_spec::ids::ColumnName,
+    wyrd_utils::py::WyrdPyResult,
     wyrd_utils::py::{json_to_pyobject, pyobject_to_json},
 };
 
@@ -63,11 +63,11 @@ impl ModelSignature {
     /// Create a model signature from explicit field specs.
     #[new]
     #[pyo3(signature = (inputs, outputs))]
-    fn __new__(inputs: &Bound<'_, PyAny>, outputs: &Bound<'_, PyAny>) -> CardPyResult<Self> {
-        Ok(Self::from_inner(ModelSignatureSpec::from_fields(
-            parse_fields(inputs)?,
-            parse_fields(outputs)?,
-        )?))
+    fn __new__(inputs: &Bound<'_, PyAny>, outputs: &Bound<'_, PyAny>) -> WyrdPyResult<Self> {
+        Ok(Self::from_inner(
+            ModelSignatureSpec::from_fields(parse_fields(inputs)?, parse_fields(outputs)?)
+                .map_err(crate::error::card_error)?,
+        ))
     }
 
     /// Return input fields in declaration order.
@@ -93,7 +93,7 @@ impl ModelSignature {
     }
 
     /// Return the Rust metadata representation as a Python dictionary.
-    fn to_dict(&self, py: Python<'_>) -> CardPyResult<Py<PyAny>> {
+    fn to_dict(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
         Ok(json_to_pyobject(py, &serde_json::to_value(&self.inner)?)?)
     }
 
@@ -105,9 +105,10 @@ impl ModelSignature {
         py: Python<'_>,
         inputs: &Bound<'_, PyAny>,
         outputs: &Bound<'_, PyAny>,
-    ) -> CardPyResult<Self> {
+    ) -> WyrdPyResult<Self> {
         let signature =
-            ModelSignatureSpec::from_fields(infer_fields(py, inputs)?, infer_fields(py, outputs)?)?;
+            ModelSignatureSpec::from_fields(infer_fields(py, inputs)?, infer_fields(py, outputs)?)
+                .map_err(crate::error::card_error)?;
         Ok(Self::from_inner(signature))
     }
 }
@@ -120,7 +121,7 @@ pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
 }
 
 #[cfg(feature = "python")]
-fn parse_fields(value: &Bound<'_, PyAny>) -> CardPyResult<Vec<FieldSpec>> {
+fn parse_fields(value: &Bound<'_, PyAny>) -> WyrdPyResult<Vec<FieldSpec>> {
     let mut fields = Vec::new();
     for item in value.try_iter()? {
         let item = item?;
@@ -134,7 +135,7 @@ fn parse_fields(value: &Bound<'_, PyAny>) -> CardPyResult<Vec<FieldSpec>> {
 }
 
 #[cfg(feature = "python")]
-fn infer_fields(py: Python<'_>, obj: &Bound<'_, PyAny>) -> CardPyResult<Vec<FieldSpec>> {
+fn infer_fields(py: Python<'_>, obj: &Bound<'_, PyAny>) -> WyrdPyResult<Vec<FieldSpec>> {
     if is_framework_class(py, obj, "pandas", "DataFrame")?
         || is_framework_class(py, obj, "polars", "DataFrame")?
         || is_framework_class(py, obj, "pyarrow", "Table")?
@@ -158,32 +159,33 @@ fn infer_fields(py: Python<'_>, obj: &Bound<'_, PyAny>) -> CardPyResult<Vec<Fiel
     if obj.is_instance_of::<PyString>() {
         return text_field(false);
     }
-    Err(WyrdPyError::missing_signature(
+    Err(crate::error::missing_signature(
         "ModelSignature.from_data requires pandas, polars, pyarrow, numpy, torch, dict[str, numpy.ndarray], list[str], or str values",
-    ))
+    ).into())
 }
 
 #[cfg(feature = "python")]
 fn fields_from_dict_of_ndarray(
     py: Python<'_>,
     obj: &Bound<'_, PyAny>,
-) -> CardPyResult<Vec<FieldSpec>> {
+) -> WyrdPyResult<Vec<FieldSpec>> {
     let dict = obj.cast::<PyDict>()?;
     let mut fields = Vec::with_capacity(dict.len());
     for (key, value) in dict.iter() {
         let name: String = key
             .extract()
-            .map_err(|_| WyrdPyError::missing_signature("dict keys must be strings"))?;
+            .map_err(|_| crate::error::missing_signature("dict keys must be strings"))?;
         if !is_framework_class(py, &value, "numpy", "ndarray")? {
-            return Err(WyrdPyError::missing_signature(format!(
+            return Err(crate::error::missing_signature(format!(
                 "dict value for key {name:?} is not numpy.ndarray"
-            )));
+            ))
+            .into());
         }
         let dtype = dtype_string_from_py(py, "numpy", &value)?;
         let shape = value.getattr("shape")?.extract::<Vec<i64>>()?;
         fields.push(FieldSpec {
             name: ColumnName::new(&name).map_err(|source| {
-                WyrdPyError::missing_signature(format!(
+                crate::error::missing_signature(format!(
                     "dict key {name:?} is not a valid field name: {source}"
                 ))
             })?,
@@ -202,10 +204,10 @@ fn list_is_all_str(list: &Bound<'_, PyList>) -> bool {
 }
 
 #[cfg(feature = "python")]
-fn text_field(dynamic_batch: bool) -> CardPyResult<Vec<FieldSpec>> {
+fn text_field(dynamic_batch: bool) -> WyrdPyResult<Vec<FieldSpec>> {
     Ok(vec![FieldSpec {
         name: ColumnName::new("text")
-            .map_err(|source| WyrdPyError::missing_signature(source.to_string()))?,
+            .map_err(|source| crate::error::missing_signature(source.to_string()))?,
         dtype: "utf8".to_string(),
         shape: if dynamic_batch {
             vec![Dim::Dynamic(Some("batch".to_string()))]

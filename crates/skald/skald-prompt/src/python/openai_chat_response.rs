@@ -13,7 +13,7 @@ use skald_spec::wire::openai_chat::{
     OpenAiChatChoice, OpenAiChatLogprobs, OpenAiChatResponse, OpenAiCompletionTokensDetails,
     OpenAiPromptTokensDetails, OpenAiUsage,
 };
-use wyrd_interfaces::error::CardPyResult;
+use wyrd_utils::py::WyrdPyResult;
 
 use super::openai_chat_messages::PyOpenAiChatMessage;
 use super::shared::ChatMessageSource;
@@ -154,12 +154,12 @@ impl PyOpenAiChatLogprobs {
 #[pymethods]
 impl PyOpenAiChatLogprobs {
     #[getter]
-    fn content(&self, py: Python<'_>) -> CardPyResult<Py<PyAny>> {
+    fn content(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
         wyrd_utils::py::json_to_pyobject(py, &serde_json::Value::Array(self.l().content.clone()))
             .map_err(Into::into)
     }
     #[getter]
-    fn refusal(&self, py: Python<'_>) -> CardPyResult<Py<PyAny>> {
+    fn refusal(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
         wyrd_utils::py::json_to_pyobject(py, &serde_json::Value::Array(self.l().refusal.clone()))
             .map_err(Into::into)
     }

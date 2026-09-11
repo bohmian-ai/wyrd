@@ -6,7 +6,6 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use wyrd_interfaces::error::CardPyResult;
 use wyrd_spec::api_version::ApiVersion;
 use wyrd_spec::card::prompt::{PromptRef as NativePromptRef, PromptSpec};
 use wyrd_spec::envelope::{
@@ -15,6 +14,8 @@ use wyrd_spec::envelope::{
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::metadata::{Annotations, Labels};
 use wyrd_spec::reference::CardRef;
+#[cfg(feature = "python")]
+use wyrd_utils::py::WyrdPyResult;
 
 use crate::identity::{card_name, optional_card_uid, space_name, validation_error, version_block};
 
@@ -28,8 +29,8 @@ use {
     pyo3::pyclass::{PyTraverseError, PyVisit},
     pyo3::types::{PyAny, PyAnyMethods},
     std::path::PathBuf,
-    wyrd_interfaces::error::WyrdPyError,
     wyrd_spec::metadata::{AnnotationKey, AnnotationValue, LabelKey, LabelValue, MetadataError},
+    wyrd_utils::py::WyrdPyError,
 };
 
 /// Python-holder metadata accumulated by a local `PromptCard`.
@@ -141,8 +142,9 @@ impl PromptCard {
     /// # Errors
     /// Returns a Wyrd error when `PromptSpec` validation, identity validation, or
     /// JSON serialization fails.
-    pub fn model_dump_json(&self) -> CardPyResult<String> {
-        Ok(serde_json::to_string(&self.to_card()?)?)
+    pub fn model_dump_json(&self) -> Result<String, WyrdError> {
+        serde_json::to_string(&self.to_card()?)
+            .map_err(|error| wyrd_interfaces::error::json_error(&error))
     }
 
     /// Convert serialized holder metadata into a Rust card spec body.
@@ -280,7 +282,7 @@ impl PromptRef {
     /// Returns a Wyrd error when the card identity fields are invalid.
     #[staticmethod]
     #[pyo3(signature = (name, version, *, space, uid=None))]
-    pub fn card(name: &str, version: &str, space: &str, uid: Option<&str>) -> CardPyResult<Self> {
+    pub fn card(name: &str, version: &str, space: &str, uid: Option<&str>) -> WyrdPyResult<Self> {
         let card_ref = CardRef {
             kind: CardKind::Prompt,
             name: card_name("name", name)?,
@@ -296,7 +298,7 @@ impl PromptRef {
     /// # Errors
     /// Returns a Wyrd error when the prompt is invalid.
     #[staticmethod]
-    pub fn inline(prompt: &Bound<'_, PyAny>) -> CardPyResult<Self> {
+    pub fn inline(prompt: &Bound<'_, PyAny>) -> WyrdPyResult<Self> {
         let spec = PromptSpec::new(native_prompt_from_py(prompt)?)?;
         Ok(Self::from_native(NativePromptRef::Inline(Box::new(spec))))
     }
@@ -314,7 +316,7 @@ impl PromptRef {
     ///
     /// # Errors
     /// Returns a Wyrd error when JSON conversion fails.
-    pub fn model_dump(&self, py: Python<'_>) -> CardPyResult<Py<PyAny>> {
+    pub fn model_dump(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
         wyrd_utils::py::json_to_pyobject(py, &serde_json::to_value(&self.inner)?)
             .map_err(Into::into)
     }
@@ -323,8 +325,9 @@ impl PromptRef {
     ///
     /// # Errors
     /// Returns a Wyrd error when JSON serialization fails.
-    pub fn model_dump_json(&self) -> CardPyResult<String> {
-        Ok(serde_json::to_string(&self.inner)?)
+    pub fn model_dump_json(&self) -> WyrdPyResult<String> {
+        serde_json::to_string(&self.inner)
+            .map_err(|error| wyrd_interfaces::error::json_error(&error).into())
     }
 
     /// Rebuild a `PromptRef` from JSON.
@@ -332,7 +335,7 @@ impl PromptRef {
     /// # Errors
     /// Returns a Wyrd error when JSON parsing or validation fails.
     #[staticmethod]
-    pub fn model_validate_json(data: &str) -> CardPyResult<Self> {
+    pub fn model_validate_json(data: &str) -> WyrdPyResult<Self> {
         Ok(Self::from_native(serde_json::from_str(data)?))
     }
 
@@ -354,7 +357,7 @@ impl PromptCardMetadata {
     pub fn __new__(
         prompt: Option<&Bound<'_, PyAny>>,
         model_settings: Option<&Bound<'_, PyAny>>,
-    ) -> CardPyResult<Self> {
+    ) -> WyrdPyResult<Self> {
         let prompt = prompt
             .map(native_prompt_from_py)
             .transpose()?
@@ -367,10 +370,11 @@ impl PromptCardMetadata {
     ///
     /// # Errors
     /// Returns a Wyrd error when JSON conversion fails.
-    pub fn to_dict(&self, py: Python<'_>) -> CardPyResult<Py<PyAny>> {
+    pub fn to_dict(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
         wyrd_utils::py::json_to_pyobject(
             py,
-            &serde_json::to_value(self).map_err(|error| WyrdPyError::Json(error.to_string()))?,
+            &serde_json::to_value(self)
+                .map_err(|error| wyrd_interfaces::error::json_error(&error))?,
         )
         .map_err(Into::into)
     }
@@ -380,7 +384,7 @@ impl PromptCardMetadata {
     /// # Errors
     /// Returns a Wyrd error when `PromptSpec` validation or JSON conversion fails.
     #[pyo3(name = "to_spec")]
-    pub fn to_spec_py(&self, py: Python<'_>) -> CardPyResult<Py<PyAny>> {
+    pub fn to_spec_py(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
         let spec = PromptCardMetadata::to_spec(self)?;
         wyrd_utils::py::json_to_pyobject(py, &serde_json::to_value(spec)?).map_err(Into::into)
     }
@@ -419,7 +423,7 @@ impl PromptCard {
         annotations: Option<BTreeMap<String, String>>,
         metadata: Option<PromptCardMetadata>,
         model_settings: Option<&Bound<'_, PyAny>>,
-    ) -> CardPyResult<Self> {
+    ) -> WyrdPyResult<Self> {
         let mut metadata = metadata.unwrap_or(PromptCardMetadata {
             prompt: default_prompt(),
         });
@@ -447,7 +451,7 @@ impl PromptCard {
 
     /// Return the held live prompt, if one is attached.
     #[getter]
-    pub fn prompt(&self, py: Python<'_>) -> CardPyResult<Py<PyAny>> {
+    pub fn prompt(&self, py: Python<'_>) -> WyrdPyResult<Py<PyAny>> {
         if let Some(prompt) = self.prompt.as_ref() {
             return Ok(prompt.clone_ref(py));
         }
@@ -459,7 +463,7 @@ impl PromptCard {
     /// # Errors
     /// Returns a Wyrd error when the value is not a `wyrd.prompt.Prompt`.
     #[setter]
-    pub fn set_prompt(&mut self, prompt: &Bound<'_, PyAny>) -> CardPyResult<()> {
+    pub fn set_prompt(&mut self, prompt: &Bound<'_, PyAny>) -> WyrdPyResult<()> {
         self.metadata.prompt = native_prompt_from_py(prompt)?;
         self.prompt = Some(prompt.clone().unbind());
         Ok(())
@@ -467,7 +471,7 @@ impl PromptCard {
 
     /// Return typed provider generation settings, or `None` for raw prompts.
     #[getter]
-    pub fn model_settings(&self, py: Python<'_>) -> CardPyResult<Option<Py<PyAny>>> {
+    pub fn model_settings(&self, py: Python<'_>) -> WyrdPyResult<Option<Py<PyAny>>> {
         skald_prompt::model_settings_py(&self.metadata.prompt, py)
     }
 
@@ -531,7 +535,7 @@ impl PromptCard {
     /// Returns a Wyrd error when a key or value is invalid for user-authored
     /// labels.
     #[setter]
-    pub fn set_labels(&mut self, value: BTreeMap<String, String>) -> CardPyResult<()> {
+    pub fn set_labels(&mut self, value: BTreeMap<String, String>) -> WyrdPyResult<()> {
         self.labels = labels_from_user(value)?;
         Ok(())
     }
@@ -548,7 +552,7 @@ impl PromptCard {
     /// Returns a Wyrd error when a key or value is invalid for user-authored
     /// annotations.
     #[setter]
-    pub fn set_annotations(&mut self, value: BTreeMap<String, String>) -> CardPyResult<()> {
+    pub fn set_annotations(&mut self, value: BTreeMap<String, String>) -> WyrdPyResult<()> {
         self.annotations = annotations_from_user(value)?;
         Ok(())
     }
@@ -571,7 +575,7 @@ impl PromptCard {
     /// # Errors
     /// Returns a Wyrd error when `PromptSpec` validation fails.
     #[getter]
-    pub fn content_hash(&self) -> CardPyResult<String> {
+    pub fn content_hash(&self) -> WyrdPyResult<String> {
         Ok(self.to_prompt_spec_from_metadata()?.content_hash())
     }
 
@@ -580,7 +584,7 @@ impl PromptCard {
     /// # Errors
     /// Returns a Wyrd error when `PromptSpec` validation fails.
     #[getter]
-    pub fn parameters(&self) -> CardPyResult<Vec<String>> {
+    pub fn parameters(&self) -> WyrdPyResult<Vec<String>> {
         Ok(self
             .to_prompt_spec_from_metadata()?
             .parameters()
@@ -594,7 +598,7 @@ impl PromptCard {
     /// # Errors
     /// Returns a Wyrd error when `PromptSpec` validation fails.
     #[getter]
-    pub fn is_fully_bound(&self) -> CardPyResult<bool> {
+    pub fn is_fully_bound(&self) -> WyrdPyResult<bool> {
         Ok(self.to_prompt_spec_from_metadata()?.is_fully_bound())
     }
 
@@ -604,7 +608,7 @@ impl PromptCard {
     /// Returns a Wyrd validation error when identity fields fail newtype
     /// invariants.
     #[pyo3(name = "as_card_ref")]
-    pub fn as_card_ref_py(&self) -> CardPyResult<CardRefPy> {
+    pub fn as_card_ref_py(&self) -> WyrdPyResult<CardRefPy> {
         self.as_card_ref().map(CardRefPy).map_err(Into::into)
     }
 
@@ -616,7 +620,7 @@ impl PromptCard {
     #[wyrd_test_contract_macros::critical("python:PromptCard.save")]
     // justification: pyo3 boundary; the extractor produces an owned value (PathBuf/PyRef/newtype), taking it by reference would require a caller-side clone
     #[allow(clippy::needless_pass_by_value)]
-    pub fn save(&self, path: PathBuf) -> CardPyResult<()> {
+    pub fn save(&self, path: PathBuf) -> WyrdPyResult<()> {
         Ok(io::write_card_file(&self.to_card()?, &path)?)
     }
 
@@ -632,7 +636,7 @@ impl PromptCard {
     #[staticmethod]
     // justification: pyo3 boundary; the extractor produces an owned value (PathBuf/PyRef/newtype), taking it by reference would require a caller-side clone
     #[allow(clippy::needless_pass_by_value)]
-    pub fn load(py: Python<'_>, path: PathBuf) -> CardPyResult<Self> {
+    pub fn load(py: Python<'_>, path: PathBuf) -> WyrdPyResult<Self> {
         let mut card = Self::from_card(io::read_card_file(&path)?)?;
         card.prompt = Some(skald_prompt::prompt_py(card.metadata.prompt.clone(), py)?);
         Ok(card)
@@ -652,7 +656,7 @@ impl PromptCard {
     #[pyo3(name = "from_path")]
     // justification: pyo3 boundary; the extractor produces an owned value (PathBuf/PyRef/newtype), taking it by reference would require a caller-side clone
     #[allow(clippy::needless_pass_by_value)]
-    pub fn from_path_py(py: Python<'_>, path: PathBuf) -> CardPyResult<Self> {
+    pub fn from_path_py(py: Python<'_>, path: PathBuf) -> WyrdPyResult<Self> {
         let mut card = Self::from_card(io::read_card_file(&path)?)?;
         card.prompt = Some(skald_prompt::prompt_py(card.metadata.prompt.clone(), py)?);
         Ok(card)
@@ -664,8 +668,8 @@ impl PromptCard {
     /// Returns a Wyrd error when `PromptSpec` validation or serialization fails.
     #[wyrd_test_contract_macros::critical("python:PromptCard.model_dump_json")]
     #[pyo3(name = "model_dump_json")]
-    pub fn model_dump_json_py(&self) -> CardPyResult<String> {
-        self.model_dump_json()
+    pub fn model_dump_json_py(&self) -> WyrdPyResult<String> {
+        self.model_dump_json().map_err(Into::into)
     }
 
     /// Build a `PromptCard` from serialized Wyrd card-envelope JSON.
@@ -675,7 +679,7 @@ impl PromptCard {
     #[wyrd_test_contract_macros::critical("python:PromptCard.model_validate_json")]
     #[staticmethod]
     #[pyo3(name = "model_validate_json")]
-    pub fn model_validate_json_py(py: Python<'_>, json_string: &str) -> CardPyResult<Self> {
+    pub fn model_validate_json_py(py: Python<'_>, json_string: &str) -> WyrdPyResult<Self> {
         let mut card = Self::from_card(serde_json::from_str(json_string)?)?;
         card.prompt = Some(skald_prompt::prompt_py(card.metadata.prompt.clone(), py)?);
         Ok(card)
@@ -715,15 +719,17 @@ impl PromptCard {
 }
 
 #[cfg(feature = "python")]
-fn native_prompt_from_py(prompt: &Bound<'_, PyAny>) -> CardPyResult<skald_spec::Prompt> {
+fn native_prompt_from_py(prompt: &Bound<'_, PyAny>) -> WyrdPyResult<skald_spec::Prompt> {
     let prompt = prompt
         .extract::<PyRef<'_, skald_prompt::Prompt>>()
-        .map_err(|_| WyrdPyError::validation("PromptCard requires a wyrd.prompt.Prompt"))?;
+        .map_err(|_| {
+            wyrd_interfaces::error::validation("PromptCard requires a wyrd.prompt.Prompt")
+        })?;
     Ok(prompt.native().clone())
 }
 
 #[cfg(feature = "python")]
-fn labels_from_user(values: BTreeMap<String, String>) -> CardPyResult<Labels> {
+fn labels_from_user(values: BTreeMap<String, String>) -> WyrdPyResult<Labels> {
     values
         .into_iter()
         .map(|(key, value)| {
@@ -736,7 +742,7 @@ fn labels_from_user(values: BTreeMap<String, String>) -> CardPyResult<Labels> {
 }
 
 #[cfg(feature = "python")]
-fn annotations_from_user(values: BTreeMap<String, String>) -> CardPyResult<Annotations> {
+fn annotations_from_user(values: BTreeMap<String, String>) -> WyrdPyResult<Annotations> {
     values
         .into_iter()
         .map(|(key, value)| {
@@ -766,10 +772,11 @@ fn annotations_to_strings(values: &Annotations) -> BTreeMap<String, String> {
 
 #[cfg(feature = "python")]
 fn metadata_error(error: MetadataError) -> WyrdPyError {
-    WyrdPyError::validation_with_details(
+    wyrd_interfaces::error::validation_with_details(
         "invalid PromptCard metadata label or annotation",
         json!({ "reason": error.to_string() }),
     )
+    .into()
 }
 
 #[cfg(any(feature = "python", test))]
